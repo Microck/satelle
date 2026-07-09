@@ -1,0 +1,4 @@
+interface:
+  display_name: "Satelle Recover"
+  short_description: "Diagnose and recover Satelle failures."
+  default_prompt: "Use Satelle Recover to diagnose a failed Satelle setup, run, or session."

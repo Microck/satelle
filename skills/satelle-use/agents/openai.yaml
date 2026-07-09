@@ -1,0 +1,4 @@
+interface:
+  display_name: "Satelle Use"
+  short_description: "Operate Satelle sessions safely."
+  default_prompt: "Use Satelle Use to run or steer a remote computer-use session safely."

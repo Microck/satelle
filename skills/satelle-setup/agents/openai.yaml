@@ -1,0 +1,4 @@
+interface:
+  display_name: "Satelle Setup"
+  short_description: "Set up Satelle safely from an AI-agent workflow."
+  default_prompt: "Use Satelle Setup to configure and verify a Satelle host without exposing secrets."

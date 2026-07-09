@@ -1,0 +1,4 @@
+interface:
+  display_name: "Satelle"
+  short_description: "Choose the right Satelle workflow skill."
+  default_prompt: "Use Satelle to pick the right workflow for a remote computer-use bridge task."

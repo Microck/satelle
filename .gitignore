@@ -1,0 +1,9 @@
+/target/
+/tmp/
+/eng.traineddata
+/.workflow/
+
+*.log
+.DS_Store
+Thumbs.db
+.residue/
