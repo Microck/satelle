@@ -1,4 +1,5 @@
 use super::*;
+use crate::TestStateDir as TempDir;
 use rusqlite::{Connection, params};
 use satelle_core::session::{
     ApprovalPolicy, DesktopBindingRef, DesktopTarget, EffectiveModelRef,
@@ -7,7 +8,6 @@ use satelle_core::session::{
     TurnStateRevision,
 };
 use std::fs;
-use tempfile::TempDir;
 use time::format_description::well_known::Rfc3339;
 
 const SESSION_1: &str = "rs_01890a5d-ac96-7b7c-8f89-37c3d0a66e11";
@@ -85,11 +85,27 @@ fn idempotency(
     .unwrap()
 }
 
-fn observed_refs(thread: &str, turn: &str) -> ObservedUpstreamRefs {
-    ObservedUpstreamRefs::new(
-        Some(PrivateUpstreamRef::new(thread).unwrap()),
-        Some(PrivateUpstreamRef::new(turn).unwrap()),
-    )
+fn record_upstream_refs(
+    storage: &mut Storage,
+    session_id: &SessionId,
+    turn_id: &TurnId,
+    thread: &str,
+    turn: &str,
+) {
+    storage
+        .record_upstream_ref(
+            session_id,
+            turn_id,
+            &ObservedUpstreamRef::thread(thread).unwrap(),
+        )
+        .unwrap();
+    storage
+        .record_upstream_ref(
+            session_id,
+            turn_id,
+            &ObservedUpstreamRef::turn(turn).unwrap(),
+        )
+        .unwrap();
 }
 
 fn revisions(session: &Session, turn: &str) -> ExpectedRevisions {

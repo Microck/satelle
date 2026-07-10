@@ -1,5 +1,4 @@
 use super::codec::{load_log_page_records, load_log_records, log_retention_bounds};
-#[cfg(any(test, feature = "test-support"))]
 use super::open::sqlite_error;
 #[cfg(any(test, feature = "test-support"))]
 use super::sql::insert_safe_log;
@@ -9,7 +8,6 @@ use crate::{
     DaemonLogEntry, DaemonLogPage, LogCursor, LogEvent, LogPageMode, LogPageQuery, LogSeverity,
     LogSource, LogSubject,
 };
-#[cfg(any(test, feature = "test-support"))]
 use rusqlite::TransactionBehavior;
 use satelle_core::TurnId;
 use satelle_core::session::Session;

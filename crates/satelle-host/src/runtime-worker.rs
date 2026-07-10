@@ -1,7 +1,7 @@
 use super::RuntimeTurnOutcome;
-use super::adapter::{AdapterSubject, ExecuteRequest};
+use super::adapter::{AdapterSubject, ExecuteRequest, UpstreamReference};
 use super::{RuntimeEngine, model};
-use crate::storage::{RecoverySubject, StorageErrorKind};
+use crate::storage::{ObservedUpstreamRef, RecoverySubject, StorageErrorKind};
 use satelle_core::session::{ExpectedRevisions, Session, TurnTransition};
 use satelle_core::{SatelleError, SessionId, TurnId};
 use std::sync::Arc;
@@ -106,10 +106,13 @@ impl RuntimeEngine {
 
         // No runtime or SQLite mutex is held while the external adapter works.
         // The terminal storage compare-and-swap arbitrates with stop/recovery.
+        let persist_upstream_ref =
+            |reference| self.persist_upstream_ref(&plan.work.subject, reference);
         let result = self.adapter.execute(ExecuteRequest::new(
             &plan.host,
             &plan.prompt,
             AdapterSubject::new(&plan.work.subject),
+            &persist_upstream_ref,
         ))?;
         let transition = result.transition();
         if matches!(
@@ -136,6 +139,21 @@ impl RuntimeEngine {
         model::turn_outcome(&session, events)
     }
 
+    fn persist_upstream_ref(
+        &self,
+        subject: &RecoverySubject,
+        reference: UpstreamReference,
+    ) -> Result<(), SatelleError> {
+        let observed = match reference {
+            UpstreamReference::Thread(value) => ObservedUpstreamRef::thread(value),
+            UpstreamReference::Turn(value) => ObservedUpstreamRef::turn(value),
+        }
+        .map_err(model::storage_failure)?;
+        self.lock_storage()?
+            .record_upstream_ref(subject.session_id(), subject.turn_id(), &observed)
+            .map_err(model::storage_failure)
+    }
+
     fn commit_or_terminal_winner(
         &self,
         session_id: &SessionId,
@@ -145,7 +163,7 @@ impl RuntimeEngine {
         at: OffsetDateTime,
     ) -> Result<(Session, bool), SatelleError> {
         let mut storage = self.lock_storage()?;
-        match storage.commit_lifecycle(session_id, turn_id, expected, transition, None, at) {
+        match storage.commit_lifecycle(session_id, turn_id, expected, transition, at) {
             Ok(session) => {
                 self.publish_committed_turn(&session, turn_id);
                 Ok((session, true))
@@ -179,7 +197,6 @@ impl RuntimeEngine {
                 turn_id,
                 expected,
                 TurnTransition::Failed,
-                None,
                 model::monotonic_now(&session),
             ) {
                 Ok(session) => {

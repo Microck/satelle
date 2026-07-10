@@ -238,13 +238,24 @@ mod platform {
     const PROC_PIDTBSDINFO: c_int = 3;
 
     #[repr(C)]
-    #[derive(Default)]
     struct ProcBsdInfo {
         _flags_status_xstatus: [u32; 3],
         pid: u32,
         _ppid_through_nice: [u8; 104],
         start_seconds: u64,
         start_microseconds: u64,
+    }
+
+    impl Default for ProcBsdInfo {
+        fn default() -> Self {
+            Self {
+                _flags_status_xstatus: [0; 3],
+                pid: 0,
+                _ppid_through_nice: [0; 104],
+                start_seconds: 0,
+                start_microseconds: 0,
+            }
+        }
     }
 
     const _: () = assert!(size_of::<ProcBsdInfo>() == 136);

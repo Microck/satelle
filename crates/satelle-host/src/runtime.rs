@@ -295,7 +295,7 @@ impl RuntimeEngine {
                     .ok_or_else(|| SatelleError::session_not_found(&command.session_id))?;
                 let confirmed_at = time::OffsetDateTime::now_utc().max(current.updated_at());
                 let commit = storage
-                    .confirm_stop(claim, observation, None, confirmed_at)
+                    .confirm_stop(claim, observation, confirmed_at)
                     .map_err(model::storage_failure)?;
                 if matches!(
                     commit.outcome(),

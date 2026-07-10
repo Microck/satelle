@@ -20,7 +20,8 @@ use windows_sys::Win32::Security::{
     GetAce, GetLengthSid, GetSecurityDescriptorControl, GetSecurityDescriptorDacl,
     GetTokenInformation, IsValidAcl, IsValidSid, OBJECT_INHERIT_ACE, OWNER_SECURITY_INFORMATION,
     PROTECTED_DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID, SE_DACL_PROTECTED,
-    SECURITY_ATTRIBUTES, TOKEN_QUERY, TOKEN_USER, TokenUser,
+    SECURITY_ATTRIBUTES, TOKEN_INFORMATION_CLASS, TOKEN_OWNER, TOKEN_QUERY, TOKEN_USER, TokenOwner,
+    TokenUser,
 };
 use windows_sys::Win32::Storage::FileSystem::{
     BY_HANDLE_FILE_INFORMATION, CreateDirectoryW, CreateFileW, FILE_ALL_ACCESS,
@@ -29,6 +30,7 @@ use windows_sys::Win32::Storage::FileSystem::{
     FILE_GENERIC_READ, FILE_GENERIC_WRITE, FILE_READ_ATTRIBUTES, FILE_SHARE_READ, FILE_SHARE_WRITE,
     FileAttributeTagInfo, GetDriveTypeW, GetFileInformationByHandle, GetFileInformationByHandleEx,
     GetVolumeInformationByHandleW, OPEN_ALWAYS, OPEN_EXISTING, READ_CONTROL, ReOpenFile, WRITE_DAC,
+    WRITE_OWNER,
 };
 use windows_sys::Win32::System::SystemServices::{ACCESS_ALLOWED_ACE_TYPE, FILE_PERSISTENT_ACLS};
 use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
@@ -43,7 +45,7 @@ const MAX_SID_STRING_UNITS: usize = 1024;
 pub(super) struct SecureStateDirectory {
     root: PathBuf,
     _pinned_directories: Vec<OwnedHandle>,
-    process_sid: ProcessSid,
+    process_identity: ProcessIdentity,
 }
 
 impl SecureStateDirectory {
@@ -58,8 +60,9 @@ impl SecureStateDirectory {
             .ok_or_else(|| StorageError::new(StorageErrorKind::UnsafeStatePath))?;
         require_fixed_drive(drive_root)?;
 
-        let process_sid = ProcessSid::current()?;
-        let directory_descriptor = PrivateDescriptor::new(&process_sid, ObjectKind::Directory)?;
+        let process_identity = ProcessIdentity::current()?;
+        let directory_descriptor =
+            PrivateDescriptor::new(&process_identity.user, ObjectKind::Directory)?;
         let mut pinned_directories = Vec::with_capacity(prefixes.len());
 
         for (index, path) in prefixes.iter().enumerate() {
@@ -81,9 +84,9 @@ impl SecureStateDirectory {
 
             if is_state_root {
                 require_persistent_acls(&handle)?;
-                require_owner(&handle, &process_sid)?;
+                require_owner(&handle, &process_identity.user)?;
                 set_private_dacl(&handle, &directory_descriptor)?;
-                verify_private_security(&handle, &process_sid, ObjectKind::Directory)?;
+                verify_private_security(&handle, &process_identity.user, ObjectKind::Directory)?;
             }
             pinned_directories.push(handle);
         }
@@ -91,7 +94,7 @@ impl SecureStateDirectory {
         Ok(Self {
             root: state_root.to_path_buf(),
             _pinned_directories: pinned_directories,
-            process_sid,
+            process_identity,
         })
     }
 
@@ -112,7 +115,7 @@ impl SecureStateDirectory {
         }
 
         let path = self.root.join(file_name);
-        let descriptor = PrivateDescriptor::new(&self.process_sid, ObjectKind::File)?;
+        let descriptor = PrivateDescriptor::new(&self.process_identity.user, ObjectKind::File)?;
         let security_attributes = descriptor.security_attributes();
         let wide = wide_path(&path)?;
         let disposition = if create { OPEN_ALWAYS } else { OPEN_EXISTING };
@@ -121,7 +124,7 @@ impl SecureStateDirectory {
             // junction itself. Every decision below is made from that handle.
             CreateFileW(
                 wide.as_ptr(),
-                FILE_READ_ATTRIBUTES | READ_CONTROL | WRITE_DAC,
+                FILE_READ_ATTRIBUTES | READ_CONTROL | WRITE_DAC | WRITE_OWNER,
                 FILE_SHARE_READ | FILE_SHARE_WRITE,
                 &security_attributes,
                 disposition,
@@ -142,18 +145,24 @@ impl SecureStateDirectory {
         };
 
         require_regular_single_link(&security_handle)?;
-        require_owner(&security_handle, &self.process_sid)?;
-        set_private_dacl(&security_handle, &descriptor)?;
-        verify_private_security(&security_handle, &self.process_sid, ObjectKind::File)?;
+        require_initial_leaf_owner(&security_handle, &self.process_identity)?;
+        set_private_owner_and_dacl(&security_handle, &descriptor, &self.process_identity.user)?;
+        verify_private_security(
+            &security_handle,
+            &self.process_identity.user,
+            ObjectKind::File,
+        )?;
 
         let reopened = unsafe {
             // ReOpenFile is handle-relative, so there is no second pathname
-            // lookup between validation and obtaining the data handle.
+            // lookup between validation and obtaining the data handle. Its
+            // final argument accepts file flags, not CreateFile attributes;
+            // zero requests no additional flags.
             ReOpenFile(
                 raw_handle(&security_handle),
                 FILE_GENERIC_READ | FILE_GENERIC_WRITE | READ_CONTROL | WRITE_DAC,
                 FILE_SHARE_READ | FILE_SHARE_WRITE,
-                FILE_ATTRIBUTE_NORMAL,
+                0,
             )
         };
         if reopened == INVALID_HANDLE_VALUE {
@@ -190,12 +199,12 @@ impl ObjectKind {
     }
 }
 
-struct ProcessSid {
-    words: Box<[usize]>,
-    sddl: String,
+struct ProcessIdentity {
+    user: ProcessSid,
+    default_owner: ProcessSid,
 }
 
-impl ProcessSid {
+impl ProcessIdentity {
     fn current() -> Result<Self, StorageError> {
         let mut token = null_mut();
         let opened = unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) };
@@ -207,41 +216,44 @@ impl ProcessSid {
             OwnedHandle::from_raw_handle(token)
         };
 
-        let mut required = 0_u32;
-        unsafe {
-            GetTokenInformation(raw_handle(&token), TokenUser, null_mut(), 0, &mut required);
-        }
-        if required < size_of::<TOKEN_USER>() as u32 {
-            return Err(last_error(StorageErrorKind::StateDirectoryUnavailable));
-        }
-        let word_count = (required as usize).div_ceil(size_of::<usize>());
-        let mut token_words = vec![0_usize; word_count];
-        let loaded = unsafe {
-            GetTokenInformation(
-                raw_handle(&token),
-                TokenUser,
-                token_words.as_mut_ptr().cast(),
-                required,
-                &mut required,
-            )
-        };
-        if loaded == 0 {
-            return Err(last_error(StorageErrorKind::StateDirectoryUnavailable));
-        }
+        let user_information = token_information(&token, TokenUser, size_of::<TOKEN_USER>())?;
         let token_user = unsafe {
-            // The API populated an aligned buffer of at least TOKEN_USER bytes.
-            &*token_words.as_ptr().cast::<TOKEN_USER>()
+            // token_information returns an aligned buffer at least TOKEN_USER bytes long.
+            &*user_information.as_ptr().cast::<TOKEN_USER>()
         };
-        if token_user.User.Sid.is_null() || unsafe { IsValidSid(token_user.User.Sid) } == 0 {
+        let user = ProcessSid::copy_from(token_user.User.Sid)?;
+
+        let owner_information = token_information(&token, TokenOwner, size_of::<TOKEN_OWNER>())?;
+        let token_owner = unsafe {
+            // token_information returns an aligned buffer at least TOKEN_OWNER bytes long.
+            &*owner_information.as_ptr().cast::<TOKEN_OWNER>()
+        };
+        let default_owner = ProcessSid::copy_from(token_owner.Owner)?;
+
+        Ok(Self {
+            user,
+            default_owner,
+        })
+    }
+}
+
+struct ProcessSid {
+    words: Box<[usize]>,
+    sddl: String,
+}
+
+impl ProcessSid {
+    fn copy_from(sid: PSID) -> Result<Self, StorageError> {
+        if sid.is_null() || unsafe { IsValidSid(sid) } == 0 {
             return Err(StorageError::new(StorageErrorKind::UnsafeStatePath));
         }
-        let sid_bytes = unsafe { GetLengthSid(token_user.User.Sid) };
+        let sid_bytes = unsafe { GetLengthSid(sid) };
         if sid_bytes == 0 {
             return Err(last_error(StorageErrorKind::StateDirectoryUnavailable));
         }
         let mut words =
             vec![0_usize; (sid_bytes as usize).div_ceil(size_of::<usize>())].into_boxed_slice();
-        let copied = unsafe { CopySid(sid_bytes, words.as_mut_ptr().cast(), token_user.User.Sid) };
+        let copied = unsafe { CopySid(sid_bytes, words.as_mut_ptr().cast(), sid) };
         if copied == 0 {
             return Err(last_error(StorageErrorKind::StateDirectoryUnavailable));
         }
@@ -252,6 +264,42 @@ impl ProcessSid {
     fn as_psid(&self) -> PSID {
         self.words.as_ptr().cast_mut().cast()
     }
+}
+
+fn token_information(
+    token: &OwnedHandle,
+    information_class: TOKEN_INFORMATION_CLASS,
+    minimum_size: usize,
+) -> Result<Box<[usize]>, StorageError> {
+    let mut required = 0_u32;
+    unsafe {
+        GetTokenInformation(
+            raw_handle(token),
+            information_class,
+            null_mut(),
+            0,
+            &mut required,
+        );
+    }
+    if required < minimum_size as u32 {
+        return Err(last_error(StorageErrorKind::StateDirectoryUnavailable));
+    }
+    let buffer_bytes = required;
+    let word_count = (buffer_bytes as usize).div_ceil(size_of::<usize>());
+    let mut words = vec![0_usize; word_count].into_boxed_slice();
+    let loaded = unsafe {
+        GetTokenInformation(
+            raw_handle(token),
+            information_class,
+            words.as_mut_ptr().cast(),
+            buffer_bytes,
+            &mut required,
+        )
+    };
+    if loaded == 0 || required < minimum_size as u32 || required > buffer_bytes {
+        return Err(last_error(StorageErrorKind::StateDirectoryUnavailable));
+    }
+    Ok(words)
 }
 
 struct PrivateDescriptor(LocalMemory);
@@ -501,6 +549,20 @@ fn require_owner(handle: &OwnedHandle, process_sid: &ProcessSid) -> Result<(), S
     Ok(())
 }
 
+fn require_initial_leaf_owner(
+    handle: &OwnedHandle,
+    process_identity: &ProcessIdentity,
+) -> Result<(), StorageError> {
+    let security = read_security(handle, OWNER_SECURITY_INFORMATION)?;
+    if security.owner.is_null()
+        || (unsafe { EqualSid(security.owner, process_identity.user.as_psid()) } == 0
+            && unsafe { EqualSid(security.owner, process_identity.default_owner.as_psid()) } == 0)
+    {
+        return Err(StorageError::new(StorageErrorKind::UnsafeStatePath));
+    }
+    Ok(())
+}
+
 fn set_private_dacl(
     handle: &OwnedHandle,
     descriptor: &PrivateDescriptor,
@@ -512,6 +574,31 @@ fn set_private_dacl(
             SE_FILE_OBJECT,
             DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
             null_mut(),
+            null_mut(),
+            dacl,
+            null(),
+        )
+    };
+    if status != ERROR_SUCCESS {
+        return Err(win32_error(StorageErrorKind::UnsafeStatePath, status));
+    }
+    Ok(())
+}
+
+fn set_private_owner_and_dacl(
+    handle: &OwnedHandle,
+    descriptor: &PrivateDescriptor,
+    process_sid: &ProcessSid,
+) -> Result<(), StorageError> {
+    let dacl = descriptor.dacl()?;
+    let status = unsafe {
+        SetSecurityInfo(
+            raw_handle(handle),
+            SE_FILE_OBJECT,
+            OWNER_SECURITY_INFORMATION
+                | DACL_SECURITY_INFORMATION
+                | PROTECTED_DACL_SECURITY_INFORMATION,
+            process_sid.as_psid(),
             null_mut(),
             dacl,
             null(),
@@ -663,4 +750,44 @@ fn last_error(kind: StorageErrorKind) -> StorageError {
 
 fn win32_error(kind: StorageErrorKind, code: u32) -> StorageError {
     StorageError::with_source(kind, io::Error::from_raw_os_error(code as i32))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn open_test_leaf(state: &SecureStateDirectory, file_name: &str, create: bool) -> File {
+        match state.open_private_leaf(file_name, create, StorageErrorKind::OpenFailed) {
+            Ok(Some(file)) => file,
+            Ok(None) => panic!("the test leaf should exist"),
+            Err(error) => panic!(
+                "secure leaf open failed: {error}; source={:?}",
+                std::error::Error::source(&error).map(ToString::to_string)
+            ),
+        }
+    }
+
+    #[test]
+    fn token_default_owner_leaf_is_canonicalized_to_process_user() {
+        let temporary_parent = tempfile::tempdir().expect("create temporary parent");
+        let state_root = temporary_parent.path().join("state");
+        let state = SecureStateDirectory::prepare(&state_root).expect("prepare state root");
+        std::fs::write(state_root.join("owner-probe.sqlite3"), b"owner probe")
+            .expect("create a leaf with the token's default owner");
+
+        let file = open_test_leaf(&state, "owner-probe.sqlite3", false);
+        file.try_lock()
+            .expect("the canonical data handle should support ownership locking");
+    }
+
+    #[test]
+    fn newly_created_private_leaf_supports_ownership_locking() {
+        let temporary_parent = tempfile::tempdir().expect("create temporary parent");
+        let state_root = temporary_parent.path().join("state");
+        let state = SecureStateDirectory::prepare(&state_root).expect("prepare state root");
+
+        let file = open_test_leaf(&state, "satelle.sqlite3.lock", true);
+        file.try_lock()
+            .expect("the newly created data handle should support ownership locking");
+    }
 }

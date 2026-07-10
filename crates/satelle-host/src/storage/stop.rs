@@ -3,12 +3,12 @@ use super::logs::canonical_log;
 use super::sql::{
     complete_stop_idempotency, ensure_control_lease_absent, ensure_control_lease_present,
     ensure_record_handles, insert_idempotency, insert_safe_log, load_recovery_subject,
-    matching_idempotency, merge_observed_references, persist_lifecycle_mutation, require_operation,
-    synchronize_control_lease, update_turn_idempotency,
+    matching_idempotency, persist_lifecycle_mutation, require_operation, synchronize_control_lease,
+    update_turn_idempotency,
 };
 use super::{
-    IdempotencyInput, IdempotentOperation, LogEvent, LogSeverity, ObservedUpstreamRefs,
-    RecoverySubject, Storage, StorageError, StorageErrorKind, sqlite_error,
+    IdempotencyInput, IdempotentOperation, LogEvent, LogSeverity, RecoverySubject, Storage,
+    StorageError, StorageErrorKind, sqlite_error,
 };
 use rusqlite::TransactionBehavior;
 use satelle_core::session::{
@@ -237,7 +237,6 @@ impl Storage {
         &mut self,
         claim: StopClaim,
         observation: StopObservation,
-        observed_refs: Option<&ObservedUpstreamRefs>,
         at: OffsetDateTime,
     ) -> Result<StopCommit, StorageError> {
         let session_id = claim.recovery_subject.session_id.clone();
@@ -290,9 +289,6 @@ impl Storage {
         if changed {
             persist_lifecycle_mutation(&transaction, &session, &turn_id, expected)?;
             update_turn_idempotency(&transaction, &session, &turn_id, at)?;
-        }
-        if let Some(observed_refs) = observed_refs {
-            merge_observed_references(&transaction, &session_id, &turn_id, observed_refs)?;
         }
         if matches!(outcome, StopCommitOutcome::AlreadyTerminal(_)) {
             ensure_control_lease_absent(&transaction, &session_id, &turn_id)?;

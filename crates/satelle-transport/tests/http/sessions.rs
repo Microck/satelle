@@ -321,7 +321,7 @@ async fn stop_idempotency_digest_binds_the_path_session_target() {
 
 #[tokio::test]
 async fn replay_and_session_read_survive_a_real_daemon_restart() {
-    let state = tempfile::tempdir().expect("temporary state directory");
+    let state = TestStateDir::new().expect("temporary state directory");
     let first_service =
         HostService::local_demo_for_tests_at(state.path()).expect("construct first Host service");
     let initialized = first_service

@@ -3,7 +3,7 @@ use super::{ApiFailure, DaemonState, api_error_response};
 use crate::contract::{ApiErrorCategory, ApiErrorCode, ApiRequestContract};
 use axum::body::to_bytes;
 use axum::extract::{FromRequest, Request};
-use axum::http::header::{CONTENT_LENGTH, CONTENT_TYPE};
+use axum::http::header::CONTENT_TYPE;
 use axum::response::Response;
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
@@ -42,15 +42,9 @@ where
             ));
         }
         let limit = state.limits.json_body_bytes();
-        if request
-            .headers()
-            .get(CONTENT_LENGTH)
-            .and_then(|value| value.to_str().ok())
-            .and_then(|value| value.parse::<usize>().ok())
-            .is_some_and(|length| length > limit)
-        {
-            return Err(payload_too_large(state, &authorized));
-        }
+        // Always let the bounded reader consume through the limit. Rejecting
+        // from Content-Length alone can reset an in-flight Windows upload
+        // before the client receives Satelle's typed 413 response.
         let body = match to_bytes(request.into_body(), limit).await {
             Ok(body) => body,
             Err(error)

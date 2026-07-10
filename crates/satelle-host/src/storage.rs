@@ -16,12 +16,14 @@ pub(crate) use self::logs::LogPageStorageError;
 use self::logs::canonical_log;
 pub(crate) use self::logs::{SafeLogRecord, StoredLogRecord};
 #[cfg(test)]
-use self::open::{DATABASE_FILE_NAME, LOCK_FILE_NAME};
+use self::open::DATABASE_FILE_NAME;
+#[cfg(all(test, unix))]
+use self::open::LOCK_FILE_NAME;
 use self::open::{PROTECTED_FILE_NAMES, sqlite_error};
 use self::sql::{
     StoredIdempotency, ensure_control_lease_available, ensure_no_pending_stop,
     insert_control_lease, insert_idempotency, insert_initial_session, insert_safe_log, insert_turn,
-    load_recovery_subject, matching_idempotency, merge_observed_references,
+    load_recovery_subject, matching_idempotency, merge_observed_reference,
     persist_lifecycle_mutation, require_operation, synchronize_control_lease, update_session_row,
     update_turn_idempotency, validate_initial_session,
 };
@@ -38,7 +40,40 @@ use std::error::Error;
 use std::fmt;
 use std::fs::File;
 use std::path::Path;
+#[cfg(any(test, feature = "test-support"))]
+use std::path::PathBuf;
 use time::OffsetDateTime;
+
+/// Owns a temporary state directory whose path and permissions satisfy the
+/// same platform security rules as production state.
+#[cfg(any(test, feature = "test-support"))]
+pub struct TestStateDir {
+    _temporary_parent: tempfile::TempDir,
+    path: PathBuf,
+}
+
+#[cfg(any(test, feature = "test-support"))]
+impl TestStateDir {
+    pub fn new() -> std::io::Result<Self> {
+        let temporary_parent = tempfile::tempdir()?;
+        #[cfg(windows)]
+        let path = temporary_parent.path().join("state");
+        #[cfg(target_os = "macos")]
+        let path = std::fs::canonicalize(temporary_parent.path())?;
+        #[cfg(not(any(target_os = "macos", windows)))]
+        let path = temporary_parent.path().to_path_buf();
+        #[cfg(windows)]
+        drop(open::prepare_state_root(&path).map_err(std::io::Error::other)?);
+        Ok(Self {
+            _temporary_parent: temporary_parent,
+            path,
+        })
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum StorageErrorKind {
@@ -287,22 +322,18 @@ impl AdmissionContext {
     }
 }
 
-#[derive(Clone, Default)]
-pub(crate) struct ObservedUpstreamRefs {
-    thread_ref: Option<PrivateUpstreamRef>,
-    turn_ref: Option<PrivateUpstreamRef>,
+pub(crate) enum ObservedUpstreamRef {
+    Thread(PrivateUpstreamRef),
+    Turn(PrivateUpstreamRef),
 }
 
-impl ObservedUpstreamRefs {
-    #[cfg(test)]
-    pub(crate) fn new(
-        thread_ref: Option<PrivateUpstreamRef>,
-        turn_ref: Option<PrivateUpstreamRef>,
-    ) -> Self {
-        Self {
-            thread_ref,
-            turn_ref,
-        }
+impl ObservedUpstreamRef {
+    pub(crate) fn thread(value: impl Into<String>) -> Result<Self, StorageError> {
+        Ok(Self::Thread(PrivateUpstreamRef::new(value)?))
+    }
+
+    pub(crate) fn turn(value: impl Into<String>) -> Result<Self, StorageError> {
+        Ok(Self::Turn(PrivateUpstreamRef::new(value)?))
     }
 }
 
@@ -767,7 +798,6 @@ impl Storage {
         turn_id: &TurnId,
         expected: ExpectedRevisions,
         transition: TurnTransition,
-        observed_refs: Option<&ObservedUpstreamRefs>,
         at: OffsetDateTime,
     ) -> Result<Session, StorageError> {
         let transaction = self
@@ -788,9 +818,6 @@ impl Storage {
             .transition_turn(turn_id, expected, transition, at)
             .map_err(StorageError::from)?;
         persist_lifecycle_mutation(&transaction, &session, turn_id, expected)?;
-        if let Some(observed_refs) = observed_refs {
-            merge_observed_references(&transaction, session_id, turn_id, observed_refs)?;
-        }
         synchronize_control_lease(&transaction, &session, turn_id)?;
         update_turn_idempotency(&transaction, &session, turn_id, at)?;
         insert_safe_log(
@@ -807,6 +834,26 @@ impl Storage {
             .commit()
             .map_err(|source| sqlite_error(StorageErrorKind::OperationFailed, source))?;
         Ok(session)
+    }
+
+    /// Persists private upstream identity as soon as the adapter observes it.
+    /// This transaction deliberately does not mutate lifecycle revisions,
+    /// idempotency outcomes, logs, or lease ownership.
+    pub(crate) fn record_upstream_ref(
+        &mut self,
+        session_id: &SessionId,
+        turn_id: &TurnId,
+        observed_ref: &ObservedUpstreamRef,
+    ) -> Result<(), StorageError> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|source| sqlite_error(StorageErrorKind::OperationFailed, source))?;
+        merge_observed_reference(&transaction, session_id, turn_id, observed_ref)?;
+        transaction
+            .commit()
+            .map_err(|source| sqlite_error(StorageErrorKind::OperationFailed, source))?;
+        Ok(())
     }
 
     pub(crate) fn load_session(

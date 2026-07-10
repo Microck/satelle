@@ -23,10 +23,16 @@ fn normal_rows_and_database_bytes_exclude_prompt_and_upstream_canaries() {
             &turn_id(TURN_1),
             revisions(&session, TURN_1),
             TurnTransition::Running,
-            Some(&observed_refs(UPSTREAM_THREAD, UPSTREAM_TURN)),
             at(1),
         )
         .unwrap();
+    record_upstream_refs(
+        &mut storage,
+        session.id(),
+        &turn_id(TURN_1),
+        UPSTREAM_THREAD,
+        UPSTREAM_TURN,
+    );
     let cursor = storage
         .append_safe_log(
             &SafeLogRecord::new(
@@ -366,10 +372,23 @@ fn state_directory_database_and_lock_are_owner_private() {
             fs::metadata(path).unwrap().permissions().mode() & 0o777
         );
     }
+    #[cfg(target_os = "linux")]
     assert!(
         !state.path().join("satelle.sqlite3-shm").exists(),
         "unix-excl must not create a shared-memory sidecar"
     );
+    #[cfg(target_os = "macos")]
+    {
+        let shared_memory = state.path().join("satelle.sqlite3-shm");
+        assert!(
+            shared_memory.exists(),
+            "the macOS SQLite VFS should create its shared-memory sidecar"
+        );
+        assert_eq!(
+            0o600,
+            fs::metadata(shared_memory).unwrap().permissions().mode() & 0o777
+        );
+    }
 }
 
 #[test]
@@ -532,15 +551,14 @@ fn windows_reparse_state_root_is_rejected_without_touching_its_target() {
 fn windows_reparse_protected_leaves_are_rejected_before_sqlite_opens() {
     for protected_name in PROTECTED_FILE_NAMES {
         let fixture = TempDir::new().expect("temporary fixture directory");
-        let state = fixture.path().join("state");
-        fs::create_dir(&state).unwrap();
-        let target = fixture.path().join("junction-target");
+        let state = fixture.path();
+        let target = state.join("junction-target");
         fs::create_dir(&target).unwrap();
         let canary = target.join("canary.txt");
         fs::write(&canary, b"protected-leaf-canary").unwrap();
         create_windows_junction(&state.join(protected_name), &target);
 
-        let error = match Storage::open(&state) {
+        let error = match Storage::open(state) {
             Ok(_) => panic!("protected reparse point {protected_name} must be rejected"),
             Err(error) => error,
         };
@@ -558,13 +576,12 @@ fn windows_reparse_protected_leaves_are_rejected_before_sqlite_opens() {
 fn windows_hard_linked_protected_leaves_are_rejected() {
     for protected_name in PROTECTED_FILE_NAMES {
         let fixture = TempDir::new().expect("temporary fixture directory");
-        let state = fixture.path().join("state");
-        fs::create_dir(&state).unwrap();
-        let target = fixture.path().join("hard-link-target");
+        let state = fixture.path();
+        let target = state.join("hard-link-target");
         fs::write(&target, b"hard-link-canary").unwrap();
         fs::hard_link(&target, state.join(protected_name)).unwrap();
 
-        let error = match Storage::open(&state) {
+        let error = match Storage::open(state) {
             Ok(_) => panic!("protected hard link {protected_name} must be rejected"),
             Err(error) => error,
         };

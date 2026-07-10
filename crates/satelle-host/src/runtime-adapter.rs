@@ -98,14 +98,21 @@ pub struct ExecuteRequest<'a> {
     host: &'a str,
     prompt: &'a str,
     subject: AdapterSubject<'a>,
+    persist_upstream_ref: &'a dyn Fn(UpstreamReference) -> Result<(), SatelleError>,
 }
 
 impl<'a> ExecuteRequest<'a> {
-    pub(super) const fn new(host: &'a str, prompt: &'a str, subject: AdapterSubject<'a>) -> Self {
+    pub(super) const fn new(
+        host: &'a str,
+        prompt: &'a str,
+        subject: AdapterSubject<'a>,
+        persist_upstream_ref: &'a dyn Fn(UpstreamReference) -> Result<(), SatelleError>,
+    ) -> Self {
         Self {
             host,
             prompt,
             subject,
+            persist_upstream_ref,
         }
     }
 
@@ -120,6 +127,23 @@ impl<'a> ExecuteRequest<'a> {
     pub const fn subject(&self) -> AdapterSubject<'a> {
         self.subject
     }
+
+    /// Commits the Codex thread identity before the adapter waits for any
+    /// later response or notification that depends on it.
+    pub fn persist_upstream_thread_ref(&self, value: &str) -> Result<(), SatelleError> {
+        (self.persist_upstream_ref)(UpstreamReference::Thread(value.to_string()))
+    }
+
+    /// Commits the Codex Turn identity before the adapter waits for terminal
+    /// completion, cancellation, or recovery evidence.
+    pub fn persist_upstream_turn_ref(&self, value: &str) -> Result<(), SatelleError> {
+        (self.persist_upstream_ref)(UpstreamReference::Turn(value.to_string()))
+    }
+}
+
+pub(super) enum UpstreamReference {
+    Thread(String),
+    Turn(String),
 }
 
 pub struct ExecuteResult {

@@ -253,7 +253,7 @@ impl HostService {
     pub fn daemon_runtime_capabilities(&self) -> DaemonRuntimeCapabilities {
         match &self.mode {
             HostMode::Production { snapshot } => production_capabilities(snapshot),
-            #[cfg(feature = "test-support")]
+            #[cfg(any(test, feature = "test-support"))]
             HostMode::TestFake => DaemonRuntimeCapabilities {
                 codex_runtime: false,
                 native_computer_use: false,
@@ -479,7 +479,7 @@ mod tests {
 
     #[test]
     fn daemon_initialization_and_authentication_share_one_runtime_owner() {
-        let state = tempfile::tempdir().expect("temporary state directory");
+        let state = crate::TestStateDir::new().expect("temporary state directory");
         let service = HostService::local_demo_for_tests_at(state.path())
             .expect("construct deterministic service");
         let clone = service.clone();
@@ -512,7 +512,7 @@ mod tests {
 
     #[test]
     fn authenticated_run_uses_payload_hmac_and_replays_one_durable_session() {
-        let state = tempfile::tempdir().expect("temporary state directory");
+        let state = crate::TestStateDir::new().expect("temporary state directory");
         let service = HostService::local_demo_for_tests_at(state.path())
             .expect("construct deterministic service");
         service.initialize_daemon().expect("initialize daemon");
@@ -578,7 +578,7 @@ mod tests {
 
     #[test]
     fn daemon_live_events_follow_commits_and_idempotent_replay_emits_nothing() {
-        let state = tempfile::tempdir().expect("temporary state directory");
+        let state = crate::TestStateDir::new().expect("temporary state directory");
         let service = HostService::local_demo_for_tests_at(state.path())
             .expect("construct deterministic service");
         service.initialize_daemon().expect("initialize daemon");

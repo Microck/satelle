@@ -33,7 +33,6 @@ impl RuntimeEngine {
                     subject.turn_id(),
                     expected,
                     TurnTransition::RecoveryPending,
-                    None,
                     model::monotonic_now(&session),
                 ) {
                     Ok(recovering) => {
@@ -98,7 +97,6 @@ impl RuntimeEngine {
                         subject.turn_id(),
                         subject.expected_revisions(),
                         transition,
-                        None,
                         observed_at,
                     )
                     .map_err(model::storage_failure)?;
