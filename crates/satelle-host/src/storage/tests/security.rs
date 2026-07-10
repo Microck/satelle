@@ -223,8 +223,9 @@ fn sqlite_nofollow_keeps_proc_fd_directory_anchor_after_rename() {
     fs::create_dir(&original).unwrap();
 
     let descriptor_path = format!(
-        "/proc/self/fd/{}/sqlite-anchor-proof.sqlite3",
-        directory.as_raw_fd()
+        "/proc/self/fd/{}/{}",
+        directory.as_raw_fd(),
+        DATABASE_FILE_NAME,
     );
     let flags = rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE
         | rusqlite::OpenFlags::SQLITE_OPEN_CREATE
@@ -246,11 +247,11 @@ fn sqlite_nofollow_keeps_proc_fd_directory_anchor_after_rename() {
         .unwrap();
     drop(connection);
 
-    assert!(anchored.join("sqlite-anchor-proof.sqlite3").exists());
-    assert!(!original.join("sqlite-anchor-proof.sqlite3").exists());
+    assert!(anchored.join(DATABASE_FILE_NAME).exists());
+    assert!(!original.join(DATABASE_FILE_NAME).exists());
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
 fn ownership_lock_and_sqlite_files_share_the_pinned_directory_after_replacement() {
     use std::os::unix::fs::PermissionsExt;
@@ -277,7 +278,10 @@ fn ownership_lock_and_sqlite_files_share_the_pinned_directory_after_replacement(
     let sqlite_filename: String = connection
         .query_row("PRAGMA database_list", [], |row| row.get(2))
         .unwrap();
+    #[cfg(target_os = "linux")]
     assert!(sqlite_filename.starts_with("/proc/self/fd/"));
+    #[cfg(target_os = "macos")]
+    assert!(sqlite_filename.starts_with("/.satelle-fd/"));
     assert!(anchored.join(LOCK_FILE_NAME).exists());
     assert!(anchored.join(DATABASE_FILE_NAME).exists());
     assert!(anchored.join("satelle.sqlite3-wal").exists());
@@ -372,23 +376,11 @@ fn state_directory_database_and_lock_are_owner_private() {
             fs::metadata(path).unwrap().permissions().mode() & 0o777
         );
     }
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     assert!(
         !state.path().join("satelle.sqlite3-shm").exists(),
         "unix-excl must not create a shared-memory sidecar"
     );
-    #[cfg(target_os = "macos")]
-    {
-        let shared_memory = state.path().join("satelle.sqlite3-shm");
-        assert!(
-            shared_memory.exists(),
-            "the macOS SQLite VFS should create its shared-memory sidecar"
-        );
-        assert_eq!(
-            0o600,
-            fs::metadata(shared_memory).unwrap().permissions().mode() & 0o777
-        );
-    }
 }
 
 #[test]

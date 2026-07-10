@@ -5,18 +5,25 @@ use std::fmt;
 use std::ptr;
 use std::sync::OnceLock;
 
+#[cfg(target_os = "macos")]
+mod macos;
+#[cfg(target_os = "macos")]
+pub(super) use macos::{DirectoryRegistration, register_directory};
+
 const VFS_NAME: &CStr = c"satelle-unix-excl";
 const DELEGATE_NAME: &CStr = c"unix-excl";
+#[cfg(target_os = "linux")]
 const PINNED_PATH_PREFIX: &[u8] = b"/proc/self/fd/";
 
 static REGISTRATION: OnceLock<Result<(), RegistrationFailure>> = OnceLock::new();
 
 /// Registers the descriptor-anchored VFS once and returns its stable name.
 ///
-/// The caller must supply SQLite with a validated path shaped like
-/// `/proc/self/fd/<directory-fd>/<leaf>`. The custom `xFullPathname` keeps
-/// that path intact instead of resolving the procfs descriptor symlink back
-/// to a replaceable pathname.
+/// The caller must supply SQLite with a validated directory descriptor and
+/// leaf. Linux uses `/proc/self/fd/<directory-fd>/<leaf>`. macOS uses an
+/// internal `/.satelle-fd/<directory-fd>/<leaf>` name whose VFS callbacks
+/// resolve the leaf with `openat`. The custom `xFullPathname` preserves the
+/// anchor instead of resolving it to a replaceable path.
 pub(super) fn name() -> Result<&'static CStr, StorageError> {
     match REGISTRATION.get_or_init(register) {
         Ok(()) => Ok(VFS_NAME),
@@ -189,6 +196,7 @@ fn validate_delegate(delegate: &ffi::sqlite3_vfs) -> Result<(), RegistrationFail
     Ok(())
 }
 
+#[cfg(target_os = "linux")]
 fn is_pinned_path(path: &[u8]) -> bool {
     let Some(relative) = path.strip_prefix(PINNED_PATH_PREFIX) else {
         return false;
@@ -198,12 +206,18 @@ fn is_pinned_path(path: &[u8]) -> bool {
     };
     let descriptor = &relative[..separator];
     let leaf = &relative[separator + 1..];
-    !descriptor.is_empty()
-        && descriptor.iter().all(u8::is_ascii_digit)
-        && !leaf.is_empty()
-        && leaf != b"."
-        && leaf != b".."
-        && !leaf.contains(&b'/')
+    !descriptor.is_empty() && descriptor.iter().all(u8::is_ascii_digit) && is_protected_leaf(leaf)
+}
+
+fn is_protected_leaf(leaf: &[u8]) -> bool {
+    super::PROTECTED_FILE_NAMES
+        .iter()
+        .any(|file_name| file_name.as_bytes() == leaf)
+}
+
+#[cfg(target_os = "macos")]
+fn is_pinned_path(path: &[u8]) -> bool {
+    macos::is_pinned_path(path)
 }
 
 unsafe fn delegate_from(wrapper: *mut ffi::sqlite3_vfs) -> Option<*mut ffi::sqlite3_vfs> {
@@ -223,6 +237,12 @@ unsafe extern "C" fn forward_open(
     flags: c_int,
     output_flags: *mut c_int,
 ) -> c_int {
+    if file.is_null() {
+        return ffi::SQLITE_IOERR;
+    }
+    // SQLite requires pMethods to be null whenever xOpen reports an error.
+    // Initialize it before any wrapper-specific validation can fail.
+    unsafe { (*file).pMethods = ptr::null() };
     // Passing the actual unix-excl VFS pointer is essential: unixOpen checks
     // that pointer's zName before enabling UNIXFILE_EXCL and heap WAL-index
     // behavior.
@@ -233,6 +253,14 @@ unsafe extern "C" fn forward_open(
     let Some(callback) = (unsafe { (*delegate).xOpen }) else {
         return ffi::SQLITE_IOERR;
     };
+    #[cfg(target_os = "macos")]
+    // SAFETY: macos validates the callback inputs before handling only its
+    // internal pinned-path namespace.
+    if let Some(code) =
+        unsafe { macos::open_pinned(delegate, callback, name, file, flags, output_flags) }
+    {
+        return code;
+    }
     // SAFETY: SQLite supplied the remaining arguments according to xOpen's
     // callback contract; the delegate callback receives its own VFS pointer.
     unsafe { callback(delegate, name, file, flags, output_flags) }
@@ -243,6 +271,11 @@ unsafe extern "C" fn forward_delete(
     name: *const c_char,
     sync_directory: c_int,
 ) -> c_int {
+    #[cfg(target_os = "macos")]
+    // SAFETY: macos validates the callback filename before resolving it.
+    if let Some(code) = unsafe { macos::delete_pinned(name, sync_directory) } {
+        return code;
+    }
     let Some(delegate) = (unsafe { delegate_from(wrapper) }) else {
         return ffi::SQLITE_IOERR;
     };
@@ -260,6 +293,11 @@ unsafe extern "C" fn forward_access(
     flags: c_int,
     output: *mut c_int,
 ) -> c_int {
+    #[cfg(target_os = "macos")]
+    // SAFETY: macos validates the callback filename and output pointer.
+    if let Some(code) = unsafe { macos::access_pinned(name, flags, output) } {
+        return code;
+    }
     let Some(delegate) = (unsafe { delegate_from(wrapper) }) else {
         return ffi::SQLITE_IOERR;
     };
@@ -492,4 +530,25 @@ unsafe extern "C" fn forward_next_system_call(
     };
     // SAFETY: SQLite supplied a valid xNextSystemCall argument set.
     unsafe { callback(delegate, name) }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::ptr::NonNull;
+
+    #[test]
+    fn failed_open_clears_methods() {
+        let mut file = ffi::sqlite3_file {
+            pMethods: NonNull::<ffi::sqlite3_io_methods>::dangling().as_ptr(),
+        };
+
+        // SAFETY: This intentionally supplies a missing wrapper VFS to drive
+        // the error path while providing writable sqlite3_file storage.
+        let code =
+            unsafe { forward_open(ptr::null_mut(), ptr::null(), &mut file, 0, ptr::null_mut()) };
+
+        assert_eq!(ffi::SQLITE_IOERR, code);
+        assert!(file.pMethods.is_null());
+    }
 }
