@@ -78,6 +78,7 @@ impl Command {
     // that a descendant does not support.
     pub(super) fn output_request(&self) -> (OutputArgs, EventOutput) {
         match self {
+            Self::Completions(_) => (OutputArgs::default(), EventOutput::None),
             Self::Setup(command) => (command.output_args, EventOutput::None),
             Self::Repair(command) => (command.output_args, EventOutput::None),
             Self::Doctor(command) => (

@@ -95,8 +95,9 @@
 - satelle interactive setup uses the Rust cliclack crate for setup intro and outro prompt framing @implemented @mvp
 
 ## completions
-- satelle exposes shell completion generation for bash, zsh, fish, and PowerShell @spec @mvp
+- satelle exposes shell completion generation for bash, zsh, fish, and PowerShell @spec @mvp @implemented
 - satelle shell completion installation supports explicit output directories and shell auto-detection without modifying shell profiles unless the user explicitly requests profile changes @spec @mvp
+- satelle completions <bash|zsh|fish|powershell> writes the selected shell completion script to stdout, exits 0, and does not initialize Host, config, or state paths @spec @contract @mvp @implemented
 
 ## profiles-and-output
 - satelle supports a global --profile option that applies selected user-level configuration profile overlays rather than only reporting the selected profile name @spec @mvp
