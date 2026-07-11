@@ -1,6 +1,8 @@
+mod completions;
 mod output;
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
+use completions::{CompletionsCommand, generate_completions};
 use output::{OutputArgs, OutputFormat, SessionResultSchemaVersion, StatusReport};
 use satelle_core::{
     BEACON_CORAL, CLI_NAME, DaemonPathOverrides, DoctorEventRecord, DoctorReport, ERROR_RED,
@@ -43,6 +45,7 @@ struct Cli {
 
 #[derive(Subcommand, Debug)]
 enum Command {
+    Completions(CompletionsCommand),
     Setup(SetupCommand),
     Repair(RepairCommand),
     Doctor(DoctorCommand),
@@ -608,6 +611,9 @@ fn try_main() -> Result<(), CliFailure> {
     let human_style = HumanStyle::detect(cli.no_color);
 
     match cli.command {
+        Command::Completions(command) => {
+            generate_completions(command).map_err(|error| failure(error, false))
+        }
         Command::Setup(command) => {
             let transport = local_transport(output)?;
             run_setup(command, &transport, human_style, output)

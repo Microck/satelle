@@ -267,6 +267,76 @@ fn help_prints_satelle_and_not_old_name() {
 }
 
 #[test]
+fn completions_generate_scripts_for_every_supported_shell_without_initializing_state() {
+    for (shell, marker) in [
+        ("bash", "_satelle"),
+        ("zsh", "#compdef satelle"),
+        ("fish", "complete -c satelle"),
+        (
+            "powershell",
+            "Register-ArgumentCompleter -Native -CommandName 'satelle'",
+        ),
+    ] {
+        let home = state_dir();
+        let untouched_home = home.path().join(format!("completion-{shell}-home"));
+        let output = production_satelle()
+            .env("SATELLE_HOME", &untouched_home)
+            .args(["completions", shell])
+            .assert()
+            .success()
+            .stderr(predicate::str::is_empty())
+            .get_output()
+            .clone();
+        let stdout = String::from_utf8(output.stdout).expect("completion script should be UTF-8");
+
+        assert!(stdout.contains(marker), "{shell} output omitted {marker:?}");
+        assert!(stdout.contains("setup"), "{shell} output omitted setup");
+        assert!(stdout.contains("run"), "{shell} output omitted run");
+        assert!(
+            !untouched_home.exists(),
+            "{shell} initialized Satelle state"
+        );
+    }
+}
+
+#[test]
+fn completions_reject_unsupported_shells_at_the_cli_boundary() {
+    production_satelle()
+        .args(["completions", "nushell"])
+        .assert()
+        .code(2)
+        .stdout(predicate::str::is_empty())
+        .stderr(
+            predicate::str::contains("invalid value 'nushell'")
+                .and(predicate::str::contains("powershell")),
+        );
+}
+
+#[cfg(unix)]
+#[test]
+fn completions_exit_cleanly_when_stdout_pipe_closes_early() {
+    for shell in ["bash", "zsh", "fish", "powershell"] {
+        let status = std::process::Command::new("bash")
+            .args([
+                "-o",
+                "pipefail",
+                "-c",
+                "\"$1\" completions \"$2\" | true",
+                "satelle-completions-test",
+            ])
+            .arg(assert_cmd::cargo::cargo_bin!("satelle"))
+            .arg(shell)
+            .status()
+            .expect("completion pipeline should start");
+
+        assert!(
+            status.success(),
+            "satelle should treat a {shell} completion reader closing the pipe as success"
+        );
+    }
+}
+
+#[test]
 fn version_is_exact_and_does_not_initialize_host_state() {
     let home = state_dir();
     let untouched_home = home.path().join("untouched-satelle-home");

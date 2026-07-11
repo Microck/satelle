@@ -10,6 +10,7 @@ test-support = ["satelle-core/test-support", "satelle-host/test-support"]
 
 [dependencies]
 clap.workspace = true
+clap_complete.workspace = true
 cliclack.workspace = true
 satelle-core = { path = "../satelle-core" }
 satelle-host = { path = "../satelle-host" }

@@ -16,6 +16,7 @@ license = "MIT"
 base64 = "0.22.1"
 axum = { version = "0.8.9", default-features = false, features = ["http1", "json", "query", "tokio", "ws"] }
 clap = { version = "4.5.52", features = ["derive", "env"] }
+clap_complete = "4.6.7"
 cliclack = "0.5.4"
 directories = "6.0.0"
 futures-util = { version = "0.3.32", default-features = false, features = ["sink", "std"] }
