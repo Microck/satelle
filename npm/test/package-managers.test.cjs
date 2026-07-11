@@ -167,7 +167,7 @@ test("npm, pnpm, and Bun install and execute the unscoped forwarding package", (
       version: "1.0.0",
       private: true,
       dependencies: {
-        satelle: pathToFileURL(unscopedArtifact).href,
+        satelle: `file:${path.relative(consumerRoot, unscopedArtifact).split(path.sep).join("/")}`,
       },
     });
 
