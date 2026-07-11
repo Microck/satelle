@@ -1,0 +1,37 @@
+{
+  "name": "@microck/satelle",
+  "version": "0.1.0",
+  "description": "Install the Satelle native CLI with npm, pnpm, or Bun.",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Microck/satelle.git",
+    "directory": "npm/satelle"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "bin": {
+    "satelle": "bin/satelle.cjs"
+  },
+  "exports": {
+    "./launcher": "./bin/satelle.cjs"
+  },
+  "files": [
+    "bin/satelle.cjs",
+    "lib/launcher.cjs",
+    "platforms.json"
+  ],
+  "optionalDependencies": {
+    "@microck/satelle-linux-arm64-gnu": "0.1.0",
+    "@microck/satelle-linux-x64-gnu": "0.1.0",
+    "@microck/satelle-darwin-arm64": "0.1.0",
+    "@microck/satelle-darwin-x64": "0.1.0",
+    "@microck/satelle-win32-arm64-msvc": "0.1.0",
+    "@microck/satelle-win32-x64-msvc": "0.1.0"
+  },
+  "publishConfig": {
+    "access": "public",
+    "provenance": true
+  }
+}

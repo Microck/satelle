@@ -1,0 +1,27 @@
+{
+  "name": "satelle",
+  "version": "0.1.0",
+  "description": "Unscoped convenience package for the Satelle native CLI.",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Microck/satelle.git",
+    "directory": "npm/satelle-unscoped"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "bin": {
+    "satelle": "bin/satelle.cjs"
+  },
+  "files": [
+    "bin/satelle.cjs"
+  ],
+  "dependencies": {
+    "@microck/satelle": "0.1.0"
+  },
+  "publishConfig": {
+    "access": "public",
+    "provenance": true
+  }
+}
