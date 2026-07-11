@@ -341,7 +341,7 @@ test("package manifests align versions, constraints, dependencies, and executabl
   assert.equal(unscopedManifest.version, canonicalManifest.version);
 });
 
-test("the unscoped executable runs the canonical public launcher", (context) => {
+test("the unscoped executable preserves canonical launcher behavior", (context) => {
   const fixtureRoot = mkdtempSync(path.join(tmpdir(), "satelle-unscoped-forwarder-"));
   context.after(() => rmSync(fixtureRoot, { recursive: true, force: true }));
   const unscopedBin = path.join(fixtureRoot, "node_modules", "satelle", "bin", "satelle.cjs");
@@ -361,15 +361,12 @@ test("the unscoped executable runs the canonical public launcher", (context) => 
   );
   writeFileSync(
     path.join(canonicalRoot, "launcher.cjs"),
-    "module.exports = { main(options) { process.stdout.write(JSON.stringify(options)); } };\n",
+    "module.exports = { main(...args) { process.stdout.write(JSON.stringify(args)); } };\n",
   );
 
   const child = spawnSync(process.execPath, [unscopedBin], { encoding: "utf8" });
   assert.equal(child.status, 0);
-  assert.deepEqual(JSON.parse(child.stdout), {
-    packageName: "satelle",
-    launcherPath: realpathSync(unscopedBin),
-  });
+  assert.deepEqual(JSON.parse(child.stdout), []);
   assert.equal(child.stderr, "");
 });
 
