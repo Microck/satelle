@@ -2326,9 +2326,16 @@ impl fmt::Display for DoctorFixability {
     }
 }
 
+/// The only schema token accepted for doctor reports in this release line.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub enum DoctorSchemaVersion {
+    #[serde(rename = "satelle.doctor.v1")]
+    V1,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct DoctorReport {
-    pub schema_version: u16,
+    pub schema_version: DoctorSchemaVersion,
     pub status: String,
     pub target: String,
     pub host: String,
@@ -2379,8 +2386,16 @@ pub struct DoctorEventRecord {
     pub data: Value,
 }
 
+/// The only schema token accepted for setup reports in this release line.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub enum SetupSchemaVersion {
+    #[serde(rename = "satelle.setup.v1")]
+    V1,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SetupReport {
+    pub schema_version: SetupSchemaVersion,
     pub host: String,
     pub dry_run: bool,
     pub status: String,
@@ -2483,9 +2498,16 @@ pub struct LogEntry {
     pub redacted: bool,
 }
 
+/// The only schema token accepted for Host session reports in this release line.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub enum HostSessionsSchemaVersion {
+    #[serde(rename = "satelle.host.sessions.v1")]
+    V1,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct HostSessionsReport {
-    pub schema_version: u16,
+    pub schema_version: HostSessionsSchemaVersion,
     pub host: String,
     pub connection_mode: String,
     pub bootstrapped: bool,

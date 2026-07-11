@@ -12,8 +12,9 @@ use satelle_core::session::{
     TimeoutPolicy, TurnTransition,
 };
 use satelle_core::{
-    DaemonPathOverrides, DoctorReport, EventSource, EventSubject, EventType, LOCAL_DEMO_HOST,
-    SatelleError, SatelleEvent, SatelleEventBody, SetupReport,
+    DaemonPathOverrides, DoctorReport, EventSource, EventSubject, EventType,
+    HostSessionsSchemaVersion, LOCAL_DEMO_HOST, SatelleError, SatelleEvent, SatelleEventBody,
+    SetupReport,
 };
 use serde_json::{Value, json};
 use time::OffsetDateTime;
@@ -62,7 +63,7 @@ impl HostService {
             vec!["direct local-demo host daemon already reachable".to_string()]
         };
         Ok(HostSessionsReport {
-            schema_version: 1,
+            schema_version: HostSessionsSchemaVersion::V1,
             host: host.to_string(),
             connection_mode: "direct".to_string(),
             bootstrapped: false,

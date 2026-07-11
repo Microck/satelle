@@ -2,7 +2,8 @@ use super::FakeComputerUseAdapter;
 use crate::runtime::ComputerUseAdapter;
 use satelle_core::{
     DaemonPathOverrides, DoctorFinding, DoctorFixability, DoctorProbeResult, DoctorReport,
-    DoctorSummary, SatelleError, SetupReadinessSummary, SetupReport, utc_now,
+    DoctorSchemaVersion, DoctorSummary, SatelleError, SetupReadinessSummary, SetupReport,
+    SetupSchemaVersion, utc_now,
 };
 
 pub(super) fn doctor(
@@ -69,7 +70,7 @@ pub(super) fn doctor(
         .collect::<Vec<_>>();
 
     Ok(DoctorReport {
-        schema_version: 1,
+        schema_version: DoctorSchemaVersion::V1,
         status: if readiness.is_ready() {
             "ready"
         } else {
@@ -128,6 +129,7 @@ pub(super) fn setup(
     }));
 
     SetupReport {
+        schema_version: SetupSchemaVersion::V1,
         host: host.to_string(),
         dry_run,
         status: "planned".to_string(),
