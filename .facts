@@ -513,9 +513,9 @@
 - satelle exposes satelle host update as the explicit maintenance command for ordinary updates to Satelle host binaries and supported standalone Codex runtime components @implemented @mvp
 - satelle host update is distinct from setup and repair: setup onboards prerequisites, repair restores broken readiness or compatibility, and host update performs user-requested maintenance updates @spec @mvp
 - satelle host update does not start prompt execution or modify Satelle sessions as a side effect @spec @mvp
-- satelle host update checks all supported update targets by default when no component filter is provided @implemented @mvp
-- satelle host update supports a repeatable --component <host|codex|all> filter for selecting update targets @implemented @mvp
-- satelle host update --component host selects only Satelle-owned host binaries and Host Daemon service assets, not Codex runtime components @implemented @mvp
+- satelle host update checks all supported update targets by default when no component filter is provided @mvp @spec
+- satelle host update supports a repeatable --component <host|codex|all> filter for selecting update targets @mvp @spec
+- satelle host update --component host selects only Satelle-owned host binaries and Host Daemon service assets, not Codex runtime components @mvp @spec
 - satelle host update --component host targets the Satelle host binary version that exactly matches the invoking local CLI release for the remote host platform @spec @mvp
 - satelle MVP does not support selecting an arbitrary Satelle host binary version, update channel, or latest remote release independently from the invoking local CLI version @spec @mvp
 - satelle host update does not intentionally leave the Satelle Host Daemon on a Satelle version different from the invoking local CLI version after a successful host component update @spec @mvp
@@ -528,12 +528,12 @@
 - satelle later Host binary version selection never downgrades a reachable Host Daemon unless the user explicitly selects a lower version and the compatibility matrix permits that downgrade @spec @later
 - satelle later Host binary version selection verifies the selected version's release artifact integrity metadata for the detected remote platform before upload or execution @spec @later
 - Satelle does not add Host update channels in current committed scope @spec @later
-- satelle host update --component codex selects the standalone Codex runtime and Codex-owned native Computer Use components required by that runtime for native Computer Use readiness @implemented @mvp
-- satelle host update --component codex does not select the Satelle host binary or Host Daemon service assets @implemented @mvp
-- satelle host update --component codex does not update unrelated browser extensions, operating-system packages, third-party tools, user browser profiles, provider credentials, or non-Codex automation software @implemented @mvp
-- satelle host update shows Codex runtime updates and Codex-owned native Computer Use component updates as separate planned actions even when they are selected by the same --component codex filter @implemented @mvp
+- satelle host update --component codex selects the standalone Codex runtime and Codex-owned native Computer Use components required by that runtime for native Computer Use readiness @mvp @spec
+- satelle host update --component codex does not select the Satelle host binary or Host Daemon service assets @mvp @spec
+- satelle host update --component codex does not update unrelated browser extensions, operating-system packages, third-party tools, user browser profiles, provider credentials, or non-Codex automation software @mvp @spec
+- satelle host update shows Codex runtime updates and Codex-owned native Computer Use component updates as separate planned actions even when they are selected by the same --component codex filter @mvp @spec
 - satelle host update reports a typed ambiguous-codex-component-ownership error when a candidate update target cannot be confidently classified as Codex-owned @spec @mvp
-- satelle host update treats --component all as an explicit request to check every supported update target on the selected host @implemented @mvp
+- satelle host update treats --component all as an explicit request to check every supported update target on the selected host @mvp @spec
 - satelle host update reports a typed component-selection-conflict usage error when --component all is combined with any other --component value @implemented @mvp
 - satelle host update has no short alias for --component in MVP because component selection is a clarity-sensitive maintenance contract @implemented @mvp
 - satelle host update never mutates the remote host during its update check; mutation starts only after the planned update actions pass the command's consent rules @spec @mvp
@@ -542,7 +542,7 @@
 - satelle host update --yes prints planned remote mutations in human output before applying when --quiet is not active and JSON output mode is not active @spec @mvp
 - satelle host update --no-input --yes follows the same human plan-output rule as --yes when human output mode is active @spec @mvp
 - satelle host update --quiet --yes suppresses non-error human plan and progress output but does not suppress final failure summaries or required recovery guidance @spec @mvp
-- satelle host update JSON output includes planned_actions before mutation and applied_actions after mutation instead of printing human plan text @implemented @mvp
+- satelle host update JSON output includes planned_actions before mutation and applied_actions after mutation instead of printing human plan text @mvp @spec
 - satelle host update does not expose a --plain output mode in MVP because --json is the stable automation contract for update plans, results, and typed errors @implemented @mvp
 - satelle host update help text directs scripts and other agents to --json instead of human output or --quiet output for stable automation data @spec @mvp
 - satelle later adds satelle host update --plain as a stable line-oriented scripting output mode narrower than --json and not a replacement for the complete JSON automation contract @spec @later
@@ -563,13 +563,13 @@
 - satelle host update --plain may add new schema versions after v1 but does not change v1 field order, field meanings, escaping, or enum token meanings in a minor release @spec @later
 - satelle host update reports unsupported selected update components as typed unsupported-update-component errors instead of silently ignoring an explicit component selection @implemented @mvp
 - satelle host update reports unsupported default update targets as skipped diagnostics when checking all supported update targets by default @spec @mvp
-- satelle host update exits 0 with status up_to_date and does not ask for mutation confirmation when all selected supported components are already current @implemented @mvp
+- satelle host update exits 0 with status up_to_date and does not ask for mutation confirmation when all selected supported components are already current @mvp @spec
 - satelle host update --quiet exits 0 with no human output when all selected supported components are already current @spec @mvp
 - satelle host update --quiet prints one concise human changed summary when one or more selected components changed and no error occurs @spec @mvp
 - satelle host update --quiet still prints failure summaries and required recovery guidance when the command fails or leaves the host in a partial or postcheck-failed state @spec @mvp
-- satelle host update supports --dry-run to preview update actions without mutating the selected host @implemented @mvp
+- satelle host update supports --dry-run to preview update actions without mutating the selected host @mvp @spec
 - satelle host update --dry-run treats the update plan as preview diagnostics and does not persist or emit a reusable apply plan @spec @mvp
-- satelle host update JSON dry-run output includes reusable_plan false so automation does not treat the preview as an apply artifact @implemented @mvp
+- satelle host update JSON dry-run output includes reusable_plan false so automation does not treat the preview as an apply artifact @mvp @spec
 - satelle host update non-dry-run invocations always re-probe the selected host and rebuild the update plan from live host state and local release metadata before asking for mutation consent @spec @mvp
 - satelle host update may apply the in-memory plan shown immediately before final confirmation within the same CLI process without repeating the full dry-run command @spec @mvp
 - satelle host update revalidates selected host identity, current component versions, selected component set, target artifact digests, and restart impact before mutating the remote host @spec @mvp
