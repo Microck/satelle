@@ -1,0 +1,27 @@
+{
+  "name": "@microck/satelle-darwin-x64",
+  "version": "0.1.0",
+  "description": "Satelle native CLI for macOS x64.",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Microck/satelle.git",
+    "directory": "npm/satelle-darwin-x64"
+  },
+  "os": [
+    "darwin"
+  ],
+  "cpu": [
+    "x64"
+  ],
+  "scripts": {
+    "prepack": "node ../scripts/verify-native-package.cjs"
+  },
+  "files": [
+    "bin/satelle"
+  ],
+  "publishConfig": {
+    "access": "public",
+    "provenance": true
+  }
+}

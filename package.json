@@ -1,0 +1,13 @@
+{
+  "name": "satelle-repository",
+  "version": "0.1.0",
+  "private": true,
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "check:npm": "node --test npm/test/npm-distribution.test.cjs npm/test/package-managers.test.cjs",
+    "test": "npm run check:npm",
+    "test:npm": "npm run check:npm"
+  }
+}

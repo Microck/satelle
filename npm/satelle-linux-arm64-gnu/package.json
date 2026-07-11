@@ -1,0 +1,30 @@
+{
+  "name": "@microck/satelle-linux-arm64-gnu",
+  "version": "0.1.0",
+  "description": "Satelle native CLI for Linux ARM64 with glibc.",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Microck/satelle.git",
+    "directory": "npm/satelle-linux-arm64-gnu"
+  },
+  "os": [
+    "linux"
+  ],
+  "cpu": [
+    "arm64"
+  ],
+  "libc": [
+    "glibc"
+  ],
+  "scripts": {
+    "prepack": "node ../scripts/verify-native-package.cjs"
+  },
+  "files": [
+    "bin/satelle"
+  ],
+  "publishConfig": {
+    "access": "public",
+    "provenance": true
+  }
+}

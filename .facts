@@ -156,10 +156,10 @@
 - satelle publishes npm-registry packages as a first-class installation path for npm, pnpm, and bun users @spec @mvp
 - satelle publishes the npm-registry package with scope microck and package name satelle as the canonical package identity for the JavaScript launcher and platform-specific native optionalDependencies @spec @mvp
 - satelle publishes satelle as an unscoped npm-registry convenience package for shorter install commands @spec @mvp
-- satelle unscoped npm-registry package depends on the exact same-version npm package with scope microck and package name satelle and forwards its satelle executable instead of duplicating native optionalDependencies or binary selection logic @spec @mvp
+- satelle unscoped npm-registry package depends on the exact same-version npm package with scope microck and package name satelle and forwards its satelle executable instead of duplicating native optionalDependencies or binary selection logic @spec @mvp @implemented
 - satelle release validation fails when scoped and unscoped npm-registry package versions, executable behavior, README install guidance, or provenance metadata diverge @spec @mvp
-- satelle npm-registry distribution exposes a satelle executable command that launches the Rust native binary instead of reimplementing the CLI in JavaScript @spec @mvp
-- satelle npm-registry distribution uses a thin JavaScript launcher or installer layer only for package-manager integration @spec @mvp
+- satelle npm-registry distribution exposes a satelle executable command that launches the Rust native binary instead of reimplementing the CLI in JavaScript @spec @mvp @implemented
+- satelle npm-registry distribution uses a thin JavaScript launcher or installer layer only for package-manager integration @spec @mvp @implemented
 - satelle npm, pnpm, and bun installation docs use the same scoped and unscoped npm-registry package identities across package managers instead of separate package identities per package manager @spec @mvp
 - satelle installation documentation lists npm, pnpm, and bun npm-registry installs before non-npm methods because npm-registry distribution is the recommended local CLI install path @spec @mvp
 - satelle MVP first-party non-npm local install methods are a Unix shell installer, a Windows PowerShell installer, a Homebrew tap, a Scoop bucket, and direct GitHub release archive downloads @spec @mvp
@@ -229,29 +229,29 @@
 - satelle post-MVP AUR, Debian package repository, RPM package repository, Nixpkgs, and MacPorts submissions are considered only after clear user demand or committed ecosystem maintainer ownership justifies their source-build policy, review, maintenance, and release-lag obligations @spec @later
 - satelle MVP does not publish .deb, .rpm, AUR, WinGet, Chocolatey, Nixpkgs, MacPorts, Homebrew core, or Scoop Main packages as release blockers @spec @mvp
 - satelle npm-registry distribution uses version-matched platform-specific native binary packages for supported local CLI platforms instead of bundling every OS and architecture binary into the top-level package @spec @mvp
-- satelle top-level npm-registry package declares version-matched platform-specific native binary packages as optionalDependencies instead of downloading the local native binary during ordinary package installation @spec @mvp
-- satelle npm-registry distribution does not require postinstall network access to fetch the local native binary during ordinary package installation @spec @mvp
-- satelle platform-specific native npm packages declare npm ecosystem platform constraints such as os, cpu, and libc where supported by the target package manager @spec @mvp
+- satelle top-level npm-registry package declares version-matched platform-specific native binary packages as optionalDependencies instead of downloading the local native binary during ordinary package installation @spec @mvp @implemented
+- satelle npm-registry distribution does not require postinstall network access to fetch the local native binary during ordinary package installation @spec @mvp @implemented
+- satelle platform-specific native npm packages declare npm ecosystem platform constraints such as os, cpu, and libc where supported by the target package manager @spec @mvp @implemented
 - satelle MVP supports Linux, macOS, and Windows as Controller Platforms independently from the narrower Computer Use Host Platform matrix @spec @mvp
 - satelle MVP supports macOS and Windows as native Computer Use Host Platforms because official Codex Computer Use is available there @spec @mvp
 - satelle MVP does not support Linux as a native Computer Use Host Platform until an official provider Computer Use runtime supports Linux @spec @mvp
-- satelle MVP Controller target matrix includes linux-arm64-gnu mapped to Rust target aarch64-unknown-linux-gnu @spec @mvp
-- satelle MVP Controller target matrix includes linux-x64-gnu mapped to Rust target x86_64-unknown-linux-gnu @spec @mvp
-- satelle MVP Controller target matrix includes darwin-arm64 mapped to Rust target aarch64-apple-darwin @spec @mvp
-- satelle MVP Controller target matrix includes darwin-x64 mapped to Rust target x86_64-apple-darwin @spec @mvp
-- satelle MVP Controller target matrix includes win32-arm64-msvc mapped to Rust target aarch64-pc-windows-msvc @spec @mvp
-- satelle MVP Controller target matrix includes win32-x64-msvc mapped to Rust target x86_64-pc-windows-msvc @spec @mvp
+- satelle MVP Controller target matrix includes linux-arm64-gnu mapped to Rust target aarch64-unknown-linux-gnu @spec @mvp @implemented
+- satelle MVP Controller target matrix includes linux-x64-gnu mapped to Rust target x86_64-unknown-linux-gnu @spec @mvp @implemented
+- satelle MVP Controller target matrix includes darwin-arm64 mapped to Rust target aarch64-apple-darwin @spec @mvp @implemented
+- satelle MVP Controller target matrix includes darwin-x64 mapped to Rust target x86_64-apple-darwin @spec @mvp @implemented
+- satelle MVP Controller target matrix includes win32-arm64-msvc mapped to Rust target aarch64-pc-windows-msvc @spec @mvp @implemented
+- satelle MVP Controller target matrix includes win32-x64-msvc mapped to Rust target x86_64-pc-windows-msvc @spec @mvp @implemented
 - satelle release validation treats Controller artifacts and native Computer Use Host acceptance as separate matrices @spec @mvp
 - the single satelle executable contains Controller commands on every Controller target and Host Daemon mode on every native Computer Use Host target @spec @mvp
 - satelle MVP does not publish native packages for 32-bit platforms, mobile OS targets, BSD targets, AIX, illumos, PowerPC, RISC-V, s390x, loong64, or ARMv7 targets @spec @mvp
-- satelle unsupported npm local platform reports a typed unsupported-local-platform error instead of trying a best-effort binary download @spec @mvp
+- satelle unsupported npm local platform reports a typed unsupported-local-platform error instead of trying a best-effort binary download @spec @mvp @implemented
 - satelle release validation fails when any MVP Controller target matrix entry is missing from the top-level npm optionalDependencies, release artifacts, or integrity metadata @spec @mvp
-- satelle JavaScript launcher resolves the installed matching platform-specific native package at runtime and executes its native satelle binary @spec @mvp
-- satelle JavaScript launcher reports a typed native-binary-package-missing error when the matching platform-specific native package is absent @spec @mvp
-- satelle native-binary-package-missing error output tells users to reinstall without omitting optional dependencies or use the direct native binary installation path @spec @mvp
-- satelle JavaScript launcher does not silently download a replacement native binary when the matching platform-specific native package is missing @spec @mvp
-- satelle JavaScript launcher does not run package-manager repair, reinstall, or mutation commands unless the user invokes an explicit repair command added for that purpose @spec @mvp
-- satelle native-binary-package-missing error output includes package-manager-specific reinstall guidance when the launcher can detect npm, pnpm, bun, or another package-manager owner from the installation layout @spec @mvp
+- satelle JavaScript launcher resolves the installed matching platform-specific native package at runtime and executes its native satelle binary @spec @mvp @implemented
+- satelle JavaScript launcher reports a typed native-binary-package-missing error when the matching platform-specific native package is absent @spec @mvp @implemented
+- satelle native-binary-package-missing error output tells users to reinstall without omitting optional dependencies or use the direct native binary installation path @spec @mvp @implemented
+- satelle JavaScript launcher does not silently download a replacement native binary when the matching platform-specific native package is missing @spec @mvp @implemented
+- satelle JavaScript launcher does not run package-manager repair, reinstall, or mutation commands unless the user invokes an explicit repair command added for that purpose @spec @mvp @implemented
+- satelle native-binary-package-missing error output includes package-manager-specific reinstall guidance when the launcher can detect npm, pnpm, bun, or another package-manager owner from the installation layout @spec @mvp @implemented
 - satelle release versions align exactly across scoped and unscoped top-level npm packages, every platform-specific native npm package, the local CLI binary, and every version-matched remote Host binary artifact @spec @contract @mvp
 - satelle public release publishing is performed only by a GitHub Actions release workflow in MVP @spec @mvp
 - satelle local developer machines may build, test, package, and dry-run releases but do not publish npm packages, upload final public GitHub release assets, or mint public release provenance @spec @mvp
