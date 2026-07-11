@@ -27,6 +27,11 @@ name = "cli"
 path = "tests/cli.rs"
 required-features = ["test-support"]
 
+[[test]]
+name = "output-format-contract"
+path = "tests/output-format-contract.rs"
+required-features = ["test-support"]
+
 [dev-dependencies]
 assert_cmd = "2.1.1"
 predicates = "3.1.3"

@@ -101,19 +101,19 @@
 ## profiles-and-output
 - satelle supports a global --profile option that applies selected user-level configuration profile overlays rather than only reporting the selected profile name @spec @mvp
 - satelle recognizes only the SATELLE_* namespace for Satelle-owned process environment variables and does not preserve pre-Satelle environment compatibility aliases @mvp @implemented
-- satelle MVP command data output modes are human and json; a command-specific streaming contract may define json as versioned NDJSON instead of one final JSON value @spec @contract @mvp
-- satelle MVP uses --format <human|json> as the canonical command data output selector for commands that support machine-readable output @spec @mvp
+- satelle MVP command data output modes are human and json; a command-specific streaming contract may define json as versioned NDJSON instead of one final JSON value @contract @mvp @implemented
+- satelle MVP uses --format <human|json> as the canonical command data output selector for commands that support machine-readable output @mvp @implemented
 - satelle later adds compact-json, toon, and markdown command data formats only after each format has a stable lossless mapping from the command's canonical JSON contract @spec @later
 - satelle later tabular inspection commands add csv only when every emitted field has a stable column contract and no nested data would be lost @spec @later
 - satelle compact-json output emits one minified JSON value for commands that otherwise emit one pretty JSON value @spec @later
 - satelle TOON output is a token-efficient structured command result format and never replaces JSON as the canonical machine-readable contract @spec @later
 - satelle later expands the canonical selector to --format <human|json|compact-json|toon|markdown|csv>, while each command advertises only formats with a lossless mapping for that command @spec @later
-- satelle keeps --json as an exact convenience alias for --format json @spec @mvp
-- satelle reports a typed output-mode-conflict usage error when --json and --format are both provided @spec @mvp
-- satelle command help lists only the output formats supported by that command @spec @mvp
-- satelle --events json remains an NDJSON event-stream selector and is not an alias for final-result --format json @spec @mvp
-- satelle run and steer report a typed output-mode-conflict usage error when --events json is combined with --json or any explicit --format value @spec @contract @mvp
-- satelle doctor reports a typed output-mode-conflict usage error when --events is combined with --json or any explicit --format value @spec @contract @mvp
+- satelle keeps --json as an exact convenience alias for --format json @mvp @implemented
+- satelle reports a typed output-mode-conflict usage error when --json and --format are both provided @mvp @implemented
+- satelle command help lists only the output formats supported by that command @mvp @implemented
+- satelle --events json remains an NDJSON event-stream selector and is not an alias for final-result --format json @mvp @implemented
+- satelle run and steer report a typed output-mode-conflict usage error when --events json is combined with --json or any explicit --format value @contract @mvp @implemented
+- satelle doctor reports a typed output-mode-conflict usage error when --events is combined with --json or any explicit --format value @contract @mvp @implemented
 - satelle run, steer, stop, status, setup, repair, doctor, config check, config explain, self update, host update, paths, and host sessions JSON results include a top-level schema_version @spec @contract @mvp
 - satelle run JSON v1 uses schema_version satelle.run.v1 @spec @contract @mvp
 - satelle steer JSON v1 uses schema_version satelle.steer.v1 @spec @contract @mvp
