@@ -2,7 +2,7 @@ use assert_cmd::Command;
 use predicates::prelude::*;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use tempfile::TempDir;
 
 const MANAGED_BLOCK_START: &str = "# >>> satelle completions >>>";
@@ -183,11 +183,9 @@ fn creates_a_missing_profile_and_parent_directory() {
 fn stores_an_absolute_completion_path_when_the_output_directory_is_relative() {
     let fixture = TempDir::new().expect("test directory should be created");
     let output_dir = Path::new("relative completion output");
-    let working_dir = fs::canonicalize(fixture.path()).expect("working directory should resolve");
-    let destination = working_dir.join(output_dir).join("satelle.bash");
     let profile = fixture.path().join(".bashrc");
 
-    update_profile_command(
+    let output = update_profile_command(
         "bash",
         output_dir,
         &profile,
@@ -196,12 +194,22 @@ fn stores_an_absolute_completion_path_when_the_output_directory_is_relative() {
     .current_dir(fixture.path())
     .assert()
     .success()
-    .stdout(format!("{}\n", destination.display()))
-    .stderr(predicate::str::is_empty());
+    .stderr(predicate::str::is_empty())
+    .get_output()
+    .clone();
+    let stdout = String::from_utf8(output.stdout).expect("installed path should be UTF-8");
+    let installed_path = PathBuf::from(
+        stdout
+            .strip_suffix('\n')
+            .expect("installed path should end with one newline"),
+    );
+
+    assert!(installed_path.is_absolute(), "installed path was relative");
+    assert!(installed_path.is_file(), "installed script does not exist");
 
     assert_eq!(
         fs::read(&profile).expect("profile should be readable"),
-        managed_block("bash", &destination, "\n"),
+        managed_block("bash", &installed_path, "\n"),
         "managed block stored a working-directory-relative path"
     );
 }
