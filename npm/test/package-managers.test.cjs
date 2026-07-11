@@ -16,7 +16,6 @@ const {
 const { tmpdir } = require("node:os");
 const path = require("node:path");
 const test = require("node:test");
-const { pathToFileURL } = require("node:url");
 
 const repositoryRoot = path.resolve(__dirname, "../..");
 const sourceCanonicalRoot = path.join(repositoryRoot, "npm", "satelle");
@@ -56,6 +55,10 @@ function readJson(filePath) {
 
 function writeJson(filePath, value) {
   writeFileSync(filePath, `${JSON.stringify(value, null, 2)}\n`);
+}
+
+function localTarballReference(artifactPath) {
+  return `file:${artifactPath.split(path.sep).join("/")}`;
 }
 
 function commandIsAvailable(packageManager) {
@@ -121,12 +124,13 @@ function stagePackages(fixtureRoot) {
       path.join(packagesRoot, `satelle-${targetId}`),
       packsRoot,
     );
-    canonicalManifest.optionalDependencies[target.packageName] = pathToFileURL(nativeArtifact).href;
+    canonicalManifest.optionalDependencies[target.packageName] =
+      localTarballReference(nativeArtifact);
   }
   writeJson(path.join(canonicalRoot, "package.json"), canonicalManifest);
   const canonicalArtifact = packFixturePackage(canonicalRoot, packsRoot);
   const unscopedManifest = readJson(path.join(unscopedRoot, "package.json"));
-  unscopedManifest.dependencies["@microck/satelle"] = pathToFileURL(canonicalArtifact).href;
+  unscopedManifest.dependencies["@microck/satelle"] = localTarballReference(canonicalArtifact);
   writeJson(path.join(unscopedRoot, "package.json"), unscopedManifest);
   return packFixturePackage(unscopedRoot, packsRoot);
 }
