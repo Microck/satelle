@@ -183,7 +183,8 @@ fn creates_a_missing_profile_and_parent_directory() {
 fn stores_an_absolute_completion_path_when_the_output_directory_is_relative() {
     let fixture = TempDir::new().expect("test directory should be created");
     let output_dir = Path::new("relative completion output");
-    let destination = fixture.path().join(output_dir).join("satelle.bash");
+    let working_dir = fs::canonicalize(fixture.path()).expect("working directory should resolve");
+    let destination = working_dir.join(output_dir).join("satelle.bash");
     let profile = fixture.path().join(".bashrc");
 
     update_profile_command(
