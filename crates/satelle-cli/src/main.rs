@@ -1800,138 +1800,33 @@ fn show_host_sessions(
 }
 
 fn run_host_update(command: HostUpdateCommand) -> Result<(), CliFailure> {
-    let components =
-        host_update_components(&command.component).map_err(|error| failure(error, command.json))?;
-    let hosts = if command.host.is_empty() {
-        vec![LOCAL_DEMO_HOST.to_string()]
-    } else {
-        command.host.clone()
-    };
-    let selected_host_count = selected_host_count(command.host.len(), command.all_remotes);
-    let planned_actions = host_update_planned_actions(&hosts, &components);
-    let component_records = components
-        .iter()
-        .flat_map(|component| match component.as_str() {
-            "host" => vec![json!({
-                "component": "host",
-                "phase": "checked",
-                "status": "up_to_date",
-                "current_version": env!("CARGO_PKG_VERSION"),
-                "target_version": env!("CARGO_PKG_VERSION"),
-                "changed": false,
-                "restart_required": false,
-                "selected_targets": ["satelle-host-daemon", "satelle-host-service-assets"],
-            })],
-            "codex" => vec![
-                json!({
-                    "component": "codex_runtime",
-                    "phase": "checked",
-                    "status": "up_to_date",
-                    "current_version": "local-demo",
-                    "target_version": "local-demo",
-                    "changed": false,
-                    "restart_required": false,
-                    "selected_targets": ["standalone-codex-runtime"],
-                }),
-                json!({
-                    "component": "codex_native_computer_use",
-                    "phase": "checked",
-                    "status": "up_to_date",
-                    "current_version": "local-demo",
-                    "target_version": "local-demo",
-                    "changed": false,
-                    "restart_required": false,
-                    "selected_targets": ["codex-owned-native-computer-use-components"],
-                }),
-            ],
-            _ => Vec::new(),
-        })
-        .collect::<Vec<_>>();
-
-    let output = json!({
-        "schema_version": 1,
-        "status": "up_to_date",
-        "changed": false,
-        "dry_run": command.dry_run,
-        "reusable_plan": false,
-        "selected_host_count": selected_host_count,
-        "hosts": hosts,
-        "selected_components": components,
-        "planned_actions": planned_actions,
-        "applied_actions": [],
-        "component_results": component_records,
-        "restart_required": false,
-        "post_update_checks": [
-            "host_daemon_reachability",
-            "codex_app_server_startup",
-            "native_computer_use_readiness",
-        ],
-        "not_checked": ["remote_host_live_state"],
-        "recovery_commands": [],
-    });
-
-    if command.json {
-        print_json(&output).map_err(|error| failure(error, command.json))
-    } else {
-        println!("Status: up_to_date");
-        println!("Changed: false");
-        println!("Dry run: {}", command.dry_run);
-        println!("Hosts: {}", selected_host_count);
-        println!("Components: {}", components.join(", "));
-        for action in planned_actions {
-            println!("Plan: {action}");
-        }
-        Ok(())
-    }
+    validate_host_update_components(&command.component)
+        .map_err(|error| failure(error, command.json))?;
+    Err(failure(
+        SatelleError::not_implemented(concat!(
+            "Host update was not run because live Host planning and application are not ",
+            "implemented. No Host state or Satelle sessions were changed."
+        )),
+        command.json,
+    ))
 }
 
-fn host_update_components(raw_components: &[String]) -> Result<Vec<String>, SatelleError> {
-    if raw_components.is_empty() {
-        return Ok(vec!["host".to_string(), "codex".to_string()]);
-    }
-
+fn validate_host_update_components(raw_components: &[String]) -> Result<(), SatelleError> {
     let has_all = raw_components.iter().any(|component| component == "all");
     if has_all && raw_components.len() > 1 {
         return Err(SatelleError::component_selection_conflict());
     }
     if has_all {
-        return Ok(vec!["host".to_string(), "codex".to_string()]);
+        return Ok(());
     }
 
-    let mut components = Vec::new();
     for component in raw_components {
-        match component.as_str() {
-            "host" | "codex" => {
-                if !components.contains(component) {
-                    components.push(component.clone());
-                }
-            }
-            _ => return Err(SatelleError::unsupported_update_component(component)),
+        if !matches!(component.as_str(), "host" | "codex") {
+            return Err(SatelleError::unsupported_update_component(component));
         }
     }
 
-    Ok(components)
-}
-
-fn host_update_planned_actions(hosts: &[String], components: &[String]) -> Vec<String> {
-    let mut actions = Vec::new();
-    for host in hosts {
-        for component in components {
-            match component.as_str() {
-                "host" => actions.push(format!(
-                    "check Satelle host binary and Host Daemon service assets on {host}"
-                )),
-                "codex" => {
-                    actions.push(format!("check standalone Codex runtime on {host}"));
-                    actions.push(format!(
-                        "check Codex-owned native Computer Use components on {host}"
-                    ));
-                }
-                _ => {}
-            }
-        }
-    }
-    actions
+    Ok(())
 }
 
 fn run_host_storage(command: HostStorageCommand) -> Result<(), CliFailure> {
@@ -2003,14 +1898,6 @@ fn run_support(command: SupportCommand) -> Result<(), CliFailure> {
             command.json,
         )),
     }
-}
-
-fn selected_host_count(explicit_hosts: usize, all_remotes: bool) -> usize {
-    if all_remotes {
-        return explicit_hosts.max(1);
-    }
-
-    explicit_hosts.max(1)
 }
 
 fn run_prompt(command: RunCommand, transport: &impl TransportClient) -> Result<(), CliFailure> {

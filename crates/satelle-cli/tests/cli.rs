@@ -1698,40 +1698,11 @@ variable = "OPENAI_API_KEY"
 }
 
 #[test]
-fn host_update_reports_up_to_date_json_for_default_all_host_and_codex_components() {
+fn host_update_valid_selections_fail_truthfully_without_mutating_state() {
     let state = state_dir();
-    let output = satelle()
-        .env("SATELLE_STATE_DIR", state.path())
-        .args(["host", "update", "--host", "local-demo", "--json"])
-        .assert()
-        .success()
-        .get_output()
-        .clone();
-    let report = parse_json_output(&output.stdout);
-
-    assert_eq!(report["status"], "up_to_date");
-    assert_eq!(report["changed"], false);
-    assert_eq!(
-        report["selected_components"],
-        serde_json::json!(["host", "codex"])
-    );
-    assert!(report["planned_actions"].as_array().unwrap().len() >= 3);
-    assert_eq!(report["applied_actions"], serde_json::json!([]));
-    assert_eq!(report["restart_required"], false);
-    assert_eq!(report["component_results"][0]["component"], "host");
-    assert_eq!(
-        report["component_results"][0]["selected_targets"],
-        serde_json::json!(["satelle-host-daemon", "satelle-host-service-assets"])
-    );
-    assert_eq!(report["component_results"][1]["component"], "codex_runtime");
-    assert_eq!(
-        report["component_results"][2]["component"],
-        "codex_native_computer_use"
-    );
-
-    let output = satelle()
-        .env("SATELLE_STATE_DIR", state.path())
-        .args([
+    for args in [
+        vec!["host", "update", "--host", "local-demo", "--json"],
+        vec![
             "host",
             "update",
             "--host",
@@ -1739,19 +1710,8 @@ fn host_update_reports_up_to_date_json_for_default_all_host_and_codex_components
             "--component",
             "host",
             "--json",
-        ])
-        .assert()
-        .success()
-        .get_output()
-        .clone();
-    let report = parse_json_output(&output.stdout);
-    assert_eq!(report["selected_components"], serde_json::json!(["host"]));
-    assert_eq!(report["component_results"].as_array().unwrap().len(), 1);
-    assert_eq!(report["component_results"][0]["component"], "host");
-
-    let output = satelle()
-        .env("SATELLE_STATE_DIR", state.path())
-        .args([
+        ],
+        vec![
             "host",
             "update",
             "--host",
@@ -1759,25 +1719,19 @@ fn host_update_reports_up_to_date_json_for_default_all_host_and_codex_components
             "--component",
             "codex",
             "--json",
-        ])
-        .assert()
-        .success()
-        .get_output()
-        .clone();
-    let report = parse_json_output(&output.stdout);
-    assert_eq!(report["selected_components"], serde_json::json!(["codex"]));
-    assert_eq!(report["component_results"].as_array().unwrap().len(), 2);
-    assert!(
-        report["planned_actions"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .all(|action| !action.as_str().unwrap().contains("Host Daemon service"))
-    );
-
-    let output = satelle()
-        .env("SATELLE_STATE_DIR", state.path())
-        .args([
+        ],
+        vec![
+            "host",
+            "update",
+            "--host",
+            "local-demo",
+            "--component",
+            "host",
+            "--component",
+            "codex",
+            "--json",
+        ],
+        vec![
             "host",
             "update",
             "--host",
@@ -1786,18 +1740,26 @@ fn host_update_reports_up_to_date_json_for_default_all_host_and_codex_components
             "all",
             "--dry-run",
             "--json",
-        ])
-        .assert()
-        .success()
-        .get_output()
-        .clone();
-    let report = parse_json_output(&output.stdout);
-    assert_eq!(
-        report["selected_components"],
-        serde_json::json!(["host", "codex"])
-    );
-    assert_eq!(report["dry_run"], true);
-    assert_eq!(report["reusable_plan"], false);
+        ],
+    ] {
+        let output = satelle()
+            .env("SATELLE_STATE_DIR", state.path())
+            .args(args)
+            .assert()
+            .code(78)
+            .get_output()
+            .clone();
+        assert!(output.stdout.is_empty());
+        let report = parse_json_output(&output.stderr);
+        assert_exact_object_keys(&report, &["schema_version", "error"]);
+        assert_eq!(report["schema_version"], "satelle.error.v1");
+        assert_eq!(report["error"]["code"], "not-implemented");
+        let message = report["error"]["message"].as_str().unwrap();
+        assert!(message.contains("Host update was not run"));
+        assert!(message.contains("No Host state or Satelle sessions were changed"));
+        assert!(!state.path().join("satelle.sqlite3").exists());
+        assert!(!state.path().join("satelle.sqlite3.lock").exists());
+    }
 }
 
 #[test]
