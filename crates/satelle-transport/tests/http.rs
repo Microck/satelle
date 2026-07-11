@@ -96,10 +96,28 @@ fn bearer(token: &ApiBearerToken) -> String {
 #[tokio::test]
 async fn liveness_is_exact_and_reveals_no_protected_metadata() {
     let running = RunningServer::start(ApiScopes::READ).await;
-    let response = reqwest::get(running.url("/v1/live"))
+    let generated_response = reqwest::get(running.url("/v1/live"))
+        .await
+        .expect("request liveness without a caller correlation ID");
+    RequestId::parse(
+        generated_response.headers()["satelle-request-id"]
+            .to_str()
+            .expect("generated request ID is ASCII"),
+    )
+    .expect("liveness generates a canonical UUIDv7 correlation ID");
+
+    let request_id = RequestId::new();
+    let response = reqwest::Client::new()
+        .get(running.url("/v1/live"))
+        .header("Satelle-Request-Id", request_id.to_string())
+        .send()
         .await
         .expect("request liveness");
     assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response.headers()["satelle-request-id"],
+        request_id.as_str()
+    );
     assert_eq!(
         response.headers()["content-type"],
         "application/json; charset=utf-8"
@@ -118,6 +136,28 @@ async fn liveness_is_exact_and_reveals_no_protected_metadata() {
     let parsed: LiveResponse = serde_json::from_slice(&bytes).expect("decode live contract");
     assert!(parsed.alive());
     assert!(!String::from_utf8_lossy(&bytes).contains(&running.host_identity));
+}
+
+#[tokio::test]
+async fn liveness_method_rejections_are_correlated() {
+    let running = RunningServer::start(ApiScopes::READ).await;
+    let request_id = RequestId::new();
+    let response = reqwest::Client::new()
+        .post(running.url("/v1/live"))
+        .header("Satelle-Request-Id", request_id.to_string())
+        .send()
+        .await
+        .expect("request an unsupported liveness method");
+
+    assert_eq!(response.status(), StatusCode::METHOD_NOT_ALLOWED);
+    assert_eq!(
+        response.headers()["satelle-request-id"],
+        request_id.as_str()
+    );
+    let error: ApiError = response.json().await.expect("decode liveness method error");
+    assert_eq!(error.code().as_str(), "method-not-allowed");
+    assert_eq!(error.request_id(), &request_id);
+    assert_eq!(error.host_identity(), None);
 }
 
 #[tokio::test]
@@ -170,6 +210,41 @@ async fn protected_reads_authenticate_before_host_pinning() {
         mismatch_error.host_identity(),
         Some(running.host_identity.as_str())
     );
+
+    let generated = client
+        .get(running.url("/v1/host/status"))
+        .header("Authorization", format!("Bearer {}", exposed.as_str()))
+        .header("Satelle-Expected-Host-Identity", &running.host_identity)
+        .send()
+        .await
+        .expect("request status without a caller correlation ID");
+    assert_eq!(generated.status(), StatusCode::OK);
+    let generated_header = RequestId::parse(
+        generated.headers()["satelle-request-id"]
+            .to_str()
+            .expect("generated request ID is ASCII"),
+    )
+    .expect("authenticated response generates a canonical UUIDv7 request ID");
+    let generated_status: HostStatusResponse = generated
+        .json()
+        .await
+        .expect("decode generated-correlation status");
+    assert_eq!(generated_status.request_id(), &generated_header);
+
+    let malformed_id = client
+        .get(running.url("/v1/host/status"))
+        .header("Authorization", format!("Bearer {}", exposed.as_str()))
+        .header("Satelle-Expected-Host-Identity", &running.host_identity)
+        .header("Satelle-Request-Id", "not-a-uuidv7")
+        .send()
+        .await
+        .expect("request status with a malformed correlation ID");
+    assert_eq!(malformed_id.status(), StatusCode::BAD_REQUEST);
+    let malformed_id_error: ApiError = malformed_id
+        .json()
+        .await
+        .expect("decode malformed request ID error");
+    assert_eq!(malformed_id_error.code().as_str(), "invalid-request");
 
     let accepted = running
         .request("/v1/host/status")

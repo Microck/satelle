@@ -36,6 +36,7 @@ use tokio::sync::watch;
 use tokio::task::JoinHandle;
 
 const DEFAULT_MAX_CONNECTIONS: usize = 128;
+const HOST_IDENTITY_HEADER: &str = "satelle-host-identity";
 const FAILED_AUTH_LIMIT: usize = 10;
 const READ_LIMIT: usize = 600;
 const CONTROL_LIMIT: usize = 120;
@@ -333,13 +334,32 @@ fn router(state: Arc<DaemonState>) -> Router {
             auth::authorize,
         ));
     Router::new()
-        .route("/v1/live", get(live))
+        .route("/v1/live", get(live).fallback(live_method_not_allowed))
         .merge(protected)
         .with_state(state)
 }
 
-async fn live() -> Response {
-    json_response(StatusCode::OK, &LiveResponse::new())
+async fn live(headers: HeaderMap) -> Response {
+    json_response(
+        StatusCode::OK,
+        &LiveResponse::new(),
+        request_id_or_new(&headers),
+    )
+}
+
+async fn live_method_not_allowed(headers: HeaderMap) -> Response {
+    api_error_response(
+        request_id_or_new(&headers),
+        None,
+        ApiFailure {
+            status: StatusCode::METHOD_NOT_ALLOWED,
+            code: ApiErrorCode::MethodNotAllowed,
+            category: ApiErrorCategory::InvalidRequest,
+            retryable: false,
+            message: "the requested method is not supported by the liveness route",
+            details: None,
+        },
+    )
 }
 
 async fn capabilities(
@@ -470,8 +490,8 @@ pub(super) fn api_error_response(
     )
 }
 
-pub(super) fn json_response(status: StatusCode, value: &impl Serialize) -> Response {
-    json_response_with_context(status, value, RequestId::new(), None)
+fn json_response(status: StatusCode, value: &impl Serialize, request_id: RequestId) -> Response {
+    json_response_with_context(status, value, request_id, None)
 }
 
 pub(super) fn authenticated_json_response(
@@ -494,11 +514,12 @@ fn json_response_with_context(
     request_id: RequestId,
     host_identity: Option<String>,
 ) -> Response {
+    let response_host_identity = host_identity.clone();
     let (status, body) = match serde_json::to_vec(value) {
         Ok(body) => (status, body),
         Err(_) => {
             let fallback = ApiError::new(
-                request_id,
+                request_id.clone(),
                 host_identity,
                 ApiErrorCode::InternalError,
                 ApiErrorCategory::Internal,
@@ -516,7 +537,36 @@ fn json_response_with_context(
         CONTENT_TYPE,
         HeaderValue::from_static("application/json; charset=utf-8"),
     );
-    security_headers(response)
+    security_headers(with_response_context(
+        response,
+        &request_id,
+        response_host_identity.as_deref(),
+    ))
+}
+
+pub(super) fn with_response_context(
+    mut response: Response,
+    request_id: &RequestId,
+    host_identity: Option<&str>,
+) -> Response {
+    let response_request_id = HeaderValue::try_from(request_id.as_str())
+        .expect("a canonical UUIDv7 is always a valid HTTP header value");
+    tracing::debug!(
+        request_id = %request_id,
+        status = response.status().as_u16(),
+        "Host Daemon HTTP response completed"
+    );
+    response
+        .headers_mut()
+        .insert(REQUEST_ID_HEADER, response_request_id);
+    if let Some(host_identity) = host_identity {
+        let response_host_identity = HeaderValue::try_from(host_identity)
+            .expect("a stored Host Identity is always a valid HTTP header value");
+        response
+            .headers_mut()
+            .insert(HOST_IDENTITY_HEADER, response_host_identity);
+    }
+    response
 }
 
 pub(super) fn security_headers(mut response: Response) -> Response {

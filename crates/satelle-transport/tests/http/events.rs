@@ -3,6 +3,7 @@ use futures_util::{SinkExt, StreamExt};
 use satelle_core::{EventStateSubject, EventType, SatelleEvent};
 use satelle_transport::{EventSubscription, SessionResponse, SubscribeRequest, WsServerControl};
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+use tokio_tungstenite::tungstenite::handshake::client::Response as WebSocketResponse;
 use tokio_tungstenite::tungstenite::http::HeaderValue;
 use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
 use tokio_tungstenite::tungstenite::{Error as WebSocketError, Message};
@@ -34,6 +35,17 @@ async fn try_connect_events_at(
     token: &ApiBearerToken,
     host_identity: &str,
 ) -> Result<EventSocket, WebSocketError> {
+    try_connect_events_with_id_at(address, token, host_identity, RequestId::new())
+        .await
+        .map(|connected| connected.0)
+}
+
+async fn try_connect_events_with_id_at(
+    address: SocketAddr,
+    token: &ApiBearerToken,
+    host_identity: &str,
+    request_id: RequestId,
+) -> Result<(EventSocket, WebSocketResponse), WebSocketError> {
     let mut request = format!("ws://{address}/v1/events")
         .into_client_request()
         .expect("build WebSocket request");
@@ -47,7 +59,29 @@ async fn try_connect_events_at(
     );
     request.headers_mut().insert(
         "satelle-request-id",
-        HeaderValue::from_str(RequestId::new().as_str()).expect("valid request ID header"),
+        HeaderValue::from_str(request_id.as_str()).expect("valid request ID header"),
+    );
+    let stream = TcpStream::connect(address)
+        .await
+        .expect("connect WebSocket TCP stream");
+    client_async(request, stream).await
+}
+
+async fn try_connect_events_without_id_at(
+    address: SocketAddr,
+    token: &ApiBearerToken,
+    host_identity: &str,
+) -> Result<EventSocket, WebSocketError> {
+    let mut request = format!("ws://{address}/v1/events")
+        .into_client_request()
+        .expect("build WebSocket request");
+    request.headers_mut().insert(
+        "authorization",
+        HeaderValue::from_str(&bearer(token)).expect("valid bearer header"),
+    );
+    request.headers_mut().insert(
+        "satelle-expected-host-identity",
+        HeaderValue::from_str(host_identity).expect("valid Host Identity header"),
     );
     let stream = TcpStream::connect(address)
         .await
@@ -55,6 +89,87 @@ async fn try_connect_events_at(
     client_async(request, stream)
         .await
         .map(|connected| connected.0)
+}
+
+#[tokio::test]
+async fn event_upgrade_echoes_request_correlation_id() {
+    let running = RunningServer::start(ApiScopes::READ).await;
+    let request_id = RequestId::new();
+    let (_socket, response) = try_connect_events_with_id_at(
+        running.server.local_addr(),
+        &running.token,
+        &running.host_identity,
+        request_id.clone(),
+    )
+    .await
+    .expect("upgrade authenticated event socket");
+
+    assert_eq!(
+        response.headers()["satelle-request-id"],
+        request_id.as_str()
+    );
+    assert_eq!(
+        response.headers()["satelle-host-identity"],
+        running.host_identity
+    );
+}
+
+#[tokio::test]
+async fn event_upgrade_requires_a_caller_request_id() {
+    let running = RunningServer::start(ApiScopes::READ).await;
+    let error = try_connect_events_without_id_at(
+        running.server.local_addr(),
+        &running.token,
+        &running.host_identity,
+    )
+    .await
+    .expect_err("an event upgrade without a request ID must be rejected");
+
+    let WebSocketError::Http(response) = error else {
+        panic!("expected HTTP request-ID rejection, got {error:?}");
+    };
+    assert_eq!(response.status().as_u16(), StatusCode::BAD_REQUEST);
+    let response_request_id = RequestId::parse(
+        response.headers()["satelle-request-id"]
+            .to_str()
+            .expect("generated response request ID is ASCII"),
+    )
+    .expect("the rejection response carries a canonical UUIDv7");
+    let error: ApiError = serde_json::from_slice(
+        response
+            .body()
+            .as_deref()
+            .expect("the rejection response has a JSON body"),
+    )
+    .expect("decode request-ID rejection");
+    assert_eq!(error.code().as_str(), "invalid-request");
+    assert_eq!(error.request_id(), &response_request_id);
+}
+
+#[tokio::test]
+async fn malformed_event_upgrades_return_correlated_typed_errors() {
+    let running = RunningServer::start(ApiScopes::READ).await;
+    let response = running
+        .request("/v1/events")
+        .send()
+        .await
+        .expect("send authenticated plain GET to the event route");
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(
+        response.headers()["satelle-host-identity"],
+        running.host_identity
+    );
+    let response_request_id = RequestId::parse(
+        response.headers()["satelle-request-id"]
+            .to_str()
+            .expect("response request ID is ASCII"),
+    )
+    .expect("the rejection response carries a canonical UUIDv7");
+    let error: ApiError = response.json().await.expect("decode upgrade rejection");
+    assert_eq!(error.code().as_str(), "invalid-request");
+    assert_eq!(error.request_id(), &response_request_id);
+    assert_eq!(error.host_identity(), Some(running.host_identity.as_str()));
 }
 
 async fn send_subscribe(socket: &mut EventSocket, subscriptions: Vec<EventSubscription>) {
