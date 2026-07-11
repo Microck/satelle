@@ -612,8 +612,7 @@ fn try_main() -> Result<(), CliFailure> {
 
     match cli.command {
         Command::Completions(command) => {
-            generate_completions(command);
-            Ok(())
+            generate_completions(command).map_err(|error| failure(error, false))
         }
         Command::Setup(command) => {
             let transport = local_transport(output)?;

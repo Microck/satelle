@@ -1,7 +1,7 @@
 use clap::{Args, CommandFactory, ValueEnum};
-use clap_complete::{Shell, generate};
-use satelle_core::CLI_NAME;
-use std::io;
+use clap_complete::{Generator, Shell};
+use satelle_core::{CLI_NAME, ErrorCode, SatelleError};
+use std::io::{self, ErrorKind};
 
 use super::Cli;
 
@@ -30,11 +30,23 @@ impl From<CompletionShell> for Shell {
     }
 }
 
-pub(super) fn generate_completions(command: CompletionsCommand) {
-    generate(
-        Shell::from(command.shell),
-        &mut Cli::command(),
-        CLI_NAME,
-        &mut io::stdout(),
-    );
+pub(super) fn generate_completions(command: CompletionsCommand) -> Result<(), SatelleError> {
+    let mut cli = Cli::command();
+    cli.set_bin_name(CLI_NAME);
+    cli.build();
+
+    let stdout = io::stdout();
+    let mut stdout = stdout.lock();
+    match Shell::from(command.shell).try_generate(&cli, &mut stdout) {
+        Ok(()) => Ok(()),
+        // Early-closing consumers such as `head` are a successful CLI pipeline outcome.
+        Err(source) if source.kind() == ErrorKind::BrokenPipe => Ok(()),
+        Err(source) => Err(SatelleError {
+            code: ErrorCode::InvalidUsage,
+            message: "could not write shell completion script".to_string(),
+            recovery_command: None,
+            source_detail: Some(source.to_string()),
+            details: Default::default(),
+        }),
+    }
 }
