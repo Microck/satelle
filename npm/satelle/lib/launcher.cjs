@@ -1,7 +1,7 @@
 "use strict";
 
 const { spawnSync } = require("node:child_process");
-const { existsSync } = require("node:fs");
+const { existsSync, readFileSync } = require("node:fs");
 const { createRequire } = require("node:module");
 const path = require("node:path");
 
@@ -60,19 +60,38 @@ function detectLinuxLibc(processObject = process) {
 }
 
 function detectPackageManager({ userAgent, execPath, launcherPath } = {}) {
-  const installationClues = [userAgent, execPath, launcherPath]
-    .filter(Boolean)
-    .join(" ")
-    .toLowerCase();
-
-  if (installationClues.includes("pnpm")) {
+  const normalizedUserAgent = userAgent?.toLowerCase() || "";
+  if (normalizedUserAgent.startsWith("pnpm/")) {
     return "pnpm";
   }
-  if (installationClues.includes("bun")) {
+  if (normalizedUserAgent.startsWith("bun/")) {
     return "bun";
   }
-  if (installationClues.includes("npm")) {
+  if (normalizedUserAgent.startsWith("npm/")) {
     return "npm";
+  }
+
+  const executableName = path.basename(execPath || "").toLowerCase();
+  if (executableName.includes("pnpm")) {
+    return "pnpm";
+  }
+  if (executableName === "bun" || executableName === "bun.exe") {
+    return "bun";
+  }
+  if (
+    executableName === "npm" ||
+    executableName === "npm.cmd" ||
+    executableName === "npm-cli.js"
+  ) {
+    return "npm";
+  }
+
+  const normalizedLauncherPath = launcherPath?.replaceAll("\\", "/").toLowerCase() || "";
+  if (normalizedLauncherPath.includes("/.pnpm/") || normalizedLauncherPath.includes("/pnpm/")) {
+    return "pnpm";
+  }
+  if (normalizedLauncherPath.includes("/.bun/") || normalizedLauncherPath.includes("/bun/")) {
+    return "bun";
   }
   return undefined;
 }
@@ -93,6 +112,39 @@ function detectInstallationScope(launcherPath) {
     return "global";
   }
   return normalizedPath.includes("/node_modules/") ? "local" : undefined;
+}
+
+function detectForwardingContext({ packageName, launcherPath }) {
+  if (packageName !== "@microck/satelle") {
+    return { packageName, launcherPath };
+  }
+
+  const canonicalRoot = path.dirname(path.dirname(launcherPath));
+  if (
+    path.basename(canonicalRoot) !== "satelle" ||
+    path.basename(path.dirname(canonicalRoot)) !== "@microck"
+  ) {
+    return { packageName, launcherPath };
+  }
+
+  const nodeModulesRoot = path.dirname(path.dirname(canonicalRoot));
+  const unscopedRoot = path.join(nodeModulesRoot, "satelle");
+  const unscopedManifestPath = path.join(unscopedRoot, "package.json");
+  const unscopedLauncherPath = path.join(unscopedRoot, "bin", "satelle.cjs");
+  if (!existsSync(unscopedManifestPath) || !existsSync(unscopedLauncherPath)) {
+    return { packageName, launcherPath };
+  }
+
+  try {
+    const manifest = JSON.parse(readFileSync(unscopedManifestPath, "utf8"));
+    if (manifest.name === "satelle" && manifest.dependencies?.["@microck/satelle"]) {
+      return { packageName: "satelle", launcherPath: unscopedLauncherPath };
+    }
+  } catch {
+    // Invalid package metadata must not change the canonical launch context.
+  }
+
+  return { packageName, launcherPath };
 }
 
 function reinstallCommand({ packageManager, packageName, installScope }) {
@@ -164,6 +216,7 @@ function executeNativeBinary(binaryPath, argumentsToForward) {
 
 function main({ packageName = "@microck/satelle", launcherPath = __filename } = {}) {
   try {
+    const launchContext = detectForwardingContext({ packageName, launcherPath });
     const runtime = {
       platform: process.platform,
       arch: process.arch,
@@ -173,12 +226,12 @@ function main({ packageName = "@microck/satelle", launcherPath = __filename } = 
     const packageManager = detectPackageManager({
       userAgent: process.env.npm_config_user_agent,
       execPath: process.env.npm_execpath,
-      launcherPath,
+      launcherPath: launchContext.launcherPath,
     });
     const recoveryContext = {
       packageManager,
-      packageName,
-      installScope: detectInstallationScope(launcherPath),
+      packageName: launchContext.packageName,
+      installScope: detectInstallationScope(launchContext.launcherPath),
     };
     const binaryPath = resolveNativeBinary(
       target,
@@ -197,6 +250,7 @@ function main({ packageName = "@microck/satelle", launcherPath = __filename } = 
 
 module.exports = {
   LauncherError,
+  detectForwardingContext,
   detectInstallationScope,
   detectLinuxLibc,
   detectPackageManager,

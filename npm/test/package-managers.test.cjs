@@ -10,9 +10,11 @@ const {
   mkdtempSync,
   mkdirSync,
   readFileSync,
+  realpathSync,
   rmSync,
   writeFileSync,
 } = require("node:fs");
+const { createRequire } = require("node:module");
 const { tmpdir } = require("node:os");
 const path = require("node:path");
 const test = require("node:test");
@@ -206,5 +208,30 @@ test("npm, pnpm, and Bun install and execute the unscoped forwarding package", (
     assert.equal(execution.status, 23, `${packageManager.name}: ${execution.stderr}`);
     assert.equal(execution.stdout, JSON.stringify([packageManager.name, "unscoped"]));
     assert.equal(execution.stderr, "");
+
+    const canonicalLauncherPath = createRequire(
+      realpathSync(path.join(consumerRoot, "node_modules", "satelle", "package.json")),
+    ).resolve("@microck/satelle/launcher");
+    const nativePackageManifest = createRequire(canonicalLauncherPath).resolve(
+      `${currentTargetEntry()[1].packageName}/package.json`,
+    );
+    rmSync(path.dirname(nativePackageManifest), { recursive: true, force: true });
+    const missingNativeExecution = spawnSync(executable, [], {
+      cwd: consumerRoot,
+      encoding: "utf8",
+      env: {
+        ...process.env,
+        npm_config_user_agent: `${packageManager.name}/test`,
+      },
+      shell: process.platform === "win32",
+    });
+    assert.equal(missingNativeExecution.status, 1, packageManager.name);
+    assert.match(
+      missingNativeExecution.stderr,
+      packageManager.name === "npm"
+        ? /npm install satelle --include=optional/
+        : new RegExp(`${packageManager.name} add satelle`),
+      packageManager.name,
+    );
   }
 });

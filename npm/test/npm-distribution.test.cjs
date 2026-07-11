@@ -209,6 +209,12 @@ test("package-manager detection recognizes npm, pnpm, and Bun owners", () => {
     "bun",
   );
   assert.equal(launcher.detectPackageManager({ launcherPath: "/tmp/custom/satelle.cjs" }), undefined);
+  assert.equal(
+    launcher.detectPackageManager({
+      launcherPath: "/home/ubuntu/project/node_modules/satelle/bin/satelle.cjs",
+    }),
+    undefined,
+  );
 });
 
 test("installation scope detection recognizes global and local package layouts", () => {
@@ -225,6 +231,39 @@ test("installation scope detection recognizes global and local package layouts",
     "local",
   );
   assert.equal(launcher.detectInstallationScope("/opt/satelle/bin/satelle.cjs"), undefined);
+});
+
+test("canonical launches detect an installed unscoped forwarding package", (context) => {
+  const fixtureRoot = mkdtempSync(path.join(tmpdir(), "satelle-forwarding-context-"));
+  context.after(() => rmSync(fixtureRoot, { recursive: true, force: true }));
+  const canonicalLauncher = path.join(
+    fixtureRoot,
+    "node_modules",
+    "@microck",
+    "satelle",
+    "bin",
+    "satelle.cjs",
+  );
+  const unscopedRoot = path.join(fixtureRoot, "node_modules", "satelle");
+  const unscopedLauncher = path.join(unscopedRoot, "bin", "satelle.cjs");
+  mkdirSync(path.dirname(canonicalLauncher), { recursive: true });
+  mkdirSync(path.dirname(unscopedLauncher), { recursive: true });
+  writeFileSync(unscopedLauncher, "fixture");
+  writeFileSync(
+    path.join(unscopedRoot, "package.json"),
+    JSON.stringify({
+      name: "satelle",
+      dependencies: { "@microck/satelle": "0.1.0" },
+    }),
+  );
+
+  assert.deepEqual(
+    launcher.detectForwardingContext({
+      packageName: "@microck/satelle",
+      launcherPath: canonicalLauncher,
+    }),
+    { packageName: "satelle", launcherPath: unscopedLauncher },
+  );
 });
 
 test("Linux libc detection distinguishes glibc, musl, and unknown runtimes", () => {
@@ -341,7 +380,7 @@ test("package manifests align versions, constraints, dependencies, and executabl
   assert.equal(unscopedManifest.version, canonicalManifest.version);
 });
 
-test("the unscoped executable preserves canonical launcher behavior", (context) => {
+test("the unscoped executable preserves its forwarding context", (context) => {
   const fixtureRoot = mkdtempSync(path.join(tmpdir(), "satelle-unscoped-forwarder-"));
   context.after(() => rmSync(fixtureRoot, { recursive: true, force: true }));
   const unscopedBin = path.join(fixtureRoot, "node_modules", "satelle", "bin", "satelle.cjs");
@@ -361,12 +400,15 @@ test("the unscoped executable preserves canonical launcher behavior", (context) 
   );
   writeFileSync(
     path.join(canonicalRoot, "launcher.cjs"),
-    "module.exports = { main(...args) { process.stdout.write(JSON.stringify(args)); } };\n",
+    "module.exports = { main(options) { process.stdout.write(JSON.stringify(options)); } };\n",
   );
 
   const child = spawnSync(process.execPath, [unscopedBin], { encoding: "utf8" });
   assert.equal(child.status, 0);
-  assert.deepEqual(JSON.parse(child.stdout), []);
+  assert.deepEqual(JSON.parse(child.stdout), {
+    packageName: "satelle",
+    launcherPath: realpathSync(unscopedBin),
+  });
   assert.equal(child.stderr, "");
 });
 
