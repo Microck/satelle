@@ -5,6 +5,7 @@ members = [
     "crates/satelle-host",
     "crates/satelle-transport",
 ]
+exclude = ["vendor/command-group"]
 resolver = "3"
 
 [workspace.package]
@@ -14,6 +15,7 @@ license = "MIT"
 
 [workspace.dependencies]
 base64 = "0.22.1"
+command-group = "5.0.1"
 axum = { version = "0.8.9", default-features = false, features = ["http1", "json", "query", "tokio", "ws"] }
 clap = { version = "4.5.52", features = ["derive", "env"] }
 clap_complete = "4.6.7"
@@ -40,3 +42,9 @@ tracing = "0.1.44"
 uuid = { version = "1.23.0", features = ["v7"] }
 windows-sys = { version = "=0.61.2", default-features = false }
 zeroize = "1.9.0"
+
+[patch.crates-io]
+# command-group 5.0.1 leaks a suspended Windows child when job assignment
+# fails. Keep the upstream API but vendor the lifecycle fix until it is
+# released upstream.
+command-group = { path = "vendor/command-group" }

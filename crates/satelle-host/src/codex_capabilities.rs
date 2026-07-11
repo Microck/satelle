@@ -1,18 +1,26 @@
+use command_group::{CommandGroup, GroupChild};
 use serde::Serialize;
 use std::fmt;
 use std::io::ErrorKind;
 use std::io::Read;
-use std::process::{Child, Command, Stdio};
+use std::process::{Command, Stdio};
 use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
+
+#[path = "runtime-codex.rs"]
+mod control_plane;
+
+#[cfg(test)]
+#[path = "runtime-codex-tests.rs"]
+mod control_plane_tests;
 
 const VERSION_OUTPUT_LIMIT: u64 = 129;
 const VERSION_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 const VERSION_PROBE_POLL_INTERVAL: Duration = Duration::from_millis(10);
 
-/// The only Codex release whose stable app-server contract is accepted by
-/// Satelle Phase 0. A newer semver is not assumed to be compatible.
+/// Exact Codex release whose stable schema and native-host behavior define the
+/// Phase 0 compatibility contract. Later patches require fresh acceptance.
 pub(crate) const REQUIRED_CODEX_VERSION: CodexVersion = CodexVersion::new(0, 144, 0);
 
 /// Every upstream capability required before native Computer Use can be
@@ -261,8 +269,8 @@ pub(crate) struct CapabilityMatrix {
 }
 
 impl CapabilityMatrix {
-    /// Production discovery has not yet run the stable schema and native-host
-    /// acceptance suite, so every capability remains explicitly unproven.
+    /// Fail-closed fallback when the installed runtime cannot expose a version
+    /// and stable schema. Native-host acceptance remains separately unproven.
     pub(crate) const fn unproven() -> Self {
         let absent = CapabilityEvidence::new(EvidenceSurface::Absent, LiveProofStatus::NotRequired);
         let unobserved =
@@ -379,10 +387,26 @@ impl Phase0SupportVerdict {
 /// Collects the deliberately narrow evidence production can prove today. The
 /// version command's bytes are classified and dropped inside this module.
 pub(crate) fn discover_phase0_evidence() -> Phase0CapabilityEvidence {
+    let host_platform = HostPlatform::current();
+    if !host_platform.supports_native_computer_use() {
+        return Phase0CapabilityEvidence {
+            codex_version: CodexVersionEvidence::Unavailable,
+            host_platform,
+            capabilities: CapabilityMatrix::unproven(),
+        };
+    }
+
+    let codex_version = probe_codex_version();
+    let capabilities = match codex_version {
+        CodexVersionEvidence::Detected { version } if version == REQUIRED_CODEX_VERSION => {
+            CapabilityMatrix::from_control_plane(control_plane::probe_installed_control_plane())
+        }
+        _ => CapabilityMatrix::unproven(),
+    };
     Phase0CapabilityEvidence {
-        codex_version: probe_codex_version(),
-        host_platform: HostPlatform::current(),
-        capabilities: CapabilityMatrix::unproven(),
+        codex_version,
+        host_platform,
+        capabilities,
     }
 }
 
@@ -391,6 +415,16 @@ pub(crate) fn discover_phase0_evidence() -> Phase0CapabilityEvidence {
 /// no blocker exists.
 #[must_use]
 pub(crate) fn evaluate_phase0_support(evidence: Phase0CapabilityEvidence) -> Phase0SupportVerdict {
+    if !evidence.host_platform.supports_native_computer_use() {
+        return Phase0SupportVerdict::Blocked {
+            blockers: vec![blocker_for(
+                evidence,
+                BlockerReason::UnsupportedHostPlatform,
+                RequiredCapability::NativeReadiness,
+            )],
+        };
+    }
+
     let mut blockers = Vec::new();
 
     let version_blocker = match evidence.codex_version {
@@ -402,14 +436,6 @@ pub(crate) fn evaluate_phase0_support(evidence: Phase0CapabilityEvidence) -> Pha
     };
     if let Some(reason) = version_blocker {
         blockers.push(blocker_for(evidence, reason, RequiredCapability::Handshake));
-    }
-
-    if !evidence.host_platform.supports_native_computer_use() {
-        blockers.push(blocker_for(
-            evidence,
-            BlockerReason::UnsupportedHostPlatform,
-            RequiredCapability::NativeReadiness,
-        ));
     }
 
     for capability in REQUIRED_CAPABILITIES {
@@ -478,15 +504,14 @@ fn probe_codex_version_command(mut command: Command, timeout: Duration) -> Codex
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
-        .spawn()
+        .group_spawn()
     {
         Ok(child) => child,
         Err(error) if error.kind() == ErrorKind::NotFound => return CodexVersionEvidence::Missing,
         Err(_) => return CodexVersionEvidence::Unavailable,
     };
-    let Some(stdout) = child.stdout.take() else {
-        let _ = child.kill();
-        let _ = child.wait();
+    let Some(stdout) = child.inner().stdout.take() else {
+        let _ = terminate_group(&mut child);
         return CodexVersionEvidence::Unavailable;
     };
 
@@ -494,25 +519,30 @@ fn probe_codex_version_command(mut command: Command, timeout: Duration) -> Codex
     // that point prevents an unexpected executable from filling memory with
     // arbitrary output. Stderr is discarded at the process boundary.
     let (sender, receiver) = mpsc::channel();
-    let _reader = thread::spawn(move || {
-        let mut output = Vec::with_capacity(VERSION_OUTPUT_LIMIT as usize);
-        let output = stdout
-            .take(VERSION_OUTPUT_LIMIT)
-            .read_to_end(&mut output)
-            .map(|_| output);
+    let reader = thread::spawn(move || {
+        let output = read_version_output(stdout, deadline);
         let _ = sender.send(output);
     });
 
-    let Some(status) = wait_for_child(&mut child, deadline) else {
-        let _ = child.kill();
-        let _ = child.wait();
+    let status = wait_for_leader(&mut child, deadline);
+    let group_stopped = terminate_group(&mut child);
+    #[cfg(not(unix))]
+    if !group_stopped && !reader.is_finished() {
         return CodexVersionEvidence::Unavailable;
-    };
+    }
     let remaining = deadline.saturating_duration_since(Instant::now());
-    let Ok(Ok(output)) = receiver.recv_timeout(remaining) else {
+    let output = receiver.recv_timeout(remaining);
+    let reader_stopped = reader.join().is_ok();
+    let Ok(Ok(output)) = output else {
         return CodexVersionEvidence::Unavailable;
     };
+    if !group_stopped || !reader_stopped {
+        return CodexVersionEvidence::Unavailable;
+    }
 
+    let GroupWaitOutcome::Exited(status) = status else {
+        return CodexVersionEvidence::Unavailable;
+    };
     if !status.success() {
         return CodexVersionEvidence::Unavailable;
     }
@@ -520,14 +550,108 @@ fn probe_codex_version_command(mut command: Command, timeout: Duration) -> Codex
     parse_codex_version_output(&output)
 }
 
-fn wait_for_child(child: &mut Child, deadline: Instant) -> Option<std::process::ExitStatus> {
+#[cfg(unix)]
+fn read_version_output(
+    stdout: std::process::ChildStdout,
+    deadline: Instant,
+) -> std::io::Result<Vec<u8>> {
+    set_nonblocking(&stdout)?;
+
+    let mut output = Vec::with_capacity(VERSION_OUTPUT_LIMIT as usize);
+    let mut bounded = stdout.take(VERSION_OUTPUT_LIMIT);
     loop {
-        match child.try_wait() {
-            Ok(Some(status)) => return Some(status),
-            Ok(None) if Instant::now() < deadline => thread::sleep(VERSION_PROBE_POLL_INTERVAL),
-            Ok(None) | Err(_) => return None,
+        match bounded.read_to_end(&mut output) {
+            Ok(_) => return Ok(output),
+            Err(error) if error.kind() == ErrorKind::WouldBlock && Instant::now() < deadline => {
+                thread::sleep(VERSION_PROBE_POLL_INTERVAL);
+            }
+            Err(error) => return Err(error),
         }
     }
+}
+
+#[cfg(not(unix))]
+fn read_version_output(
+    stdout: std::process::ChildStdout,
+    _deadline: Instant,
+) -> std::io::Result<Vec<u8>> {
+    let mut output = Vec::with_capacity(VERSION_OUTPUT_LIMIT as usize);
+    stdout
+        .take(VERSION_OUTPUT_LIMIT)
+        .read_to_end(&mut output)
+        .map(|_| output)
+}
+
+#[cfg(unix)]
+fn set_nonblocking(fd: &impl std::os::fd::AsFd) -> std::io::Result<()> {
+    let flags = rustix::fs::fcntl_getfl(fd)?;
+    Ok(rustix::fs::fcntl_setfl(
+        fd,
+        flags | rustix::fs::OFlags::NONBLOCK,
+    )?)
+}
+
+enum GroupWaitOutcome {
+    Exited(std::process::ExitStatus),
+    Deadline,
+    Error,
+}
+
+fn wait_for_leader(child: &mut GroupChild, deadline: Instant) -> GroupWaitOutcome {
+    loop {
+        match child.inner().try_wait() {
+            Ok(Some(status)) => return GroupWaitOutcome::Exited(status),
+            Ok(None) if Instant::now() < deadline => thread::sleep(VERSION_PROBE_POLL_INTERVAL),
+            Ok(None) => return GroupWaitOutcome::Deadline,
+            Err(_) => return GroupWaitOutcome::Error,
+        }
+    }
+}
+
+fn wait_for_group(child: &mut GroupChild, deadline: Instant) -> GroupWaitOutcome {
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return GroupWaitOutcome::Exited(status),
+            Ok(None) if Instant::now() < deadline => thread::sleep(VERSION_PROBE_POLL_INTERVAL),
+            Ok(None) => return GroupWaitOutcome::Deadline,
+            Err(_) => return GroupWaitOutcome::Error,
+        }
+    }
+}
+
+fn terminate_group(child: &mut GroupChild) -> bool {
+    let killed_or_gone = match child.kill() {
+        Ok(()) => true,
+        Err(error) => group_is_gone(&error),
+    };
+    if !killed_or_gone {
+        return false;
+    }
+    match child.wait() {
+        Ok(_) => true,
+        Err(error) => group_is_reaped(&error),
+    }
+}
+
+fn group_is_gone(error: &std::io::Error) -> bool {
+    if matches!(error.kind(), ErrorKind::NotFound | ErrorKind::InvalidInput) {
+        return true;
+    }
+    #[cfg(unix)]
+    {
+        error.raw_os_error() == Some(rustix::io::Errno::SRCH.raw_os_error())
+    }
+    #[cfg(not(unix))]
+    false
+}
+
+fn group_is_reaped(_error: &std::io::Error) -> bool {
+    #[cfg(unix)]
+    {
+        _error.raw_os_error() == Some(rustix::io::Errno::CHILD.raw_os_error())
+    }
+    #[cfg(not(unix))]
+    false
 }
 
 fn parse_codex_version_output(output: &[u8]) -> CodexVersionEvidence {
@@ -581,354 +705,5 @@ fn parse_version_component(component: &str) -> Option<u16> {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    const INCOMPLETE_PROOF_STATES: [LiveProofStatus; 3] = [
-        LiveProofStatus::NotRequired,
-        LiveProofStatus::NotObserved,
-        LiveProofStatus::Failed,
-    ];
-    const NON_STABLE_SURFACES: [EvidenceSurface; 3] = [
-        EvidenceSurface::Experimental,
-        EvidenceSurface::Undocumented,
-        EvidenceSurface::Absent,
-    ];
-
-    #[test]
-    fn exact_candidate_with_complete_proof_supports_macos_and_windows() {
-        for platform in [HostPlatform::Macos, HostPlatform::Windows] {
-            let verdict = evaluate_phase0_support(fully_proven_evidence(platform));
-
-            assert_eq!(
-                verdict,
-                Phase0SupportVerdict::Supported {
-                    codex_version: REQUIRED_CODEX_VERSION,
-                    host_platform: platform,
-                }
-            );
-        }
-    }
-
-    #[test]
-    fn every_other_codex_version_is_blocked_at_the_handshake_gate() {
-        for detected_version in [
-            CodexVersion::new(0, 143, 9),
-            CodexVersion::new(0, 144, 1),
-            CodexVersion::new(0, 145, 0),
-            CodexVersion::new(1, 0, 0),
-        ] {
-            let mut evidence = fully_proven_evidence(HostPlatform::Windows);
-            evidence.codex_version = CodexVersionEvidence::Detected {
-                version: detected_version,
-            };
-
-            assert_eq!(
-                blockers(evaluate_phase0_support(evidence)),
-                vec![Phase0CapabilityBlocker {
-                    reason: BlockerReason::UnsupportedCodexVersion,
-                    capability: RequiredCapability::Handshake,
-                    codex_version: CodexVersionEvidence::Detected {
-                        version: detected_version,
-                    },
-                    host_platform: HostPlatform::Windows,
-                    observed_surface: EvidenceSurface::Stable,
-                    live_proof: LiveProofStatus::NotRequired,
-                }]
-            );
-        }
-    }
-
-    #[test]
-    fn every_non_host_platform_is_blocked_at_native_readiness() {
-        for platform in [HostPlatform::Linux, HostPlatform::Other] {
-            let evidence = fully_proven_evidence(platform);
-
-            assert_eq!(
-                blockers(evaluate_phase0_support(evidence)),
-                vec![Phase0CapabilityBlocker {
-                    reason: BlockerReason::UnsupportedHostPlatform,
-                    capability: RequiredCapability::NativeReadiness,
-                    codex_version: CodexVersionEvidence::Detected {
-                        version: REQUIRED_CODEX_VERSION,
-                    },
-                    host_platform: platform,
-                    observed_surface: EvidenceSurface::Stable,
-                    live_proof: LiveProofStatus::Passed,
-                }]
-            );
-        }
-    }
-
-    #[test]
-    fn every_required_capability_rejects_every_non_stable_surface() {
-        for capability in REQUIRED_CAPABILITIES {
-            for surface in NON_STABLE_SURFACES {
-                let mut evidence = fully_proven_evidence(HostPlatform::Macos);
-                evidence_mut(&mut evidence.capabilities, capability).surface = surface;
-
-                assert_eq!(
-                    blockers(evaluate_phase0_support(evidence)),
-                    vec![Phase0CapabilityBlocker {
-                        reason: BlockerReason::NonStableSurface,
-                        capability,
-                        codex_version: CodexVersionEvidence::Detected {
-                            version: REQUIRED_CODEX_VERSION,
-                        },
-                        host_platform: HostPlatform::Macos,
-                        observed_surface: surface,
-                        live_proof: if capability.requires_live_proof() {
-                            LiveProofStatus::Passed
-                        } else {
-                            LiveProofStatus::NotRequired
-                        },
-                    }],
-                    "{capability:?} unexpectedly accepted {surface:?} evidence"
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn every_live_proof_capability_rejects_every_incomplete_proof_state() {
-        for capability in REQUIRED_CAPABILITIES
-            .into_iter()
-            .filter(|capability| capability.requires_live_proof())
-        {
-            for proof_status in INCOMPLETE_PROOF_STATES {
-                let mut evidence = fully_proven_evidence(HostPlatform::Windows);
-                evidence_mut(&mut evidence.capabilities, capability).live_proof = proof_status;
-
-                assert_eq!(
-                    blockers(evaluate_phase0_support(evidence)),
-                    vec![Phase0CapabilityBlocker {
-                        reason: BlockerReason::IncompleteLiveProof,
-                        capability,
-                        codex_version: CodexVersionEvidence::Detected {
-                            version: REQUIRED_CODEX_VERSION,
-                        },
-                        host_platform: HostPlatform::Windows,
-                        observed_surface: EvidenceSurface::Stable,
-                        live_proof: proof_status,
-                    }],
-                    "{capability:?} unexpectedly accepted {proof_status:?} proof"
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn all_blocker_classes_are_reported_together_without_claiming_support() {
-        let mut evidence = fully_proven_evidence(HostPlatform::Linux);
-        evidence.codex_version = CodexVersionEvidence::Detected {
-            version: CodexVersion::new(0, 145, 0),
-        };
-        evidence.capabilities.approval_observation.surface = EvidenceSurface::Absent;
-        evidence.capabilities.approval_observation.live_proof = LiveProofStatus::NotObserved;
-
-        let blockers = blockers(evaluate_phase0_support(evidence));
-
-        assert_eq!(blockers.len(), 4);
-        assert!(
-            blockers
-                .iter()
-                .any(|blocker| { blocker.reason == BlockerReason::UnsupportedCodexVersion })
-        );
-        assert!(
-            blockers
-                .iter()
-                .any(|blocker| { blocker.reason == BlockerReason::UnsupportedHostPlatform })
-        );
-        assert!(
-            blockers
-                .iter()
-                .any(|blocker| blocker.reason == BlockerReason::NonStableSurface)
-        );
-        assert!(
-            blockers
-                .iter()
-                .any(|blocker| { blocker.reason == BlockerReason::IncompleteLiveProof })
-        );
-    }
-
-    #[test]
-    fn serialized_blockers_have_a_closed_diagnostic_shape() {
-        let mut evidence = fully_proven_evidence(HostPlatform::Linux);
-        evidence.capabilities.native_harmless_action.surface = EvidenceSurface::Undocumented;
-        evidence.capabilities.native_harmless_action.live_proof = LiveProofStatus::Failed;
-
-        let verdict = evaluate_phase0_support(evidence);
-        let serialized = serde_json::to_string(&verdict).expect("verdict must serialize");
-
-        assert!(!serialized.contains("terminal"));
-        assert!(!serialized.contains("gui"));
-        assert!(!serialized.contains("method"));
-
-        let value = serde_json::to_value(&verdict).expect("verdict must serialize as JSON");
-        assert_eq!(value["status"], "blocked");
-        let blocker = value["blockers"][0]
-            .as_object()
-            .expect("blocked verdict must contain typed blocker objects");
-        let mut keys: Vec<_> = blocker.keys().map(String::as_str).collect();
-        keys.sort_unstable();
-        assert_eq!(
-            vec![
-                "capability",
-                "codex_version",
-                "host_platform",
-                "live_proof",
-                "observed_surface",
-                "reason",
-            ],
-            keys
-        );
-    }
-
-    fn fully_proven_evidence(host_platform: HostPlatform) -> Phase0CapabilityEvidence {
-        let stable = CapabilityEvidence::new(EvidenceSurface::Stable, LiveProofStatus::NotRequired);
-        let proven = CapabilityEvidence::new(EvidenceSurface::Stable, LiveProofStatus::Passed);
-
-        Phase0CapabilityEvidence {
-            codex_version: CodexVersionEvidence::Detected {
-                version: REQUIRED_CODEX_VERSION,
-            },
-            host_platform,
-            capabilities: CapabilityMatrix {
-                handshake: stable,
-                session_thread_creation: stable,
-                turn_start: stable,
-                lifecycle_events: stable,
-                approval_observation: proven,
-                native_readiness: proven,
-                native_harmless_action: proven,
-                recovery: proven,
-                follow_up_turn: proven,
-                detached_turn_ownership: proven,
-                interrupt_request: stable,
-                confirmed_stop: proven,
-            },
-        }
-    }
-
-    fn evidence_mut(
-        matrix: &mut CapabilityMatrix,
-        capability: RequiredCapability,
-    ) -> &mut CapabilityEvidence {
-        match capability {
-            RequiredCapability::Handshake => &mut matrix.handshake,
-            RequiredCapability::SessionThreadCreation => &mut matrix.session_thread_creation,
-            RequiredCapability::TurnStart => &mut matrix.turn_start,
-            RequiredCapability::LifecycleEvents => &mut matrix.lifecycle_events,
-            RequiredCapability::ApprovalObservation => &mut matrix.approval_observation,
-            RequiredCapability::NativeReadiness => &mut matrix.native_readiness,
-            RequiredCapability::NativeHarmlessAction => &mut matrix.native_harmless_action,
-            RequiredCapability::Recovery => &mut matrix.recovery,
-            RequiredCapability::FollowUpTurn => &mut matrix.follow_up_turn,
-            RequiredCapability::DetachedTurnOwnership => &mut matrix.detached_turn_ownership,
-            RequiredCapability::InterruptRequest => &mut matrix.interrupt_request,
-            RequiredCapability::ConfirmedStop => &mut matrix.confirmed_stop,
-        }
-    }
-
-    fn blockers(verdict: Phase0SupportVerdict) -> Vec<Phase0CapabilityBlocker> {
-        match verdict {
-            Phase0SupportVerdict::Blocked { blockers } => blockers,
-            Phase0SupportVerdict::Supported { .. } => {
-                panic!("expected a blocked Phase 0 support verdict")
-            }
-        }
-    }
-
-    #[test]
-    fn version_probe_parser_accepts_only_the_canonical_codex_cli_line() {
-        let expected = CodexVersionEvidence::Detected {
-            version: REQUIRED_CODEX_VERSION,
-        };
-        assert_eq!(parse_codex_version_output(b"codex-cli 0.144.0\n"), expected);
-        assert_eq!(
-            parse_codex_version_output(b"codex-cli 0.144.0\r\n"),
-            expected
-        );
-
-        for malformed in [
-            b"codex 0.144.0".as_slice(),
-            b" codex-cli 0.144.0".as_slice(),
-            b"codex-cli 0.144.0 ".as_slice(),
-            b"codex-cli 0.144".as_slice(),
-            b"codex-cli 00.144.0".as_slice(),
-            b"codex-cli 0.0144.0".as_slice(),
-            b"codex-cli 0.144.0-beta.1".as_slice(),
-            b"codex-cli 0.144.0\nextra".as_slice(),
-            b"codex-cli 0.144.0\n\n".as_slice(),
-            b"\xff\xfe".as_slice(),
-        ] {
-            assert_eq!(
-                parse_codex_version_output(malformed),
-                CodexVersionEvidence::Malformed
-            );
-        }
-
-        assert_eq!(
-            parse_codex_version_output(&[b'x'; VERSION_OUTPUT_LIMIT as usize]),
-            CodexVersionEvidence::Malformed
-        );
-    }
-
-    #[test]
-    fn missing_and_malformed_versions_have_distinct_typed_blockers() {
-        for (version, expected_reason) in [
-            (
-                CodexVersionEvidence::Missing,
-                BlockerReason::MissingCodexRuntime,
-            ),
-            (
-                CodexVersionEvidence::Malformed,
-                BlockerReason::MalformedCodexVersion,
-            ),
-            (
-                CodexVersionEvidence::Unavailable,
-                BlockerReason::CodexVersionUnavailable,
-            ),
-        ] {
-            let mut evidence = fully_proven_evidence(HostPlatform::Windows);
-            evidence.codex_version = version;
-
-            let blockers = blockers(evaluate_phase0_support(evidence));
-            assert_eq!(blockers.len(), 1);
-            assert_eq!(blockers[0].reason, expected_reason);
-            assert_eq!(blockers[0].codex_version, version);
-        }
-    }
-
-    #[test]
-    fn version_probe_times_out_and_terminates_a_slow_process() {
-        let mut command = Command::new(
-            std::env::current_exe().expect("the current test executable should be available"),
-        );
-        command
-            .args([
-                "--exact",
-                "codex_capabilities::tests::slow_version_probe_child",
-                "--nocapture",
-            ])
-            .env("SATELLE_VERSION_PROBE_TEST_CHILD", "slow");
-        let started = Instant::now();
-
-        let evidence = probe_codex_version_command(command, Duration::from_millis(50));
-
-        assert_eq!(evidence, CodexVersionEvidence::Unavailable);
-        assert!(
-            started.elapsed() < Duration::from_secs(2),
-            "the bounded version probe exceeded its termination deadline"
-        );
-    }
-
-    #[test]
-    fn slow_version_probe_child() {
-        if std::env::var_os("SATELLE_VERSION_PROBE_TEST_CHILD").as_deref()
-            == Some(std::ffi::OsStr::new("slow"))
-        {
-            thread::sleep(Duration::from_secs(5));
-        }
-    }
-}
+#[path = "codex-capabilities-tests.rs"]
+mod tests;
