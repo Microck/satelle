@@ -378,12 +378,6 @@ impl RuntimeEngine {
             .map_err(model::storage_failure)
     }
 
-    fn session_count(&self) -> Result<usize, SatelleError> {
-        self.lock_storage()?
-            .session_count()
-            .map_err(model::storage_failure)
-    }
-
     fn host_identity(&self) -> Result<satelle_core::session::HostIdentityRef, SatelleError> {
         self.lock_storage()?
             .host_identity()
@@ -524,23 +518,13 @@ impl RuntimeHandle {
             .append_log_for_tests(timestamp, source, severity)
     }
 
-    pub(crate) fn session_count(&self) -> Result<usize, SatelleError> {
-        self.engine()?.session_count()
-    }
-
-    pub(crate) fn reconcile(&self) -> Result<(), SatelleError> {
-        let engine = self.engine()?;
-        engine.reconcile_pending().map(|_resolved| ())?;
-        self.adapter.preflight(LOCAL_DEMO_HOST).map(|_| ())
-    }
-
-    pub(crate) fn initialize_for_daemon(&self) -> Result<RuntimeSnapshot, SatelleError> {
+    pub(crate) fn reconcile_and_snapshot(&self) -> Result<RuntimeSnapshot, SatelleError> {
         let engine = self.engine()?;
         engine.reconcile_pending()?;
         engine.snapshot()
     }
 
-    pub(crate) fn snapshot_for_daemon(&self) -> Result<RuntimeSnapshot, SatelleError> {
+    pub(crate) fn snapshot(&self) -> Result<RuntimeSnapshot, SatelleError> {
         self.engine()?.snapshot()
     }
 

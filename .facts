@@ -2040,6 +2040,9 @@
 - label: No CI-tagged fact is manual
   command: test -z "$(facts list --tags ci --manual --light | sed -n '/^-/p')"
   tags: [implemented, ci, mvp]
+- label: Rust workspace release build passes with warnings denied
+  command: RUSTFLAGS="-D warnings" cargo build --workspace --release --locked
+  tags: [ci, mvp, implemented]
 
 ## contract-suites
 - the ci tag is reserved for command-bearing facts, while manual conformance and release-gate requirements use the verification tag until an executable mapping exists @spec @mvp

@@ -865,14 +865,6 @@ impl Storage {
         load_session_from_connection(&self.connection, session_id)
     }
 
-    pub(crate) fn session_count(&self) -> Result<usize, StorageError> {
-        let count: i64 = self
-            .connection
-            .query_row("SELECT count(*) FROM sessions", [], |row| row.get(0))
-            .map_err(|source| sqlite_error(StorageErrorKind::OperationFailed, source))?;
-        usize::try_from(count).map_err(|_| StorageError::new(StorageErrorKind::InvalidStoredState))
-    }
-
     pub(crate) fn snapshot(&self) -> Result<StorageSnapshot, StorageError> {
         let counts: (i64, i64, i64) = self
             .connection
