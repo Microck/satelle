@@ -1,7 +1,7 @@
 mod output;
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
-use output::{OutputArgs, OutputFormat};
+use output::{OutputArgs, OutputFormat, SessionResultSchemaVersion, StatusReport};
 use satelle_core::{
     BEACON_CORAL, CLI_NAME, DaemonPathOverrides, DoctorEventRecord, DoctorReport, ERROR_RED,
     ErrorCode, HostConfig, HostSessionsReport, LOCAL_DEMO_HOST, LogEntry, PRODUCT_NAME, RELAY_ROSE,
@@ -1927,7 +1927,13 @@ fn run_prompt(
         let session = transport
             .run_detached(&host, &prompt)
             .map_err(|error| failure(error, json))?;
-        return print_detached_session(session, effective_timeouts, &yolo_policy, json);
+        return print_detached_session(
+            session,
+            effective_timeouts,
+            &yolo_policy,
+            SessionResultSchemaVersion::RunV1,
+            json,
+        );
     }
 
     let outcome = transport
@@ -1942,6 +1948,7 @@ fn run_prompt(
             verbose: command.verbose,
             effective_timeouts,
             yolo_policy: &yolo_policy,
+            schema_version: SessionResultSchemaVersion::RunV1,
             json,
         },
     )
@@ -1981,7 +1988,13 @@ fn steer_prompt(
         let session = transport
             .steer_detached(&session_id, &prompt)
             .map_err(|error| failure(error, json))?;
-        return print_detached_session(session, effective_timeouts, &yolo_policy, json);
+        return print_detached_session(
+            session,
+            effective_timeouts,
+            &yolo_policy,
+            SessionResultSchemaVersion::SteerV1,
+            json,
+        );
     }
 
     let outcome = transport
@@ -1996,6 +2009,7 @@ fn steer_prompt(
             verbose: command.verbose,
             effective_timeouts,
             yolo_policy: &yolo_policy,
+            schema_version: SessionResultSchemaVersion::SteerV1,
             json,
         },
     )
@@ -2014,7 +2028,7 @@ fn show_status(
         .map_err(|error| failure(error, json))?;
 
     if json {
-        print_json(&session).map_err(|error| failure(error, json))
+        print_json(&StatusReport::new(&session)).map_err(|error| failure(error, json))
     } else {
         print_session_human(&session);
         Ok(())
@@ -2330,6 +2344,7 @@ struct TurnOutputOptions<'a> {
     verbose: bool,
     effective_timeouts: serde_json::Value,
     yolo_policy: &'a YoloPolicy,
+    schema_version: SessionResultSchemaVersion,
     json: bool,
 }
 
@@ -2377,6 +2392,7 @@ fn print_turn_outcome(
 
     if options.json {
         print_json(&json!({
+            "schema_version": options.schema_version,
             "session_id": outcome.session.session_id,
             "status": outcome.session.status,
             "effective_timeouts": options.effective_timeouts,
@@ -2397,10 +2413,12 @@ fn print_detached_session(
     session: SessionRecord,
     effective_timeouts: serde_json::Value,
     yolo_policy: &YoloPolicy,
+    schema_version: SessionResultSchemaVersion,
     json: bool,
 ) -> Result<(), CliFailure> {
     if json {
         print_json(&json!({
+            "schema_version": schema_version,
             "session_id": session.session_id,
             "host": session.host,
             "status": session.status,

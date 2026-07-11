@@ -1,5 +1,6 @@
 use clap::{Args, ValueEnum};
-use satelle_core::SatelleError;
+use satelle_core::{SatelleError, SessionId, SessionRecord, TurnRecord, TurnStatus};
+use serde::{Deserialize, Serialize};
 
 use super::{
     Command, ConfigCommand, EventMode, HostCommand, HostStorageCommand, SelfSubcommand,
@@ -10,6 +11,42 @@ use super::{
 pub(crate) enum OutputFormat {
     Human,
     Json,
+}
+
+/// Command-specific schema tokens for JSON results backed by a Satelle session.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub(crate) enum SessionResultSchemaVersion {
+    #[serde(rename = "satelle.run.v1")]
+    RunV1,
+    #[serde(rename = "satelle.steer.v1")]
+    SteerV1,
+    #[serde(rename = "satelle.status.v1")]
+    StatusV1,
+}
+
+#[derive(Serialize)]
+pub(crate) struct StatusReport<'a> {
+    schema_version: SessionResultSchemaVersion,
+    session_id: &'a SessionId,
+    host: &'a str,
+    status: &'a TurnStatus,
+    created_at: &'a str,
+    updated_at: &'a str,
+    turns: &'a [TurnRecord],
+}
+
+impl<'a> StatusReport<'a> {
+    pub(crate) fn new(session: &'a SessionRecord) -> Self {
+        Self {
+            schema_version: SessionResultSchemaVersion::StatusV1,
+            session_id: &session.session_id,
+            host: &session.host,
+            status: &session.status,
+            created_at: &session.created_at,
+            updated_at: &session.updated_at,
+            turns: &session.turns,
+        }
+    }
 }
 
 impl OutputFormat {
@@ -170,6 +207,7 @@ impl OutputArgs {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     fn args(format: Option<OutputFormat>, json: bool) -> OutputArgs {
         OutputArgs { format, json }
@@ -218,5 +256,23 @@ mod tests {
                 assert_eq!(stream_conflict.code.as_str(), "output-mode-conflict");
             }
         }
+    }
+
+    #[test]
+    fn session_result_schema_tokens_are_exact_and_strict() {
+        for (schema, expected) in [
+            (SessionResultSchemaVersion::RunV1, "satelle.run.v1"),
+            (SessionResultSchemaVersion::SteerV1, "satelle.steer.v1"),
+            (SessionResultSchemaVersion::StatusV1, "satelle.status.v1"),
+        ] {
+            assert_eq!(
+                serde_json::to_value(schema).expect("session result schema should serialize"),
+                json!(expected)
+            );
+        }
+
+        assert!(
+            serde_json::from_value::<SessionResultSchemaVersion>(json!("satelle.run.v2")).is_err()
+        );
     }
 }
