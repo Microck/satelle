@@ -219,10 +219,11 @@ test("npm, pnpm, and Bun install and execute the unscoped forwarding package", (
     const missingNativeExecution = spawnSync(executable, [], {
       cwd: consumerRoot,
       encoding: "utf8",
-      env: {
-        ...process.env,
-        npm_config_user_agent: `${packageManager.name}/test`,
-      },
+      env: Object.fromEntries(
+        Object.entries(process.env).filter(
+          ([name]) => name !== "npm_config_user_agent" && name !== "npm_execpath",
+        ),
+      ),
       shell: process.platform === "win32",
     });
     assert.equal(missingNativeExecution.status, 1, packageManager.name);

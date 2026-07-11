@@ -199,7 +199,7 @@ test("a missing native package produces typed package-manager-specific recovery 
   }
 });
 
-test("package-manager detection recognizes npm, pnpm, and Bun owners", () => {
+test("package-manager detection recognizes npm, pnpm, and Bun owners", (context) => {
   assert.equal(launcher.detectPackageManager({ userAgent: "npm/11.6.2 node/v24" }), "npm");
   assert.equal(launcher.detectPackageManager({ execPath: "/usr/local/bin/pnpm.cjs" }), "pnpm");
   assert.equal(
@@ -215,6 +215,20 @@ test("package-manager detection recognizes npm, pnpm, and Bun owners", () => {
     }),
     undefined,
   );
+
+  const fixtureRoot = mkdtempSync(path.join(tmpdir(), "satelle-manager-lockfiles-"));
+  context.after(() => rmSync(fixtureRoot, { recursive: true, force: true }));
+  const launcherPath = path.join(fixtureRoot, "node_modules", "satelle", "bin", "satelle.cjs");
+  mkdirSync(path.dirname(launcherPath), { recursive: true });
+  for (const [lockfile, expectedManager] of [
+    ["bun.lock", "bun"],
+    ["pnpm-lock.yaml", "pnpm"],
+    ["package-lock.json", "npm"],
+  ]) {
+    writeFileSync(path.join(fixtureRoot, lockfile), "fixture");
+    assert.equal(launcher.detectPackageManager({ launcherPath }), expectedManager, lockfile);
+    rmSync(path.join(fixtureRoot, lockfile));
+  }
 });
 
 test("installation scope detection recognizes global and local package layouts", () => {

@@ -93,6 +93,29 @@ function detectPackageManager({ userAgent, execPath, launcherPath } = {}) {
   if (normalizedLauncherPath.includes("/.bun/") || normalizedLauncherPath.includes("/bun/")) {
     return "bun";
   }
+
+  let installationRoot = launcherPath ? path.resolve(launcherPath) : undefined;
+  while (installationRoot && path.basename(installationRoot) !== "node_modules") {
+    const parent = path.dirname(installationRoot);
+    if (parent === installationRoot) {
+      installationRoot = undefined;
+      break;
+    }
+    installationRoot = parent;
+  }
+  const projectRoot = installationRoot ? path.dirname(installationRoot) : undefined;
+  if (projectRoot) {
+    const lockfileManagers = [
+      ["bun", ["bun.lock", "bun.lockb"]],
+      ["pnpm", ["pnpm-lock.yaml"]],
+      ["npm", ["package-lock.json", "npm-shrinkwrap.json"]],
+    ];
+    for (const [packageManager, lockfiles] of lockfileManagers) {
+      if (lockfiles.some((lockfile) => existsSync(path.join(projectRoot, lockfile)))) {
+        return packageManager;
+      }
+    }
+  }
   return undefined;
 }
 
