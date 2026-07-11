@@ -135,16 +135,18 @@ fn failure(error: &SatelleError) -> ApiFailure {
             message: "the execution runtime could not complete the operation",
             details: None,
         },
-        // Completion installation is a Controller-local workflow. If this code ever crosses the
-        // Host boundary, expose only the stable internal-error contract rather than local paths.
-        ErrorCode::CompletionInstallFailed => ApiFailure {
-            status: StatusCode::INTERNAL_SERVER_ERROR,
-            code: ApiErrorCode::InternalError,
-            category: ApiErrorCategory::Internal,
-            retryable: false,
-            message: "the Host operation failed unexpectedly",
-            details: None,
-        },
+        // Completion installation and profile activation are Controller-local workflows. If
+        // either code crosses the Host boundary, expose only the stable internal-error contract.
+        ErrorCode::CompletionInstallFailed | ErrorCode::CompletionProfileUpdateFailed => {
+            ApiFailure {
+                status: StatusCode::INTERNAL_SERVER_ERROR,
+                code: ApiErrorCode::InternalError,
+                category: ApiErrorCategory::Internal,
+                retryable: false,
+                message: "the Host operation failed unexpectedly",
+                details: None,
+            }
+        }
         ErrorCode::CapacityExceeded | ErrorCode::ConcurrencyLimitExceeded => ApiFailure {
             status: StatusCode::SERVICE_UNAVAILABLE,
             code: ApiErrorCode::CapacityExceeded,
