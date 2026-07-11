@@ -1938,7 +1938,7 @@ impl SatelleError {
         Self {
             code: ErrorCode::OutputModeConflict,
             message: message.into(),
-            recovery_command: Some("choose either --json or --events".to_string()),
+            recovery_command: Some("remove all but one conflicting output selector".to_string()),
             source_detail: None,
             details: BTreeMap::new(),
         }
