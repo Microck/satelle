@@ -115,12 +115,12 @@
 - satelle run and steer report a typed output-mode-conflict usage error when --events json is combined with --json or any explicit --format value @contract @mvp @implemented
 - satelle doctor reports a typed output-mode-conflict usage error when --events is combined with --json or any explicit --format value @contract @mvp @implemented
 - satelle run, steer, stop, status, setup, repair, doctor, config check, config explain, self update, host update, paths, and host sessions JSON results include a top-level schema_version @spec @contract @mvp
-- satelle run JSON v1 uses schema_version satelle.run.v1 @spec @contract @mvp
-- satelle steer JSON v1 uses schema_version satelle.steer.v1 @spec @contract @mvp
+- satelle run JSON v1 uses schema_version satelle.run.v1 @contract @mvp @implemented
+- satelle steer JSON v1 uses schema_version satelle.steer.v1 @contract @mvp @implemented
 - satelle stop JSON v1 uses schema_version satelle.stop.v1 @spec @contract @mvp
 - satelle stop JSON v1 includes outcome, session_id, turn_id, previous_state, current_state, changed, and stopped_at fields; outcome is stopped or already_terminal @spec @contract @mvp
 - satelle stop on an already-terminal Turn exits 0 with outcome already_terminal and changed false @spec @contract @mvp
-- satelle status JSON v1 uses schema_version satelle.status.v1 @spec @contract @mvp
+- satelle status JSON v1 uses schema_version satelle.status.v1 @contract @mvp @implemented
 - satelle logs initial and followed JSON records each use schema_version satelle.logs.entry.v1 and emit exactly one record per line without a top-level wrapper @spec @contract @mvp
 - satelle setup JSON v1 uses schema_version satelle.setup.v1 @contract @mvp @implemented
 - satelle repair JSON v1 uses schema_version satelle.repair.v1 @spec @contract @mvp

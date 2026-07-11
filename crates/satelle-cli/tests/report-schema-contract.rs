@@ -23,6 +23,19 @@ fn satelle() -> Command {
     command
 }
 
+fn json_report(state: &TestStateDir, args: Vec<&str>) -> Value {
+    let output = satelle()
+        .env("SATELLE_STATE_DIR", state.path())
+        .args(args)
+        .assert()
+        .success()
+        .get_output()
+        .clone();
+
+    assert!(output.stderr.is_empty());
+    serde_json::from_slice(&output.stdout).expect("stdout should be one JSON report")
+}
+
 #[test]
 fn readiness_reports_use_their_canonical_v1_schema_tokens() {
     let state = TestStateDir::new().expect("secure temp state directory should be created");
@@ -48,19 +61,72 @@ fn readiness_reports_use_their_canonical_v1_schema_tokens() {
             "satelle.host.sessions.v1",
         ),
     ] {
-        let output = satelle()
-            .env("SATELLE_STATE_DIR", state.path())
-            .args(args)
-            .assert()
-            .success()
-            .get_output()
-            .clone();
-
-        assert!(output.stderr.is_empty());
-        let report: Value =
-            serde_json::from_slice(&output.stdout).expect("stdout should be one JSON report");
+        let report = json_report(&state, args);
         assert_eq!(report["schema_version"], expected_schema);
     }
+}
+
+#[test]
+fn session_commands_use_command_specific_v1_schema_tokens() {
+    let state = TestStateDir::new().expect("secure temp state directory should be created");
+
+    let run = json_report(
+        &state,
+        vec!["run", "--host", "local-demo", "--json", "Inspect"],
+    );
+    assert_eq!(run["schema_version"], "satelle.run.v1");
+    let session = run["session_id"]
+        .as_str()
+        .expect("run should return a session id");
+
+    let steer = json_report(
+        &state,
+        vec!["steer", session, "--json", "Continue inspection"],
+    );
+    assert_eq!(steer["schema_version"], "satelle.steer.v1");
+
+    let status = json_report(&state, vec!["status", session, "--json"]);
+    assert_eq!(status["schema_version"], "satelle.status.v1");
+    let status_fields = status.as_object().expect("status should be a JSON object");
+    assert_eq!(status_fields.len(), 7);
+    for field in [
+        "schema_version",
+        "session_id",
+        "host",
+        "status",
+        "created_at",
+        "updated_at",
+        "turns",
+    ] {
+        assert!(status_fields.contains_key(field), "missing field {field}");
+    }
+
+    let detached_steer = json_report(
+        &state,
+        vec![
+            "steer",
+            session,
+            "--detach",
+            "--json",
+            "Continue asynchronously",
+        ],
+    );
+    assert_eq!(detached_steer["schema_version"], "satelle.steer.v1");
+
+    let detached_run_state =
+        TestStateDir::new().expect("second secure temp state directory should be created");
+    let detached_run = json_report(
+        &detached_run_state,
+        vec![
+            "run",
+            "--host",
+            "local-demo",
+            "--detach",
+            "--json",
+            "Inspect asynchronously",
+        ],
+    );
+    assert_eq!(detached_run["schema_version"], "satelle.run.v1");
 }
 
 #[test]
