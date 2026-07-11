@@ -476,7 +476,7 @@ async fn event_handshakes_enforce_shape_and_per_principal_connection_capacity() 
 
 #[tokio::test]
 async fn daemon_shutdown_closes_event_sockets_with_a_typed_reason() {
-    let state = tempfile::tempdir().expect("temporary state directory");
+    let state = TestStateDir::new().expect("temporary state directory");
     let service = HostService::local_demo_for_tests_at(state.path())
         .expect("construct deterministic Host service");
     let initialized = service.initialize_daemon().expect("initialize Host state");

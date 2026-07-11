@@ -22,4 +22,3 @@ zeroize.workspace = true
 
 [dev-dependencies]
 satelle-host = { path = "../satelle-host", features = ["test-support"] }
-tempfile.workspace = true

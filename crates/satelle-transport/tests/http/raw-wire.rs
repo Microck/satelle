@@ -42,7 +42,7 @@ async fn duplicate_singleton_headers_fail_closed_without_admission() {
 
 #[tokio::test]
 async fn stalled_upload_cannot_hold_daemon_shutdown_open_forever() {
-    let state = tempfile::tempdir().expect("temporary state directory");
+    let state = TestStateDir::new().expect("temporary state directory");
     let service = HostService::local_demo_for_tests_at(state.path())
         .expect("construct deterministic Host service");
     let initialized = service.initialize_daemon().expect("initialize Host state");

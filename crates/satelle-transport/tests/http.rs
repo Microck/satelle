@@ -8,7 +8,7 @@ mod raw_wire;
 mod sessions;
 
 use reqwest::StatusCode;
-use satelle_host::{ApiBearerToken, ApiScopes, HostService};
+use satelle_host::{ApiBearerToken, ApiScopes, HostService, test_support::TestStateDir};
 use satelle_transport::{
     ApiError, CapabilitiesResponse, DaemonClient, DaemonClientError, DaemonServer,
     DaemonServerConfig, HostStatusResponse, LiveResponse, LogsPageResponse, RequestId,
@@ -16,7 +16,6 @@ use satelle_transport::{
 use serde_json::Value;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::time::Duration;
-use tempfile::TempDir;
 use tokio::io::AsyncWriteExt;
 use tokio::net::{TcpListener, TcpStream};
 
@@ -33,7 +32,7 @@ const EXPECTED_OPERATIONS: [&str; 9] = [
 ];
 
 struct RunningServer {
-    _state: TempDir,
+    _state: TestStateDir,
     service: HostService,
     server: DaemonServer,
     token: ApiBearerToken,
@@ -42,7 +41,7 @@ struct RunningServer {
 
 impl RunningServer {
     async fn start(scopes: ApiScopes) -> Self {
-        let state = tempfile::tempdir().expect("temporary state directory");
+        let state = TestStateDir::new().expect("temporary state directory");
         let service = HostService::local_demo_for_tests_at(state.path())
             .expect("construct deterministic Host service");
         let initialized = service.initialize_daemon().expect("initialize Host state");
@@ -425,7 +424,7 @@ async fn capabilities_are_truthful_and_unknown_routes_are_typed() {
 
 #[tokio::test]
 async fn plaintext_non_loopback_bind_is_rejected_before_listening() {
-    let state = tempfile::tempdir().expect("temporary state directory");
+    let state = TestStateDir::new().expect("temporary state directory");
     let service = HostService::local_demo_for_tests_at(state.path())
         .expect("construct deterministic Host service");
     let error = DaemonServer::bind(
@@ -549,7 +548,7 @@ async fn failed_authentication_limit_uses_the_real_peer_address() {
 
 #[tokio::test]
 async fn advertised_connection_limit_is_enforced_by_the_listener() {
-    let state = tempfile::tempdir().expect("temporary state directory");
+    let state = TestStateDir::new().expect("temporary state directory");
     let service = HostService::local_demo_for_tests_at(state.path())
         .expect("construct deterministic Host service");
     let initialized = service.initialize_daemon().expect("initialize Host state");

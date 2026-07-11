@@ -55,7 +55,6 @@ fn confirmed_stop_and_its_canonical_log_commit_atomically() {
             &turn_id(TURN_1),
             revisions(&session, TURN_1),
             TurnTransition::Running,
-            None,
             at(1),
         )
         .unwrap();
@@ -77,12 +76,7 @@ fn confirmed_stop_and_its_canonical_log_commit_atomically() {
         .expect("install deterministic stop-log failure");
 
     let error = storage
-        .confirm_stop(
-            claim,
-            StopObservation::UpstreamInactiveConfirmed,
-            None,
-            at(3),
-        )
+        .confirm_stop(claim, StopObservation::UpstreamInactiveConfirmed, at(3))
         .expect_err("a rejected canonical log must reject the stop commit");
 
     assert_eq!(StorageErrorKind::OperationFailed, error.kind());
@@ -130,7 +124,6 @@ fn lifecycle_transitions_emit_one_canonical_log_in_their_transaction() {
             &turn_id(TURN_1),
             revisions(&session, TURN_1),
             TurnTransition::Running,
-            None,
             at(1),
         )
         .expect("commit running");
@@ -140,7 +133,6 @@ fn lifecycle_transitions_emit_one_canonical_log_in_their_transaction() {
             &turn_id(TURN_1),
             revisions(&running, TURN_1),
             TurnTransition::Completed,
-            None,
             at(2),
         )
         .expect("commit completed");
@@ -210,7 +202,6 @@ fn lifecycle_transition_rolls_back_when_its_canonical_log_is_rejected() {
             &turn_id(TURN_1),
             revisions(&session, TURN_1),
             TurnTransition::Running,
-            None,
             at(1),
         )
         .expect_err("rejected canonical log must reject lifecycle commit");
@@ -243,7 +234,6 @@ fn restart_recovery_transition_and_log_commit_atomically() {
             &turn_id(TURN_1),
             revisions(&session, TURN_1),
             TurnTransition::Running,
-            None,
             at(1),
         )
         .expect("commit running");

@@ -1,10 +1,10 @@
 use assert_cmd::Command;
 use predicates::prelude::*;
 use satelle_core::SessionId;
+use satelle_host::test_support::TestStateDir;
 use serde_json::Value;
 use std::collections::BTreeSet;
 use std::fs;
-use tempfile::TempDir;
 
 const TEST_SUPPORT_ADAPTER_ENV: &str = "SATELLE_TEST_SUPPORT_ADAPTER";
 
@@ -32,8 +32,19 @@ fn production_satelle() -> Command {
     command
 }
 
-fn state_dir() -> TempDir {
-    tempfile::tempdir().expect("temp state dir should be created")
+fn state_dir() -> TestStateDir {
+    TestStateDir::new().expect("secure temp state directory should be created")
+}
+
+fn absolute_test_path(components: &[&str]) -> std::path::PathBuf {
+    #[cfg(windows)]
+    let mut path = std::path::PathBuf::from(r"C:\");
+    #[cfg(not(windows))]
+    let mut path = std::path::PathBuf::from("/");
+    for component in components {
+        path.push(component);
+    }
+    path
 }
 
 fn legacy_env(name: &str) -> String {
@@ -1244,16 +1255,26 @@ fn detach_returns_started_session_without_event_streaming() {
         .get_output()
         .clone();
     let logs = parse_json_output(&logs_output.stdout);
-    let events = logs["entries"]
+    let entries = logs["entries"]
         .as_array()
-        .unwrap()
+        .expect("logs should contain an entries array");
+    let recovery_cursor = entries
         .iter()
-        .map(|entry| entry["fields"]["event"].as_str().unwrap())
-        .collect::<Vec<_>>();
-    assert!(events.contains(&"restart_recovery_pending"));
+        .find(|entry| entry["fields"]["event"] == "restart_recovery_pending")
+        .and_then(|entry| entry["fields"]["cursor"].as_str())
+        .and_then(|cursor| cursor.parse::<u64>().ok())
+        .expect("restart recovery should be recorded with a numeric cursor");
     assert!(
-        !events.contains(&"turn_state_committed"),
-        "read-only commands must not invent adapter-confirmed liveness"
+        entries
+            .iter()
+            .filter(|entry| entry["fields"]["event"] == "turn_state_committed")
+            .all(|entry| {
+                entry["fields"]["cursor"]
+                    .as_str()
+                    .and_then(|cursor| cursor.parse::<u64>().ok())
+                    .is_some_and(|cursor| cursor < recovery_cursor)
+            }),
+        "read-only commands must not commit liveness after recovery begins"
     );
 
     let busy_output = satelle()
@@ -1886,6 +1907,11 @@ fn setup_mode_flags_are_reported_in_json() {
 #[test]
 fn setup_daemon_path_overrides_are_reported_and_validated() {
     let state = state_dir();
+    let daemon_home = absolute_test_path(&["srv", "satelle"]);
+    let daemon_config_file = daemon_home.join("config").join("config.toml");
+    let daemon_state_dir = daemon_home.join("state");
+    let daemon_cache_dir = daemon_home.join("cache");
+    let daemon_log_dir = daemon_home.join("logs");
     let output = satelle()
         .env("SATELLE_STATE_DIR", state.path())
         .args([
@@ -1894,17 +1920,17 @@ fn setup_daemon_path_overrides_are_reported_and_validated() {
             "--host",
             "local-demo",
             "--daemon-home",
-            "/srv/satelle",
-            "--daemon-config-file",
-            "/srv/satelle/config/config.toml",
-            "--daemon-state-dir",
-            "/srv/satelle/state",
-            "--daemon-cache-dir",
-            "/srv/satelle/cache",
-            "--daemon-log-dir",
-            "/srv/satelle/logs",
-            "--json",
         ])
+        .arg(&daemon_home)
+        .arg("--daemon-config-file")
+        .arg(&daemon_config_file)
+        .arg("--daemon-state-dir")
+        .arg(&daemon_state_dir)
+        .arg("--daemon-cache-dir")
+        .arg(&daemon_cache_dir)
+        .arg("--daemon-log-dir")
+        .arg(&daemon_log_dir)
+        .arg("--json")
         .assert()
         .success()
         .get_output()
@@ -1914,7 +1940,7 @@ fn setup_daemon_path_overrides_are_reported_and_validated() {
 
     assert_eq!(overrides.len(), 5);
     assert_eq!(overrides[0]["environment_variable"], "SATELLE_HOME");
-    assert_eq!(overrides[0]["value"], "/srv/satelle");
+    assert_eq!(overrides[0]["value"], serde_json::json!(daemon_home));
     assert_eq!(overrides[0]["source"], "setup_flag");
     assert_eq!(
         overrides[0]["service_configuration_surface"],
@@ -1969,17 +1995,24 @@ fn setup_daemon_path_overrides_are_reported_and_validated() {
 fn setup_uses_user_config_daemon_path_defaults_with_flags_taking_precedence() {
     let state = state_dir();
     let user_config = state.path().join("user-config.toml");
+    let daemon_state_dir = absolute_test_path(&["srv", "satelle", "state-from-config"]);
+    let daemon_log_dir = absolute_test_path(&["srv", "satelle", "logs-from-config"]);
+    let flag_log_dir = absolute_test_path(&["srv", "satelle", "logs-from-flag"]);
     fs::write(
         &user_config,
-        r#"
+        format!(
+            r#"
 default_host = "local-demo"
 
 [hosts.local-demo]
 transport = "local"
 adapter = "fake"
-daemon_state_dir = "/srv/satelle/state-from-config"
-daemon_log_dir = "/srv/satelle/logs-from-config"
+daemon_state_dir = '{}'
+daemon_log_dir = '{}'
 "#,
+            daemon_state_dir.display(),
+            daemon_log_dir.display()
+        ),
     )
     .expect("user config should be written");
 
@@ -1992,9 +2025,9 @@ daemon_log_dir = "/srv/satelle/logs-from-config"
             "--host",
             "local-demo",
             "--daemon-log-dir",
-            "/srv/satelle/logs-from-flag",
-            "--json",
         ])
+        .arg(&flag_log_dir)
+        .arg("--json")
         .assert()
         .success()
         .get_output()
@@ -2004,10 +2037,10 @@ daemon_log_dir = "/srv/satelle/logs-from-config"
 
     assert_eq!(overrides.len(), 2);
     assert_eq!(overrides[0]["environment_variable"], "SATELLE_STATE_DIR");
-    assert_eq!(overrides[0]["value"], "/srv/satelle/state-from-config");
+    assert_eq!(overrides[0]["value"], serde_json::json!(daemon_state_dir));
     assert_eq!(overrides[0]["source"], "user_config");
     assert_eq!(overrides[1]["environment_variable"], "SATELLE_LOG_DIR");
-    assert_eq!(overrides[1]["value"], "/srv/satelle/logs-from-flag");
+    assert_eq!(overrides[1]["value"], serde_json::json!(flag_log_dir));
     assert_eq!(overrides[1]["source"], "setup_flag");
 }
 
@@ -2192,7 +2225,7 @@ provider_alias = "anthropic"
 
     let output = satelle()
         .current_dir(&project)
-        .env("XDG_CONFIG_HOME", state.path().join("xdg"))
+        .env("SATELLE_CONFIG_FILE", user_config.join("config.toml"))
         .env("SATELLE_STATE_DIR", state.path())
         .args(["config", "explain", "--json"])
         .assert()
@@ -3134,9 +3167,11 @@ value = "42"
 fn provider_auth_secret_sources_are_host_resolved_and_redacted_in_config_explain() {
     let state = state_dir();
     let user_config = state.path().join("user-config.toml");
+    let secret_file = absolute_test_path(&["run", "secrets", "openai-api-key"]);
     fs::write(
         &user_config,
-        r#"
+        format!(
+            r#"
 default_host = "local-demo"
 
 [hosts.local-demo]
@@ -3145,7 +3180,7 @@ adapter = "fake"
 
 [hosts.local-demo.provider_auth.openai]
 kind = "file"
-path = "/run/secrets/openai-api-key"
+path = '{}'
 
 [hosts.local-demo.provider_auth.anthropic]
 kind = "environment"
@@ -3160,6 +3195,8 @@ account = "apple"
 kind = "host-store"
 name = "local-provider-token"
 "#,
+            secret_file.display()
+        ),
     )
     .expect("user config should be written");
 
@@ -3179,7 +3216,7 @@ name = "local-provider-token"
         .get_output()
         .clone();
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(!stdout.contains("/run/secrets/openai-api-key"));
+    assert!(!stdout.contains(secret_file.to_string_lossy().as_ref()));
     assert!(!stdout.contains("ANTHROPIC_API_KEY"));
     let report = parse_json_output(&output.stdout);
     let openai = &report["effective"]["hosts"]["local-demo"]["provider_auth"]["openai"];
@@ -3206,7 +3243,7 @@ name = "local-provider-token"
 
     assert_eq!(
         provider_auth["openai"]["path"],
-        "/run/secrets/openai-api-key"
+        serde_json::json!(secret_file)
     );
     assert_eq!(provider_auth["openai"]["redacted"], false);
     assert_eq!(provider_auth["anthropic"]["variable"], "ANTHROPIC_API_KEY");

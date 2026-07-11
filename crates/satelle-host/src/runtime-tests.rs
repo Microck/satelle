@@ -3,6 +3,7 @@ use super::{
     ComputerUseAdapter, LogQuery, RecoveryObservation, RequestIdentity, RunCommand, RuntimeHandle,
     RuntimeStartupState, SteerCommand, StopCommand,
 };
+use crate::storage::PrivateUpstreamRef;
 use crate::test_runtime::FakeComputerUseAdapter;
 use satelle_core::session::{StopObservation, TurnState};
 use satelle_core::{ErrorCode, EventType, LOCAL_DEMO_HOST, SatelleError};
@@ -12,6 +13,8 @@ use std::time::Duration;
 
 const WAIT_LIMIT: Duration = Duration::from_secs(2);
 const STABLE_DIGEST: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+const PRIVATE_UPSTREAM_THREAD_REF: &str = "PRIVATE_UPSTREAM_THREAD_REFERENCE_CANARY";
+const PRIVATE_UPSTREAM_TURN_REF: &str = "PRIVATE_UPSTREAM_TURN_REFERENCE_CANARY";
 
 #[test]
 fn adapter_types_are_erased_at_the_runtime_handle_boundary() {
@@ -31,7 +34,7 @@ fn adapter_types_are_erased_at_the_runtime_handle_boundary() {
 
 #[test]
 fn blocked_preflight_opens_authoritative_state_without_admitting_work() {
-    let state = tempfile::tempdir().expect("temporary state directory should exist");
+    let state = crate::TestStateDir::new().expect("temporary state directory should exist");
     let runtime = RuntimeHandle::new(
         Ok(state.path().to_path_buf()),
         BlockedComputerUseAdapter::new(SatelleError::computer_use_not_ready()),
@@ -57,7 +60,7 @@ fn blocked_preflight_opens_authoritative_state_without_admitting_work() {
 
 #[test]
 fn retrying_a_stable_run_identity_does_not_repeat_adapter_execution() {
-    let state = tempfile::tempdir().expect("temporary state directory should exist");
+    let state = crate::TestStateDir::new().expect("temporary state directory should exist");
     let execute_calls = Arc::new(AtomicUsize::new(0));
     let adapter = CountingAdapter::new(Arc::clone(&execute_calls));
     let runtime = RuntimeHandle::new(Ok(state.path().to_path_buf()), adapter);
@@ -84,7 +87,7 @@ fn retrying_a_stable_run_identity_does_not_repeat_adapter_execution() {
 
 #[test]
 fn retrying_a_stable_steer_identity_does_not_repeat_adapter_execution() {
-    let state = tempfile::tempdir().expect("temporary state directory should exist");
+    let state = crate::TestStateDir::new().expect("temporary state directory should exist");
     let execute_calls = Arc::new(AtomicUsize::new(0));
     let adapter = CountingAdapter::new(Arc::clone(&execute_calls));
     let runtime = RuntimeHandle::new(Ok(state.path().to_path_buf()), adapter);
@@ -116,7 +119,7 @@ fn retrying_a_stable_steer_identity_does_not_repeat_adapter_execution() {
 
 #[test]
 fn stable_stop_replay_keeps_its_original_turn_after_a_later_follow_up() {
-    let state = tempfile::tempdir().expect("temporary state directory should exist");
+    let state = crate::TestStateDir::new().expect("temporary state directory should exist");
     let adapter = FailFirstAdapter::default();
     let runtime = RuntimeHandle::new(Ok(state.path().to_path_buf()), adapter.clone());
     let session = runtime
@@ -161,7 +164,7 @@ fn stable_stop_replay_keeps_its_original_turn_after_a_later_follow_up() {
 
 #[test]
 fn reads_and_stop_remain_available_during_slow_execution_and_stop_observation() {
-    let state = tempfile::tempdir().expect("temporary state directory should exist");
+    let state = crate::TestStateDir::new().expect("temporary state directory should exist");
     let adapter = BlockingExecutionAndStopAdapter::default();
     let runtime = RuntimeHandle::new(Ok(state.path().to_path_buf()), adapter.clone());
     let session = runtime
@@ -257,8 +260,84 @@ fn reads_and_stop_remain_available_during_slow_execution_and_stop_observation() 
 }
 
 #[test]
+fn adapter_persists_upstream_refs_before_waiting_and_stop_keeps_them_durable() {
+    let state = crate::TestStateDir::new().expect("temporary state directory should exist");
+    let adapter = ReferencePersistingAdapter::default();
+    let runtime = RuntimeHandle::new(Ok(state.path().to_path_buf()), adapter.clone());
+    let session = runtime
+        .run(RunCommand::detached(
+            LOCAL_DEMO_HOST,
+            "PRIVATE_REFERENCE_PERSISTENCE_PROMPT",
+        ))
+        .expect("detached work should be admitted")
+        .session;
+    let turn_id = session
+        .latest_turn()
+        .expect("admitted Session must contain its starting Turn")
+        .turn_id
+        .clone();
+    if !adapter.references_recorded.wait_for(WAIT_LIMIT) {
+        adapter.execute_release.signal();
+        panic!("the adapter did not durably record its upstream references");
+    }
+
+    let engine = runtime.engine().expect("runtime engine should be open");
+    let expected_thread_ref = PrivateUpstreamRef::new(PRIVATE_UPSTREAM_THREAD_REF)
+        .expect("the thread canary must be a valid private reference");
+    let expected_turn_ref = PrivateUpstreamRef::new(PRIVATE_UPSTREAM_TURN_REF)
+        .expect("the Turn canary must be a valid private reference");
+    let durable_subject = engine
+        .lock_storage()
+        .expect("lock runtime storage")
+        .recovery_subject(&session.session_id, &turn_id)
+        .expect("reload durable adapter subject");
+    assert_eq!(
+        durable_subject.upstream_thread_ref(),
+        Some(&expected_thread_ref)
+    );
+    assert_eq!(
+        durable_subject.upstream_turn_ref(),
+        Some(&expected_turn_ref)
+    );
+    let public_session = runtime
+        .status_public(&session.session_id)
+        .expect("read public Session while execution is waiting");
+    let logs = runtime
+        .logs(LogQuery::for_host(LOCAL_DEMO_HOST))
+        .expect("read safe logs while execution is waiting");
+    let public_json = serde_json::to_string(&(public_session, logs))
+        .expect("serialize public state and safe logs");
+    assert!(!public_json.contains(PRIVATE_UPSTREAM_THREAD_REF));
+    assert!(!public_json.contains(PRIVATE_UPSTREAM_TURN_REF));
+
+    let stopped = runtime
+        .stop(StopCommand::new(session.session_id.clone()))
+        .expect("stop observation should consume the durable references");
+    assert_eq!(stopped.current_state(), TurnState::Stopped);
+    adapter.execute_release.signal();
+    runtime
+        .wait_for_background()
+        .expect("the losing execution worker should finish");
+
+    let final_status = runtime
+        .status(session.session_id.clone())
+        .expect("the confirmed stop should remain terminal");
+    assert_eq!(final_status.status, satelle_core::TurnStatus::Stopped);
+    let final_subject = engine
+        .lock_storage()
+        .expect("lock runtime storage after stop")
+        .recovery_subject(&session.session_id, &turn_id)
+        .expect("reload durable adapter subject after stop");
+    assert_eq!(
+        final_subject.upstream_thread_ref(),
+        Some(&expected_thread_ref)
+    );
+    assert_eq!(final_subject.upstream_turn_ref(), Some(&expected_turn_ref));
+}
+
+#[test]
 fn read_paths_open_storage_without_computer_use_preflight() {
-    let state = tempfile::tempdir().expect("temporary state directory should exist");
+    let state = crate::TestStateDir::new().expect("temporary state directory should exist");
     let state_root = state.path().to_path_buf();
     let seeded = RuntimeHandle::new(Ok(state_root.clone()), FakeComputerUseAdapter);
     let session = seeded
@@ -288,7 +367,7 @@ fn read_paths_open_storage_without_computer_use_preflight() {
 
 #[test]
 fn detached_adapter_error_enters_recovery_without_a_restart() {
-    let state = tempfile::tempdir().expect("temporary state directory should exist");
+    let state = crate::TestStateDir::new().expect("temporary state directory should exist");
     let runtime = RuntimeHandle::new(Ok(state.path().to_path_buf()), FailFirstAdapter::default());
     let session = runtime
         .run(RunCommand::detached(
@@ -335,7 +414,7 @@ fn restart_recovery_commits_adapter_proven_blocked_and_failed_outcomes() {
             satelle_core::TurnStatus::Failed,
         ),
     ] {
-        let state = tempfile::tempdir().expect("temporary state directory should exist");
+        let state = crate::TestStateDir::new().expect("temporary state directory should exist");
         let state_root = state.path().to_path_buf();
         let interrupted = RuntimeHandle::new(Ok(state_root.clone()), FailFirstAdapter::default());
         let old_session = interrupted
@@ -366,7 +445,7 @@ fn restart_recovery_commits_adapter_proven_blocked_and_failed_outcomes() {
 
 #[test]
 fn new_admission_reconciles_restart_work_without_blocking_reads() {
-    let state = tempfile::tempdir().expect("temporary state directory should exist");
+    let state = crate::TestStateDir::new().expect("temporary state directory should exist");
     let state_root = state.path().to_path_buf();
     let interrupted = RuntimeHandle::new(Ok(state_root.clone()), FailFirstAdapter::default());
     let old_session = interrupted
@@ -452,7 +531,7 @@ fn new_admission_reconciles_restart_work_without_blocking_reads() {
 
 #[test]
 fn unknown_restart_work_blocks_new_admission_until_stop_resolves_it() {
-    let state = tempfile::tempdir().expect("temporary state directory should exist");
+    let state = crate::TestStateDir::new().expect("temporary state directory should exist");
     let state_root = state.path().to_path_buf();
     let interrupted = RuntimeHandle::new(Ok(state_root.clone()), FailFirstAdapter::default());
     let session = interrupted
@@ -615,6 +694,46 @@ struct BlockingExecutionAndStopAdapter {
     execute_release: Latch,
     stop_started: Latch,
     stop_release: Latch,
+}
+
+#[derive(Clone, Default)]
+struct ReferencePersistingAdapter {
+    references_recorded: Latch,
+    execute_release: Latch,
+}
+
+impl super::ComputerUseAdapter for ReferencePersistingAdapter {
+    fn preflight(&self, host: &str) -> Result<super::AdapterReadiness, SatelleError> {
+        FakeComputerUseAdapter.preflight(host)
+    }
+
+    fn execute(
+        &self,
+        request: super::ExecuteRequest<'_>,
+    ) -> Result<super::ExecuteResult, SatelleError> {
+        request.persist_upstream_thread_ref(PRIVATE_UPSTREAM_THREAD_REF)?;
+        request.persist_upstream_turn_ref(PRIVATE_UPSTREAM_TURN_REF)?;
+        self.references_recorded.signal();
+        self.execute_release.wait();
+        FakeComputerUseAdapter.execute(request)
+    }
+
+    fn observe_stop(
+        &self,
+        subject: super::AdapterSubject<'_>,
+    ) -> Result<StopObservation, SatelleError> {
+        if !subject.has_upstream_references() {
+            return Err(SatelleError::computer_use_not_ready());
+        }
+        Ok(StopObservation::UpstreamInactiveConfirmed)
+    }
+
+    fn observe_recovery(
+        &self,
+        subject: super::AdapterSubject<'_>,
+    ) -> Result<RecoveryObservation, SatelleError> {
+        FakeComputerUseAdapter.observe_recovery(subject)
+    }
 }
 
 impl BlockingExecutionAndStopAdapter {

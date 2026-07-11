@@ -2,13 +2,15 @@ use super::codec::format_time;
 use super::{StorageError, StorageErrorKind};
 use rusqlite::ffi::ErrorCode as SqliteErrorCode;
 use rusqlite::{Connection, OpenFlags, OptionalExtension, TransactionBehavior, params};
-use std::fs::{self, File, TryLockError};
+use std::fs::{File, TryLockError};
 use std::path::Path;
 use std::time::Duration;
 use time::OffsetDateTime;
 
 #[cfg(unix)]
 use rustix::fs::{FileType, Mode, OFlags};
+#[cfg(unix)]
+use std::fs;
 #[cfg(unix)]
 use std::os::unix::fs::MetadataExt;
 
@@ -127,7 +129,7 @@ pub(super) fn anchored_vfs_name_for_test() -> Result<&'static std::ffi::CStr, St
     unix_vfs::name()
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 pub(super) fn open_parts_with_after_lock_hook(
     state_root: &Path,
     after_lock: impl FnOnce(),
@@ -136,7 +138,7 @@ pub(super) fn open_parts_with_after_lock_hook(
 }
 
 #[cfg(unix)]
-fn prepare_state_root(state_root: &Path) -> Result<StateDirectory, StorageError> {
+pub(super) fn prepare_state_root(state_root: &Path) -> Result<StateDirectory, StorageError> {
     if !state_root.is_absolute() || state_root.parent().is_none() {
         return Err(StorageError::new(StorageErrorKind::UnsafeStatePath));
     }
@@ -230,8 +232,14 @@ fn open_and_restrict_state_directory(path: &Path) -> Result<StateDirectory, Stor
     let path_metadata = fs::symlink_metadata(path).map_err(|source| {
         StorageError::with_source(StorageErrorKind::StateDirectoryUnavailable, source)
     })?;
+    #[cfg(target_os = "macos")]
+    // macOS exposes `dev_t` as a signed C integer even though it is an opaque
+    // device bit pattern. Preserve those bits for `MetadataExt::dev()`.
+    let descriptor_device = metadata.st_dev as u64;
+    #[cfg(not(target_os = "macos"))]
+    let descriptor_device = metadata.st_dev;
     if path_metadata.file_type().is_symlink()
-        || path_metadata.dev() != metadata.st_dev
+        || path_metadata.dev() != descriptor_device
         || path_metadata.ino() != metadata.st_ino
     {
         return Err(StorageError::new(StorageErrorKind::UnsafeStatePath));
@@ -242,7 +250,7 @@ fn open_and_restrict_state_directory(path: &Path) -> Result<StateDirectory, Stor
 }
 
 #[cfg(windows)]
-fn prepare_state_root(state_root: &Path) -> Result<StateDirectory, StorageError> {
+pub(super) fn prepare_state_root(state_root: &Path) -> Result<StateDirectory, StorageError> {
     windows::SecureStateDirectory::prepare(state_root).map(|secure| StateDirectory { secure })
 }
 

@@ -6,7 +6,7 @@ use super::codec::{
 };
 use super::logs::canonical_log;
 use super::{
-    IdempotencyInput, IdempotentOperation, LeaseOwner, LogEvent, LogSeverity, ObservedUpstreamRefs,
+    IdempotencyInput, IdempotentOperation, LeaseOwner, LogEvent, LogSeverity, ObservedUpstreamRef,
     PrivateRequestToken, PrivateUpstreamRef, RecoverySubject, SafeLogRecord, Storage, StorageError,
     StorageErrorKind, sqlite_error,
 };
@@ -329,39 +329,52 @@ pub(super) fn persist_lifecycle_mutation(
     Ok(())
 }
 
-pub(super) fn merge_observed_references(
+pub(super) fn merge_observed_reference(
     transaction: &Transaction<'_>,
     session_id: &SessionId,
     turn_id: &TurnId,
-    observed: &ObservedUpstreamRefs,
+    observed: &ObservedUpstreamRef,
 ) -> Result<(), StorageError> {
-    if let Some(thread_ref) = &observed.thread_ref {
-        let changed = transaction
+    let belongs_to_session: i64 = transaction
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM turns WHERE session_id = ?1 AND turn_id = ?2)",
+            params![session_id.as_str(), turn_id.as_str()],
+            |row| row.get(0),
+        )
+        .map_err(|source| sqlite_error(StorageErrorKind::OperationFailed, source))?;
+    if belongs_to_session != 1 {
+        return Err(StorageError::new(StorageErrorKind::InvalidStoredState));
+    }
+
+    let changed = match observed {
+        ObservedUpstreamRef::Thread(thread_ref) => transaction
             .execute(
                 "UPDATE session_private_refs SET upstream_thread_ref = COALESCE(upstream_thread_ref, ?1) \
-                 WHERE session_id = ?2 AND (upstream_thread_ref IS NULL OR upstream_thread_ref = ?1)",
+                 WHERE session_id = ?2 \
+                   AND (upstream_thread_ref IS NULL OR upstream_thread_ref = ?1) \
+                   AND NOT EXISTS ( \
+                       SELECT 1 FROM session_private_refs AS existing \
+                       WHERE existing.session_id <> ?2 AND existing.upstream_thread_ref = ?1 \
+                   )",
                 params![thread_ref.0.as_str(), session_id.as_str()],
-            )
-            .map_err(|source| sqlite_error(StorageErrorKind::OperationFailed, source))?;
-        if changed != 1 {
-            return Err(StorageError::new(
-                StorageErrorKind::PrivateReferenceConflict,
-            ));
-        }
-    }
-    if let Some(turn_ref) = &observed.turn_ref {
-        let changed = transaction
+            ),
+        ObservedUpstreamRef::Turn(turn_ref) => transaction
             .execute(
                 "UPDATE turn_private_refs SET upstream_turn_ref = COALESCE(upstream_turn_ref, ?1) \
-                 WHERE turn_id = ?2 AND (upstream_turn_ref IS NULL OR upstream_turn_ref = ?1)",
+                 WHERE turn_id = ?2 \
+                   AND (upstream_turn_ref IS NULL OR upstream_turn_ref = ?1) \
+                   AND NOT EXISTS ( \
+                       SELECT 1 FROM turn_private_refs AS existing \
+                       WHERE existing.turn_id <> ?2 AND existing.upstream_turn_ref = ?1 \
+                   )",
                 params![turn_ref.0.as_str(), turn_id.as_str()],
-            )
-            .map_err(|source| sqlite_error(StorageErrorKind::OperationFailed, source))?;
-        if changed != 1 {
-            return Err(StorageError::new(
-                StorageErrorKind::PrivateReferenceConflict,
-            ));
-        }
+            ),
+    }
+    .map_err(|source| sqlite_error(StorageErrorKind::OperationFailed, source))?;
+    if changed != 1 {
+        return Err(StorageError::new(
+            StorageErrorKind::PrivateReferenceConflict,
+        ));
     }
     Ok(())
 }

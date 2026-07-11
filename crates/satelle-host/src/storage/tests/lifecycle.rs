@@ -31,17 +31,22 @@ fn terminal_session_round_trips_with_follow_up_and_exact_snapshot() {
                 TurnStateRevision::initial(),
             ),
             TurnTransition::Running,
-            Some(&observed_refs("thread-private-1", "turn-private-1")),
             at(1),
         )
         .expect("commit running");
+    record_upstream_refs(
+        &mut storage,
+        session.id(),
+        &turn_id(TURN_1),
+        "thread-private-1",
+        "turn-private-1",
+    );
     session = storage
         .commit_lifecycle(
             session.id(),
             &turn_id(TURN_1),
             revisions(&session, TURN_1),
             TurnTransition::Completed,
-            None,
             at(2),
         )
         .expect("commit completion");
@@ -69,13 +74,19 @@ fn terminal_session_round_trips_with_follow_up_and_exact_snapshot() {
         panic!("new follow-up admission must execute");
     };
     session = follow_up;
+    record_upstream_refs(
+        &mut storage,
+        session.id(),
+        &turn_id(TURN_2),
+        "thread-private-1",
+        "turn-private-2",
+    );
     session = storage
         .commit_lifecycle(
             session.id(),
             &turn_id(TURN_2),
             revisions(&session, TURN_2),
             TurnTransition::Completed,
-            Some(&observed_refs("thread-private-1", "turn-private-2")),
             at(4),
         )
         .expect("complete follow-up");
@@ -89,6 +100,246 @@ fn terminal_session_round_trips_with_follow_up_and_exact_snapshot() {
         .expect("load Session")
         .expect("stored Session");
     assert_eq!(expected, restored.snapshot());
+}
+
+#[test]
+fn upstream_reference_observation_is_lifecycle_neutral_idempotent_and_conflict_safe() {
+    let state = TempDir::new().expect("temporary state directory");
+    let (mut storage, _) = Storage::open(state.path()).expect("open storage");
+    let session = initial_session(&storage, SESSION_1, TURN_1, at(0));
+    let context = admission(
+        IdempotentOperation::Run,
+        "run-reference-observation",
+        "request-reference-observation",
+        at(0),
+    );
+    let AdmissionOutcome::Execute {
+        session: admitted, ..
+    } = storage
+        .begin_session(&session, &context)
+        .expect("admit initial Session")
+    else {
+        panic!("new Session admission must execute");
+    };
+    let before = admitted.snapshot();
+    let logs_before = storage
+        .logs_after(None, 100)
+        .expect("read logs before reference observation")
+        .len();
+
+    let thread_ref = ObservedUpstreamRef::thread("thread-private-1").unwrap();
+    let turn_ref = ObservedUpstreamRef::turn("turn-private-1").unwrap();
+    storage
+        .record_upstream_ref(admitted.id(), &turn_id(TURN_1), &thread_ref)
+        .expect("persist the first observed thread reference");
+    storage
+        .record_upstream_ref(admitted.id(), &turn_id(TURN_1), &turn_ref)
+        .expect("persist the first observed Turn reference");
+    storage
+        .record_upstream_ref(admitted.id(), &turn_id(TURN_1), &thread_ref)
+        .expect("recording the same thread reference must be idempotent");
+    storage
+        .record_upstream_ref(admitted.id(), &turn_id(TURN_1), &turn_ref)
+        .expect("recording the same Turn reference must be idempotent");
+
+    let conflicting_thread = storage
+        .record_upstream_ref(
+            admitted.id(),
+            &turn_id(TURN_1),
+            &ObservedUpstreamRef::thread("thread-private-conflict").unwrap(),
+        )
+        .expect_err("a different thread reference must fail closed");
+    assert_eq!(
+        StorageErrorKind::PrivateReferenceConflict,
+        conflicting_thread.kind()
+    );
+
+    let conflicting_turn = storage
+        .record_upstream_ref(
+            admitted.id(),
+            &turn_id(TURN_1),
+            &ObservedUpstreamRef::turn("turn-private-conflict").unwrap(),
+        )
+        .expect_err("a different Turn reference must fail closed");
+    assert_eq!(
+        StorageErrorKind::PrivateReferenceConflict,
+        conflicting_turn.kind()
+    );
+
+    let restored = storage
+        .load_session(admitted.id())
+        .expect("load Session after reference observation")
+        .expect("stored Session");
+    assert_eq!(before, restored.snapshot());
+    assert_eq!(
+        logs_before,
+        storage
+            .logs_after(None, 100)
+            .expect("read logs after reference observation")
+            .len()
+    );
+    let refs = storage
+        .recovery_subject(admitted.id(), &turn_id(TURN_1))
+        .expect("reload the final reference-bearing subject");
+    let expected_thread_ref = PrivateUpstreamRef::new("thread-private-1").unwrap();
+    let expected_turn_ref = PrivateUpstreamRef::new("turn-private-1").unwrap();
+    assert_eq!(Some(&expected_thread_ref), refs.upstream_thread_ref());
+    assert_eq!(Some(&expected_turn_ref), refs.upstream_turn_ref());
+    assert!(matches!(
+        storage
+            .begin_session(&session, &context)
+            .expect("idempotency outcome must remain readable"),
+        AdmissionOutcome::InProgress(_)
+    ));
+
+    let competing = initial_session(&storage, SESSION_2, TURN_3, at(1));
+    let lease_error = storage
+        .begin_session(
+            &competing,
+            &admission(
+                IdempotentOperation::Run,
+                "run-reference-competitor",
+                "request-reference-competitor",
+                at(1),
+            ),
+        )
+        .expect_err("reference persistence must retain Control Lease ownership");
+    assert_eq!(StorageErrorKind::LeaseConflict, lease_error.kind());
+}
+
+#[test]
+fn upstream_reference_rejects_a_valid_turn_owned_by_another_session() {
+    let state = TempDir::new().expect("temporary state directory");
+    let (mut storage, _) = Storage::open(state.path()).expect("open storage");
+    let first = initial_session(&storage, SESSION_1, TURN_1, at(0));
+    let AdmissionOutcome::Execute { session: first, .. } = storage
+        .begin_session(
+            &first,
+            &admission(IdempotentOperation::Run, "run-1", "request-run-1", at(0)),
+        )
+        .expect("admit the first Session")
+    else {
+        panic!("new Session admission must execute");
+    };
+    let first = storage
+        .commit_lifecycle(
+            first.id(),
+            &turn_id(TURN_1),
+            revisions(&first, TURN_1),
+            TurnTransition::Completed,
+            at(1),
+        )
+        .expect("complete the first Session and release its lease");
+    let second = initial_session(&storage, SESSION_2, TURN_2, at(2));
+    let AdmissionOutcome::Execute {
+        session: second, ..
+    } = storage
+        .begin_session(
+            &second,
+            &admission(IdempotentOperation::Run, "run-2", "request-run-2", at(2)),
+        )
+        .expect("admit the second Session")
+    else {
+        panic!("new Session admission must execute");
+    };
+
+    let error = storage
+        .record_upstream_ref(
+            first.id(),
+            &turn_id(TURN_2),
+            &ObservedUpstreamRef::thread("thread-cross-session").unwrap(),
+        )
+        .expect_err("a Turn owned by another Session must be rejected");
+    assert_eq!(StorageErrorKind::InvalidStoredState, error.kind());
+    assert!(
+        storage
+            .recovery_subject(first.id(), &turn_id(TURN_1))
+            .expect("reload the first subject")
+            .upstream_thread_ref()
+            .is_none()
+    );
+    assert!(
+        storage
+            .recovery_subject(second.id(), &turn_id(TURN_2))
+            .expect("reload the second subject")
+            .upstream_thread_ref()
+            .is_none()
+    );
+}
+
+#[test]
+fn upstream_references_cannot_alias_distinct_sessions_or_turns() {
+    let state = TempDir::new().expect("temporary state directory");
+    let (mut storage, _) = Storage::open(state.path()).expect("open storage");
+    let first = initial_session(&storage, SESSION_1, TURN_1, at(0));
+    let AdmissionOutcome::Execute { session: first, .. } = storage
+        .begin_session(
+            &first,
+            &admission(IdempotentOperation::Run, "run-1", "request-run-1", at(0)),
+        )
+        .expect("admit the first Session")
+    else {
+        panic!("new Session admission must execute");
+    };
+    record_upstream_refs(
+        &mut storage,
+        first.id(),
+        &turn_id(TURN_1),
+        "thread-private-shared",
+        "turn-private-shared",
+    );
+    storage
+        .commit_lifecycle(
+            first.id(),
+            &turn_id(TURN_1),
+            revisions(&first, TURN_1),
+            TurnTransition::Completed,
+            at(1),
+        )
+        .expect("complete the first Session and release its lease");
+
+    let second = initial_session(&storage, SESSION_2, TURN_2, at(2));
+    let AdmissionOutcome::Execute {
+        session: second, ..
+    } = storage
+        .begin_session(
+            &second,
+            &admission(IdempotentOperation::Run, "run-2", "request-run-2", at(2)),
+        )
+        .expect("admit the second Session")
+    else {
+        panic!("new Session admission must execute");
+    };
+
+    let thread_error = storage
+        .record_upstream_ref(
+            second.id(),
+            &turn_id(TURN_2),
+            &ObservedUpstreamRef::thread("thread-private-shared").unwrap(),
+        )
+        .expect_err("one upstream thread must not belong to two Sessions");
+    assert_eq!(
+        StorageErrorKind::PrivateReferenceConflict,
+        thread_error.kind()
+    );
+
+    let turn_error = storage
+        .record_upstream_ref(
+            second.id(),
+            &turn_id(TURN_2),
+            &ObservedUpstreamRef::turn("turn-private-shared").unwrap(),
+        )
+        .expect_err("one upstream Turn must not belong to two Satelle Turns");
+    assert_eq!(
+        StorageErrorKind::PrivateReferenceConflict,
+        turn_error.kind()
+    );
+
+    let second_refs = storage
+        .recovery_subject(second.id(), &turn_id(TURN_2))
+        .expect("reload the second subject");
+    assert!(second_refs.upstream_thread_ref().is_none());
+    assert!(second_refs.upstream_turn_ref().is_none());
 }
 
 #[test]
@@ -108,10 +359,16 @@ fn restart_marks_active_turn_recovery_pending_and_retains_lease() {
             &turn_id(TURN_1),
             revisions(&session, TURN_1),
             TurnTransition::Running,
-            Some(&observed_refs("thread-private-1", "turn-private-1")),
             at(1),
         )
         .unwrap();
+    record_upstream_refs(
+        &mut storage,
+        running.id(),
+        &turn_id(TURN_1),
+        "thread-private-1",
+        "turn-private-1",
+    );
     drop(storage);
 
     let (mut storage, recovery) = Storage::open(state.path()).expect("restart storage");
@@ -170,10 +427,16 @@ fn begin_stop_claims_before_observation_and_confirmed_stop_releases_lease() {
             &turn_id(TURN_1),
             revisions(&session, TURN_1),
             TurnTransition::Running,
-            Some(&observed_refs("thread-private-1", "turn-private-1")),
             at(1),
         )
         .unwrap();
+    record_upstream_refs(
+        &mut storage,
+        running.id(),
+        &turn_id(TURN_1),
+        "thread-private-1",
+        "turn-private-1",
+    );
     let stop_idempotency = idempotency(IdempotentOperation::Stop, "stop-1", at(2));
 
     let claim = match storage
@@ -199,12 +462,7 @@ fn begin_stop_claims_before_observation_and_confirmed_stop_releases_lease() {
     };
     assert_eq!(running.id(), replay_claim.recovery_subject().session_id());
     let stopped = storage
-        .confirm_stop(
-            claim,
-            StopObservation::UpstreamInactiveConfirmed,
-            None,
-            at(3),
-        )
+        .confirm_stop(claim, StopObservation::UpstreamInactiveConfirmed, at(3))
         .expect("commit confirmed stop");
     assert_eq!(
         &StopCommitOutcome::Stopped(TurnState::Running),
@@ -276,19 +534,13 @@ fn pending_stop_blocks_a_later_nonterminal_execution_commit() {
             &turn_id(TURN_1),
             revisions(&starting, TURN_1),
             TurnTransition::Running,
-            None,
             at(2),
         )
         .expect_err("a pending stop must block a later Running commit");
     assert_eq!(StorageErrorKind::StateConflict, error.kind());
 
     let stopped = storage
-        .confirm_stop(
-            claim,
-            StopObservation::UpstreamInactiveConfirmed,
-            None,
-            at(2),
-        )
+        .confirm_stop(claim, StopObservation::UpstreamInactiveConfirmed, at(2))
         .expect("the stop claim should remain commit-able");
     assert_eq!(
         &StopCommitOutcome::Stopped(TurnState::Starting),
@@ -313,10 +565,16 @@ fn lifecycle_completion_wins_a_stop_race_without_redeleting_its_lease() {
             &turn_id(TURN_1),
             revisions(&session, TURN_1),
             TurnTransition::Running,
-            Some(&observed_refs("thread-private-1", "turn-private-1")),
             at(1),
         )
         .unwrap();
+    record_upstream_refs(
+        &mut storage,
+        running.id(),
+        &turn_id(TURN_1),
+        "thread-private-1",
+        "turn-private-1",
+    );
     let stop_idempotency = idempotency(IdempotentOperation::Stop, "stop-1", at(2));
     let BeginStopOutcome::Observe(claim) = storage
         .begin_stop(running.id(), &turn_id(TURN_1), &stop_idempotency)
@@ -330,18 +588,12 @@ fn lifecycle_completion_wins_a_stop_race_without_redeleting_its_lease() {
             &turn_id(TURN_1),
             revisions(&running, TURN_1),
             TurnTransition::Completed,
-            None,
             at(3),
         )
         .expect("completion wins the terminal commit");
 
     let stop = storage
-        .confirm_stop(
-            claim,
-            StopObservation::UpstreamInactiveConfirmed,
-            None,
-            at(4),
-        )
+        .confirm_stop(claim, StopObservation::UpstreamInactiveConfirmed, at(4))
         .expect("stop observes the winning terminal state");
     assert_eq!(
         &StopCommitOutcome::AlreadyTerminal(TerminalTurnState::Completed),
@@ -377,7 +629,6 @@ fn admission_replays_the_same_request_and_rejects_a_changed_digest() {
             &turn_id(TURN_1),
             revisions(&session, TURN_1),
             TurnTransition::Completed,
-            None,
             at(1),
         )
         .expect("complete the admitted request");
@@ -416,7 +667,6 @@ fn run_replay_uses_stored_handles_and_the_original_terminal_snapshot() {
             &turn_id(TURN_1),
             revisions(&session, TURN_1),
             TurnTransition::Completed,
-            None,
             at(1),
         )
         .expect("complete run");
@@ -449,7 +699,6 @@ fn run_replay_uses_stored_handles_and_the_original_terminal_snapshot() {
             &turn_id(TURN_2),
             revisions(&followed_up, TURN_2),
             TurnTransition::Completed,
-            None,
             at(3),
         )
         .expect("complete later follow-up");
@@ -487,7 +736,6 @@ fn steer_replay_uses_its_stored_turn_handle() {
             &turn_id(TURN_1),
             revisions(&session, TURN_1),
             TurnTransition::Completed,
-            None,
             at(1),
         )
         .expect("complete run");
@@ -519,7 +767,6 @@ fn steer_replay_uses_its_stored_turn_handle() {
             &turn_id(TURN_2),
             revisions(&followed_up, TURN_2),
             TurnTransition::Completed,
-            None,
             at(3),
         )
         .expect("complete follow-up");
@@ -562,7 +809,6 @@ fn in_progress_steer_replay_wins_before_active_turn_rejection() {
             &turn_id(TURN_1),
             revisions(&starting, TURN_1),
             TurnTransition::Completed,
-            None,
             at(1),
         )
         .expect("complete run");

@@ -44,8 +44,17 @@ use satelle_core::{
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::time::Instant;
-#[cfg(feature = "test-support")]
+#[cfg(any(test, feature = "test-support"))]
 use test_runtime::FakeComputerUseAdapter;
+
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub mod test_support {
+    pub use crate::storage::TestStateDir;
+}
+
+#[cfg(test)]
+use test_support::TestStateDir;
 
 #[derive(Clone, Debug)]
 pub struct HostService {
@@ -58,7 +67,7 @@ enum HostMode {
     Production {
         snapshot: ProductionCapabilitySnapshot,
     },
-    #[cfg(feature = "test-support")]
+    #[cfg(any(test, feature = "test-support"))]
     TestFake,
 }
 
@@ -136,7 +145,7 @@ impl HostService {
             HostMode::Production { snapshot } => {
                 Ok(production_doctor_report(host, scope, snapshot))
             }
-            #[cfg(feature = "test-support")]
+            #[cfg(any(test, feature = "test-support"))]
             HostMode::TestFake => self.fake_doctor(host, scope, refresh, &FakeComputerUseAdapter),
         }
     }
@@ -158,7 +167,7 @@ impl HostService {
                 setup_components,
                 daemon_path_overrides,
             )),
-            #[cfg(feature = "test-support")]
+            #[cfg(any(test, feature = "test-support"))]
             HostMode::TestFake => self.setup_fake(
                 host,
                 dry_run,
@@ -176,7 +185,7 @@ impl HostService {
                 mode: "production-capability-blocked".to_string(),
                 sessions: 0,
             }),
-            #[cfg(feature = "test-support")]
+            #[cfg(any(test, feature = "test-support"))]
             HostMode::TestFake => {
                 self.runtime.reconcile()?;
                 Ok(HostStatus {
@@ -235,7 +244,7 @@ impl HostService {
     ) -> Result<HostSessionsReport, SatelleError> {
         match &self.mode {
             HostMode::Production { snapshot } => Err(execution_blocker(&snapshot.verdict)),
-            #[cfg(feature = "test-support")]
+            #[cfg(any(test, feature = "test-support"))]
             HostMode::TestFake => self.host_sessions_fake(_host, _no_bootstrap),
         }
     }
@@ -629,7 +638,7 @@ mod tests {
                 },
             ),
         ] {
-            let state = tempfile::tempdir().expect("temporary state directory should exist");
+            let state = TestStateDir::new().expect("temporary state directory should exist");
             let state_path = state.path().join(format!("{name}.json"));
             let snapshot = capability_snapshot(evidence, 7);
             let service = HostService {

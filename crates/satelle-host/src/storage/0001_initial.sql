@@ -46,7 +46,7 @@ CREATE TABLE session_private_refs (
     host_identity_ref TEXT NOT NULL
         REFERENCES daemon_identity(host_identity_ref) ON DELETE RESTRICT,
     desktop_binding_ref TEXT NOT NULL,
-    upstream_thread_ref TEXT
+    upstream_thread_ref TEXT UNIQUE
 ) STRICT;
 
 CREATE TABLE turns (
@@ -111,7 +111,7 @@ CREATE TABLE turn_private_refs (
     turn_id TEXT PRIMARY KEY
         REFERENCES turns(turn_id) ON DELETE CASCADE,
     request_token TEXT NOT NULL UNIQUE,
-    upstream_turn_ref TEXT
+    upstream_turn_ref TEXT UNIQUE
 ) STRICT;
 
 CREATE TABLE turn_policies (

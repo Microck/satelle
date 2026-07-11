@@ -2,7 +2,7 @@ use super::*;
 
 #[test]
 fn stable_run_replay_skips_repeated_adapter_preflight() {
-    let state = tempfile::tempdir().expect("temporary state directory should exist");
+    let state = crate::TestStateDir::new().expect("temporary state directory should exist");
     let preflight_calls = Arc::new(AtomicUsize::new(0));
     let execute_calls = Arc::new(AtomicUsize::new(0));
     let adapter = PreflightCountingAdapter {
@@ -33,7 +33,7 @@ fn stable_run_replay_skips_repeated_adapter_preflight() {
 
 #[test]
 fn stable_run_replay_after_restart_skips_adapter_preflight() {
-    let state = tempfile::tempdir().expect("temporary state directory should exist");
+    let state = crate::TestStateDir::new().expect("temporary state directory should exist");
     let state_root = state.path().to_path_buf();
     let identity = RequestIdentity::new("stable-restart-key", STABLE_DIGEST);
     let initial = RuntimeHandle::new(
@@ -76,7 +76,7 @@ fn stable_run_replay_after_restart_skips_adapter_preflight() {
 
 #[test]
 fn duplicate_attached_run_returns_in_progress_handles_without_waiting_for_execution() {
-    let state = tempfile::tempdir().expect("temporary state directory should exist");
+    let state = crate::TestStateDir::new().expect("temporary state directory should exist");
     let adapter = SubjectBlockingAdapter::default();
     let runtime = RuntimeHandle::new(Ok(state.path().to_path_buf()), adapter.clone());
     let identity = RequestIdentity::new("stable-in-progress-key", STABLE_DIGEST);
@@ -138,7 +138,7 @@ fn duplicate_attached_run_returns_in_progress_handles_without_waiting_for_execut
 
 #[test]
 fn stable_steer_replays_while_a_later_turn_is_active() {
-    let state = tempfile::tempdir().expect("temporary state directory should exist");
+    let state = crate::TestStateDir::new().expect("temporary state directory should exist");
     let adapter = BlockOnThirdExecutionAdapter::default();
     let runtime = RuntimeHandle::new(Ok(state.path().to_path_buf()), adapter.clone());
     let session_id = runtime
@@ -184,7 +184,7 @@ fn stable_steer_replays_while_a_later_turn_is_active() {
 
 #[test]
 fn proven_running_restart_work_is_restored_and_keeps_admission_blocked() {
-    let state = tempfile::tempdir().expect("temporary state directory should exist");
+    let state = crate::TestStateDir::new().expect("temporary state directory should exist");
     let state_root = state.path().to_path_buf();
     let interrupted = RuntimeHandle::new(Ok(state_root.clone()), FailFirstAdapter::default());
     let session = interrupted
@@ -225,7 +225,7 @@ fn proven_running_restart_work_is_restored_and_keeps_admission_blocked() {
 
 #[test]
 fn stop_during_recovery_observation_does_not_resurrect_the_subject() {
-    let state = tempfile::tempdir().expect("temporary state directory should exist");
+    let state = crate::TestStateDir::new().expect("temporary state directory should exist");
     let state_root = state.path().to_path_buf();
     let interrupted = RuntimeHandle::new(Ok(state_root.clone()), FailFirstAdapter::default());
     let session = interrupted
@@ -278,7 +278,7 @@ fn stop_during_recovery_observation_does_not_resurrect_the_subject() {
 
 #[test]
 fn attached_execution_losing_to_stop_returns_the_durable_stopped_state() {
-    let state = tempfile::tempdir().expect("temporary state directory should exist");
+    let state = crate::TestStateDir::new().expect("temporary state directory should exist");
     let adapter = SubjectBlockingAdapter::default();
     let runtime = RuntimeHandle::new(Ok(state.path().to_path_buf()), adapter.clone());
     let run_runtime = runtime.clone();
@@ -316,7 +316,7 @@ fn attached_execution_losing_to_stop_returns_the_durable_stopped_state() {
 
 #[test]
 fn cancellation_confirmed_worker_exit_does_not_block_new_turn_admission() {
-    let state = tempfile::tempdir().expect("temporary state directory should exist");
+    let state = crate::TestStateDir::new().expect("temporary state directory should exist");
     let adapter = BlockingExecutionAndStopAdapter::default();
     let runtime = RuntimeHandle::new(Ok(state.path().to_path_buf()), adapter.clone());
     let session_id = runtime
@@ -378,7 +378,7 @@ fn cancellation_confirmed_worker_exit_does_not_block_new_turn_admission() {
 
 #[test]
 fn stop_proven_still_active_is_not_queued_for_running_to_running_recovery() {
-    let state = tempfile::tempdir().expect("temporary state directory should exist");
+    let state = crate::TestStateDir::new().expect("temporary state directory should exist");
     let adapter = StillActiveStopAdapter::default();
     let runtime = RuntimeHandle::new(Ok(state.path().to_path_buf()), adapter.clone());
     let session_id = runtime
@@ -416,7 +416,7 @@ fn stop_proven_still_active_is_not_queued_for_running_to_running_recovery() {
 
 #[test]
 fn preflight_and_execution_use_the_same_adapter_instance() {
-    let state = tempfile::tempdir().expect("temporary state directory should exist");
+    let state = crate::TestStateDir::new().expect("temporary state directory should exist");
     let adapter = CloneDistinguishingAdapter {
         instance: 1,
         preflight_instance: Arc::new(AtomicUsize::new(0)),
@@ -434,7 +434,7 @@ fn preflight_and_execution_use_the_same_adapter_instance() {
 
 #[test]
 fn pending_stop_retry_resumes_observation_and_then_replays() {
-    let state = tempfile::tempdir().expect("temporary state directory should exist");
+    let state = crate::TestStateDir::new().expect("temporary state directory should exist");
     let adapter = FailFirstStopAdapter::default();
     let runtime = RuntimeHandle::new(Ok(state.path().to_path_buf()), adapter.clone());
     let session_id = runtime
@@ -475,7 +475,7 @@ fn pending_stop_retry_resumes_observation_and_then_replays() {
 
 #[test]
 fn pending_stop_retry_completes_after_the_turn_terminalizes() {
-    let state = tempfile::tempdir().expect("temporary state directory should exist");
+    let state = crate::TestStateDir::new().expect("temporary state directory should exist");
     let adapter = FailFirstStopAdapter::default();
     let runtime = RuntimeHandle::new(Ok(state.path().to_path_buf()), adapter.clone());
     let session_id = runtime
@@ -512,7 +512,7 @@ fn pending_stop_retry_completes_after_the_turn_terminalizes() {
 
 #[test]
 fn stop_winning_before_running_skips_adapter_execution_and_returns_stopped() {
-    let state = tempfile::tempdir().expect("temporary state directory should exist");
+    let state = crate::TestStateDir::new().expect("temporary state directory should exist");
     let execute_calls = Arc::new(AtomicUsize::new(0));
     let runtime = RuntimeHandle::new(
         Ok(state.path().to_path_buf()),

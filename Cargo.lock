@@ -1219,7 +1219,6 @@ dependencies = [
  "satelle-host",
  "serde",
  "serde_json",
- "tempfile",
  "time",
  "toml",
 ]
@@ -1272,7 +1271,6 @@ dependencies = [
  "satelle-host",
  "serde",
  "serde_json",
- "tempfile",
  "time",
  "tokio",
  "tokio-tungstenite",

@@ -1353,6 +1353,9 @@
 - satelle queue status and logs expose queued position, enqueue time, expiry time, and normalized pre-start failure without exposing raw prompt or attachment content @spec @later
 - Satelle Events distinguish turn_queued, queue_position_changed, turn_dequeued, turn_queue_cancelled, turn_queue_expired, and turn_queue_validation_failed @spec @later
 - satelle maps each Satelle session to the underlying Codex thread, turn, and goal identifiers inside the Host Daemon adapter layer @spec @mvp
+- the Host Daemon durably persists each newly observed upstream Codex thread or Turn identifier before the Codex adapter continues waiting for later upstream work @mvp @implemented
+- persisting an upstream Codex identifier does not change Session or Turn lifecycle state, state revisions, safe logs, idempotency outcomes, or Control Lease ownership @mvp @implemented
+- recording the same upstream Codex identifier again is idempotent, while recording a different identifier for the same Session or Turn fails closed without overwriting the original @mvp @implemented
 - satelle session records include enough host, readiness, provider, goal, and lifecycle metadata to survive transport changes without changing the public session identifier @spec @mvp
 - satelle Host Daemon is the canonical store for session metadata because it owns the Codex thread, app-server lifecycle, Computer Use readiness, logs, and recovery state @spec @mvp
 - satelle CLI may keep read-only convenience cache for recently used sessions but must refresh from the Host Daemon before reporting authoritative status @spec @mvp
@@ -1455,6 +1458,8 @@
 - satelle recording mode output reports every produced artifact path, retention expiry, and cleanup command so storage remains visible to the invoking user @spec @later
 - satelle recording modes record audit metadata in the Host Daemon SQLite store without storing screenshot bytes, desktop video bytes, full transcripts, raw prompts, provider request bodies, provider response bodies, or raw artifact contents in the audit record @spec @later
 - Host Daemon Session HTTP responses use the canonical PublicSession and PublicTurn lifecycle states and revisions and never embed Satelle Event streams or Controller-owned Host Alias fields @spec @contract @mvp
+- one upstream Codex thread identifier belongs to at most one Satelle Session, and recording it for another Session fails closed @implemented @mvp
+- one upstream Codex Turn identifier belongs to at most one Satelle Turn, and recording it for another Turn fails closed @implemented @mvp
 
 # storage
 
