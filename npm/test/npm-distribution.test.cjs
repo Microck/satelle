@@ -7,6 +7,7 @@ const {
   mkdtempSync,
   mkdirSync,
   readFileSync,
+  realpathSync,
   rmSync,
   writeFileSync,
 } = require("node:fs");
@@ -142,7 +143,10 @@ test("native package resolution returns the installed binary", (context) => {
   writeFileSync(path.join(packageRoot, "package.json"), JSON.stringify({ name: target.packageName }));
   writeFileSync(binaryPath, "fixture");
 
-  assert.equal(launcher.resolveNativeBinary(target, fixtureRoot), binaryPath);
+  assert.equal(
+    realpathSync(launcher.resolveNativeBinary(target, fixtureRoot)),
+    realpathSync(binaryPath),
+  );
 });
 
 test("a missing native package produces typed package-manager-specific recovery guidance", (context) => {
@@ -150,13 +154,34 @@ test("a missing native package produces typed package-manager-specific recovery 
   const fixtureRoot = mkdtempSync(path.join(tmpdir(), "satelle-missing-package-"));
   context.after(() => rmSync(fixtureRoot, { recursive: true, force: true }));
 
-  for (const [packageManager, expectedCommand] of [
-    ["npm", "npm install @microck/satelle --include=optional"],
-    ["pnpm", "pnpm add @microck/satelle"],
-    ["bun", "bun add @microck/satelle"],
+  for (const [recoveryContext, expectedCommand] of [
+    [
+      { packageManager: "npm", packageName: "@microck/satelle", installScope: "local" },
+      "npm install @microck/satelle --include=optional",
+    ],
+    [
+      { packageManager: "pnpm", packageName: "@microck/satelle", installScope: "local" },
+      "pnpm add @microck/satelle",
+    ],
+    [
+      { packageManager: "bun", packageName: "@microck/satelle", installScope: "local" },
+      "bun add @microck/satelle",
+    ],
+    [
+      { packageManager: "npm", packageName: "satelle", installScope: "global" },
+      "npm install --global satelle --include=optional",
+    ],
+    [
+      { packageManager: "pnpm", packageName: "satelle", installScope: "global" },
+      "pnpm add --global satelle",
+    ],
+    [
+      { packageManager: "bun", packageName: "satelle", installScope: "global" },
+      "bun add --global satelle",
+    ],
   ]) {
     assert.throws(
-      () => launcher.resolveNativeBinary(target, fixtureRoot, packageManager),
+      () => launcher.resolveNativeBinary(target, fixtureRoot, recoveryContext),
       (error) => {
         assert.equal(error.code, "native-binary-package-missing");
         assert.match(error.message, new RegExp(target.packageName.replace("/", "\\/")));
@@ -179,6 +204,22 @@ test("package-manager detection recognizes npm, pnpm, and Bun owners", () => {
     "bun",
   );
   assert.equal(launcher.detectPackageManager({ launcherPath: "/tmp/custom/satelle.cjs" }), undefined);
+});
+
+test("installation scope detection recognizes global and local package layouts", () => {
+  for (const launcherPath of [
+    "/usr/local/lib/node_modules/@microck/satelle/bin/satelle.cjs",
+    "/home/me/.bun/install/global/node_modules/satelle/bin/satelle.cjs",
+    "/home/me/.local/share/pnpm/global/5/node_modules/satelle/bin/satelle.cjs",
+    "C:\\Users\\me\\AppData\\Roaming\\npm\\node_modules\\satelle\\bin\\satelle.cjs",
+  ]) {
+    assert.equal(launcher.detectInstallationScope(launcherPath), "global", launcherPath);
+  }
+  assert.equal(
+    launcher.detectInstallationScope("/home/me/project/node_modules/satelle/bin/satelle.cjs"),
+    "local",
+  );
+  assert.equal(launcher.detectInstallationScope("/opt/satelle/bin/satelle.cjs"), undefined);
 });
 
 test("Linux libc detection distinguishes glibc, musl, and unknown runtimes", () => {
@@ -229,6 +270,30 @@ test("native execution forwards arguments and returns the child exit status", (c
   assert.equal(status, 23);
   assert.deepEqual(readJson(outputPath), ["run", "--command", "two words"]);
 });
+
+test(
+  "native execution preserves signal termination",
+  { skip: process.platform === "win32" },
+  (context) => {
+    const fixtureRoot = mkdtempSync(path.join(tmpdir(), "satelle-signal-"));
+    context.after(() => rmSync(fixtureRoot, { recursive: true, force: true }));
+    const wrapperScript = path.join(fixtureRoot, "signal-wrapper.cjs");
+    writeFileSync(
+      wrapperScript,
+      [
+        `const { executeNativeBinary } = require(${JSON.stringify(
+          path.join(canonicalPackageRoot, "lib", "launcher.cjs"),
+        )});`,
+        'executeNativeBinary(process.execPath, ["-e", "process.kill(process.pid, \'SIGTERM\')"]);',
+        "",
+      ].join("\n"),
+    );
+
+    const child = spawnSync(process.execPath, [wrapperScript]);
+    assert.equal(child.status, null);
+    assert.equal(child.signal, "SIGTERM");
+  },
+);
 
 test("package manifests align versions, constraints, dependencies, and executable ownership", () => {
   const rootManifest = readJson(path.join(repositoryRoot, "package.json"));
@@ -291,12 +356,15 @@ test("the unscoped executable runs the canonical public launcher", (context) => 
   );
   writeFileSync(
     path.join(canonicalRoot, "launcher.cjs"),
-    'module.exports = { main() { process.stdout.write("forwarded-through-canonical-launcher"); } };\n',
+    "module.exports = { main(options) { process.stdout.write(JSON.stringify(options)); } };\n",
   );
 
   const child = spawnSync(process.execPath, [unscopedBin], { encoding: "utf8" });
   assert.equal(child.status, 0);
-  assert.equal(child.stdout, "forwarded-through-canonical-launcher");
+  assert.deepEqual(JSON.parse(child.stdout), {
+    packageName: "satelle",
+    launcherPath: unscopedBin,
+  });
   assert.equal(child.stderr, "");
 });
 

@@ -77,31 +77,58 @@ function detectPackageManager({ userAgent, execPath, launcherPath } = {}) {
   return undefined;
 }
 
-function reinstallCommand(packageManager) {
+function detectInstallationScope(launcherPath) {
+  if (!launcherPath) {
+    return undefined;
+  }
+
+  const normalizedPath = launcherPath.replaceAll("\\", "/").toLowerCase();
+  const globalLayoutMarkers = [
+    "/lib/node_modules/",
+    "/appdata/roaming/npm/node_modules/",
+    "/.bun/install/global/",
+    "/pnpm/global/",
+  ];
+  if (globalLayoutMarkers.some((marker) => normalizedPath.includes(marker))) {
+    return "global";
+  }
+  return normalizedPath.includes("/node_modules/") ? "local" : undefined;
+}
+
+function reinstallCommand({ packageManager, packageName, installScope }) {
+  const globalFlag = installScope === "global" ? " --global" : "";
   switch (packageManager) {
     case "pnpm":
-      return "pnpm add @microck/satelle";
+      return `pnpm add${globalFlag} ${packageName}`;
     case "bun":
-      return "bun add @microck/satelle";
+      return `bun add${globalFlag} ${packageName}`;
     case "npm":
     default:
-      return "npm install @microck/satelle --include=optional";
+      return `npm install${globalFlag} ${packageName} --include=optional`;
   }
 }
 
-function missingPackageError(target, packageManager) {
+function missingPackageError(target, recoveryContext = {}) {
+  const context = {
+    packageManager: recoveryContext.packageManager,
+    packageName: recoveryContext.packageName || "@microck/satelle",
+    installScope: recoveryContext.installScope,
+  };
+  const unknownScopeHint = context.installScope
+    ? ""
+    : " If Satelle was installed globally, add --global to that command.";
   return new LauncherError(
     "native-binary-package-missing",
     [
       `The matching native package ${target.packageName} is missing`,
       `or does not contain ${target.binaryPath}.`,
-      `Reinstall without omitting optional dependencies using \`${reinstallCommand(packageManager)}\`,`,
-      "or use the direct native binary installation path.",
+      `Reinstall without omitting optional dependencies using \`${reinstallCommand(context)}\`,`,
+      `or use the direct native binary installation path.${unknownScopeHint}`,
     ].join(" "),
   );
 }
 
-function resolveNativeBinary(target, searchFrom = path.resolve(__dirname, ".."), packageManager) {
+function resolveNativeBinary(target, searchFrom = path.resolve(__dirname, ".."), recoveryContext) {
   const resolver = createRequire(path.join(path.resolve(searchFrom), "satelle-resolver.cjs"));
   let packageManifestPath;
 
@@ -109,14 +136,14 @@ function resolveNativeBinary(target, searchFrom = path.resolve(__dirname, ".."),
     packageManifestPath = resolver.resolve(`${target.packageName}/package.json`);
   } catch (error) {
     if (error?.code === "MODULE_NOT_FOUND") {
-      throw missingPackageError(target, packageManager);
+      throw missingPackageError(target, recoveryContext);
     }
     throw error;
   }
 
   const binaryPath = path.join(path.dirname(packageManifestPath), target.binaryPath);
   if (!existsSync(binaryPath)) {
-    throw missingPackageError(target, packageManager);
+    throw missingPackageError(target, recoveryContext);
   }
   return binaryPath;
 }
@@ -129,10 +156,13 @@ function executeNativeBinary(binaryPath, argumentsToForward) {
       `Could not start ${binaryPath}: ${child.error.message}`,
     );
   }
+  if (child.signal) {
+    process.kill(process.pid, child.signal);
+  }
   return child.status === null ? 1 : child.status;
 }
 
-function main() {
+function main({ packageName = "@microck/satelle", launcherPath = __filename } = {}) {
   try {
     const runtime = {
       platform: process.platform,
@@ -143,9 +173,18 @@ function main() {
     const packageManager = detectPackageManager({
       userAgent: process.env.npm_config_user_agent,
       execPath: process.env.npm_execpath,
-      launcherPath: __filename,
+      launcherPath,
     });
-    const binaryPath = resolveNativeBinary(target, path.resolve(__dirname, ".."), packageManager);
+    const recoveryContext = {
+      packageManager,
+      packageName,
+      installScope: detectInstallationScope(launcherPath),
+    };
+    const binaryPath = resolveNativeBinary(
+      target,
+      path.resolve(__dirname, ".."),
+      recoveryContext,
+    );
     process.exitCode = executeNativeBinary(binaryPath, process.argv.slice(2));
   } catch (error) {
     if (!(error instanceof LauncherError)) {
@@ -158,6 +197,7 @@ function main() {
 
 module.exports = {
   LauncherError,
+  detectInstallationScope,
   detectLinuxLibc,
   detectPackageManager,
   executeNativeBinary,

@@ -6,7 +6,8 @@
     "node": ">=18"
   },
   "scripts": {
-    "check:npm": "node --test npm/test/*.test.cjs",
-    "test:npm": "node --test npm/test/*.test.cjs"
+    "check:npm": "node --test npm/test/npm-distribution.test.cjs npm/test/package-managers.test.cjs",
+    "test": "npm run check:npm",
+    "test:npm": "npm run check:npm"
   }
 }
