@@ -96,7 +96,9 @@
 
 ## completions
 - satelle exposes shell completion generation for bash, zsh, fish, and PowerShell @spec @mvp @implemented
-- satelle shell completion installation supports explicit output directories and shell auto-detection without modifying shell profiles unless the user explicitly requests profile changes @spec @mvp
+- satelle completions <bash|zsh|fish|powershell> --output-dir <directory> installs the selected shell's canonical completion filename, while omitting the shell with --output-dir detects SHELL and falls back to PowerShell only on Windows; installation creates the output directory, writes the installed path followed by one newline to stdout, does not modify shell profiles, and does not initialize Host, config, or state paths @spec @contract @mvp @implemented
+- satelle completion installation filesystem failures use the completion-install-failed error code and exit 73 without printing a Rust panic or backtrace @spec @contract @mvp @implemented
+- satelle shell profile activation is a separate opt-in operation that requires an explicit --update-profile request, writes an idempotent Satelle-managed block, and preserves all unrelated profile content @spec @mvp
 - satelle completions <bash|zsh|fish|powershell> writes the selected shell completion script to stdout, exits 0, and does not initialize Host, config, or state paths @spec @contract @mvp @implemented
 
 ## profiles-and-output

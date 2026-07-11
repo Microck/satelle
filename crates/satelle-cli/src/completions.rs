@@ -1,14 +1,23 @@
 use clap::{Args, CommandFactory, ValueEnum};
-use clap_complete::{Shell, generate};
+use clap_complete::{Generator, Shell, generate};
 use satelle_core::{CLI_NAME, ErrorCode, SatelleError};
+use std::fs;
 use std::io::{self, ErrorKind, Write};
+use std::path::{Path, PathBuf};
 
 use super::Cli;
 
 #[derive(Args, Debug)]
 pub(super) struct CompletionsCommand {
-    #[arg(value_enum)]
-    shell: CompletionShell,
+    #[arg(value_enum, required_unless_present = "output_dir")]
+    shell: Option<CompletionShell>,
+
+    #[arg(
+        long,
+        value_name = "DIRECTORY",
+        help = "Install the completion script in DIRECTORY; detect the shell when omitted"
+    )]
+    output_dir: Option<PathBuf>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
@@ -30,29 +39,107 @@ impl From<CompletionShell> for Shell {
     }
 }
 
-pub(super) fn generate_completions(command: CompletionsCommand) -> Result<(), SatelleError> {
+pub(super) fn run_completions(command: CompletionsCommand) -> Result<(), SatelleError> {
+    if let Some(output_dir) = command.output_dir {
+        let shell = match command.shell {
+            Some(shell) => shell,
+            None => detect_shell()?,
+        };
+        return install_completions(shell, &output_dir);
+    }
+
+    let shell = command
+        .shell
+        .expect("clap requires a shell when --output-dir is absent");
+    write_stdout(
+        &completion_script(shell),
+        "could not write shell completion script",
+    )
+}
+
+fn completion_script(shell: CompletionShell) -> Vec<u8> {
     // Some clap generators still panic on writer errors inside their fallible path. Generate
     // against an infallible memory buffer so stdout remains the only I/O failure boundary.
     let mut script = Vec::new();
     generate(
-        Shell::from(command.shell),
+        Shell::from(shell),
         &mut Cli::command(),
         CLI_NAME,
         &mut script,
     );
+    script
+}
 
+fn install_completions(shell: CompletionShell, output_dir: &Path) -> Result<(), SatelleError> {
+    fs::create_dir_all(output_dir).map_err(|source| {
+        completion_install_error(
+            format!(
+                "could not create completion output directory {}",
+                output_dir.display()
+            ),
+            source,
+        )
+    })?;
+
+    let destination = output_dir.join(Shell::from(shell).file_name(CLI_NAME));
+    fs::write(&destination, completion_script(shell)).map_err(|source| {
+        completion_install_error(
+            format!(
+                "could not write shell completion script {}",
+                destination.display()
+            ),
+            source,
+        )
+    })?;
+
+    write_stdout(
+        format!("{}\n", destination.display()).as_bytes(),
+        "could not write installed completion path",
+    )
+}
+
+fn detect_shell() -> Result<CompletionShell, SatelleError> {
+    match Shell::from_env() {
+        Some(Shell::Bash) => Ok(CompletionShell::Bash),
+        Some(Shell::Zsh) => Ok(CompletionShell::Zsh),
+        Some(Shell::Fish) => Ok(CompletionShell::Fish),
+        Some(Shell::PowerShell) => Ok(CompletionShell::Powershell),
+        Some(_) | None => Err(SatelleError {
+            code: ErrorCode::InvalidUsage,
+            message: "could not detect a supported shell; select bash, zsh, fish, or powershell"
+                .to_string(),
+            recovery_command: Some(
+                "satelle completions <shell> --output-dir <directory>".to_string(),
+            ),
+            source_detail: None,
+            details: Default::default(),
+        }),
+    }
+}
+
+fn write_stdout(bytes: &[u8], message: &'static str) -> Result<(), SatelleError> {
     let stdout = io::stdout();
     let mut stdout = stdout.lock();
-    match stdout.write_all(&script).and_then(|()| stdout.flush()) {
+    match stdout.write_all(bytes).and_then(|()| stdout.flush()) {
         Ok(()) => Ok(()),
         // Early-closing consumers such as `head` are a successful CLI pipeline outcome.
         Err(source) if source.kind() == ErrorKind::BrokenPipe => Ok(()),
         Err(source) => Err(SatelleError {
             code: ErrorCode::InvalidUsage,
-            message: "could not write shell completion script".to_string(),
+            message: message.to_string(),
             recovery_command: None,
             source_detail: Some(source.to_string()),
             details: Default::default(),
         }),
+    }
+}
+
+fn completion_install_error(message: String, source: io::Error) -> SatelleError {
+    SatelleError {
+        code: ErrorCode::CompletionInstallFailed,
+        message,
+        recovery_command: Some("choose a writable output directory and retry".to_string()),
+        source_detail: Some(source.to_string()),
+        details: Default::default(),
     }
 }

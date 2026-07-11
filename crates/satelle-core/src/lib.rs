@@ -1216,6 +1216,7 @@ fn edit_distance(left: &str, right: &str) -> usize {
 #[serde(rename_all = "kebab-case")]
 pub enum ErrorCode {
     InvalidUsage,
+    CompletionInstallFailed,
     ConfigError,
     ConfigNotFound,
     UnknownConfigKey,
@@ -1262,6 +1263,7 @@ impl ErrorCode {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::InvalidUsage => "invalid-usage",
+            Self::CompletionInstallFailed => "completion-install-failed",
             Self::ConfigError => "configuration-error",
             Self::ConfigNotFound => "config-not-found",
             Self::UnknownConfigKey => "unknown-config-key",
@@ -1319,6 +1321,7 @@ impl ErrorCode {
             | Self::ComponentSelectionConflict
             | Self::UnsupportedUpdateComponent
             | Self::InputRequired => 64,
+            Self::CompletionInstallFailed => 73,
             Self::StorageIntegrityFailed => 65,
             Self::ConfigError
             | Self::ConfigNotFound
