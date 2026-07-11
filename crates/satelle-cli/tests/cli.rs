@@ -2065,15 +2065,20 @@ fn setup_does_not_inherit_local_path_environment_as_daemon_overrides() {
 fn config_precedence_is_flags_over_project_over_user_over_defaults() {
     let state = state_dir();
     let user_config = state.path().join("xdg").join("satelle");
+    let user_config_file = user_config.join("config.toml");
     fs::create_dir_all(&user_config).expect("user config dir should be created");
     fs::write(
-        user_config.join("config.toml"),
+        &user_config_file,
         r#"
 default_host = "user-host"
 
 [hosts.user-host]
 transport = "local"
 adapter = "fake"
+
+[profiles.environment-profile]
+
+[profiles.flag-profile]
 "#,
     )
     .expect("user config should be written");
@@ -2095,7 +2100,7 @@ adapter = "fake"
 
     satelle()
         .current_dir(&project)
-        .env("XDG_CONFIG_HOME", state.path().join("xdg"))
+        .env("SATELLE_CONFIG_FILE", &user_config_file)
         .env("SATELLE_STATE_DIR", state.path())
         .env_remove("SATELLE_HOST")
         .args(["doctor", "--json"])
@@ -2106,7 +2111,7 @@ adapter = "fake"
 
     satelle()
         .current_dir(&project)
-        .env("XDG_CONFIG_HOME", state.path().join("xdg"))
+        .env("SATELLE_CONFIG_FILE", &user_config_file)
         .env("SATELLE_STATE_DIR", state.path())
         .env("SATELLE_HOST", "local-demo")
         .args(["doctor", "--json"])
@@ -2116,7 +2121,7 @@ adapter = "fake"
 
     satelle()
         .current_dir(&project)
-        .env("XDG_CONFIG_HOME", state.path().join("xdg"))
+        .env("SATELLE_CONFIG_FILE", &user_config_file)
         .env("SATELLE_STATE_DIR", state.path())
         .env("SATELLE_HOST", "project-host")
         .args(["doctor", "--host", "local-demo", "--json"])
@@ -2126,7 +2131,7 @@ adapter = "fake"
 
     let output = satelle()
         .current_dir(&project)
-        .env("XDG_CONFIG_HOME", state.path().join("xdg"))
+        .env("SATELLE_CONFIG_FILE", &user_config_file)
         .env("SATELLE_STATE_DIR", state.path())
         .env("SATELLE_HOST", "local-demo")
         .env("SATELLE_PROFILE", "environment-profile")
@@ -2157,7 +2162,7 @@ adapter = "fake"
 
     let output = satelle()
         .current_dir(&project)
-        .env("XDG_CONFIG_HOME", state.path().join("xdg"))
+        .env("SATELLE_CONFIG_FILE", &user_config_file)
         .env("SATELLE_STATE_DIR", state.path())
         .env("SATELLE_HOST", "local-demo")
         .env("SATELLE_PROFILE", "environment-profile")
@@ -2902,6 +2907,8 @@ hostnme = "desktop"
             "provider_alias",
             "experimental_provider_computer_use",
             "yolo",
+            "profile",
+            "profiles",
             "hosts"
         ])
     );

@@ -11,6 +11,7 @@ use time::format_description::well_known::Rfc3339;
 
 mod events;
 pub mod ids;
+mod profiles;
 pub mod session;
 
 pub use events::{
@@ -18,6 +19,7 @@ pub use events::{
     SatelleEventBody, SatelleEventError,
 };
 pub use ids::{IdParseError, SessionId, TurnId};
+pub use profiles::{ProfileField, ProfileSelectionSource, SelectedProfile};
 
 pub const PRODUCT_NAME: &str = "Satelle";
 pub const CLI_NAME: &str = "satelle";
@@ -128,6 +130,18 @@ pub struct HostConfig {
 pub struct TimeoutConfig {
     pub native_readiness: Option<ExplicitDuration>,
     pub provider_smoke_test: Option<ExplicitDuration>,
+}
+
+impl TimeoutConfig {
+    fn merge(mut self, higher: TimeoutConfig) -> Self {
+        if higher.native_readiness.is_some() {
+            self.native_readiness = higher.native_readiness;
+        }
+        if higher.provider_smoke_test.is_some() {
+            self.provider_smoke_test = higher.provider_smoke_test;
+        }
+        self
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -262,6 +276,11 @@ pub struct ResolvedConfig {
     pub config: SatelleConfig,
     pub user_config_path: PathBuf,
     pub project_config_path: PathBuf,
+    pub selected_profile: Option<SelectedProfile>,
+    // The overlay follows the eventual host selection. Keeping it intact avoids mutating every
+    // configured host before SATELLE_HOST or --host chooses one.
+    #[serde(skip)]
+    profile_overlay: Option<profiles::ProfileConfig>,
 }
 
 impl ResolvedConfig {
@@ -275,34 +294,83 @@ impl ResolvedConfig {
             .or_else(|| self.config.default_host.clone())
             .unwrap_or_else(|| LOCAL_DEMO_HOST.to_string());
 
-        let host = self
+        let mut host = self
             .config
             .hosts
             .get(&alias)
             .cloned()
             .ok_or_else(|| SatelleError::host_not_found(alias.clone()))?;
 
+        if let (Some(profile), Some(selected)) = (&self.profile_overlay, &self.selected_profile) {
+            profile.apply_to_host(&alias, &mut host, selected.source);
+        }
+
         Ok((alias, host))
+    }
+
+    pub fn profile_overrides_for_host(&self, field: ProfileField, host: &str) -> bool {
+        match (&self.profile_overlay, &self.selected_profile) {
+            (Some(profile), Some(selected)) => {
+                profile.overrides_for_host(field, host, selected.source)
+            }
+            _ => false,
+        }
     }
 }
 
-pub fn load_config(cwd: &Path) -> Result<ResolvedConfig, SatelleError> {
+pub fn load_config(cwd: &Path, flag_profile: Option<&str>) -> Result<ResolvedConfig, SatelleError> {
     let paths = resolve_path_set(cwd)?;
     let user_config_path = paths.config_file;
     let project_config_path = paths.project_config_file;
 
     let mut config = SatelleConfig::defaults();
-    if let Some(user_config) = read_config_file(&user_config_path, ConfigScope::User)? {
-        config = config.merge(user_config);
+    let user_config = read_config_file(&user_config_path, ConfigScope::User)?;
+    let project_config = read_config_file(&project_config_path, ConfigScope::Project)?;
+
+    if let Some(user_config) = &user_config {
+        config = config.merge(user_config.config.clone());
     }
-    if let Some(project_config) = read_config_file(&project_config_path, ConfigScope::Project)? {
-        config = config.merge(project_config);
+    if let Some(project_config) = &project_config {
+        config = config.merge(project_config.config.clone());
     }
+
+    let selected_profile = profiles::select_profile(
+        flag_profile,
+        user_config
+            .as_ref()
+            .and_then(|config| config.default_profile.as_deref()),
+        project_config
+            .as_ref()
+            .and_then(|config| config.default_profile.as_deref()),
+    );
+    let profile_overlay = if let Some(selected) = &selected_profile {
+        let profile = user_config
+            .as_ref()
+            .and_then(|config| config.profiles.get(&selected.name))
+            .cloned()
+            .ok_or_else(|| {
+                let available_profiles = user_config
+                    .as_ref()
+                    .map(|config| config.profiles.keys().cloned().collect())
+                    .unwrap_or_default();
+                SatelleError::profile_not_found(
+                    &user_config_path,
+                    &selected.name,
+                    available_profiles,
+                )
+            })?;
+        profile.apply_to_base(&mut config, selected.source);
+        Some(profile)
+    } else {
+        None
+    };
 
     Ok(ResolvedConfig {
         config,
         user_config_path,
         project_config_path,
+        selected_profile,
+        profile_overlay,
     })
 }
 
@@ -446,10 +514,17 @@ enum ConfigScope {
     Project,
 }
 
+#[derive(Clone, Debug)]
+struct ParsedConfigFile {
+    config: SatelleConfig,
+    default_profile: Option<String>,
+    profiles: BTreeMap<String, profiles::ProfileConfig>,
+}
+
 fn read_config_file(
     path: &Path,
     scope: ConfigScope,
-) -> Result<Option<SatelleConfig>, SatelleError> {
+) -> Result<Option<ParsedConfigFile>, SatelleError> {
     if !path.exists() {
         return Ok(None);
     }
@@ -462,12 +537,14 @@ fn read_config_file(
         details: BTreeMap::new(),
     })?;
 
-    let value = toml::from_str::<toml::Value>(&raw).map_err(|source| {
+    let mut value = toml::from_str::<toml::Value>(&raw).map_err(|source| {
         SatelleError::config_error(
             format!("could not parse config file {}", path.display()),
             Some(source.to_string()),
         )
     })?;
+    let profile_data =
+        profiles::extract_profile_data(path, &mut value, scope == ConfigScope::User)?;
     reject_config_composition(path, &value)?;
     reject_interpolation(path, &value)?;
     reject_timeout_config_errors(path, &value)?;
@@ -478,14 +555,21 @@ fn read_config_file(
     reject_provider_secret_source_errors(path, &value)?;
     reject_unknown_config_keys(path, &value)?;
 
-    let config = toml::from_str(&raw).map_err(|source| {
-        SatelleError::config_error(
-            format!("could not decode config file {}", path.display()),
-            Some(source.to_string()),
-        )
-    })?;
+    let config = value
+        .clone()
+        .try_into()
+        .map_err(|source: toml::de::Error| {
+            SatelleError::config_error(
+                format!("could not decode config file {}", path.display()),
+                Some(source.to_string()),
+            )
+        })?;
 
-    Ok(Some(config))
+    Ok(Some(ParsedConfigFile {
+        config,
+        default_profile: profile_data.default_profile,
+        profiles: profile_data.profiles,
+    }))
 }
 
 fn reject_project_forbidden_keys(path: &Path, value: &toml::Value) -> Result<(), SatelleError> {
@@ -1049,6 +1133,8 @@ fn reject_unknown_config_keys(path: &Path, value: &toml::Value) -> Result<(), Sa
             "provider_alias",
             "experimental_provider_computer_use",
             "yolo",
+            "profile",
+            "profiles",
             "hosts",
         ],
         &mut unknown_keys,
@@ -1221,6 +1307,8 @@ pub enum ErrorCode {
     ConfigError,
     ConfigNotFound,
     UnknownConfigKey,
+    ProfileNotFound,
+    ProjectProfileDefinitionNotAllowed,
     ConfigInterpolationNotSupported,
     UnknownTimeoutKey,
     DurationUnitRequired,
@@ -1269,6 +1357,8 @@ impl ErrorCode {
             Self::ConfigError => "configuration-error",
             Self::ConfigNotFound => "config-not-found",
             Self::UnknownConfigKey => "unknown-config-key",
+            Self::ProfileNotFound => "profile-not-found",
+            Self::ProjectProfileDefinitionNotAllowed => "project-profile-definition-not-allowed",
             Self::ConfigInterpolationNotSupported => "config-interpolation-not-supported",
             Self::UnknownTimeoutKey => "unknown-timeout-key",
             Self::DurationUnitRequired => "duration-unit-required",
@@ -1328,6 +1418,8 @@ impl ErrorCode {
             Self::ConfigError
             | Self::ConfigNotFound
             | Self::UnknownConfigKey
+            | Self::ProfileNotFound
+            | Self::ProjectProfileDefinitionNotAllowed
             | Self::ConfigInterpolationNotSupported
             | Self::UnknownTimeoutKey
             | Self::DurationUnitRequired

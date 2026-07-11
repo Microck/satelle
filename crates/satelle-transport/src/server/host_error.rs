@@ -38,6 +38,8 @@ fn failure(error: &SatelleError) -> ApiFailure {
         | ErrorCode::ConfigError
         | ErrorCode::ConfigNotFound
         | ErrorCode::UnknownConfigKey
+        | ErrorCode::ProfileNotFound
+        | ErrorCode::ProjectProfileDefinitionNotAllowed
         | ErrorCode::ConfigInterpolationNotSupported
         | ErrorCode::UnknownTimeoutKey
         | ErrorCode::DurationUnitRequired

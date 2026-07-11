@@ -103,7 +103,7 @@
 - satelle completions <bash|zsh|fish|powershell> writes the selected shell completion script to stdout, exits 0, and does not initialize Host, config, or state paths @spec @contract @mvp @implemented
 
 ## profiles-and-output
-- satelle supports a global --profile option that applies selected user-level configuration profile overlays rather than only reporting the selected profile name @spec @mvp
+- satelle supports a global --profile option that applies selected user-level configuration profile overlays rather than only reporting the selected profile name @spec @mvp @implemented
 - satelle recognizes only the SATELLE_* namespace for Satelle-owned process environment variables and does not preserve pre-Satelle environment compatibility aliases @mvp @implemented
 - satelle MVP command data output modes are human and json; a command-specific streaming contract may define json as versioned NDJSON instead of one final JSON value @contract @mvp @implemented
 - satelle MVP uses --format <human|json> as the canonical command data output selector for commands that support machine-readable output @mvp @implemented
@@ -894,7 +894,7 @@
 - satelle config check never creates, edits, formats, deletes, backs up, or migrates user-level or project-level configuration files @implemented @mvp
 - satelle config check validates TOML syntax, typed schema decoding, unknown-key rejection, unsupported config composition, interpolation syntax, explicit duration-unit syntax, path environment overrides, user/project merge precedence, selected profile resolution, effective host alias binding, and project-level forbidden keys when those checks can be decided locally @spec @mvp
 - satelle config check always performs file-level validation for every loaded user-level and project-level config file before context-specific validation @spec @mvp
-- satelle config check without --all applies the effective profile overlay, validates the resulting selected context, and reports the source of each context selection @spec @mvp
+- satelle config check without --all applies the effective profile overlay, validates the resulting selected context, and reports the source of each context selection @spec @mvp @implemented
 - satelle config check --all validates context-specific local semantics for the default context, each configured host alias without a profile override, each configured profile without a host override, and each explicit project host/profile default pair @spec @mvp
 - satelle config check --all does not synthesize every possible host/profile cross product unless a host/profile pair is explicitly selectable from defaults or configuration @spec @mvp
 - satelle config check human output states whether it checked selected-context mode or all-contexts mode @implemented @mvp
@@ -911,7 +911,7 @@
 - satelle config explain reports the effective merged configuration for a selected context and explains which source won each reported value @implemented @mvp
 - satelle config explain validates loaded configuration enough to compute the effective merged configuration and exits with the configuration error class when parsing, schema validation, or local merge validation fails @implemented @mvp
 - satelle config explain never opens SSH connections, Tailscale connections, Host Daemon connections, Codex app-server control-plane sessions, native Computer Use sessions, provider probe surfaces, or provider smoke tests @implemented @mvp
-- satelle config explain supports --host and applies the --profile overlay to the explained effective configuration without changing stored defaults @spec @mvp
+- satelle config explain supports --host and applies the --profile overlay to the explained effective configuration without changing stored defaults @spec @mvp @implemented
 - satelle config explain human output is optimized for debugging precedence and should not duplicate the full validation checklist from satelle config check @implemented @mvp
 - satelle config explain --json emits one final JSON object with schema_version, status, selected_host, selected_profile, checked_files, sources, effective, values, and not_checked fields @implemented @mvp
 - satelle config explain redacts schema-marked sensitive, secret, credential, token, auth-command, and secret-source fields by default in both human and JSON output @spec @mvp
@@ -1036,9 +1036,9 @@
 - satelle does not support a process-global or all-host persistent YOLO default @spec @mvp
 - satelle resolves YOLO policy per command and per target host instead of treating it as only a process-global switch @implemented @mvp
 - satelle Host-specific YOLO policy is the only persistent base YOLO policy within a user-level configuration source @spec @mvp
-- satelle selected user-level profile YOLO policy overlays the merged base configuration according to the same precedence model used for other profile settings @spec @mvp
-- satelle accepts selected profile YOLO policy only when that policy comes from user-level configuration, names an explicit Host Alias, and the profile is selected by a user-level default or explicit --profile option @spec @mvp
-- satelle does not activate Trusted Profile consent or YOLO policy solely because SATELLE_PROFILE selected a profile @spec @mvp
+- satelle selected user-level profile YOLO policy overlays the merged base configuration according to the same precedence model used for other profile settings @spec @mvp @implemented
+- satelle accepts selected profile YOLO enablement only when that policy comes from user-level configuration, names an explicit Host Alias, and the profile is selected by a user-level default or explicit --profile option; project and SATELLE_PROFILE selection may apply yolo = false but never yolo = true @spec @mvp @implemented
+- satelle does not activate Trusted Profile consent or YOLO policy solely because SATELLE_PROFILE selected a profile @spec @mvp @implemented
 - satelle CLI flags can enable or disable YOLO mode for one command and take precedence over user-level YOLO policy @implemented @mvp
 - satelle config explain output shows the effective YOLO policy, target host, selected_profile field, contributing config files, and winning source @implemented @mvp
 - satelle non-quiet preflight output identifies when YOLO mode is active and whether it came from a CLI flag, user-level Host configuration, or an explicitly selected Host-bound user-level profile @spec @mvp
@@ -1051,14 +1051,14 @@
 - satelle reports a typed config-interpolation-not-supported configuration error when a schema-owned config field contains recognizable environment interpolation syntax such as $VAR, ${VAR}, or %VAR% @implemented @mvp
 - satelle config explain output reports explicit Satelle process environment overrides as separate contributing sources instead of presenting them as expanded config-file values @implemented @mvp
 - satelle supports SATELLE_HOST as an optional process environment default Host selector that is lower precedence than --host and higher precedence than config-file Host defaults @spec @mvp
-- satelle supports SATELLE_PROFILE as an optional process environment profile selector that is lower precedence than --profile and higher precedence than config-file profile defaults @spec @mvp
-- satelle supports configuration profiles that select default values and policy overlays on top of the merged base configuration @spec @mvp
+- satelle supports SATELLE_PROFILE as an optional process environment profile selector that is lower precedence than --profile and higher precedence than config-file profile defaults @spec @mvp @implemented
+- satelle supports configuration profiles that select default values and policy overlays on top of the merged base configuration @spec @mvp @implemented
 - satelle named profiles can define host selection, model and provider intent, timeout policy, output preferences, log verbosity, YOLO policy, and Trusted Profile references subject to each field's existing source restrictions @spec @mvp
-- satelle profile overlays are applied after base user and project configuration and before explicit environment variables and CLI flags @spec @mvp
-- satelle project-level configuration may request a profile name only as shared intent and cannot define trusted profiles, mutation consent, YOLO enablement, or secret-source locations through that profile @spec @mvp
-- satelle profiles do not redefine the entire host configuration tree independently from base user and project configuration @spec @mvp
-- satelle timeout configuration lives under a nested timeouts table at host and profile scopes instead of as direct host or profile keys @spec @mvp
-- satelle timeout configuration may be set in any configuration source that can define host or profile defaults, subject to normal configuration precedence @spec @mvp
+- satelle profile overlays are applied after base user and project configuration and before explicit environment variables and CLI flags @spec @mvp @implemented
+- satelle project-level configuration may request a profile name only as shared intent and cannot define trusted profiles, mutation consent, YOLO enablement, or secret-source locations through that profile @spec @mvp @implemented
+- satelle profiles do not redefine the entire host configuration tree independently from base user and project configuration @spec @mvp @implemented
+- satelle timeout configuration lives under a nested timeouts table at host and profile scopes instead of as direct host or profile keys @spec @mvp @implemented
+- satelle timeout configuration may be set in any configuration source that can define host or profile defaults, subject to normal configuration precedence @spec @mvp @implemented
 - satelle MVP timeout configuration keys are timeouts.native_readiness, timeouts.provider_smoke_test, and timeouts.turn_execution @spec @mvp
 - satelle timeouts.turn_execution configuration values are finite human duration strings with explicit units @spec @mvp
 - satelle rejects bare integer timeouts.turn_execution values with a typed duration-unit-required configuration error @spec @mvp
@@ -1203,6 +1203,9 @@
 - satelle reports a typed secret-file-tilde-form-unsupported configuration error when a Satelle File Secret Source uses unsupported tilde syntax @spec @later
 - satelle reports a typed secret-file-home-unavailable error when a Host Daemon must expand a tilde-prefixed Satelle File Secret Source but the resolving OS account has no available home directory @spec @later
 - satelle.error.v1 errors for secret-file-tilde-form-unsupported and secret-file-home-unavailable place config_file, toml_path, host, secret_source_kind, resolver_os, and supported_forms under details and place safe recovery commands under suggested_commands @spec @later
+- satelle user-level TOML defines named profile overlays under [profiles.<name>], while top-level profile selects a config-file default; project TOML may select profile but cannot define profiles @spec @contract @mvp @implemented
+- satelle profile overlays place host selection at host, model and provider intent at model_alias and provider_alias, provider opt-in at its existing key, host-bound YOLO policy at yolo, and timeout policy under nested timeouts; profile overlays do not define a hosts tree @spec @contract @mvp @implemented
+- satelle selects profiles in precedence order user config default, project config default, SATELLE_PROFILE, then global --profile; selecting an undefined profile reports typed profile-not-found with exit 66 @spec @contract @mvp @implemented
 
 # roadmap
 

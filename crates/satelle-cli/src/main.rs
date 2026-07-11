@@ -6,9 +6,10 @@ use completions::{CompletionsCommand, run_completions};
 use output::{OutputArgs, OutputFormat, SessionResultSchemaVersion, StatusReport};
 use satelle_core::{
     BEACON_CORAL, CLI_NAME, DaemonPathOverrides, DoctorEventRecord, DoctorReport, ERROR_RED,
-    ErrorCode, HostConfig, HostSessionsReport, LOCAL_DEMO_HOST, LogEntry, PRODUCT_NAME, RELAY_ROSE,
-    SUCCESS_GREEN, SatelleError, SessionId, SessionRecord, SetupReport, SetupRequiredInput,
-    StopResult, TurnStatus, load_config, resolve_path_set, utc_now,
+    ErrorCode, HostConfig, HostSessionsReport, LOCAL_DEMO_HOST, LogEntry, PRODUCT_NAME,
+    ProfileField, RELAY_ROSE, ResolvedConfig, SUCCESS_GREEN, SatelleError, SessionId,
+    SessionRecord, SetupReport, SetupRequiredInput, StopResult, TurnStatus, load_config,
+    resolve_path_set, utc_now,
 };
 use satelle_host::{HostService, HostStatus, TurnOutcome};
 use serde_json::json;
@@ -39,8 +40,39 @@ struct Cli {
     #[arg(long, global = true, help = "Disable colored human output")]
     no_color: bool,
 
+    #[arg(
+        long,
+        global = true,
+        value_name = "NAME",
+        value_parser = clap::builder::NonEmptyStringValueParser::new(),
+        help = "Apply a named user-level configuration profile"
+    )]
+    profile: Option<String>,
+
     #[command(subcommand)]
     command: Command,
+}
+
+#[derive(Clone, Copy)]
+struct ConfigContext<'a> {
+    flag_profile: Option<&'a str>,
+}
+
+impl ConfigContext<'_> {
+    fn load(self, json: bool) -> Result<ResolvedConfig, CliFailure> {
+        let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        load_config(&cwd, self.flag_profile).map_err(|error| failure(error, json))
+    }
+
+    fn resolve_host(
+        self,
+        flag_host: Option<&str>,
+        json: bool,
+    ) -> Result<(String, HostConfig), CliFailure> {
+        self.load(json)?
+            .resolve_host(flag_host)
+            .map_err(|error| failure(error, json))
+    }
 }
 
 #[derive(Subcommand, Debug)]
@@ -79,8 +111,8 @@ enum Command {
     after_long_help = "Agent-safe noninteractive provider auth flow:\n  1. Configure host-resolved Secret Source descriptors in user-level host config.\n  2. Run satelle setup --no-input --json to get a stable plan.\n  3. Treat missing raw provider secret material as required human input, not as an agent-handled value."
 )]
 struct SetupCommand {
-    #[arg(long, default_value = LOCAL_DEMO_HOST)]
-    host: String,
+    #[arg(long)]
+    host: Option<String>,
     #[arg(long)]
     dry_run: bool,
     #[arg(long)]
@@ -159,8 +191,6 @@ struct ConfigCheckCommand {
     host: Option<String>,
     #[arg(long)]
     all: bool,
-    #[arg(long)]
-    profile: Option<String>,
     #[command(flatten)]
     output_args: OutputArgs,
 }
@@ -169,8 +199,6 @@ struct ConfigCheckCommand {
 struct ConfigExplainCommand {
     #[arg(long)]
     host: Option<String>,
-    #[arg(long)]
-    profile: Option<String>,
     #[arg(long)]
     show_secret_references: bool,
     #[command(flatten)]
@@ -602,41 +630,48 @@ fn main() -> ExitCode {
 }
 
 fn try_main() -> Result<(), CliFailure> {
-    let cli = Cli::parse();
-    let (output_args, event_output) = cli.command.output_request();
+    let Cli {
+        no_color,
+        profile,
+        command,
+    } = Cli::parse();
+    let (output_args, event_output) = command.output_request();
     let error_json = output_args.requests_json();
     let output = output_args
         .resolve(event_output)
         .map_err(|error| failure(error, error_json))?;
-    let human_style = HumanStyle::detect(cli.no_color);
+    let human_style = HumanStyle::detect(no_color);
+    let config = ConfigContext {
+        flag_profile: profile.as_deref(),
+    };
 
-    match cli.command {
+    match command {
         Command::Completions(command) => {
             run_completions(command).map_err(|error| failure(error, false))
         }
         Command::Setup(command) => {
             let transport = local_transport(output)?;
-            run_setup(command, &transport, human_style, output)
+            run_setup(command, &transport, human_style, config, output)
         }
         Command::Repair(command) => run_repair(command, output),
         Command::Doctor(command) => {
             let transport = local_transport(output)?;
-            run_doctor(command, &transport, output)
+            run_doctor(command, &transport, config, output)
         }
-        Command::Config { command } => run_config(command, output),
+        Command::Config { command } => run_config(command, config, output),
         Command::Paths(command) => show_paths(command, output),
         Command::Host { command } => {
             let transport = local_transport(output)?;
-            run_host(command, &transport, output)
+            run_host(command, &transport, config, output)
         }
         Command::SelfCtl { command } => run_self(command, output),
         Command::Run(command) => {
             let transport = local_transport(output)?;
-            run_prompt(command, &transport, output)
+            run_prompt(command, &transport, config, output)
         }
         Command::Steer(command) => {
             let transport = local_transport(output)?;
-            steer_prompt(command, &transport, output)
+            steer_prompt(command, &transport, config, output)
         }
         Command::Status(command) => {
             let transport = local_transport(output)?;
@@ -648,7 +683,7 @@ fn try_main() -> Result<(), CliFailure> {
         }
         Command::Logs(command) => {
             let transport = local_transport(output)?;
-            show_logs(command, &transport, output)
+            show_logs(command, &transport, config, output)
         }
         Command::Support { command } => run_support(command, output),
     }
@@ -690,6 +725,7 @@ fn run_setup(
     command: SetupCommand,
     transport: &impl TransportClient,
     style: HumanStyle,
+    config: ConfigContext<'_>,
     format: OutputFormat,
 ) -> Result<(), CliFailure> {
     let json = format.is_json();
@@ -716,7 +752,7 @@ fn run_setup(
         })?;
     }
 
-    let (_, host_config) = resolve_host(Some(&command.host), json)?;
+    let (host, host_config) = config.resolve_host(command.host.as_deref(), json)?;
     let daemon_path_overrides =
         daemon_path_overrides(&command, &host_config).map_err(|error| failure(error, json))?;
     let setup_components =
@@ -729,7 +765,7 @@ fn run_setup(
 
     let mut report = transport
         .setup(
-            &command.host,
+            &host,
             command.dry_run,
             setup_mode,
             setup_components,
@@ -930,6 +966,7 @@ fn run_repair(command: RepairCommand, format: OutputFormat) -> Result<(), CliFai
 fn run_doctor(
     command: DoctorCommand,
     transport: &impl TransportClient,
+    config: ConfigContext<'_>,
     format: OutputFormat,
 ) -> Result<(), CliFailure> {
     let json = format.is_json();
@@ -953,7 +990,7 @@ fn run_doctor(
         );
     }
 
-    let (host, _) = match resolve_host(command.host.as_deref(), json) {
+    let (host, _) = match config.resolve_host(command.host.as_deref(), json) {
         Ok(resolved) => resolved,
         Err(failure) => {
             return fail_doctor(
@@ -1258,18 +1295,32 @@ fn doctor_event(
     event
 }
 
-fn run_config(command: ConfigCommand, format: OutputFormat) -> Result<(), CliFailure> {
+fn run_config(
+    command: ConfigCommand,
+    config: ConfigContext<'_>,
+    format: OutputFormat,
+) -> Result<(), CliFailure> {
     match command {
-        ConfigCommand::Check(command) => config_check(command, format),
-        ConfigCommand::Explain(command) => config_explain(command, format),
+        ConfigCommand::Check(command) => config_check(command, config, format),
+        ConfigCommand::Explain(command) => config_explain(command, config, format),
     }
 }
 
-fn config_check(command: ConfigCheckCommand, format: OutputFormat) -> Result<(), CliFailure> {
+fn config_check(
+    command: ConfigCheckCommand,
+    config_context: ConfigContext<'_>,
+    format: OutputFormat,
+) -> Result<(), CliFailure> {
     let json = format.is_json();
-    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-    let config = load_config(&cwd).map_err(|error| failure(error, json))?;
-    let selected_profile = selected_profile(command.profile);
+    let config = config_context.load(json)?;
+    let selected_profile = config
+        .selected_profile
+        .as_ref()
+        .map(|profile| profile.name.as_str());
+    let selected_profile_source = config
+        .selected_profile
+        .as_ref()
+        .map_or("default", |profile| profile.source.as_str());
     let selected_host = config
         .resolve_host(command.host.as_deref())
         .map(|(alias, _)| alias)
@@ -1288,7 +1339,7 @@ fn config_check(command: ConfigCheckCommand, format: OutputFormat) -> Result<(),
         "checked_contexts": [{
             "host": selected_host,
             "profile": selected_profile,
-            "source": "effective",
+            "source": selected_profile_source,
             "status": "ok",
             "checks": ["toml_parse", "host_resolution"],
             "errors": [],
@@ -1319,14 +1370,28 @@ fn config_check(command: ConfigCheckCommand, format: OutputFormat) -> Result<(),
     }
 }
 
-fn config_explain(command: ConfigExplainCommand, format: OutputFormat) -> Result<(), CliFailure> {
+fn config_explain(
+    command: ConfigExplainCommand,
+    config_context: ConfigContext<'_>,
+    format: OutputFormat,
+) -> Result<(), CliFailure> {
     let json = format.is_json();
-    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-    let config = load_config(&cwd).map_err(|error| failure(error, json))?;
-    let selected_profile = selected_profile(command.profile);
+    let config = config_context.load(json)?;
+    let selected_profile = config
+        .selected_profile
+        .as_ref()
+        .map(|profile| profile.name.as_str());
+    let selected_profile_source = config
+        .selected_profile
+        .as_ref()
+        .map(|profile| profile.source.as_str());
     let (selected_host, selected_host_config) = config
         .resolve_host(command.host.as_deref())
         .map_err(|error| failure(error, json))?;
+    let mut effective_config = config.config.clone();
+    effective_config
+        .hosts
+        .insert(selected_host.clone(), selected_host_config.clone());
     let environment_sources = json!({
         "host": env_source("SATELLE_HOST"),
         "profile": env_source("SATELLE_PROFILE"),
@@ -1351,16 +1416,17 @@ fn config_explain(command: ConfigExplainCommand, format: OutputFormat) -> Result
             "defaults": true,
             "user_config": config.user_config_path,
             "project_config": config.project_config_path,
+            "profile": selected_profile_source,
             "environment": environment_sources,
             "flags": ["--host", "--profile"],
         },
-        "effective": redacted_config_json(&config.config, command.show_secret_references),
+        "effective": redacted_config_json(&effective_config, command.show_secret_references),
         "values": {
             "default_host": config.config.default_host,
             "host_count": config.config.hosts.len(),
             "effective_timeouts": effective_timeouts_json(&selected_host_config),
             "daemon_path_overrides": daemon_path_overrides_json(&selected_host_config),
-            "model_provider": model_provider_config_json(&config),
+            "model_provider": model_provider_config_json(&config, &selected_host),
             "experimental_provider_computer_use": experimental_provider_computer_use_json(
                 &config,
                 &selected_host,
@@ -1385,14 +1451,6 @@ fn config_explain(command: ConfigExplainCommand, format: OutputFormat) -> Result
         println!("Host aliases: {}", config.config.hosts.len());
         Ok(())
     }
-}
-
-fn selected_profile(flag_profile: Option<String>) -> Option<String> {
-    flag_profile.or_else(|| {
-        std::env::var("SATELLE_PROFILE")
-            .ok()
-            .filter(|profile| !profile.is_empty())
-    })
 }
 
 fn env_source(name: &str) -> serde_json::Value {
@@ -1521,17 +1579,30 @@ fn daemon_path_overrides_json(host_config: &HostConfig) -> serde_json::Value {
     serde_json::Value::Array(entries)
 }
 
-fn model_provider_config_json(config: &satelle_core::ResolvedConfig) -> serde_json::Value {
-    let model_alias_source = root_config_key_source(
-        "model_alias",
-        &config.user_config_path,
-        &config.project_config_path,
-    );
-    let provider_alias_source = root_config_key_source(
-        "provider_alias",
-        &config.user_config_path,
-        &config.project_config_path,
-    );
+fn model_provider_config_json(
+    config: &satelle_core::ResolvedConfig,
+    selected_host: &str,
+) -> serde_json::Value {
+    let model_alias_source =
+        if config.profile_overrides_for_host(ProfileField::ModelAlias, selected_host) {
+            json!("user_config_profile")
+        } else {
+            root_config_key_source(
+                "model_alias",
+                &config.user_config_path,
+                &config.project_config_path,
+            )
+        };
+    let provider_alias_source =
+        if config.profile_overrides_for_host(ProfileField::ProviderAlias, selected_host) {
+            json!("user_config_profile")
+        } else {
+            root_config_key_source(
+                "provider_alias",
+                &config.user_config_path,
+                &config.project_config_path,
+            )
+        };
 
     json!({
         "requested_model_alias": config.config.model_alias,
@@ -1561,6 +1632,17 @@ fn experimental_provider_computer_use_json(
     selected_host: &str,
     selected_host_config: &HostConfig,
 ) -> serde_json::Value {
+    if config
+        .profile_overrides_for_host(ProfileField::ExperimentalProviderComputerUse, selected_host)
+    {
+        return json!({
+            "active": selected_host_config.experimental_provider_computer_use.unwrap_or(false),
+            "source": "user_config_profile",
+            "host": selected_host,
+            "selected_by_cli_flag": false,
+        });
+    }
+
     if let Some(active) = selected_host_config.experimental_provider_computer_use {
         return json!({
             "active": active,
@@ -1612,6 +1694,12 @@ fn resolve_yolo_policy(
             source: "cli_flag",
         };
     }
+    if config.profile_overrides_for_host(ProfileField::Yolo, selected_host) {
+        return YoloPolicy {
+            active: selected_host_config.yolo.unwrap_or(false),
+            source: "user_config_profile",
+        };
+    }
     if let Some(active) = selected_host_config.yolo {
         return YoloPolicy {
             active,
@@ -1625,7 +1713,6 @@ fn resolve_yolo_policy(
         };
     }
 
-    let _ = selected_host;
     YoloPolicy {
         active: false,
         source: "absent",
@@ -1642,7 +1729,10 @@ fn yolo_config_json(
         "active": policy.active,
         "source": policy.source,
         "target_host": selected_host,
-        "selected_profile": serde_json::Value::Null,
+        "selected_profile": config
+            .selected_profile
+            .as_ref()
+            .map(|profile| profile.name.as_str()),
         "contributing_config_files": [
             config.user_config_path,
             config.project_config_path,
@@ -1723,6 +1813,7 @@ fn show_paths(command: PathsCommand, format: OutputFormat) -> Result<(), CliFail
 fn run_host(
     command: HostCommand,
     transport: &impl TransportClient,
+    config: ConfigContext<'_>,
     format: OutputFormat,
 ) -> Result<(), CliFailure> {
     let json = format.is_json();
@@ -1762,7 +1853,7 @@ fn run_host(
             json,
         )),
         HostCommand::Update(command) => run_host_update(command, format),
-        HostCommand::Sessions(command) => show_host_sessions(command, transport, format),
+        HostCommand::Sessions(command) => show_host_sessions(command, transport, config, format),
         HostCommand::Storage { command } => run_host_storage(command, format),
     }
 }
@@ -1770,10 +1861,11 @@ fn run_host(
 fn show_host_sessions(
     command: HostSessionsCommand,
     transport: &impl TransportClient,
+    config: ConfigContext<'_>,
     format: OutputFormat,
 ) -> Result<(), CliFailure> {
     let json = format.is_json();
-    let (host, _) = resolve_host(command.host.as_deref(), json)?;
+    let (host, _) = config.resolve_host(command.host.as_deref(), json)?;
     let report = transport
         .host_sessions(&host, command.no_bootstrap)
         .map_err(|error| failure(error, json))?;
@@ -1912,6 +2004,7 @@ fn run_support(command: SupportCommand, format: OutputFormat) -> Result<(), CliF
 fn run_prompt(
     command: RunCommand,
     transport: &impl TransportClient,
+    config_context: ConfigContext<'_>,
     format: OutputFormat,
 ) -> Result<(), CliFailure> {
     let json = format.is_json();
@@ -1921,8 +2014,7 @@ fn run_prompt(
         command.refresh_provider_smoke_test,
     );
     let prompt = read_prompt(command.prompt, command.prompt_file, json)?;
-    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-    let config = load_config(&cwd).map_err(|error| failure(error, json))?;
+    let config = config_context.load(json)?;
     let (host, host_config) = config
         .resolve_host(command.host.as_deref())
         .map_err(|error| failure(error, json))?;
@@ -1963,6 +2055,7 @@ fn run_prompt(
 fn steer_prompt(
     command: SteerCommand,
     transport: &impl TransportClient,
+    config_context: ConfigContext<'_>,
     format: OutputFormat,
 ) -> Result<(), CliFailure> {
     let json = format.is_json();
@@ -1977,8 +2070,7 @@ fn steer_prompt(
     let session = transport
         .status(&session_id)
         .map_err(|error| failure(error, json))?;
-    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-    let config = load_config(&cwd).map_err(|error| failure(error, json))?;
+    let config = config_context.load(json)?;
     let (_, host_config) = config
         .resolve_host(Some(&session.host))
         .map_err(|error| failure(error, json))?;
@@ -2073,6 +2165,7 @@ fn stop_session(
 fn show_logs(
     command: LogsCommand,
     transport: &impl TransportClient,
+    config: ConfigContext<'_>,
     format: OutputFormat,
 ) -> Result<(), CliFailure> {
     let json = format.is_json();
@@ -2109,7 +2202,7 @@ fn show_logs(
             },
         )
     } else {
-        resolve_host(command.host.as_deref(), json)?
+        config.resolve_host(command.host.as_deref(), json)?
     };
 
     let tail = match command.tail {
@@ -2247,17 +2340,6 @@ fn log_timestamp_at_or_after(timestamp: &str, since: OffsetDateTime) -> bool {
     OffsetDateTime::parse(timestamp, &Rfc3339)
         .map(|timestamp| timestamp >= since)
         .unwrap_or(false)
-}
-
-fn resolve_host(
-    flag_host: Option<&str>,
-    json: bool,
-) -> Result<(String, satelle_core::HostConfig), CliFailure> {
-    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-    let config = load_config(&cwd).map_err(|error| failure(error, json))?;
-    config
-        .resolve_host(flag_host)
-        .map_err(|error| failure(error, json))
 }
 
 fn effective_timeouts_json(host_config: &satelle_core::HostConfig) -> serde_json::Value {
