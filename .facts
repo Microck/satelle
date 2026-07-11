@@ -122,15 +122,15 @@
 - satelle stop on an already-terminal Turn exits 0 with outcome already_terminal and changed false @spec @contract @mvp
 - satelle status JSON v1 uses schema_version satelle.status.v1 @spec @contract @mvp
 - satelle logs initial and followed JSON records each use schema_version satelle.logs.entry.v1 and emit exactly one record per line without a top-level wrapper @spec @contract @mvp
-- satelle setup JSON v1 uses schema_version satelle.setup.v1 @spec @contract @mvp
+- satelle setup JSON v1 uses schema_version satelle.setup.v1 @contract @mvp @implemented
 - satelle repair JSON v1 uses schema_version satelle.repair.v1 @spec @contract @mvp
-- satelle doctor JSON v1 uses schema_version satelle.doctor.v1 @spec @contract @mvp
+- satelle doctor JSON v1 uses schema_version satelle.doctor.v1 @contract @mvp @implemented
 - satelle config check JSON v1 uses schema_version satelle.config.check.v1 @contract @mvp @implemented
 - satelle config explain JSON v1 uses schema_version satelle.config.explain.v1 @contract @mvp @implemented
 - satelle self update JSON v1 uses schema_version satelle.self.update.v1 @spec @contract @mvp
 - satelle host update JSON v1 uses schema_version satelle.host.update.v1 @spec @contract @mvp
 - satelle paths JSON v1 uses schema_version satelle.paths.v1 @contract @mvp @implemented
-- satelle host sessions JSON v1 uses schema_version satelle.host.sessions.v1 @spec @contract @mvp
+- satelle host sessions JSON v1 uses schema_version satelle.host.sessions.v1 @contract @mvp @implemented
 - satelle JSON error v1 uses schema_version satelle.error.v1 @contract @mvp @implemented
 - satelle does not remove fields, change field meanings, or rename enum tokens within one result schema_version @spec @contract @mvp
 - breaking machine-readable result changes require a new schema_version @spec @contract @mvp

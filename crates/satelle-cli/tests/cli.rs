@@ -3687,7 +3687,7 @@ fn host_sessions_lists_local_demo_metadata_only() {
         .clone();
     let report = parse_json_output(&output.stdout);
 
-    assert_eq!(report["schema_version"], 1);
+    assert_eq!(report["schema_version"], "satelle.host.sessions.v1");
     assert_eq!(report["host"], "local-demo");
     assert_eq!(report["connection_mode"], "direct");
     assert_eq!(report["bootstrapped"], false);

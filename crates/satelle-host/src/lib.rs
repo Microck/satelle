@@ -37,9 +37,9 @@ use runtime::{
 };
 use satelle_core::{
     DaemonPathOverrides, DoctorFinding, DoctorFixability, DoctorProbeResult, DoctorReport,
-    DoctorSummary, HostSessionsReport, LOCAL_DEMO_HOST, LogEntry, SatelleError, SatelleEvent,
-    SessionId, SessionRecord, SetupReadinessSummary, SetupReport, StopResult, object_value,
-    utc_now,
+    DoctorSchemaVersion, DoctorSummary, HostSessionsReport, LOCAL_DEMO_HOST, LogEntry,
+    SatelleError, SatelleEvent, SessionId, SessionRecord, SetupReadinessSummary, SetupReport,
+    SetupSchemaVersion, StopResult, object_value, utc_now,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -317,7 +317,7 @@ fn production_doctor_report(
     recovery_commands.dedup();
 
     DoctorReport {
-        schema_version: 1,
+        schema_version: DoctorSchemaVersion::V1,
         status: if ready { "ready" } else { "blocked" }.to_string(),
         target: host.to_string(),
         host: host.to_string(),
@@ -541,6 +541,7 @@ fn production_setup_report(
     }));
 
     SetupReport {
+        schema_version: SetupSchemaVersion::V1,
         host: host.to_string(),
         dry_run,
         status: "planned".to_string(),
