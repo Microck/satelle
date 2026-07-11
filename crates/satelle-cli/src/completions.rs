@@ -86,7 +86,8 @@ fn install_completions(
     output_dir: &Path,
     profile_path: Option<&Path>,
 ) -> Result<(), SatelleError> {
-    fs::create_dir_all(output_dir).map_err(|source| {
+    let output_dir = absolute_output_dir(output_dir)?;
+    fs::create_dir_all(&output_dir).map_err(|source| {
         completion_install_error(
             format!(
                 "could not create completion output directory {}",
@@ -115,6 +116,24 @@ fn install_completions(
         format!("{}\n", destination.display()).as_bytes(),
         "could not write installed completion path",
     )
+}
+
+fn absolute_output_dir(output_dir: &Path) -> Result<PathBuf, SatelleError> {
+    if output_dir.is_absolute() {
+        return Ok(output_dir.to_path_buf());
+    }
+
+    std::env::current_dir()
+        .map(|current_dir| current_dir.join(output_dir))
+        .map_err(|source| {
+            completion_install_error(
+                format!(
+                    "could not resolve completion output directory {}",
+                    output_dir.display()
+                ),
+                source,
+            )
+        })
 }
 
 fn detect_shell() -> Result<CompletionShell, SatelleError> {

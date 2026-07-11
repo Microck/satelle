@@ -180,6 +180,32 @@ fn creates_a_missing_profile_and_parent_directory() {
 }
 
 #[test]
+fn stores_an_absolute_completion_path_when_the_output_directory_is_relative() {
+    let fixture = TempDir::new().expect("test directory should be created");
+    let output_dir = Path::new("relative completion output");
+    let destination = fixture.path().join(output_dir).join("satelle.bash");
+    let profile = fixture.path().join(".bashrc");
+
+    update_profile_command(
+        "bash",
+        output_dir,
+        &profile,
+        &fixture.path().join("untouched-satelle-home"),
+    )
+    .current_dir(fixture.path())
+    .assert()
+    .success()
+    .stdout(format!("{}\n", destination.display()))
+    .stderr(predicate::str::is_empty());
+
+    assert_eq!(
+        fs::read(&profile).expect("profile should be readable"),
+        managed_block("bash", &destination, "\n"),
+        "managed block stored a working-directory-relative path"
+    );
+}
+
+#[test]
 fn replaces_one_existing_block_and_preserves_surrounding_crlf_bytes() {
     let fixture = TempDir::new().expect("test directory should be created");
     let first_output = fixture.path().join("first output");
