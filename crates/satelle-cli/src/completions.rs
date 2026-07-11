@@ -1,7 +1,7 @@
 use clap::{Args, CommandFactory, ValueEnum};
-use clap_complete::{Generator, Shell};
+use clap_complete::{Shell, generate};
 use satelle_core::{CLI_NAME, ErrorCode, SatelleError};
-use std::io::{self, ErrorKind};
+use std::io::{self, ErrorKind, Write};
 
 use super::Cli;
 
@@ -31,13 +31,19 @@ impl From<CompletionShell> for Shell {
 }
 
 pub(super) fn generate_completions(command: CompletionsCommand) -> Result<(), SatelleError> {
-    let mut cli = Cli::command();
-    cli.set_bin_name(CLI_NAME);
-    cli.build();
+    // Some clap generators still panic on writer errors inside their fallible path. Generate
+    // against an infallible memory buffer so stdout remains the only I/O failure boundary.
+    let mut script = Vec::new();
+    generate(
+        Shell::from(command.shell),
+        &mut Cli::command(),
+        CLI_NAME,
+        &mut script,
+    );
 
     let stdout = io::stdout();
     let mut stdout = stdout.lock();
-    match Shell::from(command.shell).try_generate(&cli, &mut stdout) {
+    match stdout.write_all(&script).and_then(|()| stdout.flush()) {
         Ok(()) => Ok(()),
         // Early-closing consumers such as `head` are a successful CLI pipeline outcome.
         Err(source) if source.kind() == ErrorKind::BrokenPipe => Ok(()),

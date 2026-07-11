@@ -315,22 +315,25 @@ fn completions_reject_unsupported_shells_at_the_cli_boundary() {
 #[cfg(unix)]
 #[test]
 fn completions_exit_cleanly_when_stdout_pipe_closes_early() {
-    let status = std::process::Command::new("bash")
-        .args([
-            "-o",
-            "pipefail",
-            "-c",
-            "\"$1\" completions bash | true",
-            "satelle-completions-test",
-        ])
-        .arg(assert_cmd::cargo::cargo_bin!("satelle"))
-        .status()
-        .expect("completion pipeline should start");
+    for shell in ["bash", "zsh", "fish", "powershell"] {
+        let status = std::process::Command::new("bash")
+            .args([
+                "-o",
+                "pipefail",
+                "-c",
+                "\"$1\" completions \"$2\" | true",
+                "satelle-completions-test",
+            ])
+            .arg(assert_cmd::cargo::cargo_bin!("satelle"))
+            .arg(shell)
+            .status()
+            .expect("completion pipeline should start");
 
-    assert!(
-        status.success(),
-        "satelle should treat a completion reader closing the pipe as success"
-    );
+        assert!(
+            status.success(),
+            "satelle should treat a {shell} completion reader closing the pipe as success"
+        );
+    }
 }
 
 #[test]
