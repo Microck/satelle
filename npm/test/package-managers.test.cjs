@@ -42,6 +42,14 @@ const packageManagers = [
   },
 ];
 
+function spawnCommand(executable, arguments_, options = {}) {
+  return spawnSync(
+    executable,
+    arguments_,
+    process.platform === "win32" ? { ...options, shell: true } : options,
+  );
+}
+
 function readJson(filePath) {
   return JSON.parse(readFileSync(filePath, "utf8"));
 }
@@ -51,13 +59,13 @@ function writeJson(filePath, value) {
 }
 
 function commandIsAvailable(packageManager) {
-  const version = spawnSync(packageManager.executable, ["--version"], { encoding: "utf8" });
+  const version = spawnCommand(packageManager.executable, ["--version"], { encoding: "utf8" });
   return version.status === 0;
 }
 
 function packFixturePackage(packageRoot, packDestination) {
   const npmExecutable = process.platform === "win32" ? "npm.cmd" : "npm";
-  const packed = spawnSync(
+  const packed = spawnCommand(
     npmExecutable,
     ["pack", "--json", "--silent", "--ignore-scripts", "--pack-destination", packDestination],
     { cwd: packageRoot, encoding: "utf8" },
@@ -163,7 +171,7 @@ test("npm, pnpm, and Bun install and execute the unscoped forwarding package", (
       },
     });
 
-    const install = spawnSync(packageManager.executable, packageManager.installArguments, {
+    const install = spawnCommand(packageManager.executable, packageManager.installArguments, {
       cwd: consumerRoot,
       encoding: "utf8",
       env: {

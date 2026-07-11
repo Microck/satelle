@@ -60,12 +60,17 @@ function readJson(filePath) {
   return JSON.parse(readFileSync(filePath, "utf8"));
 }
 
+function npmSpawnOptions(options = {}) {
+  return process.platform === "win32" ? { ...options, shell: true } : options;
+}
+
 function packDryRun(packageRoot) {
   const npmExecutable = process.platform === "win32" ? "npm.cmd" : "npm";
-  const output = execFileSync(npmExecutable, ["pack", "--dry-run", "--json", packageRoot], {
-    cwd: repositoryRoot,
-    encoding: "utf8",
-  });
+  const output = execFileSync(
+    npmExecutable,
+    ["pack", "--dry-run", "--json", packageRoot],
+    npmSpawnOptions({ cwd: repositoryRoot, encoding: "utf8" }),
+  );
   return JSON.parse(output)[0];
 }
 
@@ -74,11 +79,11 @@ function packPackage(packageRoot, packDestination) {
   const output = execFileSync(
     npmExecutable,
     ["pack", "--json", "--silent", "--pack-destination", packDestination, packageRoot],
-    {
+    npmSpawnOptions({
       cwd: repositoryRoot,
       encoding: "utf8",
       env: { ...process.env, npm_config_ignore_scripts: "false" },
-    },
+    }),
   );
   return JSON.parse(output)[0];
 }
@@ -363,7 +368,7 @@ test("the unscoped executable runs the canonical public launcher", (context) => 
   assert.equal(child.status, 0);
   assert.deepEqual(JSON.parse(child.stdout), {
     packageName: "satelle",
-    launcherPath: unscopedBin,
+    launcherPath: realpathSync(unscopedBin),
   });
   assert.equal(child.stderr, "");
 });
@@ -407,11 +412,11 @@ test("native packages fail closed when release assembly has not injected a binar
         packDestination,
         path.join(repositoryRoot, "npm", `satelle-${targetId}`),
       ],
-      {
+      npmSpawnOptions({
         cwd: repositoryRoot,
         encoding: "utf8",
         env: { ...process.env, npm_config_ignore_scripts: "false" },
-      },
+      }),
     );
     assert.notEqual(child.status, 0, targetId);
     assert.match(`${child.stdout}\n${child.stderr}`, /native-package-invalid/, targetId);
