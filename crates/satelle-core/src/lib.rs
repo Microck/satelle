@@ -1217,6 +1217,7 @@ fn edit_distance(left: &str, right: &str) -> usize {
 pub enum ErrorCode {
     InvalidUsage,
     CompletionInstallFailed,
+    CompletionProfileUpdateFailed,
     ConfigError,
     ConfigNotFound,
     UnknownConfigKey,
@@ -1264,6 +1265,7 @@ impl ErrorCode {
         match self {
             Self::InvalidUsage => "invalid-usage",
             Self::CompletionInstallFailed => "completion-install-failed",
+            Self::CompletionProfileUpdateFailed => "completion-profile-update-failed",
             Self::ConfigError => "configuration-error",
             Self::ConfigNotFound => "config-not-found",
             Self::UnknownConfigKey => "unknown-config-key",
@@ -1321,7 +1323,7 @@ impl ErrorCode {
             | Self::ComponentSelectionConflict
             | Self::UnsupportedUpdateComponent
             | Self::InputRequired => 64,
-            Self::CompletionInstallFailed => 73,
+            Self::CompletionInstallFailed | Self::CompletionProfileUpdateFailed => 73,
             Self::StorageIntegrityFailed => 65,
             Self::ConfigError
             | Self::ConfigNotFound

@@ -1,3 +1,5 @@
+mod profile;
+
 use clap::{Args, CommandFactory, ValueEnum};
 use clap_complete::{Generator, Shell, generate};
 use satelle_core::{CLI_NAME, ErrorCode, SatelleError};
@@ -6,6 +8,7 @@ use std::io::{self, ErrorKind, Write};
 use std::path::{Path, PathBuf};
 
 use super::Cli;
+use profile::update_shell_profile;
 
 #[derive(Args, Debug)]
 pub(super) struct CompletionsCommand {
@@ -18,6 +21,14 @@ pub(super) struct CompletionsCommand {
         help = "Install the completion script in DIRECTORY; detect the shell when omitted"
     )]
     output_dir: Option<PathBuf>,
+
+    #[arg(
+        long,
+        value_name = "FILE",
+        requires = "output_dir",
+        help = "Activate the installed script through one managed block in FILE"
+    )]
+    update_profile: Option<PathBuf>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
@@ -45,7 +56,7 @@ pub(super) fn run_completions(command: CompletionsCommand) -> Result<(), Satelle
             Some(shell) => shell,
             None => detect_shell()?,
         };
-        return install_completions(shell, &output_dir);
+        return install_completions(shell, &output_dir, command.update_profile.as_deref());
     }
 
     let shell = command
@@ -70,7 +81,11 @@ fn completion_script(shell: CompletionShell) -> Vec<u8> {
     script
 }
 
-fn install_completions(shell: CompletionShell, output_dir: &Path) -> Result<(), SatelleError> {
+fn install_completions(
+    shell: CompletionShell,
+    output_dir: &Path,
+    profile_path: Option<&Path>,
+) -> Result<(), SatelleError> {
     fs::create_dir_all(output_dir).map_err(|source| {
         completion_install_error(
             format!(
@@ -91,6 +106,10 @@ fn install_completions(shell: CompletionShell, output_dir: &Path) -> Result<(), 
             source,
         )
     })?;
+
+    if let Some(profile_path) = profile_path {
+        update_shell_profile(shell, &destination, profile_path)?;
+    }
 
     write_stdout(
         format!("{}\n", destination.display()).as_bytes(),
