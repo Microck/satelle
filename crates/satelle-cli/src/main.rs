@@ -16,6 +16,10 @@ use std::str::FromStr;
 
 #[cfg(feature = "test-support")]
 const TEST_SUPPORT_ADAPTER_ENV: &str = "SATELLE_TEST_SUPPORT_ADAPTER";
+const CONFIG_CHECK_SCHEMA_VERSION: &str = "satelle.config.check.v1";
+const CONFIG_EXPLAIN_SCHEMA_VERSION: &str = "satelle.config.explain.v1";
+const ERROR_SCHEMA_VERSION: &str = "satelle.error.v1";
+const PATHS_SCHEMA_VERSION: &str = "satelle.paths.v1";
 use time::format_description::well_known::Rfc3339;
 use time::{Duration, OffsetDateTime};
 
@@ -1274,7 +1278,7 @@ fn config_check(command: ConfigCheckCommand) -> Result<(), CliFailure> {
         .map(|(alias, _)| alias)
         .map_err(|error| failure(error, command.json))?;
     let output = json!({
-        "schema_version": 1,
+        "schema_version": CONFIG_CHECK_SCHEMA_VERSION,
         "status": "ok",
         "mode": if command.all { "all" } else { "selected" },
         "selected_host": selected_host,
@@ -1337,7 +1341,7 @@ fn config_explain(command: ConfigExplainCommand) -> Result<(), CliFailure> {
         },
     });
     let output = json!({
-        "schema_version": 1,
+        "schema_version": CONFIG_EXPLAIN_SCHEMA_VERSION,
         "status": "ok",
         "selected_host": selected_host,
         "selected_profile": selected_profile,
@@ -1688,7 +1692,7 @@ fn show_paths(command: PathsCommand) -> Result<(), CliFailure> {
     let selected_host = command.host.unwrap_or_else(|| LOCAL_DEMO_HOST.to_string());
     let paths = resolve_path_set(&cwd).map_err(|error| failure(error, command.json))?;
     let output = json!({
-        "schema_version": 1,
+        "schema_version": PATHS_SCHEMA_VERSION,
         "host": selected_host,
         "config_file": paths.config_file,
         "cache_root": paths.cache_root,
@@ -2616,7 +2620,10 @@ fn print_error(error: &SatelleError, json: bool) {
         for (key, value) in &error.details {
             error_object.insert(key.clone(), value.clone());
         }
-        let value = json!({ "error": error_object });
+        let value = json!({
+            "schema_version": ERROR_SCHEMA_VERSION,
+            "error": error_object,
+        });
         if let Ok(raw) = serde_json::to_string_pretty(&value) {
             eprintln!("{raw}");
             return;

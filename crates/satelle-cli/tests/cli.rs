@@ -2683,7 +2683,7 @@ fn local_demo_outputs_do_not_include_old_product_name() {
 }
 
 #[test]
-fn config_check_explain_and_paths_are_read_only_json_commands() {
+fn config_check_explain_and_paths_use_versioned_read_only_json_contracts() {
     let state = state_dir();
     let project = state.path().join("project");
     fs::create_dir_all(project.join(".satelle")).expect("project config dir should be created");
@@ -2699,38 +2699,69 @@ adapter = "fake"
     )
     .expect("project config should be written");
 
-    satelle()
+    let check_output = satelle()
         .current_dir(&project)
         .env("SATELLE_STATE_DIR", state.path())
         .args(["config", "check", "--json"])
         .assert()
         .success()
-        .stdout(predicate::str::contains(r#""status": "ok""#))
-        .stdout(predicate::str::contains("native_computer_use"));
+        .get_output()
+        .clone();
+    assert!(check_output.stderr.is_empty());
+    let check_report = parse_json_output(&check_output.stdout);
+    assert_eq!(check_report["schema_version"], "satelle.config.check.v1");
+    assert_eq!(check_report["status"], "ok");
+    assert!(
+        check_report["not_checked"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|value| value == "native_computer_use")
+    );
 
-    satelle()
+    let explain_output = satelle()
         .current_dir(&project)
         .env("SATELLE_STATE_DIR", state.path())
         .args(["config", "explain", "--json"])
         .assert()
         .success()
-        .stdout(predicate::str::contains(r#""selected_host": "local-demo""#))
-        .stdout(predicate::str::contains(r#""effective""#));
+        .get_output()
+        .clone();
+    assert!(explain_output.stderr.is_empty());
+    let explain_report = parse_json_output(&explain_output.stdout);
+    assert_eq!(
+        explain_report["schema_version"],
+        "satelle.config.explain.v1"
+    );
+    assert_eq!(explain_report["selected_host"], "local-demo");
+    assert!(explain_report["effective"].is_object());
 
-    satelle()
+    let paths_output = satelle()
         .current_dir(&project)
         .env("SATELLE_STATE_DIR", state.path())
         .args(["paths", "--json"])
         .assert()
         .success()
-        .stdout(predicate::str::contains(r#""config_file""#))
-        .stdout(predicate::str::contains(r#""cache_root""#))
-        .stdout(predicate::str::contains(r#""state_root""#))
-        .stdout(predicate::str::contains(r#""sqlite_store""#))
-        .stdout(predicate::str::contains(r#""operator_log_root""#))
-        .stdout(predicate::str::contains(r#""recording_root""#))
-        .stdout(predicate::str::contains(r#""project_config_file""#))
-        .stdout(predicate::str::contains(r#""install_receipt""#));
+        .get_output()
+        .clone();
+    assert!(paths_output.stderr.is_empty());
+    let paths_report = parse_json_output(&paths_output.stdout);
+    assert_eq!(paths_report["schema_version"], "satelle.paths.v1");
+    for field in [
+        "config_file",
+        "cache_root",
+        "state_root",
+        "sqlite_store",
+        "operator_log_root",
+        "recording_root",
+        "project_config_file",
+        "install_receipt",
+    ] {
+        assert!(
+            !paths_report[field].is_null(),
+            "paths JSON should include {field}"
+        );
+    }
 
     assert!(!state.path().join("local-demo-state.json").exists());
 }
@@ -3373,7 +3404,11 @@ adapter = "fake"
         .code(66)
         .get_output()
         .clone();
-    let error = parse_json_output(&output.stderr)["error"].clone();
+    assert!(output.stdout.is_empty());
+    let report = parse_json_output(&output.stderr);
+    assert_exact_object_keys(&report, &["schema_version", "error"]);
+    assert_eq!(report["schema_version"], "satelle.error.v1");
+    let error = report["error"].clone();
 
     assert_eq!(error["code"], "unknown-config-key");
     assert_eq!(error["path"], "defalt_host");

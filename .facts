@@ -125,13 +125,13 @@
 - satelle setup JSON v1 uses schema_version satelle.setup.v1 @spec @contract @mvp
 - satelle repair JSON v1 uses schema_version satelle.repair.v1 @spec @contract @mvp
 - satelle doctor JSON v1 uses schema_version satelle.doctor.v1 @spec @contract @mvp
-- satelle config check JSON v1 uses schema_version satelle.config.check.v1 @spec @contract @mvp
-- satelle config explain JSON v1 uses schema_version satelle.config.explain.v1 @spec @contract @mvp
+- satelle config check JSON v1 uses schema_version satelle.config.check.v1 @contract @mvp @implemented
+- satelle config explain JSON v1 uses schema_version satelle.config.explain.v1 @contract @mvp @implemented
 - satelle self update JSON v1 uses schema_version satelle.self.update.v1 @spec @contract @mvp
 - satelle host update JSON v1 uses schema_version satelle.host.update.v1 @spec @contract @mvp
-- satelle paths JSON v1 uses schema_version satelle.paths.v1 @spec @contract @mvp
+- satelle paths JSON v1 uses schema_version satelle.paths.v1 @contract @mvp @implemented
 - satelle host sessions JSON v1 uses schema_version satelle.host.sessions.v1 @spec @contract @mvp
-- satelle JSON error v1 uses schema_version satelle.error.v1 @spec @contract @mvp
+- satelle JSON error v1 uses schema_version satelle.error.v1 @contract @mvp @implemented
 - satelle does not remove fields, change field meanings, or rename enum tokens within one result schema_version @spec @contract @mvp
 - breaking machine-readable result changes require a new schema_version @spec @contract @mvp
 
@@ -2022,7 +2022,7 @@
 - the public GitHub release remains draft until every required npm package is registry-visible and passes clean-install smoke tests @spec @mvp
 - a partial npm publication failure stops later package publication and records which immutable versions already exist plus an idempotent recovery procedure @spec @mvp
 - release recovery never moves the signed version tag or republishes different bytes under an already published package version @spec @mvp
-- the release-candidate offline JSON smoke command is satelle paths --json and must emit schema_version satelle.paths.v1 before target-specific online smoke tests run @spec @release-gate @verification @mvp
+- the release-candidate offline JSON smoke command is satelle paths --json and must emit schema_version satelle.paths.v1 before target-specific online smoke tests run @release-gate @verification @mvp @spec
 - release-candidate validation installs, executes the --version contract, runs satelle paths --json, upgrades, and uninstalls Satelle on every Controller target @spec @verification @mvp
 
 # verification

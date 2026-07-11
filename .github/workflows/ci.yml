@@ -39,3 +39,6 @@ jobs:
 
       - name: Build release binaries
         run: cargo build --workspace --release --locked
+
+      - name: Smoke-test release binary contracts
+        run: cargo test --locked -p satelle-cli --test release-binary-contract release_binary_satisfies_offline_contract -- --exact --ignored
