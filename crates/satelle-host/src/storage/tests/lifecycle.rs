@@ -20,7 +20,7 @@ fn terminal_session_round_trips_with_follow_up_and_exact_snapshot() {
     };
     assert_eq!(session.snapshot(), admitted.snapshot());
     assert_eq!(session.id(), recovery_subject.session_id());
-    assert_eq!(1, storage.session_count().unwrap());
+    assert_eq!(1, storage.snapshot().unwrap().session_count());
 
     session = storage
         .commit_lifecycle(
@@ -621,7 +621,7 @@ fn admission_replays_the_same_request_and_rejects_a_changed_digest() {
         panic!("an in-progress replay must return its durable handles");
     };
     assert_eq!(session.snapshot(), replayed.snapshot());
-    assert_eq!(1, storage.session_count().unwrap());
+    assert_eq!(1, storage.snapshot().unwrap().session_count());
 
     let completed = storage
         .commit_lifecycle(
@@ -647,7 +647,7 @@ fn admission_replays_the_same_request_and_rejects_a_changed_digest() {
         .begin_session(&session, &conflicting)
         .expect_err("changed digest conflicts");
     assert_eq!(StorageErrorKind::IdempotencyConflict, error.kind());
-    assert_eq!(1, storage.session_count().unwrap());
+    assert_eq!(1, storage.snapshot().unwrap().session_count());
 }
 
 #[test]

@@ -23,7 +23,7 @@ fn admission_and_its_canonical_log_commit_atomically() {
         .expect_err("a rejected canonical log must reject admission");
 
     assert_eq!(StorageErrorKind::OperationFailed, error.kind());
-    assert_eq!(0, storage.session_count().unwrap());
+    assert_eq!(0, storage.snapshot().unwrap().session_count());
     for table in ["control_leases", "idempotency_records", "logs"] {
         let count: i64 = storage
             .connection_for_test()

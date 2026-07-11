@@ -38,6 +38,8 @@ jobs:
         run: cargo test --workspace --all-targets --all-features --locked --no-fail-fast
 
       - name: Build release binaries
+        env:
+          RUSTFLAGS: -D warnings
         run: cargo build --workspace --release --locked
 
       - name: Smoke-test release binary contracts

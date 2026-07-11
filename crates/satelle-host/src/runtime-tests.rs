@@ -52,9 +52,10 @@ fn blocked_preflight_opens_authoritative_state_without_admitting_work() {
     assert!(state.path().join("satelle.sqlite3.lock").exists());
     assert_eq!(
         runtime
-            .session_count()
-            .expect("blocked readiness must leave authoritative state readable"),
-        0
+            .snapshot()
+            .expect("blocked readiness must leave authoritative state readable")
+            .session_count(),
+        0,
     );
 }
 
@@ -184,7 +185,7 @@ fn reads_and_stop_remain_available_during_slow_execution_and_stop_observation() 
     let read_session_id = session.session_id.clone();
     let execute_read = std::thread::spawn(move || {
         let read_result = read_runtime.status(read_session_id).and_then(|status| {
-            let count = read_runtime.session_count()?;
+            let count = read_runtime.snapshot()?.session_count();
             Ok((status, count))
         });
         read_sender
@@ -357,8 +358,9 @@ fn read_paths_open_storage_without_computer_use_preflight() {
         .logs(LogQuery::for_host(LOCAL_DEMO_HOST))
         .expect("logs should not require adapter readiness");
     let count = blocked
-        .session_count()
-        .expect("session count should not require adapter readiness");
+        .snapshot()
+        .expect("runtime snapshot should not require adapter readiness")
+        .session_count();
 
     assert_eq!(status.status, satelle_core::TurnStatus::Completed);
     assert!(!logs.is_empty());

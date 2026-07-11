@@ -187,11 +187,11 @@ impl HostService {
             }),
             #[cfg(any(test, feature = "test-support"))]
             HostMode::TestFake => {
-                self.runtime.reconcile()?;
+                let snapshot = self.runtime.reconcile_and_snapshot()?;
                 Ok(HostStatus {
                     running: true,
                     mode: "local-demo-in-process".to_string(),
-                    sessions: self.runtime.session_count()?,
+                    sessions: snapshot.session_count(),
                 })
             }
         }

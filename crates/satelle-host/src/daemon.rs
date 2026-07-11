@@ -214,14 +214,14 @@ impl HostService {
     /// Existing nonterminal work is reconciled first, so a daemon never reports
     /// itself initialized while restart recovery remains unexamined.
     pub fn initialize_daemon(&self) -> Result<DaemonRuntimeStatus, SatelleError> {
-        let snapshot = self.runtime.initialize_for_daemon()?;
+        let snapshot = self.runtime.reconcile_and_snapshot()?;
         Ok(daemon_status(snapshot))
     }
 
     /// Reads current authoritative status without running restart recovery or
     /// adapter preflight. Startup owns reconciliation before the listener opens.
     pub fn daemon_runtime_status(&self) -> Result<DaemonRuntimeStatus, SatelleError> {
-        self.runtime.snapshot_for_daemon().map(daemon_status)
+        self.runtime.snapshot().map(daemon_status)
     }
 
     pub fn daemon_workers_idle(&self) -> Result<bool, SatelleError> {
