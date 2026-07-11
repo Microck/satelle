@@ -490,6 +490,8 @@ fn validate_replayed_turn_outcome(
 }
 
 pub(crate) struct Storage {
+    // Field order is a drop invariant: SQLite must close every delegated file
+    // before the ownership lock and pinned state directory are released.
     connection: Connection,
     _ownership_lock: File,
     _state_directory: open::StateDirectory,

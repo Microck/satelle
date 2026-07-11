@@ -14,13 +14,13 @@ use std::fs;
 #[cfg(unix)]
 use std::os::unix::fs::MetadataExt;
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 mod unix_vfs;
 #[cfg(windows)]
 mod windows;
 
-#[cfg(not(any(unix, windows)))]
-compile_error!("Satelle storage supports only Unix and Windows hosts");
+#[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
+compile_error!("Satelle storage supports only Linux, macOS, and Windows hosts");
 
 pub(super) const DATABASE_FILE_NAME: &str = "satelle.sqlite3";
 pub(super) const LOCK_FILE_NAME: &str = "satelle.sqlite3.lock";
@@ -46,6 +46,10 @@ pub(super) fn sqlite_error(fallback: StorageErrorKind, source: rusqlite::Error) 
 }
 
 pub(super) struct StateDirectory {
+    // Field order is a drop invariant on macOS: release every retained SQLite
+    // descriptor and pathname before closing the directory descriptor.
+    #[cfg(target_os = "macos")]
+    _vfs_registration: unix_vfs::DirectoryRegistration,
     #[cfg(unix)]
     handle: File,
     #[cfg(windows)]
@@ -85,11 +89,11 @@ fn open_parts_after_lock(
         | OpenFlags::SQLITE_OPEN_CREATE
         | OpenFlags::SQLITE_OPEN_NO_MUTEX
         | OpenFlags::SQLITE_OPEN_NOFOLLOW;
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     let mut connection =
         Connection::open_with_flags_and_vfs(&database_path, flags, unix_vfs::name()?)
             .map_err(|source| sqlite_error(StorageErrorKind::OpenFailed, source))?;
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(windows)]
     let mut connection = Connection::open_with_flags(&database_path, flags)
         .map_err(|source| sqlite_error(StorageErrorKind::OpenFailed, source))?;
     verify_database_readable(&connection)?;
@@ -99,6 +103,21 @@ fn open_parts_after_lock(
     #[cfg(windows)]
     restrict_database_files(&state_directory)?;
     Ok((connection, ownership_lock, state_directory))
+}
+
+#[cfg(target_os = "macos")]
+fn sqlite_database_path(
+    _state_root: &Path,
+    state_directory: &StateDirectory,
+) -> std::path::PathBuf {
+    use std::os::fd::AsRawFd;
+
+    format!(
+        "/.satelle-fd/{}/{}",
+        state_directory.handle.as_raw_fd(),
+        DATABASE_FILE_NAME
+    )
+    .into()
 }
 
 #[cfg(target_os = "linux")]
@@ -116,7 +135,7 @@ fn sqlite_database_path(
     .into()
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(windows)]
 fn sqlite_database_path(
     state_root: &Path,
     _state_directory: &StateDirectory,
@@ -129,7 +148,7 @@ pub(super) fn anchored_vfs_name_for_test() -> Result<&'static std::ffi::CStr, St
     unix_vfs::name()
 }
 
-#[cfg(all(test, target_os = "linux"))]
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
 pub(super) fn open_parts_with_after_lock_hook(
     state_root: &Path,
     after_lock: impl FnOnce(),
@@ -244,8 +263,13 @@ fn open_and_restrict_state_directory(path: &Path) -> Result<StateDirectory, Stor
     {
         return Err(StorageError::new(StorageErrorKind::UnsafeStatePath));
     }
+    let handle = File::from(descriptor);
+    #[cfg(target_os = "macos")]
+    let vfs_registration = unix_vfs::register_directory(&handle)?;
     Ok(StateDirectory {
-        handle: File::from(descriptor),
+        #[cfg(target_os = "macos")]
+        _vfs_registration: vfs_registration,
+        handle,
     })
 }
 
