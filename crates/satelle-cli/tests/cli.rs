@@ -267,6 +267,22 @@ fn help_prints_satelle_and_not_old_name() {
 }
 
 #[test]
+fn version_is_exact_and_does_not_initialize_host_state() {
+    let home = state_dir();
+    let untouched_home = home.path().join("untouched-satelle-home");
+
+    production_satelle()
+        .env("SATELLE_HOME", &untouched_home)
+        .arg("--version")
+        .assert()
+        .success()
+        .stdout(format!("satelle {}\n", env!("CARGO_PKG_VERSION")))
+        .stderr(predicate::str::is_empty());
+
+    assert!(!untouched_home.exists());
+}
+
+#[test]
 fn legacy_environment_namespace_is_ignored() {
     let state = state_dir();
     let satelle_home = state.path().join("satelle-home");

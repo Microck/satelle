@@ -90,7 +90,7 @@
 
 ## foundations
 - the satelle CLI is implemented in Rust @implemented @mvp
-- satelle --version writes exactly satelle <version> followed by one newline to stdout and exits 0 without contacting a Host @spec @contract @mvp
+- satelle --version writes exactly satelle <version> followed by one newline to stdout and exits 0 without contacting a Host @contract @mvp @implemented
 - satelle CLI parsing uses clap derive for commands, subcommands, flags, help text, and future shell completion support @implemented @mvp
 - satelle interactive setup uses the Rust cliclack crate for setup intro and outro prompt framing @implemented @mvp
 
