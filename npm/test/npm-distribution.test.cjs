@@ -145,12 +145,42 @@ test("native package resolution returns the installed binary", (context) => {
   const packageRoot = path.join(fixtureRoot, "node_modules", "@microck", "satelle-linux-x64-gnu");
   const binaryPath = path.join(packageRoot, "bin", "satelle");
   mkdirSync(path.dirname(binaryPath), { recursive: true });
-  writeFileSync(path.join(packageRoot, "package.json"), JSON.stringify({ name: target.packageName }));
+  writeFileSync(
+    path.join(packageRoot, "package.json"),
+    JSON.stringify({ name: target.packageName, version: "0.1.0" }),
+  );
   writeFileSync(binaryPath, "fixture");
 
   assert.equal(
-    realpathSync(launcher.resolveNativeBinary(target, fixtureRoot)),
+    realpathSync(launcher.resolveNativeBinary(target, fixtureRoot, undefined, "0.1.0")),
     realpathSync(binaryPath),
+  );
+});
+
+test("native package resolution rejects an ancestor package from another version", (context) => {
+  const fixtureRoot = mkdtempSync(path.join(tmpdir(), "satelle-native-version-"));
+  context.after(() => rmSync(fixtureRoot, { recursive: true, force: true }));
+  const target = platformMatrix["linux-x64-gnu"];
+  const packageRoot = path.join(fixtureRoot, "node_modules", "@microck", "satelle-linux-x64-gnu");
+  const nestedLauncherRoot = path.join(
+    fixtureRoot,
+    "node_modules",
+    "consumer",
+    "node_modules",
+    "@microck",
+    "satelle",
+  );
+  mkdirSync(path.join(packageRoot, "bin"), { recursive: true });
+  mkdirSync(nestedLauncherRoot, { recursive: true });
+  writeFileSync(
+    path.join(packageRoot, "package.json"),
+    JSON.stringify({ name: target.packageName, version: "0.1.0" }),
+  );
+  writeFileSync(path.join(packageRoot, "bin", "satelle"), "stale fixture");
+
+  assert.throws(
+    () => launcher.resolveNativeBinary(target, nestedLauncherRoot, undefined, "0.2.0"),
+    (error) => error.code === "native-binary-package-missing",
   );
 });
 

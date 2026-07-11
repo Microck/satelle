@@ -5,6 +5,7 @@ const { existsSync, readFileSync } = require("node:fs");
 const { createRequire } = require("node:module");
 const path = require("node:path");
 
+const launcherVersion = require("../package.json").version;
 const platformMatrix = require("../platforms.json");
 
 class LauncherError extends Error {
@@ -203,7 +204,12 @@ function missingPackageError(target, recoveryContext = {}) {
   );
 }
 
-function resolveNativeBinary(target, searchFrom = path.resolve(__dirname, ".."), recoveryContext) {
+function resolveNativeBinary(
+  target,
+  searchFrom = path.resolve(__dirname, ".."),
+  recoveryContext,
+  expectedVersion = launcherVersion,
+) {
   const resolver = createRequire(path.join(path.resolve(searchFrom), "satelle-resolver.cjs"));
   let packageManifestPath;
 
@@ -214,6 +220,11 @@ function resolveNativeBinary(target, searchFrom = path.resolve(__dirname, ".."),
       throw missingPackageError(target, recoveryContext);
     }
     throw error;
+  }
+
+  const nativeManifest = JSON.parse(readFileSync(packageManifestPath, "utf8"));
+  if (nativeManifest.version !== expectedVersion) {
+    throw missingPackageError(target, recoveryContext);
   }
 
   const binaryPath = path.join(path.dirname(packageManifestPath), target.binaryPath);
