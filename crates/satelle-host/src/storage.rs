@@ -151,6 +151,11 @@ impl StorageError {
         self.kind
     }
 
+    #[cfg(test)]
+    pub(crate) fn for_test(kind: StorageErrorKind) -> Self {
+        Self::new(kind)
+    }
+
     pub(crate) fn conflicting_session_id(&self) -> Option<&SessionId> {
         self.conflicting_session_id.as_ref()
     }

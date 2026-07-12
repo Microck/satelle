@@ -437,6 +437,14 @@ fn sqlite_busy_exhaustion_returns_a_typed_redacted_error() {
     assert_eq!(StorageErrorKind::Busy, error.kind());
     assert_eq!("the Satelle SQLite store is busy", error.to_string());
     assert_eq!("StorageError { kind: Busy, .. }", format!("{error:?}"));
+    let log_count: i64 = storage
+        .connection_for_test()
+        .query_row("SELECT count(*) FROM logs", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(
+        0, log_count,
+        "busy exhaustion must not retain a partial write"
+    );
 
     blocker.execute_batch("ROLLBACK").unwrap();
 }
