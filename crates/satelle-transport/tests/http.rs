@@ -12,6 +12,7 @@ mod raw_wire;
 mod sessions;
 
 use reqwest::StatusCode;
+use satelle_core::ErrorCode;
 use satelle_host::{ApiBearerToken, ApiScopes, HostService, test_support::TestStateDir};
 use satelle_transport::{
     ApiError, CapabilitiesResponse, DaemonClient, DaemonClientError, DaemonServer,
@@ -537,6 +538,38 @@ async fn plaintext_non_loopback_bind_is_rejected_before_listening() {
     .await
     .expect_err("non-loopback plaintext bind must fail");
     assert_eq!(error.code(), "non-loopback-plaintext-bind");
+}
+
+#[tokio::test]
+async fn second_daemon_reports_store_in_use_before_accepting_requests() {
+    let state = TestStateDir::new().expect("temporary state directory");
+    let first_service =
+        HostService::local_demo_for_tests_at(state.path()).expect("construct first Host service");
+    let first_server = DaemonServer::bind(
+        first_service,
+        DaemonServerConfig::loopback(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))),
+    )
+    .await
+    .expect("bind first daemon");
+    let second_service =
+        HostService::local_demo_for_tests_at(state.path()).expect("construct second Host service");
+
+    let error = DaemonServer::bind(
+        second_service,
+        DaemonServerConfig::loopback(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))),
+    )
+    .await
+    .expect_err("the second daemon must fail before serving");
+
+    assert_eq!(error.code(), "store-in-use");
+    assert_eq!(
+        error
+            .host_error()
+            .expect("retain the typed Host initialization failure")
+            .code,
+        ErrorCode::StoreInUse
+    );
+    first_server.shutdown().await.expect("stop first daemon");
 }
 
 #[tokio::test]

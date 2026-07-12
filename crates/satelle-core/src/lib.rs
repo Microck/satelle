@@ -1335,6 +1335,8 @@ pub enum ErrorCode {
     HostNotFound,
     HostUnreachable,
     HostBusy,
+    StoreInUse,
+    StateConflict,
     IdempotencyKeyConflict,
     RemoteExecution,
     StorageBusy,
@@ -1357,7 +1359,7 @@ pub enum ErrorCode {
 }
 
 impl ErrorCode {
-    pub fn as_str(self) -> &'static str {
+    pub const fn as_str(self) -> &'static str {
         match self {
             Self::InvalidUsage => "invalid-usage",
             Self::CompletionInstallFailed => "completion-install-failed",
@@ -1389,6 +1391,8 @@ impl ErrorCode {
             Self::HostNotFound => "host-not-found",
             Self::HostUnreachable => "host-unreachable",
             Self::HostBusy => "host-busy",
+            Self::StoreInUse => "store-in-use",
+            Self::StateConflict => "state-conflict",
             Self::IdempotencyKeyConflict => "idempotency-key-conflict",
             Self::RemoteExecution => "remote-execution",
             Self::StorageBusy => "storage-busy",
@@ -1450,11 +1454,14 @@ impl ErrorCode {
             | Self::HostNotFound
             | Self::SessionNotFound
             | Self::LogsCursorExpired => 66,
-            Self::CapacityExceeded | Self::HostUnreachable | Self::HostBusy => 69,
+            Self::CapacityExceeded | Self::HostUnreachable | Self::HostBusy | Self::StoreInUse => {
+                69
+            }
             Self::RemoteExecution | Self::StorageBusy => 74,
             Self::IncompatibleControlPlane
             | Self::ComputerUseNotReady
-            | Self::DoctorReadinessBlockersFound => 75,
+            | Self::DoctorReadinessBlockersFound
+            | Self::StateConflict => 75,
             Self::NotImplemented => 78,
         }
     }
@@ -2010,6 +2017,28 @@ impl SatelleError {
             code: ErrorCode::StorageBusy,
             message: "the Host state store is temporarily busy".to_string(),
             recovery_command: Some("retry the operation after a short delay".to_string()),
+            source_detail: None,
+            details: BTreeMap::new(),
+        }
+    }
+
+    pub fn store_in_use() -> Self {
+        Self {
+            code: ErrorCode::StoreInUse,
+            message: "the Host state store is already owned by another daemon process".to_string(),
+            recovery_command: Some(
+                "stop the other Host Daemon or select a different state directory".to_string(),
+            ),
+            source_detail: None,
+            details: BTreeMap::new(),
+        }
+    }
+
+    pub fn state_conflict() -> Self {
+        Self {
+            code: ErrorCode::StateConflict,
+            message: "the Host state changed before the operation could commit".to_string(),
+            recovery_command: Some("retry the operation against current Host state".to_string()),
             source_detail: None,
             details: BTreeMap::new(),
         }

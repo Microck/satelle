@@ -21,6 +21,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::serve::IncomingStream;
 use listener::LimitedTcpListener;
+use satelle_core::SatelleError;
 use satelle_host::{DaemonRuntimeCapabilities, HostService};
 use serde::Serialize;
 use serde_json::Value;
@@ -95,10 +96,10 @@ impl DaemonServer {
         }
         let initialized = service
             .initialize_daemon()
-            .map_err(|_| DaemonServerError::HostInitializationFailed)?;
+            .map_err(DaemonServerError::HostInitializationFailed)?;
         let capabilities = service
             .daemon_runtime_capabilities()
-            .map_err(|_| DaemonServerError::HostInitializationFailed)?;
+            .map_err(DaemonServerError::HostInitializationFailed)?;
         let listener = TcpListener::bind(config.bind_addr)
             .await
             .map_err(DaemonServerError::BindFailed)?;
@@ -211,7 +212,7 @@ pub enum DaemonServerError {
     NonLoopbackPlaintextBind,
     InvalidConnectionLimit,
     InvalidShutdownGrace,
-    HostInitializationFailed,
+    HostInitializationFailed(SatelleError),
     BindFailed(std::io::Error),
     ServeFailed(std::io::Error),
     TaskFailed(tokio::task::JoinError),
@@ -225,12 +226,19 @@ impl DaemonServerError {
             Self::NonLoopbackPlaintextBind => "non-loopback-plaintext-bind",
             Self::InvalidConnectionLimit => "invalid-connection-limit",
             Self::InvalidShutdownGrace => "invalid-shutdown-grace",
-            Self::HostInitializationFailed => "host-initialization-failed",
+            Self::HostInitializationFailed(error) => error.code.as_str(),
             Self::BindFailed(_) => "bind-failed",
             Self::ServeFailed(_) => "serve-failed",
             Self::TaskFailed(_) => "server-task-failed",
             Self::ShutdownTimedOut => "shutdown-timeout",
             Self::HostShutdownFailed => "host-shutdown-failed",
+        }
+    }
+
+    pub const fn host_error(&self) -> Option<&SatelleError> {
+        match self {
+            Self::HostInitializationFailed(error) => Some(error),
+            _ => None,
         }
     }
 }
@@ -243,7 +251,7 @@ impl fmt::Display for DaemonServerError {
             }
             Self::InvalidConnectionLimit => "the Host Daemon connection limit must be positive",
             Self::InvalidShutdownGrace => "the Host Daemon shutdown grace period must be positive",
-            Self::HostInitializationFailed => {
+            Self::HostInitializationFailed(_) => {
                 "the Host Daemon could not initialize its authoritative state"
             }
             Self::BindFailed(_) => "the Host Daemon could not bind its listener",
@@ -260,6 +268,7 @@ impl fmt::Display for DaemonServerError {
 impl std::error::Error for DaemonServerError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
+            Self::HostInitializationFailed(error) => Some(error),
             Self::BindFailed(error) | Self::ServeFailed(error) => Some(error),
             Self::TaskFailed(error) => Some(error),
             _ => None,

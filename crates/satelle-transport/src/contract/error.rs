@@ -19,6 +19,8 @@ pub enum ApiErrorCode {
     LogsCursorExpired,
     HostUnreachable,
     HostBusy,
+    StoreInUse,
+    StateConflict,
     IncompatibleProtocol,
     IncompatibleControlPlane,
     ComputerUseNotReady,
@@ -47,6 +49,8 @@ impl ApiErrorCode {
             Self::LogsCursorExpired => "logs-cursor-expired",
             Self::HostUnreachable => "host-unreachable",
             Self::HostBusy => "host-busy",
+            Self::StoreInUse => "store-in-use",
+            Self::StateConflict => "state-conflict",
             Self::IncompatibleProtocol => "incompatible-protocol",
             Self::IncompatibleControlPlane => "incompatible-control-plane",
             Self::ComputerUseNotReady => "computer-use-not-ready",
@@ -86,6 +90,17 @@ mod tests {
             serde_json::to_value(ApiErrorCode::StorageBusy).unwrap(),
             json!("storage-busy")
         );
+    }
+
+    #[test]
+    fn storage_conflict_codes_have_exact_public_tokens() {
+        for (code, token) in [
+            (ApiErrorCode::StoreInUse, "store-in-use"),
+            (ApiErrorCode::StateConflict, "state-conflict"),
+        ] {
+            assert_eq!(code.as_str(), token);
+            assert_eq!(serde_json::to_value(code).unwrap(), json!(token));
+        }
     }
 }
 
