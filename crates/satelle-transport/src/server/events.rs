@@ -344,7 +344,11 @@ async fn controller_loop(
                 if matches!(message, Message::Close(_)) {
                     return ConnectionEnd::PeerClosed;
                 }
-                if !state.websocket_inbound_limit.allow(rate_key.clone()) {
+                if state
+                    .websocket_inbound_limit
+                    .admit(rate_key.clone())
+                    .is_some()
+                {
                     return ConnectionEnd::Failure {
                         request_id: active_request_id,
                         reason: WsCloseReason::RateLimited,

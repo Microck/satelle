@@ -600,6 +600,16 @@ struct RateWindow {
     count: usize,
 }
 
+impl RateWindow {
+    fn is_active(&self, now: Instant) -> bool {
+        now.duration_since(self.started_at) < RATE_WINDOW
+    }
+
+    fn retry_after(&self, now: Instant) -> Duration {
+        RATE_WINDOW.saturating_sub(now.saturating_duration_since(self.started_at))
+    }
+}
+
 struct FixedWindowLimiter<K> {
     limit: usize,
     entries: Mutex<HashMap<K, RateWindow>>,
@@ -616,22 +626,32 @@ where
         }
     }
 
-    fn allow(&self, key: K) -> bool {
-        let now = Instant::now();
+    /// Returns `None` when the request is admitted and the remaining window
+    /// when it is limited. Keeping the duration in the limiter prevents HTTP
+    /// and WebSocket callers from reconstructing timing from policy constants.
+    fn admit(&self, key: K) -> Option<Duration> {
+        self.admit_at(key, Instant::now())
+    }
+
+    fn admit_at(&self, key: K, now: Instant) -> Option<Duration> {
         let mut entries = self
             .entries
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
-        entries.retain(|_, window| now.duration_since(window.started_at) < RATE_WINDOW);
+        entries.retain(|_, window| window.is_active(now));
         if !entries.contains_key(&key) && entries.len() >= MAX_RATE_KEYS {
-            return false;
+            return entries.values().map(|window| window.retry_after(now)).min();
         }
         let window = entries.entry(key).or_insert(RateWindow {
             started_at: now,
             count: 0,
         });
-        window.count += 1;
-        window.count <= self.limit
+        if window.count >= self.limit {
+            Some(window.retry_after(now))
+        } else {
+            window.count += 1;
+            None
+        }
     }
 }
 
@@ -646,31 +666,38 @@ impl FailedAuthLimiter {
         }
     }
 
-    fn is_blocked(&self, source: IpAddr) -> bool {
-        let now = Instant::now();
+    fn retry_after(&self, source: IpAddr) -> Option<Duration> {
+        self.retry_after_at(source, Instant::now())
+    }
+
+    fn retry_after_at(&self, source: IpAddr, now: Instant) -> Option<Duration> {
         let mut entries = self
             .entries
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
-        entries.retain(|_, window| now.duration_since(window.started_at) < RATE_WINDOW);
+        entries.retain(|_, window| window.is_active(now));
         entries
             .get(&source)
-            .is_some_and(|window| window.count >= FAILED_AUTH_LIMIT)
+            .filter(|window| window.count >= FAILED_AUTH_LIMIT)
+            .map(|window| window.retry_after(now))
     }
 
     fn record_failure(&self, source: IpAddr) {
-        let now = Instant::now();
+        self.record_failure_at(source, Instant::now());
+    }
+
+    fn record_failure_at(&self, source: IpAddr, now: Instant) {
         let mut entries = self
             .entries
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
-        entries.retain(|_, window| now.duration_since(window.started_at) < RATE_WINDOW);
+        entries.retain(|_, window| window.is_active(now));
         if !entries.contains_key(&source) && entries.len() >= MAX_RATE_KEYS {
             return;
         }
         entries
             .entry(source)
-            .and_modify(|window| window.count += 1)
+            .and_modify(|window| window.count = window.count.saturating_add(1))
             .or_insert(RateWindow {
                 started_at: now,
                 count: 1,
@@ -678,9 +705,16 @@ impl FailedAuthLimiter {
     }
 }
 
+fn retry_after_ms(duration: Duration) -> u64 {
+    let rounded_millis =
+        duration.as_millis() + u128::from(!duration.subsec_nanos().is_multiple_of(1_000_000));
+    u64::try_from(rounded_millis).expect("the one-minute rate window fits in u64 milliseconds")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::net::Ipv4Addr;
 
     struct SerializationFailure;
 
@@ -710,5 +744,65 @@ mod tests {
         assert_eq!(error.code(), ApiErrorCode::InternalError);
         assert_eq!(error.request_id(), &request_id);
         assert_eq!(error.host_identity(), Some("host-test"));
+    }
+
+    #[test]
+    fn fixed_window_reports_remaining_time_and_reopens_at_expiry() {
+        let limiter = FixedWindowLimiter::new(1);
+        let started_at = Instant::now();
+
+        assert_eq!(limiter.admit_at("principal", started_at), None);
+        assert_eq!(
+            limiter.admit_at("principal", started_at + Duration::from_millis(125),),
+            Some(RATE_WINDOW - Duration::from_millis(125))
+        );
+        assert_eq!(
+            limiter.admit_at("principal", started_at + RATE_WINDOW),
+            None
+        );
+    }
+
+    #[test]
+    fn failed_auth_window_reports_remaining_time_and_expires() {
+        let limiter = FailedAuthLimiter::new();
+        let source = IpAddr::V4(Ipv4Addr::LOCALHOST);
+        let started_at = Instant::now();
+        for _ in 0..FAILED_AUTH_LIMIT {
+            limiter.record_failure_at(source, started_at);
+        }
+
+        assert_eq!(
+            limiter.retry_after_at(source, started_at + Duration::from_millis(250)),
+            Some(RATE_WINDOW - Duration::from_millis(250))
+        );
+        assert_eq!(
+            limiter.retry_after_at(source, started_at + RATE_WINDOW),
+            None
+        );
+    }
+
+    #[test]
+    fn full_key_table_reports_the_earliest_window_expiry() {
+        let limiter = FixedWindowLimiter::new(1);
+        let started_at = Instant::now();
+        for key in 0..MAX_RATE_KEYS {
+            assert_eq!(limiter.admit_at(key, started_at), None);
+        }
+
+        assert_eq!(
+            limiter.admit_at(MAX_RATE_KEYS, started_at + Duration::from_secs(1)),
+            Some(RATE_WINDOW - Duration::from_secs(1))
+        );
+        assert_eq!(
+            limiter.admit_at(MAX_RATE_KEYS, started_at + RATE_WINDOW),
+            None
+        );
+    }
+
+    #[test]
+    fn retry_metadata_rounds_up_to_the_next_millisecond() {
+        assert_eq!(retry_after_ms(Duration::from_nanos(1)), 1);
+        assert_eq!(retry_after_ms(Duration::from_micros(1_001)), 2);
+        assert_eq!(retry_after_ms(Duration::from_millis(60_000)), 60_000);
     }
 }
