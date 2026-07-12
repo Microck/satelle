@@ -1,6 +1,5 @@
 use super::{
-    ApiFailure, DaemonState, PeerAddress, api_error_response, header_request_id, request_id_or_new,
-    security_headers,
+    ApiFailure, DaemonState, PeerAddress, api_error_response, header_request_id, security_headers,
 };
 use crate::contract::{ApiErrorCategory, ApiErrorCode, RequestId};
 use axum::extract::{ConnectInfo, Request, State};
@@ -18,12 +17,17 @@ pub(super) const REQUEST_ID_HEADER: &str = "satelle-request-id";
 #[derive(Clone)]
 pub(super) struct AuthorizedRequest {
     request_id: RequestId,
+    request_id_was_supplied: bool,
     principal: ApiPrincipal,
 }
 
 impl AuthorizedRequest {
     pub(super) fn request_id(&self) -> &RequestId {
         &self.request_id
+    }
+
+    pub(super) const fn request_id_was_supplied(&self) -> bool {
+        self.request_id_was_supplied
     }
 
     pub(super) const fn principal(&self) -> &ApiPrincipal {
@@ -36,7 +40,8 @@ pub(super) async fn authorize(
     mut request: Request,
     next: Next,
 ) -> Response {
-    let request_id = request_id_or_new(request.headers());
+    let supplied_request_id = header_request_id(request.headers());
+    let request_id = supplied_request_id.clone().unwrap_or_default();
     let peer_ip = request
         .extensions()
         .get::<ConnectInfo<PeerAddress>>()
@@ -93,22 +98,27 @@ pub(super) async fn authorize(
         .authenticated_limit
         .allow(principal.principal_ref().to_string())
     {
-        return rate_limited_for_principal(&state, &request_id, &principal, "authenticated");
+        return rate_limited(&state, &request_id, "authenticated");
     }
 
-    let Some(valid_request_id) = header_request_id(request.headers()) else {
-        return api_error_response(
-            request_id,
-            Some(state.host_identity.clone()),
-            ApiFailure {
-                status: axum::http::StatusCode::BAD_REQUEST,
-                code: ApiErrorCode::InvalidRequest,
-                category: ApiErrorCategory::InvalidRequest,
-                retryable: false,
-                message: "Satelle-Request-Id must contain one canonical UUIDv7",
-                details: None,
-            },
-        );
+    let request_id_was_supplied = supplied_request_id.is_some();
+    let valid_request_id = match supplied_request_id {
+        Some(request_id) => request_id,
+        None if !request.headers().contains_key(REQUEST_ID_HEADER) => request_id,
+        None => {
+            return api_error_response(
+                request_id,
+                Some(state.host_identity.clone()),
+                ApiFailure {
+                    status: axum::http::StatusCode::BAD_REQUEST,
+                    code: ApiErrorCode::InvalidRequest,
+                    category: ApiErrorCategory::InvalidRequest,
+                    retryable: false,
+                    message: "Satelle-Request-Id must contain one canonical UUIDv7",
+                    details: None,
+                },
+            );
+        }
     };
     let expected_identity = single_header(request.headers(), EXPECTED_HOST_IDENTITY_HEADER);
     let Some(expected_identity) = expected_identity else {
@@ -144,6 +154,7 @@ pub(super) async fn authorize(
     }
     request.extensions_mut().insert(AuthorizedRequest {
         request_id: valid_request_id,
+        request_id_was_supplied,
         principal,
     });
     security_headers(next.run(request).await)
@@ -257,7 +268,7 @@ pub(super) async fn require_control(
         .control_limit
         .allow(authorized.principal().principal_ref().to_string())
     {
-        return rate_limited(&state, &authorized, "control");
+        return rate_limited(&state, authorized.request_id(), "control");
     }
     let Some(idempotency_key) = single_header(request.headers(), IDEMPOTENCY_KEY_HEADER) else {
         return invalid_idempotency_key(&state, &authorized);
@@ -308,13 +319,9 @@ fn insufficient_scope(
     )
 }
 
-fn rate_limited(
-    state: &DaemonState,
-    authorized: &AuthorizedRequest,
-    scope: &'static str,
-) -> Response {
+fn rate_limited(state: &DaemonState, request_id: &RequestId, scope: &'static str) -> Response {
     api_error_response(
-        authorized.request_id().clone(),
+        request_id.clone(),
         Some(state.host_identity.clone()),
         ApiFailure {
             status: axum::http::StatusCode::TOO_MANY_REQUESTS,
@@ -328,19 +335,6 @@ fn rate_limited(
             details: Some(serde_json::json!({"retry_after_ms": 60_000})),
         },
     )
-}
-
-fn rate_limited_for_principal(
-    state: &DaemonState,
-    request_id: &RequestId,
-    principal: &ApiPrincipal,
-    scope: &'static str,
-) -> Response {
-    let authorized = AuthorizedRequest {
-        request_id: request_id.clone(),
-        principal: principal.clone(),
-    };
-    rate_limited(state, &authorized, scope)
 }
 
 fn missing_authorization_context() -> Response {

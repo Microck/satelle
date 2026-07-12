@@ -1,13 +1,14 @@
 use super::auth::AuthorizedRequest;
-use super::{ApiFailure, DaemonState, api_error_response};
+use super::{ApiFailure, DaemonState, api_error_response, with_response_context};
 use crate::contract::{
     ApiErrorCategory, ApiErrorCode, EventSubscription, MAX_EVENT_SUBSCRIPTIONS, RequestId,
     SubscribeRequest, SubscribedResponse, WsCloseReason, WsControlError,
 };
+use axum::extract::ws::rejection::WebSocketUpgradeRejection;
 use axum::extract::ws::{CloseFrame, Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{Extension, State};
 use axum::http::StatusCode;
-use axum::response::Response;
+use axum::response::{IntoResponse, Response};
 use futures_util::stream::{SplitSink, SplitStream};
 use futures_util::{SinkExt, StreamExt};
 use satelle_host::{ApiPrincipal, LiveEventReceiveError, LiveEventSubscription};
@@ -78,10 +79,42 @@ impl Drop for ConnectionPermit {
 }
 
 pub(super) async fn get_events(
-    websocket: WebSocketUpgrade,
+    websocket: Result<WebSocketUpgrade, WebSocketUpgradeRejection>,
     State(state): State<Arc<DaemonState>>,
     Extension(authorized): Extension<AuthorizedRequest>,
 ) -> Response {
+    if !authorized.request_id_was_supplied() {
+        return api_error_response(
+            authorized.request_id().clone(),
+            Some(state.host_identity.clone()),
+            ApiFailure {
+                status: StatusCode::BAD_REQUEST,
+                code: ApiErrorCode::InvalidRequest,
+                category: ApiErrorCategory::InvalidRequest,
+                retryable: false,
+                message: "Satelle-Request-Id is required for WebSocket upgrades",
+                details: None,
+            },
+        );
+    }
+    let websocket = match websocket {
+        Ok(websocket) => websocket,
+        Err(rejection) => {
+            let status = rejection.into_response().status();
+            return api_error_response(
+                authorized.request_id().clone(),
+                Some(state.host_identity.clone()),
+                ApiFailure {
+                    status,
+                    code: ApiErrorCode::InvalidRequest,
+                    category: ApiErrorCategory::InvalidRequest,
+                    retryable: false,
+                    message: "the WebSocket upgrade request is invalid",
+                    details: None,
+                },
+            );
+        }
+    };
     let Some(permit) = state
         .websocket_connections
         .acquire(authorized.principal().principal_ref())
@@ -100,12 +133,19 @@ pub(super) async fn get_events(
         );
     };
     let maximum_message_bytes = state.limits.websocket_message_bytes();
-    websocket
+    let response_request_id = authorized.request_id().clone();
+    let response_host_identity = state.host_identity.clone();
+    let response = websocket
         .write_buffer_size(0)
         .max_write_buffer_size(maximum_message_bytes * 2)
         .max_message_size(maximum_message_bytes)
         .max_frame_size(maximum_message_bytes)
-        .on_upgrade(move |socket| serve_socket(socket, state, authorized, permit))
+        .on_upgrade(move |socket| serve_socket(socket, state, authorized, permit));
+    with_response_context(
+        response,
+        &response_request_id,
+        Some(&response_host_identity),
+    )
 }
 
 async fn serve_socket(
