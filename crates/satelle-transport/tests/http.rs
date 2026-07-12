@@ -2,6 +2,8 @@
 mod events;
 #[path = "http/logs.rs"]
 mod logs;
+#[path = "http/protocol.rs"]
+mod protocol;
 #[path = "http/raw-wire.rs"]
 mod raw_wire;
 #[path = "http/sessions.rs"]
@@ -76,6 +78,7 @@ impl RunningServer {
     fn mutation(&self, path: &str, idempotency_key: &str) -> reqwest::RequestBuilder {
         self.protected_request(reqwest::Method::POST, path)
             .header("Idempotency-Key", idempotency_key)
+            .header("Satelle-Protocol-Version", "1")
     }
 
     fn protected_request(&self, method: reqwest::Method, path: &str) -> reqwest::RequestBuilder {

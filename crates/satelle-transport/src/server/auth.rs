@@ -1,7 +1,9 @@
 use super::{
     ApiFailure, DaemonState, PeerAddress, api_error_response, header_request_id, security_headers,
 };
-use crate::contract::{ApiErrorCategory, ApiErrorCode, RequestId};
+use crate::contract::{
+    ApiErrorCategory, ApiErrorCode, PROTOCOL_VERSION, PROTOCOL_VERSION_HEADER, RequestId,
+};
 use axum::extract::{ConnectInfo, Request, State};
 use axum::http::header::{AUTHORIZATION, CONTENT_LENGTH, COOKIE, TRANSFER_ENCODING};
 use axum::middleware::Next;
@@ -250,6 +252,9 @@ pub(super) async fn require_control(
     if !authorized.principal().scopes().allows(ApiScopes::CONTROL) {
         return insufficient_scope(&state, &authorized, "control");
     }
+    if let Err(failure) = validate_protocol_version(request.headers()) {
+        return incompatible_protocol(&state, &authorized, failure);
+    }
     if request.uri().query().is_some() || request.headers().contains_key(COOKIE) {
         return api_error_response(
             authorized.request_id().clone(),
@@ -280,6 +285,82 @@ pub(super) async fn require_control(
         };
     request.extensions_mut().insert(authority);
     next.run(request).await
+}
+
+enum ProtocolVersionFailure {
+    Missing,
+    Malformed,
+    Duplicate,
+    Unsupported(String),
+}
+
+impl ProtocolVersionFailure {
+    const fn reason(&self) -> &'static str {
+        match self {
+            Self::Missing => "missing",
+            Self::Malformed => "malformed",
+            Self::Duplicate => "duplicate",
+            Self::Unsupported(_) => "unsupported",
+        }
+    }
+
+    fn received_version(&self) -> Option<&str> {
+        match self {
+            Self::Missing | Self::Malformed | Self::Duplicate => None,
+            Self::Unsupported(value) => Some(value),
+        }
+    }
+}
+
+fn validate_protocol_version(
+    headers: &axum::http::HeaderMap,
+) -> Result<(), ProtocolVersionFailure> {
+    let mut values = headers.get_all(PROTOCOL_VERSION_HEADER).iter();
+    let Some(value) = values.next() else {
+        return Err(ProtocolVersionFailure::Missing);
+    };
+    if values.next().is_some() {
+        return Err(ProtocolVersionFailure::Duplicate);
+    }
+    let value = value
+        .to_str()
+        .map_err(|_| ProtocolVersionFailure::Malformed)?;
+    if value.contains(',') {
+        return Err(ProtocolVersionFailure::Duplicate);
+    }
+    if value.is_empty()
+        || !value.bytes().all(|byte| byte.is_ascii_digit())
+        || (value.len() > 1 && value.starts_with('0'))
+    {
+        return Err(ProtocolVersionFailure::Malformed);
+    }
+    if value != PROTOCOL_VERSION {
+        return Err(ProtocolVersionFailure::Unsupported(value.to_string()));
+    }
+    Ok(())
+}
+
+fn incompatible_protocol(
+    state: &DaemonState,
+    authorized: &AuthorizedRequest,
+    failure: ProtocolVersionFailure,
+) -> Response {
+    api_error_response(
+        authorized.request_id().clone(),
+        Some(state.host_identity.clone()),
+        ApiFailure {
+            status: axum::http::StatusCode::UPGRADE_REQUIRED,
+            code: ApiErrorCode::IncompatibleProtocol,
+            category: ApiErrorCategory::Compatibility,
+            retryable: false,
+            message: "the CLI and Host Daemon protocol versions are incompatible",
+            details: Some(serde_json::json!({
+                "reason": failure.reason(),
+                "supported_versions": [PROTOCOL_VERSION],
+                "received_version": failure.received_version(),
+            })),
+        },
+    )
 }
 
 fn invalid_idempotency_key(state: &DaemonState, authorized: &AuthorizedRequest) -> Response {
