@@ -13,8 +13,8 @@ mod worker;
 
 pub(crate) use adapter::BlockedComputerUseAdapter;
 pub use adapter::{
-    AdapterReadiness, AdapterSubject, ComputerUseAdapter, ExecuteRequest, ExecuteResult,
-    RecoveryObservation,
+    AdapterReadiness, AdapterSubject, ComputerUseAdapter, EvidenceError, ExecuteRequest,
+    ExecuteResult, ProviderSmokeEvidence, ReadinessEvidence, RecoveryObservation,
 };
 pub(crate) use request::{LogQuery, RequestIdentity, RunCommand, SteerCommand, StopCommand};
 use worker::{ExecutionPlan, TurnWork, WorkerRegistry};
@@ -151,6 +151,7 @@ impl RuntimeEngine {
         readiness: AdapterReadiness,
     ) -> Result<RuntimeTurnOutcome, SatelleError> {
         ensure_local_host(command.host)?;
+        self.persist_readiness(&readiness)?;
         let session_id = SessionId::new();
         let turn_id = TurnId::new();
         let started_at = time::OffsetDateTime::now_utc();
@@ -186,6 +187,7 @@ impl RuntimeEngine {
         command: SteerCommand<'_>,
         readiness: AdapterReadiness,
     ) -> Result<RuntimeTurnOutcome, SatelleError> {
+        self.persist_readiness(&readiness)?;
         let existing = self
             .lock_storage()?
             .load_session(&command.session_id)
@@ -218,6 +220,18 @@ impl RuntimeEngine {
             outcome
         };
         self.finish_admission(LOCAL_DEMO_HOST, command.prompt, command.dispatch, outcome)
+    }
+
+    fn persist_readiness(&self, readiness: &AdapterReadiness) -> Result<(), SatelleError> {
+        self.lock_storage()?
+            .store_preflight_successes(
+                readiness.adapter(),
+                readiness.desktop_binding(),
+                readiness.execution_policy(),
+                readiness.evidence(),
+                readiness.provider_smoke_evidence(),
+            )
+            .map_err(model::storage_failure)
     }
 
     fn finish_admission(

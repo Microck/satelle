@@ -29,8 +29,8 @@ pub use log_page::{
     LogPageQueryError, LogSeverity, LogSource, LogSubject,
 };
 pub use runtime::{
-    AdapterReadiness, AdapterSubject, ComputerUseAdapter, ExecuteRequest, ExecuteResult,
-    RecoveryObservation,
+    AdapterReadiness, AdapterSubject, ComputerUseAdapter, EvidenceError, ExecuteRequest,
+    ExecuteResult, ProviderSmokeEvidence, ReadinessEvidence, RecoveryObservation,
 };
 use runtime::{
     BlockedComputerUseAdapter, LogQuery, RunCommand, RuntimeHandle, SteerCommand, StopCommand,

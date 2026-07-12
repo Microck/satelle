@@ -32,8 +32,25 @@ pub(super) const PROTECTED_FILE_NAMES: [&str; 5] = [
     "satelle.sqlite3-journal",
 ];
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
-const INITIAL_MIGRATION_VERSION: i64 = 1;
-const INITIAL_MIGRATION: &str = include_str!("0001_initial.sql");
+const MIGRATIONS: [Migration; 2] = [
+    Migration {
+        version: 1,
+        sql: include_str!("0001_initial.sql"),
+        seeds_sensitive_state: true,
+    },
+    Migration {
+        version: 2,
+        sql: include_str!("0002_operational_evidence.sql"),
+        seeds_sensitive_state: false,
+    },
+];
+
+#[derive(Clone, Copy)]
+struct Migration {
+    version: i64,
+    sql: &'static str,
+    seeds_sensitive_state: bool,
+}
 
 pub(super) fn sqlite_error(fallback: StorageErrorKind, source: rusqlite::Error) -> StorageError {
     let kind = match source.sqlite_error_code() {
@@ -402,7 +419,6 @@ fn verify_database_readable(connection: &Connection) -> Result<(), StorageError>
 }
 
 fn apply_migrations(connection: &mut Connection) -> Result<(), StorageError> {
-    let checksum = migration_checksum(INITIAL_MIGRATION);
     let transaction = connection
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .map_err(|source| sqlite_error(StorageErrorKind::MigrationFailed, source))?;
@@ -415,54 +431,68 @@ fn apply_migrations(connection: &mut Connection) -> Result<(), StorageError> {
             ) STRICT;",
         )
         .map_err(|source| sqlite_error(StorageErrorKind::MigrationFailed, source))?;
-    let unexpected: i64 = transaction
-        .query_row(
-            "SELECT count(*) FROM schema_migrations WHERE version <> ?1",
-            [INITIAL_MIGRATION_VERSION],
-            |row| row.get(0),
-        )
-        .map_err(|source| sqlite_error(StorageErrorKind::MigrationIntegrity, source))?;
-    if unexpected != 0 {
+    let applied = {
+        let mut statement = transaction
+            .prepare("SELECT version, checksum FROM schema_migrations ORDER BY version")
+            .map_err(|source| sqlite_error(StorageErrorKind::MigrationIntegrity, source))?;
+        statement
+            .query_map([], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+            })
+            .map_err(|source| sqlite_error(StorageErrorKind::MigrationIntegrity, source))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|source| sqlite_error(StorageErrorKind::MigrationIntegrity, source))?
+    };
+    if applied.len() > MIGRATIONS.len()
+        || applied
+            .iter()
+            .zip(MIGRATIONS)
+            .any(|((version, checksum), migration)| {
+                *version != migration.version || *checksum != migration_checksum(migration.sql)
+            })
+    {
         return Err(StorageError::new(StorageErrorKind::MigrationIntegrity));
-    }
-    let stored_checksum: Option<String> = transaction
-        .query_row(
-            "SELECT checksum FROM schema_migrations WHERE version = ?1",
-            [INITIAL_MIGRATION_VERSION],
-            |row| row.get(0),
-        )
-        .optional()
-        .map_err(|source| sqlite_error(StorageErrorKind::MigrationIntegrity, source))?;
-    match stored_checksum {
-        Some(stored) if stored != checksum => {
-            return Err(StorageError::new(StorageErrorKind::MigrationIntegrity));
-        }
-        Some(_) => {}
-        None => {
-            let applied_at = OffsetDateTime::now_utc();
-            transaction
-                .execute_batch(INITIAL_MIGRATION)
-                .map_err(|source| sqlite_error(StorageErrorKind::MigrationFailed, source))?;
-            super::auth::seed_sensitive_state(&transaction, applied_at)?;
-            transaction
-                .execute(
-                    "INSERT INTO schema_migrations (version, checksum, applied_at) VALUES (?1, ?2, ?3)",
-                    params![
-                        INITIAL_MIGRATION_VERSION,
-                        checksum,
-                        format_time(applied_at)?,
-                    ],
-                )
-                .map_err(|source| sqlite_error(StorageErrorKind::MigrationFailed, source))?;
-            transaction
-                .pragma_update(None, "user_version", INITIAL_MIGRATION_VERSION)
-                .map_err(|source| sqlite_error(StorageErrorKind::MigrationFailed, source))?;
-        }
     }
     let user_version: i64 = transaction
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .map_err(|source| sqlite_error(StorageErrorKind::MigrationIntegrity, source))?;
-    if user_version != INITIAL_MIGRATION_VERSION {
+    let expected_user_version = applied.last().map_or(0, |(version, _)| *version);
+    if user_version != expected_user_version {
+        return Err(StorageError::new(StorageErrorKind::MigrationIntegrity));
+    }
+
+    for migration in MIGRATIONS.iter().skip(applied.len()) {
+        let applied_at = OffsetDateTime::now_utc();
+        transaction
+            .execute_batch(migration.sql)
+            .map_err(|source| sqlite_error(StorageErrorKind::MigrationFailed, source))?;
+        if migration.seeds_sensitive_state {
+            super::auth::seed_sensitive_state(&transaction, applied_at)?;
+        }
+        transaction
+            .execute(
+                "INSERT INTO schema_migrations (version, checksum, applied_at) VALUES (?1, ?2, ?3)",
+                params![
+                    migration.version,
+                    migration_checksum(migration.sql),
+                    format_time(applied_at)?,
+                ],
+            )
+            .map_err(|source| sqlite_error(StorageErrorKind::MigrationFailed, source))?;
+        transaction
+            .pragma_update(None, "user_version", migration.version)
+            .map_err(|source| sqlite_error(StorageErrorKind::MigrationFailed, source))?;
+    }
+
+    let final_user_version: i64 = transaction
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .map_err(|source| sqlite_error(StorageErrorKind::MigrationIntegrity, source))?;
+    if final_user_version
+        != MIGRATIONS
+            .last()
+            .expect("migration registry is non-empty")
+            .version
+    {
         return Err(StorageError::new(StorageErrorKind::MigrationIntegrity));
     }
     transaction

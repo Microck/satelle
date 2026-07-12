@@ -3,7 +3,7 @@ mod diagnostics;
 
 use crate::runtime::{
     AdapterReadiness, AdapterSubject, ComputerUseAdapter, ExecuteRequest, ExecuteResult,
-    RecoveryObservation,
+    ProviderSmokeEvidence, ReadinessEvidence, RecoveryObservation,
 };
 use crate::{HostService, HostSessionsReport};
 use satelle_core::session::{
@@ -102,14 +102,36 @@ impl ComputerUseAdapter for FakeComputerUseAdapter {
             SandboxPolicy::WorkspaceWrite,
             TimeoutPolicy::bounded_seconds(120)
                 .map_err(|_| adapter_configuration_error("timeout policy"))?,
-            ExperimentalFeatureChoices::new(FeatureChoice::Enabled, FeatureChoice::Disabled),
+            ExperimentalFeatureChoices::new(FeatureChoice::Enabled, FeatureChoice::Enabled),
         );
-        Ok(AdapterReadiness::ready(
+        let observed_at = time::OffsetDateTime::now_utc();
+        let evidence = ReadinessEvidence::new(
+            format!("readiness-{}", satelle_core::SessionId::new()),
+            "fake-codex-v1",
+            "fake-native-runtime-v1",
+            Some("fake-plugin-v1"),
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            observed_at,
+            observed_at + time::Duration::minutes(5),
+        )
+        .map_err(|_| adapter_configuration_error("readiness evidence"))?;
+        let provider_evidence = ProviderSmokeEvidence::new(
+            format!("provider-smoke-{}", satelle_core::SessionId::new()),
+            "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+            observed_at,
+            observed_at + time::Duration::hours(24),
+        )
+        .map_err(|_| adapter_configuration_error("provider smoke evidence"))?;
+        AdapterReadiness::ready(
             "fake",
             "fake native computer-use adapter is ready for local demo",
             desktop_binding,
             execution_policy,
-        ))
+            evidence,
+            Some(provider_evidence),
+        )
+        .map_err(|_| adapter_configuration_error("preflight evidence policy"))
     }
 
     fn execute(&self, request: ExecuteRequest<'_>) -> Result<ExecuteResult, SatelleError> {

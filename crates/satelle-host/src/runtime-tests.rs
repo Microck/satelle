@@ -84,6 +84,18 @@ fn retrying_a_stable_run_identity_does_not_repeat_adapter_execution() {
 
     assert_eq!(first.session.session_id, replay.session.session_id);
     assert_eq!(execute_calls.load(Ordering::SeqCst), 1);
+    drop(runtime);
+
+    let connection = rusqlite::Connection::open(state.path().join("satelle.sqlite3"))
+        .expect("open released authoritative store");
+    for table in ["readiness_successes", "provider_smoke_successes"] {
+        let count: i64 = connection
+            .query_row(&format!("SELECT count(*) FROM {table}"), [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(1, count, "stable replay must not duplicate {table}");
+    }
 }
 
 #[test]

@@ -1,18 +1,192 @@
 use crate::storage::RecoverySubject;
 use satelle_core::session::{
-    DesktopBindingRef, ExecutionPolicy, HostIdentityRef, SessionStateRevision, StopObservation,
-    TurnStateRevision, TurnTransition,
+    DesktopBindingRef, ExecutionPolicy, FeatureChoice, HostIdentityRef, SessionStateRevision,
+    StopObservation, TurnStateRevision, TurnTransition,
 };
 use satelle_core::{SatelleError, SatelleEvent, SessionId, TurnId};
+use thiserror::Error;
 
 /// Typed evidence returned before the runtime may durably admit work.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Eq, PartialEq)]
 pub struct AdapterReadiness {
     ready: bool,
     adapter: &'static str,
     message: &'static str,
     desktop_binding: DesktopBindingRef,
     execution_policy: ExecutionPolicy,
+    evidence: ReadinessEvidence,
+    provider_smoke_evidence: Option<ProviderSmokeEvidence>,
+}
+
+impl std::fmt::Debug for AdapterReadiness {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("AdapterReadiness")
+            .field("ready", &self.ready)
+            .field("adapter", &self.adapter)
+            .field("desktop_binding", &self.desktop_binding)
+            .field("execution_policy", &self.execution_policy)
+            .finish_non_exhaustive()
+    }
+}
+
+#[derive(Clone, Copy, Debug, Error, Eq, PartialEq)]
+pub enum EvidenceError {
+    #[error("preflight evidence contains an invalid normalized identifier")]
+    InvalidIdentifier,
+    #[error("preflight evidence contains an invalid fingerprint digest")]
+    InvalidFingerprint,
+    #[error("preflight evidence has an invalid validity window")]
+    InvalidWindow,
+    #[error("preflight evidence conflicts with the effective execution policy")]
+    InconsistentPolicy,
+}
+
+#[derive(Clone, Eq, PartialEq)]
+struct EvidenceWindow {
+    result_id: String,
+    observed_at: time::OffsetDateTime,
+    expires_at: time::OffsetDateTime,
+}
+
+impl EvidenceWindow {
+    fn new(
+        result_id: impl Into<String>,
+        observed_at: time::OffsetDateTime,
+        expires_at: time::OffsetDateTime,
+    ) -> Result<Self, EvidenceError> {
+        let result_id = normalized_identifier(result_id)?;
+        if expires_at <= observed_at {
+            return Err(EvidenceError::InvalidWindow);
+        }
+        Ok(Self {
+            result_id,
+            observed_at,
+            expires_at,
+        })
+    }
+}
+
+/// Normalized evidence observed by the provider-specific half of preflight.
+#[derive(Clone, Eq, PartialEq)]
+pub struct ProviderSmokeEvidence {
+    window: EvidenceWindow,
+    provider_config_fingerprint: String,
+}
+
+impl ProviderSmokeEvidence {
+    pub fn new(
+        result_id: impl Into<String>,
+        provider_config_fingerprint: impl Into<String>,
+        observed_at: time::OffsetDateTime,
+        expires_at: time::OffsetDateTime,
+    ) -> Result<Self, EvidenceError> {
+        Ok(Self {
+            window: EvidenceWindow::new(result_id, observed_at, expires_at)?,
+            provider_config_fingerprint: fingerprint(provider_config_fingerprint)?,
+        })
+    }
+
+    pub(crate) fn result_id(&self) -> &str {
+        &self.window.result_id
+    }
+
+    pub(crate) fn provider_config_fingerprint(&self) -> &str {
+        &self.provider_config_fingerprint
+    }
+
+    pub(crate) const fn observed_at(&self) -> time::OffsetDateTime {
+        self.window.observed_at
+    }
+
+    pub(crate) const fn expires_at(&self) -> time::OffsetDateTime {
+        self.window.expires_at
+    }
+}
+
+impl std::fmt::Debug for ProviderSmokeEvidence {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ProviderSmokeEvidence")
+            .finish_non_exhaustive()
+    }
+}
+
+/// Versioned evidence observed by a successful live readiness probe.
+///
+/// The adapter supplies only normalized identifiers and fingerprints. Raw probe
+/// output, screenshots, and transcripts never cross this persistence boundary.
+#[derive(Clone, Eq, PartialEq)]
+pub struct ReadinessEvidence {
+    window: EvidenceWindow,
+    codex_version: String,
+    native_runtime_version: String,
+    plugin_version: Option<String>,
+    os_permission_fingerprint: String,
+    app_approval_fingerprint: String,
+}
+
+impl ReadinessEvidence {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        result_id: impl Into<String>,
+        codex_version: impl Into<String>,
+        native_runtime_version: impl Into<String>,
+        plugin_version: Option<impl Into<String>>,
+        os_permission_fingerprint: impl Into<String>,
+        app_approval_fingerprint: impl Into<String>,
+        observed_at: time::OffsetDateTime,
+        expires_at: time::OffsetDateTime,
+    ) -> Result<Self, EvidenceError> {
+        Ok(Self {
+            window: EvidenceWindow::new(result_id, observed_at, expires_at)?,
+            codex_version: normalized_identifier(codex_version)?,
+            native_runtime_version: normalized_identifier(native_runtime_version)?,
+            plugin_version: plugin_version.map(normalized_identifier).transpose()?,
+            os_permission_fingerprint: fingerprint(os_permission_fingerprint)?,
+            app_approval_fingerprint: fingerprint(app_approval_fingerprint)?,
+        })
+    }
+
+    pub(crate) fn result_id(&self) -> &str {
+        &self.window.result_id
+    }
+
+    pub(crate) fn codex_version(&self) -> &str {
+        &self.codex_version
+    }
+
+    pub(crate) fn native_runtime_version(&self) -> &str {
+        &self.native_runtime_version
+    }
+
+    pub(crate) fn plugin_version(&self) -> Option<&str> {
+        self.plugin_version.as_deref()
+    }
+
+    pub(crate) fn os_permission_fingerprint(&self) -> &str {
+        &self.os_permission_fingerprint
+    }
+
+    pub(crate) fn app_approval_fingerprint(&self) -> &str {
+        &self.app_approval_fingerprint
+    }
+
+    pub(crate) const fn observed_at(&self) -> time::OffsetDateTime {
+        self.window.observed_at
+    }
+
+    pub(crate) const fn expires_at(&self) -> time::OffsetDateTime {
+        self.window.expires_at
+    }
+}
+
+impl std::fmt::Debug for ReadinessEvidence {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ReadinessEvidence")
+            .finish_non_exhaustive()
+    }
 }
 
 impl AdapterReadiness {
@@ -21,14 +195,30 @@ impl AdapterReadiness {
         message: &'static str,
         desktop_binding: DesktopBindingRef,
         execution_policy: ExecutionPolicy,
-    ) -> Self {
-        Self {
+        evidence: ReadinessEvidence,
+        provider_smoke_evidence: Option<ProviderSmokeEvidence>,
+    ) -> Result<Self, EvidenceError> {
+        normalized_identifier(adapter)?;
+        let features = execution_policy.experimental_features();
+        let provider_evidence_matches = matches!(
+            (features.provider_computer_use(), &provider_smoke_evidence),
+            (FeatureChoice::Enabled, Some(_)) | (FeatureChoice::Disabled, None)
+        );
+        if features.computer_use() != FeatureChoice::Enabled
+            || execution_policy.desktop_target().binding() != &desktop_binding
+            || !provider_evidence_matches
+        {
+            return Err(EvidenceError::InconsistentPolicy);
+        }
+        Ok(Self {
             ready: true,
             adapter,
             message,
             desktop_binding,
             execution_policy,
-        }
+            evidence,
+            provider_smoke_evidence,
+        })
     }
 
     pub const fn is_ready(&self) -> bool {
@@ -49,6 +239,159 @@ impl AdapterReadiness {
 
     pub fn execution_policy(&self) -> &ExecutionPolicy {
         &self.execution_policy
+    }
+
+    pub(crate) fn evidence(&self) -> &ReadinessEvidence {
+        &self.evidence
+    }
+
+    pub(crate) fn provider_smoke_evidence(&self) -> Option<&ProviderSmokeEvidence> {
+        self.provider_smoke_evidence.as_ref()
+    }
+}
+
+fn normalized_identifier(value: impl Into<String>) -> Result<String, EvidenceError> {
+    let value = value.into();
+    if value.is_empty()
+        || value.len() > 128
+        || !value.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b':' | b'/')
+        })
+    {
+        return Err(EvidenceError::InvalidIdentifier);
+    }
+    Ok(value)
+}
+
+fn fingerprint(value: impl Into<String>) -> Result<String, EvidenceError> {
+    let value = value.into();
+    if value.len() != 64
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+    {
+        return Err(EvidenceError::InvalidFingerprint);
+    }
+    Ok(value)
+}
+
+#[cfg(test)]
+mod evidence_tests {
+    use super::*;
+    use satelle_core::session::{
+        ApprovalPolicy, DesktopTarget, EffectiveModelRef, ExperimentalFeatureChoices,
+        ProviderBindingRef, SandboxPolicy, TimeoutPolicy,
+    };
+
+    const FINGERPRINT_A: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const FINGERPRINT_B: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+
+    #[test]
+    fn public_evidence_boundary_validates_and_redacts_values() {
+        let observed_at = time::OffsetDateTime::UNIX_EPOCH;
+        let evidence = ReadinessEvidence::new(
+            "readiness-private-id",
+            "0.144.0",
+            "1.0.0",
+            Some("plugin-1.0.0"),
+            FINGERPRINT_A,
+            FINGERPRINT_B,
+            observed_at,
+            observed_at + time::Duration::minutes(5),
+        )
+        .unwrap();
+        let debug = format!("{evidence:?}");
+        assert!(!debug.contains("readiness-private-id"));
+        assert!(!debug.contains(FINGERPRINT_A));
+
+        assert_eq!(
+            EvidenceError::InvalidFingerprint,
+            ReadinessEvidence::new(
+                "readiness-2",
+                "0.144.0",
+                "1.0.0",
+                None::<String>,
+                "raw-secret",
+                FINGERPRINT_B,
+                observed_at,
+                observed_at + time::Duration::minutes(5),
+            )
+            .unwrap_err()
+        );
+        assert_eq!(
+            EvidenceError::InvalidWindow,
+            ProviderSmokeEvidence::new("provider-1", FINGERPRINT_A, observed_at, observed_at,)
+                .unwrap_err()
+        );
+    }
+
+    #[test]
+    fn provider_evidence_presence_matches_the_effective_policy() {
+        let desktop = DesktopBindingRef::new("desktop-1").unwrap();
+        let policy = policy(desktop.clone(), FeatureChoice::Disabled);
+        let evidence = readiness_evidence();
+
+        assert!(
+            AdapterReadiness::ready(
+                "test",
+                "ready",
+                desktop.clone(),
+                policy.clone(),
+                evidence.clone(),
+                None,
+            )
+            .is_ok()
+        );
+        assert_eq!(
+            EvidenceError::InconsistentPolicy,
+            AdapterReadiness::ready(
+                "test",
+                "ready",
+                desktop,
+                policy,
+                evidence,
+                Some(provider_evidence()),
+            )
+            .unwrap_err()
+        );
+    }
+
+    fn readiness_evidence() -> ReadinessEvidence {
+        let observed_at = time::OffsetDateTime::UNIX_EPOCH;
+        ReadinessEvidence::new(
+            "readiness-1",
+            "0.144.0",
+            "1.0.0",
+            None::<String>,
+            FINGERPRINT_A,
+            FINGERPRINT_B,
+            observed_at,
+            observed_at + time::Duration::minutes(5),
+        )
+        .unwrap()
+    }
+
+    fn provider_evidence() -> ProviderSmokeEvidence {
+        let observed_at = time::OffsetDateTime::UNIX_EPOCH;
+        ProviderSmokeEvidence::new(
+            "provider-1",
+            FINGERPRINT_A,
+            observed_at,
+            observed_at + time::Duration::hours(24),
+        )
+        .unwrap()
+    }
+
+    fn policy(desktop: DesktopBindingRef, provider_computer_use: FeatureChoice) -> ExecutionPolicy {
+        ExecutionPolicy::new(
+            EffectiveModelRef::new("model-1").unwrap(),
+            ProviderBindingRef::new("provider-1").unwrap(),
+            DesktopTarget::new(desktop),
+            ApprovalPolicy::OnRequest,
+            SandboxPolicy::WorkspaceWrite,
+            TimeoutPolicy::bounded_seconds(120).unwrap(),
+            ExperimentalFeatureChoices::new(FeatureChoice::Enabled, provider_computer_use),
+        )
     }
 }
 
