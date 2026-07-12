@@ -50,18 +50,12 @@ pub(super) async fn authorize(
         .map_or(IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), |peer| {
             peer.0.0.ip()
         });
-    if state.failed_auth_limit.is_blocked(peer_ip) {
-        return api_error_response(
+    if let Some(retry_after) = state.failed_auth_limit.retry_after(peer_ip) {
+        return rate_limited_response(
             request_id,
             None,
-            ApiFailure {
-                status: axum::http::StatusCode::TOO_MANY_REQUESTS,
-                code: ApiErrorCode::RateLimited,
-                category: ApiErrorCategory::RateLimit,
-                retryable: true,
-                message: "too many failed authentication attempts",
-                details: None,
-            },
+            "too many failed authentication attempts",
+            retry_after,
         );
     }
 
@@ -96,11 +90,16 @@ pub(super) async fn authorize(
             }
         };
 
-    if !state
+    if let Some(retry_after) = state
         .authenticated_limit
-        .allow(principal.principal_ref().to_string())
+        .admit(principal.principal_ref().to_string())
     {
-        return rate_limited(&state, &request_id, "authenticated");
+        return rate_limited_response(
+            request_id,
+            Some(state.host_identity.clone()),
+            "the API Principal exceeded the authenticated request limit",
+            retry_after,
+        );
     }
 
     let request_id_was_supplied = supplied_request_id.is_some();
@@ -269,11 +268,16 @@ pub(super) async fn require_control(
             },
         );
     }
-    if !state
+    if let Some(retry_after) = state
         .control_limit
-        .allow(authorized.principal().principal_ref().to_string())
+        .admit(authorized.principal().principal_ref().to_string())
     {
-        return rate_limited(&state, authorized.request_id(), "control");
+        return rate_limited_response(
+            authorized.request_id().clone(),
+            Some(state.host_identity.clone()),
+            "the API Principal exceeded the control request limit",
+            retry_after,
+        );
     }
     let Some(idempotency_key) = single_header(request.headers(), IDEMPOTENCY_KEY_HEADER) else {
         return invalid_idempotency_key(&state, &authorized);
@@ -400,20 +404,24 @@ fn insufficient_scope(
     )
 }
 
-fn rate_limited(state: &DaemonState, request_id: &RequestId, scope: &'static str) -> Response {
+fn rate_limited_response(
+    request_id: RequestId,
+    host_identity: Option<String>,
+    message: &'static str,
+    retry_after: std::time::Duration,
+) -> Response {
     api_error_response(
-        request_id.clone(),
-        Some(state.host_identity.clone()),
+        request_id,
+        host_identity,
         ApiFailure {
             status: axum::http::StatusCode::TOO_MANY_REQUESTS,
             code: ApiErrorCode::RateLimited,
             category: ApiErrorCategory::RateLimit,
             retryable: true,
-            message: match scope {
-                "control" => "the API Principal exceeded the control request limit",
-                _ => "the API Principal exceeded the read request limit",
-            },
-            details: Some(serde_json::json!({"retry_after_ms": 60_000})),
+            message,
+            details: Some(serde_json::json!({
+                "retry_after_ms": super::retry_after_ms(retry_after)
+            })),
         },
     )
 }

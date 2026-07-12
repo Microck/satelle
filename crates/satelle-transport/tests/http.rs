@@ -96,6 +96,27 @@ fn bearer(token: &ApiBearerToken) -> String {
     format!("Bearer {}", exposed.as_str())
 }
 
+async fn assert_rate_limited(
+    response: reqwest::Response,
+    expected_host_identity: Option<&str>,
+) -> u64 {
+    assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+    let error = response
+        .json::<Value>()
+        .await
+        .expect("decode typed rate-limit response");
+    assert_eq!(error["code"], "rate-limited");
+    assert_eq!(error["category"], "rate_limit");
+    assert_eq!(error["retryable"], true);
+    assert_eq!(
+        error["host_identity"],
+        expected_host_identity.map_or(Value::Null, |value| Value::String(value.to_string()))
+    );
+    error["details"]["retry_after_ms"]
+        .as_u64()
+        .expect("known fixed-window timing must be reported")
+}
+
 #[tokio::test]
 async fn liveness_is_exact_and_reveals_no_protected_metadata() {
     let running = RunningServer::start(ApiScopes::READ).await;
@@ -608,6 +629,7 @@ async fn tokens_outside_authorization_and_read_request_bodies_are_rejected() {
 async fn failed_authentication_limit_uses_the_real_peer_address() {
     let running = RunningServer::start(ApiScopes::READ).await;
     let client = reqwest::Client::new();
+    let mut limited_response = None;
     for attempt in 1..=11 {
         let response = client
             .get(running.url("/v1/host/status"))
@@ -621,6 +643,71 @@ async fn failed_authentication_limit_uses_the_real_peer_address() {
             StatusCode::TOO_MANY_REQUESTS
         };
         assert_eq!(response.status(), expected);
+        if attempt == 11 {
+            limited_response = Some(response);
+        }
+    }
+    let retry_after_ms = assert_rate_limited(
+        limited_response.expect("the eleventh attempt must be rate limited"),
+        None,
+    )
+    .await;
+    assert!((1..60_000).contains(&retry_after_ms));
+}
+
+#[tokio::test]
+async fn authenticated_request_limit_reports_the_remaining_window() {
+    let running = RunningServer::start(ApiScopes::READ).await;
+    let client = reqwest::Client::new();
+    let authorization = bearer(&running.token);
+    for attempt in 1..=601 {
+        let response = client
+            .get(running.url("/v1/host/status"))
+            .header("Authorization", &authorization)
+            .header("Satelle-Expected-Host-Identity", &running.host_identity)
+            .header("Satelle-Request-Id", RequestId::new().to_string())
+            .send()
+            .await
+            .expect("request authenticated rate limit");
+        if attempt <= 600 {
+            assert_eq!(response.status(), StatusCode::OK);
+            response
+                .bytes()
+                .await
+                .expect("drain successful read response");
+        } else {
+            let retry_after_ms = assert_rate_limited(response, Some(&running.host_identity)).await;
+            assert!((1..60_000).contains(&retry_after_ms));
+        }
+    }
+}
+
+#[tokio::test]
+async fn control_routes_limit_control_and_admin_principals() {
+    for (scope_name, scopes) in [("control", ApiScopes::CONTROL), ("admin", ApiScopes::ADMIN)] {
+        let running = RunningServer::start(scopes).await;
+        for attempt in 1..=121 {
+            let response = running
+                .mutation("/v1/sessions", "control-rate-limit-probe")
+                .send()
+                .await
+                .expect("request control rate limit");
+            if attempt <= 120 {
+                assert_eq!(
+                    response.status(),
+                    StatusCode::UNSUPPORTED_MEDIA_TYPE,
+                    "{scope_name} request {attempt} was limited too early"
+                );
+                response
+                    .bytes()
+                    .await
+                    .expect("drain rejected mutation response");
+            } else {
+                let retry_after_ms =
+                    assert_rate_limited(response, Some(&running.host_identity)).await;
+                assert!((1..60_000).contains(&retry_after_ms));
+            }
+        }
     }
 }
 
