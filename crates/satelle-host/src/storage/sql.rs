@@ -6,9 +6,9 @@ use super::codec::{
 };
 use super::logs::canonical_log;
 use super::{
-    IdempotencyInput, IdempotentOperation, LeaseOwner, LogEvent, LogSeverity, ObservedUpstreamRef,
-    PrivateRequestToken, PrivateUpstreamRef, RecoverySubject, SafeLogRecord, Storage, StorageError,
-    StorageErrorKind, sqlite_error,
+    IDEMPOTENCY_RETENTION, IdempotencyInput, IdempotentOperation, LeaseOwner, LogEvent,
+    LogSeverity, ObservedUpstreamRef, PrivateRequestToken, PrivateUpstreamRef, RecoverySubject,
+    SafeLogRecord, Storage, StorageError, StorageErrorKind, sqlite_error,
 };
 use crate::LogSubject;
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
@@ -704,8 +704,9 @@ pub(super) fn update_turn_idempotency(
         .execute(
             "UPDATE idempotency_records \
              SET status = ?1, durable_outcome = ?2, completed_at = ?3, \
-                 result_session_state_revision = ?4, result_session_updated_at = ?5 \
-             WHERE session_id = ?6 AND turn_id = ?7 AND operation IN ('run', 'steer')",
+                 result_session_state_revision = ?4, result_session_updated_at = ?5, \
+                 expires_at = CASE WHEN ?1 = 'terminal' THEN ?6 ELSE expires_at END \
+             WHERE session_id = ?7 AND turn_id = ?8 AND operation IN ('run', 'steer')",
             params![
                 if terminal { "terminal" } else { "in_progress" },
                 turn_idempotency_token(turn.state()),
@@ -717,6 +718,11 @@ pub(super) fn update_turn_idempotency(
                 terminal.then(|| format_revision(session.session_state_revision())),
                 if terminal {
                     Some(format_time(session.updated_at())?)
+                } else {
+                    None
+                },
+                if terminal {
+                    Some(format_time(at + IDEMPOTENCY_RETENTION)?)
                 } else {
                     None
                 },
@@ -740,12 +746,13 @@ pub(super) fn complete_stop_idempotency(
     let changed = transaction
         .execute(
             "UPDATE idempotency_records \
-             SET status = 'terminal', durable_outcome = ?1, completed_at = ?2 \
-             WHERE principal_ref = ?3 AND operation = 'stop' AND idempotency_key = ?4 \
-               AND request_digest = ?5 AND status = 'in_progress'",
+             SET status = 'terminal', durable_outcome = ?1, completed_at = ?2, expires_at = ?3 \
+             WHERE principal_ref = ?4 AND operation = 'stop' AND idempotency_key = ?5 \
+               AND request_digest = ?6 AND status = 'in_progress'",
             params![
                 durable_outcome,
                 format_time(at)?,
+                format_time(at + IDEMPOTENCY_RETENTION)?,
                 input.principal_ref.as_str(),
                 input.key.as_str(),
                 input.request_digest.as_str(),

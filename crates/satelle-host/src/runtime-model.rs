@@ -2,9 +2,9 @@ use super::RequestIdentity;
 use super::adapter::AdapterReadiness;
 use crate::process_identity::{ProcessIdentity, ProcessIdentityError};
 use crate::storage::{
-    AdmissionContext, IdempotencyInput, IdempotentOperation, LeaseOwner, LogEvent, LogSeverity,
-    LogSource, PrivateRequestToken, RecoverySubject, StorageError, StorageErrorKind,
-    StoredLogRecord,
+    AdmissionContext, IDEMPOTENCY_RETENTION, IdempotencyInput, IdempotentOperation, LeaseOwner,
+    LogEvent, LogSeverity, LogSource, PrivateRequestToken, RecoverySubject, StorageError,
+    StorageErrorKind, StoredLogRecord,
 };
 use satelle_core::session::{ExpectedRevisions, RetainedOwnership, Session, TurnState};
 use satelle_core::{
@@ -12,8 +12,8 @@ use satelle_core::{
     StopResult, TurnId, TurnRecord, TurnStatus,
 };
 use serde_json::Value;
+use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
-use time::{Duration, OffsetDateTime};
 
 pub(super) fn initial_session(
     session_id: SessionId,
@@ -102,7 +102,7 @@ pub(super) fn idempotency(
         identity.digest_schema_version(),
         identity.hmac_key_version(),
         requested_at,
-        requested_at + Duration::hours(24),
+        requested_at + IDEMPOTENCY_RETENTION,
     )
     .map_err(storage_failure)
 }

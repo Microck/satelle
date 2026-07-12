@@ -1,6 +1,112 @@
 use super::*;
 
 #[test]
+fn terminal_idempotency_retention_starts_when_the_operation_completes() {
+    let state = TempDir::new().expect("temporary state directory");
+    let (mut storage, _) = Storage::open(state.path()).expect("open storage");
+    let session = initial_session(&storage, SESSION_1, TURN_1, at(0));
+    let run = admission(
+        IdempotentOperation::Run,
+        "run-retention",
+        "request-retention",
+        at(0),
+    );
+    let AdmissionOutcome::Execute { session, .. } = storage
+        .begin_session(&session, &run)
+        .expect("admit initial Session")
+    else {
+        panic!("new Session admission must execute");
+    };
+
+    let completed_at = at(2);
+    storage
+        .commit_lifecycle(
+            session.id(),
+            &turn_id(TURN_1),
+            revisions(&session, TURN_1),
+            TurnTransition::Completed,
+            completed_at,
+        )
+        .expect("complete the operation");
+
+    let (stored_completed_at, expires_at) = storage
+        .connection_for_test()
+        .query_row(
+            "SELECT completed_at, expires_at FROM idempotency_records \
+             WHERE operation = 'run' AND idempotency_key = 'run-retention'",
+            [],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+        )
+        .expect("read terminal idempotency retention");
+    assert_eq!(stored_completed_at, completed_at.format(&Rfc3339).unwrap());
+    assert_eq!(
+        expires_at,
+        (completed_at + IDEMPOTENCY_RETENTION)
+            .format(&Rfc3339)
+            .unwrap()
+    );
+}
+
+#[test]
+fn stop_idempotency_retention_starts_when_stop_completes() {
+    let state = TempDir::new().expect("temporary state directory");
+    let (mut storage, _) = Storage::open(state.path()).expect("open storage");
+    let session = initial_session(&storage, SESSION_1, TURN_1, at(0));
+    storage
+        .begin_session(
+            &session,
+            &admission(
+                IdempotentOperation::Run,
+                "run-for-stop",
+                "request-run",
+                at(0),
+            ),
+        )
+        .expect("admit initial Session");
+    let running = storage
+        .commit_lifecycle(
+            session.id(),
+            &turn_id(TURN_1),
+            revisions(&session, TURN_1),
+            TurnTransition::Running,
+            at(1),
+        )
+        .expect("commit running state");
+    let stop = idempotency(IdempotentOperation::Stop, "stop-retention", at(2));
+    let BeginStopOutcome::Observe(claim) = storage
+        .begin_stop(running.id(), &turn_id(TURN_1), &stop)
+        .expect("claim stop")
+    else {
+        panic!("a new stop must require observation");
+    };
+    let completed_at = at(3);
+    storage
+        .confirm_stop(
+            claim,
+            StopObservation::UpstreamInactiveConfirmed,
+            completed_at,
+        )
+        .expect("complete stop");
+
+    let (stored_completed_at, expires_at) = storage
+        .connection_for_test()
+        .query_row(
+            "SELECT completed_at, expires_at FROM idempotency_records \
+             WHERE operation = 'stop' AND idempotency_key = 'stop-retention'",
+            [],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+        )
+        .expect("read terminal stop retention");
+    assert_eq!(stored_completed_at, completed_at.format(&Rfc3339).unwrap());
+    assert_eq!(
+        expires_at,
+        (completed_at + IDEMPOTENCY_RETENTION)
+            .format(&Rfc3339)
+            .unwrap()
+    );
+}
+
+#[test]
 fn admission_and_its_canonical_log_commit_atomically() {
     let state = TempDir::new().expect("temporary state directory");
     let (mut storage, _) = Storage::open(state.path()).expect("open storage");

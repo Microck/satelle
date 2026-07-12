@@ -81,7 +81,7 @@ fn idempotency(
         1,
         1,
         created_at,
-        created_at + time::Duration::hours(24),
+        created_at + IDEMPOTENCY_RETENTION,
     )
     .unwrap()
 }

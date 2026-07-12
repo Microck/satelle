@@ -8,6 +8,10 @@ pub(crate) mod stop;
 #[cfg(test)]
 mod tests;
 
+// Admission needs an initial expiry, then the terminal commit resets it so the
+// full replay window begins only after the operation has finished.
+pub(crate) const IDEMPOTENCY_RETENTION: time::Duration = time::Duration::hours(24);
+
 pub(crate) use self::auth::{ApiTokenRegistration, SensitiveRequestDigest};
 use self::codec::{
     idempotent_operation_token, load_required_session, load_session_at_operation_outcome,
