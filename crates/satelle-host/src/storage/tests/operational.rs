@@ -57,7 +57,9 @@ fn readiness_and_provider_results_round_trip_without_raw_evidence() {
     let state = TempDir::new().expect("temporary state directory");
     let (mut storage, _) = Storage::open(state.path()).expect("open storage");
     let observed_at = at(1);
-    let expires_at = observed_at + time::Duration::minutes(5);
+    // Fixed-width integer timestamps must preserve a valid subsecond window.
+    // Variable-width RFC3339 text would compare these two instants backward.
+    let expires_at = observed_at + time::Duration::milliseconds(100);
     let desktop = DesktopBindingRef::new("desktop-binding-1").unwrap();
     let policy = ExecutionPolicy::new(
         EffectiveModelRef::new("computer-use-preview").unwrap(),

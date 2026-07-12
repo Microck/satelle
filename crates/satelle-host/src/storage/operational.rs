@@ -1,4 +1,4 @@
-use super::codec::format_time;
+use super::codec::unix_timestamp_nanos;
 use super::{Storage, StorageError, StorageErrorKind};
 use crate::{ProviderSmokeEvidence, ReadinessEvidence};
 use rusqlite::{TransactionBehavior, params};
@@ -77,8 +77,8 @@ fn insert_readiness(
                 evidence.plugin_version(),
                 evidence.os_permission_fingerprint(),
                 evidence.app_approval_fingerprint(),
-                format_time(evidence.observed_at())?,
-                format_time(evidence.expires_at())?,
+                unix_timestamp_nanos(evidence.observed_at())?,
+                unix_timestamp_nanos(evidence.expires_at())?,
             ],
         )
         .map_err(operation_failed)
@@ -119,8 +119,8 @@ fn insert_provider_smoke(
                 readiness.codex_version(),
                 readiness.native_runtime_version(),
                 evidence.provider_config_fingerprint(),
-                format_time(evidence.observed_at())?,
-                format_time(evidence.expires_at())?,
+                unix_timestamp_nanos(evidence.observed_at())?,
+                unix_timestamp_nanos(evidence.expires_at())?,
             ],
         )
         .map_err(operation_failed)

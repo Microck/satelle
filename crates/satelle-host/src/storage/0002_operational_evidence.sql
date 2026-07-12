@@ -9,8 +9,8 @@ CREATE TABLE readiness_successes (
     plugin_version TEXT,
     os_permission_fingerprint TEXT NOT NULL,
     app_approval_fingerprint TEXT NOT NULL,
-    observed_at TEXT NOT NULL,
-    expires_at TEXT NOT NULL,
+    observed_at INTEGER NOT NULL,
+    expires_at INTEGER NOT NULL,
     CHECK (expires_at > observed_at)
 ) STRICT;
 
@@ -24,7 +24,7 @@ CREATE TABLE provider_smoke_successes (
     codex_version TEXT NOT NULL,
     native_runtime_version TEXT NOT NULL,
     provider_config_fingerprint TEXT NOT NULL,
-    observed_at TEXT NOT NULL,
-    expires_at TEXT NOT NULL,
+    observed_at INTEGER NOT NULL,
+    expires_at INTEGER NOT NULL,
     CHECK (expires_at > observed_at)
 ) STRICT;
