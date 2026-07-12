@@ -39,9 +39,9 @@ use runtime::{
 };
 use satelle_core::{
     DaemonPathOverrides, DoctorFinding, DoctorFixability, DoctorProbeResult, DoctorReport,
-    DoctorSchemaVersion, DoctorSummary, HostSessionsReport, LOCAL_DEMO_HOST, LogEntry,
-    SatelleError, SatelleEvent, SessionId, SessionRecord, SetupReadinessSummary, SetupReport,
-    SetupSchemaVersion, StopResult, object_value, utc_now,
+    DoctorSchemaVersion, DoctorSummary, HostSessionsReport, HostSessionsSchemaVersion,
+    LOCAL_DEMO_HOST, LogEntry, SatelleError, SatelleEvent, SessionId, SessionRecord,
+    SetupReadinessSummary, SetupReport, SetupSchemaVersion, StopResult, object_value, utc_now,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -272,16 +272,25 @@ impl HostService {
 
     pub fn host_sessions(
         &self,
-        _host: &str,
-        _no_bootstrap: bool,
+        host: &str,
+        no_bootstrap: bool,
     ) -> Result<HostSessionsReport, SatelleError> {
-        match &self.mode {
-            HostMode::Production { snapshot } => Err(execution_blocker(
-                &read_production_snapshot(snapshot)?.verdict,
-            )),
-            #[cfg(any(test, feature = "test-support"))]
-            HostMode::TestFake => self.host_sessions_fake(_host, _no_bootstrap),
-        }
+        ensure_local_demo(host)?;
+        let sessions = self.daemon_desktop_sessions()?;
+        let bootstrap_actions = if no_bootstrap {
+            Vec::new()
+        } else {
+            vec!["direct local-demo host daemon already reachable".to_string()]
+        };
+        Ok(HostSessionsReport {
+            schema_version: HostSessionsSchemaVersion::V1,
+            host: host.to_string(),
+            connection_mode: "direct".to_string(),
+            bootstrapped: false,
+            bootstrap_actions,
+            host_daemon_version: env!("CARGO_PKG_VERSION").to_string(),
+            sessions,
+        })
     }
 }
 fn execution_blocker(verdict: &Phase0SupportVerdict) -> SatelleError {

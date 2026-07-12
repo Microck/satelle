@@ -1,10 +1,15 @@
 use super::{AuthenticatedResponseContract, RequestId, define_schema_token};
+use satelle_core::DesktopSessionRecord;
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 
 define_schema_token!(LiveSchema, "satelle.live.v1");
 define_schema_token!(CapabilitiesSchema, "satelle.capabilities.v1");
 define_schema_token!(HostStatusSchema, "satelle.host.status.v1");
+define_schema_token!(
+    HostDesktopSessionsSchema,
+    "satelle.host.desktop-sessions.v1"
+);
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -32,6 +37,7 @@ enum Operation {
     Live,
     Capabilities,
     HostStatus,
+    HostDesktopSessions,
     SessionCreate,
     TurnCreate,
     SessionRead,
@@ -46,6 +52,7 @@ impl Operation {
             Self::Live => "live",
             Self::Capabilities => "capabilities",
             Self::HostStatus => "host_status",
+            Self::HostDesktopSessions => "host_desktop_sessions",
             Self::SessionCreate => "session_create",
             Self::TurnCreate => "turn_create",
             Self::SessionRead => "session_read",
@@ -191,6 +198,7 @@ impl CapabilitiesResponse {
                 Operation::Live,
                 Operation::Capabilities,
                 Operation::HostStatus,
+                Operation::HostDesktopSessions,
                 Operation::SessionCreate,
                 Operation::TurnCreate,
                 Operation::SessionRead,
@@ -296,6 +304,52 @@ impl HostStatusResponse {
 }
 
 impl AuthenticatedResponseContract for HostStatusResponse {
+    fn request_id(&self) -> &RequestId {
+        self.request_id()
+    }
+
+    fn host_identity(&self) -> &str {
+        self.host_identity()
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct HostDesktopSessionsResponse {
+    schema_version: HostDesktopSessionsSchema,
+    request_id: RequestId,
+    host_identity: String,
+    sessions: Vec<DesktopSessionRecord>,
+}
+
+impl HostDesktopSessionsResponse {
+    pub(crate) fn new(
+        request_id: RequestId,
+        host_identity: String,
+        sessions: Vec<DesktopSessionRecord>,
+    ) -> Self {
+        Self {
+            schema_version: HostDesktopSessionsSchema,
+            request_id,
+            host_identity,
+            sessions,
+        }
+    }
+
+    pub const fn request_id(&self) -> &RequestId {
+        &self.request_id
+    }
+
+    pub fn host_identity(&self) -> &str {
+        &self.host_identity
+    }
+
+    pub fn sessions(&self) -> &[DesktopSessionRecord] {
+        &self.sessions
+    }
+}
+
+impl AuthenticatedResponseContract for HostDesktopSessionsResponse {
     fn request_id(&self) -> &RequestId {
         self.request_id()
     }

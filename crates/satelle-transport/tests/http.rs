@@ -1,3 +1,5 @@
+#[path = "http/desktop-sessions.rs"]
+mod desktop_sessions;
 #[path = "http/events.rs"]
 mod events;
 #[path = "http/logs.rs"]
@@ -13,7 +15,8 @@ use reqwest::StatusCode;
 use satelle_host::{ApiBearerToken, ApiScopes, HostService, test_support::TestStateDir};
 use satelle_transport::{
     ApiError, CapabilitiesResponse, DaemonClient, DaemonClientError, DaemonServer,
-    DaemonServerConfig, HostStatusResponse, LiveResponse, LogsPageResponse, RequestId,
+    DaemonServerConfig, HostDesktopSessionsResponse, HostStatusResponse, LiveResponse,
+    LogsPageResponse, RequestId,
 };
 use serde_json::Value;
 use std::net::{Ipv4Addr, SocketAddr};
@@ -21,10 +24,11 @@ use std::time::Duration;
 use tokio::io::AsyncWriteExt;
 use tokio::net::{TcpListener, TcpStream};
 
-const EXPECTED_OPERATIONS: [&str; 9] = [
+const EXPECTED_OPERATIONS: [&str; 10] = [
     "live",
     "capabilities",
     "host_status",
+    "host_desktop_sessions",
     "session_create",
     "turn_create",
     "session_read",
