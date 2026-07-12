@@ -487,10 +487,31 @@ async fn capabilities_are_truthful_and_unknown_routes_are_typed() {
         .await
         .expect("request capabilities");
     assert_eq!(response.status(), StatusCode::OK);
-    let capabilities: CapabilitiesResponse = response.json().await.expect("decode capabilities");
+    let capabilities_json: serde_json::Value =
+        response.json().await.expect("decode capabilities JSON");
+    assert_eq!(
+        capabilities_json["schema_version"],
+        "satelle.capabilities.v2"
+    );
+    let mut obsolete_v1 = capabilities_json.clone();
+    obsolete_v1["schema_version"] = serde_json::json!("satelle.capabilities.v1");
+    assert!(serde_json::from_value::<CapabilitiesResponse>(obsolete_v1).is_err());
+    let capabilities: CapabilitiesResponse =
+        serde_json::from_value(capabilities_json).expect("decode typed capabilities");
     assert_eq!(capabilities.host_identity(), running.host_identity);
     assert_eq!(capabilities.operations(), EXPECTED_OPERATIONS);
+    assert_eq!(capabilities.limits().json_body_bytes(), 1_048_576);
+    assert_eq!(capabilities.limits().http_connections(), 128);
+    assert_eq!(capabilities.limits().operation_concurrency(), 1);
     assert_eq!(capabilities.limits().attachment_count(), 0);
+    assert_eq!(capabilities.limits().attachment_bytes_each(), 0);
+    assert_eq!(capabilities.limits().attachment_bytes_total(), 0);
+    assert_eq!(capabilities.limits().failed_auth_attempts_per_minute(), 10);
+    assert_eq!(
+        capabilities.limits().authenticated_requests_per_minute(),
+        600
+    );
+    assert_eq!(capabilities.limits().control_requests_per_minute(), 120);
     assert_eq!(
         capabilities.limits().websocket_connections_per_principal(),
         4
@@ -671,6 +692,9 @@ async fn failed_authentication_limit_uses_the_real_peer_address() {
         let response = client
             .get(running.url("/v1/host/status"))
             .header("Satelle-Request-Id", RequestId::new().to_string())
+            .header("Forwarded", format!("for=192.0.2.{attempt}"))
+            .header("X-Forwarded-For", format!("198.51.100.{attempt}"))
+            .header("X-Real-IP", format!("203.0.113.{attempt}"))
             .send()
             .await
             .expect("request missing token");

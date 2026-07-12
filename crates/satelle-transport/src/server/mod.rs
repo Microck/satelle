@@ -38,9 +38,6 @@ use tokio::task::JoinHandle;
 
 const DEFAULT_MAX_CONNECTIONS: usize = 128;
 const HOST_IDENTITY_HEADER: &str = "satelle-host-identity";
-const FAILED_AUTH_LIMIT: usize = 10;
-const READ_LIMIT: usize = 600;
-const CONTROL_LIMIT: usize = 120;
 const RATE_WINDOW: Duration = Duration::from_secs(60);
 const MAX_RATE_KEYS: usize = 4096;
 const DEFAULT_SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
@@ -115,9 +112,11 @@ impl DaemonServer {
             started_at: OffsetDateTime::now_utc(),
             capabilities,
             limits,
-            failed_auth_limit: FailedAuthLimiter::new(),
-            authenticated_limit: FixedWindowLimiter::new(READ_LIMIT),
-            control_limit: FixedWindowLimiter::new(CONTROL_LIMIT),
+            failed_auth_limit: FailedAuthLimiter::new(limits.failed_auth_attempts_per_minute()),
+            authenticated_limit: FixedWindowLimiter::new(
+                limits.authenticated_requests_per_minute(),
+            ),
+            control_limit: FixedWindowLimiter::new(limits.control_requests_per_minute()),
             websocket_inbound_limit: FixedWindowLimiter::new(
                 limits.websocket_inbound_messages_per_minute(),
             ),
@@ -690,12 +689,14 @@ where
 }
 
 struct FailedAuthLimiter {
+    limit: usize,
     entries: Mutex<HashMap<IpAddr, RateWindow>>,
 }
 
 impl FailedAuthLimiter {
-    fn new() -> Self {
+    fn new(limit: usize) -> Self {
         Self {
+            limit,
             entries: Mutex::new(HashMap::new()),
         }
     }
@@ -712,7 +713,7 @@ impl FailedAuthLimiter {
         entries.retain(|_, window| window.is_active(now));
         entries
             .get(&source)
-            .filter(|window| window.count >= FAILED_AUTH_LIMIT)
+            .filter(|window| window.count >= self.limit)
             .map(|window| window.retry_after(now))
     }
 
@@ -798,10 +799,10 @@ mod tests {
 
     #[test]
     fn failed_auth_window_reports_remaining_time_and_expires() {
-        let limiter = FailedAuthLimiter::new();
+        let limiter = FailedAuthLimiter::new(10);
         let source = IpAddr::V4(Ipv4Addr::LOCALHOST);
         let started_at = Instant::now();
-        for _ in 0..FAILED_AUTH_LIMIT {
+        for _ in 0..10 {
             limiter.record_failure_at(source, started_at);
         }
 

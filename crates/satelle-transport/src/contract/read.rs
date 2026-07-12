@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 
 define_schema_token!(LiveSchema, "satelle.live.v1");
-define_schema_token!(CapabilitiesSchema, "satelle.capabilities.v1");
+define_schema_token!(CapabilitiesSchema, "satelle.capabilities.v2");
 define_schema_token!(HostStatusSchema, "satelle.host.status.v1");
 define_schema_token!(
     HostDesktopSessionsSchema,
@@ -110,6 +110,9 @@ pub struct EffectiveLimits {
     attachment_count: usize,
     attachment_bytes_each: usize,
     attachment_bytes_total: usize,
+    failed_auth_attempts_per_minute: usize,
+    authenticated_requests_per_minute: usize,
+    control_requests_per_minute: usize,
     websocket_connections_per_principal: usize,
     websocket_message_bytes: usize,
     websocket_subscriptions_per_connection: usize,
@@ -126,6 +129,30 @@ impl EffectiveLimits {
 
     pub const fn attachment_count(self) -> usize {
         self.attachment_count
+    }
+
+    pub const fn attachment_bytes_each(self) -> usize {
+        self.attachment_bytes_each
+    }
+
+    pub const fn attachment_bytes_total(self) -> usize {
+        self.attachment_bytes_total
+    }
+
+    pub const fn failed_auth_attempts_per_minute(self) -> usize {
+        self.failed_auth_attempts_per_minute
+    }
+
+    pub const fn authenticated_requests_per_minute(self) -> usize {
+        self.authenticated_requests_per_minute
+    }
+
+    pub const fn control_requests_per_minute(self) -> usize {
+        self.control_requests_per_minute
+    }
+
+    pub const fn operation_concurrency(self) -> usize {
+        self.operation_concurrency
     }
 
     pub const fn websocket_connections_per_principal(self) -> usize {
@@ -367,6 +394,9 @@ pub(crate) fn effective_limits(http_connections: usize) -> EffectiveLimits {
         attachment_count: 0,
         attachment_bytes_each: 0,
         attachment_bytes_total: 0,
+        failed_auth_attempts_per_minute: 10,
+        authenticated_requests_per_minute: 600,
+        control_requests_per_minute: 120,
         websocket_connections_per_principal: 4,
         websocket_message_bytes: 65_536,
         websocket_subscriptions_per_connection: 16,
