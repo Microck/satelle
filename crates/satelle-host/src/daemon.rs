@@ -268,9 +268,7 @@ impl HostService {
     /// bootstrap metadata belong to the CLI-facing `host_sessions` wrapper.
     pub fn daemon_desktop_sessions(&self) -> Result<Vec<DesktopSessionRecord>, SatelleError> {
         match &self.mode {
-            HostMode::Production { snapshot } => Err(crate::execution_blocker(
-                &crate::read_production_snapshot(snapshot)?.verdict,
-            )),
+            HostMode::Production { .. } => crate::desktop_sessions::discover(),
             #[cfg(any(test, feature = "test-support"))]
             HostMode::TestFake => Ok(self.desktop_sessions_fake()),
         }

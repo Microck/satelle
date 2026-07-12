@@ -4,6 +4,8 @@ mod codex_capabilities;
 #[path = "codex-session.rs"]
 mod codex_session;
 mod daemon;
+#[path = "desktop-sessions.rs"]
+mod desktop_sessions;
 #[path = "live-events.rs"]
 mod live_events;
 #[path = "log-page.rs"]
@@ -747,7 +749,7 @@ mod tests {
     }
 
     #[test]
-    fn refreshed_production_snapshot_updates_every_service_surface_and_clone() {
+    fn refreshed_production_snapshot_updates_admission_surfaces_but_not_desktop_discovery() {
         let state = TestStateDir::new().expect("temporary state directory should exist");
         let initial = ProductionCapabilitySnapshot {
             verdict: Phase0SupportVerdict::Supported {
@@ -801,13 +803,11 @@ mod tests {
             .expect_err("the cloned service must use refreshed admission");
         assert_eq!(refreshed_error.code, ErrorCode::IncompatibleControlPlane);
         assert!(!clone.daemon_runtime_capabilities().unwrap().codex_runtime());
-        assert_eq!(
-            clone
-                .host_sessions(LOCAL_DEMO_HOST, false)
-                .expect_err("refreshed readiness must block host sessions")
-                .code,
-            ErrorCode::ComputerUseNotReady
-        );
+        let sessions = clone
+            .host_sessions(LOCAL_DEMO_HOST, false)
+            .expect("desktop discovery must remain available for readiness diagnosis");
+        assert_eq!(sessions.schema_version, HostSessionsSchemaVersion::V1);
+        assert_eq!(sessions.host, LOCAL_DEMO_HOST);
         let doctor = clone
             .doctor(LOCAL_DEMO_HOST, Some("codex"), false)
             .expect("non-refresh doctor must read the refreshed snapshot");

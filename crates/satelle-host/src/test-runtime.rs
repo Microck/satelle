@@ -57,7 +57,7 @@ impl HostService {
             display_summary: "active local demo visible desktop".to_string(),
             portable_selectors: vec!["console".to_string(), "active".to_string()],
             native_selectors: vec!["local-demo:console:active".to_string()],
-            selected_by_current_config: true,
+            selected_by_current_config: false,
         }]
     }
 }

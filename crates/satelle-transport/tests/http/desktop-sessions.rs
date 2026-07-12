@@ -43,7 +43,7 @@ async fn desktop_sessions_are_a_flat_authenticated_read_contract() {
     assert_eq!(contract.request_id().as_str(), request_id);
     assert_eq!(contract.host_identity(), running.host_identity);
     assert_eq!(contract.sessions()[0].session_id, "local-demo-console");
-    assert!(contract.sessions()[0].selected_by_current_config);
+    assert!(!contract.sessions()[0].selected_by_current_config);
 }
 
 #[tokio::test]

@@ -3756,6 +3756,85 @@ fn host_sessions_lists_local_demo_metadata_only() {
 }
 
 #[test]
+fn host_sessions_marks_only_the_session_selected_by_effective_host_config() {
+    let state = state_dir();
+    let user_config = state.path().join("user-config.toml");
+    let cases = [
+        (
+            "console match",
+            r#"
+desktop_user = "local-demo-user"
+desktop_session_preference = "console"
+"#,
+            true,
+        ),
+        (
+            "desktop user mismatch",
+            r#"
+desktop_user = "another-user"
+desktop_session_preference = "only"
+"#,
+            false,
+        ),
+        (
+            "native selector match",
+            r#"
+desktop_user = "local-demo-user"
+
+[hosts.local-demo.desktop_session_native_selector]
+platform = "local-demo"
+kind = "console"
+value = "active"
+"#,
+            true,
+        ),
+        (
+            "native selector mismatch",
+            r#"
+desktop_user = "local-demo-user"
+
+[hosts.local-demo.desktop_session_native_selector]
+platform = "local-demo"
+kind = "console"
+value = "inactive"
+"#,
+            false,
+        ),
+    ];
+
+    for (case, selection, expected) in cases {
+        fs::write(
+            &user_config,
+            format!(
+                r#"
+default_host = "local-demo"
+
+[hosts.local-demo]
+transport = "local"
+adapter = "fake"
+{selection}
+"#
+            ),
+        )
+        .expect("user config should be written");
+
+        let output = satelle()
+            .env("SATELLE_CONFIG_FILE", &user_config)
+            .env("SATELLE_STATE_DIR", state.path())
+            .args(["host", "sessions", "--no-bootstrap", "--json"])
+            .assert()
+            .success()
+            .get_output()
+            .clone();
+        let report = parse_json_output(&output.stdout);
+        assert_eq!(
+            report["sessions"][0]["selected_by_current_config"], expected,
+            "{case}"
+        );
+    }
+}
+
+#[test]
 fn future_cli_surfaces_parse_and_return_typed_not_implemented() {
     let state = state_dir();
     for args in [

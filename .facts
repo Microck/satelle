@@ -594,6 +594,8 @@
 - satelle host update human postcheck-failure output states the updates that were applied, the failed readiness check, preserved remote state, invalidated caches, and the recommended repair or doctor command @spec @mvp
 - satelle host update JSON postcheck-failure output includes status postcheck_failed, changed true, applied_actions, postcheck_results, invalidated_caches, preserved_state, and recovery_command fields @spec @mvp
 - satelle host update --dry-run reports the post-update readiness checks that would run after applying the plan without running those post-update checks @spec @mvp
+- a Windows Host Daemon reports only its own active user WTS session as compatible, using native selector windows:wts-session:<decimal-session-id> and portable active plus console or remote selectors @contract @mvp @implemented
+- a macOS Host Daemon reports a compatible console session only when /dev/console is owned by the daemon OS user, using native selector macos:console-uid:<decimal-user-id> and portable active and console selectors @contract @mvp @implemented
 
 ## doctor-and-diagnostics
 - satelle treats Codex thread goals as lifecycle metadata for objective, status, budget, and usage tracking, not as a replacement for thread and turn control @spec @mvp
