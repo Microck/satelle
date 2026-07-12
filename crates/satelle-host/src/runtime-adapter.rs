@@ -3,7 +3,8 @@ use satelle_core::session::{
     DesktopBindingRef, ExecutionPolicy, FeatureChoice, HostIdentityRef, SessionStateRevision,
     StopObservation, TurnStateRevision, TurnTransition,
 };
-use satelle_core::{SatelleError, SatelleEvent, SessionId, TurnId};
+use satelle_core::{ControlPlaneOperation, SatelleError, SatelleEvent, SessionId, TurnId};
+use std::sync::{Arc, RwLock};
 use thiserror::Error;
 
 /// Typed evidence returned before the runtime may durably admit work.
@@ -520,6 +521,12 @@ impl ExecuteResult {
 /// The only external Computer Use seam. SQLite remains concrete and internal;
 /// production and deterministic adapters vary only at this true I/O seam.
 pub trait ComputerUseAdapter: Send + Sync + 'static {
+    /// Adapters without an upstream control plane have no separate protocol
+    /// admission step. Production Codex adapters must override this method.
+    fn admit_operation(&self, _operation: ControlPlaneOperation) -> Result<(), SatelleError> {
+        Ok(())
+    }
+
     fn preflight(&self, host: &str) -> Result<AdapterReadiness, SatelleError>;
 
     fn execute(&self, request: ExecuteRequest<'_>) -> Result<ExecuteResult, SatelleError>;
@@ -536,20 +543,55 @@ pub trait ComputerUseAdapter: Send + Sync + 'static {
 /// available and admitted by the Phase 0 capability gate.
 #[derive(Clone, Debug)]
 pub(crate) struct BlockedComputerUseAdapter {
-    error: SatelleError,
+    state: BlockedComputerUseState,
+}
+
+#[derive(Clone, Debug)]
+enum BlockedComputerUseState {
+    #[cfg(test)]
+    Static(SatelleError),
+    Production(Arc<RwLock<crate::ProductionCapabilitySnapshot>>),
 }
 
 impl BlockedComputerUseAdapter {
+    #[cfg(test)]
     pub(crate) fn new(error: SatelleError) -> Self {
-        Self { error }
+        Self {
+            state: BlockedComputerUseState::Static(error),
+        }
+    }
+
+    pub(crate) fn production(snapshot: Arc<RwLock<crate::ProductionCapabilitySnapshot>>) -> Self {
+        Self {
+            state: BlockedComputerUseState::Production(snapshot),
+        }
     }
 
     fn blocked<T>(&self) -> Result<T, SatelleError> {
-        Err(self.error.clone())
+        match &self.state {
+            #[cfg(test)]
+            BlockedComputerUseState::Static(error) => Err(error.clone()),
+            BlockedComputerUseState::Production(snapshot) => {
+                let snapshot = crate::read_production_snapshot(snapshot)?;
+                Err(crate::execution_blocker(&snapshot.verdict))
+            }
+        }
     }
 }
 
 impl ComputerUseAdapter for BlockedComputerUseAdapter {
+    fn admit_operation(&self, operation: ControlPlaneOperation) -> Result<(), SatelleError> {
+        match &self.state {
+            #[cfg(test)]
+            BlockedComputerUseState::Static(_) => Ok(()),
+            BlockedComputerUseState::Production(snapshot) => {
+                crate::read_production_snapshot(snapshot)?
+                    .control_plane_admission
+                    .admit(operation)
+            }
+        }
+    }
+
     fn preflight(&self, _host: &str) -> Result<AdapterReadiness, SatelleError> {
         self.blocked()
     }

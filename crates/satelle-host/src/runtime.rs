@@ -23,14 +23,15 @@ use crate::live_events::LiveEventHub;
 use crate::process_identity::ProcessIdentity;
 use crate::storage::{
     AdmissionOutcome, ApiTokenRegistration, BeginStopOutcome, IdempotentOperation,
-    LogPageStorageError, SensitiveRequestDigest, StopCommitOutcome, Storage, StorageSnapshot,
+    LogPageStorageError, SensitiveRequestDigest, StopCommitOutcome, Storage, StorageErrorKind,
+    StorageSnapshot,
 };
 use crate::{ApiBearerToken, ApiPrincipal, DaemonLogPage, LogCursor, LogPageQuery};
 use recovery::RecoveryQueue;
 use satelle_core::session::{PublicSession, TurnState};
 use satelle_core::{
-    LOCAL_DEMO_HOST, LogEntry, SatelleError, SatelleEvent, SessionId, SessionRecord, StopResult,
-    TurnId,
+    ControlPlaneOperation, LOCAL_DEMO_HOST, LogEntry, SatelleError, SatelleEvent, SessionId,
+    SessionRecord, StopResult, TurnId,
 };
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -55,6 +56,10 @@ pub(crate) fn storage_error(error: crate::storage::StorageError) -> SatelleError
     model::storage_failure(error)
 }
 
+pub(crate) fn integrity_error(message: impl Into<String>) -> SatelleError {
+    model::integrity_failure(message)
+}
+
 #[cfg(test)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum RuntimeStartupState {
@@ -68,6 +73,7 @@ pub(crate) struct RuntimeEngine {
     storage: Mutex<Storage>,
     adapter: Arc<dyn ComputerUseAdapter>,
     recovery: Mutex<RecoveryQueue>,
+    restart_recovery_initialized: Mutex<bool>,
     workers: Mutex<WorkerRegistry>,
     live_events: LiveEventHub,
     process_identity: ProcessIdentity,
@@ -110,11 +116,13 @@ impl RuntimeEngine {
     ) -> Result<Arc<Self>, SatelleError> {
         let process_identity =
             ProcessIdentity::current().map_err(model::process_identity_failure)?;
-        let (storage, subjects) = Storage::open(state_root).map_err(model::storage_failure)?;
+        let storage =
+            Storage::open_without_restart_recovery(state_root).map_err(model::storage_failure)?;
         Ok(Arc::new(Self {
             storage: Mutex::new(storage),
             adapter,
-            recovery: Mutex::new(RecoveryQueue::new(subjects)),
+            recovery: Mutex::new(RecoveryQueue::new(Vec::new())),
+            restart_recovery_initialized: Mutex::new(false),
             workers: Mutex::new(WorkerRegistry::default()),
             live_events: LiveEventHub::new(),
             process_identity,
@@ -143,6 +151,24 @@ impl RuntimeEngine {
                 )),
             })
             .transpose()
+    }
+
+    fn initialize_restart_recovery(&self) -> Result<(), SatelleError> {
+        let mut initialized = self.restart_recovery_initialized.lock().map_err(|_| {
+            model::integrity_failure("the restart recovery initialization lock was poisoned")
+        })?;
+        if *initialized {
+            return Ok(());
+        }
+        let subjects = self
+            .lock_storage()?
+            .initialize_restart_recovery()
+            .map_err(model::storage_failure)?;
+        *self.recovery.lock().map_err(|_| {
+            model::integrity_failure("the runtime recovery lock was poisoned during startup")
+        })? = RecoveryQueue::new(subjects);
+        *initialized = true;
+        Ok(())
     }
 
     fn run(
@@ -290,10 +316,29 @@ impl RuntimeEngine {
     fn stop(&self, command: StopCommand) -> Result<RuntimeStopOutcome, SatelleError> {
         let requested_at = time::OffsetDateTime::now_utc();
         let idempotency = model::stop_idempotency(requested_at, &command.identity)?;
-        let outcome = self
-            .lock_storage()?
-            .begin_latest_stop(&command.session_id, &idempotency)
-            .map_err(|error| model::storage_failure_for_session(error, &command.session_id))?;
+        let outcome = loop {
+            let target = self
+                .lock_storage()?
+                .stop_admission_target(&command.session_id, &idempotency)
+                .map_err(|error| model::storage_failure_for_session(error, &command.session_id))?;
+            if target.requires_control_plane() {
+                self.adapter.admit_operation(ControlPlaneOperation::Stop)?;
+            }
+            let turn_id = target.turn_id().clone();
+            match self
+                .lock_storage()?
+                .begin_stop(&command.session_id, &turn_id, &idempotency)
+            {
+                Ok(outcome) => break outcome,
+                Err(error) if error.kind() == StorageErrorKind::StateConflict => continue,
+                Err(error) => {
+                    return Err(model::storage_failure_for_session(
+                        error,
+                        &command.session_id,
+                    ));
+                }
+            }
+        };
         let commit = match outcome {
             BeginStopOutcome::Complete(commit) => commit,
             BeginStopOutcome::Observe(claim) => {
@@ -465,6 +510,7 @@ impl RuntimeHandle {
         {
             return Ok(replay);
         }
+        self.adapter.admit_operation(ControlPlaneOperation::Run)?;
         let engine = self.engine()?;
         engine.reconcile_before_admission()?;
         let readiness = self.adapter.preflight(command.host)?;
@@ -484,6 +530,7 @@ impl RuntimeHandle {
         {
             return Ok(replay);
         }
+        self.adapter.admit_operation(ControlPlaneOperation::Steer)?;
         let engine = self.engine()?;
         engine.reconcile_before_admission()?;
         let readiness = self.adapter.preflight(LOCAL_DEMO_HOST)?;
@@ -656,6 +703,12 @@ impl RuntimeHandle {
     }
 
     fn engine(&self) -> Result<Arc<RuntimeEngine>, SatelleError> {
+        let engine = self.engine_without_restart_recovery()?;
+        engine.initialize_restart_recovery()?;
+        Ok(engine)
+    }
+
+    fn engine_without_restart_recovery(&self) -> Result<Arc<RuntimeEngine>, SatelleError> {
         let mut lazy = self.lazy.lock().map_err(|_| {
             model::integrity_failure("the lazy runtime lock was poisoned while opening storage")
         })?;
@@ -681,7 +734,7 @@ impl RuntimeHandle {
         if !Storage::has_existing_state(&state_root).map_err(model::storage_failure)? {
             return Ok(None);
         }
-        self.engine().map(Some)
+        self.engine_without_restart_recovery().map(Some)
     }
 }
 

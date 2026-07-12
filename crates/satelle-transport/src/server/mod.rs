@@ -96,7 +96,9 @@ impl DaemonServer {
         let initialized = service
             .initialize_daemon()
             .map_err(|_| DaemonServerError::HostInitializationFailed)?;
-        let capabilities = service.daemon_runtime_capabilities();
+        let capabilities = service
+            .daemon_runtime_capabilities()
+            .map_err(|_| DaemonServerError::HostInitializationFailed)?;
         let listener = TcpListener::bind(config.bind_addr)
             .await
             .map_err(DaemonServerError::BindFailed)?;

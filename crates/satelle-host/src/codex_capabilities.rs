@@ -1,4 +1,5 @@
 use command_group::{CommandGroup, GroupChild};
+use satelle_core::ControlPlaneFailureReason;
 use serde::Serialize;
 use std::fmt;
 use std::io::ErrorKind;
@@ -10,6 +11,7 @@ use std::time::{Duration, Instant};
 
 #[path = "runtime-codex.rs"]
 mod control_plane;
+pub(crate) use control_plane::ControlPlaneAdmission;
 
 #[cfg(test)]
 #[path = "runtime-codex-tests.rs"]
@@ -320,6 +322,11 @@ pub(crate) struct Phase0CapabilityEvidence {
     pub(crate) capabilities: CapabilityMatrix,
 }
 
+pub(crate) struct Phase0Discovery {
+    pub(crate) evidence: Phase0CapabilityEvidence,
+    pub(crate) control_plane_admission: control_plane::ControlPlaneAdmission,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum BlockerReason {
@@ -386,28 +393,68 @@ impl Phase0SupportVerdict {
 
 /// Collects the deliberately narrow evidence production can prove today. The
 /// version command's bytes are classified and dropped inside this module.
-pub(crate) fn discover_phase0_evidence() -> Phase0CapabilityEvidence {
+pub(crate) fn discover_phase0() -> Phase0Discovery {
     let host_platform = HostPlatform::current();
     if !host_platform.supports_native_computer_use() {
-        return Phase0CapabilityEvidence {
-            codex_version: CodexVersionEvidence::Unavailable,
-            host_platform,
-            capabilities: CapabilityMatrix::unproven(),
+        return Phase0Discovery {
+            evidence: Phase0CapabilityEvidence {
+                codex_version: CodexVersionEvidence::Unavailable,
+                host_platform,
+                capabilities: CapabilityMatrix::unproven(),
+            },
+            // Linux and unknown platforms are native Computer Use readiness
+            // failures. They must not be mislabeled as Codex protocol errors.
+            control_plane_admission: control_plane::ControlPlaneAdmission::not_applicable(),
         };
     }
 
     let codex_version = probe_codex_version();
-    let capabilities = match codex_version {
+    let (capabilities, control_plane_admission) = match codex_version {
         CodexVersionEvidence::Detected { version } if version == REQUIRED_CODEX_VERSION => {
-            CapabilityMatrix::from_control_plane(control_plane::probe_installed_control_plane())
+            let probe = control_plane::probe_installed_control_plane();
+            (
+                CapabilityMatrix::from_control_plane(probe),
+                control_plane::ControlPlaneAdmission::from_probe(probe),
+            )
         }
-        _ => CapabilityMatrix::unproven(),
+        CodexVersionEvidence::Missing => (
+            CapabilityMatrix::unproven(),
+            control_plane::ControlPlaneAdmission::unavailable(
+                ControlPlaneFailureReason::RuntimeMissing,
+            ),
+        ),
+        CodexVersionEvidence::Malformed => (
+            CapabilityMatrix::unproven(),
+            control_plane::ControlPlaneAdmission::unavailable(
+                ControlPlaneFailureReason::VersionMalformed,
+            ),
+        ),
+        CodexVersionEvidence::Unavailable => (
+            CapabilityMatrix::unproven(),
+            control_plane::ControlPlaneAdmission::unavailable(
+                ControlPlaneFailureReason::VersionUnavailable,
+            ),
+        ),
+        CodexVersionEvidence::Detected { .. } => (
+            CapabilityMatrix::unproven(),
+            control_plane::ControlPlaneAdmission::unavailable(
+                ControlPlaneFailureReason::VersionUnsupported,
+            ),
+        ),
     };
-    Phase0CapabilityEvidence {
-        codex_version,
-        host_platform,
-        capabilities,
+    Phase0Discovery {
+        evidence: Phase0CapabilityEvidence {
+            codex_version,
+            host_platform,
+            capabilities,
+        },
+        control_plane_admission,
     }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) fn discover_phase0_evidence() -> Phase0CapabilityEvidence {
+    discover_phase0().evidence
 }
 
 /// Evaluates the complete Phase 0 capability contract. The evaluator reports

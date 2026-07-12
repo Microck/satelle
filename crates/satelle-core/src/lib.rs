@@ -9,11 +9,17 @@ use thiserror::Error;
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 
+#[path = "control-plane.rs"]
+pub mod control_plane;
 mod events;
 pub mod ids;
 mod profiles;
 pub mod session;
 
+pub use control_plane::{
+    ControlPlaneCapability, ControlPlaneCapabilitySet, ControlPlaneFailureReason,
+    ControlPlaneOperation, IncompatibleControlPlaneDetails, IncompatibleControlPlaneDetailsError,
+};
 pub use events::{
     EVENT_SCHEMA_VERSION, EventSource, EventStateSubject, EventSubject, EventType, SatelleEvent,
     SatelleEventBody, SatelleEventError,
@@ -1332,6 +1338,7 @@ pub enum ErrorCode {
     IdempotencyKeyConflict,
     RemoteExecution,
     StorageIntegrityFailed,
+    IncompatibleControlPlane,
     ComputerUseNotReady,
     DoctorReadinessBlockersFound,
     SessionNotFound,
@@ -1384,6 +1391,7 @@ impl ErrorCode {
             Self::IdempotencyKeyConflict => "idempotency-key-conflict",
             Self::RemoteExecution => "remote-execution",
             Self::StorageIntegrityFailed => "storage-integrity-failed",
+            Self::IncompatibleControlPlane => "incompatible-control-plane",
             Self::ComputerUseNotReady => "computer-use-not-ready",
             Self::DoctorReadinessBlockersFound => "doctor-readiness-blockers-found",
             Self::SessionNotFound => "session-not-found",
@@ -1440,12 +1448,11 @@ impl ErrorCode {
             | Self::HostNotFound
             | Self::SessionNotFound
             | Self::LogsCursorExpired => 66,
-            Self::CapacityExceeded
-            | Self::HostUnreachable
-            | Self::HostBusy
-            | Self::ComputerUseNotReady
-            | Self::DoctorReadinessBlockersFound => 69,
+            Self::CapacityExceeded | Self::HostUnreachable | Self::HostBusy => 69,
             Self::RemoteExecution => 74,
+            Self::IncompatibleControlPlane
+            | Self::ComputerUseNotReady
+            | Self::DoctorReadinessBlockersFound => 75,
             Self::NotImplemented => 78,
         }
     }
@@ -1993,6 +2000,19 @@ impl SatelleError {
             ),
             source_detail: None,
             details: BTreeMap::new(),
+        }
+    }
+
+    pub fn incompatible_control_plane(details: IncompatibleControlPlaneDetails) -> Self {
+        Self {
+            code: ErrorCode::IncompatibleControlPlane,
+            message: format!(
+                "the Codex control plane cannot admit the {} operation",
+                details.operation().as_str()
+            ),
+            recovery_command: Some("satelle doctor --scope codex --refresh --json".to_string()),
+            source_detail: None,
+            details: details.into_error_details(),
         }
     }
 

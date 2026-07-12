@@ -1,3 +1,4 @@
+use self::control_plane::CountingAdapter;
 use super::adapter::BlockedComputerUseAdapter;
 use super::{
     ComputerUseAdapter, LogQuery, RecoveryObservation, RequestIdentity, RunCommand, RuntimeHandle,
@@ -6,7 +7,10 @@ use super::{
 use crate::storage::PrivateUpstreamRef;
 use crate::test_runtime::FakeComputerUseAdapter;
 use satelle_core::session::{StopObservation, TurnState};
-use satelle_core::{ErrorCode, EventType, LOCAL_DEMO_HOST, SatelleError};
+use satelle_core::{
+    ControlPlaneFailureReason, ControlPlaneOperation, ErrorCode, EventType,
+    IncompatibleControlPlaneDetails, LOCAL_DEMO_HOST, SatelleError,
+};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, mpsc};
 use std::time::Duration;
@@ -63,7 +67,8 @@ fn blocked_preflight_opens_authoritative_state_without_admitting_work() {
 fn retrying_a_stable_run_identity_does_not_repeat_adapter_execution() {
     let state = crate::TestStateDir::new().expect("temporary state directory should exist");
     let execute_calls = Arc::new(AtomicUsize::new(0));
-    let adapter = CountingAdapter::new(Arc::clone(&execute_calls));
+    let admission_calls = Arc::new(AtomicUsize::new(0));
+    let adapter = CountingAdapter::new(Arc::clone(&execute_calls), Arc::clone(&admission_calls));
     let runtime = RuntimeHandle::new(Ok(state.path().to_path_buf()), adapter);
     let identity = RequestIdentity::new("stable-run-key", STABLE_DIGEST);
 
@@ -84,6 +89,7 @@ fn retrying_a_stable_run_identity_does_not_repeat_adapter_execution() {
 
     assert_eq!(first.session.session_id, replay.session.session_id);
     assert_eq!(execute_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(admission_calls.load(Ordering::SeqCst), 1);
     drop(runtime);
 
     let connection = rusqlite::Connection::open(state.path().join("satelle.sqlite3"))
@@ -102,7 +108,8 @@ fn retrying_a_stable_run_identity_does_not_repeat_adapter_execution() {
 fn retrying_a_stable_steer_identity_does_not_repeat_adapter_execution() {
     let state = crate::TestStateDir::new().expect("temporary state directory should exist");
     let execute_calls = Arc::new(AtomicUsize::new(0));
-    let adapter = CountingAdapter::new(Arc::clone(&execute_calls));
+    let admission_calls = Arc::new(AtomicUsize::new(0));
+    let adapter = CountingAdapter::new(Arc::clone(&execute_calls), Arc::clone(&admission_calls));
     let runtime = RuntimeHandle::new(Ok(state.path().to_path_buf()), adapter);
     let session_id = runtime
         .run(RunCommand::attached(LOCAL_DEMO_HOST, "PRIVATE_INITIAL"))
@@ -128,51 +135,7 @@ fn retrying_a_stable_steer_identity_does_not_repeat_adapter_execution() {
 
     assert_eq!(first.session.turns, replay.session.turns);
     assert_eq!(execute_calls.load(Ordering::SeqCst), 2);
-}
-
-#[test]
-fn stable_stop_replay_keeps_its_original_turn_after_a_later_follow_up() {
-    let state = crate::TestStateDir::new().expect("temporary state directory should exist");
-    let adapter = FailFirstAdapter::default();
-    let runtime = RuntimeHandle::new(Ok(state.path().to_path_buf()), adapter.clone());
-    let session = runtime
-        .run(RunCommand::detached_with_identity(
-            LOCAL_DEMO_HOST,
-            "PRIVATE_INTERRUPTED",
-            RequestIdentity::new("stable-interrupted-run", STABLE_DIGEST),
-        ))
-        .expect("detached work should be durably admitted")
-        .session;
-    runtime
-        .wait_for_background()
-        .expect("the deterministic failed worker should finish");
-
-    let stop_identity = RequestIdentity::new("stable-stop-key", STABLE_DIGEST);
-    let first_stop = runtime
-        .stop(StopCommand::with_identity(
-            session.session_id.clone(),
-            stop_identity.clone(),
-        ))
-        .expect("the interrupted first turn should stop");
-    let original_turn_id = first_stop.turn_id().clone();
-    runtime
-        .steer(SteerCommand::attached(
-            session.session_id.clone(),
-            "PRIVATE_LATER_FOLLOW_UP",
-        ))
-        .expect("a later follow-up should complete");
-
-    let replay = runtime
-        .stop(StopCommand::with_identity(
-            session.session_id,
-            stop_identity,
-        ))
-        .expect("the stable stop retry should replay its original outcome");
-
-    assert_eq!(replay.turn_id(), &original_turn_id);
-    assert_eq!(replay.previous_state(), first_stop.previous_state());
-    assert_eq!(replay.current_state(), first_stop.current_state());
-    assert_eq!(adapter.stop_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(admission_calls.load(Ordering::SeqCst), 2);
 }
 
 #[test]
@@ -588,53 +551,23 @@ fn unknown_restart_work_blocks_new_admission_until_stop_resolves_it() {
     );
 }
 
-#[derive(Clone)]
-struct CountingAdapter {
-    inner: FakeComputerUseAdapter,
-    execute_calls: Arc<AtomicUsize>,
-}
-
-impl CountingAdapter {
-    fn new(execute_calls: Arc<AtomicUsize>) -> Self {
-        Self {
-            inner: FakeComputerUseAdapter,
-            execute_calls,
-        }
-    }
-}
-
-impl super::ComputerUseAdapter for CountingAdapter {
-    fn preflight(&self, host: &str) -> Result<super::AdapterReadiness, SatelleError> {
-        self.inner.preflight(host)
-    }
-
-    fn execute(
-        &self,
-        request: super::ExecuteRequest<'_>,
-    ) -> Result<super::ExecuteResult, SatelleError> {
-        self.execute_calls.fetch_add(1, Ordering::SeqCst);
-        self.inner.execute(request)
-    }
-
-    fn observe_stop(
-        &self,
-        subject: super::AdapterSubject<'_>,
-    ) -> Result<StopObservation, SatelleError> {
-        self.inner.observe_stop(subject)
-    }
-
-    fn observe_recovery(
-        &self,
-        subject: super::AdapterSubject<'_>,
-    ) -> Result<RecoveryObservation, SatelleError> {
-        self.inner.observe_recovery(subject)
-    }
-}
-
 #[derive(Clone, Default)]
 struct FailFirstAdapter {
     execute_calls: Arc<AtomicUsize>,
     stop_calls: Arc<AtomicUsize>,
+    stop_admission_calls: Arc<AtomicUsize>,
+    reject_replayed_stop: bool,
+    follow_up_started: Latch,
+    follow_up_release: Latch,
+}
+
+impl FailFirstAdapter {
+    fn replay_sensitive() -> Self {
+        Self {
+            reject_replayed_stop: true,
+            ..Self::default()
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -670,6 +603,23 @@ impl super::ComputerUseAdapter for TerminalRecoveryAdapter {
 }
 
 impl super::ComputerUseAdapter for FailFirstAdapter {
+    fn admit_operation(&self, operation: ControlPlaneOperation) -> Result<(), SatelleError> {
+        if operation != ControlPlaneOperation::Stop {
+            return FakeComputerUseAdapter.admit_operation(operation);
+        }
+        let call = self.stop_admission_calls.fetch_add(1, Ordering::SeqCst);
+        if !self.reject_replayed_stop || call == 0 {
+            return Ok(());
+        }
+        let details = IncompatibleControlPlaneDetails::new(
+            operation,
+            ControlPlaneFailureReason::HandshakeUnavailable,
+            &[],
+        )
+        .expect("closed test admission details must be valid");
+        Err(SatelleError::incompatible_control_plane(details))
+    }
+
     fn preflight(&self, host: &str) -> Result<super::AdapterReadiness, SatelleError> {
         FakeComputerUseAdapter.preflight(host)
     }
@@ -678,10 +628,15 @@ impl super::ComputerUseAdapter for FailFirstAdapter {
         &self,
         request: super::ExecuteRequest<'_>,
     ) -> Result<super::ExecuteResult, SatelleError> {
-        if self.execute_calls.fetch_add(1, Ordering::SeqCst) == 0 {
+        let call = self.execute_calls.fetch_add(1, Ordering::SeqCst);
+        if call == 0 {
             return Err(SatelleError::not_implemented(
                 "deterministic adapter interruption",
             ));
+        }
+        if self.reject_replayed_stop && call == 1 {
+            self.follow_up_started.signal();
+            self.follow_up_release.wait();
         }
         FakeComputerUseAdapter.execute(request)
     }
@@ -855,6 +810,9 @@ impl Latch {
         *signaled
     }
 }
+
+#[path = "runtime-tests/control-plane.rs"]
+mod control_plane;
 
 #[path = "runtime-tests/review-regressions.rs"]
 mod review_regressions;

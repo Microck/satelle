@@ -17,7 +17,7 @@ mod test_runtime;
 pub use api_auth::{ApiBearerToken, ApiBearerTokenError, ApiPrincipal, ApiScopes};
 use codex_capabilities::{
     BlockerReason, CodexVersionEvidence, Phase0CapabilityBlocker, Phase0SupportVerdict,
-    RequiredCapability, discover_phase0_evidence, evaluate_phase0_support,
+    RequiredCapability, discover_phase0, evaluate_phase0_support,
 };
 pub use daemon::{
     DaemonRuntimeCapabilities, DaemonRuntimeStatus, MutationAuthority, MutationAuthorityError,
@@ -43,6 +43,7 @@ use satelle_core::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use std::sync::{Arc, RwLock, RwLockReadGuard};
 use std::time::Instant;
 #[cfg(any(test, feature = "test-support"))]
 use test_runtime::FakeComputerUseAdapter;
@@ -65,15 +66,16 @@ pub struct HostService {
 #[derive(Clone, Debug)]
 enum HostMode {
     Production {
-        snapshot: ProductionCapabilitySnapshot,
+        snapshot: Arc<RwLock<ProductionCapabilitySnapshot>>,
     },
     #[cfg(any(test, feature = "test-support"))]
     TestFake,
 }
 
 #[derive(Clone, Debug)]
-struct ProductionCapabilitySnapshot {
+pub(crate) struct ProductionCapabilitySnapshot {
     verdict: Phase0SupportVerdict,
+    control_plane_admission: codex_capabilities::ControlPlaneAdmission,
     started_at: String,
     finished_at: String,
     duration_ms: u64,
@@ -83,11 +85,13 @@ impl ProductionCapabilitySnapshot {
     fn collect() -> Self {
         let started_at = utc_now();
         let started = Instant::now();
-        let verdict = evaluate_phase0_support(discover_phase0_evidence());
+        let discovery = discover_phase0();
+        let verdict = evaluate_phase0_support(discovery.evidence);
         let duration_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
 
         Self {
             verdict,
+            control_plane_admission: discovery.control_plane_admission,
             started_at,
             finished_at: utc_now(),
             duration_ms,
@@ -95,12 +99,30 @@ impl ProductionCapabilitySnapshot {
     }
 }
 
+fn read_production_snapshot(
+    snapshot: &RwLock<ProductionCapabilitySnapshot>,
+) -> Result<RwLockReadGuard<'_, ProductionCapabilitySnapshot>, SatelleError> {
+    snapshot.read().map_err(|_| {
+        crate::runtime::integrity_error("the production capability snapshot lock was poisoned")
+    })
+}
+
+fn replace_production_snapshot(
+    snapshot: &RwLock<ProductionCapabilitySnapshot>,
+    refreshed: ProductionCapabilitySnapshot,
+) -> Result<(), SatelleError> {
+    *snapshot.write().map_err(|_| {
+        crate::runtime::integrity_error("the production capability snapshot lock was poisoned")
+    })? = refreshed;
+    Ok(())
+}
+
 impl HostService {
     /// Builds the only runtime available in normal and release builds. The
     /// constructor retains only typed, diagnostic-safe capability evidence.
     pub fn production() -> Self {
-        let snapshot = ProductionCapabilitySnapshot::collect();
-        let adapter = BlockedComputerUseAdapter::new(execution_blocker(&snapshot.verdict));
+        let snapshot = Arc::new(RwLock::new(ProductionCapabilitySnapshot::collect()));
+        let adapter = BlockedComputerUseAdapter::production(Arc::clone(&snapshot));
         Self {
             runtime: RuntimeHandle::new(satelle_core::state_dir(), adapter),
             mode: HostMode::Production { snapshot },
@@ -138,13 +160,17 @@ impl HostService {
             return Err(SatelleError::invalid_usage("unsupported doctor scope"));
         }
         match &self.mode {
-            HostMode::Production { .. } if refresh => {
-                let snapshot = ProductionCapabilitySnapshot::collect();
-                Ok(production_doctor_report(host, scope, &snapshot))
+            HostMode::Production { snapshot } if refresh => {
+                let refreshed = ProductionCapabilitySnapshot::collect();
+                let report = production_doctor_report(host, scope, &refreshed);
+                replace_production_snapshot(snapshot, refreshed)?;
+                Ok(report)
             }
-            HostMode::Production { snapshot } => {
-                Ok(production_doctor_report(host, scope, snapshot))
-            }
+            HostMode::Production { snapshot } => Ok(production_doctor_report(
+                host,
+                scope,
+                &*read_production_snapshot(snapshot)?,
+            )),
             #[cfg(any(test, feature = "test-support"))]
             HostMode::TestFake => self.fake_doctor(host, scope, refresh, &FakeComputerUseAdapter),
         }
@@ -243,7 +269,9 @@ impl HostService {
         _no_bootstrap: bool,
     ) -> Result<HostSessionsReport, SatelleError> {
         match &self.mode {
-            HostMode::Production { snapshot } => Err(execution_blocker(&snapshot.verdict)),
+            HostMode::Production { snapshot } => Err(execution_blocker(
+                &read_production_snapshot(snapshot)?.verdict,
+            )),
             #[cfg(any(test, feature = "test-support"))]
             HostMode::TestFake => self.host_sessions_fake(_host, _no_bootstrap),
         }
@@ -648,12 +676,10 @@ mod tests {
         ] {
             let state = TestStateDir::new().expect("temporary state directory should exist");
             let state_path = state.path().join(format!("{name}.json"));
-            let snapshot = capability_snapshot(evidence, 7);
+            let snapshot = Arc::new(RwLock::new(capability_snapshot(evidence, 7)));
+            let adapter = BlockedComputerUseAdapter::production(Arc::clone(&snapshot));
             let service = HostService {
-                runtime: RuntimeHandle::new(
-                    Ok(state.path().to_path_buf()),
-                    BlockedComputerUseAdapter::new(execution_blocker(&snapshot.verdict)),
-                ),
+                runtime: RuntimeHandle::new(Ok(state.path().to_path_buf()), adapter),
                 mode: HostMode::Production { snapshot },
             };
             let session_id = SessionId::new();
@@ -694,6 +720,75 @@ mod tests {
                 "blocked production execution must not create {state_path:?}"
             );
         }
+    }
+
+    #[test]
+    fn refreshed_production_snapshot_updates_every_service_surface_and_clone() {
+        let state = TestStateDir::new().expect("temporary state directory should exist");
+        let initial = ProductionCapabilitySnapshot {
+            verdict: Phase0SupportVerdict::Supported {
+                codex_version: REQUIRED_CODEX_VERSION,
+                host_platform: HostPlatform::Windows,
+            },
+            control_plane_admission: codex_capabilities::ControlPlaneAdmission::not_applicable(),
+            started_at: "2026-07-09T00:00:00Z".to_string(),
+            finished_at: "2026-07-09T00:00:01Z".to_string(),
+            duration_ms: 7,
+        };
+        let snapshot = Arc::new(RwLock::new(initial));
+        let adapter = BlockedComputerUseAdapter::production(Arc::clone(&snapshot));
+        let shared_snapshot = Arc::clone(&snapshot);
+        let service = HostService {
+            runtime: RuntimeHandle::new(Ok(state.path().to_path_buf()), adapter),
+            mode: HostMode::Production { snapshot },
+        };
+        let clone = service.clone();
+
+        let initial_error = service
+            .run(LOCAL_DEMO_HOST, "PRIVATE_BEFORE_CONTROL_PLANE_REFRESH")
+            .expect_err("the supported snapshot should reach the native execution blocker");
+        assert_eq!(initial_error.code, ErrorCode::NotImplemented);
+        assert!(
+            service
+                .daemon_runtime_capabilities()
+                .unwrap()
+                .codex_runtime()
+        );
+
+        let mut refreshed = capability_snapshot(
+            Phase0CapabilityEvidence {
+                codex_version: CodexVersionEvidence::Missing,
+                host_platform: HostPlatform::Windows,
+                capabilities: CapabilityMatrix::unproven(),
+            },
+            11,
+        );
+        refreshed.control_plane_admission = codex_capabilities::ControlPlaneAdmission::unavailable(
+            satelle_core::ControlPlaneFailureReason::RuntimeMissing,
+        );
+        replace_production_snapshot(&shared_snapshot, refreshed)
+            .expect("doctor refresh should atomically replace the shared snapshot");
+
+        let refreshed_error = clone
+            .run(LOCAL_DEMO_HOST, "PRIVATE_AFTER_CONTROL_PLANE_REFRESH")
+            .expect_err("the cloned service must use refreshed admission");
+        assert_eq!(refreshed_error.code, ErrorCode::IncompatibleControlPlane);
+        assert!(!clone.daemon_runtime_capabilities().unwrap().codex_runtime());
+        assert_eq!(
+            clone
+                .host_sessions(LOCAL_DEMO_HOST, false)
+                .expect_err("refreshed readiness must block host sessions")
+                .code,
+            ErrorCode::ComputerUseNotReady
+        );
+        let doctor = clone
+            .doctor(LOCAL_DEMO_HOST, Some("codex"), false)
+            .expect("non-refresh doctor must read the refreshed snapshot");
+        assert!(doctor.findings.iter().any(|finding| {
+            finding
+                .evidence
+                .contains(&"reason=missing_codex_runtime".to_string())
+        }));
     }
 
     #[test]
@@ -803,6 +898,7 @@ mod tests {
     ) -> ProductionCapabilitySnapshot {
         ProductionCapabilitySnapshot {
             verdict: evaluate_phase0_support(evidence),
+            control_plane_admission: codex_capabilities::ControlPlaneAdmission::not_applicable(),
             started_at: "2026-07-09T00:00:00Z".to_string(),
             finished_at: "2026-07-09T00:00:01Z".to_string(),
             duration_ms,

@@ -145,8 +145,11 @@ fn assert_sqlite_files_are_private(state_root: &std::path::Path, canaries: &[&st
 #[test]
 fn ordinary_production_run_is_blocked_without_fake_completion_or_state_mutation() {
     let state = state_dir();
+    let empty_path = state.path().join("empty-path");
+    fs::create_dir(&empty_path).expect("create a deterministic empty executable search path");
     let output = production_satelle()
         .env("SATELLE_STATE_DIR", state.path())
+        .env("PATH", empty_path)
         .args([
             "run",
             "--host",
@@ -155,12 +158,19 @@ fn ordinary_production_run_is_blocked_without_fake_completion_or_state_mutation(
             "PRODUCTION_ADMISSION_PROMPT_CANARY",
         ])
         .assert()
-        .code(69)
+        .code(75)
         .get_output()
         .clone();
     let combined = command_output_text(&output);
 
-    assert!(combined.contains("computer-use-not-ready"));
+    // Linux is rejected at the native Computer Use boundary. Supported
+    // desktop platforms reach Codex admission first, where an absent or
+    // incompatible runtime has its own public error contract.
+    #[cfg(target_os = "linux")]
+    let expected_error_code = "computer-use-not-ready";
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    let expected_error_code = "incompatible-control-plane";
+    assert!(combined.contains(expected_error_code));
     assert!(!combined.contains("fake"));
     assert!(!combined.contains("completed"));
     assert!(!combined.contains("PRODUCTION_ADMISSION_PROMPT_CANARY"));
@@ -174,7 +184,7 @@ fn ordinary_production_doctor_reports_blocked_probes_without_fake_readiness() {
         .env("SATELLE_STATE_DIR", state.path())
         .args(["doctor", "--host", "local-demo", "--json"])
         .assert()
-        .code(69)
+        .code(75)
         .get_output()
         .clone();
     let combined = command_output_text(&output);

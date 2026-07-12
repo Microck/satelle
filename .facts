@@ -869,6 +869,9 @@
 - satelle does not use generic failure messages when a specific failed host, transport, Codex, Computer Use, provider, config, or session check is known @spec @mvp
 - satelle separates user-facing error messages from diagnostic implementation details and exposes low-level details only when they help the user or agent act @spec @mvp
 - satelle typed error codes are the stable automation contract while human copy may improve for clarity without changing the code @spec @mvp
+- incompatible-control-plane uses exit 75 and recovery command satelle doctor --scope codex --refresh --json @implemented @contract @mvp
+- Host Daemon HTTP incompatible-control-plane errors use status 503, category readiness, and retryable false @implemented @contract @mvp
+- incompatible-control-plane details contain only operation, reason, required_capabilities, and missing_capabilities using stable Satelle tokens; reason is runtime_missing, version_malformed, version_unavailable, version_unsupported, schema_unavailable, handshake_unavailable, or required_capability_missing, and no upstream method name or raw probe output is exposed @implemented @contract @mvp
 - satelle uses a small fixed set of process exit codes for broad failure classes and keeps specific failure causes in typed JSON error codes @spec @mvp
 - satelle exit codes distinguish success, usage error, configuration error, unreachable host, host readiness failure, remote execution failure, and internal error @spec @mvp
 - satelle exits 0 for success and clean user-declined no-op outcomes @spec @mvp
@@ -1719,14 +1722,17 @@
 - satelle MVP supports Codex app-server as the only Codex control plane used by the Host Daemon @spec @mvp
 - satelle MVP does not implement multiple Codex protocol backends or terminal-UI scraping backends for remote Computer Use control @spec @mvp @implemented
 - satelle keeps Codex app-server behind an internal adapter boundary so a future backend can be added without changing the public Satelle API @spec @mvp @implemented
-- satelle probes the remote Codex app-server protocol for required methods before treating a Codex runtime as compatible @spec @mvp
-- Host Daemon startup performs an app-server protocol version and capability handshake before reporting the Codex control plane ready @spec @mvp
+- satelle probes the remote Codex app-server protocol for required methods before treating a Codex runtime as compatible @implemented @mvp
+- Host Daemon startup performs an app-server protocol version and capability handshake before reporting the Codex control plane ready @implemented @mvp
 - the Codex adapter defines an exact required capability set for Session creation, Turn start, event observation, steering, status, and cancellation @spec @mvp @implemented
-- absence of a required Codex capability blocks the affected operation with a typed incompatible-control-plane error @spec @mvp
+- absence of a required Codex capability blocks the affected operation with a typed incompatible-control-plane error @implemented @mvp
+- incompatible-control-plane admission maps run to session_creation, turn_start, and event_observation; steer to steering and event_observation; and an active stop to cancellation and event_observation @implemented @contract @mvp
+- ordinary durable Session status reads and already-terminal stop outcomes do not require live Codex control-plane admission @implemented @contract @mvp
+- upstream restart recovery admission requires both status and steering before external Codex observation @implemented @contract @mvp
 - optional Codex goal methods are capability-gated and never block core Session and Turn control when goals are unavailable @spec @mvp
 - unknown app-server notifications are ignored or normalized without changing committed Satelle state @spec @mvp
 - raw app-server messages never enter normal logs, errors, events, or SQLite records @spec @mvp
-- satelle reports a typed incompatible-control-plane error when the remote Codex runtime cannot expose the required app-server protocol @spec @mvp
+- satelle reports a typed incompatible-control-plane error when the remote Codex runtime cannot expose the required app-server protocol @implemented @mvp
 - satelle does not expose app-server over a public unauthenticated listener @spec @mvp @implemented
 - satelle MVP requires a standalone installer-managed Codex runtime on the remote host instead of treating npm-installed Codex as a supported remote runtime @spec @mvp
 - satelle target architecture includes a Satelle Host Daemon running on the controlled remote machine and a local satelle CLI acting as the client @spec @mvp
