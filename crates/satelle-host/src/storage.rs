@@ -2,6 +2,7 @@ mod auth;
 mod codec;
 mod logs;
 mod open;
+mod operational;
 mod sql;
 mod stop;
 #[cfg(test)]

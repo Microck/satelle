@@ -443,29 +443,31 @@ fn sqlite_busy_exhaustion_returns_a_typed_redacted_error() {
 
 #[test]
 fn migration_checksum_tampering_blocks_reopen_with_safe_error_text() {
-    let state = TempDir::new().expect("temporary state directory");
-    let (storage, _) = Storage::open(state.path()).expect("open storage");
-    drop(storage);
-    let connection = Connection::open(state.path().join("satelle.sqlite3")).unwrap();
-    connection
-        .execute(
-            "UPDATE schema_migrations SET checksum = 'tampered' WHERE version = 1",
-            [],
-        )
-        .unwrap();
-    drop(connection);
+    for version in [1_i64, 2_i64] {
+        let state = TempDir::new().expect("temporary state directory");
+        let (storage, _) = Storage::open(state.path()).expect("open storage");
+        drop(storage);
+        let connection = Connection::open(state.path().join("satelle.sqlite3")).unwrap();
+        connection
+            .execute(
+                "UPDATE schema_migrations SET checksum = 'tampered' WHERE version = ?1",
+                [version],
+            )
+            .unwrap();
+        drop(connection);
 
-    let error = match Storage::open(state.path()) {
-        Ok(_) => panic!("tampered migration history must fail closed"),
-        Err(error) => error,
-    };
-    assert_eq!(StorageErrorKind::MigrationIntegrity, error.kind());
-    assert_eq!(
-        "the Satelle SQLite migration history is inconsistent",
-        error.to_string()
-    );
-    assert!(!error.to_string().contains("UPDATE"));
-    assert!(!error.to_string().contains("schema_migrations"));
+        let error = match Storage::open(state.path()) {
+            Ok(_) => panic!("tampered migration {version} history must fail closed"),
+            Err(error) => error,
+        };
+        assert_eq!(StorageErrorKind::MigrationIntegrity, error.kind());
+        assert_eq!(
+            "the Satelle SQLite migration history is inconsistent",
+            error.to_string()
+        );
+        assert!(!error.to_string().contains("UPDATE"));
+        assert!(!error.to_string().contains("schema_migrations"));
+    }
 }
 
 #[test]

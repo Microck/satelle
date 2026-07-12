@@ -20,6 +20,7 @@ mod atomicity;
 mod auth;
 mod lifecycle;
 mod logs;
+mod operational;
 mod security;
 
 fn initial_session(storage: &Storage, session: &str, turn: &str, at: OffsetDateTime) -> Session {
