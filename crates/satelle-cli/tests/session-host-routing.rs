@@ -52,9 +52,10 @@ default_host = "local-demo"
 transport = "local"
 adapter = "fake"
 
-[hosts.other]
-transport = "local"
+[hosts.remote]
+transport = "direct"
 adapter = "fake"
+address = "https://example.invalid"
 "#,
     )
     .expect("user config should be written");
@@ -112,17 +113,17 @@ adapter = "fake"
         .success();
 
     for args in [
-        vec!["status", &session, "--host", "other", "--json"],
+        vec!["status", &session, "--host", "remote", "--json"],
         vec![
             "steer",
             &session,
             "--host",
-            "other",
+            "remote",
             "Do not route this Turn",
             "--json",
         ],
-        vec!["stop", &session, "--host", "other", "--json"],
-        vec!["logs", "--session", &session, "--host", "other", "--json"],
+        vec!["stop", &session, "--host", "remote", "--json"],
+        vec!["logs", "--session", &session, "--host", "remote", "--json"],
     ] {
         let output = satelle()
             .env("SATELLE_CONFIG_FILE", &user_config)
