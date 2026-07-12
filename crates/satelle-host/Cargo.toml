@@ -10,6 +10,7 @@ test-support = ["satelle-core/test-support", "dep:tempfile"]
 
 [dependencies]
 base64.workspace = true
+command-group.workspace = true
 getrandom.workspace = true
 hmac.workspace = true
 rusqlite.workspace = true

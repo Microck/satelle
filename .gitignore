@@ -1,4 +1,5 @@
-/target/
+target/
+/vendor/command-group/Cargo.lock
 /tmp/
 node_modules/
 /eng.traineddata

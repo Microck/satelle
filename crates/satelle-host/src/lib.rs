@@ -413,12 +413,19 @@ fn production_probe_result(
         .filter(|finding| finding.scope == scope)
         .map(|finding| finding.finding_id.clone())
         .collect::<Vec<_>>();
-    let dependency_blocked = scope == "computer-use"
-        && snapshot
-            .verdict
-            .blockers()
+    let blockers = snapshot.verdict.blockers();
+    let computer_use_blocked_by_codex = scope == "computer-use"
+        && blockers
             .iter()
             .any(|blocker| blocker_scope(blocker) == "codex");
+    // Codex probing is deliberately skipped when native Computer Use cannot
+    // run on the host. The unobserved control-plane gate is blocked rather
+    // than mislabeled as passed, without inventing a Codex-specific finding.
+    let codex_blocked_by_platform = scope == "codex"
+        && blockers
+            .iter()
+            .any(|blocker| blocker.reason == BlockerReason::UnsupportedHostPlatform);
+    let dependency_blocked = computer_use_blocked_by_codex || codex_blocked_by_platform;
     let blocked = !finding_ids.is_empty() || dependency_blocked;
     let capability_probe = matches!(scope, "codex" | "computer-use");
     let (started_at, finished_at, duration_ms) = if capability_probe {
@@ -694,7 +701,7 @@ mod tests {
         let snapshot = capability_snapshot(
             Phase0CapabilityEvidence {
                 codex_version: CodexVersionEvidence::Malformed,
-                host_platform: HostPlatform::Other,
+                host_platform: HostPlatform::Windows,
                 capabilities: CapabilityMatrix::unproven(),
             },
             17,
@@ -759,6 +766,12 @@ mod tests {
         assert_eq!(config.scopes, ["config"]);
         assert!(config.findings.is_empty());
         assert_eq!(config.probe_results[0].status, "passed");
+
+        let codex = production_doctor_report(LOCAL_DEMO_HOST, Some("codex"), &snapshot);
+        assert!(!codex.ready);
+        assert!(codex.findings.is_empty());
+        assert_eq!(codex.probe_results[0].status, "blocked");
+        assert_eq!(codex.probe_results[0].dependency_status, "blocked");
 
         let computer_use =
             production_doctor_report(LOCAL_DEMO_HOST, Some("computer-use"), &snapshot);
