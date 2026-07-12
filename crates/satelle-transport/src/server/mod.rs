@@ -8,7 +8,7 @@ mod sessions;
 
 use crate::contract::{
     ApiError, ApiErrorCategory, ApiErrorCode, CapabilitiesResponse, EffectiveLimits,
-    HostStatusResponse, LiveResponse, RequestId, effective_limits,
+    HostDesktopSessionsResponse, HostStatusResponse, LiveResponse, RequestId, effective_limits,
 };
 use auth::{AuthorizedRequest, REQUEST_ID_HEADER};
 use axum::Router;
@@ -294,6 +294,7 @@ fn router(state: Arc<DaemonState>) -> Router {
     let bodyless_read_routes = Router::new()
         .route("/v1/capabilities", get(capabilities))
         .route("/v1/host/status", get(host_status))
+        .route("/v1/host/desktop-sessions", get(host_desktop_sessions))
         .route("/v1/sessions/{session_id}", get(sessions::get_session))
         .route("/v1/events", get(events::get_events))
         .route_layer(middleware::from_fn_with_state(
@@ -415,6 +416,30 @@ async fn host_status(
         status.session_count(),
         status.active_turn_count(),
         status.recovery_pending_turn_count(),
+    );
+    authenticated_json_response(
+        StatusCode::OK,
+        &response,
+        authorized.request_id(),
+        &state.host_identity,
+    )
+}
+
+async fn host_desktop_sessions(
+    State(state): State<Arc<DaemonState>>,
+    Extension(authorized): Extension<AuthorizedRequest>,
+) -> Response {
+    let service = Arc::clone(&state.service);
+    let sessions =
+        match tokio::task::spawn_blocking(move || service.daemon_desktop_sessions()).await {
+            Ok(Ok(sessions)) => sessions,
+            Ok(Err(error)) => return host_error::response(&state, &authorized, &error),
+            Err(_) => return host_error::task_failure(&state, &authorized),
+        };
+    let response = HostDesktopSessionsResponse::new(
+        authorized.request_id().clone(),
+        state.host_identity.clone(),
+        sessions,
     );
     authenticated_json_response(
         StatusCode::OK,

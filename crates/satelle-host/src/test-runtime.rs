@@ -1,20 +1,19 @@
 #[path = "test-runtime/diagnostics.rs"]
 mod diagnostics;
 
+use crate::HostService;
 use crate::runtime::{
     AdapterReadiness, AdapterSubject, ComputerUseAdapter, ExecuteRequest, ExecuteResult,
     ProviderSmokeEvidence, ReadinessEvidence, RecoveryObservation,
 };
-use crate::{HostService, HostSessionsReport};
 use satelle_core::session::{
     ApprovalPolicy, DesktopBindingRef, DesktopTarget, EffectiveModelRef, ExecutionPolicy,
     ExperimentalFeatureChoices, FeatureChoice, ProviderBindingRef, SandboxPolicy, StopObservation,
     TimeoutPolicy, TurnTransition,
 };
 use satelle_core::{
-    DaemonPathOverrides, DoctorReport, EventSource, EventSubject, EventType,
-    HostSessionsSchemaVersion, LOCAL_DEMO_HOST, SatelleError, SatelleEvent, SatelleEventBody,
-    SetupReport,
+    DaemonPathOverrides, DesktopSessionRecord, DoctorReport, EventSource, EventSubject, EventType,
+    SatelleError, SatelleEvent, SatelleEventBody, SetupReport,
 };
 use serde_json::{Value, json};
 use time::OffsetDateTime;
@@ -47,41 +46,19 @@ impl HostService {
         ))
     }
 
-    pub(super) fn host_sessions_fake(
-        &self,
-        host: &str,
-        no_bootstrap: bool,
-    ) -> Result<HostSessionsReport, SatelleError> {
-        if host != LOCAL_DEMO_HOST {
-            return Err(SatelleError::not_implemented(format!(
-                "host '{host}' is configured, but only local-demo execution is implemented"
-            )));
-        }
-        let bootstrap_actions = if no_bootstrap {
-            Vec::new()
-        } else {
-            vec!["direct local-demo host daemon already reachable".to_string()]
-        };
-        Ok(HostSessionsReport {
-            schema_version: HostSessionsSchemaVersion::V1,
-            host: host.to_string(),
-            connection_mode: "direct".to_string(),
-            bootstrapped: false,
-            bootstrap_actions,
-            host_daemon_version: env!("CARGO_PKG_VERSION").to_string(),
-            sessions: vec![satelle_core::DesktopSessionRecord {
-                session_id: "local-demo-console".to_string(),
-                desktop_user: "local-demo-user".to_string(),
-                state: "active".to_string(),
-                session_kind: "visible_desktop".to_string(),
-                is_console: true,
-                is_remote: false,
-                display_summary: "active local demo visible desktop".to_string(),
-                portable_selectors: vec!["console".to_string(), "active".to_string()],
-                native_selectors: vec!["local-demo:console:active".to_string()],
-                selected_by_current_config: true,
-            }],
-        })
+    pub(super) fn desktop_sessions_fake(&self) -> Vec<DesktopSessionRecord> {
+        vec![DesktopSessionRecord {
+            session_id: "local-demo-console".to_string(),
+            desktop_user: "local-demo-user".to_string(),
+            state: "active".to_string(),
+            session_kind: "visible_desktop".to_string(),
+            is_console: true,
+            is_remote: false,
+            display_summary: "active local demo visible desktop".to_string(),
+            portable_selectors: vec!["console".to_string(), "active".to_string()],
+            native_selectors: vec!["local-demo:console:active".to_string()],
+            selected_by_current_config: true,
+        }]
     }
 }
 

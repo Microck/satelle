@@ -13,7 +13,10 @@ pub use events::{
 };
 pub use logs::LogsPageResponse;
 pub(crate) use read::effective_limits;
-pub use read::{CapabilitiesResponse, EffectiveLimits, HostStatusResponse, LiveResponse};
+pub use read::{
+    CapabilitiesResponse, EffectiveLimits, HostDesktopSessionsResponse, HostStatusResponse,
+    LiveResponse,
+};
 pub(crate) use session::ApiRequestContract;
 pub use session::{SessionResponse, StopRequest, StopResponse, TurnRequest};
 

@@ -5,7 +5,7 @@ use crate::{
     ApiBearerToken, ApiPrincipal, ApiScopes, HostMode, HostService, ProductionCapabilitySnapshot,
 };
 use satelle_core::session::{PublicSession, SessionStateRevision, TurnStateRevision};
-use satelle_core::{LOCAL_DEMO_HOST, SatelleError, SessionId, StopResult};
+use satelle_core::{DesktopSessionRecord, LOCAL_DEMO_HOST, SatelleError, SessionId, StopResult};
 use serde::Serialize;
 use std::fmt;
 use thiserror::Error;
@@ -261,6 +261,18 @@ impl HostService {
                 native_computer_use: false,
                 provider_computer_use: false,
             }),
+        }
+    }
+
+    /// Reads only Host-observed desktop state. Controller transport and
+    /// bootstrap metadata belong to the CLI-facing `host_sessions` wrapper.
+    pub fn daemon_desktop_sessions(&self) -> Result<Vec<DesktopSessionRecord>, SatelleError> {
+        match &self.mode {
+            HostMode::Production { snapshot } => Err(crate::execution_blocker(
+                &crate::read_production_snapshot(snapshot)?.verdict,
+            )),
+            #[cfg(any(test, feature = "test-support"))]
+            HostMode::TestFake => Ok(self.desktop_sessions_fake()),
         }
     }
 

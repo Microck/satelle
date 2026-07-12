@@ -1,7 +1,8 @@
 use crate::contract::{
     ApiError, ApiErrorCode, AuthenticatedResponseContract, CapabilitiesResponse,
-    HostStatusResponse, LiveResponse, LogsPageResponse, PROTOCOL_VERSION, PROTOCOL_VERSION_HEADER,
-    RequestId, SessionResponse, StopRequest, StopResponse, TurnRequest,
+    HostDesktopSessionsResponse, HostStatusResponse, LiveResponse, LogsPageResponse,
+    PROTOCOL_VERSION, PROTOCOL_VERSION_HEADER, RequestId, SessionResponse, StopRequest,
+    StopResponse, TurnRequest,
 };
 use reqwest::blocking::{Client, RequestBuilder, Response};
 use reqwest::header::{AUTHORIZATION, HeaderValue};
@@ -61,6 +62,12 @@ impl DaemonClient {
 
     pub fn host_status(&self) -> Result<HostStatusResponse, DaemonClientError> {
         let (request, request_id) = self.protected_request(Method::GET, "/v1/host/status")?;
+        self.send_authenticated(request, request_id, StatusCode::OK)
+    }
+
+    pub fn desktop_sessions(&self) -> Result<HostDesktopSessionsResponse, DaemonClientError> {
+        let (request, request_id) =
+            self.protected_request(Method::GET, "/v1/host/desktop-sessions")?;
         self.send_authenticated(request, request_id, StatusCode::OK)
     }
 
