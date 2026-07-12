@@ -335,6 +335,7 @@ pub(crate) enum BlockerReason {
     CodexVersionUnavailable,
     UnsupportedCodexVersion,
     UnsupportedHostPlatform,
+    NativeExecutionPathUnavailable,
     NonStableSurface,
     IncompleteLiveProof,
 }
@@ -347,6 +348,7 @@ impl BlockerReason {
             Self::CodexVersionUnavailable => "codex_version_unavailable",
             Self::UnsupportedCodexVersion => "unsupported_codex_version",
             Self::UnsupportedHostPlatform => "unsupported_host_platform",
+            Self::NativeExecutionPathUnavailable => "native_execution_path_unavailable",
             Self::NonStableSurface => "non_stable_surface",
             Self::IncompleteLiveProof => "incomplete_live_proof",
         }
@@ -489,7 +491,7 @@ pub(crate) fn evaluate_phase0_support(evidence: Phase0CapabilityEvidence) -> Pha
         let observation = evidence.capabilities.evidence_for(capability);
         if observation.surface != EvidenceSurface::Stable {
             blockers.push(Phase0CapabilityBlocker {
-                reason: BlockerReason::NonStableSurface,
+                reason: surface_blocker_reason(evidence.capabilities, capability),
                 capability,
                 codex_version: evidence.codex_version,
                 host_platform: evidence.host_platform,
@@ -520,6 +522,24 @@ pub(crate) fn evaluate_phase0_support(evidence: Phase0CapabilityEvidence) -> Pha
         }
     } else {
         Phase0SupportVerdict::Blocked { blockers }
+    }
+}
+
+fn surface_blocker_reason(
+    capabilities: CapabilityMatrix,
+    capability: RequiredCapability,
+) -> BlockerReason {
+    let private_control_plane_proven = capabilities.handshake.surface == EvidenceSurface::Stable;
+    if private_control_plane_proven
+        && capabilities.evidence_for(capability).surface == EvidenceSurface::Absent
+        && matches!(
+            capability,
+            RequiredCapability::NativeReadiness | RequiredCapability::NativeHarmlessAction
+        )
+    {
+        BlockerReason::NativeExecutionPathUnavailable
+    } else {
+        BlockerReason::NonStableSurface
     }
 }
 

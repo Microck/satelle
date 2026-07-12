@@ -396,7 +396,9 @@ fn blocker_scope(blocker: &Phase0CapabilityBlocker) -> &'static str {
         | BlockerReason::MalformedCodexVersion
         | BlockerReason::CodexVersionUnavailable
         | BlockerReason::UnsupportedCodexVersion => "codex",
-        BlockerReason::UnsupportedHostPlatform => "computer-use",
+        BlockerReason::UnsupportedHostPlatform | BlockerReason::NativeExecutionPathUnavailable => {
+            "computer-use"
+        }
         BlockerReason::NonStableSurface | BlockerReason::IncompleteLiveProof => {
             capability_scope(blocker.capability)
         }
@@ -541,6 +543,9 @@ fn blocker_summary(blocker: &Phase0CapabilityBlocker) -> &'static str {
         BlockerReason::UnsupportedCodexVersion => "the installed Codex version is unsupported",
         BlockerReason::UnsupportedHostPlatform => {
             "native Computer Use is unsupported on this host platform"
+        }
+        BlockerReason::NativeExecutionPathUnavailable => {
+            "the private Codex app-server exposes no stable native Computer Use path"
         }
         BlockerReason::NonStableSurface => {
             "a required capability lacks evidence from the stable surface"
@@ -839,6 +844,44 @@ mod tests {
         );
         assert!(!serialized.contains("fake"));
         assert!(!serialized.contains("codex-cli"));
+    }
+
+    #[test]
+    fn production_doctor_identifies_the_missing_private_native_execution_path() {
+        let mut capabilities = CapabilityMatrix::unproven();
+        capabilities.handshake = codex_capabilities::CapabilityEvidence::new(
+            codex_capabilities::EvidenceSurface::Stable,
+            codex_capabilities::LiveProofStatus::NotRequired,
+        );
+        let snapshot = capability_snapshot(
+            Phase0CapabilityEvidence {
+                codex_version: CodexVersionEvidence::Detected {
+                    version: REQUIRED_CODEX_VERSION,
+                },
+                host_platform: HostPlatform::Windows,
+                capabilities,
+            },
+            19,
+        );
+
+        let report = production_doctor_report(LOCAL_DEMO_HOST, Some("computer-use"), &snapshot);
+        let finding = report
+            .findings
+            .iter()
+            .find(|finding| {
+                finding
+                    .evidence
+                    .contains(&"reason=native_execution_path_unavailable".to_string())
+            })
+            .expect("doctor must identify an absent native path on the private app-server");
+
+        assert_eq!(finding.scope, "computer-use");
+        assert_eq!(
+            finding.summary,
+            "the private Codex app-server exposes no stable native Computer Use path"
+        );
+        assert_eq!(finding.readiness_impact, "blocked");
+        assert!(!report.ready);
     }
 
     #[test]

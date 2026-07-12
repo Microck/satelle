@@ -1864,6 +1864,9 @@
 - satelle provider smoke-test refresh during run or steer ignores matching cached pass and fail entries and replaces them with the new live smoke-test result @spec @mvp
 - satelle provider smoke-test refresh during run or steer still blocks prompt execution when the live smoke test fails @spec @mvp
 - satelle provider smoke-test refresh during run or steer is distinct from doctor provider refresh because run and steer refresh validate immediately before a real prompt turn while doctor refresh validates without starting prompt execution @spec @mvp
+- label: satelle reports a typed native-execution-path-unavailable readiness blocker when its private Codex app-server exposes no stable native Computer Use path, even if separate desktop acceptance succeeded
+  id: qvk
+  tags: [implemented, mvp]
 
 ## computer-use
 - satelle prefers native Codex Computer Use installed on the remote host over custom screenshot and input automation @spec @mvp
