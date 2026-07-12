@@ -21,6 +21,7 @@ pub enum ApiErrorCode {
     HostBusy,
     StoreInUse,
     StateConflict,
+    StopNotConfirmed,
     IncompatibleProtocol,
     IncompatibleControlPlane,
     ComputerUseNotReady,
@@ -51,6 +52,7 @@ impl ApiErrorCode {
             Self::HostBusy => "host-busy",
             Self::StoreInUse => "store-in-use",
             Self::StateConflict => "state-conflict",
+            Self::StopNotConfirmed => "stop-not-confirmed",
             Self::IncompatibleProtocol => "incompatible-protocol",
             Self::IncompatibleControlPlane => "incompatible-control-plane",
             Self::ComputerUseNotReady => "computer-use-not-ready",
@@ -101,6 +103,18 @@ mod tests {
             assert_eq!(code.as_str(), token);
             assert_eq!(serde_json::to_value(code).unwrap(), json!(token));
         }
+    }
+
+    #[test]
+    fn stop_not_confirmed_has_exact_public_token() {
+        assert_eq!(
+            ApiErrorCode::StopNotConfirmed.as_str(),
+            "stop-not-confirmed"
+        );
+        assert_eq!(
+            serde_json::to_value(ApiErrorCode::StopNotConfirmed).unwrap(),
+            json!("stop-not-confirmed")
+        );
     }
 }
 

@@ -77,7 +77,8 @@ CREATE TABLE turns (
         CHECK (safe_summary IS NULL OR safe_summary IN (
             'task_completed',
             'blocked_by_policy',
-            'execution_failed'
+            'execution_failed',
+            'daemon_restart_recovery_failed'
         )),
     UNIQUE (session_id, ordinal),
     UNIQUE (session_id, turn_id),
@@ -93,7 +94,10 @@ CREATE TABLE turns (
             AND safe_summary = 'blocked_by_policy')
         OR (state = 'failed'
             AND terminal_at IS NOT NULL
-            AND safe_summary = 'execution_failed')
+            AND safe_summary IN (
+                'execution_failed',
+                'daemon_restart_recovery_failed'
+            ))
         OR (state = 'stopped'
             AND terminal_at IS NOT NULL
             AND safe_summary IS NULL)

@@ -6,7 +6,7 @@ use super::{
 };
 use crate::storage::PrivateUpstreamRef;
 use crate::test_runtime::FakeComputerUseAdapter;
-use satelle_core::session::{StopObservation, TurnState, TurnTransition};
+use satelle_core::session::{SafeSummary, StopObservation, TurnState, TurnTransition};
 use satelle_core::{
     ControlPlaneFailureReason, ControlPlaneOperation, ErrorCode, EventType,
     IncompatibleControlPlaneDetails, LOCAL_DEMO_HOST, SatelleError,
@@ -437,10 +437,20 @@ fn restart_recovery_commits_adapter_proven_blocked_and_failed_outcomes() {
                 "PRIVATE_AFTER_TERMINAL_RECOVERY",
             ))
             .expect("terminal recovery should release admission");
+        let recovered_session_id = old_session.session_id;
         let recovered = restarted
-            .status(old_session.session_id)
+            .status(recovered_session_id.clone())
             .expect("the recovered Session should remain readable");
         assert_eq!(recovered.status, expected_status);
+        if observation == RecoveryObservation::Failed {
+            let public = restarted
+                .status_public(&recovered_session_id)
+                .expect("read recovered public Session");
+            assert_eq!(
+                public.turns().last().unwrap().safe_summary(),
+                Some(&SafeSummary::DaemonRestartRecoveryFailed)
+            );
+        }
     }
 }
 
@@ -555,6 +565,11 @@ fn unknown_restart_work_blocks_new_admission_until_stop_resolves_it() {
         ))
         .expect_err("unknown recovery must block new admission");
     assert_eq!(error.code, ErrorCode::HostBusy);
+    assert_eq!(error.details["reason"], "outcome_unknown");
+    assert_eq!(
+        error.recovery_command,
+        Some(format!("satelle status {} --json", session.session_id))
+    );
     assert_eq!(
         restarted
             .startup_state()

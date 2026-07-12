@@ -358,6 +358,12 @@ impl RuntimeEngine {
                 let commit = storage
                     .confirm_stop(claim, observation, confirmed_at)
                     .map_err(model::storage_failure)?;
+                let stop_committed = matches!(commit.outcome(), StopCommitOutcome::Stopped(_));
+                drop(storage);
+                if stop_committed {
+                    self.adapter
+                        .stop_committed(commit.session().id(), commit.turn_id());
+                }
                 if matches!(
                     commit.outcome(),
                     StopCommitOutcome::Stopped(_)

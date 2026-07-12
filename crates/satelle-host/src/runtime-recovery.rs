@@ -81,7 +81,7 @@ impl RuntimeEngine {
                 RecoveryObservation::Running => TurnTransition::Running,
                 RecoveryObservation::Completed => TurnTransition::Completed,
                 RecoveryObservation::Blocked => TurnTransition::Blocked,
-                RecoveryObservation::Failed => TurnTransition::Failed,
+                RecoveryObservation::Failed => TurnTransition::RecoveryFailed,
                 RecoveryObservation::Unknown => {
                     if self.restore_recovery_subject(subject)? {
                         return Ok(false);

@@ -1,6 +1,6 @@
 use super::{
     PublicSession, PublicSnapshotError, PublicTurn, SafeSummary, SessionActivity,
-    SessionStateRevision, TurnState, TurnStateRevision, state_derived_safe_summary,
+    SessionStateRevision, TurnState, TurnStateRevision, terminal_summary_matches,
 };
 use crate::{SessionId, TurnId};
 use serde::{Deserialize, Deserializer};
@@ -55,7 +55,7 @@ fn validate_turn(turn: &PublicTurn) -> Result<(), &'static str> {
         if turn.terminal_at != Some(turn.updated_at) {
             return Err("a terminal public Turn has incoherent terminal time");
         }
-        if turn.safe_summary != state_derived_safe_summary(turn.state) {
+        if !terminal_summary_matches(turn.state, turn.safe_summary) {
             return Err("a terminal public Turn has incoherent safe summary");
         }
     } else if turn.terminal_at.is_some() || turn.safe_summary.is_some() {

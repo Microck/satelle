@@ -1337,6 +1337,7 @@ pub enum ErrorCode {
     HostBusy,
     StoreInUse,
     StateConflict,
+    StopNotConfirmed,
     IdempotencyKeyConflict,
     RemoteExecution,
     StorageBusy,
@@ -1393,6 +1394,7 @@ impl ErrorCode {
             Self::HostBusy => "host-busy",
             Self::StoreInUse => "store-in-use",
             Self::StateConflict => "state-conflict",
+            Self::StopNotConfirmed => "stop-not-confirmed",
             Self::IdempotencyKeyConflict => "idempotency-key-conflict",
             Self::RemoteExecution => "remote-execution",
             Self::StorageBusy => "storage-busy",
@@ -1457,7 +1459,7 @@ impl ErrorCode {
             Self::CapacityExceeded | Self::HostUnreachable | Self::HostBusy | Self::StoreInUse => {
                 69
             }
-            Self::RemoteExecution | Self::StorageBusy => 74,
+            Self::RemoteExecution | Self::StorageBusy | Self::StopNotConfirmed => 74,
             Self::IncompatibleControlPlane
             | Self::ComputerUseNotReady
             | Self::DoctorReadinessBlockersFound

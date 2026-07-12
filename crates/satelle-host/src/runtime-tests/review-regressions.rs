@@ -315,6 +315,38 @@ fn attached_execution_losing_to_stop_returns_the_durable_stopped_state() {
 }
 
 #[test]
+fn controlled_execution_returns_only_after_the_durable_stop_winner() {
+    let state = crate::TestStateDir::new().expect("temporary state directory should exist");
+    let adapter = SubjectBlockingAdapter::controlled_stop();
+    let runtime = RuntimeHandle::new(Ok(state.path().to_path_buf()), adapter.clone());
+    let run_runtime = runtime.clone();
+    let attached = std::thread::spawn(move || {
+        run_runtime.run(RunCommand::attached(
+            LOCAL_DEMO_HOST,
+            "PRIVATE_CONTROLLED_STOP_WINNER",
+        ))
+    });
+    let session_id = adapter
+        .session_receiver
+        .lock()
+        .expect("subject receiver lock should not be poisoned")
+        .recv_timeout(WAIT_LIMIT)
+        .expect("adapter should expose the admitted Session");
+
+    runtime
+        .stop(StopCommand::new(session_id))
+        .expect("stop should become durable before controlled execution exits");
+    adapter.execute_release.signal();
+    let outcome = attached
+        .join()
+        .expect("attached execution thread should not panic")
+        .expect("controlled execution should read the durable stop winner");
+
+    assert_eq!(outcome.session.status, satelle_core::TurnStatus::Stopped);
+    assert!(outcome.events.is_empty());
+}
+
+#[test]
 fn cancellation_confirmed_worker_exit_does_not_block_new_turn_admission() {
     let state = crate::TestStateDir::new().expect("temporary state directory should exist");
     let adapter = BlockingExecutionAndStopAdapter::default();
@@ -397,7 +429,8 @@ fn stop_proven_still_active_is_not_queued_for_running_to_running_recovery() {
     let stop_error = runtime
         .stop(StopCommand::new(session_id))
         .expect_err("known-active stop observation should report not confirmed");
-    assert_eq!(stop_error.code, ErrorCode::RemoteExecution);
+    assert_eq!(stop_error.code, ErrorCode::StopNotConfirmed);
+    assert_eq!(stop_error.code.as_str(), "stop-not-confirmed");
     assert_eq!(stop_error.details["ownership"], "active");
     let error = runtime
         .run(RunCommand::attached(
@@ -689,6 +722,7 @@ struct SubjectBlockingAdapter {
     session_receiver: Arc<Mutex<mpsc::Receiver<satelle_core::SessionId>>>,
     execute_release: Latch,
     execute_calls: Arc<AtomicUsize>,
+    returns_controlled_stop: bool,
 }
 
 impl Default for SubjectBlockingAdapter {
@@ -699,6 +733,16 @@ impl Default for SubjectBlockingAdapter {
             session_receiver: Arc::new(Mutex::new(session_receiver)),
             execute_release: Latch::default(),
             execute_calls: Arc::new(AtomicUsize::new(0)),
+            returns_controlled_stop: false,
+        }
+    }
+}
+
+impl SubjectBlockingAdapter {
+    fn controlled_stop() -> Self {
+        Self {
+            returns_controlled_stop: true,
+            ..Self::default()
         }
     }
 }
@@ -717,6 +761,9 @@ impl ComputerUseAdapter for SubjectBlockingAdapter {
             .send(request.subject().session_id().clone())
             .map_err(|_| SatelleError::not_implemented("subject receiver disconnected"))?;
         self.execute_release.wait();
+        if self.returns_controlled_stop {
+            return Ok(super::super::ExecuteResult::stopped_by_control());
+        }
         FakeComputerUseAdapter.execute(request)
     }
 

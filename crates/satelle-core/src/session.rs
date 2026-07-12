@@ -90,6 +90,7 @@ pub enum SafeSummary {
     TaskCompleted,
     BlockedByPolicy,
     ExecutionFailed,
+    DaemonRestartRecoveryFailed,
 }
 
 impl SafeSummary {
@@ -98,6 +99,7 @@ impl SafeSummary {
             Self::TaskCompleted => "task_completed",
             Self::BlockedByPolicy => "blocked_by_policy",
             Self::ExecutionFailed => "execution_failed",
+            Self::DaemonRestartRecoveryFailed => "daemon_restart_recovery_failed",
         }
     }
 }
@@ -468,6 +470,7 @@ pub enum TurnTransition {
     Completed,
     Blocked,
     Failed,
+    RecoveryFailed,
 }
 
 impl TurnTransition {
@@ -478,6 +481,10 @@ impl TurnTransition {
             Self::Completed => (TurnState::Completed, Some(SafeSummary::TaskCompleted)),
             Self::Blocked => (TurnState::Blocked, Some(SafeSummary::BlockedByPolicy)),
             Self::Failed => (TurnState::Failed, Some(SafeSummary::ExecutionFailed)),
+            Self::RecoveryFailed => (
+                TurnState::Failed,
+                Some(SafeSummary::DaemonRestartRecoveryFailed),
+            ),
         }
     }
 }
@@ -905,7 +912,7 @@ impl SessionSnapshot {
                 if terminal_at != turn.updated_at {
                     return Err(SnapshotError::TerminalTimestampMismatch);
                 }
-                if turn.safe_summary != state_derived_safe_summary(turn.state) {
+                if !terminal_summary_matches(turn.state, turn.safe_summary) {
                     return Err(SnapshotError::TerminalSummaryMismatch);
                 }
             }
@@ -928,15 +935,16 @@ impl SessionSnapshot {
     }
 }
 
-fn state_derived_safe_summary(state: TurnState) -> Option<SafeSummary> {
+pub(super) fn terminal_summary_matches(state: TurnState, summary: Option<SafeSummary>) -> bool {
     match state {
-        TurnState::Completed => Some(SafeSummary::TaskCompleted),
-        TurnState::Blocked => Some(SafeSummary::BlockedByPolicy),
-        TurnState::Failed => Some(SafeSummary::ExecutionFailed),
-        TurnState::Stopped
-        | TurnState::Starting
-        | TurnState::Running
-        | TurnState::RecoveryPending => None,
+        TurnState::Completed => summary == Some(SafeSummary::TaskCompleted),
+        TurnState::Blocked => summary == Some(SafeSummary::BlockedByPolicy),
+        TurnState::Failed => matches!(
+            summary,
+            Some(SafeSummary::ExecutionFailed | SafeSummary::DaemonRestartRecoveryFailed)
+        ),
+        TurnState::Stopped => summary.is_none(),
+        TurnState::Starting | TurnState::Running | TurnState::RecoveryPending => false,
     }
 }
 
@@ -1440,6 +1448,29 @@ mod tests {
                 session.turn(&turn_1()).unwrap().safe_summary()
             );
         }
+    }
+
+    #[test]
+    fn restart_recovery_failure_has_a_closed_typed_summary() {
+        let mut session = in_state(TurnState::RecoveryPending);
+
+        session
+            .transition_turn(
+                &turn_1(),
+                revisions(&session),
+                TurnTransition::RecoveryFailed,
+                at(10),
+            )
+            .expect("commit restart recovery failure");
+
+        assert_eq!(
+            session.turn(&turn_1()).unwrap().safe_summary(),
+            Some(&SafeSummary::DaemonRestartRecoveryFailed)
+        );
+        assert_eq!(
+            serde_json::to_value(SafeSummary::DaemonRestartRecoveryFailed).unwrap(),
+            serde_json::json!("daemon_restart_recovery_failed")
+        );
     }
 
     #[test]
