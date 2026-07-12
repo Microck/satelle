@@ -145,6 +145,14 @@ fn failure(error: &SatelleError) -> ApiFailure {
             message: "the execution runtime could not complete the operation",
             details: None,
         },
+        ErrorCode::StorageBusy => ApiFailure {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            code: ApiErrorCode::StorageBusy,
+            category: ApiErrorCategory::Storage,
+            retryable: true,
+            message: "the Host state store is temporarily busy",
+            details: None,
+        },
         // Completion installation and profile activation are Controller-local workflows. If
         // either code crosses the Host boundary, expose only the stable internal-error contract.
         ErrorCode::CompletionInstallFailed | ErrorCode::CompletionProfileUpdateFailed => {
@@ -249,5 +257,16 @@ mod tests {
         assert!(!mapped.retryable);
         assert_eq!(mapped.details, None);
         assert!(!mapped.message.contains("PRIVATE_"));
+    }
+
+    #[test]
+    fn storage_busy_is_a_retryable_service_unavailable_response() {
+        let mapped = failure(&SatelleError::storage_busy());
+
+        assert_eq!(mapped.status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(mapped.code, ApiErrorCode::StorageBusy);
+        assert_eq!(mapped.category, ApiErrorCategory::Storage);
+        assert!(mapped.retryable);
+        assert_eq!(mapped.details, None);
     }
 }

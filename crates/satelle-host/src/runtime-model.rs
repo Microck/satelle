@@ -326,6 +326,7 @@ pub(super) fn storage_failure(error: StorageError) -> SatelleError {
             source_detail: None,
             details: std::collections::BTreeMap::new(),
         },
+        StorageErrorKind::Busy => SatelleError::storage_busy(),
         StorageErrorKind::UnsafeStatePath
         | StorageErrorKind::OpenFailed
         | StorageErrorKind::MigrationFailed
@@ -381,4 +382,20 @@ fn public_time(value: OffsetDateTime) -> Result<String, SatelleError> {
     value
         .format(&Rfc3339)
         .map_err(|_| integrity_failure("stored timestamp cannot be represented"))
+}
+
+#[cfg(test)]
+mod storage_failure_tests {
+    use super::*;
+
+    #[test]
+    fn sqlite_busy_is_preserved_as_a_typed_transient_error() {
+        let error = storage_failure(StorageError::for_test(StorageErrorKind::Busy));
+
+        assert_eq!(error.code, ErrorCode::StorageBusy);
+        assert_eq!(error.code.as_str(), "storage-busy");
+        assert_eq!(error.exit_code(), 74);
+        assert!(!error.message.contains("SQLite"));
+        assert!(error.source_detail.is_none());
+    }
 }

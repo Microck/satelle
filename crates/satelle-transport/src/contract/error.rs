@@ -22,6 +22,7 @@ pub enum ApiErrorCode {
     IncompatibleProtocol,
     IncompatibleControlPlane,
     ComputerUseNotReady,
+    StorageBusy,
     StorageIntegrityFailed,
     RemoteExecutionFailed,
     CapacityExceeded,
@@ -49,6 +50,7 @@ impl ApiErrorCode {
             Self::IncompatibleProtocol => "incompatible-protocol",
             Self::IncompatibleControlPlane => "incompatible-control-plane",
             Self::ComputerUseNotReady => "computer-use-not-ready",
+            Self::StorageBusy => "storage-busy",
             Self::StorageIntegrityFailed => "storage-integrity-failed",
             Self::RemoteExecutionFailed => "remote-execution-failed",
             Self::CapacityExceeded => "capacity-exceeded",
@@ -74,6 +76,15 @@ mod tests {
         assert_eq!(
             serde_json::to_value(ApiErrorCode::IncompatibleControlPlane).unwrap(),
             json!("incompatible-control-plane")
+        );
+    }
+
+    #[test]
+    fn storage_busy_code_has_exact_public_token() {
+        assert_eq!(ApiErrorCode::StorageBusy.as_str(), "storage-busy");
+        assert_eq!(
+            serde_json::to_value(ApiErrorCode::StorageBusy).unwrap(),
+            json!("storage-busy")
         );
     }
 }

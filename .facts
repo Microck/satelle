@@ -1486,7 +1486,7 @@
 - one Host Daemon process holds an exclusive ownership lock for one SQLite store while serving requests @spec @mvp
 - a second Host Daemon process for the same SQLite store fails with a typed store-in-use error before accepting API requests @spec @mvp
 - satelle enables SQLite foreign-key enforcement for every Host Daemon connection @spec @mvp
-- SQLite busy exhaustion returns a typed storage-busy error instead of dropping or overwriting state @spec @mvp
+- SQLite busy exhaustion returns a typed storage-busy error instead of dropping or overwriting state @mvp @implemented
 - Turn admission, active-Turn uniqueness, Session linkage, Idempotency Record creation, and Control Lease ownership are committed atomically @spec @mvp
 - every lifecycle transition uses the prior session_state_revision and turn_state_revision of every affected record as transaction preconditions @spec @contract @mvp
 - a failed lifecycle transition precondition returns a typed state-conflict error without rewriting the winning state @spec @mvp

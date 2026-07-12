@@ -1337,6 +1337,7 @@ pub enum ErrorCode {
     HostBusy,
     IdempotencyKeyConflict,
     RemoteExecution,
+    StorageBusy,
     StorageIntegrityFailed,
     IncompatibleControlPlane,
     ComputerUseNotReady,
@@ -1390,6 +1391,7 @@ impl ErrorCode {
             Self::HostBusy => "host-busy",
             Self::IdempotencyKeyConflict => "idempotency-key-conflict",
             Self::RemoteExecution => "remote-execution",
+            Self::StorageBusy => "storage-busy",
             Self::StorageIntegrityFailed => "storage-integrity-failed",
             Self::IncompatibleControlPlane => "incompatible-control-plane",
             Self::ComputerUseNotReady => "computer-use-not-ready",
@@ -1449,7 +1451,7 @@ impl ErrorCode {
             | Self::SessionNotFound
             | Self::LogsCursorExpired => 66,
             Self::CapacityExceeded | Self::HostUnreachable | Self::HostBusy => 69,
-            Self::RemoteExecution => 74,
+            Self::RemoteExecution | Self::StorageBusy => 74,
             Self::IncompatibleControlPlane
             | Self::ComputerUseNotReady
             | Self::DoctorReadinessBlockersFound => 75,
@@ -1998,6 +2000,16 @@ impl SatelleError {
             recovery_command: Some(
                 "satelle doctor --scope computer-use --refresh --json".to_string(),
             ),
+            source_detail: None,
+            details: BTreeMap::new(),
+        }
+    }
+
+    pub fn storage_busy() -> Self {
+        Self {
+            code: ErrorCode::StorageBusy,
+            message: "the Host state store is temporarily busy".to_string(),
+            recovery_command: Some("retry the operation after a short delay".to_string()),
             source_detail: None,
             details: BTreeMap::new(),
         }
