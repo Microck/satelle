@@ -1,5 +1,6 @@
 use super::{
-    ApiFailure, DaemonState, PeerAddress, api_error_response, header_request_id, security_headers,
+    ApiFailure, DaemonState, api_error_response, header_request_id, listener::ConnectionContext,
+    security_headers,
 };
 use crate::contract::{
     ApiErrorCategory, ApiErrorCode, PROTOCOL_VERSION, PROTOCOL_VERSION_HEADER, RequestId,
@@ -15,6 +16,13 @@ use std::sync::Arc;
 pub(super) const EXPECTED_HOST_IDENTITY_HEADER: &str = "satelle-expected-host-identity";
 pub(super) const IDEMPOTENCY_KEY_HEADER: &str = "idempotency-key";
 pub(super) const REQUEST_ID_HEADER: &str = "satelle-request-id";
+
+pub(super) fn expected_host_identity_matches(
+    headers: &axum::http::HeaderMap,
+    host_identity: &str,
+) -> bool {
+    single_header(headers, EXPECTED_HOST_IDENTITY_HEADER) == Some(host_identity)
+}
 
 #[derive(Clone)]
 pub(super) struct AuthorizedRequest {
@@ -46,9 +54,9 @@ pub(super) async fn authorize(
     let request_id = supplied_request_id.clone().unwrap_or_default();
     let peer_ip = request
         .extensions()
-        .get::<ConnectInfo<PeerAddress>>()
+        .get::<ConnectInfo<ConnectionContext>>()
         .map_or(IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), |peer| {
-            peer.0.0.ip()
+            peer.0.peer_ip()
         });
     if let Some(retry_after) = state.failed_auth_limit.retry_after(peer_ip) {
         return rate_limited_response(

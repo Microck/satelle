@@ -22,7 +22,7 @@ use satelle_transport::{
 use serde_json::Value;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::time::Duration;
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
 const EXPECTED_OPERATIONS: [&str; 10] = [
@@ -773,7 +773,7 @@ async fn control_routes_limit_control_and_admin_principals() {
 }
 
 #[tokio::test]
-async fn advertised_connection_limit_is_enforced_by_the_listener() {
+async fn advertised_connection_limit_returns_a_typed_capacity_error() {
     let state = TestStateDir::new().expect("temporary state directory");
     let service = HostService::local_demo_for_tests_at(state.path())
         .expect("construct deterministic Host service");
@@ -792,23 +792,78 @@ async fn advertised_connection_limit_is_enforced_by_the_listener() {
     let mut held = TcpStream::connect(server.local_addr())
         .await
         .expect("open held connection");
-    held.write_all(b"GET /v1/live HTTP/1.1\r\nHost: localhost\r\n")
+    held.write_all(b"GET /v1/live HTTP/1.1\r\nHost: localhost\r\n\r\n")
         .await
-        .expect("write partial request");
-    tokio::time::sleep(Duration::from_millis(25)).await;
+        .expect("write held keep-alive request");
+    tokio::time::timeout(Duration::from_secs(1), async {
+        let mut response = Vec::new();
+        loop {
+            let mut chunk = [0_u8; 512];
+            let count = held
+                .read(&mut chunk)
+                .await
+                .expect("read held keep-alive response");
+            assert_ne!(count, 0, "held keep-alive connection closed unexpectedly");
+            response.extend_from_slice(&chunk[..count]);
+            if response
+                .windows(b"\"alive\":true".len())
+                .any(|window| window == b"\"alive\":true")
+            {
+                break;
+            }
+        }
+    })
+    .await
+    .expect("held request must establish the capacity-owning connection");
 
-    let blocked_client = reqwest::Client::builder()
-        .timeout(Duration::from_millis(100))
+    let overloaded_request_id = RequestId::new();
+    let overloaded_client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(1))
         .build()
         .expect("build bounded client");
-    let blocked = blocked_client
+    let overloaded = overloaded_client
         .get(format!("http://{}/v1/live", server.local_addr()))
+        .header("Satelle-Request-Id", overloaded_request_id.to_string())
         .send()
-        .await;
-    assert!(
-        blocked.is_err(),
-        "a second connection must wait for capacity"
+        .await
+        .expect("receive typed connection-capacity response");
+    assert_eq!(overloaded.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(
+        overloaded.headers()["satelle-request-id"],
+        overloaded_request_id.as_str()
     );
+    assert_eq!(overloaded.headers()["connection"], "close");
+    let error = overloaded
+        .json::<Value>()
+        .await
+        .expect("decode typed connection-capacity response");
+    assert_eq!(error["code"], "capacity-exceeded");
+    assert_eq!(error["category"], "capacity");
+    assert_eq!(error["retryable"], true);
+    assert_eq!(error["host_identity"], Value::Null);
+
+    let pinned_token = {
+        let exposed = token.expose();
+        ApiBearerToken::parse(exposed.as_str()).expect("copy token for pinned capacity request")
+    };
+    let pinned_address = server.local_addr();
+    let pinned_identity = initialized.host_identity().to_string();
+    let pinned_error = tokio::task::spawn_blocking(move || {
+        DaemonClient::loopback(pinned_address, pinned_token, pinned_identity)
+            .expect("construct pinned capacity client")
+            .capabilities()
+            .expect_err("pinned client must receive the capacity rejection")
+    })
+    .await
+    .expect("join pinned capacity client");
+    match pinned_error {
+        DaemonClientError::Api { status, error } => {
+            assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+            assert_eq!(error.code().as_str(), "capacity-exceeded");
+            assert_eq!(error.host_identity(), Some(initialized.host_identity()));
+        }
+        other => panic!("expected typed pinned capacity error, got {other:?}"),
+    }
     drop(held);
 
     let address = server.local_addr();
