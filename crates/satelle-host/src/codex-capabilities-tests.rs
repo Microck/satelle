@@ -99,6 +99,47 @@ fn every_non_host_platform_is_blocked_at_native_readiness() {
 }
 
 #[test]
+fn absent_native_surface_reports_the_private_execution_path_blocker() {
+    for capability in [
+        RequiredCapability::NativeReadiness,
+        RequiredCapability::NativeHarmlessAction,
+    ] {
+        let mut evidence = fully_proven_evidence(HostPlatform::Windows);
+        evidence_mut(&mut evidence.capabilities, capability).surface = EvidenceSurface::Absent;
+
+        assert_eq!(
+            blockers(evaluate_phase0_support(evidence)),
+            vec![Phase0CapabilityBlocker {
+                reason: BlockerReason::NativeExecutionPathUnavailable,
+                capability,
+                codex_version: CodexVersionEvidence::Detected {
+                    version: REQUIRED_CODEX_VERSION,
+                },
+                host_platform: HostPlatform::Windows,
+                observed_surface: EvidenceSurface::Absent,
+                live_proof: LiveProofStatus::Passed,
+            }],
+            "{capability:?} did not identify the missing private execution path"
+        );
+    }
+}
+
+#[test]
+fn unproven_control_plane_does_not_claim_the_private_native_path_was_queried() {
+    let evidence = Phase0CapabilityEvidence {
+        codex_version: CodexVersionEvidence::Missing,
+        host_platform: HostPlatform::Windows,
+        capabilities: CapabilityMatrix::unproven(),
+    };
+
+    assert!(
+        blockers(evaluate_phase0_support(evidence))
+            .iter()
+            .all(|blocker| blocker.reason != BlockerReason::NativeExecutionPathUnavailable)
+    );
+}
+
+#[test]
 fn every_required_capability_rejects_every_non_stable_surface() {
     for capability in REQUIRED_CAPABILITIES {
         for surface in NON_STABLE_SURFACES {
@@ -108,7 +149,7 @@ fn every_required_capability_rejects_every_non_stable_surface() {
             assert_eq!(
                 blockers(evaluate_phase0_support(evidence)),
                 vec![Phase0CapabilityBlocker {
-                    reason: BlockerReason::NonStableSurface,
+                    reason: surface_blocker_reason(evidence.capabilities, capability),
                     capability,
                     codex_version: CodexVersionEvidence::Detected {
                         version: REQUIRED_CODEX_VERSION,
