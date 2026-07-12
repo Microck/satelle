@@ -113,6 +113,22 @@ fn failure(error: &SatelleError) -> ApiFailure {
             message: "the Host is already controlling its authorized desktop",
             details: None,
         },
+        ErrorCode::StoreInUse => ApiFailure {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            code: ApiErrorCode::StoreInUse,
+            category: ApiErrorCategory::Storage,
+            retryable: true,
+            message: "the Host state store is already owned by another daemon process",
+            details: None,
+        },
+        ErrorCode::StateConflict => ApiFailure {
+            status: StatusCode::CONFLICT,
+            code: ApiErrorCode::StateConflict,
+            category: ApiErrorCategory::Conflict,
+            retryable: true,
+            message: "the Host state changed before the operation could commit",
+            details: None,
+        },
         ErrorCode::IncompatibleControlPlane => ApiFailure {
             status: StatusCode::SERVICE_UNAVAILABLE,
             code: ApiErrorCode::IncompatibleControlPlane,
@@ -266,6 +282,28 @@ mod tests {
         assert_eq!(mapped.status, StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(mapped.code, ApiErrorCode::StorageBusy);
         assert_eq!(mapped.category, ApiErrorCategory::Storage);
+        assert!(mapped.retryable);
+        assert_eq!(mapped.details, None);
+    }
+
+    #[test]
+    fn store_in_use_is_a_retryable_storage_unavailable_response() {
+        let mapped = failure(&SatelleError::store_in_use());
+
+        assert_eq!(mapped.status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(mapped.code, ApiErrorCode::StoreInUse);
+        assert_eq!(mapped.category, ApiErrorCategory::Storage);
+        assert!(mapped.retryable);
+        assert_eq!(mapped.details, None);
+    }
+
+    #[test]
+    fn state_conflict_is_a_retryable_conflict_response() {
+        let mapped = failure(&SatelleError::state_conflict());
+
+        assert_eq!(mapped.status, StatusCode::CONFLICT);
+        assert_eq!(mapped.code, ApiErrorCode::StateConflict);
+        assert_eq!(mapped.category, ApiErrorCategory::Conflict);
         assert!(mapped.retryable);
         assert_eq!(mapped.details, None);
     }

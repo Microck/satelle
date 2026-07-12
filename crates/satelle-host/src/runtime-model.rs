@@ -327,6 +327,8 @@ pub(super) fn storage_failure(error: StorageError) -> SatelleError {
             details: std::collections::BTreeMap::new(),
         },
         StorageErrorKind::Busy => SatelleError::storage_busy(),
+        StorageErrorKind::StoreInUse => SatelleError::store_in_use(),
+        StorageErrorKind::StateConflict => SatelleError::state_conflict(),
         StorageErrorKind::UnsafeStatePath
         | StorageErrorKind::OpenFailed
         | StorageErrorKind::MigrationFailed
@@ -395,6 +397,28 @@ mod storage_failure_tests {
         assert_eq!(error.code, ErrorCode::StorageBusy);
         assert_eq!(error.code.as_str(), "storage-busy");
         assert_eq!(error.exit_code(), 74);
+        assert!(!error.message.contains("SQLite"));
+        assert!(error.source_detail.is_none());
+    }
+
+    #[test]
+    fn store_ownership_conflict_is_preserved_as_a_typed_startup_error() {
+        let error = storage_failure(StorageError::for_test(StorageErrorKind::StoreInUse));
+
+        assert_eq!(error.code, ErrorCode::StoreInUse);
+        assert_eq!(error.code.as_str(), "store-in-use");
+        assert_eq!(error.exit_code(), 69);
+        assert!(!error.message.contains("SQLite"));
+        assert!(error.source_detail.is_none());
+    }
+
+    #[test]
+    fn stale_revision_is_preserved_as_a_typed_transient_error() {
+        let error = storage_failure(StorageError::for_test(StorageErrorKind::StateConflict));
+
+        assert_eq!(error.code, ErrorCode::StateConflict);
+        assert_eq!(error.code.as_str(), "state-conflict");
+        assert_eq!(error.exit_code(), 75);
         assert!(!error.message.contains("SQLite"));
         assert!(error.source_detail.is_none());
     }

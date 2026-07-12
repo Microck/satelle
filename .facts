@@ -1486,13 +1486,13 @@
 
 ## transactional-integrity
 - satelle Host Daemon uses SQLite on the remote host as the canonical local store for session metadata, turn lifecycle, readiness cache, provider Computer Use smoke results, setup action ledgers, and normalized log summaries @spec @mvp
-- one Host Daemon process holds an exclusive ownership lock for one SQLite store while serving requests @spec @mvp
-- a second Host Daemon process for the same SQLite store fails with a typed store-in-use error before accepting API requests @spec @mvp
-- satelle enables SQLite foreign-key enforcement for every Host Daemon connection @spec @mvp
+- one Host Daemon process holds an exclusive ownership lock for one SQLite store while serving requests @mvp @implemented
+- a second Host Daemon process for the same SQLite store fails with a typed store-in-use error before accepting API requests @mvp @implemented
+- satelle enables SQLite foreign-key enforcement for every Host Daemon connection @mvp @implemented
 - SQLite busy exhaustion returns a typed storage-busy error instead of dropping or overwriting state @mvp @implemented
-- Turn admission, active-Turn uniqueness, Session linkage, Idempotency Record creation, and Control Lease ownership are committed atomically @spec @mvp
-- every lifecycle transition uses the prior session_state_revision and turn_state_revision of every affected record as transaction preconditions @spec @contract @mvp
-- a failed lifecycle transition precondition returns a typed state-conflict error without rewriting the winning state @spec @mvp
+- Turn admission, active-Turn uniqueness, Session linkage, Idempotency Record creation, and Control Lease ownership are committed atomically @mvp @implemented
+- every lifecycle transition uses the prior session_state_revision and turn_state_revision of every affected record as transaction preconditions @contract @mvp @implemented
+- a failed lifecycle transition precondition returns a typed state-conflict error without rewriting the winning state @mvp @implemented
 - a failed startup integrity check blocks state-changing operations plus ordinary status and log reads until repair or restore succeeds, while exposing only minimal redacted integrity diagnostics needed for safe repair @spec @mvp
 
 ## privacy-and-filesystem
@@ -1592,8 +1592,8 @@
 - satelle does not store recording artifacts in project directories by default @spec @later
 - satelle recording artifact retention defaults to 24 hours @spec @later
 - satelle recording artifact retention can be configured per host, profile, or recording-enabled session @spec @later
-- satelle SQLite access uses rusqlite behind a small storage boundary instead of spreading SQL calls through daemon handlers @spec @mvp
-- satelle Host Daemon keeps blocking SQLite work off Tokio runtime worker threads through a storage service boundary or spawn_blocking pattern @spec @mvp
+- satelle SQLite access uses rusqlite behind a small storage boundary instead of spreading SQL calls through daemon handlers @mvp @implemented
+- satelle Host Daemon keeps blocking SQLite work off Tokio runtime worker threads through a storage service boundary or spawn_blocking pattern @mvp @implemented
 - satelle embeds SQLite schema migrations in the binary so on-demand remote bootstrap does not require sidecar migration files @spec @mvp
 - satelle Host Daemon applies embedded SQLite migrations on startup before accepting API requests @spec @mvp
 - satelle runs each migration step transactionally when SQLite supports transactional execution for that step @spec @mvp

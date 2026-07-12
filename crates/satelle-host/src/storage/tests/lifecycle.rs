@@ -626,6 +626,54 @@ fn pending_stop_blocks_a_later_nonterminal_execution_commit() {
 }
 
 #[test]
+fn stale_turn_revision_does_not_rewrite_the_winning_session_state() {
+    let state = TempDir::new().expect("temporary state directory");
+    let (mut storage, _) = Storage::open(state.path()).expect("open storage");
+    let initial = initial_session(&storage, SESSION_1, TURN_1, at(0));
+    let AdmissionOutcome::Execute {
+        session: starting, ..
+    } = storage
+        .begin_session(
+            &initial,
+            &admission(IdempotentOperation::Run, "run-1", "request-run-1", at(0)),
+        )
+        .expect("admit initial Session")
+    else {
+        panic!("new Session admission must execute");
+    };
+    let running = storage
+        .commit_lifecycle(
+            starting.id(),
+            &turn_id(TURN_1),
+            revisions(&starting, TURN_1),
+            TurnTransition::Running,
+            at(1),
+        )
+        .expect("commit the winning Running transition");
+
+    let stale = ExpectedRevisions::new(
+        running.session_state_revision(),
+        TurnStateRevision::initial(),
+    );
+    let error = storage
+        .commit_lifecycle(
+            running.id(),
+            &turn_id(TURN_1),
+            stale,
+            TurnTransition::Completed,
+            at(2),
+        )
+        .expect_err("the stale Turn revision must lose");
+
+    assert_eq!(StorageErrorKind::StateConflict, error.kind());
+    let stored = storage
+        .load_session(running.id())
+        .expect("reload the winning state")
+        .expect("winning Session remains stored");
+    assert_eq!(running.snapshot(), stored.snapshot());
+}
+
+#[test]
 fn lifecycle_completion_wins_a_stop_race_without_redeleting_its_lease() {
     let state = TempDir::new().expect("temporary state directory");
     let (mut storage, _) = Storage::open(state.path()).expect("open storage");
