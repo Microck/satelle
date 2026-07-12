@@ -12,15 +12,13 @@ use crate::contract::{
 };
 use auth::{AuthorizedRequest, REQUEST_ID_HEADER};
 use axum::Router;
-use axum::extract::connect_info::Connected;
 use axum::extract::{Extension, State};
 use axum::http::header::{CACHE_CONTROL, CONTENT_TYPE};
 use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::middleware;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
-use axum::serve::IncomingStream;
-use listener::LimitedTcpListener;
+use listener::{ConnectionContext, LimitedTcpListener};
 use satelle_core::SatelleError;
 use satelle_host::{DaemonRuntimeCapabilities, HostService};
 use serde::Serialize;
@@ -130,7 +128,7 @@ impl DaemonServer {
         let task = tokio::spawn(async move {
             axum::serve(
                 listener,
-                router.into_make_service_with_connect_info::<PeerAddress>(),
+                router.into_make_service_with_connect_info::<ConnectionContext>(),
             )
             .with_graceful_shutdown(async move {
                 while !*receiver.borrow() {
@@ -289,16 +287,8 @@ pub(super) struct DaemonState {
     shutdown: watch::Sender<bool>,
 }
 
-#[derive(Clone, Copy, Debug)]
-pub(super) struct PeerAddress(SocketAddr);
-
-impl Connected<IncomingStream<'_, LimitedTcpListener>> for PeerAddress {
-    fn connect_info(stream: IncomingStream<'_, LimitedTcpListener>) -> Self {
-        Self(*stream.remote_addr())
-    }
-}
-
 fn router(state: Arc<DaemonState>) -> Router {
+    let capacity_state = Arc::clone(&state);
     let bodyless_read_routes = Router::new()
         .route("/v1/capabilities", get(capabilities))
         .route("/v1/host/status", get(host_status))
@@ -348,6 +338,10 @@ fn router(state: Arc<DaemonState>) -> Router {
         .route("/v1/live", get(live).fallback(live_method_not_allowed))
         .merge(protected)
         .with_state(state)
+        .layer(middleware::from_fn_with_state(
+            capacity_state,
+            listener::enforce_capacity,
+        ))
 }
 
 async fn live(headers: HeaderMap) -> Response {
