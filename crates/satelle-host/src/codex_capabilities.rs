@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 
 #[path = "runtime-codex.rs"]
 mod control_plane;
-pub(crate) use control_plane::ControlPlaneAdmission;
+pub(crate) use control_plane::{ControlPlaneAdmission, installed_app_server_command};
 
 #[cfg(test)]
 #[path = "runtime-codex-tests.rs"]
@@ -630,7 +630,7 @@ fn read_version_output(
 }
 
 #[cfg(unix)]
-fn set_nonblocking(fd: &impl std::os::fd::AsFd) -> std::io::Result<()> {
+pub(crate) fn set_nonblocking(fd: &impl std::os::fd::AsFd) -> std::io::Result<()> {
     let flags = rustix::fs::fcntl_getfl(fd)?;
     Ok(rustix::fs::fcntl_setfl(
         fd,
@@ -666,18 +666,56 @@ fn wait_for_group(child: &mut GroupChild, deadline: Instant) -> GroupWaitOutcome
     }
 }
 
-fn terminate_group(child: &mut GroupChild) -> bool {
-    let killed_or_gone = match child.kill() {
-        Ok(()) => true,
-        Err(error) => group_is_gone(&error),
+pub(crate) fn terminate_group(child: &mut GroupChild) -> bool {
+    let killed_or_gone = loop {
+        match child.kill() {
+            Ok(()) => break true,
+            Err(error) if error.kind() == ErrorKind::Interrupted => continue,
+            Err(error) => break group_is_gone(&error) || reap_proven_empty_group(child),
+        }
     };
     if !killed_or_gone {
         return false;
     }
-    match child.wait() {
-        Ok(_) => true,
-        Err(error) => group_is_reaped(&error),
+
+    // On Unix, kill() has already signaled the complete process group. Reap
+    // the direct child by PID instead of asking command-group to wait by
+    // negative process-group ID. Once the group disappears, macOS can report
+    // that group wait as unavailable even though the leader is still ours to
+    // reap, incorrectly turning successful containment into a failure.
+    loop {
+        #[cfg(unix)]
+        let reaped = child.inner().wait();
+        #[cfg(not(unix))]
+        let reaped = child.wait();
+        match reaped {
+            Ok(_) => return true,
+            Err(error) if error.kind() == ErrorKind::Interrupted => continue,
+            Err(error) => return group_is_reaped(&error),
+        }
     }
+}
+
+#[cfg(unix)]
+fn reap_proven_empty_group(child: &mut GroupChild) -> bool {
+    let Some(group_id) = i32::try_from(child.id())
+        .ok()
+        .and_then(rustix::process::Pid::from_raw)
+    else {
+        return false;
+    };
+    if !matches!(child.try_wait(), Ok(Some(_))) {
+        return false;
+    }
+    matches!(
+        rustix::process::test_kill_process_group(group_id),
+        Err(error) if error == rustix::io::Errno::SRCH
+    )
+}
+
+#[cfg(not(unix))]
+fn reap_proven_empty_group(_child: &mut GroupChild) -> bool {
+    false
 }
 
 fn group_is_gone(error: &std::io::Error) -> bool {

@@ -6,7 +6,7 @@ use super::{
 };
 use crate::storage::PrivateUpstreamRef;
 use crate::test_runtime::FakeComputerUseAdapter;
-use satelle_core::session::{StopObservation, TurnState};
+use satelle_core::session::{StopObservation, TurnState, TurnTransition};
 use satelle_core::{
     ControlPlaneFailureReason, ControlPlaneOperation, ErrorCode, EventType,
     IncompatibleControlPlaneDetails, LOCAL_DEMO_HOST, SatelleError,
@@ -309,6 +309,30 @@ fn adapter_persists_upstream_refs_before_waiting_and_stop_keeps_them_durable() {
         Some(&expected_thread_ref)
     );
     assert_eq!(final_subject.upstream_turn_ref(), Some(&expected_turn_ref));
+}
+
+#[test]
+fn adapter_receives_committed_policy_and_resumes_the_private_thread_reference() {
+    let state = crate::TestStateDir::new().expect("temporary state directory should exist");
+    let adapter = BoundaryInspectingAdapter::default();
+    let runtime = RuntimeHandle::new(Ok(state.path().to_path_buf()), adapter.clone());
+
+    let session_id = runtime
+        .run(RunCommand::attached(
+            LOCAL_DEMO_HOST,
+            "PRIVATE_INITIAL_POLICY_PROMPT",
+        ))
+        .expect("initial Turn should execute through the adapter boundary")
+        .session
+        .session_id;
+    runtime
+        .steer(SteerCommand::attached(
+            session_id,
+            "PRIVATE_FOLLOW_UP_POLICY_PROMPT",
+        ))
+        .expect("follow-up Turn should reuse the persisted private thread reference");
+
+    assert_eq!(adapter.execute_calls.load(Ordering::SeqCst), 2);
 }
 
 #[test]
@@ -669,6 +693,72 @@ struct BlockingExecutionAndStopAdapter {
 struct ReferencePersistingAdapter {
     references_recorded: Latch,
     execute_release: Latch,
+}
+
+#[derive(Clone, Default)]
+struct BoundaryInspectingAdapter {
+    execute_calls: Arc<AtomicUsize>,
+    expected_policy: Arc<Mutex<Option<satelle_core::session::ExecutionPolicy>>>,
+}
+
+impl super::ComputerUseAdapter for BoundaryInspectingAdapter {
+    fn preflight(&self, host: &str) -> Result<super::AdapterReadiness, SatelleError> {
+        let readiness = FakeComputerUseAdapter.preflight(host)?;
+        *self
+            .expected_policy
+            .lock()
+            .expect("the policy expectation lock should not be poisoned") =
+            Some(readiness.execution_policy().clone());
+        Ok(readiness)
+    }
+
+    fn execute(
+        &self,
+        request: super::ExecuteRequest<'_>,
+    ) -> Result<super::ExecuteResult, SatelleError> {
+        let call = self.execute_calls.fetch_add(1, Ordering::SeqCst);
+        let expected_policy = self
+            .expected_policy
+            .lock()
+            .expect("the policy expectation lock should not be poisoned");
+        assert_eq!(
+            request.execution_policy(),
+            expected_policy.as_ref().unwrap()
+        );
+        match call {
+            0 => {
+                assert_eq!(request.upstream_thread_ref(), None);
+                request.persist_upstream_thread_ref(PRIVATE_UPSTREAM_THREAD_REF)?;
+                request.persist_upstream_turn_ref("PRIVATE_INITIAL_TURN_REFERENCE")?;
+            }
+            1 => {
+                assert_eq!(
+                    request.upstream_thread_ref(),
+                    Some(PRIVATE_UPSTREAM_THREAD_REF)
+                );
+                request.persist_upstream_turn_ref("PRIVATE_FOLLOW_UP_TURN_REFERENCE")?;
+            }
+            _ => panic!("the boundary test scheduled an unexpected extra execution"),
+        }
+        Ok(super::ExecuteResult::new(
+            TurnTransition::Completed,
+            Vec::new(),
+        ))
+    }
+
+    fn observe_stop(
+        &self,
+        _subject: super::AdapterSubject<'_>,
+    ) -> Result<StopObservation, SatelleError> {
+        Ok(StopObservation::UpstreamInactiveConfirmed)
+    }
+
+    fn observe_recovery(
+        &self,
+        _subject: super::AdapterSubject<'_>,
+    ) -> Result<RecoveryObservation, SatelleError> {
+        Ok(RecoveryObservation::Unknown)
+    }
 }
 
 impl super::ComputerUseAdapter for ReferencePersistingAdapter {

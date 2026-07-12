@@ -108,9 +108,16 @@ impl RuntimeEngine {
         // The terminal storage compare-and-swap arbitrates with stop/recovery.
         let persist_upstream_ref =
             |reference| self.persist_upstream_ref(&plan.work.subject, reference);
+        let execution_policy = plan
+            .work
+            .session
+            .turn(&turn_id)
+            .ok_or_else(|| model::integrity_failure("the executing Turn is missing"))?
+            .execution_policy();
         let result = self.adapter.execute(ExecuteRequest::new(
             &plan.host,
             &plan.prompt,
+            execution_policy,
             AdapterSubject::new(&plan.work.subject),
             &persist_upstream_ref,
         ))?;

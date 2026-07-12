@@ -192,7 +192,7 @@ pub(super) fn probe_installed_control_plane() -> ControlPlaneProbe {
     )
 }
 
-pub(super) fn installed_app_server_command() -> Command {
+pub(crate) fn installed_app_server_command() -> Command {
     let mut command = Command::new("codex");
     // The Host owns this process through private pipes. No socket or public
     // listener exists at the upstream protocol seam.

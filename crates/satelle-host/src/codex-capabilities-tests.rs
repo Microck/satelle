@@ -377,6 +377,27 @@ fn version_probe_terminates_stdout_inheriting_descendants_after_leader_exit() {
     );
 }
 
+#[test]
+fn termination_reaps_an_already_exited_empty_process_group() {
+    let mut command = Command::new(
+        std::env::current_exe().expect("the current test executable should be available"),
+    );
+    command
+        .args(["--exact", "no_test_has_this_name", "--nocapture"])
+        .stdout(Stdio::piped());
+    let mut child = command.group_spawn().expect("spawn empty process group");
+    let mut stdout = child.inner().stdout.take().expect("capture child stdout");
+    let mut bytes = Vec::new();
+    stdout
+        .read_to_end(&mut bytes)
+        .expect("observe process-group leader exit");
+
+    assert!(
+        terminate_group(&mut child),
+        "an already-exited empty process group must be proven reaped"
+    );
+}
+
 #[cfg(unix)]
 #[test]
 fn version_probe_deadline_survives_a_group_escaping_pipe_holder() {

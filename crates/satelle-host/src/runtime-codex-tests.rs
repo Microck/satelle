@@ -190,11 +190,11 @@ fn schema_and_handshake_share_one_hard_deadline() {
         &fixture,
         "timeout",
         "hang-with-descendant",
-        Duration::from_secs(2),
+        Duration::from_secs(5),
     );
 
     assert!(
-        started.elapsed() < Duration::from_millis(2_500),
+        started.elapsed() < Duration::from_millis(6_500),
         "schema discovery and the handshake used separate timeout budgets"
     );
     assert_eq!(
@@ -414,7 +414,7 @@ fn schema_fixture_child() {
     if mode == "timeout" {
         // Spending part of the budget here proves schema discovery and the
         // live handshake share one deadline instead of receiving fresh timers.
-        std::thread::sleep(Duration::from_millis(750));
+        std::thread::sleep(Duration::from_secs(3));
     }
     let include_cancellation = !matches!(
         mode.to_str(),

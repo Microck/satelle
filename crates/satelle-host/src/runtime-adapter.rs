@@ -4,7 +4,6 @@ use satelle_core::session::{
     StopObservation, TurnStateRevision, TurnTransition,
 };
 use satelle_core::{ControlPlaneOperation, SatelleError, SatelleEvent, SessionId, TurnId};
-use std::sync::{Arc, RwLock};
 use thiserror::Error;
 
 /// Typed evidence returned before the runtime may durably admit work.
@@ -441,6 +440,7 @@ impl<'a> AdapterSubject<'a> {
 pub struct ExecuteRequest<'a> {
     host: &'a str,
     prompt: &'a str,
+    execution_policy: &'a ExecutionPolicy,
     subject: AdapterSubject<'a>,
     persist_upstream_ref: &'a dyn Fn(UpstreamReference) -> Result<(), SatelleError>,
 }
@@ -449,12 +449,14 @@ impl<'a> ExecuteRequest<'a> {
     pub(super) const fn new(
         host: &'a str,
         prompt: &'a str,
+        execution_policy: &'a ExecutionPolicy,
         subject: AdapterSubject<'a>,
         persist_upstream_ref: &'a dyn Fn(UpstreamReference) -> Result<(), SatelleError>,
     ) -> Self {
         Self {
             host,
             prompt,
+            execution_policy,
             subject,
             persist_upstream_ref,
         }
@@ -466,6 +468,20 @@ impl<'a> ExecuteRequest<'a> {
 
     pub const fn prompt(&self) -> &'a str {
         self.prompt
+    }
+
+    pub const fn execution_policy(&self) -> &'a ExecutionPolicy {
+        self.execution_policy
+    }
+
+    /// Returns the private Codex thread reference for a follow-up Turn. This
+    /// identity is available only at the trusted adapter boundary and never
+    /// enters public Session, event, log, or error contracts.
+    pub fn upstream_thread_ref(&self) -> Option<&'a str> {
+        self.subject
+            .subject
+            .upstream_thread_ref()
+            .map(crate::storage::PrivateUpstreamRef::as_str)
     }
 
     pub const fn subject(&self) -> AdapterSubject<'a> {
@@ -539,59 +555,25 @@ pub trait ComputerUseAdapter: Send + Sync + 'static {
     ) -> Result<RecoveryObservation, SatelleError>;
 }
 
-/// Production uses this adapter until the real Codex Computer Use adapter is
-/// available and admitted by the Phase 0 capability gate.
+#[cfg(test)]
 #[derive(Clone, Debug)]
 pub(crate) struct BlockedComputerUseAdapter {
-    state: BlockedComputerUseState,
+    error: SatelleError,
 }
 
-#[derive(Clone, Debug)]
-enum BlockedComputerUseState {
-    #[cfg(test)]
-    Static(SatelleError),
-    Production(Arc<RwLock<crate::ProductionCapabilitySnapshot>>),
-}
-
+#[cfg(test)]
 impl BlockedComputerUseAdapter {
-    #[cfg(test)]
     pub(crate) fn new(error: SatelleError) -> Self {
-        Self {
-            state: BlockedComputerUseState::Static(error),
-        }
-    }
-
-    pub(crate) fn production(snapshot: Arc<RwLock<crate::ProductionCapabilitySnapshot>>) -> Self {
-        Self {
-            state: BlockedComputerUseState::Production(snapshot),
-        }
+        Self { error }
     }
 
     fn blocked<T>(&self) -> Result<T, SatelleError> {
-        match &self.state {
-            #[cfg(test)]
-            BlockedComputerUseState::Static(error) => Err(error.clone()),
-            BlockedComputerUseState::Production(snapshot) => {
-                let snapshot = crate::read_production_snapshot(snapshot)?;
-                Err(crate::execution_blocker(&snapshot.verdict))
-            }
-        }
+        Err(self.error.clone())
     }
 }
 
+#[cfg(test)]
 impl ComputerUseAdapter for BlockedComputerUseAdapter {
-    fn admit_operation(&self, operation: ControlPlaneOperation) -> Result<(), SatelleError> {
-        match &self.state {
-            #[cfg(test)]
-            BlockedComputerUseState::Static(_) => Ok(()),
-            BlockedComputerUseState::Production(snapshot) => {
-                crate::read_production_snapshot(snapshot)?
-                    .control_plane_admission
-                    .admit(operation)
-            }
-        }
-    }
-
     fn preflight(&self, _host: &str) -> Result<AdapterReadiness, SatelleError> {
         self.blocked()
     }

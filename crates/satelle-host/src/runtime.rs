@@ -1,5 +1,7 @@
 #[path = "runtime-adapter.rs"]
 mod adapter;
+#[path = "runtime-codex-adapter.rs"]
+mod codex_adapter;
 #[path = "runtime-events.rs"]
 mod events;
 #[path = "runtime-model.rs"]
@@ -11,11 +13,11 @@ mod request;
 #[path = "runtime-worker.rs"]
 mod worker;
 
-pub(crate) use adapter::BlockedComputerUseAdapter;
 pub use adapter::{
     AdapterReadiness, AdapterSubject, ComputerUseAdapter, EvidenceError, ExecuteRequest,
     ExecuteResult, ProviderSmokeEvidence, ReadinessEvidence, RecoveryObservation,
 };
+pub(crate) use codex_adapter::ProductionComputerUseAdapter;
 pub(crate) use request::{LogQuery, RequestIdentity, RunCommand, SteerCommand, StopCommand};
 use worker::{ExecutionPlan, TurnWork, WorkerRegistry};
 

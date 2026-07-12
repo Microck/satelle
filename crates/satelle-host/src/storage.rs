@@ -206,6 +206,10 @@ impl PrivateUpstreamRef {
     pub(crate) fn new(value: impl Into<String>) -> Result<Self, StorageError> {
         validated_private_reference(value.into()).map(Self)
     }
+
+    pub(crate) fn as_str(&self) -> &str {
+        &self.0
+    }
 }
 
 impl fmt::Debug for PrivateUpstreamRef {
