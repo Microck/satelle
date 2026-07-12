@@ -5,9 +5,9 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 use completions::{CompletionsCommand, run_completions};
 use output::{OutputArgs, OutputFormat, SessionResultSchemaVersion, StatusReport};
 use satelle_core::{
-    BEACON_CORAL, CLI_NAME, DaemonPathOverrides, DoctorEventRecord, DoctorReport, ERROR_RED,
-    ErrorCode, HostConfig, HostSessionsReport, LOCAL_DEMO_HOST, LogEntry, PRODUCT_NAME,
-    ProfileField, RELAY_ROSE, ResolvedConfig, SUCCESS_GREEN, SatelleError, SessionId,
+    BEACON_CORAL, CLI_NAME, DaemonPathOverrides, DesktopSessionPreference, DoctorEventRecord,
+    DoctorReport, ERROR_RED, ErrorCode, HostConfig, HostSessionsReport, LOCAL_DEMO_HOST, LogEntry,
+    PRODUCT_NAME, ProfileField, RELAY_ROSE, ResolvedConfig, SUCCESS_GREEN, SatelleError, SessionId,
     SessionRecord, SetupReport, SetupRequiredInput, StopResult, TurnStatus, load_config,
     resolve_path_set, utc_now,
 };
@@ -1865,10 +1865,11 @@ fn show_host_sessions(
     format: OutputFormat,
 ) -> Result<(), CliFailure> {
     let json = format.is_json();
-    let (host, _) = config.resolve_host(command.host.as_deref(), json)?;
-    let report = transport
+    let (host, host_config) = config.resolve_host(command.host.as_deref(), json)?;
+    let mut report = transport
         .host_sessions(&host, command.no_bootstrap)
         .map_err(|error| failure(error, json))?;
+    apply_current_desktop_selection(&mut report, &host_config);
 
     if json {
         print_json(&report).map_err(|error| failure(error, json))
@@ -1894,6 +1895,49 @@ fn show_host_sessions(
             );
         }
         Ok(())
+    }
+}
+
+fn apply_current_desktop_selection(report: &mut HostSessionsReport, host: &HostConfig) {
+    for session in &mut report.sessions {
+        session.selected_by_current_config = false;
+    }
+
+    let native_selector = host
+        .desktop_session_native_selector
+        .as_ref()
+        .map(|selector| format!("{}:{}:{}", selector.platform, selector.kind, selector.value));
+    let selected_index = {
+        let mut matches = report
+            .sessions
+            .iter()
+            .enumerate()
+            .filter(|(_, session)| {
+                host.desktop_user
+                    .as_deref()
+                    .is_none_or(|user| user == session.desktop_user)
+            })
+            .filter(|(_, session)| {
+                if let Some(selector) = &native_selector {
+                    session.native_selectors.contains(selector)
+                } else {
+                    match host.desktop_session_preference {
+                        Some(DesktopSessionPreference::Console) => session.is_console,
+                        Some(DesktopSessionPreference::Only) | None => true,
+                    }
+                }
+            })
+            .map(|(index, _)| index);
+        let first = matches.next();
+        if matches.next().is_some() {
+            None
+        } else {
+            first
+        }
+    };
+
+    if let Some(index) = selected_index {
+        report.sessions[index].selected_by_current_config = true;
     }
 }
 
