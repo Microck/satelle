@@ -239,6 +239,8 @@ struct HostStartCommand {
 
 #[derive(Args, Debug)]
 struct HostStatusCommand {
+    #[arg(long)]
+    host: Option<String>,
     #[command(flatten)]
     output_args: OutputArgs,
 }
@@ -371,6 +373,8 @@ struct RunCommand {
 struct SteerCommand {
     session_id: String,
     #[arg(long)]
+    host: Option<String>,
+    #[arg(long)]
     detach: bool,
     #[arg(long)]
     quiet: bool,
@@ -407,6 +411,8 @@ struct SteerCommand {
 #[derive(Args, Debug)]
 struct StatusCommand {
     session_id: String,
+    #[arg(long)]
+    host: Option<String>,
     #[command(flatten)]
     output_args: OutputArgs,
 }
@@ -414,6 +420,8 @@ struct StatusCommand {
 #[derive(Args, Debug)]
 struct StopCommand {
     session_id: String,
+    #[arg(long)]
+    host: Option<String>,
     #[command(flatten)]
     output_args: OutputArgs,
 }
@@ -510,7 +518,7 @@ trait TransportClient {
         refresh: bool,
     ) -> Result<DoctorReport, SatelleError>;
 
-    fn host_status(&self) -> Result<HostStatus, SatelleError>;
+    fn host_status(&self, host: &str) -> Result<HostStatus, SatelleError>;
 
     fn host_sessions(
         &self,
@@ -522,17 +530,23 @@ trait TransportClient {
 
     fn run_detached(&self, host: &str, prompt: &str) -> Result<SessionRecord, SatelleError>;
 
-    fn steer(&self, session_id: &SessionId, prompt: &str) -> Result<TurnOutcome, SatelleError>;
+    fn steer(
+        &self,
+        host: &str,
+        session_id: &SessionId,
+        prompt: &str,
+    ) -> Result<TurnOutcome, SatelleError>;
 
     fn steer_detached(
         &self,
+        host: &str,
         session_id: &SessionId,
         prompt: &str,
     ) -> Result<SessionRecord, SatelleError>;
 
-    fn status(&self, session_id: &SessionId) -> Result<SessionRecord, SatelleError>;
+    fn status(&self, host: &str, session_id: &SessionId) -> Result<SessionRecord, SatelleError>;
 
-    fn stop(&self, session_id: &SessionId) -> Result<StopResult, SatelleError>;
+    fn stop(&self, host: &str, session_id: &SessionId) -> Result<StopResult, SatelleError>;
 
     fn logs(&self, host: &str) -> Result<Vec<LogEntry>, SatelleError>;
 }
@@ -574,7 +588,8 @@ impl TransportClient for LocalTransport {
         self.service.doctor(host, scope, refresh)
     }
 
-    fn host_status(&self) -> Result<HostStatus, SatelleError> {
+    fn host_status(&self, host: &str) -> Result<HostStatus, SatelleError> {
+        ensure_local_transport_host(host)?;
         self.service.host_status()
     }
 
@@ -594,28 +609,46 @@ impl TransportClient for LocalTransport {
         self.service.run_detached(host, prompt)
     }
 
-    fn steer(&self, session_id: &SessionId, prompt: &str) -> Result<TurnOutcome, SatelleError> {
+    fn steer(
+        &self,
+        host: &str,
+        session_id: &SessionId,
+        prompt: &str,
+    ) -> Result<TurnOutcome, SatelleError> {
+        ensure_local_transport_host(host)?;
         self.service.steer(session_id, prompt)
     }
 
     fn steer_detached(
         &self,
+        host: &str,
         session_id: &SessionId,
         prompt: &str,
     ) -> Result<SessionRecord, SatelleError> {
+        ensure_local_transport_host(host)?;
         self.service.steer_detached(session_id, prompt)
     }
 
-    fn status(&self, session_id: &SessionId) -> Result<SessionRecord, SatelleError> {
+    fn status(&self, host: &str, session_id: &SessionId) -> Result<SessionRecord, SatelleError> {
+        ensure_local_transport_host(host)?;
         self.service.status(session_id)
     }
 
-    fn stop(&self, session_id: &SessionId) -> Result<StopResult, SatelleError> {
+    fn stop(&self, host: &str, session_id: &SessionId) -> Result<StopResult, SatelleError> {
+        ensure_local_transport_host(host)?;
         self.service.stop(session_id)
     }
 
     fn logs(&self, host: &str) -> Result<Vec<LogEntry>, SatelleError> {
         self.service.logs(host)
+    }
+}
+
+fn ensure_local_transport_host(host: &str) -> Result<(), SatelleError> {
+    if host == LOCAL_DEMO_HOST {
+        Ok(())
+    } else {
+        Err(SatelleError::host_unreachable(host))
     }
 }
 
@@ -675,11 +708,11 @@ fn try_main() -> Result<(), CliFailure> {
         }
         Command::Status(command) => {
             let transport = local_transport(output)?;
-            show_status(command, &transport, output)
+            show_status(command, &transport, config, output)
         }
         Command::Stop(command) => {
             let transport = local_transport(output)?;
-            stop_session(command, &transport, output)
+            stop_session(command, &transport, config, output)
         }
         Command::Logs(command) => {
             let transport = local_transport(output)?;
@@ -1825,9 +1858,10 @@ fn run_host(
             ));
             Err(failure(error, json))
         }
-        HostCommand::Status(_) => {
+        HostCommand::Status(command) => {
+            let (host, _) = config.resolve_host(command.host.as_deref(), json)?;
             let status = transport
-                .host_status()
+                .host_status(&host)
                 .map_err(|error| failure(error, json))?;
             if json {
                 print_json(&status).map_err(|error| failure(error, json))
@@ -2111,24 +2145,16 @@ fn steer_prompt(
     let prompt = read_prompt(command.prompt, command.prompt_file, json)?;
     let session_id =
         SessionId::from_str(&command.session_id).map_err(|error| failure(error.into(), json))?;
-    let session = transport
-        .status(&session_id)
-        .map_err(|error| failure(error, json))?;
     let config = config_context.load(json)?;
-    let (_, host_config) = config
-        .resolve_host(Some(&session.host))
+    let (host, host_config) = config
+        .resolve_host(command.host.as_deref())
         .map_err(|error| failure(error, json))?;
     let effective_timeouts = effective_timeouts_json(&host_config);
-    let yolo_policy = resolve_yolo_policy(
-        &config,
-        &session.host,
-        &host_config,
-        command.yolo,
-        command.no_yolo,
-    );
+    let yolo_policy =
+        resolve_yolo_policy(&config, &host, &host_config, command.yolo, command.no_yolo);
     if command.detach {
         let session = transport
-            .steer_detached(&session_id, &prompt)
+            .steer_detached(&host, &session_id, &prompt)
             .map_err(|error| failure(error, json))?;
         return print_detached_session(
             session,
@@ -2140,7 +2166,7 @@ fn steer_prompt(
     }
 
     let outcome = transport
-        .steer(&session_id, &prompt)
+        .steer(&host, &session_id, &prompt)
         .map_err(|error| failure(error, json))?;
     print_turn_outcome(
         outcome,
@@ -2160,13 +2186,15 @@ fn steer_prompt(
 fn show_status(
     command: StatusCommand,
     transport: &impl TransportClient,
+    config: ConfigContext<'_>,
     format: OutputFormat,
 ) -> Result<(), CliFailure> {
     let json = format.is_json();
     let session_id =
         SessionId::from_str(&command.session_id).map_err(|error| failure(error.into(), json))?;
+    let (host, _) = config.resolve_host(command.host.as_deref(), json)?;
     let session = transport
-        .status(&session_id)
+        .status(&host, &session_id)
         .map_err(|error| failure(error, json))?;
 
     if json {
@@ -2180,13 +2208,15 @@ fn show_status(
 fn stop_session(
     command: StopCommand,
     transport: &impl TransportClient,
+    config: ConfigContext<'_>,
     format: OutputFormat,
 ) -> Result<(), CliFailure> {
     let json = format.is_json();
     let session_id =
         SessionId::from_str(&command.session_id).map_err(|error| failure(error.into(), json))?;
+    let (host, _) = config.resolve_host(command.host.as_deref(), json)?;
     let result = transport
-        .stop(&session_id)
+        .stop(&host, &session_id)
         .map_err(|error| failure(error, json))?;
 
     if json {
@@ -2220,34 +2250,12 @@ fn show_logs(
         .map(SessionId::from_str)
         .transpose()
         .map_err(|error| failure(error.into(), json))?;
-    let (host, _) = if let Some(session_id) = &session_id {
-        let session = transport
-            .status(session_id)
+    let (host, _) = config.resolve_host(command.host.as_deref(), json)?;
+    if let Some(session_id) = &session_id {
+        transport
+            .status(&host, session_id)
             .map_err(|error| failure(error, json))?;
-        (
-            session.host,
-            satelle_core::HostConfig {
-                transport: satelle_core::TransportKind::Local,
-                adapter: satelle_core::AdapterKind::Codex,
-                address: None,
-                network: None,
-                timeouts: None,
-                desktop_user: None,
-                desktop_session_preference: None,
-                desktop_session_native_selector: None,
-                daemon_home: None,
-                daemon_config_file: None,
-                daemon_state_dir: None,
-                daemon_cache_dir: None,
-                daemon_log_dir: None,
-                experimental_provider_computer_use: None,
-                yolo: None,
-                provider_auth: BTreeMap::new(),
-            },
-        )
-    } else {
-        config.resolve_host(command.host.as_deref(), json)?
-    };
+    }
 
     let tail = match command.tail {
         Some(1..=10_000) => command.tail,
