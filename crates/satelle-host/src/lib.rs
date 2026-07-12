@@ -1,6 +1,8 @@
 #[path = "api-auth.rs"]
 mod api_auth;
 mod codex_capabilities;
+#[path = "codex-session.rs"]
+mod codex_session;
 mod daemon;
 #[path = "live-events.rs"]
 mod live_events;
@@ -33,7 +35,7 @@ pub use runtime::{
     ExecuteResult, ProviderSmokeEvidence, ReadinessEvidence, RecoveryObservation,
 };
 use runtime::{
-    BlockedComputerUseAdapter, LogQuery, RunCommand, RuntimeHandle, SteerCommand, StopCommand,
+    LogQuery, ProductionComputerUseAdapter, RunCommand, RuntimeHandle, SteerCommand, StopCommand,
 };
 use satelle_core::{
     DaemonPathOverrides, DoctorFinding, DoctorFixability, DoctorProbeResult, DoctorReport,
@@ -122,9 +124,14 @@ impl HostService {
     /// constructor retains only typed, diagnostic-safe capability evidence.
     pub fn production() -> Self {
         let snapshot = Arc::new(RwLock::new(ProductionCapabilitySnapshot::collect()));
-        let adapter = BlockedComputerUseAdapter::production(Arc::clone(&snapshot));
+        let state_root = satelle_core::state_dir();
+        let working_directory = state_root
+            .as_ref()
+            .map(|path| path.join("codex-app-server-work"))
+            .map_err(Clone::clone);
+        let adapter = ProductionComputerUseAdapter::new(Arc::clone(&snapshot), working_directory);
         Self {
-            runtime: RuntimeHandle::new(satelle_core::state_dir(), adapter),
+            runtime: RuntimeHandle::new(state_root, adapter),
             mode: HostMode::Production { snapshot },
         }
     }
@@ -677,7 +684,10 @@ mod tests {
             let state = TestStateDir::new().expect("temporary state directory should exist");
             let state_path = state.path().join(format!("{name}.json"));
             let snapshot = Arc::new(RwLock::new(capability_snapshot(evidence, 7)));
-            let adapter = BlockedComputerUseAdapter::production(Arc::clone(&snapshot));
+            let adapter = ProductionComputerUseAdapter::new(
+                Arc::clone(&snapshot),
+                Ok(state.path().join("codex-app-server-work")),
+            );
             let service = HostService {
                 runtime: RuntimeHandle::new(Ok(state.path().to_path_buf()), adapter),
                 mode: HostMode::Production { snapshot },
@@ -736,7 +746,10 @@ mod tests {
             duration_ms: 7,
         };
         let snapshot = Arc::new(RwLock::new(initial));
-        let adapter = BlockedComputerUseAdapter::production(Arc::clone(&snapshot));
+        let adapter = ProductionComputerUseAdapter::new(
+            Arc::clone(&snapshot),
+            Ok(state.path().join("codex-app-server-work")),
+        );
         let shared_snapshot = Arc::clone(&snapshot);
         let service = HostService {
             runtime: RuntimeHandle::new(Ok(state.path().to_path_buf()), adapter),

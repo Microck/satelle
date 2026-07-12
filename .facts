@@ -1767,6 +1767,32 @@
 - satelle clients communicate with a Satelle-specific API instead of speaking the Codex app-server protocol directly @spec @mvp @implemented
 - satelle Host Daemon treats the Codex app-server protocol as an internal adapter boundary behind the Satelle API @spec @mvp @implemented
 - satelle API exposes host readiness, sessions, goals, turns, state, logs, and errors as Satelle concepts independent from Codex protocol details @spec @mvp
+- a first Satelle Turn starts one Codex thread, while a follow-up Turn resumes the Session's persisted private Codex thread reference before starting another Codex turn @implemented @mvp
+- the runtime passes the committed Turn Execution Policy and any persisted private Codex thread reference to the adapter before app-server execution begins @spec @mvp @implemented
+- the private Codex app-server process starts in an owner-private Host Daemon working directory whose canonical path is outside every detected project checkout, including when configured ancestors are symlinks @implemented @mvp
+- private Codex thread start and resume requests omit a project working-directory parameter @implemented @mvp
+- private WorkspaceWrite Codex turns use the owner-private Host Daemon working directory as their only writable root @implemented @mvp
+- one private Codex app-server execution session owns exactly one stdio child process @implemented @mvp
+- one hard deadline covers the private Codex app-server execution session from process spawn through terminal observation @implemented @mvp
+- the private Codex app-server execution session performs initialize and initialized before thread start or resume, performs thread start or resume before turn start, and observes a terminal Turn only after turn start @implemented @mvp
+- every private Codex app-server execution-session return path terminates and reaps the complete owned process group @implemented @mvp
+- failure to prove private Codex app-server process-group containment always surfaces as a remote execution error instead of an ordinary terminal Turn outcome @implemented @mvp
+- the private Codex app-server execution session accepts only one response for each outstanding request id and rejects unknown, duplicate, or out-of-order responses @implemented @mvp
+- private Codex app-server messages containing both id and method are handled as server requests before outbound response-id matching @implemented @mvp
+- turn-scoped Codex app-server requests must match the active private thread and turn before Satelle responds @implemented @mvp
+- documented Codex app-server approval and elicitation requests are declined when no Satelle interactive relay is active @implemented @mvp
+- unsupported Codex app-server requests receive a closed JSON-RPC method-not-supported response without echoing raw parameters @implemented @mvp
+- Codex thread and turn identifiers are accepted only from correlated responses or matching lifecycle notifications @implemented @mvp
+- each accepted private Codex thread or turn identifier is durably persisted before the execution session consumes a later message that depends on that identifier @implemented @mvp
+- conflicting Codex thread or turn identifiers fail the private execution session closed @implemented @mvp
+- the private Codex app-server execution session recognizes only inProgress, completed, interrupted, and failed upstream Turn status tokens @implemented @mvp
+- a terminal Codex notification must identify the active private thread and turn before it can produce a closed Completed, Interrupted, or Failed execution outcome @implemented @mvp
+- unknown Codex app-server notifications are no-ops that do not change execution-session identity, status, persistence, events, logs, or errors @implemented @mvp
+- malformed or larger-than-2-MiB Codex app-server JSON lines fail the private execution session closed @implemented @mvp
+- Codex app-server EOF, timeout, or process exit before a matching terminal Turn fails the private execution session closed @implemented @mvp
+- a contained private app-server failure before turn dispatch commits the Satelle Turn as failed without entering recovery pending @implemented @mvp
+- a private app-server failure during or after turn dispatch keeps the Satelle Turn recovery pending until upstream ownership is reconciled @implemented @mvp
+- private Codex app-server protocol failures expose only closed sanitized reasons and never raw messages, item payloads, prompts, thread identifiers, or turn identifiers @implemented @mvp
 
 ## capabilities
 - satelle reports Codex runtime availability, native Computer Use availability, and model-provider compatibility as separate host capabilities @spec @mvp
