@@ -1981,6 +1981,18 @@ impl SatelleError {
         }
     }
 
+    pub fn host_unreachable(alias: &str) -> Self {
+        let mut details = BTreeMap::new();
+        details.insert("host".to_string(), Value::String(alias.to_string()));
+        Self {
+            code: ErrorCode::HostUnreachable,
+            message: format!("host '{alias}' is configured but unreachable"),
+            recovery_command: Some("satelle config check --json".to_string()),
+            source_detail: None,
+            details,
+        }
+    }
+
     pub fn host_busy(host: &str, active_session_id: &SessionId) -> Self {
         let mut details = BTreeMap::new();
         details.insert("host".to_string(), Value::String(host.to_string()));
