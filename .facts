@@ -750,7 +750,7 @@
 - authenticated Host Daemon requests use Satelle-Request-Id for caller-supplied UUIDv7 correlation and Satelle-Expected-Host-Identity for Host pinning; neither header grants authority or idempotency @spec @contract @mvp @implemented
 - authenticated Host Daemon HTTP requests without Satelle-Request-Id receive a generated canonical UUIDv7 except GET /v1/events, whose WebSocket upgrade contract requires a caller-supplied Satelle-Request-Id; malformed or duplicate supplied request-id headers are rejected @spec @contract @mvp @implemented
 - satelle Host Daemon MVP uses GET /v1/live, GET /v1/capabilities, GET /v1/host/status, GET /v1/host/desktop-sessions, POST /v1/setup, POST /v1/doctor, POST /v1/sessions, POST /v1/sessions/{session_id}/turns, GET /v1/sessions/{session_id}, POST /v1/sessions/{session_id}/stop, GET /v1/logs, and GET /v1/events as its canonical route set and exposes no run, steer, blocking-run, SSE, or HTTP logs-follow aliases @spec @contract @mvp
-- Host Daemon response schemas use the exact tokens satelle.capabilities.v1, satelle.host.status.v1, satelle.host.desktop-sessions.v1, satelle.logs.page.v1, and satelle.ws.control.v1 for their corresponding v1 surfaces @contract @mvp @implemented
+- Host Daemon response schemas use the exact tokens satelle.capabilities.v2, satelle.host.status.v1, satelle.host.desktop-sessions.v1, satelle.logs.page.v1, and satelle.ws.control.v1 for their corresponding versioned surfaces @contract @mvp @implemented
 - GET /v1/logs accepts only the query fields mode, cursor, limit, session_id, sources, minimum_severity, and since; unknown fields, duplicate singleton fields, empty source tokens, and duplicate source tokens report a typed invalid-request error @spec @contract @mvp @implemented
 - GET /v1/logs mode is tail or forward, defaults to tail, and permits cursor only with forward mode @spec @contract @mvp @implemented
 - GET /v1/logs limit defaults to 200 and accepts only integers from 1 through 10000 inclusive @spec @contract @mvp @implemented
@@ -789,14 +789,14 @@
 - reusing an idempotency key with a different request digest fails with a typed idempotency-key-conflict error @mvp @implemented
 - Satelle Idempotency Records are retained for at least 24 hours after their operation becomes terminal @mvp @implemented
 - a successful mutating API response is emitted only after the corresponding state and Idempotency Record are durably committed @mvp @implemented
-- the authenticated capabilities response advertises effective JSON body, attachment, WebSocket message, connection, and operation-concurrency limits @spec @mvp
+- the authenticated satelle.capabilities.v2 response advertises the effective JSON body, attachment, WebSocket, connection, operation-concurrency, failed-authentication, authenticated-read, and control-request limits that the Host Daemon enforces @contract @mvp @implemented
 - requests exceeding a body or attachment limit fail before prompt execution with a typed payload-too-large error @spec @mvp
 - requests exceeding an operation or connection capacity limit fail with a typed capacity-exceeded error @spec @mvp
 - failed authentication attempts are limited to 10 per minute per network source by default @mvp @implemented
-- failed-authentication rate limiting derives network source from the transport peer address and ignores Forwarded, X-Forwarded-For, and equivalent headers by default @spec @mvp
+- failed-authentication rate limiting derives network source from the transport peer address and ignores Forwarded, X-Forwarded-For, and equivalent headers by default @mvp @implemented
 - Satelle trusts forwarded client addresses only from an explicit Host-owned trusted-proxy allowlist and derives the client source from the nearest untrusted hop @spec @mvp
 - authenticated read operations are limited to 600 requests per minute per API Principal by default @mvp @implemented
-- authenticated control and admin operations are limited to 120 requests per minute per API Principal by default @mvp @spec
+- authenticated control and admin operations are limited to 120 requests per minute per API Principal by default @mvp @implemented
 - API rate limits are configurable only through Host-owned or user-level configuration and cannot be weakened by project-level configuration @spec @mvp
 - rate-limited responses use the typed rate-limited error and include retry_after_ms when retry timing is known @contract @mvp @implemented
 - satelle Host Daemon does not log raw HTTP request bodies, Authorization headers, prompt text, or attachment bytes @spec @mvp
