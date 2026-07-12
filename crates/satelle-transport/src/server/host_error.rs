@@ -3,7 +3,7 @@ use super::{ApiFailure, DaemonState, api_error_response};
 use crate::contract::{ApiErrorCategory, ApiErrorCode};
 use axum::http::StatusCode;
 use axum::response::Response;
-use satelle_core::{ErrorCode, SatelleError};
+use satelle_core::{ErrorCode, IncompatibleControlPlaneDetails, SatelleError};
 
 pub(super) fn response(
     state: &DaemonState,
@@ -113,6 +113,14 @@ fn failure(error: &SatelleError) -> ApiFailure {
             message: "the Host is already controlling its authorized desktop",
             details: None,
         },
+        ErrorCode::IncompatibleControlPlane => ApiFailure {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            code: ApiErrorCode::IncompatibleControlPlane,
+            category: ApiErrorCategory::Readiness,
+            retryable: false,
+            message: "the Codex control plane cannot admit this operation",
+            details: validated_control_plane_details(error),
+        },
         ErrorCode::ComputerUseNotReady | ErrorCode::DoctorReadinessBlockersFound => ApiFailure {
             status: StatusCode::SERVICE_UNAVAILABLE,
             code: ApiErrorCode::ComputerUseNotReady,
@@ -175,5 +183,71 @@ fn failure(error: &SatelleError) -> ApiFailure {
             message: "the Host does not implement the requested operation",
             details: None,
         },
+    }
+}
+
+fn validated_control_plane_details(error: &SatelleError) -> Option<serde_json::Value> {
+    let value = serde_json::Value::Object(error.details.clone().into_iter().collect());
+    let details = serde_json::from_value::<IncompatibleControlPlaneDetails>(value).ok()?;
+    serde_json::to_value(details).ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use satelle_core::{
+        ControlPlaneCapability, ControlPlaneFailureReason, ControlPlaneOperation,
+        IncompatibleControlPlaneDetails,
+    };
+    use serde_json::json;
+    use std::collections::BTreeMap;
+
+    #[test]
+    fn incompatible_control_plane_is_a_sanitized_readiness_failure() {
+        let details = IncompatibleControlPlaneDetails::new(
+            ControlPlaneOperation::Run,
+            ControlPlaneFailureReason::RequiredCapabilityMissing,
+            &[ControlPlaneCapability::EventObservation],
+        )
+        .unwrap();
+        let failure = failure(&SatelleError::incompatible_control_plane(details));
+
+        assert_eq!(failure.status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(failure.code, ApiErrorCode::IncompatibleControlPlane);
+        assert_eq!(failure.category, ApiErrorCategory::Readiness);
+        assert!(!failure.retryable);
+        assert_eq!(
+            failure.details,
+            Some(json!({
+                "operation": "run",
+                "reason": "required_capability_missing",
+                "required_capabilities": [
+                    "session_creation",
+                    "turn_start",
+                    "event_observation"
+                ],
+                "missing_capabilities": ["event_observation"]
+            }))
+        );
+    }
+
+    #[test]
+    fn malformed_internal_details_never_cross_the_http_boundary() {
+        let error = SatelleError {
+            code: ErrorCode::IncompatibleControlPlane,
+            message: "PRIVATE_MESSAGE_CANARY".to_string(),
+            recovery_command: None,
+            source_detail: Some("PRIVATE_SOURCE_CANARY".to_string()),
+            details: BTreeMap::from([("raw_message".to_string(), json!("PRIVATE_DETAILS_CANARY"))]),
+        };
+
+        let mapped = failure(&error);
+
+        assert_eq!(mapped.status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(mapped.code, ApiErrorCode::IncompatibleControlPlane);
+        assert_eq!(mapped.category, ApiErrorCategory::Readiness);
+        assert!(!mapped.retryable);
+        assert_eq!(mapped.details, None);
+        assert!(!mapped.message.contains("PRIVATE_"));
     }
 }

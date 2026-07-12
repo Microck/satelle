@@ -4,7 +4,7 @@ use super::adapter::{AdapterSubject, RecoveryObservation};
 use super::{RuntimeEngine, model};
 use crate::storage::{RecoverySubject, StorageErrorKind};
 use satelle_core::session::{TurnState, TurnTransition};
-use satelle_core::{SatelleError, SessionId, TurnId};
+use satelle_core::{ControlPlaneOperation, SatelleError, SessionId, TurnId};
 use std::collections::VecDeque;
 use std::sync::MutexGuard;
 
@@ -62,6 +62,12 @@ impl RuntimeEngine {
 
             // The key remains in-flight, but no mutex is held while the
             // adapter inspects external ownership.
+            if let Err(error) = self.adapter.admit_operation(ControlPlaneOperation::Status) {
+                if self.restore_recovery_subject(subject)? {
+                    return Err(error);
+                }
+                continue;
+            }
             let observation = match self.adapter.observe_recovery(AdapterSubject::new(&subject)) {
                 Ok(observation) => observation,
                 Err(error) => {

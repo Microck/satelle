@@ -411,6 +411,83 @@ fn restart_marks_active_turn_recovery_pending_and_retains_lease() {
 }
 
 #[test]
+fn replay_only_open_preserves_running_state_before_external_admission() {
+    let state = TempDir::new().expect("temporary state directory");
+    let (mut storage, _) = Storage::open(state.path()).expect("open storage");
+    let session = initial_session(&storage, SESSION_1, TURN_1, at(0));
+    let run = admission(
+        IdempotentOperation::Run,
+        "run-replay-only",
+        "request-replay-only",
+        at(0),
+    );
+    storage.begin_session(&session, &run).unwrap();
+    storage
+        .commit_lifecycle(
+            session.id(),
+            &turn_id(TURN_1),
+            revisions(&session, TURN_1),
+            TurnTransition::Running,
+            at(1),
+        )
+        .unwrap();
+
+    let persisted_state = |connection: &rusqlite::Connection| {
+        let lifecycle = connection
+            .query_row(
+                "SELECT sessions.session_state_revision, turns.turn_state_revision, turns.state, control_leases.lease_state \
+                 FROM sessions JOIN turns USING (session_id) JOIN control_leases USING (session_id, turn_id) \
+                 WHERE sessions.session_id = ?1",
+                [SESSION_1],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                    ))
+                },
+            )
+            .unwrap();
+        let idempotency = connection
+            .query_row(
+                "SELECT status, durable_outcome FROM idempotency_records \
+                 WHERE operation = 'run' AND idempotency_key = 'run-replay-only'",
+                [],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .unwrap();
+        let recovery_logs = connection
+            .query_row(
+                "SELECT count(*) FROM logs WHERE event_kind = 'restart_recovery_pending'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap();
+        (lifecycle, idempotency, recovery_logs)
+    };
+    let before = persisted_state(&storage.connection);
+    assert_eq!(before.0.2, "running");
+    assert_eq!(before.0.3, "active");
+    assert_eq!(
+        before.1,
+        ("in_progress".to_string(), "v1.turn.running".to_string())
+    );
+    assert_eq!(before.2, 0);
+    drop(storage);
+
+    let storage = Storage::open_without_restart_recovery(state.path())
+        .expect("replay-only open should validate without lifecycle mutation");
+    assert!(
+        storage
+            .replay_admission_if_present(IdempotentOperation::Run, run.idempotency(), None)
+            .expect("read the durable replay")
+            .is_some()
+    );
+    assert_eq!(persisted_state(&storage.connection), before);
+}
+
+#[test]
 fn begin_stop_claims_before_observation_and_confirmed_stop_releases_lease() {
     let state = TempDir::new().expect("temporary state directory");
     let (mut storage, _) = Storage::open(state.path()).expect("open storage");

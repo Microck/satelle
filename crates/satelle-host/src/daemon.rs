@@ -250,15 +250,17 @@ impl HostService {
             .append_log_for_tests(timestamp, source, severity)
     }
 
-    pub fn daemon_runtime_capabilities(&self) -> DaemonRuntimeCapabilities {
+    pub fn daemon_runtime_capabilities(&self) -> Result<DaemonRuntimeCapabilities, SatelleError> {
         match &self.mode {
-            HostMode::Production { snapshot } => production_capabilities(snapshot),
+            HostMode::Production { snapshot } => Ok(production_capabilities(
+                &*crate::read_production_snapshot(snapshot)?,
+            )),
             #[cfg(any(test, feature = "test-support"))]
-            HostMode::TestFake => DaemonRuntimeCapabilities {
+            HostMode::TestFake => Ok(DaemonRuntimeCapabilities {
                 codex_runtime: false,
                 native_computer_use: false,
                 provider_computer_use: false,
-            },
+            }),
         }
     }
 

@@ -1,4 +1,8 @@
 use command_group::CommandGroup;
+use satelle_core::{
+    ControlPlaneCapability, ControlPlaneCapabilitySet, ControlPlaneFailureReason,
+    ControlPlaneOperation, IncompatibleControlPlaneDetails, SatelleError,
+};
 use serde_json::{Value, json};
 use std::fs::File;
 use std::io::{BufRead, BufReader, Read, Write};
@@ -8,7 +12,6 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use thiserror::Error;
 
 const SCHEMA_FILE_LIMIT: u64 = 2 * 1024 * 1024;
 const HANDSHAKE_LINE_LIMIT: u64 = 64 * 1024;
@@ -24,86 +27,11 @@ const REQUIRED_LIFECYCLE_NOTIFICATIONS: [&str; 5] = [
     "item/completed",
     "turn/completed",
 ];
-/// The stable Satelle operations that the Codex control plane must support.
-/// Upstream method spellings stay private to this module.
-pub(super) const REQUIRED_OPERATION_CAPABILITIES: [RequiredOperationCapability; 6] = [
-    RequiredOperationCapability::SessionCreation,
-    RequiredOperationCapability::TurnStart,
-    RequiredOperationCapability::EventObservation,
-    RequiredOperationCapability::Steering,
-    RequiredOperationCapability::Status,
-    RequiredOperationCapability::Cancellation,
-];
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) enum RequiredOperationCapability {
-    SessionCreation,
-    TurnStart,
-    EventObservation,
-    Steering,
-    Status,
-    Cancellation,
-}
-
-impl RequiredOperationCapability {
-    const fn index(self) -> usize {
-        match self {
-            Self::SessionCreation => 0,
-            Self::TurnStart => 1,
-            Self::EventObservation => 2,
-            Self::Steering => 3,
-            Self::Status => 4,
-            Self::Cancellation => 5,
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) enum IncompatibleControlPlaneReason {
-    SchemaUnavailable,
-    HandshakeUnavailable,
-    MissingRequiredCapability,
-}
-
-/// A closed incompatibility error. It never retains raw schema bytes, process
-/// output, app-server messages, upstream identifiers, or method names.
-#[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
-#[error("the Codex control plane is incompatible with {capability:?}: {reason:?}")]
-pub(super) struct IncompatibleControlPlane {
-    reason: IncompatibleControlPlaneReason,
-    capability: RequiredOperationCapability,
-}
-
-impl IncompatibleControlPlane {
-    #[cfg(test)]
-    pub(super) const fn reason(self) -> IncompatibleControlPlaneReason {
-        self.reason
-    }
-
-    #[cfg(test)]
-    pub(super) const fn capability(self) -> RequiredOperationCapability {
-        self.capability
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct OperationCapabilities([bool; REQUIRED_OPERATION_CAPABILITIES.len()]);
-
-impl OperationCapabilities {
-    const fn none() -> Self {
-        Self([false; REQUIRED_OPERATION_CAPABILITIES.len()])
-    }
-
-    const fn contains(self, capability: RequiredOperationCapability) -> bool {
-        self.0[capability.index()]
-    }
-}
-
 /// Sanitized result of schema discovery plus a live initialize/initialized
 /// exchange over a private stdio child process.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) struct ControlPlaneProbe {
-    operations: OperationCapabilities,
+pub(crate) struct ControlPlaneProbe {
+    operations: ControlPlaneCapabilitySet,
     schema_available: bool,
     handshake_completed: bool,
 }
@@ -111,33 +39,73 @@ pub(super) struct ControlPlaneProbe {
 impl ControlPlaneProbe {
     const fn unavailable() -> Self {
         Self {
-            operations: OperationCapabilities::none(),
+            operations: ControlPlaneCapabilitySet::EMPTY,
             schema_available: false,
             handshake_completed: false,
         }
     }
 
-    pub(super) fn require(
-        self,
-        capability: RequiredOperationCapability,
-    ) -> Result<(), IncompatibleControlPlane> {
-        let reason = if !self.schema_available {
-            Some(IncompatibleControlPlaneReason::SchemaUnavailable)
-        } else if !self.operations.contains(capability) {
-            Some(IncompatibleControlPlaneReason::MissingRequiredCapability)
-        } else if !self.handshake_completed {
-            Some(IncompatibleControlPlaneReason::HandshakeUnavailable)
-        } else {
-            None
-        };
-
-        reason.map_or(Ok(()), |reason| {
-            Err(IncompatibleControlPlane { reason, capability })
-        })
+    pub(super) const fn supports(self, capability: ControlPlaneCapability) -> bool {
+        self.schema_available && self.handshake_completed && self.operations.contains(capability)
     }
 
     pub(super) const fn handshake_completed(self) -> bool {
         self.handshake_completed
+    }
+}
+
+/// Sanitized admission evidence retained by the production adapter. It stores
+/// only closed failure reasons and capability bits, never upstream method
+/// names, schema bytes, process output, or app-server messages.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ControlPlaneAdmission {
+    NotApplicable,
+    Unavailable(ControlPlaneFailureReason),
+    Probed(ControlPlaneProbe),
+}
+
+impl ControlPlaneAdmission {
+    pub(crate) const fn not_applicable() -> Self {
+        Self::NotApplicable
+    }
+
+    pub(crate) const fn unavailable(reason: ControlPlaneFailureReason) -> Self {
+        Self::Unavailable(reason)
+    }
+
+    pub(crate) const fn from_probe(probe: ControlPlaneProbe) -> Self {
+        Self::Probed(probe)
+    }
+
+    pub(crate) fn admit(self, operation: ControlPlaneOperation) -> Result<(), SatelleError> {
+        let required = operation.required_capabilities();
+        let (reason, missing) = match self {
+            Self::NotApplicable => return Ok(()),
+            Self::Unavailable(reason) => (reason, Vec::new()),
+            Self::Probed(probe) if !probe.schema_available => {
+                (ControlPlaneFailureReason::SchemaUnavailable, Vec::new())
+            }
+            Self::Probed(probe) if !probe.handshake_completed => {
+                (ControlPlaneFailureReason::HandshakeUnavailable, Vec::new())
+            }
+            Self::Probed(probe) => {
+                let missing = required
+                    .iter()
+                    .copied()
+                    .filter(|capability| !probe.operations.contains(*capability))
+                    .collect::<Vec<_>>();
+                if missing.is_empty() {
+                    return Ok(());
+                }
+                (
+                    ControlPlaneFailureReason::RequiredCapabilityMissing,
+                    missing,
+                )
+            }
+        };
+        let details = IncompatibleControlPlaneDetails::new(operation, reason, &missing)
+            .expect("the closed operation capability matrix is internally consistent");
+        Err(SatelleError::incompatible_control_plane(details))
     }
 }
 
@@ -149,7 +117,7 @@ impl super::CapabilityMatrix {
         );
         let stable = |capability| {
             super::CapabilityEvidence::new(
-                if probe.require(capability).is_ok() {
+                if probe.supports(capability) {
                     super::EvidenceSurface::Stable
                 } else {
                     super::EvidenceSurface::Absent
@@ -174,14 +142,14 @@ impl super::CapabilityMatrix {
 
         Self {
             handshake,
-            session_thread_creation: stable(RequiredOperationCapability::SessionCreation),
-            turn_start: stable(RequiredOperationCapability::TurnStart),
-            lifecycle_events: stable(RequiredOperationCapability::EventObservation),
+            session_thread_creation: stable(ControlPlaneCapability::SessionCreation),
+            turn_start: stable(ControlPlaneCapability::TurnStart),
+            lifecycle_events: stable(ControlPlaneCapability::EventObservation),
             approval_observation: unobserved,
             native_readiness: unobserved,
             native_harmless_action: unobserved,
-            recovery: if probe.require(RequiredOperationCapability::Status).is_ok()
-                && probe.require(RequiredOperationCapability::Steering).is_ok()
+            recovery: if probe.supports(ControlPlaneCapability::Status)
+                && probe.supports(ControlPlaneCapability::Steering)
             {
                 super::CapabilityEvidence::new(
                     super::EvidenceSurface::Stable,
@@ -190,17 +158,13 @@ impl super::CapabilityMatrix {
             } else {
                 unobserved
             },
-            follow_up_turn: stable_unobserved(RequiredOperationCapability::Steering),
+            follow_up_turn: stable_unobserved(ControlPlaneCapability::Steering),
             // Detached ownership is a Host Daemon behavior, not a method in
             // the upstream schema. It remains unproven until the live journey.
             detached_turn_ownership: unobserved,
-            interrupt_request: stable(RequiredOperationCapability::Cancellation),
-            confirmed_stop: if probe
-                .require(RequiredOperationCapability::Cancellation)
-                .is_ok()
-                && probe
-                    .require(RequiredOperationCapability::EventObservation)
-                    .is_ok()
+            interrupt_request: stable(ControlPlaneCapability::Cancellation),
+            confirmed_stop: if probe.supports(ControlPlaneCapability::Cancellation)
+                && probe.supports(ControlPlaneCapability::EventObservation)
             {
                 super::CapabilityEvidence::new(
                     super::EvidenceSurface::Stable,
@@ -301,30 +265,29 @@ impl StableProtocolSchema {
         })
     }
 
-    fn operation_capabilities(&self) -> OperationCapabilities {
-        OperationCapabilities(REQUIRED_OPERATION_CAPABILITIES.map(|capability| {
-            match capability {
-                RequiredOperationCapability::SessionCreation => {
+    fn operation_capabilities(&self) -> ControlPlaneCapabilitySet {
+        ControlPlaneCapability::ALL
+            .into_iter()
+            .filter(|capability| match capability {
+                ControlPlaneCapability::SessionCreation => {
                     self.client_requests.declares("thread/start")
                 }
-                RequiredOperationCapability::TurnStart => {
-                    self.client_requests.declares("turn/start")
-                }
-                RequiredOperationCapability::EventObservation => REQUIRED_LIFECYCLE_NOTIFICATIONS
+                ControlPlaneCapability::TurnStart => self.client_requests.declares("turn/start"),
+                ControlPlaneCapability::EventObservation => REQUIRED_LIFECYCLE_NOTIFICATIONS
                     .iter()
                     .all(|method| self.server_notifications.declares(method)),
                 // Public Satelle steering starts a follow-up Turn on the same
                 // thread. It does not map to upstream in-flight turn/steer.
-                RequiredOperationCapability::Steering => {
+                ControlPlaneCapability::Steering => {
                     self.client_requests.declares("turn/start")
                         && self.client_requests.declares("thread/resume")
                 }
-                RequiredOperationCapability::Status => self.client_requests.declares("thread/read"),
-                RequiredOperationCapability::Cancellation => {
+                ControlPlaneCapability::Status => self.client_requests.declares("thread/read"),
+                ControlPlaneCapability::Cancellation => {
                     self.client_requests.declares("turn/interrupt")
                 }
-            }
-        }))
+            })
+            .collect()
     }
 }
 

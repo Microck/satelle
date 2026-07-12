@@ -1,7 +1,7 @@
 use super::control_plane::{
-    IncompatibleControlPlaneReason, REQUIRED_OPERATION_CAPABILITIES, RequiredOperationCapability,
-    installed_app_server_command, probe_control_plane_with,
+    ControlPlaneAdmission, installed_app_server_command, probe_control_plane_with,
 };
+use satelle_core::{ControlPlaneCapability, ControlPlaneOperation, ErrorCode};
 use serde_json::json;
 use std::fs::File;
 use std::path::{Path, PathBuf};
@@ -107,33 +107,34 @@ fn spawn_escaped_descendant() {
 #[test]
 fn required_method_set_is_exact_and_missing_capabilities_are_typed() {
     assert_eq!(
-        REQUIRED_OPERATION_CAPABILITIES,
+        ControlPlaneCapability::ALL,
         [
-            RequiredOperationCapability::SessionCreation,
-            RequiredOperationCapability::TurnStart,
-            RequiredOperationCapability::EventObservation,
-            RequiredOperationCapability::Steering,
-            RequiredOperationCapability::Status,
-            RequiredOperationCapability::Cancellation,
+            ControlPlaneCapability::SessionCreation,
+            ControlPlaneCapability::TurnStart,
+            ControlPlaneCapability::EventObservation,
+            ControlPlaneCapability::Steering,
+            ControlPlaneCapability::Status,
+            ControlPlaneCapability::Cancellation,
         ]
     );
 
     let probe = run_fixture("missing-cancellation");
-    let error = probe
-        .require(RequiredOperationCapability::Cancellation)
+    let error = ControlPlaneAdmission::from_probe(probe)
+        .admit(ControlPlaneOperation::Stop)
         .expect_err("a missing required method must block cancellation");
 
+    assert_eq!(error.code, ErrorCode::IncompatibleControlPlane);
     assert_eq!(
-        error.reason(),
-        IncompatibleControlPlaneReason::MissingRequiredCapability
+        error.details["reason"],
+        serde_json::json!("required_capability_missing")
     );
     assert_eq!(
-        error.capability(),
-        RequiredOperationCapability::Cancellation
+        error.details["missing_capabilities"],
+        serde_json::json!(["cancellation"])
     );
     assert!(
-        probe
-            .require(RequiredOperationCapability::SessionCreation)
+        ControlPlaneAdmission::from_probe(probe)
+            .admit(ControlPlaneOperation::Run)
             .is_ok(),
         "one missing method must not erase unrelated capability evidence"
     );
@@ -150,15 +151,33 @@ fn required_method_set_is_exact_and_missing_capabilities_are_typed() {
 }
 
 #[test]
+fn recovery_requires_status_and_steering_capabilities() {
+    let probe = run_fixture("missing-steering");
+    let error = ControlPlaneAdmission::from_probe(probe)
+        .admit(ControlPlaneOperation::Status)
+        .expect_err("recovery must fail before I/O when steering is unavailable");
+
+    assert_eq!(error.code, ErrorCode::IncompatibleControlPlane);
+    assert_eq!(
+        error.details["required_capabilities"],
+        serde_json::json!(["status", "steering"])
+    );
+    assert_eq!(
+        error.details["missing_capabilities"],
+        serde_json::json!(["steering"])
+    );
+}
+
+#[test]
 fn nested_schema_decoy_does_not_satisfy_a_required_capability() {
     let probe = run_fixture("decoy-cancellation");
-    let error = probe
-        .require(RequiredOperationCapability::Cancellation)
+    let error = ControlPlaneAdmission::from_probe(probe)
+        .admit(ControlPlaneOperation::Stop)
         .expect_err("a nested decoy must not declare a top-level request method");
 
     assert_eq!(
-        error.reason(),
-        IncompatibleControlPlaneReason::MissingRequiredCapability
+        error.details["reason"],
+        serde_json::json!("required_capability_missing")
     );
 }
 
@@ -179,11 +198,11 @@ fn schema_and_handshake_share_one_hard_deadline() {
         "schema discovery and the handshake used separate timeout budgets"
     );
     assert_eq!(
-        probe
-            .require(RequiredOperationCapability::SessionCreation)
+        ControlPlaneAdmission::from_probe(probe)
+            .admit(ControlPlaneOperation::Run)
             .expect_err("the incomplete handshake must remain blocked")
-            .reason(),
-        IncompatibleControlPlaneReason::HandshakeUnavailable
+            .details["reason"],
+        serde_json::json!("handshake_unavailable")
     );
 }
 
@@ -191,10 +210,8 @@ fn schema_and_handshake_share_one_hard_deadline() {
 fn handshake_ignores_unknown_notifications() {
     let probe = run_fixture("required");
 
-    for capability in REQUIRED_OPERATION_CAPABILITIES {
-        probe
-            .require(capability)
-            .expect("the required stable protocol fixture must be compatible");
+    for capability in ControlPlaneCapability::ALL {
+        assert!(probe.supports(capability));
     }
     assert!(probe.handshake_completed());
 
@@ -223,10 +240,8 @@ fn installed_app_server_is_private_stdio_only() {
 fn production_stdio_handshake_uses_the_same_parser_and_redaction_boundary() {
     let probe = run_production_stdio_fixture("success", Duration::from_secs(2));
 
-    for capability in REQUIRED_OPERATION_CAPABILITIES {
-        probe
-            .require(capability)
-            .expect("the production stdio fixture must prove every required operation");
+    for capability in ControlPlaneCapability::ALL {
+        assert!(probe.supports(capability));
     }
     let diagnostic = format!("{probe:?}");
     assert!(!diagnostic.contains(RAW_NOTIFICATION_CANARY));
@@ -249,11 +264,11 @@ fn production_stdio_timeout_terminates_stdout_inheriting_descendants() {
         "production stdio process-tree shutdown exceeded the hard deadline"
     );
     assert_eq!(
-        probe
-            .require(RequiredOperationCapability::SessionCreation)
+        ControlPlaneAdmission::from_probe(probe)
+            .admit(ControlPlaneOperation::Run)
             .expect_err("the timed-out production stdio handshake must remain blocked")
-            .reason(),
-        IncompatibleControlPlaneReason::HandshakeUnavailable
+            .details["reason"],
+        serde_json::json!("handshake_unavailable")
     );
 }
 
@@ -274,11 +289,11 @@ fn production_stdio_deadline_survives_a_group_escaping_pipe_holder() {
         "an escaped stdout holder exceeded the hard protocol deadline"
     );
     assert_eq!(
-        probe
-            .require(RequiredOperationCapability::SessionCreation)
+        ControlPlaneAdmission::from_probe(probe)
+            .admit(ControlPlaneOperation::Run)
             .expect_err("an incomplete escaped-child handshake must remain blocked")
-            .reason(),
-        IncompatibleControlPlaneReason::HandshakeUnavailable
+            .details["reason"],
+        serde_json::json!("handshake_unavailable")
     );
 }
 
@@ -406,13 +421,10 @@ fn schema_fixture_child() {
         Some("missing-cancellation" | "decoy-cancellation")
     );
 
-    let mut client_methods = vec![
-        "initialize",
-        "thread/start",
-        "turn/start",
-        "thread/resume",
-        "thread/read",
-    ];
+    let mut client_methods = vec!["initialize", "thread/start", "turn/start", "thread/read"];
+    if mode != "missing-steering" {
+        client_methods.push("thread/resume");
+    }
     if include_cancellation {
         client_methods.push("turn/interrupt");
     }

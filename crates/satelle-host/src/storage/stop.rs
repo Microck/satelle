@@ -23,6 +23,21 @@ pub(crate) struct StopClaim {
     recovery_subject: RecoverySubject,
 }
 
+pub(crate) struct StopAdmissionTarget {
+    turn_id: TurnId,
+    requires_control_plane: bool,
+}
+
+impl StopAdmissionTarget {
+    pub(crate) fn turn_id(&self) -> &TurnId {
+        &self.turn_id
+    }
+
+    pub(crate) const fn requires_control_plane(&self) -> bool {
+        self.requires_control_plane
+    }
+}
+
 impl StopClaim {
     pub(crate) fn recovery_subject(&self) -> &RecoverySubject {
         &self.recovery_subject
@@ -66,28 +81,59 @@ impl StopCommit {
 }
 
 impl Storage {
-    pub(crate) fn begin_latest_stop(
-        &mut self,
+    /// Resolves replay and terminal-stop cases before external capability I/O.
+    /// The later `begin_stop` transaction uses this Turn ID as a CAS guard.
+    pub(crate) fn stop_admission_target(
+        &self,
         session_id: &SessionId,
         idempotency: &IdempotencyInput,
-    ) -> Result<BeginStopOutcome, StorageError> {
-        self.begin_stop_transaction(session_id, None, idempotency)
+    ) -> Result<StopAdmissionTarget, StorageError> {
+        require_operation(idempotency, IdempotentOperation::Stop)?;
+        if let Some(record) = matching_idempotency(&self.connection, idempotency)? {
+            let turn_id = record
+                .turn_id
+                .as_deref()
+                .ok_or_else(|| StorageError::new(StorageErrorKind::InvalidStoredState))
+                .and_then(|value| {
+                    TurnId::parse(value)
+                        .map_err(|_| StorageError::new(StorageErrorKind::InvalidStoredState))
+                })?;
+            ensure_record_handles(&record, session_id, &turn_id)?;
+            let session = load_required_session(&self.connection, session_id)?;
+            let turn = session
+                .turn(&turn_id)
+                .ok_or_else(|| StorageError::new(StorageErrorKind::InvalidStoredState))?;
+            let requires_control_plane =
+                match (record.status.as_str(), record.durable_outcome.as_str()) {
+                    ("terminal", _) => false,
+                    // An interrupted observation leaves this record pending,
+                    // but the Turn may have terminalized independently before
+                    // the retry. `begin_stop` can then finalize the durable
+                    // stop outcome without contacting the control plane.
+                    ("in_progress", "v1.stop.pending") => !turn.state().is_terminal(),
+                    _ => return Err(StorageError::new(StorageErrorKind::InvalidStoredState)),
+                };
+            return Ok(StopAdmissionTarget {
+                turn_id,
+                requires_control_plane,
+            });
+        }
+
+        let session = load_required_session(&self.connection, session_id)?;
+        let turn = session
+            .turns()
+            .last()
+            .ok_or_else(|| StorageError::new(StorageErrorKind::InvalidStoredState))?;
+        Ok(StopAdmissionTarget {
+            turn_id: turn.id().clone(),
+            requires_control_plane: !turn.state().is_terminal(),
+        })
     }
 
-    #[cfg(test)]
     pub(crate) fn begin_stop(
         &mut self,
         session_id: &SessionId,
         expected_turn_id: &TurnId,
-        idempotency: &IdempotencyInput,
-    ) -> Result<BeginStopOutcome, StorageError> {
-        self.begin_stop_transaction(session_id, Some(expected_turn_id), idempotency)
-    }
-
-    fn begin_stop_transaction(
-        &mut self,
-        session_id: &SessionId,
-        expected_turn_id: Option<&TurnId>,
         idempotency: &IdempotencyInput,
     ) -> Result<BeginStopOutcome, StorageError> {
         require_operation(idempotency, IdempotentOperation::Stop)?;
@@ -175,7 +221,7 @@ impl Storage {
             .ok_or_else(|| StorageError::new(StorageErrorKind::InvalidStoredState))?
             .id()
             .clone();
-        if expected_turn_id.is_some_and(|expected| expected != &turn_id) {
+        if expected_turn_id != &turn_id {
             return Err(StorageError::new(StorageErrorKind::StateConflict));
         }
         let turn = session

@@ -19,6 +19,7 @@ pub enum ApiErrorCode {
     LogsCursorExpired,
     HostUnreachable,
     HostBusy,
+    IncompatibleControlPlane,
     ComputerUseNotReady,
     StorageIntegrityFailed,
     RemoteExecutionFailed,
@@ -44,6 +45,7 @@ impl ApiErrorCode {
             Self::LogsCursorExpired => "logs-cursor-expired",
             Self::HostUnreachable => "host-unreachable",
             Self::HostBusy => "host-busy",
+            Self::IncompatibleControlPlane => "incompatible-control-plane",
             Self::ComputerUseNotReady => "computer-use-not-ready",
             Self::StorageIntegrityFailed => "storage-integrity-failed",
             Self::RemoteExecutionFailed => "remote-execution-failed",
@@ -53,6 +55,24 @@ impl ApiErrorCode {
             Self::MethodNotAllowed => "method-not-allowed",
             Self::InternalError => "internal-error",
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn incompatible_control_plane_code_has_exact_public_token() {
+        assert_eq!(
+            ApiErrorCode::IncompatibleControlPlane.as_str(),
+            "incompatible-control-plane"
+        );
+        assert_eq!(
+            serde_json::to_value(ApiErrorCode::IncompatibleControlPlane).unwrap(),
+            json!("incompatible-control-plane")
+        );
     }
 }
 

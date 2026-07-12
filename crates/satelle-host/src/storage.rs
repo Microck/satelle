@@ -4,7 +4,7 @@ mod logs;
 mod open;
 mod operational;
 mod sql;
-mod stop;
+pub(crate) mod stop;
 #[cfg(test)]
 mod tests;
 
@@ -321,6 +321,11 @@ impl AdmissionContext {
             request_token,
         }
     }
+
+    #[cfg(test)]
+    pub(crate) fn idempotency(&self) -> &IdempotencyInput {
+        &self.idempotency
+    }
 }
 
 pub(crate) enum ObservedUpstreamRef {
@@ -515,16 +520,31 @@ impl Storage {
         Ok(false)
     }
 
+    #[cfg(test)]
     pub(crate) fn open(state_root: &Path) -> Result<(Self, Vec<RecoverySubject>), StorageError> {
+        let mut storage = Self::open_without_restart_recovery(state_root)?;
+        let recovery_subjects = storage.mark_restart_recovery_pending()?;
+        Ok((storage, recovery_subjects))
+    }
+
+    /// Opens and validates the authoritative store without changing lifecycle
+    /// state. This is used only for an idempotency replay lookup that must
+    /// remain local even when a new operation cannot pass external admission.
+    pub(crate) fn open_without_restart_recovery(state_root: &Path) -> Result<Self, StorageError> {
         let (connection, ownership_lock, state_directory) = open::open_parts(state_root)?;
-        let mut storage = Self {
+        let storage = Self {
             connection,
             _ownership_lock: ownership_lock,
             _state_directory: state_directory,
         };
         auth::validate_sensitive_state(&storage.connection)?;
-        let recovery_subjects = storage.mark_restart_recovery_pending()?;
-        Ok((storage, recovery_subjects))
+        Ok(storage)
+    }
+
+    pub(crate) fn initialize_restart_recovery(
+        &mut self,
+    ) -> Result<Vec<RecoverySubject>, StorageError> {
+        self.mark_restart_recovery_pending()
     }
 
     pub(crate) fn host_identity(&self) -> Result<HostIdentityRef, StorageError> {
