@@ -17,6 +17,9 @@ pub use read::{CapabilitiesResponse, EffectiveLimits, HostStatusResponse, LiveRe
 pub(crate) use session::ApiRequestContract;
 pub use session::{SessionResponse, StopRequest, StopResponse, TurnRequest};
 
+pub(crate) const PROTOCOL_VERSION_HEADER: &str = "satelle-protocol-version";
+pub(crate) const PROTOCOL_VERSION: &str = "1";
+
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::fmt;
 use std::str::FromStr;

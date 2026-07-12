@@ -488,6 +488,7 @@ async fn mutation_validation_fails_before_execution_with_typed_errors() {
 
     let missing_key = running
         .protected_request(Method::POST, "/v1/sessions")
+        .header("Satelle-Protocol-Version", "1")
         .json(&TurnRequest::new("PRIVATE_MISSING_KEY_CANARY"))
         .send()
         .await
@@ -673,14 +674,20 @@ fn protected_at(
     authorization: &str,
     host_identity: &str,
 ) -> reqwest::RequestBuilder {
-    client
+    let is_mutation = method == Method::POST;
+    let request = client
         .request(method, format!("http://{address}{path}"))
         .header("Authorization", authorization)
         .header("Satelle-Expected-Host-Identity", host_identity)
-        .header("Satelle-Request-Id", RequestId::new().to_string())
+        .header("Satelle-Request-Id", RequestId::new().to_string());
+    if is_mutation {
+        request.header("Satelle-Protocol-Version", "1")
+    } else {
+        request
+    }
 }
 
-async fn assert_api_error(response: reqwest::Response, status: StatusCode, code: &str) {
+pub(super) async fn assert_api_error(response: reqwest::Response, status: StatusCode, code: &str) {
     assert_eq!(response.status(), status);
     assert_eq!(
         response.headers()["content-type"],

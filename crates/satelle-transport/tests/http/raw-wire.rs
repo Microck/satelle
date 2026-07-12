@@ -7,7 +7,7 @@ async fn chunked_oversize_body_returns_typed_413_without_admission() {
     let authorization = bearer(&running.token);
     let payload_bytes = 1_048_577;
     let head = format!(
-        "POST /v1/sessions HTTP/1.1\r\nHost: localhost\r\nAuthorization: {authorization}\r\nSatelle-Expected-Host-Identity: {}\r\nSatelle-Request-Id: {}\r\nIdempotency-Key: raw-chunked-limit\r\nContent-Type: application/json\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n{payload_bytes:x}\r\n",
+        "POST /v1/sessions HTTP/1.1\r\nHost: localhost\r\nAuthorization: {authorization}\r\nSatelle-Expected-Host-Identity: {}\r\nSatelle-Request-Id: {}\r\nSatelle-Protocol-Version: 1\r\nIdempotency-Key: raw-chunked-limit\r\nContent-Type: application/json\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n{payload_bytes:x}\r\n",
         running.host_identity,
         RequestId::new(),
     );
@@ -62,7 +62,7 @@ async fn stalled_upload_cannot_hold_daemon_shutdown_open_forever() {
         .await
         .expect("open stalled request connection");
     let partial = format!(
-        "POST /v1/sessions HTTP/1.1\r\nHost: localhost\r\nAuthorization: {}\r\nSatelle-Expected-Host-Identity: {}\r\nSatelle-Request-Id: {}\r\nIdempotency-Key: stalled-shutdown\r\nContent-Type: application/json\r\nContent-Length: 1000\r\n\r\n{{",
+        "POST /v1/sessions HTTP/1.1\r\nHost: localhost\r\nAuthorization: {}\r\nSatelle-Expected-Host-Identity: {}\r\nSatelle-Request-Id: {}\r\nSatelle-Protocol-Version: 1\r\nIdempotency-Key: stalled-shutdown\r\nContent-Type: application/json\r\nContent-Length: 1000\r\n\r\n{{",
         bearer(&token),
         initialized.host_identity(),
         RequestId::new(),
@@ -81,7 +81,7 @@ async fn stalled_upload_cannot_hold_daemon_shutdown_open_forever() {
     drop(held);
 }
 
-async fn raw_request(address: SocketAddr, request: &[u8]) -> Vec<u8> {
+pub(super) async fn raw_request(address: SocketAddr, request: &[u8]) -> Vec<u8> {
     let mut stream = TcpStream::connect(address)
         .await
         .expect("connect raw HTTP client");
@@ -117,7 +117,7 @@ async fn duplicate_header_case(header: DuplicateHeader, status: u16, code: &str)
         ),
     };
     let mut request = format!(
-        "POST /v1/sessions HTTP/1.1\r\nHost: localhost\r\nSatelle-Expected-Host-Identity: {}\r\nSatelle-Request-Id: {}\r\nContent-Length: {}\r\n{duplicated}Connection: close\r\n\r\n",
+        "POST /v1/sessions HTTP/1.1\r\nHost: localhost\r\nSatelle-Expected-Host-Identity: {}\r\nSatelle-Request-Id: {}\r\nSatelle-Protocol-Version: 1\r\nContent-Length: {}\r\n{duplicated}Connection: close\r\n\r\n",
         running.host_identity,
         RequestId::new(),
         body.len(),
@@ -138,7 +138,7 @@ async fn duplicate_header_case(header: DuplicateHeader, status: u16, code: &str)
     assert_eq!(session_count, 0);
 }
 
-fn assert_raw_api_error(response: &[u8], status: u16, code: &str) {
+pub(super) fn assert_raw_api_error(response: &[u8], status: u16, code: &str) {
     let separator = response
         .windows(4)
         .position(|window| window == b"\r\n\r\n")

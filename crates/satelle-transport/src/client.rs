@@ -1,7 +1,7 @@
 use crate::contract::{
     ApiError, ApiErrorCode, AuthenticatedResponseContract, CapabilitiesResponse,
-    HostStatusResponse, LiveResponse, LogsPageResponse, RequestId, SessionResponse, StopRequest,
-    StopResponse, TurnRequest,
+    HostStatusResponse, LiveResponse, LogsPageResponse, PROTOCOL_VERSION, PROTOCOL_VERSION_HEADER,
+    RequestId, SessionResponse, StopRequest, StopResponse, TurnRequest,
 };
 use reqwest::blocking::{Client, RequestBuilder, Response};
 use reqwest::header::{AUTHORIZATION, HeaderValue};
@@ -130,7 +130,12 @@ impl DaemonClient {
             .map_err(|_| DaemonClientError::InvalidIdempotencyKeyHeader)?;
         header.set_sensitive(true);
         let (request, request_id) = self.protected_request(Method::POST, path)?;
-        Ok((request.header("Idempotency-Key", header), request_id))
+        Ok((
+            request
+                .header("Idempotency-Key", header)
+                .header(PROTOCOL_VERSION_HEADER, PROTOCOL_VERSION),
+            request_id,
+        ))
     }
 
     fn protected_request(
