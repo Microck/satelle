@@ -75,6 +75,15 @@ fn main() {
         hang();
     }
     receive(&mut input, &log);
+    if scenario.starts_with("read-") {
+        let request = receive(&mut input, &log);
+        assert!(request.contains(r#""method":"thread/read""#));
+        assert!(request.contains(r#""threadId":"thread-1""#));
+        assert!(request.contains(r#""includeTurns":true"#));
+        let status = scenario.strip_prefix("read-").unwrap();
+        send(&mut output, &format!(r#"{{"id":2,"result":{{"thread":{{"id":"thread-1","turns":[{{"id":"turn-1","status":"{status}"}}]}}}}}}"#));
+        hang();
+    }
     let thread_request = receive(&mut input, &log);
     let thread_id = if thread_request.contains(r#""threadId":"thread-existing""#) {
         "thread-existing"
@@ -114,6 +123,16 @@ fn main() {
 
     send(&mut output, r#"{"id":3,"result":{"turn":{"id":"turn-1","status":"inProgress"}}}"#);
     wait_for(&turn_marker);
+    if scenario == "controlled-interrupt" {
+        let interrupt = receive(&mut input, &log);
+        assert!(interrupt.contains(r#""id":4"#));
+        assert!(interrupt.contains(r#""method":"turn/interrupt""#));
+        assert!(interrupt.contains(r#""threadId":"thread-1""#));
+        assert!(interrupt.contains(r#""turnId":"turn-1""#));
+        send(&mut output, r#"{"method":"turn/completed","params":{"threadId":"thread-1","turn":{"id":"turn-1","status":"interrupted"}}}"#);
+        send(&mut output, r#"{"id":4,"result":{}}"#);
+        return;
+    }
     if scenario == "server-requests" {
         send(&mut output, &format!(r#"{{"id":"approval-1","method":"item/commandExecution/requestApproval","params":{{"threadId":"{thread_id}","turnId":"turn-1","itemId":"item-1","startedAtMs":1}}}}"#));
         receive(&mut input, &log);
@@ -312,6 +331,7 @@ fn run_scenario_with_options(
             deadline: Instant::now() + timeout,
             persist_thread_ref: &mut persist_thread,
             persist_turn_ref: &mut persist_turn,
+            control: None,
         },
     );
     let session_elapsed = session_started.elapsed();
@@ -349,6 +369,17 @@ fn touch(path: &Path) {
         "persisted"
     )
     .expect("write persistence marker");
+}
+
+fn wait_for(path: &Path) {
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while !path.exists() {
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for fixture marker"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
 }
 
 #[test]
@@ -415,6 +446,120 @@ fn terminal_status_is_closed() {
             run_scenario(scenario, None, Duration::from_secs(3)).result,
             Ok(expected)
         );
+    }
+}
+
+#[test]
+fn live_interrupt_waits_for_the_durable_stop_acknowledgement() {
+    let fixture = compile_fixture();
+    let directory = tempfile::tempdir().expect("control scenario directory");
+    let log_path = directory.path().join("requests.jsonl");
+    let cwd_log_path = directory.path().join("child-cwd");
+    let thread_marker = directory.path().join("thread-persisted");
+    let turn_marker = directory.path().join("turn-persisted");
+    let descendant_marker = directory.path().join("descendant-escaped");
+    let mut command = Command::new(&fixture.executable);
+    command
+        .env("SATELLE_FIXTURE_SCENARIO", "controlled-interrupt")
+        .env("SATELLE_FIXTURE_LOG", &log_path)
+        .env("SATELLE_FIXTURE_CWD_LOG", &cwd_log_path)
+        .env("SATELLE_THREAD_MARKER", &thread_marker)
+        .env("SATELLE_TURN_MARKER", &turn_marker)
+        .env("SATELLE_DESCENDANT_MARKER", &descendant_marker);
+    let deadline = Instant::now() + Duration::from_secs(3);
+    let control = CodexSessionControl::new(deadline);
+    let session_control = control.clone();
+    let session_directory = directory.path().to_path_buf();
+    let session_thread_marker = thread_marker.clone();
+    let session_turn_marker = turn_marker.clone();
+    let session = std::thread::spawn(move || {
+        let mut persist_thread = |_: &str| {
+            touch(&session_thread_marker);
+            Ok(())
+        };
+        let mut persist_turn = |_: &str| {
+            touch(&session_turn_marker);
+            Ok(())
+        };
+        run_codex_session(
+            command,
+            CodexSessionRequest {
+                working_directory: &session_directory,
+                prompt: "PRIVATE_CONTROLLED_STOP_PROMPT",
+                existing_thread_ref: None,
+                model: "gpt-fixture",
+                model_provider: "fixture-provider",
+                approval_policy: CodexApprovalPolicy::OnRequest,
+                sandbox_policy: CodexSandboxPolicy::WorkspaceWrite,
+                deadline,
+                persist_thread_ref: &mut persist_thread,
+                persist_turn_ref: &mut persist_turn,
+                control: Some(session_control),
+            },
+        )
+    });
+    wait_for(&turn_marker);
+
+    assert_eq!(
+        control.interrupt(),
+        StopObservation::UpstreamInactiveConfirmed
+    );
+    assert!(
+        !session.is_finished(),
+        "execution must wait until the stopped state is durable"
+    );
+    control.stop_committed();
+
+    assert_eq!(
+        session.join().expect("join controlled execution"),
+        Ok(CodexSessionTerminal::StoppedByControl)
+    );
+}
+
+#[test]
+fn restart_observation_reads_only_the_matching_persisted_turn() {
+    for (status, expected) in [
+        ("inProgress", CodexTurnStatus::InProgress),
+        ("completed", CodexTurnStatus::Completed),
+        ("interrupted", CodexTurnStatus::Interrupted),
+        ("failed", CodexTurnStatus::Failed),
+    ] {
+        let fixture = compile_fixture();
+        let directory = tempfile::tempdir().expect("read scenario directory");
+        let log_path = directory.path().join("requests.jsonl");
+        let cwd_log_path = directory.path().join("child-cwd");
+        let mut command = Command::new(&fixture.executable);
+        command
+            .env("SATELLE_FIXTURE_SCENARIO", format!("read-{status}"))
+            .env("SATELLE_FIXTURE_LOG", &log_path)
+            .env("SATELLE_FIXTURE_CWD_LOG", &cwd_log_path)
+            .env(
+                "SATELLE_THREAD_MARKER",
+                directory.path().join("unused-thread"),
+            )
+            .env("SATELLE_TURN_MARKER", directory.path().join("unused-turn"))
+            .env(
+                "SATELLE_DESCENDANT_MARKER",
+                directory.path().join("unused-descendant"),
+            );
+
+        let observed = read_codex_turn(
+            command,
+            CodexTurnReadRequest {
+                working_directory: directory.path(),
+                thread_ref: "thread-1",
+                turn_ref: "turn-1",
+                deadline: Instant::now() + Duration::from_secs(3),
+            },
+        );
+        assert!(
+            observed.is_ok(),
+            "read matching durable Turn failed with {observed:?}; requests: {}",
+            read_to_string(&log_path).unwrap_or_default()
+        );
+        let observed = observed.unwrap();
+
+        assert_eq!(observed, expected);
     }
 }
 
@@ -619,11 +764,7 @@ fn every_closed_policy_has_an_exact_protocol_mapping() {
 
 #[test]
 fn an_expired_writer_does_not_mark_turn_dispatch() {
-    let (sender, _receiver) = mpsc::channel();
-    let writer = ProtocolWriter {
-        sender,
-        deadline: Instant::now(),
-    };
+    let writer = ProtocolWriter::expired_for_test();
     let mut dispatched = false;
 
     assert_eq!(

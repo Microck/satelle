@@ -579,6 +579,7 @@ pub(super) fn load_recovery_subject(
     Ok(RecoverySubject {
         session_id: session.id().clone(),
         turn_id: turn_id.clone(),
+        turn_state: turn.state(),
         expected_revisions: ExpectedRevisions::new(
             session.session_state_revision(),
             turn.turn_state_revision(),

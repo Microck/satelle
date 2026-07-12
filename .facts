@@ -1313,12 +1313,12 @@
 - a Bootstrap Lock operation that may have mutated remote state or started a managed process preserves the lock and recovery metadata until postcondition reconciliation proves the outcome @spec @mvp
 
 ## stop-and-recovery
-- satelle stop transitions a starting, running, or recovery_pending Turn to stopped only after the adapter confirms cancellation or otherwise proves that the same upstream Turn is no longer active @spec @mvp
+- satelle stop transitions a starting, running, or recovery_pending Turn to stopped only after the adapter confirms cancellation or otherwise proves that the same upstream Turn is no longer active @mvp @implemented
 - satelle stop on a terminal Turn returns already_terminal without changing stored history @spec @mvp
 - concurrent completion and stop use a compare-and-set transition so exactly one terminal state wins @spec @mvp
 - a late Codex completion cannot overwrite a previously committed stopped state @spec @mvp
-- a stop request that cannot confirm upstream cancellation reports stop-not-confirmed instead of persisting a false stopped state @spec @mvp
-- stop-not-confirmed leaves the Turn nonterminal, preserves running when the same upstream Turn is known active or recovery_pending when its state is ambiguous, and retains the Control Lease @spec @mvp
+- a stop request that cannot confirm upstream cancellation reports stop-not-confirmed instead of persisting a false stopped state @mvp @implemented
+- stop-not-confirmed leaves the Turn nonterminal, preserves running when the same upstream Turn is known active or recovery_pending when its state is ambiguous, and retains the Control Lease @mvp @implemented
 - satelle stop is idempotent for the same Session, Turn, and idempotency key @spec @mvp
 - transport disconnection does not stop a remote Turn @spec @mvp
 - satelle run and steer support --detach-on-interrupt to leave an already-created remote Turn running when the attached CLI receives Ctrl-C @spec @mvp
@@ -1327,11 +1327,11 @@
 - interrupting run or steer before Turn creation requests cancellation of any active readiness or provider probe without sending a stop request for a nonexistent prompt Turn; it releases the Control Lease only after probe termination is confirmed and otherwise leaves recovery_pending ownership for reconciliation @spec @mvp
 - an attached CLI that cannot confirm stop after interruption prints the Session identifier and a status recovery command before exiting 130 @spec @mvp
 - Host Daemon startup marks every stored nonterminal Turn as recovery_pending before accepting a new Turn for the same Control Lease @spec @mvp
-- startup reconciliation queries the Codex adapter before resolving a recovery_pending Turn @spec @mvp
-- startup reconciliation restores running only when the adapter proves that the same upstream Turn remains active @spec @mvp
-- startup reconciliation records failed with a typed daemon-restart-recovery-failed cause and releases the Control Lease only when the adapter proves that the same upstream Turn is no longer active and cannot be recovered @spec @mvp
-- when startup reconciliation cannot determine whether the same upstream Turn remains active, the Turn remains recovery_pending, the Control Lease remains held, and conflicting admission remains blocked with outcome_unknown recovery guidance @spec @mvp
-- the Host Daemon never admits a new Turn while previous Turn ownership remains ambiguous @spec @mvp
+- startup reconciliation queries the Codex adapter before resolving a recovery_pending Turn @mvp @implemented
+- startup reconciliation restores running only when the adapter proves that the same upstream Turn remains active @mvp @implemented
+- startup reconciliation records failed with a typed daemon-restart-recovery-failed cause and releases the Control Lease only when the adapter proves that the same upstream Turn is no longer active and cannot be recovered @mvp @implemented
+- when startup reconciliation cannot determine whether the same upstream Turn remains active, the Turn remains recovery_pending, the Control Lease remains held, and conflicting admission remains blocked with outcome_unknown recovery guidance @mvp @implemented
+- the Host Daemon never admits a new Turn while previous Turn ownership remains ambiguous @mvp @implemented
 
 ## public-identity-and-retention
 - satelle exposes Satelle-owned Session identifiers to CLI users and JSON output consumers instead of exposing Codex thread IDs as the public Session contract @spec @mvp

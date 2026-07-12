@@ -415,6 +415,10 @@ impl<'a> AdapterSubject<'a> {
         self.subject.turn_id()
     }
 
+    pub(crate) fn turn_state(self) -> satelle_core::session::TurnState {
+        self.subject.turn_state()
+    }
+
     pub fn host_identity(self) -> &'a HostIdentityRef {
         self.subject.host_identity()
     }
@@ -429,6 +433,18 @@ impl<'a> AdapterSubject<'a> {
 
     pub fn has_upstream_references(self) -> bool {
         self.subject.upstream_thread_ref().is_some() || self.subject.upstream_turn_ref().is_some()
+    }
+
+    pub(crate) fn upstream_thread_ref(self) -> Option<&'a str> {
+        self.subject
+            .upstream_thread_ref()
+            .map(crate::storage::PrivateUpstreamRef::as_str)
+    }
+
+    pub(crate) fn upstream_turn_ref(self) -> Option<&'a str> {
+        self.subject
+            .upstream_turn_ref()
+            .map(crate::storage::PrivateUpstreamRef::as_str)
     }
 
     pub fn has_request_token(self) -> bool {
@@ -507,8 +523,13 @@ pub(super) enum UpstreamReference {
 }
 
 pub struct ExecuteResult {
-    transition: TurnTransition,
+    outcome: ExecuteOutcome,
     events: Vec<SatelleEvent>,
+}
+
+enum ExecuteOutcome {
+    Terminal(TurnTransition),
+    StoppedByControl,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -522,11 +543,24 @@ pub enum RecoveryObservation {
 
 impl ExecuteResult {
     pub fn new(transition: TurnTransition, events: Vec<SatelleEvent>) -> Self {
-        Self { transition, events }
+        Self {
+            outcome: ExecuteOutcome::Terminal(transition),
+            events,
+        }
     }
 
-    pub(super) fn transition(&self) -> TurnTransition {
-        self.transition.clone()
+    pub(crate) fn stopped_by_control() -> Self {
+        Self {
+            outcome: ExecuteOutcome::StoppedByControl,
+            events: Vec::new(),
+        }
+    }
+
+    pub(super) fn transition(&self) -> Option<TurnTransition> {
+        match &self.outcome {
+            ExecuteOutcome::Terminal(transition) => Some(transition.clone()),
+            ExecuteOutcome::StoppedByControl => None,
+        }
     }
 
     pub(super) fn into_events(self) -> Vec<SatelleEvent> {
@@ -553,6 +587,10 @@ pub trait ComputerUseAdapter: Send + Sync + 'static {
         &self,
         subject: AdapterSubject<'_>,
     ) -> Result<RecoveryObservation, SatelleError>;
+
+    /// Releases an execution exchange that was deliberately held open until
+    /// its confirmed stopped state became durable.
+    fn stop_committed(&self, _session_id: &SessionId, _turn_id: &TurnId) {}
 }
 
 #[cfg(test)]

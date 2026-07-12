@@ -547,6 +547,7 @@ fn parse_safe_summary(value: &str) -> Result<SafeSummary, StorageError> {
         "task_completed" => Ok(SafeSummary::TaskCompleted),
         "blocked_by_policy" => Ok(SafeSummary::BlockedByPolicy),
         "execution_failed" => Ok(SafeSummary::ExecutionFailed),
+        "daemon_restart_recovery_failed" => Ok(SafeSummary::DaemonRestartRecoveryFailed),
         _ => Err(StorageError::new(StorageErrorKind::InvalidStoredState)),
     }
 }

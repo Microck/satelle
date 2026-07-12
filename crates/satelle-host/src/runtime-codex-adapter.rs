@@ -3,24 +3,54 @@ use super::adapter::{
     RecoveryObservation,
 };
 use crate::codex_session::{
-    CodexApprovalPolicy, CodexSandboxPolicy, CodexSessionError, CodexSessionFailure,
-    CodexSessionRequest, CodexSessionTerminal, run_codex_session,
+    CodexApprovalPolicy, CodexSandboxPolicy, CodexSessionControl, CodexSessionError,
+    CodexSessionFailure, CodexSessionRequest, CodexSessionTerminal, CodexTurnReadRequest,
+    CodexTurnStatus, read_codex_turn, run_codex_session,
 };
-use satelle_core::session::{ApprovalPolicy, SandboxPolicy, StopObservation, TurnTransition};
+use satelle_core::session::{
+    ApprovalPolicy, SandboxPolicy, StopObservation, TurnState, TurnTransition,
+};
 use satelle_core::{ControlPlaneOperation, ErrorCode, SatelleError};
 use serde_json::Value;
 use std::cell::RefCell;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
 /// The production adapter owns the private Codex app-server boundary. Native
 /// execution remains gated by preflight evidence; no caller can reach execute
 /// merely because the protocol session itself is implemented.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub(crate) struct ProductionComputerUseAdapter {
     snapshot: Arc<RwLock<crate::ProductionCapabilitySnapshot>>,
     working_directory: Result<PathBuf, SatelleError>,
+    active_execution: Arc<Mutex<Option<ActiveCodexExecution>>>,
+}
+
+#[derive(Clone)]
+struct ActiveCodexExecution {
+    session_id: satelle_core::SessionId,
+    turn_id: satelle_core::TurnId,
+    control: CodexSessionControl,
+}
+
+struct ActiveExecutionGuard {
+    registry: Arc<Mutex<Option<ActiveCodexExecution>>>,
+    session_id: satelle_core::SessionId,
+    turn_id: satelle_core::TurnId,
+}
+
+impl Drop for ActiveExecutionGuard {
+    fn drop(&mut self) {
+        let Ok(mut active) = self.registry.lock() else {
+            return;
+        };
+        if active.as_ref().is_some_and(|execution| {
+            execution.session_id == self.session_id && execution.turn_id == self.turn_id
+        }) {
+            *active = None;
+        }
+    }
 }
 
 impl ProductionComputerUseAdapter {
@@ -31,6 +61,7 @@ impl ProductionComputerUseAdapter {
         Self {
             snapshot,
             working_directory,
+            active_execution: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -46,6 +77,75 @@ impl ProductionComputerUseAdapter {
         } else {
             Err(crate::execution_blocker(&snapshot.verdict))
         }
+    }
+
+    fn register_execution(
+        &self,
+        subject: AdapterSubject<'_>,
+        control: CodexSessionControl,
+    ) -> Result<ActiveExecutionGuard, SatelleError> {
+        let mut active = self
+            .active_execution
+            .lock()
+            .map_err(|_| adapter_failure("control_registry_unavailable"))?;
+        if active.is_some() {
+            return Err(adapter_failure("desktop_owner_conflict"));
+        }
+        let execution = ActiveCodexExecution {
+            session_id: subject.session_id().clone(),
+            turn_id: subject.turn_id().clone(),
+            control,
+        };
+        let guard = ActiveExecutionGuard {
+            registry: Arc::clone(&self.active_execution),
+            session_id: execution.session_id.clone(),
+            turn_id: execution.turn_id.clone(),
+        };
+        *active = Some(execution);
+        Ok(guard)
+    }
+
+    fn active_control(
+        &self,
+        subject: AdapterSubject<'_>,
+    ) -> Result<Option<CodexSessionControl>, SatelleError> {
+        let active = self
+            .active_execution
+            .lock()
+            .map_err(|_| adapter_failure("control_registry_unavailable"))?;
+        Ok(active
+            .as_ref()
+            .filter(|execution| {
+                execution.session_id == *subject.session_id()
+                    && execution.turn_id == *subject.turn_id()
+            })
+            .map(|execution| execution.control.clone()))
+    }
+
+    fn read_persisted_turn(&self, subject: AdapterSubject<'_>) -> Option<CodexTurnStatus> {
+        // No transport or protocol failure proves ownership inactive. Collapse
+        // every uncertain read to None so callers retain the Control Lease.
+        let (Some(thread_ref), Some(turn_ref)) =
+            (subject.upstream_thread_ref(), subject.upstream_turn_ref())
+        else {
+            return None;
+        };
+        let working_directory = self
+            .working_directory
+            .as_ref()
+            .ok()
+            .and_then(|path| prepare_working_directory(path).ok())?;
+        let deadline = Instant::now().checked_add(Duration::from_secs(5))?;
+        read_codex_turn(
+            crate::codex_capabilities::installed_app_server_command(),
+            CodexTurnReadRequest {
+                working_directory: &working_directory,
+                thread_ref,
+                turn_ref,
+                deadline,
+            },
+        )
+        .ok()
     }
 }
 
@@ -74,6 +174,8 @@ impl ComputerUseAdapter for ProductionComputerUseAdapter {
             .as_ref()
             .map_err(Clone::clone)
             .and_then(|path| prepare_working_directory(path))?;
+        let control = CodexSessionControl::new(deadline);
+        let _active_execution = self.register_execution(request.subject(), control.clone())?;
 
         // Preserve the original storage failure outside the protocol layer so
         // a private-reference conflict is not misclassified as transport I/O.
@@ -101,20 +203,71 @@ impl ComputerUseAdapter for ProductionComputerUseAdapter {
                 deadline,
                 persist_thread_ref: &mut persist_thread_ref,
                 persist_turn_ref: &mut persist_turn_ref,
+                control: Some(control),
             },
         );
         finish_execution(result, persistence_error.into_inner())
     }
 
-    fn observe_stop(&self, _subject: AdapterSubject<'_>) -> Result<StopObservation, SatelleError> {
-        self.blocked()
+    fn observe_stop(&self, subject: AdapterSubject<'_>) -> Result<StopObservation, SatelleError> {
+        if let Some(control) = self.active_control(subject)? {
+            return Ok(control.interrupt());
+        }
+        Ok(stop_observation(
+            subject.turn_state(),
+            subject.has_upstream_references(),
+            self.read_persisted_turn(subject),
+        ))
     }
 
     fn observe_recovery(
         &self,
-        _subject: AdapterSubject<'_>,
+        subject: AdapterSubject<'_>,
     ) -> Result<RecoveryObservation, SatelleError> {
-        self.blocked()
+        Ok(recovery_observation(self.read_persisted_turn(subject)))
+    }
+
+    fn stop_committed(&self, session_id: &satelle_core::SessionId, turn_id: &satelle_core::TurnId) {
+        let control = self.active_execution.lock().ok().and_then(|mut active| {
+            let matching = active.as_ref().is_some_and(|execution| {
+                execution.session_id == *session_id && execution.turn_id == *turn_id
+            });
+            matching
+                .then(|| active.take().map(|execution| execution.control))
+                .flatten()
+        });
+        if let Some(control) = control {
+            control.stop_committed();
+        }
+    }
+}
+
+fn stop_observation(
+    turn_state: TurnState,
+    has_upstream_references: bool,
+    status: Option<CodexTurnStatus>,
+) -> StopObservation {
+    // The worker must durably enter Running before calling execute, so a
+    // Starting Turn with no private references cannot have reached Codex.
+    // Running and recovery_pending remain ambiguous without exact evidence.
+    if turn_state == TurnState::Starting && !has_upstream_references {
+        return StopObservation::UpstreamInactiveConfirmed;
+    }
+    match status {
+        Some(CodexTurnStatus::InProgress) => StopObservation::UpstreamStillActive,
+        Some(
+            CodexTurnStatus::Completed | CodexTurnStatus::Interrupted | CodexTurnStatus::Failed,
+        ) => StopObservation::UpstreamInactiveConfirmed,
+        None => StopObservation::OutcomeUnknown,
+    }
+}
+
+fn recovery_observation(status: Option<CodexTurnStatus>) -> RecoveryObservation {
+    match status {
+        Some(CodexTurnStatus::InProgress) => RecoveryObservation::Running,
+        Some(CodexTurnStatus::Completed) => RecoveryObservation::Completed,
+        Some(CodexTurnStatus::Interrupted | CodexTurnStatus::Failed) => RecoveryObservation::Failed,
+        None => RecoveryObservation::Unknown,
     }
 }
 
@@ -204,6 +357,7 @@ fn terminal_result(
         Ok(CodexSessionTerminal::Interrupted | CodexSessionTerminal::Failed) => {
             Ok(ExecuteResult::new(TurnTransition::Failed, Vec::new()))
         }
+        Ok(CodexSessionTerminal::StoppedByControl) => Ok(ExecuteResult::stopped_by_control()),
         // A cleanup failure is never an ordinary terminal outcome. Even when
         // no turn was dispatched, the daemon has not proven that its private
         // app-server process group stopped.
@@ -246,6 +400,7 @@ fn session_failure(error: CodexSessionError) -> SatelleError {
         CodexSessionError::Timeout => "timeout",
         CodexSessionError::Persistence => "persistence_failed",
         CodexSessionError::Containment => "containment_failed",
+        CodexSessionError::Control => "control_failed",
     };
     adapter_failure(reason)
 }
@@ -307,7 +462,7 @@ mod tests {
             terminal_result(Ok(CodexSessionTerminal::Completed))
                 .unwrap()
                 .transition(),
-            TurnTransition::Completed
+            Some(TurnTransition::Completed)
         );
         for terminal in [
             CodexSessionTerminal::Interrupted,
@@ -315,9 +470,80 @@ mod tests {
         ] {
             assert_eq!(
                 terminal_result(Ok(terminal)).unwrap().transition(),
-                TurnTransition::Failed
+                Some(TurnTransition::Failed)
             );
         }
+        assert!(
+            terminal_result(Ok(CodexSessionTerminal::StoppedByControl))
+                .unwrap()
+                .transition()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn durable_turn_status_has_closed_stop_and_recovery_meanings() {
+        assert_eq!(
+            stop_observation(TurnState::Running, true, Some(CodexTurnStatus::InProgress)),
+            StopObservation::UpstreamStillActive
+        );
+        assert_eq!(
+            recovery_observation(Some(CodexTurnStatus::InProgress)),
+            RecoveryObservation::Running
+        );
+        assert_eq!(
+            recovery_observation(Some(CodexTurnStatus::Completed)),
+            RecoveryObservation::Completed
+        );
+        for terminal in [
+            CodexTurnStatus::Completed,
+            CodexTurnStatus::Interrupted,
+            CodexTurnStatus::Failed,
+        ] {
+            assert_eq!(
+                stop_observation(TurnState::RecoveryPending, true, Some(terminal)),
+                StopObservation::UpstreamInactiveConfirmed
+            );
+        }
+        for failed in [CodexTurnStatus::Interrupted, CodexTurnStatus::Failed] {
+            assert_eq!(
+                recovery_observation(Some(failed)),
+                RecoveryObservation::Failed
+            );
+        }
+        assert_eq!(
+            stop_observation(TurnState::Starting, false, None),
+            StopObservation::UpstreamInactiveConfirmed
+        );
+        assert_eq!(
+            stop_observation(TurnState::Running, false, None),
+            StopObservation::OutcomeUnknown
+        );
+        assert_eq!(
+            stop_observation(TurnState::RecoveryPending, false, None),
+            StopObservation::OutcomeUnknown
+        );
+        assert_eq!(recovery_observation(None), RecoveryObservation::Unknown);
+    }
+
+    #[test]
+    fn durable_stop_synchronously_releases_the_active_registry_entry() {
+        let adapter = ProductionComputerUseAdapter::new(
+            Arc::new(RwLock::new(crate::ProductionCapabilitySnapshot::collect())),
+            Ok(tempfile::tempdir().unwrap().path().join("codex-work")),
+        );
+        let session_id = satelle_core::SessionId::new();
+        let turn_id = satelle_core::TurnId::new();
+        let control = CodexSessionControl::new(Instant::now() + Duration::from_secs(1));
+        *adapter.active_execution.lock().unwrap() = Some(ActiveCodexExecution {
+            session_id: session_id.clone(),
+            turn_id: turn_id.clone(),
+            control,
+        });
+
+        adapter.stop_committed(&session_id, &turn_id);
+
+        assert!(adapter.active_execution.lock().unwrap().is_none());
     }
 
     #[test]
@@ -346,7 +572,7 @@ mod tests {
             false,
         )))
         .unwrap();
-        assert_eq!(before_dispatch.transition(), TurnTransition::Failed);
+        assert_eq!(before_dispatch.transition(), Some(TurnTransition::Failed));
 
         let after_dispatch = match terminal_result(Err(CodexSessionFailure::after_exchange(
             CodexSessionError::Timeout,
@@ -380,7 +606,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             persisted_before_dispatch.transition(),
-            TurnTransition::Failed
+            Some(TurnTransition::Failed)
         );
     }
 
@@ -457,6 +683,7 @@ mod tests {
             CodexSessionError::Timeout,
             CodexSessionError::Persistence,
             CodexSessionError::Containment,
+            CodexSessionError::Control,
         ] {
             let public = session_failure(error);
             assert_eq!(public.code, ErrorCode::RemoteExecution);

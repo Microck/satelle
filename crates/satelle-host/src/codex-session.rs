@@ -1,19 +1,23 @@
-use command_group::CommandGroup;
+use satelle_core::session::StopObservation;
 use serde_json::{Map, Value, json};
-use std::io::{BufRead, BufReader, ErrorKind, Read, Write};
 use std::path::Path;
-use std::process::{Command, Stdio};
-use std::sync::mpsc;
-use std::thread;
+use std::process::Command;
+use std::sync::{Arc, Mutex, mpsc};
 use std::time::{Duration, Instant};
+
+#[path = "codex-process.rs"]
+mod codex_process;
+#[path = "codex-turn-read.rs"]
+mod codex_turn_read;
+
+use codex_process::{CodexExchange, ProtocolWriter, ReadEvent, run_exchange};
 
 #[cfg(test)]
 #[path = "codex-session-tests.rs"]
 mod tests;
 
-const INBOUND_LINE_LIMIT: usize = 2 * 1024 * 1024;
-const INBOUND_QUEUE_CAPACITY: usize = 8;
-const READER_POLL_INTERVAL: Duration = Duration::from_millis(5);
+const CONTROL_POLL_INTERVAL: Duration = Duration::from_millis(5);
+const CONTROL_RESPONSE_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum CodexApprovalPolicy {
@@ -77,6 +81,7 @@ pub(crate) struct CodexSessionRequest<'a> {
     pub(crate) deadline: Instant,
     pub(crate) persist_thread_ref: &'a mut dyn FnMut(&str) -> Result<(), ()>,
     pub(crate) persist_turn_ref: &'a mut dyn FnMut(&str) -> Result<(), ()>,
+    pub(crate) control: Option<CodexSessionControl>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -84,6 +89,84 @@ pub(crate) enum CodexSessionTerminal {
     Completed,
     Interrupted,
     Failed,
+    StoppedByControl,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum CodexTurnStatus {
+    InProgress,
+    Completed,
+    Interrupted,
+    Failed,
+}
+
+pub(crate) struct CodexTurnReadRequest<'a> {
+    pub(crate) working_directory: &'a Path,
+    pub(crate) thread_ref: &'a str,
+    pub(crate) turn_ref: &'a str,
+    pub(crate) deadline: Instant,
+}
+
+#[derive(Clone)]
+pub(crate) struct CodexSessionControl {
+    inner: Arc<CodexSessionControlInner>,
+}
+
+struct CodexSessionControlInner {
+    sender: mpsc::Sender<ControlCommand>,
+    receiver: Mutex<Option<mpsc::Receiver<ControlCommand>>>,
+    deadline: Instant,
+}
+
+enum ControlCommand {
+    Interrupt {
+        reply: mpsc::Sender<StopObservation>,
+    },
+    StopCommitted,
+}
+
+impl CodexSessionControl {
+    pub(crate) fn new(deadline: Instant) -> Self {
+        let (sender, receiver) = mpsc::channel();
+        Self {
+            inner: Arc::new(CodexSessionControlInner {
+                sender,
+                receiver: Mutex::new(Some(receiver)),
+                deadline,
+            }),
+        }
+    }
+
+    pub(crate) fn interrupt(&self) -> StopObservation {
+        let (reply, response) = mpsc::channel();
+        if self
+            .inner
+            .sender
+            .send(ControlCommand::Interrupt { reply })
+            .is_err()
+        {
+            return StopObservation::OutcomeUnknown;
+        }
+        let Some(remaining) = self.inner.deadline.checked_duration_since(Instant::now()) else {
+            return StopObservation::OutcomeUnknown;
+        };
+        response
+            .recv_timeout(remaining.min(CONTROL_RESPONSE_TIMEOUT))
+            .unwrap_or(StopObservation::OutcomeUnknown)
+    }
+
+    pub(crate) fn stop_committed(&self) {
+        let _ = self.inner.sender.send(ControlCommand::StopCommitted);
+    }
+
+    fn claim_receiver(&self) -> Result<mpsc::Receiver<ControlCommand>, CodexSessionError> {
+        self.inner
+            .receiver
+            .lock()
+            .map_err(|_| CodexSessionError::Control)?
+            .take()
+            .ok_or(CodexSessionError::Control)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
@@ -112,6 +195,8 @@ pub(crate) enum CodexSessionError {
     Persistence,
     #[error("the private Codex app-server process group could not be contained")]
     Containment,
+    #[error("the private Codex app-server control channel failed")]
+    Control,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -148,7 +233,7 @@ impl CodexSessionFailure {
 }
 
 pub(crate) fn run_codex_session(
-    mut command: Command,
+    command: Command,
     request: CodexSessionRequest<'_>,
 ) -> Result<CodexSessionTerminal, CodexSessionFailure> {
     if Instant::now() >= request.deadline {
@@ -156,115 +241,78 @@ pub(crate) fn run_codex_session(
             CodexSessionError::Timeout,
         ));
     }
-
-    let mut child = command
-        .current_dir(request.working_directory)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .group_spawn()
-        .map_err(|_| CodexSessionFailure::before_turn_dispatch(CodexSessionError::Spawn))?;
-    let stdin = child.inner().stdin.take();
-    let stdout = child.inner().stdout.take();
-    let (Some(stdin), Some(stdout)) = (stdin, stdout) else {
-        let _ = crate::codex_capabilities::terminate_group(&mut child);
-        return Err(CodexSessionFailure::before_turn_dispatch(
-            CodexSessionError::Spawn,
-        ));
-    };
-
-    #[cfg(unix)]
-    if crate::codex_capabilities::set_nonblocking(&stdout).is_err() {
-        let _ = crate::codex_capabilities::terminate_group(&mut child);
-        return Err(CodexSessionFailure::before_turn_dispatch(
-            CodexSessionError::Spawn,
-        ));
-    }
-
+    let working_directory = request.working_directory;
     let deadline = request.deadline;
-    let (sender, receiver) = mpsc::sync_channel(INBOUND_QUEUE_CAPACITY);
-    let reader = match thread::Builder::new()
-        .name("satelle-codex-reader".to_string())
-        .spawn(move || read_messages(stdout, deadline, sender))
-    {
-        Ok(reader) => reader,
-        Err(_) => {
-            let _ = crate::codex_capabilities::terminate_group(&mut child);
-            return Err(CodexSessionFailure::before_turn_dispatch(
-                CodexSessionError::Spawn,
-            ));
-        }
+    let control = match request.control.as_ref() {
+        Some(control) => match control.claim_receiver() {
+            Ok(receiver) => Some(receiver),
+            Err(error) => return Err(CodexSessionFailure::before_turn_dispatch(error)),
+        },
+        None => None,
     };
-    let (write_sender, write_receiver) = mpsc::channel();
-    let writer = ProtocolWriter {
-        sender: write_sender,
-        deadline,
-    };
-    let writer_thread = match thread::Builder::new()
-        .name("satelle-codex-writer".to_string())
-        .spawn(move || write_messages(stdin, write_receiver))
-    {
-        Ok(writer_thread) => writer_thread,
-        Err(_) => {
-            drop(writer);
-            drop(receiver);
-            let _ = crate::codex_capabilities::terminate_group(&mut child);
-            let _ = reader.join();
-            return Err(CodexSessionFailure::before_turn_dispatch(
-                CodexSessionError::Spawn,
-            ));
-        }
-    };
-    let mut exchange = SessionExchange::new(request);
-    let exchange_result = exchange.run(&writer, &receiver);
-    let turn_dispatch_attempted = exchange.turn_dispatch_attempted;
+    let mut exchange = SessionExchange::new(request, control);
+    run_exchange(command, working_directory, deadline, &mut exchange)
+}
 
-    // The reader may be backpressured on the bounded queue. Drop the receiver
-    // before joining so every cleanup path can release that blocked send.
-    drop(receiver);
-    drop(writer);
-    let group_stopped = crate::codex_capabilities::terminate_group(&mut child);
-    let reader_stopped = reader.join().is_ok();
-    let writer_stopped = writer_thread.join().is_ok();
-    if !group_stopped || !reader_stopped || !writer_stopped {
-        return Err(CodexSessionFailure::after_exchange(
-            CodexSessionError::Containment,
-            turn_dispatch_attempted,
+pub(crate) fn read_codex_turn(
+    command: Command,
+    request: CodexTurnReadRequest<'_>,
+) -> Result<CodexTurnStatus, CodexSessionFailure> {
+    if Instant::now() >= request.deadline {
+        return Err(CodexSessionFailure::before_turn_dispatch(
+            CodexSessionError::Timeout,
         ));
     }
-    match exchange_result {
-        Ok(terminal) => Ok(terminal),
-        Err(error) => Err(CodexSessionFailure::after_exchange(
-            error,
-            turn_dispatch_attempted,
-        )),
-    }
+    let mut exchange = codex_turn_read::TurnReadExchange::new(
+        request.thread_ref,
+        request.turn_ref,
+        request.deadline,
+    );
+    run_exchange(
+        command,
+        request.working_directory,
+        request.deadline,
+        &mut exchange,
+    )
 }
 
 struct SessionExchange<'a> {
     request: CodexSessionRequest<'a>,
-    responses: [bool; 4],
+    responses: [bool; 5],
     thread_ref: Option<String>,
     thread_observed: bool,
     turn_ref: Option<String>,
     turn_dispatch_attempted: bool,
     terminal: Option<CodexSessionTerminal>,
+    control: Option<mpsc::Receiver<ControlCommand>>,
+    pending_interrupt: Option<mpsc::Sender<StopObservation>>,
+    interrupt_sent: bool,
+    controlled_stop: bool,
+    stop_committed: bool,
 }
 
 impl<'a> SessionExchange<'a> {
-    fn new(request: CodexSessionRequest<'a>) -> Self {
+    fn new(
+        request: CodexSessionRequest<'a>,
+        control: Option<mpsc::Receiver<ControlCommand>>,
+    ) -> Self {
         Self {
             thread_ref: request.existing_thread_ref.map(str::to_owned),
             request,
-            responses: [false; 4],
+            responses: [false; 5],
             thread_observed: false,
             turn_ref: None,
             turn_dispatch_attempted: false,
             terminal: None,
+            control,
+            pending_interrupt: None,
+            interrupt_sent: false,
+            controlled_stop: false,
+            stop_committed: false,
         }
     }
 
-    fn run(
+    fn run_inner(
         &mut self,
         writer: &ProtocolWriter,
         receiver: &mpsc::Receiver<ReadEvent>,
@@ -272,15 +320,27 @@ impl<'a> SessionExchange<'a> {
         self.write_initialize(writer)?;
         while !self.responses[1] {
             self.consume_next(writer, receiver)?;
+            if self.controlled_stop {
+                return self.wait_for_stop_commit(writer);
+            }
+        }
+        self.poll_control(writer)?;
+        if self.controlled_stop {
+            return self.wait_for_stop_commit(writer);
         }
         writer.write(&json!({"method": "initialized"}))?;
         self.write_thread_request(writer)?;
 
         loop {
-            if !self.turn_dispatch_attempted && self.thread_observed {
+            self.poll_control(writer)?;
+            if self.controlled_stop {
+                return self.wait_for_stop_commit(writer);
+            }
+            if !self.controlled_stop && !self.turn_dispatch_attempted && self.thread_observed {
                 self.write_turn_request(writer)?;
             }
-            if self.responses[2]
+            if !self.controlled_stop
+                && self.responses[2]
                 && self.responses[3]
                 && let Some(terminal) = self.terminal
             {
@@ -295,24 +355,102 @@ impl<'a> SessionExchange<'a> {
         writer: &ProtocolWriter,
         receiver: &mpsc::Receiver<ReadEvent>,
     ) -> Result<(), CodexSessionError> {
+        self.poll_control(writer)?;
+        if self.controlled_stop {
+            return Ok(());
+        }
         let remaining = self
             .request
             .deadline
             .checked_duration_since(Instant::now())
             .ok_or(CodexSessionError::Timeout)?;
-        match receiver.recv_timeout(remaining) {
+        let wait = if self.control.is_some() {
+            remaining.min(CONTROL_POLL_INTERVAL)
+        } else {
+            remaining
+        };
+        match receiver.recv_timeout(wait) {
             Ok(ReadEvent::Line(line)) => {
                 if let Some(response) = self.consume_line(&line)? {
                     writer.write(&response)?;
                 }
+                self.poll_control(writer)?;
                 Ok(())
             }
             Ok(ReadEvent::Oversized) => Err(CodexSessionError::OversizedMessage),
             Ok(ReadEvent::Eof | ReadEvent::Io) => Err(CodexSessionError::PrematureExit),
             Ok(ReadEvent::Timeout) => Err(CodexSessionError::Timeout),
+            Err(mpsc::RecvTimeoutError::Timeout) if Instant::now() < self.request.deadline => {
+                self.poll_control(writer)
+            }
             Err(mpsc::RecvTimeoutError::Timeout) => Err(CodexSessionError::Timeout),
             Err(mpsc::RecvTimeoutError::Disconnected) => Err(CodexSessionError::PrematureExit),
         }
+    }
+
+    fn poll_control(&mut self, writer: &ProtocolWriter) -> Result<(), CodexSessionError> {
+        loop {
+            let command = match self.control.as_ref().map(mpsc::Receiver::try_recv) {
+                Some(Ok(command)) => command,
+                Some(Err(mpsc::TryRecvError::Empty)) | None => break,
+                Some(Err(mpsc::TryRecvError::Disconnected)) => {
+                    self.control = None;
+                    break;
+                }
+            };
+            match command {
+                ControlCommand::Interrupt { reply } => {
+                    if self.pending_interrupt.is_some() || self.controlled_stop {
+                        let _ = reply.send(StopObservation::OutcomeUnknown);
+                    } else if self.terminal.is_some() || !self.turn_dispatch_attempted {
+                        self.controlled_stop = reply
+                            .send(StopObservation::UpstreamInactiveConfirmed)
+                            .is_ok();
+                    } else {
+                        self.pending_interrupt = Some(reply);
+                    }
+                }
+                ControlCommand::StopCommitted => self.stop_committed = true,
+            }
+        }
+        self.maybe_write_interrupt(writer)
+    }
+
+    fn maybe_write_interrupt(&mut self, writer: &ProtocolWriter) -> Result<(), CodexSessionError> {
+        if self.pending_interrupt.is_none() || self.interrupt_sent {
+            return Ok(());
+        }
+        let (Some(thread_ref), Some(turn_ref)) =
+            (self.thread_ref.as_deref(), self.turn_ref.as_deref())
+        else {
+            return Ok(());
+        };
+        writer.write_after_queue(
+            &json!({
+                "id": 4,
+                "method": "turn/interrupt",
+                "params": {"threadId": thread_ref, "turnId": turn_ref}
+            }),
+            || self.interrupt_sent = true,
+        )
+    }
+
+    fn wait_for_stop_commit(
+        &mut self,
+        writer: &ProtocolWriter,
+    ) -> Result<CodexSessionTerminal, CodexSessionError> {
+        while !self.stop_committed {
+            self.poll_control(writer)?;
+            if !self.stop_committed {
+                let remaining = self
+                    .request
+                    .deadline
+                    .checked_duration_since(Instant::now())
+                    .ok_or(CodexSessionError::Timeout)?;
+                std::thread::sleep(remaining.min(CONTROL_POLL_INTERVAL));
+            }
+        }
+        Ok(CodexSessionTerminal::StoppedByControl)
     }
 
     fn consume_line(&mut self, line: &[u8]) -> Result<Option<Value>, CodexSessionError> {
@@ -391,10 +529,17 @@ impl<'a> SessionExchange<'a> {
             .get("id")
             .and_then(Value::as_u64)
             .and_then(|id| usize::try_from(id).ok())
-            .filter(|id| (1..=3).contains(id))
+            .filter(|id| (1..=4).contains(id))
             .ok_or(CodexSessionError::UnexpectedResponse)?;
         if self.responses[id] {
             return Err(CodexSessionError::DuplicateResponse);
+        }
+        if object.contains_key("error") && id == 4 && self.interrupt_sent {
+            if let Some(reply) = self.pending_interrupt.take() {
+                let _ = reply.send(StopObservation::OutcomeUnknown);
+            }
+            self.responses[id] = true;
+            return Ok(());
         }
         if object.contains_key("error") {
             return Err(CodexSessionError::ResponseError);
@@ -420,6 +565,7 @@ impl<'a> SessionExchange<'a> {
                 let turn_ref = required_string(turn, "id")?;
                 self.observe_turn(turn_ref)?;
             }
+            4 if self.interrupt_sent => {}
             _ => return Err(CodexSessionError::UnexpectedResponse),
         }
         self.responses[id] = true;
@@ -464,6 +610,11 @@ impl<'a> SessionExchange<'a> {
                     return Err(CodexSessionError::ConflictingIdentity);
                 }
                 self.terminal = Some(terminal);
+                if let Some(reply) = self.pending_interrupt.take() {
+                    self.controlled_stop = reply
+                        .send(StopObservation::UpstreamInactiveConfirmed)
+                        .is_ok();
+                }
                 Ok(())
             }
             "item/started" | "item/completed" if self.turn_dispatch_attempted => {
@@ -575,6 +726,22 @@ impl<'a> SessionExchange<'a> {
     }
 }
 
+impl CodexExchange for SessionExchange<'_> {
+    type Output = CodexSessionTerminal;
+
+    fn run(
+        &mut self,
+        writer: &ProtocolWriter,
+        receiver: &mpsc::Receiver<ReadEvent>,
+    ) -> Result<Self::Output, CodexSessionError> {
+        self.run_inner(writer, receiver)
+    }
+
+    fn turn_dispatch_attempted(&self) -> bool {
+        self.turn_dispatch_attempted
+    }
+}
+
 fn validate_initialize(result: &Map<String, Value>) -> Result<(), CodexSessionError> {
     ["userAgent", "codexHome", "platformFamily", "platformOs"]
         .into_iter()
@@ -609,125 +776,4 @@ fn required_string<'a>(
         .and_then(Value::as_str)
         .filter(|value| !value.is_empty())
         .ok_or(CodexSessionError::MalformedMessage)
-}
-
-struct ProtocolWriter {
-    sender: mpsc::Sender<WriteCommand>,
-    deadline: Instant,
-}
-
-struct WriteCommand {
-    bytes: Vec<u8>,
-    completed: mpsc::Sender<Result<(), ()>>,
-}
-
-impl ProtocolWriter {
-    fn write(&self, value: &Value) -> Result<(), CodexSessionError> {
-        self.write_after_queue(value, || {})
-    }
-
-    fn write_after_queue(
-        &self,
-        value: &Value,
-        after_queue: impl FnOnce(),
-    ) -> Result<(), CodexSessionError> {
-        if Instant::now() >= self.deadline {
-            return Err(CodexSessionError::Timeout);
-        }
-        let mut bytes = serde_json::to_vec(value).map_err(|_| CodexSessionError::Write)?;
-        bytes.push(b'\n');
-        if Instant::now() >= self.deadline {
-            return Err(CodexSessionError::Timeout);
-        }
-        let (completed, completion) = mpsc::channel();
-        self.sender
-            .send(WriteCommand { bytes, completed })
-            .map_err(|_| CodexSessionError::Write)?;
-        after_queue();
-        let remaining = self
-            .deadline
-            .checked_duration_since(Instant::now())
-            .ok_or(CodexSessionError::Timeout)?;
-        match completion.recv_timeout(remaining) {
-            Ok(Ok(())) => Ok(()),
-            Ok(Err(())) | Err(mpsc::RecvTimeoutError::Disconnected) => {
-                Err(CodexSessionError::Write)
-            }
-            Err(mpsc::RecvTimeoutError::Timeout) => Err(CodexSessionError::Timeout),
-        }
-    }
-}
-
-fn write_messages(mut stdin: std::process::ChildStdin, receiver: mpsc::Receiver<WriteCommand>) {
-    while let Ok(command) = receiver.recv() {
-        let result = stdin
-            .write_all(&command.bytes)
-            .and_then(|()| stdin.flush())
-            .map_err(|_| ());
-        let failed = result.is_err();
-        let _ = command.completed.send(result);
-        if failed {
-            return;
-        }
-    }
-}
-
-enum ReadEvent {
-    Line(Vec<u8>),
-    Oversized,
-    Eof,
-    Io,
-    Timeout,
-}
-
-fn read_messages(
-    stdout: std::process::ChildStdout,
-    deadline: Instant,
-    sender: mpsc::SyncSender<ReadEvent>,
-) {
-    let mut reader = BufReader::new(stdout);
-    loop {
-        let mut line = Vec::new();
-        let mut bounded = (&mut reader).take((INBOUND_LINE_LIMIT + 1) as u64);
-        loop {
-            match bounded.read_until(b'\n', &mut line) {
-                Ok(0) if line.is_empty() => {
-                    let _ = sender.send(ReadEvent::Eof);
-                    return;
-                }
-                // App-server messages are JSON Lines. A final fragment is not
-                // a message even when its bytes happen to form valid JSON.
-                Ok(0) => {
-                    let _ = sender.send(ReadEvent::Io);
-                    return;
-                }
-                Ok(_) if line.last() == Some(&b'\n') => break,
-                Ok(_) if line.len() > INBOUND_LINE_LIMIT => {
-                    let _ = sender.send(ReadEvent::Oversized);
-                    return;
-                }
-                Ok(_) => {}
-                Err(error)
-                    if error.kind() == ErrorKind::WouldBlock && Instant::now() < deadline =>
-                {
-                    thread::sleep(READER_POLL_INTERVAL);
-                }
-                Err(error) if error.kind() == ErrorKind::WouldBlock => {
-                    let _ = sender.send(ReadEvent::Timeout);
-                    return;
-                }
-                Err(_) => {
-                    let _ = sender.send(ReadEvent::Io);
-                    return;
-                }
-            }
-        }
-        if line.len() > INBOUND_LINE_LIMIT {
-            let _ = sender.send(ReadEvent::Oversized);
-            return;
-        }
-        if sender.send(ReadEvent::Line(line)).is_err() {
-            return;
-        }
-    }
 }

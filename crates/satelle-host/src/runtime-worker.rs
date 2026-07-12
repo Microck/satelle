@@ -121,7 +121,22 @@ impl RuntimeEngine {
             AdapterSubject::new(&plan.work.subject),
             &persist_upstream_ref,
         ))?;
-        let transition = result.transition();
+        let Some(transition) = result.transition() else {
+            let session = self
+                .lock_storage()?
+                .load_session(&session_id)
+                .map_err(model::storage_failure)?
+                .ok_or_else(|| SatelleError::session_not_found(&session_id))?;
+            let turn = session
+                .turn(&turn_id)
+                .ok_or_else(|| model::integrity_failure("the controlled Turn is missing"))?;
+            if turn.state() != satelle_core::session::TurnState::Stopped {
+                return Err(model::integrity_failure(
+                    "controlled execution returned before stop was durable",
+                ));
+            }
+            return model::turn_outcome(&session, Vec::new());
+        };
         if matches!(
             transition,
             TurnTransition::Running | TurnTransition::RecoveryPending

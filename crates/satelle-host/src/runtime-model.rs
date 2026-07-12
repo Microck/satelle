@@ -279,7 +279,13 @@ pub(super) fn stop_result(
 }
 
 pub(super) fn recovery_host_busy(subject: &RecoverySubject) -> SatelleError {
-    SatelleError::host_busy(LOCAL_DEMO_HOST, subject.session_id())
+    let mut error = SatelleError::host_busy(LOCAL_DEMO_HOST, subject.session_id());
+    error.details.insert(
+        "reason".to_string(),
+        Value::String("outcome_unknown".to_string()),
+    );
+    error.recovery_command = Some(format!("satelle status {} --json", subject.session_id()));
+    error
 }
 
 fn stop_not_confirmed(
@@ -305,7 +311,7 @@ fn stop_not_confirmed(
     details.insert("state_changed".to_string(), Value::Bool(changed));
     details.insert("retryable".to_string(), Value::Bool(true));
     SatelleError {
-        code: ErrorCode::RemoteExecution,
+        code: ErrorCode::StopNotConfirmed,
         message: "stop was not confirmed; Satelle retained control of the Turn".to_string(),
         recovery_command: Some(format!("satelle status {session_id} --json")),
         source_detail: None,

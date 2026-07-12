@@ -3,7 +3,7 @@ use super::{ApiFailure, DaemonState, api_error_response};
 use crate::contract::{ApiErrorCategory, ApiErrorCode};
 use axum::http::StatusCode;
 use axum::response::Response;
-use satelle_core::{ErrorCode, IncompatibleControlPlaneDetails, SatelleError};
+use satelle_core::{ErrorCode, IncompatibleControlPlaneDetails, SatelleError, SessionId, TurnId};
 
 pub(super) fn response(
     state: &DaemonState,
@@ -129,6 +129,14 @@ fn failure(error: &SatelleError) -> ApiFailure {
             message: "the Host state changed before the operation could commit",
             details: None,
         },
+        ErrorCode::StopNotConfirmed => ApiFailure {
+            status: StatusCode::CONFLICT,
+            code: ApiErrorCode::StopNotConfirmed,
+            category: ApiErrorCategory::Conflict,
+            retryable: true,
+            message: "upstream cancellation could not be confirmed",
+            details: validated_stop_not_confirmed_details(error),
+        },
         ErrorCode::IncompatibleControlPlane => ApiFailure {
             status: StatusCode::SERVICE_UNAVAILABLE,
             code: ApiErrorCode::IncompatibleControlPlane,
@@ -214,6 +222,31 @@ fn validated_control_plane_details(error: &SatelleError) -> Option<serde_json::V
     let value = serde_json::Value::Object(error.details.clone().into_iter().collect());
     let details = serde_json::from_value::<IncompatibleControlPlaneDetails>(value).ok()?;
     serde_json::to_value(details).ok()
+}
+
+fn validated_stop_not_confirmed_details(error: &SatelleError) -> Option<serde_json::Value> {
+    if error.details.len() != 5 {
+        return None;
+    }
+    let session_id = error.details.get("session_id")?.as_str()?;
+    let turn_id = error.details.get("turn_id")?.as_str()?;
+    SessionId::parse(session_id).ok()?;
+    TurnId::parse(turn_id).ok()?;
+    let ownership = error.details.get("ownership")?.as_str()?;
+    if !matches!(ownership, "active" | "recovery_pending") {
+        return None;
+    }
+    let state_changed = error.details.get("state_changed")?.as_bool()?;
+    if !error.details.get("retryable")?.as_bool()? {
+        return None;
+    }
+    Some(serde_json::json!({
+        "session_id": session_id,
+        "turn_id": turn_id,
+        "ownership": ownership,
+        "state_changed": state_changed,
+        "retryable": true
+    }))
 }
 
 #[cfg(test)]
@@ -306,5 +339,57 @@ mod tests {
         assert_eq!(mapped.category, ApiErrorCategory::Conflict);
         assert!(mapped.retryable);
         assert_eq!(mapped.details, None);
+    }
+
+    #[test]
+    fn stop_not_confirmed_is_a_retryable_conflict_response() {
+        let session_id = SessionId::new();
+        let turn_id = TurnId::new();
+        let mapped = failure(&SatelleError {
+            code: ErrorCode::StopNotConfirmed,
+            message: "PRIVATE_INTERNAL_STOP_MESSAGE".to_string(),
+            recovery_command: None,
+            source_detail: None,
+            details: BTreeMap::from([
+                ("session_id".to_string(), json!(session_id)),
+                ("turn_id".to_string(), json!(turn_id)),
+                ("ownership".to_string(), json!("recovery_pending")),
+                ("state_changed".to_string(), json!(true)),
+                ("retryable".to_string(), json!(true)),
+            ]),
+        });
+
+        assert_eq!(mapped.status, StatusCode::CONFLICT);
+        assert_eq!(mapped.code, ApiErrorCode::StopNotConfirmed);
+        assert_eq!(mapped.category, ApiErrorCategory::Conflict);
+        assert!(mapped.retryable);
+        assert!(!mapped.message.contains("PRIVATE_"));
+        assert_eq!(
+            mapped.details,
+            Some(json!({
+                "session_id": session_id,
+                "turn_id": turn_id,
+                "ownership": "recovery_pending",
+                "state_changed": true,
+                "retryable": true
+            }))
+        );
+    }
+
+    #[test]
+    fn malformed_stop_details_do_not_cross_the_http_boundary() {
+        let mapped = failure(&SatelleError {
+            code: ErrorCode::StopNotConfirmed,
+            message: "PRIVATE_INTERNAL_STOP_MESSAGE".to_string(),
+            recovery_command: None,
+            source_detail: Some("PRIVATE_SOURCE_CANARY".to_string()),
+            details: BTreeMap::from([
+                ("ownership".to_string(), json!("PRIVATE_INVALID_OWNER")),
+                ("raw".to_string(), json!("PRIVATE_DETAILS_CANARY")),
+            ]),
+        });
+
+        assert_eq!(mapped.details, None);
+        assert!(!mapped.message.contains("PRIVATE_"));
     }
 }

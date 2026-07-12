@@ -37,7 +37,7 @@ use crate::{ApiBearerToken, ApiPrincipal};
 pub(crate) use crate::{LogEvent, LogSeverity, LogSource};
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior};
 use satelle_core::session::{
-    ExecutionPolicy, ExpectedRevisions, HostIdentityRef, Session, SessionStateRevision,
+    ExecutionPolicy, ExpectedRevisions, HostIdentityRef, Session, SessionStateRevision, TurnState,
     TurnTransition,
 };
 use satelle_core::{SessionId, TurnId};
@@ -360,6 +360,7 @@ impl ObservedUpstreamRef {
 pub(crate) struct RecoverySubject {
     session_id: SessionId,
     turn_id: TurnId,
+    turn_state: TurnState,
     expected_revisions: ExpectedRevisions,
     host_identity: HostIdentityRef,
     request_token: PrivateRequestToken,
@@ -374,6 +375,10 @@ impl RecoverySubject {
 
     pub(crate) fn turn_id(&self) -> &TurnId {
         &self.turn_id
+    }
+
+    pub(crate) fn turn_state(&self) -> TurnState {
+        self.turn_state
     }
 
     pub(crate) fn expected_revisions(&self) -> ExpectedRevisions {
@@ -403,6 +408,7 @@ impl fmt::Debug for RecoverySubject {
             .debug_struct("RecoverySubject")
             .field("session_id", &self.session_id)
             .field("turn_id", &self.turn_id)
+            .field("turn_state", &self.turn_state)
             .field("expected_revisions", &self.expected_revisions)
             .finish_non_exhaustive()
     }
