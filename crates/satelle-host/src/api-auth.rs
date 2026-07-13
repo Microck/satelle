@@ -228,6 +228,27 @@ mod tests {
         let exposed = token.expose();
         let reparsed = ApiBearerToken::parse(&exposed).expect("parse generated token");
 
+        let mut segments = exposed.split('.');
+        assert_eq!(segments.next(), Some(TOKEN_PREFIX));
+        assert_eq!(segments.next(), Some(token.token_id()));
+        let encoded_secret = segments.next().expect("token has a secret segment");
+        assert!(segments.next().is_none());
+        assert_eq!(
+            URL_SAFE_NO_PAD
+                .decode(encoded_secret)
+                .expect("generated secret uses canonical base64url")
+                .len(),
+            TOKEN_SECRET_BYTES
+        );
+        let uuid = Uuid::parse_str(
+            token
+                .token_id()
+                .strip_prefix("token-")
+                .expect("generated token ID has the stable prefix"),
+        )
+        .expect("generated token ID contains a UUID");
+        assert_eq!(uuid.get_version_num(), 7);
+
         assert_eq!(token.token_id(), reparsed.token_id());
         assert_eq!(token.verifier(), reparsed.verifier());
         assert!(!format!("{token:?}").contains(exposed.as_str()));
@@ -265,6 +286,18 @@ mod tests {
 
     #[test]
     fn scope_hierarchy_is_explicit_and_diagnostics_remains_additive() {
+        for scope in [
+            ApiScopes::READ,
+            ApiScopes::CONTROL,
+            ApiScopes::ADMIN,
+            ApiScopes::DIAGNOSTICS_SENSITIVE,
+        ] {
+            assert_ne!(scope.bits(), 0);
+            assert_eq!(ApiScopes::from_bits(scope.bits()), Ok(scope));
+        }
+        assert_eq!(ApiScopes::from_bits(0), Err(ApiScopeDecodeError));
+        assert_eq!(ApiScopes::from_bits(0x10), Err(ApiScopeDecodeError));
+
         assert!(ApiScopes::CONTROL.allows(ApiScopes::READ));
         assert!(ApiScopes::ADMIN.allows(ApiScopes::CONTROL | ApiScopes::READ));
         assert!(!ApiScopes::READ.allows(ApiScopes::CONTROL));
