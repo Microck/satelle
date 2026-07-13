@@ -226,9 +226,15 @@ mod tests {
 
     #[test]
     fn public_session_deserialization_accepts_one_coherent_snapshot() {
-        let session = serde_json::from_value::<PublicSession>(starting_session())
+        let expected = starting_session();
+        let session = serde_json::from_value::<PublicSession>(expected.clone())
             .expect("decode coherent public Session");
         assert_eq!(session.session_id().as_str(), SESSION_ID);
+        assert_eq!(
+            serde_json::to_value(session).expect("serialize public Session"),
+            expected,
+            "public lifecycle serialization must not expose private upstream or policy fields"
+        );
     }
 
     #[test]

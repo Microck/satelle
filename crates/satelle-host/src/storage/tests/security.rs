@@ -3,14 +3,32 @@ use crate::LogSubject;
 use crate::storage::open::PROTECTED_FILE_NAMES;
 
 #[test]
-fn normal_rows_and_database_bytes_exclude_prompt_and_upstream_canaries() {
-    const PROMPT_CANARY: &str = "prompt canary with spaces SECRET-9090";
+fn private_upstream_refs_are_isolated_from_public_rows_and_logs() {
     const UPSTREAM_THREAD: &str = "thread-private-canary-9090";
     const UPSTREAM_TURN: &str = "turn-private-canary-9090";
+    const MODEL_REF: &str = "model-private-canary-9090";
+    const PROVIDER_REF: &str = "provider-private-canary-9090";
 
     let state = TempDir::new().expect("temporary state directory");
     let (mut storage, _) = Storage::open(state.path()).expect("open storage");
-    let session = initial_session(&storage, SESSION_1, TURN_1, at(0));
+    let desktop_binding = DesktopBindingRef::new("desktop-binding-1").unwrap();
+    let session = Session::start(
+        session_id(SESSION_1),
+        storage.host_identity().expect("load Host Identity"),
+        desktop_binding.clone(),
+        turn_id(TURN_1),
+        ExecutionPolicy::new(
+            EffectiveModelRef::new(MODEL_REF).unwrap(),
+            ProviderBindingRef::new(PROVIDER_REF).unwrap(),
+            DesktopTarget::new(desktop_binding),
+            ApprovalPolicy::OnRequest,
+            SandboxPolicy::WorkspaceWrite,
+            TimeoutPolicy::bounded_seconds(120).unwrap(),
+            ExperimentalFeatureChoices::new(FeatureChoice::Enabled, FeatureChoice::Disabled),
+        ),
+        at(0),
+    )
+    .unwrap();
     storage
         .begin_session(
             &session,
@@ -83,7 +101,6 @@ fn normal_rows_and_database_bytes_exclude_prompt_and_upstream_canaries() {
             |row| row.get(0),
         )
         .expect("read public-safe rows");
-    assert!(!public_rows.contains(PROMPT_CANARY));
     assert!(!public_rows.contains(UPSTREAM_THREAD));
     assert!(!public_rows.contains(UPSTREAM_TURN));
     let private_refs: (String, String) = storage
@@ -98,20 +115,154 @@ fn normal_rows_and_database_bytes_exclude_prompt_and_upstream_canaries() {
         (UPSTREAM_THREAD.to_string(), UPSTREAM_TURN.to_string()),
         private_refs
     );
-    storage.checkpoint_for_test();
-    drop(storage);
 
-    for suffix in [
-        "satelle.sqlite3",
-        "satelle.sqlite3-wal",
-        "satelle.sqlite3-shm",
-    ] {
-        let path = state.path().join(suffix);
-        if path.exists() {
-            let bytes = fs::read(path).expect("read SQLite storage file");
-            assert!(!contains_bytes(&bytes, PROMPT_CANARY.as_bytes()));
-        }
+    // Exercise the actual storage-to-public conversion rather than a synthetic
+    // public value. Internal adapter and policy identifiers must stop at this
+    // boundary even though the private tables retain them for recovery.
+    let public_json = serde_json::to_string(
+        &storage
+            .load_session(session.id())
+            .expect("load stored Session")
+            .expect("stored Session exists")
+            .to_public(),
+    )
+    .expect("serialize public Session");
+    for private_canary in [UPSTREAM_THREAD, UPSTREAM_TURN, MODEL_REF, PROVIDER_REF] {
+        assert!(
+            !public_json.contains(private_canary),
+            "public Session exposed private identifier {private_canary}"
+        );
     }
+}
+
+fn assert_table_columns(storage: &Storage, table: &str, expected: &[&str]) {
+    let mut statement = storage
+        .connection_for_test()
+        .prepare("SELECT name FROM pragma_table_info(?1) ORDER BY cid")
+        .expect("prepare table-column query");
+    let columns = statement
+        .query_map([table], |row| row.get::<_, String>(0))
+        .expect("query table columns")
+        .collect::<Result<Vec<_>, _>>()
+        .expect("decode table columns");
+    assert_eq!(
+        columns.iter().map(String::as_str).collect::<Vec<_>>(),
+        expected,
+        "unexpected persistence field in {table}"
+    );
+}
+
+#[test]
+fn lifecycle_schema_excludes_raw_content_and_replayable_event_history() {
+    let state = TempDir::new().expect("temporary state directory");
+    let (storage, _) = Storage::open(state.path()).expect("open storage");
+
+    // This closed allowlist is intentionally strict: every new SQLite table
+    // must receive an explicit privacy review before it can become persistent.
+    let mut statement = storage
+        .connection_for_test()
+        .prepare("SELECT name FROM sqlite_schema WHERE type = 'table' ORDER BY name")
+        .expect("prepare table-name query");
+    let tables = statement
+        .query_map([], |row| row.get::<_, String>(0))
+        .expect("query table names")
+        .collect::<Result<Vec<_>, _>>()
+        .expect("decode table names");
+    assert_eq!(
+        tables,
+        [
+            "api_tokens",
+            "control_leases",
+            "daemon_identity",
+            "idempotency_hmac_keys",
+            "idempotency_records",
+            "log_retention_state",
+            "logs",
+            "maintenance_leases",
+            "provider_smoke_successes",
+            "readiness_successes",
+            "schema_migrations",
+            "session_private_refs",
+            "sessions",
+            "sqlite_sequence",
+            "turn_policies",
+            "turn_private_refs",
+            "turns",
+        ]
+    );
+
+    assert_table_columns(
+        &storage,
+        "sessions",
+        &[
+            "session_id",
+            "session_state_revision",
+            "created_at",
+            "updated_at",
+        ],
+    );
+    assert_table_columns(
+        &storage,
+        "turns",
+        &[
+            "turn_id",
+            "session_id",
+            "ordinal",
+            "turn_state_revision",
+            "state",
+            "started_at",
+            "updated_at",
+            "terminal_at",
+            "safe_summary",
+        ],
+    );
+    assert_table_columns(
+        &storage,
+        "logs",
+        &[
+            "log_cursor",
+            "recorded_at",
+            "recorded_at_unix_nanos",
+            "source",
+            "severity",
+            "event_kind",
+            "session_id",
+            "turn_id",
+            "session_state_revision",
+            "turn_state_revision",
+            "redacted",
+        ],
+    );
+    assert_table_columns(
+        &storage,
+        "session_private_refs",
+        &[
+            "session_id",
+            "host_identity_ref",
+            "desktop_binding_ref",
+            "upstream_thread_ref",
+        ],
+    );
+    assert_table_columns(
+        &storage,
+        "turn_private_refs",
+        &["turn_id", "request_token", "upstream_turn_ref"],
+    );
+    assert_table_columns(
+        &storage,
+        "turn_policies",
+        &[
+            "turn_id",
+            "effective_model_ref",
+            "provider_binding_ref",
+            "desktop_binding_ref",
+            "approval_policy",
+            "sandbox_policy",
+            "timeout_seconds",
+            "computer_use_enabled",
+            "provider_computer_use_enabled",
+        ],
+    );
 }
 
 #[test]

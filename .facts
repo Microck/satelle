@@ -1497,11 +1497,11 @@
 - a failed startup integrity check blocks state-changing operations plus ordinary status and log reads until repair or restore succeeds, while exposing only minimal redacted integrity diagnostics needed for safe repair @spec @mvp
 
 ## privacy-and-filesystem
-- Satelle-owned SQLite Session and Turn records do not store raw prompt text by default @spec @mvp
+- Satelle-owned SQLite Session and Turn records do not store raw prompt text by default @spec @mvp @implemented
 - Satelle-owned stores do not persist raw Codex final transcripts by default @spec @mvp
 - prompt-derived summaries are redacted before persistence @spec @mvp
 - when required redaction fails, Satelle omits the sensitive field or fails the entire record, output, or artifact write and never persists or emits the unredacted value as a fallback @spec @mvp
-- internal Codex and provider identifiers are schema-marked sensitive storage fields and never enter public response types @spec @mvp
+- internal Codex and provider identifiers are schema-marked sensitive storage fields and never enter public response types @spec @mvp @implemented
 - Host Daemon state directories are accessible only to the daemon OS user and required operating-system service principals @spec @mvp @implemented
 - Satelle creates sensitive POSIX directories with mode 0700 and sensitive POSIX files with mode 0600 @spec @mvp @implemented
 - Satelle applies equivalent current-user restricted ACLs to sensitive Windows state @spec @mvp @implemented
@@ -1586,7 +1586,7 @@
 - satelle repair human output mentions unavailable setup history as a warning only when it affects explanation quality, then shows the live-probe-derived repair plan @spec @mvp
 - satelle repair JSON output includes ledger_status and plan_source fields when repair planning uses live probes because no usable setup action ledger is available @spec @mvp
 - satelle reports a typed setup-ledger-unavailable diagnostic when a user asks to inspect or resume a specific setup run whose ledger records expired or are missing @spec @mvp
-- satelle SQLite does not store a replayable Satelle Event history in MVP @spec @mvp
+- satelle SQLite does not store a replayable Satelle Event history in MVP @spec @mvp @implemented
 - satelle stores opt-in recording artifacts as files referenced by SQLite metadata instead of storing large screenshots or transcripts directly in SQLite @spec @later
 - satelle SQLite recording metadata includes artifact path, timestamp, type, hash or integrity marker, and retention state @spec @later
 - satelle stores recording artifact files under an OS-native Satelle app data directory on the remote host @spec @later
