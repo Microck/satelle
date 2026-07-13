@@ -9,6 +9,9 @@ use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
 use tokio_tungstenite::tungstenite::{Error as WebSocketError, Message};
 use tokio_tungstenite::{WebSocketStream, client_async};
 
+#[path = "events/limits.rs"]
+mod limits;
+
 type EventSocket = WebSocketStream<TcpStream>;
 
 async fn connect_events(running: &RunningServer) -> EventSocket {
@@ -649,7 +652,7 @@ async fn replacing_event_subscriptions_filters_live_events_without_resetting_seq
 }
 
 #[tokio::test]
-async fn event_handshakes_enforce_shape_and_per_principal_connection_capacity() {
+async fn event_handshakes_reject_unexpected_query_cookie_and_body_shapes() {
     let running = RunningServer::start(ApiScopes::READ).await;
     for request in [
         running.request("/v1/events?unexpected=true"),
@@ -670,45 +673,6 @@ async fn event_handshakes_enforce_shape_and_per_principal_connection_capacity() 
             "invalid-request"
         );
     }
-
-    let second_token = ApiBearerToken::generate().expect("generate second Principal token");
-    running
-        .service
-        .register_api_token(&second_token, "principal-http-test", ApiScopes::READ, None)
-        .expect("register second token for the same Principal");
-    let other_principal = ApiBearerToken::generate().expect("generate other Principal token");
-    running
-        .service
-        .register_api_token(&other_principal, "principal-other", ApiScopes::READ, None)
-        .expect("register token for another Principal");
-
-    let mut sockets = Vec::new();
-    for token in [&running.token, &running.token, &second_token, &second_token] {
-        sockets.push(
-            connect_events_at(running.server.local_addr(), token, &running.host_identity).await,
-        );
-    }
-    let error = try_connect_events_at(
-        running.server.local_addr(),
-        &second_token,
-        &running.host_identity,
-    )
-    .await
-    .expect_err("the fifth Principal connection must be rejected");
-    match error {
-        WebSocketError::Http(response) => {
-            assert_eq!(response.status().as_u16(), StatusCode::TOO_MANY_REQUESTS);
-        }
-        other => panic!("expected HTTP capacity rejection, got {other:?}"),
-    }
-    sockets.push(
-        connect_events_at(
-            running.server.local_addr(),
-            &other_principal,
-            &running.host_identity,
-        )
-        .await,
-    );
 }
 
 #[tokio::test]
@@ -830,131 +794,6 @@ async fn daemon_event_client_preserves_typed_handshake_rejections() {
             if status == StatusCode::UNAUTHORIZED.as_u16()
                 && error.code().as_str() == "authentication-failed"
                 && error.host_identity().is_none()
-    ));
-}
-
-#[tokio::test]
-async fn event_socket_enforces_the_advertised_inbound_message_limit() {
-    let running = RunningServer::start(ApiScopes::READ).await;
-    let mut socket = connect_events(&running).await;
-    for _ in 0..120 {
-        send_subscribe(&mut socket, vec![EventSubscription::Host]).await;
-        expect_subscribed(&mut socket, &running.host_identity).await;
-    }
-
-    send_subscribe(&mut socket, vec![EventSubscription::Host]).await;
-    let error: WsServerControl = serde_json::from_str(&next_text(&mut socket).await)
-        .expect("decode rate-limit control error");
-    assert!(matches!(
-        error,
-        WsServerControl::Error(error) if error.code().as_str() == "rate-limited"
-    ));
-    let close = socket
-        .next()
-        .await
-        .expect("receive rate-limit close")
-        .expect("decode rate-limit close");
-    assert!(matches!(
-        close,
-        Message::Close(Some(frame)) if frame.code == CloseCode::Policy && frame.reason == "rate-limited"
-    ));
-}
-
-#[tokio::test]
-async fn event_socket_charges_non_text_frames_to_the_inbound_limit() {
-    let running = RunningServer::start(ApiScopes::READ).await;
-    let mut socket = connect_events(&running).await;
-    for _ in 0..120 {
-        socket
-            .send(Message::Pong(Vec::new().into()))
-            .await
-            .expect("send inbound pong frame");
-    }
-
-    send_subscribe(&mut socket, vec![EventSubscription::Host]).await;
-    let error: WsServerControl = serde_json::from_str(&next_text(&mut socket).await)
-        .expect("decode non-text rate-limit control error");
-    assert!(matches!(
-        error,
-        WsServerControl::Error(error)
-            if error.reason() == satelle_transport::WsCloseReason::RateLimited
-    ));
-    let close = socket
-        .next()
-        .await
-        .expect("receive non-text rate-limit close")
-        .expect("decode non-text rate-limit close");
-    assert!(matches!(
-        close,
-        Message::Close(Some(frame)) if frame.code == CloseCode::Policy && frame.reason == "rate-limited"
-    ));
-}
-
-#[tokio::test]
-async fn event_socket_reports_subscription_capacity_separately_from_invalid_input() {
-    let running = RunningServer::start(ApiScopes::READ).await;
-    let mut socket = connect_events(&running).await;
-    let subscriptions = (0..17)
-        .map(|_| {
-            serde_json::json!({
-                "kind": "session",
-                "session_id": satelle_core::SessionId::new()
-            })
-        })
-        .collect::<Vec<_>>();
-    socket
-        .send(Message::Text(
-            serde_json::json!({
-                "schema_version": "satelle.ws.control.v1",
-                "type": "subscribe",
-                "request_id": RequestId::new(),
-                "subscriptions": subscriptions
-            })
-            .to_string()
-            .into(),
-        ))
-        .await
-        .expect("send oversized subscription set");
-    let error: WsServerControl =
-        serde_json::from_str(&next_text(&mut socket).await).expect("decode capacity control error");
-    assert!(matches!(
-        error,
-        WsServerControl::Error(error) if error.code().as_str() == "capacity-exceeded"
-    ));
-    let close = socket
-        .next()
-        .await
-        .expect("receive capacity close")
-        .expect("decode capacity close");
-    assert!(matches!(
-        close,
-        Message::Close(Some(frame)) if frame.code == CloseCode::Policy && frame.reason == "capacity-exceeded"
-    ));
-}
-
-#[tokio::test]
-async fn event_socket_reports_oversized_messages_as_payload_too_large() {
-    let running = RunningServer::start(ApiScopes::READ).await;
-    let mut socket = connect_events(&running).await;
-    socket
-        .send(Message::Text("x".repeat(65_537).into()))
-        .await
-        .expect("send oversized WebSocket message");
-
-    let error: WsServerControl = serde_json::from_str(&next_text(&mut socket).await)
-        .expect("decode payload-too-large control error");
-    assert!(matches!(
-        error,
-        WsServerControl::Error(error) if error.code().as_str() == "payload-too-large"
-    ));
-    let close = socket
-        .next()
-        .await
-        .expect("receive payload-too-large close")
-        .expect("decode payload-too-large close");
-    assert!(matches!(
-        close,
-        Message::Close(Some(frame)) if frame.code == CloseCode::Size && frame.reason == "payload-too-large"
     ));
 }
 
