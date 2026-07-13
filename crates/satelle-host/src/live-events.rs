@@ -91,4 +91,35 @@ mod tests {
             Err(LiveEventReceiveError::Lagged { dropped: 1 })
         );
     }
+
+    #[test]
+    fn subscribers_receive_only_events_published_after_they_subscribe() {
+        let hub = LiveEventHub::new();
+        let event = SatelleEventBody::new(
+            EventType::Readiness,
+            EventSource::HostDaemon,
+            time::OffsetDateTime::UNIX_EPOCH,
+            "host-test",
+            None,
+            "readiness observation",
+            serde_json::json!({}),
+        )
+        .expect("valid safe event");
+
+        hub.publish(event.clone());
+        let mut existing_subscription = hub.subscribe();
+        assert_eq!(
+            existing_subscription.try_recv(),
+            Err(LiveEventReceiveError::Empty)
+        );
+
+        hub.publish(event.clone());
+        assert_eq!(existing_subscription.try_recv().as_deref(), Ok(&event));
+
+        let mut later_subscription = hub.subscribe();
+        assert_eq!(
+            later_subscription.try_recv(),
+            Err(LiveEventReceiveError::Empty)
+        );
+    }
 }
