@@ -1645,7 +1645,7 @@
 - Host Daemon TLS startup fails closed on an unreadable key, unsafe permissions, an expired certificate, or a certificate and private-key mismatch and never falls back to plaintext @spec @mvp
 - when TLS terminates in an external reverse proxy, the plaintext Host Daemon backend binds only to loopback and still requires normal Satelle bearer-token authentication and authorization @spec @mvp
 - TLS reload installs a new certificate and key atomically only after full validation; failed reload retains the previous valid TLS configuration and emits a typed diagnostic instead of exposing plaintext @spec @mvp
-- satelle Host Daemon API authentication uses bearer tokens for MVP @spec @mvp
+- satelle Host Daemon API authentication uses bearer tokens for MVP @spec @mvp @implemented
 - satelle stores Host Daemon API bearer tokens in external secret stores or token files instead of inline Satelle configuration @spec @mvp
 - satelle Host Daemon generates durable API bearer tokens by default during setup or persistent service installation @spec @mvp
 - durable API bearer tokens remain valid until explicitly revoked by default and may instead define an optional expires_at timestamp @spec @mvp
@@ -1653,20 +1653,20 @@
 - expired bearer tokens are rejected before authorization and token metadata reports their optional expiry without exposing token material @spec @mvp
 - satelle allows explicitly provided API bearer tokens for automation or managed environments when stored outside inline Satelle configuration @spec @mvp
 - an external bearer-token file must be a regular file owned by the resolving OS user; Satelle rejects symlinks, directories, devices, sockets, and files readable or writable by unrelated principals, using mode 0600 on POSIX and an owner-only Windows ACL @spec @mvp
-- every Host Daemon bearer token has a stable non-secret token id @spec @mvp
-- every Host Daemon bearer token has one or more read, control, admin, and diagnostics_sensitive scopes @spec @mvp
+- every Host Daemon bearer token has a stable non-secret token id @spec @mvp @implemented
+- every Host Daemon bearer token has one or more read, control, admin, and diagnostics_sensitive scopes @spec @mvp @implemented
 - read scope authorizes readiness, status, Host session metadata, paths, and redacted logs @spec @mvp
 - control scope authorizes read operations plus run, steer, stop, and attachment upload @spec @mvp
 - admin scope authorizes control operations plus setup, repair, Host lifecycle, Host update, storage migration, token management, and destructive maintenance @spec @mvp
 - diagnostics_sensitive scope is required in addition to command-specific consent for Raw Diagnostic Export, recording, and Desktop Snapshot Export operations @spec @mvp
 - transport authorization never substitutes for mutation consent, provider-secret consent, raw-diagnostic consent, recording consent, desktop-snapshot consent, or YOLO selection @spec @mvp
 - a request with valid authentication but insufficient scope fails with a typed authorization-insufficient-scope error @spec @mvp
-- Host Daemon bearer tokens contain at least 256 bits of cryptographically random entropy @spec @mvp
-- the Host Daemon stores only a one-way token verifier and non-secret token metadata @spec @mvp
+- Host Daemon bearer tokens contain at least 256 bits of cryptographically random entropy @spec @mvp @implemented
+- the Host Daemon stores only a one-way token verifier and non-secret token metadata @spec @mvp @implemented
 - a newly issued raw bearer token is returned exactly once @spec @mvp
 - a successful bearer-token issuance or rotation response contains durable token metadata plus raw token material generated for that response and never persisted by Satelle @spec @mvp
-- bearer-token verification uses a timing-safe comparison @spec @mvp
-- bearer tokens are accepted only through the Authorization header @spec @mvp
+- bearer-token verification uses a timing-safe comparison @spec @mvp @implemented
+- bearer tokens are accepted only through the Authorization header @spec @mvp @implemented
 - bearer tokens are rejected in URLs, query strings, cookies, JSON bodies, WebSocket subscription messages, command-line arguments, and process environment variables @spec @mvp
 - token logs and audit records identify tokens only by non-secret token id @spec @mvp
 - admin Principals can rotate or revoke individual bearer tokens without replacing unrelated tokens @spec @mvp
