@@ -6,12 +6,9 @@ use crate::storage::{
     LogEvent, LogSeverity, LogSource, PrivateRequestToken, RecoverySubject, StorageError,
     StorageErrorKind, StoredLogRecord,
 };
-use satelle_core::session::{
-    ExecutionPolicy, ExpectedRevisions, RetainedOwnership, Session, TurnState,
-};
+use satelle_core::session::{ExecutionPolicy, ExpectedRevisions, RetainedOwnership, Session};
 use satelle_core::{
-    ErrorCode, LOCAL_DEMO_HOST, LogEntry, SatelleError, SatelleEvent, SessionId, SessionRecord,
-    StopResult, TurnId, TurnRecord, TurnStatus,
+    ErrorCode, LOCAL_DEMO_HOST, LogEntry, SatelleError, SatelleEvent, SessionId, StopResult, TurnId,
 };
 use serde_json::Value;
 use time::OffsetDateTime;
@@ -127,65 +124,13 @@ pub(super) fn monotonic_now(session: &Session) -> OffsetDateTime {
     OffsetDateTime::now_utc().max(session.updated_at())
 }
 
-pub(super) fn session_record(session: &Session) -> Result<SessionRecord, SatelleError> {
-    let turns = session
-        .turns()
-        .map(|turn| {
-            Ok(TurnRecord {
-                turn_id: turn.id().clone(),
-                status: turn_status(turn.state()),
-                started_at: public_time(turn.started_at())?,
-                completed_at: turn.terminal_at().map(public_time).transpose()?,
-                summary: turn_summary(turn.state()).to_string(),
-            })
-        })
-        .collect::<Result<Vec<_>, SatelleError>>()?;
-    let status = turns
-        .last()
-        .map(|turn| turn.status.clone())
-        .ok_or_else(|| integrity_failure("stored Session has no Turn history"))?;
-    Ok(SessionRecord {
-        session_id: session.id().clone(),
-        host: LOCAL_DEMO_HOST.to_string(),
-        status,
-        created_at: public_time(session.created_at())?,
-        updated_at: public_time(session.updated_at())?,
-        turns,
-    })
-}
-
 pub(super) fn turn_outcome(
     session: &Session,
     events: Vec<SatelleEvent>,
-) -> Result<super::RuntimeTurnOutcome, SatelleError> {
-    Ok(super::RuntimeTurnOutcome {
-        session: session_record(session)?,
+) -> super::RuntimeTurnOutcome {
+    super::RuntimeTurnOutcome {
+        session: session.to_public(),
         events,
-        public_session: session.to_public(),
-    })
-}
-
-fn turn_status(state: TurnState) -> TurnStatus {
-    match state {
-        TurnState::Starting | TurnState::Running | TurnState::RecoveryPending => {
-            TurnStatus::Started
-        }
-        TurnState::Completed => TurnStatus::Completed,
-        TurnState::Blocked => TurnStatus::Blocked,
-        TurnState::Failed => TurnStatus::Failed,
-        TurnState::Stopped => TurnStatus::Stopped,
-    }
-}
-
-fn turn_summary(state: TurnState) -> &'static str {
-    match state {
-        TurnState::Starting => "turn is starting",
-        TurnState::Running => "turn is running",
-        TurnState::RecoveryPending => "turn recovery is pending",
-        TurnState::Completed => "fake computer-use turn completed",
-        TurnState::Blocked => "turn was blocked by policy",
-        TurnState::Failed => "turn execution failed",
-        TurnState::Stopped => "turn was stopped by the user",
     }
 }
 

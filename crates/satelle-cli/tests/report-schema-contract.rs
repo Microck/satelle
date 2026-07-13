@@ -67,14 +67,14 @@ fn readiness_reports_use_their_canonical_v1_schema_tokens() {
 }
 
 #[test]
-fn session_commands_use_command_specific_v1_schema_tokens() {
+fn session_commands_use_command_specific_v2_schema_tokens() {
     let state = TestStateDir::new().expect("secure temp state directory should be created");
 
     let run = json_report(
         &state,
         vec!["run", "--host", "local-demo", "--json", "Inspect"],
     );
-    assert_eq!(run["schema_version"], "satelle.run.v1");
+    assert_eq!(run["schema_version"], "satelle.run.v2");
     let session = run["session_id"]
         .as_str()
         .expect("run should return a session id");
@@ -83,10 +83,10 @@ fn session_commands_use_command_specific_v1_schema_tokens() {
         &state,
         vec!["steer", session, "--json", "Continue inspection"],
     );
-    assert_eq!(steer["schema_version"], "satelle.steer.v1");
+    assert_eq!(steer["schema_version"], "satelle.steer.v2");
 
     let status = json_report(&state, vec!["status", session, "--json"]);
-    assert_eq!(status["schema_version"], "satelle.status.v1");
+    assert_eq!(status["schema_version"], "satelle.status.v2");
     let status_fields = status.as_object().expect("status should be a JSON object");
     assert_eq!(status_fields.len(), 7);
     for field in [
@@ -111,7 +111,7 @@ fn session_commands_use_command_specific_v1_schema_tokens() {
             "Continue asynchronously",
         ],
     );
-    assert_eq!(detached_steer["schema_version"], "satelle.steer.v1");
+    assert_eq!(detached_steer["schema_version"], "satelle.steer.v2");
 
     let detached_run_state =
         TestStateDir::new().expect("second secure temp state directory should be created");
@@ -126,7 +126,7 @@ fn session_commands_use_command_specific_v1_schema_tokens() {
             "Inspect asynchronously",
         ],
     );
-    assert_eq!(detached_run["schema_version"], "satelle.run.v1");
+    assert_eq!(detached_run["schema_version"], "satelle.run.v2");
 }
 
 #[test]

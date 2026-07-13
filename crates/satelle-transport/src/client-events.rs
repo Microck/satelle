@@ -2,36 +2,57 @@ use crate::contract::{
     ApiError, EventSubscription, RequestId, SubscribeRequest, SubscribedResponse, WsCloseReason,
     WsControlError, WsServerControl,
 };
+use crate::transport_tls::{
+    TlsFailureKind, WebSocketTrustError, classify_tls_error, find_error_in_tree,
+    websocket_tls_config,
+};
 use futures_util::{SinkExt, StreamExt};
-use satelle_core::SatelleEvent;
+use rustls::ClientConfig;
+use satelle_core::{DirectHostBinding, SatelleEvent};
 use std::fmt;
+use std::net::SocketAddr;
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::TcpStream;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::http::HeaderValue;
 use tokio_tungstenite::tungstenite::protocol::CloseFrame;
 use tokio_tungstenite::tungstenite::{Error as WebSocketError, Message};
-use tokio_tungstenite::{WebSocketStream, client_async};
+use tokio_tungstenite::{
+    Connector, MaybeTlsStream, WebSocketStream, client_async, connect_async_tls_with_config,
+};
 use zeroize::Zeroizing;
 
+type EventSocket = WebSocketStream<MaybeTlsStream<TcpStream>>;
+
 pub struct DaemonEventStream {
-    socket: WebSocketStream<TcpStream>,
+    socket: EventSocket,
     expected_host_identity: String,
     expected_request_id: RequestId,
     last_sequence: u64,
 }
 
 const CONTROL_CLOSE_TIMEOUT: Duration = Duration::from_secs(1);
+const EVENT_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
+const EVENT_STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(45);
 
 pub struct DaemonEventClient {
-    address: std::net::SocketAddr,
+    endpoint: EventEndpoint,
     token: satelle_host::ApiBearerToken,
     expected_host_identity: String,
 }
 
+enum EventEndpoint {
+    Loopback(SocketAddr),
+    Direct {
+        url: String,
+        tls_config: Arc<ClientConfig>,
+    },
+}
+
 impl DaemonEventClient {
     pub fn loopback(
-        address: std::net::SocketAddr,
+        address: SocketAddr,
         token: satelle_host::ApiBearerToken,
         expected_host_identity: impl Into<String>,
     ) -> Result<Self, DaemonEventError> {
@@ -42,7 +63,33 @@ impl DaemonEventClient {
         HeaderValue::from_str(&expected_host_identity)
             .map_err(|_| DaemonEventError::InvalidHeader)?;
         Ok(Self {
-            address,
+            endpoint: EventEndpoint::Loopback(address),
+            token,
+            expected_host_identity,
+        })
+    }
+
+    pub fn wss(
+        binding: &DirectHostBinding,
+        token: satelle_host::ApiBearerToken,
+        ca_bundle: Option<&[u8]>,
+    ) -> Result<Self, DaemonEventError> {
+        let expected_host_identity = binding.expected_host_identity().to_string();
+        HeaderValue::from_str(&expected_host_identity)
+            .map_err(|_| DaemonEventError::InvalidHeader)?;
+        let url = format!(
+            "{}/v1/events",
+            binding.origin().replacen("https://", "wss://", 1)
+        );
+        let tls_config = websocket_tls_config(ca_bundle).map_err(|error| match error {
+            WebSocketTrustError::InvalidCaBundle => DaemonEventError::InvalidCaBundle,
+            WebSocketTrustError::EmptyCaBundle => DaemonEventError::EmptyCaBundle,
+            WebSocketTrustError::TlsConfiguration(error) => {
+                DaemonEventError::TlsConfiguration(error)
+            }
+        })?;
+        Ok(Self {
+            endpoint: EventEndpoint::Direct { url, tls_config },
             token,
             expected_host_identity,
         })
@@ -52,10 +99,35 @@ impl DaemonEventClient {
         &self,
         subscriptions: Vec<EventSubscription>,
     ) -> Result<DaemonEventStream, DaemonEventError> {
+        self.connect_events_with_timeout(subscriptions, EVENT_HANDSHAKE_TIMEOUT)
+            .await
+    }
+
+    async fn connect_events_with_timeout(
+        &self,
+        subscriptions: Vec<EventSubscription>,
+        handshake_timeout: Duration,
+    ) -> Result<DaemonEventStream, DaemonEventError> {
+        tokio::time::timeout(
+            handshake_timeout,
+            self.connect_events_without_timeout(subscriptions),
+        )
+        .await
+        .map_err(|_| DaemonEventError::HandshakeTimeout)?
+    }
+
+    async fn connect_events_without_timeout(
+        &self,
+        subscriptions: Vec<EventSubscription>,
+    ) -> Result<DaemonEventStream, DaemonEventError> {
         let request_id = RequestId::new();
         let subscribe = SubscribeRequest::new(request_id.clone(), subscriptions.clone())
             .map_err(|_| DaemonEventError::InvalidSubscriptions)?;
-        let mut request = format!("ws://{}/v1/events", self.address)
+        let url = match &self.endpoint {
+            EventEndpoint::Loopback(address) => format!("ws://{address}/v1/events"),
+            EventEndpoint::Direct { url, .. } => url.clone(),
+        };
+        let mut request = url
             .into_client_request()
             .map_err(DaemonEventError::Transport)?;
         let exposed = self.token.expose();
@@ -75,12 +147,24 @@ impl DaemonEventClient {
                 .map_err(|_| DaemonEventError::InvalidHeader)?,
         );
         drop(exposed);
-        let tcp = TcpStream::connect(self.address)
-            .await
-            .map_err(DaemonEventError::Connect)?;
-        let (mut socket, _) = client_async(request, tcp).await.map_err(|error| {
-            map_handshake_error(error, &request_id, &self.expected_host_identity)
-        })?;
+        let (mut socket, _) = match &self.endpoint {
+            EventEndpoint::Loopback(address) => {
+                let tcp = TcpStream::connect(address)
+                    .await
+                    .map_err(DaemonEventError::Connect)?;
+                client_async(request, MaybeTlsStream::Plain(tcp)).await
+            }
+            EventEndpoint::Direct { tls_config, .. } => {
+                connect_async_tls_with_config(
+                    request,
+                    None,
+                    false,
+                    Some(Connector::Rustls(Arc::clone(tls_config))),
+                )
+                .await
+            }
+        }
+        .map_err(|error| map_connection_error(error, &request_id, &self.expected_host_identity))?;
         socket
             .send(Message::Text(
                 serde_json::to_string(&subscribe)
@@ -108,11 +192,20 @@ impl DaemonEventClient {
 
 impl DaemonEventStream {
     pub async fn next_event(&mut self) -> Result<SatelleEvent, DaemonEventError> {
+        self.next_event_with_timeout(EVENT_STREAM_IDLE_TIMEOUT)
+            .await
+    }
+
+    async fn next_event_with_timeout(
+        &mut self,
+        idle_timeout: Duration,
+    ) -> Result<SatelleEvent, DaemonEventError> {
         loop {
-            let message = self
-                .socket
-                .next()
+            // Bound each wait independently so heartbeat frames renew liveness
+            // without extending a genuinely silent stream indefinitely.
+            let message = tokio::time::timeout(idle_timeout, self.socket.next())
                 .await
+                .map_err(|_| DaemonEventError::StreamIdleTimeout)?
                 .ok_or(DaemonEventError::Disconnected)?
                 .map_err(DaemonEventError::Transport)?;
             match message {
@@ -162,7 +255,7 @@ impl DaemonEventStream {
 }
 
 async fn read_control(
-    socket: &mut WebSocketStream<TcpStream>,
+    socket: &mut EventSocket,
     expected_request_id: &RequestId,
     expected_host_identity: &str,
 ) -> Result<SubscribedResponse, DaemonEventError> {
@@ -236,7 +329,7 @@ fn validate_control_context(
 }
 
 async fn read_close_after_control(
-    socket: &mut WebSocketStream<TcpStream>,
+    socket: &mut EventSocket,
     control: WsControlError,
 ) -> DaemonEventError {
     match tokio::time::timeout(CONTROL_CLOSE_TIMEOUT, wait_for_close(socket)).await {
@@ -245,7 +338,7 @@ async fn read_close_after_control(
     }
 }
 
-async fn wait_for_close(socket: &mut WebSocketStream<TcpStream>) -> Result<Option<CloseFrame>, ()> {
+async fn wait_for_close(socket: &mut EventSocket) -> Result<Option<CloseFrame>, ()> {
     loop {
         let message = socket.next().await.ok_or(())?.map_err(|_| ())?;
         match message {
@@ -290,6 +383,26 @@ fn close_error(frame: Option<CloseFrame>, control: Option<WsControlError>) -> Da
     }
 }
 
+fn map_connection_error(
+    error: WebSocketError,
+    request_id: &RequestId,
+    expected_host_identity: &str,
+) -> DaemonEventError {
+    if matches!(error, WebSocketError::Http(_)) {
+        return map_handshake_error(error, request_id, expected_host_identity);
+    }
+    match find_error_in_tree::<rustls::Error>(&error, 16).map(classify_tls_error) {
+        Some(TlsFailureKind::CertificateUntrusted) => DaemonEventError::CertificateUntrusted(error),
+        Some(TlsFailureKind::CertificateHostnameMismatch) => {
+            DaemonEventError::CertificateHostnameMismatch(error)
+        }
+        Some(TlsFailureKind::CertificateExpired) => DaemonEventError::CertificateExpired(error),
+        Some(TlsFailureKind::VersionUnsupported) => DaemonEventError::TlsVersionUnsupported(error),
+        Some(TlsFailureKind::Handshake) => DaemonEventError::TlsHandshake(error),
+        None => DaemonEventError::Transport(error),
+    }
+}
+
 fn map_handshake_error(
     error: WebSocketError,
     request_id: &RequestId,
@@ -322,6 +435,16 @@ pub enum DaemonEventError {
     NonLoopbackPlaintextEndpoint,
     InvalidSubscriptions,
     InvalidHeader,
+    InvalidCaBundle,
+    EmptyCaBundle,
+    TlsConfiguration(rustls::Error),
+    CertificateUntrusted(WebSocketError),
+    CertificateHostnameMismatch(WebSocketError),
+    CertificateExpired(WebSocketError),
+    TlsVersionUnsupported(WebSocketError),
+    TlsHandshake(WebSocketError),
+    HandshakeTimeout,
+    StreamIdleTimeout,
     InvalidHandshakeResponse,
     Connect(std::io::Error),
     Transport(WebSocketError),
@@ -351,6 +474,28 @@ pub enum DaemonEventError {
     Disconnected,
 }
 
+impl DaemonEventError {
+    /// Returns true only when the event contract remains trustworthy and the
+    /// underlying connection itself was lost. Protocol, identity, TLS, frame,
+    /// and sequence failures must never be hidden by status reconciliation.
+    pub fn is_recoverable_disconnect(&self) -> bool {
+        matches!(
+            self,
+            Self::Connect(_)
+                | Self::HandshakeTimeout
+                | Self::StreamIdleTimeout
+                | Self::Disconnected
+                | Self::Transport(WebSocketError::ConnectionClosed | WebSocketError::Io(_))
+                | Self::Closed {
+                    reason: WsCloseReason::IdleTimeout
+                        | WsCloseReason::ServerShutdown
+                        | WsCloseReason::SlowConsumer,
+                    ..
+                }
+        )
+    }
+}
+
 impl fmt::Display for DaemonEventError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(match self {
@@ -359,6 +504,20 @@ impl fmt::Display for DaemonEventError {
             }
             Self::InvalidSubscriptions => "the live event subscriptions are invalid",
             Self::InvalidHeader => "the live event handshake contains an invalid header",
+            Self::InvalidCaBundle => "the configured CA bundle is invalid",
+            Self::EmptyCaBundle => "the configured CA bundle contains no certificates",
+            Self::TlsConfiguration(_) => "the live event TLS configuration failed",
+            Self::CertificateUntrusted(_) => "the Host Daemon certificate is not trusted",
+            Self::CertificateHostnameMismatch(_) => {
+                "the Host Daemon certificate does not match the configured hostname"
+            }
+            Self::CertificateExpired(_) => "the Host Daemon certificate has expired",
+            Self::TlsVersionUnsupported(_) => "the Host Daemon does not support TLS 1.2 or newer",
+            Self::TlsHandshake(_) => "the Host Daemon TLS handshake failed",
+            Self::HandshakeTimeout => "the live event handshake timed out",
+            Self::StreamIdleTimeout => {
+                "the live event stream timed out while waiting for the next frame"
+            }
             Self::InvalidHandshakeResponse => {
                 "the Host Daemon returned an invalid WebSocket handshake response"
             }
@@ -392,9 +551,16 @@ impl fmt::Display for DaemonEventError {
 
 impl fmt::Debug for DaemonEventClient {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_struct("DaemonEventClient")
-            .field("address", &self.address)
+        let mut debug = formatter.debug_struct("DaemonEventClient");
+        match &self.endpoint {
+            EventEndpoint::Loopback(address) => {
+                debug.field("endpoint", &format_args!("ws://{address}/v1/events"));
+            }
+            EventEndpoint::Direct { url, .. } => {
+                debug.field("endpoint", url);
+            }
+        }
+        debug
             .field("expected_host_identity", &self.expected_host_identity)
             .finish_non_exhaustive()
     }
@@ -404,7 +570,13 @@ impl std::error::Error for DaemonEventError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Connect(error) => Some(error),
-            Self::Transport(error) => Some(error),
+            Self::TlsConfiguration(error) => Some(error),
+            Self::CertificateUntrusted(error)
+            | Self::CertificateHostnameMismatch(error)
+            | Self::CertificateExpired(error)
+            | Self::TlsVersionUnsupported(error)
+            | Self::TlsHandshake(error)
+            | Self::Transport(error) => Some(error),
             Self::Encode(error) | Self::InvalidControl(error) | Self::InvalidEvent(error) => {
                 Some(error)
             }
@@ -414,63 +586,5 @@ impl std::error::Error for DaemonEventError {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn subscription_acknowledgement_must_echo_the_exact_context() {
-        let request_id = RequestId::new();
-        let subscriptions = vec![EventSubscription::Host];
-        let acknowledgement = SubscribedResponse::new(
-            request_id.clone(),
-            "host-expected".to_string(),
-            subscriptions.clone(),
-        );
-        assert!(
-            validate_acknowledgement(
-                acknowledgement,
-                &request_id,
-                "host-expected",
-                &subscriptions
-            )
-            .is_ok()
-        );
-
-        let wrong_request = SubscribedResponse::new(
-            RequestId::new(),
-            "host-expected".to_string(),
-            subscriptions.clone(),
-        );
-        assert!(matches!(
-            validate_acknowledgement(wrong_request, &request_id, "host-expected", &subscriptions),
-            Err(DaemonEventError::RequestIdMismatch)
-        ));
-
-        let wrong_host = SubscribedResponse::new(
-            request_id.clone(),
-            "host-other".to_string(),
-            subscriptions.clone(),
-        );
-        assert!(matches!(
-            validate_acknowledgement(wrong_host, &request_id, "host-expected", &subscriptions),
-            Err(DaemonEventError::HostIdentityMismatch)
-        ));
-
-        let wrong_subscriptions = SubscribedResponse::new(
-            request_id.clone(),
-            "host-expected".to_string(),
-            vec![EventSubscription::Session {
-                session_id: satelle_core::SessionId::new(),
-            }],
-        );
-        assert!(matches!(
-            validate_acknowledgement(
-                wrong_subscriptions,
-                &request_id,
-                "host-expected",
-                &subscriptions
-            ),
-            Err(DaemonEventError::SubscriptionMismatch)
-        ));
-    }
-}
+#[path = "client-events-tests.rs"]
+mod tests;

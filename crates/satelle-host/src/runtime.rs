@@ -30,19 +30,18 @@ use crate::storage::{
 };
 use crate::{ApiBearerToken, ApiPrincipal, DaemonLogPage, LogCursor, LogPageQuery};
 use recovery::RecoveryQueue;
-use satelle_core::session::{PublicSession, TurnState};
+use satelle_core::session::{PublicSession, TurnAdmissionFailure, TurnState};
 use satelle_core::{
     ControlPlaneOperation, LOCAL_DEMO_HOST, LogEntry, SatelleError, SatelleEvent, SessionId,
-    SessionRecord, StopResult, TurnId,
+    StopResult, TurnId,
 };
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
 
 #[derive(Debug)]
 pub(crate) struct RuntimeTurnOutcome {
-    pub(crate) session: SessionRecord,
+    pub(crate) session: PublicSession,
     pub(crate) events: Vec<SatelleEvent>,
-    pub(crate) public_session: PublicSession,
 }
 
 impl RuntimeTurnOutcome {
@@ -52,6 +51,21 @@ impl RuntimeTurnOutcome {
             events: self.events,
         }
     }
+}
+
+pub(crate) fn admitted_session(
+    result: Result<RuntimeTurnOutcome, TurnAdmissionFailure>,
+) -> Result<PublicSession, SatelleError> {
+    match result {
+        Ok(outcome) => Ok(outcome.session),
+        Err(TurnAdmissionFailure::Admitted { session, .. }) => Ok(*session),
+        Err(failure) => Err(failure.into_error()),
+    }
+}
+
+struct RuntimeAdmissionReplay {
+    outcome: RuntimeTurnOutcome,
+    turn_id: TurnId,
 }
 
 pub(crate) fn storage_error(error: crate::storage::StorageError) -> SatelleError {
@@ -136,7 +150,7 @@ impl RuntimeEngine {
         operation: IdempotentOperation,
         identity: &RequestIdentity,
         expected_session_id: Option<&SessionId>,
-    ) -> Result<Option<RuntimeTurnOutcome>, SatelleError> {
+    ) -> Result<Option<RuntimeAdmissionReplay>, SatelleError> {
         let requested_at = time::OffsetDateTime::now_utc();
         let idempotency = model::idempotency(operation, identity, requested_at)?;
         let replay = self
@@ -144,13 +158,19 @@ impl RuntimeEngine {
             .replay_admission_if_present(operation, &idempotency, expected_session_id)
             .map_err(model::storage_failure)?;
         replay
-            .map(|outcome| match outcome {
-                AdmissionOutcome::InProgress(session) | AdmissionOutcome::Complete(session) => {
-                    model::turn_outcome(&session, Vec::new())
-                }
-                AdmissionOutcome::Execute { .. } => Err(model::integrity_failure(
-                    "a stored idempotency replay requested new adapter execution",
-                )),
+            .map(|replay| {
+                let (outcome, _session_id, turn_id) = replay.into_parts();
+                let outcome = match outcome {
+                    AdmissionOutcome::InProgress(session) | AdmissionOutcome::Complete(session) => {
+                        model::turn_outcome(&session, Vec::new())
+                    }
+                    AdmissionOutcome::Execute { .. } => {
+                        return Err(model::integrity_failure(
+                            "a stored idempotency replay requested new adapter execution",
+                        ));
+                    }
+                };
+                Ok(RuntimeAdmissionReplay { outcome, turn_id })
             })
             .transpose()
     }
@@ -291,7 +311,7 @@ impl RuntimeEngine {
     ) -> Result<RuntimeTurnOutcome, SatelleError> {
         match outcome {
             AdmissionOutcome::InProgress(session) | AdmissionOutcome::Complete(session) => {
-                model::turn_outcome(&session, Vec::new())
+                Ok(model::turn_outcome(&session, Vec::new()))
             }
             AdmissionOutcome::Execute {
                 session,
@@ -301,7 +321,7 @@ impl RuntimeEngine {
                     session,
                     subject: recovery_subject,
                 };
-                let admitted = model::turn_outcome(&work.session, Vec::new())?;
+                let admitted = model::turn_outcome(&work.session, Vec::new());
                 let plan = ExecutionPlan {
                     host: host.to_string(),
                     prompt: prompt.to_string(),
@@ -319,21 +339,13 @@ impl RuntimeEngine {
         }
     }
 
-    fn status(&self, session_id: &SessionId) -> Result<SessionRecord, SatelleError> {
+    fn status(&self, session_id: &SessionId) -> Result<PublicSession, SatelleError> {
         let session = self
             .lock_storage()?
             .load_session(session_id)
             .map_err(model::storage_failure)?
             .ok_or_else(|| SatelleError::session_not_found(session_id))?;
-        model::session_record(&session)
-    }
-
-    fn status_public(&self, session_id: &SessionId) -> Result<PublicSession, SatelleError> {
-        self.lock_storage()?
-            .load_session(session_id)
-            .map_err(model::storage_failure)?
-            .map(|session| session.to_public())
-            .ok_or_else(|| SatelleError::session_not_found(session_id))
+        Ok(session.to_public())
     }
 
     fn stop(&self, command: StopCommand) -> Result<RuntimeStopOutcome, SatelleError> {
@@ -532,49 +544,198 @@ impl RuntimeHandle {
         }
     }
 
-    pub(crate) fn run(&self, command: RunCommand<'_>) -> Result<RuntimeTurnOutcome, SatelleError> {
-        if let Some(engine) = self.existing_engine()?
-            && let Some(replay) =
-                engine.replay_admission(IdempotentOperation::Run, &command.identity, None)?
+    pub(crate) fn run(
+        &self,
+        command: RunCommand<'_>,
+    ) -> Result<RuntimeTurnOutcome, TurnAdmissionFailure> {
+        let existing_engine = self
+            .existing_engine()
+            .map_err(TurnAdmissionFailure::admission_unknown)?;
+        if let Some(engine) = &existing_engine
+            && let Some(replay) = engine
+                .replay_admission(IdempotentOperation::Run, &command.identity, None)
+                .map_err(TurnAdmissionFailure::admission_unknown)?
         {
-            return Ok(replay);
+            return Ok(replay.outcome);
         }
-        self.adapter.admit_operation(ControlPlaneOperation::Run)?;
-        let engine = self.engine()?;
-        engine.reconcile_before_admission()?;
-        let readiness = self.adapter.preflight(command.host)?;
-        engine.run(command, readiness)
+        if let Err(error) = self.adapter.admit_operation(ControlPlaneOperation::Run) {
+            return self.resolve_precommit_failure(
+                IdempotentOperation::Run,
+                &command.identity,
+                None,
+                error,
+            );
+        }
+        let needs_persistent_replay = existing_engine.is_none();
+        let engine = match self.engine() {
+            Ok(engine) => engine,
+            Err(error) => {
+                return self.resolve_precommit_failure(
+                    IdempotentOperation::Run,
+                    &command.identity,
+                    None,
+                    error,
+                );
+            }
+        };
+        if needs_persistent_replay
+            && let Some(replay) = engine
+                .replay_admission(IdempotentOperation::Run, &command.identity, None)
+                .map_err(TurnAdmissionFailure::admission_unknown)?
+        {
+            return Ok(replay.outcome);
+        }
+        if let Err(error) = engine.reconcile_before_admission() {
+            return self.resolve_precommit_failure(
+                IdempotentOperation::Run,
+                &command.identity,
+                None,
+                error,
+            );
+        }
+        let readiness = match self.adapter.preflight(command.host) {
+            Ok(readiness) => readiness,
+            Err(error) => {
+                return self.resolve_precommit_failure(
+                    IdempotentOperation::Run,
+                    &command.identity,
+                    None,
+                    error,
+                );
+            }
+        };
+        let identity = command.identity.clone();
+        match engine.run(command, readiness) {
+            Ok(outcome) => Ok(outcome),
+            Err(error) => Err(Self::classify_failed_admission(
+                &engine,
+                IdempotentOperation::Run,
+                &identity,
+                None,
+                error,
+            )),
+        }
     }
 
     pub(crate) fn steer(
         &self,
         command: SteerCommand<'_>,
-    ) -> Result<RuntimeTurnOutcome, SatelleError> {
-        if let Some(engine) = self.existing_engine()?
-            && let Some(replay) = engine.replay_admission(
+    ) -> Result<RuntimeTurnOutcome, TurnAdmissionFailure> {
+        let existing_engine = self
+            .existing_engine()
+            .map_err(TurnAdmissionFailure::admission_unknown)?;
+        if let Some(engine) = &existing_engine
+            && let Some(replay) = engine
+                .replay_admission(
+                    IdempotentOperation::Steer,
+                    &command.identity,
+                    Some(&command.session_id),
+                )
+                .map_err(TurnAdmissionFailure::admission_unknown)?
+        {
+            return Ok(replay.outcome);
+        }
+        if let Err(error) = self.adapter.admit_operation(ControlPlaneOperation::Steer) {
+            return self.resolve_precommit_failure(
                 IdempotentOperation::Steer,
                 &command.identity,
                 Some(&command.session_id),
-            )?
-        {
-            return Ok(replay);
+                error,
+            );
         }
-        self.adapter.admit_operation(ControlPlaneOperation::Steer)?;
-        let engine = self.engine()?;
-        engine.reconcile_before_admission()?;
-        let readiness = self.adapter.preflight(LOCAL_DEMO_HOST)?;
-        engine.steer(command, readiness)
+        let needs_persistent_replay = existing_engine.is_none();
+        let engine = match self.engine() {
+            Ok(engine) => engine,
+            Err(error) => {
+                return self.resolve_precommit_failure(
+                    IdempotentOperation::Steer,
+                    &command.identity,
+                    Some(&command.session_id),
+                    error,
+                );
+            }
+        };
+        if needs_persistent_replay
+            && let Some(replay) = engine
+                .replay_admission(
+                    IdempotentOperation::Steer,
+                    &command.identity,
+                    Some(&command.session_id),
+                )
+                .map_err(TurnAdmissionFailure::admission_unknown)?
+        {
+            return Ok(replay.outcome);
+        }
+        if let Err(error) = engine.reconcile_before_admission() {
+            return self.resolve_precommit_failure(
+                IdempotentOperation::Steer,
+                &command.identity,
+                Some(&command.session_id),
+                error,
+            );
+        }
+        let readiness = match self.adapter.preflight(LOCAL_DEMO_HOST) {
+            Ok(readiness) => readiness,
+            Err(error) => {
+                return self.resolve_precommit_failure(
+                    IdempotentOperation::Steer,
+                    &command.identity,
+                    Some(&command.session_id),
+                    error,
+                );
+            }
+        };
+        let identity = command.identity.clone();
+        let session_id = command.session_id.clone();
+        match engine.steer(command, readiness) {
+            Ok(outcome) => Ok(outcome),
+            Err(error) => Err(Self::classify_failed_admission(
+                &engine,
+                IdempotentOperation::Steer,
+                &identity,
+                Some(&session_id),
+                error,
+            )),
+        }
     }
 
-    pub(crate) fn status(&self, session_id: SessionId) -> Result<SessionRecord, SatelleError> {
-        self.engine()?.status(&session_id)
+    fn classify_failed_admission(
+        engine: &RuntimeEngine,
+        operation: IdempotentOperation,
+        identity: &RequestIdentity,
+        expected_session_id: Option<&SessionId>,
+        error: SatelleError,
+    ) -> TurnAdmissionFailure {
+        match engine.replay_admission(operation, identity, expected_session_id) {
+            Ok(Some(replay)) => {
+                TurnAdmissionFailure::admitted(error, replay.outcome.session, replay.turn_id)
+            }
+            Ok(None) => TurnAdmissionFailure::not_admitted(error),
+            Err(_) => TurnAdmissionFailure::admission_unknown(error),
+        }
     }
 
-    pub(crate) fn status_public(
+    fn resolve_precommit_failure(
         &self,
-        session_id: &SessionId,
-    ) -> Result<PublicSession, SatelleError> {
-        self.engine()?.status_public(session_id)
+        operation: IdempotentOperation,
+        identity: &RequestIdentity,
+        expected_session_id: Option<&SessionId>,
+        error: SatelleError,
+    ) -> Result<RuntimeTurnOutcome, TurnAdmissionFailure> {
+        let engine = match self.existing_engine() {
+            Ok(Some(engine)) => engine,
+            Ok(None) => return Err(TurnAdmissionFailure::not_admitted(error)),
+            Err(_) => return Err(TurnAdmissionFailure::admission_unknown(error)),
+        };
+        match engine.replay_admission(operation, identity, expected_session_id) {
+            Ok(Some(replay)) => Ok(replay.outcome),
+            Ok(None) => Err(TurnAdmissionFailure::not_admitted(error)),
+            Err(_) => Err(TurnAdmissionFailure::admission_unknown(error)),
+        }
+    }
+
+    pub(crate) fn status(&self, session_id: SessionId) -> Result<PublicSession, SatelleError> {
+        self.engine()?.status(&session_id)
     }
 
     pub(crate) fn stop(&self, command: StopCommand) -> Result<StopResult, SatelleError> {
@@ -729,6 +890,20 @@ impl RuntimeHandle {
     pub(crate) fn wait_for_background(&self) -> Result<(), SatelleError> {
         let engine = self.engine()?;
         worker::wait_for_background(&engine.workers)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn poison_worker_registry_for_tests(&self) -> Result<(), SatelleError> {
+        let engine = self.engine()?;
+        let poisoner = std::thread::spawn(move || {
+            let _worker_registry = engine
+                .workers
+                .lock()
+                .expect("the worker registry should be healthy before the test poisons it");
+            panic!("poison the worker registry for deterministic dispatch failure");
+        });
+        assert!(poisoner.join().is_err());
+        Ok(())
     }
 
     fn engine(&self) -> Result<Arc<RuntimeEngine>, SatelleError> {

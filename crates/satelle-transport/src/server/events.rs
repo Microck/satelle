@@ -505,6 +505,12 @@ async fn controller_loop(
                     }
                     Err(LiveEventReceiveError::Empty) => continue,
                 };
+                if !subscriptions
+                    .iter()
+                    .any(|subscription: &EventSubscription| subscription.matches(&event))
+                {
+                    continue;
+                }
                 let Some(next_sequence) = sequence.checked_add(1) else {
                     return ConnectionEnd::Failure {
                         request_id: active_request_id,
@@ -512,12 +518,6 @@ async fn controller_loop(
                     };
                 };
                 sequence = next_sequence;
-                if !subscriptions
-                    .iter()
-                    .any(|subscription: &EventSubscription| subscription.matches(&event))
-                {
-                    continue;
-                }
                 let wire = event
                     .as_ref()
                     .clone()
@@ -880,3 +880,7 @@ mod tests {
         assert_eq!(diagnostic.dropped_event_count, 3);
     }
 }
+
+#[cfg(test)]
+#[path = "event-sequence-tests.rs"]
+mod sequence_tests;

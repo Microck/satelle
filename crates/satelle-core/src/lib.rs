@@ -2573,43 +2573,6 @@ impl From<IdParseError> for SatelleError {
     }
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum TurnStatus {
-    Started,
-    Completed,
-    Blocked,
-    Failed,
-    Stopped,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-pub struct TurnRecord {
-    pub turn_id: TurnId,
-    pub status: TurnStatus,
-    pub started_at: String,
-    pub completed_at: Option<String>,
-    pub summary: String,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-pub struct SessionRecord {
-    pub session_id: SessionId,
-    pub host: String,
-    pub status: TurnStatus,
-    pub created_at: String,
-    pub updated_at: String,
-    pub turns: Vec<TurnRecord>,
-}
-
-impl SessionRecord {
-    pub fn latest_turn(&self) -> Option<&TurnRecord> {
-        self.turns.last()
-    }
-}
-
 #[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq)]
 pub enum StopSchemaVersion {
     #[serde(rename = "satelle.stop.v1")]

@@ -424,6 +424,37 @@ pub(crate) enum AdmissionOutcome {
     Complete(Session),
 }
 
+/// A durable idempotency replay and the exact handles stored with that record.
+///
+/// The handles remain explicit because a terminal Session snapshot may later
+/// contain additional Turns. Callers must not recover admission identity from
+/// Turn history position.
+pub(crate) struct AdmissionReplay {
+    outcome: AdmissionOutcome,
+    session_id: SessionId,
+    turn_id: TurnId,
+}
+
+impl AdmissionReplay {
+    #[cfg(test)]
+    pub(crate) fn session_id(&self) -> &SessionId {
+        &self.session_id
+    }
+
+    #[cfg(test)]
+    pub(crate) fn turn_id(&self) -> &TurnId {
+        &self.turn_id
+    }
+
+    pub(crate) fn into_parts(self) -> (AdmissionOutcome, SessionId, TurnId) {
+        (self.outcome, self.session_id, self.turn_id)
+    }
+
+    fn into_outcome(self) -> AdmissionOutcome {
+        self.outcome
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct StorageSnapshot {
     session_count: usize,
@@ -449,7 +480,7 @@ fn replay_admission(
     connection: &Connection,
     record: &StoredIdempotency,
     expected_session_id: Option<&SessionId>,
-) -> Result<AdmissionOutcome, StorageError> {
+) -> Result<AdmissionReplay, StorageError> {
     let session_id = record
         .session_id
         .as_deref()
@@ -497,7 +528,11 @@ fn replay_admission(
         }
         _ => return Err(StorageError::new(StorageErrorKind::InvalidStoredState)),
     };
-    Ok(outcome)
+    Ok(AdmissionReplay {
+        outcome,
+        session_id,
+        turn_id,
+    })
 }
 
 fn validate_replayed_turn_outcome(
@@ -642,7 +677,7 @@ impl Storage {
         operation: IdempotentOperation,
         idempotency: &IdempotencyInput,
         expected_session_id: Option<&SessionId>,
-    ) -> Result<Option<AdmissionOutcome>, StorageError> {
+    ) -> Result<Option<AdmissionReplay>, StorageError> {
         require_operation(idempotency, operation)?;
         matching_idempotency(&self.connection, idempotency)?
             .map(|record| replay_admission(&self.connection, &record, expected_session_id))
@@ -705,7 +740,7 @@ impl Storage {
             .map_err(|source| sqlite_error(StorageErrorKind::OperationFailed, source))?;
 
         if let Some(record) = matching_idempotency(&transaction, &context.idempotency)? {
-            let outcome = replay_admission(&transaction, &record, None)?;
+            let outcome = replay_admission(&transaction, &record, None)?.into_outcome();
             transaction
                 .commit()
                 .map_err(|source| sqlite_error(StorageErrorKind::OperationFailed, source))?;
@@ -768,7 +803,7 @@ impl Storage {
             .map_err(|source| sqlite_error(StorageErrorKind::OperationFailed, source))?;
 
         if let Some(record) = matching_idempotency(&transaction, &context.idempotency)? {
-            let outcome = replay_admission(&transaction, &record, Some(session_id))?;
+            let outcome = replay_admission(&transaction, &record, Some(session_id))?.into_outcome();
             transaction
                 .commit()
                 .map_err(|source| sqlite_error(StorageErrorKind::OperationFailed, source))?;

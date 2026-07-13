@@ -39,12 +39,12 @@ pub use runtime::{
 use runtime::{
     LogQuery, ProductionComputerUseAdapter, RunCommand, RuntimeHandle, SteerCommand, StopCommand,
 };
-use satelle_core::session::TurnExecutionMode;
+use satelle_core::session::{PublicSession, TurnAdmissionFailure, TurnExecutionMode};
 use satelle_core::{
     DaemonPathOverrides, DoctorFinding, DoctorFixability, DoctorProbeResult, DoctorReport,
     DoctorSchemaVersion, DoctorSummary, HostSessionsReport, HostSessionsSchemaVersion,
-    LOCAL_DEMO_HOST, LogEntry, SatelleError, SatelleEvent, SessionId, SessionRecord,
-    SetupReadinessSummary, SetupReport, SetupSchemaVersion, StopResult, object_value, utc_now,
+    LOCAL_DEMO_HOST, LogEntry, SatelleError, SatelleEvent, SessionId, SetupReadinessSummary,
+    SetupReport, SetupSchemaVersion, StopResult, object_value, utc_now,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -238,7 +238,7 @@ impl HostService {
         host: &str,
         prompt: &str,
         execution_mode: TurnExecutionMode,
-    ) -> Result<TurnOutcome, SatelleError> {
+    ) -> Result<TurnOutcome, TurnAdmissionFailure> {
         self.runtime
             .run(RunCommand::attached(host, prompt).with_execution_mode(execution_mode))
             .map(crate::runtime::RuntimeTurnOutcome::into_command_outcome)
@@ -249,10 +249,11 @@ impl HostService {
         host: &str,
         prompt: &str,
         execution_mode: TurnExecutionMode,
-    ) -> Result<SessionRecord, SatelleError> {
-        self.runtime
-            .run(RunCommand::detached(host, prompt).with_execution_mode(execution_mode))
-            .map(|outcome| outcome.session)
+    ) -> Result<PublicSession, SatelleError> {
+        crate::runtime::admitted_session(
+            self.runtime
+                .run(RunCommand::detached(host, prompt).with_execution_mode(execution_mode)),
+        )
     }
 
     pub fn steer(
@@ -260,7 +261,7 @@ impl HostService {
         session_id: &SessionId,
         prompt: &str,
         execution_mode: TurnExecutionMode,
-    ) -> Result<TurnOutcome, SatelleError> {
+    ) -> Result<TurnOutcome, TurnAdmissionFailure> {
         self.runtime
             .steer(
                 SteerCommand::attached(session_id.clone(), prompt)
@@ -274,16 +275,13 @@ impl HostService {
         session_id: &SessionId,
         prompt: &str,
         execution_mode: TurnExecutionMode,
-    ) -> Result<SessionRecord, SatelleError> {
-        self.runtime
-            .steer(
-                SteerCommand::detached(session_id.clone(), prompt)
-                    .with_execution_mode(execution_mode),
-            )
-            .map(|outcome| outcome.session)
+    ) -> Result<PublicSession, SatelleError> {
+        crate::runtime::admitted_session(self.runtime.steer(
+            SteerCommand::detached(session_id.clone(), prompt).with_execution_mode(execution_mode),
+        ))
     }
 
-    pub fn status(&self, session_id: &SessionId) -> Result<SessionRecord, SatelleError> {
+    pub fn status(&self, session_id: &SessionId) -> Result<PublicSession, SatelleError> {
         self.runtime.status(session_id.clone())
     }
 
@@ -658,7 +656,7 @@ pub struct HostStatus {
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct TurnOutcome {
-    pub session: SessionRecord,
+    pub session: PublicSession,
     pub events: Vec<SatelleEvent>,
 }
 

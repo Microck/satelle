@@ -6,7 +6,7 @@ use std::fmt;
 use thiserror::Error;
 use time::{OffsetDateTime, UtcOffset};
 
-pub const EVENT_SCHEMA_VERSION: &str = "satelle.events.v1";
+pub const EVENT_SCHEMA_VERSION: &str = "satelle.events.v2";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct EventSchema;
@@ -30,7 +30,7 @@ impl<'de> Deserialize<'de> for EventSchema {
             Ok(Self)
         } else {
             Err(serde::de::Error::custom(
-                "expected schema_version satelle.events.v1",
+                "expected schema_version satelle.events.v2",
             ))
         }
     }
@@ -45,6 +45,7 @@ pub enum EventType {
     TurnStarted,
     TurnProgress,
     ActionRequired,
+    CommandFailed,
     TurnCompleted,
     TurnBlocked,
     TurnFailed,
@@ -60,6 +61,7 @@ impl EventType {
             Self::TurnStarted => "turn_started",
             Self::TurnProgress => "turn_progress",
             Self::ActionRequired => "action_required",
+            Self::CommandFailed => "command_failed",
             Self::TurnCompleted => "turn_completed",
             Self::TurnBlocked => "turn_blocked",
             Self::TurnFailed => "turn_failed",
@@ -68,6 +70,17 @@ impl EventType {
     }
 
     pub const fn is_terminal(self) -> bool {
+        matches!(
+            self,
+            Self::CommandFailed
+                | Self::TurnCompleted
+                | Self::TurnBlocked
+                | Self::TurnFailed
+                | Self::TurnStopped
+        )
+    }
+
+    pub const fn requires_turn_subject(self) -> bool {
         matches!(
             self,
             Self::TurnCompleted | Self::TurnBlocked | Self::TurnFailed | Self::TurnStopped
@@ -165,8 +178,12 @@ impl SatelleEventBody {
         if !data.is_object() {
             return Err(SatelleEventError::DataMustBeObject);
         }
-        if event_type.is_terminal() && !matches!(subject, Some(EventSubject::Turn { .. })) {
+        if event_type.requires_turn_subject() && !matches!(subject, Some(EventSubject::Turn { .. }))
+        {
             return Err(SatelleEventError::TerminalEventRequiresTurn);
+        }
+        if event_type == EventType::CommandFailed && subject.is_some() {
+            return Err(SatelleEventError::CommandFailedRequiresNoSubject);
         }
         let (session_id, turn_id, state_subject) = match subject {
             None => (None, None, None),
@@ -426,8 +443,10 @@ pub enum SatelleEventError {
     EmptyMessage,
     #[error("Satelle Event data must be a JSON object")]
     DataMustBeObject,
-    #[error("a terminal Satelle Event requires a Turn state subject")]
+    #[error("a Turn-terminal Satelle Event requires a Turn state subject")]
     TerminalEventRequiresTurn,
+    #[error("a command_failed Satelle Event must not have a state subject")]
+    CommandFailedRequiresNoSubject,
 }
 
 #[cfg(test)]
@@ -436,7 +455,7 @@ mod tests {
 
     fn valid_event() -> Value {
         serde_json::json!({
-            "schema_version": "satelle.events.v1",
+            "schema_version": "satelle.events.v2",
             "type": "turn_completed",
             "source": "host_daemon",
             "timestamp": "2026-07-10T12:00:00Z",
@@ -454,14 +473,125 @@ mod tests {
         })
     }
 
+    fn valid_command_failed_event() -> Value {
+        serde_json::json!({
+            "schema_version": "satelle.events.v2",
+            "type": "command_failed",
+            "source": "cli",
+            "timestamp": "2026-07-10T12:00:00Z",
+            "seq": 1,
+            "session_id": null,
+            "turn_id": null,
+            "host": "workstation",
+            "state_subject": null,
+            "message": "Host is unreachable",
+            "data": {
+                "code": "host-unreachable",
+                "message": "Host is unreachable",
+                "recovery_command": null,
+                "source_detail": null,
+                "details": {},
+                "admission_phase": "not_admitted",
+                "session_id": null,
+                "turn_id": null
+            }
+        })
+    }
+
     #[test]
-    fn satelle_event_v1_is_closed_and_revision_bound() {
+    fn command_failed_is_a_subjectless_terminal_event() {
+        let wire = valid_command_failed_event();
+        let event: SatelleEvent =
+            serde_json::from_value(wire.clone()).expect("decode subjectless command failure");
+
+        assert_eq!(event.event_type(), EventType::CommandFailed);
+        assert!(event.event_type().is_terminal());
+        assert!(!event.event_type().requires_turn_subject());
+        assert_eq!(event.session_id(), None);
+        assert_eq!(event.turn_id(), None);
+        assert_eq!(event.state_subject(), None);
+        assert_eq!(
+            serde_json::to_value(event).expect("encode command failure"),
+            wire
+        );
+    }
+
+    #[test]
+    fn command_failed_rejects_a_state_subject() {
+        let mut turn_subject = valid_event();
+        turn_subject["type"] = serde_json::json!("command_failed");
+
+        let mut session_subject = turn_subject.clone();
+        session_subject["turn_id"] = Value::Null;
+        session_subject["state_subject"] = serde_json::json!({
+            "kind": "session",
+            "session_state_revision": 3
+        });
+
+        for wire in [session_subject, turn_subject] {
+            let error = serde_json::from_value::<SatelleEvent>(wire)
+                .expect_err("command failure with a state subject must be rejected");
+            assert!(
+                error
+                    .to_string()
+                    .contains("command_failed Satelle Event must not have a state subject")
+            );
+        }
+    }
+
+    #[test]
+    fn turn_terminal_events_still_require_a_turn_subject() {
+        let error = SatelleEventBody::new(
+            EventType::TurnCompleted,
+            EventSource::HostDaemon,
+            OffsetDateTime::UNIX_EPOCH,
+            "workstation",
+            None,
+            "completed Turn",
+            serde_json::json!({"state": "completed"}),
+        )
+        .expect_err("Turn terminal event without a Turn subject must be rejected");
+
+        assert_eq!(error, SatelleEventError::TerminalEventRequiresTurn);
+    }
+
+    #[test]
+    fn terminal_classification_distinguishes_stream_and_turn_requirements() {
+        assert!(EventType::CommandFailed.is_terminal());
+        assert!(!EventType::CommandFailed.requires_turn_subject());
+
+        for event_type in [
+            EventType::TurnCompleted,
+            EventType::TurnBlocked,
+            EventType::TurnFailed,
+            EventType::TurnStopped,
+        ] {
+            assert!(event_type.is_terminal());
+            assert!(event_type.requires_turn_subject());
+        }
+
+        for event_type in [
+            EventType::Preflight,
+            EventType::Readiness,
+            EventType::ProviderSmoke,
+            EventType::TurnStarted,
+            EventType::TurnProgress,
+            EventType::ActionRequired,
+        ] {
+            assert!(!event_type.is_terminal());
+            assert!(!event_type.requires_turn_subject());
+        }
+    }
+
+    #[test]
+    fn satelle_event_v2_is_closed_and_revision_bound() {
         let event: SatelleEvent =
             serde_json::from_value(valid_event()).expect("decode coherent event");
         assert_eq!(event.event_type(), EventType::TurnCompleted);
         assert_eq!(event.seq(), 7);
 
-        let mutations: [fn(&mut Value); 4] = [
+        let mutations: [fn(&mut Value); 5] = [
+            |value| value["schema_version"] = serde_json::json!("satelle.events.v1"),
             |value| value["schema_version"] = serde_json::json!(1),
             |value| value["seq"] = serde_json::json!(0),
             |value| {

@@ -1,4 +1,3 @@
-use self::control_plane::CountingAdapter;
 use super::adapter::BlockedComputerUseAdapter;
 use super::{
     ComputerUseAdapter, LogQuery, RecoveryObservation, RequestIdentity, RunCommand, RuntimeHandle,
@@ -6,7 +5,9 @@ use super::{
 };
 use crate::storage::PrivateUpstreamRef;
 use crate::test_runtime::FakeComputerUseAdapter;
-use satelle_core::session::{SafeSummary, StopObservation, TurnState, TurnTransition};
+use satelle_core::session::{
+    PublicSession, PublicTurn, SafeSummary, StopObservation, TurnState, TurnTransition,
+};
 use satelle_core::{
     ControlPlaneFailureReason, ControlPlaneOperation, ErrorCode, EventType,
     IncompatibleControlPlaneDetails, LOCAL_DEMO_HOST, SatelleError,
@@ -19,6 +20,17 @@ const WAIT_LIMIT: Duration = Duration::from_secs(2);
 const STABLE_DIGEST: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 const PRIVATE_UPSTREAM_THREAD_REF: &str = "PRIVATE_UPSTREAM_THREAD_REFERENCE_CANARY";
 const PRIVATE_UPSTREAM_TURN_REF: &str = "PRIVATE_UPSTREAM_TURN_REFERENCE_CANARY";
+
+fn latest_turn(session: &PublicSession) -> &PublicTurn {
+    session
+        .turns()
+        .last()
+        .expect("a public Session must contain Turn history")
+}
+
+fn latest_turn_state(session: &PublicSession) -> TurnState {
+    latest_turn(session).state()
+}
 
 #[test]
 fn adapter_types_are_erased_at_the_runtime_handle_boundary() {
@@ -51,7 +63,7 @@ fn blocked_preflight_opens_authoritative_state_without_admitting_work() {
         ))
         .expect_err("blocked preflight must reject execution");
 
-    assert_eq!(error.code, ErrorCode::ComputerUseNotReady);
+    assert_eq!(error.error().code, ErrorCode::ComputerUseNotReady);
     assert!(state.path().join("satelle.sqlite3").exists());
     assert!(state.path().join("satelle.sqlite3.lock").exists());
     assert_eq!(
@@ -61,81 +73,6 @@ fn blocked_preflight_opens_authoritative_state_without_admitting_work() {
             .session_count(),
         0,
     );
-}
-
-#[test]
-fn retrying_a_stable_run_identity_does_not_repeat_adapter_execution() {
-    let state = crate::TestStateDir::new().expect("temporary state directory should exist");
-    let execute_calls = Arc::new(AtomicUsize::new(0));
-    let admission_calls = Arc::new(AtomicUsize::new(0));
-    let adapter = CountingAdapter::new(Arc::clone(&execute_calls), Arc::clone(&admission_calls));
-    let runtime = RuntimeHandle::new(Ok(state.path().to_path_buf()), adapter);
-    let identity = RequestIdentity::new("stable-run-key", STABLE_DIGEST);
-
-    let first = runtime
-        .run(RunCommand::attached_with_identity(
-            LOCAL_DEMO_HOST,
-            "PRIVATE_RETRY_CANARY",
-            identity.clone(),
-        ))
-        .expect("first request should execute");
-    let replay = runtime
-        .run(RunCommand::attached_with_identity(
-            LOCAL_DEMO_HOST,
-            "PRIVATE_RETRY_CANARY",
-            identity,
-        ))
-        .expect("stable retry should return the durable result");
-
-    assert_eq!(first.session.session_id, replay.session.session_id);
-    assert_eq!(execute_calls.load(Ordering::SeqCst), 1);
-    assert_eq!(admission_calls.load(Ordering::SeqCst), 1);
-    drop(runtime);
-
-    let connection = rusqlite::Connection::open(state.path().join("satelle.sqlite3"))
-        .expect("open released authoritative store");
-    for table in ["readiness_successes", "provider_smoke_successes"] {
-        let count: i64 = connection
-            .query_row(&format!("SELECT count(*) FROM {table}"), [], |row| {
-                row.get(0)
-            })
-            .unwrap();
-        assert_eq!(1, count, "stable replay must not duplicate {table}");
-    }
-}
-
-#[test]
-fn retrying_a_stable_steer_identity_does_not_repeat_adapter_execution() {
-    let state = crate::TestStateDir::new().expect("temporary state directory should exist");
-    let execute_calls = Arc::new(AtomicUsize::new(0));
-    let admission_calls = Arc::new(AtomicUsize::new(0));
-    let adapter = CountingAdapter::new(Arc::clone(&execute_calls), Arc::clone(&admission_calls));
-    let runtime = RuntimeHandle::new(Ok(state.path().to_path_buf()), adapter);
-    let session_id = runtime
-        .run(RunCommand::attached(LOCAL_DEMO_HOST, "PRIVATE_INITIAL"))
-        .expect("initial run should complete")
-        .session
-        .session_id;
-    let identity = RequestIdentity::new("stable-steer-key", STABLE_DIGEST);
-
-    let first = runtime
-        .steer(SteerCommand::attached_with_identity(
-            session_id.clone(),
-            "PRIVATE_FOLLOW_UP",
-            identity.clone(),
-        ))
-        .expect("first steer should execute");
-    let replay = runtime
-        .steer(SteerCommand::attached_with_identity(
-            session_id,
-            "PRIVATE_FOLLOW_UP",
-            identity,
-        ))
-        .expect("stable steer retry should replay its durable result");
-
-    assert_eq!(first.session.turns, replay.session.turns);
-    assert_eq!(execute_calls.load(Ordering::SeqCst), 2);
-    assert_eq!(admission_calls.load(Ordering::SeqCst), 2);
 }
 
 #[test]
@@ -157,7 +94,7 @@ fn reads_and_stop_remain_available_during_slow_execution_and_stop_observation() 
 
     let (read_sender, read_receiver) = mpsc::sync_channel(1);
     let read_runtime = runtime.clone();
-    let read_session_id = session.session_id.clone();
+    let read_session_id = session.session_id().clone();
     let execute_read = std::thread::spawn(move || {
         let read_result = read_runtime.status(read_session_id).and_then(|status| {
             let count = read_runtime.snapshot()?.session_count();
@@ -175,12 +112,12 @@ fn reads_and_stop_remain_available_during_slow_execution_and_stop_observation() 
         }
     };
     execute_read.join().expect("read worker should finish");
-    assert_eq!(running_status.status, satelle_core::TurnStatus::Started);
+    assert_eq!(latest_turn_state(&running_status), TurnState::Running);
     assert_eq!(count, 1);
 
     let (stop_sender, stop_receiver) = mpsc::sync_channel(1);
     let stop_runtime = runtime.clone();
-    let stop_session_id = session.session_id.clone();
+    let stop_session_id = session.session_id().clone();
     let stop_worker = std::thread::spawn(move || {
         let stop = stop_runtime.stop(StopCommand::with_identity(
             stop_session_id,
@@ -197,7 +134,7 @@ fn reads_and_stop_remain_available_during_slow_execution_and_stop_observation() 
 
     let (read_sender, read_receiver) = mpsc::sync_channel(1);
     let read_runtime = runtime.clone();
-    let read_session_id = session.session_id.clone();
+    let read_session_id = session.session_id().clone();
     let stop_read = std::thread::spawn(move || {
         let read_result = read_runtime.status(read_session_id).and_then(|status| {
             let logs = read_runtime.logs(LogQuery::for_host(LOCAL_DEMO_HOST))?;
@@ -230,9 +167,9 @@ fn reads_and_stop_remain_available_during_slow_execution_and_stop_observation() 
         .wait_for_background()
         .expect("the losing execution worker should finish");
     let final_status = runtime
-        .status(session.session_id)
+        .status(session.session_id().clone())
         .expect("the terminal stop compare-and-swap should win");
-    assert_eq!(final_status.status, satelle_core::TurnStatus::Stopped);
+    assert_eq!(latest_turn_state(&final_status), TurnState::Stopped);
 }
 
 #[test]
@@ -247,11 +184,7 @@ fn adapter_persists_upstream_refs_before_waiting_and_stop_keeps_them_durable() {
         ))
         .expect("detached work should be admitted")
         .session;
-    let turn_id = session
-        .latest_turn()
-        .expect("admitted Session must contain its starting Turn")
-        .turn_id
-        .clone();
+    let turn_id = latest_turn(&session).turn_id().clone();
     if !adapter.references_recorded.wait_for(WAIT_LIMIT) {
         adapter.execute_release.signal();
         panic!("the adapter did not durably record its upstream references");
@@ -265,7 +198,7 @@ fn adapter_persists_upstream_refs_before_waiting_and_stop_keeps_them_durable() {
     let durable_subject = engine
         .lock_storage()
         .expect("lock runtime storage")
-        .recovery_subject(&session.session_id, &turn_id)
+        .recovery_subject(session.session_id(), &turn_id)
         .expect("reload durable adapter subject");
     assert_eq!(
         durable_subject.upstream_thread_ref(),
@@ -276,7 +209,7 @@ fn adapter_persists_upstream_refs_before_waiting_and_stop_keeps_them_durable() {
         Some(&expected_turn_ref)
     );
     let public_session = runtime
-        .status_public(&session.session_id)
+        .status(session.session_id().clone())
         .expect("read public Session while execution is waiting");
     let logs = runtime
         .logs(LogQuery::for_host(LOCAL_DEMO_HOST))
@@ -287,7 +220,7 @@ fn adapter_persists_upstream_refs_before_waiting_and_stop_keeps_them_durable() {
     assert!(!public_json.contains(PRIVATE_UPSTREAM_TURN_REF));
 
     let stopped = runtime
-        .stop(StopCommand::new(session.session_id.clone()))
+        .stop(StopCommand::new(session.session_id().clone()))
         .expect("stop observation should consume the durable references");
     assert_eq!(stopped.current_state(), TurnState::Stopped);
     adapter.execute_release.signal();
@@ -296,13 +229,13 @@ fn adapter_persists_upstream_refs_before_waiting_and_stop_keeps_them_durable() {
         .expect("the losing execution worker should finish");
 
     let final_status = runtime
-        .status(session.session_id.clone())
+        .status(session.session_id().clone())
         .expect("the confirmed stop should remain terminal");
-    assert_eq!(final_status.status, satelle_core::TurnStatus::Stopped);
+    assert_eq!(latest_turn_state(&final_status), TurnState::Stopped);
     let final_subject = engine
         .lock_storage()
         .expect("lock runtime storage after stop")
-        .recovery_subject(&session.session_id, &turn_id)
+        .recovery_subject(session.session_id(), &turn_id)
         .expect("reload durable adapter subject after stop");
     assert_eq!(
         final_subject.upstream_thread_ref(),
@@ -324,7 +257,8 @@ fn adapter_receives_committed_policy_and_resumes_the_private_thread_reference() 
         ))
         .expect("initial Turn should execute through the adapter boundary")
         .session
-        .session_id;
+        .session_id()
+        .clone();
     runtime
         .steer(SteerCommand::attached(
             session_id,
@@ -370,7 +304,7 @@ fn read_paths_open_storage_without_computer_use_preflight() {
         BlockedComputerUseAdapter::new(SatelleError::computer_use_not_ready()),
     );
     let status = blocked
-        .status(session.session_id)
+        .status(session.session_id().clone())
         .expect("status should not require adapter readiness");
     let logs = blocked
         .logs(LogQuery::for_host(LOCAL_DEMO_HOST))
@@ -380,7 +314,7 @@ fn read_paths_open_storage_without_computer_use_preflight() {
         .expect("runtime snapshot should not require adapter readiness")
         .session_count();
 
-    assert_eq!(status.status, satelle_core::TurnStatus::Completed);
+    assert_eq!(latest_turn_state(&status), TurnState::Completed);
     assert!(!logs.is_empty());
     assert_eq!(count, 1);
 }
@@ -407,12 +341,12 @@ fn detached_adapter_error_enters_recovery_without_a_restart() {
         RuntimeStartupState::RecoveryRequired
     );
     let status = runtime
-        .status(session.session_id.clone())
+        .status(session.session_id().clone())
         .expect("the recovering Session should remain readable");
-    assert_eq!(status.status, satelle_core::TurnStatus::Started);
+    assert_eq!(latest_turn_state(&status), TurnState::RecoveryPending);
 
     runtime
-        .stop(StopCommand::new(session.session_id))
+        .stop(StopCommand::new(session.session_id().clone()))
         .expect("confirmed stop should resolve the queued recovery subject");
     assert_eq!(
         runtime
@@ -424,15 +358,9 @@ fn detached_adapter_error_enters_recovery_without_a_restart() {
 
 #[test]
 fn restart_recovery_commits_adapter_proven_blocked_and_failed_outcomes() {
-    for (observation, expected_status) in [
-        (
-            RecoveryObservation::Blocked,
-            satelle_core::TurnStatus::Blocked,
-        ),
-        (
-            RecoveryObservation::Failed,
-            satelle_core::TurnStatus::Failed,
-        ),
+    for (observation, expected_state) in [
+        (RecoveryObservation::Blocked, TurnState::Blocked),
+        (RecoveryObservation::Failed, TurnState::Failed),
     ] {
         let state = crate::TestStateDir::new().expect("temporary state directory should exist");
         let state_root = state.path().to_path_buf();
@@ -456,14 +384,14 @@ fn restart_recovery_commits_adapter_proven_blocked_and_failed_outcomes() {
                 "PRIVATE_AFTER_TERMINAL_RECOVERY",
             ))
             .expect("terminal recovery should release admission");
-        let recovered_session_id = old_session.session_id;
+        let recovered_session_id = old_session.session_id().clone();
         let recovered = restarted
             .status(recovered_session_id.clone())
             .expect("the recovered Session should remain readable");
-        assert_eq!(recovered.status, expected_status);
+        assert_eq!(latest_turn_state(&recovered), expected_state);
         if observation == RecoveryObservation::Failed {
             let public = restarted
-                .status_public(&recovered_session_id)
+                .status(recovered_session_id.clone())
                 .expect("read recovered public Session");
             assert_eq!(
                 public.turns().last().unwrap().safe_summary(),
@@ -489,7 +417,7 @@ fn new_admission_reconciles_restart_work_without_blocking_reads() {
         .wait_for_background()
         .expect("the interrupted worker should finish");
     let before_recovery = interrupted
-        .status(old_session.session_id.clone())
+        .status(old_session.session_id().clone())
         .expect("interrupted status should be readable");
     drop(interrupted);
 
@@ -513,7 +441,7 @@ fn new_admission_reconciles_restart_work_without_blocking_reads() {
 
     let (read_sender, read_receiver) = mpsc::sync_channel(1);
     let read_runtime = restarted.clone();
-    let read_session_id = old_session.session_id.clone();
+    let read_session_id = old_session.session_id().clone();
     let read_worker = std::thread::spawn(move || {
         let result = read_runtime.status(read_session_id).and_then(|status| {
             let logs = read_runtime.logs(LogQuery::for_host(LOCAL_DEMO_HOST))?;
@@ -531,7 +459,10 @@ fn new_admission_reconciles_restart_work_without_blocking_reads() {
         }
     };
     read_worker.join().expect("read worker should finish");
-    assert_eq!(recovering_status.status, satelle_core::TurnStatus::Started);
+    assert_eq!(
+        latest_turn_state(&recovering_status),
+        TurnState::RecoveryPending
+    );
     assert!(log_count > 0);
 
     adapter.recovery_release.signal();
@@ -541,14 +472,14 @@ fn new_admission_reconciles_restart_work_without_blocking_reads() {
         .expect("recovery and new execution should succeed");
     run_worker.join().expect("run worker should finish");
     let recovered = restarted
-        .status(old_session.session_id)
+        .status(old_session.session_id().clone())
         .expect("recovered Session should remain readable");
 
-    assert_eq!(recovered.status, satelle_core::TurnStatus::Completed);
-    assert!(recovered.updated_at >= before_recovery.updated_at);
+    assert_eq!(latest_turn_state(&recovered), TurnState::Completed);
+    assert!(recovered.updated_at() >= before_recovery.updated_at());
     assert_eq!(
-        new_outcome.session.status,
-        satelle_core::TurnStatus::Completed
+        latest_turn_state(&new_outcome.session),
+        TurnState::Completed
     );
     assert_eq!(adapter.recovery_calls.load(Ordering::SeqCst), 1);
     assert_eq!(
@@ -583,11 +514,11 @@ fn unknown_restart_work_blocks_new_admission_until_stop_resolves_it() {
             "PRIVATE_MUST_NOT_ADMIT",
         ))
         .expect_err("unknown recovery must block new admission");
-    assert_eq!(error.code, ErrorCode::HostBusy);
-    assert_eq!(error.details["reason"], "outcome_unknown");
+    assert_eq!(error.error().code, ErrorCode::HostBusy);
+    assert_eq!(error.error().details["reason"], "outcome_unknown");
     assert_eq!(
-        error.recovery_command,
-        Some(format!("satelle status {} --json", session.session_id))
+        error.error().recovery_command.as_deref(),
+        Some(format!("satelle status {} --json", session.session_id())).as_deref()
     );
     assert_eq!(
         restarted
@@ -597,7 +528,7 @@ fn unknown_restart_work_blocks_new_admission_until_stop_resolves_it() {
     );
 
     let stopped = restarted
-        .stop(StopCommand::new(session.session_id.clone()))
+        .stop(StopCommand::new(session.session_id().clone()))
         .expect("explicit stop should resolve unknown restart work");
     assert_eq!(stopped.previous_state(), TurnState::RecoveryPending);
     assert_eq!(stopped.current_state(), TurnState::Stopped);
@@ -945,3 +876,6 @@ mod control_plane;
 
 #[path = "runtime-tests/review-regressions.rs"]
 mod review_regressions;
+
+#[path = "runtime-admission-tests.rs"]
+mod admission_tests;

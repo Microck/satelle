@@ -69,7 +69,7 @@ fn stable_run_replay_after_restart_skips_adapter_preflight() {
         ))
         .expect("the restarted runtime should return the durable result");
 
-    assert_eq!(replay.session.session_id, first.session.session_id);
+    assert_eq!(replay.session, first.session);
     assert_eq!(preflight_calls.load(Ordering::SeqCst), 0);
     assert_eq!(execute_calls.load(Ordering::SeqCst), 0);
 }
@@ -123,7 +123,7 @@ fn duplicate_attached_run_returns_in_progress_handles_without_waiting_for_execut
             panic!("the duplicate waited for adapter execution to finish: {error}");
         }
     };
-    assert_eq!(replay.session.session_id, session_id);
+    assert_eq!(replay.session.session_id(), &session_id);
     assert_eq!(adapter.execute_calls.load(Ordering::SeqCst), 1);
 
     adapter.execute_release.signal();
@@ -145,7 +145,8 @@ fn stable_steer_replays_while_a_later_turn_is_active() {
         .run(RunCommand::attached(LOCAL_DEMO_HOST, "PRIVATE_INITIAL"))
         .expect("initial run should complete")
         .session
-        .session_id;
+        .session_id()
+        .clone();
     let identity = RequestIdentity::new("stable-active-steer", STABLE_DIGEST);
     let original = runtime
         .steer(SteerCommand::attached_with_identity(
@@ -173,7 +174,7 @@ fn stable_steer_replays_while_a_later_turn_is_active() {
             identity,
         ))
         .expect("stable retry should replay despite the later active Turn");
-    assert_eq!(replay.session.turns, original.session.turns);
+    assert_eq!(replay.session.turns(), original.session.turns());
     assert_eq!(adapter.execute_calls.load(Ordering::SeqCst), 3);
 
     adapter.blocked_release.signal();
@@ -207,11 +208,11 @@ fn proven_running_restart_work_is_restored_and_keeps_admission_blocked() {
         ))
         .expect_err("a proven-running Turn must retain the Control Lease");
 
-    assert_eq!(error.code, ErrorCode::HostBusy);
+    assert_eq!(error.error().code, ErrorCode::HostBusy);
     let status = restarted
-        .status(session.session_id.clone())
+        .status(session.session_id().clone())
         .expect("restored running Session should remain readable");
-    assert_eq!(status.status, satelle_core::TurnStatus::Started);
+    assert_eq!(latest_turn_state(&status), TurnState::Running);
     assert_eq!(
         restarted
             .startup_state()
@@ -219,7 +220,7 @@ fn proven_running_restart_work_is_restored_and_keeps_admission_blocked() {
         RuntimeStartupState::Ready
     );
     restarted
-        .stop(StopCommand::new(session.session_id))
+        .stop(StopCommand::new(session.session_id().clone()))
         .expect("test cleanup should stop the restored Turn");
 }
 
@@ -255,7 +256,7 @@ fn stop_during_recovery_observation_does_not_resurrect_the_subject() {
     );
 
     let stopped = restarted
-        .stop(StopCommand::new(session.session_id.clone()))
+        .stop(StopCommand::new(session.session_id().clone()))
         .expect("explicit stop should resolve the observed recovery subject");
     assert_eq!(stopped.current_state(), TurnState::Stopped);
     adapter.recovery_release.signal();
@@ -265,8 +266,8 @@ fn stop_during_recovery_observation_does_not_resurrect_the_subject() {
         .expect("admission thread should not panic")
         .expect("resolved recovery should allow the waiting admission");
     assert_eq!(
-        new_outcome.session.status,
-        satelle_core::TurnStatus::Completed
+        latest_turn_state(&new_outcome.session),
+        TurnState::Completed
     );
     assert_eq!(
         restarted
@@ -304,7 +305,7 @@ fn attached_execution_losing_to_stop_returns_the_durable_stopped_state() {
         .expect("attached execution thread should not panic")
         .expect("the losing execution should return durable terminal state");
 
-    assert_eq!(outcome.session.status, satelle_core::TurnStatus::Stopped);
+    assert_eq!(latest_turn_state(&outcome.session), TurnState::Stopped);
     assert!(
         outcome
             .events
@@ -342,7 +343,7 @@ fn controlled_execution_returns_only_after_the_durable_stop_winner() {
         .expect("attached execution thread should not panic")
         .expect("controlled execution should read the durable stop winner");
 
-    assert_eq!(outcome.session.status, satelle_core::TurnStatus::Stopped);
+    assert_eq!(latest_turn_state(&outcome.session), TurnState::Stopped);
     assert!(outcome.events.is_empty());
 }
 
@@ -358,7 +359,8 @@ fn cancellation_confirmed_worker_exit_does_not_block_new_turn_admission() {
         ))
         .expect("the original detached Turn should be admitted")
         .session
-        .session_id;
+        .session_id()
+        .clone();
     assert!(
         adapter.execute_started.wait_for(WAIT_LIMIT),
         "the original local worker should start"
@@ -389,8 +391,8 @@ fn cancellation_confirmed_worker_exit_does_not_block_new_turn_admission() {
             "PRIVATE_AFTER_CONFIRMED_CANCELLATION",
         ))
         .expect("a cancellation-confirmed worker must not become a second admission authority");
-    assert_eq!(admitted.session.status, satelle_core::TurnStatus::Started);
-    assert_eq!(admitted.session.turns.len(), 2);
+    assert_eq!(latest_turn_state(&admitted.session), TurnState::Starting);
+    assert_eq!(admitted.session.turns().len(), 2);
 
     adapter.execute_release.signal();
     runtime
@@ -402,10 +404,7 @@ fn cancellation_confirmed_worker_exit_does_not_block_new_turn_admission() {
             "PRIVATE_AFTER_WORKER_REAP",
         ))
         .expect("a later Turn should execute after the worker slot is reaped");
-    assert_eq!(
-        recovered.session.status,
-        satelle_core::TurnStatus::Completed
-    );
+    assert_eq!(latest_turn_state(&recovered.session), TurnState::Completed);
 }
 
 #[test]
@@ -420,7 +419,8 @@ fn stop_proven_still_active_is_not_queued_for_running_to_running_recovery() {
         ))
         .expect("detached Turn should be admitted")
         .session
-        .session_id;
+        .session_id()
+        .clone();
     assert!(
         adapter.execute_started.wait_for(WAIT_LIMIT),
         "adapter execution should start"
@@ -438,7 +438,7 @@ fn stop_proven_still_active_is_not_queued_for_running_to_running_recovery() {
             "PRIVATE_CONFLICTING_AFTER_STILL_ACTIVE",
         ))
         .expect_err("the retained Control Lease should block new admission");
-    assert_eq!(error.code, ErrorCode::HostBusy);
+    assert_eq!(error.error().code, ErrorCode::HostBusy);
     assert_eq!(adapter.recovery_calls.load(Ordering::SeqCst), 0);
 
     adapter.execute_release.signal();
@@ -462,7 +462,7 @@ fn preflight_and_execution_use_the_same_adapter_instance() {
             "PRIVATE_SINGLE_ADAPTER_INSTANCE",
         ))
         .expect("one adapter instance should own preflight and execution");
-    assert_eq!(outcome.session.status, satelle_core::TurnStatus::Completed);
+    assert_eq!(latest_turn_state(&outcome.session), TurnState::Completed);
 }
 
 #[test]
@@ -474,7 +474,8 @@ fn pending_stop_retry_resumes_observation_and_then_replays() {
         .run(RunCommand::detached(LOCAL_DEMO_HOST, "PRIVATE_STOP_RETRY"))
         .expect("detached Turn should be admitted")
         .session
-        .session_id;
+        .session_id()
+        .clone();
     assert!(
         adapter.execute_started.wait_for(WAIT_LIMIT),
         "adapter execution should start"
@@ -518,7 +519,8 @@ fn pending_stop_retry_completes_after_the_turn_terminalizes() {
         ))
         .expect("detached Turn should be admitted")
         .session
-        .session_id;
+        .session_id()
+        .clone();
     assert!(
         adapter.execute_started.wait_for(WAIT_LIMIT),
         "adapter execution should start"
@@ -609,7 +611,7 @@ fn stop_winning_before_running_skips_adapter_execution_and_returns_stopped() {
         .execute(plan)
         .expect("the execution path should return the durable stop winner");
 
-    assert_eq!(outcome.session.status, satelle_core::TurnStatus::Stopped);
+    assert_eq!(latest_turn_state(&outcome.session), TurnState::Stopped);
     assert!(outcome.events.is_empty());
     assert_eq!(execute_calls.load(Ordering::SeqCst), 0);
 }

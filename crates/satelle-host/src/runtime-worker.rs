@@ -52,10 +52,20 @@ impl RuntimeEngine {
     pub(super) fn schedule(self: &Arc<Self>, plan: ExecutionPlan) -> Result<(), SatelleError> {
         let admitted_work = plan.work.clone();
         let engine = Arc::clone(self);
-        let mut workers = self.workers.lock().map_err(|_| {
-            model::integrity_failure("the detached runtime worker registry was poisoned")
-        })?;
-        workers.reap_finished()?;
+        let mut workers = match self.workers.lock() {
+            Ok(workers) => workers,
+            Err(_) => {
+                let failure =
+                    model::integrity_failure("the detached runtime worker registry was poisoned");
+                self.fail_unstarted_dispatch(&admitted_work)?;
+                return Err(failure);
+            }
+        };
+        if let Err(failure) = workers.reap_finished() {
+            drop(workers);
+            self.fail_unstarted_dispatch(&admitted_work)?;
+            return Err(failure);
+        }
         let spawned = std::thread::Builder::new()
             .name("satelle-runtime-turn".to_string())
             .spawn(move || {
@@ -102,7 +112,7 @@ impl RuntimeEngine {
         )?;
         plan.work.session = running;
         if !running_committed {
-            return model::turn_outcome(&plan.work.session, Vec::new());
+            return Ok(model::turn_outcome(&plan.work.session, Vec::new()));
         }
 
         // No runtime or SQLite mutex is held while the external adapter works.
@@ -137,7 +147,7 @@ impl RuntimeEngine {
                     "controlled execution returned before stop was durable",
                 ));
             }
-            return model::turn_outcome(&session, Vec::new());
+            return Ok(model::turn_outcome(&session, Vec::new()));
         };
         if matches!(
             transition,
@@ -160,7 +170,7 @@ impl RuntimeEngine {
         } else {
             Vec::new()
         };
-        model::turn_outcome(&session, events)
+        Ok(model::turn_outcome(&session, events))
     }
 
     fn persist_upstream_ref(

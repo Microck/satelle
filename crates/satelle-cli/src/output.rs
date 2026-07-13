@@ -1,6 +1,8 @@
 use clap::{Args, ValueEnum};
-use satelle_core::{SatelleError, SessionId, SessionRecord, TurnRecord, TurnStatus};
+use satelle_core::session::{PublicSession, PublicTurn, TurnState};
+use satelle_core::{SatelleError, SessionId};
 use serde::{Deserialize, Serialize};
+use time::OffsetDateTime;
 
 use super::{
     Command, ConfigCommand, EventMode, HostCommand, HostStorageCommand, SelfSubcommand,
@@ -16,12 +18,12 @@ pub(crate) enum OutputFormat {
 /// Command-specific schema tokens for JSON results backed by a Satelle session.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub(crate) enum SessionResultSchemaVersion {
-    #[serde(rename = "satelle.run.v1")]
-    RunV1,
-    #[serde(rename = "satelle.steer.v1")]
-    SteerV1,
-    #[serde(rename = "satelle.status.v1")]
-    StatusV1,
+    #[serde(rename = "satelle.run.v2")]
+    RunV2,
+    #[serde(rename = "satelle.steer.v2")]
+    SteerV2,
+    #[serde(rename = "satelle.status.v2")]
+    StatusV2,
 }
 
 #[derive(Serialize)]
@@ -29,22 +31,28 @@ pub(crate) struct StatusReport<'a> {
     schema_version: SessionResultSchemaVersion,
     session_id: &'a SessionId,
     host: &'a str,
-    status: &'a TurnStatus,
-    created_at: &'a str,
-    updated_at: &'a str,
-    turns: &'a [TurnRecord],
+    status: TurnState,
+    #[serde(with = "time::serde::rfc3339")]
+    created_at: OffsetDateTime,
+    #[serde(with = "time::serde::rfc3339")]
+    updated_at: OffsetDateTime,
+    turns: &'a [PublicTurn],
 }
 
 impl<'a> StatusReport<'a> {
-    pub(crate) fn new(session: &'a SessionRecord) -> Self {
+    pub(crate) fn new(session: &'a PublicSession, host: &'a str) -> Self {
+        let latest_turn = session
+            .turns()
+            .last()
+            .expect("validated public Sessions always contain Turn history");
         Self {
-            schema_version: SessionResultSchemaVersion::StatusV1,
-            session_id: &session.session_id,
-            host: &session.host,
-            status: &session.status,
-            created_at: &session.created_at,
-            updated_at: &session.updated_at,
-            turns: &session.turns,
+            schema_version: SessionResultSchemaVersion::StatusV2,
+            session_id: session.session_id(),
+            host,
+            status: latest_turn.state(),
+            created_at: session.created_at(),
+            updated_at: session.updated_at(),
+            turns: session.turns(),
         }
     }
 }
@@ -71,6 +79,13 @@ pub(crate) enum EventOutput {
     None,
     LifecycleJson,
     DoctorEvents,
+}
+
+impl EventOutput {
+    /// Lifecycle JSON is both a stdout stream contract and a machine-readable error selector.
+    pub(crate) const fn requests_json_errors(self) -> bool {
+        matches!(self, Self::LifecycleJson)
+    }
 }
 
 impl Command {
@@ -210,6 +225,31 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    fn starting_public_session() -> PublicSession {
+        serde_json::from_value(json!({
+            "session_id": "rs_01890a5d-ac96-7b7c-8f89-37c3d0a66e11",
+            "session_state_revision": 1,
+            "created_at": "2024-01-01T00:00:00Z",
+            "updated_at": "2024-01-01T00:00:00Z",
+            "activity": {
+                "state": "starting",
+                "turn_id": "rt_01890a5d-ac96-7b7c-8f89-37c3d0a66e21",
+                "turn_state_revision": 1
+            },
+            "turns": [{
+                "session_id": "rs_01890a5d-ac96-7b7c-8f89-37c3d0a66e11",
+                "turn_id": "rt_01890a5d-ac96-7b7c-8f89-37c3d0a66e21",
+                "turn_state_revision": 1,
+                "state": "starting",
+                "started_at": "2024-01-01T00:00:00Z",
+                "updated_at": "2024-01-01T00:00:00Z",
+                "terminal_at": null,
+                "safe_summary": null
+            }]
+        }))
+        .expect("fixture should be a valid public Session")
+    }
+
     fn args(format: Option<OutputFormat>, json: bool) -> OutputArgs {
         OutputArgs { format, json }
     }
@@ -260,11 +300,18 @@ mod tests {
     }
 
     #[test]
+    fn lifecycle_json_selects_machine_readable_errors() {
+        assert!(EventOutput::LifecycleJson.requests_json_errors());
+        assert!(!EventOutput::None.requests_json_errors());
+        assert!(!EventOutput::DoctorEvents.requests_json_errors());
+    }
+
+    #[test]
     fn session_result_schema_tokens_are_exact_and_strict() {
         for (schema, expected) in [
-            (SessionResultSchemaVersion::RunV1, "satelle.run.v1"),
-            (SessionResultSchemaVersion::SteerV1, "satelle.steer.v1"),
-            (SessionResultSchemaVersion::StatusV1, "satelle.status.v1"),
+            (SessionResultSchemaVersion::RunV2, "satelle.run.v2"),
+            (SessionResultSchemaVersion::SteerV2, "satelle.steer.v2"),
+            (SessionResultSchemaVersion::StatusV2, "satelle.status.v2"),
         ] {
             assert_eq!(
                 serde_json::to_value(schema).expect("session result schema should serialize"),
@@ -273,7 +320,21 @@ mod tests {
         }
 
         assert!(
-            serde_json::from_value::<SessionResultSchemaVersion>(json!("satelle.run.v2")).is_err()
+            serde_json::from_value::<SessionResultSchemaVersion>(json!("satelle.run.v1")).is_err()
         );
+    }
+
+    #[test]
+    fn status_report_projects_the_canonical_public_session_without_a_legacy_shape() {
+        let session = starting_public_session();
+        let report = serde_json::to_value(StatusReport::new(&session, "remote"))
+            .expect("status report should serialize");
+
+        assert_eq!(report["schema_version"], "satelle.status.v2");
+        assert_eq!(report["host"], "remote");
+        assert_eq!(report["status"], "starting");
+        assert_eq!(report["turns"][0]["state"], "starting");
+        assert_eq!(report["turns"][0]["turn_state_revision"], 1);
+        assert!(report["turns"][0].get("status").is_none());
     }
 }

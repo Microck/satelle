@@ -1,0 +1,338 @@
+use super::*;
+use satelle_core::session::{TurnAdmissionPhase, TurnState};
+use satelle_core::{ErrorCode, EventSource, EventSubject, EventType, SatelleEventBody};
+use satelle_host::{ApiScopes, test_support::TestStateDir};
+use satelle_transport::{DaemonServer, DaemonServerConfig};
+use std::net::{Ipv4Addr, SocketAddr};
+
+#[path = "transport-reconnect-tests.rs"]
+mod reconnect;
+
+fn register_client_tokens(
+    service: &HostService,
+    principal: &str,
+) -> (ApiBearerToken, ApiBearerToken) {
+    let generated = ApiBearerToken::generate().expect("generate API token");
+    let exposed = generated.expose();
+    let registry_token = ApiBearerToken::parse(exposed.as_str()).expect("parse registry token");
+    let http_token = ApiBearerToken::parse(exposed.as_str()).expect("parse HTTP token");
+    let event_token = ApiBearerToken::parse(exposed.as_str()).expect("parse event token");
+    service
+        .register_api_token(&registry_token, principal, ApiScopes::CONTROL, None)
+        .expect("register API token");
+    (http_token, event_token)
+}
+
+struct DirectFixture {
+    _state: TestStateDir,
+    service: HostService,
+    host_identity: String,
+    address: SocketAddr,
+    server: Option<DaemonServer>,
+    server_runtime: tokio::runtime::Runtime,
+    transport: Option<DirectTransport>,
+}
+
+impl DirectFixture {
+    fn start() -> Self {
+        let state = TestStateDir::new().expect("temporary state directory");
+        let service = HostService::local_demo_for_tests_at(state.path())
+            .expect("construct deterministic Host service");
+        let initialized = service.initialize_daemon().expect("initialize Host state");
+        let host_identity = initialized.host_identity().to_string();
+        let (http_token, event_token) =
+            register_client_tokens(&service, "principal-cli-direct-test");
+        let server_runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .expect("construct daemon runtime");
+        let server = server_runtime
+            .block_on(DaemonServer::bind(
+                service.clone(),
+                DaemonServerConfig::loopback(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))),
+            ))
+            .expect("bind loopback daemon");
+        let address = server.local_addr();
+        let client = DaemonClient::loopback(address, http_token, &host_identity)
+            .expect("construct loopback HTTP client");
+        let event_client = DaemonEventClient::loopback(address, event_token, &host_identity)
+            .expect("construct loopback event client");
+        let event_runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("construct event runtime");
+        Self {
+            _state: state,
+            service,
+            host_identity,
+            address,
+            server: Some(server),
+            server_runtime,
+            transport: Some(DirectTransport {
+                alias: "direct-test".to_string(),
+                client: Arc::new(client),
+                event_client,
+                event_runtime,
+            }),
+        }
+    }
+
+    fn transport(&self) -> &DirectTransport {
+        self.transport
+            .as_ref()
+            .expect("fixture transport is present")
+    }
+}
+
+impl Drop for DirectFixture {
+    fn drop(&mut self) {
+        drop(self.transport.take());
+        if let Some(server) = self.server.take() {
+            self.server_runtime
+                .block_on(server.shutdown())
+                .expect("shut down loopback daemon");
+        }
+    }
+}
+
+#[test]
+fn direct_attached_run_and_steer_follow_committed_host_events() {
+    let fixture = DirectFixture::start();
+    let mut run_events = Vec::new();
+    let run_outcome = fixture
+        .transport()
+        .run(&TurnRequest::new("first turn"), &mut |event| {
+            run_events.push(event);
+            Ok(())
+        })
+        .expect("run attached Turn");
+    let run = &run_outcome.session;
+    assert_eq!(
+        run_events
+            .iter()
+            .map(SatelleEvent::event_type)
+            .collect::<Vec<_>>(),
+        [
+            EventType::TurnStarted,
+            EventType::TurnProgress,
+            EventType::TurnCompleted,
+        ]
+    );
+    assert_eq!(
+        run.turns().last().map(|turn| turn.state()),
+        Some(TurnState::Completed)
+    );
+    assert_eq!(
+        run.turns().last().map(|turn| turn.turn_id()),
+        Some(&run_outcome.turn_id)
+    );
+    let admitted_failure = TurnAdmissionFailure::admitted(
+        SatelleError::host_unreachable("direct-test"),
+        run.clone(),
+        run_outcome.turn_id.clone(),
+    );
+    assert_eq!(admitted_failure.phase(), TurnAdmissionPhase::Admitted);
+    assert_eq!(
+        admitted_failure.durable_handles(),
+        Some((run.session_id(), &run_outcome.turn_id))
+    );
+    let reconciled = fixture
+        .transport()
+        .reconciled_terminal_event(
+            run,
+            run.turns().last().expect("run retains its Turn").turn_id(),
+        )
+        .expect("construct reconciled terminal event");
+    assert_eq!(reconciled.source(), EventSource::Cli);
+    assert_eq!(reconciled.event_type(), EventType::TurnCompleted);
+    assert_eq!(reconciled.session_id(), Some(run.session_id()));
+    let run_turn = run.turns().last().expect("run retains its Turn");
+    let contradictory = SatelleEventBody::new(
+        EventType::TurnFailed,
+        EventSource::HostDaemon,
+        run_turn.updated_at(),
+        "direct-test",
+        Some(EventSubject::Turn {
+            session_id: run.session_id().clone(),
+            turn_id: run_turn.turn_id().clone(),
+            session_state_revision: run.session_state_revision(),
+            turn_state_revision: run_turn.turn_state_revision(),
+        }),
+        "contradictory terminal fixture",
+        serde_json::json!({}),
+    )
+    .and_then(|body| body.with_seq(1))
+    .expect("construct contradictory event");
+    assert!(
+        fixture
+            .transport()
+            .validate_terminal_event(&contradictory, run, run_turn.turn_id())
+            .is_err()
+    );
+
+    let mut steer_events = Vec::new();
+    let steer_outcome = fixture
+        .transport()
+        .steer(
+            run.session_id(),
+            &TurnRequest::new("follow-up turn"),
+            &mut |event| {
+                steer_events.push(event);
+                Ok(())
+            },
+        )
+        .expect("steer attached Turn");
+    let steer = &steer_outcome.session;
+    assert_eq!(steer.turns().len(), 2);
+    assert_eq!(
+        steer.turns().last().map(|turn| turn.turn_id()),
+        Some(&steer_outcome.turn_id)
+    );
+    assert_eq!(
+        steer_events
+            .iter()
+            .map(SatelleEvent::event_type)
+            .collect::<Vec<_>>(),
+        [
+            EventType::TurnStarted,
+            EventType::TurnProgress,
+            EventType::TurnCompleted,
+        ]
+    );
+    assert!(steer_events.iter().all(|event| {
+        event.session_id() == Some(steer.session_id())
+            && event.turn_id() == steer.turns().last().map(|turn| turn.turn_id())
+    }));
+    let reconciled_first_turn = fixture
+        .transport()
+        .event_runtime
+        .block_on(fixture.transport().reconcile(
+            run.session_id(),
+            run_turn.turn_id(),
+            Some(run_turn.turn_state_revision()),
+        ))
+        .expect("reconcile the first Turn after a follow-up advanced the Session revision");
+    assert!(reconciled_first_turn.is_some());
+}
+
+#[test]
+fn mutation_idempotency_keys_are_fresh_uuid_v7_values() {
+    let first = DirectTransport::idempotency_key();
+    let second = DirectTransport::idempotency_key();
+    assert_ne!(first, second);
+    assert_eq!(
+        Uuid::parse_str(&first)
+            .expect("parse first idempotency key")
+            .get_version_num(),
+        7
+    );
+    assert_eq!(
+        Uuid::parse_str(&second)
+            .expect("parse second idempotency key")
+            .get_version_num(),
+        7
+    );
+}
+
+#[test]
+fn only_connection_loss_and_transient_http_outage_enter_retry_paths() {
+    assert!(direct_attached::event_error_allows_reconciliation(
+        &DaemonEventError::HandshakeTimeout
+    ));
+    assert!(direct_attached::event_error_allows_reconciliation(
+        &DaemonEventError::Disconnected
+    ));
+    assert!(!direct_attached::event_error_allows_reconciliation(
+        &DaemonEventError::SequenceDidNotAdvance
+    ));
+    assert!(!direct_attached::event_error_allows_reconciliation(
+        &DaemonEventError::HostIdentityMismatch
+    ));
+    assert!(!direct_attached::event_error_allows_reconciliation(
+        &DaemonEventError::SubscriptionMismatch
+    ));
+    assert!(!direct_attached::event_error_allows_reconciliation(
+        &DaemonEventError::UnexpectedFrame
+    ));
+    assert!(direct_attached::reconciliation_error_allows_retry(
+        &SatelleError::host_unreachable("direct-test")
+    ));
+    assert!(!direct_attached::reconciliation_error_allows_retry(
+        &SatelleError::remote_api_error("direct-test", "invalid-daemon-response")
+    ));
+    assert_eq!(
+        direct_event_error("direct-test", DaemonEventError::HandshakeTimeout).code,
+        ErrorCode::HostUnreachable
+    );
+}
+
+#[test]
+fn admission_failures_preserve_definitive_and_ambiguous_phases() {
+    for code in [
+        ApiErrorCode::AuthenticationFailed,
+        ApiErrorCode::AuthorizationInsufficientScope,
+        ApiErrorCode::HostIdentityMismatch,
+        ApiErrorCode::InvalidRequest,
+        ApiErrorCode::UnsupportedSchema,
+        ApiErrorCode::UnsupportedContentType,
+        ApiErrorCode::PayloadTooLarge,
+        ApiErrorCode::IdempotencyKeyConflict,
+        ApiErrorCode::SessionNotFound,
+        ApiErrorCode::HostBusy,
+        ApiErrorCode::IncompatibleProtocol,
+        ApiErrorCode::IncompatibleControlPlane,
+        ApiErrorCode::ComputerUseNotReady,
+        ApiErrorCode::CapacityExceeded,
+        ApiErrorCode::RateLimited,
+        ApiErrorCode::RouteNotFound,
+        ApiErrorCode::MethodNotAllowed,
+    ] {
+        assert!(api_error_is_definitively_not_admitted(code), "{code:?}");
+    }
+    for code in [
+        ApiErrorCode::LogsCursorExpired,
+        ApiErrorCode::HostUnreachable,
+        ApiErrorCode::StoreInUse,
+        ApiErrorCode::StateConflict,
+        ApiErrorCode::StopNotConfirmed,
+        ApiErrorCode::StorageBusy,
+        ApiErrorCode::StorageIntegrityFailed,
+        ApiErrorCode::RemoteExecutionFailed,
+        ApiErrorCode::InternalError,
+    ] {
+        assert!(!api_error_is_definitively_not_admitted(code), "{code:?}");
+    }
+
+    let rejected = direct_admission_error("direct-test", DaemonClientError::InvalidTokenHeader);
+    assert_eq!(rejected.phase(), TurnAdmissionPhase::NotAdmitted);
+    assert!(rejected.durable_handles().is_none());
+
+    let ambiguous =
+        direct_admission_error("direct-test", DaemonClientError::ResponseRequestIdMismatch);
+    assert_eq!(ambiguous.phase(), TurnAdmissionPhase::AdmissionUnknown);
+    assert!(ambiguous.durable_handles().is_none());
+
+    let api_error: satelle_transport::ApiError = serde_json::from_value(serde_json::json!({
+        "schema_version": "satelle.error.v1",
+        "request_id": satelle_transport::RequestId::new().to_string(),
+        "host_identity": "host-direct-test",
+        "code": "host-unreachable",
+        "category": "remote_execution",
+        "retryable": true,
+        "message": "the configured execution runtime is unreachable",
+        "details": null,
+        "docs_url": null,
+        "suggested_commands": []
+    }))
+    .expect("deserialize representative daemon API failure");
+    let api_failure = direct_admission_error(
+        "direct-test",
+        DaemonClientError::Api {
+            status: 503_u16.try_into().expect("503 is a valid HTTP status"),
+            error: Box::new(api_error),
+        },
+    );
+    assert_eq!(api_failure.phase(), TurnAdmissionPhase::AdmissionUnknown);
+    assert!(api_failure.durable_handles().is_none());
+}

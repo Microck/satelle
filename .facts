@@ -119,12 +119,12 @@
 - satelle run and steer report a typed output-mode-conflict usage error when --events json is combined with --json or any explicit --format value @contract @mvp @implemented
 - satelle doctor reports a typed output-mode-conflict usage error when --events is combined with --json or any explicit --format value @contract @mvp @implemented
 - satelle run, steer, stop, status, setup, repair, doctor, config check, config explain, self update, host update, paths, and host sessions JSON results include a top-level schema_version @spec @contract @mvp
-- satelle run JSON v1 uses schema_version satelle.run.v1 @contract @mvp @implemented
-- satelle steer JSON v1 uses schema_version satelle.steer.v1 @contract @mvp @implemented
+- satelle run JSON v2 uses schema_version satelle.run.v2 @contract @mvp @implemented
+- satelle steer JSON v2 uses schema_version satelle.steer.v2 @contract @mvp @implemented
 - satelle stop JSON v1 uses schema_version satelle.stop.v1 @spec @contract @mvp
 - satelle stop JSON v1 includes outcome, session_id, turn_id, previous_state, current_state, changed, and stopped_at fields; outcome is stopped or already_terminal @spec @contract @mvp
 - satelle stop on an already-terminal Turn exits 0 with outcome already_terminal and changed false @spec @contract @mvp
-- satelle status JSON v1 uses schema_version satelle.status.v1 @contract @mvp @implemented
+- satelle status JSON v2 uses schema_version satelle.status.v2 @contract @mvp @implemented
 - satelle logs initial and followed JSON records each use schema_version satelle.logs.entry.v1 and emit exactly one record per line without a top-level wrapper @spec @contract @mvp
 - satelle setup JSON v1 uses schema_version satelle.setup.v1 @contract @mvp @implemented
 - satelle repair JSON v1 uses schema_version satelle.repair.v1 @spec @contract @mvp
@@ -342,9 +342,11 @@
 - satelle Satelle Event type values are stable snake_case enum strings @implemented @mvp
 - satelle Satelle Event message values are human-readable convenience text and are not the stable automation contract @implemented @mvp
 - satelle Satelle Event data values contain event-type-specific structured details for automation @implemented @mvp
-- satelle Satelle Event v1 records use schema_version satelle.events.v1 @spec @mvp
-- satelle MVP Satelle Event types are limited to preflight, readiness, provider_smoke, turn_started, turn_progress, action_required, turn_completed, turn_blocked, turn_failed, and turn_stopped @implemented @mvp
-- satelle Satelle Event terminal types are turn_completed, turn_blocked, turn_failed, and turn_stopped @implemented @mvp
+- satelle Satelle Event v2 records use schema_version satelle.events.v2 @mvp @implemented
+- satelle MVP Satelle Event types are limited to preflight, readiness, provider_smoke, turn_started, turn_progress, action_required, command_failed, turn_completed, turn_blocked, turn_failed, and turn_stopped @implemented @mvp
+- satelle Satelle Event stream-terminal types are command_failed, turn_completed, turn_blocked, turn_failed, and turn_stopped @implemented @mvp
+- when attached satelle run or steer with --events json fails after a nonempty Host Alias is known from explicit selection or successful resolution, its final stdout record is exactly one command_failed Satelle Event with source cli and null envelope session_id, turn_id, and state_subject @contract @mvp @implemented
+- command_failed Satelle Event data contains the originating SatelleError as code, message, recovery_command, source_detail, and details, plus admission_phase with exactly not_admitted, admission_unknown, or admitted and durable session_id and turn_id; absent recovery_command or source_detail is null, absent details is an empty object, admitted failures contain their durable identifiers, and other failures contain null identifiers @contract @mvp @implemented
 - satelle does not remove fields, change field meanings, or rename enum tokens within one Satelle Event schema_version @spec @mvp
 - satelle may add optional Satelle Event fields or event types within one schema_version only when older consumers can ignore them safely @spec @mvp
 - satelle breaking Satelle Event wire changes require a new schema_version @spec @mvp
@@ -776,7 +778,7 @@
 ## idempotency-and-capacity
 - satelle mutating Host Daemon API requests use the Idempotency-Key HTTP header @mvp @implemented
 - run, steer, stop, setup, repair, host update, storage migration, token mutation, and destructive maintenance API requests require an idempotency key @spec @mvp
-- satelle CLI generates a UUIDv7 idempotency key when the caller does not supply one @spec @mvp
+- satelle CLI generates a UUIDv7 idempotency key when the caller does not supply one @mvp @implemented
 - an Idempotency Record digest covers the full canonical typed operation payload after defaults and normalization, excludes only transport authentication credentials, request_id, tracing metadata, and the idempotency key itself, and includes operation payload secrets through the sensitive HMAC path without storing their raw values @contract @mvp @implemented
 - prompt-bearing or otherwise sensitive idempotency digests use HMAC-SHA-256 with a Host Daemon-owned key and are never returned through public APIs or logs @mvp @implemented
 - idempotency HMAC keys inherit the token-verifier sensitive-state boundary, survive Host Daemon restart and migration restore for at least the maximum Idempotency Record retention window, and are never exposed through public APIs, logs, or diagnostics @spec @mvp
@@ -820,11 +822,11 @@
 ## event-streams
 - satelle Host Daemon WebSocket event streams are live-only in MVP and begin at connection or subscription time @spec @mvp @implemented
 - satelle MVP does not expose a durable event history, event replay cursor, event resume token, or event replay endpoint for Satelle Events @spec @mvp @implemented
-- satelle Host Daemon WebSocket event stream emits the same Satelle Event JSON envelope used by CLI --events json @spec @mvp
-- satelle Host Daemon is the canonical producer for remote Session and Turn lifecycle Satelle Events observed on the controlled Host @spec @mvp
-- satelle CLI is the canonical producer for local preflight, configuration, and transport Satelle Events observed before or around Host Daemon communication @spec @mvp
-- satelle CLI --events json may merge CLI-produced Satelle Events with Host Daemon-produced Satelle Events in one newline-delimited stream while preserving the shared envelope @spec @mvp
-- satelle CLI --events json assigns seq values for the CLI output stream even when relaying Host Daemon-produced Satelle Events @spec @mvp
+- satelle Host Daemon WebSocket event stream emits the same Satelle Event JSON envelope used by CLI --events json @mvp @implemented
+- satelle Host Daemon is the canonical producer for remote Session and Turn lifecycle Satelle Events observed on the controlled Host @mvp @implemented
+- satelle CLI is the canonical producer for local preflight, configuration, and transport Satelle Events observed before or around Host Daemon communication @mvp @implemented
+- satelle CLI --events json may merge CLI-produced Satelle Events with Host Daemon-produced Satelle Events in one newline-delimited stream while preserving the shared envelope @mvp @implemented
+- satelle CLI --events json assigns seq values for the CLI output stream even when relaying Host Daemon-produced Satelle Events @mvp @implemented
 - satelle Host Daemon WebSocket assigns seq values for each WebSocket event stream and does not expose seq as a durable stored event id @spec @mvp @implemented
 - satelle automation consumers correlate durable Satelle state with session_id, turn_id, type, timestamp, and structured data rather than seq alone @spec @mvp
 - a Host Daemon WebSocket connection authenticates and authorizes its API Principal before accepting subscriptions @spec @mvp
@@ -860,7 +862,7 @@
 - satelle Host Daemon uses Axum on Tokio for its HTTP JSON and WebSocket API implementation @spec @mvp
 - satelle API keeps streaming event flow separate from command response flow instead of forcing every operation through one transport shape @spec @mvp
 - satelle API does not mirror Codex app-server JSON-RPC as its public contract @spec @mvp
-- attached satelle run and steer subscribe to live Host Daemon WebSocket events and reconcile authoritative Session status after stream loss, while detached commands return the same durable admission handles without waiting @spec @contract @mvp
+- attached satelle run and steer over direct Host transport subscribe to live Host Daemon WebSocket events and reconcile authoritative Session status after stream loss, while detached direct commands return the same durable admission handles without waiting @contract @mvp @implemented
 
 # errors
 - satelle reports failures with stable typed error codes plus human-readable messages @spec @mvp

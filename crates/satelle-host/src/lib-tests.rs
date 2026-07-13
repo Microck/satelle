@@ -3,7 +3,32 @@ use crate::codex_capabilities::{
     CapabilityMatrix, CodexVersionEvidence, HostPlatform, Phase0CapabilityEvidence,
     REQUIRED_CODEX_VERSION,
 };
-use satelle_core::ErrorCode;
+use satelle_core::session::{StopObservation, TurnState};
+use satelle_core::{ErrorCode, SatelleError};
+
+#[derive(Clone, Copy)]
+struct FailingExecutionAdapter;
+
+impl ComputerUseAdapter for FailingExecutionAdapter {
+    fn preflight(&self, host: &str) -> Result<AdapterReadiness, SatelleError> {
+        FakeComputerUseAdapter.preflight(host)
+    }
+
+    fn execute(&self, _request: ExecuteRequest<'_>) -> Result<ExecuteResult, SatelleError> {
+        Err(SatelleError::host_unreachable(LOCAL_DEMO_HOST))
+    }
+
+    fn observe_stop(&self, subject: AdapterSubject<'_>) -> Result<StopObservation, SatelleError> {
+        FakeComputerUseAdapter.observe_stop(subject)
+    }
+
+    fn observe_recovery(
+        &self,
+        subject: AdapterSubject<'_>,
+    ) -> Result<RecoveryObservation, SatelleError> {
+        FakeComputerUseAdapter.observe_recovery(subject)
+    }
+}
 
 #[test]
 fn unsupported_or_unproven_production_execution_is_blocked_before_admission() {
@@ -40,7 +65,7 @@ fn unsupported_or_unproven_production_execution_is_blocked_before_admission() {
         };
         let session_id = SessionId::new();
 
-        for error in [
+        for failure in [
             service
                 .run(
                     LOCAL_DEMO_HOST,
@@ -49,19 +74,29 @@ fn unsupported_or_unproven_production_execution_is_blocked_before_admission() {
                 )
                 .expect_err("attached run must be blocked"),
             service
-                .run_detached(
-                    LOCAL_DEMO_HOST,
-                    "PRIVATE_PRODUCTION_PROMPT",
-                    TurnExecutionMode::Standard,
-                )
-                .expect_err("detached run must be blocked"),
-            service
                 .steer(
                     &session_id,
                     "PRIVATE_PRODUCTION_PROMPT",
                     TurnExecutionMode::Standard,
                 )
                 .expect_err("attached steer must be blocked before session lookup"),
+        ] {
+            assert!(matches!(failure, TurnAdmissionFailure::NotAdmitted(_)));
+            assert_eq!(failure.error().code, ErrorCode::ComputerUseNotReady);
+            let serialized = serde_json::to_string(failure.error())
+                .expect("closed capability blocker must serialize");
+            assert!(!serialized.contains("PRIVATE_PRODUCTION_PROMPT"));
+            assert!(!serialized.contains("fake"));
+        }
+
+        for error in [
+            service
+                .run_detached(
+                    LOCAL_DEMO_HOST,
+                    "PRIVATE_PRODUCTION_PROMPT",
+                    TurnExecutionMode::Standard,
+                )
+                .expect_err("detached run must be blocked"),
             service
                 .steer_detached(
                     &session_id,
@@ -92,6 +127,92 @@ fn unsupported_or_unproven_production_execution_is_blocked_before_admission() {
             "blocked production execution must not create {state_path:?}"
         );
     }
+}
+
+#[test]
+fn attached_adapter_failures_return_exact_durable_run_and_steer_handles() {
+    let run_state = TestStateDir::new().expect("temporary run state directory should exist");
+    let run_service = HostService {
+        runtime: RuntimeHandle::new(Ok(run_state.path().to_path_buf()), FailingExecutionAdapter),
+        mode: HostMode::TestFake,
+    };
+    let run_failure = run_service
+        .run(
+            LOCAL_DEMO_HOST,
+            "PRIVATE_FAIL_AFTER_RUN_COMMIT",
+            TurnExecutionMode::Standard,
+        )
+        .expect_err("the deterministic adapter must fail after run admission");
+    let (run_failure_session, run_turn_id) = match run_failure {
+        TurnAdmissionFailure::Admitted {
+            session, turn_id, ..
+        } => (*session, turn_id),
+        other => panic!("postcommit run failure had the wrong phase: {other:?}"),
+    };
+    let run_session_id = run_failure_session.session_id().clone();
+    let run_status = run_service
+        .status(&run_session_id)
+        .expect("the admitted run must remain readable");
+    let durable_run = run_status
+        .turns()
+        .last()
+        .expect("the admitted run must retain its Turn");
+    assert_eq!(durable_run.turn_id(), &run_turn_id);
+    assert_eq!(durable_run.state(), TurnState::RecoveryPending);
+    assert_eq!(run_failure_session, run_status);
+
+    let steer_state = TestStateDir::new().expect("temporary steer state directory should exist");
+    let seeded = HostService {
+        runtime: RuntimeHandle::new(Ok(steer_state.path().to_path_buf()), FakeComputerUseAdapter),
+        mode: HostMode::TestFake,
+    };
+    let initial = seeded
+        .run(
+            LOCAL_DEMO_HOST,
+            "PRIVATE_SUCCESSFUL_INITIAL_RUN",
+            TurnExecutionMode::Standard,
+        )
+        .expect("the initial run should complete");
+    let steer_session_id = initial.session.session_id().clone();
+    drop(seeded);
+    let steer_service = HostService {
+        runtime: RuntimeHandle::new(
+            Ok(steer_state.path().to_path_buf()),
+            FailingExecutionAdapter,
+        ),
+        mode: HostMode::TestFake,
+    };
+    let steer_failure = steer_service
+        .steer(
+            &steer_session_id,
+            "PRIVATE_FAIL_AFTER_STEER_COMMIT",
+            TurnExecutionMode::Standard,
+        )
+        .expect_err("the deterministic adapter must fail after steer admission");
+    let steer_turn_id = match steer_failure {
+        TurnAdmissionFailure::Admitted {
+            session, turn_id, ..
+        } => {
+            assert_eq!(session.session_id(), &steer_session_id);
+            assert_eq!(session.turns().len(), 2);
+            assert_eq!(
+                session.turns().last().map(|turn| turn.state()),
+                Some(TurnState::RecoveryPending)
+            );
+            turn_id
+        }
+        other => panic!("postcommit steer failure had the wrong phase: {other:?}"),
+    };
+    let steer_status = steer_service
+        .status(&steer_session_id)
+        .expect("the admitted steer must remain readable");
+    assert_eq!(steer_status.turns().len(), 2);
+    let durable_steer = steer_status
+        .turns()
+        .last()
+        .expect("the admitted steer must retain its Turn");
+    assert_eq!(durable_steer.turn_id(), &steer_turn_id);
+    assert_eq!(durable_steer.state(), TurnState::RecoveryPending);
 }
 
 #[test]
@@ -126,7 +247,11 @@ fn refreshed_production_snapshot_updates_admission_surfaces_but_not_desktop_disc
             TurnExecutionMode::Standard,
         )
         .expect_err("the supported snapshot should reach the native execution blocker");
-    assert_eq!(initial_error.code, ErrorCode::NotImplemented);
+    assert!(matches!(
+        initial_error,
+        TurnAdmissionFailure::NotAdmitted(_)
+    ));
+    assert_eq!(initial_error.error().code, ErrorCode::NotImplemented);
     assert!(
         service
             .daemon_runtime_capabilities()
@@ -155,7 +280,14 @@ fn refreshed_production_snapshot_updates_admission_surfaces_but_not_desktop_disc
             TurnExecutionMode::Standard,
         )
         .expect_err("the cloned service must use refreshed admission");
-    assert_eq!(refreshed_error.code, ErrorCode::IncompatibleControlPlane);
+    assert!(matches!(
+        refreshed_error,
+        TurnAdmissionFailure::NotAdmitted(_)
+    ));
+    assert_eq!(
+        refreshed_error.error().code,
+        ErrorCode::IncompatibleControlPlane
+    );
     assert!(!clone.daemon_runtime_capabilities().unwrap().codex_runtime());
     let sessions = clone
         .host_sessions(LOCAL_DEMO_HOST, false)

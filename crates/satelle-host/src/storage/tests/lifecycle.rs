@@ -478,12 +478,12 @@ fn replay_only_open_preserves_running_state_before_external_admission() {
 
     let storage = Storage::open_without_restart_recovery(state.path())
         .expect("replay-only open should validate without lifecycle mutation");
-    assert!(
-        storage
-            .replay_admission_if_present(IdempotentOperation::Run, run.idempotency(), None)
-            .expect("read the durable replay")
-            .is_some()
-    );
+    let replay = storage
+        .replay_admission_if_present(IdempotentOperation::Run, run.idempotency(), None)
+        .expect("read the durable replay")
+        .expect("the committed admission must be replayable");
+    assert_eq!(replay.session_id(), session.id());
+    assert_eq!(replay.turn_id(), &turn_id(TURN_1));
     assert_eq!(persisted_state(&storage.connection), before);
 }
 

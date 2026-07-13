@@ -363,11 +363,12 @@ impl HostService {
             canonical_payload.as_slice(),
             canonical_payload.digest_schema_version,
         )?;
-        let outcome = self.runtime.run(
-            RunCommand::detached_with_identity(LOCAL_DEMO_HOST, &intent.prompt, identity)
-                .with_execution_mode(intent.execution_mode),
-        )?;
-        Ok(outcome.public_session)
+        crate::runtime::admitted_session(
+            self.runtime.run(
+                RunCommand::detached_with_identity(LOCAL_DEMO_HOST, &intent.prompt, identity)
+                    .with_execution_mode(intent.execution_mode),
+            ),
+        )
     }
 
     pub fn admit_steer(
@@ -392,11 +393,12 @@ impl HostService {
             canonical_payload.as_slice(),
             canonical_payload.digest_schema_version,
         )?;
-        let outcome = self.runtime.steer(
-            SteerCommand::detached_with_identity(session_id.clone(), &intent.prompt, identity)
-                .with_execution_mode(intent.execution_mode),
-        )?;
-        Ok(outcome.public_session)
+        crate::runtime::admitted_session(
+            self.runtime.steer(
+                SteerCommand::detached_with_identity(session_id.clone(), &intent.prompt, identity)
+                    .with_execution_mode(intent.execution_mode),
+            ),
+        )
     }
 
     pub fn admit_stop(
@@ -429,7 +431,7 @@ impl HostService {
     }
 
     pub fn session_status(&self, session_id: &SessionId) -> Result<PublicSession, SatelleError> {
-        self.runtime.status_public(session_id)
+        self.runtime.status(session_id.clone())
     }
 
     #[cfg(any(test, feature = "test-support"))]
@@ -667,6 +669,49 @@ mod tests {
             .admit_run(&changed, &authority)
             .expect_err("changed payload must conflict");
         assert_eq!(error.code, satelle_core::ErrorCode::IdempotencyKeyConflict);
+    }
+
+    #[test]
+    fn postcommit_dispatch_failure_returns_the_durable_failed_admission() {
+        let state = crate::TestStateDir::new().expect("temporary state directory");
+        let service = HostService::local_demo_for_tests_at(state.path())
+            .expect("construct deterministic service");
+        service.initialize_daemon().expect("initialize daemon");
+        let token = ApiBearerToken::generate().expect("generate API token");
+        let principal = service
+            .register_api_token(
+                &token,
+                "principal-dispatch-failure",
+                ApiScopes::CONTROL,
+                None,
+            )
+            .expect("register API token");
+        let intent = TurnIntent::new(
+            "PRIVATE_POSTCOMMIT_DISPATCH_FAILURE",
+            TurnExecutionMode::Standard,
+        )
+        .expect("construct Turn intent");
+        let authority = MutationAuthority::new(principal, "01890a5d-ac96-7b7c-8f89-37c3d0a66e93")
+            .expect("construct mutation authority");
+        service
+            .runtime
+            .poison_worker_registry_for_tests()
+            .expect("poison the deterministic worker registry");
+
+        let admitted = service
+            .admit_run(&intent, &authority)
+            .expect("a committed Turn remains an accepted admission");
+        let target = admitted
+            .turns()
+            .last()
+            .expect("the accepted admission contains its target Turn");
+        assert_eq!(target.state(), satelle_core::session::TurnState::Failed);
+        assert_eq!(
+            service
+                .session_status(admitted.session_id())
+                .expect("the failed admission remains readable"),
+            admitted
+        );
     }
 
     #[test]

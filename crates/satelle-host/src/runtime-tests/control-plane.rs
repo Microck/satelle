@@ -13,7 +13,7 @@ fn control_plane_admission_blocks_run_and_steer_before_preflight_or_state_mutati
             "PRIVATE_REJECTED_RUN",
         ))
         .expect_err("run must fail before adapter preflight");
-    assert_eq!(error.code, ErrorCode::IncompatibleControlPlane);
+    assert_eq!(error.error().code, ErrorCode::IncompatibleControlPlane);
     assert_eq!(run_adapter.preflight_calls.load(Ordering::SeqCst), 0);
     assert_eq!(run_adapter.execute_calls.load(Ordering::SeqCst), 0);
     assert_eq!(run_runtime.snapshot().unwrap().session_count(), 0);
@@ -26,7 +26,8 @@ fn control_plane_admission_blocks_run_and_steer_before_preflight_or_state_mutati
         .run(RunCommand::attached(LOCAL_DEMO_HOST, "PRIVATE_INITIAL_RUN"))
         .expect("unrelated run admission should remain available")
         .session
-        .session_id;
+        .session_id()
+        .clone();
 
     let error = steer_runtime
         .steer(SteerCommand::attached(
@@ -34,11 +35,11 @@ fn control_plane_admission_blocks_run_and_steer_before_preflight_or_state_mutati
             "PRIVATE_REJECTED_STEER",
         ))
         .expect_err("steer must fail before adapter preflight");
-    assert_eq!(error.code, ErrorCode::IncompatibleControlPlane);
+    assert_eq!(error.error().code, ErrorCode::IncompatibleControlPlane);
     assert_eq!(steer_adapter.preflight_calls.load(Ordering::SeqCst), 1);
     assert_eq!(steer_adapter.execute_calls.load(Ordering::SeqCst), 1);
     assert_eq!(
-        steer_runtime.status(session_id).unwrap().turns.len(),
+        steer_runtime.status(session_id).unwrap().turns().len(),
         1,
         "rejected steer must not append a Turn"
     );
@@ -56,7 +57,8 @@ fn rejected_run_does_not_reconcile_or_mutate_pending_recovery() {
         ))
         .expect("detached work should be durably admitted")
         .session
-        .session_id;
+        .session_id()
+        .clone();
     interrupted
         .wait_for_background()
         .expect("the interrupted worker should finish");
@@ -101,7 +103,7 @@ fn rejected_run_does_not_reconcile_or_mutate_pending_recovery() {
         ))
         .expect_err("run admission must fail before recovery observation");
 
-    assert_eq!(error.code, ErrorCode::IncompatibleControlPlane);
+    assert_eq!(error.error().code, ErrorCode::IncompatibleControlPlane);
     assert_eq!(adapter.recovery_calls.load(Ordering::SeqCst), 0);
     assert_eq!(durable_state(), before);
 }
@@ -118,7 +120,8 @@ fn active_stop_admission_fails_before_any_stop_mutation_but_terminal_stop_stays_
         ))
         .expect("detached run should be durably admitted")
         .session
-        .session_id;
+        .session_id()
+        .clone();
     assert!(
         adapter.execute_started.wait_for(WAIT_LIMIT),
         "execution should remain active during the stop attempt"
@@ -163,7 +166,8 @@ fn active_stop_admission_fails_before_any_stop_mutation_but_terminal_stop_stays_
         ))
         .expect("run should reach a terminal state")
         .session
-        .session_id;
+        .session_id()
+        .clone();
     let stopped = terminal_runtime
         .stop(StopCommand::new(terminal_session))
         .expect("already-terminal stop must not contact Codex");
@@ -190,14 +194,14 @@ fn completed_stop_replay_stays_local_while_a_later_turn_is_active() {
     let stop_identity = RequestIdentity::new("stable-stop-key", STABLE_DIGEST);
     let first_stop = runtime
         .stop(StopCommand::with_identity(
-            session.session_id.clone(),
+            session.session_id().clone(),
             stop_identity.clone(),
         ))
         .expect("the interrupted first Turn should stop");
     let original_turn_id = first_stop.turn_id().clone();
     runtime
         .steer(SteerCommand::detached(
-            session.session_id.clone(),
+            session.session_id().clone(),
             "PRIVATE_LATER_FOLLOW_UP",
         ))
         .expect("a later follow-up should be admitted");
@@ -208,7 +212,7 @@ fn completed_stop_replay_stays_local_while_a_later_turn_is_active() {
 
     let replay = runtime
         .stop(StopCommand::with_identity(
-            session.session_id,
+            session.session_id().clone(),
             stop_identity,
         ))
         .expect("the completed stop retry should remain local");
@@ -236,7 +240,8 @@ fn pending_stop_replay_rechecks_admission_before_observing_upstream_state() {
         ))
         .expect("detached work should be admitted")
         .session
-        .session_id;
+        .session_id()
+        .clone();
     runtime
         .wait_for_background()
         .expect("the interrupted worker should finish");
@@ -272,12 +277,13 @@ fn pending_stop_replay_finishes_locally_after_its_turn_terminalizes() {
         ))
         .expect("detached work should be admitted")
         .session
-        .session_id;
+        .session_id()
+        .clone();
     runtime
         .wait_for_background()
         .expect("the interrupted worker should finish");
-    let original_turn_id = runtime.status(session_id.clone()).unwrap().turns[0]
-        .turn_id
+    let original_turn_id = runtime.status(session_id.clone()).unwrap().turns()[0]
+        .turn_id()
         .clone();
     let identity = RequestIdentity::new("pending-terminal-stop-key", STABLE_DIGEST);
 

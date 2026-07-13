@@ -10,6 +10,85 @@ mod public_serde;
 
 const MAX_REFERENCE_BYTES: usize = 128;
 
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TurnAdmissionPhase {
+    NotAdmitted,
+    AdmissionUnknown,
+    Admitted,
+}
+
+impl TurnAdmissionPhase {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::NotAdmitted => "not_admitted",
+            Self::AdmissionUnknown => "admission_unknown",
+            Self::Admitted => "admitted",
+        }
+    }
+}
+
+/// Failure from an attached Turn request, classified by durable admission phase.
+#[derive(Debug)]
+pub enum TurnAdmissionFailure {
+    NotAdmitted(Box<crate::SatelleError>),
+    AdmissionUnknown(Box<crate::SatelleError>),
+    Admitted {
+        error: Box<crate::SatelleError>,
+        session: Box<PublicSession>,
+        turn_id: TurnId,
+    },
+}
+
+impl TurnAdmissionFailure {
+    pub fn phase(&self) -> TurnAdmissionPhase {
+        match self {
+            Self::NotAdmitted(_) => TurnAdmissionPhase::NotAdmitted,
+            Self::AdmissionUnknown(_) => TurnAdmissionPhase::AdmissionUnknown,
+            Self::Admitted { .. } => TurnAdmissionPhase::Admitted,
+        }
+    }
+
+    pub fn error(&self) -> &crate::SatelleError {
+        match self {
+            Self::NotAdmitted(error) | Self::AdmissionUnknown(error) => error,
+            Self::Admitted { error, .. } => error,
+        }
+    }
+
+    pub fn into_error(self) -> crate::SatelleError {
+        match self {
+            Self::NotAdmitted(error) | Self::AdmissionUnknown(error) => *error,
+            Self::Admitted { error, .. } => *error,
+        }
+    }
+
+    pub fn durable_handles(&self) -> Option<(&SessionId, &TurnId)> {
+        match self {
+            Self::Admitted {
+                session, turn_id, ..
+            } => Some((session.session_id(), turn_id)),
+            Self::NotAdmitted(_) | Self::AdmissionUnknown(_) => None,
+        }
+    }
+
+    pub fn not_admitted(error: crate::SatelleError) -> Self {
+        Self::NotAdmitted(Box::new(error))
+    }
+
+    pub fn admission_unknown(error: crate::SatelleError) -> Self {
+        Self::AdmissionUnknown(Box::new(error))
+    }
+
+    pub fn admitted(error: crate::SatelleError, session: PublicSession, turn_id: TurnId) -> Self {
+        Self::Admitted {
+            error: Box::new(error),
+            session: Box::new(session),
+            turn_id,
+        }
+    }
+}
+
 /// A rejected reference never retains the supplied text, so the error is safe to log.
 #[derive(Clone, Copy, Debug, Error, Eq, PartialEq)]
 pub enum ReferenceError {
@@ -1400,6 +1479,48 @@ mod tests {
                 serde_json::to_string(&state).unwrap()
             );
             assert_eq!(terminal, state.is_terminal());
+        }
+    }
+
+    #[test]
+    fn turn_admission_failure_preserves_phase_error_and_durable_handles() {
+        let session = new_session().to_public();
+        let session_id = session.session_id().clone();
+        let turn_id = session.turns()[0].turn_id().clone();
+        let admitted = TurnAdmissionFailure::admitted(
+            crate::SatelleError::host_unreachable("host-test"),
+            session,
+            turn_id.clone(),
+        );
+        assert_eq!(admitted.phase(), TurnAdmissionPhase::Admitted);
+        assert_eq!(admitted.durable_handles(), Some((&session_id, &turn_id)));
+        assert_eq!(admitted.error().code, crate::ErrorCode::HostUnreachable);
+
+        let not_admitted =
+            TurnAdmissionFailure::not_admitted(crate::SatelleError::computer_use_not_ready());
+        assert_eq!(not_admitted.phase(), TurnAdmissionPhase::NotAdmitted);
+        assert!(not_admitted.durable_handles().is_none());
+
+        let unknown = TurnAdmissionFailure::admission_unknown(
+            crate::SatelleError::host_unreachable("host-test"),
+        );
+        assert_eq!(unknown.phase(), TurnAdmissionPhase::AdmissionUnknown);
+        assert!(unknown.durable_handles().is_none());
+
+        for (phase, token) in [
+            (TurnAdmissionPhase::NotAdmitted, "not_admitted"),
+            (TurnAdmissionPhase::AdmissionUnknown, "admission_unknown"),
+            (TurnAdmissionPhase::Admitted, "admitted"),
+        ] {
+            assert_eq!(phase.as_str(), token);
+            assert_eq!(
+                serde_json::to_string(&phase).unwrap(),
+                format!("\"{token}\"")
+            );
+            assert_eq!(
+                serde_json::from_str::<TurnAdmissionPhase>(&format!("\"{token}\"")).unwrap(),
+                phase
+            );
         }
     }
 

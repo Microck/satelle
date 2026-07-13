@@ -10,6 +10,7 @@ futures-util.workspace = true
 http-body-util.workspace = true
 reqwest.workspace = true
 rustls.workspace = true
+rustls-platform-verifier.workspace = true
 satelle-core = { path = "../satelle-core" }
 satelle-host = { path = "../satelle-host" }
 serde.workspace = true
