@@ -493,15 +493,43 @@ mod tests {
 
     #[test]
     fn close_reasons_own_one_exact_token_code_and_control_mapping() {
-        for reason in WsCloseReason::ALL {
+        let expected = [
+            (WsCloseReason::InvalidRequest, "invalid-request", 1008),
+            (WsCloseReason::UnsupportedSchema, "unsupported-schema", 1008),
+            (
+                WsCloseReason::AuthorizationInsufficientScope,
+                "authorization-insufficient-scope",
+                1008,
+            ),
+            (WsCloseReason::CapacityExceeded, "capacity-exceeded", 1008),
+            (WsCloseReason::RateLimited, "rate-limited", 1008),
+            (
+                WsCloseReason::AuthenticationFailed,
+                "authentication-failed",
+                1008,
+            ),
+            (WsCloseReason::SlowConsumer, "slow-consumer", 1008),
+            (WsCloseReason::PayloadTooLarge, "payload-too-large", 1009),
+            (WsCloseReason::InternalError, "internal-error", 1011),
+            (WsCloseReason::IdleTimeout, "idle-timeout", 1008),
+            (WsCloseReason::ServerShutdown, "server-shutdown", 1001),
+        ];
+        assert_eq!(
+            WsCloseReason::ALL,
+            expected.map(|(reason, _, _)| reason),
+            "the closed reason set and its literal contract table must stay synchronized"
+        );
+
+        for (reason, token, close_code) in expected {
             let encoded = serde_json::to_value(reason).unwrap();
-            assert_eq!(encoded, reason.as_str());
-            assert_eq!(WsCloseReason::parse(reason.as_str()), Some(reason));
+            assert_eq!(reason.as_str(), token);
+            assert_eq!(reason.close_code(), close_code);
+            assert_eq!(encoded, token);
+            assert_eq!(WsCloseReason::parse(token), Some(reason));
             assert_eq!(
                 serde_json::from_value::<WsCloseReason>(encoded).unwrap(),
                 reason
             );
-            assert!(matches!(reason.close_code(), 1001 | 1008 | 1009 | 1011));
 
             let error =
                 WsControlError::new(RequestId::new(), "host-test".to_string(), reason, None);
