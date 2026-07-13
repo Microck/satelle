@@ -662,7 +662,17 @@ fn notification_flood_is_backpressured_and_cleanup_remains_bounded() {
 fn unknown_and_item_payloads_are_discarded_without_leaking_canaries() {
     let run = run_scenario("unknown-canary", None, Duration::from_secs(3));
     assert_eq!(run.result, Ok(CodexSessionTerminal::Completed));
+    assert_eq!(run.requests.len(), 4);
+    assert_eq!(run.persisted_threads, ["thread-1"]);
     assert_eq!(run.persisted_turns, ["turn-1"]);
+
+    let retained = format!(
+        "{:?} {}",
+        run.result,
+        serde_json::to_string(&(&run.requests, &run.persisted_threads, &run.persisted_turns,))
+            .expect("retained protocol state serializes")
+    );
+    assert!(!retained.contains("PRIVATE_RAW_CANARY"));
 }
 
 #[test]
