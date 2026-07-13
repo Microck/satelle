@@ -60,6 +60,7 @@ fn failure(error: &SatelleError) -> ApiFailure {
         | ErrorCode::EventsWithDetach
         | ErrorCode::OutputModeConflict
         | ErrorCode::LogTailLimitExceeded
+        | ErrorCode::LogPositionConflict
         | ErrorCode::ConcurrencyWithoutRemoteUpdate
         | ErrorCode::ComponentSelectionConflict
         | ErrorCode::UnsupportedUpdateComponent

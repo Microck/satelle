@@ -3,12 +3,11 @@ use super::adapter::AdapterReadiness;
 use crate::process_identity::{ProcessIdentity, ProcessIdentityError};
 use crate::storage::{
     AdmissionContext, IDEMPOTENCY_RETENTION, IdempotencyInput, IdempotentOperation, LeaseOwner,
-    LogEvent, LogSeverity, LogSource, PrivateRequestToken, RecoverySubject, StorageError,
-    StorageErrorKind, StoredLogRecord,
+    PrivateRequestToken, RecoverySubject, StorageError, StorageErrorKind,
 };
 use satelle_core::session::{ExecutionPolicy, ExpectedRevisions, RetainedOwnership, Session};
 use satelle_core::{
-    ErrorCode, LOCAL_DEMO_HOST, LogEntry, SatelleError, SatelleEvent, SessionId, StopResult, TurnId,
+    ErrorCode, LOCAL_DEMO_HOST, SatelleError, SatelleEvent, SessionId, StopResult, TurnId,
 };
 use serde_json::Value;
 use time::OffsetDateTime;
@@ -132,66 +131,6 @@ pub(super) fn turn_outcome(
         session: session.to_public(),
         events,
     }
-}
-
-pub(super) fn stored_log_entry(stored: StoredLogRecord) -> Result<LogEntry, SatelleError> {
-    let record = stored.record();
-    let source = match record.source() {
-        LogSource::HostDaemon => "host_daemon",
-        LogSource::Storage => "storage",
-        LogSource::CodexAdapter => "codex_adapter",
-    };
-    let severity = match record.severity() {
-        LogSeverity::Info => "info",
-        LogSeverity::Warning => "warn",
-        LogSeverity::Error => "error",
-    };
-    let (event, message) = match record.event() {
-        LogEvent::SessionStarted => ("session_started", "created local demo session"),
-        LogEvent::FollowUpStarted => ("follow_up_started", "appended local demo turn"),
-        LogEvent::TurnStateCommitted => ("turn_state_committed", "committed local demo turn state"),
-        LogEvent::StopConfirmed => ("stop_confirmed", "resolved local demo stop request"),
-        LogEvent::StopNotConfirmed => ("stop_not_confirmed", "local demo stop was not confirmed"),
-        LogEvent::RestartRecoveryPending => (
-            "restart_recovery_pending",
-            "local demo turn requires restart recovery",
-        ),
-        LogEvent::StoreOpened => ("store_opened", "opened local demo storage"),
-    };
-    let mut fields = std::collections::BTreeMap::from([
-        ("cursor".to_string(), stored.cursor().to_string()),
-        ("event".to_string(), event.to_string()),
-    ]);
-    let session_id = match record.subject() {
-        crate::LogSubject::Host => None,
-        crate::LogSubject::Turn {
-            session_id,
-            turn_id,
-            session_state_revision,
-            turn_state_revision,
-        } => {
-            fields.insert("turn_id".to_string(), turn_id.to_string());
-            fields.insert(
-                "session_state_revision".to_string(),
-                session_state_revision.get().to_string(),
-            );
-            fields.insert(
-                "turn_state_revision".to_string(),
-                turn_state_revision.get().to_string(),
-            );
-            Some(session_id.clone())
-        }
-    };
-    Ok(LogEntry {
-        timestamp: public_time(record.recorded_at())?,
-        source: source.to_string(),
-        severity: severity.to_string(),
-        host: LOCAL_DEMO_HOST.to_string(),
-        session_id,
-        message: message.to_string(),
-        fields,
-        redacted: true,
-    })
 }
 
 pub(super) fn stop_result(

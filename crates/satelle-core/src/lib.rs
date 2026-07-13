@@ -1494,6 +1494,7 @@ pub enum ErrorCode {
     EventsWithDetach,
     OutputModeConflict,
     LogTailLimitExceeded,
+    LogPositionConflict,
     LogsCursorExpired,
     CapacityExceeded,
     ConcurrencyLimitExceeded,
@@ -1560,6 +1561,7 @@ impl ErrorCode {
             Self::EventsWithDetach => "events-with-detach",
             Self::OutputModeConflict => "output-mode-conflict",
             Self::LogTailLimitExceeded => "log-tail-limit-exceeded",
+            Self::LogPositionConflict => "log-position-conflict",
             Self::LogsCursorExpired => "logs-cursor-expired",
             Self::CapacityExceeded => "capacity-exceeded",
             Self::ConcurrencyLimitExceeded => "concurrency-limit-exceeded",
@@ -1578,6 +1580,7 @@ impl ErrorCode {
             | Self::EventsWithDetach
             | Self::OutputModeConflict
             | Self::LogTailLimitExceeded
+            | Self::LogPositionConflict
             | Self::ConcurrencyLimitExceeded
             | Self::ConcurrencyWithoutRemoteUpdate
             | Self::ComponentSelectionConflict
@@ -2415,6 +2418,27 @@ impl SatelleError {
         }
     }
 
+    pub fn log_position_conflict(conflicting_selector: &str) -> Self {
+        let mut details = BTreeMap::new();
+        details.insert(
+            "conflicting_selectors".to_string(),
+            Value::Array(
+                ["--after", conflicting_selector]
+                    .into_iter()
+                    .map(|selector| Value::String(selector.to_string()))
+                    .collect(),
+            ),
+        );
+
+        Self {
+            code: ErrorCode::LogPositionConflict,
+            message: format!("--after cannot be combined with {conflicting_selector}"),
+            recovery_command: Some(format!("remove either --after or {conflicting_selector}")),
+            source_detail: None,
+            details,
+        }
+    }
+
     pub fn logs_cursor_expired(
         earliest_available_cursor: Option<String>,
         resume_cursor: String,
@@ -2539,6 +2563,43 @@ impl SatelleError {
 
     pub fn exit_code(&self) -> i32 {
         self.code.exit_code()
+    }
+}
+
+#[cfg(test)]
+mod error_contract_tests {
+    use super::*;
+
+    #[test]
+    fn log_position_conflict_has_a_stable_usage_error_contract() {
+        assert_eq!(
+            ErrorCode::LogPositionConflict.as_str(),
+            "log-position-conflict"
+        );
+        assert_eq!(
+            serde_json::to_value(ErrorCode::LogPositionConflict)
+                .expect("serialize log position conflict code"),
+            serde_json::json!("log-position-conflict")
+        );
+        assert_eq!(ErrorCode::LogPositionConflict.exit_code(), 64);
+
+        for conflicting_selector in ["--since", "--tail"] {
+            let error = SatelleError::log_position_conflict(conflicting_selector);
+            assert_eq!(error.code, ErrorCode::LogPositionConflict);
+            assert_eq!(
+                error.message,
+                format!("--after cannot be combined with {conflicting_selector}")
+            );
+            assert_eq!(
+                error.recovery_command,
+                Some(format!("remove either --after or {conflicting_selector}"))
+            );
+            assert_eq!(
+                error.details.get("conflicting_selectors"),
+                Some(&serde_json::json!(["--after", conflicting_selector]))
+            );
+            assert_eq!(error.exit_code(), 64);
+        }
     }
 }
 
@@ -2919,19 +2980,6 @@ pub struct DaemonPathOverride {
     pub value: String,
     pub source: String,
     pub service_configuration_surface: String,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-pub struct LogEntry {
-    pub timestamp: String,
-    pub source: String,
-    pub severity: String,
-    pub host: String,
-    pub session_id: Option<SessionId>,
-    pub message: String,
-    pub fields: BTreeMap<String, String>,
-    pub redacted: bool,
 }
 
 /// The only schema token accepted for Host session reports in this release line.

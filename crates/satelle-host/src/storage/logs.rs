@@ -1,4 +1,6 @@
-use super::codec::{load_log_page_records, load_log_records, log_retention_bounds};
+#[cfg(test)]
+use super::codec::load_log_records;
+use super::codec::{load_log_page_records, log_retention_bounds};
 use super::open::sqlite_error;
 #[cfg(any(test, feature = "test-support"))]
 use super::sql::insert_safe_log;
@@ -42,18 +44,22 @@ impl SafeLogRecord {
         })
     }
 
+    #[cfg(test)]
     pub(crate) fn recorded_at(&self) -> OffsetDateTime {
         self.recorded_at
     }
 
+    #[cfg(test)]
     pub(crate) fn source(&self) -> LogSource {
         self.source
     }
 
+    #[cfg(test)]
     pub(crate) fn severity(&self) -> LogSeverity {
         self.severity
     }
 
+    #[cfg(test)]
     pub(crate) fn event(&self) -> LogEvent {
         self.event
     }
@@ -94,10 +100,12 @@ pub(crate) struct StoredLogRecord {
 }
 
 impl StoredLogRecord {
+    #[cfg(test)]
     pub(crate) fn cursor(&self) -> u64 {
         self.cursor
     }
 
+    #[cfg(test)]
     pub(crate) fn record(&self) -> &SafeLogRecord {
         &self.record
     }
@@ -117,6 +125,7 @@ impl Storage {
         Ok(cursor)
     }
 
+    #[cfg(test)]
     pub(crate) fn logs_after(
         &self,
         cursor: Option<u64>,
