@@ -428,4 +428,18 @@ mod storage_failure_tests {
         assert!(!error.message.contains("SQLite"));
         assert!(error.source_detail.is_none());
     }
+
+    #[test]
+    fn migration_failure_is_typed_and_prescribes_non_destructive_repair() {
+        let error = storage_failure(StorageError::for_test(StorageErrorKind::MigrationFailed));
+
+        assert_eq!(error.code, ErrorCode::StorageIntegrityFailed);
+        assert_eq!(error.code.as_str(), "storage-integrity-failed");
+        assert_eq!(error.message, "the Satelle SQLite migration failed");
+        assert_eq!(
+            error.recovery_command.as_deref(),
+            Some("preserve the state directory and run satelle doctor --scope storage --json")
+        );
+        assert!(error.source_detail.is_none());
+    }
 }

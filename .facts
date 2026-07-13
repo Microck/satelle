@@ -1595,15 +1595,15 @@
 - satelle recording artifact retention can be configured per host, profile, or recording-enabled session @spec @later
 - satelle SQLite access uses rusqlite behind a small storage boundary instead of spreading SQL calls through daemon handlers @mvp @implemented
 - satelle Host Daemon keeps blocking SQLite work off Tokio runtime worker threads through a storage service boundary or spawn_blocking pattern @mvp @implemented
-- satelle embeds SQLite schema migrations in the binary so on-demand remote bootstrap does not require sidecar migration files @spec @mvp
-- satelle Host Daemon applies embedded SQLite migrations on startup before accepting API requests @spec @mvp
-- satelle runs each migration step transactionally when SQLite supports transactional execution for that step @spec @mvp
+- satelle embeds SQLite schema migrations in the binary so on-demand remote bootstrap does not require sidecar migration files @mvp @implemented
+- satelle Host Daemon applies embedded SQLite migrations on startup before accepting API requests @mvp @implemented
+- satelle runs each migration step transactionally when SQLite supports transactional execution for that step @mvp @implemented
 - satelle creates a SQLite-consistent backup before the first irreversible migration step @spec @mvp
 - a pre-migration backup is flushed to durable storage and passes SQLite integrity validation before the first irreversible migration step begins @spec @mvp
 - each migration backup records the source schema version, source database digest, created_at, Satelle version, and restore-compatibility metadata without adding plaintext secrets @spec @mvp
 - a failed migration never deletes or overwrites the only validated backup capable of restoring the pre-migration store @spec @mvp
-- satelle does not automatically downgrade, reset, or delete the SQLite store when migration fails @spec @mvp
-- satelle reports migration failures with typed errors and repair guidance instead of starting with a partially migrated store @spec @mvp
+- satelle does not automatically downgrade, reset, or delete the SQLite store when migration fails @mvp @implemented
+- satelle reports migration failures with typed errors and repair guidance instead of starting with a partially migrated store @mvp @implemented
 - satelle exposes satelle host storage restore --host <alias> --backup <path> as the explicit authenticated restore operation @spec @mvp
 - host storage restore verifies backup integrity and compatibility, preserves the failed store separately, runs under the applicable Maintenance Lease or Bootstrap Lock, and atomically activates the restored store before restarting API service @spec @mvp
 - host storage restore follows maintenance plan presentation, --dry-run, interactive confirmation, --yes, --no-input --yes, action-ledger, and partial-failure rules @spec @mvp

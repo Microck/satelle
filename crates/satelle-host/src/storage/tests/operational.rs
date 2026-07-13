@@ -53,6 +53,68 @@ fn version_one_store_upgrades_without_replacing_existing_state() {
 }
 
 #[test]
+fn failed_migration_rolls_back_partial_schema_and_preserves_existing_state() {
+    let state = TempDir::new().expect("temporary state directory");
+    let (storage, _) = Storage::open(state.path()).expect("open storage");
+    let expected_host = storage.host_identity().unwrap();
+    storage
+        .connection_for_test()
+        .execute_batch(
+            "DROP TABLE provider_smoke_successes;
+             DROP TABLE readiness_successes;
+             DELETE FROM schema_migrations WHERE version = 2;
+             PRAGMA user_version = 1;
+             CREATE TABLE migration_sentinel (value TEXT NOT NULL) STRICT;
+             INSERT INTO migration_sentinel (value) VALUES ('preserve-me');
+             CREATE TRIGGER fail_migration_two_history
+             BEFORE INSERT ON schema_migrations
+             WHEN NEW.version = 2
+             BEGIN
+                 SELECT RAISE(ABORT, 'forced migration failure');
+             END;",
+        )
+        .unwrap();
+    drop(storage);
+
+    let error = match Storage::open(state.path()) {
+        Ok(_) => panic!("a failed migration must not expose a partially migrated store"),
+        Err(error) => error,
+    };
+    assert_eq!(StorageErrorKind::MigrationFailed, error.kind());
+
+    let connection = Connection::open(state.path().join(DATABASE_FILE_NAME)).unwrap();
+    assert_eq!(1_i64, pragma_integer(&connection, "user_version"));
+    let applied_versions = connection
+        .prepare("SELECT version FROM schema_migrations ORDER BY version")
+        .unwrap()
+        .query_map([], |row| row.get::<_, i64>(0))
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert_eq!(vec![1_i64], applied_versions);
+    for table in ["readiness_successes", "provider_smoke_successes"] {
+        let exists: bool = connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = ?1)",
+                [table],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(!exists, "partial migration table {table} must roll back");
+    }
+    let sentinel: String = connection
+        .query_row("SELECT value FROM migration_sentinel", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!("preserve-me", sentinel);
+    let stored_host: String = connection
+        .query_row("SELECT host_identity_ref FROM daemon_identity", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(expected_host.to_string(), stored_host);
+}
+
+#[test]
 fn readiness_and_provider_results_round_trip_without_raw_evidence() {
     let state = TempDir::new().expect("temporary state directory");
     let (mut storage, _) = Storage::open(state.path()).expect("open storage");
