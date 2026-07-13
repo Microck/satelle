@@ -1729,7 +1729,7 @@
 - satelle reports a typed yolo-blocked-by-native-approval error when native Computer Use blocks on a non-bypassable OS, app, or sensitive-action approval while YOLO mode is active @spec @mvp
 
 ## control-plane
-- satelle MVP supports Codex app-server as the only Codex control plane used by the Host Daemon @spec @mvp
+- satelle MVP supports Codex app-server as the only Codex control plane used by the Host Daemon @spec @mvp @implemented
 - satelle MVP does not implement multiple Codex protocol backends or terminal-UI scraping backends for remote Computer Use control @spec @mvp @implemented
 - satelle keeps Codex app-server behind an internal adapter boundary so a future backend can be added without changing the public Satelle API @spec @mvp @implemented
 - satelle probes the remote Codex app-server protocol for required methods before treating a Codex runtime as compatible @implemented @mvp
@@ -1740,8 +1740,8 @@
 - ordinary durable Session status reads and already-terminal stop outcomes do not require live Codex control-plane admission @implemented @contract @mvp
 - upstream restart recovery admission requires both status and steering before external Codex observation @implemented @contract @mvp
 - optional Codex goal methods are capability-gated and never block core Session and Turn control when goals are unavailable @spec @mvp
-- unknown app-server notifications are ignored or normalized without changing committed Satelle state @spec @mvp
-- raw app-server messages never enter normal logs, errors, events, or SQLite records @spec @mvp
+- unknown app-server notifications are ignored or normalized without changing committed Satelle state @spec @mvp @implemented
+- raw app-server messages never enter normal logs, errors, events, or SQLite records @spec @mvp @implemented
 - satelle reports a typed incompatible-control-plane error when the remote Codex runtime cannot expose the required app-server protocol @implemented @mvp
 - satelle does not expose app-server over a public unauthenticated listener @spec @mvp @implemented
 - satelle MVP requires a standalone installer-managed Codex runtime on the remote host instead of treating npm-installed Codex as a supported remote runtime @spec @mvp
