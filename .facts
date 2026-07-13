@@ -751,7 +751,7 @@
 - satelle Host Daemon Turn request bodies use the exact schema_version token satelle.api.v2 while unchanged stop request bodies use satelle.api.v1 @spec @contract @mvp @implemented
 - authenticated Host Daemon requests use Satelle-Request-Id for caller-supplied UUIDv7 correlation and Satelle-Expected-Host-Identity for Host pinning; neither header grants authority or idempotency @spec @contract @mvp @implemented
 - authenticated Host Daemon HTTP requests without Satelle-Request-Id receive a generated canonical UUIDv7 except GET /v1/events, whose WebSocket upgrade contract requires a caller-supplied Satelle-Request-Id; malformed or duplicate supplied request-id headers are rejected @spec @contract @mvp @implemented
-- satelle Host Daemon MVP uses GET /v1/live, GET /v1/capabilities, GET /v1/host/status, GET /v1/host/desktop-sessions, POST /v1/setup, POST /v1/doctor, POST /v1/sessions, POST /v1/sessions/{session_id}/turns, GET /v1/sessions/{session_id}, POST /v1/sessions/{session_id}/stop, GET /v1/logs, and GET /v1/events as its canonical route set and exposes no run, steer, blocking-run, SSE, or HTTP logs-follow aliases @spec @contract @mvp
+- satelle Host Daemon MVP uses GET /v1/live, GET /v1/capabilities, GET /v1/host/status, GET /v1/host/desktop-sessions, POST /v1/setup, POST /v1/doctor, POST /v1/sessions, POST /v1/sessions/{session_id}/turns, GET /v1/sessions/{session_id}, POST /v1/sessions/{session_id}/stop, GET /v1/logs, and GET /v1/events as its canonical route set and exposes no run, steer, blocking-run, SSE, or HTTP logs-follow aliases @spec @contract @mvp @implemented
 - Host Daemon response schemas use the exact tokens satelle.capabilities.v2, satelle.host.status.v1, satelle.host.desktop-sessions.v1, satelle.logs.page.v1, and satelle.ws.control.v1 for their corresponding versioned surfaces @contract @mvp @implemented
 - GET /v1/logs accepts only the query fields mode, cursor, limit, session_id, sources, minimum_severity, and since; unknown fields, duplicate singleton fields, empty source tokens, and duplicate source tokens report a typed invalid-request error @spec @contract @mvp @implemented
 - GET /v1/logs mode is tail or forward, defaults to tail, and permits cursor only with forward mode @spec @contract @mvp @implemented
@@ -1405,9 +1405,9 @@
 - satelle local aggregate stats are diagnostic convenience data and are never treated as authoritative remote host state @spec @mvp
 - satelle exposes a top-level logs command in MVP @implemented @mvp
 - satelle logs is a read-only diagnostic command that never starts prompt execution, setup, repair, host update, service mutation, or configuration mutation @implemented @mvp
-- satelle logs reads authoritative Satelle Log Entries from the remote Host Daemon instead of relying on a local CLI cache @spec @mvp
+- satelle logs reads authoritative Satelle Log Entries from the remote Host Daemon instead of relying on a local CLI cache @spec @mvp @implemented
 - satelle logs targets the resolved current or default host when no host or session selector is provided @implemented @mvp
-- satelle logs supports --host <alias> to read host-scoped logs for a configured remote host @spec @mvp
+- satelle logs supports --host <alias> to read host-scoped logs for a configured remote host @spec @mvp @implemented
 - satelle logs supports --session <session_id> to read logs scoped to one Satelle session @implemented @mvp
 - satelle logs reports a typed logs-target-required error when no host, default host, current host, or session selector can be resolved @spec @mvp
 - satelle logs for SSH bootstrap hosts may restart the on-demand Host Daemon before reading stored normalized logs @spec @mvp
@@ -1416,18 +1416,18 @@
 - satelle logs accepts --tail values from 1 through 10000 and reports a typed log-tail-limit-exceeded usage error for larger values @implemented @mvp
 - satelle logs supports --since <duration-or-rfc3339> to show only matching log entries at or after the requested time @implemented @mvp
 - satelle logs supports -f and --follow to continue streaming new matching log entries after the initial result set @spec @mvp
-- satelle logs supports repeatable --source <host_daemon|codex_adapter|transport|readiness|provider_smoke|setup|repair> filters @implemented @mvp
+- satelle logs supports repeatable --source <host_daemon|storage|codex_adapter> filters @spec @mvp @implemented
 - satelle logs without --source includes all MVP log sources that pass the default redaction policy @implemented @mvp
-- satelle logs supports --level <trace|debug|info|warn|error> as a minimum severity filter @implemented @mvp
+- satelle logs supports --level <info|warn|error> as a minimum severity filter @spec @mvp @implemented
 - satelle logs default minimum severity is info @implemented @mvp
 - satelle logs MVP does not support --export <path> or support bundle creation @implemented @mvp
 - satelle logs uses stdout as the data output contract instead of adding file destination flags in MVP @implemented @mvp
 - satelle logs human output writes log entries to stdout and diagnostics or command errors to stderr @implemented @mvp
-- satelle logs --json emits the initial matching set as one LF-terminated satelle.logs.entry.v1 JSON record per entry without a top-level wrapper @spec @contract @mvp
+- satelle logs --json emits the initial matching set as one LF-terminated satelle.logs.entry.v1 JSON record per entry without a top-level wrapper @spec @contract @mvp @implemented
 - satelle logs --json without --follow exits 0 with empty stdout when no entries match, while satelle logs --json --follow remains attached waiting for later matching entries until interrupted or failed @spec @contract @mvp
-- satelle logs JSON records include target, source, severity, timestamp, optional Session id, message, structured fields, redaction metadata, and their opaque Log Cursor @spec @contract @mvp
-- satelle logs supports --after <log_cursor> to return entries strictly after one previously delivered Log Cursor @spec @mvp
-- satelle logs reports a typed log-position-conflict usage error when --after and --since are both provided @spec @mvp
+- satelle logs JSON records use the exact satelle.logs.entry.v1 fields defined by the Host Daemon contract and add no CLI-only wrapper, target, or structured-fields properties @spec @contract @mvp @implemented
+- satelle logs supports --after <log_cursor> to return entries strictly after one previously delivered Log Cursor @spec @mvp @implemented
+- satelle logs reports a typed log-position-conflict usage error when --after is combined with --since or an explicit --tail @spec @mvp @implemented
 - satelle logs --json --follow continues the same newline-delimited satelle.logs.entry.v1 record stream after the initial matching set @spec @contract @mvp
 - satelle logs --follow exits 130 when interrupted by Ctrl-C and does not treat the interrupt as a remote host failure @spec @mvp
 - satelle logs --follow automatically attempts to reconnect when the log stream ends because of transient transport loss or Host Daemon restart @spec @mvp
@@ -1520,7 +1520,7 @@
 - satelle Host Daemon stores recording artifacts under a recordings directory inside the resolved Satelle local mutable state root by default @spec @mvp
 - satelle Host Daemon writes Satelle Operator Log Files by default when the resolved OS-native Satelle log directory is writable @spec @mvp
 - satelle Satelle Operator Log Files are a best-effort local inspection mirror and are never authoritative for satelle logs, satelle status, recovery, retention, or support bundle collection @spec @mvp
-- satelle logs command reads Satelle Log Entries from SQLite through the Host Daemon API instead of parsing Satelle Operator Log Files @spec @mvp
+- satelle logs command reads Satelle Log Entries from SQLite through the Host Daemon API instead of parsing Satelle Operator Log Files @spec @mvp @implemented
 - satelle Satelle Operator Log Files contain human-readable redacted summaries derived from Satelle Log Entries instead of raw protocol payloads or raw subprocess streams @spec @mvp
 - satelle Satelle Operator Log Files do not include provider request bodies, provider response bodies, full prompts, screenshots, desktop recordings, full transcripts, raw setup stdout, raw setup stderr, raw repair stdout, or raw repair stderr by default @spec @mvp
 - satelle Satelle Operator Log Files rotate at 10 MiB and retain at most 5 files total per Host Daemon instance by default @spec @mvp
@@ -1540,9 +1540,9 @@
 - satelle SQLite Satelle Log Entries are retained for 7 days by default @spec @mvp
 - satelle SQLite Satelle Log Entry retention can be configured per host or profile @spec @mvp
 - each persisted Satelle Log Entry receives a monotonic Log Cursor in its Host Daemon store @spec @mvp
-- logs pagination resumes strictly after the last delivered Log Cursor @spec @mvp
+- logs pagination resumes strictly after the last delivered Log Cursor @spec @mvp @implemented
 - logs follow reconnection uses a Log Cursor instead of timestamp alone @spec @mvp
-- a Log Cursor older than retained log history reports a typed logs-cursor-expired error and identifies the earliest available cursor @spec @mvp
+- a Log Cursor older than retained log history reports a typed logs-cursor-expired error and identifies the earliest available cursor @spec @mvp @implemented
 - satelle stores the Satelle Setup Action Ledger in the remote Host Daemon SQLite store instead of storing it only on the local CLI machine @spec @mvp
 - satelle treats the remote Host Daemon SQLite setup action ledger as authoritative for setup and repair recovery because it records mutations against that remote host @spec @mvp
 - satelle CLI may cache setup action ledger summaries for display convenience but must refresh from the Host Daemon before reporting authoritative setup or repair state @spec @mvp
@@ -1657,7 +1657,7 @@
 - an external bearer-token file must be a regular file owned by the resolving OS user; Satelle rejects symlinks, directories, devices, sockets, and files readable or writable by unrelated principals, using mode 0600 on POSIX and an owner-only Windows ACL @spec @mvp
 - every Host Daemon bearer token has a stable non-secret token id @spec @mvp @implemented
 - every Host Daemon bearer token has one or more read, control, admin, and diagnostics_sensitive scopes @spec @mvp @implemented
-- read scope authorizes readiness, status, Host session metadata, paths, and redacted logs @spec @mvp
+- read scope authorizes readiness, status, Host session metadata, paths, and redacted logs @spec @mvp @implemented
 - control scope authorizes read operations plus run, steer, stop, and attachment upload @spec @mvp
 - admin scope authorizes control operations plus setup, repair, Host lifecycle, Host update, storage migration, token management, and destructive maintenance @spec @mvp
 - diagnostics_sensitive scope is required in addition to command-specific consent for Raw Diagnostic Export, recording, and Desktop Snapshot Export operations @spec @mvp

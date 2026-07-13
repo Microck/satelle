@@ -70,6 +70,33 @@ fn log_pages_filter_before_limiting_and_resume_after_the_delivered_cursor() {
 }
 
 #[test]
+fn log_pages_treat_future_since_values_as_an_empty_result() {
+    let state = TempDir::new().expect("temporary state directory");
+    let (mut storage, _) = Storage::open(state.path()).expect("open storage");
+    let cursor = storage
+        .append_safe_log(&host_log(
+            OffsetDateTime::now_utc(),
+            LogSource::Storage,
+            LogSeverity::Info,
+        ))
+        .expect("append current log");
+    let future =
+        OffsetDateTime::parse("2999-01-01T00:00:00Z", &Rfc3339).expect("future RFC 3339 timestamp");
+
+    let page = storage
+        .log_page(
+            &LogPageQuery::forward(None, 10)
+                .expect("valid forward query")
+                .with_since(future),
+        )
+        .expect("a future lower bound is a valid empty query");
+
+    assert!(page.entries().is_empty());
+    assert!(!page.truncated());
+    assert_eq!(page.next_cursor().position(), cursor);
+}
+
+#[test]
 fn retention_expires_only_cursors_that_can_no_longer_resume_the_retained_prefix() {
     let state = TempDir::new().expect("temporary state directory");
     let (mut storage, _) = Storage::open(state.path()).expect("open storage");

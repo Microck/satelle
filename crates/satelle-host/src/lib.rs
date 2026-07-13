@@ -36,15 +36,13 @@ pub use runtime::{
     AdapterReadiness, AdapterSubject, ComputerUseAdapter, EvidenceError, ExecuteRequest,
     ExecuteResult, ProviderSmokeEvidence, ReadinessEvidence, RecoveryObservation,
 };
-use runtime::{
-    LogQuery, ProductionComputerUseAdapter, RunCommand, RuntimeHandle, SteerCommand, StopCommand,
-};
+use runtime::{ProductionComputerUseAdapter, RunCommand, RuntimeHandle, SteerCommand, StopCommand};
 use satelle_core::session::{PublicSession, TurnAdmissionFailure, TurnExecutionMode};
 use satelle_core::{
     DaemonPathOverrides, DoctorFinding, DoctorFixability, DoctorProbeResult, DoctorReport,
     DoctorSchemaVersion, DoctorSummary, HostSessionsReport, HostSessionsSchemaVersion,
-    LOCAL_DEMO_HOST, LogEntry, SatelleError, SatelleEvent, SessionId, SetupReadinessSummary,
-    SetupReport, SetupSchemaVersion, StopResult, object_value, utc_now,
+    LOCAL_DEMO_HOST, SatelleError, SatelleEvent, SessionId, SetupReadinessSummary, SetupReport,
+    SetupSchemaVersion, StopResult, object_value, utc_now,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -287,10 +285,6 @@ impl HostService {
 
     pub fn stop(&self, session_id: &SessionId) -> Result<StopResult, SatelleError> {
         self.runtime.stop(StopCommand::new(session_id.clone()))
-    }
-
-    pub fn logs(&self, host: &str) -> Result<Vec<LogEntry>, SatelleError> {
-        self.runtime.logs(LogQuery::for_host(host))
     }
 
     pub fn host_sessions(

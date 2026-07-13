@@ -1,9 +1,11 @@
 mod completions;
+mod logs;
 mod output;
 mod transport;
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use completions::{CompletionsCommand, run_completions};
+use logs::{LogsCommand, show_logs};
 use output::{OutputArgs, OutputFormat, SessionResultSchemaVersion, StatusReport};
 use satelle_core::session::{
     PublicSession, PublicTurn, TurnAdmissionPhase, TurnExecutionMode, TurnState,
@@ -29,8 +31,8 @@ const CONFIG_CHECK_SCHEMA_VERSION: &str = "satelle.config.check.v1";
 const CONFIG_EXPLAIN_SCHEMA_VERSION: &str = "satelle.config.explain.v1";
 const ERROR_SCHEMA_VERSION: &str = "satelle.error.v1";
 const PATHS_SCHEMA_VERSION: &str = "satelle.paths.v1";
+use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
-use time::{Duration, OffsetDateTime};
 
 #[derive(Parser, Debug)]
 #[command(
@@ -434,24 +436,6 @@ struct StopCommand {
     session_id: String,
     #[arg(long)]
     host: Option<String>,
-    #[command(flatten)]
-    output_args: OutputArgs,
-}
-
-#[derive(Args, Debug)]
-struct LogsCommand {
-    #[arg(long)]
-    host: Option<String>,
-    #[arg(long)]
-    session: Option<String>,
-    #[arg(long)]
-    tail: Option<usize>,
-    #[arg(long)]
-    since: Option<String>,
-    #[arg(long)]
-    source: Vec<String>,
-    #[arg(long)]
-    level: Option<String>,
     #[command(flatten)]
     output_args: OutputArgs,
 }
@@ -2235,162 +2219,6 @@ fn stop_session(
         );
         Ok(())
     }
-}
-
-fn show_logs(
-    command: LogsCommand,
-    config: ConfigContext<'_>,
-    format: OutputFormat,
-) -> Result<(), CliFailure> {
-    let json = format.is_json();
-    let started_at = utc_now();
-    let session_id = command
-        .session
-        .as_deref()
-        .map(SessionId::from_str)
-        .transpose()
-        .map_err(|error| failure(error.into(), json))?;
-    let host = config.resolve_host(command.host.as_deref(), json)?;
-    let transport = transport_for(&host, format)?;
-    if let Some(session_id) = &session_id {
-        transport
-            .status(session_id)
-            .map_err(|error| failure(error, json))?;
-    }
-
-    let tail = match command.tail {
-        Some(1..=10_000) => command.tail,
-        Some(value) => {
-            return Err(failure(SatelleError::log_tail_limit_exceeded(value), json));
-        }
-        None => {
-            if command.since.is_none() {
-                Some(200)
-            } else {
-                None
-            }
-        }
-    };
-    let minimum_level = command.level.as_deref().unwrap_or("info");
-    let minimum_level_rank = log_level_rank(minimum_level).ok_or_else(|| {
-        failure(
-            SatelleError::invalid_usage(
-                "--level must be one of trace, debug, info, warn, or error",
-            ),
-            json,
-        )
-    })?;
-    let since = command
-        .since
-        .as_deref()
-        .map(parse_log_since)
-        .transpose()
-        .map_err(|error| failure(error, json))?;
-    let allowed_sources = [
-        "host_daemon",
-        "codex_adapter",
-        "transport",
-        "readiness",
-        "provider_smoke",
-        "setup",
-        "repair",
-    ];
-    for source in &command.source {
-        if !allowed_sources.contains(&source.as_str()) {
-            return Err(failure(
-                SatelleError::invalid_usage(format!(
-                    "--source must be one of {}",
-                    allowed_sources.join(", ")
-                )),
-                json,
-            ));
-        }
-    }
-
-    let mut entries = transport.logs().map_err(|error| failure(error, json))?;
-    entries.retain(|entry| {
-        session_id
-            .as_ref()
-            .is_none_or(|session_id| entry.session_id.as_ref() == Some(session_id))
-            && (command.source.is_empty()
-                || command.source.iter().any(|source| source == &entry.source))
-    });
-    entries.retain(|entry| {
-        log_level_rank(&entry.severity).unwrap_or(usize::MAX) >= minimum_level_rank
-            && since.is_none_or(|since| log_timestamp_at_or_after(&entry.timestamp, since))
-    });
-    let matching_count = entries.len();
-    let truncated = tail.is_some_and(|tail| matching_count > tail);
-    if let Some(tail) = tail
-        && entries.len() > tail
-    {
-        entries = entries.split_off(entries.len() - tail);
-    }
-    let next_since = entries.last().map(|entry| entry.timestamp.clone());
-
-    if json {
-        let output = json!({
-            "schema_version": 1,
-            "target": {
-                "host": host.alias,
-                "session_id": session_id,
-            },
-            "filters": {
-                "tail": tail,
-                "since": command.since,
-                "source": command.source,
-                "level": minimum_level,
-            },
-            "entries": entries,
-            "truncated": truncated,
-            "started_at": started_at,
-            "finished_at": utc_now(),
-            "next_since": next_since,
-        });
-        print_json(&output).map_err(|error| failure(error, json))
-    } else if entries.is_empty() {
-        println!("No local demo logs for host {}", host.alias);
-        Ok(())
-    } else {
-        for entry in entries {
-            let session = entry
-                .session_id
-                .as_ref()
-                .map(ToString::to_string)
-                .unwrap_or_else(|| "-".to_string());
-            println!(
-                "{} [{}] host={} session={} {}",
-                entry.timestamp, entry.severity, entry.host, session, entry.message
-            );
-        }
-        Ok(())
-    }
-}
-
-fn log_level_rank(level: &str) -> Option<usize> {
-    match level {
-        "trace" => Some(0),
-        "debug" => Some(1),
-        "info" => Some(2),
-        "warn" => Some(3),
-        "error" => Some(4),
-        _ => None,
-    }
-}
-
-fn parse_log_since(value: &str) -> Result<OffsetDateTime, SatelleError> {
-    if let Ok(timestamp) = OffsetDateTime::parse(value, &Rfc3339) {
-        return Ok(timestamp);
-    }
-
-    let millis = parse_duration_ms(value)?;
-    Ok(OffsetDateTime::now_utc() - Duration::milliseconds(millis.min(i64::MAX as u64) as i64))
-}
-
-fn log_timestamp_at_or_after(timestamp: &str, since: OffsetDateTime) -> bool {
-    OffsetDateTime::parse(timestamp, &Rfc3339)
-        .map(|timestamp| timestamp >= since)
-        .unwrap_or(false)
 }
 
 fn effective_timeouts_json(host_config: &satelle_core::HostConfig) -> serde_json::Value {

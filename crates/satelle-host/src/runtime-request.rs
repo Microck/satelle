@@ -189,16 +189,6 @@ impl StopCommand {
     }
 }
 
-pub(crate) struct LogQuery<'a> {
-    pub(super) host: &'a str,
-}
-
-impl<'a> LogQuery<'a> {
-    pub(crate) const fn for_host(host: &'a str) -> Self {
-        Self { host }
-    }
-}
-
 fn identifier_hex(value: &str) -> String {
     value
         .split_once('_')

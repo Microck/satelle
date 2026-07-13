@@ -3,12 +3,15 @@ use crate::{CliFailure, SelectedHost, failure};
 use satelle_core::session::{PublicSession, TurnAdmissionFailure};
 use satelle_core::{
     ApiTokenSource, DaemonPathOverrides, DirectHostBinding, DoctorReport, HostSessionsReport,
-    LogEntry, SatelleError, SatelleEvent, SessionId, SetupReport, StopResult, TransportKind,
+    LOCAL_DEMO_HOST, SatelleError, SatelleEvent, SessionId, SetupReport, StopResult, TransportKind,
     TurnId, read_owner_only_secret_file, read_trusted_ca_bundle_file,
 };
-use satelle_host::{ApiBearerToken, HostService, HostStatus};
+use satelle_host::{
+    ApiBearerToken, DaemonLogPage, HostService, HostStatus, LogCursor, LogPageQuery,
+};
 use satelle_transport::{
-    ApiErrorCode, DaemonClient, DaemonClientError, DaemonEventClient, DaemonEventError, TurnRequest,
+    ApiError, ApiErrorCode, DaemonClient, DaemonClientError, DaemonEventClient, DaemonEventError,
+    TurnRequest,
 };
 use std::sync::Arc;
 use uuid::Uuid;
@@ -56,7 +59,7 @@ pub(crate) trait TransportClient {
     ) -> Result<PublicSession, SatelleError>;
     fn status(&self, session_id: &SessionId) -> Result<PublicSession, SatelleError>;
     fn stop(&self, session_id: &SessionId) -> Result<StopResult, SatelleError>;
-    fn logs(&self) -> Result<Vec<LogEntry>, SatelleError>;
+    fn logs(&self, query: &LogPageQuery) -> Result<DaemonLogPage, SatelleError>;
 }
 
 struct LocalTransport {
@@ -174,8 +177,11 @@ impl TransportClient for LocalTransport {
         self.service.stop(session_id)
     }
 
-    fn logs(&self) -> Result<Vec<LogEntry>, SatelleError> {
-        self.service.logs(&self.alias)
+    fn logs(&self, query: &LogPageQuery) -> Result<DaemonLogPage, SatelleError> {
+        if self.alias != LOCAL_DEMO_HOST {
+            return Err(SatelleError::host_not_found(self.alias.clone()));
+        }
+        self.service.daemon_log_page(query)
     }
 }
 
@@ -280,8 +286,11 @@ impl TransportClient for DirectTransport {
             .map_err(|error| direct_transport_error(&self.alias, error))
     }
 
-    fn logs(&self) -> Result<Vec<LogEntry>, SatelleError> {
-        Err(self.unsupported("logs"))
+    fn logs(&self, query: &LogPageQuery) -> Result<DaemonLogPage, SatelleError> {
+        self.client
+            .logs(query)
+            .map(|response| response.page().clone())
+            .map_err(|error| direct_logs_error(&self.alias, error))
     }
 }
 
@@ -365,7 +374,7 @@ fn direct_event_error(host: &str, error: DaemonEventError) -> SatelleError {
 
 fn direct_transport_error(host: &str, error: DaemonClientError) -> SatelleError {
     match error {
-        DaemonClientError::Api { error, .. } => api_code_error(host, error.code()),
+        DaemonClientError::Api { error, .. } => map_api_error(host, &error),
         DaemonClientError::ResponseHostIdentityMismatch => {
             SatelleError::host_identity_mismatch(host)
         }
@@ -389,6 +398,51 @@ fn direct_transport_error(host: &str, error: DaemonClientError) -> SatelleError 
             SatelleError::remote_api_error(host, "invalid-daemon-response")
         }
     }
+}
+
+fn direct_logs_error(host: &str, error: DaemonClientError) -> SatelleError {
+    match error {
+        DaemonClientError::Api { error, .. } if error.code() == ApiErrorCode::InvalidRequest => {
+            SatelleError::invalid_usage("the Host rejected the logs query")
+        }
+        error => direct_transport_error(host, error),
+    }
+}
+
+// Cursor expiry is the one API failure whose details are required to resume
+// safely. Validate that recovery boundary at the transport boundary instead
+// of collapsing it into the generic remote API error used for other codes.
+fn map_api_error(host: &str, error: &ApiError) -> SatelleError {
+    if error.code() != ApiErrorCode::LogsCursorExpired {
+        return api_code_error(host, error.code());
+    }
+
+    let Some(details) = error.details().and_then(serde_json::Value::as_object) else {
+        return SatelleError::remote_api_error(host, "invalid-daemon-response");
+    };
+    let earliest_available_cursor = match details.get("earliest_available_cursor") {
+        Some(serde_json::Value::Null) => None,
+        Some(serde_json::Value::String(cursor)) => match LogCursor::parse(cursor) {
+            Ok(cursor) => Some(cursor),
+            Err(_) => return SatelleError::remote_api_error(host, "invalid-daemon-response"),
+        },
+        _ => return SatelleError::remote_api_error(host, "invalid-daemon-response"),
+    };
+    let Some(resume_cursor) = details
+        .get("resume_cursor")
+        .and_then(serde_json::Value::as_str)
+        .and_then(|cursor| LogCursor::parse(cursor).ok())
+    else {
+        return SatelleError::remote_api_error(host, "invalid-daemon-response");
+    };
+    if earliest_available_cursor.is_some_and(|earliest| earliest <= resume_cursor) {
+        return SatelleError::remote_api_error(host, "invalid-daemon-response");
+    }
+
+    SatelleError::logs_cursor_expired(
+        earliest_available_cursor.map(|cursor| cursor.to_string()),
+        resume_cursor.to_string(),
+    )
 }
 
 fn direct_admission_error(host: &str, error: DaemonClientError) -> TurnAdmissionFailure {

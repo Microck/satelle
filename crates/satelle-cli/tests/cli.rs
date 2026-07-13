@@ -70,6 +70,28 @@ fn session_id(stdout: &[u8]) -> String {
         .to_string()
 }
 
+fn completed_log_session(state: &TestStateDir) -> String {
+    let run_output = satelle()
+        .env("SATELLE_STATE_DIR", state.path())
+        .args(["run", "--host", "local-demo", "Open the browser"])
+        .assert()
+        .success()
+        .get_output()
+        .clone();
+    let session = session_id(&run_output.stdout);
+    satelle()
+        .env("SATELLE_STATE_DIR", state.path())
+        .args(["steer", &session, "Continue"])
+        .assert()
+        .success();
+    satelle()
+        .env("SATELLE_STATE_DIR", state.path())
+        .args(["stop", &session])
+        .assert()
+        .success();
+    session
+}
+
 fn combined_output(output: &assert_cmd::assert::Assert) -> String {
     let output = output.get_output();
     format!(
@@ -1535,24 +1557,19 @@ fn detach_returns_starting_session_without_event_streaming() {
         .success()
         .get_output()
         .clone();
-    let logs = parse_json_output(&logs_output.stdout);
-    let entries = logs["entries"]
-        .as_array()
-        .expect("logs should contain an entries array");
+    let entries = parse_json_lines(&logs_output.stdout);
     let recovery_cursor = entries
         .iter()
-        .find(|entry| entry["fields"]["event"] == "restart_recovery_pending")
-        .and_then(|entry| entry["fields"]["cursor"].as_str())
-        .and_then(|cursor| cursor.parse::<u64>().ok())
-        .expect("restart recovery should be recorded with a numeric cursor");
+        .find(|entry| entry["event"] == "restart_recovery_pending")
+        .and_then(|entry| entry["cursor"].as_str())
+        .expect("restart recovery should be recorded with an opaque cursor");
     assert!(
         entries
             .iter()
-            .filter(|entry| entry["fields"]["event"] == "turn_state_committed")
+            .filter(|entry| entry["event"] == "turn_state_committed")
             .all(|entry| {
-                entry["fields"]["cursor"]
+                entry["cursor"]
                     .as_str()
-                    .and_then(|cursor| cursor.parse::<u64>().ok())
                     .is_some_and(|cursor| cursor < recovery_cursor)
             }),
         "read-only commands must not commit liveness after recovery begins"
@@ -1620,27 +1637,9 @@ fn detach_returns_starting_session_without_event_streaming() {
 }
 
 #[test]
-fn logs_json_filters_tail_session_source_level_and_since() {
+fn logs_json_applies_tail_session_source_level_and_since_on_the_host() {
     let state = state_dir();
-    let run_output = satelle()
-        .env("SATELLE_STATE_DIR", state.path())
-        .args(["run", "--host", "local-demo", "Open the browser"])
-        .assert()
-        .success()
-        .get_output()
-        .clone();
-    let session = session_id(&run_output.stdout);
-
-    satelle()
-        .env("SATELLE_STATE_DIR", state.path())
-        .args(["steer", &session, "Continue"])
-        .assert()
-        .success();
-    satelle()
-        .env("SATELLE_STATE_DIR", state.path())
-        .args(["stop", &session])
-        .assert()
-        .success();
+    let session = completed_log_session(&state);
 
     let output = satelle()
         .env("SATELLE_STATE_DIR", state.path())
@@ -1658,29 +1657,37 @@ fn logs_json_filters_tail_session_source_level_and_since() {
         .success()
         .get_output()
         .clone();
-    let report = parse_json_output(&output.stdout);
+    assert!(output.stderr.is_empty());
+    let entries = parse_json_lines(&output.stdout);
+    assert_eq!(entries.len(), 2);
+    assert!(entries.iter().all(|entry| {
+        entry["source"] == "host_daemon" && entry["subject"]["session_id"] == session
+    }));
+    assert_eq!(entries[0]["event"], "turn_state_committed");
+    assert_eq!(entries[0]["severity"], "info");
+    assert_eq!(entries[1]["event"], "stop_confirmed");
+    assert_eq!(entries[1]["severity"], "warn");
 
-    assert_eq!(report["schema_version"], 1);
-    assert_eq!(report["target"]["host"], "local-demo");
-    assert_eq!(report["target"]["session_id"], session);
-    assert_eq!(report["filters"]["tail"], 2);
-    assert_eq!(report["filters"]["level"], "info");
-    assert_eq!(
-        report["filters"]["source"],
-        serde_json::json!(["host_daemon"])
-    );
-    assert_eq!(report["entries"].as_array().unwrap().len(), 2);
-    assert_eq!(report["truncated"], true);
-    assert!(report.get("started_at").is_some());
-    assert!(report.get("finished_at").is_some());
-    assert!(report.get("next_since").is_some());
-    assert_eq!(
-        report["entries"][0]["message"],
-        "committed local demo turn state"
-    );
-    assert_eq!(
-        report["entries"][1]["message"],
-        "resolved local demo stop request"
+    let output = satelle()
+        .env("SATELLE_STATE_DIR", state.path())
+        .args([
+            "logs",
+            "--source",
+            "host_daemon",
+            "--source",
+            "storage",
+            "--json",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .clone();
+    let repeated_source_entries = parse_json_lines(&output.stdout);
+    assert!(!repeated_source_entries.is_empty());
+    assert!(
+        repeated_source_entries
+            .iter()
+            .all(|entry| { matches!(entry["source"].as_str(), Some("host_daemon" | "storage")) })
     );
 
     let output = satelle()
@@ -1690,10 +1697,18 @@ fn logs_json_filters_tail_session_source_level_and_since() {
         .success()
         .get_output()
         .clone();
-    let report = parse_json_output(&output.stdout);
-    assert_eq!(report["entries"].as_array().unwrap().len(), 1);
-    assert_eq!(report["entries"][0]["severity"], "warn");
-    assert_eq!(report["filters"]["tail"], 200);
+    let entries = parse_json_lines(&output.stdout);
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0]["severity"], "warn");
+
+    let output = satelle()
+        .env("SATELLE_STATE_DIR", state.path())
+        .args(["logs", "--session", &session, "--since", "30m", "--json"])
+        .assert()
+        .success()
+        .get_output()
+        .clone();
+    assert!(!parse_json_lines(&output.stdout).is_empty());
 
     let output = satelle()
         .env("SATELLE_STATE_DIR", state.path())
@@ -1709,9 +1724,8 @@ fn logs_json_filters_tail_session_source_level_and_since() {
         .success()
         .get_output()
         .clone();
-    let report = parse_json_output(&output.stdout);
-    assert_eq!(report["entries"].as_array().unwrap().len(), 0);
-    assert_eq!(report["filters"]["tail"], serde_json::Value::Null);
+    assert!(output.stdout.is_empty());
+    assert!(output.stderr.is_empty());
 
     let output = satelle()
         .env("SATELLE_STATE_DIR", state.path())
@@ -1722,6 +1736,103 @@ fn logs_json_filters_tail_session_source_level_and_since() {
         .clone();
     let error = parse_json_output(&output.stderr);
     assert_eq!(error["error"]["code"], "log-tail-limit-exceeded");
+}
+
+#[test]
+fn logs_after_resumes_strictly_after_the_opaque_cursor() {
+    let state = state_dir();
+    let session = completed_log_session(&state);
+
+    let initial = satelle()
+        .env("SATELLE_STATE_DIR", state.path())
+        .args(["logs", "--session", &session, "--tail", "2", "--json"])
+        .assert()
+        .success()
+        .get_output()
+        .clone();
+    let initial_entries = parse_json_lines(&initial.stdout);
+    assert_eq!(initial_entries.len(), 2);
+    let cursor = initial_entries[0]["cursor"]
+        .as_str()
+        .expect("a Log Entry should expose an opaque cursor");
+
+    let resumed = satelle()
+        .env("SATELLE_STATE_DIR", state.path())
+        .args(["logs", "--session", &session, "--after", cursor, "--json"])
+        .assert()
+        .success()
+        .get_output()
+        .clone();
+    assert!(resumed.stderr.is_empty());
+    let resumed_entries = parse_json_lines(&resumed.stdout);
+    assert_eq!(resumed_entries.len(), 1);
+    assert_eq!(resumed_entries[0]["cursor"], initial_entries[1]["cursor"]);
+    assert!(resumed_entries.iter().all(|entry| {
+        entry["cursor"]
+            .as_str()
+            .is_some_and(|resumed_cursor| resumed_cursor > cursor)
+    }));
+}
+
+#[test]
+fn logs_after_rejects_since_and_explicit_tail_with_a_typed_conflict() {
+    let state = state_dir();
+    let cursor = "slc1_0000000000000000";
+
+    for conflicting_args in [
+        vec!["--since", "2024-01-01T00:00:00Z"],
+        vec!["--tail", "20"],
+    ] {
+        let mut args = vec!["logs", "--after", cursor, "--json"];
+        args.extend(conflicting_args);
+        let output = satelle()
+            .env("SATELLE_STATE_DIR", state.path())
+            .args(args)
+            .assert()
+            .code(64)
+            .get_output()
+            .clone();
+
+        assert!(output.stdout.is_empty());
+        let error = parse_json_output(&output.stderr);
+        assert_eq!(error["schema_version"], "satelle.error.v1");
+        assert_eq!(error["error"]["code"], "log-position-conflict");
+    }
+}
+
+#[test]
+fn logs_accepts_only_canonical_sources_and_severities() {
+    let state = state_dir();
+
+    for source in ["host_daemon", "storage", "codex_adapter"] {
+        satelle()
+            .env("SATELLE_STATE_DIR", state.path())
+            .args(["logs", "--source", source, "--json"])
+            .assert()
+            .success()
+            .stderr(predicate::str::is_empty());
+    }
+    for severity in ["info", "warn", "error"] {
+        satelle()
+            .env("SATELLE_STATE_DIR", state.path())
+            .args(["logs", "--level", severity, "--json"])
+            .assert()
+            .success()
+            .stderr(predicate::str::is_empty());
+    }
+
+    for (flag, value) in [("--source", "transport"), ("--level", "debug")] {
+        let output = satelle()
+            .env("SATELLE_STATE_DIR", state.path())
+            .args(["logs", flag, value, "--json"])
+            .assert()
+            .code(64)
+            .get_output()
+            .clone();
+        assert!(output.stdout.is_empty());
+        let error = parse_json_output(&output.stderr);
+        assert_eq!(error["error"]["code"], "invalid-usage");
+    }
 }
 
 #[test]

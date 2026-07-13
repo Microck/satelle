@@ -2,6 +2,7 @@ use assert_cmd::Command;
 use satelle_core::{DoctorSchemaVersion, HostSessionsSchemaVersion, SetupSchemaVersion};
 use satelle_host::test_support::TestStateDir;
 use serde_json::{Value, json};
+use std::collections::BTreeSet;
 
 const TEST_SUPPORT_ADAPTER_ENV: &str = "SATELLE_TEST_SUPPORT_ADAPTER";
 
@@ -127,6 +128,85 @@ fn session_commands_use_command_specific_v2_schema_tokens() {
         ],
     );
     assert_eq!(detached_run["schema_version"], "satelle.run.v2");
+}
+
+#[test]
+fn logs_json_lines_use_the_exact_entry_v1_contract() {
+    let state = TestStateDir::new().expect("secure temp state directory should be created");
+    let run = json_report(
+        &state,
+        vec!["run", "--host", "local-demo", "--json", "Inspect"],
+    );
+    let session = run["session_id"]
+        .as_str()
+        .expect("run should return a Session id");
+
+    let output = satelle()
+        .env("SATELLE_STATE_DIR", state.path())
+        .args(["logs", "--session", session, "--json"])
+        .assert()
+        .success()
+        .get_output()
+        .clone();
+
+    assert!(output.stderr.is_empty());
+    assert!(output.stdout.ends_with(b"\n"));
+    assert!(!output.stdout.contains(&b'\r'));
+    let expected_fields = [
+        "cursor",
+        "event",
+        "message",
+        "redacted",
+        "schema_version",
+        "severity",
+        "source",
+        "subject",
+        "timestamp",
+    ]
+    .into_iter()
+    .collect::<BTreeSet<_>>();
+    let body = output
+        .stdout
+        .strip_suffix(b"\n")
+        .expect("NDJSON output should have one final line feed");
+    let lines = body.split(|byte| *byte == b'\n').collect::<Vec<_>>();
+    assert!(!lines.is_empty());
+
+    for line in lines {
+        assert_eq!(line.first(), Some(&b'{'));
+        assert_eq!(line.last(), Some(&b'}'));
+        let entry =
+            serde_json::from_slice::<Value>(line).expect("each line should be one JSON value");
+        let actual_fields = entry
+            .as_object()
+            .expect("each Log Entry should be an object")
+            .keys()
+            .map(String::as_str)
+            .collect::<BTreeSet<_>>();
+        assert_eq!(actual_fields, expected_fields);
+        assert_eq!(entry["schema_version"], "satelle.logs.entry.v1");
+        assert!(
+            entry["cursor"]
+                .as_str()
+                .is_some_and(|cursor| cursor.starts_with("slc1_"))
+        );
+        assert!(matches!(
+            entry["source"].as_str(),
+            Some("host_daemon" | "storage" | "codex_adapter")
+        ));
+        assert!(matches!(
+            entry["severity"].as_str(),
+            Some("info" | "warn" | "error")
+        ));
+        assert!(entry["timestamp"].is_string());
+        assert!(entry["event"].is_string());
+        assert!(entry["message"].is_string());
+        assert_eq!(entry["redacted"], true);
+        assert!(matches!(
+            entry["subject"]["kind"].as_str(),
+            Some("host" | "turn")
+        ));
+    }
 }
 
 #[test]

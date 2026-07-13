@@ -1,7 +1,9 @@
 use super::*;
 use satelle_core::session::{TurnAdmissionPhase, TurnState};
 use satelle_core::{ErrorCode, EventSource, EventSubject, EventType, SatelleEventBody};
-use satelle_host::{ApiScopes, test_support::TestStateDir};
+use satelle_host::{
+    ApiScopes, LogCursor, LogPageQuery, LogSeverity, LogSource, test_support::TestStateDir,
+};
 use satelle_transport::{DaemonServer, DaemonServerConfig};
 use std::net::{Ipv4Addr, SocketAddr};
 
@@ -23,14 +25,36 @@ fn register_client_tokens(
     (http_token, event_token)
 }
 
+fn cursor_expiry_api_error(
+    earliest_available_cursor: serde_json::Value,
+    resume_cursor: &str,
+) -> satelle_transport::ApiError {
+    serde_json::from_value(serde_json::json!({
+        "schema_version": "satelle.error.v1",
+        "request_id": satelle_transport::RequestId::new().to_string(),
+        "host_identity": "host-direct-test",
+        "code": "logs-cursor-expired",
+        "category": "not_found",
+        "retryable": false,
+        "message": "the Log Cursor is older than retained Host history",
+        "details": {
+            "earliest_available_cursor": earliest_available_cursor,
+            "resume_cursor": resume_cursor,
+        },
+        "docs_url": null,
+        "suggested_commands": []
+    }))
+    .expect("deserialize cursor-expiry API response")
+}
+
 struct DirectFixture {
-    _state: TestStateDir,
     service: HostService,
     host_identity: String,
     address: SocketAddr,
     server: Option<DaemonServer>,
     server_runtime: tokio::runtime::Runtime,
     transport: Option<DirectTransport>,
+    _state: TestStateDir,
 }
 
 impl DirectFixture {
@@ -63,7 +87,6 @@ impl DirectFixture {
             .build()
             .expect("construct event runtime");
         Self {
-            _state: state,
             service,
             host_identity,
             address,
@@ -75,6 +98,7 @@ impl DirectFixture {
                 event_client,
                 event_runtime,
             }),
+            _state: state,
         }
     }
 
@@ -89,11 +113,142 @@ impl Drop for DirectFixture {
     fn drop(&mut self) {
         drop(self.transport.take());
         if let Some(server) = self.server.take() {
-            self.server_runtime
-                .block_on(server.shutdown())
-                .expect("shut down loopback daemon");
+            let shutdown = self.server_runtime.block_on(server.shutdown());
+            if !std::thread::panicking() {
+                shutdown.expect("shut down loopback daemon");
+            }
         }
     }
+}
+
+#[test]
+fn local_and_direct_logs_return_the_same_authoritative_page() {
+    let fixture = DirectFixture::start();
+    let appended = fixture
+        .service
+        .append_daemon_log_for_tests(
+            time::OffsetDateTime::now_utc(),
+            LogSource::Storage,
+            LogSeverity::Warning,
+        )
+        .expect("append a canonical Host log");
+    let query = LogPageQuery::tail(1)
+        .expect("construct canonical tail query")
+        .with_sources([LogSource::Storage])
+        .with_minimum_severity(LogSeverity::Warning);
+    let local = LocalTransport::new("local-demo".to_string(), fixture.service.clone());
+
+    let local_page = local
+        .logs(&query)
+        .expect("read logs through local transport");
+    let direct_page = fixture
+        .transport()
+        .logs(&query)
+        .expect("read logs through direct transport");
+
+    assert_eq!(direct_page, local_page);
+    assert_eq!(direct_page.entries().len(), 1);
+    assert_eq!(direct_page.entries()[0].cursor(), appended);
+    assert_eq!(direct_page.entries()[0].source(), LogSource::Storage);
+    assert_eq!(direct_page.entries()[0].severity(), LogSeverity::Warning);
+}
+
+#[test]
+fn local_logs_reject_a_non_local_demo_alias_before_reading_the_shared_store() {
+    let state = TestStateDir::new().expect("temporary state directory");
+    let service = HostService::local_demo_for_tests_at(state.path())
+        .expect("construct deterministic Host service");
+    let local = LocalTransport::new("other-local".to_string(), service);
+    let query = LogPageQuery::tail(1).expect("construct canonical tail query");
+
+    let error = local
+        .logs(&query)
+        .expect_err("a non-local-demo alias must not read the shared local Host store");
+
+    assert_eq!(error.code, ErrorCode::HostNotFound);
+    assert_eq!(error.message, "host 'other-local' is not configured");
+    assert_eq!(error.exit_code(), 66);
+}
+
+#[test]
+fn local_and_direct_logs_report_cursor_ahead_as_invalid_usage() {
+    let fixture = DirectFixture::start();
+    let future_cursor = LogCursor::parse("slc1_7fffffffffffffff")
+        .expect("the maximum supported Log Cursor is valid");
+    let query =
+        LogPageQuery::forward(Some(future_cursor), 1).expect("construct future-cursor query");
+    let local = LocalTransport::new("local-demo".to_string(), fixture.service.clone());
+
+    let local_error = local
+        .logs(&query)
+        .expect_err("local transport must reject a cursor above its high-water mark");
+    let direct_error = fixture
+        .transport()
+        .logs(&query)
+        .expect_err("direct transport must reject a cursor above its high-water mark");
+
+    assert_eq!(local_error.code, ErrorCode::InvalidUsage);
+    assert_eq!(direct_error.code, local_error.code);
+    assert_eq!(direct_error.exit_code(), 64);
+}
+
+#[test]
+fn direct_logs_preserve_typed_cursor_expiry_details() {
+    let earliest = "slc1_0000000000000002";
+    let resume = "slc1_0000000000000001";
+    let api_error = cursor_expiry_api_error(serde_json::json!(earliest), resume);
+
+    let error = direct_logs_error(
+        "direct-test",
+        DaemonClientError::Api {
+            status: 410_u16.try_into().expect("410 is a valid HTTP status"),
+            error: Box::new(api_error),
+        },
+    );
+
+    assert_eq!(error.code, ErrorCode::LogsCursorExpired);
+    assert_eq!(
+        error.details.get("earliest_available_cursor"),
+        Some(&serde_json::json!(earliest))
+    );
+    assert_eq!(
+        error.details.get("resume_cursor"),
+        Some(&serde_json::json!(resume))
+    );
+
+    let api_error = cursor_expiry_api_error(serde_json::Value::Null, resume);
+    let error = direct_logs_error(
+        "direct-test",
+        DaemonClientError::Api {
+            status: 410_u16.try_into().expect("410 is a valid HTTP status"),
+            error: Box::new(api_error),
+        },
+    );
+    assert_eq!(error.code, ErrorCode::LogsCursorExpired);
+    assert_eq!(
+        error.details.get("earliest_available_cursor"),
+        Some(&serde_json::Value::Null)
+    );
+}
+
+#[test]
+fn direct_logs_reject_contradictory_cursor_expiry_details() {
+    let resume = "slc1_0000000000000002";
+    let api_error = cursor_expiry_api_error(serde_json::json!(resume), resume);
+
+    let error = direct_logs_error(
+        "direct-test",
+        DaemonClientError::Api {
+            status: 410_u16.try_into().expect("410 is a valid HTTP status"),
+            error: Box::new(api_error),
+        },
+    );
+
+    assert_eq!(error.code, ErrorCode::RemoteExecution);
+    assert_eq!(
+        error.details.get("remote_code"),
+        Some(&serde_json::json!("invalid-daemon-response"))
+    );
 }
 
 #[test]

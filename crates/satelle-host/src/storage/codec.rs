@@ -191,6 +191,7 @@ pub(super) fn load_required_session(
         .ok_or_else(|| StorageError::new(StorageErrorKind::SessionNotFound))
 }
 
+#[cfg(test)]
 pub(super) fn load_log_records(
     connection: &Connection,
     cursor: i64,
@@ -232,7 +233,18 @@ pub(super) fn load_log_page_records(
     let cursor = i64::try_from(query.cursor().map_or(0, crate::LogCursor::position))
         .map_err(|_| StorageError::new(StorageErrorKind::InvalidInput))?;
     let session_id = query.session_id().map(SessionId::as_str);
-    let since = query.since().map(unix_timestamp_nanos).transpose()?;
+    let since_nanos = query.since().map(OffsetDateTime::unix_timestamp_nanos);
+    if since_nanos.is_some_and(|value| value > i128::from(i64::MAX)) {
+        // SQLite stores Log timestamps as signed 64-bit nanoseconds. A valid RFC 3339 lower
+        // bound beyond that representable range is newer than every storable entry, so it is a
+        // successful empty query rather than invalid storage input.
+        return Ok(Vec::new());
+    }
+    let since = since_nanos
+        .map(|value| value.max(i128::from(i64::MIN)))
+        .map(i64::try_from)
+        .transpose()
+        .expect("the Log query timestamp was bounded to SQLite's signed 64-bit range");
     let all_sources = i64::from(
         query.includes_source(crate::LogSource::HostDaemon)
             && query.includes_source(crate::LogSource::Storage)

@@ -1,7 +1,7 @@
 use super::adapter::BlockedComputerUseAdapter;
 use super::{
-    ComputerUseAdapter, LogQuery, RecoveryObservation, RequestIdentity, RunCommand, RuntimeHandle,
-    RuntimeStartupState, SteerCommand, StopCommand,
+    ComputerUseAdapter, LogPageQuery, RecoveryObservation, RequestIdentity, RunCommand,
+    RuntimeHandle, RuntimeStartupState, SteerCommand, StopCommand,
 };
 use crate::storage::PrivateUpstreamRef;
 use crate::test_runtime::FakeComputerUseAdapter;
@@ -137,7 +137,7 @@ fn reads_and_stop_remain_available_during_slow_execution_and_stop_observation() 
     let read_session_id = session.session_id().clone();
     let stop_read = std::thread::spawn(move || {
         let read_result = read_runtime.status(read_session_id).and_then(|status| {
-            let logs = read_runtime.logs(LogQuery::for_host(LOCAL_DEMO_HOST))?;
+            let logs = read_runtime.log_page(&LogPageQuery::default())?;
             Ok((status, logs))
         });
         read_sender
@@ -152,7 +152,7 @@ fn reads_and_stop_remain_available_during_slow_execution_and_stop_observation() 
         }
     };
     stop_read.join().expect("read worker should finish");
-    assert!(!logs.is_empty());
+    assert!(!logs.entries().is_empty());
 
     adapter.stop_release.signal();
     let stopped = stop_receiver
@@ -212,7 +212,7 @@ fn adapter_persists_upstream_refs_before_waiting_and_stop_keeps_them_durable() {
         .status(session.session_id().clone())
         .expect("read public Session while execution is waiting");
     let logs = runtime
-        .logs(LogQuery::for_host(LOCAL_DEMO_HOST))
+        .log_page(&LogPageQuery::default())
         .expect("read safe logs while execution is waiting");
     let public_json = serde_json::to_string(&(public_session, logs))
         .expect("serialize public state and safe logs");
@@ -307,7 +307,7 @@ fn read_paths_open_storage_without_computer_use_preflight() {
         .status(session.session_id().clone())
         .expect("status should not require adapter readiness");
     let logs = blocked
-        .logs(LogQuery::for_host(LOCAL_DEMO_HOST))
+        .log_page(&LogPageQuery::default())
         .expect("logs should not require adapter readiness");
     let count = blocked
         .snapshot()
@@ -315,7 +315,7 @@ fn read_paths_open_storage_without_computer_use_preflight() {
         .session_count();
 
     assert_eq!(latest_turn_state(&status), TurnState::Completed);
-    assert!(!logs.is_empty());
+    assert!(!logs.entries().is_empty());
     assert_eq!(count, 1);
 }
 
@@ -444,8 +444,8 @@ fn new_admission_reconciles_restart_work_without_blocking_reads() {
     let read_session_id = old_session.session_id().clone();
     let read_worker = std::thread::spawn(move || {
         let result = read_runtime.status(read_session_id).and_then(|status| {
-            let logs = read_runtime.logs(LogQuery::for_host(LOCAL_DEMO_HOST))?;
-            Ok((status, logs.len()))
+            let logs = read_runtime.log_page(&LogPageQuery::default())?;
+            Ok((status, logs.entries().len()))
         });
         read_sender
             .send(result)

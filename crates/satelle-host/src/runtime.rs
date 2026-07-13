@@ -18,7 +18,7 @@ pub use adapter::{
     ExecuteResult, ProviderSmokeEvidence, ReadinessEvidence, RecoveryObservation,
 };
 pub(crate) use codex_adapter::ProductionComputerUseAdapter;
-pub(crate) use request::{LogQuery, RequestIdentity, RunCommand, SteerCommand, StopCommand};
+pub(crate) use request::{RequestIdentity, RunCommand, SteerCommand, StopCommand};
 use worker::{ExecutionPlan, TurnWork, WorkerRegistry};
 
 use crate::live_events::LiveEventHub;
@@ -32,8 +32,8 @@ use crate::{ApiBearerToken, ApiPrincipal, DaemonLogPage, LogCursor, LogPageQuery
 use recovery::RecoveryQueue;
 use satelle_core::session::{PublicSession, TurnAdmissionFailure, TurnState};
 use satelle_core::{
-    ControlPlaneOperation, LOCAL_DEMO_HOST, LogEntry, SatelleError, SatelleEvent, SessionId,
-    StopResult, TurnId,
+    ControlPlaneOperation, LOCAL_DEMO_HOST, SatelleError, SatelleEvent, SessionId, StopResult,
+    TurnId,
 };
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -429,16 +429,6 @@ impl RuntimeEngine {
         })
     }
 
-    fn logs(&self, query: LogQuery<'_>) -> Result<Vec<LogEntry>, SatelleError> {
-        ensure_local_host(query.host)?;
-        self.lock_storage()?
-            .logs_after(None, 10_000)
-            .map_err(model::storage_failure)?
-            .into_iter()
-            .map(model::stored_log_entry)
-            .collect()
-    }
-
     fn log_page(&self, query: &LogPageQuery) -> Result<DaemonLogPage, SatelleError> {
         match self.lock_storage()?.log_page(query) {
             Ok(page) => Ok(page),
@@ -748,10 +738,6 @@ impl RuntimeHandle {
         command: StopCommand,
     ) -> Result<RuntimeStopOutcome, SatelleError> {
         self.engine()?.stop(command)
-    }
-
-    pub(crate) fn logs(&self, query: LogQuery<'_>) -> Result<Vec<LogEntry>, SatelleError> {
-        self.engine()?.logs(query)
     }
 
     pub(crate) fn log_page(&self, query: &LogPageQuery) -> Result<DaemonLogPage, SatelleError> {

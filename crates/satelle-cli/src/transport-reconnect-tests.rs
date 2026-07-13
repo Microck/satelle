@@ -98,14 +98,12 @@ impl DropFirstHttpConnection {
         let (serving_sender, serving) = mpsc::channel();
         let (shutdown, shutdown_receiver) = mpsc::channel();
         let thread = thread::spawn(move || {
-            // The first real client connection is accepted and dropped before HTTP decoding. The
-            // real daemon then binds the same address before the bounded reconciliation retry.
-            loop {
+            // Keep the first real client connection open while replacing this listener. Closing
+            // it only after the real daemon binds makes the resulting retry deterministic: the
+            // client cannot observe a connection-refused gap between the two listeners.
+            let first_connection = loop {
                 match listener.accept() {
-                    Ok((connection, _)) => {
-                        drop(connection);
-                        break;
-                    }
+                    Ok((connection, _)) => break connection,
                     Err(error) if error.kind() == ErrorKind::WouldBlock => {
                         match shutdown_receiver.try_recv() {
                             Ok(()) | Err(TryRecvError::Disconnected) => return,
@@ -114,7 +112,7 @@ impl DropFirstHttpConnection {
                     }
                     Err(error) => panic!("accept transient HTTP connection: {error}"),
                 }
-            }
+            };
             drop(listener);
 
             let runtime = tokio::runtime::Builder::new_current_thread()
@@ -125,6 +123,7 @@ impl DropFirstHttpConnection {
                 let server = DaemonServer::bind(service, DaemonServerConfig::loopback(address))
                     .await
                     .expect("start real HTTP daemon after transient failure");
+                drop(first_connection);
                 serving_sender
                     .send(())
                     .expect("report transient HTTP daemon readiness");
@@ -157,20 +156,22 @@ impl DropFirstHttpConnection {
     }
 
     fn stop(mut self) {
-        self.stop_inner();
+        self.stop_inner()
+            .expect("join transient HTTP daemon thread");
     }
 
-    fn stop_inner(&mut self) {
+    fn stop_inner(&mut self) -> thread::Result<()> {
+        let Some(thread) = self.thread.take() else {
+            return Ok(());
+        };
         let _ = self.shutdown.send(());
-        if let Some(thread) = self.thread.take() {
-            thread.join().expect("join transient HTTP daemon thread");
-        }
+        thread.join()
     }
 }
 
 impl Drop for DropFirstHttpConnection {
     fn drop(&mut self) {
-        self.stop_inner();
+        let _ = self.stop_inner();
     }
 }
 
@@ -227,17 +228,22 @@ impl DropSubscribedStreams {
         self.handshakes.load(Ordering::SeqCst)
     }
 
-    fn stop_inner(&mut self) {
+    fn stop(mut self) {
+        self.stop_inner().expect("join subscribed-stream proxy");
+    }
+
+    fn stop_inner(&mut self) -> thread::Result<()> {
+        let Some(thread) = self.thread.take() else {
+            return Ok(());
+        };
         let _ = self.shutdown.send(());
-        if let Some(thread) = self.thread.take() {
-            thread.join().expect("join subscribed-stream proxy");
-        }
+        thread.join()
     }
 }
 
 impl Drop for DropSubscribedStreams {
     fn drop(&mut self) {
-        self.stop_inner();
+        let _ = self.stop_inner();
     }
 }
 
@@ -292,17 +298,23 @@ impl ActiveReconciliationServer {
         self.address
     }
 
-    fn stop_inner(&mut self) {
+    fn stop(mut self) {
+        self.stop_inner()
+            .expect("join active reconciliation fixture");
+    }
+
+    fn stop_inner(&mut self) -> thread::Result<()> {
+        let Some(thread) = self.thread.take() else {
+            return Ok(());
+        };
         let _ = self.shutdown.send(());
-        if let Some(thread) = self.thread.take() {
-            thread.join().expect("join active reconciliation fixture");
-        }
+        thread.join()
     }
 }
 
 impl Drop for ActiveReconciliationServer {
     fn drop(&mut self) {
-        self.stop_inner();
+        let _ = self.stop_inner();
     }
 }
 
@@ -645,6 +657,8 @@ fn subscribed_replacements_that_close_before_events_exhaust_the_reconnect_budget
         direct_attached::MAX_EVENT_RECONNECTS + 1,
         "the original subscribed stream plus exactly the bounded replacements succeed"
     );
+    dropping_streams.stop();
+    reconciliation.stop();
 }
 
 #[test]
