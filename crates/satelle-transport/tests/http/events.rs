@@ -212,13 +212,17 @@ async fn next_text(socket: &mut EventSocket) -> String {
     }
 }
 
-async fn expect_subscribed(socket: &mut EventSocket, host_identity: &str) {
+async fn expect_subscribed(
+    socket: &mut EventSocket,
+    host_identity: &str,
+) -> satelle_transport::SubscribedResponse {
     let message: WsServerControl =
         serde_json::from_str(&next_text(socket).await).expect("decode control acknowledgement");
     let WsServerControl::Subscribed(acknowledgement) = message else {
         panic!("expected subscribed acknowledgement");
     };
     assert_eq!(acknowledgement.host_identity(), host_identity);
+    acknowledgement
 }
 
 async fn wait_for_workers(running: &RunningServer) {
@@ -398,8 +402,29 @@ async fn event_socket_streams_only_post_subscription_commits_in_order() {
 }
 
 #[tokio::test]
-async fn event_socket_closes_on_unsupported_schema_and_revoked_credentials() {
+async fn event_socket_closes_on_invalid_control_or_revoked_credentials() {
     let running = RunningServer::start(ApiScopes::READ).await;
+    let mut binary = connect_events(&running).await;
+    binary
+        .send(Message::Binary(Vec::new().into()))
+        .await
+        .expect("send binary control frame");
+    let error: WsServerControl =
+        serde_json::from_str(&next_text(&mut binary).await).expect("decode invalid-request error");
+    assert!(matches!(
+        error,
+        WsServerControl::Error(error) if error.code().as_str() == "invalid-request"
+    ));
+    let close = binary
+        .next()
+        .await
+        .expect("receive binary control close")
+        .expect("decode binary control close");
+    assert!(matches!(
+        close,
+        Message::Close(Some(frame)) if frame.code == CloseCode::Policy && frame.reason == "invalid-request"
+    ));
+
     let mut unsupported = connect_events(&running).await;
     unsupported
         .send(Message::Text(
@@ -476,18 +501,31 @@ async fn event_socket_closes_on_unsupported_schema_and_revoked_credentials() {
 #[tokio::test]
 async fn replacing_event_subscriptions_filters_live_events_without_resetting_sequence() {
     let running = RunningServer::start(ApiScopes::CONTROL).await;
+    let prior = running
+        .mutation("/v1/sessions", "01890a5d-ac96-7b7c-8f89-37c3d0a66ea2")
+        .json(&satelle_transport::TurnRequest::new(
+            "PRIVATE_PRIOR_SCOPE_PROMPT",
+        ))
+        .send()
+        .await
+        .expect("admit prior Session")
+        .json::<SessionResponse>()
+        .await
+        .expect("decode prior Session");
+    wait_for_workers(&running).await;
+
     let mut socket = connect_events(&running).await;
     send_subscribe(
         &mut socket,
         vec![EventSubscription::Session {
-            session_id: satelle_core::SessionId::new(),
+            session_id: prior.session().session_id().clone(),
         }],
     )
     .await;
     expect_subscribed(&mut socket, &running.host_identity).await;
 
     let admitted = running
-        .mutation("/v1/sessions", "01890a5d-ac96-7b7c-8f89-37c3d0a66ea2")
+        .mutation("/v1/sessions", "01890a5d-ac96-7b7c-8f89-37c3d0a66ea3")
         .json(&satelle_transport::TurnRequest::new(
             "PRIVATE_FILTERED_PROMPT",
         ))
@@ -499,18 +537,29 @@ async fn replacing_event_subscriptions_filters_live_events_without_resetting_seq
         .expect("decode filtered Session");
     wait_for_workers(&running).await;
     assert!(
-        tokio::time::timeout(Duration::from_millis(100), socket.next())
+        tokio::time::timeout(Duration::from_millis(100), next_text(&mut socket))
             .await
             .is_err(),
         "a nonmatching Session scope must receive no event"
     );
 
-    send_subscribe(&mut socket, vec![EventSubscription::Host]).await;
-    expect_subscribed(&mut socket, &running.host_identity).await;
+    let replacement_request_id = RequestId::new();
+    let replacement = vec![EventSubscription::Session {
+        session_id: admitted.session().session_id().clone(),
+    }];
+    send_subscribe_with_id(
+        &mut socket,
+        replacement_request_id.clone(),
+        replacement.clone(),
+    )
+    .await;
+    let acknowledgement = expect_subscribed(&mut socket, &running.host_identity).await;
+    assert_eq!(acknowledgement.request_id(), &replacement_request_id);
+    assert_eq!(acknowledgement.subscriptions(), replacement);
     let follow_up = running
         .mutation(
             &format!("/v1/sessions/{}/turns", admitted.session().session_id()),
-            "01890a5d-ac96-7b7c-8f89-37c3d0a66ea3",
+            "01890a5d-ac96-7b7c-8f89-37c3d0a66ea4",
         )
         .json(&satelle_transport::TurnRequest::new(
             "PRIVATE_VISIBLE_PROMPT",
@@ -520,10 +569,83 @@ async fn replacing_event_subscriptions_filters_live_events_without_resetting_seq
         .expect("admit visible follow-up");
     assert_eq!(follow_up.status(), StatusCode::ACCEPTED);
 
-    let first: SatelleEvent =
-        serde_json::from_str(&next_text(&mut socket).await).expect("decode first matching event");
-    assert_eq!(first.seq(), 4);
-    assert_eq!(first.session_id(), Some(admitted.session().session_id()));
+    let mut events = Vec::new();
+    for _ in 0..3 {
+        events.push(
+            serde_json::from_str::<SatelleEvent>(&next_text(&mut socket).await)
+                .expect("decode matching event"),
+        );
+    }
+    assert_eq!(
+        events.iter().map(SatelleEvent::seq).collect::<Vec<_>>(),
+        [4, 5, 6]
+    );
+    assert!(
+        events
+            .iter()
+            .all(|event| event.session_id() == Some(admitted.session().session_id()))
+    );
+
+    let filtered_prior = running
+        .mutation(
+            &format!("/v1/sessions/{}/turns", prior.session().session_id()),
+            "01890a5d-ac96-7b7c-8f89-37c3d0a66ea5",
+        )
+        .json(&satelle_transport::TurnRequest::new(
+            "PRIVATE_REPLACED_SCOPE_PROMPT",
+        ))
+        .send()
+        .await
+        .expect("admit follow-up for replaced scope");
+    assert_eq!(filtered_prior.status(), StatusCode::ACCEPTED);
+    wait_for_workers(&running).await;
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), next_text(&mut socket))
+            .await
+            .is_err(),
+        "the replacement must discard the complete prior subscription set"
+    );
+
+    let overlap = vec![
+        EventSubscription::Host,
+        EventSubscription::Session {
+            session_id: admitted.session().session_id().clone(),
+        },
+    ];
+    send_subscribe(&mut socket, overlap).await;
+    expect_subscribed(&mut socket, &running.host_identity).await;
+    let overlap_follow_up = running
+        .mutation(
+            &format!("/v1/sessions/{}/turns", admitted.session().session_id()),
+            "01890a5d-ac96-7b7c-8f89-37c3d0a66ea6",
+        )
+        .json(&satelle_transport::TurnRequest::new(
+            "PRIVATE_OVERLAP_PROMPT",
+        ))
+        .send()
+        .await
+        .expect("admit overlapping-scope follow-up");
+    assert_eq!(overlap_follow_up.status(), StatusCode::ACCEPTED);
+    let mut overlap_events = Vec::new();
+    for _ in 0..3 {
+        overlap_events.push(
+            serde_json::from_str::<SatelleEvent>(&next_text(&mut socket).await)
+                .expect("decode overlapping-scope event"),
+        );
+    }
+    assert_eq!(
+        overlap_events
+            .iter()
+            .map(SatelleEvent::seq)
+            .collect::<Vec<_>>(),
+        [10, 11, 12]
+    );
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), next_text(&mut socket))
+            .await
+            .is_err(),
+        "overlapping scopes must not duplicate matching events"
+    );
 }
 
 #[tokio::test]

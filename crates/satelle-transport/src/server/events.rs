@@ -239,6 +239,34 @@ enum ConnectionEnd {
     },
 }
 
+struct AcknowledgedReplacement {
+    request_id: RequestId,
+    subscriptions: Vec<EventSubscription>,
+    live_events: LiveEventSubscription,
+}
+
+fn acknowledge_replacement(
+    outbound: &mpsc::Sender<OutboundFrame>,
+    host_identity: &str,
+    request: &SubscribeRequest,
+    live_events: LiveEventSubscription,
+) -> Result<AcknowledgedReplacement, QueueError> {
+    let acknowledgement = SubscribedResponse::new(
+        request.request_id().clone(),
+        host_identity.to_string(),
+        request.subscriptions().to_vec(),
+    );
+
+    // The fresh receiver stays owned here until its acknowledgement is in the
+    // FIFO outbound queue, so matching events cannot overtake the ack.
+    queue_json(outbound, &acknowledgement, None)?;
+    Ok(AcknowledgedReplacement {
+        request_id: request.request_id().clone(),
+        subscriptions: request.subscriptions().to_vec(),
+        live_events,
+    })
+}
+
 async fn controller_loop(
     mut stream: EventStream,
     outbound: mpsc::Sender<OutboundFrame>,
@@ -387,16 +415,16 @@ async fn controller_loop(
                                 };
                             }
                         };
-                        let acknowledgement = SubscribedResponse::new(
-                            request.request_id().clone(),
-                            state.host_identity.clone(),
-                            request.subscriptions().to_vec(),
-                        );
-                        match queue_json(&outbound, &acknowledgement, None) {
-                            Ok(()) => {
-                                active_request_id = request.request_id().clone();
-                                subscriptions = request.subscriptions().to_vec();
-                                live_events = Some(replacement);
+                        match acknowledge_replacement(
+                            &outbound,
+                            &state.host_identity,
+                            &request,
+                            replacement,
+                        ) {
+                            Ok(replacement) => {
+                                active_request_id = replacement.request_id;
+                                subscriptions = replacement.subscriptions;
+                                live_events = Some(replacement.live_events);
                             }
                             Err(QueueError::Full) => {
                                 record_slow_consumer(
@@ -750,6 +778,9 @@ fn shutdown_requested(shutdown: &tokio::sync::watch::Receiver<bool>) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::contract::WsServerControl;
+    use satelle_host::HostService;
+    use satelle_host::test_support::TestStateDir;
 
     #[test]
     fn a_receiver_created_after_shutdown_observes_the_current_value() {
@@ -758,6 +789,46 @@ mod tests {
         let late_receiver = shutdown.subscribe();
 
         assert!(shutdown_requested(&late_receiver));
+    }
+
+    #[test]
+    fn replacement_is_returned_only_after_its_exact_ack_is_queued() {
+        let state = TestStateDir::new().expect("temporary Host state");
+        let service = HostService::local_demo_for_tests_at(state.path())
+            .expect("construct deterministic Host service");
+        let request_id = RequestId::new();
+        let subscriptions = vec![EventSubscription::Host];
+        let request = SubscribeRequest::new(request_id.clone(), subscriptions.clone())
+            .expect("construct valid subscription replacement");
+        let live_events = service
+            .subscribe_live_events()
+            .expect("create fresh live receiver");
+        let (outbound, mut queued) = mpsc::channel(1);
+
+        let mut replacement =
+            acknowledge_replacement(&outbound, "host-test", &request, live_events)
+                .expect("queue replacement acknowledgement");
+
+        assert_eq!(replacement.request_id, request_id);
+        assert_eq!(replacement.subscriptions, subscriptions);
+        assert!(matches!(
+            replacement.live_events.try_recv(),
+            Err(LiveEventReceiveError::Empty)
+        ));
+        let OutboundFrame::Control(Message::Text(acknowledgement)) = queued
+            .try_recv()
+            .expect("acknowledgement is already queued")
+        else {
+            panic!("replacement must queue one text acknowledgement");
+        };
+        let acknowledgement = serde_json::from_str::<WsServerControl>(&acknowledgement)
+            .expect("decode queued acknowledgement");
+        let WsServerControl::Subscribed(acknowledgement) = acknowledgement else {
+            panic!("replacement must queue subscribed acknowledgement");
+        };
+        assert_eq!(acknowledgement.request_id(), &request_id);
+        assert_eq!(acknowledgement.host_identity(), "host-test");
+        assert_eq!(acknowledgement.subscriptions(), subscriptions);
     }
 
     #[tokio::test]

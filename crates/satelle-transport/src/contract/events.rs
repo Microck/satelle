@@ -186,8 +186,8 @@ impl WsCloseReason {
     }
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
-#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
 pub enum EventSubscription {
     Host,
     Session {
@@ -197,6 +197,38 @@ pub enum EventSubscription {
         session_id: SessionId,
         turn_id: TurnId,
     },
+}
+
+#[derive(Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+enum EventSubscriptionOwned {
+    Host {},
+    Session {
+        session_id: SessionId,
+    },
+    Turn {
+        session_id: SessionId,
+        turn_id: TurnId,
+    },
+}
+
+impl<'de> Deserialize<'de> for EventSubscription {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        Ok(match EventSubscriptionOwned::deserialize(deserializer)? {
+            EventSubscriptionOwned::Host {} => Self::Host,
+            EventSubscriptionOwned::Session { session_id } => Self::Session { session_id },
+            EventSubscriptionOwned::Turn {
+                session_id,
+                turn_id,
+            } => Self::Turn {
+                session_id,
+                turn_id,
+            },
+        })
+    }
 }
 
 impl EventSubscription {
@@ -447,48 +479,158 @@ fn validate_subscriptions(
 mod tests {
     use super::*;
 
+    fn session_subscription(index: usize) -> EventSubscription {
+        EventSubscription::Session {
+            session_id: SessionId::parse(&format!(
+                "rs_01890a5d-ac96-7b7c-8f89-37c3d0a66e{:02x}",
+                index
+            ))
+            .unwrap(),
+        }
+    }
+
     #[test]
-    fn subscribe_contract_is_closed_bounded_and_duplicate_free() {
+    fn subscribe_contract_has_one_exact_closed_wire_shape() {
+        let session_id = SessionId::parse("rs_01890a5d-ac96-7b7c-8f89-37c3d0a66e11").unwrap();
+        let turn_id = TurnId::parse("rt_01890a5d-ac96-7b7c-8f89-37c3d0a66e12").unwrap();
         let request = SubscribeRequest::new(
             RequestId::new(),
             vec![
                 EventSubscription::Host,
                 EventSubscription::Session {
-                    session_id: SessionId::parse("rs_01890a5d-ac96-7b7c-8f89-37c3d0a66e11")
-                        .unwrap(),
+                    session_id: session_id.clone(),
+                },
+                EventSubscription::Turn {
+                    session_id,
+                    turn_id,
                 },
             ],
         )
         .unwrap();
         let value = serde_json::to_value(&request).unwrap();
+        let mut keys = value.as_object().unwrap().keys().collect::<Vec<_>>();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            ["request_id", "schema_version", "subscriptions", "type"]
+        );
         assert_eq!(value["schema_version"], "satelle.ws.control.v1");
         assert_eq!(value["type"], "subscribe");
+        assert_eq!(
+            value["subscriptions"],
+            serde_json::json!([
+                {"kind": "host"},
+                {
+                    "kind": "session",
+                    "session_id": "rs_01890a5d-ac96-7b7c-8f89-37c3d0a66e11"
+                },
+                {
+                    "kind": "turn",
+                    "session_id": "rs_01890a5d-ac96-7b7c-8f89-37c3d0a66e11",
+                    "turn_id": "rt_01890a5d-ac96-7b7c-8f89-37c3d0a66e12"
+                }
+            ])
+        );
         assert_eq!(
             serde_json::from_value::<SubscribeRequest>(value.clone()).unwrap(),
             request
         );
+    }
 
+    #[test]
+    fn subscribe_contract_is_bounded_and_duplicate_free() {
+        let maximum = (0..MAX_EVENT_SUBSCRIPTIONS)
+            .map(session_subscription)
+            .collect::<Vec<_>>();
+        assert!(SubscribeRequest::new(RequestId::new(), maximum).is_ok());
+
+        let over_capacity = (0..=MAX_EVENT_SUBSCRIPTIONS)
+            .map(session_subscription)
+            .collect::<Vec<_>>();
+        assert!(SubscribeRequest::new(RequestId::new(), over_capacity).is_err());
+        assert!(SubscribeRequest::new(RequestId::new(), Vec::new()).is_err());
+        assert!(
+            SubscribeRequest::new(
+                RequestId::new(),
+                vec![EventSubscription::Host, EventSubscription::Host]
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn subscribe_contract_rejects_ambiguous_or_forbidden_control_shapes() {
+        let request_id = RequestId::new();
+        let valid = serde_json::json!({
+            "schema_version": "satelle.ws.control.v1",
+            "type": "subscribe",
+            "request_id": request_id,
+            "subscriptions": [{"kind": "host"}]
+        });
         for invalid in [
-            serde_json::json!({
-                "schema_version": "satelle.ws.control.v1",
-                "type": "subscribe",
-                "request_id": RequestId::new(),
-                "subscriptions": []
-            }),
-            serde_json::json!({
-                "schema_version": "satelle.ws.control.v1",
-                "type": "subscribe",
-                "request_id": RequestId::new(),
-                "subscriptions": [{"kind":"host"}, {"kind":"host"}]
-            }),
             {
-                let mut value = value.clone();
+                let mut value = valid.clone();
+                value["subscriptions"] = serde_json::json!([]);
+                value
+            },
+            {
+                let mut value = valid.clone();
+                value["subscriptions"] = serde_json::json!([{"kind": "host"}, {"kind": "host"}]);
+                value
+            },
+            {
+                let mut value = valid.clone();
                 value["authorization"] = serde_json::json!("Bearer forbidden");
+                value
+            },
+            {
+                let mut value = valid.clone();
+                value["schema_version"] = serde_json::json!("satelle.ws.control.v2");
+                value
+            },
+            {
+                let mut value = valid.clone();
+                value["type"] = serde_json::json!("unsubscribe");
+                value
+            },
+            {
+                let mut value = valid.clone();
+                value["subscriptions"] = serde_json::json!([{
+                    "kind": "session",
+                    "session_id": "session-not-canonical"
+                }]);
+                value
+            },
+            {
+                let mut value = valid.clone();
+                value["subscriptions"] = serde_json::json!([{
+                    "kind": "host",
+                    "session_id": "rs_01890a5d-ac96-7b7c-8f89-37c3d0a66e11"
+                }]);
                 value
             },
         ] {
             assert!(serde_json::from_value::<SubscribeRequest>(invalid).is_err());
         }
+
+        for forbidden_kind in ["operation", "log", "goal"] {
+            let mut invalid = valid.clone();
+            invalid["subscriptions"] = serde_json::json!([{"kind": forbidden_kind}]);
+            assert!(serde_json::from_value::<SubscribeRequest>(invalid).is_err());
+        }
+
+        let duplicate_top_level = format!(
+            r#"{{"schema_version":"satelle.ws.control.v1","type":"subscribe","request_id":"{}","request_id":"{}","subscriptions":[{{"kind":"host"}}]}}"#,
+            request_id.as_str(),
+            request_id.as_str()
+        );
+        assert!(serde_json::from_str::<SubscribeRequest>(&duplicate_top_level).is_err());
+
+        let duplicate_scope_field = format!(
+            r#"{{"schema_version":"satelle.ws.control.v1","type":"subscribe","request_id":"{}","subscriptions":[{{"kind":"session","session_id":"rs_01890a5d-ac96-7b7c-8f89-37c3d0a66e11","session_id":"rs_01890a5d-ac96-7b7c-8f89-37c3d0a66e11"}}]}}"#,
+            request_id.as_str()
+        );
+        assert!(serde_json::from_str::<SubscribeRequest>(&duplicate_scope_field).is_err());
     }
 
     #[test]
