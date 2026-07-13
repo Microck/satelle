@@ -184,11 +184,15 @@ impl RuntimeEngine {
         let turn_id = TurnId::new();
         let started_at = time::OffsetDateTime::now_utc();
         let host_identity = self.host_identity()?;
+        let execution_policy = readiness
+            .execution_policy()
+            .for_turn_mode(command.execution_mode);
         let initial = model::initial_session(
             session_id.clone(),
             turn_id.clone(),
             host_identity,
             &readiness,
+            execution_policy,
             started_at,
         )?;
         let context = model::admission(
@@ -207,7 +211,13 @@ impl RuntimeEngine {
             }
             outcome
         };
-        self.finish_admission(command.host, command.prompt, command.dispatch, outcome)
+        self.finish_admission(
+            command.host,
+            command.prompt,
+            command.execution_mode,
+            command.dispatch,
+            outcome,
+        )
     }
 
     fn steer(
@@ -224,6 +234,9 @@ impl RuntimeEngine {
         model::validate_follow_up_bindings(&existing, &readiness)?;
         let turn_id = TurnId::new();
         let started_at = model::monotonic_now(&existing);
+        let execution_policy = readiness
+            .execution_policy()
+            .for_turn_mode(command.execution_mode);
         let context = model::admission(
             IdempotentOperation::Steer,
             started_at,
@@ -237,7 +250,7 @@ impl RuntimeEngine {
                     &command.session_id,
                     existing.session_state_revision(),
                     turn_id.clone(),
-                    readiness.execution_policy().clone(),
+                    execution_policy,
                     started_at,
                     &context,
                 )
@@ -247,7 +260,13 @@ impl RuntimeEngine {
             }
             outcome
         };
-        self.finish_admission(LOCAL_DEMO_HOST, command.prompt, command.dispatch, outcome)
+        self.finish_admission(
+            LOCAL_DEMO_HOST,
+            command.prompt,
+            command.execution_mode,
+            command.dispatch,
+            outcome,
+        )
     }
 
     fn persist_readiness(&self, readiness: &AdapterReadiness) -> Result<(), SatelleError> {
@@ -266,6 +285,7 @@ impl RuntimeEngine {
         self: &Arc<Self>,
         host: &str,
         prompt: &str,
+        execution_mode: satelle_core::session::TurnExecutionMode,
         dispatch_preference: request::DispatchPreference,
         outcome: AdmissionOutcome,
     ) -> Result<RuntimeTurnOutcome, SatelleError> {
@@ -285,6 +305,7 @@ impl RuntimeEngine {
                 let plan = ExecutionPlan {
                     host: host.to_string(),
                     prompt: prompt.to_string(),
+                    execution_mode,
                     work,
                 };
                 match dispatch_preference {

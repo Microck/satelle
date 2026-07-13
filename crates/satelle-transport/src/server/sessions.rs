@@ -19,7 +19,8 @@ pub(super) async fn create_session(
     Extension(authority): Extension<MutationAuthority>,
     ApiJson(request): ApiJson<TurnRequest>,
 ) -> Response {
-    let intent = match TurnIntent::new(request.into_prompt()) {
+    let (prompt, execution_mode) = request.into_parts();
+    let intent = match TurnIntent::new(prompt, execution_mode) {
         Ok(intent) => intent,
         Err(_) => return invalid_turn_request(&state, &authorized),
     };
@@ -51,7 +52,8 @@ pub(super) async fn create_turn(
     SessionPath(session_id): SessionPath,
     ApiJson(request): ApiJson<TurnRequest>,
 ) -> Response {
-    let intent = match TurnIntent::new(request.into_prompt()) {
+    let (prompt, execution_mode) = request.into_parts();
+    let intent = match TurnIntent::new(prompt, execution_mode) {
         Ok(intent) => intent,
         Err(_) => return invalid_turn_request(&state, &authorized),
     };

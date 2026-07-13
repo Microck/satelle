@@ -731,11 +731,11 @@
 - every Host Daemon JSON response and error declares one Satelle API schema version @spec @mvp @implemented
 - satelle rejects unsupported API schema versions before executing an operation @spec @mvp @implemented
 - satelle rejects incompatible CLI and Host Daemon protocol versions before executing a mutating request @spec @contract @mvp @implemented
-- authenticated Host Daemon mutations require exactly one Satelle-Protocol-Version header whose value is a canonical unsigned decimal without leading zeroes, and MVP supports only value 1 @spec @contract @mvp @implemented
+- authenticated Host Daemon mutations require exactly one Satelle-Protocol-Version header whose value is a canonical unsigned decimal without leading zeroes, and MVP supports only value 2 @spec @contract @mvp @implemented
 - protocol compatibility is checked after authentication, control-scope authorization, request correlation, and Host Identity pinning but before mutation query or cookie validation, control rate limiting, idempotency validation, request-body decoding, or Host calls @spec @contract @mvp @implemented
 - missing, malformed, duplicate, and unsupported Satelle-Protocol-Version values return HTTP 426 with code incompatible-protocol, category compatibility, retryable false, and schema_version satelle.error.v1 @spec @contract @mvp @implemented
-- incompatible-protocol details contain exactly reason, supported_versions, and received_version; reason is missing, malformed, duplicate, or unsupported, supported_versions is ["1"], received_version is the validated canonical unsupported token or null, and arbitrary header bytes are never reflected @spec @contract @mvp @implemented
-- DaemonClient sends Satelle-Protocol-Version 1 on every mutating request and does not require the header for authenticated reads used to diagnose or recover version skew @spec @contract @mvp @implemented
+- incompatible-protocol details contain exactly reason, supported_versions, and received_version; reason is missing, malformed, duplicate, or unsupported, supported_versions is ["2"], received_version is the validated canonical unsupported token or null, and arbitrary header bytes are never reflected @spec @contract @mvp @implemented
+- DaemonClient sends Satelle-Protocol-Version 2 on every mutating request and does not require the header for authenticated reads used to diagnose or recover version skew @spec @contract @mvp @implemented
 - POST /v1/sessions, POST /v1/sessions/{session_id}/turns, and POST /v1/sessions/{session_id}/stop enforce protocol compatibility, and future POST /v1/setup and POST /v1/doctor routes use the same mutation gate when implemented @spec @contract @mvp @implemented
 - satelle API JSON decoding rejects unknown fields instead of ignoring misspelled security, authority, or execution-policy fields @spec @mvp @implemented
 - satelle API endpoints reject unsupported content types before reading operation data @spec @mvp @implemented
@@ -746,7 +746,7 @@
 - Satelle Session, diagnostic, setup, and secret-provisioning responses include Cache-Control: no-store @spec @mvp @implemented
 - Host Daemon shutdown stops accepting new HTTP connections, drains in-flight HTTP requests for a finite configured grace period that defaults to 5 seconds, and returns a typed shutdown-timeout result after aborting the serving task when the grace period expires @spec @contract @mvp @implemented
 - satelle Host Daemon does not enable cross-origin browser access by default @spec @mvp @implemented
-- satelle Host Daemon v1 JSON request bodies use the exact schema_version token satelle.api.v1 @spec @contract @mvp @implemented
+- satelle Host Daemon Turn request bodies use the exact schema_version token satelle.api.v2 while unchanged stop request bodies use satelle.api.v1 @spec @contract @mvp @implemented
 - authenticated Host Daemon requests use Satelle-Request-Id for caller-supplied UUIDv7 correlation and Satelle-Expected-Host-Identity for Host pinning; neither header grants authority or idempotency @spec @contract @mvp @implemented
 - authenticated Host Daemon HTTP requests without Satelle-Request-Id receive a generated canonical UUIDv7 except GET /v1/events, whose WebSocket upgrade contract requires a caller-supplied Satelle-Request-Id; malformed or duplicate supplied request-id headers are rejected @spec @contract @mvp @implemented
 - satelle Host Daemon MVP uses GET /v1/live, GET /v1/capabilities, GET /v1/host/status, GET /v1/host/desktop-sessions, POST /v1/setup, POST /v1/doctor, POST /v1/sessions, POST /v1/sessions/{session_id}/turns, GET /v1/sessions/{session_id}, POST /v1/sessions/{session_id}/stop, GET /v1/logs, and GET /v1/events as its canonical route set and exposes no run, steer, blocking-run, SSE, or HTTP logs-follow aliases @spec @contract @mvp
@@ -1272,7 +1272,7 @@
 - public Session responses include session_state_revision and public Turn responses include turn_state_revision @spec @contract @mvp
 - lifecycle Satelle Events include state_subject plus the corresponding session_state_revision or turn_state_revision, and Turn lifecycle events may include both revisions when one commit mutates both records @spec @contract @mvp
 - the Host Daemon passes the committed Turn Execution Policy to the Codex adapter before Turn start @spec @mvp
-- the Codex adapter never infers YOLO, provider, model, timeout, or desktop target from CLI presentation fields @spec @mvp
+- the Codex adapter never infers YOLO, provider, model, timeout, or desktop target from CLI presentation fields @spec @mvp @implemented
 
 ## admission-and-leases
 - the Host Daemon acquires the selected Control Lease and creates the starting Turn in one SQLite transaction @spec @mvp
@@ -1719,12 +1719,12 @@
 - an unanswered relayed action request expires after 5 minutes or when its Turn becomes terminal, whichever occurs first, and Satelle sends deny when the upstream callback remains available @spec @later
 - --relay-native-actions is mutually exclusive with YOLO mode, reports a typed native-action-policy-conflict for that combination, and is never implied by --yes @spec @later
 - satelle run and steer support an explicit YOLO option for users who want Codex-controlled approvals to be auto-accepted @implemented @mvp
-- satelle YOLO mode is disabled by default and must be selected by a command option, user-level configuration policy, or user-level profile policy @spec @mvp
+- satelle YOLO mode is disabled by default and must be selected by a command option, user-level configuration policy, or user-level profile policy @spec @mvp @implemented
 - satelle YOLO mode does not ask for an additional Satelle confirmation prompt after the user explicitly selects the mode @spec @mvp
-- satelle YOLO mode starts or updates the Codex thread with approval policy never and sandbox danger-full-access when the compatible app-server protocol supports those settings @spec @mvp
-- satelle YOLO mode auto-accepts documented Codex app-server approval callbacks that Satelle receives and can answer with an accept decision @spec @mvp
+- satelle YOLO mode starts or updates the Codex thread with approval policy never and sandbox danger-full-access when the compatible app-server protocol supports those settings @spec @mvp @implemented
+- satelle YOLO mode auto-accepts documented Codex app-server approval callbacks that Satelle receives and can answer with an accept decision @spec @mvp @implemented
 - satelle YOLO mode does not bypass host authentication, transport security, host readiness, native Computer Use readiness, or unsupported-platform checks @spec @mvp
-- satelle YOLO mode does not grant operating-system privacy permissions, approve administrator authentication, approve security prompts, unlock machines, or click through Codex app UI permission prompts that are not exposed as supported app-server approval callbacks @spec @mvp
+- satelle YOLO mode does not grant operating-system privacy permissions, approve administrator authentication, approve security prompts, unlock machines, or click through Codex app UI permission prompts that are not exposed as supported app-server approval callbacks @spec @mvp @implemented
 - satelle reports a typed yolo-not-supported error when the remote Codex control plane cannot honor the requested YOLO approval and sandbox behavior @spec @mvp
 - satelle reports a typed yolo-blocked-by-native-approval error when native Computer Use blocks on a non-bypassable OS, app, or sensitive-action approval while YOLO mode is active @spec @mvp
 

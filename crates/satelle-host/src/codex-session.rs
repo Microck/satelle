@@ -1,10 +1,13 @@
 use satelle_core::session::StopObservation;
+use satelle_core::session::TurnExecutionMode;
 use serde_json::{Map, Value, json};
 use std::path::Path;
 use std::process::Command;
 use std::sync::{Arc, Mutex, mpsc};
 use std::time::{Duration, Instant};
 
+#[path = "codex-approval.rs"]
+mod codex_approval;
 #[path = "codex-process.rs"]
 mod codex_process;
 #[path = "codex-turn-read.rs"]
@@ -76,12 +79,21 @@ pub(crate) struct CodexSessionRequest<'a> {
     pub(crate) existing_thread_ref: Option<&'a str>,
     pub(crate) model: &'a str,
     pub(crate) model_provider: &'a str,
+    pub(crate) execution_mode: TurnExecutionMode,
     pub(crate) approval_policy: CodexApprovalPolicy,
     pub(crate) sandbox_policy: CodexSandboxPolicy,
     pub(crate) deadline: Instant,
     pub(crate) persist_thread_ref: &'a mut dyn FnMut(&str) -> Result<(), ()>,
     pub(crate) persist_turn_ref: &'a mut dyn FnMut(&str) -> Result<(), ()>,
     pub(crate) control: Option<CodexSessionControl>,
+}
+
+impl CodexSessionRequest<'_> {
+    const fn auto_approves_callbacks(&self) -> bool {
+        matches!(self.execution_mode, TurnExecutionMode::Yolo)
+            && matches!(self.approval_policy, CodexApprovalPolicy::Never)
+            && matches!(self.sandbox_policy, CodexSandboxPolicy::DangerFullAccess)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -480,24 +492,23 @@ impl<'a> SessionExchange<'a> {
             .ok_or(CodexSessionError::MalformedMessage)?
             .clone();
         let method = required_string(object, "method")?;
-        if matches!(
+        let auto_approve = self.request.auto_approves_callbacks();
+        if let Some(result) = codex_approval::approval_result(
             method,
-            "item/commandExecution/requestApproval"
-                | "item/fileChange/requestApproval"
-                | "item/tool/requestUserInput"
-                | "item/permissions/requestApproval"
-                | "item/tool/call"
-        ) {
-            self.validate_server_request_correlation(required_object(object, "params")?)?;
+            object,
+            auto_approve,
+            self.thread_ref.as_deref(),
+            self.turn_ref.as_deref(),
+        )? {
+            return Ok(json!({"id": id, "result": result}));
+        }
+        if matches!(method, "item/tool/requestUserInput" | "item/tool/call") {
+            let params = required_object(object, "params")?;
+            self.validate_server_request_correlation(params)?;
         }
         let result = match method {
-            "item/commandExecution/requestApproval" | "item/fileChange/requestApproval" => {
-                json!({"decision": "decline"})
-            }
-            "item/permissions/requestApproval" => json!({"permissions": {}}),
             "mcpServer/elicitation/request" => json!({"action": "decline"}),
             "item/tool/call" => json!({"contentItems": [], "success": false}),
-            "applyPatchApproval" | "execCommandApproval" => json!({"decision": "denied"}),
             _ => {
                 return Ok(json!({
                     "id": id,

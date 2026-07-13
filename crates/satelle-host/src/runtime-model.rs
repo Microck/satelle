@@ -6,7 +6,9 @@ use crate::storage::{
     LogEvent, LogSeverity, LogSource, PrivateRequestToken, RecoverySubject, StorageError,
     StorageErrorKind, StoredLogRecord,
 };
-use satelle_core::session::{ExpectedRevisions, RetainedOwnership, Session, TurnState};
+use satelle_core::session::{
+    ExecutionPolicy, ExpectedRevisions, RetainedOwnership, Session, TurnState,
+};
 use satelle_core::{
     ErrorCode, LOCAL_DEMO_HOST, LogEntry, SatelleError, SatelleEvent, SessionId, SessionRecord,
     StopResult, TurnId, TurnRecord, TurnStatus,
@@ -20,6 +22,7 @@ pub(super) fn initial_session(
     turn_id: TurnId,
     host_identity: satelle_core::session::HostIdentityRef,
     readiness: &AdapterReadiness,
+    execution_policy: ExecutionPolicy,
     started_at: OffsetDateTime,
 ) -> Result<Session, SatelleError> {
     Session::start(
@@ -27,7 +30,7 @@ pub(super) fn initial_session(
         host_identity,
         readiness.desktop_binding().clone(),
         turn_id,
-        readiness.execution_policy().clone(),
+        execution_policy,
         started_at,
     )
     .map_err(|_| runtime_failure("the Session could not be initialized"))

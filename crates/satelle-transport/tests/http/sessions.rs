@@ -1,7 +1,7 @@
 use super::*;
 use reqwest::Method;
 use satelle_core::StopResultOutcome;
-use satelle_core::session::SessionActivity;
+use satelle_core::session::{SessionActivity, TurnExecutionMode};
 use satelle_transport::{SessionResponse, StopRequest, StopResponse, TurnRequest};
 
 const CREATE_KEY: &str = "01890a5d-ac96-7b7c-8f89-37c3d0a66f01";
@@ -122,6 +122,22 @@ async fn mutation_replays_preserve_operation_boundaries_and_reject_digest_drift(
     let error: ApiError = serde_json::from_slice(&conflict_bytes).expect("decode conflict");
     assert_eq!(error.code().as_str(), "idempotency-key-conflict");
     assert!(!String::from_utf8_lossy(&conflict_bytes).contains(changed_prompt));
+
+    let mode_conflict = running
+        .mutation("/v1/sessions", CREATE_KEY)
+        .json(
+            &TurnRequest::new("PRIVATE_REPLAY_PROMPT_CANARY")
+                .with_execution_mode(TurnExecutionMode::Yolo),
+        )
+        .send()
+        .await
+        .expect("send changed-mode replay");
+    assert_eq!(mode_conflict.status(), StatusCode::CONFLICT);
+    let error: ApiError = mode_conflict
+        .json()
+        .await
+        .expect("decode changed-mode conflict");
+    assert_eq!(error.code().as_str(), "idempotency-key-conflict");
 
     // The original create replay stays at its one-Turn operation boundary even
     // after a later follow-up mutates the current Session.
@@ -488,7 +504,7 @@ async fn mutation_validation_fails_before_execution_with_typed_errors() {
 
     let missing_key = running
         .protected_request(Method::POST, "/v1/sessions")
-        .header("Satelle-Protocol-Version", "1")
+        .header("Satelle-Protocol-Version", "2")
         .json(&TurnRequest::new("PRIVATE_MISSING_KEY_CANARY"))
         .send()
         .await
@@ -498,8 +514,9 @@ async fn mutation_validation_fails_before_execution_with_typed_errors() {
     let wrong_schema = running
         .mutation("/v1/sessions", CREATE_KEY)
         .json(&serde_json::json!({
-            "schema_version": "satelle.api.v2",
-            "prompt": "PRIVATE_WRONG_SCHEMA_CANARY"
+            "schema_version": "satelle.api.v1",
+            "prompt": "PRIVATE_WRONG_SCHEMA_CANARY",
+            "execution_mode": "standard"
         }))
         .send()
         .await
@@ -509,8 +526,9 @@ async fn mutation_validation_fails_before_execution_with_typed_errors() {
     let unknown_field = running
         .mutation("/v1/sessions", CREATE_KEY)
         .json(&serde_json::json!({
-            "schema_version": "satelle.api.v1",
+            "schema_version": "satelle.api.v2",
             "prompt": "PRIVATE_UNKNOWN_FIELD_CANARY",
+            "execution_mode": "standard",
             "attachments": []
         }))
         .send()
@@ -521,7 +539,9 @@ async fn mutation_validation_fails_before_execution_with_typed_errors() {
     let wrong_content_type = running
         .mutation("/v1/sessions", CREATE_KEY)
         .header("Content-Type", "text/plain")
-        .body(r#"{"schema_version":"satelle.api.v1","prompt":"private"}"#)
+        .body(
+            r#"{"schema_version":"satelle.api.v2","prompt":"private","execution_mode":"standard"}"#,
+        )
         .send()
         .await
         .expect("send wrong content type");
@@ -535,7 +555,7 @@ async fn mutation_validation_fails_before_execution_with_typed_errors() {
     let duplicate_prompt = running
         .mutation("/v1/sessions", "duplicate-json-field-key")
         .header("Content-Type", "application/json")
-        .body(r#"{"schema_version":"satelle.api.v1","prompt":"first","prompt":"second"}"#)
+        .body(r#"{"schema_version":"satelle.api.v2","prompt":"first","prompt":"second","execution_mode":"standard"}"#)
         .send()
         .await
         .expect("send duplicate JSON field");
@@ -681,7 +701,7 @@ fn protected_at(
         .header("Satelle-Expected-Host-Identity", host_identity)
         .header("Satelle-Request-Id", RequestId::new().to_string());
     if is_mutation {
-        request.header("Satelle-Protocol-Version", "1")
+        request.header("Satelle-Protocol-Version", "2")
     } else {
         request
     }

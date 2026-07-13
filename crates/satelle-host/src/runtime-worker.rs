@@ -2,7 +2,7 @@ use super::RuntimeTurnOutcome;
 use super::adapter::{AdapterSubject, ExecuteRequest, UpstreamReference};
 use super::{RuntimeEngine, model};
 use crate::storage::{ObservedUpstreamRef, RecoverySubject, StorageErrorKind};
-use satelle_core::session::{ExpectedRevisions, Session, TurnTransition};
+use satelle_core::session::{ExpectedRevisions, Session, TurnExecutionMode, TurnTransition};
 use satelle_core::{SatelleError, SessionId, TurnId};
 use std::sync::Arc;
 #[cfg(test)]
@@ -18,6 +18,7 @@ pub(super) struct TurnWork {
 pub(super) struct ExecutionPlan {
     pub(super) host: String,
     pub(super) prompt: String,
+    pub(super) execution_mode: TurnExecutionMode,
     pub(super) work: TurnWork,
 }
 
@@ -117,6 +118,7 @@ impl RuntimeEngine {
         let result = self.adapter.execute(ExecuteRequest::new(
             &plan.host,
             &plan.prompt,
+            plan.execution_mode,
             execution_policy,
             AdapterSubject::new(&plan.work.subject),
             &persist_upstream_ref,

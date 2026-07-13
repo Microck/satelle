@@ -1,10 +1,13 @@
 use super::{AuthenticatedResponseContract, RequestId, define_schema_token};
-use satelle_core::session::{PublicSession, SessionStateRevision, TurnState, TurnStateRevision};
+use satelle_core::session::{
+    PublicSession, SessionStateRevision, TurnExecutionMode, TurnState, TurnStateRevision,
+};
 use satelle_core::{SessionId, StopResult, StopResultOutcome, TurnId};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::fmt;
 
-define_schema_token!(ApiRequestSchema, "satelle.api.v1");
+define_schema_token!(TurnRequestSchema, "satelle.api.v2");
+define_schema_token!(StopRequestSchema, "satelle.api.v1");
 define_schema_token!(SessionSchema, "satelle.session.v1");
 define_schema_token!(SessionStopSchema, "satelle.session.stop.v1");
 
@@ -15,29 +18,40 @@ pub(crate) trait ApiRequestContract {
 #[derive(Clone, Deserialize, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct TurnRequest {
-    schema_version: ApiRequestSchema,
+    schema_version: TurnRequestSchema,
     prompt: String,
+    execution_mode: TurnExecutionMode,
 }
 
 impl TurnRequest {
     pub fn new(prompt: impl Into<String>) -> Self {
         Self {
-            schema_version: ApiRequestSchema,
+            schema_version: TurnRequestSchema,
             prompt: prompt.into(),
+            execution_mode: TurnExecutionMode::Standard,
         }
+    }
+
+    pub fn with_execution_mode(mut self, execution_mode: TurnExecutionMode) -> Self {
+        self.execution_mode = execution_mode;
+        self
     }
 
     pub fn prompt(&self) -> &str {
         &self.prompt
     }
 
-    pub(crate) fn into_prompt(self) -> String {
-        self.prompt
+    pub const fn execution_mode(&self) -> TurnExecutionMode {
+        self.execution_mode
+    }
+
+    pub(crate) fn into_parts(self) -> (String, TurnExecutionMode) {
+        (self.prompt, self.execution_mode)
     }
 }
 
 impl ApiRequestContract for TurnRequest {
-    const SCHEMA_VERSION: &'static str = ApiRequestSchema::TOKEN;
+    const SCHEMA_VERSION: &'static str = TurnRequestSchema::TOKEN;
 }
 
 impl fmt::Debug for TurnRequest {
@@ -45,6 +59,7 @@ impl fmt::Debug for TurnRequest {
         formatter
             .debug_struct("TurnRequest")
             .field("prompt_bytes", &self.prompt.len())
+            .field("execution_mode", &self.execution_mode)
             .finish_non_exhaustive()
     }
 }
@@ -52,13 +67,13 @@ impl fmt::Debug for TurnRequest {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct StopRequest {
-    schema_version: ApiRequestSchema,
+    schema_version: StopRequestSchema,
 }
 
 impl StopRequest {
     pub const fn new() -> Self {
         Self {
-            schema_version: ApiRequestSchema,
+            schema_version: StopRequestSchema,
         }
     }
 }
@@ -70,7 +85,7 @@ impl Default for StopRequest {
 }
 
 impl ApiRequestContract for StopRequest {
-    const SCHEMA_VERSION: &'static str = ApiRequestSchema::TOKEN;
+    const SCHEMA_VERSION: &'static str = StopRequestSchema::TOKEN;
 }
 
 /// Flat authenticated Session envelope. The lifecycle projection remains the
@@ -340,22 +355,46 @@ mod tests {
     }
 
     #[test]
-    fn request_contract_omits_unimplemented_policy_and_attachment_fields() {
+    fn request_contract_requires_an_explicit_closed_execution_mode() {
         let request = TurnRequest::new("private prompt");
         assert_eq!(
             serde_json::to_value(request).expect("serialize request"),
             serde_json::json!({
-                "schema_version": "satelle.api.v1",
-                "prompt": "private prompt"
+                "schema_version": "satelle.api.v2",
+                "prompt": "private prompt",
+                "execution_mode": "standard"
+            })
+        );
+        assert_eq!(
+            serde_json::to_value(
+                TurnRequest::new("private prompt").with_execution_mode(TurnExecutionMode::Yolo)
+            )
+            .expect("serialize YOLO request"),
+            serde_json::json!({
+                "schema_version": "satelle.api.v2",
+                "prompt": "private prompt",
+                "execution_mode": "yolo"
             })
         );
         assert!(
             serde_json::from_value::<TurnRequest>(serde_json::json!({
-                "schema_version": "satelle.api.v1",
+                "schema_version": "satelle.api.v2",
+                "prompt": "private prompt"
+            }))
+            .is_err()
+        );
+        assert!(
+            serde_json::from_value::<TurnRequest>(serde_json::json!({
+                "schema_version": "satelle.api.v2",
                 "prompt": "private prompt",
+                "execution_mode": "standard",
                 "attachments": []
             }))
             .is_err()
+        );
+        assert_eq!(
+            serde_json::to_value(StopRequest::new()).expect("serialize stop request"),
+            serde_json::json!({"schema_version": "satelle.api.v1"})
         );
     }
 

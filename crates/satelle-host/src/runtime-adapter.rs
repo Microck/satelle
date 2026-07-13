@@ -456,6 +456,7 @@ impl<'a> AdapterSubject<'a> {
 pub struct ExecuteRequest<'a> {
     host: &'a str,
     prompt: &'a str,
+    execution_mode: satelle_core::session::TurnExecutionMode,
     execution_policy: &'a ExecutionPolicy,
     subject: AdapterSubject<'a>,
     persist_upstream_ref: &'a dyn Fn(UpstreamReference) -> Result<(), SatelleError>,
@@ -465,6 +466,7 @@ impl<'a> ExecuteRequest<'a> {
     pub(super) const fn new(
         host: &'a str,
         prompt: &'a str,
+        execution_mode: satelle_core::session::TurnExecutionMode,
         execution_policy: &'a ExecutionPolicy,
         subject: AdapterSubject<'a>,
         persist_upstream_ref: &'a dyn Fn(UpstreamReference) -> Result<(), SatelleError>,
@@ -472,6 +474,7 @@ impl<'a> ExecuteRequest<'a> {
         Self {
             host,
             prompt,
+            execution_mode,
             execution_policy,
             subject,
             persist_upstream_ref,
@@ -484,6 +487,10 @@ impl<'a> ExecuteRequest<'a> {
 
     pub const fn prompt(&self) -> &'a str {
         self.prompt
+    }
+
+    pub const fn execution_mode(&self) -> satelle_core::session::TurnExecutionMode {
+        self.execution_mode
     }
 
     pub const fn execution_policy(&self) -> &'a ExecutionPolicy {

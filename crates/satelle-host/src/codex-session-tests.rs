@@ -6,6 +6,9 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant};
 
+#[path = "codex-session-tests/approvals.rs"]
+mod approvals;
+
 const FIXTURE_SOURCE: &str = r##"
 use std::fs::OpenOptions;
 use std::io::{BufRead, Write};
@@ -134,17 +137,37 @@ fn main() {
         return;
     }
     if scenario == "server-requests" {
-        send(&mut output, &format!(r#"{{"id":"approval-1","method":"item/commandExecution/requestApproval","params":{{"threadId":"{thread_id}","turnId":"turn-1","itemId":"item-1","startedAtMs":1}}}}"#));
+        send(&mut output, &format!(r#"{{"id":"approval-1","method":"item/commandExecution/requestApproval","params":{{"threadId":"{thread_id}","turnId":"turn-1","itemId":"item-1","startedAtMs":1,"additionalPermissions":{{"fileSystem":{{"entries":[]}}}},"availableDecisions":["accept","decline"]}}}}"#));
         receive(&mut input, &log);
-        send(&mut output, &format!(r#"{{"id":"permissions-1","method":"item/permissions/requestApproval","params":{{"threadId":"{thread_id}","turnId":"turn-1"}}}}"#));
+        send(&mut output, &format!(r#"{{"id":"file-1","method":"item/fileChange/requestApproval","params":{{"threadId":"{thread_id}","turnId":"turn-1","itemId":"item-2","startedAtMs":2}}}}"#));
         receive(&mut input, &log);
-        send(&mut output, &format!(r#"{{"id":"input-1","method":"item/tool/requestUserInput","params":{{"threadId":"{thread_id}","turnId":"turn-1","itemId":"item-2","questions":[]}}}}"#));
+        send(&mut output, &format!(r#"{{"id":"permissions-1","method":"item/permissions/requestApproval","params":{{"threadId":"{thread_id}","turnId":"turn-1","itemId":"item-3","startedAtMs":3,"cwd":"/fixture","permissions":{{"fileSystem":{{"entries":[]}},"network":{{"enabled":true}}}}}}}}"#));
+        receive(&mut input, &log);
+        send(&mut output, &format!(r#"{{"id":"legacy-patch","method":"applyPatchApproval","params":{{"callId":"patch-1","conversationId":"{thread_id}","fileChanges":{{}}}}}}"#));
+        receive(&mut input, &log);
+        send(&mut output, &format!(r#"{{"id":"legacy-command","method":"execCommandApproval","params":{{"callId":"command-1","command":[],"conversationId":"{thread_id}","cwd":"/fixture","parsedCmd":[]}}}}"#));
+        receive(&mut input, &log);
+        send(&mut output, &format!(r#"{{"id":"input-1","method":"item/tool/requestUserInput","params":{{"threadId":"{thread_id}","turnId":"turn-1","itemId":"item-4","questions":[]}}}}"#));
+        receive(&mut input, &log);
+        send(&mut output, r#"{"id":"native-ui","method":"private/osPrivacy/requestApproval"}"#);
         receive(&mut input, &log);
         send(&mut output, r#"{"id":99,"method":"account/chatgptAuthTokens/refresh"}"#);
         receive(&mut input, &log);
     }
+    if scenario == "unsupported-permission" {
+        send(&mut output, &format!(r#"{{"id":"permissions-unsupported","method":"item/permissions/requestApproval","params":{{"threadId":"{thread_id}","turnId":"turn-1","itemId":"item-1","startedAtMs":1,"cwd":"/fixture","permissions":{{"osPrivacy":{{"screenRecording":true}}}}}}}}"#));
+        receive(&mut input, &log);
+    }
+    if scenario == "malformed-permission" {
+        send(&mut output, &format!(r#"{{"id":"permissions-malformed","method":"item/permissions/requestApproval","params":{{"threadId":"{thread_id}","turnId":"turn-1","itemId":"item-1","startedAtMs":1,"cwd":"/fixture","permissions":{{"network":"enabled"}}}}}}"#));
+        hang();
+    }
     if scenario == "server-request-conflict" {
         send(&mut output, r#"{"id":"approval-conflict","method":"item/fileChange/requestApproval","params":{"threadId":"thread-conflict","turnId":"turn-1","itemId":"item-1","startedAtMs":1}}"#);
+        hang();
+    }
+    if scenario == "legacy-server-request-conflict" {
+        send(&mut output, r#"{"id":"legacy-conflict","method":"execCommandApproval","params":{"callId":"command-1","command":[],"conversationId":"thread-conflict","cwd":"/fixture","parsedCmd":[]}}"#);
         hang();
     }
     if scenario == "unknown-canary" {
@@ -247,6 +270,39 @@ enum PersistFailure {
     Turn,
 }
 
+#[derive(Clone, Copy)]
+struct ScenarioExecution {
+    mode: TurnExecutionMode,
+    approval_policy: CodexApprovalPolicy,
+    sandbox_policy: CodexSandboxPolicy,
+}
+
+impl ScenarioExecution {
+    const STANDARD: Self = Self {
+        mode: TurnExecutionMode::Standard,
+        approval_policy: CodexApprovalPolicy::OnRequest,
+        sandbox_policy: CodexSandboxPolicy::WorkspaceWrite,
+    };
+
+    const YOLO: Self = Self {
+        mode: TurnExecutionMode::Yolo,
+        approval_policy: CodexApprovalPolicy::Never,
+        sandbox_policy: CodexSandboxPolicy::DangerFullAccess,
+    };
+
+    const fn new(
+        mode: TurnExecutionMode,
+        approval_policy: CodexApprovalPolicy,
+        sandbox_policy: CodexSandboxPolicy,
+    ) -> Self {
+        Self {
+            mode,
+            approval_policy,
+            sandbox_policy,
+        }
+    }
+}
+
 fn run_scenario(
     scenario: &str,
     existing_thread_ref: Option<&str>,
@@ -258,6 +314,7 @@ fn run_scenario(
         timeout,
         "perform the harmless action PRIVATE_PROMPT_CANARY",
         PersistFailure::None,
+        ScenarioExecution::STANDARD,
     )
 }
 
@@ -273,6 +330,18 @@ fn run_scenario_with_prompt(
         timeout,
         prompt,
         PersistFailure::None,
+        ScenarioExecution::STANDARD,
+    )
+}
+
+fn run_yolo_scenario(scenario: &str, timeout: Duration) -> ScenarioResult {
+    run_scenario_with_options(
+        scenario,
+        None,
+        timeout,
+        "perform the harmless action PRIVATE_PROMPT_CANARY",
+        PersistFailure::None,
+        ScenarioExecution::YOLO,
     )
 }
 
@@ -282,6 +351,7 @@ fn run_scenario_with_options(
     timeout: Duration,
     prompt: &str,
     persist_failure: PersistFailure,
+    execution: ScenarioExecution,
 ) -> ScenarioResult {
     let fixture = compile_fixture();
     let directory = tempfile::tempdir().expect("scenario directory");
@@ -326,8 +396,9 @@ fn run_scenario_with_options(
             existing_thread_ref,
             model: "gpt-fixture",
             model_provider: "fixture-provider",
-            approval_policy: CodexApprovalPolicy::OnRequest,
-            sandbox_policy: CodexSandboxPolicy::WorkspaceWrite,
+            execution_mode: execution.mode,
+            approval_policy: execution.approval_policy,
+            sandbox_policy: execution.sandbox_policy,
             deadline: Instant::now() + timeout,
             persist_thread_ref: &mut persist_thread,
             persist_turn_ref: &mut persist_turn,
@@ -489,6 +560,7 @@ fn live_interrupt_waits_for_the_durable_stop_acknowledgement() {
                 existing_thread_ref: None,
                 model: "gpt-fixture",
                 model_provider: "fixture-provider",
+                execution_mode: TurnExecutionMode::Standard,
                 approval_policy: CodexApprovalPolicy::OnRequest,
                 sandbox_policy: CodexSandboxPolicy::WorkspaceWrite,
                 deadline,
@@ -611,6 +683,7 @@ fn persistence_failure_stops_before_dependent_protocol_work() {
         Duration::from_secs(3),
         "PRIVATE_THREAD_PERSISTENCE_FAILURE_PROMPT",
         PersistFailure::Thread,
+        ScenarioExecution::STANDARD,
     );
     assert_eq!(thread_failure.result, Err(CodexSessionError::Persistence));
     assert!(!thread_failure.turn_dispatch_attempted);
@@ -624,6 +697,7 @@ fn persistence_failure_stops_before_dependent_protocol_work() {
         Duration::from_secs(3),
         "PRIVATE_TURN_PERSISTENCE_FAILURE_PROMPT",
         PersistFailure::Turn,
+        ScenarioExecution::STANDARD,
     );
     assert_eq!(turn_failure.result, Err(CodexSessionError::Persistence));
     assert!(turn_failure.turn_dispatch_attempted);
@@ -673,44 +747,6 @@ fn unknown_and_item_payloads_are_discarded_without_leaking_canaries() {
             .expect("retained protocol state serializes")
     );
     assert!(!retained.contains("PRIVATE_RAW_CANARY"));
-}
-
-#[test]
-fn server_requests_are_classified_correlated_and_declined_without_raw_payloads() {
-    let run = run_scenario("server-requests", None, Duration::from_secs(3));
-    assert_eq!(run.result, Ok(CodexSessionTerminal::Completed));
-    assert_eq!(run.requests.len(), 8);
-    assert_eq!(
-        run.requests[4],
-        json!({"id": "approval-1", "result": {"decision": "decline"}})
-    );
-    assert_eq!(
-        run.requests[5],
-        json!({"id": "permissions-1", "result": {"permissions": {}}})
-    );
-    assert_eq!(
-        run.requests[6],
-        json!({
-            "id": "input-1",
-            "error": {
-                "code": -32601,
-                "message": "server request is not supported by the Satelle adapter"
-            }
-        })
-    );
-    assert_eq!(
-        run.requests[7],
-        json!({
-            "id": 99,
-            "error": {
-                "code": -32601,
-                "message": "server request is not supported by the Satelle adapter"
-            }
-        })
-    );
-    let rendered = serde_json::to_string(&run.requests[4..]).unwrap();
-    assert!(!rendered.contains("questions"));
-    assert!(!rendered.contains("item-"));
 }
 
 #[test]

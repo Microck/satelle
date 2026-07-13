@@ -250,6 +250,18 @@ pub enum SandboxPolicy {
     DangerFullAccess,
 }
 
+/// Operator-selected execution posture for one Turn.
+///
+/// This is explicit request intent. Adapters must consume the resulting
+/// immutable `ExecutionPolicy` and never infer the mode from CLI output.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TurnExecutionMode {
+    #[default]
+    Standard,
+    Yolo,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum FeatureChoice {
     Disabled,
@@ -369,6 +381,24 @@ impl ExecutionPolicy {
 
     pub fn experimental_features(&self) -> ExperimentalFeatureChoices {
         self.experimental_features
+    }
+
+    /// Applies the operator's Turn mode without changing readiness-owned
+    /// model, provider, desktop, timeout, or experimental feature choices.
+    pub fn for_turn_mode(&self, mode: TurnExecutionMode) -> Self {
+        let (approval_policy, sandbox_policy) = match mode {
+            TurnExecutionMode::Standard => (self.approval_policy, self.sandbox_policy),
+            TurnExecutionMode::Yolo => (ApprovalPolicy::Never, SandboxPolicy::DangerFullAccess),
+        };
+        Self {
+            effective_model: self.effective_model.clone(),
+            provider_binding: self.provider_binding.clone(),
+            desktop_target: self.desktop_target.clone(),
+            approval_policy,
+            sandbox_policy,
+            timeout_policy: self.timeout_policy,
+            experimental_features: self.experimental_features,
+        }
     }
 }
 
@@ -1371,6 +1401,27 @@ mod tests {
             );
             assert_eq!(terminal, state.is_terminal());
         }
+    }
+
+    #[test]
+    fn turn_execution_mode_changes_only_approval_and_sandbox_policy() {
+        let standard = default_policy();
+        assert_eq!(
+            standard.for_turn_mode(TurnExecutionMode::Standard),
+            standard
+        );
+
+        let yolo = standard.for_turn_mode(TurnExecutionMode::Yolo);
+        assert_eq!(yolo.approval_policy(), ApprovalPolicy::Never);
+        assert_eq!(yolo.sandbox_policy(), SandboxPolicy::DangerFullAccess);
+        assert_eq!(yolo.effective_model(), standard.effective_model());
+        assert_eq!(yolo.provider_binding(), standard.provider_binding());
+        assert_eq!(yolo.desktop_target(), standard.desktop_target());
+        assert_eq!(yolo.timeout_policy(), standard.timeout_policy());
+        assert_eq!(
+            yolo.experimental_features(),
+            standard.experimental_features()
+        );
     }
 
     #[test]

@@ -6,7 +6,7 @@ use satelle_core::{
     read_owner_only_secret_file, read_trusted_ca_bundle_file,
 };
 use satelle_host::{ApiBearerToken, HostService, HostStatus, TurnOutcome};
-use satelle_transport::{ApiErrorCode, DaemonClient, DaemonClientError};
+use satelle_transport::{ApiErrorCode, DaemonClient, DaemonClientError, TurnRequest};
 
 #[cfg(feature = "test-support")]
 const TEST_SUPPORT_ADAPTER_ENV: &str = "SATELLE_TEST_SUPPORT_ADAPTER";
@@ -24,13 +24,17 @@ pub(crate) trait TransportClient {
     fn doctor(&self, scope: Option<&str>, refresh: bool) -> Result<DoctorReport, SatelleError>;
     fn host_status(&self) -> Result<HostStatus, SatelleError>;
     fn host_sessions(&self, no_bootstrap: bool) -> Result<HostSessionsReport, SatelleError>;
-    fn run(&self, prompt: &str) -> Result<TurnOutcome, SatelleError>;
-    fn run_detached(&self, prompt: &str) -> Result<SessionRecord, SatelleError>;
-    fn steer(&self, session_id: &SessionId, prompt: &str) -> Result<TurnOutcome, SatelleError>;
+    fn run(&self, request: &TurnRequest) -> Result<TurnOutcome, SatelleError>;
+    fn run_detached(&self, request: &TurnRequest) -> Result<SessionRecord, SatelleError>;
+    fn steer(
+        &self,
+        session_id: &SessionId,
+        request: &TurnRequest,
+    ) -> Result<TurnOutcome, SatelleError>;
     fn steer_detached(
         &self,
         session_id: &SessionId,
-        prompt: &str,
+        request: &TurnRequest,
     ) -> Result<SessionRecord, SatelleError>;
     fn status(&self, session_id: &SessionId) -> Result<SessionRecord, SatelleError>;
     fn stop(&self, session_id: &SessionId) -> Result<StopResult, SatelleError>;
@@ -77,24 +81,32 @@ impl TransportClient for LocalTransport {
         self.service.host_sessions(&self.alias, no_bootstrap)
     }
 
-    fn run(&self, prompt: &str) -> Result<TurnOutcome, SatelleError> {
-        self.service.run(&self.alias, prompt)
+    fn run(&self, request: &TurnRequest) -> Result<TurnOutcome, SatelleError> {
+        self.service
+            .run(&self.alias, request.prompt(), request.execution_mode())
     }
 
-    fn run_detached(&self, prompt: &str) -> Result<SessionRecord, SatelleError> {
-        self.service.run_detached(&self.alias, prompt)
+    fn run_detached(&self, request: &TurnRequest) -> Result<SessionRecord, SatelleError> {
+        self.service
+            .run_detached(&self.alias, request.prompt(), request.execution_mode())
     }
 
-    fn steer(&self, session_id: &SessionId, prompt: &str) -> Result<TurnOutcome, SatelleError> {
-        self.service.steer(session_id, prompt)
+    fn steer(
+        &self,
+        session_id: &SessionId,
+        request: &TurnRequest,
+    ) -> Result<TurnOutcome, SatelleError> {
+        self.service
+            .steer(session_id, request.prompt(), request.execution_mode())
     }
 
     fn steer_detached(
         &self,
         session_id: &SessionId,
-        prompt: &str,
+        request: &TurnRequest,
     ) -> Result<SessionRecord, SatelleError> {
-        self.service.steer_detached(session_id, prompt)
+        self.service
+            .steer_detached(session_id, request.prompt(), request.execution_mode())
     }
 
     fn status(&self, session_id: &SessionId) -> Result<SessionRecord, SatelleError> {
@@ -155,22 +167,26 @@ impl TransportClient for DirectTransport {
         Err(self.unsupported("host sessions"))
     }
 
-    fn run(&self, _prompt: &str) -> Result<TurnOutcome, SatelleError> {
+    fn run(&self, _request: &TurnRequest) -> Result<TurnOutcome, SatelleError> {
         Err(self.unsupported("run"))
     }
 
-    fn run_detached(&self, _prompt: &str) -> Result<SessionRecord, SatelleError> {
+    fn run_detached(&self, _request: &TurnRequest) -> Result<SessionRecord, SatelleError> {
         Err(self.unsupported("detached run"))
     }
 
-    fn steer(&self, _session_id: &SessionId, _prompt: &str) -> Result<TurnOutcome, SatelleError> {
+    fn steer(
+        &self,
+        _session_id: &SessionId,
+        _request: &TurnRequest,
+    ) -> Result<TurnOutcome, SatelleError> {
         Err(self.unsupported("steer"))
     }
 
     fn steer_detached(
         &self,
         _session_id: &SessionId,
-        _prompt: &str,
+        _request: &TurnRequest,
     ) -> Result<SessionRecord, SatelleError> {
         Err(self.unsupported("detached steer"))
     }
