@@ -4,6 +4,10 @@ use crate::contract::{
     PROTOCOL_VERSION, PROTOCOL_VERSION_HEADER, RequestId, SessionResponse, StopRequest,
     StopResponse, TurnRequest,
 };
+use crate::transport_tls::{
+    ReqwestTrustError, TlsFailureKind, classify_tls_error, configure_reqwest_trust,
+    find_error_in_tree,
+};
 use reqwest::blocking::{Client, RequestBuilder, Response};
 use reqwest::header::{AUTHORIZATION, HeaderValue};
 use reqwest::redirect::Policy;
@@ -66,22 +70,15 @@ impl DaemonClient {
         let expected_host_identity = binding.expected_host_identity().to_string();
         HeaderValue::from_str(&expected_host_identity)
             .map_err(|_| DaemonClientError::InvalidHostIdentityHeader)?;
-        let mut builder = Client::builder()
+        let builder = Client::builder()
             .redirect(Policy::none())
             .https_only(true)
             .min_tls_version(reqwest::tls::Version::TLS_1_2)
             .timeout(request_timeout);
-        if let Some(ca_bundle) = ca_bundle {
-            let certificates = reqwest::Certificate::from_pem_bundle(ca_bundle)
-                .map_err(DaemonClientError::InvalidCaBundle)?;
-            if certificates.is_empty() {
-                return Err(DaemonClientError::EmptyCaBundle);
-            }
-            // A Host-specific CA is a trust pin, not an addition to the
-            // platform roots. Otherwise an unrelated public or enterprise CA
-            // could authenticate the endpoint and receive the bearer token.
-            builder = builder.tls_certs_only(certificates);
-        }
+        let builder = configure_reqwest_trust(builder, ca_bundle).map_err(|error| match error {
+            ReqwestTrustError::InvalidCaBundle(error) => DaemonClientError::InvalidCaBundle(error),
+            ReqwestTrustError::EmptyCaBundle => DaemonClientError::EmptyCaBundle,
+        })?;
         let client = builder.build().map_err(DaemonClientError::Transport)?;
         Ok(Self {
             client,
@@ -331,84 +328,6 @@ fn classify_request_error(error: reqwest::Error) -> DaemonClientError {
         Some(TlsFailureKind::Handshake) => DaemonClientError::TlsHandshake(error),
         None => DaemonClientError::Transport(error),
     }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum TlsFailureKind {
-    CertificateUntrusted,
-    CertificateHostnameMismatch,
-    CertificateExpired,
-    VersionUnsupported,
-    Handshake,
-}
-
-fn classify_tls_error(error: &rustls::Error) -> TlsFailureKind {
-    use rustls::CertificateError;
-    match error {
-        rustls::Error::InvalidCertificate(
-            CertificateError::Expired | CertificateError::ExpiredContext { .. },
-        ) => TlsFailureKind::CertificateExpired,
-        rustls::Error::InvalidCertificate(
-            CertificateError::NotValidForName | CertificateError::NotValidForNameContext { .. },
-        ) => TlsFailureKind::CertificateHostnameMismatch,
-        rustls::Error::InvalidCertificate(CertificateError::Other(error)) => {
-            classify_platform_certificate_error(error)
-                .unwrap_or(TlsFailureKind::CertificateUntrusted)
-        }
-        rustls::Error::InvalidCertificate(_) | rustls::Error::NoCertificatesPresented => {
-            TlsFailureKind::CertificateUntrusted
-        }
-        rustls::Error::PeerIncompatible(
-            rustls::PeerIncompatible::ServerDoesNotSupportTls12Or13
-            | rustls::PeerIncompatible::ServerTlsVersionIsDisabledByOurConfig
-            | rustls::PeerIncompatible::Tls12NotOffered
-            | rustls::PeerIncompatible::Tls12NotOfferedOrEnabled,
-        )
-        | rustls::Error::InvalidMessage(rustls::InvalidMessage::UnknownProtocolVersion)
-        | rustls::Error::AlertReceived(rustls::AlertDescription::ProtocolVersion) => {
-            TlsFailureKind::VersionUnsupported
-        }
-        _ => TlsFailureKind::Handshake,
-    }
-}
-
-fn classify_platform_certificate_error(error: &rustls::OtherError) -> Option<TlsFailureKind> {
-    #[cfg(target_vendor = "apple")]
-    {
-        // rustls-platform-verifier 0.7 currently erases unhandled Apple
-        // certificate failures into OtherError, but retains the stable
-        // Security.framework OSStatus. Match only errSecCertificateExpired;
-        // every unknown native error still fails closed as untrusted.
-        if error.to_string().ends_with(": -67818") {
-            return Some(TlsFailureKind::CertificateExpired);
-        }
-    }
-    let _ = error;
-    None
-}
-
-fn find_error_in_tree<'error, E: std::error::Error + 'static>(
-    error: &'error (dyn std::error::Error + 'static),
-    remaining_depth: usize,
-) -> Option<&'error E> {
-    if let Some(found) = error.downcast_ref::<E>() {
-        return Some(found);
-    }
-    if remaining_depth == 0 {
-        return None;
-    }
-    // hyper-rustls can wrap the rustls error in nested io::Error values while
-    // exposing only the outer io::Error through Error::source(). Inspect the
-    // owned inner error as well so classification remains type-based.
-    if let Some(io_error) = error.downcast_ref::<std::io::Error>()
-        && let Some(inner) = io_error.get_ref()
-        && let Some(found) = find_error_in_tree::<E>(inner, remaining_depth - 1)
-    {
-        return Some(found);
-    }
-    error
-        .source()
-        .and_then(|source| find_error_in_tree::<E>(source, remaining_depth - 1))
 }
 
 fn decode_unpinned<T: DeserializeOwned>(
@@ -816,41 +735,6 @@ mod tests {
             "unexpected error: {error:?}"
         );
         server.join().expect("join TLS alert server");
-    }
-
-    #[test]
-    fn rustls_failures_map_to_the_stable_tls_error_contract() {
-        let cases = [
-            (
-                rustls::Error::InvalidCertificate(rustls::CertificateError::UnknownIssuer),
-                TlsFailureKind::CertificateUntrusted,
-            ),
-            (
-                rustls::Error::InvalidCertificate(rustls::CertificateError::NotValidForName),
-                TlsFailureKind::CertificateHostnameMismatch,
-            ),
-            (
-                rustls::Error::InvalidCertificate(rustls::CertificateError::Expired),
-                TlsFailureKind::CertificateExpired,
-            ),
-            (
-                rustls::Error::AlertReceived(rustls::AlertDescription::ProtocolVersion),
-                TlsFailureKind::VersionUnsupported,
-            ),
-        ];
-        for (error, expected) in cases {
-            assert_eq!(classify_tls_error(&error), expected);
-        }
-
-        #[cfg(target_vendor = "apple")]
-        assert_eq!(
-            classify_tls_error(&rustls::Error::InvalidCertificate(
-                rustls::CertificateError::Other(rustls::OtherError(Arc::new(
-                    std::io::Error::other("certificate is expired: -67818"),
-                ))),
-            )),
-            TlsFailureKind::CertificateExpired
-        );
     }
 
     fn spawn_handshake_tls_server() -> (std::net::SocketAddr, String, std::thread::JoinHandle<()>) {

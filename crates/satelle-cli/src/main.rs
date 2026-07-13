@@ -5,15 +5,16 @@ mod transport;
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use completions::{CompletionsCommand, run_completions};
 use output::{OutputArgs, OutputFormat, SessionResultSchemaVersion, StatusReport};
-use satelle_core::session::TurnExecutionMode;
+use satelle_core::session::{
+    PublicSession, PublicTurn, TurnAdmissionPhase, TurnExecutionMode, TurnState,
+};
 use satelle_core::{
     BEACON_CORAL, CLI_NAME, DaemonPathOverrides, DesktopSessionPreference, DoctorEventRecord,
-    DoctorReport, ERROR_RED, ErrorCode, HostConfig, HostSessionsReport, LOCAL_DEMO_HOST,
-    PRODUCT_NAME, ProfileField, RELAY_ROSE, ResolvedConfig, SUCCESS_GREEN, SatelleError, SessionId,
-    SessionRecord, SetupReport, SetupRequiredInput, TurnStatus, load_config, resolve_path_set,
-    utc_now,
+    DoctorReport, ERROR_RED, ErrorCode, EventSource, EventType, HostConfig, HostSessionsReport,
+    LOCAL_DEMO_HOST, PRODUCT_NAME, ProfileField, RELAY_ROSE, ResolvedConfig, SUCCESS_GREEN,
+    SatelleError, SatelleEvent, SatelleEventBody, SessionId, SetupReport, SetupRequiredInput,
+    load_config, resolve_path_set, utc_now,
 };
-use satelle_host::TurnOutcome;
 use satelle_transport::TurnRequest;
 use serde_json::json;
 use std::collections::BTreeMap;
@@ -22,7 +23,7 @@ use std::io::{self, IsTerminal, Read, Write};
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::str::FromStr;
-use transport::transport_for;
+use transport::{AttachedTurnOutcome, transport_for};
 
 const CONFIG_CHECK_SCHEMA_VERSION: &str = "satelle.config.check.v1";
 const CONFIG_EXPLAIN_SCHEMA_VERSION: &str = "satelle.config.explain.v1";
@@ -528,11 +529,21 @@ fn try_main() -> Result<(), CliFailure> {
         profile,
         command,
     } = Cli::parse();
+    let early_lifecycle_host = explicit_lifecycle_json_host(&command).map(str::to_owned);
     let (output_args, event_output) = command.output_request();
-    let error_json = output_args.requests_json();
-    let output = output_args
-        .resolve(event_output)
-        .map_err(|error| failure(error, error_json))?;
+    let error_json = output_args.requests_json() || event_output.requests_json_errors();
+    let output = match output_args.resolve(event_output) {
+        Ok(output) => output,
+        Err(error) => {
+            if let Some(host_alias) = early_lifecycle_host.as_deref() {
+                let mut event_output = TurnEventOutput::new(EffectiveEventMode::Json, false);
+                event_output
+                    .emit_command_failed(host_alias, &error, TurnAdmissionPhase::NotAdmitted, None)
+                    .map_err(|output_error| failure(output_error, error_json))?;
+            }
+            return Err(failure(error, error_json));
+        }
+    };
     let human_style = HumanStyle::detect(no_color);
     let config = ConfigContext {
         flag_profile: profile.as_deref(),
@@ -549,12 +560,24 @@ fn try_main() -> Result<(), CliFailure> {
         Command::Paths(command) => show_paths(command, output),
         Command::Host { command } => run_host(command, config, output),
         Command::SelfCtl { command } => run_self(command, output),
-        Command::Run(command) => run_prompt(command, config, output),
-        Command::Steer(command) => steer_prompt(command, config, output),
+        Command::Run(command) => run_prompt(command, config, output, error_json),
+        Command::Steer(command) => steer_prompt(command, config, output, error_json),
         Command::Status(command) => show_status(command, config, output),
         Command::Stop(command) => stop_session(command, config, output),
         Command::Logs(command) => show_logs(command, config, output),
         Command::Support { command } => run_support(command, output),
+    }
+}
+
+fn explicit_lifecycle_json_host(command: &Command) -> Option<&str> {
+    match command {
+        Command::Run(command) if !command.detach && command.events == EventMode::Json => {
+            command.host.as_deref().filter(|alias| !alias.is_empty())
+        }
+        Command::Steer(command) if !command.detach && command.events == EventMode::Json => {
+            command.host.as_deref().filter(|alias| !alias.is_empty())
+        }
+        _ => None,
     }
 }
 
@@ -1914,24 +1937,84 @@ fn run_support(command: SupportCommand, format: OutputFormat) -> Result<(), CliF
     }
 }
 
+fn report_not_admitted<T>(
+    event_output: &mut TurnEventOutput,
+    explicit_host_alias: Option<&str>,
+    operation: Result<T, CliFailure>,
+) -> Result<T, CliFailure> {
+    match operation {
+        Ok(value) => Ok(value),
+        Err(cli_failure) => {
+            if let Some(host_alias) = explicit_host_alias.filter(|alias| !alias.is_empty()) {
+                event_output
+                    .emit_command_failed(
+                        host_alias,
+                        &cli_failure.error,
+                        TurnAdmissionPhase::NotAdmitted,
+                        None,
+                    )
+                    .map_err(|error| failure(error, cli_failure.json))?;
+            }
+            Err(cli_failure)
+        }
+    }
+}
+
 fn run_prompt(
     command: RunCommand,
     config_context: ConfigContext<'_>,
     format: OutputFormat,
+    error_json: bool,
 ) -> Result<(), CliFailure> {
     let json = format.is_json();
-    validate_event_mode(command.detach, command.events, json)?;
+    validate_event_mode(command.detach, command.events, error_json)?;
+    let effective_mode = effective_event_mode(command.events, command.detach, command.quiet, json);
+    let mut event_output = TurnEventOutput::new(effective_mode, command.verbose);
     let _provider_computer_use_options = (
         command.experimental_provider_computer_use,
         command.refresh_provider_smoke_test,
     );
-    let prompt = read_prompt(command.prompt, command.prompt_file, json)?;
-    let config = config_context.load(json)?;
-    let host = config
-        .resolve_host(command.host.as_deref())
-        .map(SelectedHost::from)
-        .map_err(|error| failure(error, json))?;
-    let transport = transport_for(&host, format)?;
+    let explicit_host_alias = command.host.as_deref();
+    let prompt = report_not_admitted(
+        &mut event_output,
+        explicit_host_alias,
+        read_prompt(command.prompt, command.prompt_file, error_json),
+    )?;
+    let config = report_not_admitted(
+        &mut event_output,
+        explicit_host_alias,
+        config_context.load(error_json),
+    )?;
+    let host = report_not_admitted(
+        &mut event_output,
+        explicit_host_alias,
+        config
+            .resolve_host(explicit_host_alias)
+            .map(SelectedHost::from)
+            .map_err(|error| failure(error, error_json)),
+    )?;
+    let transport = match transport_for(&host, format).map_err(|failure| CliFailure {
+        error: failure.error,
+        json: error_json,
+    }) {
+        Ok(transport) => transport,
+        Err(transport_failure) => {
+            if !command.detach {
+                event_output
+                    .emit_preflight(&host.alias, "run", &host.config.transport)
+                    .map_err(|error| failure(error, error_json))?;
+                event_output
+                    .emit_command_failed(
+                        &host.alias,
+                        &transport_failure.error,
+                        TurnAdmissionPhase::NotAdmitted,
+                        None,
+                    )
+                    .map_err(|error| failure(error, error_json))?;
+            }
+            return Err(transport_failure);
+        }
+    };
     let effective_timeouts = effective_timeouts_json(&host.config);
     let yolo_policy = resolve_yolo_policy(
         &config,
@@ -1947,26 +2030,40 @@ fn run_prompt(
             .map_err(|error| failure(error, json))?;
         return print_detached_session(
             session,
+            &host.alias,
             effective_timeouts,
             &yolo_policy,
-            SessionResultSchemaVersion::RunV1,
+            SessionResultSchemaVersion::RunV2,
             json,
         );
     }
 
-    let outcome = transport
-        .run(&request)
-        .map_err(|error| failure(error, json))?;
-    print_turn_outcome(
+    event_output
+        .emit_preflight(&host.alias, "run", &host.config.transport)
+        .map_err(|error| failure(error, error_json))?;
+    let outcome = match transport.run(&request, &mut |event| event_output.emit(event)) {
+        Ok(outcome) => outcome,
+        Err(attached_failure) => {
+            event_output
+                .emit_command_failed(
+                    &host.alias,
+                    attached_failure.error(),
+                    attached_failure.phase(),
+                    attached_failure.durable_handles(),
+                )
+                .map_err(|error| failure(error, error_json))?;
+            return Err(failure(attached_failure.into_error(), error_json));
+        }
+    };
+    print_turn_session(
         outcome,
         TurnOutputOptions {
-            mode: command.events,
-            detach: command.detach,
+            effective_mode,
             quiet: command.quiet,
-            verbose: command.verbose,
+            host: &host.alias,
             effective_timeouts,
             yolo_policy: &yolo_policy,
-            schema_version: SessionResultSchemaVersion::RunV1,
+            schema_version: SessionResultSchemaVersion::RunV2,
             json,
         },
     )
@@ -1976,22 +2073,62 @@ fn steer_prompt(
     command: SteerCommand,
     config_context: ConfigContext<'_>,
     format: OutputFormat,
+    error_json: bool,
 ) -> Result<(), CliFailure> {
     let json = format.is_json();
-    validate_event_mode(command.detach, command.events, json)?;
+    validate_event_mode(command.detach, command.events, error_json)?;
+    let effective_mode = effective_event_mode(command.events, command.detach, command.quiet, json);
+    let mut event_output = TurnEventOutput::new(effective_mode, command.verbose);
     let _provider_computer_use_options = (
         command.experimental_provider_computer_use,
         command.refresh_provider_smoke_test,
     );
-    let prompt = read_prompt(command.prompt, command.prompt_file, json)?;
-    let session_id =
-        SessionId::from_str(&command.session_id).map_err(|error| failure(error.into(), json))?;
-    let config = config_context.load(json)?;
-    let host = config
-        .resolve_host(command.host.as_deref())
-        .map(SelectedHost::from)
-        .map_err(|error| failure(error, json))?;
-    let transport = transport_for(&host, format)?;
+    let explicit_host_alias = command.host.as_deref();
+    let prompt = report_not_admitted(
+        &mut event_output,
+        explicit_host_alias,
+        read_prompt(command.prompt, command.prompt_file, error_json),
+    )?;
+    let session_id = report_not_admitted(
+        &mut event_output,
+        explicit_host_alias,
+        SessionId::from_str(&command.session_id).map_err(|error| failure(error.into(), error_json)),
+    )?;
+    let config = report_not_admitted(
+        &mut event_output,
+        explicit_host_alias,
+        config_context.load(error_json),
+    )?;
+    let host = report_not_admitted(
+        &mut event_output,
+        explicit_host_alias,
+        config
+            .resolve_host(explicit_host_alias)
+            .map(SelectedHost::from)
+            .map_err(|error| failure(error, error_json)),
+    )?;
+    let transport = match transport_for(&host, format).map_err(|failure| CliFailure {
+        error: failure.error,
+        json: error_json,
+    }) {
+        Ok(transport) => transport,
+        Err(transport_failure) => {
+            if !command.detach {
+                event_output
+                    .emit_preflight(&host.alias, "steer", &host.config.transport)
+                    .map_err(|error| failure(error, error_json))?;
+                event_output
+                    .emit_command_failed(
+                        &host.alias,
+                        &transport_failure.error,
+                        TurnAdmissionPhase::NotAdmitted,
+                        None,
+                    )
+                    .map_err(|error| failure(error, error_json))?;
+            }
+            return Err(transport_failure);
+        }
+    };
     let effective_timeouts = effective_timeouts_json(&host.config);
     let yolo_policy = resolve_yolo_policy(
         &config,
@@ -2007,26 +2144,41 @@ fn steer_prompt(
             .map_err(|error| failure(error, json))?;
         return print_detached_session(
             session,
+            &host.alias,
             effective_timeouts,
             &yolo_policy,
-            SessionResultSchemaVersion::SteerV1,
+            SessionResultSchemaVersion::SteerV2,
             json,
         );
     }
 
-    let outcome = transport
-        .steer(&session_id, &request)
-        .map_err(|error| failure(error, json))?;
-    print_turn_outcome(
+    event_output
+        .emit_preflight(&host.alias, "steer", &host.config.transport)
+        .map_err(|error| failure(error, error_json))?;
+    let outcome =
+        match transport.steer(&session_id, &request, &mut |event| event_output.emit(event)) {
+            Ok(outcome) => outcome,
+            Err(attached_failure) => {
+                event_output
+                    .emit_command_failed(
+                        &host.alias,
+                        attached_failure.error(),
+                        attached_failure.phase(),
+                        attached_failure.durable_handles(),
+                    )
+                    .map_err(|error| failure(error, error_json))?;
+                return Err(failure(attached_failure.into_error(), error_json));
+            }
+        };
+    print_turn_session(
         outcome,
         TurnOutputOptions {
-            mode: command.events,
-            detach: command.detach,
+            effective_mode,
             quiet: command.quiet,
-            verbose: command.verbose,
+            host: &host.alias,
             effective_timeouts,
             yolo_policy: &yolo_policy,
-            schema_version: SessionResultSchemaVersion::SteerV1,
+            schema_version: SessionResultSchemaVersion::SteerV2,
             json,
         },
     )
@@ -2047,9 +2199,9 @@ fn show_status(
         .map_err(|error| failure(error, json))?;
 
     if json {
-        print_json(&StatusReport::new(&session)).map_err(|error| failure(error, json))
+        print_json(&StatusReport::new(&session, &host.alias)).map_err(|error| failure(error, json))
     } else {
-        print_session_human(&session);
+        print_session_human(&session, latest_turn(&session), &host.alias);
         Ok(())
     }
 }
@@ -2325,103 +2477,76 @@ fn read_prompt(
 }
 
 struct TurnOutputOptions<'a> {
-    mode: EventMode,
-    detach: bool,
+    effective_mode: EffectiveEventMode,
     quiet: bool,
-    verbose: bool,
+    host: &'a str,
     effective_timeouts: serde_json::Value,
     yolo_policy: &'a YoloPolicy,
     schema_version: SessionResultSchemaVersion,
     json: bool,
 }
 
-fn print_turn_outcome(
-    outcome: TurnOutcome,
+fn print_turn_session(
+    outcome: AttachedTurnOutcome,
     options: TurnOutputOptions<'_>,
 ) -> Result<(), CliFailure> {
-    let effective_mode =
-        effective_event_mode(options.mode, options.detach, options.quiet, options.json);
-    match effective_mode {
-        EffectiveEventMode::Json => {
-            for event in &outcome.events {
-                println!(
-                    "{}",
-                    serde_json::to_string(event).map_err(|error| failure(
-                        SatelleError::invalid_usage(error.to_string()),
-                        options.json
-                    ))?
-                );
-            }
-        }
-        EffectiveEventMode::Human => {
-            for event in &outcome.events {
-                if options.verbose {
-                    eprintln!(
-                        "{}: {} data={}",
-                        event.event_type(),
-                        event.message(),
-                        serde_json::to_string(event.data()).map_err(|error| failure(
-                            SatelleError::invalid_usage(error.to_string()),
-                            options.json
-                        ))?
-                    );
-                } else {
-                    eprintln!("{}: {}", event.event_type(), event.message());
-                }
-            }
-        }
-        EffectiveEventMode::None => {}
-    }
-
-    if effective_mode == EffectiveEventMode::Json {
+    let AttachedTurnOutcome { session, turn_id } = outcome;
+    let target_turn = session
+        .turns()
+        .iter()
+        .find(|turn| turn.turn_id() == &turn_id)
+        .expect("an attached Turn outcome retains its admitted target Turn");
+    if options.effective_mode == EffectiveEventMode::Json {
         return Ok(());
     }
 
     if options.json {
         print_json(&json!({
             "schema_version": options.schema_version,
-            "session_id": outcome.session.session_id,
-            "status": outcome.session.status,
+            "session_id": session.session_id(),
+            "status": target_turn.state(),
             "effective_timeouts": options.effective_timeouts,
             "yolo": yolo_state_json(options.yolo_policy),
-            "latest_turn": outcome.session.latest_turn(),
+            "latest_turn": target_turn,
         }))
         .map_err(|error| failure(error, options.json))
     } else {
         if options.yolo_policy.active && !options.quiet {
             println!("YOLO mode: active ({})", options.yolo_policy.source);
         }
-        print_session_human(&outcome.session);
+        print_session_human(&session, target_turn, options.host);
         Ok(())
     }
 }
 
 fn print_detached_session(
-    session: SessionRecord,
+    session: PublicSession,
+    host: &str,
     effective_timeouts: serde_json::Value,
     yolo_policy: &YoloPolicy,
     schema_version: SessionResultSchemaVersion,
     json: bool,
 ) -> Result<(), CliFailure> {
+    let latest_turn = latest_turn(&session);
     if json {
         print_json(&json!({
             "schema_version": schema_version,
-            "session_id": session.session_id,
-            "host": session.host,
-            "status": session.status,
-            "created_at": session.created_at,
-            "updated_at": session.updated_at,
+            "session_id": session.session_id(),
+            "host": host,
+            "status": latest_turn.state(),
+            "created_at": session.created_at().format(&Rfc3339).expect("a public Session timestamp is RFC 3339 representable"),
+            "updated_at": session.updated_at().format(&Rfc3339).expect("a public Session timestamp is RFC 3339 representable"),
             "effective_timeouts": effective_timeouts,
             "yolo": yolo_state_json(yolo_policy),
-            "turns": session.turns,
+            "turns": session.turns(),
         }))
         .map_err(|error| failure(error, json))
     } else {
         if yolo_policy.active {
             println!("YOLO mode: active ({})", yolo_policy.source);
         }
-        println!("Session: {}", session.session_id);
-        println!("Status: {}", status_label(&session.status));
+        println!("Session: {}", session.session_id());
+        println!("Status: {}", status_label(latest_turn.state()));
         Ok(())
     }
 }
@@ -2431,6 +2556,125 @@ enum EffectiveEventMode {
     Human,
     Json,
     None,
+}
+
+struct TurnEventOutput {
+    mode: EffectiveEventMode,
+    verbose: bool,
+    next_sequence: u64,
+}
+
+impl TurnEventOutput {
+    fn new(mode: EffectiveEventMode, verbose: bool) -> Self {
+        Self {
+            mode,
+            verbose,
+            next_sequence: 1,
+        }
+    }
+
+    fn emit_preflight(
+        &mut self,
+        host: &str,
+        operation: &str,
+        transport: &satelle_core::TransportKind,
+    ) -> Result<(), SatelleError> {
+        if self.mode == EffectiveEventMode::None {
+            return Ok(());
+        }
+        let body = SatelleEventBody::new(
+            EventType::Preflight,
+            EventSource::Cli,
+            OffsetDateTime::now_utc(),
+            host,
+            None,
+            "resolved configuration and selected Host transport",
+            json!({
+                "operation": operation,
+                "transport": transport,
+            }),
+        )
+        .map_err(|error| SatelleError::invalid_usage(error.to_string()))?;
+        self.emit_body(body)
+    }
+
+    fn emit(&mut self, event: SatelleEvent) -> Result<(), SatelleError> {
+        self.emit_body(event.into_body())
+    }
+
+    fn emit_command_failed(
+        &mut self,
+        host: &str,
+        error: &SatelleError,
+        admission_phase: TurnAdmissionPhase,
+        durable_handles: Option<(&SessionId, &satelle_core::TurnId)>,
+    ) -> Result<(), SatelleError> {
+        if self.mode != EffectiveEventMode::Json {
+            return Ok(());
+        }
+        let (session_id, turn_id) = durable_handles.unzip();
+        let body = SatelleEventBody::new(
+            EventType::CommandFailed,
+            EventSource::Cli,
+            OffsetDateTime::now_utc(),
+            host,
+            None,
+            error.message.clone(),
+            json!({
+                "code": error.code.as_str(),
+                "message": &error.message,
+                "recovery_command": &error.recovery_command,
+                "source_detail": &error.source_detail,
+                "details": &error.details,
+                "admission_phase": admission_phase.as_str(),
+                "session_id": session_id,
+                "turn_id": turn_id,
+            }),
+        )
+        .map_err(|error| SatelleError::invalid_usage(error.to_string()))?;
+        self.emit_body(body)
+    }
+
+    fn emit_body(&mut self, body: SatelleEventBody) -> Result<(), SatelleError> {
+        if self.mode == EffectiveEventMode::None {
+            return Ok(());
+        }
+        let sequence = self.next_sequence;
+        self.next_sequence = sequence
+            .checked_add(1)
+            .ok_or_else(|| SatelleError::invalid_usage("event output sequence is exhausted"))?;
+        let event = body
+            .with_seq(sequence)
+            .map_err(|error| SatelleError::invalid_usage(error.to_string()))?;
+        match self.mode {
+            EffectiveEventMode::Json => {
+                let mut stdout = io::stdout().lock();
+                serde_json::to_writer(&mut stdout, &event)
+                    .map_err(|error| SatelleError::invalid_usage(error.to_string()))?;
+                writeln!(stdout).map_err(event_output_error)?;
+                stdout.flush().map_err(event_output_error)
+            }
+            EffectiveEventMode::Human => {
+                if self.verbose {
+                    eprintln!(
+                        "{}: {} data={}",
+                        event.event_type(),
+                        event.message(),
+                        serde_json::to_string(event.data())
+                            .map_err(|error| SatelleError::invalid_usage(error.to_string()))?
+                    );
+                } else {
+                    eprintln!("{}: {}", event.event_type(), event.message());
+                }
+                Ok(())
+            }
+            EffectiveEventMode::None => Ok(()),
+        }
+    }
+}
+
+fn event_output_error(error: io::Error) -> SatelleError {
+    SatelleError::invalid_usage(format!("could not write event output: {error}"))
 }
 
 fn effective_event_mode(
@@ -2484,25 +2728,34 @@ fn print_setup_human(report: &SetupReport) {
     println!("Next: {}", report.next_command);
 }
 
-fn print_session_human(session: &SessionRecord) {
-    println!("Session: {}", session.session_id);
-    println!("Host: {}", session.host);
-    println!("Status: {}", status_label(&session.status));
-    println!("Turns: {}", session.turns.len());
-    if let Some(turn) = session.latest_turn() {
-        println!("Latest turn: {}", turn.turn_id);
-        println!("Latest status: {}", status_label(&turn.status));
-        println!("Summary: {}", turn.summary);
+fn print_session_human(session: &PublicSession, turn: &PublicTurn, host: &str) {
+    println!("Session: {}", session.session_id());
+    println!("Host: {host}");
+    println!("Status: {}", status_label(turn.state()));
+    println!("Turns: {}", session.turns().len());
+    println!("Latest turn: {}", turn.turn_id());
+    println!("Latest status: {}", status_label(turn.state()));
+    if let Some(summary) = turn.safe_summary() {
+        println!("Summary: {}", summary.as_str());
     }
 }
 
-fn status_label(status: &TurnStatus) -> &'static str {
+fn latest_turn(session: &PublicSession) -> &PublicTurn {
+    session
+        .turns()
+        .last()
+        .expect("validated public Sessions always contain Turn history")
+}
+
+fn status_label(status: TurnState) -> &'static str {
     match status {
-        TurnStatus::Started => "started",
-        TurnStatus::Completed => "completed",
-        TurnStatus::Blocked => "blocked",
-        TurnStatus::Failed => "failed",
-        TurnStatus::Stopped => "stopped",
+        TurnState::Starting => "starting",
+        TurnState::Running => "running",
+        TurnState::RecoveryPending => "recovery_pending",
+        TurnState::Completed => "completed",
+        TurnState::Blocked => "blocked",
+        TurnState::Failed => "failed",
+        TurnState::Stopped => "stopped",
     }
 }
 

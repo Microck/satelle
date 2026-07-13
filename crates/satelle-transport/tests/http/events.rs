@@ -527,6 +527,25 @@ async fn replacing_event_subscriptions_filters_live_events_without_resetting_seq
     .await;
     expect_subscribed(&mut socket, &running.host_identity).await;
 
+    let prior_follow_up = running
+        .mutation(
+            &format!("/v1/sessions/{}/turns", prior.session().session_id()),
+            "01890a5d-ac96-7b7c-8f89-37c3d0a66eb6",
+        )
+        .json(&satelle_transport::TurnRequest::new(
+            "PRIVATE_PRIOR_VISIBLE_PROMPT",
+        ))
+        .send()
+        .await
+        .expect("admit visible follow-up for prior scope");
+    assert_eq!(prior_follow_up.status(), StatusCode::ACCEPTED);
+    for expected_sequence in 1..=3 {
+        let event = serde_json::from_str::<SatelleEvent>(&next_text(&mut socket).await)
+            .expect("decode prior matching event");
+        assert_eq!(event.seq(), expected_sequence);
+        assert_eq!(event.session_id(), Some(prior.session().session_id()));
+    }
+
     let admitted = running
         .mutation("/v1/sessions", "01890a5d-ac96-7b7c-8f89-37c3d0a66ea3")
         .json(&satelle_transport::TurnRequest::new(
@@ -641,7 +660,7 @@ async fn replacing_event_subscriptions_filters_live_events_without_resetting_seq
             .iter()
             .map(SatelleEvent::seq)
             .collect::<Vec<_>>(),
-        [10, 11, 12]
+        [7, 8, 9]
     );
     assert!(
         tokio::time::timeout(Duration::from_millis(100), next_text(&mut socket))

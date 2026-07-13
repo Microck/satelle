@@ -1,6 +1,8 @@
 mod client;
 mod contract;
 mod server;
+#[path = "transport-tls.rs"]
+mod transport_tls;
 
 pub use client::{
     DaemonClient, DaemonClientError, DaemonEventClient, DaemonEventError, DaemonEventStream,

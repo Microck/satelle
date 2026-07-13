@@ -1,10 +1,11 @@
 use assert_cmd::Command;
 use predicates::prelude::*;
 use satelle_core::SessionId;
-use satelle_host::test_support::TestStateDir;
+use satelle_host::{ApiBearerToken, test_support::TestStateDir};
 use serde_json::Value;
 use std::collections::BTreeSet;
 use std::fs;
+use std::net::TcpListener;
 
 #[path = "support/test-file.rs"]
 mod test_file;
@@ -412,9 +413,7 @@ fn run_steer_and_status_share_a_local_demo_session() {
         .success()
         .stdout(predicate::str::contains(format!("Session: {session_id}")))
         .stdout(predicate::str::contains("Turns: 2"))
-        .stdout(predicate::str::contains(
-            "Summary: fake computer-use turn completed",
-        ))
+        .stdout(predicate::str::contains("Summary: task_completed"))
         .stdout(predicate::str::contains("Continue from the same session").not());
 }
 
@@ -477,6 +476,7 @@ fn runtime_surfaces_and_persisted_state_do_not_retain_prompts_or_upstream_ids() 
         .clone();
     assert_command_output_is_private(&run_output, &[&run_prompt, run_secret, run_upstream_id]);
     let run_report = parse_json_output(&run_output.stdout);
+    assert_eq!(run_report["schema_version"], "satelle.run.v2");
     let session = run_report["session_id"].as_str().unwrap().to_string();
 
     let steer_secret = "sk-satelle-steer-private-canary";
@@ -876,9 +876,10 @@ fn stopping_terminal_turn_preserves_history_and_allows_later_steer() {
         .get_output()
         .clone();
     let steered = parse_json_output(&steer_output.stdout);
+    assert_eq!(steered["schema_version"], "satelle.steer.v2");
     assert_eq!(steered["session_id"], session_id);
     assert_eq!(steered["status"], "completed");
-    assert_eq!(steered["latest_turn"]["status"], "completed");
+    assert_eq!(steered["latest_turn"]["state"], "completed");
 
     let status_output = satelle()
         .env("SATELLE_STATE_DIR", state.path())
@@ -888,9 +889,10 @@ fn stopping_terminal_turn_preserves_history_and_allows_later_steer() {
         .get_output()
         .clone();
     let status = parse_json_output(&status_output.stdout);
+    assert_eq!(status["schema_version"], "satelle.status.v2");
     assert_eq!(status["turns"].as_array().unwrap().len(), 2);
-    assert_eq!(status["turns"][0]["status"], "completed");
-    assert_eq!(status["turns"][1]["status"], "completed");
+    assert_eq!(status["turns"][0]["state"], "completed");
+    assert_eq!(status["turns"][1]["state"], "completed");
 }
 
 #[test]
@@ -958,7 +960,7 @@ fn stopping_detached_turn_returns_exact_stop_contract() {
     let status = parse_json_output(&status_output.stdout);
     assert_eq!(status["turns"].as_array().unwrap().len(), 1);
     assert_eq!(status["turns"][0]["turn_id"], turn_id);
-    assert_eq!(status["turns"][0]["status"], "stopped");
+    assert_eq!(status["turns"][0]["state"], "stopped");
 }
 
 #[test]
@@ -983,10 +985,7 @@ fn run_and_steer_accept_prompt_file_and_stdin_sources() {
         .clone();
     let run_report = parse_json_output(&output.stdout);
     let session = run_report["session_id"].as_str().unwrap().to_string();
-    assert_eq!(
-        run_report["latest_turn"]["summary"],
-        "fake computer-use turn completed"
-    );
+    assert_eq!(run_report["latest_turn"]["safe_summary"], "task_completed");
     assert_command_output_is_private(&output, &["Read this from a file"]);
 
     let steer_prompt_file = state.path().join("steer-prompt.txt");
@@ -1007,8 +1006,8 @@ fn run_and_steer_accept_prompt_file_and_stdin_sources() {
         .clone();
     let steer_report = parse_json_output(&output.stdout);
     assert_eq!(
-        steer_report["latest_turn"]["summary"],
-        "fake computer-use turn completed"
+        steer_report["latest_turn"]["safe_summary"],
+        "task_completed"
     );
     assert_command_output_is_private(&output, &["Continue from a file"]);
 
@@ -1022,8 +1021,8 @@ fn run_and_steer_accept_prompt_file_and_stdin_sources() {
         .clone();
     let stdin_report = parse_json_output(&output.stdout);
     assert_eq!(
-        stdin_report["latest_turn"]["summary"],
-        "fake computer-use turn completed"
+        stdin_report["latest_turn"]["safe_summary"],
+        "task_completed"
     );
     assert_command_output_is_private(&output, &["Read this from stdin"]);
 
@@ -1067,21 +1066,29 @@ fn events_json_emits_newline_delimited_satelle_events() {
         .map(|line| serde_json::from_str::<Value>(line).expect("event line should be JSON"))
         .collect::<Vec<_>>();
 
-    assert_eq!(events.len(), 5);
+    assert_eq!(events.len(), 6);
     assert_eq!(events[0]["type"], "preflight");
-    assert_eq!(events[4]["type"], "turn_completed");
-    let session_id = events[0]["session_id"].as_str().unwrap().to_string();
-    for event in &events {
-        assert_eq!(event["schema_version"], "satelle.events.v1");
+    assert_eq!(events[0]["source"], "cli");
+    assert!(events[0]["session_id"].is_null());
+    assert!(events[0]["turn_id"].is_null());
+    assert_eq!(events[5]["type"], "turn_completed");
+    let session_id = events[1]["session_id"].as_str().unwrap().to_string();
+    for (index, event) in events.iter().enumerate() {
+        assert_eq!(event["schema_version"], "satelle.events.v2");
         assert!(event.get("source").is_some());
         assert!(event.get("timestamp").is_some());
-        assert!(event.get("seq").is_some());
+        assert_eq!(event["seq"], u64::try_from(index + 1).unwrap());
         assert!(event.get("session_id").is_some());
         assert!(event.get("turn_id").is_some());
         assert_eq!(event["host"], "local-demo");
         assert!(event.get("message").is_some());
         assert!(event.get("data").is_some());
     }
+    assert!(
+        events[1..].iter().all(|event| {
+            event["session_id"] == session_id && event["turn_id"].as_str().is_some()
+        })
+    );
 
     let output = satelle()
         .env("SATELLE_STATE_DIR", state.path())
@@ -1097,10 +1104,245 @@ fn events_json_emits_newline_delimited_satelle_events() {
         .get_output()
         .clone();
     let steer_events = parse_json_lines(&output.stdout);
-    assert_eq!(steer_events.len(), 5);
+    assert_eq!(steer_events.len(), 6);
     assert_eq!(steer_events[0]["type"], "preflight");
-    assert_eq!(steer_events[4]["type"], "turn_completed");
-    assert_eq!(steer_events[4]["session_id"], session_id);
+    assert_eq!(steer_events[0]["source"], "cli");
+    assert_eq!(steer_events[5]["type"], "turn_completed");
+    assert_eq!(steer_events[5]["session_id"], session_id);
+    assert_eq!(
+        steer_events
+            .iter()
+            .map(|event| event["seq"].as_u64().unwrap())
+            .collect::<Vec<_>>(),
+        [1, 2, 3, 4, 5, 6]
+    );
+}
+
+#[test]
+fn events_json_ends_run_and_steer_with_command_failed_when_wss_cannot_connect() {
+    let state = state_dir();
+    let user_config = state.path().join("user-config.toml");
+    let token_file = state.path().join("satelle.token");
+    let token = ApiBearerToken::generate().expect("generate API token");
+    test_file::write_user_controlled(&token_file, token.expose().as_str())
+        .expect("write owner-only API token");
+
+    let closed_listener = TcpListener::bind("127.0.0.1:0").expect("bind temporary port");
+    let closed_address = closed_listener
+        .local_addr()
+        .expect("read temporary address");
+    drop(closed_listener);
+    let token_path = toml::Value::String(token_file.to_string_lossy().into_owned()).to_string();
+    write_user_config(
+        &user_config,
+        format!(
+            r#"
+default_host = "remote"
+
+[hosts.remote]
+transport = "direct"
+adapter = "codex"
+address = "https://{closed_address}"
+expected_host_id = "host-windows-11"
+api_token = {{ kind = "file", path = {token_path} }}
+"#,
+        ),
+    )
+    .expect("write direct Host config");
+
+    for arguments in [
+        vec![
+            "run".to_string(),
+            "--events".to_string(),
+            "json".to_string(),
+            "Open the browser".to_string(),
+        ],
+        vec![
+            "steer".to_string(),
+            SessionId::new().to_string(),
+            "--events".to_string(),
+            "json".to_string(),
+            "Continue".to_string(),
+        ],
+    ] {
+        let output = production_satelle()
+            .env("SATELLE_CONFIG_FILE", &user_config)
+            .env("SATELLE_STATE_DIR", state.path())
+            .args(arguments)
+            .assert()
+            .code(69)
+            .get_output()
+            .clone();
+        let events = parse_json_lines(&output.stdout);
+
+        assert_eq!(events.len(), 2, "stdout must contain no result JSON");
+        assert_eq!(events[0]["type"], "preflight");
+        let terminal = &events[1];
+        assert_eq!(terminal["schema_version"], "satelle.events.v2");
+        assert_eq!(terminal["type"], "command_failed");
+        assert_eq!(terminal["source"], "cli");
+        assert_eq!(terminal["host"], "remote");
+        assert!(terminal["session_id"].is_null());
+        assert!(terminal["turn_id"].is_null());
+        assert!(terminal["state_subject"].is_null());
+        assert_eq!(terminal["data"]["code"], "host-unreachable");
+        assert_eq!(terminal["data"]["admission_phase"], "not_admitted");
+        assert!(terminal["data"]["session_id"].is_null());
+        assert!(terminal["data"]["turn_id"].is_null());
+        assert_eq!(terminal["message"], terminal["data"]["message"]);
+        assert!(terminal["data"]["details"].is_object());
+        assert_exact_object_keys(
+            &terminal["data"],
+            &[
+                "admission_phase",
+                "code",
+                "details",
+                "message",
+                "recovery_command",
+                "session_id",
+                "source_detail",
+                "turn_id",
+            ],
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event["type"] == "command_failed")
+                .count(),
+            1
+        );
+    }
+}
+
+#[test]
+fn events_json_reports_an_explicit_unknown_host_as_not_admitted() {
+    let state = state_dir();
+
+    for arguments in [
+        vec![
+            "run".to_string(),
+            "--host".to_string(),
+            "unknown-host".to_string(),
+            "--events".to_string(),
+            "json".to_string(),
+            "Open the browser".to_string(),
+        ],
+        vec![
+            "steer".to_string(),
+            SessionId::new().to_string(),
+            "--host".to_string(),
+            "unknown-host".to_string(),
+            "--events".to_string(),
+            "json".to_string(),
+            "Continue".to_string(),
+        ],
+    ] {
+        let output = satelle()
+            .env("SATELLE_STATE_DIR", state.path())
+            .args(arguments)
+            .assert()
+            .failure()
+            .get_output()
+            .clone();
+        let events = parse_json_lines(&output.stdout);
+
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0]["type"], "command_failed");
+        assert_eq!(events[0]["schema_version"], "satelle.events.v2");
+        assert_eq!(events[0]["source"], "cli");
+        assert_eq!(events[0]["host"], "unknown-host");
+        assert_eq!(events[0]["data"]["code"], "host-not-found");
+        assert_eq!(events[0]["data"]["admission_phase"], "not_admitted");
+        assert!(events[0]["session_id"].is_null());
+        assert!(events[0]["turn_id"].is_null());
+        assert!(events[0]["state_subject"].is_null());
+        assert!(events[0]["data"]["session_id"].is_null());
+        assert!(events[0]["data"]["turn_id"].is_null());
+
+        let error = parse_json_output(&output.stderr);
+        assert_eq!(error["schema_version"], "satelle.error.v1");
+        assert_eq!(error["error"]["code"], "host-not-found");
+    }
+}
+
+#[test]
+fn events_json_reports_prompt_failure_when_explicit_host_is_already_known() {
+    let state = state_dir();
+    let missing_prompt = state.path().join("missing-prompt.txt");
+    let output = production_satelle()
+        .env("SATELLE_STATE_DIR", state.path())
+        .args([
+            "run",
+            "--host",
+            "selected-host",
+            "--events",
+            "json",
+            "--prompt-file",
+            missing_prompt.to_str().expect("test path should be UTF-8"),
+        ])
+        .assert()
+        .failure()
+        .get_output()
+        .clone();
+    let events = parse_json_lines(&output.stdout);
+
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0]["type"], "command_failed");
+    assert_eq!(events[0]["schema_version"], "satelle.events.v2");
+    assert_eq!(events[0]["host"], "selected-host");
+    assert_eq!(events[0]["data"]["code"], "input-required");
+    assert_eq!(events[0]["data"]["admission_phase"], "not_admitted");
+    assert!(events[0]["data"]["session_id"].is_null());
+    assert!(events[0]["data"]["turn_id"].is_null());
+}
+
+#[test]
+fn events_json_reports_output_conflict_when_explicit_host_is_already_known() {
+    for arguments in [
+        vec![
+            "run".to_string(),
+            "--host".to_string(),
+            "selected-host".to_string(),
+            "--events".to_string(),
+            "json".to_string(),
+            "--format".to_string(),
+            "human".to_string(),
+            "Open the browser".to_string(),
+        ],
+        vec![
+            "steer".to_string(),
+            SessionId::new().to_string(),
+            "--host".to_string(),
+            "selected-host".to_string(),
+            "--events".to_string(),
+            "json".to_string(),
+            "--format".to_string(),
+            "human".to_string(),
+            "Continue".to_string(),
+        ],
+    ] {
+        let output = satelle()
+            .args(arguments)
+            .assert()
+            .failure()
+            .get_output()
+            .clone();
+        let events = parse_json_lines(&output.stdout);
+
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0]["type"], "command_failed");
+        assert_eq!(events[0]["schema_version"], "satelle.events.v2");
+        assert_eq!(events[0]["host"], "selected-host");
+        assert_eq!(events[0]["data"]["code"], "output-mode-conflict");
+        assert_eq!(events[0]["data"]["admission_phase"], "not_admitted");
+        assert!(events[0]["session_id"].is_null());
+        assert!(events[0]["turn_id"].is_null());
+        assert!(events[0]["state_subject"].is_null());
+
+        let error = parse_json_output(&output.stderr);
+        assert_eq!(error["schema_version"], "satelle.error.v1");
+        assert_eq!(error["error"]["code"], "output-mode-conflict");
+    }
 }
 
 #[test]
@@ -1249,7 +1491,7 @@ fn events_json_with_detach_fails_with_typed_usage_error() {
 }
 
 #[test]
-fn detach_returns_started_session_without_event_streaming() {
+fn detach_returns_starting_session_without_event_streaming() {
     let state = state_dir();
     let output = satelle()
         .env("SATELLE_STATE_DIR", state.path())
@@ -1268,10 +1510,10 @@ fn detach_returns_started_session_without_event_streaming() {
     let session = parse_json_output(&output.stdout);
     let session_id = session["session_id"].as_str().unwrap().to_string();
 
-    assert_eq!(session["status"], "started");
+    assert_eq!(session["status"], "starting");
     assert_eq!(session["turns"].as_array().unwrap().len(), 1);
-    assert_eq!(session["turns"][0]["status"], "started");
-    assert!(session["turns"][0]["completed_at"].is_null());
+    assert_eq!(session["turns"][0]["state"], "starting");
+    assert!(session["turns"][0]["terminal_at"].is_null());
 
     let status_output = satelle()
         .env("SATELLE_STATE_DIR", state.path())
@@ -1281,7 +1523,10 @@ fn detach_returns_started_session_without_event_streaming() {
         .get_output()
         .clone();
     let status = parse_json_output(&status_output.stdout);
-    assert_eq!(status["status"], "started");
+    assert!(matches!(
+        status["status"].as_str(),
+        Some("starting" | "recovery_pending")
+    ));
 
     let logs_output = satelle()
         .env("SATELLE_STATE_DIR", state.path())
@@ -1368,10 +1613,10 @@ fn detach_returns_started_session_without_event_streaming() {
         .clone();
     let steered = parse_json_output(&steer_output.stdout);
     assert_eq!(steered["session_id"], session_id);
-    assert_eq!(steered["status"], "started");
+    assert_eq!(steered["status"], "starting");
     assert_eq!(steered["turns"].as_array().unwrap().len(), 2);
-    assert_eq!(steered["turns"][1]["status"], "started");
-    assert!(steered["turns"][1]["completed_at"].is_null());
+    assert_eq!(steered["turns"][1]["state"], "starting");
+    assert!(steered["turns"][1]["terminal_at"].is_null());
 }
 
 #[test]
