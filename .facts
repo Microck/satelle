@@ -818,14 +818,14 @@
 - satelle mcp install preserves unrelated existing MCP server entries in each AI client configuration file instead of rewriting the whole file from a Satelle-only template @spec @mvp
 
 ## event-streams
-- satelle Host Daemon WebSocket event streams are live-only in MVP and begin at connection or subscription time @spec @mvp
-- satelle MVP does not expose a durable event history, event replay cursor, event resume token, or event replay endpoint for Satelle Events @spec @mvp
+- satelle Host Daemon WebSocket event streams are live-only in MVP and begin at connection or subscription time @spec @mvp @implemented
+- satelle MVP does not expose a durable event history, event replay cursor, event resume token, or event replay endpoint for Satelle Events @spec @mvp @implemented
 - satelle Host Daemon WebSocket event stream emits the same Satelle Event JSON envelope used by CLI --events json @spec @mvp
 - satelle Host Daemon is the canonical producer for remote Session and Turn lifecycle Satelle Events observed on the controlled Host @spec @mvp
 - satelle CLI is the canonical producer for local preflight, configuration, and transport Satelle Events observed before or around Host Daemon communication @spec @mvp
 - satelle CLI --events json may merge CLI-produced Satelle Events with Host Daemon-produced Satelle Events in one newline-delimited stream while preserving the shared envelope @spec @mvp
 - satelle CLI --events json assigns seq values for the CLI output stream even when relaying Host Daemon-produced Satelle Events @spec @mvp
-- satelle Host Daemon WebSocket assigns seq values for each WebSocket event stream and does not expose seq as a durable stored event id @spec @mvp
+- satelle Host Daemon WebSocket assigns seq values for each WebSocket event stream and does not expose seq as a durable stored event id @spec @mvp @implemented
 - satelle automation consumers correlate durable Satelle state with session_id, turn_id, type, timestamp, and structured data rather than seq alone @spec @mvp
 - a Host Daemon WebSocket connection authenticates and authorizes its API Principal before accepting subscriptions @spec @mvp
 - an MVP WebSocket subscription selects one or more explicit host, session, or turn scopes allowed by its API Principal @spec @contract @mvp
@@ -840,10 +840,10 @@
 - a slow WebSocket subscriber never blocks Turn execution, SQLite commits, cancellation, or delivery to other subscribers @spec @mvp
 - the Host Daemon closes a subscriber whose outbound queue overflows with a typed slow-consumer close reason @spec @mvp
 - WebSocket overflow diagnostics record only Principal token id, subscription scope, last delivered seq, and dropped event count @spec @mvp
-- stream-local seq values may contain gaps after authorization filtering or slow-consumer overflow @spec @mvp
-- a terminal Turn event is published only after the terminal state transaction commits @spec @mvp
-- clients never treat receipt of a WebSocket event as proof of committed state unless the event references the committed session_state_revision or turn_state_revision for its state_subject @spec @mvp
-- loss of a terminal event does not lose terminal state because satelle status remains authoritative @spec @mvp
+- stream-local seq values may contain gaps after authorization filtering or slow-consumer overflow @spec @mvp @implemented
+- a terminal Turn event is published only after the terminal state transaction commits @spec @mvp @implemented
+- clients never treat receipt of a WebSocket event as proof of committed state unless the event references the committed session_state_revision or turn_state_revision for its state_subject @spec @mvp @implemented
+- loss of a terminal event does not lose terminal state because satelle status remains authoritative @spec @mvp @implemented
 - clients reconcile status and normalized logs after any WebSocket disconnect or seq discontinuity @spec @mvp
 - WebSocket ping, pong, idle timeout, maximum message size, and outbound queue limits are advertised through authenticated capabilities @spec @mvp
 - authenticated capabilities advertise the maximum subscriptions per WebSocket and the inbound WebSocket message rate per API Principal @spec @mvp
