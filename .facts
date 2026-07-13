@@ -1502,9 +1502,9 @@
 - prompt-derived summaries are redacted before persistence @spec @mvp
 - when required redaction fails, Satelle omits the sensitive field or fails the entire record, output, or artifact write and never persists or emits the unredacted value as a fallback @spec @mvp
 - internal Codex and provider identifiers are schema-marked sensitive storage fields and never enter public response types @spec @mvp
-- Host Daemon state directories are accessible only to the daemon OS user and required operating-system service principals @spec @mvp
-- Satelle creates sensitive POSIX directories with mode 0700 and sensitive POSIX files with mode 0600 @spec @mvp
-- Satelle applies equivalent current-user restricted ACLs to sensitive Windows state @spec @mvp
+- Host Daemon state directories are accessible only to the daemon OS user and required operating-system service principals @spec @mvp @implemented
+- Satelle creates sensitive POSIX directories with mode 0700 and sensitive POSIX files with mode 0600 @spec @mvp @implemented
+- Satelle applies equivalent current-user restricted ACLs to sensitive Windows state @spec @mvp @implemented
 - SQLite database, WAL, SHM, token verifier, attachment staging, and sensitive export staging files inherit the same restricted access boundary @spec @mvp
 - Satelle Operator Log Files, local CLI state and cache, migration backups, setup recovery metadata, and recording artifacts inherit the same OS-user-private directory and file boundary @spec @mvp
 - Satelle refuses to use a sensitive state path that resolves through an unsafe writable directory boundary @spec @mvp
@@ -1631,14 +1631,14 @@
 - telemetry buffering uses an OS-user-private local queue capped at 10 MiB and 24 hours, drops oldest records on overflow, and never blocks command execution or Host control when delivery fails @spec @later
 - disabling telemetry stops new capture immediately, deletes queued unsent telemetry for that machine, and does not contact the configured endpoint @spec @later
 - satelle telemetry status reports enabled state, endpoint origin without credentials or path secrets, buffered record count and bytes, oldest record age, last delivery outcome, and excluded data categories @spec @later
-- satelle allows plaintext HTTP and WebSocket transport only on loopback listeners used locally or through authenticated SSH tunnels @spec @mvp
-- satelle rejects plaintext non-loopback HTTP and WebSocket transport @spec @mvp
+- satelle allows plaintext HTTP and WebSocket transport only on loopback listeners used locally or through authenticated SSH tunnels @spec @mvp @implemented
+- satelle rejects plaintext non-loopback HTTP and WebSocket transport @spec @mvp @implemented
 - satelle requires authenticated HTTPS for HTTP and authenticated WSS for WebSocket on every non-loopback direct Host Daemon connection @spec @mvp
 - satelle direct TLS validates the certificate chain and requested Host name against platform trust roots or an explicitly configured user-level CA bundle @spec @mvp @implemented
 - a configured CA bundle must be a regular non-symlink file owned by the invoking OS user or a trusted system administrator, must not be writable by unrelated principals, and must use an owner-controlled Windows ACL @spec @mvp @implemented
 - satelle direct TLS requires TLS 1.2 or newer @spec @mvp @implemented
 - satelle direct TLS reports typed certificate-untrusted, certificate-hostname-mismatch, certificate-expired, and tls-version-unsupported errors before API authentication @spec @mvp @implemented
-- satelle does not expose an insecure direct-transport option that disables certificate or Host-name verification @spec @mvp
+- satelle does not expose an insecure direct-transport option that disables certificate or Host-name verification @spec @mvp @implemented
 - satelle MVP does not manage TLS certificate issuance or renewal for non-loopback direct Host Daemon transport @spec @mvp
 - satelle non-loopback direct transport relies on user-provided TLS termination or configured TLS materials outside MVP certificate automation @spec @mvp
 - when the Host Daemon terminates TLS, its certificate-chain and private-key files must be regular non-symlink files under a Host-owned configuration boundary, and the private key must not be readable or writable by unrelated principals @spec @mvp
