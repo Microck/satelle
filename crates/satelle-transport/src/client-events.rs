@@ -412,3 +412,65 @@ impl std::error::Error for DaemonEventError {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn subscription_acknowledgement_must_echo_the_exact_context() {
+        let request_id = RequestId::new();
+        let subscriptions = vec![EventSubscription::Host];
+        let acknowledgement = SubscribedResponse::new(
+            request_id.clone(),
+            "host-expected".to_string(),
+            subscriptions.clone(),
+        );
+        assert!(
+            validate_acknowledgement(
+                acknowledgement,
+                &request_id,
+                "host-expected",
+                &subscriptions
+            )
+            .is_ok()
+        );
+
+        let wrong_request = SubscribedResponse::new(
+            RequestId::new(),
+            "host-expected".to_string(),
+            subscriptions.clone(),
+        );
+        assert!(matches!(
+            validate_acknowledgement(wrong_request, &request_id, "host-expected", &subscriptions),
+            Err(DaemonEventError::RequestIdMismatch)
+        ));
+
+        let wrong_host = SubscribedResponse::new(
+            request_id.clone(),
+            "host-other".to_string(),
+            subscriptions.clone(),
+        );
+        assert!(matches!(
+            validate_acknowledgement(wrong_host, &request_id, "host-expected", &subscriptions),
+            Err(DaemonEventError::HostIdentityMismatch)
+        ));
+
+        let wrong_subscriptions = SubscribedResponse::new(
+            request_id.clone(),
+            "host-expected".to_string(),
+            vec![EventSubscription::Session {
+                session_id: satelle_core::SessionId::new(),
+            }],
+        );
+        assert!(matches!(
+            validate_acknowledgement(
+                wrong_subscriptions,
+                &request_id,
+                "host-expected",
+                &subscriptions
+            ),
+            Err(DaemonEventError::SubscriptionMismatch)
+        ));
+    }
+}
