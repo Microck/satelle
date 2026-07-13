@@ -9,6 +9,7 @@ axum.workspace = true
 futures-util.workspace = true
 http-body-util.workspace = true
 reqwest.workspace = true
+rustls.workspace = true
 satelle-core = { path = "../satelle-core" }
 satelle-host = { path = "../satelle-host" }
 serde.workspace = true
@@ -21,4 +22,5 @@ uuid.workspace = true
 zeroize.workspace = true
 
 [dev-dependencies]
+rcgen = "=0.14.8"
 satelle-host = { path = "../satelle-host", features = ["test-support"] }

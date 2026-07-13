@@ -11,21 +11,30 @@ use time::format_description::well_known::Rfc3339;
 
 #[path = "control-plane.rs"]
 pub mod control_plane;
+#[path = "direct-host-binding.rs"]
+mod direct_host_binding;
 mod events;
 pub mod ids;
 mod profiles;
+#[path = "secure-file.rs"]
+mod secure_file;
 pub mod session;
 
 pub use control_plane::{
     ControlPlaneCapability, ControlPlaneCapabilitySet, ControlPlaneFailureReason,
     ControlPlaneOperation, IncompatibleControlPlaneDetails, IncompatibleControlPlaneDetailsError,
 };
+pub use direct_host_binding::{ApiTokenSource, DirectHostBinding, DirectHostBindingError};
 pub use events::{
     EVENT_SCHEMA_VERSION, EventSource, EventStateSubject, EventSubject, EventType, SatelleEvent,
     SatelleEventBody, SatelleEventError,
 };
 pub use ids::{IdParseError, SessionId, TurnId};
 pub use profiles::{ProfileField, ProfileSelectionSource, SelectedProfile};
+pub use secure_file::{
+    SecureFileError, read_owner_controlled_config_file, read_owner_only_secret_file,
+    read_trusted_ca_bundle_file,
+};
 
 pub const PRODUCT_NAME: &str = "Satelle";
 pub const CLI_NAME: &str = "satelle";
@@ -70,6 +79,10 @@ impl SatelleConfig {
                 daemon_log_dir: None,
                 experimental_provider_computer_use: None,
                 yolo: None,
+                allow_project_selection: false,
+                expected_host_id: None,
+                api_token: None,
+                ca_bundle: None,
                 provider_auth: BTreeMap::new(),
             },
         );
@@ -127,6 +140,14 @@ pub struct HostConfig {
     pub daemon_log_dir: Option<PathBuf>,
     pub experimental_provider_computer_use: Option<bool>,
     pub yolo: Option<bool>,
+    #[serde(default)]
+    pub allow_project_selection: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_host_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_token: Option<ApiTokenSource>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ca_bundle: Option<PathBuf>,
     #[serde(default)]
     pub provider_auth: BTreeMap<String, ProviderSecretSource>,
 }
@@ -287,6 +308,12 @@ pub struct ResolvedConfig {
     // configured host before SATELLE_HOST or --host chooses one.
     #[serde(skip)]
     profile_overlay: Option<profiles::ProfileConfig>,
+    #[serde(skip)]
+    default_host_requires_project_permission: bool,
+    // Project configuration may replace a HostConfig, so its merged permission bit cannot prove
+    // that the user authorized project selection. Preserve that authorization at the trust boundary.
+    #[serde(skip)]
+    project_selectable_hosts: BTreeSet<String>,
 }
 
 impl ResolvedConfig {
@@ -294,9 +321,10 @@ impl ResolvedConfig {
         &self,
         flag_host: Option<&str>,
     ) -> Result<(String, HostConfig), SatelleError> {
+        let environment_host = optional_non_empty_env("SATELLE_HOST");
         let alias = flag_host
             .map(str::to_string)
-            .or_else(|| optional_non_empty_env("SATELLE_HOST"))
+            .or_else(|| environment_host.clone())
             .or_else(|| self.config.default_host.clone())
             .unwrap_or_else(|| LOCAL_DEMO_HOST.to_string());
 
@@ -306,6 +334,14 @@ impl ResolvedConfig {
             .get(&alias)
             .cloned()
             .ok_or_else(|| SatelleError::host_not_found(alias.clone()))?;
+
+        if flag_host.is_none()
+            && environment_host.is_none()
+            && self.default_host_requires_project_permission
+            && !self.project_selectable_hosts.contains(&alias)
+        {
+            return Err(SatelleError::project_host_selection_not_allowed(alias));
+        }
 
         if let (Some(profile), Some(selected)) = (&self.profile_overlay, &self.selected_profile) {
             profile.apply_to_host(&alias, &mut host, selected.source);
@@ -332,6 +368,20 @@ pub fn load_config(cwd: &Path, flag_profile: Option<&str>) -> Result<ResolvedCon
     let mut config = SatelleConfig::defaults();
     let user_config = read_config_file(&user_config_path, ConfigScope::User)?;
     let project_config = read_config_file(&project_config_path, ConfigScope::Project)?;
+    let project_selectable_hosts = user_config
+        .as_ref()
+        .map(|config| {
+            config
+                .config
+                .hosts
+                .iter()
+                .filter_map(|(alias, host)| host.allow_project_selection.then_some(alias.clone()))
+                .collect()
+        })
+        .unwrap_or_default();
+    let mut default_host_requires_project_permission = project_config
+        .as_ref()
+        .is_some_and(|config| config.config.default_host.is_some());
 
     if let Some(user_config) = &user_config {
         config = config.merge(user_config.config.clone());
@@ -366,6 +416,10 @@ pub fn load_config(cwd: &Path, flag_profile: Option<&str>) -> Result<ResolvedCon
                 )
             })?;
         profile.apply_to_base(&mut config, selected.source);
+        if profile.selects_host() {
+            default_host_requires_project_permission =
+                selected.source == profiles::ProfileSelectionSource::ProjectConfig;
+        }
         Some(profile)
     } else {
         None
@@ -377,6 +431,8 @@ pub fn load_config(cwd: &Path, flag_profile: Option<&str>) -> Result<ResolvedCon
         project_config_path,
         selected_profile,
         profile_overlay,
+        default_host_requires_project_permission,
+        project_selectable_hosts,
     })
 }
 
@@ -535,13 +591,24 @@ fn read_config_file(
         return Ok(None);
     }
 
-    let raw = fs::read_to_string(path).map_err(|source| SatelleError {
-        code: ErrorCode::ConfigNotFound,
-        message: format!("could not read config file {}", path.display()),
-        recovery_command: Some("satelle setup --host local-demo --dry-run".to_string()),
-        source_detail: Some(source.to_string()),
-        details: BTreeMap::new(),
-    })?;
+    let raw = match scope {
+        ConfigScope::User => read_owner_controlled_config_file(path).map_err(|error| {
+            SatelleError::config_error(
+                format!(
+                    "user config file {} does not satisfy the owner security policy",
+                    path.display()
+                ),
+                Some(error.to_string()),
+            )
+        })?,
+        ConfigScope::Project => fs::read_to_string(path).map_err(|source| SatelleError {
+            code: ErrorCode::ConfigNotFound,
+            message: format!("could not read config file {}", path.display()),
+            recovery_command: Some("satelle setup --host local-demo --dry-run".to_string()),
+            source_detail: Some(source.to_string()),
+            details: BTreeMap::new(),
+        })?,
+    };
 
     let mut value = toml::from_str::<toml::Value>(&raw).map_err(|source| {
         SatelleError::config_error(
@@ -691,6 +758,13 @@ fn reject_project_forbidden_keys(path: &Path, value: &toml::Value) -> Result<(),
             );
         }
 
+        if host_table.contains_key("allow_project_selection") {
+            return Err(SatelleError::project_host_selection_permission_not_allowed(
+                path,
+                &format!("{host_path}.allow_project_selection"),
+            ));
+        }
+
         for &key in PROJECT_CREDENTIAL_HELPER_KEYS {
             if host_table.contains_key(key) {
                 return Err(SatelleError::project_credential_helper_not_allowed(
@@ -716,6 +790,9 @@ fn reject_project_forbidden_keys(path: &Path, value: &toml::Value) -> Result<(),
 }
 
 const PROJECT_SECRET_SOURCE_KEYS: &[&str] = &[
+    "api_token",
+    "ca_bundle",
+    "expected_host_id",
     "provider_auth",
     "provider_credentials",
     "provider_secret",
@@ -809,6 +886,8 @@ fn reject_interpolation(path: &Path, value: &toml::Value) -> Result<(), SatelleE
             "transport",
             "adapter",
             "address",
+            "expected_host_id",
+            "ca_bundle",
             "desktop_user",
             "desktop_session_preference",
             "daemon_home",
@@ -874,6 +953,16 @@ fn reject_interpolation(path: &Path, value: &toml::Value) -> Result<(), SatelleE
                         &mut interpolations,
                     );
                 }
+            }
+        }
+
+        if let Some(api_token_table) = host_table.get("api_token").and_then(toml::Value::as_table) {
+            for key in ["kind", "path"] {
+                collect_interpolation_for_value(
+                    &format!("{host_path}.api_token.{key}"),
+                    api_token_table.get(key),
+                    &mut interpolations,
+                );
             }
         }
     }
@@ -1041,6 +1130,38 @@ fn reject_provider_secret_source_errors(
         let Some(host_table) = host_value.as_table() else {
             continue;
         };
+        if let Some(api_token) = host_table.get("api_token").and_then(toml::Value::as_table) {
+            let source_path = format!("{host_path}.api_token");
+            if let Some(kind) = api_token.get("kind").and_then(toml::Value::as_str)
+                && kind != "file"
+            {
+                return Err(SatelleError::unsupported_secret_source_kind(
+                    path,
+                    &format!("{source_path}.kind"),
+                    kind,
+                ));
+            }
+            if let Some(file_path) = api_token.get("path").and_then(toml::Value::as_str) {
+                let parsed = PathBuf::from(file_path);
+                if parsed.starts_with("~") || !parsed.is_absolute() {
+                    return Err(SatelleError::secret_file_path_not_absolute(
+                        path,
+                        &format!("{source_path}.path"),
+                        file_path,
+                    ));
+                }
+            }
+        }
+        if let Some(ca_bundle) = host_table.get("ca_bundle").and_then(toml::Value::as_str) {
+            let parsed = PathBuf::from(ca_bundle);
+            if parsed.starts_with("~") || !parsed.is_absolute() {
+                return Err(SatelleError::secret_file_path_not_absolute(
+                    path,
+                    &format!("{host_path}.ca_bundle"),
+                    ca_bundle,
+                ));
+            }
+        }
         let Some(provider_auth) = host_table
             .get("provider_auth")
             .and_then(toml::Value::as_table)
@@ -1172,6 +1293,10 @@ fn reject_unknown_config_keys(path: &Path, value: &toml::Value) -> Result<(), Sa
                     "daemon_log_dir",
                     "experimental_provider_computer_use",
                     "yolo",
+                    "allow_project_selection",
+                    "expected_host_id",
+                    "api_token",
+                    "ca_bundle",
                     "provider_auth",
                 ],
                 &mut unknown_keys,
@@ -1213,6 +1338,17 @@ fn reject_unknown_config_keys(path: &Path, value: &toml::Value) -> Result<(), Sa
                         &mut unknown_keys,
                     );
                 }
+            }
+
+            if let Some(api_token_table) =
+                host_table.get("api_token").and_then(toml::Value::as_table)
+            {
+                collect_unknown_keys_for_table(
+                    &format!("{host_path}.api_token"),
+                    api_token_table,
+                    &["kind", "path"],
+                    &mut unknown_keys,
+                );
             }
         }
     }
@@ -1324,6 +1460,7 @@ pub enum ErrorCode {
     ProjectYoloEnableNotAllowed,
     ProjectExperimentalProviderOptInNotAllowed,
     ProjectMutationConsentNotAllowed,
+    ProjectHostSelectionNotAllowed,
     ProjectSecretSourceNotAllowed,
     ProjectCredentialHelperNotAllowed,
     UnsupportedSecretSourceKind,
@@ -1334,6 +1471,14 @@ pub enum ErrorCode {
     DaemonPathOverrideNotAbsolute,
     HostNotFound,
     HostUnreachable,
+    CertificateUntrusted,
+    CertificateHostnameMismatch,
+    CertificateExpired,
+    TlsVersionUnsupported,
+    TlsHandshakeFailed,
+    AuthenticationFailed,
+    AuthorizationInsufficientScope,
+    HostIdentityMismatch,
     HostBusy,
     StoreInUse,
     StateConflict,
@@ -1381,6 +1526,7 @@ impl ErrorCode {
                 "project-experimental-provider-opt-in-not-allowed"
             }
             Self::ProjectMutationConsentNotAllowed => "project-mutation-consent-not-allowed",
+            Self::ProjectHostSelectionNotAllowed => "project-host-selection-not-allowed",
             Self::ProjectSecretSourceNotAllowed => "project-secret-source-not-allowed",
             Self::ProjectCredentialHelperNotAllowed => "project-credential-helper-not-allowed",
             Self::UnsupportedSecretSourceKind => "unsupported-secret-source-kind",
@@ -1391,6 +1537,14 @@ impl ErrorCode {
             Self::DaemonPathOverrideNotAbsolute => "daemon-path-override-not-absolute",
             Self::HostNotFound => "host-not-found",
             Self::HostUnreachable => "host-unreachable",
+            Self::CertificateUntrusted => "certificate-untrusted",
+            Self::CertificateHostnameMismatch => "certificate-hostname-mismatch",
+            Self::CertificateExpired => "certificate-expired",
+            Self::TlsVersionUnsupported => "tls-version-unsupported",
+            Self::TlsHandshakeFailed => "tls-handshake-failed",
+            Self::AuthenticationFailed => "authentication-failed",
+            Self::AuthorizationInsufficientScope => "authorization-insufficient-scope",
+            Self::HostIdentityMismatch => "host-identity-mismatch",
             Self::HostBusy => "host-busy",
             Self::StoreInUse => "store-in-use",
             Self::StateConflict => "state-conflict",
@@ -1445,6 +1599,7 @@ impl ErrorCode {
             | Self::ProjectYoloEnableNotAllowed
             | Self::ProjectExperimentalProviderOptInNotAllowed
             | Self::ProjectMutationConsentNotAllowed
+            | Self::ProjectHostSelectionNotAllowed
             | Self::ProjectSecretSourceNotAllowed
             | Self::ProjectCredentialHelperNotAllowed
             | Self::UnsupportedSecretSourceKind
@@ -1459,6 +1614,14 @@ impl ErrorCode {
             Self::CapacityExceeded | Self::HostUnreachable | Self::HostBusy | Self::StoreInUse => {
                 69
             }
+            Self::CertificateUntrusted
+            | Self::CertificateHostnameMismatch
+            | Self::CertificateExpired
+            | Self::TlsVersionUnsupported
+            | Self::TlsHandshakeFailed => 76,
+            Self::AuthenticationFailed
+            | Self::AuthorizationInsufficientScope
+            | Self::HostIdentityMismatch => 77,
             Self::RemoteExecution | Self::StorageBusy | Self::StopNotConfirmed => 74,
             Self::IncompatibleControlPlane
             | Self::ComputerUseNotReady
@@ -1781,6 +1944,19 @@ impl SatelleError {
         )
     }
 
+    pub fn project_host_selection_permission_not_allowed(
+        config_file: &Path,
+        toml_path: &str,
+    ) -> Self {
+        Self::project_forbidden_config_error(
+            ErrorCode::ProjectHostSelectionNotAllowed,
+            config_file,
+            toml_path,
+            "allow_project_selection",
+            "only the user-level Host Binding can authorize project selection",
+        )
+    }
+
     pub fn project_secret_source_not_allowed(
         config_file: &Path,
         toml_path: &str,
@@ -1981,6 +2157,26 @@ impl SatelleError {
         }
     }
 
+    pub fn project_host_selection_not_allowed(alias: String) -> Self {
+        let mut details = BTreeMap::new();
+        details.insert("host".to_string(), Value::String(alias.clone()));
+        details.insert(
+            "selection_source".to_string(),
+            Value::String("project".to_string()),
+        );
+        Self {
+            code: ErrorCode::ProjectHostSelectionNotAllowed,
+            message: format!(
+                "project configuration selected host '{alias}', but its user-level Host Binding does not allow project selection"
+            ),
+            recovery_command: Some(format!(
+                "set hosts.{alias}.allow_project_selection = true in user-level configuration or pass --host {alias} explicitly"
+            )),
+            source_detail: None,
+            details,
+        }
+    }
+
     pub fn host_unreachable(alias: &str) -> Self {
         let mut details = BTreeMap::new();
         details.insert("host".to_string(), Value::String(alias.to_string()));
@@ -1988,6 +2184,94 @@ impl SatelleError {
             code: ErrorCode::HostUnreachable,
             message: format!("host '{alias}' is configured but unreachable"),
             recovery_command: Some("satelle config check --json".to_string()),
+            source_detail: None,
+            details,
+        }
+    }
+
+    pub fn authentication_failed(alias: &str) -> Self {
+        host_access_error(
+            ErrorCode::AuthenticationFailed,
+            alias,
+            "the Host Daemon rejected the configured bearer token",
+            "replace the configured api_token file with a valid scoped token",
+        )
+    }
+
+    pub fn tls_handshake_failed(alias: &str) -> Self {
+        host_access_error(
+            ErrorCode::TlsHandshakeFailed,
+            alias,
+            "the Host Daemon TLS handshake failed",
+            "verify the Host endpoint certificate, hostname, and TLS configuration",
+        )
+    }
+
+    pub fn certificate_untrusted(alias: &str) -> Self {
+        host_access_error(
+            ErrorCode::CertificateUntrusted,
+            alias,
+            "the Host Daemon certificate is not trusted",
+            "verify the certificate chain or configure an owner-controlled ca_bundle",
+        )
+    }
+
+    pub fn certificate_hostname_mismatch(alias: &str) -> Self {
+        host_access_error(
+            ErrorCode::CertificateHostnameMismatch,
+            alias,
+            "the Host Daemon certificate does not match the configured hostname",
+            "use the certificate's verified hostname or replace the certificate",
+        )
+    }
+
+    pub fn certificate_expired(alias: &str) -> Self {
+        host_access_error(
+            ErrorCode::CertificateExpired,
+            alias,
+            "the Host Daemon certificate has expired",
+            "renew the Host Daemon certificate before reconnecting",
+        )
+    }
+
+    pub fn tls_version_unsupported(alias: &str) -> Self {
+        host_access_error(
+            ErrorCode::TlsVersionUnsupported,
+            alias,
+            "the Host Daemon does not support TLS 1.2 or newer",
+            "enable TLS 1.2 or newer on the Host Daemon TLS terminator",
+        )
+    }
+
+    pub fn authorization_insufficient_scope(alias: &str) -> Self {
+        host_access_error(
+            ErrorCode::AuthorizationInsufficientScope,
+            alias,
+            "the configured Host Daemon token lacks the required scope",
+            "issue a token with the required scope and replace the configured api_token file",
+        )
+    }
+
+    pub fn host_identity_mismatch(alias: &str) -> Self {
+        host_access_error(
+            ErrorCode::HostIdentityMismatch,
+            alias,
+            "the reached Host Daemon does not match the pinned Host Identity",
+            "run satelle host trust only after verifying the intended Host",
+        )
+    }
+
+    pub fn remote_api_error(alias: &str, remote_code: &str) -> Self {
+        let mut details = BTreeMap::new();
+        details.insert("host".to_string(), Value::String(alias.to_string()));
+        details.insert(
+            "remote_code".to_string(),
+            Value::String(remote_code.to_string()),
+        );
+        Self {
+            code: ErrorCode::RemoteExecution,
+            message: "the Host Daemon rejected the operation".to_string(),
+            recovery_command: Some("satelle doctor --scope transport --json".to_string()),
             source_detail: None,
             details,
         }
@@ -2255,6 +2539,23 @@ impl SatelleError {
 
     pub fn exit_code(&self) -> i32 {
         self.code.exit_code()
+    }
+}
+
+fn host_access_error(
+    code: ErrorCode,
+    alias: &str,
+    message: &str,
+    recovery_command: &str,
+) -> SatelleError {
+    let mut details = BTreeMap::new();
+    details.insert("host".to_string(), Value::String(alias.to_string()));
+    SatelleError {
+        code,
+        message: message.to_string(),
+        recovery_command: Some(recovery_command.to_string()),
+        source_detail: None,
+        details,
     }
 }
 

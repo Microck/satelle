@@ -1,17 +1,18 @@
 mod completions;
 mod output;
+mod transport;
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use completions::{CompletionsCommand, run_completions};
 use output::{OutputArgs, OutputFormat, SessionResultSchemaVersion, StatusReport};
 use satelle_core::{
     BEACON_CORAL, CLI_NAME, DaemonPathOverrides, DesktopSessionPreference, DoctorEventRecord,
-    DoctorReport, ERROR_RED, ErrorCode, HostConfig, HostSessionsReport, LOCAL_DEMO_HOST, LogEntry,
+    DoctorReport, ERROR_RED, ErrorCode, HostConfig, HostSessionsReport, LOCAL_DEMO_HOST,
     PRODUCT_NAME, ProfileField, RELAY_ROSE, ResolvedConfig, SUCCESS_GREEN, SatelleError, SessionId,
-    SessionRecord, SetupReport, SetupRequiredInput, StopResult, TransportKind, TurnStatus,
-    load_config, resolve_path_set, utc_now,
+    SessionRecord, SetupReport, SetupRequiredInput, TurnStatus, load_config, resolve_path_set,
+    utc_now,
 };
-use satelle_host::{HostService, HostStatus, TurnOutcome};
+use satelle_host::TurnOutcome;
 use serde_json::json;
 use std::collections::BTreeMap;
 use std::fs;
@@ -19,9 +20,8 @@ use std::io::{self, IsTerminal, Read, Write};
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::str::FromStr;
+use transport::transport_for;
 
-#[cfg(feature = "test-support")]
-const TEST_SUPPORT_ADAPTER_ENV: &str = "SATELLE_TEST_SUPPORT_ADAPTER";
 const CONFIG_CHECK_SCHEMA_VERSION: &str = "satelle.config.check.v1";
 const CONFIG_EXPLAIN_SCHEMA_VERSION: &str = "satelle.config.explain.v1";
 const ERROR_SCHEMA_VERSION: &str = "satelle.error.v1";
@@ -510,184 +510,6 @@ impl SetupComponent {
     }
 }
 
-trait TransportClient {
-    fn setup(
-        &self,
-        host: &SelectedHost,
-        dry_run: bool,
-        setup_mode: String,
-        setup_components: Vec<String>,
-        daemon_path_overrides: DaemonPathOverrides,
-    ) -> Result<SetupReport, SatelleError>;
-
-    fn doctor(
-        &self,
-        host: &SelectedHost,
-        scope: Option<&str>,
-        refresh: bool,
-    ) -> Result<DoctorReport, SatelleError>;
-
-    fn host_status(&self, host: &SelectedHost) -> Result<HostStatus, SatelleError>;
-
-    fn host_sessions(
-        &self,
-        host: &SelectedHost,
-        no_bootstrap: bool,
-    ) -> Result<HostSessionsReport, SatelleError>;
-
-    fn run(&self, host: &SelectedHost, prompt: &str) -> Result<TurnOutcome, SatelleError>;
-
-    fn run_detached(
-        &self,
-        host: &SelectedHost,
-        prompt: &str,
-    ) -> Result<SessionRecord, SatelleError>;
-
-    fn steer(
-        &self,
-        host: &SelectedHost,
-        session_id: &SessionId,
-        prompt: &str,
-    ) -> Result<TurnOutcome, SatelleError>;
-
-    fn steer_detached(
-        &self,
-        host: &SelectedHost,
-        session_id: &SessionId,
-        prompt: &str,
-    ) -> Result<SessionRecord, SatelleError>;
-
-    fn status(
-        &self,
-        host: &SelectedHost,
-        session_id: &SessionId,
-    ) -> Result<SessionRecord, SatelleError>;
-
-    fn stop(&self, host: &SelectedHost, session_id: &SessionId)
-    -> Result<StopResult, SatelleError>;
-
-    fn logs(&self, host: &SelectedHost) -> Result<Vec<LogEntry>, SatelleError>;
-}
-
-struct LocalTransport {
-    service: HostService,
-}
-
-impl LocalTransport {
-    fn new(service: HostService) -> Self {
-        Self { service }
-    }
-}
-
-impl TransportClient for LocalTransport {
-    fn setup(
-        &self,
-        host: &SelectedHost,
-        dry_run: bool,
-        setup_mode: String,
-        setup_components: Vec<String>,
-        daemon_path_overrides: DaemonPathOverrides,
-    ) -> Result<SetupReport, SatelleError> {
-        ensure_local_transport_host(host)?;
-        self.service.setup(
-            &host.alias,
-            dry_run,
-            setup_mode,
-            setup_components,
-            daemon_path_overrides,
-        )
-    }
-
-    fn doctor(
-        &self,
-        host: &SelectedHost,
-        scope: Option<&str>,
-        refresh: bool,
-    ) -> Result<DoctorReport, SatelleError> {
-        ensure_local_transport_host(host)?;
-        self.service.doctor(&host.alias, scope, refresh)
-    }
-
-    fn host_status(&self, host: &SelectedHost) -> Result<HostStatus, SatelleError> {
-        ensure_local_transport_host(host)?;
-        self.service.host_status()
-    }
-
-    fn host_sessions(
-        &self,
-        host: &SelectedHost,
-        no_bootstrap: bool,
-    ) -> Result<HostSessionsReport, SatelleError> {
-        ensure_local_transport_host(host)?;
-        self.service.host_sessions(&host.alias, no_bootstrap)
-    }
-
-    fn run(&self, host: &SelectedHost, prompt: &str) -> Result<TurnOutcome, SatelleError> {
-        ensure_local_transport_host(host)?;
-        self.service.run(&host.alias, prompt)
-    }
-
-    fn run_detached(
-        &self,
-        host: &SelectedHost,
-        prompt: &str,
-    ) -> Result<SessionRecord, SatelleError> {
-        ensure_local_transport_host(host)?;
-        self.service.run_detached(&host.alias, prompt)
-    }
-
-    fn steer(
-        &self,
-        host: &SelectedHost,
-        session_id: &SessionId,
-        prompt: &str,
-    ) -> Result<TurnOutcome, SatelleError> {
-        ensure_local_transport_host(host)?;
-        self.service.steer(session_id, prompt)
-    }
-
-    fn steer_detached(
-        &self,
-        host: &SelectedHost,
-        session_id: &SessionId,
-        prompt: &str,
-    ) -> Result<SessionRecord, SatelleError> {
-        ensure_local_transport_host(host)?;
-        self.service.steer_detached(session_id, prompt)
-    }
-
-    fn status(
-        &self,
-        host: &SelectedHost,
-        session_id: &SessionId,
-    ) -> Result<SessionRecord, SatelleError> {
-        ensure_local_transport_host(host)?;
-        self.service.status(session_id)
-    }
-
-    fn stop(
-        &self,
-        host: &SelectedHost,
-        session_id: &SessionId,
-    ) -> Result<StopResult, SatelleError> {
-        ensure_local_transport_host(host)?;
-        self.service.stop(session_id)
-    }
-
-    fn logs(&self, host: &SelectedHost) -> Result<Vec<LogEntry>, SatelleError> {
-        ensure_local_transport_host(host)?;
-        self.service.logs(&host.alias)
-    }
-}
-
-fn ensure_local_transport_host(host: &SelectedHost) -> Result<(), SatelleError> {
-    if host.config.transport == TransportKind::Local {
-        Ok(())
-    } else {
-        Err(SatelleError::host_unreachable(&host.alias))
-    }
-}
-
 fn main() -> ExitCode {
     match try_main() {
         Ok(()) => ExitCode::SUCCESS,
@@ -718,81 +540,24 @@ fn try_main() -> Result<(), CliFailure> {
         Command::Completions(command) => {
             run_completions(command).map_err(|error| failure(error, false))
         }
-        Command::Setup(command) => {
-            let transport = local_transport(output)?;
-            run_setup(command, &transport, human_style, config, output)
-        }
+        Command::Setup(command) => run_setup(command, human_style, config, output),
         Command::Repair(command) => run_repair(command, output),
-        Command::Doctor(command) => {
-            let transport = local_transport(output)?;
-            run_doctor(command, &transport, config, output)
-        }
+        Command::Doctor(command) => run_doctor(command, config, output),
         Command::Config { command } => run_config(command, config, output),
         Command::Paths(command) => show_paths(command, output),
-        Command::Host { command } => {
-            let transport = local_transport(output)?;
-            run_host(command, &transport, config, output)
-        }
+        Command::Host { command } => run_host(command, config, output),
         Command::SelfCtl { command } => run_self(command, output),
-        Command::Run(command) => {
-            let transport = local_transport(output)?;
-            run_prompt(command, &transport, config, output)
-        }
-        Command::Steer(command) => {
-            let transport = local_transport(output)?;
-            steer_prompt(command, &transport, config, output)
-        }
-        Command::Status(command) => {
-            let transport = local_transport(output)?;
-            show_status(command, &transport, config, output)
-        }
-        Command::Stop(command) => {
-            let transport = local_transport(output)?;
-            stop_session(command, &transport, config, output)
-        }
-        Command::Logs(command) => {
-            let transport = local_transport(output)?;
-            show_logs(command, &transport, config, output)
-        }
+        Command::Run(command) => run_prompt(command, config, output),
+        Command::Steer(command) => steer_prompt(command, config, output),
+        Command::Status(command) => show_status(command, config, output),
+        Command::Stop(command) => stop_session(command, config, output),
+        Command::Logs(command) => show_logs(command, config, output),
         Command::Support { command } => run_support(command, output),
     }
 }
 
-fn local_transport(_output: OutputFormat) -> Result<LocalTransport, CliFailure> {
-    #[cfg(feature = "test-support")]
-    let json = _output.is_json();
-    #[cfg(feature = "test-support")]
-    match std::env::var(TEST_SUPPORT_ADAPTER_ENV) {
-        Ok(value) if value == "fake" => {
-            return HostService::local_demo_for_tests()
-                .map(LocalTransport::new)
-                .map_err(|error| failure(error, json));
-        }
-        Ok(_) => {
-            return Err(failure(
-                SatelleError::invalid_usage(
-                    "SATELLE_TEST_SUPPORT_ADAPTER must be exactly 'fake' or unset",
-                ),
-                json,
-            ));
-        }
-        Err(std::env::VarError::NotUnicode(_)) => {
-            return Err(failure(
-                SatelleError::invalid_usage(
-                    "SATELLE_TEST_SUPPORT_ADAPTER must contain valid UTF-8",
-                ),
-                json,
-            ));
-        }
-        Err(std::env::VarError::NotPresent) => {}
-    }
-
-    Ok(LocalTransport::new(HostService::production()))
-}
-
 fn run_setup(
     command: SetupCommand,
-    transport: &impl TransportClient,
     style: HumanStyle,
     config: ConfigContext<'_>,
     format: OutputFormat,
@@ -822,6 +587,7 @@ fn run_setup(
     }
 
     let host = config.resolve_host(command.host.as_deref(), json)?;
+    let transport = transport_for(&host, format)?;
     let daemon_path_overrides =
         daemon_path_overrides(&command, &host.config).map_err(|error| failure(error, json))?;
     let setup_components =
@@ -834,7 +600,6 @@ fn run_setup(
 
     let mut report = transport
         .setup(
-            &host,
             command.dry_run,
             setup_mode,
             setup_components,
@@ -1034,7 +799,6 @@ fn run_repair(command: RepairCommand, format: OutputFormat) -> Result<(), CliFai
 
 fn run_doctor(
     command: DoctorCommand,
-    transport: &impl TransportClient,
     config: ConfigContext<'_>,
     format: OutputFormat,
 ) -> Result<(), CliFailure> {
@@ -1070,7 +834,18 @@ fn run_doctor(
             );
         }
     };
-    let report = match transport.doctor(&host, command.scope.as_deref(), command.refresh) {
+    let transport = match transport_for(&host, format) {
+        Ok(transport) => transport,
+        Err(failure) => {
+            return fail_doctor(
+                failure,
+                command.events,
+                &host.alias,
+                command.scope.as_deref(),
+            );
+        }
+    };
+    let report = match transport.doctor(command.scope.as_deref(), command.refresh) {
         Ok(report) => report,
         Err(error) => {
             return fail_doctor(
@@ -1552,6 +1327,11 @@ fn redacted_config_json(
         let Some(host_object) = host.as_object_mut() else {
             continue;
         };
+
+        if let Some(api_token) = host_object.get_mut("api_token") {
+            redact_secret_source_descriptor(api_token, show_secret_references);
+        }
+
         let Some(provider_auth) = host_object
             .get_mut("provider_auth")
             .and_then(serde_json::Value::as_object_mut)
@@ -1560,27 +1340,34 @@ fn redacted_config_json(
         };
 
         for descriptor in provider_auth.values_mut() {
-            let kind = descriptor
-                .get("kind")
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or("unknown")
-                .to_string();
-
-            *descriptor = if show_secret_references {
-                reveal_secret_source_descriptor(&kind, descriptor)
-            } else {
-                json!({
-                    "kind": kind,
-                    "value": null,
-                    "redacted": true,
-                    "redaction_reason": "secret_source_reference",
-                    "source": "user_config",
-                })
-            };
+            redact_secret_source_descriptor(descriptor, show_secret_references);
         }
     }
 
     value
+}
+
+fn redact_secret_source_descriptor(
+    descriptor: &mut serde_json::Value,
+    show_secret_references: bool,
+) {
+    let kind = descriptor
+        .get("kind")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("unknown")
+        .to_string();
+
+    *descriptor = if show_secret_references {
+        reveal_secret_source_descriptor(&kind, descriptor)
+    } else {
+        json!({
+            "kind": kind,
+            "value": null,
+            "redacted": true,
+            "redaction_reason": "secret_source_reference",
+            "source": "user_config",
+        })
+    };
 }
 
 fn reveal_secret_source_descriptor(
@@ -1881,7 +1668,6 @@ fn show_paths(command: PathsCommand, format: OutputFormat) -> Result<(), CliFail
 
 fn run_host(
     command: HostCommand,
-    transport: &impl TransportClient,
     config: ConfigContext<'_>,
     format: OutputFormat,
 ) -> Result<(), CliFailure> {
@@ -1896,8 +1682,9 @@ fn run_host(
         }
         HostCommand::Status(command) => {
             let host = config.resolve_host(command.host.as_deref(), json)?;
+            let transport = transport_for(&host, format)?;
             let status = transport
-                .host_status(&host)
+                .host_status()
                 .map_err(|error| failure(error, json))?;
             if json {
                 print_json(&status).map_err(|error| failure(error, json))
@@ -1923,21 +1710,21 @@ fn run_host(
             json,
         )),
         HostCommand::Update(command) => run_host_update(command, format),
-        HostCommand::Sessions(command) => show_host_sessions(command, transport, config, format),
+        HostCommand::Sessions(command) => show_host_sessions(command, config, format),
         HostCommand::Storage { command } => run_host_storage(command, format),
     }
 }
 
 fn show_host_sessions(
     command: HostSessionsCommand,
-    transport: &impl TransportClient,
     config: ConfigContext<'_>,
     format: OutputFormat,
 ) -> Result<(), CliFailure> {
     let json = format.is_json();
     let host = config.resolve_host(command.host.as_deref(), json)?;
+    let transport = transport_for(&host, format)?;
     let mut report = transport
-        .host_sessions(&host, command.no_bootstrap)
+        .host_sessions(command.no_bootstrap)
         .map_err(|error| failure(error, json))?;
     apply_current_desktop_selection(&mut report, &host.config);
 
@@ -2117,7 +1904,6 @@ fn run_support(command: SupportCommand, format: OutputFormat) -> Result<(), CliF
 
 fn run_prompt(
     command: RunCommand,
-    transport: &impl TransportClient,
     config_context: ConfigContext<'_>,
     format: OutputFormat,
 ) -> Result<(), CliFailure> {
@@ -2133,6 +1919,7 @@ fn run_prompt(
         .resolve_host(command.host.as_deref())
         .map(SelectedHost::from)
         .map_err(|error| failure(error, json))?;
+    let transport = transport_for(&host, format)?;
     let effective_timeouts = effective_timeouts_json(&host.config);
     let yolo_policy = resolve_yolo_policy(
         &config,
@@ -2143,7 +1930,7 @@ fn run_prompt(
     );
     if command.detach {
         let session = transport
-            .run_detached(&host, &prompt)
+            .run_detached(&prompt)
             .map_err(|error| failure(error, json))?;
         return print_detached_session(
             session,
@@ -2155,7 +1942,7 @@ fn run_prompt(
     }
 
     let outcome = transport
-        .run(&host, &prompt)
+        .run(&prompt)
         .map_err(|error| failure(error, json))?;
     print_turn_outcome(
         outcome,
@@ -2174,7 +1961,6 @@ fn run_prompt(
 
 fn steer_prompt(
     command: SteerCommand,
-    transport: &impl TransportClient,
     config_context: ConfigContext<'_>,
     format: OutputFormat,
 ) -> Result<(), CliFailure> {
@@ -2192,6 +1978,7 @@ fn steer_prompt(
         .resolve_host(command.host.as_deref())
         .map(SelectedHost::from)
         .map_err(|error| failure(error, json))?;
+    let transport = transport_for(&host, format)?;
     let effective_timeouts = effective_timeouts_json(&host.config);
     let yolo_policy = resolve_yolo_policy(
         &config,
@@ -2202,7 +1989,7 @@ fn steer_prompt(
     );
     if command.detach {
         let session = transport
-            .steer_detached(&host, &session_id, &prompt)
+            .steer_detached(&session_id, &prompt)
             .map_err(|error| failure(error, json))?;
         return print_detached_session(
             session,
@@ -2214,7 +2001,7 @@ fn steer_prompt(
     }
 
     let outcome = transport
-        .steer(&host, &session_id, &prompt)
+        .steer(&session_id, &prompt)
         .map_err(|error| failure(error, json))?;
     print_turn_outcome(
         outcome,
@@ -2233,7 +2020,6 @@ fn steer_prompt(
 
 fn show_status(
     command: StatusCommand,
-    transport: &impl TransportClient,
     config: ConfigContext<'_>,
     format: OutputFormat,
 ) -> Result<(), CliFailure> {
@@ -2241,8 +2027,9 @@ fn show_status(
     let session_id =
         SessionId::from_str(&command.session_id).map_err(|error| failure(error.into(), json))?;
     let host = config.resolve_host(command.host.as_deref(), json)?;
+    let transport = transport_for(&host, format)?;
     let session = transport
-        .status(&host, &session_id)
+        .status(&session_id)
         .map_err(|error| failure(error, json))?;
 
     if json {
@@ -2255,7 +2042,6 @@ fn show_status(
 
 fn stop_session(
     command: StopCommand,
-    transport: &impl TransportClient,
     config: ConfigContext<'_>,
     format: OutputFormat,
 ) -> Result<(), CliFailure> {
@@ -2263,8 +2049,9 @@ fn stop_session(
     let session_id =
         SessionId::from_str(&command.session_id).map_err(|error| failure(error.into(), json))?;
     let host = config.resolve_host(command.host.as_deref(), json)?;
+    let transport = transport_for(&host, format)?;
     let result = transport
-        .stop(&host, &session_id)
+        .stop(&session_id)
         .map_err(|error| failure(error, json))?;
 
     if json {
@@ -2286,7 +2073,6 @@ fn stop_session(
 
 fn show_logs(
     command: LogsCommand,
-    transport: &impl TransportClient,
     config: ConfigContext<'_>,
     format: OutputFormat,
 ) -> Result<(), CliFailure> {
@@ -2299,9 +2085,10 @@ fn show_logs(
         .transpose()
         .map_err(|error| failure(error.into(), json))?;
     let host = config.resolve_host(command.host.as_deref(), json)?;
+    let transport = transport_for(&host, format)?;
     if let Some(session_id) = &session_id {
         transport
-            .status(&host, session_id)
+            .status(session_id)
             .map_err(|error| failure(error, json))?;
     }
 
@@ -2354,9 +2141,7 @@ fn show_logs(
         }
     }
 
-    let mut entries = transport
-        .logs(&host)
-        .map_err(|error| failure(error, json))?;
+    let mut entries = transport.logs().map_err(|error| failure(error, json))?;
     entries.retain(|entry| {
         session_id
             .as_ref()

@@ -1003,7 +1003,7 @@
 - satelle treats project-level configuration as untrusted repository input @spec @mvp
 - satelle project-level configuration is limited to non-secret shared Host Aliases, model and provider intent, output defaults, timeout defaults, and non-authoritative transport preferences @spec @mvp
 - every project-declared Host Alias resolves through a user-level Satelle Host Binding before remote communication or mutation begins @spec @mvp
-- a user-level Host Binding is selectable by project configuration only when that exact binding sets allow_project_selection = true @spec @mvp
+- a user-level Host Binding is selectable by project configuration only when that exact binding sets allow_project_selection = true @spec @mvp @implemented
 - project Host selection permission is scoped to one exact Host Alias and does not grant mutation consent, YOLO, provider-secret consent, Trusted Profile consent, or sensitive-export consent @spec @mvp
 - a Provider Binding in user-level or Host-owned configuration is selectable by project configuration only when that exact Operator-controlled binding sets allow_project_selection = true @spec @mvp
 - project Provider selection permission is scoped to one exact provider alias and does not grant provider-secret access, endpoint override authority, experimental-provider opt-in, mutation consent, YOLO, or sensitive-export consent @spec @mvp
@@ -1220,6 +1220,7 @@
 - satelle user-level TOML defines named profile overlays under [profiles.<name>], while top-level profile selects a config-file default; project TOML may select profile but cannot define profiles @spec @contract @mvp @implemented
 - satelle profile overlays place host selection at host, model and provider intent at model_alias and provider_alias, provider opt-in at its existing key, host-bound YOLO policy at yolo, and timeout policy under nested timeouts; profile overlays do not define a hosts tree @spec @contract @mvp @implemented
 - satelle selects profiles in precedence order user config default, project config default, SATELLE_PROFILE, then global --profile; selecting an undefined profile reports typed profile-not-found with exit 66 @spec @contract @mvp @implemented
+- a direct Host Binding uses address = "<https-url>", expected_host_id = "<host-id>", api_token = { kind = "file", path = "<absolute-path>" }, and optional ca_bundle = "<absolute-path>"; ordinary authenticated operations fail closed when any required field is missing @spec @mvp @contract @implemented
 
 # roadmap
 
@@ -1633,10 +1634,10 @@
 - satelle allows plaintext HTTP and WebSocket transport only on loopback listeners used locally or through authenticated SSH tunnels @spec @mvp
 - satelle rejects plaintext non-loopback HTTP and WebSocket transport @spec @mvp
 - satelle requires authenticated HTTPS for HTTP and authenticated WSS for WebSocket on every non-loopback direct Host Daemon connection @spec @mvp
-- satelle direct TLS validates the certificate chain and requested Host name against platform trust roots or an explicitly configured user-level CA bundle @spec @mvp
-- a configured CA bundle must be a regular non-symlink file owned by the invoking OS user or a trusted system administrator, must not be writable by unrelated principals, and must use an owner-controlled Windows ACL @spec @mvp
-- satelle direct TLS requires TLS 1.2 or newer @spec @mvp
-- satelle direct TLS reports typed certificate-untrusted, certificate-hostname-mismatch, certificate-expired, and tls-version-unsupported errors before API authentication @spec @mvp
+- satelle direct TLS validates the certificate chain and requested Host name against platform trust roots or an explicitly configured user-level CA bundle @spec @mvp @implemented
+- a configured CA bundle must be a regular non-symlink file owned by the invoking OS user or a trusted system administrator, must not be writable by unrelated principals, and must use an owner-controlled Windows ACL @spec @mvp @implemented
+- satelle direct TLS requires TLS 1.2 or newer @spec @mvp @implemented
+- satelle direct TLS reports typed certificate-untrusted, certificate-hostname-mismatch, certificate-expired, and tls-version-unsupported errors before API authentication @spec @mvp @implemented
 - satelle does not expose an insecure direct-transport option that disables certificate or Host-name verification @spec @mvp
 - satelle MVP does not manage TLS certificate issuance or renewal for non-loopback direct Host Daemon transport @spec @mvp
 - satelle non-loopback direct transport relies on user-provided TLS termination or configured TLS materials outside MVP certificate automation @spec @mvp

@@ -6,6 +6,9 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use tempfile::TempDir;
 
+#[path = "support/test-file.rs"]
+mod test_file;
+
 const TEST_SUPPORT_ADAPTER_ENV: &str = "SATELLE_TEST_SUPPORT_ADAPTER";
 
 struct ConfigFixture {
@@ -29,7 +32,8 @@ impl ConfigFixture {
                 .expect("project config should have a parent"),
         )
         .expect("project config directory should be created");
-        fs::write(&user_config_path, user_config).expect("user config should be written");
+        test_file::write_user_controlled(&user_config_path, user_config)
+            .expect("user config should be written securely");
         fs::write(project_config_path, project_config).expect("project config should be written");
 
         Self {
@@ -203,6 +207,7 @@ adapter = "fake"
 [hosts.project-host]
 transport = "local"
 adapter = "fake"
+allow_project_selection = true
 
 [hosts.environment-host]
 transport = "local"
@@ -277,6 +282,7 @@ default_host = "local-demo"
 [hosts.local-demo]
 transport = "local"
 adapter = "fake"
+allow_project_selection = true
 
 [profiles.unsafe]
 host = "local-demo"
@@ -355,6 +361,7 @@ yolo = true
 [hosts.local-demo]
 transport = "local"
 adapter = "fake"
+allow_project_selection = true
 
 [profiles.safe]
 host = "local-demo"
@@ -442,7 +449,7 @@ hosts = "profiles do not own host trees"
     assert_eq!(error["error"]["code"], "unknown-config-key");
     assert_eq!(error["error"]["path"], "profiles.broken.hosts");
 
-    fs::write(
+    test_file::write_user_controlled(
         &fixture.user_config,
         r#"
 [profiles.unbound]
@@ -459,7 +466,7 @@ yolo = true
             "must bind yolo to a non-empty host alias",
         ));
 
-    fs::write(
+    test_file::write_user_controlled(
         &fixture.user_config,
         r#"
 [profiles.broken.timeouts]
@@ -508,4 +515,291 @@ host = "local-demo"
         .assert()
         .success()
         .stdout(predicate::str::contains(r#""host": "local-demo""#));
+}
+
+#[test]
+fn direct_host_binding_accepts_only_an_external_absolute_token_file_reference() {
+    let token_path = std::env::temp_dir().join("satelle-token-reference");
+    let token_path_literal =
+        toml::Value::String(token_path.to_string_lossy().into_owned()).to_string();
+    let ca_bundle_path = std::env::temp_dir().join("satelle-ca-bundle.pem");
+    let ca_bundle_path_literal =
+        toml::Value::String(ca_bundle_path.to_string_lossy().into_owned()).to_string();
+    let user_config = format!(
+        r#"
+default_host = "remote"
+
+[hosts.remote]
+transport = "direct"
+adapter = "codex"
+address = "https://windows.example.test"
+expected_host_id = "host-windows-11"
+api_token = {{ kind = "file", path = {token_path_literal} }}
+ca_bundle = {ca_bundle_path_literal}
+"#
+    );
+    let fixture = ConfigFixture::new(&user_config, "");
+
+    let hidden = fixture
+        .command()
+        .args(["config", "explain", "--json"])
+        .assert()
+        .success()
+        .get_output()
+        .clone();
+    let hidden = parse_json(&hidden.stdout);
+    assert_eq!(
+        hidden["effective"]["hosts"]["remote"]["api_token"],
+        serde_json::json!({
+            "kind": "file",
+            "value": null,
+            "redacted": true,
+            "redaction_reason": "secret_source_reference",
+            "source": "user_config",
+        })
+    );
+
+    let revealed = fixture
+        .command()
+        .args(["config", "explain", "--show-secret-references", "--json"])
+        .assert()
+        .success()
+        .get_output()
+        .clone();
+    let revealed = parse_json(&revealed.stdout);
+    assert_eq!(
+        revealed["effective"]["hosts"]["remote"]["api_token"],
+        serde_json::json!({
+            "kind": "file",
+            "path": token_path.to_string_lossy(),
+            "redacted": false,
+            "source": "user_config",
+        })
+    );
+    assert_eq!(
+        revealed["effective"]["hosts"]["remote"]["ca_bundle"],
+        serde_json::json!(ca_bundle_path)
+    );
+
+    test_file::write_user_controlled(
+        &fixture.user_config,
+        r#"
+[hosts.remote]
+transport = "direct"
+adapter = "codex"
+address = "https://windows.example.test"
+expected_host_id = "host-windows-11"
+api_token = { kind = "file", path = "relative.token" }
+"#,
+    )
+    .expect("user config should be replaced");
+    let invalid = fixture
+        .command()
+        .args(["config", "check", "--json"])
+        .assert()
+        .code(66)
+        .get_output()
+        .clone();
+    let invalid = parse_json(&invalid.stderr);
+    assert_eq!(invalid["error"]["code"], "secret-file-path-not-absolute");
+    assert_eq!(invalid["error"]["path"], "hosts.remote.api_token.path");
+
+    test_file::write_user_controlled(
+        &fixture.user_config,
+        format!(
+            r#"
+[hosts.remote]
+transport = "direct"
+adapter = "codex"
+address = "https://windows.example.test"
+expected_host_id = "host-windows-11"
+api_token = {{ kind = "file", path = {token_path_literal} }}
+ca_bundle = "relative-ca.pem"
+"#
+        ),
+    )
+    .expect("user config should be replaced");
+    let invalid = fixture
+        .command()
+        .args(["config", "check", "--json"])
+        .assert()
+        .code(66)
+        .get_output()
+        .clone();
+    let invalid = parse_json(&invalid.stderr);
+    assert_eq!(invalid["error"]["code"], "secret-file-path-not-absolute");
+    assert_eq!(invalid["error"]["path"], "hosts.remote.ca_bundle");
+}
+
+#[test]
+fn project_config_cannot_supply_direct_host_authentication() {
+    let fixture = ConfigFixture::new("", "");
+    write_project_config(
+        &fixture.project,
+        r#"
+[hosts.remote]
+transport = "direct"
+adapter = "codex"
+address = "https://attacker.example.test"
+expected_host_id = "host-attacker"
+api_token = { kind = "file", path = "/tmp/attacker.token" }
+"#,
+    );
+
+    let output = fixture
+        .command()
+        .args(["config", "check", "--json"])
+        .assert()
+        .code(66)
+        .get_output()
+        .clone();
+    let error = parse_json(&output.stderr);
+    assert_eq!(error["error"]["code"], "project-secret-source-not-allowed");
+    assert_eq!(error["error"]["path"], "hosts.remote.api_token");
+}
+
+#[test]
+fn project_host_selection_requires_user_authorization_and_explicit_host_bypasses_it() {
+    let fixture = ConfigFixture::new(
+        r#"
+[hosts.remote]
+transport = "local"
+adapter = "fake"
+"#,
+        r#"
+default_host = "remote"
+
+[hosts.remote]
+transport = "local"
+adapter = "fake"
+
+[hosts.remote.timeouts]
+native_readiness = "3s"
+"#,
+    );
+
+    let denied = fixture
+        .command()
+        .args(["config", "explain", "--json"])
+        .assert()
+        .code(66)
+        .get_output()
+        .clone();
+    let denied = parse_json(&denied.stderr);
+    assert_eq!(
+        denied["error"]["code"],
+        "project-host-selection-not-allowed"
+    );
+    assert_eq!(denied["error"]["host"], "remote");
+    assert_eq!(denied["error"]["selection_source"], "project");
+
+    let explicit = fixture
+        .command()
+        .args(["config", "explain", "--host", "remote", "--json"])
+        .assert()
+        .success()
+        .get_output()
+        .clone();
+    assert_eq!(parse_json(&explicit.stdout)["selected_host"], "remote");
+
+    test_file::write_user_controlled(
+        &fixture.user_config,
+        r#"
+[hosts.remote]
+transport = "local"
+adapter = "fake"
+allow_project_selection = true
+"#,
+    )
+    .expect("user config should authorize project host selection");
+    let authorized = fixture
+        .command()
+        .args(["config", "explain", "--json"])
+        .assert()
+        .success()
+        .get_output()
+        .clone();
+    assert_eq!(parse_json(&authorized.stdout)["selected_host"], "remote");
+
+    let built_in = ConfigFixture::new("", "default_host = \"local-demo\"\n");
+    let denied = built_in
+        .command()
+        .args(["config", "explain", "--json"])
+        .assert()
+        .code(66)
+        .get_output()
+        .clone();
+    assert_eq!(
+        parse_json(&denied.stderr)["error"]["code"],
+        "project-host-selection-not-allowed"
+    );
+}
+
+#[test]
+fn project_selected_profile_cannot_select_an_unauthorized_host() {
+    let fixture = ConfigFixture::new(
+        r#"
+[hosts.remote]
+transport = "local"
+adapter = "fake"
+
+[profiles.remote-profile]
+host = "remote"
+"#,
+        r#"
+profile = "remote-profile"
+"#,
+    );
+
+    let denied = fixture
+        .command()
+        .args(["config", "explain", "--json"])
+        .assert()
+        .code(66)
+        .get_output()
+        .clone();
+    assert_eq!(
+        parse_json(&denied.stderr)["error"]["code"],
+        "project-host-selection-not-allowed"
+    );
+
+    let explicit_profile = fixture
+        .command()
+        .args(["config", "explain", "--profile", "remote-profile", "--json"])
+        .assert()
+        .success()
+        .get_output()
+        .clone();
+    let report = parse_json(&explicit_profile.stdout);
+    assert_eq!(report["selected_host"], "remote");
+    assert_eq!(report["sources"]["profile"], "cli_flag");
+}
+
+#[test]
+fn project_config_cannot_authorize_its_own_host_selection() {
+    let fixture = ConfigFixture::new(
+        r#"
+[hosts.remote]
+transport = "local"
+adapter = "fake"
+"#,
+        r#"
+[hosts.remote]
+allow_project_selection = true
+"#,
+    );
+
+    let output = fixture
+        .command()
+        .args(["config", "check", "--json"])
+        .assert()
+        .code(66)
+        .get_output()
+        .clone();
+    let error = parse_json(&output.stderr);
+    assert_eq!(error["error"]["code"], "project-host-selection-not-allowed");
+    assert_eq!(
+        error["error"]["path"],
+        "hosts.remote.allow_project_selection"
+    );
 }
