@@ -569,6 +569,7 @@ fn stop_winning_before_running_skips_adapter_execution_and_returns_stopped() {
         turn_id,
         host_identity,
         &readiness,
+        readiness.execution_policy().clone(),
         started_at,
     )
     .expect("build the initial Session");
@@ -594,6 +595,7 @@ fn stop_winning_before_running_skips_adapter_execution_and_returns_stopped() {
     let plan = super::super::worker::ExecutionPlan {
         host: LOCAL_DEMO_HOST.to_string(),
         prompt: "PRIVATE_STOP_BEFORE_RUNNING".to_string(),
+        execution_mode: satelle_core::session::TurnExecutionMode::Standard,
         work: super::super::worker::TurnWork {
             session,
             subject: recovery_subject,

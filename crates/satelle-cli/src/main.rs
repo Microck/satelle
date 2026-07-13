@@ -5,6 +5,7 @@ mod transport;
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use completions::{CompletionsCommand, run_completions};
 use output::{OutputArgs, OutputFormat, SessionResultSchemaVersion, StatusReport};
+use satelle_core::session::TurnExecutionMode;
 use satelle_core::{
     BEACON_CORAL, CLI_NAME, DaemonPathOverrides, DesktopSessionPreference, DoctorEventRecord,
     DoctorReport, ERROR_RED, ErrorCode, HostConfig, HostSessionsReport, LOCAL_DEMO_HOST,
@@ -13,6 +14,7 @@ use satelle_core::{
     utc_now,
 };
 use satelle_host::TurnOutcome;
+use satelle_transport::TurnRequest;
 use serde_json::json;
 use std::collections::BTreeMap;
 use std::fs;
@@ -1531,6 +1533,16 @@ struct YoloPolicy {
     source: &'static str,
 }
 
+impl YoloPolicy {
+    const fn execution_mode(&self) -> TurnExecutionMode {
+        if self.active {
+            TurnExecutionMode::Yolo
+        } else {
+            TurnExecutionMode::Standard
+        }
+    }
+}
+
 fn resolve_yolo_policy(
     config: &satelle_core::ResolvedConfig,
     selected_host: &str,
@@ -1928,9 +1940,10 @@ fn run_prompt(
         command.yolo,
         command.no_yolo,
     );
+    let request = TurnRequest::new(prompt).with_execution_mode(yolo_policy.execution_mode());
     if command.detach {
         let session = transport
-            .run_detached(&prompt)
+            .run_detached(&request)
             .map_err(|error| failure(error, json))?;
         return print_detached_session(
             session,
@@ -1942,7 +1955,7 @@ fn run_prompt(
     }
 
     let outcome = transport
-        .run(&prompt)
+        .run(&request)
         .map_err(|error| failure(error, json))?;
     print_turn_outcome(
         outcome,
@@ -1987,9 +2000,10 @@ fn steer_prompt(
         command.yolo,
         command.no_yolo,
     );
+    let request = TurnRequest::new(prompt).with_execution_mode(yolo_policy.execution_mode());
     if command.detach {
         let session = transport
-            .steer_detached(&session_id, &prompt)
+            .steer_detached(&session_id, &request)
             .map_err(|error| failure(error, json))?;
         return print_detached_session(
             session,
@@ -2001,7 +2015,7 @@ fn steer_prompt(
     }
 
     let outcome = transport
-        .steer(&session_id, &prompt)
+        .steer(&session_id, &request)
         .map_err(|error| failure(error, json))?;
     print_turn_outcome(
         outcome,

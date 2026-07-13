@@ -4,7 +4,9 @@ use crate::storage::{ApiTokenRegistration, IdempotentOperation};
 use crate::{
     ApiBearerToken, ApiPrincipal, ApiScopes, HostMode, HostService, ProductionCapabilitySnapshot,
 };
-use satelle_core::session::{PublicSession, SessionStateRevision, TurnStateRevision};
+use satelle_core::session::{
+    PublicSession, SessionStateRevision, TurnExecutionMode, TurnStateRevision,
+};
 use satelle_core::{DesktopSessionRecord, LOCAL_DEMO_HOST, SatelleError, SessionId, StopResult};
 use serde::Serialize;
 use std::fmt;
@@ -13,7 +15,8 @@ use time::OffsetDateTime;
 use zeroize::Zeroizing;
 
 const MAX_IDEMPOTENCY_KEY_BYTES: usize = 256;
-const IDEMPOTENCY_DIGEST_SCHEMA_VERSION: u16 = 1;
+const TURN_IDEMPOTENCY_DIGEST_SCHEMA_VERSION: u16 = 2;
+const STOP_IDEMPOTENCY_DIGEST_SCHEMA_VERSION: u16 = 1;
 
 /// A diagnostic-safe snapshot captured from the daemon-owned runtime after
 /// storage has opened and restart recovery has been reconciled.
@@ -103,15 +106,22 @@ pub enum MutationAuthorityError {
 /// exist.
 pub struct TurnIntent {
     prompt: String,
+    execution_mode: TurnExecutionMode,
 }
 
 impl TurnIntent {
-    pub fn new(prompt: impl Into<String>) -> Result<Self, TurnIntentError> {
+    pub fn new(
+        prompt: impl Into<String>,
+        execution_mode: TurnExecutionMode,
+    ) -> Result<Self, TurnIntentError> {
         let prompt = prompt.into();
         if prompt.is_empty() {
             return Err(TurnIntentError::EmptyPrompt);
         }
-        Ok(Self { prompt })
+        Ok(Self {
+            prompt,
+            execution_mode,
+        })
     }
 }
 
@@ -120,6 +130,7 @@ impl fmt::Debug for TurnIntent {
         formatter
             .debug_struct("TurnIntent")
             .field("prompt_bytes", &self.prompt.len())
+            .field("execution_mode", &self.execution_mode)
             .finish_non_exhaustive()
     }
 }
@@ -163,6 +174,7 @@ impl StopAdmission {
 struct CanonicalSessionCreate<'a> {
     operation: &'static str,
     prompt: &'a str,
+    execution_mode: TurnExecutionMode,
 }
 
 #[derive(Serialize)]
@@ -170,6 +182,7 @@ struct CanonicalTurnCreate<'a> {
     operation: &'static str,
     session_id: &'a str,
     prompt: &'a str,
+    execution_mode: TurnExecutionMode,
 }
 
 #[derive(Serialize)]
@@ -335,10 +348,14 @@ impl HostService {
         intent: &TurnIntent,
         authority: &MutationAuthority,
     ) -> Result<PublicSession, SatelleError> {
-        let canonical_payload = canonical_payload(&CanonicalSessionCreate {
-            operation: "session_create",
-            prompt: &intent.prompt,
-        })?;
+        let canonical_payload = canonical_payload(
+            &CanonicalSessionCreate {
+                operation: "session_create",
+                prompt: &intent.prompt,
+                execution_mode: intent.execution_mode,
+            },
+            TURN_IDEMPOTENCY_DIGEST_SCHEMA_VERSION,
+        )?;
         let identity = self.runtime.authenticated_request_identity(
             &authority.principal,
             IdempotentOperation::Run,
@@ -346,11 +363,10 @@ impl HostService {
             canonical_payload.as_slice(),
             canonical_payload.digest_schema_version,
         )?;
-        let outcome = self.runtime.run(RunCommand::detached_with_identity(
-            LOCAL_DEMO_HOST,
-            &intent.prompt,
-            identity,
-        ))?;
+        let outcome = self.runtime.run(
+            RunCommand::detached_with_identity(LOCAL_DEMO_HOST, &intent.prompt, identity)
+                .with_execution_mode(intent.execution_mode),
+        )?;
         Ok(outcome.public_session)
     }
 
@@ -360,11 +376,15 @@ impl HostService {
         intent: &TurnIntent,
         authority: &MutationAuthority,
     ) -> Result<PublicSession, SatelleError> {
-        let canonical_payload = canonical_payload(&CanonicalTurnCreate {
-            operation: "turn_create",
-            session_id: session_id.as_str(),
-            prompt: &intent.prompt,
-        })?;
+        let canonical_payload = canonical_payload(
+            &CanonicalTurnCreate {
+                operation: "turn_create",
+                session_id: session_id.as_str(),
+                prompt: &intent.prompt,
+                execution_mode: intent.execution_mode,
+            },
+            TURN_IDEMPOTENCY_DIGEST_SCHEMA_VERSION,
+        )?;
         let identity = self.runtime.authenticated_request_identity(
             &authority.principal,
             IdempotentOperation::Steer,
@@ -372,11 +392,10 @@ impl HostService {
             canonical_payload.as_slice(),
             canonical_payload.digest_schema_version,
         )?;
-        let outcome = self.runtime.steer(SteerCommand::detached_with_identity(
-            session_id.clone(),
-            &intent.prompt,
-            identity,
-        ))?;
+        let outcome = self.runtime.steer(
+            SteerCommand::detached_with_identity(session_id.clone(), &intent.prompt, identity)
+                .with_execution_mode(intent.execution_mode),
+        )?;
         Ok(outcome.public_session)
     }
 
@@ -385,10 +404,13 @@ impl HostService {
         session_id: &SessionId,
         authority: &MutationAuthority,
     ) -> Result<StopAdmission, SatelleError> {
-        let canonical_payload = canonical_payload(&CanonicalSessionStop {
-            operation: "session_stop",
-            session_id: session_id.as_str(),
-        })?;
+        let canonical_payload = canonical_payload(
+            &CanonicalSessionStop {
+                operation: "session_stop",
+                session_id: session_id.as_str(),
+            },
+            STOP_IDEMPOTENCY_DIGEST_SCHEMA_VERSION,
+        )?;
         let identity = self.runtime.authenticated_request_identity(
             &authority.principal,
             IdempotentOperation::Stop,
@@ -450,8 +472,10 @@ fn daemon_status(snapshot: crate::runtime::RuntimeSnapshot) -> DaemonRuntimeStat
     }
 }
 
-fn canonical_payload<T: Serialize>(value: &T) -> Result<SensitiveCanonicalPayload, SatelleError> {
-    let digest_schema_version = IDEMPOTENCY_DIGEST_SCHEMA_VERSION;
+fn canonical_payload<T: Serialize>(
+    value: &T,
+    digest_schema_version: u16,
+) -> Result<SensitiveCanonicalPayload, SatelleError> {
     let envelope = CanonicalPayloadEnvelope {
         digest_schema_version,
         payload: value,
@@ -488,6 +512,53 @@ fn authentication_state_failure() -> SatelleError {
 mod tests {
     use super::*;
     use crate::LiveEventReceiveError;
+
+    #[test]
+    fn idempotency_digest_versions_change_only_for_turn_payloads() {
+        let turn = canonical_payload(
+            &CanonicalSessionCreate {
+                operation: "session_create",
+                prompt: "PRIVATE_DIGEST_VERSION_PROMPT",
+                execution_mode: TurnExecutionMode::Yolo,
+            },
+            TURN_IDEMPOTENCY_DIGEST_SCHEMA_VERSION,
+        )
+        .expect("serialize Turn idempotency payload");
+        assert_eq!(turn.digest_schema_version, 2);
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(turn.as_slice())
+                .expect("decode Turn payload"),
+            serde_json::json!({
+                "digest_schema_version": 2,
+                "payload": {
+                    "operation": "session_create",
+                    "prompt": "PRIVATE_DIGEST_VERSION_PROMPT",
+                    "execution_mode": "yolo"
+                }
+            })
+        );
+
+        let stop = canonical_payload(
+            &CanonicalSessionStop {
+                operation: "session_stop",
+                session_id: "rs_01890a5d-ac96-7b7c-8f89-37c3d0a66e11",
+            },
+            STOP_IDEMPOTENCY_DIGEST_SCHEMA_VERSION,
+        )
+        .expect("serialize stop idempotency payload");
+        assert_eq!(stop.digest_schema_version, 1);
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(stop.as_slice())
+                .expect("decode stop payload"),
+            serde_json::json!({
+                "digest_schema_version": 1,
+                "payload": {
+                    "operation": "session_stop",
+                    "session_id": "rs_01890a5d-ac96-7b7c-8f89-37c3d0a66e11"
+                }
+            })
+        );
+    }
 
     #[test]
     fn daemon_initialization_and_authentication_share_one_runtime_owner() {
@@ -533,7 +604,8 @@ mod tests {
             .register_api_token(&token, "principal-test", ApiScopes::CONTROL, None)
             .expect("register API token");
         let prompt = "PRIVATE_AUTHENTICATED_PROMPT_CANARY";
-        let intent = TurnIntent::new(prompt).expect("construct turn intent");
+        let intent =
+            TurnIntent::new(prompt, TurnExecutionMode::Standard).expect("construct turn intent");
         let authority =
             MutationAuthority::new(principal.clone(), "01890a5d-ac96-7b7c-8f89-37c3d0a66e90")
                 .expect("construct mutation authority");
@@ -547,7 +619,8 @@ mod tests {
             .expect("finish first turn");
 
         let follow_up =
-            TurnIntent::new("SECOND_PRIVATE_PROMPT_CANARY").expect("construct follow-up intent");
+            TurnIntent::new("SECOND_PRIVATE_PROMPT_CANARY", TurnExecutionMode::Standard)
+                .expect("construct follow-up intent");
         let follow_up_authority =
             MutationAuthority::new(principal, "01890a5d-ac96-7b7c-8f89-37c3d0a66e91")
                 .expect("construct follow-up authority");
@@ -581,7 +654,15 @@ mod tests {
         );
         assert!(!format!("{intent:?} {authority:?}").contains(prompt));
 
-        let changed = TurnIntent::new(format!("{prompt}-changed")).expect("changed turn intent");
+        let changed_mode = TurnIntent::new(prompt, TurnExecutionMode::Yolo)
+            .expect("construct changed-mode turn intent");
+        let error = service
+            .admit_run(&changed_mode, &authority)
+            .expect_err("changed execution mode must conflict");
+        assert_eq!(error.code, satelle_core::ErrorCode::IdempotencyKeyConflict);
+
+        let changed = TurnIntent::new(format!("{prompt}-changed"), TurnExecutionMode::Standard)
+            .expect("changed turn intent");
         let error = service
             .admit_run(&changed, &authority)
             .expect_err("changed payload must conflict");
@@ -598,7 +679,8 @@ mod tests {
         let principal = service
             .register_api_token(&token, "principal-events", ApiScopes::CONTROL, None)
             .expect("register API token");
-        let intent = TurnIntent::new("PRIVATE_EVENT_PROMPT").expect("construct Turn intent");
+        let intent = TurnIntent::new("PRIVATE_EVENT_PROMPT", TurnExecutionMode::Standard)
+            .expect("construct Turn intent");
         let authority = MutationAuthority::new(principal, "01890a5d-ac96-7b7c-8f89-37c3d0a66e92")
             .expect("construct mutation authority");
         let mut subscription = service

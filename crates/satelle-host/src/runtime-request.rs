@@ -1,3 +1,4 @@
+use satelle_core::session::TurnExecutionMode;
 use satelle_core::{SessionId, TurnId};
 
 #[derive(Clone)]
@@ -67,6 +68,7 @@ pub(crate) struct RunCommand<'a> {
     pub(super) prompt: &'a str,
     pub(super) dispatch: DispatchPreference,
     pub(super) identity: RequestIdentity,
+    pub(super) execution_mode: TurnExecutionMode,
 }
 
 #[derive(Clone, Copy)]
@@ -90,6 +92,7 @@ impl<'a> RunCommand<'a> {
             prompt,
             dispatch: DispatchPreference::Inline,
             identity,
+            execution_mode: TurnExecutionMode::Standard,
         }
     }
 
@@ -107,7 +110,13 @@ impl<'a> RunCommand<'a> {
             prompt,
             dispatch: DispatchPreference::Detached,
             identity,
+            execution_mode: TurnExecutionMode::Standard,
         }
+    }
+
+    pub(crate) fn with_execution_mode(mut self, execution_mode: TurnExecutionMode) -> Self {
+        self.execution_mode = execution_mode;
+        self
     }
 }
 
@@ -116,6 +125,7 @@ pub(crate) struct SteerCommand<'a> {
     pub(super) prompt: &'a str,
     pub(super) dispatch: DispatchPreference,
     pub(super) identity: RequestIdentity,
+    pub(super) execution_mode: TurnExecutionMode,
 }
 
 impl<'a> SteerCommand<'a> {
@@ -133,6 +143,7 @@ impl<'a> SteerCommand<'a> {
             prompt,
             dispatch: DispatchPreference::Inline,
             identity,
+            execution_mode: TurnExecutionMode::Standard,
         }
     }
 
@@ -150,7 +161,13 @@ impl<'a> SteerCommand<'a> {
             prompt,
             dispatch: DispatchPreference::Detached,
             identity,
+            execution_mode: TurnExecutionMode::Standard,
         }
+    }
+
+    pub(crate) fn with_execution_mode(mut self, execution_mode: TurnExecutionMode) -> Self {
+        self.execution_mode = execution_mode;
+        self
     }
 }
 

@@ -21,6 +21,8 @@ The product requirements are the following `.facts` entries:
   Linux is a Controller Platform, not a native Computer Use Host Platform.
 - `r7b`, `9uvm`, and `k0f`: native prompts remain operator-visible unless a
   stable callback exists, and capability probes outrank remembered docs.
+- `hbqw`, `b3i`, and `q0a`: YOLO applies the documented Codex approval and
+  sandbox settings without extending into native or operating-system prompts.
 - `pr0`, `h2e`, and `sj4`: Satelle steer starts a follow-up Turn on the same
   Session and may return after that new Turn starts.
 
@@ -110,6 +112,23 @@ requests:
 - `item/fileChange/requestApproval`
 - `item/permissions/requestApproval`
 
+Satelle uses this closed response mapping when the committed Turn Execution
+Policy has approval `never` and sandbox `danger-full-access`:
+
+| Server request | YOLO response | Scope |
+| --- | --- | --- |
+| `item/commandExecution/requestApproval` | `{"decision":"accept"}` | Current request only |
+| `item/fileChange/requestApproval` | `{"decision":"accept"}` | Current request only |
+| `item/permissions/requestApproval` | Echo the requested `fileSystem` and `network` profile with `"scope":"turn"` | Current Turn only |
+| `applyPatchApproval` | `{"decision":"approved"}` | Current deprecated request only |
+| `execCommandApproval` | `{"decision":"approved"}` | Current deprecated request only |
+
+Satelle deliberately does not return `acceptForSession`,
+`approved_for_session`, exec-policy amendments, or network-policy amendments.
+Those responses persist authority beyond the callback currently being handled.
+Permission responses reject top-level fields outside the pinned `fileSystem`
+and `network` profile before anything is echoed to app-server.
+
 It does not contain a documented native Computer Use app-approval or
 sensitive-action callback. The current official manual also says Computer Use
 app approvals surface directly to the user and are separate from shell, file,
@@ -127,7 +146,9 @@ Therefore Satelle Phase 0 must distinguish two outcomes:
 Satelle must not auto-answer native app, operating-system, administrator,
 security, or sensitive-action prompts unless a documented stable callback
 explicitly permits it. Terminal UI scraping and undocumented GUI automation are
-not fallback transports.
+not fallback transports. MCP elicitation, dynamic tool calls, user-input
+requests, unknown methods, and future approval-like method names are not part of
+the YOLO allowlist and remain declined, failed, or unsupported.
 
 ## Typed blocker contract
 

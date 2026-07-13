@@ -336,6 +336,25 @@ fn adapter_receives_committed_policy_and_resumes_the_private_thread_reference() 
 }
 
 #[test]
+fn yolo_turn_commits_never_and_danger_full_access_before_adapter_execution() {
+    let state = crate::TestStateDir::new().expect("temporary state directory should exist");
+    let adapter = BoundaryInspectingAdapter {
+        expected_mode: satelle_core::session::TurnExecutionMode::Yolo,
+        ..BoundaryInspectingAdapter::default()
+    };
+    let runtime = RuntimeHandle::new(Ok(state.path().to_path_buf()), adapter.clone());
+
+    runtime
+        .run(
+            RunCommand::attached(LOCAL_DEMO_HOST, "PRIVATE_YOLO_POLICY_PROMPT")
+                .with_execution_mode(satelle_core::session::TurnExecutionMode::Yolo),
+        )
+        .expect("YOLO Turn should execute through the committed policy boundary");
+
+    assert_eq!(adapter.execute_calls.load(Ordering::SeqCst), 1);
+}
+
+#[test]
 fn read_paths_open_storage_without_computer_use_preflight() {
     let state = crate::TestStateDir::new().expect("temporary state directory should exist");
     let state_root = state.path().to_path_buf();
@@ -714,6 +733,7 @@ struct ReferencePersistingAdapter {
 struct BoundaryInspectingAdapter {
     execute_calls: Arc<AtomicUsize>,
     expected_policy: Arc<Mutex<Option<satelle_core::session::ExecutionPolicy>>>,
+    expected_mode: satelle_core::session::TurnExecutionMode,
 }
 
 impl super::ComputerUseAdapter for BoundaryInspectingAdapter {
@@ -722,8 +742,11 @@ impl super::ComputerUseAdapter for BoundaryInspectingAdapter {
         *self
             .expected_policy
             .lock()
-            .expect("the policy expectation lock should not be poisoned") =
-            Some(readiness.execution_policy().clone());
+            .expect("the policy expectation lock should not be poisoned") = Some(
+            readiness
+                .execution_policy()
+                .for_turn_mode(self.expected_mode),
+        );
         Ok(readiness)
     }
 
@@ -740,6 +763,7 @@ impl super::ComputerUseAdapter for BoundaryInspectingAdapter {
             request.execution_policy(),
             expected_policy.as_ref().unwrap()
         );
+        assert_eq!(request.execution_mode(), self.expected_mode);
         match call {
             0 => {
                 assert_eq!(request.upstream_thread_ref(), None);

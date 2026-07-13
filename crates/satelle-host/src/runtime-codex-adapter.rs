@@ -198,6 +198,7 @@ impl ComputerUseAdapter for ProductionComputerUseAdapter {
                 existing_thread_ref: request.upstream_thread_ref(),
                 model: policy.effective_model().as_str(),
                 model_provider: policy.provider_binding().as_str(),
+                execution_mode: request.execution_mode(),
                 approval_policy,
                 sandbox_policy,
                 deadline,
