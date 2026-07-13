@@ -49,6 +49,7 @@ fn failure(error: &SatelleError) -> ApiFailure {
         | ErrorCode::ProjectYoloEnableNotAllowed
         | ErrorCode::ProjectExperimentalProviderOptInNotAllowed
         | ErrorCode::ProjectMutationConsentNotAllowed
+        | ErrorCode::ProjectHostSelectionNotAllowed
         | ErrorCode::ProjectSecretSourceNotAllowed
         | ErrorCode::ProjectCredentialHelperNotAllowed
         | ErrorCode::UnsupportedSecretSourceKind
@@ -179,16 +180,23 @@ fn failure(error: &SatelleError) -> ApiFailure {
         },
         // Completion installation and profile activation are Controller-local workflows. If
         // either code crosses the Host boundary, expose only the stable internal-error contract.
-        ErrorCode::CompletionInstallFailed | ErrorCode::CompletionProfileUpdateFailed => {
-            ApiFailure {
-                status: StatusCode::INTERNAL_SERVER_ERROR,
-                code: ApiErrorCode::InternalError,
-                category: ApiErrorCategory::Internal,
-                retryable: false,
-                message: "the Host operation failed unexpectedly",
-                details: None,
-            }
-        }
+        ErrorCode::CompletionInstallFailed
+        | ErrorCode::CompletionProfileUpdateFailed
+        | ErrorCode::CertificateUntrusted
+        | ErrorCode::CertificateHostnameMismatch
+        | ErrorCode::CertificateExpired
+        | ErrorCode::TlsVersionUnsupported
+        | ErrorCode::TlsHandshakeFailed
+        | ErrorCode::AuthenticationFailed
+        | ErrorCode::AuthorizationInsufficientScope
+        | ErrorCode::HostIdentityMismatch => ApiFailure {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            code: ApiErrorCode::InternalError,
+            category: ApiErrorCategory::Internal,
+            retryable: false,
+            message: "the Host operation failed unexpectedly",
+            details: None,
+        },
         ErrorCode::CapacityExceeded | ErrorCode::ConcurrencyLimitExceeded => ApiFailure {
             status: StatusCode::SERVICE_UNAVAILABLE,
             code: ApiErrorCode::CapacityExceeded,

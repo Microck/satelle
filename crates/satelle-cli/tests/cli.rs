@@ -6,6 +6,9 @@ use serde_json::Value;
 use std::collections::BTreeSet;
 use std::fs;
 
+#[path = "support/test-file.rs"]
+mod test_file;
+
 const TEST_SUPPORT_ADAPTER_ENV: &str = "SATELLE_TEST_SUPPORT_ADAPTER";
 
 fn satelle() -> Command {
@@ -34,6 +37,13 @@ fn production_satelle() -> Command {
 
 fn state_dir() -> TestStateDir {
     TestStateDir::new().expect("secure temp state directory should be created")
+}
+
+fn write_user_config(
+    path: impl AsRef<std::path::Path>,
+    contents: impl AsRef<[u8]>,
+) -> std::io::Result<()> {
+    test_file::write_user_controlled(path.as_ref(), contents)
 }
 
 fn absolute_test_path(components: &[&str]) -> std::path::PathBuf {
@@ -298,7 +308,7 @@ fn legacy_environment_namespace_is_ignored() {
     let satelle_home = state.path().join("satelle-home");
     let config_file = satelle_home.join("config").join("config.toml");
     fs::create_dir_all(config_file.parent().unwrap()).expect("config dir should be created");
-    fs::write(
+    write_user_config(
         &config_file,
         r#"
 default_host = "project-host"
@@ -1667,7 +1677,7 @@ fn setup_provider_auth_no_input_reports_required_descriptor_without_prompting() 
     assert!(!state.path().join("local-demo-state.json").exists());
 
     let user_config = state.path().join("user-config.toml");
-    fs::write(
+    write_user_config(
         &user_config,
         r#"
 default_host = "local-demo"
@@ -1986,7 +1996,7 @@ fn setup_uses_user_config_daemon_path_defaults_with_flags_taking_precedence() {
     let daemon_state_dir = absolute_test_path(&["srv", "satelle", "state-from-config"]);
     let daemon_log_dir = absolute_test_path(&["srv", "satelle", "logs-from-config"]);
     let flag_log_dir = absolute_test_path(&["srv", "satelle", "logs-from-flag"]);
-    fs::write(
+    write_user_config(
         &user_config,
         format!(
             r#"
@@ -2077,7 +2087,7 @@ fn config_precedence_is_flags_over_project_over_user_over_defaults() {
     let user_config = state.path().join("xdg").join("satelle");
     let user_config_file = user_config.join("config.toml");
     fs::create_dir_all(&user_config).expect("user config dir should be created");
-    fs::write(
+    write_user_config(
         &user_config_file,
         r#"
 default_host = "user-host"
@@ -2085,6 +2095,11 @@ default_host = "user-host"
 [hosts.user-host]
 transport = "local"
 adapter = "fake"
+
+[hosts.project-host]
+transport = "local"
+adapter = "fake"
+allow_project_selection = true
 
 [profiles.environment-profile]
 
@@ -2100,10 +2115,6 @@ adapter = "fake"
         project_config.join("config.toml"),
         r#"
 default_host = "project-host"
-
-[hosts.project-host]
-transport = "local"
-adapter = "fake"
 "#,
     )
     .expect("project config should be written");
@@ -2190,7 +2201,7 @@ fn config_explain_reports_model_and_provider_alias_intent() {
     let state = state_dir();
     let user_config = state.path().join("xdg").join("satelle");
     fs::create_dir_all(&user_config).expect("user config dir should be created");
-    fs::write(
+    write_user_config(
         user_config.join("config.toml"),
         r#"
 default_host = "local-demo"
@@ -2261,7 +2272,7 @@ provider_alias = "anthropic"
 fn config_explain_reports_user_level_experimental_provider_opt_in() {
     let state = state_dir();
     let user_config = state.path().join("user-config.toml");
-    fs::write(
+    write_user_config(
         &user_config,
         r#"
 default_host = "local-demo"
@@ -2293,7 +2304,7 @@ adapter = "fake"
     assert_eq!(experimental["source"], "user_config_global");
     assert_eq!(experimental["selected_by_cli_flag"], false);
 
-    fs::write(
+    write_user_config(
         &user_config,
         r#"
 default_host = "local-demo"
@@ -2331,7 +2342,7 @@ experimental_provider_computer_use = false
 fn yolo_policy_resolves_from_user_config_and_config_explain_reports_source() {
     let state = state_dir();
     let user_config = state.path().join("user-config.toml");
-    fs::write(
+    write_user_config(
         &user_config,
         r#"
 default_host = "local-demo"
@@ -2372,7 +2383,7 @@ yolo = false
 fn run_and_steer_report_yolo_state_and_flags_override_config() {
     let state = state_dir();
     let user_config = state.path().join("user-config.toml");
-    fs::write(
+    write_user_config(
         &user_config,
         r#"
 default_host = "local-demo"
@@ -2668,10 +2679,6 @@ fn config_check_explain_and_paths_use_versioned_read_only_json_contracts() {
         project.join(".satelle").join("config.toml"),
         r#"
 default_host = "local-demo"
-
-[hosts.local-demo]
-transport = "local"
-adapter = "fake"
 "#,
     )
     .expect("project config should be written");
@@ -2679,7 +2686,7 @@ adapter = "fake"
     let check_output = satelle()
         .current_dir(&project)
         .env("SATELLE_STATE_DIR", state.path())
-        .args(["config", "check", "--json"])
+        .args(["config", "check", "--host", "local-demo", "--json"])
         .assert()
         .success()
         .get_output()
@@ -2699,7 +2706,7 @@ adapter = "fake"
     let explain_output = satelle()
         .current_dir(&project)
         .env("SATELLE_STATE_DIR", state.path())
-        .args(["config", "explain", "--json"])
+        .args(["config", "explain", "--host", "local-demo", "--json"])
         .assert()
         .success()
         .get_output()
@@ -2825,10 +2832,6 @@ fn project_config_discovery_walks_up_to_nearest_satelle_config() {
         project.join(".satelle").join("config.toml"),
         r#"
 default_host = "local-demo"
-
-[hosts.local-demo]
-transport = "local"
-adapter = "fake"
 "#,
     )
     .expect("project config should be written");
@@ -2836,7 +2839,7 @@ adapter = "fake"
     let output = satelle()
         .current_dir(&nested)
         .env("SATELLE_STATE_DIR", state.path())
-        .args(["config", "check", "--json"])
+        .args(["config", "check", "--host", "local-demo", "--json"])
         .assert()
         .success()
         .get_output()
@@ -3058,7 +3061,7 @@ credential_helper = { argv = ["/usr/bin/op", "read", "secret"] }
 fn user_host_config_accepts_desktop_binding_and_daemon_path_fields() {
     let state = state_dir();
     let user_config = state.path().join("user-config.toml");
-    fs::write(
+    write_user_config(
         &user_config,
         r#"
 default_host = "local-demo"
@@ -3111,7 +3114,7 @@ daemon_log_dir = "/srv/satelle/logs"
         "satelle_service_configuration"
     );
 
-    fs::write(
+    write_user_config(
         &user_config,
         r#"
 default_host = "local-demo"
@@ -3149,7 +3152,7 @@ value = "42"
 fn config_rejects_portable_and_native_desktop_selectors_together() {
     let state = state_dir();
     let user_config = state.path().join("user-config.toml");
-    fs::write(
+    write_user_config(
         &user_config,
         r#"
 default_host = "local-demo"
@@ -3194,7 +3197,7 @@ fn provider_auth_secret_sources_are_host_resolved_and_redacted_in_config_explain
     let state = state_dir();
     let user_config = state.path().join("user-config.toml");
     let secret_file = absolute_test_path(&["run", "secrets", "openai-api-key"]);
-    fs::write(
+    write_user_config(
         &user_config,
         format!(
             r#"
@@ -3338,7 +3341,7 @@ path = "~/openai-key"
     ];
 
     for (config, code, path, detail_key, detail_value) in cases {
-        fs::write(&user_config, config).expect("user config should be written");
+        write_user_config(&user_config, config).expect("user config should be written");
 
         let output = satelle()
             .env("SATELLE_CONFIG_FILE", &user_config)
@@ -3407,6 +3410,7 @@ default_host = "${EXAMPLE_HOST}"
 transport = "local"
 adapter = "fake"
 address = "$EXAMPLE_ADDRESS"
+ca_bundle = "${EXAMPLE_CA_BUNDLE}"
 
 [hosts.local-demo.network]
 provider = "tailscale"
@@ -3434,7 +3438,7 @@ hostname = "%EXAMPLE_HOSTNAME%"
     );
     assert_eq!(error["path"], "default_host");
     assert_eq!(error["syntax"], "${EXAMPLE_HOST}");
-    assert_eq!(error["unsupported_syntax"].as_array().unwrap().len(), 3);
+    assert_eq!(error["unsupported_syntax"].as_array().unwrap().len(), 4);
     assert_eq!(
         error["unsupported_syntax"][1]["path"],
         "hosts.local-demo.address"
@@ -3442,10 +3446,18 @@ hostname = "%EXAMPLE_HOSTNAME%"
     assert_eq!(error["unsupported_syntax"][1]["syntax"], "$EXAMPLE_ADDRESS");
     assert_eq!(
         error["unsupported_syntax"][2]["path"],
-        "hosts.local-demo.network.hostname"
+        "hosts.local-demo.ca_bundle"
     );
     assert_eq!(
         error["unsupported_syntax"][2]["syntax"],
+        "${EXAMPLE_CA_BUNDLE}"
+    );
+    assert_eq!(
+        error["unsupported_syntax"][3]["path"],
+        "hosts.local-demo.network.hostname"
+    );
+    assert_eq!(
+        error["unsupported_syntax"][3]["syntax"],
         "%EXAMPLE_HOSTNAME%"
     );
 }
@@ -3471,7 +3483,7 @@ address = "~/satelle-host.sock"
     let output = satelle()
         .current_dir(&project)
         .env("SATELLE_STATE_DIR", state.path())
-        .args(["config", "explain", "--json"])
+        .args(["config", "explain", "--host", "local-demo", "--json"])
         .assert()
         .success()
         .get_output()
@@ -3528,7 +3540,7 @@ provider_smoke_test = "2m"
     let output = satelle()
         .current_dir(&project)
         .env("SATELLE_STATE_DIR", state.path())
-        .args(["config", "explain", "--json"])
+        .args(["config", "explain", "--host", "local-demo", "--json"])
         .assert()
         .success()
         .get_output()
@@ -3803,7 +3815,7 @@ value = "inactive"
     ];
 
     for (case, selection, expected) in cases {
-        fs::write(
+        write_user_config(
             &user_config,
             format!(
                 r#"
