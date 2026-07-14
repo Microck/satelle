@@ -1,5 +1,7 @@
 #[path = "http/desktop-sessions.rs"]
 mod desktop_sessions;
+#[path = "http/event-client.rs"]
+mod event_client;
 #[path = "http/events.rs"]
 mod events;
 #[path = "http/logs.rs"]

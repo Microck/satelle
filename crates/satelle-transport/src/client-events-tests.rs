@@ -65,6 +65,14 @@ fn subscription_acknowledgement_must_echo_the_exact_context() {
 }
 
 #[test]
+fn request_id_mismatch_diagnostic_covers_every_protocol_phase() {
+    assert_eq!(
+        "the live event protocol response did not match the request ID",
+        DaemonEventError::RequestIdMismatch.to_string()
+    );
+}
+
+#[test]
 fn direct_event_client_rejects_invalid_ca_bundles() {
     let binding = direct_binding("https://localhost:8443").expect("construct direct Host Binding");
 
