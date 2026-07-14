@@ -1,6 +1,6 @@
 use super::codec::unix_timestamp_nanos;
 use super::open::sqlite_error;
-use super::sql::prune_expired_logs;
+use super::sql::{logs_need_pruning, prune_expired_logs};
 use super::{Storage, StorageError, StorageErrorKind};
 use rusqlite::{Connection, Transaction, TransactionBehavior, params};
 use satelle_core::SessionId;
@@ -55,6 +55,9 @@ fn session_retention_needs_pruning(
     cutoff_nanos: i64,
     observed_at: OffsetDateTime,
 ) -> Result<bool, StorageError> {
+    if logs_need_pruning(connection, observed_at)? {
+        return Ok(true);
+    }
     for session_id in terminal_session_candidates(connection, cutoff, cutoff_nanos)? {
         if idempotency_records_allow_deletion(connection, &session_id, observed_at)? {
             return Ok(true);
@@ -123,19 +126,17 @@ fn idempotency_records_allow_deletion(
 ) -> Result<bool, StorageError> {
     let mut statement = connection
         .prepare(
-            "SELECT status, expires_at FROM idempotency_records
+            "SELECT expires_at FROM idempotency_records
              WHERE session_id = ?1",
         )
         .map_err(|source| sqlite_error(StorageErrorKind::OperationFailed, source))?;
     let rows = statement
-        .query_map([session_id.as_str()], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-        })
+        .query_map([session_id.as_str()], |row| row.get::<_, String>(0))
         .map_err(|source| sqlite_error(StorageErrorKind::OperationFailed, source))?;
     for row in rows {
-        let (status, expires_at) =
+        let expires_at =
             row.map_err(|source| sqlite_error(StorageErrorKind::OperationFailed, source))?;
-        if status != "terminal" || parse_stored_time(&expires_at)? > observed_at {
+        if parse_stored_time(&expires_at)? > observed_at {
             return Ok(false);
         }
     }

@@ -1,4 +1,4 @@
-use super::RuntimeHandle;
+use super::{ComputerUseAdapter, RuntimeHandle, SteerCommand};
 use crate::storage::{
     AdmissionContext, AdmissionOutcome, IDEMPOTENCY_RETENTION, IdempotencyInput,
     IdempotentOperation, LeaseOwner, PrivateRequestToken, Storage,
@@ -22,6 +22,27 @@ fn normal_status_use_hides_and_deletes_expired_session_metadata() {
         .expect_err("expired Session must be absent on normal status use");
     assert_eq!(ErrorCode::SessionNotFound, error.code);
     assert_eq!(0, runtime.snapshot().unwrap().session_count());
+}
+
+#[test]
+fn runtime_engine_steer_prunes_expired_session_before_follow_up_admission() {
+    let (state, storage, session_id) = expired_session_fixture();
+    drop(storage);
+
+    let runtime = RuntimeHandle::new(Ok(state.path().to_path_buf()), FakeComputerUseAdapter);
+    let engine = runtime.engine().expect("open runtime storage");
+    let readiness = FakeComputerUseAdapter
+        .preflight(satelle_core::LOCAL_DEMO_HOST)
+        .expect("fake adapter should be ready");
+    let error = engine
+        .steer(
+            SteerCommand::attached(session_id.clone(), "expired follow-up"),
+            readiness,
+        )
+        .expect_err("the engine must prune an expired Session before follow-up admission");
+
+    assert_eq!(ErrorCode::SessionNotFound, error.code);
+    assert_eq!(0, engine.snapshot().unwrap().session_count());
 }
 
 #[test]

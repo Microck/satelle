@@ -350,14 +350,87 @@ fn unexpired_idempotency_record_blocks_session_deletion() {
             ],
         )
         .expect("extend the durable replay fixture");
+    let last_cursor: i64 = storage
+        .connection_for_test()
+        .query_row("SELECT max(log_cursor) FROM logs", [], |row| row.get(0))
+        .expect("read the last retained cursor");
 
     storage
         .prune_expired_session_metadata(observed_at)
         .expect("maintain retention around an unexpired replay");
 
     assert!(storage.load_session(session.id()).unwrap().is_some());
+    assert_eq!(0, table_rows_for_session(&storage, "logs", session.id()));
     assert_eq!(
         1,
+        table_rows_for_session(&storage, "idempotency_records", session.id())
+    );
+    let expired_through: i64 = storage
+        .connection_for_test()
+        .query_row(
+            "SELECT expired_through_cursor FROM log_retention_state WHERE singleton = 1",
+            [],
+            |row| row.get(0),
+        )
+        .expect("read the expired cursor high-water mark");
+    assert_eq!(last_cursor, expired_through);
+}
+
+#[test]
+fn expired_pending_stop_does_not_preserve_a_terminal_session() {
+    let state = TempDir::new().expect("temporary state directory");
+    let (mut storage, _) = Storage::open(state.path()).expect("open storage");
+    let started_at = at(0);
+    let stop_at = at(1);
+    let terminal_at = at(2);
+    let initial = initial_session(&storage, SESSION_1, TURN_1, started_at);
+    let AdmissionOutcome::Execute { session, .. } = storage
+        .begin_session(
+            &initial,
+            &admission(IdempotentOperation::Run, TURN_1, TURN_1, started_at),
+        )
+        .expect("admit Session")
+    else {
+        panic!("new Session admission must execute");
+    };
+    assert!(matches!(
+        storage
+            .begin_stop(
+                session.id(),
+                &turn_id(TURN_1),
+                &idempotency(IdempotentOperation::Stop, "pending-stop", stop_at),
+            )
+            .expect("claim Session stop"),
+        BeginStopOutcome::Observe(_)
+    ));
+    let terminal = storage
+        .commit_lifecycle(
+            session.id(),
+            &turn_id(TURN_1),
+            revisions(&session, TURN_1),
+            TurnTransition::Completed,
+            terminal_at,
+        )
+        .expect("complete the Turn after stop observation is interrupted");
+    assert!(
+        terminal
+            .turn(&turn_id(TURN_1))
+            .expect("terminal Session retains its Turn")
+            .state()
+            .is_terminal()
+    );
+    assert_eq!(
+        0,
+        table_rows_for_session(&storage, "control_leases", session.id())
+    );
+
+    storage
+        .prune_expired_session_metadata(terminal_at + time::Duration::days(30))
+        .expect("prune terminal Session with an expired pending stop");
+
+    assert!(storage.load_session(session.id()).unwrap().is_none());
+    assert_eq!(
+        0,
         table_rows_for_session(&storage, "idempotency_records", session.id())
     );
 }

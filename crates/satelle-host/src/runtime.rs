@@ -247,6 +247,10 @@ impl RuntimeEngine {
         readiness: AdapterReadiness,
     ) -> Result<RuntimeTurnOutcome, SatelleError> {
         self.persist_readiness(&readiness)?;
+        // Preflight can outlive the retention observation made during replay
+        // admission. Recheck at the authoritative Session load so a follow-up
+        // cannot revive metadata that crossed the retention boundary meanwhile.
+        self.maintain_session_retention(time::OffsetDateTime::now_utc())?;
         let existing = self
             .lock_storage()?
             .load_session(&command.session_id)
