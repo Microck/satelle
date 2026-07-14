@@ -256,6 +256,7 @@ struct StopResponseOwned {
     previous_state: TurnState,
     current_state: TurnState,
     changed: bool,
+    #[serde(deserialize_with = "Option::deserialize")]
     stopped_at: Option<String>,
 }
 
@@ -451,5 +452,27 @@ mod tests {
         for case in cases {
             assert!(serde_json::from_value::<StopResponse>(case).is_err());
         }
+    }
+
+    #[test]
+    fn stop_response_requires_nullable_stopped_at() {
+        let response = serde_json::from_value::<StopResponse>(terminal_stop_response())
+            .expect("decode coherent stop response");
+        let mut wire = serde_json::to_value(response).expect("serialize stop response");
+
+        assert_eq!(
+            wire.get("stopped_at"),
+            Some(&serde_json::Value::Null),
+            "serialization must emit stopped_at as explicit null"
+        );
+        serde_json::from_value::<StopResponse>(wire.clone())
+            .expect("decode complete serialized stop response");
+        let removed = wire
+            .as_object_mut()
+            .expect("stop response is an object")
+            .remove("stopped_at");
+        assert_eq!(removed, Some(serde_json::Value::Null));
+
+        assert!(serde_json::from_value::<StopResponse>(wire).is_err());
     }
 }

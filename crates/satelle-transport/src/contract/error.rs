@@ -116,6 +116,40 @@ mod tests {
             json!("stop-not-confirmed")
         );
     }
+
+    #[test]
+    fn api_error_requires_nullable_fields() {
+        let error = ApiError::new(
+            RequestId::new(),
+            None,
+            ApiErrorCode::InvalidRequest,
+            ApiErrorCategory::InvalidRequest,
+            false,
+            "the request is invalid",
+            None,
+        );
+        let wire = serde_json::to_value(error).expect("serialize API error");
+        serde_json::from_value::<ApiError>(wire.clone())
+            .expect("decode complete serialized API error");
+
+        for field in ["host_identity", "details", "docs_url"] {
+            assert_eq!(
+                wire.get(field),
+                Some(&serde_json::Value::Null),
+                "serialization must emit {field} as explicit null"
+            );
+            let mut missing = wire.clone();
+            let removed = missing
+                .as_object_mut()
+                .expect("API error is an object")
+                .remove(field);
+            assert_eq!(removed, Some(serde_json::Value::Null));
+            assert!(
+                serde_json::from_value::<ApiError>(missing).is_err(),
+                "missing {field} must be rejected"
+            );
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -140,12 +174,15 @@ pub(crate) enum ApiErrorCategory {
 pub struct ApiError {
     schema_version: ErrorSchema,
     request_id: RequestId,
+    #[serde(deserialize_with = "Option::deserialize")]
     host_identity: Option<String>,
     code: ApiErrorCode,
     category: ApiErrorCategory,
     retryable: bool,
     message: String,
+    #[serde(deserialize_with = "Option::deserialize")]
     details: Option<Value>,
+    #[serde(deserialize_with = "Option::deserialize")]
     docs_url: Option<String>,
     suggested_commands: Vec<String>,
 }

@@ -368,7 +368,9 @@ struct WsControlErrorOwned {
     category: ApiErrorCategory,
     retryable: bool,
     message: String,
+    #[serde(deserialize_with = "Option::deserialize")]
     details: Option<Value>,
+    #[serde(deserialize_with = "Option::deserialize")]
     docs_url: Option<String>,
     suggested_commands: Vec<String>,
 }
@@ -687,5 +689,36 @@ mod tests {
             assert!(serde_json::from_value::<WsControlError>(mismatched).is_err());
         }
         assert_eq!(WsCloseReason::parse("not-a-close-reason"), None);
+    }
+
+    #[test]
+    fn websocket_control_error_requires_nullable_fields() {
+        let error = WsControlError::new(
+            RequestId::new(),
+            "host-test".to_string(),
+            WsCloseReason::InvalidRequest,
+            None,
+        );
+        let wire = serde_json::to_value(error).expect("serialize WebSocket control error");
+        serde_json::from_value::<WsControlError>(wire.clone())
+            .expect("decode complete serialized WebSocket control error");
+
+        for field in ["details", "docs_url"] {
+            assert_eq!(
+                wire.get(field),
+                Some(&serde_json::Value::Null),
+                "serialization must emit {field} as explicit null"
+            );
+            let mut missing = wire.clone();
+            let removed = missing
+                .as_object_mut()
+                .expect("WebSocket control error is an object")
+                .remove(field);
+            assert_eq!(removed, Some(serde_json::Value::Null));
+            assert!(
+                serde_json::from_value::<WsControlError>(missing).is_err(),
+                "missing {field} must be rejected"
+            );
+        }
     }
 }
