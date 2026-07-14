@@ -1,3 +1,5 @@
+#[path = "http/conformance.rs"]
+mod conformance;
 #[path = "http/desktop-sessions.rs"]
 mod desktop_sessions;
 #[path = "http/event-client.rs"]
