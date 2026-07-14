@@ -1364,7 +1364,10 @@
   label: Satelle Turn terminal states are completed, blocked, failed, and stopped
   command: cargo test --locked -p satelle-core --lib session::tests::states_have_exact_names_and_terminal_partition -- --exact
   tags: [spec, mvp, implemented, ci]
-- a terminal Satelle Turn never transitions to another Turn state @spec @mvp
+- id: hjz
+  label: a terminal Satelle Turn never transitions to another Turn state
+  command: cargo test --locked -p satelle-core --lib session::tests::transition_matrix_is_exhaustive -- --exact && cargo test --locked -p satelle-core --lib session::tests::stale_revision_cannot_overwrite_the_winning_terminal_state -- --exact
+  tags: [spec, mvp, implemented, ci]
 - a Satelle Session has at most one nonterminal Turn @spec @mvp
 - a Satelle Session is active exactly when it references one nonterminal Turn @spec @mvp
 - satelle derives Session activity from the active Turn instead of storing an independently mutable duplicate status @spec @mvp
@@ -1431,8 +1434,14 @@
   label: satelle stop on a terminal Turn returns already_terminal without changing stored history
   command: cargo test --locked -p satelle-cli --features test-support --test cli stopping_terminal_turn_preserves_history_and_allows_later_steer -- --exact
   tags: [spec, mvp, implemented, ci]
-- concurrent completion and stop use a compare-and-set transition so exactly one terminal state wins @spec @mvp
-- a late Codex completion cannot overwrite a previously committed stopped state @spec @mvp
+- id: t10
+  label: concurrent completion and stop use a compare-and-set transition so exactly one terminal state wins
+  command: cargo test --locked -p satelle-host --lib runtime::tests::reads_and_stop_remain_available_during_slow_execution_and_stop_observation -- --exact && cargo test --locked -p satelle-host --lib storage::tests::lifecycle::lifecycle_completion_wins_a_stop_race_without_redeleting_its_lease -- --exact
+  tags: [spec, mvp, implemented, ci]
+- id: sp8
+  label: a late Codex completion cannot overwrite a previously committed stopped state
+  command: cargo test --locked -p satelle-host --lib runtime::tests::review_regressions::attached_execution_losing_to_stop_returns_the_durable_stopped_state -- --exact
+  tags: [spec, mvp, implemented, ci]
 - a stop request that cannot confirm upstream cancellation reports stop-not-confirmed instead of persisting a false stopped state @mvp @implemented
 - stop-not-confirmed leaves the Turn nonterminal, preserves running when the same upstream Turn is known active or recovery_pending when its state is ambiguous, and retains the Control Lease @mvp @implemented
 - satelle stop is idempotent for the same Session, Turn, and idempotency key @spec @mvp
