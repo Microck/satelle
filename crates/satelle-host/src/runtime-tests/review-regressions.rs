@@ -78,6 +78,10 @@ fn stable_run_replay_after_restart_skips_adapter_preflight() {
 fn duplicate_attached_run_returns_in_progress_handles_without_waiting_for_execution() {
     let state = crate::TestStateDir::new().expect("temporary state directory should exist");
     let adapter = SubjectBlockingAdapter::default();
+    let deadlock_guard = DeadlockGuard::new([
+        adapter.session_ready.clone(),
+        adapter.execute_release.clone(),
+    ]);
     let runtime = RuntimeHandle::new(Ok(state.path().to_path_buf()), adapter.clone());
     let identity = RequestIdentity::new("stable-in-progress-key", STABLE_DIGEST);
     let first_runtime = runtime.clone();
@@ -89,40 +93,25 @@ fn duplicate_attached_run_returns_in_progress_handles_without_waiting_for_execut
             first_identity,
         ))
     });
-    let session_id = adapter
-        .session_receiver
-        .lock()
-        .expect("subject receiver lock should not be poisoned")
-        .recv_timeout(WAIT_LIMIT)
-        .expect("the original execution should expose its durable Session");
+    let session_id = adapter.take_session();
 
     let duplicate_runtime = runtime.clone();
     let (duplicate_sender, duplicate_receiver) = mpsc::sync_channel(1);
     let duplicate = std::thread::spawn(move || {
-        let outcome = duplicate_runtime.run(RunCommand::attached_with_identity(
+        let result = duplicate_runtime.run(RunCommand::attached_with_identity(
             LOCAL_DEMO_HOST,
             "PRIVATE_IN_PROGRESS_REPLAY",
             identity,
         ));
         duplicate_sender
-            .send(outcome)
-            .expect("duplicate result receiver should remain connected");
+            .send(result)
+            .expect("duplicate receiver should remain connected");
     });
 
-    let replay = match duplicate_receiver.recv_timeout(WAIT_LIMIT) {
-        Ok(outcome) => outcome.expect("the duplicate should return durable in-progress handles"),
-        Err(error) => {
-            adapter.execute_release.signal();
-            first
-                .join()
-                .expect("original request should not panic")
-                .ok();
-            duplicate
-                .join()
-                .expect("duplicate request should not panic");
-            panic!("the duplicate waited for adapter execution to finish: {error}");
-        }
-    };
+    let replay = duplicate_receiver
+        .recv()
+        .expect("duplicate worker should publish its result")
+        .expect("the duplicate should return durable in-progress handles");
     assert_eq!(replay.session.session_id(), &session_id);
     assert_eq!(adapter.execute_calls.load(Ordering::SeqCst), 1);
 
@@ -134,6 +123,7 @@ fn duplicate_attached_run_returns_in_progress_handles_without_waiting_for_execut
     duplicate
         .join()
         .expect("duplicate request should not panic");
+    deadlock_guard.complete();
 }
 
 #[test]
@@ -281,6 +271,10 @@ fn stop_during_recovery_observation_does_not_resurrect_the_subject() {
 fn attached_execution_losing_to_stop_returns_the_durable_stopped_state() {
     let state = crate::TestStateDir::new().expect("temporary state directory should exist");
     let adapter = SubjectBlockingAdapter::default();
+    let deadlock_guard = DeadlockGuard::new([
+        adapter.session_ready.clone(),
+        adapter.execute_release.clone(),
+    ]);
     let runtime = RuntimeHandle::new(Ok(state.path().to_path_buf()), adapter.clone());
     let run_runtime = runtime.clone();
     let attached = std::thread::spawn(move || {
@@ -289,12 +283,7 @@ fn attached_execution_losing_to_stop_returns_the_durable_stopped_state() {
             "PRIVATE_ATTACHED_STOP_RACE",
         ))
     });
-    let session_id = adapter
-        .session_receiver
-        .lock()
-        .expect("subject receiver lock should not be poisoned")
-        .recv_timeout(WAIT_LIMIT)
-        .expect("adapter should expose the admitted Session");
+    let session_id = adapter.take_session();
 
     runtime
         .stop(StopCommand::new(session_id))
@@ -313,12 +302,17 @@ fn attached_execution_losing_to_stop_returns_the_durable_stopped_state() {
             .all(|event| event.event_type() != EventType::TurnCompleted),
         "a losing completion must not be reported as committed"
     );
+    deadlock_guard.complete();
 }
 
 #[test]
 fn controlled_execution_returns_only_after_the_durable_stop_winner() {
     let state = crate::TestStateDir::new().expect("temporary state directory should exist");
     let adapter = SubjectBlockingAdapter::controlled_stop();
+    let deadlock_guard = DeadlockGuard::new([
+        adapter.session_ready.clone(),
+        adapter.execute_release.clone(),
+    ]);
     let runtime = RuntimeHandle::new(Ok(state.path().to_path_buf()), adapter.clone());
     let run_runtime = runtime.clone();
     let attached = std::thread::spawn(move || {
@@ -327,12 +321,7 @@ fn controlled_execution_returns_only_after_the_durable_stop_winner() {
             "PRIVATE_CONTROLLED_STOP_WINNER",
         ))
     });
-    let session_id = adapter
-        .session_receiver
-        .lock()
-        .expect("subject receiver lock should not be poisoned")
-        .recv_timeout(WAIT_LIMIT)
-        .expect("adapter should expose the admitted Session");
+    let session_id = adapter.take_session();
 
     runtime
         .stop(StopCommand::new(session_id))
@@ -345,12 +334,19 @@ fn controlled_execution_returns_only_after_the_durable_stop_winner() {
 
     assert_eq!(latest_turn_state(&outcome.session), TurnState::Stopped);
     assert!(outcome.events.is_empty());
+    deadlock_guard.complete();
 }
 
 #[test]
 fn cancellation_confirmed_worker_exit_does_not_block_new_turn_admission() {
     let state = crate::TestStateDir::new().expect("temporary state directory should exist");
     let adapter = BlockingExecutionAndStopAdapter::default();
+    let deadlock_guard = DeadlockGuard::new([
+        adapter.execute_started.clone(),
+        adapter.execute_release.clone(),
+        adapter.stop_started.clone(),
+        adapter.stop_release.clone(),
+    ]);
     let runtime = RuntimeHandle::new(Ok(state.path().to_path_buf()), adapter.clone());
     let session_id = runtime
         .run(RunCommand::detached(
@@ -361,27 +357,22 @@ fn cancellation_confirmed_worker_exit_does_not_block_new_turn_admission() {
         .session
         .session_id()
         .clone();
-    assert!(
-        adapter.execute_started.wait_for(WAIT_LIMIT),
-        "the original local worker should start"
-    );
+    adapter.execute_started.wait();
 
     let stop_runtime = runtime.clone();
     let stop_session_id = session_id.clone();
     let (stop_sender, stop_receiver) = mpsc::sync_channel(1);
     let stop_worker = std::thread::spawn(move || {
+        let result = stop_runtime.stop(StopCommand::new(stop_session_id));
         stop_sender
-            .send(stop_runtime.stop(StopCommand::new(stop_session_id)))
+            .send(result)
             .expect("stop receiver should remain connected");
     });
-    assert!(
-        adapter.stop_started.wait_for(WAIT_LIMIT),
-        "stop observation should start"
-    );
+    adapter.stop_started.wait();
     adapter.stop_release.signal();
     stop_receiver
-        .recv_timeout(WAIT_LIMIT)
-        .expect("stop should finish")
+        .recv()
+        .expect("stop worker should publish its result")
         .expect("confirmed stop should win");
     stop_worker.join().expect("stop worker should not panic");
 
@@ -405,6 +396,7 @@ fn cancellation_confirmed_worker_exit_does_not_block_new_turn_admission() {
         ))
         .expect("a later Turn should execute after the worker slot is reaped");
     assert_eq!(latest_turn_state(&recovered.session), TurnState::Completed);
+    deadlock_guard.complete();
 }
 
 #[test]
@@ -722,8 +714,8 @@ impl ComputerUseAdapter for RunningRecoveryAdapter {
 
 #[derive(Clone)]
 struct SubjectBlockingAdapter {
-    session_sender: mpsc::SyncSender<satelle_core::SessionId>,
-    session_receiver: Arc<Mutex<mpsc::Receiver<satelle_core::SessionId>>>,
+    session: Arc<Mutex<Option<satelle_core::SessionId>>>,
+    session_ready: Latch,
     execute_release: Latch,
     execute_calls: Arc<AtomicUsize>,
     returns_controlled_stop: bool,
@@ -731,10 +723,9 @@ struct SubjectBlockingAdapter {
 
 impl Default for SubjectBlockingAdapter {
     fn default() -> Self {
-        let (session_sender, session_receiver) = mpsc::sync_channel(1);
         Self {
-            session_sender,
-            session_receiver: Arc::new(Mutex::new(session_receiver)),
+            session: Arc::new(Mutex::new(None)),
+            session_ready: Latch::default(),
             execute_release: Latch::default(),
             execute_calls: Arc::new(AtomicUsize::new(0)),
             returns_controlled_stop: false,
@@ -749,6 +740,15 @@ impl SubjectBlockingAdapter {
             ..Self::default()
         }
     }
+
+    fn take_session(&self) -> satelle_core::SessionId {
+        self.session_ready.wait();
+        self.session
+            .lock()
+            .expect("subject slot lock should not be poisoned")
+            .take()
+            .expect("the adapter signaled without publishing its durable Session")
+    }
 }
 
 impl ComputerUseAdapter for SubjectBlockingAdapter {
@@ -761,9 +761,12 @@ impl ComputerUseAdapter for SubjectBlockingAdapter {
         request: super::super::ExecuteRequest<'_>,
     ) -> Result<super::super::ExecuteResult, SatelleError> {
         self.execute_calls.fetch_add(1, Ordering::SeqCst);
-        self.session_sender
-            .send(request.subject().session_id().clone())
-            .map_err(|_| SatelleError::not_implemented("subject receiver disconnected"))?;
+        *self
+            .session
+            .lock()
+            .expect("subject slot lock should not be poisoned") =
+            Some(request.subject().session_id().clone());
+        self.session_ready.signal();
         self.execute_release.wait();
         if self.returns_controlled_stop {
             return Ok(super::super::ExecuteResult::stopped_by_control());
