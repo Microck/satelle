@@ -170,12 +170,12 @@
 - after publication, npm installs the canonical scoped launcher package with `npm install --global <package> --include=optional` and exposes the `satelle` executable @spec @contract @mvp
 - after publication, pnpm installs the canonical scoped launcher package with `pnpm add --global <package>` and exposes the `satelle` executable @spec @contract @mvp
 - after publication, bun installs the canonical scoped launcher package with `bun add --global <package>` and exposes the `satelle` executable @spec @contract @mvp
-- after publication, canonical npm one-shot execution uses `npm exec --package=<package> -- satelle <args>` @spec @contract @mvp
-- after publication, canonical npx one-shot execution uses `npx --package=<package> -- satelle <args>` @spec @contract @mvp
-- after publication, canonical pnpm one-shot execution uses `pnpm dlx --package <package> satelle <args>` @spec @contract @mvp
-- after publication, canonical bun one-shot execution uses `bunx --package <package> satelle <args>` @spec @contract @mvp
-- npm, npx, pnpm, and bun one-shot execution enters the same Satelle JavaScript launcher used by persistent npm-registry installations @spec @contract @mvp
-- the Satelle JavaScript launcher forwards every argument after `satelle` unchanged to the selected Rust executable @spec @contract @mvp
+- after publication, canonical npm one-shot execution uses `npm exec --package=<package> -- satelle <args>` @spec @contract @mvp @implemented
+- after publication, canonical npx one-shot execution uses `npx --package=<package> -- satelle <args>` @spec @contract @mvp @implemented
+- after publication, canonical pnpm one-shot execution uses `pnpm --package=<package> dlx satelle <args>` @spec @contract @mvp @implemented
+- after publication, with Bun 1.3.14 or newer, canonical bun one-shot execution uses `bunx --package <package> satelle <args>` @spec @contract @mvp @implemented
+- npm, npx, pnpm, and bun one-shot execution with Bun 1.3.14 or newer enters the same Satelle JavaScript launcher used by persistent npm-registry installations @spec @contract @mvp @implemented
+- the Satelle JavaScript launcher forwards every argument after `satelle` unchanged to the selected Rust executable @spec @contract @mvp @implemented
 - satelle installation documentation lists npm, pnpm, and bun npm-registry installs before non-npm methods because npm-registry distribution is the recommended local CLI install path @spec @mvp
 - satelle MVP first-party non-npm local install methods are a Unix shell installer, a Windows PowerShell installer, a Homebrew tap, a Scoop bucket, and direct GitHub release archive downloads @spec @mvp
 - satelle Unix shell installer supports curl and wget entrypoints that pipe a canonical HTTPS installer script into sh @spec @mvp

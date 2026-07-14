@@ -235,7 +235,9 @@ function resolveNativeBinary(
 }
 
 function executeNativeBinary(binaryPath, argumentsToForward) {
-  const child = spawnSync(binaryPath, argumentsToForward, { stdio: "inherit" });
+  const child = spawnSync(path.toNamespacedPath(binaryPath), argumentsToForward, {
+    stdio: "inherit",
+  });
   if (child.error) {
     throw new LauncherError(
       "native-binary-execution-failed",
