@@ -3865,7 +3865,18 @@ fn config_explain_supports_secret_references_but_not_show_secrets() {
 fn timeout_configuration_uses_nested_explicit_unit_keys() {
     let state = state_dir();
     let project = state.path().join("project");
+    let user_config = state.path().join("user-config.toml");
     fs::create_dir_all(project.join(".satelle")).expect("project config dir should be created");
+    write_user_config(
+        &user_config,
+        r#"
+[hosts.local-demo]
+transport = "local"
+adapter = "fake"
+allow_project_selection = true
+"#,
+    )
+    .expect("user config should be written");
     fs::write(
         project.join(".satelle").join("config.toml"),
         r#"
@@ -3883,6 +3894,7 @@ provider_smoke_test = "2m"
 
     let output = satelle()
         .current_dir(&project)
+        .env("SATELLE_CONFIG_FILE", &user_config)
         .env("SATELLE_STATE_DIR", state.path())
         .args(["config", "explain", "--host", "local-demo", "--json"])
         .assert()
@@ -3909,6 +3921,7 @@ provider_smoke_test = "2m"
 
     let output = satelle()
         .current_dir(&project)
+        .env("SATELLE_CONFIG_FILE", &user_config)
         .env("SATELLE_STATE_DIR", state.path())
         .args([
             "run",
@@ -3933,6 +3946,7 @@ provider_smoke_test = "2m"
 
     let output = satelle()
         .current_dir(&project)
+        .env("SATELLE_CONFIG_FILE", &user_config)
         .env("SATELLE_STATE_DIR", state.path())
         .args([
             "run",
@@ -3970,6 +3984,7 @@ native_readiness_timeout = "120s"
 
     satelle()
         .current_dir(&project)
+        .env("SATELLE_CONFIG_FILE", &user_config)
         .env("SATELLE_STATE_DIR", state.path())
         .args(["config", "check", "--json"])
         .assert()
@@ -3993,6 +4008,7 @@ native_readiness = 120
 
     let output = satelle()
         .current_dir(&project)
+        .env("SATELLE_CONFIG_FILE", &user_config)
         .env("SATELLE_STATE_DIR", state.path())
         .args(["config", "check", "--json"])
         .assert()
@@ -4023,6 +4039,7 @@ provider_timeout = "120s"
 
     let output = satelle()
         .current_dir(&project)
+        .env("SATELLE_CONFIG_FILE", &user_config)
         .env("SATELLE_STATE_DIR", state.path())
         .args(["config", "check", "--json"])
         .assert()

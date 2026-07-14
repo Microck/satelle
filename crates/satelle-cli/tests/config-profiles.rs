@@ -844,7 +844,7 @@ fn project_host_intent_requires_an_existing_trusted_binding() {
     let fixture = ConfigFixture::new(
         "",
         r#"
-[hosts.missing]
+[hosts.local-demo]
 transport = "local"
 "#,
     );
@@ -862,8 +862,8 @@ transport = "local"
         error["error"]["file"],
         fixture.resolved_project_config().display().to_string()
     );
-    assert_eq!(error["error"]["path"], "hosts.missing");
-    assert_eq!(error["error"]["host"], "missing");
+    assert_eq!(error["error"]["path"], "hosts.local-demo");
+    assert_eq!(error["error"]["host"], "local-demo");
     assert_eq!(error["error"]["scope"], "project");
     assert_eq!(
         error["error"]["user_config_file"],
@@ -872,7 +872,7 @@ transport = "local"
     assert_eq!(
         error["error"]["recovery_command"],
         format!(
-            "configure hosts.missing in user-level config {}; set hosts.missing.allow_project_selection = true there when the project selects this host implicitly",
+            "configure hosts.local-demo in user-level config {}; set hosts.local-demo.allow_project_selection = true there when the project selects this host implicitly",
             fixture.user_config.display()
         )
     );

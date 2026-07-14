@@ -125,13 +125,22 @@ impl SatelleConfig {
     fn apply_project_config(
         mut self,
         higher: &ProjectConfig,
+        user_bound_hosts: &BTreeSet<String>,
         user_config_path: &Path,
         project_config_path: &Path,
     ) -> Result<Self, SatelleError> {
         // Validate the complete project overlay before changing the effective config. A project
-        // alias may carry shared intent, but the concrete Host Binding must already exist in a
-        // trusted default or user config and its transport cannot be redirected.
+        // alias may carry shared intent, but the concrete Host Binding must already exist in
+        // user config and its transport cannot be redirected. Built-in demo defaults are not
+        // operator authorization for repository-controlled intent.
         for (alias, intent) in &higher.hosts {
+            if !user_bound_hosts.contains(alias) {
+                return Err(SatelleError::project_host_binding_not_found(
+                    project_config_path,
+                    user_config_path,
+                    alias,
+                ));
+            }
             let host = self.hosts.get(alias).ok_or_else(|| {
                 SatelleError::project_host_binding_not_found(
                     project_config_path,
@@ -433,6 +442,10 @@ pub fn load_config(cwd: &Path, flag_profile: Option<&str>) -> Result<ResolvedCon
     let mut config = SatelleConfig::defaults();
     let user_config = read_user_config_file(&user_config_path)?;
     let project_config = read_project_config_file(&project_config_path)?;
+    let user_bound_hosts = user_config
+        .as_ref()
+        .map(|config| config.config.hosts.keys().cloned().collect())
+        .unwrap_or_default();
     let project_selectable_hosts = user_config
         .as_ref()
         .map(|config| {
@@ -454,6 +467,7 @@ pub fn load_config(cwd: &Path, flag_profile: Option<&str>) -> Result<ResolvedCon
     if let Some(project_config) = &project_config {
         config = config.apply_project_config(
             &project_config.config,
+            &user_bound_hosts,
             &user_config_path,
             &project_config_path,
         )?;
