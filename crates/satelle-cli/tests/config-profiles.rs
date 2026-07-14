@@ -79,6 +79,21 @@ fn parse_json(bytes: &[u8]) -> Value {
     serde_json::from_slice(bytes).expect("output should be one JSON value")
 }
 
+fn assert_same_file(actual: &Value, expected: &Path) -> String {
+    let actual = actual
+        .as_str()
+        .expect("file detail should be a path string");
+    assert_eq!(
+        Path::new(actual)
+            .canonicalize()
+            .expect("reported file should resolve"),
+        expected
+            .canonicalize()
+            .expect("expected file should resolve")
+    );
+    actual.to_owned()
+}
+
 fn write_project_config(project: &Path, config: &str) {
     fs::write(project.join(".satelle").join("config.toml"), config)
         .expect("project config should be replaced");
@@ -820,10 +835,8 @@ transport = "direct"
         .clone();
     let error = parse_json(&output.stderr);
     assert_eq!(error["error"]["code"], "project-host-binding-not-allowed");
-    assert_eq!(
-        error["error"]["file"],
-        fixture.resolved_project_config().display().to_string()
-    );
+    let reported_file =
+        assert_same_file(&error["error"]["file"], &fixture.resolved_project_config());
     assert_eq!(error["error"]["path"], "hosts.remote.transport");
     assert_eq!(error["error"]["key"], "transport");
     assert_eq!(error["error"]["scope"], "project");
@@ -834,7 +847,7 @@ transport = "direct"
         error["error"]["recovery_command"],
         format!(
             "remove hosts.remote.transport from {} or set it to \"local\" to match the trusted Host Binding",
-            fixture.resolved_project_config().display()
+            reported_file
         )
     );
 }
@@ -858,10 +871,7 @@ transport = "local"
         .clone();
     let error = parse_json(&output.stderr);
     assert_eq!(error["error"]["code"], "host-not-found");
-    assert_eq!(
-        error["error"]["file"],
-        fixture.resolved_project_config().display().to_string()
-    );
+    assert_same_file(&error["error"]["file"], &fixture.resolved_project_config());
     assert_eq!(error["error"]["path"], "hosts.local-demo");
     assert_eq!(error["error"]["host"], "local-demo");
     assert_eq!(error["error"]["scope"], "project");
