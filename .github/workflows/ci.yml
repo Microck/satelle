@@ -44,6 +44,14 @@ jobs:
       - name: Install npm test workspace
         run: npm ci --ignore-scripts
 
+      - name: Install Facts CLI
+        if: runner.os == 'Linux'
+        run: npm install --global @avcodes/facts@0.6.0
+
+      - name: Enforce executable CI facts
+        if: runner.os == 'Linux'
+        run: facts check --tags facts-policy
+
       - name: Check npm distribution
         env:
           SATELLE_REQUIRED_PACKAGE_MANAGERS: npm,pnpm,bun

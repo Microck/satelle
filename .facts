@@ -161,7 +161,9 @@
 - satelle publishes the npm-registry package with scope microck and package name satelle as the canonical package identity for the JavaScript launcher and platform-specific native optionalDependencies @spec @mvp
 - satelle publishes satelle as an unscoped npm-registry convenience package for shorter install commands @spec @mvp
 - while Satelle's npm distribution is in the pre-publication state, public documentation treats the canonical scoped launcher package, unscoped satelle package, and all six scoped native packages as unavailable from the public npm registry @spec @mvp @release-gate @verification
-- repository manifests and local tarball tests validate intended post-publication npm behavior without establishing public registry availability @spec @mvp @release-gate @verification
+- label: repository manifests and local tarball tests validate intended post-publication npm behavior without establishing public registry availability
+  command: SATELLE_REQUIRED_PACKAGE_MANAGERS=npm,pnpm,bun npm run check:npm
+  tags: [spec, mvp, release-gate, verification, implemented, ci]
 - satelle unscoped npm-registry package depends on the exact same-version npm package with scope microck and package name satelle and forwards its satelle executable instead of duplicating native optionalDependencies or binary selection logic @spec @mvp @implemented
 - satelle release validation fails when scoped and unscoped npm-registry package versions, executable behavior, README install guidance, or provenance metadata diverge @spec @mvp
 - satelle npm-registry distribution exposes a satelle executable command that launches the Rust native binary instead of reimplementing the CLI in JavaScript @spec @mvp @implemented
@@ -2175,7 +2177,9 @@
 - a partial npm publication or validation failure stops later package publication and leaves every existing default dist-tag unchanged @spec @mvp
 - a partial npm publication or validation failure records which immutable candidate versions exist plus an idempotent recovery procedure before any npm promotion transaction may begin @spec @mvp
 - release recovery never moves the signed version tag or republishes different bytes under an already published package version @spec @mvp
-- the release-candidate offline JSON smoke command is satelle paths --json and must emit schema_version satelle.paths.v1 before target-specific online smoke tests run @release-gate @verification @mvp @spec
+- label: the release-candidate offline JSON smoke command is satelle paths --json and must emit schema_version satelle.paths.v1 before target-specific online smoke tests run
+  command: cargo build --workspace --release --locked && cargo test --locked -p satelle-cli --test release-binary-contract release_binary_satisfies_offline_contract -- --exact --ignored
+  tags: [release-gate, verification, mvp, spec, implemented, ci]
 - release-candidate validation installs, executes the --version contract, runs satelle paths --json, upgrades, and uninstalls Satelle on every Controller target @spec @verification @mvp
 
 # verification
@@ -2192,7 +2196,7 @@
   tags: [implemented, ci, mvp]
 - label: No CI-tagged fact is manual
   command: test -z "$(facts list --tags ci --manual --light | sed -n '/^-/p')"
-  tags: [implemented, ci, mvp]
+  tags: [implemented, ci, mvp, facts-policy]
 - label: Rust workspace release build passes with warnings denied
   command: RUSTFLAGS="-D warnings" cargo build --workspace --release --locked
   tags: [ci, mvp, implemented]
@@ -2203,13 +2207,19 @@
 - parser failures and semantic validation failures share the same human and JSON error conformance suite @spec @verification @mvp
 - direct and SSH-tunneled Host Daemon transports pass one shared API and Session conformance suite @spec @verification @mvp
 - concurrent admission tests prove that one Control Lease cannot create two active Turns across processes @spec @verification @mvp
-- stop and completion race tests prove that exactly one immutable terminal Turn state wins @spec @verification @mvp
-- Host Daemon restart tests prove recovery_pending reconciliation before replacement Turn admission @spec @verification @mvp
+- label: stop and completion race tests prove that exactly one immutable terminal Turn state wins
+  command: cargo test --locked -p satelle-core --lib session::tests::stale_revision_cannot_overwrite_the_winning_terminal_state -- --exact && cargo test --locked -p satelle-host --lib storage::tests::lifecycle::lifecycle_completion_wins_a_stop_race_without_redeleting_its_lease -- --exact && cargo test --locked -p satelle-host --lib runtime::tests::review_regressions::attached_execution_losing_to_stop_returns_the_durable_stopped_state -- --exact
+  tags: [spec, verification, mvp, implemented, ci]
+- label: Host Daemon restart tests prove recovery_pending reconciliation before replacement Turn admission
+  command: cargo test --locked -p satelle-host --lib storage::tests::lifecycle::restart_marks_active_turn_recovery_pending_and_retains_lease -- --exact && cargo test --locked -p satelle-host --lib runtime::tests::new_admission_reconciles_restart_work_without_blocking_reads -- --exact && cargo test --locked -p satelle-host --lib runtime::tests::unknown_restart_work_blocks_new_admission_until_stop_resolves_it -- --exact
+  tags: [spec, verification, mvp, implemented, ci]
 - setup, repair, Host update, self-update remotes, and doctor fix have no-mutation dry-run tests @spec @verification @mvp
 - later storage migration and config repair have no-mutation dry-run tests @spec @verification @later
 - a canary secret and canary prompt are absent from every normal log, error, event, setup ledger, status result, and public API response @spec @verification @mvp
 - later diagnostic bundle and Raw Diagnostic Export redaction tests remove canary secrets from every artifact category covered by the declared redaction policy @spec @verification @later
-- project configuration trust tests prove a checkout cannot replace a concrete Host Binding, redirect an endpoint, select an unauthorized binding, or activate consent and YOLO policy @spec @verification @mvp @implemented
+- label: project configuration trust tests prove a checkout cannot replace a concrete Host Binding, redirect an endpoint, select an unauthorized binding, or activate consent and YOLO policy
+  command: cargo test --locked -p satelle-cli --features test-support --test project-host-binding && cargo test --locked -p satelle-cli --features test-support --test cli project_config_forbidden_keys_report_typed_errors -- --exact && cargo test --locked -p satelle-cli --features test-support --test config-profiles untrusted_profile_selectors_do_not_activate_yolo_policy -- --exact
+  tags: [spec, verification, mvp, implemented, ci]
 - each declared Controller target has release-candidate build, install, upgrade, smoke, and uninstall coverage @spec @verification @mvp
 - each declared Computer Use Host Platform has end-to-end setup, readiness, run, status, steer, stop, reconnect, and recovery coverage @spec @verification @mvp
 - bundled skill commands and documentation command examples parse against the same release binary @spec @verification @mvp
