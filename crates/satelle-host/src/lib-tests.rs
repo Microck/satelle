@@ -61,6 +61,7 @@ fn unsupported_or_unproven_production_execution_is_blocked_before_admission() {
         );
         let service = HostService {
             runtime: RuntimeHandle::new(Ok(state.path().to_path_buf()), adapter),
+            operation_capacity: Arc::new(OperationCapacity::default()),
             mode: HostMode::Production { snapshot },
         };
         let session_id = SessionId::new();
@@ -134,6 +135,7 @@ fn attached_adapter_failures_return_exact_durable_run_and_steer_handles() {
     let run_state = TestStateDir::new().expect("temporary run state directory should exist");
     let run_service = HostService {
         runtime: RuntimeHandle::new(Ok(run_state.path().to_path_buf()), FailingExecutionAdapter),
+        operation_capacity: Arc::new(OperationCapacity::default()),
         mode: HostMode::TestFake,
     };
     let run_failure = run_service
@@ -164,6 +166,7 @@ fn attached_adapter_failures_return_exact_durable_run_and_steer_handles() {
     let steer_state = TestStateDir::new().expect("temporary steer state directory should exist");
     let seeded = HostService {
         runtime: RuntimeHandle::new(Ok(steer_state.path().to_path_buf()), FakeComputerUseAdapter),
+        operation_capacity: Arc::new(OperationCapacity::default()),
         mode: HostMode::TestFake,
     };
     let initial = seeded
@@ -180,6 +183,7 @@ fn attached_adapter_failures_return_exact_durable_run_and_steer_handles() {
             Ok(steer_state.path().to_path_buf()),
             FailingExecutionAdapter,
         ),
+        operation_capacity: Arc::new(OperationCapacity::default()),
         mode: HostMode::TestFake,
     };
     let steer_failure = steer_service
@@ -236,6 +240,7 @@ fn refreshed_production_snapshot_updates_admission_surfaces_but_not_desktop_disc
     let shared_snapshot = Arc::clone(&snapshot);
     let service = HostService {
         runtime: RuntimeHandle::new(Ok(state.path().to_path_buf()), adapter),
+        operation_capacity: Arc::new(OperationCapacity::default()),
         mode: HostMode::Production { snapshot },
     };
     let clone = service.clone();

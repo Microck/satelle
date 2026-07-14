@@ -10,6 +10,8 @@ mod model;
 mod recovery;
 #[path = "runtime-request.rs"]
 mod request;
+#[path = "runtime-stop.rs"]
+mod stop;
 #[path = "runtime-worker.rs"]
 mod worker;
 
@@ -19,21 +21,20 @@ pub use adapter::{
 };
 pub(crate) use codex_adapter::ProductionComputerUseAdapter;
 pub(crate) use request::{RequestIdentity, RunCommand, SteerCommand, StopCommand};
+pub(crate) use stop::RuntimeStopOutcome;
 use worker::{ExecutionPlan, TurnWork, WorkerRegistry};
 
 use crate::live_events::LiveEventHub;
 use crate::process_identity::ProcessIdentity;
 use crate::storage::{
-    AdmissionOutcome, ApiTokenRegistration, BeginStopOutcome, IdempotentOperation,
-    LogPageStorageError, SensitiveRequestDigest, StopCommitOutcome, Storage, StorageErrorKind,
-    StorageSnapshot,
+    AdmissionOutcome, ApiTokenRegistration, IdempotentOperation, LogPageStorageError,
+    SensitiveRequestDigest, Storage, StorageSnapshot,
 };
 use crate::{ApiBearerToken, ApiPrincipal, DaemonLogPage, LogCursor, LogPageQuery};
 use recovery::RecoveryQueue;
-use satelle_core::session::{PublicSession, TurnAdmissionFailure, TurnState};
+use satelle_core::session::{PublicSession, TurnAdmissionFailure};
 use satelle_core::{
-    ControlPlaneOperation, LOCAL_DEMO_HOST, SatelleError, SatelleEvent, SessionId, StopResult,
-    TurnId,
+    ControlPlaneOperation, LOCAL_DEMO_HOST, SatelleError, SatelleEvent, SessionId, TurnId,
 };
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -63,9 +64,15 @@ pub(crate) fn admitted_session(
     }
 }
 
-struct RuntimeAdmissionReplay {
+pub(crate) struct RuntimeAdmissionReplay {
     outcome: RuntimeTurnOutcome,
     turn_id: TurnId,
+}
+
+impl RuntimeAdmissionReplay {
+    pub(crate) fn into_session(self) -> PublicSession {
+        self.outcome.session
+    }
 }
 
 pub(crate) fn storage_error(error: crate::storage::StorageError) -> SatelleError {
@@ -74,6 +81,10 @@ pub(crate) fn storage_error(error: crate::storage::StorageError) -> SatelleError
 
 pub(crate) fn integrity_error(message: impl Into<String>) -> SatelleError {
     model::integrity_failure(message)
+}
+
+pub(crate) fn idempotency_conflict() -> SatelleError {
+    model::idempotency_conflict()
 }
 
 #[cfg(test)]
@@ -99,12 +110,6 @@ pub(crate) struct RuntimeEngine {
 pub(crate) struct RuntimeSnapshot {
     host_identity: satelle_core::session::HostIdentityRef,
     storage: StorageSnapshot,
-}
-
-pub(crate) struct RuntimeStopOutcome {
-    pub(crate) result: StopResult,
-    pub(crate) session_state_revision: satelle_core::session::SessionStateRevision,
-    pub(crate) turn_state_revision: satelle_core::session::TurnStateRevision,
 }
 
 impl RuntimeSnapshot {
@@ -354,88 +359,6 @@ impl RuntimeEngine {
         Ok(session.to_public())
     }
 
-    fn stop(&self, command: StopCommand) -> Result<RuntimeStopOutcome, SatelleError> {
-        let requested_at = time::OffsetDateTime::now_utc();
-        self.maintain_session_retention(requested_at)?;
-        let idempotency = model::stop_idempotency(requested_at, &command.identity)?;
-        let outcome = loop {
-            let target = self
-                .lock_storage()?
-                .stop_admission_target(&command.session_id, &idempotency)
-                .map_err(|error| model::storage_failure_for_session(error, &command.session_id))?;
-            if target.requires_control_plane() {
-                self.adapter.admit_operation(ControlPlaneOperation::Stop)?;
-            }
-            let turn_id = target.turn_id().clone();
-            match self
-                .lock_storage()?
-                .begin_stop(&command.session_id, &turn_id, &idempotency)
-            {
-                Ok(outcome) => break outcome,
-                Err(error) if error.kind() == StorageErrorKind::StateConflict => continue,
-                Err(error) => {
-                    return Err(model::storage_failure_for_session(
-                        error,
-                        &command.session_id,
-                    ));
-                }
-            }
-        };
-        let commit = match outcome {
-            BeginStopOutcome::Complete(commit) => commit,
-            BeginStopOutcome::Observe(claim) => {
-                // Stop observation is external I/O and must not serialize
-                // status, logs, or the terminal execution compare-and-swap.
-                let observation = self
-                    .adapter
-                    .observe_stop(AdapterSubject::new(claim.recovery_subject()))?;
-                let mut storage = self.lock_storage()?;
-                let current = storage
-                    .load_session(&command.session_id)
-                    .map_err(model::storage_failure)?
-                    .ok_or_else(|| SatelleError::session_not_found(&command.session_id))?;
-                let confirmed_at = time::OffsetDateTime::now_utc().max(current.updated_at());
-                let commit = storage
-                    .confirm_stop(claim, observation, confirmed_at)
-                    .map_err(model::storage_failure)?;
-                let stop_committed = matches!(commit.outcome(), StopCommitOutcome::Stopped(_));
-                drop(storage);
-                if stop_committed {
-                    self.adapter
-                        .stop_committed(commit.session().id(), commit.turn_id());
-                }
-                if matches!(
-                    commit.outcome(),
-                    StopCommitOutcome::Stopped(_)
-                        | StopCommitOutcome::NotConfirmed { changed: true, .. }
-                ) {
-                    self.publish_committed_turn(commit.session(), commit.turn_id());
-                }
-                commit
-            }
-        };
-        let committed_turn = commit
-            .session()
-            .turn(commit.turn_id())
-            .ok_or_else(|| model::integrity_failure("the stopped Turn is missing"))?;
-        let session_state_revision = commit.session().session_state_revision();
-        let turn_state_revision = committed_turn.turn_state_revision();
-        if committed_turn.state() == TurnState::RecoveryPending {
-            let subject = self
-                .lock_storage()?
-                .recovery_subject(&command.session_id, commit.turn_id())
-                .map_err(model::storage_failure)?;
-            self.enqueue_recovery_subject(subject)?;
-        } else {
-            self.remove_recovery_subject(&command.session_id, commit.turn_id())?;
-        }
-        Ok(RuntimeStopOutcome {
-            result: model::stop_result(&commit, &command.session_id)?,
-            session_state_revision,
-            turn_state_revision,
-        })
-    }
-
     fn log_page(&self, query: &LogPageQuery) -> Result<DaemonLogPage, SatelleError> {
         self.maintain_session_retention(time::OffsetDateTime::now_utc())?;
         match self.lock_storage()?.log_page(query) {
@@ -552,20 +475,31 @@ impl RuntimeHandle {
         }
     }
 
+    pub(crate) fn replay_admission_if_present(
+        &self,
+        operation: IdempotentOperation,
+        identity: &RequestIdentity,
+        expected_session_id: Option<&SessionId>,
+    ) -> Result<Option<RuntimeAdmissionReplay>, SatelleError> {
+        let Some(engine) = self.existing_engine()? else {
+            return Ok(None);
+        };
+        engine.replay_admission(operation, identity, expected_session_id)
+    }
+
     pub(crate) fn run(
         &self,
         command: RunCommand<'_>,
     ) -> Result<RuntimeTurnOutcome, TurnAdmissionFailure> {
-        let existing_engine = self
-            .existing_engine()
-            .map_err(TurnAdmissionFailure::admission_unknown)?;
-        if let Some(engine) = &existing_engine
-            && let Some(replay) = engine
-                .replay_admission(IdempotentOperation::Run, &command.identity, None)
-                .map_err(TurnAdmissionFailure::admission_unknown)?
+        if let Some(replay) = self
+            .replay_admission_if_present(IdempotentOperation::Run, &command.identity, None)
+            .map_err(TurnAdmissionFailure::admission_unknown)?
         {
             return Ok(replay.outcome);
         }
+        let existing_engine = self
+            .existing_engine()
+            .map_err(TurnAdmissionFailure::admission_unknown)?;
         if let Err(error) = self.adapter.admit_operation(ControlPlaneOperation::Run) {
             return self.resolve_precommit_failure(
                 IdempotentOperation::Run,
@@ -629,20 +563,19 @@ impl RuntimeHandle {
         &self,
         command: SteerCommand<'_>,
     ) -> Result<RuntimeTurnOutcome, TurnAdmissionFailure> {
-        let existing_engine = self
-            .existing_engine()
-            .map_err(TurnAdmissionFailure::admission_unknown)?;
-        if let Some(engine) = &existing_engine
-            && let Some(replay) = engine
-                .replay_admission(
-                    IdempotentOperation::Steer,
-                    &command.identity,
-                    Some(&command.session_id),
-                )
-                .map_err(TurnAdmissionFailure::admission_unknown)?
+        if let Some(replay) = self
+            .replay_admission_if_present(
+                IdempotentOperation::Steer,
+                &command.identity,
+                Some(&command.session_id),
+            )
+            .map_err(TurnAdmissionFailure::admission_unknown)?
         {
             return Ok(replay.outcome);
         }
+        let existing_engine = self
+            .existing_engine()
+            .map_err(TurnAdmissionFailure::admission_unknown)?;
         if let Err(error) = self.adapter.admit_operation(ControlPlaneOperation::Steer) {
             return self.resolve_precommit_failure(
                 IdempotentOperation::Steer,
@@ -744,18 +677,6 @@ impl RuntimeHandle {
 
     pub(crate) fn status(&self, session_id: SessionId) -> Result<PublicSession, SatelleError> {
         self.engine()?.status(&session_id)
-    }
-
-    pub(crate) fn stop(&self, command: StopCommand) -> Result<StopResult, SatelleError> {
-        self.stop_with_snapshot(command)
-            .map(|outcome| outcome.result)
-    }
-
-    pub(crate) fn stop_with_snapshot(
-        &self,
-        command: StopCommand,
-    ) -> Result<RuntimeStopOutcome, SatelleError> {
-        self.engine()?.stop(command)
     }
 
     pub(crate) fn log_page(&self, query: &LogPageQuery) -> Result<DaemonLogPage, SatelleError> {

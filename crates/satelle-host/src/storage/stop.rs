@@ -1,16 +1,19 @@
-use super::codec::{load_required_session, parse_stop_outcome, stop_outcome_token};
+use super::codec::{
+    load_required_session, load_session_at_operation_outcome, parse_stop_outcome,
+    stop_outcome_token,
+};
 use super::logs::canonical_log;
 use super::sql::{
-    complete_stop_idempotency, ensure_control_lease_absent, ensure_control_lease_present,
-    ensure_record_handles, insert_idempotency, insert_safe_log, load_recovery_subject,
-    matching_idempotency, persist_lifecycle_mutation, require_operation, synchronize_control_lease,
-    update_turn_idempotency,
+    StoredIdempotency, complete_stop_idempotency, ensure_control_lease_absent,
+    ensure_control_lease_present, ensure_record_handles, insert_idempotency, insert_safe_log,
+    load_recovery_subject, matching_idempotency, persist_lifecycle_mutation, require_operation,
+    synchronize_control_lease, update_turn_idempotency,
 };
 use super::{
     IdempotencyInput, IdempotentOperation, LogEvent, LogSeverity, RecoverySubject, Storage,
     StorageError, StorageErrorKind, sqlite_error,
 };
-use rusqlite::TransactionBehavior;
+use rusqlite::{Connection, TransactionBehavior};
 use satelle_core::session::{
     LifecycleMutation, RetainedOwnership, Session, StopObservation, StopOutcome, TerminalTurnState,
     TurnState,
@@ -80,7 +83,83 @@ impl StopCommit {
     }
 }
 
+fn stop_record_turn_id(
+    record: &StoredIdempotency,
+    session_id: &SessionId,
+) -> Result<TurnId, StorageError> {
+    let turn_id = record
+        .turn_id
+        .as_deref()
+        .ok_or_else(|| StorageError::new(StorageErrorKind::InvalidStoredState))
+        .and_then(|value| {
+            TurnId::parse(value)
+                .map_err(|_| StorageError::new(StorageErrorKind::InvalidStoredState))
+        })?;
+    ensure_record_handles(record, session_id, &turn_id)?;
+    Ok(turn_id)
+}
+
+fn completed_stop_commit(
+    connection: &Connection,
+    record: &StoredIdempotency,
+    session_id: &SessionId,
+) -> Result<StopCommit, StorageError> {
+    if record.status != "terminal" {
+        return Err(StorageError::new(StorageErrorKind::InvalidStoredState));
+    }
+    let turn_id = stop_record_turn_id(record, session_id)?;
+    let outcome = parse_stop_outcome(&record.durable_outcome)?;
+    let session = if matches!(outcome, StopCommitOutcome::NotConfirmed { .. }) {
+        // A not-confirmed response contains only durable ownership metadata.
+        // The retained worker may advance the Turn after this response, so
+        // combining its current row with the response's historical Session
+        // revision would create an internally inconsistent snapshot.
+        load_required_session(connection, session_id)?
+    } else {
+        let session_revision = record
+            .result_session_state_revision
+            .as_deref()
+            .ok_or_else(|| StorageError::new(StorageErrorKind::InvalidStoredState))?;
+        let session_updated_at = record
+            .result_session_updated_at
+            .as_deref()
+            .ok_or_else(|| StorageError::new(StorageErrorKind::InvalidStoredState))?;
+        load_session_at_operation_outcome(
+            connection,
+            session_id,
+            &turn_id,
+            session_revision,
+            session_updated_at,
+        )?
+    };
+    Ok(StopCommit {
+        session,
+        turn_id,
+        outcome,
+    })
+}
+
 impl Storage {
+    /// Returns a completed stop replay without creating or advancing a stop
+    /// claim. Pending records deliberately remain capacity-controlled.
+    pub(crate) fn replay_completed_stop_if_present(
+        &self,
+        session_id: &SessionId,
+        idempotency: &IdempotencyInput,
+    ) -> Result<Option<StopCommit>, StorageError> {
+        require_operation(idempotency, IdempotentOperation::Stop)?;
+        let Some(record) = matching_idempotency(&self.connection, idempotency)? else {
+            return Ok(None);
+        };
+        match (record.status.as_str(), record.durable_outcome.as_str()) {
+            ("in_progress", "v1.stop.pending") => Ok(None),
+            ("terminal", _) => {
+                completed_stop_commit(&self.connection, &record, session_id).map(Some)
+            }
+            _ => Err(StorageError::new(StorageErrorKind::InvalidStoredState)),
+        }
+    }
+
     /// Resolves replay and terminal-stop cases before external capability I/O.
     /// The later `begin_stop` transaction uses this Turn ID as a CAS guard.
     pub(crate) fn stop_admission_target(
@@ -90,15 +169,7 @@ impl Storage {
     ) -> Result<StopAdmissionTarget, StorageError> {
         require_operation(idempotency, IdempotentOperation::Stop)?;
         if let Some(record) = matching_idempotency(&self.connection, idempotency)? {
-            let turn_id = record
-                .turn_id
-                .as_deref()
-                .ok_or_else(|| StorageError::new(StorageErrorKind::InvalidStoredState))
-                .and_then(|value| {
-                    TurnId::parse(value)
-                        .map_err(|_| StorageError::new(StorageErrorKind::InvalidStoredState))
-                })?;
-            ensure_record_handles(&record, session_id, &turn_id)?;
+            let turn_id = stop_record_turn_id(&record, session_id)?;
             let session = load_required_session(&self.connection, session_id)?;
             let turn = session
                 .turn(&turn_id)
@@ -143,33 +214,21 @@ impl Storage {
             .map_err(|source| sqlite_error(StorageErrorKind::OperationFailed, source))?;
 
         if let Some(record) = matching_idempotency(&transaction, idempotency)? {
-            let turn_id = record
-                .turn_id
-                .as_deref()
-                .ok_or_else(|| StorageError::new(StorageErrorKind::InvalidStoredState))
-                .and_then(|value| {
-                    TurnId::parse(value)
-                        .map_err(|_| StorageError::new(StorageErrorKind::InvalidStoredState))
-                })?;
-            ensure_record_handles(&record, session_id, &turn_id)?;
-            let session = load_required_session(&transaction, session_id)?;
-            let turn = session
-                .turn(&turn_id)
-                .ok_or_else(|| StorageError::new(StorageErrorKind::InvalidStoredState))?;
+            let turn_id = stop_record_turn_id(&record, session_id)?;
             if record.status == "terminal" {
-                let outcome = parse_stop_outcome(&record.durable_outcome)?;
+                let commit = completed_stop_commit(&transaction, &record, session_id)?;
                 transaction
                     .commit()
                     .map_err(|source| sqlite_error(StorageErrorKind::OperationFailed, source))?;
-                return Ok(BeginStopOutcome::Complete(StopCommit {
-                    session,
-                    turn_id,
-                    outcome,
-                }));
+                return Ok(BeginStopOutcome::Complete(commit));
             }
             if record.durable_outcome != "v1.stop.pending" {
                 return Err(StorageError::new(StorageErrorKind::InvalidStoredState));
             }
+            let session = load_required_session(&transaction, session_id)?;
+            let turn = session
+                .turn(&turn_id)
+                .ok_or_else(|| StorageError::new(StorageErrorKind::InvalidStoredState))?;
             if let Ok(state) = TerminalTurnState::try_from(turn.state()) {
                 let outcome = StopCommitOutcome::AlreadyTerminal(state);
                 let completed_at = OffsetDateTime::now_utc().max(session.updated_at());
@@ -178,6 +237,7 @@ impl Storage {
                     &transaction,
                     idempotency,
                     stop_outcome_token(&outcome)?,
+                    &session,
                     completed_at,
                 )?;
                 insert_safe_log(
@@ -232,11 +292,18 @@ impl Storage {
             insert_idempotency(
                 &transaction,
                 idempotency,
-                "terminal",
-                stop_outcome_token(&outcome)?,
+                "in_progress",
+                "v1.stop.pending",
                 Some(session_id),
                 Some(&turn_id),
-                Some(idempotency.created_at),
+                None,
+            )?;
+            complete_stop_idempotency(
+                &transaction,
+                idempotency,
+                stop_outcome_token(&outcome)?,
+                &session,
+                idempotency.created_at,
             )?;
             insert_safe_log(
                 &transaction,
@@ -295,16 +362,11 @@ impl Storage {
             .ok_or_else(|| StorageError::new(StorageErrorKind::InvalidStoredState))?;
         ensure_record_handles(&record, &session_id, &turn_id)?;
         if record.status == "terminal" {
-            let session = load_required_session(&transaction, &session_id)?;
-            let outcome = parse_stop_outcome(&record.durable_outcome)?;
+            let commit = completed_stop_commit(&transaction, &record, &session_id)?;
             transaction
                 .commit()
                 .map_err(|source| sqlite_error(StorageErrorKind::OperationFailed, source))?;
-            return Ok(StopCommit {
-                session,
-                turn_id,
-                outcome,
-            });
+            return Ok(commit);
         }
 
         let mut session = load_required_session(&transaction, &session_id)?;
@@ -345,6 +407,7 @@ impl Storage {
             &transaction,
             &claim.idempotency,
             stop_outcome_token(&outcome)?,
+            &session,
             at,
         )?;
         let event = if matches!(outcome, StopCommitOutcome::NotConfirmed { .. }) {

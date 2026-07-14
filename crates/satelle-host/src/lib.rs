@@ -10,6 +10,8 @@ mod desktop_sessions;
 mod live_events;
 #[path = "log-page.rs"]
 mod log_page;
+#[path = "operation-capacity.rs"]
+mod operation_capacity;
 #[path = "process-identity.rs"]
 mod process_identity;
 mod runtime;
@@ -32,6 +34,7 @@ pub use log_page::{
     DaemonLogEntry, DaemonLogPage, LogCursor, LogCursorError, LogEvent, LogPageMode, LogPageQuery,
     LogPageQueryError, LogSeverity, LogSource, LogSubject,
 };
+use operation_capacity::OperationCapacity;
 pub use runtime::{
     AdapterReadiness, AdapterSubject, ComputerUseAdapter, EvidenceError, ExecuteRequest,
     ExecuteResult, ProviderSmokeEvidence, ReadinessEvidence, RecoveryObservation,
@@ -60,9 +63,14 @@ pub mod test_support {
 #[cfg(test)]
 use test_support::TestStateDir;
 
+#[cfg(test)]
+#[path = "operation-capacity-tests.rs"]
+mod operation_capacity_tests;
+
 #[derive(Clone, Debug)]
 pub struct HostService {
     runtime: RuntimeHandle,
+    operation_capacity: Arc<OperationCapacity>,
     mode: HostMode,
 }
 
@@ -133,6 +141,7 @@ impl HostService {
         let adapter = ProductionComputerUseAdapter::new(Arc::clone(&snapshot), working_directory);
         Self {
             runtime: RuntimeHandle::new(state_root, adapter),
+            operation_capacity: Arc::new(OperationCapacity::default()),
             mode: HostMode::Production { snapshot },
         }
     }
@@ -143,6 +152,7 @@ impl HostService {
     pub fn local_demo_for_tests() -> Result<Self, SatelleError> {
         Ok(Self {
             runtime: RuntimeHandle::new(satelle_core::state_dir(), FakeComputerUseAdapter),
+            operation_capacity: Arc::new(OperationCapacity::default()),
             mode: HostMode::TestFake,
         })
     }
