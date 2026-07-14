@@ -72,6 +72,24 @@ pub(super) struct ParsedProjectConfig {
     pub(super) default_profile: Option<String>,
 }
 
+pub(super) fn validate_selected_profile_host(
+    alias: &str,
+    user_bound_hosts: &BTreeSet<String>,
+    user_config_path: &Path,
+    project_config_path: &Path,
+) -> Result<(), SatelleError> {
+    if user_bound_hosts.contains(alias) {
+        return Ok(());
+    }
+
+    Err(SatelleError::project_host_binding_not_found_at(
+        project_config_path,
+        "profile",
+        user_config_path,
+        alias,
+    ))
+}
+
 impl ParsedProjectConfig {
     pub(super) fn selects_default_host(&self) -> bool {
         self.config.default_host.is_some()

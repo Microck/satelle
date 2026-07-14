@@ -296,6 +296,40 @@ fn project_default_host_requires_an_existing_trusted_binding() {
 }
 
 #[test]
+fn project_selected_profile_requires_an_existing_trusted_binding() {
+    for alias in ["missing", "local-demo"] {
+        let user_config = format!(
+            r#"
+[profiles.checkout]
+host = "{alias}"
+"#,
+        );
+        let fixture = ConfigFixture::new(&user_config, "profile = \"checkout\"\n");
+
+        let output = fixture
+            .command()
+            .args(["config", "check", "--json"])
+            .assert()
+            .code(66)
+            .get_output()
+            .clone();
+        let error = parse_json(&output.stderr);
+        assert_eq!(error["error"]["code"], "host-not-found");
+        assert_same_file(&error["error"]["file"], &fixture.resolved_project_config());
+        assert_eq!(error["error"]["path"], "profile");
+        assert_same_file(
+            &error["error"]["reference_file"],
+            &fixture.resolved_project_config(),
+        );
+        assert_eq!(error["error"]["reference_path"], "profile");
+        assert_eq!(error["error"]["host"], alias);
+        assert_eq!(error["error"]["scope"], "project");
+        assert_same_file(&error["error"]["binding_file"], fixture.user_config_path());
+        assert_eq!(error["error"]["binding_path"], format!("hosts.{alias}"));
+    }
+}
+
+#[test]
 fn project_host_selection_requires_user_authorization_and_explicit_host_bypasses_it() {
     let fixture = ConfigFixture::new(
         r#"

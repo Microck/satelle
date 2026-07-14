@@ -425,11 +425,19 @@ pub fn load_config(cwd: &Path, flag_profile: Option<&str>) -> Result<ResolvedCon
                     available_profiles,
                 )
             })?;
-        profile.apply_to_base(&mut config, selected.source);
-        if profile.selects_host() {
+        if let Some(profile_host) = profile.selected_host() {
+            if selected.source == profiles::ProfileSelectionSource::ProjectConfig {
+                project_config::validate_selected_profile_host(
+                    profile_host,
+                    &user_bound_hosts,
+                    &user_config_path,
+                    &project_config_path,
+                )?;
+            }
             default_host_requires_project_permission =
                 selected.source == profiles::ProfileSelectionSource::ProjectConfig;
         }
+        profile.apply_to_base(&mut config, selected.source);
         Some(profile)
     } else {
         None

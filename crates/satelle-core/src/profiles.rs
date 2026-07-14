@@ -69,8 +69,8 @@ pub(super) struct ProfileConfig {
 }
 
 impl ProfileConfig {
-    pub(super) fn selects_host(&self) -> bool {
-        self.host.is_some()
+    pub(super) fn selected_host(&self) -> Option<&str> {
+        self.host.as_deref()
     }
 
     fn yolo_applies(&self, source: ProfileSelectionSource) -> bool {
