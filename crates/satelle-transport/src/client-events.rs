@@ -222,19 +222,27 @@ impl DaemonEventStream {
                             self.last_sequence = event.seq();
                             return Ok(event);
                         }
-                        Err(event_error) => {
-                            if let Ok(WsServerControl::Error(error)) =
-                                serde_json::from_str::<WsServerControl>(text)
-                            {
+                        Err(event_error) => match serde_json::from_str::<WsServerControl>(text) {
+                            Ok(WsServerControl::Subscribed(acknowledgement)) => {
                                 validate_control_context(
-                                    &error,
+                                    acknowledgement.request_id(),
+                                    acknowledgement.host_identity(),
+                                    &self.expected_request_id,
+                                    &self.expected_host_identity,
+                                )?;
+                                return Err(DaemonEventError::UnexpectedFrame);
+                            }
+                            Ok(WsServerControl::Error(error)) => {
+                                validate_control_context(
+                                    error.request_id(),
+                                    error.host_identity(),
                                     &self.expected_request_id,
                                     &self.expected_host_identity,
                                 )?;
                                 return Err(read_close_after_control(&mut self.socket, error).await);
                             }
-                            return Err(DaemonEventError::InvalidEvent(event_error));
-                        }
+                            Err(_) => return Err(DaemonEventError::InvalidEvent(event_error)),
+                        },
                     }
                 }
                 Message::Ping(payload) => self
@@ -273,7 +281,8 @@ async fn read_control(
                     WsServerControl::Subscribed(acknowledgement) => Ok(acknowledgement),
                     WsServerControl::Error(error) => {
                         validate_control_context(
-                            &error,
+                            error.request_id(),
+                            error.host_identity(),
                             expected_request_id,
                             expected_host_identity,
                         )?;
@@ -302,12 +311,12 @@ fn validate_acknowledgement(
     expected_host_identity: &str,
     subscriptions: &[EventSubscription],
 ) -> Result<(), DaemonEventError> {
-    if acknowledgement.request_id() != request_id {
-        return Err(DaemonEventError::RequestIdMismatch);
-    }
-    if acknowledgement.host_identity() != expected_host_identity {
-        return Err(DaemonEventError::HostIdentityMismatch);
-    }
+    validate_control_context(
+        acknowledgement.request_id(),
+        acknowledgement.host_identity(),
+        request_id,
+        expected_host_identity,
+    )?;
     if acknowledgement.subscriptions() != subscriptions {
         return Err(DaemonEventError::SubscriptionMismatch);
     }
@@ -315,14 +324,15 @@ fn validate_acknowledgement(
 }
 
 fn validate_control_context(
-    error: &WsControlError,
+    request_id: &RequestId,
+    host_identity: &str,
     expected_request_id: &RequestId,
     expected_host_identity: &str,
 ) -> Result<(), DaemonEventError> {
-    if error.request_id() != expected_request_id {
+    if request_id != expected_request_id {
         return Err(DaemonEventError::RequestIdMismatch);
     }
-    if error.host_identity() != expected_host_identity {
+    if host_identity != expected_host_identity {
         return Err(DaemonEventError::HostIdentityMismatch);
     }
     Ok(())
@@ -534,7 +544,9 @@ impl fmt::Display for DaemonEventError {
             Self::CloseContractMismatch { .. } => {
                 "the Host Daemon WebSocket error and close frame did not match"
             }
-            Self::RequestIdMismatch => "the subscription acknowledgement request ID did not match",
+            Self::RequestIdMismatch => {
+                "the live event protocol response did not match the request ID"
+            }
             Self::HostIdentityMismatch => {
                 "the live event stream did not match the pinned Host Identity"
             }
