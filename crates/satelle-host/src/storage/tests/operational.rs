@@ -53,6 +53,86 @@ fn version_one_store_upgrades_without_replacing_existing_state() {
 }
 
 #[test]
+fn logically_corrupt_version_one_store_is_rejected_before_migration() {
+    assert_version_one_corruption_rejected_before_migration(
+        "DELETE FROM control_leases;",
+        StorageErrorKind::IntegrityCheckFailed,
+    );
+}
+
+#[test]
+fn corrupt_sensitive_version_one_state_is_rejected_before_migration() {
+    assert_version_one_corruption_rejected_before_migration(
+        "UPDATE idempotency_hmac_keys SET created_at = 'not-a-time' WHERE retired_at IS NULL;",
+        StorageErrorKind::InvalidStoredState,
+    );
+}
+
+fn assert_version_one_corruption_rejected_before_migration(
+    corruption_sql: &str,
+    expected_error: StorageErrorKind,
+) {
+    let state = TempDir::new().expect("temporary state directory");
+    let (mut storage, _) = Storage::open(state.path()).expect("open storage");
+    let session = initial_session(&storage, SESSION_1, TURN_1, at(0));
+    storage
+        .begin_session(
+            &session,
+            &admission(
+                IdempotentOperation::Run,
+                "run-before-migration",
+                "request-before-migration",
+                at(0),
+            ),
+        )
+        .expect("admit an active Turn");
+    storage
+        .connection_for_test()
+        .execute_batch(corruption_sql)
+        .expect("corrupt version one state");
+    storage
+        .connection_for_test()
+        .execute_batch(
+            "DROP TABLE provider_smoke_successes;
+             DROP TABLE readiness_successes;
+             DELETE FROM schema_migrations WHERE version = 2;
+             PRAGMA user_version = 1;",
+        )
+        .expect("create a logically corrupt version one store");
+    drop(storage);
+
+    let error = match Storage::open(state.path()) {
+        Ok(_) => panic!("a corrupt version one store must fail before migration"),
+        Err(error) => error,
+    };
+    assert_eq!(expected_error, error.kind());
+
+    let connection = Connection::open(state.path().join(DATABASE_FILE_NAME)).unwrap();
+    assert_eq!(1_i64, pragma_integer(&connection, "user_version"));
+    let applied_versions = connection
+        .prepare("SELECT version FROM schema_migrations ORDER BY version")
+        .unwrap()
+        .query_map([], |row| row.get::<_, i64>(0))
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert_eq!(vec![1_i64], applied_versions);
+    for table in ["readiness_successes", "provider_smoke_successes"] {
+        let exists: bool = connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = ?1)",
+                [table],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(
+            !exists,
+            "migration created {table} before rejecting corruption"
+        );
+    }
+}
+
+#[test]
 fn failed_migration_rolls_back_partial_schema_and_preserves_existing_state() {
     let state = TempDir::new().expect("temporary state directory");
     let (storage, _) = Storage::open(state.path()).expect("open storage");

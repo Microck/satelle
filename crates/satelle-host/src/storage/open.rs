@@ -472,6 +472,14 @@ fn apply_migrations(connection: &mut Connection) -> Result<(), StorageError> {
         return Err(StorageError::new(StorageErrorKind::MigrationIntegrity));
     }
 
+    // Existing stores must prove their current state is sound before a newer
+    // migration can rewrite it. Fresh stores have no schema to validate, and
+    // current stores are verified once after this no-op migration pass.
+    if !applied.is_empty() && applied.len() < MIGRATIONS.len() {
+        verify_integrity(&transaction)?;
+        super::auth::validate_sensitive_state(&transaction)?;
+    }
+
     for migration in MIGRATIONS.iter().skip(applied.len()) {
         let applied_at = OffsetDateTime::now_utc();
         transaction

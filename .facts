@@ -1574,7 +1574,7 @@
 - Turn admission, active-Turn uniqueness, Session linkage, Idempotency Record creation, and Control Lease ownership are committed atomically @mvp @implemented
 - every lifecycle transition uses the prior session_state_revision and turn_state_revision of every affected record as transaction preconditions @contract @mvp @implemented
 - a failed lifecycle transition precondition returns a typed state-conflict error without rewriting the winning state @mvp @implemented
-- a failed startup integrity check blocks state-changing operations plus ordinary status and log reads until repair or restore succeeds, while exposing only minimal redacted integrity diagnostics needed for safe repair @spec @mvp
+- a failed startup integrity check blocks state-changing operations plus ordinary status and log reads until repair or restore succeeds, while exposing only minimal redacted integrity diagnostics needed for safe repair @mvp @implemented
 
 ## privacy-and-filesystem
 - Satelle-owned SQLite Session and Turn records do not store raw prompt text by default @spec @mvp @implemented
