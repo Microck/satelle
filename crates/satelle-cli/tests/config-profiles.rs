@@ -65,6 +65,14 @@ impl ConfigFixture {
             .env(TEST_SUPPORT_ADAPTER_ENV, "fake");
         command
     }
+
+    fn resolved_project_config(&self) -> PathBuf {
+        self.project
+            .canonicalize()
+            .expect("project fixture path should resolve")
+            .join(".satelle")
+            .join("config.toml")
+    }
 }
 
 fn parse_json(bytes: &[u8]) -> Value {
@@ -814,12 +822,7 @@ transport = "direct"
     assert_eq!(error["error"]["code"], "project-host-binding-not-allowed");
     assert_eq!(
         error["error"]["file"],
-        fixture
-            .project
-            .join(".satelle")
-            .join("config.toml")
-            .display()
-            .to_string()
+        fixture.resolved_project_config().display().to_string()
     );
     assert_eq!(error["error"]["path"], "hosts.remote.transport");
     assert_eq!(error["error"]["key"], "transport");
@@ -831,11 +834,7 @@ transport = "direct"
         error["error"]["recovery_command"],
         format!(
             "remove hosts.remote.transport from {} or set it to \"local\" to match the trusted Host Binding",
-            fixture
-                .project
-                .join(".satelle")
-                .join("config.toml")
-                .display()
+            fixture.resolved_project_config().display()
         )
     );
 }
@@ -861,12 +860,7 @@ transport = "local"
     assert_eq!(error["error"]["code"], "host-not-found");
     assert_eq!(
         error["error"]["file"],
-        fixture
-            .project
-            .join(".satelle")
-            .join("config.toml")
-            .display()
-            .to_string()
+        fixture.resolved_project_config().display().to_string()
     );
     assert_eq!(error["error"]["path"], "hosts.missing");
     assert_eq!(error["error"]["host"], "missing");
