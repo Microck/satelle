@@ -1606,7 +1606,7 @@
 - satelle Satelle Operator Log Files are stored under an OS-native Satelle log directory on the remote host instead of project directories @spec @mvp
 - satelle default Linux Satelle Operator Log File root is ${XDG_STATE_HOME:-$HOME/.local/state}/satelle/logs @spec @mvp
 - satelle default Windows Satelle Operator Log File root is the Local AppData Known Folder joined with Microck\Satelle\data\state\logs @spec @mvp
-- satelle default macOS Satelle Operator Log File root is $HOME/Library/Logs/dev.Microck.Satelle @spec @mvp
+- satelle default macOS Satelle Operator Log File root is $HOME/Library/Logs/dev.Microck.Satelle @spec @mvp @implemented
 - satelle Host Daemon continues running when Satelle Operator Log File writes fail while SQLite remains writable, and records the degraded log-file sink as a typed diagnostic finding @spec @mvp
 - satelle Host Daemon writes startup, shutdown, and fatal-error notices to stdout or stderr so service managers and containers can capture minimal process diagnostics @spec @mvp
 - satelle MVP does not require direct journald, Windows Event Log, or macOS unified logging API integration as a separate log sink @spec @mvp
