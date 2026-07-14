@@ -32,9 +32,9 @@ impl ComputerUseAdapter for FailingExecutionAdapter {
 
 #[test]
 fn unsupported_or_unproven_production_execution_is_blocked_before_admission() {
-    for (name, evidence) in [
+    for (name, evidence, control_plane_admission) in [
         (
-            "unsupported-platform",
+            "unsupported-linux-host",
             Phase0CapabilityEvidence {
                 codex_version: CodexVersionEvidence::Detected {
                     version: REQUIRED_CODEX_VERSION,
@@ -42,19 +42,24 @@ fn unsupported_or_unproven_production_execution_is_blocked_before_admission() {
                 host_platform: HostPlatform::Linux,
                 capabilities: CapabilityMatrix::unproven(),
             },
+            codex_capabilities::ControlPlaneAdmission::not_applicable(),
         ),
         (
-            "missing-runtime",
+            "supported-windows-host-with-unproven-native-readiness",
             Phase0CapabilityEvidence {
-                codex_version: CodexVersionEvidence::Missing,
+                codex_version: CodexVersionEvidence::Detected {
+                    version: REQUIRED_CODEX_VERSION,
+                },
                 host_platform: HostPlatform::Windows,
                 capabilities: CapabilityMatrix::unproven(),
             },
+            codex_capabilities::ControlPlaneAdmission::not_applicable(),
         ),
     ] {
         let state = TestStateDir::new().expect("temporary state directory should exist");
-        let state_path = state.path().join(format!("{name}.json"));
-        let snapshot = Arc::new(RwLock::new(capability_snapshot(evidence, 7)));
+        let mut production_snapshot = capability_snapshot(evidence, 7);
+        production_snapshot.control_plane_admission = control_plane_admission;
+        let snapshot = Arc::new(RwLock::new(production_snapshot));
         let adapter = ProductionComputerUseAdapter::new(
             Arc::clone(&snapshot),
             Ok(state.path().join("codex-app-server-work")),
@@ -66,51 +71,68 @@ fn unsupported_or_unproven_production_execution_is_blocked_before_admission() {
         };
         let session_id = SessionId::new();
 
-        for failure in [
-            service
-                .run(
-                    LOCAL_DEMO_HOST,
-                    "PRIVATE_PRODUCTION_PROMPT",
-                    TurnExecutionMode::Standard,
-                )
-                .expect_err("attached run must be blocked"),
-            service
-                .steer(
-                    &session_id,
-                    "PRIVATE_PRODUCTION_PROMPT",
-                    TurnExecutionMode::Standard,
-                )
-                .expect_err("attached steer must be blocked before session lookup"),
+        let assert_blocked_error = |operation: &str, error: &SatelleError| {
+            assert_eq!(error.code, ErrorCode::ComputerUseNotReady);
+            assert!(
+                error.details.is_empty(),
+                "{name} {operation} must remain a native readiness failure"
+            );
+
+            let serialized =
+                serde_json::to_string(error).expect("closed capability blocker must serialize");
+            assert!(!serialized.contains("PRIVATE_PRODUCTION_PROMPT"));
+            assert!(!serialized.contains("fake"));
+        };
+
+        for (operation, failure) in [
+            (
+                "run",
+                service
+                    .run(
+                        LOCAL_DEMO_HOST,
+                        "PRIVATE_PRODUCTION_PROMPT",
+                        TurnExecutionMode::Standard,
+                    )
+                    .expect_err("attached run must be blocked"),
+            ),
+            (
+                "steer",
+                service
+                    .steer(
+                        &session_id,
+                        "PRIVATE_PRODUCTION_PROMPT",
+                        TurnExecutionMode::Standard,
+                    )
+                    .expect_err("attached steer must be blocked before session lookup"),
+            ),
         ] {
             assert!(matches!(failure, TurnAdmissionFailure::NotAdmitted(_)));
-            assert_eq!(failure.error().code, ErrorCode::ComputerUseNotReady);
-            let serialized = serde_json::to_string(failure.error())
-                .expect("closed capability blocker must serialize");
-            assert!(!serialized.contains("PRIVATE_PRODUCTION_PROMPT"));
-            assert!(!serialized.contains("fake"));
+            assert_blocked_error(operation, failure.error());
         }
 
-        for error in [
-            service
-                .run_detached(
-                    LOCAL_DEMO_HOST,
-                    "PRIVATE_PRODUCTION_PROMPT",
-                    TurnExecutionMode::Standard,
-                )
-                .expect_err("detached run must be blocked"),
-            service
-                .steer_detached(
-                    &session_id,
-                    "PRIVATE_PRODUCTION_PROMPT",
-                    TurnExecutionMode::Standard,
-                )
-                .expect_err("detached steer must be blocked before session lookup"),
+        for (operation, error) in [
+            (
+                "run",
+                service
+                    .run_detached(
+                        LOCAL_DEMO_HOST,
+                        "PRIVATE_PRODUCTION_PROMPT",
+                        TurnExecutionMode::Standard,
+                    )
+                    .expect_err("detached run must be blocked"),
+            ),
+            (
+                "steer",
+                service
+                    .steer_detached(
+                        &session_id,
+                        "PRIVATE_PRODUCTION_PROMPT",
+                        TurnExecutionMode::Standard,
+                    )
+                    .expect_err("detached steer must be blocked before session lookup"),
+            ),
         ] {
-            assert_eq!(error.code, ErrorCode::ComputerUseNotReady);
-            let serialized =
-                serde_json::to_string(&error).expect("closed capability blocker must serialize");
-            assert!(!serialized.contains("PRIVATE_PRODUCTION_PROMPT"));
-            assert!(!serialized.contains("fake"));
+            assert_blocked_error(operation, &error);
         }
 
         let stop_error = service
@@ -123,9 +145,17 @@ fn unsupported_or_unproven_production_execution_is_blocked_before_admission() {
             .expect_err("read-only status should open storage without adapter readiness");
         assert_eq!(status_error.code, ErrorCode::SessionNotFound);
 
-        assert!(
-            !state_path.exists(),
-            "blocked production execution must not create {state_path:?}"
+        let runtime_status = service
+            .daemon_runtime_status()
+            .expect("blocked production execution must leave runtime status readable");
+        assert_eq!(
+            (
+                runtime_status.session_count(),
+                runtime_status.active_turn_count(),
+                runtime_status.recovery_pending_turn_count(),
+            ),
+            (0, 0, 0),
+            "{name} must not durably admit a Session or Turn"
         );
     }
 }
