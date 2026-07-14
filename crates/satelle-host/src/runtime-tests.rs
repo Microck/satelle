@@ -12,11 +12,12 @@ use satelle_core::{
     ControlPlaneFailureReason, ControlPlaneOperation, ErrorCode, EventType,
     IncompatibleControlPlaneDetails, LOCAL_DEMO_HOST, SatelleError,
 };
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, mpsc};
 use std::time::Duration;
 
 const WAIT_LIMIT: Duration = Duration::from_secs(2);
+const DEADLOCK_GUARD_LIMIT: Duration = Duration::from_secs(30);
 const STABLE_DIGEST: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 const PRIVATE_UPSTREAM_THREAD_REF: &str = "PRIVATE_UPSTREAM_THREAD_REFERENCE_CANARY";
 const PRIVATE_UPSTREAM_TURN_REF: &str = "PRIVATE_UPSTREAM_TURN_REFERENCE_CANARY";
@@ -79,6 +80,12 @@ fn blocked_preflight_opens_authoritative_state_without_admitting_work() {
 fn reads_and_stop_remain_available_during_slow_execution_and_stop_observation() {
     let state = crate::TestStateDir::new().expect("temporary state directory should exist");
     let adapter = BlockingExecutionAndStopAdapter::default();
+    let deadlock_guard = DeadlockGuard::new([
+        adapter.execute_started.clone(),
+        adapter.execute_release.clone(),
+        adapter.stop_started.clone(),
+        adapter.stop_release.clone(),
+    ]);
     let runtime = RuntimeHandle::new(Ok(state.path().to_path_buf()), adapter.clone());
     let session = runtime
         .run(RunCommand::detached(
@@ -87,30 +94,24 @@ fn reads_and_stop_remain_available_during_slow_execution_and_stop_observation() 
         ))
         .expect("detached work should be admitted")
         .session;
-    assert!(
-        adapter.execute_started.wait_for(WAIT_LIMIT),
-        "the detached worker should invoke the adapter"
-    );
+    adapter.execute_started.wait();
 
     let (read_sender, read_receiver) = mpsc::sync_channel(1);
     let read_runtime = runtime.clone();
     let read_session_id = session.session_id().clone();
     let execute_read = std::thread::spawn(move || {
-        let read_result = read_runtime.status(read_session_id).and_then(|status| {
+        let result = read_runtime.status(read_session_id).and_then(|status| {
             let count = read_runtime.snapshot()?.session_count();
             Ok((status, count))
         });
         read_sender
-            .send(read_result)
+            .send(result)
             .expect("read receiver should remain connected");
     });
-    let (running_status, count) = match read_receiver.recv_timeout(WAIT_LIMIT) {
-        Ok(result) => result.expect("reads should succeed during adapter execution"),
-        Err(error) => {
-            adapter.release_all();
-            panic!("reads were serialized behind adapter execution: {error}");
-        }
-    };
+    let (running_status, count) = read_receiver
+        .recv()
+        .expect("read worker should publish its result")
+        .expect("reads should succeed during adapter execution");
     execute_read.join().expect("read worker should finish");
     assert_eq!(latest_turn_state(&running_status), TurnState::Running);
     assert_eq!(count, 1);
@@ -119,45 +120,39 @@ fn reads_and_stop_remain_available_during_slow_execution_and_stop_observation() 
     let stop_runtime = runtime.clone();
     let stop_session_id = session.session_id().clone();
     let stop_worker = std::thread::spawn(move || {
-        let stop = stop_runtime.stop(StopCommand::with_identity(
+        let result = stop_runtime.stop(StopCommand::with_identity(
             stop_session_id,
             RequestIdentity::new("blocking-stop", STABLE_DIGEST),
         ));
         stop_sender
-            .send(stop)
+            .send(result)
             .expect("stop receiver should remain connected");
     });
-    if !adapter.stop_started.wait_for(WAIT_LIMIT) {
-        adapter.release_all();
-        panic!("stop could not reach observation while execution was blocked");
-    }
+    adapter.stop_started.wait();
 
     let (read_sender, read_receiver) = mpsc::sync_channel(1);
     let read_runtime = runtime.clone();
     let read_session_id = session.session_id().clone();
     let stop_read = std::thread::spawn(move || {
-        let read_result = read_runtime.status(read_session_id).and_then(|status| {
+        let result = read_runtime.status(read_session_id).and_then(|status| {
             let logs = read_runtime.log_page(&LogPageQuery::default())?;
             Ok((status, logs))
         });
         read_sender
-            .send(read_result)
+            .send(result)
             .expect("read receiver should remain connected");
     });
-    let (_status, logs) = match read_receiver.recv_timeout(WAIT_LIMIT) {
-        Ok(result) => result.expect("reads should succeed during stop observation"),
-        Err(error) => {
-            adapter.release_all();
-            panic!("reads were serialized behind stop observation: {error}");
-        }
-    };
+    let (_status, logs) = read_receiver
+        .recv()
+        .expect("read worker should publish its result")
+        .expect("reads should succeed during stop observation");
     stop_read.join().expect("read worker should finish");
     assert!(!logs.entries().is_empty());
 
     adapter.stop_release.signal();
     let stopped = stop_receiver
-        .recv_timeout(WAIT_LIMIT)
-        .expect("stop should finish after observation is released")
+        .recv()
+        .expect("stop worker should publish its result")
         .expect("confirmed stop should succeed");
     stop_worker.join().expect("stop worker should finish");
     assert_eq!(stopped.current_state(), TurnState::Stopped);
@@ -170,6 +165,7 @@ fn reads_and_stop_remain_available_during_slow_execution_and_stop_observation() 
         .status(session.session_id().clone())
         .expect("the terminal stop compare-and-swap should win");
     assert_eq!(latest_turn_state(&final_status), TurnState::Stopped);
+    deadlock_guard.complete();
 }
 
 #[test]
@@ -422,22 +418,23 @@ fn new_admission_reconciles_restart_work_without_blocking_reads() {
     drop(interrupted);
 
     let adapter = BlockingRecoveryAdapter::default();
+    let deadlock_guard = DeadlockGuard::new([
+        adapter.recovery_started.clone(),
+        adapter.recovery_release.clone(),
+    ]);
     let restarted = RuntimeHandle::new(Ok(state_root), adapter.clone());
     let run_runtime = restarted.clone();
     let (run_sender, run_receiver) = mpsc::sync_channel(1);
     let run_worker = std::thread::spawn(move || {
-        let outcome = run_runtime.run(RunCommand::attached(
+        let result = run_runtime.run(RunCommand::attached(
             LOCAL_DEMO_HOST,
             "PRIVATE_AFTER_RECOVERY",
         ));
         run_sender
-            .send(outcome)
+            .send(result)
             .expect("run receiver should remain connected");
     });
-    if !adapter.recovery_started.wait_for(WAIT_LIMIT) {
-        adapter.recovery_release.signal();
-        panic!("new admission did not attempt restart reconciliation");
-    }
+    adapter.recovery_started.wait();
 
     let (read_sender, read_receiver) = mpsc::sync_channel(1);
     let read_runtime = restarted.clone();
@@ -451,13 +448,10 @@ fn new_admission_reconciles_restart_work_without_blocking_reads() {
             .send(result)
             .expect("read receiver should remain connected");
     });
-    let (recovering_status, log_count) = match read_receiver.recv_timeout(WAIT_LIMIT) {
-        Ok(result) => result.expect("reads should succeed during recovery observation"),
-        Err(error) => {
-            adapter.recovery_release.signal();
-            panic!("reads were serialized behind recovery observation: {error}");
-        }
-    };
+    let (recovering_status, log_count) = read_receiver
+        .recv()
+        .expect("read worker should publish its result")
+        .expect("reads should succeed during recovery observation");
     read_worker.join().expect("read worker should finish");
     assert_eq!(
         latest_turn_state(&recovering_status),
@@ -467,8 +461,8 @@ fn new_admission_reconciles_restart_work_without_blocking_reads() {
 
     adapter.recovery_release.signal();
     let new_outcome = run_receiver
-        .recv_timeout(WAIT_LIMIT)
-        .expect("admission should continue after recovery")
+        .recv()
+        .expect("run worker should publish its result")
         .expect("recovery and new execution should succeed");
     run_worker.join().expect("run worker should finish");
     let recovered = restarted
@@ -488,6 +482,7 @@ fn new_admission_reconciles_restart_work_without_blocking_reads() {
             .expect("successful reconciliation should clear startup recovery"),
         RuntimeStartupState::Ready
     );
+    deadlock_guard.complete();
 }
 
 #[test]
@@ -765,13 +760,6 @@ impl super::ComputerUseAdapter for ReferencePersistingAdapter {
     }
 }
 
-impl BlockingExecutionAndStopAdapter {
-    fn release_all(&self) {
-        self.execute_release.signal();
-        self.stop_release.signal();
-    }
-}
-
 impl super::ComputerUseAdapter for BlockingExecutionAndStopAdapter {
     fn preflight(&self, host: &str) -> Result<super::AdapterReadiness, SatelleError> {
         FakeComputerUseAdapter.preflight(host)
@@ -868,6 +856,76 @@ impl Latch {
             .wait_timeout_while(signaled, timeout, |signaled| !*signaled)
             .expect("test latch lock should not be poisoned");
         *signaled
+    }
+}
+
+struct DeadlockGuard {
+    emergency_releases: Vec<Latch>,
+    cancelled: mpsc::SyncSender<()>,
+    expired: Arc<AtomicBool>,
+    watchdog: Option<std::thread::JoinHandle<()>>,
+}
+
+impl DeadlockGuard {
+    fn new(emergency_releases: impl IntoIterator<Item = Latch>) -> Self {
+        let emergency_releases = emergency_releases.into_iter().collect::<Vec<_>>();
+        let watchdog_releases = emergency_releases.clone();
+        let expired = Arc::new(AtomicBool::new(false));
+        let watchdog_expired = Arc::clone(&expired);
+        let (cancelled, cancellation) = mpsc::sync_channel(1);
+        // Phase ordering is synchronized without elapsed-time assertions. This
+        // watchdog exists only to release intentionally blocked adapters and
+        // turn a genuine test deadlock into a bounded failure.
+        let watchdog = std::thread::spawn(move || {
+            if matches!(
+                cancellation.recv_timeout(DEADLOCK_GUARD_LIMIT),
+                Err(mpsc::RecvTimeoutError::Timeout)
+            ) {
+                watchdog_expired.store(true, Ordering::SeqCst);
+                for release in watchdog_releases {
+                    release.signal();
+                }
+            }
+        });
+        Self {
+            emergency_releases,
+            cancelled,
+            expired,
+            watchdog: Some(watchdog),
+        }
+    }
+
+    fn complete(mut self) {
+        self.stop_watchdog();
+        assert!(
+            !self.expired.load(Ordering::SeqCst),
+            "test synchronization exceeded the deadlock guard"
+        );
+    }
+
+    fn stop_watchdog(&mut self) {
+        let _ = self.cancelled.send(());
+        if let Some(watchdog) = self.watchdog.take() {
+            watchdog
+                .join()
+                .expect("the deadlock watchdog should not panic");
+        }
+    }
+
+    fn release_all(&self) {
+        for release in &self.emergency_releases {
+            release.signal();
+        }
+    }
+}
+
+impl Drop for DeadlockGuard {
+    fn drop(&mut self) {
+        if self.watchdog.is_none() {
+            return;
+        }
+        self.release_all();
+        self.stop_watchdog();
     }
 }
 
