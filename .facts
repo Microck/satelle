@@ -1369,9 +1369,15 @@
 - a Satelle Session is active exactly when it references one nonterminal Turn @spec @mvp
 - satelle derives Session activity from the active Turn instead of storing an independently mutable duplicate status @spec @mvp
 - a Satelle Session remains steerable after a terminal Turn while its Host and internal Codex thread mapping remain available @spec @mvp
-- the Host Identity and Desktop Binding of a Satelle Session are immutable after Session creation @spec @mvp
+- id: ksl
+  label: the Host Identity and Desktop Binding of a Satelle Session are immutable after Session creation
+  command: cargo test --locked -p satelle-core --lib session::tests::policy_is_snapshotted_and_desktop_binding_is_immutable -- --exact
+  tags: [spec, mvp, implemented, ci]
 - each Turn stores the effective model, Provider Binding, desktop target, approval policy, sandbox policy, timeout policy, and experimental-feature choices used for that Turn @spec @mvp
-- every Session record has a monotonically increasing session_state_revision and every Turn record has a monotonically increasing turn_state_revision updated by each committed lifecycle mutation of that record @spec @contract @mvp
+- id: lwp
+  label: every Session record has a monotonically increasing session_state_revision and every Turn record has a monotonically increasing turn_state_revision updated by each committed lifecycle mutation of that record
+  command: cargo test --locked -p satelle-core --lib session::tests::each_turn_commit_checks_and_increments_both_revisions_once -- --exact && cargo test --locked -p satelle-core --lib session::tests::follow_up_preserves_history_and_at_most_one_turn_is_active -- --exact && cargo test --locked -p satelle-core --lib session::tests::stop_without_confirmation_retains_active_or_recovery_ownership -- --exact && cargo test --locked -p satelle-host --lib storage::tests::lifecycle::terminal_session_round_trips_with_follow_up_and_exact_snapshot -- --exact
+  tags: [spec, contract, mvp, implemented, ci]
 - id: g60
   label: public Session responses include session_state_revision and public Turn responses include turn_state_revision
   command: cargo test --locked -p satelle-core --lib session::tests::public_json_has_exact_safe_allowlist -- --exact

@@ -1747,12 +1747,14 @@ mod tests {
     #[test]
     fn each_turn_commit_checks_and_increments_both_revisions_once() {
         let mut session = new_session();
+        let before_running = revisions(&session);
         let running = transition_to(&mut session, TurnState::Running, 1).unwrap();
+        let after_running = next_revisions(before_running);
         assert_eq!(
-            SessionStateRevision::new(2).unwrap(),
-            running.session_revision()
+            after_running,
+            ExpectedRevisions::new(running.session_revision(), running.turn_revision())
         );
-        assert_eq!(TurnStateRevision::new(2).unwrap(), running.turn_revision());
+        assert_eq!(after_running, revisions(&session));
 
         let before = session.to_public();
         let stale_turn = ExpectedRevisions::new(
@@ -1774,15 +1776,14 @@ mod tests {
         ));
         assert_eq!(before, session.to_public());
 
+        let before_completed = revisions(&session);
         let completed = transition_to(&mut session, TurnState::Completed, 3).unwrap();
+        let after_completed = next_revisions(before_completed);
         assert_eq!(
-            SessionStateRevision::new(3).unwrap(),
-            completed.session_revision()
+            after_completed,
+            ExpectedRevisions::new(completed.session_revision(), completed.turn_revision())
         );
-        assert_eq!(
-            TurnStateRevision::new(3).unwrap(),
-            completed.turn_revision()
-        );
+        assert_eq!(after_completed, revisions(&session));
     }
 
     #[test]
@@ -1811,6 +1812,7 @@ mod tests {
             )
             .unwrap();
         assert_eq!(prior_revision.next().unwrap(), commit.session_revision());
+        assert_eq!(commit.session_revision(), session.session_state_revision());
         assert_eq!(TurnStateRevision::initial(), commit.turn_revision());
         assert_eq!(
             history_before,
@@ -1838,38 +1840,40 @@ mod tests {
     #[test]
     fn stop_without_confirmation_retains_active_or_recovery_ownership() {
         let mut session = new_session();
-        let active = session
-            .stop_turn(
-                &turn_1(),
-                revisions(&session),
-                StopObservation::UpstreamStillActive,
-                at(1),
-            )
-            .unwrap();
+        let before_active = revisions(&session);
         assert!(matches!(
-            active,
+            session
+                .stop_turn(
+                    &turn_1(),
+                    before_active,
+                    StopObservation::UpstreamStillActive,
+                    at(1),
+                )
+                .unwrap(),
             StopOutcome::NotConfirmed {
                 ownership: RetainedOwnership::Active,
                 mutation: LifecycleMutation::Committed(_),
             }
         ));
+        assert_eq!(next_revisions(before_active), revisions(&session));
         assert_eq!(TurnState::Running, session.turn(&turn_1()).unwrap().state());
 
-        let recovery = session
-            .stop_turn(
-                &turn_1(),
-                revisions(&session),
-                StopObservation::OutcomeUnknown,
-                at(2),
-            )
-            .unwrap();
+        let before_recovery = revisions(&session);
         assert!(matches!(
-            recovery,
+            session
+                .stop_turn(
+                    &turn_1(),
+                    before_recovery,
+                    StopObservation::OutcomeUnknown,
+                    at(2),
+                )
+                .unwrap(),
             StopOutcome::NotConfirmed {
                 ownership: RetainedOwnership::RecoveryPending,
                 mutation: LifecycleMutation::Committed(_),
             }
         ));
+        assert_eq!(next_revisions(before_recovery), revisions(&session));
         assert!(session.is_active());
 
         let current = revisions(&session);
@@ -1879,21 +1883,30 @@ mod tests {
                 .mark_active_recovery_pending(current, at(3))
                 .unwrap()
         );
+        assert_eq!(current, revisions(&session));
+
+        let before_stop = revisions(&session);
         assert!(matches!(
             session
                 .stop_turn(
                     &turn_1(),
-                    revisions(&session),
+                    before_stop,
                     StopObservation::UpstreamInactiveConfirmed,
                     at(4),
                 )
                 .unwrap(),
             StopOutcome::Stopped(_)
         ));
+        assert_eq!(next_revisions(before_stop), revisions(&session));
         assert!(!session.is_active());
 
+        let terminal_revisions = revisions(&session);
         let before = session.to_public();
-        assert!(matches!(
+        assert_eq!(
+            StopOutcome::AlreadyTerminal {
+                state: TerminalTurnState::Stopped,
+                revisions: terminal_revisions,
+            },
             session
                 .stop_turn(
                     &turn_1(),
@@ -1904,12 +1917,9 @@ mod tests {
                     StopObservation::CancellationConfirmed,
                     at(5),
                 )
-                .unwrap(),
-            StopOutcome::AlreadyTerminal {
-                state: TerminalTurnState::Stopped,
-                ..
-            }
-        ));
+                .unwrap()
+        );
+        assert_eq!(terminal_revisions, revisions(&session));
         assert_eq!(before, session.to_public());
     }
 
@@ -1939,7 +1949,7 @@ mod tests {
         assert_eq!(&desktop(), session.desktop_binding());
 
         let mut idle = in_state(TurnState::Completed);
-        let before = idle.to_public();
+        let before = idle.snapshot();
         assert_eq!(
             Err(LifecycleError::DesktopTargetMismatch),
             idle.start_follow_up(
@@ -1952,7 +1962,7 @@ mod tests {
                 at(3),
             )
         );
-        assert_eq!(before, idle.to_public());
+        assert_eq!(before, idle.snapshot());
     }
 
     #[test]
@@ -2616,6 +2626,13 @@ mod tests {
         ExpectedRevisions::new(
             session.session_state_revision(),
             session.turn(&turn_1()).unwrap().turn_state_revision(),
+        )
+    }
+
+    fn next_revisions(revisions: ExpectedRevisions) -> ExpectedRevisions {
+        ExpectedRevisions::new(
+            revisions.session().next().unwrap(),
+            revisions.turn().next().unwrap(),
         )
     }
 
