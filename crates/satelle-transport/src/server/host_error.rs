@@ -49,6 +49,7 @@ fn failure(error: &SatelleError) -> ApiFailure {
         | ErrorCode::ProjectYoloEnableNotAllowed
         | ErrorCode::ProjectExperimentalProviderOptInNotAllowed
         | ErrorCode::ProjectMutationConsentNotAllowed
+        | ErrorCode::ProjectHostBindingNotAllowed
         | ErrorCode::ProjectHostSelectionNotAllowed
         | ErrorCode::ProjectSecretSourceNotAllowed
         | ErrorCode::ProjectCredentialHelperNotAllowed

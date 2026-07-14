@@ -1,4 +1,5 @@
 use directories::ProjectDirs;
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use std::collections::{BTreeMap, BTreeSet};
@@ -119,6 +120,62 @@ impl SatelleConfig {
         }
 
         self
+    }
+
+    fn apply_project_config(
+        mut self,
+        higher: &ProjectConfig,
+        user_config_path: &Path,
+        project_config_path: &Path,
+    ) -> Result<Self, SatelleError> {
+        // Validate the complete project overlay before changing the effective config. A project
+        // alias may carry shared intent, but the concrete Host Binding must already exist in a
+        // trusted default or user config and its transport cannot be redirected.
+        for (alias, intent) in &higher.hosts {
+            let host = self.hosts.get(alias).ok_or_else(|| {
+                SatelleError::project_host_binding_not_found(
+                    project_config_path,
+                    user_config_path,
+                    alias,
+                )
+            })?;
+            if let Some(project_transport) = &intent.transport
+                && project_transport != &host.transport
+            {
+                return Err(SatelleError::project_transport_preference_not_allowed(
+                    project_config_path,
+                    alias,
+                    project_transport,
+                    &host.transport,
+                ));
+            }
+        }
+
+        if higher.default_host.is_some() {
+            self.default_host.clone_from(&higher.default_host);
+        }
+        if higher.model_alias.is_some() {
+            self.model_alias.clone_from(&higher.model_alias);
+        }
+        if higher.provider_alias.is_some() {
+            self.provider_alias.clone_from(&higher.provider_alias);
+        }
+
+        for (alias, intent) in &higher.hosts {
+            if let Some(timeouts) = &intent.timeouts {
+                let host = self
+                    .hosts
+                    .get_mut(alias)
+                    .expect("project host intents were validated before application");
+                host.timeouts = Some(
+                    host.timeouts
+                        .take()
+                        .map_or_else(|| timeouts.clone(), |base| base.merge(timeouts.clone())),
+                );
+            }
+        }
+
+        Ok(self)
     }
 }
 
@@ -247,6 +304,14 @@ pub enum TransportKind {
     Ssh,
 }
 
+fn transport_kind_name(transport: &TransportKind) -> &'static str {
+    match transport {
+        TransportKind::Local => "local",
+        TransportKind::Direct => "direct",
+        TransportKind::Ssh => "ssh",
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
 pub enum AdapterKind {
@@ -310,8 +375,8 @@ pub struct ResolvedConfig {
     profile_overlay: Option<profiles::ProfileConfig>,
     #[serde(skip)]
     default_host_requires_project_permission: bool,
-    // Project configuration may replace a HostConfig, so its merged permission bit cannot prove
-    // that the user authorized project selection. Preserve that authorization at the trust boundary.
+    // Preserve user authorization separately from shared project intent so only the exact
+    // user-level Host Binding can permit implicit project selection.
     #[serde(skip)]
     project_selectable_hosts: BTreeSet<String>,
 }
@@ -366,8 +431,8 @@ pub fn load_config(cwd: &Path, flag_profile: Option<&str>) -> Result<ResolvedCon
     let project_config_path = paths.project_config_file;
 
     let mut config = SatelleConfig::defaults();
-    let user_config = read_config_file(&user_config_path, ConfigScope::User)?;
-    let project_config = read_config_file(&project_config_path, ConfigScope::Project)?;
+    let user_config = read_user_config_file(&user_config_path)?;
+    let project_config = read_project_config_file(&project_config_path)?;
     let project_selectable_hosts = user_config
         .as_ref()
         .map(|config| {
@@ -387,7 +452,11 @@ pub fn load_config(cwd: &Path, flag_profile: Option<&str>) -> Result<ResolvedCon
         config = config.merge(user_config.config.clone());
     }
     if let Some(project_config) = &project_config {
-        config = config.merge(project_config.config.clone());
+        config = config.apply_project_config(
+            &project_config.config,
+            &user_config_path,
+            &project_config_path,
+        )?;
     }
 
     let selected_profile = profiles::select_profile(
@@ -577,16 +646,45 @@ enum ConfigScope {
 }
 
 #[derive(Clone, Debug)]
-struct ParsedConfigFile {
-    config: SatelleConfig,
+struct ParsedConfigFile<Config> {
+    config: Config,
     default_profile: Option<String>,
     profiles: BTreeMap<String, profiles::ProfileConfig>,
 }
 
-fn read_config_file(
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct ProjectConfig {
+    default_host: Option<String>,
+    model_alias: Option<String>,
+    provider_alias: Option<String>,
+    #[serde(default)]
+    hosts: BTreeMap<String, ProjectHostIntent>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct ProjectHostIntent {
+    transport: Option<TransportKind>,
+    timeouts: Option<TimeoutConfig>,
+}
+
+fn read_user_config_file(
+    path: &Path,
+) -> Result<Option<ParsedConfigFile<SatelleConfig>>, SatelleError> {
+    read_config_file(path, ConfigScope::User)
+}
+
+fn read_project_config_file(
+    path: &Path,
+) -> Result<Option<ParsedConfigFile<ProjectConfig>>, SatelleError> {
+    read_config_file(path, ConfigScope::Project)
+}
+
+fn read_config_file<Config: DeserializeOwned>(
     path: &Path,
     scope: ConfigScope,
-) -> Result<Option<ParsedConfigFile>, SatelleError> {
+) -> Result<Option<ParsedConfigFile<Config>>, SatelleError> {
     if !path.exists() {
         return Ok(None);
     }
@@ -626,7 +724,7 @@ fn read_config_file(
     }
     reject_desktop_session_selector_conflicts(path, &value)?;
     reject_provider_secret_source_errors(path, &value)?;
-    reject_unknown_config_keys(path, &value)?;
+    reject_unknown_config_keys(path, &value, scope)?;
 
     let config = value
         .clone()
@@ -778,6 +876,16 @@ fn reject_project_forbidden_keys(path: &Path, value: &toml::Value) -> Result<(),
         for &key in PROJECT_SECRET_SOURCE_KEYS {
             if host_table.contains_key(key) {
                 return Err(SatelleError::project_secret_source_not_allowed(
+                    path,
+                    &format!("{host_path}.{key}"),
+                    key,
+                ));
+            }
+        }
+
+        for key in ["address", "adapter", "network"] {
+            if host_table.contains_key(key) {
+                return Err(SatelleError::project_host_binding_not_allowed(
                     path,
                     &format!("{host_path}.{key}"),
                     key,
@@ -1245,16 +1353,18 @@ pub struct UnknownConfigKey {
     pub suggestion: Option<String>,
 }
 
-fn reject_unknown_config_keys(path: &Path, value: &toml::Value) -> Result<(), SatelleError> {
+fn reject_unknown_config_keys(
+    path: &Path,
+    value: &toml::Value,
+    scope: ConfigScope,
+) -> Result<(), SatelleError> {
     let Some(table) = value.as_table() else {
         return Ok(());
     };
 
     let mut unknown_keys = Vec::new();
-    collect_unknown_keys_for_table(
-        "",
-        table,
-        &[
+    let accepted_root_keys: &[&str] = match scope {
+        ConfigScope::User => &[
             "default_host",
             "model_alias",
             "provider_alias",
@@ -1264,8 +1374,16 @@ fn reject_unknown_config_keys(path: &Path, value: &toml::Value) -> Result<(), Sa
             "profiles",
             "hosts",
         ],
-        &mut unknown_keys,
-    );
+        ConfigScope::Project => &[
+            "default_host",
+            "model_alias",
+            "provider_alias",
+            "profile",
+            "profiles",
+            "hosts",
+        ],
+    };
+    collect_unknown_keys_for_table("", table, accepted_root_keys, &mut unknown_keys);
 
     if let Some(hosts) = table.get("hosts").and_then(toml::Value::as_table) {
         for (alias, host_value) in hosts {
@@ -1274,10 +1392,8 @@ fn reject_unknown_config_keys(path: &Path, value: &toml::Value) -> Result<(), Sa
                 continue;
             };
 
-            collect_unknown_keys_for_table(
-                &host_path,
-                host_table,
-                &[
+            let accepted_host_keys: &[&str] = match scope {
+                ConfigScope::User => &[
                     "transport",
                     "adapter",
                     "address",
@@ -1299,10 +1415,19 @@ fn reject_unknown_config_keys(path: &Path, value: &toml::Value) -> Result<(), Sa
                     "ca_bundle",
                     "provider_auth",
                 ],
+                ConfigScope::Project => &["transport", "timeouts"],
+            };
+            collect_unknown_keys_for_table(
+                &host_path,
+                host_table,
+                accepted_host_keys,
                 &mut unknown_keys,
             );
 
-            if let Some(network_table) = host_table.get("network").and_then(toml::Value::as_table) {
+            if scope == ConfigScope::User
+                && let Some(network_table) =
+                    host_table.get("network").and_then(toml::Value::as_table)
+            {
                 collect_unknown_keys_for_table(
                     &format!("{host_path}.network"),
                     network_table,
@@ -1311,9 +1436,10 @@ fn reject_unknown_config_keys(path: &Path, value: &toml::Value) -> Result<(), Sa
                 );
             }
 
-            if let Some(selector_table) = host_table
-                .get("desktop_session_native_selector")
-                .and_then(toml::Value::as_table)
+            if scope == ConfigScope::User
+                && let Some(selector_table) = host_table
+                    .get("desktop_session_native_selector")
+                    .and_then(toml::Value::as_table)
             {
                 collect_unknown_keys_for_table(
                     &format!("{host_path}.desktop_session_native_selector"),
@@ -1323,9 +1449,10 @@ fn reject_unknown_config_keys(path: &Path, value: &toml::Value) -> Result<(), Sa
                 );
             }
 
-            if let Some(provider_auth_table) = host_table
-                .get("provider_auth")
-                .and_then(toml::Value::as_table)
+            if scope == ConfigScope::User
+                && let Some(provider_auth_table) = host_table
+                    .get("provider_auth")
+                    .and_then(toml::Value::as_table)
             {
                 for (provider_alias, source_value) in provider_auth_table {
                     let Some(source_table) = source_value.as_table() else {
@@ -1340,8 +1467,9 @@ fn reject_unknown_config_keys(path: &Path, value: &toml::Value) -> Result<(), Sa
                 }
             }
 
-            if let Some(api_token_table) =
-                host_table.get("api_token").and_then(toml::Value::as_table)
+            if scope == ConfigScope::User
+                && let Some(api_token_table) =
+                    host_table.get("api_token").and_then(toml::Value::as_table)
             {
                 collect_unknown_keys_for_table(
                     &format!("{host_path}.api_token"),
@@ -1460,6 +1588,7 @@ pub enum ErrorCode {
     ProjectYoloEnableNotAllowed,
     ProjectExperimentalProviderOptInNotAllowed,
     ProjectMutationConsentNotAllowed,
+    ProjectHostBindingNotAllowed,
     ProjectHostSelectionNotAllowed,
     ProjectSecretSourceNotAllowed,
     ProjectCredentialHelperNotAllowed,
@@ -1527,6 +1656,7 @@ impl ErrorCode {
                 "project-experimental-provider-opt-in-not-allowed"
             }
             Self::ProjectMutationConsentNotAllowed => "project-mutation-consent-not-allowed",
+            Self::ProjectHostBindingNotAllowed => "project-host-binding-not-allowed",
             Self::ProjectHostSelectionNotAllowed => "project-host-selection-not-allowed",
             Self::ProjectSecretSourceNotAllowed => "project-secret-source-not-allowed",
             Self::ProjectCredentialHelperNotAllowed => "project-credential-helper-not-allowed",
@@ -1602,6 +1732,7 @@ impl ErrorCode {
             | Self::ProjectYoloEnableNotAllowed
             | Self::ProjectExperimentalProviderOptInNotAllowed
             | Self::ProjectMutationConsentNotAllowed
+            | Self::ProjectHostBindingNotAllowed
             | Self::ProjectHostSelectionNotAllowed
             | Self::ProjectSecretSourceNotAllowed
             | Self::ProjectCredentialHelperNotAllowed
@@ -1945,6 +2076,96 @@ impl SatelleError {
             key,
             "project configuration cannot grant noninteractive mutation consent",
         )
+    }
+
+    pub fn project_host_binding_not_allowed(
+        config_file: &Path,
+        toml_path: &str,
+        key: &str,
+    ) -> Self {
+        Self::project_forbidden_config_error(
+            ErrorCode::ProjectHostBindingNotAllowed,
+            config_file,
+            toml_path,
+            key,
+            "project configuration cannot define or replace a concrete Host Binding",
+        )
+    }
+
+    pub fn project_host_binding_not_found(
+        project_config_file: &Path,
+        user_config_file: &Path,
+        alias: &str,
+    ) -> Self {
+        let path = format!("hosts.{alias}");
+        let mut details = BTreeMap::new();
+        details.insert(
+            "file".to_string(),
+            Value::String(project_config_file.display().to_string()),
+        );
+        details.insert("path".to_string(), Value::String(path.clone()));
+        details.insert("host".to_string(), Value::String(alias.to_string()));
+        details.insert("scope".to_string(), Value::String("project".to_string()));
+        details.insert(
+            "user_config_file".to_string(),
+            Value::String(user_config_file.display().to_string()),
+        );
+
+        Self {
+            code: ErrorCode::HostNotFound,
+            message: format!(
+                "config file {} references host '{alias}' at {path}, but no trusted user-level Host Binding exists",
+                project_config_file.display()
+            ),
+            recovery_command: Some(format!(
+                "configure {path} in user-level config {}; set {path}.allow_project_selection = true there when the project selects this host implicitly",
+                user_config_file.display()
+            )),
+            source_detail: None,
+            details,
+        }
+    }
+
+    pub fn project_transport_preference_not_allowed(
+        config_file: &Path,
+        alias: &str,
+        project_transport: &TransportKind,
+        trusted_transport: &TransportKind,
+    ) -> Self {
+        let path = format!("hosts.{alias}.transport");
+        let trusted_transport = transport_kind_name(trusted_transport);
+        let mut details = BTreeMap::new();
+        details.insert(
+            "file".to_string(),
+            Value::String(config_file.display().to_string()),
+        );
+        details.insert("path".to_string(), Value::String(path.clone()));
+        details.insert("key".to_string(), Value::String("transport".to_string()));
+        details.insert("scope".to_string(), Value::String("project".to_string()));
+        details.insert("host".to_string(), Value::String(alias.to_string()));
+        details.insert(
+            "project_transport".to_string(),
+            Value::String(transport_kind_name(project_transport).to_string()),
+        );
+        details.insert(
+            "trusted_transport".to_string(),
+            Value::String(trusted_transport.to_string()),
+        );
+
+        Self {
+            code: ErrorCode::ProjectHostBindingNotAllowed,
+            message: format!(
+                "config file {} sets project transport '{}' at {path}, but trusted host '{alias}' uses '{trusted_transport}'",
+                config_file.display(),
+                transport_kind_name(project_transport)
+            ),
+            recovery_command: Some(format!(
+                "remove {path} from {} or set it to \"{trusted_transport}\" to match the trusted Host Binding",
+                config_file.display()
+            )),
+            source_detail: None,
+            details,
+        }
     }
 
     pub fn project_host_selection_permission_not_allowed(

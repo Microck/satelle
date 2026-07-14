@@ -3240,12 +3240,7 @@ defalt_host = "local-demo"
 
 [hosts.local-demo]
 transport = "local"
-adapter = "fake"
-adress = "127.0.0.1"
-
-[hosts.local-demo.network]
-provider = "tailscale"
-hostnme = "desktop"
+transpor = "direct"
 "#,
     )
     .expect("project config should be written");
@@ -3274,21 +3269,17 @@ hostnme = "desktop"
             "default_host",
             "model_alias",
             "provider_alias",
-            "experimental_provider_computer_use",
-            "yolo",
             "profile",
             "profiles",
             "hosts"
         ])
     );
-    assert_eq!(error["unknown_keys"].as_array().unwrap().len(), 3);
-    assert_eq!(error["unknown_keys"][1]["path"], "hosts.local-demo.adress");
-    assert_eq!(error["unknown_keys"][1]["suggestion"], "address");
+    assert_eq!(error["unknown_keys"].as_array().unwrap().len(), 2);
     assert_eq!(
-        error["unknown_keys"][2]["path"],
-        "hosts.local-demo.network.hostnme"
+        error["unknown_keys"][1]["path"],
+        "hosts.local-demo.transpor"
     );
-    assert_eq!(error["unknown_keys"][2]["suggestion"], "hostname");
+    assert_eq!(error["unknown_keys"][1]["suggestion"], "transport");
 }
 
 #[test]
@@ -3726,10 +3717,6 @@ fn config_check_failures_exit_with_configuration_error_class() {
         r#"
 default_host = "local-demo"
 defalt_host = "local-demo"
-
-[hosts.local-demo]
-transport = "local"
-adapter = "fake"
 "#,
     )
     .expect("project config should be written");
@@ -3822,9 +3809,10 @@ hostname = "%EXAMPLE_HOSTNAME%"
 fn config_tilde_values_are_not_shell_expanded() {
     let state = state_dir();
     let project = state.path().join("project");
-    fs::create_dir_all(project.join(".satelle")).expect("project config dir should be created");
-    fs::write(
-        project.join(".satelle").join("config.toml"),
+    let user_config = state.path().join("user-config.toml");
+    fs::create_dir_all(&project).expect("project directory should be created");
+    write_user_config(
+        &user_config,
         r#"
 default_host = "local-demo"
 
@@ -3834,10 +3822,11 @@ adapter = "fake"
 address = "~/satelle-host.sock"
 "#,
     )
-    .expect("project config should be written");
+    .expect("user config should be written");
 
     let output = satelle()
         .current_dir(&project)
+        .env("SATELLE_CONFIG_FILE", &user_config)
         .env("SATELLE_STATE_DIR", state.path())
         .args(["config", "explain", "--host", "local-demo", "--json"])
         .assert()
@@ -3884,7 +3873,6 @@ default_host = "local-demo"
 
 [hosts.local-demo]
 transport = "local"
-adapter = "fake"
 
 [hosts.local-demo.timeouts]
 native_readiness = "120s"
@@ -3975,7 +3963,6 @@ default_host = "local-demo"
 
 [hosts.local-demo]
 transport = "local"
-adapter = "fake"
 native_readiness_timeout = "120s"
 "#,
     )
@@ -3997,7 +3984,6 @@ default_host = "local-demo"
 
 [hosts.local-demo]
 transport = "local"
-adapter = "fake"
 
 [hosts.local-demo.timeouts]
 native_readiness = 120
@@ -4028,7 +4014,6 @@ default_host = "local-demo"
 
 [hosts.local-demo]
 transport = "local"
-adapter = "fake"
 
 [hosts.local-demo.timeouts]
 provider_timeout = "120s"
