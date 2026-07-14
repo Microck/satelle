@@ -259,6 +259,63 @@ api_token = {{ kind = "file", path = {missing_token_literal} }}
     assert!(!String::from_utf8_lossy(&output.stderr).contains("must-not-be-read.token"));
 }
 
+#[test]
+fn project_host_redirection_is_rejected_before_secret_or_transport_access() {
+    let state = state_dir();
+    let project = state.path().join("project");
+    let project_config = project.join(".satelle").join("config.toml");
+    let user_config = state.path().join("user-config.toml");
+    let missing_token = state.path().join("trusted-token-must-not-be-read.token");
+    let missing_token_literal =
+        toml::Value::String(missing_token.to_string_lossy().into_owned()).to_string();
+    fs::create_dir_all(
+        project_config
+            .parent()
+            .expect("project config should have a parent"),
+    )
+    .expect("project config directory should be created");
+    fs::write(
+        &project_config,
+        r#"
+default_host = "remote"
+
+[hosts.remote]
+transport = "direct"
+adapter = "codex"
+address = "https://attacker.example.test"
+"#,
+    )
+    .expect("project config should be written");
+    write_user_config(
+        &user_config,
+        format!(
+            r#"
+[hosts.remote]
+transport = "direct"
+adapter = "codex"
+address = "https://127.0.0.1:9"
+expected_host_id = "host-windows-11"
+api_token = {{ kind = "file", path = {missing_token_literal} }}
+allow_project_selection = true
+"#,
+        ),
+    );
+
+    let output = satelle()
+        .current_dir(&project)
+        .env("SATELLE_CONFIG_FILE", &user_config)
+        .env("SATELLE_STATE_DIR", state.path())
+        .args(["host", "status", "--json"])
+        .assert()
+        .code(66)
+        .get_output()
+        .clone();
+    let error = parse_json_output(&output.stderr);
+    assert_eq!(error["error"]["code"], "project-host-binding-not-allowed");
+    assert_eq!(error["error"]["path"], "hosts.remote.address");
+    assert!(!String::from_utf8_lossy(&output.stderr).contains("trusted-token-must-not-be-read"));
+}
+
 #[cfg(unix)]
 #[test]
 fn direct_host_status_reads_a_secure_token_and_rejects_plaintext_transport() {

@@ -1002,22 +1002,22 @@
 - satelle project-level configuration discovery works outside Git repositories @implemented @mvp
 - satelle treats a Git repository root as a helpful boundary for project discovery when present but does not require Git for project configuration @spec @mvp
 - satelle project-level configuration discovery stops at the nearest .satelle/config.toml and does not merge parent project configuration files in MVP @implemented @mvp
-- satelle treats project-level configuration as untrusted repository input @spec @mvp
+- satelle treats project-level configuration as untrusted repository input @spec @mvp @implemented
 - satelle project-level configuration is limited to non-secret shared Host Aliases, model and provider intent, output defaults, timeout defaults, and non-authoritative transport preferences @spec @mvp
-- every project-declared Host Alias resolves through a user-level Satelle Host Binding before remote communication or mutation begins @spec @mvp
+- every project-declared Host Alias resolves through a user-level Satelle Host Binding before remote communication or mutation begins @spec @mvp @implemented
 - a user-level Host Binding is selectable by project configuration only when that exact binding sets allow_project_selection = true @spec @mvp @implemented
-- project Host selection permission is scoped to one exact Host Alias and does not grant mutation consent, YOLO, provider-secret consent, Trusted Profile consent, or sensitive-export consent @spec @mvp
+- project Host selection permission is scoped to one exact Host Alias and does not grant mutation consent, YOLO, provider-secret consent, Trusted Profile consent, or sensitive-export consent @spec @mvp @implemented
 - a Provider Binding in user-level or Host-owned configuration is selectable by project configuration only when that exact Operator-controlled binding sets allow_project_selection = true @spec @mvp
 - project Provider selection permission is scoped to one exact provider alias and does not grant provider-secret access, endpoint override authority, experimental-provider opt-in, mutation consent, YOLO, or sensitive-export consent @spec @mvp
-- satelle project-level configuration cannot define or override a concrete network address, SSH destination, direct API URL, TLS trust material, bearer-token descriptor, Tailscale node identity, Desktop Binding, daemon path, provider endpoint binding, or provider credential binding @spec @mvp
-- a project transport preference may select a transport kind only when the user-level Host Binding supplies and authorizes the concrete destination and authentication details @spec @mvp
-- satelle configuration merging never allows a project object to replace a user-owned Host Binding as a whole object @spec @mvp
+- satelle project-level configuration cannot define or override a concrete network address, SSH destination, direct API URL, TLS trust material, bearer-token descriptor, Tailscale node identity, Desktop Binding, daemon path, provider endpoint binding, or provider credential binding @spec @mvp @implemented
+- a project transport preference is accepted only when its transport kind exactly matches the user-level Host Binding, while the concrete destination and authentication details remain exclusively user-owned @spec @mvp @implemented
+- satelle configuration merging never allows a project object to replace a user-owned Host Binding as a whole object @spec @mvp @implemented
 - satelle preflight reports when Host, model, provider, profile, timeout, or transport intent came from project-level configuration @spec @mvp
 - project-level output defaults cannot suppress Host identity, desktop target, YOLO, authority, consent, or sensitive-export warnings required by the selected command @spec @mvp
 - satelle project-level configuration cannot define --yes equivalents, assume-yes behavior, trusted profile declarations, or any setting that grants noninteractive mutation consent for setup, repair, host update, self update remote-update flows, or doctor fix flows @implemented @mvp
 - satelle reports a typed project-mutation-consent-not-allowed configuration error when project-level configuration attempts to grant noninteractive mutation consent @implemented @mvp
 - satelle applies configuration precedence as built-in defaults, then user-level configuration, then project-level configuration, then explicit Satelle process environment variables, then CLI flags for non-secret overlapping settings @implemented @mvp
-- satelle applies project-level precedence only to fields that the project-level schema is authorized to define @spec @mvp
+- satelle applies project-level precedence only to fields that the project-level schema is authorized to define @spec @mvp @implemented
 - satelle user-level configuration may define Satelle Trusted Profiles that grant noninteractive mutation consent only for configured command families and host aliases @spec @mvp
 - satelle MVP Satelle Trusted Profiles require a non-empty explicit host alias allowlist for noninteractive mutation consent @spec @mvp
 - satelle MVP Satelle Trusted Profiles do not support all-hosts consent scopes, wildcard host scopes, glob host scopes, regex host scopes, project-host scopes, or default-host scopes @spec @mvp
@@ -1080,9 +1080,9 @@
 - satelle rejects bare integer timeouts.turn_execution values with a typed duration-unit-required configuration error @spec @mvp
 - satelle reports a typed unknown-timeout-key configuration error for unrecognized keys under a timeouts table @implemented @mvp
 - satelle MVP does not support direct native_readiness_timeout or provider_smoke_test_timeout configuration keys outside the nested timeouts table @implemented @mvp
-- satelle project-level configuration may reference host aliases that users bind to concrete personal host access details in user-level configuration @spec @mvp
-- satelle project-level configuration cannot define or override a concrete Host Binding @spec @mvp
-- satelle reports a missing host binding when the effective configuration context references a project-level host alias that the user has not configured @spec @mvp
+- satelle project-level configuration may reference host aliases that users bind to concrete personal host access details in user-level configuration @spec @mvp @implemented
+- satelle project-level configuration cannot define or override a concrete Host Binding @spec @mvp @implemented
+- satelle reports a missing host binding with separate project reference and required user binding paths when the effective configuration context references a project-level host alias that the user has not configured @spec @mvp @implemented
 - satelle config check --all reports missing host binding for every locally selectable project-level host alias context that lacks a user-level binding @spec @mvp
 - satelle user-level host configuration may define desktop_user as the Satelle Desktop Binding account for that concrete host alias @implemented @mvp
 - satelle user-level host configuration may define desktop_session_preference for that concrete host alias @implemented @mvp
@@ -2112,7 +2112,7 @@
 - later storage migration and config repair have no-mutation dry-run tests @spec @verification @later
 - a canary secret and canary prompt are absent from every normal log, error, event, setup ledger, status result, and public API response @spec @verification @mvp
 - later diagnostic bundle and Raw Diagnostic Export redaction tests remove canary secrets from every artifact category covered by the declared redaction policy @spec @verification @later
-- project configuration trust tests prove a checkout cannot replace a concrete Host Binding, redirect an endpoint, select an unauthorized binding, or activate consent and YOLO policy @spec @verification @mvp
+- project configuration trust tests prove a checkout cannot replace a concrete Host Binding, redirect an endpoint, select an unauthorized binding, or activate consent and YOLO policy @spec @verification @mvp @implemented
 - each declared Controller target has release-candidate build, install, upgrade, smoke, and uninstall coverage @spec @verification @mvp
 - each declared Computer Use Host Platform has end-to-end setup, readiness, run, status, steer, stop, reconnect, and recovery coverage @spec @verification @mvp
 - bundled skill commands and documentation command examples parse against the same release binary @spec @verification @mvp

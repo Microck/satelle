@@ -3034,7 +3034,7 @@ fn config_check_explain_and_paths_use_versioned_read_only_json_contracts() {
     fs::write(
         project.join(".satelle").join("config.toml"),
         r#"
-default_host = "local-demo"
+model_alias = "project-model"
 "#,
     )
     .expect("project config should be written");
@@ -3187,7 +3187,7 @@ fn project_config_discovery_walks_up_to_nearest_satelle_config() {
     fs::write(
         project.join(".satelle").join("config.toml"),
         r#"
-default_host = "local-demo"
+model_alias = "project-model"
 "#,
     )
     .expect("project config should be written");
@@ -3240,12 +3240,7 @@ defalt_host = "local-demo"
 
 [hosts.local-demo]
 transport = "local"
-adapter = "fake"
-adress = "127.0.0.1"
-
-[hosts.local-demo.network]
-provider = "tailscale"
-hostnme = "desktop"
+transpor = "direct"
 "#,
     )
     .expect("project config should be written");
@@ -3274,21 +3269,16 @@ hostnme = "desktop"
             "default_host",
             "model_alias",
             "provider_alias",
-            "experimental_provider_computer_use",
-            "yolo",
             "profile",
-            "profiles",
             "hosts"
         ])
     );
-    assert_eq!(error["unknown_keys"].as_array().unwrap().len(), 3);
-    assert_eq!(error["unknown_keys"][1]["path"], "hosts.local-demo.adress");
-    assert_eq!(error["unknown_keys"][1]["suggestion"], "address");
+    assert_eq!(error["unknown_keys"].as_array().unwrap().len(), 2);
     assert_eq!(
-        error["unknown_keys"][2]["path"],
-        "hosts.local-demo.network.hostnme"
+        error["unknown_keys"][1]["path"],
+        "hosts.local-demo.transpor"
     );
-    assert_eq!(error["unknown_keys"][2]["suggestion"], "hostname");
+    assert_eq!(error["unknown_keys"][1]["suggestion"], "transport");
 }
 
 #[test]
@@ -3726,10 +3716,6 @@ fn config_check_failures_exit_with_configuration_error_class() {
         r#"
 default_host = "local-demo"
 defalt_host = "local-demo"
-
-[hosts.local-demo]
-transport = "local"
-adapter = "fake"
 "#,
     )
     .expect("project config should be written");
@@ -3822,9 +3808,10 @@ hostname = "%EXAMPLE_HOSTNAME%"
 fn config_tilde_values_are_not_shell_expanded() {
     let state = state_dir();
     let project = state.path().join("project");
-    fs::create_dir_all(project.join(".satelle")).expect("project config dir should be created");
-    fs::write(
-        project.join(".satelle").join("config.toml"),
+    let user_config = state.path().join("user-config.toml");
+    fs::create_dir_all(&project).expect("project directory should be created");
+    write_user_config(
+        &user_config,
         r#"
 default_host = "local-demo"
 
@@ -3834,10 +3821,11 @@ adapter = "fake"
 address = "~/satelle-host.sock"
 "#,
     )
-    .expect("project config should be written");
+    .expect("user config should be written");
 
     let output = satelle()
         .current_dir(&project)
+        .env("SATELLE_CONFIG_FILE", &user_config)
         .env("SATELLE_STATE_DIR", state.path())
         .args(["config", "explain", "--host", "local-demo", "--json"])
         .assert()
@@ -3876,7 +3864,18 @@ fn config_explain_supports_secret_references_but_not_show_secrets() {
 fn timeout_configuration_uses_nested_explicit_unit_keys() {
     let state = state_dir();
     let project = state.path().join("project");
+    let user_config = state.path().join("user-config.toml");
     fs::create_dir_all(project.join(".satelle")).expect("project config dir should be created");
+    write_user_config(
+        &user_config,
+        r#"
+[hosts.local-demo]
+transport = "local"
+adapter = "fake"
+allow_project_selection = true
+"#,
+    )
+    .expect("user config should be written");
     fs::write(
         project.join(".satelle").join("config.toml"),
         r#"
@@ -3884,7 +3883,6 @@ default_host = "local-demo"
 
 [hosts.local-demo]
 transport = "local"
-adapter = "fake"
 
 [hosts.local-demo.timeouts]
 native_readiness = "120s"
@@ -3895,6 +3893,7 @@ provider_smoke_test = "2m"
 
     let output = satelle()
         .current_dir(&project)
+        .env("SATELLE_CONFIG_FILE", &user_config)
         .env("SATELLE_STATE_DIR", state.path())
         .args(["config", "explain", "--host", "local-demo", "--json"])
         .assert()
@@ -3921,6 +3920,7 @@ provider_smoke_test = "2m"
 
     let output = satelle()
         .current_dir(&project)
+        .env("SATELLE_CONFIG_FILE", &user_config)
         .env("SATELLE_STATE_DIR", state.path())
         .args([
             "run",
@@ -3945,6 +3945,7 @@ provider_smoke_test = "2m"
 
     let output = satelle()
         .current_dir(&project)
+        .env("SATELLE_CONFIG_FILE", &user_config)
         .env("SATELLE_STATE_DIR", state.path())
         .args([
             "run",
@@ -3975,7 +3976,6 @@ default_host = "local-demo"
 
 [hosts.local-demo]
 transport = "local"
-adapter = "fake"
 native_readiness_timeout = "120s"
 "#,
     )
@@ -3983,6 +3983,7 @@ native_readiness_timeout = "120s"
 
     satelle()
         .current_dir(&project)
+        .env("SATELLE_CONFIG_FILE", &user_config)
         .env("SATELLE_STATE_DIR", state.path())
         .args(["config", "check", "--json"])
         .assert()
@@ -3997,7 +3998,6 @@ default_host = "local-demo"
 
 [hosts.local-demo]
 transport = "local"
-adapter = "fake"
 
 [hosts.local-demo.timeouts]
 native_readiness = 120
@@ -4007,6 +4007,7 @@ native_readiness = 120
 
     let output = satelle()
         .current_dir(&project)
+        .env("SATELLE_CONFIG_FILE", &user_config)
         .env("SATELLE_STATE_DIR", state.path())
         .args(["config", "check", "--json"])
         .assert()
@@ -4028,7 +4029,6 @@ default_host = "local-demo"
 
 [hosts.local-demo]
 transport = "local"
-adapter = "fake"
 
 [hosts.local-demo.timeouts]
 provider_timeout = "120s"
@@ -4038,6 +4038,7 @@ provider_timeout = "120s"
 
     let output = satelle()
         .current_dir(&project)
+        .env("SATELLE_CONFIG_FILE", &user_config)
         .env("SATELLE_STATE_DIR", state.path())
         .args(["config", "check", "--json"])
         .assert()
