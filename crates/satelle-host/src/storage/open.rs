@@ -73,16 +73,27 @@ pub(super) struct StateDirectory {
     secure: windows::SecureStateDirectory,
 }
 
+pub(super) struct OwnershipLock(File);
+
+impl Drop for OwnershipLock {
+    fn drop(&mut self) {
+        // A child between fork and exec can retain this descriptor. Explicitly
+        // unlock the shared file description before closing our descriptor so
+        // dropping Storage always hands ownership to the next opener.
+        let _ = self.0.unlock();
+    }
+}
+
 pub(super) fn open_parts(
     state_root: &Path,
-) -> Result<(Connection, File, StateDirectory), StorageError> {
+) -> Result<(Connection, OwnershipLock, StateDirectory), StorageError> {
     open_parts_after_lock(state_root, || {})
 }
 
 fn open_parts_after_lock(
     state_root: &Path,
     after_lock: impl FnOnce(),
-) -> Result<(Connection, File, StateDirectory), StorageError> {
+) -> Result<(Connection, OwnershipLock, StateDirectory), StorageError> {
     let state_directory = prepare_state_root(state_root)?;
     preflight_protected_files(&state_directory)?;
     let ownership_lock = acquire_ownership_lock(&state_directory)?;
@@ -169,7 +180,7 @@ pub(super) fn anchored_vfs_name_for_test() -> Result<&'static std::ffi::CStr, St
 pub(super) fn open_parts_with_after_lock_hook(
     state_root: &Path,
     after_lock: impl FnOnce(),
-) -> Result<(Connection, File, StateDirectory), StorageError> {
+) -> Result<(Connection, OwnershipLock, StateDirectory), StorageError> {
     open_parts_after_lock(state_root, after_lock)
 }
 
@@ -295,7 +306,7 @@ pub(super) fn prepare_state_root(state_root: &Path) -> Result<StateDirectory, St
     windows::SecureStateDirectory::prepare(state_root).map(|secure| StateDirectory { secure })
 }
 
-fn acquire_ownership_lock(state_directory: &StateDirectory) -> Result<File, StorageError> {
+fn acquire_ownership_lock(state_directory: &StateDirectory) -> Result<OwnershipLock, StorageError> {
     let file = open_private_leaf(
         state_directory,
         LOCK_FILE_NAME,
@@ -304,7 +315,7 @@ fn acquire_ownership_lock(state_directory: &StateDirectory) -> Result<File, Stor
     )?
     .ok_or_else(|| StorageError::new(StorageErrorKind::LockUnavailable))?;
     match file.try_lock() {
-        Ok(()) => Ok(file),
+        Ok(()) => Ok(OwnershipLock(file)),
         Err(TryLockError::WouldBlock) => Err(StorageError::new(StorageErrorKind::StoreInUse)),
         Err(TryLockError::Error(source)) => Err(StorageError::with_source(
             StorageErrorKind::LockUnavailable,
