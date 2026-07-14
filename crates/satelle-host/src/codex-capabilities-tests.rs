@@ -5,11 +5,174 @@ const INCOMPLETE_PROOF_STATES: [LiveProofStatus; 3] = [
     LiveProofStatus::NotObserved,
     LiveProofStatus::Failed,
 ];
-const NON_STABLE_SURFACES: [EvidenceSurface; 3] = [
+const NON_STABLE_SURFACES: [EvidenceSurface; 5] = [
+    EvidenceSurface::Private,
     EvidenceSurface::Experimental,
     EvidenceSurface::Undocumented,
     EvidenceSurface::Absent,
+    EvidenceSurface::Incomplete,
 ];
+const WINDOWS_APP_POLICY_FIXTURE_HOME: &str = "SATELLE_WINDOWS_APP_POLICY_FIXTURE_HOME";
+const WINDOWS_APP_POLICY_FIXTURE_COMPILE_TIMEOUT: Duration = Duration::from_secs(30);
+const WINDOWS_APP_POLICY_FIXTURE_SOURCE: &str = r##"
+use std::io::{BufRead, Read, Write};
+
+fn main() {
+    let mode = std::env::args().nth(1).expect("fixture mode");
+    let codex_home = std::env::var("SATELLE_WINDOWS_APP_POLICY_FIXTURE_HOME")
+        .expect("fixture Codex home");
+    let stdin = std::io::stdin();
+    let mut input = stdin.lock();
+    let mut line = String::new();
+    input.read_line(&mut line).expect("read initialize request");
+    assert!(line.contains("\"method\":\"initialize\""));
+
+    let mut output = std::io::stdout().lock();
+    writeln!(output, "{{\"method\":\"fixture/notification\",\"params\":{{}}}}")
+        .expect("write notification");
+    writeln!(
+        output,
+        "{{\"id\":1,\"result\":{{\"userAgent\":\"fixture\",\"codexHome\":\"{}\",\"platformFamily\":\"windows\",\"platformOs\":\"windows\"}}}}",
+        json_escape(&codex_home)
+    )
+    .expect("write initialize response");
+    output.flush().expect("flush initialize response");
+
+    line.clear();
+    input.read_line(&mut line).expect("read initialized notification");
+    assert!(line.contains("\"method\":\"initialized\""));
+    line.clear();
+    input.read_line(&mut line).expect("read config request");
+    assert!(line.contains("\"method\":\"config/read\""));
+    assert!(line.contains("\"includeLayers\":true"));
+
+    let config = match mode.as_str() {
+        "stable" => r#"{"computer_use":{"windows":{"always_allowed_app_ids":["fixture-paint.exe"]}}}"#,
+        "legacy" => "{}",
+        _ => std::process::exit(2),
+    };
+    let config_file = std::path::Path::new(&codex_home).join("config.toml");
+    writeln!(
+        output,
+        "{{\"id\":2,\"result\":{{\"config\":{{}},\"origins\":{{}},\"layers\":[{{\"name\":{{\"type\":\"user\",\"file\":\"{}\",\"profile\":null}},\"version\":\"fixture\",\"config\":{config},\"disabledReason\":null}}]}}}}",
+        json_escape(&config_file.display().to_string())
+    )
+    .expect("write config response");
+    output.flush().expect("flush config response");
+
+    let mut rest = String::new();
+    input.read_to_string(&mut rest).expect("wait for probe shutdown");
+}
+
+fn json_escape(value: &str) -> String {
+    let mut escaped = String::new();
+    for character in value.chars() {
+        match character {
+            '\\' => escaped.push_str("\\\\"),
+            '"' => escaped.push_str("\\\""),
+            '\n' => escaped.push_str("\\n"),
+            '\r' => escaped.push_str("\\r"),
+            character if character.is_control() => panic!("control character in fixture path"),
+            character => escaped.push(character),
+        }
+    }
+    escaped
+}
+"##;
+
+struct CompiledWindowsAppPolicyFixture {
+    _directory: tempfile::TempDir,
+    executable: std::path::PathBuf,
+}
+
+fn compile_windows_app_policy_fixture() -> CompiledWindowsAppPolicyFixture {
+    let directory = tempfile::tempdir().expect("create Windows app-policy fixture directory");
+    let source = directory.path().join("windows-app-policy-fixture.rs");
+    std::fs::write(&source, WINDOWS_APP_POLICY_FIXTURE_SOURCE)
+        .expect("write Windows app-policy fixture source");
+    let executable = directory.path().join(if cfg!(windows) {
+        "windows-app-policy-fixture.exe"
+    } else {
+        "windows-app-policy-fixture"
+    });
+    let rustc = std::env::var_os("RUSTC").unwrap_or_else(|| "rustc".into());
+    let compiler_stderr_path = directory.path().join("rustc.stderr");
+    let compiler_stderr = std::fs::File::create(&compiler_stderr_path)
+        .expect("create Windows app-policy compiler stderr fixture");
+    let mut compiler_command = Command::new(rustc);
+    compiler_command
+        .arg(&source)
+        .arg("--edition=2024")
+        .arg("-o")
+        .arg(&executable)
+        .stdout(Stdio::null())
+        .stderr(Stdio::from(compiler_stderr));
+    let mut compiler = compiler_command
+        .group_spawn()
+        .expect("spawn Windows app-policy fixture compiler");
+    let compile_deadline = Instant::now() + WINDOWS_APP_POLICY_FIXTURE_COMPILE_TIMEOUT;
+    let output_status = match wait_for_group(&mut compiler, compile_deadline) {
+        GroupWaitOutcome::Exited(status) => status,
+        GroupWaitOutcome::Deadline => {
+            assert!(
+                terminate_group(&mut compiler),
+                "terminate stalled fixture compiler"
+            );
+            panic!("Windows app-policy fixture compilation timed out");
+        }
+        GroupWaitOutcome::Error => {
+            let _ = terminate_group(&mut compiler);
+            panic!("Windows app-policy fixture compiler wait failed");
+        }
+    };
+    assert!(
+        terminate_group(&mut compiler),
+        "clean up Windows app-policy fixture compiler"
+    );
+    let compiler_stderr = std::fs::read_to_string(compiler_stderr_path)
+        .expect("read Windows app-policy compiler stderr fixture");
+    assert!(
+        output_status.success(),
+        "Windows app-policy fixture compilation failed: {}",
+        compiler_stderr
+    );
+    CompiledWindowsAppPolicyFixture {
+        _directory: directory,
+        executable,
+    }
+}
+
+fn windows_app_policy_fixture_command(
+    fixture: &CompiledWindowsAppPolicyFixture,
+    mode: &str,
+    codex_home: &std::path::Path,
+) -> Command {
+    let mut command = Command::new(&fixture.executable);
+    command
+        .arg(mode)
+        .env(WINDOWS_APP_POLICY_FIXTURE_HOME, codex_home);
+    command
+}
+
+fn windows_config_read_result(
+    codex_home: &std::path::Path,
+    config: serde_json::Value,
+) -> serde_json::Value {
+    serde_json::json!({
+        "config": {},
+        "origins": {},
+        "layers": [{
+            "name": {
+                "type": "user",
+                "file": codex_home.join("config.toml").display().to_string(),
+                "profile": null,
+            },
+            "version": "fixture",
+            "config": config,
+            "disabledReason": null,
+        }]
+    })
+}
 
 #[test]
 fn exact_candidate_with_complete_proof_supports_macos_and_windows() {
@@ -130,6 +293,222 @@ fn compiled_host_uses_its_own_platform_capability_policy() {
     assert_eq!(
         HostPlatform::current().supports_native_computer_use(),
         matches!(expected, HostPlatform::Macos | HostPlatform::Windows)
+    );
+}
+
+#[test]
+fn current_windows_app_policy_is_stable_and_does_not_retain_app_ids() {
+    let codex_home = tempfile::TempDir::new().expect("create deterministic Codex home");
+    std::fs::create_dir(codex_home.path().join("computer-use"))
+        .expect("create legacy policy directory");
+    std::fs::write(
+        codex_home.path().join("computer-use/config.toml"),
+        "[apps]\ndenied = [\"sensitive-admin-app.exe\"]\n",
+    )
+    .expect("write ignored legacy denied list");
+    std::fs::write(
+        codex_home.path().join("config.toml"),
+        concat!(
+            "model = \"fixture\"\n",
+            "[computer_use.windows]\n",
+            "always_allowed_app_ids = [\"fixture-paint.exe\"]\n",
+        ),
+    )
+    .expect("write current Windows app policy");
+
+    let config_result = windows_config_read_result(
+        codex_home.path(),
+        serde_json::json!({
+            "computer_use": {
+                "windows": {
+                    "always_allowed_app_ids": ["fixture-paint.exe"]
+                }
+            }
+        }),
+    );
+    let surface = classify_windows_app_policy(codex_home.path(), &config_result);
+
+    assert_eq!(surface, EvidenceSurface::Stable);
+    let serialized = serde_json::to_string(&surface).expect("serialize closed evidence surface");
+    assert_eq!(serialized, "\"stable\"");
+    assert!(!serialized.contains("fixture-paint"));
+    assert!(!serialized.contains(&codex_home.path().display().to_string()));
+}
+
+#[test]
+fn legacy_allow_list_is_private_migration_input() {
+    let codex_home = tempfile::TempDir::new().expect("create deterministic Codex home");
+    std::fs::create_dir(codex_home.path().join("computer-use"))
+        .expect("create legacy policy directory");
+    std::fs::write(
+        codex_home.path().join("computer-use/config.toml"),
+        concat!(
+            "[apps]\n",
+            "allowed = [\n",
+            "  \"fixture-paint.exe\", # a desktop executable id\n",
+            "  'Fixture.Package_123!App',\n",
+            "]\n",
+            "denied = [\"ignored-denied-app.exe\"]\n",
+        ),
+    )
+    .expect("write legacy app policy");
+
+    assert_eq!(
+        classify_windows_app_policy(
+            codex_home.path(),
+            &windows_config_read_result(codex_home.path(), serde_json::json!({})),
+        ),
+        EvidenceSurface::Private
+    );
+}
+
+#[test]
+fn removed_legacy_denied_list_is_never_an_app_policy_fallback() {
+    let codex_home = tempfile::TempDir::new().expect("create deterministic Codex home");
+    std::fs::create_dir(codex_home.path().join("computer-use"))
+        .expect("create legacy policy directory");
+    std::fs::write(
+        codex_home.path().join("computer-use/config.toml"),
+        "[apps]\ndenied = [\"fixture-calculator.exe\"]\n",
+    )
+    .expect("write denied-only legacy policy");
+
+    assert_eq!(
+        classify_windows_app_policy(
+            codex_home.path(),
+            &windows_config_read_result(codex_home.path(), serde_json::json!({})),
+        ),
+        EvidenceSurface::Absent
+    );
+}
+
+#[test]
+fn malformed_current_or_legacy_allow_lists_are_incomplete() {
+    let legacy_home = tempfile::TempDir::new().expect("create legacy Codex home");
+    std::fs::create_dir(legacy_home.path().join("computer-use"))
+        .expect("create legacy policy directory");
+    std::fs::write(
+        legacy_home.path().join("computer-use/config.toml"),
+        "[apps]\nallowed = [\"unterminated.exe\"\n",
+    )
+    .expect("write malformed legacy policy");
+
+    assert_eq!(
+        classify_windows_app_policy(
+            legacy_home.path(),
+            &windows_config_read_result(legacy_home.path(), serde_json::json!({})),
+        ),
+        EvidenceSurface::Incomplete
+    );
+
+    let current_home = tempfile::TempDir::new().expect("create current Codex home");
+    std::fs::write(
+        current_home.path().join("config.toml"),
+        "[computer_use.windows]\nalways_allowed_app_ids = \"fixture-paint.exe\"\n",
+    )
+    .expect("write malformed current policy");
+    let malformed_result = windows_config_read_result(
+        current_home.path(),
+        serde_json::json!({
+            "computer_use": {
+                "windows": {
+                    "always_allowed_app_ids": "fixture-paint.exe"
+                }
+            }
+        }),
+    );
+    assert_eq!(
+        classify_windows_app_policy(current_home.path(), &malformed_result),
+        EvidenceSurface::Incomplete
+    );
+}
+
+#[test]
+fn missing_current_and_legacy_windows_app_policy_is_absent() {
+    let codex_home = tempfile::TempDir::new().expect("create deterministic Codex home");
+
+    assert_eq!(
+        classify_windows_app_policy(
+            codex_home.path(),
+            &windows_config_read_result(codex_home.path(), serde_json::json!({})),
+        ),
+        EvidenceSurface::Absent
+    );
+}
+
+#[test]
+fn process_probe_resolves_codex_home_before_classifying_legacy_input() {
+    let codex_home = tempfile::TempDir::new().expect("create deterministic Codex home");
+    std::fs::create_dir(codex_home.path().join("computer-use"))
+        .expect("create legacy policy directory");
+    std::fs::write(
+        codex_home.path().join("computer-use/config.toml"),
+        "[apps]\nallowed = [\"fixture-paint.exe\"]\n",
+    )
+    .expect("write legacy policy fixture");
+    let fixture = compile_windows_app_policy_fixture();
+    let command = windows_app_policy_fixture_command(&fixture, "legacy", codex_home.path());
+
+    assert_eq!(
+        probe_windows_app_policy_with(command, Duration::from_secs(2)),
+        EvidenceSurface::Private
+    );
+}
+
+#[test]
+fn a_stable_app_allow_list_does_not_prove_sensitive_action_approval() {
+    let codex_home = tempfile::TempDir::new().expect("create deterministic Codex home");
+    std::fs::write(
+        codex_home.path().join("config.toml"),
+        "[computer_use.windows]\nalways_allowed_app_ids = []\n",
+    )
+    .expect("write empty stable policy");
+    let config_result = windows_config_read_result(
+        codex_home.path(),
+        serde_json::json!({
+            "computer_use": {
+                "windows": {
+                    "always_allowed_app_ids": []
+                }
+            }
+        }),
+    );
+    let surface = classify_windows_app_policy(codex_home.path(), &config_result);
+    let mut evidence = fully_proven_evidence(HostPlatform::Windows);
+    evidence.capabilities.approval_observation =
+        CapabilityEvidence::new(surface, LiveProofStatus::NotObserved);
+
+    assert_eq!(
+        blockers(evaluate_phase0_support(evidence)),
+        vec![Phase0CapabilityBlocker {
+            reason: BlockerReason::IncompleteLiveProof,
+            capability: RequiredCapability::ApprovalObservation,
+            codex_version: CodexVersionEvidence::Detected {
+                version: REQUIRED_CODEX_VERSION,
+            },
+            host_platform: HostPlatform::Windows,
+            observed_surface: EvidenceSurface::Stable,
+            live_proof: LiveProofStatus::NotObserved,
+        }]
+    );
+}
+
+#[cfg(target_os = "windows")]
+#[test]
+fn windows_ci_observes_the_native_app_policy_fixture() {
+    assert_eq!(HostPlatform::current(), HostPlatform::Windows);
+    let codex_home = tempfile::TempDir::new().expect("create Windows Codex home fixture");
+    std::fs::write(
+        codex_home.path().join("config.toml"),
+        "[computer_use.windows]\nalways_allowed_app_ids = [\"mspaint.exe\"]\n",
+    )
+    .expect("write Windows current app-policy fixture");
+    let fixture = compile_windows_app_policy_fixture();
+    let command = windows_app_policy_fixture_command(&fixture, "stable", codex_home.path());
+
+    assert_eq!(
+        probe_windows_app_policy_with(command, Duration::from_secs(2)),
+        EvidenceSurface::Stable
     );
 }
 
