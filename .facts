@@ -774,7 +774,7 @@
 - satelle Host Daemon Turn request bodies use the exact schema_version token satelle.api.v2 while unchanged stop request bodies use satelle.api.v1 @spec @contract @mvp @implemented
 - authenticated Host Daemon requests use Satelle-Request-Id for caller-supplied UUIDv7 correlation and Satelle-Expected-Host-Identity for Host pinning; neither header grants authority or idempotency @spec @contract @mvp @implemented
 - authenticated Host Daemon HTTP requests without Satelle-Request-Id receive a generated canonical UUIDv7 except GET /v1/events, whose WebSocket upgrade contract requires a caller-supplied Satelle-Request-Id; malformed or duplicate supplied request-id headers are rejected @spec @contract @mvp @implemented
-- satelle Host Daemon MVP uses GET /v1/live, GET /v1/capabilities, GET /v1/host/status, GET /v1/host/desktop-sessions, POST /v1/setup, POST /v1/doctor, POST /v1/sessions, POST /v1/sessions/{session_id}/turns, GET /v1/sessions/{session_id}, POST /v1/sessions/{session_id}/stop, GET /v1/logs, and GET /v1/events as its canonical route set and exposes no run, steer, blocking-run, SSE, or HTTP logs-follow aliases @spec @contract @mvp @implemented
+- satelle Host Daemon MVP uses GET /v1/live, GET /v1/capabilities, GET /v1/host/status, GET /v1/host/desktop-sessions, POST /v1/sessions, POST /v1/sessions/{session_id}/turns, GET /v1/sessions/{session_id}, POST /v1/sessions/{session_id}/stop, GET /v1/logs, and GET /v1/events as its canonical route set and exposes no run, steer, blocking-run, SSE, or HTTP logs-follow aliases @spec @contract @mvp @implemented
 - Host Daemon response schemas use the exact tokens satelle.capabilities.v2, satelle.host.status.v1, satelle.host.desktop-sessions.v1, satelle.logs.page.v1, and satelle.ws.control.v1 for their corresponding versioned surfaces @contract @mvp @implemented
 - GET /v1/logs accepts only the query fields mode, cursor, limit, session_id, sources, minimum_severity, and since; unknown fields, duplicate singleton fields, empty source tokens, and duplicate source tokens report a typed invalid-request error @spec @contract @mvp @implemented
 - GET /v1/logs mode is tail or forward, defaults to tail, and permits cursor only with forward mode @spec @contract @mvp @implemented
@@ -800,7 +800,7 @@
 
 ## idempotency-and-capacity
 - satelle mutating Host Daemon API requests use the Idempotency-Key HTTP header @mvp @implemented
-- run, steer, stop, setup, repair, host update, storage migration, token mutation, and destructive maintenance API requests require an idempotency key @spec @mvp
+- run, steer, stop, setup, repair, host update, storage migration, and destructive maintenance API requests require an idempotency key @spec @mvp
 - satelle CLI generates a UUIDv7 idempotency key when the caller does not supply one @mvp @implemented
 - an Idempotency Record digest covers the full canonical typed operation payload after defaults and normalization, excludes only transport authentication credentials, request_id, tracing metadata, and the idempotency key itself, and includes operation payload secrets through the sensitive HMAC path without storing their raw values @contract @mvp @implemented
 - prompt-bearing or otherwise sensitive idempotency digests use HMAC-SHA-256 with a Host Daemon-owned key and are never returned through public APIs or logs @mvp @implemented
@@ -813,7 +813,7 @@
 - a matching duplicate received while the original operation is in progress returns the same operation, Session, and Turn handles that exist at that point and never starts a second execution @contract @mvp @implemented
 - concurrent requests with the same API Principal, operation, idempotency key, and request digest join one logical operation and consume one shared operation-concurrency slot @spec @contract @mvp @implemented
 - a matching duplicate received after the original operation is terminal returns its durable terminal result @contract @mvp @implemented
-- a matching duplicate of a completed bearer-token issuance or rotation returns the original durable token metadata plus a typed token-secret-not-replayable result and revoke-and-reissue recovery guidance and never returns the raw token again @spec @contract @mvp
+- a matching duplicate of a completed bearer-token issuance or rotation returns the original durable token metadata plus a typed token-secret-not-replayable result and revoke-and-reissue recovery guidance and never returns the raw token again @spec @contract @later
 - reusing an idempotency key with a different request digest fails with a typed idempotency-key-conflict error @mvp @implemented
 - a request that reuses an API Principal, operation, and idempotency key with a different request digest returns idempotency-key-conflict before operation-concurrency capacity is evaluated @spec @contract @mvp @implemented
 - Satelle Idempotency Records are retained for at least 24 hours after their operation becomes terminal @mvp @implemented
@@ -1746,17 +1746,17 @@
 - Host Daemon bearer tokens contain at least 256 bits of cryptographically random entropy @spec @mvp @implemented
 - the Host Daemon stores only a one-way token verifier and non-secret token metadata @spec @mvp @implemented
 - a newly issued raw bearer token is returned exactly once @spec @mvp
-- a successful bearer-token issuance or rotation response contains durable token metadata plus raw token material generated for that response and never persisted by Satelle @spec @mvp
+- a successful bearer-token issuance or rotation response contains durable token metadata plus raw token material generated for that response and never persisted by Satelle @spec @later
 - bearer-token verification uses a timing-safe comparison @spec @mvp @implemented
 - bearer tokens are accepted only through the Authorization header @spec @mvp @implemented
 - bearer tokens are rejected in URLs, query strings, cookies, JSON bodies, WebSocket subscription messages, command-line arguments, and process environment variables @spec @mvp
 - token logs and audit records identify tokens only by non-secret token id @spec @mvp
-- admin Principals can rotate or revoke individual bearer tokens without replacing unrelated tokens @spec @mvp
-- bearer-token rotation preserves the token id and API Principal identity, increments its credential revision, atomically invalidates the previous verifier, and commits the replacement verifier before returning the replacement raw token @spec @mvp
-- token revocation takes effect immediately for new HTTP requests and new WebSocket connections @spec @mvp
+- admin Principals can rotate or revoke individual bearer tokens without replacing unrelated tokens @spec @later
+- bearer-token rotation preserves the token id and API Principal identity, increments its credential revision, atomically invalidates the previous verifier, and commits the replacement verifier before returning the replacement raw token @spec @later
+- token revocation takes effect immediately for new HTTP requests and new WebSocket connections @spec @later
 - existing WebSocket connections are closed when their authenticating token expires, is revoked, or is rotated @spec @mvp
 - failed authentication returns one generic typed authentication-failed response and does not reveal whether a token id exists, is expired, was rotated, was revoked, or has different scopes @spec @mvp
-- bearer-token issuance and rotation responses include Cache-Control: no-store @spec @mvp
+- bearer-token issuance and rotation responses include Cache-Control: no-store @spec @later
 - initial SSH bootstrap may use one ephemeral API bearer token generated by the Controller for the current bootstrap operation @spec @mvp
 - an SSH bootstrap token contains at least 256 bits of cryptographically random entropy and only the scopes required by that bootstrap operation @spec @mvp
 - the Controller transmits an SSH bootstrap token through the started Host Daemon process stdin instead of SSH command arguments, remote process arguments, environment variables, or files @spec @mvp
