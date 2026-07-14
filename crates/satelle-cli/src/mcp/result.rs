@@ -140,9 +140,9 @@ fn error_class(code: ErrorCode) -> (ErrorCategory, bool) {
         | ErrorCode::DoctorReadinessBlockersFound => (ErrorCategory::Readiness, false),
         ErrorCode::StoreInUse | ErrorCode::StorageBusy => (ErrorCategory::Storage, true),
         ErrorCode::StorageIntegrityFailed => (ErrorCategory::Storage, false),
-        ErrorCode::HostUnreachable | ErrorCode::RemoteExecution => {
-            (ErrorCategory::RemoteExecution, true)
-        }
+        ErrorCode::HostUnreachable
+        | ErrorCode::DirectDaemonUnreachable
+        | ErrorCode::RemoteExecution => (ErrorCategory::RemoteExecution, true),
         ErrorCode::CapacityExceeded | ErrorCode::ConcurrencyLimitExceeded => {
             (ErrorCategory::Capacity, true)
         }

@@ -1,7 +1,28 @@
-use super::{SatelleMcp, service_result, stdio};
+use super::{SatelleMcp, result, service_result, stdio};
 use rmcp::service::QuitReason;
+use satelle_core::SatelleError;
 use std::future::{pending, ready};
 use std::time::Duration;
+
+#[test]
+fn direct_daemon_unreachable_is_a_retryable_remote_execution_error() {
+    let tool_result = result::operational_error(SatelleError::direct_daemon_unreachable("remote"));
+    let structured = tool_result
+        .structured_content
+        .expect("operational errors include a structured MCP envelope");
+
+    assert_eq!(tool_result.is_error, Some(true));
+    assert_eq!(structured["code"], "direct-daemon-unreachable");
+    assert_eq!(structured["category"], "remote_execution");
+    assert_eq!(structured["retryable"], true);
+    assert_eq!(structured["details"], serde_json::json!({"host": "remote"}));
+    assert_eq!(
+        structured["suggested_commands"],
+        serde_json::json!([
+            "start the configured Host Daemon, then retry satelle run --host remote"
+        ])
+    );
+}
 
 #[tokio::test]
 async fn local_state_gate_prefers_cancellation_and_releases_the_waiter() {
