@@ -121,9 +121,15 @@
 - satelle run, steer, stop, status, setup, repair, doctor, config check, config explain, self update, host update, paths, and host sessions JSON results include a top-level schema_version @spec @contract @mvp
 - satelle run JSON v2 uses schema_version satelle.run.v2 @contract @mvp @implemented
 - satelle steer JSON v2 uses schema_version satelle.steer.v2 @contract @mvp @implemented
-- satelle stop JSON v1 uses schema_version satelle.stop.v1 @spec @contract @mvp
+- id: i3f
+  label: satelle stop JSON v1 uses schema_version satelle.stop.v1
+  command: cargo test --locked -p satelle-cli --features test-support --test cli stopping_terminal_turn_preserves_history_and_allows_later_steer -- --exact
+  tags: [spec, contract, mvp, implemented, ci]
 - satelle stop JSON v1 includes outcome, session_id, turn_id, previous_state, current_state, changed, and stopped_at fields; outcome is stopped or already_terminal @spec @contract @mvp
-- satelle stop on an already-terminal Turn exits 0 with outcome already_terminal and changed false @spec @contract @mvp
+- id: 5hb
+  label: satelle stop on an already-terminal Turn exits 0 with outcome already_terminal and changed false
+  command: cargo test --locked -p satelle-cli --features test-support --test cli stopping_terminal_turn_preserves_history_and_allows_later_steer -- --exact
+  tags: [spec, contract, mvp, implemented, ci]
 - satelle status JSON v2 uses schema_version satelle.status.v2 @contract @mvp @implemented
 - satelle logs initial and followed JSON records each use schema_version satelle.logs.entry.v1 and emit exactly one record per line without a top-level wrapper @spec @contract @mvp
 - satelle setup JSON v1 uses schema_version satelle.setup.v1 @contract @mvp @implemented
@@ -413,7 +419,10 @@
 - satelle steer can add a new turn to the same Satelle session and underlying Codex thread after the previous turn or goal completed @implemented @mvp
 - satelle steer updates session lifecycle metadata to reflect the new active turn while preserving previous turn history @implemented @mvp
 - satelle stop stops the active Turn in a Session by default without stopping the Host Daemon lifecycle @spec @mvp
-- satelle stop preserves the Session and records the active Turn as stopped instead of deleting the Session @spec @mvp
+- id: hav
+  label: satelle stop preserves the Session and records the active Turn as stopped instead of deleting the Session
+  command: cargo test --locked -p satelle-cli --features test-support --test cli stopping_detached_turn_returns_exact_stop_contract -- --exact
+  tags: [spec, mvp, implemented, ci]
 - satelle allows later steer commands to continue from a stopped session when the stored Codex thread identifier remains available @implemented @mvp
 
 ## setup-and-maintenance
