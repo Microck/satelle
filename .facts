@@ -1344,8 +1344,14 @@
 # sessions
 
 ## lifecycle-state
-- Satelle Turn nonterminal states are starting, running, and recovery_pending @spec @mvp
-- Satelle Turn terminal states are completed, blocked, failed, and stopped @spec @mvp
+- id: 0hy
+  label: Satelle Turn nonterminal states are starting, running, and recovery_pending
+  command: cargo test --locked -p satelle-core --lib session::tests::states_have_exact_names_and_terminal_partition -- --exact
+  tags: [spec, mvp, implemented, ci]
+- id: ftq
+  label: Satelle Turn terminal states are completed, blocked, failed, and stopped
+  command: cargo test --locked -p satelle-core --lib session::tests::states_have_exact_names_and_terminal_partition -- --exact
+  tags: [spec, mvp, implemented, ci]
 - a terminal Satelle Turn never transitions to another Turn state @spec @mvp
 - a Satelle Session has at most one nonterminal Turn @spec @mvp
 - a Satelle Session is active exactly when it references one nonterminal Turn @spec @mvp

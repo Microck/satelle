@@ -1474,6 +1474,16 @@ mod tests {
             (TurnState::Stopped, "stopped", true),
         ];
         for (state, name, terminal) in cases {
+            // Keep this match exhaustive so new states cannot bypass the closed vocabulary proof.
+            match state {
+                TurnState::Starting
+                | TurnState::Running
+                | TurnState::RecoveryPending
+                | TurnState::Completed
+                | TurnState::Blocked
+                | TurnState::Failed
+                | TurnState::Stopped => {}
+            }
             assert_eq!(
                 format!("\"{name}\""),
                 serde_json::to_string(&state).unwrap()
