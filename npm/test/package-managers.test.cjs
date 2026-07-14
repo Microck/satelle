@@ -72,9 +72,8 @@ const oneShotRunners = [
     requiredManager: "pnpm",
     executable: process.platform === "win32" ? "pnpm.cmd" : "pnpm",
     arguments: (packageReference, commandArguments) => [
+      `--package=${packageReference}`,
       "dlx",
-      "--package",
-      packageReference,
       "satelle",
       ...commandArguments,
     ],
@@ -94,11 +93,15 @@ const oneShotRunners = [
 ];
 
 function spawnCommand(executable, arguments_, options = {}) {
-  return spawnSync(
-    executable,
-    arguments_,
-    process.platform === "win32" ? { ...options, shell: true } : options,
-  );
+  if (process.platform === "win32" && executable.toLowerCase().endsWith(".cmd")) {
+    return spawnSync(
+      process.env.ComSpec || "cmd.exe",
+      ["/d", "/s", "/c", executable, ...arguments_],
+      options,
+    );
+  }
+
+  return spawnSync(executable, arguments_, options);
 }
 
 function readJson(filePath) {
@@ -251,10 +254,9 @@ test("npm, pnpm, and Bun install and execute the unscoped forwarding package", (
     );
     const executable = installedBin(consumerRoot);
     assert.ok(executable, `${packageManager.name} did not create the satelle executable`);
-    const execution = spawnSync(executable, [probeScript, packageManager.name, "unscoped"], {
+    const execution = spawnCommand(executable, [probeScript, packageManager.name, "unscoped"], {
       cwd: consumerRoot,
       encoding: "utf8",
-      shell: process.platform === "win32",
     });
     assert.equal(execution.status, 23, `${packageManager.name}: ${execution.stderr}`);
     assert.equal(execution.stdout, JSON.stringify([packageManager.name, "unscoped"]));
@@ -267,7 +269,7 @@ test("npm, pnpm, and Bun install and execute the unscoped forwarding package", (
       `${currentTargetEntry()[1].packageName}/package.json`,
     );
     rmSync(path.dirname(nativePackageManifest), { recursive: true, force: true });
-    const missingNativeExecution = spawnSync(executable, [], {
+    const missingNativeExecution = spawnCommand(executable, [], {
       cwd: consumerRoot,
       encoding: "utf8",
       env: Object.fromEntries(
@@ -275,7 +277,6 @@ test("npm, pnpm, and Bun install and execute the unscoped forwarding package", (
           ([name]) => name !== "npm_config_user_agent" && name !== "npm_execpath",
         ),
       ),
-      shell: process.platform === "win32",
     });
     assert.equal(missingNativeExecution.status, 1, packageManager.name);
     assert.match(
