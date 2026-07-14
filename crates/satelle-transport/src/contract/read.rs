@@ -246,6 +246,10 @@ impl CapabilitiesResponse {
         &self.host_identity
     }
 
+    pub fn daemon_version(&self) -> &str {
+        &self.daemon_version
+    }
+
     pub const fn request_id(&self) -> &RequestId {
         &self.request_id
     }

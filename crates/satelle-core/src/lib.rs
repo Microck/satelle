@@ -30,7 +30,7 @@ pub use events::{
     EVENT_SCHEMA_VERSION, EventSource, EventStateSubject, EventSubject, EventType, SatelleEvent,
     SatelleEventBody, SatelleEventError,
 };
-pub use ids::{IdParseError, SessionId, TurnId};
+pub use ids::{IdParseError, SESSION_ID_PATTERN, SessionId, TurnId};
 pub use profiles::{ProfileField, ProfileSelectionSource, SelectedProfile};
 pub use secure_file::{
     SecureFileError, read_owner_controlled_config_file, read_owner_only_secret_file,

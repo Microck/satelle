@@ -27,6 +27,7 @@ hmac = "0.13.0"
 http-body-util = "0.1.3"
 rusqlite = { version = "=0.40.1", default-features = false, features = ["backup", "bundled"] }
 reqwest = { version = "0.13.4", default-features = false, features = ["blocking", "json", "query", "rustls"] }
+rmcp = { version = "=2.2.0", default-features = false, features = ["server"] }
 rustls = "0.23.41"
 rustls-platform-verifier = "0.7.0"
 rustix = { version = "1.1.4", features = ["fs", "process"] }
@@ -37,7 +38,7 @@ subtle = "2.6.1"
 tempfile = "3.23.0"
 thiserror = "2.0.17"
 time = { version = "0.3.44", features = ["formatting", "parsing", "serde"] }
-tokio = { version = "1.52.3", features = ["io-util", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
+tokio = { version = "1.52.3", features = ["io-std", "io-util", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
 tokio-tungstenite = { version = "0.29.0", default-features = false, features = ["connect", "rustls-tls-native-roots"] }
 toml = "0.9.8"
 tracing = "0.1.44"

@@ -3,8 +3,8 @@ use crate::{CliFailure, SelectedHost, failure};
 use satelle_core::session::{PublicSession, TurnAdmissionFailure};
 use satelle_core::{
     ApiTokenSource, DaemonPathOverrides, DirectHostBinding, DoctorReport, HostSessionsReport,
-    LOCAL_DEMO_HOST, SatelleError, SatelleEvent, SessionId, SetupReport, StopResult, TransportKind,
-    TurnId, read_owner_only_secret_file, read_trusted_ca_bundle_file,
+    HostSessionsSchemaVersion, LOCAL_DEMO_HOST, SatelleError, SatelleEvent, SessionId, SetupReport,
+    StopResult, TransportKind, TurnId, read_owner_only_secret_file, read_trusted_ca_bundle_file,
 };
 use satelle_host::{
     ApiBearerToken, DaemonLogPage, HostService, HostStatus, LogCursor, LogPageQuery,
@@ -232,7 +232,25 @@ impl TransportClient for DirectTransport {
     }
 
     fn host_sessions(&self, _no_bootstrap: bool) -> Result<HostSessionsReport, SatelleError> {
-        Err(self.unsupported("host sessions"))
+        // The desktop-session envelope intentionally excludes the daemon version.
+        // Read the canonical capabilities envelope instead of reporting the CLI version.
+        let capabilities = self
+            .client
+            .capabilities()
+            .map_err(|error| direct_transport_error(&self.alias, error))?;
+        let desktop_sessions = self
+            .client
+            .desktop_sessions()
+            .map_err(|error| direct_transport_error(&self.alias, error))?;
+        Ok(HostSessionsReport {
+            schema_version: HostSessionsSchemaVersion::V1,
+            host: self.alias.clone(),
+            connection_mode: "direct".to_string(),
+            bootstrapped: false,
+            bootstrap_actions: Vec::new(),
+            host_daemon_version: capabilities.daemon_version().to_string(),
+            sessions: desktop_sessions.sessions().to_vec(),
+        })
     }
 
     fn run(
