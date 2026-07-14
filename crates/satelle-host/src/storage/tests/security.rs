@@ -2,6 +2,9 @@ use super::*;
 use crate::LogSubject;
 use crate::storage::open::PROTECTED_FILE_NAMES;
 
+#[path = "security/control-lease-process.rs"]
+mod control_lease_process;
+
 #[test]
 fn private_upstream_refs_are_isolated_from_public_rows_and_logs() {
     const UPSTREAM_THREAD: &str = "thread-private-canary-9090";
