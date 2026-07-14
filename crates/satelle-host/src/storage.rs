@@ -44,7 +44,6 @@ use satelle_core::session::{
 use satelle_core::{SessionId, TurnId};
 use std::error::Error;
 use std::fmt;
-use std::fs::File;
 use std::path::Path;
 #[cfg(any(test, feature = "test-support"))]
 use std::path::PathBuf;
@@ -554,7 +553,7 @@ pub(crate) struct Storage {
     // Field order is a drop invariant: SQLite must close every delegated file
     // before the ownership lock and pinned state directory are released.
     connection: Connection,
-    _ownership_lock: File,
+    _ownership_lock: open::OwnershipLock,
     _state_directory: open::StateDirectory,
 }
 

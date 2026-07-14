@@ -278,6 +278,77 @@ fn one_process_exclusively_owns_the_store() {
     Storage::open(state.path()).expect("lock released with owner");
 }
 
+#[cfg(target_os = "macos")]
+#[test]
+fn ownership_lock_releases_while_a_forked_child_holds_the_descriptor() {
+    use std::io::{Read, Write};
+    use std::os::unix::net::UnixStream;
+    use std::os::unix::process::CommandExt;
+
+    let state = TempDir::new().expect("temporary state directory");
+    let (storage, _) = Storage::open(state.path()).expect("open storage");
+    let (mut parent_barrier, child_barrier) =
+        UnixStream::pair().expect("create the pre-exec barrier");
+
+    // Command::spawn waits for the child to exec, so run it on another thread
+    // while this thread verifies the lock during the pre-exec interval.
+    let child_thread = std::thread::spawn(move || {
+        let mut command =
+            std::process::Command::new(std::env::current_exe().expect("current test binary"));
+        command.args([
+            "--exact",
+            "storage::tests::security::ownership_lock_pre_exec_probe_child",
+        ]);
+        // SAFETY: after fork and before exec, the callback performs only one
+        // write(2) and one read(2), both async-signal-safe POSIX operations.
+        // The full-duplex socket deterministically holds the child in this
+        // interval without allocating, locking, sleeping, or polling there.
+        unsafe {
+            command.pre_exec(move || {
+                let written =
+                    rustix::io::write(&child_barrier, &[1]).map_err(std::io::Error::from)?;
+                if written != 1 {
+                    return Err(std::io::ErrorKind::WriteZero.into());
+                }
+
+                let mut release = [0_u8; 1];
+                let read =
+                    rustix::io::read(&child_barrier, &mut release).map_err(std::io::Error::from)?;
+                if read != 1 || release != [1] {
+                    return Err(std::io::ErrorKind::UnexpectedEof.into());
+                }
+                Ok(())
+            });
+        }
+        command.status()
+    });
+
+    let mut ready = [0_u8; 1];
+    parent_barrier
+        .read_exact(&mut ready)
+        .expect("child reaches the pre-exec barrier");
+    assert_eq!([1], ready);
+
+    drop(storage);
+    let reopened = Storage::open(state.path());
+
+    // Always release and reap the child before asserting the reopen result,
+    // including when this regression test fails against the old lock owner.
+    parent_barrier
+        .write_all(&[1])
+        .expect("release the pre-exec child");
+    let child_status = child_thread
+        .join()
+        .expect("join the child process thread")
+        .expect("run the pre-exec child");
+    assert!(child_status.success(), "pre-exec child must exit cleanly");
+    drop(reopened.expect("dropping Storage must release its inherited lock"));
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn ownership_lock_pre_exec_probe_child() {}
+
 #[cfg(unix)]
 #[test]
 fn preexisting_protected_symlinks_are_rejected() {
