@@ -1986,6 +1986,14 @@ mod tests {
                 "updated_at",
             ],
         );
+        assert_eq!(
+            object["session_state_revision"],
+            serde_json::json!(session.session_state_revision().get())
+        );
+        assert_eq!(
+            object["turns"][0]["turn_state_revision"],
+            serde_json::json!(session.turn(&turn_1()).unwrap().turn_state_revision().get())
+        );
         let json = serde_json::to_string(&value).unwrap();
         for forbidden in [
             "prompt",
