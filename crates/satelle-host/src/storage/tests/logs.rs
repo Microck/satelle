@@ -131,6 +131,99 @@ fn retention_expires_only_cursors_that_can_no_longer_resume_the_retained_prefix(
 }
 
 #[test]
+fn logs_expire_only_after_the_exact_seven_day_boundary() {
+    let state = TempDir::new().expect("temporary state directory");
+    let (mut storage, _) = Storage::open(state.path()).expect("open storage");
+    let recorded_at = at(0);
+    let cursor = storage
+        .append_safe_log(&host_log(
+            recorded_at,
+            LogSource::Storage,
+            LogSeverity::Info,
+        ))
+        .expect("append retained log");
+
+    storage
+        .prune_expired_session_metadata(recorded_at + time::Duration::days(7))
+        .expect("maintain retention at the exact boundary");
+    assert_eq!(
+        storage
+            .logs_after(None, 10)
+            .expect("read log at the exact retention boundary")
+            .into_iter()
+            .map(|record| record.cursor())
+            .collect::<Vec<_>>(),
+        vec![cursor]
+    );
+
+    storage
+        .prune_expired_session_metadata(
+            recorded_at + time::Duration::days(7) + time::Duration::nanoseconds(1),
+        )
+        .expect("maintain retention after the exact boundary");
+    assert!(
+        storage
+            .logs_after(None, 10)
+            .expect("read logs after retention expiry")
+            .is_empty()
+    );
+}
+
+#[test]
+fn log_cursors_continue_increasing_after_full_pruning_and_reopen() {
+    let state = TempDir::new().expect("temporary state directory");
+    let recorded_at = at(0);
+    let (mut storage, _) = Storage::open(state.path()).expect("open storage");
+    let deleted_cursor = storage
+        .append_safe_log(&host_log(
+            recorded_at,
+            LogSource::Storage,
+            LogSeverity::Info,
+        ))
+        .expect("append log that will expire");
+    storage
+        .prune_expired_session_metadata(
+            recorded_at + time::Duration::days(7) + time::Duration::nanoseconds(1),
+        )
+        .expect("prune the complete log history");
+    assert!(
+        storage
+            .logs_after(None, 10)
+            .expect("confirm the complete log history was pruned")
+            .is_empty()
+    );
+
+    let after_pruning = storage
+        .append_safe_log(&host_log(
+            recorded_at + time::Duration::days(8),
+            LogSource::Storage,
+            LogSeverity::Info,
+        ))
+        .expect("append log after full pruning");
+    assert!(after_pruning > deleted_cursor);
+    drop(storage);
+
+    let (mut reopened, _) = Storage::open(state.path()).expect("reopen storage");
+    let after_reopen = reopened
+        .append_safe_log(&host_log(
+            recorded_at + time::Duration::days(8) + time::Duration::seconds(1),
+            LogSource::Storage,
+            LogSeverity::Info,
+        ))
+        .expect("append log after reopening the store");
+    assert!(after_reopen > after_pruning);
+    assert_eq!(
+        reopened
+            .logs_after(None, 10)
+            .expect("read retained logs in cursor order")
+            .into_iter()
+            .map(|record| record.cursor())
+            .collect::<Vec<_>>(),
+        vec![after_pruning, after_reopen]
+    );
+}
+
+#[test]
 fn appended_log_timestamps_cannot_move_backwards_behind_the_cursor_order() {
     let state = TempDir::new().expect("temporary state directory");
     let (mut storage, _) = Storage::open(state.path()).expect("open storage");

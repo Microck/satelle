@@ -1578,7 +1578,7 @@
 
 ## privacy-and-filesystem
 - Satelle-owned SQLite Session and Turn records do not store raw prompt text by default @spec @mvp @implemented
-- Satelle-owned stores do not persist raw Codex final transcripts by default @spec @mvp
+- Satelle-owned stores do not persist raw Codex final transcripts by default @spec @mvp @implemented
 - prompt-derived summaries are redacted before persistence @spec @mvp
 - when required redaction fails, Satelle omits the sensitive field or fails the entire record, output, or artifact write and never persists or emits the unredacted value as a fallback @spec @mvp
 - internal Codex and provider identifiers are schema-marked sensitive storage fields and never enter public response types @spec @mvp @implemented
@@ -1587,7 +1587,7 @@
 - Satelle applies equivalent current-user restricted ACLs to sensitive Windows state @spec @mvp @implemented
 - SQLite database, WAL, SHM, token verifier, attachment staging, and sensitive export staging files inherit the same restricted access boundary @spec @mvp
 - Satelle Operator Log Files, local CLI state and cache, migration backups, setup recovery metadata, and recording artifacts inherit the same OS-user-private directory and file boundary @spec @mvp
-- Satelle refuses to use a sensitive state path that resolves through an unsafe writable directory boundary @spec @mvp
+- Satelle refuses to use a sensitive state path that resolves through an unsafe writable directory boundary @spec @mvp @implemented
 - retention deletion does not claim cryptographic erasure from SQLite pages, filesystem snapshots, backups, or upstream services @spec @mvp
 - Satelle documents that Codex and model providers may retain data independently from Satelle-owned retention @spec @mvp
 - satelle local CLI cache stores only convenience data such as redacted command history, aggregate stats, AI client installer state, downloaded release metadata, and non-authoritative recent host summaries @spec @mvp
@@ -1615,9 +1615,9 @@
 - satelle Satelle Platform-Native Log Sinks emit the same redacted summaries and default exclusions as Satelle Operator Log Files instead of raw protocol payloads, provider bodies, prompts, screenshots, transcripts, recordings, or raw setup and repair subprocess streams @spec @later
 - satelle Host Daemon continues running when a Satelle Platform-Native Log Sink fails while SQLite remains writable, and records the degraded platform-native log sink as a typed diagnostic finding @spec @later
 - satelle Satelle Platform-Native Log Sink retention and query behavior are treated as operating-system-managed mirror behavior and do not change SQLite Satelle Log Entry retention, Satelle Operator Log File retention, or satelle logs output semantics @spec @later
-- satelle SQLite Satelle Log Entries are retained for 7 days by default @spec @mvp
+- satelle SQLite Satelle Log Entries are retained for 7 days by default @spec @mvp @implemented
 - satelle SQLite Satelle Log Entry retention can be configured per host or profile @spec @mvp
-- each persisted Satelle Log Entry receives a monotonic Log Cursor in its Host Daemon store @spec @mvp
+- each persisted Satelle Log Entry receives a monotonic Log Cursor in its Host Daemon store @spec @mvp @implemented
 - logs pagination resumes strictly after the last delivered Log Cursor @spec @mvp @implemented
 - logs follow reconnection uses a Log Cursor instead of timestamp alone @spec @mvp
 - a Log Cursor older than retained log history reports a typed logs-cursor-expired error and identifies the earliest available cursor @spec @mvp @implemented
