@@ -59,8 +59,13 @@ pub(super) fn run_exchange<E: CodexExchange>(
     let (sender, receiver) = mpsc::sync_channel(INBOUND_QUEUE_CAPACITY);
     let reader = match thread::Builder::new()
         .name("satelle-codex-reader".to_string())
-        .spawn(move || read_messages(stdout, deadline, sender))
-    {
+        .spawn(move || {
+            let mut stdout = stdout;
+            read_messages(&mut stdout, deadline, sender);
+            // Returning the pipe keeps it owned by the JoinHandle until the
+            // parent has attempted process-group termination and joins us.
+            stdout
+        }) {
         Ok(reader) => reader,
         Err(_) => {
             let _ = crate::codex_capabilities::terminate_group(&mut child);
@@ -81,8 +86,8 @@ pub(super) fn run_exchange<E: CodexExchange>(
         Ok(writer_thread) => writer_thread,
         Err(_) => {
             drop(writer);
-            drop(receiver);
             let _ = crate::codex_capabilities::terminate_group(&mut child);
+            drop(receiver);
             let _ = reader.join();
             return Err(CodexSessionFailure::before_turn_dispatch(
                 CodexSessionError::Spawn,
@@ -93,12 +98,12 @@ pub(super) fn run_exchange<E: CodexExchange>(
     let turn_dispatch_attempted = exchange.turn_dispatch_attempted();
 
     // Keep both pipe-owning threads connected until the process group is
-    // signaled and its leader reaped. Closing stdout first lets a backpressured
-    // child exit on a broken pipe while group termination is starting, which
-    // makes macOS observe an ambiguous zombie-to-empty-group transition.
+    // signaled and reaped. Closing stdout first can make a backpressured child
+    // exit while group termination is starting, leaving macOS unable to prove
+    // that the group is contained.
     let group_stopped = crate::codex_capabilities::terminate_group(&mut child);
-    // The reader may still be backpressured on the bounded queue. Release its
-    // blocked send before joining either thread.
+    // Release a reader blocked on the bounded queue before joining either pipe
+    // owner. A completed reader retains stdout in its JoinHandle until join.
     drop(receiver);
     drop(writer);
     let reader_stopped = reader.join().is_ok();
@@ -196,11 +201,7 @@ pub(super) enum ReadEvent {
     Timeout,
 }
 
-fn read_messages(
-    stdout: std::process::ChildStdout,
-    deadline: Instant,
-    sender: mpsc::SyncSender<ReadEvent>,
-) {
+fn read_messages<R: Read>(stdout: &mut R, deadline: Instant, sender: mpsc::SyncSender<ReadEvent>) {
     let mut reader = BufReader::new(stdout);
     loop {
         let mut line = Vec::new();
@@ -245,5 +246,46 @@ fn read_messages(
         if sender.send(ReadEvent::Line(line)).is_err() {
             return;
         }
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::{ReadEvent, read_messages};
+    use std::io::Write;
+    use std::os::unix::net::UnixStream;
+    use std::sync::mpsc;
+    use std::thread;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn completed_reader_retains_pipe_until_join() {
+        let (mut writer, reader_stream) = UnixStream::pair().expect("create stream pair");
+        reader_stream
+            .set_nonblocking(true)
+            .expect("make reader nonblocking");
+        let (sender, receiver) = mpsc::sync_channel(1);
+        let (finished_sender, finished_receiver) = mpsc::channel();
+        let reader = thread::spawn(move || {
+            let mut reader_stream = reader_stream;
+            read_messages(&mut reader_stream, Instant::now(), sender);
+            finished_sender.send(()).expect("report reader completion");
+            reader_stream
+        });
+
+        assert!(matches!(
+            receiver.recv_timeout(Duration::from_secs(1)),
+            Ok(ReadEvent::Timeout)
+        ));
+        finished_receiver
+            .recv_timeout(Duration::from_secs(1))
+            .expect("reader must finish after its timeout");
+
+        writer
+            .write_all(b"pipe remains owned")
+            .expect("completed reader must retain its pipe");
+        let retained_pipe = reader.join().expect("reader thread must stop cleanly");
+        drop(retained_pipe);
+        assert!(writer.write_all(b"pipe is now closed").is_err());
     }
 }
