@@ -21,6 +21,7 @@ mod auth;
 mod lifecycle;
 mod logs;
 mod operational;
+mod retention;
 mod security;
 
 fn initial_session(storage: &Storage, session: &str, turn: &str, at: OffsetDateTime) -> Session {
@@ -144,7 +145,7 @@ fn contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {
 }
 
 impl Storage {
-    fn connection_for_test(&self) -> &Connection {
+    pub(crate) fn connection_for_test(&self) -> &Connection {
         &self.connection
     }
 

@@ -3,6 +3,7 @@ mod codec;
 mod logs;
 mod open;
 mod operational;
+mod retention;
 mod sql;
 pub(crate) mod stop;
 #[cfg(test)]
