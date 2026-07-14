@@ -135,7 +135,14 @@ fn logs_expire_only_after_the_exact_seven_day_boundary() {
     let state = TempDir::new().expect("temporary state directory");
     let (mut storage, _) = Storage::open(state.path()).expect("open storage");
     let recorded_at = at(0);
-    let cursor = storage
+    let expired_cursor = storage
+        .append_safe_log(&host_log(
+            recorded_at - time::Duration::nanoseconds(1),
+            LogSource::Storage,
+            LogSeverity::Info,
+        ))
+        .expect("append log that forces exact-boundary pruning");
+    let boundary_cursor = storage
         .append_safe_log(&host_log(
             recorded_at,
             LogSource::Storage,
@@ -153,8 +160,10 @@ fn logs_expire_only_after_the_exact_seven_day_boundary() {
             .into_iter()
             .map(|record| record.cursor())
             .collect::<Vec<_>>(),
-        vec![cursor]
+        vec![boundary_cursor],
+        "actual pruning must delete the older row but retain the exact-boundary row"
     );
+    assert!(boundary_cursor > expired_cursor);
 
     storage
         .prune_expired_session_metadata(
@@ -193,25 +202,32 @@ fn log_cursors_continue_increasing_after_full_pruning_and_reopen() {
             .is_empty()
     );
 
-    let after_pruning = storage
+    drop(storage);
+
+    let (mut reopened, _) = Storage::open(state.path()).expect("reopen the fully pruned store");
+    assert!(
+        reopened
+            .logs_after(None, 10)
+            .expect("confirm the reopened log table remains empty")
+            .is_empty()
+    );
+    let after_reopen = reopened
         .append_safe_log(&host_log(
             recorded_at + time::Duration::days(8),
             LogSource::Storage,
             LogSeverity::Info,
         ))
-        .expect("append log after full pruning");
-    assert!(after_pruning > deleted_cursor);
-    drop(storage);
+        .expect("append the first log after reopening the fully pruned store");
+    assert!(after_reopen > deleted_cursor);
 
-    let (mut reopened, _) = Storage::open(state.path()).expect("reopen storage");
-    let after_reopen = reopened
+    let following_cursor = reopened
         .append_safe_log(&host_log(
             recorded_at + time::Duration::days(8) + time::Duration::seconds(1),
             LogSource::Storage,
             LogSeverity::Info,
         ))
-        .expect("append log after reopening the store");
-    assert!(after_reopen > after_pruning);
+        .expect("append the following retained log");
+    assert!(following_cursor > after_reopen);
     assert_eq!(
         reopened
             .logs_after(None, 10)
@@ -219,7 +235,7 @@ fn log_cursors_continue_increasing_after_full_pruning_and_reopen() {
             .into_iter()
             .map(|record| record.cursor())
             .collect::<Vec<_>>(),
-        vec![after_pruning, after_reopen]
+        vec![after_reopen, following_cursor]
     );
 }
 
