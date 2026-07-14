@@ -152,6 +152,7 @@ impl RuntimeEngine {
         expected_session_id: Option<&SessionId>,
     ) -> Result<Option<RuntimeAdmissionReplay>, SatelleError> {
         let requested_at = time::OffsetDateTime::now_utc();
+        self.maintain_session_retention(requested_at)?;
         let idempotency = model::idempotency(operation, identity, requested_at)?;
         let replay = self
             .lock_storage()?
@@ -340,6 +341,7 @@ impl RuntimeEngine {
     }
 
     fn status(&self, session_id: &SessionId) -> Result<PublicSession, SatelleError> {
+        self.maintain_session_retention(time::OffsetDateTime::now_utc())?;
         let session = self
             .lock_storage()?
             .load_session(session_id)
@@ -350,6 +352,7 @@ impl RuntimeEngine {
 
     fn stop(&self, command: StopCommand) -> Result<RuntimeStopOutcome, SatelleError> {
         let requested_at = time::OffsetDateTime::now_utc();
+        self.maintain_session_retention(requested_at)?;
         let idempotency = model::stop_idempotency(requested_at, &command.identity)?;
         let outcome = loop {
             let target = self
@@ -430,6 +433,7 @@ impl RuntimeEngine {
     }
 
     fn log_page(&self, query: &LogPageQuery) -> Result<DaemonLogPage, SatelleError> {
+        self.maintain_session_retention(time::OffsetDateTime::now_utc())?;
         match self.lock_storage()?.log_page(query) {
             Ok(page) => Ok(page),
             Err(LogPageStorageError::Storage(error)) => Err(model::storage_failure(error)),
@@ -475,6 +479,7 @@ impl RuntimeEngine {
     }
 
     fn snapshot(&self) -> Result<RuntimeSnapshot, SatelleError> {
+        self.maintain_session_retention(time::OffsetDateTime::now_utc())?;
         let storage = self.lock_storage()?;
         Ok(RuntimeSnapshot {
             host_identity: storage.host_identity().map_err(model::storage_failure)?,
@@ -492,6 +497,15 @@ impl RuntimeEngine {
 
     fn subscribe_live_events(&self) -> crate::LiveEventSubscription {
         self.live_events.subscribe()
+    }
+
+    fn maintain_session_retention(
+        &self,
+        observed_at: time::OffsetDateTime,
+    ) -> Result<(), SatelleError> {
+        self.lock_storage()?
+            .prune_expired_session_metadata(observed_at)
+            .map_err(model::storage_failure)
     }
 
     fn lock_storage(&self) -> Result<MutexGuard<'_, Storage>, SatelleError> {
@@ -938,6 +952,9 @@ fn ensure_local_host(host: &str) -> Result<(), SatelleError> {
     }
 }
 
+#[cfg(test)]
+#[path = "runtime-retention-tests.rs"]
+mod retention_tests;
 #[cfg(test)]
 #[path = "runtime-tests.rs"]
 mod tests;

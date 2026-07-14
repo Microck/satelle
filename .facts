@@ -1391,10 +1391,10 @@
 - a Session operation verifies that the requested Session belongs to the connected Host Identity @spec @mvp
 - the local CLI uses its non-authoritative Session-to-Host cache only to select a candidate Host @spec @mvp
 - satelle requires --host when a Session identifier cannot be mapped to exactly one configured Host without probing unrelated Hosts @spec @mvp
-- satelle remote host retains minimal session metadata for 7 days by default @spec @mvp
+- satelle remote host retains minimal session metadata for 7 days by default @implemented @mvp
 - satelle session metadata retention can be configured per host or profile @spec @mvp
-- session retention cleanup never deletes a nonterminal Session or Turn @spec @mvp
-- session retention age begins when the Session's most recent Turn becomes terminal @spec @mvp
+- session retention cleanup never deletes a nonterminal Session or Turn @implemented @mvp
+- session retention age begins when the Session's most recent Turn becomes terminal @implemented @mvp
 - expiration of Satelle metadata does not claim to delete Codex, provider, or operating-system records outside Satelle ownership @spec @mvp
 - satelle can export a redacted task artifact set containing plan.md, worklog.md, and goal.md for a selected session so another agent or human can audit what happened without replaying raw desktop content @spec @mvp
 - satelle records local redacted command history for setup, repair, run, steer, status, stop, logs, doctor, host, config, and MCP installer commands when local state storage is available @spec @mvp
