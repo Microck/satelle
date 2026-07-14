@@ -2206,7 +2206,9 @@
 - every versioned JSON and NDJSON surface has contract tests for schema_version, required fields, enum tokens, stdout, stderr, and exit status @spec @verification @mvp
 - parser failures and semantic validation failures share the same human and JSON error conformance suite @spec @verification @mvp
 - direct and SSH-tunneled Host Daemon transports pass one shared API and Session conformance suite @spec @verification @mvp
-- concurrent admission tests prove that one Control Lease cannot create two active Turns across processes @spec @verification @mvp
+- label: concurrent admission tests prove that one Control Lease cannot create two active Turns across processes
+  command: cargo test --locked -p satelle-host --lib storage::tests::security::control_lease_process::cross_process_control_lease_blocks_competing_turn_after_owner_handoff -- --exact
+  tags: [spec, verification, mvp, implemented, ci]
 - label: stop and completion race tests prove that exactly one immutable terminal Turn state wins
   command: cargo test --locked -p satelle-core --lib session::tests::stale_revision_cannot_overwrite_the_winning_terminal_state -- --exact && cargo test --locked -p satelle-host --lib storage::tests::lifecycle::lifecycle_completion_wins_a_stop_race_without_redeleting_its_lease -- --exact && cargo test --locked -p satelle-host --lib runtime::tests::review_regressions::attached_execution_losing_to_stop_returns_the_durable_stopped_state -- --exact
   tags: [spec, verification, mvp, implemented, ci]
