@@ -81,11 +81,28 @@ impl OperationCapacity {
         operation: impl FnOnce() -> SharedResult,
     ) -> SharedResult {
         loop {
-            // The generation makes the replay probe and in-memory decision one
+            // An exact in-memory request owns the authoritative result until
+            // it clears. Durable state may already contain an intermediate
+            // snapshot that the leader can still replace with a dispatch
+            // failure, so matching followers must join before replay.
+            let (observed_generation, follower) = {
+                let state = self.lock()?;
+                let observed_generation = self.generation.load(Ordering::Acquire);
+                let follower = self.matching_active(&state, &request)?;
+                (observed_generation, follower)
+            };
+            if let Some(follower) = follower {
+                return follower.wait();
+            }
+
+            // The generation makes the replay probe and capacity decision one
             // optimistic read. SQLite work remains outside the mutex, while a
-            // concurrent install or clear forces a fresh durable probe.
-            let observed_generation = self.generation.load(Ordering::Acquire);
-            if let Some(replayed) = replay()? {
+            // concurrent install or clear discards the probe and starts again.
+            let replayed = replay()?;
+            if self.generation.load(Ordering::Acquire) != observed_generation {
+                continue;
+            }
+            if let Some(replayed) = replayed {
                 return Ok(replayed);
             }
 
@@ -93,6 +110,8 @@ impl OperationCapacity {
                 let mut state = self.lock()?;
                 if self.generation.load(Ordering::Acquire) != observed_generation {
                     None
+                } else if let Some(follower) = self.matching_active(&state, &request)? {
+                    Some(Role::Follower(follower))
                 } else {
                     Some(match &state.active {
                         None => {
@@ -100,19 +119,6 @@ impl OperationCapacity {
                             state.active = Some(Arc::clone(&entry));
                             self.generation.fetch_add(1, Ordering::Release);
                             Role::Leader(entry)
-                        }
-                        Some(active)
-                            if active.request.same_base(&request) && active.request != request =>
-                        {
-                            return Err(crate::runtime::idempotency_conflict());
-                        }
-                        Some(active) if active.request == request => {
-                            #[cfg(test)]
-                            {
-                                active.followers.fetch_add(1, Ordering::SeqCst);
-                                self.registration_changed.notify_all();
-                            }
-                            Role::Follower(Arc::clone(active))
                         }
                         Some(_) => {
                             return Err(SatelleError::capacity_exceeded(RESOURCE, LIMIT));
@@ -129,6 +135,28 @@ impl OperationCapacity {
                 Role::Follower(entry) => entry.wait(),
             };
         }
+    }
+
+    fn matching_active(
+        &self,
+        state: &CapacityState,
+        request: &OperationRequest,
+    ) -> Result<Option<Arc<InFlight>>, SatelleError> {
+        let Some(active) = &state.active else {
+            return Ok(None);
+        };
+        if active.request.same_base(request) && active.request != *request {
+            return Err(crate::runtime::idempotency_conflict());
+        }
+        if active.request != *request {
+            return Ok(None);
+        }
+        #[cfg(test)]
+        {
+            active.followers.fetch_add(1, Ordering::SeqCst);
+            self.registration_changed.notify_all();
+        }
+        Ok(Some(Arc::clone(active)))
     }
 
     fn lock(&self) -> Result<MutexGuard<'_, CapacityState>, SatelleError> {

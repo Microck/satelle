@@ -133,6 +133,68 @@ fn identical_follower_receives_the_exact_pre_durable_leader_error() {
 }
 
 #[test]
+fn matching_in_memory_request_wins_over_an_in_progress_durable_replay() {
+    let capacity = Arc::new(OperationCapacity::default());
+    let durable_starting = coordinator_result_session();
+    let leader_started = Latch::default();
+    let release_leader = Latch::default();
+
+    let leader_capacity = Arc::clone(&capacity);
+    let leader_started_signal = leader_started.clone();
+    let release_leader_wait = release_leader.clone();
+    let leader = std::thread::spawn(move || {
+        leader_capacity.execute(
+            operation_request("principal-a", "key-a", DIGEST_A),
+            || Ok(None),
+            || {
+                leader_started_signal.signal();
+                release_leader_wait.wait();
+                Err(crate::runtime::integrity_error(
+                    "the scheduled dispatch failed after durable admission",
+                ))
+            },
+        )
+    });
+    assert!(
+        leader_started.wait_for(WAIT_LIMIT),
+        "the leader must remain active after durable admission"
+    );
+
+    let replay_calls = Arc::new(AtomicUsize::new(0));
+    let follower_capacity = Arc::clone(&capacity);
+    let follower_replay_calls = Arc::clone(&replay_calls);
+    let follower = std::thread::spawn(move || {
+        follower_capacity.execute(
+            operation_request("principal-a", "key-a", DIGEST_A),
+            || {
+                follower_replay_calls.fetch_add(1, Ordering::SeqCst);
+                Ok(Some(OperationOutcome::Session(durable_starting.clone())))
+            },
+            || panic!("an identical duplicate must not become a second leader"),
+        )
+    });
+
+    if !capacity.wait_for_follower_registration(WAIT_LIMIT) {
+        release_leader.signal();
+        let _ = leader.join();
+        let _ = follower.join();
+        panic!("the duplicate accepted durable in-progress state instead of joining the leader");
+    }
+    release_leader.signal();
+    let leader_error = match leader.join().expect("leader thread must not panic") {
+        Ok(_) => panic!("the leader's post-admission dispatch must fail"),
+        Err(error) => error,
+    };
+    let follower_error = match follower.join().expect("follower thread must not panic") {
+        Ok(_) => panic!("the follower must receive the leader's exact failure"),
+        Err(error) => error,
+    };
+
+    assert_same_error(&leader_error, &follower_error);
+    assert_eq!(replay_calls.load(Ordering::SeqCst), 0);
+}
+
+#[test]
 fn conflicting_identity_beats_occupied_capacity() {
     let state = crate::TestStateDir::new().expect("temporary state directory");
     let adapter = ControlledAdapter::default();
@@ -524,32 +586,6 @@ fn stale_probe_after_handoff(expectation: StaleProbeExpectation) -> StaleProbeSc
     let capacity = Arc::new(OperationCapacity::default());
     let durable = Arc::new(AtomicBool::new(false));
 
-    let leader_started = Latch::default();
-    let release_leader = Latch::default();
-    let leader_capacity = Arc::clone(&capacity);
-    let leader_durable = Arc::clone(&durable);
-    let leader_expected = expected.clone();
-    let leader_started_signal = leader_started.clone();
-    let release_leader_wait = release_leader.clone();
-    let leader = std::thread::spawn(move || {
-        leader_capacity
-            .execute(
-                operation_request("principal-a", "key-a", DIGEST_A),
-                || Ok(None),
-                || {
-                    leader_started_signal.signal();
-                    release_leader_wait.wait();
-                    leader_durable.store(true, Ordering::SeqCst);
-                    Ok(OperationOutcome::Session(leader_expected))
-                },
-            )
-            .and_then(OperationOutcome::into_session)
-    });
-    assert!(
-        leader_started.wait_for(WAIT_LIMIT),
-        "leader A must occupy the coordinator before the stale probe"
-    );
-
     let first_probe_started = Latch::default();
     let release_first_probe = Latch::default();
     let probe_count = Arc::new(AtomicUsize::new(0));
@@ -591,7 +627,33 @@ fn stale_probe_after_handoff(expectation: StaleProbeExpectation) -> StaleProbeSc
     });
     assert!(
         first_probe_started.wait_for(WAIT_LIMIT),
-        "duplicate A's first durable probe must miss while leader A is active"
+        "duplicate A's first durable probe must start before leader A installs"
+    );
+
+    let leader_started = Latch::default();
+    let release_leader = Latch::default();
+    let leader_capacity = Arc::clone(&capacity);
+    let leader_durable = Arc::clone(&durable);
+    let leader_expected = expected.clone();
+    let leader_started_signal = leader_started.clone();
+    let release_leader_wait = release_leader.clone();
+    let leader = std::thread::spawn(move || {
+        leader_capacity
+            .execute(
+                operation_request("principal-a", "key-a", DIGEST_A),
+                || Ok(None),
+                || {
+                    leader_started_signal.signal();
+                    release_leader_wait.wait();
+                    leader_durable.store(true, Ordering::SeqCst);
+                    Ok(OperationOutcome::Session(leader_expected))
+                },
+            )
+            .and_then(OperationOutcome::into_session)
+    });
+    assert!(
+        leader_started.wait_for(WAIT_LIMIT),
+        "leader A must install while duplicate A's first probe is paused"
     );
 
     release_leader.signal();
