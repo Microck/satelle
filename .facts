@@ -2095,7 +2095,10 @@
 - satelle constructs OpenSSH argv values without invoking a local shell @spec @mvp
 - remote prompts, bearer tokens, provider secrets, and raw configuration are never embedded in SSH command strings @spec @mvp
 - SSH bootstrap tunnels bind only to Controller loopback by default @spec @mvp
-- Host Daemon API authentication remains required inside an SSH tunnel @spec @mvp
+- id: cr4
+  label: Host Daemon API authentication remains required inside an SSH tunnel
+  command: cargo test --locked -p satelle-transport --test http conformance::established_ssh_tunnel_requires_api_authentication_for_http_and_websocket -- --exact
+  tags: [spec, mvp, implemented, ci]
 - uploaded Host Daemon binaries are verified against release integrity metadata before remote execution @spec @mvp
 - uploaded binaries are staged under generated names and atomically promoted only after verification @spec @mvp
 - remote bootstrap stdout used as a machine protocol is size-bounded and separated from diagnostic stderr @spec @mvp
