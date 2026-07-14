@@ -507,7 +507,23 @@ pub fn resolve_path_set(cwd: &Path) -> Result<SatellePathSet, SatelleError> {
     } else if let Some(home) = &satelle_home {
         (home.join("logs"), PathSource::SatelleHome)
     } else {
-        (state_root.join("logs"), state_source)
+        #[cfg(target_os = "macos")]
+        {
+            let base_dirs = directories::BaseDirs::new()
+                .ok_or_else(SatelleError::platform_directories_unavailable)?;
+            (
+                base_dirs
+                    .home_dir()
+                    .join("Library")
+                    .join("Logs")
+                    .join("dev.Microck.Satelle"),
+                PathSource::OsDefault,
+            )
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            (state_root.join("logs"), state_source)
+        }
     };
 
     let (recording_root, recording_source) = if let Some(home) = &satelle_home {

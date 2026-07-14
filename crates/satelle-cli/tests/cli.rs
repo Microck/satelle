@@ -3144,6 +3144,27 @@ fn paths_json_uses_satelle_home_and_explicit_overrides() {
     );
 }
 
+#[cfg(target_os = "macos")]
+#[test]
+fn paths_json_uses_the_native_macos_operator_log_root() {
+    let state = state_dir();
+    let home = state.path().join("home");
+    let output = satelle()
+        .env("HOME", &home)
+        .args(["paths", "--json"])
+        .assert()
+        .success()
+        .get_output()
+        .clone();
+    let paths = parse_json_output(&output.stdout);
+
+    assert_eq!(
+        paths["operator_log_root"],
+        serde_json::json!(home.join("Library/Logs/dev.Microck.Satelle"))
+    );
+    assert_eq!(paths["sources"]["operator_log_root"], "os_default");
+}
+
 #[test]
 fn empty_path_overrides_are_treated_as_unset() {
     let state = state_dir();
