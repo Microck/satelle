@@ -3,6 +3,7 @@ members = [
     "crates/satelle-cli",
     "crates/satelle-core",
     "crates/satelle-host",
+    "crates/satelle-test-contract",
     "crates/satelle-transport",
 ]
 exclude = ["vendor/command-group"]

@@ -2197,6 +2197,7 @@ dependencies = [
  "rmcp",
  "satelle-core",
  "satelle-host",
+ "satelle-test-contract",
  "satelle-transport",
  "serde",
  "serde_json",
@@ -2250,6 +2251,13 @@ dependencies = [
  "uuid",
  "windows-sys 0.61.2",
  "zeroize",
+]
+
+[[package]]
+name = "satelle-test-contract"
+version = "0.1.0"
+dependencies = [
+ "serde_json",
 ]
 
 [[package]]
