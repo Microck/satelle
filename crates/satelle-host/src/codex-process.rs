@@ -92,11 +92,15 @@ pub(super) fn run_exchange<E: CodexExchange>(
     let exchange_result = exchange.run(&writer, &receiver);
     let turn_dispatch_attempted = exchange.turn_dispatch_attempted();
 
-    // The reader may be backpressured on the bounded queue. Drop the receiver
-    // before joining so every cleanup path can release that blocked send.
+    // Keep both pipe-owning threads connected until the process group is
+    // signaled and its leader reaped. Closing stdout first lets a backpressured
+    // child exit on a broken pipe while group termination is starting, which
+    // makes macOS observe an ambiguous zombie-to-empty-group transition.
+    let group_stopped = crate::codex_capabilities::terminate_group(&mut child);
+    // The reader may still be backpressured on the bounded queue. Release its
+    // blocked send before joining either thread.
     drop(receiver);
     drop(writer);
-    let group_stopped = crate::codex_capabilities::terminate_group(&mut child);
     let reader_stopped = reader.join().is_ok();
     let writer_stopped = writer_thread.join().is_ok();
     if !group_stopped || !reader_stopped || !writer_stopped {

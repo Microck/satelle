@@ -724,7 +724,7 @@ fn reap_proven_empty_group(child: &mut GroupChild) -> bool {
     else {
         return false;
     };
-    if !matches!(child.inner().try_wait(), Ok(Some(_))) {
+    if !matches!(child.try_wait(), Ok(Some(_))) {
         return false;
     }
     matches!(
