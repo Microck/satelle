@@ -20,6 +20,7 @@ struct PublicTurnWire {
     updated_at: OffsetDateTime,
     #[serde(with = "time::serde::rfc3339::option")]
     terminal_at: Option<OffsetDateTime>,
+    #[serde(deserialize_with = "Option::deserialize")]
     safe_summary: Option<SafeSummary>,
 }
 
@@ -235,6 +236,26 @@ mod tests {
             expected,
             "public lifecycle serialization must not expose private upstream or policy fields"
         );
+    }
+
+    #[test]
+    fn public_turn_requires_nullable_metadata_fields() {
+        for field in ["terminal_at", "safe_summary"] {
+            let mut wire = starting_session();
+            let turn = wire["turns"][0]
+                .as_object_mut()
+                .expect("starting Session contains a Turn object");
+            assert!(
+                turn.remove(field).is_some(),
+                "fixture must contain nullable field {field}"
+            );
+            assert!(!turn.contains_key(field), "mutation must remove {field}");
+
+            assert!(
+                serde_json::from_value::<PublicSession>(wire).is_err(),
+                "omitted nullable field {field} must be rejected"
+            );
+        }
     }
 
     #[test]
