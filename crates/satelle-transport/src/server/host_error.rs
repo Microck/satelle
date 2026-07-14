@@ -191,7 +191,10 @@ fn failure(error: &SatelleError) -> ApiFailure {
         | ErrorCode::TlsHandshakeFailed
         | ErrorCode::AuthenticationFailed
         | ErrorCode::AuthorizationInsufficientScope
-        | ErrorCode::HostIdentityMismatch => ApiFailure {
+        | ErrorCode::HostIdentityMismatch
+        // This is a Controller-local reachability error. If it ever reaches
+        // the Host boundary, fail closed instead of inventing a wire code.
+        | ErrorCode::DirectDaemonUnreachable => ApiFailure {
             status: StatusCode::INTERNAL_SERVER_ERROR,
             code: ApiErrorCode::InternalError,
             category: ApiErrorCategory::Internal,
@@ -314,6 +317,21 @@ mod tests {
         assert_eq!(mapped.code, ApiErrorCode::IncompatibleControlPlane);
         assert_eq!(mapped.category, ApiErrorCategory::Readiness);
         assert!(!mapped.retryable);
+        assert_eq!(mapped.details, None);
+        assert!(!mapped.message.contains("PRIVATE_"));
+    }
+
+    #[test]
+    fn direct_daemon_unreachable_is_sanitized_at_the_host_boundary() {
+        let mapped = failure(&SatelleError::direct_daemon_unreachable(
+            "PRIVATE_HOST_CANARY",
+        ));
+
+        assert_eq!(mapped.status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(mapped.code, ApiErrorCode::InternalError);
+        assert_eq!(mapped.category, ApiErrorCategory::Internal);
+        assert!(!mapped.retryable);
+        assert_eq!(mapped.message, "the Host operation failed unexpectedly");
         assert_eq!(mapped.details, None);
         assert!(!mapped.message.contains("PRIVATE_"));
     }

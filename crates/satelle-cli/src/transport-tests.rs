@@ -5,7 +5,9 @@ use satelle_host::{
     ApiScopes, LogCursor, LogPageQuery, LogSeverity, LogSource, test_support::TestStateDir,
 };
 use satelle_transport::{DaemonServer, DaemonServerConfig};
-use std::net::{Ipv4Addr, SocketAddr};
+use std::net::{Ipv4Addr, SocketAddr, TcpListener};
+use tokio_tungstenite::tungstenite::Error as WebSocketError;
+use tokio_tungstenite::tungstenite::error::ProtocolError;
 
 #[path = "transport-reconnect-tests.rs"]
 mod reconnect;
@@ -119,6 +121,51 @@ impl Drop for DirectFixture {
             }
         }
     }
+}
+
+#[test]
+fn attached_run_reports_direct_daemon_unreachable_after_wss_subscription_succeeds() {
+    let mut fixture = DirectFixture::start();
+    let subscribed_stream = fixture
+        .transport()
+        .event_runtime
+        .block_on(
+            fixture
+                .transport()
+                .event_client
+                .connect_events(vec![satelle_transport::EventSubscription::Host]),
+        )
+        .expect("prove the WSS Host subscription is reachable");
+    let closed_listener =
+        TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("reserve a closed HTTP endpoint");
+    let closed_address = closed_listener
+        .local_addr()
+        .expect("read the closed HTTP endpoint");
+    drop(closed_listener);
+
+    let disconnected_token = ApiBearerToken::generate().expect("generate disconnected token");
+    let disconnected_client =
+        DaemonClient::loopback(closed_address, disconnected_token, &fixture.host_identity)
+            .expect("construct disconnected HTTP client");
+    fixture
+        .transport
+        .as_mut()
+        .expect("fixture transport is present")
+        .client = Arc::new(disconnected_client);
+
+    let failure = match fixture
+        .transport()
+        .run(&TurnRequest::new("must not be admitted"), &mut |_| {
+            panic!("an unadmitted run must not emit events")
+        }) {
+        Ok(_) => panic!("the disconnected HTTP client must fail run admission"),
+        Err(failure) => failure,
+    };
+
+    assert_eq!(failure.phase(), TurnAdmissionPhase::NotAdmitted);
+    assert_eq!(failure.error().code, ErrorCode::DirectDaemonUnreachable);
+    assert!(failure.durable_handles().is_none());
+    drop(subscribed_stream);
 }
 
 #[test]
@@ -442,6 +489,57 @@ fn only_connection_loss_and_transient_http_outage_enter_retry_paths() {
         direct_event_error("direct-test", DaemonEventError::HandshakeTimeout).code,
         ErrorCode::HostUnreachable
     );
+    assert_eq!(
+        direct_run_event_error("direct-test", DaemonEventError::HandshakeTimeout).code,
+        ErrorCode::DirectDaemonUnreachable
+    );
+    assert_eq!(
+        direct_run_event_error("direct-test", DaemonEventError::HostIdentityMismatch).code,
+        ErrorCode::HostIdentityMismatch,
+        "run-specific reachability mapping must preserve trust failures"
+    );
+    assert_eq!(
+        direct_run_event_error(
+            "direct-test",
+            DaemonEventError::Transport(WebSocketError::Protocol(ProtocolError::WrongHttpMethod)),
+        )
+        .code,
+        ErrorCode::HostUnreachable,
+        "run-specific reachability mapping must preserve generic protocol-failure handling"
+    );
+}
+
+#[test]
+fn direct_run_preserves_typed_recoverable_close_errors() {
+    let control = serde_json::from_value(serde_json::json!({
+        "schema_version": "satelle.ws.control.v1",
+        "type": "error",
+        "request_id": satelle_transport::RequestId::new(),
+        "host_identity": "host-direct-test",
+        "reason": "slow-consumer",
+        "code": "capacity-exceeded",
+        "category": "capacity",
+        "retryable": false,
+        "message": "the WebSocket subscriber could not keep up with live events",
+        "details": null,
+        "docs_url": null,
+        "suggested_commands": []
+    }))
+    .expect("deserialize valid slow-consumer control error");
+
+    assert_eq!(
+        direct_run_event_error(
+            "direct-test",
+            DaemonEventError::Closed {
+                control: Some(Box::new(control)),
+                code: 1008,
+                reason: satelle_transport::WsCloseReason::SlowConsumer,
+            },
+        )
+        .code,
+        ErrorCode::RemoteExecution,
+        "typed close controls must remain authoritative during direct run admission"
+    );
 }
 
 #[test]
@@ -484,11 +582,19 @@ fn admission_failures_preserve_definitive_and_ambiguous_phases() {
     let rejected = direct_admission_error("direct-test", DaemonClientError::InvalidTokenHeader);
     assert_eq!(rejected.phase(), TurnAdmissionPhase::NotAdmitted);
     assert!(rejected.durable_handles().is_none());
+    let run_rejected =
+        direct_run_admission_error("direct-test", DaemonClientError::InvalidTokenHeader);
+    assert_eq!(run_rejected.phase(), rejected.phase());
+    assert_eq!(run_rejected.error().code, rejected.error().code);
 
     let ambiguous =
         direct_admission_error("direct-test", DaemonClientError::ResponseRequestIdMismatch);
     assert_eq!(ambiguous.phase(), TurnAdmissionPhase::AdmissionUnknown);
     assert!(ambiguous.durable_handles().is_none());
+    let run_ambiguous =
+        direct_run_admission_error("direct-test", DaemonClientError::ResponseRequestIdMismatch);
+    assert_eq!(run_ambiguous.phase(), ambiguous.phase());
+    assert_eq!(run_ambiguous.error().code, ambiguous.error().code);
 
     let api_error: satelle_transport::ApiError = serde_json::from_value(serde_json::json!({
         "schema_version": "satelle.error.v1",

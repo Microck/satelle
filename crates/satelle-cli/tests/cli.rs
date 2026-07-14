@@ -1141,7 +1141,7 @@ fn events_json_emits_newline_delimited_satelle_events() {
 }
 
 #[test]
-fn events_json_ends_run_and_steer_with_command_failed_when_wss_cannot_connect() {
+fn events_json_scopes_direct_daemon_unreachable_to_run_when_wss_cannot_connect() {
     let state = state_dir();
     let user_config = state.path().join("user-config.toml");
     let token_file = state.path().join("satelle.token");
@@ -1172,20 +1172,26 @@ api_token = {{ kind = "file", path = {token_path} }}
     )
     .expect("write direct Host config");
 
-    for arguments in [
-        vec![
-            "run".to_string(),
-            "--events".to_string(),
-            "json".to_string(),
-            "Open the browser".to_string(),
-        ],
-        vec![
-            "steer".to_string(),
-            SessionId::new().to_string(),
-            "--events".to_string(),
-            "json".to_string(),
-            "Continue".to_string(),
-        ],
+    for (arguments, expected_code) in [
+        (
+            vec![
+                "run".to_string(),
+                "--events".to_string(),
+                "json".to_string(),
+                "Open the browser".to_string(),
+            ],
+            "direct-daemon-unreachable",
+        ),
+        (
+            vec![
+                "steer".to_string(),
+                SessionId::new().to_string(),
+                "--events".to_string(),
+                "json".to_string(),
+                "Continue".to_string(),
+            ],
+            "host-unreachable",
+        ),
     ] {
         let output = production_satelle()
             .env("SATELLE_CONFIG_FILE", &user_config)
@@ -1207,7 +1213,7 @@ api_token = {{ kind = "file", path = {token_path} }}
         assert!(terminal["session_id"].is_null());
         assert!(terminal["turn_id"].is_null());
         assert!(terminal["state_subject"].is_null());
-        assert_eq!(terminal["data"]["code"], "host-unreachable");
+        assert_eq!(terminal["data"]["code"], expected_code);
         assert_eq!(terminal["data"]["admission_phase"], "not_admitted");
         assert!(terminal["data"]["session_id"].is_null());
         assert!(terminal["data"]["turn_id"].is_null());
@@ -1234,6 +1240,20 @@ api_token = {{ kind = "file", path = {token_path} }}
             1
         );
     }
+
+    let detached = production_satelle()
+        .env("SATELLE_CONFIG_FILE", &user_config)
+        .env("SATELLE_STATE_DIR", state.path())
+        .args(["run", "--detach", "--json", "Open the browser"])
+        .assert()
+        .code(69)
+        .get_output()
+        .clone();
+    assert!(detached.stdout.is_empty());
+    assert_eq!(
+        parse_json_output(&detached.stderr)["error"]["code"],
+        "direct-daemon-unreachable"
+    );
 }
 
 #[test]

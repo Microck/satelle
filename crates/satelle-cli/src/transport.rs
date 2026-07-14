@@ -266,7 +266,7 @@ impl TransportClient for DirectTransport {
         self.client
             .create_session(request, &Self::idempotency_key())
             .map(|response| response.session().clone())
-            .map_err(|error| direct_transport_error(&self.alias, error))
+            .map_err(|error| direct_run_transport_error(&self.alias, error))
     }
 
     fn steer(
@@ -390,6 +390,28 @@ fn direct_event_error(host: &str, error: DaemonEventError) -> SatelleError {
     }
 }
 
+// A direct run requires its daemon to be reachable before admission begins.
+// Keep this context-specific so steer and post-admission stream loss retain
+// the broader host-unreachable contract.
+fn direct_run_event_error(host: &str, error: DaemonEventError) -> SatelleError {
+    // A typed server control remains authoritative even when its close reason
+    // also describes a recoverable connection loss, such as a slow consumer.
+    if matches!(
+        &error,
+        DaemonEventError::Closed {
+            control: Some(_),
+            ..
+        }
+    ) {
+        return direct_event_error(host, error);
+    }
+    if error.is_recoverable_disconnect() {
+        SatelleError::direct_daemon_unreachable(host)
+    } else {
+        direct_event_error(host, error)
+    }
+}
+
 fn direct_transport_error(host: &str, error: DaemonClientError) -> SatelleError {
     match error {
         DaemonClientError::Api { error, .. } => map_api_error(host, &error),
@@ -415,6 +437,15 @@ fn direct_transport_error(host: &str, error: DaemonClientError) -> SatelleError 
         | DaemonClientError::ResponseRequestIdMismatch => {
             SatelleError::remote_api_error(host, "invalid-daemon-response")
         }
+    }
+}
+
+fn direct_run_transport_error(host: &str, error: DaemonClientError) -> SatelleError {
+    match error {
+        DaemonClientError::Transport(error) if error.is_connect() => {
+            SatelleError::direct_daemon_unreachable(host)
+        }
+        error => direct_transport_error(host, error),
     }
 }
 
@@ -491,6 +522,16 @@ fn direct_admission_error(host: &str, error: DaemonClientError) -> TurnAdmission
     } else {
         TurnAdmissionFailure::admission_unknown(error)
     }
+}
+
+fn direct_run_admission_error(host: &str, error: DaemonClientError) -> TurnAdmissionFailure {
+    // reqwest connect failures happen before the create-session request can
+    // reach the daemon, so this run is definitively not admitted. Every later
+    // transport phase retains the generic admission-unknown classification.
+    if matches!(&error, DaemonClientError::Transport(error) if error.is_connect()) {
+        return TurnAdmissionFailure::not_admitted(SatelleError::direct_daemon_unreachable(host));
+    }
+    direct_admission_error(host, error)
 }
 
 fn api_error_is_definitively_not_admitted(code: ApiErrorCode) -> bool {

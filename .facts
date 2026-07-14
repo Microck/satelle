@@ -1831,7 +1831,7 @@
 - satelle MVP may bootstrap or run the remote host component through SSH before persistent service installation is implemented @spec @mvp
 - satelle MVP starts the remote host component on demand instead of installing a persistent OS service by default @spec @mvp
 - satelle run automatically starts the on-demand Host Daemon for SSH bootstrap hosts when it is not already running @spec @mvp
-- satelle run requires an already reachable Host Daemon for direct transport hosts and reports a direct-daemon-unreachable error when none is available @spec @mvp
+- satelle run requires an already reachable Host Daemon for direct transport hosts and reports a direct-daemon-unreachable error when none is available @spec @mvp @implemented
 - satelle on-demand Host Daemon stays alive after a session ends for a short configurable idle timeout so follow-up commands can reuse it @spec @mvp
 - satelle on-demand Host Daemon default idle timeout is 10 minutes @spec @mvp
 - satelle on-demand Host Daemon idle timeout can be configured per host or profile @spec @mvp

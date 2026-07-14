@@ -1292,6 +1292,7 @@ pub enum ErrorCode {
     DaemonPathOverrideNotAbsolute,
     HostNotFound,
     HostUnreachable,
+    DirectDaemonUnreachable,
     CertificateUntrusted,
     CertificateHostnameMismatch,
     CertificateExpired,
@@ -1360,6 +1361,7 @@ impl ErrorCode {
             Self::DaemonPathOverrideNotAbsolute => "daemon-path-override-not-absolute",
             Self::HostNotFound => "host-not-found",
             Self::HostUnreachable => "host-unreachable",
+            Self::DirectDaemonUnreachable => "direct-daemon-unreachable",
             Self::CertificateUntrusted => "certificate-untrusted",
             Self::CertificateHostnameMismatch => "certificate-hostname-mismatch",
             Self::CertificateExpired => "certificate-expired",
@@ -1437,9 +1439,11 @@ impl ErrorCode {
             | Self::HostNotFound
             | Self::SessionNotFound
             | Self::LogsCursorExpired => 66,
-            Self::CapacityExceeded | Self::HostUnreachable | Self::HostBusy | Self::StoreInUse => {
-                69
-            }
+            Self::CapacityExceeded
+            | Self::HostUnreachable
+            | Self::DirectDaemonUnreachable
+            | Self::HostBusy
+            | Self::StoreInUse => 69,
             Self::CertificateUntrusted
             | Self::CertificateHostnameMismatch
             | Self::CertificateExpired
@@ -1880,6 +1884,20 @@ impl SatelleError {
         }
     }
 
+    pub fn direct_daemon_unreachable(alias: &str) -> Self {
+        let mut details = BTreeMap::new();
+        details.insert("host".to_string(), Value::String(alias.to_string()));
+        Self {
+            code: ErrorCode::DirectDaemonUnreachable,
+            message: format!("direct Host Daemon for host '{alias}' is not reachable"),
+            recovery_command: Some(format!(
+                "start the configured Host Daemon, then retry satelle run --host {alias}"
+            )),
+            source_detail: None,
+            details,
+        }
+    }
+
     pub fn authentication_failed(alias: &str) -> Self {
         host_access_error(
             ErrorCode::AuthenticationFailed,
@@ -2257,6 +2275,37 @@ impl SatelleError {
 #[cfg(test)]
 mod error_contract_tests {
     use super::*;
+
+    #[test]
+    fn direct_daemon_unreachable_has_a_stable_unreachable_host_contract() {
+        assert_eq!(
+            ErrorCode::DirectDaemonUnreachable.as_str(),
+            "direct-daemon-unreachable"
+        );
+        assert_eq!(
+            serde_json::to_value(ErrorCode::DirectDaemonUnreachable)
+                .expect("serialize direct daemon unreachable code"),
+            serde_json::json!("direct-daemon-unreachable")
+        );
+        assert_eq!(ErrorCode::DirectDaemonUnreachable.exit_code(), 69);
+
+        let error = SatelleError::direct_daemon_unreachable("remote");
+        assert_eq!(error.code, ErrorCode::DirectDaemonUnreachable);
+        assert_eq!(
+            error.message,
+            "direct Host Daemon for host 'remote' is not reachable"
+        );
+        assert_eq!(
+            error.recovery_command.as_deref(),
+            Some("start the configured Host Daemon, then retry satelle run --host remote")
+        );
+        assert_eq!(error.source_detail, None);
+        assert_eq!(
+            error.details,
+            BTreeMap::from([("host".to_string(), serde_json::json!("remote"))])
+        );
+        assert_eq!(error.exit_code(), 69);
+    }
 
     #[test]
     fn log_position_conflict_has_a_stable_usage_error_contract() {
