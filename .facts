@@ -929,7 +929,10 @@
 - clients reconcile status and normalized logs after any WebSocket disconnect or seq discontinuity @spec @mvp
 - WebSocket ping, pong, idle timeout, maximum message size, and outbound queue limits are advertised through authenticated capabilities @spec @mvp @implemented
 - authenticated capabilities advertise the maximum subscriptions per WebSocket and the inbound WebSocket message rate per API Principal @spec @mvp @implemented
-- exceeding a WebSocket subscription or inbound-message limit closes the connection with a typed capacity or rate-limit reason without affecting active Turns or other subscribers @spec @mvp
+- id: q82
+  label: exceeding a WebSocket subscription or inbound-message limit closes the connection with a typed capacity or rate-limit reason without affecting active Turns or other subscribers
+  command: cargo test --locked -p satelle-transport --test http events::limits::failing_sockets_do_not_interrupt_an_unrelated_live_subscriber -- --exact
+  tags: [spec, mvp, implemented, ci]
 - every inbound WebSocket text, binary, ping, or pong frame consumes the API Principal's inbound-message allowance, while a close frame may terminate without consuming allowance @spec @contract @mvp @implemented
 - WebSocket connection capacity and inbound-message limits both aggregate by the authenticated Principal reference rather than by bearer token id, so rotating or issuing another token cannot multiply one Principal's limits @spec @contract @mvp @implemented
 - satelle.ws.control.v1 protocol failures send a best-effort flat typed error control message containing an exact reason field and then a close frame whose ASCII reason token remains authoritative when the error message cannot be delivered @spec @contract @mvp
@@ -1773,7 +1776,10 @@
 - prompt execution after setup uses a durable scoped API token and never reuses an initial SSH bootstrap token @spec @mvp
 - Host Daemon API authentication is required for direct, loopback, Tailscale, and SSH-tunneled API connections @spec @mvp
 - SSH authentication and Tailscale identity do not replace Host Daemon API authentication or authorization @spec @mvp
-- an unauthenticated liveness endpoint may reveal only that the Host Daemon process is alive @spec @mvp
+- id: kyc
+  label: an unauthenticated liveness endpoint may reveal only that the Host Daemon process is alive
+  command: cargo test --locked -p satelle-transport --test http liveness_is_exact_and_reveals_no_protected_metadata -- --exact
+  tags: [spec, mvp, implemented, ci]
 - readiness details, versions, capabilities, Host Identity, and Session metadata require read scope @spec @mvp
 - satelle MVP does not support mTLS client certificate authentication for direct Host Daemon transport @spec @mvp
 - satelle later supports optional mutual TLS as defense in depth in addition to scoped bearer-token authentication and authorization @spec @later
