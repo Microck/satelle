@@ -1,6 +1,8 @@
 mod completions;
 mod logs;
+mod mcp;
 mod output;
+mod read;
 mod transport;
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
@@ -114,10 +116,19 @@ enum Command {
     Status(StatusCommand),
     Stop(StopCommand),
     Logs(LogsCommand),
+    Mcp {
+        #[command(subcommand)]
+        command: McpCommand,
+    },
     Support {
         #[command(subcommand)]
         command: SupportCommand,
     },
+}
+
+#[derive(Subcommand, Debug)]
+enum McpCommand {
+    Serve,
 }
 
 #[derive(Args, Debug)]
@@ -549,6 +560,9 @@ fn try_main() -> Result<(), CliFailure> {
         Command::Status(command) => show_status(command, config, output),
         Command::Stop(command) => stop_session(command, config, output),
         Command::Logs(command) => show_logs(command, config, output),
+        Command::Mcp {
+            command: McpCommand::Serve,
+        } => mcp::serve(profile.as_deref()),
         Command::Support { command } => run_support(command, output),
     }
 }
@@ -1165,43 +1179,7 @@ fn config_check(
     format: OutputFormat,
 ) -> Result<(), CliFailure> {
     let json = format.is_json();
-    let config = config_context.load(json)?;
-    let selected_profile = config
-        .selected_profile
-        .as_ref()
-        .map(|profile| profile.name.as_str());
-    let selected_profile_source = config
-        .selected_profile
-        .as_ref()
-        .map_or("default", |profile| profile.source.as_str());
-    let selected_host = config
-        .resolve_host(command.host.as_deref())
-        .map(|(alias, _)| alias)
-        .map_err(|error| failure(error, json))?;
-    let output = json!({
-        "schema_version": CONFIG_CHECK_SCHEMA_VERSION,
-        "status": "ok",
-        "mode": if command.all { "all" } else { "selected" },
-        "selected_host": selected_host,
-        "selected_profile": selected_profile,
-        "checked_files": [
-            config.user_config_path,
-            config.project_config_path,
-        ],
-        "checks": ["toml_parse", "host_resolution"],
-        "checked_contexts": [{
-            "host": selected_host,
-            "profile": selected_profile,
-            "source": selected_profile_source,
-            "status": "ok",
-            "checks": ["toml_parse", "host_resolution"],
-            "errors": [],
-            "not_checked": ["remote_host", "provider_auth", "native_computer_use"],
-        }],
-        "errors": [],
-        "not_checked": ["remote_host", "provider_auth", "native_computer_use"],
-        "recovery_commands": [],
-    });
+    let output = read::config_check_report(command.host, command.all, config_context, json)?;
 
     if json {
         print_json(&output).map_err(|error| failure(error, json))
@@ -1209,15 +1187,24 @@ fn config_check(
         println!("Config: ok");
         println!(
             "Mode: {}",
-            if command.all {
+            if output["mode"] == "all" {
                 "all-contexts"
             } else {
                 "selected-context"
             }
         );
-        println!("Host: {selected_host}");
-        println!("User config: {}", config.user_config_path.display());
-        println!("Project config: {}", config.project_config_path.display());
+        println!(
+            "Host: {}",
+            output["selected_host"].as_str().unwrap_or_default()
+        );
+        println!(
+            "User config: {}",
+            output["checked_files"][0].as_str().unwrap_or_default()
+        );
+        println!(
+            "Project config: {}",
+            output["checked_files"][1].as_str().unwrap_or_default()
+        );
         println!("Not checked: remote_host, provider_auth, native_computer_use");
         Ok(())
     }
@@ -1229,79 +1216,38 @@ fn config_explain(
     format: OutputFormat,
 ) -> Result<(), CliFailure> {
     let json = format.is_json();
-    let config = config_context.load(json)?;
-    let selected_profile = config
-        .selected_profile
-        .as_ref()
-        .map(|profile| profile.name.as_str());
-    let selected_profile_source = config
-        .selected_profile
-        .as_ref()
-        .map(|profile| profile.source.as_str());
-    let (selected_host, selected_host_config) = config
-        .resolve_host(command.host.as_deref())
-        .map_err(|error| failure(error, json))?;
-    let mut effective_config = config.config.clone();
-    effective_config
-        .hosts
-        .insert(selected_host.clone(), selected_host_config.clone());
-    let environment_sources = json!({
-        "host": env_source("SATELLE_HOST"),
-        "profile": env_source("SATELLE_PROFILE"),
-        "paths": {
-            "home": env_source("SATELLE_HOME"),
-            "config_file": env_source("SATELLE_CONFIG_FILE"),
-            "state_dir": env_source("SATELLE_STATE_DIR"),
-            "cache_dir": env_source("SATELLE_CACHE_DIR"),
-            "log_dir": env_source("SATELLE_LOG_DIR"),
-        },
-    });
-    let output = json!({
-        "schema_version": CONFIG_EXPLAIN_SCHEMA_VERSION,
-        "status": "ok",
-        "selected_host": selected_host,
-        "selected_profile": selected_profile,
-        "checked_files": [
-            config.user_config_path,
-            config.project_config_path,
-        ],
-        "sources": {
-            "defaults": true,
-            "user_config": config.user_config_path,
-            "project_config": config.project_config_path,
-            "profile": selected_profile_source,
-            "environment": environment_sources,
-            "flags": ["--host", "--profile"],
-        },
-        "effective": redacted_config_json(&effective_config, command.show_secret_references),
-        "values": {
-            "default_host": config.config.default_host,
-            "host_count": config.config.hosts.len(),
-            "effective_timeouts": effective_timeouts_json(&selected_host_config),
-            "daemon_path_overrides": daemon_path_overrides_json(&selected_host_config),
-            "model_provider": model_provider_config_json(&config, &selected_host),
-            "experimental_provider_computer_use": experimental_provider_computer_use_json(
-                &config,
-                &selected_host,
-                &selected_host_config,
-            ),
-            "yolo": yolo_config_json(&config, &selected_host, &selected_host_config),
-            "show_secret_references": command.show_secret_references,
-        },
-        "not_checked": ["remote_host", "provider_auth", "native_computer_use"],
-    });
+    let output = read::config_explain_report(
+        command.host,
+        command.show_secret_references,
+        config_context,
+        json,
+    )?;
 
     if json {
         print_json(&output).map_err(|error| failure(error, json))
     } else {
-        println!("Selected host: {selected_host}");
-        println!("User config: {}", config.user_config_path.display());
-        println!("Project config: {}", config.project_config_path.display());
+        println!(
+            "Selected host: {}",
+            output["selected_host"].as_str().unwrap_or_default()
+        );
+        println!(
+            "User config: {}",
+            output["checked_files"][0].as_str().unwrap_or_default()
+        );
+        println!(
+            "Project config: {}",
+            output["checked_files"][1].as_str().unwrap_or_default()
+        );
         println!(
             "Default host: {}",
-            config.config.default_host.unwrap_or_default()
+            output["values"]["default_host"]
+                .as_str()
+                .unwrap_or_default()
         );
-        println!("Host aliases: {}", config.config.hosts.len());
+        println!(
+            "Host aliases: {}",
+            output["values"]["host_count"].as_u64().unwrap_or_default()
+        );
         Ok(())
     }
 }
@@ -1652,35 +1598,44 @@ fn config_file_has_root_key(path: &std::path::Path, key: &str) -> bool {
 
 fn show_paths(command: PathsCommand, format: OutputFormat) -> Result<(), CliFailure> {
     let json = format.is_json();
-    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-    let selected_host = command.host.unwrap_or_else(|| LOCAL_DEMO_HOST.to_string());
-    let paths = resolve_path_set(&cwd).map_err(|error| failure(error, json))?;
-    let output = json!({
-        "schema_version": PATHS_SCHEMA_VERSION,
-        "host": selected_host,
-        "config_file": paths.config_file,
-        "cache_root": paths.cache_root,
-        "state_root": paths.state_root,
-        "sqlite_store": paths.sqlite_store,
-        "operator_log_root": paths.operator_log_root,
-        "recording_root": paths.recording_root,
-        "project_config_file": paths.project_config_file,
-        "install_receipt": paths.install_receipt,
-        "sources": paths.sources,
-    });
+    let output = read::paths_report(command.host, json)?;
 
     if json {
         print_json(&output).map_err(|error| failure(error, json))
     } else {
-        println!("Host: {selected_host}");
-        println!("Config: {}", paths.config_file.display());
-        println!("Cache: {}", paths.cache_root.display());
-        println!("State: {}", paths.state_root.display());
-        println!("SQLite: {}", paths.sqlite_store.display());
-        println!("Operator logs: {}", paths.operator_log_root.display());
-        println!("Recordings: {}", paths.recording_root.display());
-        println!("Project config: {}", paths.project_config_file.display());
-        println!("Install receipt: {}", paths.install_receipt.display());
+        println!("Host: {}", output["host"].as_str().unwrap_or_default());
+        println!(
+            "Config: {}",
+            output["config_file"].as_str().unwrap_or_default()
+        );
+        println!(
+            "Cache: {}",
+            output["cache_root"].as_str().unwrap_or_default()
+        );
+        println!(
+            "State: {}",
+            output["state_root"].as_str().unwrap_or_default()
+        );
+        println!(
+            "SQLite: {}",
+            output["sqlite_store"].as_str().unwrap_or_default()
+        );
+        println!(
+            "Operator logs: {}",
+            output["operator_log_root"].as_str().unwrap_or_default()
+        );
+        println!(
+            "Recordings: {}",
+            output["recording_root"].as_str().unwrap_or_default()
+        );
+        println!(
+            "Project config: {}",
+            output["project_config_file"].as_str().unwrap_or_default()
+        );
+        println!(
+            "Install receipt: {}",
+            output["install_receipt"].as_str().unwrap_or_default()
+        );
         Ok(())
     }
 }
@@ -1700,11 +1655,7 @@ fn run_host(
             Err(failure(error, json))
         }
         HostCommand::Status(command) => {
-            let host = config.resolve_host(command.host.as_deref(), json)?;
-            let transport = transport_for(&host, format)?;
-            let status = transport
-                .host_status()
-                .map_err(|error| failure(error, json))?;
+            let status = read::host_status(command.host.as_deref(), config, format)?;
             if json {
                 print_json(&status).map_err(|error| failure(error, json))
             } else {
@@ -1740,12 +1691,12 @@ fn show_host_sessions(
     format: OutputFormat,
 ) -> Result<(), CliFailure> {
     let json = format.is_json();
-    let host = config.resolve_host(command.host.as_deref(), json)?;
-    let transport = transport_for(&host, format)?;
-    let mut report = transport
-        .host_sessions(command.no_bootstrap)
-        .map_err(|error| failure(error, json))?;
-    apply_current_desktop_selection(&mut report, &host.config);
+    let report = read::host_sessions(
+        command.host.as_deref(),
+        command.no_bootstrap,
+        config,
+        format,
+    )?;
 
     if json {
         print_json(&report).map_err(|error| failure(error, json))
@@ -2174,18 +2125,13 @@ fn show_status(
     format: OutputFormat,
 ) -> Result<(), CliFailure> {
     let json = format.is_json();
-    let session_id =
-        SessionId::from_str(&command.session_id).map_err(|error| failure(error.into(), json))?;
-    let host = config.resolve_host(command.host.as_deref(), json)?;
-    let transport = transport_for(&host, format)?;
-    let session = transport
-        .status(&session_id)
-        .map_err(|error| failure(error, json))?;
+    let (session, host_alias) =
+        read::status(&command.session_id, command.host.as_deref(), config, format)?;
 
     if json {
-        print_json(&StatusReport::new(&session, &host.alias)).map_err(|error| failure(error, json))
+        print_json(&StatusReport::new(&session, &host_alias)).map_err(|error| failure(error, json))
     } else {
-        print_session_human(&session, latest_turn(&session), &host.alias);
+        print_session_human(&session, latest_turn(&session), &host_alias);
         Ok(())
     }
 }

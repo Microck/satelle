@@ -8,6 +8,10 @@ use uuid::{Uuid, Variant, Version};
 const SESSION_ID_PREFIX: &str = "rs_";
 const TURN_ID_PREFIX: &str = "rt_";
 
+/// JSON Schema pattern for the canonical public Session identifier format.
+pub const SESSION_ID_PATTERN: &str =
+    "^rs_[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$";
+
 /// Explains why a public Satelle identifier could not be parsed.
 ///
 /// The error deliberately does not retain the rejected input. Identifiers can

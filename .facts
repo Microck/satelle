@@ -805,13 +805,64 @@
 - Host Daemon run and steer HTTP operations always return after durable asynchronous Turn admission; attach and detach are Controller presentation behaviors and are excluded from the operation payload and idempotency digest @spec @contract @mvp
 
 ## mcp
-- satelle exposes a local MCP stdio server command for AI clients that speak JSON-RPC over stdin and stdout @spec @mvp
-- satelle MCP stdio server handles initialize, tools/list, and tools/call without requiring the AI client to know Satelle CLI argument syntax @spec @mvp
-- satelle MCP stdio server exposes read-only tools for config check, config explain, paths, status, logs, doctor, host status, and host sessions @spec @mvp
+- id: e8h
+  label: the exact command that starts the local Satelle MCP stdio server is `satelle mcp serve`
+  tags: [spec, contract, mvp, implemented]
+- satelle mcp serve reads newline-delimited JSON-RPC 2.0 messages from stdin and writes newline-delimited JSON-RPC 2.0 messages to stdout @spec @contract @mvp @implemented
+- satelle mcp serve accepts fragmented stdin writes and processes each complete newline-delimited JSON-RPC message exactly once @spec @contract @mvp @implemented
+- satelle mcp serve accepts at most 1048576 bytes before the newline delimiter of one JSON-RPC input message @spec @contract @mvp @implemented
+- satelle mcp serve enforces its 1 MiB input-message limit in bounded stdio framing before complete accepted messages are passed to rmcp for MCP and JSON-RPC protocol handling @spec @mvp @implemented
+- an MCP input message that exceeds 1048576 bytes before its newline delimiter shuts satelle mcp serve down with a deterministic nonzero exit code, a stderr diagnostic, and no additional stdout message @spec @contract @mvp @implemented
+- satelle mcp serve supports MCP protocol version 2025-06-18 @spec @contract @mvp @implemented
+- satelle mcp serve uses the Rust rmcp SDK to negotiate the mutually supported MCP protocol version returned by initialize instead of implementing Satelle-private negotiation behavior @spec @mvp @implemented
+- the satelle mcp serve initialize result uses `satelle` as serverInfo.name @spec @contract @mvp @implemented
+- the satelle mcp serve initialize result uses the Satelle executable package version as serverInfo.version @spec @contract @mvp @implemented
+- satelle mcp serve advertises the tools capability and does not advertise prompts, resources, or logging capabilities in its read-only MVP mode @spec @contract @mvp @implemented
+- `satelle --profile <name> mcp serve` selects one configuration profile for the lifetime of that MCP server process @spec @contract @mvp @implemented
+- satelle MCP read-only tool input schemas do not expose a per-call profile field @spec @contract @mvp @implemented
+- satelle MCP stdio server handles initialize, tools/list, and tools/call without requiring the AI client to know Satelle CLI argument syntax @spec @mvp @implemented
+- id: kh2
+  label: satelle MCP tools/list in read-only mode exposes exactly `config_check`, `config_explain`, `paths`, `status`, `logs`, `doctor`, `host_status`, and `host_sessions`
+  tags: [spec, contract, mvp, implemented]
+- every satelle MCP read-only tool inputSchema is a JSON Schema 2020-12 object schema with additionalProperties set to false @spec @contract @mvp @implemented
+- satelle MCP session_id and session inputs accept exactly the public Satelle Session ID grammar of rs_ followed by a canonical lowercase UUIDv7 @spec @contract @mvp @implemented
+- satelle MCP config_check inputSchema has no required fields and permits only an optional non-empty string host and an optional boolean all that defaults to false @spec @contract @mvp @implemented
+- satelle MCP config_explain inputSchema has no required fields and permits only an optional non-empty string host and an optional boolean show_secret_references that defaults to false @spec @contract @mvp @implemented
+- satelle MCP paths inputSchema has no required fields and permits only an optional non-empty string host @spec @contract @mvp @implemented
+- satelle MCP status inputSchema requires a session_id string satisfying the public Satelle Session ID grammar and permits only session_id plus an optional non-empty string host @spec @contract @mvp @implemented
+- satelle MCP logs inputSchema has no required fields and permits only host, session, tail, since, after, source, and level fields @spec @contract @mvp @implemented
+- satelle MCP logs host is a non-empty Host alias string, session satisfies the public Satelle Session ID grammar, tail is an integer from 1 through 10000, since is a duration or RFC 3339 string, and after is an opaque Log Cursor string @spec @contract @mvp @implemented
+- satelle MCP logs since accepts either an RFC 3339 timestamp or a relative-duration token made of one or more ASCII decimal digits whose value fits u64 immediately followed by ms, s, or m; zero is valid, while a leading sign, a fractional value, leading, internal, or trailing whitespace, a missing unit, and every other unit are rejected @spec @contract @mvp @implemented
+- satelle MCP logs source is an array whose items are host_daemon, storage, or codex_adapter and level is info, warn, or error with info as its default @spec @contract @mvp @implemented
+- satelle MCP logs rejects after combined with either since or tail and reads the most recent 200 matching entries when after, since, and tail are all absent @spec @contract @mvp @implemented
+- satelle MCP doctor inputSchema has no required fields and permits only an optional non-empty string host and an optional scope from transport, codex, computer-use, provider, config, or all @spec @contract @mvp @implemented
+- satelle MCP host_status inputSchema has no required fields and permits only an optional non-empty string host @spec @contract @mvp @implemented
+- a successful satelle MCP host_status result contains one text content block with the compact JSON serialization of exactly the current satelle host status --json payload: an object containing only running as a boolean, mode as a string, and sessions as a non-negative integer @spec @contract @mvp @implemented
+- satelle MCP host_status omits outputSchema and structuredContent until the host status command payload has a schema_version @spec @contract @mvp @implemented
+- satelle MCP host_sessions inputSchema has no required fields and permits only an optional non-empty string host @spec @contract @mvp @implemented
+- satelle MCP host_sessions always uses no-bootstrap behavior and never initiates SSH bootstrap when the configured direct Host connection is unavailable @spec @contract @mvp @implemented
 - satelle MCP stdio server exposes mutating tools for run, steer, stop, setup, repair, host update, and host lifecycle only when explicit MCP mutating-tool enablement is configured @spec @mvp
 - satelle MCP mutating tools preserve the same consent, --yes, YOLO, Trusted Profile, host-busy, readiness, and provider smoke-test rules as equivalent CLI commands @spec @mvp
-- satelle MCP tool results use Satelle JSON envelopes and typed Satelle errors instead of inventing MCP-only result shapes for the same operations @spec @mvp
-- satelle MCP server writes JSON-RPC protocol messages only to stdout and writes diagnostics only to stderr so AI clients can parse the stream safely @spec @mvp
+- id: wq0
+  label: each non-stream satelle MCP read-only tool whose canonical Satelle success result has a defined schema_version publishes an outputSchema whose top-level oneOf contains exactly that canonical success schema and the direct satelle.error.v1 schema, and every returned structuredContent conforms to one of those branches
+  tags: [spec, contract, mvp, implemented]
+- each successful non-stream satelle MCP read-only tool with a defined versioned result contains one text content block with the compact JSON serialization of the same object returned in structuredContent @spec @contract @mvp @implemented
+- each successful satelle MCP read-only tool result sets isError to false @spec @contract @mvp @implemented
+- a completed satelle MCP doctor call returns the complete satelle.doctor.v1 report in structuredContent even when readiness-blocking findings remain @spec @contract @mvp @implemented
+- a completed satelle MCP doctor call with readiness-blocking findings sets isError to true without replacing its satelle.doctor.v1 report with a satelle.error.v1 envelope @spec @contract @mvp @implemented
+- each completed satelle MCP doctor call contains one text content block with the compact JSON serialization of the same satelle.doctor.v1 report returned in structuredContent, including when readiness-blocking findings make isError true @spec @contract @mvp @implemented
+- each ordinary Satelle operational failure returned by tools/call sets structuredContent to the complete canonical direct satelle.error.v1 object containing schema_version, code, category, retryable, message, details, docs_url, and suggested_commands, with no outer error object or additional MCP-specific wrapper @spec @contract @mvp @implemented
+- each ordinary Satelle operational failure returned by tools/call contains one text content block with the compact JSON serialization of the same satelle.error.v1 envelope returned in structuredContent @spec @contract @mvp @implemented
+- a successful satelle MCP logs result contains one text content block with zero or more complete satelle.logs.entry.v1 JSON records separated and terminated by newline characters @spec @contract @mvp @implemented
+- a successful satelle MCP logs result omits structuredContent instead of inventing a logs collection wrapper that has no canonical Satelle schema @spec @contract @mvp @implemented
+- a satelle mcp serve request for an unknown JSON-RPC method returns the standard JSON-RPC method-not-found error code -32601 @spec @contract @mvp @implemented
+- a satelle MCP tools/call request for an unknown tool or arguments that do not satisfy the closed tool input schema returns the standard JSON-RPC invalid-params error code -32602 @spec @contract @mvp @implemented
+- Satelle configuration, transport, readiness, and operation failures are tools/call results with isError true and are never represented as JSON-RPC protocol errors @spec @contract @mvp @implemented
+- satelle MCP server writes JSON-RPC protocol messages only to stdout and writes diagnostics only to stderr so AI clients can parse the stream safely @spec @mvp @implemented
+- satelle mcp serve never writes a JSON-RPC response for a notification, including notifications/initialized, notifications/cancelled, and unknown notifications @spec @contract @mvp @implemented
+- satelle MCP MVP does not guarantee that notifications/cancelled stops an in-flight Satelle operation and permits rmcp to treat that notification as a no-op until operation-specific cancellation behavior is specified @spec @contract @mvp @implemented
+- stdin EOF after a completed MCP initialization shuts satelle mcp serve down with exit code 0 and no additional stdout message @spec @contract @mvp @implemented
+- stdin EOF before MCP initialization completes shuts satelle mcp serve down with a nonzero exit code, no additional stdout message, and a diagnostic on stderr @spec @contract @mvp @implemented
 - satelle exposes satelle mcp install as the AI client bootstrapper for configuring Satelle MCP server entries in supported local AI clients @spec @mvp
 - satelle mcp install supports --target <client>, --all, --server-name <name>, --satelle-path <path>, and --dry-run options @spec @mvp
 - satelle mcp install supports Claude Code, Claude Desktop, Codex, Cursor, VS Code, Windsurf, Gemini, OpenCode, Cline, Roo Code, Droid, and Antigravity as named Satelle AI Client Install Targets @spec @mvp

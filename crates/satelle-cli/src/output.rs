@@ -127,6 +127,7 @@ impl Command {
             Self::Status(command) => (command.output_args, EventOutput::None),
             Self::Stop(command) => (command.output_args, EventOutput::None),
             Self::Logs(command) => (command.output_args, EventOutput::None),
+            Self::Mcp { .. } => (OutputArgs::default(), EventOutput::None),
             Self::Support { command } => command.output_request(),
         }
     }

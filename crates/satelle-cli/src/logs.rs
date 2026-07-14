@@ -60,6 +60,30 @@ pub(crate) struct LogsCommand {
     pub(crate) output_args: OutputArgs,
 }
 
+pub(crate) struct LogReadRequest {
+    pub(crate) host: Option<String>,
+    pub(crate) session: Option<String>,
+    pub(crate) tail: Option<usize>,
+    pub(crate) since: Option<String>,
+    pub(crate) after: Option<String>,
+    pub(crate) source: Vec<String>,
+    pub(crate) level: Option<String>,
+}
+
+impl From<LogsCommand> for LogReadRequest {
+    fn from(command: LogsCommand) -> Self {
+        Self {
+            host: command.host,
+            session: command.session,
+            tail: command.tail,
+            since: command.since,
+            after: command.after,
+            source: command.source,
+            level: command.level,
+        }
+    }
+}
+
 #[derive(Clone, Copy)]
 enum LogPosition {
     Tail(usize),
@@ -76,7 +100,7 @@ struct LogReadPlan {
 }
 
 impl LogReadPlan {
-    fn resolve(command: &LogsCommand, json: bool) -> Result<Self, CliFailure> {
+    fn resolve(command: &LogReadRequest, json: bool) -> Result<Self, CliFailure> {
         if command.after.is_some() && command.since.is_some() {
             return Err(failure(
                 SatelleError::log_position_conflict("--since"),
@@ -195,10 +219,57 @@ impl LogReadPlan {
         }
     }
 
+    fn read(&self, transport: &dyn TransportClient) -> Result<Vec<DaemonLogEntry>, SatelleError> {
+        match self.position {
+            LogPosition::Tail(limit) => {
+                let query = self.query(
+                    LogPageQuery::tail(limit).expect("the validated tail Log limit is valid"),
+                );
+                Ok(transport.logs(&query)?.entries().to_vec())
+            }
+            LogPosition::After(cursor) => {
+                let query = self.query(
+                    LogPageQuery::forward(Some(cursor), DEFAULT_LOG_PAGE_LIMIT)
+                        .expect("the default forward Log limit is valid"),
+                );
+                Ok(transport.logs(&query)?.entries().to_vec())
+            }
+            LogPosition::SinceAll => self.read_since_snapshot(transport),
+        }
+    }
+
+    fn read_since_snapshot(
+        &self,
+        transport: &dyn TransportClient,
+    ) -> Result<Vec<DaemonLogEntry>, SatelleError> {
+        let mut entries = Vec::new();
+        self.visit_since_snapshot(transport, |page, snapshot| {
+            entries.extend(
+                page.iter()
+                    .take_while(|entry| entry.cursor() <= snapshot)
+                    .cloned(),
+            );
+            Ok(())
+        })?;
+        Ok(entries)
+    }
+
     fn emit_since_snapshot(
         &self,
         transport: &dyn TransportClient,
         format: OutputFormat,
+    ) -> Result<(), SatelleError> {
+        self.visit_since_snapshot(transport, |entries, snapshot| {
+            // Logs are record streams. If a later page fails, already-written complete records
+            // remain valid stdout while the command reports failure on stderr and exits nonzero.
+            write_entries(entries, Some(snapshot), format)
+        })
+    }
+
+    fn visit_since_snapshot(
+        &self,
+        transport: &dyn TransportClient,
+        mut visit: impl FnMut(&[DaemonLogEntry], LogCursor) -> Result<(), SatelleError>,
     ) -> Result<(), SatelleError> {
         // Capture one Host high-water boundary before paging. New entries may arrive while this
         // finite command runs, but they belong to a later invocation and cannot extend this read.
@@ -220,10 +291,7 @@ impl LogReadPlan {
                     .entries()
                     .last()
                     .is_some_and(|entry| entry.cursor() >= snapshot);
-
-            // Logs are record streams. If a later page fails, already-written complete records
-            // remain valid stdout while the command reports failure on stderr and exits nonzero.
-            write_entries(page.entries(), Some(snapshot), format)?;
+            visit(page.entries(), snapshot)?;
             if reached_snapshot {
                 return Ok(());
             }
@@ -238,11 +306,22 @@ pub(crate) fn show_logs(
     format: OutputFormat,
 ) -> Result<(), CliFailure> {
     let json = format.is_json();
-    let plan = LogReadPlan::resolve(&command, json)?;
-    let host = config.resolve_host(command.host.as_deref(), json)?;
+    let request = LogReadRequest::from(command);
+    let plan = LogReadPlan::resolve(&request, json)?;
+    let host = config.resolve_host(request.host.as_deref(), json)?;
     let transport = transport_for(&host, format)?;
     plan.emit(transport.as_ref(), format)
         .map_err(|error| failure(error, json))
+}
+
+pub(crate) fn read_logs_for_host(
+    request: &LogReadRequest,
+    host: &super::SelectedHost,
+) -> Result<Vec<DaemonLogEntry>, CliFailure> {
+    let plan = LogReadPlan::resolve(request, true)?;
+    let transport = transport_for(host, OutputFormat::Json)?;
+    plan.read(transport.as_ref())
+        .map_err(|error| failure(error, true))
 }
 
 fn write_entries(

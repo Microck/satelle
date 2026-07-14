@@ -122,6 +122,28 @@ impl Drop for DirectFixture {
 }
 
 #[test]
+fn direct_host_sessions_read_daemon_metadata_without_bootstrap() {
+    let fixture = DirectFixture::start();
+    let local = fixture
+        .service
+        .host_sessions(LOCAL_DEMO_HOST, true)
+        .expect("read local Host desktop sessions");
+
+    let direct = fixture
+        .transport()
+        .host_sessions(true)
+        .expect("read desktop sessions through direct transport");
+
+    assert_eq!(direct.schema_version, HostSessionsSchemaVersion::V1);
+    assert_eq!(direct.host, "direct-test");
+    assert_eq!(direct.connection_mode, "direct");
+    assert!(!direct.bootstrapped);
+    assert!(direct.bootstrap_actions.is_empty());
+    assert_eq!(direct.host_daemon_version, env!("CARGO_PKG_VERSION"));
+    assert_eq!(direct.sessions, local.sessions);
+}
+
+#[test]
 fn local_and_direct_logs_return_the_same_authoritative_page() {
     let fixture = DirectFixture::start();
     let appended = fixture
