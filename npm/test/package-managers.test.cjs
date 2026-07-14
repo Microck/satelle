@@ -43,6 +43,56 @@ const packageManagers = [
   },
 ];
 
+const oneShotRunners = [
+  {
+    name: "npm exec",
+    requiredManager: "npm",
+    executable: process.platform === "win32" ? "npm.cmd" : "npm",
+    arguments: (packageReference, commandArguments) => [
+      "exec",
+      `--package=${packageReference}`,
+      "--",
+      "satelle",
+      ...commandArguments,
+    ],
+  },
+  {
+    name: "npx",
+    requiredManager: "npm",
+    executable: process.platform === "win32" ? "npx.cmd" : "npx",
+    arguments: (packageReference, commandArguments) => [
+      `--package=${packageReference}`,
+      "--",
+      "satelle",
+      ...commandArguments,
+    ],
+  },
+  {
+    name: "pnpm dlx",
+    requiredManager: "pnpm",
+    executable: process.platform === "win32" ? "pnpm.cmd" : "pnpm",
+    arguments: (packageReference, commandArguments) => [
+      "dlx",
+      "--package",
+      packageReference,
+      "satelle",
+      ...commandArguments,
+    ],
+  },
+  {
+    name: "bunx",
+    requiredManager: "bun",
+    executable: process.platform === "win32" ? "bunx.exe" : "bunx",
+    arguments: (packageReference, commandArguments) => [
+      "--silent",
+      "--package",
+      packageReference,
+      "satelle",
+      ...commandArguments,
+    ],
+  },
+];
+
 function spawnCommand(executable, arguments_, options = {}) {
   return spawnSync(
     executable,
@@ -134,7 +184,8 @@ function stagePackages(fixtureRoot) {
   const unscopedManifest = readJson(path.join(unscopedRoot, "package.json"));
   unscopedManifest.dependencies["@microck/satelle"] = localTarballReference(canonicalArtifact);
   writeJson(path.join(unscopedRoot, "package.json"), unscopedManifest);
-  return packFixturePackage(unscopedRoot, packsRoot);
+  const unscopedArtifact = packFixturePackage(unscopedRoot, packsRoot);
+  return { canonicalArtifact, unscopedArtifact };
 }
 
 function installedBin(consumerRoot) {
@@ -147,7 +198,7 @@ function installedBin(consumerRoot) {
 test("npm, pnpm, and Bun install and execute the unscoped forwarding package", (context) => {
   const fixtureRoot = mkdtempSync(path.join(tmpdir(), "satelle-package-managers-"));
   context.after(() => rmSync(fixtureRoot, { recursive: true, force: true }));
-  const unscopedArtifact = stagePackages(fixtureRoot);
+  const { unscopedArtifact } = stagePackages(fixtureRoot);
   const requiredManagers = new Set(
     (process.env.SATELLE_REQUIRED_PACKAGE_MANAGERS || "npm")
       .split(",")
@@ -234,5 +285,71 @@ test("npm, pnpm, and Bun install and execute the unscoped forwarding package", (
         : new RegExp(`${packageManager.name} add satelle`),
       packageManager.name,
     );
+  }
+});
+
+test("npm exec, npx, pnpm dlx, and bunx execute the canonical package", (context) => {
+  const fixtureRoot = mkdtempSync(path.join(tmpdir(), "satelle-one-shot-"));
+  context.after(() => rmSync(fixtureRoot, { recursive: true, force: true }));
+  const { canonicalArtifact } = stagePackages(fixtureRoot);
+  const packageReference = localTarballReference(canonicalArtifact);
+  const requiredManagers = new Set(
+    (process.env.SATELLE_REQUIRED_PACKAGE_MANAGERS || "npm")
+      .split(",")
+      .map((name) => name.trim())
+      .filter(Boolean),
+  );
+  const probeScript = path.join(fixtureRoot, "native-probe.cjs");
+  const stderrSentinel = "satelle-native-stderr";
+  writeFileSync(
+    probeScript,
+    `process.stderr.write(${JSON.stringify(stderrSentinel)}); process.stdout.write(JSON.stringify(process.argv.slice(2))); process.exit(23);\n`,
+  );
+
+  for (const runner of oneShotRunners) {
+    const available = commandIsAvailable(runner);
+    if (!available) {
+      assert.equal(
+        requiredManagers.has(runner.requiredManager),
+        false,
+        `${runner.name} is required but is not installed`,
+      );
+      continue;
+    }
+
+    const runnerRoot = path.join(fixtureRoot, runner.name.replaceAll(" ", "-"));
+    const tempRoot = path.join(runnerRoot, "tmp");
+    mkdirSync(tempRoot, { recursive: true });
+    const expectedArguments = [runner.name, "value with spaces", "--looks-like-an-option"];
+    const execution = spawnCommand(
+      runner.executable,
+      runner.arguments(packageReference, [probeScript, ...expectedArguments]),
+      {
+        cwd: runnerRoot,
+        encoding: "utf8",
+        env: {
+          ...process.env,
+          BUN_CONFIG_REGISTRY: "http://127.0.0.1:9/",
+          BUN_INSTALL_CACHE_DIR: path.join(runnerRoot, "bun-cache"),
+          NO_COLOR: "1",
+          TEMP: tempRoot,
+          TMP: tempRoot,
+          TMPDIR: tempRoot,
+          npm_config_cache: path.join(runnerRoot, "npm-cache"),
+          npm_config_loglevel: "error",
+          npm_config_registry: "http://127.0.0.1:9/",
+          PNPM_CONFIG_REGISTRY: "http://127.0.0.1:9/",
+          PNPM_CONFIG_REPORTER: "silent",
+          pnpm_config_store_dir: path.join(runnerRoot, "pnpm-store"),
+        },
+      },
+    );
+    assert.equal(
+      execution.status,
+      23,
+      `${runner.name} execution failed\n${execution.stdout}\n${execution.stderr}`,
+    );
+    assert.equal(execution.stdout, JSON.stringify(expectedArguments), runner.name);
+    assert.equal(execution.stderr, stderrSentinel, runner.name);
   }
 });
