@@ -374,9 +374,12 @@ struct SatelleEventOwned {
     #[serde(with = "time::serde::rfc3339")]
     timestamp: OffsetDateTime,
     seq: u64,
+    #[serde(deserialize_with = "Option::deserialize")]
     session_id: Option<SessionId>,
+    #[serde(deserialize_with = "Option::deserialize")]
     turn_id: Option<TurnId>,
     host: String,
+    #[serde(deserialize_with = "Option::deserialize")]
     state_subject: Option<EventStateSubject>,
     message: String,
     data: Value,
@@ -514,6 +517,26 @@ mod tests {
             serde_json::to_value(event).expect("encode command failure"),
             wire
         );
+    }
+
+    #[test]
+    fn satelle_event_v2_requires_nullable_subject_fields() {
+        for field in ["session_id", "turn_id", "state_subject"] {
+            let mut wire = valid_command_failed_event();
+            let event = wire
+                .as_object_mut()
+                .expect("command_failed fixture is an Event object");
+            assert!(
+                event.remove(field).is_some(),
+                "fixture must contain nullable field {field}"
+            );
+            assert!(!event.contains_key(field), "mutation must remove {field}");
+
+            assert!(
+                serde_json::from_value::<SatelleEvent>(wire).is_err(),
+                "omitted nullable field {field} must be rejected"
+            );
+        }
     }
 
     #[test]
