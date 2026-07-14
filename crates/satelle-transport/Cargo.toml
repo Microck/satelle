@@ -25,3 +25,4 @@ zeroize.workspace = true
 [dev-dependencies]
 rcgen = "=0.14.8"
 satelle-host = { path = "../satelle-host", features = ["test-support"] }
+tokio-rustls = "0.26.4"

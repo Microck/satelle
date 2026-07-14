@@ -7,7 +7,10 @@
 - Satelle keeps authoritative Host, Session, Turn, and diagnostic state on Operator-controlled machines unless the Operator explicitly exports an artifact @spec @mvp
 - Satelle's primary successful-use journey configures and trusts one Host, completes satelle setup --verify, runs one attached Turn to completion and captures its reusable Session identifier, reconnects a fresh Client, reads current status, starts one detached steer Turn on the same Session, stops that active Turn, and confirms the stopped state through status @spec @mvp
 - Satelle public MVP acceptance requires the primary successful-use journey and recovery after client reconnect to pass end to end on every declared MVP Computer Use Host Platform @spec @mvp @release-gate @verification
-- Satelle public MVP acceptance requires the same public Session, error, and event contracts across SSH-tunneled and direct transports @spec @mvp @release-gate @verification
+- id: 0jf
+  label: Satelle public MVP acceptance requires the same public Session, error, and event contracts across SSH-tunneled and direct transports
+  command: cargo test --locked -p satelle-transport --test http conformance::direct_and_established_ssh_tunnel_share_session_error_and_event_contracts -- --exact
+  tags: [spec, mvp, release-gate, verification, implemented, ci]
 
 # domain
 - a Satelle Bridge is a self-hosted control plane that orchestrates native Computer Use through a compatible upstream agent runtime instead of implementing screenshot and input automation itself @spec @mvp
@@ -2242,7 +2245,7 @@
   tags: [spec, verification, mvp, implemented, ci]
 - id: imt
   label: direct and SSH-tunneled Host Daemon transports pass one shared API and Session conformance suite
-  command: cargo test --locked -p satelle-transport --test http conformance::direct_and_established_ssh_tunnel_share_api_and_session_contract -- --exact
+  command: cargo test --locked -p satelle-transport --test http conformance::direct_and_established_ssh_tunnel_share_session_error_and_event_contracts -- --exact
   tags: [spec, verification, mvp, implemented, ci]
 - label: concurrent admission tests prove that one Control Lease cannot create two active Turns across processes
   command: cargo test --locked -p satelle-host --lib storage::tests::security::control_lease_process::cross_process_control_lease_blocks_competing_turn_after_owner_handoff -- --exact
