@@ -2153,7 +2153,10 @@
 - satelle workflow_dispatch release runs do not publish public npm packages or final GitHub release assets in MVP @spec @mvp
 - satelle release archives use the canonical name satelle-v<version>-<target>.tar.gz on Unix targets and satelle-v<version>-<target>.zip on Windows targets @spec @mvp
 - satelle release workflow publishes SHA-256 digests for every release archive in a canonical SHA256SUMS manifest @spec @mvp
-- every Satelle release archive contains exactly one executable at its root, named satelle on Unix and satelle.exe on Windows @spec @contract @mvp
+- id: 3ha
+  label: every Satelle release archive contains exactly one executable at its root, named satelle on Unix and satelle.exe on Windows
+  command: cargo test --locked -p satelle-cli --test release-archive-contract release_archives_require_one_expected_root_executable -- --exact
+  tags: [spec, contract, mvp, implemented, ci]
 - release validation extracts every archive and verifies executable name, root layout, executable mode where applicable, reported version, target identity, and digest before publication @spec @release-gate @verification @mvp
 - release validation checks the archive target against its expected matrix entry through archive naming plus binary format, architecture, and libc-family inspection where applicable instead of trusting archive naming alone @spec @release-gate @verification @mvp
 - before npm publication, satelle release validation extracts every version-matched GitHub release archive and compares its native executable digest with the executable embedded in the corresponding platform-specific npm package, rejecting any mismatch @spec @release-gate @verification @mvp
