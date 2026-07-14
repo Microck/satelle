@@ -63,6 +63,7 @@ assert_cmd = "2.1.1"
 flate2 = "1.1.9"
 jsonschema = { version = "0.47.0", default-features = false }
 predicates = "3.1.3"
+satelle-test-contract = { path = "../satelle-test-contract" }
 serde_json.workspace = true
 tar = { version = "0.4.46", default-features = false }
 tokio-tungstenite.workspace = true

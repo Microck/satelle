@@ -1,17 +1,7 @@
 use assert_cmd::Command;
-use serde_json::{Value, json};
+use satelle_test_contract::{assert_error_process, assert_human_error, assert_json_error};
 
 const ERROR_FORMAT_ENV: &str = "SATELLE_ERROR_FORMAT";
-const ERROR_KEYS: [&str; 8] = [
-    "category",
-    "code",
-    "details",
-    "docs_url",
-    "message",
-    "retryable",
-    "schema_version",
-    "suggested_commands",
-];
 
 fn satelle() -> Command {
     let mut command = Command::cargo_bin("satelle").expect("satelle binary should build");
@@ -31,45 +21,6 @@ fn satelle() -> Command {
     command
 }
 
-fn assert_json_error(stderr: &[u8], expected_code: &str, expected_suggestions: &[&str]) -> Value {
-    let report: Value = serde_json::from_slice(stderr).expect("stderr should be one JSON value");
-    let object = report
-        .as_object()
-        .expect("the JSON error envelope should be an object");
-    let mut keys = object.keys().map(String::as_str).collect::<Vec<_>>();
-    keys.sort_unstable();
-    assert_eq!(keys, ERROR_KEYS);
-    assert_eq!(report["schema_version"], "satelle.error.v1");
-    assert_eq!(report["code"], expected_code);
-    assert_eq!(report["category"], "invalid_request");
-    assert_eq!(report["retryable"], false);
-    assert!(
-        report["message"]
-            .as_str()
-            .is_some_and(|value| !value.is_empty())
-    );
-    assert_eq!(report["details"], Value::Null);
-    assert_eq!(report["docs_url"], Value::Null);
-    assert_eq!(report["suggested_commands"], json!(expected_suggestions));
-
-    let raw = String::from_utf8_lossy(stderr);
-    assert!(
-        !raw.contains('\u{1b}'),
-        "JSON errors must not contain ANSI escapes"
-    );
-    assert!(
-        !raw.starts_with("error:"),
-        "JSON errors must not use human framing"
-    );
-    report
-}
-
-fn assert_human_error(stderr: &[u8]) {
-    let raw = String::from_utf8_lossy(stderr);
-    assert!(raw.starts_with("error: invalid-usage\n"));
-    assert!(!raw.trim_start().starts_with('{'));
-}
-
 #[test]
 fn unknown_commands_default_to_typed_human_errors() {
     let output = satelle()
@@ -80,7 +31,7 @@ fn unknown_commands_default_to_typed_human_errors() {
         .clone();
 
     assert!(output.stdout.is_empty());
-    assert_human_error(&output.stderr);
+    assert_human_error(&output.stderr, "invalid-usage");
     assert!(String::from_utf8_lossy(&output.stderr).contains("unknown-command"));
 }
 
@@ -117,7 +68,7 @@ fn explicit_error_format_has_precedence_over_environment_and_result_selectors() 
         .get_output()
         .clone();
     assert!(human.stdout.is_empty());
-    assert_human_error(&human.stderr);
+    assert_human_error(&human.stderr, "invalid-usage");
 
     let json = satelle()
         .env(ERROR_FORMAT_ENV, "human")
@@ -154,41 +105,46 @@ fn unparsed_and_positional_machine_selectors_do_not_choose_json() {
         let output = satelle().args(args).assert().failure().get_output().clone();
 
         assert!(output.stdout.is_empty());
-        assert_human_error(&output.stderr);
+        assert_human_error(&output.stderr, "invalid-usage");
     }
 }
 
-#[test]
-fn parser_and_semantic_usage_failures_share_the_json_contract_and_status() {
-    let parser = satelle()
-        .args(["--error-format", "json", "completions", "nushell"])
-        .assert()
-        .failure()
-        .get_output()
-        .clone();
-    let semantic = satelle()
-        .args([
-            "--error-format",
-            "json",
-            "paths",
-            "--json",
-            "--format",
-            "human",
-        ])
-        .assert()
-        .failure()
-        .get_output()
-        .clone();
+fn usage_failure(args: &[&str]) -> std::process::Output {
+    satelle().args(args).assert().failure().get_output().clone()
+}
 
-    assert!(parser.stdout.is_empty());
-    assert!(semantic.stdout.is_empty());
-    assert_eq!(parser.status, semantic.status);
-    assert_json_error(&parser.stderr, "invalid-usage", &["satelle --help"]);
-    assert_json_error(
-        &semantic.stderr,
-        "output-mode-conflict",
-        &["remove all but one conflicting output selector"],
+#[test]
+fn parser_and_semantic_usage_failures_share_the_human_and_json_contract_and_status() {
+    let parser = usage_failure(&["completions", "nushell"]);
+    let semantic = usage_failure(&["self", "update", "--host", "remote"]);
+
+    assert_error_process(&parser);
+    assert_error_process(&semantic);
+    assert_eq!(
+        parser.status, semantic.status,
+        "parser and semantic human errors must share an exit status"
     );
+    assert_human_error(&parser.stderr, "invalid-usage");
+    assert_human_error(&semantic.stderr, "invalid-usage");
+
+    let parser = usage_failure(&["--error-format", "json", "completions", "nushell"]);
+    let semantic = usage_failure(&[
+        "--error-format",
+        "json",
+        "self",
+        "update",
+        "--host",
+        "remote",
+    ]);
+
+    assert_error_process(&parser);
+    assert_error_process(&semantic);
+    assert_eq!(
+        parser.status, semantic.status,
+        "parser and semantic JSON errors must share an exit status"
+    );
+    assert_json_error(&parser.stderr, "invalid-usage", &["satelle --help"]);
+    assert_json_error(&semantic.stderr, "invalid-usage", &["satelle --help"]);
 }
 
 #[test]

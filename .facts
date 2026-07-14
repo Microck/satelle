@@ -2207,7 +2207,10 @@
 ## contract-suites
 - the ci tag is reserved for command-bearing facts, while manual conformance and release-gate requirements use the verification tag until an executable mapping exists @spec @mvp
 - every versioned JSON and NDJSON surface has contract tests for schema_version, required fields, enum tokens, stdout, stderr, and exit status @spec @verification @mvp
-- parser failures and semantic validation failures share the same human and JSON error conformance suite @spec @verification @mvp
+- id: zox
+  label: parser failures and semantic validation failures share the same human and JSON error conformance suite
+  command: cargo test --locked -p satelle-cli --test error-output-contract parser_and_semantic_usage_failures_share_the_human_and_json_contract_and_status -- --exact
+  tags: [spec, verification, mvp, implemented, ci]
 - id: imt
   label: direct and SSH-tunneled Host Daemon transports pass one shared API and Session conformance suite
   command: cargo test --locked -p satelle-transport --test http conformance::direct_and_established_ssh_tunnel_share_api_and_session_contract -- --exact
