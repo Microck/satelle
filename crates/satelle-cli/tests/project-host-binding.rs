@@ -35,9 +35,9 @@ address = "https://attacker.example.test"
         .get_output()
         .clone();
     let error = parse_json(&output.stderr);
-    assert_eq!(error["error"]["code"], "project-host-binding-not-allowed");
-    assert_eq!(error["error"]["path"], "hosts.remote.address");
-    assert_eq!(error["error"]["key"], "address");
+    assert_eq!(error["code"], "project-host-binding-not-allowed");
+    assert_eq!(error["details"]["path"], "hosts.remote.address");
+    assert_eq!(error["details"]["key"], "address");
 }
 
 #[test]
@@ -112,15 +112,15 @@ variable = "ATTACKER_API_KEY"
             .clone();
         let error = parse_json(&output.stderr);
         assert_eq!(
-            error["error"]["code"], expected_code,
+            error["code"], expected_code,
             "unexpected error code for {key}"
         );
         assert_eq!(
-            error["error"]["path"],
+            error["details"]["path"],
             format!("hosts.attacker.{key}"),
             "unexpected path for {key}"
         );
-        assert_eq!(error["error"]["key"], key, "unexpected key for {key}");
+        assert_eq!(error["details"]["key"], key, "unexpected key for {key}");
     }
 }
 
@@ -195,21 +195,23 @@ transport = "direct"
         .get_output()
         .clone();
     let error = parse_json(&output.stderr);
-    assert_eq!(error["error"]["code"], "project-host-binding-not-allowed");
-    let reported_file =
-        assert_same_file(&error["error"]["file"], &fixture.resolved_project_config());
-    assert_eq!(error["error"]["path"], "hosts.remote.transport");
-    assert_eq!(error["error"]["key"], "transport");
-    assert_eq!(error["error"]["scope"], "project");
-    assert_eq!(error["error"]["host"], "remote");
-    assert_eq!(error["error"]["project_transport"], "direct");
-    assert_eq!(error["error"]["trusted_transport"], "local");
+    assert_eq!(error["code"], "project-host-binding-not-allowed");
+    let reported_file = assert_same_file(
+        &error["details"]["file"],
+        &fixture.resolved_project_config(),
+    );
+    assert_eq!(error["details"]["path"], "hosts.remote.transport");
+    assert_eq!(error["details"]["key"], "transport");
+    assert_eq!(error["details"]["scope"], "project");
+    assert_eq!(error["details"]["host"], "remote");
+    assert_eq!(error["details"]["project_transport"], "direct");
+    assert_eq!(error["details"]["trusted_transport"], "local");
     assert_eq!(
-        error["error"]["recovery_command"],
-        format!(
+        error["suggested_commands"],
+        serde_json::json!([format!(
             "remove hosts.remote.transport from {} or set it to \"local\" to match the trusted Host Binding",
             reported_file
-        )
+        )])
     );
 }
 
@@ -231,28 +233,34 @@ transport = "local"
         .get_output()
         .clone();
     let error = parse_json(&output.stderr);
-    assert_eq!(error["error"]["code"], "host-not-found");
-    assert_same_file(&error["error"]["file"], &fixture.resolved_project_config());
-    assert_eq!(error["error"]["path"], "hosts.local-demo");
+    assert_eq!(error["code"], "host-not-found");
     assert_same_file(
-        &error["error"]["reference_file"],
+        &error["details"]["file"],
         &fixture.resolved_project_config(),
     );
-    assert_eq!(error["error"]["reference_path"], "hosts.local-demo");
-    assert_eq!(error["error"]["host"], "local-demo");
-    assert_eq!(error["error"]["scope"], "project");
-    assert_same_file(&error["error"]["binding_file"], fixture.user_config_path());
-    assert_eq!(error["error"]["binding_path"], "hosts.local-demo");
+    assert_eq!(error["details"]["path"], "hosts.local-demo");
+    assert_same_file(
+        &error["details"]["reference_file"],
+        &fixture.resolved_project_config(),
+    );
+    assert_eq!(error["details"]["reference_path"], "hosts.local-demo");
+    assert_eq!(error["details"]["host"], "local-demo");
+    assert_eq!(error["details"]["scope"], "project");
+    assert_same_file(
+        &error["details"]["binding_file"],
+        fixture.user_config_path(),
+    );
+    assert_eq!(error["details"]["binding_path"], "hosts.local-demo");
     assert_eq!(
-        error["error"]["user_config_file"],
+        error["details"]["user_config_file"],
         fixture.user_config_path().display().to_string()
     );
     assert_eq!(
-        error["error"]["recovery_command"],
-        format!(
+        error["suggested_commands"],
+        serde_json::json!([format!(
             "configure hosts.local-demo in user-level config {}; set hosts.local-demo.allow_project_selection = true there when the project selects this host implicitly",
             fixture.user_config_path().display()
-        )
+        )])
     );
 }
 
@@ -269,28 +277,34 @@ fn project_default_host_requires_an_existing_trusted_binding() {
             .get_output()
             .clone();
         let error = parse_json(&output.stderr);
-        assert_eq!(error["error"]["code"], "host-not-found");
-        assert_same_file(&error["error"]["file"], &fixture.resolved_project_config());
-        assert_eq!(error["error"]["path"], "default_host");
+        assert_eq!(error["code"], "host-not-found");
         assert_same_file(
-            &error["error"]["reference_file"],
+            &error["details"]["file"],
             &fixture.resolved_project_config(),
         );
-        assert_eq!(error["error"]["reference_path"], "default_host");
-        assert_eq!(error["error"]["host"], alias);
-        assert_eq!(error["error"]["scope"], "project");
-        assert_same_file(&error["error"]["binding_file"], fixture.user_config_path());
-        assert_eq!(error["error"]["binding_path"], format!("hosts.{alias}"));
+        assert_eq!(error["details"]["path"], "default_host");
+        assert_same_file(
+            &error["details"]["reference_file"],
+            &fixture.resolved_project_config(),
+        );
+        assert_eq!(error["details"]["reference_path"], "default_host");
+        assert_eq!(error["details"]["host"], alias);
+        assert_eq!(error["details"]["scope"], "project");
+        assert_same_file(
+            &error["details"]["binding_file"],
+            fixture.user_config_path(),
+        );
+        assert_eq!(error["details"]["binding_path"], format!("hosts.{alias}"));
         assert_eq!(
-            error["error"]["user_config_file"],
+            error["details"]["user_config_file"],
             fixture.user_config_path().display().to_string()
         );
         assert_eq!(
-            error["error"]["recovery_command"],
-            format!(
+            error["suggested_commands"],
+            serde_json::json!([format!(
                 "configure hosts.{alias} in user-level config {}; set hosts.{alias}.allow_project_selection = true there when the project selects this host implicitly",
                 fixture.user_config_path().display()
-            )
+            )])
         );
     }
 }
@@ -314,18 +328,24 @@ host = "{alias}"
             .get_output()
             .clone();
         let error = parse_json(&output.stderr);
-        assert_eq!(error["error"]["code"], "host-not-found");
-        assert_same_file(&error["error"]["file"], &fixture.resolved_project_config());
-        assert_eq!(error["error"]["path"], "profile");
+        assert_eq!(error["code"], "host-not-found");
         assert_same_file(
-            &error["error"]["reference_file"],
+            &error["details"]["file"],
             &fixture.resolved_project_config(),
         );
-        assert_eq!(error["error"]["reference_path"], "profile");
-        assert_eq!(error["error"]["host"], alias);
-        assert_eq!(error["error"]["scope"], "project");
-        assert_same_file(&error["error"]["binding_file"], fixture.user_config_path());
-        assert_eq!(error["error"]["binding_path"], format!("hosts.{alias}"));
+        assert_eq!(error["details"]["path"], "profile");
+        assert_same_file(
+            &error["details"]["reference_file"],
+            &fixture.resolved_project_config(),
+        );
+        assert_eq!(error["details"]["reference_path"], "profile");
+        assert_eq!(error["details"]["host"], alias);
+        assert_eq!(error["details"]["scope"], "project");
+        assert_same_file(
+            &error["details"]["binding_file"],
+            fixture.user_config_path(),
+        );
+        assert_eq!(error["details"]["binding_path"], format!("hosts.{alias}"));
     }
 }
 
@@ -356,12 +376,9 @@ native_readiness = "3s"
         .get_output()
         .clone();
     let denied = parse_json(&denied.stderr);
-    assert_eq!(
-        denied["error"]["code"],
-        "project-host-selection-not-allowed"
-    );
-    assert_eq!(denied["error"]["host"], "remote");
-    assert_eq!(denied["error"]["selection_source"], "project");
+    assert_eq!(denied["code"], "project-host-selection-not-allowed");
+    assert_eq!(denied["details"]["host"], "remote");
+    assert_eq!(denied["details"]["selection_source"], "project");
 
     let explicit = fixture
         .command()
@@ -414,7 +431,7 @@ profile = "remote-profile"
         .get_output()
         .clone();
     assert_eq!(
-        parse_json(&denied.stderr)["error"]["code"],
+        parse_json(&denied.stderr)["code"],
         "project-host-selection-not-allowed"
     );
 
@@ -452,9 +469,9 @@ allow_project_selection = true
         .get_output()
         .clone();
     let error = parse_json(&output.stderr);
-    assert_eq!(error["error"]["code"], "project-host-selection-not-allowed");
+    assert_eq!(error["code"], "project-host-selection-not-allowed");
     assert_eq!(
-        error["error"]["path"],
+        error["details"]["path"],
         "hosts.remote.allow_project_selection"
     );
 }

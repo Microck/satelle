@@ -100,21 +100,18 @@ struct LogReadPlan {
 }
 
 impl LogReadPlan {
-    fn resolve(command: &LogReadRequest, json: bool) -> Result<Self, CliFailure> {
+    fn resolve(command: &LogReadRequest) -> Result<Self, CliFailure> {
         if command.after.is_some() && command.since.is_some() {
-            return Err(failure(
-                SatelleError::log_position_conflict("--since"),
-                json,
-            ));
+            return Err(failure(SatelleError::log_position_conflict("--since")));
         }
         if command.after.is_some() && command.tail.is_some() {
-            return Err(failure(SatelleError::log_position_conflict("--tail"), json));
+            return Err(failure(SatelleError::log_position_conflict("--tail")));
         }
 
         let tail = match command.tail {
             Some(value @ 1..=MAX_LOG_PAGE_LIMIT) => Some(value),
             Some(value) => {
-                return Err(failure(SatelleError::log_tail_limit_exceeded(value), json));
+                return Err(failure(SatelleError::log_tail_limit_exceeded(value)));
             }
             None => None,
         };
@@ -123,16 +120,15 @@ impl LogReadPlan {
             .as_deref()
             .map(SessionId::from_str)
             .transpose()
-            .map_err(|error| failure(error.into(), json))?;
+            .map_err(|error| failure(error.into()))?;
         let minimum_severity = match command.level.as_deref().unwrap_or("info") {
             "info" => LogSeverity::Info,
             "warn" => LogSeverity::Warning,
             "error" => LogSeverity::Error,
             _ => {
-                return Err(failure(
-                    SatelleError::invalid_usage("--level must be one of info, warn, or error"),
-                    json,
-                ));
+                return Err(failure(SatelleError::invalid_usage(
+                    "--level must be one of info, warn, or error",
+                )));
             }
         };
         let since = command
@@ -140,7 +136,7 @@ impl LogReadPlan {
             .as_deref()
             .map(parse_log_since)
             .transpose()
-            .map_err(|error| failure(error, json))?;
+            .map_err(failure)?;
         let sources = command
             .source
             .iter()
@@ -148,20 +144,16 @@ impl LogReadPlan {
                 "host_daemon" => Ok(LogSource::HostDaemon),
                 "storage" => Ok(LogSource::Storage),
                 "codex_adapter" => Ok(LogSource::CodexAdapter),
-                _ => Err(failure(
-                    SatelleError::invalid_usage(
-                        "--source must be one of host_daemon, storage, or codex_adapter",
-                    ),
-                    json,
-                )),
+                _ => Err(failure(SatelleError::invalid_usage(
+                    "--source must be one of host_daemon, storage, or codex_adapter",
+                ))),
             })
             .collect::<Result<Vec<_>, _>>()?;
         let position = if let Some(after) = command.after.as_deref() {
             LogPosition::After(LogCursor::parse(after).map_err(|error| {
-                failure(
-                    SatelleError::invalid_usage(format!("invalid --after cursor: {error}")),
-                    json,
-                )
+                failure(SatelleError::invalid_usage(format!(
+                    "invalid --after cursor: {error}"
+                )))
             })?)
         } else if let Some(tail) = tail {
             LogPosition::Tail(tail)
@@ -305,23 +297,20 @@ pub(crate) fn show_logs(
     config: ConfigContext<'_>,
     format: OutputFormat,
 ) -> Result<(), CliFailure> {
-    let json = format.is_json();
     let request = LogReadRequest::from(command);
-    let plan = LogReadPlan::resolve(&request, json)?;
-    let host = config.resolve_host(request.host.as_deref(), json)?;
-    let transport = transport_for(&host, format)?;
-    plan.emit(transport.as_ref(), format)
-        .map_err(|error| failure(error, json))
+    let plan = LogReadPlan::resolve(&request)?;
+    let host = config.resolve_host(request.host.as_deref())?;
+    let transport = transport_for(&host)?;
+    plan.emit(transport.as_ref(), format).map_err(failure)
 }
 
 pub(crate) fn read_logs_for_host(
     request: &LogReadRequest,
     host: &super::SelectedHost,
 ) -> Result<Vec<DaemonLogEntry>, CliFailure> {
-    let plan = LogReadPlan::resolve(request, true)?;
-    let transport = transport_for(host, OutputFormat::Json)?;
-    plan.read(transport.as_ref())
-        .map_err(|error| failure(error, true))
+    let plan = LogReadPlan::resolve(request)?;
+    let transport = transport_for(host)?;
+    plan.read(transport.as_ref()).map_err(failure)
 }
 
 fn write_entries(

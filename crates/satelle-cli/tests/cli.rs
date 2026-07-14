@@ -22,6 +22,7 @@ fn satelle() -> Command {
         "SATELLE_LOG_DIR",
         "SATELLE_HOST",
         "SATELLE_PROFILE",
+        "SATELLE_ERROR_FORMAT",
         TEST_SUPPORT_ADAPTER_ENV,
     ] {
         command.env_remove(name);
@@ -759,10 +760,10 @@ fn post_ingestion_errors_do_not_echo_prompt_or_secret() {
 
     assert_command_output_is_private(&output, &[&prompt, secret, upstream_id]);
     let error = parse_json_output(&output.stderr);
-    assert_eq!(error["error"]["code"], "invalid-usage");
+    assert_eq!(error["code"], "invalid-usage");
     assert_eq!(
-        error["error"]["recovery_command"],
-        "use the exact Session or Turn identifier returned by Satelle"
+        error["suggested_commands"],
+        serde_json::json!(["use the exact Session or Turn identifier returned by Satelle"])
     );
 }
 
@@ -801,7 +802,7 @@ fn corrupt_sqlite_fails_closed_without_mutating_or_leaking_state() {
     assert_command_canaries_are_absent(&output, &[corruption_canary]);
 
     let error = parse_json_output(&output.stderr);
-    assert_eq!(error["error"]["code"], "storage-integrity-failed");
+    assert_eq!(error["code"], "storage-integrity-failed");
     assert_eq!(
         fs::read(&database_path).expect("rejected SQLite state should be preserved"),
         corrupted,
@@ -1251,7 +1252,7 @@ api_token = {{ kind = "file", path = {token_path} }}
         .clone();
     assert!(detached.stdout.is_empty());
     assert_eq!(
-        parse_json_output(&detached.stderr)["error"]["code"],
+        parse_json_output(&detached.stderr)["code"],
         "direct-daemon-unreachable"
     );
 }
@@ -1303,7 +1304,7 @@ fn events_json_reports_an_explicit_unknown_host_as_not_admitted() {
 
         let error = parse_json_output(&output.stderr);
         assert_eq!(error["schema_version"], "satelle.error.v1");
-        assert_eq!(error["error"]["code"], "host-not-found");
+        assert_eq!(error["code"], "host-not-found");
     }
 }
 
@@ -1383,7 +1384,7 @@ fn events_json_reports_output_conflict_when_explicit_host_is_already_known() {
 
         let error = parse_json_output(&output.stderr);
         assert_eq!(error["schema_version"], "satelle.error.v1");
-        assert_eq!(error["error"]["code"], "output-mode-conflict");
+        assert_eq!(error["code"], "output-mode-conflict");
     }
 }
 
@@ -1608,10 +1609,10 @@ fn detach_returns_starting_session_without_event_streaming() {
         .failure()
         .get_output()
         .clone();
-    let busy_error = parse_json_output(&busy_output.stderr)["error"].clone();
+    let busy_error = parse_json_output(&busy_output.stderr);
     assert_eq!(busy_error["code"], "host-busy");
-    assert_eq!(busy_error["host"], "local-demo");
-    assert_eq!(busy_error["active_session_id"], session_id);
+    assert_eq!(busy_error["details"]["host"], "local-demo");
+    assert_eq!(busy_error["details"]["active_session_id"], session_id);
 
     let busy_output = satelle()
         .env("SATELLE_STATE_DIR", state.path())
@@ -1625,9 +1626,9 @@ fn detach_returns_starting_session_without_event_streaming() {
         .failure()
         .get_output()
         .clone();
-    let busy_error = parse_json_output(&busy_output.stderr)["error"].clone();
+    let busy_error = parse_json_output(&busy_output.stderr);
     assert_eq!(busy_error["code"], "host-busy");
-    assert_eq!(busy_error["active_session_id"], session_id);
+    assert_eq!(busy_error["details"]["active_session_id"], session_id);
 
     satelle()
         .env("SATELLE_STATE_DIR", state.path())
@@ -1755,7 +1756,7 @@ fn logs_json_applies_tail_session_source_level_and_since_on_the_host() {
         .get_output()
         .clone();
     let error = parse_json_output(&output.stderr);
-    assert_eq!(error["error"]["code"], "log-tail-limit-exceeded");
+    assert_eq!(error["code"], "log-tail-limit-exceeded");
 }
 
 #[test]
@@ -1816,7 +1817,7 @@ fn logs_after_rejects_since_and_explicit_tail_with_a_typed_conflict() {
         assert!(output.stdout.is_empty());
         let error = parse_json_output(&output.stderr);
         assert_eq!(error["schema_version"], "satelle.error.v1");
-        assert_eq!(error["error"]["code"], "log-position-conflict");
+        assert_eq!(error["code"], "log-position-conflict");
     }
 }
 
@@ -1851,7 +1852,7 @@ fn logs_accepts_only_canonical_sources_and_severities() {
             .clone();
         assert!(output.stdout.is_empty());
         let error = parse_json_output(&output.stderr);
-        assert_eq!(error["error"]["code"], "invalid-usage");
+        assert_eq!(error["code"], "invalid-usage");
     }
 }
 
@@ -1924,7 +1925,7 @@ fn setup_component_filters_default_repeat_and_reject_all_conflict() {
         .failure()
         .get_output()
         .clone();
-    let error = parse_json_output(&output.stderr)["error"].clone();
+    let error = parse_json_output(&output.stderr);
     assert_eq!(error["code"], "component-selection-conflict");
 
     let output = satelle()
@@ -2147,10 +2148,22 @@ fn host_update_valid_selections_fail_truthfully_without_mutating_state() {
             .clone();
         assert!(output.stdout.is_empty());
         let report = parse_json_output(&output.stderr);
-        assert_exact_object_keys(&report, &["schema_version", "error"]);
+        assert_exact_object_keys(
+            &report,
+            &[
+                "category",
+                "code",
+                "details",
+                "docs_url",
+                "message",
+                "retryable",
+                "schema_version",
+                "suggested_commands",
+            ],
+        );
         assert_eq!(report["schema_version"], "satelle.error.v1");
-        assert_eq!(report["error"]["code"], "not-implemented");
-        let message = report["error"]["message"].as_str().unwrap();
+        assert_eq!(report["code"], "not-implemented");
+        let message = report["message"].as_str().unwrap();
         assert!(message.contains("Host update was not run"));
         assert!(message.contains("No Host state or Satelle sessions were changed"));
         assert!(!state.path().join("satelle.sqlite3").exists());
@@ -2182,12 +2195,12 @@ fn host_update_rejects_conflicting_or_unsupported_components() {
         .code(64)
         .get_output()
         .clone();
-    let error = parse_json_output(&output.stderr)["error"].clone();
+    let error = parse_json_output(&output.stderr);
 
     assert_eq!(error["code"], "unsupported-update-component");
-    assert_eq!(error["component"], "browser");
+    assert_eq!(error["details"]["component"], "browser");
     assert_eq!(
-        error["supported_components"],
+        error["details"]["supported_components"],
         serde_json::json!(["host", "codex", "all"])
     );
 }
@@ -2342,10 +2355,10 @@ fn setup_daemon_path_overrides_are_reported_and_validated() {
         .failure()
         .get_output()
         .clone();
-    let error = parse_json_output(&output.stderr)["error"].clone();
+    let error = parse_json_output(&output.stderr);
     assert_eq!(error["code"], "daemon-path-override-not-absolute");
-    assert_eq!(error["flag"], "--daemon-state-dir");
-    assert_eq!(error["value"], "relative-state");
+    assert_eq!(error["details"]["flag"], "--daemon-state-dir");
+    assert_eq!(error["details"]["value"], "relative-state");
 
     satelle()
         .env("SATELLE_STATE_DIR", state.path())
@@ -3294,18 +3307,18 @@ transpor = "direct"
         .failure()
         .get_output()
         .clone();
-    let error = parse_json_output(&output.stderr)["error"].clone();
+    let error = parse_json_output(&output.stderr);
 
     assert_eq!(error["code"], "unknown-config-key");
     assert_eq!(
-        error["file"],
+        error["details"]["file"],
         serde_json::json!(project.join(".satelle").join("config.toml"))
     );
-    assert_eq!(error["path"], "defalt_host");
-    assert_eq!(error["key"], "defalt_host");
-    assert_eq!(error["suggestion"], "default_host");
+    assert_eq!(error["details"]["path"], "defalt_host");
+    assert_eq!(error["details"]["key"], "defalt_host");
+    assert_eq!(error["details"]["suggestion"], "default_host");
     assert_eq!(
-        error["accepted_keys"],
+        error["details"]["accepted_keys"],
         serde_json::json!([
             "default_host",
             "model_alias",
@@ -3314,12 +3327,18 @@ transpor = "direct"
             "hosts"
         ])
     );
-    assert_eq!(error["unknown_keys"].as_array().unwrap().len(), 2);
     assert_eq!(
-        error["unknown_keys"][1]["path"],
+        error["details"]["unknown_keys"].as_array().unwrap().len(),
+        2
+    );
+    assert_eq!(
+        error["details"]["unknown_keys"][1]["path"],
         "hosts.local-demo.transpor"
     );
-    assert_eq!(error["unknown_keys"][1]["suggestion"], "transport");
+    assert_eq!(
+        error["details"]["unknown_keys"][1]["suggestion"],
+        "transport"
+    );
 }
 
 #[test]
@@ -3434,13 +3453,13 @@ credential_helper = { argv = ["/usr/bin/op", "read", "secret"] }
             .code(66)
             .get_output()
             .clone();
-        let error = parse_json_output(&output.stderr)["error"].clone();
+        let error = parse_json_output(&output.stderr);
 
         assert_eq!(error["code"], expected_code);
-        assert_eq!(error["file"], serde_json::json!(config_file));
-        assert_eq!(error["path"], expected_path);
-        assert_eq!(error["key"], expected_key);
-        assert_eq!(error["scope"], "project");
+        assert_eq!(error["details"]["file"], serde_json::json!(config_file));
+        assert_eq!(error["details"]["path"], expected_path);
+        assert_eq!(error["details"]["key"], expected_key);
+        assert_eq!(error["details"]["scope"], "project");
     }
 }
 
@@ -3565,13 +3584,13 @@ value = "42"
         .code(66)
         .get_output()
         .clone();
-    let error = parse_json_output(&output.stderr)["error"].clone();
+    let error = parse_json_output(&output.stderr);
 
     assert_eq!(error["code"], "desktop-session-selector-conflict");
-    assert_eq!(error["file"], serde_json::json!(user_config));
-    assert_eq!(error["path"], "hosts.local-demo");
+    assert_eq!(error["details"]["file"], serde_json::json!(user_config));
+    assert_eq!(error["details"]["path"], "hosts.local-demo");
     assert_eq!(
-        error["conflicting_keys"],
+        error["details"]["conflicting_keys"],
         serde_json::json!([
             "desktop_session_preference",
             "desktop_session_native_selector"
@@ -3738,12 +3757,12 @@ path = "~/openai-key"
             .code(66)
             .get_output()
             .clone();
-        let error = parse_json_output(&output.stderr)["error"].clone();
+        let error = parse_json_output(&output.stderr);
 
         assert_eq!(error["code"], code);
-        assert_eq!(error["file"], serde_json::json!(user_config));
-        assert_eq!(error["path"], path);
-        assert_eq!(error[detail_key], detail_value);
+        assert_eq!(error["details"]["file"], serde_json::json!(user_config));
+        assert_eq!(error["details"]["path"], path);
+        assert_eq!(error["details"][detail_key], detail_value);
     }
 }
 
@@ -3771,12 +3790,22 @@ defalt_host = "local-demo"
         .clone();
     assert!(output.stdout.is_empty());
     let report = parse_json_output(&output.stderr);
-    assert_exact_object_keys(&report, &["schema_version", "error"]);
+    assert_exact_object_keys(
+        &report,
+        &[
+            "category",
+            "code",
+            "details",
+            "docs_url",
+            "message",
+            "retryable",
+            "schema_version",
+            "suggested_commands",
+        ],
+    );
     assert_eq!(report["schema_version"], "satelle.error.v1");
-    let error = report["error"].clone();
-
-    assert_eq!(error["code"], "unknown-config-key");
-    assert_eq!(error["path"], "defalt_host");
+    assert_eq!(report["code"], "unknown-config-key");
+    assert_eq!(report["details"]["path"], "defalt_host");
 }
 
 #[test]
@@ -3812,35 +3841,44 @@ hostname = "%EXAMPLE_HOSTNAME%"
         .failure()
         .get_output()
         .clone();
-    let error = parse_json_output(&output.stderr)["error"].clone();
+    let error = parse_json_output(&output.stderr);
 
     assert_eq!(error["code"], "config-interpolation-not-supported");
     assert_eq!(
-        error["file"],
+        error["details"]["file"],
         serde_json::json!(project.join(".satelle").join("config.toml"))
     );
-    assert_eq!(error["path"], "default_host");
-    assert_eq!(error["syntax"], "${EXAMPLE_HOST}");
-    assert_eq!(error["unsupported_syntax"].as_array().unwrap().len(), 4);
+    assert_eq!(error["details"]["path"], "default_host");
+    assert_eq!(error["details"]["syntax"], "${EXAMPLE_HOST}");
     assert_eq!(
-        error["unsupported_syntax"][1]["path"],
+        error["details"]["unsupported_syntax"]
+            .as_array()
+            .unwrap()
+            .len(),
+        4
+    );
+    assert_eq!(
+        error["details"]["unsupported_syntax"][1]["path"],
         "hosts.local-demo.address"
     );
-    assert_eq!(error["unsupported_syntax"][1]["syntax"], "$EXAMPLE_ADDRESS");
     assert_eq!(
-        error["unsupported_syntax"][2]["path"],
+        error["details"]["unsupported_syntax"][1]["syntax"],
+        "$EXAMPLE_ADDRESS"
+    );
+    assert_eq!(
+        error["details"]["unsupported_syntax"][2]["path"],
         "hosts.local-demo.ca_bundle"
     );
     assert_eq!(
-        error["unsupported_syntax"][2]["syntax"],
+        error["details"]["unsupported_syntax"][2]["syntax"],
         "${EXAMPLE_CA_BUNDLE}"
     );
     assert_eq!(
-        error["unsupported_syntax"][3]["path"],
+        error["details"]["unsupported_syntax"][3]["path"],
         "hosts.local-demo.network.hostname"
     );
     assert_eq!(
-        error["unsupported_syntax"][3]["syntax"],
+        error["details"]["unsupported_syntax"][3]["syntax"],
         "%EXAMPLE_HOSTNAME%"
     );
 }
@@ -4055,11 +4093,14 @@ native_readiness = 120
         .failure()
         .get_output()
         .clone();
-    let error = parse_json_output(&output.stderr)["error"].clone();
+    let error = parse_json_output(&output.stderr);
     assert_eq!(error["code"], "duration-unit-required");
-    assert_eq!(error["path"], "hosts.local-demo.timeouts.native_readiness");
     assert_eq!(
-        error["supported_units"],
+        error["details"]["path"],
+        "hosts.local-demo.timeouts.native_readiness"
+    );
+    assert_eq!(
+        error["details"]["supported_units"],
         serde_json::json!(["ms", "s", "m"])
     );
 
@@ -4086,11 +4127,11 @@ provider_timeout = "120s"
         .failure()
         .get_output()
         .clone();
-    let error = parse_json_output(&output.stderr)["error"].clone();
+    let error = parse_json_output(&output.stderr);
     assert_eq!(error["code"], "unknown-timeout-key");
-    assert_eq!(error["key"], "provider_timeout");
+    assert_eq!(error["details"]["key"], "provider_timeout");
     assert_eq!(
-        error["accepted_keys"],
+        error["details"]["accepted_keys"],
         serde_json::json!(["native_readiness", "provider_smoke_test"])
     );
 }
@@ -4290,11 +4331,11 @@ fn self_update_remote_options_require_update_remotes() {
         .failure()
         .get_output()
         .clone();
-    let error = parse_json_output(&output.stderr)["error"].clone();
+    let error = parse_json_output(&output.stderr);
     assert_eq!(error["code"], "concurrency-without-remote-update");
     assert_eq!(
-        error["recovery_command"],
-        "add --update-remotes or remove --concurrency"
+        error["suggested_commands"],
+        serde_json::json!(["add --update-remotes or remove --concurrency"])
     );
 
     let output = satelle()
@@ -4311,11 +4352,11 @@ fn self_update_remote_options_require_update_remotes() {
         .failure()
         .get_output()
         .clone();
-    let error = parse_json_output(&output.stderr)["error"].clone();
+    let error = parse_json_output(&output.stderr);
     assert_eq!(error["code"], "concurrency-limit-exceeded");
-    assert_eq!(error["concurrency"], 17);
-    assert_eq!(error["minimum"], 1);
-    assert_eq!(error["maximum"], 16);
+    assert_eq!(error["details"]["concurrency"], 17);
+    assert_eq!(error["details"]["minimum"], 1);
+    assert_eq!(error["details"]["maximum"], 16);
 }
 
 #[test]

@@ -16,6 +16,7 @@ fn satelle() -> Command {
         "SATELLE_LOG_DIR",
         "SATELLE_HOST",
         "SATELLE_PROFILE",
+        "SATELLE_ERROR_FORMAT",
         TEST_SUPPORT_ADAPTER_ENV,
     ] {
         command.env_remove(name);
@@ -101,10 +102,11 @@ fn rejects_unsupported_shells_at_the_cli_boundary() {
     satelle()
         .args(["completions", "nushell"])
         .assert()
-        .code(2)
+        .failure()
         .stdout(predicate::str::is_empty())
         .stderr(
-            predicate::str::contains("invalid value 'nushell'")
+            predicate::str::starts_with("error: invalid-usage\n")
+                .and(predicate::str::contains("invalid value 'nushell'"))
                 .and(predicate::str::contains("powershell")),
         );
 }

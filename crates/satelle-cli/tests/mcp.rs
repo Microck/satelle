@@ -110,6 +110,7 @@ fn satelle_command(home: &Path, test_adapter: bool) -> Command {
         "SATELLE_LOG_DIR",
         "SATELLE_HOST",
         "SATELLE_PROFILE",
+        "SATELLE_ERROR_FORMAT",
         "SATELLE_TEST_SUPPORT_ADAPTER",
     ] {
         command.env_remove(name);

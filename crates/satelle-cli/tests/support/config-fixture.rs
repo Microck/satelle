@@ -53,6 +53,7 @@ impl ConfigFixture {
             "SATELLE_LOG_DIR",
             "SATELLE_HOST",
             "SATELLE_PROFILE",
+            "SATELLE_ERROR_FORMAT",
             TEST_SUPPORT_ADAPTER_ENV,
         ] {
             command.env_remove(name);

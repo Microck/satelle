@@ -1,4 +1,4 @@
-use clap::{Args, ValueEnum};
+use clap::{ArgMatches, Args, ValueEnum};
 use satelle_core::session::{PublicSession, PublicTurn, TurnState};
 use satelle_core::{SatelleError, SessionId};
 use serde::{Deserialize, Serialize};
@@ -82,9 +82,9 @@ pub(crate) enum EventOutput {
 }
 
 impl EventOutput {
-    /// Lifecycle JSON is both a stdout stream contract and a machine-readable error selector.
+    /// JSON event streams are also machine-readable error selectors.
     pub(crate) const fn requests_json_errors(self) -> bool {
-        matches!(self, Self::LifecycleJson)
+        matches!(self, Self::LifecycleJson | Self::DoctorEvents)
     }
 }
 
@@ -131,6 +131,58 @@ impl Command {
             Self::Support { command } => command.output_request(),
         }
     }
+
+    pub(super) fn requests_machine_errors(&self) -> bool {
+        let (output, events) = self.output_request();
+        output.requests_json() || events.requests_json_errors()
+    }
+}
+
+/// Resolves only selectors that Clap accepted before a parser failure.
+///
+/// `ArgMatches` preserves the parser's ordering semantics, including the `--` delimiter, so this
+/// deliberately does not inspect raw argv. Event selectors are interpreted only on the leaves
+/// that define their machine-readable behavior.
+pub(crate) fn partial_requests_machine_errors(matches: &ArgMatches) -> bool {
+    if parsed_output_selector(matches) {
+        return true;
+    }
+
+    match matches.subcommand() {
+        Some(("run" | "steer", command)) => {
+            parsed_output_selector(command)
+                || command
+                    .try_get_one::<EventMode>("events")
+                    .ok()
+                    .flatten()
+                    .is_some_and(|mode| *mode == EventMode::Json)
+        }
+        Some(("doctor", command)) => {
+            parsed_output_selector(command)
+                || command
+                    .try_get_one::<bool>("events")
+                    .ok()
+                    .flatten()
+                    .copied()
+                    .unwrap_or(false)
+        }
+        Some((_, command)) => partial_requests_machine_errors(command),
+        None => false,
+    }
+}
+
+fn parsed_output_selector(matches: &ArgMatches) -> bool {
+    matches
+        .try_get_one::<bool>("json")
+        .ok()
+        .flatten()
+        .copied()
+        .unwrap_or(false)
+        || matches
+            .try_get_one::<OutputFormat>("format")
+            .ok()
+            .flatten()
+            .is_some_and(|format| *format == OutputFormat::Json)
 }
 
 impl ConfigCommand {
@@ -301,10 +353,10 @@ mod tests {
     }
 
     #[test]
-    fn lifecycle_json_selects_machine_readable_errors() {
+    fn json_event_streams_select_machine_readable_errors() {
         assert!(EventOutput::LifecycleJson.requests_json_errors());
         assert!(!EventOutput::None.requests_json_errors());
-        assert!(!EventOutput::DoctorEvents.requests_json_errors());
+        assert!(EventOutput::DoctorEvents.requests_json_errors());
     }
 
     #[test]

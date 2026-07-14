@@ -6,7 +6,6 @@ mod schema;
 mod stdio;
 
 use super::logs::read_logs_for_host;
-use super::output::OutputFormat;
 use super::read;
 use super::{CliFailure, ConfigContext, SelectedHost};
 use arguments::{
@@ -78,7 +77,6 @@ fn mcp_failure(message: impl Into<String>) -> CliFailure {
             source_detail: None,
             details: Default::default(),
         },
-        json: false,
     }
 }
 
@@ -118,7 +116,6 @@ impl SatelleMcp {
                     input.host,
                     input.all,
                     self.config(),
-                    true,
                 ))
             }
             "config_explain" => {
@@ -128,27 +125,26 @@ impl SatelleMcp {
                     input.host,
                     input.show_secret_references,
                     self.config(),
-                    true,
                 ))
             }
             "paths" => {
                 let input: HostInput = decode(arguments)?;
                 validate_host(input.host.as_deref())?;
-                self.operation(read::paths_report(input.host, true))
+                self.operation(read::paths_report(input.host))
             }
             "status" => {
                 let input: StatusInput = decode(arguments)?;
                 validate_host(input.host.as_deref())?;
                 let session_id = SessionId::from_str(&input.session_id)
                     .map_err(|error| invalid_params(error.to_string()))?;
-                let host = match self.config().resolve_host(input.host.as_deref(), true) {
+                let host = match self.config().resolve_host(input.host.as_deref()) {
                     Ok(host) => host,
                     Err(failure) => return Ok(operational_error(failure.error)),
                 };
                 let host_alias = host.alias.clone();
                 let session = match self
                     .host_read(host, &context, move |host| {
-                        read::status_for_host(&session_id, host, OutputFormat::Json)
+                        read::status_for_host(&session_id, host)
                     })
                     .await?
                 {
@@ -163,7 +159,7 @@ impl SatelleMcp {
                 let input: LogsInput = decode(arguments)?;
                 input.validate()?;
                 let request = input.into_request();
-                let host = match self.config().resolve_host(request.host.as_deref(), true) {
+                let host = match self.config().resolve_host(request.host.as_deref()) {
                     Ok(host) => host,
                     Err(failure) => return Ok(operational_error(failure.error)),
                 };
@@ -190,7 +186,7 @@ impl SatelleMcp {
                 let input: DoctorInput = decode(arguments)?;
                 validate_host(input.host.as_deref())?;
                 validate_doctor_scope(input.scope.as_deref())?;
-                let host = match self.config().resolve_host(input.host.as_deref(), true) {
+                let host = match self.config().resolve_host(input.host.as_deref()) {
                     Ok(host) => host,
                     Err(failure) => return Ok(operational_error(failure.error)),
                 };
@@ -211,14 +207,12 @@ impl SatelleMcp {
             "host_status" => {
                 let input: HostInput = decode(arguments)?;
                 validate_host(input.host.as_deref())?;
-                let host = match self.config().resolve_host(input.host.as_deref(), true) {
+                let host = match self.config().resolve_host(input.host.as_deref()) {
                     Ok(host) => host,
                     Err(failure) => return Ok(operational_error(failure.error)),
                 };
                 let status = match self
-                    .host_read(host, &context, |host| {
-                        read::host_status_for_host(host, OutputFormat::Json)
-                    })
+                    .host_read(host, &context, read::host_status_for_host)
                     .await?
                 {
                     Ok(status) => status,
@@ -231,13 +225,13 @@ impl SatelleMcp {
             "host_sessions" => {
                 let input: HostInput = decode(arguments)?;
                 validate_host(input.host.as_deref())?;
-                let host = match self.config().resolve_host(input.host.as_deref(), true) {
+                let host = match self.config().resolve_host(input.host.as_deref()) {
                     Ok(host) => host,
                     Err(failure) => return Ok(operational_error(failure.error)),
                 };
                 let report = match self
                     .host_read(host, &context, |host| {
-                        read::host_sessions_for_host(host, true, OutputFormat::Json)
+                        read::host_sessions_for_host(host, true)
                     })
                     .await?
                 {
