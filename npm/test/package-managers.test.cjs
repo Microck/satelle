@@ -82,6 +82,8 @@ const oneShotRunners = [
     name: "bunx",
     requiredManager: "bun",
     executable: process.platform === "win32" ? "bunx.exe" : "bunx",
+    requiredHelpOption: "--package",
+    unsupportedMessage: "bunx one-shot execution requires Bun 1.3.14 or newer",
     arguments: (packageReference, commandArguments) => [
       "--silent",
       "--package",
@@ -118,7 +120,12 @@ function localTarballReference(artifactPath) {
 
 function commandIsAvailable(packageManager) {
   const version = spawnCommand(packageManager.executable, ["--version"], { encoding: "utf8" });
-  return version.status === 0;
+  if (version.status !== 0 || !packageManager.requiredHelpOption) {
+    return version.status === 0;
+  }
+
+  const help = spawnCommand(packageManager.executable, ["--help"], { encoding: "utf8" });
+  return `${help.stdout}\n${help.stderr}`.includes(packageManager.requiredHelpOption);
 }
 
 function packFixturePackage(packageRoot, packDestination) {
@@ -313,7 +320,7 @@ test("npm exec, npx, pnpm dlx, and bunx execute the canonical package", (context
       assert.equal(
         requiredManagers.has(runner.requiredManager),
         false,
-        `${runner.name} is required but is not installed`,
+        runner.unsupportedMessage || `${runner.name} is required but is not installed`,
       );
       continue;
     }

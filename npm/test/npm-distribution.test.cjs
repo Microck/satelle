@@ -360,6 +360,28 @@ test("native execution forwards arguments and returns the child exit status", (c
 });
 
 test(
+  "native execution supports extended-length Windows paths",
+  { skip: process.platform !== "win32" },
+  (context) => {
+    const fixtureRoot = mkdtempSync(path.join(tmpdir(), "satelle-long-exec-"));
+    context.after(() => rmSync(fixtureRoot, { recursive: true, force: true }));
+    const longRoot = path.join(
+      fixtureRoot,
+      ...Array.from({ length: 12 }, () => "pnpm-dlx-package-layout"),
+    );
+    const executablePath = path.join(longRoot, "satelle.exe");
+    mkdirSync(longRoot, { recursive: true });
+    copyFileSync(process.execPath, executablePath);
+
+    assert.ok(executablePath.length > 260, executablePath);
+    assert.equal(
+      launcher.executeNativeBinary(executablePath, ["-e", "process.exit(23)"]),
+      23,
+    );
+  },
+);
+
+test(
   "native execution preserves signal termination",
   { skip: process.platform === "win32" },
   (context) => {
