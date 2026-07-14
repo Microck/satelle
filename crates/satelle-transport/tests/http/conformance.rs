@@ -1,14 +1,22 @@
 use super::{EXPECTED_OPERATIONS, RunningServer};
 use reqwest::StatusCode;
-use satelle_core::SessionId;
+use satelle_core::{
+    ApiTokenSource, DirectHostBinding, EventStateSubject, EventType, SatelleConfig, SessionId,
+    TransportKind, TurnId,
+};
 use satelle_host::{ApiBearerToken, ApiScopes};
-use satelle_transport::{ApiErrorCode, DaemonClient, DaemonClientError, TurnRequest};
+use satelle_transport::{
+    ApiErrorCode, DaemonClient, DaemonClientError, DaemonEventClient, EventSubscription,
+    TurnRequest,
+};
 use std::io;
 use std::net::{Ipv4Addr, SocketAddr};
+use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt, copy_bidirectional};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::oneshot;
 use tokio::task::{JoinHandle, JoinSet};
+use tokio_rustls::TlsAcceptor;
 
 /// The SSH-specific bootstrap, authentication, and host-key checks happen
 /// before this boundary. This fixture exercises the established tunnel as a
@@ -39,6 +47,51 @@ impl EstablishedTunnel {
     async fn shutdown(self) -> io::Result<()> {
         // The task can close the receiver after an I/O failure. Signaling is
         // therefore advisory; the task result is the authoritative outcome.
+        let _ = self.shutdown.send(());
+        self.task.await.map_err(io::Error::other)?
+    }
+}
+
+/// Terminates the direct transport's real TLS connection before forwarding
+/// the decrypted HTTP or WebSocket stream to the loopback daemon fixture.
+struct TlsForwarder {
+    address: SocketAddr,
+    ca_bundle: String,
+    shutdown: oneshot::Sender<()>,
+    task: JoinHandle<io::Result<()>>,
+}
+
+impl TlsForwarder {
+    async fn start(target: SocketAddr) -> Self {
+        let rcgen::CertifiedKey { cert, signing_key } =
+            rcgen::generate_simple_self_signed(vec![Ipv4Addr::LOCALHOST.to_string()])
+                .expect("generate direct transport certificate");
+        let ca_bundle = cert.pem();
+        let private_key = rustls::pki_types::PrivatePkcs8KeyDer::from(signing_key.serialize_der());
+        let server_config = rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(vec![cert.der().clone()], private_key.into())
+            .expect("configure direct TLS fixture");
+        let acceptor = TlsAcceptor::from(Arc::new(server_config));
+        let listener = TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
+            .await
+            .expect("bind direct TLS fixture");
+        let address = listener.local_addr().expect("read direct TLS address");
+        let (shutdown, receiver) = oneshot::channel();
+        let task = tokio::spawn(serve_tls_forwarder(listener, target, acceptor, receiver));
+        Self {
+            address,
+            ca_bundle,
+            shutdown,
+            task,
+        }
+    }
+
+    fn ca_bundle(&self) -> &[u8] {
+        self.ca_bundle.as_bytes()
+    }
+
+    async fn shutdown(self) -> io::Result<()> {
         let _ = self.shutdown.send(());
         self.task.await.map_err(io::Error::other)?
     }
@@ -78,14 +131,60 @@ async fn forward_connection(mut downstream: TcpStream, target: SocketAddr) -> io
     upstream.shutdown().await
 }
 
-fn assert_api_and_session_conformance(
-    endpoint: SocketAddr,
-    token: ApiBearerToken,
-    host_identity: String,
-) {
-    let client = DaemonClient::loopback(endpoint, token, &host_identity)
-        .expect("construct loopback daemon client");
+async fn serve_tls_forwarder(
+    listener: TcpListener,
+    target: SocketAddr,
+    acceptor: TlsAcceptor,
+    mut shutdown: oneshot::Receiver<()>,
+) -> io::Result<()> {
+    let mut connections = JoinSet::new();
+    loop {
+        tokio::select! {
+            _ = &mut shutdown => break,
+            accepted = listener.accept() => {
+                let (downstream, _) = accepted?;
+                connections.spawn(forward_tls_connection(
+                    downstream,
+                    target,
+                    acceptor.clone(),
+                ));
+            }
+            Some(connection) = connections.join_next(), if !connections.is_empty() => {
+                connection.map_err(io::Error::other)??;
+            }
+        }
+    }
 
+    while let Some(connection) = connections.join_next().await {
+        connection.map_err(io::Error::other)??;
+    }
+    Ok(())
+}
+
+async fn forward_tls_connection(
+    downstream: TcpStream,
+    target: SocketAddr,
+    acceptor: TlsAcceptor,
+) -> io::Result<()> {
+    let mut downstream = acceptor.accept(downstream).await?;
+    let mut upstream = TcpStream::connect(target).await?;
+    match copy_bidirectional(&mut downstream, &mut upstream).await {
+        Ok(_) => {}
+        // The public clients own no explicit TLS close operation. Dropping a
+        // completed HTTP pool or event stream therefore closes the socket
+        // without a close_notify alert, which rustls reports as EOF.
+        Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => {}
+        Err(error) => return Err(error),
+    }
+    downstream.shutdown().await?;
+    upstream.shutdown().await
+}
+
+fn assert_api_and_session_conformance(
+    client: DaemonClient,
+    host_identity: &str,
+    idempotency_key: &str,
+) -> (SessionId, TurnId) {
     assert!(client.live().expect("read liveness").alive());
 
     let capabilities = client.capabilities().expect("read capabilities");
@@ -95,16 +194,15 @@ fn assert_api_and_session_conformance(
     let status = client.host_status().expect("read Host status");
     assert_eq!(status.host_identity(), host_identity);
 
-    let idempotency_key = format!("established-tunnel-conformance-{}", endpoint.port());
     let request = TurnRequest::new("PRIVATE_ESTABLISHED_TUNNEL_CONFORMANCE_CANARY");
     let created = client
-        .create_session(&request, &idempotency_key)
+        .create_session(&request, idempotency_key)
         .expect("create durable Session");
     assert_eq!(created.host_identity(), host_identity);
     assert_eq!(created.session().turns().len(), 1);
 
     let replay = client
-        .create_session(&request, &idempotency_key)
+        .create_session(&request, idempotency_key)
         .expect("replay the same Session admission");
     assert_eq!(
         replay.session().session_id(),
@@ -130,14 +228,14 @@ fn assert_api_and_session_conformance(
     let conflict = client
         .create_session(
             &TurnRequest::new("PRIVATE_CHANGED_TUNNEL_CONFORMANCE_CANARY"),
-            &idempotency_key,
+            idempotency_key,
         )
         .expect_err("changed payload must conflict with the existing admission");
     assert_api_error(
         conflict,
         StatusCode::CONFLICT,
         ApiErrorCode::IdempotencyKeyConflict,
-        &host_identity,
+        host_identity,
     );
 
     let missing = client
@@ -147,8 +245,64 @@ fn assert_api_and_session_conformance(
         missing,
         StatusCode::NOT_FOUND,
         ApiErrorCode::SessionNotFound,
-        &host_identity,
+        host_identity,
     );
+
+    (
+        created.session().session_id().clone(),
+        created.session().turns()[0].turn_id().clone(),
+    )
+}
+
+async fn assert_transport_conformance(
+    client: DaemonClient,
+    event_client: DaemonEventClient,
+    host_identity: String,
+    idempotency_key: &'static str,
+) {
+    let mut event_stream = event_client
+        .connect_events(vec![EventSubscription::Host])
+        .await
+        .expect("subscribe to Host events before Session admission");
+    let asserted_host_identity = host_identity.clone();
+    let (session_id, turn_id) = tokio::task::spawn_blocking(move || {
+        assert_api_and_session_conformance(client, &asserted_host_identity, idempotency_key)
+    })
+    .await
+    .expect("join blocking API conformance runner");
+
+    let mut events = Vec::with_capacity(3);
+    for _ in 0..3 {
+        events.push(
+            event_stream
+                .next_event()
+                .await
+                .expect("read conformance event"),
+        );
+    }
+    assert_eq!(
+        events
+            .iter()
+            .map(|event| event.event_type())
+            .collect::<Vec<_>>(),
+        [
+            EventType::TurnStarted,
+            EventType::TurnProgress,
+            EventType::TurnCompleted,
+        ]
+    );
+    assert_eq!(
+        events.iter().map(|event| event.seq()).collect::<Vec<_>>(),
+        [1, 2, 3]
+    );
+    assert!(events.iter().all(|event| {
+        event.session_id() == Some(&session_id)
+            && event.turn_id() == Some(&turn_id)
+            && matches!(event.state_subject(), Some(EventStateSubject::Turn { .. }))
+    }));
+
+    drop(event_stream);
+    drop(event_client);
 }
 
 fn assert_api_error(
@@ -173,33 +327,83 @@ fn copy_token(token: &ApiBearerToken) -> ApiBearerToken {
 }
 
 #[tokio::test]
-async fn direct_and_established_ssh_tunnel_share_api_and_session_contract() {
+async fn direct_and_established_ssh_tunnel_share_session_error_and_event_contracts() {
     let running = RunningServer::start(ApiScopes::CONTROL).await;
     let daemon_address = running.server.local_addr();
 
-    let direct_token = copy_token(&running.token);
-    let direct_host_identity = running.host_identity.clone();
-    tokio::task::spawn_blocking(move || {
-        assert_api_and_session_conformance(daemon_address, direct_token, direct_host_identity);
+    let direct = TlsForwarder::start(daemon_address).await;
+    let binding = direct_binding(direct.address, &running.host_identity);
+    let direct_api_binding = binding.clone();
+    let direct_api_token = copy_token(&running.token);
+    let direct_ca_bundle = direct.ca_bundle().to_vec();
+    let direct_client = tokio::task::spawn_blocking(move || {
+        DaemonClient::https(
+            &direct_api_binding,
+            direct_api_token,
+            Some(&direct_ca_bundle),
+        )
+        .expect("construct direct HTTPS client")
     })
     .await
-    .expect("join direct conformance runner");
+    .expect("join direct HTTPS client construction");
+    let direct_event_client = DaemonEventClient::wss(
+        &binding,
+        copy_token(&running.token),
+        Some(direct.ca_bundle()),
+    )
+    .expect("construct direct WSS client");
+    assert_transport_conformance(
+        direct_client,
+        direct_event_client,
+        running.host_identity.clone(),
+        "direct-transport-conformance",
+    )
+    .await;
+    direct.shutdown().await.expect("stop direct TLS fixture");
 
     let tunnel = EstablishedTunnel::start(daemon_address).await;
-    let tunnel_token = copy_token(&running.token);
-    let tunnel_host_identity = running.host_identity.clone();
     let tunnel_address = tunnel.address;
-    tokio::task::spawn_blocking(move || {
-        assert_api_and_session_conformance(tunnel_address, tunnel_token, tunnel_host_identity);
+    let tunnel_api_token = copy_token(&running.token);
+    let tunnel_api_identity = running.host_identity.clone();
+    let tunnel_client = tokio::task::spawn_blocking(move || {
+        DaemonClient::loopback(tunnel_address, tunnel_api_token, tunnel_api_identity)
+            .expect("construct established-tunnel HTTP client")
     })
     .await
-    .expect("join established-tunnel conformance runner");
+    .expect("join established-tunnel HTTP client construction");
+    let tunnel_event_client = DaemonEventClient::loopback(
+        tunnel.address,
+        copy_token(&running.token),
+        &running.host_identity,
+    )
+    .expect("construct established-tunnel event client");
+    assert_transport_conformance(
+        tunnel_client,
+        tunnel_event_client,
+        running.host_identity.clone(),
+        "established-tunnel-conformance",
+    )
+    .await;
 
     tunnel
         .shutdown()
         .await
         .expect("stop established-tunnel fixture");
     running.server.shutdown().await.expect("stop daemon server");
+}
+
+fn direct_binding(address: SocketAddr, expected_host_identity: &str) -> DirectHostBinding {
+    let mut config = SatelleConfig::defaults()
+        .hosts
+        .remove("local-demo")
+        .expect("default local Host config");
+    config.transport = TransportKind::Direct;
+    config.address = Some(format!("https://127.0.0.1:{}", address.port()));
+    config.expected_host_id = Some(expected_host_identity.to_string());
+    config.api_token = Some(ApiTokenSource::File {
+        path: std::env::temp_dir().join("satelle-conformance.token"),
+    });
+    DirectHostBinding::from_host_config(&config).expect("construct direct Host Binding")
 }
 
 #[tokio::test]
