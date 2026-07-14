@@ -6,7 +6,7 @@ use std::net::{Shutdown, TcpListener, TcpStream};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 impl DirectFixture {
     fn connect_host_stream(&self) -> DaemonEventStream {
@@ -374,14 +374,42 @@ fn write_websocket_close(stream: &mut TcpStream, reason: WsCloseReason) {
 }
 
 fn read_http_headers(stream: &mut TcpStream) -> Vec<u8> {
+    let deadline = Instant::now()
+        .checked_add(Duration::from_secs(2))
+        .expect("HTTP fixture read deadline is representable");
+    let original_read_timeout = stream
+        .read_timeout()
+        .expect("read HTTP fixture socket timeout");
     let mut bytes = Vec::new();
     let mut buffer = [0_u8; 1024];
     while !bytes.windows(4).any(|window| window == b"\r\n\r\n") {
-        let read = stream.read(&mut buffer).expect("read HTTP headers");
-        assert!(read > 0, "HTTP peer closed before completing headers");
-        bytes.extend_from_slice(&buffer[..read]);
-        assert!(bytes.len() <= 16 * 1024, "HTTP fixture headers are bounded");
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        assert!(
+            !remaining.is_zero(),
+            "HTTP fixture timed out before completing headers"
+        );
+        stream
+            .set_read_timeout(Some(remaining))
+            .expect("bound HTTP fixture header read");
+        match stream.read(&mut buffer) {
+            Ok(0) => panic!("HTTP peer closed before completing headers"),
+            Ok(read) => {
+                bytes.extend_from_slice(&buffer[..read]);
+                assert!(bytes.len() <= 16 * 1024, "HTTP fixture headers are bounded");
+            }
+            Err(error) if matches!(error.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {
+                assert!(
+                    Instant::now() < deadline,
+                    "HTTP fixture timed out before completing headers"
+                );
+                thread::yield_now();
+            }
+            Err(error) => panic!("read HTTP headers: {error}"),
+        }
     }
+    stream
+        .set_read_timeout(original_read_timeout)
+        .expect("restore HTTP fixture socket timeout");
     bytes
 }
 
