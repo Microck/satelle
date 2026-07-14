@@ -3034,7 +3034,7 @@ fn config_check_explain_and_paths_use_versioned_read_only_json_contracts() {
     fs::write(
         project.join(".satelle").join("config.toml"),
         r#"
-default_host = "local-demo"
+model_alias = "project-model"
 "#,
     )
     .expect("project config should be written");
@@ -3187,7 +3187,7 @@ fn project_config_discovery_walks_up_to_nearest_satelle_config() {
     fs::write(
         project.join(".satelle").join("config.toml"),
         r#"
-default_host = "local-demo"
+model_alias = "project-model"
 "#,
     )
     .expect("project config should be written");
@@ -3270,7 +3270,6 @@ transpor = "direct"
             "model_alias",
             "provider_alias",
             "profile",
-            "profiles",
             "hosts"
         ])
     );

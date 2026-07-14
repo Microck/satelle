@@ -1010,7 +1010,7 @@
 - a Provider Binding in user-level or Host-owned configuration is selectable by project configuration only when that exact Operator-controlled binding sets allow_project_selection = true @spec @mvp
 - project Provider selection permission is scoped to one exact provider alias and does not grant provider-secret access, endpoint override authority, experimental-provider opt-in, mutation consent, YOLO, or sensitive-export consent @spec @mvp
 - satelle project-level configuration cannot define or override a concrete network address, SSH destination, direct API URL, TLS trust material, bearer-token descriptor, Tailscale node identity, Desktop Binding, daemon path, provider endpoint binding, or provider credential binding @spec @mvp @implemented
-- a project transport preference may select a transport kind only when the user-level Host Binding supplies and authorizes the concrete destination and authentication details @spec @mvp @implemented
+- a project transport preference is accepted only when its transport kind exactly matches the user-level Host Binding, while the concrete destination and authentication details remain exclusively user-owned @spec @mvp @implemented
 - satelle configuration merging never allows a project object to replace a user-owned Host Binding as a whole object @spec @mvp @implemented
 - satelle preflight reports when Host, model, provider, profile, timeout, or transport intent came from project-level configuration @spec @mvp
 - project-level output defaults cannot suppress Host identity, desktop target, YOLO, authority, consent, or sensitive-export warnings required by the selected command @spec @mvp
@@ -1082,7 +1082,7 @@
 - satelle MVP does not support direct native_readiness_timeout or provider_smoke_test_timeout configuration keys outside the nested timeouts table @implemented @mvp
 - satelle project-level configuration may reference host aliases that users bind to concrete personal host access details in user-level configuration @spec @mvp @implemented
 - satelle project-level configuration cannot define or override a concrete Host Binding @spec @mvp @implemented
-- satelle reports a missing host binding when the effective configuration context references a project-level host alias that the user has not configured @spec @mvp @implemented
+- satelle reports a missing host binding with separate project reference and required user binding paths when the effective configuration context references a project-level host alias that the user has not configured @spec @mvp @implemented
 - satelle config check --all reports missing host binding for every locally selectable project-level host alias context that lacks a user-level binding @spec @mvp
 - satelle user-level host configuration may define desktop_user as the Satelle Desktop Binding account for that concrete host alias @implemented @mvp
 - satelle user-level host configuration may define desktop_session_preference for that concrete host alias @implemented @mvp
