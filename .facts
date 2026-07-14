@@ -1904,7 +1904,9 @@
 - a native Computer Use readiness smoke-test timeout requests upstream cancellation and blocks prompt execution @spec @mvp
 - a timed-out native readiness probe stores a terminal timed_out Readiness Result and releases its Control Lease only after the Codex adapter confirms that no upstream probe Turn remains active @spec @mvp
 - when timed-out native readiness probe cancellation cannot be confirmed, Satelle records outcome_unknown diagnostics, keeps the Control Lease recovery_pending, and blocks conflicting Turn or probe admission until reconciliation succeeds @spec @mvp
-- satelle does not allow prompt execution or remote-control flows on hosts that fail native Codex Computer Use readiness @spec @mvp
+- label: satelle does not allow prompt execution or remote-control flows on hosts that fail native Codex Computer Use readiness
+  command: cargo test --locked -p satelle-host --lib tests::unsupported_or_unproven_production_execution_is_blocked_before_admission -- --exact
+  tags: [spec, mvp, implemented, ci]
 - satelle may keep a host that lacks native Codex Computer Use only for diagnostics, installation, and repair flows @spec @mvp
 - satelle host capability checks are OS-aware for Windows, Linux, and macOS instead of assuming one platform's Codex or Computer Use behavior applies to every platform @spec @mvp
 - satelle treats cross-platform host support as successful configuration, diagnostics, and capability reporting, not as a guarantee that native Codex Computer Use is available on every operating system @spec @mvp
