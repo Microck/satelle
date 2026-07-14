@@ -29,6 +29,7 @@ fn satelle() -> Command {
         "SATELLE_LOG_DIR",
         "SATELLE_HOST",
         "SATELLE_PROFILE",
+        "SATELLE_ERROR_FORMAT",
         TEST_SUPPORT_ADAPTER_ENV,
     ] {
         command.env_remove(name);
@@ -151,7 +152,7 @@ adapter = "fake"
             .get_output()
             .clone();
         assert_eq!(
-            parse_json_output(&output.stderr)["error"]["code"],
+            parse_json_output(&output.stderr)["code"],
             "host-unreachable"
         );
     }
@@ -173,10 +174,7 @@ fn host_status_resolves_the_selected_host_before_contacting_transport() {
         .failure()
         .get_output()
         .clone();
-    assert_eq!(
-        parse_json_output(&output.stderr)["error"]["code"],
-        "host-not-found"
-    );
+    assert_eq!(parse_json_output(&output.stderr)["code"], "host-not-found");
 }
 
 #[test]
@@ -204,9 +202,9 @@ address = "https://127.0.0.1:9"
         .get_output()
         .clone();
     let error = parse_json_output(&output.stderr);
-    assert_eq!(error["error"]["code"], "configuration-error");
+    assert_eq!(error["code"], "configuration-error");
     assert!(
-        error["error"]["message"]
+        error["message"]
             .as_str()
             .expect("error message")
             .contains("expected_host_id")
@@ -254,8 +252,8 @@ api_token = {{ kind = "file", path = {missing_token_literal} }}
         .get_output()
         .clone();
     let error = parse_json_output(&output.stderr);
-    assert_eq!(error["error"]["code"], "project-host-selection-not-allowed");
-    assert_eq!(error["error"]["host"], "remote");
+    assert_eq!(error["code"], "project-host-selection-not-allowed");
+    assert_eq!(error["details"]["host"], "remote");
     assert!(!String::from_utf8_lossy(&output.stderr).contains("must-not-be-read.token"));
 }
 
@@ -311,8 +309,8 @@ allow_project_selection = true
         .get_output()
         .clone();
     let error = parse_json_output(&output.stderr);
-    assert_eq!(error["error"]["code"], "project-host-binding-not-allowed");
-    assert_eq!(error["error"]["path"], "hosts.remote.address");
+    assert_eq!(error["code"], "project-host-binding-not-allowed");
+    assert_eq!(error["details"]["path"], "hosts.remote.address");
     assert!(!String::from_utf8_lossy(&output.stderr).contains("trusted-token-must-not-be-read"));
 }
 
@@ -357,7 +355,7 @@ api_token = {{ kind = "file", path = "{}" }}
         .get_output()
         .clone();
     assert_eq!(
-        parse_json_output(&insecure.stderr)["error"]["code"],
+        parse_json_output(&insecure.stderr)["code"],
         "configuration-error"
     );
     assert!(!String::from_utf8_lossy(&insecure.stderr).contains(exposed.as_str()));
@@ -375,7 +373,7 @@ api_token = {{ kind = "file", path = "{}" }}
         .get_output()
         .clone();
     assert_eq!(
-        parse_json_output(&unreachable.stderr)["error"]["code"],
+        parse_json_output(&unreachable.stderr)["code"],
         "host-unreachable"
     );
     assert!(!String::from_utf8_lossy(&unreachable.stderr).contains(exposed.as_str()));
@@ -403,7 +401,7 @@ api_token = {{ kind = "file", path = "{}" }}
         .get_output()
         .clone();
     assert_eq!(
-        parse_json_output(&tls_failure.stderr)["error"]["code"],
+        parse_json_output(&tls_failure.stderr)["code"],
         "tls-handshake-failed"
     );
     assert!(!String::from_utf8_lossy(&tls_failure.stderr).contains(exposed.as_str()));
@@ -432,7 +430,7 @@ api_token = {{ kind = "file", path = "{}" }}
         .get_output()
         .clone();
     assert_eq!(
-        parse_json_output(&tls_version.stderr)["error"]["code"],
+        parse_json_output(&tls_version.stderr)["code"],
         "tls-version-unsupported"
     );
     assert!(!String::from_utf8_lossy(&tls_version.stderr).contains(exposed.as_str()));

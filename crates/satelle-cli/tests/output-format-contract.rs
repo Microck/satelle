@@ -14,6 +14,7 @@ fn satelle() -> Command {
         "SATELLE_LOG_DIR",
         "SATELLE_HOST",
         "SATELLE_PROFILE",
+        "SATELLE_ERROR_FORMAT",
         TEST_SUPPORT_ADAPTER_ENV,
     ] {
         command.env_remove(name);
@@ -30,26 +31,49 @@ fn parse_json(bytes: &[u8]) -> Value {
     serde_json::from_slice(bytes).expect("output should be one JSON value")
 }
 
+fn assert_error_keys(report: &Value) {
+    let mut keys = report
+        .as_object()
+        .expect("error envelope should be an object")
+        .keys()
+        .map(String::as_str)
+        .collect::<Vec<_>>();
+    keys.sort_unstable();
+    assert_eq!(
+        keys,
+        [
+            "category",
+            "code",
+            "details",
+            "docs_url",
+            "message",
+            "retryable",
+            "schema_version",
+            "suggested_commands",
+        ]
+    );
+}
+
 fn assert_output_conflict(args: &[&str], json_error: bool) {
     let state = state_dir();
     let output = satelle()
         .env("SATELLE_STATE_DIR", state.path())
         .args(args)
         .assert()
-        .code(64)
+        .failure()
         .get_output()
         .clone();
 
     assert!(output.stdout.is_empty());
     if json_error {
         let report = parse_json(&output.stderr);
+        assert_error_keys(&report);
         assert_eq!(report["schema_version"], "satelle.error.v1");
-        assert_eq!(report["error"]["code"], "output-mode-conflict");
+        assert_eq!(report["code"], "output-mode-conflict");
     } else {
-        assert!(
-            String::from_utf8_lossy(&output.stderr).contains("output-mode-conflict"),
-            "human errors should retain the typed code"
-        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.starts_with("error: output-mode-conflict\n"));
+        assert!(!stderr.trim_start().starts_with('{'));
     }
     assert!(!state.path().join("satelle.sqlite3").exists());
     assert!(!state.path().join("satelle.sqlite3.lock").exists());
@@ -105,7 +129,7 @@ fn final_result_selectors_and_json_event_streams_report_typed_conflicts() {
         ),
         (
             vec!["run", "--events", "json", "--format", "human", "Inspect"],
-            false,
+            true,
         ),
         (
             vec![
@@ -140,11 +164,11 @@ fn final_result_selectors_and_json_event_streams_report_typed_conflicts() {
                 "human",
                 "Inspect",
             ],
-            false,
+            true,
         ),
         (vec!["doctor", "--events", "--json"], true),
         (vec!["doctor", "--events", "--format", "json"], true),
-        (vec!["doctor", "--events", "--format", "human"], false),
+        (vec!["doctor", "--events", "--format", "human"], true),
     ] {
         assert_output_conflict(&args, json_error);
     }

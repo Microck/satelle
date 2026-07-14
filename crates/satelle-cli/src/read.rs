@@ -1,4 +1,4 @@
-use super::output::{OutputFormat, StatusReport};
+use super::output::StatusReport;
 use super::transport::transport_for;
 use super::{
     CONFIG_CHECK_SCHEMA_VERSION, CONFIG_EXPLAIN_SCHEMA_VERSION, CliFailure, ConfigContext,
@@ -16,9 +16,8 @@ pub(super) fn config_check_report(
     host: Option<String>,
     all: bool,
     config_context: ConfigContext<'_>,
-    json_errors: bool,
 ) -> Result<Value, CliFailure> {
-    let config = config_context.load(json_errors)?;
+    let config = config_context.load()?;
     let selected_profile = config
         .selected_profile
         .as_ref()
@@ -30,7 +29,7 @@ pub(super) fn config_check_report(
     let selected_host = config
         .resolve_host(host.as_deref())
         .map(|(alias, _)| alias)
-        .map_err(|error| failure(error, json_errors))?;
+        .map_err(failure)?;
     Ok(json!({
         "schema_version": CONFIG_CHECK_SCHEMA_VERSION,
         "status": "ok",
@@ -58,9 +57,8 @@ pub(super) fn config_explain_report(
     host: Option<String>,
     show_secret_references: bool,
     config_context: ConfigContext<'_>,
-    json_errors: bool,
 ) -> Result<Value, CliFailure> {
-    let config = config_context.load(json_errors)?;
+    let config = config_context.load()?;
     let selected_profile = config
         .selected_profile
         .as_ref()
@@ -69,9 +67,8 @@ pub(super) fn config_explain_report(
         .selected_profile
         .as_ref()
         .map(|profile| profile.source.as_str());
-    let (selected_host, selected_host_config) = config
-        .resolve_host(host.as_deref())
-        .map_err(|error| failure(error, json_errors))?;
+    let (selected_host, selected_host_config) =
+        config.resolve_host(host.as_deref()).map_err(failure)?;
     let mut effective_config = config.config.clone();
     effective_config
         .hosts
@@ -120,10 +117,10 @@ pub(super) fn config_explain_report(
     }))
 }
 
-pub(super) fn paths_report(host: Option<String>, json_errors: bool) -> Result<Value, CliFailure> {
+pub(super) fn paths_report(host: Option<String>) -> Result<Value, CliFailure> {
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let selected_host = host.unwrap_or_else(|| LOCAL_DEMO_HOST.to_string());
-    let paths = resolve_path_set(&cwd).map_err(|error| failure(error, json_errors))?;
+    let paths = resolve_path_set(&cwd).map_err(failure)?;
     Ok(json!({
         "schema_version": PATHS_SCHEMA_VERSION,
         "host": selected_host,
@@ -143,51 +140,39 @@ pub(super) fn doctor_for_host(
     host: &super::SelectedHost,
     scope: Option<&str>,
 ) -> Result<DoctorReport, CliFailure> {
-    transport_for(host, OutputFormat::Json)?
-        .doctor(scope, false)
-        .map_err(|error| failure(error, true))
+    transport_for(host)?.doctor(scope, false).map_err(failure)
 }
 
 pub(super) fn host_status(
     host: Option<&str>,
     config: ConfigContext<'_>,
-    format: OutputFormat,
 ) -> Result<satelle_host::HostStatus, CliFailure> {
-    let json_errors = format.is_json();
-    let host = config.resolve_host(host, json_errors)?;
-    host_status_for_host(&host, format)
+    let host = config.resolve_host(host)?;
+    host_status_for_host(&host)
 }
 
 pub(super) fn host_status_for_host(
     host: &super::SelectedHost,
-    format: OutputFormat,
 ) -> Result<satelle_host::HostStatus, CliFailure> {
-    let json_errors = format.is_json();
-    transport_for(host, format)?
-        .host_status()
-        .map_err(|error| failure(error, json_errors))
+    transport_for(host)?.host_status().map_err(failure)
 }
 
 pub(super) fn host_sessions(
     host: Option<&str>,
     no_bootstrap: bool,
     config: ConfigContext<'_>,
-    format: OutputFormat,
 ) -> Result<HostSessionsReport, CliFailure> {
-    let json_errors = format.is_json();
-    let host = config.resolve_host(host, json_errors)?;
-    host_sessions_for_host(&host, no_bootstrap, format)
+    let host = config.resolve_host(host)?;
+    host_sessions_for_host(&host, no_bootstrap)
 }
 
 pub(super) fn host_sessions_for_host(
     host: &super::SelectedHost,
     no_bootstrap: bool,
-    format: OutputFormat,
 ) -> Result<HostSessionsReport, CliFailure> {
-    let json_errors = format.is_json();
-    let mut report = transport_for(host, format)?
+    let mut report = transport_for(host)?
         .host_sessions(no_bootstrap)
-        .map_err(|error| failure(error, json_errors))?;
+        .map_err(failure)?;
     apply_current_desktop_selection(&mut report, &host.config);
     Ok(report)
 }
@@ -196,24 +181,17 @@ pub(super) fn status(
     session_id: &str,
     host: Option<&str>,
     config: ConfigContext<'_>,
-    format: OutputFormat,
 ) -> Result<(PublicSession, String), CliFailure> {
-    let json_errors = format.is_json();
-    let session_id =
-        SessionId::from_str(session_id).map_err(|error| failure(error.into(), json_errors))?;
-    let host = config.resolve_host(host, json_errors)?;
-    status_for_host(&session_id, &host, format).map(|session| (session, host.alias))
+    let session_id = SessionId::from_str(session_id).map_err(|error| failure(error.into()))?;
+    let host = config.resolve_host(host)?;
+    status_for_host(&session_id, &host).map(|session| (session, host.alias))
 }
 
 pub(super) fn status_for_host(
     session_id: &SessionId,
     host: &super::SelectedHost,
-    format: OutputFormat,
 ) -> Result<PublicSession, CliFailure> {
-    let json_errors = format.is_json();
-    let session = transport_for(host, format)?
-        .status(session_id)
-        .map_err(|error| failure(error, json_errors))?;
+    let session = transport_for(host)?.status(session_id).map_err(failure)?;
     Ok(session)
 }
 

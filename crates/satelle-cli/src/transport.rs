@@ -1,4 +1,3 @@
-use crate::output::OutputFormat;
 use crate::{CliFailure, SelectedHost, failure};
 use satelle_core::session::{PublicSession, TurnAdmissionFailure};
 use satelle_core::{
@@ -569,29 +568,21 @@ fn api_code_error(host: &str, code: ApiErrorCode) -> SatelleError {
     }
 }
 
-fn local_host_service(_output: OutputFormat) -> Result<HostService, CliFailure> {
-    #[cfg(feature = "test-support")]
-    let json = _output.is_json();
+fn local_host_service() -> Result<HostService, CliFailure> {
     #[cfg(feature = "test-support")]
     match std::env::var(TEST_SUPPORT_ADAPTER_ENV) {
         Ok(value) if value == "fake" => {
-            return HostService::local_demo_for_tests().map_err(|error| failure(error, json));
+            return HostService::local_demo_for_tests().map_err(failure);
         }
         Ok(_) => {
-            return Err(failure(
-                SatelleError::invalid_usage(
-                    "SATELLE_TEST_SUPPORT_ADAPTER must be exactly 'fake' or unset",
-                ),
-                json,
-            ));
+            return Err(failure(SatelleError::invalid_usage(
+                "SATELLE_TEST_SUPPORT_ADAPTER must be exactly 'fake' or unset",
+            )));
         }
         Err(std::env::VarError::NotUnicode(_)) => {
-            return Err(failure(
-                SatelleError::invalid_usage(
-                    "SATELLE_TEST_SUPPORT_ADAPTER must contain valid UTF-8",
-                ),
-                json,
-            ));
+            return Err(failure(SatelleError::invalid_usage(
+                "SATELLE_TEST_SUPPORT_ADAPTER must contain valid UTF-8",
+            )));
         }
         Err(std::env::VarError::NotPresent) => {}
     }
@@ -599,20 +590,14 @@ fn local_host_service(_output: OutputFormat) -> Result<HostService, CliFailure> 
     Ok(HostService::production())
 }
 
-pub(crate) fn transport_for(
-    host: &SelectedHost,
-    output: OutputFormat,
-) -> Result<Box<dyn TransportClient>, CliFailure> {
+pub(crate) fn transport_for(host: &SelectedHost) -> Result<Box<dyn TransportClient>, CliFailure> {
     match host.config.transport {
-        TransportKind::Local => local_host_service(output)
+        TransportKind::Local => local_host_service()
             .map(|service| Box::new(LocalTransport::new(host.alias.clone(), service)) as _),
         TransportKind::Direct => direct_transport(host)
             .map(|transport| Box::new(transport) as _)
-            .map_err(|error| failure(error, output.is_json())),
-        TransportKind::Ssh => Err(failure(
-            SatelleError::host_unreachable(&host.alias),
-            output.is_json(),
-        )),
+            .map_err(failure),
+        TransportKind::Ssh => Err(failure(SatelleError::host_unreachable(&host.alias))),
     }
 }
 

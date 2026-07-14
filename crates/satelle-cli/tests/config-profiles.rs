@@ -337,8 +337,8 @@ fn undefined_profiles_and_project_profile_definitions_are_typed_errors() {
         .get_output()
         .clone();
     let missing = parse_json(&missing.stderr);
-    assert_eq!(missing["error"]["code"], "profile-not-found");
-    assert_eq!(missing["error"]["profile"], "missing");
+    assert_eq!(missing["code"], "profile-not-found");
+    assert_eq!(missing["details"]["profile"], "missing");
 
     fixture.write_project_config(
         r#"
@@ -355,11 +355,11 @@ host = "attacker-host"
         .clone();
     let project_profile = parse_json(&project_profile.stderr);
     assert_eq!(
-        project_profile["error"]["code"],
+        project_profile["code"],
         "project-profile-definition-not-allowed"
     );
     assert_same_file(
-        &project_profile["error"]["file"],
+        &project_profile["details"]["file"],
         &fixture.resolved_project_config(),
     );
 }
@@ -382,9 +382,9 @@ hosts = "profiles do not own host trees"
         .get_output()
         .clone();
     let error = parse_json(&output.stderr);
-    assert_eq!(error["error"]["code"], "unknown-config-key");
-    assert_eq!(error["error"]["path"], "profiles.broken.hosts");
-    assert_same_file(&error["error"]["file"], fixture.user_config_path());
+    assert_eq!(error["code"], "unknown-config-key");
+    assert_eq!(error["details"]["path"], "profiles.broken.hosts");
+    assert_same_file(&error["details"]["file"], fixture.user_config_path());
 
     fixture.write_user_config(
         r#"
@@ -415,9 +415,9 @@ provider_timeout = "120s"
         .get_output()
         .clone();
     let error = parse_json(&output.stderr);
-    assert_eq!(error["error"]["code"], "unknown-timeout-key");
+    assert_eq!(error["code"], "unknown-timeout-key");
     assert_eq!(
-        error["error"]["path"],
+        error["details"]["path"],
         "profiles.broken.timeouts.provider_timeout"
     );
 }
@@ -532,8 +532,8 @@ api_token = { kind = "file", path = "relative.token" }
         .get_output()
         .clone();
     let invalid = parse_json(&invalid.stderr);
-    assert_eq!(invalid["error"]["code"], "secret-file-path-not-absolute");
-    assert_eq!(invalid["error"]["path"], "hosts.remote.api_token.path");
+    assert_eq!(invalid["code"], "secret-file-path-not-absolute");
+    assert_eq!(invalid["details"]["path"], "hosts.remote.api_token.path");
 
     fixture.write_user_config(&format!(
         r#"
@@ -554,6 +554,6 @@ ca_bundle = "relative-ca.pem"
         .get_output()
         .clone();
     let invalid = parse_json(&invalid.stderr);
-    assert_eq!(invalid["error"]["code"], "secret-file-path-not-absolute");
-    assert_eq!(invalid["error"]["path"], "hosts.remote.ca_bundle");
+    assert_eq!(invalid["code"], "secret-file-path-not-absolute");
+    assert_eq!(invalid["details"]["path"], "hosts.remote.ca_bundle");
 }

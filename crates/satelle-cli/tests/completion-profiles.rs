@@ -21,6 +21,7 @@ fn satelle() -> Command {
         "SATELLE_LOG_DIR",
         "SATELLE_HOST",
         "SATELLE_PROFILE",
+        "SATELLE_ERROR_FORMAT",
         TEST_SUPPORT_ADAPTER_ENV,
     ] {
         command.env_remove(name);
@@ -261,7 +262,7 @@ fn update_profile_requires_an_output_directory() {
         .args(["completions", "bash", "--update-profile"])
         .arg(fixture.path().join(".bashrc"))
         .assert()
-        .code(2)
+        .code(64)
         .stdout(predicate::str::is_empty())
         .stderr(predicate::str::contains("--output-dir"));
 }
