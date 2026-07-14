@@ -6,8 +6,8 @@ use satelle_core::{
 };
 use satelle_host::{ApiBearerToken, ApiScopes};
 use satelle_transport::{
-    ApiErrorCode, DaemonClient, DaemonClientError, DaemonEventClient, EventSubscription,
-    TurnRequest,
+    ApiErrorCode, DaemonClient, DaemonClientError, DaemonEventClient, DaemonEventError,
+    EventSubscription, TurnRequest,
 };
 use std::io;
 use std::net::{Ipv4Addr, SocketAddr};
@@ -385,6 +385,59 @@ async fn direct_and_established_ssh_tunnel_share_session_error_and_event_contrac
     )
     .await;
 
+    tunnel
+        .shutdown()
+        .await
+        .expect("stop established-tunnel fixture");
+    running.server.shutdown().await.expect("stop daemon server");
+}
+
+#[tokio::test]
+async fn established_ssh_tunnel_requires_api_authentication_for_http_and_websocket() {
+    let running = RunningServer::start(ApiScopes::READ).await;
+    let tunnel = EstablishedTunnel::start(running.server.local_addr()).await;
+    let unregistered_token =
+        ApiBearerToken::generate().expect("generate valid unregistered API token");
+
+    let tunnel_address = tunnel.address;
+    let expected_host_identity = running.host_identity.clone();
+    let api_token = copy_token(&unregistered_token);
+    let api_error = tokio::task::spawn_blocking(move || {
+        let client = DaemonClient::loopback(tunnel_address, api_token, expected_host_identity)
+            .expect("construct established-tunnel HTTP client");
+        client
+            .host_status()
+            .expect_err("an unregistered credential must not read Host status")
+    })
+    .await
+    .expect("join established-tunnel authentication request");
+    assert!(matches!(
+        api_error,
+        DaemonClientError::Api { status, error }
+            if status == StatusCode::UNAUTHORIZED
+                && error.code() == ApiErrorCode::AuthenticationFailed
+                && error.host_identity().is_none()
+    ));
+
+    let event_client =
+        DaemonEventClient::loopback(tunnel.address, unregistered_token, &running.host_identity)
+            .expect("construct established-tunnel event client");
+    let event_error = match event_client
+        .connect_events(vec![EventSubscription::Host])
+        .await
+    {
+        Ok(_) => panic!("an unregistered credential must not complete the event handshake"),
+        Err(error) => error,
+    };
+    assert!(matches!(
+        event_error,
+        DaemonEventError::Handshake { status, error }
+            if status == StatusCode::UNAUTHORIZED.as_u16()
+                && error.code() == ApiErrorCode::AuthenticationFailed
+                && error.host_identity().is_none()
+    ));
+
+    drop(event_client);
     tunnel
         .shutdown()
         .await
