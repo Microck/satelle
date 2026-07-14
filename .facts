@@ -2208,7 +2208,10 @@
 - the ci tag is reserved for command-bearing facts, while manual conformance and release-gate requirements use the verification tag until an executable mapping exists @spec @mvp
 - every versioned JSON and NDJSON surface has contract tests for schema_version, required fields, enum tokens, stdout, stderr, and exit status @spec @verification @mvp
 - parser failures and semantic validation failures share the same human and JSON error conformance suite @spec @verification @mvp
-- direct and SSH-tunneled Host Daemon transports pass one shared API and Session conformance suite @spec @verification @mvp
+- id: imt
+  label: direct and SSH-tunneled Host Daemon transports pass one shared API and Session conformance suite
+  command: cargo test --locked -p satelle-transport --test http conformance::direct_and_established_ssh_tunnel_share_api_and_session_contract -- --exact
+  tags: [spec, verification, mvp, implemented, ci]
 - label: concurrent admission tests prove that one Control Lease cannot create two active Turns across processes
   command: cargo test --locked -p satelle-host --lib storage::tests::security::control_lease_process::cross_process_control_lease_blocks_competing_turn_after_owner_handoff -- --exact
   tags: [spec, verification, mvp, implemented, ci]
