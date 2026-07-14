@@ -805,11 +805,15 @@
 - idempotency HMAC keys inherit the token-verifier sensitive-state boundary, survive Host Daemon restart and migration restore for at least the maximum Idempotency Record retention window, and are never exposed through public APIs, logs, or diagnostics @spec @mvp
 - each Idempotency Record stores non-secret digest-schema and HMAC-key versions, and retired HMAC keys remain available until every record using them expires @mvp @implemented
 - an Idempotency Record durable outcome never contains raw bearer-token material or another one-time secret @contract @mvp @implemented
+- the operation-concurrency limit is one Host-global capacity budget shared by every API Principal, bearer token, transport, and connection for that Host Daemon @spec @contract @mvp @implemented
 - repeating a request with the same API Principal, operation, idempotency key, and request digest returns the original durable outcome without repeating side effects @mvp @implemented
+- a request matching an Idempotency Record that already has a durable outcome returns that outcome without checking or acquiring operation-concurrency capacity @spec @contract @mvp @implemented
 - a matching duplicate received while the original operation is in progress returns the same operation, Session, and Turn handles that exist at that point and never starts a second execution @contract @mvp @implemented
+- concurrent requests with the same API Principal, operation, idempotency key, and request digest join one logical operation and consume one shared operation-concurrency slot @spec @contract @mvp @implemented
 - a matching duplicate received after the original operation is terminal returns its durable terminal result @contract @mvp @implemented
 - a matching duplicate of a completed bearer-token issuance or rotation returns the original durable token metadata plus a typed token-secret-not-replayable result and revoke-and-reissue recovery guidance and never returns the raw token again @spec @contract @mvp
 - reusing an idempotency key with a different request digest fails with a typed idempotency-key-conflict error @mvp @implemented
+- a request that reuses an API Principal, operation, and idempotency key with a different request digest returns idempotency-key-conflict before operation-concurrency capacity is evaluated @spec @contract @mvp @implemented
 - Satelle Idempotency Records are retained for at least 24 hours after their operation becomes terminal @mvp @implemented
 - a successful mutating API response is emitted only after the corresponding state and Idempotency Record are durably committed @mvp @implemented
 - the authenticated satelle.capabilities.v2 response advertises the effective JSON body, attachment, WebSocket, connection, operation-concurrency, failed-authentication, authenticated-read, and control-request limits that the Host Daemon enforces @contract @mvp @implemented
@@ -824,6 +828,8 @@
 - rate-limited responses use the typed rate-limited error and include retry_after_ms when retry timing is known @contract @mvp @implemented
 - satelle Host Daemon does not log raw HTTP request bodies, Authorization headers, prompt text, or attachment bytes @spec @mvp
 - Host Daemon run and steer HTTP operations always return after durable asynchronous Turn admission; attach and detach are Controller presentation behaviors and are excluded from the operation payload and idempotency digest @spec @contract @mvp
+- a run or steer operation holds its operation-concurrency slot through durable asynchronous Turn admission and execution handoff, then releases the slot without waiting for the admitted Turn to become terminal @spec @contract @mvp @implemented
+- a stop operation holds its operation-concurrency slot until the stop is durably confirmed and its Idempotency Record durable outcome is committed @spec @contract @mvp @implemented
 
 ## mcp
 - id: e8h

@@ -363,12 +363,39 @@ impl HostService {
             canonical_payload.as_slice(),
             canonical_payload.digest_schema_version,
         )?;
-        crate::runtime::admitted_session(
-            self.runtime.run(
-                RunCommand::detached_with_identity(LOCAL_DEMO_HOST, &intent.prompt, identity)
-                    .with_execution_mode(intent.execution_mode),
-            ),
-        )
+        let operation_identity = identity.clone();
+        self.operation_capacity
+            .execute(
+                crate::operation_capacity::OperationRequest::new(
+                    IdempotentOperation::Run,
+                    &identity,
+                ),
+                || {
+                    self.runtime
+                        .replay_admission_if_present(IdempotentOperation::Run, &identity, None)
+                        .map(|replay| {
+                            replay.map(|replay| {
+                                crate::operation_capacity::OperationOutcome::Session(
+                                    replay.into_session(),
+                                )
+                            })
+                        })
+                },
+                || {
+                    crate::runtime::admitted_session(
+                        self.runtime.run(
+                            RunCommand::detached_with_identity(
+                                LOCAL_DEMO_HOST,
+                                &intent.prompt,
+                                operation_identity,
+                            )
+                            .with_execution_mode(intent.execution_mode),
+                        ),
+                    )
+                    .map(crate::operation_capacity::OperationOutcome::Session)
+                },
+            )?
+            .into_session()
     }
 
     pub fn admit_steer(
@@ -393,12 +420,43 @@ impl HostService {
             canonical_payload.as_slice(),
             canonical_payload.digest_schema_version,
         )?;
-        crate::runtime::admitted_session(
-            self.runtime.steer(
-                SteerCommand::detached_with_identity(session_id.clone(), &intent.prompt, identity)
-                    .with_execution_mode(intent.execution_mode),
-            ),
-        )
+        let operation_identity = identity.clone();
+        self.operation_capacity
+            .execute(
+                crate::operation_capacity::OperationRequest::new(
+                    IdempotentOperation::Steer,
+                    &identity,
+                ),
+                || {
+                    self.runtime
+                        .replay_admission_if_present(
+                            IdempotentOperation::Steer,
+                            &identity,
+                            Some(session_id),
+                        )
+                        .map(|replay| {
+                            replay.map(|replay| {
+                                crate::operation_capacity::OperationOutcome::Session(
+                                    replay.into_session(),
+                                )
+                            })
+                        })
+                },
+                || {
+                    crate::runtime::admitted_session(
+                        self.runtime.steer(
+                            SteerCommand::detached_with_identity(
+                                session_id.clone(),
+                                &intent.prompt,
+                                operation_identity,
+                            )
+                            .with_execution_mode(intent.execution_mode),
+                        ),
+                    )
+                    .map(crate::operation_capacity::OperationOutcome::Session)
+                },
+            )?
+            .into_session()
     }
 
     pub fn admit_stop(
@@ -420,14 +478,31 @@ impl HostService {
             canonical_payload.as_slice(),
             canonical_payload.digest_schema_version,
         )?;
-        let outcome = self
-            .runtime
-            .stop_with_snapshot(StopCommand::with_identity(session_id.clone(), identity))?;
-        Ok(StopAdmission {
-            result: outcome.result,
-            session_state_revision: outcome.session_state_revision,
-            turn_state_revision: outcome.turn_state_revision,
-        })
+        let operation_identity = identity.clone();
+        self.operation_capacity
+            .execute(
+                crate::operation_capacity::OperationRequest::new(
+                    IdempotentOperation::Stop,
+                    &identity,
+                ),
+                || {
+                    self.runtime
+                        .replay_completed_stop_if_present(session_id, &identity)
+                        .map(|outcome| {
+                            outcome.map(crate::operation_capacity::OperationOutcome::Stop)
+                        })
+                },
+                || {
+                    self.runtime
+                        .stop_with_snapshot(StopCommand::with_identity(
+                            session_id.clone(),
+                            operation_identity,
+                        ))
+                        .map(crate::operation_capacity::OperationOutcome::Stop)
+                },
+            )?
+            .into_stop()
+            .map(stop_admission)
     }
 
     pub fn session_status(&self, session_id: &SessionId) -> Result<PublicSession, SatelleError> {
@@ -442,6 +517,9 @@ impl HostService {
             runtime: crate::runtime::RuntimeHandle::new(
                 Ok(state_root.into()),
                 crate::test_runtime::FakeComputerUseAdapter,
+            ),
+            operation_capacity: std::sync::Arc::new(
+                crate::operation_capacity::OperationCapacity::default(),
             ),
             mode: HostMode::TestFake,
         })
@@ -471,6 +549,14 @@ fn daemon_status(snapshot: crate::runtime::RuntimeSnapshot) -> DaemonRuntimeStat
         session_count: snapshot.session_count(),
         active_turn_count: snapshot.active_turn_count(),
         recovery_pending_turn_count: snapshot.recovery_pending_turn_count(),
+    }
+}
+
+fn stop_admission(outcome: crate::runtime::RuntimeStopOutcome) -> StopAdmission {
+    StopAdmission {
+        result: outcome.result,
+        session_state_revision: outcome.session_state_revision,
+        turn_state_revision: outcome.turn_state_revision,
     }
 }
 

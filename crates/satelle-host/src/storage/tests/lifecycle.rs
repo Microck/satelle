@@ -576,6 +576,74 @@ fn begin_stop_claims_before_observation_and_confirmed_stop_releases_lease() {
 }
 
 #[test]
+fn not_confirmed_stop_replays_after_the_turn_advances() {
+    let state = TempDir::new().expect("temporary state directory");
+    let (mut storage, _) = Storage::open(state.path()).expect("open storage");
+    let session = initial_session(&storage, SESSION_1, TURN_1, at(0));
+    let AdmissionOutcome::Execute {
+        session: starting, ..
+    } = storage
+        .begin_session(
+            &session,
+            &admission(IdempotentOperation::Run, "run-1", "request-run-1", at(0)),
+        )
+        .expect("admit initial Session")
+    else {
+        panic!("new Session admission must execute");
+    };
+    let running = storage
+        .commit_lifecycle(
+            starting.id(),
+            &turn_id(TURN_1),
+            revisions(&starting, TURN_1),
+            TurnTransition::Running,
+            at(1),
+        )
+        .expect("commit running");
+    record_upstream_refs(
+        &mut storage,
+        running.id(),
+        &turn_id(TURN_1),
+        "thread-private-1",
+        "turn-private-1",
+    );
+    let stop_idempotency = idempotency(IdempotentOperation::Stop, "stop-1", at(2));
+    let claim = match storage
+        .begin_stop(running.id(), &turn_id(TURN_1), &stop_idempotency)
+        .expect("claim stop")
+    {
+        BeginStopOutcome::Observe(claim) => claim,
+        BeginStopOutcome::Complete(_) => panic!("an active Turn requires observation"),
+    };
+    let not_confirmed = storage
+        .confirm_stop(claim, StopObservation::UpstreamStillActive, at(3))
+        .expect("persist the not-confirmed outcome");
+    assert_eq!(
+        &StopCommitOutcome::NotConfirmed {
+            ownership: satelle_core::session::RetainedOwnership::Active,
+            changed: false,
+        },
+        not_confirmed.outcome()
+    );
+
+    storage
+        .commit_lifecycle(
+            running.id(),
+            &turn_id(TURN_1),
+            revisions(&running, TURN_1),
+            TurnTransition::Completed,
+            at(4),
+        )
+        .expect("the retained worker may complete after the stop response");
+
+    let replay = storage
+        .replay_completed_stop_if_present(running.id(), &stop_idempotency)
+        .expect("replay the durable not-confirmed response")
+        .expect("the completed stop record must be present");
+    assert_eq!(not_confirmed.outcome(), replay.outcome());
+}
+
+#[test]
 fn pending_stop_blocks_a_later_nonterminal_execution_commit() {
     let state = TempDir::new().expect("temporary state directory");
     let (mut storage, _) = Storage::open(state.path()).expect("open storage");

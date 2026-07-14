@@ -212,13 +212,7 @@ pub(super) fn storage_failure(error: StorageError) -> SatelleError {
     }
     match error.kind() {
         StorageErrorKind::InvalidInput => SatelleError::invalid_usage(error.to_string()),
-        StorageErrorKind::IdempotencyConflict => SatelleError {
-            code: ErrorCode::IdempotencyKeyConflict,
-            message: "the idempotency key was already used for a different request".to_string(),
-            recovery_command: None,
-            source_detail: None,
-            details: std::collections::BTreeMap::new(),
-        },
+        StorageErrorKind::IdempotencyConflict => idempotency_conflict(),
         StorageErrorKind::Busy => SatelleError::storage_busy(),
         StorageErrorKind::StoreInUse => SatelleError::store_in_use(),
         StorageErrorKind::StateConflict => SatelleError::state_conflict(),
@@ -230,6 +224,16 @@ pub(super) fn storage_failure(error: StorageError) -> SatelleError {
         | StorageErrorKind::InvalidStoredState
         | StorageErrorKind::PrivateReferenceConflict => integrity_failure(error.to_string()),
         _ => runtime_failure(error.to_string()),
+    }
+}
+
+pub(super) fn idempotency_conflict() -> SatelleError {
+    SatelleError {
+        code: ErrorCode::IdempotencyKeyConflict,
+        message: "the idempotency key was already used for a different request".to_string(),
+        recovery_command: None,
+        source_detail: None,
+        details: std::collections::BTreeMap::new(),
     }
 }
 

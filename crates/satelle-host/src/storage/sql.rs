@@ -742,18 +742,22 @@ pub(super) fn complete_stop_idempotency(
     transaction: &Transaction<'_>,
     input: &IdempotencyInput,
     durable_outcome: &str,
+    session: &Session,
     at: OffsetDateTime,
 ) -> Result<(), StorageError> {
     let changed = transaction
         .execute(
             "UPDATE idempotency_records \
-             SET status = 'terminal', durable_outcome = ?1, completed_at = ?2, expires_at = ?3 \
-             WHERE principal_ref = ?4 AND operation = 'stop' AND idempotency_key = ?5 \
-               AND request_digest = ?6 AND status = 'in_progress'",
+             SET status = 'terminal', durable_outcome = ?1, completed_at = ?2, expires_at = ?3, \
+                 result_session_state_revision = ?4, result_session_updated_at = ?5 \
+             WHERE principal_ref = ?6 AND operation = 'stop' AND idempotency_key = ?7 \
+               AND request_digest = ?8 AND status = 'in_progress'",
             params![
                 durable_outcome,
                 format_time(at)?,
                 format_time(at + IDEMPOTENCY_RETENTION)?,
+                format_revision(session.session_state_revision()),
+                format_time(session.updated_at())?,
                 input.principal_ref.as_str(),
                 input.key.as_str(),
                 input.request_digest.as_str(),

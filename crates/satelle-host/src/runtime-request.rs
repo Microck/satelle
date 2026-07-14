@@ -31,23 +31,23 @@ impl RequestIdentity {
         }
     }
 
-    pub(super) fn principal_ref(&self) -> &str {
+    pub(crate) fn principal_ref(&self) -> &str {
         &self.principal_ref
     }
 
-    pub(super) fn key(&self) -> &str {
+    pub(crate) fn key(&self) -> &str {
         &self.key
     }
 
-    pub(super) fn request_digest(&self) -> &str {
+    pub(crate) fn request_digest(&self) -> &str {
         &self.request_digest
     }
 
-    pub(super) const fn digest_schema_version(&self) -> u16 {
+    pub(crate) const fn digest_schema_version(&self) -> u16 {
         self.digest_schema_version
     }
 
-    pub(super) const fn hmac_key_version(&self) -> u16 {
+    pub(crate) const fn hmac_key_version(&self) -> u16 {
         self.hmac_key_version
     }
 
