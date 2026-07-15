@@ -2,7 +2,7 @@ use assert_cmd::Command;
 use predicates::prelude::*;
 use satelle_core::SessionId;
 use satelle_host::{ApiBearerToken, test_support::TestStateDir};
-use satelle_test_contract::assert_privacy_canaries_absent;
+use satelle_test_contract::{assert_directory_tree_unchanged, assert_privacy_canaries_absent};
 use serde_json::Value;
 use std::collections::BTreeSet;
 use std::fs;
@@ -1865,17 +1865,135 @@ fn logs_accepts_only_canonical_sources_and_severities() {
 }
 
 #[test]
-fn setup_dry_run_does_not_write_local_demo_state() {
-    let state = state_dir();
-    satelle()
-        .env("SATELLE_STATE_DIR", state.path())
-        .args(["setup", "--dry-run", "--host", "local-demo"])
-        .assert()
-        .success()
-        .stdout(predicate::str::contains("Dry run: true"))
-        .stdout(predicate::str::contains("Mutated: false"));
+fn production_setup_dry_run_reports_plan_without_mutating_declared_paths() {
+    let sandbox = state_dir();
+    let operator_home = sandbox.path().join("operator/home");
+    let operator_config_file = sandbox.path().join("operator/config/config.toml");
+    let operator_state_dir = sandbox.path().join("operator/state");
+    let operator_cache_dir = sandbox.path().join("operator/cache");
+    let operator_log_dir = sandbox.path().join("operator/logs");
+    let daemon_home = sandbox.path().join("daemon/home");
+    let daemon_config_file = sandbox.path().join("daemon/config/config.toml");
+    let daemon_state_dir = sandbox.path().join("daemon/state");
+    let daemon_cache_dir = sandbox.path().join("daemon/cache");
+    let daemon_log_dir = sandbox.path().join("daemon/logs");
 
-    assert!(!state.path().join("local-demo-state.json").exists());
+    for config_parent in [
+        operator_config_file
+            .parent()
+            .expect("operator config path should have a parent"),
+        daemon_config_file
+            .parent()
+            .expect("daemon config path should have a parent"),
+    ] {
+        fs::create_dir_all(config_parent).expect("config parent directory should be created");
+    }
+
+    write_user_config(
+        &operator_config_file,
+        r#"
+default_host = "local-demo"
+
+[hosts.local-demo]
+transport = "local"
+adapter = "codex"
+"#,
+    )
+    .expect("production local Host config should be written");
+    write_user_config(&daemon_config_file, b"daemon config canary\n")
+        .expect("daemon config canary should be written");
+
+    for (directory, canary) in [
+        (&operator_home, "operator home canary"),
+        (&operator_state_dir, "operator state canary"),
+        (&operator_cache_dir, "operator cache canary"),
+        (&operator_log_dir, "operator log canary"),
+        (&daemon_home, "daemon home canary"),
+        (&daemon_state_dir, "daemon state canary"),
+        (&daemon_cache_dir, "daemon cache canary"),
+        (&daemon_log_dir, "daemon log canary"),
+    ] {
+        let canary_path = directory.join("nested/canary.bin");
+        fs::create_dir_all(
+            canary_path
+                .parent()
+                .expect("canary path should have a parent"),
+        )
+        .expect("nested canary directory should be created");
+        fs::write(canary_path, canary.as_bytes()).expect("nested canary should be written");
+    }
+
+    let output = assert_directory_tree_unchanged("satelle setup --dry-run", sandbox.path(), || {
+        production_satelle()
+            .env("SATELLE_HOME", &operator_home)
+            .env("SATELLE_CONFIG_FILE", &operator_config_file)
+            .env("SATELLE_STATE_DIR", &operator_state_dir)
+            .env("SATELLE_CACHE_DIR", &operator_cache_dir)
+            .env("SATELLE_LOG_DIR", &operator_log_dir)
+            .args(["setup", "--dry-run", "--host", "local-demo", "--json"])
+            .arg("--daemon-home")
+            .arg(&daemon_home)
+            .arg("--daemon-config-file")
+            .arg(&daemon_config_file)
+            .arg("--daemon-state-dir")
+            .arg(&daemon_state_dir)
+            .arg("--daemon-cache-dir")
+            .arg(&daemon_cache_dir)
+            .arg("--daemon-log-dir")
+            .arg(&daemon_log_dir)
+            .assert()
+            .success()
+            .stderr(predicate::str::is_empty())
+            .get_output()
+            .clone()
+    });
+    let report = parse_json_output(&output.stdout);
+
+    assert_eq!(report["schema_version"], "satelle.setup.v1");
+    assert_eq!(report["dry_run"], true);
+    assert_eq!(report["status"], "planned");
+    assert_eq!(
+        report["daemon_path_overrides"],
+        serde_json::json!([
+            {
+                "environment_variable": "SATELLE_HOME",
+                "value": daemon_home,
+                "source": "setup_flag",
+                "service_configuration_surface": "satelle_service_configuration",
+            },
+            {
+                "environment_variable": "SATELLE_CONFIG_FILE",
+                "value": daemon_config_file,
+                "source": "setup_flag",
+                "service_configuration_surface": "satelle_service_configuration",
+            },
+            {
+                "environment_variable": "SATELLE_STATE_DIR",
+                "value": daemon_state_dir,
+                "source": "setup_flag",
+                "service_configuration_surface": "satelle_service_configuration",
+            },
+            {
+                "environment_variable": "SATELLE_CACHE_DIR",
+                "value": daemon_cache_dir,
+                "source": "setup_flag",
+                "service_configuration_surface": "satelle_service_configuration",
+            },
+            {
+                "environment_variable": "SATELLE_LOG_DIR",
+                "value": daemon_log_dir,
+                "source": "setup_flag",
+                "service_configuration_surface": "satelle_service_configuration",
+            },
+        ])
+    );
+    assert!(
+        report["planned_actions"]
+            .as_array()
+            .is_some_and(|actions| !actions.is_empty())
+    );
+    assert_eq!(report["applied_actions"], serde_json::json!([]));
+    assert_eq!(report["mutated"], false);
 }
 
 #[test]

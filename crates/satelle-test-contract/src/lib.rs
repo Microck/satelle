@@ -1,5 +1,25 @@
-use std::{fmt::Debug, process::Output};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    fmt::Debug,
+    fs,
+    path::{Path, PathBuf},
+    process::Output,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        mpsc::{self, RecvTimeoutError},
+    },
+    time::{Duration, Instant},
+};
 
+#[cfg(unix)]
+use std::os::unix::fs::MetadataExt;
+#[cfg(windows)]
+use std::os::windows::fs::MetadataExt;
+
+use notify::{
+    Config, Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher,
+    event::{MetadataKind, ModifyKind},
+};
 use serde_json::{Value, json};
 
 const ERROR_KEYS: [&str; 8] = [
@@ -88,6 +108,269 @@ pub fn assert_privacy_canaries_absent(surface: &str, observed: &[u8], canaries: 
             "{surface} leaked private canary {canary:?}"
         );
     }
+}
+
+#[derive(Debug, Eq, PartialEq)]
+enum DirectoryTreeEntryKind {
+    Directory,
+    RegularFile(Vec<u8>),
+    Symlink(PathBuf),
+    Other,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct StableAccessMetadata {
+    readonly: bool,
+    #[cfg(unix)]
+    mode: u32,
+    #[cfg(unix)]
+    uid: u32,
+    #[cfg(unix)]
+    gid: u32,
+    #[cfg(windows)]
+    file_attributes: u32,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct DirectoryTreeEntry {
+    kind: DirectoryTreeEntryKind,
+    access: StableAccessMetadata,
+}
+
+const MUTATION_BARRIER_TIMEOUT: Duration = Duration::from_secs(5);
+static MUTATION_BARRIER_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+struct MutationBarrier {
+    path: PathBuf,
+    armed: bool,
+}
+
+impl MutationBarrier {
+    fn create(operation: &str, root: &Path) -> Self {
+        let sequence = MUTATION_BARRIER_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let path = root.join(format!(
+            ".satelle-mutation-barrier-{}-{sequence}",
+            std::process::id()
+        ));
+        fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .unwrap_or_else(|error| {
+                panic!(
+                    "{operation} could not create mutation watcher barrier {}: {error}",
+                    path.display()
+                )
+            });
+        Self { path, armed: true }
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+
+    fn remove(mut self, operation: &str) {
+        fs::remove_file(&self.path).unwrap_or_else(|error| {
+            panic!(
+                "{operation} could not remove mutation watcher barrier {}: {error}",
+                self.path.display()
+            )
+        });
+        self.armed = false;
+    }
+}
+
+impl Drop for MutationBarrier {
+    fn drop(&mut self) {
+        if self.armed {
+            // Cleanup during unwinding must not replace the original watcher failure.
+            let _ = fs::remove_file(&self.path);
+        }
+    }
+}
+
+fn snapshot_directory_tree(root: &Path) -> std::io::Result<BTreeMap<PathBuf, DirectoryTreeEntry>> {
+    fn visit(
+        root: &Path,
+        path: &Path,
+        entries: &mut BTreeMap<PathBuf, DirectoryTreeEntry>,
+    ) -> std::io::Result<()> {
+        let metadata = fs::symlink_metadata(path)?;
+        let relative_path = path
+            .strip_prefix(root)
+            .expect("snapshot paths should remain beneath the requested root")
+            .to_path_buf();
+        let file_type = metadata.file_type();
+        let kind = if file_type.is_dir() {
+            DirectoryTreeEntryKind::Directory
+        } else if file_type.is_file() {
+            DirectoryTreeEntryKind::RegularFile(fs::read(path)?)
+        } else if file_type.is_symlink() {
+            DirectoryTreeEntryKind::Symlink(fs::read_link(path)?)
+        } else {
+            DirectoryTreeEntryKind::Other
+        };
+        let access = StableAccessMetadata {
+            readonly: metadata.permissions().readonly(),
+            #[cfg(unix)]
+            mode: metadata.mode(),
+            #[cfg(unix)]
+            uid: metadata.uid(),
+            #[cfg(unix)]
+            gid: metadata.gid(),
+            #[cfg(windows)]
+            file_attributes: metadata.file_attributes(),
+        };
+        entries.insert(relative_path, DirectoryTreeEntry { kind, access });
+
+        if file_type.is_dir() {
+            for child in fs::read_dir(path)? {
+                visit(root, &child?.path(), entries)?;
+            }
+        }
+        Ok(())
+    }
+
+    let mut entries = BTreeMap::new();
+    visit(root, root, &mut entries)?;
+    Ok(entries)
+}
+
+fn is_ignored_filesystem_event(kind: EventKind) -> bool {
+    matches!(
+        kind,
+        EventKind::Access(_) | EventKind::Modify(ModifyKind::Metadata(MetadataKind::AccessTime))
+    )
+}
+
+fn observe_transient_mutations(
+    operation: &str,
+    root: &Path,
+    barrier_path: &Path,
+    events: &mpsc::Receiver<notify::Result<Event>>,
+) -> BTreeSet<PathBuf> {
+    let deadline = Instant::now() + MUTATION_BARRIER_TIMEOUT;
+    let mut changed_paths = BTreeSet::new();
+    let mut barrier_observed = false;
+
+    while !barrier_observed {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            panic!(
+                "{operation} mutation watcher did not observe its barrier for {}",
+                root.display()
+            );
+        }
+        match events.recv_timeout(remaining) {
+            Ok(Ok(event)) => {
+                if event.need_rescan() {
+                    panic!(
+                        "{operation} mutation watcher lost events for {}",
+                        root.display()
+                    );
+                }
+                let ignored = is_ignored_filesystem_event(event.kind);
+                barrier_observed = !ignored && event.paths.iter().any(|path| path == barrier_path);
+                if ignored {
+                    continue;
+                }
+                let mut event_path_observed = false;
+                for path in event.paths.iter().filter(|path| *path != barrier_path) {
+                    if let Ok(relative_path) = path.strip_prefix(root) {
+                        changed_paths.insert(relative_path.to_path_buf());
+                        event_path_observed = true;
+                    }
+                }
+                if !barrier_observed && !event_path_observed {
+                    changed_paths.insert(PathBuf::from("."));
+                }
+            }
+            Ok(Err(error)) => panic!(
+                "{operation} mutation watcher failed for {}: {error}",
+                root.display()
+            ),
+            Err(RecvTimeoutError::Timeout) => panic!(
+                "{operation} mutation watcher did not observe its barrier for {}",
+                root.display()
+            ),
+            Err(RecvTimeoutError::Disconnected) => panic!(
+                "{operation} mutation watcher disconnected for {}",
+                root.display()
+            ),
+        }
+    }
+    changed_paths
+}
+
+/// Runs an operation and asserts that its directory tree remains byte-for-byte unchanged.
+///
+/// Native filesystem events detect transient writes while final snapshots record relative paths,
+/// entry kinds, regular-file bytes, symlink targets, and the stable access metadata exposed by the
+/// standard library. Symlinks are never followed, and volatile timestamps are intentionally
+/// ignored.
+pub fn assert_directory_tree_unchanged<T>(
+    operation: &str,
+    root: impl AsRef<Path>,
+    run: impl FnOnce() -> T,
+) -> T {
+    let root = fs::canonicalize(root.as_ref()).unwrap_or_else(|error| {
+        panic!(
+            "{operation} could not resolve directory tree {}: {error}",
+            root.as_ref().display()
+        )
+    });
+    let snapshot = || {
+        snapshot_directory_tree(&root).unwrap_or_else(|error| {
+            panic!(
+                "{operation} could not snapshot directory tree {}: {error}",
+                root.display()
+            )
+        })
+    };
+    let before = snapshot();
+    let (event_sender, event_receiver) = mpsc::channel();
+    let mut watcher =
+        RecommendedWatcher::new(event_sender, Config::default().with_follow_symlinks(false))
+            .unwrap_or_else(|error| {
+                panic!(
+                    "{operation} could not start mutation watcher for {}: {error}",
+                    root.display()
+                )
+            });
+    watcher
+        .watch(&root, RecursiveMode::Recursive)
+        .unwrap_or_else(|error| {
+            panic!(
+                "{operation} could not watch directory tree {}: {error}",
+                root.display()
+            )
+        });
+    let result = run();
+    let barrier = MutationBarrier::create(operation, &root);
+    let mut changed_paths =
+        observe_transient_mutations(operation, &root, barrier.path(), &event_receiver);
+    watcher.unwatch(&root).unwrap_or_else(|error| {
+        panic!(
+            "{operation} could not stop mutation watcher for {}: {error}",
+            root.display()
+        )
+    });
+    barrier.remove(operation);
+    let after = snapshot();
+    changed_paths.extend(
+        before
+            .keys()
+            .chain(after.keys())
+            .filter(|path| before.get(*path) != after.get(*path))
+            .cloned(),
+    );
+
+    assert!(
+        changed_paths.is_empty(),
+        "{operation} mutated directory tree {}; changed paths: {changed_paths:#?}",
+        root.display(),
+    );
+    result
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1214,6 +1497,8 @@ pub fn assert_versioned_payload_contract<E: Debug>(
 mod tests {
     use super::*;
 
+    static TEMP_TREE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
     #[test]
     fn privacy_canary_assertion_accepts_clean_raw_bytes() {
         assert_privacy_canaries_absent(
@@ -1231,6 +1516,114 @@ mod tests {
             b"public prefix PRIVATE_SECRET_CANARY public suffix",
             &["PRIVATE_PROMPT_CANARY", "PRIVATE_SECRET_CANARY"],
         );
+    }
+
+    #[test]
+    fn directory_tree_assertion_reports_the_operation_and_added_path() {
+        let sequence = TEMP_TREE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let tree = std::env::temp_dir().join(format!(
+            "satelle-test-contract-{}-{sequence}",
+            std::process::id()
+        ));
+        fs::create_dir(&tree).expect("temporary directory tree should be created");
+        let failure = std::panic::catch_unwind(|| {
+            assert_directory_tree_unchanged("maintenance dry run", &tree, || {
+                fs::write(tree.join("unexpected-state.json"), b"mutated")
+                    .expect("deliberate test mutation should be written");
+            });
+        });
+        fs::remove_dir_all(&tree).expect("temporary directory tree should be removed");
+        let failure = failure.expect_err("an added file must fail the unchanged assertion");
+        let message = failure
+            .downcast_ref::<String>()
+            .expect("assertion panic should contain a string message");
+
+        assert!(message.contains("maintenance dry run mutated directory tree"));
+        assert!(message.contains("unexpected-state.json"));
+    }
+
+    #[test]
+    fn directory_tree_assertion_reports_a_permission_change() {
+        let sequence = TEMP_TREE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let tree = std::env::temp_dir().join(format!(
+            "satelle-test-contract-{}-{sequence}",
+            std::process::id()
+        ));
+        fs::create_dir(&tree).expect("temporary directory tree should be created");
+        let canary = tree.join("permission-canary.txt");
+        fs::write(&canary, b"unchanged bytes").expect("permission canary should be written");
+        let original_permissions = fs::metadata(&canary)
+            .expect("permission canary metadata should be readable")
+            .permissions();
+        let failure = std::panic::catch_unwind(|| {
+            assert_directory_tree_unchanged("maintenance dry run", &tree, || {
+                let mut changed_permissions = original_permissions.clone();
+                changed_permissions.set_readonly(true);
+                fs::set_permissions(&canary, changed_permissions)
+                    .expect("permission canary should become read-only");
+            });
+        });
+        fs::set_permissions(&canary, original_permissions)
+            .expect("permission canary permissions should be restored");
+        fs::remove_dir_all(&tree).expect("temporary directory tree should be removed");
+        let failure = failure.expect_err("a permission change must fail the unchanged assertion");
+        let message = failure
+            .downcast_ref::<String>()
+            .expect("assertion panic should contain a string message");
+
+        assert!(message.contains("maintenance dry run mutated directory tree"));
+        assert!(message.contains("permission-canary.txt"));
+    }
+
+    #[test]
+    fn directory_tree_assertion_reports_a_transient_mutation() {
+        let sequence = TEMP_TREE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let tree = std::env::temp_dir().join(format!(
+            "satelle-test-contract-{}-{sequence}",
+            std::process::id()
+        ));
+        fs::create_dir(&tree).expect("temporary directory tree should be created");
+        let failure = std::panic::catch_unwind(|| {
+            assert_directory_tree_unchanged("maintenance dry run", &tree, || {
+                let transient = tree.join("transient-state.json");
+                fs::write(&transient, b"mutated")
+                    .expect("transient test mutation should be written");
+                fs::remove_file(transient).expect("transient test mutation should be removed");
+            });
+        });
+        fs::remove_dir_all(&tree).expect("temporary directory tree should be removed");
+        let failure = failure.expect_err("a transient mutation must fail the unchanged assertion");
+        let message = failure
+            .downcast_ref::<String>()
+            .expect("assertion panic should contain a string message");
+
+        assert!(message.contains("maintenance dry run mutated directory tree"));
+        assert!(message.contains("transient-state.json"));
+    }
+
+    #[test]
+    fn mutation_barrier_is_removed_during_unwind() {
+        let sequence = TEMP_TREE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let tree = std::env::temp_dir().join(format!(
+            "satelle-test-contract-{}-{sequence}",
+            std::process::id()
+        ));
+        fs::create_dir(&tree).expect("temporary directory tree should be created");
+
+        let failure = std::panic::catch_unwind(|| {
+            let _barrier = MutationBarrier::create("maintenance dry run", &tree);
+            panic!("deliberate unwind after mutation barrier creation");
+        });
+
+        assert!(failure.is_err(), "the deliberate panic should unwind");
+        assert_eq!(
+            fs::read_dir(&tree)
+                .expect("temporary directory tree should be readable")
+                .count(),
+            0,
+            "the mutation barrier should be removed during unwind"
+        );
+        fs::remove_dir(&tree).expect("temporary directory tree should be removed");
     }
 
     #[rustfmt::skip]
