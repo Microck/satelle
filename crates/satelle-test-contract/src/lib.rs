@@ -1038,9 +1038,269 @@ pub fn assert_archive_npm_executable_parity_contract<E: Debug>(
     assert_archive_npm_parity_cases(&ARCHIVE_NPM_PARITY_CASES, evaluate);
 }
 
+/// The expected top-level framing of one versioned machine-readable payload.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum VersionedPayloadFraming {
+    Json,
+    Ndjson,
+}
+
+/// One top-level enum field and its complete allowed token set for a schema version.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct VersionedPayloadEnumFieldContract {
+    pub field: &'static str,
+    pub allowed_tokens: &'static [&'static str],
+}
+
+/// Raw channel-neutral observations and expectations for one versioned payload surface.
+///
+/// Carrier values are opaque identifiers compared only for equality. They do not classify or map
+/// process, HTTP, WebSocket, or any other transport behavior.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct VersionedPayloadContractFixture {
+    pub expected_carrier: &'static str,
+    pub observed_carrier: &'static str,
+    pub framing: VersionedPayloadFraming,
+    pub payload: &'static [u8],
+    pub expected_schema_version: &'static str,
+    pub required_fields: &'static [&'static str],
+    pub enum_fields: &'static [VersionedPayloadEnumFieldContract],
+}
+
+/// Ordinary adapter decisions; errors are reserved for materialization or harness failures.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum VersionedPayloadAdapterOutcome {
+    Accepted,
+    Rejected,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct VersionedPayloadContractCase<F> {
+    name: &'static str,
+    fixture: F,
+    expected: ExpectedOutcome,
+}
+
+const fn versioned_payload_case<F>(
+    name: &'static str,
+    fixture: F,
+    expected: ExpectedOutcome,
+) -> VersionedPayloadContractCase<F> {
+    VersionedPayloadContractCase {
+        name,
+        fixture,
+        expected,
+    }
+}
+
+const VERSIONED_PAYLOAD_REQUIRED_FIELDS: [&str; 3] = ["schema_version", "id", "state"];
+const VERSIONED_PAYLOAD_STATE_TOKENS: [&str; 2] = ["ready", "busy"];
+const VERSIONED_PAYLOAD_ENUM_FIELDS: [VersionedPayloadEnumFieldContract; 1] =
+    [VersionedPayloadEnumFieldContract {
+        field: "state",
+        allowed_tokens: &VERSIONED_PAYLOAD_STATE_TOKENS,
+    }];
+
+const VALID_JSON_PAYLOAD: &[u8] =
+    br#"{"schema_version":"satelle.catalog.v1","id":"one","state":"ready"}"#;
+const NULL_REQUIRED_FIELD_JSON_PAYLOAD: &[u8] =
+    br#"{"schema_version":"satelle.catalog.v1","id":null,"state":"ready"}"#;
+const VALID_NDJSON_PAYLOAD: &[u8] = b"{\"schema_version\":\"satelle.catalog.v1\",\"id\":\"one\",\"state\":\"ready\"}\n{\"schema_version\":\"satelle.catalog.v1\",\"id\":\"two\",\"state\":\"busy\"}\n";
+const MISSING_SCHEMA_VERSION_PAYLOAD: &[u8] = br#"{"id":"one","state":"ready"}"#;
+const WRONG_SCHEMA_VERSION_PAYLOAD: &[u8] =
+    br#"{"schema_version":"satelle.catalog.v2","id":"one","state":"ready"}"#;
+const NON_STRING_SCHEMA_VERSION_PAYLOAD: &[u8] =
+    br#"{"schema_version":1,"id":"one","state":"ready"}"#;
+const MISSING_REQUIRED_FIELD_PAYLOAD: &[u8] =
+    br#"{"schema_version":"satelle.catalog.v1","state":"ready"}"#;
+const NON_STRING_ENUM_TOKEN_PAYLOAD: &[u8] =
+    br#"{"schema_version":"satelle.catalog.v1","id":"one","state":1}"#;
+const NON_OBJECT_JSON_PAYLOAD: &[u8] = br#"["satelle.catalog.v1","one","ready"]"#;
+const INVALID_SECOND_NDJSON_ENUM_PAYLOAD: &[u8] = b"{\"schema_version\":\"satelle.catalog.v1\",\"id\":\"one\",\"state\":\"ready\"}\n{\"schema_version\":\"satelle.catalog.v1\",\"id\":\"two\",\"state\":\"unknown\"}\n";
+const PRETTY_JSON_BYTES_FOR_NDJSON_PAYLOAD: &[u8] = b"{\n  \"schema_version\": \"satelle.catalog.v1\",\n  \"id\": \"one\",\n  \"state\": \"ready\"\n}\n";
+const MALFORMED_JSON_PAYLOAD: &[u8] =
+    br#"{"schema_version":"satelle.catalog.v1","id":"one","state":"ready"#;
+const MALFORMED_SECOND_NDJSON_PAYLOAD: &[u8] = b"{\"schema_version\":\"satelle.catalog.v1\",\"id\":\"one\",\"state\":\"ready\"}\n{\"schema_version\":\"satelle.catalog.v1\",\"id\":\"two\",\"state\":\"busy\"\n";
+
+const VALID_VERSIONED_JSON_FIXTURE: VersionedPayloadContractFixture =
+    VersionedPayloadContractFixture {
+        expected_carrier: "opaque-catalog-carrier",
+        observed_carrier: "opaque-catalog-carrier",
+        framing: VersionedPayloadFraming::Json,
+        payload: VALID_JSON_PAYLOAD,
+        expected_schema_version: "satelle.catalog.v1",
+        required_fields: &VERSIONED_PAYLOAD_REQUIRED_FIELDS,
+        enum_fields: &VERSIONED_PAYLOAD_ENUM_FIELDS,
+    };
+
+#[rustfmt::skip]
+const VERSIONED_PAYLOAD_CASES: [VersionedPayloadContractCase<VersionedPayloadContractFixture>; 15] = [
+    versioned_payload_case("single JSON value satisfies the versioned contract", VALID_VERSIONED_JSON_FIXTURE, Accept),
+    versioned_payload_case("present nullable field satisfies required-field presence", VersionedPayloadContractFixture { payload: NULL_REQUIRED_FIELD_JSON_PAYLOAD, ..VALID_VERSIONED_JSON_FIXTURE }, Accept),
+    versioned_payload_case("multiple NDJSON values each satisfy the versioned contract", VersionedPayloadContractFixture { framing: VersionedPayloadFraming::Ndjson, payload: VALID_NDJSON_PAYLOAD, ..VALID_VERSIONED_JSON_FIXTURE }, Accept),
+    versioned_payload_case("observed carrier differs from the opaque expected carrier", VersionedPayloadContractFixture { observed_carrier: "other-opaque-carrier", ..VALID_VERSIONED_JSON_FIXTURE }, Reject),
+    versioned_payload_case("schema_version is missing", VersionedPayloadContractFixture { payload: MISSING_SCHEMA_VERSION_PAYLOAD, ..VALID_VERSIONED_JSON_FIXTURE }, Reject),
+    versioned_payload_case("schema_version has the wrong token", VersionedPayloadContractFixture { payload: WRONG_SCHEMA_VERSION_PAYLOAD, ..VALID_VERSIONED_JSON_FIXTURE }, Reject),
+    versioned_payload_case("schema_version is not a string", VersionedPayloadContractFixture { payload: NON_STRING_SCHEMA_VERSION_PAYLOAD, ..VALID_VERSIONED_JSON_FIXTURE }, Reject),
+    versioned_payload_case("required field is missing", VersionedPayloadContractFixture { payload: MISSING_REQUIRED_FIELD_PAYLOAD, ..VALID_VERSIONED_JSON_FIXTURE }, Reject),
+    versioned_payload_case("enum token is not a string", VersionedPayloadContractFixture { payload: NON_STRING_ENUM_TOKEN_PAYLOAD, ..VALID_VERSIONED_JSON_FIXTURE }, Reject),
+    versioned_payload_case("top-level JSON value is not an object", VersionedPayloadContractFixture { payload: NON_OBJECT_JSON_PAYLOAD, ..VALID_VERSIONED_JSON_FIXTURE }, Reject),
+    versioned_payload_case("second NDJSON value has an invalid enum token", VersionedPayloadContractFixture { framing: VersionedPayloadFraming::Ndjson, payload: INVALID_SECOND_NDJSON_ENUM_PAYLOAD, ..VALID_VERSIONED_JSON_FIXTURE }, Reject),
+    versioned_payload_case("NDJSON bytes do not satisfy single JSON framing", VersionedPayloadContractFixture { payload: VALID_NDJSON_PAYLOAD, ..VALID_VERSIONED_JSON_FIXTURE }, Reject),
+    versioned_payload_case("pretty JSON bytes do not satisfy NDJSON framing", VersionedPayloadContractFixture { framing: VersionedPayloadFraming::Ndjson, payload: PRETTY_JSON_BYTES_FOR_NDJSON_PAYLOAD, ..VALID_VERSIONED_JSON_FIXTURE }, Reject),
+    versioned_payload_case("malformed JSON is rejected", VersionedPayloadContractFixture { payload: MALFORMED_JSON_PAYLOAD, ..VALID_VERSIONED_JSON_FIXTURE }, Reject),
+    versioned_payload_case("malformed second NDJSON value is rejected", VersionedPayloadContractFixture { framing: VersionedPayloadFraming::Ndjson, payload: MALFORMED_SECOND_NDJSON_PAYLOAD, ..VALID_VERSIONED_JSON_FIXTURE }, Reject),
+];
+
+fn assert_versioned_payload_cases<F, E: Debug>(
+    cases: &[VersionedPayloadContractCase<F>],
+    mut evaluate: impl FnMut(&F) -> Result<VersionedPayloadAdapterOutcome, E>,
+) {
+    for case in cases {
+        let outcome = evaluate(&case.fixture).unwrap_or_else(|error| {
+            panic!(
+                "versioned payload case '{}' failed before an adapter outcome: {error:?}",
+                case.name
+            )
+        });
+
+        match (case.expected, outcome) {
+            (Accept, VersionedPayloadAdapterOutcome::Accepted)
+            | (Reject, VersionedPayloadAdapterOutcome::Rejected) => {}
+            (Accept, VersionedPayloadAdapterOutcome::Rejected) => {
+                panic!("versioned payload case '{}' was rejected", case.name)
+            }
+            (Reject, VersionedPayloadAdapterOutcome::Accepted) => {
+                panic!("versioned payload case '{}' was accepted", case.name)
+            }
+        }
+    }
+}
+
+/// Runs the shared channel-neutral versioned-payload catalog through a caller adapter.
+///
+/// Expected outcomes remain private to this crate. The adapter reports ordinary conformance
+/// rejection with [`VersionedPayloadAdapterOutcome::Rejected`] and reserves `Err` for fixture
+/// materialization or harness failures. This catalog defines no stdout, stderr, exit-status, HTTP,
+/// or WebSocket behavior and does not map between process and transport channels.
+pub fn assert_versioned_payload_contract<E: Debug>(
+    evaluate: impl FnMut(&VersionedPayloadContractFixture) -> Result<VersionedPayloadAdapterOutcome, E>,
+) {
+    assert_versioned_payload_cases(&VERSIONED_PAYLOAD_CASES, evaluate);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[rustfmt::skip]
+    const VERSIONED_PAYLOAD_DRIVER_CASES: [VersionedPayloadContractCase<bool>; 2] = [
+        versioned_payload_case("accepted payload case", true, Accept),
+        versioned_payload_case("rejected payload case", false, Reject),
+    ];
+
+    fn reference_versioned_payload_outcome(
+        fixture: &VersionedPayloadContractFixture,
+    ) -> VersionedPayloadAdapterOutcome {
+        let values = match fixture.framing {
+            VersionedPayloadFraming::Json => serde_json::from_slice::<Value>(fixture.payload)
+                .ok()
+                .filter(Value::is_object)
+                .map(|value| vec![value]),
+            VersionedPayloadFraming::Ndjson => {
+                let payload = fixture
+                    .payload
+                    .strip_suffix(b"\n")
+                    .unwrap_or(fixture.payload);
+                (!payload.is_empty())
+                    .then(|| {
+                        payload
+                            .split(|byte| *byte == b'\n')
+                            .map(|line| serde_json::from_slice::<Value>(line).ok())
+                            .collect::<Option<Vec<_>>>()
+                    })
+                    .flatten()
+                    .filter(|values| values.iter().all(Value::is_object))
+            }
+        };
+
+        let accepted = fixture.expected_carrier == fixture.observed_carrier
+            && values.is_some_and(|values| {
+                values.iter().all(|value| {
+                    let object = value
+                        .as_object()
+                        .expect("non-object payloads were rejected before validation");
+
+                    object.get("schema_version").and_then(Value::as_str)
+                        == Some(fixture.expected_schema_version)
+                        && fixture
+                            .required_fields
+                            .iter()
+                            .all(|field| object.contains_key(*field))
+                        && fixture.enum_fields.iter().all(|enum_field| {
+                            object
+                                .get(enum_field.field)
+                                .and_then(Value::as_str)
+                                .is_some_and(|token| enum_field.allowed_tokens.contains(&token))
+                        })
+                })
+            });
+
+        if accepted {
+            VersionedPayloadAdapterOutcome::Accepted
+        } else {
+            VersionedPayloadAdapterOutcome::Rejected
+        }
+    }
+
+    #[test]
+    fn versioned_payload_public_catalog_matches_reference_model() {
+        let mut evaluated_cases = 0;
+
+        assert_versioned_payload_contract(|fixture| {
+            evaluated_cases += 1;
+            Ok::<_, &str>(reference_versioned_payload_outcome(fixture))
+        });
+
+        assert_eq!(evaluated_cases, 15, "every versioned payload case must run");
+    }
+
+    #[test]
+    fn versioned_payload_case_driver_accepts_matching_accept_and_reject_outcomes() {
+        assert_versioned_payload_cases(&VERSIONED_PAYLOAD_DRIVER_CASES, |fixture| {
+            Ok::<_, &str>(if *fixture {
+                VersionedPayloadAdapterOutcome::Accepted
+            } else {
+                VersionedPayloadAdapterOutcome::Rejected
+            })
+        });
+    }
+
+    #[test]
+    #[should_panic(expected = "versioned payload case 'rejected payload case' was accepted")]
+    fn versioned_payload_case_driver_rejects_false_acceptance() {
+        assert_versioned_payload_cases(&VERSIONED_PAYLOAD_DRIVER_CASES[1..], |_| {
+            Ok::<_, &str>(VersionedPayloadAdapterOutcome::Accepted)
+        });
+    }
+
+    #[test]
+    #[should_panic(expected = "versioned payload case 'accepted payload case' was rejected")]
+    fn versioned_payload_case_driver_rejects_false_rejection() {
+        assert_versioned_payload_cases(&VERSIONED_PAYLOAD_DRIVER_CASES[..1], |_| {
+            Ok::<_, &str>(VersionedPayloadAdapterOutcome::Rejected)
+        });
+    }
+
+    #[test]
+    #[should_panic(
+        expected = "versioned payload case 'rejected payload case' failed before an adapter outcome: \"materialization failed\""
+    )]
+    fn versioned_payload_case_driver_rejects_harness_error() {
+        assert_versioned_payload_cases(&VERSIONED_PAYLOAD_DRIVER_CASES[1..], |_| {
+            Err::<VersionedPayloadAdapterOutcome, _>("materialization failed")
+        });
+    }
 
     const DRIVER_CASES: [ReleaseArchiveContractCase; 2] = [
         case(
