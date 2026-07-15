@@ -1,5 +1,7 @@
 use super::*;
 use crate::{EvidenceError, ProviderSmokeEvidence, ReadinessCacheKey, ReadinessEvidence};
+use sha2::{Digest, Sha256};
+use std::path::{Path, PathBuf};
 
 #[test]
 fn operational_evidence_schema_is_migrated_atomically_to_version_three() {
@@ -26,6 +28,7 @@ fn operational_evidence_schema_is_migrated_atomically_to_version_three() {
             .unwrap();
         assert!(exists, "missing operational evidence table {table}");
     }
+    assert!(migration_backups(state.path()).is_empty());
 }
 
 #[test]
@@ -49,6 +52,45 @@ fn version_one_store_upgrades_without_replacing_existing_state() {
     assert_eq!(
         3_i64,
         pragma_integer(storage.connection_for_test(), "user_version")
+    );
+
+    let backups = migration_backups(state.path());
+    assert_eq!(1, backups.len());
+    let backup_path = &backups[0];
+    let backup_name = backup_path.file_name().unwrap().to_str().unwrap();
+    let manifest_bytes = fs::read(format!("{}.json", backup_path.display())).unwrap();
+    let manifest: serde_json::Value = serde_json::from_slice(&manifest_bytes).unwrap();
+    assert_eq!(1, manifest["manifest_version"]);
+    assert_eq!(backup_name, manifest["backup_file"]);
+    assert_eq!(1, manifest["source_schema_version"]);
+    assert_eq!(env!("CARGO_PKG_VERSION"), manifest["satelle_version"]);
+    assert_eq!(
+        "sqlite3",
+        manifest["restore_compatibility"]["database_format"]
+    );
+    assert_eq!(1, manifest["restore_compatibility"]["schema_version"]);
+    assert_eq!(
+        true,
+        manifest["restore_compatibility"]["explicit_restore_required"]
+    );
+    assert_eq!(
+        file_digest(backup_path),
+        manifest["source_database_digest"].as_str().unwrap()
+    );
+    assert!(
+        !String::from_utf8(manifest_bytes)
+            .unwrap()
+            .contains(expected_host.as_str())
+    );
+    let backup =
+        Connection::open_with_flags(backup_path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .unwrap();
+    assert_eq!(1, pragma_integer(&backup, "user_version"));
+    assert_eq!(
+        "ok",
+        backup
+            .query_row("PRAGMA integrity_check", [], |row| row.get::<_, String>(0))
+            .unwrap()
     );
 }
 
@@ -166,6 +208,25 @@ fn failed_migration_rolls_back_partial_schema_and_preserves_existing_state() {
     };
     assert_eq!(StorageErrorKind::MigrationFailed, error.kind());
 
+    let first_backups = migration_backups(state.path());
+    assert_eq!(1, first_backups.len());
+    let first_backup = first_backups[0].clone();
+    let first_backup_bytes = fs::read(&first_backup).unwrap();
+    let first_manifest_path = PathBuf::from(format!("{}.json", first_backup.display()));
+    let first_manifest_bytes = fs::read(&first_manifest_path).unwrap();
+
+    let repeated_error = match Storage::open(state.path()) {
+        Ok(_) => panic!("the forced migration failure must remain reproducible"),
+        Err(error) => error,
+    };
+    assert_eq!(StorageErrorKind::MigrationFailed, repeated_error.kind());
+    assert_eq!(first_backup_bytes, fs::read(&first_backup).unwrap());
+    assert_eq!(
+        first_manifest_bytes,
+        fs::read(&first_manifest_path).unwrap()
+    );
+    assert_eq!(2, migration_backups(state.path()).len());
+
     let connection = Connection::open(state.path().join(DATABASE_FILE_NAME)).unwrap();
     assert_eq!(1_i64, pragma_integer(&connection, "user_version"));
     let applied_versions = connection
@@ -200,6 +261,33 @@ fn failed_migration_rolls_back_partial_schema_and_preserves_existing_state() {
         })
         .unwrap();
     assert_eq!(expected_host.to_string(), stored_host);
+}
+
+fn migration_backups(state_root: &Path) -> Vec<PathBuf> {
+    let mut backups = fs::read_dir(state_root)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .filter(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| {
+                    name.starts_with("satelle.sqlite3.migration-v") && name.ends_with(".backup")
+                })
+        })
+        .collect::<Vec<_>>();
+    backups.sort();
+    backups
+}
+
+fn file_digest(path: &Path) -> String {
+    let digest = Sha256::digest(fs::read(path).unwrap());
+    format!(
+        "sha256:{}",
+        digest
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>()
+    )
 }
 
 #[test]

@@ -1,4 +1,4 @@
-use super::{StorageError, StorageErrorKind};
+use super::{LeafOpenMode, StorageError, StorageErrorKind};
 use std::ffi::c_void;
 use std::fs::File;
 use std::io;
@@ -24,13 +24,13 @@ use windows_sys::Win32::Security::{
     TokenUser,
 };
 use windows_sys::Win32::Storage::FileSystem::{
-    BY_HANDLE_FILE_INFORMATION, CreateDirectoryW, CreateFileW, FILE_ALL_ACCESS,
+    BY_HANDLE_FILE_INFORMATION, CREATE_NEW, CreateDirectoryW, CreateFileW, FILE_ALL_ACCESS,
     FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_NORMAL, FILE_ATTRIBUTE_REPARSE_POINT,
     FILE_ATTRIBUTE_TAG_INFO, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
     FILE_GENERIC_READ, FILE_GENERIC_WRITE, FILE_READ_ATTRIBUTES, FILE_SHARE_READ, FILE_SHARE_WRITE,
-    FileAttributeTagInfo, GetDriveTypeW, GetFileInformationByHandle, GetFileInformationByHandleEx,
-    GetVolumeInformationByHandleW, OPEN_ALWAYS, OPEN_EXISTING, READ_CONTROL, ReOpenFile, WRITE_DAC,
-    WRITE_OWNER,
+    FileAttributeTagInfo, FlushFileBuffers, GetDriveTypeW, GetFileInformationByHandle,
+    GetFileInformationByHandleEx, GetVolumeInformationByHandleW, OPEN_ALWAYS, OPEN_EXISTING,
+    READ_CONTROL, ReOpenFile, WRITE_DAC, WRITE_OWNER,
 };
 use windows_sys::Win32::System::SystemServices::{ACCESS_ALLOWED_ACE_TYPE, FILE_PERSISTENT_ACLS};
 use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
@@ -101,7 +101,7 @@ impl SecureStateDirectory {
     pub(super) fn open_private_leaf(
         &self,
         file_name: &str,
-        create: bool,
+        mode: LeafOpenMode,
         fallback: StorageErrorKind,
     ) -> Result<Option<File>, StorageError> {
         if file_name.is_empty()
@@ -118,7 +118,11 @@ impl SecureStateDirectory {
         let descriptor = PrivateDescriptor::new(&self.process_identity.user, ObjectKind::File)?;
         let security_attributes = descriptor.security_attributes();
         let wide = wide_path(&path)?;
-        let disposition = if create { OPEN_ALWAYS } else { OPEN_EXISTING };
+        let disposition = match mode {
+            LeafOpenMode::Existing => OPEN_EXISTING,
+            LeafOpenMode::CreateIfMissing => OPEN_ALWAYS,
+            LeafOpenMode::CreateNew => CREATE_NEW,
+        };
         let raw = unsafe {
             // FILE_FLAG_OPEN_REPARSE_POINT makes this the handle to a link or
             // junction itself. Every decision below is made from that handle.
@@ -134,7 +138,9 @@ impl SecureStateDirectory {
         };
         if raw == INVALID_HANDLE_VALUE {
             let code = unsafe { GetLastError() };
-            if !create && matches!(code, ERROR_FILE_NOT_FOUND | ERROR_PATH_NOT_FOUND) {
+            if matches!(mode, LeafOpenMode::Existing)
+                && matches!(code, ERROR_FILE_NOT_FOUND | ERROR_PATH_NOT_FOUND)
+            {
                 return Ok(None);
             }
             return Err(win32_error(fallback, code));
@@ -174,6 +180,29 @@ impl SecureStateDirectory {
         };
         require_regular_single_link(&data_handle)?;
         Ok(Some(File::from(data_handle)))
+    }
+
+    pub(super) fn sync(&self) -> Result<(), StorageError> {
+        let state_directory = self
+            ._pinned_directories
+            .last()
+            .ok_or_else(|| StorageError::new(StorageErrorKind::StateDirectoryUnavailable))?;
+        let reopened = unsafe {
+            ReOpenFile(
+                raw_handle(state_directory),
+                FILE_GENERIC_READ | FILE_GENERIC_WRITE,
+                FILE_SHARE_READ | FILE_SHARE_WRITE,
+                FILE_FLAG_BACKUP_SEMANTICS,
+            )
+        };
+        if reopened == INVALID_HANDLE_VALUE {
+            return Err(last_error(StorageErrorKind::MigrationFailed));
+        }
+        let sync_handle = unsafe { OwnedHandle::from_raw_handle(reopened) };
+        if unsafe { FlushFileBuffers(raw_handle(&sync_handle)) } == 0 {
+            return Err(last_error(StorageErrorKind::MigrationFailed));
+        }
+        Ok(())
     }
 }
 
@@ -757,7 +786,12 @@ mod tests {
     use super::*;
 
     fn open_test_leaf(state: &SecureStateDirectory, file_name: &str, create: bool) -> File {
-        match state.open_private_leaf(file_name, create, StorageErrorKind::OpenFailed) {
+        let mode = if create {
+            LeafOpenMode::CreateIfMissing
+        } else {
+            LeafOpenMode::Existing
+        };
+        match state.open_private_leaf(file_name, mode, StorageErrorKind::OpenFailed) {
             Ok(Some(file)) => file,
             Ok(None) => panic!("the test leaf should exist"),
             Err(error) => panic!(

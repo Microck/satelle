@@ -213,6 +213,25 @@ fn is_protected_leaf(leaf: &[u8]) -> bool {
     super::PROTECTED_FILE_NAMES
         .iter()
         .any(|file_name| file_name.as_bytes() == leaf)
+        || is_migration_backup_leaf(leaf)
+}
+
+fn is_migration_backup_leaf(leaf: &[u8]) -> bool {
+    let Ok(file_name) = std::str::from_utf8(leaf) else {
+        return false;
+    };
+    let Some(remainder) = file_name.strip_prefix("satelle.sqlite3.migration-v") else {
+        return false;
+    };
+    let stem = remainder
+        .strip_suffix(".backup.json")
+        .or_else(|| remainder.strip_suffix(".backup"));
+    let Some((schema_version, backup_id)) = stem.and_then(|stem| stem.split_once('-')) else {
+        return false;
+    };
+    !schema_version.is_empty()
+        && schema_version.bytes().all(|byte| byte.is_ascii_digit())
+        && uuid::Uuid::parse_str(backup_id).is_ok()
 }
 
 #[cfg(target_os = "macos")]

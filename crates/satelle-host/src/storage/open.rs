@@ -1,11 +1,16 @@
 use super::codec::format_time;
 use super::{StorageError, StorageErrorKind};
+use rusqlite::backup::Backup;
 use rusqlite::ffi::ErrorCode as SqliteErrorCode;
 use rusqlite::{Connection, OpenFlags, OptionalExtension, TransactionBehavior, params};
+use serde::Serialize;
+use sha2::{Digest, Sha256};
 use std::fs::{File, TryLockError};
+use std::io::{Read, Seek, Write};
 use std::path::Path;
 use std::time::Duration;
 use time::OffsetDateTime;
+use uuid::Uuid;
 
 #[cfg(unix)]
 use rustix::fs::{FileType, Mode, OFlags};
@@ -32,21 +37,25 @@ pub(super) const PROTECTED_FILE_NAMES: [&str; 5] = [
     "satelle.sqlite3-journal",
 ];
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
+const BACKUP_FORMAT_VERSION: u32 = 1;
 const MIGRATIONS: [Migration; 3] = [
     Migration {
         version: 1,
         sql: include_str!("0001_initial.sql"),
         seeds_sensitive_state: true,
+        irreversible: false,
     },
     Migration {
         version: 2,
         sql: include_str!("0002_operational_evidence.sql"),
         seeds_sensitive_state: false,
+        irreversible: false,
     },
     Migration {
         version: 3,
         sql: include_str!("0003_native_readiness_results.sql"),
         seeds_sensitive_state: false,
+        irreversible: true,
     },
 ];
 
@@ -55,6 +64,32 @@ struct Migration {
     version: i64,
     sql: &'static str,
     seeds_sensitive_state: bool,
+    irreversible: bool,
+}
+
+#[derive(Clone, Copy)]
+enum LeafOpenMode {
+    Existing,
+    CreateIfMissing,
+    CreateNew,
+}
+
+#[derive(Serialize)]
+struct MigrationBackupManifest<'a> {
+    manifest_version: u32,
+    backup_file: &'a str,
+    source_schema_version: i64,
+    source_database_digest: &'a str,
+    created_at: String,
+    satelle_version: &'static str,
+    restore_compatibility: RestoreCompatibility,
+}
+
+#[derive(Serialize)]
+struct RestoreCompatibility {
+    database_format: &'static str,
+    schema_version: i64,
+    explicit_restore_required: bool,
 }
 
 pub(super) fn sqlite_error(fallback: StorageErrorKind, source: rusqlite::Error) -> StorageError {
@@ -76,6 +111,20 @@ pub(super) struct StateDirectory {
     handle: File,
     #[cfg(windows)]
     secure: windows::SecureStateDirectory,
+}
+
+impl StateDirectory {
+    #[cfg(unix)]
+    fn sync(&self) -> Result<(), StorageError> {
+        self.handle
+            .sync_all()
+            .map_err(|source| StorageError::with_source(StorageErrorKind::MigrationFailed, source))
+    }
+
+    #[cfg(windows)]
+    fn sync(&self) -> Result<(), StorageError> {
+        self.secure.sync()
+    }
 }
 
 pub(super) struct OwnershipLock(File);
@@ -109,7 +158,7 @@ fn open_parts_after_lock(
     let database_guard = open_private_leaf(
         &state_directory,
         DATABASE_FILE_NAME,
-        true,
+        LeafOpenMode::CreateIfMissing,
         StorageErrorKind::OpenFailed,
     )?
     .ok_or_else(|| StorageError::new(StorageErrorKind::OpenFailed))?;
@@ -131,7 +180,7 @@ fn open_parts_after_lock(
         .map_err(|source| sqlite_error(StorageErrorKind::OpenFailed, source))?;
     verify_database_readable(&connection)?;
     configure_connection(&connection)?;
-    apply_migrations(&mut connection)?;
+    apply_migrations(&mut connection, state_root, &state_directory)?;
     verify_integrity(&connection)?;
     #[cfg(windows)]
     restrict_database_files(&state_directory)?;
@@ -139,41 +188,59 @@ fn open_parts_after_lock(
 }
 
 #[cfg(target_os = "macos")]
-fn sqlite_database_path(
+fn sqlite_database_path(state_root: &Path, state_directory: &StateDirectory) -> std::path::PathBuf {
+    sqlite_leaf_path(state_root, state_directory, DATABASE_FILE_NAME)
+}
+
+#[cfg(target_os = "macos")]
+fn sqlite_leaf_path(
     _state_root: &Path,
     state_directory: &StateDirectory,
+    file_name: &str,
 ) -> std::path::PathBuf {
     use std::os::fd::AsRawFd;
 
     format!(
         "/.satelle-fd/{}/{}",
         state_directory.handle.as_raw_fd(),
-        DATABASE_FILE_NAME
+        file_name
     )
     .into()
 }
 
 #[cfg(target_os = "linux")]
-fn sqlite_database_path(
+fn sqlite_database_path(state_root: &Path, state_directory: &StateDirectory) -> std::path::PathBuf {
+    sqlite_leaf_path(state_root, state_directory, DATABASE_FILE_NAME)
+}
+
+#[cfg(target_os = "linux")]
+fn sqlite_leaf_path(
     _state_root: &Path,
     state_directory: &StateDirectory,
+    file_name: &str,
 ) -> std::path::PathBuf {
     use std::os::fd::AsRawFd;
 
     format!(
         "/proc/self/fd/{}/{}",
         state_directory.handle.as_raw_fd(),
-        DATABASE_FILE_NAME
+        file_name
     )
     .into()
 }
 
 #[cfg(windows)]
-fn sqlite_database_path(
+fn sqlite_database_path(state_root: &Path, state_directory: &StateDirectory) -> std::path::PathBuf {
+    sqlite_leaf_path(state_root, state_directory, DATABASE_FILE_NAME)
+}
+
+#[cfg(windows)]
+fn sqlite_leaf_path(
     state_root: &Path,
     _state_directory: &StateDirectory,
+    file_name: &str,
 ) -> std::path::PathBuf {
-    state_root.join(DATABASE_FILE_NAME)
+    state_root.join(file_name)
 }
 
 #[cfg(all(test, target_os = "linux"))]
@@ -315,7 +382,7 @@ fn acquire_ownership_lock(state_directory: &StateDirectory) -> Result<OwnershipL
     let file = open_private_leaf(
         state_directory,
         LOCK_FILE_NAME,
-        true,
+        LeafOpenMode::CreateIfMissing,
         StorageErrorKind::LockUnavailable,
     )?
     .ok_or_else(|| StorageError::new(StorageErrorKind::LockUnavailable))?;
@@ -333,12 +400,14 @@ fn acquire_ownership_lock(state_directory: &StateDirectory) -> Result<OwnershipL
 fn open_private_leaf(
     state_directory: &StateDirectory,
     file_name: &str,
-    create: bool,
+    mode: LeafOpenMode,
     fallback: StorageErrorKind,
 ) -> Result<Option<File>, StorageError> {
     let mut flags = OFlags::RDWR | OFlags::NOFOLLOW | OFlags::CLOEXEC;
-    if create {
-        flags |= OFlags::CREATE;
+    match mode {
+        LeafOpenMode::Existing => {}
+        LeafOpenMode::CreateIfMissing => flags |= OFlags::CREATE,
+        LeafOpenMode::CreateNew => flags |= OFlags::CREATE | OFlags::EXCL,
     }
     let descriptor = match rustix::fs::openat(
         &state_directory.handle,
@@ -347,7 +416,7 @@ fn open_private_leaf(
         Mode::RUSR | Mode::WUSR,
     ) {
         Ok(descriptor) => descriptor,
-        Err(rustix::io::Errno::NOENT) if !create => return Ok(None),
+        Err(rustix::io::Errno::NOENT) if matches!(mode, LeafOpenMode::Existing) => return Ok(None),
         Err(source) => return Err(secure_open_error(fallback, source)),
     };
     let metadata = rustix::fs::fstat(&descriptor)
@@ -375,12 +444,12 @@ fn secure_open_error(fallback: StorageErrorKind, source: rustix::io::Errno) -> S
 fn open_private_leaf(
     state_directory: &StateDirectory,
     file_name: &str,
-    create: bool,
+    mode: LeafOpenMode,
     fallback: StorageErrorKind,
 ) -> Result<Option<File>, StorageError> {
     state_directory
         .secure
-        .open_private_leaf(file_name, create, fallback)
+        .open_private_leaf(file_name, mode, fallback)
 }
 
 fn preflight_protected_files(state_directory: &StateDirectory) -> Result<(), StorageError> {
@@ -388,7 +457,7 @@ fn preflight_protected_files(state_directory: &StateDirectory) -> Result<(), Sto
         open_private_leaf(
             state_directory,
             file_name,
-            false,
+            LeafOpenMode::Existing,
             StorageErrorKind::OpenFailed,
         )?;
     }
@@ -401,7 +470,7 @@ fn restrict_database_files(state_directory: &StateDirectory) -> Result<(), Stora
         open_private_leaf(
             state_directory,
             file_name,
-            false,
+            LeafOpenMode::Existing,
             StorageErrorKind::OpenFailed,
         )?;
     }
@@ -434,7 +503,66 @@ fn verify_database_readable(connection: &Connection) -> Result<(), StorageError>
         .map_err(|source| sqlite_error(StorageErrorKind::IntegrityCheckFailed, source))
 }
 
-fn apply_migrations(connection: &mut Connection) -> Result<(), StorageError> {
+fn apply_migrations(
+    connection: &mut Connection,
+    state_root: &Path,
+    state_directory: &StateDirectory,
+) -> Result<(), StorageError> {
+    let user_version: i64 = connection
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .map_err(|source| sqlite_error(StorageErrorKind::MigrationIntegrity, source))?;
+    let migration_table_exists: bool = connection
+        .query_row(
+            "SELECT EXISTS(\
+                SELECT 1 FROM sqlite_schema \
+                WHERE type = 'table' AND name = 'schema_migrations'\
+            )",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|source| sqlite_error(StorageErrorKind::MigrationIntegrity, source))?;
+    let applied = if migration_table_exists {
+        load_applied_migrations(connection)?
+    } else {
+        Vec::new()
+    };
+    if applied.len() > MIGRATIONS.len()
+        || applied
+            .iter()
+            .zip(MIGRATIONS)
+            .any(|((version, checksum), migration)| {
+                *version != migration.version || *checksum != migration_checksum(migration.sql)
+            })
+    {
+        return Err(StorageError::new(StorageErrorKind::MigrationIntegrity));
+    }
+    let expected_user_version = applied.last().map_or(0, |(version, _)| *version);
+    if user_version != expected_user_version {
+        return Err(StorageError::new(StorageErrorKind::MigrationIntegrity));
+    }
+
+    // Existing stores must prove their current state is sound before a newer
+    // migration can rewrite it. Fresh stores have no schema to validate, and
+    // current stores are verified once after this no-op migration pass.
+    if !applied.is_empty() && applied.len() < MIGRATIONS.len() {
+        verify_integrity(connection)?;
+        super::auth::validate_sensitive_state(connection)?;
+    }
+
+    if !applied.is_empty()
+        && MIGRATIONS
+            .iter()
+            .skip(applied.len())
+            .any(|migration| migration.irreversible)
+    {
+        create_migration_backup(
+            connection,
+            state_root,
+            state_directory,
+            expected_user_version,
+        )?;
+    }
+
     let transaction = connection
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .map_err(|source| sqlite_error(StorageErrorKind::MigrationFailed, source))?;
@@ -447,43 +575,6 @@ fn apply_migrations(connection: &mut Connection) -> Result<(), StorageError> {
             ) STRICT;",
         )
         .map_err(|source| sqlite_error(StorageErrorKind::MigrationFailed, source))?;
-    let applied = {
-        let mut statement = transaction
-            .prepare("SELECT version, checksum FROM schema_migrations ORDER BY version")
-            .map_err(|source| sqlite_error(StorageErrorKind::MigrationIntegrity, source))?;
-        statement
-            .query_map([], |row| {
-                Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
-            })
-            .map_err(|source| sqlite_error(StorageErrorKind::MigrationIntegrity, source))?
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|source| sqlite_error(StorageErrorKind::MigrationIntegrity, source))?
-    };
-    if applied.len() > MIGRATIONS.len()
-        || applied
-            .iter()
-            .zip(MIGRATIONS)
-            .any(|((version, checksum), migration)| {
-                *version != migration.version || *checksum != migration_checksum(migration.sql)
-            })
-    {
-        return Err(StorageError::new(StorageErrorKind::MigrationIntegrity));
-    }
-    let user_version: i64 = transaction
-        .query_row("PRAGMA user_version", [], |row| row.get(0))
-        .map_err(|source| sqlite_error(StorageErrorKind::MigrationIntegrity, source))?;
-    let expected_user_version = applied.last().map_or(0, |(version, _)| *version);
-    if user_version != expected_user_version {
-        return Err(StorageError::new(StorageErrorKind::MigrationIntegrity));
-    }
-
-    // Existing stores must prove their current state is sound before a newer
-    // migration can rewrite it. Fresh stores have no schema to validate, and
-    // current stores are verified once after this no-op migration pass.
-    if !applied.is_empty() && applied.len() < MIGRATIONS.len() {
-        verify_integrity(&transaction)?;
-        super::auth::validate_sensitive_state(&transaction)?;
-    }
 
     for migration in MIGRATIONS.iter().skip(applied.len()) {
         let applied_at = OffsetDateTime::now_utc();
@@ -522,6 +613,134 @@ fn apply_migrations(connection: &mut Connection) -> Result<(), StorageError> {
     transaction
         .commit()
         .map_err(|source| sqlite_error(StorageErrorKind::MigrationFailed, source))
+}
+
+fn load_applied_migrations(connection: &Connection) -> Result<Vec<(i64, String)>, StorageError> {
+    let mut statement = connection
+        .prepare("SELECT version, checksum FROM schema_migrations ORDER BY version")
+        .map_err(|source| sqlite_error(StorageErrorKind::MigrationIntegrity, source))?;
+    statement
+        .query_map([], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+        })
+        .map_err(|source| sqlite_error(StorageErrorKind::MigrationIntegrity, source))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|source| sqlite_error(StorageErrorKind::MigrationIntegrity, source))
+}
+
+fn create_migration_backup(
+    source: &Connection,
+    state_root: &Path,
+    state_directory: &StateDirectory,
+    source_schema_version: i64,
+) -> Result<(), StorageError> {
+    let backup_id = Uuid::now_v7();
+    let backup_file_name =
+        format!("satelle.sqlite3.migration-v{source_schema_version}-{backup_id}.backup");
+    let manifest_file_name = format!("{backup_file_name}.json");
+    let backup_path = sqlite_leaf_path(state_root, state_directory, &backup_file_name);
+
+    let backup_guard = open_private_leaf(
+        state_directory,
+        &backup_file_name,
+        LeafOpenMode::CreateNew,
+        StorageErrorKind::MigrationFailed,
+    )?
+    .ok_or_else(|| StorageError::new(StorageErrorKind::MigrationFailed))?;
+    drop(backup_guard);
+
+    let flags = OpenFlags::SQLITE_OPEN_READ_WRITE
+        | OpenFlags::SQLITE_OPEN_NO_MUTEX
+        | OpenFlags::SQLITE_OPEN_NOFOLLOW;
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    let mut destination =
+        Connection::open_with_flags_and_vfs(&backup_path, flags, unix_vfs::name()?)
+            .map_err(|source| sqlite_error(StorageErrorKind::MigrationFailed, source))?;
+    #[cfg(windows)]
+    let mut destination = Connection::open_with_flags(&backup_path, flags)
+        .map_err(|source| sqlite_error(StorageErrorKind::MigrationFailed, source))?;
+    Backup::new(source, &mut destination)
+        .and_then(|backup| backup.run_to_completion(128, Duration::from_millis(5), None))
+        .map_err(|source| sqlite_error(StorageErrorKind::MigrationFailed, source))?;
+    drop(destination);
+
+    let validation_flags = OpenFlags::SQLITE_OPEN_READ_ONLY
+        | OpenFlags::SQLITE_OPEN_NO_MUTEX
+        | OpenFlags::SQLITE_OPEN_NOFOLLOW;
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    let validation =
+        Connection::open_with_flags_and_vfs(&backup_path, validation_flags, unix_vfs::name()?)
+            .map_err(|source| sqlite_error(StorageErrorKind::MigrationFailed, source))?;
+    #[cfg(windows)]
+    let validation = Connection::open_with_flags(&backup_path, validation_flags)
+        .map_err(|source| sqlite_error(StorageErrorKind::MigrationFailed, source))?;
+    verify_integrity(&validation)?;
+    drop(validation);
+
+    let mut backup_file = open_private_leaf(
+        state_directory,
+        &backup_file_name,
+        LeafOpenMode::Existing,
+        StorageErrorKind::MigrationFailed,
+    )?
+    .ok_or_else(|| StorageError::new(StorageErrorKind::MigrationFailed))?;
+    backup_file
+        .sync_all()
+        .map_err(|source| StorageError::with_source(StorageErrorKind::MigrationFailed, source))?;
+    backup_file
+        .rewind()
+        .map_err(|source| StorageError::with_source(StorageErrorKind::MigrationFailed, source))?;
+    let mut digest = Sha256::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let bytes_read = backup_file.read(&mut buffer).map_err(|source| {
+            StorageError::with_source(StorageErrorKind::MigrationFailed, source)
+        })?;
+        if bytes_read == 0 {
+            break;
+        }
+        digest.update(&buffer[..bytes_read]);
+    }
+    let source_database_digest = format!(
+        "sha256:{}",
+        digest
+            .finalize()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>()
+    );
+
+    let created_at = OffsetDateTime::now_utc();
+    let manifest = MigrationBackupManifest {
+        manifest_version: BACKUP_FORMAT_VERSION,
+        backup_file: &backup_file_name,
+        source_schema_version,
+        source_database_digest: &source_database_digest,
+        created_at: format_time(created_at)?,
+        satelle_version: env!("CARGO_PKG_VERSION"),
+        restore_compatibility: RestoreCompatibility {
+            database_format: "sqlite3",
+            schema_version: source_schema_version,
+            explicit_restore_required: true,
+        },
+    };
+    let mut manifest_file = open_private_leaf(
+        state_directory,
+        &manifest_file_name,
+        LeafOpenMode::CreateNew,
+        StorageErrorKind::MigrationFailed,
+    )?
+    .ok_or_else(|| StorageError::new(StorageErrorKind::MigrationFailed))?;
+    serde_json::to_writer(&mut manifest_file, &manifest)
+        .map_err(|source| StorageError::with_source(StorageErrorKind::MigrationFailed, source))?;
+    manifest_file
+        .write_all(b"\n")
+        .map_err(|source| StorageError::with_source(StorageErrorKind::MigrationFailed, source))?;
+    manifest_file
+        .sync_all()
+        .map_err(|source| StorageError::with_source(StorageErrorKind::MigrationFailed, source))?;
+    state_directory.sync()?;
+    Ok(())
 }
 
 fn migration_checksum(value: &str) -> String {
