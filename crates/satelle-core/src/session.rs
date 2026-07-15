@@ -1689,32 +1689,32 @@ mod tests {
     #[test]
     fn stale_revision_cannot_overwrite_the_winning_terminal_state() {
         let turn_id = turn_1();
-        let mut completion_wins = in_state(TurnState::Running);
-        let stale = revisions(&completion_wins);
-        completion_wins
-            .transition_turn(
-                &turn_id,
-                stale,
-                terminal_transition(TurnState::Completed),
-                at(10),
-            )
-            .unwrap();
-        assert!(matches!(
-            completion_wins.stop_turn(
-                &turn_id,
-                stale,
-                StopObservation::CancellationConfirmed,
-                at(11),
-            ),
-            Ok(StopOutcome::AlreadyTerminal {
-                state: TerminalTurnState::Completed,
-                ..
-            })
-        ));
-        assert_eq!(
-            TurnState::Completed,
-            completion_wins.turn(&turn_id).unwrap().state()
-        );
+        for winning_state in [TurnState::Completed, TurnState::Blocked, TurnState::Failed] {
+            let mut transition_wins = in_state(TurnState::Running);
+            let stale = revisions(&transition_wins);
+            transition_wins
+                .transition_turn(&turn_id, stale, terminal_transition(winning_state), at(10))
+                .unwrap();
+
+            assert_eq!(
+                StopOutcome::AlreadyTerminal {
+                    state: TerminalTurnState::try_from(winning_state).unwrap(),
+                    revisions: revisions(&transition_wins),
+                },
+                transition_wins
+                    .stop_turn(
+                        &turn_id,
+                        stale,
+                        StopObservation::CancellationConfirmed,
+                        at(11),
+                    )
+                    .unwrap()
+            );
+            assert_eq!(
+                winning_state,
+                transition_wins.turn(&turn_id).unwrap().state()
+            );
+        }
 
         let mut stop_wins = in_state(TurnState::Running);
         let stale = revisions(&stop_wins);
