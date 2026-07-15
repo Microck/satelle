@@ -1,13 +1,13 @@
 use super::*;
-use crate::{EvidenceError, ProviderSmokeEvidence, ReadinessEvidence};
+use crate::{EvidenceError, ProviderSmokeEvidence, ReadinessCacheKey, ReadinessEvidence};
 
 #[test]
-fn operational_evidence_schema_is_migrated_atomically_to_version_two() {
+fn operational_evidence_schema_is_migrated_atomically_to_version_three() {
     let state = TempDir::new().expect("temporary state directory");
     let (storage, _) = Storage::open(state.path()).expect("open storage");
     let connection = storage.connection_for_test();
 
-    assert_eq!(2_i64, pragma_integer(connection, "user_version"));
+    assert_eq!(3_i64, pragma_integer(connection, "user_version"));
     let versions = connection
         .prepare("SELECT version FROM schema_migrations ORDER BY version")
         .unwrap()
@@ -15,8 +15,8 @@ fn operational_evidence_schema_is_migrated_atomically_to_version_two() {
         .unwrap()
         .collect::<Result<Vec<_>, _>>()
         .unwrap();
-    assert_eq!(vec![1_i64, 2_i64], versions);
-    for table in ["readiness_successes", "provider_smoke_successes"] {
+    assert_eq!(vec![1_i64, 2_i64, 3_i64], versions);
+    for table in ["native_readiness_results", "provider_smoke_successes"] {
         let exists: bool = connection
             .query_row(
                 "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = ?1)",
@@ -36,9 +36,9 @@ fn version_one_store_upgrades_without_replacing_existing_state() {
     storage
         .connection_for_test()
         .execute_batch(
-            "DROP TABLE provider_smoke_successes;
-             DROP TABLE readiness_successes;
-             DELETE FROM schema_migrations WHERE version = 2;
+            "DROP TABLE native_readiness_results;
+             DROP TABLE provider_smoke_successes;
+             DELETE FROM schema_migrations WHERE version IN (2, 3);
              PRAGMA user_version = 1;",
         )
         .unwrap();
@@ -47,7 +47,7 @@ fn version_one_store_upgrades_without_replacing_existing_state() {
     let (storage, _) = Storage::open(state.path()).expect("upgrade version one store");
     assert_eq!(expected_host, storage.host_identity().unwrap());
     assert_eq!(
-        2_i64,
+        3_i64,
         pragma_integer(storage.connection_for_test(), "user_version")
     );
 }
@@ -93,9 +93,9 @@ fn assert_version_one_corruption_rejected_before_migration(
     storage
         .connection_for_test()
         .execute_batch(
-            "DROP TABLE provider_smoke_successes;
-             DROP TABLE readiness_successes;
-             DELETE FROM schema_migrations WHERE version = 2;
+            "DROP TABLE native_readiness_results;
+             DROP TABLE provider_smoke_successes;
+             DELETE FROM schema_migrations WHERE version IN (2, 3);
              PRAGMA user_version = 1;",
         )
         .expect("create a logically corrupt version one store");
@@ -117,7 +117,11 @@ fn assert_version_one_corruption_rejected_before_migration(
         .collect::<Result<Vec<_>, _>>()
         .unwrap();
     assert_eq!(vec![1_i64], applied_versions);
-    for table in ["readiness_successes", "provider_smoke_successes"] {
+    for table in [
+        "readiness_successes",
+        "native_readiness_results",
+        "provider_smoke_successes",
+    ] {
         let exists: bool = connection
             .query_row(
                 "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = ?1)",
@@ -140,9 +144,9 @@ fn failed_migration_rolls_back_partial_schema_and_preserves_existing_state() {
     storage
         .connection_for_test()
         .execute_batch(
-            "DROP TABLE provider_smoke_successes;
-             DROP TABLE readiness_successes;
-             DELETE FROM schema_migrations WHERE version = 2;
+            "DROP TABLE native_readiness_results;
+             DROP TABLE provider_smoke_successes;
+             DELETE FROM schema_migrations WHERE version IN (2, 3);
              PRAGMA user_version = 1;
              CREATE TABLE migration_sentinel (value TEXT NOT NULL) STRICT;
              INSERT INTO migration_sentinel (value) VALUES ('preserve-me');
@@ -172,7 +176,11 @@ fn failed_migration_rolls_back_partial_schema_and_preserves_existing_state() {
         .collect::<Result<Vec<_>, _>>()
         .unwrap();
     assert_eq!(vec![1_i64], applied_versions);
-    for table in ["readiness_successes", "provider_smoke_successes"] {
+    for table in [
+        "readiness_successes",
+        "native_readiness_results",
+        "provider_smoke_successes",
+    ] {
         let exists: bool = connection
             .query_row(
                 "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = ?1)",
@@ -248,6 +256,29 @@ fn readiness_and_provider_results_round_trip_without_raw_evidence() {
             Some(&provider),
         )
         .expect("replaying identical evidence is idempotent");
+    let cache_key = ReadinessCacheKey::new(
+        "codex-native-computer-use",
+        desktop.clone(),
+        policy.clone(),
+        "0.144.0",
+        "1.0.0",
+        Some("plugin-1.0.0"),
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    )
+    .unwrap();
+    assert_eq!(
+        Some(readiness.clone()),
+        storage
+            .load_reusable_readiness(&cache_key, observed_at)
+            .expect("matching success is reusable before expiry")
+    );
+    assert!(
+        storage
+            .load_reusable_readiness(&cache_key, expires_at)
+            .expect("expiry lookup")
+            .is_none()
+    );
 
     let second_readiness = ReadinessEvidence::new(
         "readiness-2",
@@ -277,13 +308,25 @@ fn readiness_and_provider_results_round_trip_without_raw_evidence() {
         )
         .expect_err("a conflicting provider result must roll back its readiness insert");
     assert_eq!(StorageErrorKind::StateConflict, error.kind());
+    storage
+        .store_preflight_failure(&cache_key, &second_readiness, "action_not_observed")
+        .expect("store terminal native readiness failure");
     let readiness_count: i64 = storage
         .connection_for_test()
-        .query_row("SELECT count(*) FROM readiness_successes", [], |row| {
+        .query_row("SELECT count(*) FROM native_readiness_results", [], |row| {
             row.get(0)
         })
         .unwrap();
-    assert_eq!(1, readiness_count);
+    assert_eq!(2, readiness_count);
+    let statuses = storage
+        .connection_for_test()
+        .prepare("SELECT status FROM native_readiness_results ORDER BY result_id")
+        .unwrap()
+        .query_map([], |row| row.get::<_, String>(0))
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert_eq!(vec!["passed", "failed"], statuses);
     let provider_count: i64 = storage
         .connection_for_test()
         .query_row("SELECT count(*) FROM provider_smoke_successes", [], |row| {

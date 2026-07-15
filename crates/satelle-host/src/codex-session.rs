@@ -77,8 +77,8 @@ pub(crate) struct CodexSessionRequest<'a> {
     pub(crate) working_directory: &'a Path,
     pub(crate) prompt: &'a str,
     pub(crate) existing_thread_ref: Option<&'a str>,
-    pub(crate) model: &'a str,
-    pub(crate) model_provider: &'a str,
+    pub(crate) model: Option<&'a str>,
+    pub(crate) model_provider: Option<&'a str>,
     pub(crate) execution_mode: TurnExecutionMode,
     pub(crate) approval_policy: CodexApprovalPolicy,
     pub(crate) sandbox_policy: CodexSandboxPolicy,
@@ -700,11 +700,15 @@ impl<'a> SessionExchange<'a> {
 
     fn write_thread_request(&self, writer: &ProtocolWriter) -> Result<(), CodexSessionError> {
         let mut params = json!({
-            "model": self.request.model,
-            "modelProvider": self.request.model_provider,
             "approvalPolicy": self.request.approval_policy.as_protocol_value(),
             "sandbox": self.request.sandbox_policy.as_thread_value()
         });
+        if let Some(model) = self.request.model {
+            params["model"] = Value::String(model.to_owned());
+        }
+        if let Some(provider) = self.request.model_provider {
+            params["modelProvider"] = Value::String(provider.to_owned());
+        }
         let method = if let Some(thread_ref) = self.request.existing_thread_ref {
             params["threadId"] = Value::String(thread_ref.to_owned());
             "thread/resume"

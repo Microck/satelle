@@ -1,21 +1,30 @@
 use super::adapter::{
-    AdapterReadiness, AdapterSubject, ComputerUseAdapter, ExecuteRequest, ExecuteResult,
-    RecoveryObservation,
+    AdapterPreflight, AdapterReadiness, AdapterSubject, ComputerUseAdapter, ExecuteRequest,
+    ExecuteResult, ReadinessCacheKey, ReadinessEvidence, RecoveryObservation,
 };
 use crate::codex_session::{
     CodexApprovalPolicy, CodexSandboxPolicy, CodexSessionControl, CodexSessionError,
     CodexSessionFailure, CodexSessionRequest, CodexSessionTerminal, CodexTurnReadRequest,
     CodexTurnStatus, read_codex_turn, run_codex_session,
 };
+use command_group::{CommandGroup, GroupChild};
 use satelle_core::session::{
-    ApprovalPolicy, SandboxPolicy, StopObservation, TurnState, TurnTransition,
+    ApprovalPolicy, DesktopBindingRef, DesktopTarget, EffectiveModelRef, ExecutionPolicy,
+    ExperimentalFeatureChoices, FeatureChoice, ProviderBindingRef, SandboxPolicy, StopObservation,
+    TimeoutPolicy, TurnExecutionMode, TurnState, TurnTransition,
 };
 use satelle_core::{ControlPlaneOperation, ErrorCode, SatelleError};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use std::cell::RefCell;
 use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
+
+const DEFAULT_MODEL_BINDING: &str = "codex-default";
+const DEFAULT_PROVIDER_BINDING: &str = "codex-default";
+const NATIVE_ADAPTER: &str = "codex-native-computer-use";
 
 /// The production adapter owns the private Codex app-server boundary. Native
 /// execution remains gated by preflight evidence; no caller can reach execute
@@ -25,6 +34,8 @@ pub(crate) struct ProductionComputerUseAdapter {
     snapshot: Arc<RwLock<crate::ProductionCapabilitySnapshot>>,
     working_directory: Result<PathBuf, SatelleError>,
     active_execution: Arc<Mutex<Option<ActiveCodexExecution>>>,
+    native_readiness_timeout: Duration,
+    native_readiness_ttl: time::Duration,
 }
 
 #[derive(Clone)]
@@ -54,6 +65,7 @@ impl Drop for ActiveExecutionGuard {
 }
 
 impl ProductionComputerUseAdapter {
+    #[cfg(test)]
     pub(crate) fn new(
         snapshot: Arc<RwLock<crate::ProductionCapabilitySnapshot>>,
         working_directory: Result<PathBuf, SatelleError>,
@@ -62,21 +74,177 @@ impl ProductionComputerUseAdapter {
             snapshot,
             working_directory,
             active_execution: Arc::new(Mutex::new(None)),
+            native_readiness_timeout: crate::DEFAULT_NATIVE_READINESS_TIMEOUT,
+            native_readiness_ttl: crate::DEFAULT_NATIVE_READINESS_TTL,
         }
     }
 
-    fn blocked<T>(&self) -> Result<T, SatelleError> {
+    pub(crate) fn with_readiness_policy(
+        snapshot: Arc<RwLock<crate::ProductionCapabilitySnapshot>>,
+        working_directory: Result<PathBuf, SatelleError>,
+        timeout: Duration,
+        ttl: time::Duration,
+    ) -> Self {
+        Self {
+            snapshot,
+            working_directory,
+            active_execution: Arc::new(Mutex::new(None)),
+            native_readiness_timeout: timeout,
+            native_readiness_ttl: ttl,
+        }
+    }
+
+    fn native_readiness_key(&self) -> Result<ReadinessCacheKey, SatelleError> {
         let snapshot = crate::read_production_snapshot(&self.snapshot)?;
-        Err(crate::execution_blocker(&snapshot.verdict))
+        let version = match snapshot.evidence.codex_version {
+            crate::codex_capabilities::CodexVersionEvidence::Detected { version }
+                if version == crate::codex_capabilities::REQUIRED_CODEX_VERSION =>
+            {
+                version
+            }
+            _ => return Err(crate::execution_blocker(&snapshot.verdict)),
+        };
+        if !snapshot
+            .evidence
+            .host_platform
+            .supports_native_computer_use()
+        {
+            return Err(crate::execution_blocker(&snapshot.verdict));
+        }
+        snapshot
+            .control_plane_admission
+            .admit(ControlPlaneOperation::Run)?;
+        drop(snapshot);
+
+        let desktop = crate::desktop_sessions::discover()?
+            .into_iter()
+            .next()
+            .ok_or_else(SatelleError::computer_use_not_ready)?;
+        let desktop_binding = DesktopBindingRef::new(desktop.session_id.clone())
+            .map_err(|_| adapter_failure("desktop_binding_invalid"))?;
+        let execution_policy = ExecutionPolicy::new(
+            EffectiveModelRef::new(DEFAULT_MODEL_BINDING)
+                .map_err(|_| adapter_failure("model_binding_invalid"))?,
+            ProviderBindingRef::new(DEFAULT_PROVIDER_BINDING)
+                .map_err(|_| adapter_failure("provider_binding_invalid"))?,
+            DesktopTarget::new(desktop_binding.clone()),
+            ApprovalPolicy::OnRequest,
+            SandboxPolicy::WorkspaceWrite,
+            TimeoutPolicy::bounded_seconds(120)
+                .map_err(|_| adapter_failure("timeout_policy_invalid"))?,
+            ExperimentalFeatureChoices::new(FeatureChoice::Enabled, FeatureChoice::Disabled),
+        );
+        let platform = crate::codex_capabilities::HostPlatform::current().as_str();
+        let codex_version = version.to_string();
+        let native_runtime_version = format!("codex-native-{codex_version}");
+        ReadinessCacheKey::new(
+            NATIVE_ADAPTER,
+            desktop_binding,
+            execution_policy,
+            codex_version,
+            native_runtime_version,
+            None::<String>,
+            readiness_fingerprint("os-permission", platform, &desktop.session_id),
+            readiness_fingerprint("app-approval", platform, &desktop.session_id),
+        )
+        .map_err(|_| adapter_failure("readiness_key_invalid"))
+    }
+
+    fn readiness_from_evidence(
+        &self,
+        key: &ReadinessCacheKey,
+        evidence: ReadinessEvidence,
+    ) -> Result<AdapterReadiness, SatelleError> {
+        AdapterReadiness::ready(
+            key.adapter(),
+            "native Computer Use passed the Host action-path smoke test",
+            key.desktop_binding().clone(),
+            key.execution_policy().clone(),
+            evidence,
+            None,
+        )
+        .map_err(|_| adapter_failure("readiness_evidence_invalid"))
+    }
+
+    fn live_native_preflight(&self, key: ReadinessCacheKey) -> AdapterPreflight {
+        let observed_at = time::OffsetDateTime::now_utc();
+        let Some(expires_at) = observed_at.checked_add(self.native_readiness_ttl) else {
+            return AdapterPreflight::UncachedFailure(adapter_failure("readiness_ttl_invalid"));
+        };
+        let evidence = match key.evidence(
+            format!("native-readiness-{}", satelle_core::SessionId::new()),
+            observed_at,
+            expires_at,
+        ) {
+            Ok(evidence) => evidence,
+            Err(_) => {
+                return AdapterPreflight::UncachedFailure(adapter_failure(
+                    "readiness_evidence_invalid",
+                ));
+            }
+        };
+        match self.run_native_smoke(&key) {
+            Ok(()) => match self.readiness_from_evidence(&key, evidence) {
+                Ok(readiness) => AdapterPreflight::Ready(readiness),
+                Err(error) => AdapterPreflight::UncachedFailure(error),
+            },
+            Err(reason) => AdapterPreflight::Failed {
+                key,
+                evidence,
+                reason,
+                error: native_readiness_failure(reason),
+            },
+        }
+    }
+
+    fn run_native_smoke(&self, _key: &ReadinessCacheKey) -> Result<(), &'static str> {
+        let nonce = format!("SATELLE-{}", satelle_core::TurnId::new());
+        let deadline = Instant::now()
+            .checked_add(self.native_readiness_timeout)
+            .ok_or("native_readiness_timeout_invalid")?;
+        let mut target = NativeActionTarget::spawn(&nonce, self.native_readiness_timeout)?;
+        std::thread::sleep(Duration::from_millis(200));
+        let working_directory = self
+            .working_directory
+            .as_ref()
+            .map_err(|_| "working_directory_unavailable")
+            .and_then(|path| {
+                prepare_working_directory(path).map_err(|_| "working_directory_unavailable")
+            })?;
+        let prompt = format!(
+            "Use native Computer Use, not shell or file tools, to click the button labeled {nonce} in the visible 'Satelle Native Readiness' window. Stop after clicking it."
+        );
+        let mut persist_thread = |_value: &str| Ok(());
+        let mut persist_turn = |_value: &str| Ok(());
+        let terminal = run_codex_session(
+            crate::codex_capabilities::installed_app_server_command(),
+            CodexSessionRequest {
+                working_directory: &working_directory,
+                prompt: &prompt,
+                existing_thread_ref: None,
+                model: None,
+                model_provider: None,
+                execution_mode: TurnExecutionMode::Standard,
+                approval_policy: CodexApprovalPolicy::OnRequest,
+                sandbox_policy: CodexSandboxPolicy::WorkspaceWrite,
+                deadline,
+                persist_thread_ref: &mut persist_thread,
+                persist_turn_ref: &mut persist_turn,
+                control: None,
+            },
+        )
+        .map_err(|failure| match failure.error() {
+            CodexSessionError::Timeout => "native_readiness_timed_out",
+            _ => "native_readiness_session_failed",
+        })?;
+        if terminal != CodexSessionTerminal::Completed {
+            return Err("native_readiness_session_failed");
+        }
+        target.wait_for_success(deadline)
     }
 
     fn ensure_platform_admitted(&self) -> Result<(), SatelleError> {
-        let snapshot = crate::read_production_snapshot(&self.snapshot)?;
-        if snapshot.verdict.is_supported() {
-            Ok(())
-        } else {
-            Err(crate::execution_blocker(&snapshot.verdict))
-        }
+        self.native_readiness_key().map(|_| ())
     }
 
     fn register_execution(
@@ -149,6 +317,110 @@ impl ProductionComputerUseAdapter {
     }
 }
 
+struct NativeActionTarget {
+    child: GroupChild,
+}
+
+impl NativeActionTarget {
+    fn spawn(nonce: &str, timeout: Duration) -> Result<Self, &'static str> {
+        let mut command = native_action_command(nonce, timeout)?;
+        command
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        command
+            .group_spawn()
+            .map(|child| Self { child })
+            .map_err(|_| "native_readiness_target_unavailable")
+    }
+
+    fn wait_for_success(&mut self, deadline: Instant) -> Result<(), &'static str> {
+        loop {
+            match self.child.try_wait() {
+                Ok(Some(status)) if status.success() => return Ok(()),
+                Ok(Some(_)) => return Err("native_readiness_action_not_observed"),
+                Ok(None) if Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Ok(None) => return Err("native_readiness_timed_out"),
+                Err(_) => return Err("native_readiness_target_failed"),
+            }
+        }
+    }
+}
+
+impl Drop for NativeActionTarget {
+    fn drop(&mut self) {
+        let _ = crate::codex_capabilities::terminate_group(&mut self.child);
+    }
+}
+
+#[cfg(windows)]
+fn native_action_command(nonce: &str, _timeout: Duration) -> Result<Command, &'static str> {
+    let script = format!(
+        "$ErrorActionPreference='Stop'; Add-Type -AssemblyName PresentationFramework; \
+         $window=New-Object Windows.Window; $window.Title='Satelle Native Readiness'; \
+         $window.Width=520; $window.Height=180; $window.Topmost=$true; \
+         $button=New-Object Windows.Controls.Button; $button.Content='{nonce}'; \
+         $button.FontSize=24; $button.Margin=20; \
+         $button.Add_Click({{$window.Tag='passed'; $window.Close()}}); \
+         $window.Content=$button; [void]$window.ShowDialog(); \
+         if ($window.Tag -eq 'passed') {{ exit 0 }} else {{ exit 1 }}"
+    );
+    let mut command = Command::new("powershell.exe");
+    command.args(["-NoLogo", "-NoProfile", "-STA", "-Command", &script]);
+    Ok(command)
+}
+
+#[cfg(target_os = "macos")]
+fn native_action_command(nonce: &str, timeout: Duration) -> Result<Command, &'static str> {
+    let timeout = timeout.as_secs().max(1);
+    let script = format!(
+        "tell application \"System Events\" to set probeResult to display dialog \"Click the readiness button\" with title \"Satelle Native Readiness\" buttons {{\"Cancel\", \"{nonce}\"}} default button \"{nonce}\" cancel button \"Cancel\" giving up after {timeout}\n\
+         if gave up of probeResult then error \"native readiness timed out\" number 1\n\
+         if button returned of probeResult is not \"{nonce}\" then error \"native readiness action not observed\" number 2"
+    );
+    let mut command = Command::new("/usr/bin/osascript");
+    command.args(["-e", &script]);
+    Ok(command)
+}
+
+#[cfg(not(any(windows, target_os = "macos")))]
+fn native_action_command(_nonce: &str, _timeout: Duration) -> Result<Command, &'static str> {
+    Err("unsupported_host_platform")
+}
+
+fn readiness_fingerprint(domain: &str, platform: &str, desktop: &str) -> String {
+    let mut digest = Sha256::new();
+    digest.update(b"satelle-native-readiness-v1\0");
+    digest.update(domain.as_bytes());
+    digest.update([0]);
+    digest.update(platform.as_bytes());
+    digest.update([0]);
+    digest.update(desktop.as_bytes());
+    digest
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+fn protocol_override(value: &str) -> Option<&str> {
+    (value != DEFAULT_MODEL_BINDING && value != DEFAULT_PROVIDER_BINDING).then_some(value)
+}
+
+fn native_readiness_failure(reason: &'static str) -> SatelleError {
+    let mut details = std::collections::BTreeMap::new();
+    details.insert("reason".to_string(), Value::String(reason.to_string()));
+    SatelleError {
+        code: ErrorCode::ComputerUseNotReady,
+        message: "native Computer Use did not pass the Host action-path smoke test".to_string(),
+        recovery_command: Some("satelle doctor --scope computer-use --refresh --json".to_string()),
+        source_detail: None,
+        details,
+    }
+}
+
 impl ComputerUseAdapter for ProductionComputerUseAdapter {
     fn admit_operation(&self, operation: ControlPlaneOperation) -> Result<(), SatelleError> {
         crate::read_production_snapshot(&self.snapshot)?
@@ -156,8 +428,30 @@ impl ComputerUseAdapter for ProductionComputerUseAdapter {
             .admit(operation)
     }
 
-    fn preflight(&self, _host: &str) -> Result<AdapterReadiness, SatelleError> {
-        self.blocked()
+    fn preflight(&self, host: &str) -> Result<AdapterReadiness, SatelleError> {
+        self.preflight_terminal(host, None).into_result()
+    }
+
+    fn readiness_cache_key(&self, _host: &str) -> Result<Option<ReadinessCacheKey>, SatelleError> {
+        self.native_readiness_key().map(Some)
+    }
+
+    fn preflight_terminal(
+        &self,
+        _host: &str,
+        cached: Option<ReadinessEvidence>,
+    ) -> AdapterPreflight {
+        let key = match self.native_readiness_key() {
+            Ok(key) => key,
+            Err(error) => return AdapterPreflight::UncachedFailure(error),
+        };
+        match cached {
+            Some(evidence) => match self.readiness_from_evidence(&key, evidence) {
+                Ok(readiness) => AdapterPreflight::Ready(readiness),
+                Err(error) => AdapterPreflight::UncachedFailure(error),
+            },
+            None => self.live_native_preflight(key),
+        }
     }
 
     fn execute(&self, request: ExecuteRequest<'_>) -> Result<ExecuteResult, SatelleError> {
@@ -196,8 +490,8 @@ impl ComputerUseAdapter for ProductionComputerUseAdapter {
                 working_directory: &working_directory,
                 prompt: request.prompt(),
                 existing_thread_ref: request.upstream_thread_ref(),
-                model: policy.effective_model().as_str(),
-                model_provider: policy.provider_binding().as_str(),
+                model: protocol_override(policy.effective_model().as_str()),
+                model_provider: protocol_override(policy.provider_binding().as_str()),
                 execution_mode: request.execution_mode(),
                 approval_policy,
                 sandbox_policy,

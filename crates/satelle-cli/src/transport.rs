@@ -568,7 +568,7 @@ fn api_code_error(host: &str, code: ApiErrorCode) -> SatelleError {
     }
 }
 
-fn local_host_service() -> Result<HostService, CliFailure> {
+fn local_host_service(host_config: &satelle_core::HostConfig) -> Result<HostService, CliFailure> {
     #[cfg(feature = "test-support")]
     match std::env::var(TEST_SUPPORT_ADAPTER_ENV) {
         Ok(value) if value == "fake" => {
@@ -590,12 +590,12 @@ fn local_host_service() -> Result<HostService, CliFailure> {
         Err(std::env::VarError::NotPresent) => {}
     }
 
-    Ok(HostService::production())
+    Ok(HostService::production_for_host(host_config))
 }
 
 pub(crate) fn transport_for(host: &SelectedHost) -> Result<Box<dyn TransportClient>, CliFailure> {
     match host.config.transport {
-        TransportKind::Local => local_host_service()
+        TransportKind::Local => local_host_service(&host.config)
             .map(|service| Box::new(LocalTransport::new(host.alias.clone(), service)) as _),
         TransportKind::Direct => direct_transport(host)
             .map(|transport| Box::new(transport) as _)

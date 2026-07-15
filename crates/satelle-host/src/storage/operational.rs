@@ -1,7 +1,7 @@
 use super::codec::unix_timestamp_nanos;
 use super::{Storage, StorageError, StorageErrorKind};
-use crate::{ProviderSmokeEvidence, ReadinessEvidence};
-use rusqlite::{TransactionBehavior, params};
+use crate::{ProviderSmokeEvidence, ReadinessCacheKey, ReadinessEvidence};
+use rusqlite::{OptionalExtension, TransactionBehavior, params};
 use satelle_core::session::{DesktopBindingRef, ExecutionPolicy};
 
 impl Storage {
@@ -27,6 +27,8 @@ impl Storage {
             adapter,
             desktop_binding,
             readiness,
+            "passed",
+            None,
         )?;
         if let Some(provider) = provider {
             insert_provider_smoke(
@@ -40,6 +42,84 @@ impl Storage {
         }
         transaction.commit().map_err(operation_failed)
     }
+
+    pub(crate) fn store_preflight_failure(
+        &mut self,
+        key: &ReadinessCacheKey,
+        evidence: &ReadinessEvidence,
+        reason: &'static str,
+    ) -> Result<(), StorageError> {
+        let host_identity = self.host_identity()?;
+        insert_readiness(
+            &self.connection,
+            host_identity.as_str(),
+            key.adapter(),
+            key.desktop_binding(),
+            evidence,
+            "failed",
+            Some(reason),
+        )
+    }
+
+    /// Returns only a matching, unexpired success. Failed results remain in
+    /// the authoritative store for diagnostics but never authorize execution.
+    pub(crate) fn load_reusable_readiness(
+        &self,
+        key: &ReadinessCacheKey,
+        now: time::OffsetDateTime,
+    ) -> Result<Option<ReadinessEvidence>, StorageError> {
+        let host_identity = self.host_identity()?;
+        let row = self
+            .connection
+            .query_row(
+                "SELECT result_id, observed_at, expires_at
+                 FROM native_readiness_results
+                 WHERE host_identity_ref = ?1
+                   AND desktop_binding_ref = ?2
+                   AND adapter_ref = ?3
+                   AND codex_version = ?4
+                   AND native_runtime_version = ?5
+                   AND plugin_version IS ?6
+                   AND os_permission_fingerprint = ?7
+                   AND app_approval_fingerprint = ?8
+                   AND status = 'passed'
+                   AND observed_at <= ?9
+                   AND expires_at > ?9
+                 ORDER BY observed_at DESC
+                 LIMIT 1",
+                params![
+                    host_identity.as_str(),
+                    key.desktop_binding().as_str(),
+                    key.adapter(),
+                    key.codex_version(),
+                    key.native_runtime_version(),
+                    key.plugin_version(),
+                    key.os_permission_fingerprint(),
+                    key.app_approval_fingerprint(),
+                    unix_timestamp_nanos(now)?,
+                ],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, i64>(2)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(operation_failed)?;
+        row.map(|(result_id, observed_at, expires_at)| {
+            let observed_at =
+                time::OffsetDateTime::from_unix_timestamp_nanos(i128::from(observed_at))
+                    .map_err(|_| StorageError::new(StorageErrorKind::InvalidStoredState))?;
+            let expires_at =
+                time::OffsetDateTime::from_unix_timestamp_nanos(i128::from(expires_at))
+                    .map_err(|_| StorageError::new(StorageErrorKind::InvalidStoredState))?;
+            key.evidence(result_id, observed_at, expires_at)
+                .map_err(|_| StorageError::new(StorageErrorKind::InvalidStoredState))
+        })
+        .transpose()
+    }
 }
 
 fn insert_readiness(
@@ -48,18 +128,23 @@ fn insert_readiness(
     adapter: &str,
     desktop_binding: &DesktopBindingRef,
     evidence: &ReadinessEvidence,
+    status: &'static str,
+    failure_reason: Option<&'static str>,
 ) -> Result<(), StorageError> {
     connection
         .execute(
-            "INSERT INTO readiness_successes (
+            "INSERT INTO native_readiness_results (
                 result_id, host_identity_ref, desktop_binding_ref, adapter_ref,
+                status, failure_reason,
                 codex_version, native_runtime_version, plugin_version,
                 os_permission_fingerprint, app_approval_fingerprint, observed_at, expires_at
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
             ON CONFLICT(result_id) DO UPDATE SET result_id = excluded.result_id
             WHERE host_identity_ref = excluded.host_identity_ref
               AND desktop_binding_ref = excluded.desktop_binding_ref
               AND adapter_ref = excluded.adapter_ref
+              AND status = excluded.status
+              AND failure_reason IS excluded.failure_reason
               AND codex_version = excluded.codex_version
               AND native_runtime_version = excluded.native_runtime_version
               AND plugin_version IS excluded.plugin_version
@@ -72,6 +157,8 @@ fn insert_readiness(
                 host_identity,
                 desktop_binding.as_str(),
                 adapter,
+                status,
+                failure_reason,
                 evidence.codex_version(),
                 evidence.native_runtime_version(),
                 evidence.plugin_version(),

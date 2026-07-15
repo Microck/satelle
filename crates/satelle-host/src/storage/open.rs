@@ -32,7 +32,7 @@ pub(super) const PROTECTED_FILE_NAMES: [&str; 5] = [
     "satelle.sqlite3-journal",
 ];
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
-const MIGRATIONS: [Migration; 2] = [
+const MIGRATIONS: [Migration; 3] = [
     Migration {
         version: 1,
         sql: include_str!("0001_initial.sql"),
@@ -41,6 +41,11 @@ const MIGRATIONS: [Migration; 2] = [
     Migration {
         version: 2,
         sql: include_str!("0002_operational_evidence.sql"),
+        seeds_sensitive_state: false,
+    },
+    Migration {
+        version: 3,
+        sql: include_str!("0003_native_readiness_results.sql"),
         seeds_sensitive_state: false,
     },
 ];

@@ -114,7 +114,7 @@ impl HostPlatform {
         }
     }
 
-    const fn supports_native_computer_use(self) -> bool {
+    pub(crate) const fn supports_native_computer_use(self) -> bool {
         matches!(self, Self::Macos | Self::Windows)
     }
 

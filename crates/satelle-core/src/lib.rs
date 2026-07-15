@@ -70,6 +70,7 @@ impl SatelleConfig {
                 address: None,
                 network: None,
                 timeouts: None,
+                native_readiness_cache_ttl: None,
                 desktop_user: None,
                 desktop_session_preference: None,
                 desktop_session_native_selector: None,
@@ -131,6 +132,7 @@ pub struct HostConfig {
     pub address: Option<String>,
     pub network: Option<NetworkConfig>,
     pub timeouts: Option<TimeoutConfig>,
+    pub native_readiness_cache_ttl: Option<ExplicitDuration>,
     pub desktop_user: Option<String>,
     pub desktop_session_preference: Option<DesktopSessionPreference>,
     pub desktop_session_native_selector: Option<DesktopSessionNativeSelector>,
@@ -715,6 +717,7 @@ fn reject_interpolation(path: &Path, value: &toml::Value) -> Result<(), SatelleE
             "daemon_state_dir",
             "daemon_cache_dir",
             "daemon_log_dir",
+            "native_readiness_cache_ttl",
         ] {
             collect_interpolation_for_value(
                 &format!("{host_path}.{key}"),
@@ -912,6 +915,15 @@ fn reject_timeout_config_errors(path: &Path, value: &toml::Value) -> Result<(), 
         let Some(host_table) = host_value.as_table() else {
             continue;
         };
+        if let Some(value) = host_table.get("native_readiness_cache_ttl") {
+            let ttl_path = format!("{host_path}.native_readiness_cache_ttl");
+            let Some(value) = value.as_str() else {
+                return Err(SatelleError::duration_unit_required(path, &ttl_path));
+            };
+            if ExplicitDuration::parse(value).is_none() {
+                return Err(SatelleError::duration_unit_required(path, &ttl_path));
+            }
+        }
         let Some(timeouts) = host_table.get("timeouts").and_then(toml::Value::as_table) else {
             continue;
         };
@@ -1103,6 +1115,7 @@ fn reject_unknown_user_config_keys(path: &Path, value: &toml::Value) -> Result<(
                     "address",
                     "network",
                     "timeouts",
+                    "native_readiness_cache_ttl",
                     "desktop_user",
                     "desktop_session_preference",
                     "desktop_session_native_selector",
