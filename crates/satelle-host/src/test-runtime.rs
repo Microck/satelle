@@ -65,6 +65,34 @@ impl HostService {
 #[derive(Clone, Debug)]
 pub(super) struct FakeComputerUseAdapter;
 
+#[derive(Clone, Debug)]
+pub(super) struct PendingComputerUseAdapter;
+
+impl ComputerUseAdapter for PendingComputerUseAdapter {
+    fn preflight(&self, host: &str) -> Result<AdapterReadiness, SatelleError> {
+        FakeComputerUseAdapter.preflight(host)
+    }
+
+    fn execute(&self, _request: ExecuteRequest<'_>) -> Result<ExecuteResult, SatelleError> {
+        // Only short-lived CLI subprocess tests may use this adapter: no
+        // in-process owner should retain its permanently parked worker.
+        loop {
+            std::thread::park();
+        }
+    }
+
+    fn observe_stop(&self, subject: AdapterSubject<'_>) -> Result<StopObservation, SatelleError> {
+        FakeComputerUseAdapter.observe_stop(subject)
+    }
+
+    fn observe_recovery(
+        &self,
+        subject: AdapterSubject<'_>,
+    ) -> Result<RecoveryObservation, SatelleError> {
+        FakeComputerUseAdapter.observe_recovery(subject)
+    }
+}
+
 impl ComputerUseAdapter for FakeComputerUseAdapter {
     fn preflight(&self, _host: &str) -> Result<AdapterReadiness, SatelleError> {
         let desktop_binding = DesktopBindingRef::new("local-demo-desktop-v1")

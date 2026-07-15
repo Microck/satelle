@@ -52,7 +52,7 @@ use serde_json::{Value, json};
 use std::sync::{Arc, RwLock, RwLockReadGuard};
 use std::time::Instant;
 #[cfg(any(test, feature = "test-support"))]
-use test_runtime::FakeComputerUseAdapter;
+use test_runtime::{FakeComputerUseAdapter, PendingComputerUseAdapter};
 
 #[cfg(any(test, feature = "test-support"))]
 #[doc(hidden)]
@@ -152,6 +152,16 @@ impl HostService {
     pub fn local_demo_for_tests() -> Result<Self, SatelleError> {
         Ok(Self {
             runtime: RuntimeHandle::new(satelle_core::state_dir(), FakeComputerUseAdapter),
+            operation_capacity: Arc::new(OperationCapacity::default()),
+            mode: HostMode::TestFake,
+        })
+    }
+
+    #[doc(hidden)]
+    #[cfg(feature = "test-support")]
+    pub fn pending_local_demo_for_tests() -> Result<Self, SatelleError> {
+        Ok(Self {
+            runtime: RuntimeHandle::new(satelle_core::state_dir(), PendingComputerUseAdapter),
             operation_capacity: Arc::new(OperationCapacity::default()),
             mode: HostMode::TestFake,
         })
