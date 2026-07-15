@@ -36,14 +36,15 @@ pub use log_page::{
 };
 use operation_capacity::OperationCapacity;
 pub use runtime::{
-    AdapterReadiness, AdapterSubject, ComputerUseAdapter, EvidenceError, ExecuteRequest,
-    ExecuteResult, ProviderSmokeEvidence, ReadinessEvidence, RecoveryObservation,
+    AdapterPreflight, AdapterReadiness, AdapterSubject, ComputerUseAdapter, EvidenceError,
+    ExecuteRequest, ExecuteResult, ProviderSmokeEvidence, ReadinessCacheKey, ReadinessEvidence,
+    RecoveryObservation,
 };
 use runtime::{ProductionComputerUseAdapter, RunCommand, RuntimeHandle, SteerCommand, StopCommand};
 use satelle_core::session::{PublicSession, TurnAdmissionFailure, TurnExecutionMode};
 use satelle_core::{
     DaemonPathOverrides, DoctorFinding, DoctorFixability, DoctorProbeResult, DoctorReport,
-    DoctorSchemaVersion, DoctorSummary, HostSessionsReport, HostSessionsSchemaVersion,
+    DoctorSchemaVersion, DoctorSummary, HostConfig, HostSessionsReport, HostSessionsSchemaVersion,
     LOCAL_DEMO_HOST, SatelleError, SatelleEvent, SessionId, SetupReadinessSummary, SetupReport,
     SetupSchemaVersion, StopResult, object_value, utc_now,
 };
@@ -52,7 +53,12 @@ use serde_json::{Value, json};
 use std::sync::{Arc, RwLock, RwLockReadGuard};
 use std::time::Instant;
 #[cfg(any(test, feature = "test-support"))]
-use test_runtime::{FakeComputerUseAdapter, PendingComputerUseAdapter};
+use test_runtime::FakeComputerUseAdapter;
+#[cfg(feature = "test-support")]
+use test_runtime::PendingComputerUseAdapter;
+
+const DEFAULT_NATIVE_READINESS_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+const DEFAULT_NATIVE_READINESS_TTL: time::Duration = time::Duration::minutes(5);
 
 #[cfg(any(test, feature = "test-support"))]
 #[doc(hidden)]
@@ -85,6 +91,7 @@ enum HostMode {
 
 #[derive(Clone, Debug)]
 pub(crate) struct ProductionCapabilitySnapshot {
+    evidence: codex_capabilities::Phase0CapabilityEvidence,
     verdict: Phase0SupportVerdict,
     control_plane_admission: codex_capabilities::ControlPlaneAdmission,
     started_at: String,
@@ -101,6 +108,7 @@ impl ProductionCapabilitySnapshot {
         let duration_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
 
         Self {
+            evidence: discovery.evidence,
             verdict,
             control_plane_admission: discovery.control_plane_admission,
             started_at,
@@ -132,13 +140,43 @@ impl HostService {
     /// Builds the only runtime available in normal and release builds. The
     /// constructor retains only typed, diagnostic-safe capability evidence.
     pub fn production() -> Self {
+        let config = satelle_core::SatelleConfig::defaults()
+            .hosts
+            .remove(LOCAL_DEMO_HOST)
+            .expect("the built-in local Host config exists");
+        Self::production_for_host(&config)
+    }
+
+    /// Builds a production Host whose native probe timeout and cache TTL come
+    /// from the fully resolved host/profile configuration.
+    pub fn production_for_host(config: &HostConfig) -> Self {
         let snapshot = Arc::new(RwLock::new(ProductionCapabilitySnapshot::collect()));
         let state_root = satelle_core::state_dir();
         let working_directory = state_root
             .as_ref()
             .map(|path| path.join("codex-app-server-work"))
             .map_err(Clone::clone);
-        let adapter = ProductionComputerUseAdapter::new(Arc::clone(&snapshot), working_directory);
+        let timeout = config
+            .timeouts
+            .as_ref()
+            .and_then(|timeouts| timeouts.native_readiness.as_ref())
+            .map_or(DEFAULT_NATIVE_READINESS_TIMEOUT, |duration| {
+                std::time::Duration::from_millis(duration.milliseconds())
+            });
+        let ttl = config.native_readiness_cache_ttl.as_ref().map_or(
+            DEFAULT_NATIVE_READINESS_TTL,
+            |duration| {
+                time::Duration::milliseconds(
+                    i64::try_from(duration.milliseconds()).unwrap_or(i64::MAX),
+                )
+            },
+        );
+        let adapter = ProductionComputerUseAdapter::with_readiness_policy(
+            Arc::clone(&snapshot),
+            working_directory,
+            timeout,
+            ttl,
+        );
         Self {
             runtime: RuntimeHandle::new(state_root, adapter),
             operation_capacity: Arc::new(OperationCapacity::default()),

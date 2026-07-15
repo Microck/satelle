@@ -16,8 +16,9 @@ mod stop;
 mod worker;
 
 pub use adapter::{
-    AdapterReadiness, AdapterSubject, ComputerUseAdapter, EvidenceError, ExecuteRequest,
-    ExecuteResult, ProviderSmokeEvidence, ReadinessEvidence, RecoveryObservation,
+    AdapterPreflight, AdapterReadiness, AdapterSubject, ComputerUseAdapter, EvidenceError,
+    ExecuteRequest, ExecuteResult, ProviderSmokeEvidence, ReadinessCacheKey, ReadinessEvidence,
+    RecoveryObservation,
 };
 pub(crate) use codex_adapter::ProductionComputerUseAdapter;
 pub(crate) use request::{RequestIdentity, RunCommand, SteerCommand, StopCommand};
@@ -34,7 +35,8 @@ use crate::{ApiBearerToken, ApiPrincipal, DaemonLogPage, LogCursor, LogPageQuery
 use recovery::RecoveryQueue;
 use satelle_core::session::{PublicSession, TurnAdmissionFailure};
 use satelle_core::{
-    ControlPlaneOperation, LOCAL_DEMO_HOST, SatelleError, SatelleEvent, SessionId, TurnId,
+    ControlPlaneOperation, ErrorCode, LOCAL_DEMO_HOST, SatelleError, SatelleEvent, SessionId,
+    TurnId,
 };
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -205,7 +207,6 @@ impl RuntimeEngine {
         readiness: AdapterReadiness,
     ) -> Result<RuntimeTurnOutcome, SatelleError> {
         ensure_local_host(command.host)?;
-        self.persist_readiness(&readiness)?;
         let session_id = SessionId::new();
         let turn_id = TurnId::new();
         let started_at = time::OffsetDateTime::now_utc();
@@ -251,7 +252,6 @@ impl RuntimeEngine {
         command: SteerCommand<'_>,
         readiness: AdapterReadiness,
     ) -> Result<RuntimeTurnOutcome, SatelleError> {
-        self.persist_readiness(&readiness)?;
         // Preflight can outlive the retention observation made during replay
         // admission. Recheck at the authoritative Session load so a follow-up
         // cannot revive metadata that crossed the retention boundary meanwhile.
@@ -299,15 +299,62 @@ impl RuntimeEngine {
         )
     }
 
-    fn persist_readiness(&self, readiness: &AdapterReadiness) -> Result<(), SatelleError> {
+    fn preflight(&self, host: &str) -> Result<AdapterReadiness, SatelleError> {
+        let cache_key = self.adapter.readiness_cache_key(host)?;
+        let cached = cache_key
+            .as_ref()
+            .map(|key| {
+                self.lock_storage()?
+                    .load_reusable_readiness(key, time::OffsetDateTime::now_utc())
+                    .map_err(model::storage_failure)
+            })
+            .transpose()?
+            .flatten();
+        match self.adapter.preflight_terminal(host, cached) {
+            AdapterPreflight::Ready(readiness) => {
+                self.lock_storage()?
+                    .store_preflight_successes(
+                        readiness.adapter(),
+                        readiness.desktop_binding(),
+                        readiness.execution_policy(),
+                        readiness.evidence(),
+                        readiness.provider_smoke_evidence(),
+                    )
+                    .map_err(model::storage_failure)?;
+                Ok(readiness)
+            }
+            AdapterPreflight::Failed {
+                key,
+                evidence,
+                reason,
+                error,
+            } => {
+                self.lock_storage()?
+                    .store_preflight_failure(&key, &evidence, reason)
+                    .map_err(model::storage_failure)?;
+                Err(error)
+            }
+            AdapterPreflight::UncachedFailure(error) => Err(error),
+        }
+    }
+
+    fn has_reusable_readiness(&self, host: &str) -> Result<bool, SatelleError> {
+        let key = match self.adapter.readiness_cache_key(host) {
+            Ok(Some(key)) => key,
+            Ok(None) => return Ok(false),
+            Err(error)
+                if matches!(
+                    error.code,
+                    ErrorCode::ComputerUseNotReady | ErrorCode::IncompatibleControlPlane
+                ) =>
+            {
+                return Ok(false);
+            }
+            Err(error) => return Err(error),
+        };
         self.lock_storage()?
-            .store_preflight_successes(
-                readiness.adapter(),
-                readiness.desktop_binding(),
-                readiness.execution_policy(),
-                readiness.evidence(),
-                readiness.provider_smoke_evidence(),
-            )
+            .load_reusable_readiness(&key, time::OffsetDateTime::now_utc())
+            .map(|result| result.is_some())
             .map_err(model::storage_failure)
     }
 
@@ -535,7 +582,7 @@ impl RuntimeHandle {
                 error,
             );
         }
-        let readiness = match self.adapter.preflight(command.host) {
+        let readiness = match engine.preflight(command.host) {
             Ok(readiness) => readiness,
             Err(error) => {
                 return self.resolve_precommit_failure(
@@ -615,7 +662,7 @@ impl RuntimeHandle {
                 error,
             );
         }
-        let readiness = match self.adapter.preflight(LOCAL_DEMO_HOST) {
+        let readiness = match engine.preflight(LOCAL_DEMO_HOST) {
             Ok(readiness) => readiness,
             Err(error) => {
                 return self.resolve_precommit_failure(
@@ -702,6 +749,10 @@ impl RuntimeHandle {
 
     pub(crate) fn snapshot(&self) -> Result<RuntimeSnapshot, SatelleError> {
         self.engine()?.snapshot()
+    }
+
+    pub(crate) fn has_reusable_readiness(&self, host: &str) -> Result<bool, SatelleError> {
+        self.engine()?.has_reusable_readiness(host)
     }
 
     pub(crate) fn daemon_workers_idle(&self) -> Result<bool, SatelleError> {

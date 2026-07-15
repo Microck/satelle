@@ -126,6 +126,131 @@ pub struct ReadinessEvidence {
     app_approval_fingerprint: String,
 }
 
+/// Stable inputs that must still match before a successful native readiness
+/// result may be reused. The Host runtime owns lookup and persistence; the
+/// adapter can only describe the environment it is about to exercise.
+#[derive(Clone, Eq, PartialEq)]
+pub struct ReadinessCacheKey {
+    adapter: &'static str,
+    desktop_binding: DesktopBindingRef,
+    execution_policy: ExecutionPolicy,
+    codex_version: String,
+    native_runtime_version: String,
+    plugin_version: Option<String>,
+    os_permission_fingerprint: String,
+    app_approval_fingerprint: String,
+}
+
+impl ReadinessCacheKey {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        adapter: &'static str,
+        desktop_binding: DesktopBindingRef,
+        execution_policy: ExecutionPolicy,
+        codex_version: impl Into<String>,
+        native_runtime_version: impl Into<String>,
+        plugin_version: Option<impl Into<String>>,
+        os_permission_fingerprint: impl Into<String>,
+        app_approval_fingerprint: impl Into<String>,
+    ) -> Result<Self, EvidenceError> {
+        normalized_identifier(adapter)?;
+        Ok(Self {
+            adapter,
+            desktop_binding,
+            execution_policy,
+            codex_version: normalized_identifier(codex_version)?,
+            native_runtime_version: normalized_identifier(native_runtime_version)?,
+            plugin_version: plugin_version.map(normalized_identifier).transpose()?,
+            os_permission_fingerprint: fingerprint(os_permission_fingerprint)?,
+            app_approval_fingerprint: fingerprint(app_approval_fingerprint)?,
+        })
+    }
+
+    pub(crate) const fn adapter(&self) -> &'static str {
+        self.adapter
+    }
+
+    pub(crate) fn desktop_binding(&self) -> &DesktopBindingRef {
+        &self.desktop_binding
+    }
+
+    pub(crate) fn execution_policy(&self) -> &ExecutionPolicy {
+        &self.execution_policy
+    }
+
+    pub(crate) fn codex_version(&self) -> &str {
+        &self.codex_version
+    }
+
+    pub(crate) fn native_runtime_version(&self) -> &str {
+        &self.native_runtime_version
+    }
+
+    pub(crate) fn plugin_version(&self) -> Option<&str> {
+        self.plugin_version.as_deref()
+    }
+
+    pub(crate) fn os_permission_fingerprint(&self) -> &str {
+        &self.os_permission_fingerprint
+    }
+
+    pub(crate) fn app_approval_fingerprint(&self) -> &str {
+        &self.app_approval_fingerprint
+    }
+
+    pub(crate) fn evidence(
+        &self,
+        result_id: impl Into<String>,
+        observed_at: time::OffsetDateTime,
+        expires_at: time::OffsetDateTime,
+    ) -> Result<ReadinessEvidence, EvidenceError> {
+        ReadinessEvidence::new(
+            result_id,
+            self.codex_version.clone(),
+            self.native_runtime_version.clone(),
+            self.plugin_version.clone(),
+            self.os_permission_fingerprint.clone(),
+            self.app_approval_fingerprint.clone(),
+            observed_at,
+            expires_at,
+        )
+    }
+}
+
+impl std::fmt::Debug for ReadinessCacheKey {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ReadinessCacheKey")
+            .field("adapter", &self.adapter)
+            .field("desktop_binding", &self.desktop_binding)
+            .finish_non_exhaustive()
+    }
+}
+
+/// One completed native readiness attempt. Failures retain only a closed
+/// reason and normalized evidence; raw app-server or desktop output never
+/// reaches the Host store.
+pub enum AdapterPreflight {
+    Ready(AdapterReadiness),
+    Failed {
+        key: ReadinessCacheKey,
+        evidence: ReadinessEvidence,
+        reason: &'static str,
+        error: SatelleError,
+    },
+    UncachedFailure(SatelleError),
+}
+
+impl AdapterPreflight {
+    pub(crate) fn into_result(self) -> Result<AdapterReadiness, SatelleError> {
+        match self {
+            Self::Ready(readiness) => Ok(readiness),
+            Self::Failed { error, .. } => Err(error),
+            Self::UncachedFailure(error) => Err(error),
+        }
+    }
+}
+
 impl ReadinessEvidence {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
@@ -585,6 +710,26 @@ pub trait ComputerUseAdapter: Send + Sync + 'static {
     }
 
     fn preflight(&self, host: &str) -> Result<AdapterReadiness, SatelleError>;
+
+    /// Returns a production cache key without running the harmless action.
+    /// Adapters that do not represent the native production boundary opt out.
+    fn readiness_cache_key(&self, _host: &str) -> Result<Option<ReadinessCacheKey>, SatelleError> {
+        Ok(None)
+    }
+
+    /// Runs preflight or reconstructs readiness from Host-owned evidence.
+    /// The default deliberately ignores cached evidence because only an
+    /// adapter with an explicit cache key can prove it still matches.
+    fn preflight_terminal(
+        &self,
+        host: &str,
+        _cached: Option<ReadinessEvidence>,
+    ) -> AdapterPreflight {
+        match self.preflight(host) {
+            Ok(readiness) => AdapterPreflight::Ready(readiness),
+            Err(error) => AdapterPreflight::UncachedFailure(error),
+        }
+    }
 
     fn execute(&self, request: ExecuteRequest<'_>) -> Result<ExecuteResult, SatelleError>;
 

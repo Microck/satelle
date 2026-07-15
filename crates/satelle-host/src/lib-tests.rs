@@ -252,16 +252,16 @@ fn attached_adapter_failures_return_exact_durable_run_and_steer_handles() {
 #[test]
 fn refreshed_production_snapshot_updates_admission_surfaces_but_not_desktop_discovery() {
     let state = TestStateDir::new().expect("temporary state directory should exist");
-    let initial = ProductionCapabilitySnapshot {
-        verdict: Phase0SupportVerdict::Supported {
-            codex_version: REQUIRED_CODEX_VERSION,
+    let initial = capability_snapshot(
+        Phase0CapabilityEvidence {
+            codex_version: CodexVersionEvidence::Detected {
+                version: REQUIRED_CODEX_VERSION,
+            },
             host_platform: HostPlatform::Windows,
+            capabilities: CapabilityMatrix::unproven(),
         },
-        control_plane_admission: codex_capabilities::ControlPlaneAdmission::not_applicable(),
-        started_at: "2026-07-09T00:00:00Z".to_string(),
-        finished_at: "2026-07-09T00:00:01Z".to_string(),
-        duration_ms: 7,
-    };
+        7,
+    );
     let snapshot = Arc::new(RwLock::new(initial));
     let adapter = ProductionComputerUseAdapter::new(
         Arc::clone(&snapshot),
@@ -286,7 +286,7 @@ fn refreshed_production_snapshot_updates_admission_surfaces_but_not_desktop_disc
         initial_error,
         TurnAdmissionFailure::NotAdmitted(_)
     ));
-    assert_eq!(initial_error.error().code, ErrorCode::NotImplemented);
+    assert_eq!(initial_error.error().code, ErrorCode::ComputerUseNotReady);
     assert!(
         service
             .daemon_runtime_capabilities()
@@ -482,6 +482,7 @@ fn capability_snapshot(
     duration_ms: u64,
 ) -> ProductionCapabilitySnapshot {
     ProductionCapabilitySnapshot {
+        evidence,
         verdict: evaluate_phase0_support(evidence),
         control_plane_admission: codex_capabilities::ControlPlaneAdmission::not_applicable(),
         started_at: "2026-07-09T00:00:00Z".to_string(),

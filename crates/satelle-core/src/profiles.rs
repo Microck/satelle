@@ -16,6 +16,7 @@ const PROFILE_KEYS: &[&str] = &[
     "experimental_provider_computer_use",
     "yolo",
     "timeouts",
+    "native_readiness_cache_ttl",
 ];
 const TIMEOUT_KEYS: &[&str] = &["native_readiness", "provider_smoke_test"];
 
@@ -66,6 +67,7 @@ pub(super) struct ProfileConfig {
     experimental_provider_computer_use: Option<bool>,
     yolo: Option<bool>,
     timeouts: Option<TimeoutConfig>,
+    native_readiness_cache_ttl: Option<ExplicitDuration>,
 }
 
 impl ProfileConfig {
@@ -110,6 +112,9 @@ impl ProfileConfig {
                     .take()
                     .map_or_else(|| timeouts.clone(), |base| base.merge(timeouts.clone())),
             );
+        }
+        if let Some(ttl) = &self.native_readiness_cache_ttl {
+            host.native_readiness_cache_ttl = Some(ttl.clone());
         }
         if source.allows_user_policy()
             && let Some(enabled) = self.experimental_provider_computer_use
@@ -295,7 +300,7 @@ fn validate_profile(path: &Path, name: &str, value: &toml::Value) -> Result<(), 
     }
 
     reject_profile_interpolation(path, &profile_path, table)?;
-    reject_profile_timeout_errors(path, &profile_path, table)
+    reject_profile_duration_errors(path, &profile_path, table)
 }
 
 fn reject_profile_interpolation(
@@ -311,6 +316,11 @@ fn reject_profile_interpolation(
             &mut interpolations,
         );
     }
+    collect_interpolation_for_value(
+        &format!("{profile_path}.native_readiness_cache_ttl"),
+        table.get("native_readiness_cache_ttl"),
+        &mut interpolations,
+    );
     if let Some(timeouts) = table.get("timeouts").and_then(toml::Value::as_table) {
         for key in TIMEOUT_KEYS {
             collect_interpolation_for_value(
@@ -323,11 +333,20 @@ fn reject_profile_interpolation(
     finish_interpolation_check(path, interpolations)
 }
 
-fn reject_profile_timeout_errors(
+fn reject_profile_duration_errors(
     path: &Path,
     profile_path: &str,
     table: &toml::Table,
 ) -> Result<(), SatelleError> {
+    if let Some(value) = table.get("native_readiness_cache_ttl") {
+        let ttl_path = format!("{profile_path}.native_readiness_cache_ttl");
+        let Some(value) = value.as_str() else {
+            return Err(SatelleError::duration_unit_required(path, &ttl_path));
+        };
+        if ExplicitDuration::parse(value).is_none() {
+            return Err(SatelleError::duration_unit_required(path, &ttl_path));
+        }
+    }
     let Some(timeouts) = table.get("timeouts").and_then(toml::Value::as_table) else {
         return Ok(());
     };
