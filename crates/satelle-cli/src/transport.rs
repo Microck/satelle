@@ -574,9 +574,12 @@ fn local_host_service() -> Result<HostService, CliFailure> {
         Ok(value) if value == "fake" => {
             return HostService::local_demo_for_tests().map_err(failure);
         }
+        Ok(value) if value == "pending" => {
+            return HostService::pending_local_demo_for_tests().map_err(failure);
+        }
         Ok(_) => {
             return Err(failure(SatelleError::invalid_usage(
-                "SATELLE_TEST_SUPPORT_ADAPTER must be exactly 'fake' or unset",
+                "SATELLE_TEST_SUPPORT_ADAPTER must be exactly 'fake', 'pending', or unset",
             )));
         }
         Err(std::env::VarError::NotUnicode(_)) => {

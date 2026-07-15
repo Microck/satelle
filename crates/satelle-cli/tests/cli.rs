@@ -923,6 +923,7 @@ fn stopping_detached_turn_returns_exact_stop_contract() {
     let state = state_dir();
     let run_output = satelle()
         .env("SATELLE_STATE_DIR", state.path())
+        .env(TEST_SUPPORT_ADAPTER_ENV, "pending")
         .args([
             "run",
             "--host",
@@ -944,6 +945,7 @@ fn stopping_detached_turn_returns_exact_stop_contract() {
 
     let stop_output = satelle()
         .env("SATELLE_STATE_DIR", state.path())
+        .env(TEST_SUPPORT_ADAPTER_ENV, "pending")
         .args(["stop", &session_id, "--json"])
         .assert()
         .success()
@@ -975,6 +977,7 @@ fn stopping_detached_turn_returns_exact_stop_contract() {
 
     let status_output = satelle()
         .env("SATELLE_STATE_DIR", state.path())
+        .env(TEST_SUPPORT_ADAPTER_ENV, "pending")
         .args(["status", &session_id, "--json"])
         .assert()
         .success()
