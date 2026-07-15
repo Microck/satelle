@@ -1,5 +1,6 @@
 use super::*;
 use satelle_host::{LogCursor, LogPageQuery, LogSeverity, LogSource};
+use satelle_test_contract::assert_privacy_canaries_absent;
 use satelle_transport::TurnRequest;
 
 const LOG_CREATE_KEY: &str = "01890a5d-ac96-7b7c-8f89-37c3d0a66f31";
@@ -7,10 +8,12 @@ const LOG_CREATE_KEY: &str = "01890a5d-ac96-7b7c-8f89-37c3d0a66f31";
 #[tokio::test]
 async fn logs_route_pages_redacted_host_owned_entries_and_client_resumes() {
     let running = RunningServer::start(ApiScopes::CONTROL).await;
-    let prompt = "PRIVATE_LOG_ROUTE_PROMPT_CANARY";
+    let secret = "PRIVATE_LOG_ROUTE_SECRET_CANARY";
+    let prompt_canary = "PRIVATE_LOG_ROUTE_PROMPT_CANARY";
+    let prompt = format!("{prompt_canary} secret={secret}");
     let created = running
         .mutation("/v1/sessions", LOG_CREATE_KEY)
-        .json(&TurnRequest::new(prompt))
+        .json(&TurnRequest::new(&prompt))
         .send()
         .await
         .expect("create log-producing Session");
@@ -24,7 +27,7 @@ async fn logs_route_pages_redacted_host_owned_entries_and_client_resumes() {
         .expect("read initial log tail");
     assert_eq!(response.status(), StatusCode::OK);
     let bytes = response.bytes().await.expect("read log page body");
-    assert!(!String::from_utf8_lossy(&bytes).contains(prompt));
+    assert_privacy_canaries_absent("HTTP logs response", &bytes, &[prompt_canary, secret]);
     let page: LogsPageResponse = serde_json::from_slice(&bytes).expect("decode log page");
     assert_eq!(page.host_identity(), running.host_identity);
     assert!(!page.page().entries().is_empty());

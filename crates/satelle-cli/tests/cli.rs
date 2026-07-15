@@ -2,6 +2,7 @@ use assert_cmd::Command;
 use predicates::prelude::*;
 use satelle_core::SessionId;
 use satelle_host::{ApiBearerToken, test_support::TestStateDir};
+use satelle_test_contract::assert_privacy_canaries_absent;
 use serde_json::Value;
 use std::collections::BTreeSet;
 use std::fs;
@@ -124,17 +125,9 @@ fn assert_exact_object_keys(value: &Value, expected: &[&str]) {
     assert_eq!(actual, expected);
 }
 
-fn assert_private_canaries_are_absent(output: &str, canaries: &[&str]) {
-    for canary in canaries {
-        assert!(
-            !output.contains(canary),
-            "runtime output leaked private canary {canary:?}: {output}"
-        );
-    }
-}
-
-fn assert_runtime_text_is_private(output: &str, canaries: &[&str]) {
-    assert_private_canaries_are_absent(output, canaries);
+fn assert_runtime_bytes_are_private(surface: &str, output: &[u8], canaries: &[&str]) {
+    assert_privacy_canaries_absent(surface, output, canaries);
+    let output = String::from_utf8_lossy(output);
     for forbidden in [r#""prompt""#, r#""codex_thread_id""#, "codex_thread_"] {
         assert!(
             !output.contains(forbidden),
@@ -152,11 +145,13 @@ fn command_output_text(output: &std::process::Output) -> String {
 }
 
 fn assert_command_output_is_private(output: &std::process::Output, canaries: &[&str]) {
-    assert_runtime_text_is_private(&command_output_text(output), canaries);
+    assert_runtime_bytes_are_private("CLI command stdout", &output.stdout, canaries);
+    assert_runtime_bytes_are_private("CLI command stderr", &output.stderr, canaries);
 }
 
 fn assert_command_canaries_are_absent(output: &std::process::Output, canaries: &[&str]) {
-    assert_private_canaries_are_absent(&command_output_text(output), canaries);
+    assert_privacy_canaries_absent("CLI command stdout", &output.stdout, canaries);
+    assert_privacy_canaries_absent("CLI command stderr", &output.stderr, canaries);
 }
 
 fn assert_sqlite_files_are_private(state_root: &std::path::Path, canaries: &[&str]) {
@@ -172,7 +167,8 @@ fn assert_sqlite_files_are_private(state_root: &std::path::Path, canaries: &[&st
 
         let bytes = fs::read(&path)
             .unwrap_or_else(|error| panic!("could not read SQLite state file {path:?}: {error}"));
-        assert_runtime_text_is_private(&String::from_utf8_lossy(&bytes), canaries);
+        let surface = format!("CLI SQLite state file {file_name}");
+        assert_runtime_bytes_are_private(&surface, &bytes, canaries);
     }
 }
 
@@ -488,8 +484,8 @@ fn runtime_surfaces_and_persisted_state_do_not_retain_prompts_or_upstream_ids() 
     let state = state_dir();
     let run_secret = "sk-satelle-run-private-canary";
     let run_upstream_id = "thread_codex_run_private_canary";
-    let run_prompt =
-        format!("RUN_PRIVATE_PROMPT_CANARY secret={run_secret} upstream={run_upstream_id}");
+    let run_prompt_canary = "RUN_PRIVATE_PROMPT_CANARY";
+    let run_prompt = format!("{run_prompt_canary} secret={run_secret} upstream={run_upstream_id}");
     let run_output = satelle()
         .env("SATELLE_STATE_DIR", state.path())
         .args(["run", "--host", "local-demo", "--json", &run_prompt])
@@ -497,15 +493,19 @@ fn runtime_surfaces_and_persisted_state_do_not_retain_prompts_or_upstream_ids() 
         .success()
         .get_output()
         .clone();
-    assert_command_output_is_private(&run_output, &[&run_prompt, run_secret, run_upstream_id]);
+    assert_command_output_is_private(
+        &run_output,
+        &[run_prompt_canary, run_secret, run_upstream_id],
+    );
     let run_report = parse_json_output(&run_output.stdout);
     assert_eq!(run_report["schema_version"], "satelle.run.v2");
     let session = run_report["session_id"].as_str().unwrap().to_string();
 
     let steer_secret = "sk-satelle-steer-private-canary";
     let steer_upstream_id = "turn_codex_steer_private_canary";
+    let steer_prompt_canary = "STEER_PRIVATE_PROMPT_CANARY";
     let steer_prompt =
-        format!("STEER_PRIVATE_PROMPT_CANARY secret={steer_secret} upstream={steer_upstream_id}");
+        format!("{steer_prompt_canary} secret={steer_secret} upstream={steer_upstream_id}");
     let steer_output = satelle()
         .env("SATELLE_STATE_DIR", state.path())
         .args(["steer", &session, "--json", &steer_prompt])
@@ -515,7 +515,7 @@ fn runtime_surfaces_and_persisted_state_do_not_retain_prompts_or_upstream_ids() 
         .clone();
     assert_command_output_is_private(
         &steer_output,
-        &[&steer_prompt, steer_secret, steer_upstream_id],
+        &[steer_prompt_canary, steer_secret, steer_upstream_id],
     );
 
     let status_output = satelle()
@@ -528,10 +528,10 @@ fn runtime_surfaces_and_persisted_state_do_not_retain_prompts_or_upstream_ids() 
     assert_command_output_is_private(
         &status_output,
         &[
-            &run_prompt,
+            run_prompt_canary,
             run_secret,
             run_upstream_id,
-            &steer_prompt,
+            steer_prompt_canary,
             steer_secret,
             steer_upstream_id,
         ],
@@ -547,10 +547,10 @@ fn runtime_surfaces_and_persisted_state_do_not_retain_prompts_or_upstream_ids() 
     assert_command_output_is_private(
         &logs_output,
         &[
-            &run_prompt,
+            run_prompt_canary,
             run_secret,
             run_upstream_id,
-            &steer_prompt,
+            steer_prompt_canary,
             steer_secret,
             steer_upstream_id,
         ],
@@ -558,8 +558,9 @@ fn runtime_surfaces_and_persisted_state_do_not_retain_prompts_or_upstream_ids() 
 
     let event_secret = "sk-satelle-event-private-canary";
     let event_upstream_id = "response_codex_event_private_canary";
+    let event_prompt_canary = "EVENT_PRIVATE_PROMPT_CANARY";
     let event_prompt =
-        format!("EVENT_PRIVATE_PROMPT_CANARY secret={event_secret} upstream={event_upstream_id}");
+        format!("{event_prompt_canary} secret={event_secret} upstream={event_upstream_id}");
     let events_output = satelle()
         .env("SATELLE_STATE_DIR", state.path())
         .args([
@@ -576,14 +577,14 @@ fn runtime_surfaces_and_persisted_state_do_not_retain_prompts_or_upstream_ids() 
         .clone();
     assert_command_output_is_private(
         &events_output,
-        &[&event_prompt, event_secret, event_upstream_id],
+        &[event_prompt_canary, event_secret, event_upstream_id],
     );
 
     let verbose_secret = "sk-satelle-verbose-event-private-canary";
     let verbose_upstream_id = "response_codex_verbose_event_private_canary";
-    let verbose_prompt = format!(
-        "VERBOSE_EVENT_PRIVATE_PROMPT_CANARY secret={verbose_secret} upstream={verbose_upstream_id}"
-    );
+    let verbose_prompt_canary = "VERBOSE_EVENT_PRIVATE_PROMPT_CANARY";
+    let verbose_prompt =
+        format!("{verbose_prompt_canary} secret={verbose_secret} upstream={verbose_upstream_id}");
     let verbose_output = satelle()
         .env("SATELLE_STATE_DIR", state.path())
         .args([
@@ -602,13 +603,14 @@ fn runtime_surfaces_and_persisted_state_do_not_retain_prompts_or_upstream_ids() 
         .clone();
     assert_command_output_is_private(
         &verbose_output,
-        &[&verbose_prompt, verbose_secret, verbose_upstream_id],
+        &[verbose_prompt_canary, verbose_secret, verbose_upstream_id],
     );
 
     let detached_run_secret = "sk-satelle-detached-run-private-canary";
     let detached_run_upstream_id = "thread_codex_detached_run_private_canary";
+    let detached_run_prompt_canary = "DETACHED_RUN_PRIVATE_PROMPT_CANARY";
     let detached_run_prompt = format!(
-        "DETACHED_RUN_PRIVATE_PROMPT_CANARY secret={detached_run_secret} upstream={detached_run_upstream_id}"
+        "{detached_run_prompt_canary} secret={detached_run_secret} upstream={detached_run_upstream_id}"
     );
     let detached_run_output = satelle()
         .env("SATELLE_STATE_DIR", state.path())
@@ -627,7 +629,7 @@ fn runtime_surfaces_and_persisted_state_do_not_retain_prompts_or_upstream_ids() 
     assert_command_output_is_private(
         &detached_run_output,
         &[
-            &detached_run_prompt,
+            detached_run_prompt_canary,
             detached_run_secret,
             detached_run_upstream_id,
         ],
@@ -648,7 +650,7 @@ fn runtime_surfaces_and_persisted_state_do_not_retain_prompts_or_upstream_ids() 
     assert_command_output_is_private(
         &stop_output,
         &[
-            &detached_run_prompt,
+            detached_run_prompt_canary,
             detached_run_secret,
             detached_run_upstream_id,
         ],
@@ -656,8 +658,9 @@ fn runtime_surfaces_and_persisted_state_do_not_retain_prompts_or_upstream_ids() 
 
     let detached_steer_secret = "sk-satelle-detached-steer-private-canary";
     let detached_steer_upstream_id = "turn_codex_detached_steer_private_canary";
+    let detached_steer_prompt_canary = "DETACHED_STEER_PRIVATE_PROMPT_CANARY";
     let detached_steer_prompt = format!(
-        "DETACHED_STEER_PRIVATE_PROMPT_CANARY secret={detached_steer_secret} upstream={detached_steer_upstream_id}"
+        "{detached_steer_prompt_canary} secret={detached_steer_secret} upstream={detached_steer_upstream_id}"
     );
     let detached_steer_output = satelle()
         .env("SATELLE_STATE_DIR", state.path())
@@ -675,7 +678,7 @@ fn runtime_surfaces_and_persisted_state_do_not_retain_prompts_or_upstream_ids() 
     assert_command_output_is_private(
         &detached_steer_output,
         &[
-            &detached_steer_prompt,
+            detached_steer_prompt_canary,
             detached_steer_secret,
             detached_steer_upstream_id,
         ],
@@ -691,10 +694,10 @@ fn runtime_surfaces_and_persisted_state_do_not_retain_prompts_or_upstream_ids() 
     assert_command_output_is_private(
         &detached_status_output,
         &[
-            &detached_run_prompt,
+            detached_run_prompt_canary,
             detached_run_secret,
             detached_run_upstream_id,
-            &detached_steer_prompt,
+            detached_steer_prompt_canary,
             detached_steer_secret,
             detached_steer_upstream_id,
         ],
@@ -710,10 +713,10 @@ fn runtime_surfaces_and_persisted_state_do_not_retain_prompts_or_upstream_ids() 
     assert_command_output_is_private(
         &detached_logs_output,
         &[
-            &detached_run_prompt,
+            detached_run_prompt_canary,
             detached_run_secret,
             detached_run_upstream_id,
-            &detached_steer_prompt,
+            detached_steer_prompt_canary,
             detached_steer_secret,
             detached_steer_upstream_id,
         ],
@@ -722,22 +725,22 @@ fn runtime_surfaces_and_persisted_state_do_not_retain_prompts_or_upstream_ids() 
     assert_sqlite_files_are_private(
         state.path(),
         &[
-            &run_prompt,
+            run_prompt_canary,
             run_secret,
             run_upstream_id,
-            &steer_prompt,
+            steer_prompt_canary,
             steer_secret,
             steer_upstream_id,
-            &event_prompt,
+            event_prompt_canary,
             event_secret,
             event_upstream_id,
-            &verbose_prompt,
+            verbose_prompt_canary,
             verbose_secret,
             verbose_upstream_id,
-            &detached_run_prompt,
+            detached_run_prompt_canary,
             detached_run_secret,
             detached_run_upstream_id,
-            &detached_steer_prompt,
+            detached_steer_prompt_canary,
             detached_steer_secret,
             detached_steer_upstream_id,
         ],
@@ -749,7 +752,8 @@ fn post_ingestion_errors_do_not_echo_prompt_or_secret() {
     let state = state_dir();
     let secret = "sk-satelle-error-private-canary";
     let upstream_id = "thread_codex_error_private_canary";
-    let prompt = format!("ERROR_PRIVATE_PROMPT_CANARY secret={secret} upstream={upstream_id}");
+    let prompt_canary = "ERROR_PRIVATE_PROMPT_CANARY";
+    let prompt = format!("{prompt_canary} secret={secret} upstream={upstream_id}");
     let output = satelle()
         .env("SATELLE_STATE_DIR", state.path())
         .args(["steer", "not-a-valid-session-id", "--json", &prompt])
@@ -758,7 +762,7 @@ fn post_ingestion_errors_do_not_echo_prompt_or_secret() {
         .get_output()
         .clone();
 
-    assert_command_output_is_private(&output, &[&prompt, secret, upstream_id]);
+    assert_command_output_is_private(&output, &[prompt_canary, secret, upstream_id]);
     let error = parse_json_output(&output.stderr);
     assert_eq!(error["code"], "invalid-usage");
     assert_eq!(
@@ -771,7 +775,8 @@ fn post_ingestion_errors_do_not_echo_prompt_or_secret() {
 fn corrupt_sqlite_fails_closed_without_mutating_or_leaking_state() {
     let state = state_dir();
     let base_secret = "sk-satelle-hard-cut-base-canary";
-    let base_prompt = format!("HARD_CUT_BASE_PROMPT_CANARY secret={base_secret}");
+    let base_prompt_canary = "HARD_CUT_BASE_PROMPT_CANARY";
+    let base_prompt = format!("{base_prompt_canary} secret={base_secret}");
     let run_output = satelle()
         .env("SATELLE_STATE_DIR", state.path())
         .args(["run", "--host", "local-demo", "--json", &base_prompt])
@@ -779,7 +784,7 @@ fn corrupt_sqlite_fails_closed_without_mutating_or_leaking_state() {
         .success()
         .get_output()
         .clone();
-    assert_command_output_is_private(&run_output, &[&base_prompt, base_secret]);
+    assert_command_output_is_private(&run_output, &[base_prompt_canary, base_secret]);
     let session_id = parse_json_output(&run_output.stdout)["session_id"]
         .as_str()
         .unwrap()

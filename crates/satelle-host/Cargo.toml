@@ -42,4 +42,5 @@ windows-sys = { workspace = true, features = [
 ] }
 
 [dev-dependencies]
+satelle-test-contract = { path = "../satelle-test-contract" }
 tempfile.workspace = true
