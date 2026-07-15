@@ -2,6 +2,7 @@ use super::*;
 use reqwest::Method;
 use satelle_core::StopResultOutcome;
 use satelle_core::session::{SessionActivity, TurnExecutionMode};
+use satelle_test_contract::assert_privacy_canaries_absent;
 use satelle_transport::{SessionResponse, StopRequest, StopResponse, TurnRequest};
 
 const CREATE_KEY: &str = "01890a5d-ac96-7b7c-8f89-37c3d0a66f01";
@@ -13,10 +14,12 @@ const CROSS_SESSION_TURN_KEY: &str = "01890a5d-ac96-7b7c-8f89-37c3d0a66f05";
 #[tokio::test]
 async fn session_routes_complete_the_durable_reconnect_journey() {
     let running = RunningServer::start(ApiScopes::CONTROL).await;
-    let prompt = "PRIVATE_HTTP_CREATE_PROMPT_CANARY";
+    let secret = "PRIVATE_HTTP_CREATE_SECRET_CANARY";
+    let prompt_canary = "PRIVATE_HTTP_CREATE_PROMPT_CANARY";
+    let prompt = format!("{prompt_canary} secret={secret}");
     let create = running
         .mutation("/v1/sessions", CREATE_KEY)
-        .json(&TurnRequest::new(prompt))
+        .json(&TurnRequest::new(&prompt))
         .send()
         .await
         .expect("create Session");
@@ -26,7 +29,11 @@ async fn session_routes_complete_the_durable_reconnect_journey() {
     assert_eq!(create_json["schema_version"], "satelle.session.v1");
     assert!(create_json.get("session").is_none());
     assert!(create_json.get("session_id").is_some());
-    assert!(!String::from_utf8_lossy(&create_bytes).contains(prompt));
+    assert_privacy_canaries_absent(
+        "HTTP create Session response",
+        &create_bytes,
+        &[prompt_canary, secret],
+    );
     assert!(!String::from_utf8_lossy(&create_bytes).contains("local-demo"));
     let created: SessionResponse =
         serde_json::from_slice(&create_bytes).expect("decode create contract");
@@ -50,16 +57,22 @@ async fn session_routes_complete_the_durable_reconnect_journey() {
         .expect("decode Session read");
     assert_eq!(reconnected.session(), terminal.session());
 
-    let steer_prompt = "PRIVATE_HTTP_STEER_PROMPT_CANARY";
+    let steer_secret = "PRIVATE_HTTP_STEER_SECRET_CANARY";
+    let steer_prompt_canary = "PRIVATE_HTTP_STEER_PROMPT_CANARY";
+    let steer_prompt = format!("{steer_prompt_canary} secret={steer_secret}");
     let steer = running
         .mutation(&format!("/v1/sessions/{session_id}/turns"), STEER_KEY)
-        .json(&TurnRequest::new(steer_prompt))
+        .json(&TurnRequest::new(&steer_prompt))
         .send()
         .await
         .expect("create follow-up Turn");
     assert_eq!(steer.status(), StatusCode::ACCEPTED);
     let steer_bytes = steer.bytes().await.expect("read steer response");
-    assert!(!String::from_utf8_lossy(&steer_bytes).contains(steer_prompt));
+    assert_privacy_canaries_absent(
+        "HTTP steer Session response",
+        &steer_bytes,
+        &[steer_prompt_canary, steer_secret],
+    );
     let steered: SessionResponse =
         serde_json::from_slice(&steer_bytes).expect("decode steer contract");
     assert_eq!(steered.session().session_id(), &session_id);
@@ -110,10 +123,12 @@ async fn mutation_replays_preserve_operation_boundaries_and_reject_digest_drift(
     assert_eq!(replay.session().session_id(), &session_id);
     assert_eq!(replay.session().turns().len(), 1);
 
-    let changed_prompt = "PRIVATE_CHANGED_REPLAY_PROMPT_CANARY";
+    let changed_secret = "PRIVATE_CHANGED_REPLAY_SECRET_CANARY";
+    let changed_prompt_canary = "PRIVATE_CHANGED_REPLAY_PROMPT_CANARY";
+    let changed_prompt = format!("{changed_prompt_canary} secret={changed_secret}");
     let conflict = running
         .mutation("/v1/sessions", CREATE_KEY)
-        .json(&TurnRequest::new(changed_prompt))
+        .json(&TurnRequest::new(&changed_prompt))
         .send()
         .await
         .expect("send conflicting replay");
@@ -121,7 +136,11 @@ async fn mutation_replays_preserve_operation_boundaries_and_reject_digest_drift(
     let conflict_bytes = conflict.bytes().await.expect("read conflict body");
     let error: ApiError = serde_json::from_slice(&conflict_bytes).expect("decode conflict");
     assert_eq!(error.code().as_str(), "idempotency-key-conflict");
-    assert!(!String::from_utf8_lossy(&conflict_bytes).contains(changed_prompt));
+    assert_privacy_canaries_absent(
+        "HTTP idempotency conflict response",
+        &conflict_bytes,
+        &[changed_prompt_canary, changed_secret],
+    );
 
     let mode_conflict = running
         .mutation("/v1/sessions", CREATE_KEY)

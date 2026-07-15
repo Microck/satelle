@@ -1,6 +1,7 @@
 use super::*;
 use futures_util::{SinkExt, StreamExt};
 use satelle_core::{EventStateSubject, EventType, SatelleEvent};
+use satelle_test_contract::assert_privacy_canaries_absent;
 use satelle_transport::{EventSubscription, SessionResponse, SubscribeRequest, WsServerControl};
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::handshake::client::Response as WebSocketResponse;
@@ -249,9 +250,12 @@ async fn event_socket_streams_only_post_subscription_commits_in_order() {
     send_subscribe(&mut socket, vec![EventSubscription::Host]).await;
     expect_subscribed(&mut socket, &running.host_identity).await;
 
+    let secret = "PRIVATE_WS_SECRET_CANARY";
+    let prompt_canary = "PRIVATE_WS_PROMPT_CANARY";
+    let prompt = format!("{prompt_canary} secret={secret}");
     let admitted = running
         .mutation("/v1/sessions", "01890a5d-ac96-7b7c-8f89-37c3d0a66ea1")
-        .json(&satelle_transport::TurnRequest::new("PRIVATE_WS_PROMPT"))
+        .json(&satelle_transport::TurnRequest::new(&prompt))
         .send()
         .await
         .expect("admit Session over HTTP");
@@ -260,10 +264,13 @@ async fn event_socket_streams_only_post_subscription_commits_in_order() {
 
     let mut events = Vec::new();
     for _ in 0..3 {
-        events.push(
-            serde_json::from_str::<SatelleEvent>(&next_text(&mut socket).await)
-                .expect("decode Satelle Event"),
+        let frame = next_text(&mut socket).await;
+        assert_privacy_canaries_absent(
+            "WebSocket raw event frame",
+            frame.as_bytes(),
+            &[prompt_canary, secret],
         );
+        events.push(serde_json::from_str(&frame).expect("decode Satelle Event"));
     }
     assert_eq!(
         events

@@ -69,6 +69,27 @@ pub fn assert_human_error(stderr: &[u8], expected_code: &str) {
     );
 }
 
+/// Asserts that raw output from a named public boundary contains none of its private canaries.
+pub fn assert_privacy_canaries_absent(surface: &str, observed: &[u8], canaries: &[&str]) {
+    assert!(
+        !canaries.is_empty(),
+        "{surface} requires at least one private canary"
+    );
+    for canary in canaries {
+        let canary_bytes = canary.as_bytes();
+        assert!(
+            !canary_bytes.is_empty(),
+            "{surface} requires non-empty private canaries"
+        );
+        assert!(
+            !observed
+                .windows(canary_bytes.len())
+                .any(|window| window == canary_bytes),
+            "{surface} leaked private canary {canary:?}"
+        );
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ReleaseArchiveContainer {
     TarGz,
@@ -1192,6 +1213,25 @@ pub fn assert_versioned_payload_contract<E: Debug>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn privacy_canary_assertion_accepts_clean_raw_bytes() {
+        assert_privacy_canaries_absent(
+            "HTTP logs response",
+            b"\x00public log bytes\xff",
+            &["PRIVATE_PROMPT_CANARY", "PRIVATE_SECRET_CANARY"],
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "HTTP logs response leaked private canary \"PRIVATE_SECRET_CANARY\"")]
+    fn privacy_canary_assertion_identifies_surface_and_any_leaked_canary() {
+        assert_privacy_canaries_absent(
+            "HTTP logs response",
+            b"public prefix PRIVATE_SECRET_CANARY public suffix",
+            &["PRIVATE_PROMPT_CANARY", "PRIVATE_SECRET_CANARY"],
+        );
+    }
 
     #[rustfmt::skip]
     const VERSIONED_PAYLOAD_DRIVER_CASES: [VersionedPayloadContractCase<bool>; 2] = [

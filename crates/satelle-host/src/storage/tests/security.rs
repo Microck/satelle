@@ -1,6 +1,7 @@
 use super::*;
 use crate::LogSubject;
 use crate::storage::open::PROTECTED_FILE_NAMES;
+use satelle_test_contract::assert_privacy_canaries_absent;
 
 #[path = "security/control-lease-process.rs"]
 mod control_lease_process;
@@ -104,8 +105,11 @@ fn private_upstream_refs_are_isolated_from_public_rows_and_logs() {
             |row| row.get(0),
         )
         .expect("read public-safe rows");
-    assert!(!public_rows.contains(UPSTREAM_THREAD));
-    assert!(!public_rows.contains(UPSTREAM_TURN));
+    assert_privacy_canaries_absent(
+        "storage public rows",
+        public_rows.as_bytes(),
+        &[UPSTREAM_THREAD, UPSTREAM_TURN],
+    );
     let private_refs: (String, String) = storage
         .connection_for_test()
         .query_row(
@@ -130,12 +134,11 @@ fn private_upstream_refs_are_isolated_from_public_rows_and_logs() {
             .to_public(),
     )
     .expect("serialize public Session");
-    for private_canary in [UPSTREAM_THREAD, UPSTREAM_TURN, MODEL_REF, PROVIDER_REF] {
-        assert!(
-            !public_json.contains(private_canary),
-            "public Session exposed private identifier {private_canary}"
-        );
-    }
+    assert_privacy_canaries_absent(
+        "storage public Session",
+        public_json.as_bytes(),
+        &[UPSTREAM_THREAD, UPSTREAM_TURN, MODEL_REF, PROVIDER_REF],
+    );
 }
 
 fn assert_table_columns(storage: &Storage, table: &str, expected: &[&str]) {

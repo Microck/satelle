@@ -12,6 +12,7 @@ use satelle_core::{
     ControlPlaneFailureReason, ControlPlaneOperation, ErrorCode, EventType,
     IncompatibleControlPlaneDetails, LOCAL_DEMO_HOST, SatelleError,
 };
+use satelle_test_contract::assert_privacy_canaries_absent;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, mpsc};
 use std::time::Duration;
@@ -212,8 +213,11 @@ fn adapter_persists_upstream_refs_before_waiting_and_stop_keeps_them_durable() {
         .expect("read safe logs while execution is waiting");
     let public_json = serde_json::to_string(&(public_session, logs))
         .expect("serialize public state and safe logs");
-    assert!(!public_json.contains(PRIVATE_UPSTREAM_THREAD_REF));
-    assert!(!public_json.contains(PRIVATE_UPSTREAM_TURN_REF));
+    assert_privacy_canaries_absent(
+        "Host runtime status and log projection",
+        public_json.as_bytes(),
+        &[PRIVATE_UPSTREAM_THREAD_REF, PRIVATE_UPSTREAM_TURN_REF],
+    );
 
     let stopped = runtime
         .stop(StopCommand::new(session.session_id().clone()))
