@@ -820,6 +820,224 @@ pub fn assert_npm_promotion_release_contract<E: Debug>(
     assert_npm_promotion_cases(&PROMOTION_RELEASE_CASES, evaluate);
 }
 
+/// One versioned release archive's already-extracted native executable digest.
+///
+/// The digest is an opaque identifier. This fixture does not define its syntax or how it is
+/// computed from archive contents.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ReleaseArchiveExecutableDigestFixture {
+    pub target: &'static str,
+    pub candidate_version: &'static str,
+    pub executable_digest: &'static str,
+}
+
+/// One platform-specific npm package's already-extracted native executable digest.
+///
+/// The digest is an opaque identifier. This fixture does not define package extraction or digest
+/// computation behavior.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct NpmPackageExecutableDigestFixture {
+    pub package: &'static str,
+    pub candidate_version: &'static str,
+    pub executable_digest: &'static str,
+}
+
+/// Semantic observations needed to compare release archives with their corresponding npm packages.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ArchiveNpmParityFixture {
+    pub release_archives: &'static [ReleaseArchiveExecutableDigestFixture],
+    pub npm_packages: &'static [NpmPackageExecutableDigestFixture],
+}
+
+/// Ordinary adapter decisions; errors are reserved for materialization or harness failures.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ArchiveNpmParityAdapterOutcome {
+    Accepted,
+    Rejected,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ArchiveNpmParityContractCase<F> {
+    name: &'static str,
+    fixture: F,
+    expected: ExpectedOutcome,
+}
+
+const fn archive_npm_parity_case<F>(
+    name: &'static str,
+    fixture: F,
+    expected: ExpectedOutcome,
+) -> ArchiveNpmParityContractCase<F> {
+    ArchiveNpmParityContractCase {
+        name,
+        fixture,
+        expected,
+    }
+}
+
+const fn archive_digest(
+    target: &'static str,
+    candidate_version: &'static str,
+    executable_digest: &'static str,
+) -> ReleaseArchiveExecutableDigestFixture {
+    ReleaseArchiveExecutableDigestFixture {
+        target,
+        candidate_version,
+        executable_digest,
+    }
+}
+
+const fn npm_package_digest(
+    package: &'static str,
+    candidate_version: &'static str,
+    executable_digest: &'static str,
+) -> NpmPackageExecutableDigestFixture {
+    NpmPackageExecutableDigestFixture {
+        package,
+        candidate_version,
+        executable_digest,
+    }
+}
+
+#[rustfmt::skip]
+const VERSION_MATCHED_ARCHIVES: [ReleaseArchiveExecutableDigestFixture; 6] = [
+    archive_digest("linux-arm64-gnu", "1.2.3", "opaque-linux-arm64"),
+    archive_digest("linux-x64-gnu", "1.2.3", "opaque-linux-x64"),
+    archive_digest("darwin-arm64", "1.2.3", "opaque-darwin-arm64"),
+    archive_digest("darwin-x64", "1.2.3", "opaque-darwin-x64"),
+    archive_digest("win32-arm64-msvc", "1.2.3", "opaque-win32-arm64"),
+    archive_digest("win32-x64-msvc", "1.2.3", "opaque-win32-x64"),
+];
+
+#[rustfmt::skip]
+const MATCHING_NPM_PACKAGES: [NpmPackageExecutableDigestFixture; 6] = [
+    npm_package_digest("@microck/satelle-linux-arm64-gnu", "1.2.3", "opaque-linux-arm64"),
+    npm_package_digest("@microck/satelle-linux-x64-gnu", "1.2.3", "opaque-linux-x64"),
+    npm_package_digest("@microck/satelle-darwin-arm64", "1.2.3", "opaque-darwin-arm64"),
+    npm_package_digest("@microck/satelle-darwin-x64", "1.2.3", "opaque-darwin-x64"),
+    npm_package_digest("@microck/satelle-win32-arm64-msvc", "1.2.3", "opaque-win32-arm64"),
+    npm_package_digest("@microck/satelle-win32-x64-msvc", "1.2.3", "opaque-win32-x64"),
+];
+
+const PERMUTED_NPM_PACKAGES: [NpmPackageExecutableDigestFixture; 6] = [
+    MATCHING_NPM_PACKAGES[5],
+    MATCHING_NPM_PACKAGES[4],
+    MATCHING_NPM_PACKAGES[3],
+    MATCHING_NPM_PACKAGES[2],
+    MATCHING_NPM_PACKAGES[1],
+    MATCHING_NPM_PACKAGES[0],
+];
+
+const MISMATCHED_NPM_PACKAGES: [NpmPackageExecutableDigestFixture; 6] = [
+    MATCHING_NPM_PACKAGES[0],
+    npm_package_digest("@microck/satelle-linux-x64-gnu", "1.2.3", "opaque-mismatch"),
+    MATCHING_NPM_PACKAGES[2],
+    MATCHING_NPM_PACKAGES[3],
+    MATCHING_NPM_PACKAGES[4],
+    MATCHING_NPM_PACKAGES[5],
+];
+
+const MISSING_NPM_PACKAGE: [NpmPackageExecutableDigestFixture; 5] = [
+    MATCHING_NPM_PACKAGES[0],
+    MATCHING_NPM_PACKAGES[1],
+    MATCHING_NPM_PACKAGES[2],
+    MATCHING_NPM_PACKAGES[3],
+    MATCHING_NPM_PACKAGES[4],
+];
+
+// Swapping two digests preserves both identity and digest sets while breaking correspondence.
+const DIGESTS_UNDER_WRONG_PACKAGE_IDENTITIES: [NpmPackageExecutableDigestFixture; 6] = [
+    MATCHING_NPM_PACKAGES[0],
+    MATCHING_NPM_PACKAGES[1],
+    npm_package_digest(
+        "@microck/satelle-darwin-arm64",
+        "1.2.3",
+        "opaque-darwin-x64",
+    ),
+    npm_package_digest(
+        "@microck/satelle-darwin-x64",
+        "1.2.3",
+        "opaque-darwin-arm64",
+    ),
+    MATCHING_NPM_PACKAGES[4],
+    MATCHING_NPM_PACKAGES[5],
+];
+
+const WRONG_VERSION_NPM_PACKAGES: [NpmPackageExecutableDigestFixture; 6] = [
+    MATCHING_NPM_PACKAGES[0],
+    MATCHING_NPM_PACKAGES[1],
+    MATCHING_NPM_PACKAGES[2],
+    MATCHING_NPM_PACKAGES[3],
+    MATCHING_NPM_PACKAGES[4],
+    npm_package_digest(
+        "@microck/satelle-win32-x64-msvc",
+        "1.2.4",
+        "opaque-win32-x64",
+    ),
+];
+
+const WRONG_VERSION_ARCHIVES: [ReleaseArchiveExecutableDigestFixture; 6] = [
+    VERSION_MATCHED_ARCHIVES[0],
+    VERSION_MATCHED_ARCHIVES[1],
+    VERSION_MATCHED_ARCHIVES[2],
+    VERSION_MATCHED_ARCHIVES[3],
+    archive_digest("win32-arm64-msvc", "1.2.4", "opaque-win32-arm64"),
+    VERSION_MATCHED_ARCHIVES[5],
+];
+
+#[rustfmt::skip]
+const VALID_ARCHIVE_NPM_PARITY: ArchiveNpmParityFixture = ArchiveNpmParityFixture {
+    release_archives: &VERSION_MATCHED_ARCHIVES, npm_packages: &MATCHING_NPM_PACKAGES,
+};
+
+#[rustfmt::skip]
+const ARCHIVE_NPM_PARITY_CASES: [ArchiveNpmParityContractCase<ArchiveNpmParityFixture>; 7] = [
+    archive_npm_parity_case("all six version-matched archive and npm executable digests match", VALID_ARCHIVE_NPM_PARITY, Accept),
+    archive_npm_parity_case("npm package observations may be permuted", ArchiveNpmParityFixture { npm_packages: &PERMUTED_NPM_PACKAGES, ..VALID_ARCHIVE_NPM_PARITY }, Accept),
+    archive_npm_parity_case("one archive and npm executable digest mismatches", ArchiveNpmParityFixture { npm_packages: &MISMATCHED_NPM_PACKAGES, ..VALID_ARCHIVE_NPM_PARITY }, Reject),
+    archive_npm_parity_case("required platform npm package is missing", ArchiveNpmParityFixture { npm_packages: &MISSING_NPM_PACKAGE, ..VALID_ARCHIVE_NPM_PARITY }, Reject),
+    archive_npm_parity_case("archive digests exist only under wrong platform package identities", ArchiveNpmParityFixture { npm_packages: &DIGESTS_UNDER_WRONG_PACKAGE_IDENTITIES, ..VALID_ARCHIVE_NPM_PARITY }, Reject),
+    archive_npm_parity_case("one npm package version differs from its release archive", ArchiveNpmParityFixture { npm_packages: &WRONG_VERSION_NPM_PACKAGES, ..VALID_ARCHIVE_NPM_PARITY }, Reject),
+    archive_npm_parity_case("one release archive version differs from its npm package", ArchiveNpmParityFixture { release_archives: &WRONG_VERSION_ARCHIVES, ..VALID_ARCHIVE_NPM_PARITY }, Reject),
+];
+
+fn assert_archive_npm_parity_cases<F, E: Debug>(
+    cases: &[ArchiveNpmParityContractCase<F>],
+    mut evaluate: impl FnMut(&F) -> Result<ArchiveNpmParityAdapterOutcome, E>,
+) {
+    for case in cases {
+        let outcome = evaluate(&case.fixture).unwrap_or_else(|error| {
+            panic!(
+                "archive/npm parity case '{}' failed before an adapter outcome: {error:?}",
+                case.name
+            )
+        });
+
+        match (case.expected, outcome) {
+            (Accept, ArchiveNpmParityAdapterOutcome::Accepted)
+            | (Reject, ArchiveNpmParityAdapterOutcome::Rejected) => {}
+            (Accept, ArchiveNpmParityAdapterOutcome::Rejected) => {
+                panic!("archive/npm parity case '{}' was rejected", case.name)
+            }
+            (Reject, ArchiveNpmParityAdapterOutcome::Accepted) => {
+                panic!("archive/npm parity case '{}' was accepted", case.name)
+            }
+        }
+    }
+}
+
+/// Runs the six-platform archive-to-npm executable-digest catalog through a caller adapter.
+///
+/// Expected outcomes remain private to this crate. The adapter reports ordinary parity rejection
+/// with [`ArchiveNpmParityAdapterOutcome::Rejected`] and reserves `Err` for fixture materialization
+/// or harness failures. This catalog does not read archives or packages, compute or parse digests,
+/// serialize observations, or prove production release wiring.
+pub fn assert_archive_npm_executable_parity_contract<E: Debug>(
+    evaluate: impl FnMut(&ArchiveNpmParityFixture) -> Result<ArchiveNpmParityAdapterOutcome, E>,
+) {
+    assert_archive_npm_parity_cases(&ARCHIVE_NPM_PARITY_CASES, evaluate);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -910,6 +1128,99 @@ mod tests {
     fn npm_promotion_case_driver_rejects_harness_error() {
         assert_npm_promotion_cases(&PROMOTION_DRIVER_CASES[1..], |_| {
             Err::<NpmPromotionAdapterOutcome, _>("materialization failed")
+        });
+    }
+
+    #[rustfmt::skip]
+    const ARCHIVE_NPM_PARITY_DRIVER_CASES: [ArchiveNpmParityContractCase<bool>; 2] = [
+        archive_npm_parity_case("accepted parity case", true, Accept),
+        archive_npm_parity_case("rejected parity case", false, Reject),
+    ];
+
+    const ARCHIVE_NPM_TARGET_PACKAGE_PAIRS: [(&str, &str); 6] = [
+        ("linux-arm64-gnu", "@microck/satelle-linux-arm64-gnu"),
+        ("linux-x64-gnu", "@microck/satelle-linux-x64-gnu"),
+        ("darwin-arm64", "@microck/satelle-darwin-arm64"),
+        ("darwin-x64", "@microck/satelle-darwin-x64"),
+        ("win32-arm64-msvc", "@microck/satelle-win32-arm64-msvc"),
+        ("win32-x64-msvc", "@microck/satelle-win32-x64-msvc"),
+    ];
+
+    #[test]
+    fn archive_npm_parity_public_catalog_matches_pairwise_reference_model() {
+        let mut evaluated_cases = 0;
+
+        assert_archive_npm_executable_parity_contract(|fixture| {
+            evaluated_cases += 1;
+
+            let accepted = fixture.release_archives.len() == ARCHIVE_NPM_TARGET_PACKAGE_PAIRS.len()
+                && fixture.npm_packages.len() == ARCHIVE_NPM_TARGET_PACKAGE_PAIRS.len()
+                && ARCHIVE_NPM_TARGET_PACKAGE_PAIRS
+                    .iter()
+                    .all(|(target, package)| {
+                        let Some(archive) = fixture
+                            .release_archives
+                            .iter()
+                            .find(|archive| archive.target == *target)
+                        else {
+                            return false;
+                        };
+                        let Some(npm_package) = fixture
+                            .npm_packages
+                            .iter()
+                            .find(|npm_package| npm_package.package == *package)
+                        else {
+                            return false;
+                        };
+
+                        archive.candidate_version == npm_package.candidate_version
+                            && archive.executable_digest == npm_package.executable_digest
+                    });
+
+            Ok::<_, &str>(if accepted {
+                ArchiveNpmParityAdapterOutcome::Accepted
+            } else {
+                ArchiveNpmParityAdapterOutcome::Rejected
+            })
+        });
+
+        assert_eq!(evaluated_cases, 7, "every parity catalog case must run");
+    }
+
+    #[test]
+    fn archive_npm_parity_case_driver_accepts_matching_accept_and_reject_outcomes() {
+        assert_archive_npm_parity_cases(&ARCHIVE_NPM_PARITY_DRIVER_CASES, |fixture| {
+            Ok::<_, &str>(if *fixture {
+                ArchiveNpmParityAdapterOutcome::Accepted
+            } else {
+                ArchiveNpmParityAdapterOutcome::Rejected
+            })
+        });
+    }
+
+    #[test]
+    #[should_panic(expected = "archive/npm parity case 'rejected parity case' was accepted")]
+    fn archive_npm_parity_case_driver_rejects_false_acceptance() {
+        assert_archive_npm_parity_cases(&ARCHIVE_NPM_PARITY_DRIVER_CASES[1..], |_| {
+            Ok::<_, &str>(ArchiveNpmParityAdapterOutcome::Accepted)
+        });
+    }
+
+    #[test]
+    #[should_panic(expected = "archive/npm parity case 'accepted parity case' was rejected")]
+    fn archive_npm_parity_case_driver_rejects_false_rejection() {
+        assert_archive_npm_parity_cases(&ARCHIVE_NPM_PARITY_DRIVER_CASES[..1], |_| {
+            Ok::<_, &str>(ArchiveNpmParityAdapterOutcome::Rejected)
+        });
+    }
+
+    #[test]
+    #[should_panic(
+        expected = "archive/npm parity case 'rejected parity case' failed before an adapter outcome: \"materialization failed\""
+    )]
+    fn archive_npm_parity_case_driver_rejects_harness_error() {
+        assert_archive_npm_parity_cases(&ARCHIVE_NPM_PARITY_DRIVER_CASES[1..], |_| {
+            Err::<ArchiveNpmParityAdapterOutcome, _>("materialization failed")
         });
     }
 }
