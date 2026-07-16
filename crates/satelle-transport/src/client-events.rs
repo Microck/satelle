@@ -10,6 +10,7 @@ use futures_util::{SinkExt, StreamExt};
 use rustls::ClientConfig;
 use satelle_core::{DirectHostBinding, SatelleEvent};
 use std::fmt;
+use std::future::Future;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -191,6 +192,29 @@ impl DaemonEventClient {
 }
 
 impl DaemonEventStream {
+    /// Keeps the live-only event stream responsive while another operation is pending.
+    ///
+    /// Attached admissions can spend several minutes in readiness probes. The event socket must
+    /// still consume heartbeats during that interval, and events received before the admission
+    /// response must be retained for the caller rather than discarded.
+    pub async fn buffer_events_until<F>(
+        &mut self,
+        future: F,
+    ) -> Result<(F::Output, Vec<SatelleEvent>), DaemonEventError>
+    where
+        F: Future,
+    {
+        let mut future = std::pin::pin!(future);
+        let mut buffered_events = Vec::new();
+        loop {
+            tokio::select! {
+                biased;
+                output = &mut future => return Ok((output, buffered_events)),
+                event = self.next_event() => buffered_events.push(event?),
+            }
+        }
+    }
+
     pub async fn next_event(&mut self) -> Result<SatelleEvent, DaemonEventError> {
         self.next_event_with_timeout(EVENT_STREAM_IDLE_TIMEOUT)
             .await

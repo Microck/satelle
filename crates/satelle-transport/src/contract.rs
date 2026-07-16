@@ -22,7 +22,9 @@ pub(crate) use session::TurnRequestParts;
 pub use session::{SessionResponse, StopRequest, StopResponse, TurnRequest};
 
 pub(crate) const PROTOCOL_VERSION_HEADER: &str = "satelle-protocol-version";
-pub(crate) const PROTOCOL_VERSION: &str = "2";
+// Native readiness timeout is a new typed API error variant. Bump the exact-match mutation
+// protocol so an older v2 CLI never attempts to decode a response token it cannot represent.
+pub(crate) const PROTOCOL_VERSION: &str = "3";
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::fmt;

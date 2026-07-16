@@ -524,6 +524,7 @@ fn ssh_transport(
                         tunnel.local_addr(),
                         &expected_host_identity,
                         admission_timeout,
+                        &host.config,
                     )?;
                     (client, event_client, Some(bootstrap))
                 }
@@ -537,6 +538,7 @@ fn ssh_transport(
                 tunnel.local_addr(),
                 &expected_host_identity,
                 admission_timeout,
+                &host.config,
             )?;
             (client, event_client, Some(bootstrap))
         }
@@ -562,18 +564,18 @@ fn bootstrap_ssh_clients(
     tunnel_addr: std::net::SocketAddr,
     expected_host_identity: &str,
     admission_timeout: Duration,
+    host_config: &satelle_core::HostConfig,
 ) -> Result<(Arc<DaemonClient>, DaemonEventClient, SshBootstrapProcess), SatelleError> {
     let bootstrap_token =
         ApiBearerToken::generate().map_err(|_| SatelleError::host_unreachable(alias))?;
     let raw_bootstrap_token = bootstrap_token.expose();
-    let bootstrap = SshBootstrapProcess::launch(destination, &bootstrap_token).map_err(
-        |error| match error {
+    let bootstrap = SshBootstrapProcess::launch(destination, &bootstrap_token, host_config)
+        .map_err(|error| match error {
             ssh_bootstrap::SshBootstrapError::HostKeyVerificationRequired => {
                 SatelleError::ssh_host_key_verification_required(alias)
             }
             _ => SatelleError::host_unreachable(alias),
-        },
-    )?;
+        })?;
     let http_token = ApiBearerToken::parse(raw_bootstrap_token.as_str())
         .map_err(|_| SatelleError::host_unreachable(alias))?;
     let event_token = ApiBearerToken::parse(raw_bootstrap_token.as_str())

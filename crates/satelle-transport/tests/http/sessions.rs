@@ -523,7 +523,7 @@ async fn mutation_validation_fails_before_execution_with_typed_errors() {
 
     let missing_key = running
         .protected_request(Method::POST, "/v1/sessions")
-        .header("Satelle-Protocol-Version", "2")
+        .header("Satelle-Protocol-Version", "3")
         .json(&TurnRequest::new("PRIVATE_MISSING_KEY_CANARY"))
         .send()
         .await
@@ -758,7 +758,7 @@ fn protected_at(
         .header("Satelle-Expected-Host-Identity", host_identity)
         .header("Satelle-Request-Id", RequestId::new().to_string());
     if is_mutation {
-        request.header("Satelle-Protocol-Version", "2")
+        request.header("Satelle-Protocol-Version", "3")
     } else {
         request
     }

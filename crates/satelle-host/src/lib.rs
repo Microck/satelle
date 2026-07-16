@@ -167,7 +167,7 @@ impl HostService {
             .as_ref()
             .map(|path| path.join("codex-app-server-work"))
             .map_err(Clone::clone);
-        let (timeout, provider_smoke_timeout) = configured_readiness_timeouts(config);
+        let (timeout, provider_smoke_timeout) = readiness_probe_timeouts(config);
         let ttl = config
             .native_readiness_cache_ttl
             .as_ref()
@@ -202,8 +202,9 @@ impl HostService {
     pub fn production_for_ssh_bootstrap(
         token: &ApiBearerToken,
         expires_at: time::OffsetDateTime,
+        config: &HostConfig,
     ) -> Self {
-        let mut service = Self::production();
+        let mut service = Self::production_for_host(config);
         service.bootstrap_auth = Some(Arc::new(EphemeralApiAuthenticator::new(
             token,
             ApiScopes::CONTROL,
@@ -439,9 +440,8 @@ fn duration_to_time(duration: &satelle_core::ExplicitDuration) -> time::Duration
     time::Duration::milliseconds(i64::try_from(duration.milliseconds()).unwrap_or(i64::MAX))
 }
 
-fn configured_readiness_timeouts(
-    config: &HostConfig,
-) -> (std::time::Duration, std::time::Duration) {
+/// Returns the native and provider probe deadlines resolved from Host config.
+pub fn readiness_probe_timeouts(config: &HostConfig) -> (std::time::Duration, std::time::Duration) {
     let native = config
         .timeouts
         .as_ref()
@@ -462,7 +462,7 @@ fn configured_readiness_timeouts(
 /// Returns the deadline a remote admission request needs in order to receive
 /// typed outcomes from both serial readiness probes plus response overhead.
 pub fn admission_request_timeout(config: &HostConfig) -> std::time::Duration {
-    let (native, provider) = configured_readiness_timeouts(config);
+    let (native, provider) = readiness_probe_timeouts(config);
     native
         .saturating_add(provider)
         .saturating_add(ADMISSION_RESPONSE_GRACE)

@@ -1,6 +1,7 @@
 use flate2::read::GzDecoder;
 use reqwest::blocking::{Client, Response};
-use satelle_host::ApiBearerToken;
+use satelle_core::HostConfig;
+use satelle_host::{ApiBearerToken, readiness_probe_timeouts};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use std::ffi::{OsStr, OsString};
@@ -35,11 +36,20 @@ impl SshBootstrapProcess {
     pub(super) fn launch(
         destination: &str,
         token: &ApiBearerToken,
+        host_config: &HostConfig,
     ) -> Result<Self, SshBootstrapError> {
         let target = RemoteTarget::probe(destination)?;
         let artifact = DownloadedArtifact::fetch(target)?;
         let remote_binary = upload_artifact(destination, target, artifact.path())?;
-        Self::start(destination, target, &remote_binary, token)
+        let (native_timeout, provider_timeout) = readiness_probe_timeouts(host_config);
+        Self::start(
+            destination,
+            target,
+            &remote_binary,
+            token,
+            native_timeout,
+            provider_timeout,
+        )
     }
 
     fn start(
@@ -47,12 +57,14 @@ impl SshBootstrapProcess {
         target: RemoteTarget,
         remote_binary: &str,
         token: &ApiBearerToken,
+        native_timeout: Duration,
+        provider_timeout: Duration,
     ) -> Result<Self, SshBootstrapError> {
         let mut command = Command::new("ssh");
         command
             .arg("-T")
             .arg(destination)
-            .arg(target.start_command(remote_binary))
+            .arg(target.start_command(remote_binary, native_timeout, provider_timeout))
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
@@ -264,11 +276,25 @@ impl RemoteTarget {
         }
     }
 
-    fn start_command(self, remote_binary: &str) -> String {
+    fn start_command(
+        self,
+        remote_binary: &str,
+        native_timeout: Duration,
+        provider_timeout: Duration,
+    ) -> String {
+        let timeout_args = format!(
+            "--bootstrap-native-readiness-timeout-ms {} --bootstrap-provider-smoke-timeout-ms {}",
+            native_timeout.as_millis(),
+            provider_timeout.as_millis()
+        );
         if self.is_windows() {
-            format!("cmd.exe /d /c {remote_binary} host start --bootstrap-token-stdin --json")
+            format!(
+                "cmd.exe /d /c {remote_binary} host start --bootstrap-token-stdin {timeout_args} --json"
+            )
         } else {
-            format!("sh -c 'exec {remote_binary} host start --bootstrap-token-stdin --json'")
+            format!(
+                "sh -c 'exec {remote_binary} host start --bootstrap-token-stdin {timeout_args} --json'"
+            )
         }
     }
 
@@ -824,6 +850,28 @@ mod tests {
             concat!(
                 "cmd.exe /d /c \"tailscale.exe serve --bg --yes --https 443 ",
                 "http://127.0.0.1:3001 >nul\""
+            )
+        );
+    }
+
+    #[test]
+    fn bootstrap_start_commands_forward_resolved_readiness_timeouts() {
+        let native = Duration::from_millis(2_500);
+        let provider = Duration::from_millis(7_500);
+        assert_eq!(
+            RemoteTarget::LinuxX64Gnu.start_command("/tmp/satelle", native, provider),
+            concat!(
+                "sh -c 'exec /tmp/satelle host start --bootstrap-token-stdin ",
+                "--bootstrap-native-readiness-timeout-ms 2500 ",
+                "--bootstrap-provider-smoke-timeout-ms 7500 --json'"
+            )
+        );
+        assert_eq!(
+            RemoteTarget::WindowsX64Msvc.start_command("satelle.exe", native, provider),
+            concat!(
+                "cmd.exe /d /c satelle.exe host start --bootstrap-token-stdin ",
+                "--bootstrap-native-readiness-timeout-ms 2500 ",
+                "--bootstrap-provider-smoke-timeout-ms 7500 --json"
             )
         );
     }

@@ -515,7 +515,7 @@ fn server_restart_reconciles_the_exact_attached_turn_once() {
         .block_on(
             fixture
                 .transport()
-                .follow_turn(stream, admitted, &mut |event| {
+                .follow_turn(stream, admitted, Vec::new(), &mut |event| {
                     events.push(event);
                     Ok(())
                 }),
@@ -563,7 +563,7 @@ fn transient_http_reconciliation_failure_retains_the_reconnected_stream() {
         .block_on(
             fixture
                 .transport()
-                .follow_turn(stream, admitted, &mut |event| {
+                .follow_turn(stream, admitted, Vec::new(), &mut |event| {
                     events.push(event);
                     Ok(())
                 }),
@@ -664,7 +664,7 @@ fn subscribed_replacements_that_close_before_events_exhaust_the_reconnect_budget
             Duration::from_secs(5),
             fixture
                 .transport()
-                .follow_turn(stream, active, &mut |event| {
+                .follow_turn(stream, active, Vec::new(), &mut |event| {
                     events.push(event);
                     Ok(())
                 }),
@@ -702,7 +702,7 @@ fn server_loss_exhaustion_emits_nothing_and_returns_host_unreachable() {
         .block_on(
             fixture
                 .transport()
-                .follow_turn(stream, admitted, &mut |event| {
+                .follow_turn(stream, admitted, Vec::new(), &mut |event| {
                     events.push(event);
                     Ok(())
                 }),
