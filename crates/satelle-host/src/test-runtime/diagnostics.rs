@@ -13,7 +13,7 @@ pub(super) fn doctor(
     adapter: &FakeComputerUseAdapter,
 ) -> Result<DoctorReport, SatelleError> {
     let started_at = utc_now();
-    let readiness = adapter.preflight(host)?;
+    let readiness = adapter.preflight(host, &crate::ProviderComputerUseIntent::host_default())?;
     let probes = probe_plan(scope);
     let mut findings = Vec::new();
     let mut probe_results = Vec::new();

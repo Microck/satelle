@@ -1,13 +1,83 @@
 use super::*;
-use satelle_core::session::{TurnAdmissionPhase, TurnState};
+use satelle_core::session::{StopObservation, TurnAdmissionPhase, TurnState};
 use satelle_core::{ErrorCode, EventSource, EventSubject, EventType, SatelleEventBody};
 use satelle_host::{
-    ApiScopes, LogCursor, LogPageQuery, LogSeverity, LogSource, test_support::TestStateDir,
+    AdapterReadiness, AdapterSubject, ApiScopes, ComputerUseAdapter, ExecuteRequest, ExecuteResult,
+    LogCursor, LogPageQuery, LogSeverity, LogSource, ProviderComputerUseIntent,
+    RecoveryObservation, test_support::TestStateDir,
 };
 use satelle_transport::{DaemonServer, DaemonServerConfig};
 use std::net::{Ipv4Addr, SocketAddr, TcpListener};
+use std::sync::Mutex;
 use tokio_tungstenite::tungstenite::Error as WebSocketError;
 use tokio_tungstenite::tungstenite::error::ProtocolError;
+
+#[derive(Clone)]
+struct RecordingProviderIntentAdapter {
+    observed: Arc<Mutex<Option<ProviderComputerUseIntent>>>,
+}
+
+impl ComputerUseAdapter for RecordingProviderIntentAdapter {
+    fn preflight(
+        &self,
+        _host: &str,
+        intent: &ProviderComputerUseIntent,
+    ) -> Result<AdapterReadiness, SatelleError> {
+        *self.observed.lock().unwrap() = Some(intent.clone());
+        Err(SatelleError::unsupported_provider_computer_use())
+    }
+
+    fn execute(&self, _request: ExecuteRequest<'_>) -> Result<ExecuteResult, SatelleError> {
+        unreachable!("failed preflight must prevent adapter execution")
+    }
+
+    fn observe_stop(&self, _subject: AdapterSubject<'_>) -> Result<StopObservation, SatelleError> {
+        Ok(StopObservation::UpstreamInactiveConfirmed)
+    }
+
+    fn observe_recovery(
+        &self,
+        _subject: AdapterSubject<'_>,
+    ) -> Result<RecoveryObservation, SatelleError> {
+        Ok(RecoveryObservation::Unknown)
+    }
+}
+
+#[test]
+fn local_turn_request_provider_intent_reaches_host_preflight() {
+    let state = TestStateDir::new().unwrap();
+    let observed = Arc::new(Mutex::new(None));
+    let service = HostService::with_adapter_for_tests_at(
+        state.path(),
+        RecordingProviderIntentAdapter {
+            observed: Arc::clone(&observed),
+        },
+    )
+    .unwrap();
+    let transport = LocalTransport::new(LOCAL_DEMO_HOST.to_string(), service);
+    let request = TurnRequest::new("provider intent probe").with_provider_intent(
+        Some("model-explicit".to_string()),
+        Some("provider-explicit".to_string()),
+        true,
+        true,
+    );
+
+    let failure = match transport.run(&request, &mut |_| Ok(())) {
+        Err(failure) => failure,
+        Ok(_) => panic!("provider preflight should reject the recording adapter"),
+    };
+
+    assert_eq!(
+        failure.error().code,
+        ErrorCode::UnsupportedProviderComputerUse
+    );
+    let observed = observed.lock().unwrap();
+    let observed = observed.as_ref().expect("adapter observed provider intent");
+    assert_eq!(observed.model().unwrap().as_str(), "model-explicit");
+    assert_eq!(observed.provider().unwrap().as_str(), "provider-explicit");
+    assert!(observed.experimental());
+    assert!(observed.refresh());
+}
 
 #[path = "transport-reconnect-tests.rs"]
 mod reconnect;
@@ -561,6 +631,8 @@ fn admission_failures_preserve_definitive_and_ambiguous_phases() {
         ApiErrorCode::IncompatibleProtocol,
         ApiErrorCode::IncompatibleControlPlane,
         ApiErrorCode::ComputerUseNotReady,
+        ApiErrorCode::ProviderSmokeTestTimeout,
+        ApiErrorCode::UnsupportedProviderComputerUse,
         ApiErrorCode::CapacityExceeded,
         ApiErrorCode::RateLimited,
         ApiErrorCode::RouteNotFound,
@@ -589,6 +661,15 @@ fn admission_failures_preserve_definitive_and_ambiguous_phases() {
         direct_run_admission_error("direct-test", DaemonClientError::InvalidTokenHeader);
     assert_eq!(run_rejected.phase(), rejected.phase());
     assert_eq!(run_rejected.error().code, rejected.error().code);
+
+    assert_eq!(
+        api_code_error("direct-test", ApiErrorCode::ProviderSmokeTestTimeout).code,
+        ErrorCode::ProviderSmokeTestTimeout
+    );
+    assert_eq!(
+        api_code_error("direct-test", ApiErrorCode::UnsupportedProviderComputerUse,).code,
+        ErrorCode::UnsupportedProviderComputerUse
+    );
 
     let ambiguous =
         direct_admission_error("direct-test", DaemonClientError::ResponseRequestIdMismatch);

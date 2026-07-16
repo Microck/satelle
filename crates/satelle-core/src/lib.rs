@@ -1508,6 +1508,8 @@ pub enum ErrorCode {
     StorageIntegrityFailed,
     IncompatibleControlPlane,
     ComputerUseNotReady,
+    ProviderSmokeTestTimeout,
+    UnsupportedProviderComputerUse,
     DoctorReadinessBlockersFound,
     DoctorRefreshScopeRequired,
     DoctorRefreshTimeoutWithoutRefresh,
@@ -1581,6 +1583,8 @@ impl ErrorCode {
             Self::StorageIntegrityFailed => "storage-integrity-failed",
             Self::IncompatibleControlPlane => "incompatible-control-plane",
             Self::ComputerUseNotReady => "computer-use-not-ready",
+            Self::ProviderSmokeTestTimeout => "provider-smoke-test-timeout",
+            Self::UnsupportedProviderComputerUse => "unsupported-provider-computer-use",
             Self::DoctorReadinessBlockersFound => "doctor-readiness-blockers-found",
             Self::DoctorRefreshScopeRequired => "refresh-scope-required",
             Self::DoctorRefreshTimeoutWithoutRefresh => "refresh-timeout-without-refresh",
@@ -1663,6 +1667,8 @@ impl ErrorCode {
             Self::RemoteExecution | Self::StorageBusy | Self::StopNotConfirmed => 74,
             Self::IncompatibleControlPlane
             | Self::ComputerUseNotReady
+            | Self::ProviderSmokeTestTimeout
+            | Self::UnsupportedProviderComputerUse
             | Self::DoctorReadinessBlockersFound
             | Self::StateConflict => 75,
             Self::NotImplemented => 78,
@@ -1694,6 +1700,32 @@ impl SatelleError {
             code: ErrorCode::InvalidUsage,
             message: message.into(),
             recovery_command: Some("satelle --help".to_string()),
+            source_detail: None,
+            details: BTreeMap::new(),
+        }
+    }
+
+    pub fn provider_smoke_test_timeout() -> Self {
+        Self {
+            code: ErrorCode::ProviderSmokeTestTimeout,
+            message: "the live provider Computer Use smoke test timed out".to_string(),
+            recovery_command: Some(
+                "rerun the original satelle run or steer command with --refresh-provider-smoke-test"
+                    .to_string(),
+            ),
+            source_detail: None,
+            details: BTreeMap::new(),
+        }
+    }
+
+    pub fn unsupported_provider_computer_use() -> Self {
+        Self {
+            code: ErrorCode::UnsupportedProviderComputerUse,
+            message: "the selected provider does not support native Computer Use".to_string(),
+            recovery_command: Some(
+                "rerun the original satelle run or steer command with --refresh-provider-smoke-test"
+                    .to_string(),
+            ),
             source_detail: None,
             details: BTreeMap::new(),
         }

@@ -3,15 +3,24 @@ use crate::codex_capabilities::{
     CapabilityMatrix, CodexVersionEvidence, HostPlatform, Phase0CapabilityEvidence,
     REQUIRED_CODEX_VERSION,
 };
+use satelle_core::session::TurnExecutionMode;
 use satelle_core::session::{StopObservation, TurnState};
 use satelle_core::{ErrorCode, SatelleError};
+
+fn turn_intent(prompt: &str) -> TurnIntent {
+    TurnIntent::new(prompt, TurnExecutionMode::Standard).expect("valid test Turn intent")
+}
 
 #[derive(Clone, Copy)]
 struct FailingExecutionAdapter;
 
 impl ComputerUseAdapter for FailingExecutionAdapter {
-    fn preflight(&self, host: &str) -> Result<AdapterReadiness, SatelleError> {
-        FakeComputerUseAdapter.preflight(host)
+    fn preflight(
+        &self,
+        host: &str,
+        provider_intent: &crate::ProviderComputerUseIntent,
+    ) -> Result<AdapterReadiness, SatelleError> {
+        FakeComputerUseAdapter.preflight(host, provider_intent)
     }
 
     fn execute(&self, _request: ExecuteRequest<'_>) -> Result<ExecuteResult, SatelleError> {
@@ -89,21 +98,13 @@ fn unsupported_or_unproven_production_execution_is_blocked_before_admission() {
             (
                 "run",
                 service
-                    .run(
-                        LOCAL_DEMO_HOST,
-                        "PRIVATE_PRODUCTION_PROMPT",
-                        TurnExecutionMode::Standard,
-                    )
+                    .run(LOCAL_DEMO_HOST, &turn_intent("PRIVATE_PRODUCTION_PROMPT"))
                     .expect_err("attached run must be blocked"),
             ),
             (
                 "steer",
                 service
-                    .steer(
-                        &session_id,
-                        "PRIVATE_PRODUCTION_PROMPT",
-                        TurnExecutionMode::Standard,
-                    )
+                    .steer(&session_id, &turn_intent("PRIVATE_PRODUCTION_PROMPT"))
                     .expect_err("attached steer must be blocked before session lookup"),
             ),
         ] {
@@ -115,21 +116,13 @@ fn unsupported_or_unproven_production_execution_is_blocked_before_admission() {
             (
                 "run",
                 service
-                    .run_detached(
-                        LOCAL_DEMO_HOST,
-                        "PRIVATE_PRODUCTION_PROMPT",
-                        TurnExecutionMode::Standard,
-                    )
+                    .run_detached(LOCAL_DEMO_HOST, &turn_intent("PRIVATE_PRODUCTION_PROMPT"))
                     .expect_err("detached run must be blocked"),
             ),
             (
                 "steer",
                 service
-                    .steer_detached(
-                        &session_id,
-                        "PRIVATE_PRODUCTION_PROMPT",
-                        TurnExecutionMode::Standard,
-                    )
+                    .steer_detached(&session_id, &turn_intent("PRIVATE_PRODUCTION_PROMPT"))
                     .expect_err("detached steer must be blocked before session lookup"),
             ),
         ] {
@@ -173,8 +166,7 @@ fn attached_adapter_failures_return_exact_durable_run_and_steer_handles() {
     let run_failure = run_service
         .run(
             LOCAL_DEMO_HOST,
-            "PRIVATE_FAIL_AFTER_RUN_COMMIT",
-            TurnExecutionMode::Standard,
+            &turn_intent("PRIVATE_FAIL_AFTER_RUN_COMMIT"),
         )
         .expect_err("the deterministic adapter must fail after run admission");
     let (run_failure_session, run_turn_id) = match run_failure {
@@ -205,8 +197,7 @@ fn attached_adapter_failures_return_exact_durable_run_and_steer_handles() {
     let initial = seeded
         .run(
             LOCAL_DEMO_HOST,
-            "PRIVATE_SUCCESSFUL_INITIAL_RUN",
-            TurnExecutionMode::Standard,
+            &turn_intent("PRIVATE_SUCCESSFUL_INITIAL_RUN"),
         )
         .expect("the initial run should complete");
     let steer_session_id = initial.session.session_id().clone();
@@ -223,8 +214,7 @@ fn attached_adapter_failures_return_exact_durable_run_and_steer_handles() {
     let steer_failure = steer_service
         .steer(
             &steer_session_id,
-            "PRIVATE_FAIL_AFTER_STEER_COMMIT",
-            TurnExecutionMode::Standard,
+            &turn_intent("PRIVATE_FAIL_AFTER_STEER_COMMIT"),
         )
         .expect_err("the deterministic adapter must fail after steer admission");
     let steer_turn_id = match steer_failure {
@@ -283,8 +273,7 @@ fn refreshed_production_snapshot_updates_admission_surfaces_but_not_desktop_disc
     let initial_error = service
         .run(
             LOCAL_DEMO_HOST,
-            "PRIVATE_BEFORE_CONTROL_PLANE_REFRESH",
-            TurnExecutionMode::Standard,
+            &turn_intent("PRIVATE_BEFORE_CONTROL_PLANE_REFRESH"),
         )
         .expect_err("the supported snapshot should reach the native execution blocker");
     assert!(matches!(
@@ -316,8 +305,7 @@ fn refreshed_production_snapshot_updates_admission_surfaces_but_not_desktop_disc
     let refreshed_error = clone
         .run(
             LOCAL_DEMO_HOST,
-            "PRIVATE_AFTER_CONTROL_PLANE_REFRESH",
-            TurnExecutionMode::Standard,
+            &turn_intent("PRIVATE_AFTER_CONTROL_PLANE_REFRESH"),
         )
         .expect_err("the cloned service must use refreshed admission");
     assert!(matches!(

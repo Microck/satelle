@@ -5,7 +5,8 @@ use crate::{
     ApiBearerToken, ApiPrincipal, ApiScopes, HostMode, HostService, ProductionCapabilitySnapshot,
 };
 use satelle_core::session::{
-    PublicSession, SessionStateRevision, TurnExecutionMode, TurnStateRevision,
+    EffectiveModelRef, ProviderBindingRef, PublicSession, SessionStateRevision, TurnExecutionMode,
+    TurnStateRevision,
 };
 use satelle_core::{DesktopSessionRecord, LOCAL_DEMO_HOST, SatelleError, SessionId, StopResult};
 use serde::Serialize;
@@ -15,7 +16,7 @@ use time::OffsetDateTime;
 use zeroize::Zeroizing;
 
 const MAX_IDEMPOTENCY_KEY_BYTES: usize = 256;
-const TURN_IDEMPOTENCY_DIGEST_SCHEMA_VERSION: u16 = 2;
+const TURN_IDEMPOTENCY_DIGEST_SCHEMA_VERSION: u16 = 3;
 const STOP_IDEMPOTENCY_DIGEST_SCHEMA_VERSION: u16 = 1;
 
 /// A diagnostic-safe snapshot captured from the daemon-owned runtime after
@@ -119,12 +120,12 @@ pub enum MutationAuthorityError {
     InvalidIdempotencyKey,
 }
 
-/// Prompt intent accepted by the current Host API. Execution-policy overrides
-/// and attachments are intentionally absent until their full vertical slices
-/// exist.
+/// Prompt and non-secret provider intent accepted by the Host API. Attachments
+/// remain absent until their full vertical slice exists.
 pub struct TurnIntent {
     prompt: String,
     execution_mode: TurnExecutionMode,
+    provider_intent: crate::ProviderComputerUseIntent,
 }
 
 impl TurnIntent {
@@ -139,7 +140,40 @@ impl TurnIntent {
         Ok(Self {
             prompt,
             execution_mode,
+            provider_intent: crate::ProviderComputerUseIntent::host_default(),
         })
+    }
+
+    pub fn with_provider_intent(
+        mut self,
+        model: Option<String>,
+        provider: Option<String>,
+        experimental: bool,
+        refresh: bool,
+    ) -> Result<Self, TurnIntentError> {
+        let model = model
+            .map(EffectiveModelRef::new)
+            .transpose()
+            .map_err(|_| TurnIntentError::InvalidModel)?;
+        let provider = provider
+            .map(ProviderBindingRef::new)
+            .transpose()
+            .map_err(|_| TurnIntentError::InvalidProvider)?;
+        self.provider_intent =
+            crate::ProviderComputerUseIntent::new(model, provider, experimental, refresh);
+        Ok(self)
+    }
+
+    pub(crate) fn prompt(&self) -> &str {
+        &self.prompt
+    }
+
+    pub(crate) const fn execution_mode(&self) -> TurnExecutionMode {
+        self.execution_mode
+    }
+
+    pub(crate) fn provider_intent(&self) -> &crate::ProviderComputerUseIntent {
+        &self.provider_intent
     }
 }
 
@@ -149,6 +183,7 @@ impl fmt::Debug for TurnIntent {
             .debug_struct("TurnIntent")
             .field("prompt_bytes", &self.prompt.len())
             .field("execution_mode", &self.execution_mode)
+            .field("provider_intent", &self.provider_intent)
             .finish_non_exhaustive()
     }
 }
@@ -157,6 +192,10 @@ impl fmt::Debug for TurnIntent {
 pub enum TurnIntentError {
     #[error("the prompt must not be empty")]
     EmptyPrompt,
+    #[error("the model override is invalid")]
+    InvalidModel,
+    #[error("the provider override is invalid")]
+    InvalidProvider,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -193,6 +232,10 @@ struct CanonicalSessionCreate<'a> {
     operation: &'static str,
     prompt: &'a str,
     execution_mode: TurnExecutionMode,
+    model: Option<&'a str>,
+    provider: Option<&'a str>,
+    experimental_provider_computer_use: bool,
+    refresh_provider_smoke_test: bool,
 }
 
 #[derive(Serialize)]
@@ -201,6 +244,10 @@ struct CanonicalTurnCreate<'a> {
     session_id: &'a str,
     prompt: &'a str,
     execution_mode: TurnExecutionMode,
+    model: Option<&'a str>,
+    provider: Option<&'a str>,
+    experimental_provider_computer_use: bool,
+    refresh_provider_smoke_test: bool,
 }
 
 #[derive(Serialize)]
@@ -396,6 +443,16 @@ impl HostService {
                 operation: "session_create",
                 prompt: &intent.prompt,
                 execution_mode: intent.execution_mode,
+                model: intent
+                    .provider_intent
+                    .model()
+                    .map(EffectiveModelRef::as_str),
+                provider: intent
+                    .provider_intent
+                    .provider()
+                    .map(ProviderBindingRef::as_str),
+                experimental_provider_computer_use: intent.provider_intent.experimental(),
+                refresh_provider_smoke_test: intent.provider_intent.refresh(),
             },
             TURN_IDEMPOTENCY_DIGEST_SCHEMA_VERSION,
         )?;
@@ -432,7 +489,8 @@ impl HostService {
                                 &intent.prompt,
                                 operation_identity,
                             )
-                            .with_execution_mode(intent.execution_mode),
+                            .with_execution_mode(intent.execution_mode)
+                            .with_provider_intent(intent.provider_intent.clone()),
                         ),
                     )
                     .map(crate::operation_capacity::OperationOutcome::Session)
@@ -453,6 +511,16 @@ impl HostService {
                 session_id: session_id.as_str(),
                 prompt: &intent.prompt,
                 execution_mode: intent.execution_mode,
+                model: intent
+                    .provider_intent
+                    .model()
+                    .map(EffectiveModelRef::as_str),
+                provider: intent
+                    .provider_intent
+                    .provider()
+                    .map(ProviderBindingRef::as_str),
+                experimental_provider_computer_use: intent.provider_intent.experimental(),
+                refresh_provider_smoke_test: intent.provider_intent.refresh(),
             },
             TURN_IDEMPOTENCY_DIGEST_SCHEMA_VERSION,
         )?;
@@ -493,7 +561,8 @@ impl HostService {
                                 &intent.prompt,
                                 operation_identity,
                             )
-                            .with_execution_mode(intent.execution_mode),
+                            .with_execution_mode(intent.execution_mode)
+                            .with_provider_intent(intent.provider_intent.clone()),
                         ),
                     )
                     .map(crate::operation_capacity::OperationOutcome::Session)
@@ -561,6 +630,22 @@ impl HostService {
                 Ok(state_root.into()),
                 crate::test_runtime::FakeComputerUseAdapter,
             ),
+            operation_capacity: std::sync::Arc::new(
+                crate::operation_capacity::OperationCapacity::default(),
+            ),
+            mode: HostMode::TestFake,
+            bootstrap_auth: None,
+        })
+    }
+
+    #[doc(hidden)]
+    #[cfg(feature = "test-support")]
+    pub fn with_adapter_for_tests_at<A: crate::ComputerUseAdapter>(
+        state_root: impl Into<std::path::PathBuf>,
+        adapter: A,
+    ) -> Result<Self, SatelleError> {
+        Ok(Self {
+            runtime: crate::runtime::RuntimeHandle::new(Ok(state_root.into()), adapter),
             operation_capacity: std::sync::Arc::new(
                 crate::operation_capacity::OperationCapacity::default(),
             ),
@@ -655,20 +740,28 @@ mod tests {
                 operation: "session_create",
                 prompt: "PRIVATE_DIGEST_VERSION_PROMPT",
                 execution_mode: TurnExecutionMode::Yolo,
+                model: Some("model-test"),
+                provider: Some("provider-test"),
+                experimental_provider_computer_use: true,
+                refresh_provider_smoke_test: true,
             },
             TURN_IDEMPOTENCY_DIGEST_SCHEMA_VERSION,
         )
         .expect("serialize Turn idempotency payload");
-        assert_eq!(turn.digest_schema_version, 2);
+        assert_eq!(turn.digest_schema_version, 3);
         assert_eq!(
             serde_json::from_slice::<serde_json::Value>(turn.as_slice())
                 .expect("decode Turn payload"),
             serde_json::json!({
-                "digest_schema_version": 2,
+                "digest_schema_version": 3,
                 "payload": {
                     "operation": "session_create",
                     "prompt": "PRIVATE_DIGEST_VERSION_PROMPT",
-                    "execution_mode": "yolo"
+                    "execution_mode": "yolo",
+                    "model": "model-test",
+                    "provider": "provider-test",
+                    "experimental_provider_computer_use": true,
+                    "refresh_provider_smoke_test": true
                 }
             })
         );

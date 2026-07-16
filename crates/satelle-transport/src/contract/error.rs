@@ -25,6 +25,8 @@ pub enum ApiErrorCode {
     IncompatibleProtocol,
     IncompatibleControlPlane,
     ComputerUseNotReady,
+    ProviderSmokeTestTimeout,
+    UnsupportedProviderComputerUse,
     StorageBusy,
     StorageIntegrityFailed,
     RemoteExecutionFailed,
@@ -56,6 +58,8 @@ impl ApiErrorCode {
             Self::IncompatibleProtocol => "incompatible-protocol",
             Self::IncompatibleControlPlane => "incompatible-control-plane",
             Self::ComputerUseNotReady => "computer-use-not-ready",
+            Self::ProviderSmokeTestTimeout => "provider-smoke-test-timeout",
+            Self::UnsupportedProviderComputerUse => "unsupported-provider-computer-use",
             Self::StorageBusy => "storage-busy",
             Self::StorageIntegrityFailed => "storage-integrity-failed",
             Self::RemoteExecutionFailed => "remote-execution-failed",
@@ -83,6 +87,23 @@ mod tests {
             serde_json::to_value(ApiErrorCode::IncompatibleControlPlane).unwrap(),
             json!("incompatible-control-plane")
         );
+    }
+
+    #[test]
+    fn provider_smoke_codes_have_exact_public_tokens() {
+        for (code, token) in [
+            (
+                ApiErrorCode::ProviderSmokeTestTimeout,
+                "provider-smoke-test-timeout",
+            ),
+            (
+                ApiErrorCode::UnsupportedProviderComputerUse,
+                "unsupported-provider-computer-use",
+            ),
+        ] {
+            assert_eq!(code.as_str(), token);
+            assert_eq!(serde_json::to_value(code).unwrap(), json!(token));
+        }
     }
 
     #[test]

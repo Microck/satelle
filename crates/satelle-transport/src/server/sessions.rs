@@ -3,14 +3,14 @@ use super::auth::AuthorizedRequest;
 use super::{ApiFailure, DaemonState, api_error_response, authenticated_json_response, host_error};
 use crate::contract::{
     ApiErrorCategory, ApiErrorCode, RequestId, SessionResponse, StopRequest, StopResponse,
-    TurnRequest,
+    TurnRequest, TurnRequestParts,
 };
 use axum::extract::{Extension, FromRequestParts, Path, State};
 use axum::http::StatusCode;
 use axum::http::request::Parts;
 use axum::response::Response;
 use satelle_core::{SatelleError, SessionId};
-use satelle_host::{MutationAuthority, TurnIntent};
+use satelle_host::{MutationAuthority, TurnIntent, TurnIntentError};
 use std::sync::Arc;
 
 pub(super) async fn create_session(
@@ -19,10 +19,9 @@ pub(super) async fn create_session(
     Extension(authority): Extension<MutationAuthority>,
     ApiJson(request): ApiJson<TurnRequest>,
 ) -> Response {
-    let (prompt, execution_mode) = request.into_parts();
-    let intent = match TurnIntent::new(prompt, execution_mode) {
+    let intent = match turn_intent(request) {
         Ok(intent) => intent,
-        Err(_) => return invalid_turn_request(&state, &authorized),
+        Err(error) => return invalid_turn_request(&state, &authorized, error),
     };
     let service = Arc::clone(&state.service);
     let session = match host_call(&state, &authorized, move || {
@@ -52,10 +51,9 @@ pub(super) async fn create_turn(
     SessionPath(session_id): SessionPath,
     ApiJson(request): ApiJson<TurnRequest>,
 ) -> Response {
-    let (prompt, execution_mode) = request.into_parts();
-    let intent = match TurnIntent::new(prompt, execution_mode) {
+    let intent = match turn_intent(request) {
         Ok(intent) => intent,
-        Err(_) => return invalid_turn_request(&state, &authorized),
+        Err(error) => return invalid_turn_request(&state, &authorized, error),
     };
     let service = Arc::clone(&state.service);
     let session = match host_call(&state, &authorized, move || {
@@ -175,8 +173,37 @@ where
     }
 }
 
-fn invalid_turn_request(state: &DaemonState, authorized: &AuthorizedRequest) -> Response {
-    request_error(state, authorized, "prompt must not be empty")
+fn turn_intent(request: TurnRequest) -> Result<TurnIntent, TurnIntentError> {
+    let TurnRequestParts {
+        prompt,
+        execution_mode,
+        model,
+        provider,
+        experimental_provider_computer_use,
+        refresh_provider_smoke_test,
+    } = request.into_parts();
+
+    TurnIntent::new(prompt, execution_mode).and_then(|intent| {
+        intent.with_provider_intent(
+            model,
+            provider,
+            experimental_provider_computer_use,
+            refresh_provider_smoke_test,
+        )
+    })
+}
+
+fn invalid_turn_request(
+    state: &DaemonState,
+    authorized: &AuthorizedRequest,
+    error: TurnIntentError,
+) -> Response {
+    let message = match error {
+        TurnIntentError::EmptyPrompt => "prompt must not be empty",
+        TurnIntentError::InvalidModel => "model override is invalid",
+        TurnIntentError::InvalidProvider => "provider override is invalid",
+    };
+    request_error(state, authorized, message)
 }
 
 fn invalid_session_id(state: &DaemonState, authorized: &AuthorizedRequest) -> Response {

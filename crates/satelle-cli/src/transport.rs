@@ -157,9 +157,8 @@ impl TransportClient for LocalTransport {
         request: &TurnRequest,
         on_event: &mut dyn FnMut(SatelleEvent) -> Result<(), SatelleError>,
     ) -> Result<AttachedTurnOutcome, TurnAdmissionFailure> {
-        let outcome = self
-            .service
-            .run(&self.alias, request.prompt(), request.execution_mode())?;
+        let intent = local_turn_intent(request).map_err(TurnAdmissionFailure::not_admitted)?;
+        let outcome = self.service.run(&self.alias, &intent)?;
         let turn_id = outcome
             .session
             .turns()
@@ -180,7 +179,7 @@ impl TransportClient for LocalTransport {
 
     fn run_detached(&self, request: &TurnRequest) -> Result<PublicSession, SatelleError> {
         self.service
-            .run_detached(&self.alias, request.prompt(), request.execution_mode())
+            .run_detached(&self.alias, &local_turn_intent(request)?)
     }
 
     fn steer(
@@ -189,9 +188,8 @@ impl TransportClient for LocalTransport {
         request: &TurnRequest,
         on_event: &mut dyn FnMut(SatelleEvent) -> Result<(), SatelleError>,
     ) -> Result<AttachedTurnOutcome, TurnAdmissionFailure> {
-        let outcome = self
-            .service
-            .steer(session_id, request.prompt(), request.execution_mode())?;
+        let intent = local_turn_intent(request).map_err(TurnAdmissionFailure::not_admitted)?;
+        let outcome = self.service.steer(session_id, &intent)?;
         let turn_id = outcome
             .session
             .turns()
@@ -216,7 +214,7 @@ impl TransportClient for LocalTransport {
         request: &TurnRequest,
     ) -> Result<PublicSession, SatelleError> {
         self.service
-            .steer_detached(session_id, request.prompt(), request.execution_mode())
+            .steer_detached(session_id, &local_turn_intent(request)?)
     }
 
     fn status(&self, session_id: &SessionId) -> Result<PublicSession, SatelleError> {
@@ -233,6 +231,19 @@ impl TransportClient for LocalTransport {
         }
         self.service.daemon_log_page(query)
     }
+}
+
+fn local_turn_intent(request: &TurnRequest) -> Result<satelle_host::TurnIntent, SatelleError> {
+    satelle_host::TurnIntent::new(request.prompt(), request.execution_mode())
+        .and_then(|intent| {
+            intent.with_provider_intent(
+                request.model().map(str::to_string),
+                request.provider().map(str::to_string),
+                request.experimental_provider_computer_use(),
+                request.refresh_provider_smoke_test(),
+            )
+        })
+        .map_err(|error| SatelleError::invalid_usage(error.to_string()))
 }
 
 struct DirectTransport {
@@ -767,6 +778,8 @@ fn api_error_is_definitively_not_admitted(code: ApiErrorCode) -> bool {
             | ApiErrorCode::IncompatibleProtocol
             | ApiErrorCode::IncompatibleControlPlane
             | ApiErrorCode::ComputerUseNotReady
+            | ApiErrorCode::ProviderSmokeTestTimeout
+            | ApiErrorCode::UnsupportedProviderComputerUse
             | ApiErrorCode::CapacityExceeded
             | ApiErrorCode::RateLimited
             | ApiErrorCode::RouteNotFound
@@ -782,6 +795,10 @@ fn api_code_error(host: &str, code: ApiErrorCode) -> SatelleError {
         }
         ApiErrorCode::HostIdentityMismatch => SatelleError::host_identity_mismatch(host),
         ApiErrorCode::HostUnreachable => SatelleError::host_unreachable(host),
+        ApiErrorCode::ProviderSmokeTestTimeout => SatelleError::provider_smoke_test_timeout(),
+        ApiErrorCode::UnsupportedProviderComputerUse => {
+            SatelleError::unsupported_provider_computer_use()
+        }
         code => SatelleError::remote_api_error(host, code.as_str()),
     }
 }

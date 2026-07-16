@@ -1,3 +1,4 @@
+use super::ProviderComputerUseIntent;
 use satelle_core::session::TurnExecutionMode;
 use satelle_core::{SessionId, TurnId};
 
@@ -69,6 +70,7 @@ pub(crate) struct RunCommand<'a> {
     pub(super) dispatch: DispatchPreference,
     pub(super) identity: RequestIdentity,
     pub(super) execution_mode: TurnExecutionMode,
+    pub(super) provider_intent: ProviderComputerUseIntent,
 }
 
 #[derive(Clone, Copy)]
@@ -93,6 +95,7 @@ impl<'a> RunCommand<'a> {
             dispatch: DispatchPreference::Inline,
             identity,
             execution_mode: TurnExecutionMode::Standard,
+            provider_intent: ProviderComputerUseIntent::host_default(),
         }
     }
 
@@ -111,11 +114,20 @@ impl<'a> RunCommand<'a> {
             dispatch: DispatchPreference::Detached,
             identity,
             execution_mode: TurnExecutionMode::Standard,
+            provider_intent: ProviderComputerUseIntent::host_default(),
         }
     }
 
     pub(crate) fn with_execution_mode(mut self, execution_mode: TurnExecutionMode) -> Self {
         self.execution_mode = execution_mode;
+        self
+    }
+
+    pub(crate) fn with_provider_intent(
+        mut self,
+        provider_intent: ProviderComputerUseIntent,
+    ) -> Self {
+        self.provider_intent = provider_intent;
         self
     }
 }
@@ -126,6 +138,7 @@ pub(crate) struct SteerCommand<'a> {
     pub(super) dispatch: DispatchPreference,
     pub(super) identity: RequestIdentity,
     pub(super) execution_mode: TurnExecutionMode,
+    pub(super) provider_intent: ProviderComputerUseIntent,
 }
 
 impl<'a> SteerCommand<'a> {
@@ -144,6 +157,7 @@ impl<'a> SteerCommand<'a> {
             dispatch: DispatchPreference::Inline,
             identity,
             execution_mode: TurnExecutionMode::Standard,
+            provider_intent: ProviderComputerUseIntent::host_default(),
         }
     }
 
@@ -162,11 +176,20 @@ impl<'a> SteerCommand<'a> {
             dispatch: DispatchPreference::Detached,
             identity,
             execution_mode: TurnExecutionMode::Standard,
+            provider_intent: ProviderComputerUseIntent::host_default(),
         }
     }
 
     pub(crate) fn with_execution_mode(mut self, execution_mode: TurnExecutionMode) -> Self {
         self.execution_mode = execution_mode;
+        self
+    }
+
+    pub(crate) fn with_provider_intent(
+        mut self,
+        provider_intent: ProviderComputerUseIntent,
+    ) -> Self {
+        self.provider_intent = provider_intent;
         self
     }
 }

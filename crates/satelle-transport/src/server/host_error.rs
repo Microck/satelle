@@ -159,6 +159,22 @@ fn failure(error: &SatelleError) -> ApiFailure {
             message: "native Computer Use is not ready on this Host",
             details: None,
         },
+        ErrorCode::ProviderSmokeTestTimeout => ApiFailure {
+            status: StatusCode::GATEWAY_TIMEOUT,
+            code: ApiErrorCode::ProviderSmokeTestTimeout,
+            category: ApiErrorCategory::Readiness,
+            retryable: true,
+            message: "the live provider Computer Use smoke test timed out",
+            details: None,
+        },
+        ErrorCode::UnsupportedProviderComputerUse => ApiFailure {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            code: ApiErrorCode::UnsupportedProviderComputerUse,
+            category: ApiErrorCategory::Readiness,
+            retryable: false,
+            message: "the selected provider does not support native Computer Use",
+            details: None,
+        },
         ErrorCode::HostUnreachable => ApiFailure {
             status: StatusCode::SERVICE_UNAVAILABLE,
             code: ApiErrorCode::HostUnreachable,
@@ -303,6 +319,22 @@ mod tests {
                 "missing_capabilities": ["event_observation"]
             }))
         );
+    }
+
+    #[test]
+    fn provider_smoke_failures_keep_distinct_typed_api_codes() {
+        let timeout = failure(&SatelleError::provider_smoke_test_timeout());
+        assert_eq!(timeout.status, StatusCode::GATEWAY_TIMEOUT);
+        assert_eq!(timeout.code, ApiErrorCode::ProviderSmokeTestTimeout);
+        assert!(timeout.retryable);
+
+        let unsupported = failure(&SatelleError::unsupported_provider_computer_use());
+        assert_eq!(unsupported.status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            unsupported.code,
+            ApiErrorCode::UnsupportedProviderComputerUse
+        );
+        assert!(!unsupported.retryable);
     }
 
     #[test]

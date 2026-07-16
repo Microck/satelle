@@ -21,6 +21,27 @@ pub struct TurnRequest {
     schema_version: TurnRequestSchema,
     prompt: String,
     execution_mode: TurnExecutionMode,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    provider: Option<String>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    experimental_provider_computer_use: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    refresh_provider_smoke_test: bool,
+}
+
+pub(crate) struct TurnRequestParts {
+    pub(crate) prompt: String,
+    pub(crate) execution_mode: TurnExecutionMode,
+    pub(crate) model: Option<String>,
+    pub(crate) provider: Option<String>,
+    pub(crate) experimental_provider_computer_use: bool,
+    pub(crate) refresh_provider_smoke_test: bool,
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 impl TurnRequest {
@@ -29,11 +50,29 @@ impl TurnRequest {
             schema_version: TurnRequestSchema,
             prompt: prompt.into(),
             execution_mode: TurnExecutionMode::Standard,
+            model: None,
+            provider: None,
+            experimental_provider_computer_use: false,
+            refresh_provider_smoke_test: false,
         }
     }
 
     pub fn with_execution_mode(mut self, execution_mode: TurnExecutionMode) -> Self {
         self.execution_mode = execution_mode;
+        self
+    }
+
+    pub fn with_provider_intent(
+        mut self,
+        model: Option<String>,
+        provider: Option<String>,
+        experimental_provider_computer_use: bool,
+        refresh_provider_smoke_test: bool,
+    ) -> Self {
+        self.model = model;
+        self.provider = provider;
+        self.experimental_provider_computer_use = experimental_provider_computer_use;
+        self.refresh_provider_smoke_test = refresh_provider_smoke_test;
         self
     }
 
@@ -45,8 +84,31 @@ impl TurnRequest {
         self.execution_mode
     }
 
-    pub(crate) fn into_parts(self) -> (String, TurnExecutionMode) {
-        (self.prompt, self.execution_mode)
+    pub fn model(&self) -> Option<&str> {
+        self.model.as_deref()
+    }
+
+    pub fn provider(&self) -> Option<&str> {
+        self.provider.as_deref()
+    }
+
+    pub const fn experimental_provider_computer_use(&self) -> bool {
+        self.experimental_provider_computer_use
+    }
+
+    pub const fn refresh_provider_smoke_test(&self) -> bool {
+        self.refresh_provider_smoke_test
+    }
+
+    pub(crate) fn into_parts(self) -> TurnRequestParts {
+        TurnRequestParts {
+            prompt: self.prompt,
+            execution_mode: self.execution_mode,
+            model: self.model,
+            provider: self.provider,
+            experimental_provider_computer_use: self.experimental_provider_computer_use,
+            refresh_provider_smoke_test: self.refresh_provider_smoke_test,
+        }
     }
 }
 
@@ -60,6 +122,16 @@ impl fmt::Debug for TurnRequest {
             .debug_struct("TurnRequest")
             .field("prompt_bytes", &self.prompt.len())
             .field("execution_mode", &self.execution_mode)
+            .field("has_model_override", &self.model.is_some())
+            .field("has_provider_override", &self.provider.is_some())
+            .field(
+                "experimental_provider_computer_use",
+                &self.experimental_provider_computer_use,
+            )
+            .field(
+                "refresh_provider_smoke_test",
+                &self.refresh_provider_smoke_test,
+            )
             .finish_non_exhaustive()
     }
 }
@@ -375,6 +447,24 @@ mod tests {
                 "schema_version": "satelle.api.v2",
                 "prompt": "private prompt",
                 "execution_mode": "yolo"
+            })
+        );
+        assert_eq!(
+            serde_json::to_value(TurnRequest::new("private prompt").with_provider_intent(
+                Some("model-explicit".to_string()),
+                Some("provider-explicit".to_string()),
+                true,
+                true,
+            ))
+            .expect("serialize provider intent"),
+            serde_json::json!({
+                "schema_version": "satelle.api.v2",
+                "prompt": "private prompt",
+                "execution_mode": "standard",
+                "model": "model-explicit",
+                "provider": "provider-explicit",
+                "experimental_provider_computer_use": true,
+                "refresh_provider_smoke_test": true
             })
         );
         assert!(
