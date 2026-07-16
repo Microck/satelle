@@ -35,8 +35,8 @@ pub use events::{
 pub use ids::{IdParseError, SESSION_ID_PATTERN, SessionId, TurnId};
 pub use profiles::{ProfileField, ProfileSelectionSource, SelectedProfile};
 pub use secure_file::{
-    SecureFileError, read_owner_controlled_config_file, read_owner_only_secret_file,
-    read_trusted_ca_bundle_file,
+    SecureFileError, open_or_create_owner_only_directory, open_or_create_owner_only_file,
+    read_owner_controlled_config_file, read_owner_only_secret_file, read_trusted_ca_bundle_file,
 };
 
 pub const PRODUCT_NAME: &str = "Satelle";
@@ -57,6 +57,7 @@ pub struct SatelleConfig {
     pub provider_alias: Option<String>,
     pub experimental_provider_computer_use: Option<bool>,
     pub yolo: Option<bool>,
+    pub command_history: Option<bool>,
     #[serde(default)]
     pub hosts: BTreeMap<String, HostConfig>,
 }
@@ -101,6 +102,7 @@ impl SatelleConfig {
             provider_alias: None,
             experimental_provider_computer_use: None,
             yolo: None,
+            command_history: None,
             hosts,
         }
     }
@@ -120,6 +122,9 @@ impl SatelleConfig {
         }
         if higher.yolo.is_some() {
             self.yolo = higher.yolo;
+        }
+        if higher.command_history.is_some() {
+            self.command_history = higher.command_history;
         }
 
         for (alias, host) in higher.hosts {
@@ -1293,6 +1298,7 @@ fn reject_unknown_user_config_keys(path: &Path, value: &toml::Value) -> Result<(
             "provider_alias",
             "experimental_provider_computer_use",
             "yolo",
+            "command_history",
             "profile",
             "profiles",
             "hosts",

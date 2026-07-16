@@ -2282,6 +2282,8 @@ dependencies = [
  "predicates",
  "reqwest",
  "rmcp",
+ "rusqlite",
+ "rustix",
  "satelle-core",
  "satelle-host",
  "satelle-test-contract",
@@ -2307,6 +2309,7 @@ name = "satelle-core"
 version = "0.1.0"
 dependencies = [
  "directories",
+ "libc",
  "rustix",
  "serde",
  "serde_json",

@@ -92,6 +92,7 @@ pub(super) fn config_explain_report(
     let environment_sources = json!({
         "host": env_source("SATELLE_HOST"),
         "profile": env_source("SATELLE_PROFILE"),
+        "command_history": env_source("SATELLE_COMMAND_HISTORY"),
         "paths": {
             "home": env_source("SATELLE_HOME"),
             "config_file": env_source("SATELLE_CONFIG_FILE"),
@@ -120,13 +121,13 @@ pub(super) fn config_explain_report(
             "host_count": config.config.hosts.len(),
             "effective_timeouts": super::effective_timeouts_json(&selected_host_config),
             "daemon_path_overrides": daemon_path_overrides_json(&selected_host_config),
-            "model_provider": model_provider_config_json(&config, &selected_host),
+            "model_provider": model_provider_config_json(config, &selected_host),
             "experimental_provider_computer_use": experimental_provider_computer_use_json(
-                &config,
+                config,
                 &selected_host,
                 &selected_host_config,
             ),
-            "yolo": yolo_config_json(&config, &selected_host, &selected_host_config),
+            "yolo": yolo_config_json(config, &selected_host, &selected_host_config),
             "show_secret_references": show_secret_references,
         },
         "not_checked": ["remote_host", "provider_auth", "native_computer_use"],

@@ -68,6 +68,34 @@ pub(super) struct FakeComputerUseAdapter;
 #[derive(Clone, Debug)]
 pub(super) struct PendingComputerUseAdapter;
 
+#[derive(Clone, Debug)]
+pub(super) struct FailingComputerUseAdapter;
+
+impl ComputerUseAdapter for FailingComputerUseAdapter {
+    fn preflight(
+        &self,
+        host: &str,
+        provider_intent: &crate::ProviderComputerUseIntent,
+    ) -> Result<AdapterReadiness, SatelleError> {
+        FakeComputerUseAdapter.preflight(host, provider_intent)
+    }
+
+    fn execute(&self, _request: ExecuteRequest<'_>) -> Result<ExecuteResult, SatelleError> {
+        Err(adapter_configuration_error("forced admitted failure"))
+    }
+
+    fn observe_stop(&self, subject: AdapterSubject<'_>) -> Result<StopObservation, SatelleError> {
+        FakeComputerUseAdapter.observe_stop(subject)
+    }
+
+    fn observe_recovery(
+        &self,
+        subject: AdapterSubject<'_>,
+    ) -> Result<RecoveryObservation, SatelleError> {
+        FakeComputerUseAdapter.observe_recovery(subject)
+    }
+}
+
 impl ComputerUseAdapter for PendingComputerUseAdapter {
     fn preflight(
         &self,

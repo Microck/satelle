@@ -77,6 +77,7 @@ fn mcp_failure(message: impl Into<String>) -> CliFailure {
             source_detail: None,
             details: Default::default(),
         },
+        history_session_id: None,
     }
 }
 
@@ -97,9 +98,7 @@ impl SatelleMcp {
     }
 
     fn config(&self) -> ConfigContext<'_> {
-        ConfigContext {
-            flag_profile: self.profile.as_deref(),
-        }
+        ConfigContext::new(self.profile.as_deref())
     }
 
     async fn call(
