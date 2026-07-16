@@ -617,6 +617,33 @@ pub(crate) fn transport_for(host: &SelectedHost) -> Result<Box<dyn TransportClie
     }
 }
 
+pub(crate) fn discover_direct_host_identity(host: &SelectedHost) -> Result<String, SatelleError> {
+    if host.config.transport != TransportKind::Direct {
+        return Err(SatelleError::invalid_usage(
+            "host trust currently requires a direct HTTPS Host Binding",
+        ));
+    }
+    let mut probe_config = host.config.clone();
+    probe_config.expected_host_id = Some(format!("trust-probe-{}", Uuid::now_v7()));
+    let binding = DirectHostBinding::from_host_config(&probe_config)
+        .map_err(|error| SatelleError::config_error(error.to_string(), None))?;
+    let ApiTokenSource::File { path } = binding.api_token();
+    let raw_token = read_owner_only_secret_file(path)
+        .map_err(|error| SatelleError::config_error(error.to_string(), None))?;
+    let token = ApiBearerToken::parse(raw_token.as_str())
+        .map_err(|error| SatelleError::config_error(error.to_string(), None))?;
+    let ca_bundle = binding
+        .ca_bundle()
+        .map(read_trusted_ca_bundle_file)
+        .transpose()
+        .map_err(|error| SatelleError::config_error(error.to_string(), None))?;
+    let client = DaemonClient::https(&binding, token, ca_bundle.as_deref().map(str::as_bytes))
+        .map_err(|error| direct_transport_error(&host.alias, error))?;
+    client
+        .discover_host_identity()
+        .map_err(|error| direct_transport_error(&host.alias, error))
+}
+
 #[cfg(all(test, feature = "test-support"))]
 #[path = "transport-tests.rs"]
 mod tests;

@@ -102,6 +102,39 @@ impl DaemonClient {
         self.send_authenticated(request, request_id, StatusCode::OK)
     }
 
+    /// Discovers the authenticated daemon identity through the normal protected
+    /// request boundary. Callers construct this client with a fresh probe identity,
+    /// so a valid daemon returns its observed identity in the typed mismatch response.
+    pub fn discover_host_identity(&self) -> Result<String, DaemonClientError> {
+        match self.capabilities() {
+            Ok(response) => Ok(response.host_identity().to_string()),
+            Err(DaemonClientError::Api { status: _, error })
+                if error.code() == ApiErrorCode::HostIdentityMismatch =>
+            {
+                let observed = error
+                    .host_identity()
+                    .ok_or(DaemonClientError::ResponseHostIdentityMismatch)?;
+                let details = error
+                    .details()
+                    .and_then(serde_json::Value::as_object)
+                    .ok_or(DaemonClientError::ResponseHostIdentityMismatch)?;
+                if details
+                    .get("expected_host_identity")
+                    .and_then(serde_json::Value::as_str)
+                    != Some(self.expected_host_identity.as_str())
+                    || details
+                        .get("observed_host_identity")
+                        .and_then(serde_json::Value::as_str)
+                        != Some(observed)
+                {
+                    return Err(DaemonClientError::ResponseHostIdentityMismatch);
+                }
+                Ok(observed.to_string())
+            }
+            Err(error) => Err(error),
+        }
+    }
+
     pub fn host_status(&self) -> Result<HostStatusResponse, DaemonClientError> {
         let (request, request_id) = self.protected_request(Method::GET, "/v1/host/status")?;
         self.send_authenticated(request, request_id, StatusCode::OK)
