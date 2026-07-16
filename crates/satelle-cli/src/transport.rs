@@ -84,6 +84,7 @@ pub(crate) trait TransportClient {
         &self,
         scope: Option<&str>,
         options: DoctorOptions,
+        provider_intent: &satelle_host::ProviderComputerUseIntent,
     ) -> Result<DoctorReport, SatelleError>;
     fn host_status(&self) -> Result<HostStatus, SatelleError>;
     fn host_sessions(&self, no_bootstrap: bool) -> Result<HostSessionsReport, SatelleError>;
@@ -141,8 +142,10 @@ impl TransportClient for LocalTransport {
         &self,
         scope: Option<&str>,
         options: DoctorOptions,
+        provider_intent: &satelle_host::ProviderComputerUseIntent,
     ) -> Result<DoctorReport, SatelleError> {
-        self.service.doctor(&self.alias, scope, options)
+        self.service
+            .doctor_with_provider_intent(&self.alias, scope, options, provider_intent)
     }
 
     fn host_status(&self) -> Result<HostStatus, SatelleError> {
@@ -323,6 +326,7 @@ impl TransportClient for DirectTransport {
         &self,
         _scope: Option<&str>,
         _options: DoctorOptions,
+        _provider_intent: &satelle_host::ProviderComputerUseIntent,
     ) -> Result<DoctorReport, SatelleError> {
         Err(self.unsupported("doctor"))
     }

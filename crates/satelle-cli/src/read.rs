@@ -157,7 +157,11 @@ pub(super) fn doctor_for_host(
     scope: Option<&str>,
 ) -> Result<DoctorReport, CliFailure> {
     transport_for(host)?
-        .doctor(scope, DoctorOptions::default())
+        .doctor(
+            scope,
+            DoctorOptions::default(),
+            &satelle_host::ProviderComputerUseIntent::host_default(),
+        )
         .map_err(failure)
 }
 

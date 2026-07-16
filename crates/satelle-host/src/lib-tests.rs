@@ -470,6 +470,47 @@ fn production_doctor_filters_requested_scopes_without_relabeling_blockers() {
     assert!(all.findings.iter().all(|finding| finding.scope != "all"));
 }
 
+#[test]
+fn doctor_provider_refresh_updates_cache_without_admitting_prompt_work() {
+    let state = crate::TestStateDir::new().expect("temporary state directory");
+    let service = HostService::local_demo_for_tests_at(state.path())
+        .expect("construct deterministic Host service");
+    let intent = ProviderComputerUseIntent::new(
+        Some(
+            satelle_core::session::EffectiveModelRef::new("provider-doctor-model")
+                .expect("valid model"),
+        ),
+        Some(
+            satelle_core::session::ProviderBindingRef::new("provider-doctor-binding")
+                .expect("valid provider"),
+        ),
+        true,
+        true,
+    );
+
+    let report = service
+        .doctor_with_provider_intent(
+            LOCAL_DEMO_HOST,
+            Some("provider"),
+            DoctorOptions::new(true, Some(std::time::Duration::from_secs(5))),
+            &intent,
+        )
+        .expect("provider doctor refresh should complete");
+
+    assert!(report.ready);
+    assert!(report.changed);
+    assert_eq!(report.cache_updates, ["provider_smoke"]);
+    assert_eq!(report.probe_results.len(), 1);
+    assert_eq!(report.probe_results[0].probe_id, "provider.smoke.refresh");
+    assert_eq!(report.probe_results[0].cache_status, "refreshed");
+    assert!(
+        report.findings[0]
+            .evidence
+            .contains(&"source=refresh".to_string())
+    );
+    assert_eq!(service.host_status().unwrap().sessions, 0);
+}
+
 fn capability_snapshot(
     evidence: Phase0CapabilityEvidence,
     duration_ms: u64,
