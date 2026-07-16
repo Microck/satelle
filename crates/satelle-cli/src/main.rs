@@ -2760,7 +2760,11 @@ fn print_turn_session(
     outcome: AttachedTurnOutcome,
     options: TurnOutputOptions<'_>,
 ) -> Result<(), CliFailure> {
-    let AttachedTurnOutcome { session, turn_id } = outcome;
+    let AttachedTurnOutcome {
+        session,
+        turn_id,
+        provider_smoke,
+    } = outcome;
     let target_turn = session
         .turns()
         .iter()
@@ -2776,6 +2780,7 @@ fn print_turn_session(
             "session_id": session.session_id(),
             "status": target_turn.state(),
             "effective_timeouts": options.effective_timeouts,
+            "provider_smoke": provider_smoke,
             "yolo": yolo_state_json(options.yolo_policy),
             "latest_turn": target_turn,
         }))

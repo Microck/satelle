@@ -597,6 +597,7 @@ fn stop_winning_before_running_skips_adapter_execution_and_returns_stopped() {
             session,
             subject: recovery_subject,
         },
+        provider_smoke_event: None,
     };
 
     runtime

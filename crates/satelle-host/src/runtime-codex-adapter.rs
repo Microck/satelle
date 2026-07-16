@@ -1,7 +1,8 @@
 use super::adapter::{
     AdapterPreflight, AdapterReadiness, AdapterSubject, ComputerUseAdapter, ExecuteRequest,
     ExecuteResult, ProviderComputerUseIntent, ProviderSmokeEvidence, ProviderSmokeFailureEvidence,
-    ProviderSmokeResult, ReadinessCacheKey, ReadinessEvidence, RecoveryObservation,
+    ProviderSmokeResult, ProviderSmokeSource, ReadinessCacheKey, ReadinessEvidence,
+    RecoveryObservation,
 };
 use crate::codex_session::{
     CodexApprovalPolicy, CodexSandboxPolicy, CodexSessionControl, CodexSessionError,
@@ -22,6 +23,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
+use time::format_description::well_known::Rfc3339;
 
 const DEFAULT_MODEL_BINDING: &str = "codex-default";
 const DEFAULT_PROVIDER_BINDING: &str = "codex-default";
@@ -192,8 +194,9 @@ impl ProductionComputerUseAdapter {
         key: &ReadinessCacheKey,
         evidence: ReadinessEvidence,
         cached_provider: Option<ProviderSmokeResult>,
+        refresh_provider: bool,
     ) -> AdapterPreflight {
-        match self.run_required_provider_smoke(key, cached_provider) {
+        match self.run_required_provider_smoke(key, cached_provider, refresh_provider) {
             Ok(provider_smoke_evidence) => AdapterReadiness::ready(
                 key.adapter(),
                 "native Computer Use passed the Host action-path smoke test",
@@ -228,6 +231,7 @@ impl ProductionComputerUseAdapter {
         &self,
         key: ReadinessCacheKey,
         cached_provider: Option<ProviderSmokeResult>,
+        refresh_provider: bool,
     ) -> AdapterPreflight {
         let observed_at = time::OffsetDateTime::now_utc();
         let Some(expires_at) = observed_at.checked_add(self.native_readiness_ttl) else {
@@ -246,7 +250,9 @@ impl ProductionComputerUseAdapter {
             }
         };
         match self.run_native_smoke(&key) {
-            Ok(()) => self.readiness_from_evidence(&key, evidence, cached_provider),
+            Ok(()) => {
+                self.readiness_from_evidence(&key, evidence, cached_provider, refresh_provider)
+            }
             Err(reason) => AdapterPreflight::Failed {
                 key,
                 evidence,
@@ -306,6 +312,7 @@ impl ProductionComputerUseAdapter {
         &self,
         key: &ReadinessCacheKey,
         cached_provider: Option<ProviderSmokeResult>,
+        refresh: bool,
     ) -> Result<Option<ProviderSmokeEvidence>, ProviderSmokeAttemptFailure> {
         if key
             .execution_policy()
@@ -320,16 +327,18 @@ impl ProductionComputerUseAdapter {
             Some(ProviderSmokeResult::Failed(failure)) => {
                 return Err(ProviderSmokeAttemptFailure {
                     evidence: None,
-                    error: Box::new(provider_smoke_error(
-                        failure.error_code(),
-                        failure.failure_reason(),
-                    )),
+                    error: Box::new(provider_smoke_error_from_failure(&failure)),
                 });
             }
             None => {}
         }
 
-        self.run_live_provider_smoke(key)
+        let source = if refresh {
+            ProviderSmokeSource::Refresh
+        } else {
+            ProviderSmokeSource::Live
+        };
+        self.run_live_provider_smoke(key, source)
             .map(Some)
             .map_err(|error| {
                 let observed_at = time::OffsetDateTime::now_utc();
@@ -348,8 +357,18 @@ impl ProductionComputerUseAdapter {
                             observed_at,
                             expires_at,
                         )
+                        .map(|evidence| evidence.with_source(source))
                         .ok()
                     });
+                let error = match evidence.as_ref() {
+                    Some(evidence) => annotate_provider_smoke_error(
+                        error,
+                        evidence.source(),
+                        evidence.observed_at(),
+                        evidence.expires_at(),
+                    ),
+                    None => error,
+                };
                 ProviderSmokeAttemptFailure {
                     evidence,
                     error: Box::new(error),
@@ -360,6 +379,7 @@ impl ProductionComputerUseAdapter {
     fn run_live_provider_smoke(
         &self,
         key: &ReadinessCacheKey,
+        source: ProviderSmokeSource,
     ) -> Result<ProviderSmokeEvidence, SatelleError> {
         let probe = crate::provider_probe::ProviderProbeSurface::start(self.provider_smoke_timeout)
             .map_err(provider_smoke_failure)?;
@@ -416,6 +436,7 @@ impl ProductionComputerUseAdapter {
             observed_at,
             expires_at,
         )
+        .map(|evidence| evidence.with_source(source))
         .map_err(|_| adapter_failure("provider_smoke_evidence_invalid"))
     }
 
@@ -707,6 +728,54 @@ fn provider_smoke_error(code: ErrorCode, reason: &str) -> SatelleError {
     }
 }
 
+fn provider_smoke_error_from_failure(failure: &ProviderSmokeFailureEvidence) -> SatelleError {
+    annotate_provider_smoke_error(
+        provider_smoke_error(failure.error_code(), failure.failure_reason()),
+        failure.source(),
+        failure.observed_at(),
+        failure.expires_at(),
+    )
+}
+
+fn annotate_provider_smoke_error(
+    mut error: SatelleError,
+    source: ProviderSmokeSource,
+    observed_at: time::OffsetDateTime,
+    expires_at: time::OffsetDateTime,
+) -> SatelleError {
+    let age_ms = (time::OffsetDateTime::now_utc() - observed_at)
+        .whole_milliseconds()
+        .clamp(0, i128::from(u64::MAX)) as u64;
+    error.details.extend([
+        (
+            "provider_smoke_status".to_string(),
+            Value::String("failed".to_string()),
+        ),
+        (
+            "provider_smoke_source".to_string(),
+            Value::String(source.as_str().to_string()),
+        ),
+        (
+            "provider_smoke_observed_at".to_string(),
+            Value::String(
+                observed_at
+                    .format(&Rfc3339)
+                    .expect("provider evidence timestamp is RFC 3339 representable"),
+            ),
+        ),
+        (
+            "provider_smoke_expires_at".to_string(),
+            Value::String(
+                expires_at
+                    .format(&Rfc3339)
+                    .expect("provider evidence expiry is RFC 3339 representable"),
+            ),
+        ),
+        ("provider_smoke_age_ms".to_string(), Value::from(age_ms)),
+    ]);
+    error
+}
+
 impl ComputerUseAdapter for ProductionComputerUseAdapter {
     fn admit_operation(&self, operation: ControlPlaneOperation) -> Result<(), SatelleError> {
         crate::read_production_snapshot(&self.snapshot)?
@@ -749,8 +818,13 @@ impl ComputerUseAdapter for ProductionComputerUseAdapter {
         let cached_provider =
             provider_cache_for_preflight(cached_provider, provider_intent.refresh());
         match cached {
-            Some(evidence) => self.readiness_from_evidence(&key, evidence, cached_provider),
-            None => self.live_native_preflight(key, cached_provider),
+            Some(evidence) => self.readiness_from_evidence(
+                &key,
+                evidence,
+                cached_provider,
+                provider_intent.refresh(),
+            ),
+            None => self.live_native_preflight(key, cached_provider, provider_intent.refresh()),
         }
     }
 
@@ -1128,13 +1202,15 @@ mod tests {
             observed_at,
             observed_at + time::Duration::hours(24),
         )
-        .unwrap();
+        .unwrap()
+        .with_source(ProviderSmokeSource::Cache);
 
         assert_eq!(
             adapter
                 .run_required_provider_smoke(
                     &key,
                     Some(ProviderSmokeResult::Passed(provider.clone())),
+                    false,
                 )
                 .unwrap(),
             Some(provider)
@@ -1148,11 +1224,13 @@ mod tests {
             observed_at,
             observed_at + adapter.provider_smoke_failure_ttl,
         )
-        .unwrap();
+        .unwrap()
+        .with_source(ProviderSmokeSource::Cache);
         let cached_failure = adapter
             .run_required_provider_smoke(
                 &key,
                 Some(ProviderSmokeResult::Failed(provider_failure.clone())),
+                false,
             )
             .expect_err("a cached provider failure remains a preflight blocker");
         assert!(cached_failure.evidence.is_none());
@@ -1160,6 +1238,17 @@ mod tests {
             cached_failure.error.code,
             ErrorCode::UnsupportedProviderComputerUse
         );
+        assert_eq!(
+            cached_failure.error.details["provider_smoke_source"],
+            "cache"
+        );
+        assert_eq!(
+            cached_failure.error.details["provider_smoke_status"],
+            "failed"
+        );
+        assert!(cached_failure.error.details["provider_smoke_observed_at"].is_string());
+        assert!(cached_failure.error.details["provider_smoke_expires_at"].is_string());
+        assert!(cached_failure.error.details["provider_smoke_age_ms"].is_u64());
 
         let refreshed_pass = ProviderSmokeResult::Passed(
             ProviderSmokeEvidence::new(

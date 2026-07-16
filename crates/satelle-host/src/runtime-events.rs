@@ -1,7 +1,8 @@
-use super::RuntimeEngine;
+use super::{AdapterReadiness, RuntimeEngine};
 use satelle_core::session::{Session, TurnState};
 use satelle_core::{EventSource, EventSubject, EventType, SatelleEventBody, TurnId};
 use serde_json::json;
+use time::format_description::well_known::Rfc3339;
 
 impl RuntimeEngine {
     /// Publishes one live observation of state that SQLite has already
@@ -28,6 +29,49 @@ impl RuntimeEngine {
         )
         .expect("a committed Session produces a valid safe lifecycle event");
         self.live_events.publish(event);
+    }
+
+    /// Publishes normalized provider preflight provenance without exposing the
+    /// provider fingerprint, prompt, transcript, or desktop content.
+    pub(super) fn publish_provider_smoke(
+        &self,
+        readiness: &AdapterReadiness,
+        session: &Session,
+        turn_id: &TurnId,
+    ) -> Option<SatelleEventBody> {
+        let evidence = readiness.provider_smoke_evidence()?;
+        let turn = session
+            .turn(turn_id)
+            .expect("an admitted provider preflight retains its Turn");
+        let now = time::OffsetDateTime::now_utc();
+        let age_ms = (now - evidence.observed_at())
+            .whole_milliseconds()
+            .clamp(0, i128::from(u64::MAX)) as u64;
+        let event = SatelleEventBody::new(
+            EventType::ProviderSmoke,
+            EventSource::HostDaemon,
+            now,
+            session.host_identity().as_str(),
+            Some(EventSubject::Turn {
+                session_id: session.id().clone(),
+                turn_id: turn_id.clone(),
+                session_state_revision: session.session_state_revision(),
+                turn_state_revision: turn.turn_state_revision(),
+            }),
+            "provider Computer Use preflight passed",
+            json!({
+                "status": "passed",
+                "source": evidence.source().as_str(),
+                "observed_at": evidence.observed_at().format(&Rfc3339)
+                    .expect("provider evidence timestamp is RFC 3339 representable"),
+                "expires_at": evidence.expires_at().format(&Rfc3339)
+                    .expect("provider evidence expiry is RFC 3339 representable"),
+                "age_ms": age_ms,
+            }),
+        )
+        .expect("typed provider evidence produces a valid safe preflight event");
+        self.live_events.publish(event.clone());
+        Some(event)
     }
 }
 

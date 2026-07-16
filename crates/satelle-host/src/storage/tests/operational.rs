@@ -373,7 +373,11 @@ fn readiness_and_provider_results_round_trip_without_raw_evidence() {
             .is_none()
     );
     assert_eq!(
-        Some(ProviderSmokeResult::Passed(provider.clone())),
+        Some(ProviderSmokeResult::Passed(
+            provider
+                .clone()
+                .with_source(crate::ProviderSmokeSource::Cache),
+        )),
         storage
             .load_reusable_provider_smoke(&cache_key, observed_at)
             .expect("matching provider smoke is reusable before expiry")
@@ -439,7 +443,11 @@ fn readiness_and_provider_results_round_trip_without_raw_evidence() {
         .store_provider_smoke_failure(&cache_key, &failure_readiness, &provider_failure)
         .expect("store normalized provider failure");
     assert_eq!(
-        Some(ProviderSmokeResult::Failed(provider_failure.clone())),
+        Some(ProviderSmokeResult::Failed(
+            provider_failure
+                .clone()
+                .with_source(crate::ProviderSmokeSource::Cache),
+        )),
         storage
             .load_reusable_provider_smoke(&cache_key, failure_observed_at)
             .expect("matching provider failure is reusable before expiry")

@@ -193,15 +193,23 @@ impl DirectTransport {
         let mut highest_event_revision: Option<TurnStateRevision> = None;
         let mut previous_stream_sequence = 0_u64;
         let mut reconnect_attempts = 0_usize;
+        let mut provider_smoke = None;
 
         loop {
             match stream.next_event().await {
                 Ok(event) => {
                     reconnect_attempts = 0;
+                    if event.event_type() == satelle_core::EventType::ProviderSmoke {
+                        provider_smoke = Some(event.data().clone());
+                    }
                     let sequence_gap = previous_stream_sequence != 0
                         && event.seq() > previous_stream_sequence.saturating_add(1);
                     previous_stream_sequence = event.seq();
                     let event_revision = target_event_revision(&event, &session_id, &turn_id);
+                    if event.event_type() == satelle_core::EventType::ProviderSmoke {
+                        on_event(event)?;
+                        continue;
+                    }
                     if sequence_gap {
                         let minimum_revision = match (highest_event_revision, event_revision) {
                             (Some(highest), Some(current)) => Some(highest.max(current)),
@@ -220,11 +228,19 @@ impl DirectTransport {
                                 }
                                 on_event(event)?;
                                 if terminal {
-                                    return Ok(AttachedTurnOutcome { session, turn_id });
+                                    return Ok(AttachedTurnOutcome {
+                                        session,
+                                        turn_id,
+                                        provider_smoke,
+                                    });
                                 }
                             }
                             on_event(self.reconciled_terminal_event(&session, &turn_id)?)?;
-                            return Ok(AttachedTurnOutcome { session, turn_id });
+                            return Ok(AttachedTurnOutcome {
+                                session,
+                                turn_id,
+                                provider_smoke,
+                            });
                         }
                     }
                     let Some(revision) = event_revision else {
@@ -242,7 +258,11 @@ impl DirectTransport {
                             .ok_or_else(|| self.invalid_response())?;
                         self.validate_terminal_event(&event, &session, &turn_id)?;
                         on_event(event)?;
-                        return Ok(AttachedTurnOutcome { session, turn_id });
+                        return Ok(AttachedTurnOutcome {
+                            session,
+                            turn_id,
+                            provider_smoke,
+                        });
                     }
                     on_event(event)?;
                 }
@@ -278,7 +298,11 @@ impl DirectTransport {
                                     .await?
                                 {
                                     on_event(self.reconciled_terminal_event(&session, &turn_id)?)?;
-                                    return Ok(AttachedTurnOutcome { session, turn_id });
+                                    return Ok(AttachedTurnOutcome {
+                                        session,
+                                        turn_id,
+                                        provider_smoke,
+                                    });
                                 }
                                 break;
                             }
@@ -295,7 +319,11 @@ impl DirectTransport {
                                         on_event(
                                             self.reconciled_terminal_event(&session, &turn_id)?,
                                         )?;
-                                        return Ok(AttachedTurnOutcome { session, turn_id });
+                                        return Ok(AttachedTurnOutcome {
+                                            session,
+                                            turn_id,
+                                            provider_smoke,
+                                        });
                                     }
                                     Ok(None) => {}
                                     Err(error)

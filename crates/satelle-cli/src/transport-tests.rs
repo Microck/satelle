@@ -412,9 +412,14 @@ fn direct_attached_run_and_steer_follow_committed_host_events() {
             .collect::<Vec<_>>(),
         [
             EventType::TurnStarted,
+            EventType::ProviderSmoke,
             EventType::TurnProgress,
             EventType::TurnCompleted,
         ]
+    );
+    assert_eq!(
+        run_outcome.provider_smoke.as_ref().unwrap()["source"],
+        "live"
     );
     assert_eq!(
         run.turns().last().map(|turn| turn.state()),
@@ -493,9 +498,14 @@ fn direct_attached_run_and_steer_follow_committed_host_events() {
             .collect::<Vec<_>>(),
         [
             EventType::TurnStarted,
+            EventType::ProviderSmoke,
             EventType::TurnProgress,
             EventType::TurnCompleted,
         ]
+    );
+    assert_eq!(
+        steer_outcome.provider_smoke.as_ref().unwrap()["source"],
+        "live"
     );
     assert!(steer_events.iter().all(|event| {
         event.session_id() == Some(steer.session_id())

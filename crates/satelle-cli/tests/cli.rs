@@ -499,6 +499,16 @@ fn runtime_surfaces_and_persisted_state_do_not_retain_prompts_or_upstream_ids() 
     );
     let run_report = parse_json_output(&run_output.stdout);
     assert_eq!(run_report["schema_version"], "satelle.run.v2");
+    assert_eq!(run_report["provider_smoke"]["status"], "passed");
+    assert_eq!(run_report["provider_smoke"]["source"], "live");
+    assert!(run_report["provider_smoke"]["observed_at"].is_string());
+    assert!(run_report["provider_smoke"]["expires_at"].is_string());
+    assert!(run_report["provider_smoke"]["age_ms"].is_u64());
+    assert!(
+        run_report["provider_smoke"]
+            .get("provider_config_fingerprint")
+            .is_none()
+    );
     let session = run_report["session_id"].as_str().unwrap().to_string();
 
     let steer_secret = "sk-satelle-steer-private-canary";
@@ -508,7 +518,13 @@ fn runtime_surfaces_and_persisted_state_do_not_retain_prompts_or_upstream_ids() 
         format!("{steer_prompt_canary} secret={steer_secret} upstream={steer_upstream_id}");
     let steer_output = satelle()
         .env("SATELLE_STATE_DIR", state.path())
-        .args(["steer", &session, "--json", &steer_prompt])
+        .args([
+            "steer",
+            &session,
+            "--refresh-provider-smoke-test",
+            "--json",
+            &steer_prompt,
+        ])
         .assert()
         .success()
         .get_output()
@@ -517,6 +533,9 @@ fn runtime_surfaces_and_persisted_state_do_not_retain_prompts_or_upstream_ids() 
         &steer_output,
         &[steer_prompt_canary, steer_secret, steer_upstream_id],
     );
+    let steer_report = parse_json_output(&steer_output.stdout);
+    assert_eq!(steer_report["provider_smoke"]["status"], "passed");
+    assert_eq!(steer_report["provider_smoke"]["source"], "refresh");
 
     let status_output = satelle()
         .env("SATELLE_STATE_DIR", state.path())

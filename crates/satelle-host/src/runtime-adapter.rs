@@ -121,6 +121,7 @@ impl EvidenceWindow {
 pub struct ProviderSmokeEvidence {
     window: EvidenceWindow,
     provider_config_fingerprint: String,
+    source: ProviderSmokeSource,
 }
 
 impl ProviderSmokeEvidence {
@@ -133,7 +134,13 @@ impl ProviderSmokeEvidence {
         Ok(Self {
             window: EvidenceWindow::new(result_id, observed_at, expires_at)?,
             provider_config_fingerprint: fingerprint(provider_config_fingerprint)?,
+            source: ProviderSmokeSource::Live,
         })
+    }
+
+    pub(crate) const fn with_source(mut self, source: ProviderSmokeSource) -> Self {
+        self.source = source;
+        self
     }
 
     pub(crate) fn result_id(&self) -> &str {
@@ -150,6 +157,10 @@ impl ProviderSmokeEvidence {
 
     pub(crate) const fn expires_at(&self) -> time::OffsetDateTime {
         self.window.expires_at
+    }
+
+    pub(crate) const fn source(&self) -> ProviderSmokeSource {
+        self.source
     }
 }
 
@@ -170,6 +181,7 @@ pub struct ProviderSmokeFailureEvidence {
     provider_config_fingerprint: String,
     error_code: ErrorCode,
     failure_reason: String,
+    source: ProviderSmokeSource,
 }
 
 impl ProviderSmokeFailureEvidence {
@@ -186,7 +198,13 @@ impl ProviderSmokeFailureEvidence {
             provider_config_fingerprint: fingerprint(provider_config_fingerprint)?,
             error_code,
             failure_reason: normalized_identifier(failure_reason)?,
+            source: ProviderSmokeSource::Live,
         })
+    }
+
+    pub(crate) const fn with_source(mut self, source: ProviderSmokeSource) -> Self {
+        self.source = source;
+        self
     }
 
     pub(crate) fn result_id(&self) -> &str {
@@ -212,6 +230,10 @@ impl ProviderSmokeFailureEvidence {
     pub(crate) const fn expires_at(&self) -> time::OffsetDateTime {
         self.window.expires_at
     }
+
+    pub(crate) const fn source(&self) -> ProviderSmokeSource {
+        self.source
+    }
 }
 
 impl std::fmt::Debug for ProviderSmokeFailureEvidence {
@@ -228,6 +250,23 @@ impl std::fmt::Debug for ProviderSmokeFailureEvidence {
 pub enum ProviderSmokeResult {
     Passed(ProviderSmokeEvidence),
     Failed(ProviderSmokeFailureEvidence),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ProviderSmokeSource {
+    Cache,
+    Live,
+    Refresh,
+}
+
+impl ProviderSmokeSource {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Cache => "cache",
+            Self::Live => "live",
+            Self::Refresh => "refresh",
+        }
+    }
 }
 
 /// Versioned evidence observed by a successful live readiness probe.

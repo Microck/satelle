@@ -4,7 +4,7 @@ mod diagnostics;
 use crate::HostService;
 use crate::runtime::{
     AdapterReadiness, AdapterSubject, ComputerUseAdapter, ExecuteRequest, ExecuteResult,
-    ProviderSmokeEvidence, ReadinessEvidence, RecoveryObservation,
+    ProviderSmokeEvidence, ProviderSmokeSource, ReadinessEvidence, RecoveryObservation,
 };
 use satelle_core::session::{
     ApprovalPolicy, DesktopBindingRef, DesktopTarget, EffectiveModelRef, ExecutionPolicy,
@@ -101,7 +101,7 @@ impl ComputerUseAdapter for FakeComputerUseAdapter {
     fn preflight(
         &self,
         _host: &str,
-        _provider_intent: &crate::ProviderComputerUseIntent,
+        provider_intent: &crate::ProviderComputerUseIntent,
     ) -> Result<AdapterReadiness, SatelleError> {
         let desktop_binding = DesktopBindingRef::new("local-demo-desktop-v1")
             .map_err(|_| adapter_configuration_error("desktop binding"))?;
@@ -135,7 +135,12 @@ impl ComputerUseAdapter for FakeComputerUseAdapter {
             observed_at,
             observed_at + time::Duration::hours(24),
         )
-        .map_err(|_| adapter_configuration_error("provider smoke evidence"))?;
+        .map_err(|_| adapter_configuration_error("provider smoke evidence"))?
+        .with_source(if provider_intent.refresh() {
+            ProviderSmokeSource::Refresh
+        } else {
+            ProviderSmokeSource::Live
+        });
         AdapterReadiness::ready(
             "fake",
             "fake native computer-use adapter is ready for local demo",

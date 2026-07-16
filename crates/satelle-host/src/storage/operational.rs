@@ -1,8 +1,8 @@
 use super::codec::unix_timestamp_nanos;
 use super::{Storage, StorageError, StorageErrorKind};
 use crate::{
-    ProviderSmokeEvidence, ProviderSmokeFailureEvidence, ProviderSmokeResult, ReadinessCacheKey,
-    ReadinessEvidence,
+    ProviderSmokeEvidence, ProviderSmokeFailureEvidence, ProviderSmokeResult, ProviderSmokeSource,
+    ReadinessCacheKey, ReadinessEvidence,
 };
 use rusqlite::{OptionalExtension, TransactionBehavior, params};
 use satelle_core::session::{DesktopBindingRef, ExecutionPolicy};
@@ -230,6 +230,7 @@ impl Storage {
                         observed_at,
                         expires_at,
                     )
+                    .map(|evidence| evidence.with_source(ProviderSmokeSource::Cache))
                     .map(ProviderSmokeResult::Passed)
                     .map_err(|_| StorageError::new(StorageErrorKind::InvalidStoredState)),
                     ("failed", Some(error_code), Some(failure_reason)) => {
@@ -245,6 +246,7 @@ impl Storage {
                             observed_at,
                             expires_at,
                         )
+                        .map(|evidence| evidence.with_source(ProviderSmokeSource::Cache))
                         .map(ProviderSmokeResult::Failed)
                         .map_err(|_| StorageError::new(StorageErrorKind::InvalidStoredState))
                     }
