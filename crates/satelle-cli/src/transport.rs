@@ -406,8 +406,12 @@ fn ssh_transport(host: &SelectedHost) -> Result<DirectTransport, SatelleError> {
         .map_err(|error| SatelleError::config_error(error.to_string(), None))?;
     let event_token = ApiBearerToken::parse(raw_token.as_str())
         .map_err(|error| SatelleError::config_error(error.to_string(), None))?;
-    let tunnel = SshTunnel::open(binding.destination())
-        .map_err(|_| SatelleError::host_unreachable(&host.alias))?;
+    let tunnel = SshTunnel::open(binding.destination()).map_err(|error| match error {
+        ssh_tunnel::SshTunnelError::HostKeyVerificationRequired => {
+            SatelleError::ssh_host_key_verification_required(&host.alias)
+        }
+        _ => SatelleError::host_unreachable(&host.alias),
+    })?;
     let expected_host_identity = binding.expected_host_identity().to_string();
     let client = Arc::new(
         DaemonClient::loopback_with_timeout(

@@ -197,7 +197,8 @@ fn failure(error: &SatelleError) -> ApiFailure {
         | ErrorCode::HostIdentityMismatch
         // This is a Controller-local reachability error. If it ever reaches
         // the Host boundary, fail closed instead of inventing a wire code.
-        | ErrorCode::DirectDaemonUnreachable => ApiFailure {
+        | ErrorCode::DirectDaemonUnreachable
+        | ErrorCode::SshHostKeyVerificationRequired => ApiFailure {
             status: StatusCode::INTERNAL_SERVER_ERROR,
             code: ApiErrorCode::InternalError,
             category: ApiErrorCategory::Internal,

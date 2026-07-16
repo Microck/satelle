@@ -149,6 +149,7 @@ fn error_class(code: ErrorCode) -> (ErrorCategory, bool) {
         ErrorCode::HostUnreachable
         | ErrorCode::DirectDaemonUnreachable
         | ErrorCode::RemoteExecution => (ErrorCategory::RemoteExecution, true),
+        ErrorCode::SshHostKeyVerificationRequired => (ErrorCategory::RemoteExecution, false),
         ErrorCode::CapacityExceeded | ErrorCode::ConcurrencyLimitExceeded => {
             (ErrorCategory::Capacity, true)
         }
