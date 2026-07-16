@@ -319,9 +319,20 @@ fn readiness_and_provider_results_round_trip_without_raw_evidence() {
         expires_at,
     )
     .unwrap();
+    let cache_key = ReadinessCacheKey::new(
+        "codex-native-computer-use",
+        desktop.clone(),
+        policy.clone(),
+        "0.144.0",
+        "1.0.0",
+        Some("plugin-1.0.0"),
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    )
+    .unwrap();
     let provider = ProviderSmokeEvidence::new(
         "provider-smoke-1",
-        "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+        cache_key.provider_config_fingerprint(),
         observed_at,
         expires_at,
     )
@@ -344,17 +355,6 @@ fn readiness_and_provider_results_round_trip_without_raw_evidence() {
             Some(&provider),
         )
         .expect("replaying identical evidence is idempotent");
-    let cache_key = ReadinessCacheKey::new(
-        "codex-native-computer-use",
-        desktop.clone(),
-        policy.clone(),
-        "0.144.0",
-        "1.0.0",
-        Some("plugin-1.0.0"),
-        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-        "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
-    )
-    .unwrap();
     assert_eq!(
         Some(readiness.clone()),
         storage
@@ -365,6 +365,18 @@ fn readiness_and_provider_results_round_trip_without_raw_evidence() {
         storage
             .load_reusable_readiness(&cache_key, expires_at)
             .expect("expiry lookup")
+            .is_none()
+    );
+    assert_eq!(
+        Some(provider.clone()),
+        storage
+            .load_reusable_provider_smoke(&cache_key, observed_at)
+            .expect("matching provider smoke is reusable before expiry")
+    );
+    assert!(
+        storage
+            .load_reusable_provider_smoke(&cache_key, expires_at)
+            .expect("provider expiry lookup")
             .is_none()
     );
 
@@ -381,7 +393,7 @@ fn readiness_and_provider_results_round_trip_without_raw_evidence() {
     .unwrap();
     let conflicting_provider = ProviderSmokeEvidence::new(
         "provider-smoke-1",
-        "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+        cache_key.provider_config_fingerprint(),
         observed_at,
         expires_at + time::Duration::minutes(1),
     )

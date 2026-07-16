@@ -550,7 +550,10 @@ fn stop_winning_before_running_skips_adapter_execution_and_returns_stopped() {
     );
     let engine = runtime.engine().expect("open runtime storage");
     let readiness = FakeComputerUseAdapter
-        .preflight(LOCAL_DEMO_HOST)
+        .preflight(
+            LOCAL_DEMO_HOST,
+            &crate::ProviderComputerUseIntent::host_default(),
+        )
         .expect("fake adapter should be ready");
     let session_id = satelle_core::SessionId::new();
     let turn_id = satelle_core::TurnId::new();
@@ -615,9 +618,13 @@ struct PreflightCountingAdapter {
 }
 
 impl ComputerUseAdapter for PreflightCountingAdapter {
-    fn preflight(&self, host: &str) -> Result<super::super::AdapterReadiness, SatelleError> {
+    fn preflight(
+        &self,
+        host: &str,
+        provider_intent: &crate::ProviderComputerUseIntent,
+    ) -> Result<super::super::AdapterReadiness, SatelleError> {
         self.preflight_calls.fetch_add(1, Ordering::SeqCst);
-        FakeComputerUseAdapter.preflight(host)
+        FakeComputerUseAdapter.preflight(host, provider_intent)
     }
 
     fn execute(
@@ -651,8 +658,12 @@ struct BlockOnThirdExecutionAdapter {
 }
 
 impl ComputerUseAdapter for BlockOnThirdExecutionAdapter {
-    fn preflight(&self, host: &str) -> Result<super::super::AdapterReadiness, SatelleError> {
-        FakeComputerUseAdapter.preflight(host)
+    fn preflight(
+        &self,
+        host: &str,
+        provider_intent: &crate::ProviderComputerUseIntent,
+    ) -> Result<super::super::AdapterReadiness, SatelleError> {
+        FakeComputerUseAdapter.preflight(host, provider_intent)
     }
 
     fn execute(
@@ -686,8 +697,12 @@ impl ComputerUseAdapter for BlockOnThirdExecutionAdapter {
 struct RunningRecoveryAdapter;
 
 impl ComputerUseAdapter for RunningRecoveryAdapter {
-    fn preflight(&self, host: &str) -> Result<super::super::AdapterReadiness, SatelleError> {
-        FakeComputerUseAdapter.preflight(host)
+    fn preflight(
+        &self,
+        host: &str,
+        provider_intent: &crate::ProviderComputerUseIntent,
+    ) -> Result<super::super::AdapterReadiness, SatelleError> {
+        FakeComputerUseAdapter.preflight(host, provider_intent)
     }
 
     fn execute(
@@ -752,8 +767,12 @@ impl SubjectBlockingAdapter {
 }
 
 impl ComputerUseAdapter for SubjectBlockingAdapter {
-    fn preflight(&self, host: &str) -> Result<super::super::AdapterReadiness, SatelleError> {
-        FakeComputerUseAdapter.preflight(host)
+    fn preflight(
+        &self,
+        host: &str,
+        provider_intent: &crate::ProviderComputerUseIntent,
+    ) -> Result<super::super::AdapterReadiness, SatelleError> {
+        FakeComputerUseAdapter.preflight(host, provider_intent)
     }
 
     fn execute(
@@ -809,8 +828,12 @@ struct FailFirstStopAdapter {
 }
 
 impl ComputerUseAdapter for FailFirstStopAdapter {
-    fn preflight(&self, host: &str) -> Result<super::super::AdapterReadiness, SatelleError> {
-        FakeComputerUseAdapter.preflight(host)
+    fn preflight(
+        &self,
+        host: &str,
+        provider_intent: &crate::ProviderComputerUseIntent,
+    ) -> Result<super::super::AdapterReadiness, SatelleError> {
+        FakeComputerUseAdapter.preflight(host, provider_intent)
     }
 
     fn execute(
@@ -852,10 +875,14 @@ impl Clone for CloneDistinguishingAdapter {
 }
 
 impl ComputerUseAdapter for CloneDistinguishingAdapter {
-    fn preflight(&self, host: &str) -> Result<super::super::AdapterReadiness, SatelleError> {
+    fn preflight(
+        &self,
+        host: &str,
+        provider_intent: &crate::ProviderComputerUseIntent,
+    ) -> Result<super::super::AdapterReadiness, SatelleError> {
         self.preflight_instance
             .store(self.instance, Ordering::SeqCst);
-        FakeComputerUseAdapter.preflight(host)
+        FakeComputerUseAdapter.preflight(host, provider_intent)
     }
 
     fn execute(
@@ -886,8 +913,12 @@ impl ComputerUseAdapter for CloneDistinguishingAdapter {
 }
 
 impl ComputerUseAdapter for StillActiveStopAdapter {
-    fn preflight(&self, host: &str) -> Result<super::super::AdapterReadiness, SatelleError> {
-        FakeComputerUseAdapter.preflight(host)
+    fn preflight(
+        &self,
+        host: &str,
+        provider_intent: &crate::ProviderComputerUseIntent,
+    ) -> Result<super::super::AdapterReadiness, SatelleError> {
+        FakeComputerUseAdapter.preflight(host, provider_intent)
     }
 
     fn execute(

@@ -842,7 +842,11 @@ impl ControlledAdapter {
 }
 
 impl ComputerUseAdapter for ControlledAdapter {
-    fn preflight(&self, host: &str) -> Result<AdapterReadiness, SatelleError> {
+    fn preflight(
+        &self,
+        host: &str,
+        provider_intent: &crate::ProviderComputerUseIntent,
+    ) -> Result<AdapterReadiness, SatelleError> {
         self.preflight_calls.fetch_add(1, Ordering::SeqCst);
         if self.block_preflight.swap(false, Ordering::SeqCst) {
             self.preflight_started.signal();
@@ -851,7 +855,7 @@ impl ComputerUseAdapter for ControlledAdapter {
         if self.fail_next_preflight.swap(false, Ordering::SeqCst) {
             return Err(SatelleError::computer_use_not_ready());
         }
-        FakeComputerUseAdapter.preflight(host)
+        FakeComputerUseAdapter.preflight(host, provider_intent)
     }
 
     fn execute(&self, request: ExecuteRequest<'_>) -> Result<ExecuteResult, SatelleError> {

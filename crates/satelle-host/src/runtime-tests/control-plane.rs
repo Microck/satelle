@@ -343,8 +343,12 @@ impl ComputerUseAdapter for CountingAdapter {
         self.inner.admit_operation(operation)
     }
 
-    fn preflight(&self, host: &str) -> Result<AdapterReadiness, SatelleError> {
-        self.inner.preflight(host)
+    fn preflight(
+        &self,
+        host: &str,
+        provider_intent: &crate::ProviderComputerUseIntent,
+    ) -> Result<AdapterReadiness, SatelleError> {
+        self.inner.preflight(host, provider_intent)
     }
 
     fn execute(&self, request: ExecuteRequest<'_>) -> Result<ExecuteResult, SatelleError> {
@@ -397,9 +401,13 @@ impl ComputerUseAdapter for RejectingAdmissionAdapter {
         Err(SatelleError::incompatible_control_plane(details))
     }
 
-    fn preflight(&self, host: &str) -> Result<AdapterReadiness, SatelleError> {
+    fn preflight(
+        &self,
+        host: &str,
+        provider_intent: &crate::ProviderComputerUseIntent,
+    ) -> Result<AdapterReadiness, SatelleError> {
         self.preflight_calls.fetch_add(1, Ordering::SeqCst);
-        FakeComputerUseAdapter.preflight(host)
+        FakeComputerUseAdapter.preflight(host, provider_intent)
     }
 
     fn execute(&self, request: ExecuteRequest<'_>) -> Result<ExecuteResult, SatelleError> {
@@ -455,8 +463,12 @@ impl ComputerUseAdapter for PendingStopAdmissionAdapter {
         Err(SatelleError::incompatible_control_plane(details))
     }
 
-    fn preflight(&self, host: &str) -> Result<AdapterReadiness, SatelleError> {
-        FakeComputerUseAdapter.preflight(host)
+    fn preflight(
+        &self,
+        host: &str,
+        provider_intent: &crate::ProviderComputerUseIntent,
+    ) -> Result<AdapterReadiness, SatelleError> {
+        FakeComputerUseAdapter.preflight(host, provider_intent)
     }
 
     fn execute(&self, _request: ExecuteRequest<'_>) -> Result<ExecuteResult, SatelleError> {
@@ -501,8 +513,12 @@ impl ComputerUseAdapter for RejectingActiveStopAdapter {
         Err(SatelleError::incompatible_control_plane(details))
     }
 
-    fn preflight(&self, host: &str) -> Result<AdapterReadiness, SatelleError> {
-        FakeComputerUseAdapter.preflight(host)
+    fn preflight(
+        &self,
+        host: &str,
+        provider_intent: &crate::ProviderComputerUseIntent,
+    ) -> Result<AdapterReadiness, SatelleError> {
+        FakeComputerUseAdapter.preflight(host, provider_intent)
     }
 
     fn execute(&self, request: ExecuteRequest<'_>) -> Result<ExecuteResult, SatelleError> {

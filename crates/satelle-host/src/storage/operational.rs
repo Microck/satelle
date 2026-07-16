@@ -120,6 +120,71 @@ impl Storage {
         })
         .transpose()
     }
+
+    /// Returns provider evidence only for the exact unexpired provider,
+    /// model, Codex, native runtime, and provider-configuration tuple.
+    pub(crate) fn load_reusable_provider_smoke(
+        &self,
+        key: &ReadinessCacheKey,
+        now: time::OffsetDateTime,
+    ) -> Result<Option<ProviderSmokeEvidence>, StorageError> {
+        let host_identity = self.host_identity()?;
+        let row = self
+            .connection
+            .query_row(
+                "SELECT result_id, provider_config_fingerprint, observed_at, expires_at
+                 FROM provider_smoke_successes
+                 WHERE host_identity_ref = ?1
+                   AND desktop_binding_ref = ?2
+                   AND provider_binding_ref = ?3
+                   AND effective_model_ref = ?4
+                   AND codex_version = ?5
+                   AND native_runtime_version = ?6
+                   AND provider_config_fingerprint = ?7
+                   AND observed_at <= ?8
+                   AND expires_at > ?8
+                 ORDER BY observed_at DESC
+                 LIMIT 1",
+                params![
+                    host_identity.as_str(),
+                    key.desktop_binding().as_str(),
+                    key.execution_policy().provider_binding().as_str(),
+                    key.execution_policy().effective_model().as_str(),
+                    key.codex_version(),
+                    key.native_runtime_version(),
+                    key.provider_config_fingerprint(),
+                    unix_timestamp_nanos(now)?,
+                ],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, i64>(3)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(operation_failed)?;
+        row.map(
+            |(result_id, provider_config_fingerprint, observed_at, expires_at)| {
+                let observed_at =
+                    time::OffsetDateTime::from_unix_timestamp_nanos(i128::from(observed_at))
+                        .map_err(|_| StorageError::new(StorageErrorKind::InvalidStoredState))?;
+                let expires_at =
+                    time::OffsetDateTime::from_unix_timestamp_nanos(i128::from(expires_at))
+                        .map_err(|_| StorageError::new(StorageErrorKind::InvalidStoredState))?;
+                ProviderSmokeEvidence::new(
+                    result_id,
+                    provider_config_fingerprint,
+                    observed_at,
+                    expires_at,
+                )
+                .map_err(|_| StorageError::new(StorageErrorKind::InvalidStoredState))
+            },
+        )
+        .transpose()
+    }
 }
 
 fn insert_readiness(

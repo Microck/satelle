@@ -17,8 +17,8 @@ mod worker;
 
 pub use adapter::{
     AdapterPreflight, AdapterReadiness, AdapterSubject, ComputerUseAdapter, EvidenceError,
-    ExecuteRequest, ExecuteResult, ProviderSmokeEvidence, ReadinessCacheKey, ReadinessEvidence,
-    RecoveryObservation,
+    ExecuteRequest, ExecuteResult, ProviderComputerUseIntent, ProviderSmokeEvidence,
+    ReadinessCacheKey, ReadinessEvidence, RecoveryObservation,
 };
 pub(crate) use codex_adapter::ProductionComputerUseAdapter;
 pub(crate) use request::{RequestIdentity, RunCommand, SteerCommand, StopCommand};
@@ -300,18 +300,33 @@ impl RuntimeEngine {
         )
     }
 
-    fn preflight(&self, host: &str) -> Result<AdapterReadiness, SatelleError> {
-        let cache_key = self.adapter.readiness_cache_key(host)?;
-        let cached = cache_key
-            .as_ref()
-            .map(|key| {
-                self.lock_storage()?
-                    .load_reusable_readiness(key, time::OffsetDateTime::now_utc())
-                    .map_err(model::storage_failure)
-            })
-            .transpose()?
-            .flatten();
-        match self.adapter.preflight_terminal(host, cached) {
+    fn preflight(
+        &self,
+        host: &str,
+        provider_intent: &ProviderComputerUseIntent,
+    ) -> Result<AdapterReadiness, SatelleError> {
+        let cache_key = self.adapter.readiness_cache_key(host, provider_intent)?;
+        let (cached, cached_provider) = if let Some(key) = cache_key.as_ref() {
+            let now = time::OffsetDateTime::now_utc();
+            let storage = self.lock_storage()?;
+            let readiness = storage
+                .load_reusable_readiness(key, now)
+                .map_err(model::storage_failure)?;
+            let provider = if provider_intent.experimental() && !provider_intent.refresh() {
+                storage
+                    .load_reusable_provider_smoke(key, now)
+                    .map_err(model::storage_failure)?
+            } else {
+                None
+            };
+            (readiness, provider)
+        } else {
+            (None, None)
+        };
+        match self
+            .adapter
+            .preflight_terminal(host, cached, cached_provider, provider_intent)
+        {
             AdapterPreflight::Ready(readiness) => {
                 self.lock_storage()?
                     .store_preflight_successes(
@@ -340,7 +355,8 @@ impl RuntimeEngine {
     }
 
     fn has_reusable_readiness(&self, host: &str) -> Result<bool, SatelleError> {
-        let key = match self.adapter.readiness_cache_key(host) {
+        let intent = ProviderComputerUseIntent::host_default();
+        let key = match self.adapter.readiness_cache_key(host, &intent) {
             Ok(Some(key)) => key,
             Ok(None) => return Ok(false),
             Err(error)
@@ -583,7 +599,7 @@ impl RuntimeHandle {
                 error,
             );
         }
-        let readiness = match engine.preflight(command.host) {
+        let readiness = match engine.preflight(command.host, &command.provider_intent) {
             Ok(readiness) => readiness,
             Err(error) => {
                 return self.resolve_precommit_failure(
@@ -663,7 +679,7 @@ impl RuntimeHandle {
                 error,
             );
         }
-        let readiness = match engine.preflight(LOCAL_DEMO_HOST) {
+        let readiness = match engine.preflight(LOCAL_DEMO_HOST, &command.provider_intent) {
             Ok(readiness) => readiness,
             Err(error) => {
                 return self.resolve_precommit_failure(

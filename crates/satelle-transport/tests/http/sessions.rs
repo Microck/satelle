@@ -588,6 +588,44 @@ async fn mutation_validation_fails_before_execution_with_typed_errors() {
         .expect("send empty prompt");
     assert_api_error(empty_prompt, StatusCode::BAD_REQUEST, "invalid-request").await;
 
+    let invalid_model = running
+        .mutation("/v1/sessions", "invalid-model-key")
+        .json(&TurnRequest::new("private").with_provider_intent(
+            Some(" ".to_owned()),
+            None,
+            false,
+            false,
+        ))
+        .send()
+        .await
+        .expect("send invalid model override");
+    assert_api_error_message(
+        invalid_model,
+        StatusCode::BAD_REQUEST,
+        "invalid-request",
+        "model override is invalid",
+    )
+    .await;
+
+    let invalid_provider = running
+        .mutation("/v1/sessions", "invalid-provider-key")
+        .json(&TurnRequest::new("private").with_provider_intent(
+            None,
+            Some(" ".to_owned()),
+            false,
+            false,
+        ))
+        .send()
+        .await
+        .expect("send invalid provider override");
+    assert_api_error_message(
+        invalid_provider,
+        StatusCode::BAD_REQUEST,
+        "invalid-request",
+        "provider override is invalid",
+    )
+    .await;
+
     let malformed_path = running
         .mutation("/v1/sessions/not-a-session/turns", STEER_KEY)
         .json(&TurnRequest::new("PRIVATE_BAD_PATH_CANARY"))
@@ -735,4 +773,16 @@ pub(super) async fn assert_api_error(response: reqwest::Response, status: Status
     assert_eq!(response.headers()["cache-control"], "no-store");
     let error: ApiError = response.json().await.expect("decode API error");
     assert_eq!(error.code().as_str(), code);
+}
+
+async fn assert_api_error_message(
+    response: reqwest::Response,
+    status: StatusCode,
+    code: &str,
+    message: &str,
+) {
+    assert_eq!(response.status(), status);
+    let error: serde_json::Value = response.json().await.expect("decode API error");
+    assert_eq!(error["code"], code);
+    assert_eq!(error["message"], message);
 }

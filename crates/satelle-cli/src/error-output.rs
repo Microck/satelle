@@ -143,7 +143,9 @@ fn error_class(code: ErrorCode) -> (ErrorCategory, bool) {
         }
         ErrorCode::IncompatibleControlPlane
         | ErrorCode::ComputerUseNotReady
+        | ErrorCode::UnsupportedProviderComputerUse
         | ErrorCode::DoctorReadinessBlockersFound => (ErrorCategory::Readiness, false),
+        ErrorCode::ProviderSmokeTestTimeout => (ErrorCategory::Readiness, true),
         ErrorCode::StoreInUse | ErrorCode::StorageBusy => (ErrorCategory::Storage, true),
         ErrorCode::StorageIntegrityFailed => (ErrorCategory::Storage, false),
         ErrorCode::HostUnreachable
@@ -201,5 +203,17 @@ fn error_class(code: ErrorCode) -> (ErrorCategory, bool) {
         | ErrorCode::CompletionProfileUpdateFailed
         | ErrorCode::PlatformDirectoriesUnavailable
         | ErrorCode::NotImplemented => (ErrorCategory::Internal, false),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn provider_smoke_timeout_is_retryable_readiness_failure() {
+        let (category, retryable) = error_class(ErrorCode::ProviderSmokeTestTimeout);
+        assert_eq!(category.as_str(), "readiness");
+        assert!(retryable);
     }
 }

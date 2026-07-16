@@ -4,7 +4,54 @@ use satelle_core::session::{
     StopObservation, TurnStateRevision, TurnTransition,
 };
 use satelle_core::{ControlPlaneOperation, SatelleError, SatelleEvent, SessionId, TurnId};
+use sha2::{Digest, Sha256};
 use thiserror::Error;
+
+/// Non-secret provider intent resolved by the Controller and validated at the
+/// Host boundary before it can affect native Computer Use preflight.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProviderComputerUseIntent {
+    model: Option<satelle_core::session::EffectiveModelRef>,
+    provider: Option<satelle_core::session::ProviderBindingRef>,
+    experimental: bool,
+    refresh: bool,
+}
+
+impl ProviderComputerUseIntent {
+    pub fn new(
+        model: Option<satelle_core::session::EffectiveModelRef>,
+        provider: Option<satelle_core::session::ProviderBindingRef>,
+        experimental: bool,
+        refresh: bool,
+    ) -> Self {
+        Self {
+            model,
+            provider,
+            experimental,
+            refresh,
+        }
+    }
+
+    pub fn host_default() -> Self {
+        Self::new(None, None, false, false)
+    }
+
+    pub fn model(&self) -> Option<&satelle_core::session::EffectiveModelRef> {
+        self.model.as_ref()
+    }
+
+    pub fn provider(&self) -> Option<&satelle_core::session::ProviderBindingRef> {
+        self.provider.as_ref()
+    }
+
+    pub const fn experimental(&self) -> bool {
+        self.experimental
+    }
+
+    pub const fn refresh(&self) -> bool {
+        self.refresh
+    }
+}
 
 /// Typed evidence returned before the runtime may durably admit work.
 #[derive(Clone, Eq, PartialEq)]
@@ -196,6 +243,25 @@ impl ReadinessCacheKey {
 
     pub(crate) fn app_approval_fingerprint(&self) -> &str {
         &self.app_approval_fingerprint
+    }
+
+    /// Binds reusable provider evidence to the exact provider/model/runtime
+    /// tuple that the next prompt Turn will use.
+    pub(crate) fn provider_config_fingerprint(&self) -> String {
+        let mut digest = Sha256::new();
+        digest.update(b"satelle-provider-smoke-v1\0");
+        digest.update(self.execution_policy.provider_binding().as_str().as_bytes());
+        digest.update([0]);
+        digest.update(self.execution_policy.effective_model().as_str().as_bytes());
+        digest.update([0]);
+        digest.update(self.codex_version.as_bytes());
+        digest.update([0]);
+        digest.update(self.native_runtime_version.as_bytes());
+        digest
+            .finalize()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect()
     }
 
     pub(crate) fn evidence(
@@ -715,11 +781,19 @@ pub trait ComputerUseAdapter: Send + Sync + 'static {
         false
     }
 
-    fn preflight(&self, host: &str) -> Result<AdapterReadiness, SatelleError>;
+    fn preflight(
+        &self,
+        host: &str,
+        provider_intent: &ProviderComputerUseIntent,
+    ) -> Result<AdapterReadiness, SatelleError>;
 
     /// Returns a production cache key without running the harmless action.
     /// Adapters that do not represent the native production boundary opt out.
-    fn readiness_cache_key(&self, _host: &str) -> Result<Option<ReadinessCacheKey>, SatelleError> {
+    fn readiness_cache_key(
+        &self,
+        _host: &str,
+        _provider_intent: &ProviderComputerUseIntent,
+    ) -> Result<Option<ReadinessCacheKey>, SatelleError> {
         Ok(None)
     }
 
@@ -730,8 +804,10 @@ pub trait ComputerUseAdapter: Send + Sync + 'static {
         &self,
         host: &str,
         _cached: Option<ReadinessEvidence>,
+        _cached_provider: Option<ProviderSmokeEvidence>,
+        provider_intent: &ProviderComputerUseIntent,
     ) -> AdapterPreflight {
-        match self.preflight(host) {
+        match self.preflight(host, provider_intent) {
             Ok(readiness) => AdapterPreflight::Ready(readiness),
             Err(error) => AdapterPreflight::UncachedFailure(error),
         }
@@ -770,7 +846,11 @@ impl BlockedComputerUseAdapter {
 
 #[cfg(test)]
 impl ComputerUseAdapter for BlockedComputerUseAdapter {
-    fn preflight(&self, _host: &str) -> Result<AdapterReadiness, SatelleError> {
+    fn preflight(
+        &self,
+        _host: &str,
+        _provider_intent: &crate::ProviderComputerUseIntent,
+    ) -> Result<AdapterReadiness, SatelleError> {
         self.blocked()
     }
 

@@ -1,6 +1,7 @@
 use super::adapter::{
     AdapterPreflight, AdapterReadiness, AdapterSubject, ComputerUseAdapter, ExecuteRequest,
-    ExecuteResult, ReadinessCacheKey, ReadinessEvidence, RecoveryObservation,
+    ExecuteResult, ProviderComputerUseIntent, ProviderSmokeEvidence, ReadinessCacheKey,
+    ReadinessEvidence, RecoveryObservation,
 };
 use crate::codex_session::{
     CodexApprovalPolicy, CodexSandboxPolicy, CodexSessionControl, CodexSessionError,
@@ -36,6 +37,7 @@ pub(crate) struct ProductionComputerUseAdapter {
     active_execution: Arc<Mutex<Option<ActiveCodexExecution>>>,
     native_readiness_timeout: Duration,
     native_readiness_ttl: time::Duration,
+    provider_smoke_timeout: Duration,
 }
 
 #[derive(Clone)]
@@ -76,6 +78,7 @@ impl ProductionComputerUseAdapter {
             active_execution: Arc::new(Mutex::new(None)),
             native_readiness_timeout: crate::DEFAULT_NATIVE_READINESS_TIMEOUT,
             native_readiness_ttl: crate::DEFAULT_NATIVE_READINESS_TTL,
+            provider_smoke_timeout: Duration::from_secs(120),
         }
     }
 
@@ -84,6 +87,7 @@ impl ProductionComputerUseAdapter {
         working_directory: Result<PathBuf, SatelleError>,
         timeout: Duration,
         ttl: time::Duration,
+        provider_smoke_timeout: Duration,
     ) -> Self {
         Self {
             snapshot,
@@ -91,10 +95,14 @@ impl ProductionComputerUseAdapter {
             active_execution: Arc::new(Mutex::new(None)),
             native_readiness_timeout: timeout,
             native_readiness_ttl: ttl,
+            provider_smoke_timeout,
         }
     }
 
-    fn native_readiness_key(&self) -> Result<ReadinessCacheKey, SatelleError> {
+    fn native_readiness_key(
+        &self,
+        provider_intent: &ProviderComputerUseIntent,
+    ) -> Result<ReadinessCacheKey, SatelleError> {
         let snapshot = crate::read_production_snapshot(&self.snapshot)?;
         let version = match snapshot.evidence.codex_version {
             crate::codex_capabilities::CodexVersionEvidence::Detected { version }
@@ -122,17 +130,32 @@ impl ProductionComputerUseAdapter {
             .ok_or_else(SatelleError::computer_use_not_ready)?;
         let desktop_binding = DesktopBindingRef::new(desktop.session_id.clone())
             .map_err(|_| adapter_failure("desktop_binding_invalid"))?;
+        let effective_model = provider_intent
+            .model()
+            .cloned()
+            .map_or_else(|| EffectiveModelRef::new(DEFAULT_MODEL_BINDING), Ok)
+            .map_err(|_| adapter_failure("model_binding_invalid"))?;
+        let provider_binding = provider_intent
+            .provider()
+            .cloned()
+            .map_or_else(|| ProviderBindingRef::new(DEFAULT_PROVIDER_BINDING), Ok)
+            .map_err(|_| adapter_failure("provider_binding_invalid"))?;
         let execution_policy = ExecutionPolicy::new(
-            EffectiveModelRef::new(DEFAULT_MODEL_BINDING)
-                .map_err(|_| adapter_failure("model_binding_invalid"))?,
-            ProviderBindingRef::new(DEFAULT_PROVIDER_BINDING)
-                .map_err(|_| adapter_failure("provider_binding_invalid"))?,
+            effective_model,
+            provider_binding,
             DesktopTarget::new(desktop_binding.clone()),
             ApprovalPolicy::OnRequest,
             SandboxPolicy::WorkspaceWrite,
             TimeoutPolicy::bounded_seconds(120)
                 .map_err(|_| adapter_failure("timeout_policy_invalid"))?,
-            ExperimentalFeatureChoices::new(FeatureChoice::Enabled, FeatureChoice::Disabled),
+            ExperimentalFeatureChoices::new(
+                FeatureChoice::Enabled,
+                if provider_intent.experimental() {
+                    FeatureChoice::Enabled
+                } else {
+                    FeatureChoice::Disabled
+                },
+            ),
         );
         let platform = crate::codex_capabilities::HostPlatform::current().as_str();
         let codex_version = version.to_string();
@@ -154,19 +177,25 @@ impl ProductionComputerUseAdapter {
         &self,
         key: &ReadinessCacheKey,
         evidence: ReadinessEvidence,
+        cached_provider: Option<ProviderSmokeEvidence>,
     ) -> Result<AdapterReadiness, SatelleError> {
+        let provider_smoke_evidence = self.run_required_provider_smoke(key, cached_provider)?;
         AdapterReadiness::ready(
             key.adapter(),
             "native Computer Use passed the Host action-path smoke test",
             key.desktop_binding().clone(),
             key.execution_policy().clone(),
             evidence,
-            None,
+            provider_smoke_evidence,
         )
         .map_err(|_| adapter_failure("readiness_evidence_invalid"))
     }
 
-    fn live_native_preflight(&self, key: ReadinessCacheKey) -> AdapterPreflight {
+    fn live_native_preflight(
+        &self,
+        key: ReadinessCacheKey,
+        cached_provider: Option<ProviderSmokeEvidence>,
+    ) -> AdapterPreflight {
         let observed_at = time::OffsetDateTime::now_utc();
         let Some(expires_at) = observed_at.checked_add(self.native_readiness_ttl) else {
             return AdapterPreflight::UncachedFailure(adapter_failure("readiness_ttl_invalid"));
@@ -184,7 +213,7 @@ impl ProductionComputerUseAdapter {
             }
         };
         match self.run_native_smoke(&key) {
-            Ok(()) => match self.readiness_from_evidence(&key, evidence) {
+            Ok(()) => match self.readiness_from_evidence(&key, evidence, cached_provider) {
                 Ok(readiness) => AdapterPreflight::Ready(readiness),
                 Err(error) => AdapterPreflight::UncachedFailure(error),
             },
@@ -243,8 +272,85 @@ impl ProductionComputerUseAdapter {
         target.wait_for_success(deadline)
     }
 
+    fn run_required_provider_smoke(
+        &self,
+        key: &ReadinessCacheKey,
+        cached_provider: Option<ProviderSmokeEvidence>,
+    ) -> Result<Option<ProviderSmokeEvidence>, SatelleError> {
+        if key
+            .execution_policy()
+            .experimental_features()
+            .provider_computer_use()
+            != FeatureChoice::Enabled
+        {
+            return Ok(None);
+        }
+        if let Some(cached_provider) = cached_provider {
+            return Ok(Some(cached_provider));
+        }
+
+        let probe = crate::provider_probe::ProviderProbeSurface::start(self.provider_smoke_timeout)
+            .map_err(provider_smoke_failure)?;
+        let page_url = probe.page_url().to_string();
+        let deadline = Instant::now()
+            .checked_add(self.provider_smoke_timeout)
+            .ok_or_else(|| {
+                provider_smoke_failure(crate::provider_probe::ProviderProbeError::TimedOut)
+            })?;
+        let working_directory = self
+            .working_directory
+            .as_ref()
+            .map_err(Clone::clone)
+            .and_then(|path| prepare_working_directory(path))?;
+        let prompt = format!(
+            "Use native Computer Use only to open {page_url} in the approved visible browser. Read the nonce shown on the page, drag the marker into the drop target, and stop. Do not use shell, file, or network tools."
+        );
+        let mut persist_thread = |_value: &str| Ok(());
+        let mut persist_turn = |_value: &str| Ok(());
+        let terminal = run_codex_session(
+            crate::codex_capabilities::installed_app_server_command(),
+            CodexSessionRequest {
+                working_directory: &working_directory,
+                prompt: &prompt,
+                existing_thread_ref: None,
+                model: model_override(key.execution_policy().effective_model().as_str()),
+                model_provider: provider_override(
+                    key.execution_policy().provider_binding().as_str(),
+                ),
+                execution_mode: TurnExecutionMode::Standard,
+                approval_policy: CodexApprovalPolicy::OnRequest,
+                sandbox_policy: CodexSandboxPolicy::WorkspaceWrite,
+                deadline,
+                persist_thread_ref: &mut persist_thread,
+                persist_turn_ref: &mut persist_turn,
+                control: None,
+            },
+        )
+        .map_err(|failure| provider_smoke_session_failure(failure.error()))?;
+        if terminal != CodexSessionTerminal::Completed {
+            return Err(provider_smoke_session_failure(
+                CodexSessionError::ResponseError,
+            ));
+        }
+        probe
+            .wait_for_completion()
+            .map_err(provider_smoke_failure)?;
+
+        let observed_at = time::OffsetDateTime::now_utc();
+        let expires_at = observed_at + time::Duration::hours(24);
+        ProviderSmokeEvidence::new(
+            format!("provider-smoke-{}", satelle_core::SessionId::new()),
+            key.provider_config_fingerprint(),
+            observed_at,
+            expires_at,
+        )
+        .map(Some)
+        .map_err(|_| adapter_failure("provider_smoke_evidence_invalid"))
+    }
+
     fn ensure_platform_admitted(&self) -> Result<(), SatelleError> {
-        self.native_readiness_key().map(|_| ())
+        self.native_readiness_key(&ProviderComputerUseIntent::host_default())
+            .map(|_| ())
     }
 
     fn register_execution(
@@ -405,8 +511,12 @@ fn readiness_fingerprint(domain: &str, platform: &str, desktop: &str) -> String 
         .collect()
 }
 
-fn protocol_override(value: &str) -> Option<&str> {
-    (value != DEFAULT_MODEL_BINDING && value != DEFAULT_PROVIDER_BINDING).then_some(value)
+fn model_override(value: &str) -> Option<&str> {
+    (value != DEFAULT_MODEL_BINDING).then_some(value)
+}
+
+fn provider_override(value: &str) -> Option<&str> {
+    (value != DEFAULT_PROVIDER_BINDING).then_some(value)
 }
 
 fn native_readiness_failure(reason: &'static str) -> SatelleError {
@@ -416,6 +526,104 @@ fn native_readiness_failure(reason: &'static str) -> SatelleError {
         code: ErrorCode::ComputerUseNotReady,
         message: "native Computer Use did not pass the Host action-path smoke test".to_string(),
         recovery_command: Some("satelle doctor --scope computer-use --refresh --json".to_string()),
+        source_detail: None,
+        details,
+    }
+}
+
+fn provider_smoke_session_failure(error: CodexSessionError) -> SatelleError {
+    let (code, reason) = match error {
+        CodexSessionError::Timeout => (
+            ErrorCode::ProviderSmokeTestTimeout,
+            "provider_smoke_test_timed_out",
+        ),
+        CodexSessionError::ResponseError => (
+            ErrorCode::UnsupportedProviderComputerUse,
+            "provider_smoke_provider_rejected",
+        ),
+        CodexSessionError::Spawn => (
+            ErrorCode::ComputerUseNotReady,
+            "provider_smoke_spawn_failed",
+        ),
+        CodexSessionError::Write => (
+            ErrorCode::ComputerUseNotReady,
+            "provider_smoke_write_failed",
+        ),
+        CodexSessionError::MalformedMessage => (
+            ErrorCode::ComputerUseNotReady,
+            "provider_smoke_malformed_message",
+        ),
+        CodexSessionError::OversizedMessage => (
+            ErrorCode::ComputerUseNotReady,
+            "provider_smoke_oversized_message",
+        ),
+        CodexSessionError::UnexpectedResponse => (
+            ErrorCode::ComputerUseNotReady,
+            "provider_smoke_unexpected_response",
+        ),
+        CodexSessionError::DuplicateResponse => (
+            ErrorCode::ComputerUseNotReady,
+            "provider_smoke_duplicate_response",
+        ),
+        CodexSessionError::ConflictingIdentity => (
+            ErrorCode::ComputerUseNotReady,
+            "provider_smoke_conflicting_identity",
+        ),
+        CodexSessionError::PrematureExit => (
+            ErrorCode::ComputerUseNotReady,
+            "provider_smoke_premature_exit",
+        ),
+        CodexSessionError::Persistence => (
+            ErrorCode::ComputerUseNotReady,
+            "provider_smoke_persistence_failed",
+        ),
+        CodexSessionError::Containment => (
+            ErrorCode::ComputerUseNotReady,
+            "provider_smoke_containment_failed",
+        ),
+        CodexSessionError::Control => (
+            ErrorCode::ComputerUseNotReady,
+            "provider_smoke_control_failed",
+        ),
+    };
+    provider_smoke_error(code, reason)
+}
+
+fn provider_smoke_failure(error: crate::provider_probe::ProviderProbeError) -> SatelleError {
+    let (code, reason) = match error {
+        crate::provider_probe::ProviderProbeError::TimedOut => (
+            ErrorCode::ProviderSmokeTestTimeout,
+            "provider_smoke_test_timed_out",
+        ),
+        crate::provider_probe::ProviderProbeError::InvalidRequest => (
+            ErrorCode::ComputerUseNotReady,
+            "provider_smoke_callback_invalid",
+        ),
+        crate::provider_probe::ProviderProbeError::Cancelled => {
+            (ErrorCode::ComputerUseNotReady, "provider_smoke_cancelled")
+        }
+        crate::provider_probe::ProviderProbeError::Bind(_)
+        | crate::provider_probe::ProviderProbeError::Random(_)
+        | crate::provider_probe::ProviderProbeError::Io(_)
+        | crate::provider_probe::ProviderProbeError::WorkerSpawn(_)
+        | crate::provider_probe::ProviderProbeError::WorkerStopped => (
+            ErrorCode::ComputerUseNotReady,
+            "provider_smoke_surface_unavailable",
+        ),
+    };
+    provider_smoke_error(code, reason)
+}
+
+fn provider_smoke_error(code: ErrorCode, reason: &'static str) -> SatelleError {
+    let mut details = std::collections::BTreeMap::new();
+    details.insert("reason".to_string(), Value::String(reason.to_string()));
+    SatelleError {
+        code,
+        message: "the selected provider did not pass the live Computer Use smoke test".to_string(),
+        recovery_command: Some(
+            "rerun the original satelle run or steer command with --refresh-provider-smoke-test"
+                .to_string(),
+        ),
         source_detail: None,
         details,
     }
@@ -432,29 +640,45 @@ impl ComputerUseAdapter for ProductionComputerUseAdapter {
         true
     }
 
-    fn preflight(&self, host: &str) -> Result<AdapterReadiness, SatelleError> {
-        self.preflight_terminal(host, None).into_result()
+    fn preflight(
+        &self,
+        host: &str,
+        provider_intent: &ProviderComputerUseIntent,
+    ) -> Result<AdapterReadiness, SatelleError> {
+        self.preflight_terminal(host, None, None, provider_intent)
+            .into_result()
     }
 
-    fn readiness_cache_key(&self, _host: &str) -> Result<Option<ReadinessCacheKey>, SatelleError> {
-        self.native_readiness_key().map(Some)
+    fn readiness_cache_key(
+        &self,
+        _host: &str,
+        provider_intent: &ProviderComputerUseIntent,
+    ) -> Result<Option<ReadinessCacheKey>, SatelleError> {
+        self.native_readiness_key(provider_intent).map(Some)
     }
 
     fn preflight_terminal(
         &self,
         _host: &str,
         cached: Option<ReadinessEvidence>,
+        cached_provider: Option<ProviderSmokeEvidence>,
+        provider_intent: &ProviderComputerUseIntent,
     ) -> AdapterPreflight {
-        let key = match self.native_readiness_key() {
+        let key = match self.native_readiness_key(provider_intent) {
             Ok(key) => key,
             Err(error) => return AdapterPreflight::UncachedFailure(error),
         };
+        let cached_provider = if provider_intent.refresh() {
+            None
+        } else {
+            cached_provider
+        };
         match cached {
-            Some(evidence) => match self.readiness_from_evidence(&key, evidence) {
+            Some(evidence) => match self.readiness_from_evidence(&key, evidence, cached_provider) {
                 Ok(readiness) => AdapterPreflight::Ready(readiness),
                 Err(error) => AdapterPreflight::UncachedFailure(error),
             },
-            None => self.live_native_preflight(key),
+            None => self.live_native_preflight(key, cached_provider),
         }
     }
 
@@ -494,8 +718,8 @@ impl ComputerUseAdapter for ProductionComputerUseAdapter {
                 working_directory: &working_directory,
                 prompt: request.prompt(),
                 existing_thread_ref: request.upstream_thread_ref(),
-                model: protocol_override(policy.effective_model().as_str()),
-                model_provider: protocol_override(policy.provider_binding().as_str()),
+                model: model_override(policy.effective_model().as_str()),
+                model_provider: provider_override(policy.provider_binding().as_str()),
                 execution_mode: request.execution_mode(),
                 approval_policy,
                 sandbox_policy,
@@ -722,6 +946,13 @@ mod tests {
 
     #[test]
     fn every_supported_policy_has_one_exact_protocol_mapping() {
+        assert_eq!(model_override(DEFAULT_MODEL_BINDING), None);
+        assert_eq!(model_override("explicit-model"), Some("explicit-model"));
+        assert_eq!(provider_override(DEFAULT_PROVIDER_BINDING), None);
+        assert_eq!(
+            provider_override("explicit-provider"),
+            Some("explicit-provider")
+        );
         assert_eq!(
             codex_approval_policy(ApprovalPolicy::Untrusted).unwrap(),
             CodexApprovalPolicy::Untrusted
@@ -752,6 +983,86 @@ mod tests {
         assert_eq!(
             codex_sandbox_policy(SandboxPolicy::DangerFullAccess),
             CodexSandboxPolicy::DangerFullAccess
+        );
+    }
+
+    #[test]
+    fn provider_smoke_timeout_and_incompatibility_remain_distinct() {
+        let timeout = provider_smoke_session_failure(CodexSessionError::Timeout);
+        assert_eq!(timeout.code, ErrorCode::ProviderSmokeTestTimeout);
+        let unsupported = provider_smoke_session_failure(CodexSessionError::ResponseError);
+        assert_eq!(unsupported.code, ErrorCode::UnsupportedProviderComputerUse);
+        for failure in [&timeout, &unsupported] {
+            assert_eq!(
+                failure.recovery_command.as_deref(),
+                Some(
+                    "rerun the original satelle run or steer command with --refresh-provider-smoke-test"
+                )
+            );
+        }
+        for local_failure in [
+            CodexSessionError::Spawn,
+            CodexSessionError::Write,
+            CodexSessionError::MalformedMessage,
+            CodexSessionError::OversizedMessage,
+            CodexSessionError::UnexpectedResponse,
+            CodexSessionError::DuplicateResponse,
+            CodexSessionError::ConflictingIdentity,
+            CodexSessionError::PrematureExit,
+            CodexSessionError::Persistence,
+            CodexSessionError::Containment,
+            CodexSessionError::Control,
+        ] {
+            assert_eq!(
+                provider_smoke_session_failure(local_failure).code,
+                ErrorCode::ComputerUseNotReady
+            );
+        }
+    }
+
+    #[test]
+    fn matching_provider_smoke_evidence_skips_a_live_probe() {
+        let adapter = ProductionComputerUseAdapter::new(
+            Arc::new(RwLock::new(crate::ProductionCapabilitySnapshot::collect(
+                None,
+            ))),
+            Ok(tempfile::tempdir().unwrap().path().join("codex-work")),
+        );
+        let desktop_binding = DesktopBindingRef::new("desktop-provider-cache").unwrap();
+        let policy = ExecutionPolicy::new(
+            EffectiveModelRef::new("model-provider-cache").unwrap(),
+            ProviderBindingRef::new("provider-cache").unwrap(),
+            DesktopTarget::new(desktop_binding.clone()),
+            ApprovalPolicy::OnRequest,
+            SandboxPolicy::WorkspaceWrite,
+            TimeoutPolicy::bounded_seconds(120).unwrap(),
+            ExperimentalFeatureChoices::new(FeatureChoice::Enabled, FeatureChoice::Enabled),
+        );
+        let key = ReadinessCacheKey::new(
+            NATIVE_ADAPTER,
+            desktop_binding,
+            policy,
+            "0.144.0",
+            "codex-native-0.144.0",
+            None::<String>,
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        )
+        .unwrap();
+        let observed_at = time::OffsetDateTime::now_utc();
+        let provider = ProviderSmokeEvidence::new(
+            "provider-smoke-cached",
+            key.provider_config_fingerprint(),
+            observed_at,
+            observed_at + time::Duration::hours(24),
+        )
+        .unwrap();
+
+        assert_eq!(
+            adapter
+                .run_required_provider_smoke(&key, Some(provider.clone()))
+                .unwrap(),
+            Some(provider)
         );
     }
 

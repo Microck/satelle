@@ -14,6 +14,8 @@ mod log_page;
 mod operation_capacity;
 #[path = "process-identity.rs"]
 mod process_identity;
+#[path = "provider-probe.rs"]
+mod provider_probe;
 mod runtime;
 mod storage;
 #[cfg(any(test, feature = "test-support"))]
@@ -38,11 +40,11 @@ pub use log_page::{
 use operation_capacity::OperationCapacity;
 pub use runtime::{
     AdapterPreflight, AdapterReadiness, AdapterSubject, ComputerUseAdapter, EvidenceError,
-    ExecuteRequest, ExecuteResult, ProviderSmokeEvidence, ReadinessCacheKey, ReadinessEvidence,
-    RecoveryObservation,
+    ExecuteRequest, ExecuteResult, ProviderComputerUseIntent, ProviderSmokeEvidence,
+    ReadinessCacheKey, ReadinessEvidence, RecoveryObservation,
 };
 use runtime::{ProductionComputerUseAdapter, RunCommand, RuntimeHandle, SteerCommand, StopCommand};
-use satelle_core::session::{PublicSession, TurnAdmissionFailure, TurnExecutionMode};
+use satelle_core::session::{PublicSession, TurnAdmissionFailure};
 use satelle_core::{
     DaemonPathOverrides, DoctorFinding, DoctorFixability, DoctorOptions, DoctorProbeResult,
     DoctorReport, DoctorSchemaVersion, DoctorSummary, HostConfig, HostSessionsReport,
@@ -173,11 +175,19 @@ impl HostService {
                 )
             },
         );
+        let provider_smoke_timeout = config
+            .timeouts
+            .as_ref()
+            .and_then(|timeouts| timeouts.provider_smoke_test.as_ref())
+            .map_or(std::time::Duration::from_secs(120), |duration| {
+                std::time::Duration::from_millis(duration.milliseconds())
+            });
         let adapter = ProductionComputerUseAdapter::with_readiness_policy(
             Arc::clone(&snapshot),
             working_directory,
             timeout,
             ttl,
+            provider_smoke_timeout,
         );
         Self {
             runtime: RuntimeHandle::new(state_root, adapter),
@@ -317,36 +327,41 @@ impl HostService {
     pub fn run(
         &self,
         host: &str,
-        prompt: &str,
-        execution_mode: TurnExecutionMode,
+        intent: &TurnIntent,
     ) -> Result<TurnOutcome, TurnAdmissionFailure> {
         self.runtime
-            .run(RunCommand::attached(host, prompt).with_execution_mode(execution_mode))
+            .run(
+                RunCommand::attached(host, intent.prompt())
+                    .with_execution_mode(intent.execution_mode())
+                    .with_provider_intent(intent.provider_intent().clone()),
+            )
             .map(crate::runtime::RuntimeTurnOutcome::into_command_outcome)
     }
 
     pub fn run_detached(
         &self,
         host: &str,
-        prompt: &str,
-        execution_mode: TurnExecutionMode,
+        intent: &TurnIntent,
     ) -> Result<PublicSession, SatelleError> {
         crate::runtime::admitted_session(
-            self.runtime
-                .run(RunCommand::detached(host, prompt).with_execution_mode(execution_mode)),
+            self.runtime.run(
+                RunCommand::detached(host, intent.prompt())
+                    .with_execution_mode(intent.execution_mode())
+                    .with_provider_intent(intent.provider_intent().clone()),
+            ),
         )
     }
 
     pub fn steer(
         &self,
         session_id: &SessionId,
-        prompt: &str,
-        execution_mode: TurnExecutionMode,
+        intent: &TurnIntent,
     ) -> Result<TurnOutcome, TurnAdmissionFailure> {
         self.runtime
             .steer(
-                SteerCommand::attached(session_id.clone(), prompt)
-                    .with_execution_mode(execution_mode),
+                SteerCommand::attached(session_id.clone(), intent.prompt())
+                    .with_execution_mode(intent.execution_mode())
+                    .with_provider_intent(intent.provider_intent().clone()),
             )
             .map(crate::runtime::RuntimeTurnOutcome::into_command_outcome)
     }
@@ -354,12 +369,15 @@ impl HostService {
     pub fn steer_detached(
         &self,
         session_id: &SessionId,
-        prompt: &str,
-        execution_mode: TurnExecutionMode,
+        intent: &TurnIntent,
     ) -> Result<PublicSession, SatelleError> {
-        crate::runtime::admitted_session(self.runtime.steer(
-            SteerCommand::detached(session_id.clone(), prompt).with_execution_mode(execution_mode),
-        ))
+        crate::runtime::admitted_session(
+            self.runtime.steer(
+                SteerCommand::detached(session_id.clone(), intent.prompt())
+                    .with_execution_mode(intent.execution_mode())
+                    .with_provider_intent(intent.provider_intent().clone()),
+            ),
+        )
     }
 
     pub fn status(&self, session_id: &SessionId) -> Result<PublicSession, SatelleError> {

@@ -1748,6 +1748,18 @@ fn resolve_yolo_policy(
     }
 }
 
+fn resolve_experimental_provider_computer_use(
+    command_flag: bool,
+    host_config: &HostConfig,
+    config: &satelle_core::ResolvedConfig,
+) -> bool {
+    command_flag
+        || host_config
+            .experimental_provider_computer_use
+            .or(config.config.experimental_provider_computer_use)
+            .unwrap_or(false)
+}
+
 fn yolo_config_json(
     config: &satelle_core::ResolvedConfig,
     selected_host: &str,
@@ -2392,10 +2404,6 @@ fn run_prompt(
     validate_event_mode(command.detach, command.events)?;
     let effective_mode = effective_event_mode(command.events, command.detach, command.quiet, json);
     let mut event_output = TurnEventOutput::new(effective_mode, command.verbose);
-    let _provider_computer_use_options = (
-        command.experimental_provider_computer_use,
-        command.refresh_provider_smoke_test,
-    );
     let explicit_host_alias = command.host.as_deref();
     let prompt = report_not_admitted(
         &mut event_output,
@@ -2442,7 +2450,19 @@ fn run_prompt(
         command.yolo,
         command.no_yolo,
     );
-    let request = TurnRequest::new(prompt).with_execution_mode(yolo_policy.execution_mode());
+    let experimental_provider_computer_use = resolve_experimental_provider_computer_use(
+        command.experimental_provider_computer_use,
+        &host.config,
+        &config,
+    );
+    let request = TurnRequest::new(prompt)
+        .with_execution_mode(yolo_policy.execution_mode())
+        .with_provider_intent(
+            config.config.model_alias.clone(),
+            config.config.provider_alias.clone(),
+            experimental_provider_computer_use,
+            command.refresh_provider_smoke_test,
+        );
     if command.detach {
         let session = transport.run_detached(&request).map_err(failure)?;
         return print_detached_session(
@@ -2495,10 +2515,6 @@ fn steer_prompt(
     validate_event_mode(command.detach, command.events)?;
     let effective_mode = effective_event_mode(command.events, command.detach, command.quiet, json);
     let mut event_output = TurnEventOutput::new(effective_mode, command.verbose);
-    let _provider_computer_use_options = (
-        command.experimental_provider_computer_use,
-        command.refresh_provider_smoke_test,
-    );
     let explicit_host_alias = command.host.as_deref();
     let prompt = report_not_admitted(
         &mut event_output,
@@ -2550,7 +2566,19 @@ fn steer_prompt(
         command.yolo,
         command.no_yolo,
     );
-    let request = TurnRequest::new(prompt).with_execution_mode(yolo_policy.execution_mode());
+    let experimental_provider_computer_use = resolve_experimental_provider_computer_use(
+        command.experimental_provider_computer_use,
+        &host.config,
+        &config,
+    );
+    let request = TurnRequest::new(prompt)
+        .with_execution_mode(yolo_policy.execution_mode())
+        .with_provider_intent(
+            config.config.model_alias.clone(),
+            config.config.provider_alias.clone(),
+            experimental_provider_computer_use,
+            command.refresh_provider_smoke_test,
+        );
     if command.detach {
         let session = transport
             .steer_detached(&session_id, &request)

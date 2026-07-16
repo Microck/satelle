@@ -32,7 +32,10 @@ fn runtime_engine_steer_prunes_expired_session_before_follow_up_admission() {
     let runtime = RuntimeHandle::new(Ok(state.path().to_path_buf()), FakeComputerUseAdapter);
     let engine = runtime.engine().expect("open runtime storage");
     let readiness = FakeComputerUseAdapter
-        .preflight(satelle_core::LOCAL_DEMO_HOST)
+        .preflight(
+            satelle_core::LOCAL_DEMO_HOST,
+            &crate::ProviderComputerUseIntent::host_default(),
+        )
         .expect("fake adapter should be ready");
     let error = engine
         .steer(

@@ -18,6 +18,7 @@ pub use read::{
     LiveResponse,
 };
 pub(crate) use session::ApiRequestContract;
+pub(crate) use session::TurnRequestParts;
 pub use session::{SessionResponse, StopRequest, StopResponse, TurnRequest};
 
 pub(crate) const PROTOCOL_VERSION_HEADER: &str = "satelle-protocol-version";

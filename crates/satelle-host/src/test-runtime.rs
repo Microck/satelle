@@ -69,8 +69,12 @@ pub(super) struct FakeComputerUseAdapter;
 pub(super) struct PendingComputerUseAdapter;
 
 impl ComputerUseAdapter for PendingComputerUseAdapter {
-    fn preflight(&self, host: &str) -> Result<AdapterReadiness, SatelleError> {
-        FakeComputerUseAdapter.preflight(host)
+    fn preflight(
+        &self,
+        host: &str,
+        provider_intent: &crate::ProviderComputerUseIntent,
+    ) -> Result<AdapterReadiness, SatelleError> {
+        FakeComputerUseAdapter.preflight(host, provider_intent)
     }
 
     fn execute(&self, _request: ExecuteRequest<'_>) -> Result<ExecuteResult, SatelleError> {
@@ -94,7 +98,11 @@ impl ComputerUseAdapter for PendingComputerUseAdapter {
 }
 
 impl ComputerUseAdapter for FakeComputerUseAdapter {
-    fn preflight(&self, _host: &str) -> Result<AdapterReadiness, SatelleError> {
+    fn preflight(
+        &self,
+        _host: &str,
+        _provider_intent: &crate::ProviderComputerUseIntent,
+    ) -> Result<AdapterReadiness, SatelleError> {
         let desktop_binding = DesktopBindingRef::new("local-demo-desktop-v1")
             .map_err(|_| adapter_configuration_error("desktop binding"))?;
         let execution_policy = ExecutionPolicy::new(

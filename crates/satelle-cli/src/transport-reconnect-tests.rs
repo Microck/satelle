@@ -69,12 +69,10 @@ impl DirectFixture {
 
     fn complete_while_server_is_down(&self, prompt: &str) -> PublicSession {
         let request = TurnRequest::new(prompt);
+        let intent = satelle_host::TurnIntent::new(request.prompt(), request.execution_mode())
+            .expect("construct local Turn intent");
         self.service
-            .run(
-                satelle_core::LOCAL_DEMO_HOST,
-                request.prompt(),
-                request.execution_mode(),
-            )
+            .run(satelle_core::LOCAL_DEMO_HOST, &intent)
             .expect("admit and complete the target through the cloned Host service")
             .session
     }
@@ -586,13 +584,14 @@ fn transient_http_reconciliation_failure_retains_the_reconnected_stream() {
 #[test]
 fn subscribed_replacements_that_close_before_events_exhaust_the_reconnect_budget() {
     let mut fixture = DirectFixture::start();
+    let intent = satelle_host::TurnIntent::new(
+        "build active reconciliation fixture",
+        satelle_core::session::TurnExecutionMode::Standard,
+    )
+    .expect("construct local Turn intent");
     let terminal = fixture
         .service
-        .run(
-            satelle_core::LOCAL_DEMO_HOST,
-            "build active reconciliation fixture",
-            satelle_core::session::TurnExecutionMode::Standard,
-        )
+        .run(satelle_core::LOCAL_DEMO_HOST, &intent)
         .expect("create a real durable Session fixture")
         .session;
     let target = terminal
