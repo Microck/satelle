@@ -64,7 +64,7 @@ pub use storage::{
 #[cfg(any(test, feature = "test-support"))]
 use test_runtime::FakeComputerUseAdapter;
 #[cfg(feature = "test-support")]
-use test_runtime::PendingComputerUseAdapter;
+use test_runtime::{FailingComputerUseAdapter, PendingComputerUseAdapter};
 use time::format_description::well_known::Rfc3339;
 
 const DEFAULT_NATIVE_READINESS_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
@@ -321,6 +321,17 @@ impl HostService {
     pub fn pending_local_demo_for_tests() -> Result<Self, SatelleError> {
         Ok(Self {
             runtime: RuntimeHandle::new(satelle_core::state_dir(), PendingComputerUseAdapter),
+            operation_capacity: Arc::new(OperationCapacity::default()),
+            mode: HostMode::TestFake,
+            bootstrap_auth: None,
+        })
+    }
+
+    #[doc(hidden)]
+    #[cfg(feature = "test-support")]
+    pub fn failing_local_demo_for_tests() -> Result<Self, SatelleError> {
+        Ok(Self {
+            runtime: RuntimeHandle::new(satelle_core::state_dir(), FailingComputerUseAdapter),
             operation_capacity: Arc::new(OperationCapacity::default()),
             mode: HostMode::TestFake,
             bootstrap_auth: None,

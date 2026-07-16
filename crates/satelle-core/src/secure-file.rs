@@ -48,6 +48,161 @@ pub fn read_trusted_ca_bundle_file(path: &Path) -> Result<String, SecureFileErro
         .map_err(|_| SecureFileError::NotUtf8)
 }
 
+/// Creates a regular file with Satelle's owner-only policy, or opens an
+/// existing file only when it already satisfies that policy.
+#[cfg(unix)]
+pub fn open_or_create_owner_only_file(path: &Path) -> Result<File, SecureFileError> {
+    use rustix::fs::{FileType, Mode, OFlags};
+
+    require_macos_parent_without_extended_acl(path)?;
+    let create_flags =
+        OFlags::RDWR | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC;
+    let (descriptor, created) = match rustix::fs::open(path, create_flags, Mode::RUSR | Mode::WUSR)
+    {
+        Ok(descriptor) => (descriptor, true),
+        Err(rustix::io::Errno::EXIST) => (
+            rustix::fs::open(
+                path,
+                OFlags::RDWR | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                Mode::empty(),
+            )
+            .map_err(|_| SecureFileError::UnsafeOrUnavailable)?,
+            false,
+        ),
+        Err(_) => return Err(SecureFileError::UnsafeOrUnavailable),
+    };
+    let metadata =
+        rustix::fs::fstat(&descriptor).map_err(|_| SecureFileError::UnsafeOrUnavailable)?;
+    if FileType::from_raw_mode(metadata.st_mode) != FileType::RegularFile
+        || metadata.st_uid != rustix::process::geteuid().as_raw()
+        || metadata.st_nlink != 1
+        || (!created && metadata.st_mode & 0o777 != 0o600)
+    {
+        return Err(SecureFileError::UnsafeOrUnavailable);
+    }
+    require_no_macos_extended_acl(&descriptor)?;
+    if created {
+        rustix::fs::fchmod(&descriptor, Mode::RUSR | Mode::WUSR)
+            .map_err(|_| SecureFileError::UnsafeOrUnavailable)?;
+    }
+    Ok(File::from(descriptor))
+}
+
+/// Opens or creates an owner-only directory. Keeping the returned handle alive
+/// pins the directory against replacement on platforms that support that
+/// guarantee.
+#[cfg(unix)]
+pub fn open_or_create_owner_only_directory(path: &Path) -> Result<File, SecureFileError> {
+    use rustix::fs::{FileType, Mode, OFlags};
+    use std::os::unix::fs::DirBuilderExt;
+
+    let mut builder = std::fs::DirBuilder::new();
+    builder.mode(0o700);
+    require_macos_parent_without_extended_acl(path)?;
+    let created = match builder.create(path) {
+        Ok(()) => true,
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => false,
+        Err(_) => return Err(SecureFileError::UnsafeOrUnavailable),
+    };
+    let descriptor = rustix::fs::open(
+        path,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .map_err(|_| SecureFileError::UnsafeOrUnavailable)?;
+    let metadata =
+        rustix::fs::fstat(&descriptor).map_err(|_| SecureFileError::UnsafeOrUnavailable)?;
+    if FileType::from_raw_mode(metadata.st_mode) != FileType::Directory
+        || metadata.st_uid != rustix::process::geteuid().as_raw()
+        || (!created && metadata.st_mode & 0o777 != 0o700)
+    {
+        return Err(SecureFileError::UnsafeOrUnavailable);
+    }
+    require_no_macos_extended_acl(&descriptor)?;
+    if created {
+        rustix::fs::fchmod(&descriptor, Mode::RWXU)
+            .map_err(|_| SecureFileError::UnsafeOrUnavailable)?;
+    }
+    Ok(File::from(descriptor))
+}
+
+#[cfg(target_os = "macos")]
+fn require_macos_parent_without_extended_acl(path: &Path) -> Result<(), SecureFileError> {
+    use rustix::fs::{Mode, OFlags};
+
+    let parent = path.parent().ok_or(SecureFileError::UnsafeOrUnavailable)?;
+    let descriptor = rustix::fs::open(
+        parent,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .map_err(|_| SecureFileError::UnsafeOrUnavailable)?;
+    require_no_macos_extended_acl(&descriptor)
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+fn require_macos_parent_without_extended_acl(_path: &Path) -> Result<(), SecureFileError> {
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn require_no_macos_extended_acl(
+    descriptor: &impl std::os::fd::AsFd,
+) -> Result<(), SecureFileError> {
+    use std::os::fd::AsRawFd;
+
+    const ACL_TYPE_EXTENDED: libc::c_int = 0x0000_0100;
+
+    unsafe extern "C" {
+        fn acl_get_fd_np(fd: libc::c_int, acl_type: libc::c_int) -> *mut libc::c_void;
+        fn acl_free(object: *mut libc::c_void) -> libc::c_int;
+    }
+
+    // acl_get_fd_np returns NULL with ENOENT when no extended ACL exists.
+    // Any allocated ACL is non-canonical for Satelle's owner-only policy,
+    // regardless of its allow/deny ordering.
+    unsafe {
+        *libc::__error() = 0;
+        let acl = acl_get_fd_np(descriptor.as_fd().as_raw_fd(), ACL_TYPE_EXTENDED);
+        if acl.is_null() {
+            return (*libc::__error() == libc::ENOENT)
+                .then_some(())
+                .ok_or(SecureFileError::UnsafeOrUnavailable);
+        }
+        let _ = acl_free(acl);
+    }
+    Err(SecureFileError::UnsafeOrUnavailable)
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+fn require_no_macos_extended_acl(
+    _descriptor: &impl std::os::fd::AsFd,
+) -> Result<(), SecureFileError> {
+    Ok(())
+}
+
+#[cfg(windows)]
+pub fn open_or_create_owner_only_file(path: &Path) -> Result<File, SecureFileError> {
+    windows::open_or_create_owner_only_file(path)
+}
+
+#[cfg(windows)]
+pub fn open_or_create_owner_only_directory(path: &Path) -> Result<File, SecureFileError> {
+    windows::open_or_create_owner_only_directory(path)
+}
+
+#[cfg(not(any(unix, windows)))]
+pub fn open_or_create_owner_only_file(_path: &Path) -> Result<File, SecureFileError> {
+    // Satelle cannot claim owner-only persistence on a platform without an
+    // implemented file-security policy.
+    Err(SecureFileError::UnsafeOrUnavailable)
+}
+
+#[cfg(not(any(unix, windows)))]
+pub fn open_or_create_owner_only_directory(_path: &Path) -> Result<File, SecureFileError> {
+    Err(SecureFileError::UnsafeOrUnavailable)
+}
+
 fn read_secure_file(
     path: &Path,
     policy: SecurityPolicy,
@@ -113,25 +268,30 @@ mod windows {
     use std::path::Path;
     use std::ptr::{null, null_mut};
     use windows_sys::Win32::Foundation::{
-        GENERIC_ALL, GENERIC_EXECUTE, GENERIC_READ, GENERIC_WRITE, HANDLE, HLOCAL,
-        INVALID_HANDLE_VALUE, LocalFree,
+        ERROR_ALREADY_EXISTS, GENERIC_ALL, GENERIC_EXECUTE, GENERIC_READ, GENERIC_WRITE,
+        GetLastError, HANDLE, HLOCAL, INVALID_HANDLE_VALUE, LocalFree,
     };
-    use windows_sys::Win32::Security::Authorization::{GetSecurityInfo, SE_FILE_OBJECT};
+    use windows_sys::Win32::Security::Authorization::{
+        ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW,
+        GetSecurityInfo, SDDL_REVISION_1, SE_FILE_OBJECT,
+    };
     use windows_sys::Win32::Security::{
-        ACCESS_ALLOWED_ACE, ACE_HEADER, ACL, CopySid, DACL_SECURITY_INFORMATION, EqualSid, GetAce,
-        GetLengthSid, GetSecurityDescriptorControl, GetTokenInformation, IsValidAcl, IsValidSid,
-        IsWellKnownSid, OWNER_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID, SE_DACL_PROTECTED,
-        TOKEN_INFORMATION_CLASS, TOKEN_QUERY, TOKEN_USER, TokenUser, WinBuiltinAdministratorsSid,
-        WinLocalSystemSid,
+        ACCESS_ALLOWED_ACE, ACE_HEADER, ACL, CONTAINER_INHERIT_ACE, CopySid,
+        DACL_SECURITY_INFORMATION, EqualSid, GetAce, GetLengthSid, GetSecurityDescriptorControl,
+        GetSecurityDescriptorDacl, GetTokenInformation, IsValidAcl, IsValidSid, IsWellKnownSid,
+        OBJECT_INHERIT_ACE, OWNER_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID,
+        SE_DACL_PROTECTED, SECURITY_ATTRIBUTES, TOKEN_INFORMATION_CLASS, TOKEN_QUERY, TOKEN_USER,
+        TokenUser, WinBuiltinAdministratorsSid, WinLocalSystemSid,
     };
     use windows_sys::Win32::Storage::FileSystem::{
-        BY_HANDLE_FILE_INFORMATION, CreateFileW, DELETE, FILE_ALL_ACCESS, FILE_APPEND_DATA,
-        FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_NORMAL, FILE_ATTRIBUTE_REPARSE_POINT,
-        FILE_ATTRIBUTE_TAG_INFO, FILE_FLAG_OPEN_REPARSE_POINT, FILE_GENERIC_EXECUTE,
-        FILE_GENERIC_READ, FILE_GENERIC_WRITE, FILE_READ_ATTRIBUTES, FILE_SHARE_READ,
-        FILE_TYPE_DISK, FILE_WRITE_ATTRIBUTES, FILE_WRITE_DATA, FILE_WRITE_EA,
-        FileAttributeTagInfo, GetFileInformationByHandle, GetFileInformationByHandleEx,
-        GetFileType, GetVolumeInformationByHandleW, OPEN_EXISTING, READ_CONTROL, WRITE_DAC,
+        BY_HANDLE_FILE_INFORMATION, CreateDirectoryW, CreateFileW, DELETE, FILE_ALL_ACCESS,
+        FILE_APPEND_DATA, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_NORMAL,
+        FILE_ATTRIBUTE_REPARSE_POINT, FILE_ATTRIBUTE_TAG_INFO, FILE_FLAG_BACKUP_SEMANTICS,
+        FILE_FLAG_OPEN_REPARSE_POINT, FILE_GENERIC_EXECUTE, FILE_GENERIC_READ, FILE_GENERIC_WRITE,
+        FILE_READ_ATTRIBUTES, FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_TYPE_DISK,
+        FILE_WRITE_ATTRIBUTES, FILE_WRITE_DATA, FILE_WRITE_EA, FileAttributeTagInfo,
+        GetFileInformationByHandle, GetFileInformationByHandleEx, GetFileType,
+        GetVolumeInformationByHandleW, OPEN_ALWAYS, OPEN_EXISTING, READ_CONTROL, WRITE_DAC,
         WRITE_OWNER,
     };
     use windows_sys::Win32::System::SystemServices::{
@@ -148,6 +308,74 @@ mod windows {
         | WRITE_OWNER
         | GENERIC_WRITE
         | GENERIC_ALL;
+
+    pub(super) fn open_or_create_owner_only_file(path: &Path) -> Result<File, SecureFileError> {
+        let process_sid = current_user_sid()?;
+        let descriptor = PrivateDescriptor::new(&process_sid, "")?;
+        let attributes = descriptor.security_attributes();
+        let wide = wide_path(path)?;
+        let raw = unsafe {
+            CreateFileW(
+                wide.as_ptr(),
+                FILE_GENERIC_READ | FILE_GENERIC_WRITE | READ_CONTROL | WRITE_DAC,
+                FILE_SHARE_READ | FILE_SHARE_WRITE,
+                &attributes,
+                OPEN_ALWAYS,
+                FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT,
+                null_mut(),
+            )
+        };
+        if raw == INVALID_HANDLE_VALUE {
+            return Err(SecureFileError::UnsafeOrUnavailable);
+        }
+        let handle = unsafe { OwnedHandle::from_raw_handle(raw) };
+        require_persistent_acls(&handle)?;
+        require_regular_single_link(&handle)?;
+
+        // SECURITY_ATTRIBUTES applies the policy atomically on creation.
+        // Existing files are verified as-is so an earlier broad ACL and any
+        // already-open handles can never be normalized into apparent safety.
+        verify_security(&handle, &process_sid, SecurityPolicy::OwnerOnly)?;
+        Ok(File::from(handle))
+    }
+
+    pub(super) fn open_or_create_owner_only_directory(
+        path: &Path,
+    ) -> Result<File, SecureFileError> {
+        let process_sid = current_user_sid()?;
+        let descriptor = PrivateDescriptor::new(&process_sid, "OICI")?;
+        let attributes = descriptor.security_attributes();
+        let wide = wide_path(path)?;
+        let created = unsafe { CreateDirectoryW(wide.as_ptr(), &attributes) };
+        if created == 0 && unsafe { GetLastError() } != ERROR_ALREADY_EXISTS {
+            return Err(SecureFileError::UnsafeOrUnavailable);
+        }
+        let raw = unsafe {
+            CreateFileW(
+                wide.as_ptr(),
+                FILE_READ_ATTRIBUTES | READ_CONTROL | WRITE_DAC,
+                FILE_SHARE_READ | FILE_SHARE_WRITE,
+                null(),
+                OPEN_EXISTING,
+                FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
+                null_mut(),
+            )
+        };
+        if raw == INVALID_HANDLE_VALUE {
+            return Err(SecureFileError::UnsafeOrUnavailable);
+        }
+        let handle = unsafe { OwnedHandle::from_raw_handle(raw) };
+        require_persistent_acls(&handle)?;
+        require_directory(&handle)?;
+        // CreateDirectoryW applies the protected DACL only to a new directory.
+        // Existing namespaces must already satisfy it before they are used.
+        verify_owner_only_security(
+            &handle,
+            &process_sid,
+            (OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE) as u8,
+        )?;
+        Ok(File::from(handle))
+    }
 
     pub(super) fn open_secure_file(
         path: &Path,
@@ -204,6 +432,28 @@ mod windows {
         Ok(())
     }
 
+    fn require_directory(handle: &OwnedHandle) -> Result<(), SecureFileError> {
+        if unsafe { GetFileType(raw_handle(handle)) } != FILE_TYPE_DISK {
+            return Err(SecureFileError::UnsafeOrUnavailable);
+        }
+        let mut attributes = FILE_ATTRIBUTE_TAG_INFO::default();
+        let loaded = unsafe {
+            GetFileInformationByHandleEx(
+                raw_handle(handle),
+                FileAttributeTagInfo,
+                (&mut attributes as *mut FILE_ATTRIBUTE_TAG_INFO).cast(),
+                size_of::<FILE_ATTRIBUTE_TAG_INFO>() as u32,
+            )
+        };
+        if loaded == 0
+            || attributes.FileAttributes & FILE_ATTRIBUTE_DIRECTORY == 0
+            || attributes.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT != 0
+        {
+            return Err(SecureFileError::UnsafeOrUnavailable);
+        }
+        Ok(())
+    }
+
     fn require_persistent_acls(handle: &OwnedHandle) -> Result<(), SecureFileError> {
         let mut flags = 0_u32;
         let loaded = unsafe {
@@ -242,7 +492,7 @@ mod windows {
             return Err(SecureFileError::UnsafeOrUnavailable);
         }
         match policy {
-            SecurityPolicy::OwnerOnly => verify_owner_only_dacl(&security, process_sid),
+            SecurityPolicy::OwnerOnly => verify_owner_only_dacl(&security, process_sid, 0),
             SecurityPolicy::OwnerControlled | SecurityPolicy::UserOrAdministratorControlled => {
                 verify_owner_controlled_dacl(&security, process_sid)
             }
@@ -252,6 +502,7 @@ mod windows {
     fn verify_owner_only_dacl(
         security: &SecurityView,
         process_sid: &ProcessSid,
+        expected_ace_flags: u8,
     ) -> Result<(), SecureFileError> {
         let mut control = 0_u16;
         let mut revision = 0_u32;
@@ -272,7 +523,7 @@ mod windows {
                 AceEntry::Denied => {}
                 AceEntry::Allowed(ace) => {
                     if owner_allow_seen
-                        || ace.flags != 0
+                        || ace.flags != expected_ace_flags
                         || normalized_file_access_mask(ace.mask) != FILE_ALL_ACCESS
                         || !ace_matches(&ace, process_sid)
                     {
@@ -286,6 +537,22 @@ mod windows {
         owner_allow_seen
             .then_some(())
             .ok_or(SecureFileError::UnsafeOrUnavailable)
+    }
+
+    fn verify_owner_only_security(
+        handle: &OwnedHandle,
+        process_sid: &ProcessSid,
+        expected_ace_flags: u8,
+    ) -> Result<(), SecureFileError> {
+        let security = read_security(handle)?;
+        if security.owner.is_null()
+            || unsafe { EqualSid(security.owner, process_sid.as_psid()) } == 0
+            || security.dacl.is_null()
+            || unsafe { IsValidAcl(security.dacl) } == 0
+        {
+            return Err(SecureFileError::UnsafeOrUnavailable);
+        }
+        verify_owner_only_dacl(&security, process_sid, expected_ace_flags)
     }
 
     fn normalized_file_access_mask(mask: u32) -> u32 {
@@ -483,6 +750,47 @@ mod windows {
         fn as_psid(&self) -> PSID {
             self.0.as_ptr().cast_mut().cast()
         }
+
+        fn sddl(&self) -> Result<String, SecureFileError> {
+            let mut raw = null_mut();
+            if unsafe { ConvertSidToStringSidW(self.as_psid(), &mut raw) } == 0 || raw.is_null() {
+                return Err(SecureFileError::UnsafeOrUnavailable);
+            }
+            let allocation = LocalWideString(raw);
+            allocation.to_string()
+        }
+    }
+
+    struct PrivateDescriptor(LocalMemory);
+
+    impl PrivateDescriptor {
+        fn new(process_sid: &ProcessSid, ace_flags: &str) -> Result<Self, SecureFileError> {
+            let sid = process_sid.sddl()?;
+            let sddl = format!("O:{sid}D:P(A;{ace_flags};FA;;;{sid})");
+            let wide = wide_string(&sddl)?;
+            let mut descriptor = null_mut();
+            if unsafe {
+                ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                    wide.as_ptr(),
+                    SDDL_REVISION_1,
+                    &mut descriptor,
+                    null_mut(),
+                )
+            } == 0
+                || descriptor.is_null()
+            {
+                return Err(SecureFileError::UnsafeOrUnavailable);
+            }
+            Ok(Self(LocalMemory(descriptor)))
+        }
+
+        fn security_attributes(&self) -> SECURITY_ATTRIBUTES {
+            SECURITY_ATTRIBUTES {
+                nLength: size_of::<SECURITY_ATTRIBUTES>() as u32,
+                lpSecurityDescriptor: self.0.as_ptr(),
+                bInheritHandle: 0,
+            }
+        }
     }
 
     struct SecurityView {
@@ -531,9 +839,38 @@ mod windows {
         }
     }
 
+    struct LocalWideString(*mut u16);
+
+    impl LocalWideString {
+        fn to_string(&self) -> Result<String, SecureFileError> {
+            const MAX_SID_STRING_UNITS: usize = 1024;
+
+            let length = (0..MAX_SID_STRING_UNITS)
+                .find(|index| unsafe { *self.0.add(*index) } == 0)
+                .ok_or(SecureFileError::UnsafeOrUnavailable)?;
+            String::from_utf16(unsafe { std::slice::from_raw_parts(self.0, length) })
+                .map_err(|_| SecureFileError::UnsafeOrUnavailable)
+        }
+    }
+
+    impl Drop for LocalWideString {
+        fn drop(&mut self) {
+            unsafe { LocalFree(self.0.cast::<c_void>() as HLOCAL) };
+        }
+    }
+
     fn wide_path(path: &Path) -> Result<Vec<u16>, SecureFileError> {
         let mut wide = path.as_os_str().encode_wide().collect::<Vec<_>>();
         if wide.is_empty() || wide.contains(&0) {
+            return Err(SecureFileError::UnsafeOrUnavailable);
+        }
+        wide.push(0);
+        Ok(wide)
+    }
+
+    fn wide_string(value: &str) -> Result<Vec<u16>, SecureFileError> {
+        let mut wide = value.encode_utf16().collect::<Vec<_>>();
+        if wide.contains(&0) {
             return Err(SecureFileError::UnsafeOrUnavailable);
         }
         wide.push(0);
@@ -576,9 +913,134 @@ mod tests {
     use super::*;
     #[cfg(any(unix, windows))]
     use std::fs;
+    #[cfg(any(unix, windows))]
+    use std::io::Write;
 
     #[cfg(unix)]
     use std::os::unix::fs::{PermissionsExt, symlink};
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn owner_only_files_are_private_before_callers_write() {
+        let directory = tempfile::tempdir().expect("create temporary directory");
+        let fresh = directory.path().join("fresh-owner-only");
+        let mut file = open_or_create_owner_only_file(&fresh).expect("create owner-only file");
+        file.write_all(b"fresh-secret")
+            .expect("write newly private file");
+        drop(file);
+        assert_eq!(
+            read_owner_only_secret_file(&fresh)
+                .expect("read newly private file")
+                .as_str(),
+            "fresh-secret"
+        );
+
+        let existing = directory.path().join("existing-owner-only");
+        let mut existing_file =
+            open_or_create_owner_only_file(&existing).expect("create existing private file");
+        existing_file
+            .write_all(b"existing-secret")
+            .expect("write existing private file");
+        drop(existing_file);
+        drop(open_or_create_owner_only_file(&existing).expect("reopen existing private file"));
+        assert_eq!(
+            read_owner_only_secret_file(&existing)
+                .expect("read existing private file")
+                .as_str(),
+            "existing-secret"
+        );
+
+        #[cfg(unix)]
+        {
+            fs::set_permissions(&existing, fs::Permissions::from_mode(0o644))
+                .expect("make existing file broadly readable");
+            assert!(matches!(
+                open_or_create_owner_only_file(&existing),
+                Err(SecureFileError::UnsafeOrUnavailable)
+            ));
+        }
+
+        let private_directory = directory.path().join("owner-only-directory");
+        let _directory_guard = open_or_create_owner_only_directory(&private_directory)
+            .expect("create owner-only directory");
+        let nested = private_directory.join("nested-owner-only");
+        let mut nested_file =
+            open_or_create_owner_only_file(&nested).expect("create file in owner-only directory");
+        nested_file
+            .write_all(b"nested-secret")
+            .expect("write nested owner-only file");
+        drop(nested_file);
+        assert_eq!(
+            read_owner_only_secret_file(&nested)
+                .expect("read nested owner-only file")
+                .as_str(),
+            "nested-secret"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn permissive_existing_directory_with_a_sidecar_is_rejected() {
+        let directory = tempfile::tempdir().expect("create temporary directory");
+        let history = directory.path().join("command-history");
+        fs::create_dir(&history).expect("create permissive history directory");
+        let sidecar = history.join("command-history.sqlite3-journal");
+        fs::write(&sidecar, b"planted-sidecar").expect("plant SQLite sidecar");
+        fs::set_permissions(&history, fs::Permissions::from_mode(0o770))
+            .expect("make history directory group writable");
+
+        assert!(matches!(
+            open_or_create_owner_only_directory(&history),
+            Err(SecureFileError::UnsafeOrUnavailable)
+        ));
+        assert_eq!(
+            fs::read(&sidecar).expect("read rejected sidecar"),
+            b"planted-sidecar"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_extended_and_inherited_acls_are_rejected() {
+        fn add_acl(path: &Path, entry: &str) {
+            let status = std::process::Command::new("chmod")
+                .arg("+a")
+                .arg(entry)
+                .arg(path)
+                .status()
+                .expect("run macOS chmod ACL command");
+            assert!(status.success(), "macOS chmod must add the test ACL");
+        }
+
+        let directory = tempfile::tempdir().expect("create temporary directory");
+        let existing = directory.path().join("existing-owner-only");
+        fs::write(&existing, b"existing-secret").expect("write existing private file");
+        fs::set_permissions(&existing, fs::Permissions::from_mode(0o600))
+            .expect("set owner-only mode");
+        add_acl(&existing, "everyone allow read");
+        assert!(matches!(
+            open_or_create_owner_only_file(&existing),
+            Err(SecureFileError::UnsafeOrUnavailable)
+        ));
+
+        let inheriting_parent = directory.path().join("inheriting-parent");
+        fs::create_dir(&inheriting_parent).expect("create ACL inheritance parent");
+        fs::set_permissions(&inheriting_parent, fs::Permissions::from_mode(0o700))
+            .expect("set owner-only parent mode");
+        add_acl(
+            &inheriting_parent,
+            "everyone allow read,file_inherit,directory_inherit",
+        );
+        let child = inheriting_parent.join("new-owner-only");
+        assert!(matches!(
+            open_or_create_owner_only_file(&child),
+            Err(SecureFileError::UnsafeOrUnavailable)
+        ));
+        assert!(
+            !child.exists(),
+            "ACL-bearing parents must be rejected before creation"
+        );
+    }
 
     #[cfg(unix)]
     #[test]

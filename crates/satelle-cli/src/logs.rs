@@ -60,6 +60,16 @@ pub(crate) struct LogsCommand {
     pub(crate) output_args: OutputArgs,
 }
 
+impl LogsCommand {
+    pub(super) fn history_host(&self) -> Option<&str> {
+        self.host.as_deref()
+    }
+
+    pub(super) fn history_session_id(&self) -> Option<&str> {
+        self.session.as_deref()
+    }
+}
+
 pub(crate) struct LogReadRequest {
     pub(crate) host: Option<String>,
     pub(crate) session: Option<String>,

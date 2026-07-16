@@ -15,6 +15,8 @@ cliclack.workspace = true
 flate2.workspace = true
 rmcp.workspace = true
 reqwest.workspace = true
+rusqlite.workspace = true
+rustix.workspace = true
 satelle-core = { path = "../satelle-core" }
 satelle-host = { path = "../satelle-host" }
 satelle-transport = { path = "../satelle-transport" }
@@ -59,6 +61,11 @@ required-features = ["test-support"]
 [[test]]
 name = "session-host-routing"
 path = "tests/session-host-routing.rs"
+required-features = ["test-support"]
+
+[[test]]
+name = "command-history"
+path = "tests/command-history.rs"
 required-features = ["test-support"]
 
 [[test]]

@@ -1,3 +1,5 @@
+#[path = "command-history.rs"]
+mod command_history;
 mod completions;
 #[path = "error-output.rs"]
 mod error_output;
@@ -39,6 +41,7 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::str::FromStr;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 use tailscale::transport_doctor_report;
 use transport::{
@@ -87,9 +90,10 @@ struct Cli {
     command: Command,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct ConfigContext<'a> {
     flag_profile: Option<&'a str>,
+    resolved: Arc<OnceLock<Result<ResolvedConfig, SatelleError>>>,
 }
 
 #[derive(Debug)]
@@ -104,13 +108,23 @@ impl From<(String, HostConfig)> for SelectedHost {
     }
 }
 
-impl ConfigContext<'_> {
-    fn load(self) -> Result<ResolvedConfig, CliFailure> {
-        let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-        load_config(&cwd, self.flag_profile).map_err(failure)
+impl<'a> ConfigContext<'a> {
+    fn new(flag_profile: Option<&'a str>) -> Self {
+        Self {
+            flag_profile,
+            resolved: Arc::new(OnceLock::new()),
+        }
     }
 
-    fn resolve_host(self, flag_host: Option<&str>) -> Result<SelectedHost, CliFailure> {
+    fn load(&self) -> Result<&ResolvedConfig, CliFailure> {
+        let resolved = self.resolved.get_or_init(|| {
+            let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+            load_config(&cwd, self.flag_profile)
+        });
+        resolved.as_ref().map_err(|error| failure(error.clone()))
+    }
+
+    fn resolve_host(&self, flag_host: Option<&str>) -> Result<SelectedHost, CliFailure> {
         self.load()?
             .resolve_host(flag_host)
             .map(SelectedHost::from)
@@ -540,6 +554,7 @@ enum EventMode {
 
 struct CliFailure {
     error: SatelleError,
+    history_session_id: Option<Box<SessionId>>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, ValueEnum)]
@@ -586,7 +601,7 @@ fn main() -> ExitCode {
     let error_format =
         ErrorFormat::resolve(cli.error_format, cli.command.requests_machine_errors());
 
-    match try_main(cli) {
+    match try_main(cli, error_format) {
         Ok(()) => ExitCode::SUCCESS,
         Err(failure) => {
             print_error(&failure.error, error_format);
@@ -613,13 +628,41 @@ fn parser_error_format(args: &[std::ffi::OsString]) -> ErrorFormat {
     ErrorFormat::resolve(configured, machine_selector)
 }
 
-fn try_main(cli: Cli) -> Result<(), CliFailure> {
+fn try_main(cli: Cli, error_format: ErrorFormat) -> Result<(), CliFailure> {
     let Cli {
         no_color,
         profile,
         error_format: _,
         command,
     } = cli;
+    let config = ConfigContext::new(profile.as_deref());
+    let history = start_command_history(&command, &config);
+    let outcome = execute_command(command, no_color, profile.as_deref(), config);
+
+    if let Some(history) = history {
+        let session_id = match &outcome {
+            Ok(session_id) => session_id.as_ref(),
+            Err(failure) => failure.history_session_id.as_deref(),
+        };
+        let error_code = outcome.as_ref().err().map(|failure| failure.error.code);
+        if let Err(error) = history.finish(session_id, error_code)
+            && error_format == ErrorFormat::Human
+        {
+            // History is non-authoritative and cannot replace the command's
+            // outcome, but operators still need to know when a row was lost.
+            eprintln!("warning: command history was not recorded: {error}");
+        }
+    }
+
+    outcome.map(|_| ())
+}
+
+fn execute_command(
+    command: Command,
+    no_color: bool,
+    profile: Option<&str>,
+    config: ConfigContext<'_>,
+) -> Result<Option<SessionId>, CliFailure> {
     let early_lifecycle_host = explicit_lifecycle_json_host(&command).map(str::to_owned);
     let (output_args, event_output) = command.output_request();
     let output = match output_args.resolve(event_output) {
@@ -635,29 +678,276 @@ fn try_main(cli: Cli) -> Result<(), CliFailure> {
         }
     };
     let human_style = HumanStyle::detect(no_color);
-    let config = ConfigContext {
-        flag_profile: profile.as_deref(),
-    };
 
     match command {
-        Command::Completions(command) => run_completions(command).map_err(failure),
-        Command::Setup(command) => run_setup(command, human_style, config, output),
-        Command::Repair(command) => run_repair(command),
-        Command::Doctor(command) => run_doctor(command, config, output),
-        Command::Config { command } => run_config(command, config, output),
-        Command::Paths(command) => show_paths(command, output),
-        Command::Host { command } => run_host(command, config, output),
-        Command::SelfCtl { command } => run_self(command),
-        Command::Run(command) => run_prompt(command, config, output),
-        Command::Steer(command) => steer_prompt(command, config, output),
-        Command::Status(command) => show_status(command, config, output),
-        Command::Stop(command) => stop_session(command, config, output),
-        Command::Logs(command) => show_logs(command, config, output),
+        Command::Completions(command) => run_completions(command).map_err(failure).map(|_| None),
+        Command::Setup(command) => run_setup(command, human_style, config, output).map(|_| None),
+        Command::Repair(command) => run_repair(command).map(|_| None),
+        Command::Doctor(command) => run_doctor(command, config, output).map(|_| None),
+        Command::Config { command } => run_config(command, config, output).map(|_| None),
+        Command::Paths(command) => show_paths(command, output).map(|_| None),
+        Command::Host { command } => run_host(command, config, output).map(|_| None),
+        Command::SelfCtl { command } => run_self(command).map(|_| None),
+        Command::Run(command) => run_prompt(command, config, output).map(Some),
+        Command::Steer(command) => steer_prompt(command, config, output).map(Some),
+        Command::Status(command) => show_status(command, config, output).map(|_| None),
+        Command::Stop(command) => stop_session(command, config, output).map(|_| None),
+        Command::Logs(command) => show_logs(command, config, output).map(|_| None),
         Command::Mcp {
             command: McpCommand::Serve,
-        } => mcp::serve(profile.as_deref()),
-        Command::Support { command } => run_support(command),
+        } => mcp::serve(profile).map(|_| None),
+        Command::Support { command } => run_support(command).map(|_| None),
     }
+}
+
+struct HistoryTarget<'a> {
+    family: &'static str,
+    selects_host: bool,
+    explicit_host: Option<&'a str>,
+    session_id: Option<String>,
+}
+
+fn start_command_history(
+    command: &Command,
+    config: &ConfigContext<'_>,
+) -> Option<command_history::Recorder> {
+    let selects_profile = !matches!(
+        command,
+        Command::Config {
+            command: ConfigCommand::Check(command),
+        } if command.all
+    );
+    let target = history_target(command)?;
+    let environment_preference = command_history_environment_preference();
+    if environment_preference == Some(false) {
+        return None;
+    }
+
+    // Reuse the same cached resolution that command dispatch consumes. Raw
+    // CLI and environment selectors never cross the history boundary: only
+    // profile and host names accepted by the configuration resolver do.
+    let resolved = match config.load() {
+        Ok(resolved) => Some(resolved),
+        // An invalid configuration may contain an opt-out that could not be
+        // decoded safely. Fail closed unless the environment explicitly
+        // overrides configuration and enables history.
+        Err(_) if environment_preference == Some(true) => None,
+        Err(_) => return None,
+    };
+    let config_enabled = resolved
+        .and_then(|resolved| resolved.config.command_history)
+        .unwrap_or(true);
+    if !environment_preference.unwrap_or(config_enabled) {
+        return None;
+    }
+
+    let selected_profile = selects_profile
+        .then(|| {
+            resolved.and_then(|resolved| {
+                resolved
+                    .selected_profile
+                    .as_ref()
+                    .map(|profile| profile.name.clone())
+            })
+        })
+        .flatten();
+    let selected_host = if target.selects_host {
+        resolved
+            .and_then(|resolved| resolved.resolve_host(target.explicit_host).ok())
+            .map(|(alias, _)| alias)
+    } else {
+        None
+    };
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let cache_root = resolve_path_set(&cwd).ok()?.cache_root;
+    let invocation = command_history::Invocation::new(
+        target.family,
+        selected_host,
+        selected_profile,
+        target.session_id,
+    );
+    Some(command_history::Recorder::start(cache_root, invocation))
+}
+
+fn history_target(command: &Command) -> Option<HistoryTarget<'_>> {
+    let target = match command {
+        // A dry-run must not mutate any declared state or cache path. The
+        // corresponding mutating invocation is still recorded when executed.
+        Command::Setup(command) if command.dry_run => return None,
+        Command::Setup(command) => HistoryTarget {
+            family: "setup",
+            selects_host: true,
+            explicit_host: command.host.as_deref(),
+            session_id: None,
+        },
+        Command::Repair(command) if command.dry_run => return None,
+        Command::Repair(command) => HistoryTarget {
+            family: "repair",
+            selects_host: true,
+            explicit_host: command.host.as_deref(),
+            session_id: None,
+        },
+        Command::Doctor(command) => HistoryTarget {
+            family: "doctor",
+            selects_host: true,
+            explicit_host: command.host.as_deref(),
+            session_id: None,
+        },
+        Command::Config { command } => HistoryTarget {
+            family: "config",
+            selects_host: match command {
+                ConfigCommand::Check(command) => !command.all,
+                ConfigCommand::Explain(_) => true,
+            },
+            explicit_host: match command {
+                ConfigCommand::Check(command) => command.host.as_deref(),
+                ConfigCommand::Explain(command) => command.host.as_deref(),
+            },
+            session_id: None,
+        },
+        Command::Host {
+            command: HostCommand::Update(command),
+        } if command.dry_run => return None,
+        Command::Host {
+            command:
+                HostCommand::Storage {
+                    command: HostStorageCommand::Migrate(command),
+                },
+        } if command.dry_run => return None,
+        Command::Host { command } => HistoryTarget {
+            family: "host",
+            selects_host: match command {
+                HostCommand::Start(command) => {
+                    !command.foreground && !command.bootstrap_token_stdin
+                }
+                HostCommand::Update(command) => command.host.len() == 1 && !command.all_remotes,
+                _ => true,
+            },
+            explicit_host: match command {
+                HostCommand::Start(_) => None,
+                HostCommand::Trust(command) => Some(command.host.as_str()),
+                HostCommand::Status(command) => command.host.as_deref(),
+                HostCommand::Stop(command) | HostCommand::Restart(command) => {
+                    command.host.as_deref()
+                }
+                HostCommand::Update(command) => (command.host.len() == 1 && !command.all_remotes)
+                    .then(|| command.host[0].as_str()),
+                HostCommand::Sessions(command) => command.host.as_deref(),
+                HostCommand::Storage {
+                    command: HostStorageCommand::Migrate(command),
+                } => command.host.as_deref(),
+            },
+            session_id: None,
+        },
+        Command::Run(command) => HistoryTarget {
+            family: "run",
+            selects_host: true,
+            explicit_host: command.host.as_deref(),
+            session_id: None,
+        },
+        Command::Steer(command) => HistoryTarget {
+            family: "steer",
+            selects_host: true,
+            explicit_host: command.host.as_deref(),
+            session_id: canonical_history_session_id(&command.session_id),
+        },
+        Command::Status(command) => HistoryTarget {
+            family: "status",
+            selects_host: true,
+            explicit_host: command.host.as_deref(),
+            session_id: canonical_history_session_id(&command.session_id),
+        },
+        Command::Stop(command) => HistoryTarget {
+            family: "stop",
+            selects_host: true,
+            explicit_host: command.host.as_deref(),
+            session_id: canonical_history_session_id(&command.session_id),
+        },
+        Command::Logs(command) => HistoryTarget {
+            family: "logs",
+            selects_host: true,
+            explicit_host: command.history_host(),
+            session_id: command
+                .history_session_id()
+                .and_then(canonical_history_session_id),
+        },
+        Command::Mcp { .. } => HistoryTarget {
+            family: "mcp",
+            selects_host: false,
+            explicit_host: None,
+            session_id: None,
+        },
+        Command::Completions(_)
+        | Command::Paths(_)
+        | Command::SelfCtl { .. }
+        | Command::Support { .. } => return None,
+    };
+    Some(target)
+}
+
+fn command_history_environment_preference() -> Option<bool> {
+    let value = match std::env::var("SATELLE_COMMAND_HISTORY") {
+        Ok(value) => value,
+        Err(std::env::VarError::NotPresent) => return None,
+        // A present value that cannot be decoded is still an explicit,
+        // malformed preference. History contains operational metadata, so it
+        // must fail closed just like an unrecognized Unicode value.
+        Err(std::env::VarError::NotUnicode(_)) => return Some(false),
+    };
+    match value.to_ascii_lowercase().as_str() {
+        "1" | "true" | "on" | "yes" => Some(true),
+        "0" | "false" | "off" | "no" => Some(false),
+        // History contains operational metadata. A malformed opt-out must not
+        // silently fall back to enabled recording.
+        _ => Some(false),
+    }
+}
+
+#[cfg(test)]
+mod history_target_tests {
+    use super::*;
+
+    fn host_start(foreground: bool, bootstrap_token_stdin: bool) -> Command {
+        Command::Host {
+            command: HostCommand::Start(HostStartCommand {
+                bind: "127.0.0.1:3001".to_string(),
+                foreground,
+                bootstrap_token_stdin,
+                bootstrap_native_readiness_timeout_ms: None,
+                bootstrap_provider_smoke_timeout_ms: None,
+                output_args: OutputArgs::default(),
+            }),
+        }
+    }
+
+    #[test]
+    fn only_on_demand_host_start_selects_a_configured_host() {
+        let on_demand = host_start(false, false);
+        let foreground = host_start(true, false);
+        let ssh_bootstrap = host_start(false, true);
+
+        assert!(
+            history_target(&on_demand)
+                .expect("on-demand target")
+                .selects_host
+        );
+        assert!(
+            !history_target(&foreground)
+                .expect("foreground target")
+                .selects_host
+        );
+        assert!(
+            !history_target(&ssh_bootstrap)
+                .expect("SSH bootstrap target")
+                .selects_host
+        );
+    }
+}
+
+fn canonical_history_session_id(value: &str) -> Option<String> {
+    SessionId::from_str(value)
+        .ok()
+        .map(|session| session.to_string())
 }
 
 fn explicit_lifecycle_json_host(command: &Command) -> Option<&str> {
@@ -1096,7 +1386,7 @@ fn run_doctor(
     };
     let options = DoctorOptions::new(command.refresh, timeout);
     let provider_intent = match doctor_provider_intent(
-        &resolved_config,
+        resolved_config,
         &host.config,
         command.refresh,
         options.probe_timeout(),
@@ -1175,8 +1465,10 @@ fn fail_doctor(
     scope: Option<&str>,
 ) -> Result<(), CliFailure> {
     if events {
-        print_doctor_failed_event(target, scope, &failure.error)
-            .map_err(|error| CliFailure { error })?;
+        print_doctor_failed_event(target, scope, &failure.error).map_err(|error| CliFailure {
+            error,
+            history_session_id: None,
+        })?;
     }
 
     Err(failure)
@@ -2493,7 +2785,7 @@ fn run_prompt(
     command: RunCommand,
     config_context: ConfigContext<'_>,
     format: OutputFormat,
-) -> Result<(), CliFailure> {
+) -> Result<SessionId, CliFailure> {
     let json = format.is_json();
     validate_event_mode(command.detach, command.events)?;
     let effective_mode = effective_event_mode(command.events, command.detach, command.quiet, json);
@@ -2538,7 +2830,7 @@ fn run_prompt(
     };
     let effective_timeouts = effective_timeouts_json(&host.config);
     let yolo_policy = resolve_yolo_policy(
-        &config,
+        config,
         &host.alias,
         &host.config,
         command.yolo,
@@ -2547,7 +2839,7 @@ fn run_prompt(
     let experimental_provider_computer_use = resolve_experimental_provider_computer_use(
         command.experimental_provider_computer_use,
         &host.config,
-        &config,
+        config,
     );
     let request = TurnRequest::new(prompt)
         .with_execution_mode(yolo_policy.execution_mode())
@@ -2575,6 +2867,9 @@ fn run_prompt(
     let outcome = match transport.run(&request, &mut |event| event_output.emit(event)) {
         Ok(outcome) => outcome,
         Err(attached_failure) => {
+            let history_session_id = attached_failure
+                .durable_handles()
+                .map(|(session_id, _)| Box::new(session_id.clone()));
             event_output
                 .emit_command_failed(
                     &host.alias,
@@ -2582,8 +2877,14 @@ fn run_prompt(
                     attached_failure.phase(),
                     attached_failure.durable_handles(),
                 )
-                .map_err(failure)?;
-            return Err(failure(attached_failure.into_error()));
+                .map_err(|error| CliFailure {
+                    error,
+                    history_session_id: history_session_id.clone(),
+                })?;
+            return Err(CliFailure {
+                error: attached_failure.into_error(),
+                history_session_id,
+            });
         }
     };
     print_turn_session(
@@ -2604,7 +2905,7 @@ fn steer_prompt(
     command: SteerCommand,
     config_context: ConfigContext<'_>,
     format: OutputFormat,
-) -> Result<(), CliFailure> {
+) -> Result<SessionId, CliFailure> {
     let json = format.is_json();
     validate_event_mode(command.detach, command.events)?;
     let effective_mode = effective_event_mode(command.events, command.detach, command.quiet, json);
@@ -2654,7 +2955,7 @@ fn steer_prompt(
     };
     let effective_timeouts = effective_timeouts_json(&host.config);
     let yolo_policy = resolve_yolo_policy(
-        &config,
+        config,
         &host.alias,
         &host.config,
         command.yolo,
@@ -2663,7 +2964,7 @@ fn steer_prompt(
     let experimental_provider_computer_use = resolve_experimental_provider_computer_use(
         command.experimental_provider_computer_use,
         &host.config,
-        &config,
+        config,
     );
     let request = TurnRequest::new(prompt)
         .with_execution_mode(yolo_policy.execution_mode())
@@ -2694,6 +2995,9 @@ fn steer_prompt(
         match transport.steer(&session_id, &request, &mut |event| event_output.emit(event)) {
             Ok(outcome) => outcome,
             Err(attached_failure) => {
+                let history_session_id = attached_failure
+                    .durable_handles()
+                    .map(|(session_id, _)| Box::new(session_id.clone()));
                 event_output
                     .emit_command_failed(
                         &host.alias,
@@ -2701,8 +3005,14 @@ fn steer_prompt(
                         attached_failure.phase(),
                         attached_failure.durable_handles(),
                     )
-                    .map_err(failure)?;
-                return Err(failure(attached_failure.into_error()));
+                    .map_err(|error| CliFailure {
+                        error,
+                        history_session_id: history_session_id.clone(),
+                    })?;
+                return Err(CliFailure {
+                    error: attached_failure.into_error(),
+                    history_session_id,
+                });
             }
         };
     print_turn_session(
@@ -2853,7 +3163,7 @@ struct TurnOutputOptions<'a> {
 fn print_turn_session(
     outcome: AttachedTurnOutcome,
     options: TurnOutputOptions<'_>,
-) -> Result<(), CliFailure> {
+) -> Result<SessionId, CliFailure> {
     let AttachedTurnOutcome {
         session,
         turn_id,
@@ -2864,8 +3174,9 @@ fn print_turn_session(
         .iter()
         .find(|turn| turn.turn_id() == &turn_id)
         .expect("an attached Turn outcome retains its admitted target Turn");
+    let session_id = session.session_id().clone();
     if options.effective_mode == EffectiveEventMode::Json {
-        return Ok(());
+        return Ok(session_id);
     }
 
     if options.json {
@@ -2878,14 +3189,14 @@ fn print_turn_session(
             "yolo": yolo_state_json(options.yolo_policy),
             "latest_turn": target_turn,
         }))
-        .map_err(failure)
+        .map_err(|error| failure_for_admitted_session(error, &session_id))?;
     } else {
         if options.yolo_policy.active && !options.quiet {
             println!("YOLO mode: active ({})", options.yolo_policy.source);
         }
         print_session_human(&session, target_turn, options.host);
-        Ok(())
     }
+    Ok(session_id)
 }
 
 fn print_detached_session(
@@ -2895,7 +3206,8 @@ fn print_detached_session(
     yolo_policy: &YoloPolicy,
     schema_version: SessionResultSchemaVersion,
     json: bool,
-) -> Result<(), CliFailure> {
+) -> Result<SessionId, CliFailure> {
+    let session_id = session.session_id().clone();
     let latest_turn = latest_turn(&session);
     if json {
         print_json(&json!({
@@ -2909,15 +3221,15 @@ fn print_detached_session(
             "yolo": yolo_state_json(yolo_policy),
             "turns": session.turns(),
         }))
-        .map_err(failure)
+        .map_err(|error| failure_for_admitted_session(error, &session_id))?;
     } else {
         if yolo_policy.active {
             println!("YOLO mode: active ({})", yolo_policy.source);
         }
         println!("Session: {}", session.session_id());
         println!("Status: {}", status_label(latest_turn.state()));
-        Ok(())
     }
+    Ok(session_id)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -3147,7 +3459,33 @@ fn print_json(value: &impl serde::Serialize) -> Result<(), SatelleError> {
 }
 
 fn failure(error: SatelleError) -> CliFailure {
-    CliFailure { error }
+    CliFailure {
+        error,
+        history_session_id: None,
+    }
+}
+
+fn failure_for_admitted_session(error: SatelleError, session_id: &SessionId) -> CliFailure {
+    CliFailure {
+        error,
+        history_session_id: Some(Box::new(session_id.clone())),
+    }
+}
+
+#[cfg(test)]
+mod admitted_session_failure_tests {
+    use super::*;
+
+    #[test]
+    fn retains_the_durable_session_id() {
+        let session_id = SessionId::new();
+        let failure = failure_for_admitted_session(
+            SatelleError::input_required("synthetic output failure"),
+            &session_id,
+        );
+
+        assert_eq!(failure.history_session_id.as_deref(), Some(&session_id));
+    }
 }
 
 #[derive(Clone, Copy)]
