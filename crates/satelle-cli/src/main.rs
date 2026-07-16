@@ -792,7 +792,9 @@ fn history_target(command: &Command) -> Option<HistoryTarget<'_>> {
         Command::Repair(command) => HistoryTarget {
             family: "repair",
             selects_host: true,
-            explicit_host: command.host.as_deref(),
+            // Repair does not consume ConfigContext; its handler defaults
+            // directly to the local demo Host when --host is absent.
+            explicit_host: Some(command.host.as_deref().unwrap_or(LOCAL_DEMO_HOST)),
             session_id: None,
         },
         Command::Doctor(command) => HistoryTarget {
@@ -836,14 +838,14 @@ fn history_target(command: &Command) -> Option<HistoryTarget<'_>> {
                 HostCommand::Trust(command) => Some(command.host.as_str()),
                 HostCommand::Status(command) => command.host.as_deref(),
                 HostCommand::Stop(command) | HostCommand::Restart(command) => {
-                    command.host.as_deref()
+                    Some(command.host.as_deref().unwrap_or(LOCAL_DEMO_HOST))
                 }
                 HostCommand::Update(command) => (command.host.len() == 1 && !command.all_remotes)
                     .then(|| command.host[0].as_str()),
                 HostCommand::Sessions(command) => command.host.as_deref(),
                 HostCommand::Storage {
                     command: HostStorageCommand::Migrate(command),
-                } => command.host.as_deref(),
+                } => Some(command.host.as_deref().unwrap_or(LOCAL_DEMO_HOST)),
             },
             session_id: None,
         },

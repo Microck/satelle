@@ -339,6 +339,59 @@ fn multi_host_updates_are_not_attributed_to_the_default_host() {
 }
 
 #[test]
+fn config_independent_lifecycle_commands_record_their_local_default() {
+    let fixture = Fixture::new();
+    let config_path = fixture.cache.path().join("remote-default-config.toml");
+    test_file::write_user_controlled(
+        &config_path,
+        br#"
+default_host = "remote"
+
+[hosts.remote]
+transport = "local"
+adapter = "fake"
+
+[hosts.local-demo]
+transport = "local"
+adapter = "fake"
+"#,
+    )
+    .expect("write remote-default config");
+
+    for arguments in [
+        vec!["repair", "--yes", "--json"],
+        vec!["host", "stop", "--json"],
+        vec!["host", "restart", "--json"],
+        vec!["host", "storage", "migrate", "--json"],
+    ] {
+        fixture
+            .command()
+            .env("SATELLE_CONFIG_FILE", &config_path)
+            .args(arguments)
+            .assert()
+            .failure();
+    }
+
+    let connection = fixture.connection();
+    let selected_hosts = connection
+        .prepare("SELECT selected_host FROM command_history ORDER BY id")
+        .expect("prepare local lifecycle history query")
+        .query_map([], |row| row.get::<_, Option<String>>(0))
+        .expect("query local lifecycle history")
+        .collect::<Result<Vec<_>, _>>()
+        .expect("read local lifecycle history");
+    assert_eq!(
+        selected_hosts,
+        vec![
+            Some("local-demo".to_string()),
+            Some("local-demo".to_string()),
+            Some("local-demo".to_string()),
+            Some("local-demo".to_string()),
+        ]
+    );
+}
+
+#[test]
 fn history_failures_do_not_corrupt_json_error_output() {
     let fixture = Fixture::new();
     fs::create_dir(fixture.history_root()).expect("create command-history directory");
