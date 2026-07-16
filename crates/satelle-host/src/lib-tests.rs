@@ -19,7 +19,7 @@ fn admission_request_timeout_tracks_both_configured_readiness_phases() {
         .expect("built-in Host config exists");
     assert_eq!(
         admission_request_timeout(&config),
-        std::time::Duration::from_secs(245)
+        std::time::Duration::from_secs(250)
     );
 
     config.timeouts = Some(satelle_core::TimeoutConfig {
@@ -28,7 +28,7 @@ fn admission_request_timeout_tracks_both_configured_readiness_phases() {
     });
     assert_eq!(
         admission_request_timeout(&config),
-        std::time::Duration::from_secs(10)
+        std::time::Duration::from_secs(15)
     );
 }
 

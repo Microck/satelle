@@ -36,6 +36,9 @@ pub struct DaemonEventStream {
 const CONTROL_CLOSE_TIMEOUT: Duration = Duration::from_secs(1);
 const EVENT_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
 const EVENT_STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(45);
+// Match the daemon's advertised outbound queue so a pending admission cannot turn a bounded
+// transport queue into an unbounded client allocation.
+const MAX_ADMISSION_BUFFERED_EVENTS: usize = 256;
 
 pub struct DaemonEventClient {
     endpoint: EventEndpoint,
@@ -200,17 +203,46 @@ impl DaemonEventStream {
     pub async fn buffer_events_until<F>(
         &mut self,
         future: F,
-    ) -> Result<(F::Output, Vec<SatelleEvent>), DaemonEventError>
+    ) -> (F::Output, Vec<SatelleEvent>, Option<DaemonEventError>)
     where
         F: Future,
     {
+        self.buffer_events_until_observing(future, |_| {}).await
+    }
+
+    async fn buffer_events_until_observing<F, O>(
+        &mut self,
+        future: F,
+        on_stream_error: O,
+    ) -> (F::Output, Vec<SatelleEvent>, Option<DaemonEventError>)
+    where
+        F: Future,
+        O: FnOnce(&DaemonEventError),
+    {
         let mut future = std::pin::pin!(future);
         let mut buffered_events = Vec::new();
+        let mut on_stream_error = Some(on_stream_error);
         loop {
             tokio::select! {
                 biased;
-                output = &mut future => return Ok((output, buffered_events)),
-                event = self.next_event() => buffered_events.push(event?),
+                output = &mut future => return (output, buffered_events, None),
+                event = self.next_event() => match event {
+                    Ok(event) => {
+                        if let Err(error) = buffer_admission_event(&mut buffered_events, event) {
+                            on_stream_error.take().expect("stream error observer exists")(&error);
+                            let output = future.await;
+                            return (output, buffered_events, Some(error));
+                        }
+                    }
+                    Err(error) => {
+                        // The blocking HTTP request cannot be cancelled by dropping its JoinHandle.
+                        // Preserve this stream failure until the admission result establishes
+                        // whether the existing reconnect and reconciliation path owns recovery.
+                        on_stream_error.take().expect("stream error observer exists")(&error);
+                        let output = future.await;
+                        return (output, buffered_events, Some(error));
+                    }
+                },
             }
         }
     }
@@ -284,6 +316,17 @@ impl DaemonEventStream {
             }
         }
     }
+}
+
+fn buffer_admission_event(
+    buffered_events: &mut Vec<SatelleEvent>,
+    event: SatelleEvent,
+) -> Result<(), DaemonEventError> {
+    if buffered_events.len() >= MAX_ADMISSION_BUFFERED_EVENTS {
+        return Err(DaemonEventError::AdmissionEventBufferOverflow);
+    }
+    buffered_events.push(event);
+    Ok(())
 }
 
 async fn read_control(
@@ -479,6 +522,7 @@ pub enum DaemonEventError {
     TlsHandshake(WebSocketError),
     HandshakeTimeout,
     StreamIdleTimeout,
+    AdmissionEventBufferOverflow,
     InvalidHandshakeResponse,
     Connect(std::io::Error),
     Transport(WebSocketError),
@@ -509,15 +553,16 @@ pub enum DaemonEventError {
 }
 
 impl DaemonEventError {
-    /// Returns true only when the event contract remains trustworthy and the
-    /// underlying connection itself was lost. Protocol, identity, TLS, frame,
-    /// and sequence failures must never be hidden by status reconciliation.
+    /// Returns true only when authoritative status reconciliation can safely
+    /// recover from connection loss or a bounded local event backlog. Protocol,
+    /// identity, TLS, frame, and sequence failures must remain visible.
     pub fn is_recoverable_disconnect(&self) -> bool {
         matches!(
             self,
             Self::Connect(_)
                 | Self::HandshakeTimeout
                 | Self::StreamIdleTimeout
+                | Self::AdmissionEventBufferOverflow
                 | Self::Disconnected
                 | Self::Transport(WebSocketError::ConnectionClosed | WebSocketError::Io(_))
                 | Self::Closed {
@@ -551,6 +596,9 @@ impl fmt::Display for DaemonEventError {
             Self::HandshakeTimeout => "the live event handshake timed out",
             Self::StreamIdleTimeout => {
                 "the live event stream timed out while waiting for the next frame"
+            }
+            Self::AdmissionEventBufferOverflow => {
+                "the pending admission exceeded the live event buffer limit"
             }
             Self::InvalidHandshakeResponse => {
                 "the Host Daemon returned an invalid WebSocket handshake response"

@@ -622,6 +622,7 @@ fn direct_event_error(host: &str, error: DaemonEventError) -> SatelleError {
         } => api_code_error(host, control.code()),
         DaemonEventError::HandshakeTimeout
         | DaemonEventError::StreamIdleTimeout
+        | DaemonEventError::AdmissionEventBufferOverflow
         | DaemonEventError::Connect(_)
         | DaemonEventError::Transport(_)
         | DaemonEventError::Closed { control: None, .. }

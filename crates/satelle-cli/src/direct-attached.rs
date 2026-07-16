@@ -183,6 +183,7 @@ impl DirectTransport {
         mut stream: DaemonEventStream,
         admitted: PublicSession,
         buffered_events: Vec<SatelleEvent>,
+        initial_connection_error: Option<DaemonEventError>,
         on_event: &mut dyn FnMut(SatelleEvent) -> Result<(), SatelleError>,
     ) -> Result<AttachedTurnOutcome, SatelleError> {
         let session_id = admitted.session_id().clone();
@@ -197,11 +198,15 @@ impl DirectTransport {
         let mut reconnect_attempts = 0_usize;
         let mut provider_smoke = None;
         let mut buffered_events = VecDeque::from(buffered_events);
+        let mut initial_connection_error = initial_connection_error;
 
         loop {
             let next_event = match buffered_events.pop_front() {
                 Some(event) => Ok(event),
-                None => stream.next_event().await,
+                None => match initial_connection_error.take() {
+                    Some(error) => Err(error),
+                    None => stream.next_event().await,
+                },
             };
             match next_event {
                 Ok(event) => {
@@ -364,7 +369,7 @@ impl DirectTransport {
             .map_err(|error| TurnAdmissionFailure::not_admitted(self.run_event_error(error)))?;
         let request = request.clone();
         let idempotency_key = Self::idempotency_key();
-        let (admitted, buffered_events) = stream
+        let (admitted, buffered_events, initial_connection_error) = stream
             .buffer_events_until(self.blocking_admission_http(
                 move |client| {
                     client
@@ -373,10 +378,7 @@ impl DirectTransport {
                 },
                 self.run_admission_error(),
             ))
-            .await
-            .map_err(|error| {
-                TurnAdmissionFailure::admission_unknown(self.run_event_error(error))
-            })?;
+            .await;
         let admitted = admitted?;
         let turn_id = admitted
             .turns()
@@ -385,9 +387,15 @@ impl DirectTransport {
             .turn_id()
             .clone();
         let admitted_snapshot = admitted.clone();
-        self.follow_turn(stream, admitted, buffered_events, on_event)
-            .await
-            .map_err(|error| TurnAdmissionFailure::admitted(error, admitted_snapshot, turn_id))
+        self.follow_turn(
+            stream,
+            admitted,
+            buffered_events,
+            initial_connection_error,
+            on_event,
+        )
+        .await
+        .map_err(|error| TurnAdmissionFailure::admitted(error, admitted_snapshot, turn_id))
     }
 
     pub(super) async fn steer_attached(
@@ -408,7 +416,7 @@ impl DirectTransport {
         let admitted_session_id = session_id.clone();
         let request = request.clone();
         let idempotency_key = Self::idempotency_key();
-        let (admitted, buffered_events) = stream
+        let (admitted, buffered_events, initial_connection_error) = stream
             .buffer_events_until(self.blocking_admission_http(
                 move |client| {
                     client
@@ -417,10 +425,7 @@ impl DirectTransport {
                 },
                 direct_admission_error,
             ))
-            .await
-            .map_err(|error| {
-                TurnAdmissionFailure::admission_unknown(direct_event_error(&self.alias, error))
-            })?;
+            .await;
         let admitted = admitted?;
         if admitted.session_id() != session_id || admitted.turns().is_empty() {
             return Err(TurnAdmissionFailure::admission_unknown(
@@ -434,9 +439,15 @@ impl DirectTransport {
             .turn_id()
             .clone();
         let admitted_snapshot = admitted.clone();
-        self.follow_turn(stream, admitted, buffered_events, on_event)
-            .await
-            .map_err(|error| TurnAdmissionFailure::admitted(error, admitted_snapshot, turn_id))
+        self.follow_turn(
+            stream,
+            admitted,
+            buffered_events,
+            initial_connection_error,
+            on_event,
+        )
+        .await
+        .map_err(|error| TurnAdmissionFailure::admitted(error, admitted_snapshot, turn_id))
     }
 }
 

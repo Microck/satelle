@@ -249,10 +249,9 @@ async fn post_handshake_silence_is_a_recoverable_stream_timeout() {
 }
 
 #[tokio::test]
-async fn pending_operation_buffers_events_and_services_heartbeats() {
+async fn pending_operation_buffers_events_services_heartbeats_and_retains_disconnect() {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind event peer");
     let address = listener.local_addr().expect("read event peer address");
-    let (admission_finished, await_admission) = tokio::sync::oneshot::channel();
     let server = std::thread::spawn(move || {
         let (stream, _) = listener.accept().expect("accept event client");
         let mut socket =
@@ -300,9 +299,7 @@ async fn pending_operation_buffers_events_and_services_heartbeats() {
             .expect("send heartbeat");
         let pong = socket.read().expect("read heartbeat response");
         assert_eq!(pong, Message::Pong(vec![1, 2, 3].into()));
-        admission_finished
-            .send("admitted")
-            .expect("complete pending admission");
+        socket.close(None).expect("close event stream");
     });
     let client = DaemonEventClient::loopback(
         address,
@@ -315,14 +312,33 @@ async fn pending_operation_buffers_events_and_services_heartbeats() {
         .await
         .expect("complete event subscription");
 
-    let (outcome, buffered_events) = stream
-        .buffer_events_until(await_admission)
-        .await
-        .expect("keep stream alive during pending admission");
+    let (stream_failed, await_stream_failure) = tokio::sync::oneshot::channel();
+    let admission = async move {
+        await_stream_failure
+            .await
+            .expect("observe stream failure before admission completes");
+        "admitted"
+    };
+    let (outcome, buffered_events, stream_error) = stream
+        .buffer_events_until_observing(admission, move |_| {
+            stream_failed
+                .send(())
+                .expect("report observed stream failure");
+        })
+        .await;
 
-    assert_eq!(outcome.expect("receive admission outcome"), "admitted");
+    assert_eq!(outcome, "admitted");
     assert_eq!(buffered_events.len(), 1);
     assert_eq!(buffered_events[0].event_type(), EventType::ProviderSmoke);
+    assert!(matches!(stream_error, Some(DaemonEventError::Disconnected)));
+
+    let event = buffered_events[0].clone();
+    let mut at_capacity = vec![event.clone(); MAX_ADMISSION_BUFFERED_EVENTS];
+    assert!(matches!(
+        buffer_admission_event(&mut at_capacity, event),
+        Err(DaemonEventError::AdmissionEventBufferOverflow)
+    ));
+    assert_eq!(at_capacity.len(), MAX_ADMISSION_BUFFERED_EVENTS);
     server.join().expect("join event peer");
 }
 
@@ -521,6 +537,7 @@ fn only_connection_loss_is_recoverable_after_event_admission() {
     );
     assert!(DaemonEventError::Disconnected.is_recoverable_disconnect());
     assert!(DaemonEventError::StreamIdleTimeout.is_recoverable_disconnect());
+    assert!(DaemonEventError::AdmissionEventBufferOverflow.is_recoverable_disconnect());
     assert!(
         !DaemonEventError::Transport(WebSocketError::Protocol(
             tokio_tungstenite::tungstenite::error::ProtocolError::WrongHttpMethod,

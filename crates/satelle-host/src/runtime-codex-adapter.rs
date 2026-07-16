@@ -4,6 +4,7 @@ use super::adapter::{
     ProviderSmokeFailureEvidence, ProviderSmokeResult, ProviderSmokeSource, ReadinessCacheKey,
     ReadinessEvidence, ReadinessProbeDriver, RecoveryObservation,
 };
+use crate::READINESS_CANCELLATION_GRACE;
 use crate::codex_session::{
     CodexApprovalPolicy, CodexSandboxPolicy, CodexSessionControl, CodexSessionError,
     CodexSessionFailure, CodexSessionRequest, CodexSessionTerminal, CodexTurnReadRequest,
@@ -29,7 +30,6 @@ use time::format_description::well_known::Rfc3339;
 const DEFAULT_MODEL_BINDING: &str = "codex-default";
 const DEFAULT_PROVIDER_BINDING: &str = "codex-default";
 const NATIVE_ADAPTER: &str = "codex-native-computer-use";
-const PROVIDER_SMOKE_CANCELLATION_GRACE: Duration = Duration::from_secs(5);
 
 #[derive(Debug)]
 struct ProviderSmokeAttemptFailure {
@@ -330,7 +330,7 @@ impl ProductionComputerUseAdapter {
                 persist_turn_ref,
                 control: None,
             },
-            PROVIDER_SMOKE_CANCELLATION_GRACE,
+            READINESS_CANCELLATION_GRACE,
         );
         if let Some(observation) = run.cancellation {
             return Err(native_readiness_timeout_after_cancellation(observation));
@@ -461,7 +461,7 @@ impl ProductionComputerUseAdapter {
                 persist_turn_ref: persistence.persist_turn_ref,
                 control: None,
             },
-            PROVIDER_SMOKE_CANCELLATION_GRACE,
+            READINESS_CANCELLATION_GRACE,
         );
         if let Some(observation) = run.cancellation {
             return Err(provider_smoke_timeout_after_cancellation(observation));

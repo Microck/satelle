@@ -65,6 +65,8 @@ use time::format_description::well_known::Rfc3339;
 const DEFAULT_NATIVE_READINESS_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
 const DEFAULT_PROVIDER_SMOKE_TEST_TIMEOUT: std::time::Duration =
     std::time::Duration::from_secs(120);
+pub(crate) const READINESS_CANCELLATION_GRACE: std::time::Duration =
+    std::time::Duration::from_secs(5);
 const ADMISSION_RESPONSE_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
 const DEFAULT_NATIVE_READINESS_TTL: time::Duration = time::Duration::minutes(5);
 const DEFAULT_PROVIDER_SMOKE_SUCCESS_TTL: time::Duration = time::Duration::hours(24);
@@ -460,11 +462,13 @@ pub fn readiness_probe_timeouts(config: &HostConfig) -> (std::time::Duration, st
 }
 
 /// Returns the deadline a remote admission request needs in order to receive
-/// typed outcomes from both serial readiness probes plus response overhead.
+/// typed outcomes from both serial readiness probes, timeout cancellation,
+/// and response overhead.
 pub fn admission_request_timeout(config: &HostConfig) -> std::time::Duration {
     let (native, provider) = readiness_probe_timeouts(config);
     native
         .saturating_add(provider)
+        .saturating_add(READINESS_CANCELLATION_GRACE)
         .saturating_add(ADMISSION_RESPONSE_GRACE)
 }
 
