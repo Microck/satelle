@@ -3,6 +3,7 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use sha2::{Digest, Sha256};
 use std::fmt;
 use std::ops::BitOr;
+use subtle::ConstantTimeEq;
 use thiserror::Error;
 use time::OffsetDateTime;
 use uuid::Uuid;
@@ -182,6 +183,64 @@ pub struct ApiPrincipal {
     pub(crate) expires_at: Option<OffsetDateTime>,
 }
 
+/// Process-local authentication for the one token that starts an on-demand
+/// daemon over SSH. The verifier and principal disappear with the process and
+/// are never passed to durable storage.
+#[derive(Clone)]
+pub(crate) struct EphemeralApiAuthenticator {
+    verifier: ApiTokenVerifier,
+    principal: ApiPrincipal,
+}
+
+impl EphemeralApiAuthenticator {
+    pub(crate) fn new(
+        token: &ApiBearerToken,
+        scopes: ApiScopes,
+        expires_at: OffsetDateTime,
+    ) -> Self {
+        Self {
+            verifier: token.verifier(),
+            principal: ApiPrincipal {
+                token_id: token.token_id().to_string(),
+                principal_ref: "ssh-bootstrap".to_string(),
+                credential_revision: 1,
+                scopes,
+                expires_at: Some(expires_at),
+            },
+        }
+    }
+
+    pub(crate) fn authenticate(
+        &self,
+        token: &ApiBearerToken,
+        at: OffsetDateTime,
+    ) -> Option<ApiPrincipal> {
+        if token.token_id() != self.principal.token_id || at >= self.principal.expires_at? {
+            return None;
+        }
+        let presented = token.verifier();
+        bool::from(presented.as_bytes().ct_eq(self.verifier.as_bytes()))
+            .then(|| self.principal.clone())
+    }
+
+    pub(crate) fn is_active(&self, principal: &ApiPrincipal, at: OffsetDateTime) -> bool {
+        principal.token_id == self.principal.token_id
+            && principal.principal_ref == self.principal.principal_ref
+            && principal.credential_revision == self.principal.credential_revision
+            && at < self.principal.expires_at.expect("ephemeral tokens expire")
+    }
+}
+
+impl fmt::Debug for EphemeralApiAuthenticator {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("EphemeralApiAuthenticator")
+            .field("token_id", &self.principal.token_id)
+            .field("expires_at", &self.principal.expires_at)
+            .finish_non_exhaustive()
+    }
+}
+
 impl ApiPrincipal {
     pub fn token_id(&self) -> &str {
         &self.token_id
@@ -252,6 +311,22 @@ mod tests {
         assert_eq!(token.token_id(), reparsed.token_id());
         assert_eq!(token.verifier(), reparsed.verifier());
         assert!(!format!("{token:?}").contains(exposed.as_str()));
+    }
+
+    #[test]
+    fn ephemeral_bootstrap_authentication_expires_without_durable_state() {
+        let token = ApiBearerToken::generate().expect("generate bootstrap token");
+        let expires_at = OffsetDateTime::UNIX_EPOCH + time::Duration::minutes(15);
+        let authenticator = EphemeralApiAuthenticator::new(&token, ApiScopes::CONTROL, expires_at);
+
+        let principal = authenticator
+            .authenticate(&token, OffsetDateTime::UNIX_EPOCH)
+            .expect("bootstrap token authenticates before expiry");
+        assert!(principal.scopes().allows(ApiScopes::READ));
+        assert!(principal.scopes().allows(ApiScopes::CONTROL));
+        assert!(authenticator.is_active(&principal, expires_at - time::Duration::SECOND));
+        assert!(authenticator.authenticate(&token, expires_at).is_none());
+        assert!(!authenticator.is_active(&principal, expires_at));
     }
 
     #[test]

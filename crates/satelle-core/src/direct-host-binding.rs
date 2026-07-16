@@ -26,11 +26,19 @@ pub struct DirectHostBinding {
 pub struct SshHostBinding {
     destination: String,
     expected_host_identity: HostIdentityRef,
-    api_token: ApiTokenSource,
+    api_token: Option<ApiTokenSource>,
 }
 
 impl SshHostBinding {
     pub fn from_host_config(host: &HostConfig) -> Result<Self, SshHostBindingError> {
+        Self::validate(host, true)
+    }
+
+    pub fn from_host_config_for_bootstrap(host: &HostConfig) -> Result<Self, SshHostBindingError> {
+        Self::validate(host, false)
+    }
+
+    fn validate(host: &HostConfig, require_api_token: bool) -> Result<Self, SshHostBindingError> {
         if host.transport != TransportKind::Ssh {
             return Err(SshHostBindingError::WrongTransport);
         }
@@ -50,12 +58,13 @@ impl SshHostBinding {
             .ok_or(SshHostBindingError::MissingExpectedHostIdentity)?;
         let expected_host_identity = HostIdentityRef::new(identity)
             .map_err(|_| SshHostBindingError::InvalidExpectedHostIdentity)?;
-        let api_token = host
-            .api_token
-            .clone()
-            .ok_or(SshHostBindingError::MissingApiToken)?;
-        let ApiTokenSource::File { path: token_path } = &api_token;
-        if !is_absolute_file_reference(token_path) {
+        let api_token = host.api_token.clone();
+        if require_api_token && api_token.is_none() {
+            return Err(SshHostBindingError::MissingApiToken);
+        }
+        if let Some(ApiTokenSource::File { path: token_path }) = &api_token
+            && !is_absolute_file_reference(token_path)
+        {
             return Err(SshHostBindingError::InvalidApiTokenPath);
         }
         if host.ca_bundle.is_some() {
@@ -76,8 +85,8 @@ impl SshHostBinding {
         &self.expected_host_identity
     }
 
-    pub const fn api_token(&self) -> &ApiTokenSource {
-        &self.api_token
+    pub const fn api_token(&self) -> Option<&ApiTokenSource> {
+        self.api_token.as_ref()
     }
 }
 
@@ -234,6 +243,22 @@ mod tests {
                 .expect("standard OpenSSH destination should be accepted");
             assert_eq!(binding.destination(), destination);
         }
+    }
+
+    #[test]
+    fn initial_ssh_bootstrap_does_not_require_a_durable_token_descriptor() {
+        let mut config = ssh_config("operator@example.test");
+        config.api_token = None;
+        assert_eq!(
+            SshHostBinding::from_host_config(&config).unwrap_err(),
+            SshHostBindingError::MissingApiToken
+        );
+        assert!(
+            SshHostBinding::from_host_config_for_bootstrap(&config)
+                .unwrap()
+                .api_token()
+                .is_none()
+        );
     }
 
     #[test]

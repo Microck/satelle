@@ -21,9 +21,12 @@ const SSH_DAEMON_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[path = "direct-attached.rs"]
 mod direct_attached;
+#[path = "ssh-bootstrap.rs"]
+mod ssh_bootstrap;
 #[path = "ssh-tunnel.rs"]
 mod ssh_tunnel;
 
+use ssh_bootstrap::SshBootstrapProcess;
 use ssh_tunnel::SshTunnel;
 
 #[cfg(feature = "test-support")]
@@ -208,6 +211,9 @@ struct DirectTransport {
     event_runtime: tokio::runtime::Runtime,
     // Fields drop in declaration order, so the tunnel outlives both clients.
     _tunnel: Option<SshTunnel>,
+    // A bootstrapped daemon remains attached to this owned SSH child until all
+    // tunneled clients have been dropped.
+    _bootstrap: Option<SshBootstrapProcess>,
 }
 
 impl DirectTransport {
@@ -393,19 +399,32 @@ fn direct_transport(host: &SelectedHost) -> Result<DirectTransport, SatelleError
         event_client,
         event_runtime,
         _tunnel: None,
+        _bootstrap: None,
     })
 }
 
-fn ssh_transport(host: &SelectedHost) -> Result<DirectTransport, SatelleError> {
-    let binding = SshHostBinding::from_host_config(&host.config)
-        .map_err(|error| SatelleError::config_error(error.to_string(), None))?;
-    let ApiTokenSource::File { path } = binding.api_token();
-    let raw_token = read_owner_only_secret_file(path)
-        .map_err(|error| SatelleError::config_error(error.to_string(), None))?;
-    let http_token = ApiBearerToken::parse(raw_token.as_str())
-        .map_err(|error| SatelleError::config_error(error.to_string(), None))?;
-    let event_token = ApiBearerToken::parse(raw_token.as_str())
-        .map_err(|error| SatelleError::config_error(error.to_string(), None))?;
+fn ssh_transport(
+    host: &SelectedHost,
+    bootstrap_if_unreachable: bool,
+) -> Result<DirectTransport, SatelleError> {
+    let binding = if bootstrap_if_unreachable {
+        SshHostBinding::from_host_config_for_bootstrap(&host.config)
+    } else {
+        SshHostBinding::from_host_config(&host.config)
+    }
+    .map_err(|error| SatelleError::config_error(error.to_string(), None))?;
+    let durable_tokens = match binding.api_token() {
+        Some(ApiTokenSource::File { path }) => {
+            let raw_token = read_owner_only_secret_file(path)
+                .map_err(|error| SatelleError::config_error(error.to_string(), None))?;
+            let http_token = ApiBearerToken::parse(raw_token.as_str())
+                .map_err(|error| SatelleError::config_error(error.to_string(), None))?;
+            let event_token = ApiBearerToken::parse(raw_token.as_str())
+                .map_err(|error| SatelleError::config_error(error.to_string(), None))?;
+            Some((http_token, event_token))
+        }
+        None => None,
+    };
     let tunnel = SshTunnel::open(binding.destination()).map_err(|error| match error {
         ssh_tunnel::SshTunnelError::HostKeyVerificationRequired => {
             SatelleError::ssh_host_key_verification_required(&host.alias)
@@ -413,21 +432,51 @@ fn ssh_transport(host: &SelectedHost) -> Result<DirectTransport, SatelleError> {
         _ => SatelleError::host_unreachable(&host.alias),
     })?;
     let expected_host_identity = binding.expected_host_identity().to_string();
-    let client = Arc::new(
-        DaemonClient::loopback_with_timeout(
-            tunnel.local_addr(),
-            http_token,
-            &expected_host_identity,
-            SSH_DAEMON_REQUEST_TIMEOUT,
-        )
-        .map_err(|error| direct_transport_error(&host.alias, error))?,
-    );
-    client
-        .capabilities()
-        .map_err(|error| direct_transport_error(&host.alias, error))?;
-    let event_client =
-        DaemonEventClient::loopback(tunnel.local_addr(), event_token, expected_host_identity)
-            .map_err(|error| direct_event_error(&host.alias, error))?;
+    let (client, event_client, bootstrap) = match durable_tokens {
+        Some((http_token, event_token)) => {
+            let durable_client = Arc::new(
+                DaemonClient::loopback_with_timeout(
+                    tunnel.local_addr(),
+                    http_token,
+                    &expected_host_identity,
+                    SSH_DAEMON_REQUEST_TIMEOUT,
+                )
+                .map_err(|error| direct_transport_error(&host.alias, error))?,
+            );
+            match durable_client.capabilities() {
+                Ok(_) => {
+                    let event_client = DaemonEventClient::loopback(
+                        tunnel.local_addr(),
+                        event_token,
+                        expected_host_identity.clone(),
+                    )
+                    .map_err(|error| direct_event_error(&host.alias, error))?;
+                    (durable_client, event_client, None)
+                }
+                Err(DaemonClientError::Transport(error))
+                    if error.is_connect() && bootstrap_if_unreachable =>
+                {
+                    let (client, event_client, bootstrap) = bootstrap_ssh_clients(
+                        &host.alias,
+                        binding.destination(),
+                        tunnel.local_addr(),
+                        &expected_host_identity,
+                    )?;
+                    (client, event_client, Some(bootstrap))
+                }
+                Err(error) => return Err(direct_transport_error(&host.alias, error)),
+            }
+        }
+        None => {
+            let (client, event_client, bootstrap) = bootstrap_ssh_clients(
+                &host.alias,
+                binding.destination(),
+                tunnel.local_addr(),
+                &expected_host_identity,
+            )?;
+            (client, event_client, Some(bootstrap))
+        }
+    };
     let event_runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -439,7 +488,47 @@ fn ssh_transport(host: &SelectedHost) -> Result<DirectTransport, SatelleError> {
         event_client,
         event_runtime,
         _tunnel: Some(tunnel),
+        _bootstrap: bootstrap,
     })
+}
+
+fn bootstrap_ssh_clients(
+    alias: &str,
+    destination: &str,
+    tunnel_addr: std::net::SocketAddr,
+    expected_host_identity: &str,
+) -> Result<(Arc<DaemonClient>, DaemonEventClient, SshBootstrapProcess), SatelleError> {
+    let bootstrap_token =
+        ApiBearerToken::generate().map_err(|_| SatelleError::host_unreachable(alias))?;
+    let raw_bootstrap_token = bootstrap_token.expose();
+    let bootstrap = SshBootstrapProcess::launch(destination, &bootstrap_token).map_err(
+        |error| match error {
+            ssh_bootstrap::SshBootstrapError::HostKeyVerificationRequired => {
+                SatelleError::ssh_host_key_verification_required(alias)
+            }
+            _ => SatelleError::host_unreachable(alias),
+        },
+    )?;
+    let http_token = ApiBearerToken::parse(raw_bootstrap_token.as_str())
+        .map_err(|_| SatelleError::host_unreachable(alias))?;
+    let event_token = ApiBearerToken::parse(raw_bootstrap_token.as_str())
+        .map_err(|_| SatelleError::host_unreachable(alias))?;
+    let client = Arc::new(
+        DaemonClient::loopback_with_timeout(
+            tunnel_addr,
+            http_token,
+            expected_host_identity,
+            SSH_DAEMON_REQUEST_TIMEOUT,
+        )
+        .map_err(|error| direct_transport_error(alias, error))?,
+    );
+    client
+        .capabilities()
+        .map_err(|error| direct_transport_error(alias, error))?;
+    let event_client =
+        DaemonEventClient::loopback(tunnel_addr, event_token, expected_host_identity)
+            .map_err(|error| direct_event_error(alias, error))?;
+    Ok((client, event_client, bootstrap))
 }
 
 fn direct_event_error(host: &str, error: DaemonEventError) -> SatelleError {
@@ -691,13 +780,20 @@ fn local_host_service(host_config: &satelle_core::HostConfig) -> Result<HostServ
 }
 
 pub(crate) fn transport_for(host: &SelectedHost) -> Result<Box<dyn TransportClient>, CliFailure> {
+    transport_for_with_ssh_bootstrap(host, false)
+}
+
+pub(crate) fn transport_for_with_ssh_bootstrap(
+    host: &SelectedHost,
+    bootstrap_if_unreachable: bool,
+) -> Result<Box<dyn TransportClient>, CliFailure> {
     match host.config.transport {
         TransportKind::Local => local_host_service(&host.config)
             .map(|service| Box::new(LocalTransport::new(host.alias.clone(), service)) as _),
         TransportKind::Direct => direct_transport(host)
             .map(|transport| Box::new(transport) as _)
             .map_err(failure),
-        TransportKind::Ssh => ssh_transport(host)
+        TransportKind::Ssh => ssh_transport(host, bootstrap_if_unreachable)
             .map(|transport| Box::new(transport) as _)
             .map_err(failure),
     }

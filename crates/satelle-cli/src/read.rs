@@ -1,5 +1,5 @@
 use super::output::StatusReport;
-use super::transport::transport_for;
+use super::transport::{transport_for, transport_for_with_ssh_bootstrap};
 use super::{
     CONFIG_CHECK_SCHEMA_VERSION, CONFIG_EXPLAIN_SCHEMA_VERSION, CliFailure, ConfigContext,
     HostSessionsReport, LOCAL_DEMO_HOST, PATHS_SCHEMA_VERSION, PublicSession, SessionId,
@@ -188,7 +188,7 @@ pub(super) fn host_sessions_for_host(
     host: &super::SelectedHost,
     no_bootstrap: bool,
 ) -> Result<HostSessionsReport, CliFailure> {
-    let mut report = transport_for(host)?
+    let mut report = transport_for_with_ssh_bootstrap(host, !no_bootstrap)?
         .host_sessions(no_bootstrap)
         .map_err(failure)?;
     apply_current_desktop_selection(&mut report, &host.config);

@@ -125,11 +125,17 @@ fn spawn_stderr_reader(
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-struct SshStderrClassification {
+pub(super) struct SshStderrClassification {
     host_key_verification_failed: bool,
 }
 
-fn classify_stderr(mut stderr: impl Read) -> SshStderrClassification {
+impl SshStderrClassification {
+    pub(super) const fn host_key_verification_failed(self) -> bool {
+        self.host_key_verification_failed
+    }
+}
+
+pub(super) fn classify_stderr(mut stderr: impl Read) -> SshStderrClassification {
     let mut classification = SshStderrClassification::default();
     let mut marker_offsets = [0_usize; HOST_KEY_FAILURE_MARKERS.len()];
     let mut buffer = [0_u8; 4096];

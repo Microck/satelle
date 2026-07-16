@@ -20,6 +20,7 @@ mod storage;
 #[path = "test-runtime.rs"]
 mod test_runtime;
 
+use api_auth::EphemeralApiAuthenticator;
 pub use api_auth::{ApiBearerToken, ApiBearerTokenError, ApiPrincipal, ApiScopes};
 use codex_capabilities::{
     BlockerReason, CodexVersionEvidence, Phase0CapabilityBlocker, Phase0SupportVerdict,
@@ -78,6 +79,7 @@ pub struct HostService {
     runtime: RuntimeHandle,
     operation_capacity: Arc<OperationCapacity>,
     mode: HostMode,
+    bootstrap_auth: Option<Arc<EphemeralApiAuthenticator>>,
 }
 
 #[derive(Clone, Debug)]
@@ -181,7 +183,23 @@ impl HostService {
             runtime: RuntimeHandle::new(state_root, adapter),
             operation_capacity: Arc::new(OperationCapacity::default()),
             mode: HostMode::Production { snapshot },
+            bootstrap_auth: None,
         }
+    }
+
+    /// Builds an on-demand Host whose only bootstrap credential is held in
+    /// process memory and expires independently of durable Host state.
+    pub fn production_for_ssh_bootstrap(
+        token: &ApiBearerToken,
+        expires_at: time::OffsetDateTime,
+    ) -> Self {
+        let mut service = Self::production();
+        service.bootstrap_auth = Some(Arc::new(EphemeralApiAuthenticator::new(
+            token,
+            ApiScopes::CONTROL,
+            expires_at,
+        )));
+        service
     }
 
     /// The deterministic adapter requires both the compile-time feature and a
@@ -192,6 +210,7 @@ impl HostService {
             runtime: RuntimeHandle::new(satelle_core::state_dir(), FakeComputerUseAdapter),
             operation_capacity: Arc::new(OperationCapacity::default()),
             mode: HostMode::TestFake,
+            bootstrap_auth: None,
         })
     }
 
@@ -202,6 +221,7 @@ impl HostService {
             runtime: RuntimeHandle::new(satelle_core::state_dir(), PendingComputerUseAdapter),
             operation_capacity: Arc::new(OperationCapacity::default()),
             mode: HostMode::TestFake,
+            bootstrap_auth: None,
         })
     }
 
