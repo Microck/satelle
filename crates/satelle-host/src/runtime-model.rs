@@ -216,6 +216,7 @@ pub(super) fn storage_failure(error: StorageError) -> SatelleError {
         StorageErrorKind::Busy => SatelleError::storage_busy(),
         StorageErrorKind::StoreInUse => SatelleError::store_in_use(),
         StorageErrorKind::StateConflict => SatelleError::state_conflict(),
+        StorageErrorKind::SessionNotSteerable => SatelleError::computer_use_not_ready(),
         StorageErrorKind::UnsafeStatePath
         | StorageErrorKind::OpenFailed
         | StorageErrorKind::MigrationFailed
@@ -317,6 +318,21 @@ mod storage_failure_tests {
         assert_eq!(error.code.as_str(), "state-conflict");
         assert_eq!(error.exit_code(), 75);
         assert!(!error.message.contains("SQLite"));
+        assert!(error.source_detail.is_none());
+    }
+
+    #[test]
+    fn unavailable_session_thread_is_a_computer_use_readiness_blocker() {
+        let error = storage_failure(StorageError::for_test(
+            StorageErrorKind::SessionNotSteerable,
+        ));
+
+        assert_eq!(error.code, ErrorCode::ComputerUseNotReady);
+        assert_eq!(error.exit_code(), 75);
+        assert_eq!(
+            error.recovery_command.as_deref(),
+            Some("satelle doctor --scope computer-use --refresh --json")
+        );
         assert!(error.source_detail.is_none());
     }
 

@@ -64,6 +64,7 @@ fn terminal_session_round_trips_with_follow_up_and_exact_snapshot() {
             turn_id(TURN_2),
             policy(),
             at(3),
+            false,
             &steer,
         )
         .expect("admit follow-up");
@@ -100,6 +101,82 @@ fn terminal_session_round_trips_with_follow_up_and_exact_snapshot() {
         .expect("load Session")
         .expect("stored Session");
     assert_eq!(expected, restored.snapshot());
+}
+
+#[test]
+fn required_upstream_thread_blocks_follow_up_before_any_mutation() {
+    let state = TempDir::new().expect("temporary state directory");
+    let (mut storage, _) = Storage::open(state.path()).expect("open storage");
+    let initial = initial_session(&storage, SESSION_1, TURN_1, at(0));
+    let AdmissionOutcome::Execute { session, .. } = storage
+        .begin_session(
+            &initial,
+            &admission(IdempotentOperation::Run, "run-1", "request-run-1", at(0)),
+        )
+        .expect("admit initial Session")
+    else {
+        panic!("new Session admission must execute");
+    };
+    let terminal = storage
+        .commit_lifecycle(
+            session.id(),
+            &turn_id(TURN_1),
+            revisions(&session, TURN_1),
+            TurnTransition::Completed,
+            at(1),
+        )
+        .expect("complete initial Turn");
+    let before = terminal.snapshot();
+    let steer = admission(
+        IdempotentOperation::Steer,
+        "steer-requires-thread",
+        "request-steer-requires-thread",
+        at(2),
+    );
+
+    let error = storage
+        .begin_follow_up(
+            terminal.id(),
+            terminal.session_state_revision(),
+            turn_id(TURN_2),
+            policy(),
+            at(2),
+            true,
+            &steer,
+        )
+        .expect_err("production follow-up requires the retained Codex thread");
+    assert_eq!(StorageErrorKind::SessionNotSteerable, error.kind());
+    assert_eq!(
+        before,
+        storage
+            .load_session(terminal.id())
+            .expect("load Session")
+            .expect("Session remains stored")
+            .snapshot(),
+        "failed admission must not append a Turn or advance lifecycle state"
+    );
+
+    record_upstream_refs(
+        &mut storage,
+        terminal.id(),
+        &turn_id(TURN_1),
+        "thread-private-1",
+        "turn-private-1",
+    );
+    assert!(matches!(
+        storage
+            .begin_follow_up(
+                terminal.id(),
+                terminal.session_state_revision(),
+                turn_id(TURN_2),
+                policy(),
+                at(2),
+                true,
+                &steer,
+            )
+            .expect("retained thread makes terminal Session steerable"),
+        AdmissionOutcome::Execute { .. }
+    ));
 }
 
 #[test]
@@ -565,6 +642,7 @@ fn begin_stop_claims_before_observation_and_confirmed_stop_releases_lease() {
             turn_id(TURN_2),
             policy(),
             at(4),
+            false,
             &admission(
                 IdempotentOperation::Steer,
                 "steer-1",
@@ -880,6 +958,7 @@ fn run_replay_uses_stored_handles_and_the_original_terminal_snapshot() {
             turn_id(TURN_2),
             policy(),
             at(2),
+            false,
             &steer,
         )
         .expect("admit later follow-up")
@@ -948,6 +1027,7 @@ fn steer_replay_uses_its_stored_turn_handle() {
             turn_id(TURN_2),
             policy(),
             at(2),
+            false,
             &steer,
         )
         .expect("admit follow-up")
@@ -971,6 +1051,7 @@ fn steer_replay_uses_its_stored_turn_handle() {
             turn_id(TURN_3),
             policy(),
             at(4),
+            false,
             &steer,
         )
         .expect("replay steer with a regenerated Turn handle")
@@ -1020,6 +1101,7 @@ fn in_progress_steer_replay_wins_before_active_turn_rejection() {
             turn_id(TURN_2),
             policy(),
             at(2),
+            false,
             &steer,
         )
         .expect("admit follow-up")
@@ -1034,6 +1116,7 @@ fn in_progress_steer_replay_wins_before_active_turn_rejection() {
             turn_id(TURN_3),
             policy(),
             at(3),
+            false,
             &steer,
         )
         .expect("same-key active follow-up must replay")

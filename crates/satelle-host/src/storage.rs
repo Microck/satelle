@@ -94,6 +94,7 @@ pub(crate) enum StorageErrorKind {
     InvalidInput,
     InvalidStoredState,
     SessionNotFound,
+    SessionNotSteerable,
     LeaseConflict,
     StateConflict,
     IdempotencyConflict,
@@ -116,6 +117,9 @@ impl fmt::Display for StorageErrorKind {
             Self::InvalidInput => "the storage operation input is invalid",
             Self::InvalidStoredState => "the stored Satelle lifecycle state is invalid",
             Self::SessionNotFound => "the requested Satelle Session was not found",
+            Self::SessionNotSteerable => {
+                "the Session has no retained upstream thread available for steering"
+            }
             Self::LeaseConflict => "the selected Satelle Control Lease is already owned",
             Self::StateConflict => "the stored Satelle lifecycle state changed concurrently",
             Self::IdempotencyConflict => "the idempotency key was reused for a different request",
@@ -791,6 +795,7 @@ impl Storage {
         turn_id: TurnId,
         execution_policy: ExecutionPolicy,
         at: OffsetDateTime,
+        requires_upstream_thread: bool,
         context: &AdmissionContext,
     ) -> Result<AdmissionOutcome, StorageError> {
         require_operation(&context.idempotency, IdempotentOperation::Steer)?;
@@ -813,6 +818,19 @@ impl Storage {
         let mut session = load_required_session(&transaction, session_id)?;
         if session.is_active() {
             return Err(StorageError::lease_conflict(session.id().clone()));
+        }
+        if requires_upstream_thread {
+            let upstream_thread_ref = transaction
+                .query_row(
+                    "SELECT upstream_thread_ref FROM session_private_refs WHERE session_id = ?1",
+                    [session_id.as_str()],
+                    |row| row.get::<_, Option<String>>(0),
+                )
+                .map_err(|source| sqlite_error(StorageErrorKind::InvalidStoredState, source))?;
+            let upstream_thread_ref = upstream_thread_ref
+                .ok_or_else(|| StorageError::new(StorageErrorKind::SessionNotSteerable))?;
+            PrivateUpstreamRef::new(upstream_thread_ref)
+                .map_err(|_| StorageError::new(StorageErrorKind::InvalidStoredState))?;
         }
         let previous_revision = session.session_state_revision();
         session

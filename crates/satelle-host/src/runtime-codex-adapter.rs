@@ -428,6 +428,10 @@ impl ComputerUseAdapter for ProductionComputerUseAdapter {
             .admit(operation)
     }
 
+    fn requires_upstream_thread_for_follow_up(&self) -> bool {
+        true
+    }
+
     fn preflight(&self, host: &str) -> Result<AdapterReadiness, SatelleError> {
         self.preflight_terminal(host, None).into_result()
     }
