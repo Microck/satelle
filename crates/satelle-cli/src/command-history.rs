@@ -74,7 +74,6 @@ pub(super) struct Invocation {
     selected_host: Option<String>,
     selected_profile: Option<String>,
     session_id: Option<String>,
-    started_at: String,
 }
 
 impl Invocation {
@@ -89,7 +88,20 @@ impl Invocation {
             selected_host,
             selected_profile,
             session_id,
+        }
+    }
+}
+
+pub(super) struct InvocationStart {
+    started_at: String,
+    started: Instant,
+}
+
+impl InvocationStart {
+    pub(super) fn capture() -> Self {
+        Self {
             started_at: format_started_at(OffsetDateTime::now_utc()),
+            started: Instant::now(),
         }
     }
 }
@@ -116,15 +128,21 @@ fn format_started_at(timestamp: OffsetDateTime) -> String {
 pub(super) struct Recorder {
     cache_root: PathBuf,
     invocation: Invocation,
+    started_at: String,
     started: Instant,
 }
 
 impl Recorder {
-    pub(super) fn start(cache_root: PathBuf, invocation: Invocation) -> Self {
+    pub(super) fn start(
+        cache_root: PathBuf,
+        invocation: Invocation,
+        start: InvocationStart,
+    ) -> Self {
         Self {
             cache_root,
             invocation,
-            started: Instant::now(),
+            started_at: start.started_at,
+            started: start.started,
         }
     }
 
@@ -184,7 +202,7 @@ impl Recorder {
                 self.invocation.selected_host,
                 self.invocation.selected_profile,
                 session_id,
-                self.invocation.started_at,
+                self.started_at,
                 duration_ms,
                 outcome_status,
                 error_code.map(|code| code.as_str()),
@@ -311,7 +329,9 @@ pub(super) enum HistoryWriteError {
 
 #[cfg(test)]
 mod tests {
-    use super::format_started_at;
+    use super::{Invocation, InvocationStart, Recorder, format_started_at};
+    use std::path::PathBuf;
+    use std::time::Duration;
     use time::OffsetDateTime;
 
     #[test]
@@ -324,5 +344,18 @@ mod tests {
         assert_eq!(earlier.len(), 30);
         assert_eq!(later.len(), 30);
         assert!(earlier < later);
+    }
+
+    #[test]
+    fn recorder_preserves_work_done_before_it_is_constructed() {
+        let start = InvocationStart::capture();
+        std::thread::sleep(Duration::from_millis(25));
+        let recorder = Recorder::start(
+            PathBuf::new(),
+            Invocation::new("config", None, None, None),
+            start,
+        );
+
+        assert!(recorder.started.elapsed() >= Duration::from_millis(20));
     }
 }

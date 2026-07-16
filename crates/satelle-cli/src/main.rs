@@ -711,6 +711,10 @@ fn start_command_history(
     command: &Command,
     config: &ConfigContext<'_>,
 ) -> Option<command_history::Recorder> {
+    // Capture the invocation boundary before configuration discovery and
+    // validation. Recorder construction happens later because the resolved
+    // configuration controls both opt-out policy and redacted attribution.
+    let invocation_start = command_history::InvocationStart::capture();
     let selects_profile = !matches!(
         command,
         Command::Config {
@@ -766,7 +770,11 @@ fn start_command_history(
         selected_profile,
         target.session_id,
     );
-    Some(command_history::Recorder::start(cache_root, invocation))
+    Some(command_history::Recorder::start(
+        cache_root,
+        invocation,
+        invocation_start,
+    ))
 }
 
 fn history_target(command: &Command) -> Option<HistoryTarget<'_>> {
