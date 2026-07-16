@@ -2221,6 +2221,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tempfile",
+ "thiserror",
  "time",
  "tokio",
  "tokio-tungstenite",

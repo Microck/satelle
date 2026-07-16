@@ -1,6 +1,6 @@
 use super::{
     AttachedTurnOutcome, DirectTransport, direct_admission_error, direct_event_error,
-    direct_run_admission_error, direct_run_event_error, direct_transport_error,
+    direct_transport_error,
 };
 use satelle_core::session::{PublicSession, TurnAdmissionFailure, TurnState, TurnStateRevision};
 use satelle_core::{
@@ -326,9 +326,7 @@ impl DirectTransport {
             .event_client
             .connect_events(vec![EventSubscription::Host])
             .await
-            .map_err(|error| {
-                TurnAdmissionFailure::not_admitted(direct_run_event_error(&self.alias, error))
-            })?;
+            .map_err(|error| TurnAdmissionFailure::not_admitted(self.run_event_error(error)))?;
         let request = request.clone();
         let idempotency_key = Self::idempotency_key();
         let admitted = self
@@ -338,7 +336,7 @@ impl DirectTransport {
                         .create_session(&request, &idempotency_key)
                         .map(|response| response.session().clone())
                 },
-                direct_run_admission_error,
+                self.run_admission_error(),
             )
             .await?;
         let turn_id = admitted

@@ -35,16 +35,41 @@ impl DaemonClient {
         token: ApiBearerToken,
         expected_host_identity: impl Into<String>,
     ) -> Result<Self, DaemonClientError> {
+        Self::loopback_with_optional_timeout(address, token, expected_host_identity, None)
+    }
+
+    pub fn loopback_with_timeout(
+        address: SocketAddr,
+        token: ApiBearerToken,
+        expected_host_identity: impl Into<String>,
+        request_timeout: Duration,
+    ) -> Result<Self, DaemonClientError> {
+        Self::loopback_with_optional_timeout(
+            address,
+            token,
+            expected_host_identity,
+            Some(request_timeout),
+        )
+    }
+
+    fn loopback_with_optional_timeout(
+        address: SocketAddr,
+        token: ApiBearerToken,
+        expected_host_identity: impl Into<String>,
+        request_timeout: Option<Duration>,
+    ) -> Result<Self, DaemonClientError> {
         if !address.ip().is_loopback() {
             return Err(DaemonClientError::NonLoopbackPlaintextEndpoint);
         }
         let expected_host_identity = expected_host_identity.into();
         HeaderValue::from_str(&expected_host_identity)
             .map_err(|_| DaemonClientError::InvalidHostIdentityHeader)?;
-        let client = Client::builder()
-            .redirect(Policy::none())
-            .build()
-            .map_err(DaemonClientError::Transport)?;
+        let builder = Client::builder().redirect(Policy::none());
+        let builder = match request_timeout {
+            Some(timeout) => builder.timeout(timeout),
+            None => builder,
+        };
+        let client = builder.build().map_err(DaemonClientError::Transport)?;
         Ok(Self {
             client,
             base_url: format!("http://{address}"),

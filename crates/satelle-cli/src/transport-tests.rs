@@ -96,9 +96,11 @@ impl DirectFixture {
             server_runtime,
             transport: Some(DirectTransport {
                 alias: "direct-test".to_string(),
+                mode: "direct",
                 client: Arc::new(client),
                 event_client,
                 event_runtime,
+                _tunnel: None,
             }),
             _state: state,
         }
