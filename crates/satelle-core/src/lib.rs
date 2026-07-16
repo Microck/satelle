@@ -1489,6 +1489,7 @@ pub enum ErrorCode {
     HostNotFound,
     HostUnreachable,
     DirectDaemonUnreachable,
+    SshHostKeyVerificationRequired,
     CertificateUntrusted,
     CertificateHostnameMismatch,
     CertificateExpired,
@@ -1561,6 +1562,7 @@ impl ErrorCode {
             Self::HostNotFound => "host-not-found",
             Self::HostUnreachable => "host-unreachable",
             Self::DirectDaemonUnreachable => "direct-daemon-unreachable",
+            Self::SshHostKeyVerificationRequired => "ssh-host-key-verification-required",
             Self::CertificateUntrusted => "certificate-untrusted",
             Self::CertificateHostnameMismatch => "certificate-hostname-mismatch",
             Self::CertificateExpired => "certificate-expired",
@@ -1653,7 +1655,8 @@ impl ErrorCode {
             | Self::CertificateHostnameMismatch
             | Self::CertificateExpired
             | Self::TlsVersionUnsupported
-            | Self::TlsHandshakeFailed => 76,
+            | Self::TlsHandshakeFailed
+            | Self::SshHostKeyVerificationRequired => 76,
             Self::AuthenticationFailed
             | Self::AuthorizationInsufficientScope
             | Self::HostIdentityMismatch => 77,
@@ -2103,6 +2106,20 @@ impl SatelleError {
         }
     }
 
+    pub fn ssh_host_key_verification_required(alias: &str) -> Self {
+        let mut details = BTreeMap::new();
+        details.insert("host".to_string(), Value::String(alias.to_string()));
+        Self {
+            code: ErrorCode::SshHostKeyVerificationRequired,
+            message: format!(
+                "system OpenSSH could not verify the Host key for host '{alias}' without prompting"
+            ),
+            recovery_command: None,
+            source_detail: None,
+            details,
+        }
+    }
+
     pub fn authentication_failed(alias: &str) -> Self {
         host_access_error(
             ErrorCode::AuthenticationFailed,
@@ -2529,6 +2546,18 @@ impl SatelleError {
 #[cfg(test)]
 mod error_contract_tests {
     use super::*;
+
+    #[test]
+    fn ssh_host_key_verification_required_is_a_typed_transport_failure() {
+        let error = SatelleError::ssh_host_key_verification_required("remote");
+        assert_eq!(error.code.as_str(), "ssh-host-key-verification-required");
+        assert_eq!(error.exit_code(), 76);
+        assert_eq!(
+            error.details.get("host"),
+            Some(&serde_json::json!("remote"))
+        );
+        assert_eq!(error.source_detail, None);
+    }
 
     #[test]
     fn direct_daemon_unreachable_has_a_stable_unreachable_host_contract() {

@@ -1,17 +1,22 @@
 use std::ffi::OsString;
-use std::io;
+use std::io::{self, Read};
 use std::net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream};
-use std::process::{Child, Command, Stdio};
-use std::thread;
+use std::process::{Child, ChildStderr, Command, Stdio};
+use std::thread::{self, JoinHandle};
 use std::time::Duration;
 use thiserror::Error;
 
 const REMOTE_DAEMON_PORT: u16 = 3001;
 const READY_POLL_INTERVAL: Duration = Duration::from_millis(20);
+const HOST_KEY_FAILURE_MARKERS: [&[u8]; 2] = [
+    b"Host key verification failed.",
+    b"REMOTE HOST IDENTIFICATION HAS CHANGED!",
+];
 
 pub(super) struct SshTunnel {
     child: Child,
     local_addr: SocketAddr,
+    stderr_reader: Option<JoinHandle<SshStderrClassification>>,
 }
 
 impl SshTunnel {
@@ -29,10 +34,27 @@ impl SshTunnel {
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             // OpenSSH owns authentication and host-key interaction. Satelle
-            // never captures or reproduces potentially remote-controlled text.
-            .stderr(Stdio::null());
-        let child = command.spawn().map_err(SshTunnelError::Spawn)?;
-        let mut tunnel = Self { child, local_addr };
+            // drains stderr only into a streaming classifier and never keeps
+            // or reproduces potentially remote-controlled text.
+            .stderr(Stdio::piped());
+        let mut child = command.spawn().map_err(SshTunnelError::Spawn)?;
+        let stderr = child
+            .stderr
+            .take()
+            .expect("OpenSSH stderr was configured as piped");
+        let stderr_reader = match spawn_stderr_reader(stderr) {
+            Ok(reader) => reader,
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(error);
+            }
+        };
+        let mut tunnel = Self {
+            child,
+            local_addr,
+            stderr_reader: Some(stderr_reader),
+        };
         tunnel.wait_until_listening()?;
         Ok(tunnel)
     }
@@ -49,7 +71,7 @@ impl SshTunnel {
                 .map_err(SshTunnelError::Inspect)?
                 .is_some()
             {
-                return Err(SshTunnelError::ExitedBeforeReady);
+                return Err(self.exited_before_ready());
             }
             if let Ok(connection) = TcpStream::connect(self.local_addr) {
                 drop(connection);
@@ -61,21 +83,77 @@ impl SshTunnel {
                 {
                     return Ok(());
                 }
-                return Err(SshTunnelError::ExitedBeforeReady);
+                return Err(self.exited_before_ready());
             }
             thread::sleep(READY_POLL_INTERVAL);
         }
+    }
+
+    fn exited_before_ready(&mut self) -> SshTunnelError {
+        if self.finish_stderr_reader().host_key_verification_failed {
+            SshTunnelError::HostKeyVerificationRequired
+        } else {
+            SshTunnelError::ExitedBeforeReady
+        }
+    }
+
+    fn finish_stderr_reader(&mut self) -> SshStderrClassification {
+        self.stderr_reader
+            .take()
+            .and_then(|reader| reader.join().ok())
+            .unwrap_or_default()
     }
 }
 
 impl Drop for SshTunnel {
     fn drop(&mut self) {
-        match self.child.try_wait() {
-            Ok(Some(_)) => return,
-            Ok(None) | Err(_) => {}
+        if !matches!(self.child.try_wait(), Ok(Some(_))) {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
         }
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        self.finish_stderr_reader();
+    }
+}
+
+fn spawn_stderr_reader(
+    stderr: ChildStderr,
+) -> Result<JoinHandle<SshStderrClassification>, SshTunnelError> {
+    thread::Builder::new()
+        .name("satelle-ssh-stderr".to_string())
+        .spawn(move || classify_stderr(stderr))
+        .map_err(SshTunnelError::StderrReader)
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct SshStderrClassification {
+    host_key_verification_failed: bool,
+}
+
+fn classify_stderr(mut stderr: impl Read) -> SshStderrClassification {
+    let mut classification = SshStderrClassification::default();
+    let mut marker_offsets = [0_usize; HOST_KEY_FAILURE_MARKERS.len()];
+    let mut buffer = [0_u8; 4096];
+    loop {
+        let count = match stderr.read(&mut buffer) {
+            Ok(0) | Err(_) => return classification,
+            Ok(count) => count,
+        };
+        for byte in &buffer[..count] {
+            for (marker, offset) in HOST_KEY_FAILURE_MARKERS
+                .iter()
+                .zip(marker_offsets.iter_mut())
+            {
+                if *byte == marker[*offset] {
+                    *offset += 1;
+                    if *offset == marker.len() {
+                        classification.host_key_verification_failed = true;
+                        *offset = 0;
+                    }
+                } else {
+                    *offset = usize::from(*byte == marker[0]);
+                }
+            }
+        }
     }
 }
 
@@ -99,8 +177,12 @@ pub(super) enum SshTunnelError {
     PortAllocation(#[source] io::Error),
     #[error("could not start system OpenSSH")]
     Spawn(#[source] io::Error),
+    #[error("could not start the system OpenSSH diagnostic reader")]
+    StderrReader(#[source] io::Error),
     #[error("could not inspect the system OpenSSH process")]
     Inspect(#[source] io::Error),
+    #[error("system OpenSSH requires Host-key verification")]
+    HostKeyVerificationRequired,
     #[error("system OpenSSH exited before the tunnel became ready")]
     ExitedBeforeReady,
 }
@@ -123,6 +205,17 @@ mod tests {
                 "operator@example",
             ]
             .map(OsString::from)
+        );
+    }
+
+    #[test]
+    fn stderr_classifier_recognizes_only_host_key_failures() {
+        for diagnostic in HOST_KEY_FAILURE_MARKERS {
+            assert!(classify_stderr(diagnostic).host_key_verification_failed);
+        }
+        assert_eq!(
+            classify_stderr(&b"connection refused by the configured host"[..]),
+            SshStderrClassification::default()
         );
     }
 }
