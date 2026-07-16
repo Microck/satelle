@@ -1,0 +1,61 @@
+---
+title: Connect to a remote Host
+description: Configure the implemented direct HTTPS transport, including a Tailscale address.
+---
+
+The implemented remote execution path is `direct`: HTTPS for requests and WSS
+for lifecycle events. The remote Host Daemon must already be configured and
+running. Remote setup is not implemented.
+
+## Start the Host Daemon
+
+On the native Host, bind the server explicitly:
+
+```sh
+satelle host start --bind 127.0.0.1:3001 --foreground
+```
+
+The default bind address is loopback. Exposing the daemon beyond loopback
+requires the TLS, Host identity, and token boundary described below.
+
+## Configure the controller
+
+Create an owner-controlled user configuration with an HTTPS address, expected
+Host identity, token file descriptor, and CA bundle:
+
+```toml
+default_host = "studio-mac"
+
+[hosts.studio-mac]
+transport = "direct"
+adapter = "codex"
+address = "https://studio-mac.example.ts.net:3001"
+expected_host_id = "studio-mac"
+ca_bundle = "/absolute/path/to/satelle-ca.pem"
+
+[hosts.studio-mac.api_token]
+kind = "file"
+path = "/absolute/path/to/satelle-token"
+
+[hosts.studio-mac.network]
+provider = "tailscale"
+tailnet_name = "example.ts.net"
+hostname = "studio-mac"
+```
+
+The token file must be owner-only. The CA bundle is explicit trust material,
+not an instruction to disable certificate validation.
+
+Tailscale can provide the routable name and private network path, but it does
+not replace Satelle authentication, TLS validation, or Host identity pinning.
+
+## Verify before running work
+
+```sh
+satelle config check --host studio-mac --json
+satelle host status --host studio-mac --json
+satelle run --host studio-mac --detach --json "Open the browser"
+```
+
+SSH is accepted as a configuration transport kind but is not an implemented
+execution transport in this release.

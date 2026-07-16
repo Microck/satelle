@@ -1,0 +1,47 @@
+---
+title: Command reference
+description: Current Satelle CLI command surface and implementation status.
+---
+
+Global options include `--no-color`, `--profile <name>`, and
+`--error-format human|json`. Most state-reading commands also accept `--json`.
+
+| Command | Purpose | Status |
+| --- | --- | --- |
+| `satelle setup` | Plan local Host onboarding | Dry-run planning implemented; application unavailable |
+| `satelle repair` | Repair a Host | Not implemented |
+| `satelle doctor` | Run diagnostic probes | Implemented |
+| `satelle config check` | Validate one or all local contexts | Implemented |
+| `satelle config explain` | Explain effective values and sources | Implemented |
+| `satelle paths` | Print resolved config, state, cache, and log paths | Implemented |
+| `satelle host start` | Run Host Daemon mode | Implemented |
+| `satelle host status` | Read Host status | Implemented |
+| `satelle host sessions` | List eligible native desktop sessions | Implemented |
+| `satelle host stop` / `restart` | Control Host service lifecycle | Not implemented |
+| `satelle host update` | Update remote components | Not implemented |
+| `satelle host storage migrate` | Run an explicit storage migration | Not implemented |
+| `satelle run` | Create a Session and first Turn | Implemented |
+| `satelle steer` | Add a follow-up Turn to a Session | Implemented |
+| `satelle status` | Read authoritative Session state | Implemented |
+| `satelle stop` | Stop the active Turn | Implemented |
+| `satelle logs` | Read normalized retained Host logs | Implemented |
+| `satelle mcp serve` | Serve the MCP interface over stdio | Implemented |
+| `satelle support bundle` | Export a support bundle | Not implemented |
+| `satelle self update` | Update the executable and optional remotes | Not implemented |
+| `satelle completions` | Generate shell completions | Implemented |
+
+Use `satelle <command> --help` as the exact option reference for the binary you
+are running. Pre-release commands may change before the first stable release.
+
+## Session commands
+
+`run` and `steer` accept `--host`, `--detach`, `--quiet`, `--verbose`,
+`--events auto|human|json|none`, `--prompt-file`, `--yolo`, and `--no-yolo`.
+The prompt can be an argument or `-` for stdin. `steer`, `status`, and `stop`
+take a public `session_id` positional argument.
+
+## Doctor options
+
+`doctor` accepts `--host`, `--scope`, `--refresh`, `--timeout`,
+`--serial-probes`, `--events`, and `--no-input`. `--timeout` is valid for an
+eligible refresh scope and requires explicit units.

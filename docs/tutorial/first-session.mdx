@@ -1,0 +1,67 @@
+---
+title: Run your first session
+description: Build Satelle, inspect setup, prove native readiness, and start durable work.
+---
+
+This tutorial uses `local-demo`, the built-in local Host binding. Run it on the
+macOS or Windows machine whose visible desktop Satelle will control.
+
+## 1. Build the executable
+
+Install Rust 1.97.0 and Codex 0.144.0, then build from the repository root:
+
+```sh
+cargo build --release --locked -p satelle-cli
+```
+
+Use `target/release/satelle` below, or put that executable on your `PATH`.
+Public npm packages are not available yet.
+
+## 2. Inspect setup before changing anything
+
+```sh
+satelle paths
+satelle config check
+satelle setup --host local-demo --dry-run
+```
+
+The dry run reports planned actions, required human input, readiness, and
+recovery commands. Run setup without `--dry-run` only after reviewing the plan.
+In noninteractive use, mutations require explicit `--yes`.
+
+## 3. Prove native readiness
+
+Keep the target desktop unlocked and visible, then run:
+
+```sh
+satelle doctor --host local-demo --scope computer-use --refresh
+```
+
+On macOS, grant Screen Recording and Accessibility when the operating system
+asks. On Windows, keep the target app on the active desktop. Satelle does not
+click through these prompts for you.
+
+## 4. Start durable work
+
+```sh
+satelle run --host local-demo "Open the browser"
+```
+
+Capture the returned `session_id`. It is the public handle for follow-up work,
+status, logs, and stop requests.
+
+```sh
+satelle status <session_id>
+satelle steer <session_id> "Navigate to example.com"
+satelle logs --session <session_id> --tail 50
+```
+
+You have completed the tutorial when the first Turn reaches a terminal state
+and the same Session remains readable through `status`.
+
+## Current limitations
+
+- Native Host readiness is supported only on candidate macOS and Windows
+  Hosts that pass the live probe. Linux native Computer Use is unavailable.
+- The release has not been published to npm.
+- SSH transport, remote setup, and automatic repair are not implemented.

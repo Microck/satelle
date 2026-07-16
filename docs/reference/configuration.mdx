@@ -1,0 +1,89 @@
+---
+title: Configuration reference
+description: User and project configuration, precedence, profiles, paths, and Host bindings.
+---
+
+Run `satelle paths --json` for the effective paths on the current operating
+system. `SATELLE_HOME` relocates the config, state, cache, and log roots.
+`SATELLE_CONFIG_FILE`, `SATELLE_STATE_DIR`, `SATELLE_CACHE_DIR`, and
+`SATELLE_LOG_DIR` override individual absolute paths.
+
+## User configuration
+
+User configuration owns concrete Host bindings and sensitive descriptors:
+
+```toml
+default_host = "local-demo"
+model_alias = "default-model"
+provider_alias = "openai"
+
+[hosts.local-demo]
+transport = "local"
+adapter = "codex"
+setup_mode = "on-demand"
+native_readiness_cache_ttl = "5m"
+yolo = false
+
+[hosts.local-demo.timeouts]
+native_readiness = "120s"
+provider_smoke_test = "2m"
+```
+
+Host fields include `transport`, `adapter`, `address`, `network`, `timeouts`,
+desktop selection, daemon path overrides, `setup_mode`, experimental-provider
+opt-in, Host-scoped `yolo`, project-selection permission, direct-transport
+identity and trust fields, and provider Secret Source descriptors.
+
+The duration parser requires explicit units such as `500ms`, `30s`, or `2m`.
+Configuration does not perform environment-variable interpolation.
+
+## Named profiles
+
+Profiles can select a Host and overlay model, provider, timeouts, readiness
+cache TTL, experimental-provider opt-in, and Host-bound YOLO policy.
+
+```toml
+[profiles.work]
+host = "local-demo"
+provider_alias = "openai"
+yolo = false
+
+[profiles.work.timeouts]
+native_readiness = "90s"
+```
+
+Select a profile with `--profile work`, `SATELLE_PROFILE=work`, or a config
+default. Source matters: environment or project selection cannot activate
+`yolo = true`.
+
+## Project configuration
+
+Satelle discovers `.satelle/config.toml` from the current directory upward.
+Project configuration is shared intent, not authority:
+
+```toml
+default_host = "studio-mac"
+provider_alias = "openai"
+
+[hosts.studio-mac]
+transport = "direct"
+
+[hosts.studio-mac.timeouts]
+native_readiness = "90s"
+```
+
+The matching Host alias must already exist in user configuration and permit
+project selection. Project configuration cannot define addresses, TLS trust,
+tokens, desktop identity, daemon paths, Secret Sources, mutation consent,
+Trusted Profiles, or YOLO enablement.
+
+## Inspect the result
+
+```sh
+satelle config check --all --json
+satelle config explain --host local-demo --json
+```
+
+`config explain` redacts Secret Source references unless
+`--show-secret-references` is explicit. It never reads or prints secret
+material.

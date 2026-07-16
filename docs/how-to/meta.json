@@ -1,0 +1,4 @@
+{
+  "title": "How-to guides",
+  "pages": ["setup-host", "operate-session", "diagnose", "connect-remote"]
+}

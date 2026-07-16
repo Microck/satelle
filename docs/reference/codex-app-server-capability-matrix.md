@@ -1,3 +1,8 @@
+---
+title: Codex app-server capability matrix
+description: Pinned upstream capabilities, approval boundaries, and native Host readiness blockers.
+---
+
 # Codex app-server capability matrix
 
 This reference fixes the upstream contract target for Satelle Phase 0. It is

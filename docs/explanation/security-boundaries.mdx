@@ -1,0 +1,55 @@
+---
+title: Security boundaries
+description: Understand authority, transport trust, durable state, prompts, and diagnostics.
+---
+
+Satelle separates controller intent from Host authority.
+
+```text
+Controller CLI
+    |
+    | local call or authenticated HTTPS/WSS
+    v
+Host Daemon -> durable Session state and normalized logs
+    |
+    | private stdio protocol
+    v
+Codex app-server -> visible native desktop
+```
+
+## The Host owns execution
+
+The Host Daemon admits work, owns the Codex process, resolves provider Secret
+Sources, persists Sessions and Turns, and confirms terminal state. A controller
+connection loss does not transfer that authority or erase durable state.
+
+The public handle is a Satelle `session_id`. Upstream Codex thread identifiers
+remain Host-owned adapter state.
+
+## Configuration is split by trust
+
+User configuration can authorize exact Host bindings and store Secret Source
+descriptors. Project configuration can request shared model, provider, Host,
+transport, and timeout intent, but cannot introduce endpoints, credentials,
+trust roots, desktop identities, mutation consent, or YOLO authority.
+
+## Direct transport is closed by default
+
+Remote direct transport uses HTTPS and WSS. It requires a pinned Host identity,
+an explicit CA bundle, and a bearer token loaded from an owner-only file.
+Tailscale can carry the traffic but does not replace these controls.
+
+## Native prompts remain human boundaries
+
+YOLO can auto-accept only documented Codex command, file, and permission
+callbacks within the current Turn. Native app prompts, operating-system
+permissions, administrator prompts, security prompts, and sensitive-action
+prompts remain visible operator decisions. Satelle does not scrape a terminal
+UI or automate undocumented dialogs as a fallback.
+
+## Diagnostics minimize disclosure
+
+Normal logs contain normalized operational events, not raw provider secrets.
+Readiness caches store verdicts and evidence suitable for diagnosis, not prompt
+content. Explicit diagnostic-export features must not be confused with normal
+`--verbose`, `--json`, or event output.
