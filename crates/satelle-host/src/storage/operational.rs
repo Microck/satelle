@@ -1,7 +1,7 @@
 use super::codec::unix_timestamp_nanos;
 use super::{
-    LeaseOwner, ObservedUpstreamRef, PrivateUpstreamRef, ProviderProbeRecoverySubject,
-    ProviderProbeTerminal, Storage, StorageError, StorageErrorKind,
+    LeaseOwner, ObservedUpstreamRef, PrivateUpstreamRef, ProbeRecoverySubject, ReadinessProbeKind,
+    ReadinessProbeTerminal, Storage, StorageError, StorageErrorKind,
 };
 use crate::{
     ProviderSmokeEvidence, ProviderSmokeFailureEvidence, ProviderSmokeResult, ProviderSmokeSource,
@@ -11,14 +11,33 @@ use rusqlite::{OptionalExtension, TransactionBehavior, params};
 use satelle_core::session::{DesktopBindingRef, ExecutionPolicy};
 
 impl Storage {
+    pub(crate) fn begin_native_probe(
+        &mut self,
+        key: &ReadinessCacheKey,
+        native_probe_ref: &str,
+        owner: &LeaseOwner,
+    ) -> Result<(), StorageError> {
+        self.begin_readiness_probe(key, native_probe_ref, owner, ReadinessProbeKind::Native)
+    }
+
     pub(crate) fn begin_provider_probe(
         &mut self,
         key: &ReadinessCacheKey,
         provider_probe_ref: &str,
         owner: &LeaseOwner,
     ) -> Result<(), StorageError> {
+        self.begin_readiness_probe(key, provider_probe_ref, owner, ReadinessProbeKind::Provider)
+    }
+
+    fn begin_readiness_probe(
+        &mut self,
+        key: &ReadinessCacheKey,
+        probe_ref: &str,
+        owner: &LeaseOwner,
+        kind: ReadinessProbeKind,
+    ) -> Result<(), StorageError> {
         let host_identity = self.host_identity()?;
-        let provider_probe_ref = PrivateUpstreamRef::new(provider_probe_ref.to_string())?;
+        let probe_ref = PrivateUpstreamRef::new(probe_ref.to_string())?;
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
@@ -28,13 +47,17 @@ impl Storage {
             &host_identity,
             key.desktop_binding(),
         )?;
+        let sql = format!(
+            "INSERT INTO control_leases (
+                host_identity_ref, desktop_binding_ref, operation_id,
+                owner_process_id, owner_process_start_ref, owner_boot_identity_ref,
+                acquired_at, heartbeat_at, lease_state, owner_kind, {}
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7, 'active', ?8, ?9)",
+            kind.reference_column()
+        );
         transaction
             .execute(
-                "INSERT INTO control_leases (
-                    host_identity_ref, desktop_binding_ref, operation_id,
-                    owner_process_id, owner_process_start_ref, owner_boot_identity_ref,
-                    acquired_at, heartbeat_at, lease_state, owner_kind, provider_probe_ref
-                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7, 'active', 'provider_probe', ?8)",
+                &sql,
                 rusqlite::params![
                     host_identity.as_str(),
                     key.desktop_binding().as_str(),
@@ -43,16 +66,42 @@ impl Storage {
                     owner.process_start_ref.as_str(),
                     owner.boot_identity_ref.as_str(),
                     super::codec::format_time(owner.acquired_at)?,
-                    provider_probe_ref.as_str(),
+                    kind.owner_kind(),
+                    probe_ref.as_str(),
                 ],
             )
             .map_err(|source| super::sqlite_error(StorageErrorKind::LeaseConflict, source))?;
         transaction.commit().map_err(operation_failed)
     }
 
+    pub(crate) fn persist_native_probe_upstream_ref(
+        &mut self,
+        native_probe_ref: &str,
+        observed: ObservedUpstreamRef,
+    ) -> Result<(), StorageError> {
+        self.persist_readiness_probe_upstream_ref(
+            ReadinessProbeKind::Native,
+            native_probe_ref,
+            observed,
+        )
+    }
+
     pub(crate) fn persist_provider_probe_upstream_ref(
         &mut self,
         provider_probe_ref: &str,
+        observed: ObservedUpstreamRef,
+    ) -> Result<(), StorageError> {
+        self.persist_readiness_probe_upstream_ref(
+            ReadinessProbeKind::Provider,
+            provider_probe_ref,
+            observed,
+        )
+    }
+
+    fn persist_readiness_probe_upstream_ref(
+        &mut self,
+        kind: ReadinessProbeKind,
+        probe_ref: &str,
         observed: ObservedUpstreamRef,
     ) -> Result<(), StorageError> {
         let (column, value) = match observed {
@@ -61,32 +110,58 @@ impl Storage {
         };
         let sql = format!(
             "UPDATE control_leases SET {column} = COALESCE({column}, ?1)
-             WHERE owner_kind = 'provider_probe'
-               AND provider_probe_ref = ?2
-               AND ({column} IS NULL OR {column} = ?1)"
+             WHERE owner_kind = ?3
+               AND {} = ?2
+               AND ({column} IS NULL OR {column} = ?1)",
+            kind.reference_column()
         );
         let changed = self
             .connection
-            .execute(&sql, params![value.as_str(), provider_probe_ref])
+            .execute(&sql, params![value.as_str(), probe_ref, kind.owner_kind()])
             .map_err(operation_failed)?;
         require_idempotent_write(changed)
+    }
+
+    pub(crate) fn pending_native_probe(
+        &self,
+        host_identity: &satelle_core::session::HostIdentityRef,
+        desktop_binding: &DesktopBindingRef,
+    ) -> Result<Option<ProbeRecoverySubject>, StorageError> {
+        self.pending_readiness_probe(host_identity, desktop_binding, ReadinessProbeKind::Native)
     }
 
     pub(crate) fn pending_provider_probe(
         &self,
         host_identity: &satelle_core::session::HostIdentityRef,
         desktop_binding: &DesktopBindingRef,
-    ) -> Result<Option<ProviderProbeRecoverySubject>, StorageError> {
+    ) -> Result<Option<ProbeRecoverySubject>, StorageError> {
+        self.pending_readiness_probe(host_identity, desktop_binding, ReadinessProbeKind::Provider)
+    }
+
+    fn pending_readiness_probe(
+        &self,
+        host_identity: &satelle_core::session::HostIdentityRef,
+        desktop_binding: &DesktopBindingRef,
+        kind: ReadinessProbeKind,
+    ) -> Result<Option<ProbeRecoverySubject>, StorageError> {
+        let sql = format!(
+            "SELECT host_identity_ref, desktop_binding_ref, {},
+                    upstream_thread_ref, upstream_turn_ref, lease_state
+             FROM control_leases
+             WHERE owner_kind = ?3
+               AND host_identity_ref = ?1
+               AND desktop_binding_ref = ?2
+               AND lease_state IN ('active', 'recovery_pending')",
+            kind.reference_column()
+        );
         self.connection
             .query_row(
-                "SELECT host_identity_ref, desktop_binding_ref, provider_probe_ref,
-                        upstream_thread_ref, upstream_turn_ref, lease_state
-                 FROM control_leases
-                 WHERE owner_kind = 'provider_probe'
-                   AND host_identity_ref = ?1
-                   AND desktop_binding_ref = ?2
-                   AND lease_state IN ('active', 'recovery_pending')",
-                params![host_identity.as_str(), desktop_binding.as_str()],
+                &sql,
+                params![
+                    host_identity.as_str(),
+                    desktop_binding.as_str(),
+                    kind.owner_kind()
+                ],
                 |row| {
                     Ok((
                         row.get::<_, String>(0)?,
@@ -106,12 +181,13 @@ impl Storage {
                     "recovery_pending" => true,
                     _ => return Err(StorageError::new(StorageErrorKind::InvalidStoredState)),
                 };
-                Ok(ProviderProbeRecoverySubject {
+                Ok(ProbeRecoverySubject {
                     host_identity: satelle_core::session::HostIdentityRef::new(host)
                         .map_err(|_| StorageError::new(StorageErrorKind::InvalidStoredState))?,
                     desktop_binding: DesktopBindingRef::new(desktop)
                         .map_err(|_| StorageError::new(StorageErrorKind::InvalidStoredState))?,
-                    provider_probe_ref: PrivateUpstreamRef::new(probe)?,
+                    probe_kind: kind,
+                    probe_ref: PrivateUpstreamRef::new(probe)?,
                     upstream_thread_ref: thread.map(PrivateUpstreamRef::new).transpose()?,
                     upstream_turn_ref: turn.map(PrivateUpstreamRef::new).transpose()?,
                     recovery_pending,
@@ -132,6 +208,127 @@ impl Storage {
                    AND lease_state = 'recovery_pending'
                    AND provider_probe_ref = ?1",
                 [provider_probe_ref],
+            )
+            .map_err(operation_failed)?;
+        require_idempotent_write(changed)
+    }
+
+    pub(crate) fn release_reconciled_native_probe(
+        &mut self,
+        native_probe_ref: &str,
+    ) -> Result<(), StorageError> {
+        let changed = self
+            .connection
+            .execute(
+                "DELETE FROM control_leases
+                 WHERE owner_kind = 'native_probe'
+                   AND lease_state = 'recovery_pending'
+                   AND native_probe_ref = ?1",
+                [native_probe_ref],
+            )
+            .map_err(operation_failed)?;
+        require_idempotent_write(changed)
+    }
+
+    pub(crate) fn finish_native_probe_success(
+        &mut self,
+        native_probe_ref: &str,
+        key: &ReadinessCacheKey,
+        evidence: &ReadinessEvidence,
+    ) -> Result<(), StorageError> {
+        let host_identity = self.host_identity()?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(operation_failed)?;
+        insert_readiness(
+            &transaction,
+            host_identity.as_str(),
+            key.adapter(),
+            key.desktop_binding(),
+            evidence,
+            "passed",
+            None,
+        )?;
+        let changed = transaction
+            .execute(
+                "DELETE FROM control_leases
+                 WHERE owner_kind = 'native_probe'
+                   AND native_probe_ref = ?1
+                   AND lease_state = 'active'",
+                [native_probe_ref],
+            )
+            .map_err(operation_failed)?;
+        require_idempotent_write(changed)?;
+        transaction.commit().map_err(operation_failed)
+    }
+
+    pub(crate) fn finish_native_probe_failure(
+        &mut self,
+        native_probe_ref: &str,
+        key: &ReadinessCacheKey,
+        evidence: &ReadinessEvidence,
+        reason: &'static str,
+        terminal: ReadinessProbeTerminal,
+    ) -> Result<(), StorageError> {
+        let host_identity = self.host_identity()?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(operation_failed)?;
+        insert_readiness(
+            &transaction,
+            host_identity.as_str(),
+            key.adapter(),
+            key.desktop_binding(),
+            evidence,
+            terminal.as_str(),
+            Some(reason),
+        )?;
+        let sql = match terminal {
+            ReadinessProbeTerminal::Failed | ReadinessProbeTerminal::TimedOut => {
+                "DELETE FROM control_leases WHERE owner_kind = 'native_probe' AND native_probe_ref = ?1 AND lease_state = 'active'"
+            }
+            ReadinessProbeTerminal::OutcomeUnknown => {
+                "UPDATE control_leases SET lease_state = 'recovery_pending' WHERE owner_kind = 'native_probe' AND native_probe_ref = ?1 AND lease_state = 'active'"
+            }
+        };
+        let changed = transaction
+            .execute(sql, [native_probe_ref])
+            .map_err(operation_failed)?;
+        require_idempotent_write(changed)?;
+        transaction.commit().map_err(operation_failed)
+    }
+
+    pub(crate) fn retain_native_probe_recovery(
+        &mut self,
+        native_probe_ref: &str,
+    ) -> Result<(), StorageError> {
+        let changed = self
+            .connection
+            .execute(
+                "UPDATE control_leases SET lease_state = 'recovery_pending'
+                 WHERE owner_kind = 'native_probe'
+                   AND native_probe_ref = ?1
+                   AND lease_state = 'active'",
+                [native_probe_ref],
+            )
+            .map_err(operation_failed)?;
+        require_idempotent_write(changed)
+    }
+
+    pub(crate) fn release_native_probe(
+        &mut self,
+        native_probe_ref: &str,
+    ) -> Result<(), StorageError> {
+        let changed = self
+            .connection
+            .execute(
+                "DELETE FROM control_leases
+                 WHERE owner_kind = 'native_probe'
+                   AND native_probe_ref = ?1
+                   AND lease_state = 'active'",
+                [native_probe_ref],
             )
             .map_err(operation_failed)?;
         require_idempotent_write(changed)
@@ -233,7 +430,7 @@ impl Storage {
         key: &ReadinessCacheKey,
         readiness: &ReadinessEvidence,
         failure: &ProviderSmokeFailureEvidence,
-        terminal: ProviderProbeTerminal,
+        terminal: ReadinessProbeTerminal,
     ) -> Result<(), StorageError> {
         let host_identity = self.host_identity()?;
         let transaction = self
@@ -261,10 +458,10 @@ impl Storage {
             },
         )?;
         let sql = match terminal {
-            ProviderProbeTerminal::Failed | ProviderProbeTerminal::TimedOut => {
+            ReadinessProbeTerminal::Failed | ReadinessProbeTerminal::TimedOut => {
                 "DELETE FROM control_leases WHERE owner_kind = 'provider_probe' AND provider_probe_ref = ?1 AND lease_state = 'active'"
             }
-            ProviderProbeTerminal::OutcomeUnknown => {
+            ReadinessProbeTerminal::OutcomeUnknown => {
                 "UPDATE control_leases SET lease_state = 'recovery_pending' WHERE owner_kind = 'provider_probe' AND provider_probe_ref = ?1 AND lease_state = 'active'"
             }
         };

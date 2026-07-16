@@ -15,13 +15,13 @@ mod stop;
 #[path = "runtime-worker.rs"]
 mod worker;
 
-use adapter::ProviderProbeDriver;
 pub use adapter::{
     AdapterPreflight, AdapterReadiness, AdapterSubject, ComputerUseAdapter, EvidenceError,
     ExecuteRequest, ExecuteResult, ProviderComputerUseIntent, ProviderSmokeEvidence,
     ProviderSmokeFailureEvidence, ProviderSmokeResult, ProviderSmokeSource, ReadinessCacheKey,
     ReadinessEvidence, RecoveryObservation,
 };
+use adapter::{NativeProbeResult, ReadinessProbeDriver};
 pub(crate) use codex_adapter::ProductionComputerUseAdapter;
 pub(crate) use request::{RequestIdentity, RunCommand, SteerCommand, StopCommand};
 pub(crate) use stop::RuntimeStopOutcome;
@@ -31,7 +31,8 @@ use crate::live_events::LiveEventHub;
 use crate::process_identity::ProcessIdentity;
 use crate::storage::{
     AdmissionOutcome, ApiTokenRegistration, IdempotentOperation, LeaseOwner, LogPageStorageError,
-    ObservedUpstreamRef, ProviderProbeTerminal, SensitiveRequestDigest, Storage, StorageSnapshot,
+    ObservedUpstreamRef, ReadinessProbeKind, ReadinessProbeTerminal, SensitiveRequestDigest,
+    Storage, StorageSnapshot,
 };
 use crate::{ApiBearerToken, ApiPrincipal, DaemonLogPage, LogCursor, LogPageQuery};
 use recovery::RecoveryQueue;
@@ -91,30 +92,34 @@ pub(crate) fn idempotency_conflict() -> SatelleError {
     model::idempotency_conflict()
 }
 
-fn provider_probe_terminal(
+fn readiness_probe_terminal(
     error: &SatelleError,
     persistence_failed: bool,
-) -> ProviderProbeTerminal {
+    cancellation_detail: &str,
+    timeout_code: Option<ErrorCode>,
+) -> ReadinessProbeTerminal {
     if persistence_failed {
-        return ProviderProbeTerminal::OutcomeUnknown;
+        return ReadinessProbeTerminal::OutcomeUnknown;
     }
     match error
         .details
-        .get("provider_smoke_cancellation")
+        .get(cancellation_detail)
         .and_then(serde_json::Value::as_str)
     {
-        Some("outcome_unknown" | "upstream_still_active") => ProviderProbeTerminal::OutcomeUnknown,
-        Some("confirmed") => ProviderProbeTerminal::TimedOut,
-        _ if error.code == ErrorCode::ProviderSmokeTestTimeout => ProviderProbeTerminal::TimedOut,
-        _ => ProviderProbeTerminal::Failed,
+        Some("outcome_unknown" | "upstream_still_active") => ReadinessProbeTerminal::OutcomeUnknown,
+        Some("confirmed") => ReadinessProbeTerminal::TimedOut,
+        _ if timeout_code.is_some_and(|code| error.code == code) => {
+            ReadinessProbeTerminal::TimedOut
+        }
+        _ => ReadinessProbeTerminal::Failed,
     }
 }
 
-fn provider_probe_recovery_pending() -> SatelleError {
+fn readiness_probe_recovery_pending(kind: ReadinessProbeKind) -> SatelleError {
     let mut error = SatelleError::computer_use_not_ready();
     error.details.insert(
         "reason".to_string(),
-        serde_json::Value::String("provider_probe_recovery_pending".to_string()),
+        serde_json::Value::String(format!("{}_recovery_pending", kind.owner_kind())),
     );
     error
 }
@@ -131,7 +136,7 @@ pub(crate) struct RuntimeEngine {
     // admission/read/commit sections only and is never held across adapter I/O.
     storage: Mutex<Storage>,
     adapter: Arc<dyn ComputerUseAdapter>,
-    provider_probe_driver: Option<Arc<dyn ProviderProbeDriver>>,
+    readiness_probe_driver: Option<Arc<dyn ReadinessProbeDriver>>,
     recovery: Mutex<RecoveryQueue>,
     restart_recovery_initialized: Mutex<bool>,
     workers: Mutex<WorkerRegistry>,
@@ -167,7 +172,7 @@ impl RuntimeEngine {
     fn open(
         state_root: &Path,
         adapter: Arc<dyn ComputerUseAdapter>,
-        provider_probe_driver: Option<Arc<dyn ProviderProbeDriver>>,
+        readiness_probe_driver: Option<Arc<dyn ReadinessProbeDriver>>,
     ) -> Result<Arc<Self>, SatelleError> {
         let process_identity =
             ProcessIdentity::current().map_err(model::process_identity_failure)?;
@@ -176,7 +181,7 @@ impl RuntimeEngine {
         Ok(Arc::new(Self {
             storage: Mutex::new(storage),
             adapter,
-            provider_probe_driver,
+            readiness_probe_driver,
             recovery: Mutex::new(RecoveryQueue::new(Vec::new())),
             restart_recovery_initialized: Mutex::new(false),
             workers: Mutex::new(WorkerRegistry::default()),
@@ -344,11 +349,13 @@ impl RuntimeEngine {
         provider_intent: &ProviderComputerUseIntent,
     ) -> Result<AdapterReadiness, SatelleError> {
         let cache_key = self.adapter.readiness_cache_key(host, provider_intent)?;
-        if let (Some(key), Some(driver)) = (cache_key.as_ref(), self.provider_probe_driver.as_ref())
+        if let (Some(key), Some(driver)) =
+            (cache_key.as_ref(), self.readiness_probe_driver.as_ref())
         {
-            self.reconcile_provider_probe(key, driver.as_ref())?;
+            self.reconcile_readiness_probe(key, driver.as_ref(), ReadinessProbeKind::Native)?;
+            self.reconcile_readiness_probe(key, driver.as_ref(), ReadinessProbeKind::Provider)?;
         }
-        let (cached, cached_provider) = if let Some(key) = cache_key.as_ref() {
+        let (mut cached, cached_provider) = if let Some(key) = cache_key.as_ref() {
             let now = time::OffsetDateTime::now_utc();
             let storage = self.lock_storage()?;
             let readiness = storage
@@ -365,10 +372,16 @@ impl RuntimeEngine {
         } else {
             (None, None)
         };
+        if cached.is_none()
+            && let (Some(key), Some(driver)) =
+                (cache_key.as_ref(), self.readiness_probe_driver.as_ref())
+        {
+            cached = Some(self.run_live_native_probe(key, driver.as_ref())?);
+        }
         let requires_live_provider_probe = provider_intent.experimental()
             && (provider_intent.refresh() || cached_provider.is_none());
         let provider_probe_ref = if requires_live_provider_probe
-            && self.provider_probe_driver.is_some()
+            && self.readiness_probe_driver.is_some()
             && let Some(key) = cache_key.as_ref()
         {
             let provider_probe_ref = format!("provider-probe-{}", SessionId::new());
@@ -420,7 +433,7 @@ impl RuntimeEngine {
                         *persistence_error.borrow_mut() = Some(error);
                     })
             };
-            match self.provider_probe_driver.as_ref() {
+            match self.readiness_probe_driver.as_ref() {
                 Some(driver) if provider_probe_ref.is_some() => driver
                     .preflight_terminal_with_provider_probe(
                         host,
@@ -479,7 +492,12 @@ impl RuntimeEngine {
                 error,
             } => {
                 if let Some(provider_probe_ref) = provider_probe_ref.as_deref() {
-                    let terminal = provider_probe_terminal(&error, persistence_failed);
+                    let terminal = readiness_probe_terminal(
+                        &error,
+                        persistence_failed,
+                        "provider_smoke_cancellation",
+                        Some(ErrorCode::ProviderSmokeTestTimeout),
+                    );
                     self.lock_storage()?
                         .finish_provider_probe_failure(
                             provider_probe_ref,
@@ -507,33 +525,145 @@ impl RuntimeEngine {
         }
     }
 
-    fn reconcile_provider_probe(
+    fn run_live_native_probe(
         &self,
         key: &ReadinessCacheKey,
-        driver: &dyn ProviderProbeDriver,
+        driver: &dyn ReadinessProbeDriver,
+    ) -> Result<ReadinessEvidence, SatelleError> {
+        let native_probe_ref = format!("native-probe-{}", SessionId::new());
+        let now = time::OffsetDateTime::now_utc();
+        let owner = LeaseOwner::new(
+            native_probe_ref.clone(),
+            self.process_identity.process_id(),
+            self.process_identity.process_start_ref(),
+            self.process_identity.boot_identity_ref(),
+            now,
+        )
+        .map_err(model::storage_failure)?;
+        self.lock_storage()?
+            .begin_native_probe(key, &native_probe_ref, &owner)
+            .map_err(model::storage_failure)?;
+
+        let persistence_error = std::cell::RefCell::new(None);
+        let probe = {
+            let mut persist_thread_ref = |value: &str| {
+                self.lock_storage()
+                    .and_then(|mut storage| {
+                        storage
+                            .persist_native_probe_upstream_ref(
+                                &native_probe_ref,
+                                ObservedUpstreamRef::thread(value)
+                                    .map_err(model::storage_failure)?,
+                            )
+                            .map_err(model::storage_failure)
+                    })
+                    .map_err(|error| {
+                        *persistence_error.borrow_mut() = Some(error);
+                    })
+            };
+            let mut persist_turn_ref = |value: &str| {
+                self.lock_storage()
+                    .and_then(|mut storage| {
+                        storage
+                            .persist_native_probe_upstream_ref(
+                                &native_probe_ref,
+                                ObservedUpstreamRef::turn(value).map_err(model::storage_failure)?,
+                            )
+                            .map_err(model::storage_failure)
+                    })
+                    .map_err(|error| {
+                        *persistence_error.borrow_mut() = Some(error);
+                    })
+            };
+            driver.run_native_probe(key, &mut persist_thread_ref, &mut persist_turn_ref)
+        };
+        let persistence_failed = persistence_error.into_inner().is_some();
+
+        match probe {
+            NativeProbeResult::Passed(evidence) if !persistence_failed => {
+                self.lock_storage()?
+                    .finish_native_probe_success(&native_probe_ref, key, &evidence)
+                    .map_err(model::storage_failure)?;
+                Ok(evidence)
+            }
+            NativeProbeResult::Passed(_) => {
+                self.lock_storage()?
+                    .retain_native_probe_recovery(&native_probe_ref)
+                    .map_err(model::storage_failure)?;
+                Err(readiness_probe_recovery_pending(ReadinessProbeKind::Native))
+            }
+            NativeProbeResult::Failed {
+                evidence,
+                reason,
+                error,
+            } => {
+                let terminal = readiness_probe_terminal(
+                    &error,
+                    persistence_failed,
+                    "native_readiness_cancellation",
+                    None,
+                );
+                self.lock_storage()?
+                    .finish_native_probe_failure(
+                        &native_probe_ref,
+                        key,
+                        &evidence,
+                        reason,
+                        terminal,
+                    )
+                    .map_err(model::storage_failure)?;
+                Err(error)
+            }
+            NativeProbeResult::UncachedFailure(error) => {
+                self.lock_storage()?
+                    .release_native_probe(&native_probe_ref)
+                    .map_err(model::storage_failure)?;
+                Err(error)
+            }
+        }
+    }
+
+    fn reconcile_readiness_probe(
+        &self,
+        key: &ReadinessCacheKey,
+        driver: &dyn ReadinessProbeDriver,
+        kind: ReadinessProbeKind,
     ) -> Result<(), SatelleError> {
         let subject = {
             let storage = self.lock_storage()?;
             let host_identity = storage.host_identity().map_err(model::storage_failure)?;
-            storage
-                .pending_provider_probe(&host_identity, key.desktop_binding())
-                .map_err(model::storage_failure)?
+            match kind {
+                ReadinessProbeKind::Native => storage
+                    .pending_native_probe(&host_identity, key.desktop_binding())
+                    .map_err(model::storage_failure)?,
+                ReadinessProbeKind::Provider => storage
+                    .pending_provider_probe(&host_identity, key.desktop_binding())
+                    .map_err(model::storage_failure)?,
+            }
         };
         let Some(subject) = subject else {
             return Ok(());
         };
+        debug_assert_eq!(kind, subject.probe_kind());
         if !subject.is_recovery_pending() {
-            return Err(provider_probe_recovery_pending());
+            return Err(readiness_probe_recovery_pending(kind));
         }
-        match driver.observe_provider_probe(&subject) {
+        match driver.observe_readiness_probe(&subject) {
             RecoveryObservation::Completed
             | RecoveryObservation::Blocked
-            | RecoveryObservation::Failed => self
-                .lock_storage()?
-                .release_reconciled_provider_probe(subject.provider_probe_ref())
-                .map_err(model::storage_failure),
+            | RecoveryObservation::Failed => {
+                let mut storage = self.lock_storage()?;
+                match kind {
+                    ReadinessProbeKind::Native => storage
+                        .release_reconciled_native_probe(subject.probe_ref())
+                        .map_err(model::storage_failure),
+                    ReadinessProbeKind::Provider => storage
+                        .release_reconciled_provider_probe(subject.probe_ref())
+                        .map_err(model::storage_failure),
+                }
+            }
             RecoveryObservation::Running | RecoveryObservation::Unknown => {
-                Err(provider_probe_recovery_pending())
+                Err(readiness_probe_recovery_pending(kind))
             }
         }
     }
@@ -700,7 +830,7 @@ struct LazyRuntime {
 #[derive(Clone)]
 pub(crate) struct RuntimeHandle {
     adapter: Arc<dyn ComputerUseAdapter>,
-    provider_probe_driver: Option<Arc<dyn ProviderProbeDriver>>,
+    readiness_probe_driver: Option<Arc<dyn ReadinessProbeDriver>>,
     lazy: Arc<Mutex<LazyRuntime>>,
 }
 
@@ -720,7 +850,7 @@ impl RuntimeHandle {
     ) -> Self {
         Self {
             adapter: Arc::new(adapter),
-            provider_probe_driver: None,
+            readiness_probe_driver: None,
             lazy: Arc::new(Mutex::new(LazyRuntime {
                 state_root,
                 engine: None,
@@ -734,10 +864,10 @@ impl RuntimeHandle {
     ) -> Self {
         let adapter = Arc::new(adapter);
         let computer_use_adapter: Arc<dyn ComputerUseAdapter> = adapter.clone();
-        let provider_probe_driver: Arc<dyn ProviderProbeDriver> = adapter;
+        let readiness_probe_driver: Arc<dyn ReadinessProbeDriver> = adapter;
         Self {
             adapter: computer_use_adapter,
-            provider_probe_driver: Some(provider_probe_driver),
+            readiness_probe_driver: Some(readiness_probe_driver),
             lazy: Arc::new(Mutex::new(LazyRuntime {
                 state_root,
                 engine: None,
@@ -746,18 +876,18 @@ impl RuntimeHandle {
     }
 
     #[cfg(test)]
-    fn new_with_provider_probe_driver<A, D>(
+    fn new_with_readiness_probe_driver<A, D>(
         state_root: Result<PathBuf, SatelleError>,
         adapter: A,
-        provider_probe_driver: D,
+        readiness_probe_driver: D,
     ) -> Self
     where
         A: ComputerUseAdapter,
-        D: ProviderProbeDriver,
+        D: ReadinessProbeDriver,
     {
         Self {
             adapter: Arc::new(adapter),
-            provider_probe_driver: Some(Arc::new(provider_probe_driver)),
+            readiness_probe_driver: Some(Arc::new(readiness_probe_driver)),
             lazy: Arc::new(Mutex::new(LazyRuntime {
                 state_root,
                 engine: None,
@@ -1153,7 +1283,7 @@ impl RuntimeHandle {
         let engine = RuntimeEngine::open(
             &state_root,
             Arc::clone(&self.adapter),
-            self.provider_probe_driver.clone(),
+            self.readiness_probe_driver.clone(),
         )?;
         lazy.engine = Some(Arc::clone(&engine));
         Ok(engine)

@@ -351,13 +351,35 @@ pub(crate) enum ObservedUpstreamRef {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum ProviderProbeTerminal {
+pub(crate) enum ReadinessProbeTerminal {
     Failed,
     TimedOut,
     OutcomeUnknown,
 }
 
-impl ProviderProbeTerminal {
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ReadinessProbeKind {
+    Native,
+    Provider,
+}
+
+impl ReadinessProbeKind {
+    pub(crate) const fn owner_kind(self) -> &'static str {
+        match self {
+            Self::Native => "native_probe",
+            Self::Provider => "provider_probe",
+        }
+    }
+
+    pub(crate) const fn reference_column(self) -> &'static str {
+        match self {
+            Self::Native => "native_probe_ref",
+            Self::Provider => "provider_probe_ref",
+        }
+    }
+}
+
+impl ReadinessProbeTerminal {
     pub(crate) const fn as_str(self) -> &'static str {
         match self {
             Self::Failed => "failed",
@@ -368,18 +390,23 @@ impl ProviderProbeTerminal {
 }
 
 #[derive(Clone)]
-pub(crate) struct ProviderProbeRecoverySubject {
+pub(crate) struct ProbeRecoverySubject {
     host_identity: HostIdentityRef,
     desktop_binding: DesktopBindingRef,
-    provider_probe_ref: PrivateUpstreamRef,
+    probe_kind: ReadinessProbeKind,
+    probe_ref: PrivateUpstreamRef,
     upstream_thread_ref: Option<PrivateUpstreamRef>,
     upstream_turn_ref: Option<PrivateUpstreamRef>,
     recovery_pending: bool,
 }
 
-impl ProviderProbeRecoverySubject {
-    pub(crate) fn provider_probe_ref(&self) -> &str {
-        self.provider_probe_ref.as_str()
+impl ProbeRecoverySubject {
+    pub(crate) const fn probe_kind(&self) -> ReadinessProbeKind {
+        self.probe_kind
+    }
+
+    pub(crate) fn probe_ref(&self) -> &str {
+        self.probe_ref.as_str()
     }
 
     pub(crate) fn upstream_thread_ref(&self) -> Option<&str> {
@@ -399,10 +426,10 @@ impl ProviderProbeRecoverySubject {
     }
 }
 
-impl fmt::Debug for ProviderProbeRecoverySubject {
+impl fmt::Debug for ProbeRecoverySubject {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
-            .debug_struct("ProviderProbeRecoverySubject")
+            .debug_struct("ProbeRecoverySubject")
             .field("host_identity", &self.host_identity)
             .field("desktop_binding", &self.desktop_binding)
             .finish_non_exhaustive()

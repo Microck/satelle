@@ -1,8 +1,8 @@
 use super::adapter::{
     AdapterPreflight, AdapterReadiness, AdapterSubject, ComputerUseAdapter, ExecuteRequest,
-    ExecuteResult, ProviderComputerUseIntent, ProviderProbeDriver, ProviderSmokeEvidence,
+    ExecuteResult, NativeProbeResult, ProviderComputerUseIntent, ProviderSmokeEvidence,
     ProviderSmokeFailureEvidence, ProviderSmokeResult, ProviderSmokeSource, ReadinessCacheKey,
-    ReadinessEvidence, RecoveryObservation,
+    ReadinessEvidence, ReadinessProbeDriver, RecoveryObservation,
 };
 use crate::codex_session::{
     CodexApprovalPolicy, CodexSandboxPolicy, CodexSessionControl, CodexSessionError,
@@ -35,6 +35,11 @@ const PROVIDER_SMOKE_CANCELLATION_GRACE: Duration = Duration::from_secs(5);
 struct ProviderSmokeAttemptFailure {
     evidence: Option<ProviderSmokeFailureEvidence>,
     error: Box<SatelleError>,
+}
+
+struct NativeSmokeFailure {
+    reason: &'static str,
+    error: SatelleError,
 }
 
 struct ProviderProbePersistence<'a> {
@@ -266,7 +271,9 @@ impl ProductionComputerUseAdapter {
                 ));
             }
         };
-        match self.run_native_smoke(&key) {
+        let mut persist_thread_ref = |_value: &str| Ok(());
+        let mut persist_turn_ref = |_value: &str| Ok(());
+        match self.run_native_smoke(&mut persist_thread_ref, &mut persist_turn_ref) {
             Ok(()) => self.readiness_from_evidence(
                 &key,
                 evidence,
@@ -275,35 +282,39 @@ impl ProductionComputerUseAdapter {
                 provider_smoke_timeout,
                 persistence,
             ),
-            Err(reason) => AdapterPreflight::Failed {
+            Err(failure) => AdapterPreflight::Failed {
                 key,
                 evidence,
-                reason,
-                error: native_readiness_failure(reason),
+                reason: failure.reason,
+                error: failure.error,
             },
         }
     }
 
-    fn run_native_smoke(&self, _key: &ReadinessCacheKey) -> Result<(), &'static str> {
+    fn run_native_smoke(
+        &self,
+        persist_thread_ref: &mut dyn FnMut(&str) -> Result<(), ()>,
+        persist_turn_ref: &mut dyn FnMut(&str) -> Result<(), ()>,
+    ) -> Result<(), NativeSmokeFailure> {
         let nonce = format!("SATELLE-{}", satelle_core::TurnId::new());
         let deadline = Instant::now()
             .checked_add(self.native_readiness_timeout)
-            .ok_or("native_readiness_timeout_invalid")?;
-        let mut target = NativeActionTarget::spawn(&nonce, self.native_readiness_timeout)?;
+            .ok_or_else(|| native_smoke_failure("native_readiness_timeout_invalid"))?;
+        let mut target = NativeActionTarget::spawn(&nonce, self.native_readiness_timeout)
+            .map_err(native_smoke_failure)?;
         std::thread::sleep(Duration::from_millis(200));
         let working_directory = self
             .working_directory
             .as_ref()
-            .map_err(|_| "working_directory_unavailable")
+            .map_err(|_| native_smoke_failure("working_directory_unavailable"))
             .and_then(|path| {
-                prepare_working_directory(path).map_err(|_| "working_directory_unavailable")
+                prepare_working_directory(path)
+                    .map_err(|_| native_smoke_failure("working_directory_unavailable"))
             })?;
         let prompt = format!(
             "Use native Computer Use, not shell or file tools, to click the button labeled {nonce} in the visible 'Satelle Native Readiness' window. Stop after clicking it."
         );
-        let mut persist_thread = |_value: &str| Ok(());
-        let mut persist_turn = |_value: &str| Ok(());
-        let terminal = run_codex_session(
+        let run = run_codex_session_with_timeout_cancellation(
             crate::codex_capabilities::installed_app_server_command(),
             CodexSessionRequest {
                 working_directory: &working_directory,
@@ -315,19 +326,29 @@ impl ProductionComputerUseAdapter {
                 approval_policy: CodexApprovalPolicy::OnRequest,
                 sandbox_policy: CodexSandboxPolicy::WorkspaceWrite,
                 deadline,
-                persist_thread_ref: &mut persist_thread,
-                persist_turn_ref: &mut persist_turn,
+                persist_thread_ref,
+                persist_turn_ref,
                 control: None,
             },
-        )
-        .map_err(|failure| match failure.error() {
-            CodexSessionError::Timeout => "native_readiness_timed_out",
-            _ => "native_readiness_session_failed",
+            PROVIDER_SMOKE_CANCELLATION_GRACE,
+        );
+        if let Some(observation) = run.cancellation {
+            return Err(native_readiness_timeout_after_cancellation(observation));
+        }
+        let terminal = run.result.map_err(|failure| {
+            let reason = match failure.error() {
+                CodexSessionError::Timeout => "native_readiness_timed_out",
+                CodexSessionError::Persistence => "native_readiness_persistence_failed",
+                _ => "native_readiness_session_failed",
+            };
+            native_smoke_failure(reason)
         })?;
         if terminal != CodexSessionTerminal::Completed {
-            return Err("native_readiness_session_failed");
+            return Err(native_smoke_failure("native_readiness_session_failed"));
         }
-        target.wait_for_success(deadline)
+        target
+            .wait_for_success(deadline)
+            .map_err(native_smoke_failure)
     }
 
     fn run_required_provider_smoke(
@@ -543,9 +564,9 @@ impl ProductionComputerUseAdapter {
         .ok()
     }
 
-    fn read_provider_probe_turn(
+    fn read_readiness_probe_turn(
         &self,
-        subject: &crate::storage::ProviderProbeRecoverySubject,
+        subject: &crate::storage::ProbeRecoverySubject,
     ) -> Option<CodexTurnStatus> {
         let (Some(thread_ref), Some(turn_ref)) =
             (subject.upstream_thread_ref(), subject.upstream_turn_ref())
@@ -716,6 +737,29 @@ fn native_readiness_failure(reason: &'static str) -> SatelleError {
         source_detail: None,
         details,
     }
+}
+
+fn native_smoke_failure(reason: &'static str) -> NativeSmokeFailure {
+    NativeSmokeFailure {
+        reason,
+        error: native_readiness_failure(reason),
+    }
+}
+
+fn native_readiness_timeout_after_cancellation(observation: StopObservation) -> NativeSmokeFailure {
+    let mut failure = native_smoke_failure("native_readiness_timed_out");
+    let cancellation = match observation {
+        StopObservation::CancellationConfirmed | StopObservation::UpstreamInactiveConfirmed => {
+            "confirmed"
+        }
+        StopObservation::UpstreamStillActive => "upstream_still_active",
+        StopObservation::OutcomeUnknown => "outcome_unknown",
+    };
+    failure.error.details.insert(
+        "native_readiness_cancellation".to_string(),
+        Value::String(cancellation.to_string()),
+    );
+    failure
 }
 
 fn provider_smoke_session_failure(error: CodexSessionError) -> SatelleError {
@@ -1007,7 +1051,39 @@ impl ComputerUseAdapter for ProductionComputerUseAdapter {
     }
 }
 
-impl ProviderProbeDriver for ProductionComputerUseAdapter {
+impl ReadinessProbeDriver for ProductionComputerUseAdapter {
+    fn run_native_probe(
+        &self,
+        key: &ReadinessCacheKey,
+        persist_thread_ref: &mut dyn FnMut(&str) -> Result<(), ()>,
+        persist_turn_ref: &mut dyn FnMut(&str) -> Result<(), ()>,
+    ) -> NativeProbeResult {
+        let observed_at = time::OffsetDateTime::now_utc();
+        let Some(expires_at) = observed_at.checked_add(self.native_readiness_ttl) else {
+            return NativeProbeResult::UncachedFailure(adapter_failure("readiness_ttl_invalid"));
+        };
+        let evidence = match key.evidence(
+            format!("native-readiness-{}", satelle_core::SessionId::new()),
+            observed_at,
+            expires_at,
+        ) {
+            Ok(evidence) => evidence,
+            Err(_) => {
+                return NativeProbeResult::UncachedFailure(adapter_failure(
+                    "readiness_evidence_invalid",
+                ));
+            }
+        };
+        match self.run_native_smoke(persist_thread_ref, persist_turn_ref) {
+            Ok(()) => NativeProbeResult::Passed(evidence),
+            Err(failure) => NativeProbeResult::Failed {
+                evidence,
+                reason: failure.reason,
+                error: failure.error,
+            },
+        }
+    }
+
     fn preflight_terminal_with_provider_probe(
         &self,
         _host: &str,
@@ -1024,11 +1100,11 @@ impl ProviderProbeDriver for ProductionComputerUseAdapter {
         self.preflight_terminal_inner(provider_intent, cached, cached_provider, &mut persistence)
     }
 
-    fn observe_provider_probe(
+    fn observe_readiness_probe(
         &self,
-        subject: &crate::storage::ProviderProbeRecoverySubject,
+        subject: &crate::storage::ProbeRecoverySubject,
     ) -> RecoveryObservation {
-        match self.read_provider_probe_turn(subject) {
+        match self.read_readiness_probe_turn(subject) {
             Some(CodexTurnStatus::InProgress) => RecoveryObservation::Running,
             Some(
                 CodexTurnStatus::Completed | CodexTurnStatus::Interrupted | CodexTurnStatus::Failed,

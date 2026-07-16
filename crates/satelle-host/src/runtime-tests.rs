@@ -1,11 +1,11 @@
-use super::adapter::{BlockedComputerUseAdapter, ProviderProbeDriver};
+use super::adapter::{BlockedComputerUseAdapter, NativeProbeResult, ReadinessProbeDriver};
 use super::{
     AdapterPreflight, AdapterReadiness, ComputerUseAdapter, ExecuteRequest, ExecuteResult,
     LogPageQuery, ProviderComputerUseIntent, ProviderSmokeFailureEvidence, ReadinessCacheKey,
     ReadinessEvidence, RecoveryObservation, RequestIdentity, RunCommand, RuntimeHandle,
     RuntimeStartupState, SteerCommand, StopCommand,
 };
-use crate::storage::{LeaseOwner, PrivateUpstreamRef, ProviderProbeRecoverySubject};
+use crate::storage::{LeaseOwner, PrivateUpstreamRef, ProbeRecoverySubject};
 use crate::test_runtime::FakeComputerUseAdapter;
 use satelle_core::session::{
     ApprovalPolicy, DesktopBindingRef, DesktopTarget, EffectiveModelRef, ExecutionPolicy,
@@ -117,7 +117,7 @@ fn unknown_provider_probe_ownership_blocks_probe_and_prompt_until_terminal_recon
         RecoveryObservation::Running,
         RecoveryObservation::Completed,
     ]);
-    let runtime = RuntimeHandle::new_with_provider_probe_driver(
+    let runtime = RuntimeHandle::new_with_readiness_probe_driver(
         Ok(state.path().to_path_buf()),
         adapter.clone(),
         adapter,
@@ -195,7 +195,7 @@ fn unknown_provider_probe_ownership_blocks_probe_and_prompt_until_terminal_recon
 fn active_provider_probe_blocks_without_external_reconciliation() {
     let state = crate::TestStateDir::new().expect("temporary state directory should exist");
     let adapter = ProviderProbeRecoveryAdapter::new([]);
-    let runtime = RuntimeHandle::new_with_provider_probe_driver(
+    let runtime = RuntimeHandle::new_with_readiness_probe_driver(
         Ok(state.path().to_path_buf()),
         adapter.clone(),
         adapter.clone(),
@@ -219,6 +219,176 @@ fn active_provider_probe_blocks_without_external_reconciliation() {
     assert_eq!(
         error.error().details["reason"],
         "provider_probe_recovery_pending"
+    );
+    assert_eq!(0, adapter.observation_calls.load(Ordering::SeqCst));
+}
+
+#[test]
+fn confirmed_native_probe_timeout_is_terminal_and_releases_control() {
+    let state = crate::TestStateDir::new().expect("temporary state directory should exist");
+    let adapter = ProviderProbeRecoveryAdapter::with_native_results(
+        [],
+        [
+            NativeProbeBehavior::TimedOutConfirmed,
+            NativeProbeBehavior::Passed,
+        ],
+    );
+    let runtime = RuntimeHandle::new_with_readiness_probe_driver(
+        Ok(state.path().to_path_buf()),
+        adapter.clone(),
+        adapter,
+    );
+
+    let error = runtime
+        .run(RunCommand::attached(
+            LOCAL_DEMO_HOST,
+            "blocked-by-native-timeout",
+        ))
+        .expect_err("the prompt must not execute after a native readiness timeout");
+    assert_eq!(
+        error.error().details["native_readiness_cancellation"],
+        "confirmed"
+    );
+    let engine = runtime.engine().expect("runtime engine should be open");
+    let storage = engine.lock_storage().unwrap();
+    let status: String = storage
+        .connection_for_test()
+        .query_row("SELECT status FROM native_readiness_results", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    let leases: i64 = storage
+        .connection_for_test()
+        .query_row(
+            "SELECT count(*) FROM control_leases WHERE owner_kind = 'native_probe'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    drop(storage);
+    assert_eq!("timed_out", status);
+    assert_eq!(0, leases);
+
+    runtime
+        .run(RunCommand::attached(
+            LOCAL_DEMO_HOST,
+            "prompt-after-confirmed-timeout",
+        ))
+        .expect("confirmed cancellation must allow a later native probe and prompt");
+}
+
+#[test]
+fn unknown_native_probe_timeout_blocks_until_terminal_reconciliation() {
+    let state = crate::TestStateDir::new().expect("temporary state directory should exist");
+    let adapter = ProviderProbeRecoveryAdapter::with_native_results(
+        [
+            RecoveryObservation::Running,
+            RecoveryObservation::Running,
+            RecoveryObservation::Completed,
+        ],
+        [
+            NativeProbeBehavior::TimedOutUnknown,
+            NativeProbeBehavior::Passed,
+        ],
+    );
+    let runtime = RuntimeHandle::new_with_readiness_probe_driver(
+        Ok(state.path().to_path_buf()),
+        adapter.clone(),
+        adapter,
+    );
+
+    runtime
+        .run(RunCommand::attached(
+            LOCAL_DEMO_HOST,
+            "native-timeout-unknown",
+        ))
+        .expect_err("unconfirmed cancellation must fail closed");
+    let engine = runtime.engine().expect("runtime engine should be open");
+    let storage = engine.lock_storage().unwrap();
+    let status: String = storage
+        .connection_for_test()
+        .query_row("SELECT status FROM native_readiness_results", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    let lease = storage
+        .connection_for_test()
+        .query_row(
+            "SELECT lease_state, upstream_thread_ref, upstream_turn_ref
+             FROM control_leases WHERE owner_kind = 'native_probe'",
+            [],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            },
+        )
+        .unwrap();
+    drop(storage);
+    assert_eq!("outcome_unknown", status);
+    assert_eq!("recovery_pending", lease.0);
+    assert_eq!(PRIVATE_UPSTREAM_THREAD_REF, lease.1);
+    assert_eq!(PRIVATE_UPSTREAM_TURN_REF, lease.2);
+
+    for prompt in ["conflicting-prompt", "conflicting-native-probe"] {
+        let error = runtime
+            .run(RunCommand::attached(LOCAL_DEMO_HOST, prompt))
+            .expect_err("an active upstream probe must retain exclusive control");
+        assert_eq!(
+            error.error().details["reason"],
+            "native_probe_recovery_pending"
+        );
+    }
+
+    runtime
+        .run(RunCommand::attached(
+            LOCAL_DEMO_HOST,
+            "prompt-after-native-reconciliation",
+        ))
+        .expect("terminal observation must release control before retrying the probe");
+    let remaining: i64 = engine
+        .lock_storage()
+        .unwrap()
+        .connection_for_test()
+        .query_row(
+            "SELECT count(*) FROM control_leases WHERE owner_kind = 'native_probe'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(0, remaining);
+}
+
+#[test]
+fn active_native_probe_blocks_without_external_reconciliation() {
+    let state = crate::TestStateDir::new().expect("temporary state directory should exist");
+    let adapter = ProviderProbeRecoveryAdapter::new([]);
+    let runtime = RuntimeHandle::new_with_readiness_probe_driver(
+        Ok(state.path().to_path_buf()),
+        adapter.clone(),
+        adapter.clone(),
+    );
+    let engine = runtime.engine().expect("runtime engine should be open");
+    let now = time::OffsetDateTime::now_utc();
+    let owner = LeaseOwner::new("active-native-probe", 1, "process-start", "boot-id", now).unwrap();
+    engine
+        .lock_storage()
+        .unwrap()
+        .begin_native_probe(
+            &ProviderProbeRecoveryAdapter::key(),
+            "active-native-probe",
+            &owner,
+        )
+        .unwrap();
+
+    let error = runtime
+        .run(RunCommand::attached(LOCAL_DEMO_HOST, "conflicting-prompt"))
+        .expect_err("an active native probe owns the desktop");
+    assert_eq!(
+        error.error().details["reason"],
+        "native_probe_recovery_pending"
     );
     assert_eq!(0, adapter.observation_calls.load(Ordering::SeqCst));
 }
@@ -713,6 +883,15 @@ struct TerminalRecoveryAdapter {
 struct ProviderProbeRecoveryAdapter {
     observations: Arc<Mutex<VecDeque<RecoveryObservation>>>,
     observation_calls: Arc<AtomicUsize>,
+    native_results: Arc<Mutex<VecDeque<NativeProbeBehavior>>>,
+    native_probe_calls: Arc<AtomicUsize>,
+}
+
+#[derive(Clone, Copy)]
+enum NativeProbeBehavior {
+    Passed,
+    TimedOutConfirmed,
+    TimedOutUnknown,
 }
 
 impl ProviderProbeRecoveryAdapter {
@@ -720,7 +899,18 @@ impl ProviderProbeRecoveryAdapter {
         Self {
             observations: Arc::new(Mutex::new(observations.into_iter().collect())),
             observation_calls: Arc::new(AtomicUsize::new(0)),
+            native_results: Arc::new(Mutex::new(VecDeque::new())),
+            native_probe_calls: Arc::new(AtomicUsize::new(0)),
         }
+    }
+
+    fn with_native_results(
+        observations: impl IntoIterator<Item = RecoveryObservation>,
+        results: impl IntoIterator<Item = NativeProbeBehavior>,
+    ) -> Self {
+        let adapter = Self::new(observations);
+        *adapter.native_results.lock().unwrap() = results.into_iter().collect();
+        adapter
     }
 
     fn key() -> ReadinessCacheKey {
@@ -747,15 +937,15 @@ impl ProviderProbeRecoveryAdapter {
         .unwrap()
     }
 
-    fn readiness() -> ReadinessEvidence {
+    fn readiness_with_id(result_id: impl Into<String>) -> ReadinessEvidence {
         let now = time::OffsetDateTime::now_utc();
         Self::key()
-            .evidence(
-                "provider-probe-native-result",
-                now,
-                now + time::Duration::minutes(5),
-            )
+            .evidence(result_id, now, now + time::Duration::minutes(5))
             .unwrap()
+    }
+
+    fn readiness() -> ReadinessEvidence {
+        Self::readiness_with_id("provider-probe-native-result")
     }
 }
 
@@ -795,7 +985,51 @@ impl ComputerUseAdapter for ProviderProbeRecoveryAdapter {
     }
 }
 
-impl ProviderProbeDriver for ProviderProbeRecoveryAdapter {
+impl ReadinessProbeDriver for ProviderProbeRecoveryAdapter {
+    fn run_native_probe(
+        &self,
+        _key: &ReadinessCacheKey,
+        persist_thread_ref: &mut dyn FnMut(&str) -> Result<(), ()>,
+        persist_turn_ref: &mut dyn FnMut(&str) -> Result<(), ()>,
+    ) -> NativeProbeResult {
+        let call = self.native_probe_calls.fetch_add(1, Ordering::SeqCst);
+        let evidence = Self::readiness_with_id(format!("native-probe-result-{call}"));
+        match self
+            .native_results
+            .lock()
+            .unwrap()
+            .pop_front()
+            .unwrap_or(NativeProbeBehavior::Passed)
+        {
+            NativeProbeBehavior::Passed => NativeProbeResult::Passed(evidence),
+            behavior => {
+                persist_thread_ref(PRIVATE_UPSTREAM_THREAD_REF).unwrap();
+                persist_turn_ref(PRIVATE_UPSTREAM_TURN_REF).unwrap();
+                let mut error = SatelleError::computer_use_not_ready();
+                error.details.insert(
+                    "reason".to_string(),
+                    serde_json::Value::String("native_readiness_timed_out".to_string()),
+                );
+                error.details.insert(
+                    "native_readiness_cancellation".to_string(),
+                    serde_json::Value::String(
+                        match behavior {
+                            NativeProbeBehavior::TimedOutConfirmed => "confirmed",
+                            NativeProbeBehavior::TimedOutUnknown => "outcome_unknown",
+                            NativeProbeBehavior::Passed => unreachable!(),
+                        }
+                        .to_string(),
+                    ),
+                );
+                NativeProbeResult::Failed {
+                    evidence,
+                    reason: "native_readiness_timed_out",
+                    error,
+                }
+            }
+        }
+    }
+
     fn preflight_terminal_with_provider_probe(
         &self,
         _host: &str,
@@ -838,10 +1072,7 @@ impl ProviderProbeDriver for ProviderProbeRecoveryAdapter {
         }
     }
 
-    fn observe_provider_probe(
-        &self,
-        subject: &ProviderProbeRecoverySubject,
-    ) -> RecoveryObservation {
+    fn observe_readiness_probe(&self, subject: &ProbeRecoverySubject) -> RecoveryObservation {
         self.observation_calls.fetch_add(1, Ordering::SeqCst);
         assert_eq!(
             Some(PRIVATE_UPSTREAM_THREAD_REF),
