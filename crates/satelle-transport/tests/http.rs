@@ -17,7 +17,11 @@ mod sessions;
 
 use reqwest::StatusCode;
 use satelle_core::ErrorCode;
-use satelle_host::{ApiBearerToken, ApiScopes, HostService, test_support::TestStateDir};
+use satelle_core::session::TurnExecutionMode;
+use satelle_host::{
+    ApiBearerToken, ApiScopes, HostService, MutationAuthority, TurnIntent,
+    test_support::TestStateDir,
+};
 use satelle_transport::{
     ApiError, CapabilitiesResponse, DaemonClient, DaemonClientError, DaemonServer,
     DaemonServerConfig, HostDesktopSessionsResponse, HostStatusResponse, LiveResponse,
@@ -124,6 +128,87 @@ async fn assert_rate_limited(
     error["details"]["retry_after_ms"]
         .as_u64()
         .expect("known fixed-window timing must be reported")
+}
+
+#[tokio::test]
+async fn idle_server_waits_for_timeout_and_connected_clients() {
+    let state = TestStateDir::new().expect("temporary state directory");
+    let service = HostService::local_demo_for_tests_at(state.path())
+        .expect("construct deterministic Host service");
+    let idle_timeout = Duration::from_millis(80);
+    let server = DaemonServer::bind(
+        service,
+        DaemonServerConfig::loopback(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
+            .with_idle_timeout(idle_timeout),
+    )
+    .await
+    .expect("bind idle server");
+    let address = server.local_addr();
+    let mut waiting = Box::pin(server.wait());
+
+    assert!(
+        tokio::time::timeout(Duration::from_millis(30), &mut waiting)
+            .await
+            .is_err(),
+        "server wait must remain pending before the idle timeout"
+    );
+
+    let client = TcpStream::connect(address)
+        .await
+        .expect("connect idle client");
+    assert!(
+        tokio::time::timeout(idle_timeout + Duration::from_millis(40), &mut waiting)
+            .await
+            .is_err(),
+        "a connected client must prevent idle shutdown"
+    );
+
+    drop(client);
+    tokio::time::timeout(idle_timeout + Duration::from_millis(150), waiting)
+        .await
+        .expect("server should exit after the client disconnects and timeout elapses")
+        .expect("idle shutdown should be graceful");
+}
+
+#[tokio::test]
+async fn retained_idle_session_does_not_prevent_idle_shutdown() {
+    let state = TestStateDir::new().expect("temporary state directory");
+    let service = HostService::local_demo_for_tests_at(state.path())
+        .expect("construct deterministic Host service");
+    service.initialize_daemon().expect("initialize Host state");
+    let token = ApiBearerToken::generate().expect("generate API token");
+    let principal = service
+        .register_api_token(&token, "principal-idle-session", ApiScopes::CONTROL, None)
+        .expect("register API principal");
+    let intent = TurnIntent::new("finish before idle shutdown", TurnExecutionMode::Standard)
+        .expect("construct Turn intent");
+    let authority = MutationAuthority::new(principal, "idle-session-request")
+        .expect("construct mutation authority");
+    service.admit_run(&intent, &authority).expect("admit Turn");
+    while !service
+        .daemon_workers_idle()
+        .expect("inspect daemon workers")
+    {
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    let status = service
+        .daemon_runtime_status()
+        .expect("read retained Session status");
+    assert_eq!(status.session_count(), 1);
+    assert_eq!(status.active_turn_count(), 0);
+
+    let server = DaemonServer::bind(
+        service,
+        DaemonServerConfig::loopback(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
+            .with_idle_timeout(Duration::from_millis(50)),
+    )
+    .await
+    .expect("bind idle server with retained Session");
+
+    tokio::time::timeout(Duration::from_millis(250), server.wait())
+        .await
+        .expect("retained idle Session must not keep the daemon alive")
+        .expect("idle shutdown should be graceful");
 }
 
 #[tokio::test]

@@ -21,6 +21,7 @@ adapter = "fake"
 [hosts.work-host]
 transport = "local"
 adapter = "fake"
+daemon_idle_timeout = "12m"
 
 [hosts.work-host.timeouts]
 provider_smoke_test = "11s"
@@ -31,6 +32,7 @@ model_alias = "work-model"
 provider_alias = "work-provider"
 experimental_provider_computer_use = true
 yolo = true
+daemon_idle_timeout = "3m"
 
 [profiles.work.timeouts]
 native_readiness = "7s"
@@ -59,6 +61,10 @@ native_readiness = "7s"
     );
     assert_eq!(report["effective"]["yolo"], false);
     assert_eq!(report["effective"]["hosts"]["work-host"]["yolo"], true);
+    assert_eq!(
+        report["effective"]["hosts"]["work-host"]["daemon_idle_timeout"],
+        "3m"
+    );
     assert_eq!(
         report["effective"]["hosts"]["work-host"]["timeouts"]["native_readiness"],
         "7s"
@@ -121,6 +127,34 @@ native_readiness = "7s"
         overridden_host["values"]["yolo"]["source"],
         "user_config_profile"
     );
+}
+
+#[test]
+fn daemon_idle_timeout_requires_explicit_units_on_hosts_and_profiles() {
+    for config in [
+        r#"
+[hosts.local-demo]
+transport = "local"
+adapter = "fake"
+daemon_idle_timeout = 600
+"#,
+        r#"
+[hosts.local-demo]
+transport = "local"
+adapter = "fake"
+
+[profiles.work]
+host = "local-demo"
+daemon_idle_timeout = "600"
+"#,
+    ] {
+        ConfigFixture::new(config, "")
+            .command()
+            .args(["config", "check", "--json"])
+            .assert()
+            .failure()
+            .stderr(predicate::str::contains("daemon_idle_timeout"));
+    }
 }
 
 #[test]

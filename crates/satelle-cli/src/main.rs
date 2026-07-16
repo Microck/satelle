@@ -35,11 +35,13 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::str::FromStr;
+use std::time::Duration;
 use transport::{AttachedTurnOutcome, discover_direct_host_identity, transport_for};
 
 const CONFIG_CHECK_SCHEMA_VERSION: &str = "satelle.config.check.v1";
 const CONFIG_EXPLAIN_SCHEMA_VERSION: &str = "satelle.config.explain.v1";
 const PATHS_SCHEMA_VERSION: &str = "satelle.paths.v1";
+const DEFAULT_ON_DEMAND_IDLE_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 
@@ -1814,7 +1816,7 @@ fn run_host(
 ) -> Result<(), CliFailure> {
     let json = format.is_json();
     match command {
-        HostCommand::Start(command) => start_host_daemon(command, format),
+        HostCommand::Start(command) => start_host_daemon(command, config, format),
         HostCommand::Trust(command) => trust_host(command, config, format),
         HostCommand::Status(command) => {
             let status = read::host_status(command.host.as_deref(), config)?;
@@ -1957,13 +1959,11 @@ fn trust_host(
     }
 }
 
-fn start_host_daemon(command: HostStartCommand, format: OutputFormat) -> Result<(), CliFailure> {
-    if !command.foreground {
-        return Err(failure(SatelleError::invalid_usage(
-            "host start currently requires --foreground; persistent service installation is owned by satelle setup --persistent",
-        )));
-    }
-
+fn start_host_daemon(
+    command: HostStartCommand,
+    config: ConfigContext<'_>,
+    format: OutputFormat,
+) -> Result<(), CliFailure> {
     let bind_addr = command.bind.parse::<SocketAddr>().map_err(|error| {
         failure(SatelleError {
             code: ErrorCode::InvalidUsage,
@@ -1982,22 +1982,40 @@ fn start_host_daemon(command: HostStartCommand, format: OutputFormat) -> Result<
         })
     })?;
 
+    let on_demand_host = (!command.foreground)
+        .then(|| config.resolve_host(None))
+        .transpose()?;
+    let idle_timeout = on_demand_host
+        .as_ref()
+        .map(|host| on_demand_idle_timeout(&host.config));
+    let service = on_demand_host
+        .as_ref()
+        .map_or_else(HostService::production, |host| {
+            HostService::production_for_host(&host.config)
+        });
+    let mode = if command.foreground {
+        "foreground"
+    } else {
+        "on_demand"
+    };
+
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
         .map_err(|error| daemon_process_failure("runtime-create-failed", error.to_string()))?;
     runtime.block_on(async move {
-        let server = DaemonServer::bind(
-            HostService::production(),
-            DaemonServerConfig::loopback(bind_addr),
-        )
-        .await
-        .map_err(daemon_server_failure)?;
+        let mut server_config = DaemonServerConfig::loopback(bind_addr);
+        if let Some(idle_timeout) = idle_timeout {
+            server_config = server_config.with_idle_timeout(idle_timeout);
+        }
+        let server = DaemonServer::bind(service, server_config)
+            .await
+            .map_err(daemon_server_failure)?;
 
         if format.is_json() {
             print_json(&json!({
                 "schema_version": "satelle.host.start.v1",
-                "mode": "foreground",
+                "mode": mode,
                 "bind": server.local_addr(),
                 "running": true,
             }))
@@ -2006,11 +2024,47 @@ fn start_host_daemon(command: HostStartCommand, format: OutputFormat) -> Result<
             println!("Host Daemon listening on {}", server.local_addr());
         }
 
-        tokio::signal::ctrl_c()
-            .await
-            .map_err(|error| daemon_process_failure("signal-wait-failed", error.to_string()))?;
-        server.shutdown().await.map_err(daemon_server_failure)
+        if command.foreground {
+            tokio::signal::ctrl_c()
+                .await
+                .map_err(|error| daemon_process_failure("signal-wait-failed", error.to_string()))?;
+            server.shutdown().await.map_err(daemon_server_failure)
+        } else {
+            server.wait().await.map_err(daemon_server_failure)
+        }
     })
+}
+
+fn on_demand_idle_timeout(config: &HostConfig) -> Duration {
+    config
+        .daemon_idle_timeout
+        .as_ref()
+        .map_or(DEFAULT_ON_DEMAND_IDLE_TIMEOUT, |timeout| {
+            Duration::from_millis(timeout.milliseconds())
+        })
+}
+
+#[cfg(test)]
+mod on_demand_idle_timeout_tests {
+    use super::*;
+
+    #[test]
+    fn defaults_to_ten_minutes_and_accepts_an_explicit_host_value() {
+        let mut config = satelle_core::SatelleConfig::defaults()
+            .hosts
+            .remove(LOCAL_DEMO_HOST)
+            .expect("built-in local Host config");
+        assert_eq!(
+            on_demand_idle_timeout(&config),
+            Duration::from_secs(10 * 60)
+        );
+
+        config.daemon_idle_timeout = Some(
+            satelle_core::ExplicitDuration::parse("75s")
+                .expect("parse explicit daemon idle timeout"),
+        );
+        assert_eq!(on_demand_idle_timeout(&config), Duration::from_secs(75));
+    }
 }
 
 fn daemon_server_failure(error: DaemonServerError) -> CliFailure {
@@ -2021,7 +2075,8 @@ fn daemon_server_failure(error: DaemonServerError) -> CliFailure {
     match error {
         DaemonServerError::NonLoopbackPlaintextBind
         | DaemonServerError::InvalidConnectionLimit
-        | DaemonServerError::InvalidShutdownGrace => {
+        | DaemonServerError::InvalidShutdownGrace
+        | DaemonServerError::InvalidIdleTimeout => {
             failure(SatelleError::invalid_usage(error.to_string()))
         }
         _ => daemon_process_failure(error.code(), error.to_string()),

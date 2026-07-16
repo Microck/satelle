@@ -21,6 +21,7 @@ provider_alias = "openai"
 transport = "local"
 adapter = "codex"
 setup_mode = "on-demand"
+daemon_idle_timeout = "10m"
 native_readiness_cache_ttl = "5m"
 yolo = false
 
@@ -31,7 +32,7 @@ provider_smoke_test = "2m"
 
 Host fields include `transport`, `adapter`, `address`, `network`, `timeouts`,
 desktop selection, daemon path overrides, `setup_mode`, experimental-provider
-opt-in, Host-scoped `yolo`, project-selection permission, direct-transport
+opt-in, `daemon_idle_timeout`, Host-scoped `yolo`, project-selection permission, direct-transport
 identity and trust fields, and provider Secret Source descriptors.
 
 The duration parser requires explicit units such as `500ms`, `30s`, or `2m`.
@@ -39,8 +40,8 @@ Configuration does not perform environment-variable interpolation.
 
 ## Named profiles
 
-Profiles can select a Host and overlay model, provider, timeouts, readiness
-cache TTL, experimental-provider opt-in, and Host-bound YOLO policy.
+Profiles can select a Host and overlay model, provider, timeouts, daemon idle
+timeout, readiness cache TTL, experimental-provider opt-in, and Host-bound YOLO policy.
 
 ```toml
 [profiles.work]

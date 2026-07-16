@@ -17,6 +17,7 @@ const PROFILE_KEYS: &[&str] = &[
     "yolo",
     "timeouts",
     "native_readiness_cache_ttl",
+    "daemon_idle_timeout",
 ];
 const TIMEOUT_KEYS: &[&str] = &["native_readiness", "provider_smoke_test"];
 
@@ -68,6 +69,7 @@ pub(super) struct ProfileConfig {
     yolo: Option<bool>,
     timeouts: Option<TimeoutConfig>,
     native_readiness_cache_ttl: Option<ExplicitDuration>,
+    daemon_idle_timeout: Option<ExplicitDuration>,
 }
 
 impl ProfileConfig {
@@ -115,6 +117,9 @@ impl ProfileConfig {
         }
         if let Some(ttl) = &self.native_readiness_cache_ttl {
             host.native_readiness_cache_ttl = Some(ttl.clone());
+        }
+        if let Some(timeout) = &self.daemon_idle_timeout {
+            host.daemon_idle_timeout = Some(timeout.clone());
         }
         if source.allows_user_policy()
             && let Some(enabled) = self.experimental_provider_computer_use
@@ -321,6 +326,11 @@ fn reject_profile_interpolation(
         table.get("native_readiness_cache_ttl"),
         &mut interpolations,
     );
+    collect_interpolation_for_value(
+        &format!("{profile_path}.daemon_idle_timeout"),
+        table.get("daemon_idle_timeout"),
+        &mut interpolations,
+    );
     if let Some(timeouts) = table.get("timeouts").and_then(toml::Value::as_table) {
         for key in TIMEOUT_KEYS {
             collect_interpolation_for_value(
@@ -345,6 +355,15 @@ fn reject_profile_duration_errors(
         };
         if ExplicitDuration::parse(value).is_none() {
             return Err(SatelleError::duration_unit_required(path, &ttl_path));
+        }
+    }
+    if let Some(value) = table.get("daemon_idle_timeout") {
+        let timeout_path = format!("{profile_path}.daemon_idle_timeout");
+        let Some(value) = value.as_str() else {
+            return Err(SatelleError::duration_unit_required(path, &timeout_path));
+        };
+        if ExplicitDuration::parse(value).is_none() {
+            return Err(SatelleError::duration_unit_required(path, &timeout_path));
         }
     }
     let Some(timeouts) = table.get("timeouts").and_then(toml::Value::as_table) else {

@@ -50,6 +50,48 @@ fn one_host_global_slot_is_shared_by_clones_and_principals() {
 }
 
 #[test]
+fn daemon_activity_snapshot_tracks_live_host_operations() {
+    let state = crate::TestStateDir::new().expect("temporary state directory");
+    let adapter = ControlledAdapter::default();
+    adapter.block_next_preflight();
+    let service = service(state.path(), adapter.clone());
+    let request_authority = authority(&service, "principal-activity", "activity-request");
+    let initial = service
+        .daemon_activity_snapshot()
+        .expect("read initial daemon activity");
+    assert!(initial.is_idle());
+
+    let operation_service = service.clone();
+    let operation = std::thread::spawn(move || {
+        operation_service.admit_run(&intent("tracked operation"), &request_authority)
+    });
+    assert!(
+        adapter.preflight_started.wait_for(WAIT_LIMIT),
+        "the operation must occupy Host capacity before activity is inspected"
+    );
+    let active = service
+        .daemon_activity_snapshot()
+        .expect("read active daemon activity");
+    assert!(!active.is_idle());
+    assert_ne!(active.generation(), initial.generation());
+
+    adapter.preflight_release.signal();
+    operation
+        .join()
+        .expect("operation thread must not panic")
+        .expect("operation admission must finish");
+    service
+        .runtime
+        .wait_for_background()
+        .expect("operation worker must finish");
+    let finished = service
+        .daemon_activity_snapshot()
+        .expect("read finished daemon activity");
+    assert!(finished.is_idle());
+    assert_ne!(finished.generation(), active.generation());
+}
+
+#[test]
 fn identical_concurrent_requests_join_one_execution() {
     let state = crate::TestStateDir::new().expect("temporary state directory");
     let adapter = ControlledAdapter::default();

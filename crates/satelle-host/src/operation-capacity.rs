@@ -74,6 +74,14 @@ impl Default for OperationCapacity {
 }
 
 impl OperationCapacity {
+    pub(crate) fn activity_snapshot(&self) -> Result<(bool, u64), SatelleError> {
+        let state = self.lock()?;
+        Ok((
+            state.active.is_none(),
+            self.generation.load(Ordering::Acquire),
+        ))
+    }
+
     pub(crate) fn execute(
         &self,
         request: OperationRequest,
