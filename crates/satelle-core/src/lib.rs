@@ -317,6 +317,25 @@ pub struct ResolvedConfig {
     // user-level Host Binding can permit implicit project selection.
     #[serde(skip)]
     project_selectable_hosts: BTreeSet<String>,
+    // Config-check enumeration retains only selectors discovered from already validated files.
+    // Effective HostConfig values continue to have a single owner in `config`.
+    #[serde(skip)]
+    config_check_metadata: ConfigCheckMetadata,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct ConfigCheckMetadata {
+    configured_hosts: Vec<String>,
+    configured_profiles: Vec<(String, profiles::ProfileConfig)>,
+    base_default_host: String,
+    project_defaults: Option<(String, String)>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ConfigCheckContext {
+    pub host: String,
+    pub profile: Option<String>,
+    pub source: String,
 }
 
 impl ResolvedConfig {
@@ -361,6 +380,108 @@ impl ResolvedConfig {
             _ => false,
         }
     }
+
+    pub fn config_check_contexts(
+        &self,
+        flag_host: Option<&str>,
+        all: bool,
+    ) -> Result<Vec<ConfigCheckContext>, SatelleError> {
+        let (selected_host, _) = self.resolve_host(flag_host)?;
+        let selected_profile = self
+            .selected_profile
+            .as_ref()
+            .map(|profile| profile.name.clone());
+
+        if !all {
+            let source = self
+                .selected_profile
+                .as_ref()
+                .map_or("default", |profile| profile.source.as_str());
+            return Ok(vec![ConfigCheckContext {
+                host: selected_host,
+                profile: selected_profile,
+                source: source.to_string(),
+            }]);
+        }
+
+        let mut contexts = vec![ConfigCheckContext {
+            host: selected_host,
+            profile: selected_profile,
+            source: "default_context".to_string(),
+        }];
+
+        contexts.extend(
+            self.config_check_metadata
+                .configured_hosts
+                .iter()
+                .map(|host| ConfigCheckContext {
+                    host: host.clone(),
+                    profile: None,
+                    source: "configured_host".to_string(),
+                }),
+        );
+
+        for (profile_name, profile) in &self.config_check_metadata.configured_profiles {
+            let host = profile
+                .selected_host()
+                .unwrap_or(&self.config_check_metadata.base_default_host);
+            let mut effective_host = self
+                .config
+                .hosts
+                .get(host)
+                .cloned()
+                .ok_or_else(|| SatelleError::host_not_found(host.to_string()))?;
+            profile.apply_to_host(host, &mut effective_host, ProfileSelectionSource::CliFlag);
+            contexts.push(ConfigCheckContext {
+                host: host.to_string(),
+                profile: Some(profile_name.clone()),
+                source: "configured_profile".to_string(),
+            });
+        }
+
+        if let Some((project_host, profile_name)) = &self.config_check_metadata.project_defaults {
+            let profile = self
+                .config_check_metadata
+                .configured_profiles
+                .iter()
+                .find_map(|(name, profile)| (name == profile_name).then_some(profile))
+                .ok_or_else(|| {
+                    SatelleError::profile_not_found(
+                        &self.user_config_path,
+                        profile_name,
+                        self.config_check_metadata
+                            .configured_profiles
+                            .iter()
+                            .map(|(name, _)| name.clone())
+                            .collect(),
+                    )
+                })?;
+            let host = profile.selected_host().unwrap_or(project_host);
+            let mut effective_host = self
+                .config
+                .hosts
+                .get(host)
+                .cloned()
+                .ok_or_else(|| SatelleError::host_not_found(host.to_string()))?;
+            if !self.project_selectable_hosts.contains(host) {
+                return Err(SatelleError::project_host_selection_not_allowed(
+                    host.to_string(),
+                ));
+            }
+            profile.apply_to_host(
+                host,
+                &mut effective_host,
+                ProfileSelectionSource::ProjectConfig,
+            );
+            contexts.push(ConfigCheckContext {
+                host: host.to_string(),
+                profile: Some(profile_name.clone()),
+                source: "project_defaults".to_string(),
+            });
+        }
+
+        Ok(contexts)
+    }
 }
 
 pub fn load_config(cwd: &Path, flag_profile: Option<&str>) -> Result<ResolvedConfig, SatelleError> {
@@ -401,6 +522,27 @@ pub fn load_config(cwd: &Path, flag_profile: Option<&str>) -> Result<ResolvedCon
             &project_config_path,
         )?;
     }
+
+    let configured_hosts = config.hosts.keys().cloned().collect();
+    let default_host_without_profile = config
+        .default_host
+        .clone()
+        .unwrap_or_else(|| LOCAL_DEMO_HOST.to_string());
+    let configured_profiles = user_config
+        .as_ref()
+        .map(|user_config| {
+            user_config
+                .profiles
+                .iter()
+                .map(|(name, profile)| (name.clone(), profile.clone()))
+                .collect()
+        })
+        .unwrap_or_default();
+    let project_defaults = project_config.as_ref().and_then(|project_config| {
+        let host = project_config.default_host()?;
+        let profile_name = project_config.default_profile.as_deref()?;
+        Some((host.to_string(), profile_name.to_string()))
+    });
 
     let selected_profile = profiles::select_profile(
         flag_profile,
@@ -453,6 +595,12 @@ pub fn load_config(cwd: &Path, flag_profile: Option<&str>) -> Result<ResolvedCon
         profile_overlay,
         default_host_requires_project_permission,
         project_selectable_hosts,
+        config_check_metadata: ConfigCheckMetadata {
+            configured_hosts,
+            configured_profiles,
+            base_default_host: default_host_without_profile,
+            project_defaults,
+        },
     })
 }
 

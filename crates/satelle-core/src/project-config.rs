@@ -91,6 +91,10 @@ pub(super) fn validate_selected_profile_host(
 }
 
 impl ParsedProjectConfig {
+    pub(super) fn default_host(&self) -> Option<&str> {
+        self.config.default_host.as_deref()
+    }
+
     pub(super) fn selects_default_host(&self) -> bool {
         self.config.default_host.is_some()
     }
