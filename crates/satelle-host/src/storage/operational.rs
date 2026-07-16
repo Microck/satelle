@@ -1,6 +1,9 @@
 use super::codec::unix_timestamp_nanos;
 use super::{Storage, StorageError, StorageErrorKind};
-use crate::{ProviderSmokeEvidence, ReadinessCacheKey, ReadinessEvidence};
+use crate::{
+    ProviderSmokeEvidence, ProviderSmokeFailureEvidence, ProviderSmokeResult, ReadinessCacheKey,
+    ReadinessEvidence,
+};
 use rusqlite::{OptionalExtension, TransactionBehavior, params};
 use satelle_core::session::{DesktopBindingRef, ExecutionPolicy};
 
@@ -37,7 +40,7 @@ impl Storage {
                 desktop_binding,
                 policy,
                 readiness,
-                provider,
+                ProviderSmokeInsert::Passed(provider),
             )?;
         }
         transaction.commit().map_err(operation_failed)
@@ -59,6 +62,40 @@ impl Storage {
             "failed",
             Some(reason),
         )
+    }
+
+    /// Persists successful native readiness and the terminal provider failure
+    /// atomically. Provider failure evidence is a short-lived blocker, not
+    /// authorization to execute.
+    pub(crate) fn store_provider_smoke_failure(
+        &mut self,
+        key: &ReadinessCacheKey,
+        readiness: &ReadinessEvidence,
+        failure: &ProviderSmokeFailureEvidence,
+    ) -> Result<(), StorageError> {
+        let host_identity = self.host_identity()?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(operation_failed)?;
+        insert_readiness(
+            &transaction,
+            host_identity.as_str(),
+            key.adapter(),
+            key.desktop_binding(),
+            readiness,
+            "passed",
+            None,
+        )?;
+        insert_provider_smoke(
+            &transaction,
+            host_identity.as_str(),
+            key.desktop_binding(),
+            key.execution_policy(),
+            readiness,
+            ProviderSmokeInsert::Failed(failure),
+        )?;
+        transaction.commit().map_err(operation_failed)
     }
 
     /// Returns only a matching, unexpired success. Failed results remain in
@@ -127,13 +164,14 @@ impl Storage {
         &self,
         key: &ReadinessCacheKey,
         now: time::OffsetDateTime,
-    ) -> Result<Option<ProviderSmokeEvidence>, StorageError> {
+    ) -> Result<Option<ProviderSmokeResult>, StorageError> {
         let host_identity = self.host_identity()?;
         let row = self
             .connection
             .query_row(
-                "SELECT result_id, provider_config_fingerprint, observed_at, expires_at
-                 FROM provider_smoke_successes
+                "SELECT result_id, provider_config_fingerprint, status,
+                        failure_code, failure_reason, observed_at, expires_at
+                 FROM provider_smoke_results
                  WHERE host_identity_ref = ?1
                    AND desktop_binding_ref = ?2
                    AND provider_binding_ref = ?3
@@ -159,28 +197,59 @@ impl Storage {
                     Ok((
                         row.get::<_, String>(0)?,
                         row.get::<_, String>(1)?,
-                        row.get::<_, i64>(2)?,
-                        row.get::<_, i64>(3)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, Option<String>>(3)?,
+                        row.get::<_, Option<String>>(4)?,
+                        row.get::<_, i64>(5)?,
+                        row.get::<_, i64>(6)?,
                     ))
                 },
             )
             .optional()
             .map_err(operation_failed)?;
         row.map(
-            |(result_id, provider_config_fingerprint, observed_at, expires_at)| {
+            |(
+                result_id,
+                provider_config_fingerprint,
+                status,
+                failure_code,
+                failure_reason,
+                observed_at,
+                expires_at,
+            )| {
                 let observed_at =
                     time::OffsetDateTime::from_unix_timestamp_nanos(i128::from(observed_at))
                         .map_err(|_| StorageError::new(StorageErrorKind::InvalidStoredState))?;
                 let expires_at =
                     time::OffsetDateTime::from_unix_timestamp_nanos(i128::from(expires_at))
                         .map_err(|_| StorageError::new(StorageErrorKind::InvalidStoredState))?;
-                ProviderSmokeEvidence::new(
-                    result_id,
-                    provider_config_fingerprint,
-                    observed_at,
-                    expires_at,
-                )
-                .map_err(|_| StorageError::new(StorageErrorKind::InvalidStoredState))
+                match (status.as_str(), failure_code, failure_reason) {
+                    ("passed", None, None) => ProviderSmokeEvidence::new(
+                        result_id,
+                        provider_config_fingerprint,
+                        observed_at,
+                        expires_at,
+                    )
+                    .map(ProviderSmokeResult::Passed)
+                    .map_err(|_| StorageError::new(StorageErrorKind::InvalidStoredState)),
+                    ("failed", Some(error_code), Some(failure_reason)) => {
+                        let error_code = serde_json::from_value(serde_json::Value::String(
+                            error_code,
+                        ))
+                        .map_err(|_| StorageError::new(StorageErrorKind::InvalidStoredState))?;
+                        ProviderSmokeFailureEvidence::new(
+                            result_id,
+                            provider_config_fingerprint,
+                            error_code,
+                            failure_reason,
+                            observed_at,
+                            expires_at,
+                        )
+                        .map(ProviderSmokeResult::Failed)
+                        .map_err(|_| StorageError::new(StorageErrorKind::InvalidStoredState))
+                    }
+                    _ => Err(StorageError::new(StorageErrorKind::InvalidStoredState)),
+                }
             },
         )
         .transpose()
@@ -237,21 +306,78 @@ fn insert_readiness(
         .and_then(require_idempotent_write)
 }
 
+enum ProviderSmokeInsert<'a> {
+    Passed(&'a ProviderSmokeEvidence),
+    Failed(&'a ProviderSmokeFailureEvidence),
+}
+
 fn insert_provider_smoke(
     connection: &rusqlite::Connection,
     host_identity: &str,
     desktop_binding: &DesktopBindingRef,
     policy: &ExecutionPolicy,
     readiness: &ReadinessEvidence,
-    evidence: &ProviderSmokeEvidence,
+    evidence: ProviderSmokeInsert<'_>,
 ) -> Result<(), StorageError> {
+    let (
+        result_id,
+        provider_config_fingerprint,
+        status,
+        failure_code,
+        failure_reason,
+        observed_at,
+        expires_at,
+    ) = match evidence {
+        ProviderSmokeInsert::Passed(evidence) => (
+            evidence.result_id(),
+            evidence.provider_config_fingerprint(),
+            "passed",
+            None,
+            None,
+            evidence.observed_at(),
+            evidence.expires_at(),
+        ),
+        ProviderSmokeInsert::Failed(evidence) => (
+            evidence.result_id(),
+            evidence.provider_config_fingerprint(),
+            "failed",
+            Some(evidence.error_code().as_str()),
+            Some(evidence.failure_reason()),
+            evidence.observed_at(),
+            evidence.expires_at(),
+        ),
+    };
     connection
         .execute(
-            "INSERT INTO provider_smoke_successes (
+            "DELETE FROM provider_smoke_results
+             WHERE host_identity_ref = ?1
+               AND desktop_binding_ref = ?2
+               AND provider_binding_ref = ?3
+               AND effective_model_ref = ?4
+               AND codex_version = ?5
+               AND native_runtime_version = ?6
+               AND provider_config_fingerprint = ?7
+               AND result_id <> ?8",
+            params![
+                host_identity,
+                desktop_binding.as_str(),
+                policy.provider_binding().as_str(),
+                policy.effective_model().as_str(),
+                readiness.codex_version(),
+                readiness.native_runtime_version(),
+                provider_config_fingerprint,
+                result_id,
+            ],
+        )
+        .map_err(operation_failed)?;
+    connection
+        .execute(
+            "INSERT INTO provider_smoke_results (
                 result_id, host_identity_ref, desktop_binding_ref,
                 provider_binding_ref, effective_model_ref, codex_version,
-                native_runtime_version, provider_config_fingerprint, observed_at, expires_at
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+                native_runtime_version, provider_config_fingerprint, status,
+                failure_code, failure_reason, observed_at, expires_at
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
             ON CONFLICT(result_id) DO UPDATE SET result_id = excluded.result_id
             WHERE host_identity_ref = excluded.host_identity_ref
               AND desktop_binding_ref = excluded.desktop_binding_ref
@@ -260,19 +386,25 @@ fn insert_provider_smoke(
               AND codex_version = excluded.codex_version
               AND native_runtime_version = excluded.native_runtime_version
               AND provider_config_fingerprint = excluded.provider_config_fingerprint
+              AND status = excluded.status
+              AND failure_code IS excluded.failure_code
+              AND failure_reason IS excluded.failure_reason
               AND observed_at = excluded.observed_at
               AND expires_at = excluded.expires_at",
             params![
-                evidence.result_id(),
+                result_id,
                 host_identity,
                 desktop_binding.as_str(),
                 policy.provider_binding().as_str(),
                 policy.effective_model().as_str(),
                 readiness.codex_version(),
                 readiness.native_runtime_version(),
-                evidence.provider_config_fingerprint(),
-                unix_timestamp_nanos(evidence.observed_at())?,
-                unix_timestamp_nanos(evidence.expires_at())?,
+                provider_config_fingerprint,
+                status,
+                failure_code,
+                failure_reason,
+                unix_timestamp_nanos(observed_at)?,
+                unix_timestamp_nanos(expires_at)?,
             ],
         )
         .map_err(operation_failed)

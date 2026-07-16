@@ -1,7 +1,7 @@
 use super::adapter::{
     AdapterPreflight, AdapterReadiness, AdapterSubject, ComputerUseAdapter, ExecuteRequest,
-    ExecuteResult, ProviderComputerUseIntent, ProviderSmokeEvidence, ReadinessCacheKey,
-    ReadinessEvidence, RecoveryObservation,
+    ExecuteResult, ProviderComputerUseIntent, ProviderSmokeEvidence, ProviderSmokeFailureEvidence,
+    ProviderSmokeResult, ReadinessCacheKey, ReadinessEvidence, RecoveryObservation,
 };
 use crate::codex_session::{
     CodexApprovalPolicy, CodexSandboxPolicy, CodexSessionControl, CodexSessionError,
@@ -26,6 +26,13 @@ use std::time::{Duration, Instant};
 const DEFAULT_MODEL_BINDING: &str = "codex-default";
 const DEFAULT_PROVIDER_BINDING: &str = "codex-default";
 const NATIVE_ADAPTER: &str = "codex-native-computer-use";
+const PROVIDER_SMOKE_FAILURE_TTL: time::Duration = time::Duration::minutes(10);
+
+#[derive(Debug)]
+struct ProviderSmokeAttemptFailure {
+    evidence: Option<ProviderSmokeFailureEvidence>,
+    error: Box<SatelleError>,
+}
 
 /// The production adapter owns the private Codex app-server boundary. Native
 /// execution remains gated by preflight evidence; no caller can reach execute
@@ -177,24 +184,43 @@ impl ProductionComputerUseAdapter {
         &self,
         key: &ReadinessCacheKey,
         evidence: ReadinessEvidence,
-        cached_provider: Option<ProviderSmokeEvidence>,
-    ) -> Result<AdapterReadiness, SatelleError> {
-        let provider_smoke_evidence = self.run_required_provider_smoke(key, cached_provider)?;
-        AdapterReadiness::ready(
-            key.adapter(),
-            "native Computer Use passed the Host action-path smoke test",
-            key.desktop_binding().clone(),
-            key.execution_policy().clone(),
-            evidence,
-            provider_smoke_evidence,
-        )
-        .map_err(|_| adapter_failure("readiness_evidence_invalid"))
+        cached_provider: Option<ProviderSmokeResult>,
+    ) -> AdapterPreflight {
+        match self.run_required_provider_smoke(key, cached_provider) {
+            Ok(provider_smoke_evidence) => AdapterReadiness::ready(
+                key.adapter(),
+                "native Computer Use passed the Host action-path smoke test",
+                key.desktop_binding().clone(),
+                key.execution_policy().clone(),
+                evidence,
+                provider_smoke_evidence,
+            )
+            .map_or_else(
+                |_| {
+                    AdapterPreflight::UncachedFailure(adapter_failure("readiness_evidence_invalid"))
+                },
+                AdapterPreflight::Ready,
+            ),
+            Err(ProviderSmokeAttemptFailure {
+                evidence: Some(failure),
+                error,
+            }) => AdapterPreflight::ProviderFailed {
+                key: key.clone(),
+                readiness: evidence,
+                failure,
+                error: *error,
+            },
+            Err(ProviderSmokeAttemptFailure {
+                evidence: None,
+                error,
+            }) => AdapterPreflight::UncachedFailure(*error),
+        }
     }
 
     fn live_native_preflight(
         &self,
         key: ReadinessCacheKey,
-        cached_provider: Option<ProviderSmokeEvidence>,
+        cached_provider: Option<ProviderSmokeResult>,
     ) -> AdapterPreflight {
         let observed_at = time::OffsetDateTime::now_utc();
         let Some(expires_at) = observed_at.checked_add(self.native_readiness_ttl) else {
@@ -213,10 +239,7 @@ impl ProductionComputerUseAdapter {
             }
         };
         match self.run_native_smoke(&key) {
-            Ok(()) => match self.readiness_from_evidence(&key, evidence, cached_provider) {
-                Ok(readiness) => AdapterPreflight::Ready(readiness),
-                Err(error) => AdapterPreflight::UncachedFailure(error),
-            },
+            Ok(()) => self.readiness_from_evidence(&key, evidence, cached_provider),
             Err(reason) => AdapterPreflight::Failed {
                 key,
                 evidence,
@@ -275,8 +298,8 @@ impl ProductionComputerUseAdapter {
     fn run_required_provider_smoke(
         &self,
         key: &ReadinessCacheKey,
-        cached_provider: Option<ProviderSmokeEvidence>,
-    ) -> Result<Option<ProviderSmokeEvidence>, SatelleError> {
+        cached_provider: Option<ProviderSmokeResult>,
+    ) -> Result<Option<ProviderSmokeEvidence>, ProviderSmokeAttemptFailure> {
         if key
             .execution_policy()
             .experimental_features()
@@ -285,10 +308,52 @@ impl ProductionComputerUseAdapter {
         {
             return Ok(None);
         }
-        if let Some(cached_provider) = cached_provider {
-            return Ok(Some(cached_provider));
+        match cached_provider {
+            Some(ProviderSmokeResult::Passed(evidence)) => return Ok(Some(evidence)),
+            Some(ProviderSmokeResult::Failed(failure)) => {
+                return Err(ProviderSmokeAttemptFailure {
+                    evidence: None,
+                    error: Box::new(provider_smoke_error(
+                        failure.error_code(),
+                        failure.failure_reason(),
+                    )),
+                });
+            }
+            None => {}
         }
 
+        self.run_live_provider_smoke(key)
+            .map(Some)
+            .map_err(|error| {
+                let observed_at = time::OffsetDateTime::now_utc();
+                let evidence = observed_at
+                    .checked_add(PROVIDER_SMOKE_FAILURE_TTL)
+                    .and_then(|expires_at| {
+                        ProviderSmokeFailureEvidence::new(
+                            format!("provider-smoke-{}", satelle_core::SessionId::new()),
+                            key.provider_config_fingerprint(),
+                            error.code,
+                            error
+                                .details
+                                .get("reason")
+                                .and_then(Value::as_str)
+                                .unwrap_or_else(|| error.code.as_str()),
+                            observed_at,
+                            expires_at,
+                        )
+                        .ok()
+                    });
+                ProviderSmokeAttemptFailure {
+                    evidence,
+                    error: Box::new(error),
+                }
+            })
+    }
+
+    fn run_live_provider_smoke(
+        &self,
+        key: &ReadinessCacheKey,
+    ) -> Result<ProviderSmokeEvidence, SatelleError> {
         let probe = crate::provider_probe::ProviderProbeSurface::start(self.provider_smoke_timeout)
             .map_err(provider_smoke_failure)?;
         let page_url = probe.page_url().to_string();
@@ -344,7 +409,6 @@ impl ProductionComputerUseAdapter {
             observed_at,
             expires_at,
         )
-        .map(Some)
         .map_err(|_| adapter_failure("provider_smoke_evidence_invalid"))
     }
 
@@ -519,6 +583,13 @@ fn provider_override(value: &str) -> Option<&str> {
     (value != DEFAULT_PROVIDER_BINDING).then_some(value)
 }
 
+fn provider_cache_for_preflight(
+    cached: Option<ProviderSmokeResult>,
+    refresh: bool,
+) -> Option<ProviderSmokeResult> {
+    if refresh { None } else { cached }
+}
+
 fn native_readiness_failure(reason: &'static str) -> SatelleError {
     let mut details = std::collections::BTreeMap::new();
     details.insert("reason".to_string(), Value::String(reason.to_string()));
@@ -614,7 +685,7 @@ fn provider_smoke_failure(error: crate::provider_probe::ProviderProbeError) -> S
     provider_smoke_error(code, reason)
 }
 
-fn provider_smoke_error(code: ErrorCode, reason: &'static str) -> SatelleError {
+fn provider_smoke_error(code: ErrorCode, reason: &str) -> SatelleError {
     let mut details = std::collections::BTreeMap::new();
     details.insert("reason".to_string(), Value::String(reason.to_string()));
     SatelleError {
@@ -661,23 +732,17 @@ impl ComputerUseAdapter for ProductionComputerUseAdapter {
         &self,
         _host: &str,
         cached: Option<ReadinessEvidence>,
-        cached_provider: Option<ProviderSmokeEvidence>,
+        cached_provider: Option<ProviderSmokeResult>,
         provider_intent: &ProviderComputerUseIntent,
     ) -> AdapterPreflight {
         let key = match self.native_readiness_key(provider_intent) {
             Ok(key) => key,
             Err(error) => return AdapterPreflight::UncachedFailure(error),
         };
-        let cached_provider = if provider_intent.refresh() {
-            None
-        } else {
-            cached_provider
-        };
+        let cached_provider =
+            provider_cache_for_preflight(cached_provider, provider_intent.refresh());
         match cached {
-            Some(evidence) => match self.readiness_from_evidence(&key, evidence, cached_provider) {
-                Ok(readiness) => AdapterPreflight::Ready(readiness),
-                Err(error) => AdapterPreflight::UncachedFailure(error),
-            },
+            Some(evidence) => self.readiness_from_evidence(&key, evidence, cached_provider),
             None => self.live_native_preflight(key, cached_provider),
         }
     }
@@ -1021,7 +1086,7 @@ mod tests {
     }
 
     #[test]
-    fn matching_provider_smoke_evidence_skips_a_live_probe() {
+    fn matching_provider_smoke_results_skip_or_block_without_a_live_probe() {
         let adapter = ProductionComputerUseAdapter::new(
             Arc::new(RwLock::new(crate::ProductionCapabilitySnapshot::collect(
                 None,
@@ -1060,9 +1125,51 @@ mod tests {
 
         assert_eq!(
             adapter
-                .run_required_provider_smoke(&key, Some(provider.clone()))
+                .run_required_provider_smoke(
+                    &key,
+                    Some(ProviderSmokeResult::Passed(provider.clone())),
+                )
                 .unwrap(),
             Some(provider)
+        );
+
+        let provider_failure = ProviderSmokeFailureEvidence::new(
+            "provider-smoke-failed",
+            key.provider_config_fingerprint(),
+            ErrorCode::UnsupportedProviderComputerUse,
+            "provider_smoke_provider_rejected",
+            observed_at,
+            observed_at + PROVIDER_SMOKE_FAILURE_TTL,
+        )
+        .unwrap();
+        let cached_failure = adapter
+            .run_required_provider_smoke(
+                &key,
+                Some(ProviderSmokeResult::Failed(provider_failure.clone())),
+            )
+            .expect_err("a cached provider failure remains a preflight blocker");
+        assert!(cached_failure.evidence.is_none());
+        assert_eq!(
+            cached_failure.error.code,
+            ErrorCode::UnsupportedProviderComputerUse
+        );
+
+        let refreshed_pass = ProviderSmokeResult::Passed(
+            ProviderSmokeEvidence::new(
+                "provider-smoke-refresh-pass",
+                key.provider_config_fingerprint(),
+                observed_at,
+                observed_at + time::Duration::hours(24),
+            )
+            .unwrap(),
+        );
+        assert!(provider_cache_for_preflight(Some(refreshed_pass), true).is_none());
+        assert!(
+            provider_cache_for_preflight(
+                Some(ProviderSmokeResult::Failed(provider_failure)),
+                true,
+            )
+            .is_none()
         );
     }
 

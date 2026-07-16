@@ -41,7 +41,8 @@ use operation_capacity::OperationCapacity;
 pub use runtime::{
     AdapterPreflight, AdapterReadiness, AdapterSubject, ComputerUseAdapter, EvidenceError,
     ExecuteRequest, ExecuteResult, ProviderComputerUseIntent, ProviderSmokeEvidence,
-    ReadinessCacheKey, ReadinessEvidence, RecoveryObservation,
+    ProviderSmokeFailureEvidence, ProviderSmokeResult, ReadinessCacheKey, ReadinessEvidence,
+    RecoveryObservation,
 };
 use runtime::{ProductionComputerUseAdapter, RunCommand, RuntimeHandle, SteerCommand, StopCommand};
 use satelle_core::session::{PublicSession, TurnAdmissionFailure};
