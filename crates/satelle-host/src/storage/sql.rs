@@ -403,7 +403,8 @@ pub(super) fn ensure_control_lease_available(
         return Err(StorageError::new(StorageErrorKind::LeaseConflict));
     }
     if let Some((owner_kind, session_id)) = control {
-        if owner_kind == "provider_probe" && session_id.is_none() {
+        if matches!(owner_kind.as_str(), "provider_probe" | "native_probe") && session_id.is_none()
+        {
             return Err(StorageError::new(StorageErrorKind::LeaseConflict));
         }
         let session_id = session_id
@@ -786,14 +787,15 @@ impl Storage {
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|source| sqlite_error(StorageErrorKind::OperationFailed, source))?;
-        // An active provider probe can only survive opening this process if
+        // An active readiness probe can only survive opening this process if
         // its prior owner exited before finalization. Convert it to explicit
         // recovery ownership before any new admission can inspect it.
         transaction
             .execute(
                 "UPDATE control_leases
                  SET lease_state = 'recovery_pending'
-                 WHERE owner_kind = 'provider_probe' AND lease_state = 'active'",
+                 WHERE owner_kind IN ('provider_probe', 'native_probe')
+                   AND lease_state = 'active'",
                 [],
             )
             .map_err(|source| sqlite_error(StorageErrorKind::OperationFailed, source))?;

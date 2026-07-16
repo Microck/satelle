@@ -1,4 +1,4 @@
-use crate::storage::ProviderProbeRecoverySubject;
+use crate::storage::ProbeRecoverySubject;
 use crate::storage::RecoverySubject;
 use satelle_core::session::{
     DesktopBindingRef, ExecutionPolicy, FeatureChoice, HostIdentityRef, SessionStateRevision,
@@ -273,7 +273,24 @@ pub enum ProviderSmokeSource {
     Refresh,
 }
 
-pub(crate) trait ProviderProbeDriver: Send + Sync + 'static {
+pub(crate) enum NativeProbeResult {
+    Passed(ReadinessEvidence),
+    Failed {
+        evidence: ReadinessEvidence,
+        reason: &'static str,
+        error: SatelleError,
+    },
+    UncachedFailure(SatelleError),
+}
+
+pub(crate) trait ReadinessProbeDriver: Send + Sync + 'static {
+    fn run_native_probe(
+        &self,
+        key: &ReadinessCacheKey,
+        persist_thread_ref: &mut dyn FnMut(&str) -> Result<(), ()>,
+        persist_turn_ref: &mut dyn FnMut(&str) -> Result<(), ()>,
+    ) -> NativeProbeResult;
+
     #[allow(clippy::too_many_arguments)]
     fn preflight_terminal_with_provider_probe(
         &self,
@@ -285,8 +302,7 @@ pub(crate) trait ProviderProbeDriver: Send + Sync + 'static {
         persist_turn_ref: &mut dyn FnMut(&str) -> Result<(), ()>,
     ) -> AdapterPreflight;
 
-    fn observe_provider_probe(&self, subject: &ProviderProbeRecoverySubject)
-    -> RecoveryObservation;
+    fn observe_readiness_probe(&self, subject: &ProbeRecoverySubject) -> RecoveryObservation;
 }
 
 impl ProviderSmokeSource {

@@ -38,7 +38,7 @@ pub(super) const PROTECTED_FILE_NAMES: [&str; 5] = [
 ];
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 const BACKUP_FORMAT_VERSION: u32 = 1;
-const MIGRATIONS: [Migration; 5] = [
+const MIGRATIONS: [Migration; 6] = [
     Migration {
         version: 1,
         sql: include_str!("0001_initial.sql"),
@@ -66,6 +66,12 @@ const MIGRATIONS: [Migration; 5] = [
     Migration {
         version: 5,
         sql: include_str!("0005_provider_probe_recovery.sql"),
+        seeds_sensitive_state: false,
+        irreversible: true,
+    },
+    Migration {
+        version: 6,
+        sql: include_str!("0006_native_probe_recovery.sql"),
         seeds_sensitive_state: false,
         irreversible: true,
     },
