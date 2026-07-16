@@ -589,6 +589,64 @@ fn live_interrupt_waits_for_the_durable_stop_acknowledgement() {
 }
 
 #[test]
+fn timed_provider_exchange_requests_correlated_upstream_cancellation() {
+    let fixture = compile_fixture();
+    let directory = tempfile::tempdir().expect("provider timeout scenario directory");
+    let log_path = directory.path().join("requests.jsonl");
+    let cwd_log_path = directory.path().join("child-cwd");
+    let thread_marker = directory.path().join("thread-persisted");
+    let turn_marker = directory.path().join("turn-persisted");
+    let mut command = Command::new(&fixture.executable);
+    command
+        .env("SATELLE_FIXTURE_SCENARIO", "controlled-interrupt")
+        .env("SATELLE_FIXTURE_LOG", &log_path)
+        .env("SATELLE_FIXTURE_CWD_LOG", &cwd_log_path)
+        .env("SATELLE_THREAD_MARKER", &thread_marker)
+        .env("SATELLE_TURN_MARKER", &turn_marker)
+        .env(
+            "SATELLE_DESCENDANT_MARKER",
+            directory.path().join("unused-descendant"),
+        );
+    let mut persist_thread = |_: &str| {
+        touch(&thread_marker);
+        Ok(())
+    };
+    let mut persist_turn = |_: &str| {
+        touch(&turn_marker);
+        Ok(())
+    };
+
+    let run = run_codex_session_with_timeout_cancellation(
+        command,
+        CodexSessionRequest {
+            working_directory: directory.path(),
+            prompt: "PRIVATE_PROVIDER_SMOKE_PROMPT",
+            existing_thread_ref: None,
+            model: Some("gpt-fixture"),
+            model_provider: Some("fixture-provider"),
+            execution_mode: TurnExecutionMode::Standard,
+            approval_policy: CodexApprovalPolicy::OnRequest,
+            sandbox_policy: CodexSandboxPolicy::WorkspaceWrite,
+            deadline: Instant::now() + Duration::from_millis(100),
+            persist_thread_ref: &mut persist_thread,
+            persist_turn_ref: &mut persist_turn,
+            control: None,
+        },
+        Duration::from_secs(1),
+    );
+
+    assert_eq!(
+        run.cancellation,
+        Some(StopObservation::UpstreamInactiveConfirmed)
+    );
+    assert_eq!(run.result, Ok(CodexSessionTerminal::StoppedByControl));
+    let requests = read_to_string(log_path).expect("provider timeout protocol log");
+    assert!(requests.contains(r#""method":"turn/interrupt""#));
+    assert!(requests.contains(r#""threadId":"thread-1""#));
+    assert!(requests.contains(r#""turnId":"turn-1""#));
+}
+
+#[test]
 fn restart_observation_reads_only_the_matching_persisted_turn() {
     for (status, expected) in [
         ("inProgress", CodexTurnStatus::InProgress),
