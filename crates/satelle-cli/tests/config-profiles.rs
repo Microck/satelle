@@ -22,6 +22,8 @@ adapter = "fake"
 transport = "local"
 adapter = "fake"
 daemon_idle_timeout = "12m"
+provider_smoke_success_cache_ttl = "1080m"
+provider_smoke_failure_cache_ttl = "8m"
 
 [hosts.work-host.timeouts]
 provider_smoke_test = "11s"
@@ -33,6 +35,8 @@ provider_alias = "work-provider"
 experimental_provider_computer_use = true
 yolo = true
 daemon_idle_timeout = "3m"
+provider_smoke_success_cache_ttl = "1200m"
+provider_smoke_failure_cache_ttl = "6m"
 
 [profiles.work.timeouts]
 native_readiness = "7s"
@@ -66,6 +70,14 @@ native_readiness = "7s"
         "3m"
     );
     assert_eq!(
+        report["effective"]["hosts"]["work-host"]["provider_smoke_success_cache_ttl"],
+        "1200m"
+    );
+    assert_eq!(
+        report["effective"]["hosts"]["work-host"]["provider_smoke_failure_cache_ttl"],
+        "6m"
+    );
+    assert_eq!(
         report["effective"]["hosts"]["work-host"]["timeouts"]["native_readiness"],
         "7s"
     );
@@ -80,6 +92,14 @@ native_readiness = "7s"
     assert_eq!(
         report["values"]["effective_timeouts"]["provider_smoke_test_timeout_ms"],
         11_000
+    );
+    assert_eq!(
+        report["values"]["effective_timeouts"]["provider_smoke_success_cache_ttl_ms"],
+        72_000_000
+    );
+    assert_eq!(
+        report["values"]["effective_timeouts"]["provider_smoke_failure_cache_ttl_ms"],
+        360_000
     );
     assert_eq!(
         report["values"]["model_provider"]["model_alias_source"],

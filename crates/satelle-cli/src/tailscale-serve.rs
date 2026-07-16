@@ -132,6 +132,8 @@ mod tests {
             }),
             timeouts: None,
             native_readiness_cache_ttl: None,
+            provider_smoke_success_cache_ttl: None,
+            provider_smoke_failure_cache_ttl: None,
             daemon_idle_timeout: None,
             desktop_user: None,
             desktop_session_preference: None,

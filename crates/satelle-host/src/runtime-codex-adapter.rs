@@ -26,7 +26,6 @@ use std::time::{Duration, Instant};
 const DEFAULT_MODEL_BINDING: &str = "codex-default";
 const DEFAULT_PROVIDER_BINDING: &str = "codex-default";
 const NATIVE_ADAPTER: &str = "codex-native-computer-use";
-const PROVIDER_SMOKE_FAILURE_TTL: time::Duration = time::Duration::minutes(10);
 
 #[derive(Debug)]
 struct ProviderSmokeAttemptFailure {
@@ -45,6 +44,8 @@ pub(crate) struct ProductionComputerUseAdapter {
     native_readiness_timeout: Duration,
     native_readiness_ttl: time::Duration,
     provider_smoke_timeout: Duration,
+    provider_smoke_success_ttl: time::Duration,
+    provider_smoke_failure_ttl: time::Duration,
 }
 
 #[derive(Clone)]
@@ -86,6 +87,8 @@ impl ProductionComputerUseAdapter {
             native_readiness_timeout: crate::DEFAULT_NATIVE_READINESS_TIMEOUT,
             native_readiness_ttl: crate::DEFAULT_NATIVE_READINESS_TTL,
             provider_smoke_timeout: Duration::from_secs(120),
+            provider_smoke_success_ttl: crate::DEFAULT_PROVIDER_SMOKE_SUCCESS_TTL,
+            provider_smoke_failure_ttl: crate::DEFAULT_PROVIDER_SMOKE_FAILURE_TTL,
         }
     }
 
@@ -95,6 +98,8 @@ impl ProductionComputerUseAdapter {
         timeout: Duration,
         ttl: time::Duration,
         provider_smoke_timeout: Duration,
+        provider_smoke_success_ttl: time::Duration,
+        provider_smoke_failure_ttl: time::Duration,
     ) -> Self {
         Self {
             snapshot,
@@ -103,6 +108,8 @@ impl ProductionComputerUseAdapter {
             native_readiness_timeout: timeout,
             native_readiness_ttl: ttl,
             provider_smoke_timeout,
+            provider_smoke_success_ttl,
+            provider_smoke_failure_ttl,
         }
     }
 
@@ -327,7 +334,7 @@ impl ProductionComputerUseAdapter {
             .map_err(|error| {
                 let observed_at = time::OffsetDateTime::now_utc();
                 let evidence = observed_at
-                    .checked_add(PROVIDER_SMOKE_FAILURE_TTL)
+                    .checked_add(self.provider_smoke_failure_ttl)
                     .and_then(|expires_at| {
                         ProviderSmokeFailureEvidence::new(
                             format!("provider-smoke-{}", satelle_core::SessionId::new()),
@@ -402,7 +409,7 @@ impl ProductionComputerUseAdapter {
             .map_err(provider_smoke_failure)?;
 
         let observed_at = time::OffsetDateTime::now_utc();
-        let expires_at = observed_at + time::Duration::hours(24);
+        let expires_at = observed_at + self.provider_smoke_success_ttl;
         ProviderSmokeEvidence::new(
             format!("provider-smoke-{}", satelle_core::SessionId::new()),
             key.provider_config_fingerprint(),
@@ -1139,7 +1146,7 @@ mod tests {
             ErrorCode::UnsupportedProviderComputerUse,
             "provider_smoke_provider_rejected",
             observed_at,
-            observed_at + PROVIDER_SMOKE_FAILURE_TTL,
+            observed_at + adapter.provider_smoke_failure_ttl,
         )
         .unwrap();
         let cached_failure = adapter

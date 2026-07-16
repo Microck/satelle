@@ -73,6 +73,8 @@ impl SatelleConfig {
                 network: None,
                 timeouts: None,
                 native_readiness_cache_ttl: None,
+                provider_smoke_success_cache_ttl: None,
+                provider_smoke_failure_cache_ttl: None,
                 daemon_idle_timeout: None,
                 desktop_user: None,
                 desktop_session_preference: None,
@@ -137,6 +139,8 @@ pub struct HostConfig {
     pub network: Option<NetworkConfig>,
     pub timeouts: Option<TimeoutConfig>,
     pub native_readiness_cache_ttl: Option<ExplicitDuration>,
+    pub provider_smoke_success_cache_ttl: Option<ExplicitDuration>,
+    pub provider_smoke_failure_cache_ttl: Option<ExplicitDuration>,
     pub daemon_idle_timeout: Option<ExplicitDuration>,
     pub desktop_user: Option<String>,
     pub desktop_session_preference: Option<DesktopSessionPreference>,
@@ -889,6 +893,8 @@ fn reject_interpolation(path: &Path, value: &toml::Value) -> Result<(), SatelleE
             "daemon_log_dir",
             "setup_mode",
             "native_readiness_cache_ttl",
+            "provider_smoke_success_cache_ttl",
+            "provider_smoke_failure_cache_ttl",
             "daemon_idle_timeout",
         ] {
             collect_interpolation_for_value(
@@ -1096,6 +1102,20 @@ fn reject_timeout_config_errors(path: &Path, value: &toml::Value) -> Result<(), 
                 return Err(SatelleError::duration_unit_required(path, &ttl_path));
             }
         }
+        for key in [
+            "provider_smoke_success_cache_ttl",
+            "provider_smoke_failure_cache_ttl",
+        ] {
+            if let Some(value) = host_table.get(key) {
+                let ttl_path = format!("{host_path}.{key}");
+                let Some(value) = value.as_str() else {
+                    return Err(SatelleError::duration_unit_required(path, &ttl_path));
+                };
+                if ExplicitDuration::parse(value).is_none() {
+                    return Err(SatelleError::duration_unit_required(path, &ttl_path));
+                }
+            }
+        }
         if let Some(value) = host_table.get("daemon_idle_timeout") {
             let timeout_path = format!("{host_path}.daemon_idle_timeout");
             let Some(value) = value.as_str() else {
@@ -1297,6 +1317,8 @@ fn reject_unknown_user_config_keys(path: &Path, value: &toml::Value) -> Result<(
                     "network",
                     "timeouts",
                     "native_readiness_cache_ttl",
+                    "provider_smoke_success_cache_ttl",
+                    "provider_smoke_failure_cache_ttl",
                     "daemon_idle_timeout",
                     "desktop_user",
                     "desktop_session_preference",
