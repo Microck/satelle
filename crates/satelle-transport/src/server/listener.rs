@@ -12,7 +12,7 @@ use std::future::Future;
 use std::io;
 use std::net::{IpAddr, SocketAddr};
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
@@ -26,6 +26,7 @@ pub(super) struct LimitedTcpListener {
     inner: TcpListener,
     permits: Arc<Semaphore>,
     rejection_permits: Arc<Semaphore>,
+    activity: ConnectionActivity,
 }
 
 impl LimitedTcpListener {
@@ -37,7 +38,12 @@ impl LimitedTcpListener {
             // creating unbounded Hyper tasks while still giving an ordinary
             // over-capacity caller a typed response.
             rejection_permits: Arc::new(Semaphore::new(1)),
+            activity: ConnectionActivity::default(),
         }
+    }
+
+    pub(super) fn activity(&self) -> ConnectionActivity {
+        self.activity.clone()
     }
 
     async fn acquire_admission(&self) -> ConnectionAdmission {
@@ -73,9 +79,10 @@ impl Listener for LimitedTcpListener {
         loop {
             match self.inner.accept().await {
                 Ok((stream, address)) => {
+                    let activity = self.activity.connect();
                     let admission = self.acquire_admission().await;
                     let _ = stream.set_nodelay(true);
-                    return (PermitIo::new(stream, admission), address);
+                    return (PermitIo::new(stream, admission, activity), address);
                 }
                 Err(_) => {
                     tokio::time::sleep(Duration::from_millis(50)).await;
@@ -92,6 +99,7 @@ impl Listener for LimitedTcpListener {
 pub(super) struct PermitIo {
     stream: TcpStream,
     admission: ConnectionAdmission,
+    _activity: ConnectedClient,
     rejection_deadline: Option<Pin<Box<Sleep>>>,
 }
 
@@ -101,18 +109,62 @@ enum ConnectionAdmission {
 }
 
 impl PermitIo {
-    fn new(stream: TcpStream, admission: ConnectionAdmission) -> Self {
+    fn new(stream: TcpStream, admission: ConnectionAdmission, activity: ConnectedClient) -> Self {
         let rejection_deadline =
             (!admission.admitted()).then(|| Box::pin(tokio::time::sleep(REJECTION_IDLE_TIMEOUT)));
         Self {
             stream,
             admission,
+            _activity: activity,
             rejection_deadline,
         }
     }
 
     const fn admitted(&self) -> bool {
         self.admission.admitted()
+    }
+}
+
+#[derive(Clone, Default)]
+pub(super) struct ConnectionActivity {
+    state: Arc<Mutex<ConnectionActivityState>>,
+}
+
+impl ConnectionActivity {
+    fn connect(&self) -> ConnectedClient {
+        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        state.connected += 1;
+        state.generation = state.generation.wrapping_add(1);
+        ConnectedClient {
+            activity: self.clone(),
+        }
+    }
+
+    pub(super) fn snapshot(&self) -> (usize, u64) {
+        let state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        (state.connected, state.generation)
+    }
+}
+
+#[derive(Default)]
+struct ConnectionActivityState {
+    connected: usize,
+    generation: u64,
+}
+
+pub(super) struct ConnectedClient {
+    activity: ConnectionActivity,
+}
+
+impl Drop for ConnectedClient {
+    fn drop(&mut self) {
+        let mut state = self
+            .activity
+            .state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        state.connected -= 1;
+        state.generation = state.generation.wrapping_add(1);
     }
 }
 

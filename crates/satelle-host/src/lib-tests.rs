@@ -330,7 +330,7 @@ fn refreshed_production_snapshot_updates_admission_surfaces_but_not_desktop_disc
     assert_eq!(sessions.schema_version, HostSessionsSchemaVersion::V1);
     assert_eq!(sessions.host, LOCAL_DEMO_HOST);
     let doctor = clone
-        .doctor(LOCAL_DEMO_HOST, Some("codex"), false)
+        .doctor(LOCAL_DEMO_HOST, Some("codex"), DoctorOptions::default())
         .expect("non-refresh doctor must read the refreshed snapshot");
     assert!(doctor.findings.iter().any(|finding| {
         finding

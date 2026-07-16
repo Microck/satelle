@@ -56,6 +56,24 @@ pub struct DaemonRuntimeCapabilities {
     provider_computer_use: bool,
 }
 
+/// Volatile activity used only to decide whether an on-demand daemon may exit.
+/// Durable Session records are intentionally absent from this snapshot.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DaemonActivitySnapshot {
+    idle: bool,
+    generation: u64,
+}
+
+impl DaemonActivitySnapshot {
+    pub const fn is_idle(self) -> bool {
+        self.idle
+    }
+
+    pub const fn generation(self) -> u64 {
+        self.generation
+    }
+}
+
 /// Authenticated authority for one Host mutation. Canonical payload bytes are
 /// intentionally absent: each admission method derives them from the exact
 /// typed values it executes.
@@ -239,6 +257,15 @@ impl HostService {
 
     pub fn daemon_workers_idle(&self) -> Result<bool, SatelleError> {
         self.runtime.daemon_workers_idle()
+    }
+
+    pub fn daemon_activity_snapshot(&self) -> Result<DaemonActivitySnapshot, SatelleError> {
+        let workers_idle = self.runtime.daemon_workers_idle()?;
+        let (operations_idle, generation) = self.operation_capacity.activity_snapshot()?;
+        Ok(DaemonActivitySnapshot {
+            idle: workers_idle && operations_idle,
+            generation,
+        })
     }
 
     pub fn daemon_log_page(

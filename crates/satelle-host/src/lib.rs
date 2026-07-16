@@ -26,8 +26,8 @@ use codex_capabilities::{
     RequiredCapability, discover_phase0, evaluate_phase0_support,
 };
 pub use daemon::{
-    DaemonRuntimeCapabilities, DaemonRuntimeStatus, MutationAuthority, MutationAuthorityError,
-    StopAdmission, TurnIntent, TurnIntentError,
+    DaemonActivitySnapshot, DaemonRuntimeCapabilities, DaemonRuntimeStatus, MutationAuthority,
+    MutationAuthorityError, StopAdmission, TurnIntent, TurnIntentError,
 };
 pub use live_events::{LiveEventReceiveError, LiveEventSubscription};
 pub use log_page::{

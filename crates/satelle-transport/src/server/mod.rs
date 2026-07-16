@@ -18,7 +18,7 @@ use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::middleware;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
-use listener::{ConnectionContext, LimitedTcpListener};
+use listener::{ConnectionActivity, ConnectionContext, LimitedTcpListener};
 use satelle_core::SatelleError;
 use satelle_host::{DaemonRuntimeCapabilities, HostService};
 use serde::Serialize;
@@ -45,6 +45,7 @@ pub struct DaemonServerConfig {
     bind_addr: SocketAddr,
     max_connections: usize,
     shutdown_grace: Duration,
+    idle_timeout: Option<Duration>,
 }
 
 impl DaemonServerConfig {
@@ -53,6 +54,7 @@ impl DaemonServerConfig {
             bind_addr,
             max_connections: DEFAULT_MAX_CONNECTIONS,
             shutdown_grace: DEFAULT_SHUTDOWN_GRACE,
+            idle_timeout: None,
         }
     }
 
@@ -63,6 +65,11 @@ impl DaemonServerConfig {
 
     pub const fn with_shutdown_grace(mut self, shutdown_grace: Duration) -> Self {
         self.shutdown_grace = shutdown_grace;
+        self
+    }
+
+    pub const fn with_idle_timeout(mut self, idle_timeout: Duration) -> Self {
+        self.idle_timeout = Some(idle_timeout);
         self
     }
 }
@@ -88,6 +95,9 @@ impl DaemonServer {
         }
         if config.shutdown_grace.is_zero() {
             return Err(DaemonServerError::InvalidShutdownGrace);
+        }
+        if config.idle_timeout.is_some_and(|timeout| timeout.is_zero()) {
+            return Err(DaemonServerError::InvalidIdleTimeout);
         }
         let initialized = service
             .initialize_daemon()
@@ -125,16 +135,18 @@ impl DaemonServer {
         });
         let router = router(Arc::clone(&state));
         let listener = LimitedTcpListener::new(listener, config.max_connections);
+        let connection_activity = listener.activity();
+        let idle_service = Arc::clone(&state.service);
+        let idle_timeout = config.idle_timeout;
         let task = tokio::spawn(async move {
             axum::serve(
                 listener,
                 router.into_make_service_with_connect_info::<ConnectionContext>(),
             )
             .with_graceful_shutdown(async move {
-                while !*receiver.borrow() {
-                    if receiver.changed().await.is_err() {
-                        break;
-                    }
+                tokio::select! {
+                    () = wait_for_shutdown(&mut receiver) => {}
+                    () = wait_for_idle(idle_service, connection_activity, idle_timeout) => {}
                 }
             })
             .await
@@ -152,10 +164,25 @@ impl DaemonServer {
         self.local_addr
     }
 
+    pub async fn wait(mut self) -> Result<(), DaemonServerError> {
+        let task = self.task.take().expect("server task is present");
+        let result = match task.await {
+            Ok(Ok(())) => self.wait_for_workers().await,
+            Ok(Err(error)) => Err(DaemonServerError::ServeFailed(error)),
+            Err(error) => Err(DaemonServerError::TaskFailed(error)),
+        };
+        self.shutdown.take();
+        result
+    }
+
     pub async fn shutdown(mut self) -> Result<(), DaemonServerError> {
         if let Some(shutdown) = self.shutdown.take() {
             let _ = shutdown.send(true);
         }
+        self.finish_bounded().await
+    }
+
+    async fn finish_bounded(&mut self) -> Result<(), DaemonServerError> {
         let mut task = self.task.take().expect("server task is present");
         match tokio::time::timeout(self.shutdown_grace, &mut task).await {
             Ok(Ok(Ok(()))) => {}
@@ -187,6 +214,58 @@ impl DaemonServer {
     }
 }
 
+async fn wait_for_shutdown(receiver: &mut watch::Receiver<bool>) {
+    while !*receiver.borrow() {
+        if receiver.changed().await.is_err() {
+            break;
+        }
+    }
+}
+
+async fn wait_for_idle(
+    service: Arc<HostService>,
+    connections: ConnectionActivity,
+    idle_timeout: Option<Duration>,
+) {
+    let Some(idle_timeout) = idle_timeout else {
+        std::future::pending::<()>().await;
+        return;
+    };
+    let poll_interval = idle_timeout.min(Duration::from_secs(1));
+    let mut observed_generation = None;
+    let mut idle_since = None;
+
+    loop {
+        let activity_service = Arc::clone(&service);
+        let host_activity =
+            tokio::task::spawn_blocking(move || activity_service.daemon_activity_snapshot()).await;
+        let (connected_clients, connection_generation) = connections.snapshot();
+        let now = tokio::time::Instant::now();
+
+        match host_activity {
+            Ok(Ok(host_activity)) => {
+                let generation = (host_activity.generation(), connection_generation);
+                if observed_generation != Some(generation) {
+                    observed_generation = Some(generation);
+                    idle_since = None;
+                }
+
+                if host_activity.is_idle() && connected_clients == 0 {
+                    let started = idle_since.get_or_insert(now);
+                    if now.duration_since(*started) >= idle_timeout {
+                        return;
+                    }
+                } else {
+                    idle_since = None;
+                }
+            }
+            Ok(Err(_)) | Err(_) => idle_since = None,
+        }
+
+        tokio::time::sleep(poll_interval).await;
+    }
+}
+
 impl fmt::Debug for DaemonServer {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
@@ -209,6 +288,7 @@ pub enum DaemonServerError {
     NonLoopbackPlaintextBind,
     InvalidConnectionLimit,
     InvalidShutdownGrace,
+    InvalidIdleTimeout,
     HostInitializationFailed(SatelleError),
     BindFailed(std::io::Error),
     ServeFailed(std::io::Error),
@@ -223,6 +303,7 @@ impl DaemonServerError {
             Self::NonLoopbackPlaintextBind => "non-loopback-plaintext-bind",
             Self::InvalidConnectionLimit => "invalid-connection-limit",
             Self::InvalidShutdownGrace => "invalid-shutdown-grace",
+            Self::InvalidIdleTimeout => "invalid-idle-timeout",
             Self::HostInitializationFailed(error) => error.code.as_str(),
             Self::BindFailed(_) => "bind-failed",
             Self::ServeFailed(_) => "serve-failed",
@@ -248,6 +329,7 @@ impl fmt::Display for DaemonServerError {
             }
             Self::InvalidConnectionLimit => "the Host Daemon connection limit must be positive",
             Self::InvalidShutdownGrace => "the Host Daemon shutdown grace period must be positive",
+            Self::InvalidIdleTimeout => "the Host Daemon idle timeout must be positive",
             Self::HostInitializationFailed(_) => {
                 "the Host Daemon could not initialize its authoritative state"
             }
