@@ -1,0 +1,152 @@
+# yaml-language-server: $schema=https://coderabbit.ai/integrations/schema.v2.json
+
+tone_instructions: >-
+  Be direct and evidence-first. State the observable risk, affected contract,
+  and smallest valid fix. Avoid generic praise, corporate phrasing, and we/our
+  language. Use plain ASCII punctuation.
+
+reviews:
+  auto_review:
+    enabled: true
+    auto_incremental_review: false
+    drafts: false
+
+  path_instructions:
+    - path: ".facts"
+      instructions: |
+        Treat this file as Satelle's product contract, with lifecycle tags that
+        change how a fact applies. An `implemented` fact claims current behavior;
+        a `spec` fact without `implemented` is planned work; a `later` fact is not
+        an MVP requirement unless the pull request explicitly targets it.
+
+        A `ci` tag means the fact has a command selected by `facts check`; it does
+        not include or exclude the referenced Rust test from `cargo test`. Do not
+        suggest changing fact tags to quarantine a Rust test. Review changed fact
+        labels, tags, and commands for consistency with the code, tests, current
+        freeze rules, and `.spec-gaps.md`, without inventing behavior to close an
+        unresolved gap. When a pull request changes only lifecycle tags, check
+        whether the changed tags match existing evidence without reopening an
+        unchanged contract or already-implemented behavior.
+
+    - path: ".orchestration-state.md"
+      instructions: |
+        This is an execution ledger, not a product contract. Check changed counts,
+        commit identifiers, PR status, platform evidence, ownership, blockers, and
+        queue entries against the rest of the document and the pull request. Keep
+        historical evidence distinct from current state. Do not propose product
+        behavior merely to make this ledger read as complete.
+
+    - path: ".spec-gaps.md"
+      instructions: |
+        This ledger records undefined behavior and must not silently resolve it or
+        add product scope. Flag changes that choose a contract without recording an
+        explicit resolution, or that contradict the authoritative `.facts` file.
+
+    - path: "crates/satelle-test-contract/**"
+      instructions: |
+        These helpers are executable conformance evidence. Preserve independently
+        typed fixtures, outcomes, reference models, and case-specific diagnostics
+        when they prove different contracts. Do not recommend a generic boolean
+        adapter or shared helper if it erases those distinctions. Do flag omitted
+        matrix dimensions, untested fields, tautological expectations, transient
+        mutations hidden by final-state snapshots, and cleanup that fails on unwind.
+
+    - path: "crates/satelle-core/**"
+      instructions: |
+        Protect the domain invariants in `.facts`: terminal Turn states are
+        immutable; Session and Turn revisions advance only with committed lifecycle
+        mutations; Host and Desktop bindings are immutable after Session creation;
+        derived state must not become an independently mutable copy; and public
+        types must not expose upstream identifiers or sensitive storage fields.
+        Require exact regression coverage for changes to state transitions, public
+        serialization, identifier parsing, policy snapshots, or error semantics.
+
+    - path: "crates/satelle-host/**"
+      instructions: |
+        Review timeout, cancellation, process exit, transport loss, restart, and
+        error paths as ownership transitions. None of them alone proves upstream
+        Computer Use stopped or permits Control Lease release. Terminal state and
+        lease release must be durably coordinated; ambiguous outcomes remain
+        recovery_pending and block conflicting admission. Check that background
+        workers, subprocesses, and probe connections are bounded and cleaned up on
+        every success, error, timeout, and unwind path.
+
+        Satelle has no external installed user base and uses one canonical current
+        state. Do not request rolling-version compatibility, migration shims, dual
+        behavior, or fallback paths for historical local state unless `.facts`
+        explicitly requires them. Flag newly introduced compatibility bridges that
+        lack an explicit contract and deletion criterion.
+
+    - path: "crates/satelle-host/src/storage/**"
+      instructions: |
+        Preserve the SQLite transaction, revision, lease, integrity, migration, and
+        retention contracts. Integrity checks precede migration, migration failures
+        fail closed without destructive reset, and a lifecycle transition must not
+        partially commit state or release ownership. Flag persistence or diagnostics
+        that can contain raw prompts, transcripts, bearer tokens, provider secrets,
+        upstream identifiers, or unredacted fallback data. Sensitive paths must keep
+        the repository's regular-file, no-symlink, ownership, and permission rules.
+
+    - path: "crates/satelle-transport/**"
+      instructions: |
+        Treat HTTP, WebSocket, and client types as strict public contracts. Check
+        authentication, authorization, Host Identity pinning, correlation, and
+        protocol-version ordering before mutation; reject unknown fields and unsafe
+        transport fallback; preserve direct and established-tunnel parity; and keep
+        status codes, retryability, typed errors, WebSocket reasons, and close codes
+        consistent across server and client paths. Public payloads must not expose
+        upstream identifiers, credentials, prompts, or internal diagnostics.
+
+    - path: "crates/satelle-cli/**"
+      instructions: |
+        Preserve exact CLI and MCP boundaries: machine-readable stdout, diagnostic
+        stderr, process exit class, schema_version, required fields, enum tokens,
+        and suggested commands must agree. Project configuration is untrusted input
+        and cannot supply concrete endpoints, credentials, provider Secret Sources,
+        YOLO policy, or mutation consent. Config inspection must not resolve secrets
+        or contact remote systems. Dry-run paths must not perform even transient
+        filesystem, service, remote-host, credential, or desktop mutations.
+
+    - path: "crates/satelle-cli/src/mcp/**"
+      instructions: |
+        Treat AI client configuration as externally owned state. Plan from exact
+        source bytes, reject intervening edits before replacement, preserve unrelated
+        semantic entries and required filesystem metadata, reject symlinks and
+        non-regular files, and report partial multi-target application precisely.
+        Dry-run must not lock or write client files.
+
+        Verify each client path and schema against current authoritative upstream
+        source or repository-pinned evidence before reporting a mismatch. Do not
+        substitute a legacy or extension-specific integration, require preservation
+        of JSON/JSONC comments or whitespace unless the contract says so, or invent a
+        new public error category outside the shared error contract.
+
+    - path: "npm/**"
+      instructions: |
+        Treat the npm package graph, launcher, native packages, archives, and
+        ownership manifest as one release contract. Check that validation and
+        packaging use the same immutable bytes; package name, version, target,
+        format, architecture, libc family, metadata, member set, permissions, and
+        hashes remain aligned; subprocesses and archive expansion are bounded; and
+        lifecycle scripts cannot mutate launcher packages during packing.
+
+        Follow `.facts` and `.spec-gaps.md` for proof scope. Do not invent an
+        unauthenticated sidecar, require cross-target execution from one runner, or
+        claim unresolved provenance and attestation behavior is already required.
+
+    - path: ".github/workflows/release.yml"
+      instructions: |
+        Review the release workflow as a fail-closed publication boundary. Keep
+        permissions least-privileged and job-scoped; allow publishing, OIDC, and
+        attestations only from the documented trusted tag flow after every platform
+        lifecycle and artifact-identity gate succeeds. Dry runs and pull requests
+        must not publish, attest, promote registry tags, or mutate final releases.
+
+    - path: "scripts/install.*"
+      instructions: |
+        Preserve the installer transaction across downloaded archive, verified
+        attestation and checksum, selected target, installed binary, and ownership
+        receipt. Reject ambiguous or malformed manifests; serialize install,
+        upgrade, and uninstall; stage and roll back binary plus receipt together;
+        bound downloads, verification, subprocesses, and signal cleanup; and test
+        the real lifecycle on each supported operating-system family.
