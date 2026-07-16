@@ -24,8 +24,8 @@
 - an MVP Satelle Host owns exactly one explicitly authorized Desktop Binding @spec @mvp
 - a later broker-capable Satelle Host may own multiple explicitly authorized Desktop Bindings @spec @later
 - a Satelle Host Identity is a stable random identifier generated and stored by one Host Daemon installation @spec @mvp
-- a Satelle Host Alias is a stable logical name used by projects, profiles, commands, and public output to select a Satelle Host @spec @mvp
-- a Satelle Host Binding is the user-level mapping from a Host Alias to a concrete transport endpoint, authentication descriptor, Desktop Binding, Host-owned provider configuration, and optional expected Host Identity before first trust @spec @mvp
+- a Satelle Host Alias is a stable logical name used by projects, profiles, commands, and public output to select a Satelle Host @spec @mvp @implemented
+- a Satelle Host Binding is the user-level mapping from a Host Alias to a concrete transport endpoint, authentication descriptor, Desktop Binding, Host-owned provider configuration, and optional expected Host Identity before first trust @spec @mvp @implemented
 - a Satelle Host Daemon is a remote-machine service that owns Host checks, Codex app-server lifecycle, capability probes, authoritative state, and Satelle Client connections @spec @mvp
 - a Satelle API Principal is one authenticated Client token identity with explicit permission scopes @spec @mvp
 - a Satelle Session is a durable Satelle-owned control record mapped internally to one Satelle Host and one upstream Codex thread @spec @mvp
@@ -349,8 +349,8 @@
 - prompt Turns use a 30 minute default and maximum execution timeout, configurable through timeouts.turn_execution as a human duration string with explicit units and a finite hard maximum of 24 hours @spec @mvp
 - satelle run and steer accept --timeout <duration> as the exact per-Turn execution-timeout override; the override may shorten but never lengthen the resolved user-level or Host-owned limit and rejects bare integers or values above 24 hours @spec @contract @mvp
 - project-level configuration may request a shorter finite Turn timeout but cannot disable or lengthen the user-level or Host-owned Turn timeout limit @spec @mvp
-- when a Turn exceeds its effective execution timeout, Satelle requests upstream cancellation and reports a typed turn-timeout failure @spec @mvp
-- Satelle commits failed with turn-timeout and releases the Control Lease only after upstream cancellation or another terminal upstream state is confirmed; otherwise the Turn becomes recovery_pending and retains the lease @spec @mvp
+- when a Turn exceeds its effective execution timeout, Satelle requests upstream cancellation and reports a typed turn-timeout failure @spec @mvp @implemented
+- Satelle commits failed with turn-timeout and releases the Control Lease only after upstream cancellation or another terminal upstream state is confirmed; otherwise the Turn becomes recovery_pending and retains the lease @spec @mvp @implemented
 - satelle run supports a detach option that returns after starting the turn and prints the reusable session identifier @implemented @mvp
 - satelle run streams concise human lifecycle and progress events by default when running attached in an interactive terminal @implemented @mvp
 - satelle run does not require a separate watch option for the ordinary attached interactive run path @implemented @mvp
@@ -400,11 +400,11 @@
 - satelle quiet output may suppress native readiness smoke-test progress text but does not skip native readiness smoke tests required for prompt execution @spec @mvp
 - satelle run and steer JSON event streaming emits readiness events that distinguish native readiness cache hits, live native readiness smoke tests, passes, failures, and manual-action-required blockers before turn_started @spec @mvp
 - satelle native readiness smoke-test failures block prompt execution and include a typed error plus a recommended diagnostic or repair command @spec @mvp
-- satelle run and steer automatically run the required provider Computer Use smoke test during preflight when experimental provider Computer Use is active and no valid matching provider smoke-test cache entry exists @spec @mvp
-- satelle run and steer do not start a prompt Turn until a required live provider Computer Use smoke test passes or a valid matching provider smoke-test cache entry exists @spec @mvp
+- satelle run and steer automatically run the required provider Computer Use smoke test during preflight when experimental provider Computer Use is active and no valid matching provider smoke-test cache entry exists @spec @mvp @implemented
+- satelle run and steer do not start a prompt Turn until a required live provider Computer Use smoke test passes or a valid matching provider smoke-test cache entry exists @spec @mvp @implemented
 - satelle Provider Probe Surface includes a harmless click-and-drag task before caching provider Computer Use readiness for providers that claim pointer control support @spec @mvp
 - satelle quiet output may suppress provider smoke-test progress text but does not skip provider smoke tests required for prompt execution @spec @mvp
-- satelle run and steer support --refresh-provider-smoke-test to ignore a matching provider smoke-test cache entry and rerun the provider Computer Use smoke test before prompt execution @spec @mvp
+- satelle run and steer support --refresh-provider-smoke-test to ignore a matching provider smoke-test cache entry and rerun the provider Computer Use smoke test before prompt execution @spec @mvp @implemented
 - satelle --refresh-provider-smoke-test does not opt into experimental provider Computer Use by itself; non-OpenAI provider use still requires --experimental-provider-computer-use or user-level configuration opt-in @implemented @mvp
 - satelle --refresh-provider-smoke-test has no short alias in MVP because it is a diagnostic validation control rather than a frequent-path flag @implemented @mvp
 - satelle help text describes --refresh-provider-smoke-test as a cache refresh, not as a provider capability bypass or experimental provider opt-in @implemented @mvp
@@ -443,7 +443,7 @@
 - satelle setup does not silently install a persistent Host Daemon service; the service install or configuration action is shown in the setup plan and follows the normal confirmation, --yes, --no-input --yes, and --dry-run rules @spec @mvp
 - satelle setup prefers a user-level or login-session service over a privileged system service for native Computer Use hosts because visible desktop control usually belongs to the signed-in user session @spec @mvp
 - satelle setup uses a privileged system service only when the requested host mode requires it and the setup plan states the privilege, service account, and desktop-session implications before mutation @spec @mvp
-- satelle MVP binds each concrete host alias to one Satelle Desktop Binding instead of selecting a desktop user per run @spec @mvp
+- satelle MVP binds each concrete host alias to one Satelle Desktop Binding instead of selecting a desktop user per run @spec @mvp @implemented
 - before first trust, a user-level Host Binding may set expected_host_id = null so setup can discover but not silently pre-trust the reachable Host Identity @spec @mvp
 - satelle setup defaults the Satelle Desktop Binding to the authenticated bootstrap OS account when that account has a compatible active desktop session @spec @mvp
 - satelle setup supports setup-time desktop binding selection through an interactive prompt or user-level host configuration when multiple candidate desktop users are visible @spec @mvp
@@ -639,7 +639,7 @@
 ## doctor-and-diagnostics
 - satelle treats Codex thread goals as lifecycle metadata for objective, status, budget, and usage tracking, not as a replacement for thread and turn control @spec @mvp
 - satelle exposes one top-level doctor command for selected-host diagnostics @implemented @mvp
-- satelle doctor supports repeatable --scope <transport|codex|computer-use|provider|config|all> for selected-host diagnostics @spec @mvp
+- satelle doctor supports repeatable --scope <transport|codex|computer-use|provider|config|all> for selected-host diagnostics @spec @mvp @implemented
 - satelle doctor defaults to scope all when no --scope is provided, so doctor --refresh without an explicit scope refreshes both computer-use and provider probes @spec @mvp
 - satelle doctor reports a typed scope-selection-conflict usage error when --scope all is combined with another scope @spec @mvp
 - satelle doctor reports Satelle Doctor Findings with stable fixability values repairable, manual_action_required, blocked, and informational @implemented @mvp
@@ -700,16 +700,16 @@
 - satelle doctor accepted fix flow reruns affected readiness diagnostics before deciding the final doctor exit status @spec @mvp
 - satelle doctor exits 0 after an accepted fix flow only when the post-fix diagnostics no longer report readiness-blocking findings @spec @mvp
 - satelle doctor exits with the host readiness failure class when the user declines a fix offer and readiness-blocking findings remain @spec @mvp
-- satelle doctor may mutate readiness or provider smoke-test caches only when --refresh is explicitly provided; refresh never performs setup, repair, install, host update, service, or configuration mutations @spec @mvp
+- satelle doctor may mutate readiness or provider smoke-test caches only when --refresh is explicitly provided; refresh never performs setup, repair, install, host update, service, or configuration mutations @spec @mvp @implemented
 - satelle doctor supports --scope computer-use --refresh to rerun the native Computer Use readiness smoke test and update the host readiness cache without starting prompt execution @implemented @mvp
 - satelle doctor accepts --refresh only when the selected scopes include computer-use, provider, or all and otherwise reports a typed refresh-scope-required usage error @spec @mvp
-- satelle doctor --scope all --refresh reruns both native Computer Use readiness and required provider smoke tests before updating their independent caches @spec @mvp
+- satelle doctor --scope all --refresh reruns both native Computer Use readiness and required provider smoke tests before updating their independent caches @spec @mvp @implemented
 - satelle doctor computer-use refresh accepts an explicit timeout option for diagnostics without changing stored timeout configuration @implemented @mvp
 - satelle doctor computer-use refresh timeout option is --timeout <duration> and uses the same explicit-unit duration syntax as configuration @implemented @mvp
-- satelle doctor --scope provider --refresh reruns provider Computer Use smoke tests and updates the host-side provider smoke-test cache without starting prompt execution @spec @mvp
+- satelle doctor --scope provider --refresh reruns provider Computer Use smoke tests and updates the host-side provider smoke-test cache without starting prompt execution @spec @mvp @implemented
 - satelle doctor provider refresh accepts an explicit timeout option for diagnostics without changing stored timeout configuration @implemented @mvp
 - satelle doctor provider refresh timeout option is --timeout <duration> and uses the same explicit-unit duration syntax as configuration @implemented @mvp
-- satelle doctor accepts --timeout only with --refresh and a selected computer-use, provider, or all scope and otherwise reports a typed refresh-timeout-without-refresh usage error @spec @mvp
+- satelle doctor accepts --timeout only with --refresh and a selected computer-use, provider, or all scope and otherwise reports a typed refresh-timeout-without-refresh usage error @spec @mvp @implemented
 - when doctor refresh selects both computer-use and provider, one --timeout value applies independently to each live probe rather than to their combined wall-clock duration @spec @mvp
 - satelle doctor implementation uses modular probes internally instead of encoding subsystem checks directly in the command handler @implemented @mvp
 - satelle diagnostic bundle export is deferred until after MVP logs, status, and doctor behavior is implemented @spec @later
@@ -1396,10 +1396,10 @@
 - Control Lease ownership is keyed by Host Identity and Desktop Binding instead of a Client-selected Host Alias @spec @mvp
 - Host Aliases resolving to the same Host Identity and Desktop Binding share one Control Lease @spec @mvp
 - Control Lease acquisition conflicts report host-busy without creating a Session, Turn, Codex thread, or attachment staging record @spec @mvp
-- native Computer Use readiness smoke tests, provider smoke tests, and prompt Turns use the same exclusive Control Lease @spec @mvp
+- native Computer Use readiness smoke tests, provider smoke tests, and prompt Turns use the same exclusive Control Lease @spec @mvp @implemented
 - doctor refresh reports host-busy instead of operating the desktop while a prompt Turn owns the Control Lease @spec @mvp
 - the Host Daemon releases the Control Lease in the same transaction that persists a terminal Turn state @spec @mvp
-- a standalone readiness or provider probe releases its Control Lease in the same transaction that persists the terminal Readiness Result only after the Codex adapter confirms that no upstream probe Turn remains active @spec @mvp
+- a standalone readiness or provider probe releases its Control Lease in the same transaction that persists the terminal Readiness Result only after the Codex adapter confirms that no upstream probe Turn remains active @spec @mvp @implemented
 - setup, repair, host update, storage migration, and service restart acquire a Maintenance Lease before mutation @spec @mvp
 - a Maintenance Lease cannot coexist with a Control Lease for the same Host except when the same maintenance operation owns a postcheck Control sublease @spec @mvp
 - Turn admission requires both the selected Control Lease and absence of a Maintenance Lease for the same Host @spec @mvp
@@ -1649,7 +1649,7 @@
 - Satelle refuses to use a sensitive state path that resolves through an unsafe writable directory boundary @spec @mvp @implemented
 - retention deletion does not claim cryptographic erasure from SQLite pages, filesystem snapshots, backups, or upstream services @spec @mvp
 - Satelle documents that Codex and model providers may retain data independently from Satelle-owned retention @spec @mvp
-- satelle local CLI cache stores only convenience data such as redacted command history, aggregate stats, AI client installer state, downloaded release metadata, and non-authoritative recent host summaries @spec @mvp
+- satelle local CLI cache stores only convenience data such as redacted command history, aggregate stats, AI client installer state, downloaded release metadata, and non-authoritative recent host summaries @spec @mvp @implemented
 - satelle local CLI cache root is configurable through SATELLE_CACHE_DIR @spec @mvp
 - satelle local CLI cache entries have explicit time-to-live or retention policies instead of persisting indefinitely by default @spec @mvp
 - satelle local CLI cache never stores provider credentials, raw prompts, screenshots, desktop recordings, full transcripts, raw Codex protocol payloads, or raw provider request and response bodies by default @spec @mvp
@@ -1816,7 +1816,7 @@
 - satelle direct TLS requires TLS 1.2 or newer @spec @mvp @implemented
 - satelle direct TLS reports typed certificate-untrusted, certificate-hostname-mismatch, certificate-expired, and tls-version-unsupported errors before API authentication @spec @mvp @implemented
 - satelle does not expose an insecure direct-transport option that disables certificate or Host-name verification @spec @mvp @implemented
-- satelle MVP does not manage TLS certificate issuance or renewal for non-loopback direct Host Daemon transport @spec @mvp
+- satelle MVP does not manage TLS certificate issuance or renewal for non-loopback direct Host Daemon transport @spec @mvp @implemented
 - satelle non-loopback direct transport relies on user-provided TLS termination or configured TLS materials outside MVP certificate automation @spec @mvp @implemented
 - when the Host Daemon terminates TLS, its certificate-chain and private-key files must each be regular Host-owned non-symlink files under a Host-owned configuration boundary whose full directory ancestry prevents replacement by unrelated principals, neither file may be writable by unrelated principals, and the private key must not be readable by unrelated principals @spec @mvp @implemented
 - Host Daemon TLS startup fails closed on an unreadable key, unsafe permissions, an expired certificate, or a certificate and private-key mismatch and never falls back to plaintext @spec @mvp @implemented
@@ -1928,9 +1928,9 @@
 - satelle target architecture includes a Satelle Host Daemon running on the controlled remote machine and a local satelle CLI acting as the client @spec @mvp
 - satelle Host Daemon binds to loopback by default even when installed as a persistent service @spec @mvp
 - satelle Host Daemon non-loopback binding is an explicit configuration choice that requires the direct transport security requirements @spec @mvp
-- satelle MVP may bootstrap or run the remote host component through SSH before persistent service installation is implemented @spec @mvp
+- satelle MVP may bootstrap or run the remote host component through SSH before persistent service installation is implemented @spec @mvp @implemented
 - satelle MVP starts the remote host component on demand instead of installing a persistent OS service by default @spec @mvp
-- satelle run automatically starts the on-demand Host Daemon for SSH bootstrap hosts when it is not already running @spec @mvp
+- satelle run automatically starts the on-demand Host Daemon for SSH bootstrap hosts when it is not already running @spec @mvp @implemented
 - satelle run requires an already reachable Host Daemon for direct transport hosts and reports a direct-daemon-unreachable error when none is available @spec @mvp @implemented
 - satelle on-demand Host Daemon stays alive after a session ends for a short configurable idle timeout so follow-up commands can reuse it @spec @mvp
 - satelle on-demand Host Daemon default idle timeout is 10 minutes @spec @mvp
@@ -1938,9 +1938,9 @@
 - satelle on-demand Host Daemon idle timeout counts active Turns, active control probes, active maintenance operations, queued Turn Requests, and connected Clients instead of retained Session records @spec @mvp
 - retained idle Sessions do not prevent an on-demand Host Daemon from exiting after its idle timeout @spec @mvp
 - satelle persistent host service installation is an explicit setup action separate from ordinary prompt execution @spec @mvp
-- satelle MVP can bootstrap the remote host component by uploading a matching self-contained host binary to the remote machine when a supported transport can copy and execute files @spec @mvp
-- satelle MVP does not require Satelle to already be installed on the remote host before prompt execution when bootstrap upload is available @spec @mvp
-- satelle bootstrap invokes the uploaded binary in host-daemon mode on the remote machine @spec @mvp
+- satelle MVP can bootstrap the remote host component by uploading a matching self-contained host binary to the remote machine when a supported transport can copy and execute files @spec @mvp @implemented
+- satelle MVP does not require Satelle to already be installed on the remote host before prompt execution when bootstrap upload is available @spec @mvp @implemented
+- satelle bootstrap invokes the uploaded binary in host-daemon mode on the remote machine @spec @mvp @implemented
 - satelle stores uploaded on-demand host binaries in a user-scoped versioned cache directory on the remote machine instead of temporary directories or global install paths @spec @mvp
 - uploaded Host binary cache directories and files are owner-only, and bootstrap rejects a cached binary before execution when it is not a regular file, is a symlink, or is group- or other-writable @spec @mvp
 - satelle remote binary cache paths include the Satelle version and target platform so different client and host builds do not overwrite each other @spec @mvp
@@ -1982,7 +1982,7 @@
 - satelle reports Codex runtime availability, native Computer Use availability, and model-provider compatibility as separate host capabilities @spec @mvp
 - satelle validates native Computer Use with a host-side action-path smoke test instead of only checking that a plugin or feature flag exists @spec @mvp
 - satelle MVP readiness requires native Codex Computer Use to be installed, enabled, and passing the host-side smoke test @spec @mvp
-- the Host Daemon caches every terminal native Computer Use Readiness Result @spec @mvp
+- the Host Daemon caches every terminal native Computer Use Readiness Result @spec @mvp @implemented
 - a matching successful native Computer Use Readiness Result no older than 5 minutes is sufficient for native readiness during prompt preflight unless an invalidation condition applies @spec @mvp
 - satelle native Computer Use readiness cache time-to-live values are configurable per host or profile @spec @mvp
 - satelle Host Daemon is the canonical store for readiness cache entries because it observes the remote runtime directly @spec @mvp
@@ -2026,21 +2026,21 @@
 - satelle proves selected model-provider Computer Use compatibility with a host-side provider smoke test before prompt execution @spec @mvp
 - satelle provider smoke tests run through the same remote Codex control plane and native Computer Use path that prompt execution will use @spec @mvp
 - satelle blocks prompt execution with a typed unsupported-provider-computer-use error when the selected provider or model cannot pass the Computer Use smoke test @spec @mvp
-- satelle can use cached provider smoke test results only when the cache key exactly matches the target host, provider, model, Codex version, native Computer Use runtime version, and relevant provider configuration fingerprint @spec @mvp
-- satelle provider smoke tests create a fresh random nonce and probe session on the remote Host Daemon @spec @mvp
-- satelle provider smoke tests use a Satelle Provider Probe Surface served by the Host Daemon over a loopback or local-only endpoint on the remote host @spec @mvp
+- satelle can use cached provider smoke test results only when the cache key exactly matches the target host, provider, model, Codex version, native Computer Use runtime version, and relevant provider configuration fingerprint @spec @mvp @implemented
+- satelle provider smoke tests create a fresh random nonce and probe session on the remote Host Daemon @spec @mvp @implemented
+- satelle provider smoke tests use a Satelle Provider Probe Surface served by the Host Daemon over a loopback or local-only endpoint on the remote host @spec @mvp @implemented
 - each Provider Probe Surface binds only to loopback @spec @mvp
 - each Provider Probe Surface uses a fresh unguessable capability value valid for exactly one probe attempt @spec @mvp
 - a Provider Probe Surface accepts only the expected nonce and expected action result @spec @mvp
 - a Provider Probe Surface exposes no user files, cookies, credentials, Session data, Host metadata, or unrelated network proxy behavior @spec @mvp
 - provider probe completion closes the listener and invalidates its capability immediately @spec @mvp
 - satelle provider smoke tests do not depend on external websites, real user accounts, signed-in browser profiles, browser extensions, user files, payment pages, security settings pages, or destructive desktop actions @spec @mvp
-- satelle provider smoke tests ask Codex native Computer Use to read the probe nonce, perform a harmless visible action, and submit the expected result through the probe surface @spec @mvp
+- satelle provider smoke tests ask Codex native Computer Use to read the probe nonce, perform a harmless visible action, and submit the expected result through the probe surface @spec @mvp @implemented
 - satelle Host Daemon verifies provider smoke test success from probe surface callbacks or daemon-observed state instead of trusting the model's final message text @spec @mvp
 - satelle provider smoke tests may use a browser as the probe target only when native Computer Use is operating that browser as an approved desktop target rather than relying solely on the Codex Browser plugin @spec @mvp
 - satelle provider smoke tests distinguish selected provider or model failure from native Computer Use readiness failures such as missing OS permissions, app approval prompts, locked desktop state, or inability to open the probe target @spec @mvp
 - satelle provider smoke tests report readiness blockers or manual-action-required when the probe cannot run because native Computer Use cannot access the probe target @spec @mvp
-- satelle provider smoke tests time out, close or retire the probe surface, and clean up probe session state after completion or failure @spec @mvp
+- satelle provider smoke tests time out, close or retire the probe surface, and clean up probe session state after completion or failure @spec @mvp @implemented
 - label: satelle provider smoke tests use a 120 second timeout by default
   command: cargo test --locked -p satelle-host --lib tests::admission_request_timeout_tracks_both_configured_readiness_phases -- --exact
   tags: [spec, mvp, implemented, ci]
@@ -2063,17 +2063,17 @@
   command: cargo test --locked -p satelle-host --lib runtime::tests::unknown_provider_probe_ownership_blocks_probe_and_prompt_until_terminal_reconciliation -- --exact
   tags: [spec, mvp, implemented, ci]
 - satelle provider smoke tests store normalized pass/fail metadata and typed failure reasons but do not store screenshots, full transcripts, or desktop recordings by default @spec @mvp
-- satelle provider smoke test cache misses during prompt execution trigger a live provider smoke test when the selected provider requires experimental provider Computer Use and the user has opted into that experimental mode @spec @mvp
-- satelle live provider smoke test failures block prompt execution and store the normalized failure result in the Host Daemon cache @spec @mvp
-- satelle provider smoke test cache hits, live refreshes, and failures are distinguishable in preflight, doctor, and JSON output @spec @mvp
-- satelle provider smoke-test cache successful results are trusted for 24 hours by default when the cache key still exactly matches the target host, provider, model, Codex version, native Computer Use runtime version, and relevant provider configuration fingerprint @spec @mvp
-- satelle provider smoke-test cache failed results are trusted for 10 minutes by default when the cache key still exactly matches the target host, provider, model, Codex version, native Computer Use runtime version, and relevant provider configuration fingerprint @spec @mvp
-- satelle treats expired provider smoke-test cache entries as cache misses for prompt execution @spec @mvp
-- satelle provider smoke-test cache time-to-live values are configurable per host or profile @spec @mvp
-- satelle preflight and JSON output identify when provider Computer Use compatibility came from cache and include the cached result age or expiry metadata @spec @mvp
-- satelle provider smoke-test refresh during run or steer ignores matching cached pass and fail entries and replaces them with the new live smoke-test result @spec @mvp
-- satelle provider smoke-test refresh during run or steer still blocks prompt execution when the live smoke test fails @spec @mvp
-- satelle provider smoke-test refresh during run or steer is distinct from doctor provider refresh because run and steer refresh validate immediately before a real prompt turn while doctor refresh validates without starting prompt execution @spec @mvp
+- satelle provider smoke test cache misses during prompt execution trigger a live provider smoke test when the selected provider requires experimental provider Computer Use and the user has opted into that experimental mode @spec @mvp @implemented
+- satelle live provider smoke test failures block prompt execution and store the normalized failure result in the Host Daemon cache @spec @mvp @implemented
+- satelle provider smoke test cache hits, live refreshes, and failures are distinguishable in preflight, doctor, and JSON output @spec @mvp @implemented
+- satelle provider smoke-test cache successful results are trusted for 24 hours by default when the cache key still exactly matches the target host, provider, model, Codex version, native Computer Use runtime version, and relevant provider configuration fingerprint @spec @mvp @implemented
+- satelle provider smoke-test cache failed results are trusted for 10 minutes by default when the cache key still exactly matches the target host, provider, model, Codex version, native Computer Use runtime version, and relevant provider configuration fingerprint @spec @mvp @implemented
+- satelle treats expired provider smoke-test cache entries as cache misses for prompt execution @spec @mvp @implemented
+- satelle provider smoke-test cache time-to-live values are configurable per host or profile @spec @mvp @implemented
+- satelle preflight and JSON output identify when provider Computer Use compatibility came from cache and include the cached result age or expiry metadata @spec @mvp @implemented
+- satelle provider smoke-test refresh during run or steer ignores matching cached pass and fail entries and replaces them with the new live smoke-test result @spec @mvp @implemented
+- satelle provider smoke-test refresh during run or steer still blocks prompt execution when the live smoke test fails @spec @mvp @implemented
+- satelle provider smoke-test refresh during run or steer is distinct from doctor provider refresh because run and steer refresh validate immediately before a real prompt turn while doctor refresh validates without starting prompt execution @spec @mvp @implemented
 - label: satelle reports a typed native-execution-path-unavailable readiness blocker when its private Codex app-server exposes no stable native Computer Use path, even if separate desktop acceptance succeeded
   id: qvk
   tags: [implemented, mvp]
@@ -2141,51 +2141,51 @@
 - satelle refuses prompt execution on hosts that still fail native Computer Use readiness after setup or repair @spec @mvp
 
 ## transport
-- satelle treats Tailscale as an optional first-class private connectivity option for reaching configured remote hosts @spec @mvp
-- satelle does not require Tailscale for core remote host configuration or execution flows @spec @mvp
-- satelle supports connectivity paths that are not exclusive to Tailscale @spec @mvp
-- satelle does not assume Tailscale SSH is available on Windows hosts @spec @mvp
-- satelle host configuration is transport-agnostic and represents remote host capabilities independently from the connectivity method used to reach the host @spec @mvp
-- satelle MVP includes first-class optional Tailscale support rather than treating Tailscale as a post-MVP recipe @spec @mvp
-- satelle Tailscale support includes host reachability checks, tailnet address resolution guidance, and transport diagnostics for Tailscale-backed hosts @spec @mvp
-- satelle models Tailscale as an optional network provider for SSH and direct Host Daemon transports @spec @mvp
-- satelle host configuration may include a small Tailscale-specific block when the host selects Tailscale as its network provider @spec @mvp
-- satelle Tailscale-specific configuration stays scoped to Tailscale-backed hosts instead of adding Tailscale fields to every host shape @spec @mvp
-- satelle detects the local tailscale CLI and Tailscale login or daemon status when diagnosing Tailscale-backed hosts @spec @mvp
-- satelle Tailscale diagnostics can report partial results without the tailscale CLI by validating configuration shape and explaining which live checks were skipped @spec @mvp
-- satelle Tailscale diagnostics provide full live reachability and status checks only when the tailscale CLI or equivalent local status source is available @spec @mvp
-- satelle reads Tailscale status data when available to validate configured tailnet host visibility and suggest Tailscale DNS or IP addresses @spec @mvp
-- satelle validates Tailscale-backed host reachability with Tailscale-aware diagnostics when available @spec @mvp
-- satelle does not automatically run tailscale up, edit tailnet ACLs, or call the Tailscale admin API in MVP @spec @mvp
-- satelle MVP includes an explicit Tailscale Serve setup helper for exposing a remote Host Daemon to the user's tailnet when a host uses Tailscale-backed direct transport @spec @mvp
-- satelle Tailscale Serve setup runs against the remote host's Tailscale daemon because the exposed service is the remote Host Daemon, not the local CLI @spec @mvp
-- satelle Tailscale Serve setup is never run automatically by run, steer, status, or doctor commands @spec @mvp
-- satelle Tailscale Serve setup separates preview from apply so users can inspect the planned tailscale serve change before Satelle mutates remote Tailscale configuration @spec @mvp
-- satelle Tailscale Serve setup preserves unrelated existing Tailscale Serve configuration instead of resetting or overwriting the remote node's full Serve state @spec @mvp
-- satelle MVP does not configure Tailscale Funnel or public internet exposure as a normal setup path @spec @mvp
+- satelle treats Tailscale as an optional first-class private connectivity option for reaching configured remote hosts @spec @mvp @implemented
+- satelle does not require Tailscale for core remote host configuration or execution flows @spec @mvp @implemented
+- satelle supports connectivity paths that are not exclusive to Tailscale @spec @mvp @implemented
+- satelle does not assume Tailscale SSH is available on Windows hosts @spec @mvp @implemented
+- satelle host configuration is transport-agnostic and represents remote host capabilities independently from the connectivity method used to reach the host @spec @mvp @implemented
+- satelle MVP includes first-class optional Tailscale support rather than treating Tailscale as a post-MVP recipe @spec @mvp @implemented
+- satelle Tailscale support includes host reachability checks, tailnet address resolution guidance, and transport diagnostics for Tailscale-backed hosts @spec @mvp @implemented
+- satelle models Tailscale as an optional network provider for SSH and direct Host Daemon transports @spec @mvp @implemented
+- satelle host configuration may include a small Tailscale-specific block when the host selects Tailscale as its network provider @spec @mvp @implemented
+- satelle Tailscale-specific configuration stays scoped to Tailscale-backed hosts instead of adding Tailscale fields to every host shape @spec @mvp @implemented
+- satelle detects the local tailscale CLI and Tailscale login or daemon status when diagnosing Tailscale-backed hosts @spec @mvp @implemented
+- satelle Tailscale diagnostics can report partial results without the tailscale CLI by validating configuration shape and explaining which live checks were skipped @spec @mvp @implemented
+- satelle Tailscale diagnostics provide full live reachability and status checks only when the tailscale CLI or equivalent local status source is available @spec @mvp @implemented
+- satelle reads Tailscale status data when available to validate configured tailnet host visibility and suggest Tailscale DNS or IP addresses @spec @mvp @implemented
+- satelle validates Tailscale-backed host reachability with Tailscale-aware diagnostics when available @spec @mvp @implemented
+- satelle does not automatically run tailscale up, edit tailnet ACLs, or call the Tailscale admin API in MVP @spec @mvp @implemented
+- satelle MVP includes an explicit Tailscale Serve setup helper for exposing a remote Host Daemon to the user's tailnet when a host uses Tailscale-backed direct transport @spec @mvp @implemented
+- satelle Tailscale Serve setup runs against the remote host's Tailscale daemon because the exposed service is the remote Host Daemon, not the local CLI @spec @mvp @implemented
+- satelle Tailscale Serve setup is never run automatically by run, steer, status, or doctor commands @spec @mvp @implemented
+- satelle Tailscale Serve setup separates preview from apply so users can inspect the planned tailscale serve change before Satelle mutates remote Tailscale configuration @spec @mvp @implemented
+- satelle Tailscale Serve setup preserves unrelated existing Tailscale Serve configuration instead of resetting or overwriting the remote node's full Serve state @spec @mvp @implemented
+- satelle MVP does not configure Tailscale Funnel or public internet exposure as a normal setup path @spec @mvp @implemented
 - satelle warns when a configuration attempts to use Tailscale Funnel or public exposure for desktop-control access @spec @mvp
-- satelle MVP supports SSH transport for bootstrap, file upload, remote command execution, and tunneled access to the on-demand Host Daemon @spec @mvp
-- satelle MVP supports direct HTTPS and WSS transport for already reachable or persistently installed Host Daemons @spec @mvp
-- satelle models Tailscale as optional reachability and address resolution for supported transports rather than as a separate execution model @spec @mvp
+- satelle MVP supports SSH transport for bootstrap, file upload, remote command execution, and tunneled access to the on-demand Host Daemon @spec @mvp @implemented
+- satelle MVP supports direct HTTPS and WSS transport for already reachable or persistently installed Host Daemons @spec @mvp @implemented
+- satelle models Tailscale as optional reachability and address resolution for supported transports rather than as a separate execution model @spec @mvp @implemented
 - satelle treats direct authenticated HTTPS and WSS access to the Host Daemon as the preferred runtime transport when the daemon is already reachable @spec @mvp
 - satelle treats system OpenSSH as the default SSH backend for bootstrap and repair because it preserves user SSH configuration, agents, hardware keys, jump hosts, known hosts, and Tailscale SSH behavior @spec @mvp
 - satelle SSH bootstrap does not assume a POSIX shell on the remote host and uses OS-aware command execution, quoting, path, and file-copy behavior for Windows, Linux, and macOS @spec @mvp
 - satelle never disables OpenSSH Host-key verification automatically @spec @mvp
-- satelle never accepts a changed SSH Host key automatically @spec @mvp
-- first-use SSH Host-key acceptance requires normal OpenSSH interactive confirmation or preconfigured known-host state @spec @mvp
-- noninteractive SSH bootstrap fails with a typed ssh-host-key-verification-required error when trust cannot be established without prompting @spec @mvp
-- project-level configuration cannot supply raw OpenSSH options, ProxyCommand values, identity paths, or executable overrides @spec @mvp
-- satelle constructs OpenSSH argv values without invoking a local shell @spec @mvp
-- remote prompts, bearer tokens, provider secrets, and raw configuration are never embedded in SSH command strings @spec @mvp
-- SSH bootstrap tunnels bind only to Controller loopback by default @spec @mvp
+- satelle never accepts a changed SSH Host key automatically @spec @mvp @implemented
+- first-use SSH Host-key acceptance requires normal OpenSSH interactive confirmation or preconfigured known-host state @spec @mvp @implemented
+- noninteractive SSH bootstrap fails with a typed ssh-host-key-verification-required error when trust cannot be established without prompting @spec @mvp @implemented
+- project-level configuration cannot supply raw OpenSSH options, ProxyCommand values, identity paths, or executable overrides @spec @mvp @implemented
+- satelle constructs OpenSSH argv values without invoking a local shell @spec @mvp @implemented
+- remote prompts, bearer tokens, provider secrets, and raw configuration are never embedded in SSH command strings @spec @mvp @implemented
+- SSH bootstrap tunnels bind only to Controller loopback by default @spec @mvp @implemented
 - id: cr4
   label: Host Daemon API authentication remains required inside an SSH tunnel
   command: cargo test --locked -p satelle-transport --test http conformance::established_ssh_tunnel_requires_api_authentication_for_http_and_websocket -- --exact
   tags: [spec, mvp, implemented, ci]
-- uploaded Host Daemon binaries are verified against release integrity metadata before remote execution @spec @mvp
-- uploaded binaries are staged under generated names and atomically promoted only after verification @spec @mvp
-- remote bootstrap stdout used as a machine protocol is size-bounded and separated from diagnostic stderr @spec @mvp
-- satelle supports direct transport for hosts where SSH bootstrap is unavailable but a Host Daemon is already installed and reachable @spec @mvp
+- uploaded Host Daemon binaries are verified against release integrity metadata before remote execution @spec @mvp @implemented
+- uploaded binaries are staged under generated names and atomically promoted only after verification @spec @mvp @implemented
+- remote bootstrap stdout used as a machine protocol is size-bounded and separated from diagnostic stderr @spec @mvp @implemented
+- satelle supports direct transport for hosts where SSH bootstrap is unavailable but a Host Daemon is already installed and reachable @spec @mvp @implemented
 
 # research
 
@@ -2201,7 +2201,7 @@
 - satelle supports explicit per-run model and provider overrides when the remote host can validate the requested combination @spec @mvp
 - satelle project-level model and provider defaults are treated as shared intent and must resolve through user-level or host-owned provider bindings before execution @spec @mvp
 - satelle does not write provider credentials or project-defined provider endpoint data into the remote Codex configuration as a side effect of resolving project model defaults @spec @mvp
-- satelle requires an explicit experimental provider Computer Use option before attempting native Computer Use with a non-OpenAI provider @spec @mvp
+- satelle requires an explicit experimental provider Computer Use option before attempting native Computer Use with a non-OpenAI provider @spec @mvp @implemented
 - satelle experimental non-OpenAI provider Computer Use opt-in must come from a CLI flag or user-level configuration rather than project-level configuration @implemented @mvp
 - satelle supports non-OpenAI provider Computer Use only as an explicit experimental mode guarded by warning text and a live remote smoke test @spec @mvp
 - satelle caches non-OpenAI provider Computer Use smoke test results by host, provider, model, Codex version, and native Computer Use runtime version @spec @mvp
