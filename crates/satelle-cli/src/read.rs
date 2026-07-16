@@ -18,40 +18,56 @@ pub(super) fn config_check_report(
     config_context: ConfigContext<'_>,
 ) -> Result<Value, CliFailure> {
     let config = config_context.load()?;
-    let selected_profile = config
-        .selected_profile
-        .as_ref()
-        .map(|profile| profile.name.as_str());
-    let selected_profile_source = config
-        .selected_profile
-        .as_ref()
-        .map_or("default", |profile| profile.source.as_str());
-    let selected_host = config
-        .resolve_host(host.as_deref())
-        .map(|(alias, _)| alias)
+    let contexts = config
+        .config_check_contexts(host.as_deref(), all)
         .map_err(failure)?;
+    let selected = contexts
+        .first()
+        .expect("config check always validates at least the selected context");
+    let checked_contexts = contexts
+        .iter()
+        .map(|context| {
+            json!({
+                "host": context.host,
+                "profile": context.profile,
+                "source": context.source,
+                "status": "ok",
+                "checks": LOCAL_CONFIG_CHECKS,
+                "errors": [],
+                "not_checked": REMOTE_CONFIG_CHECKS,
+            })
+        })
+        .collect::<Vec<_>>();
     Ok(json!({
         "schema_version": CONFIG_CHECK_SCHEMA_VERSION,
         "status": "ok",
         "mode": if all { "all" } else { "selected" },
-        "selected_host": selected_host,
-        "selected_profile": selected_profile,
+        "selected_host": selected.host,
+        "selected_profile": selected.profile,
         "checked_files": [config.user_config_path, config.project_config_path],
-        "checks": ["toml_parse", "host_resolution"],
-        "checked_contexts": [{
-            "host": selected_host,
-            "profile": selected_profile,
-            "source": selected_profile_source,
-            "status": "ok",
-            "checks": ["toml_parse", "host_resolution"],
-            "errors": [],
-            "not_checked": ["remote_host", "provider_auth", "native_computer_use"],
-        }],
+        "checks": LOCAL_CONFIG_CHECKS,
+        "checked_contexts": checked_contexts,
         "errors": [],
-        "not_checked": ["remote_host", "provider_auth", "native_computer_use"],
+        "not_checked": REMOTE_CONFIG_CHECKS,
         "recovery_commands": [],
     }))
 }
+
+const LOCAL_CONFIG_CHECKS: &[&str] = &[
+    "toml_parse",
+    "typed_schema",
+    "unknown_keys",
+    "unsupported_composition",
+    "interpolation_syntax",
+    "duration_units",
+    "path_overrides",
+    "merge_precedence",
+    "profile_resolution",
+    "host_resolution",
+    "project_forbidden_keys",
+];
+
+const REMOTE_CONFIG_CHECKS: &[&str] = &["remote_host", "provider_auth", "native_computer_use"];
 
 pub(super) fn config_explain_report(
     host: Option<String>,

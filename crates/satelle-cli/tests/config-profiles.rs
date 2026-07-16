@@ -203,6 +203,70 @@ profile = "project-profile"
 }
 
 #[test]
+fn config_check_all_enumerates_only_selectable_contexts() {
+    let fixture = ConfigFixture::new(
+        r#"
+default_host = "user-host"
+
+[hosts.user-host]
+transport = "local"
+adapter = "fake"
+allow_project_selection = true
+
+[hosts.work-host]
+transport = "local"
+adapter = "fake"
+allow_project_selection = true
+
+[profiles.work]
+host = "work-host"
+
+[profiles.audit]
+model_alias = "audit-model"
+"#,
+        r#"
+default_host = "user-host"
+profile = "work"
+"#,
+    );
+
+    let output = fixture
+        .command()
+        .args(["config", "check", "--all", "--json"])
+        .assert()
+        .success()
+        .get_output()
+        .clone();
+    let report = parse_json(&output.stdout);
+    let contexts = report["checked_contexts"]
+        .as_array()
+        .expect("checked contexts should be an array");
+
+    let context = |host: &str, profile: Option<&str>, source: &str| {
+        contexts.iter().any(|context| {
+            context["host"] == host
+                && context["profile"].as_str() == profile
+                && context["source"] == source
+        })
+    };
+
+    assert!(context("work-host", Some("work"), "default_context"));
+    assert!(context("user-host", None, "configured_host"));
+    assert!(context("work-host", None, "configured_host"));
+    assert!(context("work-host", Some("work"), "configured_profile"));
+    assert!(context("user-host", Some("audit"), "configured_profile"));
+    assert!(context("work-host", Some("work"), "project_defaults"));
+
+    // `audit` defaults to user-host. `work-host` + `audit` would exist only in a synthesized
+    // host/profile cross product, so all-context validation must not invent it.
+    assert!(
+        !contexts
+            .iter()
+            .any(|context| { context["host"] == "work-host" && context["profile"] == "audit" })
+    );
+}
+
+#[test]
 fn untrusted_profile_selectors_do_not_activate_yolo_policy() {
     let fixture = ConfigFixture::new(
         r#"
@@ -420,6 +484,28 @@ provider_timeout = "120s"
         error["details"]["path"],
         "profiles.broken.timeouts.provider_timeout"
     );
+
+    fixture.write_user_config(
+        r#"
+[profiles.missing-host]
+host = "not-configured"
+"#,
+    );
+    fixture
+        .command()
+        .args(["config", "check", "--json"])
+        .assert()
+        .success();
+    let output = fixture
+        .command()
+        .args(["config", "check", "--all", "--json"])
+        .assert()
+        .code(66)
+        .get_output()
+        .clone();
+    let error = parse_json(&output.stderr);
+    assert_eq!(error["code"], "host-not-found");
+    assert_eq!(error["message"], "host 'not-configured' is not configured");
 }
 
 #[test]
