@@ -63,6 +63,9 @@ use test_runtime::PendingComputerUseAdapter;
 use time::format_description::well_known::Rfc3339;
 
 const DEFAULT_NATIVE_READINESS_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+const DEFAULT_PROVIDER_SMOKE_TEST_TIMEOUT: std::time::Duration =
+    std::time::Duration::from_secs(120);
+const ADMISSION_RESPONSE_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
 const DEFAULT_NATIVE_READINESS_TTL: time::Duration = time::Duration::minutes(5);
 const DEFAULT_PROVIDER_SMOKE_SUCCESS_TTL: time::Duration = time::Duration::hours(24);
 const DEFAULT_PROVIDER_SMOKE_FAILURE_TTL: time::Duration = time::Duration::minutes(10);
@@ -164,24 +167,11 @@ impl HostService {
             .as_ref()
             .map(|path| path.join("codex-app-server-work"))
             .map_err(Clone::clone);
-        let timeout = config
-            .timeouts
-            .as_ref()
-            .and_then(|timeouts| timeouts.native_readiness.as_ref())
-            .map_or(DEFAULT_NATIVE_READINESS_TIMEOUT, |duration| {
-                std::time::Duration::from_millis(duration.milliseconds())
-            });
+        let (timeout, provider_smoke_timeout) = configured_readiness_timeouts(config);
         let ttl = config
             .native_readiness_cache_ttl
             .as_ref()
             .map_or(DEFAULT_NATIVE_READINESS_TTL, duration_to_time);
-        let provider_smoke_timeout = config
-            .timeouts
-            .as_ref()
-            .and_then(|timeouts| timeouts.provider_smoke_test.as_ref())
-            .map_or(std::time::Duration::from_secs(120), |duration| {
-                std::time::Duration::from_millis(duration.milliseconds())
-            });
         let provider_smoke_success_ttl = config
             .provider_smoke_success_cache_ttl
             .as_ref()
@@ -447,6 +437,35 @@ impl HostService {
 
 fn duration_to_time(duration: &satelle_core::ExplicitDuration) -> time::Duration {
     time::Duration::milliseconds(i64::try_from(duration.milliseconds()).unwrap_or(i64::MAX))
+}
+
+fn configured_readiness_timeouts(
+    config: &HostConfig,
+) -> (std::time::Duration, std::time::Duration) {
+    let native = config
+        .timeouts
+        .as_ref()
+        .and_then(|timeouts| timeouts.native_readiness.as_ref())
+        .map_or(DEFAULT_NATIVE_READINESS_TIMEOUT, |duration| {
+            std::time::Duration::from_millis(duration.milliseconds())
+        });
+    let provider = config
+        .timeouts
+        .as_ref()
+        .and_then(|timeouts| timeouts.provider_smoke_test.as_ref())
+        .map_or(DEFAULT_PROVIDER_SMOKE_TEST_TIMEOUT, |duration| {
+            std::time::Duration::from_millis(duration.milliseconds())
+        });
+    (native, provider)
+}
+
+/// Returns the deadline a remote admission request needs in order to receive
+/// typed outcomes from both serial readiness probes plus response overhead.
+pub fn admission_request_timeout(config: &HostConfig) -> std::time::Duration {
+    let (native, provider) = configured_readiness_timeouts(config);
+    native
+        .saturating_add(provider)
+        .saturating_add(ADMISSION_RESPONSE_GRACE)
 }
 
 fn apply_provider_refresh(
