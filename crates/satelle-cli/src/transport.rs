@@ -1,7 +1,7 @@
 use crate::{CliFailure, SelectedHost, failure};
 use satelle_core::session::{PublicSession, TurnAdmissionFailure};
 use satelle_core::{
-    ApiTokenSource, DaemonPathOverrides, DirectHostBinding, DoctorOptions, DoctorReport,
+    ApiTokenSource, DaemonPathOverrides, DirectHostBinding, DoctorOptions, DoctorReport, ErrorCode,
     HostSessionsReport, HostSessionsSchemaVersion, LOCAL_DEMO_HOST, SatelleError, SatelleEvent,
     SessionId, SetupReport, SshHostBinding, StopResult, TransportKind, TurnId,
     read_owner_only_secret_file, read_trusted_ca_bundle_file,
@@ -28,6 +28,38 @@ mod ssh_tunnel;
 
 use ssh_bootstrap::SshBootstrapProcess;
 use ssh_tunnel::SshTunnel;
+
+pub(crate) fn probe_tailscale_serve(alias: &str, destination: &str) -> Result<(), SatelleError> {
+    ssh_bootstrap::probe_tailscale_serve(destination)
+        .map_err(|error| map_tailscale_serve_error(alias, error))
+}
+
+pub(crate) fn apply_tailscale_serve(alias: &str, destination: &str) -> Result<(), SatelleError> {
+    ssh_bootstrap::apply_tailscale_serve(destination)
+        .map_err(|error| map_tailscale_serve_error(alias, error))
+}
+
+fn map_tailscale_serve_error(alias: &str, error: ssh_bootstrap::SshBootstrapError) -> SatelleError {
+    if matches!(
+        error,
+        ssh_bootstrap::SshBootstrapError::HostKeyVerificationRequired
+    ) {
+        SatelleError::ssh_host_key_verification_required(alias)
+    } else {
+        SatelleError {
+            code: ErrorCode::RemoteExecution,
+            message: format!("remote Tailscale Serve setup failed for host '{alias}'"),
+            recovery_command: Some(format!(
+                "verify system OpenSSH access, then run satelle doctor --host {alias} --scope transport --json"
+            )),
+            source_detail: None,
+            details: std::collections::BTreeMap::from([(
+                "host".to_string(),
+                serde_json::Value::String(alias.to_string()),
+            )]),
+        }
+    }
+}
 
 #[cfg(feature = "test-support")]
 const TEST_SUPPORT_ADAPTER_ENV: &str = "SATELLE_TEST_SUPPORT_ADAPTER";

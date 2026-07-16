@@ -8,6 +8,8 @@ mod mcp;
 mod output;
 mod read;
 mod tailscale;
+#[path = "tailscale-serve.rs"]
+mod tailscale_serve;
 mod transport;
 
 use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum};
@@ -671,7 +673,6 @@ fn run_setup(
 ) -> Result<(), CliFailure> {
     let json = format.is_json();
     let host = config.resolve_host(command.host.as_deref())?;
-    let transport = transport_for(&host)?;
     let daemon_path_overrides = daemon_path_overrides(&command, &host.config).map_err(failure)?;
     let setup_components = setup_components(&command.component).map_err(failure)?;
     let explicit_provider_auth = command
@@ -686,14 +687,27 @@ fn run_setup(
         &daemon_path_overrides,
     );
 
-    let mut report = transport
-        .setup(
-            true,
-            setup_mode.clone(),
-            setup_components.clone(),
-            daemon_path_overrides.clone(),
-        )
-        .map_err(failure)?;
+    let tailscale_serve_setup = command.component.as_slice() == [SetupComponent::Transport]
+        && tailscale_serve::applies_to(&host.config);
+    let transport = if tailscale_serve_setup {
+        None
+    } else {
+        Some(transport_for(&host)?)
+    };
+    let mut report = if tailscale_serve_setup {
+        tailscale_serve::configure(&host.alias, &host.config, true, &setup_mode).map_err(failure)?
+    } else {
+        transport
+            .as_ref()
+            .expect("ordinary setup transport is present")
+            .setup(
+                true,
+                setup_mode.clone(),
+                setup_components.clone(),
+                daemon_path_overrides.clone(),
+            )
+            .map_err(failure)?
+    };
     report.dry_run = command.dry_run;
     add_setup_required_inputs(&mut report, &host.config, explicit_provider_auth);
 
@@ -737,9 +751,16 @@ fn run_setup(
             }
         }
 
-        report = transport
-            .setup(false, setup_mode, setup_components, daemon_path_overrides)
-            .map_err(failure)?;
+        report = if tailscale_serve_setup {
+            tailscale_serve::configure(&host.alias, &host.config, false, &setup_mode)
+                .map_err(failure)?
+        } else {
+            transport
+                .as_ref()
+                .expect("ordinary setup transport is present")
+                .setup(false, setup_mode, setup_components, daemon_path_overrides)
+                .map_err(failure)?
+        };
         add_setup_required_inputs(&mut report, &host.config, explicit_provider_auth);
     }
 
