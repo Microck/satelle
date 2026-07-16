@@ -190,6 +190,8 @@ fn lifecycle_schema_excludes_raw_content_and_replayable_event_history() {
             "schema_migrations",
             "session_private_refs",
             "sessions",
+            "setup_actions",
+            "setup_runs",
             "sqlite_sequence",
             "turn_policies",
             "turn_private_refs",
@@ -267,6 +269,38 @@ fn lifecycle_schema_excludes_raw_content_and_replayable_event_history() {
             "timeout_seconds",
             "computer_use_enabled",
             "provider_computer_use_enabled",
+        ],
+    );
+    assert_table_columns(
+        &storage,
+        "setup_runs",
+        &[
+            "run_id",
+            "host_identity_ref",
+            "desktop_binding_ref",
+            "satelle_version",
+            "operation_kind",
+            "status",
+            "started_at",
+            "finished_at",
+        ],
+    );
+    assert_table_columns(
+        &storage,
+        "setup_actions",
+        &[
+            "run_id",
+            "action_id",
+            "action_order",
+            "action_label",
+            "status",
+            "started_at",
+            "finished_at",
+            "retry_safe",
+            "error_code",
+            "exit_status",
+            "recovery_hint",
+            "skip_reason",
         ],
     );
 }

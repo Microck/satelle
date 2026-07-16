@@ -23,6 +23,7 @@ mod logs;
 mod operational;
 mod retention;
 mod security;
+mod setup_ledger;
 
 fn initial_session(storage: &Storage, session: &str, turn: &str, at: OffsetDateTime) -> Session {
     Session::start(

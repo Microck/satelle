@@ -7,12 +7,12 @@ use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
 
 #[test]
-fn operational_evidence_schema_is_migrated_atomically_to_version_six() {
+fn operational_evidence_schema_is_migrated_atomically_to_version_seven() {
     let state = TempDir::new().expect("temporary state directory");
     let (storage, _) = Storage::open(state.path()).expect("open storage");
     let connection = storage.connection_for_test();
 
-    assert_eq!(6_i64, pragma_integer(connection, "user_version"));
+    assert_eq!(7_i64, pragma_integer(connection, "user_version"));
     let versions = connection
         .prepare("SELECT version FROM schema_migrations ORDER BY version")
         .unwrap()
@@ -20,8 +20,16 @@ fn operational_evidence_schema_is_migrated_atomically_to_version_six() {
         .unwrap()
         .collect::<Result<Vec<_>, _>>()
         .unwrap();
-    assert_eq!(vec![1_i64, 2_i64, 3_i64, 4_i64, 5_i64, 6_i64], versions);
-    for table in ["native_readiness_results", "provider_smoke_results"] {
+    assert_eq!(
+        vec![1_i64, 2_i64, 3_i64, 4_i64, 5_i64, 6_i64, 7_i64],
+        versions
+    );
+    for table in [
+        "native_readiness_results",
+        "provider_smoke_results",
+        "setup_runs",
+        "setup_actions",
+    ] {
         let exists: bool = connection
             .query_row(
                 "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = ?1)",
@@ -150,9 +158,11 @@ fn version_one_store_upgrades_without_replacing_existing_state() {
     storage
         .connection_for_test()
         .execute_batch(
-            "DROP TABLE native_readiness_results;
+            "DROP TABLE setup_actions;
+             DROP TABLE setup_runs;
+             DROP TABLE native_readiness_results;
              DROP TABLE provider_smoke_results;
-             DELETE FROM schema_migrations WHERE version IN (2, 3, 4, 5, 6);
+             DELETE FROM schema_migrations WHERE version IN (2, 3, 4, 5, 6, 7);
              PRAGMA user_version = 1;",
         )
         .unwrap();
@@ -161,7 +171,7 @@ fn version_one_store_upgrades_without_replacing_existing_state() {
     let (storage, _) = Storage::open(state.path()).expect("upgrade version one store");
     assert_eq!(expected_host, storage.host_identity().unwrap());
     assert_eq!(
-        6_i64,
+        7_i64,
         pragma_integer(storage.connection_for_test(), "user_version")
     );
 
@@ -246,9 +256,11 @@ fn assert_version_one_corruption_rejected_before_migration(
     storage
         .connection_for_test()
         .execute_batch(
-            "DROP TABLE native_readiness_results;
+            "DROP TABLE setup_actions;
+             DROP TABLE setup_runs;
+             DROP TABLE native_readiness_results;
              DROP TABLE provider_smoke_results;
-             DELETE FROM schema_migrations WHERE version IN (2, 3, 4, 5, 6);
+             DELETE FROM schema_migrations WHERE version IN (2, 3, 4, 5, 6, 7);
              PRAGMA user_version = 1;",
         )
         .expect("create a logically corrupt version one store");
@@ -275,6 +287,8 @@ fn assert_version_one_corruption_rejected_before_migration(
         "native_readiness_results",
         "provider_smoke_successes",
         "provider_smoke_results",
+        "setup_runs",
+        "setup_actions",
     ] {
         let exists: bool = connection
             .query_row(
@@ -298,9 +312,11 @@ fn failed_migration_rolls_back_partial_schema_and_preserves_existing_state() {
     storage
         .connection_for_test()
         .execute_batch(
-            "DROP TABLE native_readiness_results;
+            "DROP TABLE setup_actions;
+             DROP TABLE setup_runs;
+             DROP TABLE native_readiness_results;
              DROP TABLE provider_smoke_results;
-             DELETE FROM schema_migrations WHERE version IN (2, 3, 4, 5, 6);
+             DELETE FROM schema_migrations WHERE version IN (2, 3, 4, 5, 6, 7);
              PRAGMA user_version = 1;
              CREATE TABLE migration_sentinel (value TEXT NOT NULL) STRICT;
              INSERT INTO migration_sentinel (value) VALUES ('preserve-me');
@@ -354,6 +370,8 @@ fn failed_migration_rolls_back_partial_schema_and_preserves_existing_state() {
         "native_readiness_results",
         "provider_smoke_successes",
         "provider_smoke_results",
+        "setup_runs",
+        "setup_actions",
     ] {
         let exists: bool = connection
             .query_row(

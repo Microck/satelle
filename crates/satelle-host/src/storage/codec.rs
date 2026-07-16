@@ -490,7 +490,7 @@ pub(super) fn unix_timestamp_nanos(value: OffsetDateTime) -> Result<i64, Storage
         .map_err(|_| StorageError::new(StorageErrorKind::InvalidInput))
 }
 
-fn parse_time(value: &str) -> Result<OffsetDateTime, StorageError> {
+pub(super) fn parse_time(value: &str) -> Result<OffsetDateTime, StorageError> {
     OffsetDateTime::parse(value, &Rfc3339)
         .map_err(|_| StorageError::new(StorageErrorKind::InvalidStoredState))
 }
