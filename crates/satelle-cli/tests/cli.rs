@@ -1997,6 +1997,46 @@ adapter = "codex"
 }
 
 #[test]
+fn production_setup_with_consent_fails_closed_when_local_mutations_are_unsupported() {
+    let sandbox = state_dir();
+    let config_file = sandbox.path().join("config.toml");
+    write_user_config(
+        &config_file,
+        r#"
+default_host = "local-demo"
+
+[hosts.local-demo]
+transport = "local"
+adapter = "codex"
+"#,
+    )
+    .expect("production config should be written");
+
+    let output = assert_directory_tree_unchanged(
+        "satelle setup --yes with unsupported local mutations",
+        sandbox.path(),
+        || {
+            production_satelle()
+                .env("SATELLE_CONFIG_FILE", &config_file)
+                .env("SATELLE_STATE_DIR", sandbox.path())
+                .args(["setup", "--yes", "--host", "local-demo", "--json"])
+                .assert()
+                .code(78)
+                .get_output()
+                .clone()
+        },
+    );
+    let error = parse_json_output(&output.stderr);
+
+    assert_eq!(error["code"], "not-implemented");
+    assert!(
+        error["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("setup mutations are not supported"))
+    );
+}
+
+#[test]
 fn setup_component_filters_default_repeat_and_reject_all_conflict() {
     let state = state_dir();
     let output = satelle()
@@ -2090,40 +2130,29 @@ fn repair_yes_help_describes_ordinary_repair_mutations() {
 }
 
 #[test]
-fn setup_no_input_json_returns_stable_non_mutating_plan_without_yes() {
+fn setup_no_input_json_requires_consent_without_mutating() {
     let state = state_dir();
     let output = satelle()
         .env("SATELLE_STATE_DIR", state.path())
         .args(["setup", "--no-input", "--json", "--host", "local-demo"])
         .assert()
-        .success()
+        .code(64)
         .get_output()
         .clone();
-    let report = parse_json_output(&output.stdout);
+    let error = parse_json_output(&output.stderr);
 
-    assert_eq!(report["status"], "planned");
-    assert_eq!(report["setup_components"], serde_json::json!(["all"]));
-    assert!(report["planned_actions"].as_array().unwrap().len() >= 3);
-    assert_eq!(report["applied_actions"], serde_json::json!([]));
-    assert_eq!(report["required_input"], serde_json::json!([]));
-    assert_eq!(
-        report["recovery_commands"],
-        serde_json::json!(["satelle doctor --scope computer-use --refresh"])
-    );
-    assert_eq!(report["readiness_summary"]["transport"], "ready");
-    assert_eq!(
-        report["readiness_summary"]["host_daemon"],
-        "local_demo_in_process"
+    assert_eq!(error["code"], "setup-consent-required");
+    assert_eq!(error["details"]["applied_actions"], serde_json::json!([]));
+    assert_eq!(error["details"]["mutated"], false);
+    assert!(
+        error["details"]["planned_actions"]
+            .as_array()
+            .is_some_and(|actions| actions.len() >= 3)
     );
     assert_eq!(
-        report["readiness_summary"]["native_computer_use"],
-        "not_verified"
+        error["suggested_commands"][0],
+        "satelle setup --host local-demo --on-demand --no-input --json --yes"
     );
-    assert_eq!(
-        report["readiness_summary"]["provider_auth"],
-        "not_required_for_local_demo"
-    );
-    assert_eq!(report["mutated"], false);
     assert!(!state.path().join("local-demo-state.json").exists());
 }
 
@@ -2136,6 +2165,7 @@ fn setup_provider_auth_no_input_reports_required_descriptor_without_prompting() 
             "setup",
             "--component",
             "provider-auth",
+            "--dry-run",
             "--no-input",
             "--json",
             "--host",
@@ -2202,6 +2232,7 @@ variable = "OPENAI_API_KEY"
             "setup",
             "--component",
             "provider-auth",
+            "--dry-run",
             "--no-input",
             "--json",
             "--host",
@@ -2358,9 +2389,9 @@ fn setup_mode_flags_are_reported_in_json() {
         .get_output()
         .clone();
     let report = parse_json_output(&output.stdout);
-    assert_eq!(report["setup_mode"], "persistent");
-    assert_eq!(report["service_persistent"], true);
-    assert_eq!(report["service_scope"], "user");
+    assert_eq!(report["setup_mode"], "on_demand");
+    assert_eq!(report["service_persistent"], false);
+    assert_eq!(report["service_scope"], "on_demand");
     assert!(report["fallback_reason"].is_null());
 
     let output = satelle()
@@ -2400,6 +2431,48 @@ fn setup_mode_flags_are_reported_in_json() {
     let report = parse_json_output(&output.stdout);
     assert_eq!(report["setup_mode"], "persistent");
     assert_eq!(report["service_persistent"], true);
+
+    let user_config = state.path().join("setup-mode-config.toml");
+    write_user_config(
+        &user_config,
+        r#"
+default_host = "local-demo"
+
+[hosts.local-demo]
+transport = "local"
+adapter = "fake"
+setup_mode = "persistent"
+"#,
+    )
+    .expect("setup mode config should be written");
+    let output = satelle()
+        .env("SATELLE_CONFIG_FILE", &user_config)
+        .env("SATELLE_STATE_DIR", state.path())
+        .args(["setup", "--dry-run", "--host", "local-demo", "--json"])
+        .assert()
+        .success()
+        .get_output()
+        .clone();
+    let report = parse_json_output(&output.stdout);
+    assert_eq!(report["setup_mode"], "persistent");
+
+    let output = satelle()
+        .env("SATELLE_CONFIG_FILE", &user_config)
+        .env("SATELLE_STATE_DIR", state.path())
+        .args([
+            "setup",
+            "--dry-run",
+            "--host",
+            "local-demo",
+            "--on-demand",
+            "--json",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .clone();
+    let report = parse_json_output(&output.stdout);
+    assert_eq!(report["setup_mode"], "on_demand");
 
     satelle()
         .env("SATELLE_STATE_DIR", state.path())

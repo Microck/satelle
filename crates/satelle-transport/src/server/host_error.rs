@@ -65,6 +65,7 @@ fn failure(error: &SatelleError) -> ApiFailure {
         | ErrorCode::ConcurrencyWithoutRemoteUpdate
         | ErrorCode::ComponentSelectionConflict
         | ErrorCode::UnsupportedUpdateComponent
+        | ErrorCode::SetupConsentRequired
         | ErrorCode::InputRequired => ApiFailure {
             status: StatusCode::BAD_REQUEST,
             code: ApiErrorCode::InvalidRequest,

@@ -19,8 +19,8 @@ use satelle_core::{
     BEACON_CORAL, CLI_NAME, DaemonPathOverrides, DesktopSessionPreference, DoctorEventRecord,
     DoctorReport, ERROR_RED, ErrorCode, EventSource, EventType, HostConfig, HostSessionsReport,
     LOCAL_DEMO_HOST, PRODUCT_NAME, ProfileField, RELAY_ROSE, ResolvedConfig, SUCCESS_GREEN,
-    SatelleError, SatelleEvent, SatelleEventBody, SessionId, SetupReport, SetupRequiredInput,
-    load_config, resolve_path_set, utc_now,
+    SatelleError, SatelleEvent, SatelleEventBody, SessionId, SetupMode, SetupReport,
+    SetupRequiredInput, load_config, resolve_path_set, utc_now,
 };
 use satelle_host::HostService;
 use satelle_transport::{DaemonServer, DaemonServerConfig, DaemonServerError, TurnRequest};
@@ -633,25 +633,6 @@ fn run_setup(
     format: OutputFormat,
 ) -> Result<(), CliFailure> {
     let json = format.is_json();
-    if command.no_input && !command.dry_run && !command.yes && !json {
-        return Err(failure(SatelleError::input_required(
-            "setup needs --yes when --no-input is used for mutations",
-        )));
-    }
-
-    if !command.dry_run && !command.no_input && !json {
-        let _color_enabled = style.color_enabled();
-        cliclack::intro(format!("{PRODUCT_NAME} setup")).map_err(|source| {
-            failure(SatelleError {
-                code: ErrorCode::InvalidUsage,
-                message: "could not start interactive setup prompt".to_string(),
-                recovery_command: Some("rerun with --no-input --yes or --dry-run".to_string()),
-                source_detail: Some(source.to_string()),
-                details: std::collections::BTreeMap::new(),
-            })
-        })?;
-    }
-
     let host = config.resolve_host(command.host.as_deref())?;
     let transport = transport_for(&host)?;
     let daemon_path_overrides = daemon_path_overrides(&command, &host.config).map_err(failure)?;
@@ -660,19 +641,72 @@ fn run_setup(
         .component
         .iter()
         .any(|component| component == &SetupComponent::ProviderAuth);
-    let setup_mode = setup_mode(&command).map_err(failure)?;
+    let setup_mode = setup_mode(&command, &host.config).map_err(failure)?;
+    let consent_recovery_command = setup_consent_recovery_command(
+        &command,
+        config.flag_profile,
+        &setup_mode,
+        &daemon_path_overrides,
+    );
 
     let mut report = transport
         .setup(
-            command.dry_run,
-            setup_mode,
-            setup_components,
-            daemon_path_overrides,
+            true,
+            setup_mode.clone(),
+            setup_components.clone(),
+            daemon_path_overrides.clone(),
         )
         .map_err(failure)?;
+    report.dry_run = command.dry_run;
     add_setup_required_inputs(&mut report, &host.config, explicit_provider_auth);
 
-    if !command.dry_run && !command.no_input && !json {
+    if !command.dry_run && report.required_input.is_empty() {
+        if !command.yes && (command.no_input || json || !io::stdin().is_terminal()) {
+            return Err(failure(SatelleError::setup_consent_required(
+                &report.planned_actions,
+                &consent_recovery_command,
+            )));
+        }
+
+        if !command.yes {
+            let _color_enabled = style.color_enabled();
+            cliclack::intro(format!("{PRODUCT_NAME} setup")).map_err(|source| {
+                failure(SatelleError {
+                    code: ErrorCode::InvalidUsage,
+                    message: "could not start interactive setup prompt".to_string(),
+                    recovery_command: Some("rerun with --yes or --dry-run".to_string()),
+                    source_detail: Some(source.to_string()),
+                    details: BTreeMap::new(),
+                })
+            })?;
+            print_setup_human(&report);
+            let confirmed = cliclack::confirm("Apply these setup mutations?")
+                .initial_value(false)
+                .interact()
+                .map_err(|source| {
+                    failure(SatelleError {
+                        code: ErrorCode::InvalidUsage,
+                        message: "could not read setup confirmation".to_string(),
+                        recovery_command: Some("rerun with --yes or --dry-run".to_string()),
+                        source_detail: Some(source.to_string()),
+                        details: BTreeMap::new(),
+                    })
+                })?;
+            if !confirmed {
+                return Err(failure(SatelleError::setup_consent_required(
+                    &report.planned_actions,
+                    &consent_recovery_command,
+                )));
+            }
+        }
+
+        report = transport
+            .setup(false, setup_mode, setup_components, daemon_path_overrides)
+            .map_err(failure)?;
+        add_setup_required_inputs(&mut report, &host.config, explicit_provider_auth);
+    }
+
+    if !command.dry_run && report.required_input.is_empty() && !command.no_input && !json {
         cliclack::outro("Satelle setup produced a readiness plan").map_err(|source| {
             failure(SatelleError {
                 code: ErrorCode::InvalidUsage,
@@ -805,7 +839,7 @@ fn setup_components(components: &[SetupComponent]) -> Result<Vec<String>, Satell
         .collect())
 }
 
-fn setup_mode(command: &SetupCommand) -> Result<String, SatelleError> {
+fn setup_mode(command: &SetupCommand, host_config: &HostConfig) -> Result<String, SatelleError> {
     if command.on_demand && command.persistent {
         return Err(SatelleError::invalid_usage(
             "--on-demand and --persistent cannot be combined",
@@ -818,7 +852,63 @@ fn setup_mode(command: &SetupCommand) -> Result<String, SatelleError> {
         return Ok("persistent".to_string());
     }
 
-    Ok("persistent".to_string())
+    Ok(host_config
+        .setup_mode
+        .unwrap_or(SetupMode::OnDemand)
+        .as_str()
+        .to_string())
+}
+
+fn setup_consent_recovery_command(
+    command: &SetupCommand,
+    profile: Option<&str>,
+    setup_mode: &str,
+    daemon_path_overrides: &DaemonPathOverrides,
+) -> String {
+    let mut arguments = vec!["satelle".to_string()];
+    if let Some(profile) = profile {
+        arguments.extend(["--profile".to_string(), shell_argument(profile)]);
+    }
+    arguments.push("setup".to_string());
+    if let Some(host) = command.host.as_deref() {
+        arguments.extend(["--host".to_string(), shell_argument(host)]);
+    }
+    arguments.push(if setup_mode == "persistent" {
+        "--persistent".to_string()
+    } else {
+        "--on-demand".to_string()
+    });
+    for component in &command.component {
+        arguments.extend(["--component".to_string(), component.as_str().to_string()]);
+    }
+    for path_override in daemon_path_overrides.entries() {
+        let flag = match path_override.environment_variable.as_str() {
+            "SATELLE_HOME" => "--daemon-home",
+            "SATELLE_CONFIG_FILE" => "--daemon-config-file",
+            "SATELLE_STATE_DIR" => "--daemon-state-dir",
+            "SATELLE_CACHE_DIR" => "--daemon-cache-dir",
+            "SATELLE_LOG_DIR" => "--daemon-log-dir",
+            _ => continue,
+        };
+        arguments.extend([flag.to_string(), shell_argument(&path_override.value)]);
+    }
+    arguments.extend([
+        "--no-input".to_string(),
+        "--json".to_string(),
+        "--yes".to_string(),
+    ]);
+    arguments.join(" ")
+}
+
+fn shell_argument(value: &str) -> String {
+    if value
+        .chars()
+        .all(|character| character.is_ascii_alphanumeric() || "-_./:".contains(character))
+    {
+        return value.to_string();
+    }
+
+    format!("'{}'", value.replace('\'', "'\"'\"'"))
 }
 
 fn validate_daemon_path(

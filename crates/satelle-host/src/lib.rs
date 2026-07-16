@@ -251,6 +251,11 @@ impl HostService {
         daemon_path_overrides: DaemonPathOverrides,
     ) -> Result<SetupReport, SatelleError> {
         ensure_local_demo(host)?;
+        if !dry_run {
+            return Err(SatelleError::not_implemented(format!(
+                "{setup_mode} setup mutations are not supported by the local Host transport"
+            )));
+        }
         match &self.mode {
             HostMode::Production { .. } => Ok(production_setup_report(
                 host,
