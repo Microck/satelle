@@ -1,0 +1,44 @@
+---
+title: Diagnose a Host
+description: Run focused probes, refresh readiness evidence, and gather logs safely.
+---
+
+Start with local configuration because it does not contact a Host:
+
+```sh
+satelle config check --all --json
+satelle config explain --host <alias> --json
+```
+
+Then run diagnostics:
+
+```sh
+satelle doctor --host <alias> --scope all --json
+```
+
+Use `--serial-probes` when deterministic one-at-a-time probing is useful. Use
+`--events` for an NDJSON event stream; validation and transport errors remain
+on stderr.
+
+## Refresh live readiness evidence
+
+`--refresh` is the explicit cache-mutation boundary. It reruns eligible live
+probes instead of reading the current cached verdict.
+
+```sh
+satelle doctor --host <alias> --scope computer-use --refresh --timeout 120s --json
+```
+
+The timeout requires an explicit unit such as `30s` or `2m`. Refresh does not
+perform setup, repair, service installation, or configuration changes.
+
+## Read normalized logs
+
+```sh
+satelle logs --host <alias> --level warn --tail 200 --json
+satelle logs --host <alias> --source codex_adapter --since 10m --json
+```
+
+Normal logs are designed for operational diagnosis and exclude raw provider
+secrets. Support bundle export is present in the command tree but is not
+implemented yet. Automatic repair and doctor fix flows are also unavailable.

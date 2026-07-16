@@ -1,0 +1,60 @@
+---
+title: Run and continue work
+description: Start, steer, inspect, stop, and read logs for durable Sessions.
+---
+
+## Start a Session
+
+Use attached mode for live lifecycle output:
+
+```sh
+satelle run --host local-demo --events human "Open the browser"
+```
+
+Use structured output for automation:
+
+```sh
+satelle run --host local-demo --json "Open the browser"
+```
+
+For a long task that another process will inspect later:
+
+```sh
+satelle run --host local-demo --detach --json "Prepare the workspace"
+```
+
+Save the returned `session_id`.
+
+## Continue the same Session
+
+`steer` starts a follow-up Turn on the same Session. It is not input injection
+into an already active Turn.
+
+```sh
+satelle steer <session_id> --host local-demo "Now open the settings page"
+```
+
+Only one nonterminal Turn may exist in a Session, so wait for the current Turn
+to finish before steering.
+
+## Inspect state and logs
+
+```sh
+satelle status <session_id> --host local-demo --json
+satelle logs --host local-demo --session <session_id> --tail 100 --json
+```
+
+Filter logs with repeatable `--source` values `host_daemon`, `storage`, or
+`codex_adapter`, and with `--level info|warn|error`. `--since` accepts an
+explicit duration or RFC 3339 time. `--after` resumes from an opaque log cursor
+and conflicts with `--tail` and `--since`.
+
+## Stop active work
+
+```sh
+satelle stop <session_id> --host local-demo --json
+```
+
+Stop targets the active Turn. It does not delete the Session or stop the Host
+Daemon. Treat the returned terminal state, not request acceptance, as proof
+that execution stopped.

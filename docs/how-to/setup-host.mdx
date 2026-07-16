@@ -1,0 +1,88 @@
+---
+title: Onboard a native Host
+description: Plan local setup, select a desktop, configure provider auth, and verify readiness.
+---
+
+## Check the local context
+
+```sh
+satelle config check --json
+satelle config explain --host local-demo --json
+satelle paths --json
+```
+
+Use the paths report instead of assuming an operating-system-specific config
+location.
+
+## Build a setup plan
+
+For an agent-safe plan that never prompts:
+
+```sh
+satelle setup --host local-demo --dry-run --no-input --json
+```
+
+Limit the plan when you are addressing one subsystem:
+
+```sh
+satelle setup --host local-demo --component desktop --dry-run --json
+satelle setup --host local-demo --component provider-auth --dry-run --no-input --json
+```
+
+Supported component values are `transport`, `host`, `codex`, `computer-use`,
+`desktop`, `provider-auth`, and `all`.
+
+## Choose how the Host runs
+
+Pass exactly one lifecycle mode when the default is not suitable:
+
+```sh
+satelle setup --host local-demo --on-demand --dry-run
+satelle setup --host local-demo --persistent --dry-run
+```
+
+The current setup command produces local Host plans. Applying those plans and
+remote setup over direct transport are not implemented yet, so `--yes` fails
+closed instead of reporting a mutation that did not occur.
+
+## Bind the visible desktop
+
+User configuration can set `desktop_user` and either a preference or a native
+selector. Do not set both a preference and a native selector for the same
+Host.
+
+```toml
+[hosts.local-demo]
+transport = "local"
+adapter = "codex"
+desktop_user = "operator"
+desktop_session_preference = "console"
+```
+
+Use `only` instead of `console` only when setup must fail rather than select
+another eligible session.
+
+## Configure provider authentication
+
+Store a Secret Source descriptor in user configuration. Do not put the secret
+value itself in the TOML file or command line.
+
+```toml
+[hosts.local-demo.provider_auth.openai]
+kind = "environment"
+variable = "OPENAI_API_KEY"
+```
+
+File, operating-system credential-store, and Host-store descriptors are also
+supported. See [Provider authentication](/docs/reference/provider-auth).
+
+## Verify the Host
+
+```sh
+satelle doctor --host local-demo --scope computer-use --refresh --json
+satelle host sessions --host local-demo --json
+satelle host status --host local-demo --json
+```
+
+`ready` means the live action-path probe succeeded on this Host. A binary,
+plugin, or feature flag alone is not proof of readiness.

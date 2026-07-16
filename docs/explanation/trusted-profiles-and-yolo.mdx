@@ -1,0 +1,39 @@
+---
+title: Trusted Profiles and YOLO
+description: Distinguish mutation consent from Turn execution policy and understand current availability.
+---
+
+Trusted Profiles and YOLO solve different problems.
+
+## YOLO is Turn execution policy
+
+YOLO sets the Codex approval policy to `never` and sandbox policy to
+`danger-full-access` for the selected Turn. It can come from a one-command
+`--yolo` flag or permitted Host-bound user configuration. `--no-yolo` wins for
+one command.
+
+```sh
+satelle run --host local-demo --yolo "Open the browser"
+```
+
+YOLO does not consent to Satelle setup, repair, service, update, or storage
+mutations. It also does not answer native app or operating-system prompts.
+
+Project configuration and `SATELLE_PROFILE` selection cannot activate YOLO.
+An explicitly selected user profile may activate it only when that profile
+binds the policy to an exact Host alias.
+
+## Trusted Profiles are planned mutation consent
+
+The intended Trusted Profile model grants noninteractive mutation consent only
+for explicit Host aliases and explicit mutation command families. It does not
+grant wildcard, all-host, project-host, or future-command authority.
+
+**Current status:** Trusted Profile schema and consent enforcement are not
+implemented in this release. Do not add guessed Trusted Profile TOML. Use
+interactive confirmation or the explicit per-command `--yes` boundary after
+reviewing the mutation plan.
+
+This distinction is deliberate: selecting a profile, choosing a Host, enabling
+YOLO, or approving one Codex callback must never silently authorize Host
+installation or configuration changes.

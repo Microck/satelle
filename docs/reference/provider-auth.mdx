@@ -1,0 +1,52 @@
+---
+title: Provider authentication
+description: Configure Host-resolved Secret Sources without exposing provider secrets.
+---
+
+Provider authentication belongs to the Host. User configuration stores only a
+descriptor that tells the Host where to resolve secret material.
+
+## Environment
+
+```toml
+[hosts.local-demo.provider_auth.openai]
+kind = "environment"
+variable = "OPENAI_API_KEY"
+```
+
+## Owner-only file
+
+```toml
+[hosts.local-demo.provider_auth.openai]
+kind = "file"
+path = "/absolute/path/to/openai-token"
+```
+
+## Operating-system credential store
+
+```toml
+[hosts.local-demo.provider_auth.openai]
+kind = "credential-store"
+service = "satelle"
+account = "openai"
+```
+
+## Host-managed store
+
+```toml
+[hosts.local-demo.provider_auth.openai]
+kind = "host-store"
+name = "openai-production"
+```
+
+Run a noninteractive setup plan to discover missing input without exposing a
+secret:
+
+```sh
+satelle setup --host local-demo --component provider-auth --dry-run --no-input --json
+```
+
+Raw secret values must not appear in command arguments, project configuration,
+logs, support artifacts, or agent conversation. `config explain` returns
+redacted descriptors by default. The explicit `--show-secret-references` flag
+shows descriptor locations and names, not the secret values they resolve.

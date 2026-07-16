@@ -2,11 +2,16 @@
   "name": "satelle-repository",
   "version": "0.1.0",
   "private": true,
+  "workspaces": [
+    "website"
+  ],
   "engines": {
-    "node": ">=18"
+    "node": ">=20.9.0"
   },
   "scripts": {
     "check:npm": "node --test npm/test/npm-distribution.test.cjs npm/test/package-managers.test.cjs",
+    "docs:build": "npm run build --workspace website",
+    "docs:dev": "npm run dev --workspace website",
     "test": "npm run check:npm",
     "test:npm": "npm run check:npm"
   }
