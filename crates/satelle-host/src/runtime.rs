@@ -32,11 +32,12 @@ use crate::process_identity::ProcessIdentity;
 use crate::storage::{
     AdmissionOutcome, ApiTokenRegistration, IdempotentOperation, LeaseOwner, LogPageStorageError,
     ObservedUpstreamRef, ReadinessProbeKind, ReadinessProbeTerminal, SensitiveRequestDigest,
-    SetupActionSkipReason, SetupRunPlan, SetupRunRecord, SetupRunStatus, Storage, StorageSnapshot,
+    SetupActionSkipReason, SetupRepairPlan, SetupRepairProbe, SetupRunPlan, SetupRunRecord,
+    SetupRunStatus, Storage, StorageSnapshot,
 };
 use crate::{ApiBearerToken, ApiPrincipal, DaemonLogPage, LogCursor, LogPageQuery};
 use recovery::RecoveryQueue;
-use satelle_core::session::{PublicSession, TurnAdmissionFailure};
+use satelle_core::session::{DesktopBindingRef, PublicSession, TurnAdmissionFailure};
 use satelle_core::{
     ControlPlaneOperation, ErrorCode, LOCAL_DEMO_HOST, SatelleError, SatelleEvent, SessionId,
     TurnId,
@@ -928,6 +929,17 @@ impl RuntimeHandle {
         self.engine()?
             .lock_storage()?
             .load_setup_run(run_id)
+            .map_err(model::storage_failure)
+    }
+
+    pub(crate) fn plan_setup_repair(
+        &self,
+        desktop_binding: Option<&DesktopBindingRef>,
+        probes: &[SetupRepairProbe],
+    ) -> Result<SetupRepairPlan, SatelleError> {
+        self.engine()?
+            .lock_storage()?
+            .plan_setup_repair(desktop_binding, probes)
             .map_err(model::storage_failure)
     }
 

@@ -1,7 +1,7 @@
 use super::*;
 use crate::storage::{
-    SetupActionPlan, SetupActionSkipReason, SetupActionStatus, SetupOperationKind, SetupRunPlan,
-    SetupRunStatus,
+    SetupActionPlan, SetupActionSkipReason, SetupActionStatus, SetupOperationKind,
+    SetupRepairDecision, SetupRepairPostcondition, SetupRepairProbe, SetupRunPlan, SetupRunStatus,
 };
 
 fn plan() -> SetupRunPlan {
@@ -9,10 +9,14 @@ fn plan() -> SetupRunPlan {
 }
 
 fn plan_with_run_id(run_id: &str) -> SetupRunPlan {
+    plan_with_run_id_and_binding(run_id, "desktop-binding-1")
+}
+
+fn plan_with_run_id_and_binding(run_id: &str, desktop_binding: &str) -> SetupRunPlan {
     SetupRunPlan::new(
         run_id,
         SetupOperationKind::Setup,
-        Some(DesktopBindingRef::new("desktop-binding-1").unwrap()),
+        Some(DesktopBindingRef::new(desktop_binding).unwrap()),
         at(1),
         vec![
             SetupActionPlan::new("install-codex", "Install Codex runtime", true).unwrap(),
@@ -296,6 +300,70 @@ fn restart_recovery_clamps_backward_clock_changes_to_durable_start_times() {
 }
 
 #[test]
+fn restart_closes_runs_interrupted_before_or_between_actions() {
+    let state = TempDir::new().expect("temporary state directory");
+    let (mut storage, _) = Storage::open(state.path()).expect("open storage");
+    storage
+        .begin_setup_run(&plan_with_run_id("before-first-action"))
+        .unwrap();
+    storage
+        .begin_setup_run(&plan_with_run_id_and_binding(
+            "between-actions",
+            "desktop-binding-2",
+        ))
+        .unwrap();
+    storage
+        .start_setup_action("between-actions", "install-codex", at(2))
+        .unwrap();
+    storage
+        .complete_setup_action_after_verified_postcondition(
+            "between-actions",
+            "install-codex",
+            at(3),
+        )
+        .unwrap();
+    drop(storage);
+
+    let (recovered, _) = Storage::open(state.path()).expect("restart recovery opens storage");
+    let before_first = recovered
+        .load_setup_run("before-first-action")
+        .unwrap()
+        .unwrap();
+    assert_eq!(SetupRunStatus::OutcomeUnknown, before_first.status());
+    assert!(
+        before_first
+            .actions()
+            .iter()
+            .all(|action| action.status() == SetupActionStatus::Planned)
+    );
+    let between = recovered
+        .load_setup_run("between-actions")
+        .unwrap()
+        .unwrap();
+    assert_eq!(SetupRunStatus::OutcomeUnknown, between.status());
+    assert_eq!(SetupActionStatus::Completed, between.actions()[0].status());
+    assert_eq!(SetupActionStatus::Planned, between.actions()[1].status());
+
+    let binding = DesktopBindingRef::new("desktop-binding-1").unwrap();
+    let repair = recovered
+        .plan_setup_repair(
+            Some(&binding),
+            &[SetupRepairProbe::try_new(
+                "install-codex",
+                "Install Codex runtime",
+                true,
+                SetupRepairPostcondition::Unsatisfied,
+            )
+            .unwrap()],
+        )
+        .expect("stale running rows no longer block repair planning");
+    assert_eq!(
+        SetupRepairDecision::RetryAutomatically,
+        repair.actions()[0].decision()
+    );
+}
+
+#[test]
 fn failed_actions_store_normalized_metadata_without_raw_stream_columns() {
     let state = TempDir::new().expect("temporary state directory");
     let (mut storage, _) = Storage::open(state.path()).expect("open storage");
@@ -416,4 +484,482 @@ fn malformed_persisted_action_references_are_stored_state_errors() {
         .load_setup_run("setup-run-1")
         .expect_err("malformed durable identifiers are storage corruption");
     assert_eq!(StorageErrorKind::InvalidStoredState, error.kind());
+}
+
+#[test]
+fn repair_waits_for_a_live_postcondition_before_retrying_outcome_unknown() {
+    let state = TempDir::new().expect("temporary state directory");
+    let (mut storage, _) = Storage::open(state.path()).expect("open storage");
+    let setup_plan = plan();
+    storage.begin_setup_run(&setup_plan).unwrap();
+    storage
+        .start_setup_action("setup-run-1", "install-codex", at(2))
+        .unwrap();
+    storage
+        .mark_interrupted_setup_actions_outcome_unknown(at(3))
+        .unwrap();
+
+    let unknown = storage
+        .plan_setup_repair(
+            setup_plan.desktop_binding(),
+            &[SetupRepairProbe::try_new(
+                "install-codex",
+                "Install Codex runtime",
+                true,
+                SetupRepairPostcondition::Unknown,
+            )
+            .unwrap()],
+        )
+        .unwrap();
+    assert_eq!(
+        SetupRepairDecision::ProbeRequired,
+        unknown.actions()[0].decision()
+    );
+
+    let satisfied = storage
+        .plan_setup_repair(
+            setup_plan.desktop_binding(),
+            &[SetupRepairProbe::try_new(
+                "install-codex",
+                "Install Codex runtime",
+                true,
+                SetupRepairPostcondition::Satisfied,
+            )
+            .unwrap()],
+        )
+        .unwrap();
+    assert_eq!(
+        SetupRepairDecision::NoActionRequired,
+        satisfied.actions()[0].decision()
+    );
+
+    let unsatisfied = storage
+        .plan_setup_repair(
+            setup_plan.desktop_binding(),
+            &[SetupRepairProbe::try_new(
+                "install-codex",
+                "Install Codex runtime",
+                true,
+                SetupRepairPostcondition::Unsatisfied,
+            )
+            .unwrap()],
+        )
+        .unwrap();
+    assert_eq!(
+        SetupRepairDecision::RetryAutomatically,
+        unsatisfied.actions()[0].decision()
+    );
+    assert_eq!(
+        Some(SetupActionStatus::OutcomeUnknown),
+        unsatisfied.actions()[0].previous_status()
+    );
+}
+
+#[test]
+fn repair_uses_the_durable_retry_safe_marker_for_incomplete_actions() {
+    let state = TempDir::new().expect("temporary state directory");
+    let (mut storage, _) = Storage::open(state.path()).expect("open storage");
+    let safe_run = SetupRunPlan::new(
+        "setup-run-safe",
+        SetupOperationKind::Setup,
+        None,
+        at(1),
+        vec![SetupActionPlan::new("install-codex", "Install Codex runtime", true).unwrap()],
+    )
+    .unwrap();
+    storage.begin_setup_run(&safe_run).unwrap();
+    storage
+        .start_setup_action("setup-run-safe", "install-codex", at(2))
+        .unwrap();
+    storage
+        .fail_setup_action(
+            "setup-run-safe",
+            "install-codex",
+            "installer-failed",
+            None,
+            None,
+            at(3),
+        )
+        .unwrap();
+    storage.finish_setup_run("setup-run-safe", at(4)).unwrap();
+
+    let unsafe_run = SetupRunPlan::new(
+        "setup-run-unsafe",
+        SetupOperationKind::Setup,
+        None,
+        at(5),
+        vec![
+            SetupActionPlan::new(
+                "configure-computer-use",
+                "Configure native Computer Use",
+                false,
+            )
+            .unwrap(),
+        ],
+    )
+    .unwrap();
+    storage.begin_setup_run(&unsafe_run).unwrap();
+    storage
+        .start_setup_action("setup-run-unsafe", "configure-computer-use", at(6))
+        .unwrap();
+    storage
+        .fail_setup_action(
+            "setup-run-unsafe",
+            "configure-computer-use",
+            "configuration-failed",
+            None,
+            None,
+            at(7),
+        )
+        .unwrap();
+    storage.finish_setup_run("setup-run-unsafe", at(8)).unwrap();
+
+    let repair = storage
+        .plan_setup_repair(
+            None,
+            &[
+                SetupRepairProbe::try_new(
+                    "install-codex",
+                    "Install Codex runtime",
+                    true,
+                    SetupRepairPostcondition::Unsatisfied,
+                )
+                .unwrap(),
+                // A caller cannot make a historically unsafe action automatic by
+                // changing its current probe declaration to retry-safe.
+                SetupRepairProbe::try_new(
+                    "configure-computer-use",
+                    "Configure native Computer Use",
+                    true,
+                    SetupRepairPostcondition::Unsatisfied,
+                )
+                .unwrap(),
+            ],
+        )
+        .unwrap();
+
+    assert_eq!(
+        SetupRepairDecision::RetryAutomatically,
+        repair.actions()[0].decision()
+    );
+    assert_eq!(
+        SetupRepairDecision::OperatorActionRequired,
+        repair.actions()[1].decision()
+    );
+    assert!(repair.actions()[0].retry_safe());
+    assert!(!repair.actions()[1].retry_safe());
+}
+
+#[test]
+fn repair_replans_from_live_probes_when_ledger_history_is_missing() {
+    let state = TempDir::new().expect("temporary state directory");
+    let (storage, _) = Storage::open(state.path()).expect("open storage");
+
+    let repair = storage
+        .plan_setup_repair(
+            None,
+            &[
+                SetupRepairProbe::try_new(
+                    "already-ready",
+                    "Already ready component",
+                    true,
+                    SetupRepairPostcondition::Satisfied,
+                )
+                .unwrap(),
+                SetupRepairProbe::try_new(
+                    "safe-missing-action",
+                    "Missing retry-safe component",
+                    true,
+                    SetupRepairPostcondition::Unsatisfied,
+                )
+                .unwrap(),
+                SetupRepairProbe::try_new(
+                    "unsafe-missing-action",
+                    "Missing unsafe component",
+                    false,
+                    SetupRepairPostcondition::Unsatisfied,
+                )
+                .unwrap(),
+            ],
+        )
+        .unwrap();
+
+    assert_eq!(3, repair.actions().len());
+    assert!(
+        repair
+            .actions()
+            .iter()
+            .all(|action| action.previous_status().is_none())
+    );
+    assert_eq!(
+        SetupRepairDecision::NoActionRequired,
+        repair.actions()[0].decision()
+    );
+    assert_eq!(
+        SetupRepairDecision::RetryAutomatically,
+        repair.actions()[1].decision()
+    );
+    assert_eq!(
+        SetupRepairDecision::OperatorActionRequired,
+        repair.actions()[2].decision()
+    );
+}
+
+#[test]
+fn repair_blocks_automatic_retry_while_a_compatible_run_is_active() {
+    let state = TempDir::new().expect("temporary state directory");
+    let (mut storage, _) = Storage::open(state.path()).expect("open storage");
+    let active_binding = DesktopBindingRef::new("active-desktop-binding").unwrap();
+    let other_binding = DesktopBindingRef::new("other-desktop-binding").unwrap();
+    let active = SetupRunPlan::new(
+        "active-run",
+        SetupOperationKind::Setup,
+        Some(active_binding.clone()),
+        at(1),
+        vec![SetupActionPlan::new("install-codex", "Install Codex runtime", false).unwrap()],
+    )
+    .unwrap();
+    storage.begin_setup_run(&active).unwrap();
+    storage
+        .start_setup_action("active-run", "install-codex", at(2))
+        .unwrap();
+    let probe = SetupRepairProbe::try_new(
+        "install-codex",
+        "Install Codex runtime",
+        true,
+        SetupRepairPostcondition::Unsatisfied,
+    )
+    .unwrap();
+
+    let error = storage
+        .plan_setup_repair(Some(&active_binding), std::slice::from_ref(&probe))
+        .expect_err("an active host mutation blocks repair planning");
+    assert_eq!(StorageErrorKind::StateConflict, error.kind());
+
+    let other_binding_plan = storage
+        .plan_setup_repair(Some(&other_binding), std::slice::from_ref(&probe))
+        .expect("an active run for another binding does not block repair");
+    assert_eq!(
+        SetupRepairDecision::RetryAutomatically,
+        other_binding_plan.actions()[0].decision()
+    );
+
+    storage
+        .connection_for_test()
+        .execute(
+            "UPDATE setup_runs
+             SET satelle_version = 'incompatible-version'
+             WHERE run_id = 'active-run'",
+            [],
+        )
+        .unwrap();
+    let other_version_plan = storage
+        .plan_setup_repair(Some(&active_binding), &[probe])
+        .expect("an active run from another version does not block repair");
+    assert_eq!(
+        SetupRepairDecision::RetryAutomatically,
+        other_version_plan.actions()[0].decision()
+    );
+}
+
+#[test]
+fn beginning_repair_atomically_reserves_compatible_scope() {
+    let state = TempDir::new().expect("temporary state directory");
+    let (mut storage, _) = Storage::open(state.path()).expect("open storage");
+    let binding = DesktopBindingRef::new("repair-desktop-binding").unwrap();
+    let other_binding = DesktopBindingRef::new("other-desktop-binding").unwrap();
+    let action = SetupActionPlan::new("install-codex", "Install Codex runtime", true).unwrap();
+    let first = SetupRunPlan::new(
+        "repair-run-1",
+        SetupOperationKind::Repair,
+        Some(binding.clone()),
+        at(1),
+        vec![action.clone()],
+    )
+    .unwrap();
+    let competing = SetupRunPlan::new(
+        "repair-run-2",
+        SetupOperationKind::Repair,
+        Some(binding.clone()),
+        at(2),
+        vec![action.clone()],
+    )
+    .unwrap();
+    let competing_setup = SetupRunPlan::new(
+        "setup-run-2",
+        SetupOperationKind::Setup,
+        Some(binding.clone()),
+        at(3),
+        vec![action.clone()],
+    )
+    .unwrap();
+    let other_scope = SetupRunPlan::new(
+        "repair-run-3",
+        SetupOperationKind::Repair,
+        Some(other_binding),
+        at(4),
+        vec![action],
+    )
+    .unwrap();
+    let probe = SetupRepairProbe::try_new(
+        "install-codex",
+        "Install Codex runtime",
+        true,
+        SetupRepairPostcondition::Unsatisfied,
+    )
+    .unwrap();
+
+    // Both callers can plan before either reserves the repair scope.
+    storage
+        .plan_setup_repair(Some(&binding), std::slice::from_ref(&probe))
+        .unwrap();
+    storage.plan_setup_repair(Some(&binding), &[probe]).unwrap();
+
+    storage.begin_setup_run(&first).unwrap();
+    let error = storage
+        .begin_setup_run(&competing)
+        .expect_err("the first repair run reserves its compatible scope");
+    assert_eq!(StorageErrorKind::StateConflict, error.kind());
+    let error = storage
+        .begin_setup_run(&competing_setup)
+        .expect_err("a setup run cannot bypass the repair reservation");
+    assert_eq!(StorageErrorKind::StateConflict, error.kind());
+    storage
+        .begin_setup_run(&other_scope)
+        .expect("another desktop binding has an independent repair scope");
+}
+
+#[test]
+fn repair_ignores_history_from_other_bindings_or_satelle_versions() {
+    let state = TempDir::new().expect("temporary state directory");
+    let (mut storage, _) = Storage::open(state.path()).expect("open storage");
+    let old_binding = DesktopBindingRef::new("old-desktop-binding").unwrap();
+    let current_binding = DesktopBindingRef::new("current-desktop-binding").unwrap();
+    let old_run = SetupRunPlan::new(
+        "old-scope-run",
+        SetupOperationKind::Setup,
+        Some(old_binding),
+        at(1),
+        vec![SetupActionPlan::new("install-codex", "Install Codex runtime", false).unwrap()],
+    )
+    .unwrap();
+    storage.begin_setup_run(&old_run).unwrap();
+    storage
+        .start_setup_action("old-scope-run", "install-codex", at(2))
+        .unwrap();
+    storage
+        .fail_setup_action(
+            "old-scope-run",
+            "install-codex",
+            "installer-failed",
+            None,
+            None,
+            at(3),
+        )
+        .unwrap();
+    storage.finish_setup_run("old-scope-run", at(4)).unwrap();
+    let probe = SetupRepairProbe::try_new(
+        "install-codex",
+        "Install Codex runtime",
+        true,
+        SetupRepairPostcondition::Unsatisfied,
+    )
+    .unwrap();
+
+    let other_binding = storage
+        .plan_setup_repair(Some(&current_binding), std::slice::from_ref(&probe))
+        .unwrap();
+    assert_eq!(
+        SetupRepairDecision::RetryAutomatically,
+        other_binding.actions()[0].decision()
+    );
+    assert_eq!(None, other_binding.actions()[0].previous_run_id());
+
+    storage
+        .connection_for_test()
+        .execute(
+            "UPDATE setup_runs
+             SET desktop_binding_ref = ?1, satelle_version = 'incompatible-version'
+             WHERE run_id = 'old-scope-run'",
+            [current_binding.as_str()],
+        )
+        .unwrap();
+    let other_version = storage
+        .plan_setup_repair(Some(&current_binding), &[probe])
+        .unwrap();
+    assert_eq!(
+        SetupRepairDecision::RetryAutomatically,
+        other_version.actions()[0].decision()
+    );
+    assert_eq!(None, other_version.actions()[0].previous_run_id());
+}
+
+#[test]
+fn repair_uses_each_actions_most_recent_retained_ledger_entry() {
+    let state = TempDir::new().expect("temporary state directory");
+    let (mut storage, _) = Storage::open(state.path()).expect("open storage");
+    let older = SetupRunPlan::new(
+        "setup-run-1",
+        SetupOperationKind::Setup,
+        None,
+        at(1),
+        vec![SetupActionPlan::new("install-codex", "Install Codex runtime", false).unwrap()],
+    )
+    .unwrap();
+    storage.begin_setup_run(&older).unwrap();
+    storage
+        .start_setup_action("setup-run-1", "install-codex", at(2))
+        .unwrap();
+    storage
+        .fail_setup_action(
+            "setup-run-1",
+            "install-codex",
+            "installer-failed",
+            None,
+            None,
+            at(3),
+        )
+        .unwrap();
+    storage.finish_setup_run("setup-run-1", at(4)).unwrap();
+
+    // The second run remains the newest ledger entry even if the wall clock
+    // moves backward between runs.
+    let newer = SetupRunPlan::new(
+        "setup-run-2",
+        SetupOperationKind::Repair,
+        None,
+        at(0),
+        vec![SetupActionPlan::new("install-codex", "Install Codex runtime", true).unwrap()],
+    )
+    .unwrap();
+    storage.begin_setup_run(&newer).unwrap();
+    storage
+        .start_setup_action("setup-run-2", "install-codex", at(6))
+        .unwrap();
+    storage
+        .complete_setup_action_after_verified_postcondition("setup-run-2", "install-codex", at(7))
+        .unwrap();
+    storage.finish_setup_run("setup-run-2", at(8)).unwrap();
+
+    let repair = storage
+        .plan_setup_repair(
+            None,
+            &[SetupRepairProbe::try_new(
+                "install-codex",
+                "Install Codex runtime",
+                true,
+                SetupRepairPostcondition::Unsatisfied,
+            )
+            .unwrap()],
+        )
+        .unwrap();
+    assert_eq!(
+        SetupRepairDecision::OperatorActionRequired,
+        repair.actions()[0].decision()
+    );
+    assert_eq!(Some("setup-run-2"), repair.actions()[0].previous_run_id());
+    assert_eq!(
+        Some(SetupActionStatus::Completed),
+        repair.actions()[0].previous_status()
+    );
 }

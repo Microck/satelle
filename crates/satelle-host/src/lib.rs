@@ -58,7 +58,8 @@ use std::sync::{Arc, RwLock, RwLockReadGuard};
 use std::time::Instant;
 pub use storage::{
     SetupActionPlan, SetupActionRecord, SetupActionSkipReason, SetupActionStatus,
-    SetupOperationKind, SetupRunPlan, SetupRunRecord, SetupRunStatus,
+    SetupOperationKind, SetupRepairAction, SetupRepairDecision, SetupRepairPlan,
+    SetupRepairPostcondition, SetupRepairProbe, SetupRunPlan, SetupRunRecord, SetupRunStatus,
 };
 #[cfg(any(test, feature = "test-support"))]
 use test_runtime::FakeComputerUseAdapter;
@@ -226,6 +227,16 @@ impl HostService {
 
     pub fn load_setup_run(&self, run_id: &str) -> Result<Option<SetupRunRecord>, SatelleError> {
         self.runtime.load_setup_run(run_id)
+    }
+
+    /// Plans repair from current live postconditions. Retained ledger records
+    /// contribute safety metadata when present but are not required.
+    pub fn plan_setup_repair(
+        &self,
+        desktop_binding: Option<&satelle_core::session::DesktopBindingRef>,
+        probes: &[SetupRepairProbe],
+    ) -> Result<SetupRepairPlan, SatelleError> {
+        self.runtime.plan_setup_repair(desktop_binding, probes)
     }
 
     /// Builds the only runtime available in normal and release builds. The
