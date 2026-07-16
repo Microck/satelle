@@ -303,8 +303,8 @@ fn a_control_lease_blocks_terminal_session_deletion() {
             "INSERT INTO control_leases (
                  host_identity_ref, desktop_binding_ref, operation_id,
                  owner_process_id, owner_process_start_ref, owner_boot_identity_ref,
-                 acquired_at, heartbeat_at, lease_state, session_id, turn_id
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7, 'active', ?8, ?9)",
+                 acquired_at, heartbeat_at, lease_state, owner_kind, session_id, turn_id
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7, 'active', 'turn', ?8, ?9)",
             params![
                 host_identity.as_str(),
                 "desktop-binding-1",

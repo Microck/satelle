@@ -15,6 +15,7 @@ mod stop;
 #[path = "runtime-worker.rs"]
 mod worker;
 
+use adapter::ProviderProbeDriver;
 pub use adapter::{
     AdapterPreflight, AdapterReadiness, AdapterSubject, ComputerUseAdapter, EvidenceError,
     ExecuteRequest, ExecuteResult, ProviderComputerUseIntent, ProviderSmokeEvidence,
@@ -29,8 +30,8 @@ use worker::{ExecutionPlan, TurnWork, WorkerRegistry};
 use crate::live_events::LiveEventHub;
 use crate::process_identity::ProcessIdentity;
 use crate::storage::{
-    AdmissionOutcome, ApiTokenRegistration, IdempotentOperation, LogPageStorageError,
-    SensitiveRequestDigest, Storage, StorageSnapshot,
+    AdmissionOutcome, ApiTokenRegistration, IdempotentOperation, LeaseOwner, LogPageStorageError,
+    ObservedUpstreamRef, ProviderProbeTerminal, SensitiveRequestDigest, Storage, StorageSnapshot,
 };
 use crate::{ApiBearerToken, ApiPrincipal, DaemonLogPage, LogCursor, LogPageQuery};
 use recovery::RecoveryQueue;
@@ -90,6 +91,34 @@ pub(crate) fn idempotency_conflict() -> SatelleError {
     model::idempotency_conflict()
 }
 
+fn provider_probe_terminal(
+    error: &SatelleError,
+    persistence_failed: bool,
+) -> ProviderProbeTerminal {
+    if persistence_failed {
+        return ProviderProbeTerminal::OutcomeUnknown;
+    }
+    match error
+        .details
+        .get("provider_smoke_cancellation")
+        .and_then(serde_json::Value::as_str)
+    {
+        Some("outcome_unknown" | "upstream_still_active") => ProviderProbeTerminal::OutcomeUnknown,
+        Some("confirmed") => ProviderProbeTerminal::TimedOut,
+        _ if error.code == ErrorCode::ProviderSmokeTestTimeout => ProviderProbeTerminal::TimedOut,
+        _ => ProviderProbeTerminal::Failed,
+    }
+}
+
+fn provider_probe_recovery_pending() -> SatelleError {
+    let mut error = SatelleError::computer_use_not_ready();
+    error.details.insert(
+        "reason".to_string(),
+        serde_json::Value::String("provider_probe_recovery_pending".to_string()),
+    );
+    error
+}
+
 #[cfg(test)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum RuntimeStartupState {
@@ -102,6 +131,7 @@ pub(crate) struct RuntimeEngine {
     // admission/read/commit sections only and is never held across adapter I/O.
     storage: Mutex<Storage>,
     adapter: Arc<dyn ComputerUseAdapter>,
+    provider_probe_driver: Option<Arc<dyn ProviderProbeDriver>>,
     recovery: Mutex<RecoveryQueue>,
     restart_recovery_initialized: Mutex<bool>,
     workers: Mutex<WorkerRegistry>,
@@ -137,6 +167,7 @@ impl RuntimeEngine {
     fn open(
         state_root: &Path,
         adapter: Arc<dyn ComputerUseAdapter>,
+        provider_probe_driver: Option<Arc<dyn ProviderProbeDriver>>,
     ) -> Result<Arc<Self>, SatelleError> {
         let process_identity =
             ProcessIdentity::current().map_err(model::process_identity_failure)?;
@@ -145,6 +176,7 @@ impl RuntimeEngine {
         Ok(Arc::new(Self {
             storage: Mutex::new(storage),
             adapter,
+            provider_probe_driver,
             recovery: Mutex::new(RecoveryQueue::new(Vec::new())),
             restart_recovery_initialized: Mutex::new(false),
             workers: Mutex::new(WorkerRegistry::default()),
@@ -312,6 +344,10 @@ impl RuntimeEngine {
         provider_intent: &ProviderComputerUseIntent,
     ) -> Result<AdapterReadiness, SatelleError> {
         let cache_key = self.adapter.readiness_cache_key(host, provider_intent)?;
+        if let (Some(key), Some(driver)) = (cache_key.as_ref(), self.provider_probe_driver.as_ref())
+        {
+            self.reconcile_provider_probe(key, driver.as_ref())?;
+        }
         let (cached, cached_provider) = if let Some(key) = cache_key.as_ref() {
             let now = time::OffsetDateTime::now_utc();
             let storage = self.lock_storage()?;
@@ -329,10 +365,80 @@ impl RuntimeEngine {
         } else {
             (None, None)
         };
-        match self
-            .adapter
-            .preflight_terminal(host, cached, cached_provider, provider_intent)
+        let requires_live_provider_probe = provider_intent.experimental()
+            && (provider_intent.refresh() || cached_provider.is_none());
+        let provider_probe_ref = if requires_live_provider_probe
+            && self.provider_probe_driver.is_some()
+            && let Some(key) = cache_key.as_ref()
         {
+            let provider_probe_ref = format!("provider-probe-{}", SessionId::new());
+            let now = time::OffsetDateTime::now_utc();
+            let owner = LeaseOwner::new(
+                provider_probe_ref.clone(),
+                self.process_identity.process_id(),
+                self.process_identity.process_start_ref(),
+                self.process_identity.boot_identity_ref(),
+                now,
+            )
+            .map_err(model::storage_failure)?;
+            self.lock_storage()?
+                .begin_provider_probe(key, &provider_probe_ref, &owner)
+                .map_err(model::storage_failure)?;
+            Some(provider_probe_ref)
+        } else {
+            None
+        };
+
+        let persistence_error = std::cell::RefCell::new(None);
+        let preflight = {
+            let mut persist_thread_ref = |value: &str| {
+                self.lock_storage()
+                    .and_then(|mut storage| {
+                        storage
+                            .persist_provider_probe_upstream_ref(
+                                provider_probe_ref.as_deref().unwrap_or_default(),
+                                ObservedUpstreamRef::thread(value)
+                                    .map_err(model::storage_failure)?,
+                            )
+                            .map_err(model::storage_failure)
+                    })
+                    .map_err(|error| {
+                        *persistence_error.borrow_mut() = Some(error);
+                    })
+            };
+            let mut persist_turn_ref = |value: &str| {
+                self.lock_storage()
+                    .and_then(|mut storage| {
+                        storage
+                            .persist_provider_probe_upstream_ref(
+                                provider_probe_ref.as_deref().unwrap_or_default(),
+                                ObservedUpstreamRef::turn(value).map_err(model::storage_failure)?,
+                            )
+                            .map_err(model::storage_failure)
+                    })
+                    .map_err(|error| {
+                        *persistence_error.borrow_mut() = Some(error);
+                    })
+            };
+            match self.provider_probe_driver.as_ref() {
+                Some(driver) if provider_probe_ref.is_some() => driver
+                    .preflight_terminal_with_provider_probe(
+                        host,
+                        cached,
+                        cached_provider,
+                        provider_intent,
+                        &mut persist_thread_ref,
+                        &mut persist_turn_ref,
+                    ),
+                _ => {
+                    self.adapter
+                        .preflight_terminal(host, cached, cached_provider, provider_intent)
+                }
+            }
+        };
+        let persistence_failed = persistence_error.into_inner().is_some();
+
+        match preflight {
             AdapterPreflight::Ready(readiness) => {
                 self.lock_storage()?
                     .store_preflight_successes(
@@ -343,6 +449,11 @@ impl RuntimeEngine {
                         readiness.provider_smoke_evidence(),
                     )
                     .map_err(model::storage_failure)?;
+                if let Some(provider_probe_ref) = provider_probe_ref.as_deref() {
+                    self.lock_storage()?
+                        .release_provider_probe(provider_probe_ref)
+                        .map_err(model::storage_failure)?;
+                }
                 Ok(readiness)
             }
             AdapterPreflight::Failed {
@@ -354,6 +465,11 @@ impl RuntimeEngine {
                 self.lock_storage()?
                     .store_preflight_failure(&key, &evidence, reason)
                     .map_err(model::storage_failure)?;
+                if let Some(provider_probe_ref) = provider_probe_ref.as_deref() {
+                    self.lock_storage()?
+                        .release_provider_probe(provider_probe_ref)
+                        .map_err(model::storage_failure)?;
+                }
                 Err(error)
             }
             AdapterPreflight::ProviderFailed {
@@ -362,12 +478,63 @@ impl RuntimeEngine {
                 failure,
                 error,
             } => {
-                self.lock_storage()?
-                    .store_provider_smoke_failure(&key, &readiness, &failure)
-                    .map_err(model::storage_failure)?;
+                if let Some(provider_probe_ref) = provider_probe_ref.as_deref() {
+                    let terminal = provider_probe_terminal(&error, persistence_failed);
+                    self.lock_storage()?
+                        .finish_provider_probe_failure(
+                            provider_probe_ref,
+                            &key,
+                            &readiness,
+                            &failure,
+                            terminal,
+                        )
+                        .map_err(model::storage_failure)?;
+                } else {
+                    self.lock_storage()?
+                        .store_provider_smoke_failure(&key, &readiness, &failure)
+                        .map_err(model::storage_failure)?;
+                }
                 Err(error)
             }
-            AdapterPreflight::UncachedFailure(error) => Err(error),
+            AdapterPreflight::UncachedFailure(error) => {
+                if let Some(provider_probe_ref) = provider_probe_ref.as_deref() {
+                    self.lock_storage()?
+                        .retain_provider_probe_recovery(provider_probe_ref)
+                        .map_err(model::storage_failure)?;
+                }
+                Err(error)
+            }
+        }
+    }
+
+    fn reconcile_provider_probe(
+        &self,
+        key: &ReadinessCacheKey,
+        driver: &dyn ProviderProbeDriver,
+    ) -> Result<(), SatelleError> {
+        let subject = {
+            let storage = self.lock_storage()?;
+            let host_identity = storage.host_identity().map_err(model::storage_failure)?;
+            storage
+                .pending_provider_probe(&host_identity, key.desktop_binding())
+                .map_err(model::storage_failure)?
+        };
+        let Some(subject) = subject else {
+            return Ok(());
+        };
+        if !subject.is_recovery_pending() {
+            return Err(provider_probe_recovery_pending());
+        }
+        match driver.observe_provider_probe(&subject) {
+            RecoveryObservation::Completed
+            | RecoveryObservation::Blocked
+            | RecoveryObservation::Failed => self
+                .lock_storage()?
+                .release_reconciled_provider_probe(subject.provider_probe_ref())
+                .map_err(model::storage_failure),
+            RecoveryObservation::Running | RecoveryObservation::Unknown => {
+                Err(provider_probe_recovery_pending())
+            }
         }
     }
 
@@ -533,6 +700,7 @@ struct LazyRuntime {
 #[derive(Clone)]
 pub(crate) struct RuntimeHandle {
     adapter: Arc<dyn ComputerUseAdapter>,
+    provider_probe_driver: Option<Arc<dyn ProviderProbeDriver>>,
     lazy: Arc<Mutex<LazyRuntime>>,
 }
 
@@ -545,12 +713,51 @@ impl std::fmt::Debug for RuntimeHandle {
 }
 
 impl RuntimeHandle {
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn new<A: ComputerUseAdapter>(
         state_root: Result<PathBuf, SatelleError>,
         adapter: A,
     ) -> Self {
         Self {
             adapter: Arc::new(adapter),
+            provider_probe_driver: None,
+            lazy: Arc::new(Mutex::new(LazyRuntime {
+                state_root,
+                engine: None,
+            })),
+        }
+    }
+
+    pub(crate) fn new_production(
+        state_root: Result<PathBuf, SatelleError>,
+        adapter: ProductionComputerUseAdapter,
+    ) -> Self {
+        let adapter = Arc::new(adapter);
+        let computer_use_adapter: Arc<dyn ComputerUseAdapter> = adapter.clone();
+        let provider_probe_driver: Arc<dyn ProviderProbeDriver> = adapter;
+        Self {
+            adapter: computer_use_adapter,
+            provider_probe_driver: Some(provider_probe_driver),
+            lazy: Arc::new(Mutex::new(LazyRuntime {
+                state_root,
+                engine: None,
+            })),
+        }
+    }
+
+    #[cfg(test)]
+    fn new_with_provider_probe_driver<A, D>(
+        state_root: Result<PathBuf, SatelleError>,
+        adapter: A,
+        provider_probe_driver: D,
+    ) -> Self
+    where
+        A: ComputerUseAdapter,
+        D: ProviderProbeDriver,
+    {
+        Self {
+            adapter: Arc::new(adapter),
+            provider_probe_driver: Some(Arc::new(provider_probe_driver)),
             lazy: Arc::new(Mutex::new(LazyRuntime {
                 state_root,
                 engine: None,
@@ -943,7 +1150,11 @@ impl RuntimeHandle {
             return Ok(Arc::clone(engine));
         }
         let state_root = lazy.state_root.clone()?;
-        let engine = RuntimeEngine::open(&state_root, Arc::clone(&self.adapter))?;
+        let engine = RuntimeEngine::open(
+            &state_root,
+            Arc::clone(&self.adapter),
+            self.provider_probe_driver.clone(),
+        )?;
         lazy.engine = Some(Arc::clone(&engine));
         Ok(engine)
     }

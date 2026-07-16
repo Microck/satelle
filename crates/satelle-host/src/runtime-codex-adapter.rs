@@ -1,8 +1,8 @@
 use super::adapter::{
     AdapterPreflight, AdapterReadiness, AdapterSubject, ComputerUseAdapter, ExecuteRequest,
-    ExecuteResult, ProviderComputerUseIntent, ProviderSmokeEvidence, ProviderSmokeFailureEvidence,
-    ProviderSmokeResult, ProviderSmokeSource, ReadinessCacheKey, ReadinessEvidence,
-    RecoveryObservation,
+    ExecuteResult, ProviderComputerUseIntent, ProviderProbeDriver, ProviderSmokeEvidence,
+    ProviderSmokeFailureEvidence, ProviderSmokeResult, ProviderSmokeSource, ReadinessCacheKey,
+    ReadinessEvidence, RecoveryObservation,
 };
 use crate::codex_session::{
     CodexApprovalPolicy, CodexSandboxPolicy, CodexSessionControl, CodexSessionError,
@@ -35,6 +35,11 @@ const PROVIDER_SMOKE_CANCELLATION_GRACE: Duration = Duration::from_secs(5);
 struct ProviderSmokeAttemptFailure {
     evidence: Option<ProviderSmokeFailureEvidence>,
     error: Box<SatelleError>,
+}
+
+struct ProviderProbePersistence<'a> {
+    persist_thread_ref: &'a mut dyn FnMut(&str) -> Result<(), ()>,
+    persist_turn_ref: &'a mut dyn FnMut(&str) -> Result<(), ()>,
 }
 
 /// The production adapter owns the private Codex app-server boundary. Native
@@ -198,12 +203,14 @@ impl ProductionComputerUseAdapter {
         cached_provider: Option<ProviderSmokeResult>,
         refresh_provider: bool,
         provider_smoke_timeout: Option<Duration>,
+        persistence: &mut ProviderProbePersistence<'_>,
     ) -> AdapterPreflight {
         match self.run_required_provider_smoke(
             key,
             cached_provider,
             refresh_provider,
             provider_smoke_timeout,
+            persistence,
         ) {
             Ok(provider_smoke_evidence) => AdapterReadiness::ready(
                 key.adapter(),
@@ -241,6 +248,7 @@ impl ProductionComputerUseAdapter {
         cached_provider: Option<ProviderSmokeResult>,
         refresh_provider: bool,
         provider_smoke_timeout: Option<Duration>,
+        persistence: &mut ProviderProbePersistence<'_>,
     ) -> AdapterPreflight {
         let observed_at = time::OffsetDateTime::now_utc();
         let Some(expires_at) = observed_at.checked_add(self.native_readiness_ttl) else {
@@ -265,6 +273,7 @@ impl ProductionComputerUseAdapter {
                 cached_provider,
                 refresh_provider,
                 provider_smoke_timeout,
+                persistence,
             ),
             Err(reason) => AdapterPreflight::Failed {
                 key,
@@ -327,6 +336,7 @@ impl ProductionComputerUseAdapter {
         cached_provider: Option<ProviderSmokeResult>,
         refresh: bool,
         timeout_override: Option<Duration>,
+        persistence: &mut ProviderProbePersistence<'_>,
     ) -> Result<Option<ProviderSmokeEvidence>, ProviderSmokeAttemptFailure> {
         if key
             .execution_policy()
@@ -352,7 +362,7 @@ impl ProductionComputerUseAdapter {
         } else {
             ProviderSmokeSource::Live
         };
-        self.run_live_provider_smoke(key, source, timeout_override)
+        self.run_live_provider_smoke(key, source, timeout_override, persistence)
             .map(Some)
             .map_err(|error| {
                 let observed_at = time::OffsetDateTime::now_utc();
@@ -395,6 +405,7 @@ impl ProductionComputerUseAdapter {
         key: &ReadinessCacheKey,
         source: ProviderSmokeSource,
         timeout_override: Option<Duration>,
+        persistence: &mut ProviderProbePersistence<'_>,
     ) -> Result<ProviderSmokeEvidence, SatelleError> {
         let timeout = timeout_override.unwrap_or(self.provider_smoke_timeout);
         let probe = crate::provider_probe::ProviderProbeSurface::start(timeout)
@@ -411,8 +422,6 @@ impl ProductionComputerUseAdapter {
         let prompt = format!(
             "Use native Computer Use only to open {page_url} in the approved visible browser. Read the nonce shown on the page, drag the marker into the drop target, and stop. Do not use shell, file, or network tools."
         );
-        let mut persist_thread = |_value: &str| Ok(());
-        let mut persist_turn = |_value: &str| Ok(());
         let run = run_codex_session_with_timeout_cancellation(
             crate::codex_capabilities::installed_app_server_command(),
             CodexSessionRequest {
@@ -427,8 +436,8 @@ impl ProductionComputerUseAdapter {
                 approval_policy: CodexApprovalPolicy::OnRequest,
                 sandbox_policy: CodexSandboxPolicy::WorkspaceWrite,
                 deadline,
-                persist_thread_ref: &mut persist_thread,
-                persist_turn_ref: &mut persist_turn,
+                persist_thread_ref: persistence.persist_thread_ref,
+                persist_turn_ref: persistence.persist_turn_ref,
                 control: None,
             },
             PROVIDER_SMOKE_CANCELLATION_GRACE,
@@ -532,6 +541,65 @@ impl ProductionComputerUseAdapter {
             },
         )
         .ok()
+    }
+
+    fn read_provider_probe_turn(
+        &self,
+        subject: &crate::storage::ProviderProbeRecoverySubject,
+    ) -> Option<CodexTurnStatus> {
+        let (Some(thread_ref), Some(turn_ref)) =
+            (subject.upstream_thread_ref(), subject.upstream_turn_ref())
+        else {
+            return None;
+        };
+        let working_directory = self
+            .working_directory
+            .as_ref()
+            .ok()
+            .and_then(|path| prepare_working_directory(path).ok())?;
+        let deadline = Instant::now().checked_add(Duration::from_secs(5))?;
+        read_codex_turn(
+            crate::codex_capabilities::installed_app_server_command(),
+            CodexTurnReadRequest {
+                working_directory: &working_directory,
+                thread_ref,
+                turn_ref,
+                deadline,
+            },
+        )
+        .ok()
+    }
+
+    fn preflight_terminal_inner(
+        &self,
+        provider_intent: &ProviderComputerUseIntent,
+        cached: Option<ReadinessEvidence>,
+        cached_provider: Option<ProviderSmokeResult>,
+        persistence: &mut ProviderProbePersistence<'_>,
+    ) -> AdapterPreflight {
+        let key = match self.native_readiness_key(provider_intent) {
+            Ok(key) => key,
+            Err(error) => return AdapterPreflight::UncachedFailure(error),
+        };
+        let cached_provider =
+            provider_cache_for_preflight(cached_provider, provider_intent.refresh());
+        match cached {
+            Some(evidence) => self.readiness_from_evidence(
+                &key,
+                evidence,
+                cached_provider,
+                provider_intent.refresh(),
+                provider_intent.provider_smoke_timeout(),
+                persistence,
+            ),
+            None => self.live_native_preflight(
+                key,
+                cached_provider,
+                provider_intent.refresh(),
+                provider_intent.provider_smoke_timeout(),
+                persistence,
+            ),
+        }
     }
 }
 
@@ -847,27 +915,13 @@ impl ComputerUseAdapter for ProductionComputerUseAdapter {
         cached_provider: Option<ProviderSmokeResult>,
         provider_intent: &ProviderComputerUseIntent,
     ) -> AdapterPreflight {
-        let key = match self.native_readiness_key(provider_intent) {
-            Ok(key) => key,
-            Err(error) => return AdapterPreflight::UncachedFailure(error),
+        let mut persist_thread_ref = |_value: &str| Ok(());
+        let mut persist_turn_ref = |_value: &str| Ok(());
+        let mut persistence = ProviderProbePersistence {
+            persist_thread_ref: &mut persist_thread_ref,
+            persist_turn_ref: &mut persist_turn_ref,
         };
-        let cached_provider =
-            provider_cache_for_preflight(cached_provider, provider_intent.refresh());
-        match cached {
-            Some(evidence) => self.readiness_from_evidence(
-                &key,
-                evidence,
-                cached_provider,
-                provider_intent.refresh(),
-                provider_intent.provider_smoke_timeout(),
-            ),
-            None => self.live_native_preflight(
-                key,
-                cached_provider,
-                provider_intent.refresh(),
-                provider_intent.provider_smoke_timeout(),
-            ),
-        }
+        self.preflight_terminal_inner(provider_intent, cached, cached_provider, &mut persistence)
     }
 
     fn execute(&self, request: ExecuteRequest<'_>) -> Result<ExecuteResult, SatelleError> {
@@ -949,6 +1003,37 @@ impl ComputerUseAdapter for ProductionComputerUseAdapter {
         });
         if let Some(control) = control {
             control.stop_committed();
+        }
+    }
+}
+
+impl ProviderProbeDriver for ProductionComputerUseAdapter {
+    fn preflight_terminal_with_provider_probe(
+        &self,
+        _host: &str,
+        cached: Option<ReadinessEvidence>,
+        cached_provider: Option<ProviderSmokeResult>,
+        provider_intent: &ProviderComputerUseIntent,
+        persist_thread_ref: &mut dyn FnMut(&str) -> Result<(), ()>,
+        persist_turn_ref: &mut dyn FnMut(&str) -> Result<(), ()>,
+    ) -> AdapterPreflight {
+        let mut persistence = ProviderProbePersistence {
+            persist_thread_ref,
+            persist_turn_ref,
+        };
+        self.preflight_terminal_inner(provider_intent, cached, cached_provider, &mut persistence)
+    }
+
+    fn observe_provider_probe(
+        &self,
+        subject: &crate::storage::ProviderProbeRecoverySubject,
+    ) -> RecoveryObservation {
+        match self.read_provider_probe_turn(subject) {
+            Some(CodexTurnStatus::InProgress) => RecoveryObservation::Running,
+            Some(
+                CodexTurnStatus::Completed | CodexTurnStatus::Interrupted | CodexTurnStatus::Failed,
+            ) => RecoveryObservation::Completed,
+            None => RecoveryObservation::Unknown,
         }
     }
 }
@@ -1246,6 +1331,12 @@ mod tests {
         )
         .unwrap()
         .with_source(ProviderSmokeSource::Cache);
+        let mut persist_thread_ref = |_value: &str| Ok(());
+        let mut persist_turn_ref = |_value: &str| Ok(());
+        let mut persistence = ProviderProbePersistence {
+            persist_thread_ref: &mut persist_thread_ref,
+            persist_turn_ref: &mut persist_turn_ref,
+        };
 
         assert_eq!(
             adapter
@@ -1254,6 +1345,7 @@ mod tests {
                     Some(ProviderSmokeResult::Passed(provider.clone())),
                     false,
                     None,
+                    &mut persistence,
                 )
                 .unwrap(),
             Some(provider)
@@ -1275,6 +1367,7 @@ mod tests {
                 Some(ProviderSmokeResult::Failed(provider_failure.clone())),
                 false,
                 None,
+                &mut persistence,
             )
             .expect_err("a cached provider failure remains a preflight blocker");
         assert!(cached_failure.evidence.is_none());

@@ -1,3 +1,4 @@
+use crate::storage::ProviderProbeRecoverySubject;
 use crate::storage::RecoverySubject;
 use satelle_core::session::{
     DesktopBindingRef, ExecutionPolicy, FeatureChoice, HostIdentityRef, SessionStateRevision,
@@ -270,6 +271,22 @@ pub enum ProviderSmokeSource {
     Cache,
     Live,
     Refresh,
+}
+
+pub(crate) trait ProviderProbeDriver: Send + Sync + 'static {
+    #[allow(clippy::too_many_arguments)]
+    fn preflight_terminal_with_provider_probe(
+        &self,
+        host: &str,
+        cached: Option<ReadinessEvidence>,
+        cached_provider: Option<ProviderSmokeResult>,
+        provider_intent: &ProviderComputerUseIntent,
+        persist_thread_ref: &mut dyn FnMut(&str) -> Result<(), ()>,
+        persist_turn_ref: &mut dyn FnMut(&str) -> Result<(), ()>,
+    ) -> AdapterPreflight;
+
+    fn observe_provider_probe(&self, subject: &ProviderProbeRecoverySubject)
+    -> RecoveryObservation;
 }
 
 impl ProviderSmokeSource {

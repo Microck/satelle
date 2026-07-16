@@ -7,12 +7,12 @@ use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
 
 #[test]
-fn operational_evidence_schema_is_migrated_atomically_to_version_four() {
+fn operational_evidence_schema_is_migrated_atomically_to_version_five() {
     let state = TempDir::new().expect("temporary state directory");
     let (storage, _) = Storage::open(state.path()).expect("open storage");
     let connection = storage.connection_for_test();
 
-    assert_eq!(4_i64, pragma_integer(connection, "user_version"));
+    assert_eq!(5_i64, pragma_integer(connection, "user_version"));
     let versions = connection
         .prepare("SELECT version FROM schema_migrations ORDER BY version")
         .unwrap()
@@ -20,7 +20,7 @@ fn operational_evidence_schema_is_migrated_atomically_to_version_four() {
         .unwrap()
         .collect::<Result<Vec<_>, _>>()
         .unwrap();
-    assert_eq!(vec![1_i64, 2_i64, 3_i64, 4_i64], versions);
+    assert_eq!(vec![1_i64, 2_i64, 3_i64, 4_i64, 5_i64], versions);
     for table in ["native_readiness_results", "provider_smoke_results"] {
         let exists: bool = connection
             .query_row(
@@ -35,6 +35,66 @@ fn operational_evidence_schema_is_migrated_atomically_to_version_four() {
 }
 
 #[test]
+fn provider_probe_control_lease_has_a_discriminated_durable_owner() {
+    let state = TempDir::new().expect("temporary state directory");
+    let (storage, _) = Storage::open(state.path()).expect("open storage");
+    let host = storage.host_identity().unwrap();
+    let connection = storage.connection_for_test();
+    let acquired_at = "2026-07-16T00:00:00Z";
+
+    connection
+        .execute(
+            "INSERT INTO control_leases (
+                host_identity_ref, desktop_binding_ref, operation_id,
+                owner_process_id, owner_process_start_ref, owner_boot_identity_ref,
+                acquired_at, heartbeat_at, lease_state, owner_kind, provider_probe_ref
+             ) VALUES (?1, 'desktop-provider', 'probe-operation', 1, 'process-start',
+                       'boot-id', ?2, ?2, 'active', 'provider_probe', 'probe-private-ref')",
+            rusqlite::params![host.as_str(), acquired_at],
+        )
+        .expect("provider probe lease");
+
+    let owner = connection
+        .query_row(
+            "SELECT owner_kind, session_id, turn_id, provider_probe_ref
+             FROM control_leases WHERE desktop_binding_ref = 'desktop-provider'",
+            [],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, String>(3)?,
+                ))
+            },
+        )
+        .unwrap();
+    assert_eq!(
+        (
+            "provider_probe".to_string(),
+            None,
+            None,
+            "probe-private-ref".to_string()
+        ),
+        owner
+    );
+
+    let invalid = connection.execute(
+        "INSERT INTO control_leases (
+            host_identity_ref, desktop_binding_ref, operation_id,
+            owner_process_id, owner_process_start_ref, owner_boot_identity_ref,
+            acquired_at, heartbeat_at, lease_state, owner_kind, provider_probe_ref, session_id
+         ) VALUES (?1, 'desktop-invalid', 'probe-invalid', 1, 'process-start', 'boot-id',
+                   ?2, ?2, 'active', 'provider_probe', 'probe-invalid-ref', 'session-invalid')",
+        rusqlite::params![host.as_str(), acquired_at],
+    );
+    assert!(
+        invalid.is_err(),
+        "mixed owner fields must violate the schema"
+    );
+}
+
+#[test]
 fn version_one_store_upgrades_without_replacing_existing_state() {
     let state = TempDir::new().expect("temporary state directory");
     let (storage, _) = Storage::open(state.path()).expect("open storage");
@@ -44,7 +104,7 @@ fn version_one_store_upgrades_without_replacing_existing_state() {
         .execute_batch(
             "DROP TABLE native_readiness_results;
              DROP TABLE provider_smoke_results;
-             DELETE FROM schema_migrations WHERE version IN (2, 3, 4);
+             DELETE FROM schema_migrations WHERE version IN (2, 3, 4, 5);
              PRAGMA user_version = 1;",
         )
         .unwrap();
@@ -53,7 +113,7 @@ fn version_one_store_upgrades_without_replacing_existing_state() {
     let (storage, _) = Storage::open(state.path()).expect("upgrade version one store");
     assert_eq!(expected_host, storage.host_identity().unwrap());
     assert_eq!(
-        4_i64,
+        5_i64,
         pragma_integer(storage.connection_for_test(), "user_version")
     );
 
@@ -140,7 +200,7 @@ fn assert_version_one_corruption_rejected_before_migration(
         .execute_batch(
             "DROP TABLE native_readiness_results;
              DROP TABLE provider_smoke_results;
-             DELETE FROM schema_migrations WHERE version IN (2, 3, 4);
+             DELETE FROM schema_migrations WHERE version IN (2, 3, 4, 5);
              PRAGMA user_version = 1;",
         )
         .expect("create a logically corrupt version one store");
@@ -192,7 +252,7 @@ fn failed_migration_rolls_back_partial_schema_and_preserves_existing_state() {
         .execute_batch(
             "DROP TABLE native_readiness_results;
              DROP TABLE provider_smoke_results;
-             DELETE FROM schema_migrations WHERE version IN (2, 3, 4);
+             DELETE FROM schema_migrations WHERE version IN (2, 3, 4, 5);
              PRAGMA user_version = 1;
              CREATE TABLE migration_sentinel (value TEXT NOT NULL) STRICT;
              INSERT INTO migration_sentinel (value) VALUES ('preserve-me');

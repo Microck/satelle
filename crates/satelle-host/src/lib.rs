@@ -200,7 +200,7 @@ impl HostService {
             provider_smoke_failure_ttl,
         );
         Self {
-            runtime: RuntimeHandle::new(state_root, adapter),
+            runtime: RuntimeHandle::new_production(state_root, adapter),
             operation_capacity: Arc::new(OperationCapacity::default()),
             mode: HostMode::Production { snapshot },
             bootstrap_auth: None,
