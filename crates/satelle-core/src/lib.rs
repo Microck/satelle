@@ -25,7 +25,9 @@ pub use control_plane::{
     ControlPlaneCapability, ControlPlaneCapabilitySet, ControlPlaneFailureReason,
     ControlPlaneOperation, IncompatibleControlPlaneDetails, IncompatibleControlPlaneDetailsError,
 };
-pub use direct_host_binding::{ApiTokenSource, DirectHostBinding, DirectHostBindingError};
+pub use direct_host_binding::{
+    ApiTokenSource, DirectHostBinding, DirectHostBindingError, SshHostBinding, SshHostBindingError,
+};
 pub use events::{
     EVENT_SCHEMA_VERSION, EventSource, EventStateSubject, EventSubject, EventType, SatelleEvent,
     SatelleEventBody, SatelleEventError,

@@ -3,8 +3,8 @@ use satelle_core::session::{PublicSession, TurnAdmissionFailure};
 use satelle_core::{
     ApiTokenSource, DaemonPathOverrides, DirectHostBinding, DoctorOptions, DoctorReport,
     HostSessionsReport, HostSessionsSchemaVersion, LOCAL_DEMO_HOST, SatelleError, SatelleEvent,
-    SessionId, SetupReport, StopResult, TransportKind, TurnId, read_owner_only_secret_file,
-    read_trusted_ca_bundle_file,
+    SessionId, SetupReport, SshHostBinding, StopResult, TransportKind, TurnId,
+    read_owner_only_secret_file, read_trusted_ca_bundle_file,
 };
 use satelle_host::{
     ApiBearerToken, DaemonLogPage, HostService, HostStatus, LogCursor, LogPageQuery,
@@ -14,10 +14,17 @@ use satelle_transport::{
     TurnRequest,
 };
 use std::sync::Arc;
+use std::time::Duration;
 use uuid::Uuid;
+
+const SSH_DAEMON_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[path = "direct-attached.rs"]
 mod direct_attached;
+#[path = "ssh-tunnel.rs"]
+mod ssh_tunnel;
+
+use ssh_tunnel::SshTunnel;
 
 #[cfg(feature = "test-support")]
 const TEST_SUPPORT_ADAPTER_ENV: &str = "SATELLE_TEST_SUPPORT_ADAPTER";
@@ -195,21 +202,50 @@ impl TransportClient for LocalTransport {
 
 struct DirectTransport {
     alias: String,
+    mode: &'static str,
     client: Arc<DaemonClient>,
     event_client: DaemonEventClient,
     event_runtime: tokio::runtime::Runtime,
+    // Fields drop in declaration order, so the tunnel outlives both clients.
+    _tunnel: Option<SshTunnel>,
 }
 
 impl DirectTransport {
     fn unsupported(&self, operation: &str) -> SatelleError {
         SatelleError::not_implemented(format!(
-            "direct transport for host '{}' does not yet support {operation}",
-            self.alias
+            "{} transport for host '{}' does not yet support {operation}",
+            self.mode, self.alias
         ))
     }
 
     fn idempotency_key() -> String {
         Uuid::now_v7().hyphenated().to_string()
+    }
+
+    pub(super) fn run_event_error(&self, error: DaemonEventError) -> SatelleError {
+        if self.mode == "direct" {
+            direct_run_event_error(&self.alias, error)
+        } else {
+            direct_event_error(&self.alias, error)
+        }
+    }
+
+    pub(super) fn run_admission_error(
+        &self,
+    ) -> fn(&str, DaemonClientError) -> TurnAdmissionFailure {
+        if self.mode == "direct" {
+            direct_run_admission_error
+        } else {
+            direct_admission_error
+        }
+    }
+
+    fn run_transport_error(&self, error: DaemonClientError) -> SatelleError {
+        if self.mode == "direct" {
+            direct_run_transport_error(&self.alias, error)
+        } else {
+            direct_transport_error(&self.alias, error)
+        }
     }
 }
 impl TransportClient for DirectTransport {
@@ -238,7 +274,7 @@ impl TransportClient for DirectTransport {
             .map_err(|error| direct_transport_error(&self.alias, error))?;
         Ok(HostStatus {
             running: true,
-            mode: "direct".to_string(),
+            mode: self.mode.to_string(),
             sessions: response.session_count(),
         })
     }
@@ -257,7 +293,7 @@ impl TransportClient for DirectTransport {
         Ok(HostSessionsReport {
             schema_version: HostSessionsSchemaVersion::V1,
             host: self.alias.clone(),
-            connection_mode: "direct".to_string(),
+            connection_mode: self.mode.to_string(),
             bootstrapped: false,
             bootstrap_actions: Vec::new(),
             host_daemon_version: capabilities.daemon_version().to_string(),
@@ -278,7 +314,7 @@ impl TransportClient for DirectTransport {
         self.client
             .create_session(request, &Self::idempotency_key())
             .map(|response| response.session().clone())
-            .map_err(|error| direct_run_transport_error(&self.alias, error))
+            .map_err(|error| self.run_transport_error(error))
     }
 
     fn steer(
@@ -352,9 +388,53 @@ fn direct_transport(host: &SelectedHost) -> Result<DirectTransport, SatelleError
         .map_err(|_| SatelleError::host_unreachable(&host.alias))?;
     Ok(DirectTransport {
         alias: host.alias.clone(),
+        mode: "direct",
         client,
         event_client,
         event_runtime,
+        _tunnel: None,
+    })
+}
+
+fn ssh_transport(host: &SelectedHost) -> Result<DirectTransport, SatelleError> {
+    let binding = SshHostBinding::from_host_config(&host.config)
+        .map_err(|error| SatelleError::config_error(error.to_string(), None))?;
+    let ApiTokenSource::File { path } = binding.api_token();
+    let raw_token = read_owner_only_secret_file(path)
+        .map_err(|error| SatelleError::config_error(error.to_string(), None))?;
+    let http_token = ApiBearerToken::parse(raw_token.as_str())
+        .map_err(|error| SatelleError::config_error(error.to_string(), None))?;
+    let event_token = ApiBearerToken::parse(raw_token.as_str())
+        .map_err(|error| SatelleError::config_error(error.to_string(), None))?;
+    let tunnel = SshTunnel::open(binding.destination())
+        .map_err(|_| SatelleError::host_unreachable(&host.alias))?;
+    let expected_host_identity = binding.expected_host_identity().to_string();
+    let client = Arc::new(
+        DaemonClient::loopback_with_timeout(
+            tunnel.local_addr(),
+            http_token,
+            &expected_host_identity,
+            SSH_DAEMON_REQUEST_TIMEOUT,
+        )
+        .map_err(|error| direct_transport_error(&host.alias, error))?,
+    );
+    client
+        .capabilities()
+        .map_err(|error| direct_transport_error(&host.alias, error))?;
+    let event_client =
+        DaemonEventClient::loopback(tunnel.local_addr(), event_token, expected_host_identity)
+            .map_err(|error| direct_event_error(&host.alias, error))?;
+    let event_runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|_| SatelleError::host_unreachable(&host.alias))?;
+    Ok(DirectTransport {
+        alias: host.alias.clone(),
+        mode: "ssh",
+        client,
+        event_client,
+        event_runtime,
+        _tunnel: Some(tunnel),
     })
 }
 
@@ -613,7 +693,9 @@ pub(crate) fn transport_for(host: &SelectedHost) -> Result<Box<dyn TransportClie
         TransportKind::Direct => direct_transport(host)
             .map(|transport| Box::new(transport) as _)
             .map_err(failure),
-        TransportKind::Ssh => Err(failure(SatelleError::host_unreachable(&host.alias))),
+        TransportKind::Ssh => ssh_transport(host)
+            .map(|transport| Box::new(transport) as _)
+            .map_err(failure),
     }
 }
 
