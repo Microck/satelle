@@ -12,8 +12,8 @@ use satelle_core::session::{
     TimeoutPolicy, TurnTransition,
 };
 use satelle_core::{
-    DaemonPathOverrides, DesktopSessionRecord, DoctorReport, EventSource, EventSubject, EventType,
-    SatelleError, SatelleEvent, SatelleEventBody, SetupReport,
+    DaemonPathOverrides, DesktopSessionRecord, DoctorOptions, DoctorReport, EventSource,
+    EventSubject, EventType, SatelleError, SatelleEvent, SatelleEventBody, SetupReport,
 };
 use serde_json::{Value, json};
 use time::OffsetDateTime;
@@ -23,10 +23,10 @@ impl HostService {
         &self,
         host: &str,
         scope: Option<&str>,
-        refresh: bool,
+        options: DoctorOptions,
         adapter: &FakeComputerUseAdapter,
     ) -> Result<DoctorReport, SatelleError> {
-        diagnostics::doctor(host, scope, refresh, adapter)
+        diagnostics::doctor(host, scope, options, adapter)
     }
 
     pub(super) fn setup_fake(

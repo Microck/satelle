@@ -3205,6 +3205,80 @@ fn doctor_refresh_timeout_updates_cache_metadata() {
 }
 
 #[test]
+fn doctor_timeout_requires_refresh_and_live_probe_scope() {
+    let state = state_dir();
+    satelle()
+        .env("SATELLE_STATE_DIR", state.path())
+        .args(["doctor", "--timeout", "30s", "--json"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            r#""code": "refresh-timeout-without-refresh""#,
+        ));
+
+    satelle()
+        .env("SATELLE_STATE_DIR", state.path())
+        .args([
+            "doctor",
+            "--scope",
+            "codex",
+            "--refresh",
+            "--timeout",
+            "30s",
+            "--json",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            r#""code": "refresh-timeout-without-refresh""#,
+        ));
+}
+
+#[test]
+fn doctor_refresh_requires_a_live_probe_scope() {
+    let state = state_dir();
+    satelle()
+        .env("SATELLE_STATE_DIR", state.path())
+        .args(["doctor", "--scope", "config", "--refresh", "--json"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            r#""code": "refresh-scope-required""#,
+        ));
+}
+
+#[test]
+fn doctor_timeout_must_be_positive() {
+    let state = state_dir();
+    satelle()
+        .env("SATELLE_STATE_DIR", state.path())
+        .args([
+            "doctor",
+            "--scope",
+            "computer-use",
+            "--refresh",
+            "--timeout",
+            "0s",
+            "--json",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "duration must use a positive number",
+        ));
+}
+
+#[test]
+fn doctor_serial_no_input_run_remains_noninteractive() {
+    let state = state_dir();
+    satelle()
+        .env("SATELLE_STATE_DIR", state.path())
+        .args(["doctor", "--serial-probes", "--no-input", "--json"])
+        .assert()
+        .success();
+}
+
+#[test]
 fn doctor_events_invalid_scope_emits_failed_terminal_event() {
     let state = state_dir();
     let output = satelle()

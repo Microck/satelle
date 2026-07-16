@@ -1,15 +1,15 @@
 use super::FakeComputerUseAdapter;
 use crate::runtime::ComputerUseAdapter;
 use satelle_core::{
-    DaemonPathOverrides, DoctorFinding, DoctorFixability, DoctorProbeResult, DoctorReport,
-    DoctorSchemaVersion, DoctorSummary, SatelleError, SetupReadinessSummary, SetupReport,
-    SetupSchemaVersion, utc_now,
+    DaemonPathOverrides, DoctorFinding, DoctorFixability, DoctorOptions, DoctorProbeResult,
+    DoctorReport, DoctorSchemaVersion, DoctorSummary, SatelleError, SetupReadinessSummary,
+    SetupReport, SetupSchemaVersion, utc_now,
 };
 
 pub(super) fn doctor(
     host: &str,
     scope: Option<&str>,
-    refresh: bool,
+    options: DoctorOptions,
     adapter: &FakeComputerUseAdapter,
 ) -> Result<DoctorReport, SatelleError> {
     let started_at = utc_now();
@@ -31,7 +31,7 @@ pub(super) fn doctor(
             summary: readiness.message().to_string(),
             evidence: vec![
                 format!("adapter={}", readiness.adapter()),
-                format!("refresh={refresh}"),
+                format!("refresh={}", options.refresh()),
                 "transport=local".to_string(),
                 format!("dependencies={}", probe.dependencies.join(",")),
             ],
@@ -44,7 +44,12 @@ pub(super) fn doctor(
             started_at: probe_started_at,
             finished_at: utc_now(),
             duration_ms: 0,
-            cache_status: if refresh { "refreshed" } else { "not_used" }.to_string(),
+            cache_status: if options.refresh() {
+                "refreshed"
+            } else {
+                "not_used"
+            }
+            .to_string(),
             dependency_status: "satisfied".to_string(),
             finding_ids: vec![finding_id],
         });
@@ -93,8 +98,8 @@ pub(super) fn doctor(
         ready: readiness.is_ready(),
         findings,
         recovery_commands,
-        changed: refresh,
-        cache_updates: if refresh {
+        changed: options.refresh(),
+        cache_updates: if options.refresh() {
             vec!["local-demo-readiness".to_string()]
         } else {
             Vec::new()

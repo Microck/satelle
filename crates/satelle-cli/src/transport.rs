@@ -1,9 +1,10 @@
 use crate::{CliFailure, SelectedHost, failure};
 use satelle_core::session::{PublicSession, TurnAdmissionFailure};
 use satelle_core::{
-    ApiTokenSource, DaemonPathOverrides, DirectHostBinding, DoctorReport, HostSessionsReport,
-    HostSessionsSchemaVersion, LOCAL_DEMO_HOST, SatelleError, SatelleEvent, SessionId, SetupReport,
-    StopResult, TransportKind, TurnId, read_owner_only_secret_file, read_trusted_ca_bundle_file,
+    ApiTokenSource, DaemonPathOverrides, DirectHostBinding, DoctorOptions, DoctorReport,
+    HostSessionsReport, HostSessionsSchemaVersion, LOCAL_DEMO_HOST, SatelleError, SatelleEvent,
+    SessionId, SetupReport, StopResult, TransportKind, TurnId, read_owner_only_secret_file,
+    read_trusted_ca_bundle_file,
 };
 use satelle_host::{
     ApiBearerToken, DaemonLogPage, HostService, HostStatus, LogCursor, LogPageQuery,
@@ -36,7 +37,11 @@ pub(crate) trait TransportClient {
         setup_components: Vec<String>,
         daemon_path_overrides: DaemonPathOverrides,
     ) -> Result<SetupReport, SatelleError>;
-    fn doctor(&self, scope: Option<&str>, refresh: bool) -> Result<DoctorReport, SatelleError>;
+    fn doctor(
+        &self,
+        scope: Option<&str>,
+        options: DoctorOptions,
+    ) -> Result<DoctorReport, SatelleError>;
     fn host_status(&self) -> Result<HostStatus, SatelleError>;
     fn host_sessions(&self, no_bootstrap: bool) -> Result<HostSessionsReport, SatelleError>;
     fn run(
@@ -89,8 +94,12 @@ impl TransportClient for LocalTransport {
         )
     }
 
-    fn doctor(&self, scope: Option<&str>, refresh: bool) -> Result<DoctorReport, SatelleError> {
-        self.service.doctor(&self.alias, scope, refresh)
+    fn doctor(
+        &self,
+        scope: Option<&str>,
+        options: DoctorOptions,
+    ) -> Result<DoctorReport, SatelleError> {
+        self.service.doctor(&self.alias, scope, options)
     }
 
     fn host_status(&self) -> Result<HostStatus, SatelleError> {
@@ -214,7 +223,11 @@ impl TransportClient for DirectTransport {
         Err(self.unsupported("setup"))
     }
 
-    fn doctor(&self, _scope: Option<&str>, _refresh: bool) -> Result<DoctorReport, SatelleError> {
+    fn doctor(
+        &self,
+        _scope: Option<&str>,
+        _options: DoctorOptions,
+    ) -> Result<DoctorReport, SatelleError> {
         Err(self.unsupported("doctor"))
     }
 

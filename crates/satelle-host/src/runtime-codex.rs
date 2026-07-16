@@ -177,7 +177,7 @@ impl super::CapabilityMatrix {
     }
 }
 
-pub(super) fn probe_installed_control_plane() -> ControlPlaneProbe {
+pub(super) fn probe_installed_control_plane(timeout: Option<Duration>) -> ControlPlaneProbe {
     let schema_command = |schema_dir: &Path| {
         let mut command = Command::new("codex");
         command
@@ -188,7 +188,7 @@ pub(super) fn probe_installed_control_plane() -> ControlPlaneProbe {
     probe_control_plane_with(
         schema_command,
         installed_app_server_command(),
-        PROBE_TIMEOUT,
+        timeout.unwrap_or(PROBE_TIMEOUT),
     )
 }
 

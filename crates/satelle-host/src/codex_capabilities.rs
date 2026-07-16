@@ -395,7 +395,7 @@ impl Phase0SupportVerdict {
 
 /// Collects the deliberately narrow evidence production can prove today. The
 /// version command's bytes are classified and dropped inside this module.
-pub(crate) fn discover_phase0() -> Phase0Discovery {
+pub(crate) fn discover_phase0(probe_timeout: Option<Duration>) -> Phase0Discovery {
     let host_platform = HostPlatform::current();
     if !host_platform.supports_native_computer_use() {
         return Phase0Discovery {
@@ -410,10 +410,10 @@ pub(crate) fn discover_phase0() -> Phase0Discovery {
         };
     }
 
-    let codex_version = probe_codex_version();
+    let codex_version = probe_codex_version(probe_timeout.unwrap_or(VERSION_PROBE_TIMEOUT));
     let (capabilities, control_plane_admission) = match codex_version {
         CodexVersionEvidence::Detected { version } if version == REQUIRED_CODEX_VERSION => {
-            let probe = control_plane::probe_installed_control_plane();
+            let probe = control_plane::probe_installed_control_plane(probe_timeout);
             (
                 CapabilityMatrix::from_control_plane(probe),
                 control_plane::ControlPlaneAdmission::from_probe(probe),
@@ -456,7 +456,7 @@ pub(crate) fn discover_phase0() -> Phase0Discovery {
 
 #[cfg(all(test, target_os = "linux"))]
 pub(crate) fn discover_phase0_evidence() -> Phase0CapabilityEvidence {
-    discover_phase0().evidence
+    discover_phase0(None).evidence
 }
 
 /// Evaluates the complete Phase 0 capability contract. The evaluator reports
@@ -559,10 +559,10 @@ fn blocker_for(
     }
 }
 
-fn probe_codex_version() -> CodexVersionEvidence {
+fn probe_codex_version(timeout: Duration) -> CodexVersionEvidence {
     let mut command = Command::new("codex");
     command.arg("--version");
-    probe_codex_version_command(command, VERSION_PROBE_TIMEOUT)
+    probe_codex_version_command(command, timeout)
 }
 
 fn probe_codex_version_command(mut command: Command, timeout: Duration) -> CodexVersionEvidence {

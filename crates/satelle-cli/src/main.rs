@@ -17,9 +17,9 @@ use satelle_core::session::{
 };
 use satelle_core::{
     BEACON_CORAL, CLI_NAME, DaemonPathOverrides, DesktopSessionPreference, DoctorEventRecord,
-    DoctorReport, ERROR_RED, ErrorCode, EventSource, EventType, HostConfig, HostSessionsReport,
-    LOCAL_DEMO_HOST, PRODUCT_NAME, ProfileField, RELAY_ROSE, ResolvedConfig, SUCCESS_GREEN,
-    SatelleError, SatelleEvent, SatelleEventBody, SessionId, SetupMode, SetupReport,
+    DoctorOptions, DoctorReport, ERROR_RED, ErrorCode, EventSource, EventType, HostConfig,
+    HostSessionsReport, LOCAL_DEMO_HOST, PRODUCT_NAME, ProfileField, RELAY_ROSE, ResolvedConfig,
+    SUCCESS_GREEN, SatelleError, SatelleEvent, SatelleEventBody, SessionId, SetupMode, SetupReport,
     SetupRequiredInput, load_config, resolve_path_set, utc_now,
 };
 use satelle_host::HostService;
@@ -956,11 +956,35 @@ fn run_doctor(
             command.scope.as_deref(),
         );
     }
-    if let Some(timeout) = &command.timeout
-        && let Err(error) = parse_duration_ms(timeout)
+    let timeout = match command
+        .timeout
+        .as_deref()
+        .map(parse_duration_ms)
+        .transpose()
+    {
+        Ok(timeout) => timeout.map(std::time::Duration::from_millis),
+        Err(error) => {
+            return fail_doctor(
+                failure(error),
+                command.events,
+                target_hint,
+                command.scope.as_deref(),
+            );
+        }
+    };
+    if timeout.is_some()
+        && (!command.refresh || !doctor_scope_supports_refresh(command.scope.as_deref()))
     {
         return fail_doctor(
-            failure(error),
+            failure(SatelleError::doctor_refresh_timeout_without_refresh()),
+            command.events,
+            target_hint,
+            command.scope.as_deref(),
+        );
+    }
+    if command.refresh && !doctor_scope_supports_refresh(command.scope.as_deref()) {
+        return fail_doctor(
+            failure(SatelleError::doctor_refresh_scope_required()),
             command.events,
             target_hint,
             command.scope.as_deref(),
@@ -989,7 +1013,8 @@ fn run_doctor(
             );
         }
     };
-    let report = match transport.doctor(command.scope.as_deref(), command.refresh) {
+    let options = DoctorOptions::new(command.refresh, timeout);
+    let report = match transport.doctor(command.scope.as_deref(), options) {
         Ok(report) => report,
         Err(error) => {
             return fail_doctor(
@@ -1001,8 +1026,6 @@ fn run_doctor(
         }
     };
 
-    let _serial_probes = command.serial_probes;
-    let _no_input = command.no_input;
     let readiness_error = if report.summary.ready {
         None
     } else {
@@ -1081,30 +1104,35 @@ fn validate_doctor_scope(scope: Option<&str>) -> Result<(), CliFailure> {
     ))))
 }
 
+fn doctor_scope_supports_refresh(scope: Option<&str>) -> bool {
+    matches!(scope, None | Some("computer-use" | "provider" | "all"))
+}
+
 fn parse_duration_ms(value: &str) -> Result<u64, SatelleError> {
     if let Some(ms) = value.strip_suffix("ms") {
-        return ms
-            .parse::<u64>()
-            .map_err(|_| SatelleError::invalid_usage("duration must use a positive number"));
+        return parse_positive_duration(ms, 1);
     }
 
     if let Some(seconds) = value.strip_suffix('s') {
-        return seconds
-            .parse::<u64>()
-            .map(|seconds| seconds.saturating_mul(1_000))
-            .map_err(|_| SatelleError::invalid_usage("duration must use a positive number"));
+        return parse_positive_duration(seconds, 1_000);
     }
 
     if let Some(minutes) = value.strip_suffix('m') {
-        return minutes
-            .parse::<u64>()
-            .map(|minutes| minutes.saturating_mul(60_000))
-            .map_err(|_| SatelleError::invalid_usage("duration must use a positive number"));
+        return parse_positive_duration(minutes, 60_000);
     }
 
     Err(SatelleError::invalid_usage(
         "duration values require an explicit unit such as 500ms, 30s, or 2m",
     ))
+}
+
+fn parse_positive_duration(value: &str, multiplier: u64) -> Result<u64, SatelleError> {
+    value
+        .parse::<u64>()
+        .ok()
+        .filter(|value| *value > 0)
+        .and_then(|value| value.checked_mul(multiplier))
+        .ok_or_else(|| SatelleError::invalid_usage("duration must use a positive number"))
 }
 
 fn print_doctor_events(
