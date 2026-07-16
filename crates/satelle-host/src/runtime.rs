@@ -18,8 +18,8 @@ mod worker;
 pub use adapter::{
     AdapterPreflight, AdapterReadiness, AdapterSubject, ComputerUseAdapter, EvidenceError,
     ExecuteRequest, ExecuteResult, ProviderComputerUseIntent, ProviderSmokeEvidence,
-    ProviderSmokeFailureEvidence, ProviderSmokeResult, ReadinessCacheKey, ReadinessEvidence,
-    RecoveryObservation,
+    ProviderSmokeFailureEvidence, ProviderSmokeResult, ProviderSmokeSource, ReadinessCacheKey,
+    ReadinessEvidence, RecoveryObservation,
 };
 pub(crate) use codex_adapter::ProductionComputerUseAdapter;
 pub(crate) use request::{RequestIdentity, RunCommand, SteerCommand, StopCommand};
@@ -229,15 +229,17 @@ impl RuntimeEngine {
             &command.identity,
             &self.process_identity,
         )?;
-        let outcome = {
+        let (outcome, provider_smoke_event) = {
             let mut storage = self.lock_storage()?;
             let outcome = storage
                 .begin_session(&initial, &context)
                 .map_err(model::storage_failure)?;
+            let mut provider_smoke_event = None;
             if let AdmissionOutcome::Execute { session, .. } = &outcome {
                 self.publish_committed_turn(session, &turn_id);
+                provider_smoke_event = self.publish_provider_smoke(&readiness, session, &turn_id);
             }
-            outcome
+            (outcome, provider_smoke_event)
         };
         self.finish_admission(
             command.host,
@@ -245,6 +247,7 @@ impl RuntimeEngine {
             command.execution_mode,
             command.dispatch,
             outcome,
+            provider_smoke_event,
         )
     }
 
@@ -274,7 +277,7 @@ impl RuntimeEngine {
             &command.identity,
             &self.process_identity,
         )?;
-        let outcome = {
+        let (outcome, provider_smoke_event) = {
             let mut storage = self.lock_storage()?;
             let outcome = storage
                 .begin_follow_up(
@@ -287,10 +290,12 @@ impl RuntimeEngine {
                     &context,
                 )
                 .map_err(model::storage_failure)?;
+            let mut provider_smoke_event = None;
             if let AdmissionOutcome::Execute { session, .. } = &outcome {
                 self.publish_committed_turn(session, &turn_id);
+                provider_smoke_event = self.publish_provider_smoke(&readiness, session, &turn_id);
             }
-            outcome
+            (outcome, provider_smoke_event)
         };
         self.finish_admission(
             LOCAL_DEMO_HOST,
@@ -298,6 +303,7 @@ impl RuntimeEngine {
             command.execution_mode,
             command.dispatch,
             outcome,
+            provider_smoke_event,
         )
     }
 
@@ -394,6 +400,7 @@ impl RuntimeEngine {
         execution_mode: satelle_core::session::TurnExecutionMode,
         dispatch_preference: request::DispatchPreference,
         outcome: AdmissionOutcome,
+        provider_smoke_event: Option<satelle_core::SatelleEventBody>,
     ) -> Result<RuntimeTurnOutcome, SatelleError> {
         match outcome {
             AdmissionOutcome::InProgress(session) | AdmissionOutcome::Complete(session) => {
@@ -413,6 +420,7 @@ impl RuntimeEngine {
                     prompt: prompt.to_string(),
                     execution_mode,
                     work,
+                    provider_smoke_event,
                 };
                 match dispatch_preference {
                     request::DispatchPreference::Inline => self.execute(plan),

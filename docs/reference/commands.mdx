@@ -41,6 +41,12 @@ are running. Pre-release commands may change before the first stable release.
 The prompt can be an argument or `-` for stdin. `steer`, `status`, and `stop`
 take a public `session_id` positional argument.
 
+When experimental provider Computer Use is enabled, attached `run` and `steer`
+JSON results include `provider_smoke` with `status`, `source`, `observed_at`,
+`expires_at`, and `age_ms`. The source is `live`, `cache`, or `refresh`.
+`--refresh-provider-smoke-test` forces `refresh` before prompt execution.
+Provider fingerprints, prompts, transcripts, and desktop content are excluded.
+
 ## Doctor options
 
 `doctor` accepts `--host`, `--scope`, `--refresh`, `--timeout`,

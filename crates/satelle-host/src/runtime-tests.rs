@@ -78,6 +78,33 @@ fn blocked_preflight_opens_authoritative_state_without_admitting_work() {
 }
 
 #[test]
+fn provider_smoke_preflight_event_reports_safe_live_provenance() {
+    let state = crate::TestStateDir::new().expect("temporary state directory should exist");
+    let runtime = RuntimeHandle::new(Ok(state.path().to_path_buf()), FakeComputerUseAdapter);
+
+    let outcome = runtime
+        .run(RunCommand::attached(
+            LOCAL_DEMO_HOST,
+            "PRIVATE_PROVIDER_PROVENANCE_CANARY",
+        ))
+        .expect("fake provider preflight and Turn should succeed");
+    let provider = outcome
+        .events
+        .first()
+        .expect("provider preflight should be the first attached event");
+
+    assert_eq!(provider.seq(), 1);
+    assert_eq!(provider.event_type(), EventType::ProviderSmoke);
+    assert_eq!(provider.data()["status"], "passed");
+    assert_eq!(provider.data()["source"], "live");
+    assert!(provider.data()["observed_at"].is_string());
+    assert!(provider.data()["expires_at"].is_string());
+    assert!(provider.data()["age_ms"].is_u64());
+    assert!(provider.data().get("provider_config_fingerprint").is_none());
+    assert_eq!(outcome.events[1].seq(), 2);
+}
+
+#[test]
 fn reads_and_stop_remain_available_during_slow_execution_and_stop_observation() {
     let state = crate::TestStateDir::new().expect("temporary state directory should exist");
     let adapter = BlockingExecutionAndStopAdapter::default();

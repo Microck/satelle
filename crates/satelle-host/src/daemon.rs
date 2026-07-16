@@ -971,10 +971,17 @@ mod tests {
                 .collect::<Vec<_>>(),
             [
                 satelle_core::EventType::TurnStarted,
+                satelle_core::EventType::ProviderSmoke,
                 satelle_core::EventType::TurnProgress,
                 satelle_core::EventType::TurnCompleted,
             ]
         );
+        let provider = events
+            .iter()
+            .find(|event| event.event_type() == satelle_core::EventType::ProviderSmoke)
+            .expect("provider preflight event should be live");
+        assert_eq!(provider.data()["source"], "live");
+        assert_eq!(provider.data()["status"], "passed");
         assert!(events.iter().all(|event| {
             event.session_id() == Some(admitted.session_id())
                 && matches!(

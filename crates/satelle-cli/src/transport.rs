@@ -67,6 +67,7 @@ const TEST_SUPPORT_ADAPTER_ENV: &str = "SATELLE_TEST_SUPPORT_ADAPTER";
 pub(crate) struct AttachedTurnOutcome {
     pub(crate) session: PublicSession,
     pub(crate) turn_id: TurnId,
+    pub(crate) provider_smoke: Option<serde_json::Value>,
 }
 
 /// The command surface is intentionally exhaustive. A new transport operation
@@ -166,7 +167,11 @@ impl TransportClient for LocalTransport {
             .expect("an admitted local run always contains its target Turn")
             .turn_id()
             .clone();
+        let mut provider_smoke = None;
         for event in outcome.events {
+            if event.event_type() == satelle_core::EventType::ProviderSmoke {
+                provider_smoke = Some(event.data().clone());
+            }
             on_event(event).map_err(|error| {
                 TurnAdmissionFailure::admitted(error, outcome.session.clone(), turn_id.clone())
             })?;
@@ -174,6 +179,7 @@ impl TransportClient for LocalTransport {
         Ok(AttachedTurnOutcome {
             session: outcome.session,
             turn_id,
+            provider_smoke,
         })
     }
 
@@ -197,7 +203,11 @@ impl TransportClient for LocalTransport {
             .expect("an admitted local steer always contains its target Turn")
             .turn_id()
             .clone();
+        let mut provider_smoke = None;
         for event in outcome.events {
+            if event.event_type() == satelle_core::EventType::ProviderSmoke {
+                provider_smoke = Some(event.data().clone());
+            }
             on_event(event).map_err(|error| {
                 TurnAdmissionFailure::admitted(error, outcome.session.clone(), turn_id.clone())
             })?;
@@ -205,6 +215,7 @@ impl TransportClient for LocalTransport {
         Ok(AttachedTurnOutcome {
             session: outcome.session,
             turn_id,
+            provider_smoke,
         })
     }
 

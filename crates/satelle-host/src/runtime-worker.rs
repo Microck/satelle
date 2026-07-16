@@ -3,7 +3,7 @@ use super::adapter::{AdapterSubject, ExecuteRequest, UpstreamReference};
 use super::{RuntimeEngine, model};
 use crate::storage::{ObservedUpstreamRef, RecoverySubject, StorageErrorKind};
 use satelle_core::session::{ExpectedRevisions, Session, TurnExecutionMode, TurnTransition};
-use satelle_core::{SatelleError, SessionId, TurnId};
+use satelle_core::{SatelleError, SatelleEvent, SessionId, TurnId};
 use std::sync::Arc;
 #[cfg(test)]
 use std::sync::Mutex;
@@ -20,6 +20,7 @@ pub(super) struct ExecutionPlan {
     pub(super) prompt: String,
     pub(super) execution_mode: TurnExecutionMode,
     pub(super) work: TurnWork,
+    pub(super) provider_smoke_event: Option<satelle_core::SatelleEventBody>,
 }
 
 #[derive(Default)]
@@ -166,7 +167,7 @@ impl RuntimeEngine {
             model::monotonic_now(&plan.work.session),
         )?;
         let events = if execution_committed {
-            result.into_events()
+            prepend_provider_smoke_event(plan.provider_smoke_event, result.into_events())?
         } else {
             Vec::new()
         };
@@ -257,6 +258,23 @@ impl RuntimeEngine {
             }
         }
     }
+}
+
+fn prepend_provider_smoke_event(
+    provider_smoke_event: Option<satelle_core::SatelleEventBody>,
+    events: Vec<SatelleEvent>,
+) -> Result<Vec<SatelleEvent>, SatelleError> {
+    let Some(provider_smoke_event) = provider_smoke_event else {
+        return Ok(events);
+    };
+    std::iter::once(provider_smoke_event)
+        .chain(events.into_iter().map(SatelleEvent::into_body))
+        .enumerate()
+        .map(|(index, body)| {
+            body.with_seq(u64::try_from(index + 1).expect("event count fits in u64"))
+                .map_err(|_| model::integrity_failure("runtime event sequence is invalid"))
+        })
+        .collect()
 }
 
 #[cfg(test)]
