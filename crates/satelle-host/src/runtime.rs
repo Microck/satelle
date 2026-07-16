@@ -792,6 +792,17 @@ impl RuntimeHandle {
         self.engine()?.has_reusable_readiness(host)
     }
 
+    /// Runs readiness preflight without admitting a Session or Turn. Doctor
+    /// uses this path so a provider refresh updates the normal Host cache but
+    /// can never cross into prompt execution.
+    pub(crate) fn refresh_provider_smoke(
+        &self,
+        host: &str,
+        provider_intent: &ProviderComputerUseIntent,
+    ) -> Result<AdapterReadiness, SatelleError> {
+        self.engine()?.preflight(host, provider_intent)
+    }
+
     pub(crate) fn daemon_workers_idle(&self) -> Result<bool, SatelleError> {
         self.engine()?.reap_finished_workers()
     }

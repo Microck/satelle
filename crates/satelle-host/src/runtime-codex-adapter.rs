@@ -195,8 +195,14 @@ impl ProductionComputerUseAdapter {
         evidence: ReadinessEvidence,
         cached_provider: Option<ProviderSmokeResult>,
         refresh_provider: bool,
+        provider_smoke_timeout: Option<Duration>,
     ) -> AdapterPreflight {
-        match self.run_required_provider_smoke(key, cached_provider, refresh_provider) {
+        match self.run_required_provider_smoke(
+            key,
+            cached_provider,
+            refresh_provider,
+            provider_smoke_timeout,
+        ) {
             Ok(provider_smoke_evidence) => AdapterReadiness::ready(
                 key.adapter(),
                 "native Computer Use passed the Host action-path smoke test",
@@ -232,6 +238,7 @@ impl ProductionComputerUseAdapter {
         key: ReadinessCacheKey,
         cached_provider: Option<ProviderSmokeResult>,
         refresh_provider: bool,
+        provider_smoke_timeout: Option<Duration>,
     ) -> AdapterPreflight {
         let observed_at = time::OffsetDateTime::now_utc();
         let Some(expires_at) = observed_at.checked_add(self.native_readiness_ttl) else {
@@ -250,9 +257,13 @@ impl ProductionComputerUseAdapter {
             }
         };
         match self.run_native_smoke(&key) {
-            Ok(()) => {
-                self.readiness_from_evidence(&key, evidence, cached_provider, refresh_provider)
-            }
+            Ok(()) => self.readiness_from_evidence(
+                &key,
+                evidence,
+                cached_provider,
+                refresh_provider,
+                provider_smoke_timeout,
+            ),
             Err(reason) => AdapterPreflight::Failed {
                 key,
                 evidence,
@@ -313,6 +324,7 @@ impl ProductionComputerUseAdapter {
         key: &ReadinessCacheKey,
         cached_provider: Option<ProviderSmokeResult>,
         refresh: bool,
+        timeout_override: Option<Duration>,
     ) -> Result<Option<ProviderSmokeEvidence>, ProviderSmokeAttemptFailure> {
         if key
             .execution_policy()
@@ -338,7 +350,7 @@ impl ProductionComputerUseAdapter {
         } else {
             ProviderSmokeSource::Live
         };
-        self.run_live_provider_smoke(key, source)
+        self.run_live_provider_smoke(key, source, timeout_override)
             .map(Some)
             .map_err(|error| {
                 let observed_at = time::OffsetDateTime::now_utc();
@@ -380,15 +392,15 @@ impl ProductionComputerUseAdapter {
         &self,
         key: &ReadinessCacheKey,
         source: ProviderSmokeSource,
+        timeout_override: Option<Duration>,
     ) -> Result<ProviderSmokeEvidence, SatelleError> {
-        let probe = crate::provider_probe::ProviderProbeSurface::start(self.provider_smoke_timeout)
+        let timeout = timeout_override.unwrap_or(self.provider_smoke_timeout);
+        let probe = crate::provider_probe::ProviderProbeSurface::start(timeout)
             .map_err(provider_smoke_failure)?;
         let page_url = probe.page_url().to_string();
-        let deadline = Instant::now()
-            .checked_add(self.provider_smoke_timeout)
-            .ok_or_else(|| {
-                provider_smoke_failure(crate::provider_probe::ProviderProbeError::TimedOut)
-            })?;
+        let deadline = Instant::now().checked_add(timeout).ok_or_else(|| {
+            provider_smoke_failure(crate::provider_probe::ProviderProbeError::TimedOut)
+        })?;
         let working_directory = self
             .working_directory
             .as_ref()
@@ -823,8 +835,14 @@ impl ComputerUseAdapter for ProductionComputerUseAdapter {
                 evidence,
                 cached_provider,
                 provider_intent.refresh(),
+                provider_intent.provider_smoke_timeout(),
             ),
-            None => self.live_native_preflight(key, cached_provider, provider_intent.refresh()),
+            None => self.live_native_preflight(
+                key,
+                cached_provider,
+                provider_intent.refresh(),
+                provider_intent.provider_smoke_timeout(),
+            ),
         }
     }
 
@@ -1211,6 +1229,7 @@ mod tests {
                     &key,
                     Some(ProviderSmokeResult::Passed(provider.clone())),
                     false,
+                    None,
                 )
                 .unwrap(),
             Some(provider)
@@ -1231,6 +1250,7 @@ mod tests {
                 &key,
                 Some(ProviderSmokeResult::Failed(provider_failure.clone())),
                 false,
+                None,
             )
             .expect_err("a cached provider failure remains a preflight blocker");
         assert!(cached_failure.evidence.is_none());

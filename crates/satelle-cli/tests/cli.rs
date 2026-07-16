@@ -3224,6 +3224,49 @@ fn doctor_refresh_timeout_updates_cache_metadata() {
 }
 
 #[test]
+fn doctor_provider_refresh_reports_provider_cache_provenance() {
+    let state = state_dir();
+    let output = satelle()
+        .env("SATELLE_STATE_DIR", state.path())
+        .args([
+            "doctor",
+            "--host",
+            "local-demo",
+            "--scope",
+            "provider",
+            "--refresh",
+            "--timeout",
+            "30s",
+            "--json",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .clone();
+    let report = parse_json_output(&output.stdout);
+
+    assert_eq!(report["changed"], true);
+    assert_eq!(
+        report["cache_updates"],
+        serde_json::json!(["provider_smoke"])
+    );
+    assert_eq!(
+        report["probe_results"][0]["probe_id"],
+        "provider.smoke.refresh"
+    );
+    assert_eq!(report["probe_results"][0]["cache_status"], "refreshed");
+    assert_eq!(report["probe_results"][0]["status"], "passed");
+    assert!(
+        report["findings"][0]["evidence"]
+            .as_array()
+            .expect("provider evidence should be an array")
+            .iter()
+            .any(|entry| entry == "source=refresh")
+    );
+    assert_eq!(report["scopes"], serde_json::json!(["provider"]));
+}
+
+#[test]
 fn doctor_timeout_requires_refresh_and_live_probe_scope() {
     let state = state_dir();
     satelle()

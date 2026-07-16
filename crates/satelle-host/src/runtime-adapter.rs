@@ -17,6 +17,7 @@ pub struct ProviderComputerUseIntent {
     provider: Option<satelle_core::session::ProviderBindingRef>,
     experimental: bool,
     refresh: bool,
+    provider_smoke_timeout: Option<std::time::Duration>,
 }
 
 impl ProviderComputerUseIntent {
@@ -31,7 +32,15 @@ impl ProviderComputerUseIntent {
             provider,
             experimental,
             refresh,
+            provider_smoke_timeout: None,
         }
+    }
+
+    /// Applies a one-shot timeout to a diagnostic provider smoke refresh.
+    /// Normal prompt admission continues to use the Host configuration.
+    pub fn with_provider_smoke_timeout(mut self, timeout: std::time::Duration) -> Self {
+        self.provider_smoke_timeout = Some(timeout);
+        self
     }
 
     pub fn host_default() -> Self {
@@ -52,6 +61,10 @@ impl ProviderComputerUseIntent {
 
     pub const fn refresh(&self) -> bool {
         self.refresh
+    }
+
+    pub const fn provider_smoke_timeout(&self) -> Option<std::time::Duration> {
+        self.provider_smoke_timeout
     }
 }
 

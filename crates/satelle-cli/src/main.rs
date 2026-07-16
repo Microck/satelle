@@ -19,7 +19,8 @@ use host_trust::{HostTrustReport, persist_host_identity};
 use logs::{LogsCommand, show_logs};
 use output::{OutputArgs, OutputFormat, SessionResultSchemaVersion, StatusReport};
 use satelle_core::session::{
-    HostIdentityRef, PublicSession, PublicTurn, TurnAdmissionPhase, TurnExecutionMode, TurnState,
+    EffectiveModelRef, HostIdentityRef, ProviderBindingRef, PublicSession, PublicTurn,
+    TurnAdmissionPhase, TurnExecutionMode, TurnState,
 };
 use satelle_core::{
     BEACON_CORAL, CLI_NAME, DaemonPathOverrides, DesktopSessionPreference, DoctorEventRecord,
@@ -28,7 +29,7 @@ use satelle_core::{
     SUCCESS_GREEN, SatelleError, SatelleEvent, SatelleEventBody, SessionId, SetupMode, SetupReport,
     SetupRequiredInput, load_config, resolve_path_set, utc_now,
 };
-use satelle_host::{ApiBearerToken, HostService};
+use satelle_host::{ApiBearerToken, HostService, ProviderComputerUseIntent};
 use satelle_transport::{DaemonServer, DaemonServerConfig, DaemonServerError, TurnRequest};
 use serde_json::json;
 use std::collections::BTreeMap;
@@ -1049,11 +1050,22 @@ fn run_doctor(
         );
     }
 
-    let host = match config.resolve_host(command.host.as_deref()) {
-        Ok(resolved) => resolved,
+    let resolved_config = match config.load() {
+        Ok(config) => config,
         Err(failure) => {
             return fail_doctor(
                 failure,
+                command.events,
+                target_hint,
+                command.scope.as_deref(),
+            );
+        }
+    };
+    let host = match resolved_config.resolve_host(command.host.as_deref()) {
+        Ok(resolved) => SelectedHost::from(resolved),
+        Err(error) => {
+            return fail_doctor(
+                failure(error),
                 command.events,
                 target_hint,
                 command.scope.as_deref(),
@@ -1077,7 +1089,23 @@ fn run_doctor(
         }
     };
     let options = DoctorOptions::new(command.refresh, timeout);
-    let report = match transport.doctor(command.scope.as_deref(), options) {
+    let provider_intent = match doctor_provider_intent(
+        &resolved_config,
+        &host.config,
+        command.refresh,
+        options.probe_timeout(),
+    ) {
+        Ok(intent) => intent,
+        Err(error) => {
+            return fail_doctor(
+                failure(error),
+                command.events,
+                &host.alias,
+                command.scope.as_deref(),
+            );
+        }
+    };
+    let report = match transport.doctor(command.scope.as_deref(), options, &provider_intent) {
         Ok(report) => report,
         Err(error) => {
             return fail_doctor(
@@ -1758,6 +1786,38 @@ fn resolve_experimental_provider_computer_use(
             .experimental_provider_computer_use
             .or(config.config.experimental_provider_computer_use)
             .unwrap_or(false)
+}
+
+fn doctor_provider_intent(
+    config: &ResolvedConfig,
+    host_config: &HostConfig,
+    refresh: bool,
+    probe_timeout: Option<std::time::Duration>,
+) -> Result<ProviderComputerUseIntent, SatelleError> {
+    let model = config
+        .config
+        .model_alias
+        .as_deref()
+        .map(EffectiveModelRef::new)
+        .transpose()
+        .map_err(|_| SatelleError::invalid_usage("the selected model alias is invalid"))?;
+    let provider = config
+        .config
+        .provider_alias
+        .as_deref()
+        .map(ProviderBindingRef::new)
+        .transpose()
+        .map_err(|_| SatelleError::invalid_usage("the selected provider alias is invalid"))?;
+    let intent = ProviderComputerUseIntent::new(
+        model,
+        provider,
+        resolve_experimental_provider_computer_use(false, host_config, config),
+        refresh,
+    );
+    Ok(match probe_timeout {
+        Some(timeout) => intent.with_provider_smoke_timeout(timeout),
+        None => intent,
+    })
 }
 
 fn yolo_config_json(

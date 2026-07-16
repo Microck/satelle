@@ -60,6 +60,7 @@ use std::time::Instant;
 use test_runtime::FakeComputerUseAdapter;
 #[cfg(feature = "test-support")]
 use test_runtime::PendingComputerUseAdapter;
+use time::format_description::well_known::Rfc3339;
 
 const DEFAULT_NATIVE_READINESS_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
 const DEFAULT_NATIVE_READINESS_TTL: time::Duration = time::Duration::minutes(5);
@@ -250,6 +251,21 @@ impl HostService {
         scope: Option<&str>,
         options: DoctorOptions,
     ) -> Result<DoctorReport, SatelleError> {
+        self.doctor_with_provider_intent(
+            host,
+            scope,
+            options,
+            &ProviderComputerUseIntent::host_default(),
+        )
+    }
+
+    pub fn doctor_with_provider_intent(
+        &self,
+        host: &str,
+        scope: Option<&str>,
+        options: DoctorOptions,
+        provider_intent: &ProviderComputerUseIntent,
+    ) -> Result<DoctorReport, SatelleError> {
         ensure_local_demo(host)?;
         if let Some(scope) = scope
             && ![
@@ -264,21 +280,32 @@ impl HostService {
         {
             return Err(SatelleError::invalid_usage("unsupported doctor scope"));
         }
-        match &self.mode {
+        let mut report = match &self.mode {
             HostMode::Production { snapshot } if options.refresh() => {
                 let refreshed = ProductionCapabilitySnapshot::collect(options.probe_timeout());
                 let report = production_doctor_report(host, scope, &refreshed);
                 replace_production_snapshot(snapshot, refreshed)?;
-                Ok(report)
+                report
             }
-            HostMode::Production { snapshot } => Ok(production_doctor_report(
-                host,
-                scope,
-                &*read_production_snapshot(snapshot)?,
-            )),
+            HostMode::Production { snapshot } => {
+                production_doctor_report(host, scope, &*read_production_snapshot(snapshot)?)
+            }
             #[cfg(any(test, feature = "test-support"))]
-            HostMode::TestFake => self.fake_doctor(host, scope, options, &FakeComputerUseAdapter),
+            HostMode::TestFake => {
+                self.fake_doctor(host, scope, options, &FakeComputerUseAdapter)?
+            }
+        };
+        if options.refresh() && matches!(scope, Some("provider" | "all")) {
+            if scope == Some("provider") {
+                report.changed = false;
+                report.cache_updates.clear();
+            }
+            let started_at = utc_now();
+            let started = Instant::now();
+            let refresh = self.runtime.refresh_provider_smoke(host, provider_intent);
+            apply_provider_refresh(&mut report, refresh, started_at, started.elapsed());
         }
+        Ok(report)
     }
 
     pub fn setup(
@@ -424,6 +451,184 @@ impl HostService {
 fn duration_to_time(duration: &satelle_core::ExplicitDuration) -> time::Duration {
     time::Duration::milliseconds(i64::try_from(duration.milliseconds()).unwrap_or(i64::MAX))
 }
+
+fn apply_provider_refresh(
+    report: &mut DoctorReport,
+    refresh: Result<AdapterReadiness, SatelleError>,
+    started_at: String,
+    duration: std::time::Duration,
+) {
+    report
+        .findings
+        .retain(|finding| finding.scope != "provider");
+    report
+        .probe_results
+        .retain(|probe| probe.scope != "provider");
+    let (finding, status, cache_status, changed) = match refresh {
+        Ok(readiness) => match readiness.provider_smoke_evidence() {
+            Some(evidence) => (
+                DoctorFinding {
+                    finding_id: "provider.smoke.refresh.passed".to_string(),
+                    scope: "provider".to_string(),
+                    severity: "info".to_string(),
+                    fixability: DoctorFixability::Informational,
+                    readiness_impact: "ready".to_string(),
+                    summary: "provider Computer Use smoke refresh passed".to_string(),
+                    evidence: vec![
+                        format!("source={}", evidence.source().as_str()),
+                        format!(
+                            "observed_at={}",
+                            evidence
+                                .observed_at()
+                                .format(&Rfc3339)
+                                .expect("provider evidence timestamp is RFC 3339 representable")
+                        ),
+                        format!(
+                            "expires_at={}",
+                            evidence
+                                .expires_at()
+                                .format(&Rfc3339)
+                                .expect("provider evidence expiry is RFC 3339 representable")
+                        ),
+                    ],
+                    recovery_command: None,
+                },
+                "passed",
+                "refreshed",
+                true,
+            ),
+            None => (
+                DoctorFinding {
+                    finding_id: "provider.smoke.refresh.not_required".to_string(),
+                    scope: "provider".to_string(),
+                    severity: "info".to_string(),
+                    fixability: DoctorFixability::Informational,
+                    readiness_impact: "ready".to_string(),
+                    summary: "the selected provider does not require an experimental smoke test"
+                        .to_string(),
+                    evidence: vec!["source=not_required".to_string()],
+                    recovery_command: None,
+                },
+                "passed",
+                "not_required",
+                false,
+            ),
+        },
+        Err(error) => {
+            let mut evidence = vec![format!("code={}", error.code.as_str())];
+            for key in [
+                "provider_smoke_source",
+                "provider_smoke_status",
+                "provider_smoke_observed_at",
+                "provider_smoke_expires_at",
+                "provider_smoke_age_ms",
+            ] {
+                if let Some(value) = error.details.get(key) {
+                    evidence.push(format!("{key}={}", json_scalar(value)));
+                }
+            }
+            let changed = error.details.contains_key("provider_smoke_expires_at");
+            (
+                DoctorFinding {
+                    finding_id: "provider.smoke.refresh.failed".to_string(),
+                    scope: "provider".to_string(),
+                    severity: "error".to_string(),
+                    fixability: DoctorFixability::Blocked,
+                    readiness_impact: "blocked".to_string(),
+                    summary: error.message,
+                    evidence,
+                    recovery_command: error.recovery_command,
+                },
+                "blocked",
+                if changed {
+                    "refreshed_failed"
+                } else {
+                    "not_updated"
+                },
+                changed,
+            )
+        }
+    };
+    let finding_id = finding.finding_id.clone();
+    let finished_at = utc_now();
+    report.findings.push(finding);
+    report.probe_results.push(DoctorProbeResult {
+        probe_id: "provider.smoke.refresh".to_string(),
+        scope: "provider".to_string(),
+        status: status.to_string(),
+        started_at,
+        finished_at,
+        duration_ms: u64::try_from(duration.as_millis()).unwrap_or(u64::MAX),
+        cache_status: cache_status.to_string(),
+        dependency_status: "satisfied".to_string(),
+        finding_ids: vec![finding_id],
+    });
+    report.findings.sort_by(|left, right| {
+        left.scope
+            .cmp(&right.scope)
+            .then(left.finding_id.cmp(&right.finding_id))
+    });
+    report.probe_results.sort_by(|left, right| {
+        left.scope
+            .cmp(&right.scope)
+            .then(left.probe_id.cmp(&right.probe_id))
+    });
+    report.changed |= changed;
+    if changed
+        && !report
+            .cache_updates
+            .iter()
+            .any(|entry| entry == "provider_smoke")
+    {
+        report.cache_updates.push("provider_smoke".to_string());
+    }
+    recompute_doctor_summary(report);
+}
+
+fn json_scalar(value: &Value) -> String {
+    value
+        .as_str()
+        .map_or_else(|| value.to_string(), str::to_string)
+}
+
+fn recompute_doctor_summary(report: &mut DoctorReport) {
+    let blocking_findings = report
+        .findings
+        .iter()
+        .filter(|finding| finding.readiness_impact == "blocked")
+        .count();
+    let repairable_findings = report
+        .findings
+        .iter()
+        .filter(|finding| finding.fixability == DoctorFixability::Repairable)
+        .count();
+    let informational_findings = report
+        .findings
+        .iter()
+        .filter(|finding| finding.fixability == DoctorFixability::Informational)
+        .count();
+    let ready = blocking_findings == 0
+        && report
+            .probe_results
+            .iter()
+            .all(|probe| probe.status == "passed");
+    report.ready = ready;
+    report.status = if ready { "ready" } else { "blocked" }.to_string();
+    report.summary = DoctorSummary {
+        ready,
+        blocking_findings,
+        repairable_findings,
+        informational_findings,
+    };
+    report.recovery_commands = report
+        .findings
+        .iter()
+        .filter_map(|finding| finding.recovery_command.clone())
+        .collect();
+    report.recovery_commands.sort();
+    report.recovery_commands.dedup();
+}
+
 fn execution_blocker(verdict: &Phase0SupportVerdict) -> SatelleError {
     if verdict.is_supported() {
         return SatelleError::not_implemented(

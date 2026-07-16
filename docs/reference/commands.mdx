@@ -52,3 +52,7 @@ Provider fingerprints, prompts, transcripts, and desktop content are excluded.
 `doctor` accepts `--host`, `--scope`, `--refresh`, `--timeout`,
 `--serial-probes`, `--events`, and `--no-input`. `--timeout` is valid for an
 eligible refresh scope and requires explicit units.
+
+`doctor --scope provider --refresh` runs the provider smoke probe as a
+diagnostic, updates the normal Host readiness cache, and reports whether the
+result was refreshed. It does not create a Session or admit a prompt Turn.
