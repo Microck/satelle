@@ -291,6 +291,22 @@ async fn protected_reads_authenticate_before_host_pinning() {
 }
 
 #[tokio::test]
+async fn authenticated_identity_probe_returns_only_the_observed_host_identity() {
+    let running = RunningServer::start(ApiScopes::READ).await;
+    let address = running.server.local_addr();
+    let token = ApiBearerToken::parse(running.token.expose().as_str())
+        .expect("copy the registered token for the client");
+    let observed = tokio::task::spawn_blocking(move || {
+        DaemonClient::loopback(address, token, "trust-probe-candidate")?.discover_host_identity()
+    })
+    .await
+    .expect("join authenticated identity probe")
+    .expect("discover authenticated Host Identity");
+
+    assert_eq!(observed, running.host_identity);
+}
+
+#[tokio::test]
 async fn daemon_client_preserves_the_typed_host_identity_mismatch() {
     let running = RunningServer::start(ApiScopes::READ).await;
     let address = running.server.local_addr();

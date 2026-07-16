@@ -1,6 +1,8 @@
 mod completions;
 #[path = "error-output.rs"]
 mod error_output;
+#[path = "host-trust.rs"]
+mod host_trust;
 mod logs;
 mod mcp;
 mod output;
@@ -10,10 +12,11 @@ mod transport;
 use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum};
 use completions::{CompletionsCommand, run_completions};
 use error_output::{ErrorFormat, parser_error, print_error};
+use host_trust::{HostTrustReport, persist_host_identity};
 use logs::{LogsCommand, show_logs};
 use output::{OutputArgs, OutputFormat, SessionResultSchemaVersion, StatusReport};
 use satelle_core::session::{
-    PublicSession, PublicTurn, TurnAdmissionPhase, TurnExecutionMode, TurnState,
+    HostIdentityRef, PublicSession, PublicTurn, TurnAdmissionPhase, TurnExecutionMode, TurnState,
 };
 use satelle_core::{
     BEACON_CORAL, CLI_NAME, DaemonPathOverrides, DesktopSessionPreference, DoctorEventRecord,
@@ -32,7 +35,7 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::str::FromStr;
-use transport::{AttachedTurnOutcome, transport_for};
+use transport::{AttachedTurnOutcome, discover_direct_host_identity, transport_for};
 
 const CONFIG_CHECK_SCHEMA_VERSION: &str = "satelle.config.check.v1";
 const CONFIG_EXPLAIN_SCHEMA_VERSION: &str = "satelle.config.explain.v1";
@@ -255,6 +258,8 @@ struct PathsCommand {
 #[derive(Subcommand, Debug)]
 enum HostCommand {
     Start(HostStartCommand),
+    /// Authenticate a direct Host and pin its stable identity in user configuration.
+    Trust(HostTrustCommand),
     Status(HostStatusCommand),
     Stop(HostLifecycleCommand),
     Restart(HostLifecycleCommand),
@@ -264,6 +269,27 @@ enum HostCommand {
         #[command(subcommand)]
         command: HostStorageCommand,
     },
+}
+
+#[derive(Args, Debug)]
+struct HostTrustCommand {
+    /// Host Binding alias to authenticate and trust.
+    #[arg(long, required = true)]
+    host: String,
+    /// Exact identity required before a noninteractive trust update.
+    #[arg(long, value_name = "HOST_ID")]
+    expected_host_id: Option<String>,
+    /// Permit replacement when the Host Binding already pins a different identity.
+    #[arg(long)]
+    replace: bool,
+    /// Apply trust without an interactive confirmation.
+    #[arg(long)]
+    yes: bool,
+    /// Reject any path that would prompt for input.
+    #[arg(long)]
+    no_input: bool,
+    #[command(flatten)]
+    output_args: OutputArgs,
 }
 
 #[derive(Args, Debug)]
@@ -1789,6 +1815,7 @@ fn run_host(
     let json = format.is_json();
     match command {
         HostCommand::Start(command) => start_host_daemon(command, format),
+        HostCommand::Trust(command) => trust_host(command, config, format),
         HostCommand::Status(command) => {
             let status = read::host_status(command.host.as_deref(), config)?;
             if json {
@@ -1811,6 +1838,122 @@ fn run_host(
         HostCommand::Update(command) => run_host_update(command),
         HostCommand::Sessions(command) => show_host_sessions(command, config, format),
         HostCommand::Storage { command } => run_host_storage(command),
+    }
+}
+
+fn trust_host(
+    command: HostTrustCommand,
+    config_context: ConfigContext<'_>,
+    format: OutputFormat,
+) -> Result<(), CliFailure> {
+    if let Some(expected) = command.expected_host_id.as_deref() {
+        HostIdentityRef::new(expected).map_err(|error| {
+            failure(SatelleError::invalid_usage(format!(
+                "--expected-host-id is invalid: {error}"
+            )))
+        })?;
+    }
+    if command.yes && command.expected_host_id.is_none() {
+        return Err(failure(SatelleError::invalid_usage(
+            "host trust --yes requires --expected-host-id <exact-id>",
+        )));
+    }
+    let noninteractive = command.no_input || format.is_json() || !io::stdin().is_terminal();
+    if noninteractive && (!command.no_input || !command.yes || command.expected_host_id.is_none()) {
+        return Err(failure(SatelleError::invalid_usage(
+            "noninteractive host trust requires --no-input --yes --expected-host-id <exact-id>",
+        )));
+    }
+
+    let resolved = config_context.load()?;
+    let host = resolved
+        .resolve_host(Some(&command.host))
+        .map(SelectedHost::from)
+        .map_err(failure)?;
+    let endpoint = host.config.address.clone().ok_or_else(|| {
+        failure(SatelleError::config_error(
+            "host trust requires a configured direct HTTPS address",
+            None,
+        ))
+    })?;
+    let observed_identity = discover_direct_host_identity(&host).map_err(failure)?;
+    HostIdentityRef::new(&observed_identity).map_err(|_| {
+        failure(SatelleError::remote_api_error(
+            &host.alias,
+            "invalid-daemon-response",
+        ))
+    })?;
+    if command
+        .expected_host_id
+        .as_deref()
+        .is_some_and(|expected| expected != observed_identity)
+    {
+        return Err(failure(SatelleError::host_identity_mismatch(&host.alias)));
+    }
+    let previous_identity = host.config.expected_host_id.clone();
+    if previous_identity
+        .as_deref()
+        .is_some_and(|previous| previous != observed_identity)
+        && !command.replace
+    {
+        return Err(failure(SatelleError::invalid_usage(
+            "replacing an existing expected_host_id requires --replace",
+        )));
+    }
+
+    if !command.yes {
+        println!("Host: {}", host.alias);
+        println!("Endpoint: {endpoint}");
+        println!("Observed Host Identity: {observed_identity}");
+        println!(
+            "Current expected Host Identity: {}",
+            previous_identity.as_deref().unwrap_or("not pinned")
+        );
+        println!(
+            "Desktop Binding: {}",
+            host.config
+                .desktop_user
+                .as_deref()
+                .unwrap_or("not configured")
+        );
+        let confirmed = cliclack::confirm("Trust this Host Identity?")
+            .initial_value(false)
+            .interact()
+            .map_err(|error| {
+                failure(SatelleError::invalid_usage(format!(
+                    "could not read Host trust confirmation: {error}"
+                )))
+            })?;
+        if !confirmed {
+            println!("No changes applied.");
+            return Ok(());
+        }
+    }
+
+    let changed =
+        persist_host_identity(&resolved.user_config_path, &host.alias, &observed_identity)
+            .map_err(failure)?;
+    let report = HostTrustReport::new(
+        host.alias,
+        endpoint,
+        observed_identity,
+        previous_identity,
+        changed,
+    );
+    if format.is_json() {
+        print_json(&report).map_err(failure)
+    } else {
+        println!("Trusted Host: {}", report.host());
+        println!("Endpoint: {}", report.endpoint());
+        println!("Host Identity: {}", report.observed_host_identity());
+        println!(
+            "Previous Host Identity: {}",
+            report
+                .previous_expected_host_identity()
+                .unwrap_or("not pinned")
+        );
+        println!("Changed: {}", report.changed());
+        Ok(())
     }
 }
 

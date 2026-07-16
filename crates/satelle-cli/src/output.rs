@@ -198,6 +198,7 @@ impl HostCommand {
     const fn output_request(&self) -> (OutputArgs, EventOutput) {
         match self {
             Self::Start(command) => (command.output_args, EventOutput::None),
+            Self::Trust(command) => (command.output_args, EventOutput::None),
             Self::Status(command) => (command.output_args, EventOutput::None),
             Self::Stop(command) | Self::Restart(command) => {
                 (command.output_args, EventOutput::None)
