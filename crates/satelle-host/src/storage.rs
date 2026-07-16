@@ -38,8 +38,8 @@ use crate::{ApiBearerToken, ApiPrincipal};
 pub(crate) use crate::{LogEvent, LogSeverity, LogSource};
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior};
 use satelle_core::session::{
-    ExecutionPolicy, ExpectedRevisions, HostIdentityRef, Session, SessionStateRevision, TurnState,
-    TurnTransition,
+    DesktopBindingRef, ExecutionPolicy, ExpectedRevisions, HostIdentityRef, Session,
+    SessionStateRevision, TurnState, TurnTransition,
 };
 use satelle_core::{SessionId, TurnId};
 use std::error::Error;
@@ -348,6 +348,65 @@ impl AdmissionContext {
 pub(crate) enum ObservedUpstreamRef {
     Thread(PrivateUpstreamRef),
     Turn(PrivateUpstreamRef),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ProviderProbeTerminal {
+    Failed,
+    TimedOut,
+    OutcomeUnknown,
+}
+
+impl ProviderProbeTerminal {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Failed => "failed",
+            Self::TimedOut => "timed_out",
+            Self::OutcomeUnknown => "outcome_unknown",
+        }
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct ProviderProbeRecoverySubject {
+    host_identity: HostIdentityRef,
+    desktop_binding: DesktopBindingRef,
+    provider_probe_ref: PrivateUpstreamRef,
+    upstream_thread_ref: Option<PrivateUpstreamRef>,
+    upstream_turn_ref: Option<PrivateUpstreamRef>,
+    recovery_pending: bool,
+}
+
+impl ProviderProbeRecoverySubject {
+    pub(crate) fn provider_probe_ref(&self) -> &str {
+        self.provider_probe_ref.as_str()
+    }
+
+    pub(crate) fn upstream_thread_ref(&self) -> Option<&str> {
+        self.upstream_thread_ref
+            .as_ref()
+            .map(PrivateUpstreamRef::as_str)
+    }
+
+    pub(crate) fn upstream_turn_ref(&self) -> Option<&str> {
+        self.upstream_turn_ref
+            .as_ref()
+            .map(PrivateUpstreamRef::as_str)
+    }
+
+    pub(crate) const fn is_recovery_pending(&self) -> bool {
+        self.recovery_pending
+    }
+}
+
+impl fmt::Debug for ProviderProbeRecoverySubject {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ProviderProbeRecoverySubject")
+            .field("host_identity", &self.host_identity)
+            .field("desktop_binding", &self.desktop_binding)
+            .finish_non_exhaustive()
+    }
 }
 
 impl ObservedUpstreamRef {

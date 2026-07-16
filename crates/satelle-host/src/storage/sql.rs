@@ -391,20 +391,28 @@ pub(super) fn ensure_control_lease_available(
             |row| row.get(0),
         )
         .map_err(|source| sqlite_error(StorageErrorKind::OperationFailed, source))?;
-    let control: Option<String> = transaction
+    let control: Option<(String, Option<String>)> = transaction
         .query_row(
-            "SELECT session_id FROM control_leases WHERE host_identity_ref = ?1 AND desktop_binding_ref = ?2",
+            "SELECT owner_kind, session_id FROM control_leases WHERE host_identity_ref = ?1 AND desktop_binding_ref = ?2",
             params![host_identity.as_str(), desktop_binding.as_str()],
-            |row| row.get(0),
+            |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .optional()
         .map_err(|source| sqlite_error(StorageErrorKind::OperationFailed, source))?;
     if maintenance != 0 {
         return Err(StorageError::new(StorageErrorKind::LeaseConflict));
     }
-    if let Some(session_id) = control {
-        let session_id = SessionId::parse(&session_id)
-            .map_err(|_| StorageError::new(StorageErrorKind::InvalidStoredState))?;
+    if let Some((owner_kind, session_id)) = control {
+        if owner_kind == "provider_probe" && session_id.is_none() {
+            return Err(StorageError::new(StorageErrorKind::LeaseConflict));
+        }
+        let session_id = session_id
+            .as_deref()
+            .ok_or_else(|| StorageError::new(StorageErrorKind::InvalidStoredState))
+            .and_then(|session_id| {
+                SessionId::parse(session_id)
+                    .map_err(|_| StorageError::new(StorageErrorKind::InvalidStoredState))
+            })?;
         return Err(StorageError::lease_conflict(session_id));
     }
     Ok(())
@@ -418,8 +426,8 @@ pub(super) fn insert_control_lease(
 ) -> Result<(), StorageError> {
     transaction
         .execute(
-            "INSERT INTO control_leases (host_identity_ref, desktop_binding_ref, operation_id, owner_process_id, owner_process_start_ref, owner_boot_identity_ref, acquired_at, heartbeat_at, lease_state, session_id, turn_id) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7, 'active', ?8, ?9)",
+            "INSERT INTO control_leases (host_identity_ref, desktop_binding_ref, operation_id, owner_process_id, owner_process_start_ref, owner_boot_identity_ref, acquired_at, heartbeat_at, lease_state, owner_kind, session_id, turn_id) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7, 'active', 'turn', ?8, ?9)",
             params![
                 session.host_identity().as_str(),
                 session.desktop_binding().as_str(),
@@ -777,6 +785,17 @@ impl Storage {
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|source| sqlite_error(StorageErrorKind::OperationFailed, source))?;
+        // An active provider probe can only survive opening this process if
+        // its prior owner exited before finalization. Convert it to explicit
+        // recovery ownership before any new admission can inspect it.
+        transaction
+            .execute(
+                "UPDATE control_leases
+                 SET lease_state = 'recovery_pending'
+                 WHERE owner_kind = 'provider_probe' AND lease_state = 'active'",
+                [],
+            )
             .map_err(|source| sqlite_error(StorageErrorKind::OperationFailed, source))?;
         let session_ids = active_session_ids(&transaction)?;
         let mut subjects = Vec::with_capacity(session_ids.len());

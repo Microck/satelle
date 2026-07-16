@@ -1,18 +1,23 @@
-use super::adapter::BlockedComputerUseAdapter;
+use super::adapter::{BlockedComputerUseAdapter, ProviderProbeDriver};
 use super::{
-    ComputerUseAdapter, LogPageQuery, RecoveryObservation, RequestIdentity, RunCommand,
-    RuntimeHandle, RuntimeStartupState, SteerCommand, StopCommand,
+    AdapterPreflight, AdapterReadiness, ComputerUseAdapter, ExecuteRequest, ExecuteResult,
+    LogPageQuery, ProviderComputerUseIntent, ProviderSmokeFailureEvidence, ReadinessCacheKey,
+    ReadinessEvidence, RecoveryObservation, RequestIdentity, RunCommand, RuntimeHandle,
+    RuntimeStartupState, SteerCommand, StopCommand,
 };
-use crate::storage::PrivateUpstreamRef;
+use crate::storage::{LeaseOwner, PrivateUpstreamRef, ProviderProbeRecoverySubject};
 use crate::test_runtime::FakeComputerUseAdapter;
 use satelle_core::session::{
-    PublicSession, PublicTurn, SafeSummary, StopObservation, TurnState, TurnTransition,
+    ApprovalPolicy, DesktopBindingRef, DesktopTarget, EffectiveModelRef, ExecutionPolicy,
+    ExperimentalFeatureChoices, FeatureChoice, ProviderBindingRef, PublicSession, PublicTurn,
+    SafeSummary, SandboxPolicy, StopObservation, TimeoutPolicy, TurnState, TurnTransition,
 };
 use satelle_core::{
     ControlPlaneFailureReason, ControlPlaneOperation, ErrorCode, EventType,
     IncompatibleControlPlaneDetails, LOCAL_DEMO_HOST, SatelleError,
 };
 use satelle_test_contract::assert_privacy_canaries_absent;
+use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, mpsc};
 use std::time::Duration;
@@ -102,6 +107,120 @@ fn provider_smoke_preflight_event_reports_safe_live_provenance() {
     assert!(provider.data()["age_ms"].is_u64());
     assert!(provider.data().get("provider_config_fingerprint").is_none());
     assert_eq!(outcome.events[1].seq(), 2);
+}
+
+#[test]
+fn unknown_provider_probe_ownership_blocks_probe_and_prompt_until_terminal_reconciliation() {
+    let state = crate::TestStateDir::new().expect("temporary state directory should exist");
+    let adapter = ProviderProbeRecoveryAdapter::new([
+        RecoveryObservation::Running,
+        RecoveryObservation::Running,
+        RecoveryObservation::Completed,
+    ]);
+    let runtime = RuntimeHandle::new_with_provider_probe_driver(
+        Ok(state.path().to_path_buf()),
+        adapter.clone(),
+        adapter,
+    );
+    let provider_intent = ProviderComputerUseIntent::new(None, None, true, true);
+
+    let first = runtime
+        .refresh_provider_smoke(LOCAL_DEMO_HOST, &provider_intent)
+        .expect_err("unknown cancellation must fail the provider probe");
+    assert_eq!(first.code, ErrorCode::ProviderSmokeTestTimeout);
+    let engine = runtime.engine().expect("runtime engine should be open");
+    let storage = engine.lock_storage().unwrap();
+    let status: String = storage
+        .connection_for_test()
+        .query_row("SELECT status FROM provider_smoke_results", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    let lease = storage
+        .connection_for_test()
+        .query_row(
+            "SELECT lease_state, upstream_thread_ref, upstream_turn_ref
+             FROM control_leases WHERE owner_kind = 'provider_probe'",
+            [],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            },
+        )
+        .unwrap();
+    drop(storage);
+    assert_eq!("outcome_unknown", status);
+    assert_eq!("recovery_pending", lease.0);
+    assert_eq!(PRIVATE_UPSTREAM_THREAD_REF, lease.1);
+    assert_eq!(PRIVATE_UPSTREAM_TURN_REF, lease.2);
+
+    let prompt_error = runtime
+        .run(RunCommand::attached(LOCAL_DEMO_HOST, "blocked-prompt"))
+        .expect_err("a running recovered probe must block prompt admission");
+    assert_eq!(
+        prompt_error.error().details["reason"],
+        "provider_probe_recovery_pending"
+    );
+    let probe_error = runtime
+        .refresh_provider_smoke(LOCAL_DEMO_HOST, &provider_intent)
+        .expect_err("a running recovered probe must block another probe");
+    assert_eq!(
+        probe_error.details["reason"],
+        "provider_probe_recovery_pending"
+    );
+
+    runtime
+        .run(RunCommand::attached(
+            LOCAL_DEMO_HOST,
+            "prompt-after-terminal-reconciliation",
+        ))
+        .expect("terminal upstream observation should release the probe lease");
+    let remaining: i64 = engine
+        .lock_storage()
+        .unwrap()
+        .connection_for_test()
+        .query_row(
+            "SELECT count(*) FROM control_leases WHERE owner_kind = 'provider_probe'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(0, remaining);
+}
+
+#[test]
+fn active_provider_probe_blocks_without_external_reconciliation() {
+    let state = crate::TestStateDir::new().expect("temporary state directory should exist");
+    let adapter = ProviderProbeRecoveryAdapter::new([]);
+    let runtime = RuntimeHandle::new_with_provider_probe_driver(
+        Ok(state.path().to_path_buf()),
+        adapter.clone(),
+        adapter.clone(),
+    );
+    let engine = runtime.engine().expect("runtime engine should be open");
+    let now = time::OffsetDateTime::now_utc();
+    let owner = LeaseOwner::new("active-probe", 1, "process-start", "boot-id", now).unwrap();
+    engine
+        .lock_storage()
+        .unwrap()
+        .begin_provider_probe(
+            &ProviderProbeRecoveryAdapter::key(),
+            "active-provider-probe",
+            &owner,
+        )
+        .unwrap();
+
+    let error = runtime
+        .run(RunCommand::attached(LOCAL_DEMO_HOST, "conflicting-prompt"))
+        .expect_err("an active provider probe owns the desktop");
+    assert_eq!(
+        error.error().details["reason"],
+        "provider_probe_recovery_pending"
+    );
+    assert_eq!(0, adapter.observation_calls.load(Ordering::SeqCst));
 }
 
 #[test]
@@ -588,6 +707,153 @@ impl FailFirstAdapter {
 #[derive(Clone, Copy)]
 struct TerminalRecoveryAdapter {
     observation: RecoveryObservation,
+}
+
+#[derive(Clone)]
+struct ProviderProbeRecoveryAdapter {
+    observations: Arc<Mutex<VecDeque<RecoveryObservation>>>,
+    observation_calls: Arc<AtomicUsize>,
+}
+
+impl ProviderProbeRecoveryAdapter {
+    fn new(observations: impl IntoIterator<Item = RecoveryObservation>) -> Self {
+        Self {
+            observations: Arc::new(Mutex::new(observations.into_iter().collect())),
+            observation_calls: Arc::new(AtomicUsize::new(0)),
+        }
+    }
+
+    fn key() -> ReadinessCacheKey {
+        let desktop = DesktopBindingRef::new("provider-probe-desktop").unwrap();
+        let policy = ExecutionPolicy::new(
+            EffectiveModelRef::new("provider-probe-model").unwrap(),
+            ProviderBindingRef::new("provider-probe-binding").unwrap(),
+            DesktopTarget::new(desktop.clone()),
+            ApprovalPolicy::OnRequest,
+            SandboxPolicy::WorkspaceWrite,
+            TimeoutPolicy::bounded_seconds(120).unwrap(),
+            ExperimentalFeatureChoices::new(FeatureChoice::Enabled, FeatureChoice::Enabled),
+        );
+        ReadinessCacheKey::new(
+            "provider-probe-test",
+            desktop,
+            policy,
+            "codex-test",
+            "native-test",
+            None::<String>,
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        )
+        .unwrap()
+    }
+
+    fn readiness() -> ReadinessEvidence {
+        let now = time::OffsetDateTime::now_utc();
+        Self::key()
+            .evidence(
+                "provider-probe-native-result",
+                now,
+                now + time::Duration::minutes(5),
+            )
+            .unwrap()
+    }
+}
+
+impl ComputerUseAdapter for ProviderProbeRecoveryAdapter {
+    fn preflight(
+        &self,
+        host: &str,
+        provider_intent: &ProviderComputerUseIntent,
+    ) -> Result<AdapterReadiness, SatelleError> {
+        FakeComputerUseAdapter.preflight(host, provider_intent)
+    }
+
+    fn readiness_cache_key(
+        &self,
+        _host: &str,
+        _provider_intent: &ProviderComputerUseIntent,
+    ) -> Result<Option<ReadinessCacheKey>, SatelleError> {
+        Ok(Some(Self::key()))
+    }
+
+    fn execute(&self, request: ExecuteRequest<'_>) -> Result<ExecuteResult, SatelleError> {
+        FakeComputerUseAdapter.execute(request)
+    }
+
+    fn observe_stop(
+        &self,
+        subject: super::AdapterSubject<'_>,
+    ) -> Result<StopObservation, SatelleError> {
+        FakeComputerUseAdapter.observe_stop(subject)
+    }
+
+    fn observe_recovery(
+        &self,
+        subject: super::AdapterSubject<'_>,
+    ) -> Result<RecoveryObservation, SatelleError> {
+        FakeComputerUseAdapter.observe_recovery(subject)
+    }
+}
+
+impl ProviderProbeDriver for ProviderProbeRecoveryAdapter {
+    fn preflight_terminal_with_provider_probe(
+        &self,
+        _host: &str,
+        _cached: Option<ReadinessEvidence>,
+        _cached_provider: Option<super::ProviderSmokeResult>,
+        _provider_intent: &ProviderComputerUseIntent,
+        persist_thread_ref: &mut dyn FnMut(&str) -> Result<(), ()>,
+        persist_turn_ref: &mut dyn FnMut(&str) -> Result<(), ()>,
+    ) -> AdapterPreflight {
+        persist_thread_ref(PRIVATE_UPSTREAM_THREAD_REF).unwrap();
+        persist_turn_ref(PRIVATE_UPSTREAM_TURN_REF).unwrap();
+        let key = Self::key();
+        let readiness = Self::readiness();
+        let now = time::OffsetDateTime::now_utc();
+        let failure = ProviderSmokeFailureEvidence::new(
+            "provider-probe-outcome-unknown",
+            key.provider_config_fingerprint(),
+            ErrorCode::ProviderSmokeTestTimeout,
+            "provider_smoke_timed_out",
+            now,
+            now + time::Duration::minutes(10),
+        )
+        .unwrap();
+        let mut error = SatelleError {
+            code: ErrorCode::ProviderSmokeTestTimeout,
+            message: "provider probe timed out".to_string(),
+            recovery_command: None,
+            source_detail: None,
+            details: std::collections::BTreeMap::new(),
+        };
+        error.details.insert(
+            "provider_smoke_cancellation".to_string(),
+            serde_json::Value::String("outcome_unknown".to_string()),
+        );
+        AdapterPreflight::ProviderFailed {
+            key,
+            readiness,
+            failure,
+            error,
+        }
+    }
+
+    fn observe_provider_probe(
+        &self,
+        subject: &ProviderProbeRecoverySubject,
+    ) -> RecoveryObservation {
+        self.observation_calls.fetch_add(1, Ordering::SeqCst);
+        assert_eq!(
+            Some(PRIVATE_UPSTREAM_THREAD_REF),
+            subject.upstream_thread_ref()
+        );
+        assert_eq!(Some(PRIVATE_UPSTREAM_TURN_REF), subject.upstream_turn_ref());
+        self.observations
+            .lock()
+            .unwrap()
+            .pop_front()
+            .unwrap_or(RecoveryObservation::Unknown)
+    }
 }
 
 impl super::ComputerUseAdapter for TerminalRecoveryAdapter {
