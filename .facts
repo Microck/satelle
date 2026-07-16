@@ -72,7 +72,9 @@
 - a Satelle AI Client Install Target is a supported AI client configuration destination that can be updated to call Satelle through MCP @spec @mvp
 - a Satelle Agent Skill Bundle is a versioned set of Satelle-owned SKILL.md guides for AI agents setting up, using, and recovering Satelle @spec @mvp
 - a Satelle Automation Workflow is a user-requested batch, watch, notify, or REPL flow that coordinates Satelle commands without changing underlying authority and safety rules @spec @later
-- a Satelle Command History Entry is a local redacted record of one Satelle command invocation, outcome, duration, target, and stable command family @spec @mvp
+- label: a Satelle Command History Entry is a local redacted record of one Satelle command invocation, outcome, duration, target, and stable command family
+  command: cargo test --locked -p satelle-cli --features test-support --test command-history records_redacted_command_metadata_and_typed_outcomes -- --exact
+  tags: [spec, mvp, implemented, ci]
 
 # brand
 - Satelle is the canonical product name for the remote computer-use bridge @implemented @mvp
@@ -1410,7 +1412,9 @@
 - lease owner process identity includes a process-start discriminator and operating-system boot identity instead of relying on a reusable process id alone @spec @mvp
 - the Host Daemon refreshes live Control and Maintenance Lease heartbeats at least every 5 seconds, and a missing heartbeat becomes stale after 30 seconds by default without permitting automatic lease release @spec @mvp
 - Host Daemon startup treats an orphaned Control or Maintenance Lease as recovery_pending and blocks conflicting admission until reconciliation completes @spec @mvp
-- an orphaned non-Turn Control Lease for a readiness or provider probe is classified outcome_unknown, reconciled against its probe process and upstream capability state, and resolved to a durable terminal Readiness Result before lease release @spec @mvp
+- label: an orphaned non-Turn Control Lease for a readiness or provider probe is classified outcome_unknown, reconciled against its probe process and upstream capability state, and resolved to a durable terminal Readiness Result before lease release
+  command: cargo test --locked -p satelle-host --lib runtime::tests::unknown_provider_probe_ownership_blocks_probe_and_prompt_until_terminal_reconciliation -- --exact && cargo test --locked -p satelle-host --lib runtime::tests::unknown_native_probe_timeout_blocks_until_terminal_reconciliation -- --exact
+  tags: [spec, mvp, implemented, ci]
 - an orphaned Maintenance Lease operation is classified outcome_unknown and reconciled from its action postconditions before retry or release @spec @mvp
 - lease expiry alone never proves that an external Computer Use or maintenance side effect stopped @spec @mvp
 - timeout expiry, a cancellation request, transport loss, adapter failure, or lease expiry never by itself proves that an upstream Computer Use execution stopped and never by itself permits Control Lease release @spec @mvp
@@ -1522,11 +1526,19 @@
 - session retention age begins when the Session's most recent Turn becomes terminal @implemented @mvp
 - expiration of Satelle metadata does not claim to delete Codex, provider, or operating-system records outside Satelle ownership @spec @mvp
 - satelle can export a redacted task artifact set containing plan.md, worklog.md, and goal.md for a selected session so another agent or human can audit what happened without replaying raw desktop content @spec @mvp
-- satelle records local redacted command history for setup, repair, run, steer, status, stop, logs, doctor, host, config, and MCP installer commands when local state storage is available @spec @mvp
+- label: satelle records local redacted command history for setup, repair, run, steer, status, stop, logs, doctor, host, config, and MCP installer commands when local state storage is available
+  command: cargo test --locked -p satelle-cli --features test-support --test command-history records_redacted_command_metadata_and_typed_outcomes -- --exact
+  tags: [spec, mvp, implemented, ci]
 - satelle later extends local redacted command history to batch, watch, notify, and REPL Automation Workflows @spec @later
-- satelle local command history stores command family, selected host, selected profile, session id when present, started_at, duration_ms, outcome status, typed error code, and Satelle CLI version without storing raw provider secrets, raw prompts, screenshots, or transcripts by default @spec @mvp
-- satelle local command history can be disabled through user-level configuration or an environment option before the command starts @spec @mvp
-- satelle local aggregate stats summarize command counts, success and failure counts, last-used hosts, last-used profiles, and common typed error codes from redacted command history @spec @mvp
+- label: satelle local command history stores command family, selected host, selected profile, session id when present, started_at, duration_ms, outcome status, typed error code, and Satelle CLI version without storing raw provider secrets, raw prompts, screenshots, or transcripts by default
+  command: cargo test --locked -p satelle-cli --features test-support --test command-history records_redacted_command_metadata_and_typed_outcomes -- --exact
+  tags: [spec, mvp, implemented, ci]
+- label: satelle local command history can be disabled through user-level configuration or an environment option before the command starts
+  command: cargo test --locked -p satelle-cli --features test-support --test command-history user_config_and_environment_can_disable_history_before_dispatch -- --exact
+  tags: [spec, mvp, implemented, ci]
+- label: satelle local aggregate stats summarize command counts, success and failure counts, last-used hosts, last-used profiles, and common typed error codes from redacted command history
+  command: cargo test --locked -p satelle-cli --features test-support --test command-history aggregate_views_summarize_outcomes_targets_profiles_and_errors -- --exact
+  tags: [spec, mvp, implemented, ci]
 - satelle local aggregate stats are diagnostic convenience data and are never treated as authoritative remote host state @spec @mvp
 - satelle exposes a top-level logs command in MVP @implemented @mvp
 - satelle logs is a read-only diagnostic command that never starts prompt execution, setup, repair, host update, service mutation, or configuration mutation @implemented @mvp
@@ -1668,20 +1680,44 @@
 - logs pagination resumes strictly after the last delivered Log Cursor @spec @mvp @implemented
 - logs follow reconnection uses a Log Cursor instead of timestamp alone @spec @mvp
 - a Log Cursor older than retained log history reports a typed logs-cursor-expired error and identifies the earliest available cursor @spec @mvp @implemented
-- satelle stores the Satelle Setup Action Ledger in the remote Host Daemon SQLite store instead of storing it only on the local CLI machine @spec @mvp
+- label: satelle stores the Satelle Setup Action Ledger in the remote Host Daemon SQLite store instead of storing it only on the local CLI machine
+  command: cargo test --locked -p satelle-host --lib storage::tests::setup_ledger::setup_action_ledger_migrates_and_persists_ordered_state_transitions -- --exact
+  tags: [spec, mvp, implemented, ci]
 - satelle treats the remote Host Daemon SQLite setup action ledger as authoritative for setup and repair recovery because it records mutations against that remote host @spec @mvp
 - satelle CLI may cache setup action ledger summaries for display convenience but must refresh from the Host Daemon before reporting authoritative setup or repair state @spec @mvp
-- satelle setup action ledger records are scoped to the target host, OS user or desktop session when relevant, Satelle host binary version, and setup run identifier @spec @mvp
-- satelle setup action ledger entries store stable action id, action label, action status, start time, completion or failure time, retry safety, error code, and recovery hint metadata @spec @mvp
-- a setup action is durably recorded as started before its external mutation begins @spec @mvp
-- a setup action is durably recorded as completed only after its postcondition is verified @spec @mvp
-- a setup action left started after a crash is classified as outcome_unknown @spec @mvp
-- repair never reruns an outcome_unknown action until live probes determine its postcondition @spec @mvp
-- repair reruns an incomplete action automatically only when the action is marked retry_safe @spec @mvp
-- satelle setup action ledger entries store normalized action summaries instead of raw installer, shell, service-manager, or operating-system command output by default @spec @mvp
-- satelle setup action ledger entries do not store raw stdout or raw stderr from setup and repair subprocesses by default @spec @mvp
-- satelle setup action ledger entries store subprocess exit status or platform-specific termination status when that status is available @spec @mvp
-- satelle setup action ledger entries store redacted failure hints only when the hint can be derived without preserving raw stdout or stderr @spec @mvp
+- label: satelle setup action ledger records are scoped to the target host, OS user or desktop session when relevant, Satelle host binary version, and setup run identifier
+  command: cargo test --locked -p satelle-host --lib storage::tests::setup_ledger::repair_ignores_history_from_other_bindings_or_satelle_versions -- --exact
+  tags: [spec, mvp, implemented, ci]
+- label: satelle setup action ledger entries store stable action id, action label, action status, start time, completion or failure time, retry safety, error code, and recovery hint metadata
+  command: cargo test --locked -p satelle-host --lib storage::tests::setup_ledger::setup_action_ledger_migrates_and_persists_ordered_state_transitions -- --exact
+  tags: [spec, mvp, implemented, ci]
+- label: a setup action is durably recorded as started before its external mutation begins
+  command: cargo test --locked -p satelle-host --lib storage::tests::setup_ledger::setup_action_ledger_migrates_and_persists_ordered_state_transitions -- --exact
+  tags: [spec, mvp, implemented, ci]
+- label: a setup action is durably recorded as completed only after its postcondition is verified
+  command: cargo test --locked -p satelle-host --lib storage::tests::setup_ledger::setup_action_ledger_migrates_and_persists_ordered_state_transitions -- --exact
+  tags: [spec, mvp, implemented, ci]
+- label: a setup action left started after a crash is classified as outcome_unknown
+  command: cargo test --locked -p satelle-host --lib storage::tests::setup_ledger::restart_classifies_started_setup_actions_as_outcome_unknown -- --exact
+  tags: [spec, mvp, implemented, ci]
+- label: repair never reruns an outcome_unknown action until live probes determine its postcondition
+  command: cargo test --locked -p satelle-host --lib storage::tests::setup_ledger::repair_waits_for_a_live_postcondition_before_retrying_outcome_unknown -- --exact
+  tags: [spec, mvp, implemented, ci]
+- label: repair reruns an incomplete action automatically only when the action is marked retry_safe
+  command: cargo test --locked -p satelle-host --lib storage::tests::setup_ledger::repair_uses_the_durable_retry_safe_marker_for_incomplete_actions -- --exact
+  tags: [spec, mvp, implemented, ci]
+- label: satelle setup action ledger entries store normalized action summaries instead of raw installer, shell, service-manager, or operating-system command output by default
+  command: cargo test --locked -p satelle-host --lib storage::tests::setup_ledger::failed_actions_store_normalized_metadata_without_raw_stream_columns -- --exact
+  tags: [spec, mvp, implemented, ci]
+- label: satelle setup action ledger entries do not store raw stdout or raw stderr from setup and repair subprocesses by default
+  command: cargo test --locked -p satelle-host --lib storage::tests::setup_ledger::failed_actions_store_normalized_metadata_without_raw_stream_columns -- --exact
+  tags: [spec, mvp, implemented, ci]
+- label: satelle setup action ledger entries store subprocess exit status or platform-specific termination status when that status is available
+  command: cargo test --locked -p satelle-host --lib storage::tests::setup_ledger::failed_actions_store_normalized_metadata_without_raw_stream_columns -- --exact
+  tags: [spec, mvp, implemented, ci]
+- label: satelle setup action ledger entries store redacted failure hints only when the hint can be derived without preserving raw stdout or stderr
+  command: cargo test --locked -p satelle-host --lib storage::tests::setup_ledger::failed_actions_store_normalized_metadata_without_raw_stream_columns -- --exact
+  tags: [spec, mvp, implemented, ci]
 - satelle setup and repair human output does not print raw installer stdout or stderr by default, even in verbose mode @spec @mvp
 - satelle setup and repair verbose output expands normalized action status, typed errors, exit status, and recovery hints without exposing raw subprocess streams by default @spec @mvp
 - satelle logs and status commands do not expose raw setup or repair subprocess stdout or stderr by default @spec @mvp
@@ -1699,14 +1735,28 @@
 - satelle setup action ledger retention can be configured per host or profile @spec @mvp
 - satelle setup action ledger retention cleanup deletes ledger metadata only and does not uninstall, roll back, or modify completed setup actions @spec @mvp
 - satelle normal prompt execution does not require retained setup action ledger records after the host passes current native Computer Use readiness checks @spec @mvp
-- satelle repair uses retained setup action ledger records when available but can re-plan from live host probes when the relevant ledger records expired or are missing @spec @mvp
-- satelle repair treats missing, expired, or incompatible setup action ledger records as non-blocking when live host probes can run @spec @mvp
+- label: satelle repair uses retained setup action ledger records when available but can re-plan from live host probes when the relevant ledger records expired or are missing
+  command: cargo test --locked -p satelle-host --lib storage::tests::setup_ledger::repair_replans_from_live_probes_when_ledger_history_is_missing -- --exact
+  tags: [spec, mvp, implemented, ci]
+- label: satelle repair treats missing, expired, or incompatible setup action ledger records as non-blocking when live host probes can run
+  command: cargo test --locked -p satelle-host --lib storage::tests::setup_ledger::repair_replans_from_live_probes_when_ledger_history_is_missing -- --exact
+  tags: [spec, mvp, implemented, ci]
 - satelle repair reports setup action ledger availability as diagnostic context instead of treating missing history as the repair cause when live host probes identify current blockers @spec @mvp
-- satelle repair performs fresh OS-aware live probes before generating a repair plan when no usable setup action ledger is available @spec @mvp
-- satelle repair generates a fresh idempotent action plan from current host probe results, effective configuration, target operating system, transport capabilities, and current Codex readiness blockers when no usable setup action ledger is available @spec @mvp
-- satelle repair does not assume previously completed setup actions succeeded unless the current host probes verify the resulting state @spec @mvp
-- satelle repair writes a new setup action ledger for the new repair run even when the previous setup action ledger expired or is missing @spec @mvp
-- satelle repair does not automatically execute a live-probe-derived repair plan solely because no usable setup action ledger is available @spec @mvp
+- label: satelle repair performs fresh OS-aware live probes before generating a repair plan when no usable setup action ledger is available
+  command: cargo test --locked -p satelle-host --lib storage::tests::setup_ledger::repair_replans_from_live_probes_when_ledger_history_is_missing -- --exact
+  tags: [spec, mvp, implemented, ci]
+- label: satelle repair generates a fresh idempotent action plan from current host probe results, effective configuration, target operating system, transport capabilities, and current Codex readiness blockers when no usable setup action ledger is available
+  command: cargo test --locked -p satelle-host --lib storage::tests::setup_ledger::repair_replans_from_live_probes_when_ledger_history_is_missing -- --exact
+  tags: [spec, mvp, implemented, ci]
+- label: satelle repair does not assume previously completed setup actions succeeded unless the current host probes verify the resulting state
+  command: cargo test --locked -p satelle-host --lib storage::tests::setup_ledger::repair_replans_from_live_probes_when_ledger_history_is_missing -- --exact
+  tags: [spec, mvp, implemented, ci]
+- label: satelle repair writes a new setup action ledger for the new repair run even when the previous setup action ledger expired or is missing
+  command: cargo test --locked -p satelle-host --lib storage::tests::setup_ledger::repair_replans_from_live_probes_when_ledger_history_is_missing -- --exact
+  tags: [spec, mvp, implemented, ci]
+- label: satelle repair does not automatically execute a live-probe-derived repair plan solely because no usable setup action ledger is available
+  command: cargo test --locked -p satelle-host --lib storage::tests::setup_ledger::repair_replans_from_live_probes_when_ledger_history_is_missing -- --exact
+  tags: [spec, mvp, implemented, ci]
 - satelle repair follows the same plan presentation, final interactive confirmation, --dry-run, --yes, and --no-input --yes mutation consent rules when no usable setup action ledger is available @spec @mvp
 - satelle repair with no usable setup action ledger requires --no-input --yes before mutating the remote host in non-interactive mode @spec @mvp
 - satelle repair --dry-run with no usable setup action ledger reports the live-probe-derived repair plan without mutating the remote host @spec @mvp
@@ -1943,15 +1993,27 @@
 - satelle treats missing, stale, or invalidated native Computer Use readiness cache entries as requiring a live harmless native Computer Use smoke test before prompt execution @spec @mvp
 - satelle invalidates native Computer Use readiness cache entries when the target host, OS user or desktop session, Codex version, native Computer Use runtime version, Computer Use plugin version, detectable OS permission state, or detectable app approval state changes @spec @mvp
 - satelle retains failed native Computer Use readiness cache entries for diagnostics but does not treat a cached failure as the only current blocker when the host and Codex control plane are reachable for a fresh prompt execution attempt @spec @mvp
-- satelle native Computer Use readiness smoke tests use a 120 second timeout by default @spec @mvp
+- label: satelle native Computer Use readiness smoke tests use a 120 second timeout by default
+  command: cargo test --locked -p satelle-host --lib tests::admission_request_timeout_tracks_both_configured_readiness_phases -- --exact
+  tags: [spec, mvp, implemented, ci]
 - satelle native Computer Use readiness smoke-test timeout values are configurable per host or profile @spec @mvp
 - satelle timeouts.native_readiness configuration values are human duration strings with explicit units such as "120s" or "2m" @implemented @mvp
 - satelle rejects bare integer timeouts.native_readiness configuration values with a typed duration-unit-required configuration error @implemented @mvp
-- satelle run and steer do not wait indefinitely for native Computer Use readiness smoke tests before prompt execution @spec @mvp
-- satelle reports a typed native-readiness-timeout error when a native Computer Use readiness smoke test exceeds its effective timeout @spec @mvp
-- a native Computer Use readiness smoke-test timeout requests upstream cancellation and blocks prompt execution @spec @mvp
-- a timed-out native readiness probe stores a terminal timed_out Readiness Result and releases its Control Lease only after the Codex adapter confirms that no upstream probe Turn remains active @spec @mvp
-- when timed-out native readiness probe cancellation cannot be confirmed, Satelle records outcome_unknown diagnostics, keeps the Control Lease recovery_pending, and blocks conflicting Turn or probe admission until reconciliation succeeds @spec @mvp
+- label: satelle run and steer do not wait indefinitely for native Computer Use readiness smoke tests before prompt execution
+  command: cargo test --locked -p satelle-host --lib runtime::tests::confirmed_native_probe_timeout_is_terminal_and_releases_control -- --exact
+  tags: [spec, mvp, implemented, ci]
+- label: satelle reports a typed native-readiness-timeout error when a native Computer Use readiness smoke test exceeds its effective timeout
+  command: cargo test --locked -p satelle-host --lib runtime::tests::confirmed_native_probe_timeout_is_terminal_and_releases_control -- --exact
+  tags: [spec, mvp, implemented, ci]
+- label: a native Computer Use readiness smoke-test timeout requests upstream cancellation and blocks prompt execution
+  command: cargo test --locked -p satelle-host --lib runtime::tests::confirmed_native_probe_timeout_is_terminal_and_releases_control -- --exact
+  tags: [spec, mvp, implemented, ci]
+- label: a timed-out native readiness probe stores a terminal timed_out Readiness Result and releases its Control Lease only after the Codex adapter confirms that no upstream probe Turn remains active
+  command: cargo test --locked -p satelle-host --lib runtime::tests::confirmed_native_probe_timeout_is_terminal_and_releases_control -- --exact
+  tags: [spec, mvp, implemented, ci]
+- label: when timed-out native readiness probe cancellation cannot be confirmed, Satelle records outcome_unknown diagnostics, keeps the Control Lease recovery_pending, and blocks conflicting Turn or probe admission until reconciliation succeeds
+  command: cargo test --locked -p satelle-host --lib runtime::tests::unknown_native_probe_timeout_blocks_until_terminal_reconciliation -- --exact
+  tags: [spec, mvp, implemented, ci]
 - label: satelle does not allow prompt execution or remote-control flows on hosts that fail native Codex Computer Use readiness
   command: cargo test --locked -p satelle-host --lib tests::unsupported_or_unproven_production_execution_is_blocked_before_admission -- --exact
   tags: [spec, mvp, implemented, ci]
@@ -1979,15 +2041,27 @@
 - satelle provider smoke tests distinguish selected provider or model failure from native Computer Use readiness failures such as missing OS permissions, app approval prompts, locked desktop state, or inability to open the probe target @spec @mvp
 - satelle provider smoke tests report readiness blockers or manual-action-required when the probe cannot run because native Computer Use cannot access the probe target @spec @mvp
 - satelle provider smoke tests time out, close or retire the probe surface, and clean up probe session state after completion or failure @spec @mvp
-- satelle provider smoke tests use a 120 second timeout by default @spec @mvp
+- label: satelle provider smoke tests use a 120 second timeout by default
+  command: cargo test --locked -p satelle-host --lib tests::admission_request_timeout_tracks_both_configured_readiness_phases -- --exact
+  tags: [spec, mvp, implemented, ci]
 - satelle provider smoke-test timeout values are configurable per host or profile @spec @mvp
 - satelle timeouts.provider_smoke_test configuration values are human duration strings with explicit units such as "120s" or "2m" @implemented @mvp
 - satelle rejects bare integer timeouts.provider_smoke_test configuration values with a typed duration-unit-required configuration error @implemented @mvp
-- satelle run and steer do not wait indefinitely for provider smoke tests before prompt execution @spec @mvp
-- satelle reports a typed provider-smoke-test-timeout error when a provider smoke test exceeds its effective timeout @spec @mvp
-- a provider smoke-test timeout requests upstream cancellation and blocks prompt execution @spec @mvp
-- a timed-out provider probe stores a terminal timed_out Readiness Result and releases its Control Lease only after the Codex adapter confirms that no upstream probe Turn remains active @spec @mvp
-- when timed-out provider probe cancellation cannot be confirmed, Satelle records outcome_unknown diagnostics, keeps the Control Lease recovery_pending, and blocks conflicting Turn or probe admission until reconciliation succeeds @spec @mvp
+- label: satelle run and steer do not wait indefinitely for provider smoke tests before prompt execution
+  command: cargo test --locked -p satelle-host --lib codex_session::tests::timed_provider_exchange_requests_correlated_upstream_cancellation -- --exact
+  tags: [spec, mvp, implemented, ci]
+- label: satelle reports a typed provider-smoke-test-timeout error when a provider smoke test exceeds its effective timeout
+  command: cargo test --locked -p satelle-host --lib runtime::codex_adapter::tests::provider_smoke_timeout_and_incompatibility_remain_distinct -- --exact
+  tags: [spec, mvp, implemented, ci]
+- label: a provider smoke-test timeout requests upstream cancellation and blocks prompt execution
+  command: cargo test --locked -p satelle-host --lib codex_session::tests::timed_provider_exchange_requests_correlated_upstream_cancellation -- --exact
+  tags: [spec, mvp, implemented, ci]
+- label: a timed-out provider probe stores a terminal timed_out Readiness Result and releases its Control Lease only after the Codex adapter confirms that no upstream probe Turn remains active
+  command: cargo test --locked -p satelle-host --lib runtime::tests::unknown_provider_probe_ownership_blocks_probe_and_prompt_until_terminal_reconciliation -- --exact
+  tags: [spec, mvp, implemented, ci]
+- label: when timed-out provider probe cancellation cannot be confirmed, Satelle records outcome_unknown diagnostics, keeps the Control Lease recovery_pending, and blocks conflicting Turn or probe admission until reconciliation succeeds
+  command: cargo test --locked -p satelle-host --lib runtime::tests::unknown_provider_probe_ownership_blocks_probe_and_prompt_until_terminal_reconciliation -- --exact
+  tags: [spec, mvp, implemented, ci]
 - satelle provider smoke tests store normalized pass/fail metadata and typed failure reasons but do not store screenshots, full transcripts, or desktop recordings by default @spec @mvp
 - satelle provider smoke test cache misses during prompt execution trigger a live provider smoke test when the selected provider requires experimental provider Computer Use and the user has opted into that experimental mode @spec @mvp
 - satelle live provider smoke test failures block prompt execution and store the normalized failure result in the Host Daemon cache @spec @mvp
