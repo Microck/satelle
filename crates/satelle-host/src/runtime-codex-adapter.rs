@@ -8,6 +8,7 @@ use crate::codex_session::{
     CodexApprovalPolicy, CodexSandboxPolicy, CodexSessionControl, CodexSessionError,
     CodexSessionFailure, CodexSessionRequest, CodexSessionTerminal, CodexTurnReadRequest,
     CodexTurnStatus, read_codex_turn, run_codex_session,
+    run_codex_session_with_timeout_cancellation,
 };
 use command_group::{CommandGroup, GroupChild};
 use satelle_core::session::{
@@ -28,6 +29,7 @@ use time::format_description::well_known::Rfc3339;
 const DEFAULT_MODEL_BINDING: &str = "codex-default";
 const DEFAULT_PROVIDER_BINDING: &str = "codex-default";
 const NATIVE_ADAPTER: &str = "codex-native-computer-use";
+const PROVIDER_SMOKE_CANCELLATION_GRACE: Duration = Duration::from_secs(5);
 
 #[derive(Debug)]
 struct ProviderSmokeAttemptFailure {
@@ -411,7 +413,7 @@ impl ProductionComputerUseAdapter {
         );
         let mut persist_thread = |_value: &str| Ok(());
         let mut persist_turn = |_value: &str| Ok(());
-        let terminal = run_codex_session(
+        let run = run_codex_session_with_timeout_cancellation(
             crate::codex_capabilities::installed_app_server_command(),
             CodexSessionRequest {
                 working_directory: &working_directory,
@@ -429,8 +431,14 @@ impl ProductionComputerUseAdapter {
                 persist_turn_ref: &mut persist_turn,
                 control: None,
             },
-        )
-        .map_err(|failure| provider_smoke_session_failure(failure.error()))?;
+            PROVIDER_SMOKE_CANCELLATION_GRACE,
+        );
+        if let Some(observation) = run.cancellation {
+            return Err(provider_smoke_timeout_after_cancellation(observation));
+        }
+        let terminal = run
+            .result
+            .map_err(|failure| provider_smoke_session_failure(failure.error()))?;
         if terminal != CodexSessionTerminal::Completed {
             return Err(provider_smoke_session_failure(
                 CodexSessionError::ResponseError,
@@ -698,6 +706,22 @@ fn provider_smoke_session_failure(error: CodexSessionError) -> SatelleError {
         ),
     };
     provider_smoke_error(code, reason)
+}
+
+fn provider_smoke_timeout_after_cancellation(observation: StopObservation) -> SatelleError {
+    let mut error = provider_smoke_session_failure(CodexSessionError::Timeout);
+    let cancellation = match observation {
+        StopObservation::CancellationConfirmed | StopObservation::UpstreamInactiveConfirmed => {
+            "confirmed"
+        }
+        StopObservation::UpstreamStillActive => "upstream_still_active",
+        StopObservation::OutcomeUnknown => "outcome_unknown",
+    };
+    error.details.insert(
+        "provider_smoke_cancellation".to_string(),
+        Value::String(cancellation.to_string()),
+    );
+    error
 }
 
 fn provider_smoke_failure(error: crate::provider_probe::ProviderProbeError) -> SatelleError {

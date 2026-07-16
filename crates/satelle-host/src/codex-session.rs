@@ -104,6 +104,11 @@ pub(crate) enum CodexSessionTerminal {
     StoppedByControl,
 }
 
+pub(crate) struct TimedCodexSessionRun {
+    pub(crate) result: Result<CodexSessionTerminal, CodexSessionFailure>,
+    pub(crate) cancellation: Option<StopObservation>,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum CodexTurnStatus {
     InProgress,
@@ -264,6 +269,56 @@ pub(crate) fn run_codex_session(
     };
     let mut exchange = SessionExchange::new(request, control);
     run_exchange(command, working_directory, deadline, &mut exchange)
+}
+
+/// Runs a provider probe until its user-visible timeout, then uses the same
+/// correlated control channel as a normal Turn stop to request upstream
+/// cancellation. The exchange deadline includes a short grace period so the
+/// app server can confirm that the probe Turn is no longer active.
+pub(crate) fn run_codex_session_with_timeout_cancellation(
+    command: Command,
+    mut request: CodexSessionRequest<'_>,
+    cancellation_grace: Duration,
+) -> TimedCodexSessionRun {
+    let timeout_deadline = request.deadline;
+    let cancellation_deadline = timeout_deadline
+        .checked_add(cancellation_grace)
+        .unwrap_or(timeout_deadline);
+    let control = CodexSessionControl::new(cancellation_deadline);
+    request.deadline = cancellation_deadline;
+    request.control = Some(control.clone());
+
+    let (finished_sender, finished_receiver) = mpsc::channel();
+    let cancellation_control = control.clone();
+    let watchdog = std::thread::spawn(move || {
+        let remaining = timeout_deadline.saturating_duration_since(Instant::now());
+        match finished_receiver.recv_timeout(remaining) {
+            Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => None,
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                let observation = cancellation_control.interrupt();
+                if matches!(
+                    observation,
+                    StopObservation::CancellationConfirmed
+                        | StopObservation::UpstreamInactiveConfirmed
+                ) {
+                    // The exchange deliberately waits for this acknowledgement
+                    // before releasing its contained app-server process group.
+                    cancellation_control.stop_committed();
+                }
+                Some(observation)
+            }
+        }
+    });
+
+    let result = run_codex_session(command, request);
+    let _ = finished_sender.send(());
+    let cancellation = watchdog
+        .join()
+        .unwrap_or(Some(StopObservation::OutcomeUnknown));
+    TimedCodexSessionRun {
+        result,
+        cancellation,
+    }
 }
 
 pub(crate) fn read_codex_turn(
