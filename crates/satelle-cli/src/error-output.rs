@@ -186,6 +186,7 @@ fn error_class(code: ErrorCode) -> (ErrorCategory, bool) {
         | ErrorCode::ConcurrencyWithoutRemoteUpdate
         | ErrorCode::ComponentSelectionConflict
         | ErrorCode::UnsupportedUpdateComponent
+        | ErrorCode::SetupConsentRequired
         | ErrorCode::InputRequired => (ErrorCategory::InvalidRequest, false),
         ErrorCode::CertificateUntrusted
         | ErrorCode::CertificateHostnameMismatch

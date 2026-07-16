@@ -79,6 +79,7 @@ impl SatelleConfig {
                 daemon_state_dir: None,
                 daemon_cache_dir: None,
                 daemon_log_dir: None,
+                setup_mode: None,
                 experimental_provider_computer_use: None,
                 yolo: None,
                 allow_project_selection: false,
@@ -141,6 +142,7 @@ pub struct HostConfig {
     pub daemon_state_dir: Option<PathBuf>,
     pub daemon_cache_dir: Option<PathBuf>,
     pub daemon_log_dir: Option<PathBuf>,
+    pub setup_mode: Option<SetupMode>,
     pub experimental_provider_computer_use: Option<bool>,
     pub yolo: Option<bool>,
     #[serde(default)]
@@ -153,6 +155,22 @@ pub struct HostConfig {
     pub ca_bundle: Option<PathBuf>,
     #[serde(default)]
     pub provider_auth: BTreeMap<String, ProviderSecretSource>,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SetupMode {
+    OnDemand,
+    Persistent,
+}
+
+impl SetupMode {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::OnDemand => "on_demand",
+            Self::Persistent => "persistent",
+        }
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -865,6 +883,7 @@ fn reject_interpolation(path: &Path, value: &toml::Value) -> Result<(), SatelleE
             "daemon_state_dir",
             "daemon_cache_dir",
             "daemon_log_dir",
+            "setup_mode",
             "native_readiness_cache_ttl",
         ] {
             collect_interpolation_for_value(
@@ -1272,6 +1291,7 @@ fn reject_unknown_user_config_keys(path: &Path, value: &toml::Value) -> Result<(
                     "daemon_state_dir",
                     "daemon_cache_dir",
                     "daemon_log_dir",
+                    "setup_mode",
                     "experimental_provider_computer_use",
                     "yolo",
                     "allow_project_selection",
@@ -1484,6 +1504,7 @@ pub enum ErrorCode {
     ConcurrencyWithoutRemoteUpdate,
     ComponentSelectionConflict,
     UnsupportedUpdateComponent,
+    SetupConsentRequired,
     InputRequired,
     NotImplemented,
 }
@@ -1553,6 +1574,7 @@ impl ErrorCode {
             Self::ConcurrencyWithoutRemoteUpdate => "concurrency-without-remote-update",
             Self::ComponentSelectionConflict => "component-selection-conflict",
             Self::UnsupportedUpdateComponent => "unsupported-update-component",
+            Self::SetupConsentRequired => "setup-consent-required",
             Self::InputRequired => "input-required",
             Self::NotImplemented => "not-implemented",
         }
@@ -1570,6 +1592,7 @@ impl ErrorCode {
             | Self::ConcurrencyWithoutRemoteUpdate
             | Self::ComponentSelectionConflict
             | Self::UnsupportedUpdateComponent
+            | Self::SetupConsentRequired
             | Self::InputRequired => 64,
             Self::CompletionInstallFailed | Self::CompletionProfileUpdateFailed => 73,
             Self::StorageIntegrityFailed => 65,
@@ -2415,6 +2438,29 @@ impl SatelleError {
             recovery_command: Some("pass a prompt argument or pipe prompt text to '-'".to_string()),
             source_detail: None,
             details: BTreeMap::new(),
+        }
+    }
+
+    pub fn setup_consent_required(
+        planned_actions: &[String],
+        recovery_command: impl Into<String>,
+    ) -> Self {
+        let mut details = BTreeMap::new();
+        details.insert(
+            "planned_actions".to_string(),
+            Value::Array(planned_actions.iter().cloned().map(Value::String).collect()),
+        );
+        details.insert("applied_actions".to_string(), Value::Array(Vec::new()));
+        details.insert("mutated".to_string(), Value::Bool(false));
+
+        Self {
+            code: ErrorCode::SetupConsentRequired,
+            message:
+                "setup has planned mutations that require explicit consent; no changes were applied"
+                    .to_string(),
+            recovery_command: Some(recovery_command.into()),
+            source_detail: None,
+            details,
         }
     }
 
