@@ -29,7 +29,8 @@ use self::open::LOCK_FILE_NAME;
 use self::open::{PROTECTED_FILE_NAMES, sqlite_error};
 pub use self::setup_ledger::{
     SetupActionPlan, SetupActionRecord, SetupActionSkipReason, SetupActionStatus,
-    SetupOperationKind, SetupRunPlan, SetupRunRecord, SetupRunStatus,
+    SetupOperationKind, SetupRepairAction, SetupRepairDecision, SetupRepairPlan,
+    SetupRepairPostcondition, SetupRepairProbe, SetupRunPlan, SetupRunRecord, SetupRunStatus,
 };
 use self::sql::{
     StoredIdempotency, ensure_control_lease_available, ensure_no_pending_stop,

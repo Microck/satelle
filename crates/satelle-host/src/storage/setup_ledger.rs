@@ -1,6 +1,6 @@
 use super::codec::{format_time, parse_time, validated_private_reference};
 use super::{Storage, StorageError, StorageErrorKind, sqlite_error};
-use rusqlite::{OptionalExtension, Transaction, TransactionBehavior, params};
+use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 use satelle_core::session::DesktopBindingRef;
 use std::collections::{HashMap, HashSet};
 use time::OffsetDateTime;
@@ -341,6 +341,126 @@ impl SetupRunRecord {
     }
 }
 
+/// Result of the live postcondition probe for one repairable setup action.
+/// Repair never infers this state from a prior ledger outcome.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SetupRepairPostcondition {
+    Satisfied,
+    Unsatisfied,
+    Unknown,
+}
+
+/// A current repair candidate paired with its live postcondition result.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SetupRepairProbe {
+    action: SetupActionPlan,
+    postcondition: SetupRepairPostcondition,
+}
+
+impl SetupRepairProbe {
+    pub fn new(
+        action_id: impl Into<String>,
+        label: impl Into<String>,
+        retry_safe: bool,
+        postcondition: SetupRepairPostcondition,
+    ) -> Result<Self, satelle_core::SatelleError> {
+        Self::try_new(action_id, label, retry_safe, postcondition)
+            .map_err(crate::runtime::storage_error)
+    }
+
+    pub(crate) fn try_new(
+        action_id: impl Into<String>,
+        label: impl Into<String>,
+        retry_safe: bool,
+        postcondition: SetupRepairPostcondition,
+    ) -> Result<Self, StorageError> {
+        Ok(Self {
+            action: SetupActionPlan::try_new(action_id, label, retry_safe)?,
+            postcondition,
+        })
+    }
+
+    pub fn action(&self) -> &SetupActionPlan {
+        &self.action
+    }
+
+    pub const fn postcondition(&self) -> SetupRepairPostcondition {
+        self.postcondition
+    }
+}
+
+/// Repair disposition derived from current probes and retained ledger safety
+/// metadata. Only `RetryAutomatically` authorizes an unattended retry.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SetupRepairDecision {
+    NoActionRequired,
+    RetryAutomatically,
+    OperatorActionRequired,
+    ProbeRequired,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SetupRepairAction {
+    action_id: String,
+    label: String,
+    decision: SetupRepairDecision,
+    retry_safe: bool,
+    previous_run_id: Option<String>,
+    previous_status: Option<SetupActionStatus>,
+}
+
+impl SetupRepairAction {
+    pub fn action_id(&self) -> &str {
+        &self.action_id
+    }
+
+    pub fn label(&self) -> &str {
+        &self.label
+    }
+
+    pub const fn decision(&self) -> SetupRepairDecision {
+        self.decision
+    }
+
+    /// This is the effective retry-safety value. When history exists, both
+    /// the retained action and the current repair candidate must permit retry.
+    pub const fn retry_safe(&self) -> bool {
+        self.retry_safe
+    }
+
+    pub fn previous_run_id(&self) -> Option<&str> {
+        self.previous_run_id.as_deref()
+    }
+
+    pub const fn previous_status(&self) -> Option<SetupActionStatus> {
+        self.previous_status
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SetupRepairPlan {
+    actions: Vec<SetupRepairAction>,
+}
+
+impl SetupRepairPlan {
+    pub fn actions(&self) -> &[SetupRepairAction] {
+        &self.actions
+    }
+
+    pub fn automatic_actions(&self) -> impl Iterator<Item = &SetupRepairAction> {
+        self.actions
+            .iter()
+            .filter(|action| action.decision == SetupRepairDecision::RetryAutomatically)
+    }
+}
+
+struct PreviousSetupAction {
+    run_id: String,
+    status: SetupActionStatus,
+    retry_safe: bool,
+    row_id: i64,
+}
+
 impl Storage {
     pub(crate) fn begin_setup_run(&mut self, plan: &SetupRunPlan) -> Result<(), StorageError> {
         let host_identity = self.host_identity()?;
@@ -348,6 +468,12 @@ impl Storage {
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|source| sqlite_error(StorageErrorKind::OperationFailed, source))?;
+        // Planning and execution are separate API calls. Reserving mutation
+        // scope inside the write transaction closes the race between callers
+        // that both planned before either persisted its run.
+        if active_setup_run_in_scope(&transaction, plan.desktop_binding.as_ref())? {
+            return Err(StorageError::new(StorageErrorKind::StateConflict));
+        }
         transaction
             .execute(
                 "INSERT INTO setup_runs (
@@ -676,6 +802,125 @@ impl Storage {
         }))
     }
 
+    /// Combines current live probes with the latest retained record for each
+    /// action. Missing history is intentionally not an error: current probes
+    /// can produce a complete repair plan without the ledger.
+    pub(crate) fn plan_setup_repair(
+        &self,
+        desktop_binding: Option<&DesktopBindingRef>,
+        probes: &[SetupRepairProbe],
+    ) -> Result<SetupRepairPlan, StorageError> {
+        let mut action_ids = HashSet::with_capacity(probes.len());
+        if probes
+            .iter()
+            .any(|probe| !action_ids.insert(probe.action.action_id.as_str()))
+        {
+            return Err(StorageError::new(StorageErrorKind::InvalidInput));
+        }
+        if active_setup_run_in_scope(&self.connection, desktop_binding)? {
+            return Err(StorageError::new(StorageErrorKind::StateConflict));
+        }
+
+        let history = self.latest_setup_actions(desktop_binding)?;
+        let actions = probes
+            .iter()
+            .map(|probe| {
+                let previous = history.get(probe.action.action_id.as_str());
+                // A newer definition cannot silently upgrade a historically
+                // unsafe action into an unattended retry.
+                let retry_safe =
+                    probe.action.retry_safe && previous.is_none_or(|action| action.retry_safe);
+                let decision = match probe.postcondition {
+                    SetupRepairPostcondition::Satisfied => SetupRepairDecision::NoActionRequired,
+                    SetupRepairPostcondition::Unknown => SetupRepairDecision::ProbeRequired,
+                    SetupRepairPostcondition::Unsatisfied if retry_safe => {
+                        SetupRepairDecision::RetryAutomatically
+                    }
+                    SetupRepairPostcondition::Unsatisfied => {
+                        SetupRepairDecision::OperatorActionRequired
+                    }
+                };
+                SetupRepairAction {
+                    action_id: probe.action.action_id.clone(),
+                    label: probe.action.label.clone(),
+                    decision,
+                    retry_safe,
+                    previous_run_id: previous.map(|action| action.run_id.clone()),
+                    previous_status: previous.map(|action| action.status),
+                }
+            })
+            .collect();
+        Ok(SetupRepairPlan { actions })
+    }
+
+    fn latest_setup_actions(
+        &self,
+        desktop_binding: Option<&DesktopBindingRef>,
+    ) -> Result<HashMap<String, PreviousSetupAction>, StorageError> {
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT runs.rowid, runs.run_id, actions.action_id, actions.status,
+                        actions.retry_safe
+                 FROM setup_actions AS actions
+                 JOIN setup_runs AS runs ON runs.run_id = actions.run_id
+                 WHERE runs.satelle_version = ?1
+                   AND (
+                       (?2 IS NULL AND runs.desktop_binding_ref IS NULL)
+                       OR runs.desktop_binding_ref = ?2
+                   )",
+            )
+            .map_err(|source| sqlite_error(StorageErrorKind::InvalidStoredState, source))?;
+        let rows = statement
+            .query_map(
+                params![
+                    env!("CARGO_PKG_VERSION"),
+                    desktop_binding.map(DesktopBindingRef::as_str)
+                ],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, i64>(4)?,
+                    ))
+                },
+            )
+            .map_err(|source| sqlite_error(StorageErrorKind::InvalidStoredState, source))?;
+        let mut latest: HashMap<String, PreviousSetupAction> = HashMap::new();
+        for row in rows {
+            let (row_id, run_id, action_id, status, retry_safe) =
+                row.map_err(|source| sqlite_error(StorageErrorKind::InvalidStoredState, source))?;
+            let run_id = validated_stored_private_reference(run_id)?;
+            let action_id = validated_stored_private_reference(action_id)?;
+            let status = SetupActionStatus::parse(&status)?;
+            let retry_safe = parse_boolean(retry_safe)?;
+            if let Some(action) = latest.get_mut(&action_id) {
+                // Every compatible record contributes its safety marker. The
+                // context shown to callers comes from the most recently
+                // inserted run, which remains monotonic across clock changes.
+                action.retry_safe &= retry_safe;
+                if row_id > action.row_id {
+                    action.run_id = run_id;
+                    action.status = status;
+                    action.row_id = row_id;
+                }
+                continue;
+            }
+            latest.insert(
+                action_id,
+                PreviousSetupAction {
+                    run_id,
+                    status,
+                    retry_safe,
+                    row_id,
+                },
+            );
+        }
+        Ok(latest)
+    }
+
     fn transition_started_action(
         &mut self,
         run_id: &str,
@@ -734,11 +979,53 @@ impl Storage {
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|source| sqlite_error(StorageErrorKind::OperationFailed, source))?;
+        // Seed every interrupted run, including crashes before the first
+        // action or between actions. Terminal timestamps contribute to the
+        // clamp so a backward wall-clock change cannot violate ledger order.
+        let mut run_recovery_times = HashMap::new();
+        {
+            let mut statement = transaction
+                .prepare(
+                    "SELECT setup_runs.run_id, setup_runs.started_at,
+                            setup_actions.started_at, setup_actions.finished_at
+                     FROM setup_runs
+                     LEFT JOIN setup_actions USING (run_id)
+                     WHERE setup_runs.status = 'running'",
+                )
+                .map_err(|source| sqlite_error(StorageErrorKind::InvalidStoredState, source))?;
+            let rows = statement
+                .query_map([], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                        row.get::<_, Option<String>>(3)?,
+                    ))
+                })
+                .map_err(|source| sqlite_error(StorageErrorKind::InvalidStoredState, source))?;
+            for row in rows {
+                let (run_id, run_started_at, action_started_at, action_finished_at) = row
+                    .map_err(|source| sqlite_error(StorageErrorKind::InvalidStoredState, source))?;
+                let run_id = validated_stored_private_reference(run_id)?;
+                let mut recovered_at = detected_at.max(parse_time(&run_started_at)?);
+                if let Some(started_at) = action_started_at {
+                    recovered_at = recovered_at.max(parse_time(&started_at)?);
+                }
+                if let Some(finished_at) = action_finished_at {
+                    recovered_at = recovered_at.max(parse_time(&finished_at)?);
+                }
+                run_recovery_times
+                    .entry(run_id)
+                    .and_modify(|existing: &mut OffsetDateTime| {
+                        *existing = (*existing).max(recovered_at);
+                    })
+                    .or_insert(recovered_at);
+            }
+        }
         let interrupted_actions = {
             let mut statement = transaction
                 .prepare(
-                    "SELECT setup_actions.run_id, setup_actions.action_id,
-                            setup_actions.started_at, setup_runs.started_at
+                    "SELECT setup_actions.run_id, setup_actions.action_id
                      FROM setup_actions
                      JOIN setup_runs USING (run_id)
                      WHERE setup_actions.status = 'started'
@@ -747,22 +1034,18 @@ impl Storage {
                 .map_err(|source| sqlite_error(StorageErrorKind::InvalidStoredState, source))?;
             let rows = statement
                 .query_map([], |row| {
-                    Ok((
-                        row.get::<_, String>(0)?,
-                        row.get::<_, String>(1)?,
-                        row.get::<_, String>(2)?,
-                        row.get::<_, String>(3)?,
-                    ))
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
                 })
                 .map_err(|source| sqlite_error(StorageErrorKind::InvalidStoredState, source))?;
             rows.collect::<Result<Vec<_>, _>>()
                 .map_err(|source| sqlite_error(StorageErrorKind::InvalidStoredState, source))?
         };
-        let mut run_recovery_times = HashMap::new();
-        for (run_id, action_id, action_started_at, run_started_at) in interrupted_actions {
-            let recovered_at = detected_at
-                .max(parse_time(&action_started_at)?)
-                .max(parse_time(&run_started_at)?);
+        for (run_id, action_id) in interrupted_actions {
+            let run_id = validated_stored_private_reference(run_id)?;
+            let action_id = validated_stored_private_reference(action_id)?;
+            let recovered_at = *run_recovery_times
+                .get(&run_id)
+                .ok_or_else(|| StorageError::new(StorageErrorKind::InvalidStoredState))?;
             let changed = transaction
                 .execute(
                     "UPDATE setup_actions
@@ -777,12 +1060,6 @@ impl Storage {
                 )
                 .map_err(|source| sqlite_error(StorageErrorKind::OperationFailed, source))?;
             require_one_transition(changed)?;
-            run_recovery_times
-                .entry(run_id)
-                .and_modify(|existing: &mut OffsetDateTime| {
-                    *existing = (*existing).max(recovered_at);
-                })
-                .or_insert(recovered_at);
         }
         for (run_id, recovered_at) in run_recovery_times {
             let changed = transaction
@@ -799,6 +1076,30 @@ impl Storage {
             .commit()
             .map_err(|source| sqlite_error(StorageErrorKind::OperationFailed, source))
     }
+}
+
+fn active_setup_run_in_scope(
+    connection: &Connection,
+    desktop_binding: Option<&DesktopBindingRef>,
+) -> Result<bool, StorageError> {
+    connection
+        .query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM setup_runs
+                WHERE status = 'running'
+                  AND satelle_version = ?1
+                  AND (
+                      (?2 IS NULL AND desktop_binding_ref IS NULL)
+                      OR desktop_binding_ref = ?2
+                  )
+             )",
+            params![
+                env!("CARGO_PKG_VERSION"),
+                desktop_binding.map(DesktopBindingRef::as_str)
+            ],
+            |row| row.get(0),
+        )
+        .map_err(|source| sqlite_error(StorageErrorKind::OperationFailed, source))
 }
 
 fn require_running_run(transaction: &Transaction<'_>, run_id: &str) -> Result<(), StorageError> {
