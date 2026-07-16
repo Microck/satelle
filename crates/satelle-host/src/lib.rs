@@ -63,6 +63,8 @@ use test_runtime::PendingComputerUseAdapter;
 
 const DEFAULT_NATIVE_READINESS_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
 const DEFAULT_NATIVE_READINESS_TTL: time::Duration = time::Duration::minutes(5);
+const DEFAULT_PROVIDER_SMOKE_SUCCESS_TTL: time::Duration = time::Duration::hours(24);
+const DEFAULT_PROVIDER_SMOKE_FAILURE_TTL: time::Duration = time::Duration::minutes(10);
 
 #[cfg(any(test, feature = "test-support"))]
 #[doc(hidden)]
@@ -152,8 +154,8 @@ impl HostService {
         Self::production_for_host(&config)
     }
 
-    /// Builds a production Host whose native probe timeout and cache TTL come
-    /// from the fully resolved host/profile configuration.
+    /// Builds a production Host whose probe timeouts and cache TTLs come from
+    /// the fully resolved host/profile configuration.
     pub fn production_for_host(config: &HostConfig) -> Self {
         let snapshot = Arc::new(RwLock::new(ProductionCapabilitySnapshot::collect(None)));
         let state_root = satelle_core::state_dir();
@@ -168,14 +170,10 @@ impl HostService {
             .map_or(DEFAULT_NATIVE_READINESS_TIMEOUT, |duration| {
                 std::time::Duration::from_millis(duration.milliseconds())
             });
-        let ttl = config.native_readiness_cache_ttl.as_ref().map_or(
-            DEFAULT_NATIVE_READINESS_TTL,
-            |duration| {
-                time::Duration::milliseconds(
-                    i64::try_from(duration.milliseconds()).unwrap_or(i64::MAX),
-                )
-            },
-        );
+        let ttl = config
+            .native_readiness_cache_ttl
+            .as_ref()
+            .map_or(DEFAULT_NATIVE_READINESS_TTL, duration_to_time);
         let provider_smoke_timeout = config
             .timeouts
             .as_ref()
@@ -183,12 +181,22 @@ impl HostService {
             .map_or(std::time::Duration::from_secs(120), |duration| {
                 std::time::Duration::from_millis(duration.milliseconds())
             });
+        let provider_smoke_success_ttl = config
+            .provider_smoke_success_cache_ttl
+            .as_ref()
+            .map_or(DEFAULT_PROVIDER_SMOKE_SUCCESS_TTL, duration_to_time);
+        let provider_smoke_failure_ttl = config
+            .provider_smoke_failure_cache_ttl
+            .as_ref()
+            .map_or(DEFAULT_PROVIDER_SMOKE_FAILURE_TTL, duration_to_time);
         let adapter = ProductionComputerUseAdapter::with_readiness_policy(
             Arc::clone(&snapshot),
             working_directory,
             timeout,
             ttl,
             provider_smoke_timeout,
+            provider_smoke_success_ttl,
+            provider_smoke_failure_ttl,
         );
         Self {
             runtime: RuntimeHandle::new(state_root, adapter),
@@ -411,6 +419,10 @@ impl HostService {
             sessions,
         })
     }
+}
+
+fn duration_to_time(duration: &satelle_core::ExplicitDuration) -> time::Duration {
+    time::Duration::milliseconds(i64::try_from(duration.milliseconds()).unwrap_or(i64::MAX))
 }
 fn execution_blocker(verdict: &Phase0SupportVerdict) -> SatelleError {
     if verdict.is_supported() {

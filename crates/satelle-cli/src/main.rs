@@ -2679,6 +2679,14 @@ fn effective_timeouts_json(host_config: &satelle_core::HostConfig) -> serde_json
         "provider_smoke_test_timeout_ms": timeouts
             .and_then(|timeouts| timeouts.provider_smoke_test.as_ref())
             .map(|duration| duration.milliseconds()),
+        "provider_smoke_success_cache_ttl_ms": host_config
+            .provider_smoke_success_cache_ttl
+            .as_ref()
+            .map(|duration| duration.milliseconds()),
+        "provider_smoke_failure_cache_ttl_ms": host_config
+            .provider_smoke_failure_cache_ttl
+            .as_ref()
+            .map(|duration| duration.milliseconds()),
     })
 }
 
