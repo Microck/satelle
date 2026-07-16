@@ -56,6 +56,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::sync::{Arc, RwLock, RwLockReadGuard};
 use std::time::Instant;
+pub use storage::{
+    SetupActionPlan, SetupActionRecord, SetupActionSkipReason, SetupActionStatus,
+    SetupOperationKind, SetupRunPlan, SetupRunRecord, SetupRunStatus,
+};
 #[cfg(any(test, feature = "test-support"))]
 use test_runtime::FakeComputerUseAdapter;
 #[cfg(feature = "test-support")]
@@ -150,6 +154,80 @@ fn replace_production_snapshot(
 }
 
 impl HostService {
+    /// Persists an ordered setup or repair plan before any action can mutate
+    /// the Host. CLI presentation and transport code do not get a separate
+    /// ledger path.
+    pub fn begin_setup_run(&self, plan: &SetupRunPlan) -> Result<(), SatelleError> {
+        self.runtime.begin_setup_run(plan)
+    }
+
+    /// Durably marks one planned action as started before external mutation.
+    pub fn start_setup_action(
+        &self,
+        run_id: &str,
+        action_id: &str,
+        started_at: time::OffsetDateTime,
+    ) -> Result<(), SatelleError> {
+        self.runtime
+            .start_setup_action(run_id, action_id, started_at)
+    }
+
+    /// Commits completion only through the postcondition-verified boundary.
+    pub fn complete_setup_action_after_verified_postcondition(
+        &self,
+        run_id: &str,
+        action_id: &str,
+        completed_at: time::OffsetDateTime,
+    ) -> Result<(), SatelleError> {
+        self.runtime
+            .complete_setup_action_after_verified_postcondition(run_id, action_id, completed_at)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn fail_setup_action(
+        &self,
+        run_id: &str,
+        action_id: &str,
+        error_code: &str,
+        exit_status: Option<i64>,
+        recovery_hint: Option<&str>,
+        failed_at: time::OffsetDateTime,
+    ) -> Result<(), SatelleError> {
+        self.runtime.fail_setup_action(
+            run_id,
+            action_id,
+            error_code,
+            exit_status,
+            recovery_hint,
+            failed_at,
+        )
+    }
+
+    pub fn skip_setup_action(
+        &self,
+        run_id: &str,
+        action_id: &str,
+        reason: SetupActionSkipReason,
+        skipped_at: time::OffsetDateTime,
+    ) -> Result<(), SatelleError> {
+        self.runtime
+            .skip_setup_action(run_id, action_id, reason, skipped_at)
+    }
+
+    /// Derives the terminal run status from committed action states rather
+    /// than accepting a caller-supplied outcome.
+    pub fn finish_setup_run(
+        &self,
+        run_id: &str,
+        finished_at: time::OffsetDateTime,
+    ) -> Result<SetupRunStatus, SatelleError> {
+        self.runtime.finish_setup_run(run_id, finished_at)
+    }
+
+    pub fn load_setup_run(&self, run_id: &str) -> Result<Option<SetupRunRecord>, SatelleError> {
+        self.runtime.load_setup_run(run_id)
+    }
+
     /// Builds the only runtime available in normal and release builds. The
     /// constructor retains only typed, diagnostic-safe capability evidence.
     pub fn production() -> Self {

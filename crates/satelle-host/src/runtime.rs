@@ -32,7 +32,7 @@ use crate::process_identity::ProcessIdentity;
 use crate::storage::{
     AdmissionOutcome, ApiTokenRegistration, IdempotentOperation, LeaseOwner, LogPageStorageError,
     ObservedUpstreamRef, ReadinessProbeKind, ReadinessProbeTerminal, SensitiveRequestDigest,
-    Storage, StorageSnapshot,
+    SetupActionSkipReason, SetupRunPlan, SetupRunRecord, SetupRunStatus, Storage, StorageSnapshot,
 };
 use crate::{ApiBearerToken, ApiPrincipal, DaemonLogPage, LogCursor, LogPageQuery};
 use recovery::RecoveryQueue;
@@ -843,6 +843,94 @@ impl std::fmt::Debug for RuntimeHandle {
 }
 
 impl RuntimeHandle {
+    pub(crate) fn begin_setup_run(&self, plan: &SetupRunPlan) -> Result<(), SatelleError> {
+        self.engine()?
+            .lock_storage()?
+            .begin_setup_run(plan)
+            .map_err(model::storage_failure)
+    }
+
+    pub(crate) fn start_setup_action(
+        &self,
+        run_id: &str,
+        action_id: &str,
+        started_at: time::OffsetDateTime,
+    ) -> Result<(), SatelleError> {
+        self.engine()?
+            .lock_storage()?
+            .start_setup_action(run_id, action_id, started_at)
+            .map_err(model::storage_failure)
+    }
+
+    pub(crate) fn complete_setup_action_after_verified_postcondition(
+        &self,
+        run_id: &str,
+        action_id: &str,
+        completed_at: time::OffsetDateTime,
+    ) -> Result<(), SatelleError> {
+        self.engine()?
+            .lock_storage()?
+            .complete_setup_action_after_verified_postcondition(run_id, action_id, completed_at)
+            .map_err(model::storage_failure)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn fail_setup_action(
+        &self,
+        run_id: &str,
+        action_id: &str,
+        error_code: &str,
+        exit_status: Option<i64>,
+        recovery_hint: Option<&str>,
+        failed_at: time::OffsetDateTime,
+    ) -> Result<(), SatelleError> {
+        self.engine()?
+            .lock_storage()?
+            .fail_setup_action(
+                run_id,
+                action_id,
+                error_code,
+                exit_status,
+                recovery_hint,
+                failed_at,
+            )
+            .map_err(model::storage_failure)
+    }
+
+    pub(crate) fn skip_setup_action(
+        &self,
+        run_id: &str,
+        action_id: &str,
+        reason: SetupActionSkipReason,
+        skipped_at: time::OffsetDateTime,
+    ) -> Result<(), SatelleError> {
+        self.engine()?
+            .lock_storage()?
+            .skip_setup_action(run_id, action_id, reason, skipped_at)
+            .map_err(model::storage_failure)
+    }
+
+    pub(crate) fn finish_setup_run(
+        &self,
+        run_id: &str,
+        finished_at: time::OffsetDateTime,
+    ) -> Result<SetupRunStatus, SatelleError> {
+        self.engine()?
+            .lock_storage()?
+            .finish_setup_run(run_id, finished_at)
+            .map_err(model::storage_failure)
+    }
+
+    pub(crate) fn load_setup_run(
+        &self,
+        run_id: &str,
+    ) -> Result<Option<SetupRunRecord>, SatelleError> {
+        self.engine()?
+            .lock_storage()?
+            .load_setup_run(run_id)
+            .map_err(model::storage_failure)
+    }
+
     #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn new<A: ComputerUseAdapter>(
         state_root: Result<PathBuf, SatelleError>,

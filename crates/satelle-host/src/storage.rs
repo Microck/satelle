@@ -4,6 +4,7 @@ mod logs;
 mod open;
 mod operational;
 mod retention;
+mod setup_ledger;
 mod sql;
 pub(crate) mod stop;
 #[cfg(test)]
@@ -26,6 +27,10 @@ use self::open::DATABASE_FILE_NAME;
 #[cfg(all(test, unix))]
 use self::open::LOCK_FILE_NAME;
 use self::open::{PROTECTED_FILE_NAMES, sqlite_error};
+pub use self::setup_ledger::{
+    SetupActionPlan, SetupActionRecord, SetupActionSkipReason, SetupActionStatus,
+    SetupOperationKind, SetupRunPlan, SetupRunRecord, SetupRunStatus,
+};
 use self::sql::{
     StoredIdempotency, ensure_control_lease_available, ensure_no_pending_stop,
     insert_control_lease, insert_idempotency, insert_initial_session, insert_safe_log, insert_turn,
@@ -667,7 +672,7 @@ impl Storage {
     #[cfg(test)]
     pub(crate) fn open(state_root: &Path) -> Result<(Self, Vec<RecoverySubject>), StorageError> {
         let mut storage = Self::open_without_restart_recovery(state_root)?;
-        let recovery_subjects = storage.mark_restart_recovery_pending()?;
+        let recovery_subjects = storage.initialize_restart_recovery()?;
         Ok((storage, recovery_subjects))
     }
 
@@ -688,6 +693,8 @@ impl Storage {
     pub(crate) fn initialize_restart_recovery(
         &mut self,
     ) -> Result<Vec<RecoverySubject>, StorageError> {
+        let detected_at = OffsetDateTime::now_utc();
+        self.mark_interrupted_setup_actions_outcome_unknown(detected_at)?;
         self.mark_restart_recovery_pending()
     }
 
