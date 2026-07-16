@@ -27,6 +27,7 @@ pub struct DaemonClient {
     base_url: String,
     token: ApiBearerToken,
     expected_host_identity: String,
+    admission_timeout: Option<Duration>,
 }
 
 impl DaemonClient {
@@ -75,6 +76,7 @@ impl DaemonClient {
             base_url: format!("http://{address}"),
             token,
             expected_host_identity,
+            admission_timeout: None,
         })
     }
 
@@ -110,7 +112,14 @@ impl DaemonClient {
             base_url: binding.origin().to_string(),
             token,
             expected_host_identity,
+            admission_timeout: None,
         })
+    }
+
+    /// Overrides the total deadline only for session and turn admission.
+    pub fn with_admission_timeout(mut self, admission_timeout: Duration) -> Self {
+        self.admission_timeout = Some(admission_timeout);
+        self
     }
 
     pub fn live(&self) -> Result<LiveResponse, DaemonClientError> {
@@ -183,11 +192,8 @@ impl DaemonClient {
     ) -> Result<SessionResponse, DaemonClientError> {
         let (request_builder, request_id) =
             self.mutation_request("/v1/sessions", idempotency_key)?;
-        self.send_authenticated(
-            request_builder.json(request),
-            request_id,
-            StatusCode::ACCEPTED,
-        )
+        let request = self.admission_request(request_builder.json(request));
+        self.send_authenticated(request, request_id, StatusCode::ACCEPTED)
     }
 
     pub fn create_turn(
@@ -198,11 +204,15 @@ impl DaemonClient {
     ) -> Result<SessionResponse, DaemonClientError> {
         let path = format!("/v1/sessions/{session_id}/turns");
         let (request_builder, request_id) = self.mutation_request(&path, idempotency_key)?;
-        self.send_authenticated(
-            request_builder.json(request),
-            request_id,
-            StatusCode::ACCEPTED,
-        )
+        let request = self.admission_request(request_builder.json(request));
+        self.send_authenticated(request, request_id, StatusCode::ACCEPTED)
+    }
+
+    fn admission_request(&self, request: RequestBuilder) -> RequestBuilder {
+        match self.admission_timeout {
+            Some(timeout) => request.timeout(timeout),
+            None => request,
+        }
     }
 
     pub fn read_session(
@@ -687,6 +697,30 @@ mod tests {
             "unexpected error: {error:?}"
         );
         server.join().expect("join stalled TLS server");
+    }
+
+    #[test]
+    fn admission_timeout_overrides_the_general_request_deadline() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback endpoint");
+        let address = listener.local_addr().expect("read loopback endpoint");
+        let admission_timeout = Duration::from_secs(245);
+        let client = DaemonClient::loopback_with_timeout(
+            address,
+            ApiBearerToken::generate().expect("generate token"),
+            "host-admission-timeout",
+            Duration::from_secs(30),
+        )
+        .expect("construct bounded loopback client")
+        .with_admission_timeout(admission_timeout);
+        let (request, _) = client
+            .mutation_request("/v1/sessions", "admission-timeout-test")
+            .expect("construct admission request");
+        let request = client
+            .admission_request(request)
+            .build()
+            .expect("build admission request");
+
+        assert_eq!(request.timeout(), Some(&admission_timeout));
     }
 
     #[test]

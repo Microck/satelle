@@ -312,6 +312,12 @@ struct HostStartCommand {
     /// retained only by this daemon process.
     #[arg(long, hide = true)]
     bootstrap_token_stdin: bool,
+    /// Internal resolved native readiness deadline for SSH bootstrap.
+    #[arg(long, hide = true, value_name = "MILLISECONDS")]
+    bootstrap_native_readiness_timeout_ms: Option<u64>,
+    /// Internal resolved provider smoke deadline for SSH bootstrap.
+    #[arg(long, hide = true, value_name = "MILLISECONDS")]
+    bootstrap_provider_smoke_timeout_ms: Option<u64>,
     #[command(flatten)]
     output_args: OutputArgs,
 }
@@ -2113,10 +2119,38 @@ fn start_host_daemon(
         .then(read_ssh_bootstrap_token)
         .transpose()?;
     let service = match (on_demand_host.as_ref(), bootstrap_token.as_ref()) {
-        (_, Some(token)) => HostService::production_for_ssh_bootstrap(
-            token,
-            OffsetDateTime::now_utc() + time::Duration::minutes(15),
-        ),
+        (_, Some(token)) => {
+            let mut host_config = satelle_core::SatelleConfig::defaults()
+                .hosts
+                .remove(LOCAL_DEMO_HOST)
+                .expect("the built-in local Host config exists");
+            match (
+                command.bootstrap_native_readiness_timeout_ms,
+                command.bootstrap_provider_smoke_timeout_ms,
+            ) {
+                (Some(native), Some(provider)) => {
+                    host_config.timeouts = Some(satelle_core::TimeoutConfig {
+                        native_readiness: satelle_core::ExplicitDuration::parse(&format!(
+                            "{native}ms"
+                        )),
+                        provider_smoke_test: satelle_core::ExplicitDuration::parse(&format!(
+                            "{provider}ms"
+                        )),
+                    });
+                }
+                (None, None) => {}
+                _ => {
+                    return Err(failure(SatelleError::invalid_usage(
+                        "SSH bootstrap readiness timeouts must be provided together",
+                    )));
+                }
+            }
+            HostService::production_for_ssh_bootstrap(
+                token,
+                OffsetDateTime::now_utc() + time::Duration::minutes(15),
+                &host_config,
+            )
+        }
         (Some(host), None) => HostService::production_for_host(&host.config),
         (None, None) => HostService::production(),
     };

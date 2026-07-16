@@ -11,6 +11,7 @@ use satelle_host::{LogPageQuery, LogSubject};
 use satelle_transport::{
     DaemonClientError, DaemonEventError, DaemonEventStream, EventSubscription, TurnRequest,
 };
+use std::collections::VecDeque;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -181,6 +182,8 @@ impl DirectTransport {
         &self,
         mut stream: DaemonEventStream,
         admitted: PublicSession,
+        buffered_events: Vec<SatelleEvent>,
+        initial_connection_error: Option<DaemonEventError>,
         on_event: &mut dyn FnMut(SatelleEvent) -> Result<(), SatelleError>,
     ) -> Result<AttachedTurnOutcome, SatelleError> {
         let session_id = admitted.session_id().clone();
@@ -194,9 +197,18 @@ impl DirectTransport {
         let mut previous_stream_sequence = 0_u64;
         let mut reconnect_attempts = 0_usize;
         let mut provider_smoke = None;
+        let mut buffered_events = VecDeque::from(buffered_events);
+        let mut initial_connection_error = initial_connection_error;
 
         loop {
-            match stream.next_event().await {
+            let next_event = match buffered_events.pop_front() {
+                Some(event) => Ok(event),
+                None => match initial_connection_error.take() {
+                    Some(error) => Err(error),
+                    None => stream.next_event().await,
+                },
+            };
+            match next_event {
                 Ok(event) => {
                     reconnect_attempts = 0;
                     if event.event_type() == satelle_core::EventType::ProviderSmoke {
@@ -350,23 +362,24 @@ impl DirectTransport {
         request: &TurnRequest,
         on_event: &mut dyn FnMut(SatelleEvent) -> Result<(), SatelleError>,
     ) -> Result<AttachedTurnOutcome, TurnAdmissionFailure> {
-        let stream = self
+        let mut stream = self
             .event_client
             .connect_events(vec![EventSubscription::Host])
             .await
             .map_err(|error| TurnAdmissionFailure::not_admitted(self.run_event_error(error)))?;
         let request = request.clone();
         let idempotency_key = Self::idempotency_key();
-        let admitted = self
-            .blocking_admission_http(
+        let (admitted, buffered_events, initial_connection_error) = stream
+            .buffer_events_until(self.blocking_admission_http(
                 move |client| {
                     client
                         .create_session(&request, &idempotency_key)
                         .map(|response| response.session().clone())
                 },
                 self.run_admission_error(),
-            )
-            .await?;
+            ))
+            .await;
+        let admitted = admitted?;
         let turn_id = admitted
             .turns()
             .last()
@@ -374,9 +387,15 @@ impl DirectTransport {
             .turn_id()
             .clone();
         let admitted_snapshot = admitted.clone();
-        self.follow_turn(stream, admitted, on_event)
-            .await
-            .map_err(|error| TurnAdmissionFailure::admitted(error, admitted_snapshot, turn_id))
+        self.follow_turn(
+            stream,
+            admitted,
+            buffered_events,
+            initial_connection_error,
+            on_event,
+        )
+        .await
+        .map_err(|error| TurnAdmissionFailure::admitted(error, admitted_snapshot, turn_id))
     }
 
     pub(super) async fn steer_attached(
@@ -385,7 +404,7 @@ impl DirectTransport {
         request: &TurnRequest,
         on_event: &mut dyn FnMut(SatelleEvent) -> Result<(), SatelleError>,
     ) -> Result<AttachedTurnOutcome, TurnAdmissionFailure> {
-        let stream = self
+        let mut stream = self
             .event_client
             .connect_events(vec![EventSubscription::Session {
                 session_id: session_id.clone(),
@@ -397,16 +416,17 @@ impl DirectTransport {
         let admitted_session_id = session_id.clone();
         let request = request.clone();
         let idempotency_key = Self::idempotency_key();
-        let admitted = self
-            .blocking_admission_http(
+        let (admitted, buffered_events, initial_connection_error) = stream
+            .buffer_events_until(self.blocking_admission_http(
                 move |client| {
                     client
                         .create_turn(&admitted_session_id, &request, &idempotency_key)
                         .map(|response| response.session().clone())
                 },
                 direct_admission_error,
-            )
-            .await?;
+            ))
+            .await;
+        let admitted = admitted?;
         if admitted.session_id() != session_id || admitted.turns().is_empty() {
             return Err(TurnAdmissionFailure::admission_unknown(
                 self.invalid_response(),
@@ -419,9 +439,15 @@ impl DirectTransport {
             .turn_id()
             .clone();
         let admitted_snapshot = admitted.clone();
-        self.follow_turn(stream, admitted, on_event)
-            .await
-            .map_err(|error| TurnAdmissionFailure::admitted(error, admitted_snapshot, turn_id))
+        self.follow_turn(
+            stream,
+            admitted,
+            buffered_events,
+            initial_connection_error,
+            on_event,
+        )
+        .await
+        .map_err(|error| TurnAdmissionFailure::admitted(error, admitted_snapshot, turn_id))
     }
 }
 

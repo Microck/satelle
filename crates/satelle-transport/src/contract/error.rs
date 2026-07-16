@@ -25,6 +25,7 @@ pub enum ApiErrorCode {
     IncompatibleProtocol,
     IncompatibleControlPlane,
     ComputerUseNotReady,
+    NativeReadinessTimeout,
     ProviderSmokeTestTimeout,
     UnsupportedProviderComputerUse,
     StorageBusy,
@@ -58,6 +59,7 @@ impl ApiErrorCode {
             Self::IncompatibleProtocol => "incompatible-protocol",
             Self::IncompatibleControlPlane => "incompatible-control-plane",
             Self::ComputerUseNotReady => "computer-use-not-ready",
+            Self::NativeReadinessTimeout => "native-readiness-timeout",
             Self::ProviderSmokeTestTimeout => "provider-smoke-test-timeout",
             Self::UnsupportedProviderComputerUse => "unsupported-provider-computer-use",
             Self::StorageBusy => "storage-busy",
@@ -104,6 +106,18 @@ mod tests {
             assert_eq!(code.as_str(), token);
             assert_eq!(serde_json::to_value(code).unwrap(), json!(token));
         }
+    }
+
+    #[test]
+    fn native_readiness_timeout_has_exact_public_token() {
+        assert_eq!(
+            ApiErrorCode::NativeReadinessTimeout.as_str(),
+            "native-readiness-timeout"
+        );
+        assert_eq!(
+            serde_json::to_value(ApiErrorCode::NativeReadinessTimeout).unwrap(),
+            json!("native-readiness-timeout")
+        );
     }
 
     #[test]

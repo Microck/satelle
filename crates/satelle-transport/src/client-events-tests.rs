@@ -1,7 +1,7 @@
 use super::*;
 use satelle_core::{
-    ApiTokenSource, DirectHostBinding, DirectHostBindingError, HostConfig, SatelleConfig,
-    TransportKind,
+    ApiTokenSource, DirectHostBinding, DirectHostBindingError, EventSource, EventType, HostConfig,
+    SatelleConfig, SatelleEventBody, TransportKind,
 };
 use satelle_host::ApiBearerToken;
 use std::net::TcpListener;
@@ -249,6 +249,100 @@ async fn post_handshake_silence_is_a_recoverable_stream_timeout() {
 }
 
 #[tokio::test]
+async fn pending_operation_buffers_events_services_heartbeats_and_retains_disconnect() {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind event peer");
+    let address = listener.local_addr().expect("read event peer address");
+    let server = std::thread::spawn(move || {
+        let (stream, _) = listener.accept().expect("accept event client");
+        let mut socket =
+            tokio_tungstenite::tungstenite::accept(stream).expect("accept WebSocket handshake");
+        let message = socket.read().expect("read subscription");
+        let subscribe: SubscribeRequest = serde_json::from_str(
+            message
+                .to_text()
+                .expect("subscription should be a text message"),
+        )
+        .expect("decode subscription");
+        let acknowledgement = SubscribedResponse::new(
+            subscribe.request_id().clone(),
+            "host-loopback".to_string(),
+            subscribe.subscriptions().to_vec(),
+        );
+        socket
+            .send(Message::Text(
+                serde_json::to_string(&acknowledgement)
+                    .expect("encode acknowledgement")
+                    .into(),
+            ))
+            .expect("send subscription acknowledgement");
+
+        let readiness = SatelleEventBody::new(
+            EventType::ProviderSmoke,
+            EventSource::HostDaemon,
+            time::OffsetDateTime::now_utc(),
+            "host-loopback",
+            None,
+            "provider readiness passed",
+            serde_json::json!({"status": "ready"}),
+        )
+        .and_then(|body| body.with_seq(1))
+        .expect("construct readiness event");
+        socket
+            .send(Message::Text(
+                serde_json::to_string(&readiness)
+                    .expect("encode readiness event")
+                    .into(),
+            ))
+            .expect("send readiness event");
+        socket
+            .send(Message::Ping(vec![1, 2, 3].into()))
+            .expect("send heartbeat");
+        let pong = socket.read().expect("read heartbeat response");
+        assert_eq!(pong, Message::Pong(vec![1, 2, 3].into()));
+        socket.close(None).expect("close event stream");
+    });
+    let client = DaemonEventClient::loopback(
+        address,
+        ApiBearerToken::generate().expect("generate token"),
+        "host-loopback",
+    )
+    .expect("construct loopback event client");
+    let mut stream = client
+        .connect_events(vec![EventSubscription::Host])
+        .await
+        .expect("complete event subscription");
+
+    let (stream_failed, await_stream_failure) = tokio::sync::oneshot::channel();
+    let admission = async move {
+        await_stream_failure
+            .await
+            .expect("observe stream failure before admission completes");
+        "admitted"
+    };
+    let (outcome, buffered_events, stream_error) = stream
+        .buffer_events_until_observing(admission, move |_| {
+            stream_failed
+                .send(())
+                .expect("report observed stream failure");
+        })
+        .await;
+
+    assert_eq!(outcome, "admitted");
+    assert_eq!(buffered_events.len(), 1);
+    assert_eq!(buffered_events[0].event_type(), EventType::ProviderSmoke);
+    assert!(matches!(stream_error, Some(DaemonEventError::Disconnected)));
+
+    let event = buffered_events[0].clone();
+    let mut at_capacity = vec![event.clone(); MAX_ADMISSION_BUFFERED_EVENTS];
+    assert!(matches!(
+        buffer_admission_event(&mut at_capacity, event),
+        Err(DaemonEventError::AdmissionEventBufferOverflow)
+    ));
+    assert_eq!(at_capacity.len(), MAX_ADMISSION_BUFFERED_EVENTS);
+    server.join().expect("join event peer");
+}
+
+#[tokio::test]
 async fn direct_event_client_classifies_real_tls_failures() {
     let (address, _certificate_pem, server) = spawn_handshake_tls_server();
     let binding = direct_binding(&format!("https://localhost:{}", address.port()))
@@ -443,6 +537,7 @@ fn only_connection_loss_is_recoverable_after_event_admission() {
     );
     assert!(DaemonEventError::Disconnected.is_recoverable_disconnect());
     assert!(DaemonEventError::StreamIdleTimeout.is_recoverable_disconnect());
+    assert!(DaemonEventError::AdmissionEventBufferOverflow.is_recoverable_disconnect());
     assert!(
         !DaemonEventError::Transport(WebSocketError::Protocol(
             tokio_tungstenite::tungstenite::error::ProtocolError::WrongHttpMethod,

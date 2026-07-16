@@ -12,6 +12,27 @@ fn turn_intent(prompt: &str) -> TurnIntent {
 }
 
 #[test]
+fn admission_request_timeout_tracks_both_configured_readiness_phases() {
+    let mut config = satelle_core::SatelleConfig::defaults()
+        .hosts
+        .remove(LOCAL_DEMO_HOST)
+        .expect("built-in Host config exists");
+    assert_eq!(
+        admission_request_timeout(&config),
+        std::time::Duration::from_secs(250)
+    );
+
+    config.timeouts = Some(satelle_core::TimeoutConfig {
+        native_readiness: satelle_core::ExplicitDuration::parse("2s"),
+        provider_smoke_test: satelle_core::ExplicitDuration::parse("3s"),
+    });
+    assert_eq!(
+        admission_request_timeout(&config),
+        std::time::Duration::from_secs(15)
+    );
+}
+
+#[test]
 fn configured_remote_alias_reaches_execution_and_session_keeps_host_identity() {
     const REMOTE_HOST_ALIAS: &str = "studio-workstation";
 

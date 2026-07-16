@@ -1530,6 +1530,7 @@ pub enum ErrorCode {
     StorageIntegrityFailed,
     IncompatibleControlPlane,
     ComputerUseNotReady,
+    NativeReadinessTimeout,
     ProviderSmokeTestTimeout,
     UnsupportedProviderComputerUse,
     DoctorReadinessBlockersFound,
@@ -1605,6 +1606,7 @@ impl ErrorCode {
             Self::StorageIntegrityFailed => "storage-integrity-failed",
             Self::IncompatibleControlPlane => "incompatible-control-plane",
             Self::ComputerUseNotReady => "computer-use-not-ready",
+            Self::NativeReadinessTimeout => "native-readiness-timeout",
             Self::ProviderSmokeTestTimeout => "provider-smoke-test-timeout",
             Self::UnsupportedProviderComputerUse => "unsupported-provider-computer-use",
             Self::DoctorReadinessBlockersFound => "doctor-readiness-blockers-found",
@@ -1689,6 +1691,7 @@ impl ErrorCode {
             Self::RemoteExecution | Self::StorageBusy | Self::StopNotConfirmed => 74,
             Self::IncompatibleControlPlane
             | Self::ComputerUseNotReady
+            | Self::NativeReadinessTimeout
             | Self::ProviderSmokeTestTimeout
             | Self::UnsupportedProviderComputerUse
             | Self::DoctorReadinessBlockersFound
@@ -1734,6 +1737,18 @@ impl SatelleError {
             recovery_command: Some(
                 "rerun the original satelle run or steer command with --refresh-provider-smoke-test"
                     .to_string(),
+            ),
+            source_detail: None,
+            details: BTreeMap::new(),
+        }
+    }
+
+    pub fn native_readiness_timeout() -> Self {
+        Self {
+            code: ErrorCode::NativeReadinessTimeout,
+            message: "the native Computer Use readiness smoke test timed out".to_string(),
+            recovery_command: Some(
+                "satelle doctor --scope computer-use --refresh --json".to_string(),
             ),
             source_detail: None,
             details: BTreeMap::new(),
@@ -2600,6 +2615,33 @@ impl SatelleError {
 #[cfg(test)]
 mod error_contract_tests {
     use super::*;
+
+    #[test]
+    fn native_readiness_timeout_has_a_stable_readiness_contract() {
+        assert_eq!(
+            ErrorCode::NativeReadinessTimeout.as_str(),
+            "native-readiness-timeout"
+        );
+        assert_eq!(
+            serde_json::to_value(ErrorCode::NativeReadinessTimeout)
+                .expect("serialize native readiness timeout code"),
+            serde_json::json!("native-readiness-timeout")
+        );
+        assert_eq!(ErrorCode::NativeReadinessTimeout.exit_code(), 75);
+
+        let error = SatelleError::native_readiness_timeout();
+        assert_eq!(error.code, ErrorCode::NativeReadinessTimeout);
+        assert_eq!(
+            error.message,
+            "the native Computer Use readiness smoke test timed out"
+        );
+        assert_eq!(
+            error.recovery_command.as_deref(),
+            Some("satelle doctor --scope computer-use --refresh --json")
+        );
+        assert_eq!(error.source_detail, None);
+        assert!(error.details.is_empty());
+    }
 
     #[test]
     fn ssh_host_key_verification_required_is_a_typed_transport_failure() {

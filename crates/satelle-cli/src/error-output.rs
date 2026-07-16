@@ -145,7 +145,9 @@ fn error_class(code: ErrorCode) -> (ErrorCategory, bool) {
         | ErrorCode::ComputerUseNotReady
         | ErrorCode::UnsupportedProviderComputerUse
         | ErrorCode::DoctorReadinessBlockersFound => (ErrorCategory::Readiness, false),
-        ErrorCode::ProviderSmokeTestTimeout => (ErrorCategory::Readiness, true),
+        ErrorCode::NativeReadinessTimeout | ErrorCode::ProviderSmokeTestTimeout => {
+            (ErrorCategory::Readiness, true)
+        }
         ErrorCode::StoreInUse | ErrorCode::StorageBusy => (ErrorCategory::Storage, true),
         ErrorCode::StorageIntegrityFailed => (ErrorCategory::Storage, false),
         ErrorCode::HostUnreachable
@@ -213,6 +215,13 @@ mod tests {
     #[test]
     fn provider_smoke_timeout_is_retryable_readiness_failure() {
         let (category, retryable) = error_class(ErrorCode::ProviderSmokeTestTimeout);
+        assert_eq!(category.as_str(), "readiness");
+        assert!(retryable);
+    }
+
+    #[test]
+    fn native_readiness_timeout_is_retryable_readiness_failure() {
+        let (category, retryable) = error_class(ErrorCode::NativeReadinessTimeout);
         assert_eq!(category.as_str(), "readiness");
         assert!(retryable);
     }

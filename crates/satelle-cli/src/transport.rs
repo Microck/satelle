@@ -8,6 +8,7 @@ use satelle_core::{
 };
 use satelle_host::{
     ApiBearerToken, DaemonLogPage, HostService, HostStatus, LogCursor, LogPageQuery,
+    admission_request_timeout,
 };
 use satelle_transport::{
     ApiError, ApiErrorCode, DaemonClient, DaemonClientError, DaemonEventClient, DaemonEventError,
@@ -442,7 +443,8 @@ fn direct_transport(host: &SelectedHost) -> Result<DirectTransport, SatelleError
     let ca_bundle = ca_bundle.as_deref().map(str::as_bytes);
     let client = Arc::new(
         DaemonClient::https(&binding, http_token, ca_bundle)
-            .map_err(|error| direct_transport_error(&host.alias, error))?,
+            .map_err(|error| direct_transport_error(&host.alias, error))?
+            .with_admission_timeout(admission_request_timeout(&host.config)),
     );
     let event_client = DaemonEventClient::wss(&binding, event_token, ca_bundle)
         .map_err(|error| direct_event_error(&host.alias, error))?;
@@ -465,6 +467,7 @@ fn ssh_transport(
     host: &SelectedHost,
     bootstrap_if_unreachable: bool,
 ) -> Result<DirectTransport, SatelleError> {
+    let admission_timeout = admission_request_timeout(&host.config);
     let binding = if bootstrap_if_unreachable {
         SshHostBinding::from_host_config_for_bootstrap(&host.config)
     } else {
@@ -499,7 +502,8 @@ fn ssh_transport(
                     &expected_host_identity,
                     SSH_DAEMON_REQUEST_TIMEOUT,
                 )
-                .map_err(|error| direct_transport_error(&host.alias, error))?,
+                .map_err(|error| direct_transport_error(&host.alias, error))?
+                .with_admission_timeout(admission_timeout),
             );
             match durable_client.capabilities() {
                 Ok(_) => {
@@ -519,6 +523,8 @@ fn ssh_transport(
                         binding.destination(),
                         tunnel.local_addr(),
                         &expected_host_identity,
+                        admission_timeout,
+                        &host.config,
                     )?;
                     (client, event_client, Some(bootstrap))
                 }
@@ -531,6 +537,8 @@ fn ssh_transport(
                 binding.destination(),
                 tunnel.local_addr(),
                 &expected_host_identity,
+                admission_timeout,
+                &host.config,
             )?;
             (client, event_client, Some(bootstrap))
         }
@@ -555,18 +563,19 @@ fn bootstrap_ssh_clients(
     destination: &str,
     tunnel_addr: std::net::SocketAddr,
     expected_host_identity: &str,
+    admission_timeout: Duration,
+    host_config: &satelle_core::HostConfig,
 ) -> Result<(Arc<DaemonClient>, DaemonEventClient, SshBootstrapProcess), SatelleError> {
     let bootstrap_token =
         ApiBearerToken::generate().map_err(|_| SatelleError::host_unreachable(alias))?;
     let raw_bootstrap_token = bootstrap_token.expose();
-    let bootstrap = SshBootstrapProcess::launch(destination, &bootstrap_token).map_err(
-        |error| match error {
+    let bootstrap = SshBootstrapProcess::launch(destination, &bootstrap_token, host_config)
+        .map_err(|error| match error {
             ssh_bootstrap::SshBootstrapError::HostKeyVerificationRequired => {
                 SatelleError::ssh_host_key_verification_required(alias)
             }
             _ => SatelleError::host_unreachable(alias),
-        },
-    )?;
+        })?;
     let http_token = ApiBearerToken::parse(raw_bootstrap_token.as_str())
         .map_err(|_| SatelleError::host_unreachable(alias))?;
     let event_token = ApiBearerToken::parse(raw_bootstrap_token.as_str())
@@ -578,7 +587,8 @@ fn bootstrap_ssh_clients(
             expected_host_identity,
             SSH_DAEMON_REQUEST_TIMEOUT,
         )
-        .map_err(|error| direct_transport_error(alias, error))?,
+        .map_err(|error| direct_transport_error(alias, error))?
+        .with_admission_timeout(admission_timeout),
     );
     client
         .capabilities()
@@ -612,6 +622,7 @@ fn direct_event_error(host: &str, error: DaemonEventError) -> SatelleError {
         } => api_code_error(host, control.code()),
         DaemonEventError::HandshakeTimeout
         | DaemonEventError::StreamIdleTimeout
+        | DaemonEventError::AdmissionEventBufferOverflow
         | DaemonEventError::Connect(_)
         | DaemonEventError::Transport(_)
         | DaemonEventError::Closed { control: None, .. }
@@ -793,6 +804,7 @@ fn api_error_is_definitively_not_admitted(code: ApiErrorCode) -> bool {
             | ApiErrorCode::IncompatibleProtocol
             | ApiErrorCode::IncompatibleControlPlane
             | ApiErrorCode::ComputerUseNotReady
+            | ApiErrorCode::NativeReadinessTimeout
             | ApiErrorCode::ProviderSmokeTestTimeout
             | ApiErrorCode::UnsupportedProviderComputerUse
             | ApiErrorCode::CapacityExceeded
@@ -810,6 +822,7 @@ fn api_code_error(host: &str, code: ApiErrorCode) -> SatelleError {
         }
         ApiErrorCode::HostIdentityMismatch => SatelleError::host_identity_mismatch(host),
         ApiErrorCode::HostUnreachable => SatelleError::host_unreachable(host),
+        ApiErrorCode::NativeReadinessTimeout => SatelleError::native_readiness_timeout(),
         ApiErrorCode::ProviderSmokeTestTimeout => SatelleError::provider_smoke_test_timeout(),
         ApiErrorCode::UnsupportedProviderComputerUse => {
             SatelleError::unsupported_provider_computer_use()

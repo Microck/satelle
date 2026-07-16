@@ -641,6 +641,7 @@ fn admission_failures_preserve_definitive_and_ambiguous_phases() {
         ApiErrorCode::IncompatibleProtocol,
         ApiErrorCode::IncompatibleControlPlane,
         ApiErrorCode::ComputerUseNotReady,
+        ApiErrorCode::NativeReadinessTimeout,
         ApiErrorCode::ProviderSmokeTestTimeout,
         ApiErrorCode::UnsupportedProviderComputerUse,
         ApiErrorCode::CapacityExceeded,
@@ -672,6 +673,10 @@ fn admission_failures_preserve_definitive_and_ambiguous_phases() {
     assert_eq!(run_rejected.phase(), rejected.phase());
     assert_eq!(run_rejected.error().code, rejected.error().code);
 
+    assert_eq!(
+        api_code_error("direct-test", ApiErrorCode::NativeReadinessTimeout).code,
+        ErrorCode::NativeReadinessTimeout
+    );
     assert_eq!(
         api_code_error("direct-test", ApiErrorCode::ProviderSmokeTestTimeout).code,
         ErrorCode::ProviderSmokeTestTimeout

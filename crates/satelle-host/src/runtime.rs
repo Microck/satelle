@@ -601,7 +601,7 @@ impl RuntimeEngine {
                     &error,
                     persistence_failed,
                     "native_readiness_cancellation",
-                    None,
+                    Some(ErrorCode::NativeReadinessTimeout),
                 );
                 self.lock_storage()?
                     .finish_native_probe_failure(

@@ -512,14 +512,16 @@ fn server_restart_reconciles_the_exact_attached_turn_once() {
     let outcome = fixture
         .transport()
         .event_runtime
-        .block_on(
-            fixture
-                .transport()
-                .follow_turn(stream, admitted, &mut |event| {
-                    events.push(event);
-                    Ok(())
-                }),
-        )
+        .block_on(fixture.transport().follow_turn(
+            stream,
+            admitted,
+            Vec::new(),
+            Some(DaemonEventError::Disconnected),
+            &mut |event| {
+                events.push(event);
+                Ok(())
+            },
+        ))
         .expect("reconnect and reconcile the attached Turn");
 
     assert_eq!(outcome.session.session_id(), &expected_session_id);
@@ -560,14 +562,16 @@ fn transient_http_reconciliation_failure_retains_the_reconnected_stream() {
     let outcome = fixture
         .transport()
         .event_runtime
-        .block_on(
-            fixture
-                .transport()
-                .follow_turn(stream, admitted, &mut |event| {
-                    events.push(event);
-                    Ok(())
-                }),
-        )
+        .block_on(fixture.transport().follow_turn(
+            stream,
+            admitted,
+            Vec::new(),
+            None,
+            &mut |event| {
+                events.push(event);
+                Ok(())
+            },
+        ))
         .expect("retry HTTP reconciliation while retaining replacement WSS");
     transient_http.wait_until_serving();
     transient_http.stop();
@@ -664,7 +668,7 @@ fn subscribed_replacements_that_close_before_events_exhaust_the_reconnect_budget
             Duration::from_secs(5),
             fixture
                 .transport()
-                .follow_turn(stream, active, &mut |event| {
+                .follow_turn(stream, active, Vec::new(), None, &mut |event| {
                     events.push(event);
                     Ok(())
                 }),
@@ -699,14 +703,16 @@ fn server_loss_exhaustion_emits_nothing_and_returns_host_unreachable() {
     let result = fixture
         .transport()
         .event_runtime
-        .block_on(
-            fixture
-                .transport()
-                .follow_turn(stream, admitted, &mut |event| {
-                    events.push(event);
-                    Ok(())
-                }),
-        );
+        .block_on(fixture.transport().follow_turn(
+            stream,
+            admitted,
+            Vec::new(),
+            None,
+            &mut |event| {
+                events.push(event);
+                Ok(())
+            },
+        ));
     let error = match result {
         Ok(_) => panic!("reconnect exhaustion must fail conservatively"),
         Err(error) => error,

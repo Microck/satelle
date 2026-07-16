@@ -159,6 +159,14 @@ fn failure(error: &SatelleError) -> ApiFailure {
             message: "native Computer Use is not ready on this Host",
             details: None,
         },
+        ErrorCode::NativeReadinessTimeout => ApiFailure {
+            status: StatusCode::GATEWAY_TIMEOUT,
+            code: ApiErrorCode::NativeReadinessTimeout,
+            category: ApiErrorCategory::Readiness,
+            retryable: true,
+            message: "the native Computer Use readiness smoke test timed out",
+            details: None,
+        },
         ErrorCode::ProviderSmokeTestTimeout => ApiFailure {
             status: StatusCode::GATEWAY_TIMEOUT,
             code: ApiErrorCode::ProviderSmokeTestTimeout,
@@ -335,6 +343,15 @@ mod tests {
             ApiErrorCode::UnsupportedProviderComputerUse
         );
         assert!(!unsupported.retryable);
+    }
+
+    #[test]
+    fn native_readiness_timeout_is_a_retryable_gateway_timeout() {
+        let timeout = failure(&SatelleError::native_readiness_timeout());
+        assert_eq!(timeout.status, StatusCode::GATEWAY_TIMEOUT);
+        assert_eq!(timeout.code, ApiErrorCode::NativeReadinessTimeout);
+        assert_eq!(timeout.category, ApiErrorCategory::Readiness);
+        assert!(timeout.retryable);
     }
 
     #[test]
