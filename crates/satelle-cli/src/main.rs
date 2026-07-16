@@ -25,7 +25,7 @@ use satelle_core::{
     SUCCESS_GREEN, SatelleError, SatelleEvent, SatelleEventBody, SessionId, SetupMode, SetupReport,
     SetupRequiredInput, load_config, resolve_path_set, utc_now,
 };
-use satelle_host::HostService;
+use satelle_host::{ApiBearerToken, HostService};
 use satelle_transport::{DaemonServer, DaemonServerConfig, DaemonServerError, TurnRequest};
 use serde_json::json;
 use std::collections::BTreeMap;
@@ -36,7 +36,10 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 use std::str::FromStr;
 use std::time::Duration;
-use transport::{AttachedTurnOutcome, discover_direct_host_identity, transport_for};
+use transport::{
+    AttachedTurnOutcome, discover_direct_host_identity, transport_for,
+    transport_for_with_ssh_bootstrap,
+};
 
 const CONFIG_CHECK_SCHEMA_VERSION: &str = "satelle.config.check.v1";
 const CONFIG_EXPLAIN_SCHEMA_VERSION: &str = "satelle.config.explain.v1";
@@ -300,6 +303,10 @@ struct HostStartCommand {
     bind: String,
     #[arg(long)]
     foreground: bool,
+    /// Internal SSH bootstrap boundary. The token is read once from stdin and
+    /// retained only by this daemon process.
+    #[arg(long, hide = true)]
+    bootstrap_token_stdin: bool,
     #[command(flatten)]
     output_args: OutputArgs,
 }
@@ -1964,6 +1971,11 @@ fn start_host_daemon(
     config: ConfigContext<'_>,
     format: OutputFormat,
 ) -> Result<(), CliFailure> {
+    if command.foreground && command.bootstrap_token_stdin {
+        return Err(failure(SatelleError::invalid_usage(
+            "SSH bootstrap tokens are valid only for on-demand Host Daemons",
+        )));
+    }
     let bind_addr = command.bind.parse::<SocketAddr>().map_err(|error| {
         failure(SatelleError {
             code: ErrorCode::InvalidUsage,
@@ -1982,22 +1994,37 @@ fn start_host_daemon(
         })
     })?;
 
-    let on_demand_host = (!command.foreground)
+    let on_demand_host = (!command.foreground && !command.bootstrap_token_stdin)
         .then(|| config.resolve_host(None))
         .transpose()?;
-    let idle_timeout = on_demand_host
-        .as_ref()
-        .map(|host| on_demand_idle_timeout(&host.config));
-    let service = on_demand_host
-        .as_ref()
-        .map_or_else(HostService::production, |host| {
-            HostService::production_for_host(&host.config)
-        });
+    let idle_timeout = if command.bootstrap_token_stdin {
+        Some(DEFAULT_ON_DEMAND_IDLE_TIMEOUT)
+    } else {
+        on_demand_host
+            .as_ref()
+            .map(|host| on_demand_idle_timeout(&host.config))
+    };
+    let bootstrap_token = command
+        .bootstrap_token_stdin
+        .then(read_ssh_bootstrap_token)
+        .transpose()?;
+    let service = match (on_demand_host.as_ref(), bootstrap_token.as_ref()) {
+        (_, Some(token)) => HostService::production_for_ssh_bootstrap(
+            token,
+            OffsetDateTime::now_utc() + time::Duration::minutes(15),
+        ),
+        (Some(host), None) => HostService::production_for_host(&host.config),
+        (None, None) => HostService::production(),
+    };
+    // The service retained only the verifier. Zeroize the raw bootstrap token
+    // before the listener starts accepting requests.
+    drop(bootstrap_token);
     let mode = if command.foreground {
         "foreground"
     } else {
         "on_demand"
     };
+    let bootstrap_protocol = command.bootstrap_token_stdin;
 
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -2012,14 +2039,34 @@ fn start_host_daemon(
             .await
             .map_err(daemon_server_failure)?;
 
-        if format.is_json() {
-            print_json(&json!({
-                "schema_version": "satelle.host.start.v1",
-                "mode": mode,
-                "bind": server.local_addr(),
-                "running": true,
-            }))
-            .map_err(failure)?;
+        let ready = json!({
+            "schema_version": "satelle.host.start.v1",
+            "mode": mode,
+            "bind": server.local_addr(),
+            "running": true,
+        });
+        if bootstrap_protocol {
+            let mut stdout = io::stdout().lock();
+            serde_json::to_writer(&mut stdout, &ready).map_err(|_| {
+                daemon_process_failure(
+                    "bootstrap-protocol-write-failed",
+                    "serialization failed".to_string(),
+                )
+            })?;
+            writeln!(stdout).map_err(|_| {
+                daemon_process_failure(
+                    "bootstrap-protocol-write-failed",
+                    "write failed".to_string(),
+                )
+            })?;
+            stdout.flush().map_err(|_| {
+                daemon_process_failure(
+                    "bootstrap-protocol-write-failed",
+                    "flush failed".to_string(),
+                )
+            })?;
+        } else if format.is_json() {
+            print_json(&ready).map_err(failure)?;
         } else {
             println!("Host Daemon listening on {}", server.local_addr());
         }
@@ -2033,6 +2080,30 @@ fn start_host_daemon(
             server.wait().await.map_err(daemon_server_failure)
         }
     })
+}
+
+fn read_ssh_bootstrap_token() -> Result<ApiBearerToken, CliFailure> {
+    const MAX_BOOTSTRAP_TOKEN_BYTES: u64 = 4096;
+
+    let mut encoded = String::new();
+    io::stdin()
+        .take(MAX_BOOTSTRAP_TOKEN_BYTES + 1)
+        .read_to_string(&mut encoded)
+        .map_err(|_| failure(SatelleError::authentication_failed("ssh-bootstrap")))?;
+    if encoded.len() as u64 > MAX_BOOTSTRAP_TOKEN_BYTES {
+        return Err(failure(SatelleError::authentication_failed(
+            "ssh-bootstrap",
+        )));
+    }
+    let encoded = encoded.strip_suffix('\n').unwrap_or(&encoded);
+    let encoded = encoded.strip_suffix('\r').unwrap_or(encoded);
+    if encoded.contains(['\r', '\n']) {
+        return Err(failure(SatelleError::authentication_failed(
+            "ssh-bootstrap",
+        )));
+    }
+    ApiBearerToken::parse(encoded)
+        .map_err(|_| failure(SatelleError::authentication_failed("ssh-bootstrap")))
 }
 
 fn on_demand_idle_timeout(config: &HostConfig) -> Duration {
@@ -2312,7 +2383,7 @@ fn run_prompt(
             .map(SelectedHost::from)
             .map_err(failure),
     )?;
-    let transport = match transport_for(&host) {
+    let transport = match transport_for_with_ssh_bootstrap(&host, true) {
         Ok(transport) => transport,
         Err(transport_failure) => {
             if !command.detach {
@@ -2420,7 +2491,7 @@ fn steer_prompt(
             .map(SelectedHost::from)
             .map_err(failure),
     )?;
-    let transport = match transport_for(&host) {
+    let transport = match transport_for_with_ssh_bootstrap(&host, true) {
         Ok(transport) => transport,
         Err(transport_failure) => {
             if !command.detach {

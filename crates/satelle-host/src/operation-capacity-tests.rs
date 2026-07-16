@@ -773,6 +773,7 @@ fn service(state_root: &Path, adapter: ControlledAdapter) -> HostService {
         runtime: RuntimeHandle::new(Ok(state_root.to_path_buf()), adapter),
         mode: HostMode::TestFake,
         operation_capacity: Arc::new(OperationCapacity::default()),
+        bootstrap_auth: None,
     }
 }
 

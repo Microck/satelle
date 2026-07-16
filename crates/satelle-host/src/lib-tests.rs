@@ -68,6 +68,7 @@ fn unsupported_or_unproven_production_execution_is_blocked_before_admission() {
             runtime: RuntimeHandle::new(Ok(state.path().to_path_buf()), adapter),
             operation_capacity: Arc::new(OperationCapacity::default()),
             mode: HostMode::Production { snapshot },
+            bootstrap_auth: None,
         };
         let session_id = SessionId::new();
 
@@ -167,6 +168,7 @@ fn attached_adapter_failures_return_exact_durable_run_and_steer_handles() {
         runtime: RuntimeHandle::new(Ok(run_state.path().to_path_buf()), FailingExecutionAdapter),
         operation_capacity: Arc::new(OperationCapacity::default()),
         mode: HostMode::TestFake,
+        bootstrap_auth: None,
     };
     let run_failure = run_service
         .run(
@@ -198,6 +200,7 @@ fn attached_adapter_failures_return_exact_durable_run_and_steer_handles() {
         runtime: RuntimeHandle::new(Ok(steer_state.path().to_path_buf()), FakeComputerUseAdapter),
         operation_capacity: Arc::new(OperationCapacity::default()),
         mode: HostMode::TestFake,
+        bootstrap_auth: None,
     };
     let initial = seeded
         .run(
@@ -215,6 +218,7 @@ fn attached_adapter_failures_return_exact_durable_run_and_steer_handles() {
         ),
         operation_capacity: Arc::new(OperationCapacity::default()),
         mode: HostMode::TestFake,
+        bootstrap_auth: None,
     };
     let steer_failure = steer_service
         .steer(
@@ -272,6 +276,7 @@ fn refreshed_production_snapshot_updates_admission_surfaces_but_not_desktop_disc
         runtime: RuntimeHandle::new(Ok(state.path().to_path_buf()), adapter),
         operation_capacity: Arc::new(OperationCapacity::default()),
         mode: HostMode::Production { snapshot },
+        bootstrap_auth: None,
     };
     let clone = service.clone();
 

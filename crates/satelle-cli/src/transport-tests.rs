@@ -101,6 +101,7 @@ impl DirectFixture {
                 event_client,
                 event_runtime,
                 _tunnel: None,
+                _bootstrap: None,
             }),
             _state: state,
         }

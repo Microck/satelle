@@ -342,11 +342,23 @@ impl HostService {
         &self,
         token: &ApiBearerToken,
     ) -> Result<Option<ApiPrincipal>, SatelleError> {
+        if let Some(principal) = self
+            .bootstrap_auth
+            .as_ref()
+            .and_then(|authenticator| authenticator.authenticate(token, OffsetDateTime::now_utc()))
+        {
+            return Ok(Some(principal));
+        }
         self.runtime
             .authenticate_api_token(token, OffsetDateTime::now_utc())
     }
 
     pub fn api_principal_is_active(&self, principal: &ApiPrincipal) -> Result<bool, SatelleError> {
+        if self.bootstrap_auth.as_ref().is_some_and(|authenticator| {
+            authenticator.is_active(principal, OffsetDateTime::now_utc())
+        }) {
+            return Ok(true);
+        }
         self.runtime
             .api_principal_is_active(principal, OffsetDateTime::now_utc())
     }
@@ -553,6 +565,7 @@ impl HostService {
                 crate::operation_capacity::OperationCapacity::default(),
             ),
             mode: HostMode::TestFake,
+            bootstrap_auth: None,
         })
     }
 }
