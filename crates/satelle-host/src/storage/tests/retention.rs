@@ -141,6 +141,7 @@ fn retention_age_starts_when_the_latest_follow_up_becomes_terminal() {
             turn_id(TURN_2),
             policy(),
             follow_up_started_at,
+            false,
             &follow_up_idempotency,
         )
         .expect("admit follow-up")
@@ -233,6 +234,7 @@ fn an_older_nonterminal_turn_blocks_session_deletion_without_a_control_lease() {
             turn_id(TURN_2),
             policy(),
             at(2),
+            false,
             &admission(
                 IdempotentOperation::Steer,
                 "nonterminal-retention",

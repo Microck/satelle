@@ -282,6 +282,7 @@ impl RuntimeEngine {
                     turn_id.clone(),
                     execution_policy,
                     started_at,
+                    self.adapter.requires_upstream_thread_for_follow_up(),
                     &context,
                 )
                 .map_err(model::storage_failure)?;

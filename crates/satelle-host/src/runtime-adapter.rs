@@ -709,6 +709,12 @@ pub trait ComputerUseAdapter: Send + Sync + 'static {
         Ok(())
     }
 
+    /// Whether a follow-up must resume a retained upstream thread instead of
+    /// allowing the adapter to start unrelated work under the same Session.
+    fn requires_upstream_thread_for_follow_up(&self) -> bool {
+        false
+    }
+
     fn preflight(&self, host: &str) -> Result<AdapterReadiness, SatelleError>;
 
     /// Returns a production cache key without running the harmless action.
