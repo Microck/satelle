@@ -22,11 +22,13 @@ use satelle_core::{
     SatelleError, SatelleEvent, SatelleEventBody, SessionId, SetupReport, SetupRequiredInput,
     load_config, resolve_path_set, utc_now,
 };
-use satelle_transport::TurnRequest;
+use satelle_host::HostService;
+use satelle_transport::{DaemonServer, DaemonServerConfig, DaemonServerError, TurnRequest};
 use serde_json::json;
 use std::collections::BTreeMap;
 use std::fs;
 use std::io::{self, IsTerminal, Read, Write};
+use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::str::FromStr;
@@ -1668,13 +1670,7 @@ fn run_host(
 ) -> Result<(), CliFailure> {
     let json = format.is_json();
     match command {
-        HostCommand::Start(command) => {
-            let error = SatelleError::not_implemented(format!(
-                "persistent Host Daemon start on {} is not implemented yet; run setup and doctor to inspect readiness",
-                command.bind
-            ));
-            Err(failure(error))
-        }
+        HostCommand::Start(command) => start_host_daemon(command, format),
         HostCommand::Status(command) => {
             let status = read::host_status(command.host.as_deref(), config)?;
             if json {
@@ -1698,6 +1694,90 @@ fn run_host(
         HostCommand::Sessions(command) => show_host_sessions(command, config, format),
         HostCommand::Storage { command } => run_host_storage(command),
     }
+}
+
+fn start_host_daemon(command: HostStartCommand, format: OutputFormat) -> Result<(), CliFailure> {
+    if !command.foreground {
+        return Err(failure(SatelleError::invalid_usage(
+            "host start currently requires --foreground; persistent service installation is owned by satelle setup --persistent",
+        )));
+    }
+
+    let bind_addr = command.bind.parse::<SocketAddr>().map_err(|error| {
+        failure(SatelleError {
+            code: ErrorCode::InvalidUsage,
+            message: format!(
+                "host start --bind must be an IP socket address, got '{}'",
+                command.bind
+            ),
+            recovery_command: Some(
+                "use satelle host start --foreground --bind 127.0.0.1:3001".to_string(),
+            ),
+            source_detail: Some(error.to_string()),
+            details: BTreeMap::from([(
+                "bind".to_string(),
+                serde_json::Value::String(command.bind.clone()),
+            )]),
+        })
+    })?;
+
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .map_err(|error| daemon_process_failure("runtime-create-failed", error.to_string()))?;
+    runtime.block_on(async move {
+        let server = DaemonServer::bind(
+            HostService::production(),
+            DaemonServerConfig::loopback(bind_addr),
+        )
+        .await
+        .map_err(daemon_server_failure)?;
+
+        if format.is_json() {
+            print_json(&json!({
+                "schema_version": "satelle.host.start.v1",
+                "mode": "foreground",
+                "bind": server.local_addr(),
+                "running": true,
+            }))
+            .map_err(failure)?;
+        } else {
+            println!("Host Daemon listening on {}", server.local_addr());
+        }
+
+        tokio::signal::ctrl_c()
+            .await
+            .map_err(|error| daemon_process_failure("signal-wait-failed", error.to_string()))?;
+        server.shutdown().await.map_err(daemon_server_failure)
+    })
+}
+
+fn daemon_server_failure(error: DaemonServerError) -> CliFailure {
+    if let Some(host_error) = error.host_error() {
+        return failure(host_error.clone());
+    }
+
+    match error {
+        DaemonServerError::NonLoopbackPlaintextBind
+        | DaemonServerError::InvalidConnectionLimit
+        | DaemonServerError::InvalidShutdownGrace => {
+            failure(SatelleError::invalid_usage(error.to_string()))
+        }
+        _ => daemon_process_failure(error.code(), error.to_string()),
+    }
+}
+
+fn daemon_process_failure(code: &str, message: String) -> CliFailure {
+    failure(SatelleError {
+        code: ErrorCode::RemoteExecution,
+        message,
+        recovery_command: Some("satelle doctor --scope host --json".to_string()),
+        source_detail: None,
+        details: BTreeMap::from([(
+            "daemon_error_code".to_string(),
+            serde_json::Value::String(code.to_string()),
+        )]),
+    })
 }
 
 fn show_host_sessions(
