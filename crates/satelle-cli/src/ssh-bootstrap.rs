@@ -271,6 +271,37 @@ impl RemoteTarget {
             format!("sh -c 'exec {remote_binary} host start --bootstrap-token-stdin --json'")
         }
     }
+
+    fn tailscale_serve_command(self, apply: bool) -> &'static str {
+        match (self.is_windows(), apply) {
+            (true, false) => "cmd.exe /d /c \"tailscale.exe serve status --json >nul\"",
+            (true, true) => concat!(
+                "cmd.exe /d /c \"tailscale.exe serve --bg --yes --https 443 ",
+                "http://127.0.0.1:3001 >nul\""
+            ),
+            (false, false) => "sh -c 'tailscale serve status --json >/dev/null'",
+            (false, true) => concat!(
+                "sh -c 'exec tailscale serve --bg --yes --https 443 ",
+                "http://127.0.0.1:3001 >/dev/null'"
+            ),
+        }
+    }
+}
+
+pub(super) fn probe_tailscale_serve(destination: &str) -> Result<(), SshBootstrapError> {
+    run_tailscale_serve(destination, false)
+}
+
+pub(super) fn apply_tailscale_serve(destination: &str) -> Result<(), SshBootstrapError> {
+    run_tailscale_serve(destination, true)
+}
+
+fn run_tailscale_serve(destination: &str, apply: bool) -> Result<(), SshBootstrapError> {
+    let target = RemoteTarget::probe(destination)?;
+    require_success(run_ssh_command(
+        destination,
+        target.tailscale_serve_command(apply),
+    )?)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -772,6 +803,28 @@ mod tests {
             )
             .unwrap(),
             [0x11; 32]
+        );
+    }
+
+    #[test]
+    fn tailscale_serve_commands_are_static_incremental_and_os_aware() {
+        assert_eq!(
+            RemoteTarget::LinuxX64Gnu.tailscale_serve_command(false),
+            "sh -c 'tailscale serve status --json >/dev/null'"
+        );
+        assert_eq!(
+            RemoteTarget::LinuxX64Gnu.tailscale_serve_command(true),
+            concat!(
+                "sh -c 'exec tailscale serve --bg --yes --https 443 ",
+                "http://127.0.0.1:3001 >/dev/null'"
+            )
+        );
+        assert_eq!(
+            RemoteTarget::WindowsX64Msvc.tailscale_serve_command(true),
+            concat!(
+                "cmd.exe /d /c \"tailscale.exe serve --bg --yes --https 443 ",
+                "http://127.0.0.1:3001 >nul\""
+            )
         );
     }
 }
