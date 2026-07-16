@@ -747,7 +747,11 @@ fn native_smoke_failure(reason: &'static str) -> NativeSmokeFailure {
 }
 
 fn native_readiness_timeout_after_cancellation(observation: StopObservation) -> NativeSmokeFailure {
-    let mut failure = native_smoke_failure("native_readiness_timed_out");
+    let reason = "native_readiness_timed_out";
+    let mut error = SatelleError::native_readiness_timeout();
+    error
+        .details
+        .insert("reason".to_string(), Value::String(reason.to_string()));
     let cancellation = match observation {
         StopObservation::CancellationConfirmed | StopObservation::UpstreamInactiveConfirmed => {
             "confirmed"
@@ -755,11 +759,11 @@ fn native_readiness_timeout_after_cancellation(observation: StopObservation) -> 
         StopObservation::UpstreamStillActive => "upstream_still_active",
         StopObservation::OutcomeUnknown => "outcome_unknown",
     };
-    failure.error.details.insert(
+    error.details.insert(
         "native_readiness_cancellation".to_string(),
         Value::String(cancellation.to_string()),
     );
-    failure
+    NativeSmokeFailure { reason, error }
 }
 
 fn provider_smoke_session_failure(error: CodexSessionError) -> SatelleError {
@@ -1365,6 +1369,23 @@ mod tests {
             assert_eq!(
                 provider_smoke_session_failure(local_failure).code,
                 ErrorCode::ComputerUseNotReady
+            );
+        }
+    }
+
+    #[test]
+    fn native_readiness_timeout_is_typed_for_every_cancellation_outcome() {
+        for observation in [
+            StopObservation::CancellationConfirmed,
+            StopObservation::UpstreamInactiveConfirmed,
+            StopObservation::UpstreamStillActive,
+            StopObservation::OutcomeUnknown,
+        ] {
+            assert_eq!(
+                native_readiness_timeout_after_cancellation(observation)
+                    .error
+                    .code,
+                ErrorCode::NativeReadinessTimeout
             );
         }
     }

@@ -793,6 +793,7 @@ fn api_error_is_definitively_not_admitted(code: ApiErrorCode) -> bool {
             | ApiErrorCode::IncompatibleProtocol
             | ApiErrorCode::IncompatibleControlPlane
             | ApiErrorCode::ComputerUseNotReady
+            | ApiErrorCode::NativeReadinessTimeout
             | ApiErrorCode::ProviderSmokeTestTimeout
             | ApiErrorCode::UnsupportedProviderComputerUse
             | ApiErrorCode::CapacityExceeded
@@ -810,6 +811,7 @@ fn api_code_error(host: &str, code: ApiErrorCode) -> SatelleError {
         }
         ApiErrorCode::HostIdentityMismatch => SatelleError::host_identity_mismatch(host),
         ApiErrorCode::HostUnreachable => SatelleError::host_unreachable(host),
+        ApiErrorCode::NativeReadinessTimeout => SatelleError::native_readiness_timeout(),
         ApiErrorCode::ProviderSmokeTestTimeout => SatelleError::provider_smoke_test_timeout(),
         ApiErrorCode::UnsupportedProviderComputerUse => {
             SatelleError::unsupported_provider_computer_use()

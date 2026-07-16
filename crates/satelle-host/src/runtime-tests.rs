@@ -245,6 +245,7 @@ fn confirmed_native_probe_timeout_is_terminal_and_releases_control() {
             "blocked-by-native-timeout",
         ))
         .expect_err("the prompt must not execute after a native readiness timeout");
+    assert_eq!(error.error().code, ErrorCode::NativeReadinessTimeout);
     assert_eq!(
         error.error().details["native_readiness_cancellation"],
         "confirmed"
@@ -1005,7 +1006,7 @@ impl ReadinessProbeDriver for ProviderProbeRecoveryAdapter {
             behavior => {
                 persist_thread_ref(PRIVATE_UPSTREAM_THREAD_REF).unwrap();
                 persist_turn_ref(PRIVATE_UPSTREAM_TURN_REF).unwrap();
-                let mut error = SatelleError::computer_use_not_ready();
+                let mut error = SatelleError::native_readiness_timeout();
                 error.details.insert(
                     "reason".to_string(),
                     serde_json::Value::String("native_readiness_timed_out".to_string()),
