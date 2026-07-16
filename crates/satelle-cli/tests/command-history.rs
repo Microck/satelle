@@ -318,16 +318,24 @@ fn multi_host_updates_are_not_attributed_to_the_default_host() {
         ])
         .assert()
         .failure();
+    fixture
+        .command()
+        .env("SATELLE_HOST", "environment-host")
+        .args(["host", "update", "--all-remotes", "--json"])
+        .assert()
+        .failure();
 
-    let selected_host = fixture
-        .connection()
-        .query_row(
-            "SELECT selected_host FROM command_history WHERE command_family = 'host'",
-            [],
-            |row| row.get::<_, Option<String>>(0),
+    let connection = fixture.connection();
+    let selected_hosts = connection
+        .prepare(
+            "SELECT selected_host FROM command_history WHERE command_family = 'host' ORDER BY id",
         )
-        .expect("query multi-host update history");
-    assert_eq!(selected_host, None);
+        .expect("prepare multi-host update history query")
+        .query_map([], |row| row.get::<_, Option<String>>(0))
+        .expect("query multi-host update history")
+        .collect::<Result<Vec<_>, _>>()
+        .expect("read multi-host update history");
+    assert_eq!(selected_hosts, vec![None, None]);
 }
 
 #[test]
@@ -335,6 +343,19 @@ fn history_failures_do_not_corrupt_json_error_output() {
     let fixture = Fixture::new();
     fs::create_dir(fixture.history_root()).expect("create command-history directory");
     fs::create_dir(fixture.database_path()).expect("block SQLite database creation");
+
+    let human_output = fixture
+        .command()
+        .args(["config", "check"])
+        .assert()
+        .success()
+        .get_output()
+        .clone();
+    assert!(
+        String::from_utf8_lossy(&human_output.stderr)
+            .contains("warning: command history was not recorded"),
+        "human diagnostics should report the best-effort history failure"
+    );
 
     let output = fixture
         .command()
