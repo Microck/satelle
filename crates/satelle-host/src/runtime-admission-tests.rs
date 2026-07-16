@@ -37,7 +37,7 @@ fn retrying_a_stable_run_identity_does_not_repeat_adapter_execution() {
 
     let connection = rusqlite::Connection::open(state.path().join("satelle.sqlite3"))
         .expect("open released authoritative store");
-    for table in ["native_readiness_results", "provider_smoke_successes"] {
+    for table in ["native_readiness_results", "provider_smoke_results"] {
         let count: i64 = connection
             .query_row(&format!("SELECT count(*) FROM {table}"), [], |row| {
                 row.get(0)

@@ -3,7 +3,9 @@ use satelle_core::session::{
     DesktopBindingRef, ExecutionPolicy, FeatureChoice, HostIdentityRef, SessionStateRevision,
     StopObservation, TurnStateRevision, TurnTransition,
 };
-use satelle_core::{ControlPlaneOperation, SatelleError, SatelleEvent, SessionId, TurnId};
+use satelle_core::{
+    ControlPlaneOperation, ErrorCode, SatelleError, SatelleEvent, SessionId, TurnId,
+};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
@@ -159,6 +161,75 @@ impl std::fmt::Debug for ProviderSmokeEvidence {
     }
 }
 
+/// Sanitized evidence from a provider smoke attempt that reached a terminal
+/// failure. The result can block an exact matching preflight until its short
+/// expiry without persisting raw provider or desktop output.
+#[derive(Clone, Eq, PartialEq)]
+pub struct ProviderSmokeFailureEvidence {
+    window: EvidenceWindow,
+    provider_config_fingerprint: String,
+    error_code: ErrorCode,
+    failure_reason: String,
+}
+
+impl ProviderSmokeFailureEvidence {
+    pub fn new(
+        result_id: impl Into<String>,
+        provider_config_fingerprint: impl Into<String>,
+        error_code: ErrorCode,
+        failure_reason: impl Into<String>,
+        observed_at: time::OffsetDateTime,
+        expires_at: time::OffsetDateTime,
+    ) -> Result<Self, EvidenceError> {
+        Ok(Self {
+            window: EvidenceWindow::new(result_id, observed_at, expires_at)?,
+            provider_config_fingerprint: fingerprint(provider_config_fingerprint)?,
+            error_code,
+            failure_reason: normalized_identifier(failure_reason)?,
+        })
+    }
+
+    pub(crate) fn result_id(&self) -> &str {
+        &self.window.result_id
+    }
+
+    pub(crate) fn provider_config_fingerprint(&self) -> &str {
+        &self.provider_config_fingerprint
+    }
+
+    pub(crate) const fn error_code(&self) -> ErrorCode {
+        self.error_code
+    }
+
+    pub(crate) fn failure_reason(&self) -> &str {
+        &self.failure_reason
+    }
+
+    pub(crate) const fn observed_at(&self) -> time::OffsetDateTime {
+        self.window.observed_at
+    }
+
+    pub(crate) const fn expires_at(&self) -> time::OffsetDateTime {
+        self.window.expires_at
+    }
+}
+
+impl std::fmt::Debug for ProviderSmokeFailureEvidence {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ProviderSmokeFailureEvidence")
+            .field("error_code", &self.error_code)
+            .field("failure_reason", &self.failure_reason)
+            .finish_non_exhaustive()
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ProviderSmokeResult {
+    Passed(ProviderSmokeEvidence),
+    Failed(ProviderSmokeFailureEvidence),
+}
+
 /// Versioned evidence observed by a successful live readiness probe.
 ///
 /// The adapter supplies only normalized identifiers and fingerprints. Raw probe
@@ -304,6 +375,12 @@ pub enum AdapterPreflight {
         reason: &'static str,
         error: SatelleError,
     },
+    ProviderFailed {
+        key: ReadinessCacheKey,
+        readiness: ReadinessEvidence,
+        failure: ProviderSmokeFailureEvidence,
+        error: SatelleError,
+    },
     UncachedFailure(SatelleError),
 }
 
@@ -311,7 +388,7 @@ impl AdapterPreflight {
     pub(crate) fn into_result(self) -> Result<AdapterReadiness, SatelleError> {
         match self {
             Self::Ready(readiness) => Ok(readiness),
-            Self::Failed { error, .. } => Err(error),
+            Self::Failed { error, .. } | Self::ProviderFailed { error, .. } => Err(error),
             Self::UncachedFailure(error) => Err(error),
         }
     }
@@ -804,7 +881,7 @@ pub trait ComputerUseAdapter: Send + Sync + 'static {
         &self,
         host: &str,
         _cached: Option<ReadinessEvidence>,
-        _cached_provider: Option<ProviderSmokeEvidence>,
+        _cached_provider: Option<ProviderSmokeResult>,
         provider_intent: &ProviderComputerUseIntent,
     ) -> AdapterPreflight {
         match self.preflight(host, provider_intent) {

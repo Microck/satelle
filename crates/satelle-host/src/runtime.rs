@@ -18,7 +18,8 @@ mod worker;
 pub use adapter::{
     AdapterPreflight, AdapterReadiness, AdapterSubject, ComputerUseAdapter, EvidenceError,
     ExecuteRequest, ExecuteResult, ProviderComputerUseIntent, ProviderSmokeEvidence,
-    ReadinessCacheKey, ReadinessEvidence, RecoveryObservation,
+    ProviderSmokeFailureEvidence, ProviderSmokeResult, ReadinessCacheKey, ReadinessEvidence,
+    RecoveryObservation,
 };
 pub(crate) use codex_adapter::ProductionComputerUseAdapter;
 pub(crate) use request::{RequestIdentity, RunCommand, SteerCommand, StopCommand};
@@ -347,6 +348,17 @@ impl RuntimeEngine {
             } => {
                 self.lock_storage()?
                     .store_preflight_failure(&key, &evidence, reason)
+                    .map_err(model::storage_failure)?;
+                Err(error)
+            }
+            AdapterPreflight::ProviderFailed {
+                key,
+                readiness,
+                failure,
+                error,
+            } => {
+                self.lock_storage()?
+                    .store_provider_smoke_failure(&key, &readiness, &failure)
                     .map_err(model::storage_failure)?;
                 Err(error)
             }

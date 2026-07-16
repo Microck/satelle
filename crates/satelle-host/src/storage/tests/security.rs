@@ -186,7 +186,7 @@ fn lifecycle_schema_excludes_raw_content_and_replayable_event_history() {
             "logs",
             "maintenance_leases",
             "native_readiness_results",
-            "provider_smoke_successes",
+            "provider_smoke_results",
             "schema_migrations",
             "session_private_refs",
             "sessions",
