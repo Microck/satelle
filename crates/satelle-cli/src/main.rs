@@ -7,6 +7,7 @@ mod logs;
 mod mcp;
 mod output;
 mod read;
+mod tailscale;
 mod transport;
 
 use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum};
@@ -36,6 +37,7 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 use std::str::FromStr;
 use std::time::Duration;
+use tailscale::transport_doctor_report;
 use transport::{
     AttachedTurnOutcome, discover_direct_host_identity, transport_for,
     transport_for_with_ssh_bootstrap,
@@ -1037,6 +1039,11 @@ fn run_doctor(
             );
         }
     };
+    if command.scope.as_deref() == Some("transport")
+        && let Some(report) = transport_doctor_report(&host.alias, &host.config)
+    {
+        return emit_doctor_report(report, command.events, json);
+    }
     let transport = match transport_for(&host) {
         Ok(transport) => transport,
         Err(failure) => {
@@ -1061,6 +1068,10 @@ fn run_doctor(
         }
     };
 
+    emit_doctor_report(report, command.events, json)
+}
+
+fn emit_doctor_report(report: DoctorReport, events: bool, json: bool) -> Result<(), CliFailure> {
     let readiness_error = if report.summary.ready {
         None
     } else {
@@ -1069,7 +1080,7 @@ fn run_doctor(
         ))
     };
 
-    if command.events {
+    if events {
         print_doctor_events(&report, readiness_error.as_ref()).map_err(failure)?;
         if let Some(error) = readiness_error {
             return Err(failure(error));
