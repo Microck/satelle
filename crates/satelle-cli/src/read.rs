@@ -7,7 +7,7 @@ use super::{
     experimental_provider_computer_use_json, failure, model_provider_config_json,
     redacted_config_json, resolve_path_set, yolo_config_json,
 };
-use satelle_core::{DoctorReport, SatelleError};
+use satelle_core::{DoctorOptions, DoctorReport, SatelleError};
 use serde_json::{Value, json};
 use std::path::PathBuf;
 use std::str::FromStr;
@@ -156,7 +156,9 @@ pub(super) fn doctor_for_host(
     host: &super::SelectedHost,
     scope: Option<&str>,
 ) -> Result<DoctorReport, CliFailure> {
-    transport_for(host)?.doctor(scope, false).map_err(failure)
+    transport_for(host)?
+        .doctor(scope, DoctorOptions::default())
+        .map_err(failure)
 }
 
 pub(super) fn host_status(

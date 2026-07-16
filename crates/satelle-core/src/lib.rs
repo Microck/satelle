@@ -1493,6 +1493,8 @@ pub enum ErrorCode {
     IncompatibleControlPlane,
     ComputerUseNotReady,
     DoctorReadinessBlockersFound,
+    DoctorRefreshScopeRequired,
+    DoctorRefreshTimeoutWithoutRefresh,
     SessionNotFound,
     EventsWithDetach,
     OutputModeConflict,
@@ -1563,6 +1565,8 @@ impl ErrorCode {
             Self::IncompatibleControlPlane => "incompatible-control-plane",
             Self::ComputerUseNotReady => "computer-use-not-ready",
             Self::DoctorReadinessBlockersFound => "doctor-readiness-blockers-found",
+            Self::DoctorRefreshScopeRequired => "refresh-scope-required",
+            Self::DoctorRefreshTimeoutWithoutRefresh => "refresh-timeout-without-refresh",
             Self::SessionNotFound => "session-not-found",
             Self::EventsWithDetach => "events-with-detach",
             Self::OutputModeConflict => "output-mode-conflict",
@@ -1593,7 +1597,9 @@ impl ErrorCode {
             | Self::ComponentSelectionConflict
             | Self::UnsupportedUpdateComponent
             | Self::SetupConsentRequired
-            | Self::InputRequired => 64,
+            | Self::InputRequired
+            | Self::DoctorRefreshScopeRequired
+            | Self::DoctorRefreshTimeoutWithoutRefresh => 64,
             Self::CompletionInstallFailed | Self::CompletionProfileUpdateFailed => 73,
             Self::StorageIntegrityFailed => 65,
             Self::ConfigError
@@ -2283,6 +2289,32 @@ impl SatelleError {
         }
     }
 
+    pub fn doctor_refresh_scope_required() -> Self {
+        Self {
+            code: ErrorCode::DoctorRefreshScopeRequired,
+            message: "--refresh requires doctor scope computer-use, provider, or all".to_string(),
+            recovery_command: Some(
+                "rerun with --scope computer-use, --scope provider, or --scope all".to_string(),
+            ),
+            source_detail: None,
+            details: BTreeMap::new(),
+        }
+    }
+
+    pub fn doctor_refresh_timeout_without_refresh() -> Self {
+        Self {
+            code: ErrorCode::DoctorRefreshTimeoutWithoutRefresh,
+            message: "--timeout requires --refresh and doctor scope computer-use, provider, or all"
+                .to_string(),
+            recovery_command: Some(
+                "rerun with --refresh and --scope computer-use, --scope provider, or --scope all"
+                    .to_string(),
+            ),
+            source_detail: None,
+            details: BTreeMap::new(),
+        }
+    }
+
     pub fn output_mode_conflict(message: impl Into<String>) -> Self {
         Self {
             code: ErrorCode::OutputModeConflict,
@@ -2772,6 +2804,35 @@ impl fmt::Display for DoctorFixability {
 pub enum DoctorSchemaVersion {
     #[serde(rename = "satelle.doctor.v1")]
     V1,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DoctorOptions {
+    refresh: bool,
+    probe_timeout: Option<std::time::Duration>,
+}
+
+impl DoctorOptions {
+    pub const fn new(refresh: bool, probe_timeout: Option<std::time::Duration>) -> Self {
+        Self {
+            refresh,
+            probe_timeout,
+        }
+    }
+
+    pub const fn refresh(self) -> bool {
+        self.refresh
+    }
+
+    pub const fn probe_timeout(self) -> Option<std::time::Duration> {
+        self.probe_timeout
+    }
+}
+
+impl Default for DoctorOptions {
+    fn default() -> Self {
+        Self::new(false, None)
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]

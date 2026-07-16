@@ -828,7 +828,9 @@ mod tests {
     #[test]
     fn durable_stop_synchronously_releases_the_active_registry_entry() {
         let adapter = ProductionComputerUseAdapter::new(
-            Arc::new(RwLock::new(crate::ProductionCapabilitySnapshot::collect())),
+            Arc::new(RwLock::new(crate::ProductionCapabilitySnapshot::collect(
+                None,
+            ))),
             Ok(tempfile::tempdir().unwrap().path().join("codex-work")),
         );
         let session_id = satelle_core::SessionId::new();

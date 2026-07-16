@@ -43,10 +43,10 @@ pub use runtime::{
 use runtime::{ProductionComputerUseAdapter, RunCommand, RuntimeHandle, SteerCommand, StopCommand};
 use satelle_core::session::{PublicSession, TurnAdmissionFailure, TurnExecutionMode};
 use satelle_core::{
-    DaemonPathOverrides, DoctorFinding, DoctorFixability, DoctorProbeResult, DoctorReport,
-    DoctorSchemaVersion, DoctorSummary, HostConfig, HostSessionsReport, HostSessionsSchemaVersion,
-    LOCAL_DEMO_HOST, SatelleError, SatelleEvent, SessionId, SetupReadinessSummary, SetupReport,
-    SetupSchemaVersion, StopResult, object_value, utc_now,
+    DaemonPathOverrides, DoctorFinding, DoctorFixability, DoctorOptions, DoctorProbeResult,
+    DoctorReport, DoctorSchemaVersion, DoctorSummary, HostConfig, HostSessionsReport,
+    HostSessionsSchemaVersion, LOCAL_DEMO_HOST, SatelleError, SatelleEvent, SessionId,
+    SetupReadinessSummary, SetupReport, SetupSchemaVersion, StopResult, object_value, utc_now,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -100,10 +100,10 @@ pub(crate) struct ProductionCapabilitySnapshot {
 }
 
 impl ProductionCapabilitySnapshot {
-    fn collect() -> Self {
+    fn collect(probe_timeout: Option<std::time::Duration>) -> Self {
         let started_at = utc_now();
         let started = Instant::now();
-        let discovery = discover_phase0();
+        let discovery = discover_phase0(probe_timeout);
         let verdict = evaluate_phase0_support(discovery.evidence);
         let duration_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
 
@@ -150,7 +150,7 @@ impl HostService {
     /// Builds a production Host whose native probe timeout and cache TTL come
     /// from the fully resolved host/profile configuration.
     pub fn production_for_host(config: &HostConfig) -> Self {
-        let snapshot = Arc::new(RwLock::new(ProductionCapabilitySnapshot::collect()));
+        let snapshot = Arc::new(RwLock::new(ProductionCapabilitySnapshot::collect(None)));
         let state_root = satelle_core::state_dir();
         let working_directory = state_root
             .as_ref()
@@ -209,7 +209,7 @@ impl HostService {
         &self,
         host: &str,
         scope: Option<&str>,
-        refresh: bool,
+        options: DoctorOptions,
     ) -> Result<DoctorReport, SatelleError> {
         ensure_local_demo(host)?;
         if let Some(scope) = scope
@@ -226,8 +226,8 @@ impl HostService {
             return Err(SatelleError::invalid_usage("unsupported doctor scope"));
         }
         match &self.mode {
-            HostMode::Production { snapshot } if refresh => {
-                let refreshed = ProductionCapabilitySnapshot::collect();
+            HostMode::Production { snapshot } if options.refresh() => {
+                let refreshed = ProductionCapabilitySnapshot::collect(options.probe_timeout());
                 let report = production_doctor_report(host, scope, &refreshed);
                 replace_production_snapshot(snapshot, refreshed)?;
                 Ok(report)
@@ -238,7 +238,7 @@ impl HostService {
                 &*read_production_snapshot(snapshot)?,
             )),
             #[cfg(any(test, feature = "test-support"))]
-            HostMode::TestFake => self.fake_doctor(host, scope, refresh, &FakeComputerUseAdapter),
+            HostMode::TestFake => self.fake_doctor(host, scope, options, &FakeComputerUseAdapter),
         }
     }
 
@@ -423,6 +423,10 @@ fn production_doctor_report(
             .then(left.finding_id.cmp(&right.finding_id))
     });
 
+    // Production capability discovery is currently one combined live probe,
+    // so it already satisfies the at-most-one execution promised by
+    // --serial-probes. The per-scope results below are static projections of
+    // that single snapshot, not additional live work to schedule.
     let probe_results = selected_scopes
         .iter()
         .map(|scope| production_probe_result(scope, &findings, snapshot))
