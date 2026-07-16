@@ -279,6 +279,53 @@ fn confirmed_native_probe_timeout_is_terminal_and_releases_control() {
 }
 
 #[test]
+fn native_probe_timeout_without_cancellation_detail_uses_typed_terminal_fallback() {
+    let state = crate::TestStateDir::new().expect("temporary state directory should exist");
+    let adapter = ProviderProbeRecoveryAdapter::with_native_results(
+        [],
+        [NativeProbeBehavior::TimedOutWithoutCancellationDetail],
+    );
+    let runtime = RuntimeHandle::new_with_readiness_probe_driver(
+        Ok(state.path().to_path_buf()),
+        adapter.clone(),
+        adapter,
+    );
+
+    let error = runtime
+        .run(RunCommand::attached(
+            LOCAL_DEMO_HOST,
+            "native-timeout-without-cancellation-detail",
+        ))
+        .expect_err("the typed timeout must terminate even without cancellation detail");
+    assert_eq!(error.error().code, ErrorCode::NativeReadinessTimeout);
+    assert!(
+        !error
+            .error()
+            .details
+            .contains_key("native_readiness_cancellation")
+    );
+
+    let engine = runtime.engine().expect("runtime engine should be open");
+    let storage = engine.lock_storage().unwrap();
+    let status: String = storage
+        .connection_for_test()
+        .query_row("SELECT status FROM native_readiness_results", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    let leases: i64 = storage
+        .connection_for_test()
+        .query_row(
+            "SELECT count(*) FROM control_leases WHERE owner_kind = 'native_probe'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!("timed_out", status);
+    assert_eq!(0, leases);
+}
+
+#[test]
 fn unknown_native_probe_timeout_blocks_until_terminal_reconciliation() {
     let state = crate::TestStateDir::new().expect("temporary state directory should exist");
     let adapter = ProviderProbeRecoveryAdapter::with_native_results(
@@ -893,6 +940,7 @@ enum NativeProbeBehavior {
     Passed,
     TimedOutConfirmed,
     TimedOutUnknown,
+    TimedOutWithoutCancellationDetail,
 }
 
 impl ProviderProbeRecoveryAdapter {
@@ -1011,17 +1059,18 @@ impl ReadinessProbeDriver for ProviderProbeRecoveryAdapter {
                     "reason".to_string(),
                     serde_json::Value::String("native_readiness_timed_out".to_string()),
                 );
-                error.details.insert(
-                    "native_readiness_cancellation".to_string(),
-                    serde_json::Value::String(
-                        match behavior {
-                            NativeProbeBehavior::TimedOutConfirmed => "confirmed",
-                            NativeProbeBehavior::TimedOutUnknown => "outcome_unknown",
-                            NativeProbeBehavior::Passed => unreachable!(),
-                        }
-                        .to_string(),
-                    ),
-                );
+                let cancellation = match behavior {
+                    NativeProbeBehavior::TimedOutConfirmed => Some("confirmed"),
+                    NativeProbeBehavior::TimedOutUnknown => Some("outcome_unknown"),
+                    NativeProbeBehavior::TimedOutWithoutCancellationDetail => None,
+                    NativeProbeBehavior::Passed => unreachable!(),
+                };
+                if let Some(cancellation) = cancellation {
+                    error.details.insert(
+                        "native_readiness_cancellation".to_string(),
+                        serde_json::Value::String(cancellation.to_string()),
+                    );
+                }
                 NativeProbeResult::Failed {
                     evidence,
                     reason: "native_readiness_timed_out",

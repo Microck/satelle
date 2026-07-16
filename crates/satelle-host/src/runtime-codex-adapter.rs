@@ -1375,17 +1375,25 @@ mod tests {
 
     #[test]
     fn native_readiness_timeout_is_typed_for_every_cancellation_outcome() {
-        for observation in [
-            StopObservation::CancellationConfirmed,
-            StopObservation::UpstreamInactiveConfirmed,
-            StopObservation::UpstreamStillActive,
-            StopObservation::OutcomeUnknown,
+        for (observation, expected_cancellation) in [
+            (StopObservation::CancellationConfirmed, "confirmed"),
+            (StopObservation::UpstreamInactiveConfirmed, "confirmed"),
+            (
+                StopObservation::UpstreamStillActive,
+                "upstream_still_active",
+            ),
+            (StopObservation::OutcomeUnknown, "outcome_unknown"),
         ] {
+            let failure = native_readiness_timeout_after_cancellation(observation);
+            assert_eq!(failure.error.code, ErrorCode::NativeReadinessTimeout);
+            assert_eq!(failure.reason, "native_readiness_timed_out");
             assert_eq!(
-                native_readiness_timeout_after_cancellation(observation)
-                    .error
-                    .code,
-                ErrorCode::NativeReadinessTimeout
+                failure.error.details["reason"],
+                "native_readiness_timed_out"
+            );
+            assert_eq!(
+                failure.error.details["native_readiness_cancellation"],
+                expected_cancellation
             );
         }
     }
