@@ -207,7 +207,6 @@ impl RuntimeEngine {
         command: RunCommand<'_>,
         readiness: AdapterReadiness,
     ) -> Result<RuntimeTurnOutcome, SatelleError> {
-        ensure_local_host(command.host)?;
         let session_id = SessionId::new();
         let turn_id = TurnId::new();
         let started_at = time::OffsetDateTime::now_utc();
@@ -963,16 +962,6 @@ impl RuntimeHandle {
             return Ok(None);
         }
         self.engine_without_restart_recovery().map(Some)
-    }
-}
-
-fn ensure_local_host(host: &str) -> Result<(), SatelleError> {
-    if host == LOCAL_DEMO_HOST {
-        Ok(())
-    } else {
-        Err(SatelleError::not_implemented(format!(
-            "host '{host}' is configured, but only local-demo execution is implemented"
-        )))
     }
 }
 

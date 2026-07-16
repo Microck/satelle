@@ -11,6 +11,95 @@ fn turn_intent(prompt: &str) -> TurnIntent {
     TurnIntent::new(prompt, TurnExecutionMode::Standard).expect("valid test Turn intent")
 }
 
+#[test]
+fn configured_remote_alias_reaches_execution_and_session_keeps_host_identity() {
+    const REMOTE_HOST_ALIAS: &str = "studio-workstation";
+
+    let state = TestStateDir::new().expect("temporary state directory should exist");
+    let service = HostService {
+        runtime: RuntimeHandle::new(Ok(state.path().to_path_buf()), FakeComputerUseAdapter),
+        operation_capacity: Arc::new(OperationCapacity::default()),
+        mode: HostMode::TestFake,
+        bootstrap_auth: None,
+    };
+
+    let outcome = service
+        .run(
+            REMOTE_HOST_ALIAS,
+            &turn_intent("exercise configured remote Host routing"),
+        )
+        .expect("the Host Daemon should accept its validated configured alias");
+    assert!(
+        outcome
+            .events
+            .iter()
+            .filter(|event| event.event_type() != satelle_core::EventType::ProviderSmoke)
+            .all(|event| event.host() == REMOTE_HOST_ALIAS),
+        "the configured alias must reach adapter execution events"
+    );
+    let public_session = outcome.session;
+    assert_eq!(
+        service
+            .status(public_session.session_id())
+            .expect("the admitted Session should remain publicly readable"),
+        public_session
+    );
+
+    // The Controller-local alias selects this daemon, but durable ownership
+    // remains bound to the daemon's stable Host Identity.
+    drop(service);
+    let (storage, _) = crate::storage::Storage::open(state.path())
+        .expect("the authoritative Host store should reopen");
+    let stored_session = storage
+        .load_session(public_session.session_id())
+        .expect("the admitted Session should be readable from storage")
+        .expect("the admitted Session should be durable");
+    assert_eq!(
+        stored_session.host_identity(),
+        &storage
+            .host_identity()
+            .expect("the Host Identity should be durable")
+    );
+    assert_eq!(stored_session.to_public(), public_session);
+}
+
+#[test]
+fn configured_remote_alias_is_accepted_by_host_diagnostics() {
+    const REMOTE_HOST_ALIAS: &str = "studio-workstation";
+
+    let state = TestStateDir::new().expect("temporary state directory should exist");
+    let service = HostService {
+        runtime: RuntimeHandle::new(Ok(state.path().to_path_buf()), FakeComputerUseAdapter),
+        operation_capacity: Arc::new(OperationCapacity::default()),
+        mode: HostMode::TestFake,
+        bootstrap_auth: None,
+    };
+    let doctor = service
+        .doctor(REMOTE_HOST_ALIAS, None, DoctorOptions::default())
+        .expect("doctor should diagnose the already-routed Host alias");
+    assert_eq!(doctor.host, REMOTE_HOST_ALIAS);
+
+    let sessions = service
+        .host_sessions(REMOTE_HOST_ALIAS, false)
+        .expect("desktop Session discovery should accept the routed Host alias");
+    assert_eq!(sessions.host, REMOTE_HOST_ALIAS);
+    assert_eq!(
+        sessions.bootstrap_actions,
+        ["direct studio-workstation Host daemon already reachable"]
+    );
+
+    let setup = service
+        .setup(
+            REMOTE_HOST_ALIAS,
+            true,
+            "full".to_string(),
+            Vec::new(),
+            DaemonPathOverrides::default(),
+        )
+        .expect("setup planning should accept the routed Host alias");
+    assert_eq!(setup.host, REMOTE_HOST_ALIAS);
+}
+
 #[derive(Clone, Copy)]
 struct FailingExecutionAdapter;
 

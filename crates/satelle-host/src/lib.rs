@@ -266,7 +266,6 @@ impl HostService {
         options: DoctorOptions,
         provider_intent: &ProviderComputerUseIntent,
     ) -> Result<DoctorReport, SatelleError> {
-        ensure_local_demo(host)?;
         if let Some(scope) = scope
             && ![
                 "transport",
@@ -316,7 +315,6 @@ impl HostService {
         setup_components: Vec<String>,
         daemon_path_overrides: DaemonPathOverrides,
     ) -> Result<SetupReport, SatelleError> {
-        ensure_local_demo(host)?;
         if !dry_run {
             return Err(SatelleError::not_implemented(format!(
                 "{setup_mode} setup mutations are not supported by the local Host transport"
@@ -429,12 +427,11 @@ impl HostService {
         host: &str,
         no_bootstrap: bool,
     ) -> Result<HostSessionsReport, SatelleError> {
-        ensure_local_demo(host)?;
         let sessions = self.daemon_desktop_sessions()?;
         let bootstrap_actions = if no_bootstrap {
             Vec::new()
         } else {
-            vec!["direct local-demo host daemon already reachable".to_string()]
+            vec![format!("direct {host} Host daemon already reachable")]
         };
         Ok(HostSessionsReport {
             schema_version: HostSessionsSchemaVersion::V1,
@@ -975,16 +972,6 @@ pub struct HostStatus {
 pub struct TurnOutcome {
     pub session: PublicSession,
     pub events: Vec<SatelleEvent>,
-}
-
-fn ensure_local_demo(host: &str) -> Result<(), SatelleError> {
-    if host == LOCAL_DEMO_HOST {
-        return Ok(());
-    }
-
-    Err(SatelleError::not_implemented(format!(
-        "host '{host}' is configured, but only local-demo execution is implemented in this MVP skeleton"
-    )))
 }
 
 pub fn health_route() -> Value {
