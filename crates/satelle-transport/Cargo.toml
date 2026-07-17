@@ -15,15 +15,17 @@ satelle-core = { path = "../satelle-core" }
 satelle-host = { path = "../satelle-host" }
 serde.workspace = true
 serde_json.workspace = true
+thiserror.workspace = true
 time.workspace = true
 tokio.workspace = true
+tokio-rustls.workspace = true
 tokio-tungstenite.workspace = true
 tracing.workspace = true
 uuid.workspace = true
+x509-parser.workspace = true
 zeroize.workspace = true
 
 [dev-dependencies]
 rcgen = "=0.14.8"
 satelle-host = { path = "../satelle-host", features = ["test-support"] }
 satelle-test-contract = { path = "../satelle-test-contract" }
-tokio-rustls = "0.26.4"

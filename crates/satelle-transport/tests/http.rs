@@ -16,16 +16,16 @@ mod raw_wire;
 mod sessions;
 
 use reqwest::StatusCode;
-use satelle_core::ErrorCode;
 use satelle_core::session::TurnExecutionMode;
+use satelle_core::{ApiTokenSource, DirectHostBinding, ErrorCode, SatelleConfig, TransportKind};
 use satelle_host::{
     ApiBearerToken, ApiScopes, HostService, MutationAuthority, TurnIntent,
     test_support::TestStateDir,
 };
 use satelle_transport::{
-    ApiError, CapabilitiesResponse, DaemonClient, DaemonClientError, DaemonServer,
-    DaemonServerConfig, HostDesktopSessionsResponse, HostStatusResponse, LiveResponse,
-    LogsPageResponse, RequestId,
+    ApiError, CapabilitiesResponse, DaemonClient, DaemonClientError, DaemonEventClient,
+    DaemonServer, DaemonServerConfig, DaemonTlsConfig, DaemonTlsConfigError, EventSubscription,
+    HostDesktopSessionsResponse, HostStatusResponse, LiveResponse, LogsPageResponse, RequestId,
 };
 use serde_json::Value;
 use std::net::{Ipv4Addr, SocketAddr};
@@ -664,6 +664,391 @@ async fn plaintext_non_loopback_bind_is_rejected_before_listening() {
     .await
     .expect_err("non-loopback plaintext bind must fail");
     assert_eq!(error.code(), "non-loopback-plaintext-bind");
+}
+
+#[tokio::test]
+async fn authenticated_https_is_served_by_a_non_loopback_tls_listener() {
+    let state = TestStateDir::new().expect("temporary state directory");
+    let service = HostService::local_demo_for_tests_at(state.path())
+        .expect("construct deterministic Host service");
+    let initialized = service.initialize_daemon().expect("initialize Host state");
+    let host_identity = initialized.host_identity().to_string();
+    let token = ApiBearerToken::generate().expect("generate API token");
+    service
+        .register_api_token(&token, "principal-https-test", ApiScopes::READ, None)
+        .expect("register API token");
+    let certified = rcgen::generate_simple_self_signed(["localhost".to_string()])
+        .expect("generate direct transport certificate");
+    let tls = DaemonTlsConfig::from_pem(
+        certified.cert.pem().as_bytes(),
+        certified.signing_key.serialize_pem().as_bytes(),
+    )
+    .expect("build validated TLS configuration");
+    let server = DaemonServer::bind_tls(
+        service,
+        DaemonServerConfig::loopback(SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0))),
+        tls,
+    )
+    .await
+    .expect("bind non-loopback TLS daemon");
+    let certificate = reqwest::Certificate::from_pem(certified.cert.pem().as_bytes())
+        .expect("parse test trust root");
+    let client = reqwest::Client::builder()
+        .tls_certs_only([certificate])
+        .build()
+        .expect("build HTTPS client");
+    let exposed = token.expose();
+    let response = client
+        .get(format!(
+            "https://localhost:{}/v1/host/status",
+            server.local_addr().port()
+        ))
+        .header("Authorization", format!("Bearer {}", exposed.as_str()))
+        .header("Satelle-Expected-Host-Identity", &host_identity)
+        .header("Satelle-Request-Id", RequestId::new().to_string())
+        .send()
+        .await
+        .expect("request authenticated Host status over TLS");
+
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let mut host_config = SatelleConfig::defaults()
+        .hosts
+        .remove("local-demo")
+        .expect("default local Host config");
+    host_config.transport = TransportKind::Direct;
+    host_config.address = Some(format!("https://localhost:{}", server.local_addr().port()));
+    host_config.expected_host_id = Some(host_identity);
+    host_config.api_token = Some(ApiTokenSource::File {
+        path: std::env::temp_dir().join("satelle-https-server-test.token"),
+    });
+    let binding =
+        DirectHostBinding::from_host_config(&host_config).expect("construct direct Host Binding");
+    let event_token = ApiBearerToken::parse(exposed.as_str()).expect("copy API token for WSS");
+    let event_client =
+        DaemonEventClient::wss(&binding, event_token, Some(certified.cert.pem().as_bytes()))
+            .expect("construct WSS client");
+    let event_stream = event_client
+        .connect_events(vec![EventSubscription::Host])
+        .await
+        .expect("connect authenticated WSS event stream");
+    drop(event_stream);
+    server.shutdown().await.expect("stop TLS daemon");
+}
+
+#[tokio::test]
+async fn an_idle_tls_handshake_does_not_block_other_clients() {
+    let state = TestStateDir::new().expect("temporary state directory");
+    let service = HostService::local_demo_for_tests_at(state.path())
+        .expect("construct deterministic Host service");
+    let host_identity = service
+        .initialize_daemon()
+        .expect("initialize Host state")
+        .host_identity()
+        .to_string();
+    let token = ApiBearerToken::generate().expect("generate API token");
+    service
+        .register_api_token(&token, "principal-concurrent-tls", ApiScopes::READ, None)
+        .expect("register API token");
+    let certified = rcgen::generate_simple_self_signed(["localhost".to_string()])
+        .expect("generate direct transport certificate");
+    let tls = DaemonTlsConfig::from_pem(
+        certified.cert.pem().as_bytes(),
+        certified.signing_key.serialize_pem().as_bytes(),
+    )
+    .expect("build validated TLS configuration");
+    let server = DaemonServer::bind_tls(
+        service,
+        DaemonServerConfig::loopback(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))),
+        tls,
+    )
+    .await
+    .expect("bind TLS daemon");
+    let _idle_handshake = TcpStream::connect(server.local_addr())
+        .await
+        .expect("open idle pre-handshake socket");
+    let certificate = reqwest::Certificate::from_pem(certified.cert.pem().as_bytes())
+        .expect("parse test trust root");
+    let client = reqwest::Client::builder()
+        .tls_certs_only([certificate])
+        .build()
+        .expect("build HTTPS client");
+    let exposed = token.expose();
+    let response = tokio::time::timeout(
+        Duration::from_secs(2),
+        client
+            .get(format!(
+                "https://localhost:{}/v1/host/status",
+                server.local_addr().port()
+            ))
+            .header("Authorization", format!("Bearer {}", exposed.as_str()))
+            .header("Satelle-Expected-Host-Identity", host_identity)
+            .header("Satelle-Request-Id", RequestId::new().to_string())
+            .send(),
+    )
+    .await
+    .expect("idle TLS peer must not block a later client")
+    .expect("request authenticated Host status over TLS");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    server.shutdown().await.expect("stop TLS daemon");
+}
+
+#[test]
+fn tls_configuration_rejects_expired_certificates_and_mismatched_keys() {
+    let mut expired_params =
+        rcgen::CertificateParams::new(["localhost".to_string()]).expect("certificate params");
+    expired_params.not_before = rcgen::date_time_ymd(2020, 1, 1);
+    expired_params.not_after = rcgen::date_time_ymd(2020, 1, 2);
+    let expired_key = rcgen::KeyPair::generate().expect("generate expired certificate key");
+    let expired = expired_params
+        .self_signed(&expired_key)
+        .expect("generate expired certificate");
+    assert_eq!(
+        DaemonTlsConfig::from_pem(
+            expired.pem().as_bytes(),
+            expired_key.serialize_pem().as_bytes()
+        )
+        .expect_err("expired certificate must fail before bind"),
+        DaemonTlsConfigError::CertificateExpired
+    );
+
+    let mut expired_issuer_params =
+        rcgen::CertificateParams::new(Vec::new()).expect("issuer certificate params");
+    expired_issuer_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+    expired_issuer_params
+        .key_usages
+        .push(rcgen::KeyUsagePurpose::KeyCertSign);
+    expired_issuer_params.not_before = rcgen::date_time_ymd(2020, 1, 1);
+    expired_issuer_params.not_after = rcgen::date_time_ymd(2020, 1, 2);
+    let expired_issuer_key = rcgen::KeyPair::generate().expect("generate expired issuer key");
+    let expired_issuer = expired_issuer_params
+        .self_signed(&expired_issuer_key)
+        .expect("generate expired issuer certificate");
+    let issuer = rcgen::Issuer::new(expired_issuer_params, expired_issuer_key);
+    let leaf_params =
+        rcgen::CertificateParams::new(["localhost".to_string()]).expect("leaf params");
+    let leaf_key = rcgen::KeyPair::generate().expect("generate valid leaf key");
+    let leaf = leaf_params
+        .signed_by(&leaf_key, &issuer)
+        .expect("generate valid leaf certificate");
+    let chain = format!("{}{}", leaf.pem(), expired_issuer.pem());
+    assert_eq!(
+        DaemonTlsConfig::from_pem(chain.as_bytes(), leaf_key.serialize_pem().as_bytes())
+            .expect_err("expired intermediate must fail before bind"),
+        DaemonTlsConfigError::CertificateExpired
+    );
+
+    let mut signer_params =
+        rcgen::CertificateParams::new(Vec::new()).expect("signer certificate params");
+    signer_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+    signer_params
+        .key_usages
+        .push(rcgen::KeyUsagePurpose::KeyCertSign);
+    let signer_key = rcgen::KeyPair::generate().expect("generate signer key");
+    let signer = rcgen::Issuer::new(signer_params, signer_key);
+    let leaf_params =
+        rcgen::CertificateParams::new(["localhost".to_string()]).expect("leaf params");
+    let leaf_key = rcgen::KeyPair::generate().expect("generate leaf key");
+    let leaf = leaf_params
+        .signed_by(&leaf_key, &signer)
+        .expect("generate signed leaf certificate");
+    let mut unrelated_params =
+        rcgen::CertificateParams::new(Vec::new()).expect("unrelated issuer params");
+    unrelated_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+    unrelated_params
+        .key_usages
+        .push(rcgen::KeyUsagePurpose::KeyCertSign);
+    let unrelated_key = rcgen::KeyPair::generate().expect("generate unrelated issuer key");
+    let unrelated = unrelated_params
+        .self_signed(&unrelated_key)
+        .expect("generate unrelated issuer certificate");
+    let chain = format!("{}{}", leaf.pem(), unrelated.pem());
+    assert_eq!(
+        DaemonTlsConfig::from_pem(chain.as_bytes(), leaf_key.serialize_pem().as_bytes())
+            .expect_err("unrelated intermediate must fail before bind"),
+        DaemonTlsConfigError::InvalidCertificateChain
+    );
+
+    let mut root_params =
+        rcgen::CertificateParams::new(Vec::new()).expect("constrained root params");
+    root_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Constrained(0));
+    root_params
+        .distinguished_name
+        .push(rcgen::DnType::CommonName, "constrained root");
+    root_params
+        .key_usages
+        .push(rcgen::KeyUsagePurpose::KeyCertSign);
+    let root_key = rcgen::KeyPair::generate().expect("generate constrained root key");
+    let root = root_params
+        .self_signed(&root_key)
+        .expect("generate constrained root certificate");
+    let root_issuer = rcgen::Issuer::new(root_params, root_key);
+    let mut intermediate_params =
+        rcgen::CertificateParams::new(Vec::new()).expect("intermediate params");
+    intermediate_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+    intermediate_params
+        .distinguished_name
+        .push(rcgen::DnType::CommonName, "subordinate intermediate");
+    intermediate_params
+        .key_usages
+        .push(rcgen::KeyUsagePurpose::KeyCertSign);
+    let intermediate_key = rcgen::KeyPair::generate().expect("generate intermediate key");
+    let intermediate = intermediate_params
+        .signed_by(&intermediate_key, &root_issuer)
+        .expect("generate intermediate certificate");
+    let intermediate_issuer = rcgen::Issuer::new(intermediate_params, intermediate_key);
+    let leaf_params =
+        rcgen::CertificateParams::new(["localhost".to_string()]).expect("leaf params");
+    let leaf_key = rcgen::KeyPair::generate().expect("generate path-length leaf key");
+    let leaf = leaf_params
+        .signed_by(&leaf_key, &intermediate_issuer)
+        .expect("generate path-length leaf certificate");
+    let chain = format!("{}{}{}", leaf.pem(), intermediate.pem(), root.pem());
+    assert_eq!(
+        DaemonTlsConfig::from_pem(chain.as_bytes(), leaf_key.serialize_pem().as_bytes())
+            .expect_err("exceeded path-length constraint must fail before bind"),
+        DaemonTlsConfigError::InvalidCertificateChain
+    );
+
+    let mut constrained_issuer_params =
+        rcgen::CertificateParams::new(Vec::new()).expect("name-constrained issuer params");
+    constrained_issuer_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+    constrained_issuer_params
+        .key_usages
+        .push(rcgen::KeyUsagePurpose::KeyCertSign);
+    constrained_issuer_params.name_constraints = Some(rcgen::NameConstraints {
+        permitted_subtrees: vec![rcgen::GeneralSubtree::DnsName("example.com".to_string())],
+        excluded_subtrees: Vec::new(),
+    });
+    let constrained_issuer_key =
+        rcgen::KeyPair::generate().expect("generate name-constrained issuer key");
+    let constrained_issuer_certificate = constrained_issuer_params
+        .self_signed(&constrained_issuer_key)
+        .expect("generate name-constrained issuer certificate");
+    let constrained_issuer = rcgen::Issuer::new(constrained_issuer_params, constrained_issuer_key);
+    let constrained_leaf_params =
+        rcgen::CertificateParams::new(["localhost".to_string()]).expect("constrained leaf params");
+    let constrained_leaf_key = rcgen::KeyPair::generate().expect("generate constrained leaf key");
+    let constrained_leaf = constrained_leaf_params
+        .signed_by(&constrained_leaf_key, &constrained_issuer)
+        .expect("generate constrained leaf certificate");
+    let constrained_chain = format!(
+        "{}{}",
+        constrained_leaf.pem(),
+        constrained_issuer_certificate.pem()
+    );
+    assert_eq!(
+        DaemonTlsConfig::from_pem(
+            constrained_chain.as_bytes(),
+            constrained_leaf_key.serialize_pem().as_bytes()
+        )
+        .expect_err("name-constrained chain must fail closed before bind"),
+        DaemonTlsConfigError::InvalidCertificateChain
+    );
+
+    let nameless_params = rcgen::CertificateParams::new(Vec::new()).expect("nameless leaf params");
+    let nameless_key = rcgen::KeyPair::generate().expect("generate nameless leaf key");
+    let nameless_leaf = nameless_params
+        .self_signed(&nameless_key)
+        .expect("generate leaf without subject alternative names");
+    assert_eq!(
+        DaemonTlsConfig::from_pem(
+            nameless_leaf.pem().as_bytes(),
+            nameless_key.serialize_pem().as_bytes()
+        )
+        .expect_err("leaf without a DNS or IP subject alternative name must fail before bind"),
+        DaemonTlsConfigError::InvalidCertificateChain
+    );
+
+    let mut unsupported_params =
+        rcgen::CertificateParams::new(["localhost".to_string()]).expect("unsupported leaf params");
+    let mut unsupported_extension =
+        rcgen::CustomExtension::from_oid_content(&[1, 3, 6, 1, 4, 1, 55_555, 1], vec![0x05, 0x00]);
+    unsupported_extension.set_criticality(true);
+    unsupported_params
+        .custom_extensions
+        .push(unsupported_extension);
+    let unsupported_key = rcgen::KeyPair::generate().expect("generate unsupported leaf key");
+    let unsupported_leaf = unsupported_params
+        .self_signed(&unsupported_key)
+        .expect("generate leaf with an unsupported critical extension");
+    assert_eq!(
+        DaemonTlsConfig::from_pem(
+            unsupported_leaf.pem().as_bytes(),
+            unsupported_key.serialize_pem().as_bytes()
+        )
+        .expect_err("unsupported critical certificate extension must fail before bind"),
+        DaemonTlsConfigError::InvalidCertificateChain
+    );
+
+    let mut ca_leaf_params =
+        rcgen::CertificateParams::new(["localhost".to_string()]).expect("CA leaf params");
+    ca_leaf_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+    ca_leaf_params.key_usages.extend([
+        rcgen::KeyUsagePurpose::DigitalSignature,
+        rcgen::KeyUsagePurpose::KeyCertSign,
+    ]);
+    let ca_leaf_key = rcgen::KeyPair::generate().expect("generate CA leaf key");
+    let ca_leaf = ca_leaf_params
+        .self_signed(&ca_leaf_key)
+        .expect("generate CA leaf certificate");
+    assert_eq!(
+        DaemonTlsConfig::from_pem(
+            ca_leaf.pem().as_bytes(),
+            ca_leaf_key.serialize_pem().as_bytes()
+        )
+        .expect_err("CA certificate must not be accepted as the server leaf"),
+        DaemonTlsConfigError::InvalidCertificateChain
+    );
+
+    let mut client_only_params =
+        rcgen::CertificateParams::new(["localhost".to_string()]).expect("client-only leaf params");
+    client_only_params
+        .extended_key_usages
+        .push(rcgen::ExtendedKeyUsagePurpose::ClientAuth);
+    let client_only_key = rcgen::KeyPair::generate().expect("generate client-only key");
+    let client_only = client_only_params
+        .self_signed(&client_only_key)
+        .expect("generate client-only certificate");
+    assert_eq!(
+        DaemonTlsConfig::from_pem(
+            client_only.pem().as_bytes(),
+            client_only_key.serialize_pem().as_bytes()
+        )
+        .expect_err("client-only certificate must fail before bind"),
+        DaemonTlsConfigError::InvalidCertificateChain
+    );
+
+    let mut signing_only_params = rcgen::CertificateParams::new(["localhost".to_string()])
+        .expect("certificate-signing-only leaf params");
+    signing_only_params
+        .key_usages
+        .push(rcgen::KeyUsagePurpose::KeyCertSign);
+    let signing_only_key = rcgen::KeyPair::generate().expect("generate signing-only key");
+    let signing_only = signing_only_params
+        .self_signed(&signing_only_key)
+        .expect("generate certificate-signing-only leaf");
+    assert_eq!(
+        DaemonTlsConfig::from_pem(
+            signing_only.pem().as_bytes(),
+            signing_only_key.serialize_pem().as_bytes()
+        )
+        .expect_err("certificate-signing-only leaf must fail before bind"),
+        DaemonTlsConfigError::InvalidCertificateChain
+    );
+
+    let certificate = rcgen::generate_simple_self_signed(["localhost".to_string()])
+        .expect("generate certificate");
+    let unrelated_key = rcgen::KeyPair::generate().expect("generate unrelated key");
+    assert_eq!(
+        DaemonTlsConfig::from_pem(
+            certificate.cert.pem().as_bytes(),
+            unrelated_key.serialize_pem().as_bytes()
+        )
+        .expect_err("certificate and key mismatch must fail before bind"),
+        DaemonTlsConfigError::CertificateKeyMismatch
+    );
 }
 
 #[tokio::test]

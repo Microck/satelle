@@ -1760,16 +1760,16 @@
 - satelle telemetry status reports enabled state, endpoint origin without credentials or path secrets, buffered record count and bytes, oldest record age, last delivery outcome, and excluded data categories @spec @later
 - satelle allows plaintext HTTP and WebSocket transport only on loopback listeners used locally or through authenticated SSH tunnels @spec @mvp @implemented
 - satelle rejects plaintext non-loopback HTTP and WebSocket transport @spec @mvp @implemented
-- satelle requires authenticated HTTPS for HTTP and authenticated WSS for WebSocket on every non-loopback direct Host Daemon connection @spec @mvp
+- satelle requires authenticated HTTPS for HTTP and authenticated WSS for WebSocket on every non-loopback direct Host Daemon connection @spec @mvp @implemented
 - satelle direct TLS validates the certificate chain and requested Host name against platform trust roots or an explicitly configured user-level CA bundle @spec @mvp @implemented
 - a configured CA bundle must be a regular non-symlink file owned by the invoking OS user or a trusted system administrator, must not be writable by unrelated principals, and must use an owner-controlled Windows ACL @spec @mvp @implemented
 - satelle direct TLS requires TLS 1.2 or newer @spec @mvp @implemented
 - satelle direct TLS reports typed certificate-untrusted, certificate-hostname-mismatch, certificate-expired, and tls-version-unsupported errors before API authentication @spec @mvp @implemented
 - satelle does not expose an insecure direct-transport option that disables certificate or Host-name verification @spec @mvp @implemented
 - satelle MVP does not manage TLS certificate issuance or renewal for non-loopback direct Host Daemon transport @spec @mvp
-- satelle non-loopback direct transport relies on user-provided TLS termination or configured TLS materials outside MVP certificate automation @spec @mvp
+- satelle non-loopback direct transport relies on user-provided TLS termination or configured TLS materials outside MVP certificate automation @spec @mvp @implemented
 - when the Host Daemon terminates TLS, its certificate-chain and private-key files must be regular non-symlink files under a Host-owned configuration boundary, and the private key must not be readable or writable by unrelated principals @spec @mvp
-- Host Daemon TLS startup fails closed on an unreadable key, unsafe permissions, an expired certificate, or a certificate and private-key mismatch and never falls back to plaintext @spec @mvp
+- Host Daemon TLS startup fails closed on an unreadable key, unsafe permissions, an expired certificate, or a certificate and private-key mismatch and never falls back to plaintext @spec @mvp @implemented
 - when TLS terminates in an external reverse proxy, the plaintext Host Daemon backend binds only to loopback and still requires normal Satelle bearer-token authentication and authorization @spec @mvp
 - TLS reload installs a new certificate and key atomically only after full validation; failed reload retains the previous valid TLS configuration and emits a typed diagnostic instead of exposing plaintext @spec @mvp
 - satelle Host Daemon API authentication uses bearer tokens for MVP @spec @mvp @implemented

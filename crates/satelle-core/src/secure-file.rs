@@ -20,6 +20,7 @@ pub enum SecureFileError {
 #[derive(Clone, Copy, Eq, PartialEq)]
 enum SecurityPolicy {
     OwnerOnly,
+    OwnerPrivate,
     OwnerControlled,
     UserOrAdministratorControlled,
 }
@@ -28,6 +29,17 @@ pub fn read_owner_only_secret_file(path: &Path) -> Result<Zeroizing<String>, Sec
     let bytes = read_secure_file(path, SecurityPolicy::OwnerOnly, MAX_SECRET_FILE_BYTES)?;
     let value = std::str::from_utf8(bytes.as_slice()).map_err(|_| SecureFileError::NotUtf8)?;
     Ok(Zeroizing::new(value.trim_ascii().to_string()))
+}
+
+/// Reads larger secret configuration material such as a PEM private key while
+/// retaining the regular-file, ownership, link, and ACL requirements of
+/// ordinary token files and allowing owner-read-only key material.
+pub fn read_owner_only_secret_config_file(
+    path: &Path,
+) -> Result<Zeroizing<String>, SecureFileError> {
+    let bytes = read_secure_file(path, SecurityPolicy::OwnerPrivate, MAX_CONFIG_FILE_BYTES)?;
+    let value = std::str::from_utf8(bytes.as_slice()).map_err(|_| SecureFileError::NotUtf8)?;
+    Ok(Zeroizing::new(value.to_string()))
 }
 
 pub fn read_owner_controlled_config_file(path: &Path) -> Result<String, SecureFileError> {
@@ -235,6 +247,7 @@ fn open_secure_file(path: &Path, policy: SecurityPolicy) -> Result<File, SecureF
     let mode = metadata.st_mode & 0o777;
     let permissions_are_safe = match policy {
         SecurityPolicy::OwnerOnly => mode == 0o600,
+        SecurityPolicy::OwnerPrivate => matches!(mode, 0o400 | 0o600),
         SecurityPolicy::OwnerControlled | SecurityPolicy::UserOrAdministratorControlled => {
             mode & 0o022 == 0
         }
@@ -247,6 +260,12 @@ fn open_secure_file(path: &Path, policy: SecurityPolicy) -> Result<File, SecureF
         || !permissions_are_safe
     {
         return Err(SecureFileError::UnsafeOrUnavailable);
+    }
+    if matches!(
+        policy,
+        SecurityPolicy::OwnerOnly | SecurityPolicy::OwnerPrivate
+    ) {
+        require_no_macos_extended_acl(&descriptor)?;
     }
     Ok(File::from(descriptor))
 }
@@ -278,10 +297,10 @@ mod windows {
     use windows_sys::Win32::Security::{
         ACCESS_ALLOWED_ACE, ACE_HEADER, ACL, CONTAINER_INHERIT_ACE, CopySid,
         DACL_SECURITY_INFORMATION, EqualSid, GetAce, GetLengthSid, GetSecurityDescriptorControl,
-        GetSecurityDescriptorDacl, GetTokenInformation, IsValidAcl, IsValidSid, IsWellKnownSid,
-        OBJECT_INHERIT_ACE, OWNER_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID,
-        SE_DACL_PROTECTED, SECURITY_ATTRIBUTES, TOKEN_INFORMATION_CLASS, TOKEN_QUERY, TOKEN_USER,
-        TokenUser, WinBuiltinAdministratorsSid, WinLocalSystemSid,
+        GetTokenInformation, IsValidAcl, IsValidSid, IsWellKnownSid, OBJECT_INHERIT_ACE,
+        OWNER_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID, SE_DACL_PROTECTED,
+        SECURITY_ATTRIBUTES, TOKEN_INFORMATION_CLASS, TOKEN_QUERY, TOKEN_USER, TokenUser,
+        WinBuiltinAdministratorsSid, WinLocalSystemSid,
     };
     use windows_sys::Win32::Storage::FileSystem::{
         BY_HANDLE_FILE_INFORMATION, CreateDirectoryW, CreateFileW, DELETE, FILE_ALL_ACCESS,
@@ -492,9 +511,29 @@ mod windows {
             return Err(SecureFileError::UnsafeOrUnavailable);
         }
         match policy {
-            SecurityPolicy::OwnerOnly => verify_owner_only_dacl(&security, process_sid, 0),
+            SecurityPolicy::OwnerOnly => {
+                verify_owner_only_dacl(&security, process_sid, 0, OwnerAccess::Full)
+            }
+            SecurityPolicy::OwnerPrivate => {
+                verify_owner_only_dacl(&security, process_sid, 0, OwnerAccess::ReadOrFull)
+            }
             SecurityPolicy::OwnerControlled | SecurityPolicy::UserOrAdministratorControlled => {
                 verify_owner_controlled_dacl(&security, process_sid)
+            }
+        }
+    }
+
+    #[derive(Clone, Copy)]
+    enum OwnerAccess {
+        Full,
+        ReadOrFull,
+    }
+
+    impl OwnerAccess {
+        const fn permits(self, access: u32) -> bool {
+            match self {
+                Self::Full => access == FILE_ALL_ACCESS,
+                Self::ReadOrFull => access & FILE_GENERIC_READ == FILE_GENERIC_READ,
             }
         }
     }
@@ -503,6 +542,7 @@ mod windows {
         security: &SecurityView,
         process_sid: &ProcessSid,
         expected_ace_flags: u8,
+        owner_access: OwnerAccess,
     ) -> Result<(), SecureFileError> {
         let mut control = 0_u16;
         let mut revision = 0_u32;
@@ -524,7 +564,7 @@ mod windows {
                 AceEntry::Allowed(ace) => {
                     if owner_allow_seen
                         || ace.flags != expected_ace_flags
-                        || normalized_file_access_mask(ace.mask) != FILE_ALL_ACCESS
+                        || !owner_access.permits(normalized_file_access_mask(ace.mask))
                         || !ace_matches(&ace, process_sid)
                     {
                         return Err(SecureFileError::UnsafeOrUnavailable);
@@ -552,7 +592,12 @@ mod windows {
         {
             return Err(SecureFileError::UnsafeOrUnavailable);
         }
-        verify_owner_only_dacl(&security, process_sid, expected_ace_flags)
+        verify_owner_only_dacl(
+            &security,
+            process_sid,
+            expected_ace_flags,
+            OwnerAccess::Full,
+        )
     }
 
     fn normalized_file_access_mask(mask: u32) -> u32 {
@@ -903,6 +948,15 @@ mod windows {
                 normalized_file_access_mask(GENERIC_ALL | ACCESS_SYSTEM_SECURITY),
                 FILE_ALL_ACCESS | ACCESS_SYSTEM_SECURITY
             );
+            assert!(OwnerAccess::Full.permits(FILE_ALL_ACCESS));
+            assert!(!OwnerAccess::Full.permits(FILE_GENERIC_READ));
+            assert!(OwnerAccess::ReadOrFull.permits(FILE_GENERIC_READ));
+            assert!(OwnerAccess::ReadOrFull.permits(FILE_ALL_ACCESS));
+            assert!(
+                OwnerAccess::ReadOrFull
+                    .permits(normalized_file_access_mask(GENERIC_READ | GENERIC_WRITE))
+            );
+            assert!(!OwnerAccess::ReadOrFull.permits(FILE_GENERIC_WRITE));
         }
     }
 }
@@ -1022,6 +1076,10 @@ mod tests {
             open_or_create_owner_only_file(&existing),
             Err(SecureFileError::UnsafeOrUnavailable)
         ));
+        assert_eq!(
+            read_owner_only_secret_config_file(&existing),
+            Err(SecureFileError::UnsafeOrUnavailable)
+        );
 
         let inheriting_parent = directory.path().join("inheriting-parent");
         fs::create_dir(&inheriting_parent).expect("create ACL inheritance parent");
@@ -1071,6 +1129,27 @@ mod tests {
         assert_eq!(
             read_owner_only_secret_file(&link),
             Err(SecureFileError::UnsafeOrUnavailable)
+        );
+
+        let private_key = directory.path().join("host-private-key.pem");
+        let pem = "x".repeat(MAX_SECRET_FILE_BYTES + 1);
+        fs::write(&private_key, &pem).expect("write larger private key fixture");
+        fs::set_permissions(&private_key, fs::Permissions::from_mode(0o600))
+            .expect("restrict private key file");
+        assert_eq!(
+            read_owner_only_secret_config_file(&private_key)
+                .expect("read larger owner-only secret configuration")
+                .as_str(),
+            pem
+        );
+
+        fs::set_permissions(&private_key, fs::Permissions::from_mode(0o400))
+            .expect("make private key owner-readable");
+        assert_eq!(
+            read_owner_only_secret_config_file(&private_key)
+                .expect("read owner-private configuration without write access")
+                .as_str(),
+            pem
         );
     }
 
@@ -1148,6 +1227,32 @@ mod tests {
                 .expect("read private token")
                 .as_str(),
             "secret-value"
+        );
+
+        set_windows_acl(&token, &[format!("*{user}:(R)")]);
+        assert_eq!(
+            read_owner_only_secret_file(&token),
+            Err(SecureFileError::UnsafeOrUnavailable)
+        );
+        set_windows_acl(&token, &[format!("*{user}:(F)")]);
+
+        let private_key = directory.path().join("host-private-key.pem");
+        let pem = "x".repeat(MAX_SECRET_FILE_BYTES + 1);
+        fs::write(&private_key, &pem).expect("write larger private key fixture");
+        set_windows_owner(&private_key, &user);
+        set_windows_acl(&private_key, &[format!("*{user}:(R)")]);
+        assert_eq!(
+            read_owner_only_secret_config_file(&private_key)
+                .expect("read owner-read-only private key")
+                .as_str(),
+            pem
+        );
+        set_windows_acl(&private_key, &[format!("*{user}:(M)")]);
+        assert_eq!(
+            read_owner_only_secret_config_file(&private_key)
+                .expect("read owner-read-write private key")
+                .as_str(),
+            pem
         );
 
         add_windows_deny(&token, "*S-1-5-7:(R)");

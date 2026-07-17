@@ -2372,12 +2372,14 @@ dependencies = [
  "satelle-test-contract",
  "serde",
  "serde_json",
+ "thiserror",
  "time",
  "tokio",
  "tokio-rustls",
  "tokio-tungstenite",
  "tracing",
  "uuid",
+ "x509-parser",
  "zeroize",
 ]
 

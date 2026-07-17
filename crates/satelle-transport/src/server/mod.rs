@@ -19,6 +19,8 @@ use axum::middleware;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use listener::{ConnectionActivity, ConnectionContext, LimitedTcpListener};
+use rustls::pki_types::pem::PemObject;
+use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName};
 use satelle_core::SatelleError;
 use satelle_host::{DaemonRuntimeCapabilities, HostService};
 use serde::Serialize;
@@ -74,6 +76,167 @@ impl DaemonServerConfig {
     }
 }
 
+/// Fully validated Host-side TLS configuration. Construction validates every
+/// supplied chain link, rejects certificates outside their validity windows,
+/// and proves that the private key matches before a network listener is opened.
+#[derive(Clone)]
+pub struct DaemonTlsConfig(Arc<rustls::ServerConfig>);
+
+impl fmt::Debug for DaemonTlsConfig {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("DaemonTlsConfig")
+            .finish_non_exhaustive()
+    }
+}
+
+impl DaemonTlsConfig {
+    pub fn from_pem(
+        certificate_chain_pem: &[u8],
+        private_key_pem: &[u8],
+    ) -> Result<Self, DaemonTlsConfigError> {
+        let certificates = CertificateDer::pem_slice_iter(certificate_chain_pem)
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|_| DaemonTlsConfigError::InvalidCertificateChain)?;
+        if certificates.is_empty() {
+            return Err(DaemonTlsConfigError::InvalidCertificateChain);
+        }
+        let parsed_certificates = certificates
+            .iter()
+            .map(|certificate_der| {
+                let (remaining, certificate) =
+                    x509_parser::parse_x509_certificate(certificate_der.as_ref())
+                        .map_err(|_| DaemonTlsConfigError::InvalidCertificateChain)?;
+                if !remaining.is_empty() {
+                    return Err(DaemonTlsConfigError::InvalidCertificateChain);
+                }
+                Ok(certificate)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let now = x509_parser::time::ASN1Time::now();
+        for certificate in &parsed_certificates {
+            let has_unsupported_critical_extension = certificate.extensions().iter().any(|ext| {
+                ext.critical
+                    && matches!(
+                        ext.parsed_extension(),
+                        x509_parser::extensions::ParsedExtension::UnsupportedExtension { .. }
+                            | x509_parser::extensions::ParsedExtension::ParseError { .. }
+                            | x509_parser::extensions::ParsedExtension::Unparsed
+                    )
+            });
+            if has_unsupported_critical_extension {
+                return Err(DaemonTlsConfigError::InvalidCertificateChain);
+            }
+            // This startup validator supports only unconstrained chains. A
+            // constrained CA must fail closed until the full RFC 5280 name
+            // constraint algorithm is part of this pre-bind validation path.
+            if certificate
+                .name_constraints()
+                .map_err(|_| DaemonTlsConfigError::InvalidCertificateChain)?
+                .is_some()
+            {
+                return Err(DaemonTlsConfigError::InvalidCertificateChain);
+            }
+            let validity = certificate.validity();
+            if validity.not_after <= now {
+                return Err(DaemonTlsConfigError::CertificateExpired);
+            }
+            if validity.not_before > now {
+                return Err(DaemonTlsConfigError::CertificateNotYetValid);
+            }
+        }
+        let leaf = &parsed_certificates[0];
+        let leaf_is_ca = leaf
+            .basic_constraints()
+            .map_err(|_| DaemonTlsConfigError::InvalidCertificateChain)?
+            .is_some_and(|constraints| constraints.value.ca);
+        let leaf_has_server_name = leaf
+            .subject_alternative_name()
+            .map_err(|_| DaemonTlsConfigError::InvalidCertificateChain)?
+            .is_some_and(|names| {
+                names.value.general_names.iter().any(|name| match name {
+                    x509_parser::extensions::GeneralName::DNSName(name) => {
+                        let validation_name = name.strip_prefix("*.").unwrap_or(name);
+                        matches!(
+                            ServerName::try_from(validation_name.to_owned()),
+                            Ok(ServerName::DnsName(_))
+                        )
+                    }
+                    x509_parser::extensions::GeneralName::IPAddress(address) => {
+                        matches!(address.len(), 4 | 16)
+                    }
+                    _ => false,
+                })
+            });
+        let leaf_allows_signing = leaf
+            .key_usage()
+            .map_err(|_| DaemonTlsConfigError::InvalidCertificateChain)?
+            .is_none_or(|usage| usage.value.digital_signature());
+        let leaf_allows_server_auth = leaf
+            .extended_key_usage()
+            .map_err(|_| DaemonTlsConfigError::InvalidCertificateChain)?
+            .is_none_or(|usage| usage.value.any || usage.value.server_auth);
+        if leaf_is_ca || !leaf_has_server_name || !leaf_allows_signing || !leaf_allows_server_auth {
+            return Err(DaemonTlsConfigError::InvalidCertificateChain);
+        }
+        for (link_index, chain_link) in parsed_certificates.windows(2).enumerate() {
+            let certificate = &chain_link[0];
+            let issuer = &chain_link[1];
+            let issuer_constraints = issuer
+                .basic_constraints()
+                .map_err(|_| DaemonTlsConfigError::InvalidCertificateChain)?
+                .ok_or(DaemonTlsConfigError::InvalidCertificateChain)?;
+            let issuer_can_sign = issuer
+                .key_usage()
+                .map_err(|_| DaemonTlsConfigError::InvalidCertificateChain)?
+                .is_none_or(|usage| usage.value.key_cert_sign());
+            let issuer_index = link_index + 1;
+            let subordinate_ca_count = parsed_certificates[1..issuer_index]
+                .iter()
+                .filter(|subordinate| subordinate.subject() != subordinate.issuer())
+                .count();
+            let path_length_exceeded = issuer_constraints
+                .value
+                .path_len_constraint
+                .is_some_and(|limit| subordinate_ca_count > limit as usize);
+            if certificate.issuer() != issuer.subject()
+                || !issuer_constraints.value.ca
+                || !issuer_can_sign
+                || path_length_exceeded
+                || certificate
+                    .verify_signature(Some(issuer.public_key()))
+                    .is_err()
+            {
+                return Err(DaemonTlsConfigError::InvalidCertificateChain);
+            }
+        }
+        let private_key = PrivateKeyDer::from_pem_slice(private_key_pem)
+            .map_err(|_| DaemonTlsConfigError::InvalidPrivateKey)?;
+        let server = rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(certificates, private_key)
+            .map_err(|error| match error {
+                rustls::Error::InconsistentKeys(_) => DaemonTlsConfigError::CertificateKeyMismatch,
+                _ => DaemonTlsConfigError::InvalidCertificateChain,
+            })?;
+        Ok(Self(Arc::new(server)))
+    }
+}
+
+#[derive(Clone, Copy, Debug, thiserror::Error, Eq, PartialEq)]
+pub enum DaemonTlsConfigError {
+    #[error("the TLS certificate chain is empty or malformed")]
+    InvalidCertificateChain,
+    #[error("the TLS certificate has expired")]
+    CertificateExpired,
+    #[error("the TLS certificate is not valid yet")]
+    CertificateNotYetValid,
+    #[error("the TLS private key is empty or malformed")]
+    InvalidPrivateKey,
+    #[error("the TLS certificate and private key do not match")]
+    CertificateKeyMismatch,
+}
+
 pub struct DaemonServer {
     local_addr: SocketAddr,
     shutdown: Option<watch::Sender<bool>>,
@@ -87,7 +250,24 @@ impl DaemonServer {
         service: HostService,
         config: DaemonServerConfig,
     ) -> Result<Self, DaemonServerError> {
-        if !config.bind_addr.ip().is_loopback() {
+        Self::bind_inner(service, config, None).await
+    }
+
+    /// Binds a Host listener using a fully validated TLS configuration.
+    pub async fn bind_tls(
+        service: HostService,
+        config: DaemonServerConfig,
+        tls: DaemonTlsConfig,
+    ) -> Result<Self, DaemonServerError> {
+        Self::bind_inner(service, config, Some(tls)).await
+    }
+
+    async fn bind_inner(
+        service: HostService,
+        config: DaemonServerConfig,
+        tls: Option<DaemonTlsConfig>,
+    ) -> Result<Self, DaemonServerError> {
+        if !config.bind_addr.ip().is_loopback() && tls.is_none() {
             return Err(DaemonServerError::NonLoopbackPlaintextBind);
         }
         if config.max_connections == 0 {
@@ -134,7 +314,10 @@ impl DaemonServer {
             shutdown: shutdown.clone(),
         });
         let router = router(Arc::clone(&state));
-        let listener = LimitedTcpListener::new(listener, config.max_connections);
+        let listener = match tls {
+            Some(tls) => LimitedTcpListener::with_tls(listener, config.max_connections, tls.0),
+            None => LimitedTcpListener::new(listener, config.max_connections),
+        };
         let connection_activity = listener.activity();
         let idle_service = Arc::clone(&state.service);
         let idle_timeout = config.idle_timeout;

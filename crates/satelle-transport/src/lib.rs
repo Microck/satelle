@@ -13,4 +13,6 @@ pub use contract::{
     StopResponse, SubscribeRequest, SubscribeRequestError, SubscribedResponse, TurnRequest,
     WsCloseReason, WsControlError, WsServerControl,
 };
-pub use server::{DaemonServer, DaemonServerConfig, DaemonServerError};
+pub use server::{
+    DaemonServer, DaemonServerConfig, DaemonServerError, DaemonTlsConfig, DaemonTlsConfigError,
+};

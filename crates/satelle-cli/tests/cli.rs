@@ -38,6 +38,117 @@ fn production_satelle() -> Command {
     command
 }
 
+#[test]
+fn host_start_requires_complete_tls_material() {
+    production_satelle()
+        .args([
+            "host",
+            "start",
+            "--foreground",
+            "--tls-cert",
+            "certificate.pem",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("--tls-key"));
+}
+
+#[cfg(unix)]
+#[test]
+fn host_start_rejects_a_private_key_readable_by_other_users() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let state = state_dir();
+    fs::set_permissions(state.path(), fs::Permissions::from_mode(0o700))
+        .expect("make TLS fixture boundary owner-only");
+    let certificate = state.path().join("certificate.pem");
+    let private_key = state.path().join("private-key.pem");
+    fs::write(&certificate, "not parsed before key security succeeds")
+        .expect("write certificate fixture");
+    fs::write(&private_key, "sensitive private key fixture").expect("write key fixture");
+    fs::set_permissions(&certificate, fs::Permissions::from_mode(0o644))
+        .expect("make certificate owner-controlled");
+    fs::set_permissions(&private_key, fs::Permissions::from_mode(0o644))
+        .expect("make private key unsafe");
+
+    production_satelle()
+        .args([
+            "host",
+            "start",
+            "--foreground",
+            "--tls-cert",
+            certificate.to_str().expect("UTF-8 certificate path"),
+            "--tls-key",
+            private_key.to_str().expect("UTF-8 key path"),
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("TLS private key"));
+}
+
+#[cfg(unix)]
+#[test]
+fn host_start_rejects_tls_files_outside_an_owner_only_boundary() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let directory = tempfile::tempdir().expect("create TLS fixture directory");
+    let certificate = directory.path().join("certificate.pem");
+    let private_key = directory.path().join("private-key.pem");
+    fs::write(&certificate, "certificate fixture").expect("write certificate fixture");
+    fs::write(&private_key, "private key fixture").expect("write key fixture");
+    fs::set_permissions(&certificate, fs::Permissions::from_mode(0o600))
+        .expect("restrict certificate file");
+    fs::set_permissions(&private_key, fs::Permissions::from_mode(0o600))
+        .expect("restrict private key file");
+    fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o777))
+        .expect("make TLS boundary unsafe");
+
+    production_satelle()
+        .args([
+            "host",
+            "start",
+            "--foreground",
+            "--tls-cert",
+            certificate.to_str().expect("UTF-8 certificate path"),
+            "--tls-key",
+            private_key.to_str().expect("UTF-8 key path"),
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("TLS file boundary"));
+}
+
+#[cfg(unix)]
+#[test]
+fn host_start_resolves_bare_tls_filenames_against_the_current_directory() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let state = state_dir();
+    fs::set_permissions(state.path(), fs::Permissions::from_mode(0o700))
+        .expect("make TLS fixture boundary owner-only");
+    for filename in ["certificate.pem", "private-key.pem"] {
+        let path = state.path().join(filename);
+        fs::write(&path, "invalid TLS material").expect("write TLS fixture");
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600))
+            .expect("restrict TLS fixture");
+    }
+
+    production_satelle()
+        .current_dir(state.path())
+        .args([
+            "host",
+            "start",
+            "--foreground",
+            "--tls-cert",
+            "certificate.pem",
+            "--tls-key",
+            "private-key.pem",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("TLS configuration is invalid"));
+}
+
 fn state_dir() -> TestStateDir {
     TestStateDir::new().expect("secure temp state directory should be created")
 }

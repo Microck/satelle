@@ -29,10 +29,15 @@ use satelle_core::{
     DoctorOptions, DoctorReport, ERROR_RED, ErrorCode, EventSource, EventType, HostConfig,
     HostSessionsReport, LOCAL_DEMO_HOST, PRODUCT_NAME, ProfileField, RELAY_ROSE, ResolvedConfig,
     SUCCESS_GREEN, SatelleError, SatelleEvent, SatelleEventBody, SessionId, SetupMode, SetupReport,
-    SetupRequiredInput, load_config, resolve_path_set, utc_now,
+    SetupRequiredInput, load_config, open_or_create_owner_only_directory,
+    read_owner_controlled_config_file, read_owner_only_secret_config_file, resolve_path_set,
+    utc_now,
 };
 use satelle_host::{ApiBearerToken, HostService, ProviderComputerUseIntent};
-use satelle_transport::{DaemonServer, DaemonServerConfig, DaemonServerError, TurnRequest};
+use satelle_transport::{
+    DaemonServer, DaemonServerConfig, DaemonServerError, DaemonTlsConfig, DaemonTlsConfigError,
+    TurnRequest,
+};
 use serde_json::json;
 use std::collections::BTreeMap;
 use std::fs;
@@ -320,6 +325,12 @@ struct HostTrustCommand {
 struct HostStartCommand {
     #[arg(long, default_value = "127.0.0.1:3001")]
     bind: String,
+    /// PEM certificate chain for Host-terminated HTTPS and WSS.
+    #[arg(long, value_name = "PATH", requires = "tls_key")]
+    tls_cert: Option<PathBuf>,
+    /// Owner-only PEM private key matching --tls-cert.
+    #[arg(long, value_name = "PATH", requires = "tls_cert")]
+    tls_key: Option<PathBuf>,
     #[arg(long)]
     foreground: bool,
     /// Internal SSH bootstrap boundary. The token is read once from stdin and
@@ -921,6 +932,8 @@ mod history_target_tests {
         Command::Host {
             command: HostCommand::Start(HostStartCommand {
                 bind: "127.0.0.1:3001".to_string(),
+                tls_cert: None,
+                tls_key: None,
                 foreground,
                 bootstrap_token_stdin,
                 bootstrap_native_readiness_timeout_ms: None,
@@ -2388,6 +2401,11 @@ fn start_host_daemon(
             "SSH bootstrap tokens are valid only for on-demand Host Daemons",
         )));
     }
+    if command.bootstrap_token_stdin && (command.tls_cert.is_some() || command.tls_key.is_some()) {
+        return Err(failure(SatelleError::invalid_usage(
+            "SSH bootstrap Host Daemons use loopback plaintext inside the authenticated tunnel and do not accept TLS files",
+        )));
+    }
     let bind_addr = command.bind.parse::<SocketAddr>().map_err(|error| {
         failure(SatelleError {
             code: ErrorCode::InvalidUsage,
@@ -2405,6 +2423,7 @@ fn start_host_daemon(
             )]),
         })
     })?;
+    let tls = daemon_tls_config(&command)?;
 
     let on_demand_host = (!command.foreground && !command.bootstrap_token_stdin)
         .then(|| config.resolve_host(None))
@@ -2475,9 +2494,11 @@ fn start_host_daemon(
         if let Some(idle_timeout) = idle_timeout {
             server_config = server_config.with_idle_timeout(idle_timeout);
         }
-        let server = DaemonServer::bind(service, server_config)
-            .await
-            .map_err(daemon_server_failure)?;
+        let server = match tls {
+            Some(tls) => DaemonServer::bind_tls(service, server_config, tls).await,
+            None => DaemonServer::bind(service, server_config).await,
+        }
+        .map_err(daemon_server_failure)?;
 
         let ready = json!({
             "schema_version": "satelle.host.start.v1",
@@ -2519,6 +2540,64 @@ fn start_host_daemon(
         } else {
             server.wait().await.map_err(daemon_server_failure)
         }
+    })
+}
+
+fn daemon_tls_config(command: &HostStartCommand) -> Result<Option<DaemonTlsConfig>, CliFailure> {
+    let (Some(certificate_path), Some(private_key_path)) =
+        (command.tls_cert.as_deref(), command.tls_key.as_deref())
+    else {
+        return Ok(None);
+    };
+    for path in [certificate_path, private_key_path] {
+        let parent = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or_else(|| std::path::Path::new("."));
+        open_or_create_owner_only_directory(parent)
+            .map_err(|error| tls_file_failure("file boundary", parent, error.to_string()))?;
+    }
+    let certificate = read_owner_controlled_config_file(certificate_path).map_err(|error| {
+        tls_file_failure("certificate chain", certificate_path, error.to_string())
+    })?;
+    let private_key = read_owner_only_secret_config_file(private_key_path)
+        .map_err(|error| tls_file_failure("private key", private_key_path, error.to_string()))?;
+    DaemonTlsConfig::from_pem(certificate.as_bytes(), private_key.as_bytes())
+        .map(Some)
+        .map_err(tls_configuration_failure)
+}
+
+fn tls_file_failure(kind: &str, path: &std::path::Path, source: String) -> CliFailure {
+    failure(SatelleError {
+        code: ErrorCode::InvalidUsage,
+        message: format!(
+            "Host Daemon TLS {kind} '{}' is unavailable or violates the required file security policy",
+            path.display()
+        ),
+        recovery_command: Some(
+            "use regular non-symlink TLS files under the Host user's configuration boundary; keep the private key owner-only"
+                .to_string(),
+        ),
+        source_detail: Some(source),
+        details: BTreeMap::new(),
+    })
+}
+
+fn tls_configuration_failure(error: DaemonTlsConfigError) -> CliFailure {
+    let code = if error == DaemonTlsConfigError::CertificateExpired {
+        ErrorCode::CertificateExpired
+    } else {
+        ErrorCode::InvalidUsage
+    };
+    failure(SatelleError {
+        code,
+        message: format!("Host Daemon TLS configuration is invalid: {error}"),
+        recovery_command: Some(
+            "replace the certificate chain or private key, then restart the Host Daemon"
+                .to_string(),
+        ),
+        source_detail: None,
+        details: BTreeMap::new(),
     })
 }
 

@@ -36,7 +36,8 @@ pub use ids::{IdParseError, SESSION_ID_PATTERN, SessionId, TurnId};
 pub use profiles::{ProfileField, ProfileSelectionSource, SelectedProfile};
 pub use secure_file::{
     SecureFileError, open_or_create_owner_only_directory, open_or_create_owner_only_file,
-    read_owner_controlled_config_file, read_owner_only_secret_file, read_trusted_ca_bundle_file,
+    read_owner_controlled_config_file, read_owner_only_secret_config_file,
+    read_owner_only_secret_file, read_trusted_ca_bundle_file,
 };
 
 pub const PRODUCT_NAME: &str = "Satelle";
