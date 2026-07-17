@@ -114,6 +114,11 @@ fn bearer(token: &ApiBearerToken) -> String {
     format!("Bearer {}", exposed.as_str())
 }
 
+fn replacement_token(token_id: &str) -> ApiBearerToken {
+    ApiBearerToken::parse(&format!("satelle_v1.{token_id}.{}", "A".repeat(43)))
+        .expect("construct replacement token with a fixed test secret")
+}
+
 async fn request_status_over_established_tls(
     stream: &mut tokio_rustls::client::TlsStream<TcpStream>,
     authorization: &str,
@@ -1534,7 +1539,7 @@ async fn second_daemon_reports_store_in_use_before_accepting_requests() {
 }
 
 #[tokio::test]
-async fn unknown_expired_and_revoked_tokens_have_one_failure_contract() {
+async fn rejected_token_states_have_one_failure_contract() {
     let running = RunningServer::start(ApiScopes::READ).await;
     let unknown = ApiBearerToken::generate().expect("generate unknown token");
     let expired = ApiBearerToken::generate().expect("generate expiring token");
@@ -1556,12 +1561,48 @@ async fn unknown_expired_and_revoked_tokens_have_one_failure_contract() {
         .service
         .revoke_api_token(revoked.token_id())
         .expect("revoke token");
+
+    let rotated = ApiBearerToken::generate().expect("generate rotatable token");
+    running
+        .service
+        .register_api_token(&rotated, "principal-rotated", ApiScopes::READ, None)
+        .expect("register rotatable token");
+    running
+        .service
+        .rotate_api_token(&replacement_token(rotated.token_id()), 1)
+        .expect("rotate token");
+
+    let read_token = ApiBearerToken::generate().expect("generate read token");
+    running
+        .service
+        .register_api_token(&read_token, "principal-read", ApiScopes::READ, None)
+        .expect("register read token");
+    let wrong_read_secret = replacement_token(read_token.token_id());
+
+    let control_token = ApiBearerToken::generate().expect("generate control token");
+    running
+        .service
+        .register_api_token(
+            &control_token,
+            "principal-control",
+            ApiScopes::CONTROL,
+            None,
+        )
+        .expect("register control token");
+    let wrong_control_secret = replacement_token(control_token.token_id());
     tokio::time::sleep(Duration::from_millis(75)).await;
 
     let request_id = RequestId::new();
     let client = reqwest::Client::new();
     let mut failures = Vec::new();
-    for token in [&unknown, &expired, &revoked] {
+    for token in [
+        &unknown,
+        &expired,
+        &revoked,
+        &rotated,
+        &wrong_read_secret,
+        &wrong_control_secret,
+    ] {
         let response = client
             .get(running.url("/v1/host/status"))
             .header("Authorization", bearer(token))

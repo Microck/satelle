@@ -260,6 +260,15 @@ impl SatelleEventBody {
         &self.data
     }
 
+    pub fn with_host(mut self, host: impl Into<String>) -> Result<Self, SatelleEventError> {
+        let host = host.into();
+        if host.is_empty() {
+            return Err(SatelleEventError::EmptyHost);
+        }
+        self.host = host;
+        Ok(self)
+    }
+
     pub fn with_seq(self, seq: u64) -> Result<SatelleEvent, SatelleEventError> {
         SatelleEvent::new(seq, self)
     }

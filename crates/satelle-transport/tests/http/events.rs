@@ -198,8 +198,16 @@ async fn send_subscribe_with_id(
 }
 
 async fn next_text(socket: &mut EventSocket) -> String {
+    next_text_with_timeout(socket, Duration::from_secs(2)).await
+}
+
+async fn next_text_with_timeout(socket: &mut EventSocket, timeout: Duration) -> String {
+    next_text_before(socket, tokio::time::Instant::now() + timeout).await
+}
+
+async fn next_text_before(socket: &mut EventSocket, deadline: tokio::time::Instant) -> String {
     loop {
-        let message = tokio::time::timeout(Duration::from_secs(2), socket.next())
+        let message = tokio::time::timeout_at(deadline, socket.next())
             .await
             .expect("WebSocket message timeout")
             .expect("WebSocket remains open")
@@ -211,6 +219,24 @@ async fn next_text(socket: &mut EventSocket) -> String {
                 .await
                 .expect("answer ping"),
             Message::Pong(_) => {}
+            other => panic!("expected text frame, got {other:?}"),
+        }
+    }
+}
+
+async fn next_text_without_writes_before(
+    socket: &mut EventSocket,
+    deadline: tokio::time::Instant,
+) -> String {
+    loop {
+        let message = tokio::time::timeout_at(deadline, socket.next())
+            .await
+            .expect("WebSocket message timeout")
+            .expect("WebSocket remains open")
+            .expect("read WebSocket message");
+        match message {
+            Message::Text(text) => return text.to_string(),
+            Message::Ping(_) | Message::Pong(_) => {}
             other => panic!("expected text frame, got {other:?}"),
         }
     }
@@ -263,7 +289,7 @@ async fn event_socket_streams_only_post_subscription_commits_in_order() {
     let admitted: SessionResponse = admitted.json().await.expect("decode admitted Session");
 
     let mut events = Vec::new();
-    for _ in 0..3 {
+    for _ in 0..4 {
         let frame = next_text(&mut socket).await;
         assert_privacy_canaries_absent(
             "WebSocket raw event frame",
@@ -279,13 +305,14 @@ async fn event_socket_streams_only_post_subscription_commits_in_order() {
             .collect::<Vec<_>>(),
         [
             EventType::TurnStarted,
+            EventType::ProviderSmoke,
             EventType::TurnProgress,
             EventType::TurnCompleted,
         ]
     );
     assert_eq!(
         events.iter().map(SatelleEvent::seq).collect::<Vec<_>>(),
-        [1, 2, 3]
+        [1, 2, 3, 4]
     );
     assert!(events.iter().all(|event| {
         event.session_id() == Some(admitted.session().session_id())
@@ -324,7 +351,7 @@ async fn event_socket_streams_only_post_subscription_commits_in_order() {
 }
 
 #[tokio::test]
-async fn event_socket_closes_on_invalid_control_or_revoked_credentials() {
+async fn event_socket_closes_on_invalid_control() {
     let running = RunningServer::start(ApiScopes::READ).await;
     let mut binary = connect_events(&running).await;
     binary
@@ -376,48 +403,99 @@ async fn event_socket_closes_on_invalid_control_or_revoked_credentials() {
         close,
         Message::Close(Some(frame)) if frame.code == CloseCode::Policy && frame.reason == "unsupported-schema"
     ));
+}
 
-    let mut revoked = connect_events(&running).await;
-    send_subscribe_with_id(
-        &mut revoked,
-        RequestId::new(),
-        vec![EventSubscription::Host],
-    )
-    .await;
-    expect_subscribed(&mut revoked, &running.host_identity).await;
+async fn subscribed_socket(
+    running: &RunningServer,
+    token: &ApiBearerToken,
+) -> (EventSocket, RequestId) {
+    let mut socket =
+        connect_events_at(running.server.local_addr(), token, &running.host_identity).await;
     let active_request_id = RequestId::new();
     send_subscribe_with_id(
-        &mut revoked,
+        &mut socket,
         active_request_id.clone(),
         vec![EventSubscription::Host],
     )
     .await;
-    expect_subscribed(&mut revoked, &running.host_identity).await;
-    running
-        .service
-        .revoke_api_token(running.token.token_id())
-        .expect("revoke live socket credential");
-    revoked
-        .send(Message::Pong(Vec::new().into()))
-        .await
-        .expect("trigger credential revalidation");
-    let error: WsServerControl = serde_json::from_str(&next_text(&mut revoked).await)
-        .expect("decode authentication failure");
+    expect_subscribed(&mut socket, &running.host_identity).await;
+    (socket, active_request_id)
+}
+
+async fn expect_authentication_close(socket: &mut EventSocket, active_request_id: &RequestId) {
+    // The server must deliver both frames within one bounded exchange. Reusing this deadline
+    // prevents heartbeat traffic from extending the test indefinitely.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(4);
+    let error: WsServerControl =
+        serde_json::from_str(&next_text_without_writes_before(socket, deadline).await)
+            .expect("decode authentication failure");
     assert!(matches!(
         error,
         WsServerControl::Error(error)
             if error.code().as_str() == "authentication-failed"
-                && error.request_id() == &active_request_id
+                && error.request_id() == active_request_id
     ));
-    let close = revoked
-        .next()
+    let close = tokio::time::timeout_at(deadline, socket.next())
         .await
-        .expect("receive revoked close")
-        .expect("decode revoked close");
+        .expect("authentication close timeout")
+        .expect("receive authentication close")
+        .expect("decode authentication close");
     assert!(matches!(
         close,
         Message::Close(Some(frame)) if frame.code == CloseCode::Policy && frame.reason == "authentication-failed"
     ));
+}
+
+#[tokio::test]
+async fn event_sockets_close_without_client_traffic_when_credentials_become_inactive() {
+    let running = RunningServer::start(ApiScopes::READ).await;
+
+    let expiring = ApiBearerToken::generate().expect("generate expiring token");
+    running
+        .service
+        .register_api_token(
+            &expiring,
+            "principal-expiring-socket",
+            ApiScopes::READ,
+            Some(time::OffsetDateTime::now_utc() + time::Duration::seconds(2)),
+        )
+        .expect("register expiring token");
+    let (mut expired_socket, expired_request_id) = subscribed_socket(&running, &expiring).await;
+    expect_authentication_close(&mut expired_socket, &expired_request_id).await;
+
+    let revocable = ApiBearerToken::generate().expect("generate revocable token");
+    running
+        .service
+        .register_api_token(
+            &revocable,
+            "principal-revocable-socket",
+            ApiScopes::READ,
+            None,
+        )
+        .expect("register revocable token");
+    let (mut revoked_socket, revoked_request_id) = subscribed_socket(&running, &revocable).await;
+    running
+        .service
+        .revoke_api_token(revocable.token_id())
+        .expect("revoke live socket credential");
+    expect_authentication_close(&mut revoked_socket, &revoked_request_id).await;
+
+    let rotatable = ApiBearerToken::generate().expect("generate rotatable token");
+    running
+        .service
+        .register_api_token(
+            &rotatable,
+            "principal-rotatable-socket",
+            ApiScopes::READ,
+            None,
+        )
+        .expect("register rotatable token");
+    let (mut rotated_socket, rotated_request_id) = subscribed_socket(&running, &rotatable).await;
+    running
+        .service
+        .rotate_api_token(&replacement_token(rotatable.token_id()), 1)
+        .expect("rotate live socket credential");
+    expect_authentication_close(&mut rotated_socket, &rotated_request_id).await;
 }
 
 #[tokio::test]
@@ -542,7 +620,7 @@ async fn replacing_event_subscriptions_filters_live_events_without_resetting_seq
         .await
         .expect("admit visible follow-up for prior scope");
     assert_eq!(prior_follow_up.status(), StatusCode::ACCEPTED);
-    for expected_sequence in 1..=3 {
+    for expected_sequence in 1..=4 {
         let event = serde_json::from_str::<SatelleEvent>(&next_text(&mut socket).await)
             .expect("decode prior matching event");
         assert_eq!(event.seq(), expected_sequence);
@@ -595,7 +673,7 @@ async fn replacing_event_subscriptions_filters_live_events_without_resetting_seq
     assert_eq!(follow_up.status(), StatusCode::ACCEPTED);
 
     let mut events = Vec::new();
-    for _ in 0..3 {
+    for _ in 0..4 {
         events.push(
             serde_json::from_str::<SatelleEvent>(&next_text(&mut socket).await)
                 .expect("decode matching event"),
@@ -603,7 +681,7 @@ async fn replacing_event_subscriptions_filters_live_events_without_resetting_seq
     }
     assert_eq!(
         events.iter().map(SatelleEvent::seq).collect::<Vec<_>>(),
-        [4, 5, 6]
+        [5, 6, 7, 8]
     );
     assert!(
         events
@@ -652,7 +730,7 @@ async fn replacing_event_subscriptions_filters_live_events_without_resetting_seq
         .expect("admit overlapping-scope follow-up");
     assert_eq!(overlap_follow_up.status(), StatusCode::ACCEPTED);
     let mut overlap_events = Vec::new();
-    for _ in 0..3 {
+    for _ in 0..4 {
         overlap_events.push(
             serde_json::from_str::<SatelleEvent>(&next_text(&mut socket).await)
                 .expect("decode overlapping-scope event"),
@@ -663,7 +741,7 @@ async fn replacing_event_subscriptions_filters_live_events_without_resetting_seq
             .iter()
             .map(SatelleEvent::seq)
             .collect::<Vec<_>>(),
-        [7, 8, 9]
+        [9, 10, 11, 12]
     );
     assert!(
         tokio::time::timeout(Duration::from_millis(100), next_text(&mut socket))
@@ -776,6 +854,14 @@ async fn daemon_event_client_validates_the_subscription_and_event_stream() {
             .expect("receive starting event")
             .event_type(),
         EventType::TurnStarted
+    );
+    assert_eq!(
+        events
+            .next_event()
+            .await
+            .expect("receive provider preflight event")
+            .event_type(),
+        EventType::ProviderSmoke
     );
     assert_eq!(
         events

@@ -380,9 +380,19 @@ impl HostService {
             ApiTokenRegistration::new(token, principal_ref, 1, scopes, expires_at, now)
                 .map_err(crate::runtime::storage_error)?;
         self.runtime.register_api_token(registration)?;
-        self.runtime
+        let principal = self
+            .runtime
             .authenticate_api_token(token, now)?
-            .ok_or_else(authentication_state_failure)
+            .ok_or_else(authentication_state_failure)?;
+        // A token ID is the deliberately non-secret identity for diagnostics.
+        // Never pass the bearer value or its verifier into a logging field.
+        tracing::info!(
+            target: "satelle::host::api_token",
+            token_id = principal.token_id(),
+            credential_revision = principal.credential_revision(),
+            "API token registered"
+        );
+        Ok(principal)
     }
 
     pub fn authenticate_api_token(
@@ -415,16 +425,29 @@ impl HostService {
         replacement: &ApiBearerToken,
         expected_credential_revision: u64,
     ) -> Result<ApiPrincipal, SatelleError> {
-        self.runtime.rotate_api_token(
+        let principal = self.runtime.rotate_api_token(
             replacement,
             expected_credential_revision,
             OffsetDateTime::now_utc(),
-        )
+        )?;
+        tracing::info!(
+            target: "satelle::host::api_token",
+            token_id = principal.token_id(),
+            credential_revision = principal.credential_revision(),
+            "API token rotated"
+        );
+        Ok(principal)
     }
 
     pub fn revoke_api_token(&self, token_id: &str) -> Result<(), SatelleError> {
         self.runtime
-            .revoke_api_token(token_id, OffsetDateTime::now_utc())
+            .revoke_api_token(token_id, OffsetDateTime::now_utc())?;
+        tracing::info!(
+            target: "satelle::host::api_token",
+            token_id,
+            "API token revoked"
+        );
+        Ok(())
     }
 
     /// Rotates the active request-digest key while retaining every older key

@@ -1,5 +1,4 @@
 use assert_cmd::Command;
-#[cfg(unix)]
 use satelle_host::ApiBearerToken;
 use satelle_host::test_support::TestStateDir;
 use serde_json::Value;
@@ -63,9 +62,14 @@ fn parse_json_output(output: &[u8]) -> Value {
 fn session_commands_route_through_the_explicit_host() {
     let state = state_dir();
     let user_config = state.path().join("user-config.toml");
+    let token_file = state.path().join("remote.token");
+    let token = ApiBearerToken::generate().expect("generate remote API token");
+    write_user_config(&token_file, token.expose().as_str());
+    let token_path = toml::Value::String(token_file.to_string_lossy().into_owned()).to_string();
     write_user_config(
         &user_config,
-        r#"
+        format!(
+            r#"
 default_host = "local-demo"
 
 [hosts.local-demo]
@@ -73,9 +77,13 @@ transport = "local"
 adapter = "fake"
 
 [hosts.remote]
-transport = "ssh"
+transport = "direct"
 adapter = "fake"
+address = "https://127.0.0.1:9"
+expected_host_id = "host-unreachable-test"
+api_token = {{ kind = "file", path = {token_path} }}
 "#,
+        ),
     );
     let run_output = satelle()
         .env("SATELLE_CONFIG_FILE", &user_config)

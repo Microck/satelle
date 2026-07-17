@@ -23,6 +23,7 @@ use tokio::time::{Instant, MissedTickBehavior};
 use tokio_tungstenite::tungstenite::Error as WebSocketError;
 
 const WRITER_CLOSE_GRACE: Duration = Duration::from_millis(250);
+const AUTH_REVALIDATION_INTERVAL: Duration = Duration::from_secs(1);
 
 type EventSink = SplitSink<WebSocket, Message>;
 type EventStream = SplitStream<WebSocket>;
@@ -288,6 +289,11 @@ async fn controller_loop(
     ));
     ping.set_missed_tick_behavior(MissedTickBehavior::Skip);
     ping.tick().await;
+    // Token expiry, rotation, and revocation must close an otherwise idle
+    // socket without waiting for the client's next frame or heartbeat.
+    let mut auth_revalidation = tokio::time::interval(AUTH_REVALIDATION_INTERVAL);
+    auth_revalidation.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    auth_revalidation.tick().await;
 
     loop {
         // A receiver created after shutdown was sent starts with `true` as its
@@ -307,15 +313,7 @@ async fn controller_loop(
                 };
             }
             _ = &mut writer_done => return ConnectionEnd::WriterGone,
-            _ = ping.tick() => {
-                if last_inbound.elapsed()
-                    >= Duration::from_millis(state.limits.websocket_idle_timeout_ms())
-                {
-                    return ConnectionEnd::Failure {
-                        request_id: active_request_id,
-                        reason: WsCloseReason::IdleTimeout,
-                    };
-                }
+            _ = auth_revalidation.tick() => {
                 match principal_is_active(&state, principal).await {
                     Ok(true) => {}
                     Ok(false) => {
@@ -330,6 +328,16 @@ async fn controller_loop(
                             reason: WsCloseReason::InternalError,
                         };
                     }
+                }
+            }
+            _ = ping.tick() => {
+                if last_inbound.elapsed()
+                    >= Duration::from_millis(state.limits.websocket_idle_timeout_ms())
+                {
+                    return ConnectionEnd::Failure {
+                        request_id: active_request_id,
+                        reason: WsCloseReason::IdleTimeout,
+                    };
                 }
                 match queue_message(
                     &outbound,
