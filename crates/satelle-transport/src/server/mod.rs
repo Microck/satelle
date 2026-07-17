@@ -237,12 +237,46 @@ pub enum DaemonTlsConfigError {
     CertificateKeyMismatch,
 }
 
+#[derive(Clone, Copy, Debug, thiserror::Error, Eq, PartialEq)]
+pub enum DaemonTlsReloadError {
+    #[error("the replacement Host Daemon TLS configuration is invalid: {0}")]
+    InvalidConfiguration(#[source] DaemonTlsConfigError),
+    #[error("the Host Daemon listener is not configured for TLS")]
+    TlsNotConfigured,
+    #[error("the Host Daemon listener stopped before TLS reload completed")]
+    ListenerStopped,
+}
+
+/// Cloneable control handle for replacing the TLS configuration used by
+/// future Host Daemon handshakes while the server task owns the listener.
+#[derive(Clone)]
+pub struct DaemonTlsReloader(watch::Sender<Arc<rustls::ServerConfig>>);
+
+impl DaemonTlsReloader {
+    pub fn reload(&self, tls: DaemonTlsConfig) -> Result<(), DaemonTlsReloadError> {
+        self.0
+            .send(tls.0)
+            .map_err(|_| DaemonTlsReloadError::ListenerStopped)
+    }
+
+    pub fn reload_from_pem(
+        &self,
+        certificate_chain_pem: &[u8],
+        private_key_pem: &[u8],
+    ) -> Result<(), DaemonTlsReloadError> {
+        let tls = DaemonTlsConfig::from_pem(certificate_chain_pem, private_key_pem)
+            .map_err(DaemonTlsReloadError::InvalidConfiguration)?;
+        self.reload(tls)
+    }
+}
+
 pub struct DaemonServer {
     local_addr: SocketAddr,
     shutdown: Option<watch::Sender<bool>>,
     task: Option<JoinHandle<Result<(), std::io::Error>>>,
     shutdown_grace: Duration,
     shutdown_service: HostService,
+    tls_reloader: Option<DaemonTlsReloader>,
 }
 
 impl DaemonServer {
@@ -314,9 +348,18 @@ impl DaemonServer {
             shutdown: shutdown.clone(),
         });
         let router = router(Arc::clone(&state));
-        let listener = match tls {
-            Some(tls) => LimitedTcpListener::with_tls(listener, config.max_connections, tls.0),
-            None => LimitedTcpListener::new(listener, config.max_connections),
+        let (listener, tls_reloader) = match tls {
+            Some(tls) => {
+                let (tls_reload, tls_config) = watch::channel(tls.0);
+                (
+                    LimitedTcpListener::with_tls(listener, config.max_connections, tls_config),
+                    Some(DaemonTlsReloader(tls_reload)),
+                )
+            }
+            None => (
+                LimitedTcpListener::new(listener, config.max_connections),
+                None,
+            ),
         };
         let connection_activity = listener.activity();
         let idle_service = Arc::clone(&state.service);
@@ -340,11 +383,30 @@ impl DaemonServer {
             task: Some(task),
             shutdown_grace: config.shutdown_grace,
             shutdown_service,
+            tls_reloader,
         })
     }
 
     pub const fn local_addr(&self) -> SocketAddr {
         self.local_addr
+    }
+
+    /// Validates and atomically installs TLS material for future handshakes.
+    /// Existing connections and the last valid configuration remain untouched
+    /// when validation fails.
+    pub fn reload_tls_from_pem(
+        &self,
+        certificate_chain_pem: &[u8],
+        private_key_pem: &[u8],
+    ) -> Result<(), DaemonTlsReloadError> {
+        self.tls_reloader
+            .as_ref()
+            .ok_or(DaemonTlsReloadError::TlsNotConfigured)?
+            .reload_from_pem(certificate_chain_pem, private_key_pem)
+    }
+
+    pub fn tls_reloader(&self) -> Option<DaemonTlsReloader> {
+        self.tls_reloader.clone()
     }
 
     pub async fn wait(mut self) -> Result<(), DaemonServerError> {

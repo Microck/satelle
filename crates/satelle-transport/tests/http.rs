@@ -16,6 +16,8 @@ mod raw_wire;
 mod sessions;
 
 use reqwest::StatusCode;
+use rustls::RootCertStore;
+use rustls::pki_types::ServerName;
 use satelle_core::session::TurnExecutionMode;
 use satelle_core::{ApiTokenSource, DirectHostBinding, ErrorCode, SatelleConfig, TransportKind};
 use satelle_host::{
@@ -24,14 +26,17 @@ use satelle_host::{
 };
 use satelle_transport::{
     ApiError, CapabilitiesResponse, DaemonClient, DaemonClientError, DaemonEventClient,
-    DaemonServer, DaemonServerConfig, DaemonTlsConfig, DaemonTlsConfigError, EventSubscription,
-    HostDesktopSessionsResponse, HostStatusResponse, LiveResponse, LogsPageResponse, RequestId,
+    DaemonServer, DaemonServerConfig, DaemonTlsConfig, DaemonTlsConfigError, DaemonTlsReloadError,
+    EventSubscription, HostDesktopSessionsResponse, HostStatusResponse, LiveResponse,
+    LogsPageResponse, RequestId,
 };
 use serde_json::Value;
 use std::net::{Ipv4Addr, SocketAddr};
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
+use tokio_rustls::TlsConnector;
 
 const EXPECTED_OPERATIONS: [&str; 10] = [
     "live",
@@ -107,6 +112,83 @@ impl RunningServer {
 fn bearer(token: &ApiBearerToken) -> String {
     let exposed = token.expose();
     format!("Bearer {}", exposed.as_str())
+}
+
+async fn request_status_over_established_tls(
+    stream: &mut tokio_rustls::client::TlsStream<TcpStream>,
+    authorization: &str,
+    host_identity: &str,
+) {
+    tokio::time::timeout(
+        Duration::from_secs(2),
+        request_status_over_established_tls_inner(stream, authorization, host_identity),
+    )
+    .await
+    .expect("established TLS request and response must remain bounded");
+}
+
+async fn request_status_over_established_tls_inner(
+    stream: &mut tokio_rustls::client::TlsStream<TcpStream>,
+    authorization: &str,
+    host_identity: &str,
+) {
+    let request = format!(
+        "GET /v1/host/status HTTP/1.1\r\nHost: localhost\r\nAuthorization: {authorization}\r\nSatelle-Expected-Host-Identity: {host_identity}\r\nSatelle-Request-Id: {}\r\nConnection: keep-alive\r\n\r\n",
+        RequestId::new()
+    );
+    stream
+        .write_all(request.as_bytes())
+        .await
+        .expect("write Host status request on established TLS connection");
+    stream
+        .flush()
+        .await
+        .expect("flush Host status request on established TLS connection");
+
+    let mut response = Vec::new();
+    let header_end = loop {
+        if let Some(offset) = response.windows(4).position(|window| window == b"\r\n\r\n") {
+            break offset + 4;
+        }
+        assert!(
+            response.len() < 16 * 1024,
+            "HTTP response headers are bounded"
+        );
+        let mut chunk = [0_u8; 1024];
+        let count = stream
+            .read(&mut chunk)
+            .await
+            .expect("read Host status response headers");
+        assert_ne!(count, 0, "established TLS connection closed unexpectedly");
+        response.extend_from_slice(&chunk[..count]);
+    };
+    let headers = std::str::from_utf8(&response[..header_end])
+        .expect("Host status response headers are UTF-8");
+    assert!(
+        headers.starts_with("HTTP/1.1 200 "),
+        "response was {headers}"
+    );
+    let content_length = headers
+        .lines()
+        .filter_map(|line| line.split_once(':'))
+        .find(|(name, _)| name.eq_ignore_ascii_case("content-length"))
+        .and_then(|(_, value)| value.trim().parse::<usize>().ok())
+        .expect("Host status response includes Content-Length");
+    let response_end = header_end + content_length;
+    while response.len() < response_end {
+        let mut chunk = [0_u8; 1024];
+        let count = stream
+            .read(&mut chunk)
+            .await
+            .expect("read Host status response body");
+        assert_ne!(count, 0, "Host status response body was truncated");
+        response.extend_from_slice(&chunk[..count]);
+    }
+    assert_eq!(
+        response.len(),
+        response_end,
+        "one request must consume exactly one response"
+    );
 }
 
 async fn assert_rate_limited(
@@ -734,6 +816,134 @@ async fn authenticated_https_is_served_by_a_non_loopback_tls_listener() {
         .expect("connect authenticated WSS event stream");
     drop(event_stream);
     server.shutdown().await.expect("stop TLS daemon");
+}
+
+#[tokio::test]
+async fn tls_reload_replaces_only_fully_validated_configuration() {
+    let state = TestStateDir::new().expect("temporary state directory");
+    let service = HostService::local_demo_for_tests_at(state.path())
+        .expect("construct deterministic Host service");
+    let host_identity = service
+        .initialize_daemon()
+        .expect("initialize Host state")
+        .host_identity()
+        .to_string();
+    let token = ApiBearerToken::generate().expect("generate API token");
+    service
+        .register_api_token(&token, "principal-tls-reload", ApiScopes::READ, None)
+        .expect("register API token");
+    let initial = rcgen::generate_simple_self_signed(["localhost".to_string()])
+        .expect("generate initial certificate");
+    let replacement = rcgen::generate_simple_self_signed(["localhost".to_string()])
+        .expect("generate replacement certificate");
+    let tls = DaemonTlsConfig::from_pem(
+        initial.cert.pem().as_bytes(),
+        initial.signing_key.serialize_pem().as_bytes(),
+    )
+    .expect("validate initial TLS configuration");
+    let server = DaemonServer::bind_tls(
+        service,
+        DaemonServerConfig::loopback(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))),
+        tls,
+    )
+    .await
+    .expect("bind reloadable TLS daemon");
+    let url = format!(
+        "https://localhost:{}/v1/host/status",
+        server.local_addr().port()
+    );
+    let authorization = format!("Bearer {}", token.expose().as_str());
+    let mut initial_roots = RootCertStore::empty();
+    initial_roots
+        .add(initial.cert.der().clone())
+        .expect("trust initial certificate");
+    let initial_tls = rustls::ClientConfig::builder()
+        .with_root_certificates(initial_roots)
+        .with_no_client_auth();
+    let connector = TlsConnector::from(Arc::new(initial_tls));
+    let socket = TcpStream::connect(server.local_addr())
+        .await
+        .expect("connect initial TLS socket");
+    let mut established = connector
+        .connect(
+            ServerName::try_from("localhost").expect("valid test server name"),
+            socket,
+        )
+        .await
+        .expect("establish initial TLS connection");
+    request_status_over_established_tls(&mut established, &authorization, &host_identity).await;
+
+    assert_eq!(
+        server
+            .reload_tls_from_pem(
+                replacement.cert.pem().as_bytes(),
+                initial.signing_key.serialize_pem().as_bytes(),
+            )
+            .expect_err("a mismatched replacement must fail"),
+        DaemonTlsReloadError::InvalidConfiguration(DaemonTlsConfigError::CertificateKeyMismatch)
+    );
+    let retained_client = reqwest::Client::builder()
+        .tls_certs_only([
+            reqwest::Certificate::from_pem(initial.cert.pem().as_bytes())
+                .expect("parse retained trust root"),
+        ])
+        .build()
+        .expect("build retained HTTPS client");
+    let retained_response = retained_client
+        .get(&url)
+        .header("Authorization", &authorization)
+        .header("Satelle-Expected-Host-Identity", &host_identity)
+        .header("Satelle-Request-Id", RequestId::new().to_string())
+        .send()
+        .await
+        .expect("request after rejected TLS reload");
+    assert_eq!(retained_response.status(), StatusCode::OK);
+    request_status_over_established_tls(&mut established, &authorization, &host_identity).await;
+
+    server
+        .reload_tls_from_pem(
+            replacement.cert.pem().as_bytes(),
+            replacement.signing_key.serialize_pem().as_bytes(),
+        )
+        .expect("install replacement TLS configuration");
+    request_status_over_established_tls(&mut established, &authorization, &host_identity).await;
+    let replacement_client = reqwest::Client::builder()
+        .tls_certs_only([
+            reqwest::Certificate::from_pem(replacement.cert.pem().as_bytes())
+                .expect("parse replacement trust root"),
+        ])
+        .build()
+        .expect("build replacement HTTPS client");
+    let replacement_response = replacement_client
+        .get(&url)
+        .header("Authorization", authorization)
+        .header("Satelle-Expected-Host-Identity", host_identity)
+        .header("Satelle-Request-Id", RequestId::new().to_string())
+        .send()
+        .await
+        .expect("request with replacement certificate");
+    assert_eq!(replacement_response.status(), StatusCode::OK);
+
+    server.shutdown().await.expect("stop TLS daemon");
+}
+
+#[tokio::test]
+async fn tls_reload_on_plaintext_server_fails_before_pem_validation() {
+    let running = RunningServer::start(ApiScopes::READ).await;
+
+    assert_eq!(
+        running
+            .server
+            .reload_tls_from_pem(b"invalid certificate", b"invalid private key")
+            .expect_err("a plaintext listener cannot reload TLS"),
+        DaemonTlsReloadError::TlsNotConfigured
+    );
+
+    running
+        .server
+        .shutdown()
+        .await
+        .expect("stop plaintext daemon");
 }
 
 #[tokio::test]
