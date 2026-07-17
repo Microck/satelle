@@ -82,9 +82,19 @@ pub(super) async fn authorize(
             return authentication_failed(request_id);
         }
     };
+    let pending_setup_self_activation = request.method() == axum::http::Method::POST
+        && request.uri().path() == format!("/v1/setup/api-token/{}/activate", token.token_id());
     let service = Arc::clone(&state.service);
     let principal =
-        match tokio::task::spawn_blocking(move || service.authenticate_api_token(&token)).await {
+        match tokio::task::spawn_blocking(move || match service.authenticate_api_token(&token)? {
+            Some(principal) => Ok(Some(principal)),
+            None if pending_setup_self_activation => {
+                service.authenticate_pending_setup_api_token(&token)
+            }
+            None => Ok(None),
+        })
+        .await
+        {
             Ok(Ok(Some(principal))) => principal,
             Ok(Ok(None)) => {
                 state.failed_auth_limit.record_failure(peer_ip);
@@ -426,6 +436,90 @@ pub(super) async fn require_query_read(
     next.run(request).await
 }
 
+pub(super) async fn require_empty_setup_mutation(
+    State(state): State<Arc<DaemonState>>,
+    request: Request,
+    next: Next,
+) -> Response {
+    let Some(authorized) = request.extensions().get::<AuthorizedRequest>().cloned() else {
+        return missing_authorization_context();
+    };
+
+    let request = match read_empty_body(&state, request).await {
+        Ok(request) => request,
+        Err(EmptyBodyFailure::TooLarge) => {
+            return empty_setup_body_failure(
+                &state,
+                &authorized,
+                axum::http::StatusCode::PAYLOAD_TOO_LARGE,
+                ApiErrorCode::PayloadTooLarge,
+                ApiErrorCategory::Capacity,
+                "the request body exceeds the advertised JSON body limit",
+            );
+        }
+        Err(EmptyBodyFailure::Read) => {
+            return empty_setup_body_failure(
+                &state,
+                &authorized,
+                axum::http::StatusCode::BAD_REQUEST,
+                ApiErrorCode::InvalidRequest,
+                ApiErrorCategory::InvalidRequest,
+                "the setup token request body could not be read",
+            );
+        }
+        Err(EmptyBodyFailure::Timeout) => {
+            return empty_setup_body_failure(
+                &state,
+                &authorized,
+                axum::http::StatusCode::REQUEST_TIMEOUT,
+                ApiErrorCode::InvalidRequest,
+                ApiErrorCategory::InvalidRequest,
+                "the setup token request body exceeded its read deadline",
+            );
+        }
+        Err(EmptyBodyFailure::DisallowedBearer) => {
+            return disallowed_bearer_token_carrier(
+                Some(state.host_identity.clone()),
+                authorized.request_id().clone(),
+            );
+        }
+        Err(EmptyBodyFailure::NonEmpty) => {
+            return empty_setup_body_failure(
+                &state,
+                &authorized,
+                axum::http::StatusCode::BAD_REQUEST,
+                ApiErrorCode::InvalidRequest,
+                ApiErrorCategory::InvalidRequest,
+                "setup token mutations do not accept a request body",
+            );
+        }
+    };
+
+    next.run(request).await
+}
+
+fn empty_setup_body_failure(
+    state: &DaemonState,
+    authorized: &AuthorizedRequest,
+    status: axum::http::StatusCode,
+    code: ApiErrorCode,
+    category: ApiErrorCategory,
+    message: &'static str,
+) -> Response {
+    api_error_response(
+        authorized.request_id().clone(),
+        Some(state.host_identity.clone()),
+        ApiFailure {
+            status,
+            code,
+            category,
+            retryable: false,
+            message,
+            details: None,
+        },
+    )
+}
+
 async fn validate_read_shape(
     state: &DaemonState,
     request: Request,
@@ -442,20 +536,53 @@ async fn validate_read_shape(
         return Err(invalid_read_shape(state, &authorized, message));
     }
 
-    // HTTP/2 bodies and trailers need no HTTP/1 framing headers. Read to the
-    // bounded deadline before accepting a supposedly bodyless read.
+    read_empty_body(state, request)
+        .await
+        .map_err(|_| invalid_read_shape(state, &authorized, message))
+}
+
+enum EmptyBodyFailure {
+    TooLarge,
+    Read,
+    Timeout,
+    DisallowedBearer,
+    NonEmpty,
+}
+
+/// Reads a bodyless route through one bounded path. HTTP/2 can carry data or
+/// trailers without HTTP/1 framing headers, so header inspection is not enough.
+async fn read_empty_body(
+    state: &DaemonState,
+    request: Request,
+) -> Result<Request, EmptyBodyFailure> {
     let (parts, body) = request.into_parts();
-    let body = tokio::time::timeout(
+    let body = match tokio::time::timeout(
         REQUEST_BODY_READ_TIMEOUT,
         super::api_json::read_bounded_body(body, state.limits.json_body_bytes()),
     )
-    .await;
-    match body {
-        Ok(Ok(body)) if body.bytes.is_empty() && body.trailers.is_none() => {
-            Ok(Request::from_parts(parts, Body::from(body.bytes)))
+    .await
+    {
+        Ok(Ok(body)) => body,
+        Ok(Err(super::api_json::BoundedBodyError::TooLarge)) => {
+            return Err(EmptyBodyFailure::TooLarge);
         }
-        _ => Err(invalid_read_shape(state, &authorized, message)),
+        Ok(Err(super::api_json::BoundedBodyError::Read)) => {
+            return Err(EmptyBodyFailure::Read);
+        }
+        Err(_) => return Err(EmptyBodyFailure::Timeout),
+    };
+    if body
+        .trailers
+        .as_ref()
+        .is_some_and(trailers_have_disallowed_bearer_carrier)
+        || contains_api_bearer_token(&String::from_utf8_lossy(&body.bytes))
+    {
+        return Err(EmptyBodyFailure::DisallowedBearer);
     }
+    if !body.bytes.is_empty() || body.trailers.is_some() {
+        return Err(EmptyBodyFailure::NonEmpty);
+    }
+    Ok(Request::from_parts(parts, Body::from(body.bytes)))
 }
 
 fn request_declares_body(request: &Request) -> bool {

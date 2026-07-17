@@ -18,6 +18,36 @@ const SECRET_BYTES: usize = 32;
 const MAX_SAFE_REFERENCE_BYTES: usize = 128;
 const INITIAL_HMAC_KEY_VERSION: u16 = 1;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ApiTokenState {
+    Active,
+    SetupPending,
+    SetupActive,
+}
+
+impl ApiTokenState {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Active => "active",
+            Self::SetupPending => "setup_pending",
+            Self::SetupActive => "setup_active",
+        }
+    }
+
+    fn parse(value: &str) -> Result<Self, StorageError> {
+        match value {
+            "active" => Ok(Self::Active),
+            "setup_pending" => Ok(Self::SetupPending),
+            "setup_active" => Ok(Self::SetupActive),
+            _ => Err(StorageError::new(StorageErrorKind::InvalidStoredState)),
+        }
+    }
+
+    const fn authenticates(self) -> bool {
+        matches!(self, Self::Active | Self::SetupActive)
+    }
+}
+
 pub(crate) struct ApiTokenRegistration {
     token_id: String,
     principal_ref: String,
@@ -26,6 +56,7 @@ pub(crate) struct ApiTokenRegistration {
     scopes: ApiScopes,
     expires_at: Option<OffsetDateTime>,
     created_at: OffsetDateTime,
+    token_state: ApiTokenState,
 }
 
 impl ApiTokenRegistration {
@@ -36,6 +67,45 @@ impl ApiTokenRegistration {
         scopes: ApiScopes,
         expires_at: Option<OffsetDateTime>,
         created_at: OffsetDateTime,
+    ) -> Result<Self, StorageError> {
+        Self::new_with_state(
+            token,
+            principal_ref,
+            credential_revision,
+            scopes,
+            expires_at,
+            created_at,
+            ApiTokenState::Active,
+        )
+    }
+
+    pub(crate) fn new_setup_pending(
+        token: &ApiBearerToken,
+        principal_ref: impl Into<String>,
+        credential_revision: u64,
+        scopes: ApiScopes,
+        pending_until: OffsetDateTime,
+        created_at: OffsetDateTime,
+    ) -> Result<Self, StorageError> {
+        Self::new_with_state(
+            token,
+            principal_ref,
+            credential_revision,
+            scopes,
+            Some(pending_until),
+            created_at,
+            ApiTokenState::SetupPending,
+        )
+    }
+
+    fn new_with_state(
+        token: &ApiBearerToken,
+        principal_ref: impl Into<String>,
+        credential_revision: u64,
+        scopes: ApiScopes,
+        expires_at: Option<OffsetDateTime>,
+        created_at: OffsetDateTime,
+        token_state: ApiTokenState,
     ) -> Result<Self, StorageError> {
         let principal_ref = principal_ref.into();
         validate_safe_reference(&principal_ref)?;
@@ -51,7 +121,21 @@ impl ApiTokenRegistration {
             scopes,
             expires_at,
             created_at,
+            token_state,
         })
+    }
+
+    pub(crate) fn principal(&self) -> ApiPrincipal {
+        ApiPrincipal {
+            token_id: self.token_id.clone(),
+            principal_ref: self.principal_ref.clone(),
+            credential_revision: self.credential_revision,
+            scopes: self.scopes,
+            expires_at: self.expires_at,
+            process_local_ssh_bootstrap: false,
+            durable_setup_pending: self.token_state == ApiTokenState::SetupPending,
+            durable_setup_active: self.token_state == ApiTokenState::SetupActive,
+        }
     }
 }
 
@@ -90,6 +174,7 @@ struct StoredTokenRow {
     credential_updated_at: String,
     expires_at: Option<String>,
     revoked_at: Option<String>,
+    token_state: String,
 }
 
 impl StoredTokenRow {
@@ -104,6 +189,7 @@ impl StoredTokenRow {
             credential_updated_at: row.get(6)?,
             expires_at: row.get(7)?,
             revoked_at: row.get(8)?,
+            token_state: row.get(9)?,
         })
     }
 
@@ -139,9 +225,12 @@ impl StoredTokenRow {
             .as_deref()
             .map(parse_stored_time)
             .transpose()?;
+        let token_state = ApiTokenState::parse(&self.token_state)?;
         if credential_updated_at < created_at
             || expires_at.is_some_and(|expires_at| expires_at <= created_at)
             || revoked_at.is_some_and(|revoked_at| revoked_at < created_at)
+            || (token_state == ApiTokenState::SetupPending && expires_at.is_none())
+            || (token_state == ApiTokenState::SetupActive && expires_at.is_some())
         {
             return Err(StorageError::new(StorageErrorKind::InvalidStoredState));
         }
@@ -151,8 +240,10 @@ impl StoredTokenRow {
             credential_revision,
             verifier,
             scopes,
+            created_at,
             expires_at,
             revoked_at,
+            token_state,
         })
     }
 }
@@ -163,8 +254,10 @@ struct StoredToken {
     credential_revision: u64,
     verifier: ApiTokenVerifier,
     scopes: ApiScopes,
+    created_at: OffsetDateTime,
     expires_at: Option<OffsetDateTime>,
     revoked_at: Option<OffsetDateTime>,
+    token_state: ApiTokenState,
 }
 
 impl StoredToken {
@@ -175,6 +268,9 @@ impl StoredToken {
             credential_revision: self.credential_revision,
             scopes: self.scopes,
             expires_at: self.expires_at,
+            process_local_ssh_bootstrap: false,
+            durable_setup_pending: self.token_state == ApiTokenState::SetupPending,
+            durable_setup_active: self.token_state == ApiTokenState::SetupActive,
         }
     }
 }
@@ -210,6 +306,22 @@ pub(super) fn seed_sensitive_state(
 }
 
 pub(super) fn validate_sensitive_state(connection: &Connection) -> Result<(), StorageError> {
+    validate_sensitive_state_with_token_state(connection, true)
+}
+
+/// Migration 8 makes the historical implicit `active` state explicit. This
+/// validator is used only before that migration is applied, so corrupt token
+/// metadata still fails closed before any schema change is committed.
+pub(super) fn validate_sensitive_state_before_token_state_migration(
+    connection: &Connection,
+) -> Result<(), StorageError> {
+    validate_sensitive_state_with_token_state(connection, false)
+}
+
+fn validate_sensitive_state_with_token_state(
+    connection: &Connection,
+    token_state_is_stored: bool,
+) -> Result<(), StorageError> {
     let identity_count: i64 = connection
         .query_row("SELECT count(*) FROM daemon_identity", [], |row| row.get(0))
         .map_err(operation_failed)?;
@@ -263,11 +375,17 @@ pub(super) fn validate_sensitive_state(connection: &Connection) -> Result<(), St
             return Err(StorageError::new(StorageErrorKind::InvalidStoredState));
         }
     }
-    let mut token_statement = connection
-        .prepare(
-            "SELECT token_id, principal_ref, credential_revision, verifier, scopes, created_at, credential_updated_at, expires_at, revoked_at FROM api_tokens ORDER BY token_id",
-        )
-        .map_err(operation_failed)?;
+    let token_state = if token_state_is_stored {
+        "token_state"
+    } else {
+        "'active' AS token_state"
+    };
+    let token_query = format!(
+        "SELECT token_id, principal_ref, credential_revision, verifier, scopes, created_at, \
+         credential_updated_at, expires_at, revoked_at, {token_state} \
+         FROM api_tokens ORDER BY token_id"
+    );
+    let mut token_statement = connection.prepare(&token_query).map_err(operation_failed)?;
     let token_rows = token_statement
         .query_map([], StoredTokenRow::read)
         .map_err(operation_failed)?;
@@ -397,6 +515,7 @@ pub(super) fn register_api_token(
             )
             && stored.scopes == registration.scopes
             && stored.expires_at == registration.expires_at
+            && stored.token_state == registration.token_state
             && stored.revoked_at.is_none();
         if !same {
             return Err(StorageError::new(StorageErrorKind::IdempotencyConflict));
@@ -408,7 +527,7 @@ pub(super) fn register_api_token(
     let created_at = format_time(registration.created_at)?;
     transaction
         .execute(
-            "INSERT INTO api_tokens (token_id, principal_ref, credential_revision, verifier, scopes, created_at, credential_updated_at, expires_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            "INSERT INTO api_tokens (token_id, principal_ref, credential_revision, verifier, scopes, created_at, credential_updated_at, expires_at, token_state) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
             params![
                 registration.token_id,
                 registration.principal_ref,
@@ -419,6 +538,7 @@ pub(super) fn register_api_token(
                 created_at,
                 format_time(registration.created_at)?,
                 registration.expires_at.map(format_time).transpose()?,
+                registration.token_state.as_str(),
             ],
         )
         .map_err(operation_failed)?;
@@ -430,6 +550,33 @@ pub(super) fn authenticate_api_token(
     token_id: &str,
     supplied_verifier: &ApiTokenVerifier,
     at: OffsetDateTime,
+) -> Result<Option<ApiPrincipal>, StorageError> {
+    authenticate_api_token_for_state(
+        connection,
+        token_id,
+        supplied_verifier,
+        at,
+        ApiTokenState::authenticates,
+    )
+}
+
+pub(super) fn authenticate_pending_setup_api_token(
+    connection: &Connection,
+    token_id: &str,
+    supplied_verifier: &ApiTokenVerifier,
+    at: OffsetDateTime,
+) -> Result<Option<ApiPrincipal>, StorageError> {
+    authenticate_api_token_for_state(connection, token_id, supplied_verifier, at, |state| {
+        state == ApiTokenState::SetupPending
+    })
+}
+
+fn authenticate_api_token_for_state(
+    connection: &Connection,
+    token_id: &str,
+    supplied_verifier: &ApiTokenVerifier,
+    at: OffsetDateTime,
+    state_authenticates: impl FnOnce(ApiTokenState) -> bool,
 ) -> Result<Option<ApiPrincipal>, StorageError> {
     validate_token_id(token_id).map_err(|_| StorageError::new(StorageErrorKind::InvalidInput))?;
     let stored = load_token(connection, token_id)?
@@ -447,6 +594,7 @@ pub(super) fn authenticate_api_token(
     };
     if !verifier_matches
         || stored.revoked_at.is_some()
+        || !state_authenticates(stored.token_state)
         || stored.expires_at.is_some_and(|expires_at| expires_at <= at)
     {
         return Ok(None);
@@ -464,6 +612,7 @@ pub(super) fn api_principal_is_active(
         .transpose()?;
     Ok(stored.is_some_and(|stored| {
         stored.revoked_at.is_none()
+            && stored.token_state.authenticates()
             && stored.expires_at.is_none_or(|expires_at| expires_at > at)
             && stored.token_id == principal.token_id
             && stored.principal_ref == principal.principal_ref
@@ -488,7 +637,10 @@ pub(super) fn rotate_api_token(
     let stored = load_token(&transaction, replacement.token_id())?
         .ok_or_else(|| StorageError::new(StorageErrorKind::InvalidInput))?
         .validate()?;
-    if stored.revoked_at.is_some() || stored.credential_revision != expected_credential_revision {
+    if stored.revoked_at.is_some()
+        || !stored.token_state.authenticates()
+        || stored.credential_revision != expected_credential_revision
+    {
         return Err(StorageError::new(StorageErrorKind::StateConflict));
     }
     let replacement_verifier = replacement.verifier();
@@ -527,7 +679,92 @@ pub(super) fn rotate_api_token(
         credential_revision: next_revision,
         scopes: stored.scopes,
         expires_at: stored.expires_at,
+        process_local_ssh_bootstrap: false,
+        durable_setup_pending: false,
+        durable_setup_active: stored.token_state == ApiTokenState::SetupActive,
     })
+}
+
+pub(super) fn activate_api_token(
+    connection: &mut Connection,
+    token_id: &str,
+    at: OffsetDateTime,
+) -> Result<ApiPrincipal, StorageError> {
+    validate_token_id(token_id).map_err(|_| StorageError::new(StorageErrorKind::InvalidInput))?;
+    let transaction = connection
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(operation_failed)?;
+    let stored = load_token(&transaction, token_id)?
+        .ok_or_else(|| StorageError::new(StorageErrorKind::InvalidInput))?
+        .validate()?;
+    if at < stored.created_at || stored.revoked_at.is_some() {
+        return Err(StorageError::new(StorageErrorKind::StateConflict));
+    }
+    if stored.token_state == ApiTokenState::SetupActive {
+        return Ok(stored.principal());
+    }
+    if stored.token_state != ApiTokenState::SetupPending
+        || stored.expires_at.is_none_or(|expires_at| expires_at <= at)
+    {
+        return Err(StorageError::new(StorageErrorKind::StateConflict));
+    }
+    let changed = transaction
+        .execute(
+            "UPDATE api_tokens SET expires_at = NULL, token_state = 'setup_active', credential_updated_at = ?1 WHERE token_id = ?2 AND token_state = 'setup_pending' AND expires_at IS NOT NULL AND revoked_at IS NULL",
+            params![format_time(at)?, token_id],
+        )
+        .map_err(operation_failed)?;
+    if changed != 1 {
+        return Err(StorageError::new(StorageErrorKind::StateConflict));
+    }
+    transaction.commit().map_err(operation_failed)?;
+    Ok(ApiPrincipal {
+        token_id: stored.token_id,
+        principal_ref: stored.principal_ref,
+        credential_revision: stored.credential_revision,
+        scopes: stored.scopes,
+        expires_at: None,
+        process_local_ssh_bootstrap: false,
+        durable_setup_pending: false,
+        durable_setup_active: true,
+    })
+}
+
+pub(super) fn abort_setup_api_token(
+    connection: &mut Connection,
+    token_id: &str,
+    at: OffsetDateTime,
+) -> Result<(), StorageError> {
+    validate_token_id(token_id).map_err(|_| StorageError::new(StorageErrorKind::InvalidInput))?;
+    let transaction = connection
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(operation_failed)?;
+    let stored = load_token(&transaction, token_id)?
+        .ok_or_else(|| StorageError::new(StorageErrorKind::InvalidInput))?
+        .validate()?;
+    if !matches!(
+        stored.token_state,
+        ApiTokenState::SetupPending | ApiTokenState::SetupActive
+    ) {
+        return Err(StorageError::new(StorageErrorKind::InvalidInput));
+    }
+    if at < stored.created_at {
+        return Err(StorageError::new(StorageErrorKind::StateConflict));
+    }
+    if stored.revoked_at.is_some() {
+        return Ok(());
+    }
+    let changed = transaction
+        .execute(
+            "UPDATE api_tokens SET revoked_at = ?1 WHERE token_id = ?2 AND token_state IN ('setup_pending', 'setup_active') AND revoked_at IS NULL",
+            params![format_time(at)?, token_id],
+        )
+        .map_err(operation_failed)?;
+    if changed != 1 {
+        return Err(StorageError::new(StorageErrorKind::StateConflict));
+    }
+    transaction.commit().map_err(operation_failed)?;
+    Ok(())
 }
 
 pub(super) fn revoke_api_token(
@@ -554,7 +791,7 @@ fn load_token(
 ) -> Result<Option<StoredTokenRow>, StorageError> {
     connection
         .query_row(
-            "SELECT token_id, principal_ref, credential_revision, verifier, scopes, created_at, credential_updated_at, expires_at, revoked_at FROM api_tokens WHERE token_id = ?1",
+            "SELECT token_id, principal_ref, credential_revision, verifier, scopes, created_at, credential_updated_at, expires_at, revoked_at, token_state FROM api_tokens WHERE token_id = ?1",
             [token_id],
             StoredTokenRow::read,
         )

@@ -164,9 +164,12 @@ impl Recorder {
         duration_ms: i64,
     ) -> Result<(), HistoryWriteError> {
         #[cfg(unix)]
-        let _cache_root_guard = prepare_cache_root(&self.cache_root)?;
+        let cache_root = prepare_cache_root(&self.cache_root)?;
         #[cfg(windows)]
         prepare_cache_root(&self.cache_root)?;
+        #[cfg(unix)]
+        let database_directory = cache_root.path.join(DATABASE_DIRECTORY_NAME);
+        #[cfg(windows)]
         let database_directory = self.cache_root.join(DATABASE_DIRECTORY_NAME);
         // SQLite creates journals and other sidecars beside the main file.
         // Isolate that whole namespace instead of securing only one path. The
@@ -217,7 +220,14 @@ impl Recorder {
 }
 
 #[cfg(unix)]
-fn prepare_cache_root(path: &Path) -> Result<std::fs::File, std::io::Error> {
+struct PreparedCacheRoot {
+    // Keep the validated boundary pinned for the entire SQLite operation.
+    _guard: std::fs::File,
+    path: PathBuf,
+}
+
+#[cfg(unix)]
+fn prepare_cache_root(path: &Path) -> Result<PreparedCacheRoot, std::io::Error> {
     use rustix::fs::{FileType, Mode, OFlags};
     use std::path::Component;
 
@@ -226,6 +236,13 @@ fn prepare_cache_root(path: &Path) -> Result<std::fs::File, std::io::Error> {
             "the command-history cache root must be absolute",
         ));
     }
+
+    #[cfg(target_os = "macos")]
+    let resolved_path = resolve_trusted_macos_aliases_for_creation(path)?;
+    #[cfg(target_os = "macos")]
+    let path = resolved_path.as_path();
+    #[cfg(not(target_os = "macos"))]
+    let resolved_path = path.to_path_buf();
 
     let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
     let mut directory = rustix::fs::open("/", flags, Mode::empty()).map_err(rustix_error)?;
@@ -280,7 +297,59 @@ fn prepare_cache_root(path: &Path) -> Result<std::fs::File, std::io::Error> {
             "the command-history cache root must be user-owned and not group- or world-writable",
         ));
     }
-    Ok(std::fs::File::from(directory))
+    Ok(PreparedCacheRoot {
+        _guard: std::fs::File::from(directory),
+        path: resolved_path,
+    })
+}
+
+#[cfg(target_os = "macos")]
+fn resolve_trusted_macos_aliases_for_creation(path: &Path) -> Result<PathBuf, std::io::Error> {
+    use std::os::unix::fs::MetadataExt;
+    use std::path::Component;
+
+    let mut resolved = PathBuf::from("/");
+    let mut components = path.components();
+    for component in components.by_ref() {
+        let Component::Normal(name) = component else {
+            if component == Component::RootDir {
+                continue;
+            }
+            return Err(cache_root_permission_error(
+                "the command-history cache root contains an unsupported path component",
+            ));
+        };
+        let candidate = resolved.join(name);
+        match std::fs::symlink_metadata(&candidate) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                let parent_metadata = std::fs::symlink_metadata(&resolved)?;
+                if metadata.uid() != 0
+                    || parent_metadata.uid() != 0
+                    || parent_metadata.mode() & 0o022 != 0
+                {
+                    return Err(cache_root_permission_error(
+                        "the command-history cache ancestry contains an untrusted alias",
+                    ));
+                }
+                resolved = std::fs::canonicalize(candidate)?;
+            }
+            Ok(_) => resolved = candidate,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                resolved = candidate;
+                for remaining in components {
+                    let Component::Normal(name) = remaining else {
+                        return Err(cache_root_permission_error(
+                            "the command-history cache root contains an unsupported path component",
+                        ));
+                    };
+                    resolved.push(name);
+                }
+                break;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(resolved)
 }
 
 #[cfg(not(unix))]

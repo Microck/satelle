@@ -1,11 +1,54 @@
 ---
 title: Connect to a remote Host
-description: Configure the implemented direct HTTPS transport, including a Tailscale address.
+description: Configure SSH setup or direct HTTPS access to a Host Daemon.
 ---
 
-The implemented remote execution path is `direct`: HTTPS for requests and WSS
-for lifecycle events. The remote Host Daemon must already be configured and
-running. Remote setup is not implemented.
+Satelle supports two authenticated remote paths:
+
+- `ssh` uploads and starts an on-demand Host Daemon through system OpenSSH.
+- `direct` connects to an already-running Host Daemon over HTTPS and WSS.
+
+Both paths require a pinned Host identity and a file-backed Satelle API token.
+SSH authenticates the transport, but never replaces Satelle API authentication.
+
+## Set up an SSH Host
+
+Create an owner-controlled user configuration with an SSH destination, the
+expected Host identity, and an absolute token-file destination:
+
+```toml
+default_host = "studio-mac"
+
+[hosts.studio-mac]
+transport = "ssh"
+adapter = "codex"
+address = "operator@studio-mac.example.ts.net"
+expected_host_id = "host-018f-example"
+
+[hosts.studio-mac.api_token]
+kind = "file"
+path = "/absolute/private/path/satelle-token"
+```
+
+The token file must not already exist for the first setup. Its parent directory
+must be owner-only. Later setup reruns validate and reuse that file without
+replacing it. Run a transport-only dry-run first, then apply with explicit
+consent:
+
+```sh
+satelle setup --host studio-mac --on-demand --component transport --dry-run --json
+satelle setup --host studio-mac --on-demand --component transport --yes
+```
+
+Setup starts a loopback-only bootstrap daemon, asks the Host to generate a
+short-lived pending credential, atomically publishes the raw token to the
+configured owner-only file, then activates the durable credential. If
+verification fails, setup revokes the pending credential and removes the new
+token file after the Host confirms it inactive. Unactivated pending credentials
+also expire automatically.
+
+Later `run` and `steer` commands start an unavailable on-demand daemon without
+another bootstrap token and authenticate with the durable token file.
 
 ## Start the Host Daemon
 
@@ -18,7 +61,12 @@ satelle host start --bind 127.0.0.1:3001 --foreground
 The default bind address is loopback. Exposing the daemon beyond loopback
 requires the TLS, Host identity, and token boundary described below.
 
-## Configure the controller
+## Configure direct HTTPS
+
+Direct HTTPS/WSS connections are supported with an operator-provisioned,
+file-backed token. Automatic direct-token provisioning is not implemented in
+this MVP: the SSH setup flow above cannot mint or provision credentials for a
+direct binding.
 
 Create an owner-controlled user configuration with an HTTPS address, expected
 Host identity, token file descriptor, and CA bundle:
@@ -57,5 +105,5 @@ satelle host status --host studio-mac --json
 satelle run --host studio-mac --detach --json "Open the browser"
 ```
 
-SSH is accepted as a configuration transport kind but is not an implemented
-execution transport in this release.
+For SSH Hosts, the same verification commands use the authenticated tunnel and
+the durable token created by setup.

@@ -1,5 +1,6 @@
 use crate::contract::{
     ApiError, ApiErrorCode, AuthenticatedResponseContract, CapabilitiesResponse,
+    DurableTokenActivationResponse, DurableTokenConfirmationResponse, DurableTokenIssuanceResponse,
     HostDesktopSessionsResponse, HostStatusResponse, LiveResponse, LogsPageResponse,
     PROTOCOL_VERSION, PROTOCOL_VERSION_HEADER, RequestId, SessionResponse, StopRequest,
     StopResponse, TurnRequest,
@@ -136,6 +137,14 @@ impl DaemonClient {
         self.send_authenticated(request, request_id, StatusCode::OK)
     }
 
+    pub fn confirm_durable_setup_token(
+        &self,
+    ) -> Result<DurableTokenConfirmationResponse, DaemonClientError> {
+        let (request, request_id) =
+            self.protected_request(Method::GET, "/v1/setup/api-token/current")?;
+        self.send_authenticated(request, request_id, StatusCode::OK)
+    }
+
     /// Discovers the authenticated daemon identity through the normal protected
     /// request boundary. Callers construct this client with a fresh probe identity,
     /// so a valid daemon returns its observed identity in the typed mismatch response.
@@ -177,6 +186,35 @@ impl DaemonClient {
     pub fn desktop_sessions(&self) -> Result<HostDesktopSessionsResponse, DaemonClientError> {
         let (request, request_id) =
             self.protected_request(Method::GET, "/v1/host/desktop-sessions")?;
+        self.send_authenticated(request, request_id, StatusCode::OK)
+    }
+
+    pub fn issue_durable_setup_token(
+        &self,
+        idempotency_key: &str,
+    ) -> Result<DurableTokenIssuanceResponse, DaemonClientError> {
+        let (request, request_id) =
+            self.mutation_request("/v1/setup/api-token", idempotency_key)?;
+        self.send_authenticated(request, request_id, StatusCode::CREATED)
+    }
+
+    pub fn activate_durable_setup_token(
+        &self,
+        token_id: &str,
+        idempotency_key: &str,
+    ) -> Result<DurableTokenActivationResponse, DaemonClientError> {
+        let path = format!("/v1/setup/api-token/{token_id}/activate");
+        let (request, request_id) = self.mutation_request(&path, idempotency_key)?;
+        self.send_authenticated(request, request_id, StatusCode::OK)
+    }
+
+    pub fn abort_durable_setup_token(
+        &self,
+        token_id: &str,
+        idempotency_key: &str,
+    ) -> Result<DurableTokenActivationResponse, DaemonClientError> {
+        let path = format!("/v1/setup/api-token/{token_id}/abort");
+        let (request, request_id) = self.mutation_request(&path, idempotency_key)?;
         self.send_authenticated(request, request_id, StatusCode::OK)
     }
 
@@ -329,6 +367,7 @@ pub enum DaemonClientError {
     },
     ResponseRequestIdMismatch,
     ResponseHostIdentityMismatch,
+    ResponseContractViolation,
 }
 
 impl fmt::Display for DaemonClientError {
@@ -362,6 +401,9 @@ impl fmt::Display for DaemonClientError {
             }
             Self::ResponseHostIdentityMismatch => {
                 "the Host Daemon response did not match the pinned Host Identity"
+            }
+            Self::ResponseContractViolation => {
+                "the Host Daemon response violated the requested operation contract"
             }
         })
     }

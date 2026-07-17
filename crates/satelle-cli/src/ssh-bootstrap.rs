@@ -5,19 +5,21 @@ use satelle_host::{ApiBearerToken, readiness_probe_timeouts};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use std::ffi::{OsStr, OsString};
+use std::fmt::Write as _;
 use std::fs::{self, File};
 use std::io::{self, BufRead, BufReader, Read, Write};
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
-use std::process::{Child, ChildStderr, ChildStdout, Command, ExitStatus, Stdio};
+use std::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command, ExitStatus, Stdio};
 use std::sync::mpsc;
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tempfile::{NamedTempFile, TempDir};
 use thiserror::Error;
 use uuid::Uuid;
 
-use super::SshBootstrapScope;
 use super::ssh_tunnel::{SshStderrClassification, classify_stderr};
+use super::{SSH_BOOTSTRAP_LOCK_READY, SshBootstrapScope};
 
 const PROBE_OUTPUT_LIMIT: usize = 4096;
 const START_OUTPUT_LIMIT: u64 = 16 * 1024;
@@ -25,10 +27,150 @@ const MANIFEST_LIMIT: u64 = 1024 * 1024;
 const ARCHIVE_LIMIT: u64 = 256 * 1024 * 1024;
 const PROCESS_TIMEOUT: Duration = Duration::from_secs(30);
 const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(60);
+const BOOTSTRAP_LOCK_EXIT_GRACE: Duration = Duration::from_millis(500);
+const BOOTSTRAP_LOCK_EXIT_POLL: Duration = Duration::from_millis(10);
 const RELEASE_BASE_URL: &str = "https://github.com/Microck/satelle/releases/download";
+pub(super) struct SshBootstrapLock {
+    child: Child,
+    stdin: Option<ChildStdin>,
+    response_receiver: mpsc::Receiver<String>,
+    stdout_reader: Option<JoinHandle<()>>,
+    stderr_reader: Option<JoinHandle<SshStderrClassification>>,
+    _helper: StagedRemoteArtifact,
+}
+
+impl SshBootstrapLock {
+    pub(super) fn acquire(destination: &str) -> Result<Self, SshBootstrapError> {
+        let target = RemoteTarget::probe(destination)?;
+        let artifact = DownloadedArtifact::fetch(target)?;
+        // The helper is copied to a unique path before locking. No shared
+        // remote file is replaced until this process holds the OS file lock.
+        let helper = stage_artifact(destination, target, artifact.path())?;
+        let mut child = Command::new("ssh")
+            .arg("-T")
+            .arg(destination)
+            .arg(target.bootstrap_lock_command(helper.path()))
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(SshBootstrapError::SpawnSsh)?;
+        let stdin = child
+            .stdin
+            .take()
+            .expect("bootstrap-lock SSH stdin was configured as piped");
+        let stdout = child
+            .stdout
+            .take()
+            .expect("bootstrap-lock SSH stdout was configured as piped");
+        let stderr = child
+            .stderr
+            .take()
+            .expect("bootstrap-lock SSH stderr was configured as piped");
+        let stderr_reader = spawn_stderr_reader(stderr)?;
+        let (ready_sender, ready_receiver) = mpsc::sync_channel(1);
+        let (response_sender, response_receiver) = mpsc::channel();
+        let stdout_reader = thread::Builder::new()
+            .name("satelle-ssh-bootstrap-lock-stdout".to_string())
+            .spawn(move || drain_bootstrap_lock_stdout(stdout, ready_sender, response_sender))
+            .map_err(|error| terminate_child(&mut child, SshBootstrapError::ReaderThread(error)))?;
+
+        let ready = match ready_receiver.recv_timeout(PROCESS_TIMEOUT) {
+            Ok(ready) => ready,
+            Err(_) => {
+                let error = terminate_child(&mut child, SshBootstrapError::BootstrapLockTimedOut);
+                let _ = stdout_reader.join();
+                let _ = stderr_reader.join();
+                return Err(error);
+            }
+        };
+        if let Err(error) = ready {
+            let error = terminate_child(&mut child, error);
+            let _ = stdout_reader.join();
+            let classification = stderr_reader.join().unwrap_or_default();
+            return Err(classify_bootstrap_lock_ready_error(error, classification));
+        }
+        if child
+            .try_wait()
+            .map_err(SshBootstrapError::InspectSsh)?
+            .is_some()
+        {
+            let _ = stdout_reader.join();
+            let classification = stderr_reader.join().unwrap_or_default();
+            return Err(if classification.host_key_verification_failed() {
+                SshBootstrapError::HostKeyVerificationRequired
+            } else {
+                SshBootstrapError::RemoteOperationFailed
+            });
+        }
+
+        Ok(Self {
+            child,
+            stdin: Some(stdin),
+            response_receiver,
+            stdout_reader: Some(stdout_reader),
+            stderr_reader: Some(stderr_reader),
+            _helper: helper,
+        })
+    }
+
+    pub(super) fn confirm_ownership(&mut self) -> Result<(), SshBootstrapError> {
+        if self
+            .child
+            .try_wait()
+            .map_err(SshBootstrapError::InspectSsh)?
+            .is_some()
+        {
+            return Err(SshBootstrapError::BootstrapLockLost);
+        }
+        let challenge = format!("satelle-bootstrap-lock-{}", Uuid::now_v7());
+        let stdin = self
+            .stdin
+            .as_mut()
+            .ok_or(SshBootstrapError::BootstrapLockLost)?;
+        writeln!(stdin, "{challenge}")
+            .and_then(|()| stdin.flush())
+            .map_err(SshBootstrapError::BootstrapLockProtocol)?;
+        match self.response_receiver.recv_timeout(PROCESS_TIMEOUT) {
+            Ok(response) if response == challenge => Ok(()),
+            Ok(_) => Err(SshBootstrapError::InvalidBootstrapLockResponse),
+            Err(_) => Err(SshBootstrapError::BootstrapLockLost),
+        }
+    }
+}
+
+impl Drop for SshBootstrapLock {
+    fn drop(&mut self) {
+        drop(self.stdin.take());
+        // EOF lets the remote helper release bootstrap.lock and unmap its
+        // staged executable before cleanup. This matters on Windows, where a
+        // running executable cannot be deleted.
+        let deadline = Instant::now() + BOOTSTRAP_LOCK_EXIT_GRACE;
+        let exited = loop {
+            match self.child.try_wait() {
+                Ok(Some(_)) => break true,
+                Ok(None) if Instant::now() < deadline => {
+                    thread::sleep(BOOTSTRAP_LOCK_EXIT_POLL);
+                }
+                Ok(None) | Err(_) => break false,
+            }
+        };
+        if !exited {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        }
+        if let Some(reader) = self.stdout_reader.take() {
+            let _ = reader.join();
+        }
+        if let Some(reader) = self.stderr_reader.take() {
+            let _ = reader.join();
+        }
+    }
+}
 
 pub(super) struct SshBootstrapProcess {
     child: Child,
+    remote_addr: SocketAddr,
     stdout_reader: Option<JoinHandle<()>>,
     stderr_reader: Option<JoinHandle<SshStderrClassification>>,
 }
@@ -40,54 +182,122 @@ impl SshBootstrapProcess {
         host_config: &HostConfig,
         bootstrap_scope: SshBootstrapScope,
     ) -> Result<Self, SshBootstrapError> {
+        Self::launch_bound(
+            destination,
+            token,
+            host_config,
+            bootstrap_scope,
+            "127.0.0.1:3001",
+            Some(3001),
+            false,
+        )
+    }
+
+    pub(super) fn launch_ephemeral(
+        destination: &str,
+        token: &ApiBearerToken,
+        host_config: &HostConfig,
+        bootstrap_scope: SshBootstrapScope,
+    ) -> Result<Self, SshBootstrapError> {
+        Self::launch_bound(
+            destination,
+            token,
+            host_config,
+            bootstrap_scope,
+            "127.0.0.1:0",
+            None,
+            true,
+        )
+    }
+
+    fn launch_bound(
+        destination: &str,
+        token: &ApiBearerToken,
+        host_config: &HostConfig,
+        bootstrap_scope: SshBootstrapScope,
+        bind: &str,
+        expected_port: Option<u16>,
+        release_existing_state_owner: bool,
+    ) -> Result<Self, SshBootstrapError> {
+        let target = RemoteTarget::probe(destination)?;
+        let artifact = DownloadedArtifact::fetch(target)?;
+        let remote_binary = upload_artifact(destination, target, artifact.path())?;
+        if release_existing_state_owner {
+            require_success(run_ssh_command(
+                destination,
+                &target.release_state_command(&remote_binary),
+            )?)?;
+        }
+        let (native_timeout, provider_timeout) = readiness_probe_timeouts(host_config);
+        Self::spawn(
+            destination,
+            target.start_command(
+                &remote_binary,
+                bootstrap_scope,
+                native_timeout,
+                provider_timeout,
+                bind,
+            ),
+            Some(token),
+            expected_port,
+        )
+    }
+
+    pub(super) const fn remote_port(&self) -> u16 {
+        self.remote_addr.port()
+    }
+
+    pub(super) fn launch_durable(
+        destination: &str,
+        idle_timeout: Duration,
+        host_config: &HostConfig,
+    ) -> Result<(), SshBootstrapError> {
         let target = RemoteTarget::probe(destination)?;
         let artifact = DownloadedArtifact::fetch(target)?;
         let remote_binary = upload_artifact(destination, target, artifact.path())?;
         let (native_timeout, provider_timeout) = readiness_probe_timeouts(host_config);
-        Self::start(
-            destination,
-            target,
+        let command = target.durable_start_command(
             &remote_binary,
-            token,
-            bootstrap_scope,
+            idle_timeout,
             native_timeout,
             provider_timeout,
-        )
+        );
+        require_success(run_ssh_command(destination, &command)?)
     }
 
-    fn start(
+    fn spawn(
         destination: &str,
-        target: RemoteTarget,
-        remote_binary: &str,
-        token: &ApiBearerToken,
-        bootstrap_scope: SshBootstrapScope,
-        native_timeout: Duration,
-        provider_timeout: Duration,
+        start_command: String,
+        token: Option<&ApiBearerToken>,
+        expected_port: Option<u16>,
     ) -> Result<Self, SshBootstrapError> {
         let mut command = Command::new("ssh");
         command
             .arg("-T")
             .arg(destination)
-            .arg(target.start_command(
-                remote_binary,
-                bootstrap_scope,
-                native_timeout,
-                provider_timeout,
-            ))
-            .stdin(Stdio::piped())
+            .arg(start_command)
+            .stdin(if token.is_some() {
+                Stdio::piped()
+            } else {
+                Stdio::null()
+            })
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
         let mut child = command.spawn().map_err(SshBootstrapError::SpawnSsh)?;
-        let mut stdin = child
-            .stdin
-            .take()
-            .expect("bootstrap SSH stdin was configured as piped");
-        let raw_token = token.expose();
-        stdin
-            .write_all(raw_token.as_bytes())
-            .and_then(|()| stdin.write_all(b"\n"))
-            .map_err(|error| terminate_child(&mut child, SshBootstrapError::WriteToken(error)))?;
-        drop(stdin);
+        if let Some(token) = token {
+            let mut stdin = child
+                .stdin
+                .take()
+                .expect("bootstrap SSH stdin was configured as piped");
+            let raw_token = token.expose();
+            stdin
+                .write_all(raw_token.as_bytes())
+                .and_then(|()| stdin.write_all(b"\n"))
+                .map_err(|error| {
+                    terminate_child(&mut child, SshBootstrapError::WriteToken(error))
+                })?;
+            drop(stdin);
+        }
 
         let stdout = child
             .stdout
@@ -111,12 +321,12 @@ impl SshBootstrapProcess {
             Ok(ready) => ready,
             Err(error) => return Err(terminate_child(&mut child, error)),
         };
-        if !ready.running || ready.bind != "127.0.0.1:3001" {
+        let Some(remote_addr) = validated_start_address(&ready, expected_port) else {
             return Err(terminate_child(
                 &mut child,
                 SshBootstrapError::InvalidStartResponse,
             ));
-        }
+        };
         let child_status = child
             .try_wait()
             .map_err(|error| terminate_child(&mut child, SshBootstrapError::InspectSsh(error)))?;
@@ -131,6 +341,7 @@ impl SshBootstrapProcess {
 
         Ok(Self {
             child,
+            remote_addr,
             stdout_reader: Some(stdout_reader),
             stderr_reader: Some(stderr_reader),
         })
@@ -240,6 +451,26 @@ impl RemoteTarget {
         }
     }
 
+    fn shared_executable_path(self, directory: &str) -> String {
+        format!("{directory}/{}", self.executable_name())
+    }
+
+    fn promoted_executable_path(self, directory: &str, digest: &[u8; 32]) -> String {
+        if !self.is_windows() {
+            return self.shared_executable_path(directory);
+        }
+
+        // Windows does not allow replacing an executable image while a daemon
+        // is running from it. A digest-addressed name is both immutable and
+        // reusable, so setup never overwrites the live image or leaks one file
+        // per retry.
+        let mut digest_hex = String::with_capacity(64);
+        for byte in digest {
+            write!(&mut digest_hex, "{byte:02x}").expect("writing to a String cannot fail");
+        }
+        format!("{directory}/satelle-{digest_hex}.exe")
+    }
+
     fn remote_directory(self) -> String {
         let version = env!("CARGO_PKG_VERSION");
         match self {
@@ -252,6 +483,14 @@ impl RemoteTarget {
             Self::LinuxArm64Gnu | Self::LinuxX64Gnu => {
                 format!(".cache/satelle/host/v{version}/{}", self.id())
             }
+        }
+    }
+
+    fn bootstrap_lock_command(self, remote_binary: &str) -> String {
+        if self.is_windows() {
+            format!("cmd.exe /d /c {remote_binary} host bootstrap-lock")
+        } else {
+            format!("sh -c 'exec {remote_binary} host bootstrap-lock'")
         }
     }
 
@@ -285,15 +524,28 @@ impl RemoteTarget {
         }
     }
 
+    fn prepare_staged_command(self, staged: &str) -> Option<String> {
+        (!self.is_windows()).then(|| format!("sh -c 'chmod 700 {staged}'"))
+    }
+
+    fn remove_staged_command(self, staged: &str) -> String {
+        if self.is_windows() {
+            format!("cmd.exe /d /c \"del /f /q {staged} >nul 2>nul\"")
+        } else {
+            format!("sh -c 'rm -f {staged}'")
+        }
+    }
+
     fn start_command(
         self,
         remote_binary: &str,
         bootstrap_scope: SshBootstrapScope,
         native_timeout: Duration,
         provider_timeout: Duration,
+        bind: &str,
     ) -> String {
         let timeout_args = format!(
-            "--bootstrap-scope {} --bootstrap-native-readiness-timeout-ms {} --bootstrap-provider-smoke-timeout-ms {}",
+            "--bind {bind} --bootstrap-scope {} --bootstrap-native-readiness-timeout-ms {} --bootstrap-provider-smoke-timeout-ms {}",
             bootstrap_scope.as_cli_value(),
             native_timeout.as_millis(),
             provider_timeout.as_millis()
@@ -306,6 +558,46 @@ impl RemoteTarget {
             format!(
                 "sh -c 'exec {remote_binary} host start --bootstrap-token-stdin {timeout_args} --json'"
             )
+        }
+    }
+
+    fn durable_start_command(
+        self,
+        remote_binary: &str,
+        idle_timeout: Duration,
+        native_timeout: Duration,
+        provider_timeout: Duration,
+    ) -> String {
+        let timeout_args = format!(
+            "--on-demand-idle-timeout-ms {} --bootstrap-native-readiness-timeout-ms {} --bootstrap-provider-smoke-timeout-ms {}",
+            idle_timeout.as_millis(),
+            native_timeout.as_millis(),
+            provider_timeout.as_millis()
+        );
+        if self.is_windows() {
+            format!(
+                concat!(
+                    "powershell.exe -NoProfile -NonInteractive -Command \"",
+                    "$binary = (Resolve-Path -LiteralPath '{}').Path; ",
+                    "$command = '\"' + $binary + '\" host start {} --json'; ",
+                    "$created = Invoke-CimMethod -ClassName Win32_Process -MethodName Create ",
+                    "-Arguments @{{ CommandLine = $command }}; ",
+                    "if ($created.ReturnValue -ne 0) {{ exit $created.ReturnValue }}\""
+                ),
+                remote_binary, timeout_args
+            )
+        } else {
+            format!(
+                "sh -c 'nohup {remote_binary} host start {timeout_args} --json </dev/null >/dev/null 2>&1 &'"
+            )
+        }
+    }
+
+    fn release_state_command(self, remote_binary: &str) -> String {
+        if self.is_windows() {
+            format!("cmd.exe /d /c {remote_binary} host release-state")
+        } else {
+            format!("sh -c '{remote_binary} host release-state'")
         }
     }
 
@@ -539,15 +831,108 @@ fn upload_artifact(
 ) -> Result<String, SshBootstrapError> {
     let local_digest = sha256_file(local_binary)?;
     let directory = target.remote_directory();
-    let final_path = format!("{directory}/{}", target.executable_name());
-    let staged = format!(
-        "{directory}/.satelle-upload-{}",
-        Uuid::now_v7().hyphenated()
-    );
+    let shared_path = target.shared_executable_path(&directory);
+    let final_path = if target.is_windows() {
+        if remote_artifact_matches(destination, target, &shared_path, &local_digest)? {
+            return Ok(shared_path);
+        }
+        let content_addressed_path = target.promoted_executable_path(&directory, &local_digest);
+        if remote_artifact_matches(destination, target, &content_addressed_path, &local_digest)? {
+            return Ok(content_addressed_path);
+        }
+        content_addressed_path
+    } else {
+        shared_path
+    };
+    let staged = stage_artifact_with_digest(destination, target, local_binary, local_digest)?;
+    let promote = run_ssh_command(
+        destination,
+        &target.promote_command(staged.path(), &final_path),
+    )?;
+    require_success(promote)?;
+    Ok(final_path)
+}
+
+fn remote_artifact_matches(
+    destination: &str,
+    target: RemoteTarget,
+    remote_path: &str,
+    expected_digest: &[u8; 32],
+) -> Result<bool, SshBootstrapError> {
+    let digest = run_ssh_command(destination, &target.digest_command(remote_path))?;
+    if !digest.status.success() {
+        return if digest.stderr.host_key_verification_failed() {
+            Err(SshBootstrapError::HostKeyVerificationRequired)
+        } else {
+            Ok(false)
+        };
+    }
+    Ok(parse_digest_output(&digest.stdout).is_ok_and(|digest| digest == *expected_digest))
+}
+
+struct StagedRemoteArtifact {
+    destination: String,
+    target: RemoteTarget,
+    path: String,
+}
+
+impl StagedRemoteArtifact {
+    fn path(&self) -> &str {
+        &self.path
+    }
+}
+
+impl Drop for StagedRemoteArtifact {
+    fn drop(&mut self) {
+        let attempts = if self.target.is_windows() { 3 } else { 1 };
+        for attempt in 0..attempts {
+            if run_ssh_command(
+                &self.destination,
+                &self.target.remove_staged_command(&self.path),
+            )
+            .is_ok_and(|output| output.status.success())
+            {
+                return;
+            }
+            if attempt + 1 < attempts {
+                thread::sleep(BOOTSTRAP_LOCK_EXIT_POLL);
+            }
+        }
+    }
+}
+
+fn stage_artifact(
+    destination: &str,
+    target: RemoteTarget,
+    local_binary: &Path,
+) -> Result<StagedRemoteArtifact, SshBootstrapError> {
+    let local_digest = sha256_file(local_binary)?;
+    stage_artifact_with_digest(destination, target, local_binary, local_digest)
+}
+
+fn stage_artifact_with_digest(
+    destination: &str,
+    target: RemoteTarget,
+    local_binary: &Path,
+    local_digest: [u8; 32],
+) -> Result<StagedRemoteArtifact, SshBootstrapError> {
+    let directory = target.remote_directory();
+    let staged_suffix = if target.is_windows() { ".exe" } else { "" };
+    // Own cleanup before the first remote mutation. Every later failure,
+    // including directory creation and SCP, then attempts to remove the
+    // staging path without changing the original error.
+    let staged = StagedRemoteArtifact {
+        destination: destination.to_string(),
+        target,
+        path: format!(
+            "{directory}/.satelle-upload-{}{staged_suffix}",
+            Uuid::now_v7().hyphenated()
+        ),
+    };
     let create = run_ssh_command(destination, &target.create_directory_command(&directory))?;
     require_success(create)?;
 
-    let remote_spec = OsString::from(format!("{destination}:{staged}"));
+    let remote_spec = OsString::from(format!("{destination}:{}", staged.path()));
     let copy = run_program(
         "scp",
         [
@@ -558,7 +943,7 @@ fn upload_artifact(
     )?;
     require_success(copy)?;
 
-    let remote_digest = run_ssh_command(destination, &target.digest_command(&staged))?;
+    let remote_digest = run_ssh_command(destination, &target.digest_command(staged.path()))?;
     if !remote_digest.status.success() {
         return Err(if remote_digest.stderr.host_key_verification_failed() {
             SshBootstrapError::HostKeyVerificationRequired
@@ -569,10 +954,10 @@ fn upload_artifact(
     if parse_digest_output(&remote_digest.stdout)? != local_digest {
         return Err(SshBootstrapError::UploadedIntegrityMismatch);
     }
-
-    let promote = run_ssh_command(destination, &target.promote_command(&staged, &final_path))?;
-    require_success(promote)?;
-    Ok(final_path)
+    if let Some(command) = target.prepare_staged_command(staged.path()) {
+        require_success(run_ssh_command(destination, &command)?)?;
+    }
+    Ok(staged)
 }
 
 fn sha256_file(path: &Path) -> Result<[u8; 32], SshBootstrapError> {
@@ -703,10 +1088,57 @@ fn drain_bootstrap_stdout(
     let _ = io::copy(&mut reader, &mut io::sink());
 }
 
+fn drain_bootstrap_lock_stdout(
+    stdout: ChildStdout,
+    ready_sender: mpsc::SyncSender<Result<(), SshBootstrapError>>,
+    response_sender: mpsc::Sender<String>,
+) {
+    let mut reader = BufReader::new(stdout);
+    let ready = read_bootstrap_lock_ready(&mut reader);
+    let valid = ready.is_ok();
+    let _ = ready_sender.send(ready);
+    if !valid {
+        return;
+    }
+    for line in reader.lines() {
+        let Ok(line) = line else {
+            return;
+        };
+        if response_sender.send(line).is_err() {
+            return;
+        }
+    }
+}
+
+fn read_bootstrap_lock_ready(reader: &mut impl BufRead) -> Result<(), SshBootstrapError> {
+    let mut ready = String::new();
+    reader
+        .take(128)
+        .read_line(&mut ready)
+        .map_err(SshBootstrapError::ReadProcess)?;
+    if ready.trim_end() == SSH_BOOTSTRAP_LOCK_READY {
+        Ok(())
+    } else {
+        Err(SshBootstrapError::InvalidBootstrapLockResponse)
+    }
+}
+
 #[derive(Deserialize)]
 struct HostStartReady {
     running: bool,
     bind: String,
+}
+
+fn validated_start_address(
+    ready: &HostStartReady,
+    expected_port: Option<u16>,
+) -> Option<SocketAddr> {
+    let address = ready.bind.parse::<SocketAddr>().ok()?;
+    (ready.running
+        && address.ip().is_loopback()
+        && address.port() != 0
+        && expected_port.is_none_or(|port| address.port() == port))
+    .then_some(address)
 }
 
 fn spawn_stderr_reader(
@@ -722,6 +1154,17 @@ fn terminate_child(child: &mut Child, error: SshBootstrapError) -> SshBootstrapE
     let _ = child.kill();
     let _ = child.wait();
     error
+}
+
+fn classify_bootstrap_lock_ready_error(
+    error: SshBootstrapError,
+    classification: SshStderrClassification,
+) -> SshBootstrapError {
+    if classification.host_key_verification_failed() {
+        SshBootstrapError::HostKeyVerificationRequired
+    } else {
+        error
+    }
 }
 
 #[derive(Debug, Error)]
@@ -778,6 +1221,14 @@ pub(super) enum SshBootstrapError {
     LocalFile(#[source] io::Error),
     #[error("a remote bootstrap operation failed")]
     RemoteOperationFailed,
+    #[error("timed out acquiring the remote SSH bootstrap lock")]
+    BootstrapLockTimedOut,
+    #[error("the remote SSH bootstrap lock was lost")]
+    BootstrapLockLost,
+    #[error("could not exchange the remote SSH bootstrap lock challenge")]
+    BootstrapLockProtocol(#[source] io::Error),
+    #[error("the remote SSH bootstrap lock returned an invalid response")]
+    InvalidBootstrapLockResponse,
     #[error("the on-demand Host Daemon did not become ready in time")]
     StartTimedOut,
     #[error("the on-demand Host Daemon returned an invalid startup response")]
@@ -789,6 +1240,40 @@ pub(super) enum SshBootstrapError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn windows_promotes_to_a_reusable_content_addressed_executable() {
+        let digest = [0x1a; 32];
+        assert_eq!(
+            RemoteTarget::WindowsX64Msvc.promoted_executable_path("Satelle/host", &digest),
+            format!("Satelle/host/satelle-{}.exe", "1a".repeat(32))
+        );
+        assert_eq!(
+            RemoteTarget::LinuxX64Gnu.promoted_executable_path(".cache/satelle", &digest),
+            ".cache/satelle/satelle"
+        );
+    }
+
+    #[test]
+    fn bootstrap_lock_ready_error_preserves_host_key_classification() {
+        let host_key_error = classify_bootstrap_lock_ready_error(
+            SshBootstrapError::InvalidBootstrapLockResponse,
+            classify_stderr(&b"Host key verification failed."[..]),
+        );
+        assert!(matches!(
+            host_key_error,
+            SshBootstrapError::HostKeyVerificationRequired
+        ));
+
+        let ordinary_error = classify_bootstrap_lock_ready_error(
+            SshBootstrapError::InvalidBootstrapLockResponse,
+            classify_stderr(&b"connection refused"[..]),
+        );
+        assert!(matches!(
+            ordinary_error,
+            SshBootstrapError::InvalidBootstrapLockResponse
+        ));
+    }
 
     #[test]
     fn platform_protocol_maps_the_six_release_targets() {
@@ -875,9 +1360,11 @@ mod tests {
                 SshBootstrapScope::Read,
                 native,
                 provider,
+                "127.0.0.1:3001",
             ),
             concat!(
                 "sh -c 'exec /tmp/satelle host start --bootstrap-token-stdin ",
+                "--bind 127.0.0.1:3001 ",
                 "--bootstrap-scope read ",
                 "--bootstrap-native-readiness-timeout-ms 2500 ",
                 "--bootstrap-provider-smoke-timeout-ms 7500 --json'"
@@ -889,12 +1376,97 @@ mod tests {
                 SshBootstrapScope::Control,
                 native,
                 provider,
+                "127.0.0.1:0",
             ),
             concat!(
                 "cmd.exe /d /c satelle.exe host start --bootstrap-token-stdin ",
+                "--bind 127.0.0.1:0 ",
                 "--bootstrap-scope control ",
                 "--bootstrap-native-readiness-timeout-ms 2500 ",
                 "--bootstrap-provider-smoke-timeout-ms 7500 --json"
+            )
+        );
+    }
+
+    #[test]
+    fn bootstrap_start_response_accepts_an_allocated_ephemeral_loopback_port() {
+        let ready = HostStartReady {
+            running: true,
+            bind: "127.0.0.1:43123".to_string(),
+        };
+
+        assert_eq!(
+            validated_start_address(&ready, None),
+            Some("127.0.0.1:43123".parse().unwrap())
+        );
+        assert_eq!(validated_start_address(&ready, Some(3001)), None);
+    }
+
+    #[test]
+    fn bootstrap_lock_commands_run_the_staged_cross_platform_lock_helper() {
+        assert_eq!(
+            RemoteTarget::LinuxX64Gnu.bootstrap_lock_command(".cache/satelle/helper"),
+            "sh -c 'exec .cache/satelle/helper host bootstrap-lock'"
+        );
+        assert_eq!(
+            RemoteTarget::DarwinArm64.bootstrap_lock_command("Library/Caches/Satelle/helper"),
+            "sh -c 'exec Library/Caches/Satelle/helper host bootstrap-lock'"
+        );
+        assert_eq!(
+            RemoteTarget::WindowsX64Msvc.bootstrap_lock_command("AppData/Local/Satelle/helper.exe"),
+            "cmd.exe /d /c AppData/Local/Satelle/helper.exe host bootstrap-lock"
+        );
+    }
+
+    #[test]
+    fn setup_bootstrap_requests_state_release_with_the_promoted_binary() {
+        assert_eq!(
+            RemoteTarget::LinuxX64Gnu.release_state_command(".cache/satelle/satelle"),
+            "sh -c '.cache/satelle/satelle host release-state'"
+        );
+        assert_eq!(
+            RemoteTarget::WindowsX64Msvc.release_state_command("AppData/Local/Satelle/satelle.exe"),
+            "cmd.exe /d /c AppData/Local/Satelle/satelle.exe host release-state"
+        );
+    }
+
+    #[test]
+    fn durable_start_commands_detach_and_forward_the_resolved_timeouts() {
+        let idle_timeout = Duration::from_secs(75);
+        let native_timeout = Duration::from_millis(2_500);
+        let provider_timeout = Duration::from_millis(7_500);
+        assert_eq!(
+            RemoteTarget::LinuxX64Gnu.durable_start_command(
+                "/tmp/satelle",
+                idle_timeout,
+                native_timeout,
+                provider_timeout,
+            ),
+            concat!(
+                "sh -c 'nohup /tmp/satelle host start --on-demand-idle-timeout-ms 75000 ",
+                "--bootstrap-native-readiness-timeout-ms 2500 ",
+                "--bootstrap-provider-smoke-timeout-ms 7500 --json ",
+                "</dev/null >/dev/null 2>&1 &'"
+            )
+        );
+        assert_eq!(
+            RemoteTarget::WindowsX64Msvc.durable_start_command(
+                "AppData/Local/Satelle/satelle.exe",
+                idle_timeout,
+                native_timeout,
+                provider_timeout,
+            ),
+            concat!(
+                "powershell.exe -NoProfile -NonInteractive -Command \"",
+                "$binary = (Resolve-Path -LiteralPath ",
+                "'AppData/Local/Satelle/satelle.exe').Path; ",
+                "$command = '\"' + $binary + '\" host start ",
+                "--on-demand-idle-timeout-ms 75000 ",
+                "--bootstrap-native-readiness-timeout-ms 2500 ",
+                "--bootstrap-provider-smoke-timeout-ms 7500 --json'; ",
+                "$created = Invoke-CimMethod -ClassName Win32_Process -MethodName Create ",
+                "-Arguments @{ CommandLine = $command }; ",
+                "if ($created.ReturnValue -ne 0) { exit $created.ReturnValue }\""
             )
         );
     }

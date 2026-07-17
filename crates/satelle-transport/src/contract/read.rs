@@ -44,6 +44,10 @@ enum Operation {
     SessionStop,
     LogsRead,
     EventsRead,
+    SetupApiTokenCurrent,
+    SetupApiTokenIssue,
+    SetupApiTokenActivate,
+    SetupApiTokenAbort,
 }
 
 impl Operation {
@@ -59,6 +63,10 @@ impl Operation {
             Self::SessionStop => "session_stop",
             Self::LogsRead => "logs_read",
             Self::EventsRead => "events_read",
+            Self::SetupApiTokenCurrent => "setup_api_token_current",
+            Self::SetupApiTokenIssue => "setup_api_token_issue",
+            Self::SetupApiTokenActivate => "setup_api_token_activate",
+            Self::SetupApiTokenAbort => "setup_api_token_abort",
         }
     }
 }
@@ -232,6 +240,10 @@ impl CapabilitiesResponse {
                 Operation::SessionStop,
                 Operation::LogsRead,
                 Operation::EventsRead,
+                Operation::SetupApiTokenCurrent,
+                Operation::SetupApiTokenIssue,
+                Operation::SetupApiTokenActivate,
+                Operation::SetupApiTokenAbort,
             ],
             runtime_capabilities: RuntimeCapabilities {
                 codex_runtime,

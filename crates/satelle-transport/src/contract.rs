@@ -3,6 +3,7 @@ mod events;
 mod logs;
 mod read;
 mod session;
+mod setup;
 
 pub(crate) use error::ApiErrorCategory;
 pub use error::{ApiError, ApiErrorCode};
@@ -20,6 +21,10 @@ pub use read::{
 pub(crate) use session::ApiRequestContract;
 pub(crate) use session::TurnRequestParts;
 pub use session::{SessionResponse, StopRequest, StopResponse, TurnRequest};
+pub use setup::{
+    DURABLE_SETUP_PENDING_TTL, DurableTokenActivationResponse, DurableTokenConfirmationResponse,
+    DurableTokenIssuanceResponse,
+};
 
 pub(crate) const PROTOCOL_VERSION_HEADER: &str = "satelle-protocol-version";
 // Native readiness timeout is a new typed API error variant. Bump the exact-match mutation

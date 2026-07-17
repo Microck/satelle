@@ -1,20 +1,506 @@
 use super::*;
 use satelle_core::session::{StopObservation, TurnAdmissionPhase, TurnState};
-use satelle_core::{ErrorCode, EventSource, EventSubject, EventType, SatelleEventBody};
+use satelle_core::{
+    ApiTokenSource, ErrorCode, EventSource, EventSubject, EventType, SatelleConfig,
+    SatelleEventBody, TransportKind,
+};
 use satelle_host::{
     AdapterReadiness, AdapterSubject, ApiScopes, ComputerUseAdapter, ExecuteRequest, ExecuteResult,
     LogCursor, LogPageQuery, LogSeverity, LogSource, ProviderComputerUseIntent,
     RecoveryObservation, test_support::TestStateDir,
 };
 use satelle_transport::{DaemonServer, DaemonServerConfig};
+use std::io::{Read, Write};
 use std::net::{Ipv4Addr, SocketAddr, TcpListener};
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Mutex, mpsc};
+use std::thread;
+use std::time::{Duration, Instant};
 use tokio_tungstenite::tungstenite::Error as WebSocketError;
 use tokio_tungstenite::tungstenite::error::ProtocolError;
 
 #[derive(Clone)]
 struct RecordingProviderIntentAdapter {
     observed: Arc<Mutex<Option<ProviderComputerUseIntent>>>,
+}
+
+fn ssh_setup_host(api_token: Option<ApiTokenSource>) -> SelectedHost {
+    let mut config = SatelleConfig::defaults()
+        .hosts
+        .remove(LOCAL_DEMO_HOST)
+        .expect("built-in Host config");
+    config.transport = TransportKind::Ssh;
+    config.address = Some("host.example.test".to_string());
+    config.expected_host_id = Some("host-setup-test".to_string());
+    config.api_token = api_token;
+    SelectedHost {
+        alias: "remote".to_string(),
+        config,
+    }
+}
+
+#[test]
+fn ssh_setup_plan_reaches_explicit_trust_for_an_unpinned_host() {
+    let state = TestStateDir::new().expect("temporary state directory");
+    let mut host = ssh_setup_host(Some(ApiTokenSource::File {
+        path: state.path().join("first-trust.token"),
+    }));
+    host.config.expected_host_id = None;
+
+    let transport = SshSetupTransport::new(&host).expect("construct unpinned SSH setup");
+    let report = transport
+        .setup(
+            true,
+            "on_demand".to_string(),
+            vec!["transport".to_string()],
+            DaemonPathOverrides::default(),
+        )
+        .expect("plan first-trust SSH setup");
+
+    assert_eq!(report.status, "planned");
+    assert_eq!(
+        report.planned_actions,
+        [
+            "allow SSH setup to stop the running Host daemon; active Host work may be interrupted",
+            "discover and explicitly trust the reachable Host Identity",
+            "issue, persist, and activate a durable control-scoped API token",
+        ]
+    );
+    assert!(!report.mutated);
+}
+
+#[test]
+fn ssh_setup_plan_requires_an_external_token_file_without_mutating() {
+    let transport = SshSetupTransport::new(&ssh_setup_host(None)).expect("construct setup");
+    let report = transport
+        .setup(
+            true,
+            "on_demand".to_string(),
+            vec!["transport".to_string()],
+            DaemonPathOverrides::default(),
+        )
+        .expect("plan SSH setup");
+
+    assert_eq!(report.status, "input_required");
+    assert!(!report.mutated);
+    assert!(report.applied_actions.is_empty());
+    assert_eq!(report.required_input.len(), 1);
+    assert_eq!(
+        report.required_input[0].input_kind,
+        "api_token_file_descriptor"
+    );
+}
+
+#[test]
+fn ordinary_ssh_commands_require_a_durable_token_descriptor() {
+    let error = match transport_for(&ssh_setup_host(None)) {
+        Ok(_) => panic!("ordinary SSH transport must reject tokenless bootstrap"),
+        Err(error) => error,
+    };
+
+    assert_eq!(error.error.code, ErrorCode::ConfigError);
+    assert!(error.error.message.contains("api_token"));
+}
+
+#[test]
+fn ssh_setup_plan_declares_one_durable_token_handoff() {
+    let state = TestStateDir::new().expect("temporary state directory");
+    let path = state.path().join("satelle-setup-plan.token");
+    let transport = SshSetupTransport::new(&ssh_setup_host(Some(ApiTokenSource::File { path })))
+        .expect("construct setup");
+    let report = transport
+        .setup(
+            true,
+            "on_demand".to_string(),
+            vec!["transport".to_string()],
+            DaemonPathOverrides::default(),
+        )
+        .expect("plan SSH setup");
+
+    assert_eq!(report.status, "planned");
+    assert!(report.required_input.is_empty());
+    assert_eq!(
+        report.planned_actions,
+        [
+            "allow SSH setup to stop the running Host daemon; active Host work may be interrupted",
+            "issue, persist, and activate a durable control-scoped API token",
+        ]
+    );
+    assert!(!report.mutated);
+}
+
+#[test]
+fn setup_token_lock_serializes_processes_targeting_the_same_credential() {
+    let state = TestStateDir::new().expect("temporary state directory");
+    #[cfg(unix)]
+    std::fs::set_permissions(
+        state.path(),
+        std::os::unix::fs::PermissionsExt::from_mode(0o700),
+    )
+    .expect("make token directory owner-only");
+    let token_path = state.path().join("serialized-setup.token");
+    let first_lock = acquire_setup_token_lock(&token_path).expect("acquire first setup lock");
+    let second_lock = open_setup_token_lock(&token_path).expect("open second setup lock");
+    assert!(matches!(
+        second_lock.try_lock(),
+        Err(std::fs::TryLockError::WouldBlock)
+    ));
+    drop(first_lock);
+    second_lock
+        .try_lock()
+        .expect("second setup acquires the released token path");
+    second_lock.unlock().expect("release the second setup lock");
+    assert!(
+        token_path
+            .parent()
+            .expect("token parent")
+            .join(".serialized-setup.token.satelle-setup.lock")
+            .is_file(),
+        "the stable lock inode remains for future setup processes"
+    );
+}
+
+#[test]
+fn ssh_setup_rerun_reuses_an_existing_secure_token_destination() {
+    let temporary_root = tempfile::tempdir().expect("temporary root");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(
+            temporary_root.path(),
+            std::fs::Permissions::from_mode(0o700),
+        )
+        .expect("make temporary root owner-only");
+    }
+    let token_directory = temporary_root.path().join("owner-only");
+    drop(
+        satelle_core::open_or_create_owner_only_directory(&token_directory)
+            .expect("create owner-only token directory"),
+    );
+    let path = token_directory.join("satelle-existing-setup.token");
+    let token = ApiBearerToken::generate().expect("generate existing API token");
+    let raw_token = token.expose();
+    persist_new_owner_only_secret_file(&path, raw_token.as_str())
+        .expect("persist initial setup token");
+    let transport = SshSetupTransport::new(&ssh_setup_host(Some(ApiTokenSource::File {
+        path: path.clone(),
+    })))
+    .expect("construct setup");
+
+    let report = transport
+        .setup(
+            true,
+            "on_demand".to_string(),
+            vec!["transport".to_string()],
+            DaemonPathOverrides::default(),
+        )
+        .expect("plan repeated SSH setup");
+
+    assert_eq!(
+        report.planned_actions,
+        [
+            "allow SSH setup to stop the running Host daemon; active Host work may be interrupted",
+            "validate and reuse the existing durable control-scoped API token, or recover an interrupted pending handoff"
+        ]
+    );
+    assert!(!report.mutated);
+    assert_eq!(
+        read_owner_only_secret_file(&path).expect("read retained token"),
+        raw_token
+    );
+}
+
+#[test]
+fn persisted_pending_setup_token_self_activates_on_the_running_daemon() {
+    let state = TestStateDir::new().expect("temporary state directory");
+    let bootstrap_token = ApiBearerToken::generate().expect("generate bootstrap token");
+    let service = HostService::local_demo_for_tests_at(state.path())
+        .expect("construct Host service")
+        .with_ssh_bootstrap_auth_for_tests(
+            &bootstrap_token,
+            ApiScopes::ADMIN,
+            time::OffsetDateTime::now_utc() + time::Duration::minutes(5),
+        );
+    let initialized = service.initialize_daemon().expect("initialize Host state");
+    let host_identity = initialized.host_identity().to_string();
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .expect("construct daemon runtime");
+    let server = runtime
+        .block_on(DaemonServer::bind(
+            service,
+            DaemonServerConfig::loopback(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))),
+        ))
+        .expect("bind loopback daemon");
+    let address = server.local_addr();
+    let bootstrap_client = DaemonClient::loopback(address, bootstrap_token, &host_identity)
+        .expect("construct bootstrap client");
+
+    let interrupted = bootstrap_client
+        .issue_durable_setup_token("interrupted-setup-issue")
+        .expect("issue pending token");
+    let interrupted_id = interrupted.token_id().to_string();
+    let interrupted_raw = interrupted
+        .into_bearer_token()
+        .expect("first issuance carries the secret");
+    let token_path = state.path().join("interrupted-setup.token");
+    persist_new_owner_only_secret_file(&token_path, interrupted_raw.as_str())
+        .expect("persist token before simulated interruption");
+    let pending_client = DaemonClient::loopback(
+        address,
+        ApiBearerToken::parse(interrupted_raw.as_str()).expect("parse pending token"),
+        &host_identity,
+    )
+    .expect("construct pending-token client");
+
+    assert!(matches!(
+        pending_client.issue_durable_setup_token("pending-cannot-issue"),
+        Err(DaemonClientError::Api {
+            status: reqwest::StatusCode::UNAUTHORIZED,
+            ..
+        })
+    ));
+    assert!(matches!(
+        pending_client.abort_durable_setup_token(&interrupted_id, "pending-cannot-abort"),
+        Err(DaemonClientError::Api {
+            status: reqwest::StatusCode::UNAUTHORIZED,
+            ..
+        })
+    ));
+
+    let verification = verify_durable_setup_token_with_launch(
+        &pending_client,
+        interrupted_id.clone(),
+        "interrupted-setup-activate",
+        "remote",
+        || -> Result<(), SatelleError> {
+            panic!("recovery must use the daemon that already owns the state store")
+        },
+    )
+    .expect("activate the persisted pending token on the running daemon");
+    assert_eq!(verification, ExistingTokenVerification::ActivatedPending);
+
+    let report = SshSetupTransport::new(&ssh_setup_host(Some(ApiTokenSource::File {
+        path: token_path.clone(),
+    })))
+    .expect("construct recovered SSH setup")
+    .setup_report(
+        false,
+        "on_demand".to_string(),
+        vec!["transport".to_string()],
+        DaemonPathOverrides::default(),
+        SetupApplication::AppliedPendingActivation,
+    );
+    assert!(report.mutated);
+    assert_eq!(
+        report.applied_actions,
+        ["activate the existing pending durable control-scoped API token"]
+    );
+    let confirmation = pending_client
+        .confirm_durable_setup_token()
+        .expect("the recovered token authenticates after self-activation");
+    assert_eq!(confirmation.token_id(), interrupted_id);
+    assert_eq!(
+        read_owner_only_secret_file(&token_path).expect("read recovered setup token"),
+        interrupted_raw
+    );
+
+    drop(server);
+}
+
+#[test]
+fn durable_verification_relaunches_after_an_established_tunnel_closes() {
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("bind loopback test tunnel");
+    let address = listener.local_addr().expect("read loopback test address");
+    let token = ApiBearerToken::generate().expect("generate durable test token");
+    let token_id = token.token_id().to_string();
+    let response_token_id = token_id.clone();
+    let (launch_sender, launch_receiver) = mpsc::channel();
+    let probe_running = Arc::new(AtomicBool::new(false));
+    let server_probe_running = Arc::clone(&probe_running);
+
+    let tunnel = thread::spawn(move || {
+        fn read_request_headers(stream: &mut std::net::TcpStream) -> String {
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .expect("bound request read timeout");
+            let mut request = Vec::new();
+            while !request.ends_with(b"\r\n\r\n") {
+                let mut chunk = [0_u8; 1024];
+                let count = stream.read(&mut chunk).expect("read test request");
+                assert_ne!(count, 0, "request closed before its headers completed");
+                request.extend_from_slice(&chunk[..count]);
+            }
+            String::from_utf8(request).expect("HTTP request headers are UTF-8")
+        }
+
+        // Model an SSH local forwarder whose remote connection is refused:
+        // the local TCP connection succeeds, but no valid HTTP response is
+        // possible. Returning bytes prevents the HTTP client from retrying
+        // this idempotent GET before Satelle can relaunch the daemon.
+        listener
+            .set_nonblocking(true)
+            .expect("poll forwarded requests and launch signal");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            match launch_receiver.try_recv() {
+                Ok(()) => break,
+                Err(mpsc::TryRecvError::Empty) => {}
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    panic!("durable daemon relaunch sender disconnected")
+                }
+            }
+            match listener.accept() {
+                Ok((mut stream, _)) => {
+                    let _request = read_request_headers(&mut stream);
+                    stream
+                        .write_all(b"remote daemon refused the forwarded connection\r\n")
+                        .expect("write invalid forwarded response");
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    thread::sleep(Duration::from_millis(5));
+                }
+                Err(error) => panic!("accept forwarded request: {error}"),
+            }
+            assert!(
+                Instant::now() < deadline,
+                "durable daemon relaunch must be requested"
+            );
+        }
+        listener
+            .set_nonblocking(false)
+            .expect("accept relaunched request");
+        let (mut stream, _) = listener.accept().expect("accept relaunched request");
+        assert!(
+            server_probe_running.load(Ordering::SeqCst),
+            "the launched probe must remain alive through token verification"
+        );
+        let request = read_request_headers(&mut stream);
+        let request_id = request
+            .lines()
+            .find_map(|line| {
+                line.split_once(':').and_then(|(name, value)| {
+                    name.eq_ignore_ascii_case("Satelle-Request-Id")
+                        .then(|| value.trim())
+                })
+            })
+            .expect("authenticated request carries a request ID");
+        let body = format!(
+            "{{\"schema_version\":\"satelle.setup-api-token-confirmation.v1\",\"request_id\":\"{request_id}\",\"host_identity\":\"host-setup-test\",\"token_id\":\"{response_token_id}\",\"setup_active\":true,\"control_scoped\":true}}"
+        );
+        write!(
+            stream,
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        )
+        .expect("write relaunched daemon response");
+    });
+
+    let client = DaemonClient::loopback_with_timeout(
+        address,
+        token,
+        "host-setup-test",
+        Duration::from_secs(2),
+    )
+    .expect("construct loopback durable client");
+    struct ProbeGuard(Arc<AtomicBool>);
+
+    impl Drop for ProbeGuard {
+        fn drop(&mut self) {
+            self.0.store(false, Ordering::SeqCst);
+        }
+    }
+
+    let mut launch_count = 0;
+    verify_durable_setup_token_with_launch(
+        &client,
+        token_id,
+        "relaunch-activation",
+        "remote",
+        || -> Result<ProbeGuard, SatelleError> {
+            launch_count += 1;
+            probe_running.store(true, Ordering::SeqCst);
+            launch_sender.send(()).expect("signal daemon relaunch");
+            Ok(ProbeGuard(Arc::clone(&probe_running)))
+        },
+    )
+    .expect("retry durable verification after relaunch");
+    assert_eq!(launch_count, 1);
+    assert!(
+        !probe_running.load(Ordering::SeqCst),
+        "the verification probe must stop before recovery can bootstrap"
+    );
+    tunnel.join().expect("test tunnel exits cleanly");
+}
+
+#[test]
+fn ssh_setup_rejects_unimplemented_components_before_mutating() {
+    let path = std::env::temp_dir().join("satelle-unsupported-setup.token");
+    let transport = SshSetupTransport::new(&ssh_setup_host(Some(ApiTokenSource::File { path })))
+        .expect("construct setup");
+
+    for components in [
+        vec!["all".to_string()],
+        vec!["provider-auth".to_string()],
+        vec!["transport".to_string(), "host".to_string()],
+    ] {
+        let error = transport
+            .setup(
+                false,
+                "on_demand".to_string(),
+                components,
+                DaemonPathOverrides::default(),
+            )
+            .expect_err("partial SSH setup must be rejected");
+
+        assert_eq!(error.code, ErrorCode::NotImplemented);
+    }
+}
+
+#[test]
+fn ssh_setup_rejects_persistent_mode_before_mutating() {
+    let path = std::env::temp_dir().join("satelle-persistent-setup.token");
+    let transport = SshSetupTransport::new(&ssh_setup_host(Some(ApiTokenSource::File { path })))
+        .expect("construct setup");
+    let error = transport
+        .setup(
+            false,
+            "persistent".to_string(),
+            vec!["transport".to_string()],
+            DaemonPathOverrides::default(),
+        )
+        .expect_err("persistent SSH setup must install a service before it can succeed");
+
+    assert_eq!(error.code, ErrorCode::NotImplemented);
+}
+
+#[test]
+fn ssh_setup_rejects_daemon_path_overrides_before_mutating() {
+    let state = TestStateDir::new().expect("temporary state directory");
+    let token_path = state.path().join("unsupported-path-override.token");
+    let transport = SshSetupTransport::new(&ssh_setup_host(Some(ApiTokenSource::File {
+        path: token_path.clone(),
+    })))
+    .expect("construct setup");
+    let overrides = DaemonPathOverrides {
+        state_dir: Some(state.path().join("remote-state")),
+        ..DaemonPathOverrides::default()
+    };
+
+    let error = transport
+        .setup(
+            false,
+            "on_demand".to_string(),
+            vec!["transport".to_string()],
+            overrides,
+        )
+        .expect_err("unsupported overrides must fail before SSH or token mutation");
+
+    assert_eq!(error.code, ErrorCode::NotImplemented);
+    assert!(!token_path.exists());
 }
 
 impl ComputerUseAdapter for RecordingProviderIntentAdapter {
@@ -261,6 +747,88 @@ fn direct_host_sessions_read_daemon_metadata_without_bootstrap() {
     assert!(direct.bootstrap_actions.is_empty());
     assert_eq!(direct.host_daemon_version, env!("CARGO_PKG_VERSION"));
     assert_eq!(direct.sessions, local.sessions);
+}
+
+#[test]
+fn durable_ssh_relaunch_policy_covers_read_and_stop_without_credential_bootstrap() {
+    assert!(!SshDaemonLaunchPolicy::Never.allows_durable_relaunch());
+    assert!(SshDaemonLaunchPolicy::DurableOnly.allows_durable_relaunch());
+    for scope in [
+        SshBootstrapScope::Read,
+        SshBootstrapScope::Control,
+        SshBootstrapScope::Admin,
+    ] {
+        let policy = SshDaemonLaunchPolicy::Bootstrap(scope);
+        assert!(policy.allows_durable_relaunch());
+        assert_eq!(policy.bootstrap_scope(), Some(scope));
+    }
+}
+
+#[test]
+fn serialized_durable_relaunch_rechecks_readiness_under_the_remote_lock() {
+    struct BootstrapLockGuard(Arc<AtomicBool>);
+
+    impl Drop for BootstrapLockGuard {
+        fn drop(&mut self) {
+            self.0.store(false, Ordering::SeqCst);
+        }
+    }
+
+    let lock_held = Arc::new(AtomicBool::new(true));
+    let bootstrap_lock = BootstrapLockGuard(Arc::clone(&lock_held));
+    let ready = relaunch_durable_daemon_under_lock(
+        "remote",
+        || {
+            assert!(
+                lock_held.load(Ordering::SeqCst),
+                "the remote helper must confirm live lock ownership"
+            );
+            Ok(())
+        },
+        || {
+            assert!(
+                lock_held.load(Ordering::SeqCst),
+                "readiness must be rechecked while the remote lock is held"
+            );
+            Ok("already started by the first Controller")
+        },
+        || -> Result<(), SatelleError> {
+            panic!("a ready daemon must not be launched a second time")
+        },
+    )
+    .expect("reuse daemon started by the first Controller");
+
+    assert_eq!(ready, "already started by the first Controller");
+    drop(bootstrap_lock);
+    assert!(
+        !lock_held.load(Ordering::SeqCst),
+        "the remote lock is released only after readiness succeeds"
+    );
+}
+
+#[test]
+fn durable_relaunch_rejects_success_when_remote_lock_ownership_is_lost() {
+    let lock_held = Arc::new(AtomicBool::new(true));
+    let confirm_lock = Arc::clone(&lock_held);
+    let readiness_lock = Arc::clone(&lock_held);
+    let error = relaunch_durable_daemon_under_lock(
+        "remote",
+        || {
+            if confirm_lock.load(Ordering::SeqCst) {
+                Ok(())
+            } else {
+                Err(SatelleError::host_unreachable("remote"))
+            }
+        },
+        || {
+            readiness_lock.store(false, Ordering::SeqCst);
+            Ok("daemon became ready as the SSH lock disconnected")
+        },
+        || -> Result<(), SatelleError> { panic!("an already-ready daemon is not relaunched") },
+    )
+    .expect_err("stale lock ownership cannot report a serialized relaunch");
+
+    assert_eq!(error.code, ErrorCode::HostUnreachable);
 }
 
 #[test]

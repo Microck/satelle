@@ -740,6 +740,19 @@ impl Storage {
         auth::authenticate_api_token(&self.connection, token.token_id(), &token.verifier(), at)
     }
 
+    pub(crate) fn authenticate_pending_setup_api_token(
+        &self,
+        token: &ApiBearerToken,
+        at: OffsetDateTime,
+    ) -> Result<Option<ApiPrincipal>, StorageError> {
+        auth::authenticate_pending_setup_api_token(
+            &self.connection,
+            token.token_id(),
+            &token.verifier(),
+            at,
+        )
+    }
+
     pub(crate) fn api_principal_is_active(
         &self,
         principal: &ApiPrincipal,
@@ -760,6 +773,22 @@ impl Storage {
             expected_credential_revision,
             at,
         )
+    }
+
+    pub(crate) fn activate_api_token(
+        &mut self,
+        token_id: &str,
+        at: OffsetDateTime,
+    ) -> Result<ApiPrincipal, StorageError> {
+        auth::activate_api_token(&mut self.connection, token_id, at)
+    }
+
+    pub(crate) fn abort_setup_api_token(
+        &mut self,
+        token_id: &str,
+        at: OffsetDateTime,
+    ) -> Result<(), StorageError> {
+        auth::abort_setup_api_token(&mut self.connection, token_id, at)
     }
 
     pub(crate) fn revoke_api_token(

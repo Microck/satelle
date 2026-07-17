@@ -223,9 +223,20 @@ fn is_migration_backup_leaf(leaf: &[u8]) -> bool {
     let Some(remainder) = file_name.strip_prefix("satelle.sqlite3.migration-v") else {
         return false;
     };
-    let stem = remainder
-        .strip_suffix(".backup.json")
-        .or_else(|| remainder.strip_suffix(".backup"));
+    // SQLite derives these sidecar names before calling the VFS. They remain
+    // inside the pinned state directory and receive the same owner-only,
+    // no-follow checks as the backup itself. The journal is normally removed
+    // when the one-shot backup switches to journal_mode=OFF, but the VFS must
+    // still recognize the name while SQLite performs that transition.
+    let stem = [
+        ".backup.json",
+        ".backup-journal",
+        ".backup-wal",
+        ".backup-shm",
+        ".backup",
+    ]
+    .into_iter()
+    .find_map(|suffix| remainder.strip_suffix(suffix));
     let Some((schema_version, backup_id)) = stem.and_then(|stem| stem.split_once('-')) else {
         return false;
     };
@@ -569,5 +580,28 @@ mod tests {
 
         assert_eq!(ffi::SQLITE_IOERR, code);
         assert!(file.pMethods.is_null());
+    }
+
+    #[test]
+    fn migration_backup_vfs_accepts_only_the_backup_namespace() {
+        let stem = b"satelle.sqlite3.migration-v1-0198a146-5ec2-7dd5-b51c-7d5e241e5890";
+        for suffix in [
+            b".backup".as_slice(),
+            b".backup.json".as_slice(),
+            b".backup-journal".as_slice(),
+            b".backup-wal".as_slice(),
+            b".backup-shm".as_slice(),
+        ] {
+            let mut leaf = stem.to_vec();
+            leaf.extend_from_slice(suffix);
+            assert!(is_migration_backup_leaf(&leaf));
+        }
+
+        assert!(!is_migration_backup_leaf(
+            b"satelle.sqlite3.migration-v1-not-a-uuid.backup-journal"
+        ));
+        assert!(!is_migration_backup_leaf(
+            b"satelle.sqlite3.migration-v1-0198a146-5ec2-7dd5-b51c-7d5e241e5890.backup.tmp"
+        ));
     }
 }

@@ -47,6 +47,28 @@ struct ProviderProbePersistence<'a> {
     persist_turn_ref: &'a mut dyn FnMut(&str) -> Result<(), ()>,
 }
 
+fn supported_execution_version(
+    snapshot: &crate::ProductionCapabilitySnapshot,
+) -> Result<crate::codex_capabilities::CodexVersion, SatelleError> {
+    let version = match snapshot.evidence.codex_version {
+        crate::codex_capabilities::CodexVersionEvidence::Detected { version }
+            if version == crate::codex_capabilities::REQUIRED_CODEX_VERSION =>
+        {
+            version
+        }
+        _ => return Err(crate::execution_blocker(&snapshot.verdict)),
+    };
+    if !snapshot
+        .evidence
+        .host_platform
+        .supports_native_computer_use()
+        || !snapshot.verdict.is_supported()
+    {
+        return Err(crate::execution_blocker(&snapshot.verdict));
+    }
+    Ok(version)
+}
+
 /// The production adapter owns the private Codex app-server boundary. Native
 /// execution remains gated by preflight evidence; no caller can reach execute
 /// merely because the protocol session itself is implemented.
@@ -132,24 +154,10 @@ impl ProductionComputerUseAdapter {
         provider_intent: &ProviderComputerUseIntent,
     ) -> Result<ReadinessCacheKey, SatelleError> {
         let snapshot = crate::read_production_snapshot(&self.snapshot)?;
-        let version = match snapshot.evidence.codex_version {
-            crate::codex_capabilities::CodexVersionEvidence::Detected { version }
-                if version == crate::codex_capabilities::REQUIRED_CODEX_VERSION =>
-            {
-                version
-            }
-            _ => return Err(crate::execution_blocker(&snapshot.verdict)),
-        };
-        if !snapshot
-            .evidence
-            .host_platform
-            .supports_native_computer_use()
-        {
-            return Err(crate::execution_blocker(&snapshot.verdict));
-        }
         snapshot
             .control_plane_admission
             .admit(ControlPlaneOperation::Run)?;
+        let version = supported_execution_version(&snapshot)?;
         drop(snapshot);
 
         let desktop = crate::desktop_sessions::discover()?
@@ -930,9 +938,18 @@ fn annotate_provider_smoke_error(
 
 impl ComputerUseAdapter for ProductionComputerUseAdapter {
     fn admit_operation(&self, operation: ControlPlaneOperation) -> Result<(), SatelleError> {
-        crate::read_production_snapshot(&self.snapshot)?
-            .control_plane_admission
-            .admit(operation)
+        let snapshot = crate::read_production_snapshot(&self.snapshot)?;
+        // Preserve the operation-specific control-plane diagnosis before the
+        // broader native execution verdict. Stop and status intentionally end
+        // here so recovery remains available after execution readiness is lost.
+        snapshot.control_plane_admission.admit(operation)?;
+        if matches!(
+            operation,
+            ControlPlaneOperation::Run | ControlPlaneOperation::Steer
+        ) {
+            supported_execution_version(&snapshot)?;
+        }
+        Ok(())
     }
 
     fn requires_upstream_thread_for_follow_up(&self) -> bool {
@@ -1296,6 +1313,61 @@ fn adapter_failure(reason: &'static str) -> SatelleError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn control_plane_failure_precedes_execution_readiness_for_run_and_steer() {
+        let evidence = crate::codex_capabilities::Phase0CapabilityEvidence {
+            codex_version: crate::codex_capabilities::CodexVersionEvidence::Detected {
+                version: crate::codex_capabilities::REQUIRED_CODEX_VERSION,
+            },
+            host_platform: crate::codex_capabilities::HostPlatform::Windows,
+            capabilities: crate::codex_capabilities::CapabilityMatrix::unproven(),
+        };
+        let snapshot = Arc::new(RwLock::new(crate::ProductionCapabilitySnapshot {
+            evidence,
+            verdict: crate::evaluate_phase0_support(evidence),
+            control_plane_admission: crate::codex_capabilities::ControlPlaneAdmission::unavailable(
+                satelle_core::ControlPlaneFailureReason::HandshakeUnavailable,
+            ),
+            started_at: "2026-07-17T00:00:00Z".to_string(),
+            finished_at: "2026-07-17T00:00:01Z".to_string(),
+            duration_ms: 1_000,
+        }));
+        let adapter = ProductionComputerUseAdapter::new(
+            Arc::clone(&snapshot),
+            Ok(tempfile::tempdir().unwrap().path().join("codex-work")),
+        );
+
+        for operation in [ControlPlaneOperation::Run, ControlPlaneOperation::Steer] {
+            let error = adapter
+                .admit_operation(operation)
+                .expect_err("control-plane admission must precede native readiness");
+            assert_eq!(error.code, ErrorCode::IncompatibleControlPlane);
+            assert_eq!(error.details["operation"], operation.as_str());
+        }
+        for operation in [ControlPlaneOperation::Stop, ControlPlaneOperation::Status] {
+            let error = adapter
+                .admit_operation(operation)
+                .expect_err("recovery operations must retain control-plane admission");
+            assert_eq!(error.code, ErrorCode::IncompatibleControlPlane);
+            assert_eq!(error.details["operation"], operation.as_str());
+        }
+
+        snapshot.write().unwrap().control_plane_admission =
+            crate::codex_capabilities::ControlPlaneAdmission::not_applicable();
+        for operation in [ControlPlaneOperation::Run, ControlPlaneOperation::Steer] {
+            let error = adapter
+                .admit_operation(operation)
+                .expect_err("execution readiness must still gate run and steer");
+            assert_eq!(error.code, ErrorCode::ComputerUseNotReady);
+            assert!(error.details.is_empty());
+        }
+        for operation in [ControlPlaneOperation::Stop, ControlPlaneOperation::Status] {
+            adapter
+                .admit_operation(operation)
+                .expect("recovery operations must remain available without execution readiness");
+        }
+    }
 
     #[test]
     fn every_supported_policy_has_one_exact_protocol_mapping() {

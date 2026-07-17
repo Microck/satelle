@@ -15,9 +15,15 @@ use thiserror::Error;
 use time::OffsetDateTime;
 use zeroize::Zeroizing;
 
+#[cfg(any(test, feature = "test-support"))]
+use crate::EphemeralApiAuthenticator;
+#[cfg(any(test, feature = "test-support"))]
+use std::sync::Arc;
+
 const MAX_IDEMPOTENCY_KEY_BYTES: usize = 256;
 const TURN_IDEMPOTENCY_DIGEST_SCHEMA_VERSION: u16 = 3;
 const STOP_IDEMPOTENCY_DIGEST_SCHEMA_VERSION: u16 = 1;
+const DURABLE_SETUP_PRINCIPAL_PREFIX: &str = "controller-setup";
 
 /// A diagnostic-safe snapshot captured from the daemon-owned runtime after
 /// storage has opened and restart recovery has been reconciled.
@@ -102,6 +108,14 @@ impl MutationAuthority {
             principal,
             idempotency_key,
         })
+    }
+
+    pub fn principal(&self) -> &ApiPrincipal {
+        &self.principal
+    }
+
+    pub fn idempotency_key(&self) -> &str {
+        &self.idempotency_key
     }
 }
 
@@ -413,6 +427,24 @@ impl HostService {
             .authenticate_api_token(token, OffsetDateTime::now_utc())
     }
 
+    /// Authenticates an unexpired pending setup token for its one narrow
+    /// recovery operation. The transport must additionally bind the principal
+    /// to activation of the same token ID.
+    pub fn authenticate_pending_setup_api_token(
+        &self,
+        token: &ApiBearerToken,
+    ) -> Result<Option<ApiPrincipal>, SatelleError> {
+        if self
+            .bootstrap_auth
+            .as_ref()
+            .is_some_and(|authenticator| authenticator.owns_token_id(token.token_id()))
+        {
+            return Ok(None);
+        }
+        self.runtime
+            .authenticate_pending_setup_api_token(token, OffsetDateTime::now_utc())
+    }
+
     pub fn api_principal_is_active(&self, principal: &ApiPrincipal) -> Result<bool, SatelleError> {
         if let Some(authenticator) = self
             .bootstrap_auth
@@ -442,6 +474,64 @@ impl HostService {
             "API token rotated"
         );
         Ok(principal)
+    }
+
+    /// Generates a durable credential in a short-lived pending state. The raw
+    /// token leaves the Host exactly once in the setup response; activation is
+    /// a separate transaction after the Controller has synced its token file.
+    pub fn issue_pending_api_token(
+        &self,
+        scopes: ApiScopes,
+        pending_until: OffsetDateTime,
+    ) -> Result<(ApiBearerToken, ApiPrincipal), SatelleError> {
+        self.operation_capacity.execute_exclusive(|| {
+            let token = ApiBearerToken::generate().map_err(|_| authentication_state_failure())?;
+            // The non-secret token ID gives each durable Controller credential a
+            // stable identity across restarts without deriving identity from the
+            // bearer secret. Limits and idempotency remain isolated per issuance.
+            let principal_ref = format!("{DURABLE_SETUP_PRINCIPAL_PREFIX}-{}", token.token_id());
+            let now = OffsetDateTime::now_utc();
+            let registration = ApiTokenRegistration::new_setup_pending(
+                &token,
+                principal_ref,
+                1,
+                scopes,
+                pending_until,
+                now,
+            )
+            .map_err(crate::runtime::storage_error)?;
+            let principal = registration.principal();
+            self.runtime.register_api_token(registration)?;
+            Ok((token, principal))
+        })
+    }
+
+    pub fn activate_api_token(&self, token_id: &str) -> Result<ApiPrincipal, SatelleError> {
+        self.operation_capacity.execute_exclusive(|| {
+            let principal = self
+                .runtime
+                .activate_api_token(token_id, OffsetDateTime::now_utc())?;
+            tracing::info!(
+                target: "satelle::host::api_token",
+                token_id = principal.token_id(),
+                credential_revision = principal.credential_revision(),
+                "pending API token activated"
+            );
+            Ok(principal)
+        })
+    }
+
+    pub fn abort_setup_api_token(&self, token_id: &str) -> Result<(), SatelleError> {
+        self.operation_capacity.execute_exclusive(|| {
+            self.runtime
+                .abort_setup_api_token(token_id, OffsetDateTime::now_utc())?;
+            tracing::info!(
+                target: "satelle::host::api_token",
+                token_id,
+                "setup-issued API token revoked"
+            );
+            Ok(())
+        })
     }
 
     pub fn revoke_api_token(&self, token_id: &str) -> Result<(), SatelleError> {
@@ -680,6 +770,20 @@ impl HostService {
     }
 
     #[doc(hidden)]
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn with_ssh_bootstrap_auth_for_tests(
+        mut self,
+        token: &ApiBearerToken,
+        scopes: ApiScopes,
+        expires_at: OffsetDateTime,
+    ) -> Self {
+        self.bootstrap_auth = Some(Arc::new(EphemeralApiAuthenticator::new(
+            token, scopes, expires_at,
+        )));
+        self
+    }
+
+    #[doc(hidden)]
     #[cfg(feature = "test-support")]
     pub fn with_adapter_for_tests_at<A: crate::ComputerUseAdapter>(
         state_root: impl Into<std::path::PathBuf>,
@@ -909,6 +1013,71 @@ mod tests {
                 .authenticate_api_token(&token)
                 .expect("check token in later daemon")
                 .is_none()
+        );
+    }
+
+    #[test]
+    fn pending_setup_token_survives_restart_only_after_activation() {
+        let state = crate::TestStateDir::new().expect("temporary state directory");
+        let service = HostService::local_demo_for_tests_at(state.path())
+            .expect("construct deterministic service");
+        service.initialize_daemon().expect("initialize daemon");
+        let (token, pending) = service
+            .issue_pending_api_token(
+                ApiScopes::CONTROL,
+                OffsetDateTime::now_utc() + time::Duration::minutes(5),
+            )
+            .expect("issue pending setup token");
+        let (other_token, other_pending) = service
+            .issue_pending_api_token(
+                ApiScopes::CONTROL,
+                OffsetDateTime::now_utc() + time::Duration::minutes(5),
+            )
+            .expect("issue an independent pending setup token");
+        assert_eq!(
+            pending.principal_ref(),
+            format!("controller-setup-{}", token.token_id())
+        );
+        assert_ne!(pending.principal_ref(), other_pending.principal_ref());
+        service
+            .abort_setup_api_token(other_token.token_id())
+            .expect("discard the independent pending token");
+        assert!(pending.expires_at().is_some());
+        assert!(
+            service
+                .authenticate_api_token(&token)
+                .expect("check pending setup token")
+                .is_none()
+        );
+        drop(service);
+
+        let restarted_pending = HostService::local_demo_for_tests_at(state.path())
+            .expect("construct restarted pending service");
+        restarted_pending
+            .initialize_daemon()
+            .expect("restart pending daemon");
+        assert!(
+            restarted_pending
+                .authenticate_api_token(&token)
+                .expect("check pending setup token after restart")
+                .is_none()
+        );
+        let active = restarted_pending
+            .activate_api_token(token.token_id())
+            .expect("activate setup token");
+        assert_eq!(active.expires_at(), None);
+        drop(restarted_pending);
+
+        let restarted = HostService::local_demo_for_tests_at(state.path())
+            .expect("construct restarted service");
+        restarted.initialize_daemon().expect("restart daemon");
+        assert_eq!(
+            restarted
+                .authenticate_api_token(&token)
+                .expect("authenticate after restart")
+                .expect("activated token remains valid")
+                .expires_at(),
+            None
         );
     }
 

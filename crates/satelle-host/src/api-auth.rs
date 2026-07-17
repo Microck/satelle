@@ -224,6 +224,9 @@ pub struct ApiPrincipal {
     pub(crate) credential_revision: u64,
     pub(crate) scopes: ApiScopes,
     pub(crate) expires_at: Option<OffsetDateTime>,
+    pub(crate) process_local_ssh_bootstrap: bool,
+    pub(crate) durable_setup_pending: bool,
+    pub(crate) durable_setup_active: bool,
 }
 
 /// Process-local authentication for the one token that starts an on-demand
@@ -249,6 +252,9 @@ impl EphemeralApiAuthenticator {
                 credential_revision: 1,
                 scopes,
                 expires_at: Some(expires_at),
+                process_local_ssh_bootstrap: true,
+                durable_setup_pending: false,
+                durable_setup_active: false,
             },
             revoked: AtomicBool::new(false),
         }
@@ -281,7 +287,8 @@ impl EphemeralApiAuthenticator {
     }
 
     pub(crate) fn owns_principal(&self, principal: &ApiPrincipal) -> bool {
-        principal.token_id == self.principal.token_id
+        principal.process_local_ssh_bootstrap
+            && principal.token_id == self.principal.token_id
             && principal.principal_ref == self.principal.principal_ref
             && principal.credential_revision == self.principal.credential_revision
     }
@@ -320,6 +327,22 @@ impl ApiPrincipal {
 
     pub const fn expires_at(&self) -> Option<OffsetDateTime> {
         self.expires_at
+    }
+
+    pub fn is_ssh_bootstrap(&self) -> bool {
+        self.process_local_ssh_bootstrap
+    }
+
+    /// Confirms that this principal was loaded from the canonical activated
+    /// setup-credential state, rather than inferred from its name or scopes.
+    pub const fn is_durable_setup_active(&self) -> bool {
+        self.durable_setup_active
+    }
+
+    /// Identifies a verified, unexpired setup credential that may authorize
+    /// only activation of its own token ID during interrupted handoff recovery.
+    pub const fn is_durable_setup_pending(&self) -> bool {
+        self.durable_setup_pending
     }
 }
 
@@ -382,11 +405,28 @@ mod tests {
         let principal = authenticator
             .authenticate(&token, OffsetDateTime::UNIX_EPOCH)
             .expect("bootstrap token authenticates before expiry");
+        assert!(principal.is_ssh_bootstrap());
         assert!(principal.scopes().allows(ApiScopes::READ));
         assert!(principal.scopes().allows(ApiScopes::CONTROL));
         assert!(authenticator.is_active(&principal, expires_at - time::Duration::SECOND));
         assert!(authenticator.authenticate(&token, expires_at).is_none());
         assert!(!authenticator.is_active(&principal, expires_at));
+    }
+
+    #[test]
+    fn durable_principal_fields_cannot_forge_bootstrap_provenance() {
+        let principal = ApiPrincipal {
+            token_id: TOKEN_ID.to_string(),
+            principal_ref: "ssh-bootstrap".to_string(),
+            credential_revision: 1,
+            scopes: ApiScopes::ADMIN,
+            expires_at: Some(OffsetDateTime::UNIX_EPOCH + time::Duration::minutes(15)),
+            process_local_ssh_bootstrap: false,
+            durable_setup_pending: false,
+            durable_setup_active: false,
+        };
+
+        assert!(!principal.is_ssh_bootstrap());
     }
 
     #[test]

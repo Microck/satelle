@@ -38,7 +38,7 @@ pub(super) const PROTECTED_FILE_NAMES: [&str; 5] = [
 ];
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 const BACKUP_FORMAT_VERSION: u32 = 1;
-const MIGRATIONS: [Migration; 7] = [
+const MIGRATIONS: [Migration; 8] = [
     Migration {
         version: 1,
         sql: include_str!("0001_initial.sql"),
@@ -78,6 +78,12 @@ const MIGRATIONS: [Migration; 7] = [
     Migration {
         version: 7,
         sql: include_str!("0007_setup_action_ledger.sql"),
+        seeds_sensitive_state: false,
+        irreversible: false,
+    },
+    Migration {
+        version: 8,
+        sql: include_str!("0008_api_token_state.sql"),
         seeds_sensitive_state: false,
         irreversible: false,
     },
@@ -570,7 +576,11 @@ fn apply_migrations(
     // current stores are verified once after this no-op migration pass.
     if !applied.is_empty() && applied.len() < MIGRATIONS.len() {
         verify_integrity(connection)?;
-        super::auth::validate_sensitive_state(connection)?;
+        if expected_user_version < 8 {
+            super::auth::validate_sensitive_state_before_token_state_migration(connection)?;
+        } else {
+            super::auth::validate_sensitive_state(connection)?;
+        }
     }
 
     if !applied.is_empty()
@@ -683,8 +693,23 @@ fn create_migration_backup(
     #[cfg(windows)]
     let mut destination = Connection::open_with_flags(&backup_path, flags)
         .map_err(|source| sqlite_error(StorageErrorKind::MigrationFailed, source))?;
+    // The destination is a new one-shot backup file. On macOS, disabling its
+    // rollback journal avoids dynamic sidecar names that cannot be represented
+    // by the descriptor-anchored VFS. Other platforms retain SQLite's normal
+    // backup behavior.
+    #[cfg(target_os = "macos")]
+    destination
+        .pragma_update(None, "journal_mode", "OFF")
+        .map_err(|source| sqlite_error(StorageErrorKind::MigrationFailed, source))?;
     Backup::new(source, &mut destination)
         .and_then(|backup| backup.run_to_completion(128, Duration::from_millis(5), None))
+        .map_err(|source| sqlite_error(StorageErrorKind::MigrationFailed, source))?;
+    #[cfg(target_os = "macos")]
+    // Backup copies the source database header, including its persisted WAL
+    // mode. Normalize the completed standalone copy again before reopening it
+    // without the source store's WAL and shared-memory sidecars.
+    destination
+        .pragma_update(None, "journal_mode", "OFF")
         .map_err(|source| sqlite_error(StorageErrorKind::MigrationFailed, source))?;
     drop(destination);
 

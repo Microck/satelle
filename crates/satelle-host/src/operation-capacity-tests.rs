@@ -50,6 +50,43 @@ fn one_host_global_slot_is_shared_by_clones_and_principals() {
 }
 
 #[test]
+fn setup_token_issuance_shares_the_host_global_slot() {
+    let state = crate::TestStateDir::new().expect("temporary state directory");
+    let adapter = ControlledAdapter::default();
+    adapter.block_next_preflight();
+    let service = service(state.path(), adapter.clone());
+    let authority = authority(&service, "principal-running", "running-operation");
+
+    let operation_service = service.clone();
+    let operation = std::thread::spawn(move || {
+        operation_service.admit_run(&intent("occupy setup capacity"), &authority)
+    });
+    assert!(
+        adapter.preflight_started.wait_for(WAIT_LIMIT),
+        "the run must occupy Host capacity before setup issuance"
+    );
+
+    let error = match service.issue_pending_api_token(
+        ApiScopes::CONTROL,
+        time::OffsetDateTime::now_utc() + time::Duration::minutes(5),
+    ) {
+        Ok(_) => panic!("setup issuance must share the occupied Host-global slot"),
+        Err(error) => error,
+    };
+    assert_capacity_exceeded(&error);
+
+    adapter.preflight_release.signal();
+    operation
+        .join()
+        .expect("run thread must not panic")
+        .expect("run admission must finish");
+    service
+        .runtime
+        .wait_for_background()
+        .expect("run execution must finish");
+}
+
+#[test]
 fn daemon_activity_snapshot_tracks_live_host_operations() {
     let state = crate::TestStateDir::new().expect("temporary state directory");
     let adapter = ControlledAdapter::default();

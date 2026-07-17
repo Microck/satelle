@@ -1270,6 +1270,17 @@ impl RuntimeHandle {
             .map_err(model::storage_failure)
     }
 
+    pub(crate) fn authenticate_pending_setup_api_token(
+        &self,
+        token: &ApiBearerToken,
+        at: time::OffsetDateTime,
+    ) -> Result<Option<ApiPrincipal>, SatelleError> {
+        self.engine()?
+            .lock_storage()?
+            .authenticate_pending_setup_api_token(token, at)
+            .map_err(model::storage_failure)
+    }
+
     pub(crate) fn api_principal_is_active(
         &self,
         principal: &ApiPrincipal,
@@ -1290,6 +1301,28 @@ impl RuntimeHandle {
         self.engine()?
             .lock_storage()?
             .rotate_api_token(replacement, expected_credential_revision, at)
+            .map_err(model::storage_failure)
+    }
+
+    pub(crate) fn activate_api_token(
+        &self,
+        token_id: &str,
+        at: time::OffsetDateTime,
+    ) -> Result<ApiPrincipal, SatelleError> {
+        self.engine()?
+            .lock_storage()?
+            .activate_api_token(token_id, at)
+            .map_err(model::storage_failure)
+    }
+
+    pub(crate) fn abort_setup_api_token(
+        &self,
+        token_id: &str,
+        at: time::OffsetDateTime,
+    ) -> Result<(), SatelleError> {
+        self.engine()?
+            .lock_storage()?
+            .abort_setup_api_token(token_id, at)
             .map_err(model::storage_failure)
     }
 

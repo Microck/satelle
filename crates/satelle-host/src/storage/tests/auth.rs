@@ -212,6 +212,240 @@ fn token_rotation_is_atomic_and_invalidates_the_previous_secret() {
 }
 
 #[test]
+fn pending_token_activation_atomically_removes_its_expiry() {
+    let state = TempDir::new().expect("temporary state directory");
+    let pending = token(TOKEN_ID, 0x2a);
+    let (mut storage, _) = Storage::open(state.path()).expect("open storage");
+    storage
+        .register_api_token(
+            ApiTokenRegistration::new_setup_pending(
+                &pending,
+                PRINCIPAL_ID,
+                1,
+                ApiScopes::CONTROL,
+                at(10),
+                at(1),
+            )
+            .expect("valid pending registration"),
+        )
+        .expect("register pending token");
+    assert!(
+        storage
+            .authenticate_api_token(&pending, at(2))
+            .expect("check pending token")
+            .is_none()
+    );
+    let recovery_principal = storage
+        .authenticate_pending_setup_api_token(&pending, at(2))
+        .expect("authenticate pending token for exact recovery")
+        .expect("unexpired pending token has recovery authority");
+    assert!(recovery_principal.is_durable_setup_pending());
+    assert!(!recovery_principal.is_durable_setup_active());
+
+    let activated = storage
+        .activate_api_token(TOKEN_ID, at(2))
+        .expect("activate pending token");
+    assert_eq!(activated.expires_at(), None);
+    assert_eq!(activated.credential_revision(), 1);
+    assert!(
+        storage
+            .authenticate_pending_setup_api_token(&pending, at(3))
+            .expect("check consumed pending authority")
+            .is_none()
+    );
+    assert_eq!(
+        storage
+            .authenticate_api_token(&pending, at(20))
+            .expect("authenticate activated token")
+            .expect("activated token remains valid")
+            .expires_at(),
+        None
+    );
+    let retried_activation = storage
+        .activate_api_token(TOKEN_ID, at(3))
+        .expect("activation retry returns the committed principal");
+    assert_eq!(retried_activation.token_id(), TOKEN_ID);
+    assert_eq!(retried_activation.expires_at(), None);
+    storage
+        .abort_setup_api_token(TOKEN_ID, at(4))
+        .expect("activated setup token remains abortable during handoff recovery");
+    storage
+        .abort_setup_api_token(TOKEN_ID, at(5))
+        .expect("abort retry confirms the setup token remains inactive");
+    assert!(
+        storage
+            .authenticate_api_token(&pending, at(4))
+            .expect("check aborted setup token")
+            .is_none()
+    );
+}
+
+#[test]
+fn pending_token_activation_compares_fractional_expiry_as_time() {
+    let state = TempDir::new().expect("temporary state directory");
+    let pending = token(TOKEN_ID, 0x2a);
+    let (mut storage, _) = Storage::open(state.path()).expect("open storage");
+    let activation = at(2) + time::Duration::milliseconds(100);
+    let expiry = at(2) + time::Duration::milliseconds(120);
+    storage
+        .register_api_token(
+            ApiTokenRegistration::new_setup_pending(
+                &pending,
+                PRINCIPAL_ID,
+                1,
+                ApiScopes::CONTROL,
+                expiry,
+                at(1),
+            )
+            .expect("valid pending registration"),
+        )
+        .expect("register pending token");
+
+    storage
+        .activate_api_token(TOKEN_ID, activation)
+        .expect("fractionally unexpired pending token activates");
+    assert!(
+        storage
+            .authenticate_api_token(&pending, at(3))
+            .expect("authenticate activated token")
+            .is_some()
+    );
+}
+
+#[test]
+fn setup_token_lifecycle_rejects_timestamps_before_creation() {
+    let state = TempDir::new().expect("temporary state directory");
+    let pending = token(TOKEN_ID, 0x2a);
+    let (mut storage, _) = Storage::open(state.path()).expect("open storage");
+    storage
+        .register_api_token(
+            ApiTokenRegistration::new_setup_pending(
+                &pending,
+                PRINCIPAL_ID,
+                1,
+                ApiScopes::CONTROL,
+                at(10),
+                at(5),
+            )
+            .expect("valid pending registration"),
+        )
+        .expect("register pending token");
+
+    assert_eq!(
+        storage
+            .activate_api_token(TOKEN_ID, at(4))
+            .expect_err("activation cannot predate token creation")
+            .kind(),
+        StorageErrorKind::StateConflict
+    );
+    assert_eq!(
+        storage
+            .abort_setup_api_token(TOKEN_ID, at(4))
+            .expect_err("revocation cannot predate token creation")
+            .kind(),
+        StorageErrorKind::StateConflict
+    );
+    assert!(
+        storage
+            .authenticate_api_token(&pending, at(6))
+            .expect("check pending token")
+            .is_none()
+    );
+    storage
+        .activate_api_token(TOKEN_ID, at(6))
+        .expect("a later valid activation still succeeds");
+    assert!(
+        storage
+            .authenticate_api_token(&pending, at(7))
+            .expect("authenticate activated token")
+            .is_some()
+    );
+}
+
+#[test]
+fn expired_pending_token_cannot_be_activated() {
+    let state = TempDir::new().expect("temporary state directory");
+    let pending = token(TOKEN_ID, 0x2a);
+    let (mut storage, _) = Storage::open(state.path()).expect("open storage");
+    storage
+        .register_api_token(
+            ApiTokenRegistration::new_setup_pending(
+                &pending,
+                PRINCIPAL_ID,
+                1,
+                ApiScopes::CONTROL,
+                at(3),
+                at(1),
+            )
+            .expect("valid pending registration"),
+        )
+        .expect("register pending token");
+
+    assert_eq!(
+        storage
+            .activate_api_token(TOKEN_ID, at(3))
+            .expect_err("expired pending token must stay expired")
+            .kind(),
+        StorageErrorKind::StateConflict
+    );
+    assert!(
+        storage
+            .authenticate_api_token(&pending, at(3))
+            .expect("expired pending token remains unusable")
+            .is_none()
+    );
+    assert!(
+        storage
+            .authenticate_pending_setup_api_token(&pending, at(3))
+            .expect("expired pending recovery lookup")
+            .is_none()
+    );
+}
+
+#[test]
+fn ordinary_expiring_token_cannot_enter_the_setup_activation_path() {
+    let state = TempDir::new().expect("temporary state directory");
+    let expiring = token(TOKEN_ID, 0x2a);
+    let (mut storage, _) = Storage::open(state.path()).expect("open storage");
+    storage
+        .register_api_token(
+            ApiTokenRegistration::new(
+                &expiring,
+                PRINCIPAL_ID,
+                1,
+                ApiScopes::CONTROL,
+                Some(at(10)),
+                at(1),
+            )
+            .expect("valid expiring registration"),
+        )
+        .expect("register ordinary expiring token");
+
+    assert_eq!(
+        storage
+            .activate_api_token(TOKEN_ID, at(2))
+            .expect_err("ordinary credentials are not setup-pending")
+            .kind(),
+        StorageErrorKind::StateConflict
+    );
+    assert_eq!(
+        storage
+            .authenticate_api_token(&expiring, at(2))
+            .expect("ordinary expiring token authenticates")
+            .expect("ordinary expiring token remains active")
+            .expires_at(),
+        Some(at(10))
+    );
+    assert_eq!(
+        storage
+            .abort_setup_api_token(TOKEN_ID, at(2))
+            .expect_err("ordinary credentials are not setup-issued")
+            .kind(),
+        StorageErrorKind::InvalidInput
+    );
+}
+
+#[test]
 fn expired_revoked_and_unknown_tokens_share_the_absent_result() {
     let state = TempDir::new().expect("temporary state directory");
     let registered = token(TOKEN_ID, 0x2a);
