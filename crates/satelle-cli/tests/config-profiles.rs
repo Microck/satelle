@@ -1,4 +1,5 @@
 use predicates::prelude::*;
+use std::fs;
 
 #[path = "support/config-fixture.rs"]
 mod config_fixture;
@@ -254,6 +255,94 @@ profile = "project-profile"
     assert_eq!(flag["selected_profile"], "flag-profile");
     assert_eq!(flag["selected_host"], "flag-host");
     assert_eq!(flag["sources"]["profile"], "cli_flag");
+}
+
+#[test]
+fn config_check_context_selectors_do_not_change_stored_defaults() {
+    let fixture = ConfigFixture::new(
+        r#"
+default_host = "default-host"
+profile = "default-profile"
+
+[hosts.default-host]
+transport = "local"
+adapter = "fake"
+
+[hosts.profile-host]
+transport = "local"
+adapter = "fake"
+
+[hosts.flag-host]
+transport = "local"
+adapter = "fake"
+
+[profiles.default-profile]
+host = "default-host"
+
+[profiles.work]
+host = "profile-host"
+"#,
+        "",
+    );
+    let user_config_before = fs::read(fixture.user_config_path())
+        .expect("user config should be readable before config check");
+    let project_config_path = fixture.resolved_project_config();
+    let project_config_before = fs::read(&project_config_path)
+        .expect("project config should be readable before config check");
+
+    let selected = fixture
+        .command()
+        .args([
+            "config",
+            "check",
+            "--host",
+            "flag-host",
+            "--profile",
+            "work",
+            "--json",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .clone();
+    let selected = parse_json(&selected.stdout);
+    assert_eq!(selected["selected_host"], "flag-host");
+    assert_eq!(selected["selected_profile"], "work");
+    assert_eq!(selected["checked_contexts"][0]["source"], "cli_flag");
+
+    let profile_only = fixture
+        .command()
+        .args(["config", "check", "--profile", "work", "--json"])
+        .assert()
+        .success()
+        .get_output()
+        .clone();
+    let profile_only = parse_json(&profile_only.stdout);
+    assert_eq!(profile_only["selected_host"], "profile-host");
+    assert_eq!(profile_only["selected_profile"], "work");
+
+    let defaults = fixture
+        .command()
+        .args(["config", "check", "--json"])
+        .assert()
+        .success()
+        .get_output()
+        .clone();
+    let defaults = parse_json(&defaults.stdout);
+    assert_eq!(defaults["selected_host"], "default-host");
+    assert_eq!(defaults["selected_profile"], "default-profile");
+    assert_eq!(defaults["checked_contexts"][0]["source"], "user_config");
+
+    assert_eq!(
+        fs::read(fixture.user_config_path())
+            .expect("user config should be readable after config check"),
+        user_config_before
+    );
+    assert_eq!(
+        fs::read(project_config_path)
+            .expect("project config should be readable after config check"),
+        project_config_before
+    );
 }
 
 #[test]

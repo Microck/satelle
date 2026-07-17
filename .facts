@@ -1015,7 +1015,7 @@
 - satelle config check reports remote-dependent validation such as remote-host owned provider bindings, host reachability, Host Daemon health, Codex availability, native Computer Use readiness, and provider Computer Use compatibility as not_checked instead of pass or fail @implemented @mvp
 - satelle config check exits 0 only when every locally decidable configuration check passes @implemented @mvp
 - satelle config check exits with the configuration error class when any locally decidable configuration check fails @implemented @mvp
-- satelle config check supports --host and --profile as context selectors without changing stored defaults @spec @mvp
+- satelle config check supports --host and --profile as context selectors without changing stored defaults @mvp @implemented
 - satelle config check human output may include suggested recovery commands and minimal config snippets, but labels them as suggestions that were not applied @spec @mvp
 - satelle config check --json emits one final JSON object with schema_version, status, mode, checked_files, checked_contexts, selected_host, selected_profile, checks, errors, not_checked, and recovery_commands fields @implemented @mvp
 - satelle config check --json checked_contexts entries include host, profile, source, status, checks, errors, and not_checked fields @implemented @mvp
