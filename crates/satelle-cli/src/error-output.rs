@@ -210,7 +210,90 @@ fn error_class(code: ErrorCode) -> (ErrorCategory, bool) {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+
+    use serde_json::json;
+
     use super::*;
+
+    #[test]
+    fn configured_error_format_precedes_machine_detection() {
+        assert_eq!(
+            ErrorFormat::resolve(Some(ErrorFormat::Human), true),
+            ErrorFormat::Human
+        );
+        assert_eq!(
+            ErrorFormat::resolve(Some(ErrorFormat::Json), false),
+            ErrorFormat::Json
+        );
+        assert_eq!(ErrorFormat::resolve(None, true), ErrorFormat::Json);
+        assert_eq!(ErrorFormat::resolve(None, false), ErrorFormat::Human);
+    }
+
+    #[test]
+    fn error_envelope_has_a_closed_shape_and_canonical_empty_values() {
+        let error = SatelleError {
+            code: ErrorCode::InvalidUsage,
+            message: "the command could not be parsed".to_string(),
+            recovery_command: None,
+            source_detail: Some("private parser implementation detail".to_string()),
+            details: BTreeMap::new(),
+        };
+
+        assert_eq!(
+            error_envelope(&error),
+            json!({
+                "schema_version": "satelle.error.v1",
+                "code": "invalid-usage",
+                "category": "invalid_request",
+                "retryable": false,
+                "message": "the command could not be parsed",
+                "details": null,
+                "docs_url": null,
+                "suggested_commands": [],
+            })
+        );
+    }
+
+    #[test]
+    fn error_envelope_exposes_actionable_details_but_not_diagnostics() {
+        let error = SatelleError {
+            code: ErrorCode::HostUnreachable,
+            message: "host 'remote' is unreachable".to_string(),
+            recovery_command: Some("satelle doctor --scope transport --json".to_string()),
+            source_detail: Some("tcp connect failed at private socket address".to_string()),
+            details: BTreeMap::from([("host".to_string(), json!("remote"))]),
+        };
+
+        let envelope = error_envelope(&error);
+        assert_eq!(envelope["details"], json!({"host": "remote"}));
+        assert_eq!(
+            envelope["suggested_commands"],
+            json!(["satelle doctor --scope transport --json"])
+        );
+        assert_eq!(envelope["category"], "remote_execution");
+        assert_eq!(envelope["retryable"], true);
+        assert!(envelope.get("source_detail").is_none());
+    }
+
+    #[test]
+    fn automation_fields_do_not_depend_on_human_copy() {
+        let first = SatelleError::invalid_usage("first human explanation");
+        let second = SatelleError::invalid_usage("clearer replacement explanation");
+        let first = error_envelope(&first);
+        let second = error_envelope(&second);
+
+        for field in [
+            "schema_version",
+            "code",
+            "category",
+            "retryable",
+            "suggested_commands",
+        ] {
+            assert_eq!(first[field], second[field], "unstable {field}");
+        }
+        assert_ne!(first["message"], second["message"]);
+    }
 
     #[test]
     fn provider_smoke_timeout_is_retryable_readiness_failure() {

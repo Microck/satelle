@@ -82,6 +82,26 @@ fn explicit_error_format_has_precedence_over_environment_and_result_selectors() 
 }
 
 #[test]
+fn environment_error_format_has_precedence_over_result_selectors() {
+    for args in [
+        vec!["paths", "--json", "--unknown-option"],
+        vec!["run", "--events", "json", "--unknown-option"],
+        vec!["doctor", "--events", "--unknown-option"],
+    ] {
+        let output = satelle()
+            .env(ERROR_FORMAT_ENV, "human")
+            .args(args)
+            .assert()
+            .failure()
+            .get_output()
+            .clone();
+
+        assert_error_process(&output);
+        assert_human_error(&output.stderr, "invalid-usage");
+    }
+}
+
+#[test]
 fn parsed_machine_selectors_choose_json_for_later_parser_failures() {
     for args in [
         vec!["paths", "--json", "--unknown-option"],
@@ -107,6 +127,34 @@ fn unparsed_and_positional_machine_selectors_do_not_choose_json() {
         assert!(output.stdout.is_empty());
         assert_human_error(&output.stderr, "invalid-usage");
     }
+}
+
+#[test]
+fn explicit_and_environment_formats_survive_unrecognized_result_selectors() {
+    let explicit = satelle()
+        .args([
+            "--error-format",
+            "json",
+            "paths",
+            "--unknown-option",
+            "--json",
+        ])
+        .assert()
+        .failure()
+        .get_output()
+        .clone();
+    assert_error_process(&explicit);
+    assert_json_error(&explicit.stderr, "invalid-usage", &["satelle --help"]);
+
+    let environment = satelle()
+        .env(ERROR_FORMAT_ENV, "json")
+        .args(["paths", "--unknown-option", "--json"])
+        .assert()
+        .failure()
+        .get_output()
+        .clone();
+    assert_error_process(&environment);
+    assert_json_error(&environment.stderr, "invalid-usage", &["satelle --help"]);
 }
 
 fn usage_failure(args: &[&str]) -> std::process::Output {
