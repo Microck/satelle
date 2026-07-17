@@ -52,6 +52,9 @@ jobs:
         if: runner.os == 'Linux'
         run: facts check --tags facts-policy
 
+      - name: Check release metadata
+        run: npm run release:check
+
       - name: Check npm distribution
         env:
           SATELLE_REQUIRED_PACKAGE_MANAGERS: npm,pnpm,bun

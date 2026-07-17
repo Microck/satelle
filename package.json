@@ -9,9 +9,10 @@
     "node": ">=20.9.0"
   },
   "scripts": {
-    "check:npm": "node --test npm/test/npm-distribution.test.cjs npm/test/package-managers.test.cjs",
+    "check:npm": "node --test npm/test/npm-distribution.test.cjs npm/test/package-managers.test.cjs npm/test/release-infrastructure.test.cjs",
     "docs:build": "npm run build --workspace website",
     "docs:dev": "npm run dev --workspace website",
+    "release:check": "node npm/scripts/release.cjs check",
     "test": "npm run check:npm",
     "test:npm": "npm run check:npm"
   }
