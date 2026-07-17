@@ -17,6 +17,15 @@ pub enum SecureFileError {
     NotUtf8,
 }
 
+#[cfg(not(windows))]
+pub type OwnerOnlyDirectory = File;
+
+#[cfg(windows)]
+pub struct OwnerOnlyDirectory {
+    _directory: File,
+    _ancestors: Vec<File>,
+}
+
 #[derive(Clone, Copy, Eq, PartialEq)]
 enum SecurityPolicy {
     OwnerOnly,
@@ -100,42 +109,267 @@ pub fn open_or_create_owner_only_file(path: &Path) -> Result<File, SecureFileErr
     Ok(File::from(descriptor))
 }
 
-/// Opens or creates an owner-only directory. Keeping the returned handle alive
-/// pins the directory against replacement on platforms that support that
-/// guarantee.
+/// Opens or creates an owner-only directory. Unix walks every absolute path
+/// component without following symlinks and rejects ancestry that permits
+/// unrelated replacement. Keeping the returned handle alive also pins the
+/// directory against replacement on platforms that support that guarantee.
 #[cfg(unix)]
-pub fn open_or_create_owner_only_directory(path: &Path) -> Result<File, SecureFileError> {
-    use rustix::fs::{FileType, Mode, OFlags};
-    use std::os::unix::fs::DirBuilderExt;
+pub fn open_or_create_owner_only_directory(
+    path: &Path,
+) -> Result<OwnerOnlyDirectory, SecureFileError> {
+    open_owner_only_directory_impl(path, true)
+}
 
-    let mut builder = std::fs::DirBuilder::new();
-    builder.mode(0o700);
-    require_macos_parent_without_extended_acl(path)?;
-    let created = match builder.create(path) {
-        Ok(()) => true,
-        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => false,
-        Err(_) => return Err(SecureFileError::UnsafeOrUnavailable),
-    };
-    let descriptor = rustix::fs::open(
-        path,
-        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-        Mode::empty(),
-    )
-    .map_err(|_| SecureFileError::UnsafeOrUnavailable)?;
+/// Opens an existing owner-only directory with the same ancestry guarantees as
+/// `open_or_create_owner_only_directory`, but never creates a missing path.
+#[cfg(unix)]
+pub fn open_owner_only_directory(path: &Path) -> Result<OwnerOnlyDirectory, SecureFileError> {
+    open_owner_only_directory_impl(path, false)
+}
+
+#[cfg(unix)]
+fn open_owner_only_directory_impl(
+    path: &Path,
+    create_if_missing: bool,
+) -> Result<File, SecureFileError> {
+    use rustix::fs::{AtFlags, FileType, Mode};
+    use std::path::Component;
+
+    if !path.is_absolute() {
+        return Err(SecureFileError::UnsafeOrUnavailable);
+    }
+    #[cfg(target_os = "macos")]
+    let resolved_path = resolve_trusted_macos_ancestor_aliases(path)?;
+    #[cfg(target_os = "macos")]
+    let path = resolved_path.as_path();
+    let mut names = Vec::new();
+    for component in path.components() {
+        match component {
+            Component::RootDir => {}
+            Component::Normal(name) => names.push(name),
+            Component::Prefix(_) | Component::CurDir | Component::ParentDir => {
+                return Err(SecureFileError::UnsafeOrUnavailable);
+            }
+        }
+    }
+    if names.is_empty() {
+        return Err(SecureFileError::UnsafeOrUnavailable);
+    }
+
+    let flags = unix_directory_search_flags()?;
+    let mut directory = rustix::fs::open("/", flags, Mode::empty())
+        .map_err(|_| SecureFileError::UnsafeOrUnavailable)?;
+    let effective_user = rustix::process::geteuid().as_raw();
+
+    for (index, name) in names.iter().enumerate() {
+        require_unix_directory_replacement_safety(&directory, effective_user)?;
+        let final_component = index + 1 == names.len();
+        let (child, created) = match rustix::fs::openat(&directory, *name, flags, Mode::empty()) {
+            Ok(child) => (child, false),
+            Err(rustix::io::Errno::NOENT) if final_component && create_if_missing => {
+                let created = match rustix::fs::mkdirat(&directory, *name, Mode::RWXU) {
+                    Ok(()) => {
+                        // Search-only descriptors cannot be passed to fchmod.
+                        // The safe parent is not writable by unrelated users,
+                        // so set the exact boundary mode before reopening it.
+                        rustix::fs::chmodat(&directory, *name, Mode::RWXU, AtFlags::empty())
+                            .map_err(|_| SecureFileError::UnsafeOrUnavailable)?;
+                        true
+                    }
+                    // Another first-run process may create the boundary after
+                    // openat reports NOENT. Reopen and validate it as existing.
+                    Err(rustix::io::Errno::EXIST) => false,
+                    Err(_) => return Err(SecureFileError::UnsafeOrUnavailable),
+                };
+                let child = rustix::fs::openat(&directory, *name, flags, Mode::empty())
+                    .map_err(|_| SecureFileError::UnsafeOrUnavailable)?;
+                (child, created)
+            }
+            Err(_) => return Err(SecureFileError::UnsafeOrUnavailable),
+        };
+        let metadata =
+            rustix::fs::fstat(&child).map_err(|_| SecureFileError::UnsafeOrUnavailable)?;
+        if FileType::from_raw_mode(metadata.st_mode) != FileType::Directory
+            || (metadata.st_uid != 0 && metadata.st_uid != effective_user)
+            || (final_component
+                && (metadata.st_uid != effective_user
+                    || (!created && metadata.st_mode & 0o777 != 0o700)))
+        {
+            return Err(SecureFileError::UnsafeOrUnavailable);
+        }
+        directory = child;
+    }
+    require_no_macos_extended_acl(&directory)?;
+    Ok(File::from(directory))
+}
+
+#[cfg(unix)]
+fn unix_directory_search_flags() -> Result<rustix::fs::OFlags, SecureFileError> {
+    use rustix::fs::OFlags;
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    let search_only = OFlags::PATH;
+    #[cfg(any(
+        target_vendor = "apple",
+        target_os = "aix",
+        target_os = "emscripten",
+        target_os = "freebsd",
+        target_os = "illumos",
+        target_os = "netbsd",
+        target_os = "solaris"
+    ))]
+    let search_only = OFlags::from_bits_retain(libc::O_SEARCH as _);
+    #[cfg(not(any(
+        target_os = "linux",
+        target_os = "android",
+        target_vendor = "apple",
+        target_os = "aix",
+        target_os = "emscripten",
+        target_os = "freebsd",
+        target_os = "illumos",
+        target_os = "netbsd",
+        target_os = "solaris"
+    )))]
+    return Err(SecureFileError::UnsafeOrUnavailable);
+
+    Ok(search_only | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC)
+}
+
+#[cfg(target_os = "macos")]
+fn resolve_trusted_macos_ancestor_aliases(
+    path: &Path,
+) -> Result<std::path::PathBuf, SecureFileError> {
+    use std::os::unix::fs::MetadataExt;
+    use std::path::{Component, PathBuf};
+
+    let parent = path.parent().ok_or(SecureFileError::UnsafeOrUnavailable)?;
+    let file_name = path
+        .file_name()
+        .ok_or(SecureFileError::UnsafeOrUnavailable)?;
+    let mut prefix = PathBuf::from("/");
+    for component in parent.components() {
+        match component {
+            Component::RootDir => continue,
+            Component::Normal(name) => prefix.push(name),
+            Component::Prefix(_) | Component::CurDir | Component::ParentDir => {
+                return Err(SecureFileError::UnsafeOrUnavailable);
+            }
+        }
+        let metadata =
+            std::fs::symlink_metadata(&prefix).map_err(|_| SecureFileError::UnsafeOrUnavailable)?;
+        if metadata.file_type().is_symlink() {
+            let containing_directory = prefix
+                .parent()
+                .ok_or(SecureFileError::UnsafeOrUnavailable)?;
+            let containing_metadata = std::fs::symlink_metadata(containing_directory)
+                .map_err(|_| SecureFileError::UnsafeOrUnavailable)?;
+            if metadata.uid() != 0
+                || containing_metadata.uid() != 0
+                || containing_metadata.mode() & 0o022 != 0
+            {
+                return Err(SecureFileError::UnsafeOrUnavailable);
+            }
+        }
+    }
+    let resolved_parent =
+        std::fs::canonicalize(parent).map_err(|_| SecureFileError::UnsafeOrUnavailable)?;
+    Ok(resolved_parent.join(file_name))
+}
+
+#[cfg(unix)]
+fn require_unix_directory_replacement_safety(
+    directory: &impl std::os::fd::AsFd,
+    effective_user: u32,
+) -> Result<(), SecureFileError> {
+    use rustix::fs::FileType;
+
     let metadata =
-        rustix::fs::fstat(&descriptor).map_err(|_| SecureFileError::UnsafeOrUnavailable)?;
+        rustix::fs::fstat(directory).map_err(|_| SecureFileError::UnsafeOrUnavailable)?;
+    let owner_is_trusted = metadata.st_uid == 0 || metadata.st_uid == effective_user;
+    let writable_by_others = metadata.st_mode & 0o022 != 0;
+    let replacement_is_sticky = metadata.st_mode & 0o1000 != 0;
     if FileType::from_raw_mode(metadata.st_mode) != FileType::Directory
-        || metadata.st_uid != rustix::process::geteuid().as_raw()
-        || (!created && metadata.st_mode & 0o777 != 0o700)
+        || !owner_is_trusted
+        || (writable_by_others && !replacement_is_sticky)
     {
         return Err(SecureFileError::UnsafeOrUnavailable);
     }
-    require_no_macos_extended_acl(&descriptor)?;
-    if created {
-        rustix::fs::fchmod(&descriptor, Mode::RWXU)
-            .map_err(|_| SecureFileError::UnsafeOrUnavailable)?;
+    require_no_macos_replacement_acl(directory)
+}
+
+#[cfg(target_os = "macos")]
+fn require_no_macos_replacement_acl(
+    descriptor: &impl std::os::fd::AsFd,
+) -> Result<(), SecureFileError> {
+    use std::os::fd::AsRawFd;
+
+    const ACL_TYPE_EXTENDED: libc::c_int = 0x0000_0100;
+    const ACL_FIRST_ENTRY: libc::c_int = 0;
+    const ACL_NEXT_ENTRY: libc::c_int = -1;
+    const ACL_EXTENDED_ALLOW: libc::c_int = 1;
+    const ACL_ADD_FILE: u64 = 1 << 2;
+    const ACL_DELETE: u64 = 1 << 4;
+    const ACL_ADD_SUBDIRECTORY: u64 = 1 << 5;
+    const ACL_DELETE_CHILD: u64 = 1 << 6;
+    const REPLACEMENT_PERMISSIONS: u64 =
+        ACL_ADD_FILE | ACL_DELETE | ACL_ADD_SUBDIRECTORY | ACL_DELETE_CHILD;
+
+    unsafe extern "C" {
+        fn acl_get_fd_np(fd: libc::c_int, acl_type: libc::c_int) -> *mut libc::c_void;
+        fn acl_get_entry(
+            acl: *mut libc::c_void,
+            entry_id: libc::c_int,
+            entry: *mut *mut libc::c_void,
+        ) -> libc::c_int;
+        fn acl_get_tag_type(entry: *mut libc::c_void, tag: *mut libc::c_int) -> libc::c_int;
+        fn acl_get_permset_mask_np(entry: *mut libc::c_void, mask: *mut u64) -> libc::c_int;
+        fn acl_free(object: *mut libc::c_void) -> libc::c_int;
     }
-    Ok(File::from(descriptor))
+
+    // Restrictive entries are common on otherwise safe macOS ancestors, such
+    // as a home directory carrying `everyone deny delete`. Only an allow entry
+    // with directory-replacement rights invalidates the mode-bit guarantee.
+    unsafe {
+        *libc::__error() = 0;
+        let acl = acl_get_fd_np(descriptor.as_fd().as_raw_fd(), ACL_TYPE_EXTENDED);
+        if acl.is_null() {
+            return (*libc::__error() == libc::ENOENT)
+                .then_some(())
+                .ok_or(SecureFileError::UnsafeOrUnavailable);
+        }
+        let validation = (|| {
+            let mut entry_id = ACL_FIRST_ENTRY;
+            loop {
+                let mut entry = std::ptr::null_mut();
+                *libc::__error() = 0;
+                if acl_get_entry(acl, entry_id, &mut entry) != 0 {
+                    return (*libc::__error() == libc::EINVAL)
+                        .then_some(())
+                        .ok_or(SecureFileError::UnsafeOrUnavailable);
+                }
+                let mut tag = 0;
+                let mut permissions = 0;
+                if acl_get_tag_type(entry, &mut tag) != 0
+                    || acl_get_permset_mask_np(entry, &mut permissions) != 0
+                {
+                    return Err(SecureFileError::UnsafeOrUnavailable);
+                }
+                if tag == ACL_EXTENDED_ALLOW && permissions & REPLACEMENT_PERMISSIONS != 0 {
+                    return Err(SecureFileError::UnsafeOrUnavailable);
+                }
+                entry_id = ACL_NEXT_ENTRY;
+            }
+        })();
+        let _ = acl_free(acl);
+        validation
+    }
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+fn require_no_macos_replacement_acl(
+    _descriptor: &impl std::os::fd::AsFd,
+) -> Result<(), SecureFileError> {
+    Ok(())
 }
 
 #[cfg(target_os = "macos")]
@@ -199,8 +433,15 @@ pub fn open_or_create_owner_only_file(path: &Path) -> Result<File, SecureFileErr
 }
 
 #[cfg(windows)]
-pub fn open_or_create_owner_only_directory(path: &Path) -> Result<File, SecureFileError> {
+pub fn open_or_create_owner_only_directory(
+    path: &Path,
+) -> Result<OwnerOnlyDirectory, SecureFileError> {
     windows::open_or_create_owner_only_directory(path)
+}
+
+#[cfg(windows)]
+pub fn open_owner_only_directory(path: &Path) -> Result<OwnerOnlyDirectory, SecureFileError> {
+    windows::open_owner_only_directory(path)
 }
 
 #[cfg(not(any(unix, windows)))]
@@ -211,7 +452,14 @@ pub fn open_or_create_owner_only_file(_path: &Path) -> Result<File, SecureFileEr
 }
 
 #[cfg(not(any(unix, windows)))]
-pub fn open_or_create_owner_only_directory(_path: &Path) -> Result<File, SecureFileError> {
+pub fn open_or_create_owner_only_directory(
+    _path: &Path,
+) -> Result<OwnerOnlyDirectory, SecureFileError> {
+    Err(SecureFileError::UnsafeOrUnavailable)
+}
+
+#[cfg(not(any(unix, windows)))]
+pub fn open_owner_only_directory(_path: &Path) -> Result<OwnerOnlyDirectory, SecureFileError> {
     Err(SecureFileError::UnsafeOrUnavailable)
 }
 
@@ -277,18 +525,22 @@ fn open_secure_file(path: &Path, policy: SecurityPolicy) -> Result<File, SecureF
 
 #[cfg(windows)]
 mod windows {
-    use super::{SecureFileError, SecurityPolicy};
-    use std::ffi::c_void;
+    use super::{OwnerOnlyDirectory, SecureFileError, SecurityPolicy};
+    use std::ffi::{OsString, c_void};
     use std::fs::File;
     use std::marker::PhantomData;
     use std::mem::{offset_of, size_of};
     use std::os::windows::ffi::OsStrExt;
     use std::os::windows::io::{FromRawHandle, OwnedHandle};
-    use std::path::Path;
+    use std::path::{Component, Path, PathBuf};
     use std::ptr::{null, null_mut};
+    use windows_sys::Wdk::Foundation::OBJECT_ATTRIBUTES;
+    use windows_sys::Wdk::Storage::FileSystem::{
+        FILE_DIRECTORY_FILE, FILE_OPEN, FILE_OPEN_IF, FILE_OPEN_REPARSE_POINT, NtCreateFile,
+    };
     use windows_sys::Win32::Foundation::{
-        ERROR_ALREADY_EXISTS, GENERIC_ALL, GENERIC_EXECUTE, GENERIC_READ, GENERIC_WRITE,
-        GetLastError, HANDLE, HLOCAL, INVALID_HANDLE_VALUE, LocalFree,
+        GENERIC_ALL, GENERIC_EXECUTE, GENERIC_READ, GENERIC_WRITE, HANDLE, HLOCAL,
+        INVALID_HANDLE_VALUE, LocalFree, OBJ_CASE_INSENSITIVE, OBJ_DONT_REPARSE, UNICODE_STRING,
     };
     use windows_sys::Win32::Security::Authorization::{
         ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW,
@@ -303,16 +555,16 @@ mod windows {
         WinBuiltinAdministratorsSid, WinLocalSystemSid,
     };
     use windows_sys::Win32::Storage::FileSystem::{
-        BY_HANDLE_FILE_INFORMATION, CreateDirectoryW, CreateFileW, DELETE, FILE_ALL_ACCESS,
-        FILE_APPEND_DATA, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_NORMAL,
-        FILE_ATTRIBUTE_REPARSE_POINT, FILE_ATTRIBUTE_TAG_INFO, FILE_FLAG_BACKUP_SEMANTICS,
-        FILE_FLAG_OPEN_REPARSE_POINT, FILE_GENERIC_EXECUTE, FILE_GENERIC_READ, FILE_GENERIC_WRITE,
-        FILE_READ_ATTRIBUTES, FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_TYPE_DISK,
-        FILE_WRITE_ATTRIBUTES, FILE_WRITE_DATA, FILE_WRITE_EA, FileAttributeTagInfo,
-        GetFileInformationByHandle, GetFileInformationByHandleEx, GetFileType,
-        GetVolumeInformationByHandleW, OPEN_ALWAYS, OPEN_EXISTING, READ_CONTROL, WRITE_DAC,
-        WRITE_OWNER,
+        BY_HANDLE_FILE_INFORMATION, CreateFileW, DELETE, FILE_ALL_ACCESS, FILE_APPEND_DATA,
+        FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_NORMAL, FILE_ATTRIBUTE_REPARSE_POINT,
+        FILE_ATTRIBUTE_TAG_INFO, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
+        FILE_GENERIC_EXECUTE, FILE_GENERIC_READ, FILE_GENERIC_WRITE, FILE_READ_ATTRIBUTES,
+        FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_TYPE_DISK, FILE_WRITE_ATTRIBUTES, FILE_WRITE_DATA,
+        FILE_WRITE_EA, FileAttributeTagInfo, GetFileInformationByHandle,
+        GetFileInformationByHandleEx, GetFileType, GetVolumeInformationByHandleW, OPEN_ALWAYS,
+        OPEN_EXISTING, READ_CONTROL, WRITE_DAC, WRITE_OWNER,
     };
+    use windows_sys::Win32::System::IO::IO_STATUS_BLOCK;
     use windows_sys::Win32::System::SystemServices::{
         ACCESS_ALLOWED_ACE_TYPE, ACCESS_DENIED_ACE_TYPE, FILE_PERSISTENT_ACLS,
     };
@@ -360,19 +612,95 @@ mod windows {
 
     pub(super) fn open_or_create_owner_only_directory(
         path: &Path,
-    ) -> Result<File, SecureFileError> {
+    ) -> Result<OwnerOnlyDirectory, SecureFileError> {
+        open_owner_only_directory_impl(path, true)
+    }
+
+    pub(super) fn open_owner_only_directory(
+        path: &Path,
+    ) -> Result<OwnerOnlyDirectory, SecureFileError> {
+        open_owner_only_directory_impl(path, false)
+    }
+
+    fn open_owner_only_directory_impl(
+        path: &Path,
+        create_if_missing: bool,
+    ) -> Result<OwnerOnlyDirectory, SecureFileError> {
         let process_sid = current_user_sid()?;
         let descriptor = PrivateDescriptor::new(&process_sid, "OICI")?;
         let attributes = descriptor.security_attributes();
-        let wide = wide_path(path)?;
-        let created = unsafe { CreateDirectoryW(wide.as_ptr(), &attributes) };
-        if created == 0 && unsafe { GetLastError() } != ERROR_ALREADY_EXISTS {
+        let (root, names) = windows_directory_components(path)?;
+        let mut directory = open_absolute_directory(&root)?;
+        require_persistent_acls(&directory)?;
+        require_directory(&directory)?;
+        let mut ancestors = Vec::with_capacity(names.len());
+
+        for (index, name) in names.iter().enumerate() {
+            let final_component = index + 1 == names.len();
+            let child = open_relative_directory(
+                &directory,
+                name,
+                final_component && create_if_missing,
+                if final_component {
+                    attributes.lpSecurityDescriptor.cast_const()
+                } else {
+                    null()
+                },
+            )?;
+            require_persistent_acls(&child)?;
+            require_directory(&child)?;
+            ancestors.push(File::from(directory));
+            directory = child;
+        }
+        // NtCreateFile applies the protected DACL only when FILE_OPEN_IF creates
+        // the final directory. Existing namespaces must already satisfy it.
+        verify_owner_only_security(
+            &directory,
+            &process_sid,
+            (OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE) as u8,
+        )?;
+        Ok(OwnerOnlyDirectory {
+            _directory: File::from(directory),
+            _ancestors: ancestors,
+        })
+    }
+
+    fn windows_directory_components(
+        path: &Path,
+    ) -> Result<(PathBuf, Vec<OsString>), SecureFileError> {
+        let mut components = path.components();
+        let Component::Prefix(prefix) = components
+            .next()
+            .ok_or(SecureFileError::UnsafeOrUnavailable)?
+        else {
+            return Err(SecureFileError::UnsafeOrUnavailable);
+        };
+        if !matches!(components.next(), Some(Component::RootDir)) {
             return Err(SecureFileError::UnsafeOrUnavailable);
         }
+        let mut root = PathBuf::from(prefix.as_os_str());
+        root.push(r"\");
+        let names = components
+            .map(|component| match component {
+                Component::Normal(name) => Ok(name.to_os_string()),
+                Component::Prefix(_)
+                | Component::RootDir
+                | Component::CurDir
+                | Component::ParentDir => Err(SecureFileError::UnsafeOrUnavailable),
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        if names.is_empty() {
+            return Err(SecureFileError::UnsafeOrUnavailable);
+        }
+        Ok((root, names))
+    }
+
+    fn open_absolute_directory(path: &Path) -> Result<OwnedHandle, SecureFileError> {
+        let wide = wide_path(path)?;
         let raw = unsafe {
             CreateFileW(
                 wide.as_ptr(),
-                FILE_READ_ATTRIBUTES | READ_CONTROL | WRITE_DAC,
+                FILE_READ_ATTRIBUTES | READ_CONTROL,
                 FILE_SHARE_READ | FILE_SHARE_WRITE,
                 null(),
                 OPEN_EXISTING,
@@ -383,17 +711,59 @@ mod windows {
         if raw == INVALID_HANDLE_VALUE {
             return Err(SecureFileError::UnsafeOrUnavailable);
         }
-        let handle = unsafe { OwnedHandle::from_raw_handle(raw) };
-        require_persistent_acls(&handle)?;
-        require_directory(&handle)?;
-        // CreateDirectoryW applies the protected DACL only to a new directory.
-        // Existing namespaces must already satisfy it before they are used.
-        verify_owner_only_security(
-            &handle,
-            &process_sid,
-            (OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE) as u8,
-        )?;
-        Ok(File::from(handle))
+        Ok(unsafe { OwnedHandle::from_raw_handle(raw) })
+    }
+
+    fn open_relative_directory(
+        parent: &OwnedHandle,
+        name: &OsString,
+        create_if_missing: bool,
+        security_descriptor: *const c_void,
+    ) -> Result<OwnedHandle, SecureFileError> {
+        let mut wide = name.encode_wide().collect::<Vec<_>>();
+        let byte_length = wide
+            .len()
+            .checked_mul(size_of::<u16>())
+            .and_then(|length| u16::try_from(length).ok())
+            .ok_or(SecureFileError::UnsafeOrUnavailable)?;
+        let object_name = UNICODE_STRING {
+            Length: byte_length,
+            MaximumLength: byte_length,
+            Buffer: wide.as_mut_ptr(),
+        };
+        let object_attributes = OBJECT_ATTRIBUTES {
+            Length: size_of::<OBJECT_ATTRIBUTES>() as u32,
+            RootDirectory: raw_handle(parent),
+            ObjectName: &object_name,
+            Attributes: OBJ_CASE_INSENSITIVE | OBJ_DONT_REPARSE,
+            SecurityDescriptor: security_descriptor.cast(),
+            SecurityQualityOfService: null(),
+        };
+        let mut raw = INVALID_HANDLE_VALUE;
+        let mut io_status = IO_STATUS_BLOCK::default();
+        let status = unsafe {
+            NtCreateFile(
+                &mut raw,
+                FILE_READ_ATTRIBUTES | READ_CONTROL,
+                &object_attributes,
+                &mut io_status,
+                null(),
+                FILE_ATTRIBUTE_DIRECTORY,
+                FILE_SHARE_READ | FILE_SHARE_WRITE,
+                if create_if_missing {
+                    FILE_OPEN_IF
+                } else {
+                    FILE_OPEN
+                },
+                FILE_DIRECTORY_FILE | FILE_OPEN_REPARSE_POINT,
+                null(),
+                0,
+            )
+        };
+        if status < 0 || raw == INVALID_HANDLE_VALUE {
+            return Err(SecureFileError::UnsafeOrUnavailable);
+        }
+        Ok(unsafe { OwnedHandle::from_raw_handle(raw) })
     }
 
     pub(super) fn open_secure_file(
@@ -977,6 +1347,9 @@ mod tests {
     #[test]
     fn owner_only_files_are_private_before_callers_write() {
         let directory = tempfile::tempdir().expect("create temporary directory");
+        #[cfg(unix)]
+        fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700))
+            .expect("make test boundary non-replaceable by unrelated users");
         let fresh = directory.path().join("fresh-owner-only");
         let mut file = open_or_create_owner_only_file(&fresh).expect("create owner-only file");
         file.write_all(b"fresh-secret")
@@ -1051,6 +1424,158 @@ mod tests {
             fs::read(&sidecar).expect("read rejected sidecar"),
             b"planted-sidecar"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn owner_only_directory_rejects_a_replaceable_ancestor() {
+        let directory = tempfile::tempdir().expect("create temporary directory");
+        let replaceable = directory.path().join("replaceable");
+        fs::create_dir(&replaceable).expect("create replaceable ancestor");
+        fs::set_permissions(&replaceable, fs::Permissions::from_mode(0o777))
+            .expect("make ancestor replaceable by unrelated users");
+        let boundary = replaceable.join("tls");
+
+        assert!(matches!(
+            open_or_create_owner_only_directory(&boundary),
+            Err(SecureFileError::UnsafeOrUnavailable)
+        ));
+        assert!(
+            !boundary.exists(),
+            "unsafe ancestry must fail before creation"
+        );
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn existing_owner_only_directory_open_never_creates_a_missing_boundary() {
+        let directory = tempfile::tempdir().expect("create temporary directory");
+        #[cfg(unix)]
+        fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700))
+            .expect("restrict test ancestry");
+        let boundary = directory.path().join("tls");
+
+        assert!(matches!(
+            open_owner_only_directory(&boundary),
+            Err(SecureFileError::UnsafeOrUnavailable)
+        ));
+        assert!(!boundary.exists(), "existing-only open must not create");
+
+        drop(
+            open_or_create_owner_only_directory(&boundary)
+                .expect("create owner-only boundary explicitly"),
+        );
+        drop(open_owner_only_directory(&boundary).expect("reopen existing owner-only boundary"));
+    }
+
+    #[cfg(all(
+        unix,
+        any(
+            target_os = "linux",
+            target_os = "android",
+            target_vendor = "apple",
+            target_os = "aix",
+            target_os = "emscripten",
+            target_os = "freebsd",
+            target_os = "illumos",
+            target_os = "netbsd",
+            target_os = "solaris"
+        )
+    ))]
+    #[test]
+    fn owner_only_directory_traverses_an_execute_only_ancestor() {
+        let directory = tempfile::tempdir().expect("create temporary directory");
+        fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700))
+            .expect("restrict test ancestry");
+        let ancestor = directory.path().join("search-only");
+        fs::create_dir(&ancestor).expect("create search-only ancestor");
+        fs::set_permissions(&ancestor, fs::Permissions::from_mode(0o700))
+            .expect("prepare writable ancestor");
+        let boundary = ancestor.join("tls");
+        drop(
+            open_or_create_owner_only_directory(&boundary)
+                .expect("create boundary before removing read permission"),
+        );
+        fs::set_permissions(&ancestor, fs::Permissions::from_mode(0o100))
+            .expect("make ancestor execute-only");
+
+        let opened = open_owner_only_directory(&boundary);
+        fs::set_permissions(&ancestor, fs::Permissions::from_mode(0o700))
+            .expect("restore ancestor for fixture cleanup");
+        drop(opened.expect("search-only handle traverses an execute-only ancestor"));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn owner_only_directory_accepts_the_root_owned_macos_tmp_alias() {
+        let directory = tempfile::tempdir_in("/tmp").expect("create directory through /tmp alias");
+        fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700))
+            .expect("restrict aliased test directory");
+        let boundary = directory.path().join("tls");
+
+        drop(
+            open_or_create_owner_only_directory(&boundary)
+                .expect("root-owned macOS aliases preserve boundary security"),
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_restrictive_ancestor_acl_preserves_replacement_safety() {
+        let directory = tempfile::tempdir().expect("create temporary directory");
+        fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700))
+            .expect("restrict ACL-bearing ancestor");
+        let add_status = std::process::Command::new("chmod")
+            .arg("+a")
+            .arg("everyone deny delete")
+            .arg(directory.path())
+            .status()
+            .expect("add restrictive macOS ACL");
+        assert!(add_status.success(), "macOS chmod must add the deny ACL");
+
+        let boundary = directory.path().join("tls");
+        let opened = open_or_create_owner_only_directory(&boundary);
+        let remove_status = std::process::Command::new("chmod")
+            .arg("-N")
+            .arg(directory.path())
+            .status()
+            .expect("remove restrictive macOS ACL");
+        assert!(
+            remove_status.success(),
+            "macOS chmod must remove the deny ACL"
+        );
+
+        drop(opened.expect("a deny-only ancestor ACL cannot enable replacement"));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_ancestor_acl_that_allows_replacement_is_rejected() {
+        let directory = tempfile::tempdir().expect("create temporary directory");
+        fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700))
+            .expect("restrict ACL-bearing ancestor");
+        let add_status = std::process::Command::new("chmod")
+            .arg("+a")
+            .arg("everyone allow delete_child")
+            .arg(directory.path())
+            .status()
+            .expect("add replacement-capable macOS ACL");
+        assert!(add_status.success(), "macOS chmod must add the allow ACL");
+
+        let boundary = directory.path().join("tls");
+        let opened = open_or_create_owner_only_directory(&boundary);
+        let remove_status = std::process::Command::new("chmod")
+            .arg("-N")
+            .arg(directory.path())
+            .status()
+            .expect("remove replacement-capable macOS ACL");
+        assert!(
+            remove_status.success(),
+            "macOS chmod must remove the allow ACL"
+        );
+
+        assert!(matches!(opened, Err(SecureFileError::UnsafeOrUnavailable)));
+        assert!(!boundary.exists(), "unsafe ACL must fail before creation");
     }
 
     #[cfg(target_os = "macos")]
@@ -1288,6 +1813,46 @@ mod tests {
             read_owner_only_secret_file(&symbolic_link),
             Err(SecureFileError::UnsafeOrUnavailable)
         );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_directory_guard_rejects_junction_ancestry_and_pins_each_component() {
+        let root = tempfile::tempdir().expect("create Windows directory guard fixture");
+        let active = root.path().join("active");
+        fs::create_dir(&active).expect("create active TLS ancestor");
+        let boundary = active.join("tls");
+        let guard = open_or_create_owner_only_directory(&boundary)
+            .expect("open a regular owner-only TLS boundary");
+        let retired = root.path().join("retired");
+        assert!(
+            fs::rename(&active, &retired).is_err(),
+            "retained ancestor handles must block a namespace swap"
+        );
+        drop(guard);
+        fs::rename(&active, &retired).expect("release every retained ancestor handle");
+
+        let junction_target = root.path().join("junction-target");
+        fs::create_dir(&junction_target).expect("create junction target");
+        let target_boundary = junction_target.join("tls");
+        drop(
+            open_or_create_owner_only_directory(&target_boundary)
+                .expect("create owner-only target boundary"),
+        );
+        let junction = root.path().join("junction");
+        let status = std::process::Command::new("cmd")
+            .args(["/C", "mklink", "/J"])
+            .arg(&junction)
+            .arg(&junction_target)
+            .status()
+            .expect("create Windows junction");
+        assert!(status.success(), "mklink must create the test junction");
+
+        assert!(matches!(
+            open_owner_only_directory(&junction.join("tls")),
+            Err(SecureFileError::UnsafeOrUnavailable)
+        ));
+        fs::remove_dir(&junction).expect("remove test junction");
     }
 
     #[cfg(windows)]

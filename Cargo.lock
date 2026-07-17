@@ -2279,7 +2279,9 @@ dependencies = [
  "cliclack",
  "flate2",
  "jsonschema",
+ "notify",
  "predicates",
+ "rcgen",
  "reqwest",
  "rmcp",
  "rusqlite",
@@ -2301,6 +2303,7 @@ dependencies = [
  "toml_edit",
  "url",
  "uuid",
+ "windows-sys 0.61.2",
  "zip",
 ]
 

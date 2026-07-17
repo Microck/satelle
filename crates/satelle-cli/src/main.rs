@@ -19,6 +19,7 @@ use completions::{CompletionsCommand, run_completions};
 use error_output::{ErrorFormat, parser_error, print_error};
 use host_trust::{HostTrustReport, persist_host_identity};
 use logs::{LogsCommand, show_logs};
+use notify::{Config as NotifyConfig, Event, RecommendedWatcher, RecursiveMode, Watcher};
 use output::{OutputArgs, OutputFormat, SessionResultSchemaVersion, StatusReport};
 use satelle_core::session::{
     EffectiveModelRef, HostIdentityRef, ProviderBindingRef, PublicSession, PublicTurn,
@@ -27,23 +28,24 @@ use satelle_core::session::{
 use satelle_core::{
     BEACON_CORAL, CLI_NAME, DaemonPathOverrides, DesktopSessionPreference, DoctorEventRecord,
     DoctorOptions, DoctorReport, ERROR_RED, ErrorCode, EventSource, EventType, HostConfig,
-    HostSessionsReport, LOCAL_DEMO_HOST, PRODUCT_NAME, ProfileField, RELAY_ROSE, ResolvedConfig,
-    SUCCESS_GREEN, SatelleError, SatelleEvent, SatelleEventBody, SessionId, SetupMode, SetupReport,
-    SetupRequiredInput, load_config, open_or_create_owner_only_directory,
+    HostSessionsReport, LOCAL_DEMO_HOST, OwnerOnlyDirectory, PRODUCT_NAME, ProfileField,
+    RELAY_ROSE, ResolvedConfig, SUCCESS_GREEN, SatelleError, SatelleEvent, SatelleEventBody,
+    SecureFileError, SessionId, SetupMode, SetupReport, SetupRequiredInput, load_config,
+    open_or_create_owner_only_directory, open_owner_only_directory,
     read_owner_controlled_config_file, read_owner_only_secret_config_file, resolve_path_set,
     utc_now,
 };
 use satelle_host::{ApiBearerToken, HostService, ProviderComputerUseIntent};
 use satelle_transport::{
     DaemonServer, DaemonServerConfig, DaemonServerError, DaemonTlsConfig, DaemonTlsConfigError,
-    TurnRequest,
+    DaemonTlsReloadError, DaemonTlsReloader, TurnRequest,
 };
 use serde_json::json;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::{self, IsTerminal, Read, Write};
 use std::net::SocketAddr;
-use std::path::PathBuf;
+use std::path::{Component, Path, PathBuf};
 use std::process::ExitCode;
 use std::str::FromStr;
 use std::sync::{Arc, OnceLock};
@@ -2494,11 +2496,30 @@ fn start_host_daemon(
         if let Some(idle_timeout) = idle_timeout {
             server_config = server_config.with_idle_timeout(idle_timeout);
         }
-        let server = match tls {
-            Some(tls) => DaemonServer::bind_tls(service, server_config, tls).await,
-            None => DaemonServer::bind(service, server_config).await,
-        }
-        .map_err(daemon_server_failure)?;
+        let (server, _tls_reload_watcher) = match tls {
+            Some(tls) => {
+                let DaemonTlsFiles {
+                    certificate_path,
+                    private_key_path,
+                    config,
+                } = tls;
+                let server = DaemonServer::bind_tls(service, server_config, config)
+                    .await
+                    .map_err(daemon_server_failure)?;
+                let reloader = server
+                    .tls_reloader()
+                    .expect("a TLS listener always exposes its reload handle");
+                let watcher =
+                    DaemonTlsWatcher::start(certificate_path, private_key_path, reloader)?;
+                (server, Some(watcher))
+            }
+            None => (
+                DaemonServer::bind(service, server_config)
+                    .await
+                    .map_err(daemon_server_failure)?,
+                None,
+            ),
+        };
 
         let ready = json!({
             "schema_version": "satelle.host.start.v1",
@@ -2543,28 +2564,860 @@ fn start_host_daemon(
     })
 }
 
-fn daemon_tls_config(command: &HostStartCommand) -> Result<Option<DaemonTlsConfig>, CliFailure> {
-    let (Some(certificate_path), Some(private_key_path)) =
-        (command.tls_cert.as_deref(), command.tls_key.as_deref())
-    else {
-        return Ok(None);
+struct DaemonTlsFiles {
+    certificate_path: PathBuf,
+    private_key_path: PathBuf,
+    config: DaemonTlsConfig,
+}
+
+fn daemon_tls_config(command: &HostStartCommand) -> Result<Option<DaemonTlsFiles>, CliFailure> {
+    let (certificate_path, private_key_path) =
+        match (command.tls_cert.as_deref(), command.tls_key.as_deref()) {
+            (None, None) => return Ok(None),
+            (Some(certificate_path), Some(private_key_path)) => {
+                (certificate_path, private_key_path)
+            }
+            _ => {
+                return Err(failure(SatelleError::invalid_usage(
+                    "--tls-cert and --tls-key must be provided together",
+                )));
+            }
+        };
+    // Absolute TLS paths do not depend on the process working directory. This
+    // matters for long-lived launchers whose original directory may be removed
+    // before the Host daemon starts.
+    let current_directory = (certificate_path.is_relative() || private_key_path.is_relative())
+        .then(std::env::current_dir)
+        .transpose()
+        .map_err(|error| daemon_process_failure("tls-path-resolution-failed", error.to_string()))?;
+    let certificate_path =
+        absolute_path(certificate_path, current_directory.as_deref()).map_err(|reason| {
+            tls_file_failure("certificate path", certificate_path, reason.to_string())
+        })?;
+    let private_key_path =
+        absolute_path(private_key_path, current_directory.as_deref()).map_err(|reason| {
+            tls_file_failure("private-key path", private_key_path, reason.to_string())
+        })?;
+    let _boundary_guards = open_daemon_tls_boundaries(
+        &certificate_path,
+        &private_key_path,
+        TlsBoundaryOpenMode::CreateIfMissing,
+    )
+    .map_err(|error| tls_material_failure(error, &certificate_path, &private_key_path))?;
+    let config = read_daemon_tls_config(&certificate_path, &private_key_path)
+        .map_err(|error| tls_material_failure(error, &certificate_path, &private_key_path))?;
+    Ok(Some(DaemonTlsFiles {
+        certificate_path,
+        private_key_path,
+        config,
+    }))
+}
+
+fn absolute_path(path: &Path, current_directory: Option<&Path>) -> Result<PathBuf, &'static str> {
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        current_directory
+            .ok_or("relative TLS material paths require a current directory")?
+            .join(path)
     };
-    for path in [certificate_path, private_key_path] {
-        let parent = path
-            .parent()
-            .filter(|parent| !parent.as_os_str().is_empty())
-            .unwrap_or_else(|| std::path::Path::new("."));
-        open_or_create_owner_only_directory(parent)
-            .map_err(|error| tls_file_failure("file boundary", parent, error.to_string()))?;
+    if !absolute.is_absolute() {
+        return Err("TLS material paths must resolve to an absolute path");
     }
-    let certificate = read_owner_controlled_config_file(certificate_path).map_err(|error| {
-        tls_file_failure("certificate chain", certificate_path, error.to_string())
-    })?;
+    comparable_path(&absolute)
+}
+
+fn comparable_path(path: &Path) -> Result<PathBuf, &'static str> {
+    // Rewriting parent traversal is unsafe when an ancestor is a symlink, and
+    // canonicalization would follow the very symlinks that secure TLS reads
+    // must reject. Fail fast on `..` and normalize only harmless `.` segments.
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::Prefix(_) | Component::RootDir | Component::Normal(_) => {
+                normalized.push(component.as_os_str());
+            }
+            Component::CurDir => {}
+            Component::ParentDir => {
+                return Err("TLS material paths must not contain parent traversal (`..`)");
+            }
+        }
+    }
+    Ok(normalized)
+}
+
+#[derive(Debug, thiserror::Error)]
+enum DaemonTlsMaterialError {
+    #[error("the TLS file boundary '{}' is unavailable or unsafe: {source}", path.display())]
+    Boundary {
+        path: PathBuf,
+        #[source]
+        source: SecureFileError,
+    },
+    #[error("the certificate-chain file is unavailable or unsafe: {0}")]
+    Certificate(#[source] SecureFileError),
+    #[error("the private-key file is unavailable or unsafe: {0}")]
+    PrivateKey(#[source] SecureFileError),
+    #[error("the replacement TLS configuration is invalid: {0}")]
+    Configuration(#[source] DaemonTlsConfigError),
+    #[error("the TLS listener stopped before the replacement could be installed")]
+    ListenerStopped,
+}
+
+impl DaemonTlsMaterialError {
+    const fn code(&self) -> &'static str {
+        match self {
+            Self::Boundary { .. } => "tls-reload-boundary-unavailable",
+            Self::Certificate(_) => "tls-reload-certificate-unavailable",
+            Self::PrivateKey(_) => "tls-reload-private-key-unavailable",
+            Self::Configuration(_) => "tls-reload-invalid-configuration",
+            Self::ListenerStopped => "tls-reload-listener-stopped",
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum TlsBoundaryOpenMode {
+    CreateIfMissing,
+    Existing,
+}
+
+fn open_daemon_tls_boundaries(
+    certificate_path: &Path,
+    private_key_path: &Path,
+    mode: TlsBoundaryOpenMode,
+) -> Result<Vec<OwnerOnlyDirectory>, DaemonTlsMaterialError> {
+    let open_boundary = match mode {
+        TlsBoundaryOpenMode::CreateIfMissing => open_or_create_owner_only_directory,
+        TlsBoundaryOpenMode::Existing => open_owner_only_directory,
+    };
+    [certificate_path, private_key_path]
+        .into_iter()
+        .map(|path| {
+            path.parent()
+                .filter(|parent| !parent.as_os_str().is_empty())
+                .ok_or_else(|| DaemonTlsMaterialError::Boundary {
+                    path: path.to_path_buf(),
+                    source: SecureFileError::UnsafeOrUnavailable,
+                })
+        })
+        .collect::<Result<BTreeSet<_>, _>>()?
+        .into_iter()
+        .map(|path| {
+            open_boundary(path).map_err(|source| DaemonTlsMaterialError::Boundary {
+                path: path.to_path_buf(),
+                source,
+            })
+        })
+        .collect()
+}
+
+fn read_daemon_tls_config(
+    certificate_path: &Path,
+    private_key_path: &Path,
+) -> Result<DaemonTlsConfig, DaemonTlsMaterialError> {
+    let certificate = read_owner_controlled_config_file(certificate_path)
+        .map_err(DaemonTlsMaterialError::Certificate)?;
     let private_key = read_owner_only_secret_config_file(private_key_path)
-        .map_err(|error| tls_file_failure("private key", private_key_path, error.to_string()))?;
+        .map_err(DaemonTlsMaterialError::PrivateKey)?;
     DaemonTlsConfig::from_pem(certificate.as_bytes(), private_key.as_bytes())
-        .map(Some)
-        .map_err(tls_configuration_failure)
+        .map_err(DaemonTlsMaterialError::Configuration)
+}
+
+fn tls_material_failure(
+    error: DaemonTlsMaterialError,
+    certificate_path: &Path,
+    private_key_path: &Path,
+) -> CliFailure {
+    match error {
+        DaemonTlsMaterialError::Boundary { path, source } => {
+            tls_file_failure("file boundary", &path, source.to_string())
+        }
+        DaemonTlsMaterialError::Certificate(source) => {
+            tls_file_failure("certificate chain", certificate_path, source.to_string())
+        }
+        DaemonTlsMaterialError::PrivateKey(source) => {
+            tls_file_failure("private key", private_key_path, source.to_string())
+        }
+        DaemonTlsMaterialError::Configuration(source) => tls_configuration_failure(source),
+        DaemonTlsMaterialError::ListenerStopped => {
+            daemon_process_failure("tls-reload-listener-stopped", error.to_string())
+        }
+    }
+}
+
+struct DaemonTlsWatcher {
+    task: tokio::task::JoinHandle<()>,
+}
+
+const TLS_DIRECTORY_WATCH_RETRY_INITIAL: Duration = Duration::from_millis(50);
+const TLS_DIRECTORY_WATCH_RETRY_MAX: Duration = Duration::from_secs(1);
+
+impl DaemonTlsWatcher {
+    fn start(
+        certificate_path: PathBuf,
+        private_key_path: PathBuf,
+        reloader: DaemonTlsReloader,
+    ) -> Result<Self, CliFailure> {
+        // Retaining these handles pins the boundary against replacement on
+        // Windows. Unix reloads additionally revalidate the trusted ancestry
+        // before every path-based read below.
+        let boundary_guards = open_daemon_tls_boundaries(
+            &certificate_path,
+            &private_key_path,
+            TlsBoundaryOpenMode::Existing,
+        )
+        .map_err(|error| tls_material_failure(error, &certificate_path, &private_key_path))?;
+        let watched_paths = Arc::new([certificate_path.clone(), private_key_path.clone()]);
+        let callback_paths = Arc::clone(&watched_paths);
+        let file_directories = watched_paths
+            .iter()
+            .filter_map(|path| path.parent().map(Path::to_path_buf))
+            .collect::<BTreeSet<_>>();
+        let (reload_sender, mut reload_receiver) = tokio::sync::watch::channel(0_u64);
+        let mut watcher = RecommendedWatcher::new(
+            move |event: notify::Result<Event>| match event {
+                Ok(event) if tls_event_requires_reload(&event, &callback_paths) => {
+                    signal_tls_reload(&reload_sender);
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    eprintln!("Host Daemon TLS reload failed [tls-reload-watch-failed]: {error}");
+                    signal_tls_reload(&reload_sender);
+                }
+            },
+            NotifyConfig::default(),
+        )
+        .map_err(|error| daemon_process_failure("tls-reload-watch-failed", error.to_string()))?;
+        install_initial_tls_directory_watches(&mut watcher, &file_directories).map_err(
+            |error| daemon_process_failure("tls-reload-watch-failed", error.to_string()),
+        )?;
+        // Close the startup race between the initial TLS read and watcher
+        // registration. Any rotation overlapping this authoritative re-read
+        // also produces a watched event and is retried by the task below.
+        if let Err(error) =
+            reload_daemon_tls_config(&certificate_path, &private_key_path, &reloader)
+        {
+            report_daemon_tls_reload_error(&error);
+        }
+        let task = tokio::spawn(async move {
+            // Keep ownership in the reload task so it can replace stale
+            // directory watches after an atomic directory swap.
+            let mut watcher = watcher;
+            let _boundary_guards = boundary_guards;
+            while reload_receiver.changed().await.is_ok() {
+                let watch_registration =
+                    refresh_tls_directory_watches(&mut watcher, &file_directories);
+                if let Err(error) =
+                    reload_daemon_tls_config(&certificate_path, &private_key_path, &reloader)
+                {
+                    report_daemon_tls_reload_error(&error);
+                }
+                if let Err(error) = watch_registration {
+                    report_daemon_tls_watch_error(&error);
+                    retry_tls_directory_watches(&mut watcher, &file_directories).await;
+                    // A parent namespace watch is optional because secure TLS
+                    // ancestry may be execute-only. Re-read after polling has
+                    // attached to a replacement boundary: its files may have
+                    // arrived before the new watch existed.
+                    if let Err(error) =
+                        reload_daemon_tls_config(&certificate_path, &private_key_path, &reloader)
+                    {
+                        report_daemon_tls_reload_error(&error);
+                    }
+                }
+            }
+        });
+        Ok(Self { task })
+    }
+}
+
+fn install_initial_tls_directory_watches(
+    watcher: &mut RecommendedWatcher,
+    file_directories: &BTreeSet<PathBuf>,
+) -> notify::Result<()> {
+    // The TLS boundary itself is owner-readable and must be watched. A
+    // move/delete event on this inode starts the bounded re-registration loop.
+    for directory in file_directories {
+        watcher.watch(directory, RecursiveMode::NonRecursive)?;
+    }
+
+    // Watching the parent namespace shortens atomic directory rotation, but
+    // Linux inotify requires read access while the secure path contract permits
+    // execute-only ancestors. Keep this optimization best-effort; when it is
+    // unavailable, the boundary move event and retry loop preserve correctness.
+    let parent_namespaces = file_directories
+        .iter()
+        .filter_map(|directory| directory.parent().map(Path::to_path_buf))
+        .filter(|parent| !file_directories.contains(parent))
+        .collect::<BTreeSet<_>>();
+    for parent in parent_namespaces {
+        if let Err(error) = watcher.watch(&parent, RecursiveMode::NonRecursive) {
+            eprintln!(
+                "Host Daemon TLS reload warning [tls-reload-namespace-watch-unavailable]: '{}': {error}; boundary replacement polling remains active",
+                parent.display()
+            );
+        }
+    }
+    Ok(())
+}
+
+fn refresh_tls_directory_watches(
+    watcher: &mut RecommendedWatcher,
+    file_directories: &BTreeSet<PathBuf>,
+) -> notify::Result<()> {
+    let mut first_error = None;
+    for directory in file_directories {
+        // A deleted or renamed-away directory may no longer be registered, so
+        // unwatch failure is expected. The following watch call is the
+        // authoritative attempt against the directory now at this path.
+        let _ = watcher.unwatch(directory);
+        if let Err(error) = watcher.watch(directory, RecursiveMode::NonRecursive) {
+            first_error.get_or_insert(error);
+        }
+    }
+    first_error.map_or(Ok(()), Err)
+}
+
+async fn retry_tls_directory_watches(
+    watcher: &mut RecommendedWatcher,
+    file_directories: &BTreeSet<PathBuf>,
+) -> usize {
+    let mut delay = TLS_DIRECTORY_WATCH_RETRY_INITIAL;
+    let mut attempts = 0;
+    loop {
+        tokio::time::sleep(delay).await;
+        attempts += 1;
+        match refresh_tls_directory_watches(watcher, file_directories) {
+            Ok(()) => return attempts,
+            Err(error) => report_daemon_tls_watch_error(&error),
+        }
+        delay = delay.saturating_mul(2).min(TLS_DIRECTORY_WATCH_RETRY_MAX);
+    }
+}
+
+fn report_daemon_tls_watch_error(error: &notify::Error) {
+    eprintln!("Host Daemon TLS reload failed [tls-reload-watch-failed]: {error}");
+}
+
+fn signal_tls_reload(sender: &tokio::sync::watch::Sender<u64>) {
+    // The generation counter coalesces repeated filesystem events in constant
+    // memory. `changed()` marks one generation as observed before re-reading,
+    // so an event arriving during that read advances the version and schedules
+    // another authoritative file-pair read.
+    sender.send_modify(|generation| *generation = generation.wrapping_add(1));
+}
+
+fn reload_daemon_tls_config(
+    certificate_path: &Path,
+    private_key_path: &Path,
+    reloader: &DaemonTlsReloader,
+) -> Result<(), DaemonTlsMaterialError> {
+    let _boundary_guards = open_daemon_tls_boundaries(
+        certificate_path,
+        private_key_path,
+        TlsBoundaryOpenMode::Existing,
+    )?;
+    let config = read_daemon_tls_config(certificate_path, private_key_path)?;
+    reloader.reload(config).map_err(|error| match error {
+        DaemonTlsReloadError::InvalidConfiguration(source) => {
+            DaemonTlsMaterialError::Configuration(source)
+        }
+        DaemonTlsReloadError::ListenerStopped | DaemonTlsReloadError::TlsNotConfigured => {
+            DaemonTlsMaterialError::ListenerStopped
+        }
+    })
+}
+
+fn report_daemon_tls_reload_error(error: &DaemonTlsMaterialError) {
+    eprintln!("Host Daemon TLS reload failed [{}]: {error}", error.code());
+}
+
+impl Drop for DaemonTlsWatcher {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+fn tls_event_requires_reload(event: &Event, watched_paths: &[PathBuf; 2]) -> bool {
+    if event.need_rescan() {
+        return true;
+    }
+    // Secure file reads can emit Access(Open) and Access(Close(Read)) for the
+    // watched files. Treating those non-mutating events as changes would make
+    // each reload schedule the next one. Close(Write) remains relevant because
+    // it marks completed mutation on backends that expose that distinction.
+    if matches!(event.kind, notify::EventKind::Access(kind) if !matches!(
+        kind,
+        notify::event::AccessKind::Close(notify::event::AccessMode::Write)
+    )) {
+        return false;
+    }
+    event.paths.iter().any(|event_path| {
+        let Ok(event_path) = comparable_path(event_path) else {
+            return false;
+        };
+        watched_paths.iter().any(|path| {
+            comparable_path(path).is_ok_and(|path| {
+                tls_paths_equal(&path, &event_path)
+                    || path
+                        .parent()
+                        .is_some_and(|directory| tls_paths_equal(directory, &event_path))
+            })
+        })
+    })
+}
+
+#[cfg(not(windows))]
+fn tls_paths_equal(left: &Path, right: &Path) -> bool {
+    left == right
+}
+
+#[cfg(windows)]
+fn tls_paths_equal(left: &Path, right: &Path) -> bool {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Globalization::{CSTR_EQUAL, CompareStringOrdinal};
+
+    let left = left.as_os_str().encode_wide().collect::<Vec<_>>();
+    let right = right.as_os_str().encode_wide().collect::<Vec<_>>();
+    let (Ok(left_length), Ok(right_length)) =
+        (i32::try_from(left.len()), i32::try_from(right.len()))
+    else {
+        return false;
+    };
+    // SAFETY: both pointers reference initialized UTF-16 buffers for the exact
+    // lengths passed to CompareStringOrdinal and remain alive for the call.
+    unsafe {
+        CompareStringOrdinal(left.as_ptr(), left_length, right.as_ptr(), right_length, 1)
+            == CSTR_EQUAL
+    }
+}
+
+#[cfg(test)]
+mod daemon_tls_watcher_tests {
+    use super::*;
+    use notify::EventKind;
+    use notify::event::{AccessKind, AccessMode, Flag};
+
+    fn tls_command(tls_cert: Option<&str>, tls_key: Option<&str>) -> HostStartCommand {
+        HostStartCommand {
+            bind: "127.0.0.1:3001".to_string(),
+            tls_cert: tls_cert.map(PathBuf::from),
+            tls_key: tls_key.map(PathBuf::from),
+            foreground: true,
+            bootstrap_token_stdin: false,
+            bootstrap_native_readiness_timeout_ms: None,
+            bootstrap_provider_smoke_timeout_ms: None,
+            output_args: OutputArgs::default(),
+        }
+    }
+
+    #[test]
+    fn rejects_each_one_sided_tls_configuration_before_plaintext_startup() {
+        match daemon_tls_config(&tls_command(None, None)) {
+            Ok(None) => {}
+            Ok(Some(_)) => panic!("no TLS flags must preserve plaintext loopback startup"),
+            Err(_) => panic!("no TLS flags must remain valid"),
+        }
+        for command in [
+            tls_command(Some("certificate.pem"), None),
+            tls_command(None, Some("private-key.pem")),
+        ] {
+            let error = match daemon_tls_config(&command) {
+                Err(failure) => failure.error,
+                Ok(_) => panic!("one-sided TLS configuration must fail closed"),
+            };
+            assert_eq!(error.code, ErrorCode::InvalidUsage);
+            assert_eq!(
+                error.message,
+                "--tls-cert and --tls-key must be provided together"
+            );
+        }
+    }
+
+    #[test]
+    fn reloads_only_for_tls_material_changes_or_rescan_requests() {
+        let watched = [
+            PathBuf::from("/host/tls/certificate.pem"),
+            PathBuf::from("/host/tls/private-key.pem"),
+        ];
+        let certificate_change = Event::new(EventKind::Any).add_path(watched[0].clone());
+        let unrelated_change =
+            Event::new(EventKind::Any).add_path(PathBuf::from("/host/tls/other.pem"));
+        let directory_replacement = Event::new(EventKind::Any).add_path(PathBuf::from("/host/tls"));
+        let read_open = Event::new(EventKind::Access(AccessKind::Open(AccessMode::Read)))
+            .add_path(watched[0].clone());
+        let read_close = Event::new(EventKind::Access(AccessKind::Close(AccessMode::Read)))
+            .add_path(watched[0].clone());
+        let read_close_rescan = Event::new(EventKind::Access(AccessKind::Close(AccessMode::Read)))
+            .add_path(watched[0].clone())
+            .set_flag(Flag::Rescan);
+        let write_close = Event::new(EventKind::Access(AccessKind::Close(AccessMode::Write)))
+            .add_path(watched[0].clone());
+        let rescan = Event::new(EventKind::Any).set_flag(Flag::Rescan);
+
+        assert!(tls_event_requires_reload(&certificate_change, &watched));
+        assert!(tls_event_requires_reload(&directory_replacement, &watched));
+        assert!(!tls_event_requires_reload(&read_open, &watched));
+        assert!(!tls_event_requires_reload(&read_close, &watched));
+        assert!(tls_event_requires_reload(&read_close_rescan, &watched));
+        assert!(tls_event_requires_reload(&write_close, &watched));
+        assert!(!tls_event_requires_reload(&unrelated_change, &watched));
+        assert!(tls_event_requires_reload(&rescan, &watched));
+    }
+
+    #[test]
+    fn normalizes_dot_segments_and_rejects_parent_traversal() {
+        let current_directory = std::env::current_dir()
+            .expect("read current directory")
+            .join("host-config");
+        let certificate =
+            absolute_path(Path::new("tls/./certificate.pem"), Some(&current_directory))
+                .expect("dot segments are safe");
+        let private_key = absolute_path(Path::new("tls/private-key.pem"), Some(&current_directory))
+            .expect("ordinary relative path is safe");
+        let watched = [certificate.clone(), private_key];
+        let equivalent_event = Event::new(EventKind::Any).add_path(
+            current_directory
+                .join("tls")
+                .join(".")
+                .join("certificate.pem"),
+        );
+
+        assert_eq!(
+            certificate,
+            current_directory.join("tls").join("certificate.pem")
+        );
+        assert!(tls_event_requires_reload(&equivalent_event, &watched));
+
+        let root = current_directory
+            .ancestors()
+            .last()
+            .expect("absolute current directory has a root");
+        let root_overflow = root
+            .join("..")
+            .join("..")
+            .join("tls")
+            .join("certificate.pem");
+        assert_eq!(
+            comparable_path(&root_overflow),
+            Err("TLS material paths must not contain parent traversal (`..`)")
+        );
+        let relative_parents = Path::new("..")
+            .join("..")
+            .join("tls")
+            .join("certificate.pem");
+        assert_eq!(
+            absolute_path(&relative_parents, Some(&current_directory)),
+            Err("TLS material paths must not contain parent traversal (`..`)")
+        );
+        assert_eq!(
+            absolute_path(&certificate, None),
+            Ok(certificate),
+            "absolute TLS paths do not require a current directory"
+        );
+        assert_eq!(
+            absolute_path(Path::new("tls/certificate.pem"), None),
+            Err("relative TLS material paths require a current directory")
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn rejects_windows_drive_relative_tls_paths() {
+        assert_eq!(
+            absolute_path(
+                Path::new(r"C:tls\certificate.pem"),
+                Some(Path::new(r"C:\host-config")),
+            ),
+            Err("TLS material paths must resolve to an absolute path")
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn matches_windows_watcher_paths_case_insensitively() {
+        let watched = [
+            PathBuf::from(r"C:\Host\TLS\CERTIFICATE.PEM"),
+            PathBuf::from(r"C:\Host\TLS\PRIVATE-KEY.PEM"),
+        ];
+        let certificate_change =
+            Event::new(EventKind::Any).add_path(PathBuf::from(r"c:\host\tls\certificate.pem"));
+
+        assert!(tls_event_requires_reload(&certificate_change, &watched));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn retries_a_failed_tls_directory_watch_until_registration_succeeds() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = tempfile::tempdir().expect("create TLS watch retry fixture");
+        fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700))
+            .expect("restrict TLS watch retry fixture");
+        let directory = root.path().join("temporarily-missing");
+        let directories = BTreeSet::from([directory.clone()]);
+        let mut watcher = RecommendedWatcher::new(|_| {}, NotifyConfig::default())
+            .expect("create real filesystem watcher");
+
+        assert!(
+            refresh_tls_directory_watches(&mut watcher, &directories).is_err(),
+            "the missing directory must force the initial registration failure"
+        );
+        let create_directory = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(90)).await;
+            fs::create_dir(&directory).expect("restore watched TLS directory");
+            fs::set_permissions(&directory, fs::Permissions::from_mode(0o700))
+                .expect("restrict restored TLS directory");
+        });
+
+        let attempts = tokio::time::timeout(
+            Duration::from_secs(2),
+            retry_tls_directory_watches(&mut watcher, &directories),
+        )
+        .await
+        .expect("bounded retry must restore the TLS directory watch");
+        create_directory.await.expect("join directory restoration");
+
+        assert!(attempts >= 2, "at least one scheduled retry must fail");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn initial_tls_watch_accepts_an_execute_only_parent_namespace() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = tempfile::tempdir().expect("create execute-only watch fixture");
+        fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700))
+            .expect("restrict execute-only watch fixture");
+        let ancestor = root.path().join("search-only");
+        let boundary = ancestor.join("tls");
+        fs::create_dir(&ancestor).expect("create watch ancestor");
+        fs::create_dir(&boundary).expect("create watched TLS boundary");
+        fs::set_permissions(&boundary, fs::Permissions::from_mode(0o700))
+            .expect("restrict watched TLS boundary");
+        fs::set_permissions(&ancestor, fs::Permissions::from_mode(0o100))
+            .expect("make watch ancestor execute-only");
+
+        let mut parent_watcher = RecommendedWatcher::new(|_| {}, NotifyConfig::default())
+            .expect("create parent namespace watcher");
+        assert!(
+            parent_watcher
+                .watch(&ancestor, RecursiveMode::NonRecursive)
+                .is_err(),
+            "Linux inotify must reject an unreadable parent namespace"
+        );
+        let mut watcher = RecommendedWatcher::new(|_| {}, NotifyConfig::default())
+            .expect("create TLS boundary watcher");
+        let installed =
+            install_initial_tls_directory_watches(&mut watcher, &BTreeSet::from([boundary]));
+
+        fs::set_permissions(&ancestor, fs::Permissions::from_mode(0o700))
+            .expect("restore watch ancestor for fixture cleanup");
+        assert!(
+            installed.is_ok(),
+            "an optional parent watch must not reject a safe TLS boundary"
+        );
+    }
+
+    #[cfg(all(feature = "test-support", unix))]
+    #[tokio::test]
+    async fn reconciles_the_startup_gap_and_later_notify_rotation() {
+        use satelle_host::{ApiScopes, test_support::TestStateDir};
+        use std::net::Ipv4Addr;
+        use std::os::unix::fs::PermissionsExt;
+
+        let state = TestStateDir::new().expect("create secure Host state directory");
+        let service = HostService::local_demo_for_tests_at(state.path())
+            .expect("construct deterministic Host service");
+        let host_identity = service
+            .initialize_daemon()
+            .expect("initialize Host state")
+            .host_identity()
+            .to_string();
+        let token = ApiBearerToken::generate().expect("generate API token");
+        service
+            .register_api_token(&token, "principal-cli-tls-reload", ApiScopes::READ, None)
+            .expect("register API token");
+        let initial = rcgen::generate_simple_self_signed(["localhost".to_string()])
+            .expect("generate initial certificate");
+        let replacement = rcgen::generate_simple_self_signed(["localhost".to_string()])
+            .expect("generate replacement certificate");
+        let live_rotation = rcgen::generate_simple_self_signed(["localhost".to_string()])
+            .expect("generate live-rotation certificate");
+        let directory_rotation = rcgen::generate_simple_self_signed(["localhost".to_string()])
+            .expect("generate directory-rotation certificate");
+        let initial_tls = DaemonTlsConfig::from_pem(
+            initial.cert.pem().as_bytes(),
+            initial.signing_key.serialize_pem().as_bytes(),
+        )
+        .expect("validate initial TLS configuration");
+        let server = DaemonServer::bind_tls(
+            service,
+            DaemonServerConfig::loopback(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))),
+            initial_tls,
+        )
+        .await
+        .expect("bind initial TLS listener");
+
+        // Model a rotation that happened after the daemon's initial read but
+        // before watcher registration. No filesystem event can be relied on.
+        let tls_root = state.path().join("tls");
+        let active_directory = tls_root.join("current");
+        fs::create_dir(&tls_root).expect("create TLS namespace");
+        fs::create_dir(&active_directory).expect("create active TLS directory");
+        fs::set_permissions(&tls_root, fs::Permissions::from_mode(0o700))
+            .expect("restrict TLS namespace");
+        fs::set_permissions(&active_directory, fs::Permissions::from_mode(0o700))
+            .expect("restrict active TLS directory");
+        let certificate_path = active_directory.join("certificate.pem");
+        let private_key_path = active_directory.join("private-key.pem");
+        fs::write(&certificate_path, replacement.cert.pem())
+            .expect("write replacement certificate");
+        fs::write(&private_key_path, replacement.signing_key.serialize_pem())
+            .expect("write replacement private key");
+        fs::set_permissions(&certificate_path, fs::Permissions::from_mode(0o600))
+            .expect("restrict replacement certificate");
+        fs::set_permissions(&private_key_path, fs::Permissions::from_mode(0o600))
+            .expect("restrict replacement private key");
+
+        let watcher = DaemonTlsWatcher::start(
+            certificate_path.clone(),
+            private_key_path.clone(),
+            server
+                .tls_reloader()
+                .expect("TLS listener exposes its reload handle"),
+        )
+        .unwrap_or_else(|_| panic!("start TLS file watcher"));
+        let url = format!(
+            "https://localhost:{}/v1/host/status",
+            server.local_addr().port()
+        );
+        let authorization = format!("Bearer {}", token.expose().as_str());
+        let client = reqwest::Client::builder()
+            .tls_certs_only([
+                reqwest::Certificate::from_pem(replacement.cert.pem().as_bytes())
+                    .expect("parse replacement trust root"),
+            ])
+            .build()
+            .expect("build replacement HTTPS client");
+        let response = client
+            .get(&url)
+            .header("Authorization", &authorization)
+            .header("Satelle-Expected-Host-Identity", &host_identity)
+            .header(
+                "Satelle-Request-Id",
+                satelle_transport::RequestId::new().to_string(),
+            )
+            .send()
+            .await
+            .expect("request Host status with reconciled certificate");
+
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+
+        // A second rotation after watcher startup must travel through notify,
+        // the bounded dirty flag, and the background reload task. Leave a
+        // mismatched pair visible long enough to exercise failed validation;
+        // the later key event must still install the valid pair.
+        fs::write(&certificate_path, live_rotation.cert.pem())
+            .expect("write live-rotation certificate");
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        fs::write(&private_key_path, live_rotation.signing_key.serialize_pem())
+            .expect("write live-rotation private key");
+        let live_client = reqwest::Client::builder()
+            .tls_certs_only([
+                reqwest::Certificate::from_pem(live_rotation.cert.pem().as_bytes())
+                    .expect("parse live-rotation trust root"),
+            ])
+            .build()
+            .expect("build live-rotation HTTPS client");
+        let live_response = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if let Ok(response) = live_client
+                    .get(&url)
+                    .header("Authorization", &authorization)
+                    .header("Satelle-Expected-Host-Identity", &host_identity)
+                    .header(
+                        "Satelle-Request-Id",
+                        satelle_transport::RequestId::new().to_string(),
+                    )
+                    .send()
+                    .await
+                    && response.status() == reqwest::StatusCode::OK
+                {
+                    break response;
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .expect("notify must install the live-rotation certificate");
+
+        assert_eq!(live_response.status(), reqwest::StatusCode::OK);
+
+        // Certificate managers may rotate an entire directory atomically. The
+        // namespace watch must notice the swap, re-register the new directory,
+        // and load the pair now present at the original paths.
+        let replacement_directory = tls_root.join("replacement");
+        let retired_directory = tls_root.join("retired");
+        fs::create_dir(&replacement_directory).expect("create replacement TLS directory");
+        fs::set_permissions(&replacement_directory, fs::Permissions::from_mode(0o700))
+            .expect("restrict replacement TLS directory");
+        let replacement_certificate = replacement_directory.join("certificate.pem");
+        let replacement_private_key = replacement_directory.join("private-key.pem");
+        fs::write(&replacement_certificate, directory_rotation.cert.pem())
+            .expect("write directory-rotation certificate");
+        fs::write(
+            &replacement_private_key,
+            directory_rotation.signing_key.serialize_pem(),
+        )
+        .expect("write directory-rotation private key");
+        fs::set_permissions(&replacement_certificate, fs::Permissions::from_mode(0o600))
+            .expect("restrict directory-rotation certificate");
+        fs::set_permissions(&replacement_private_key, fs::Permissions::from_mode(0o600))
+            .expect("restrict directory-rotation private key");
+        fs::rename(&active_directory, &retired_directory).expect("retire active TLS directory");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(
+            !active_directory.exists(),
+            "reload validation must not recreate a temporarily missing boundary"
+        );
+        fs::rename(&replacement_directory, &active_directory)
+            .expect("install replacement TLS directory");
+
+        let directory_client = reqwest::Client::builder()
+            .tls_certs_only([reqwest::Certificate::from_pem(
+                directory_rotation.cert.pem().as_bytes(),
+            )
+            .expect("parse directory-rotation trust root")])
+            .build()
+            .expect("build directory-rotation HTTPS client");
+        let directory_response = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if let Ok(response) = directory_client
+                    .get(&url)
+                    .header("Authorization", &authorization)
+                    .header("Satelle-Expected-Host-Identity", &host_identity)
+                    .header(
+                        "Satelle-Request-Id",
+                        satelle_transport::RequestId::new().to_string(),
+                    )
+                    .send()
+                    .await
+                    && response.status() == reqwest::StatusCode::OK
+                {
+                    break response;
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .expect("notify must install the atomically replaced TLS directory");
+
+        assert_eq!(directory_response.status(), reqwest::StatusCode::OK);
+        drop(watcher);
+        server.shutdown().await.expect("stop TLS listener");
+    }
 }
 
 fn tls_file_failure(kind: &str, path: &std::path::Path, source: String) -> CliFailure {

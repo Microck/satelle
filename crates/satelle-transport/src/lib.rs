@@ -15,4 +15,5 @@ pub use contract::{
 };
 pub use server::{
     DaemonServer, DaemonServerConfig, DaemonServerError, DaemonTlsConfig, DaemonTlsConfigError,
+    DaemonTlsReloadError, DaemonTlsReloader,
 };

@@ -1768,10 +1768,10 @@
 - satelle does not expose an insecure direct-transport option that disables certificate or Host-name verification @spec @mvp @implemented
 - satelle MVP does not manage TLS certificate issuance or renewal for non-loopback direct Host Daemon transport @spec @mvp
 - satelle non-loopback direct transport relies on user-provided TLS termination or configured TLS materials outside MVP certificate automation @spec @mvp @implemented
-- when the Host Daemon terminates TLS, its certificate-chain and private-key files must be regular non-symlink files under a Host-owned configuration boundary, and the private key must not be readable or writable by unrelated principals @spec @mvp
+- when the Host Daemon terminates TLS, its certificate-chain and private-key files must each be regular Host-owned non-symlink files under a Host-owned configuration boundary whose full directory ancestry prevents replacement by unrelated principals, neither file may be writable by unrelated principals, and the private key must not be readable by unrelated principals @spec @mvp @implemented
 - Host Daemon TLS startup fails closed on an unreadable key, unsafe permissions, an expired certificate, or a certificate and private-key mismatch and never falls back to plaintext @spec @mvp @implemented
-- when TLS terminates in an external reverse proxy, the plaintext Host Daemon backend binds only to loopback and still requires normal Satelle bearer-token authentication and authorization @spec @mvp
-- TLS reload installs a new certificate and key atomically only after full validation; failed reload retains the previous valid TLS configuration and emits a typed diagnostic instead of exposing plaintext @spec @mvp
+- when TLS terminates in an external reverse proxy, the plaintext Host Daemon backend binds only to loopback and still requires normal Satelle bearer-token authentication and authorization @spec @mvp @implemented
+- TLS reload installs a new certificate and key atomically only after full validation; each accepted connection snapshots one configuration for its handshake, established TLS connections retain their negotiated state, only subsequent handshakes use the replacement, and failed reload retains the previous valid TLS configuration and emits a typed diagnostic instead of exposing plaintext @spec @mvp @implemented
 - satelle Host Daemon API authentication uses bearer tokens for MVP @spec @mvp @implemented
 - satelle stores Host Daemon API bearer tokens in external secret stores or token files instead of inline Satelle configuration @spec @mvp
 - satelle Host Daemon generates durable API bearer tokens by default during setup or persistent service installation @spec @mvp

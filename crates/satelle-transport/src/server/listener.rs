@@ -17,7 +17,7 @@ use std::task::{Context, Poll};
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, watch};
 use tokio::time::Sleep;
 use tokio_rustls::Accept;
 use tokio_rustls::TlsAcceptor;
@@ -31,7 +31,7 @@ pub(super) struct LimitedTcpListener {
     permits: Arc<Semaphore>,
     rejection_permits: Arc<Semaphore>,
     activity: ConnectionActivity,
-    tls_acceptor: Option<TlsAcceptor>,
+    tls_config: Option<watch::Receiver<Arc<rustls::ServerConfig>>>,
 }
 
 impl LimitedTcpListener {
@@ -44,17 +44,17 @@ impl LimitedTcpListener {
             // over-capacity caller a typed response.
             rejection_permits: Arc::new(Semaphore::new(1)),
             activity: ConnectionActivity::default(),
-            tls_acceptor: None,
+            tls_config: None,
         }
     }
 
     pub(super) fn with_tls(
         inner: TcpListener,
         max_connections: usize,
-        server_config: Arc<rustls::ServerConfig>,
+        server_config: watch::Receiver<Arc<rustls::ServerConfig>>,
     ) -> Self {
         let mut listener = Self::new(inner, max_connections);
-        listener.tls_acceptor = Some(TlsAcceptor::from(server_config));
+        listener.tls_config = Some(server_config);
         listener
     }
 
@@ -95,10 +95,20 @@ impl Listener for LimitedTcpListener {
         loop {
             match self.inner.accept().await {
                 Ok((stream, address)) => {
+                    // Snapshot at TCP acceptance, before capacity admission can
+                    // wait. A connection already accepted under one TLS
+                    // configuration must not switch certificates while queued.
+                    let tls_acceptor = self
+                        .tls_config
+                        .as_ref()
+                        .map(|server_config| TlsAcceptor::from(server_config.borrow().clone()));
+                    // Tests and idle-shutdown tracking may observe this signal.
+                    // Publish it only after the accepted socket's TLS identity
+                    // is fixed so observers cannot race the snapshot.
                     let activity = self.activity.connect();
                     let admission = self.acquire_admission().await;
                     let _ = stream.set_nodelay(true);
-                    let stream = match &self.tls_acceptor {
+                    let stream = match tls_acceptor {
                         // Hyper polls each handshake in its own bounded
                         // connection task. The deadline prevents silent peers
                         // from retaining every admission permit indefinitely.
@@ -433,6 +443,11 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio_rustls::TlsConnector;
 
+    fn tls_receiver(tls: DaemonTlsConfig) -> watch::Receiver<Arc<rustls::ServerConfig>> {
+        let (_, receiver) = watch::channel(tls.0);
+        receiver
+    }
+
     #[tokio::test]
     async fn idle_rejected_connection_releases_its_bounded_response_lane() {
         let listener = TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
@@ -483,7 +498,7 @@ mod tests {
             .await
             .expect("bind test listener");
         let address = listener.local_addr().expect("read test listener address");
-        let mut listener = LimitedTcpListener::with_tls(listener, 0, tls.0);
+        let mut listener = LimitedTcpListener::with_tls(listener, 0, tls_receiver(tls));
         let (client, accepted) = tokio::join!(TcpStream::connect(address), listener.accept());
         let client = client.expect("open over-capacity TLS connection");
         let (mut rejected, _) = accepted;
@@ -517,6 +532,86 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn accepted_connection_snapshots_tls_before_waiting_for_admission() {
+        let initial = rcgen::generate_simple_self_signed(["localhost".to_string()])
+            .expect("generate initial direct transport certificate");
+        let replacement = rcgen::generate_simple_self_signed(["localhost".to_string()])
+            .expect("generate replacement direct transport certificate");
+        let initial_tls = DaemonTlsConfig::from_pem(
+            initial.cert.pem().as_bytes(),
+            initial.signing_key.serialize_pem().as_bytes(),
+        )
+        .expect("build initial TLS configuration");
+        let replacement_tls = DaemonTlsConfig::from_pem(
+            replacement.cert.pem().as_bytes(),
+            replacement.signing_key.serialize_pem().as_bytes(),
+        )
+        .expect("build replacement TLS configuration");
+        let client_config =
+            crate::transport_tls::websocket_tls_config(Some(initial.cert.pem().as_bytes()))
+                .unwrap_or_else(|_| panic!("build client trusting the initial certificate"));
+        let connector = TlsConnector::from(client_config);
+        let (tls_sender, tls_receiver) = watch::channel(initial_tls.0);
+        let tcp_listener = TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
+            .await
+            .expect("bind test listener");
+        let address = tcp_listener
+            .local_addr()
+            .expect("read test listener address");
+        let mut listener = LimitedTcpListener::with_tls(tcp_listener, 1, tls_receiver);
+        let activity = listener.activity();
+        let admission_permit = Arc::clone(&listener.permits)
+            .acquire_owned()
+            .await
+            .expect("occupy normal admission lane");
+        let rejection_permit = Arc::clone(&listener.rejection_permits)
+            .acquire_owned()
+            .await
+            .expect("occupy typed-rejection lane");
+        let accept_task = tokio::spawn(async move { listener.accept().await });
+        let client = TcpStream::connect(address)
+            .await
+            .expect("open queued TLS connection");
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while activity.snapshot().0 == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("listener must accept the TCP connection before TLS reload");
+        tls_sender
+            .send(replacement_tls.0)
+            .expect("publish replacement TLS configuration");
+        drop(admission_permit);
+
+        let (mut server, _) = accept_task.await.expect("join queued accept task");
+        assert!(server.admitted());
+        let server_read = tokio::spawn(async move {
+            let mut byte = [0_u8; 1];
+            server.read_exact(&mut byte).await?;
+            Ok::<_, io::Error>(byte)
+        });
+        let server_name = ServerName::try_from("localhost").expect("valid test server name");
+        let mut client = connector
+            .connect(server_name, client)
+            .await
+            .expect("accepted connection retains the initial TLS configuration");
+        client
+            .write_all(b"x")
+            .await
+            .expect("write through queued TLS connection");
+        assert_eq!(
+            server_read
+                .await
+                .expect("join queued server reader")
+                .expect("read queued TLS byte"),
+            [b'x']
+        );
+        drop(rejection_permit);
+    }
+
+    #[tokio::test]
     async fn idle_tls_handshake_releases_its_admission_permit() {
         let certified = rcgen::generate_simple_self_signed(["localhost".to_string()])
             .expect("generate direct transport certificate");
@@ -529,7 +624,7 @@ mod tests {
             .await
             .expect("bind test listener");
         let address = listener.local_addr().expect("read test listener address");
-        let mut listener = LimitedTcpListener::with_tls(listener, 1, tls.0);
+        let mut listener = LimitedTcpListener::with_tls(listener, 1, tls_receiver(tls));
         let (client, accepted) = tokio::join!(TcpStream::connect(address), listener.accept());
         let _client = client.expect("open idle TLS connection");
         let (mut stalled, _) = accepted;
@@ -571,7 +666,7 @@ mod tests {
             .await
             .expect("bind test listener");
         let address = listener.local_addr().expect("read test listener address");
-        let mut listener = LimitedTcpListener::with_tls(listener, 1, tls.0);
+        let mut listener = LimitedTcpListener::with_tls(listener, 1, tls_receiver(tls));
         let (client, accepted) = tokio::join!(TcpStream::connect(address), listener.accept());
         let mut client = client.expect("open malformed TLS connection");
         let (mut server, _) = accepted;

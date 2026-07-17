@@ -88,6 +88,43 @@ fn host_start_rejects_a_private_key_readable_by_other_users() {
 
 #[cfg(unix)]
 #[test]
+fn host_start_rejects_a_certificate_writable_by_other_users() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let state = state_dir();
+    fs::set_permissions(state.path(), fs::Permissions::from_mode(0o700))
+        .expect("make TLS fixture boundary owner-only");
+    let certificate = state.path().join("certificate.pem");
+    let private_key = state.path().join("private-key.pem");
+    let certified = rcgen::generate_simple_self_signed(["localhost".to_string()])
+        .expect("generate valid matching TLS fixture");
+    fs::write(&certificate, certified.cert.pem()).expect("write certificate fixture");
+    fs::write(&private_key, certified.signing_key.serialize_pem())
+        .expect("write private key fixture");
+    fs::set_permissions(&certificate, fs::Permissions::from_mode(0o666))
+        .expect("make certificate unsafe");
+    fs::set_permissions(&private_key, fs::Permissions::from_mode(0o600))
+        .expect("restrict private key");
+
+    production_satelle()
+        .args([
+            "host",
+            "start",
+            "--foreground",
+            "--tls-cert",
+            certificate.to_str().expect("UTF-8 certificate path"),
+            "--tls-key",
+            private_key.to_str().expect("UTF-8 key path"),
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "violates the required file security policy",
+        ));
+}
+
+#[cfg(unix)]
+#[test]
 fn host_start_rejects_tls_files_outside_an_owner_only_boundary() {
     use std::os::unix::fs::PermissionsExt;
 
