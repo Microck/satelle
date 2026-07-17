@@ -35,7 +35,9 @@ use satelle_core::{
     read_owner_controlled_config_file, read_owner_only_secret_config_file, resolve_path_set,
     utc_now,
 };
-use satelle_host::{ApiBearerToken, HostService, ProviderComputerUseIntent};
+use satelle_host::{
+    ApiBearerToken, HostService, ProviderComputerUseIntent, contains_api_bearer_token,
+};
 use satelle_transport::{
     DaemonServer, DaemonServerConfig, DaemonServerError, DaemonTlsConfig, DaemonTlsConfigError,
     DaemonTlsReloadError, DaemonTlsReloader, TurnRequest,
@@ -597,6 +599,14 @@ impl SetupComponent {
 
 fn main() -> ExitCode {
     let args = std::env::args_os().collect::<Vec<_>>();
+    if process_has_disallowed_bearer_token(&args) {
+        let error = SatelleError::invalid_usage(
+            "bearer tokens are not accepted through command-line arguments or environment variables; configure a user-level file-backed api_token descriptor",
+        );
+        let format = parser_error_format(&args);
+        print_error(&error, format);
+        return ExitCode::from(error.exit_code() as u8);
+    }
     let cli = match Cli::try_parse_from(&args) {
         Ok(cli) => cli,
         Err(error) if !error.use_stderr() => {
@@ -620,6 +630,30 @@ fn main() -> ExitCode {
             print_error(&failure.error, error_format);
             ExitCode::from(failure.error.exit_code() as u8)
         }
+    }
+}
+
+fn process_has_disallowed_bearer_token(args: &[std::ffi::OsString]) -> bool {
+    args.iter()
+        .any(|value| contains_api_bearer_token(&value.to_string_lossy()))
+        || std::env::vars_os().any(|(name, value)| {
+            contains_api_bearer_token(&name.to_string_lossy())
+                || contains_api_bearer_token(&value.to_string_lossy())
+        })
+}
+
+#[cfg(test)]
+mod process_boundary_tests {
+    use super::*;
+
+    #[test]
+    fn bearer_token_in_argument_zero_is_rejected() {
+        let token = ApiBearerToken::generate().expect("generate bearer token");
+        let exposed = token.expose();
+
+        assert!(process_has_disallowed_bearer_token(&[exposed
+            .as_str()
+            .into()]));
     }
 }
 

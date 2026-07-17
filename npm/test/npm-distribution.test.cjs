@@ -411,9 +411,9 @@ test("package manifests align versions, constraints, dependencies, and executabl
   const unscopedManifest = readJson(path.join(repositoryRoot, "npm", "satelle-unscoped", "package.json"));
 
   assert.equal(rootManifest.private, true);
-  // Native packages have mutually exclusive os/cpu constraints. Treating them as npm
-  // workspaces makes installation fail on every platform except their own.
-  assert.equal(rootManifest.workspaces, undefined);
+  // Native packages have mutually exclusive os/cpu constraints. Keep only the
+  // platform-neutral documentation site in the workspace graph.
+  assert.deepEqual(rootManifest.workspaces, ["website"]);
   assert.equal(canonicalManifest.name, "@microck/satelle");
   assert.equal(canonicalManifest.bin.satelle, "bin/satelle.cjs");
   assert.deepEqual(canonicalManifest.exports, { "./launcher": "./bin/satelle.cjs" });

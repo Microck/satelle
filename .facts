@@ -1794,7 +1794,7 @@
 - a successful bearer-token issuance or rotation response contains durable token metadata plus raw token material generated for that response and never persisted by Satelle @spec @later
 - bearer-token verification uses a timing-safe comparison @spec @mvp @implemented
 - bearer tokens are accepted only through the Authorization header @spec @mvp @implemented
-- bearer tokens are rejected in URLs, query strings, cookies, JSON bodies, WebSocket subscription messages, command-line arguments, and process environment variables @spec @mvp
+- bearer tokens are rejected in URLs, query strings, cookies, JSON bodies, WebSocket subscription messages, command-line arguments, and process environment variables @spec @mvp @implemented
 - token logs and audit records identify tokens only by non-secret token id @spec @mvp
 - admin Principals can rotate or revoke individual bearer tokens without replacing unrelated tokens @spec @later
 - bearer-token rotation preserves the token id and API Principal identity, increments its credential revision, atomically invalidates the previous verifier, and commits the replacement verifier before returning the replacement raw token @spec @later

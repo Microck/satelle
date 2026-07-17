@@ -23,7 +23,9 @@ mod storage;
 mod test_runtime;
 
 use api_auth::EphemeralApiAuthenticator;
-pub use api_auth::{ApiBearerToken, ApiBearerTokenError, ApiPrincipal, ApiScopes};
+pub use api_auth::{
+    ApiBearerToken, ApiBearerTokenError, ApiPrincipal, ApiScopes, contains_api_bearer_token,
+};
 use codex_capabilities::{
     BlockerReason, CodexVersionEvidence, Phase0CapabilityBlocker, Phase0SupportVerdict,
     RequiredCapability, discover_phase0, evaluate_phase0_support,

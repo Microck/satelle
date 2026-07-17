@@ -633,7 +633,17 @@ fn decode_subscribe(
     text: &str,
     fallback_request_id: &RequestId,
 ) -> Result<SubscribeRequest, (RequestId, WsCloseReason)> {
-    let probe = serde_json::from_str::<ControlProbe>(text)
+    let value = super::api_json::parse_json_value(text.as_bytes())
+        .map_err(|_| (fallback_request_id.clone(), WsCloseReason::InvalidRequest))?;
+    let message_request_id = value
+        .get("request_id")
+        .and_then(Value::as_str)
+        .and_then(|request_id| RequestId::parse(request_id).ok())
+        .unwrap_or_else(|| fallback_request_id.clone());
+    if super::auth::json_contains_bearer_token(&value) {
+        return Err((message_request_id, WsCloseReason::InvalidRequest));
+    }
+    let probe = serde_json::from_value::<ControlProbe>(value.clone())
         .map_err(|_| (fallback_request_id.clone(), WsCloseReason::InvalidRequest))?;
     if probe.schema_version != "satelle.ws.control.v1" {
         return Err((probe.request_id, WsCloseReason::UnsupportedSchema));
@@ -641,8 +651,6 @@ fn decode_subscribe(
     if probe.message_type != "subscribe" {
         return Err((probe.request_id, WsCloseReason::InvalidRequest));
     }
-    let value = serde_json::from_str::<Value>(text)
-        .map_err(|_| (probe.request_id.clone(), WsCloseReason::InvalidRequest))?;
     if value
         .get("subscriptions")
         .and_then(Value::as_array)
@@ -650,7 +658,7 @@ fn decode_subscribe(
     {
         return Err((probe.request_id, WsCloseReason::CapacityExceeded));
     }
-    serde_json::from_str::<SubscribeRequest>(text)
+    serde_json::from_value::<SubscribeRequest>(value)
         .map_err(|_| (probe.request_id, WsCloseReason::InvalidRequest))
 }
 

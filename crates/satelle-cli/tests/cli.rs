@@ -39,6 +39,46 @@ fn production_satelle() -> Command {
 }
 
 #[test]
+fn bearer_tokens_are_rejected_in_process_arguments_and_environment() {
+    let token = ApiBearerToken::generate().expect("generate bearer token");
+    let exposed = token.expose();
+
+    for mut command in [
+        {
+            let mut command = satelle();
+            command.env_remove("SATELLE_API_TOKEN");
+            command.args(["run", "--host", "local-demo", exposed.as_str()]);
+            command
+        },
+        {
+            let mut command = satelle();
+            command
+                .env("SATELLE_API_TOKEN", exposed.as_str())
+                .args(["paths", "--json"]);
+            command
+        },
+        {
+            let mut command = satelle();
+            command
+                .env(exposed.as_str(), "set")
+                .args(["paths", "--json"]);
+            command
+        },
+    ] {
+        let output = command.output().expect("run token-carrier rejection");
+        assert!(!output.status.success());
+        assert_privacy_canaries_absent(
+            "CLI token-carrier rejection",
+            &[output.stdout.as_slice(), output.stderr.as_slice()].concat(),
+            &[exposed.as_str()],
+        );
+        assert!(String::from_utf8_lossy(&output.stderr).contains(
+            "bearer tokens are not accepted through command-line arguments or environment variables"
+        ));
+    }
+}
+
+#[test]
 fn host_start_requires_complete_tls_material() {
     production_satelle()
         .args([
