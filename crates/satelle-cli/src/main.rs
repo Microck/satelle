@@ -138,6 +138,11 @@ impl<'a> ConfigContext<'a> {
         resolved.as_ref().map_err(|error| failure(error.clone()))
     }
 
+    fn mcp_install_profile(&self) -> Result<Option<satelle_core::SelectedProfile>, CliFailure> {
+        let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        satelle_core::resolve_invocation_profile(&cwd, self.flag_profile).map_err(failure)
+    }
+
     fn resolve_host(&self, flag_host: Option<&str>) -> Result<SelectedHost, CliFailure> {
         self.load()?
             .resolve_host(flag_host)
@@ -184,6 +189,28 @@ enum Command {
 #[derive(Subcommand, Debug)]
 enum McpCommand {
     Serve,
+    Install(McpInstallCommand),
+}
+
+#[derive(Args, Debug)]
+struct McpInstallCommand {
+    #[arg(
+        long,
+        value_enum,
+        required_unless_present = "all",
+        conflicts_with = "all"
+    )]
+    target: Vec<mcp::install::InstallTarget>,
+    #[arg(long)]
+    all: bool,
+    #[arg(long, default_value = "satelle")]
+    server_name: String,
+    #[arg(long)]
+    satelle_path: Option<PathBuf>,
+    #[arg(long)]
+    dry_run: bool,
+    #[command(flatten)]
+    output_args: OutputArgs,
 }
 
 #[derive(Args, Debug)]
@@ -766,8 +793,100 @@ fn execute_command(
         Command::Mcp {
             command: McpCommand::Serve,
         } => mcp::serve(profile).map(|_| None),
+        Command::Mcp {
+            command: McpCommand::Install(command),
+        } => run_mcp_install(command, profile, &config, output).map(|_| None),
         Command::Support { command } => run_support(command).map(|_| None),
     }
+}
+
+fn mcp_install_request(
+    command: McpInstallCommand,
+    profile: Option<&str>,
+) -> mcp::install::InstallRequest {
+    mcp::install::InstallRequest {
+        targets: command.target,
+        all: command.all,
+        server_name: command.server_name,
+        satelle_path: command.satelle_path,
+        profile: profile.map(str::to_owned),
+        dry_run: command.dry_run,
+    }
+}
+
+fn mcp_install_profile(selected: Option<&satelle_core::SelectedProfile>) -> Option<&str> {
+    selected
+        .filter(|profile| {
+            matches!(
+                profile.source,
+                satelle_core::ProfileSelectionSource::CliFlag
+                    | satelle_core::ProfileSelectionSource::Environment
+            )
+        })
+        .map(|profile| profile.name.as_str())
+}
+
+fn run_mcp_install(
+    command: McpInstallCommand,
+    _profile: Option<&str>,
+    config: &ConfigContext<'_>,
+    output: OutputFormat,
+) -> Result<(), CliFailure> {
+    let selected_profile = config.mcp_install_profile()?;
+    let effective_profile = mcp_install_profile(selected_profile.as_ref());
+    let report = mcp::install::install(mcp_install_request(command, effective_profile))?;
+
+    if output.is_json() {
+        print_json(&mcp_install_report_json(&report)).map_err(failure)?;
+        return Ok(());
+    }
+
+    for change in report.changes {
+        let target = change.target.label();
+        if change.skipped {
+            println!("{target}: skipped");
+            continue;
+        }
+
+        let path = change
+            .path
+            .expect("non-skipped MCP install changes always have a config path");
+        let action = match (report.dry_run, change.changed) {
+            (true, true) => "would write",
+            (false, true) => "wrote",
+            (_, false) => "unchanged",
+        };
+        println!("{target}: {action} {}", path.display());
+    }
+
+    Ok(())
+}
+
+fn mcp_install_report_json(report: &mcp::install::InstallReport) -> serde_json::Value {
+    let changes = report
+        .changes
+        .iter()
+        .map(|change| {
+            let action = match (report.dry_run, change.changed, change.skipped) {
+                (_, _, true) => "skipped",
+                (true, true, false) => "would_write",
+                (false, true, false) => "wrote",
+                (_, false, false) => "unchanged",
+            };
+            json!({
+                "target": change.target.slug(),
+                "path": change.path.as_ref().map(|path| path.display().to_string()),
+                "changed": change.changed,
+                "skipped": change.skipped,
+                "action": action,
+            })
+        })
+        .collect::<Vec<_>>();
+    json!({
+        "schema_version": "satelle.mcp.install.v1",
+        "dry_run": report.dry_run,
+        "changes": changes,
+    })
 }
 
 struct HistoryTarget<'a> {
@@ -956,6 +1075,9 @@ fn history_target(command: &Command) -> Option<HistoryTarget<'_>> {
                 .history_session_id()
                 .and_then(canonical_history_session_id),
         },
+        Command::Mcp {
+            command: McpCommand::Install(command),
+        } if command.dry_run => return None,
         Command::Mcp { .. } => HistoryTarget {
             family: "mcp",
             selects_host: false,
@@ -968,6 +1090,278 @@ fn history_target(command: &Command) -> Option<HistoryTarget<'_>> {
         | Command::Support { .. } => return None,
     };
     Some(target)
+}
+
+#[cfg(test)]
+mod mcp_install_cli_tests {
+    use super::*;
+
+    fn parse_install(arguments: &[&str]) -> McpInstallCommand {
+        let cli = Cli::try_parse_from(arguments).expect("parse MCP install command");
+        let Command::Mcp {
+            command: McpCommand::Install(command),
+        } = cli.command
+        else {
+            panic!("expected MCP install command");
+        };
+        command
+    }
+
+    #[test]
+    fn accepts_every_supported_target_spelling() {
+        let targets = [
+            ("claude-code", mcp::install::InstallTarget::ClaudeCode),
+            ("claude-desktop", mcp::install::InstallTarget::ClaudeDesktop),
+            ("codex", mcp::install::InstallTarget::Codex),
+            ("cursor", mcp::install::InstallTarget::Cursor),
+            ("vscode", mcp::install::InstallTarget::VsCode),
+            ("windsurf", mcp::install::InstallTarget::Windsurf),
+            ("gemini", mcp::install::InstallTarget::Gemini),
+            ("opencode", mcp::install::InstallTarget::OpenCode),
+            ("cline", mcp::install::InstallTarget::Cline),
+            ("roo-code", mcp::install::InstallTarget::RooCode),
+            ("droid", mcp::install::InstallTarget::Droid),
+            ("antigravity", mcp::install::InstallTarget::Antigravity),
+        ];
+
+        for (spelling, expected) in targets {
+            let command = parse_install(&["satelle", "mcp", "install", "--target", spelling]);
+            assert_eq!(command.target, [expected], "target spelling {spelling}");
+        }
+    }
+
+    #[test]
+    fn explicit_profile_reaches_the_installer_request() {
+        let cli = Cli::try_parse_from([
+            "satelle",
+            "--profile",
+            "work",
+            "mcp",
+            "install",
+            "--target",
+            "codex",
+        ])
+        .expect("parse profiled MCP install command");
+        let Command::Mcp {
+            command: McpCommand::Install(command),
+        } = cli.command
+        else {
+            panic!("expected MCP install command");
+        };
+
+        let selected = satelle_core::SelectedProfile {
+            name: cli.profile.expect("explicit profile"),
+            source: satelle_core::ProfileSelectionSource::CliFlag,
+        };
+        let request = mcp_install_request(command, mcp_install_profile(Some(&selected)));
+        assert_eq!(request.profile.as_deref(), Some("work"));
+    }
+
+    #[test]
+    fn environment_selected_profile_reaches_the_installer_request() {
+        let selected = satelle_core::SelectedProfile {
+            name: "work".to_string(),
+            source: satelle_core::ProfileSelectionSource::Environment,
+        };
+        let command = parse_install(&["satelle", "mcp", "install", "--target", "cursor"]);
+
+        let request = mcp_install_request(command, mcp_install_profile(Some(&selected)));
+
+        assert_eq!(request.profile.as_deref(), Some("work"));
+    }
+
+    #[test]
+    fn project_selected_profile_is_not_pinned_in_the_global_installer_request() {
+        let selected = satelle_core::SelectedProfile {
+            name: "project".to_string(),
+            source: satelle_core::ProfileSelectionSource::ProjectConfig,
+        };
+        let command = parse_install(&["satelle", "mcp", "install", "--target", "cursor"]);
+
+        let request = mcp_install_request(command, mcp_install_profile(Some(&selected)));
+
+        assert_eq!(request.profile, None);
+    }
+
+    #[test]
+    fn mcp_install_does_not_consume_a_project_aware_config_failure() {
+        let resolved = Arc::new(OnceLock::new());
+        assert!(
+            resolved
+                .set(Err(SatelleError::profile_not_found(
+                    Path::new("/test/project/.satelle/config.toml"),
+                    "project-only",
+                    Vec::new(),
+                )))
+                .is_ok()
+        );
+        let config = ConfigContext {
+            flag_profile: None,
+            resolved,
+        };
+        // The invalid target selection proves the installer reached its own
+        // validation without consuming the cached project-aware failure.
+        let command = McpInstallCommand {
+            target: Vec::new(),
+            all: false,
+            server_name: "satelle".to_string(),
+            satelle_path: None,
+            dry_run: false,
+            output_args: OutputArgs::default(),
+        };
+
+        let failure = run_mcp_install(command, None, &config, OutputFormat::Human)
+            .expect_err("installer validation must remain independent of project config");
+
+        assert_eq!(failure.error.code, ErrorCode::InvalidUsage);
+        assert_eq!(
+            failure.error.message,
+            "select at least one --target or use --all"
+        );
+    }
+
+    #[test]
+    fn parses_target_name_path_and_dry_run_options() {
+        let command = parse_install(&[
+            "satelle",
+            "mcp",
+            "install",
+            "--target",
+            "cursor",
+            "--target",
+            "codex",
+            "--server-name",
+            "satelle_tools",
+            "--satelle-path",
+            "/opt/satelle/bin/satelle",
+            "--dry-run",
+        ]);
+
+        assert_eq!(
+            command.target,
+            [
+                mcp::install::InstallTarget::Cursor,
+                mcp::install::InstallTarget::Codex,
+            ]
+        );
+        assert!(!command.all);
+        assert_eq!(command.server_name, "satelle_tools");
+        assert_eq!(
+            command.satelle_path,
+            Some(PathBuf::from("/opt/satelle/bin/satelle"))
+        );
+        assert!(command.dry_run);
+    }
+
+    #[test]
+    fn parses_all_with_canonical_defaults() {
+        let command = parse_install(&["satelle", "mcp", "install", "--all"]);
+
+        assert!(command.target.is_empty());
+        assert!(command.all);
+        assert_eq!(command.server_name, "satelle");
+        assert_eq!(command.satelle_path, None);
+        assert!(!command.dry_run);
+    }
+
+    #[test]
+    fn mcp_install_json_report_has_a_closed_versioned_shape() {
+        let command = parse_install(&[
+            "satelle",
+            "mcp",
+            "install",
+            "--target",
+            "cursor",
+            "--dry-run",
+            "--json",
+        ]);
+        assert!(command.output_args.requests_json());
+
+        let report = mcp::install::InstallReport {
+            dry_run: true,
+            changes: vec![
+                mcp::install::InstallChange {
+                    target: mcp::install::InstallTarget::Cursor,
+                    path: Some(PathBuf::from("/tmp/mcp.json")),
+                    changed: true,
+                    skipped: false,
+                },
+                mcp::install::InstallChange {
+                    target: mcp::install::InstallTarget::ClaudeDesktop,
+                    path: None,
+                    changed: false,
+                    skipped: true,
+                },
+            ],
+        };
+
+        assert_eq!(
+            mcp_install_report_json(&report),
+            json!({
+                "schema_version": "satelle.mcp.install.v1",
+                "dry_run": true,
+                "changes": [
+                    {
+                        "target": "cursor",
+                        "path": "/tmp/mcp.json",
+                        "changed": true,
+                        "skipped": false,
+                        "action": "would_write",
+                    },
+                    {
+                        "target": "claude-desktop",
+                        "path": null,
+                        "changed": false,
+                        "skipped": true,
+                        "action": "skipped",
+                    },
+                ],
+            })
+        );
+
+        let formatted = parse_install(&[
+            "satelle", "mcp", "install", "--target", "cursor", "--format", "json",
+        ]);
+        assert!(formatted.output_args.requests_json());
+    }
+
+    #[test]
+    fn requires_a_target_selection_and_rejects_ambiguous_selection() {
+        let missing = Cli::try_parse_from(["satelle", "mcp", "install"])
+            .expect_err("target selection must be required");
+        assert_eq!(
+            missing.kind(),
+            clap::error::ErrorKind::MissingRequiredArgument
+        );
+
+        let conflict =
+            Cli::try_parse_from(["satelle", "mcp", "install", "--target", "cursor", "--all"])
+                .expect_err("--target and --all must conflict");
+        assert_eq!(conflict.kind(), clap::error::ErrorKind::ArgumentConflict);
+    }
+
+    #[test]
+    fn dry_run_is_excluded_from_command_history() {
+        let dry_run = Cli::try_parse_from([
+            "satelle",
+            "mcp",
+            "install",
+            "--target",
+            "cursor",
+            "--dry-run",
+        ])
+        .expect("parse dry-run install");
+        let mutating = Cli::try_parse_from(["satelle", "mcp", "install", "--target", "cursor"])
+            .expect("parse mutating install");
+
+        assert!(history_target(&dry_run.command).is_none());
+        assert_eq!(
+            history_target(&mutating.command)
+                .expect("mutating install history")
+                .family,
+            "mcp"
+        );
+    }
 }
 
 fn command_history_environment_preference() -> Option<bool> {
