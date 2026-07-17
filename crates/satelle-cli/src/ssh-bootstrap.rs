@@ -16,6 +16,7 @@ use tempfile::{NamedTempFile, TempDir};
 use thiserror::Error;
 use uuid::Uuid;
 
+use super::SshBootstrapScope;
 use super::ssh_tunnel::{SshStderrClassification, classify_stderr};
 
 const PROBE_OUTPUT_LIMIT: usize = 4096;
@@ -37,6 +38,7 @@ impl SshBootstrapProcess {
         destination: &str,
         token: &ApiBearerToken,
         host_config: &HostConfig,
+        bootstrap_scope: SshBootstrapScope,
     ) -> Result<Self, SshBootstrapError> {
         let target = RemoteTarget::probe(destination)?;
         let artifact = DownloadedArtifact::fetch(target)?;
@@ -47,6 +49,7 @@ impl SshBootstrapProcess {
             target,
             &remote_binary,
             token,
+            bootstrap_scope,
             native_timeout,
             provider_timeout,
         )
@@ -57,6 +60,7 @@ impl SshBootstrapProcess {
         target: RemoteTarget,
         remote_binary: &str,
         token: &ApiBearerToken,
+        bootstrap_scope: SshBootstrapScope,
         native_timeout: Duration,
         provider_timeout: Duration,
     ) -> Result<Self, SshBootstrapError> {
@@ -64,7 +68,12 @@ impl SshBootstrapProcess {
         command
             .arg("-T")
             .arg(destination)
-            .arg(target.start_command(remote_binary, native_timeout, provider_timeout))
+            .arg(target.start_command(
+                remote_binary,
+                bootstrap_scope,
+                native_timeout,
+                provider_timeout,
+            ))
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
@@ -279,11 +288,13 @@ impl RemoteTarget {
     fn start_command(
         self,
         remote_binary: &str,
+        bootstrap_scope: SshBootstrapScope,
         native_timeout: Duration,
         provider_timeout: Duration,
     ) -> String {
         let timeout_args = format!(
-            "--bootstrap-native-readiness-timeout-ms {} --bootstrap-provider-smoke-timeout-ms {}",
+            "--bootstrap-scope {} --bootstrap-native-readiness-timeout-ms {} --bootstrap-provider-smoke-timeout-ms {}",
+            bootstrap_scope.as_cli_value(),
             native_timeout.as_millis(),
             provider_timeout.as_millis()
         );
@@ -859,17 +870,29 @@ mod tests {
         let native = Duration::from_millis(2_500);
         let provider = Duration::from_millis(7_500);
         assert_eq!(
-            RemoteTarget::LinuxX64Gnu.start_command("/tmp/satelle", native, provider),
+            RemoteTarget::LinuxX64Gnu.start_command(
+                "/tmp/satelle",
+                SshBootstrapScope::Read,
+                native,
+                provider,
+            ),
             concat!(
                 "sh -c 'exec /tmp/satelle host start --bootstrap-token-stdin ",
+                "--bootstrap-scope read ",
                 "--bootstrap-native-readiness-timeout-ms 2500 ",
                 "--bootstrap-provider-smoke-timeout-ms 7500 --json'"
             )
         );
         assert_eq!(
-            RemoteTarget::WindowsX64Msvc.start_command("satelle.exe", native, provider),
+            RemoteTarget::WindowsX64Msvc.start_command(
+                "satelle.exe",
+                SshBootstrapScope::Control,
+                native,
+                provider,
+            ),
             concat!(
                 "cmd.exe /d /c satelle.exe host start --bootstrap-token-stdin ",
+                "--bootstrap-scope control ",
                 "--bootstrap-native-readiness-timeout-ms 2500 ",
                 "--bootstrap-provider-smoke-timeout-ms 7500 --json"
             )

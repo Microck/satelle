@@ -294,16 +294,22 @@ impl HostService {
     /// process memory and expires independently of durable Host state.
     pub fn production_for_ssh_bootstrap(
         token: &ApiBearerToken,
+        scopes: ApiScopes,
         expires_at: time::OffsetDateTime,
         config: &HostConfig,
     ) -> Self {
         let mut service = Self::production_for_host(config);
         service.bootstrap_auth = Some(Arc::new(EphemeralApiAuthenticator::new(
-            token,
-            ApiScopes::CONTROL,
-            expires_at,
+            token, scopes, expires_at,
         )));
         service
+    }
+
+    /// Reports whether this service owns a process-local SSH bootstrap
+    /// credential. Transport servers use this to keep that credential behind
+    /// the loopback boundary even when TLS is configured.
+    pub fn uses_ssh_bootstrap_authentication(&self) -> bool {
+        self.bootstrap_auth.is_some()
     }
 
     /// The deterministic adapter requires both the compile-time feature and a

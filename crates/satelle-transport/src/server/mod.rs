@@ -301,6 +301,9 @@ impl DaemonServer {
         config: DaemonServerConfig,
         tls: Option<DaemonTlsConfig>,
     ) -> Result<Self, DaemonServerError> {
+        if service.uses_ssh_bootstrap_authentication() && !config.bind_addr.ip().is_loopback() {
+            return Err(DaemonServerError::SshBootstrapNonLoopbackBind);
+        }
         if !config.bind_addr.ip().is_loopback() && tls.is_none() {
             return Err(DaemonServerError::NonLoopbackPlaintextBind);
         }
@@ -530,6 +533,7 @@ impl Drop for DaemonServer {
 
 #[derive(Debug)]
 pub enum DaemonServerError {
+    SshBootstrapNonLoopbackBind,
     NonLoopbackPlaintextBind,
     InvalidConnectionLimit,
     InvalidShutdownGrace,
@@ -545,6 +549,7 @@ pub enum DaemonServerError {
 impl DaemonServerError {
     pub const fn code(&self) -> &'static str {
         match self {
+            Self::SshBootstrapNonLoopbackBind => "ssh-bootstrap-non-loopback-bind",
             Self::NonLoopbackPlaintextBind => "non-loopback-plaintext-bind",
             Self::InvalidConnectionLimit => "invalid-connection-limit",
             Self::InvalidShutdownGrace => "invalid-shutdown-grace",
@@ -569,6 +574,9 @@ impl DaemonServerError {
 impl fmt::Display for DaemonServerError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(match self {
+            Self::SshBootstrapNonLoopbackBind => {
+                "SSH bootstrap authentication is restricted to a loopback listener"
+            }
             Self::NonLoopbackPlaintextBind => {
                 "plaintext Host Daemon transport must bind to a loopback address"
             }

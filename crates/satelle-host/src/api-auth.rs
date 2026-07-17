@@ -3,6 +3,7 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use sha2::{Digest, Sha256};
 use std::fmt;
 use std::ops::BitOr;
+use std::sync::atomic::{AtomicBool, Ordering};
 use subtle::ConstantTimeEq;
 use thiserror::Error;
 use time::OffsetDateTime;
@@ -228,10 +229,10 @@ pub struct ApiPrincipal {
 /// Process-local authentication for the one token that starts an on-demand
 /// daemon over SSH. The verifier and principal disappear with the process and
 /// are never passed to durable storage.
-#[derive(Clone)]
 pub(crate) struct EphemeralApiAuthenticator {
     verifier: ApiTokenVerifier,
     principal: ApiPrincipal,
+    revoked: AtomicBool,
 }
 
 impl EphemeralApiAuthenticator {
@@ -249,6 +250,7 @@ impl EphemeralApiAuthenticator {
                 scopes,
                 expires_at: Some(expires_at),
             },
+            revoked: AtomicBool::new(false),
         }
     }
 
@@ -257,7 +259,10 @@ impl EphemeralApiAuthenticator {
         token: &ApiBearerToken,
         at: OffsetDateTime,
     ) -> Option<ApiPrincipal> {
-        if token.token_id() != self.principal.token_id || at >= self.principal.expires_at? {
+        if self.revoked.load(Ordering::Acquire)
+            || token.token_id() != self.principal.token_id
+            || at >= self.principal.expires_at?
+        {
             return None;
         }
         let presented = token.verifier();
@@ -266,10 +271,23 @@ impl EphemeralApiAuthenticator {
     }
 
     pub(crate) fn is_active(&self, principal: &ApiPrincipal, at: OffsetDateTime) -> bool {
+        !self.revoked.load(Ordering::Acquire)
+            && self.owns_principal(principal)
+            && at < self.principal.expires_at.expect("ephemeral tokens expire")
+    }
+
+    pub(crate) fn owns_token_id(&self, token_id: &str) -> bool {
+        token_id == self.principal.token_id
+    }
+
+    pub(crate) fn owns_principal(&self, principal: &ApiPrincipal) -> bool {
         principal.token_id == self.principal.token_id
             && principal.principal_ref == self.principal.principal_ref
             && principal.credential_revision == self.principal.credential_revision
-            && at < self.principal.expires_at.expect("ephemeral tokens expire")
+    }
+
+    pub(crate) fn revoke(&self) {
+        self.revoked.store(true, Ordering::Release);
     }
 }
 
@@ -369,6 +387,31 @@ mod tests {
         assert!(authenticator.is_active(&principal, expires_at - time::Duration::SECOND));
         assert!(authenticator.authenticate(&token, expires_at).is_none());
         assert!(!authenticator.is_active(&principal, expires_at));
+    }
+
+    #[test]
+    fn ephemeral_bootstrap_authentication_revokes_in_memory() {
+        let token = ApiBearerToken::generate().expect("generate bootstrap token");
+        let authenticator = EphemeralApiAuthenticator::new(
+            &token,
+            ApiScopes::READ,
+            OffsetDateTime::UNIX_EPOCH + time::Duration::minutes(15),
+        );
+
+        let principal = authenticator
+            .authenticate(&token, OffsetDateTime::UNIX_EPOCH)
+            .expect("bootstrap token authenticates before revocation");
+        assert!(principal.scopes().allows(ApiScopes::READ));
+        assert!(!principal.scopes().allows(ApiScopes::CONTROL));
+
+        authenticator.revoke();
+
+        assert!(
+            authenticator
+                .authenticate(&token, OffsetDateTime::UNIX_EPOCH)
+                .is_none()
+        );
+        assert!(!authenticator.is_active(&principal, OffsetDateTime::UNIX_EPOCH));
     }
 
     #[test]

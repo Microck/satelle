@@ -54,7 +54,7 @@ use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 use tailscale::transport_doctor_report;
 use transport::{
-    AttachedTurnOutcome, discover_direct_host_identity, transport_for,
+    AttachedTurnOutcome, SshBootstrapScope, discover_direct_host_identity, transport_for,
     transport_for_with_ssh_bootstrap,
 };
 
@@ -341,6 +341,9 @@ struct HostStartCommand {
     /// retained only by this daemon process.
     #[arg(long, hide = true)]
     bootstrap_token_stdin: bool,
+    /// Internal least-privilege scope for the one SSH bootstrap operation.
+    #[arg(long, hide = true, value_enum, requires = "bootstrap_token_stdin")]
+    bootstrap_scope: Option<SshBootstrapScope>,
     /// Internal resolved native readiness deadline for SSH bootstrap.
     #[arg(long, hide = true, value_name = "MILLISECONDS")]
     bootstrap_native_readiness_timeout_ms: Option<u64>,
@@ -972,6 +975,7 @@ mod history_target_tests {
                 tls_key: None,
                 foreground,
                 bootstrap_token_stdin,
+                bootstrap_scope: bootstrap_token_stdin.then_some(SshBootstrapScope::Control),
                 bootstrap_native_readiness_timeout_ms: None,
                 bootstrap_provider_smoke_timeout_ms: None,
                 output_args: OutputArgs::default(),
@@ -1000,6 +1004,28 @@ mod history_target_tests {
                 .expect("SSH bootstrap target")
                 .selects_host
         );
+    }
+
+    #[test]
+    fn ssh_bootstrap_scope_is_an_explicit_internal_argument() {
+        let cli = Cli::try_parse_from([
+            "satelle",
+            "host",
+            "start",
+            "--bootstrap-token-stdin",
+            "--bootstrap-scope",
+            "read",
+        ])
+        .expect("parse internal SSH bootstrap start command");
+
+        let Command::Host {
+            command: HostCommand::Start(command),
+        } = cli.command
+        else {
+            panic!("expected Host start command");
+        };
+        assert!(command.bootstrap_token_stdin);
+        assert_eq!(command.bootstrap_scope, Some(SshBootstrapScope::Read));
     }
 }
 
@@ -2451,6 +2477,20 @@ fn start_host_daemon(
             "SSH bootstrap Host Daemons use loopback plaintext inside the authenticated tunnel and do not accept TLS files",
         )));
     }
+    let bootstrap_scopes = match (command.bootstrap_token_stdin, command.bootstrap_scope) {
+        (true, Some(scope)) => Some(scope.api_scopes()),
+        (true, None) => {
+            return Err(failure(SatelleError::invalid_usage(
+                "SSH bootstrap Host Daemons require an explicit bootstrap scope",
+            )));
+        }
+        (false, None) => None,
+        (false, Some(_)) => {
+            return Err(failure(SatelleError::invalid_usage(
+                "SSH bootstrap scope is valid only with --bootstrap-token-stdin",
+            )));
+        }
+    };
     install_host_daemon_diagnostics();
     let bind_addr = command.bind.parse::<SocketAddr>().map_err(|error| {
         failure(SatelleError {
@@ -2514,6 +2554,7 @@ fn start_host_daemon(
             }
             HostService::production_for_ssh_bootstrap(
                 token,
+                bootstrap_scopes.expect("bootstrap token has a validated scope"),
                 OffsetDateTime::now_utc() + time::Duration::minutes(15),
                 &host_config,
             )
@@ -3062,6 +3103,7 @@ mod daemon_tls_watcher_tests {
             tls_key: tls_key.map(PathBuf::from),
             foreground: true,
             bootstrap_token_stdin: false,
+            bootstrap_scope: None,
             bootstrap_native_readiness_timeout_ms: None,
             bootstrap_provider_smoke_timeout_ms: None,
             output_args: OutputArgs::default(),
@@ -3572,7 +3614,8 @@ fn daemon_server_failure(error: DaemonServerError) -> CliFailure {
     }
 
     match error {
-        DaemonServerError::NonLoopbackPlaintextBind
+        DaemonServerError::SshBootstrapNonLoopbackBind
+        | DaemonServerError::NonLoopbackPlaintextBind
         | DaemonServerError::InvalidConnectionLimit
         | DaemonServerError::InvalidShutdownGrace
         | DaemonServerError::InvalidIdleTimeout => {
@@ -3807,7 +3850,8 @@ fn run_prompt(
             .map(SelectedHost::from)
             .map_err(failure),
     )?;
-    let transport = match transport_for_with_ssh_bootstrap(&host, true) {
+    let transport = match transport_for_with_ssh_bootstrap(&host, Some(SshBootstrapScope::Control))
+    {
         Ok(transport) => transport,
         Err(transport_failure) => {
             if !command.detach {
@@ -3933,7 +3977,8 @@ fn steer_prompt(
             .map(SelectedHost::from)
             .map_err(failure),
     )?;
-    let transport = match transport_for_with_ssh_bootstrap(&host, true) {
+    let transport = match transport_for_with_ssh_bootstrap(&host, Some(SshBootstrapScope::Control))
+    {
         Ok(transport) => transport,
         Err(transport_failure) => {
             if !command.detach {
