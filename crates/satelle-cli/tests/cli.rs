@@ -1304,12 +1304,13 @@ fn events_json_emits_newline_delimited_satelle_events() {
         .map(|line| serde_json::from_str::<Value>(line).expect("event line should be JSON"))
         .collect::<Vec<_>>();
 
-    assert_eq!(events.len(), 6);
+    assert_eq!(events.len(), 7);
     assert_eq!(events[0]["type"], "preflight");
     assert_eq!(events[0]["source"], "cli");
     assert!(events[0]["session_id"].is_null());
     assert!(events[0]["turn_id"].is_null());
-    assert_eq!(events[5]["type"], "turn_completed");
+    assert!(events.iter().any(|event| event["type"] == "provider_smoke"));
+    assert_eq!(events[6]["type"], "turn_completed");
     let session_id = events[1]["session_id"].as_str().unwrap().to_string();
     for (index, event) in events.iter().enumerate() {
         assert_eq!(event["schema_version"], "satelle.events.v2");
@@ -1342,17 +1343,22 @@ fn events_json_emits_newline_delimited_satelle_events() {
         .get_output()
         .clone();
     let steer_events = parse_json_lines(&output.stdout);
-    assert_eq!(steer_events.len(), 6);
+    assert_eq!(steer_events.len(), 7);
     assert_eq!(steer_events[0]["type"], "preflight");
     assert_eq!(steer_events[0]["source"], "cli");
-    assert_eq!(steer_events[5]["type"], "turn_completed");
-    assert_eq!(steer_events[5]["session_id"], session_id);
+    assert!(
+        steer_events
+            .iter()
+            .any(|event| event["type"] == "provider_smoke")
+    );
+    assert_eq!(steer_events[6]["type"], "turn_completed");
+    assert_eq!(steer_events[6]["session_id"], session_id);
     assert_eq!(
         steer_events
             .iter()
             .map(|event| event["seq"].as_u64().unwrap())
             .collect::<Vec<_>>(),
-        [1, 2, 3, 4, 5, 6]
+        [1, 2, 3, 4, 5, 6, 7]
     );
 }
 
@@ -1753,6 +1759,7 @@ fn detach_returns_starting_session_without_event_streaming() {
     let state = state_dir();
     let output = satelle()
         .env("SATELLE_STATE_DIR", state.path())
+        .env(TEST_SUPPORT_ADAPTER_ENV, "pending")
         .args([
             "run",
             "--host",
@@ -1781,10 +1788,7 @@ fn detach_returns_starting_session_without_event_streaming() {
         .get_output()
         .clone();
     let status = parse_json_output(&status_output.stdout);
-    assert!(matches!(
-        status["status"].as_str(),
-        Some("starting" | "recovery_pending")
-    ));
+    assert_eq!(status["status"], "recovery_pending");
 
     let logs_output = satelle()
         .env("SATELLE_STATE_DIR", state.path())
@@ -2921,9 +2925,8 @@ default_host = "project-host"
         .env_remove("SATELLE_HOST")
         .args(["doctor", "--json"])
         .assert()
-        .failure()
-        .stderr(predicate::str::contains("not-implemented"))
-        .stderr(predicate::str::contains("project-host"));
+        .success()
+        .stdout(predicate::str::contains(r#""host": "project-host""#));
 
     satelle()
         .current_dir(&project)

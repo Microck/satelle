@@ -1373,7 +1373,7 @@ fn run_doctor(
     let timeout = match command
         .timeout
         .as_deref()
-        .map(parse_duration_ms)
+        .map(parse_positive_duration_ms)
         .transpose()
     {
         Ok(timeout) => timeout.map(std::time::Duration::from_millis),
@@ -1562,15 +1562,15 @@ fn doctor_scope_supports_refresh(scope: Option<&str>) -> bool {
 
 fn parse_duration_ms(value: &str) -> Result<u64, SatelleError> {
     if let Some(ms) = value.strip_suffix("ms") {
-        return parse_positive_duration(ms, 1);
+        return parse_duration_component(ms, 1);
     }
 
     if let Some(seconds) = value.strip_suffix('s') {
-        return parse_positive_duration(seconds, 1_000);
+        return parse_duration_component(seconds, 1_000);
     }
 
     if let Some(minutes) = value.strip_suffix('m') {
-        return parse_positive_duration(minutes, 60_000);
+        return parse_duration_component(minutes, 60_000);
     }
 
     Err(SatelleError::invalid_usage(
@@ -1578,11 +1578,20 @@ fn parse_duration_ms(value: &str) -> Result<u64, SatelleError> {
     ))
 }
 
-fn parse_positive_duration(value: &str, multiplier: u64) -> Result<u64, SatelleError> {
+fn parse_positive_duration_ms(value: &str) -> Result<u64, SatelleError> {
+    let duration = parse_duration_ms(value)?;
+    if duration == 0 {
+        return Err(SatelleError::invalid_usage(
+            "duration must use a positive number",
+        ));
+    }
+    Ok(duration)
+}
+
+fn parse_duration_component(value: &str, multiplier: u64) -> Result<u64, SatelleError> {
     value
         .parse::<u64>()
         .ok()
-        .filter(|value| *value > 0)
         .and_then(|value| value.checked_mul(multiplier))
         .ok_or_else(|| SatelleError::invalid_usage("duration must use a positive number"))
 }
@@ -2442,6 +2451,7 @@ fn start_host_daemon(
             "SSH bootstrap Host Daemons use loopback plaintext inside the authenticated tunnel and do not accept TLS files",
         )));
     }
+    install_host_daemon_diagnostics();
     let bind_addr = command.bind.parse::<SocketAddr>().map_err(|error| {
         failure(SatelleError {
             code: ErrorCode::InvalidUsage,
@@ -2596,6 +2606,18 @@ fn start_host_daemon(
             server.wait().await.map_err(daemon_server_failure)
         }
     })
+}
+
+fn install_host_daemon_diagnostics() {
+    // Host start reserves stdout for its human or machine-readable readiness
+    // response. Send structured runtime diagnostics to stderr so token
+    // lifecycle events are observable without corrupting that protocol.
+    let _subscriber_already_installed = tracing_subscriber::fmt()
+        .with_ansi(false)
+        .with_target(true)
+        .with_writer(io::stderr)
+        .with_max_level(tracing_subscriber::filter::LevelFilter::INFO)
+        .try_init();
 }
 
 struct DaemonTlsFiles {
@@ -3840,7 +3862,8 @@ fn run_prompt(
     event_output
         .emit_preflight(&host.alias, "run", &host.config.transport)
         .map_err(failure)?;
-    let outcome = match transport.run(&request, &mut |event| event_output.emit(event)) {
+    let outcome = match transport.run(&request, &mut |event| event_output.emit(&host.alias, event))
+    {
         Ok(outcome) => outcome,
         Err(attached_failure) => {
             let history_session_id = attached_failure
@@ -3967,30 +3990,31 @@ fn steer_prompt(
     event_output
         .emit_preflight(&host.alias, "steer", &host.config.transport)
         .map_err(failure)?;
-    let outcome =
-        match transport.steer(&session_id, &request, &mut |event| event_output.emit(event)) {
-            Ok(outcome) => outcome,
-            Err(attached_failure) => {
-                let history_session_id = attached_failure
-                    .durable_handles()
-                    .map(|(session_id, _)| Box::new(session_id.clone()));
-                event_output
-                    .emit_command_failed(
-                        &host.alias,
-                        attached_failure.error(),
-                        attached_failure.phase(),
-                        attached_failure.durable_handles(),
-                    )
-                    .map_err(|error| CliFailure {
-                        error,
-                        history_session_id: history_session_id.clone(),
-                    })?;
-                return Err(CliFailure {
-                    error: attached_failure.into_error(),
-                    history_session_id,
-                });
-            }
-        };
+    let outcome = match transport.steer(&session_id, &request, &mut |event| {
+        event_output.emit(&host.alias, event)
+    }) {
+        Ok(outcome) => outcome,
+        Err(attached_failure) => {
+            let history_session_id = attached_failure
+                .durable_handles()
+                .map(|(session_id, _)| Box::new(session_id.clone()));
+            event_output
+                .emit_command_failed(
+                    &host.alias,
+                    attached_failure.error(),
+                    attached_failure.phase(),
+                    attached_failure.durable_handles(),
+                )
+                .map_err(|error| CliFailure {
+                    error,
+                    history_session_id: history_session_id.clone(),
+                })?;
+            return Err(CliFailure {
+                error: attached_failure.into_error(),
+                history_session_id,
+            });
+        }
+    };
     print_turn_session(
         outcome,
         TurnOutputOptions {
@@ -4255,8 +4279,12 @@ impl TurnEventOutput {
         self.emit_body(body)
     }
 
-    fn emit(&mut self, event: SatelleEvent) -> Result<(), SatelleError> {
-        self.emit_body(event.into_body())
+    fn emit(&mut self, host_alias: &str, event: SatelleEvent) -> Result<(), SatelleError> {
+        let body = event
+            .into_body()
+            .with_host(host_alias)
+            .map_err(|error| SatelleError::invalid_usage(error.to_string()))?;
+        self.emit_body(body)
     }
 
     fn emit_command_failed(
