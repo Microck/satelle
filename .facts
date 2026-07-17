@@ -130,7 +130,9 @@
   label: satelle stop JSON v1 uses schema_version satelle.stop.v1
   command: cargo test --locked -p satelle-cli --features test-support --test cli stopping_terminal_turn_preserves_history_and_allows_later_steer -- --exact
   tags: [spec, contract, mvp, implemented, ci]
-- satelle stop JSON v1 includes outcome, session_id, turn_id, previous_state, current_state, changed, and stopped_at fields; outcome is stopped or already_terminal @spec @contract @mvp
+- label: satelle stop JSON v1 includes outcome, session_id, turn_id, previous_state, current_state, changed, and stopped_at fields; outcome is stopped or already_terminal
+  command: cargo test --locked -p satelle-cli --features test-support --test output-format-contract stop_json_v1_has_one_closed_contract_for_stopped_and_already_terminal_turns -- --exact
+  tags: [spec, contract, mvp, implemented, ci]
 - id: 5hb
   label: satelle stop on an already-terminal Turn exits 0 with outcome already_terminal and changed false
   command: cargo test --locked -p satelle-cli --features test-support --test cli stopping_terminal_turn_preserves_history_and_allows_later_steer -- --exact
