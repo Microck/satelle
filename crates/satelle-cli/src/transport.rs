@@ -7,7 +7,7 @@ use satelle_core::{
     read_owner_only_secret_file, read_trusted_ca_bundle_file,
 };
 use satelle_host::{
-    ApiBearerToken, DaemonLogPage, HostService, HostStatus, LogCursor, LogPageQuery,
+    ApiBearerToken, ApiScopes, DaemonLogPage, HostService, HostStatus, LogCursor, LogPageQuery,
     admission_request_timeout,
 };
 use satelle_transport::{
@@ -19,6 +19,28 @@ use std::time::Duration;
 use uuid::Uuid;
 
 const SSH_DAEMON_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, clap::ValueEnum)]
+pub(crate) enum SshBootstrapScope {
+    Read,
+    Control,
+}
+
+impl SshBootstrapScope {
+    pub(crate) const fn api_scopes(self) -> ApiScopes {
+        match self {
+            Self::Read => ApiScopes::READ,
+            Self::Control => ApiScopes::CONTROL,
+        }
+    }
+
+    const fn as_cli_value(self) -> &'static str {
+        match self {
+            Self::Read => "read",
+            Self::Control => "control",
+        }
+    }
+}
 
 #[path = "direct-attached.rs"]
 mod direct_attached;
@@ -465,10 +487,10 @@ fn direct_transport(host: &SelectedHost) -> Result<DirectTransport, SatelleError
 
 fn ssh_transport(
     host: &SelectedHost,
-    bootstrap_if_unreachable: bool,
+    bootstrap_scope: Option<SshBootstrapScope>,
 ) -> Result<DirectTransport, SatelleError> {
     let admission_timeout = admission_request_timeout(&host.config);
-    let binding = if bootstrap_if_unreachable {
+    let binding = if bootstrap_scope.is_some() {
         SshHostBinding::from_host_config_for_bootstrap(&host.config)
     } else {
         SshHostBinding::from_host_config(&host.config)
@@ -516,7 +538,7 @@ fn ssh_transport(
                     (durable_client, event_client, None)
                 }
                 Err(DaemonClientError::Transport(error))
-                    if error.is_connect() && bootstrap_if_unreachable =>
+                    if error.is_connect() && bootstrap_scope.is_some() =>
                 {
                     let (client, event_client, bootstrap) = bootstrap_ssh_clients(
                         &host.alias,
@@ -525,6 +547,7 @@ fn ssh_transport(
                         &expected_host_identity,
                         admission_timeout,
                         &host.config,
+                        bootstrap_scope.expect("SSH bootstrap scope is present"),
                     )?;
                     (client, event_client, Some(bootstrap))
                 }
@@ -539,6 +562,7 @@ fn ssh_transport(
                 &expected_host_identity,
                 admission_timeout,
                 &host.config,
+                bootstrap_scope.expect("tokenless SSH transport requires bootstrap scope"),
             )?;
             (client, event_client, Some(bootstrap))
         }
@@ -565,17 +589,19 @@ fn bootstrap_ssh_clients(
     expected_host_identity: &str,
     admission_timeout: Duration,
     host_config: &satelle_core::HostConfig,
+    bootstrap_scope: SshBootstrapScope,
 ) -> Result<(Arc<DaemonClient>, DaemonEventClient, SshBootstrapProcess), SatelleError> {
     let bootstrap_token =
         ApiBearerToken::generate().map_err(|_| SatelleError::host_unreachable(alias))?;
     let raw_bootstrap_token = bootstrap_token.expose();
-    let bootstrap = SshBootstrapProcess::launch(destination, &bootstrap_token, host_config)
-        .map_err(|error| match error {
-            ssh_bootstrap::SshBootstrapError::HostKeyVerificationRequired => {
-                SatelleError::ssh_host_key_verification_required(alias)
-            }
-            _ => SatelleError::host_unreachable(alias),
-        })?;
+    let bootstrap =
+        SshBootstrapProcess::launch(destination, &bootstrap_token, host_config, bootstrap_scope)
+            .map_err(|error| match error {
+                ssh_bootstrap::SshBootstrapError::HostKeyVerificationRequired => {
+                    SatelleError::ssh_host_key_verification_required(alias)
+                }
+                _ => SatelleError::host_unreachable(alias),
+            })?;
     let http_token = ApiBearerToken::parse(raw_bootstrap_token.as_str())
         .map_err(|_| SatelleError::host_unreachable(alias))?;
     let event_token = ApiBearerToken::parse(raw_bootstrap_token.as_str())
@@ -860,12 +886,12 @@ fn local_host_service(host_config: &satelle_core::HostConfig) -> Result<HostServ
 }
 
 pub(crate) fn transport_for(host: &SelectedHost) -> Result<Box<dyn TransportClient>, CliFailure> {
-    transport_for_with_ssh_bootstrap(host, false)
+    transport_for_with_ssh_bootstrap(host, None)
 }
 
 pub(crate) fn transport_for_with_ssh_bootstrap(
     host: &SelectedHost,
-    bootstrap_if_unreachable: bool,
+    bootstrap_scope: Option<SshBootstrapScope>,
 ) -> Result<Box<dyn TransportClient>, CliFailure> {
     match host.config.transport {
         TransportKind::Local => local_host_service(&host.config)
@@ -873,7 +899,7 @@ pub(crate) fn transport_for_with_ssh_bootstrap(
         TransportKind::Direct => direct_transport(host)
             .map(|transport| Box::new(transport) as _)
             .map_err(failure),
-        TransportKind::Ssh => ssh_transport(host, bootstrap_if_unreachable)
+        TransportKind::Ssh => ssh_transport(host, bootstrap_scope)
             .map(|transport| Box::new(transport) as _)
             .map_err(failure),
     }

@@ -994,6 +994,38 @@ async fn plaintext_non_loopback_bind_is_rejected_before_listening() {
 }
 
 #[tokio::test]
+async fn ssh_bootstrap_authentication_rejects_non_loopback_tls_before_listening() {
+    let token = ApiBearerToken::generate().expect("generate bootstrap token");
+    let host_config = SatelleConfig::defaults()
+        .hosts
+        .remove(satelle_core::LOCAL_DEMO_HOST)
+        .expect("built-in Host config exists");
+    let service = HostService::production_for_ssh_bootstrap(
+        &token,
+        ApiScopes::READ,
+        time::OffsetDateTime::now_utc() + time::Duration::minutes(15),
+        &host_config,
+    );
+    let certified = rcgen::generate_simple_self_signed(["localhost".to_string()])
+        .expect("generate direct transport certificate");
+    let tls = DaemonTlsConfig::from_pem(
+        certified.cert.pem().as_bytes(),
+        certified.signing_key.serialize_pem().as_bytes(),
+    )
+    .expect("build validated TLS configuration");
+
+    let error = DaemonServer::bind_tls(
+        service,
+        DaemonServerConfig::loopback(SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0))),
+        tls,
+    )
+    .await
+    .expect_err("bootstrap authentication must never reach a non-loopback listener");
+
+    assert_eq!(error.code(), "ssh-bootstrap-non-loopback-bind");
+}
+
+#[tokio::test]
 async fn authenticated_https_is_served_by_a_non_loopback_tls_listener() {
     let state = TestStateDir::new().expect("temporary state directory");
     let service = HostService::local_demo_for_tests_at(state.path())

@@ -399,22 +399,27 @@ impl HostService {
         &self,
         token: &ApiBearerToken,
     ) -> Result<Option<ApiPrincipal>, SatelleError> {
-        if let Some(principal) = self
+        if let Some(authenticator) = self
             .bootstrap_auth
             .as_ref()
-            .and_then(|authenticator| authenticator.authenticate(token, OffsetDateTime::now_utc()))
+            .filter(|authenticator| authenticator.owns_token_id(token.token_id()))
         {
-            return Ok(Some(principal));
+            // A bootstrap token ID belongs exclusively to this process-local
+            // authenticator. Expiry or revocation must not fall through to a
+            // coincidentally matching durable credential.
+            return Ok(authenticator.authenticate(token, OffsetDateTime::now_utc()));
         }
         self.runtime
             .authenticate_api_token(token, OffsetDateTime::now_utc())
     }
 
     pub fn api_principal_is_active(&self, principal: &ApiPrincipal) -> Result<bool, SatelleError> {
-        if self.bootstrap_auth.as_ref().is_some_and(|authenticator| {
-            authenticator.is_active(principal, OffsetDateTime::now_utc())
-        }) {
-            return Ok(true);
+        if let Some(authenticator) = self
+            .bootstrap_auth
+            .as_ref()
+            .filter(|authenticator| authenticator.owns_principal(principal))
+        {
+            return Ok(authenticator.is_active(principal, OffsetDateTime::now_utc()));
         }
         self.runtime
             .api_principal_is_active(principal, OffsetDateTime::now_utc())
@@ -440,6 +445,19 @@ impl HostService {
     }
 
     pub fn revoke_api_token(&self, token_id: &str) -> Result<(), SatelleError> {
+        if let Some(authenticator) = self
+            .bootstrap_auth
+            .as_ref()
+            .filter(|authenticator| authenticator.owns_token_id(token_id))
+        {
+            authenticator.revoke();
+            tracing::info!(
+                target: "satelle::host::api_token",
+                token_id,
+                "ephemeral API token revoked"
+            );
+            return Ok(());
+        }
         self.runtime
             .revoke_api_token(token_id, OffsetDateTime::now_utc())?;
         tracing::info!(
@@ -755,6 +773,8 @@ fn authentication_state_failure() -> SatelleError {
 mod tests {
     use super::*;
     use crate::LiveEventReceiveError;
+    use crate::api_auth::EphemeralApiAuthenticator;
+    use std::sync::Arc;
 
     #[test]
     fn idempotency_digest_versions_change_only_for_turn_payloads() {
@@ -841,6 +861,54 @@ mod tests {
                 .expect("read through clone")
                 .host_identity(),
             initialized.host_identity()
+        );
+    }
+
+    #[test]
+    fn bootstrap_revocation_is_immediate_and_never_reaches_a_later_daemon() {
+        let state = crate::TestStateDir::new().expect("temporary state directory");
+        let token = ApiBearerToken::generate().expect("generate bootstrap token");
+        let mut service = HostService::local_demo_for_tests_at(state.path())
+            .expect("construct deterministic service");
+        service
+            .initialize_daemon()
+            .expect("initialize first daemon");
+        service.bootstrap_auth = Some(Arc::new(EphemeralApiAuthenticator::new(
+            &token,
+            ApiScopes::READ,
+            OffsetDateTime::now_utc() + time::Duration::minutes(15),
+        )));
+
+        let principal = service
+            .authenticate_api_token(&token)
+            .expect("authenticate bootstrap token")
+            .expect("bootstrap token is active");
+        service
+            .revoke_api_token(token.token_id())
+            .expect("revoke bootstrap token in memory");
+        assert!(
+            service
+                .authenticate_api_token(&token)
+                .expect("check revoked token")
+                .is_none()
+        );
+        assert!(
+            !service
+                .api_principal_is_active(&principal)
+                .expect("check revoked principal")
+        );
+
+        drop(service);
+        let later_service = HostService::local_demo_for_tests_at(state.path())
+            .expect("construct later daemon process");
+        later_service
+            .initialize_daemon()
+            .expect("initialize later daemon");
+        assert!(
+            later_service
+                .authenticate_api_token(&token)
+                .expect("check token in later daemon")
+                .is_none()
         );
     }
 
