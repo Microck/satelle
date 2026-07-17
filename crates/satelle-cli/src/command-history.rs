@@ -163,7 +163,10 @@ impl Recorder {
         error_code: Option<ErrorCode>,
         duration_ms: i64,
     ) -> Result<(), HistoryWriteError> {
+        #[cfg(unix)]
         let _cache_root_guard = prepare_cache_root(&self.cache_root)?;
+        #[cfg(windows)]
+        prepare_cache_root(&self.cache_root)?;
         let database_directory = self.cache_root.join(DATABASE_DIRECTORY_NAME);
         // SQLite creates journals and other sidecars beside the main file.
         // Isolate that whole namespace instead of securing only one path. The

@@ -616,6 +616,12 @@ pub(super) struct DaemonState {
 
 fn router(state: Arc<DaemonState>) -> Router {
     let capacity_state = Arc::clone(&state);
+    let live_route = Router::new()
+        .route("/v1/live", get(live).fallback(live_method_not_allowed))
+        .route_layer(middleware::from_fn_with_state(
+            Arc::clone(&state),
+            auth::reject_public_bearer_carriers,
+        ));
     let bodyless_read_routes = Router::new()
         .route("/v1/capabilities", get(capabilities))
         .route("/v1/host/status", get(host_status))
@@ -662,7 +668,7 @@ fn router(state: Arc<DaemonState>) -> Router {
             auth::authorize,
         ));
     Router::new()
-        .route("/v1/live", get(live).fallback(live_method_not_allowed))
+        .merge(live_route)
         .merge(protected)
         .with_state(state)
         .layer(middleware::from_fn_with_state(

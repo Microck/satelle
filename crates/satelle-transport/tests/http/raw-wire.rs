@@ -41,6 +41,40 @@ async fn duplicate_singleton_headers_fail_closed_without_admission() {
 }
 
 #[tokio::test]
+async fn bearer_tokens_in_http_trailers_are_rejected_without_admission() {
+    let running = RunningServer::start(ApiScopes::CONTROL).await;
+    let token = running.token.expose();
+    let live_request = format!(
+        "GET /v1/live HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\nTrailer: X-Api-Token\r\nConnection: close\r\n\r\n2\r\n{{}}\r\n0\r\nX-Api-Token: {}\r\n\r\n",
+        token.as_str()
+    );
+    let response = raw_request(running.server.local_addr(), live_request.as_bytes()).await;
+    assert_raw_api_error(&response, 400, "invalid-request");
+
+    let body =
+        br#"{"schema_version":"satelle.api.v2","prompt":"safe","execution_mode":"standard"}"#;
+    let mutation_request = format!(
+        "POST /v1/sessions HTTP/1.1\r\nHost: localhost\r\nAuthorization: {}\r\nSatelle-Expected-Host-Identity: {}\r\nSatelle-Request-Id: {}\r\nSatelle-Protocol-Version: 3\r\nIdempotency-Key: trailer-carrier\r\nContent-Type: application/json\r\nTransfer-Encoding: chunked\r\nTrailer: X-Api-Token\r\nConnection: close\r\n\r\n{:x}\r\n{}\r\n0\r\nX-Api-Token: {}\r\n\r\n",
+        bearer(&running.token),
+        running.host_identity,
+        RequestId::new(),
+        body.len(),
+        String::from_utf8_lossy(body),
+        token.as_str(),
+    );
+    let response = raw_request(running.server.local_addr(), mutation_request.as_bytes()).await;
+    assert_raw_api_error(&response, 400, "invalid-request");
+    assert_eq!(
+        running
+            .service
+            .initialize_daemon()
+            .expect("read session count")
+            .session_count(),
+        0
+    );
+}
+
+#[tokio::test]
 async fn stalled_upload_cannot_hold_daemon_shutdown_open_forever() {
     let state = TestStateDir::new().expect("temporary state directory");
     let service = HostService::local_demo_for_tests_at(state.path())

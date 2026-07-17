@@ -421,6 +421,90 @@ async fn event_socket_closes_on_invalid_control_or_revoked_credentials() {
 }
 
 #[tokio::test]
+async fn event_subscriptions_reject_bearer_token_fields() {
+    let running = RunningServer::start(ApiScopes::READ).await;
+    let mut socket = connect_events(&running).await;
+    let exposed = running.token.expose();
+    socket
+        .send(Message::Text(
+            serde_json::json!({
+                "schema_version": "satelle.ws.control.v1",
+                "type": "subscribe",
+                "request_id": RequestId::new(),
+                "subscriptions": [{"kind":"host"}],
+                "api_token": exposed.as_str(),
+            })
+            .to_string()
+            .into(),
+        ))
+        .await
+        .expect("send subscription containing a bearer token");
+
+    let error: WsServerControl =
+        serde_json::from_str(&next_text(&mut socket).await).expect("decode invalid-request error");
+    assert!(matches!(
+        error,
+        WsServerControl::Error(error) if error.code().as_str() == "invalid-request"
+    ));
+    let close = socket
+        .next()
+        .await
+        .expect("receive token-carrier close")
+        .expect("decode token-carrier close");
+    assert!(matches!(
+        close,
+        Message::Close(Some(frame)) if frame.code == CloseCode::Policy && frame.reason == "invalid-request"
+    ));
+
+    let mut socket = connect_events(&running).await;
+    socket
+        .send(Message::Text(
+            format!(
+                r#"{{"schema_version":"satelle.ws.control.v1","type":"subscribe","request_id":"{}","api_token":"{}","api_token":"safe","subscriptions":[{{"kind":"host"}}]}}"#,
+                RequestId::new(),
+                exposed.as_str()
+            )
+            .into(),
+        ))
+        .await
+        .expect("send duplicate-key subscription containing a bearer token");
+
+    let error: WsServerControl = serde_json::from_str(&next_text(&mut socket).await)
+        .expect("decode duplicate-key invalid-request error");
+    assert!(matches!(
+        error,
+        WsServerControl::Error(error) if error.code().as_str() == "invalid-request"
+    ));
+
+    let mut socket = connect_events(&running).await;
+    send_subscribe(&mut socket, vec![EventSubscription::Host]).await;
+    expect_subscribed(&mut socket, &running.host_identity).await;
+    let rejected_request_id = RequestId::new();
+    socket
+        .send(Message::Text(
+            serde_json::json!({
+                "schema_version": "satelle.ws.control.v1",
+                "type": "subscribe",
+                "request_id": rejected_request_id,
+                "subscriptions": [{"kind":"host"}],
+                "api_token": exposed.as_str(),
+            })
+            .to_string()
+            .into(),
+        ))
+        .await
+        .expect("send correlated subscription containing a bearer token");
+    let error: WsServerControl =
+        serde_json::from_str(&next_text(&mut socket).await).expect("decode correlated rejection");
+    assert!(matches!(
+        error,
+        WsServerControl::Error(error)
+            if error.code().as_str() == "invalid-request"
+                && error.request_id() == &rejected_request_id
+    ));
+}
+
+#[tokio::test]
 async fn replacing_event_subscriptions_filters_live_events_without_resetting_sequence() {
     let running = RunningServer::start(ApiScopes::CONTROL).await;
     let prior = running

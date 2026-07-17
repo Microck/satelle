@@ -5,17 +5,25 @@ use super::{
 use crate::contract::{
     ApiErrorCategory, ApiErrorCode, PROTOCOL_VERSION, PROTOCOL_VERSION_HEADER, RequestId,
 };
+use axum::body::Body;
 use axum::extract::{ConnectInfo, Request, State};
 use axum::http::header::{AUTHORIZATION, CONTENT_LENGTH, COOKIE, TRANSFER_ENCODING};
 use axum::middleware::Next;
 use axum::response::Response;
-use satelle_host::{ApiBearerToken, ApiPrincipal, ApiScopes, MutationAuthority};
+use percent_encoding::percent_decode_str;
+use satelle_host::{
+    ApiBearerToken, ApiPrincipal, ApiScopes, MutationAuthority, contains_api_bearer_token,
+};
+use serde_json::Value;
 use std::net::IpAddr;
 use std::sync::Arc;
+use std::time::Duration;
 
 pub(super) const EXPECTED_HOST_IDENTITY_HEADER: &str = "satelle-expected-host-identity";
 pub(super) const IDEMPOTENCY_KEY_HEADER: &str = "idempotency-key";
 pub(super) const REQUEST_ID_HEADER: &str = "satelle-request-id";
+const MAX_PERCENT_DECODE_LAYERS: usize = 8;
+const REQUEST_BODY_READ_TIMEOUT: Duration = Duration::from_secs(1);
 
 pub(super) fn expected_host_identity_matches(
     headers: &axum::http::HeaderMap,
@@ -129,6 +137,7 @@ pub(super) async fn authorize(
             );
         }
     };
+    let has_disallowed_bearer_carrier = request_has_disallowed_bearer_token(&request);
     let expected_identity = single_header(request.headers(), EXPECTED_HOST_IDENTITY_HEADER);
     let Some(expected_identity) = expected_identity else {
         return api_error_response(
@@ -145,6 +154,16 @@ pub(super) async fn authorize(
         );
     };
     if expected_identity != state.host_identity {
+        let details = if encoded_text_has_disallowed_bearer_carrier(expected_identity) {
+            serde_json::json!({
+                "observed_host_identity": state.host_identity,
+            })
+        } else {
+            serde_json::json!({
+                "expected_host_identity": expected_identity,
+                "observed_host_identity": state.host_identity,
+            })
+        };
         return api_error_response(
             valid_request_id,
             Some(state.host_identity.clone()),
@@ -154,11 +173,14 @@ pub(super) async fn authorize(
                 category: ApiErrorCategory::Conflict,
                 retryable: false,
                 message: "the observed Host Identity does not match the expected Host Identity",
-                details: Some(serde_json::json!({
-                    "expected_host_identity": expected_identity,
-                    "observed_host_identity": state.host_identity,
-                })),
+                details: Some(details),
             },
+        );
+    }
+    if has_disallowed_bearer_carrier {
+        return disallowed_bearer_token_carrier(
+            Some(state.host_identity.clone()),
+            valid_request_id,
         );
     }
     request.extensions_mut().insert(AuthorizedRequest {
@@ -167,6 +189,189 @@ pub(super) async fn authorize(
         principal,
     });
     security_headers(next.run(request).await)
+}
+
+fn request_has_disallowed_bearer_token(request: &Request) -> bool {
+    encoded_text_has_disallowed_bearer_carrier(&request.uri().to_string())
+        || headers_have_disallowed_bearer_carrier(request.headers(), true)
+}
+
+pub(super) fn trailers_have_disallowed_bearer_carrier(trailers: &axum::http::HeaderMap) -> bool {
+    headers_have_disallowed_bearer_carrier(trailers, false)
+}
+
+fn headers_have_disallowed_bearer_carrier(
+    headers: &axum::http::HeaderMap,
+    allow_authorization: bool,
+) -> bool {
+    headers.iter().any(|(name, value)| {
+        contains_api_bearer_token(name.as_str())
+            || (!allow_authorization || name != AUTHORIZATION)
+                && encoded_text_has_disallowed_bearer_carrier(&String::from_utf8_lossy(
+                    value.as_bytes(),
+                ))
+    })
+}
+
+fn encoded_text_has_disallowed_bearer_carrier(value: &str) -> bool {
+    if contains_api_bearer_token(value) {
+        return true;
+    }
+    let first = percent_decode_str(value).decode_utf8_lossy();
+    if first.as_ref() == value {
+        return false;
+    }
+    let mut decoded = first.into_owned();
+    for _ in 1..MAX_PERCENT_DECODE_LAYERS {
+        if contains_api_bearer_token(&decoded) {
+            return true;
+        }
+        // Continue to a fixed point because a downstream decoder can expose
+        // another percent-encoded layer.
+        let next = percent_decode_str(&decoded)
+            .decode_utf8_lossy()
+            .into_owned();
+        if next == decoded {
+            return false;
+        }
+        decoded = next;
+    }
+    if contains_api_bearer_token(&decoded) {
+        return true;
+    }
+    // Deeply nested encoding is itself disallowed. Failing closed keeps the
+    // unauthenticated liveness boundary at constant work per input byte.
+    percent_decode_str(&decoded).decode_utf8_lossy().as_ref() != decoded
+}
+
+pub(super) fn json_contains_bearer_token(value: &Value) -> bool {
+    match value {
+        Value::String(value) => contains_api_bearer_token(value),
+        Value::Array(values) => values.iter().any(json_contains_bearer_token),
+        Value::Object(values) => values.iter().any(|(key, value)| {
+            contains_api_bearer_token(key) || json_contains_bearer_token(value)
+        }),
+        Value::Null | Value::Bool(_) | Value::Number(_) => false,
+    }
+}
+
+pub(super) fn disallowed_bearer_token_carrier(
+    host_identity: Option<String>,
+    request_id: RequestId,
+) -> Response {
+    api_error_response(
+        request_id,
+        host_identity,
+        ApiFailure {
+            status: axum::http::StatusCode::BAD_REQUEST,
+            code: ApiErrorCode::InvalidRequest,
+            category: ApiErrorCategory::InvalidRequest,
+            retryable: false,
+            message: "bearer tokens are accepted only through the Authorization header",
+            details: None,
+        },
+    )
+}
+
+pub(super) async fn reject_public_bearer_carriers(
+    State(state): State<Arc<DaemonState>>,
+    request: Request,
+    next: Next,
+) -> Response {
+    if request_has_disallowed_bearer_token(&request) {
+        let request_id = header_request_id(request.headers()).unwrap_or_default();
+        return disallowed_bearer_token_carrier(None, request_id);
+    }
+    let request_id = header_request_id(request.headers()).unwrap_or_default();
+    let has_json_content_type = super::api_json::has_json_content_type(request.headers());
+    let is_supported_method = request.method() == axum::http::Method::GET;
+    let (parts, body) = request.into_parts();
+    let body = match tokio::time::timeout(
+        REQUEST_BODY_READ_TIMEOUT,
+        super::api_json::read_bounded_body(body, state.limits.json_body_bytes()),
+    )
+    .await
+    {
+        Ok(Ok(body)) => body,
+        Ok(Err(super::api_json::BoundedBodyError::TooLarge)) => {
+            return public_body_failure(
+                request_id,
+                axum::http::StatusCode::PAYLOAD_TOO_LARGE,
+                ApiErrorCode::PayloadTooLarge,
+                ApiErrorCategory::Capacity,
+                "the request body exceeds the advertised JSON body limit",
+            );
+        }
+        Ok(Err(super::api_json::BoundedBodyError::Read)) => {
+            return public_body_failure(
+                request_id,
+                axum::http::StatusCode::BAD_REQUEST,
+                ApiErrorCode::InvalidRequest,
+                ApiErrorCategory::InvalidRequest,
+                "the liveness request body could not be read",
+            );
+        }
+        Err(_) => {
+            return public_body_failure(
+                request_id,
+                axum::http::StatusCode::REQUEST_TIMEOUT,
+                ApiErrorCode::InvalidRequest,
+                ApiErrorCategory::InvalidRequest,
+                "the liveness request body exceeded its read deadline",
+            );
+        }
+    };
+    if body
+        .trailers
+        .as_ref()
+        .is_some_and(trailers_have_disallowed_bearer_carrier)
+        || contains_api_bearer_token(&String::from_utf8_lossy(&body.bytes))
+    {
+        return disallowed_bearer_token_carrier(None, request_id);
+    }
+    // An empty body with an explicit JSON content type is still a normal
+    // liveness probe. Parse only actual JSON payload bytes.
+    if has_json_content_type && !body.bytes.is_empty() {
+        match super::api_json::parse_json_value(&body.bytes) {
+            Ok(value) if json_contains_bearer_token(&value) => {
+                return disallowed_bearer_token_carrier(None, request_id);
+            }
+            Ok(_) => {}
+            Err(_) if is_supported_method => {
+                return public_body_failure(
+                    request_id,
+                    axum::http::StatusCode::BAD_REQUEST,
+                    ApiErrorCode::InvalidRequest,
+                    ApiErrorCategory::InvalidRequest,
+                    "the liveness request body must be valid JSON",
+                );
+            }
+            Err(_) => {}
+        }
+    }
+    let request = Request::from_parts(parts, Body::from(body.bytes));
+    security_headers(next.run(request).await)
+}
+
+fn public_body_failure(
+    request_id: RequestId,
+    status: axum::http::StatusCode,
+    code: ApiErrorCode,
+    category: ApiErrorCategory,
+    message: &'static str,
+) -> Response {
+    api_error_response(
+        request_id,
+        None,
+        ApiFailure {
+            status,
+            code,
+            category,
+            retryable: false,
+            message,
+            details: None,
+        },
+    )
 }
 
 pub(super) async fn require_read(
@@ -188,16 +393,17 @@ pub(super) async fn require_empty_read(
     request: Request,
     next: Next,
 ) -> Response {
-    let Some(authorized) = request.extensions().get::<AuthorizedRequest>() else {
-        return missing_authorization_context();
+    let request = match validate_read_shape(
+        &state,
+        request,
+        true,
+        "this read request does not accept query parameters, cookies, or a body",
+    )
+    .await
+    {
+        Ok(request) => request,
+        Err(response) => return response,
     };
-    if request.uri().query().is_some() || read_has_body_or_cookie(&request) {
-        return invalid_read_shape(
-            &state,
-            authorized,
-            "this read request does not accept query parameters, cookies, or a body",
-        );
-    }
     next.run(request).await
 }
 
@@ -206,26 +412,58 @@ pub(super) async fn require_query_read(
     request: Request,
     next: Next,
 ) -> Response {
-    let Some(authorized) = request.extensions().get::<AuthorizedRequest>() else {
-        return missing_authorization_context();
+    let request = match validate_read_shape(
+        &state,
+        request,
+        false,
+        "this query read does not accept cookies or a body",
+    )
+    .await
+    {
+        Ok(request) => request,
+        Err(response) => return response,
     };
-    if read_has_body_or_cookie(&request) {
-        return invalid_read_shape(
-            &state,
-            authorized,
-            "this query read does not accept cookies or a body",
-        );
-    }
     next.run(request).await
 }
 
-fn read_has_body_or_cookie(request: &Request) -> bool {
-    request.headers().contains_key(COOKIE)
-        || request
-            .headers()
-            .get(CONTENT_LENGTH)
-            .and_then(|value| value.to_str().ok())
-            .is_some_and(|value| value != "0")
+async fn validate_read_shape(
+    state: &DaemonState,
+    request: Request,
+    reject_query: bool,
+    message: &'static str,
+) -> Result<Request, Response> {
+    let Some(authorized) = request.extensions().get::<AuthorizedRequest>().cloned() else {
+        return Err(missing_authorization_context());
+    };
+    if (reject_query && request.uri().query().is_some())
+        || request.headers().contains_key(COOKIE)
+        || request_declares_body(&request)
+    {
+        return Err(invalid_read_shape(state, &authorized, message));
+    }
+
+    // HTTP/2 bodies and trailers need no HTTP/1 framing headers. Read to the
+    // bounded deadline before accepting a supposedly bodyless read.
+    let (parts, body) = request.into_parts();
+    let body = tokio::time::timeout(
+        REQUEST_BODY_READ_TIMEOUT,
+        super::api_json::read_bounded_body(body, state.limits.json_body_bytes()),
+    )
+    .await;
+    match body {
+        Ok(Ok(body)) if body.bytes.is_empty() && body.trailers.is_none() => {
+            Ok(Request::from_parts(parts, Body::from(body.bytes)))
+        }
+        _ => Err(invalid_read_shape(state, &authorized, message)),
+    }
+}
+
+fn request_declares_body(request: &Request) -> bool {
+    request
+        .headers()
+        .get(CONTENT_LENGTH)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value != "0")
         || request.headers().contains_key(TRANSFER_ENCODING)
 }
 

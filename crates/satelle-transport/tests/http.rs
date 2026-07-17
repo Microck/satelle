@@ -336,6 +336,50 @@ async fn liveness_is_exact_and_reveals_no_protected_metadata() {
     let parsed: LiveResponse = serde_json::from_slice(&bytes).expect("decode live contract");
     assert!(parsed.alive());
     assert!(!String::from_utf8_lossy(&bytes).contains(&running.host_identity));
+
+    let bodyless_json_response = reqwest::Client::new()
+        .get(running.url("/v1/live"))
+        .header("Content-Type", "application/json")
+        .send()
+        .await
+        .expect("request liveness with a default JSON content type");
+    assert_eq!(bodyless_json_response.status(), StatusCode::OK);
+
+    let token = running.token.expose();
+    let deeply_encoded_token = (0..32).fold(token.to_string(), |encoded, _| {
+        encoded.replace('%', "%25").replace('.', "%2E")
+    });
+    let excessively_encoded_value =
+        (0..32).fold("%41".to_string(), |encoded, _| encoded.replace('%', "%25"));
+    for request in [
+        reqwest::Client::new().get(running.url(&format!("/v1/live?token={}", token.as_str()))),
+        reqwest::Client::new()
+            .get(running.url("/v1/live"))
+            .header("Cookie", format!("token={}", token.as_str())),
+        reqwest::Client::new()
+            .get(running.url("/v1/live"))
+            .header("Content-Type", "application/json")
+            .body(format!(r#"{{"token":"{}"}}"#, token.as_str())),
+        reqwest::Client::new()
+            .get(running.url("/v1/live"))
+            .header("Content-Type", "text/plain")
+            .body(format!("token={}", token.as_str())),
+        reqwest::Client::new()
+            .get(running.url("/v1/live"))
+            .body(format!("token={}", token.as_str())),
+        reqwest::Client::new().get(running.url(&format!("/v1/live?token={deeply_encoded_token}"))),
+        reqwest::Client::new()
+            .get(running.url(&format!("/v1/live?value={excessively_encoded_value}"))),
+    ] {
+        let response = request
+            .send()
+            .await
+            .expect("request liveness with a disallowed token carrier");
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let error: ApiError = response.json().await.expect("decode carrier rejection");
+        assert_eq!(error.code().as_str(), "invalid-request");
+        assert_eq!(error.host_identity(), None);
+    }
 }
 
 #[tokio::test]
@@ -358,6 +402,156 @@ async fn liveness_method_rejections_are_correlated() {
     assert_eq!(error.code().as_str(), "method-not-allowed");
     assert_eq!(error.request_id(), &request_id);
     assert_eq!(error.host_identity(), None);
+
+    let malformed_body = reqwest::Client::new()
+        .post(running.url("/v1/live"))
+        .header("Satelle-Request-Id", request_id.to_string())
+        .header("Content-Type", "application/json")
+        .body("{")
+        .send()
+        .await
+        .expect("request unsupported liveness method with malformed JSON");
+    assert_eq!(malformed_body.status(), StatusCode::METHOD_NOT_ALLOWED);
+    let error: ApiError = malformed_body
+        .json()
+        .await
+        .expect("decode malformed-body method rejection");
+    assert_eq!(error.code().as_str(), "method-not-allowed");
+    assert_eq!(error.request_id(), &request_id);
+}
+
+#[tokio::test]
+async fn liveness_rejects_bearer_token_in_headerless_http2_body() {
+    let running = RunningServer::start(ApiScopes::READ).await;
+    let client = reqwest::Client::builder()
+        .http2_prior_knowledge()
+        .build()
+        .expect("build HTTP/2 client");
+    let token = running.token.expose();
+    let body = format!("token={}", token.as_str()).into_bytes();
+    let body = reqwest::Body::wrap_stream(futures_util::stream::once(async move {
+        Ok::<_, std::io::Error>(body)
+    }));
+    let mut request = client
+        .get(running.url("/v1/live"))
+        .body(body)
+        .build()
+        .expect("build headerless HTTP/2 liveness request");
+    request
+        .headers_mut()
+        .remove(reqwest::header::CONTENT_LENGTH);
+
+    let response = client
+        .execute(request)
+        .await
+        .expect("request liveness with an HTTP/2 body");
+
+    assert_eq!(response.version(), reqwest::Version::HTTP_2);
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let error: ApiError = response.json().await.expect("decode carrier rejection");
+    assert_eq!(error.code().as_str(), "invalid-request");
+    assert_eq!(error.host_identity(), None);
+}
+
+#[tokio::test]
+async fn liveness_stalled_http2_body_has_a_read_deadline() {
+    let running = RunningServer::start(ApiScopes::READ).await;
+    let client = reqwest::Client::builder()
+        .http2_prior_knowledge()
+        .build()
+        .expect("build HTTP/2 client");
+    let stalled_body = reqwest::Body::wrap_stream(futures_util::stream::pending::<
+        Result<Vec<u8>, std::io::Error>,
+    >());
+
+    let response = tokio::time::timeout(
+        Duration::from_secs(2),
+        client
+            .get(running.url("/v1/live"))
+            .body(stalled_body)
+            .send(),
+    )
+    .await
+    .expect("public body read must have a deadline")
+    .expect("receive typed liveness timeout");
+
+    assert_eq!(response.version(), reqwest::Version::HTTP_2);
+    assert_eq!(response.status(), StatusCode::REQUEST_TIMEOUT);
+    let error: ApiError = response.json().await.expect("decode body-read timeout");
+    assert_eq!(error.code().as_str(), "invalid-request");
+    assert_eq!(error.host_identity(), None);
+
+    let live = client
+        .get(running.url("/v1/live"))
+        .send()
+        .await
+        .expect("request liveness after the stalled stream is released");
+    assert_eq!(live.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn host_identity_mismatch_does_not_reflect_bearer_token_carriers() {
+    let running = RunningServer::start(ApiScopes::READ).await;
+    let token = running.token.expose();
+    let canonical = token.as_str().to_string();
+    let encoded = canonical.replace('.', "%2E");
+
+    for expected_identity in [&canonical, &encoded] {
+        let response = reqwest::Client::new()
+            .get(running.url("/v1/host/status"))
+            .header("Authorization", format!("Bearer {canonical}"))
+            .header("Satelle-Expected-Host-Identity", expected_identity)
+            .header("Satelle-Request-Id", RequestId::new().to_string())
+            .send()
+            .await
+            .expect("request mismatched identity containing a bearer carrier");
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let bytes = response.bytes().await.expect("read mismatch response");
+        let text = String::from_utf8_lossy(&bytes);
+        assert!(!text.contains(&canonical));
+        assert!(!text.contains(expected_identity));
+        let error: ApiError = serde_json::from_slice(&bytes).expect("decode identity mismatch");
+        assert_eq!(error.code().as_str(), "host-identity-mismatch");
+        assert!(
+            error
+                .details()
+                .and_then(|details| details.get("expected_host_identity"))
+                .is_none()
+        );
+    }
+}
+
+#[tokio::test]
+async fn protected_read_rejects_bearer_token_in_headerless_http2_body() {
+    let running = RunningServer::start(ApiScopes::READ).await;
+    let client = reqwest::Client::builder()
+        .http2_prior_knowledge()
+        .build()
+        .expect("build HTTP/2 client");
+    let token = running.token.expose();
+    let canonical = token.as_str().to_string();
+    let body = format!(r#"{{"token":"{canonical}"}}"#).into_bytes();
+    let body = reqwest::Body::wrap_stream(futures_util::stream::once(async move {
+        Ok::<_, std::io::Error>(body)
+    }));
+
+    let response = client
+        .get(running.url("/v1/host/status"))
+        .header("Authorization", format!("Bearer {canonical}"))
+        .header("Satelle-Expected-Host-Identity", &running.host_identity)
+        .header("Satelle-Request-Id", RequestId::new().to_string())
+        .header("Content-Type", "application/json")
+        .body(body)
+        .send()
+        .await
+        .expect("request protected read with an HTTP/2 body");
+
+    assert_eq!(response.version(), reqwest::Version::HTTP_2);
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let bytes = response.bytes().await.expect("read body rejection");
+    assert!(!String::from_utf8_lossy(&bytes).contains(&canonical));
+    let error: ApiError = serde_json::from_slice(&bytes).expect("decode body rejection");
+    assert_eq!(error.code().as_str(), "invalid-request");
 }
 
 #[tokio::test]
@@ -455,6 +649,52 @@ async fn protected_reads_authenticate_before_host_pinning() {
     let status: HostStatusResponse = accepted.json().await.expect("decode status");
     assert_eq!(status.host_identity(), running.host_identity);
     assert_eq!(status.session_count(), 0);
+}
+
+#[tokio::test]
+async fn bearer_tokens_outside_authorization_are_rejected() {
+    let running = RunningServer::start(ApiScopes::CONTROL).await;
+    let exposed = running.token.expose();
+    let token = exposed.as_str();
+    let encoded_token = token.replace('.', "%2E");
+    let double_encoded_token = token.replace('.', "%252E");
+    let mut non_utf8_cookie = vec![0x80, b';', b' '];
+    non_utf8_cookie.extend_from_slice(format!("api_token={token}").as_bytes());
+    let requests = [
+        running.request(&format!("/v1/logs?cursor={token}")),
+        running.request(&format!("/v1/logs?cursor={encoded_token}")),
+        running.request(&format!("/v1/logs?cursor={double_encoded_token}")),
+        running.request(&format!("/v1/{token}")),
+        running
+            .request("/v1/host/status")
+            .header("Cookie", format!("api_token={token}")),
+        running
+            .request("/v1/host/status")
+            .header("X-Api-Token", token),
+        running.request("/v1/host/status").header(
+            "Cookie",
+            reqwest::header::HeaderValue::from_bytes(&non_utf8_cookie)
+                .expect("obs-text is a valid raw header value"),
+        ),
+        running
+            .mutation("/v1/sessions", "01890a5d-ac96-7b7c-8f89-37c3d0a66ec1")
+            .json(&satelle_transport::TurnRequest::new(format!(
+                "do not accept {token} from JSON"
+            ))),
+        running
+            .mutation("/v1/sessions", "01890a5d-ac96-7b7c-8f89-37c3d0a66ec2")
+            .header("Content-Type", "application/json")
+            .body(format!(
+                r#"{{"schema_version":"satelle.api.v2","prompt":"{token}","prompt":"safe","execution_mode":"standard"}}"#
+            )),
+    ];
+
+    for request in requests {
+        let response = request.send().await.expect("send disallowed token carrier");
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let error: ApiError = response.json().await.expect("decode carrier rejection");
+        assert_eq!(error.code().as_str(), "invalid-request");
+    }
 }
 
 #[tokio::test]

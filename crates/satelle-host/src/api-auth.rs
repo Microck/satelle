@@ -86,6 +86,48 @@ impl ApiBearerToken {
     }
 }
 
+/// Detects a complete canonical Satelle bearer token without returning or
+/// retaining the matched secret. Transport and process boundaries use this to
+/// reject raw credentials outside their one supported carrier.
+pub fn contains_api_bearer_token(value: &str) -> bool {
+    let mut search_from = 0;
+    while let Some(relative_start) = value[search_from..].find(TOKEN_PREFIX) {
+        let start = search_from + relative_start;
+        if canonical_token_starts_at(value, start) {
+            return true;
+        }
+        search_from = start + TOKEN_PREFIX.len();
+    }
+    false
+}
+
+fn canonical_token_starts_at(value: &str, start: usize) -> bool {
+    let Some(id_and_secret) = value[start + TOKEN_PREFIX.len()..].strip_prefix('.') else {
+        return false;
+    };
+    // Search at most the documented ID bound so repeated prefixes cannot
+    // force overlapping scans of an attacker-controlled suffix.
+    let Some(token_id_end) = id_and_secret
+        .bytes()
+        .take(MAX_TOKEN_ID_BYTES + 1)
+        .position(|byte| byte == b'.')
+    else {
+        return false;
+    };
+    let candidate_end =
+        start + TOKEN_PREFIX.len() + 1 + token_id_end + 1 + TOKEN_SECRET_ENCODED_BYTES;
+    let Some(candidate) = value.get(start..candidate_end) else {
+        return false;
+    };
+    let Some(remainder) = value.get(candidate_end..) else {
+        return false;
+    };
+    let has_token_continuation = remainder.chars().next().is_some_and(|character| {
+        character.is_ascii_alphanumeric() || matches!(character, '_' | '-')
+    });
+    !has_token_continuation && ApiBearerToken::parse(candidate).is_ok()
+}
+
 impl fmt::Debug for ApiBearerToken {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
@@ -357,6 +399,34 @@ mod tests {
                 assert!(!error.to_string().contains(value));
             }
         }
+    }
+
+    #[test]
+    fn canonical_tokens_are_detected_only_at_complete_token_boundaries() {
+        let token = ApiBearerToken::generate().expect("generate token");
+        let exposed = token.expose();
+
+        assert!(contains_api_bearer_token(exposed.as_str()));
+        assert!(contains_api_bearer_token(&format!(
+            "prefix={} suffix",
+            exposed.as_str()
+        )));
+        assert!(contains_api_bearer_token(&format!(
+            "credential {}.",
+            exposed.as_str()
+        )));
+        assert!(!contains_api_bearer_token("satelle_v1.not-a-token"));
+        assert!(!contains_api_bearer_token(&format!(
+            "{}extra",
+            exposed.as_str()
+        )));
+
+        let repeated_prefixes = TOKEN_PREFIX.repeat(100_000);
+        assert!(!contains_api_bearer_token(&repeated_prefixes));
+        assert!(contains_api_bearer_token(&format!(
+            "{repeated_prefixes}{}",
+            exposed.as_str()
+        )));
     }
 
     #[test]
