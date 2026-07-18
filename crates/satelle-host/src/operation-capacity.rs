@@ -124,7 +124,7 @@ impl OperationCapacity {
                     Some(match &state.active {
                         None => {
                             let entry = Arc::new(InFlight::new(request.clone()));
-                            state.active = Some(Arc::clone(&entry));
+                            state.active = Some(ActiveOperation::Idempotent(Arc::clone(&entry)));
                             self.generation.fetch_add(1, Ordering::Release);
                             Role::Leader(entry)
                         }
@@ -145,12 +145,29 @@ impl OperationCapacity {
         }
     }
 
+    /// Runs a mutation whose durable idempotency is owned by another boundary
+    /// while still sharing the Host-global operation slot.
+    pub(crate) fn execute_exclusive<T>(
+        &self,
+        operation: impl FnOnce() -> Result<T, SatelleError>,
+    ) -> Result<T, SatelleError> {
+        {
+            let mut state = self.lock()?;
+            if state.active.is_some() {
+                return Err(SatelleError::capacity_exceeded(RESOURCE, LIMIT));
+            }
+            state.active = Some(ActiveOperation::Exclusive);
+            self.generation.fetch_add(1, Ordering::Release);
+        }
+        ExclusiveCapacityLeader::new(self).run(operation)
+    }
+
     fn matching_active(
         &self,
         state: &CapacityState,
         request: &OperationRequest,
     ) -> Result<Option<Arc<InFlight>>, SatelleError> {
-        let Some(active) = &state.active else {
+        let Some(ActiveOperation::Idempotent(active)) = &state.active else {
             return Ok(None);
         };
         if active.request.same_base(request) && active.request != *request {
@@ -181,8 +198,23 @@ impl OperationCapacity {
         if state
             .active
             .as_ref()
-            .is_some_and(|active| Arc::ptr_eq(active, entry))
+            .is_some_and(|active| {
+                matches!(active, ActiveOperation::Idempotent(active) if Arc::ptr_eq(active, entry))
+            })
         {
+            state.active = None;
+            self.generation.fetch_add(1, Ordering::Release);
+        }
+        #[cfg(test)]
+        self.registration_changed.notify_all();
+    }
+
+    fn clear_exclusive(&self) {
+        let mut state = match self.state.lock() {
+            Ok(state) => state,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if matches!(state.active, Some(ActiveOperation::Exclusive)) {
             state.active = None;
             self.generation.fetch_add(1, Ordering::Release);
         }
@@ -198,24 +230,31 @@ impl OperationCapacity {
         let Ok((state, _)) =
             self.registration_changed
                 .wait_timeout_while(state, timeout, |state| {
-                    state
-                        .active
-                        .as_ref()
-                        .is_none_or(|active| active.followers.load(Ordering::SeqCst) == 0)
+                    !matches!(
+                        state.active.as_ref(),
+                        Some(ActiveOperation::Idempotent(active))
+                            if active.followers.load(Ordering::SeqCst) > 0
+                    )
                 })
         else {
             return false;
         };
-        state
-            .active
-            .as_ref()
-            .is_some_and(|active| active.followers.load(Ordering::SeqCst) > 0)
+        matches!(
+            state.active.as_ref(),
+            Some(ActiveOperation::Idempotent(active))
+                if active.followers.load(Ordering::SeqCst) > 0
+        )
     }
 }
 
 #[derive(Default)]
 struct CapacityState {
-    active: Option<Arc<InFlight>>,
+    active: Option<ActiveOperation>,
+}
+
+enum ActiveOperation {
+    Idempotent(Arc<InFlight>),
+    Exclusive,
 }
 
 enum Role {
@@ -330,5 +369,37 @@ impl Drop for CapacityLeader<'_> {
             "the in-flight operation terminated before producing a result",
         )));
         self.capacity.clear(&self.entry);
+    }
+}
+
+struct ExclusiveCapacityLeader<'a> {
+    capacity: &'a OperationCapacity,
+    finished: bool,
+}
+
+impl<'a> ExclusiveCapacityLeader<'a> {
+    fn new(capacity: &'a OperationCapacity) -> Self {
+        Self {
+            capacity,
+            finished: false,
+        }
+    }
+
+    fn run<T>(
+        mut self,
+        operation: impl FnOnce() -> Result<T, SatelleError>,
+    ) -> Result<T, SatelleError> {
+        let result = operation();
+        self.capacity.clear_exclusive();
+        self.finished = true;
+        result
+    }
+}
+
+impl Drop for ExclusiveCapacityLeader<'_> {
+    fn drop(&mut self) {
+        if !self.finished {
+            self.capacity.clear_exclusive();
+        }
     }
 }

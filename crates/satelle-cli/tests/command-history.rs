@@ -6,7 +6,6 @@ use std::fs;
 use std::path::Path;
 use std::sync::{Arc, Barrier};
 use std::time::Duration;
-use tempfile::TempDir;
 
 #[path = "support/test-file.rs"]
 mod test_file;
@@ -15,13 +14,15 @@ const HISTORY_DATABASE: &str = "command-history.sqlite3";
 const TEST_SUPPORT_ADAPTER_ENV: &str = "SATELLE_TEST_SUPPORT_ADAPTER";
 
 struct Fixture {
-    cache: TempDir,
+    cache: TestStateDir,
     state: TestStateDir,
 }
 
 impl Fixture {
     fn new() -> Self {
-        let cache = tempfile::tempdir().expect("create command-history cache root");
+        // TestStateDir canonicalizes macOS's /var symlink and creates a
+        // protected child on Windows, matching production path policy.
+        let cache = TestStateDir::new().expect("create command-history cache root");
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;

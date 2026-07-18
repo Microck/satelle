@@ -5,6 +5,7 @@ mod host_error;
 mod listener;
 mod logs;
 mod sessions;
+mod setup;
 
 use crate::contract::{
     ApiError, ApiErrorCategory, ApiErrorCode, CapabilitiesResponse, EffectiveLimits,
@@ -279,6 +280,17 @@ pub struct DaemonServer {
     tls_reloader: Option<DaemonTlsReloader>,
 }
 
+#[derive(Clone, Debug)]
+/// A cloneable signal for gracefully stopping a running Host listener.
+pub struct DaemonShutdownHandle(watch::Sender<bool>);
+
+impl DaemonShutdownHandle {
+    /// Requests graceful shutdown without taking ownership of the server.
+    pub fn request_shutdown(&self) {
+        let _ = self.0.send(true);
+    }
+}
+
 impl DaemonServer {
     pub async fn bind(
         service: HostService,
@@ -348,6 +360,8 @@ impl DaemonServer {
             websocket_connections: events::ConnectionRegistry::new(
                 limits.websocket_connections_per_principal(),
             ),
+            setup_issuances: Mutex::new(HashMap::new()),
+            setup_mutations: Mutex::new(HashMap::new()),
             shutdown: shutdown.clone(),
         });
         let router = router(Arc::clone(&state));
@@ -412,9 +426,37 @@ impl DaemonServer {
         self.tls_reloader.clone()
     }
 
+    /// Returns a handle that can request graceful shutdown from another task.
+    pub fn shutdown_handle(&self) -> DaemonShutdownHandle {
+        DaemonShutdownHandle(
+            self.shutdown
+                .as_ref()
+                .expect("a running daemon retains its shutdown sender")
+                .clone(),
+        )
+    }
+
     pub async fn wait(mut self) -> Result<(), DaemonServerError> {
-        let task = self.task.take().expect("server task is present");
-        let result = match task.await {
+        let mut task = self.task.take().expect("server task is present");
+        let mut shutdown = self
+            .shutdown
+            .as_ref()
+            .expect("a running daemon retains its shutdown sender")
+            .subscribe();
+        let task_result = tokio::select! {
+            result = &mut task => result,
+            () = wait_for_shutdown(&mut shutdown) => {
+                match tokio::time::timeout(self.shutdown_grace, &mut task).await {
+                    Ok(result) => result,
+                    Err(_) => {
+                        task.abort();
+                        let _ = task.await;
+                        return Err(DaemonServerError::ShutdownTimedOut);
+                    }
+                }
+            }
+        };
+        let result = match task_result {
             Ok(Ok(())) => self.wait_for_workers().await,
             Ok(Err(error)) => Err(DaemonServerError::ServeFailed(error)),
             Err(error) => Err(DaemonServerError::TaskFailed(error)),
@@ -619,6 +661,13 @@ pub(super) struct DaemonState {
     control_limit: FixedWindowLimiter<String>,
     websocket_inbound_limit: FixedWindowLimiter<String>,
     websocket_connections: Arc<events::ConnectionRegistry>,
+    setup_issuances: Mutex<HashMap<(String, String), setup::SetupTokenIssuance>>,
+    // SSH bootstrap principals are process-local, so their replay window is
+    // exactly this daemon lifetime. Keep successful setup mutations here and
+    // bind each operation/key pair to one token target.
+    setup_mutations: Mutex<
+        HashMap<(String, setup::SetupTokenMutationOperation, String), setup::SetupTokenMutation>,
+    >,
     shutdown: watch::Sender<bool>,
 }
 
@@ -632,6 +681,7 @@ fn router(state: Arc<DaemonState>) -> Router {
         ));
     let bodyless_read_routes = Router::new()
         .route("/v1/capabilities", get(capabilities))
+        .route("/v1/setup/api-token/current", get(setup::confirm_api_token))
         .route("/v1/host/status", get(host_status))
         .route("/v1/host/desktop-sessions", get(host_desktop_sessions))
         .route("/v1/sessions/{session_id}", get(sessions::get_session))
@@ -653,6 +703,20 @@ fn router(state: Arc<DaemonState>) -> Router {
                 Arc::clone(&state),
                 auth::require_read,
             ));
+    let setup_routes = Router::new()
+        .route("/v1/setup/api-token", post(setup::issue_api_token))
+        .route(
+            "/v1/setup/api-token/{token_id}/activate",
+            post(setup::activate_api_token),
+        )
+        .route(
+            "/v1/setup/api-token/{token_id}/abort",
+            post(setup::abort_api_token),
+        )
+        .route_layer(middleware::from_fn_with_state(
+            Arc::clone(&state),
+            auth::require_empty_setup_mutation,
+        ));
     let control_routes = Router::new()
         .route("/v1/sessions", post(sessions::create_session))
         .route(
@@ -663,6 +727,7 @@ fn router(state: Arc<DaemonState>) -> Router {
             "/v1/sessions/{session_id}/stop",
             post(sessions::stop_session),
         )
+        .merge(setup_routes)
         .route_layer(middleware::from_fn_with_state(
             Arc::clone(&state),
             auth::require_control,

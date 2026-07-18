@@ -444,7 +444,7 @@
 - satelle setup prefers a user-level or login-session service over a privileged system service for native Computer Use hosts because visible desktop control usually belongs to the signed-in user session @spec @mvp
 - satelle setup uses a privileged system service only when the requested host mode requires it and the setup plan states the privilege, service account, and desktop-session implications before mutation @spec @mvp
 - satelle MVP binds each concrete host alias to one Satelle Desktop Binding instead of selecting a desktop user per run @spec @mvp @implemented
-- before first trust, a user-level Host Binding may set expected_host_id = null so setup can discover but not silently pre-trust the reachable Host Identity @spec @mvp
+- before first trust, a user-level Host Binding may set expected_host_id = null so setup can discover but not silently pre-trust the reachable Host Identity @spec @mvp @implemented
 - satelle setup defaults the Satelle Desktop Binding to the authenticated bootstrap OS account when that account has a compatible active desktop session @spec @mvp
 - satelle setup supports setup-time desktop binding selection through an interactive prompt or user-level host configuration when multiple candidate desktop users are visible @spec @mvp
 - satelle setup with --no-input reports a typed desktop-binding-required diagnostic when multiple candidate desktop users are visible and no desktop_user binding is configured @spec @mvp
@@ -775,7 +775,7 @@
 - missing, malformed, duplicate, and unsupported Satelle-Protocol-Version values return HTTP 426 with code incompatible-protocol, category compatibility, retryable false, and schema_version satelle.error.v1 @spec @contract @mvp @implemented
 - incompatible-protocol details contain exactly reason, supported_versions, and received_version; reason is missing, malformed, duplicate, or unsupported, supported_versions is ["2"], received_version is the validated canonical unsupported token or null, and arbitrary header bytes are never reflected @spec @contract @mvp @implemented
 - DaemonClient sends Satelle-Protocol-Version 2 on every mutating request and does not require the header for authenticated reads used to diagnose or recover version skew @spec @contract @mvp @implemented
-- POST /v1/sessions, POST /v1/sessions/{session_id}/turns, and POST /v1/sessions/{session_id}/stop enforce protocol compatibility, and future POST /v1/setup and POST /v1/doctor routes use the same mutation gate when implemented @spec @contract @mvp @implemented
+- POST /v1/sessions, POST /v1/sessions/{session_id}/turns, POST /v1/sessions/{session_id}/stop, POST /v1/setup/api-token, POST /v1/setup/api-token/{token_id}/activate, and POST /v1/setup/api-token/{token_id}/abort enforce protocol compatibility, and future POST /v1/doctor routes use the same mutation gate when implemented @spec @contract @mvp @implemented
 - satelle API JSON decoding rejects unknown fields instead of ignoring misspelled security, authority, or execution-policy fields @spec @mvp @implemented
 - satelle API endpoints reject unsupported content types before reading operation data @spec @mvp @implemented
 - every API request receives a correlation request_id returned in the response and included in redacted diagnostic records @spec @mvp @implemented
@@ -788,7 +788,7 @@
 - satelle Host Daemon Turn request bodies use the exact schema_version token satelle.api.v2 while unchanged stop request bodies use satelle.api.v1 @spec @contract @mvp @implemented
 - authenticated Host Daemon requests use Satelle-Request-Id for caller-supplied UUIDv7 correlation and Satelle-Expected-Host-Identity for Host pinning; neither header grants authority or idempotency @spec @contract @mvp @implemented
 - authenticated Host Daemon HTTP requests without Satelle-Request-Id receive a generated canonical UUIDv7 except GET /v1/events, whose WebSocket upgrade contract requires a caller-supplied Satelle-Request-Id; malformed or duplicate supplied request-id headers are rejected @spec @contract @mvp @implemented
-- satelle Host Daemon MVP uses GET /v1/live, GET /v1/capabilities, GET /v1/host/status, GET /v1/host/desktop-sessions, POST /v1/sessions, POST /v1/sessions/{session_id}/turns, GET /v1/sessions/{session_id}, POST /v1/sessions/{session_id}/stop, GET /v1/logs, and GET /v1/events as its canonical route set and exposes no run, steer, blocking-run, SSE, or HTTP logs-follow aliases @spec @contract @mvp @implemented
+- satelle Host Daemon MVP uses GET /v1/live, GET /v1/capabilities, GET /v1/host/status, GET /v1/host/desktop-sessions, POST /v1/sessions, POST /v1/sessions/{session_id}/turns, GET /v1/sessions/{session_id}, POST /v1/sessions/{session_id}/stop, GET /v1/logs, GET /v1/events, GET /v1/setup/api-token/current, POST /v1/setup/api-token, POST /v1/setup/api-token/{token_id}/activate, and POST /v1/setup/api-token/{token_id}/abort as its canonical route set and exposes no run, steer, blocking-run, SSE, or HTTP logs-follow aliases @spec @contract @mvp @implemented
 - Host Daemon response schemas use the exact tokens satelle.capabilities.v2, satelle.host.status.v1, satelle.host.desktop-sessions.v1, satelle.logs.page.v1, and satelle.ws.control.v1 for their corresponding versioned surfaces @contract @mvp @implemented
 - GET /v1/logs accepts only the query fields mode, cursor, limit, session_id, sources, minimum_severity, and since; unknown fields, duplicate singleton fields, empty source tokens, and duplicate source tokens report a typed invalid-request error @spec @contract @mvp @implemented
 - GET /v1/logs mode is tail or forward, defaults to tail, and permits cursor only with forward mode @spec @contract @mvp @implemented
@@ -807,7 +807,7 @@
 - POST /v1/sessions, POST /v1/sessions/{session_id}/turns, and GET /v1/sessions/{session_id} return the exact response schema token satelle.session.v1 and one flat envelope containing request_id, host_identity, and the canonical PublicSession fields @spec @contract @mvp @implemented
 - POST /v1/sessions and POST /v1/sessions/{session_id}/turns return HTTP 202 only after durable asynchronous Turn admission, while GET /v1/sessions/{session_id} returns HTTP 200 @spec @contract @mvp @implemented
 - POST /v1/sessions/{session_id}/stop returns the exact response schema token satelle.session.stop.v1 and one flat envelope containing request_id, host_identity, stop outcome fields, and canonical Session and Turn state revisions @spec @contract @mvp @implemented
-- the authenticated capabilities operations list uses the exact route-semantic tokens live, capabilities, host_status, host_desktop_sessions, session_create, turn_create, session_read, session_stop, logs_read, and events_read for the currently available v1 routes and never advertises CLI run or steer command names @spec @contract @mvp @implemented
+- the authenticated capabilities operations list uses the exact route-semantic tokens live, capabilities, host_status, host_desktop_sessions, session_create, turn_create, session_read, session_stop, logs_read, events_read, setup_api_token_current, setup_api_token_issue, setup_api_token_activate, and setup_api_token_abort for the currently available v1 routes and never advertises CLI run or steer command names @spec @contract @mvp @implemented
 - Host Daemon v1 success and error responses use operation-specific flat JSON envelopes with request_id and host_identity where authenticated, and never use a generic data wrapper @spec @contract @mvp @implemented
 - GET /v1/live returns only schema_version satelle.live.v1 and alive true and reveals no version, capability, identity, readiness, or Session metadata @spec @contract @mvp @implemented
 - GET /v1/host/desktop-sessions returns one flat satelle.host.desktop-sessions.v1 envelope containing exactly schema_version, request_id, host_identity, and the Host-observed desktop sessions @contract @mvp @implemented
@@ -1512,10 +1512,10 @@
 - satelle session records include enough host, readiness, provider, goal, and lifecycle metadata to survive transport changes without changing the public session identifier @spec @mvp
 - satelle Host Daemon is the canonical store for session metadata because it owns the Codex thread, app-server lifecycle, Computer Use readiness, logs, and recovery state @spec @mvp
 - satelle CLI may keep read-only convenience cache for recently used sessions but must refresh from the Host Daemon before reporting authoritative status @spec @mvp
-- satelle status reconnects to the session's remote host automatically when the local CLI has no active connection @spec @mvp
+- satelle status reconnects to the session's remote host automatically when the local CLI has no active connection @spec @mvp @implemented
 - satelle status and logs are the MVP surfaces for later inspection after a user disconnects from a live event stream @implemented @mvp
 - satelle clients that reconnect after missing live Satelle Events read current session state and normalized logs instead of replaying missed events @spec @mvp
-- satelle status for SSH bootstrap hosts may restart the on-demand Host Daemon before reading stored remote session metadata @spec @mvp
+- satelle status for SSH bootstrap hosts may restart the on-demand Host Daemon before reading stored remote session metadata @spec @mvp @implemented
 - satelle status reports a typed session-not-found error when the selected host cannot find the requested session metadata @implemented @mvp
 - a Session operation verifies that the requested Session belongs to the connected Host Identity @spec @mvp
 - the local CLI uses its non-authoritative Session-to-Host cache only to select a candidate Host @spec @mvp
@@ -1547,7 +1547,7 @@
 - satelle logs supports --host <alias> to read host-scoped logs for a configured remote host @spec @mvp @implemented
 - satelle logs supports --session <session_id> to read logs scoped to one Satelle session @implemented @mvp
 - satelle logs reports a typed logs-target-required error when no host, default host, current host, or session selector can be resolved @spec @mvp
-- satelle logs for SSH bootstrap hosts may restart the on-demand Host Daemon before reading stored normalized logs @spec @mvp
+- satelle logs for SSH bootstrap hosts may restart the on-demand Host Daemon before reading stored normalized logs @spec @mvp @implemented
 - satelle logs supports --tail <n> to limit output to the most recent n matching log entries @implemented @mvp
 - satelle logs defaults to --tail 200 when neither --tail nor --since is provided @implemented @mvp
 - satelle logs accepts --tail values from 1 through 10000 and reports a typed log-tail-limit-exceeded usage error for larger values @implemented @mvp
@@ -1775,10 +1775,10 @@
 - satelle embeds SQLite schema migrations in the binary so on-demand remote bootstrap does not require sidecar migration files @mvp @implemented
 - satelle Host Daemon applies embedded SQLite migrations on startup before accepting API requests @mvp @implemented
 - satelle runs each migration step transactionally when SQLite supports transactional execution for that step @mvp @implemented
-- satelle creates a SQLite-consistent backup before the first irreversible migration step @spec @mvp
-- a pre-migration backup is flushed to durable storage and passes SQLite integrity validation before the first irreversible migration step begins @spec @mvp
-- each migration backup records the source schema version, source database digest, created_at, Satelle version, and restore-compatibility metadata without adding plaintext secrets @spec @mvp
-- a failed migration never deletes or overwrites the only validated backup capable of restoring the pre-migration store @spec @mvp
+- satelle creates a SQLite-consistent backup before the first irreversible migration step @spec @mvp @implemented
+- a pre-migration backup is flushed to durable storage and passes SQLite integrity validation before the first irreversible migration step begins @spec @mvp @implemented
+- each migration backup records the source schema version, source database digest, created_at, Satelle version, and restore-compatibility metadata without adding plaintext secrets @spec @mvp @implemented
+- a failed migration never deletes or overwrites the only validated backup capable of restoring the pre-migration store @spec @mvp @implemented
 - satelle does not automatically downgrade, reset, or delete the SQLite store when migration fails @mvp @implemented
 - satelle reports migration failures with typed errors and repair guidance instead of starting with a partially migrated store @mvp @implemented
 - satelle exposes satelle host storage restore --host <alias> --backup <path> as the explicit authenticated restore operation @spec @mvp
@@ -1823,13 +1823,13 @@
 - when TLS terminates in an external reverse proxy, the plaintext Host Daemon backend binds only to loopback and still requires normal Satelle bearer-token authentication and authorization @spec @mvp @implemented
 - TLS reload installs a new certificate and key atomically only after full validation; each accepted connection snapshots one configuration for its handshake, established TLS connections retain their negotiated state, only subsequent handshakes use the replacement, and failed reload retains the previous valid TLS configuration and emits a typed diagnostic instead of exposing plaintext @spec @mvp @implemented
 - satelle Host Daemon API authentication uses bearer tokens for MVP @spec @mvp @implemented
-- satelle stores Host Daemon API bearer tokens in external secret stores or token files instead of inline Satelle configuration @spec @mvp
-- satelle Host Daemon generates durable API bearer tokens by default during setup or persistent service installation @spec @mvp
-- durable API bearer tokens remain valid until explicitly revoked by default and may instead define an optional expires_at timestamp @spec @mvp
-- bearer-token expires_at values are RFC 3339 UTC timestamps evaluated against Host Daemon time @spec @mvp
-- expired bearer tokens are rejected before authorization and token metadata reports their optional expiry without exposing token material @spec @mvp
-- satelle allows explicitly provided API bearer tokens for automation or managed environments when stored outside inline Satelle configuration @spec @mvp
-- an external bearer-token file must be a regular file owned by the resolving OS user; Satelle rejects symlinks, directories, devices, sockets, and files readable or writable by unrelated principals, using mode 0600 on POSIX and an owner-only Windows ACL @spec @mvp
+- satelle stores Host Daemon API bearer tokens in external secret stores or token files instead of inline Satelle configuration @spec @mvp @implemented
+- satelle Host Daemon generates durable API bearer tokens by default during setup or persistent service installation @spec @mvp @implemented
+- durable API bearer tokens remain valid until explicitly revoked by default and may instead define an optional expires_at timestamp @spec @mvp @implemented
+- bearer-token expires_at values are RFC 3339 UTC timestamps evaluated against Host Daemon time @spec @mvp @implemented
+- expired bearer tokens are rejected before authorization and token metadata reports their optional expiry without exposing token material @spec @mvp @implemented
+- satelle allows explicitly provided API bearer tokens for automation or managed environments when stored outside inline Satelle configuration @spec @mvp @implemented
+- an external bearer-token file must be a regular file owned by the resolving OS user; Satelle rejects symlinks, directories, devices, sockets, and files readable or writable by unrelated principals, using mode 0600 on POSIX and an owner-only Windows ACL @spec @mvp @implemented
 - every Host Daemon bearer token has a stable non-secret token id @spec @mvp @implemented
 - every Host Daemon bearer token has one or more read, control, admin, and diagnostics_sensitive scopes @spec @mvp @implemented
 - read scope authorizes readiness, status, Host session metadata, paths, and redacted logs @spec @mvp @implemented
@@ -1840,7 +1840,7 @@
 - a request with valid authentication but insufficient scope fails with a typed authorization-insufficient-scope error @spec @mvp
 - Host Daemon bearer tokens contain at least 256 bits of cryptographically random entropy @spec @mvp @implemented
 - the Host Daemon stores only a one-way token verifier and non-secret token metadata @spec @mvp @implemented
-- a newly issued raw bearer token is returned exactly once @spec @mvp
+- a newly issued raw bearer token is returned exactly once @spec @mvp @implemented
 - a successful bearer-token issuance or rotation response contains durable token metadata plus raw token material generated for that response and never persisted by Satelle @spec @later
 - bearer-token verification uses a timing-safe comparison @spec @mvp @implemented
 - bearer tokens are accepted only through the Authorization header @spec @mvp @implemented
@@ -1859,9 +1859,9 @@
 - an SSH bootstrap token expires after 15 minutes, when the bootstrap Host Daemon exits, or when the bootstrap operation explicitly revokes it, whichever occurs first @spec @mvp @implemented
 - an SSH bootstrap token is never accepted by a non-loopback listener or a later Host Daemon process @spec @mvp @implemented
 - SSH bootstrap tokens are never written to Satelle configuration, SQLite, local cache, shell history, logs, events, diagnostics, action ledgers, or service configuration @spec @mvp @implemented
-- prompt execution after setup uses a durable scoped API token and never reuses an initial SSH bootstrap token @spec @mvp
-- Host Daemon API authentication is required for direct, loopback, Tailscale, and SSH-tunneled API connections @spec @mvp
-- SSH authentication and Tailscale identity do not replace Host Daemon API authentication or authorization @spec @mvp
+- prompt execution after setup uses a durable scoped API token and never reuses an initial SSH bootstrap token @spec @mvp @implemented
+- Host Daemon API authentication is required for every protected API operation over direct, loopback, Tailscale, and SSH-tunneled connections; GET /v1/live is the only unauthenticated liveness exception @spec @mvp @implemented
+- SSH authentication and Tailscale identity do not replace Host Daemon API authentication or authorization @spec @mvp @implemented
 - id: kyc
   label: an unauthenticated liveness endpoint may reveal only that the Host Daemon process is alive
   command: cargo test --locked -p satelle-transport --test http liveness_is_exact_and_reveals_no_protected_metadata -- --exact
@@ -1873,7 +1873,7 @@
 - satelle later mutual TLS uses user-level client certificate, private-key, and CA descriptors with certificate rotation, revocation, service reload, expiry, trust-chain, and cross-platform storage diagnostics @spec @later
 - satelle later maps a verified client certificate identity into audit metadata while bearer-token scopes remain authoritative for application operations @spec @later
 - satelle Tailscale-backed direct transport still requires Satelle Host Daemon authentication and authorization because Tailscale reachability identity is not the Satelle operation permission model @spec @mvp
-- after explicit setup or trust acceptance, the CLI writes the observed stable Host Identity to expected_host_id in the user-level Host Binding @spec @mvp
+- after explicit setup or trust acceptance, the CLI writes the observed stable Host Identity to expected_host_id in the user-level Host Binding @spec @mvp @implemented
 - any Host Binding with expected_host_id = null permits identity discovery only through explicit setup or trust acceptance and cannot start ordinary Session, log, or maintenance operations @spec @mvp
 - all communication after first trust requires the observed Host Identity to match the user-level Host Binding's expected_host_id @spec @mvp
 - after first trust, every authenticated HTTP request and WebSocket handshake includes the expected Host Identity through the Satelle-Expected-Host-Identity header, and the Host Daemon compares it before handling the operation or returning protected data @spec @contract @mvp
@@ -1882,7 +1882,7 @@
 - interactive Host trust displays the transport-authenticated endpoint, observed Host Identity, current expected_host_id, Host Alias, and Desktop Binding before asking for confirmation @spec @mvp
 - noninteractive Host trust requires --no-input --yes plus --expected-host-id <exact-id>; --yes alone never accepts a discovered Host Identity @spec @mvp
 - replacing a non-null expected_host_id additionally requires --replace and is never implied by setup, repair, host update, project configuration, a Trusted Profile, or ordinary --yes consent @spec @mvp
-- setup with expected_host_id = null performs the same Host trust confirmation after the Host Identity becomes reachable and before durable token issuance, provider-secret provisioning, or any subsequent daemon-owned mutation @spec @mvp
+- setup with expected_host_id = null performs the same Host trust confirmation after the Host Identity becomes reachable and before durable token issuance, provider-secret provisioning, or any subsequent daemon-owned mutation @spec @mvp @implemented
 - provider-secret provisioning refuses to transmit raw secret material until the observed Host Identity matches the newly pinned or previously configured expected_host_id @spec @mvp
 - satelle MVP does not require local user confirmation before starting a remote Computer Use run on a ready host @spec @mvp
 - satelle prompt execution never bypasses host readiness, native Computer Use readiness, or unsupported-capability checks @spec @mvp
@@ -1907,6 +1907,10 @@
 - satelle YOLO mode does not grant operating-system privacy permissions, approve administrator authentication, approve security prompts, unlock machines, or click through Codex app UI permission prompts that are not exposed as supported app-server approval callbacks @spec @mvp @implemented
 - satelle reports a typed yolo-not-supported error when the remote Codex control plane cannot honor the requested YOLO approval and sandbox behavior @spec @mvp
 - satelle reports a typed yolo-blocked-by-native-approval error when native Computer Use blocks on a non-bypassable OS, app, or sensitive-action approval while YOLO mode is active @spec @mvp
+- id: htr
+  label: satelle host trust atomically replaces the user-level configuration without changing its POSIX mode or Windows DACL and revalidates the replacement before reporting success
+  command: cargo test --locked -p satelle-cli --bin satelle host_trust::tests::host_identity_update_preserves_unrelated_toml_and_is_idempotent -- --exact
+  tags: [mvp, implemented]
 
 ## control-plane
 - satelle MVP supports Codex app-server as the only Codex control plane used by the Host Daemon @spec @mvp @implemented
@@ -1932,7 +1936,7 @@
 - satelle MVP starts the remote host component on demand instead of installing a persistent OS service by default @spec @mvp
 - satelle run automatically starts the on-demand Host Daemon for SSH bootstrap hosts when it is not already running @spec @mvp @implemented
 - satelle run requires an already reachable Host Daemon for direct transport hosts and reports a direct-daemon-unreachable error when none is available @spec @mvp @implemented
-- satelle on-demand Host Daemon stays alive after a session ends for a short configurable idle timeout so follow-up commands can reuse it @spec @mvp
+- satelle on-demand Host Daemon stays alive after a session ends for a short configurable idle timeout so follow-up commands can reuse it @spec @mvp @implemented
 - satelle on-demand Host Daemon default idle timeout is 10 minutes @spec @mvp
 - satelle on-demand Host Daemon idle timeout can be configured per host or profile @spec @mvp
 - satelle on-demand Host Daemon idle timeout counts active Turns, active control probes, active maintenance operations, queued Turn Requests, and connected Clients instead of retained Session records @spec @mvp
@@ -2141,6 +2145,10 @@
 - satelle refuses prompt execution on hosts that still fail native Computer Use readiness after setup or repair @spec @mvp
 
 ## transport
+- id: srl
+  label: SSH durable daemon relaunches acquire the remote bootstrap lock, recheck readiness after acquisition, and retain the lock through launch and authenticated readiness
+  command: cargo test --locked -p satelle-cli --features test-support --bin satelle transport::tests::serialized_durable_relaunch_rechecks_readiness_under_the_remote_lock -- --exact
+  tags: [spec, mvp, implemented]
 - satelle treats Tailscale as an optional first-class private connectivity option for reaching configured remote hosts @spec @mvp @implemented
 - satelle does not require Tailscale for core remote host configuration or execution flows @spec @mvp @implemented
 - satelle supports connectivity paths that are not exclusive to Tailscale @spec @mvp @implemented

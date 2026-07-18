@@ -1,10 +1,12 @@
-use crate::{CliFailure, SelectedHost, failure};
+use crate::{CliFailure, SelectedHost, failure, on_demand_idle_timeout};
 use satelle_core::session::{PublicSession, TurnAdmissionFailure};
 use satelle_core::{
     ApiTokenSource, DaemonPathOverrides, DirectHostBinding, DoctorOptions, DoctorReport, ErrorCode,
     HostSessionsReport, HostSessionsSchemaVersion, LOCAL_DEMO_HOST, SatelleError, SatelleEvent,
-    SessionId, SetupReport, SshHostBinding, StopResult, TransportKind, TurnId,
-    read_owner_only_secret_file, read_trusted_ca_bundle_file,
+    SecureFileError, SessionId, SetupReadinessSummary, SetupReport, SetupRequiredInput,
+    SetupSchemaVersion, SshHostBinding, StopResult, TransportKind, TurnId,
+    open_or_create_owner_only_directory, open_or_create_owner_only_file,
+    persist_new_owner_only_secret_file, read_owner_only_secret_file, read_trusted_ca_bundle_file,
 };
 use satelle_host::{
     ApiBearerToken, ApiScopes, DaemonLogPage, HostService, HostStatus, LogCursor, LogPageQuery,
@@ -15,15 +17,20 @@ use satelle_transport::{
     TurnRequest,
 };
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
+use std::{fs, path::Path};
 use uuid::Uuid;
 
 const SSH_DAEMON_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+const SSH_DAEMON_LAUNCH_TIMEOUT: Duration = Duration::from_secs(30);
+const SSH_DAEMON_LAUNCH_POLL_INTERVAL: Duration = Duration::from_millis(100);
+pub(crate) const SSH_BOOTSTRAP_LOCK_READY: &str = "satelle-bootstrap-lock-v1";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, clap::ValueEnum)]
 pub(crate) enum SshBootstrapScope {
     Read,
     Control,
+    Admin,
 }
 
 impl SshBootstrapScope {
@@ -31,6 +38,7 @@ impl SshBootstrapScope {
         match self {
             Self::Read => ApiScopes::READ,
             Self::Control => ApiScopes::CONTROL,
+            Self::Admin => ApiScopes::ADMIN,
         }
     }
 
@@ -38,7 +46,28 @@ impl SshBootstrapScope {
         match self {
             Self::Read => "read",
             Self::Control => "control",
+            Self::Admin => "admin",
         }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SshDaemonLaunchPolicy {
+    Never,
+    DurableOnly,
+    Bootstrap(SshBootstrapScope),
+}
+
+impl SshDaemonLaunchPolicy {
+    const fn bootstrap_scope(self) -> Option<SshBootstrapScope> {
+        match self {
+            Self::Bootstrap(scope) => Some(scope),
+            Self::Never | Self::DurableOnly => None,
+        }
+    }
+
+    const fn allows_durable_relaunch(self) -> bool {
+        !matches!(self, Self::Never)
     }
 }
 
@@ -334,6 +363,692 @@ impl DirectTransport {
         }
     }
 }
+
+struct SshSetupTransport {
+    alias: String,
+    binding: SshHostBinding,
+    host_config: satelle_core::HostConfig,
+    requires_first_trust: bool,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+enum ExistingTokenVerification {
+    Reusable,
+    ActivatedPending,
+    AuthenticationRejected { token_id: String },
+}
+
+#[derive(Clone, Copy)]
+enum SetupApplication {
+    Planned { existing_token_file: bool },
+    AppliedNewToken,
+    AppliedReusableToken,
+    AppliedPendingActivation,
+}
+
+impl SshSetupTransport {
+    fn new(host: &SelectedHost) -> Result<Self, SatelleError> {
+        let requires_first_trust = host.config.expected_host_id.is_none();
+        let mut binding_config = host.config.clone();
+        if requires_first_trust {
+            // A fresh probe identity lets planning validate the SSH Binding
+            // without treating any observed daemon identity as trusted.
+            binding_config.expected_host_id = Some(format!("setup-discovery-{}", Uuid::now_v7()));
+        }
+        let binding = SshHostBinding::from_host_config_for_bootstrap(&binding_config)
+            .map_err(|error| SatelleError::config_error(error.to_string(), None))?;
+        Ok(Self {
+            alias: host.alias.clone(),
+            binding,
+            host_config: host.config.clone(),
+            requires_first_trust,
+        })
+    }
+
+    fn unsupported(&self, operation: &str) -> SatelleError {
+        SatelleError::not_implemented(format!(
+            "SSH setup transport for host '{}' does not support {operation}",
+            self.alias
+        ))
+    }
+
+    fn validate_setup_request(
+        &self,
+        setup_mode: &str,
+        setup_components: &[String],
+    ) -> Result<(), SatelleError> {
+        // Token handoff is the only SSH setup mutation implemented here. Reject
+        // broader requests before planning or opening SSH so a partial setup can
+        // never be reported as successfully applied.
+        if setup_mode != "on_demand" {
+            return Err(self.unsupported("persistent service installation"));
+        }
+        if setup_components != ["transport"] {
+            return Err(self.unsupported(
+                "components other than the on-demand transport token handoff; rerun with --on-demand --component transport",
+            ));
+        }
+        Ok(())
+    }
+
+    fn setup_report(
+        &self,
+        dry_run: bool,
+        setup_mode: String,
+        setup_components: Vec<String>,
+        daemon_path_overrides: DaemonPathOverrides,
+        application: SetupApplication,
+    ) -> SetupReport {
+        let action = match application {
+            SetupApplication::AppliedPendingActivation => {
+                "activate the existing pending durable control-scoped API token"
+            }
+            SetupApplication::Planned {
+                existing_token_file: true,
+            }
+            | SetupApplication::AppliedReusableToken => {
+                "validate and reuse the existing durable control-scoped API token, or recover an interrupted pending handoff"
+            }
+            SetupApplication::Planned {
+                existing_token_file: false,
+            }
+            | SetupApplication::AppliedNewToken => {
+                "issue, persist, and activate a durable control-scoped API token"
+            }
+        }
+        .to_string();
+        let applied = !matches!(application, SetupApplication::Planned { .. });
+        let missing_token_file = self.binding.api_token().is_none();
+        let required_input = missing_token_file
+            .then(|| SetupRequiredInput {
+                component: "transport".to_string(),
+                input_kind: "api_token_file_descriptor".to_string(),
+                reason: "SSH setup needs an absolute owner-only token-file destination; bearer tokens are never stored inline in config".to_string(),
+                recovery_command: format!(
+                    "add [hosts.{}.api_token] kind = \"file\" with an absolute path to user-level config, then rerun satelle setup --host {} --on-demand --component transport",
+                    self.alias, self.alias
+                ),
+            })
+            .into_iter()
+            .collect::<Vec<_>>();
+        let status = if missing_token_file {
+            "input_required"
+        } else if applied {
+            "applied"
+        } else {
+            "planned"
+        };
+        let service_persistent = setup_mode == "persistent";
+        let mut planned_actions = vec![
+            "allow SSH setup to stop the running Host daemon; active Host work may be interrupted"
+                .to_string(),
+        ];
+        if self.requires_first_trust {
+            planned_actions
+                .push("discover and explicitly trust the reachable Host Identity".to_string());
+        }
+        planned_actions.push(action.clone());
+        SetupReport {
+            schema_version: SetupSchemaVersion::V1,
+            host: self.alias.clone(),
+            dry_run,
+            status: status.to_string(),
+            setup_mode,
+            service_persistent,
+            service_scope: if service_persistent {
+                "user".to_string()
+            } else {
+                "on_demand".to_string()
+            },
+            fallback_reason: None,
+            setup_components,
+            planned_actions,
+            applied_actions: applied.then_some(action).into_iter().collect(),
+            required_input,
+            recovery_commands: if missing_token_file {
+                vec!["configure an absolute file-backed api_token descriptor".to_string()]
+            } else {
+                Vec::new()
+            },
+            readiness_summary: SetupReadinessSummary {
+                transport: if applied {
+                    "ready".to_string()
+                } else if missing_token_file {
+                    "input_required".to_string()
+                } else {
+                    "planned".to_string()
+                },
+                host_daemon: if applied {
+                    "durable_auth_ready".to_string()
+                } else {
+                    "not_checked".to_string()
+                },
+                codex_runtime: "not_checked".to_string(),
+                native_computer_use: "not_checked".to_string(),
+                provider_auth: "not_checked".to_string(),
+            },
+            daemon_path_overrides: daemon_path_overrides.entries(),
+            mutated: matches!(
+                application,
+                SetupApplication::AppliedNewToken | SetupApplication::AppliedPendingActivation
+            ),
+            native_computer_use_readiness: "not_checked".to_string(),
+            next_command: format!("satelle run --host {} \"<prompt>\"", self.alias),
+        }
+    }
+
+    fn token_file_exists(&self) -> Result<bool, SatelleError> {
+        let Some(ApiTokenSource::File { path }) = self.binding.api_token() else {
+            return Ok(false);
+        };
+        match fs::symlink_metadata(path) {
+            Ok(_) => Ok(true),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(error) => Err(SatelleError::config_error(
+                format!(
+                    "could not inspect the durable API token path '{}': {error}",
+                    path.display()
+                ),
+                None,
+            )),
+        }
+    }
+
+    fn verify_existing_token(&self) -> Result<ExistingTokenVerification, SatelleError> {
+        let ApiTokenSource::File { path } = self
+            .binding
+            .api_token()
+            .expect("existing token verification requires a file descriptor");
+        let raw_token =
+            read_owner_only_secret_file(path).map_err(|error| token_file_error(path, error))?;
+        let http_token = ApiBearerToken::parse(raw_token.as_str())
+            .map_err(|error| SatelleError::config_error(error.to_string(), None))?;
+        let token_id = http_token.token_id().to_string();
+        let activation_idempotency_key = Uuid::now_v7().to_string();
+        let tunnel = SshTunnel::open(self.binding.destination()).map_err(|error| match error {
+            ssh_tunnel::SshTunnelError::HostKeyVerificationRequired => {
+                SatelleError::ssh_host_key_verification_required(&self.alias)
+            }
+            _ => SatelleError::host_unreachable(&self.alias),
+        })?;
+        let client = DaemonClient::loopback_with_timeout(
+            tunnel.local_addr(),
+            http_token,
+            self.binding.expected_host_identity().to_string(),
+            SSH_DAEMON_REQUEST_TIMEOUT,
+        )
+        .map_err(|error| direct_transport_error(&self.alias, error))?;
+        let bootstrap_token =
+            ApiBearerToken::generate().map_err(|_| SatelleError::host_unreachable(&self.alias))?;
+        verify_durable_setup_token_with_launch(
+            &client,
+            token_id,
+            &activation_idempotency_key,
+            &self.alias,
+            || {
+                // If no daemon is listening, a foreground admin bootstrap owns
+                // the store while this token is verified or recovered.
+                SshBootstrapProcess::launch(
+                    self.binding.destination(),
+                    &bootstrap_token,
+                    &self.host_config,
+                    SshBootstrapScope::Admin,
+                )
+                .map_err(|error| match error {
+                    ssh_bootstrap::SshBootstrapError::HostKeyVerificationRequired => {
+                        SatelleError::ssh_host_key_verification_required(&self.alias)
+                    }
+                    _ => SatelleError::host_unreachable(&self.alias),
+                })
+            },
+        )
+    }
+
+    fn recover_interrupted_token(&self, token_id: &str) -> Result<(), SatelleError> {
+        let ApiTokenSource::File { path } = self
+            .binding
+            .api_token()
+            .expect("setup recovery requires a file descriptor");
+        let (bootstrap_client, _tunnel, _bootstrap) = setup_bootstrap_client(
+            &self.alias,
+            self.binding.destination(),
+            &self.binding.expected_host_identity().to_string(),
+            admission_request_timeout(&self.host_config),
+            &self.host_config,
+        )?;
+        rollback_setup_token(
+            &bootstrap_client,
+            token_id,
+            path,
+            &self.alias,
+            &Uuid::now_v7().to_string(),
+        )
+    }
+
+    fn provision_token(&self) -> Result<(), SatelleError> {
+        let ApiTokenSource::File { path } = self
+            .binding
+            .api_token()
+            .expect("setup apply follows a plan with a token-file descriptor");
+        let (bootstrap_client, tunnel, _bootstrap) = setup_bootstrap_client(
+            &self.alias,
+            self.binding.destination(),
+            &self.binding.expected_host_identity().to_string(),
+            admission_request_timeout(&self.host_config),
+            &self.host_config,
+        )?;
+        let issuance_idempotency_key = Uuid::now_v7().to_string();
+        let issuance = bootstrap_client
+            .issue_durable_setup_token(&issuance_idempotency_key)
+            .map_err(|error| direct_transport_error(&self.alias, error))?;
+        let token_id = issuance.token_id().to_string();
+        let abort_idempotency_key = Uuid::now_v7().to_string();
+        if time::OffsetDateTime::parse(
+            issuance.pending_expires_at(),
+            &time::format_description::well_known::Rfc3339,
+        )
+        .is_err()
+        {
+            let _ = bootstrap_client.abort_durable_setup_token(&token_id, &abort_idempotency_key);
+            return Err(SatelleError::host_unreachable(&self.alias));
+        }
+        let Some(raw_token) = issuance.into_bearer_token() else {
+            let _ = bootstrap_client.abort_durable_setup_token(&token_id, &abort_idempotency_key);
+            return Err(SatelleError::host_unreachable(&self.alias));
+        };
+        let verification_token = match ApiBearerToken::parse(raw_token.as_str()) {
+            Ok(token) => token,
+            Err(_) => {
+                let _ =
+                    bootstrap_client.abort_durable_setup_token(&token_id, &abort_idempotency_key);
+                return Err(SatelleError::host_unreachable(&self.alias));
+            }
+        };
+        if verification_token.token_id() != token_id {
+            let _ = bootstrap_client.abort_durable_setup_token(&token_id, &abort_idempotency_key);
+            return Err(SatelleError::host_unreachable(&self.alias));
+        }
+        if let Err(error) = persist_new_owner_only_secret_file(path, raw_token.as_str()) {
+            // A published file that could not be removed still contains the
+            // pending recovery credential. Keep its remote token recoverable;
+            // aborting would strand a revoked file at the no-replace path.
+            if error != SecureFileError::PublishedCleanupFailed {
+                let _ =
+                    bootstrap_client.abort_durable_setup_token(&token_id, &abort_idempotency_key);
+            }
+            return Err(token_file_error(path, error));
+        }
+
+        let activation_idempotency_key = Uuid::now_v7().to_string();
+        let activated = bootstrap_client
+            .activate_durable_setup_token(&token_id, &activation_idempotency_key)
+            .map_err(|error| direct_transport_error(&self.alias, error))
+            .map_err(|error| {
+                rollback_setup_token(
+                    &bootstrap_client,
+                    &token_id,
+                    path,
+                    &self.alias,
+                    &abort_idempotency_key,
+                )
+                .err()
+                .unwrap_or(error)
+            })?;
+        if !activated.active() || activated.token_id() != token_id {
+            let error = SatelleError::host_unreachable(&self.alias);
+            return Err(rollback_setup_token(
+                &bootstrap_client,
+                &token_id,
+                path,
+                &self.alias,
+                &abort_idempotency_key,
+            )
+            .err()
+            .unwrap_or(error));
+        }
+        let durable_client = DaemonClient::loopback_with_timeout(
+            tunnel.local_addr(),
+            verification_token,
+            self.binding.expected_host_identity().to_string(),
+            SSH_DAEMON_REQUEST_TIMEOUT,
+        )
+        .map_err(|error| direct_transport_error(&self.alias, error))
+        .map_err(|error| {
+            rollback_setup_token(
+                &bootstrap_client,
+                &token_id,
+                path,
+                &self.alias,
+                &abort_idempotency_key,
+            )
+            .err()
+            .unwrap_or(error)
+        })?;
+        if let Err(error) = durable_client.capabilities() {
+            let error = direct_transport_error(&self.alias, error);
+            return Err(rollback_setup_token(
+                &bootstrap_client,
+                &token_id,
+                path,
+                &self.alias,
+                &abort_idempotency_key,
+            )
+            .err()
+            .unwrap_or(error));
+        }
+        Ok(())
+    }
+}
+
+fn rollback_setup_token(
+    client: &DaemonClient,
+    token_id: &str,
+    token_path: &Path,
+    host: &str,
+    idempotency_key: &str,
+) -> Result<(), SatelleError> {
+    let aborted = client
+        .abort_durable_setup_token(token_id, idempotency_key)
+        .map_err(|_| uncertain_setup_rollback(host, token_path))?;
+    if aborted.active() || aborted.token_id() != token_id {
+        return Err(uncertain_setup_rollback(host, token_path));
+    }
+    fs::remove_file(token_path).map_err(|error| {
+        SatelleError::config_error(
+            format!(
+                "the setup token was revoked, but its file '{}' could not be removed: {error}",
+                token_path.display()
+            ),
+            None,
+        )
+    })
+}
+
+fn acquire_setup_token_lock(token_path: &Path) -> Result<fs::File, SatelleError> {
+    let lock = open_setup_token_lock(token_path)?;
+    lock.lock()
+        .map_err(|error| setup_token_lock_error(token_path, error))?;
+    Ok(lock)
+}
+
+fn open_setup_token_lock(token_path: &Path) -> Result<fs::File, SatelleError> {
+    let parent = token_path.parent().ok_or_else(|| {
+        setup_token_lock_error(token_path, "the token path has no parent directory")
+    })?;
+    let file_name = token_path
+        .file_name()
+        .ok_or_else(|| setup_token_lock_error(token_path, "the token path has no file name"))?;
+    let mut lock_name = std::ffi::OsString::from(".");
+    lock_name.push(file_name);
+    lock_name.push(".satelle-setup.lock");
+    let lock_path = parent.join(lock_name);
+
+    // The stable sidecar inode must remain in place after unlock. Removing it
+    // would let a new setup lock a replacement inode while an existing waiter
+    // still blocks on the old one.
+    drop(
+        open_or_create_owner_only_directory(parent)
+            .map_err(|error| setup_token_lock_error(token_path, error))?,
+    );
+    open_or_create_owner_only_file(&lock_path)
+        .map_err(|error| setup_token_lock_error(token_path, error))
+}
+
+fn verify_durable_setup_token(
+    client: &DaemonClient,
+    token_id: String,
+    activation_idempotency_key: &str,
+) -> Result<ExistingTokenVerification, DaemonClientError> {
+    match client.confirm_durable_setup_token() {
+        Ok(confirmation)
+            if confirmation.token_id() == token_id
+                && confirmation.setup_active()
+                && confirmation.control_scoped() =>
+        {
+            Ok(ExistingTokenVerification::Reusable)
+        }
+        Ok(_) => Err(DaemonClientError::ResponseContractViolation),
+        Err(DaemonClientError::Api { error, .. })
+            if error.code() == ApiErrorCode::AuthenticationFailed =>
+        {
+            // A pending setup credential is rejected everywhere except exact
+            // self-activation. Recover on the daemon that already owns the
+            // state store instead of starting a competing bootstrap process.
+            let activation =
+                match client.activate_durable_setup_token(&token_id, activation_idempotency_key) {
+                    Ok(activation) => activation,
+                    Err(DaemonClientError::Api { error, .. })
+                        if error.code() == ApiErrorCode::AuthenticationFailed =>
+                    {
+                        return Ok(ExistingTokenVerification::AuthenticationRejected { token_id });
+                    }
+                    Err(error) => return Err(error),
+                };
+            if !activation.active() || activation.token_id() != token_id {
+                return Err(DaemonClientError::ResponseContractViolation);
+            }
+            let confirmation = client.confirm_durable_setup_token()?;
+            if confirmation.token_id() == token_id
+                && confirmation.setup_active()
+                && confirmation.control_scoped()
+            {
+                Ok(ExistingTokenVerification::ActivatedPending)
+            } else {
+                Err(DaemonClientError::ResponseContractViolation)
+            }
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn verify_durable_setup_token_with_launch<T>(
+    client: &DaemonClient,
+    token_id: String,
+    activation_idempotency_key: &str,
+    host: &str,
+    launch: impl FnOnce() -> Result<T, SatelleError>,
+) -> Result<ExistingTokenVerification, SatelleError> {
+    match verify_durable_setup_token(client, token_id.clone(), activation_idempotency_key) {
+        Ok(verification) => Ok(verification),
+        Err(DaemonClientError::Transport(_)) => {
+            let _probe = launch()?;
+            wait_for_durable_daemon(host, || {
+                verify_durable_setup_token(client, token_id.clone(), activation_idempotency_key)
+            })
+        }
+        Err(error) => Err(direct_transport_error(host, error)),
+    }
+}
+
+fn wait_for_durable_daemon<T>(
+    host: &str,
+    mut operation: impl FnMut() -> Result<T, DaemonClientError>,
+) -> Result<T, SatelleError> {
+    let deadline = Instant::now() + SSH_DAEMON_LAUNCH_TIMEOUT;
+    loop {
+        match operation() {
+            Ok(value) => return Ok(value),
+            Err(error @ DaemonClientError::Transport(_)) => {
+                let now = Instant::now();
+                if now >= deadline {
+                    return Err(direct_transport_error(host, error));
+                }
+                std::thread::sleep(SSH_DAEMON_LAUNCH_POLL_INTERVAL.min(deadline - now));
+            }
+            Err(error) => return Err(direct_transport_error(host, error)),
+        }
+    }
+}
+
+fn uncertain_setup_rollback(host: &str, token_path: &Path) -> SatelleError {
+    SatelleError::config_error(
+        format!(
+            "could not confirm setup-token revocation on host '{host}'; retained '{}' for explicit recovery",
+            token_path.display()
+        ),
+        None,
+    )
+}
+
+fn token_file_error(path: &Path, error: satelle_core::SecureFileError) -> SatelleError {
+    SatelleError::config_error(
+        format!(
+            "could not persist the durable API token at '{}': {error}",
+            path.display()
+        ),
+        None,
+    )
+}
+
+fn setup_token_lock_error(path: &Path, error: impl std::fmt::Display) -> SatelleError {
+    SatelleError::config_error(
+        format!(
+            "could not serialize setup for the durable API token path '{}': {error}",
+            path.display()
+        ),
+        None,
+    )
+}
+
+impl TransportClient for SshSetupTransport {
+    fn setup(
+        &self,
+        dry_run: bool,
+        setup_mode: String,
+        setup_components: Vec<String>,
+        daemon_path_overrides: DaemonPathOverrides,
+    ) -> Result<SetupReport, SatelleError> {
+        self.validate_setup_request(&setup_mode, &setup_components)?;
+        if !daemon_path_overrides.is_empty() {
+            return Err(self.unsupported("daemon path overrides"));
+        }
+        let existing_token_file = self.token_file_exists()?;
+        let plan = self.setup_report(
+            dry_run,
+            setup_mode.clone(),
+            setup_components.clone(),
+            daemon_path_overrides.clone(),
+            SetupApplication::Planned {
+                existing_token_file,
+            },
+        );
+        if dry_run || !plan.required_input.is_empty() {
+            return Ok(plan);
+        }
+        if self.requires_first_trust {
+            return Err(SatelleError::invalid_usage(
+                "first-time SSH setup must trust the discovered Host identity before applying token setup",
+            ));
+        }
+        let ApiTokenSource::File { path } = self
+            .binding
+            .api_token()
+            .expect("setup apply follows a plan with a token-file descriptor");
+        let _token_lock = acquire_setup_token_lock(path)?;
+        let mut bootstrap_lock = ssh_bootstrap::SshBootstrapLock::acquire(
+            self.binding.destination(),
+        )
+        .map_err(|error| match error {
+            ssh_bootstrap::SshBootstrapError::HostKeyVerificationRequired => {
+                SatelleError::ssh_host_key_verification_required(&self.alias)
+            }
+            _ => SatelleError::host_unreachable(&self.alias),
+        })?;
+        confirm_bootstrap_lock(&self.alias, &mut bootstrap_lock)?;
+        // Planning intentionally does not lock or mutate. Re-read only after
+        // acquiring both the token-path lock and the remote Host lock so another
+        // completed setup is reused and a rollback cannot delete that process's
+        // replacement credential.
+        let existing_token_file = self.token_file_exists()?;
+        let application = if existing_token_file {
+            match self.verify_existing_token()? {
+                ExistingTokenVerification::Reusable => SetupApplication::AppliedReusableToken,
+                ExistingTokenVerification::ActivatedPending => {
+                    SetupApplication::AppliedPendingActivation
+                }
+                ExistingTokenVerification::AuthenticationRejected { token_id } => {
+                    // The owner-local release handshake stops any daemon that
+                    // still owns the canonical store before admin recovery.
+                    self.recover_interrupted_token(&token_id)?;
+                    self.provision_token()?;
+                    SetupApplication::AppliedNewToken
+                }
+            }
+        } else {
+            self.provision_token()?;
+            SetupApplication::AppliedNewToken
+        };
+        confirm_bootstrap_lock(&self.alias, &mut bootstrap_lock)?;
+        Ok(self.setup_report(
+            false,
+            setup_mode,
+            setup_components,
+            daemon_path_overrides,
+            application,
+        ))
+    }
+
+    fn doctor(
+        &self,
+        _scope: Option<&str>,
+        _options: DoctorOptions,
+        _provider_intent: &satelle_host::ProviderComputerUseIntent,
+    ) -> Result<DoctorReport, SatelleError> {
+        Err(self.unsupported("doctor"))
+    }
+
+    fn host_status(&self) -> Result<HostStatus, SatelleError> {
+        Err(self.unsupported("host status"))
+    }
+
+    fn host_sessions(&self, _no_bootstrap: bool) -> Result<HostSessionsReport, SatelleError> {
+        Err(self.unsupported("host sessions"))
+    }
+
+    fn run(
+        &self,
+        _request: &TurnRequest,
+        _on_event: &mut dyn FnMut(SatelleEvent) -> Result<(), SatelleError>,
+    ) -> Result<AttachedTurnOutcome, TurnAdmissionFailure> {
+        Err(TurnAdmissionFailure::not_admitted(self.unsupported("run")))
+    }
+
+    fn run_detached(&self, _request: &TurnRequest) -> Result<PublicSession, SatelleError> {
+        Err(self.unsupported("detached run"))
+    }
+
+    fn steer(
+        &self,
+        _session_id: &SessionId,
+        _request: &TurnRequest,
+        _on_event: &mut dyn FnMut(SatelleEvent) -> Result<(), SatelleError>,
+    ) -> Result<AttachedTurnOutcome, TurnAdmissionFailure> {
+        Err(TurnAdmissionFailure::not_admitted(
+            self.unsupported("steer"),
+        ))
+    }
+
+    fn steer_detached(
+        &self,
+        _session_id: &SessionId,
+        _request: &TurnRequest,
+    ) -> Result<PublicSession, SatelleError> {
+        Err(self.unsupported("detached steer"))
+    }
+
+    fn status(&self, _session_id: &SessionId) -> Result<PublicSession, SatelleError> {
+        Err(self.unsupported("session status"))
+    }
+
+    fn stop(&self, _session_id: &SessionId) -> Result<StopResult, SatelleError> {
+        Err(self.unsupported("session stop"))
+    }
+
+    fn logs(&self, _query: &LogPageQuery) -> Result<DaemonLogPage, SatelleError> {
+        Err(self.unsupported("logs"))
+    }
+}
+
 impl TransportClient for DirectTransport {
     fn setup(
         &self,
@@ -487,9 +1202,10 @@ fn direct_transport(host: &SelectedHost) -> Result<DirectTransport, SatelleError
 
 fn ssh_transport(
     host: &SelectedHost,
-    bootstrap_scope: Option<SshBootstrapScope>,
+    launch_policy: SshDaemonLaunchPolicy,
 ) -> Result<DirectTransport, SatelleError> {
     let admission_timeout = admission_request_timeout(&host.config);
+    let bootstrap_scope = launch_policy.bootstrap_scope();
     let binding = if bootstrap_scope.is_some() {
         SshHostBinding::from_host_config_for_bootstrap(&host.config)
     } else {
@@ -504,7 +1220,16 @@ fn ssh_transport(
                 .map_err(|error| SatelleError::config_error(error.to_string(), None))?;
             let event_token = ApiBearerToken::parse(raw_token.as_str())
                 .map_err(|error| SatelleError::config_error(error.to_string(), None))?;
-            Some((http_token, event_token))
+            let fallback_http_token = ApiBearerToken::parse(raw_token.as_str())
+                .map_err(|error| SatelleError::config_error(error.to_string(), None))?;
+            let fallback_event_token = ApiBearerToken::parse(raw_token.as_str())
+                .map_err(|error| SatelleError::config_error(error.to_string(), None))?;
+            Some((
+                http_token,
+                event_token,
+                fallback_http_token,
+                fallback_event_token,
+            ))
         }
         None => None,
     };
@@ -516,7 +1241,7 @@ fn ssh_transport(
     })?;
     let expected_host_identity = binding.expected_host_identity().to_string();
     let (client, event_client, bootstrap) = match durable_tokens {
-        Some((http_token, event_token)) => {
+        Some((http_token, event_token, fallback_http_token, fallback_event_token)) => {
             let durable_client = Arc::new(
                 DaemonClient::loopback_with_timeout(
                     tunnel.local_addr(),
@@ -537,19 +1262,25 @@ fn ssh_transport(
                     .map_err(|error| direct_event_error(&host.alias, error))?;
                     (durable_client, event_client, None)
                 }
-                Err(DaemonClientError::Transport(error))
-                    if error.is_connect() && bootstrap_scope.is_some() =>
-                {
-                    let (client, event_client, bootstrap) = bootstrap_ssh_clients(
+                Err(DaemonClientError::Transport(error)) => {
+                    // Ordinary commands may relaunch with the already-persisted credential,
+                    // but the explicit no-bootstrap policy forbids every remote daemon launch.
+                    if !launch_policy.allows_durable_relaunch() {
+                        return Err(direct_transport_error(
+                            &host.alias,
+                            DaemonClientError::Transport(error),
+                        ));
+                    }
+                    let (client, event_client) = durable_ssh_clients(
                         &host.alias,
                         binding.destination(),
                         tunnel.local_addr(),
                         &expected_host_identity,
                         admission_timeout,
                         &host.config,
-                        bootstrap_scope.expect("SSH bootstrap scope is present"),
+                        (fallback_http_token, fallback_event_token),
                     )?;
-                    (client, event_client, Some(bootstrap))
+                    (client, event_client, None)
                 }
                 Err(error) => return Err(direct_transport_error(&host.alias, error)),
             }
@@ -580,6 +1311,88 @@ fn ssh_transport(
         _tunnel: Some(tunnel),
         _bootstrap: bootstrap,
     })
+}
+
+fn durable_ssh_clients(
+    alias: &str,
+    destination: &str,
+    tunnel_addr: std::net::SocketAddr,
+    expected_host_identity: &str,
+    admission_timeout: Duration,
+    host_config: &satelle_core::HostConfig,
+    tokens: (ApiBearerToken, ApiBearerToken),
+) -> Result<(Arc<DaemonClient>, DaemonEventClient), SatelleError> {
+    let (http_token, event_token) = tokens;
+    let client = Arc::new(
+        DaemonClient::loopback_with_timeout(
+            tunnel_addr,
+            http_token,
+            expected_host_identity,
+            SSH_DAEMON_REQUEST_TIMEOUT,
+        )
+        .map_err(|error| direct_transport_error(alias, error))?
+        .with_admission_timeout(admission_timeout),
+    );
+    let mut bootstrap_lock =
+        ssh_bootstrap::SshBootstrapLock::acquire(destination).map_err(|error| match error {
+            ssh_bootstrap::SshBootstrapError::HostKeyVerificationRequired => {
+                SatelleError::ssh_host_key_verification_required(alias)
+            }
+            _ => SatelleError::host_unreachable(alias),
+        })?;
+    relaunch_durable_daemon_under_lock(
+        alias,
+        || confirm_bootstrap_lock(alias, &mut bootstrap_lock),
+        || client.capabilities(),
+        || {
+            SshBootstrapProcess::launch_durable(
+                destination,
+                on_demand_idle_timeout(host_config),
+                host_config,
+            )
+            .map_err(|error| match error {
+                ssh_bootstrap::SshBootstrapError::HostKeyVerificationRequired => {
+                    SatelleError::ssh_host_key_verification_required(alias)
+                }
+                _ => SatelleError::host_unreachable(alias),
+            })
+        },
+    )?;
+    let event_client =
+        DaemonEventClient::loopback(tunnel_addr, event_token, expected_host_identity)
+            .map_err(|error| direct_event_error(alias, error))?;
+    Ok((client, event_client))
+}
+
+fn relaunch_durable_daemon_under_lock<T>(
+    host: &str,
+    mut confirm_lock_ownership: impl FnMut() -> Result<(), SatelleError>,
+    mut readiness: impl FnMut() -> Result<T, DaemonClientError>,
+    launch: impl FnOnce() -> Result<(), SatelleError>,
+) -> Result<T, SatelleError> {
+    // Another Controller may have completed startup while this Controller
+    // waited for the remote lock. Recheck before launching to avoid a second
+    // daemon and retain the lock until the selected daemon is authenticated.
+    confirm_lock_ownership()?;
+    let ready = match readiness() {
+        Ok(ready) => Ok(ready),
+        Err(DaemonClientError::Transport(_)) => {
+            launch()?;
+            wait_for_durable_daemon(host, readiness)
+        }
+        Err(error) => return Err(direct_transport_error(host, error)),
+    }?;
+    confirm_lock_ownership()?;
+    Ok(ready)
+}
+
+fn confirm_bootstrap_lock(
+    host: &str,
+    bootstrap_lock: &mut ssh_bootstrap::SshBootstrapLock,
+) -> Result<(), SatelleError> {
+    bootstrap_lock
+        .confirm_ownership()
+        .map_err(|_| SatelleError::host_unreachable(host))
 }
 
 fn bootstrap_ssh_clients(
@@ -623,6 +1436,53 @@ fn bootstrap_ssh_clients(
         DaemonEventClient::loopback(tunnel_addr, event_token, expected_host_identity)
             .map_err(|error| direct_event_error(alias, error))?;
     Ok((client, event_client, bootstrap))
+}
+
+fn setup_bootstrap_client(
+    alias: &str,
+    destination: &str,
+    expected_host_identity: &str,
+    admission_timeout: Duration,
+    host_config: &satelle_core::HostConfig,
+) -> Result<(Arc<DaemonClient>, SshTunnel, SshBootstrapProcess), SatelleError> {
+    let bootstrap_token =
+        ApiBearerToken::generate().map_err(|_| SatelleError::host_unreachable(alias))?;
+    let raw_bootstrap_token = bootstrap_token.expose();
+    // Setup administration is isolated from the durable daemon. Binding the
+    // foreground bootstrap to an ephemeral remote port lets recovery proceed
+    // even when port 3001 is occupied by a daemon rejecting the durable token.
+    let bootstrap = SshBootstrapProcess::launch_ephemeral(
+        destination,
+        &bootstrap_token,
+        host_config,
+        SshBootstrapScope::Admin,
+    )
+    .map_err(|error| match error {
+        ssh_bootstrap::SshBootstrapError::HostKeyVerificationRequired => {
+            SatelleError::ssh_host_key_verification_required(alias)
+        }
+        _ => SatelleError::host_unreachable(alias),
+    })?;
+    let tunnel =
+        SshTunnel::open_to(destination, bootstrap.remote_port()).map_err(|error| match error {
+            ssh_tunnel::SshTunnelError::HostKeyVerificationRequired => {
+                SatelleError::ssh_host_key_verification_required(alias)
+            }
+            _ => SatelleError::host_unreachable(alias),
+        })?;
+    let http_token = ApiBearerToken::parse(raw_bootstrap_token.as_str())
+        .map_err(|_| SatelleError::host_unreachable(alias))?;
+    let client = Arc::new(
+        DaemonClient::loopback_with_timeout(
+            tunnel.local_addr(),
+            http_token,
+            expected_host_identity,
+            SSH_DAEMON_REQUEST_TIMEOUT,
+        )
+        .map_err(|error| direct_transport_error(alias, error))?
+        .with_admission_timeout(admission_timeout),
+    );
+    Ok((client, tunnel, bootstrap))
 }
 
 fn direct_event_error(host: &str, error: DaemonEventError) -> SatelleError {
@@ -714,7 +1574,8 @@ fn direct_transport_error(host: &str, error: DaemonClientError) -> SatelleError 
         | DaemonClientError::InvalidIdempotencyKeyHeader
         | DaemonClientError::InvalidResponse(_)
         | DaemonClientError::UnexpectedSuccessStatus { .. }
-        | DaemonClientError::ResponseRequestIdMismatch => {
+        | DaemonClientError::ResponseRequestIdMismatch
+        | DaemonClientError::ResponseContractViolation => {
             SatelleError::remote_api_error(host, "invalid-daemon-response")
         }
     }
@@ -886,12 +1747,34 @@ fn local_host_service(host_config: &satelle_core::HostConfig) -> Result<HostServ
 }
 
 pub(crate) fn transport_for(host: &SelectedHost) -> Result<Box<dyn TransportClient>, CliFailure> {
-    transport_for_with_ssh_bootstrap(host, None)
+    transport_for_with_ssh_launch_policy(host, SshDaemonLaunchPolicy::DurableOnly)
+}
+
+pub(crate) fn transport_for_setup(
+    host: &SelectedHost,
+) -> Result<Box<dyn TransportClient>, CliFailure> {
+    if host.config.transport == TransportKind::Ssh {
+        return SshSetupTransport::new(host)
+            .map(|transport| Box::new(transport) as Box<dyn TransportClient>)
+            .map_err(failure);
+    }
+    transport_for(host)
 }
 
 pub(crate) fn transport_for_with_ssh_bootstrap(
     host: &SelectedHost,
     bootstrap_scope: Option<SshBootstrapScope>,
+) -> Result<Box<dyn TransportClient>, CliFailure> {
+    let launch_policy = bootstrap_scope.map_or(
+        SshDaemonLaunchPolicy::Never,
+        SshDaemonLaunchPolicy::Bootstrap,
+    );
+    transport_for_with_ssh_launch_policy(host, launch_policy)
+}
+
+fn transport_for_with_ssh_launch_policy(
+    host: &SelectedHost,
+    launch_policy: SshDaemonLaunchPolicy,
 ) -> Result<Box<dyn TransportClient>, CliFailure> {
     match host.config.transport {
         TransportKind::Local => local_host_service(&host.config)
@@ -899,7 +1782,7 @@ pub(crate) fn transport_for_with_ssh_bootstrap(
         TransportKind::Direct => direct_transport(host)
             .map(|transport| Box::new(transport) as _)
             .map_err(failure),
-        TransportKind::Ssh => ssh_transport(host, bootstrap_scope)
+        TransportKind::Ssh => ssh_transport(host, launch_policy)
             .map(|transport| Box::new(transport) as _)
             .map_err(failure),
     }
@@ -930,6 +1813,39 @@ pub(crate) fn discover_direct_host_identity(host: &SelectedHost) -> Result<Strin
     client
         .discover_host_identity()
         .map_err(|error| direct_transport_error(&host.alias, error))
+}
+
+pub(crate) fn discover_ssh_host_identity(host: &SelectedHost) -> Result<String, SatelleError> {
+    if host.config.transport != TransportKind::Ssh {
+        return Err(SatelleError::invalid_usage(
+            "SSH Host identity discovery requires an SSH Host Binding",
+        ));
+    }
+    let probe_identity = format!("trust-probe-{}", Uuid::now_v7());
+    let mut probe_config = host.config.clone();
+    probe_config.expected_host_id = Some(probe_identity.clone());
+    let binding = SshHostBinding::from_host_config_for_bootstrap(&probe_config)
+        .map_err(|error| SatelleError::config_error(error.to_string(), None))?;
+    let mut bootstrap_lock = ssh_bootstrap::SshBootstrapLock::acquire(binding.destination())
+        .map_err(|error| match error {
+            ssh_bootstrap::SshBootstrapError::HostKeyVerificationRequired => {
+                SatelleError::ssh_host_key_verification_required(&host.alias)
+            }
+            _ => SatelleError::host_unreachable(&host.alias),
+        })?;
+    confirm_bootstrap_lock(&host.alias, &mut bootstrap_lock)?;
+    let (client, _tunnel, _bootstrap) = setup_bootstrap_client(
+        &host.alias,
+        binding.destination(),
+        &probe_identity,
+        admission_request_timeout(&host.config),
+        &host.config,
+    )?;
+    let identity = client
+        .discover_host_identity()
+        .map_err(|error| direct_transport_error(&host.alias, error))?;
+    confirm_bootstrap_lock(&host.alias, &mut bootstrap_lock)?;
+    Ok(identity)
 }
 
 #[cfg(all(test, feature = "test-support"))]

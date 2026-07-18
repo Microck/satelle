@@ -381,14 +381,15 @@ fn ordinary_production_run_is_blocked_without_fake_completion_or_state_mutation(
         .clone();
     let combined = command_output_text(&output);
 
-    // Linux is rejected at the native Computer Use boundary. Supported
-    // desktop platforms reach Codex admission first, where an absent or
-    // incompatible runtime has its own public error contract.
+    // Linux closes at native platform admission. On the supported desktop
+    // platforms, the more specific missing-runtime control-plane diagnosis
+    // precedes the native readiness blocker.
     #[cfg(target_os = "linux")]
-    let expected_error_code = "computer-use-not-ready";
-    #[cfg(any(target_os = "macos", target_os = "windows"))]
-    let expected_error_code = "incompatible-control-plane";
-    assert!(combined.contains(expected_error_code));
+    assert!(combined.contains("computer-use-not-ready"));
+    #[cfg(any(target_os = "macos", windows))]
+    assert!(combined.contains("incompatible-control-plane"));
+    #[cfg(any(target_os = "macos", windows))]
+    assert!(combined.contains("runtime_missing"));
     assert!(!combined.contains("fake"));
     assert!(!combined.contains("completed"));
     assert!(!combined.contains("PRODUCTION_ADMISSION_PROMPT_CANARY"));
@@ -2320,6 +2321,7 @@ fn setup_component_filters_default_repeat_and_reject_all_conflict() {
     assert!(help.contains("satelle setup --no-input --json"));
     assert!(help.contains("required human input"));
     assert!(help.contains("Accept ordinary setup mutations"));
+    assert!(help.contains("--expected-host-id <HOST_ID>"));
     assert!(!help.contains("YOLO"));
     assert!(!help.contains("prompt-execution auto-approval"));
     assert!(!help.contains("-c, --component"));

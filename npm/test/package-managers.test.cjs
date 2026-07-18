@@ -207,7 +207,9 @@ function installedBin(consumerRoot) {
 
 test("npm, pnpm, and Bun install and execute the unscoped forwarding package", (context) => {
   const fixtureRoot = mkdtempSync(path.join(tmpdir(), "satelle-package-managers-"));
-  context.after(() => rmSync(fixtureRoot, { recursive: true, force: true }));
+  context.after(() =>
+    rmSync(fixtureRoot, { recursive: true, force: true, maxRetries: 20, retryDelay: 100 }),
+  );
   const { unscopedArtifact } = stagePackages(fixtureRoot);
   const requiredManagers = new Set(
     (process.env.SATELLE_REQUIRED_PACKAGE_MANAGERS || "npm")
@@ -298,7 +300,9 @@ test("npm, pnpm, and Bun install and execute the unscoped forwarding package", (
 
 test("npm exec, npx, pnpm dlx, and bunx execute the canonical package", (context) => {
   const fixtureRoot = mkdtempSync(path.join(tmpdir(), "satelle-one-shot-"));
-  context.after(() => rmSync(fixtureRoot, { recursive: true, force: true }));
+  context.after(() =>
+    rmSync(fixtureRoot, { recursive: true, force: true, maxRetries: 20, retryDelay: 100 }),
+  );
   const { canonicalArtifact } = stagePackages(fixtureRoot);
   const packageReference = localTarballReference(canonicalArtifact);
   const requiredManagers = new Set(

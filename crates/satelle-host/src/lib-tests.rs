@@ -150,7 +150,7 @@ impl ComputerUseAdapter for FailingExecutionAdapter {
 }
 
 #[test]
-fn unsupported_or_unproven_production_execution_is_blocked_before_admission() {
+fn unsupported_or_unproven_production_execution_is_blocked_without_state_admission() {
     for (name, evidence, control_plane_admission) in [
         (
             "unsupported-linux-host",
@@ -262,6 +262,34 @@ fn unsupported_or_unproven_production_execution_is_blocked_before_admission() {
             "{name} must not durably admit a Session or Turn"
         );
     }
+}
+
+#[test]
+fn blocked_control_plane_precedes_capability_and_live_desktop_checks() {
+    let state = TestStateDir::new().expect("temporary state directory should exist");
+    let evidence = Phase0CapabilityEvidence {
+        codex_version: CodexVersionEvidence::Detected {
+            version: REQUIRED_CODEX_VERSION,
+        },
+        host_platform: HostPlatform::Windows,
+        capabilities: CapabilityMatrix::unproven(),
+    };
+    let mut production_snapshot = capability_snapshot(evidence, 7);
+    production_snapshot.control_plane_admission =
+        codex_capabilities::ControlPlaneAdmission::unavailable(
+            satelle_core::ControlPlaneFailureReason::HandshakeUnavailable,
+        );
+    let adapter = ProductionComputerUseAdapter::new(
+        Arc::new(RwLock::new(production_snapshot)),
+        Ok(state.path().join("codex-app-server-work")),
+    );
+    let intent = turn_intent("PRIVATE_PRODUCTION_PROMPT");
+
+    let error = match adapter.preflight(LOCAL_DEMO_HOST, intent.provider_intent()) {
+        Ok(_) => panic!("a blocked control plane must stop before live readiness"),
+        Err(error) => error,
+    };
+    assert_eq!(error.code, ErrorCode::IncompatibleControlPlane);
 }
 
 #[test]
@@ -417,7 +445,7 @@ fn refreshed_production_snapshot_updates_admission_surfaces_but_not_desktop_disc
             LOCAL_DEMO_HOST,
             &turn_intent("PRIVATE_AFTER_CONTROL_PLANE_REFRESH"),
         )
-        .expect_err("the cloned service must use refreshed admission");
+        .expect_err("the cloned service must use refreshed execution readiness");
     assert!(matches!(
         refreshed_error,
         TurnAdmissionFailure::NotAdmitted(_)

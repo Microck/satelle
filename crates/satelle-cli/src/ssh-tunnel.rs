@@ -21,6 +21,10 @@ pub(super) struct SshTunnel {
 
 impl SshTunnel {
     pub(super) fn open(destination: &str) -> Result<Self, SshTunnelError> {
+        Self::open_to(destination, REMOTE_DAEMON_PORT)
+    }
+
+    pub(super) fn open_to(destination: &str, remote_port: u16) -> Result<Self, SshTunnelError> {
         let reservation =
             TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).map_err(SshTunnelError::PortAllocation)?;
         let local_addr = reservation
@@ -30,7 +34,7 @@ impl SshTunnel {
 
         let mut command = Command::new("ssh");
         command
-            .args(ssh_arguments(destination, local_addr.port()))
+            .args(ssh_arguments(destination, local_addr.port(), remote_port))
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             // OpenSSH owns authentication and host-key interaction. Satelle
@@ -163,16 +167,14 @@ pub(super) fn classify_stderr(mut stderr: impl Read) -> SshStderrClassification 
     }
 }
 
-fn ssh_arguments(destination: &str, local_port: u16) -> Vec<OsString> {
+fn ssh_arguments(destination: &str, local_port: u16, remote_port: u16) -> Vec<OsString> {
     vec![
         OsString::from("-N"),
         OsString::from("-T"),
         OsString::from("-o"),
         OsString::from("ExitOnForwardFailure=yes"),
         OsString::from("-L"),
-        OsString::from(format!(
-            "127.0.0.1:{local_port}:127.0.0.1:{REMOTE_DAEMON_PORT}"
-        )),
+        OsString::from(format!("127.0.0.1:{local_port}:127.0.0.1:{remote_port}")),
         OsString::from(destination),
     ]
 }
@@ -200,7 +202,7 @@ mod tests {
     #[test]
     fn argv_is_loopback_only_and_contains_no_remote_command_or_host_key_bypass() {
         assert_eq!(
-            ssh_arguments("operator@example", 43123),
+            ssh_arguments("operator@example", 43123, REMOTE_DAEMON_PORT),
             [
                 "-N",
                 "-T",

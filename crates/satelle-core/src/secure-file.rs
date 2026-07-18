@@ -1,5 +1,5 @@
 use std::fs::File;
-use std::io::Read;
+use std::io::{Read, Write};
 use std::path::Path;
 use thiserror::Error;
 use zeroize::Zeroizing;
@@ -15,6 +15,8 @@ pub enum SecureFileError {
     TooLarge,
     #[error("the file is not valid UTF-8")]
     NotUtf8,
+    #[error("the published secret could not be removed after persistence failed")]
+    PublishedCleanupFailed,
 }
 
 #[cfg(not(windows))]
@@ -38,6 +40,144 @@ pub fn read_owner_only_secret_file(path: &Path) -> Result<Zeroizing<String>, Sec
     let bytes = read_secure_file(path, SecurityPolicy::OwnerOnly, MAX_SECRET_FILE_BYTES)?;
     let value = std::str::from_utf8(bytes.as_slice()).map_err(|_| SecureFileError::NotUtf8)?;
     Ok(Zeroizing::new(value.trim_ascii().to_string()))
+}
+
+/// Persists a new secret without ever replacing an existing credential. The
+/// no-replace rename publishes the secret atomically and consumes the staging
+/// name, so a crash cannot leave a second hard link that makes the credential
+/// unreadable under the owner-only policy.
+pub fn persist_new_owner_only_secret_file(
+    path: &Path,
+    secret: &str,
+) -> Result<(), SecureFileError> {
+    if secret.len() > MAX_SECRET_FILE_BYTES {
+        return Err(SecureFileError::TooLarge);
+    }
+    let parent = path.parent().ok_or(SecureFileError::UnsafeOrUnavailable)?;
+    let directory = open_or_create_owner_only_directory(parent)?;
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or(SecureFileError::UnsafeOrUnavailable)?;
+    let temporary_path = parent.join(format!(
+        ".{file_name}.{}.tmp",
+        uuid::Uuid::now_v7().hyphenated()
+    ));
+    let mut published = false;
+    let persisted = (|| {
+        let mut temporary = open_or_create_owner_only_file(&temporary_path)?;
+        temporary
+            .write_all(secret.as_bytes())
+            .and_then(|()| temporary.sync_all())
+            .map_err(|_| SecureFileError::UnsafeOrUnavailable)?;
+        // Windows owner-only handles intentionally deny delete sharing. Close
+        // the staged file before publishing and unlinking its temporary name.
+        drop(temporary);
+        publish_new_file_without_replace(&temporary_path, path, &directory)?;
+        published = true;
+        sync_owner_only_directory(parent, &directory)?;
+        let stored = read_owner_only_secret_file(path)?;
+        (stored.as_str() == secret)
+            .then_some(())
+            .ok_or(SecureFileError::UnsafeOrUnavailable)
+    })();
+    match persisted {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            cleanup_failed_new_secret(&temporary_path, path, published)?;
+            Err(error)
+        }
+    }
+}
+
+fn cleanup_failed_new_secret(
+    temporary_path: &Path,
+    path: &Path,
+    published: bool,
+) -> Result<(), SecureFileError> {
+    let _ = std::fs::remove_file(temporary_path);
+    if !published {
+        return Ok(());
+    }
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(_) => Err(SecureFileError::PublishedCleanupFailed),
+    }
+}
+
+#[cfg(unix)]
+fn publish_new_file_without_replace(
+    temporary_path: &Path,
+    path: &Path,
+    directory: &OwnerOnlyDirectory,
+) -> Result<(), SecureFileError> {
+    let temporary_name = temporary_path
+        .file_name()
+        .ok_or(SecureFileError::UnsafeOrUnavailable)?;
+    let file_name = path
+        .file_name()
+        .ok_or(SecureFileError::UnsafeOrUnavailable)?;
+    rustix::fs::renameat_with(
+        directory,
+        temporary_name,
+        directory,
+        file_name,
+        rustix::fs::RenameFlags::NOREPLACE,
+    )
+    .map_err(|_| SecureFileError::UnsafeOrUnavailable)
+}
+
+#[cfg(windows)]
+fn publish_new_file_without_replace(
+    temporary_path: &Path,
+    path: &Path,
+    _directory: &OwnerOnlyDirectory,
+) -> Result<(), SecureFileError> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::{MOVEFILE_WRITE_THROUGH, MoveFileExW};
+
+    let temporary = temporary_path
+        .as_os_str()
+        .encode_wide()
+        .chain(Some(0))
+        .collect::<Vec<_>>();
+    let destination = path
+        .as_os_str()
+        .encode_wide()
+        .chain(Some(0))
+        .collect::<Vec<_>>();
+    // Omitting MOVEFILE_REPLACE_EXISTING preserves the no-replace guarantee.
+    // WRITE_THROUGH supplies the durability barrier that directory sync gives
+    // the Unix path after its atomic rename.
+    (unsafe {
+        MoveFileExW(
+            temporary.as_ptr(),
+            destination.as_ptr(),
+            MOVEFILE_WRITE_THROUGH,
+        )
+    } != 0)
+        .then_some(())
+        .ok_or(SecureFileError::UnsafeOrUnavailable)
+}
+
+#[cfg(unix)]
+fn sync_owner_only_directory(
+    path: &Path,
+    _directory: &OwnerOnlyDirectory,
+) -> Result<(), SecureFileError> {
+    File::open(path)
+        .map_err(|_| SecureFileError::UnsafeOrUnavailable)?
+        .sync_all()
+        .map_err(|_| SecureFileError::UnsafeOrUnavailable)
+}
+
+#[cfg(not(unix))]
+fn sync_owner_only_directory(
+    _path: &Path,
+    _directory: &OwnerOnlyDirectory,
+) -> Result<(), SecureFileError> {
+    Ok(())
 }
 
 /// Reads larger secret configuration material such as a PEM private key while
@@ -470,7 +610,7 @@ fn read_secure_file(
 ) -> Result<Zeroizing<Vec<u8>>, SecureFileError> {
     let mut file = open_secure_file(path, policy)?;
     let mut bytes = Zeroizing::new(Vec::with_capacity(maximum_bytes.min(4096)));
-    file.by_ref()
+    Read::by_ref(&mut file)
         .take((maximum_bytes + 1) as u64)
         .read_to_end(&mut bytes)
         .map_err(|_| SecureFileError::UnsafeOrUnavailable)?;
@@ -1343,13 +1483,27 @@ mod tests {
     #[cfg(unix)]
     use std::os::unix::fs::{PermissionsExt, symlink};
 
+    #[cfg(unix)]
+    fn secure_test_root(path: &Path) {
+        #[cfg(target_os = "macos")]
+        {
+            let status = std::process::Command::new("chmod")
+                .arg("-N")
+                .arg(path)
+                .status()
+                .expect("remove inherited macOS ACLs from the test root");
+            assert!(status.success(), "macOS chmod must remove inherited ACLs");
+        }
+        fs::set_permissions(path, fs::Permissions::from_mode(0o700))
+            .expect("make test root owner-only");
+    }
+
     #[cfg(any(unix, windows))]
     #[test]
     fn owner_only_files_are_private_before_callers_write() {
         let directory = tempfile::tempdir().expect("create temporary directory");
         #[cfg(unix)]
-        fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700))
-            .expect("make test boundary non-replaceable by unrelated users");
+        secure_test_root(directory.path());
         let fresh = directory.path().join("fresh-owner-only");
         let mut file = open_or_create_owner_only_file(&fresh).expect("create owner-only file");
         file.write_all(b"fresh-secret")
@@ -1405,6 +1559,99 @@ mod tests {
         );
     }
 
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn no_replace_publication_is_readable_at_the_crash_boundary() {
+        let temporary_root = tempfile::tempdir().expect("create temporary root");
+        #[cfg(unix)]
+        secure_test_root(temporary_root.path());
+        let directory = temporary_root.path().join("owner-only");
+        let directory_guard =
+            open_or_create_owner_only_directory(&directory).expect("create owner-only directory");
+        let staged = directory.join(".api-token.staged");
+        let token = directory.join("api-token");
+        let mut staged_file =
+            open_or_create_owner_only_file(&staged).expect("create owner-only staging file");
+        staged_file
+            .write_all(b"crash-boundary-secret")
+            .and_then(|()| staged_file.sync_all())
+            .expect("sync staged secret");
+        drop(staged_file);
+
+        // Stop at the exact point where a process crash could occur: the
+        // publication call has returned, but no caller cleanup or directory
+        // sync has run. Atomic rename must already have consumed the staging
+        // name and produced a single-link file accepted by the read policy.
+        publish_new_file_without_replace(&staged, &token, &directory_guard)
+            .expect("publish without replacing");
+
+        assert!(!staged.exists());
+        assert_eq!(
+            read_owner_only_secret_file(&token)
+                .expect("read token at publication boundary")
+                .as_str(),
+            "crash-boundary-secret"
+        );
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn new_secret_persistence_is_owner_only_and_never_replaces() {
+        let temporary_root = tempfile::tempdir().expect("create temporary root");
+        #[cfg(unix)]
+        secure_test_root(temporary_root.path());
+        let directory = temporary_root.path().join("owner-only");
+        drop(open_or_create_owner_only_directory(&directory).expect("create owner-only directory"));
+        let token = directory.join("api-token");
+
+        persist_new_owner_only_secret_file(&token, "first-secret").expect("persist first secret");
+        assert_eq!(
+            read_owner_only_secret_file(&token)
+                .expect("read persisted secret")
+                .as_str(),
+            "first-secret"
+        );
+        assert_eq!(
+            persist_new_owner_only_secret_file(&token, "replacement-secret"),
+            Err(SecureFileError::UnsafeOrUnavailable)
+        );
+        assert_eq!(
+            read_owner_only_secret_file(&token)
+                .expect("read original after rejected replacement")
+                .as_str(),
+            "first-secret"
+        );
+        assert!(
+            std::fs::read_dir(&directory)
+                .expect("inspect token directory")
+                .all(|entry| !entry
+                    .expect("read token directory entry")
+                    .file_name()
+                    .to_string_lossy()
+                    .ends_with(".tmp")),
+            "atomic publication must consume or clean every staging name"
+        );
+    }
+
+    #[test]
+    fn failed_published_secret_cleanup_is_distinct_and_removes_staging() {
+        let root = tempfile::tempdir().expect("create temporary root");
+        let staged = root.path().join("staged-secret");
+        fs::write(&staged, b"pending-secret").expect("write staged secret");
+        let published = root.path().join("published-secret");
+        fs::create_dir(&published).expect("create unremovable file-shaped path");
+
+        assert_eq!(
+            cleanup_failed_new_secret(&staged, &published, true),
+            Err(SecureFileError::PublishedCleanupFailed)
+        );
+        assert!(!staged.exists(), "staging cleanup remains best effort");
+        assert!(
+            published.is_dir(),
+            "failed published cleanup remains visible"
+        );
+    }
+
     #[cfg(unix)]
     #[test]
     fn permissive_existing_directory_with_a_sidecar_is_rejected() {
@@ -1451,8 +1698,7 @@ mod tests {
     fn existing_owner_only_directory_open_never_creates_a_missing_boundary() {
         let directory = tempfile::tempdir().expect("create temporary directory");
         #[cfg(unix)]
-        fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700))
-            .expect("restrict test ancestry");
+        secure_test_root(directory.path());
         let boundary = directory.path().join("tls");
 
         assert!(matches!(
@@ -1485,8 +1731,7 @@ mod tests {
     #[test]
     fn owner_only_directory_traverses_an_execute_only_ancestor() {
         let directory = tempfile::tempdir().expect("create temporary directory");
-        fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700))
-            .expect("restrict test ancestry");
+        secure_test_root(directory.path());
         let ancestor = directory.path().join("search-only");
         fs::create_dir(&ancestor).expect("create search-only ancestor");
         fs::set_permissions(&ancestor, fs::Permissions::from_mode(0o700))
@@ -1509,8 +1754,7 @@ mod tests {
     #[test]
     fn owner_only_directory_accepts_the_root_owned_macos_tmp_alias() {
         let directory = tempfile::tempdir_in("/tmp").expect("create directory through /tmp alias");
-        fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700))
-            .expect("restrict aliased test directory");
+        secure_test_root(directory.path());
         let boundary = directory.path().join("tls");
 
         drop(
@@ -1523,8 +1767,7 @@ mod tests {
     #[test]
     fn macos_restrictive_ancestor_acl_preserves_replacement_safety() {
         let directory = tempfile::tempdir().expect("create temporary directory");
-        fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700))
-            .expect("restrict ACL-bearing ancestor");
+        secure_test_root(directory.path());
         let add_status = std::process::Command::new("chmod")
             .arg("+a")
             .arg("everyone deny delete")
@@ -1552,8 +1795,7 @@ mod tests {
     #[test]
     fn macos_ancestor_acl_that_allows_replacement_is_rejected() {
         let directory = tempfile::tempdir().expect("create temporary directory");
-        fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700))
-            .expect("restrict ACL-bearing ancestor");
+        secure_test_root(directory.path());
         let add_status = std::process::Command::new("chmod")
             .arg("+a")
             .arg("everyone allow delete_child")
@@ -1592,6 +1834,7 @@ mod tests {
         }
 
         let directory = tempfile::tempdir().expect("create temporary directory");
+        secure_test_root(directory.path());
         let existing = directory.path().join("existing-owner-only");
         fs::write(&existing, b"existing-secret").expect("write existing private file");
         fs::set_permissions(&existing, fs::Permissions::from_mode(0o600))
@@ -1629,6 +1872,7 @@ mod tests {
     #[test]
     fn secret_files_require_regular_owner_only_single_link_files() {
         let directory = tempfile::tempdir().expect("create temporary directory");
+        secure_test_root(directory.path());
         let token = directory.path().join("satelle.token");
         fs::write(&token, "secret-value\n").expect("write token file");
         fs::set_permissions(&token, fs::Permissions::from_mode(0o600))
@@ -1703,6 +1947,7 @@ mod tests {
     #[test]
     fn owner_controlled_config_rejects_unrelated_write_access() {
         let directory = tempfile::tempdir().expect("create temporary directory");
+        secure_test_root(directory.path());
         let config = directory.path().join("config.toml");
         fs::write(&config, "default_host = \"local-demo\"\n").expect("write config");
         fs::set_permissions(&config, fs::Permissions::from_mode(0o644))
@@ -1722,6 +1967,7 @@ mod tests {
     #[test]
     fn secure_file_reads_are_bounded_and_require_utf8() {
         let directory = tempfile::tempdir().expect("create temporary directory");
+        secure_test_root(directory.path());
         let token = directory.path().join("satelle.token");
         fs::write(&token, vec![b'x'; MAX_SECRET_FILE_BYTES + 1]).expect("write large token");
         fs::set_permissions(&token, fs::Permissions::from_mode(0o600))

@@ -7,12 +7,12 @@ use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
 
 #[test]
-fn operational_evidence_schema_is_migrated_atomically_to_version_seven() {
+fn operational_evidence_schema_is_migrated_atomically_to_version_eight() {
     let state = TempDir::new().expect("temporary state directory");
     let (storage, _) = Storage::open(state.path()).expect("open storage");
     let connection = storage.connection_for_test();
 
-    assert_eq!(7_i64, pragma_integer(connection, "user_version"));
+    assert_eq!(8_i64, pragma_integer(connection, "user_version"));
     let versions = connection
         .prepare("SELECT version FROM schema_migrations ORDER BY version")
         .unwrap()
@@ -21,7 +21,7 @@ fn operational_evidence_schema_is_migrated_atomically_to_version_seven() {
         .collect::<Result<Vec<_>, _>>()
         .unwrap();
     assert_eq!(
-        vec![1_i64, 2_i64, 3_i64, 4_i64, 5_i64, 6_i64, 7_i64],
+        vec![1_i64, 2_i64, 3_i64, 4_i64, 5_i64, 6_i64, 7_i64, 8_i64,],
         versions
     );
     for table in [
@@ -40,6 +40,57 @@ fn operational_evidence_schema_is_migrated_atomically_to_version_seven() {
         assert!(exists, "missing operational evidence table {table}");
     }
     assert!(migration_backups(state.path()).is_empty());
+}
+
+#[test]
+fn version_seven_api_tokens_upgrade_to_explicit_active_state() {
+    let state = TempDir::new().expect("temporary state directory");
+    let existing_token = crate::ApiBearerToken::generate().expect("generate existing token");
+    let existing_token_id = existing_token.token_id().to_string();
+    let (mut storage, _) = Storage::open(state.path()).expect("open current storage");
+    storage
+        .register_api_token(
+            ApiTokenRegistration::new(
+                &existing_token,
+                "existing-principal",
+                1,
+                crate::ApiScopes::CONTROL,
+                None,
+                at(1),
+            )
+            .expect("construct existing token registration"),
+        )
+        .expect("register existing token");
+    storage
+        .connection_for_test()
+        .execute_batch(
+            "ALTER TABLE api_tokens DROP COLUMN token_state;
+             DELETE FROM schema_migrations WHERE version = 8;
+             PRAGMA user_version = 7;",
+        )
+        .expect("recreate the version seven token schema");
+    drop(storage);
+
+    let (storage, _) = Storage::open(state.path()).expect("upgrade version seven storage");
+    assert_eq!(
+        8_i64,
+        pragma_integer(storage.connection_for_test(), "user_version")
+    );
+    let token_state: String = storage
+        .connection_for_test()
+        .query_row(
+            "SELECT token_state FROM api_tokens WHERE token_id = ?1",
+            [&existing_token_id],
+            |row| row.get(0),
+        )
+        .expect("read migrated token state");
+    assert_eq!("active", token_state);
+    assert!(
+        storage
+            .authenticate_api_token(&existing_token, at(2))
+            .expect("authenticate migrated token")
+            .is_some()
+    );
 }
 
 #[test]
@@ -162,16 +213,17 @@ fn version_one_store_upgrades_without_replacing_existing_state() {
              DROP TABLE setup_runs;
              DROP TABLE native_readiness_results;
              DROP TABLE provider_smoke_results;
-             DELETE FROM schema_migrations WHERE version IN (2, 3, 4, 5, 6, 7);
+             ALTER TABLE api_tokens DROP COLUMN token_state;
+             DELETE FROM schema_migrations WHERE version IN (2, 3, 4, 5, 6, 7, 8);
              PRAGMA user_version = 1;",
         )
         .unwrap();
     drop(storage);
 
-    let (storage, _) = Storage::open(state.path()).expect("upgrade version one store");
+    let (storage, _) = Storage::open(state.path()).expect("upgrade version one storage");
     assert_eq!(expected_host, storage.host_identity().unwrap());
     assert_eq!(
-        7_i64,
+        8_i64,
         pragma_integer(storage.connection_for_test(), "user_version")
     );
 
@@ -260,7 +312,8 @@ fn assert_version_one_corruption_rejected_before_migration(
              DROP TABLE setup_runs;
              DROP TABLE native_readiness_results;
              DROP TABLE provider_smoke_results;
-             DELETE FROM schema_migrations WHERE version IN (2, 3, 4, 5, 6, 7);
+             ALTER TABLE api_tokens DROP COLUMN token_state;
+             DELETE FROM schema_migrations WHERE version IN (2, 3, 4, 5, 6, 7, 8);
              PRAGMA user_version = 1;",
         )
         .expect("create a logically corrupt version one store");
@@ -316,7 +369,8 @@ fn failed_migration_rolls_back_partial_schema_and_preserves_existing_state() {
              DROP TABLE setup_runs;
              DROP TABLE native_readiness_results;
              DROP TABLE provider_smoke_results;
-             DELETE FROM schema_migrations WHERE version IN (2, 3, 4, 5, 6, 7);
+             ALTER TABLE api_tokens DROP COLUMN token_state;
+             DELETE FROM schema_migrations WHERE version IN (2, 3, 4, 5, 6, 7, 8);
              PRAGMA user_version = 1;
              CREATE TABLE migration_sentinel (value TEXT NOT NULL) STRICT;
              INSERT INTO migration_sentinel (value) VALUES ('preserve-me');

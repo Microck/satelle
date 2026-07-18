@@ -31,7 +31,7 @@ use satelle_core::{
     HostSessionsReport, LOCAL_DEMO_HOST, OwnerOnlyDirectory, PRODUCT_NAME, ProfileField,
     RELAY_ROSE, ResolvedConfig, SUCCESS_GREEN, SatelleError, SatelleEvent, SatelleEventBody,
     SecureFileError, SessionId, SetupMode, SetupReport, SetupRequiredInput, load_config,
-    open_or_create_owner_only_directory, open_owner_only_directory,
+    open_or_create_owner_only_directory, open_or_create_owner_only_file, open_owner_only_directory,
     read_owner_controlled_config_file, read_owner_only_secret_config_file, resolve_path_set,
     utc_now,
 };
@@ -45,23 +45,28 @@ use satelle_transport::{
 use serde_json::json;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
-use std::io::{self, IsTerminal, Read, Write};
+use std::io::{self, BufRead, IsTerminal, Read, Write};
 use std::net::SocketAddr;
 use std::path::{Component, Path, PathBuf};
 use std::process::ExitCode;
 use std::str::FromStr;
 use std::sync::{Arc, OnceLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tailscale::transport_doctor_report;
 use transport::{
-    AttachedTurnOutcome, SshBootstrapScope, discover_direct_host_identity, transport_for,
-    transport_for_with_ssh_bootstrap,
+    AttachedTurnOutcome, SshBootstrapScope, discover_direct_host_identity,
+    discover_ssh_host_identity, transport_for, transport_for_setup,
 };
 
 const CONFIG_CHECK_SCHEMA_VERSION: &str = "satelle.config.check.v1";
 const CONFIG_EXPLAIN_SCHEMA_VERSION: &str = "satelle.config.explain.v1";
 const PATHS_SCHEMA_VERSION: &str = "satelle.paths.v1";
 const DEFAULT_ON_DEMAND_IDLE_TIMEOUT: Duration = Duration::from_secs(10 * 60);
+const SSH_STATE_RELEASE_REQUEST: &str = "ssh-state-release.request";
+const SSH_STATE_RELEASE_REQUESTER_LOCK: &str = "ssh-state-release.requester.lock";
+const STATE_OWNERSHIP_LOCK: &str = "satelle.sqlite3.lock";
+const STATE_RELEASE_TIMEOUT: Duration = Duration::from_secs(20);
+const STATE_RELEASE_POLL_INTERVAL: Duration = Duration::from_millis(50);
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 
@@ -213,6 +218,12 @@ struct SetupCommand {
     yes: bool,
     #[arg(long)]
     no_input: bool,
+    #[arg(
+        long,
+        value_name = "HOST_ID",
+        help = "Require this exact Host identity during first-time SSH trust"
+    )]
+    expected_host_id: Option<String>,
     #[command(flatten)]
     output_args: OutputArgs,
 }
@@ -291,6 +302,12 @@ struct PathsCommand {
 #[derive(Subcommand, Debug)]
 enum HostCommand {
     Start(HostStartCommand),
+    /// Internal SSH setup lock held only while stdin remains connected.
+    #[command(hide = true)]
+    BootstrapLock,
+    /// Internal owner-local request for a running SSH daemon to release its store.
+    #[command(hide = true)]
+    ReleaseState,
     /// Authenticate a direct Host and pin its stable identity in user configuration.
     Trust(HostTrustCommand),
     Status(HostStatusCommand),
@@ -344,12 +361,15 @@ struct HostStartCommand {
     /// Internal least-privilege scope for the one SSH bootstrap operation.
     #[arg(long, hide = true, value_enum, requires = "bootstrap_token_stdin")]
     bootstrap_scope: Option<SshBootstrapScope>,
-    /// Internal resolved native readiness deadline for SSH bootstrap.
+    /// Internal resolved native readiness deadline for an SSH-launched daemon.
     #[arg(long, hide = true, value_name = "MILLISECONDS")]
     bootstrap_native_readiness_timeout_ms: Option<u64>,
-    /// Internal resolved provider smoke deadline for SSH bootstrap.
+    /// Internal resolved provider smoke deadline for an SSH-launched daemon.
     #[arg(long, hide = true, value_name = "MILLISECONDS")]
     bootstrap_provider_smoke_timeout_ms: Option<u64>,
+    /// Internal Controller-resolved idle timeout for a durable SSH launch.
+    #[arg(long, hide = true, value_name = "MILLISECONDS")]
+    on_demand_idle_timeout_ms: Option<u64>,
     #[command(flatten)]
     output_args: OutputArgs,
 }
@@ -874,6 +894,9 @@ fn history_target(command: &Command) -> Option<HistoryTarget<'_>> {
                     command: HostStorageCommand::Migrate(command),
                 },
         } if command.dry_run => return None,
+        Command::Host {
+            command: HostCommand::BootstrapLock | HostCommand::ReleaseState,
+        } => return None,
         Command::Host { command } => HistoryTarget {
             family: "host",
             selects_host: match command {
@@ -885,6 +908,8 @@ fn history_target(command: &Command) -> Option<HistoryTarget<'_>> {
             },
             explicit_host: match command {
                 HostCommand::Start(_) => None,
+                HostCommand::BootstrapLock => None,
+                HostCommand::ReleaseState => None,
                 HostCommand::Trust(command) => Some(command.host.as_str()),
                 HostCommand::Status(command) => command.host.as_deref(),
                 HostCommand::Stop(command) | HostCommand::Restart(command) => {
@@ -978,6 +1003,7 @@ mod history_target_tests {
                 bootstrap_scope: bootstrap_token_stdin.then_some(SshBootstrapScope::Control),
                 bootstrap_native_readiness_timeout_ms: None,
                 bootstrap_provider_smoke_timeout_ms: None,
+                on_demand_idle_timeout_ms: None,
                 output_args: OutputArgs::default(),
             }),
         }
@@ -1027,6 +1053,27 @@ mod history_target_tests {
         assert!(command.bootstrap_token_stdin);
         assert_eq!(command.bootstrap_scope, Some(SshBootstrapScope::Read));
     }
+
+    #[test]
+    fn durable_ssh_idle_timeout_is_an_explicit_internal_argument() {
+        let cli = Cli::try_parse_from([
+            "satelle",
+            "host",
+            "start",
+            "--on-demand-idle-timeout-ms",
+            "75000",
+        ])
+        .expect("parse internal durable SSH start command");
+
+        let Command::Host {
+            command: HostCommand::Start(command),
+        } = cli.command
+        else {
+            panic!("expected Host start command");
+        };
+        assert_eq!(command.on_demand_idle_timeout_ms, Some(75_000));
+        assert!(!command.bootstrap_token_stdin);
+    }
 }
 
 fn canonical_history_session_id(value: &str) -> Option<String> {
@@ -1054,7 +1101,36 @@ fn run_setup(
     format: OutputFormat,
 ) -> Result<(), CliFailure> {
     let json = format.is_json();
-    let host = config.resolve_host(command.host.as_deref())?;
+    if let Some(expected) = command.expected_host_id.as_deref() {
+        HostIdentityRef::new(expected).map_err(|error| {
+            failure(SatelleError::invalid_usage(format!(
+                "--expected-host-id is invalid: {error}"
+            )))
+        })?;
+    }
+    let resolved = config.load()?;
+    let mut host = resolved
+        .resolve_host(command.host.as_deref())
+        .map(SelectedHost::from)
+        .map_err(failure)?;
+    let user_config_path = resolved.user_config_path.clone();
+    if command.expected_host_id.is_some()
+        && host.config.transport != satelle_core::TransportKind::Ssh
+    {
+        return Err(failure(SatelleError::invalid_usage(
+            "setup --expected-host-id is only valid for an SSH Host Binding",
+        )));
+    }
+    if command
+        .expected_host_id
+        .as_deref()
+        .zip(host.config.expected_host_id.as_deref())
+        .is_some_and(|(required, configured)| required != configured)
+    {
+        return Err(failure(SatelleError::host_identity_mismatch(&host.alias)));
+    }
+    let first_ssh_trust = host.config.transport == satelle_core::TransportKind::Ssh
+        && host.config.expected_host_id.is_none();
     let daemon_path_overrides = daemon_path_overrides(&command, &host.config).map_err(failure)?;
     let setup_components = setup_components(&command.component).map_err(failure)?;
     let explicit_provider_auth = command
@@ -1067,14 +1143,15 @@ fn run_setup(
         config.flag_profile,
         &setup_mode,
         &daemon_path_overrides,
+        first_ssh_trust,
     );
 
     let tailscale_serve_setup = command.component.as_slice() == [SetupComponent::Transport]
         && tailscale_serve::applies_to(&host.config);
-    let transport = if tailscale_serve_setup {
+    let mut transport = if tailscale_serve_setup {
         None
     } else {
-        Some(transport_for(&host)?)
+        Some(transport_for_setup(&host)?)
     };
     let mut report = if tailscale_serve_setup {
         tailscale_serve::configure(&host.alias, &host.config, true, &setup_mode).map_err(failure)?
@@ -1133,6 +1210,14 @@ fn run_setup(
             }
         }
 
+        if first_ssh_trust {
+            if !trust_first_ssh_host_during_setup(&command, json, &user_config_path, &mut host)? {
+                println!("No changes applied.");
+                return Ok(());
+            }
+            transport = Some(transport_for_setup(&host)?);
+        }
+
         report = if tailscale_serve_setup {
             tailscale_serve::configure(&host.alias, &host.config, false, &setup_mode)
                 .map_err(failure)?
@@ -1144,6 +1229,17 @@ fn run_setup(
                 .map_err(failure)?
         };
         add_setup_required_inputs(&mut report, &host.config, explicit_provider_auth);
+        if first_ssh_trust {
+            report.planned_actions.insert(
+                0,
+                "discover and explicitly trust the reachable Host Identity".to_string(),
+            );
+            report.applied_actions.insert(
+                0,
+                "discovered and explicitly trusted the reachable Host Identity".to_string(),
+            );
+            report.mutated = true;
+        }
     }
 
     if !command.dry_run && report.required_input.is_empty() && !command.no_input && !json {
@@ -1164,6 +1260,67 @@ fn run_setup(
         print_setup_human(&report);
         Ok(())
     }
+}
+
+fn trust_first_ssh_host_during_setup(
+    command: &SetupCommand,
+    json: bool,
+    user_config_path: &Path,
+    host: &mut SelectedHost,
+) -> Result<bool, CliFailure> {
+    let noninteractive = command.no_input || json || !io::stdin().is_terminal();
+    if noninteractive && (!command.no_input || !command.yes || command.expected_host_id.is_none()) {
+        return Err(failure(SatelleError::invalid_usage(
+            "noninteractive first-time SSH setup requires --no-input --yes --expected-host-id <exact-id>",
+        )));
+    }
+
+    let observed_identity = discover_ssh_host_identity(host).map_err(failure)?;
+    HostIdentityRef::new(&observed_identity).map_err(|_| {
+        failure(SatelleError::remote_api_error(
+            &host.alias,
+            "invalid-daemon-response",
+        ))
+    })?;
+    if command
+        .expected_host_id
+        .as_deref()
+        .is_some_and(|expected| expected != observed_identity)
+    {
+        return Err(failure(SatelleError::host_identity_mismatch(&host.alias)));
+    }
+
+    if command.expected_host_id.is_none() {
+        println!("Host: {}", host.alias);
+        println!(
+            "Endpoint: {}",
+            host.config.address.as_deref().unwrap_or("not configured")
+        );
+        println!("Observed Host Identity: {observed_identity}");
+        println!("Current expected Host Identity: not pinned");
+        println!(
+            "Desktop Binding: {}",
+            host.config
+                .desktop_user
+                .as_deref()
+                .unwrap_or("not configured")
+        );
+        let confirmed = cliclack::confirm("Trust this Host Identity?")
+            .initial_value(false)
+            .interact()
+            .map_err(|error| {
+                failure(SatelleError::invalid_usage(format!(
+                    "could not read Host trust confirmation: {error}"
+                )))
+            })?;
+        if !confirmed {
+            return Ok(false);
+        }
+    }
+
+    persist_host_identity(user_config_path, &host.alias, &observed_identity).map_err(failure)?;
+    host.config.expected_host_id = Some(observed_identity);
+    Ok(true)
 }
 
 fn add_setup_required_inputs(
@@ -1304,6 +1461,7 @@ fn setup_consent_recovery_command(
     profile: Option<&str>,
     setup_mode: &str,
     daemon_path_overrides: &DaemonPathOverrides,
+    first_ssh_trust: bool,
 ) -> String {
     let mut arguments = vec!["satelle".to_string()];
     if let Some(profile) = profile {
@@ -1332,12 +1490,75 @@ fn setup_consent_recovery_command(
         };
         arguments.extend([flag.to_string(), shell_argument(&path_override.value)]);
     }
+    if let Some(expected_host_id) = command.expected_host_id.as_deref() {
+        arguments.extend([
+            "--expected-host-id".to_string(),
+            shell_argument(expected_host_id),
+        ]);
+    }
+    if first_ssh_trust && command.expected_host_id.is_none() {
+        // The first trust prompt must remain interactive unless the operator
+        // supplied the exact identity that noninteractive recovery can pin.
+        return arguments.join(" ");
+    }
     arguments.extend([
         "--no-input".to_string(),
         "--json".to_string(),
         "--yes".to_string(),
     ]);
     arguments.join(" ")
+}
+
+#[cfg(test)]
+mod setup_consent_recovery_tests {
+    use super::*;
+
+    #[test]
+    fn first_ssh_trust_recovery_preserves_the_expected_host_identity() {
+        let cli = Cli::try_parse_from([
+            "satelle",
+            "setup",
+            "--host",
+            "remote",
+            "--expected-host-id",
+            "host-expected",
+        ])
+        .expect("parse SSH setup command");
+        let Command::Setup(command) = cli.command else {
+            panic!("expected setup command");
+        };
+
+        assert_eq!(
+            setup_consent_recovery_command(
+                &command,
+                None,
+                "on_demand",
+                &DaemonPathOverrides::default(),
+                true,
+            ),
+            "satelle setup --host remote --on-demand --expected-host-id host-expected --no-input --json --yes"
+        );
+    }
+
+    #[test]
+    fn first_ssh_trust_recovery_without_an_expected_identity_remains_interactive() {
+        let cli = Cli::try_parse_from(["satelle", "setup", "--host", "remote"])
+            .expect("parse SSH setup command");
+        let Command::Setup(command) = cli.command else {
+            panic!("expected setup command");
+        };
+
+        assert_eq!(
+            setup_consent_recovery_command(
+                &command,
+                None,
+                "on_demand",
+                &DaemonPathOverrides::default(),
+                true,
+            ),
+            "satelle setup --host remote --on-demand"
+        );
+    }
 }
 
 fn shell_argument(value: &str) -> String {
@@ -2320,6 +2541,8 @@ fn run_host(
     let json = format.is_json();
     match command {
         HostCommand::Start(command) => start_host_daemon(command, config, format),
+        HostCommand::BootstrapLock => hold_ssh_bootstrap_lock(),
+        HostCommand::ReleaseState => release_ssh_state_owner(),
         HostCommand::Trust(command) => trust_host(command, config, format),
         HostCommand::Status(command) => {
             let status = read::host_status(command.host.as_deref(), config)?;
@@ -2344,6 +2567,273 @@ fn run_host(
         HostCommand::Sessions(command) => show_host_sessions(command, config, format),
         HostCommand::Storage { command } => run_host_storage(command),
     }
+}
+
+fn hold_ssh_bootstrap_lock() -> Result<(), CliFailure> {
+    let state_root = satelle_core::state_dir().map_err(failure)?;
+    drop(
+        open_or_create_owner_only_directory(&state_root)
+            .map_err(|error| ssh_bootstrap_lock_failure(&state_root, error))?,
+    );
+    let lock_path = state_root.join("bootstrap.lock");
+    let lock = open_or_create_owner_only_file(&lock_path)
+        .map_err(|error| ssh_bootstrap_lock_failure(&lock_path, error))?;
+    lock.lock()
+        .map_err(|error| ssh_bootstrap_lock_failure(&lock_path, error))?;
+
+    serve_ssh_bootstrap_lock_protocol(io::stdin().lock(), io::stdout().lock())
+        .map_err(|error| ssh_bootstrap_lock_failure(&lock_path, error))?;
+    Ok(())
+}
+
+fn serve_ssh_bootstrap_lock_protocol(
+    input: impl BufRead,
+    mut output: impl Write,
+) -> io::Result<()> {
+    writeln!(output, "{}", transport::SSH_BOOTSTRAP_LOCK_READY)?;
+    output.flush()?;
+    for line in input.lines() {
+        writeln!(output, "{}", line?)?;
+        output.flush()?;
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod ssh_bootstrap_lock_tests {
+    use super::*;
+
+    #[test]
+    fn lock_protocol_echoes_challenges_only_after_readiness() {
+        let mut output = Vec::new();
+        serve_ssh_bootstrap_lock_protocol(
+            io::Cursor::new(b"challenge-one\nchallenge-two\n"),
+            &mut output,
+        )
+        .expect("serve lock protocol");
+
+        assert_eq!(
+            String::from_utf8(output).expect("UTF-8 lock protocol"),
+            format!(
+                "{}\nchallenge-one\nchallenge-two\n",
+                transport::SSH_BOOTSTRAP_LOCK_READY
+            )
+        );
+    }
+}
+
+fn release_ssh_state_owner() -> Result<(), CliFailure> {
+    let state_root = satelle_core::state_dir().map_err(failure)?;
+    release_ssh_state_owner_at(&state_root).map_err(failure)
+}
+
+fn release_ssh_state_owner_at(state_root: &Path) -> Result<(), SatelleError> {
+    drop(
+        open_or_create_owner_only_directory(state_root)
+            .map_err(|error| state_release_failure(state_root, error))?,
+    );
+    let requester_lock_path = state_root.join(SSH_STATE_RELEASE_REQUESTER_LOCK);
+    let requester_lock = open_or_create_owner_only_file(&requester_lock_path)
+        .map_err(|error| state_release_failure(&requester_lock_path, error))?;
+    requester_lock
+        .lock()
+        .map_err(|error| state_release_failure(&requester_lock_path, error))?;
+    let request_path = state_root.join(SSH_STATE_RELEASE_REQUEST);
+    drop(
+        open_or_create_owner_only_file(&request_path)
+            .map_err(|error| state_release_failure(&request_path, error))?,
+    );
+    let lock_path = state_root.join(STATE_OWNERSHIP_LOCK);
+    let lock = open_or_create_owner_only_file(&lock_path)
+        .map_err(|error| state_release_failure(&lock_path, error))?;
+    let deadline = Instant::now() + STATE_RELEASE_TIMEOUT;
+    loop {
+        match lock.try_lock() {
+            Ok(()) => {
+                let _ = fs::remove_file(&request_path);
+                let _ = lock.unlock();
+                return Ok(());
+            }
+            Err(std::fs::TryLockError::WouldBlock) if Instant::now() < deadline => {
+                std::thread::sleep(STATE_RELEASE_POLL_INTERVAL);
+            }
+            Err(std::fs::TryLockError::WouldBlock) => {
+                let _ = fs::remove_file(&request_path);
+                return Err(state_release_failure(
+                    &lock_path,
+                    "the running Host Daemon did not release the state store before the deadline",
+                ));
+            }
+            Err(std::fs::TryLockError::Error(error)) => {
+                let _ = fs::remove_file(&request_path);
+                return Err(state_release_failure(&lock_path, error));
+            }
+        }
+    }
+}
+
+async fn wait_for_ssh_state_release_request(state_root: PathBuf) {
+    let request_path = state_root.join(SSH_STATE_RELEASE_REQUEST);
+    let requester_lock_path = state_root.join(SSH_STATE_RELEASE_REQUESTER_LOCK);
+    loop {
+        match fs::metadata(&request_path) {
+            Ok(_) => {
+                let requester_lock = match open_or_create_owner_only_file(&requester_lock_path) {
+                    Ok(lock) => lock,
+                    // The state directory is owner-only, so an unverifiable
+                    // requester lock must fail closed by releasing the store.
+                    Err(_) => return,
+                };
+                match requester_lock.try_lock() {
+                    // A live requester holds this lock before publishing the
+                    // marker and keeps it until state ownership transfers.
+                    Err(std::fs::TryLockError::WouldBlock) => return,
+                    Ok(()) => {
+                        // No live requester owns the marker. Remove it without
+                        // stopping the newly started daemon, then keep watching.
+                        let _ = fs::remove_file(&request_path);
+                        let _ = requester_lock.unlock();
+                    }
+                    // Fail closed when requester liveness cannot be proven.
+                    Err(std::fs::TryLockError::Error(_)) => return,
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            // The state directory is owner-only, so any other error means the
+            // handoff cannot be trusted. Fail closed by releasing the store.
+            Err(_) => return,
+        }
+        tokio::time::sleep(STATE_RELEASE_POLL_INTERVAL).await;
+    }
+}
+
+fn state_release_failure(path: &Path, error: impl std::fmt::Display) -> SatelleError {
+    SatelleError::config_error(
+        format!(
+            "could not coordinate SSH state release at '{}': {error}",
+            path.display()
+        ),
+        None,
+    )
+}
+
+#[cfg(test)]
+mod ssh_state_release_tests {
+    use super::*;
+
+    #[test]
+    fn stale_release_request_is_removed_without_stopping_the_next_daemon() {
+        let state = satelle_host::test_support::TestStateDir::new()
+            .expect("create secure state-release directory");
+        let state_root = state.path().to_path_buf();
+        drop(
+            open_or_create_owner_only_file(&state_root.join(SSH_STATE_RELEASE_REQUEST))
+                .expect("create stale release marker"),
+        );
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .expect("build marker watcher runtime");
+        runtime.block_on(async {
+            let outcome = tokio::time::timeout(
+                STATE_RELEASE_POLL_INTERVAL * 3,
+                wait_for_ssh_state_release_request(state_root.clone()),
+            )
+            .await;
+            assert!(
+                outcome.is_err(),
+                "a stale marker must not request daemon shutdown"
+            );
+        });
+        assert!(!state_root.join(SSH_STATE_RELEASE_REQUEST).exists());
+    }
+
+    #[test]
+    fn release_request_waits_for_the_running_owner_and_cleans_up() {
+        #[cfg(unix)]
+        let state = tempfile::Builder::new()
+            .prefix("satelle-state-release-")
+            .tempdir_in(PathBuf::from(
+                std::env::var_os("HOME").expect("test HOME directory"),
+            ))
+            .expect("create secure state-release directory");
+        #[cfg(unix)]
+        let state_root = state.path().to_path_buf();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            fs::set_permissions(&state_root, fs::Permissions::from_mode(0o700))
+                .expect("restrict state-release directory");
+        }
+        #[cfg(windows)]
+        let state = satelle_host::test_support::TestStateDir::new()
+            .expect("create secure state-release directory");
+        #[cfg(windows)]
+        let state_root = state.path().to_path_buf();
+        let lock_path = state_root.join(STATE_OWNERSHIP_LOCK);
+        let owner_lock = open_or_create_owner_only_file(&lock_path).expect("open ownership lock");
+        owner_lock
+            .lock()
+            .expect("simulate the running daemon owner");
+
+        let release_root = state_root.clone();
+        let (result_sender, result_receiver) = std::sync::mpsc::sync_channel(1);
+        let requester = std::thread::spawn(move || {
+            let result = release_ssh_state_owner_at(&release_root);
+            let _ = result_sender.send(result);
+        });
+        let request_path = state_root.join(SSH_STATE_RELEASE_REQUEST);
+        let request_deadline = Instant::now() + Duration::from_secs(5);
+        while !request_path.exists() && Instant::now() < request_deadline {
+            if let Ok(result) = result_receiver.try_recv() {
+                panic!("release requester exited before publishing its marker: {result:?}");
+            }
+            std::thread::sleep(STATE_RELEASE_POLL_INTERVAL);
+        }
+        assert!(
+            request_path.exists(),
+            "release requester publishes its marker before the owner watches it"
+        );
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .expect("build marker watcher runtime");
+        runtime
+            .block_on(async {
+                tokio::time::timeout(
+                    Duration::from_secs(2),
+                    wait_for_ssh_state_release_request(state_root.clone()),
+                )
+                .await
+            })
+            .expect("running owner observes the release request");
+        assert!(
+            request_path.exists(),
+            "a live release request remains published until ownership transfers"
+        );
+
+        owner_lock
+            .unlock()
+            .expect("running owner releases the store");
+        result_receiver
+            .recv_timeout(STATE_RELEASE_TIMEOUT)
+            .expect("release requester reports completion")
+            .expect("release requester acquires the released store");
+        requester.join().expect("release requester exits");
+        assert!(!state_root.join(SSH_STATE_RELEASE_REQUEST).exists());
+    }
+}
+
+fn ssh_bootstrap_lock_failure(path: &Path, error: impl std::fmt::Display) -> CliFailure {
+    failure(SatelleError::config_error(
+        format!(
+            "could not hold the SSH bootstrap lock at '{}': {error}",
+            path.display()
+        ),
+        None,
+    ))
 }
 
 fn trust_host(
@@ -2477,6 +2967,18 @@ fn start_host_daemon(
             "SSH bootstrap Host Daemons use loopback plaintext inside the authenticated tunnel and do not accept TLS files",
         )));
     }
+    if command.on_demand_idle_timeout_ms.is_some()
+        && (command.foreground || command.bootstrap_token_stdin)
+    {
+        return Err(failure(SatelleError::invalid_usage(
+            "the resolved on-demand idle timeout is valid only for durable on-demand Host Daemons",
+        )));
+    }
+    if command.on_demand_idle_timeout_ms == Some(0) {
+        return Err(failure(SatelleError::invalid_usage(
+            "the resolved on-demand idle timeout must be positive",
+        )));
+    }
     let bootstrap_scopes = match (command.bootstrap_token_stdin, command.bootstrap_scope) {
         (true, Some(scope)) => Some(scope.api_scopes()),
         (true, None) => {
@@ -2511,10 +3013,22 @@ fn start_host_daemon(
     })?;
     let tls = daemon_tls_config(&command)?;
 
-    let on_demand_host = (!command.foreground && !command.bootstrap_token_stdin)
-        .then(|| config.resolve_host(None))
-        .transpose()?;
-    let idle_timeout = if command.bootstrap_token_stdin {
+    // Durable SSH relaunch must reopen the same default state store used by
+    // bootstrap token issuance. The Controller has already resolved the idle
+    // and readiness timeouts, so consulting the remote user's default Host here
+    // could redirect the daemon to another daemon_state_dir and strand the
+    // durable credential.
+    let durable_ssh_launch = command.on_demand_idle_timeout_ms.is_some();
+    let on_demand_host = should_resolve_on_demand_host(
+        command.foreground,
+        command.bootstrap_token_stdin,
+        durable_ssh_launch,
+    )
+    .then(|| config.resolve_host(None))
+    .transpose()?;
+    let idle_timeout = if let Some(milliseconds) = command.on_demand_idle_timeout_ms {
+        Some(Duration::from_millis(milliseconds))
+    } else if command.bootstrap_token_stdin {
         Some(DEFAULT_ON_DEMAND_IDLE_TIMEOUT)
     } else {
         on_demand_host
@@ -2525,33 +3039,23 @@ fn start_host_daemon(
         .bootstrap_token_stdin
         .then(read_ssh_bootstrap_token)
         .transpose()?;
+    let forwarded_readiness_timeouts = ssh_launch_readiness_timeouts(
+        command.bootstrap_native_readiness_timeout_ms,
+        command.bootstrap_provider_smoke_timeout_ms,
+    )
+    .map_err(failure)?;
+    let state_release_root = on_demand_host
+        .as_ref()
+        .and_then(|host| host.config.daemon_state_dir.clone())
+        .map_or_else(satelle_core::state_dir, Ok)
+        .map_err(failure)?;
     let service = match (on_demand_host.as_ref(), bootstrap_token.as_ref()) {
         (_, Some(token)) => {
             let mut host_config = satelle_core::SatelleConfig::defaults()
                 .hosts
                 .remove(LOCAL_DEMO_HOST)
                 .expect("the built-in local Host config exists");
-            match (
-                command.bootstrap_native_readiness_timeout_ms,
-                command.bootstrap_provider_smoke_timeout_ms,
-            ) {
-                (Some(native), Some(provider)) => {
-                    host_config.timeouts = Some(satelle_core::TimeoutConfig {
-                        native_readiness: satelle_core::ExplicitDuration::parse(&format!(
-                            "{native}ms"
-                        )),
-                        provider_smoke_test: satelle_core::ExplicitDuration::parse(&format!(
-                            "{provider}ms"
-                        )),
-                    });
-                }
-                (None, None) => {}
-                _ => {
-                    return Err(failure(SatelleError::invalid_usage(
-                        "SSH bootstrap readiness timeouts must be provided together",
-                    )));
-                }
-            }
+            host_config.timeouts = forwarded_readiness_timeouts;
             HostService::production_for_ssh_bootstrap(
                 token,
                 bootstrap_scopes.expect("bootstrap token has a validated scope"),
@@ -2560,7 +3064,17 @@ fn start_host_daemon(
             )
         }
         (Some(host), None) => HostService::production_for_host(&host.config),
-        (None, None) => HostService::production(),
+        (None, None) => match forwarded_readiness_timeouts {
+            Some(timeouts) => {
+                let mut host_config = satelle_core::SatelleConfig::defaults()
+                    .hosts
+                    .remove(LOCAL_DEMO_HOST)
+                    .expect("the built-in local Host config exists");
+                host_config.timeouts = Some(timeouts);
+                HostService::production_for_host(&host_config)
+            }
+            None => HostService::production(),
+        },
     };
     // The service retained only the verifier. Zeroize the raw bootstrap token
     // before the listener starts accepting requests.
@@ -2612,6 +3126,12 @@ fn start_host_daemon(
             "bind": server.local_addr(),
             "running": true,
         });
+        let shutdown_handle = server.shutdown_handle();
+        let state_release_shutdown = shutdown_handle.clone();
+        let state_release_task = tokio::spawn(async move {
+            wait_for_ssh_state_release_request(state_release_root).await;
+            state_release_shutdown.request_shutdown();
+        });
         if bootstrap_protocol {
             let mut stdout = io::stdout().lock();
             serde_json::to_writer(&mut stdout, &ready).map_err(|_| {
@@ -2638,15 +3158,48 @@ fn start_host_daemon(
             println!("Host Daemon listening on {}", server.local_addr());
         }
 
-        if command.foreground {
-            tokio::signal::ctrl_c()
-                .await
-                .map_err(|error| daemon_process_failure("signal-wait-failed", error.to_string()))?;
-            server.shutdown().await.map_err(daemon_server_failure)
+        let mut server_wait = Box::pin(server.wait());
+        let result = if command.foreground {
+            tokio::select! {
+                result = &mut server_wait => result.map_err(daemon_server_failure),
+                signal = tokio::signal::ctrl_c() => {
+                    signal.map_err(|error| {
+                        daemon_process_failure("signal-wait-failed", error.to_string())
+                    })?;
+                    shutdown_handle.request_shutdown();
+                    server_wait.await.map_err(daemon_server_failure)
+                }
+            }
         } else {
-            server.wait().await.map_err(daemon_server_failure)
-        }
+            server_wait.await.map_err(daemon_server_failure)
+        };
+        state_release_task.abort();
+        result
     })
+}
+
+const fn should_resolve_on_demand_host(
+    foreground: bool,
+    bootstrap_token_stdin: bool,
+    durable_ssh_launch: bool,
+) -> bool {
+    !foreground && !bootstrap_token_stdin && !durable_ssh_launch
+}
+
+fn ssh_launch_readiness_timeouts(
+    native_readiness_timeout_ms: Option<u64>,
+    provider_smoke_timeout_ms: Option<u64>,
+) -> Result<Option<satelle_core::TimeoutConfig>, SatelleError> {
+    match (native_readiness_timeout_ms, provider_smoke_timeout_ms) {
+        (Some(native), Some(provider)) => Ok(Some(satelle_core::TimeoutConfig {
+            native_readiness: satelle_core::ExplicitDuration::parse(&format!("{native}ms")),
+            provider_smoke_test: satelle_core::ExplicitDuration::parse(&format!("{provider}ms")),
+        })),
+        (None, None) => Ok(None),
+        _ => Err(SatelleError::invalid_usage(
+            "SSH launch readiness timeouts must be provided together",
+        )),
+    }
 }
 
 fn install_host_daemon_diagnostics() {
@@ -3106,6 +3659,7 @@ mod daemon_tls_watcher_tests {
             bootstrap_scope: None,
             bootstrap_native_readiness_timeout_ms: None,
             bootstrap_provider_smoke_timeout_ms: None,
+            on_demand_idle_timeout_ms: None,
             output_args: OutputArgs::default(),
         }
     }
@@ -3606,6 +4160,41 @@ mod on_demand_idle_timeout_tests {
         );
         assert_eq!(on_demand_idle_timeout(&config), Duration::from_secs(75));
     }
+
+    #[test]
+    fn durable_ssh_launch_keeps_the_bootstrap_state_store() {
+        assert!(should_resolve_on_demand_host(false, false, false));
+        assert!(!should_resolve_on_demand_host(false, false, true));
+        assert!(!should_resolve_on_demand_host(false, true, false));
+        assert!(!should_resolve_on_demand_host(true, false, false));
+    }
+
+    #[test]
+    fn durable_ssh_launch_applies_both_forwarded_readiness_timeouts() {
+        let timeouts = ssh_launch_readiness_timeouts(Some(2_500), Some(7_500))
+            .expect("paired SSH launch timeouts")
+            .expect("paired timeouts produce a Host override");
+        assert_eq!(
+            timeouts
+                .native_readiness
+                .expect("native readiness timeout")
+                .milliseconds(),
+            2_500
+        );
+        assert_eq!(
+            timeouts
+                .provider_smoke_test
+                .expect("provider smoke timeout")
+                .milliseconds(),
+            7_500
+        );
+        assert!(
+            ssh_launch_readiness_timeouts(None, None)
+                .expect("omitted SSH launch timeouts")
+                .is_none()
+        );
+        assert!(ssh_launch_readiness_timeouts(Some(2_500), None).is_err());
+    }
 }
 
 fn daemon_server_failure(error: DaemonServerError) -> CliFailure {
@@ -3850,8 +4439,7 @@ fn run_prompt(
             .map(SelectedHost::from)
             .map_err(failure),
     )?;
-    let transport = match transport_for_with_ssh_bootstrap(&host, Some(SshBootstrapScope::Control))
-    {
+    let transport = match transport_for(&host) {
         Ok(transport) => transport,
         Err(transport_failure) => {
             if !command.detach {
@@ -3977,8 +4565,7 @@ fn steer_prompt(
             .map(SelectedHost::from)
             .map_err(failure),
     )?;
-    let transport = match transport_for_with_ssh_bootstrap(&host, Some(SshBootstrapScope::Control))
-    {
+    let transport = match transport_for(&host) {
         Ok(transport) => transport,
         Err(transport_failure) => {
             if !command.detach {

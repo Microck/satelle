@@ -28,9 +28,9 @@ use windows_sys::Win32::Storage::FileSystem::{
     FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_NORMAL, FILE_ATTRIBUTE_REPARSE_POINT,
     FILE_ATTRIBUTE_TAG_INFO, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
     FILE_GENERIC_READ, FILE_GENERIC_WRITE, FILE_READ_ATTRIBUTES, FILE_SHARE_READ, FILE_SHARE_WRITE,
-    FileAttributeTagInfo, FlushFileBuffers, GetDriveTypeW, GetFileInformationByHandle,
-    GetFileInformationByHandleEx, GetVolumeInformationByHandleW, OPEN_ALWAYS, OPEN_EXISTING,
-    READ_CONTROL, ReOpenFile, WRITE_DAC, WRITE_OWNER,
+    FileAttributeTagInfo, GetDriveTypeW, GetFileInformationByHandle, GetFileInformationByHandleEx,
+    GetVolumeInformationByHandleW, OPEN_ALWAYS, OPEN_EXISTING, READ_CONTROL, ReOpenFile, WRITE_DAC,
+    WRITE_OWNER,
 };
 use windows_sys::Win32::System::SystemServices::{ACCESS_ALLOWED_ACE_TYPE, FILE_PERSISTENT_ACLS};
 use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
@@ -183,25 +183,11 @@ impl SecureStateDirectory {
     }
 
     pub(super) fn sync(&self) -> Result<(), StorageError> {
-        let state_directory = self
-            ._pinned_directories
-            .last()
-            .ok_or_else(|| StorageError::new(StorageErrorKind::StateDirectoryUnavailable))?;
-        let reopened = unsafe {
-            ReOpenFile(
-                raw_handle(state_directory),
-                FILE_GENERIC_READ | FILE_GENERIC_WRITE,
-                FILE_SHARE_READ | FILE_SHARE_WRITE,
-                FILE_FLAG_BACKUP_SEMANTICS,
-            )
-        };
-        if reopened == INVALID_HANDLE_VALUE {
-            return Err(last_error(StorageErrorKind::MigrationFailed));
-        }
-        let sync_handle = unsafe { OwnedHandle::from_raw_handle(reopened) };
-        if unsafe { FlushFileBuffers(raw_handle(&sync_handle)) } == 0 {
-            return Err(last_error(StorageErrorKind::MigrationFailed));
-        }
+        // The backup and manifest handles are both flushed before this call.
+        // Windows has no portable equivalent of Unix directory fsync:
+        // FlushFileBuffers requires GENERIC_WRITE, but normal directory handles
+        // reject that access with ERROR_ACCESS_DENIED. Flushing each new file
+        // also flushes its metadata, so no separate directory flush is needed.
         Ok(())
     }
 }

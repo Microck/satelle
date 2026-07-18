@@ -25,10 +25,11 @@ use satelle_host::{
     test_support::TestStateDir,
 };
 use satelle_transport::{
-    ApiError, CapabilitiesResponse, DaemonClient, DaemonClientError, DaemonEventClient,
-    DaemonServer, DaemonServerConfig, DaemonTlsConfig, DaemonTlsConfigError, DaemonTlsReloadError,
-    EventSubscription, HostDesktopSessionsResponse, HostStatusResponse, LiveResponse,
-    LogsPageResponse, RequestId,
+    ApiError, ApiErrorCode, CapabilitiesResponse, DURABLE_SETUP_PENDING_TTL, DaemonClient,
+    DaemonClientError, DaemonEventClient, DaemonServer, DaemonServerConfig, DaemonTlsConfig,
+    DaemonTlsConfigError, DaemonTlsReloadError, DurableTokenActivationResponse,
+    DurableTokenIssuanceResponse, EventSubscription, HostDesktopSessionsResponse,
+    HostStatusResponse, LiveResponse, LogsPageResponse, RequestId,
 };
 use serde_json::Value;
 use std::net::{Ipv4Addr, SocketAddr};
@@ -38,7 +39,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio_rustls::TlsConnector;
 
-const EXPECTED_OPERATIONS: [&str; 10] = [
+const EXPECTED_OPERATIONS: [&str; 14] = [
     "live",
     "capabilities",
     "host_status",
@@ -49,6 +50,10 @@ const EXPECTED_OPERATIONS: [&str; 10] = [
     "session_stop",
     "logs_read",
     "events_read",
+    "setup_api_token_current",
+    "setup_api_token_issue",
+    "setup_api_token_activate",
+    "setup_api_token_abort",
 ];
 
 struct RunningServer {
@@ -112,6 +117,23 @@ impl RunningServer {
 fn bearer(token: &ApiBearerToken) -> String {
     let exposed = token.expose();
     format!("Bearer {}", exposed.as_str())
+}
+
+fn setup_mutation_request(
+    client: &reqwest::Client,
+    address: SocketAddr,
+    token: &ApiBearerToken,
+    host_identity: &str,
+    path: &str,
+    idempotency_key: &str,
+) -> reqwest::RequestBuilder {
+    client
+        .post(format!("http://{address}{path}"))
+        .header("Authorization", bearer(token))
+        .header("Satelle-Expected-Host-Identity", host_identity)
+        .header("Satelle-Request-Id", RequestId::new().to_string())
+        .header("Idempotency-Key", idempotency_key)
+        .header("Satelle-Protocol-Version", "3")
 }
 
 fn replacement_token(token_id: &str) -> ApiBearerToken {
@@ -1026,6 +1048,427 @@ async fn ssh_bootstrap_authentication_rejects_non_loopback_tls_before_listening(
 }
 
 #[tokio::test]
+async fn setup_token_mutations_reject_bodies_before_changing_token_state() {
+    let state = TestStateDir::new().expect("temporary state directory");
+    let bootstrap_token = ApiBearerToken::generate().expect("generate bootstrap token");
+    let service = HostService::local_demo_for_tests_at(state.path())
+        .expect("construct deterministic Host service")
+        .with_ssh_bootstrap_auth_for_tests(
+            &bootstrap_token,
+            ApiScopes::ADMIN,
+            time::OffsetDateTime::now_utc() + time::Duration::minutes(15),
+        );
+    let host_identity = service
+        .initialize_daemon()
+        .expect("initialize Host state")
+        .host_identity()
+        .to_string();
+    let server = DaemonServer::bind(
+        service,
+        DaemonServerConfig::loopback(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))),
+    )
+    .await
+    .expect("bind bootstrap server");
+    let address = server.local_addr();
+    let client = reqwest::Client::new();
+
+    let invalid_issue = setup_mutation_request(
+        &client,
+        address,
+        &bootstrap_token,
+        &host_identity,
+        "/v1/setup/api-token",
+        "bodyless-issue",
+    )
+    .header("Content-Type", "text/plain")
+    .body("unsupported payload")
+    .send()
+    .await
+    .expect("issue with an unsupported body");
+    assert_eq!(invalid_issue.status(), StatusCode::BAD_REQUEST);
+
+    // Reusing the key must still produce the one-time secret. If the rejected
+    // request had issued a token, this replay would omit it.
+    let issue = setup_mutation_request(
+        &client,
+        address,
+        &bootstrap_token,
+        &host_identity,
+        "/v1/setup/api-token",
+        "bodyless-issue",
+    )
+    .send()
+    .await
+    .expect("issue without a body");
+    assert_eq!(issue.status(), StatusCode::CREATED);
+    let issuance: DurableTokenIssuanceResponse =
+        issue.json().await.expect("decode setup token issuance");
+    let activate_token_id = issuance.token_id().to_string();
+    assert!(issuance.into_bearer_token().is_some());
+
+    let oversized_activate = setup_mutation_request(
+        &client,
+        address,
+        &bootstrap_token,
+        &host_identity,
+        &format!("/v1/setup/api-token/{activate_token_id}/activate"),
+        "bodyless-activate",
+    )
+    .body(vec![b'x'; 1_048_577])
+    .send()
+    .await
+    .expect("activate with an oversized body");
+    assert_eq!(oversized_activate.status(), StatusCode::PAYLOAD_TOO_LARGE);
+
+    let activate = setup_mutation_request(
+        &client,
+        address,
+        &bootstrap_token,
+        &host_identity,
+        &format!("/v1/setup/api-token/{activate_token_id}/activate"),
+        "bodyless-activate",
+    )
+    .send()
+    .await
+    .expect("activate without a body after rejection");
+    assert_eq!(activate.status(), StatusCode::OK);
+    let activated: DurableTokenActivationResponse =
+        activate.json().await.expect("decode activation response");
+    assert!(activated.active());
+
+    let abort_candidate = setup_mutation_request(
+        &client,
+        address,
+        &bootstrap_token,
+        &host_identity,
+        "/v1/setup/api-token",
+        "bodyless-abort-candidate",
+    )
+    .send()
+    .await
+    .expect("issue token for abort rejection");
+    assert_eq!(abort_candidate.status(), StatusCode::CREATED);
+    let abort_candidate: DurableTokenIssuanceResponse = abort_candidate
+        .json()
+        .await
+        .expect("decode abort candidate issuance");
+    let abort_token_id = abort_candidate.token_id().to_string();
+
+    let exposed = bootstrap_token.expose();
+    let invalid_abort = setup_mutation_request(
+        &client,
+        address,
+        &bootstrap_token,
+        &host_identity,
+        &format!("/v1/setup/api-token/{abort_token_id}/abort"),
+        "bodyless-abort",
+    )
+    .body(format!("token={}", exposed.as_str()))
+    .send()
+    .await
+    .expect("abort with a bearer token body");
+    assert_eq!(invalid_abort.status(), StatusCode::BAD_REQUEST);
+    let rejection = invalid_abort
+        .bytes()
+        .await
+        .expect("read bearer carrier rejection");
+    assert!(!String::from_utf8_lossy(&rejection).contains(exposed.as_str()));
+
+    // Activation proves the rejected abort left the pending token intact.
+    let activate_after_abort_rejection = setup_mutation_request(
+        &client,
+        address,
+        &bootstrap_token,
+        &host_identity,
+        &format!("/v1/setup/api-token/{abort_token_id}/activate"),
+        "activate-after-bodyless-abort",
+    )
+    .send()
+    .await
+    .expect("activate after rejected abort");
+    assert_eq!(activate_after_abort_rejection.status(), StatusCode::OK);
+
+    let second_abort_candidate = setup_mutation_request(
+        &client,
+        address,
+        &bootstrap_token,
+        &host_identity,
+        "/v1/setup/api-token",
+        "bodyless-abort-retry-candidate",
+    )
+    .send()
+    .await
+    .expect("issue a second abort candidate");
+    assert_eq!(second_abort_candidate.status(), StatusCode::CREATED);
+    let second_abort_candidate: DurableTokenIssuanceResponse = second_abort_candidate
+        .json()
+        .await
+        .expect("decode second abort candidate issuance");
+    let second_abort_token_id = second_abort_candidate.token_id().to_string();
+    let abort_after_rejection = setup_mutation_request(
+        &client,
+        address,
+        &bootstrap_token,
+        &host_identity,
+        &format!("/v1/setup/api-token/{second_abort_token_id}/abort"),
+        "bodyless-abort",
+    )
+    .send()
+    .await
+    .expect("reuse the idempotency key after rejected abort");
+    assert_eq!(abort_after_rejection.status(), StatusCode::OK);
+    let aborted: DurableTokenActivationResponse = abort_after_rejection
+        .json()
+        .await
+        .expect("decode successful abort after rejection");
+    assert!(!aborted.active());
+    assert_eq!(aborted.token_id(), second_abort_token_id);
+
+    server.shutdown().await.expect("stop bootstrap server");
+}
+
+#[tokio::test]
+async fn ssh_bootstrap_issues_and_activates_one_durable_restart_credential() {
+    let state = TestStateDir::new().expect("temporary state directory");
+    let bootstrap_token = ApiBearerToken::generate().expect("generate bootstrap token");
+    let service = HostService::local_demo_for_tests_at(state.path())
+        .expect("construct deterministic Host service")
+        .with_ssh_bootstrap_auth_for_tests(
+            &bootstrap_token,
+            ApiScopes::ADMIN,
+            time::OffsetDateTime::now_utc() + time::Duration::minutes(15),
+        );
+    let ordinary_control_token = ApiBearerToken::generate().expect("generate ordinary token");
+    service
+        .register_api_token(
+            &ordinary_control_token,
+            "ordinary-control",
+            ApiScopes::CONTROL,
+            None,
+        )
+        .expect("register ordinary control token");
+    let host_identity = service
+        .initialize_daemon()
+        .expect("initialize Host state")
+        .host_identity()
+        .to_string();
+    let server = DaemonServer::bind(
+        service.clone(),
+        DaemonServerConfig::loopback(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))),
+    )
+    .await
+    .expect("bind bootstrap server");
+    let first_address = server.local_addr();
+    let first_identity = host_identity.clone();
+    let restart_durable_token = tokio::task::spawn_blocking(move || {
+        let bootstrap_client =
+            DaemonClient::loopback(first_address, bootstrap_token, first_identity.clone())
+                .expect("construct bootstrap client");
+        let aborted_issuance = bootstrap_client
+            .issue_durable_setup_token("issue-aborted-setup-token")
+            .expect("issue token to abort");
+        let aborted_token_id = aborted_issuance.token_id().to_string();
+        let aborted_raw_token = aborted_issuance
+            .into_bearer_token()
+            .expect("first aborted issuance carries the secret");
+        let aborted_token =
+            ApiBearerToken::parse(aborted_raw_token.as_str()).expect("parse token to abort");
+        let aborted = bootstrap_client
+            .abort_durable_setup_token(&aborted_token_id, "abort-setup-token")
+            .expect("abort setup token");
+        assert!(!aborted.active());
+        assert_eq!(aborted.token_id(), aborted_token_id);
+        let replayed_abort = bootstrap_client
+            .abort_durable_setup_token(&aborted_token_id, "abort-setup-token")
+            .expect("same-key abort replay returns the committed response");
+        assert!(!replayed_abort.active());
+        assert_eq!(replayed_abort.token_id(), aborted_token_id);
+
+        let conflicting_abort = bootstrap_client
+            .issue_durable_setup_token("issue-conflicting-abort-token")
+            .expect("issue another token for abort key binding");
+        let conflicting_abort_token_id = conflicting_abort.token_id().to_string();
+        let abort_key_error = bootstrap_client
+            .abort_durable_setup_token(&conflicting_abort_token_id, "abort-setup-token")
+            .expect_err("an abort key cannot be reused for another token");
+        assert!(matches!(
+            abort_key_error,
+            DaemonClientError::Api { status, error }
+                if status == StatusCode::CONFLICT
+                    && error.code() == ApiErrorCode::IdempotencyKeyConflict
+        ));
+        bootstrap_client
+            .abort_durable_setup_token(
+                &conflicting_abort_token_id,
+                "abort-conflicting-token-cleanup",
+            )
+            .expect("abort the second pending token with its own key");
+        bootstrap_client
+            .activate_durable_setup_token(&aborted_token_id, "activate-aborted-setup-token")
+            .expect_err("aborted setup token must not be activatable");
+        let aborted_client =
+            DaemonClient::loopback(first_address, aborted_token, first_identity.clone())
+                .expect("construct aborted client");
+        assert!(aborted_client.capabilities().is_err());
+
+        let issued_after = time::OffsetDateTime::now_utc();
+        let issuance = bootstrap_client
+            .issue_durable_setup_token("issue-durable-setup-token")
+            .expect("issue pending durable token");
+        let pending_expires_at = time::OffsetDateTime::parse(
+            issuance.pending_expires_at(),
+            &time::format_description::well_known::Rfc3339,
+        )
+        .expect("pending expiry is RFC3339 UTC");
+        assert!(pending_expires_at > issued_after);
+        assert!(
+            pending_expires_at <= issued_after + DURABLE_SETUP_PENDING_TTL + time::Duration::SECOND
+        );
+        let token_id = issuance.token_id().to_string();
+        let replayed_issuance = bootstrap_client
+            .issue_durable_setup_token("issue-durable-setup-token")
+            .expect("replay issuance with the same idempotency key");
+        assert_eq!(replayed_issuance.token_id(), token_id);
+        assert_eq!(
+            replayed_issuance.pending_expires_at(),
+            issuance.pending_expires_at()
+        );
+        assert!(
+            replayed_issuance.into_bearer_token().is_none(),
+            "an idempotent replay must never re-expose the one-time secret"
+        );
+        let raw_token = issuance
+            .into_bearer_token()
+            .expect("first durable issuance carries the secret");
+        let pending_token =
+            ApiBearerToken::parse(raw_token.as_str()).expect("parse pending durable token");
+        let first_durable_token =
+            ApiBearerToken::parse(raw_token.as_str()).expect("parse issued durable token");
+        let restart_durable_token =
+            ApiBearerToken::parse(raw_token.as_str()).expect("parse restart durable token");
+        let pending_client =
+            DaemonClient::loopback(first_address, pending_token, first_identity.clone())
+                .expect("construct pending client");
+        let pending_error = pending_client
+            .capabilities()
+            .expect_err("pending token must not authenticate");
+        assert!(matches!(
+            pending_error,
+            DaemonClientError::Api {
+                status: StatusCode::UNAUTHORIZED,
+                ..
+            }
+        ));
+        let activated = bootstrap_client
+            .activate_durable_setup_token(&token_id, "activate-durable-setup-token")
+            .expect("activate durable token");
+        assert!(activated.active());
+        assert_eq!(activated.token_id(), token_id);
+        let replayed_activation = bootstrap_client
+            .activate_durable_setup_token(&token_id, "activate-durable-setup-token")
+            .expect("same-key activation replay returns the committed response");
+        assert!(replayed_activation.active());
+        assert_eq!(replayed_activation.token_id(), token_id);
+
+        let conflicting_activation = bootstrap_client
+            .issue_durable_setup_token("issue-conflicting-activation-token")
+            .expect("issue another token for activation key binding");
+        let conflicting_activation_token_id = conflicting_activation.token_id().to_string();
+        let activation_key_error = bootstrap_client
+            .activate_durable_setup_token(
+                &conflicting_activation_token_id,
+                "activate-durable-setup-token",
+            )
+            .expect_err("an activation key cannot be reused for another token");
+        assert!(matches!(
+            activation_key_error,
+            DaemonClientError::Api { status, error }
+                if status == StatusCode::CONFLICT
+                    && error.code() == ApiErrorCode::IdempotencyKeyConflict
+        ));
+        bootstrap_client
+            .abort_durable_setup_token(
+                &conflicting_activation_token_id,
+                "abort-conflicting-activation-token",
+            )
+            .expect("abort the second pending token after the conflict");
+
+        let durable_client =
+            DaemonClient::loopback(first_address, first_durable_token, first_identity.clone())
+                .expect("construct durable client");
+        durable_client
+            .capabilities()
+            .expect("activated token authenticates");
+        let confirmation = durable_client
+            .confirm_durable_setup_token()
+            .expect("Host confirms setup provenance and exact scope");
+        assert_eq!(confirmation.token_id(), token_id);
+        assert!(confirmation.setup_active());
+        assert!(confirmation.control_scoped());
+        let ordinary_client = DaemonClient::loopback(
+            first_address,
+            ordinary_control_token,
+            first_identity.clone(),
+        )
+        .expect("construct ordinary control client");
+        let ordinary_error = ordinary_client
+            .confirm_durable_setup_token()
+            .expect_err("ordinary control token is not setup-issued");
+        assert!(matches!(
+            ordinary_error,
+            DaemonClientError::Api {
+                status: StatusCode::FORBIDDEN,
+                ..
+            }
+        ));
+        let error = durable_client
+            .issue_durable_setup_token("durable-principal-setup-attempt")
+            .expect_err("durable principal cannot mint another setup token");
+        assert!(matches!(
+            error,
+            DaemonClientError::Api {
+                status: StatusCode::FORBIDDEN,
+                ..
+            }
+        ));
+        restart_durable_token
+    })
+    .await
+    .expect("join bootstrap client operations");
+    server.shutdown().await.expect("stop bootstrap server");
+    drop(service);
+
+    let restarted_service = HostService::local_demo_for_tests_at(state.path())
+        .expect("construct restarted Host service");
+    let restarted_server = DaemonServer::bind(
+        restarted_service,
+        DaemonServerConfig::loopback(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))),
+    )
+    .await
+    .expect("bind restarted server");
+    let restarted_address = restarted_server.local_addr();
+    tokio::task::spawn_blocking(move || {
+        let restart_token_id = restart_durable_token.token_id().to_string();
+        let restarted_client =
+            DaemonClient::loopback(restarted_address, restart_durable_token, host_identity)
+                .expect("construct restarted durable client");
+        restarted_client
+            .capabilities()
+            .expect("durable token authenticates after restart");
+        let confirmation = restarted_client
+            .confirm_durable_setup_token()
+            .expect("setup provenance survives Host restart");
+        assert_eq!(confirmation.token_id(), restart_token_id);
+    })
+    .await
+    .expect("join restarted client operation");
+    restarted_server
+        .shutdown()
+        .await
+        .expect("stop restarted server");
+}
+
+#[tokio::test]
 async fn authenticated_https_is_served_by_a_non_loopback_tls_listener() {
     let state = TestStateDir::new().expect("temporary state directory");
     let service = HostService::local_demo_for_tests_at(state.path())
@@ -1568,6 +2011,94 @@ async fn second_daemon_reports_store_in_use_before_accepting_requests() {
         ErrorCode::StoreInUse
     );
     first_server.shutdown().await.expect("stop first daemon");
+}
+
+#[tokio::test]
+async fn shutdown_handle_releases_the_store_for_the_next_daemon() {
+    let state = TestStateDir::new().expect("temporary state directory");
+    let first_service =
+        HostService::local_demo_for_tests_at(state.path()).expect("construct first Host service");
+    let first_server = DaemonServer::bind(
+        first_service,
+        DaemonServerConfig::loopback(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))),
+    )
+    .await
+    .expect("bind first daemon");
+
+    first_server.shutdown_handle().request_shutdown();
+    first_server
+        .wait()
+        .await
+        .expect("graceful shutdown releases the store");
+
+    let second_service =
+        HostService::local_demo_for_tests_at(state.path()).expect("construct second Host service");
+    let second_server = DaemonServer::bind(
+        second_service,
+        DaemonServerConfig::loopback(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))),
+    )
+    .await
+    .expect("the next daemon acquires the released store");
+    second_server.shutdown().await.expect("stop second daemon");
+}
+
+#[tokio::test]
+async fn shutdown_handle_bounds_a_stalled_connection_and_releases_the_store() {
+    let state = TestStateDir::new().expect("temporary state directory");
+    let state_path = state.path().to_path_buf();
+    let (ready_sender, ready_receiver) = std::sync::mpsc::sync_channel(1);
+    let owner = std::thread::spawn(move || {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .expect("build owner runtime");
+        let service = HostService::local_demo_for_tests_at(&state_path)
+            .expect("construct first Host service");
+        let server = runtime
+            .block_on(DaemonServer::bind(
+                service,
+                DaemonServerConfig::loopback(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
+                    .with_shutdown_grace(Duration::from_millis(50)),
+            ))
+            .expect("bind first daemon");
+        ready_sender
+            .send((server.local_addr(), server.shutdown_handle()))
+            .expect("publish running daemon");
+        let error = runtime
+            .block_on(server.wait())
+            .expect_err("stalled connection exceeds the shutdown grace");
+        assert_eq!(error.code(), "shutdown-timeout");
+        // The CLI daemon owns one runtime for its process. Dropping that runtime
+        // contains any connection tasks Axum retained after bounded shutdown.
+        drop(runtime);
+    });
+    let (first_addr, shutdown) = ready_receiver
+        .recv_timeout(Duration::from_secs(2))
+        .expect("receive running daemon");
+    let mut stalled = TcpStream::connect(first_addr)
+        .await
+        .expect("open stalled connection");
+    stalled
+        .write_all(b"GET /v1/live HTTP/1.1\r\nHost: localhost\r\n")
+        .await
+        .expect("write incomplete request");
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    shutdown.request_shutdown();
+    tokio::task::spawn_blocking(move || owner.join())
+        .await
+        .expect("join owner task")
+        .expect("owner thread exits after bounded shutdown");
+
+    let second_service =
+        HostService::local_demo_for_tests_at(state.path()).expect("construct second Host service");
+    let second_server = DaemonServer::bind(
+        second_service,
+        DaemonServerConfig::loopback(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))),
+    )
+    .await
+    .expect("the next daemon acquires the boundedly released store");
+    second_server.shutdown().await.expect("stop second daemon");
 }
 
 #[tokio::test]
