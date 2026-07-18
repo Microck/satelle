@@ -2,11 +2,48 @@
 use super::RuntimeStartupState;
 use super::adapter::{AdapterSubject, RecoveryObservation};
 use super::{RuntimeEngine, model};
-use crate::storage::{RecoverySubject, StorageErrorKind};
+use crate::storage::{MaintenanceLeaseState, RecoverySubject, StorageErrorKind};
 use satelle_core::session::{TurnState, TurnTransition};
-use satelle_core::{ControlPlaneOperation, SatelleError, SessionId, TurnId};
+use satelle_core::{ControlPlaneOperation, ErrorCode, SatelleError, SessionId, TurnId};
 use std::collections::VecDeque;
 use std::sync::MutexGuard;
+
+#[derive(Debug)]
+pub(crate) struct VerifiedSetupPostconditions {
+    outcomes: Vec<VerifiedSetupPostcondition>,
+}
+
+#[derive(Debug)]
+struct VerifiedSetupPostcondition {
+    action_id: String,
+    satisfied: bool,
+}
+
+impl VerifiedSetupPostconditions {
+    pub(crate) fn outcome(&self, action_id: &str) -> Option<bool> {
+        self.outcomes
+            .iter()
+            .find(|outcome| outcome.action_id == action_id)
+            .map(|outcome| outcome.satisfied)
+    }
+}
+
+pub(crate) fn verify_setup_postconditions(
+    subject: &crate::storage::MaintenanceRecoverySubject,
+    observer: &mut dyn crate::SetupPostconditionObserver,
+) -> Result<VerifiedSetupPostconditions, SatelleError> {
+    let mut outcomes = Vec::new();
+    for action in subject.run().actions() {
+        if action.status() != crate::storage::SetupActionStatus::OutcomeUnknown {
+            continue;
+        }
+        outcomes.push(VerifiedSetupPostcondition {
+            action_id: action.action_id().to_string(),
+            satisfied: observer.observe(action)?,
+        });
+    }
+    Ok(VerifiedSetupPostconditions { outcomes })
+}
 
 impl RuntimeEngine {
     pub(super) fn preserve_unknown_execution(
@@ -123,13 +160,46 @@ impl RuntimeEngine {
     }
 
     pub(super) fn reconcile_before_admission(&self) -> Result<(), SatelleError> {
-        if self.reconcile_pending()? {
-            return Ok(());
+        if !self.reconcile_pending()? {
+            let subject = self
+                .first_recovery_subject()?
+                .ok_or_else(|| model::integrity_failure("unresolved recovery has no subject"))?;
+            return Err(model::recovery_host_busy(&subject));
         }
-        let subject = self
-            .first_recovery_subject()?
-            .ok_or_else(|| model::integrity_failure("unresolved recovery has no subject"))?;
-        Err(model::recovery_host_busy(&subject))
+        let maintenance = self
+            .lock_storage()?
+            .maintenance_lease_state()
+            .map_err(model::storage_failure)?;
+        match maintenance {
+            Some(MaintenanceLeaseState::Active { operation_id }) => {
+                Err(maintenance_host_busy(&operation_id, false))
+            }
+            Some(MaintenanceLeaseState::RecoveryPending(subject)) => {
+                Err(maintenance_host_busy(subject.operation_id(), true))
+            }
+            None => Ok(()),
+        }
+    }
+
+    pub(super) fn reconcile_maintenance(
+        &self,
+        observer: &mut dyn crate::SetupPostconditionObserver,
+    ) -> Result<Option<crate::storage::SetupRunStatus>, SatelleError> {
+        let subject = match self
+            .lock_storage()?
+            .maintenance_lease_state()
+            .map_err(model::storage_failure)?
+        {
+            Some(MaintenanceLeaseState::RecoveryPending(subject)) => subject,
+            Some(MaintenanceLeaseState::Active { operation_id }) => {
+                return Err(maintenance_host_busy(&operation_id, false));
+            }
+            None => return Ok(None),
+        };
+        let verified = verify_setup_postconditions(&subject, observer)?;
+        self.lock_storage()?
+            .reconcile_maintenance_after_restart(&subject, &verified)
+            .map_err(model::storage_failure)
     }
 
     fn claim_recovery_subject(&self) -> Result<Option<RecoverySubject>, SatelleError> {
@@ -261,7 +331,11 @@ impl RuntimeEngine {
 
     #[cfg(test)]
     pub(super) fn startup_state(&self) -> Result<RuntimeStartupState, SatelleError> {
-        if self.first_recovery_subject()?.is_some() {
+        let maintenance = self
+            .lock_storage()?
+            .maintenance_lease_state()
+            .map_err(model::storage_failure)?;
+        if self.first_recovery_subject()?.is_some() || maintenance.is_some() {
             Ok(RuntimeStartupState::RecoveryRequired)
         } else {
             Ok(RuntimeStartupState::Ready)
@@ -272,6 +346,38 @@ impl RuntimeEngine {
         self.recovery.lock().map_err(|_| {
             model::integrity_failure("the runtime recovery lock was poisoned by a failed operation")
         })
+    }
+}
+
+fn maintenance_host_busy(operation_id: &str, recovery_pending: bool) -> SatelleError {
+    let mut details = std::collections::BTreeMap::new();
+    details.insert(
+        "reason".to_string(),
+        serde_json::Value::String(if recovery_pending {
+            "outcome_unknown".to_string()
+        } else {
+            "maintenance_in_progress".to_string()
+        }),
+    );
+    details.insert(
+        "ownership".to_string(),
+        serde_json::Value::String(if recovery_pending {
+            "recovery_pending".to_string()
+        } else {
+            "active".to_string()
+        }),
+    );
+    details.insert("retryable".to_string(), serde_json::Value::Bool(true));
+    details.insert(
+        "operation_id".to_string(),
+        serde_json::Value::String(operation_id.to_string()),
+    );
+    SatelleError {
+        code: ErrorCode::HostBusy,
+        message: "Host maintenance ownership blocks conflicting admission".to_string(),
+        recovery_command: None,
+        source_detail: None,
+        details,
     }
 }
 

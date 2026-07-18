@@ -27,6 +27,9 @@ use self::open::DATABASE_FILE_NAME;
 #[cfg(all(test, unix))]
 use self::open::LOCK_FILE_NAME;
 use self::open::{PROTECTED_FILE_NAMES, sqlite_error};
+pub(crate) use self::setup_ledger::{
+    MaintenanceLeaseCapability, MaintenanceLeaseState, MaintenanceRecoverySubject,
+};
 pub use self::setup_ledger::{
     SetupActionPlan, SetupActionRecord, SetupActionSkipReason, SetupActionStatus,
     SetupOperationKind, SetupRepairAction, SetupRepairDecision, SetupRepairPlan,
@@ -165,6 +168,10 @@ impl StorageError {
         self.kind
     }
 
+    pub(crate) fn state_conflict() -> Self {
+        Self::new(StorageErrorKind::StateConflict)
+    }
+
     #[cfg(test)]
     pub(crate) fn for_test(kind: StorageErrorKind) -> Self {
         Self::new(kind)
@@ -265,6 +272,10 @@ impl LeaseOwner {
             acquired_at,
         })
     }
+
+    pub(crate) fn operation_id(&self) -> &str {
+        &self.operation_id
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -343,6 +354,10 @@ impl AdmissionContext {
             idempotency,
             request_token,
         }
+    }
+
+    pub(crate) fn lease_owner(&self) -> &LeaseOwner {
+        &self.lease_owner
     }
 
     #[cfg(test)]

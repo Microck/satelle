@@ -589,6 +589,14 @@ fn stop_winning_before_running_skips_adapter_execution_and_returns_stopped() {
     else {
         panic!("new admission must execute");
     };
+    runtime
+        .stop(StopCommand::new(session_id))
+        .expect("stop should terminalize the Starting Turn");
+    let heartbeat = super::super::worker::LeaseHeartbeatGuard::start(
+        Arc::clone(&engine.storage),
+        context.lease_owner(),
+    )
+    .expect("start the admitted Turn heartbeat");
     let plan = super::super::worker::ExecutionPlan {
         host: LOCAL_DEMO_HOST.to_string(),
         prompt: "PRIVATE_STOP_BEFORE_RUNNING".to_string(),
@@ -596,13 +604,10 @@ fn stop_winning_before_running_skips_adapter_execution_and_returns_stopped() {
         work: super::super::worker::TurnWork {
             session,
             subject: recovery_subject,
+            _heartbeat: heartbeat,
         },
         provider_smoke_event: None,
     };
-
-    runtime
-        .stop(StopCommand::new(session_id))
-        .expect("stop should terminalize the Starting Turn");
     let outcome = engine
         .execute(plan)
         .expect("the execution path should return the durable stop winner");

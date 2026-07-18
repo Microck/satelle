@@ -1,8 +1,10 @@
 use super::codec::unix_timestamp_nanos;
 use super::{
-    LeaseOwner, ObservedUpstreamRef, PrivateUpstreamRef, ProbeRecoverySubject, ReadinessProbeKind,
-    ReadinessProbeTerminal, Storage, StorageError, StorageErrorKind,
+    LeaseOwner, MaintenanceLeaseCapability, MaintenanceLeaseState, MaintenanceRecoverySubject,
+    ObservedUpstreamRef, PrivateUpstreamRef, ProbeRecoverySubject, ReadinessProbeKind,
+    ReadinessProbeTerminal, SetupRunStatus, Storage, StorageError, StorageErrorKind,
 };
+use crate::runtime::VerifiedMaintenancePostcheck;
 use crate::{
     ProviderSmokeEvidence, ProviderSmokeFailureEvidence, ProviderSmokeResult, ProviderSmokeSource,
     ReadinessCacheKey, ReadinessEvidence,
@@ -11,6 +13,496 @@ use rusqlite::{OptionalExtension, TransactionBehavior, params};
 use satelle_core::session::{DesktopBindingRef, ExecutionPolicy};
 
 impl Storage {
+    pub(crate) fn maintenance_lease_state(
+        &self,
+    ) -> Result<Option<MaintenanceLeaseState>, StorageError> {
+        let lease = self
+            .connection
+            .query_row(
+                "SELECT operation_id, owner_process_id, owner_process_start_ref,
+                        owner_boot_identity_ref, acquired_at, lease_state,
+                        EXISTS(
+                            SELECT 1 FROM control_leases
+                            WHERE control_leases.operation_id = maintenance_leases.operation_id
+                              AND control_leases.lease_state = maintenance_leases.lease_state
+                        )
+                 FROM maintenance_leases LIMIT 1",
+                [],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, String>(4)?,
+                        row.get::<_, String>(5)?,
+                        row.get::<_, bool>(6)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(operation_failed)?;
+        let Some((
+            operation_id,
+            process_id,
+            process_start,
+            boot_identity,
+            acquired_at,
+            state,
+            has_postcheck,
+        )) = lease
+        else {
+            return Ok(None);
+        };
+        if state == "active" {
+            return Ok(Some(MaintenanceLeaseState::Active { operation_id }));
+        }
+        if state != "recovery_pending" {
+            return Err(StorageError::new(StorageErrorKind::InvalidStoredState));
+        }
+        let process_id = u32::try_from(process_id)
+            .map_err(|_| StorageError::new(StorageErrorKind::InvalidStoredState))?;
+        let owner = LeaseOwner::new(
+            operation_id.clone(),
+            process_id,
+            process_start,
+            boot_identity,
+            super::codec::parse_time(&acquired_at)?,
+        )?;
+        let run = self
+            .load_setup_run(&operation_id)?
+            .ok_or_else(|| StorageError::new(StorageErrorKind::InvalidStoredState))?;
+        if run.status() != SetupRunStatus::OutcomeUnknown {
+            return Err(StorageError::new(StorageErrorKind::InvalidStoredState));
+        }
+        Ok(Some(MaintenanceLeaseState::RecoveryPending(
+            MaintenanceRecoverySubject::new(owner, run, has_postcheck),
+        )))
+    }
+
+    /// Retains maintenance ownership while atomically adding the same
+    /// operation's native-readiness Control sublease. The current schema's
+    /// native-probe discriminator is the canonical postcheck representation;
+    /// the shared operation id is what distinguishes it from an ordinary
+    /// standalone probe.
+    pub(crate) fn begin_maintenance_postcheck(
+        &mut self,
+        key: &ReadinessCacheKey,
+        native_probe_ref: &str,
+        postcheck_action_id: &str,
+        capability: &MaintenanceLeaseCapability,
+    ) -> Result<(), StorageError> {
+        let owner = capability.lease_owner();
+        let host_identity = self.host_identity()?;
+        let native_probe_ref = PrivateUpstreamRef::new(native_probe_ref.to_string())?;
+        let postcheck_action_id =
+            super::codec::validated_private_reference(postcheck_action_id.to_string())?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(operation_failed)?;
+        let owns_maintenance: i64 = transaction
+            .query_row(
+                "SELECT EXISTS(
+                    SELECT 1 FROM maintenance_leases
+                    WHERE host_identity_ref = ?1
+                      AND operation_id = ?2
+                      AND owner_process_id = ?3
+                      AND owner_process_start_ref = ?4
+                      AND owner_boot_identity_ref = ?5
+                      AND acquired_at = ?6
+                      AND lease_state = 'active'
+                 )",
+                params![
+                    host_identity.as_str(),
+                    owner.operation_id.as_str(),
+                    i64::from(owner.process_id),
+                    owner.process_start_ref.as_str(),
+                    owner.boot_identity_ref.as_str(),
+                    super::codec::format_time(owner.acquired_at)?,
+                ],
+                |row| row.get(0),
+            )
+            .map_err(operation_failed)?;
+        if owns_maintenance == 0 {
+            return Err(StorageError::new(StorageErrorKind::LeaseConflict));
+        }
+        let action_started: i64 = transaction
+            .query_row(
+                "SELECT EXISTS(
+                    SELECT 1 FROM setup_actions
+                    JOIN setup_runs USING (run_id)
+                    WHERE setup_actions.run_id = ?1
+                      AND setup_actions.action_id = ?2
+                      AND setup_actions.status = 'started'
+                      AND setup_runs.status = 'running'
+                 )",
+                params![owner.operation_id.as_str(), postcheck_action_id],
+                |row| row.get(0),
+            )
+            .map_err(operation_failed)?;
+        if action_started == 0 {
+            return Err(StorageError::new(StorageErrorKind::StateConflict));
+        }
+        let control_exists: i64 = transaction
+            .query_row(
+                "SELECT EXISTS(
+                    SELECT 1 FROM control_leases WHERE host_identity_ref = ?1
+                 )",
+                [host_identity.as_str()],
+                |row| row.get(0),
+            )
+            .map_err(operation_failed)?;
+        if control_exists != 0 {
+            return Err(StorageError::new(StorageErrorKind::LeaseConflict));
+        }
+        transaction
+            .execute(
+                "INSERT INTO control_leases (
+                    host_identity_ref, desktop_binding_ref, operation_id,
+                    owner_process_id, owner_process_start_ref, owner_boot_identity_ref,
+                    acquired_at, heartbeat_at, lease_state, owner_kind, native_probe_ref
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7, 'active',
+                           'native_probe', ?8)",
+                params![
+                    host_identity.as_str(),
+                    key.desktop_binding().as_str(),
+                    owner.operation_id.as_str(),
+                    i64::from(owner.process_id),
+                    owner.process_start_ref.as_str(),
+                    owner.boot_identity_ref.as_str(),
+                    super::codec::format_time(owner.acquired_at)?,
+                    native_probe_ref.as_str(),
+                ],
+            )
+            .map_err(|source| super::sqlite_error(StorageErrorKind::LeaseConflict, source))?;
+        transaction.commit().map_err(operation_failed)
+    }
+
+    /// Refreshes only the exact live operation represented by `owner`.
+    /// Recovery ownership is deliberately excluded: a heartbeat is evidence
+    /// that this operation guard is live, not merely that its process exists.
+    pub(crate) fn refresh_lease_heartbeat(
+        &mut self,
+        owner: &LeaseOwner,
+        heartbeat_at: time::OffsetDateTime,
+    ) -> Result<usize, StorageError> {
+        let heartbeat_at = super::codec::format_time(heartbeat_at)?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(operation_failed)?;
+        let mut changed = 0;
+        for table in ["control_leases", "maintenance_leases"] {
+            let sql = format!(
+                "UPDATE {table}
+                 SET heartbeat_at = ?6
+                 WHERE operation_id = ?1
+                   AND owner_process_id = ?2
+                   AND owner_process_start_ref = ?3
+                   AND owner_boot_identity_ref = ?4
+                   AND acquired_at = ?5
+                   AND lease_state = 'active'"
+            );
+            changed += transaction
+                .execute(
+                    &sql,
+                    params![
+                        owner.operation_id.as_str(),
+                        i64::from(owner.process_id),
+                        owner.process_start_ref.as_str(),
+                        owner.boot_identity_ref.as_str(),
+                        super::codec::format_time(owner.acquired_at)?,
+                        heartbeat_at,
+                    ],
+                )
+                .map_err(operation_failed)?;
+        }
+        transaction.commit().map_err(operation_failed)?;
+        Ok(changed)
+    }
+
+    /// Stops treating a lost operation as live without releasing ownership.
+    /// Both members of a maintenance/postcheck pair move together when present.
+    pub(crate) fn retain_lease_recovery(&mut self, owner: &LeaseOwner) -> Result<(), StorageError> {
+        let acquired_at = super::codec::format_time(owner.acquired_at)?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(operation_failed)?;
+        let expected_control: i64 = transaction
+            .query_row(
+                "SELECT count(*)
+                 FROM control_leases
+                 WHERE host_identity_ref = (
+                    SELECT host_identity_ref
+                    FROM maintenance_leases
+                    WHERE operation_id = ?1
+                 )",
+                [owner.operation_id.as_str()],
+                |row| row.get(0),
+            )
+            .map_err(operation_failed)?;
+        let expected_control = match expected_control {
+            0 => 0,
+            1 => 1,
+            _ => return Err(StorageError::new(StorageErrorKind::InvalidStoredState)),
+        };
+        let running_setup: i64 = transaction
+            .query_row(
+                "SELECT EXISTS(
+                    SELECT 1 FROM setup_runs
+                    WHERE run_id = ?1 AND status = 'running'
+                 )",
+                [owner.operation_id.as_str()],
+                |row| row.get(0),
+            )
+            .map_err(operation_failed)?;
+        if running_setup == 1 {
+            super::setup_ledger::mark_setup_run_outcome_unknown_in_transaction(
+                &transaction,
+                owner.operation_id(),
+                time::OffsetDateTime::now_utc(),
+            )?;
+        }
+        let mut changed = [0; 2];
+        for (index, table) in ["control_leases", "maintenance_leases"]
+            .into_iter()
+            .enumerate()
+        {
+            let sql = format!(
+                "UPDATE {table}
+                 SET lease_state = 'recovery_pending'
+                 WHERE operation_id = ?1
+                   AND owner_process_id = ?2
+                   AND owner_process_start_ref = ?3
+                   AND owner_boot_identity_ref = ?4
+                   AND acquired_at = ?5
+                   AND lease_state = 'active'"
+            );
+            changed[index] = transaction
+                .execute(
+                    &sql,
+                    params![
+                        owner.operation_id.as_str(),
+                        i64::from(owner.process_id),
+                        owner.process_start_ref.as_str(),
+                        owner.boot_identity_ref.as_str(),
+                        acquired_at,
+                    ],
+                )
+                .map_err(operation_failed)?;
+        }
+        let [control_changed, maintenance_changed] = changed;
+        if maintenance_changed != 1 || control_changed != expected_control {
+            return Err(StorageError::new(StorageErrorKind::StateConflict));
+        }
+        transaction.commit().map_err(operation_failed)
+    }
+
+    /// Commits a known postcheck result with the terminal setup ledger state
+    /// and both releases. Unknown evidence records recovery state but retains
+    /// both leases for explicit postcondition reconciliation.
+    pub(crate) fn finish_maintenance_postcheck(
+        &mut self,
+        capability: &MaintenanceLeaseCapability,
+        native_probe_ref: &str,
+        postcheck_action_id: &str,
+        key: &ReadinessCacheKey,
+        verified: &VerifiedMaintenancePostcheck,
+    ) -> Result<Option<SetupRunStatus>, StorageError> {
+        let owner = capability.lease_owner();
+        let native_probe_ref = PrivateUpstreamRef::new(native_probe_ref.to_string())?;
+        let postcheck_action_id =
+            super::codec::validated_private_reference(postcheck_action_id.to_string())?;
+        let host_identity = self.host_identity()?;
+        let acquired_at = super::codec::format_time(owner.acquired_at)?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(operation_failed)?;
+        let finished_at = time::OffsetDateTime::now_utc();
+        let owns_pair: i64 = transaction
+            .query_row(
+                "SELECT EXISTS(
+                    SELECT 1
+                    FROM maintenance_leases AS maintenance
+                    JOIN control_leases AS control USING (host_identity_ref)
+                    WHERE maintenance.host_identity_ref = ?1
+                      AND maintenance.operation_id = ?2
+                      AND maintenance.owner_process_id = ?4
+                      AND maintenance.owner_process_start_ref = ?5
+                      AND maintenance.owner_boot_identity_ref = ?6
+                      AND maintenance.acquired_at = ?7
+                      AND maintenance.lease_state = 'active'
+                      AND control.operation_id = ?2
+                      AND control.owner_process_id = ?4
+                      AND control.owner_process_start_ref = ?5
+                      AND control.owner_boot_identity_ref = ?6
+                      AND control.acquired_at = ?7
+                      AND control.owner_kind = 'native_probe'
+                      AND control.native_probe_ref = ?3
+                      AND control.lease_state = 'active'
+                 )",
+                params![
+                    host_identity.as_str(),
+                    owner.operation_id.as_str(),
+                    native_probe_ref.as_str(),
+                    i64::from(owner.process_id),
+                    owner.process_start_ref.as_str(),
+                    owner.boot_identity_ref.as_str(),
+                    acquired_at,
+                ],
+                |row| row.get(0),
+            )
+            .map_err(operation_failed)?;
+        if owns_pair == 0 {
+            return Err(StorageError::new(StorageErrorKind::LeaseConflict));
+        }
+        let (readiness_status, failure_reason) = match verified.terminal() {
+            None => (Some("passed"), None),
+            Some(ReadinessProbeTerminal::Failed) => (Some("failed"), verified.failure_reason()),
+            Some(ReadinessProbeTerminal::TimedOut) => {
+                (Some("timed_out"), verified.failure_reason())
+            }
+            Some(ReadinessProbeTerminal::OutcomeUnknown) => (None, None),
+        };
+        let (action_status, action_error_code, action_recovery_hint) = match verified.terminal() {
+            None => ("completed", None, None),
+            Some(ReadinessProbeTerminal::Failed) => (
+                "failed",
+                Some("maintenance_postcheck_failed"),
+                Some("inspect readiness before retrying maintenance"),
+            ),
+            Some(ReadinessProbeTerminal::TimedOut) => (
+                "failed",
+                Some("maintenance_postcheck_timed_out"),
+                Some("confirm the readiness probe stopped before retrying maintenance"),
+            ),
+            Some(ReadinessProbeTerminal::OutcomeUnknown) => (
+                "outcome_unknown",
+                None,
+                Some("inspect live postconditions before retrying this action"),
+            ),
+        };
+        require_idempotent_write(
+            transaction
+                .execute(
+                    "UPDATE setup_actions
+                     SET status = ?3, finished_at = ?4, error_code = ?5,
+                         recovery_hint = ?6
+                     WHERE run_id = ?1 AND action_id = ?2 AND status = 'started'
+                       AND EXISTS (
+                           SELECT 1 FROM setup_runs
+                           WHERE setup_runs.run_id = setup_actions.run_id
+                             AND setup_runs.status = 'running'
+                       )",
+                    params![
+                        owner.operation_id.as_str(),
+                        postcheck_action_id,
+                        action_status,
+                        super::codec::format_time(finished_at)?,
+                        action_error_code,
+                        action_recovery_hint,
+                    ],
+                )
+                .map_err(operation_failed)?,
+        )?;
+        if let (Some(readiness_status), Some(evidence)) = (readiness_status, verified.evidence()) {
+            insert_readiness(
+                &transaction,
+                host_identity.as_str(),
+                key.adapter(),
+                key.desktop_binding(),
+                evidence,
+                readiness_status,
+                failure_reason,
+            )?;
+        } else if !verified.is_unknown() {
+            return Err(StorageError::new(StorageErrorKind::InvalidStoredState));
+        }
+        if verified.is_unknown() {
+            super::setup_ledger::mark_setup_run_outcome_unknown_in_transaction(
+                &transaction,
+                owner.operation_id(),
+                finished_at,
+            )?;
+            for table in ["control_leases", "maintenance_leases"] {
+                let sql = format!(
+                    "UPDATE {table} SET lease_state = 'recovery_pending'
+                     WHERE operation_id = ?1
+                       AND owner_process_id = ?2
+                       AND owner_process_start_ref = ?3
+                       AND owner_boot_identity_ref = ?4
+                       AND acquired_at = ?5
+                       AND lease_state = 'active'"
+                );
+                require_idempotent_write(
+                    transaction
+                        .execute(
+                            &sql,
+                            params![
+                                owner.operation_id.as_str(),
+                                i64::from(owner.process_id),
+                                owner.process_start_ref.as_str(),
+                                owner.boot_identity_ref.as_str(),
+                                acquired_at,
+                            ],
+                        )
+                        .map_err(operation_failed)?,
+                )?;
+            }
+            transaction.commit().map_err(operation_failed)?;
+            return Ok(None);
+        }
+        let status = super::setup_ledger::finish_setup_run_in_transaction(
+            &transaction,
+            owner.operation_id(),
+            finished_at,
+        )?;
+        let exact_owner = params![
+            host_identity.as_str(),
+            owner.operation_id.as_str(),
+            native_probe_ref.as_str(),
+            i64::from(owner.process_id),
+            owner.process_start_ref.as_str(),
+            owner.boot_identity_ref.as_str(),
+            acquired_at,
+        ];
+        let released_control = transaction
+            .execute(
+                "DELETE FROM control_leases
+                 WHERE host_identity_ref = ?1 AND operation_id = ?2
+                   AND owner_kind = 'native_probe' AND native_probe_ref = ?3
+                   AND owner_process_id = ?4 AND owner_process_start_ref = ?5
+                   AND owner_boot_identity_ref = ?6 AND acquired_at = ?7
+                   AND lease_state = 'active'",
+                exact_owner,
+            )
+            .map_err(operation_failed)?;
+        require_idempotent_write(released_control)?;
+        let released_maintenance = transaction
+            .execute(
+                "DELETE FROM maintenance_leases
+                 WHERE host_identity_ref = ?1 AND operation_id = ?2
+                   AND owner_process_id = ?3 AND owner_process_start_ref = ?4
+                   AND owner_boot_identity_ref = ?5 AND acquired_at = ?6
+                   AND lease_state = 'active'",
+                params![
+                    host_identity.as_str(),
+                    owner.operation_id.as_str(),
+                    i64::from(owner.process_id),
+                    owner.process_start_ref.as_str(),
+                    owner.boot_identity_ref.as_str(),
+                    acquired_at,
+                ],
+            )
+            .map_err(operation_failed)?;
+        require_idempotent_write(released_maintenance)?;
+        transaction.commit().map_err(operation_failed)?;
+        Ok(Some(status))
+    }
+
     pub(crate) fn begin_native_probe(
         &mut self,
         key: &ReadinessCacheKey,
@@ -223,7 +715,12 @@ impl Storage {
                 "DELETE FROM control_leases
                  WHERE owner_kind = 'native_probe'
                    AND lease_state = 'recovery_pending'
-                   AND native_probe_ref = ?1",
+                   AND native_probe_ref = ?1
+                   AND NOT EXISTS (
+                       SELECT 1 FROM maintenance_leases
+                       WHERE maintenance_leases.host_identity_ref = control_leases.host_identity_ref
+                         AND maintenance_leases.operation_id = control_leases.operation_id
+                   )",
                 [native_probe_ref],
             )
             .map_err(operation_failed)?;
@@ -676,8 +1173,8 @@ fn insert_readiness(
     adapter: &str,
     desktop_binding: &DesktopBindingRef,
     evidence: &ReadinessEvidence,
-    status: &'static str,
-    failure_reason: Option<&'static str>,
+    status: &str,
+    failure_reason: Option<&str>,
 ) -> Result<(), StorageError> {
     connection
         .execute(

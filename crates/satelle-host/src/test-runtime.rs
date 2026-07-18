@@ -18,6 +18,9 @@ use satelle_core::{
 use serde_json::{Value, json};
 use time::OffsetDateTime;
 
+pub const DETACHED_EXECUTION_TRACE_MARKER: &str =
+    "satelle_host.local_test_adapter.detached_execution";
+
 impl HostService {
     pub(super) fn fake_doctor(
         &self,
@@ -65,12 +68,15 @@ impl HostService {
 #[derive(Clone, Debug)]
 pub(super) struct FakeComputerUseAdapter;
 
+#[cfg(feature = "test-support")]
 #[derive(Clone, Debug)]
 pub(super) struct PendingComputerUseAdapter;
 
+#[cfg(feature = "test-support")]
 #[derive(Clone, Debug)]
 pub(super) struct FailingComputerUseAdapter;
 
+#[cfg(feature = "test-support")]
 impl ComputerUseAdapter for FailingComputerUseAdapter {
     fn preflight(
         &self,
@@ -96,6 +102,7 @@ impl ComputerUseAdapter for FailingComputerUseAdapter {
     }
 }
 
+#[cfg(feature = "test-support")]
 impl ComputerUseAdapter for PendingComputerUseAdapter {
     fn preflight(
         &self,
@@ -188,6 +195,10 @@ impl ComputerUseAdapter for FakeComputerUseAdapter {
         {
             return Err(adapter_configuration_error("admitted work identity"));
         }
+        tracing::info!(
+            marker = DETACHED_EXECUTION_TRACE_MARKER,
+            "local test adapter detached execution marker"
+        );
         let _private_prompt = request.prompt();
         Ok(ExecuteResult::new(
             TurnTransition::Completed,
