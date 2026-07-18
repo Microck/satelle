@@ -32,7 +32,9 @@ fn unknown_commands_default_to_typed_human_errors() {
 
     assert!(output.stdout.is_empty());
     assert_human_error(&output.stderr, "invalid-usage");
-    assert!(String::from_utf8_lossy(&output.stderr).contains("unknown-command"));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.starts_with("error: Command input was not accepted.\n"));
+    assert!(stderr.contains("unknown-command"));
 }
 
 #[test]

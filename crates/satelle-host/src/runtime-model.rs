@@ -305,7 +305,7 @@ mod storage_failure_tests {
 
         assert_eq!(error.code, ErrorCode::StoreInUse);
         assert_eq!(error.code.as_str(), "store-in-use");
-        assert_eq!(error.exit_code(), 69);
+        assert_eq!(error.exit_code(), 74);
         assert!(!error.message.contains("SQLite"));
         assert!(error.source_detail.is_none());
     }

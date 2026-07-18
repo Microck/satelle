@@ -2233,7 +2233,7 @@ adapter = "codex"
                 .env("SATELLE_STATE_DIR", sandbox.path())
                 .args(["setup", "--yes", "--host", "local-demo", "--json"])
                 .assert()
-                .code(78)
+                .code(70)
                 .get_output()
                 .clone()
         },
@@ -2513,7 +2513,7 @@ fn host_update_valid_selections_fail_truthfully_without_mutating_state() {
             .env("SATELLE_STATE_DIR", state.path())
             .args(args)
             .assert()
-            .code(78)
+            .code(70)
             .get_output()
             .clone();
         assert!(output.stdout.is_empty());

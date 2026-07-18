@@ -2132,7 +2132,6 @@ impl ErrorCode {
             | Self::DoctorRefreshScopeRequired
             | Self::DoctorRefreshTimeoutWithoutRefresh => 64,
             Self::CompletionInstallFailed | Self::CompletionProfileUpdateFailed => 73,
-            Self::StorageIntegrityFailed => 65,
             Self::ConfigError
             | Self::ConfigNotFound
             | Self::UnknownConfigKey
@@ -2160,29 +2159,31 @@ impl ErrorCode {
             | Self::HostNotFound
             | Self::SessionNotFound
             | Self::LogsCursorExpired => 66,
-            Self::CapacityExceeded
-            | Self::HostUnreachable
-            | Self::DirectDaemonUnreachable
-            | Self::HostBusy
-            | Self::StoreInUse => 69,
+            Self::HostUnreachable | Self::DirectDaemonUnreachable => 69,
             Self::CertificateUntrusted
             | Self::CertificateHostnameMismatch
             | Self::CertificateExpired
             | Self::TlsVersionUnsupported
             | Self::TlsHandshakeFailed
-            | Self::SshHostKeyVerificationRequired => 76,
-            Self::AuthenticationFailed
+            | Self::SshHostKeyVerificationRequired
+            | Self::AuthenticationFailed
             | Self::AuthorizationInsufficientScope
-            | Self::HostIdentityMismatch => 77,
-            Self::RemoteExecution | Self::StorageBusy | Self::StopNotConfirmed => 74,
-            Self::IncompatibleControlPlane
+            | Self::HostIdentityMismatch
+            | Self::StoreInUse
+            | Self::RemoteExecution
+            | Self::StorageBusy
+            | Self::StorageIntegrityFailed => 74,
+            Self::CapacityExceeded
+            | Self::HostBusy
+            | Self::IncompatibleControlPlane
             | Self::ComputerUseNotReady
             | Self::NativeReadinessTimeout
             | Self::ProviderSmokeTestTimeout
             | Self::UnsupportedProviderComputerUse
             | Self::DoctorReadinessBlockersFound
-            | Self::StateConflict => 75,
-            Self::NotImplemented => 78,
+            | Self::StateConflict
+            | Self::StopNotConfirmed => 75,
+            Self::NotImplemented => 70,
         }
     }
 }
@@ -3185,12 +3186,48 @@ mod error_contract_tests {
     fn ssh_host_key_verification_required_is_a_typed_transport_failure() {
         let error = SatelleError::ssh_host_key_verification_required("remote");
         assert_eq!(error.code.as_str(), "ssh-host-key-verification-required");
-        assert_eq!(error.exit_code(), 76);
+        assert_eq!(error.exit_code(), 74);
         assert_eq!(
             error.details.get("host"),
             Some(&serde_json::json!("remote"))
         );
         assert_eq!(error.source_detail, None);
+    }
+
+    #[test]
+    fn canonical_broad_exit_classes_cover_security_storage_and_internal_errors() {
+        for (code, expected) in [
+            (ErrorCode::InvalidUsage, 64),
+            (ErrorCode::ConfigError, 66),
+            (ErrorCode::HostUnreachable, 69),
+            (ErrorCode::NotImplemented, 70),
+            (ErrorCode::CompletionInstallFailed, 73),
+            (ErrorCode::RemoteExecution, 74),
+            (ErrorCode::StorageIntegrityFailed, 74),
+            (ErrorCode::SshHostKeyVerificationRequired, 74),
+            (ErrorCode::CertificateUntrusted, 74),
+            (ErrorCode::CertificateHostnameMismatch, 74),
+            (ErrorCode::CertificateExpired, 74),
+            (ErrorCode::TlsVersionUnsupported, 74),
+            (ErrorCode::TlsHandshakeFailed, 74),
+            (ErrorCode::AuthenticationFailed, 74),
+            (ErrorCode::AuthorizationInsufficientScope, 74),
+            (ErrorCode::HostIdentityMismatch, 74),
+            (ErrorCode::ComputerUseNotReady, 75),
+            (ErrorCode::CapacityExceeded, 75),
+            (ErrorCode::HostBusy, 75),
+            (ErrorCode::StateConflict, 75),
+            (ErrorCode::StopNotConfirmed, 75),
+            (ErrorCode::StoreInUse, 74),
+            (ErrorCode::StorageBusy, 74),
+        ] {
+            assert_eq!(
+                code.exit_code(),
+                expected,
+                "unexpected broad exit class for {}",
+                code.as_str()
+            );
+        }
     }
 
     #[test]

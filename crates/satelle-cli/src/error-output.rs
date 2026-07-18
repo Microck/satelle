@@ -39,6 +39,14 @@ enum ErrorCategory {
     Internal,
 }
 
+#[derive(Clone, Copy)]
+struct ErrorContract {
+    category: ErrorCategory,
+    retryable: bool,
+    outcome: &'static str,
+    default_recovery: &'static str,
+}
+
 impl ErrorCategory {
     const ALL: [Self; 12] = [
         Self::Authentication,
@@ -89,7 +97,7 @@ pub(crate) fn parser_error(error: &clap::Error) -> SatelleError {
     SatelleError::invalid_usage(error.render().to_string())
 }
 
-/// Converts the shared typed error contract into the CLI process boundary exactly once.
+/// Converts the core error classification into the CLI process boundary exactly once.
 pub(crate) fn process_exit_code(error: &SatelleError) -> ExitCode {
     ExitCode::from(error.exit_code() as u8)
 }
@@ -102,17 +110,39 @@ pub(crate) fn print_error(error: &SatelleError, format: ErrorFormat) {
             eprintln!("{raw}");
         }
         ErrorFormat::Human => {
-            eprintln!("error: {}", error.code.as_str());
-            eprintln!("{}", error.message);
-            if let Some(command) = &error.recovery_command {
-                eprintln!("next: {command}");
-            }
+            eprintln!("{}", human_error(error));
         }
     }
 }
 
+fn human_error(error: &SatelleError) -> String {
+    let contract = error_contract(error.code);
+    // Parser errors can contain a full multi-line Clap report. Human framing keeps the cause on
+    // one line so the outcome, cause, preserved state, and recovery step remain scannable.
+    let cause = error
+        .message
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ");
+    let recovery = error
+        .recovery_command
+        .as_deref()
+        .unwrap_or(contract.default_recovery);
+    let mut lines = vec![
+        format!("error: {}", contract.outcome),
+        format!("cause: {cause} [{}]", error.code.as_str()),
+    ];
+    if error.details.get("mutated") == Some(&Value::Bool(false)) {
+        lines.push("state: No changes were applied.".to_string());
+    }
+    lines.push(format!("next: {recovery}"));
+    lines.join("\n")
+}
+
 pub(crate) fn error_envelope(error: &SatelleError) -> Value {
-    let (category, retryable) = error_class(error.code);
+    let contract = error_contract(error.code);
     let details = if error.details.is_empty() {
         Value::Null
     } else {
@@ -121,8 +151,8 @@ pub(crate) fn error_envelope(error: &SatelleError) -> Value {
     serde_json::to_value(ErrorEnvelope {
         schema_version: ERROR_SCHEMA_VERSION,
         code: error.code.as_str(),
-        category,
-        retryable,
+        category: contract.category,
+        retryable: contract.retryable,
         message: &error.message,
         details,
         docs_url: None,
@@ -139,35 +169,127 @@ pub(crate) fn error_categories() -> Vec<&'static str> {
         .collect()
 }
 
-fn error_class(code: ErrorCode) -> (ErrorCategory, bool) {
+fn error_contract(code: ErrorCode) -> ErrorContract {
     match code {
-        ErrorCode::AuthenticationFailed => (ErrorCategory::Authentication, false),
-        ErrorCode::AuthorizationInsufficientScope => (ErrorCategory::Authorization, false),
-        ErrorCode::IdempotencyKeyConflict => (ErrorCategory::Conflict, false),
+        ErrorCode::AuthenticationFailed => ErrorContract {
+            category: ErrorCategory::Authentication,
+            retryable: false,
+            outcome: "Authentication failed.",
+            default_recovery: "check the configured authentication and retry the command",
+        },
+        ErrorCode::AuthorizationInsufficientScope => ErrorContract {
+            category: ErrorCategory::Authorization,
+            retryable: false,
+            outcome: "The requested action was not authorized.",
+            default_recovery: "use credentials with the required scope and retry the command",
+        },
+        ErrorCode::IdempotencyKeyConflict => ErrorContract {
+            category: ErrorCategory::Conflict,
+            retryable: false,
+            outcome: "The request conflicted with an earlier operation.",
+            default_recovery: "retry with a new idempotency key",
+        },
         ErrorCode::HostBusy | ErrorCode::StateConflict | ErrorCode::StopNotConfirmed => {
-            (ErrorCategory::Conflict, true)
+            ErrorContract {
+                category: ErrorCategory::Conflict,
+                retryable: true,
+                outcome: "The requested state change was not applied.",
+                default_recovery: "check the current Host and Session status, then retry",
+            }
         }
         ErrorCode::IncompatibleControlPlane
         | ErrorCode::ComputerUseNotReady
         | ErrorCode::UnsupportedProviderComputerUse
-        | ErrorCode::DoctorReadinessBlockersFound => (ErrorCategory::Readiness, false),
-        ErrorCode::NativeReadinessTimeout | ErrorCode::ProviderSmokeTestTimeout => {
-            (ErrorCategory::Readiness, true)
-        }
-        ErrorCode::StoreInUse | ErrorCode::StorageBusy => (ErrorCategory::Storage, true),
-        ErrorCode::StorageIntegrityFailed => (ErrorCategory::Storage, false),
-        ErrorCode::HostUnreachable
-        | ErrorCode::DirectDaemonUnreachable
-        | ErrorCode::RemoteExecution => (ErrorCategory::RemoteExecution, true),
-        ErrorCode::SshHostKeyVerificationRequired => (ErrorCategory::RemoteExecution, false),
-        ErrorCode::CapacityExceeded | ErrorCode::ConcurrencyLimitExceeded => {
-            (ErrorCategory::Capacity, true)
-        }
+        | ErrorCode::DoctorReadinessBlockersFound => ErrorContract {
+            category: ErrorCategory::Readiness,
+            retryable: false,
+            outcome: "The Host is not ready for this command.",
+            default_recovery: "run satelle doctor and resolve the reported readiness blockers",
+        },
+        ErrorCode::NativeReadinessTimeout | ErrorCode::ProviderSmokeTestTimeout => ErrorContract {
+            category: ErrorCategory::Readiness,
+            retryable: true,
+            outcome: "The Host readiness check did not finish.",
+            default_recovery: "run satelle doctor --refresh and retry the command",
+        },
+        ErrorCode::StoreInUse | ErrorCode::StorageBusy => ErrorContract {
+            category: ErrorCategory::Storage,
+            retryable: true,
+            outcome: "The Host state could not be changed.",
+            default_recovery: "wait for the active operation to finish, then retry",
+        },
+        ErrorCode::StorageIntegrityFailed => ErrorContract {
+            category: ErrorCategory::Storage,
+            retryable: false,
+            outcome: "The Host state could not be read safely.",
+            default_recovery: "run satelle doctor and repair the reported storage problem",
+        },
+        ErrorCode::HostUnreachable | ErrorCode::DirectDaemonUnreachable => ErrorContract {
+            category: ErrorCategory::RemoteExecution,
+            retryable: true,
+            outcome: "The Host could not be reached.",
+            default_recovery: "run satelle doctor --scope transport and retry the command",
+        },
+        ErrorCode::RemoteExecution => ErrorContract {
+            category: ErrorCategory::RemoteExecution,
+            retryable: true,
+            outcome: "The remote operation did not complete.",
+            default_recovery: "check the Host status and retry the command",
+        },
+        ErrorCode::SshHostKeyVerificationRequired => ErrorContract {
+            category: ErrorCategory::RemoteExecution,
+            retryable: false,
+            outcome: "The SSH Host identity was not accepted.",
+            default_recovery: "verify and trust the Host key, then retry the command",
+        },
+        ErrorCode::CapacityExceeded => ErrorContract {
+            category: ErrorCategory::Capacity,
+            retryable: true,
+            outcome: "The requested work could not start.",
+            default_recovery: "reduce concurrent work or wait for capacity, then retry",
+        },
         ErrorCode::HostNotFound | ErrorCode::SessionNotFound | ErrorCode::LogsCursorExpired => {
-            (ErrorCategory::NotFound, false)
+            ErrorContract {
+                category: ErrorCategory::NotFound,
+                retryable: false,
+                outcome: "The requested Satelle resource was not found.",
+                default_recovery: "check the configured Host or Session identifier and retry",
+            }
         }
         ErrorCode::InvalidUsage
-        | ErrorCode::ConfigError
+        | ErrorCode::EventsWithDetach
+        | ErrorCode::OutputModeConflict
+        | ErrorCode::LogTailLimitExceeded
+        | ErrorCode::LogPositionConflict
+        | ErrorCode::ConcurrencyLimitExceeded
+        | ErrorCode::ConcurrencyWithoutRemoteUpdate
+        | ErrorCode::ComponentSelectionConflict
+        | ErrorCode::UnsupportedUpdateComponent
+        | ErrorCode::SetupConsentRequired
+        | ErrorCode::DoctorRefreshScopeRequired
+        | ErrorCode::DoctorRefreshTimeoutWithoutRefresh
+        | ErrorCode::InputRequired => ErrorContract {
+            category: ErrorCategory::InvalidRequest,
+            retryable: false,
+            outcome: if matches!(code, ErrorCode::SetupConsentRequired) {
+                "Setup was not applied."
+            } else {
+                "Command input was not accepted."
+            },
+            default_recovery: "review satelle --help and retry with valid input",
+        },
+        ErrorCode::CertificateUntrusted
+        | ErrorCode::CertificateHostnameMismatch
+        | ErrorCode::CertificateExpired
+        | ErrorCode::TlsVersionUnsupported
+        | ErrorCode::TlsHandshakeFailed
+        | ErrorCode::HostIdentityMismatch => ErrorContract {
+            category: ErrorCategory::RemoteExecution,
+            retryable: false,
+            outcome: "The Host identity or secure connection was not accepted.",
+            default_recovery: "verify the Host identity and TLS configuration, then retry",
+        },
+        ErrorCode::ConfigError
         | ErrorCode::ConfigNotFound
         | ErrorCode::UnknownConfigKey
         | ErrorCode::ProfileNotFound
@@ -189,28 +311,32 @@ fn error_class(code: ErrorCode) -> (ErrorCategory, bool) {
         | ErrorCode::SecretFilePathNotAbsolute
         | ErrorCode::DesktopSessionSelectorConflict
         | ErrorCode::PathOverrideNotAbsolute
-        | ErrorCode::DaemonPathOverrideNotAbsolute
-        | ErrorCode::EventsWithDetach
-        | ErrorCode::OutputModeConflict
-        | ErrorCode::LogTailLimitExceeded
-        | ErrorCode::LogPositionConflict
-        | ErrorCode::ConcurrencyWithoutRemoteUpdate
-        | ErrorCode::ComponentSelectionConflict
-        | ErrorCode::UnsupportedUpdateComponent
-        | ErrorCode::SetupConsentRequired
-        | ErrorCode::DoctorRefreshScopeRequired
-        | ErrorCode::DoctorRefreshTimeoutWithoutRefresh
-        | ErrorCode::InputRequired => (ErrorCategory::InvalidRequest, false),
-        ErrorCode::CertificateUntrusted
-        | ErrorCode::CertificateHostnameMismatch
-        | ErrorCode::CertificateExpired
-        | ErrorCode::TlsVersionUnsupported
-        | ErrorCode::TlsHandshakeFailed
-        | ErrorCode::HostIdentityMismatch
-        | ErrorCode::CompletionInstallFailed
-        | ErrorCode::CompletionProfileUpdateFailed
-        | ErrorCode::PlatformDirectoriesUnavailable
-        | ErrorCode::NotImplemented => (ErrorCategory::Internal, false),
+        | ErrorCode::DaemonPathOverrideNotAbsolute => ErrorContract {
+            category: ErrorCategory::InvalidRequest,
+            retryable: false,
+            outcome: "The Satelle configuration was not accepted.",
+            default_recovery: "run satelle config check, correct the configuration, and retry",
+        },
+        ErrorCode::CompletionInstallFailed | ErrorCode::CompletionProfileUpdateFailed => {
+            ErrorContract {
+                category: ErrorCategory::Internal,
+                retryable: false,
+                outcome: "Satelle could not install the requested shell integration.",
+                default_recovery: "correct the reported filesystem problem and retry the command",
+            }
+        }
+        ErrorCode::PlatformDirectoriesUnavailable => ErrorContract {
+            category: ErrorCategory::Internal,
+            retryable: false,
+            outcome: "Satelle could not resolve the platform directories.",
+            default_recovery: "configure the required platform directory and retry the command",
+        },
+        ErrorCode::NotImplemented => ErrorContract {
+            category: ErrorCategory::Internal,
+            retryable: false,
+            outcome: "Satelle could not complete the command.",
+            default_recovery: "run satelle doctor and report the typed error if the problem remains",
+        },
     }
 }
 
@@ -236,10 +362,16 @@ mod tests {
     fn broad_process_exit_classes_are_stable_at_the_cli_boundary() {
         for (code, expected) in [
             (ErrorCode::InvalidUsage, 64),
+            (ErrorCode::ConcurrencyLimitExceeded, 64),
             (ErrorCode::ConfigError, 66),
             (ErrorCode::HostUnreachable, 69),
             (ErrorCode::ComputerUseNotReady, 75),
             (ErrorCode::RemoteExecution, 74),
+            (ErrorCode::CompletionInstallFailed, 73),
+            (ErrorCode::AuthenticationFailed, 74),
+            (ErrorCode::CertificateUntrusted, 74),
+            (ErrorCode::StorageIntegrityFailed, 74),
+            (ErrorCode::NotImplemented, 70),
         ] {
             assert_eq!(
                 process_exit_code(&error_with_code(code)),
@@ -248,6 +380,35 @@ mod tests {
                 code.as_str()
             );
         }
+    }
+
+    #[test]
+    fn human_errors_lead_with_outcome_and_end_with_recovery() {
+        let error = SatelleError {
+            code: ErrorCode::SetupConsentRequired,
+            message: "setup requires explicit consent".to_string(),
+            recovery_command: Some("satelle setup --yes".to_string()),
+            source_detail: None,
+            details: BTreeMap::from([("mutated".to_string(), json!(false))]),
+        };
+
+        assert_eq!(
+            human_error(&error),
+            [
+                "error: Setup was not applied.",
+                "cause: setup requires explicit consent [setup-consent-required]",
+                "state: No changes were applied.",
+                "next: satelle setup --yes",
+            ]
+            .join("\n")
+        );
+    }
+
+    #[test]
+    fn human_errors_preserve_significant_inline_cause_whitespace() {
+        let error = SatelleError::invalid_usage("path 'two  spaces\tand a tab' is invalid");
+
+        assert!(human_error(&error).contains("path 'two  spaces\tand a tab' is invalid"));
     }
 
     #[test]
@@ -331,15 +492,31 @@ mod tests {
 
     #[test]
     fn provider_smoke_timeout_is_retryable_readiness_failure() {
-        let (category, retryable) = error_class(ErrorCode::ProviderSmokeTestTimeout);
-        assert_eq!(category.as_str(), "readiness");
-        assert!(retryable);
+        let contract = error_contract(ErrorCode::ProviderSmokeTestTimeout);
+        assert_eq!(contract.category.as_str(), "readiness");
+        assert!(contract.retryable);
     }
 
     #[test]
     fn native_readiness_timeout_is_retryable_readiness_failure() {
-        let (category, retryable) = error_class(ErrorCode::NativeReadinessTimeout);
-        assert_eq!(category.as_str(), "readiness");
-        assert!(retryable);
+        let contract = error_contract(ErrorCode::NativeReadinessTimeout);
+        assert_eq!(contract.category.as_str(), "readiness");
+        assert!(contract.retryable);
+    }
+
+    #[test]
+    fn host_trust_errors_are_non_retryable_remote_execution_failures() {
+        for code in [
+            ErrorCode::CertificateUntrusted,
+            ErrorCode::CertificateHostnameMismatch,
+            ErrorCode::CertificateExpired,
+            ErrorCode::TlsVersionUnsupported,
+            ErrorCode::TlsHandshakeFailed,
+            ErrorCode::HostIdentityMismatch,
+        ] {
+            let contract = error_contract(code);
+            assert_eq!(contract.category.as_str(), "remote_execution");
+            assert!(!contract.retryable);
+        }
     }
 }
