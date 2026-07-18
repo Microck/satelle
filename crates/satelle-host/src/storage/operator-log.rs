@@ -1,3 +1,4 @@
+use super::Storage;
 use crate::{DaemonLogEntry, LogSubject};
 use satelle_core::{
     OwnerOnlyDirectory, open_or_create_owner_only_directory, open_or_create_owner_only_file,
@@ -10,6 +11,52 @@ use time::format_description::well_known::Rfc3339;
 const OPERATOR_LOG_FILE_NAME: &str = "satelle-host.log";
 const DEFAULT_ROTATION_BYTES: u64 = 10 * 1024 * 1024;
 const DEFAULT_RETAINED_FILES: usize = 5;
+const MIRROR_PAGE_SIZE: usize = 100;
+
+/// Runtime-owned cursor and sink for new authoritative log entries.
+///
+/// The cursor starts at the SQLite tail on each process start, so an existing
+/// local mirror is never replayed or treated as authoritative recovery state.
+pub(crate) struct OperatorLogMirror {
+    sink: OperatorLogSink,
+    mirrored_cursor: u64,
+}
+
+impl OperatorLogMirror {
+    pub(crate) fn new(policy: OperatorLogPolicy, mirrored_cursor: u64) -> Self {
+        Self {
+            sink: OperatorLogSink::new(policy),
+            mirrored_cursor,
+        }
+    }
+
+    pub(crate) fn flush_committed(&mut self, storage: &Storage) {
+        loop {
+            let Ok(entries) =
+                storage.committed_log_entries_after(self.mirrored_cursor, MIRROR_PAGE_SIZE)
+            else {
+                return;
+            };
+            let entry_count = entries.len();
+            for (cursor, entry) in entries {
+                // Mirroring is deliberately best effort. Advance even when a
+                // file write fails so recovery and public log pagination can
+                // never depend on retrying a local inspection artifact.
+                match self.sink.write_committed(&entry) {
+                    OperatorLogWriteOutcome::Failure(kind) => {
+                        let _failure_kind = kind;
+                    }
+                    OperatorLogWriteOutcome::Written
+                    | OperatorLogWriteOutcome::FailureCoalesced => {}
+                }
+                self.mirrored_cursor = cursor;
+            }
+            if entry_count < MIRROR_PAGE_SIZE {
+                return;
+            }
+        }
+    }
+}
 
 /// File policy after another layer has resolved the OS-native log root.
 ///
@@ -68,6 +115,7 @@ pub(crate) enum OperatorLogWriteOutcome {
 }
 
 impl OperatorLogWriteOutcome {
+    #[cfg(test)]
     pub(crate) fn failure_kind(&self) -> Option<OperatorLogFailureKind> {
         match self {
             Self::Failure(kind) => Some(*kind),

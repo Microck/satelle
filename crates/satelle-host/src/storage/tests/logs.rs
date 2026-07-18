@@ -1,4 +1,5 @@
 use super::*;
+use crate::DaemonLogEntry;
 use crate::{LogCursor, LogEvent, LogPageQuery, LogSeverity, LogSource};
 use std::fs;
 use std::path::Path;

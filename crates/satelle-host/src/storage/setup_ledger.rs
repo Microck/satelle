@@ -507,7 +507,7 @@ impl MaintenanceRecoverySubject {
 
 pub(crate) enum MaintenanceLeaseState {
     Active { operation_id: String },
-    RecoveryPending(MaintenanceRecoverySubject),
+    RecoveryPending(Box<MaintenanceRecoverySubject>),
 }
 
 impl SetupRepairPlan {

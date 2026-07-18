@@ -339,13 +339,14 @@ fn maintenance_recovery_snapshot(storage: &Storage, operation_id: &str) -> Strin
         .connection_for_test()
         .query_row(
             "SELECT printf(
-                '%Q|%Q|%Q|%Q|%Q|%Q|%Q|%Q|%Q',
+                '%Q|%Q|%Q|%Q|%Q|%Q|%Q|%Q|%Q|%Q',
                 setup_runs.status, setup_runs.finished_at,
                 actions.snapshot,
                 maintenance_leases.operation_id, maintenance_leases.owner_process_id,
                 maintenance_leases.owner_process_start_ref,
                 maintenance_leases.owner_boot_identity_ref,
-                maintenance_leases.acquired_at, maintenance_leases.heartbeat_at
+                maintenance_leases.acquired_at, maintenance_leases.heartbeat_at,
+                maintenance_leases.lease_state
              )
              FROM setup_runs
              JOIN (
@@ -618,7 +619,11 @@ fn maintenance_delete_failure_rolls_back_normal_and_recovery_terminal_ledgers() 
             .unwrap()
             .status()
     );
-    assert!(normal.maintenance_lease_state().unwrap().is_some());
+    assert!(matches!(
+        normal.maintenance_lease_state().unwrap(),
+        Some(crate::storage::MaintenanceLeaseState::Active { operation_id })
+            if operation_id == normal_plan.run_id()
+    ));
 
     let recovery_state = TempDir::new().expect("recovery state directory");
     let (mut recovery, _) = Storage::open(recovery_state.path()).expect("open recovery storage");
@@ -664,7 +669,11 @@ fn maintenance_delete_failure_rolls_back_normal_and_recovery_terminal_ledgers() 
         SetupActionStatus::OutcomeUnknown,
         retained.actions()[0].status()
     );
-    assert!(recovery.maintenance_lease_state().unwrap().is_some());
+    assert!(matches!(
+        recovery.maintenance_lease_state().unwrap(),
+        Some(crate::storage::MaintenanceLeaseState::RecoveryPending(subject))
+            if subject.operation_id() == recovery_plan.run_id()
+    ));
 }
 
 #[test]
@@ -716,6 +725,27 @@ fn startup_preserves_orphaned_maintenance_as_recovery_pending_outcome_unknown() 
         maintenance_recovery_snapshot(&recovered, unknown_subject.operation_id()),
         "missing verified observer evidence must not change any durable recovery field"
     );
+    assert!(matches!(
+        recovered.maintenance_lease_state().unwrap(),
+        Some(crate::storage::MaintenanceLeaseState::RecoveryPending(subject))
+            if subject.operation_id() == unknown_subject.operation_id()
+    ));
+    let conflicting = plan_with_run_id("conflicting-maintenance");
+    assert_eq!(
+        StorageErrorKind::LeaseConflict,
+        recovered
+            .begin_setup_run(
+                &conflicting,
+                maintenance_owner(conflicting.run_id(), conflicting.started_at()),
+            )
+            .expect_err("recovery_pending ownership must block conflicting admission")
+            .kind()
+    );
+    assert!(matches!(
+        recovered.maintenance_lease_state().unwrap(),
+        Some(crate::storage::MaintenanceLeaseState::RecoveryPending(subject))
+            if subject.operation_id() == unknown_subject.operation_id()
+    ));
     let verified_subject = match recovered.maintenance_lease_state().unwrap().unwrap() {
         crate::storage::MaintenanceLeaseState::RecoveryPending(subject) => subject,
         crate::storage::MaintenanceLeaseState::Active { .. } => unreachable!(),

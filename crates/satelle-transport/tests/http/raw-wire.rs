@@ -67,14 +67,7 @@ async fn chunked_attachment_limit_and_log_privacy(trace_capture: TraceCapture) {
         0
     );
     let traces = trace_capture.bytes();
-    let traces_text = String::from_utf8_lossy(&traces);
-    assert!(
-        traces_text.lines().any(|event| {
-            event.contains("Host Daemon HTTP response completed")
-                && event.contains(request_id.as_str())
-        }),
-        "tracing sink did not observe the server completion event for chunked request {request_id}"
-    );
+    assert_captured_host_admission_dispatch(&traces);
     assert_privacy_canaries_absent(
         "Host Daemon tracing sink after chunked request",
         &traces,

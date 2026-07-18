@@ -11,7 +11,7 @@ fn detached_execution_inherits_the_scheduling_dispatch() {
         marker_seen: Arc::clone(&marker_seen),
     });
     let _dispatch_guard = tracing::dispatcher::set_default(&dispatch);
-    let runtime = RuntimeHandle::new(Ok(state.path().to_path_buf()), FakeComputerUseAdapter);
+    let runtime = RuntimeHandle::new(Ok(state.path().to_path_buf()), DispatchInspectingAdapter);
 
     runtime
         .run(RunCommand::detached(
@@ -33,6 +33,42 @@ struct DetachedExecutionMarkerSubscriber {
     marker_seen: Arc<AtomicBool>,
 }
 
+#[derive(Clone, Copy)]
+struct DispatchInspectingAdapter;
+
+impl super::ComputerUseAdapter for DispatchInspectingAdapter {
+    fn preflight(
+        &self,
+        host: &str,
+        provider_intent: &crate::ProviderComputerUseIntent,
+    ) -> Result<AdapterReadiness, SatelleError> {
+        FakeComputerUseAdapter.preflight(host, provider_intent)
+    }
+
+    fn execute(&self, request: ExecuteRequest<'_>) -> Result<ExecuteResult, SatelleError> {
+        // Inspect the worker's effective dispatcher directly. A tracing
+        // callsite's global interest cache can be rebuilt concurrently by the
+        // parallel test suite and is not evidence about dispatcher identity.
+        tracing::dispatcher::get_default(|dispatch| {
+            if let Some(subscriber) = dispatch.downcast_ref::<DetachedExecutionMarkerSubscriber>() {
+                subscriber.marker_seen.store(true, Ordering::Release);
+            }
+        });
+        FakeComputerUseAdapter.execute(request)
+    }
+
+    fn observe_stop(&self, subject: AdapterSubject<'_>) -> Result<StopObservation, SatelleError> {
+        FakeComputerUseAdapter.observe_stop(subject)
+    }
+
+    fn observe_recovery(
+        &self,
+        subject: AdapterSubject<'_>,
+    ) -> Result<RecoveryObservation, SatelleError> {
+        FakeComputerUseAdapter.observe_recovery(subject)
+    }
+}
+
 impl tracing::Subscriber for DetachedExecutionMarkerSubscriber {
     fn enabled(&self, _metadata: &tracing::Metadata<'_>) -> bool {
         true
@@ -46,30 +82,11 @@ impl tracing::Subscriber for DetachedExecutionMarkerSubscriber {
 
     fn record_follows_from(&self, _span: &tracing::span::Id, _follows: &tracing::span::Id) {}
 
-    fn event(&self, event: &tracing::Event<'_>) {
-        event.record(&mut DetachedExecutionMarkerVisitor {
-            marker_seen: &self.marker_seen,
-        });
-    }
+    fn event(&self, _event: &tracing::Event<'_>) {}
 
     fn enter(&self, _span: &tracing::span::Id) {}
 
     fn exit(&self, _span: &tracing::span::Id) {}
-}
-
-struct DetachedExecutionMarkerVisitor<'a> {
-    marker_seen: &'a AtomicBool,
-}
-
-impl tracing::field::Visit for DetachedExecutionMarkerVisitor<'_> {
-    fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
-        if field.name() == "marker" && value == crate::test_runtime::DETACHED_EXECUTION_TRACE_MARKER
-        {
-            self.marker_seen.store(true, Ordering::Release);
-        }
-    }
-
-    fn record_debug(&mut self, _field: &tracing::field::Field, _value: &dyn std::fmt::Debug) {}
 }
 
 #[test]
@@ -280,13 +297,17 @@ fn assert_host_postcheck_outcome(suffix: &str, fixture: MaintenanceProbeFixture)
             ))
             .expect("known postcheck result must release both leases");
     } else {
-        service
+        let conflict = service
             .runtime
             .run(RunCommand::attached(
                 LOCAL_DEMO_HOST,
                 "PRIVATE_UNKNOWN_POSTCHECK",
             ))
             .expect_err("unknown postcheck result must retain both leases");
+        assert_eq!(
+            satelle_core::session::TurnAdmissionPhase::NotAdmitted,
+            conflict.phase()
+        );
     }
 }
 
@@ -358,13 +379,17 @@ fn host_service_reconciles_restart_postconditions_and_unknown_remains_blocking()
     restarted
         .reconcile_setup_maintenance(&mut unknown)
         .expect_err("observer failure must preserve restart ownership");
-    restarted
+    let conflict = restarted
         .runtime
         .run(RunCommand::attached(
             LOCAL_DEMO_HOST,
             "PRIVATE_UNKNOWN_RECOVERY",
         ))
         .expect_err("unknown reconciliation must remain fail-closed");
+    assert_eq!(
+        satelle_core::session::TurnAdmissionPhase::NotAdmitted,
+        conflict.phase()
+    );
 
     let mut satisfied = FixedSetupObserver::satisfied();
     assert_eq!(
@@ -413,7 +438,7 @@ impl ReadinessProbeDriver for MaintenanceProbeFixture {
                         observed_at + time::Duration::minutes(5),
                     )
                     .unwrap(),
-                reason: *reason,
+                reason,
                 error: SatelleError::computer_use_not_ready(),
             },
             Self::Unknown => {

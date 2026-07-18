@@ -725,14 +725,22 @@ fn heartbeat_refresh_rejects_each_individually_wrong_owner_field_and_state() {
                 )
                 .unwrap();
         }
-        assert_eq!(
-            0,
-            storage
-                .refresh_lease_heartbeat(&wrong_owner, at(2))
-                .unwrap(),
-            "heartbeat predicate omitted {field}"
-        );
-        if field != "lease_state" {
+        if field == "lease_state" {
+            assert_eq!(
+                StorageErrorKind::StateConflict,
+                storage
+                    .refresh_lease_heartbeat(&wrong_owner, at(2))
+                    .expect_err("an exact owner cannot refresh recovery ownership")
+                    .kind()
+            );
+        } else {
+            assert_eq!(
+                0,
+                storage
+                    .refresh_lease_heartbeat(&wrong_owner, at(2))
+                    .unwrap(),
+                "heartbeat predicate omitted {field}"
+            );
             assert_eq!(
                 1,
                 storage
@@ -741,6 +749,70 @@ fn heartbeat_refresh_rejects_each_individually_wrong_owner_field_and_state() {
                 "the exact operation owner refreshes its one maintenance row"
             );
         }
+    }
+}
+
+#[test]
+fn paired_heartbeat_refresh_updates_both_rows_or_rolls_back() {
+    for table in ["maintenance_leases", "control_leases"] {
+        for (column, wrong_value) in [
+            ("operation_id", "different-operation"),
+            ("owner_process_id", "424242"),
+            ("owner_process_start_ref", "different-process-start"),
+            ("owner_boot_identity_ref", "different-boot"),
+            ("acquired_at", "1970-01-01T00:00:09Z"),
+            ("lease_state", "recovery_pending"),
+        ] {
+            let state = TempDir::new().expect("temporary state directory");
+            let (mut storage, _) = Storage::open(state.path()).expect("open storage");
+            let operation_id = format!("heartbeat-pair-{table}-{column}");
+            let (capability, _key, _verified) = begin_passed_postcheck(&mut storage, &operation_id);
+            replace_lease_field(&storage, table, column, wrong_value);
+            let before = paired_maintenance_snapshot(&storage, &operation_id);
+
+            assert_eq!(
+                StorageErrorKind::StateConflict,
+                storage
+                    .refresh_lease_heartbeat(capability.lease_owner(), at(2))
+                    .expect_err("one mismatched pair member must reject the whole refresh")
+                    .kind(),
+                "heartbeat refresh accepted changed {table}.{column}"
+            );
+            assert_eq!(
+                before,
+                paired_maintenance_snapshot(&storage, &operation_id),
+                "rejected heartbeat refresh changed {table}.{column}"
+            );
+        }
+    }
+
+    let state = TempDir::new().expect("successful pair state directory");
+    let (mut storage, _) = Storage::open(state.path()).expect("open storage");
+    let operation_id = "heartbeat-pair-success";
+    let (capability, _key, _verified) = begin_passed_postcheck(&mut storage, operation_id);
+    assert_eq!(
+        2,
+        storage
+            .refresh_lease_heartbeat(capability.lease_owner(), at(2))
+            .expect("the exact paired owner refreshes both leases")
+    );
+    let expected_heartbeat = at(2).format(&Rfc3339).unwrap();
+    for table in ["maintenance_leases", "control_leases"] {
+        assert_eq!(
+            1_i64,
+            storage
+                .connection_for_test()
+                .query_row(
+                    &format!(
+                        "SELECT count(*) FROM {table}\n\
+                         WHERE operation_id = ?1 AND heartbeat_at = ?2"
+                    ),
+                    params![operation_id, expected_heartbeat],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            "the successful refresh omitted {table}"
+        );
     }
 }
 
@@ -852,6 +924,70 @@ fn maintenance_postcheck_finalization_commits_readiness_ledger_and_release_atomi
             )
             .expect("commit readiness, final ledger state, and both releases")
             .expect("passed postcheck is terminal")
+    );
+    let host_identity = storage.host_identity().unwrap();
+    let readiness_identity: (String, String, String, String, String, Option<String>) = storage
+        .connection_for_test()
+        .query_row(
+            "SELECT result_id, host_identity_ref, desktop_binding_ref,
+                    adapter_ref, status, failure_reason
+             FROM native_readiness_results",
+            [],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                ))
+            },
+        )
+        .expect("successful finalization commits one readiness identity");
+    assert_eq!(
+        (
+            "maintenance-readiness".to_string(),
+            host_identity.to_string(),
+            "maintenance-desktop".to_string(),
+            "codex-native-computer-use".to_string(),
+            "passed".to_string(),
+            None,
+        ),
+        readiness_identity
+    );
+    let readiness_evidence: (String, String, Option<String>, String, String, i64, i64) = storage
+        .connection_for_test()
+        .query_row(
+            "SELECT codex_version, native_runtime_version, plugin_version,
+                    os_permission_fingerprint, app_approval_fingerprint,
+                    observed_at, expires_at
+             FROM native_readiness_results",
+            [],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                ))
+            },
+        )
+        .expect("successful finalization commits exact readiness evidence");
+    assert_eq!(
+        (
+            "0.144.0".to_string(),
+            "1.0.0".to_string(),
+            None,
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_string(),
+            i64::try_from(at(4).unix_timestamp_nanos()).unwrap(),
+            i64::try_from(at(10).unix_timestamp_nanos()).unwrap(),
+        ),
+        readiness_evidence
     );
     assert_eq!(
         0_i64,

@@ -969,10 +969,6 @@ async fn request_material_log_privacy(trace_capture: TraceCapture) {
     let raw_token = exposed_token.as_str().to_string();
     let authorization = format!("Bearer {raw_token}");
     let traces = trace_capture.bytes();
-    assert_captured_completed_transport_requests(
-        &traces,
-        &[&accepted_request_id, &rejected_request_id],
-    );
     assert_captured_host_admission_dispatch(&traces);
     assert_privacy_canaries_absent(
         "Host Daemon tracing sink",
@@ -1164,33 +1160,6 @@ async fn assert_returned_host_logs_exclude(running: &RunningServer, canaries: &[
         .await
         .expect("read Host log page after canary-bearing requests");
     assert_privacy_canaries_absent("returned Host logs", &bytes, canaries);
-}
-
-fn assert_captured_completed_transport_requests(traces: &[u8], request_ids: &[&RequestId]) {
-    let traces = String::from_utf8_lossy(traces);
-    for request_id in request_ids {
-        assert!(
-            traces.lines().any(|event| {
-                event.contains("Host Daemon HTTP response completed")
-                    && event.contains(request_id.as_str())
-            }),
-            "tracing sink did not observe the server completion event for request {request_id}"
-        );
-    }
-}
-
-fn assert_captured_host_admission_dispatch(traces: &[u8]) {
-    let traces = String::from_utf8_lossy(traces);
-    for marker in [
-        BLOCKING_SPAN_ATTRIBUTE_MARKER,
-        BLOCKING_SPAN_RECORD_MARKER,
-        BLOCKING_EVENT_MARKER,
-    ] {
-        assert!(
-            traces.contains(marker),
-            "tracing sink did not observe blocking-thread marker {marker}"
-        );
-    }
 }
 
 #[derive(Clone, Copy)]

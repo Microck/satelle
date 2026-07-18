@@ -129,6 +129,7 @@ impl Storage {
     ///
     /// In particular, the timestamp comes from SQLite after monotonic clock
     /// normalization rather than from the pre-commit SafeLogRecord.
+    #[cfg(test)]
     pub(crate) fn committed_log_entry(&self, cursor: u64) -> Result<DaemonLogEntry, StorageError> {
         let previous_cursor = cursor
             .checked_sub(1)
@@ -140,6 +141,32 @@ impl Storage {
             return Err(StorageError::new(StorageErrorKind::InvalidStoredState));
         }
         stored_page_entry(stored.remove(0))
+    }
+
+    pub(crate) fn latest_log_cursor(&self) -> Result<u64, StorageError> {
+        let cursor: i64 = self
+            .connection
+            .query_row("SELECT COALESCE(MAX(log_cursor), 0) FROM logs", [], |row| {
+                row.get(0)
+            })
+            .map_err(|source| sqlite_error(StorageErrorKind::OperationFailed, source))?;
+        u64::try_from(cursor).map_err(|_| StorageError::new(StorageErrorKind::InvalidStoredState))
+    }
+
+    pub(crate) fn committed_log_entries_after(
+        &self,
+        cursor: u64,
+        limit: usize,
+    ) -> Result<Vec<(u64, DaemonLogEntry)>, StorageError> {
+        let query = LogPageQuery::forward(Some(LogCursor::from_position(cursor)), limit)
+            .map_err(|_| StorageError::new(StorageErrorKind::InvalidInput))?;
+        load_log_page_records(&self.connection, &query, limit)?
+            .into_iter()
+            .map(|stored| {
+                let cursor = stored.cursor;
+                stored_page_entry(stored).map(|entry| (cursor, entry))
+            })
+            .collect()
     }
 
     #[cfg(test)]

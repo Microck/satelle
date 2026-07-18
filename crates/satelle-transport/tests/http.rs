@@ -67,6 +67,7 @@ const EXPECTED_OPERATIONS: [&str; 14] = [
 const BLOCKING_SPAN_ATTRIBUTE_MARKER: &str = "trace-blocking-span-attribute-connected";
 const BLOCKING_SPAN_RECORD_MARKER: &str = "trace-blocking-span-record-connected";
 const BLOCKING_EVENT_MARKER: &str = "trace-blocking-event-connected";
+static TRACE_CAPTURE_LOCK: Mutex<()> = Mutex::new(());
 
 struct RunningServer {
     _state: TestStateDir,
@@ -154,6 +155,12 @@ where
     F: FnOnce(TraceCapture) -> Fut,
     Fut: Future<Output = ()>,
 {
+    // Tracing callsite interest is process-global even when each Dispatch is
+    // thread-local. Keep the two capture tests from rebuilding that cache at
+    // the same time while retaining scoped, non-global subscribers.
+    let _capture_lock = TRACE_CAPTURE_LOCK
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
     let trace_capture = TraceCapture::default();
     let dispatch = trace_capture.dispatch();
     let _server_guard = tracing::dispatcher::set_default(&dispatch);
@@ -225,6 +232,20 @@ impl TraceCapture {
             .lock()
             .unwrap_or_else(|poison| poison.into_inner())
             .extend_from_slice(event);
+    }
+}
+
+fn assert_captured_host_admission_dispatch(traces: &[u8]) {
+    let traces = String::from_utf8_lossy(traces);
+    for marker in [
+        BLOCKING_SPAN_ATTRIBUTE_MARKER,
+        BLOCKING_SPAN_RECORD_MARKER,
+        BLOCKING_EVENT_MARKER,
+    ] {
+        assert!(
+            traces.contains(marker),
+            "tracing sink did not observe blocking-thread marker {marker}"
+        );
     }
 }
 

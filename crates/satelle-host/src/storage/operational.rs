@@ -75,9 +75,9 @@ impl Storage {
         if run.status() != SetupRunStatus::OutcomeUnknown {
             return Err(StorageError::new(StorageErrorKind::InvalidStoredState));
         }
-        Ok(Some(MaintenanceLeaseState::RecoveryPending(
+        Ok(Some(MaintenanceLeaseState::RecoveryPending(Box::new(
             MaintenanceRecoverySubject::new(owner, run, has_postcheck),
-        )))
+        ))))
     }
 
     /// Retains maintenance ownership while atomically adding the same
@@ -188,10 +188,48 @@ impl Storage {
         heartbeat_at: time::OffsetDateTime,
     ) -> Result<usize, StorageError> {
         let heartbeat_at = super::codec::format_time(heartbeat_at)?;
+        let acquired_at = super::codec::format_time(owner.acquired_at)?;
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(operation_failed)?;
+        // Identify the host from either exact pair member before updating. If
+        // one member was altered, the other still establishes that both rows
+        // belong to one atomic heartbeat refresh.
+        let expected_changed: i64 = transaction
+            .query_row(
+                "WITH owned_hosts AS (
+                    SELECT host_identity_ref FROM control_leases
+                    WHERE operation_id = ?1
+                      AND owner_process_id = ?2
+                      AND owner_process_start_ref = ?3
+                      AND owner_boot_identity_ref = ?4
+                      AND acquired_at = ?5
+                    UNION
+                    SELECT host_identity_ref FROM maintenance_leases
+                    WHERE operation_id = ?1
+                      AND owner_process_id = ?2
+                      AND owner_process_start_ref = ?3
+                      AND owner_boot_identity_ref = ?4
+                      AND acquired_at = ?5
+                 )
+                 SELECT
+                    (SELECT count(*) FROM control_leases
+                     WHERE host_identity_ref IN (SELECT host_identity_ref FROM owned_hosts))
+                  + (SELECT count(*) FROM maintenance_leases
+                     WHERE host_identity_ref IN (SELECT host_identity_ref FROM owned_hosts))",
+                params![
+                    owner.operation_id.as_str(),
+                    i64::from(owner.process_id),
+                    owner.process_start_ref.as_str(),
+                    owner.boot_identity_ref.as_str(),
+                    acquired_at,
+                ],
+                |row| row.get(0),
+            )
+            .map_err(operation_failed)?;
+        let expected_changed = usize::try_from(expected_changed)
+            .map_err(|_| StorageError::new(StorageErrorKind::InvalidStoredState))?;
         let mut changed = 0;
         for table in ["control_leases", "maintenance_leases"] {
             let sql = format!(
@@ -212,11 +250,14 @@ impl Storage {
                         i64::from(owner.process_id),
                         owner.process_start_ref.as_str(),
                         owner.boot_identity_ref.as_str(),
-                        super::codec::format_time(owner.acquired_at)?,
+                        acquired_at,
                         heartbeat_at,
                     ],
                 )
                 .map_err(operation_failed)?;
+        }
+        if changed != expected_changed {
+            return Err(StorageError::new(StorageErrorKind::StateConflict));
         }
         transaction.commit().map_err(operation_failed)?;
         Ok(changed)

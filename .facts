@@ -846,7 +846,7 @@
 - Satelle Idempotency Records are retained for at least 24 hours after their operation becomes terminal @mvp @implemented
 - a successful mutating API response is emitted only after the corresponding state and Idempotency Record are durably committed @mvp @implemented
 - the authenticated satelle.capabilities.v2 response advertises the effective JSON body, attachment, WebSocket, connection, operation-concurrency, failed-authentication, authenticated-read, and control-request limits that the Host Daemon enforces @contract @mvp @implemented
-- requests exceeding a body or attachment limit fail before prompt execution with a typed payload-too-large error @spec @mvp
+- requests exceeding a body or attachment limit fail before prompt execution with a typed payload-too-large error @spec @mvp @implemented
 - requests exceeding an operation or connection capacity limit fail with a typed capacity-exceeded error @spec @mvp
 - failed authentication attempts are limited to 10 per minute per network source by default @mvp @implemented
 - failed-authentication rate limiting derives network source from the transport peer address and ignores Forwarded, X-Forwarded-For, and equivalent headers by default @mvp @implemented
@@ -855,8 +855,8 @@
 - authenticated control and admin operations are limited to 120 requests per minute per API Principal by default @mvp @implemented
 - API rate limits are configurable only through Host-owned or user-level configuration and cannot be weakened by project-level configuration @spec @mvp
 - rate-limited responses use the typed rate-limited error and include retry_after_ms when retry timing is known @contract @mvp @implemented
-- satelle Host Daemon does not log raw HTTP request bodies, Authorization headers, prompt text, or attachment bytes @spec @mvp
-- Host Daemon run and steer HTTP operations always return after durable asynchronous Turn admission; attach and detach are Controller presentation behaviors and are excluded from the operation payload and idempotency digest @spec @contract @mvp
+- satelle Host Daemon does not log raw HTTP request bodies, Authorization headers, prompt text, or attachment bytes @spec @mvp @implemented
+- Host Daemon run and steer HTTP operations always return after durable asynchronous Turn admission; attach and detach are Controller presentation behaviors and are excluded from the operation payload and idempotency digest @spec @contract @mvp @implemented
 - a run or steer operation holds its operation-concurrency slot through durable asynchronous Turn admission and execution handoff, then releases the slot without waiting for the admitted Turn to become terminal @spec @contract @mvp @implemented
 - a stop operation holds its operation-concurrency slot until the stop is durably confirmed and its Idempotency Record durable outcome is committed @spec @contract @mvp @implemented
 
@@ -1414,22 +1414,22 @@
 - the Host Daemon releases the Control Lease in the same transaction that persists a terminal Turn state @spec @mvp
 - a standalone readiness or provider probe releases its Control Lease in the same transaction that persists the terminal Readiness Result only after the Codex adapter confirms that no upstream probe Turn remains active @spec @mvp @implemented
 - setup, repair, host update, storage migration, and service restart acquire a Maintenance Lease before mutation @spec @mvp
-- a Maintenance Lease cannot coexist with a Control Lease for the same Host except when the same maintenance operation owns a postcheck Control sublease @spec @mvp
-- Turn admission requires both the selected Control Lease and absence of a Maintenance Lease for the same Host @spec @mvp
-- a maintenance operation that requires a live Computer Use postcheck retains its Maintenance Lease and atomically acquires an operation-owned postcheck Control sublease before running the probe @spec @mvp
-- no other Turn, probe, or maintenance operation is admitted while a maintenance operation owns its postcheck Control sublease @spec @mvp
+- a Maintenance Lease cannot coexist with a Control Lease for the same Host except when the same maintenance operation owns a postcheck Control sublease @spec @mvp @implemented
+- Turn admission requires both the selected Control Lease and absence of a Maintenance Lease for the same Host @spec @mvp @implemented
+- a maintenance operation that requires a live Computer Use postcheck retains its Maintenance Lease and atomically acquires an operation-owned postcheck Control sublease before running the probe @spec @mvp @implemented
+- no other Turn, probe, or maintenance operation is admitted while a maintenance operation owns its postcheck Control sublease @spec @mvp @implemented
 - a queued Turn Request does not start while a Maintenance Lease exists for its Host @spec @later
-- a maintenance operation without a live postcheck releases its Maintenance Lease only in the transaction that durably commits its final action-ledger state @spec @mvp
-- a maintenance operation with a live postcheck releases its postcheck Control sublease and Maintenance Lease only in the transaction that commits the final Readiness Result and final action-ledger state @spec @mvp
-- Control and Maintenance Leases contain an operation id, owner process identity, acquisition time, and heartbeat time @spec @mvp
-- lease owner process identity includes a process-start discriminator and operating-system boot identity instead of relying on a reusable process id alone @spec @mvp
+- a maintenance operation without a live postcheck releases its Maintenance Lease only in the transaction that durably commits its final action-ledger state @spec @mvp @implemented
+- a maintenance operation with a live postcheck releases its postcheck Control sublease and Maintenance Lease only in the transaction that commits the final Readiness Result and final action-ledger state @spec @mvp @implemented
+- Control and Maintenance Leases contain an operation id, owner process identity, acquisition time, and heartbeat time @spec @mvp @implemented
+- lease owner process identity includes a process-start discriminator and operating-system boot identity instead of relying on a reusable process id alone @spec @mvp @implemented
 - the Host Daemon refreshes live Control and Maintenance Lease heartbeats at least every 5 seconds, and a missing heartbeat becomes stale after 30 seconds by default without permitting automatic lease release @spec @mvp
-- Host Daemon startup treats an orphaned Control or Maintenance Lease as recovery_pending and blocks conflicting admission until reconciliation completes @spec @mvp
+- Host Daemon startup treats an orphaned Control or Maintenance Lease as recovery_pending and blocks conflicting admission until reconciliation completes @spec @mvp @implemented
 - label: an orphaned non-Turn Control Lease for a readiness or provider probe is classified outcome_unknown, reconciled against its probe process and upstream capability state, and resolved to a durable terminal Readiness Result before lease release
   command: cargo test --locked -p satelle-host --lib runtime::tests::unknown_provider_probe_ownership_blocks_probe_and_prompt_until_terminal_reconciliation -- --exact && cargo test --locked -p satelle-host --lib runtime::tests::unknown_native_probe_timeout_blocks_until_terminal_reconciliation -- --exact
   tags: [spec, mvp, implemented, ci]
-- an orphaned Maintenance Lease operation is classified outcome_unknown and reconciled from its action postconditions before retry or release @spec @mvp
-- lease expiry alone never proves that an external Computer Use or maintenance side effect stopped @spec @mvp
+- an orphaned Maintenance Lease operation is classified outcome_unknown and reconciled from its action postconditions before retry or release @spec @mvp @implemented
+- lease expiry alone never proves that an external Computer Use or maintenance side effect stopped @spec @mvp @implemented
 - timeout expiry, a cancellation request, transport loss, adapter failure, or lease expiry never by itself proves that an upstream Computer Use execution stopped and never by itself permits Control Lease release @spec @mvp
 - initial setup, missing-daemon repair, and Host binary replacement acquire a Bootstrap Lock before mutating remote files or starting a replacement Host Daemon @spec @mvp
 - a Bootstrap Lock uses atomic filesystem creation under the remote OS user's Satelle state boundary @spec @mvp
@@ -1669,11 +1669,11 @@
 - satelle Host Daemon stores its SQLite database under the resolved Satelle local mutable state root @spec @mvp
 - satelle Host Daemon stores recording artifacts under a recordings directory inside the resolved Satelle local mutable state root by default @spec @mvp
 - satelle Host Daemon writes Satelle Operator Log Files by default when the resolved OS-native Satelle log directory is writable @spec @mvp
-- satelle Satelle Operator Log Files are a best-effort local inspection mirror and are never authoritative for satelle logs, satelle status, recovery, retention, or support bundle collection @spec @mvp
+- satelle Satelle Operator Log Files are a best-effort local inspection mirror and are never authoritative for satelle logs, satelle status, recovery, retention, or support bundle collection @spec @mvp @implemented
 - satelle logs command reads Satelle Log Entries from SQLite through the Host Daemon API instead of parsing Satelle Operator Log Files @spec @mvp @implemented
-- satelle Satelle Operator Log Files contain human-readable redacted summaries derived from Satelle Log Entries instead of raw protocol payloads or raw subprocess streams @spec @mvp
-- satelle Satelle Operator Log Files do not include provider request bodies, provider response bodies, full prompts, screenshots, desktop recordings, full transcripts, raw setup stdout, raw setup stderr, raw repair stdout, or raw repair stderr by default @spec @mvp
-- satelle Satelle Operator Log Files rotate at 10 MiB and retain at most 5 files total per Host Daemon instance by default @spec @mvp
+- satelle Satelle Operator Log Files contain human-readable redacted summaries derived from Satelle Log Entries instead of raw protocol payloads or raw subprocess streams @spec @mvp @implemented
+- satelle Satelle Operator Log Files do not include provider request bodies, provider response bodies, full prompts, screenshots, desktop recordings, full transcripts, raw setup stdout, raw setup stderr, raw repair stdout, or raw repair stderr by default @spec @mvp @implemented
+- satelle Satelle Operator Log Files rotate at 10 MiB and retain at most 5 files total per Host Daemon instance by default @spec @mvp @implemented
 - satelle Satelle Operator Log File retention can be configured per host or profile without changing SQLite log retention @spec @mvp
 - satelle Satelle Operator Log Files are stored under an OS-native Satelle log directory on the remote host instead of project directories @spec @mvp
 - satelle default Linux Satelle Operator Log File root is ${XDG_STATE_HOME:-$HOME/.local/state}/satelle/logs @spec @mvp
@@ -1797,7 +1797,11 @@
 - satelle exposes satelle host storage restore --host <alias> --backup <path> as the explicit authenticated restore operation @spec @mvp
 - host storage restore verifies backup integrity and compatibility, preserves the failed store separately, runs under the applicable Maintenance Lease or Bootstrap Lock, and atomically activates the restored store before restarting API service @spec @mvp
 - host storage restore follows maintenance plan presentation, --dry-run, interactive confirmation, --yes, --no-input --yes, action-ledger, and partial-failure rules @spec @mvp
-- migration-backup cleanup retains the newest validated pre-migration backup and at least one previous validated backup by default @spec @mvp
+- label: Restore activation errors put the prior active database and every moved SQLite sidecar back under their active names before returning.
+  command: cargo test --locked -p satelle-host --lib storage::open::backup_tests::activation_errors_restore_active_sidecars -- --exact
+  tags: [spec, implemented]
+- migration-backup cleanup retains the newest validated pre-migration backup and at least one previous validated backup by default @spec @mvp @implemented
+- Windows migration-backup cleanup moves each quarantined pair member to one identity-stable, retry-discoverable deleting name before handle-relative deletion without appending a second UUID @spec @mvp @implemented
 - satelle host storage backup cleanup --host <alias> is the explicit command for deleting older eligible migration backups after a dry-run plan and mutation consent @spec @mvp
 - satelle destructive store reset is available only through an explicit host maintenance command @spec @mvp
 - satelle host store reset deletes metadata only by default and does not delete recordings unless the user explicitly requests recording deletion @spec @mvp

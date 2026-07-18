@@ -29,9 +29,11 @@ use self::open::DATABASE_FILE_NAME;
 #[cfg(all(test, unix))]
 use self::open::LOCK_FILE_NAME;
 use self::open::{PROTECTED_FILE_NAMES, sqlite_error};
+#[cfg(test)]
 pub(crate) use self::operator_log::{
-    OperatorLogFailureKind, OperatorLogPolicy, OperatorLogSink, OperatorLogWriteOutcome,
+    OperatorLogFailureKind, OperatorLogSink, OperatorLogWriteOutcome,
 };
+pub(crate) use self::operator_log::{OperatorLogMirror, OperatorLogPolicy};
 pub(crate) use self::setup_ledger::{
     MaintenanceLeaseCapability, MaintenanceLeaseState, MaintenanceRecoverySubject,
 };

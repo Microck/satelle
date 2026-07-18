@@ -33,18 +33,21 @@ use crate::live_events::LiveEventHub;
 use crate::process_identity::ProcessIdentity;
 use crate::storage::{
     AdmissionOutcome, ApiTokenRegistration, IdempotentOperation, LeaseOwner, LogPageStorageError,
-    ObservedUpstreamRef, ReadinessProbeKind, ReadinessProbeTerminal, SensitiveRequestDigest,
-    SetupActionSkipReason, SetupRepairPlan, SetupRepairProbe, SetupRunPlan, SetupRunRecord,
-    SetupRunStatus, Storage, StorageSnapshot,
+    ObservedUpstreamRef, OperatorLogMirror, OperatorLogPolicy, ReadinessProbeKind,
+    ReadinessProbeTerminal, SensitiveRequestDigest, SetupActionSkipReason, SetupRepairPlan,
+    SetupRepairProbe, SetupRunPlan, SetupRunRecord, SetupRunStatus, Storage, StorageSnapshot,
 };
 use crate::{ApiBearerToken, ApiPrincipal, DaemonLogPage, LogCursor, LogPageQuery};
 use recovery::RecoveryQueue;
-pub(crate) use recovery::{VerifiedSetupPostconditions, verify_setup_postconditions};
+pub(crate) use recovery::VerifiedSetupPostconditions;
+#[cfg(test)]
+pub(crate) use recovery::verify_setup_postconditions;
 use satelle_core::session::{DesktopBindingRef, PublicSession, TurnAdmissionFailure};
 use satelle_core::{
     ControlPlaneOperation, ErrorCode, LOCAL_DEMO_HOST, SatelleError, SatelleEvent, SessionId,
     TurnId,
 };
+use std::ops::{Deref, DerefMut};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
 
@@ -52,6 +55,14 @@ use std::sync::{Arc, Mutex, MutexGuard};
 pub(crate) struct RuntimeTurnOutcome {
     pub(crate) session: PublicSession,
     pub(crate) events: Vec<SatelleEvent>,
+}
+
+struct AdmissionExecution<'a> {
+    host: &'a str,
+    prompt: &'a str,
+    execution_mode: satelle_core::session::TurnExecutionMode,
+    dispatch_preference: request::DispatchPreference,
+    provider_smoke_event: Option<satelle_core::SatelleEventBody>,
 }
 
 /// Exclusive in-process authority for one live setup or repair operation.
@@ -297,6 +308,7 @@ pub(crate) struct RuntimeEngine {
     // This is the sole SQLite owner for the runtime. The mutex protects short
     // admission/read/commit sections only and is never held across adapter I/O.
     storage: Arc<Mutex<Storage>>,
+    operator_log: Mutex<OperatorLogMirror>,
     adapter: Arc<dyn ComputerUseAdapter>,
     readiness_probe_driver: Option<Arc<dyn ReadinessProbeDriver>>,
     recovery: Mutex<RecoveryQueue>,
@@ -333,6 +345,7 @@ impl RuntimeSnapshot {
 impl RuntimeEngine {
     fn open(
         state_root: &Path,
+        operator_log_root: PathBuf,
         adapter: Arc<dyn ComputerUseAdapter>,
         readiness_probe_driver: Option<Arc<dyn ReadinessProbeDriver>>,
     ) -> Result<Arc<Self>, SatelleError> {
@@ -340,8 +353,15 @@ impl RuntimeEngine {
             ProcessIdentity::current().map_err(model::process_identity_failure)?;
         let storage =
             Storage::open_without_restart_recovery(state_root).map_err(model::storage_failure)?;
+        let mirrored_cursor = storage
+            .latest_log_cursor()
+            .map_err(model::storage_failure)?;
         let engine = Arc::new(Self {
             storage: Arc::new(Mutex::new(storage)),
+            operator_log: Mutex::new(OperatorLogMirror::new(
+                OperatorLogPolicy::new(operator_log_root),
+                mirrored_cursor,
+            )),
             adapter,
             readiness_probe_driver,
             recovery: Mutex::new(RecoveryQueue::new(Vec::new())),
@@ -441,12 +461,14 @@ impl RuntimeEngine {
             (outcome, provider_smoke_event)
         };
         self.finish_admission(
-            command.host,
-            command.prompt,
-            command.execution_mode,
-            command.dispatch,
+            AdmissionExecution {
+                host: command.host,
+                prompt: command.prompt,
+                execution_mode: command.execution_mode,
+                dispatch_preference: command.dispatch,
+                provider_smoke_event,
+            },
             outcome,
-            provider_smoke_event,
             context.lease_owner().clone(),
         )
     }
@@ -498,12 +520,14 @@ impl RuntimeEngine {
             (outcome, provider_smoke_event)
         };
         self.finish_admission(
-            LOCAL_DEMO_HOST,
-            command.prompt,
-            command.execution_mode,
-            command.dispatch,
+            AdmissionExecution {
+                host: LOCAL_DEMO_HOST,
+                prompt: command.prompt,
+                execution_mode: command.execution_mode,
+                dispatch_preference: command.dispatch,
+                provider_smoke_event,
+            },
             outcome,
-            provider_smoke_event,
             context.lease_owner().clone(),
         )
     }
@@ -874,12 +898,8 @@ impl RuntimeEngine {
 
     fn finish_admission(
         self: &Arc<Self>,
-        host: &str,
-        prompt: &str,
-        execution_mode: satelle_core::session::TurnExecutionMode,
-        dispatch_preference: request::DispatchPreference,
+        execution: AdmissionExecution<'_>,
         outcome: AdmissionOutcome,
-        provider_smoke_event: Option<satelle_core::SatelleEventBody>,
         lease_owner: LeaseOwner,
     ) -> Result<RuntimeTurnOutcome, SatelleError> {
         match outcome {
@@ -905,13 +925,13 @@ impl RuntimeEngine {
                 };
                 let admitted = model::turn_outcome(&work.session, Vec::new());
                 let plan = ExecutionPlan {
-                    host: host.to_string(),
-                    prompt: prompt.to_string(),
-                    execution_mode,
+                    host: execution.host.to_string(),
+                    prompt: execution.prompt.to_string(),
+                    execution_mode: execution.execution_mode,
                     work,
-                    provider_smoke_event,
+                    provider_smoke_event: execution.provider_smoke_event,
                 };
-                match dispatch_preference {
+                match execution.dispatch_preference {
                     request::DispatchPreference::Inline => self.execute(plan),
                     request::DispatchPreference::Detached => {
                         self.schedule(plan)?;
@@ -1008,15 +1028,51 @@ impl RuntimeEngine {
             .map_err(model::storage_failure)
     }
 
-    fn lock_storage(&self) -> Result<MutexGuard<'_, Storage>, SatelleError> {
-        self.storage.lock().map_err(|_| {
-            model::integrity_failure("the runtime storage lock was poisoned by a failed operation")
-        })
+    fn lock_storage(&self) -> Result<RuntimeStorageGuard<'_>, SatelleError> {
+        self.storage
+            .lock()
+            .map(|storage| RuntimeStorageGuard {
+                storage,
+                operator_log: &self.operator_log,
+            })
+            .map_err(|_| {
+                model::integrity_failure(
+                    "the runtime storage lock was poisoned by a failed operation",
+                )
+            })
+    }
+}
+
+struct RuntimeStorageGuard<'a> {
+    storage: MutexGuard<'a, Storage>,
+    operator_log: &'a Mutex<OperatorLogMirror>,
+}
+
+impl Deref for RuntimeStorageGuard<'_> {
+    type Target = Storage;
+
+    fn deref(&self) -> &Self::Target {
+        &self.storage
+    }
+}
+
+impl DerefMut for RuntimeStorageGuard<'_> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.storage
+    }
+}
+
+impl Drop for RuntimeStorageGuard<'_> {
+    fn drop(&mut self) {
+        if let Ok(mut operator_log) = self.operator_log.lock() {
+            operator_log.flush_committed(&self.storage);
+        }
     }
 }
 
 struct LazyRuntime {
     state_root: Result<PathBuf, SatelleError>,
+    operator_log_root: Result<PathBuf, SatelleError>,
     engine: Option<Arc<RuntimeEngine>>,
 }
 
@@ -1274,11 +1330,16 @@ impl RuntimeHandle {
         state_root: Result<PathBuf, SatelleError>,
         adapter: A,
     ) -> Self {
+        let operator_log_root = state_root
+            .as_ref()
+            .map(|root| root.join("logs"))
+            .map_err(Clone::clone);
         Self {
             adapter: Arc::new(adapter),
             readiness_probe_driver: None,
             lazy: Arc::new(Mutex::new(LazyRuntime {
                 state_root,
+                operator_log_root,
                 engine: None,
             })),
         }
@@ -1286,6 +1347,7 @@ impl RuntimeHandle {
 
     pub(crate) fn new_production(
         state_root: Result<PathBuf, SatelleError>,
+        operator_log_root: Result<PathBuf, SatelleError>,
         adapter: ProductionComputerUseAdapter,
     ) -> Self {
         let adapter = Arc::new(adapter);
@@ -1296,6 +1358,7 @@ impl RuntimeHandle {
             readiness_probe_driver: Some(readiness_probe_driver),
             lazy: Arc::new(Mutex::new(LazyRuntime {
                 state_root,
+                operator_log_root,
                 engine: None,
             })),
         }
@@ -1311,11 +1374,16 @@ impl RuntimeHandle {
         A: ComputerUseAdapter,
         D: ReadinessProbeDriver,
     {
+        let operator_log_root = state_root
+            .as_ref()
+            .map(|root| root.join("logs"))
+            .map_err(Clone::clone);
         Self {
             adapter: Arc::new(adapter),
             readiness_probe_driver: Some(Arc::new(readiness_probe_driver)),
             lazy: Arc::new(Mutex::new(LazyRuntime {
                 state_root,
+                operator_log_root,
                 engine: None,
             })),
         }
@@ -1739,8 +1807,10 @@ impl RuntimeHandle {
             return Ok(Arc::clone(engine));
         }
         let state_root = lazy.state_root.clone()?;
+        let operator_log_root = lazy.operator_log_root.clone()?;
         let engine = RuntimeEngine::open(
             &state_root,
+            operator_log_root,
             Arc::clone(&self.adapter),
             self.readiness_probe_driver.clone(),
         )?;

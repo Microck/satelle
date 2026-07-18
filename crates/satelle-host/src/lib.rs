@@ -308,7 +308,17 @@ impl HostService {
     /// the fully resolved host/profile configuration.
     pub fn production_for_host(config: &HostConfig) -> Self {
         let snapshot = Arc::new(RwLock::new(ProductionCapabilitySnapshot::collect(None)));
-        let state_root = satelle_core::state_dir();
+        let paths = satelle_core::resolve_path_set(
+            &std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")),
+        );
+        let state_root = paths
+            .as_ref()
+            .map(|paths| paths.state_root.clone())
+            .map_err(Clone::clone);
+        let operator_log_root = paths
+            .as_ref()
+            .map(|paths| paths.operator_log_root.clone())
+            .map_err(Clone::clone);
         let working_directory = state_root
             .as_ref()
             .map(|path| path.join("codex-app-server-work"))
@@ -336,7 +346,7 @@ impl HostService {
             provider_smoke_failure_ttl,
         );
         Self {
-            runtime: RuntimeHandle::new_production(state_root, adapter),
+            runtime: RuntimeHandle::new_production(state_root, operator_log_root, adapter),
             operation_capacity: Arc::new(OperationCapacity::default()),
             mode: HostMode::Production { snapshot },
             bootstrap_auth: None,
