@@ -924,25 +924,25 @@
 - satelle CLI --events json may merge CLI-produced Satelle Events with Host Daemon-produced Satelle Events in one newline-delimited stream while preserving the shared envelope @mvp @implemented
 - satelle CLI --events json assigns seq values for the CLI output stream even when relaying Host Daemon-produced Satelle Events @mvp @implemented
 - satelle Host Daemon WebSocket assigns seq values for each WebSocket event stream and does not expose seq as a durable stored event id @spec @mvp @implemented
-- satelle automation consumers correlate durable Satelle state with session_id, turn_id, type, timestamp, and structured data rather than seq alone @spec @mvp
-- a Host Daemon WebSocket connection authenticates and authorizes its API Principal before accepting subscriptions @spec @mvp
-- an MVP WebSocket subscription selects one or more explicit host, session, or turn scopes allowed by its API Principal @spec @contract @mvp
+- satelle automation consumers correlate durable Satelle state with session_id, turn_id, type, timestamp, and structured data rather than seq alone @spec @mvp @implemented
+- a Host Daemon WebSocket connection authenticates and authorizes its API Principal before accepting subscriptions @spec @mvp @implemented
+- an MVP WebSocket subscription selects one or more explicit host, session, or turn scopes allowed by its API Principal @spec @contract @mvp @implemented
 - operation subscriptions are not part of MVP until a public operation identity exists, log subscriptions are not part of MVP because normalized logs use the separate cursor-based log contract, and goal subscriptions are not part of MVP until Goal lifecycle event types exist @spec @contract @mvp @implemented
-- GET /v1/events authenticates and authorizes read scope before upgrading, requires the ordinary Satelle-Request-Id and Satelle-Expected-Host-Identity headers, and rejects query parameters, cookies, and request bodies @spec @contract @mvp
+- GET /v1/events authenticates and authorizes read scope before upgrading, requires the ordinary Satelle-Request-Id and Satelle-Expected-Host-Identity headers, and rejects query parameters, cookies, and request bodies @spec @contract @mvp @implemented
 - a WebSocket client sends a satelle.ws.control.v1 subscribe message containing exactly schema_version, type, request_id, and subscriptions, where type is subscribe and subscriptions contains from 1 through 16 unique typed scopes @spec @contract @mvp @implemented
 - a host subscription contains only kind host, a session subscription contains kind session plus one canonical session_id, and a turn subscription contains kind turn plus one canonical session_id and turn_id @spec @contract @mvp @implemented
 - each valid subscribe message atomically replaces the connection's complete subscription set without resetting the stream-local seq, and the server acknowledges it with a satelle.ws.control.v1 subscribed message echoing request_id, Host Identity, and the exact validated scopes before delivering matching events @spec @contract @mvp @implemented
 - an event matching multiple WebSocket subscription scopes is delivered once, and replacing subscriptions begins from a fresh live receiver so events captured before the replacement are not replayed under the new scopes @spec @contract @mvp @implemented
 - WebSocket control decoding accepts text frames only, rejects unknown or duplicate fields and duplicate subscriptions, accepts only canonical identifiers and schema tokens, and never accepts bearer credentials in a control message @spec @contract @mvp @implemented
-- one WebSocket connection has a bounded outbound event queue @spec @mvp
-- a slow WebSocket subscriber never blocks Turn execution, SQLite commits, cancellation, or delivery to other subscribers @spec @mvp
-- the Host Daemon closes a subscriber whose outbound queue overflows with a typed slow-consumer close reason @spec @mvp
-- WebSocket overflow diagnostics record only Principal token id, subscription scope, last delivered seq, and dropped event count @spec @mvp
+- one WebSocket connection has a bounded outbound event queue @spec @mvp @implemented
+- a slow WebSocket subscriber never blocks Turn execution, SQLite commits, cancellation, or delivery to other subscribers @spec @mvp @implemented
+- the Host Daemon closes a subscriber whose outbound queue overflows with a typed slow-consumer close reason @spec @mvp @implemented
+- WebSocket overflow diagnostics record only Principal token id, subscription scope, last delivered seq, and dropped event count @spec @mvp @implemented
 - stream-local seq values may contain gaps after authorization filtering or slow-consumer overflow @spec @mvp @implemented
 - a terminal Turn event is published only after the terminal state transaction commits @spec @mvp @implemented
 - clients never treat receipt of a WebSocket event as proof of committed state unless the event references the committed session_state_revision or turn_state_revision for its state_subject @spec @mvp @implemented
 - loss of a terminal event does not lose terminal state because satelle status remains authoritative @spec @mvp @implemented
-- clients reconcile status and normalized logs after any WebSocket disconnect or seq discontinuity @spec @mvp
+- clients reconcile status and normalized logs after any WebSocket disconnect or seq discontinuity @spec @mvp @implemented
 - WebSocket ping, pong, idle timeout, maximum message size, and outbound queue limits are advertised through authenticated capabilities @spec @mvp @implemented
 - authenticated capabilities advertise the maximum subscriptions per WebSocket and the inbound WebSocket message rate per API Principal @spec @mvp @implemented
 - id: q82
@@ -951,16 +951,16 @@
   tags: [spec, mvp, implemented, ci]
 - every inbound WebSocket text, binary, ping, or pong frame consumes the API Principal's inbound-message allowance, while a close frame may terminate without consuming allowance @spec @contract @mvp @implemented
 - WebSocket connection capacity and inbound-message limits both aggregate by the authenticated Principal reference rather than by bearer token id, so rotating or issuing another token cannot multiply one Principal's limits @spec @contract @mvp @implemented
-- satelle.ws.control.v1 protocol failures send a best-effort flat typed error control message containing an exact reason field and then a close frame whose ASCII reason token remains authoritative when the error message cannot be delivered @spec @contract @mvp
+- satelle.ws.control.v1 protocol failures send a best-effort flat typed error control message containing an exact reason field and then a close frame whose ASCII reason token remains authoritative when the error message cannot be delivered @spec @contract @mvp @implemented
 - the typed WebSocket error reason, close-frame reason token, and close code use one closed mapping and never contradict one another @spec @contract @mvp @implemented
 - authenticated WebSocket clients validate both request_id and Host Identity on every subscribed or error control message and reject a typed error whose following close frame does not carry its mapped reason and code @contract @mvp @implemented
 - WebSocket close reason tokens are invalid-request, unsupported-schema, authorization-insufficient-scope, capacity-exceeded, rate-limited, authentication-failed, slow-consumer, payload-too-large, internal-error, idle-timeout, and server-shutdown @spec @contract @mvp @implemented
 - invalid-request, unsupported-schema, authorization-insufficient-scope, capacity-exceeded, rate-limited, authentication-failed, slow-consumer, and idle-timeout use WebSocket close code 1008, payload-too-large uses 1009, internal-error uses 1011, and server-shutdown uses 1001 @spec @contract @mvp @implemented
 - authenticated capabilities advertise 4 WebSocket connections per Principal, 65536 message bytes, 16 subscriptions per connection, 120 inbound messages per minute per Principal, 256 outbound queued events, a 15000 millisecond ping interval, and a 45000 millisecond idle timeout @spec @contract @mvp @implemented
-- existing WebSocket connections revalidate token id and credential revision during activity and heartbeat checks so expiration, revocation, or rotation closes them with the generic authentication-failed reason @spec @contract @mvp
-- satelle Host Daemon uses Axum on Tokio for its HTTP JSON and WebSocket API implementation @spec @mvp
-- satelle API keeps streaming event flow separate from command response flow instead of forcing every operation through one transport shape @spec @mvp
-- satelle API does not mirror Codex app-server JSON-RPC as its public contract @spec @mvp
+- existing WebSocket connections revalidate token id and credential revision during activity and heartbeat checks so expiration, revocation, or rotation closes them with the generic authentication-failed reason @spec @contract @mvp @implemented
+- satelle Host Daemon uses Axum on Tokio for its HTTP JSON and WebSocket API implementation @spec @mvp @implemented
+- satelle API keeps streaming event flow separate from command response flow instead of forcing every operation through one transport shape @spec @mvp @implemented
+- satelle API does not mirror Codex app-server JSON-RPC as its public contract @spec @mvp @implemented
 - attached satelle run and steer over direct Host transport subscribe to live Host Daemon WebSocket events and reconcile authoritative Session status after stream loss, while detached direct commands return the same durable admission handles without waiting @contract @mvp @implemented
 
 # errors
