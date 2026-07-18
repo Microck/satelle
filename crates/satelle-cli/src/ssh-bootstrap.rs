@@ -1,6 +1,6 @@
 use flate2::read::GzDecoder;
 use reqwest::blocking::{Client, Response};
-use satelle_core::HostConfig;
+use satelle_core::{DaemonPathOverrides, HostConfig};
 use satelle_host::{ApiBearerToken, readiness_probe_timeouts};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
@@ -22,6 +22,7 @@ use super::ssh_tunnel::{SshStderrClassification, classify_stderr};
 use super::{SSH_BOOTSTRAP_LOCK_READY, SshBootstrapScope};
 
 const PROBE_OUTPUT_LIMIT: usize = 4096;
+const TAILSCALE_SERVE_STATUS_OUTPUT_LIMIT: usize = 1024 * 1024;
 const START_OUTPUT_LIMIT: u64 = 16 * 1024;
 const MANIFEST_LIMIT: u64 = 1024 * 1024;
 const ARCHIVE_LIMIT: u64 = 256 * 1024 * 1024;
@@ -30,6 +31,13 @@ const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(60);
 const BOOTSTRAP_LOCK_EXIT_GRACE: Duration = Duration::from_millis(500);
 const BOOTSTRAP_LOCK_EXIT_POLL: Duration = Duration::from_millis(10);
 const RELEASE_BASE_URL: &str = "https://github.com/Microck/satelle/releases/download";
+const DAEMON_PATH_ENVIRONMENT_VARIABLES: [&str; 5] = [
+    "SATELLE_HOME",
+    "SATELLE_CONFIG_FILE",
+    "SATELLE_STATE_DIR",
+    "SATELLE_CACHE_DIR",
+    "SATELLE_LOG_DIR",
+];
 pub(super) struct SshBootstrapLock {
     child: Child,
     stdin: Option<ChildStdin>,
@@ -189,7 +197,7 @@ impl SshBootstrapProcess {
             bootstrap_scope,
             "127.0.0.1:3001",
             Some(3001),
-            false,
+            None,
         )
     }
 
@@ -197,6 +205,7 @@ impl SshBootstrapProcess {
         destination: &str,
         token: &ApiBearerToken,
         host_config: &HostConfig,
+        previous_host_config: &HostConfig,
         bootstrap_scope: SshBootstrapScope,
     ) -> Result<Self, SshBootstrapError> {
         Self::launch_bound(
@@ -206,7 +215,7 @@ impl SshBootstrapProcess {
             bootstrap_scope,
             "127.0.0.1:0",
             None,
-            true,
+            Some(previous_host_config),
         )
     }
 
@@ -217,30 +226,27 @@ impl SshBootstrapProcess {
         bootstrap_scope: SshBootstrapScope,
         bind: &str,
         expected_port: Option<u16>,
-        release_existing_state_owner: bool,
+        release_host_config: Option<&HostConfig>,
     ) -> Result<Self, SshBootstrapError> {
         let target = RemoteTarget::probe(destination)?;
+        let environment = target.validated_daemon_environment(host_config)?;
+        let release_environment = release_host_config
+            .map(|previous_host_config| target.validated_daemon_environment(previous_host_config))
+            .transpose()?;
         let artifact = DownloadedArtifact::fetch(target)?;
         let remote_binary = upload_artifact(destination, target, artifact.path())?;
-        if release_existing_state_owner {
-            require_success(run_ssh_command(
-                destination,
-                &target.release_state_command(&remote_binary),
-            )?)?;
+        let (release_command, start_command) = target.state_owner_handoff_commands(
+            &remote_binary,
+            release_environment.as_deref(),
+            host_config,
+            &environment,
+            bootstrap_scope,
+            bind,
+        );
+        if let Some(release_command) = release_command {
+            require_success(run_ssh_command(destination, &release_command)?)?;
         }
-        let (native_timeout, provider_timeout) = readiness_probe_timeouts(host_config);
-        Self::spawn(
-            destination,
-            target.start_command(
-                &remote_binary,
-                bootstrap_scope,
-                native_timeout,
-                provider_timeout,
-                bind,
-            ),
-            Some(token),
-            expected_port,
-        )
+        Self::spawn(destination, start_command, Some(token), expected_port)
     }
 
     pub(super) const fn remote_port(&self) -> u16 {
@@ -253,14 +259,16 @@ impl SshBootstrapProcess {
         host_config: &HostConfig,
     ) -> Result<(), SshBootstrapError> {
         let target = RemoteTarget::probe(destination)?;
+        let environment = target.validated_daemon_environment(host_config)?;
         let artifact = DownloadedArtifact::fetch(target)?;
         let remote_binary = upload_artifact(destination, target, artifact.path())?;
         let (native_timeout, provider_timeout) = readiness_probe_timeouts(host_config);
-        let command = target.durable_start_command(
+        let command = target.durable_start_command_with_environment(
             &remote_binary,
             idle_timeout,
             native_timeout,
             provider_timeout,
+            &environment,
         );
         require_success(run_ssh_command(destination, &command)?)
     }
@@ -374,6 +382,30 @@ enum RemoteTarget {
 }
 
 impl RemoteTarget {
+    fn state_owner_handoff_commands(
+        self,
+        remote_binary: &str,
+        release_environment: Option<&[(&'static str, &Path)]>,
+        host_config: &HostConfig,
+        environment: &[(&'static str, &Path)],
+        bootstrap_scope: SshBootstrapScope,
+        bind: &str,
+    ) -> (Option<String>, String) {
+        let release_command = release_environment.map(|environment| {
+            self.release_state_command_with_environment(remote_binary, environment)
+        });
+        let (native_timeout, provider_timeout) = readiness_probe_timeouts(host_config);
+        let start_command = self.start_command_with_environment(
+            remote_binary,
+            bootstrap_scope,
+            native_timeout,
+            provider_timeout,
+            bind,
+            environment,
+        );
+        (release_command, start_command)
+    }
+
     fn probe(destination: &str) -> Result<Self, SshBootstrapError> {
         let windows = run_ssh_command(
             destination,
@@ -536,6 +568,7 @@ impl RemoteTarget {
         }
     }
 
+    #[cfg(test)]
     fn start_command(
         self,
         remote_binary: &str,
@@ -544,6 +577,25 @@ impl RemoteTarget {
         provider_timeout: Duration,
         bind: &str,
     ) -> String {
+        self.start_command_with_environment(
+            remote_binary,
+            bootstrap_scope,
+            native_timeout,
+            provider_timeout,
+            bind,
+            &[],
+        )
+    }
+
+    fn start_command_with_environment(
+        self,
+        remote_binary: &str,
+        bootstrap_scope: SshBootstrapScope,
+        native_timeout: Duration,
+        provider_timeout: Duration,
+        bind: &str,
+        environment: &[(&'static str, &Path)],
+    ) -> String {
         let timeout_args = format!(
             "--bind {bind} --bootstrap-scope {} --bootstrap-native-readiness-timeout-ms {} --bootstrap-provider-smoke-timeout-ms {}",
             bootstrap_scope.as_cli_value(),
@@ -551,22 +603,100 @@ impl RemoteTarget {
             provider_timeout.as_millis()
         );
         if self.is_windows() {
-            format!(
-                "cmd.exe /d /c {remote_binary} host start --bootstrap-token-stdin {timeout_args} --json"
-            )
+            let script = format!(
+                "{}& {} host start --bootstrap-token-stdin {timeout_args} --json",
+                powershell_environment(environment),
+                powershell_quote(remote_binary),
+            );
+            powershell_encoded_command(&script)
         } else {
-            format!(
-                "sh -c 'exec {remote_binary} host start --bootstrap-token-stdin {timeout_args} --json'"
-            )
+            let script = format!(
+                "{}exec {remote_binary} host start --bootstrap-token-stdin {timeout_args} --json",
+                posix_environment(environment),
+            );
+            format!("sh -c {}", posix_quote(&script))
         }
     }
 
+    #[cfg(test)]
     fn durable_start_command(
         self,
         remote_binary: &str,
         idle_timeout: Duration,
         native_timeout: Duration,
         provider_timeout: Duration,
+    ) -> String {
+        self.durable_start_command_with_environment(
+            remote_binary,
+            idle_timeout,
+            native_timeout,
+            provider_timeout,
+            &[],
+        )
+    }
+
+    fn validated_daemon_environment(
+        self,
+        host_config: &HostConfig,
+    ) -> Result<Vec<(&'static str, &Path)>, SshBootstrapError> {
+        let environment = daemon_environment(host_config);
+        for (name, path) in &environment {
+            self.validate_daemon_path(name, path)?;
+        }
+        Ok(environment)
+    }
+
+    fn validate_daemon_path_overrides(
+        self,
+        daemon_path_overrides: &DaemonPathOverrides,
+    ) -> Result<(), SshBootstrapError> {
+        for entry in daemon_path_overrides.entries() {
+            let name = match (entry.environment_variable.as_str(), entry.source.as_str()) {
+                ("SATELLE_HOME", "setup_flag") => "--daemon-home",
+                ("SATELLE_CONFIG_FILE", "setup_flag") => "--daemon-config-file",
+                ("SATELLE_STATE_DIR", "setup_flag") => "--daemon-state-dir",
+                ("SATELLE_CACHE_DIR", "setup_flag") => "--daemon-cache-dir",
+                ("SATELLE_LOG_DIR", "setup_flag") => "--daemon-log-dir",
+                ("SATELLE_HOME", _) => "SATELLE_HOME",
+                ("SATELLE_CONFIG_FILE", _) => "SATELLE_CONFIG_FILE",
+                ("SATELLE_STATE_DIR", _) => "SATELLE_STATE_DIR",
+                ("SATELLE_CACHE_DIR", _) => "SATELLE_CACHE_DIR",
+                ("SATELLE_LOG_DIR", _) => "SATELLE_LOG_DIR",
+                _ => unreachable!("DaemonPathOverrides exposes only canonical variables"),
+            };
+            self.validate_daemon_path(name, Path::new(&entry.value))?;
+        }
+        Ok(())
+    }
+
+    fn validate_daemon_path(
+        self,
+        name: &'static str,
+        path: &Path,
+    ) -> Result<(), SshBootstrapError> {
+        let value = path.to_string_lossy();
+        let absolute = if self.is_windows() {
+            is_windows_absolute_path(&value)
+        } else {
+            value.starts_with('/')
+        };
+        if absolute && !value.starts_with('~') {
+            return Ok(());
+        }
+
+        Err(SshBootstrapError::DaemonPathOverrideNotAbsolute {
+            name,
+            value: value.into_owned(),
+        })
+    }
+
+    fn durable_start_command_with_environment(
+        self,
+        remote_binary: &str,
+        idle_timeout: Duration,
+        native_timeout: Duration,
+        provider_timeout: Duration,
+        environment: &[(&'static str, &Path)],
     ) -> String {
         let timeout_args = format!(
             "--on-demand-idle-timeout-ms {} --bootstrap-native-readiness-timeout-ms {} --bootstrap-provider-smoke-timeout-ms {}",
@@ -575,62 +705,269 @@ impl RemoteTarget {
             provider_timeout.as_millis()
         );
         if self.is_windows() {
-            format!(
+            let script = format!(
                 concat!(
-                    "powershell.exe -NoProfile -NonInteractive -Command \"",
-                    "$binary = (Resolve-Path -LiteralPath '{}').Path; ",
+                    "{}$binary = (Resolve-Path -LiteralPath {}).Path; ",
                     "$command = '\"' + $binary + '\" host start {} --json'; ",
+                    "$environment = [System.Environment]::GetEnvironmentVariables('Process')",
+                    ".GetEnumerator() | ForEach-Object {{ \"$($_.Key)=$($_.Value)\" }}; ",
+                    "$startup = New-CimInstance -ClassName Win32_ProcessStartup -ClientOnly ",
+                    "-Property @{{ EnvironmentVariables = @($environment) }}; ",
                     "$created = Invoke-CimMethod -ClassName Win32_Process -MethodName Create ",
-                    "-Arguments @{{ CommandLine = $command }}; ",
-                    "if ($created.ReturnValue -ne 0) {{ exit $created.ReturnValue }}\""
+                    "-Arguments @{{ CommandLine = $command; ",
+                    "ProcessStartupInformation = $startup }}; ",
+                    "if ($created.ReturnValue -ne 0) {{ exit $created.ReturnValue }}"
                 ),
-                remote_binary, timeout_args
-            )
+                powershell_environment(environment),
+                powershell_quote(remote_binary),
+                timeout_args,
+            );
+            powershell_encoded_command(&script)
         } else {
-            format!(
-                "sh -c 'nohup {remote_binary} host start {timeout_args} --json </dev/null >/dev/null 2>&1 &'"
-            )
+            let script = format!(
+                "{}nohup {remote_binary} host start {timeout_args} --json </dev/null >/dev/null 2>&1 &",
+                posix_environment(environment),
+            );
+            format!("sh -c {}", posix_quote(&script))
         }
     }
 
+    #[cfg(test)]
     fn release_state_command(self, remote_binary: &str) -> String {
+        self.release_state_command_with_environment(remote_binary, &[])
+    }
+
+    fn release_state_command_with_environment(
+        self,
+        remote_binary: &str,
+        environment: &[(&'static str, &Path)],
+    ) -> String {
         if self.is_windows() {
-            format!("cmd.exe /d /c {remote_binary} host release-state")
+            let script = format!(
+                "{}& {} host release-state",
+                powershell_environment(environment),
+                powershell_quote(remote_binary),
+            );
+            powershell_encoded_command(&script)
         } else {
-            format!("sh -c '{remote_binary} host release-state'")
+            let script = format!(
+                "{}exec {remote_binary} host release-state",
+                posix_environment(environment),
+            );
+            format!("sh -c {}", posix_quote(&script))
         }
     }
 
     fn tailscale_serve_command(self, apply: bool) -> &'static str {
         match (self.is_windows(), apply) {
-            (true, false) => "cmd.exe /d /c \"tailscale.exe serve status --json >nul\"",
+            (true, false) => "cmd.exe /d /c \"tailscale.exe serve status --json\"",
             (true, true) => concat!(
                 "cmd.exe /d /c \"tailscale.exe serve --bg --yes --https 443 ",
                 "http://127.0.0.1:3001 >nul\""
             ),
-            (false, false) => "sh -c 'tailscale serve status --json >/dev/null'",
+            (false, false) => "sh -c 'exec tailscale serve status --json'",
             (false, true) => concat!(
                 "sh -c 'exec tailscale serve --bg --yes --https 443 ",
                 "http://127.0.0.1:3001 >/dev/null'"
             ),
         }
     }
+
+    fn tailscale_service_config_command(self) -> &'static str {
+        if self.is_windows() {
+            "cmd.exe /d /c \"tailscale.exe serve get-config --all\""
+        } else {
+            "sh -c 'exec tailscale serve get-config --all'"
+        }
+    }
 }
 
-pub(super) fn probe_tailscale_serve(destination: &str) -> Result<(), SshBootstrapError> {
-    run_tailscale_serve(destination, false)
+fn daemon_environment(host_config: &HostConfig) -> Vec<(&'static str, &Path)> {
+    [
+        ("SATELLE_HOME", host_config.daemon_home.as_deref()),
+        (
+            "SATELLE_CONFIG_FILE",
+            host_config.daemon_config_file.as_deref(),
+        ),
+        ("SATELLE_STATE_DIR", host_config.daemon_state_dir.as_deref()),
+        ("SATELLE_CACHE_DIR", host_config.daemon_cache_dir.as_deref()),
+        ("SATELLE_LOG_DIR", host_config.daemon_log_dir.as_deref()),
+    ]
+    .into_iter()
+    .filter_map(|(name, path)| path.map(|path| (name, path)))
+    .collect()
+}
+
+fn is_windows_absolute_path(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    let drive_absolute = bytes.len() >= 3
+        && bytes[0].is_ascii_alphabetic()
+        && bytes[1] == b':'
+        && matches!(bytes[2], b'/' | b'\\');
+    if drive_absolute {
+        return true;
+    }
+
+    let Some(remainder) = value
+        .strip_prefix("\\\\")
+        .or_else(|| value.strip_prefix("//"))
+    else {
+        return false;
+    };
+    let mut components = remainder.split(['/', '\\']);
+    components.next().is_some_and(|server| !server.is_empty())
+        && components.next().is_some_and(|share| !share.is_empty())
+}
+
+fn posix_environment(environment: &[(&'static str, &Path)]) -> String {
+    let mut script = format!("unset {}; ", DAEMON_PATH_ENVIRONMENT_VARIABLES.join(" "));
+    for (name, value) in environment {
+        write!(script, "{name}={} ", posix_quote(&value.to_string_lossy()))
+            .expect("writing to String cannot fail");
+    }
+    script
+}
+
+fn posix_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\"'\"'"))
+}
+
+fn powershell_environment(environment: &[(&'static str, &Path)]) -> String {
+    let mut script = String::new();
+    for name in DAEMON_PATH_ENVIRONMENT_VARIABLES {
+        write!(
+            script,
+            "[System.Environment]::SetEnvironmentVariable('{name}', $null, 'Process'); "
+        )
+        .expect("writing to String cannot fail");
+    }
+    for (name, value) in environment {
+        write!(
+            script,
+            "$env:{name} = {}; ",
+            powershell_quote(&value.to_string_lossy())
+        )
+        .expect("writing to String cannot fail");
+    }
+    script
+}
+
+fn powershell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "''"))
+}
+
+fn powershell_encoded_command(script: &str) -> String {
+    let mut bytes = Vec::with_capacity(script.len() * 2);
+    for unit in script.encode_utf16() {
+        bytes.extend_from_slice(&unit.to_le_bytes());
+    }
+    format!(
+        "powershell.exe -NoProfile -NonInteractive -EncodedCommand {}",
+        encode_base64(&bytes)
+    )
+}
+
+fn encode_base64(bytes: &[u8]) -> String {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut encoded = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let first = chunk[0];
+        let second = chunk.get(1).copied().unwrap_or(0);
+        let third = chunk.get(2).copied().unwrap_or(0);
+        encoded.push(ALPHABET[(first >> 2) as usize] as char);
+        encoded.push(ALPHABET[(((first & 0x03) << 4) | (second >> 4)) as usize] as char);
+        encoded.push(if chunk.len() > 1 {
+            ALPHABET[(((second & 0x0f) << 2) | (third >> 6)) as usize] as char
+        } else {
+            '='
+        });
+        encoded.push(if chunk.len() > 2 {
+            ALPHABET[(third & 0x3f) as usize] as char
+        } else {
+            '='
+        });
+    }
+    encoded
+}
+
+#[cfg(test)]
+fn decode_powershell_command(command: &str) -> Option<String> {
+    let encoded = command.rsplit_once(' ')?.1;
+    let mut bytes = Vec::with_capacity(encoded.len() / 4 * 3);
+    for chunk in encoded.as_bytes().chunks_exact(4) {
+        let decode = |byte| match byte {
+            b'A'..=b'Z' => Some(byte - b'A'),
+            b'a'..=b'z' => Some(byte - b'a' + 26),
+            b'0'..=b'9' => Some(byte - b'0' + 52),
+            b'+' => Some(62),
+            b'/' => Some(63),
+            b'=' => Some(0),
+            _ => None,
+        };
+        let values = [
+            decode(chunk[0]),
+            decode(chunk[1]),
+            decode(chunk[2]),
+            decode(chunk[3]),
+        ];
+        let [Some(first), Some(second), Some(third), Some(fourth)] = values else {
+            return None;
+        };
+        bytes.push((first << 2) | (second >> 4));
+        if chunk[2] != b'=' {
+            bytes.push((second << 4) | (third >> 2));
+        }
+        if chunk[3] != b'=' {
+            bytes.push((third << 6) | fourth);
+        }
+    }
+    if bytes.len() % 2 != 0 {
+        return None;
+    }
+    let units = bytes
+        .chunks_exact(2)
+        .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
+        .collect::<Vec<_>>();
+    String::from_utf16(&units).ok()
+}
+
+pub(super) fn probe_tailscale_serve(
+    destination: &str,
+    daemon_path_overrides: &DaemonPathOverrides,
+) -> Result<(Vec<u8>, Vec<u8>), SshBootstrapError> {
+    let target = RemoteTarget::probe(destination)?;
+    target.validate_daemon_path_overrides(daemon_path_overrides)?;
+    let status = run_tailscale_serve(destination, target, false)?;
+    let services = require_success_output(run_ssh_command_with_output_limit(
+        destination,
+        target.tailscale_service_config_command(),
+        TAILSCALE_SERVE_STATUS_OUTPUT_LIMIT,
+    )?)?
+    .stdout;
+    Ok((status, services))
 }
 
 pub(super) fn apply_tailscale_serve(destination: &str) -> Result<(), SshBootstrapError> {
-    run_tailscale_serve(destination, true)
+    let target = RemoteTarget::probe(destination)?;
+    run_tailscale_serve(destination, target, true).map(drop)
 }
 
-fn run_tailscale_serve(destination: &str, apply: bool) -> Result<(), SshBootstrapError> {
-    let target = RemoteTarget::probe(destination)?;
-    require_success(run_ssh_command(
+fn run_tailscale_serve(
+    destination: &str,
+    target: RemoteTarget,
+    apply: bool,
+) -> Result<Vec<u8>, SshBootstrapError> {
+    let output_limit = if apply {
+        PROBE_OUTPUT_LIMIT
+    } else {
+        TAILSCALE_SERVE_STATUS_OUTPUT_LIMIT
+    };
+    require_success_output(run_ssh_command_with_output_limit(
         destination,
         target.tailscale_serve_command(apply),
+        output_limit,
     )?)
+    .map(|output| output.stdout)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -999,19 +1336,36 @@ fn run_ssh_command(
     destination: &str,
     remote_command: &str,
 ) -> Result<CommandOutput, SshBootstrapError> {
-    run_program(
+    run_ssh_command_with_output_limit(destination, remote_command, PROBE_OUTPUT_LIMIT)
+}
+
+fn run_ssh_command_with_output_limit(
+    destination: &str,
+    remote_command: &str,
+    output_limit: usize,
+) -> Result<CommandOutput, SshBootstrapError> {
+    run_program_with_output_limit(
         "ssh",
         [
             OsStr::new("-T"),
             OsStr::new(destination),
             OsStr::new(remote_command),
         ],
+        output_limit,
     )
 }
 
 fn run_program<const N: usize>(
     program: &str,
     arguments: [&OsStr; N],
+) -> Result<CommandOutput, SshBootstrapError> {
+    run_program_with_output_limit(program, arguments, PROBE_OUTPUT_LIMIT)
+}
+
+fn run_program_with_output_limit<const N: usize>(
+    program: &str,
+    arguments: [&OsStr; N],
+    output_limit: usize,
 ) -> Result<CommandOutput, SshBootstrapError> {
     let mut child = Command::new(program)
         .args(arguments)
@@ -1028,7 +1382,7 @@ fn run_program<const N: usize>(
         .stderr
         .take()
         .expect("SSH stderr was configured as piped");
-    let stdout_reader = thread::spawn(move || read_bounded(stdout, PROBE_OUTPUT_LIMIT));
+    let stdout_reader = thread::spawn(move || read_bounded(stdout, output_limit));
     let stderr_reader = spawn_stderr_reader(stderr)?;
     let status = child.wait().map_err(SshBootstrapError::WaitSsh)?;
     let stdout = stdout_reader
@@ -1043,8 +1397,12 @@ fn run_program<const N: usize>(
 }
 
 fn require_success(output: CommandOutput) -> Result<(), SshBootstrapError> {
+    require_success_output(output).map(drop)
+}
+
+fn require_success_output(output: CommandOutput) -> Result<CommandOutput, SshBootstrapError> {
     if output.status.success() {
-        Ok(())
+        Ok(output)
     } else if output.stderr.host_key_verification_failed() {
         Err(SshBootstrapError::HostKeyVerificationRequired)
     } else {
@@ -1193,6 +1551,8 @@ pub(super) enum SshBootstrapError {
     InvalidProbe,
     #[error("the remote platform is not supported by an MVP Host artifact")]
     UnsupportedPlatform,
+    #[error("{name} is not an absolute path for the detected remote platform")]
+    DaemonPathOverrideNotAbsolute { name: &'static str, value: String },
     #[error("the release artifact request failed")]
     Http(#[source] reqwest::Error),
     #[error("the release artifact body could not be read")]
@@ -1240,6 +1600,31 @@ pub(super) enum SshBootstrapError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const POSIX_DAEMON_ENVIRONMENT_CLEAR: &str = concat!(
+        "unset SATELLE_HOME SATELLE_CONFIG_FILE SATELLE_STATE_DIR ",
+        "SATELLE_CACHE_DIR SATELLE_LOG_DIR; "
+    );
+
+    fn assert_powershell_clears_daemon_environment(script: &str) {
+        for name in DAEMON_PATH_ENVIRONMENT_VARIABLES {
+            assert!(
+                script.contains(&format!(
+                    "[System.Environment]::SetEnvironmentVariable('{name}', $null, 'Process'); "
+                )),
+                "PowerShell command did not clear {name}: {script}"
+            );
+        }
+    }
+
+    fn assert_occurs_before(script: &str, first: &str, second: &str) {
+        let first_index = script.find(first).expect("first command fragment");
+        let second_index = script.find(second).expect("second command fragment");
+        assert!(
+            first_index < second_index,
+            "{first:?} must precede {second:?}: {script}"
+        );
+    }
 
     #[test]
     fn windows_promotes_to_a_reusable_content_addressed_executable() {
@@ -1308,6 +1693,44 @@ mod tests {
     }
 
     #[test]
+    fn remote_daemon_path_overrides_accept_windows_absolute_paths_for_windows_targets() {
+        assert!(
+            RemoteTarget::WindowsX64Msvc
+                .validate_daemon_path("--daemon-state-dir", Path::new(r"C:\Satelle\State"))
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn remote_daemon_path_overrides_reject_posix_paths_for_windows_targets() {
+        let error = RemoteTarget::WindowsX64Msvc
+            .validate_daemon_path("--daemon-state-dir", Path::new("/srv/satelle/state"))
+            .expect_err("a POSIX absolute path is not absolute for a Windows Host");
+
+        assert!(matches!(
+            error,
+            SshBootstrapError::DaemonPathOverrideNotAbsolute { name, value }
+                if name == "--daemon-state-dir" && value == "/srv/satelle/state"
+        ));
+    }
+
+    #[test]
+    fn remote_daemon_path_overrides_apply_posix_rules_to_linux_and_macos_targets() {
+        for target in [RemoteTarget::LinuxX64Gnu, RemoteTarget::DarwinArm64] {
+            assert!(
+                target
+                    .validate_daemon_path("--daemon-state-dir", Path::new("/srv/satelle/state"))
+                    .is_ok()
+            );
+            assert!(
+                target
+                    .validate_daemon_path("--daemon-state-dir", Path::new(r"C:\Satelle\State"))
+                    .is_err()
+            );
+        }
+    }
+
+    #[test]
     fn release_manifest_selects_one_exact_archive_digest() {
         let digest = "11".repeat(32);
         let manifest = format!("{digest}  satelle-v0.1.0-linux-x64-gnu.tar.gz\n");
@@ -1332,7 +1755,7 @@ mod tests {
     fn tailscale_serve_commands_are_static_incremental_and_os_aware() {
         assert_eq!(
             RemoteTarget::LinuxX64Gnu.tailscale_serve_command(false),
-            "sh -c 'tailscale serve status --json >/dev/null'"
+            "sh -c 'exec tailscale serve status --json'"
         );
         assert_eq!(
             RemoteTarget::LinuxX64Gnu.tailscale_serve_command(true),
@@ -1347,6 +1770,14 @@ mod tests {
                 "cmd.exe /d /c \"tailscale.exe serve --bg --yes --https 443 ",
                 "http://127.0.0.1:3001 >nul\""
             )
+        );
+        assert_eq!(
+            RemoteTarget::LinuxX64Gnu.tailscale_service_config_command(),
+            "sh -c 'exec tailscale serve get-config --all'"
+        );
+        assert_eq!(
+            RemoteTarget::WindowsX64Msvc.tailscale_service_config_command(),
+            "cmd.exe /d /c \"tailscale.exe serve get-config --all\""
         );
     }
 
@@ -1363,28 +1794,181 @@ mod tests {
                 "127.0.0.1:3001",
             ),
             concat!(
-                "sh -c 'exec /tmp/satelle host start --bootstrap-token-stdin ",
+                "sh -c 'unset SATELLE_HOME SATELLE_CONFIG_FILE SATELLE_STATE_DIR ",
+                "SATELLE_CACHE_DIR SATELLE_LOG_DIR; ",
+                "exec /tmp/satelle host start --bootstrap-token-stdin ",
                 "--bind 127.0.0.1:3001 ",
                 "--bootstrap-scope read ",
                 "--bootstrap-native-readiness-timeout-ms 2500 ",
                 "--bootstrap-provider-smoke-timeout-ms 7500 --json'"
             )
         );
-        assert_eq!(
-            RemoteTarget::WindowsX64Msvc.start_command(
-                "satelle.exe",
-                SshBootstrapScope::Control,
-                native,
-                provider,
-                "127.0.0.1:0",
-            ),
-            concat!(
-                "cmd.exe /d /c satelle.exe host start --bootstrap-token-stdin ",
-                "--bind 127.0.0.1:0 ",
-                "--bootstrap-scope control ",
-                "--bootstrap-native-readiness-timeout-ms 2500 ",
-                "--bootstrap-provider-smoke-timeout-ms 7500 --json"
-            )
+        let windows = RemoteTarget::WindowsX64Msvc.start_command(
+            "satelle.exe",
+            SshBootstrapScope::Control,
+            native,
+            provider,
+            "127.0.0.1:0",
+        );
+        let script = decode_powershell_command(&windows).expect("decode foreground command");
+        assert_powershell_clears_daemon_environment(&script);
+        assert!(script.contains("host start --bootstrap-token-stdin"));
+        assert!(script.contains("--bind 127.0.0.1:0"));
+        assert!(script.contains("--bootstrap-scope control"));
+        assert!(script.contains("--bootstrap-native-readiness-timeout-ms 2500"));
+        assert!(script.contains("--bootstrap-provider-smoke-timeout-ms 7500"));
+    }
+
+    #[test]
+    fn path_change_releases_the_old_owner_before_the_new_daemon_becomes_authoritative() {
+        let mut host = HostConfig {
+            transport: satelle_core::TransportKind::Ssh,
+            adapter: satelle_core::AdapterKind::Codex,
+            address: Some("operator@host".to_string()),
+            network: None,
+            timeouts: None,
+            native_readiness_cache_ttl: None,
+            provider_smoke_success_cache_ttl: None,
+            provider_smoke_failure_cache_ttl: None,
+            daemon_idle_timeout: None,
+            desktop_user: None,
+            desktop_session_preference: None,
+            desktop_session_native_selector: None,
+            daemon_home: Some(PathBuf::from("/srv/satelle home")),
+            daemon_config_file: None,
+            daemon_state_dir: Some(PathBuf::from("/srv/selected-state")),
+            daemon_cache_dir: None,
+            daemon_log_dir: None,
+            setup_mode: None,
+            experimental_provider_computer_use: None,
+            yolo: None,
+            allow_project_selection: false,
+            expected_host_id: Some("host-test".to_string()),
+            api_token: None,
+            ca_bundle: None,
+            provider_auth: std::collections::BTreeMap::new(),
+        };
+        let unix_environment = RemoteTarget::LinuxX64Gnu
+            .validated_daemon_environment(&host)
+            .expect("validate POSIX daemon paths");
+        let unix = RemoteTarget::LinuxX64Gnu.start_command_with_environment(
+            "/tmp/satelle",
+            SshBootstrapScope::Control,
+            Duration::from_secs(1),
+            Duration::from_secs(2),
+            "127.0.0.1:3001",
+            &unix_environment,
+        );
+        assert!(unix.contains("SATELLE_HOME"));
+        assert!(unix.contains("/srv/satelle home"));
+        assert!(unix.contains("SATELLE_STATE_DIR"));
+        assert!(unix.contains("/srv/satelle"));
+
+        let mut previous_host = host.clone();
+        previous_host.daemon_state_dir = Some(PathBuf::from("/srv/previous-state"));
+        let previous_environment = RemoteTarget::LinuxX64Gnu
+            .validated_daemon_environment(&previous_host)
+            .expect("validate the prior state-owner paths");
+        let (release, start) = RemoteTarget::LinuxX64Gnu.state_owner_handoff_commands(
+            "/tmp/satelle",
+            Some(&previous_environment),
+            &host,
+            &unix_environment,
+            SshBootstrapScope::Admin,
+            "127.0.0.1:0",
+        );
+        let release = release.expect("a setup bootstrap releases the prior state owner");
+        assert!(release.contains("/srv/previous-state"));
+        assert!(!release.contains("/srv/selected-state"));
+        assert!(start.contains("/srv/selected-state"));
+        assert!(!start.contains("/srv/previous-state"));
+        assert!(start.contains("--bind 127.0.0.1:0"));
+
+        host.daemon_home = Some(PathBuf::from(r"C:\Satelle Home"));
+        host.daemon_state_dir = Some(PathBuf::from(r"C:\Satelle State"));
+        let windows_environment = RemoteTarget::WindowsX64Msvc
+            .validated_daemon_environment(&host)
+            .expect("validate Windows daemon paths");
+        let windows = RemoteTarget::WindowsX64Msvc.start_command_with_environment(
+            "satelle.exe",
+            SshBootstrapScope::Control,
+            Duration::from_secs(1),
+            Duration::from_secs(2),
+            "127.0.0.1:3001",
+            &windows_environment,
+        );
+        let script = decode_powershell_command(&windows).expect("decode PowerShell command");
+        assert_powershell_clears_daemon_environment(&script);
+        assert!(script.contains("$env:SATELLE_HOME = 'C:\\Satelle Home'"));
+        assert!(script.contains("$env:SATELLE_STATE_DIR = 'C:\\Satelle State'"));
+        assert_occurs_before(
+            &script,
+            "SetEnvironmentVariable('SATELLE_STATE_DIR'",
+            "$env:SATELLE_STATE_DIR =",
+        );
+        assert!(!script.contains("$env:SATELLE_CONFIG_FILE ="));
+        assert!(!script.contains("$env:SATELLE_CACHE_DIR ="));
+        assert!(!script.contains("$env:SATELLE_LOG_DIR ="));
+    }
+
+    #[test]
+    fn remote_daemon_path_environment_clears_inherited_values_for_foreground_commands() {
+        let empty_posix = RemoteTarget::LinuxX64Gnu.start_command_with_environment(
+            "/tmp/satelle",
+            SshBootstrapScope::Control,
+            Duration::from_secs(1),
+            Duration::from_secs(2),
+            "127.0.0.1:3001",
+            &[],
+        );
+        assert!(empty_posix.contains(POSIX_DAEMON_ENVIRONMENT_CLEAR));
+
+        let posix_environment = [("SATELLE_STATE_DIR", Path::new("/srv/satelle state"))];
+        let configured_posix = RemoteTarget::LinuxX64Gnu.start_command_with_environment(
+            "/tmp/satelle",
+            SshBootstrapScope::Control,
+            Duration::from_secs(1),
+            Duration::from_secs(2),
+            "127.0.0.1:3001",
+            &posix_environment,
+        );
+        assert!(configured_posix.contains(POSIX_DAEMON_ENVIRONMENT_CLEAR));
+        assert!(configured_posix.contains("SATELLE_STATE_DIR="));
+        assert_occurs_before(
+            &configured_posix,
+            POSIX_DAEMON_ENVIRONMENT_CLEAR,
+            "SATELLE_STATE_DIR=",
+        );
+
+        let empty_windows = RemoteTarget::WindowsX64Msvc.start_command_with_environment(
+            "satelle.exe",
+            SshBootstrapScope::Control,
+            Duration::from_secs(1),
+            Duration::from_secs(2),
+            "127.0.0.1:3001",
+            &[],
+        );
+        let empty_script =
+            decode_powershell_command(&empty_windows).expect("decode empty foreground command");
+        assert_powershell_clears_daemon_environment(&empty_script);
+
+        let windows_environment = [("SATELLE_STATE_DIR", Path::new(r"C:\Satelle State"))];
+        let configured_windows = RemoteTarget::WindowsX64Msvc.start_command_with_environment(
+            "satelle.exe",
+            SshBootstrapScope::Control,
+            Duration::from_secs(1),
+            Duration::from_secs(2),
+            "127.0.0.1:3001",
+            &windows_environment,
+        );
+        let configured_script = decode_powershell_command(&configured_windows)
+            .expect("decode configured foreground command");
+        assert_powershell_clears_daemon_environment(&configured_script);
+        assert!(configured_script.contains("$env:SATELLE_STATE_DIR = 'C:\\Satelle State'"));
+        assert_occurs_before(
+            &configured_script,
+            "SetEnvironmentVariable('SATELLE_STATE_DIR'",
+            "$env:SATELLE_STATE_DIR =",
         );
     }
 
@@ -1422,12 +2006,116 @@ mod tests {
     fn setup_bootstrap_requests_state_release_with_the_promoted_binary() {
         assert_eq!(
             RemoteTarget::LinuxX64Gnu.release_state_command(".cache/satelle/satelle"),
-            "sh -c '.cache/satelle/satelle host release-state'"
+            concat!(
+                "sh -c 'unset SATELLE_HOME SATELLE_CONFIG_FILE SATELLE_STATE_DIR ",
+                "SATELLE_CACHE_DIR SATELLE_LOG_DIR; ",
+                "exec .cache/satelle/satelle host release-state'"
+            )
         );
-        assert_eq!(
-            RemoteTarget::WindowsX64Msvc.release_state_command("AppData/Local/Satelle/satelle.exe"),
-            "cmd.exe /d /c AppData/Local/Satelle/satelle.exe host release-state"
+        let windows =
+            RemoteTarget::WindowsX64Msvc.release_state_command("AppData/Local/Satelle/satelle.exe");
+        let script = decode_powershell_command(&windows).expect("decode release-state command");
+        assert_powershell_clears_daemon_environment(&script);
+        assert!(script.contains("& 'AppData/Local/Satelle/satelle.exe' host release-state"));
+    }
+
+    #[test]
+    fn remote_daemon_path_environment_reaches_release_state_commands() {
+        let empty_posix =
+            RemoteTarget::LinuxX64Gnu.release_state_command_with_environment("/tmp/satelle", &[]);
+        assert!(empty_posix.contains(POSIX_DAEMON_ENVIRONMENT_CLEAR));
+
+        let posix_environment = [("SATELLE_STATE_DIR", Path::new("/srv/satelle state"))];
+        let posix = RemoteTarget::LinuxX64Gnu
+            .release_state_command_with_environment("/tmp/satelle", &posix_environment);
+        assert!(posix.contains(POSIX_DAEMON_ENVIRONMENT_CLEAR));
+        assert!(posix.contains("SATELLE_STATE_DIR"));
+        assert!(posix.contains("/srv/satelle state"));
+        assert!(posix.contains("host release-state"));
+
+        let empty_windows = RemoteTarget::WindowsX64Msvc
+            .release_state_command_with_environment("Satelle/satelle.exe", &[]);
+        let empty_script =
+            decode_powershell_command(&empty_windows).expect("decode empty release-state command");
+        assert_powershell_clears_daemon_environment(&empty_script);
+
+        let windows_environment = [("SATELLE_STATE_DIR", Path::new(r"C:\Satelle State"))];
+        let windows = RemoteTarget::WindowsX64Msvc
+            .release_state_command_with_environment("Satelle/satelle.exe", &windows_environment);
+        let script = decode_powershell_command(&windows).expect("decode release-state command");
+        assert_powershell_clears_daemon_environment(&script);
+        assert!(script.contains("$env:SATELLE_STATE_DIR = 'C:\\Satelle State'"));
+        assert_occurs_before(
+            &script,
+            "SetEnvironmentVariable('SATELLE_STATE_DIR'",
+            "$env:SATELLE_STATE_DIR =",
         );
+        assert!(script.contains("host release-state"));
+    }
+
+    #[test]
+    fn remote_daemon_path_environment_is_embedded_in_posix_durable_launch() {
+        let empty = RemoteTarget::LinuxX64Gnu.durable_start_command_with_environment(
+            "/tmp/satelle",
+            Duration::from_secs(75),
+            Duration::from_millis(2_500),
+            Duration::from_millis(7_500),
+            &[],
+        );
+        assert!(empty.contains(POSIX_DAEMON_ENVIRONMENT_CLEAR));
+
+        let environment = [("SATELLE_STATE_DIR", Path::new("/srv/satelle state"))];
+        let configured = RemoteTarget::LinuxX64Gnu.durable_start_command_with_environment(
+            "/tmp/satelle",
+            Duration::from_secs(75),
+            Duration::from_millis(2_500),
+            Duration::from_millis(7_500),
+            &environment,
+        );
+        assert!(configured.contains(POSIX_DAEMON_ENVIRONMENT_CLEAR));
+        assert!(configured.contains("SATELLE_STATE_DIR="));
+        assert_occurs_before(
+            &configured,
+            POSIX_DAEMON_ENVIRONMENT_CLEAR,
+            "SATELLE_STATE_DIR=",
+        );
+        assert!(configured.contains("/srv/satelle state"));
+        assert!(configured.contains("nohup /tmp/satelle host start"));
+    }
+
+    #[test]
+    fn remote_daemon_path_environment_is_embedded_in_windows_durable_launch() {
+        let empty = RemoteTarget::WindowsX64Msvc.durable_start_command_with_environment(
+            "Satelle/satelle.exe",
+            Duration::from_secs(75),
+            Duration::from_millis(2_500),
+            Duration::from_millis(7_500),
+            &[],
+        );
+        let empty_script = decode_powershell_command(&empty).expect("decode empty WMI launcher");
+        assert_powershell_clears_daemon_environment(&empty_script);
+
+        let environment = [("SATELLE_STATE_DIR", Path::new(r"C:\Satelle State"))];
+        let command = RemoteTarget::WindowsX64Msvc.durable_start_command_with_environment(
+            "Satelle/satelle.exe",
+            Duration::from_secs(75),
+            Duration::from_millis(2_500),
+            Duration::from_millis(7_500),
+            &environment,
+        );
+        let detached_script = decode_powershell_command(&command).expect("decode WMI launcher");
+
+        assert_powershell_clears_daemon_environment(&detached_script);
+        assert!(detached_script.contains("$env:SATELLE_STATE_DIR = 'C:\\Satelle State'"));
+        assert_occurs_before(
+            &detached_script,
+            "SetEnvironmentVariable('SATELLE_STATE_DIR'",
+            "$env:SATELLE_STATE_DIR =",
+        );
+        assert!(detached_script.contains("Win32_ProcessStartup"));
+        assert!(detached_script.contains("EnvironmentVariables = @($environment)"));
+        assert!(detached_script.contains("ProcessStartupInformation = $startup"));
+        assert!(detached_script.contains("host start"));
     }
 
     #[test]
@@ -1443,31 +2131,25 @@ mod tests {
                 provider_timeout,
             ),
             concat!(
-                "sh -c 'nohup /tmp/satelle host start --on-demand-idle-timeout-ms 75000 ",
+                "sh -c 'unset SATELLE_HOME SATELLE_CONFIG_FILE SATELLE_STATE_DIR ",
+                "SATELLE_CACHE_DIR SATELLE_LOG_DIR; ",
+                "nohup /tmp/satelle host start --on-demand-idle-timeout-ms 75000 ",
                 "--bootstrap-native-readiness-timeout-ms 2500 ",
                 "--bootstrap-provider-smoke-timeout-ms 7500 --json ",
                 "</dev/null >/dev/null 2>&1 &'"
             )
         );
-        assert_eq!(
-            RemoteTarget::WindowsX64Msvc.durable_start_command(
-                "AppData/Local/Satelle/satelle.exe",
-                idle_timeout,
-                native_timeout,
-                provider_timeout,
-            ),
-            concat!(
-                "powershell.exe -NoProfile -NonInteractive -Command \"",
-                "$binary = (Resolve-Path -LiteralPath ",
-                "'AppData/Local/Satelle/satelle.exe').Path; ",
-                "$command = '\"' + $binary + '\" host start ",
-                "--on-demand-idle-timeout-ms 75000 ",
-                "--bootstrap-native-readiness-timeout-ms 2500 ",
-                "--bootstrap-provider-smoke-timeout-ms 7500 --json'; ",
-                "$created = Invoke-CimMethod -ClassName Win32_Process -MethodName Create ",
-                "-Arguments @{ CommandLine = $command }; ",
-                "if ($created.ReturnValue -ne 0) { exit $created.ReturnValue }\""
-            )
+        let windows = RemoteTarget::WindowsX64Msvc.durable_start_command(
+            "AppData/Local/Satelle/satelle.exe",
+            idle_timeout,
+            native_timeout,
+            provider_timeout,
         );
+        let script = decode_powershell_command(&windows).expect("decode durable command");
+        assert_powershell_clears_daemon_environment(&script);
+        assert!(script.contains("--on-demand-idle-timeout-ms 75000"));
+        assert!(script.contains("--bootstrap-native-readiness-timeout-ms 2500"));
+        assert!(script.contains("--bootstrap-provider-smoke-timeout-ms 7500"));
+        assert!(script.contains("ProcessStartupInformation = $startup"));
     }
 }

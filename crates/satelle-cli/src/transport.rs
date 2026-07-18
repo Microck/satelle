@@ -81,9 +81,13 @@ mod ssh_tunnel;
 use ssh_bootstrap::SshBootstrapProcess;
 use ssh_tunnel::SshTunnel;
 
-pub(crate) fn probe_tailscale_serve(alias: &str, destination: &str) -> Result<(), SatelleError> {
-    ssh_bootstrap::probe_tailscale_serve(destination)
-        .map_err(|error| map_tailscale_serve_error(alias, error))
+pub(crate) fn probe_tailscale_serve(
+    alias: &str,
+    destination: &str,
+    daemon_path_overrides: &DaemonPathOverrides,
+) -> Result<(Vec<u8>, Vec<u8>), SatelleError> {
+    ssh_bootstrap::probe_tailscale_serve(destination, daemon_path_overrides)
+        .map_err(|error| map_ssh_daemon_bootstrap_error(alias, error))
 }
 
 pub(crate) fn apply_tailscale_serve(alias: &str, destination: &str) -> Result<(), SatelleError> {
@@ -181,6 +185,7 @@ impl TransportClient for LocalTransport {
         setup_components: Vec<String>,
         daemon_path_overrides: DaemonPathOverrides,
     ) -> Result<SetupReport, SatelleError> {
+        validate_local_daemon_path_overrides(&daemon_path_overrides)?;
         self.service.setup(
             &self.alias,
             dry_run,
@@ -296,6 +301,49 @@ impl TransportClient for LocalTransport {
             return Err(SatelleError::host_not_found(self.alias.clone()));
         }
         self.service.daemon_log_page(query)
+    }
+}
+
+fn validate_local_daemon_path_overrides(
+    daemon_path_overrides: &DaemonPathOverrides,
+) -> Result<(), SatelleError> {
+    for entry in daemon_path_overrides.entries() {
+        let path = Path::new(&entry.value);
+        if path.is_absolute() && !path.starts_with("~") {
+            continue;
+        }
+        let name = if entry.source == "setup_flag" {
+            match entry.environment_variable.as_str() {
+                "SATELLE_HOME" => "--daemon-home",
+                "SATELLE_CONFIG_FILE" => "--daemon-config-file",
+                "SATELLE_STATE_DIR" => "--daemon-state-dir",
+                "SATELLE_CACHE_DIR" => "--daemon-cache-dir",
+                "SATELLE_LOG_DIR" => "--daemon-log-dir",
+                _ => entry.environment_variable.as_str(),
+            }
+        } else {
+            entry.environment_variable.as_str()
+        };
+        return Err(SatelleError::daemon_path_override_not_absolute(
+            name,
+            entry.value,
+        ));
+    }
+    Ok(())
+}
+
+fn map_ssh_daemon_bootstrap_error(
+    alias: &str,
+    error: ssh_bootstrap::SshBootstrapError,
+) -> SatelleError {
+    match error {
+        ssh_bootstrap::SshBootstrapError::HostKeyVerificationRequired => {
+            SatelleError::ssh_host_key_verification_required(alias)
+        }
+        ssh_bootstrap::SshBootstrapError::DaemonPathOverrideNotAbsolute { name, value } => {
+            SatelleError::daemon_path_override_not_absolute(name, value)
+        }
+        _ => SatelleError::host_unreachable(alias),
     }
 }
 
@@ -417,9 +465,9 @@ impl SshSetupTransport {
         setup_mode: &str,
         setup_components: &[String],
     ) -> Result<(), SatelleError> {
-        // Token handoff is the only SSH setup mutation implemented here. Reject
-        // broader requests before planning or opening SSH so a partial setup can
-        // never be reported as successfully applied.
+        // On-demand artifact bootstrap and token handoff are the only SSH setup
+        // mutations implemented here. Reject broader requests before planning or
+        // opening SSH so a partial setup can never be reported as applied.
         if setup_mode != "on_demand" {
             return Err(self.unsupported("persistent service installation"));
         }
@@ -459,7 +507,14 @@ impl SshSetupTransport {
         .to_string();
         let applied = !matches!(application, SetupApplication::Planned { .. });
         let missing_token_file = self.binding.api_token().is_none();
-        let required_input = missing_token_file
+        let path_override_entries = daemon_path_overrides.entries();
+        let existing_token_rebind_required = matches!(
+            application,
+            SetupApplication::Planned {
+                existing_token_file: true
+            }
+        ) && !path_override_entries.is_empty();
+        let mut required_input = missing_token_file
             .then(|| SetupRequiredInput {
                 component: "transport".to_string(),
                 input_kind: "api_token_file_descriptor".to_string(),
@@ -471,7 +526,27 @@ impl SshSetupTransport {
             })
             .into_iter()
             .collect::<Vec<_>>();
-        let status = if missing_token_file {
+        if existing_token_rebind_required {
+            required_input.push(SetupRequiredInput {
+                component: "transport".to_string(),
+                input_kind: "daemon_path_override_token_rebind_required".to_string(),
+                reason: "the existing durable token may belong to the previous remote path set; Satelle will not reuse it for a selected path set or replace the local credential automatically".to_string(),
+                recovery_command: format!(
+                    "configure a new unused file-backed api_token path for host {}, preserve the existing token file for the old path set, then rerun satelle setup --host {} --on-demand --component transport",
+                    self.alias, self.alias
+                ),
+            });
+        }
+        let input_required = !required_input.is_empty();
+        let recovery_commands = required_input
+            .iter()
+            .map(|input| input.recovery_command.clone())
+            .collect();
+        let next_command = required_input.first().map_or_else(
+            || format!("satelle run --host {} \"<prompt>\"", self.alias),
+            |input| input.recovery_command.clone(),
+        );
+        let status = if input_required {
             "input_required"
         } else if applied {
             "applied"
@@ -482,12 +557,36 @@ impl SshSetupTransport {
         let mut planned_actions = vec![
             "allow SSH setup to stop the running Host daemon; active Host work may be interrupted"
                 .to_string(),
+            format!(
+                "probe the remote OS, architecture, and runtime family, then upload or verify the invoking CLI v{} matching verified Host artifact for the detected remote platform without requiring a host binary URL or path; do not register a persistent service",
+                env!("CARGO_PKG_VERSION")
+            ),
         ];
         if self.requires_first_trust {
             planned_actions
                 .push("discover and explicitly trust the reachable Host Identity".to_string());
         }
         planned_actions.push(action.clone());
+        if !path_override_entries.is_empty() {
+            planned_actions.push(
+                "apply daemon path overrides only to the on-demand Host process; do not persist remote service configuration or migrate storage, preserve old storage directories, and warn that previous sessions may be invisible until the old path is restored"
+                    .to_string(),
+            );
+        }
+        let mut applied_actions = Vec::new();
+        if applied {
+            applied_actions.push(
+                "probed the remote platform and uploaded or verified the invoking CLI's matching integrity-checked Host artifact"
+                    .to_string(),
+            );
+            applied_actions.push(action);
+            if !path_override_entries.is_empty() {
+                applied_actions.push(
+                    "applied explicit daemon path overrides only to the on-demand Host process without persisting service configuration or migrating storage"
+                        .to_string(),
+                );
+            }
+        }
         SetupReport {
             schema_version: SetupSchemaVersion::V1,
             host: self.alias.clone(),
@@ -503,17 +602,13 @@ impl SshSetupTransport {
             fallback_reason: None,
             setup_components,
             planned_actions,
-            applied_actions: applied.then_some(action).into_iter().collect(),
+            applied_actions,
             required_input,
-            recovery_commands: if missing_token_file {
-                vec!["configure an absolute file-backed api_token descriptor".to_string()]
-            } else {
-                Vec::new()
-            },
+            recovery_commands,
             readiness_summary: SetupReadinessSummary {
                 transport: if applied {
                     "ready".to_string()
-                } else if missing_token_file {
+                } else if input_required {
                     "input_required".to_string()
                 } else {
                     "planned".to_string()
@@ -527,14 +622,27 @@ impl SshSetupTransport {
                 native_computer_use: "not_checked".to_string(),
                 provider_auth: "not_checked".to_string(),
             },
-            daemon_path_overrides: daemon_path_overrides.entries(),
+            daemon_path_overrides: path_override_entries,
             mutated: matches!(
                 application,
                 SetupApplication::AppliedNewToken | SetupApplication::AppliedPendingActivation
             ),
             native_computer_use_readiness: "not_checked".to_string(),
-            next_command: format!("satelle run --host {} \"<prompt>\"", self.alias),
+            next_command,
         }
+    }
+
+    fn host_config_with_overrides(
+        &self,
+        daemon_path_overrides: &DaemonPathOverrides,
+    ) -> satelle_core::HostConfig {
+        let mut host_config = self.host_config.clone();
+        host_config.daemon_home = daemon_path_overrides.home.clone();
+        host_config.daemon_config_file = daemon_path_overrides.config_file.clone();
+        host_config.daemon_state_dir = daemon_path_overrides.state_dir.clone();
+        host_config.daemon_cache_dir = daemon_path_overrides.cache_dir.clone();
+        host_config.daemon_log_dir = daemon_path_overrides.log_dir.clone();
+        host_config
     }
 
     fn token_file_exists(&self) -> Result<bool, SatelleError> {
@@ -554,7 +662,10 @@ impl SshSetupTransport {
         }
     }
 
-    fn verify_existing_token(&self) -> Result<ExistingTokenVerification, SatelleError> {
+    fn verify_existing_token(
+        &self,
+        host_config: &satelle_core::HostConfig,
+    ) -> Result<ExistingTokenVerification, SatelleError> {
         let ApiTokenSource::File { path } = self
             .binding
             .api_token()
@@ -591,20 +702,19 @@ impl SshSetupTransport {
                 SshBootstrapProcess::launch(
                     self.binding.destination(),
                     &bootstrap_token,
-                    &self.host_config,
+                    host_config,
                     SshBootstrapScope::Admin,
                 )
-                .map_err(|error| match error {
-                    ssh_bootstrap::SshBootstrapError::HostKeyVerificationRequired => {
-                        SatelleError::ssh_host_key_verification_required(&self.alias)
-                    }
-                    _ => SatelleError::host_unreachable(&self.alias),
-                })
+                .map_err(|error| map_ssh_daemon_bootstrap_error(&self.alias, error))
             },
         )
     }
 
-    fn recover_interrupted_token(&self, token_id: &str) -> Result<(), SatelleError> {
+    fn recover_interrupted_token(
+        &self,
+        token_id: &str,
+        host_config: &satelle_core::HostConfig,
+    ) -> Result<(), SatelleError> {
         let ApiTokenSource::File { path } = self
             .binding
             .api_token()
@@ -615,6 +725,7 @@ impl SshSetupTransport {
             &self.binding.expected_host_identity().to_string(),
             admission_request_timeout(&self.host_config),
             &self.host_config,
+            host_config,
         )?;
         rollback_setup_token(
             &bootstrap_client,
@@ -625,7 +736,7 @@ impl SshSetupTransport {
         )
     }
 
-    fn provision_token(&self) -> Result<(), SatelleError> {
+    fn provision_token(&self, host_config: &satelle_core::HostConfig) -> Result<(), SatelleError> {
         let ApiTokenSource::File { path } = self
             .binding
             .api_token()
@@ -636,6 +747,7 @@ impl SshSetupTransport {
             &self.binding.expected_host_identity().to_string(),
             admission_request_timeout(&self.host_config),
             &self.host_config,
+            host_config,
         )?;
         let issuance_idempotency_key = Uuid::now_v7().to_string();
         let issuance = bootstrap_client
@@ -919,9 +1031,7 @@ impl TransportClient for SshSetupTransport {
         daemon_path_overrides: DaemonPathOverrides,
     ) -> Result<SetupReport, SatelleError> {
         self.validate_setup_request(&setup_mode, &setup_components)?;
-        if !daemon_path_overrides.is_empty() {
-            return Err(self.unsupported("daemon path overrides"));
-        }
+        let host_config = self.host_config_with_overrides(&daemon_path_overrides);
         let existing_token_file = self.token_file_exists()?;
         let plan = self.setup_report(
             dry_run,
@@ -961,7 +1071,7 @@ impl TransportClient for SshSetupTransport {
         // replacement credential.
         let existing_token_file = self.token_file_exists()?;
         let application = if existing_token_file {
-            match self.verify_existing_token()? {
+            match self.verify_existing_token(&host_config)? {
                 ExistingTokenVerification::Reusable => SetupApplication::AppliedReusableToken,
                 ExistingTokenVerification::ActivatedPending => {
                     SetupApplication::AppliedPendingActivation
@@ -969,13 +1079,13 @@ impl TransportClient for SshSetupTransport {
                 ExistingTokenVerification::AuthenticationRejected { token_id } => {
                     // The owner-local release handshake stops any daemon that
                     // still owns the canonical store before admin recovery.
-                    self.recover_interrupted_token(&token_id)?;
-                    self.provision_token()?;
+                    self.recover_interrupted_token(&token_id, &host_config)?;
+                    self.provision_token(&host_config)?;
                     SetupApplication::AppliedNewToken
                 }
             }
         } else {
-            self.provision_token()?;
+            self.provision_token(&host_config)?;
             SetupApplication::AppliedNewToken
         };
         confirm_bootstrap_lock(&self.alias, &mut bootstrap_lock)?;
@@ -1350,12 +1460,7 @@ fn durable_ssh_clients(
                 on_demand_idle_timeout(host_config),
                 host_config,
             )
-            .map_err(|error| match error {
-                ssh_bootstrap::SshBootstrapError::HostKeyVerificationRequired => {
-                    SatelleError::ssh_host_key_verification_required(alias)
-                }
-                _ => SatelleError::host_unreachable(alias),
-            })
+            .map_err(|error| map_ssh_daemon_bootstrap_error(alias, error))
         },
     )?;
     let event_client =
@@ -1409,12 +1514,7 @@ fn bootstrap_ssh_clients(
     let raw_bootstrap_token = bootstrap_token.expose();
     let bootstrap =
         SshBootstrapProcess::launch(destination, &bootstrap_token, host_config, bootstrap_scope)
-            .map_err(|error| match error {
-                ssh_bootstrap::SshBootstrapError::HostKeyVerificationRequired => {
-                    SatelleError::ssh_host_key_verification_required(alias)
-                }
-                _ => SatelleError::host_unreachable(alias),
-            })?;
+            .map_err(|error| map_ssh_daemon_bootstrap_error(alias, error))?;
     let http_token = ApiBearerToken::parse(raw_bootstrap_token.as_str())
         .map_err(|_| SatelleError::host_unreachable(alias))?;
     let event_token = ApiBearerToken::parse(raw_bootstrap_token.as_str())
@@ -1443,6 +1543,7 @@ fn setup_bootstrap_client(
     destination: &str,
     expected_host_identity: &str,
     admission_timeout: Duration,
+    previous_host_config: &satelle_core::HostConfig,
     host_config: &satelle_core::HostConfig,
 ) -> Result<(Arc<DaemonClient>, SshTunnel, SshBootstrapProcess), SatelleError> {
     let bootstrap_token =
@@ -1455,14 +1556,10 @@ fn setup_bootstrap_client(
         destination,
         &bootstrap_token,
         host_config,
+        previous_host_config,
         SshBootstrapScope::Admin,
     )
-    .map_err(|error| match error {
-        ssh_bootstrap::SshBootstrapError::HostKeyVerificationRequired => {
-            SatelleError::ssh_host_key_verification_required(alias)
-        }
-        _ => SatelleError::host_unreachable(alias),
-    })?;
+    .map_err(|error| map_ssh_daemon_bootstrap_error(alias, error))?;
     let tunnel =
         SshTunnel::open_to(destination, bootstrap.remote_port()).map_err(|error| match error {
             ssh_tunnel::SshTunnelError::HostKeyVerificationRequired => {
@@ -1815,7 +1912,10 @@ pub(crate) fn discover_direct_host_identity(host: &SelectedHost) -> Result<Strin
         .map_err(|error| direct_transport_error(&host.alias, error))
 }
 
-pub(crate) fn discover_ssh_host_identity(host: &SelectedHost) -> Result<String, SatelleError> {
+pub(crate) fn discover_ssh_host_identity(
+    host: &SelectedHost,
+    daemon_path_overrides: &DaemonPathOverrides,
+) -> Result<String, SatelleError> {
     if host.config.transport != TransportKind::Ssh {
         return Err(SatelleError::invalid_usage(
             "SSH Host identity discovery requires an SSH Host Binding",
@@ -1834,12 +1934,19 @@ pub(crate) fn discover_ssh_host_identity(host: &SelectedHost) -> Result<String, 
             _ => SatelleError::host_unreachable(&host.alias),
         })?;
     confirm_bootstrap_lock(&host.alias, &mut bootstrap_lock)?;
+    let mut selected_host_config = host.config.clone();
+    selected_host_config.daemon_home = daemon_path_overrides.home.clone();
+    selected_host_config.daemon_config_file = daemon_path_overrides.config_file.clone();
+    selected_host_config.daemon_state_dir = daemon_path_overrides.state_dir.clone();
+    selected_host_config.daemon_cache_dir = daemon_path_overrides.cache_dir.clone();
+    selected_host_config.daemon_log_dir = daemon_path_overrides.log_dir.clone();
     let (client, _tunnel, _bootstrap) = setup_bootstrap_client(
         &host.alias,
         binding.destination(),
         &probe_identity,
         admission_request_timeout(&host.config),
         &host.config,
+        &selected_host_config,
     )?;
     let identity = client
         .discover_host_identity()

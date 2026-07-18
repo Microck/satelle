@@ -438,10 +438,10 @@
 
 ## setup-and-maintenance
 - satelle host lifecycle commands manage Host Daemon start, stop, restart, and service actions separately from session stop @spec @mvp
-- satelle setup treats a missing Satelle Host Daemon as a planned remote install action using the invoking local CLI release's matching verified host artifact for the detected remote platform @spec @mvp
+- satelle setup treats a missing Satelle Host Daemon as a planned remote install action using the invoking local CLI release's matching verified host artifact for the detected remote platform @spec @mvp @implemented
 - satelle setup treats an older or protocol-incompatible Satelle Host Daemon as a planned remote update action to the invoking local CLI release's matching verified host artifact @spec @mvp
-- satelle setup does not require a host binary URL or host binary path for ordinary onboarding @spec @mvp
-- satelle setup probes the remote operating system, architecture, and supported libc or runtime family before selecting a Satelle Host Daemon artifact @spec @mvp
+- satelle setup does not require a host binary URL or host binary path for ordinary onboarding @spec @mvp @implemented
+- satelle setup probes the remote operating system, architecture, and supported libc or runtime family before selecting a Satelle Host Daemon artifact @spec @mvp @implemented
 - satelle setup presents Host Daemon install or update plans with current version, target version, target platform, artifact digest, install path, and restart impact before mutating the remote host @spec @mvp
 - satelle setup applies Host Daemon install or update actions through the same final confirmation, --yes, --no-input --yes, --dry-run, action ledger, and partial-failure rules used by other setup mutations @spec @mvp
 - satelle setup defaults setup_mode to on_demand when no CLI flag or user-level host setting selects a mode @spec @mvp
@@ -482,18 +482,25 @@
 - satelle setup supports --on-demand to select on_demand setup mode and report non-persistent service intent in setup output @implemented @mvp
 - satelle setup supports --persistent to explicitly request persistent service mode when configuration would otherwise select on_demand @implemented @mvp
 - satelle setup supports host configuration key setup_mode with values persistent and on_demand, where CLI flags take precedence over configuration @spec @mvp
-- satelle setup --on-demand still uploads or verifies the Host Daemon artifact needed for SSH bootstrap but does not register a persistent service @spec @mvp
+- satelle setup --on-demand still uploads or verifies the Host Daemon artifact needed for SSH bootstrap but does not register a persistent service @spec @mvp @implemented
 - satelle setup reports a typed persistent-service-unsupported error without falling back when --persistent explicitly selects an unsupported service mode @spec @mvp
 - when an inherited user-level persistent default is unsupported, satelle setup presents an explicitly reported on-demand fallback plan, while explicit --persistent continues to fail without fallback @spec @mvp
 - satelle setup JSON output includes setup_mode, service_persistent, service_scope, and fallback_reason fields @implemented @mvp
 - satelle setup can persist Satelle Host Daemon path overrides into remote service configuration when the setup plan installs or configures a persistent Host Daemon service @spec @mvp
-- satelle setup does not persist path overrides when it only starts an on-demand SSH bootstrap Host Daemon process @spec @mvp
+- satelle setup does not persist path overrides when it only starts an on-demand SSH bootstrap Host Daemon process @spec @mvp @implemented
 - satelle setup path override flags are --daemon-home <absolute-path>, --daemon-config-file <absolute-path>, --daemon-state-dir <absolute-path>, --daemon-cache-dir <absolute-path>, and --daemon-log-dir <absolute-path> @implemented @mvp
 - satelle setup maps --daemon-home to SATELLE_HOME in the planned Satelle-owned service configuration @spec @mvp
 - satelle setup maps --daemon-config-file, --daemon-state-dir, --daemon-cache-dir, and --daemon-log-dir to SATELLE_CONFIG_FILE, SATELLE_STATE_DIR, SATELLE_CACHE_DIR, and SATELLE_LOG_DIR in the planned Satelle-owned service configuration @spec @mvp
 - satelle setup accepts persistent daemon path override values from user-level host configuration and setup flags, with setup flags taking precedence @implemented @mvp
-- satelle setup does not inherit local SATELLE_HOME, SATELLE_CONFIG_FILE, SATELLE_STATE_DIR, SATELLE_CACHE_DIR, or SATELLE_LOG_DIR into daemon service configuration automatically @spec @mvp
-- satelle setup validates daemon path override values as absolute paths before presenting a setup plan @implemented @mvp
+- satelle setup does not inherit local SATELLE_HOME, SATELLE_CONFIG_FILE, SATELLE_STATE_DIR, SATELLE_CACHE_DIR, or SATELLE_LOG_DIR into daemon service configuration automatically @spec @mvp @implemented
+- id: l00
+  label: satelle setup preserves daemon path override text until SSH detects the remote Host platform, then validates every override with that platform's path rules before constructing or applying a remote Host Daemon command
+  command: cargo test --locked -p satelle-cli --features test-support --bin satelle remote_daemon_path_overrides_ -- --test-threads=1
+  tags: [spec, mvp, implemented]
+- id: rse
+  label: satelle SSH bootstrap applies the validated remote daemon path environment to state-owner release and every detached Host Daemon launch for the selected path set
+  command: cargo test --locked -p satelle-cli --features test-support --bin satelle remote_daemon_path_environment_ -- --test-threads=1
+  tags: [spec, mvp, implemented]
 - satelle setup reports a typed daemon-path-override-not-absolute usage or configuration error when a daemon path override is relative or tilde-prefixed @implemented @mvp
 - satelle setup stores daemon path overrides in a Satelle-owned per-service configuration surface instead of the global operating-system environment @spec @mvp
 - satelle setup does not configure persistent Linux Host Daemon services in MVP because Linux is not a supported native Computer Use remote host platform @spec @mvp
@@ -540,8 +547,8 @@
 - satelle setup --no-input reports a typed provider-secret-provisioning-required error when the configured Secret Source descriptor exists but the target Host Daemon reports that the referenced provider secret material is missing @spec @mvp
 - satelle setup JSON errors for provider-secret-source-required and provider-secret-provisioning-required include safe suggested_commands that an AI agent can present or execute without containing raw secret material @spec @mvp
 - satelle setup help text documents an agent-safe noninteractive flow: configure host-resolved Secret Source descriptors, run setup with --no-input --json, and treat missing raw secret material as a user action requirement rather than an agent-handled value @implemented @mvp
-- satelle MVP does not migrate existing SQLite stores, operator log files, or recording artifacts when daemon path overrides change @spec @mvp
-- satelle setup preserves old storage directories when daemon path overrides change and warns that previous sessions may be invisible until the old path is restored or a future migration command is used @spec @mvp
+- satelle MVP does not migrate existing SQLite stores, operator log files, or recording artifacts when daemon path overrides change @spec @mvp @implemented
+- satelle setup preserves old storage directories when daemon path overrides change and warns that previous sessions may be invisible until the old path is restored or a future migration command is used @spec @mvp @implemented
 - satelle post-MVP exposes satelle host storage migrate as the explicit command for moving Host Daemon-owned SQLite stores, operator log files, and recording artifacts between Satelle Path Sets @spec @later
 - satelle setup, repair, and host update do not migrate Host Daemon-owned storage as an implicit side effect after satelle host storage migrate exists @spec @later
 - satelle host storage migrate targets one concrete host alias and refuses to run when host selection is ambiguous @spec @later
@@ -1873,14 +1880,14 @@
   command: cargo test --locked -p satelle-transport --test http liveness_is_exact_and_reveals_no_protected_metadata -- --exact
   tags: [spec, mvp, implemented, ci]
 - readiness details, versions, capabilities, Host Identity, and Session metadata require read scope @spec @mvp
-- satelle MVP does not support mTLS client certificate authentication for direct Host Daemon transport @spec @mvp
+- satelle MVP does not support mTLS client certificate authentication for direct Host Daemon transport @spec @mvp @implemented
 - satelle later supports optional mutual TLS as defense in depth in addition to scoped bearer-token authentication and authorization @spec @later
 - satelle mTLS does not replace bearer token authorization because mTLS authenticates the client connection while Satelle still needs application-layer operation scopes and audit metadata @spec @later
 - satelle later mutual TLS uses user-level client certificate, private-key, and CA descriptors with certificate rotation, revocation, service reload, expiry, trust-chain, and cross-platform storage diagnostics @spec @later
 - satelle later maps a verified client certificate identity into audit metadata while bearer-token scopes remain authoritative for application operations @spec @later
 - satelle Tailscale-backed direct transport still requires Satelle Host Daemon authentication and authorization because Tailscale reachability identity is not the Satelle operation permission model @spec @mvp
 - after explicit setup or trust acceptance, the CLI writes the observed stable Host Identity to expected_host_id in the user-level Host Binding @spec @mvp @implemented
-- any Host Binding with expected_host_id = null permits identity discovery only through explicit setup or trust acceptance and cannot start ordinary Session, log, or maintenance operations @spec @mvp
+- any Host Binding with expected_host_id = null permits identity discovery only through explicit setup or trust acceptance and cannot start ordinary Session, log, or maintenance operations @spec @mvp @implemented
 - all communication after first trust requires the observed Host Identity to match the user-level Host Binding's expected_host_id @spec @mvp
 - after first trust, every authenticated HTTP request and WebSocket handshake includes the expected Host Identity through the Satelle-Expected-Host-Identity header, and the Host Daemon compares it before handling the operation or returning protected data @spec @contract @mvp
 - a Host Identity mismatch permits only the minimal liveness response and a typed identity-mismatch response containing the expected and observed non-secret identities plus recovery guidance; it returns no other Host, Session, log, readiness, capability, or mutation data @spec @mvp
@@ -2177,14 +2184,17 @@
 - satelle Tailscale Serve setup separates preview from apply so users can inspect the planned tailscale serve change before Satelle mutates remote Tailscale configuration @spec @mvp @implemented
 - satelle Tailscale Serve setup preserves unrelated existing Tailscale Serve configuration instead of resetting or overwriting the remote node's full Serve state @spec @mvp @implemented
 - satelle MVP does not configure Tailscale Funnel or public internet exposure as a normal setup path @spec @mvp @implemented
-- satelle warns when a configuration attempts to use Tailscale Funnel or public exposure for desktop-control access @spec @mvp
+- id: n4h
+  label: satelle Tailscale Serve setup blocks apply when any live top-level, VIP Service, or Foreground route with Funnel or public exposure targets the Satelle listener
+  command: cargo test --locked -p satelle-cli --features test-support --bin satelle tailscale_serve::tests::live_ -- --test-threads=1
+  tags: [spec, mvp, implemented]
 - satelle MVP supports SSH transport for bootstrap, file upload, remote command execution, and tunneled access to the on-demand Host Daemon @spec @mvp @implemented
 - satelle MVP supports direct HTTPS and WSS transport for already reachable or persistently installed Host Daemons @spec @mvp @implemented
 - satelle models Tailscale as optional reachability and address resolution for supported transports rather than as a separate execution model @spec @mvp @implemented
-- satelle treats direct authenticated HTTPS and WSS access to the Host Daemon as the preferred runtime transport when the daemon is already reachable @spec @mvp
-- satelle treats system OpenSSH as the default SSH backend for bootstrap and repair because it preserves user SSH configuration, agents, hardware keys, jump hosts, known hosts, and Tailscale SSH behavior @spec @mvp
-- satelle SSH bootstrap does not assume a POSIX shell on the remote host and uses OS-aware command execution, quoting, path, and file-copy behavior for Windows, Linux, and macOS @spec @mvp
-- satelle never disables OpenSSH Host-key verification automatically @spec @mvp
+- satelle treats direct authenticated HTTPS and WSS access to the Host Daemon as the preferred runtime transport when the daemon is already reachable @spec @mvp @implemented
+- satelle treats system OpenSSH as the default SSH backend for bootstrap and repair because it preserves user SSH configuration, agents, hardware keys, jump hosts, known hosts, and Tailscale SSH behavior @spec @mvp @implemented
+- satelle SSH bootstrap does not assume a POSIX shell on the remote host and uses OS-aware command execution, quoting, path, and file-copy behavior for Windows, Linux, and macOS @spec @mvp @implemented
+- satelle never disables OpenSSH Host-key verification automatically @spec @mvp @implemented
 - satelle never accepts a changed SSH Host key automatically @spec @mvp @implemented
 - first-use SSH Host-key acceptance requires normal OpenSSH interactive confirmation or preconfigured known-host state @spec @mvp @implemented
 - noninteractive SSH bootstrap fails with a typed ssh-host-key-verification-required error when trust cannot be established without prompting @spec @mvp @implemented

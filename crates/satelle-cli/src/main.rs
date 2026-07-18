@@ -1515,17 +1515,19 @@ fn run_setup(
             "setup --expected-host-id is only valid for an SSH Host Binding",
         )));
     }
-    if command
-        .expected_host_id
-        .as_deref()
-        .zip(host.config.expected_host_id.as_deref())
-        .is_some_and(|(required, configured)| required != configured)
+    let daemon_path_overrides = daemon_path_overrides(&command, &host.config);
+    let path_rebind = !daemon_path_overrides.entries().is_empty();
+    if !path_rebind
+        && command
+            .expected_host_id
+            .as_deref()
+            .zip(host.config.expected_host_id.as_deref())
+            .is_some_and(|(required, configured)| required != configured)
     {
         return Err(failure(SatelleError::host_identity_mismatch(&host.alias)));
     }
     let first_ssh_trust = host.config.transport == satelle_core::TransportKind::Ssh
-        && host.config.expected_host_id.is_none();
-    let daemon_path_overrides = daemon_path_overrides(&command, &host.config).map_err(failure)?;
+        && (host.config.expected_host_id.is_none() || path_rebind);
     let setup_components = setup_components(&command.component).map_err(failure)?;
     let explicit_provider_auth = command
         .component
@@ -1548,7 +1550,14 @@ fn run_setup(
         Some(transport_for_setup(&host)?)
     };
     let mut report = if tailscale_serve_setup {
-        tailscale_serve::configure(&host.alias, &host.config, true, &setup_mode).map_err(failure)?
+        tailscale_serve::configure(
+            &host.alias,
+            &host.config,
+            &daemon_path_overrides,
+            true,
+            &setup_mode,
+        )
+        .map_err(failure)?
     } else {
         transport
             .as_ref()
@@ -1605,7 +1614,13 @@ fn run_setup(
         }
 
         if first_ssh_trust {
-            if !trust_first_ssh_host_during_setup(&command, json, &user_config_path, &mut host)? {
+            if !trust_first_ssh_host_during_setup(
+                &command,
+                json,
+                &user_config_path,
+                &daemon_path_overrides,
+                &mut host,
+            )? {
                 println!("No changes applied.");
                 return Ok(());
             }
@@ -1613,8 +1628,14 @@ fn run_setup(
         }
 
         report = if tailscale_serve_setup {
-            tailscale_serve::configure(&host.alias, &host.config, false, &setup_mode)
-                .map_err(failure)?
+            tailscale_serve::configure(
+                &host.alias,
+                &host.config,
+                &daemon_path_overrides,
+                false,
+                &setup_mode,
+            )
+            .map_err(failure)?
         } else {
             transport
                 .as_ref()
@@ -1660,16 +1681,11 @@ fn trust_first_ssh_host_during_setup(
     command: &SetupCommand,
     json: bool,
     user_config_path: &Path,
+    daemon_path_overrides: &DaemonPathOverrides,
     host: &mut SelectedHost,
 ) -> Result<bool, CliFailure> {
-    let noninteractive = command.no_input || json || !io::stdin().is_terminal();
-    if noninteractive && (!command.no_input || !command.yes || command.expected_host_id.is_none()) {
-        return Err(failure(SatelleError::invalid_usage(
-            "noninteractive first-time SSH setup requires --no-input --yes --expected-host-id <exact-id>",
-        )));
-    }
-
-    let observed_identity = discover_ssh_host_identity(host).map_err(failure)?;
+    let observed_identity =
+        discover_ssh_host_identity(host, daemon_path_overrides).map_err(failure)?;
     HostIdentityRef::new(&observed_identity).map_err(|_| {
         failure(SatelleError::remote_api_error(
             &host.alias,
@@ -1683,6 +1699,16 @@ fn trust_first_ssh_host_during_setup(
     {
         return Err(failure(SatelleError::host_identity_mismatch(&host.alias)));
     }
+    if host.config.expected_host_id.as_deref() == Some(observed_identity.as_str()) {
+        return Ok(true);
+    }
+
+    let noninteractive = command.no_input || json || !io::stdin().is_terminal();
+    if noninteractive && (!command.no_input || !command.yes || command.expected_host_id.is_none()) {
+        return Err(failure(SatelleError::invalid_usage(
+            "noninteractive SSH Host trust requires --no-input --yes --expected-host-id <exact-id>",
+        )));
+    }
 
     if command.expected_host_id.is_none() {
         println!("Host: {}", host.alias);
@@ -1691,7 +1717,13 @@ fn trust_first_ssh_host_during_setup(
             host.config.address.as_deref().unwrap_or("not configured")
         );
         println!("Observed Host Identity: {observed_identity}");
-        println!("Current expected Host Identity: not pinned");
+        println!(
+            "Current expected Host Identity: {}",
+            host.config
+                .expected_host_id
+                .as_deref()
+                .unwrap_or("not pinned")
+        );
         println!(
             "Desktop Binding: {}",
             host.config
@@ -1740,75 +1772,66 @@ fn add_setup_required_inputs(
     );
 }
 
-fn daemon_path_overrides(
-    command: &SetupCommand,
-    host_config: &HostConfig,
-) -> Result<DaemonPathOverrides, SatelleError> {
+fn daemon_path_overrides(command: &SetupCommand, host_config: &HostConfig) -> DaemonPathOverrides {
     let mut sources = BTreeMap::new();
     let home = select_daemon_path_override(
-        "--daemon-home",
         "SATELLE_HOME",
         command.daemon_home.as_ref(),
         host_config.daemon_home.as_ref(),
         &mut sources,
-    )?;
+    );
     let config_file = select_daemon_path_override(
-        "--daemon-config-file",
         "SATELLE_CONFIG_FILE",
         command.daemon_config_file.as_ref(),
         host_config.daemon_config_file.as_ref(),
         &mut sources,
-    )?;
+    );
     let state_dir = select_daemon_path_override(
-        "--daemon-state-dir",
         "SATELLE_STATE_DIR",
         command.daemon_state_dir.as_ref(),
         host_config.daemon_state_dir.as_ref(),
         &mut sources,
-    )?;
+    );
     let cache_dir = select_daemon_path_override(
-        "--daemon-cache-dir",
         "SATELLE_CACHE_DIR",
         command.daemon_cache_dir.as_ref(),
         host_config.daemon_cache_dir.as_ref(),
         &mut sources,
-    )?;
+    );
     let log_dir = select_daemon_path_override(
-        "--daemon-log-dir",
         "SATELLE_LOG_DIR",
         command.daemon_log_dir.as_ref(),
         host_config.daemon_log_dir.as_ref(),
         &mut sources,
-    )?;
+    );
 
-    Ok(DaemonPathOverrides {
+    DaemonPathOverrides {
         home,
         config_file,
         state_dir,
         cache_dir,
         log_dir,
         sources,
-    })
+    }
 }
 
 fn select_daemon_path_override(
-    flag: &'static str,
     environment_variable: &'static str,
     flag_value: Option<&PathBuf>,
     config_value: Option<&PathBuf>,
     sources: &mut BTreeMap<String, String>,
-) -> Result<Option<PathBuf>, SatelleError> {
-    if let Some(value) = validate_daemon_path(flag, flag_value)? {
+) -> Option<PathBuf> {
+    if let Some(value) = flag_value {
         sources.insert(environment_variable.to_string(), "setup_flag".to_string());
-        return Ok(Some(value));
+        return Some(value.clone());
     }
 
-    if let Some(value) = validate_daemon_path(environment_variable, config_value)? {
+    if let Some(value) = config_value {
         sources.insert(environment_variable.to_string(), "user_config".to_string());
-        return Ok(Some(value));
+        return Some(value.clone());
     }
 
-    Ok(None)
+    None
 }
 
 fn setup_components(components: &[SetupComponent]) -> Result<Vec<String>, SatelleError> {
@@ -1964,23 +1987,6 @@ fn shell_argument(value: &str) -> String {
     }
 
     format!("'{}'", value.replace('\'', "'\"'\"'"))
-}
-
-fn validate_daemon_path(
-    flag: &str,
-    path: Option<&PathBuf>,
-) -> Result<Option<PathBuf>, SatelleError> {
-    let Some(path) = path else {
-        return Ok(None);
-    };
-    if path.is_absolute() && !path.starts_with("~") {
-        return Ok(Some(path.clone()));
-    }
-
-    Err(SatelleError::daemon_path_override_not_absolute(
-        flag,
-        path.display().to_string(),
-    ))
 }
 
 fn run_repair(command: RepairCommand) -> Result<(), CliFailure> {

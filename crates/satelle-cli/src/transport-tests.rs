@@ -12,6 +12,7 @@ use satelle_host::{
 use satelle_transport::{DaemonServer, DaemonServerConfig};
 use std::io::{Read, Write};
 use std::net::{Ipv4Addr, SocketAddr, TcpListener};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, mpsc};
 use std::thread;
@@ -62,6 +63,11 @@ fn ssh_setup_plan_reaches_explicit_trust_for_an_unpinned_host() {
         report.planned_actions,
         [
             "allow SSH setup to stop the running Host daemon; active Host work may be interrupted",
+            concat!(
+                "probe the remote OS, architecture, and runtime family, then upload or verify the invoking CLI v",
+                env!("CARGO_PKG_VERSION"),
+                " matching verified Host artifact for the detected remote platform without requiring a host binary URL or path; do not register a persistent service"
+            ),
             "discover and explicitly trust the reachable Host Identity",
             "issue, persist, and activate a durable control-scoped API token",
         ]
@@ -123,10 +129,77 @@ fn ssh_setup_plan_declares_one_durable_token_handoff() {
         report.planned_actions,
         [
             "allow SSH setup to stop the running Host daemon; active Host work may be interrupted",
+            concat!(
+                "probe the remote OS, architecture, and runtime family, then upload or verify the invoking CLI v",
+                env!("CARGO_PKG_VERSION"),
+                " matching verified Host artifact for the detected remote platform without requiring a host binary URL or path; do not register a persistent service"
+            ),
             "issue, persist, and activate a durable control-scoped API token",
         ]
     );
     assert!(!report.mutated);
+}
+
+#[test]
+fn ssh_setup_plan_declares_verified_release_bootstrap_without_storage_migration() {
+    let state = TestStateDir::new().expect("temporary state directory");
+    let path = state.path().join("satelle-setup-plan.token");
+    let transport = SshSetupTransport::new(&ssh_setup_host(Some(ApiTokenSource::File { path })))
+        .expect("construct setup");
+    let overrides = DaemonPathOverrides {
+        state_dir: Some(state.path().join("remote-state")),
+        ..DaemonPathOverrides::default()
+    };
+
+    let report = transport
+        .setup(
+            true,
+            "on_demand".to_string(),
+            vec!["transport".to_string()],
+            overrides,
+        )
+        .expect("plan SSH setup with transient paths");
+
+    assert!(report.planned_actions.iter().any(|action| {
+        action.contains("matching verified Host artifact")
+            && action.contains(env!("CARGO_PKG_VERSION"))
+            && action.contains("detected remote platform")
+    }));
+    assert!(report.planned_actions.iter().any(|action| {
+        action.contains("on-demand Host process")
+            && action.contains("do not persist remote service configuration")
+            && action.contains("migrate storage")
+            && action.contains("previous sessions may be invisible")
+    }));
+    assert_eq!(report.daemon_path_overrides.len(), 1);
+    assert!(!report.mutated);
+}
+
+#[test]
+fn unpinned_and_unauthenticated_bindings_cannot_open_ordinary_transports() {
+    let mut unpinned_ssh = ssh_setup_host(Some(ApiTokenSource::File {
+        path: PathBuf::from("/tmp/unread-token"),
+    }));
+    unpinned_ssh.config.expected_host_id = None;
+    let ssh_error = match transport_for(&unpinned_ssh) {
+        Ok(_) => panic!("ordinary SSH transport must reject an unpinned Host"),
+        Err(error) => error,
+    };
+    assert_eq!(ssh_error.error.code, ErrorCode::ConfigError);
+
+    let mut direct = unpinned_ssh;
+    direct.config.transport = TransportKind::Direct;
+    direct.config.address = Some("https://studio.example.test:3001".to_string());
+    direct.config.network = Some(satelle_core::NetworkConfig::Tailscale {
+        tailnet_name: Some("example.test".to_string()),
+        hostname: Some("studio".to_string()),
+    });
+    direct.config.api_token = None;
+    let direct_error = match transport_for(&direct) {
+        Ok(_) => panic!("Tailscale reachability must not replace Host authentication"),
+        Err(error) => error,
+    };
+    assert_eq!(direct_error.error.code, ErrorCode::ConfigError);
 }
 
 #[test]
@@ -200,6 +273,11 @@ fn ssh_setup_rerun_reuses_an_existing_secure_token_destination() {
         report.planned_actions,
         [
             "allow SSH setup to stop the running Host daemon; active Host work may be interrupted",
+            concat!(
+                "probe the remote OS, architecture, and runtime family, then upload or verify the invoking CLI v",
+                env!("CARGO_PKG_VERSION"),
+                " matching verified Host artifact for the detected remote platform without requiring a host binary URL or path; do not register a persistent service"
+            ),
             "validate and reuse the existing durable control-scoped API token, or recover an interrupted pending handoff"
         ]
     );
@@ -296,7 +374,10 @@ fn persisted_pending_setup_token_self_activates_on_the_running_daemon() {
     assert!(report.mutated);
     assert_eq!(
         report.applied_actions,
-        ["activate the existing pending durable control-scoped API token"]
+        [
+            "probed the remote platform and uploaded or verified the invoking CLI's matching integrity-checked Host artifact",
+            "activate the existing pending durable control-scoped API token"
+        ]
     );
     let confirmation = pending_client
         .confirm_durable_setup_token()
@@ -478,29 +559,102 @@ fn ssh_setup_rejects_persistent_mode_before_mutating() {
 }
 
 #[test]
-fn ssh_setup_rejects_daemon_path_overrides_before_mutating() {
+fn ssh_setup_path_overrides_wait_for_required_token_input_without_mutating() {
     let state = TestStateDir::new().expect("temporary state directory");
-    let token_path = state.path().join("unsupported-path-override.token");
-    let transport = SshSetupTransport::new(&ssh_setup_host(Some(ApiTokenSource::File {
-        path: token_path.clone(),
-    })))
-    .expect("construct setup");
+    let transport = SshSetupTransport::new(&ssh_setup_host(None)).expect("construct setup");
     let overrides = DaemonPathOverrides {
         state_dir: Some(state.path().join("remote-state")),
         ..DaemonPathOverrides::default()
     };
 
-    let error = transport
+    let report = transport
         .setup(
             false,
             "on_demand".to_string(),
             vec!["transport".to_string()],
             overrides,
         )
-        .expect_err("unsupported overrides must fail before SSH or token mutation");
+        .expect("missing token input must return a non-mutating setup report");
 
-    assert_eq!(error.code, ErrorCode::NotImplemented);
-    assert!(!token_path.exists());
+    assert_eq!(report.status, "input_required");
+    assert_eq!(report.daemon_path_overrides.len(), 1);
+    assert!(!report.mutated);
+}
+
+#[test]
+fn remote_daemon_path_override_errors_preserve_the_typed_input_contract() {
+    let error = map_ssh_daemon_bootstrap_error(
+        "remote",
+        ssh_bootstrap::SshBootstrapError::DaemonPathOverrideNotAbsolute {
+            name: "SATELLE_STATE_DIR",
+            value: "/srv/satelle/state".to_string(),
+        },
+    );
+
+    assert_eq!(error.code, ErrorCode::DaemonPathOverrideNotAbsolute);
+    assert_eq!(
+        error.details.get("flag"),
+        Some(&serde_json::json!("SATELLE_STATE_DIR"))
+    );
+    assert_eq!(
+        error.details.get("value"),
+        Some(&serde_json::json!("/srv/satelle/state"))
+    );
+}
+
+#[test]
+fn ssh_setup_path_change_does_not_reuse_an_existing_store_token() {
+    let temporary_root = tempfile::tempdir().expect("temporary root");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(
+            temporary_root.path(),
+            std::fs::Permissions::from_mode(0o700),
+        )
+        .expect("make temporary root owner-only");
+    }
+    let token_directory = temporary_root.path().join("owner-only");
+    drop(
+        satelle_core::open_or_create_owner_only_directory(&token_directory)
+            .expect("create owner-only token directory"),
+    );
+    let token_path = token_directory.join("existing-store.token");
+    let token = ApiBearerToken::generate().expect("generate existing API token");
+    let raw_token = token.expose();
+    persist_new_owner_only_secret_file(&token_path, raw_token.as_str())
+        .expect("persist existing store token");
+    let transport = SshSetupTransport::new(&ssh_setup_host(Some(ApiTokenSource::File {
+        path: token_path.clone(),
+    })))
+    .expect("construct setup");
+    let overrides = DaemonPathOverrides {
+        state_dir: Some(temporary_root.path().join("different-remote-state")),
+        ..DaemonPathOverrides::default()
+    };
+
+    let report = transport
+        .setup(
+            false,
+            "on_demand".to_string(),
+            vec!["transport".to_string()],
+            overrides,
+        )
+        .expect("path change must require a distinct token binding before SSH mutation");
+
+    assert_eq!(report.status, "input_required");
+    assert_eq!(report.readiness_summary.transport, "input_required");
+    assert!(report.required_input.iter().any(|input| {
+        input.input_kind == "daemon_path_override_token_rebind_required"
+            && input
+                .recovery_command
+                .contains("new unused file-backed api_token path")
+    }));
+    assert!(!report.mutated);
+    assert_eq!(
+        read_owner_only_secret_file(&token_path).expect("read preserved old-store token"),
+        raw_token
+    );
 }
 
 impl ComputerUseAdapter for RecordingProviderIntentAdapter {
