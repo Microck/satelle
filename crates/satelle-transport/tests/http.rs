@@ -32,12 +32,20 @@ use satelle_transport::{
     HostStatusResponse, LiveResponse, LogsPageResponse, RequestId,
 };
 use serde_json::Value;
+use std::cell::RefCell;
+use std::fmt::Write as _;
+use std::future::Future;
 use std::net::{Ipv4Addr, SocketAddr};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio_rustls::TlsConnector;
+use tracing::field::{Field, Visit};
+use tracing::metadata::LevelFilter;
+use tracing::span::{Attributes, Id, Record};
+use tracing::{Event, Metadata, Subscriber};
 
 const EXPECTED_OPERATIONS: [&str; 14] = [
     "live",
@@ -55,6 +63,10 @@ const EXPECTED_OPERATIONS: [&str; 14] = [
     "setup_api_token_activate",
     "setup_api_token_abort",
 ];
+
+const BLOCKING_SPAN_ATTRIBUTE_MARKER: &str = "trace-blocking-span-attribute-connected";
+const BLOCKING_SPAN_RECORD_MARKER: &str = "trace-blocking-span-record-connected";
+const BLOCKING_EVENT_MARKER: &str = "trace-blocking-event-connected";
 
 struct RunningServer {
     _state: TestStateDir,
@@ -104,13 +116,178 @@ impl RunningServer {
             .header("Satelle-Protocol-Version", "3")
     }
 
+    fn mutation_with_request_id(
+        &self,
+        path: &str,
+        idempotency_key: &str,
+        request_id: &RequestId,
+    ) -> reqwest::RequestBuilder {
+        self.protected_request_with_request_id(reqwest::Method::POST, path, request_id)
+            .header("Idempotency-Key", idempotency_key)
+            .header("Satelle-Protocol-Version", "3")
+    }
+
     fn protected_request(&self, method: reqwest::Method, path: &str) -> reqwest::RequestBuilder {
+        self.protected_request_with_request_id(method, path, &RequestId::new())
+    }
+
+    fn protected_request_with_request_id(
+        &self,
+        method: reqwest::Method,
+        path: &str,
+        request_id: &RequestId,
+    ) -> reqwest::RequestBuilder {
         let token = self.token.expose();
         reqwest::Client::new()
             .request(method, self.url(path))
             .header("Authorization", format!("Bearer {}", token.as_str()))
             .header("Satelle-Expected-Host-Identity", &self.host_identity)
-            .header("Satelle-Request-Id", RequestId::new().to_string())
+            .header("Satelle-Request-Id", request_id.as_str())
+    }
+}
+
+/// Runs one real server test under a scoped tracing Dispatch. Tokio's runtime
+/// hooks propagate that Dispatch to the single blocking thread used by Host
+/// admission without changing the process-global subscriber.
+fn run_with_trace_capture<F, Fut>(test: F)
+where
+    F: FnOnce(TraceCapture) -> Fut,
+    Fut: Future<Output = ()>,
+{
+    let trace_capture = TraceCapture::default();
+    let dispatch = trace_capture.dispatch();
+    let _server_guard = tracing::dispatcher::set_default(&dispatch);
+    let blocking_dispatch = dispatch.clone();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .max_blocking_threads(1)
+        .on_thread_start(move || install_runtime_thread_dispatch(&blocking_dispatch))
+        .on_thread_stop(clear_runtime_thread_dispatch)
+        .build()
+        .expect("build traced Host runtime");
+    runtime.block_on(test(trace_capture));
+}
+
+thread_local! {
+    static RUNTIME_TRACE_GUARD: RefCell<Option<tracing::dispatcher::DefaultGuard>> =
+        const { RefCell::new(None) };
+}
+
+fn install_runtime_thread_dispatch(dispatch: &tracing::Dispatch) {
+    RUNTIME_TRACE_GUARD.with(|guard| {
+        let mut guard = guard.borrow_mut();
+        assert!(
+            guard.is_none(),
+            "runtime tracing dispatch is already installed"
+        );
+        *guard = Some(tracing::dispatcher::set_default(dispatch));
+    });
+    let span = tracing::trace_span!(
+        target: "satelle_transport::test",
+        "Host blocking trace capture connected",
+        initial_marker = BLOCKING_SPAN_ATTRIBUTE_MARKER,
+        later_marker = tracing::field::Empty,
+    );
+    span.record("later_marker", BLOCKING_SPAN_RECORD_MARKER);
+    tracing::trace!(
+        target: "satelle_transport::test",
+        marker = BLOCKING_EVENT_MARKER,
+        "Host blocking trace event connected"
+    );
+}
+
+fn clear_runtime_thread_dispatch() {
+    RUNTIME_TRACE_GUARD.with(|guard| {
+        guard.borrow_mut().take();
+    });
+}
+
+#[derive(Clone, Default)]
+struct TraceCapture(Arc<Mutex<Vec<u8>>>);
+
+impl TraceCapture {
+    fn dispatch(&self) -> tracing::Dispatch {
+        tracing::Dispatch::new(TraceCaptureSubscriber {
+            capture: self.clone(),
+            next_span_id: AtomicU64::new(1),
+        })
+    }
+
+    fn bytes(&self) -> Vec<u8> {
+        self.0
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .clone()
+    }
+
+    fn append(&self, event: &[u8]) {
+        self.0
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .extend_from_slice(event);
+    }
+}
+
+struct TraceCaptureSubscriber {
+    capture: TraceCapture,
+    next_span_id: AtomicU64,
+}
+
+impl Subscriber for TraceCaptureSubscriber {
+    fn enabled(&self, _metadata: &Metadata<'_>) -> bool {
+        true
+    }
+
+    fn max_level_hint(&self) -> Option<LevelFilter> {
+        Some(LevelFilter::TRACE)
+    }
+
+    fn new_span(&self, attributes: &Attributes<'_>) -> Id {
+        let id = Id::from_u64(self.next_span_id.fetch_add(1, Ordering::Relaxed));
+        let mut rendered = format!(
+            "SPAN {} {} {} ",
+            attributes.metadata().level(),
+            attributes.metadata().target(),
+            attributes.metadata().name()
+        );
+        attributes.record(&mut TraceFieldVisitor(&mut rendered));
+        rendered.push('\n');
+        self.capture.append(rendered.as_bytes());
+        id
+    }
+
+    fn record(&self, span: &Id, values: &Record<'_>) {
+        let mut rendered = format!("SPAN_RECORD {span:?} ");
+        values.record(&mut TraceFieldVisitor(&mut rendered));
+        rendered.push('\n');
+        self.capture.append(rendered.as_bytes());
+    }
+
+    fn record_follows_from(&self, _span: &Id, _follows: &Id) {}
+
+    fn event(&self, event: &Event<'_>) {
+        let metadata = event.metadata();
+        let mut rendered = format!(
+            "{} {} {} ",
+            metadata.level(),
+            metadata.target(),
+            metadata.name()
+        );
+        event.record(&mut TraceFieldVisitor(&mut rendered));
+        rendered.push('\n');
+        self.capture.append(rendered.as_bytes());
+    }
+
+    fn enter(&self, _span: &Id) {}
+
+    fn exit(&self, _span: &Id) {}
+}
+
+struct TraceFieldVisitor<'a>(&'a mut String);
+
+impl Visit for TraceFieldVisitor<'_> {
+    fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+        let _ = write!(self.0, "{}={value:?} ", field.name());
     }
 }
 
