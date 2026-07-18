@@ -1053,13 +1053,13 @@
 - satelle reports a typed platform-directories-unavailable error when the current OS user cannot resolve a required ProjectDirs path @implemented @mvp
 - satelle default Linux user-level config file is ${XDG_CONFIG_HOME:-$HOME/.config}/satelle/config.toml @implemented @mvp
 - satelle default Linux local mutable state root is ${XDG_STATE_HOME:-$HOME/.local/state}/satelle @implemented @mvp
-- satelle default Linux cache root is ${XDG_CACHE_HOME:-$HOME/.cache}/satelle @spec @mvp
-- satelle default Windows user-level config file is the Roaming AppData Known Folder joined with Microck\Satelle\config\config.toml @spec @mvp
-- satelle default Windows local mutable state root is the Local AppData Known Folder joined with Microck\Satelle\data\state @spec @mvp
-- satelle default Windows cache root is the Local AppData Known Folder joined with Microck\Satelle\cache @spec @mvp
-- satelle default macOS user-level config file is $HOME/Library/Application Support/dev.Microck.Satelle/config.toml @spec @mvp
-- satelle default macOS local mutable state root is $HOME/Library/Application Support/dev.Microck.Satelle/state @spec @mvp
-- satelle default macOS cache root is $HOME/Library/Caches/dev.Microck.Satelle @spec @mvp
+- satelle default Linux cache root is ${XDG_CACHE_HOME:-$HOME/.cache}/satelle @spec @mvp @implemented
+- satelle default Windows user-level config file is the Roaming AppData Known Folder joined with Microck\Satelle\config\config.toml @spec @mvp @implemented
+- satelle default Windows local mutable state root is the Local AppData Known Folder joined with Microck\Satelle\data\state @spec @mvp @implemented
+- satelle default Windows cache root is the Local AppData Known Folder joined with Microck\Satelle\cache @spec @mvp @implemented
+- satelle default macOS user-level config file is $HOME/Library/Application Support/dev.Microck.Satelle/config.toml @spec @mvp @implemented
+- satelle default macOS local mutable state root is $HOME/Library/Application Support/dev.Microck.Satelle/state @spec @mvp @implemented
+- satelle default macOS cache root is $HOME/Library/Caches/dev.Microck.Satelle @spec @mvp @implemented
 - satelle supports SATELLE_HOME as an optional process environment override for portable installs, CI jobs, and hermetic tests @spec @mvp @implemented
 - satelle derives config_file from SATELLE_HOME/config/config.toml when SATELLE_HOME is set and SATELLE_CONFIG_FILE is unset @spec @mvp @implemented
 - satelle derives state_root from SATELLE_HOME/state when SATELLE_HOME is set and SATELLE_STATE_DIR is unset @spec @mvp @implemented
@@ -1099,7 +1099,7 @@
 - satelle Native Desktop Session Selector values must be copied from native_selectors reported by satelle host sessions for the same host platform @spec @mvp
 - satelle discovers project-level configuration by walking upward from the current working directory to the nearest .satelle/config.toml @implemented @mvp
 - satelle project-level configuration discovery works outside Git repositories @implemented @mvp
-- satelle treats a Git repository root as a helpful boundary for project discovery when present but does not require Git for project configuration @spec @mvp
+- satelle treats a Git repository root as a helpful boundary for project discovery when present but does not require Git for project configuration @spec @mvp @implemented
 - satelle project-level configuration discovery stops at the nearest .satelle/config.toml and does not merge parent project configuration files in MVP @implemented @mvp
 - satelle treats project-level configuration as untrusted repository input @spec @mvp @implemented
 - satelle project-level configuration is limited to non-secret shared Host Aliases, model and provider intent, output defaults, timeout defaults, and non-authoritative transport preferences @spec @mvp
@@ -1158,7 +1158,7 @@
 - satelle config explain output shows the effective YOLO policy, target host, selected_profile field, contributing config files, and winning source @implemented @mvp
 - satelle non-quiet preflight output identifies when YOLO mode is active and whether it came from a CLI flag, user-level Host configuration, or an explicitly selected Host-bound user-level profile @spec @mvp
 - satelle JSON state output includes whether YOLO mode is active and the configuration source that selected it @implemented @mvp
-- satelle supports explicit environment variables for selecting config paths, default host, profile, and logging behavior @spec @mvp
+- satelle supports explicit environment variables for selecting config paths, default host, profile, and logging behavior @spec @mvp @implemented
 - satelle does not use environment variables as a full nested configuration language for host definitions or policy trees @implemented @mvp
 - satelle config files do not expand process environment variables inside TOML values during MVP @implemented @mvp
 - satelle config files do not expand shell home syntax such as ~ inside TOML values during MVP @implemented @mvp
@@ -1192,9 +1192,9 @@
 - satelle user-level host configuration may define daemon_home, daemon_config_file, daemon_state_dir, daemon_cache_dir, and daemon_log_dir as persistent daemon path override defaults @implemented @mvp
 - satelle project-level configuration cannot define daemon_home, daemon_config_file, daemon_state_dir, daemon_cache_dir, or daemon_log_dir because concrete daemon storage paths are machine-local personal configuration @implemented @mvp
 - satelle reports a typed project-daemon-path-override-not-allowed configuration error when project-level configuration defines a concrete persistent daemon path override @implemented @mvp
-- satelle user-level configuration containing Host Bindings, Provider Bindings, TLS or bearer-token descriptors, Trusted Profile consent, or YOLO policy must be owned by the invoking OS user @spec @mvp
+- satelle user-level configuration containing Host Bindings, Provider Bindings, TLS or bearer-token descriptors, Trusted Profile consent, or YOLO policy must be owned by the invoking OS user @spec @mvp @implemented
 - satelle rejects such user-level security configuration when it is writable by group or other users on POSIX systems @spec @mvp @implemented
-- satelle rejects such user-level security configuration when its Windows ACL grants write access to unrelated principals @spec @mvp
+- satelle rejects such user-level security configuration when its Windows ACL grants write access to unrelated principals @spec @mvp @implemented
 - satelle config explain output shows persistent daemon path override values, their resolved source, and whether setup must persist them before the Host Daemon uses them @implemented @mvp
 - satelle project-level configuration may request model and provider aliases as shared project defaults @implemented @mvp
 - satelle project-level configuration does not define concrete provider credentials, provider auth commands, bearer tokens, secret environment variables, or provider endpoint bindings @implemented @mvp
@@ -1203,7 +1203,7 @@
 - satelle user-level configuration may opt into experimental non-OpenAI provider Computer Use globally, per profile, per host, or per provider alias @spec @mvp
 - satelle user-level configuration uses experimental_provider_computer_use as the exact key for experimental non-OpenAI provider Computer Use opt-in @implemented @mvp
 - satelle reports a typed project-experimental-provider-opt-in-not-allowed configuration error when project-level configuration sets experimental_provider_computer_use @implemented @mvp
-- satelle CLI flags may opt into experimental non-OpenAI provider Computer Use for one command and take precedence over user-level and project-level configuration @spec @mvp
+- satelle CLI flags may opt into experimental non-OpenAI provider Computer Use for one command and take precedence over user-level and project-level configuration @spec @mvp @implemented
 - satelle reports a typed experimental-provider-opt-in-required error when project configuration requests a non-OpenAI provider for Computer Use and no CLI or user-level experimental opt-in is active @spec @mvp
 - satelle user-level configuration or remote-host owned configuration binds project model and provider aliases to concrete Codex model, modelProvider, endpoint, and authentication sources @spec @mvp
 - satelle MVP provider authentication configuration supports only typed Satelle Secret Source references for operating-system credential stores, environment variables, files, and remote-host owned provider auth stores @implemented @mvp
@@ -1235,9 +1235,9 @@
 - satelle validates Satelle File Secret Source absolute-path syntax according to the operating system that resolves the provider authentication binding @spec @mvp
 - satelle config check validates Satelle File Secret Source path syntax but does not read the referenced file contents @implemented @mvp
 - satelle config explain redacts Satelle File Secret Source values by default and never reads the referenced file contents @implemented @mvp
-- a Host Daemon resolves a Satelle File Secret Source only from a regular file owned by its OS user and rejects symlinks, directories, devices, sockets, and files readable or writable by unrelated principals @spec @mvp
-- a Satelle File Secret Source is limited to 64 KiB, must be valid UTF-8, and rejects NUL bytes @spec @mvp
-- Satelle strips exactly one terminal LF or CRLF from a Satelle File Secret Source value and otherwise preserves its UTF-8 contents exactly @spec @contract @mvp
+- a Host Daemon resolves a Satelle File Secret Source only from a regular file owned by its OS user and rejects symlinks, directories, devices, sockets, and files readable or writable by unrelated principals @spec @mvp @implemented
+- a Satelle File Secret Source is limited to 64 KiB, must be valid UTF-8, and rejects NUL bytes @spec @mvp @implemented
+- Satelle strips exactly one terminal LF or CRLF from a Satelle File Secret Source value and otherwise preserves its UTF-8 contents exactly @spec @contract @mvp @implemented
 - satelle MVP provider authentication configuration does not support shell commands, command arrays, inline scripts, shell snippets, process execution, or credential helper commands as Satelle Secret Sources @implemented @mvp
 - satelle rejects unsupported provider authentication Secret Source kinds with a typed unsupported-secret-source-kind configuration error @implemented @mvp
 - satelle MVP config loading, validation, merging, config check, config explain, setup, repair, doctor diagnostics, preflight, run, and steer never execute shell commands, command arrays, inline scripts, shell snippets, process execution hooks, or credential helper commands declared by configuration files @spec @mvp @implemented
@@ -1796,7 +1796,7 @@
 # bridge
 
 ## security
-- satelle does not store plaintext secrets in Satelle configuration files @spec @mvp
+- satelle does not store plaintext secrets in Satelle configuration files @spec @mvp @implemented
 - satelle delegates SSH keys, provider API keys, Codex authentication, and app-server tokens to existing secret stores or remote-host token files @spec @mvp
 - satelle MVP does not collect telemetry or send crash reports from the CLI or Host Daemon @spec @mvp
 - satelle later telemetry is an explicit opt-in feature with documented collection scope, redaction rules, retention policy, disable behavior, and exclusion rules for secrets, raw prompts, screenshots, desktop recordings, full transcripts, and provider request or response bodies @spec @later
@@ -1939,8 +1939,8 @@
 - satelle run automatically starts the on-demand Host Daemon for SSH bootstrap hosts when it is not already running @spec @mvp @implemented
 - satelle run requires an already reachable Host Daemon for direct transport hosts and reports a direct-daemon-unreachable error when none is available @spec @mvp @implemented
 - satelle on-demand Host Daemon stays alive after a session ends for a short configurable idle timeout so follow-up commands can reuse it @spec @mvp @implemented
-- satelle on-demand Host Daemon default idle timeout is 10 minutes @spec @mvp
-- satelle on-demand Host Daemon idle timeout can be configured per host or profile @spec @mvp
+- satelle on-demand Host Daemon default idle timeout is 10 minutes @spec @mvp @implemented
+- satelle on-demand Host Daemon idle timeout can be configured per host or profile @spec @mvp @implemented
 - satelle on-demand Host Daemon idle timeout counts active Turns, active control probes, active maintenance operations, queued Turn Requests, and connected Clients instead of retained Session records @spec @mvp
 - retained idle Sessions do not prevent an on-demand Host Daemon from exiting after its idle timeout @spec @mvp
 - satelle persistent host service installation is an explicit setup action separate from ordinary prompt execution @spec @mvp
@@ -1990,7 +1990,7 @@
 - satelle MVP readiness requires native Codex Computer Use to be installed, enabled, and passing the host-side smoke test @spec @mvp
 - the Host Daemon caches every terminal native Computer Use Readiness Result @spec @mvp @implemented
 - a matching successful native Computer Use Readiness Result no older than 5 minutes is sufficient for native readiness during prompt preflight unless an invalidation condition applies @spec @mvp
-- satelle native Computer Use readiness cache time-to-live values are configurable per host or profile @spec @mvp
+- satelle native Computer Use readiness cache time-to-live values are configurable per host or profile @spec @mvp @implemented
 - satelle Host Daemon is the canonical store for readiness cache entries because it observes the remote runtime directly @spec @mvp
 - satelle CLI may keep read-only readiness cache entries for convenience but must refresh from the Host Daemon before reporting authoritative readiness @spec @mvp
 - satelle revalidates host reachability, native Computer Use readiness, and provider Computer Use compatibility before starting prompt execution @spec @mvp
@@ -2002,7 +2002,7 @@
 - label: satelle native Computer Use readiness smoke tests use a 120 second timeout by default
   command: cargo test --locked -p satelle-host --lib tests::admission_request_timeout_tracks_both_configured_readiness_phases -- --exact
   tags: [spec, mvp, implemented, ci]
-- satelle native Computer Use readiness smoke-test timeout values are configurable per host or profile @spec @mvp
+- satelle native Computer Use readiness smoke-test timeout values are configurable per host or profile @spec @mvp @implemented
 - satelle timeouts.native_readiness configuration values are human duration strings with explicit units such as "120s" or "2m" @implemented @mvp
 - satelle rejects bare integer timeouts.native_readiness configuration values with a typed duration-unit-required configuration error @implemented @mvp
 - label: satelle run and steer do not wait indefinitely for native Computer Use readiness smoke tests before prompt execution
@@ -2050,7 +2050,7 @@
 - label: satelle provider smoke tests use a 120 second timeout by default
   command: cargo test --locked -p satelle-host --lib tests::admission_request_timeout_tracks_both_configured_readiness_phases -- --exact
   tags: [spec, mvp, implemented, ci]
-- satelle provider smoke-test timeout values are configurable per host or profile @spec @mvp
+- satelle provider smoke-test timeout values are configurable per host or profile @spec @mvp @implemented
 - satelle timeouts.provider_smoke_test configuration values are human duration strings with explicit units such as "120s" or "2m" @implemented @mvp
 - satelle rejects bare integer timeouts.provider_smoke_test configuration values with a typed duration-unit-required configuration error @implemented @mvp
 - label: satelle run and steer do not wait indefinitely for provider smoke tests before prompt execution

@@ -4,7 +4,7 @@ use std::path::Path;
 use thiserror::Error;
 use zeroize::Zeroizing;
 
-const MAX_SECRET_FILE_BYTES: usize = 1024;
+const MAX_SECRET_FILE_BYTES: usize = 64 * 1024;
 const MAX_CONFIG_FILE_BYTES: usize = 1024 * 1024;
 
 #[derive(Clone, Copy, Debug, Error, Eq, PartialEq)]
@@ -15,6 +15,8 @@ pub enum SecureFileError {
     TooLarge,
     #[error("the file is not valid UTF-8")]
     NotUtf8,
+    #[error("the file contains a NUL byte")]
+    ContainsNul,
     #[error("the published secret could not be removed after persistence failed")]
     PublishedCleanupFailed,
 }
@@ -38,8 +40,15 @@ enum SecurityPolicy {
 
 pub fn read_owner_only_secret_file(path: &Path) -> Result<Zeroizing<String>, SecureFileError> {
     let bytes = read_secure_file(path, SecurityPolicy::OwnerOnly, MAX_SECRET_FILE_BYTES)?;
+    if bytes.contains(&0) {
+        return Err(SecureFileError::ContainsNul);
+    }
     let value = std::str::from_utf8(bytes.as_slice()).map_err(|_| SecureFileError::NotUtf8)?;
-    Ok(Zeroizing::new(value.trim_ascii().to_string()))
+    let value = value
+        .strip_suffix("\r\n")
+        .or_else(|| value.strip_suffix('\n'))
+        .unwrap_or(value);
+    Ok(Zeroizing::new(value.to_string()))
 }
 
 /// Persists a new secret without ever replacing an existing credential. The
@@ -1556,6 +1565,69 @@ mod tests {
                 .expect("read nested owner-only file")
                 .as_str(),
             "nested-secret"
+        );
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn file_secret_values_preserve_utf8_and_strip_one_terminal_line_ending() {
+        let directory = tempfile::tempdir().expect("create temporary directory");
+        #[cfg(unix)]
+        secure_test_root(directory.path());
+
+        for (name, stored, expected) in [
+            ("lf", "  secret value  \n", "  secret value  "),
+            ("crlf", "secret value\r\n", "secret value"),
+            ("one-only", "secret value\r\n\n", "secret value\r\n"),
+            ("unchanged", "\tsecret value\t", "\tsecret value\t"),
+        ] {
+            let path = directory.path().join(name);
+            let mut file = open_or_create_owner_only_file(&path).expect("create owner-only secret");
+            file.write_all(stored.as_bytes())
+                .expect("write secret value");
+            drop(file);
+
+            assert_eq!(
+                read_owner_only_secret_file(&path)
+                    .expect("read owner-only secret")
+                    .as_str(),
+                expected,
+                "unexpected normalization for {name}"
+            );
+        }
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn file_secret_values_accept_64_kib_and_reject_nul_bytes() {
+        let directory = tempfile::tempdir().expect("create temporary directory");
+        #[cfg(unix)]
+        secure_test_root(directory.path());
+
+        let maximum = directory.path().join("maximum-size");
+        let mut maximum_file =
+            open_or_create_owner_only_file(&maximum).expect("create maximum-size secret");
+        let maximum_value = vec![b'x'; 64 * 1024];
+        maximum_file
+            .write_all(&maximum_value)
+            .expect("write maximum-size secret");
+        drop(maximum_file);
+        assert_eq!(
+            read_owner_only_secret_file(&maximum)
+                .expect("64 KiB secret should be accepted")
+                .len(),
+            64 * 1024
+        );
+
+        let nul = directory.path().join("contains-nul");
+        let mut nul_file = open_or_create_owner_only_file(&nul).expect("create NUL secret");
+        nul_file
+            .write_all(b"secret\0value")
+            .expect("write NUL secret");
+        drop(nul_file);
+        assert_eq!(
+            read_owner_only_secret_file(&nul),
+            Err(SecureFileError::ContainsNul)
         );
     }
 
