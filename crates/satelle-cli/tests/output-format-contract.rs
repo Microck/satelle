@@ -54,6 +54,20 @@ fn assert_error_keys(report: &Value) {
     );
 }
 
+fn assert_exact_keys(report: &Value, expected: &[&str]) {
+    let mut actual = report
+        .as_object()
+        .expect("JSON report should be an object")
+        .keys()
+        .map(String::as_str)
+        .collect::<Vec<_>>();
+    actual.sort_unstable();
+
+    let mut expected = expected.to_vec();
+    expected.sort_unstable();
+    assert_eq!(actual, expected);
+}
+
 fn assert_output_conflict(args: &[&str], json_error: bool) {
     let state = state_dir();
     let output = satelle()
@@ -171,6 +185,77 @@ fn final_result_selectors_and_json_event_streams_report_typed_conflicts() {
         (vec!["doctor", "--events", "--format", "human"], true),
     ] {
         assert_output_conflict(&args, json_error);
+    }
+}
+
+#[test]
+fn stop_json_v1_has_one_closed_contract_for_stopped_and_already_terminal_turns() {
+    let fields = [
+        "changed",
+        "current_state",
+        "outcome",
+        "previous_state",
+        "schema_version",
+        "session_id",
+        "stopped_at",
+        "turn_id",
+    ];
+
+    for (adapter, expected) in [
+        (
+            "fake",
+            ("already_terminal", "completed", "completed", false),
+        ),
+        ("pending", ("stopped", "recovery_pending", "stopped", true)),
+    ] {
+        let state = state_dir();
+        let mut run_command = satelle();
+        run_command
+            .env("SATELLE_STATE_DIR", state.path())
+            .env(TEST_SUPPORT_ADAPTER_ENV, adapter)
+            .args(["run", "--host", "local-demo"]);
+        if adapter == "pending" {
+            run_command.arg("--detach");
+        }
+        let run = run_command
+            .args(["--json", "Inspect"])
+            .assert()
+            .success()
+            .get_output()
+            .clone();
+        let run = parse_json(&run.stdout);
+        let session_id = run["session_id"]
+            .as_str()
+            .expect("run result should include a Session id");
+        let turn_id = run["latest_turn"]["turn_id"]
+            .as_str()
+            .or_else(|| run["turns"][0]["turn_id"].as_str())
+            .expect("run result should include a Turn id");
+
+        let stop = satelle()
+            .env("SATELLE_STATE_DIR", state.path())
+            .env(TEST_SUPPORT_ADAPTER_ENV, adapter)
+            .args(["stop", session_id, "--json"])
+            .assert()
+            .success()
+            .get_output()
+            .clone();
+        assert!(stop.stderr.is_empty());
+        let stop = parse_json(&stop.stdout);
+
+        assert_exact_keys(&stop, &fields);
+        assert_eq!(stop["schema_version"], "satelle.stop.v1");
+        assert_eq!(stop["session_id"], session_id);
+        assert_eq!(stop["turn_id"], turn_id);
+        assert_eq!(stop["outcome"], expected.0);
+        assert_eq!(stop["previous_state"], expected.1);
+        assert_eq!(stop["current_state"], expected.2);
+        assert_eq!(stop["changed"], expected.3);
+        if expected.3 {
+            assert!(stop["stopped_at"].is_string());
+        } else {
+            assert!(stop["stopped_at"].is_null());
+        }
     }
 }
 
