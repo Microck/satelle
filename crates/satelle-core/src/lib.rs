@@ -782,9 +782,81 @@ fn find_project_config(cwd: &Path) -> PathBuf {
         if candidate.exists() {
             return candidate;
         }
+        // A repository-local config may be discovered from any nested working
+        // directory, but a parent repository or workspace must not silently
+        // supply shared intent across this trust boundary. A `.git` directory
+        // or worktree marker is sufficient; Git itself is not required.
+        if directory.join(".git").exists() {
+            break;
+        }
     }
 
     cwd.join(".satelle").join("config.toml")
+}
+
+#[cfg(test)]
+mod project_config_discovery_tests {
+    use super::*;
+
+    #[test]
+    fn git_root_bounds_parent_project_config_discovery() {
+        let root = tempfile::tempdir().expect("create project discovery root");
+        let parent_config = root.path().join(".satelle").join("config.toml");
+        std::fs::create_dir_all(parent_config.parent().expect("parent config directory"))
+            .expect("create parent config directory");
+        std::fs::write(&parent_config, "default_host = \"parent\"\n")
+            .expect("write parent project config");
+
+        let repository = root.path().join("repository");
+        let nested = repository.join("nested");
+        std::fs::create_dir_all(repository.join(".git")).expect("create Git repository marker");
+        std::fs::create_dir_all(&nested).expect("create nested project directory");
+
+        assert_eq!(
+            find_project_config(&nested),
+            nested.join(".satelle").join("config.toml")
+        );
+    }
+
+    #[test]
+    fn git_root_project_config_is_found_before_the_boundary() {
+        let root = tempfile::tempdir().expect("create project discovery root");
+        let parent_config = root.path().join(".satelle").join("config.toml");
+        std::fs::create_dir_all(parent_config.parent().expect("parent config directory"))
+            .expect("create parent config directory");
+        std::fs::write(&parent_config, "default_host = \"parent\"\n")
+            .expect("write parent project config");
+
+        let repository = root.path().join("repository");
+        let repository_config = repository.join(".satelle").join("config.toml");
+        std::fs::create_dir_all(
+            repository_config
+                .parent()
+                .expect("repository config directory"),
+        )
+        .expect("create repository config directory");
+        std::fs::write(&repository_config, "default_host = \"repository\"\n")
+            .expect("write repository project config");
+        std::fs::create_dir_all(repository.join(".git")).expect("create Git repository marker");
+        let nested = repository.join("nested");
+        std::fs::create_dir_all(&nested).expect("create nested project directory");
+
+        assert_eq!(find_project_config(&nested), repository_config);
+    }
+
+    #[test]
+    fn project_config_discovery_still_walks_ancestors_without_git() {
+        let root = tempfile::tempdir().expect("create project discovery root");
+        let project_config = root.path().join(".satelle").join("config.toml");
+        std::fs::create_dir_all(project_config.parent().expect("project config directory"))
+            .expect("create project config directory");
+        std::fs::write(&project_config, "default_host = \"project\"\n")
+            .expect("write project config");
+        let nested = root.path().join("one").join("two");
+        std::fs::create_dir_all(&nested).expect("create nested project directory");
+
+        assert_eq!(find_project_config(&nested), project_config);
+    }
 }
 
 #[derive(Clone, Debug)]
