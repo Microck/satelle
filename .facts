@@ -962,21 +962,21 @@
 - attached satelle run and steer over direct Host transport subscribe to live Host Daemon WebSocket events and reconcile authoritative Session status after stream loss, while detached direct commands return the same durable admission handles without waiting @contract @mvp @implemented
 
 # errors
-- satelle reports failures with stable typed error codes plus human-readable messages @spec @mvp
-- satelle supports global --error-format human and --error-format json modes for commands that can fail before normal output mode is selected @spec @mvp
-- satelle supports SATELLE_ERROR_FORMAT as the environment default for the global error format @spec @mvp
+- satelle reports failures with stable typed error codes plus human-readable messages @spec @mvp @implemented
+- satelle supports global --error-format human and --error-format json modes for commands that can fail before normal output mode is selected @spec @mvp @implemented
+- satelle supports SATELLE_ERROR_FORMAT as the environment default for the global error format @spec @mvp @implemented
 - satelle error-format precedence is an explicit --error-format value, then SATELLE_ERROR_FORMAT, then a successfully parsed machine selector consisting of --json, a non-human --format value, run or steer --events json, or doctor --events, then human @spec @contract @mvp
-- parser failures that cannot recognize the command's result-format selector use an explicit --error-format value, then SATELLE_ERROR_FORMAT, then human @spec @contract @mvp
-- satelle JSON parser failures use the same typed JSON error envelope as semantic usage failures @spec @mvp
-- satelle machine-readable error modes never emit ANSI styling, spinners, progress bars, hyperlinks, or human help prose to stdout @spec @mvp
-- satelle parser and semantic usage errors write their error contract to stderr and leave stdout empty unless a command-specific streaming contract states otherwise @spec @mvp
-- every satelle.error.v1 envelope includes schema_version, code, category, retryable, message, details, docs_url, and suggested_commands, using null for unavailable details or docs_url and an empty array for unavailable suggestions @spec @contract @mvp
-- satelle machine-readable error output is stable enough for AI clients and scripts to branch on code, category, retryable, and suggested_commands without parsing human text @spec @mvp
+- parser failures that cannot recognize the command's result-format selector use an explicit --error-format value, then SATELLE_ERROR_FORMAT, then human @spec @contract @mvp @implemented
+- satelle JSON parser failures use the same typed JSON error envelope as semantic usage failures @spec @mvp @implemented
+- satelle machine-readable error modes never emit ANSI styling, spinners, progress bars, hyperlinks, or human help prose in the machine-readable error stream @spec @mvp @implemented
+- satelle parser and semantic usage errors write their error contract to stderr and leave stdout empty unless a command-specific streaming contract states otherwise @spec @mvp @implemented
+- every satelle.error.v1 envelope includes schema_version, code, category, retryable, message, details, docs_url, and suggested_commands, using null for unavailable details or docs_url and an empty array for unavailable suggestions @spec @contract @mvp @implemented
+- satelle machine-readable error output is stable enough for AI clients and scripts to branch on code, category, retryable, and suggested_commands without parsing human text @spec @mvp @implemented
 - satelle JSON errors include a stable code, a human message, optional structured details, and actionable recovery guidance when the recovery path is known @implemented @mvp
 - satelle human error messages state the user-visible outcome first, explain the known cause, identify preserved state when relevant, and provide the next recovery step @spec @mvp
 - satelle does not use generic failure messages when a specific failed host, transport, Codex, Computer Use, provider, config, or session check is known @spec @mvp
-- satelle separates user-facing error messages from diagnostic implementation details and exposes low-level details only when they help the user or agent act @spec @mvp
-- satelle typed error codes are the stable automation contract while human copy may improve for clarity without changing the code @spec @mvp
+- satelle separates user-facing error messages from diagnostic implementation details and exposes low-level details only when they help the user or agent act @spec @mvp @implemented
+- satelle typed error codes are the stable automation contract while human copy may improve for clarity without changing the code @spec @mvp @implemented
 - incompatible-control-plane uses exit 75 and recovery command satelle doctor --scope codex --refresh --json @implemented @contract @mvp
 - Host Daemon HTTP incompatible-control-plane errors use status 503, category readiness, and retryable false @implemented @contract @mvp
 - incompatible-control-plane details contain only operation, reason, required_capabilities, and missing_capabilities using stable Satelle tokens; reason is runtime_missing, version_malformed, version_unavailable, version_unsupported, schema_unavailable, handshake_unavailable, or required_capability_missing, and no upstream method name or raw probe output is exposed @implemented @contract @mvp
