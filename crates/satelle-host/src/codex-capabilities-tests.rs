@@ -441,6 +441,52 @@ fn termination_reaps_an_already_exited_empty_process_group() {
 
 #[cfg(unix)]
 #[test]
+fn leader_reap_respects_an_expired_deadline() {
+    let mut command = Command::new(
+        std::env::current_exe().expect("the current test executable should be available"),
+    );
+    command
+        .args([
+            "--exact",
+            "codex_capabilities::tests::slow_version_probe_child",
+            "--nocapture",
+        ])
+        .env("SATELLE_VERSION_PROBE_TEST_CHILD", "slow");
+    let mut child = command.group_spawn().expect("spawn live process group");
+
+    assert!(
+        !reap_group_leader(&mut child, Instant::now()),
+        "leader reaping must not block beyond an expired cleanup deadline"
+    );
+    assert!(
+        terminate_group(&mut child),
+        "the live fixture process group must still be cleaned up"
+    );
+}
+
+#[test]
+fn repeated_interrupted_kill_retries_stop_at_the_shared_deadline() {
+    let start = Instant::now();
+    let deadline = start + Duration::from_millis(500);
+    let mut attempts = 0;
+    let mut observations = [start, start, deadline].into_iter();
+
+    let error = retry_interrupted_until(
+        deadline,
+        || {
+            attempts += 1;
+            Err::<(), _>(std::io::Error::from(ErrorKind::Interrupted))
+        },
+        || observations.next().unwrap_or(deadline),
+    )
+    .expect_err("repeated EINTR must stop at the cleanup deadline");
+
+    assert_eq!(error.kind(), ErrorKind::TimedOut);
+    assert_eq!(attempts, 2);
+}
+
+#[cfg(unix)]
+#[test]
 fn version_probe_deadline_survives_a_group_escaping_pipe_holder() {
     let fixture = super::control_plane_tests::compile_stdio_fixture();
     let mut command = Command::new(fixture.executable());

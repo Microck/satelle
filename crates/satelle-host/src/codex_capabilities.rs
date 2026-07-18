@@ -687,29 +687,78 @@ fn wait_for_group(child: &mut GroupChild, deadline: Instant) -> GroupWaitOutcome
 }
 
 pub(crate) fn terminate_group(child: &mut GroupChild) -> bool {
-    let killed_or_gone = loop {
-        match child.kill() {
-            Ok(()) => break true,
-            Err(error) if error.kind() == ErrorKind::Interrupted => continue,
-            Err(error) => break group_is_gone(&error) || reap_proven_empty_group(child),
-        }
-    };
-    if !killed_or_gone {
+    let group_id = child.id();
+    let deadline = Instant::now() + Duration::from_millis(500);
+    let kill_result = retry_interrupted_until(deadline, || child.kill(), Instant::now);
+
+    match &kill_result {
+        Ok(()) => {}
+        Err(error) if group_is_gone(error) => {}
+        #[cfg(target_os = "macos")]
+        Err(error) if error.raw_os_error() == Some(rustix::io::Errno::PERM.raw_os_error()) => {}
+        Err(_) => return false,
+    }
+
+    // Signal before waiting so a live leader or descendant cannot hold the
+    // cleanup path open. Reap the direct child by PID on Unix instead of
+    // asking command-group to wait by negative process-group ID. macOS keeps
+    // a zombie-only group addressable while excluding its zombie from kill's
+    // group scan, which can transiently report EPERM. Waiting first makes the
+    // subsequent group-existence proof deterministic.
+    if !reap_group_leader(child, deadline) {
         return false;
     }
 
-    // On Unix, kill() has already signaled the complete process group. Reap
-    // the direct child by PID instead of asking command-group to wait by
-    // negative process-group ID. Once the group disappears, macOS can report
-    // that group wait as unavailable even though the leader is still ours to
-    // reap, incorrectly turning successful containment into a failure.
+    wait_for_process_group_exit(group_id, deadline)
+}
+
+fn retry_interrupted_until<T, Operation, Now>(
+    deadline: Instant,
+    mut operation: Operation,
+    mut now: Now,
+) -> std::io::Result<T>
+where
+    Operation: FnMut() -> std::io::Result<T>,
+    Now: FnMut() -> Instant,
+{
+    loop {
+        if now() >= deadline {
+            return Err(std::io::Error::new(
+                ErrorKind::TimedOut,
+                "process-group cleanup deadline expired",
+            ));
+        }
+        match operation() {
+            Err(error) if error.kind() == ErrorKind::Interrupted => continue,
+            result => return result,
+        }
+    }
+}
+
+fn wait_for_process_group_exit(group_id: u32, deadline: Instant) -> bool {
+    loop {
+        if process_group_is_gone(group_id) {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        thread::sleep(VERSION_PROBE_POLL_INTERVAL);
+    }
+}
+
+fn reap_group_leader(child: &mut GroupChild, deadline: Instant) -> bool {
     loop {
         #[cfg(unix)]
-        let reaped = child.inner().wait();
+        let reaped = child.inner().try_wait();
         #[cfg(not(unix))]
-        let reaped = child.wait();
+        let reaped = child.try_wait();
         match reaped {
-            Ok(_) => return true,
+            Ok(Some(_)) => return true,
+            Ok(None) if Instant::now() < deadline => {
+                thread::sleep(VERSION_PROBE_POLL_INTERVAL);
+            }
+            Ok(None) => return false,
             Err(error) if error.kind() == ErrorKind::Interrupted => continue,
             Err(error) => return group_is_reaped(&error),
         }
@@ -717,16 +766,13 @@ pub(crate) fn terminate_group(child: &mut GroupChild) -> bool {
 }
 
 #[cfg(unix)]
-fn reap_proven_empty_group(child: &mut GroupChild) -> bool {
-    let Some(group_id) = i32::try_from(child.id())
+fn process_group_is_gone(group_id: u32) -> bool {
+    let Some(group_id) = i32::try_from(group_id)
         .ok()
         .and_then(rustix::process::Pid::from_raw)
     else {
         return false;
     };
-    if !matches!(child.inner().try_wait(), Ok(Some(_))) {
-        return false;
-    }
     matches!(
         rustix::process::test_kill_process_group(group_id),
         Err(error) if error == rustix::io::Errno::SRCH
@@ -734,8 +780,11 @@ fn reap_proven_empty_group(child: &mut GroupChild) -> bool {
 }
 
 #[cfg(not(unix))]
-fn reap_proven_empty_group(_child: &mut GroupChild) -> bool {
-    false
+fn process_group_is_gone(_group_id: u32) -> bool {
+    // GroupChild::wait returns on Windows only after the job completion port
+    // reports JOB_OBJECT_MSG_ACTIVE_PROCESS_ZERO, so the preceding reap is
+    // already the platform-native proof that the full job is empty.
+    true
 }
 
 fn group_is_gone(error: &std::io::Error) -> bool {

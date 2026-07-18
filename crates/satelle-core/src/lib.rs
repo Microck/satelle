@@ -517,6 +517,19 @@ impl ResolvedConfig {
     }
 }
 
+pub fn resolve_invocation_profile(
+    cwd: &Path,
+    flag_profile: Option<&str>,
+) -> Result<Option<SelectedProfile>, SatelleError> {
+    let Some(selected_profile) = profiles::select_profile(flag_profile, None, None) else {
+        return Ok(None);
+    };
+    let user_config_path = resolve_path_set(cwd)?.config_file;
+    let user_config = read_user_config_file(&user_config_path)?;
+    selected_profile_definition(user_config.as_ref(), &user_config_path, &selected_profile)?;
+    Ok(Some(selected_profile))
+}
+
 pub fn load_config(cwd: &Path, flag_profile: Option<&str>) -> Result<ResolvedConfig, SatelleError> {
     let paths = resolve_path_set(cwd)?;
     let user_config_path = paths.config_file;
@@ -587,21 +600,8 @@ pub fn load_config(cwd: &Path, flag_profile: Option<&str>) -> Result<ResolvedCon
             .and_then(|config| config.default_profile.as_deref()),
     );
     let profile_overlay = if let Some(selected) = &selected_profile {
-        let profile = user_config
-            .as_ref()
-            .and_then(|config| config.profiles.get(&selected.name))
-            .cloned()
-            .ok_or_else(|| {
-                let available_profiles = user_config
-                    .as_ref()
-                    .map(|config| config.profiles.keys().cloned().collect())
-                    .unwrap_or_default();
-                SatelleError::profile_not_found(
-                    &user_config_path,
-                    &selected.name,
-                    available_profiles,
-                )
-            })?;
+        let profile =
+            selected_profile_definition(user_config.as_ref(), &user_config_path, selected)?;
         if let Some(profile_host) = profile.selected_host() {
             if selected.source == profiles::ProfileSelectionSource::ProjectConfig {
                 project_config::validate_selected_profile_host(
@@ -792,6 +792,48 @@ struct ParsedUserConfig {
     config: SatelleConfig,
     default_profile: Option<String>,
     profiles: BTreeMap<String, profiles::ProfileConfig>,
+}
+
+fn selected_profile_definition(
+    user_config: Option<&ParsedUserConfig>,
+    user_config_path: &Path,
+    selected_profile: &SelectedProfile,
+) -> Result<profiles::ProfileConfig, SatelleError> {
+    user_config
+        .and_then(|config| config.profiles.get(&selected_profile.name))
+        .cloned()
+        .ok_or_else(|| {
+            let available_profiles = user_config
+                .map(|config| config.profiles.keys().cloned().collect())
+                .unwrap_or_default();
+            SatelleError::profile_not_found(
+                user_config_path,
+                &selected_profile.name,
+                available_profiles,
+            )
+        })
+}
+
+#[cfg(test)]
+mod invocation_profile_tests {
+    use super::*;
+
+    #[test]
+    fn invocation_profile_must_exist_in_the_user_config() {
+        let selected = SelectedProfile {
+            name: "missing".to_string(),
+            source: ProfileSelectionSource::Environment,
+        };
+
+        let error = selected_profile_definition(None, Path::new("/test/config.toml"), &selected)
+            .expect_err("an invocation-selected profile must be defined by the user");
+
+        assert_eq!(error.code, ErrorCode::ProfileNotFound);
+        assert_eq!(
+            error.details.get("profile"),
+            Some(&serde_json::json!("missing"))
+        );
+    }
 }
 
 fn read_user_config_file(path: &Path) -> Result<Option<ParsedUserConfig>, SatelleError> {

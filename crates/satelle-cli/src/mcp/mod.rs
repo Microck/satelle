@@ -1,4 +1,5 @@
 mod arguments;
+pub(crate) mod install;
 #[path = "output-schema.rs"]
 mod output_schema;
 mod result;

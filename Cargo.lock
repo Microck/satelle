@@ -2317,6 +2317,7 @@ dependencies = [
  "cliclack",
  "flate2",
  "jsonschema",
+ "libc",
  "notify",
  "predicates",
  "rcgen",

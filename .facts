@@ -908,12 +908,12 @@
 - satelle MCP MVP does not guarantee that notifications/cancelled stops an in-flight Satelle operation and permits rmcp to treat that notification as a no-op until operation-specific cancellation behavior is specified @spec @contract @mvp @implemented
 - stdin EOF after a completed MCP initialization shuts satelle mcp serve down with exit code 0 and no additional stdout message @spec @contract @mvp @implemented
 - stdin EOF before MCP initialization completes shuts satelle mcp serve down with a nonzero exit code, no additional stdout message, and a diagnostic on stderr @spec @contract @mvp @implemented
-- satelle exposes satelle mcp install as the AI client bootstrapper for configuring Satelle MCP server entries in supported local AI clients @spec @mvp
-- satelle mcp install supports --target <client>, --all, --server-name <name>, --satelle-path <path>, and --dry-run options @spec @mvp
-- satelle mcp install supports Claude Code, Claude Desktop, Codex, Cursor, VS Code, Windsurf, Gemini, OpenCode, Cline, Roo Code, Droid, and Antigravity as named Satelle AI Client Install Targets @spec @mvp
-- satelle mcp install --dry-run reports planned client configuration changes without writing AI client config files or restarting client applications @spec @mvp
-- satelle mcp install never stores provider credentials, Host Daemon bearer tokens, raw prompts, session transcripts, screenshots, or desktop recordings in AI client configuration @spec @mvp
-- satelle mcp install preserves unrelated existing MCP server entries in each AI client configuration file instead of rewriting the whole file from a Satelle-only template @spec @mvp
+- satelle exposes satelle mcp install as the AI client bootstrapper for configuring Satelle MCP server entries in supported local AI clients @mvp @implemented
+- satelle mcp install supports --target <client>, --all, --server-name <name>, --satelle-path <path>, and --dry-run options @mvp @implemented
+- satelle mcp install supports Claude Code, Claude Desktop, Codex, Cursor, VS Code, Windsurf, Gemini, OpenCode, Cline, Roo Code, Droid, and Antigravity as named Satelle AI Client Install Targets @mvp @implemented
+- satelle mcp install --dry-run reports planned client configuration changes without writing AI client config files or restarting client applications @mvp @implemented
+- satelle mcp install never stores provider credentials, Host Daemon bearer tokens, raw prompts, session transcripts, screenshots, or desktop recordings in AI client configuration @mvp @implemented
+- satelle mcp install preserves unrelated existing MCP server entries in each AI client configuration file instead of rewriting the whole file from a Satelle-only template @mvp @implemented
 
 ## event-streams
 - satelle Host Daemon WebSocket event streams are live-only in MVP and begin at connection or subscription time @spec @mvp @implemented
