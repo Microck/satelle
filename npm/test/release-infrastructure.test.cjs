@@ -284,25 +284,81 @@ function writeNativeReleaseArchive(archivePath, target, binary) {
   ]);
 }
 
-function stageNativeReleaseSet(release, destination) {
+function withCrlfLineEndings(contents) {
+  return Buffer.from(
+    contents.toString("utf8").replaceAll("\r\n", "\n").replaceAll("\n", "\r\n"),
+  );
+}
+
+// Build controlled invalid packages directly. No test extracts or rewrites the immutable
+// archive bytes that the validators receive.
+function writeNativeNpmFixture(
+  archivePath,
+  target,
+  binary,
+  { manifest = undefined, binaryMode = undefined } = {},
+) {
+  const metadata = platformMatrix[target];
+  const packageManifest = manifest ?? readFileSync(
+    path.join(repositoryRoot, "npm", `satelle-${target}`, "package.json"),
+  );
+  writeTarGzArchive(archivePath, [
+    { name: "package/package.json", contents: packageManifest, mode: 0o644 },
+    {
+      name: `package/${metadata.binaryPath}`,
+      contents: binary,
+      mode: binaryMode ?? (metadata.os === "win32" ? 0o644 : 0o755),
+    },
+  ]);
+}
+
+function writeScopedNpmFixture(
+  archivePath,
+  { manifest = undefined, fileContents = {}, extraEntries = [] } = {},
+) {
+  const packageRoot = path.join(repositoryRoot, "npm", "satelle");
+  const packedManifest = manifest ?? readJson(path.join(packageRoot, "package.json"));
+  const entries = [
+    {
+      name: "package/package.json",
+      contents: `${JSON.stringify(packedManifest, null, 2)}\n`,
+      mode: 0o644,
+    },
+    ...packedManifest.files.map((fileName) => ({
+      name: `package/${fileName}`,
+      contents: Object.hasOwn(fileContents, fileName)
+        ? fileContents[fileName]
+        : readFileSync(path.join(packageRoot, fileName)),
+      mode: statSync(path.join(packageRoot, fileName)).mode & 0o777,
+    })),
+    ...extraEntries,
+  ];
+  writeTarGzArchive(archivePath, entries);
+}
+
+function stageNativeReleaseSet(
+  release,
+  destination,
+  { crlfManifestTarget = undefined } = {},
+) {
   const plan = release.check();
   const binaries = new Map();
   for (const artifact of plan.artifacts) {
     const binaryPath = path.join(destination, `fixture-${artifact.target}`);
     writeSyntheticNative(binaryPath, artifact.target);
     const binary = readFileSync(binaryPath);
-    const metadata = platformMatrix[artifact.target];
-    const packageManifest = readFileSync(
+    let packageManifest = readFileSync(
       path.join(repositoryRoot, "npm", `satelle-${artifact.target}`, "package.json"),
     );
-    writeTarGzArchive(path.join(destination, artifact.npmArtifact), [
-      { name: "package/package.json", contents: packageManifest, mode: 0o644 },
-      {
-        name: `package/${metadata.binaryPath}`,
-        contents: binary,
-        mode: metadata.os === "win32" ? 0o644 : 0o755,
-      },
-    ]);
+    if (artifact.target === crlfManifestTarget) {
+      packageManifest = withCrlfLineEndings(packageManifest);
+    }
+    writeNativeNpmFixture(
+      path.join(destination, artifact.npmArtifact),
+      artifact.target,
+      binary,
+      { manifest: packageManifest },
+    );
     writeNativeReleaseArchive(path.join(destination, artifact.archive), artifact.target, binary);
     binaries.set(artifact.target, binary);
   }
@@ -402,24 +458,6 @@ function stageCompleteArtifactSet(
 
 function writeJson(filePath, value) {
   writeFileSync(filePath, `${JSON.stringify(value, null, 2)}\n`);
-}
-
-function rewriteNpmArchive(archivePath, destination, mutate) {
-  const rewriteRoot = mkdtempSync(path.join(destination, "rewrite-"));
-  execFileSync("tar", ["-xzf", archivePath, "-C", rewriteRoot]);
-  const packageRoot = path.join(rewriteRoot, "package");
-  mutate(packageRoot);
-  const members = [];
-  function collectFiles(directory, relativeDirectory) {
-    for (const entry of readdirSync(directory, { withFileTypes: true })) {
-      const absolutePath = path.join(directory, entry.name);
-      const relativePath = path.join(relativeDirectory, entry.name);
-      if (entry.isDirectory()) collectFiles(absolutePath, relativePath);
-      else members.push(relativePath);
-    }
-  }
-  collectFiles(packageRoot, "package");
-  execFileSync("tar", ["-czf", archivePath, "-C", rewriteRoot, ...members]);
 }
 
 function fixtureRepository(context) {
@@ -844,13 +882,29 @@ test(
     const destination = mkdtempSync(path.join(tmpdir(), "satelle-release-artifacts-"));
     context.after(() => rmSync(destination, { recursive: true, force: true }));
 
-    const release = createReleaseContext(repositoryRoot);
+    const fixtureRoot = fixtureRepository(context);
+    const windowsManifestPath = path.join(
+      fixtureRoot,
+      "npm",
+      "satelle-win32-arm64-msvc",
+      "package.json",
+    );
+    writeFileSync(
+      windowsManifestPath,
+      withCrlfLineEndings(readFileSync(windowsManifestPath)),
+    );
+    const release = createReleaseContext(fixtureRoot);
     assert.throws(
       () => release.validateNpmArtifacts(destination),
       expectReleaseError("release-artifact-set-incomplete"),
     );
+    // Set CRLF in the source fixture before npm pack, then keep those packed bytes immutable.
     stageCompleteArtifactSet(release, destination);
+    const windowsArm64Path = path.join(destination, "npm-win32-arm64-msvc.tgz");
+    const windowsArm64Bytes = readFileSync(windowsArm64Path);
+
     const manifest = release.validateNpmArtifacts(destination, { writeManifest: true });
+    assert.deepEqual(readFileSync(windowsArm64Path), windowsArm64Bytes);
 
     assert.equal(manifest.schemaVersion, "satelle.npm-artifacts.v1");
     assert.equal(manifest.version, workspaceVersion());
@@ -904,9 +958,12 @@ test(
     writeFileSync(linuxX64Path, linuxX64Bytes);
 
     for (const mode of [0o644, 0o700]) {
-      rewriteNpmArchive(linuxX64Path, destination, (packageRoot) => {
-        chmodSync(path.join(packageRoot, "bin", "satelle"), mode);
-      });
+      writeNativeNpmFixture(
+        linuxX64Path,
+        "linux-x64-gnu",
+        readFileSync(path.join(destination, "fixture-linux-x64-gnu")),
+        { binaryMode: mode },
+      );
       assert.throws(
         () => release.validateNpmArtifacts(destination),
         expectReleaseError("release-artifact-permission-mismatch"),
@@ -917,20 +974,21 @@ test(
 
     const scopedPath = path.join(destination, "npm-satelle-scoped.tgz");
     const scopedBytes = readFileSync(scopedPath);
-    rewriteNpmArchive(scopedPath, destination, (packageRoot) => {
-      const packedManifestPath = path.join(packageRoot, "package.json");
-      const packedManifest = readJson(packedManifestPath);
-      delete packedManifest.exports;
-      writeJson(packedManifestPath, packedManifest);
-    });
+    const scopedManifest = readJson(path.join(repositoryRoot, "npm", "satelle", "package.json"));
+    delete scopedManifest.exports;
+    writeScopedNpmFixture(scopedPath, { manifest: scopedManifest });
     assert.throws(
       () => release.validateNpmArtifacts(destination),
       expectReleaseError("release-artifact-metadata-mismatch"),
     );
     writeFileSync(scopedPath, scopedBytes);
 
-    rewriteNpmArchive(scopedPath, destination, (packageRoot) => {
-      writeFileSync(path.join(packageRoot, "payload.cjs"), "throw new Error('payload');\n");
+    writeScopedNpmFixture(scopedPath, {
+      extraEntries: [{
+        name: "package/payload.cjs",
+        contents: "throw new Error('payload');\n",
+        mode: 0o644,
+      }],
     });
     assert.throws(
       () => release.validateNpmArtifacts(destination),
@@ -938,9 +996,11 @@ test(
     );
     writeFileSync(scopedPath, scopedBytes);
 
-    rewriteNpmArchive(scopedPath, destination, (packageRoot) => {
-      const packedManifestPath = path.join(packageRoot, "package.json");
-      writeJson(packedManifestPath, { ...readJson(packedManifestPath), private: true });
+    writeScopedNpmFixture(scopedPath, {
+      manifest: {
+        ...readJson(path.join(repositoryRoot, "npm", "satelle", "package.json")),
+        private: true,
+      },
     });
     assert.throws(
       () => release.validateNpmArtifacts(destination),
@@ -948,8 +1008,8 @@ test(
     );
     writeFileSync(scopedPath, scopedBytes);
 
-    rewriteNpmArchive(scopedPath, destination, (packageRoot) => {
-      writeFileSync(path.join(packageRoot, "bin", "satelle.cjs"), "x".repeat(1024 * 1024));
+    writeScopedNpmFixture(scopedPath, {
+      fileContents: { "bin/satelle.cjs": "x".repeat(1024 * 1024) },
     });
     assert.throws(
       () => release.validateNpmArtifacts(destination),
@@ -1083,12 +1143,19 @@ test("native release archives use canonical names and match native npm executabl
   const destination = mkdtempSync(path.join(tmpdir(), "satelle-native-release-archives-"));
   context.after(() => rmSync(destination, { recursive: true, force: true }));
   const release = createReleaseContext(repositoryRoot);
-  const { plan } = stageNativeReleaseSet(release, destination);
+  // The fixture writer packages CRLF before validation, matching a Windows runner artifact.
+  const { plan } = stageNativeReleaseSet(release, destination, {
+    crlfManifestTarget: "win32-arm64-msvc",
+  });
+  const windowsArtifact = plan.artifacts.find(({ target }) => target === "win32-arm64-msvc");
+  const windowsArtifactPath = path.join(destination, windowsArtifact.npmArtifact);
+  const windowsArtifactBytes = readFileSync(windowsArtifactPath);
 
   const validation = release.validateNativeReleaseArchives(
     destination,
     validationStaging(context, "canonical"),
   );
+  assert.deepEqual(readFileSync(windowsArtifactPath), windowsArtifactBytes);
   assert.equal(validation.version, workspaceVersion());
   assert.deepEqual(
     validation.archives.map(({ target, archive, npmArtifact }) => ({

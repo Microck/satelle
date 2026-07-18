@@ -193,21 +193,25 @@
 - the Satelle JavaScript launcher forwards every argument after `satelle` unchanged to the selected Rust executable @spec @contract @mvp @implemented
 - satelle installation documentation lists npm, pnpm, and bun npm-registry installs before non-npm methods because npm-registry distribution is the recommended local CLI install path @spec @mvp
 - satelle MVP first-party non-npm local install methods are a Unix shell installer, a Windows PowerShell installer, a Homebrew tap, a Scoop bucket, and direct GitHub release archive downloads @spec @mvp
-- satelle Unix shell installer supports curl and wget entrypoints that pipe a canonical HTTPS installer script into sh @spec @mvp
-- satelle Windows PowerShell installer supports an Invoke-RestMethod entrypoint that pipes a canonical HTTPS installer script into PowerShell @spec @mvp
-- satelle install scripts support explicit version selection instead of only installing the latest release @spec @mvp
-- the canonical Satelle release archive verifier trusts the Sigstore Public Good TUF root, requires the GitHub Actions OIDC issuer https://token.actions.githubusercontent.com, and rejects attestations produced on self-hosted runners @spec @contract @release-gate @verification @mvp
-- a valid Satelle release archive attestation has repository identity Microck/satelle, exact signer workflow path .github/workflows/release.yml, source ref refs/tags/vX.Y.Z, and both source and signer digests equal to the commit obtained by peeling that verified signed annotated version tag @spec @contract @release-gate @verification @mvp
-- a Satelle release archive attestation satisfying the canonical verifier policy is authenticity evidence for the archive, while SHA256SUMS is only an integrity cross-check and is never accepted as an authenticity trust root @spec @contract @release-gate @verification @mvp
-- satelle install scripts fetch native binaries only from the versioned GitHub release artifact set, require an exact SHA-256 entry for the selected archive in SHA256SUMS, and fail closed before installation when the entry is absent, malformed, or mismatched @spec @release-gate @verification @mvp
-- satelle install scripts fail closed before installation unless the selected archive attestation satisfies the canonical release archive verifier policy and its attested digest equals both the exact SHA256SUMS entry and the downloaded archive digest @spec @contract @release-gate @verification @mvp
-- satelle direct GitHub release archive installation guidance requires the same canonical release archive attestation and SHA256SUMS verification as the install scripts @spec @contract @mvp
-- satelle install scripts install to a user-writable bin directory by default and do not require root, administrator, or system-wide installation for ordinary use @spec @mvp
-- satelle install scripts do not modify shell profiles, PATH, or PowerShell profiles unless the user explicitly opts in with a flag or interactive consent @spec @mvp
+- satelle Unix shell installer supports curl and wget entrypoints that pipe a canonical HTTPS installer script into sh @spec @mvp @implemented
+- label: the Unix shell installer requires gh and jq in addition to curl or wget, fails before downloading when either verified prerequisite is unavailable, and uses jq to validate every required satelle.paths.v1 source member against the closed PathSource vocabulary
+  id: 9ih
+  command: node --test npm/test/release-followup.test.cjs
+  tags: [mvp, release-gate, verification, implemented]
+- satelle Windows PowerShell installer supports an Invoke-RestMethod entrypoint that pipes a canonical HTTPS installer script into PowerShell @spec @mvp @implemented
+- satelle install scripts support explicit version selection instead of only installing the latest release @spec @mvp @implemented
+- the canonical Satelle release archive verifier trusts the Sigstore Public Good TUF root, requires the GitHub Actions OIDC issuer https://token.actions.githubusercontent.com, and rejects attestations produced on self-hosted runners @spec @contract @release-gate @verification @mvp @implemented
+- a valid Satelle release archive attestation has repository identity Microck/satelle, exact signer workflow path .github/workflows/release.yml, source ref refs/tags/vX.Y.Z, and both source and signer digests equal to the commit obtained by peeling that verified signed annotated version tag @spec @contract @release-gate @verification @mvp @implemented
+- a Satelle release archive attestation satisfying the canonical verifier policy is authenticity evidence for the archive, while SHA256SUMS is only an integrity cross-check and is never accepted as an authenticity trust root @spec @contract @release-gate @verification @mvp @implemented
+- satelle install scripts fetch native binaries only from the versioned GitHub release artifact set, require an exact SHA-256 entry for the selected archive in SHA256SUMS, and fail closed before installation when the entry is absent, malformed, or mismatched @spec @release-gate @verification @mvp @implemented
+- satelle install scripts fail closed before installation unless the selected archive attestation satisfies the canonical release archive verifier policy and its attested digest equals both the exact SHA256SUMS entry and the downloaded archive digest @spec @contract @release-gate @verification @mvp @implemented
+- satelle direct GitHub release archive installation guidance requires the same canonical release archive attestation and SHA256SUMS verification as the install scripts @spec @contract @mvp @implemented
+- satelle install scripts install to a user-writable bin directory by default and do not require root, administrator, or system-wide installation for ordinary use @spec @mvp @implemented
+- satelle install scripts do not modify shell profiles, PATH, or PowerShell profiles unless the user explicitly opts in with a flag or interactive consent @spec @mvp @implemented
 - satelle Homebrew distribution uses a first-party tap in MVP instead of making Homebrew core acceptance a release blocker @spec @mvp
 - satelle Scoop distribution uses a first-party Scoop bucket in MVP instead of making Scoop Main acceptance a release blocker @spec @mvp
 - satelle package-manager installs through npm, Homebrew, or Scoop rely on the package manager's own upgrade and uninstall flow instead of Satelle self-updating those installations @spec @mvp
-- satelle install scripts and direct archive install guidance create or document a local installation receipt that records install_method, binary_path, version, target, artifact_digest, and installed_at metadata @spec @mvp
+- satelle install scripts and direct archive install guidance create or document a local installation receipt that records install_method, binary_path, version, target, artifact_digest, and installed_at metadata @spec @mvp @implemented
 - satelle exposes satelle self update for binaries installed by the Satelle install scripts or direct GitHub release archive flow when the installation receipt identifies Satelle as the binary owner @spec @mvp
 - satelle self update is disabled for npm, pnpm, bun, Homebrew, Scoop, and other package-manager-owned installations @spec @mvp
 - satelle self update reports a typed self-update-managed-install error for package-manager-owned installations and includes the detected install method plus the recommended package-manager upgrade command @spec @mvp
@@ -2275,7 +2279,7 @@
 - satelle crates.io publication remains a later release milestone rather than an MVP release blocker @spec @later
 - satelle ordinary public release flow starts with a release pull request before any public package or binary publishing occurs @spec @mvp
 - satelle release pull request updates version metadata, Tegami changelog output, package lockfiles, generated package manifests, and release configuration needed for the target version @spec @mvp
-- satelle release pull request verification builds and validates release candidate artifacts without publishing public npm packages or final GitHub release assets @spec @mvp
+- satelle release pull request verification builds and validates release candidate artifacts without publishing public npm packages or final GitHub release assets @spec @mvp @implemented
 - satelle public publish workflow is triggered by pushing a protected version tag matching vX.Y.Z after the release pull request has merged to the default branch @spec @mvp
 - satelle public publish workflow does not run from release pull request merge alone @spec @mvp
 - satelle public publish workflow verifies that the version tag, committed version metadata, Tegami changelog output, npm package metadata, native artifact metadata, and integrity metadata all describe the same version before publishing @spec @mvp
@@ -2286,16 +2290,27 @@
 - satelle public publish workflow rejects lightweight, unsigned, unverified, moved, deleted, or wrong-target release tags with a typed release-tag-not-trusted error @spec @mvp
 - satelle authorized releasers may create and push signed release tags from local developer machines after the release pull request has merged because tag creation is a release trigger, not public artifact publishing @spec @mvp
 - satelle signed release tags and GitHub tag rulesets complement npm provenance, GitHub artifact attestations, and immutable release assets instead of replacing them @spec @mvp
-- satelle workflow_dispatch release runs are limited to dry-run, diagnostics, or non-publishing recovery tasks in MVP @spec @mvp
-- satelle workflow_dispatch release runs do not publish public npm packages or final GitHub release assets in MVP @spec @mvp
+- satelle workflow_dispatch release runs are limited to dry-run, diagnostics, or non-publishing recovery tasks in MVP @spec @mvp @implemented
+- satelle workflow_dispatch release runs do not publish public npm packages or final GitHub release assets in MVP @spec @mvp @implemented
 - satelle release archives use the canonical name satelle-v<version>-<target>.tar.gz on Unix targets and satelle-v<version>-<target>.zip on Windows targets @mvp @implemented
-- satelle release workflow publishes SHA-256 digests for every release archive in a canonical SHA256SUMS manifest @spec @mvp
+- satelle release workflow publishes SHA-256 digests for every release archive in a canonical SHA256SUMS manifest @spec @mvp @implemented
 - label: every Satelle release archive contains exactly one executable at its root, named satelle on Unix and satelle.exe on Windows
   id: 3ha
   tags: [contract, mvp, implemented]
-- release validation extracts every archive and verifies executable name, root layout, executable mode where applicable, reported version, target identity, and digest before publication @spec @release-gate @verification @mvp
+- release validation extracts every archive and verifies executable name, root layout, executable mode where applicable, reported version, target identity, and digest before publication @spec @release-gate @verification @mvp @implemented
 - release validation checks the archive target against its expected matrix entry through archive naming plus binary format, architecture, and libc-family inspection where applicable instead of trusting archive naming alone @release-gate @verification @mvp @implemented
-- before npm publication, satelle release validation extracts every version-matched GitHub release archive and compares its native executable digest with the executable embedded in the corresponding platform-specific npm package, rejecting any mismatch @spec @release-gate @verification @mvp
+- before npm publication, satelle release validation extracts every version-matched GitHub release archive and compares its native executable digest with the executable embedded in the corresponding platform-specific npm package, rejecting any mismatch @spec @release-gate @verification @mvp @implemented
+- label: release npm artifact validation accepts an otherwise byte-identical package manifest produced with CRLF line endings by a Windows runner
+  command: node --test --test-name-pattern="complete npm artifact validation writes canonical ownership metadata" npm/test/release-infrastructure.test.cjs
+  tags: [mvp, release-gate, verification, ci, release-followup, implemented]
+- label: native release archive validation semantically compares package manifests so Windows CRLF artifacts match the canonical release package metadata
+  id: ncr
+  command: node --test --test-name-pattern="native release archives use canonical names and match native npm executables" npm/test/release-infrastructure.test.cjs
+  tags: [mvp, release-gate, verification, ci, release-followup, implemented]
+- label: the Windows installer rejects a nonzero paths exit before JSON parsing and rejects missing wrongly typed or invalid nested source members across the complete satelle.paths.v1 source vocabulary
+  id: pwn
+  command: node --test --test-name-pattern="PowerShell installer rejects nonzero and malformed nested paths payloads" npm/test/release-followup.test.cjs
+  tags: [mvp, release-gate, verification, ci, release-followup, implemented]
 - satelle initially publishes every required npm package version under the non-default `rc-vX.Y.Z` dist-tag so no candidate becomes a default installation target before full-graph validation passes @spec @release-gate @verification @mvp
 - satelle initial npm publication publishes platform-native packages before the scoped top-level package and publishes the unscoped forwarding package last @spec @mvp
 - release validation clean-installs the exact scoped and unscoped npm candidate versions with npm, pnpm, and bun on every Controller target before default dist-tag promotion @spec @release-gate @verification @mvp
@@ -2319,7 +2334,7 @@
 - label: the release-candidate offline JSON smoke command is satelle paths --json and must emit schema_version satelle.paths.v1 before target-specific online smoke tests run
   command: cargo build --workspace --release --locked && cargo test --locked -p satelle-cli --test release-binary-contract release_binary_satisfies_offline_contract -- --exact --ignored
   tags: [release-gate, verification, mvp, spec, implemented, ci]
-- release-candidate validation installs, executes the --version contract, runs satelle paths --json, upgrades, and uninstalls Satelle on every Controller target @spec @verification @mvp
+- release-candidate validation installs, executes the --version contract, runs satelle paths --json, upgrades, and uninstalls Satelle on every Controller target @spec @verification @mvp @implemented
 
 # verification
 
@@ -2367,6 +2382,6 @@
 - label: project configuration trust tests prove a checkout cannot replace a concrete Host Binding, redirect an endpoint, select an unauthorized binding, or activate consent and YOLO policy
   command: cargo test --locked -p satelle-cli --features test-support --test project-host-binding && cargo test --locked -p satelle-cli --features test-support --test cli project_config_forbidden_keys_report_typed_errors -- --exact && cargo test --locked -p satelle-cli --features test-support --test config-profiles untrusted_profile_selectors_do_not_activate_yolo_policy -- --exact
   tags: [spec, verification, mvp, implemented, ci]
-- each declared Controller target has release-candidate build, install, upgrade, smoke, and uninstall coverage @spec @verification @mvp
+- each declared Controller target has release-candidate build, install, upgrade, smoke, and uninstall coverage @spec @verification @mvp @implemented
 - each declared Computer Use Host Platform has end-to-end setup, readiness, run, status, steer, stop, reconnect, and recovery coverage @spec @verification @mvp
 - bundled skill commands and documentation command examples parse against the same release binary @spec @verification @mvp

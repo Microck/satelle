@@ -1,0 +1,98 @@
+---
+title: Release archive verification
+description: Verify Satelle release archives before a direct installation.
+---
+
+Satelle is still pre-release, so these commands document the release contract
+and do not claim that public archives or npm packages are currently available.
+When publication starts, installers and direct archive users must authenticate
+an archive before executing it. `SHA256SUMS` is an integrity cross-check, not
+an authenticity root.
+
+## Installer entrypoints
+
+The Unix installer requires `gh` for signed-tag and Sigstore attestation
+verification and `jq` for strict validation of the installed binary's JSON
+smoke-test output. It also requires either `curl` or `wget` to download release
+artifacts. The installer checks `gh` and `jq` before selecting or downloading a
+release; curl or wget alone is not sufficient.
+
+The Unix installer accepts an explicit version and installs into a user-owned
+directory without changing shell profiles:
+
+```sh
+curl -fsSL "$SATELLE_INSTALLER_URL" | \
+  sh -s -- --version X.Y.Z
+```
+
+`wget` is also supported:
+
+```sh
+wget -qO- "$SATELLE_INSTALLER_URL" | \
+  sh -s -- --version X.Y.Z
+```
+
+The Windows installer is invoked with `Invoke-RestMethod` and accepts the same
+explicit version selection:
+
+```powershell
+& ([scriptblock]::Create((Invoke-RestMethod $SatelleInstallerUrl))) -Version X.Y.Z
+```
+
+The public installer URL is intentionally withheld until release publication;
+the repository does not present these pre-release scripts as live downloads.
+
+Both installers default to a user-writable `.local/bin` directory, leave PATH
+and profile files unchanged, and write `.satelle-install.json` beside the
+binary. The receipt records `install_method`, `binary_path`, `version`,
+`target`, `artifact_digest`, and `installed_at`. Re-running an installer with a
+new version performs an upgrade. Pass `--uninstall` on Unix or `-Uninstall` in
+PowerShell to remove a script-owned installation.
+
+## Direct archive verification
+
+For a direct download, first verify that `vX.Y.Z` is a signed annotated tag in
+`Microck/satelle` and peel it to its verified commit. Then require the archive
+to have exactly one lowercase SHA-256 entry in `SHA256SUMS` and require the
+downloaded bytes to match it.
+
+Finally, authenticate the archive with GitHub CLI. Substitute the peeled commit
+for `<commit>`:
+
+```sh
+gh attestation verify satelle-vX.Y.Z-<target>.<archive-extension> \
+  --repo Microck/satelle \
+  --signer-workflow Microck/satelle/.github/workflows/release.yml \
+  --source-ref refs/tags/vX.Y.Z \
+  --source-digest <commit> \
+  --signer-digest <commit> \
+  --cert-oidc-issuer https://token.actions.githubusercontent.com \
+  --deny-self-hosted-runners
+```
+
+This policy uses the Sigstore Public Good trusted root selected by `gh`, pins
+the GitHub Actions issuer and exact signer workflow, rejects self-hosted runner
+attestations, and requires source and signer digests to match the peeled signed
+tag commit. Do not install when the tag, checksum, attestation, archive layout,
+reported version, or `satelle paths --json` smoke check fails.
+
+After every check above succeeds and the verified executable is in its final
+location, create `.satelle-install.json` beside the executable. Do not create
+the receipt before checksum, attestation, archive layout, `--version`, and
+`satelle paths --json` verification has passed. The direct-archive receipt is
+JSON with these six required fields:
+
+```json
+{
+  "install_method": "direct-github-release-archive",
+  "binary_path": "/absolute/path/to/satelle",
+  "version": "X.Y.Z",
+  "target": "<target>",
+  "artifact_digest": "<lowercase SHA-256 archive digest>",
+  "installed_at": "<UTC RFC 3339 timestamp>"
+}
+```
+
+`binary_path` names the final executable, `artifact_digest` is the verified
+archive digest from `SHA256SUMS`, and `installed_at` records when installation
+finished after all verification and smoke checks.
