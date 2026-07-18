@@ -2288,13 +2288,13 @@
 - satelle signed release tags and GitHub tag rulesets complement npm provenance, GitHub artifact attestations, and immutable release assets instead of replacing them @spec @mvp
 - satelle workflow_dispatch release runs are limited to dry-run, diagnostics, or non-publishing recovery tasks in MVP @spec @mvp
 - satelle workflow_dispatch release runs do not publish public npm packages or final GitHub release assets in MVP @spec @mvp
-- satelle release archives use the canonical name satelle-v<version>-<target>.tar.gz on Unix targets and satelle-v<version>-<target>.zip on Windows targets @spec @mvp
+- satelle release archives use the canonical name satelle-v<version>-<target>.tar.gz on Unix targets and satelle-v<version>-<target>.zip on Windows targets @mvp @implemented
 - satelle release workflow publishes SHA-256 digests for every release archive in a canonical SHA256SUMS manifest @spec @mvp
-- id: 3ha
-  label: every Satelle release archive contains exactly one executable at its root, named satelle on Unix and satelle.exe on Windows
-  tags: [spec, contract, mvp]
+- label: every Satelle release archive contains exactly one executable at its root, named satelle on Unix and satelle.exe on Windows
+  id: 3ha
+  tags: [contract, mvp, implemented]
 - release validation extracts every archive and verifies executable name, root layout, executable mode where applicable, reported version, target identity, and digest before publication @spec @release-gate @verification @mvp
-- release validation checks the archive target against its expected matrix entry through archive naming plus binary format, architecture, and libc-family inspection where applicable instead of trusting archive naming alone @spec @release-gate @verification @mvp
+- release validation checks the archive target against its expected matrix entry through archive naming plus binary format, architecture, and libc-family inspection where applicable instead of trusting archive naming alone @release-gate @verification @mvp @implemented
 - before npm publication, satelle release validation extracts every version-matched GitHub release archive and compares its native executable digest with the executable embedded in the corresponding platform-specific npm package, rejecting any mismatch @spec @release-gate @verification @mvp
 - satelle initially publishes every required npm package version under the non-default `rc-vX.Y.Z` dist-tag so no candidate becomes a default installation target before full-graph validation passes @spec @release-gate @verification @mvp
 - satelle initial npm publication publishes platform-native packages before the scoped top-level package and publishes the unscoped forwarding package last @spec @mvp
