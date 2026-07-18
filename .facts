@@ -1003,15 +1003,15 @@
 - satelle JSON unknown-config-key errors include code, message, file, path, key, accepted_keys, and suggestion fields @implemented @mvp
 - satelle MVP does not reserve or silently ignore extension key namespaces such as x_ or x- in configuration files @implemented @mvp
 - satelle config validation reports every unknown key it can identify after successful TOML parsing before exiting with a configuration error @implemented @mvp
-- satelle configuration files describe non-secret host settings, transport settings, defaults, and policies while delegating secrets to external secret stores @spec @mvp
+- satelle configuration files describe non-secret host settings, transport settings, defaults, and policies while delegating secrets to external secret stores @spec @mvp @implemented
 - satelle exposes a read-only satelle config check command that validates local configuration without contacting any remote host @implemented @mvp
 - satelle config check does not support --fix, --apply, --write, --yes, or any other flag that mutates local configuration @implemented @mvp
 - satelle config check never creates, edits, formats, deletes, backs up, or migrates user-level or project-level configuration files @implemented @mvp
-- satelle config check validates TOML syntax, typed schema decoding, unknown-key rejection, unsupported config composition, interpolation syntax, explicit duration-unit syntax, path environment overrides, user/project merge precedence, selected profile resolution, effective host alias binding, and project-level forbidden keys when those checks can be decided locally @spec @mvp
-- satelle config check always performs file-level validation for every loaded user-level and project-level config file before context-specific validation @spec @mvp
+- satelle config check validates TOML syntax, typed schema decoding, unknown-key rejection, unsupported config composition, interpolation syntax, explicit duration-unit syntax, path environment overrides, user/project merge precedence, selected profile resolution, effective host alias binding, and project-level forbidden keys when those checks can be decided locally @spec @mvp @implemented
+- satelle config check always performs file-level validation for every loaded user-level and project-level config file before context-specific validation @spec @mvp @implemented
 - satelle config check without --all applies the effective profile overlay, validates the resulting selected context, and reports the source of each context selection @spec @mvp @implemented
-- satelle config check --all validates context-specific local semantics for the default context, each configured host alias without a profile override, each configured profile without a host override, and each explicit project host/profile default pair @spec @mvp
-- satelle config check --all does not synthesize every possible host/profile cross product unless a host/profile pair is explicitly selectable from defaults or configuration @spec @mvp
+- satelle config check --all validates context-specific local semantics for the default context, each configured host alias without a profile override, each configured profile without a host override, and each explicit project host/profile default pair @spec @mvp @implemented
+- satelle config check --all does not synthesize every possible host/profile cross product unless a host/profile pair is explicitly selectable from defaults or configuration @spec @mvp @implemented
 - satelle config check human output states whether it checked selected-context mode or all-contexts mode @implemented @mvp
 - satelle config check never opens SSH connections, Tailscale connections, Host Daemon connections, Codex app-server control-plane sessions, native Computer Use sessions, provider probe surfaces, or provider smoke tests @implemented @mvp
 - satelle config check reports remote-dependent validation such as remote-host owned provider bindings, host reachability, Host Daemon health, Codex availability, native Computer Use readiness, and provider Computer Use compatibility as not_checked instead of pass or fail @implemented @mvp
@@ -1060,19 +1060,19 @@
 - satelle default macOS user-level config file is $HOME/Library/Application Support/dev.Microck.Satelle/config.toml @spec @mvp
 - satelle default macOS local mutable state root is $HOME/Library/Application Support/dev.Microck.Satelle/state @spec @mvp
 - satelle default macOS cache root is $HOME/Library/Caches/dev.Microck.Satelle @spec @mvp
-- satelle supports SATELLE_HOME as an optional process environment override for portable installs, CI jobs, and hermetic tests @spec @mvp
-- satelle derives config_file from SATELLE_HOME/config/config.toml when SATELLE_HOME is set and SATELLE_CONFIG_FILE is unset @spec @mvp
-- satelle derives state_root from SATELLE_HOME/state when SATELLE_HOME is set and SATELLE_STATE_DIR is unset @spec @mvp
-- satelle derives cache_root from SATELLE_HOME/cache when SATELLE_HOME is set and SATELLE_CACHE_DIR is unset @spec @mvp
-- satelle derives operator_log_root from SATELLE_HOME/logs when SATELLE_HOME is set and SATELLE_LOG_DIR is unset @spec @mvp
-- satelle derives recording_root from SATELLE_HOME/state/recordings when SATELLE_HOME is set and no more specific recording storage setting is configured @spec @mvp
-- satelle supports SATELLE_CONFIG_FILE, SATELLE_STATE_DIR, SATELLE_CACHE_DIR, and SATELLE_LOG_DIR as explicit process environment path overrides @spec @mvp
-- satelle explicit path environment overrides take precedence over paths derived from SATELLE_HOME @spec @mvp
+- satelle supports SATELLE_HOME as an optional process environment override for portable installs, CI jobs, and hermetic tests @spec @mvp @implemented
+- satelle derives config_file from SATELLE_HOME/config/config.toml when SATELLE_HOME is set and SATELLE_CONFIG_FILE is unset @spec @mvp @implemented
+- satelle derives state_root from SATELLE_HOME/state when SATELLE_HOME is set and SATELLE_STATE_DIR is unset @spec @mvp @implemented
+- satelle derives cache_root from SATELLE_HOME/cache when SATELLE_HOME is set and SATELLE_CACHE_DIR is unset @spec @mvp @implemented
+- satelle derives operator_log_root from SATELLE_HOME/logs when SATELLE_HOME is set and SATELLE_LOG_DIR is unset @spec @mvp @implemented
+- satelle derives recording_root from SATELLE_HOME/state/recordings when SATELLE_HOME is set and no more specific recording storage setting is configured @spec @mvp @implemented
+- satelle supports SATELLE_CONFIG_FILE, SATELLE_STATE_DIR, SATELLE_CACHE_DIR, and SATELLE_LOG_DIR as explicit process environment path overrides @spec @mvp @implemented
+- satelle explicit path environment overrides take precedence over paths derived from SATELLE_HOME @spec @mvp @implemented
 - satelle path environment overrides take precedence over OS-native ProjectDirs defaults and do not change project-level .satelle/config.toml discovery @implemented @mvp
 - satelle treats empty path environment override values as unset @implemented @mvp
-- satelle requires SATELLE_HOME, SATELLE_CONFIG_FILE, SATELLE_STATE_DIR, SATELLE_CACHE_DIR, and SATELLE_LOG_DIR to resolve to absolute paths when they are set @spec @mvp
+- satelle requires SATELLE_HOME, SATELLE_CONFIG_FILE, SATELLE_STATE_DIR, SATELLE_CACHE_DIR, and SATELLE_LOG_DIR to resolve to absolute paths when they are set @spec @mvp @implemented
 - satelle reports a typed path-override-not-absolute configuration error when a path environment override is relative or tilde-prefixed @implemented @mvp
-- satelle MVP does not support ambiguous path override names such as SATELLE_CONFIG, SATELLE_STATE, SATELLE_CACHE, or SATELLE_LOG @spec @mvp
+- satelle MVP does not support ambiguous path override names such as SATELLE_CONFIG, SATELLE_STATE, SATELLE_CACHE, or SATELLE_LOG @spec @mvp @implemented
 - satelle path override environment variables apply only to the Satelle process that receives the environment variable @implemented @mvp
 - satelle local CLI path override environment variables do not change daemon storage paths unless host setup or service configuration sets matching daemon path overrides @implemented @mvp
 - satelle paths output identifies each resolved path source as os_default, satelle_home, explicit_environment, service_config, project_discovery, or host_reported @spec @mvp
@@ -1162,10 +1162,10 @@
 - satelle does not use environment variables as a full nested configuration language for host definitions or policy trees @implemented @mvp
 - satelle config files do not expand process environment variables inside TOML values during MVP @implemented @mvp
 - satelle config files do not expand shell home syntax such as ~ inside TOML values during MVP @implemented @mvp
-- satelle supports environment influence only through documented Satelle-owned process environment variables and explicit secret-source configuration fields @spec @mvp
+- satelle supports environment influence only through documented Satelle-owned process environment variables and explicit secret-source configuration fields @spec @mvp @implemented
 - satelle reports a typed config-interpolation-not-supported configuration error when a schema-owned config field contains recognizable environment interpolation syntax such as $VAR, ${VAR}, or %VAR% @implemented @mvp
 - satelle config explain output reports explicit Satelle process environment overrides as separate contributing sources instead of presenting them as expanded config-file values @implemented @mvp
-- satelle supports SATELLE_HOST as an optional process environment default Host selector that is lower precedence than --host and higher precedence than config-file Host defaults @spec @mvp
+- satelle supports SATELLE_HOST as an optional process environment default Host selector that is lower precedence than --host and higher precedence than config-file Host defaults @spec @mvp @implemented
 - satelle supports SATELLE_PROFILE as an optional process environment profile selector that is lower precedence than --profile and higher precedence than config-file profile defaults @spec @mvp @implemented
 - satelle supports configuration profiles that select default values and policy overlays on top of the merged base configuration @spec @mvp @implemented
 - satelle named profiles can define host selection, model and provider intent, timeout policy, output preferences, log verbosity, YOLO policy, and Trusted Profile references subject to each field's existing source restrictions @spec @mvp
@@ -1193,7 +1193,7 @@
 - satelle project-level configuration cannot define daemon_home, daemon_config_file, daemon_state_dir, daemon_cache_dir, or daemon_log_dir because concrete daemon storage paths are machine-local personal configuration @implemented @mvp
 - satelle reports a typed project-daemon-path-override-not-allowed configuration error when project-level configuration defines a concrete persistent daemon path override @implemented @mvp
 - satelle user-level configuration containing Host Bindings, Provider Bindings, TLS or bearer-token descriptors, Trusted Profile consent, or YOLO policy must be owned by the invoking OS user @spec @mvp
-- satelle rejects such user-level security configuration when it is writable by group or other users on POSIX systems @spec @mvp
+- satelle rejects such user-level security configuration when it is writable by group or other users on POSIX systems @spec @mvp @implemented
 - satelle rejects such user-level security configuration when its Windows ACL grants write access to unrelated principals @spec @mvp
 - satelle config explain output shows persistent daemon path override values, their resolved source, and whether setup must persist them before the Host Daemon uses them @implemented @mvp
 - satelle project-level configuration may request model and provider aliases as shared project defaults @implemented @mvp
@@ -1209,8 +1209,8 @@
 - satelle MVP provider authentication configuration supports only typed Satelle Secret Source references for operating-system credential stores, environment variables, files, and remote-host owned provider auth stores @implemented @mvp
 - satelle MVP provider authentication Secret Sources are Satelle Host-Resolved Secret Sources instead of local-CLI-resolved secrets @implemented @mvp
 - satelle local CLI may transmit Satelle Host-Resolved Secret Source descriptors to the target Host Daemon only when the descriptor contains no secret material @spec @mvp
-- satelle local CLI never reads local environment variables, local files, local operating-system credential stores, local keychains, local credential helpers, or local provider auth stores to obtain provider authentication secret material for a target host @spec @mvp
-- satelle local CLI never forwards provider bearer tokens, API keys, OAuth tokens, secret file contents, or resolved provider credential material to a target Host Daemon except through the explicit interactive setup provider-secret provisioning flow @spec @mvp
+- satelle local CLI never reads local environment variables, local files, local operating-system credential stores, local keychains, local credential helpers, or local provider auth stores to obtain provider authentication secret material for a target host @spec @mvp @implemented
+- satelle local CLI never forwards provider bearer tokens, API keys, OAuth tokens, secret file contents, or resolved provider credential material to a target Host Daemon except through the explicit interactive setup provider-secret provisioning flow @spec @mvp @implemented
 - satelle interactive setup provider-secret provisioning flow requires stdin to be a TTY, disables terminal echo for secret entry, and is unavailable when --no-input, --json, --quiet, or --dry-run is active @spec @mvp
 - satelle interactive setup provider-secret provisioning flow shows the target host, selected provider alias, selected Secret Source kind, destination descriptor, persistence location class, and overwrite behavior before asking for the raw secret @spec @mvp
 - satelle interactive setup provider-secret provisioning flow requires an explicit confirmation immediately before transmitting raw secret material to the target Host Daemon @spec @mvp
@@ -1240,7 +1240,7 @@
 - Satelle strips exactly one terminal LF or CRLF from a Satelle File Secret Source value and otherwise preserves its UTF-8 contents exactly @spec @contract @mvp
 - satelle MVP provider authentication configuration does not support shell commands, command arrays, inline scripts, shell snippets, process execution, or credential helper commands as Satelle Secret Sources @implemented @mvp
 - satelle rejects unsupported provider authentication Secret Source kinds with a typed unsupported-secret-source-kind configuration error @implemented @mvp
-- satelle MVP config loading, validation, merging, config check, config explain, setup, repair, doctor diagnostics, preflight, run, and steer never execute shell commands, command arrays, inline scripts, shell snippets, process execution hooks, or credential helper commands declared by configuration files @spec @mvp
+- satelle MVP config loading, validation, merging, config check, config explain, setup, repair, doctor diagnostics, preflight, run, and steer never execute shell commands, command arrays, inline scripts, shell snippets, process execution hooks, or credential helper commands declared by configuration files @spec @mvp @implemented
 - satelle config check validates provider authentication Secret Source shape and source kind locally but does not read or resolve provider secret material @implemented @mvp
 - satelle config explain reports provider authentication Secret Source kind and winning source according to its redaction and --show-secret-references rules instead of resolving provider secret material @implemented @mvp
 - satelle reports a typed model-provider-binding-missing error when project configuration requests a model or provider alias that has no user-level or host-owned binding @spec @mvp
