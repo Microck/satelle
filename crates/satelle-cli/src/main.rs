@@ -16,7 +16,7 @@ mod transport;
 
 use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum};
 use completions::{CompletionsCommand, run_completions};
-use error_output::{ErrorFormat, parser_error, print_error};
+use error_output::{ErrorFormat, parser_error, print_error, process_exit_code};
 use host_trust::{HostTrustReport, persist_host_identity};
 use logs::{LogsCommand, show_logs};
 use notify::{Config as NotifyConfig, Event, RecommendedWatcher, RecursiveMode, Watcher};
@@ -655,7 +655,7 @@ fn main() -> ExitCode {
         );
         let format = parser_error_format(&args);
         print_error(&error, format);
-        return ExitCode::from(error.exit_code() as u8);
+        return process_exit_code(&error);
     }
     let cli = match Cli::try_parse_from(&args) {
         Ok(cli) => cli,
@@ -668,7 +668,7 @@ fn main() -> ExitCode {
             let format = parser_error_format(&args);
             let error = parser_error(&error);
             print_error(&error, format);
-            return ExitCode::from(error.exit_code() as u8);
+            return process_exit_code(&error);
         }
     };
     let error_format =
@@ -678,7 +678,7 @@ fn main() -> ExitCode {
         Ok(()) => ExitCode::SUCCESS,
         Err(failure) => {
             print_error(&failure.error, error_format);
-            ExitCode::from(failure.error.exit_code() as u8)
+            process_exit_code(&failure.error)
         }
     }
 }

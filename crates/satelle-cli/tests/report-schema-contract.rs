@@ -38,18 +38,67 @@ fn json_report(state: &TestStateDir, args: Vec<&str>) -> Value {
     serde_json::from_slice(&output.stdout).expect("stdout should be one JSON report")
 }
 
+fn assert_report_contract(report: &Value, schema_version: &str, expected_fields: &[&str]) {
+    assert_eq!(report["schema_version"], schema_version);
+    let actual_fields = report
+        .as_object()
+        .expect("a command report should be a JSON object")
+        .keys()
+        .map(String::as_str)
+        .collect::<BTreeSet<_>>();
+    let expected_fields = expected_fields.iter().copied().collect::<BTreeSet<_>>();
+    assert_eq!(actual_fields, expected_fields);
+}
+
 #[test]
 fn readiness_reports_use_their_canonical_v1_schema_tokens() {
     let state = TestStateDir::new().expect("secure temp state directory should be created");
 
-    for (args, expected_schema) in [
+    for (args, expected_schema, expected_fields) in [
         (
             vec!["setup", "--host", "local-demo", "--dry-run", "--json"],
             "satelle.setup.v1",
+            &[
+                "applied_actions",
+                "daemon_path_overrides",
+                "dry_run",
+                "fallback_reason",
+                "host",
+                "mutated",
+                "native_computer_use_readiness",
+                "next_command",
+                "planned_actions",
+                "readiness_summary",
+                "recovery_commands",
+                "required_input",
+                "schema_version",
+                "service_persistent",
+                "service_scope",
+                "setup_components",
+                "setup_mode",
+                "status",
+            ][..],
         ),
         (
             vec!["doctor", "--host", "local-demo", "--json"],
             "satelle.doctor.v1",
+            &[
+                "cache_updates",
+                "changed",
+                "duration_ms",
+                "findings",
+                "finished_at",
+                "host",
+                "probe_results",
+                "ready",
+                "recovery_commands",
+                "schema_version",
+                "scopes",
+                "started_at",
+                "status",
+                "summary",
+                "target",
+            ][..],
         ),
         (
             vec![
@@ -61,10 +110,79 @@ fn readiness_reports_use_their_canonical_v1_schema_tokens() {
                 "--json",
             ],
             "satelle.host.sessions.v1",
+            &[
+                "bootstrap_actions",
+                "bootstrapped",
+                "connection_mode",
+                "host",
+                "host_daemon_version",
+                "schema_version",
+                "sessions",
+            ][..],
         ),
     ] {
         let report = json_report(&state, args);
-        assert_eq!(report["schema_version"], expected_schema);
+        assert_report_contract(&report, expected_schema, expected_fields);
+    }
+}
+
+#[test]
+fn local_inspection_reports_keep_their_closed_v1_shapes() {
+    let state = TestStateDir::new().expect("secure temp state directory should be created");
+
+    for (args, schema_version, expected_fields) in [
+        (
+            vec!["paths", "--json"],
+            "satelle.paths.v1",
+            &[
+                "cache_root",
+                "config_file",
+                "host",
+                "install_receipt",
+                "operator_log_root",
+                "project_config_file",
+                "recording_root",
+                "schema_version",
+                "sources",
+                "sqlite_store",
+                "state_root",
+            ][..],
+        ),
+        (
+            vec!["config", "check", "--json"],
+            "satelle.config.check.v1",
+            &[
+                "checked_contexts",
+                "checked_files",
+                "checks",
+                "errors",
+                "mode",
+                "not_checked",
+                "recovery_commands",
+                "schema_version",
+                "selected_host",
+                "selected_profile",
+                "status",
+            ][..],
+        ),
+        (
+            vec!["config", "explain", "--json"],
+            "satelle.config.explain.v1",
+            &[
+                "checked_files",
+                "effective",
+                "not_checked",
+                "schema_version",
+                "selected_host",
+                "selected_profile",
+                "sources",
+                "status",
+                "values",
+            ][..],
+        ),
+    ] {
+        let report = json_report(&state, args);
+        assert_report_contract(&report, schema_version, expected_fields);
     }
 }
 
@@ -76,7 +194,19 @@ fn session_commands_use_command_specific_v2_schema_tokens() {
         &state,
         vec!["run", "--host", "local-demo", "--json", "Inspect"],
     );
-    assert_eq!(run["schema_version"], "satelle.run.v2");
+    assert_report_contract(
+        &run,
+        "satelle.run.v2",
+        &[
+            "effective_timeouts",
+            "latest_turn",
+            "provider_smoke",
+            "schema_version",
+            "session_id",
+            "status",
+            "yolo",
+        ],
+    );
     let session = run["session_id"]
         .as_str()
         .expect("run should return a session id");
@@ -85,23 +215,34 @@ fn session_commands_use_command_specific_v2_schema_tokens() {
         &state,
         vec!["steer", session, "--json", "Continue inspection"],
     );
-    assert_eq!(steer["schema_version"], "satelle.steer.v2");
+    assert_report_contract(
+        &steer,
+        "satelle.steer.v2",
+        &[
+            "effective_timeouts",
+            "latest_turn",
+            "provider_smoke",
+            "schema_version",
+            "session_id",
+            "status",
+            "yolo",
+        ],
+    );
 
     let status = json_report(&state, vec!["status", session, "--json"]);
-    assert_eq!(status["schema_version"], "satelle.status.v2");
-    let status_fields = status.as_object().expect("status should be a JSON object");
-    assert_eq!(status_fields.len(), 7);
-    for field in [
-        "schema_version",
-        "session_id",
-        "host",
-        "status",
-        "created_at",
-        "updated_at",
-        "turns",
-    ] {
-        assert!(status_fields.contains_key(field), "missing field {field}");
-    }
+    assert_report_contract(
+        &status,
+        "satelle.status.v2",
+        &[
+            "created_at",
+            "host",
+            "schema_version",
+            "session_id",
+            "status",
+            "turns",
+            "updated_at",
+        ],
+    );
 
     let detached_steer = json_report(
         &state,
@@ -113,7 +254,21 @@ fn session_commands_use_command_specific_v2_schema_tokens() {
             "Continue asynchronously",
         ],
     );
-    assert_eq!(detached_steer["schema_version"], "satelle.steer.v2");
+    assert_report_contract(
+        &detached_steer,
+        "satelle.steer.v2",
+        &[
+            "created_at",
+            "effective_timeouts",
+            "host",
+            "schema_version",
+            "session_id",
+            "status",
+            "turns",
+            "updated_at",
+            "yolo",
+        ],
+    );
 
     let detached_run_state =
         TestStateDir::new().expect("second secure temp state directory should be created");
@@ -128,7 +283,21 @@ fn session_commands_use_command_specific_v2_schema_tokens() {
             "Inspect asynchronously",
         ],
     );
-    assert_eq!(detached_run["schema_version"], "satelle.run.v2");
+    assert_report_contract(
+        &detached_run,
+        "satelle.run.v2",
+        &[
+            "created_at",
+            "effective_timeouts",
+            "host",
+            "schema_version",
+            "session_id",
+            "status",
+            "turns",
+            "updated_at",
+            "yolo",
+        ],
+    );
 }
 
 #[test]

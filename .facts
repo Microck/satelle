@@ -138,7 +138,7 @@
   command: cargo test --locked -p satelle-cli --features test-support --test cli stopping_terminal_turn_preserves_history_and_allows_later_steer -- --exact
   tags: [spec, contract, mvp, implemented, ci]
 - satelle status JSON v2 uses schema_version satelle.status.v2 @contract @mvp @implemented
-- satelle logs initial and followed JSON records each use schema_version satelle.logs.entry.v1 and emit exactly one record per line without a top-level wrapper @spec @contract @mvp
+- satelle logs initial and followed JSON records each use schema_version satelle.logs.entry.v1 and emit exactly one record per line without a top-level wrapper @spec @contract @mvp @implemented
 - satelle setup JSON v1 uses schema_version satelle.setup.v1 @contract @mvp @implemented
 - satelle repair JSON v1 uses schema_version satelle.repair.v1 @spec @contract @mvp
 - satelle doctor JSON v1 uses schema_version satelle.doctor.v1 @contract @mvp @implemented
@@ -149,8 +149,8 @@
 - satelle paths JSON v1 uses schema_version satelle.paths.v1 @contract @mvp @implemented
 - satelle host sessions JSON v1 uses schema_version satelle.host.sessions.v1 @contract @mvp @implemented
 - satelle JSON error v1 uses schema_version satelle.error.v1 @contract @mvp @implemented
-- satelle does not remove fields, change field meanings, or rename enum tokens within one result schema_version @spec @contract @mvp
-- breaking machine-readable result changes require a new schema_version @spec @contract @mvp
+- satelle does not remove fields, change field meanings, or rename enum tokens within one result schema_version @spec @contract @mvp @implemented
+- breaking machine-readable result changes require a new schema_version @spec @contract @mvp @implemented
 
 ## automation
 - satelle later exposes an interactive REPL for repeated run, steer, status, logs, doctor, and config inspection against one selected context @spec @later
@@ -967,7 +967,7 @@
 - satelle reports failures with stable typed error codes plus human-readable messages @spec @mvp @implemented
 - satelle supports global --error-format human and --error-format json modes for commands that can fail before normal output mode is selected @spec @mvp @implemented
 - satelle supports SATELLE_ERROR_FORMAT as the environment default for the global error format @spec @mvp @implemented
-- satelle error-format precedence is an explicit --error-format value, then SATELLE_ERROR_FORMAT, then a successfully parsed machine selector consisting of --json, a non-human --format value, run or steer --events json, or doctor --events, then human @spec @contract @mvp
+- satelle error-format precedence is an explicit --error-format value, then SATELLE_ERROR_FORMAT, then a successfully parsed machine selector consisting of --json, a non-human --format value, run or steer --events json, or doctor --events, then human @spec @contract @mvp @implemented
 - parser failures that cannot recognize the command's result-format selector use an explicit --error-format value, then SATELLE_ERROR_FORMAT, then human @spec @contract @mvp @implemented
 - satelle JSON parser failures use the same typed JSON error envelope as semantic usage failures @spec @mvp @implemented
 - satelle machine-readable error modes never emit ANSI styling, spinners, progress bars, hyperlinks, or human help prose in the machine-readable error stream @spec @mvp @implemented
@@ -985,11 +985,11 @@
 - satelle uses a small fixed set of process exit codes for broad failure classes and keeps specific failure causes in typed JSON error codes @spec @mvp
 - satelle exit codes distinguish success, usage error, configuration error, unreachable host, host readiness failure, remote execution failure, and internal error @spec @mvp
 - satelle exits 0 for success and clean user-declined no-op outcomes @spec @mvp
-- satelle exits 64 for usage errors @spec @mvp
-- satelle exits 66 for configuration errors @spec @mvp
-- satelle exits 69 for unreachable Host errors @spec @mvp
-- satelle exits 75 for Host readiness failures @spec @mvp
-- satelle exits 74 for remote execution failures @spec @mvp
+- satelle exits 64 for usage errors @spec @mvp @implemented
+- satelle exits 66 for configuration errors @spec @mvp @implemented
+- satelle exits 69 for unreachable Host errors @spec @mvp @implemented
+- satelle exits 75 for Host readiness failures @spec @mvp @implemented
+- satelle exits 74 for remote execution failures @spec @mvp @implemented
 - satelle exits 70 for internal errors @spec @mvp
 - satelle exits 130 when an attached command is interrupted by Ctrl-C after applying its interruption contract @spec @mvp
 - setup-consent-required and doctor-fix-consent-required use the usage-error exit class because required noninteractive consent was absent and no mutation occurred @spec @contract @mvp
