@@ -2024,27 +2024,27 @@
   command: cargo test --locked -p satelle-host --lib tests::unsupported_or_unproven_production_execution_is_blocked_before_admission -- --exact
   tags: [spec, mvp, implemented, ci]
 - satelle may keep a host that lacks native Codex Computer Use only for diagnostics, installation, and repair flows @spec @mvp
-- satelle host capability checks are OS-aware for Windows, Linux, and macOS instead of assuming one platform's Codex or Computer Use behavior applies to every platform @spec @mvp
-- satelle treats cross-platform host support as successful configuration, diagnostics, and capability reporting, not as a guarantee that native Codex Computer Use is available on every operating system @spec @mvp
+- satelle host capability checks are OS-aware for Windows, Linux, and macOS instead of assuming one platform's Codex or Computer Use behavior applies to every platform @mvp @implemented
+- satelle treats cross-platform host support as successful configuration, diagnostics, and capability reporting, not as a guarantee that native Codex Computer Use is available on every operating system @mvp @implemented
 - satelle Computer Use readiness checks verify standalone Codex installation, authentication, native Computer Use availability, required OS permissions, app-server or remote-control startup, and a harmless observable Computer Use action @spec @mvp
 - satelle Computer Use readiness checks return structured pass/fail reasons for each checked prerequisite @spec @mvp
-- satelle treats configured model and provider values as requested intent rather than proof that the provider supports native Computer Use @spec @mvp
-- satelle proves selected model-provider Computer Use compatibility with a host-side provider smoke test before prompt execution @spec @mvp
-- satelle provider smoke tests run through the same remote Codex control plane and native Computer Use path that prompt execution will use @spec @mvp
-- satelle blocks prompt execution with a typed unsupported-provider-computer-use error when the selected provider or model cannot pass the Computer Use smoke test @spec @mvp
+- satelle treats configured model and provider values as requested intent rather than proof that the provider supports native Computer Use @mvp @implemented
+- satelle proves selected model-provider Computer Use compatibility with a host-side provider smoke test before prompt execution @mvp @implemented
+- satelle provider smoke tests run through the same remote Codex control plane and native Computer Use path that prompt execution will use @mvp @implemented
+- satelle blocks prompt execution with a typed unsupported-provider-computer-use error when the selected provider or model cannot pass the Computer Use smoke test @mvp @implemented
 - satelle can use cached provider smoke test results only when the cache key exactly matches the target host, provider, model, Codex version, native Computer Use runtime version, and relevant provider configuration fingerprint @spec @mvp @implemented
 - satelle provider smoke tests create a fresh random nonce and probe session on the remote Host Daemon @spec @mvp @implemented
 - satelle provider smoke tests use a Satelle Provider Probe Surface served by the Host Daemon over a loopback or local-only endpoint on the remote host @spec @mvp @implemented
-- each Provider Probe Surface binds only to loopback @spec @mvp
-- each Provider Probe Surface uses a fresh unguessable capability value valid for exactly one probe attempt @spec @mvp
-- a Provider Probe Surface accepts only the expected nonce and expected action result @spec @mvp
-- a Provider Probe Surface exposes no user files, cookies, credentials, Session data, Host metadata, or unrelated network proxy behavior @spec @mvp
-- provider probe completion closes the listener and invalidates its capability immediately @spec @mvp
-- satelle provider smoke tests do not depend on external websites, real user accounts, signed-in browser profiles, browser extensions, user files, payment pages, security settings pages, or destructive desktop actions @spec @mvp
+- each Provider Probe Surface binds only to loopback @mvp @implemented
+- each Provider Probe Surface uses a fresh unguessable capability value valid for exactly one probe attempt @mvp @implemented
+- a Provider Probe Surface accepts only the expected nonce and expected action result @mvp @implemented
+- a Provider Probe Surface exposes no user files, cookies, credentials, Session data, Host metadata, or unrelated network proxy behavior @mvp @implemented
+- provider probe completion closes the listener and invalidates its capability immediately @mvp @implemented
+- satelle provider smoke tests do not depend on external websites, real user accounts, signed-in browser profiles, browser extensions, user files, payment pages, security settings pages, or destructive desktop actions @mvp @implemented
 - satelle provider smoke tests ask Codex native Computer Use to read the probe nonce, perform a harmless visible action, and submit the expected result through the probe surface @spec @mvp @implemented
-- satelle Host Daemon verifies provider smoke test success from probe surface callbacks or daemon-observed state instead of trusting the model's final message text @spec @mvp
-- satelle provider smoke tests may use a browser as the probe target only when native Computer Use is operating that browser as an approved desktop target rather than relying solely on the Codex Browser plugin @spec @mvp
-- satelle provider smoke tests distinguish selected provider or model failure from native Computer Use readiness failures such as missing OS permissions, app approval prompts, locked desktop state, or inability to open the probe target @spec @mvp
+- satelle Host Daemon verifies provider smoke test success from probe surface callbacks or daemon-observed state instead of trusting the model's final message text @mvp @implemented
+- satelle provider smoke tests may use a browser as the probe target only when native Computer Use is operating that browser as an approved desktop target rather than relying solely on the Codex Browser plugin @mvp @implemented
+- satelle provider smoke tests distinguish selected provider or model failure from native Computer Use readiness failures such as missing OS permissions, app approval prompts, locked desktop state, or inability to open the probe target @mvp @implemented
 - satelle provider smoke tests report readiness blockers or manual-action-required when the probe cannot run because native Computer Use cannot access the probe target @spec @mvp
 - satelle provider smoke tests time out, close or retire the probe surface, and clean up probe session state after completion or failure @spec @mvp @implemented
 - label: satelle provider smoke tests use a 120 second timeout by default
@@ -2068,7 +2068,7 @@
 - label: when timed-out provider probe cancellation cannot be confirmed, Satelle records outcome_unknown diagnostics, keeps the Control Lease recovery_pending, and blocks conflicting Turn or probe admission until reconciliation succeeds
   command: cargo test --locked -p satelle-host --lib runtime::tests::unknown_provider_probe_ownership_blocks_probe_and_prompt_until_terminal_reconciliation -- --exact
   tags: [spec, mvp, implemented, ci]
-- satelle provider smoke tests store normalized pass/fail metadata and typed failure reasons but do not store screenshots, full transcripts, or desktop recordings by default @spec @mvp
+- satelle provider smoke tests store normalized pass/fail metadata and typed failure reasons but do not store screenshots, full transcripts, or desktop recordings by default @mvp @implemented
 - satelle provider smoke test cache misses during prompt execution trigger a live provider smoke test when the selected provider requires experimental provider Computer Use and the user has opted into that experimental mode @spec @mvp @implemented
 - satelle live provider smoke test failures block prompt execution and store the normalized failure result in the Host Daemon cache @spec @mvp @implemented
 - satelle provider smoke test cache hits, live refreshes, and failures are distinguishable in preflight, doctor, and JSON output @spec @mvp @implemented
@@ -2207,16 +2207,16 @@
 - satelle does not treat native Codex Computer Use sensitive-action prompts as a complete Satelle policy guarantee unless Codex exposes a stable capability or event contract for those prompts @spec @mvp
 
 ## model-providers
-- satelle defaults model and provider selection to the configured Codex model and provider on the remote host @spec @mvp
+- satelle defaults model and provider selection to the configured Codex model and provider on the remote host @mvp @implemented
 - satelle supports explicit per-run model and provider overrides when the remote host can validate the requested combination @spec @mvp
 - satelle project-level model and provider defaults are treated as shared intent and must resolve through user-level or host-owned provider bindings before execution @spec @mvp
 - satelle does not write provider credentials or project-defined provider endpoint data into the remote Codex configuration as a side effect of resolving project model defaults @spec @mvp
 - satelle requires an explicit experimental provider Computer Use option before attempting native Computer Use with a non-OpenAI provider @spec @mvp @implemented
 - satelle experimental non-OpenAI provider Computer Use opt-in must come from a CLI flag or user-level configuration rather than project-level configuration @implemented @mvp
 - satelle supports non-OpenAI provider Computer Use only as an explicit experimental mode guarded by warning text and a live remote smoke test @spec @mvp
-- satelle caches non-OpenAI provider Computer Use smoke test results by host, provider, model, Codex version, and native Computer Use runtime version @spec @mvp
-- satelle can refresh a cached non-OpenAI provider Computer Use smoke test result on demand @spec @mvp
-- satelle reports providers that pass normal Codex text turns but fail the Computer Use smoke test as unsupported for native Computer Use on that host @spec @mvp
+- satelle caches non-OpenAI provider Computer Use smoke test results by host, provider, model, Codex version, and native Computer Use runtime version @mvp @implemented
+- satelle can refresh a cached non-OpenAI provider Computer Use smoke test result on demand @mvp @implemented
+- satelle reports providers that pass normal Codex text turns but fail the Computer Use smoke test as unsupported for native Computer Use on that host @mvp @implemented
 - satelle treats text-only or Chat-Completions-only providers as incompatible with native visual Computer Use unless a configured proxy supplies the required Responses-compatible visual/tool semantics @spec @mvp
 - satelle does not allow a non-OpenAI provider smoke test cache miss to start prompt execution without first running a live smoke test during preflight or failing with an experimental-provider-not-validated error when the live test cannot be run @spec @mvp
 

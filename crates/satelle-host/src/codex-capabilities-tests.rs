@@ -99,6 +99,41 @@ fn every_non_host_platform_is_blocked_at_native_readiness() {
 }
 
 #[test]
+fn platform_policy_keeps_controller_support_distinct_from_native_host_support() {
+    for (platform, supports_native_computer_use) in [
+        (HostPlatform::Macos, true),
+        (HostPlatform::Windows, true),
+        (HostPlatform::Linux, false),
+        (HostPlatform::Other, false),
+    ] {
+        assert_eq!(
+            platform.supports_native_computer_use(),
+            supports_native_computer_use,
+            "{platform:?} used another platform's native Computer Use policy"
+        );
+    }
+}
+
+#[test]
+fn compiled_host_uses_its_own_platform_capability_policy() {
+    let expected = if cfg!(target_os = "macos") {
+        HostPlatform::Macos
+    } else if cfg!(target_os = "windows") {
+        HostPlatform::Windows
+    } else if cfg!(target_os = "linux") {
+        HostPlatform::Linux
+    } else {
+        HostPlatform::Other
+    };
+
+    assert_eq!(HostPlatform::current(), expected);
+    assert_eq!(
+        HostPlatform::current().supports_native_computer_use(),
+        matches!(expected, HostPlatform::Macos | HostPlatform::Windows)
+    );
+}
+
+#[test]
 fn absent_native_surface_reports_the_private_execution_path_blocker() {
     for capability in [
         RequiredCapability::NativeReadiness,
