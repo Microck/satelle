@@ -3,9 +3,10 @@ mod profile;
 use clap::{Args, CommandFactory, ValueEnum};
 use clap_complete::{Generator, Shell, generate};
 use satelle_core::{CLI_NAME, ErrorCode, SatelleError};
-use std::fs;
+use std::fs::{self, Permissions};
 use std::io::{self, ErrorKind, Write};
 use std::path::{Path, PathBuf};
+use tempfile::NamedTempFile;
 
 use super::Cli;
 use profile::update_shell_profile;
@@ -87,6 +88,8 @@ fn install_completions(
     profile_path: Option<&Path>,
 ) -> Result<(), SatelleError> {
     let output_dir = absolute_output_dir(output_dir)?;
+    let destination = output_dir.join(Shell::from(shell).file_name(CLI_NAME));
+    let destination_text = completion_output_path(&destination)?;
     fs::create_dir_all(&output_dir).map_err(|source| {
         completion_install_error(
             format!(
@@ -97,25 +100,121 @@ fn install_completions(
         )
     })?;
 
-    let destination = output_dir.join(Shell::from(shell).file_name(CLI_NAME));
-    fs::write(&destination, completion_script(shell)).map_err(|source| {
-        completion_install_error(
-            format!(
-                "could not write shell completion script {}",
-                destination.display()
-            ),
-            source,
-        )
-    })?;
+    persist_completion_script(&destination, &completion_script(shell))?;
 
     if let Some(profile_path) = profile_path {
         update_shell_profile(shell, &destination, profile_path)?;
     }
 
     write_stdout(
-        format!("{}\n", destination.display()).as_bytes(),
+        format!("{destination_text}\n").as_bytes(),
         "could not write installed completion path",
     )
+}
+
+fn completion_output_path(destination: &Path) -> Result<&str, SatelleError> {
+    let Some(path) = destination.to_str() else {
+        return Err(invalid_completion_path_error());
+    };
+    if path
+        .chars()
+        .any(|character| matches!(character, '\n' | '\r'))
+    {
+        return Err(invalid_completion_path_error());
+    }
+    Ok(path)
+}
+
+fn invalid_completion_path_error() -> SatelleError {
+    SatelleError {
+        code: ErrorCode::CompletionInstallFailed,
+        message: "completion output must use a single-line UTF-8 path".to_string(),
+        recovery_command: Some("choose a writable output directory and retry".to_string()),
+        source_detail: None,
+        details: Default::default(),
+    }
+}
+
+fn persist_completion_script(destination: &Path, script: &[u8]) -> Result<(), SatelleError> {
+    let permissions = completion_permissions(destination)?;
+    let parent = destination
+        .parent()
+        .expect("an installed completion path always has an output directory");
+    let mut temporary = NamedTempFile::new_in(parent).map_err(|source| {
+        completion_install_error(
+            format!(
+                "could not create temporary completion script in {}",
+                parent.display()
+            ),
+            source,
+        )
+    })?;
+    temporary.write_all(script).map_err(|source| {
+        completion_install_error(
+            format!(
+                "could not write temporary completion script for {}",
+                destination.display()
+            ),
+            source,
+        )
+    })?;
+    if let Some(permissions) = permissions {
+        temporary
+            .as_file()
+            .set_permissions(permissions)
+            .map_err(|source| {
+                completion_install_error(
+                    format!(
+                        "could not preserve completion script permissions {}",
+                        destination.display()
+                    ),
+                    source,
+                )
+            })?;
+    }
+    temporary.as_file().sync_all().map_err(|source| {
+        completion_install_error(
+            format!(
+                "could not synchronize temporary completion script for {}",
+                destination.display()
+            ),
+            source,
+        )
+    })?;
+    temporary.persist(destination).map_err(|source| {
+        completion_install_error(
+            format!(
+                "could not atomically replace completion script {}",
+                destination.display()
+            ),
+            source.error,
+        )
+    })?;
+    Ok(())
+}
+
+fn completion_permissions(destination: &Path) -> Result<Option<Permissions>, SatelleError> {
+    match fs::symlink_metadata(destination) {
+        Ok(metadata) if metadata.file_type().is_file() => Ok(Some(metadata.permissions())),
+        Ok(_) => Err(SatelleError {
+            code: ErrorCode::CompletionInstallFailed,
+            message: format!(
+                "completion destination is not a regular file {}",
+                destination.display()
+            ),
+            recovery_command: Some("choose a writable output directory and retry".to_string()),
+            source_detail: None,
+            details: Default::default(),
+        }),
+        Err(source) if source.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(source) => Err(completion_install_error(
+            format!(
+                "could not inspect completion destination {}",
+                destination.display()
+            ),
+            source,
+        )),
+    }
 }
 
 fn absolute_output_dir(output_dir: &Path) -> Result<PathBuf, SatelleError> {
