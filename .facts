@@ -178,7 +178,7 @@
   command: SATELLE_REQUIRED_PACKAGE_MANAGERS=npm,pnpm,bun npm run check:npm
   tags: [spec, mvp, release-gate, verification, implemented, ci]
 - satelle unscoped npm-registry package depends on the exact same-version npm package with scope microck and package name satelle and forwards its satelle executable instead of duplicating native optionalDependencies or binary selection logic @spec @mvp @implemented
-- satelle release validation fails when scoped and unscoped npm-registry package versions, executable behavior, README install guidance, or provenance metadata diverge @spec @mvp
+- satelle release validation fails when scoped and unscoped npm-registry package versions, executable behavior, README install guidance, or provenance metadata diverge @spec @mvp @implemented
 - satelle npm-registry distribution exposes a satelle executable command that launches the Rust native binary instead of reimplementing the CLI in JavaScript @spec @mvp @implemented
 - satelle npm-registry distribution uses a thin JavaScript launcher or installer layer only for package-manager integration @spec @mvp @implemented
 - satelle npm, pnpm, and bun installation docs use the same scoped and unscoped npm-registry package identities across package managers instead of separate package identities per package manager @spec @mvp
@@ -263,7 +263,7 @@
 - satelle post-MVP Chocolatey submission is considered after WinGet and Scoop Main only when Chocolatey moderation, validator requirements, checksum rules, install scripts, uninstall behavior, and maintainer response expectations are documented @spec @later
 - satelle post-MVP AUR, Debian package repository, RPM package repository, Nixpkgs, and MacPorts submissions are considered only after clear user demand or committed ecosystem maintainer ownership justifies their source-build policy, review, maintenance, and release-lag obligations @spec @later
 - satelle MVP does not publish .deb, .rpm, AUR, WinGet, Chocolatey, Nixpkgs, MacPorts, Homebrew core, or Scoop Main packages as release blockers @spec @mvp
-- satelle npm-registry distribution uses version-matched platform-specific native binary packages for supported local CLI platforms instead of bundling every OS and architecture binary into the top-level package @spec @mvp
+- satelle npm-registry distribution uses version-matched platform-specific native binary packages for supported local CLI platforms instead of bundling every OS and architecture binary into the top-level package @spec @mvp @implemented
 - satelle top-level npm-registry package declares version-matched platform-specific native binary packages as optionalDependencies instead of downloading the local native binary during ordinary package installation @spec @mvp @implemented
 - satelle scoped launcher, unscoped forwarder, and native platform npm-registry packages define no consumer preinstall, install, or postinstall lifecycle scripts @spec @mvp @implemented
 - satelle native-package prepack validation is a package-assembly guard invoked by npm packing, including local pack tests, and is not a consumer installation hook @spec @mvp @implemented
@@ -294,7 +294,7 @@
 - satelle native-binary-package-missing error output includes package-manager-specific reinstall guidance when the launcher can detect npm, pnpm, bun, or another package-manager owner from the installation layout @spec @mvp @implemented
 - satelle release versions align exactly across scoped and unscoped top-level npm packages, every platform-specific native npm package, the local CLI binary, and every version-matched remote Host binary artifact @spec @contract @mvp
 - satelle public release publishing is performed only by a GitHub Actions release workflow in MVP @spec @mvp
-- satelle local developer machines may build, test, package, and dry-run releases but do not publish npm packages, upload final public GitHub release assets, or mint public release provenance @spec @mvp
+- satelle local developer machines may build, test, package, and dry-run releases but do not publish npm packages, upload final public GitHub release assets, or mint public release provenance @spec @mvp @implemented
 - satelle public npm package publishing uses npm trusted publishing with OIDC instead of long-lived npm automation tokens when npm supports trusted publishing for the package @spec @mvp
 - satelle public npm package publishing runs on cloud-hosted CI runners capable of generating npm provenance attestations @spec @mvp
 - satelle public release workflow generates GitHub artifact attestations for each native binary artifact before publishing the release @spec @mvp
