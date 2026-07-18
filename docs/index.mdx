@@ -7,8 +7,23 @@ Satelle sends durable Computer Use work to an operator-controlled Host. Start
 with the [first session tutorial](/docs/tutorial/first-session), then use the
 how-to guides for day-to-day operation.
 
-> Satelle is pre-release. Build it from source. The npm package names in this
-> repository are not published installation paths yet.
+> Satelle 0.1.0 is pre-release. These pages describe the current source tree,
+> not a published release. Build from source; the reserved npm package names
+> are not installation paths yet.
+
+## Get to a result
+
+The shortest supported path uses a local Host on candidate macOS or Windows:
+
+```sh
+cargo build --release --locked -p satelle-cli
+./target/release/satelle setup --host local-demo --dry-run
+./target/release/satelle doctor --host local-demo --scope computer-use --refresh
+./target/release/satelle run --host local-demo "Open the browser"
+```
+
+Save the returned `session_id`. It remains the public handle for status, logs,
+steering, and stop requests after the original Controller exits.
 
 ## Choose a path
 
@@ -16,3 +31,17 @@ how-to guides for day-to-day operation.
 - **Host administrator:** [Onboard a native Host](/docs/how-to/setup-host)
 - **CLI user:** [Command reference](/docs/reference/commands)
 - **Security reviewer:** [Security boundaries](/docs/explanation/security-boundaries)
+
+## Current boundaries
+
+- Controller commands run on Linux, macOS, and Windows.
+- Native Computer Use Hosts are candidates on macOS and Windows and must pass
+  the live readiness probe. Linux Host execution is unavailable.
+- Local, direct HTTPS/WSS, and SSH-tunneled Controller operations exist. Direct
+  setup, local setup mutation, and persistent Host service installation do not.
+- Repair, update, support bundle export, public packages, and the Agent Skill
+  Bundle are not available.
+
+The documentation is organized as tutorials, how-to guides, reference, and
+explanation. The repository `.facts` sheet is the specification source; these
+pages describe only behavior verified in source and current CLI help.

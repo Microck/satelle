@@ -52,14 +52,22 @@ another bootstrap token and authenticate with the durable token file.
 
 ## Start the Host Daemon
 
-On the native Host, bind the server explicitly:
+For a loopback-only Host, bind the server explicitly:
 
 ```sh
 satelle host start --bind 127.0.0.1:3001 --foreground
 ```
 
 The default bind address is loopback. Exposing the daemon beyond loopback
-requires the TLS, Host identity, and token boundary described below.
+requires a TLS certificate and owner-only private key in addition to the Host
+identity and token boundary described below:
+
+```sh
+satelle host start --bind 0.0.0.0:3001 \
+  --tls-cert /absolute/path/to/host-cert.pem \
+  --tls-key /absolute/private/path/to/host-key.pem \
+  --foreground
+```
 
 ## Configure direct HTTPS
 
@@ -78,7 +86,6 @@ default_host = "studio-mac"
 transport = "direct"
 adapter = "codex"
 address = "https://studio-mac.example.ts.net:3001"
-expected_host_id = "studio-mac"
 ca_bundle = "/absolute/path/to/satelle-ca.pem"
 
 [hosts.studio-mac.api_token]
@@ -97,6 +104,23 @@ not an instruction to disable certificate validation.
 Tailscale can provide the routable name and private network path, but it does
 not replace Satelle authentication, TLS validation, or Host identity pinning.
 
+Trust the observed Host identity interactively after verifying the endpoint and
+certificate:
+
+```sh
+satelle host trust --host studio-mac
+```
+
+After confirmation, Satelle writes the observed `expected_host_id` into the
+owner-controlled user configuration.
+
+For noninteractive trust, require the exact identity supplied out of band:
+
+```sh
+satelle host trust --host studio-mac \
+  --expected-host-id <exact-host-id> --yes --no-input
+```
+
 ## Verify before running work
 
 ```sh
@@ -107,3 +131,7 @@ satelle run --host studio-mac --detach --json "Open the browser"
 
 For SSH Hosts, the same verification commands use the authenticated tunnel and
 the durable token created by setup.
+
+Direct setup is not implemented. Provision the direct token, TLS certificate,
+private key, and CA bundle through operator-controlled tooling before using
+`host trust`.

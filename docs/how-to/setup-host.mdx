@@ -41,9 +41,11 @@ satelle setup --host local-demo --on-demand --dry-run
 satelle setup --host local-demo --persistent --dry-run
 ```
 
-The current setup command produces local Host plans. Applying those plans and
-remote setup over direct transport are not implemented yet, so `--yes` fails
-closed instead of reporting a mutation that did not occur.
+Local setup is planning-only. SSH setup can apply only the on-demand transport
+token handoff described in the remote connection guide. Local mutation,
+persistent service installation, direct setup, and SSH setup for broader
+components are not implemented; those combinations fail closed instead of
+reporting a mutation that did not occur.
 
 ## Bind the visible desktop
 

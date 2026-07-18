@@ -53,3 +53,13 @@ Normal logs contain normalized operational events, not raw provider secrets.
 Readiness caches store verdicts and evidence suitable for diagnosis, not prompt
 content. Explicit diagnostic-export features must not be confused with normal
 `--verbose`, `--json`, or event output.
+
+Operational metadata can still identify a private deployment. Redact Host
+aliases, usernames, network addresses, paths, tailnet names, and Session
+identifiers before sharing logs. Never publish bearer tokens, provider secrets,
+private keys, authorization headers, prompts, transcripts, screenshots, or
+desktop content.
+
+Support bundle export is not implemented. The absence of that command is not
+permission to archive the Host state directory. Suspected vulnerabilities use
+the private reporting process in the repository security policy.
