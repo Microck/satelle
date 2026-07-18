@@ -13,6 +13,7 @@
     "docs:build": "npm run build --workspace website",
     "docs:dev": "npm run dev --workspace website",
     "release:check": "node npm/scripts/release.cjs check",
+    "release:validate-native-archives": "node npm/scripts/release.cjs validate-native-release-archives",
     "test": "npm run check:npm",
     "test:npm": "npm run check:npm"
   }
