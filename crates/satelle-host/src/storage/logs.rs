@@ -125,6 +125,23 @@ impl Storage {
         Ok(cursor)
     }
 
+    /// Loads the authoritative normalized Log Entry after its SQLite commit.
+    ///
+    /// In particular, the timestamp comes from SQLite after monotonic clock
+    /// normalization rather than from the pre-commit SafeLogRecord.
+    pub(crate) fn committed_log_entry(&self, cursor: u64) -> Result<DaemonLogEntry, StorageError> {
+        let previous_cursor = cursor
+            .checked_sub(1)
+            .ok_or_else(|| StorageError::new(StorageErrorKind::InvalidInput))?;
+        let query = LogPageQuery::forward(Some(LogCursor::from_position(previous_cursor)), 1)
+            .map_err(|_| StorageError::new(StorageErrorKind::InvalidInput))?;
+        let mut stored = load_log_page_records(&self.connection, &query, 1)?;
+        if stored.len() != 1 || stored[0].cursor != cursor {
+            return Err(StorageError::new(StorageErrorKind::InvalidStoredState));
+        }
+        stored_page_entry(stored.remove(0))
+    }
+
     #[cfg(test)]
     pub(crate) fn logs_after(
         &self,
