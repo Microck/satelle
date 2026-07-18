@@ -168,6 +168,8 @@ fn parser_and_semantic_usage_failures_share_the_human_and_json_contract_and_stat
 
     assert_error_process(&parser);
     assert_error_process(&semantic);
+    assert_eq!(parser.status.code(), Some(64));
+    assert_eq!(semantic.status.code(), Some(64));
     assert_eq!(
         parser.status, semantic.status,
         "parser and semantic human errors must share an exit status"
@@ -187,6 +189,8 @@ fn parser_and_semantic_usage_failures_share_the_human_and_json_contract_and_stat
 
     assert_error_process(&parser);
     assert_error_process(&semantic);
+    assert_eq!(parser.status.code(), Some(64));
+    assert_eq!(semantic.status.code(), Some(64));
     assert_eq!(
         parser.status, semantic.status,
         "parser and semantic JSON errors must share an exit status"

@@ -2,6 +2,7 @@ use clap::ValueEnum;
 use satelle_core::{ErrorCode, SatelleError};
 use serde::Serialize;
 use serde_json::Value;
+use std::process::ExitCode;
 
 pub(crate) const ERROR_SCHEMA_VERSION: &str = "satelle.error.v1";
 
@@ -86,6 +87,11 @@ struct ErrorEnvelope<'a> {
 
 pub(crate) fn parser_error(error: &clap::Error) -> SatelleError {
     SatelleError::invalid_usage(error.render().to_string())
+}
+
+/// Converts the shared typed error contract into the CLI process boundary exactly once.
+pub(crate) fn process_exit_code(error: &SatelleError) -> ExitCode {
+    ExitCode::from(error.exit_code() as u8)
 }
 
 pub(crate) fn print_error(error: &SatelleError, format: ErrorFormat) {
@@ -215,6 +221,34 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+
+    fn error_with_code(code: ErrorCode) -> SatelleError {
+        SatelleError {
+            code,
+            message: "representative process failure".to_string(),
+            recovery_command: None,
+            source_detail: None,
+            details: BTreeMap::new(),
+        }
+    }
+
+    #[test]
+    fn broad_process_exit_classes_are_stable_at_the_cli_boundary() {
+        for (code, expected) in [
+            (ErrorCode::InvalidUsage, 64),
+            (ErrorCode::ConfigError, 66),
+            (ErrorCode::HostUnreachable, 69),
+            (ErrorCode::ComputerUseNotReady, 75),
+            (ErrorCode::RemoteExecution, 74),
+        ] {
+            assert_eq!(
+                process_exit_code(&error_with_code(code)),
+                ExitCode::from(expected),
+                "unexpected process exit for {}",
+                code.as_str()
+            );
+        }
+    }
 
     #[test]
     fn configured_error_format_precedes_machine_detection() {
