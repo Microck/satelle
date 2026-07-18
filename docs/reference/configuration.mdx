@@ -8,6 +8,10 @@ system. `SATELLE_HOME` relocates the config, state, cache, and log roots.
 `SATELLE_CONFIG_FILE`, `SATELLE_STATE_DIR`, `SATELLE_CACHE_DIR`, and
 `SATELLE_LOG_DIR` override individual absolute paths.
 
+Configuration selects behavior; it does not make an unimplemented transport
+operation available. Local setup is planning-only, SSH setup is limited to the
+on-demand transport token handoff, and direct setup is unavailable.
+
 ## User configuration
 
 User configuration owns concrete Host bindings and sensitive descriptors:

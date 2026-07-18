@@ -26,8 +26,10 @@ satelle setup --host local-demo --dry-run
 ```
 
 The dry run reports planned actions, required human input, readiness, and
-recovery commands. Run setup without `--dry-run` only after reviewing the plan.
-In noninteractive use, mutations require explicit `--yes`.
+recovery commands. Local setup mutation is not implemented in this release, so
+do not rerun this local command with `--yes`. Complete any reported Host,
+runtime, desktop, or provider prerequisites through operator-controlled tools.
+Satelle does not silently answer operating-system permission prompts.
 
 ## 3. Prove native readiness
 
@@ -52,16 +54,31 @@ status, logs, and stop requests.
 
 ```sh
 satelle status <session_id>
-satelle steer <session_id> "Navigate to example.com"
 satelle logs --session <session_id> --tail 50
 ```
 
-You have completed the tutorial when the first Turn reaches a terminal state
-and the same Session remains readable through `status`.
+## 5. Reconnect and control the Session
+
+Close the original shell or start a fresh Controller process. Confirm the
+Session still exists, start a detached follow-up Turn, then stop it:
+
+```sh
+satelle status <session_id> --host local-demo
+satelle steer <session_id> --host local-demo --detach "Open settings"
+satelle stop <session_id> --host local-demo
+satelle status <session_id> --host local-demo
+```
+
+You have completed the tutorial when the first Turn reached a terminal state,
+the fresh Controller read the same Session, and the final status confirms that
+the detached follow-up Turn stopped.
 
 ## Current limitations
 
 - Native Host readiness is supported only on candidate macOS and Windows
   Hosts that pass the live probe. Linux native Computer Use is unavailable.
 - The release has not been published to npm.
-- SSH transport, remote setup, and automatic repair are not implemented.
+- SSH on-demand transport setup and tunneled operation are implemented, but
+  persistent remote service installation is not.
+- Local setup mutation, direct setup, automatic repair, and support bundle
+  export are not implemented.

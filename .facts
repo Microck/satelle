@@ -2221,10 +2221,10 @@
 - satelle does not allow a non-OpenAI provider smoke test cache miss to start prompt execution without first running a live smoke test during preflight or failing with an experimental-provider-not-validated error when the live test cannot be run @spec @mvp
 
 # docs
-- satelle MVP public documentation uses Fumadocs as the documentation site framework @spec @mvp
-- satelle repository README states project status, supported platforms, implemented release surface, security model, development commands, and the shortest successful-use example @spec @mvp
-- satelle public repository includes the license file matching the workspace package metadata before preview publication @spec @mvp
-- satelle public repository includes a security policy describing vulnerability reporting and sensitive diagnostic handling before preview publication @spec @mvp
+- satelle MVP public documentation uses Fumadocs as the documentation site framework @spec @mvp @implemented
+- satelle repository README states project status, supported platforms, implemented release surface, security model, development commands, and the shortest successful-use example @spec @mvp @implemented
+- satelle public repository includes the license file matching the workspace package metadata before preview publication @spec @mvp @implemented
+- satelle public repository includes a security policy describing vulnerability reporting and sensitive diagnostic handling before preview publication @spec @mvp @implemented
 - satelle ships a Satelle Agent Skill Bundle as embedded SKILL.md content for AI agents that need to set up, operate, or recover Satelle @spec @mvp
 - satelle Agent Skill Bundle contains separate setup, use, recover, and router skills instead of one sprawling skill covering every Satelle workflow @spec @mvp
 - satelle embedded skills are Satelle-owned product guidance and not a general-purpose user skill registry, plugin marketplace, or arbitrary skill execution system @spec @mvp
@@ -2239,13 +2239,13 @@
 - satelle release validation proves embedded Agent Skill Bundle bytes match the release source copies byte for byte @spec @mvp
 - satelle release validation smoke-tests every bundled skill command example against the matching release binary @spec @mvp
 - satelle bundled skills do not include user secrets, host-specific configuration, prompts, session transcripts, screenshots, or generated diagnostic artifacts @spec @mvp
-- satelle Fumadocs setup is not a prerequisite for the first Rust CLI and Host Daemon skeleton implementation @spec @mvp
-- satelle Fumadocs setup happens after the first Rust CLI and Host Daemon skeleton establishes stable top-level commands, configuration surfaces, and setup flow names @spec @mvp
-- satelle Fumadocs setup happens before public MVP release hardening so documentation, CLI help output, and .facts can be reviewed together before publishing @spec @mvp
-- satelle first public MVP release requires a Fumadocs documentation site covering installation, setup onboarding, run, steer, status, logs, doctor, configuration, provider authentication, Trusted Profiles, transports, Tailscale support, YOLO mode, diagnostics, and security boundaries @spec @mvp
-- satelle Fumadocs documentation follows the Diataxis structure with tutorials, how-to guides, reference pages, and explanation pages instead of a single flat README-style manual @spec @mvp
-- satelle .facts remains the product specification source of truth, and Fumadocs pages are user-facing documentation derived from .facts, CLI help output, and implemented behavior @spec @mvp
-- satelle Fumadocs build dependencies are documentation and release-time dependencies only and are not runtime dependencies for the Rust CLI, Host Daemon, or remote host artifacts @spec @mvp
+- satelle Fumadocs setup is not a prerequisite for the first Rust CLI and Host Daemon skeleton implementation @spec @mvp @implemented
+- satelle Fumadocs setup happens after the first Rust CLI and Host Daemon skeleton establishes stable top-level commands, configuration surfaces, and setup flow names @spec @mvp @implemented
+- satelle Fumadocs setup happens before public MVP release hardening so documentation, CLI help output, and .facts can be reviewed together before publishing @spec @mvp @implemented
+- satelle first public MVP release requires a Fumadocs documentation site covering installation, setup onboarding, run, steer, status, logs, doctor, configuration, provider authentication, Trusted Profiles, transports, Tailscale support, YOLO mode, diagnostics, and security boundaries @spec @mvp @implemented
+- satelle Fumadocs documentation follows the Diataxis structure with tutorials, how-to guides, reference pages, and explanation pages instead of a single flat README-style manual @spec @mvp @implemented
+- satelle .facts remains the product specification source of truth, and Fumadocs pages are user-facing documentation derived from .facts, CLI help output, and implemented behavior @spec @mvp @implemented
+- satelle Fumadocs build dependencies are documentation and release-time dependencies only and are not runtime dependencies for the Rust CLI, Host Daemon, or remote host artifacts @spec @mvp @implemented
 - satelle documentation CI rejects broken internal links, missing local assets, and command examples that do not parse against the matching release binary @spec @mvp
 - satelle versioned documentation identifies the Satelle release whose CLI, API, schemas, and bundled skills it describes @spec @mvp
 - satelle generated command and schema reference is derived from the release binary or public domain types instead of manually duplicating field lists @spec @mvp

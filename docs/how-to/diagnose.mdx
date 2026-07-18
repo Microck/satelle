@@ -41,4 +41,10 @@ satelle logs --host <alias> --source codex_adapter --since 10m --json
 
 Normal logs are designed for operational diagnosis and exclude raw provider
 secrets. Support bundle export is present in the command tree but is not
-implemented yet. Automatic repair and doctor fix flows are also unavailable.
+implemented yet. Do not archive the whole state directory as a substitute.
+Automatic repair and doctor fix flows are also unavailable.
+
+Before sharing logs, redact Host aliases, usernames, addresses, tailnet names,
+Session identifiers, local paths, prompts, transcripts, and desktop content.
+Never share bearer tokens, provider secrets, private keys, or authorization
+headers. Follow the repository security policy for suspected vulnerabilities.

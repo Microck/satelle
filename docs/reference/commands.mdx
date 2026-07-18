@@ -8,7 +8,7 @@ Global options include `--no-color`, `--profile <name>`, and
 
 | Command | Purpose | Status |
 | --- | --- | --- |
-| `satelle setup` | Plan local Host onboarding | Dry-run planning implemented; application unavailable |
+| `satelle setup` | Plan Host onboarding and apply SSH token handoff | Local planning and SSH token handoff implemented |
 | `satelle repair` | Repair a Host | Not implemented |
 | `satelle doctor` | Run diagnostic probes | Implemented |
 | `satelle config check` | Validate one or all local contexts | Implemented |
@@ -27,9 +27,19 @@ Global options include `--no-color`, `--profile <name>`, and
 | `satelle stop` | Stop the active Turn | Implemented |
 | `satelle logs` | Read normalized retained Host logs | Implemented |
 | `satelle mcp serve` | Serve the MCP interface over stdio | Implemented |
+| `satelle mcp install` | Configure a supported AI client to call Satelle MCP | Implemented |
 | `satelle support bundle` | Export a support bundle | Not implemented |
 | `satelle self update` | Update the executable and optional remotes | Not implemented |
 | `satelle completions` | Generate shell completions | Implemented |
+
+`setup` application is transport-specific. Local setup is dry-run planning
+only. SSH setup can apply the on-demand transport token handoff only. Direct
+setup, persistent Host service installation, and SSH setup for broader
+components are unavailable.
+
+Direct and SSH-tunneled transports support ordinary Session operations. Live
+`doctor` probes are currently local-only; unsupported transport/scope
+combinations fail with a typed error.
 
 Use `satelle <command> --help` as the exact option reference for the binary you
 are running. Pre-release commands may change before the first stable release.
@@ -56,3 +66,10 @@ eligible refresh scope and requires explicit units.
 `doctor --scope provider --refresh` runs the provider smoke probe as a
 diagnostic, updates the normal Host readiness cache, and reports whether the
 result was refreshed. It does not create a Session or admit a prompt Turn.
+
+## Unavailable command families
+
+Commands can appear in `--help` before their implementation is complete.
+`repair`, Host stop/restart/update, storage migration, self-update, and support
+bundle export currently return typed not-implemented errors. There is no
+`satelle skills` command or embedded Agent Skill Bundle in this source tree.
