@@ -2244,7 +2244,7 @@ async fn shutdown_handle_releases_the_store_for_the_next_daemon() {
 async fn shutdown_handle_bounds_a_stalled_connection_and_releases_the_store() {
     let state = TestStateDir::new().expect("temporary state directory");
     let state_path = state.path().to_path_buf();
-    let (ready_sender, ready_receiver) = std::sync::mpsc::sync_channel(1);
+    let (ready_sender, ready_receiver) = tokio::sync::oneshot::channel();
     let owner = std::thread::spawn(move || {
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
@@ -2270,9 +2270,10 @@ async fn shutdown_handle_bounds_a_stalled_connection_and_releases_the_store() {
         // contains any connection tasks Axum retained after bounded shutdown.
         drop(runtime);
     });
-    let (first_addr, shutdown) = ready_receiver
-        .recv_timeout(Duration::from_secs(2))
-        .expect("receive running daemon");
+    // Startup is not part of the shutdown deadline under test. Wait for the
+    // owner handoff so slow scheduling cannot strand its runtime and store;
+    // setup failures still disconnect the channel and fail this receive.
+    let (first_addr, shutdown) = ready_receiver.await.expect("receive running daemon");
     let mut stalled = TcpStream::connect(first_addr)
         .await
         .expect("open stalled connection");
