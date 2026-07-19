@@ -1118,21 +1118,21 @@
 - satelle applies configuration precedence as built-in defaults, then user-level configuration, then project-level configuration, then explicit Satelle process environment variables, then CLI flags for non-secret overlapping settings @implemented @mvp
 - satelle applies project-level precedence only to fields that the project-level schema is authorized to define @spec @mvp @implemented
 - satelle user-level configuration may define Satelle Trusted Profiles that grant noninteractive mutation consent only for configured command families and host aliases @spec @mvp
-- satelle MVP Satelle Trusted Profiles require a non-empty explicit host alias allowlist for noninteractive mutation consent @spec @mvp
-- satelle MVP Satelle Trusted Profiles do not support all-hosts consent scopes, wildcard host scopes, glob host scopes, regex host scopes, project-host scopes, or default-host scopes @spec @mvp
+- satelle MVP Satelle Trusted Profiles require a non-empty explicit host alias allowlist for noninteractive mutation consent @spec @mvp @implemented
+- satelle MVP Satelle Trusted Profiles do not support all-hosts consent scopes, wildcard host scopes, glob host scopes, regex host scopes, project-host scopes, or default-host scopes @spec @mvp @implemented
 - satelle Satelle Trusted Profile host allowlists match the resolved target host alias selected for the command before remote mutation planning starts @spec @mvp
 - satelle reports a typed trusted-profile-host-allowlist-required configuration error when a Satelle Trusted Profile grants noninteractive mutation consent without at least one explicit host alias @spec @mvp
 - satelle reports a typed unsupported-trusted-profile-host-scope configuration error when a Satelle Trusted Profile uses an all-hosts, wildcard, glob, regex, project-host, or default-host scope @spec @mvp
-- satelle MVP Satelle Trusted Profiles require a non-empty explicit Satelle Mutation Command Family allowlist for noninteractive mutation consent @spec @mvp
-- satelle MVP Satelle Trusted Profiles do not support all-mutating-command consent scopes, wildcard command scopes, glob command scopes, regex command scopes, or future-command scopes @spec @mvp
-- satelle MVP Satelle Mutation Command Family values are setup, repair, host_update, self_update_remotes, and doctor_fix @spec @mvp
+- satelle MVP Satelle Trusted Profiles require a non-empty explicit Satelle Mutation Command Family allowlist for noninteractive mutation consent @spec @mvp @implemented
+- satelle MVP Satelle Trusted Profiles do not support all-mutating-command consent scopes, wildcard command scopes, glob command scopes, regex command scopes, or future-command scopes @spec @mvp @implemented
+- satelle MVP Satelle Mutation Command Family values are setup, repair, host_update, self_update_remotes, and doctor_fix @spec @mvp @implemented
 - satelle later adds config_repair and host_storage_migrate Satelle Mutation Command Family values when those commands become available @spec @later
 - satelle Satelle Trusted Profile command-family allowlists match the command family for the selected mutating command before remote mutation planning starts @spec @mvp
 - satelle reports a typed trusted-profile-command-allowlist-required configuration error when a Satelle Trusted Profile grants noninteractive mutation consent without at least one explicit Satelle Mutation Command Family @spec @mvp
 - satelle reports a typed unsupported-trusted-profile-command-scope configuration error when a Satelle Trusted Profile uses an all-mutating-command, wildcard, glob, regex, or future-command scope @spec @mvp
 - satelle does not apply Satelle Trusted Profile noninteractive mutation consent when either the resolved target host alias or the command family is outside the trusted profile allowlists @spec @mvp
-- satelle Satelle Trusted Profiles are durable user-level configuration records that remain active until the local OS user edits or removes them @spec @mvp
-- satelle MVP does not automatically expire Satelle Trusted Profiles by age, last use, CLI version, project, calendar date, or host update state @spec @mvp
+- satelle Satelle Trusted Profiles are durable user-level configuration records that remain active until the local OS user edits or removes them @spec @mvp @implemented
+- satelle MVP does not automatically expire Satelle Trusted Profiles by age, last use, CLI version, project, calendar date, or host update state @spec @mvp @implemented
 - satelle later supports optional Satelle Trusted Profile expiration through an explicit user-level field named expires_at with an RFC 3339 UTC timestamp @spec @later
 - satelle project-level configuration, environment variables, CLI flags, defaults, and profile selection cannot set or imply Satelle Trusted Profile expiration @spec @later
 - satelle Satelle Trusted Profiles without expires_at remain durable user-level configuration records that stay active until the local OS user edits or removes them @spec @later

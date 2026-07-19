@@ -62,6 +62,8 @@ pub struct SatelleConfig {
     pub command_history: Option<bool>,
     #[serde(default)]
     pub hosts: BTreeMap<String, HostConfig>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub trusted_profiles: BTreeMap<String, TrustedProfile>,
 }
 
 impl SatelleConfig {
@@ -106,6 +108,7 @@ impl SatelleConfig {
             yolo: None,
             command_history: None,
             hosts,
+            trusted_profiles: BTreeMap::new(),
         }
     }
 
@@ -132,9 +135,31 @@ impl SatelleConfig {
         for (alias, host) in higher.hosts {
             self.hosts.insert(alias, host);
         }
+        for (name, profile) in higher.trusted_profiles {
+            self.trusted_profiles.insert(name, profile);
+        }
 
         self
     }
+}
+
+/// Durable user-owned consent for an exact set of hosts and mutation workflows.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct TrustedProfile {
+    pub hosts: BTreeSet<String>,
+    pub command_families: BTreeSet<MutationCommandFamily>,
+}
+
+/// The complete MVP vocabulary that a Trusted Profile can authorize.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(rename_all = "snake_case")]
+pub enum MutationCommandFamily {
+    Setup,
+    Repair,
+    HostUpdate,
+    SelfUpdateRemotes,
+    DoctorFix,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -866,6 +891,206 @@ struct ParsedUserConfig {
     profiles: BTreeMap<String, profiles::ProfileConfig>,
 }
 
+#[cfg(test)]
+mod trusted_profile_config_tests {
+    use super::*;
+
+    const VALID_PROFILE: &str = r#"
+[trusted_profiles.maintenance]
+hosts = ["office-mac", "render-windows"]
+command_families = ["setup", "repair", "host_update", "self_update_remotes", "doctor_fix"]
+"#;
+
+    #[test]
+    fn trusted_profiles_round_trip_as_durable_typed_user_config() {
+        let parsed = parse_user_config(Path::new("/test/config.toml"), VALID_PROFILE)
+            .expect("parse trusted profile");
+        let profile = parsed
+            .config
+            .trusted_profiles
+            .get("maintenance")
+            .expect("retain trusted profile");
+
+        assert_eq!(
+            profile.hosts,
+            BTreeSet::from(["office-mac".to_string(), "render-windows".to_string()])
+        );
+        assert_eq!(
+            profile.command_families,
+            BTreeSet::from([
+                MutationCommandFamily::Setup,
+                MutationCommandFamily::Repair,
+                MutationCommandFamily::HostUpdate,
+                MutationCommandFamily::SelfUpdateRemotes,
+                MutationCommandFamily::DoctorFix,
+            ])
+        );
+
+        let encoded = toml::to_string(&parsed.config).expect("serialize trusted profile");
+        let decoded: SatelleConfig = toml::from_str(&encoded).expect("deserialize trusted profile");
+        assert_eq!(decoded.trusted_profiles, parsed.config.trusted_profiles);
+        assert!(!encoded.contains("expires_at"));
+    }
+
+    #[test]
+    fn trusted_profiles_require_both_explicit_nonempty_allowlists() {
+        for (raw, expected_code) in [
+            (
+                "[trusted_profiles.maintenance]\ncommand_families = [\"setup\"]\n",
+                ErrorCode::ConfigError,
+            ),
+            (
+                "[trusted_profiles.maintenance]\nhosts = []\ncommand_families = [\"setup\"]\n",
+                ErrorCode::ConfigError,
+            ),
+            (
+                "[trusted_profiles.maintenance]\nhosts = [\"office-mac\"]\n",
+                ErrorCode::ConfigError,
+            ),
+            (
+                "[trusted_profiles.maintenance]\nhosts = [\"office-mac\"]\ncommand_families = []\n",
+                ErrorCode::ConfigError,
+            ),
+        ] {
+            let error = parse_user_config(Path::new("/test/config.toml"), raw)
+                .expect_err("reject missing trusted profile allowlist");
+            assert_eq!(error.code, expected_code);
+        }
+    }
+
+    #[test]
+    fn trusted_profile_unknown_keys_precede_required_allowlist_errors() {
+        let error = parse_user_config(
+            Path::new("/test/config.toml"),
+            "[trusted_profiles.maintenance]\nhost = [\"office-mac\"]\n",
+        )
+        .expect_err("reject misspelled Trusted Profile key first");
+
+        assert_eq!(error.code, ErrorCode::UnknownConfigKey);
+        assert_eq!(
+            error.details.get("path"),
+            Some(&serde_json::json!("trusted_profiles.maintenance.host"))
+        );
+        assert_eq!(error.details.get("key"), Some(&serde_json::json!("host")));
+        assert_eq!(
+            error.details.get("suggestion"),
+            Some(&serde_json::json!("hosts"))
+        );
+    }
+
+    #[test]
+    fn trusted_profiles_reject_nonexplicit_host_scopes() {
+        for scope in ["all", "*", "office-*", "office.*", "project", "default"] {
+            let raw = format!(
+                "[trusted_profiles.maintenance]\nhosts = [\"{scope}\"]\ncommand_families = [\"setup\"]\n"
+            );
+            let error = parse_user_config(Path::new("/test/config.toml"), &raw)
+                .expect_err("reject unsupported host scope");
+            assert_eq!(error.code, ErrorCode::ConfigError);
+            assert_eq!(error.details.get("value"), Some(&serde_json::json!(scope)));
+        }
+    }
+
+    #[test]
+    fn trusted_profiles_reject_open_or_future_command_scopes() {
+        for scope in ["all", "*", "host_*", "host_.*", "future", "config_repair"] {
+            let raw = format!(
+                "[trusted_profiles.maintenance]\nhosts = [\"office-mac\"]\ncommand_families = [\"{scope}\"]\n"
+            );
+            let error = parse_user_config(Path::new("/test/config.toml"), &raw)
+                .expect_err("reject unsupported command scope");
+            assert_eq!(error.code, ErrorCode::ConfigError);
+            assert_eq!(error.details.get("value"), Some(&serde_json::json!(scope)));
+        }
+    }
+
+    #[test]
+    fn trusted_profile_allowlists_reject_environment_interpolation() {
+        for (raw, syntax) in [
+            (
+                "[trusted_profiles.maintenance]\nhosts = [\"${SATELLE_HOST}\"]\ncommand_families = [\"setup\"]\n",
+                "${SATELLE_HOST}",
+            ),
+            (
+                "[trusted_profiles.maintenance]\nhosts = [\"office-mac\"]\ncommand_families = [\"$SATELLE_COMMAND_FAMILY\"]\n",
+                "$SATELLE_COMMAND_FAMILY",
+            ),
+        ] {
+            let error = parse_user_config(Path::new("/test/config.toml"), raw)
+                .expect_err("reject Trusted Profile interpolation");
+            assert_eq!(error.code, ErrorCode::ConfigInterpolationNotSupported);
+            assert_eq!(
+                error.details.get("syntax"),
+                Some(&serde_json::json!(syntax))
+            );
+        }
+    }
+
+    #[test]
+    fn higher_user_config_replaces_only_the_edited_trusted_profile() {
+        let base = parse_user_config(Path::new("/test/base.toml"), VALID_PROFILE)
+            .expect("parse base config")
+            .config;
+        let higher = parse_user_config(
+            Path::new("/test/higher.toml"),
+            r#"
+[trusted_profiles.maintenance]
+hosts = ["office-mac"]
+command_families = ["doctor_fix"]
+
+[trusted_profiles.deploy]
+hosts = ["render-windows"]
+command_families = ["host_update"]
+"#,
+        )
+        .expect("parse edited config")
+        .config;
+
+        let merged = base.merge(higher);
+        assert_eq!(merged.trusted_profiles.len(), 2);
+        assert_eq!(
+            merged.trusted_profiles["maintenance"].command_families,
+            BTreeSet::from([MutationCommandFamily::DoctorFix])
+        );
+        assert_eq!(
+            merged.trusted_profiles["deploy"].hosts,
+            BTreeSet::from(["render-windows".to_string()])
+        );
+    }
+
+    #[test]
+    fn project_config_cannot_define_trusted_profiles() {
+        let root = tempfile::tempdir().expect("create project config root");
+        let path = root.path().join("config.toml");
+        std::fs::write(
+            &path,
+            "[trusted_profiles.maintenance]\nhosts = [\"office-mac\"]\ncommand_families = [\"setup\"]\n",
+        )
+        .expect("write project config");
+
+        let error = match project_config::read(&path) {
+            Err(error) => error,
+            Ok(_) => panic!("project config must reject Trusted Profile definitions"),
+        };
+        assert_eq!(error.code, ErrorCode::ProjectMutationConsentNotAllowed);
+        assert_eq!(
+            error.details.get("key"),
+            Some(&serde_json::json!("trusted_profiles"))
+        );
+
+        std::fs::write(
+            &path,
+            "[trusted_profiles.maintenance]\nhosts = [\"${SATELLE_HOST}\"]\ncommand_families = [\"setup\"]\n",
+        )
+        .expect("write interpolated project config");
+        let error = match project_config::read(&path) {
+            Err(error) => error,
+            Ok(_) => panic!("project config must reject Trusted Profile definitions"),
+        };
+        assert_eq!(error.code, ErrorCode::ProjectMutationConsentNotAllowed);
+    }
+}
+
 fn selected_profile_definition(
     user_config: Option<&ParsedUserConfig>,
     user_config_path: &Path,
@@ -923,7 +1148,11 @@ fn read_user_config_file(path: &Path) -> Result<Option<ParsedUserConfig>, Satell
         )
     })?;
 
-    let mut value = toml::from_str::<toml::Value>(&raw).map_err(|source| {
+    parse_user_config(path, &raw).map(Some)
+}
+
+fn parse_user_config(path: &Path, raw: &str) -> Result<ParsedUserConfig, SatelleError> {
+    let mut value = toml::from_str::<toml::Value>(raw).map_err(|source| {
         SatelleError::config_error(
             format!("could not parse config file {}", path.display()),
             Some(source.to_string()),
@@ -931,11 +1160,13 @@ fn read_user_config_file(path: &Path) -> Result<Option<ParsedUserConfig>, Satell
     })?;
     let profile_data = profiles::extract_profile_data(path, &mut value, true)?;
     reject_config_composition(path, &value)?;
+    reject_trusted_profile_interpolation(path, &value)?;
     reject_interpolation(path, &value)?;
     reject_timeout_config_errors(path, &value)?;
     reject_desktop_session_selector_conflicts(path, &value)?;
     reject_provider_secret_source_errors(path, &value)?;
     reject_unknown_user_config_keys(path, &value)?;
+    reject_trusted_profile_errors(path, &value)?;
 
     let config = value.try_into().map_err(|source: toml::de::Error| {
         SatelleError::config_error(
@@ -944,11 +1175,126 @@ fn read_user_config_file(path: &Path) -> Result<Option<ParsedUserConfig>, Satell
         )
     })?;
 
-    Ok(Some(ParsedUserConfig {
+    Ok(ParsedUserConfig {
         config,
         default_profile: profile_data.default_profile,
         profiles: profile_data.profiles,
-    }))
+    })
+}
+
+fn reject_trusted_profile_interpolation(
+    path: &Path,
+    value: &toml::Value,
+) -> Result<(), SatelleError> {
+    let Some(trusted_profiles) = value
+        .get("trusted_profiles")
+        .and_then(toml::Value::as_table)
+    else {
+        return Ok(());
+    };
+    let mut interpolations = Vec::new();
+    for (name, profile_value) in trusted_profiles {
+        let Some(profile) = profile_value.as_table() else {
+            continue;
+        };
+        for key in ["hosts", "command_families"] {
+            let Some(values) = profile.get(key).and_then(toml::Value::as_array) else {
+                continue;
+            };
+            for (index, value) in values.iter().enumerate() {
+                collect_interpolation_for_value(
+                    &format!("trusted_profiles.{name}.{key}[{index}]"),
+                    Some(value),
+                    &mut interpolations,
+                );
+            }
+        }
+    }
+    finish_interpolation_check(path, interpolations)
+}
+
+fn reject_trusted_profile_errors(path: &Path, value: &toml::Value) -> Result<(), SatelleError> {
+    let Some(profiles) = value
+        .get("trusted_profiles")
+        .and_then(toml::Value::as_table)
+    else {
+        return Ok(());
+    };
+
+    for (name, profile_value) in profiles {
+        let profile_path = format!("trusted_profiles.{name}");
+        let Some(profile) = profile_value.as_table() else {
+            continue;
+        };
+
+        let hosts = profile.get("hosts").and_then(toml::Value::as_array);
+        if hosts.is_none_or(Vec::is_empty) {
+            return Err(SatelleError::trusted_profile_allowlist_required(
+                path,
+                &profile_path,
+                "hosts",
+            ));
+        }
+        for host in hosts.into_iter().flatten().filter_map(toml::Value::as_str) {
+            if unsupported_host_scope(host) {
+                return Err(SatelleError::unsupported_trusted_profile_scope(
+                    path,
+                    &format!("{profile_path}.hosts"),
+                    host,
+                ));
+            }
+        }
+
+        let commands = profile
+            .get("command_families")
+            .and_then(toml::Value::as_array);
+        if commands.is_none_or(Vec::is_empty) {
+            return Err(SatelleError::trusted_profile_allowlist_required(
+                path,
+                &profile_path,
+                "command_families",
+            ));
+        }
+        for command in commands
+            .into_iter()
+            .flatten()
+            .filter_map(toml::Value::as_str)
+        {
+            if !matches!(
+                command,
+                "setup" | "repair" | "host_update" | "self_update_remotes" | "doctor_fix"
+            ) {
+                return Err(SatelleError::unsupported_trusted_profile_scope(
+                    path,
+                    &format!("{profile_path}.command_families"),
+                    command,
+                ));
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn unsupported_host_scope(host: &str) -> bool {
+    host.is_empty()
+        || matches!(
+            host,
+            "all"
+                | "all_hosts"
+                | "all-hosts"
+                | "project"
+                | "project_host"
+                | "project-host"
+                | "default"
+                | "default_host"
+                | "default-host"
+        )
+        || host.starts_with("glob:")
+        || host.starts_with("regex:")
+        || host
+            .bytes()
+            .any(|byte| matches!(byte, b'*' | b'?' | b'[' | b']'))
 }
 
 fn reject_config_composition(path: &Path, value: &toml::Value) -> Result<(), SatelleError> {
@@ -1418,9 +1764,27 @@ fn reject_unknown_user_config_keys(path: &Path, value: &toml::Value) -> Result<(
             "profile",
             "profiles",
             "hosts",
+            "trusted_profiles",
         ],
         &mut unknown_keys,
     );
+
+    if let Some(profiles) = table
+        .get("trusted_profiles")
+        .and_then(toml::Value::as_table)
+    {
+        for (name, profile_value) in profiles {
+            let Some(profile_table) = profile_value.as_table() else {
+                continue;
+            };
+            collect_unknown_keys_for_table(
+                &format!("trusted_profiles.{name}"),
+                profile_table,
+                &["hosts", "command_families"],
+                &mut unknown_keys,
+            );
+        }
+    }
 
     if let Some(hosts) = table.get("hosts").and_then(toml::Value::as_table) {
         for (alias, host_value) in hosts {
@@ -1897,6 +2261,58 @@ impl SatelleError {
             recovery_command: Some("edit the TOML file or run satelle config check".to_string()),
             source_detail,
             details: BTreeMap::new(),
+        }
+    }
+
+    fn trusted_profile_allowlist_required(
+        config_file: &Path,
+        profile_path: &str,
+        allowlist: &str,
+    ) -> Self {
+        let mut details = BTreeMap::new();
+        details.insert(
+            "file".to_string(),
+            Value::String(config_file.display().to_string()),
+        );
+        details.insert("path".to_string(), Value::String(profile_path.to_string()));
+        details.insert(
+            "allowlist".to_string(),
+            Value::String(allowlist.to_string()),
+        );
+        Self {
+            code: ErrorCode::ConfigError,
+            message: format!(
+                "config file {} Trusted Profile at {profile_path} requires a non-empty {allowlist} allowlist",
+                config_file.display()
+            ),
+            recovery_command: Some(format!(
+                "add at least one explicit value to {profile_path}.{allowlist}"
+            )),
+            source_detail: None,
+            details,
+        }
+    }
+
+    fn unsupported_trusted_profile_scope(config_file: &Path, toml_path: &str, value: &str) -> Self {
+        let mut details = BTreeMap::new();
+        details.insert(
+            "file".to_string(),
+            Value::String(config_file.display().to_string()),
+        );
+        details.insert("path".to_string(), Value::String(toml_path.to_string()));
+        details.insert("value".to_string(), Value::String(value.to_string()));
+        Self {
+            code: ErrorCode::ConfigError,
+            message: format!(
+                "config file {} uses unsupported Trusted Profile scope '{value}' at {toml_path}",
+                config_file.display()
+            ),
+            recovery_command: Some(
+                "replace the scope with explicit Host Aliases and MVP Mutation Command Family values"
+                    .to_string(),
+            ),
+            source_detail: None,
+            details,
         }
     }
 
