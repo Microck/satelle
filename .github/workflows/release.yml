@@ -1,0 +1,415 @@
+name: Release candidate validation
+
+on:
+  pull_request:
+    paths:
+      - ".github/workflows/release.yml"
+      - "Cargo.lock"
+      - "Cargo.toml"
+      - "crates/**"
+      - "npm/**"
+      - "package-lock.json"
+      - "package.json"
+      - "scripts/install.ps1"
+      - "scripts/install.sh"
+  push:
+    tags:
+      - "v*.*.*"
+  workflow_dispatch:
+
+concurrency:
+  group: release-candidate-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build ${{ matrix.target }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: linux-arm64-gnu
+            rust-target: aarch64-unknown-linux-gnu
+            runner: ubuntu-24.04-arm
+            executable: satelle
+          - target: linux-x64-gnu
+            rust-target: x86_64-unknown-linux-gnu
+            runner: ubuntu-24.04
+            executable: satelle
+          - target: darwin-arm64
+            rust-target: aarch64-apple-darwin
+            runner: macos-15
+            executable: satelle
+          - target: darwin-x64
+            rust-target: x86_64-apple-darwin
+            runner: macos-15-intel
+            executable: satelle
+          - target: win32-arm64-msvc
+            rust-target: aarch64-pc-windows-msvc
+            runner: windows-11-arm
+            executable: satelle.exe
+          - target: win32-x64-msvc
+            rust-target: x86_64-pc-windows-msvc
+            runner: windows-2025
+            executable: satelle.exe
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Install Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24
+          cache: npm
+
+      - name: Install pinned Rust target
+        shell: bash
+        run: rustup toolchain install 1.97.0 --profile minimal --target "${{ matrix.rust-target }}"
+
+      - name: Build native release executable
+        env:
+          CARGO_BUILD_JOBS: 1
+          CARGO_PROFILE_RELEASE_DEBUG: 0
+          RUSTFLAGS: -D warnings
+        run: cargo build --locked --release -p satelle-cli --target ${{ matrix.rust-target }}
+
+      - name: Stage native npm package
+        shell: bash
+        run: |
+          mkdir -p dist
+          node npm/scripts/release.cjs stage-native \
+            "${{ matrix.target }}" \
+            "target/${{ matrix.rust-target }}/release/${{ matrix.executable }}" \
+            dist
+
+      - name: Create Unix release archive
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          version=$(node npm/scripts/release.cjs check | node -pe 'JSON.parse(require("fs").readFileSync(0, "utf8")).version')
+          tar -czf "dist/satelle-v${version}-${{ matrix.target }}.tar.gz" \
+            -C "target/${{ matrix.rust-target }}/release" satelle
+
+      - name: Create Windows release archive
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $Version = (node npm/scripts/release.cjs check | ConvertFrom-Json).version
+          Compress-Archive `
+            -LiteralPath "target/${{ matrix.rust-target }}/release/satelle.exe" `
+            -DestinationPath "dist/satelle-v$Version-${{ matrix.target }}.zip"
+
+      - name: Upload target artifacts
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: release-${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: error
+
+  collect:
+    name: Validate release graph and publish dry-runs
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    outputs:
+      version: ${{ steps.plan.outputs.version }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Install Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24
+          cache: npm
+
+      - name: Install npm workspace
+        run: npm ci --ignore-scripts
+
+      - name: Download target artifacts
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: release-*
+          path: dist
+          merge-multiple: true
+
+      - name: Read canonical release plan
+        id: plan
+        shell: bash
+        run: |
+          version=$(node npm/scripts/release.cjs check | node -pe 'JSON.parse(require("fs").readFileSync(0, "utf8")).version')
+          printf 'version=%s\n' "$version" >> "$GITHUB_OUTPUT"
+
+      - name: Stage top-level npm packages
+        run: node npm/scripts/release.cjs stage-launchers dist
+
+      - name: Validate npm package graph
+        run: node npm/scripts/release.cjs validate-npm-artifacts dist --write-manifest
+
+      - name: Validate native archives and create SHA256SUMS
+        run: node npm/scripts/release.cjs validate-native-release-archives dist validated
+
+      - name: Run npm publication dry-runs sequentially
+        shell: bash
+        run: |
+          for package in \
+            ./validated/npm/npm-linux-arm64-gnu.tgz \
+            ./validated/npm/npm-linux-x64-gnu.tgz \
+            ./validated/npm/npm-darwin-arm64.tgz \
+            ./validated/npm/npm-darwin-x64.tgz \
+            ./validated/npm/npm-win32-arm64-msvc.tgz \
+            ./validated/npm/npm-win32-x64-msvc.tgz \
+            ./dist/npm-satelle-scoped.tgz \
+            ./dist/npm-satelle-unscoped.tgz
+          do
+            npm publish "$package" --dry-run --ignore-scripts
+          done
+
+      - name: Upload validated release candidate
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: validated-release-candidate
+          path: validated
+          if-no-files-found: error
+
+  attest:
+    name: Attest signed-tag release candidate
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [collect, lifecycle]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      attestations: write
+      contents: read
+      id-token: write
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Install Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24
+          cache: npm
+
+      - name: Download validated release candidate
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: validated-release-candidate
+          path: validated
+
+      - name: Resolve verified signed tag
+        id: tag
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_VERSION: ${{ needs.collect.outputs.version }}
+        shell: bash
+        run: |
+          test "$GITHUB_REF_NAME" = "v${RELEASE_VERSION}"
+          tag_ref=$(gh api "repos/${{ github.repository }}/git/ref/tags/${GITHUB_REF_NAME}" --jq '.object.type + " " + .object.sha')
+          test "${tag_ref%% *}" = tag
+          tag_digest=${tag_ref#* }
+          source_digest=$(gh api "repos/${{ github.repository }}/git/tags/$tag_digest" --jq 'select(.verification.verified == true and .object.type == "commit") | .object.sha')
+          test -n "$source_digest"
+          test "$source_digest" = "$GITHUB_SHA"
+          printf 'source-digest=%s\n' "$source_digest" >> "$GITHUB_OUTPUT"
+
+      - name: Attest every native archive
+        id: provenance
+        uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373 # v4.1.1
+        with:
+          subject-path: validated/github/satelle-*
+
+      - name: Verify archive attestations against canonical policy
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_VERSION: ${{ needs.collect.outputs.version }}
+          SOURCE_DIGEST: ${{ steps.tag.outputs.source-digest }}
+          ATTESTATION_BUNDLE: ${{ steps.provenance.outputs.bundle-path }}
+        shell: bash
+        run: |
+          for archive in validated/github/satelle-*; do
+            node npm/scripts/release.cjs verify-release-attestation \
+              "$archive" \
+              "$RELEASE_VERSION" \
+              "$SOURCE_DIGEST" \
+              "$ATTESTATION_BUNDLE"
+          done
+
+  lifecycle:
+    name: Install, upgrade, smoke, and uninstall ${{ matrix.target }}
+    needs: collect
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: linux-arm64-gnu
+            runner: ubuntu-24.04-arm
+          - target: linux-x64-gnu
+            runner: ubuntu-24.04
+          - target: darwin-arm64
+            runner: macos-15
+          - target: darwin-x64
+            runner: macos-15-intel
+          - target: win32-arm64-msvc
+            runner: windows-11-arm
+          - target: win32-x64-msvc
+            runner: windows-2025
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Download validated release candidate
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: validated-release-candidate
+          path: validated
+
+      - name: Validate Unix archive lifecycle
+        if: runner.os != 'Windows'
+        env:
+          RELEASE_TARGET: ${{ matrix.target }}
+          RELEASE_VERSION: ${{ needs.collect.outputs.version }}
+        shell: bash
+        run: |
+          checkout_root=$PWD
+          release_root=$(cd validated/github && pwd)
+          archive="satelle-v${RELEASE_VERSION}-${RELEASE_TARGET}.tar.gz"
+          cd "$release_root"
+          if command -v sha256sum >/dev/null 2>&1; then
+            grep "  ${archive}$" SHA256SUMS | sha256sum -c -
+          else
+            grep "  ${archive}$" SHA256SUMS | shasum -a 256 -c -
+          fi
+          extract_root=$(mktemp -d)
+          install_root=$(mktemp -d)
+          command_root=$(mktemp -d)
+          policy_log=$(mktemp)
+          trap 'rm -rf "$extract_root" "$install_root" "$command_root"; rm -f "$policy_log"' EXIT
+          tar -xzf "$archive" -C "$extract_root"
+          printf old > "$install_root/satelle"
+          cp "$extract_root/satelle" "$install_root/satelle"
+          chmod 755 "$install_root/satelle"
+          test "$("$install_root/satelle" --version)" = "satelle $RELEASE_VERSION"
+          test "$("$install_root/satelle" paths --json | jq -r .schema_version)" = satelle.paths.v1
+          rm "$install_root/satelle"
+          test ! -e "$install_root/satelle"
+
+          cat > "$command_root/curl" <<'SH'
+          #!/bin/sh
+          while [ "$#" -gt 0 ]; do
+            case "$1" in
+              -o) destination=$2; shift 2 ;;
+              http*) source_url=$1; shift ;;
+              *) shift ;;
+            esac
+          done
+          cp "$SATELLE_RELEASE_FIXTURES/${source_url##*/}" "$destination"
+          SH
+          cat > "$command_root/gh" <<'SH'
+          #!/bin/sh
+          printf '%s\n' "$*" >> "$SATELLE_POLICY_LOG"
+          if [ "$1" = api ]; then
+            case "$2" in
+              */git/ref/tags/*) printf '%s\n' 'tag bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb' ;;
+              */git/tags/*) printf '%s\n' 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' ;;
+            esac
+          fi
+          SH
+          chmod 755 "$command_root/curl" "$command_root/gh"
+          export PATH="$command_root:$PATH"
+          export SATELLE_RELEASE_FIXTURES="$release_root"
+          export SATELLE_POLICY_LOG="$policy_log"
+
+          script_install_root=$(mktemp -d)
+          trap 'rm -rf "$extract_root" "$install_root" "$command_root" "$script_install_root"; rm -f "$policy_log"' EXIT
+          "$checkout_root/scripts/install.sh" --version "$RELEASE_VERSION" --bin-dir "$script_install_root"
+          printf old > "$script_install_root/satelle"
+          : > "$policy_log"
+          "$checkout_root/scripts/install.sh" --version "$RELEASE_VERSION" --bin-dir "$script_install_root"
+          test "$("$script_install_root/satelle" --version)" = "satelle $RELEASE_VERSION"
+          test "$(jq -r .target "$script_install_root/.satelle-install.json")" = "$RELEASE_TARGET"
+          grep -q -- '--deny-self-hosted-runners' "$policy_log"
+          "$checkout_root/scripts/install.sh" --uninstall --bin-dir "$script_install_root"
+          test ! -e "$script_install_root/satelle"
+          test ! -e "$script_install_root/.satelle-install.json"
+
+      - name: Validate Windows archive lifecycle
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $Version = "${{ needs.collect.outputs.version }}"
+          $Archive = "satelle-v$Version-${{ matrix.target }}.zip"
+          $ReleaseRoot = Resolve-Path "validated/github"
+          $Entry = Get-Content "$ReleaseRoot/SHA256SUMS" | Where-Object { $_ -match "^([0-9a-f]{64})  $([regex]::Escape($Archive))$" }
+          if (@($Entry).Count -ne 1) { throw "missing canonical checksum for $Archive" }
+          $Digest = (Get-FileHash "$ReleaseRoot/$Archive" -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($Digest -ne $Entry.Substring(0, 64)) { throw "checksum mismatch for $Archive" }
+          $ExtractRoot = Join-Path $env:RUNNER_TEMP "satelle-extract"
+          $InstallRoot = Join-Path $env:RUNNER_TEMP "satelle-install"
+          New-Item -ItemType Directory -Path $InstallRoot -Force | Out-Null
+          Expand-Archive "$ReleaseRoot/$Archive" $ExtractRoot
+          Set-Content "$InstallRoot/satelle.exe" "old"
+          Copy-Item "$ExtractRoot/satelle.exe" "$InstallRoot/satelle.exe" -Force
+          if ((& "$InstallRoot/satelle.exe" --version) -ne "satelle $Version") { throw "version smoke failed" }
+          $Paths = & "$InstallRoot/satelle.exe" paths --json | ConvertFrom-Json
+          if ($Paths.schema_version -ne "satelle.paths.v1") { throw "paths smoke failed" }
+          Remove-Item "$InstallRoot/satelle.exe"
+          if (Test-Path "$InstallRoot/satelle.exe") { throw "uninstall failed" }
+
+      - name: Validate Windows installer lifecycle
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $Version = "${{ needs.collect.outputs.version }}"
+          $FixtureRoot = (Resolve-Path "validated/github").Path
+          $InstallRoot = Join-Path $env:RUNNER_TEMP "satelle-script-install"
+          $PolicyLog = Join-Path $env:RUNNER_TEMP "satelle-gh-policy.log"
+          $CommandRoot = Join-Path $env:RUNNER_TEMP "satelle-installer-commands"
+          New-Item -ItemType Directory -Path $CommandRoot -Force | Out-Null
+          $env:SATELLE_POLICY_LOG = $PolicyLog
+          $env:PATH = "$CommandRoot;$env:PATH"
+          @'
+          @echo off
+          echo %*>>"%SATELLE_POLICY_LOG%"
+          echo %~2| findstr /C:"/git/ref/tags/" >nul && echo {"object":{"type":"tag","sha":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}} && exit /b 0
+          echo %~2| findstr /C:"/git/tags/" >nul && echo {"verification":{"verified":true},"object":{"type":"commit","sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}} && exit /b 0
+          echo [{}]
+          '@ | Set-Content -LiteralPath (Join-Path $CommandRoot "gh.cmd") -Encoding ascii
+          function global:Invoke-WebRequest {
+            param(
+              [string]$Uri,
+              [string]$OutFile,
+              [int]$ConnectionTimeoutSeconds,
+              [int]$OperationTimeoutSeconds
+            )
+            if ($ConnectionTimeoutSeconds -ne 10 -or $OperationTimeoutSeconds -ne 300) {
+              throw "installer HTTP timeout policy mismatch"
+            }
+            Copy-Item -LiteralPath (Join-Path $FixtureRoot ([System.IO.Path]::GetFileName($Uri))) -Destination $OutFile
+          }
+          & scripts/install.ps1 -Version $Version -BinDir $InstallRoot
+          Set-Content -LiteralPath (Join-Path $InstallRoot "satelle.exe") -Value old
+          Clear-Content -LiteralPath $PolicyLog
+          & scripts/install.ps1 -Version $Version -BinDir $InstallRoot
+          if ((& (Join-Path $InstallRoot "satelle.exe") --version) -ne "satelle $Version") { throw "installer upgrade failed" }
+          $Receipt = Get-Content (Join-Path $InstallRoot ".satelle-install.json") | ConvertFrom-Json
+          if ($Receipt.version -ne $Version -or $Receipt.target -ne "${{ matrix.target }}") { throw "installer receipt mismatch" }
+          if ((Get-Content $PolicyLog -Raw) -notmatch "--deny-self-hosted-runners") { throw "attestation policy was not invoked" }
+          & scripts/install.ps1 -Uninstall -BinDir $InstallRoot
+          if (Test-Path (Join-Path $InstallRoot "satelle.exe")) { throw "installer uninstall failed" }

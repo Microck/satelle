@@ -95,6 +95,21 @@ function sha256Bytes(bytes) {
   return createHash("sha256").update(bytes).digest("hex");
 }
 
+function sha256File(filePath) {
+  const digest = createHash("sha256");
+  const file = openSync(filePath, "r");
+  const chunk = Buffer.allocUnsafe(1024 * 1024);
+  try {
+    let bytesRead;
+    while ((bytesRead = readSync(file, chunk, 0, chunk.length, null)) !== 0) {
+      digest.update(chunk.subarray(0, bytesRead));
+    }
+  } finally {
+    closeSync(file);
+  }
+  return digest.digest("hex");
+}
+
 function decodeArchiveName(bytes, label) {
   const name = bytes.toString("utf8");
   if (name.includes("\ufffd")) {
@@ -612,7 +627,7 @@ function inspectNativeReleaseArchive(request, release) {
       if (
         manifest.name !== selection.expectedName ||
         manifest.version !== selection.expectedVersion ||
-        digest !== selection.expectedSha256
+        !sameJson(manifest, selection.expectedManifest)
       ) {
         fail(
           "release-artifact-metadata-mismatch",
@@ -660,6 +675,7 @@ function createReleaseContext(repositoryRoot = defaultRepositoryRoot, options = 
   const beforeNativeArchiveFinalSourceValidation =
     options.beforeNativeArchiveFinalSourceValidation;
   const afterLauncherInstall = options.afterLauncherInstall;
+  const observeTarInvocation = options.observeTarInvocation;
   const nativeArchiveLimits = Object.freeze({
     ...defaultNativeArchiveLimits,
     ...(options.nativeArchiveLimits ?? {}),
@@ -693,6 +709,7 @@ function createReleaseContext(repositoryRoot = defaultRepositoryRoot, options = 
     observeNativeArchiveSourceRead,
     beforeNativeArchiveFinalSourceValidation,
     afterLauncherInstall,
+    observeTarInvocation,
   })) {
     if (observer !== undefined && typeof observer !== "function") {
       fail("release-archive-limit-invalid", `${name} must be a function`);
@@ -909,6 +926,144 @@ function createReleaseContext(repositoryRoot = defaultRepositoryRoot, options = 
     return `npm-${target}.tgz`;
   }
 
+  function canonicalArtifactName(fileName) {
+    return (
+      typeof fileName === "string" &&
+      fileName.length > 0 &&
+      fileName === path.basename(fileName) &&
+      !/\s/.test(fileName) &&
+      fileName !== "SHA256SUMS"
+    );
+  }
+
+  function writeSha256Sums(directory, fileNames, manifestPath = path.join(directory, "SHA256SUMS")) {
+    if (!directory || !Array.isArray(fileNames) || fileNames.length === 0) {
+      fail("release-checksum-invalid", "release archive names are required");
+    }
+    const names = [...fileNames].sort();
+    if (
+      new Set(names).size !== names.length ||
+      names.some((fileName) => !canonicalArtifactName(fileName))
+    ) {
+      fail("release-checksum-invalid", "release archive names must be unique canonical basenames");
+    }
+    const lines = names.map((fileName) => {
+      const artifactPath = path.join(directory, fileName);
+      requireFile(
+        artifactPath,
+        "release-checksum-invalid",
+        `missing release archive ${fileName}`,
+      );
+      return `${sha256File(artifactPath)}  ${fileName}`;
+    });
+    const serialized = `${lines.join("\n")}\n`;
+    const temporaryRoot = mkdtempSync(path.join(path.dirname(manifestPath), ".sha256sums-"));
+    const temporaryPath = path.join(temporaryRoot, "SHA256SUMS");
+    try {
+      writeFileSync(temporaryPath, serialized, { flag: "wx", mode: 0o600 });
+      renameSync(temporaryPath, manifestPath);
+    } catch {
+      fail("release-checksum-write-failed", "SHA256SUMS could not be atomically replaced");
+    } finally {
+      rmSync(temporaryRoot, { recursive: true, force: true });
+    }
+    return {
+      path: manifestPath,
+      sha256: sha256Bytes(Buffer.from(serialized)),
+      files: names,
+    };
+  }
+
+  function verifySha256Sums(directory, manifestPath = path.join(directory, "SHA256SUMS")) {
+    requireFile(manifestPath, "release-checksum-invalid", "SHA256SUMS is missing");
+    const source = readFileSync(manifestPath, "utf8");
+    if (!source.endsWith("\n") || source.includes("\r")) {
+      fail("release-checksum-invalid", "SHA256SUMS must use canonical LF-delimited records");
+    }
+    const entries = source.slice(0, -1).split("\n").map((line) => {
+      const match = line.match(/^([0-9a-f]{64})  (\S+)$/);
+      if (!match || !canonicalArtifactName(match[2])) {
+        fail("release-checksum-invalid", "SHA256SUMS contains a malformed entry");
+      }
+      return { digest: match[1], fileName: match[2] };
+    });
+    const names = entries.map(({ fileName }) => fileName);
+    if (new Set(names).size !== names.length || !sameJson(names, [...names].sort())) {
+      fail("release-checksum-invalid", "SHA256SUMS entries must be unique and sorted");
+    }
+    for (const { digest, fileName } of entries) {
+      const artifactPath = path.join(directory, fileName);
+      requireFile(artifactPath, "release-checksum-invalid", `missing release archive ${fileName}`);
+      if (sha256File(artifactPath) !== digest) {
+        fail("release-checksum-mismatch", `${fileName} does not match SHA256SUMS`);
+      }
+    }
+    return names;
+  }
+
+  function attestationVerificationArguments(archivePath, policy) {
+    const versionPattern = /^(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)$/;
+    const digestPattern = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/;
+    if (
+      !archivePath ||
+      !versionPattern.test(policy?.version ?? "") ||
+      !digestPattern.test(policy?.sourceDigest ?? "") ||
+      !digestPattern.test(policy?.signerDigest ?? "") ||
+      policy.sourceDigest !== policy.signerDigest
+    ) {
+      fail(
+        "release-attestation-policy-invalid",
+        "release attestation policy requires one version and matching source and signer digests",
+      );
+    }
+    return [
+      "attestation",
+      "verify",
+      archivePath,
+      "--repo",
+      "Microck/satelle",
+      "--signer-workflow",
+      "Microck/satelle/.github/workflows/release.yml",
+      "--source-ref",
+      `refs/tags/v${policy.version}`,
+      "--source-digest",
+      policy.sourceDigest,
+      "--signer-digest",
+      policy.signerDigest,
+      "--cert-oidc-issuer",
+      "https://token.actions.githubusercontent.com",
+      "--deny-self-hosted-runners",
+      ...(policy.bundlePath ? ["--bundle", policy.bundlePath] : []),
+      "--format",
+      "json",
+    ];
+  }
+
+  function verifyReleaseArchiveAttestation(archivePath, policy) {
+    const argumentsList = attestationVerificationArguments(archivePath, policy);
+    const verification = spawnSync("gh", argumentsList, {
+      encoding: "utf8",
+      timeout: 60_000,
+      windowsHide: true,
+    });
+    if (verification.error || verification.status !== 0) {
+      fail(
+        "release-attestation-invalid",
+        `release archive attestation verification failed: ${verification.stderr || verification.error?.message || "gh exited unsuccessfully"}`,
+      );
+    }
+    let output;
+    try {
+      output = JSON.parse(verification.stdout);
+    } catch {
+      fail("release-attestation-invalid", "gh returned invalid attestation verification JSON");
+    }
+    if (!Array.isArray(output) || output.length === 0) {
+      fail("release-attestation-invalid", "gh did not return a verified release attestation");
+    }
+    return { archive: path.basename(archivePath), attestations: output.length };
+  }
+
   function check(tag) {
     const version = expectedVersion(tag);
     return {
@@ -986,6 +1141,10 @@ function createReleaseContext(repositoryRoot = defaultRepositoryRoot, options = 
   }
 
   function runTar(argumentsList, options = {}) {
+    observeTarInvocation?.({
+      argumentsList: [...argumentsList],
+      cwd: options.cwd ?? process.cwd(),
+    });
     return execFileSync("tar", argumentsList, {
       ...options,
       killSignal: "SIGKILL",
@@ -1729,7 +1888,9 @@ function createReleaseContext(repositoryRoot = defaultRepositoryRoot, options = 
       const requests = snapshots.flatMap((snapshot, snapshotIndex) => {
         const metadata = matrix[snapshot.target];
         const executableName = metadata.os === "win32" ? "satelle.exe" : "satelle";
-        const expectedManifest = releaseState.manifestBytes.get(metadata.packageName);
+        const expectedManifest = JSON.parse(
+          releaseState.manifestBytes.get(metadata.packageName),
+        );
         return [
           {
             archiveHandle: snapshot.archiveSnapshot.handle,
@@ -1757,7 +1918,7 @@ function createReleaseContext(repositoryRoot = defaultRepositoryRoot, options = 
             selections: [
               {
                 expectedName: metadata.packageName,
-                expectedSha256: sha256Bytes(expectedManifest),
+                expectedManifest,
                 expectedVersion: version,
                 kind: "manifest",
                 member: "package/package.json",
@@ -1827,6 +1988,12 @@ function createReleaseContext(repositoryRoot = defaultRepositoryRoot, options = 
           executableSha256: archiveDigest,
         };
       });
+      const checksums = writeSha256Sums(
+        githubRoot,
+        archives.map(({ archive }) => archive),
+      );
+      verifySha256Sums(githubRoot, checksums.path);
+      chmodSync(checksums.path, 0o400);
       remainingDeadline(deadline, "native release archive validation");
       beforeNativeArchiveFinalSourceValidation?.();
       for (const snapshot of snapshots.flatMap(({ archiveSnapshot, npmSnapshot }) => [
@@ -1857,7 +2024,7 @@ function createReleaseContext(repositoryRoot = defaultRepositoryRoot, options = 
       chmodSync(npmArtifactRoot, 0o500);
       chmodSync(stagingRoot, 0o500);
       complete = true;
-      return { version, stagingDirectory: stagingRoot, archives };
+      return { version, stagingDirectory: stagingRoot, checksums, archives };
     } finally {
       for (const snapshot of snapshots.flatMap(({ archiveSnapshot, npmSnapshot }) => [
         archiveSnapshot,
@@ -2085,6 +2252,10 @@ function createReleaseContext(repositoryRoot = defaultRepositoryRoot, options = 
   }
 
   function validatePackedArtifact(packageName, artifactPath, version) {
+    // Git for Windows tar treats an absolute drive path as a remote archive
+    // (`C:` as a host). Run from the archive directory and pass only its basename.
+    const artifactDirectory = path.dirname(path.resolve(artifactPath));
+    const artifactFileName = path.basename(artifactPath);
     let members;
     let verboseMembers;
     let packed;
@@ -2092,11 +2263,14 @@ function createReleaseContext(repositoryRoot = defaultRepositoryRoot, options = 
     let packedNativeBinary;
     try {
       members = new Set(
-        runTar(["-tzf", artifactPath], { encoding: "utf8" })
+        runTar(["-tzf", artifactFileName], { cwd: artifactDirectory, encoding: "utf8" })
           .trim()
           .split(/\r?\n/),
       );
-      verboseMembers = runTar(["-tvzf", artifactPath], { encoding: "utf8" })
+      verboseMembers = runTar(["-tvzf", artifactFileName], {
+        cwd: artifactDirectory,
+        encoding: "utf8",
+      })
         .trim()
         .split(/\r?\n/)
         .map((line) => {
@@ -2108,18 +2282,24 @@ function createReleaseContext(repositoryRoot = defaultRepositoryRoot, options = 
         });
       packedManifest = runTar([
         "-xOzf",
-        artifactPath,
+        artifactFileName,
         "package/package.json",
-      ]);
+      ], { cwd: artifactDirectory });
       packed = JSON.parse(packedManifest.toString("utf8"));
     } catch {
       fail("release-artifact-invalid", `${path.basename(artifactPath)} is not a valid npm archive`);
     }
     const sourceManifestPath = packageManifestPath(packageName);
+    // Windows Actions checkouts retain CRLF in npm archives, while the Linux
+    // collector checks out the same manifest with LF. Normalize only that
+    // platform line-ending difference and keep every other byte significant.
+    const normalizedPackedManifest = packedManifest.toString("latin1").replaceAll("\r\n", "\n");
+    const normalizedSourceManifest = readFileSync(sourceManifestPath, "latin1")
+      .replaceAll("\r\n", "\n");
     if (
       packed.name !== packageName ||
       packed.version !== version ||
-      !packedManifest.equals(readFileSync(sourceManifestPath))
+      normalizedPackedManifest !== normalizedSourceManifest
     ) {
       fail(
         "release-artifact-metadata-mismatch",
@@ -2169,7 +2349,8 @@ function createReleaseContext(repositoryRoot = defaultRepositoryRoot, options = 
       }
       if (target) {
         try {
-          packedNativeBinary = runTar(["-xOzf", artifactPath, archiveName], {
+          packedNativeBinary = runTar(["-xOzf", artifactFileName, archiveName], {
+            cwd: artifactDirectory,
             maxBuffer: maximumNativeBinaryBytes,
           });
         } catch {
@@ -2190,7 +2371,8 @@ function createReleaseContext(repositoryRoot = defaultRepositoryRoot, options = 
         );
         let packedFile;
         try {
-          packedFile = runTar(["-xOzf", artifactPath, archiveName], {
+          packedFile = runTar(["-xOzf", artifactFileName, archiveName], {
+            cwd: artifactDirectory,
             maxBuffer: sourceFile.length + 1,
           });
         } catch (error) {
@@ -2217,6 +2399,7 @@ function createReleaseContext(repositoryRoot = defaultRepositoryRoot, options = 
   }
 
   return {
+    attestationVerificationArguments,
     check,
     stageLaunchers,
     stageNative,
@@ -2224,6 +2407,9 @@ function createReleaseContext(repositoryRoot = defaultRepositoryRoot, options = 
     validateLaunchers,
     validateNativeReleaseArchives,
     validateNpmArtifacts,
+    verifyReleaseArchiveAttestation,
+    verifySha256Sums,
+    writeSha256Sums,
   };
 }
 
@@ -2248,6 +2434,14 @@ function runCli() {
       break;
     case "validate-native-release-archives":
       output = release.validateNativeReleaseArchives(argumentsList[0], argumentsList[1]);
+      break;
+    case "verify-release-attestation":
+      output = release.verifyReleaseArchiveAttestation(argumentsList[0], {
+        version: argumentsList[1],
+        sourceDigest: argumentsList[2],
+        signerDigest: argumentsList[2],
+        bundlePath: argumentsList[3],
+      });
       break;
     default:
       fail("release-command-invalid", `unknown release command ${command ?? ""}`);
