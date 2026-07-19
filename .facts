@@ -2250,9 +2250,9 @@
 - satelle Fumadocs documentation follows the Diataxis structure with tutorials, how-to guides, reference pages, and explanation pages instead of a single flat README-style manual @spec @mvp @implemented
 - satelle .facts remains the product specification source of truth, and Fumadocs pages are user-facing documentation derived from .facts, CLI help output, and implemented behavior @spec @mvp @implemented
 - satelle Fumadocs build dependencies are documentation and release-time dependencies only and are not runtime dependencies for the Rust CLI, Host Daemon, or remote host artifacts @spec @mvp @implemented
-- satelle documentation CI rejects broken internal links, missing local assets, and command examples that do not parse against the matching release binary @spec @mvp
-- satelle versioned documentation identifies the Satelle release whose CLI, API, schemas, and bundled skills it describes @spec @mvp
-- satelle generated command and schema reference is derived from the release binary or public domain types instead of manually duplicating field lists @spec @mvp
+- satelle documentation CI rejects broken internal links, missing local assets, and command examples that do not parse against the matching release binary @mvp @implemented
+- satelle versioned documentation identifies the Satelle release whose CLI, API, schemas, and bundled skills it describes @mvp @implemented
+- satelle generated command and schema reference is derived from the release binary or public domain types instead of manually duplicating field lists @mvp @implemented
 
 # release
 - satelle uses Tegami as the preferred changelog, versioning, and publishing workflow once release automation is introduced @spec @mvp

@@ -1,4 +1,4 @@
 {
   "title": "Reference",
-  "pages": ["commands", "configuration", "provider-auth", "release-verification", "codex-app-server-capability-matrix"]
+  "pages": ["commands", "generated-cli", "configuration", "provider-auth", "release-verification", "codex-app-server-capability-matrix"]
 }

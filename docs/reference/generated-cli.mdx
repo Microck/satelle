@@ -1,0 +1,705 @@
+---
+title: Generated CLI and schema reference
+description: Binary-derived command help and public schema versions for Satelle 0.1.0.
+---
+
+This page describes **Satelle 0.1.0**. The documentation contract regenerates
+the command sections from `satelle --help` and derives schema identifiers from
+public Satelle result and event schema sources. CI rejects hand-edited or stale output.
+
+## Public schema versions
+
+| Public schema source | Production source | Serialized schema version |
+| --- | --- | --- |
+| `DoctorSchemaVersion` | `crates/satelle-core/src/lib.rs` | `satelle.doctor.v1` |
+| `ERROR_SCHEMA_VERSION` | `crates/satelle-cli/src/error-output.rs` | `satelle.error.v1` |
+| `EVENT_SCHEMA_VERSION` | `crates/satelle-core/src/events.rs` | `satelle.events.v2` |
+| `HostSessionsSchemaVersion` | `crates/satelle-core/src/lib.rs` | `satelle.host.sessions.v1` |
+| `LogEntrySchema` | `crates/satelle-host/src/log-page.rs` | `satelle.logs.entry.v1` |
+| `SessionResultSchemaVersion` | `crates/satelle-cli/src/output.rs` | `satelle.run.v2` |
+| `SetupSchemaVersion` | `crates/satelle-core/src/lib.rs` | `satelle.setup.v1` |
+| `SessionResultSchemaVersion` | `crates/satelle-cli/src/output.rs` | `satelle.status.v2` |
+| `SessionResultSchemaVersion` | `crates/satelle-cli/src/output.rs` | `satelle.steer.v2` |
+| `StopSchemaVersion` | `crates/satelle-core/src/lib.rs` | `satelle.stop.v1` |
+
+## `satelle`
+
+```text
+Satelle sends command uplinks to a visible remote host and returns telemetry from the native computer-use runtime.
+
+Usage: satelle [OPTIONS] <COMMAND>
+
+Commands:
+  completions  
+  setup        
+  repair       
+  doctor       
+  config       
+  paths        
+  host         
+  self         
+  run          
+  steer        
+  status       
+  stop         
+  logs         
+  mcp          
+  support      
+  help         Print this message or the help of the given subcommand(s)
+
+Options:
+      --no-color
+          Disable colored human output
+
+      --profile <NAME>
+          Apply a named user-level configuration profile
+
+      --error-format <FORMAT>
+          Format diagnostics as human-readable text or JSON
+          
+          [env: SATELLE_ERROR_FORMAT=]
+          [possible values: human, json]
+
+  -h, --help
+          Print help (see a summary with '-h')
+
+  -V, --version
+          Print version
+```
+
+## `satelle completions`
+
+```text
+Usage: satelle completions [OPTIONS] [SHELL]
+
+Arguments:
+  [SHELL]  [possible values: bash, zsh, fish, powershell]
+
+Options:
+      --no-color                Disable colored human output
+      --output-dir <DIRECTORY>  Install the completion script in DIRECTORY; detect the shell when omitted
+      --profile <NAME>          Apply a named user-level configuration profile
+      --update-profile <FILE>   Activate the installed script through one managed block in FILE
+      --error-format <FORMAT>   Format diagnostics as human-readable text or JSON [env: SATELLE_ERROR_FORMAT=] [possible values: human, json]
+  -h, --help                    Print help
+```
+
+## `satelle setup`
+
+```text
+Usage: satelle setup [OPTIONS]
+
+Options:
+      --host <HOST>
+          
+
+      --no-color
+          Disable colored human output
+
+      --dry-run
+          
+
+      --profile <NAME>
+          Apply a named user-level configuration profile
+
+      --error-format <FORMAT>
+          Format diagnostics as human-readable text or JSON
+          
+          [env: SATELLE_ERROR_FORMAT=]
+          [possible values: human, json]
+
+      --on-demand
+          
+
+      --persistent
+          
+
+      --component <COMPONENT>
+          [possible values: transport, host, codex, computer-use, desktop, provider-auth, all]
+
+      --daemon-home <DAEMON_HOME>
+          
+
+      --daemon-config-file <DAEMON_CONFIG_FILE>
+          
+
+      --daemon-state-dir <DAEMON_STATE_DIR>
+          
+
+      --daemon-cache-dir <DAEMON_CACHE_DIR>
+          
+
+      --daemon-log-dir <DAEMON_LOG_DIR>
+          
+
+      --yes
+          Accept ordinary setup mutations without an interactive confirmation
+
+      --no-input
+          
+
+      --expected-host-id <HOST_ID>
+          Require this exact Host identity during first-time SSH trust
+
+      --format <FORMAT>
+          [possible values: human, json]
+
+      --json
+          Alias for --format json
+
+  -h, --help
+          Print help (see a summary with '-h')
+
+Agent-safe noninteractive provider auth flow:
+  1. Configure host-resolved Secret Source descriptors in user-level host config.
+  2. Run satelle setup --no-input --json to get a stable plan.
+  3. Treat missing raw provider secret material as required human input, not as an agent-handled value.
+```
+
+## `satelle repair`
+
+```text
+Usage: satelle repair [OPTIONS]
+
+Options:
+      --host <HOST>            
+      --no-color               Disable colored human output
+      --dry-run                
+      --profile <NAME>         Apply a named user-level configuration profile
+      --error-format <FORMAT>  Format diagnostics as human-readable text or JSON [env: SATELLE_ERROR_FORMAT=] [possible values: human, json]
+      --yes                    Accept ordinary repair mutations without an interactive confirmation
+      --no-input               
+      --format <FORMAT>        [possible values: human, json]
+      --json                   Alias for --format json
+  -h, --help                   Print help
+```
+
+## `satelle doctor`
+
+```text
+Usage: satelle doctor [OPTIONS]
+
+Options:
+      --host <HOST>            
+      --no-color               Disable colored human output
+      --profile <NAME>         Apply a named user-level configuration profile
+      --scope <SCOPE>          
+      --error-format <FORMAT>  Format diagnostics as human-readable text or JSON [env: SATELLE_ERROR_FORMAT=] [possible values: human, json]
+      --refresh                
+      --timeout <TIMEOUT>      
+      --serial-probes          
+      --events                 
+      --no-input               
+      --format <FORMAT>        [possible values: human, json]
+      --json                   Alias for --format json
+  -h, --help                   Print help
+```
+
+## `satelle config`
+
+```text
+Usage: satelle config [OPTIONS] <COMMAND>
+
+Commands:
+  check    
+  explain  
+  help     Print this message or the help of the given subcommand(s)
+
+Options:
+      --no-color               Disable colored human output
+      --profile <NAME>         Apply a named user-level configuration profile
+      --error-format <FORMAT>  Format diagnostics as human-readable text or JSON [env: SATELLE_ERROR_FORMAT=] [possible values: human, json]
+  -h, --help                   Print help
+```
+
+## `satelle paths`
+
+```text
+Usage: satelle paths [OPTIONS]
+
+Options:
+      --host <HOST>            
+      --no-color               Disable colored human output
+      --format <FORMAT>        [possible values: human, json]
+      --profile <NAME>         Apply a named user-level configuration profile
+      --error-format <FORMAT>  Format diagnostics as human-readable text or JSON [env: SATELLE_ERROR_FORMAT=] [possible values: human, json]
+      --json                   Alias for --format json
+  -h, --help                   Print help
+```
+
+## `satelle host`
+
+```text
+Usage: satelle host [OPTIONS] <COMMAND>
+
+Commands:
+  start     
+  trust     Authenticate a direct Host and pin its stable identity in user configuration
+  status    
+  stop      
+  restart   
+  update    
+  sessions  
+  storage   
+  help      Print this message or the help of the given subcommand(s)
+
+Options:
+      --no-color               Disable colored human output
+      --profile <NAME>         Apply a named user-level configuration profile
+      --error-format <FORMAT>  Format diagnostics as human-readable text or JSON [env: SATELLE_ERROR_FORMAT=] [possible values: human, json]
+  -h, --help                   Print help
+```
+
+## `satelle self`
+
+```text
+Usage: satelle self [OPTIONS] <COMMAND>
+
+Commands:
+  update  
+  help    Print this message or the help of the given subcommand(s)
+
+Options:
+      --no-color               Disable colored human output
+      --profile <NAME>         Apply a named user-level configuration profile
+      --error-format <FORMAT>  Format diagnostics as human-readable text or JSON [env: SATELLE_ERROR_FORMAT=] [possible values: human, json]
+  -h, --help                   Print help
+```
+
+## `satelle run`
+
+```text
+Usage: satelle run [OPTIONS] [PROMPT_OR_DASH]
+
+Arguments:
+  [PROMPT_OR_DASH]  
+
+Options:
+      --host <HOST>
+          
+      --no-color
+          Disable colored human output
+      --detach
+          
+      --profile <NAME>
+          Apply a named user-level configuration profile
+      --error-format <FORMAT>
+          Format diagnostics as human-readable text or JSON [env: SATELLE_ERROR_FORMAT=] [possible values: human, json]
+      --quiet
+          
+      --verbose
+          
+      --experimental-provider-computer-use
+          Experimental: attempt non-OpenAI provider Computer Use; behavior may not work correctly and still requires a live provider Computer Use smoke test
+      --refresh-provider-smoke-test
+          Refresh the cached provider Computer Use smoke-test result before execution; this does not enable experimental provider Computer Use
+      --yolo
+          Enable YOLO mode for this command; Codex-controlled approvals may be auto-accepted when supported
+      --no-yolo
+          Disable YOLO mode for this command
+      --events <EVENTS>
+          [default: auto] [possible values: auto, human, json, none]
+      --prompt-file <PROMPT_FILE>
+          
+      --format <FORMAT>
+          [possible values: human, json]
+      --json
+          Alias for --format json
+  -h, --help
+          Print help
+```
+
+## `satelle steer`
+
+```text
+Usage: satelle steer [OPTIONS] <SESSION_ID> [PROMPT_OR_DASH]
+
+Arguments:
+  <SESSION_ID>      
+  [PROMPT_OR_DASH]  
+
+Options:
+      --host <HOST>
+          
+      --no-color
+          Disable colored human output
+      --detach
+          
+      --profile <NAME>
+          Apply a named user-level configuration profile
+      --error-format <FORMAT>
+          Format diagnostics as human-readable text or JSON [env: SATELLE_ERROR_FORMAT=] [possible values: human, json]
+      --quiet
+          
+      --verbose
+          
+      --experimental-provider-computer-use
+          Experimental: attempt non-OpenAI provider Computer Use; behavior may not work correctly and still requires a live provider Computer Use smoke test
+      --refresh-provider-smoke-test
+          Refresh the cached provider Computer Use smoke-test result before execution; this does not enable experimental provider Computer Use
+      --yolo
+          Enable YOLO mode for this command; Codex-controlled approvals may be auto-accepted when supported
+      --no-yolo
+          Disable YOLO mode for this command
+      --events <EVENTS>
+          [default: auto] [possible values: auto, human, json, none]
+      --prompt-file <PROMPT_FILE>
+          
+      --format <FORMAT>
+          [possible values: human, json]
+      --json
+          Alias for --format json
+  -h, --help
+          Print help
+```
+
+## `satelle status`
+
+```text
+Usage: satelle status [OPTIONS] <SESSION_ID>
+
+Arguments:
+  <SESSION_ID>  
+
+Options:
+      --host <HOST>            
+      --no-color               Disable colored human output
+      --format <FORMAT>        [possible values: human, json]
+      --profile <NAME>         Apply a named user-level configuration profile
+      --error-format <FORMAT>  Format diagnostics as human-readable text or JSON [env: SATELLE_ERROR_FORMAT=] [possible values: human, json]
+      --json                   Alias for --format json
+  -h, --help                   Print help
+```
+
+## `satelle stop`
+
+```text
+Usage: satelle stop [OPTIONS] <SESSION_ID>
+
+Arguments:
+  <SESSION_ID>  
+
+Options:
+      --host <HOST>            
+      --no-color               Disable colored human output
+      --format <FORMAT>        [possible values: human, json]
+      --profile <NAME>         Apply a named user-level configuration profile
+      --error-format <FORMAT>  Format diagnostics as human-readable text or JSON [env: SATELLE_ERROR_FORMAT=] [possible values: human, json]
+      --json                   Alias for --format json
+  -h, --help                   Print help
+```
+
+## `satelle logs`
+
+```text
+Usage: satelle logs [OPTIONS]
+
+Options:
+      --host <ALIAS>                 Read logs from this configured Host
+      --no-color                     Disable colored human output
+      --profile <NAME>               Apply a named user-level configuration profile
+      --session <SESSION_ID>         Include only entries for this Session
+      --error-format <FORMAT>        Format diagnostics as human-readable text or JSON [env: SATELLE_ERROR_FORMAT=] [possible values: human, json]
+      --tail <COUNT>                 Return the most recent 1 to 10000 matching entries (default: 200)
+      --since <DURATION_OR_RFC3339>  Include entries at or after this duration or RFC 3339 time
+      --after <LOG_CURSOR>           Return entries strictly after this opaque cursor; conflicts with --since and --tail
+      --source <SOURCE>              Include a source: host_daemon, storage, or codex_adapter; repeat to select multiple
+      --level <SEVERITY>             Set minimum severity: info, warn, or error (default: info)
+      --format <FORMAT>              [possible values: human, json]
+      --json                         Alias for --format json
+  -h, --help                         Print help
+```
+
+## `satelle mcp`
+
+```text
+Usage: satelle mcp [OPTIONS] <COMMAND>
+
+Commands:
+  serve    
+  install  
+  help     Print this message or the help of the given subcommand(s)
+
+Options:
+      --no-color               Disable colored human output
+      --profile <NAME>         Apply a named user-level configuration profile
+      --error-format <FORMAT>  Format diagnostics as human-readable text or JSON [env: SATELLE_ERROR_FORMAT=] [possible values: human, json]
+  -h, --help                   Print help
+```
+
+## `satelle support`
+
+```text
+Usage: satelle support [OPTIONS] <COMMAND>
+
+Commands:
+  bundle  
+  help    Print this message or the help of the given subcommand(s)
+
+Options:
+      --no-color               Disable colored human output
+      --profile <NAME>         Apply a named user-level configuration profile
+      --error-format <FORMAT>  Format diagnostics as human-readable text or JSON [env: SATELLE_ERROR_FORMAT=] [possible values: human, json]
+  -h, --help                   Print help
+```
+
+## `satelle config check`
+
+```text
+Usage: satelle config check [OPTIONS]
+
+Options:
+      --host <HOST>            
+      --no-color               Disable colored human output
+      --all                    
+      --profile <NAME>         Apply a named user-level configuration profile
+      --error-format <FORMAT>  Format diagnostics as human-readable text or JSON [env: SATELLE_ERROR_FORMAT=] [possible values: human, json]
+      --format <FORMAT>        [possible values: human, json]
+      --json                   Alias for --format json
+  -h, --help                   Print help
+```
+
+## `satelle config explain`
+
+```text
+Usage: satelle config explain [OPTIONS]
+
+Options:
+      --host <HOST>             
+      --no-color                Disable colored human output
+      --profile <NAME>          Apply a named user-level configuration profile
+      --show-secret-references  
+      --error-format <FORMAT>   Format diagnostics as human-readable text or JSON [env: SATELLE_ERROR_FORMAT=] [possible values: human, json]
+      --format <FORMAT>         [possible values: human, json]
+      --json                    Alias for --format json
+  -h, --help                    Print help
+```
+
+## `satelle host start`
+
+```text
+Usage: satelle host start [OPTIONS]
+
+Options:
+      --bind <BIND>            [default: 127.0.0.1:3001]
+      --no-color               Disable colored human output
+      --profile <NAME>         Apply a named user-level configuration profile
+      --tls-cert <PATH>        PEM certificate chain for Host-terminated HTTPS and WSS
+      --error-format <FORMAT>  Format diagnostics as human-readable text or JSON [env: SATELLE_ERROR_FORMAT=] [possible values: human, json]
+      --tls-key <PATH>         Owner-only PEM private key matching --tls-cert
+      --foreground             
+      --format <FORMAT>        [possible values: human, json]
+      --json                   Alias for --format json
+  -h, --help                   Print help
+```
+
+## `satelle host trust`
+
+```text
+Authenticate a direct Host and pin its stable identity in user configuration
+
+Usage: satelle host trust [OPTIONS] --host <HOST>
+
+Options:
+      --host <HOST>                 Host Binding alias to authenticate and trust
+      --no-color                    Disable colored human output
+      --expected-host-id <HOST_ID>  Exact identity required before a noninteractive trust update
+      --profile <NAME>              Apply a named user-level configuration profile
+      --error-format <FORMAT>       Format diagnostics as human-readable text or JSON [env: SATELLE_ERROR_FORMAT=] [possible values: human, json]
+      --replace                     Permit replacement when the Host Binding already pins a different identity
+      --yes                         Apply trust without an interactive confirmation
+      --no-input                    Reject any path that would prompt for input
+      --format <FORMAT>             [possible values: human, json]
+      --json                        Alias for --format json
+  -h, --help                        Print help
+```
+
+## `satelle host status`
+
+```text
+Usage: satelle host status [OPTIONS]
+
+Options:
+      --host <HOST>            
+      --no-color               Disable colored human output
+      --format <FORMAT>        [possible values: human, json]
+      --profile <NAME>         Apply a named user-level configuration profile
+      --error-format <FORMAT>  Format diagnostics as human-readable text or JSON [env: SATELLE_ERROR_FORMAT=] [possible values: human, json]
+      --json                   Alias for --format json
+  -h, --help                   Print help
+```
+
+## `satelle host stop`
+
+```text
+Usage: satelle host stop [OPTIONS]
+
+Options:
+      --host <HOST>            
+      --no-color               Disable colored human output
+      --profile <NAME>         Apply a named user-level configuration profile
+      --yes                    
+      --error-format <FORMAT>  Format diagnostics as human-readable text or JSON [env: SATELLE_ERROR_FORMAT=] [possible values: human, json]
+      --no-input               
+      --format <FORMAT>        [possible values: human, json]
+      --json                   Alias for --format json
+  -h, --help                   Print help
+```
+
+## `satelle host restart`
+
+```text
+Usage: satelle host restart [OPTIONS]
+
+Options:
+      --host <HOST>            
+      --no-color               Disable colored human output
+      --profile <NAME>         Apply a named user-level configuration profile
+      --yes                    
+      --error-format <FORMAT>  Format diagnostics as human-readable text or JSON [env: SATELLE_ERROR_FORMAT=] [possible values: human, json]
+      --no-input               
+      --format <FORMAT>        [possible values: human, json]
+      --json                   Alias for --format json
+  -h, --help                   Print help
+```
+
+## `satelle host update`
+
+```text
+Usage: satelle host update [OPTIONS]
+
+Options:
+      --host <HOST>            
+      --no-color               Disable colored human output
+      --component <COMPONENT>  
+      --profile <NAME>         Apply a named user-level configuration profile
+      --all-remotes            
+      --error-format <FORMAT>  Format diagnostics as human-readable text or JSON [env: SATELLE_ERROR_FORMAT=] [possible values: human, json]
+      --dry-run                
+      --yes                    
+      --no-input               
+      --format <FORMAT>        [possible values: human, json]
+      --json                   Alias for --format json
+  -h, --help                   Print help
+```
+
+## `satelle host sessions`
+
+```text
+Usage: satelle host sessions [OPTIONS]
+
+Options:
+      --host <HOST>            
+      --no-color               Disable colored human output
+      --no-bootstrap           
+      --profile <NAME>         Apply a named user-level configuration profile
+      --error-format <FORMAT>  Format diagnostics as human-readable text or JSON [env: SATELLE_ERROR_FORMAT=] [possible values: human, json]
+      --format <FORMAT>        [possible values: human, json]
+      --json                   Alias for --format json
+  -h, --help                   Print help
+```
+
+## `satelle host storage`
+
+```text
+Usage: satelle host storage [OPTIONS] <COMMAND>
+
+Commands:
+  migrate  
+  help     Print this message or the help of the given subcommand(s)
+
+Options:
+      --no-color               Disable colored human output
+      --profile <NAME>         Apply a named user-level configuration profile
+      --error-format <FORMAT>  Format diagnostics as human-readable text or JSON [env: SATELLE_ERROR_FORMAT=] [possible values: human, json]
+  -h, --help                   Print help
+```
+
+## `satelle self update`
+
+```text
+Usage: satelle self update [OPTIONS]
+
+Options:
+      --dry-run                    
+      --no-color                   Disable colored human output
+      --profile <NAME>             Apply a named user-level configuration profile
+      --version <VERSION>          
+      --error-format <FORMAT>      Format diagnostics as human-readable text or JSON [env: SATELLE_ERROR_FORMAT=] [possible values: human, json]
+      --update-remotes             
+      --host <HOST>                
+      --all-remotes                
+      --concurrency <CONCURRENCY>  [default: 4]
+      --no-input                   
+      --format <FORMAT>            [possible values: human, json]
+      --json                       Alias for --format json
+  -h, --help                       Print help
+```
+
+## `satelle mcp serve`
+
+```text
+Usage: satelle mcp serve [OPTIONS]
+
+Options:
+      --no-color               Disable colored human output
+      --profile <NAME>         Apply a named user-level configuration profile
+      --error-format <FORMAT>  Format diagnostics as human-readable text or JSON [env: SATELLE_ERROR_FORMAT=] [possible values: human, json]
+  -h, --help                   Print help
+```
+
+## `satelle mcp install`
+
+```text
+Usage: satelle mcp install [OPTIONS]
+
+Options:
+      --no-color                     Disable colored human output
+      --target <TARGET>              [possible values: claude-code, claude-desktop, codex, cursor, vscode, windsurf, gemini, opencode, cline, roo-code, droid, antigravity]
+      --all                          
+      --profile <NAME>               Apply a named user-level configuration profile
+      --error-format <FORMAT>        Format diagnostics as human-readable text or JSON [env: SATELLE_ERROR_FORMAT=] [possible values: human, json]
+      --server-name <SERVER_NAME>    [default: satelle]
+      --satelle-path <SATELLE_PATH>  
+      --dry-run                      
+      --format <FORMAT>              [possible values: human, json]
+      --json                         Alias for --format json
+  -h, --help                         Print help
+```
+
+## `satelle support bundle`
+
+```text
+Usage: satelle support bundle [OPTIONS]
+
+Options:
+      --host <HOST>            
+      --no-color               Disable colored human output
+      --output <OUTPUT>        
+      --profile <NAME>         Apply a named user-level configuration profile
+      --error-format <FORMAT>  Format diagnostics as human-readable text or JSON [env: SATELLE_ERROR_FORMAT=] [possible values: human, json]
+      --no-input               
+      --yes                    
+      --format <FORMAT>        [possible values: human, json]
+      --json                   Alias for --format json
+  -h, --help                   Print help
+```
+
+## `satelle host storage migrate`
+
+```text
+Usage: satelle host storage migrate [OPTIONS]
+
+Options:
+      --host <HOST>            
+      --no-color               Disable colored human output
+      --profile <NAME>         Apply a named user-level configuration profile
+      --to <TO>                
+      --dry-run                
+      --error-format <FORMAT>  Format diagnostics as human-readable text or JSON [env: SATELLE_ERROR_FORMAT=] [possible values: human, json]
+      --yes                    
+      --no-input               
+      --format <FORMAT>        [possible values: human, json]
+      --json                   Alias for --format json
+  -h, --help                   Print help
+```
