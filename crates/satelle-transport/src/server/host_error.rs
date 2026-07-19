@@ -401,6 +401,22 @@ mod tests {
     }
 
     #[test]
+    fn operation_capacity_failures_use_the_public_capacity_contract() {
+        for error in [
+            SatelleError::capacity_exceeded("operation", 1),
+            SatelleError::concurrency_limit_exceeded(1),
+        ] {
+            let mapped = failure(&error);
+
+            assert_eq!(mapped.status, StatusCode::SERVICE_UNAVAILABLE);
+            assert_eq!(mapped.code, ApiErrorCode::CapacityExceeded);
+            assert_eq!(mapped.category, ApiErrorCategory::Capacity);
+            assert!(mapped.retryable);
+            assert_eq!(mapped.details, None);
+        }
+    }
+
+    #[test]
     fn store_in_use_is_a_retryable_storage_unavailable_response() {
         let mapped = failure(&SatelleError::store_in_use());
 

@@ -17,5 +17,6 @@ pub use contract::{
 };
 pub use server::{
     DaemonServer, DaemonServerConfig, DaemonServerError, DaemonShutdownHandle, DaemonTlsConfig,
-    DaemonTlsConfigError, DaemonTlsReloadError, DaemonTlsReloader,
+    DaemonTlsConfigError, DaemonTlsReloadError, DaemonTlsReloader, TrustedProxy,
+    TrustedProxyParseError,
 };

@@ -7,7 +7,8 @@ use crate::contract::{
 };
 use axum::body::Body;
 use axum::extract::{ConnectInfo, Request, State};
-use axum::http::header::{AUTHORIZATION, CONTENT_LENGTH, COOKIE, TRANSFER_ENCODING};
+use axum::http::header::{AUTHORIZATION, CONTENT_LENGTH, COOKIE, FORWARDED, TRANSFER_ENCODING};
+use axum::http::{HeaderMap, HeaderName};
 use axum::middleware::Next;
 use axum::response::Response;
 use percent_encoding::percent_decode_str;
@@ -15,7 +16,7 @@ use satelle_host::{
     ApiBearerToken, ApiPrincipal, ApiScopes, MutationAuthority, contains_api_bearer_token,
 };
 use serde_json::Value;
-use std::net::IpAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -24,6 +25,9 @@ pub(super) const IDEMPOTENCY_KEY_HEADER: &str = "idempotency-key";
 pub(super) const REQUEST_ID_HEADER: &str = "satelle-request-id";
 const MAX_PERCENT_DECODE_LAYERS: usize = 8;
 const REQUEST_BODY_READ_TIMEOUT: Duration = Duration::from_secs(1);
+const MAX_FORWARDED_BYTES: usize = 4096;
+const MAX_FORWARDED_HOPS: usize = 32;
+const X_FORWARDED_FOR: HeaderName = HeaderName::from_static("x-forwarded-for");
 
 pub(super) fn expected_host_identity_matches(
     headers: &axum::http::HeaderMap,
@@ -63,8 +67,8 @@ pub(super) async fn authorize(
     let peer_ip = request
         .extensions()
         .get::<ConnectInfo<ConnectionContext>>()
-        .map_or(IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), |peer| {
-            peer.0.peer_ip()
+        .map_or(IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED), |peer| {
+            forwarded_client_source(request.headers(), peer.0.peer_ip(), &state.trusted_proxies)
         });
     if let Some(retry_after) = state.failed_auth_limit.retry_after(peer_ip) {
         return rate_limited_response(
@@ -199,6 +203,142 @@ pub(super) async fn authorize(
         principal,
     });
     security_headers(next.run(request).await)
+}
+
+fn forwarded_client_source(
+    headers: &HeaderMap,
+    transport_peer: IpAddr,
+    trusted_proxies: &[super::TrustedProxy],
+) -> IpAddr {
+    if !trusted_proxies
+        .iter()
+        .any(|trusted| trusted.contains(transport_peer))
+    {
+        return transport_peer;
+    }
+
+    let forwarded = parse_forwarded(headers);
+    let x_forwarded_for = parse_x_forwarded_for(headers);
+    let chain = match (forwarded, x_forwarded_for) {
+        (Ok(None), Ok(None)) => return transport_peer,
+        (Ok(Some(chain)), Ok(None)) | (Ok(None), Ok(Some(chain))) => chain,
+        (Ok(Some(forwarded)), Ok(Some(x_forwarded_for))) if forwarded == x_forwarded_for => {
+            forwarded
+        }
+        (Ok(Some(_)), Ok(Some(_))) | (Err(()), _) | (_, Err(())) => return transport_peer,
+    };
+
+    let mut source = transport_peer;
+    for hop in chain.iter().rev() {
+        if !trusted_proxies
+            .iter()
+            .any(|trusted| trusted.contains(source))
+        {
+            break;
+        }
+        source = *hop;
+    }
+    source
+}
+
+fn parse_forwarded(headers: &HeaderMap) -> Result<Option<Vec<IpAddr>>, ()> {
+    let Some(value) = joined_header_values(headers, FORWARDED)? else {
+        return Ok(None);
+    };
+    let mut addresses = Vec::new();
+    for element in value.split(',') {
+        let mut forwarded_for = None;
+        for parameter in element.split(';') {
+            let Some((name, value)) = parameter.trim().split_once('=') else {
+                return Err(());
+            };
+            if name.trim().eq_ignore_ascii_case("for") {
+                if forwarded_for.is_some() {
+                    return Err(());
+                }
+                forwarded_for = Some(parse_forwarded_address(value.trim())?);
+            }
+        }
+        addresses.push(forwarded_for.ok_or(())?);
+        if addresses.len() > MAX_FORWARDED_HOPS {
+            return Err(());
+        }
+    }
+    (!addresses.is_empty())
+        .then_some(addresses)
+        .ok_or(())
+        .map(Some)
+}
+
+fn parse_x_forwarded_for(headers: &HeaderMap) -> Result<Option<Vec<IpAddr>>, ()> {
+    let Some(value) = joined_header_values(headers, X_FORWARDED_FOR)? else {
+        return Ok(None);
+    };
+    let mut addresses = Vec::new();
+    for value in value.split(',') {
+        addresses.push(parse_forwarded_address(value.trim())?);
+        if addresses.len() > MAX_FORWARDED_HOPS {
+            return Err(());
+        }
+    }
+    (!addresses.is_empty())
+        .then_some(addresses)
+        .ok_or(())
+        .map(Some)
+}
+
+fn joined_header_values(headers: &HeaderMap, name: HeaderName) -> Result<Option<String>, ()> {
+    let mut joined = String::new();
+    let mut present = false;
+    for value in headers.get_all(name).iter() {
+        present = true;
+        let value = value.to_str().map_err(|_| ())?;
+        if value.trim().is_empty() {
+            return Err(());
+        }
+        let separator_len = usize::from(!joined.is_empty());
+        if joined
+            .len()
+            .saturating_add(separator_len)
+            .saturating_add(value.len())
+            > MAX_FORWARDED_BYTES
+        {
+            return Err(());
+        }
+        if !joined.is_empty() {
+            joined.push(',');
+        }
+        joined.push_str(value);
+    }
+    Ok(present.then_some(joined))
+}
+
+fn parse_forwarded_address(value: &str) -> Result<IpAddr, ()> {
+    let value = match value
+        .strip_prefix('"')
+        .and_then(|value| value.strip_suffix('"'))
+    {
+        Some(value) if !value.contains(['"', '\\']) => value,
+        Some(_) => return Err(()),
+        None if value.contains('"') => return Err(()),
+        None => value,
+    };
+    if value.eq_ignore_ascii_case("unknown") || value.starts_with('_') {
+        return Err(());
+    }
+    if let Ok(address) = value.parse::<IpAddr>() {
+        return Ok(address);
+    }
+    if let Ok(address) = value.parse::<SocketAddr>() {
+        return Ok(address.ip());
+    }
+    if let Some(address) = value.strip_prefix('[').and_then(|value| {
+        let (address, suffix) = value.split_once(']')?;
+        (suffix.is_empty() || suffix.strip_prefix(':')?.parse::<u16>().is_ok()).then_some(address)
+    }) {
+        return address.parse::<IpAddr>().map_err(|_| ());
+    }
+    Err(())
 }
 
 fn request_has_disallowed_bearer_token(request: &Request) -> bool {
@@ -850,4 +990,97 @@ fn authentication_failed(request_id: RequestId) -> Response {
             details: None,
         },
     )
+}
+
+#[cfg(test)]
+mod forwarded_tests {
+    use super::*;
+    use std::net::Ipv4Addr;
+
+    fn trusted_proxies() -> [super::super::TrustedProxy; 2] {
+        [
+            IpAddr::V4(Ipv4Addr::LOCALHOST).into(),
+            "127.0.0.2".parse().expect("parse trusted proxy"),
+        ]
+    }
+
+    #[test]
+    fn forwarded_chain_selects_the_nearest_untrusted_hop() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            FORWARDED,
+            "for=203.0.113.99, for=198.51.100.40, for=127.0.0.2"
+                .parse()
+                .expect("parse header"),
+        );
+
+        assert_eq!(
+            forwarded_client_source(
+                &headers,
+                IpAddr::V4(Ipv4Addr::LOCALHOST),
+                &trusted_proxies(),
+            ),
+            "198.51.100.40".parse::<IpAddr>().expect("parse origin")
+        );
+    }
+
+    #[test]
+    fn forwarded_header_families_must_describe_the_same_chain() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            FORWARDED,
+            "for=198.51.100.40, for=127.0.0.2"
+                .parse()
+                .expect("parse Forwarded header"),
+        );
+        headers.insert(
+            X_FORWARDED_FOR,
+            "203.0.113.20, 127.0.0.2"
+                .parse()
+                .expect("parse X-Forwarded-For header"),
+        );
+
+        assert_eq!(
+            forwarded_client_source(
+                &headers,
+                IpAddr::V4(Ipv4Addr::LOCALHOST),
+                &trusted_proxies(),
+            ),
+            IpAddr::V4(Ipv4Addr::LOCALHOST)
+        );
+    }
+
+    #[test]
+    fn malformed_secondary_forwarding_header_falls_back_to_the_transport_peer() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            FORWARDED,
+            "for=198.51.100.40, for=127.0.0.2"
+                .parse()
+                .expect("parse Forwarded header"),
+        );
+        headers.insert(X_FORWARDED_FOR, "".parse().expect("parse empty header"));
+
+        assert_eq!(
+            forwarded_client_source(
+                &headers,
+                IpAddr::V4(Ipv4Addr::LOCALHOST),
+                &trusted_proxies(),
+            ),
+            IpAddr::V4(Ipv4Addr::LOCALHOST)
+        );
+    }
+
+    #[test]
+    fn forwarded_socket_addresses_preserve_only_the_ip() {
+        assert_eq!(
+            parse_forwarded_address("\"[2001:db8::1]:4711\"")
+                .expect("parse bracketed IPv6 address"),
+            "2001:db8::1".parse::<IpAddr>().expect("parse IPv6 address")
+        );
+        assert_eq!(
+            parse_forwarded_address("192.0.2.1:4711").expect("parse IPv4 socket address"),
+            "192.0.2.1".parse::<IpAddr>().expect("parse IPv4 address")
+        );
+    }
 }
