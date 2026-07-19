@@ -1,0 +1,53 @@
+name: Documentation
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+concurrency:
+  group: docs-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    name: Build and validate documentation
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Install Node.js
+        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Install pinned Rust toolchain
+        run: rustup toolchain install 1.97.0 --profile minimal
+
+      - name: Install documentation dependencies
+        run: npm ci --ignore-scripts
+
+      - name: Generate Fumadocs sources
+        run: npm run postinstall --workspace website
+
+      - name: Reject public schema reference drift
+        run: node website/scripts/docs-contract.mjs schema-check
+
+      - name: Build matching Satelle binary
+        run: cargo build --release --locked -p satelle-cli
+
+      - name: Reject stale generated reference
+        env:
+          SATELLE_DOCS_BINARY: ${{ github.workspace }}/target/release/satelle
+        run: node website/scripts/docs-contract.mjs check
+
+      - name: Build Fumadocs site
+        run: npm run docs:build
