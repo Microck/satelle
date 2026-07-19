@@ -2,7 +2,7 @@ use assert_cmd::cargo::CommandCargoExt;
 use satelle_host::{ApiBearerToken, test_support::TestStateDir};
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
-use std::io::Write;
+use std::io::{BufRead, BufReader, Write};
 use std::net::{SocketAddr, TcpListener};
 use std::path::Path;
 use std::process::{Child, ChildStdin, Command, Output, Stdio};
@@ -167,6 +167,26 @@ fn wait_with_open_stdin(mut child: Child, stdin: ChildStdin, timeout_message: &s
         }
         thread::sleep(Duration::from_millis(10));
     }
+}
+
+fn synchronize_pre_initialization_server(child: &mut Child, stdin: &mut ChildStdin) {
+    // RMCP permits ping before initialization. Waiting for its response proves
+    // that the child runtime, bounded framer, and protocol reader are all
+    // running before an EOF-independent exit deadline starts. This keeps slow
+    // Windows process startup out of the shutdown contract being measured.
+    stdin
+        .write_all(b"{\"jsonrpc\":\"2.0\",\"id\":0,\"method\":\"ping\"}\n")
+        .expect("write pre-initialization ping");
+    stdin.flush().expect("flush pre-initialization ping");
+
+    let stdout = child.stdout.as_mut().expect("piped stdout");
+    let mut response = String::new();
+    BufReader::new(stdout)
+        .read_line(&mut response)
+        .expect("read pre-initialization ping response");
+    let response: Value = serde_json::from_str(&response).expect("parse ping response");
+    assert_eq!(response["id"], 0);
+    assert_eq!(response["result"], json!({}));
 }
 
 fn seed_session(home: &Path) -> String {
@@ -756,6 +776,7 @@ fn initialization_failure_exits_while_client_stdin_remains_open() {
     let (mut command, _home) = mcp_command();
     let mut child = command.spawn().expect("spawn MCP server");
     let mut stdin = child.stdin.take().expect("piped stdin");
+    synchronize_pre_initialization_server(&mut child, &mut stdin);
     stdin
         .write_all(b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/list\",\"params\":{}}\n")
         .expect("write a request before initialization");
@@ -776,6 +797,7 @@ fn oversized_input_is_rejected_before_rmcp() {
     let (mut command, _home) = mcp_command();
     let mut child = command.spawn().expect("spawn MCP server");
     let mut stdin = child.stdin.take().expect("piped stdin");
+    synchronize_pre_initialization_server(&mut child, &mut stdin);
     let _ = stdin.write_all(&vec![b' '; 1_048_577]);
     let output = wait_with_open_stdin(
         child,

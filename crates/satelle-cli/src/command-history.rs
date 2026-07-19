@@ -1,4 +1,4 @@
-use rusqlite::{Connection, OpenFlags, params};
+use rusqlite::{Connection, OpenFlags, TransactionBehavior, params};
 use satelle_core::{
     ErrorCode, SecureFileError, SessionId, open_or_create_owner_only_directory,
     open_or_create_owner_only_file,
@@ -180,7 +180,7 @@ impl Recorder {
         // inherited Windows ACL. Establish the owner-only policy first, then
         // let SQLite open the already-private file.
         drop(open_or_create_owner_only_file(&database_path)?);
-        let connection = Connection::open_with_flags(
+        let mut connection = Connection::open_with_flags(
             &database_path,
             OpenFlags::SQLITE_OPEN_READ_WRITE
                 | OpenFlags::SQLITE_OPEN_CREATE
@@ -188,7 +188,13 @@ impl Recorder {
                 | OpenFlags::SQLITE_OPEN_NOFOLLOW,
         )?;
         connection.busy_timeout(DATABASE_BUSY_TIMEOUT)?;
-        connection.execute_batch(SCHEMA)?;
+        // First-run schema creation and the row insert are one writer
+        // operation. Without this transaction, concurrent first invocations
+        // repeatedly release and reacquire SQLite's write lock between DDL
+        // statements and the insert, which can lose best-effort rows under
+        // Windows scheduler contention.
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        transaction.execute_batch(SCHEMA)?;
 
         let session_id = final_session_id
             .map(ToString::to_string)
@@ -198,7 +204,7 @@ impl Recorder {
         } else {
             "success"
         };
-        connection.execute(
+        transaction.execute(
             "INSERT INTO command_history (\
                  command_family, selected_host, selected_profile, session_id, started_at, \
                  duration_ms, outcome_status, error_code, cli_version\
@@ -215,6 +221,7 @@ impl Recorder {
                 env!("CARGO_PKG_VERSION"),
             ],
         )?;
+        transaction.commit()?;
         Ok(())
     }
 }
