@@ -42,9 +42,9 @@ pub use log_page::{
 use operation_capacity::OperationCapacity;
 pub use runtime::{
     AdapterPreflight, AdapterReadiness, AdapterSubject, ComputerUseAdapter, EvidenceError,
-    ExecuteRequest, ExecuteResult, ProviderComputerUseIntent, ProviderSmokeEvidence,
-    ProviderSmokeFailureEvidence, ProviderSmokeResult, ProviderSmokeSource, ReadinessCacheKey,
-    ReadinessEvidence, RecoveryObservation,
+    ExecuteRequest, ExecuteResult, MaintenanceOperationHandle, ProviderComputerUseIntent,
+    ProviderSmokeEvidence, ProviderSmokeFailureEvidence, ProviderSmokeResult, ProviderSmokeSource,
+    ReadinessCacheKey, ReadinessEvidence, RecoveryObservation,
 };
 use runtime::{ProductionComputerUseAdapter, RunCommand, RuntimeHandle, SteerCommand, StopCommand};
 use satelle_core::session::{PublicSession, TurnAdmissionFailure};
@@ -63,6 +63,15 @@ pub use storage::{
     SetupOperationKind, SetupRepairAction, SetupRepairDecision, SetupRepairPlan,
     SetupRepairPostcondition, SetupRepairProbe, SetupRunPlan, SetupRunRecord, SetupRunStatus,
 };
+
+/// Operation-specific observer used to reconcile an interrupted setup action.
+///
+/// Returning `Ok(true)` verifies the action's postcondition, `Ok(false)`
+/// verifies that it is unsatisfied, and an error leaves ownership in
+/// recovery_pending without any durable transition.
+pub trait SetupPostconditionObserver {
+    fn observe(&mut self, action: &SetupActionRecord) -> Result<bool, SatelleError>;
+}
 #[cfg(any(test, feature = "test-support"))]
 use test_runtime::FakeComputerUseAdapter;
 #[cfg(feature = "test-support")]
@@ -83,6 +92,7 @@ const DEFAULT_PROVIDER_SMOKE_FAILURE_TTL: time::Duration = time::Duration::minut
 #[doc(hidden)]
 pub mod test_support {
     pub use crate::storage::TestStateDir;
+    pub use crate::test_runtime::DETACHED_EXECUTION_TRACE_MARKER;
 }
 
 #[cfg(test)]
@@ -157,39 +167,61 @@ fn replace_production_snapshot(
 }
 
 impl HostService {
+    #[cfg(test)]
+    pub(crate) fn local_demo_with_readiness_driver_for_tests_at<
+        D: runtime::ReadinessProbeDriver,
+    >(
+        state_root: impl Into<std::path::PathBuf>,
+        driver: D,
+    ) -> Result<Self, SatelleError> {
+        Ok(Self {
+            runtime: RuntimeHandle::new_with_readiness_probe_driver(
+                Ok(state_root.into()),
+                FakeComputerUseAdapter,
+                driver,
+            ),
+            operation_capacity: Arc::new(OperationCapacity::default()),
+            mode: HostMode::TestFake,
+            bootstrap_auth: None,
+        })
+    }
+
     /// Persists an ordered setup or repair plan before any action can mutate
     /// the Host. CLI presentation and transport code do not get a separate
     /// ledger path.
-    pub fn begin_setup_run(&self, plan: &SetupRunPlan) -> Result<(), SatelleError> {
+    pub fn begin_setup_run(
+        &self,
+        plan: &SetupRunPlan,
+    ) -> Result<MaintenanceOperationHandle, SatelleError> {
         self.runtime.begin_setup_run(plan)
     }
 
     /// Durably marks one planned action as started before external mutation.
     pub fn start_setup_action(
         &self,
-        run_id: &str,
+        operation: &MaintenanceOperationHandle,
         action_id: &str,
         started_at: time::OffsetDateTime,
     ) -> Result<(), SatelleError> {
         self.runtime
-            .start_setup_action(run_id, action_id, started_at)
+            .start_setup_action(operation, action_id, started_at)
     }
 
     /// Commits completion only through the postcondition-verified boundary.
     pub fn complete_setup_action_after_verified_postcondition(
         &self,
-        run_id: &str,
+        operation: &MaintenanceOperationHandle,
         action_id: &str,
         completed_at: time::OffsetDateTime,
     ) -> Result<(), SatelleError> {
         self.runtime
-            .complete_setup_action_after_verified_postcondition(run_id, action_id, completed_at)
+            .complete_setup_action_after_verified_postcondition(operation, action_id, completed_at)
     }
 
     #[allow(clippy::too_many_arguments)]
     pub fn fail_setup_action(
         &self,
-        run_id: &str,
+        operation: &MaintenanceOperationHandle,
         action_id: &str,
         error_code: &str,
         exit_status: Option<i64>,
@@ -197,7 +229,7 @@ impl HostService {
         failed_at: time::OffsetDateTime,
     ) -> Result<(), SatelleError> {
         self.runtime.fail_setup_action(
-            run_id,
+            operation,
             action_id,
             error_code,
             exit_status,
@@ -208,23 +240,35 @@ impl HostService {
 
     pub fn skip_setup_action(
         &self,
-        run_id: &str,
+        operation: &MaintenanceOperationHandle,
         action_id: &str,
         reason: SetupActionSkipReason,
         skipped_at: time::OffsetDateTime,
     ) -> Result<(), SatelleError> {
         self.runtime
-            .skip_setup_action(run_id, action_id, reason, skipped_at)
+            .skip_setup_action(operation, action_id, reason, skipped_at)
+    }
+
+    /// Runs the canonical native readiness observer while this operation owns
+    /// both Maintenance and its same-operation postcheck Control sublease.
+    pub fn run_maintenance_postcheck(
+        &self,
+        operation: &mut MaintenanceOperationHandle,
+        key: &ReadinessCacheKey,
+        postcheck_action_id: &str,
+    ) -> Result<SetupRunStatus, SatelleError> {
+        self.runtime
+            .run_maintenance_postcheck(operation, key, postcheck_action_id)
     }
 
     /// Derives the terminal run status from committed action states rather
     /// than accepting a caller-supplied outcome.
     pub fn finish_setup_run(
         &self,
-        run_id: &str,
+        operation: &mut MaintenanceOperationHandle,
         finished_at: time::OffsetDateTime,
     ) -> Result<SetupRunStatus, SatelleError> {
-        self.runtime.finish_setup_run(run_id, finished_at)
+        self.runtime.finish_setup_run(operation, finished_at)
     }
 
     pub fn load_setup_run(&self, run_id: &str) -> Result<Option<SetupRunRecord>, SatelleError> {
@@ -241,6 +285,15 @@ impl HostService {
         self.runtime.plan_setup_repair(desktop_binding, probes)
     }
 
+    /// Reconciles an interrupted maintenance run from current, operation-
+    /// specific postconditions. Unknown evidence retains recovery ownership.
+    pub fn reconcile_setup_maintenance(
+        &self,
+        observer: &mut dyn SetupPostconditionObserver,
+    ) -> Result<Option<SetupRunStatus>, SatelleError> {
+        self.runtime.reconcile_setup_maintenance(observer)
+    }
+
     /// Builds the only runtime available in normal and release builds. The
     /// constructor retains only typed, diagnostic-safe capability evidence.
     pub fn production() -> Self {
@@ -255,7 +308,17 @@ impl HostService {
     /// the fully resolved host/profile configuration.
     pub fn production_for_host(config: &HostConfig) -> Self {
         let snapshot = Arc::new(RwLock::new(ProductionCapabilitySnapshot::collect(None)));
-        let state_root = satelle_core::state_dir();
+        let paths = satelle_core::resolve_path_set(
+            &std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")),
+        );
+        let state_root = paths
+            .as_ref()
+            .map(|paths| paths.state_root.clone())
+            .map_err(Clone::clone);
+        let operator_log_root = paths
+            .as_ref()
+            .map(|paths| paths.operator_log_root.clone())
+            .map_err(Clone::clone);
         let working_directory = state_root
             .as_ref()
             .map(|path| path.join("codex-app-server-work"))
@@ -283,7 +346,7 @@ impl HostService {
             provider_smoke_failure_ttl,
         );
         Self {
-            runtime: RuntimeHandle::new_production(state_root, adapter),
+            runtime: RuntimeHandle::new_production(state_root, operator_log_root, adapter),
             operation_capacity: Arc::new(OperationCapacity::default()),
             mode: HostMode::Production { snapshot },
             bootstrap_auth: None,

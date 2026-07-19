@@ -1,4 +1,4 @@
-use super::{LeafOpenMode, StorageError, StorageErrorKind};
+use super::{LeafIdentity, LeafOpenMode, StorageError, StorageErrorKind};
 use std::ffi::c_void;
 use std::fs::File;
 use std::io;
@@ -8,8 +8,8 @@ use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
 use std::path::{Component, Path, PathBuf, Prefix};
 use std::ptr::{addr_of, null, null_mut};
 use windows_sys::Win32::Foundation::{
-    ERROR_ALREADY_EXISTS, ERROR_FILE_NOT_FOUND, ERROR_PATH_NOT_FOUND, ERROR_SUCCESS, GetLastError,
-    HANDLE, HLOCAL, INVALID_HANDLE_VALUE, LocalFree,
+    ERROR_ALREADY_EXISTS, ERROR_FILE_EXISTS, ERROR_FILE_NOT_FOUND, ERROR_PATH_NOT_FOUND,
+    ERROR_SUCCESS, GetLastError, HANDLE, HLOCAL, INVALID_HANDLE_VALUE, LocalFree,
 };
 use windows_sys::Win32::Security::Authorization::{
     ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW, GetSecurityInfo,
@@ -24,13 +24,15 @@ use windows_sys::Win32::Security::{
     TokenUser,
 };
 use windows_sys::Win32::Storage::FileSystem::{
-    BY_HANDLE_FILE_INFORMATION, CREATE_NEW, CreateDirectoryW, CreateFileW, FILE_ALL_ACCESS,
+    BY_HANDLE_FILE_INFORMATION, CREATE_NEW, CreateDirectoryW, CreateFileW, DELETE, FILE_ALL_ACCESS,
     FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_NORMAL, FILE_ATTRIBUTE_REPARSE_POINT,
-    FILE_ATTRIBUTE_TAG_INFO, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
-    FILE_GENERIC_READ, FILE_GENERIC_WRITE, FILE_READ_ATTRIBUTES, FILE_SHARE_READ, FILE_SHARE_WRITE,
-    FileAttributeTagInfo, GetDriveTypeW, GetFileInformationByHandle, GetFileInformationByHandleEx,
-    GetVolumeInformationByHandleW, OPEN_ALWAYS, OPEN_EXISTING, READ_CONTROL, ReOpenFile, WRITE_DAC,
-    WRITE_OWNER,
+    FILE_ATTRIBUTE_TAG_INFO, FILE_DISPOSITION_FLAG_DELETE, FILE_DISPOSITION_FLAG_POSIX_SEMANTICS,
+    FILE_DISPOSITION_INFO_EX, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
+    FILE_GENERIC_READ, FILE_GENERIC_WRITE, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE,
+    FILE_SHARE_READ, FILE_SHARE_WRITE, FileAttributeTagInfo, FileDispositionInfoEx, GetDriveTypeW,
+    GetFileInformationByHandle, GetFileInformationByHandleEx, GetVolumeInformationByHandleW,
+    MOVEFILE_WRITE_THROUGH, MoveFileExW, OPEN_ALWAYS, OPEN_EXISTING, READ_CONTROL, ReOpenFile,
+    SetFileInformationByHandle, WRITE_DAC, WRITE_OWNER,
 };
 use windows_sys::Win32::System::SystemServices::{ACCESS_ALLOWED_ACE_TYPE, FILE_PERSISTENT_ACLS};
 use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
@@ -104,32 +106,39 @@ impl SecureStateDirectory {
         mode: LeafOpenMode,
         fallback: StorageErrorKind,
     ) -> Result<Option<File>, StorageError> {
-        if file_name.is_empty()
-            || file_name
-                .chars()
-                .any(|character| matches!(character, '/' | '\\' | ':'))
-            || file_name == "."
-            || file_name == ".."
-        {
-            return Err(StorageError::new(StorageErrorKind::UnsafeStatePath));
-        }
-
-        let path = self.root.join(file_name);
+        let path = self.leaf_path(file_name)?;
+        let strict_private = matches!(
+            mode,
+            LeafOpenMode::ExistingPrivate | LeafOpenMode::ExistingPrivateGuarded
+        );
+        let guarded = matches!(mode, LeafOpenMode::ExistingPrivateGuarded);
         let descriptor = PrivateDescriptor::new(&self.process_identity.user, ObjectKind::File)?;
         let security_attributes = descriptor.security_attributes();
         let wide = wide_path(&path)?;
         let disposition = match mode {
-            LeafOpenMode::Existing => OPEN_EXISTING,
+            LeafOpenMode::Existing
+            | LeafOpenMode::ExistingPrivate
+            | LeafOpenMode::ExistingPrivateGuarded => OPEN_EXISTING,
             LeafOpenMode::CreateIfMissing => OPEN_ALWAYS,
             LeafOpenMode::CreateNew => CREATE_NEW,
+        };
+        let desired_access = if strict_private {
+            FILE_GENERIC_READ | FILE_READ_ATTRIBUTES | READ_CONTROL
+        } else {
+            FILE_READ_ATTRIBUTES | READ_CONTROL | WRITE_DAC | WRITE_OWNER
+        };
+        let share_mode = if guarded {
+            FILE_SHARE_READ
+        } else {
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE
         };
         let raw = unsafe {
             // FILE_FLAG_OPEN_REPARSE_POINT makes this the handle to a link or
             // junction itself. Every decision below is made from that handle.
             CreateFileW(
                 wide.as_ptr(),
-                FILE_READ_ATTRIBUTES | READ_CONTROL | WRITE_DAC | WRITE_OWNER,
-                FILE_SHARE_READ | FILE_SHARE_WRITE,
+                desired_access,
+                share_mode,
                 &security_attributes,
                 disposition,
                 FILE_ATTRIBUTE_NORMAL | FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
@@ -138,8 +147,12 @@ impl SecureStateDirectory {
         };
         if raw == INVALID_HANDLE_VALUE {
             let code = unsafe { GetLastError() };
-            if matches!(mode, LeafOpenMode::Existing)
-                && matches!(code, ERROR_FILE_NOT_FOUND | ERROR_PATH_NOT_FOUND)
+            if matches!(
+                mode,
+                LeafOpenMode::Existing
+                    | LeafOpenMode::ExistingPrivate
+                    | LeafOpenMode::ExistingPrivateGuarded
+            ) && matches!(code, ERROR_FILE_NOT_FOUND | ERROR_PATH_NOT_FOUND)
             {
                 return Ok(None);
             }
@@ -151,25 +164,34 @@ impl SecureStateDirectory {
         };
 
         require_regular_single_link(&security_handle)?;
-        require_initial_leaf_owner(&security_handle, &self.process_identity)?;
-        set_private_owner_and_dacl(&security_handle, &descriptor, &self.process_identity.user)?;
-        verify_private_security(
-            &security_handle,
-            &self.process_identity.user,
-            ObjectKind::File,
-        )?;
+        if strict_private {
+            require_owner(&security_handle, &self.process_identity.user)?;
+            verify_private_security(
+                &security_handle,
+                &self.process_identity.user,
+                ObjectKind::File,
+            )?;
+        } else {
+            require_initial_leaf_owner(&security_handle, &self.process_identity)?;
+            set_private_owner_and_dacl(&security_handle, &descriptor, &self.process_identity.user)?;
+            verify_private_security(
+                &security_handle,
+                &self.process_identity.user,
+                ObjectKind::File,
+            )?;
+        }
 
+        let reopened_access = if strict_private {
+            FILE_GENERIC_READ | READ_CONTROL
+        } else {
+            FILE_GENERIC_READ | FILE_GENERIC_WRITE | READ_CONTROL | WRITE_DAC
+        };
         let reopened = unsafe {
             // ReOpenFile is handle-relative, so there is no second pathname
             // lookup between validation and obtaining the data handle. Its
             // final argument accepts file flags, not CreateFile attributes;
             // zero requests no additional flags.
-            ReOpenFile(
-                raw_handle(&security_handle),
-                FILE_GENERIC_READ | FILE_GENERIC_WRITE | READ_CONTROL | WRITE_DAC,
-                FILE_SHARE_READ | FILE_SHARE_WRITE,
-                0,
-            )
+            ReOpenFile(raw_handle(&security_handle), reopened_access, share_mode, 0)
         };
         if reopened == INVALID_HANDLE_VALUE {
             return Err(last_error(fallback));
@@ -182,12 +204,130 @@ impl SecureStateDirectory {
         Ok(Some(File::from(data_handle)))
     }
 
+    pub(super) fn leaf_names(&self) -> Result<Vec<String>, StorageError> {
+        let entries = std::fs::read_dir(&self.root).map_err(|source| {
+            StorageError::with_source(StorageErrorKind::OperationFailed, source)
+        })?;
+        let mut names = Vec::new();
+        for entry in entries {
+            let entry = entry.map_err(|source| {
+                StorageError::with_source(StorageErrorKind::OperationFailed, source)
+            })?;
+            let file_name = entry.file_name();
+            if let Some(name) = file_name.to_str() {
+                names.push(name.to_owned());
+            }
+        }
+        Ok(names)
+    }
+
+    pub(super) fn delete_leaf(
+        &self,
+        file_name: &str,
+        expected_identity: LeafIdentity,
+    ) -> Result<bool, StorageError> {
+        let path = self.leaf_path(file_name)?;
+        let wide = wide_path(&path)?;
+        let raw = unsafe {
+            CreateFileW(
+                wide.as_ptr(),
+                DELETE | FILE_READ_ATTRIBUTES | READ_CONTROL,
+                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                null(),
+                OPEN_EXISTING,
+                FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT,
+                null_mut(),
+            )
+        };
+        if raw == INVALID_HANDLE_VALUE {
+            let code = unsafe { GetLastError() };
+            if matches!(code, ERROR_FILE_NOT_FOUND | ERROR_PATH_NOT_FOUND) {
+                return Ok(false);
+            }
+            return Err(win32_error(StorageErrorKind::OperationFailed, code));
+        }
+        let handle = unsafe { OwnedHandle::from_raw_handle(raw) };
+        require_regular_single_link(&handle)?;
+        require_owner(&handle, &self.process_identity.user)?;
+        verify_private_security(&handle, &self.process_identity.user, ObjectKind::File)?;
+        if handle_identity(&handle, StorageErrorKind::OperationFailed)? != expected_identity {
+            return Err(StorageError::new(StorageErrorKind::StateConflict));
+        }
+        // POSIX semantics removes the directory entry before this call
+        // returns, even when another share-delete handle still pins the file
+        // object. Cleanup may advance to the manifest only after the backup
+        // name is gone; legacy FileDispositionInfo merely marks the object
+        // delete-pending and can strand a visible `.deleting` name that no
+        // retry can reopen.
+        let disposition = FILE_DISPOSITION_INFO_EX {
+            Flags: FILE_DISPOSITION_FLAG_DELETE | FILE_DISPOSITION_FLAG_POSIX_SEMANTICS,
+        };
+        let deleted = unsafe {
+            SetFileInformationByHandle(
+                raw_handle(&handle),
+                FileDispositionInfoEx,
+                addr_of!(disposition).cast(),
+                size_of::<FILE_DISPOSITION_INFO_EX>() as u32,
+            )
+        };
+        if deleted == 0 {
+            return Err(last_error(StorageErrorKind::OperationFailed));
+        }
+        drop(handle);
+        Ok(true)
+    }
+
+    pub(super) fn move_leaf(
+        &self,
+        source_file_name: &str,
+        destination_file_name: &str,
+    ) -> Result<(), StorageError> {
+        let source = wide_path(&self.leaf_path(source_file_name)?)?;
+        let destination = wide_path(&self.leaf_path(destination_file_name)?)?;
+        let moved = unsafe {
+            // Omitting MOVEFILE_REPLACE_EXISTING makes the unique tombstone or
+            // failed-sidecar name a no-clobber destination. WRITE_THROUGH does
+            // not report success until the same-volume rename is durable.
+            MoveFileExW(
+                source.as_ptr(),
+                destination.as_ptr(),
+                MOVEFILE_WRITE_THROUGH,
+            )
+        };
+        if moved == 0 {
+            let code = unsafe { GetLastError() };
+            if matches!(code, ERROR_ALREADY_EXISTS | ERROR_FILE_EXISTS) {
+                return Err(StorageError::new(StorageErrorKind::StateConflict));
+            }
+            return Err(win32_error(StorageErrorKind::OperationFailed, code));
+        }
+        Ok(())
+    }
+
+    pub(super) fn sqlite_leaf_path(&self, file_name: &str) -> PathBuf {
+        // SQLite receives only fixed database names or filenames accepted by
+        // the migration-backup parser before reaching this platform helper.
+        self.root.join(file_name)
+    }
+
+    fn leaf_path(&self, file_name: &str) -> Result<PathBuf, StorageError> {
+        if file_name.is_empty()
+            || file_name
+                .chars()
+                .any(|character| matches!(character, '/' | '\\' | ':'))
+            || file_name == "."
+            || file_name == ".."
+        {
+            return Err(StorageError::new(StorageErrorKind::UnsafeStatePath));
+        }
+        Ok(self.root.join(file_name))
+    }
+
     pub(super) fn sync(&self) -> Result<(), StorageError> {
-        // The backup and manifest handles are both flushed before this call.
-        // Windows has no portable equivalent of Unix directory fsync:
-        // FlushFileBuffers requires GENERIC_WRITE, but normal directory handles
-        // reject that access with ERROR_ACCESS_DENIED. Flushing each new file
-        // also flushes its metadata, so no separate directory flush is needed.
+        // Windows has no portable ordinary-directory fsync. Callers flush new
+        // file contents directly and use MOVEFILE_WRITE_THROUGH for every
+        // metadata transition that must be crash-recoverable. Deletion occurs
+        // only after such a move into the independently retryable namespace.
         Ok(())
     }
 }
@@ -327,7 +467,11 @@ impl PrivateDescriptor {
             kind.sddl_flags(),
             process_sid.sddl
         );
-        let wide = wide_string(&sddl)?;
+        Self::from_sddl(&sddl)
+    }
+
+    fn from_sddl(sddl: &str) -> Result<Self, StorageError> {
+        let wide = wide_string(sddl)?;
         let mut descriptor: PSECURITY_DESCRIPTOR = null_mut();
         let converted = unsafe {
             ConvertStringSecurityDescriptorToSecurityDescriptorW(
@@ -367,6 +511,80 @@ impl PrivateDescriptor {
             bInheritHandle: 0,
         }
     }
+}
+
+pub(super) fn leaf_identity(
+    file: &File,
+    fallback: StorageErrorKind,
+) -> Result<LeafIdentity, StorageError> {
+    let handle = file.as_raw_handle();
+    let mut information = BY_HANDLE_FILE_INFORMATION::default();
+    let loaded = unsafe { GetFileInformationByHandle(handle, &mut information) };
+    if loaded == 0 {
+        return Err(last_error(fallback));
+    }
+    Ok(LeafIdentity {
+        volume_serial_number: information.dwVolumeSerialNumber,
+        file_index: (u64::from(information.nFileIndexHigh) << 32)
+            | u64::from(information.nFileIndexLow),
+    })
+}
+
+fn handle_identity(
+    handle: &OwnedHandle,
+    fallback: StorageErrorKind,
+) -> Result<LeafIdentity, StorageError> {
+    let mut information = BY_HANDLE_FILE_INFORMATION::default();
+    let loaded = unsafe { GetFileInformationByHandle(raw_handle(handle), &mut information) };
+    if loaded == 0 {
+        return Err(last_error(fallback));
+    }
+    Ok(LeafIdentity {
+        volume_serial_number: information.dwVolumeSerialNumber,
+        file_index: (u64::from(information.nFileIndexHigh) << 32)
+            | u64::from(information.nFileIndexLow),
+    })
+}
+
+#[cfg(test)]
+pub(super) fn create_file_symlink_for_test(source: &Path, destination: &Path) -> io::Result<()> {
+    std::os::windows::fs::symlink_file(source, destination)
+}
+
+#[cfg(test)]
+pub(super) fn broaden_leaf_dacl_for_test(path: &Path) -> Result<(), StorageError> {
+    let descriptor = PrivateDescriptor::from_sddl("D:(A;;FA;;;WD)")?;
+    let wide = wide_path(path)?;
+    let raw = unsafe {
+        CreateFileW(
+            wide.as_ptr(),
+            READ_CONTROL | WRITE_DAC,
+            FILE_SHARE_READ | FILE_SHARE_WRITE,
+            null(),
+            OPEN_EXISTING,
+            FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT,
+            null_mut(),
+        )
+    };
+    if raw == INVALID_HANDLE_VALUE {
+        return Err(last_error(StorageErrorKind::OperationFailed));
+    }
+    let handle = unsafe { OwnedHandle::from_raw_handle(raw) };
+    let status = unsafe {
+        SetSecurityInfo(
+            raw_handle(&handle),
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION,
+            null_mut(),
+            null_mut(),
+            descriptor.dacl()?,
+            null_mut(),
+        )
+    };
+    if status != ERROR_SUCCESS {
+        return Err(win32_error(StorageErrorKind::OperationFailed, status));
+    }
+    Ok(())
 }
 
 struct LocalMemory(*mut c_void);

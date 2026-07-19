@@ -1,5 +1,6 @@
 use super::codec::{format_time, parse_time, validated_private_reference};
-use super::{Storage, StorageError, StorageErrorKind, sqlite_error};
+use super::{LeaseOwner, Storage, StorageError, StorageErrorKind, sqlite_error};
+use crate::runtime::VerifiedSetupPostconditions;
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 use satelle_core::session::DesktopBindingRef;
 use std::collections::{HashMap, HashSet};
@@ -9,6 +10,36 @@ const OUTCOME_UNKNOWN_RECOVERY_HINT: &str =
     "inspect live postconditions before retrying this action";
 const MAX_ACTION_LABEL_BYTES: usize = 256;
 const MAX_RECOVERY_HINT_BYTES: usize = 512;
+
+/// In-process authority for one live Host maintenance operation.
+///
+/// `LeaseOwner` remains durable identity. This non-Clone capability can only
+/// be constructed here after the setup ledger and lease commit together.
+pub(crate) struct MaintenanceLeaseCapability {
+    owner: LeaseOwner,
+}
+
+impl MaintenanceLeaseCapability {
+    fn new(owner: LeaseOwner) -> Self {
+        Self { owner }
+    }
+
+    pub(crate) fn operation_id(&self) -> &str {
+        self.owner.operation_id()
+    }
+
+    pub(crate) fn lease_owner(&self) -> &LeaseOwner {
+        &self.owner
+    }
+}
+
+impl std::fmt::Debug for MaintenanceLeaseCapability {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("MaintenanceLeaseCapability")
+            .finish_non_exhaustive()
+    }
+}
 
 enum StartedActionOutcome<'a> {
     Completed,
@@ -442,6 +473,43 @@ pub struct SetupRepairPlan {
     actions: Vec<SetupRepairAction>,
 }
 
+pub(crate) struct MaintenanceRecoverySubject {
+    owner: LeaseOwner,
+    run: SetupRunRecord,
+    has_postcheck: bool,
+}
+
+impl MaintenanceRecoverySubject {
+    pub(super) fn new(owner: LeaseOwner, run: SetupRunRecord, has_postcheck: bool) -> Self {
+        Self {
+            owner,
+            run,
+            has_postcheck,
+        }
+    }
+
+    pub(crate) fn operation_id(&self) -> &str {
+        self.owner.operation_id()
+    }
+
+    pub(crate) const fn operation_kind(&self) -> SetupOperationKind {
+        self.run.operation_kind()
+    }
+
+    pub(crate) fn run(&self) -> &SetupRunRecord {
+        &self.run
+    }
+
+    pub(crate) const fn has_postcheck(&self) -> bool {
+        self.has_postcheck
+    }
+}
+
+pub(crate) enum MaintenanceLeaseState {
+    Active { operation_id: String },
+    RecoveryPending(Box<MaintenanceRecoverySubject>),
+}
+
 impl SetupRepairPlan {
     pub fn actions(&self) -> &[SetupRepairAction] {
         &self.actions
@@ -462,17 +530,44 @@ struct PreviousSetupAction {
 }
 
 impl Storage {
-    pub(crate) fn begin_setup_run(&mut self, plan: &SetupRunPlan) -> Result<(), StorageError> {
+    pub(crate) fn begin_setup_run(
+        &mut self,
+        plan: &SetupRunPlan,
+        owner: LeaseOwner,
+    ) -> Result<MaintenanceLeaseCapability, StorageError> {
+        if plan.run_id != owner.operation_id {
+            return Err(StorageError::new(StorageErrorKind::InvalidInput));
+        }
         let host_identity = self.host_identity()?;
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|source| sqlite_error(StorageErrorKind::OperationFailed, source))?;
+        let maintenance_exists: i64 = transaction
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM maintenance_leases WHERE host_identity_ref = ?1)",
+                [host_identity.as_str()],
+                |row| row.get(0),
+            )
+            .map_err(|source| sqlite_error(StorageErrorKind::OperationFailed, source))?;
+        if maintenance_exists != 0 {
+            return Err(StorageError::new(StorageErrorKind::LeaseConflict));
+        }
         // Planning and execution are separate API calls. Reserving mutation
         // scope inside the write transaction closes the race between callers
         // that both planned before either persisted its run.
         if active_setup_run_in_scope(&transaction, plan.desktop_binding.as_ref())? {
             return Err(StorageError::new(StorageErrorKind::StateConflict));
+        }
+        let control_exists: i64 = transaction
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM control_leases WHERE host_identity_ref = ?1)",
+                [host_identity.as_str()],
+                |row| row.get(0),
+            )
+            .map_err(|source| sqlite_error(StorageErrorKind::OperationFailed, source))?;
+        if control_exists != 0 {
+            return Err(StorageError::new(StorageErrorKind::LeaseConflict));
         }
         transaction
             .execute(
@@ -511,23 +606,42 @@ impl Storage {
                 .map_err(setup_write_error)?;
         }
         transaction
+            .execute(
+                "INSERT INTO maintenance_leases (
+                    host_identity_ref, operation_id, owner_process_id,
+                    owner_process_start_ref, owner_boot_identity_ref,
+                    acquired_at, heartbeat_at, lease_state
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6, 'active')",
+                params![
+                    host_identity.as_str(),
+                    owner.operation_id.as_str(),
+                    i64::from(owner.process_id),
+                    owner.process_start_ref.as_str(),
+                    owner.boot_identity_ref.as_str(),
+                    format_time(owner.acquired_at)?,
+                ],
+            )
+            .map_err(|source| sqlite_error(StorageErrorKind::LeaseConflict, source))?;
+        transaction
             .commit()
-            .map_err(|source| sqlite_error(StorageErrorKind::OperationFailed, source))
+            .map_err(|source| sqlite_error(StorageErrorKind::OperationFailed, source))?;
+        Ok(MaintenanceLeaseCapability::new(owner))
     }
 
     pub(crate) fn start_setup_action(
         &mut self,
-        run_id: &str,
+        capability: &MaintenanceLeaseCapability,
         action_id: &str,
         started_at: OffsetDateTime,
     ) -> Result<(), StorageError> {
-        let run_id = validated_private_reference(run_id.to_string())?;
+        let run_id = capability.operation_id();
         let action_id = validated_private_reference(action_id.to_string())?;
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|source| sqlite_error(StorageErrorKind::OperationFailed, source))?;
-        require_run_and_predecessor_times(&transaction, &run_id, &action_id, started_at)?;
+        require_active_maintenance_owner(&transaction, capability)?;
+        require_run_and_predecessor_times(&transaction, run_id, &action_id, started_at)?;
         let changed = transaction
             .execute(
                 "UPDATE setup_actions
@@ -555,12 +669,12 @@ impl Storage {
 
     pub(crate) fn complete_setup_action_after_verified_postcondition(
         &mut self,
-        run_id: &str,
+        capability: &MaintenanceLeaseCapability,
         action_id: &str,
         completed_at: OffsetDateTime,
     ) -> Result<(), StorageError> {
         self.transition_started_action(
-            run_id,
+            capability,
             action_id,
             StartedActionOutcome::Completed,
             completed_at,
@@ -569,7 +683,7 @@ impl Storage {
 
     pub(crate) fn fail_setup_action(
         &mut self,
-        run_id: &str,
+        capability: &MaintenanceLeaseCapability,
         action_id: &str,
         error_code: &str,
         exit_status: Option<i64>,
@@ -581,7 +695,7 @@ impl Storage {
             .map(|hint| normalized_text(hint.to_string(), MAX_RECOVERY_HINT_BYTES))
             .transpose()?;
         self.transition_started_action(
-            run_id,
+            capability,
             action_id,
             StartedActionOutcome::Failed {
                 error_code: &error_code,
@@ -594,18 +708,19 @@ impl Storage {
 
     pub(crate) fn skip_setup_action(
         &mut self,
-        run_id: &str,
+        capability: &MaintenanceLeaseCapability,
         action_id: &str,
         reason: SetupActionSkipReason,
         skipped_at: OffsetDateTime,
     ) -> Result<(), StorageError> {
-        let run_id = validated_private_reference(run_id.to_string())?;
+        let run_id = capability.operation_id();
         let action_id = validated_private_reference(action_id.to_string())?;
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|source| sqlite_error(StorageErrorKind::OperationFailed, source))?;
-        require_run_and_predecessor_times(&transaction, &run_id, &action_id, skipped_at)?;
+        require_active_maintenance_owner(&transaction, capability)?;
+        require_run_and_predecessor_times(&transaction, run_id, &action_id, skipped_at)?;
         let changed = transaction
             .execute(
                 "UPDATE setup_actions
@@ -631,58 +746,174 @@ impl Storage {
             .map_err(|source| sqlite_error(StorageErrorKind::OperationFailed, source))
     }
 
-    pub(crate) fn finish_setup_run(
+    /// Commits the terminal setup ledger state and releases Host maintenance
+    /// ownership in the same SQLite transaction. Operations with a live
+    /// postcheck must use the operational postcheck finalizer instead.
+    pub(crate) fn finish_setup_run_and_release_maintenance(
         &mut self,
-        run_id: &str,
+        capability: &MaintenanceLeaseCapability,
         finished_at: OffsetDateTime,
     ) -> Result<SetupRunStatus, StorageError> {
-        let run_id = validated_private_reference(run_id.to_string())?;
+        let owner = capability.lease_owner();
+        let run_id = capability.operation_id();
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|source| sqlite_error(StorageErrorKind::OperationFailed, source))?;
-        require_running_run(&transaction, &run_id)?;
-        require_run_finish_time(&transaction, &run_id, finished_at)?;
-        let (pending, completed, failed, unknown): (i64, i64, i64, i64) = transaction
-            .query_row(
-                "SELECT
-                    sum(CASE WHEN status IN ('planned', 'started') THEN 1 ELSE 0 END),
-                    sum(CASE WHEN status = 'completed' THEN 1 ELSE 0 END),
-                    sum(CASE
-                        WHEN status = 'failed'
-                          OR (status = 'skipped' AND skip_reason = 'dependency_failed')
-                        THEN 1 ELSE 0
-                    END),
-                    sum(CASE WHEN status = 'outcome_unknown' THEN 1 ELSE 0 END)
-                 FROM setup_actions WHERE run_id = ?1",
-                [&run_id],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
-            )
-            .map_err(|source| sqlite_error(StorageErrorKind::InvalidStoredState, source))?;
-        if pending != 0 {
-            return Err(StorageError::new(StorageErrorKind::StateConflict));
-        }
-        let status = if unknown != 0 {
-            SetupRunStatus::OutcomeUnknown
-        } else if failed == 0 {
-            SetupRunStatus::Completed
-        } else if completed == 0 {
-            SetupRunStatus::Failed
-        } else {
-            SetupRunStatus::PartialFailure
-        };
-        let changed = transaction
+        require_active_maintenance_owner(&transaction, capability)?;
+        let status = finish_setup_run_in_transaction(&transaction, run_id, finished_at)?;
+        let released = transaction
             .execute(
-                "UPDATE setup_runs SET status = ?2, finished_at = ?3
-                 WHERE run_id = ?1 AND status = 'running'",
-                params![run_id, status.as_str(), format_time(finished_at)?],
+                "DELETE FROM maintenance_leases
+                 WHERE operation_id = ?1
+                   AND owner_process_id = ?2
+                   AND owner_process_start_ref = ?3
+                   AND owner_boot_identity_ref = ?4
+                   AND acquired_at = ?5
+                   AND lease_state = 'active'
+                   AND NOT EXISTS (
+                       SELECT 1 FROM control_leases
+                       WHERE control_leases.operation_id = maintenance_leases.operation_id
+                   )",
+                params![
+                    run_id,
+                    i64::from(owner.process_id),
+                    owner.process_start_ref.as_str(),
+                    owner.boot_identity_ref.as_str(),
+                    format_time(owner.acquired_at)?,
+                ],
             )
             .map_err(|source| sqlite_error(StorageErrorKind::OperationFailed, source))?;
-        require_one_transition(changed)?;
+        require_one_transition(released)?;
         transaction
             .commit()
             .map_err(|source| sqlite_error(StorageErrorKind::OperationFailed, source))?;
         Ok(status)
+    }
+
+    /// Commits live postcondition reconciliation and releases the exact
+    /// restart-preserved owner in one transaction. Any unknown or missing
+    /// postcondition leaves the ledger and ownership untouched.
+    pub(crate) fn reconcile_maintenance_after_restart(
+        &mut self,
+        subject: &MaintenanceRecoverySubject,
+        verified: &VerifiedSetupPostconditions,
+    ) -> Result<Option<SetupRunStatus>, StorageError> {
+        if subject.has_postcheck() {
+            // A postcheck needs its readiness-specific recovery observation;
+            // action probes alone cannot truthfully finalize that Control Lease.
+            return Ok(None);
+        }
+        let mut outcomes = Vec::new();
+        for action in subject.run().actions() {
+            if action.status() != SetupActionStatus::OutcomeUnknown {
+                continue;
+            }
+            let satisfied = verified
+                .outcome(action.action_id())
+                .ok_or_else(|| StorageError::new(StorageErrorKind::InvalidInput))?;
+            outcomes.push((action.action_id(), satisfied));
+        }
+        let unsatisfied_code = match subject.operation_kind() {
+            SetupOperationKind::Setup => "setup_postcondition_unsatisfied",
+            SetupOperationKind::Repair => "repair_postcondition_unsatisfied",
+        };
+        let owner = &subject.owner;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|source| sqlite_error(StorageErrorKind::OperationFailed, source))?;
+        let reconciled_at = subject
+            .run()
+            .actions()
+            .iter()
+            .filter_map(SetupActionRecord::finished_at)
+            .fold(
+                OffsetDateTime::now_utc().max(subject.run().started_at()),
+                OffsetDateTime::max,
+            );
+        require_recovery_maintenance_owner(&transaction, subject)?;
+        for (action_id, satisfied) in outcomes {
+            let (status, error_code, recovery_hint) = if satisfied {
+                ("completed", None, None)
+            } else {
+                (
+                    "failed",
+                    Some(unsatisfied_code),
+                    Some("inspect the failed postcondition before retrying maintenance"),
+                )
+            };
+            require_one_transition(
+                transaction
+                    .execute(
+                        "UPDATE setup_actions
+                         SET status = ?3, finished_at = ?4, error_code = ?5,
+                             recovery_hint = ?6
+                         WHERE run_id = ?1 AND action_id = ?2
+                           AND status = 'outcome_unknown'",
+                        params![
+                            subject.operation_id(),
+                            action_id,
+                            status,
+                            format_time(reconciled_at)?,
+                            error_code,
+                            recovery_hint,
+                        ],
+                    )
+                    .map_err(|source| sqlite_error(StorageErrorKind::OperationFailed, source))?,
+            )?;
+        }
+        transaction
+            .execute(
+                "UPDATE setup_actions
+                 SET status = 'skipped', finished_at = ?2,
+                     skip_reason = 'dependency_failed'
+                 WHERE run_id = ?1 AND status = 'planned'",
+                params![subject.operation_id(), format_time(reconciled_at)?],
+            )
+            .map_err(|source| sqlite_error(StorageErrorKind::OperationFailed, source))?;
+        let status = terminal_setup_status(&transaction, subject.operation_id())?;
+        require_one_transition(
+            transaction
+                .execute(
+                    "UPDATE setup_runs SET status = ?2, finished_at = ?3
+                     WHERE run_id = ?1 AND status = 'outcome_unknown'",
+                    params![
+                        subject.operation_id(),
+                        status.as_str(),
+                        format_time(reconciled_at)?,
+                    ],
+                )
+                .map_err(|source| sqlite_error(StorageErrorKind::OperationFailed, source))?,
+        )?;
+        require_one_transition(
+            transaction
+                .execute(
+                    "DELETE FROM maintenance_leases
+                     WHERE operation_id = ?1
+                       AND owner_process_id = ?2
+                       AND owner_process_start_ref = ?3
+                       AND owner_boot_identity_ref = ?4
+                       AND acquired_at = ?5
+                       AND lease_state = 'recovery_pending'
+                       AND NOT EXISTS (
+                           SELECT 1 FROM control_leases
+                           WHERE control_leases.operation_id = maintenance_leases.operation_id
+                       )",
+                    params![
+                        owner.operation_id.as_str(),
+                        i64::from(owner.process_id),
+                        owner.process_start_ref.as_str(),
+                        owner.boot_identity_ref.as_str(),
+                        format_time(owner.acquired_at)?,
+                    ],
+                )
+                .map_err(|source| sqlite_error(StorageErrorKind::OperationFailed, source))?,
+        )?;
+        transaction
+            .commit()
+            .map_err(|source| sqlite_error(StorageErrorKind::OperationFailed, source))?;
+        Ok(Some(status))
     }
 
     pub(crate) fn load_setup_run(
@@ -923,12 +1154,12 @@ impl Storage {
 
     fn transition_started_action(
         &mut self,
-        run_id: &str,
+        capability: &MaintenanceLeaseCapability,
         action_id: &str,
         outcome: StartedActionOutcome<'_>,
         finished_at: OffsetDateTime,
     ) -> Result<(), StorageError> {
-        let run_id = validated_private_reference(run_id.to_string())?;
+        let run_id = capability.operation_id();
         let action_id = validated_private_reference(action_id.to_string())?;
         let (status, error_code, exit_status, recovery_hint) = match outcome {
             StartedActionOutcome::Completed => ("completed", None, None, None),
@@ -942,7 +1173,8 @@ impl Storage {
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|source| sqlite_error(StorageErrorKind::OperationFailed, source))?;
-        require_started_action_time(&transaction, &run_id, &action_id, finished_at)?;
+        require_active_maintenance_owner(&transaction, capability)?;
+        require_started_action_time(&transaction, run_id, &action_id, finished_at)?;
         let changed = transaction
             .execute(
                 "UPDATE setup_actions
@@ -1072,10 +1304,96 @@ impl Storage {
                 .map_err(|source| sqlite_error(StorageErrorKind::OperationFailed, source))?;
             require_one_transition(changed)?;
         }
+        // A restart never infers that the previous process's external side
+        // effect stopped. Durable ownership remains present but changes to the
+        // canonical recovery state until action postconditions are reconciled.
+        transaction
+            .execute(
+                "UPDATE maintenance_leases
+                 SET lease_state = 'recovery_pending'
+                 WHERE lease_state = 'active'",
+                [],
+            )
+            .map_err(|source| sqlite_error(StorageErrorKind::OperationFailed, source))?;
         transaction
             .commit()
             .map_err(|source| sqlite_error(StorageErrorKind::OperationFailed, source))
     }
+}
+
+pub(super) fn finish_setup_run_in_transaction(
+    transaction: &Transaction<'_>,
+    run_id: &str,
+    finished_at: OffsetDateTime,
+) -> Result<SetupRunStatus, StorageError> {
+    require_running_run(transaction, run_id)?;
+    require_run_finish_time(transaction, run_id, finished_at)?;
+    let (pending, completed, failed, unknown): (i64, i64, i64, i64) = transaction
+        .query_row(
+            "SELECT
+                sum(CASE WHEN status IN ('planned', 'started') THEN 1 ELSE 0 END),
+                sum(CASE WHEN status = 'completed' THEN 1 ELSE 0 END),
+                sum(CASE
+                    WHEN status = 'failed'
+                      OR (status = 'skipped' AND skip_reason = 'dependency_failed')
+                    THEN 1 ELSE 0
+                END),
+                sum(CASE WHEN status = 'outcome_unknown' THEN 1 ELSE 0 END)
+             FROM setup_actions WHERE run_id = ?1",
+            [run_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .map_err(|source| sqlite_error(StorageErrorKind::InvalidStoredState, source))?;
+    if pending != 0 {
+        return Err(StorageError::new(StorageErrorKind::StateConflict));
+    }
+    let status = if unknown != 0 {
+        SetupRunStatus::OutcomeUnknown
+    } else if failed == 0 {
+        SetupRunStatus::Completed
+    } else if completed == 0 {
+        SetupRunStatus::Failed
+    } else {
+        SetupRunStatus::PartialFailure
+    };
+    let changed = transaction
+        .execute(
+            "UPDATE setup_runs SET status = ?2, finished_at = ?3
+             WHERE run_id = ?1 AND status = 'running'",
+            params![run_id, status.as_str(), format_time(finished_at)?],
+        )
+        .map_err(|source| sqlite_error(StorageErrorKind::OperationFailed, source))?;
+    require_one_transition(changed)?;
+    Ok(status)
+}
+
+pub(super) fn mark_setup_run_outcome_unknown_in_transaction(
+    transaction: &Transaction<'_>,
+    run_id: &str,
+    detected_at: OffsetDateTime,
+) -> Result<(), StorageError> {
+    let changed = transaction
+        .execute(
+            "UPDATE setup_actions
+             SET status = 'outcome_unknown', finished_at = ?2,
+                 recovery_hint = ?3
+             WHERE run_id = ?1 AND status = 'started'",
+            params![
+                run_id,
+                format_time(detected_at)?,
+                OUTCOME_UNKNOWN_RECOVERY_HINT,
+            ],
+        )
+        .map_err(|source| sqlite_error(StorageErrorKind::OperationFailed, source))?;
+    let _started_actions = changed;
+    let changed = transaction
+        .execute(
+            "UPDATE setup_runs SET status = 'outcome_unknown', finished_at = ?2
+             WHERE run_id = ?1 AND status = 'running'",
+            params![run_id, format_time(detected_at)?],
+        )
+        .map_err(|source| sqlite_error(StorageErrorKind::OperationFailed, source))?;
+    require_one_transition(changed)
 }
 
 fn active_setup_run_in_scope(
@@ -1116,6 +1434,104 @@ fn require_running_run(transaction: &Transaction<'_>, run_id: &str) -> Result<()
     } else {
         Err(StorageError::new(StorageErrorKind::StateConflict))
     }
+}
+
+fn require_active_maintenance_owner(
+    transaction: &Transaction<'_>,
+    capability: &MaintenanceLeaseCapability,
+) -> Result<(), StorageError> {
+    let owner = capability.lease_owner();
+    let owned: i64 = transaction
+        .query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM maintenance_leases
+                WHERE operation_id = ?1
+                  AND owner_process_id = ?2
+                  AND owner_process_start_ref = ?3
+                  AND owner_boot_identity_ref = ?4
+                  AND acquired_at = ?5
+                  AND lease_state = 'active'
+             )",
+            params![
+                owner.operation_id.as_str(),
+                i64::from(owner.process_id),
+                owner.process_start_ref.as_str(),
+                owner.boot_identity_ref.as_str(),
+                format_time(owner.acquired_at)?,
+            ],
+            |row| row.get(0),
+        )
+        .map_err(|source| sqlite_error(StorageErrorKind::OperationFailed, source))?;
+    if owned == 1 {
+        Ok(())
+    } else {
+        Err(StorageError::new(StorageErrorKind::StateConflict))
+    }
+}
+
+fn require_recovery_maintenance_owner(
+    transaction: &Transaction<'_>,
+    subject: &MaintenanceRecoverySubject,
+) -> Result<(), StorageError> {
+    let owner = &subject.owner;
+    let owned: i64 = transaction
+        .query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM maintenance_leases
+                JOIN setup_runs ON setup_runs.run_id = maintenance_leases.operation_id
+                WHERE maintenance_leases.operation_id = ?1
+                  AND maintenance_leases.owner_process_id = ?2
+                  AND maintenance_leases.owner_process_start_ref = ?3
+                  AND maintenance_leases.owner_boot_identity_ref = ?4
+                  AND maintenance_leases.acquired_at = ?5
+                  AND maintenance_leases.lease_state = 'recovery_pending'
+                  AND setup_runs.status = 'outcome_unknown'
+             )",
+            params![
+                owner.operation_id.as_str(),
+                i64::from(owner.process_id),
+                owner.process_start_ref.as_str(),
+                owner.boot_identity_ref.as_str(),
+                format_time(owner.acquired_at)?,
+            ],
+            |row| row.get(0),
+        )
+        .map_err(|source| sqlite_error(StorageErrorKind::OperationFailed, source))?;
+    if owned == 1 {
+        Ok(())
+    } else {
+        Err(StorageError::new(StorageErrorKind::StateConflict))
+    }
+}
+
+fn terminal_setup_status(
+    transaction: &Transaction<'_>,
+    run_id: &str,
+) -> Result<SetupRunStatus, StorageError> {
+    let (pending, completed, failed, unknown): (i64, i64, i64, i64) = transaction
+        .query_row(
+            "SELECT
+                sum(CASE WHEN status IN ('planned', 'started') THEN 1 ELSE 0 END),
+                sum(CASE WHEN status = 'completed' THEN 1 ELSE 0 END),
+                sum(CASE WHEN status = 'failed' OR
+                    (status = 'skipped' AND skip_reason = 'dependency_failed')
+                    THEN 1 ELSE 0 END),
+                sum(CASE WHEN status = 'outcome_unknown' THEN 1 ELSE 0 END)
+             FROM setup_actions WHERE run_id = ?1",
+            [run_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .map_err(|source| sqlite_error(StorageErrorKind::InvalidStoredState, source))?;
+    if pending != 0 || unknown != 0 {
+        return Err(StorageError::new(StorageErrorKind::StateConflict));
+    }
+    Ok(if failed == 0 {
+        SetupRunStatus::Completed
+    } else if completed == 0 {
+        SetupRunStatus::Failed
+    } else {
+        SetupRunStatus::PartialFailure
+    })
 }
 
 fn require_run_and_predecessor_times(

@@ -51,7 +51,11 @@ where
         let body = match read_bounded_body(request.into_body(), limit).await {
             Ok(body) => body,
             Err(BoundedBodyError::TooLarge) => {
-                return Err(payload_too_large(state, &authorized));
+                return Err(payload_too_large(
+                    state,
+                    &authorized,
+                    "the request body exceeds the advertised JSON body limit",
+                ));
             }
             Err(BoundedBodyError::Read) => {
                 return Err(invalid_request(
@@ -96,6 +100,13 @@ where
                     message: "the request schema_version is unsupported",
                     details: None,
                 },
+            ));
+        }
+        if T::exceeds_attachment_limit(&value) {
+            return Err(payload_too_large(
+                state,
+                &authorized,
+                "the request exceeds the advertised attachment limit",
             ));
         }
         let decoded = serde_json::from_value(value).map_err(|_| {
@@ -259,7 +270,11 @@ pub(super) fn has_json_content_type(headers: &axum::http::HeaderMap) -> bool {
     })
 }
 
-fn payload_too_large(state: &DaemonState, authorized: &AuthorizedRequest) -> Response {
+fn payload_too_large(
+    state: &DaemonState,
+    authorized: &AuthorizedRequest,
+    message: &'static str,
+) -> Response {
     api_error_response(
         authorized.request_id().clone(),
         Some(state.host_identity.clone()),
@@ -268,7 +283,7 @@ fn payload_too_large(state: &DaemonState, authorized: &AuthorizedRequest) -> Res
             code: ApiErrorCode::PayloadTooLarge,
             category: ApiErrorCategory::Capacity,
             retryable: false,
-            message: "the request body exceeds the advertised JSON body limit",
+            message,
             details: None,
         },
     )

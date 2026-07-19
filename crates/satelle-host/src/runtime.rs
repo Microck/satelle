@@ -21,27 +21,33 @@ pub use adapter::{
     ProviderSmokeFailureEvidence, ProviderSmokeResult, ProviderSmokeSource, ReadinessCacheKey,
     ReadinessEvidence, RecoveryObservation,
 };
-use adapter::{NativeProbeResult, ReadinessProbeDriver};
+pub(crate) use adapter::{NativeProbeResult, ReadinessProbeDriver};
 pub(crate) use codex_adapter::ProductionComputerUseAdapter;
 pub(crate) use request::{RequestIdentity, RunCommand, SteerCommand, StopCommand};
 pub(crate) use stop::RuntimeStopOutcome;
-use worker::{ExecutionPlan, TurnWork, WorkerRegistry};
+use worker::{
+    ExecutionPlan, LeaseHeartbeatGuard, MaintenanceOperationGuard, TurnWork, WorkerRegistry,
+};
 
 use crate::live_events::LiveEventHub;
 use crate::process_identity::ProcessIdentity;
 use crate::storage::{
     AdmissionOutcome, ApiTokenRegistration, IdempotentOperation, LeaseOwner, LogPageStorageError,
-    ObservedUpstreamRef, ReadinessProbeKind, ReadinessProbeTerminal, SensitiveRequestDigest,
-    SetupActionSkipReason, SetupRepairPlan, SetupRepairProbe, SetupRunPlan, SetupRunRecord,
-    SetupRunStatus, Storage, StorageSnapshot,
+    ObservedUpstreamRef, OperatorLogMirror, OperatorLogPolicy, ReadinessProbeKind,
+    ReadinessProbeTerminal, SensitiveRequestDigest, SetupActionSkipReason, SetupRepairPlan,
+    SetupRepairProbe, SetupRunPlan, SetupRunRecord, SetupRunStatus, Storage, StorageSnapshot,
 };
 use crate::{ApiBearerToken, ApiPrincipal, DaemonLogPage, LogCursor, LogPageQuery};
 use recovery::RecoveryQueue;
+pub(crate) use recovery::VerifiedSetupPostconditions;
+#[cfg(test)]
+pub(crate) use recovery::verify_setup_postconditions;
 use satelle_core::session::{DesktopBindingRef, PublicSession, TurnAdmissionFailure};
 use satelle_core::{
     ControlPlaneOperation, ErrorCode, LOCAL_DEMO_HOST, SatelleError, SatelleEvent, SessionId,
     TurnId,
 };
+use std::ops::{Deref, DerefMut};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
 
@@ -49,6 +55,119 @@ use std::sync::{Arc, Mutex, MutexGuard};
 pub(crate) struct RuntimeTurnOutcome {
     pub(crate) session: PublicSession,
     pub(crate) events: Vec<SatelleEvent>,
+}
+
+struct AdmissionExecution<'a> {
+    host: &'a str,
+    prompt: &'a str,
+    execution_mode: satelle_core::session::TurnExecutionMode,
+    dispatch_preference: request::DispatchPreference,
+    provider_smoke_event: Option<satelle_core::SatelleEventBody>,
+}
+
+/// Exclusive in-process authority for one live setup or repair operation.
+///
+/// The handle is intentionally non-Clone. Dropping it without a successful
+/// terminal commit synchronously stops its heartbeat and retains the exact
+/// durable owner as recovery_pending.
+pub struct MaintenanceOperationHandle {
+    operation_id: String,
+    operation: Option<MaintenanceOperationGuard>,
+}
+
+impl MaintenanceOperationHandle {
+    pub fn operation_id(&self) -> &str {
+        &self.operation_id
+    }
+
+    fn operation(&self) -> Result<&MaintenanceOperationGuard, crate::storage::StorageError> {
+        self.operation
+            .as_ref()
+            .ok_or_else(crate::storage::StorageError::state_conflict)
+    }
+
+    fn disarm(&mut self) {
+        if let Some(operation) = self.operation.as_mut() {
+            operation.disarm();
+        }
+        drop(self.operation.take());
+    }
+}
+
+impl std::fmt::Debug for MaintenanceOperationHandle {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("MaintenanceOperationHandle")
+            .finish_non_exhaustive()
+    }
+}
+
+pub(crate) struct VerifiedMaintenancePostcheck {
+    evidence: Option<ReadinessEvidence>,
+    outcome: VerifiedMaintenancePostcheckOutcome,
+}
+
+#[derive(Clone, Copy)]
+enum VerifiedMaintenancePostcheckOutcome {
+    Passed,
+    Failed {
+        reason: &'static str,
+        terminal: ReadinessProbeTerminal,
+    },
+    Unknown,
+}
+
+impl VerifiedMaintenancePostcheck {
+    fn passed(evidence: ReadinessEvidence) -> Self {
+        Self {
+            evidence: Some(evidence),
+            outcome: VerifiedMaintenancePostcheckOutcome::Passed,
+        }
+    }
+
+    fn failed(
+        evidence: ReadinessEvidence,
+        reason: &'static str,
+        terminal: ReadinessProbeTerminal,
+    ) -> Self {
+        Self {
+            evidence: Some(evidence),
+            outcome: VerifiedMaintenancePostcheckOutcome::Failed { reason, terminal },
+        }
+    }
+
+    fn unknown() -> Self {
+        Self {
+            evidence: None,
+            outcome: VerifiedMaintenancePostcheckOutcome::Unknown,
+        }
+    }
+
+    pub(crate) fn evidence(&self) -> Option<&ReadinessEvidence> {
+        self.evidence.as_ref()
+    }
+
+    pub(crate) const fn terminal(&self) -> Option<ReadinessProbeTerminal> {
+        match self.outcome {
+            VerifiedMaintenancePostcheckOutcome::Passed => None,
+            VerifiedMaintenancePostcheckOutcome::Failed { terminal, .. } => Some(terminal),
+            VerifiedMaintenancePostcheckOutcome::Unknown => {
+                Some(ReadinessProbeTerminal::OutcomeUnknown)
+            }
+        }
+    }
+
+    pub(crate) const fn failure_reason(&self) -> Option<&'static str> {
+        match self.outcome {
+            VerifiedMaintenancePostcheckOutcome::Failed { reason, .. } => Some(reason),
+            VerifiedMaintenancePostcheckOutcome::Passed
+            | VerifiedMaintenancePostcheckOutcome::Unknown => None,
+        }
+    }
+
+    pub(crate) const fn is_unknown(&self) -> bool {
+        matches!(self.outcome, VerifiedMaintenancePostcheckOutcome::Unknown)
+    }
 }
 
 impl RuntimeTurnOutcome {
@@ -93,6 +212,16 @@ pub(crate) fn idempotency_conflict() -> SatelleError {
     model::idempotency_conflict()
 }
 
+fn heartbeat_start_failure(error: std::io::Error) -> SatelleError {
+    SatelleError {
+        code: ErrorCode::HostUnreachable,
+        message: format!("the Host lease heartbeat driver could not start: {error}"),
+        recovery_command: Some("retry after verifying Host process resources".to_string()),
+        source_detail: None,
+        details: std::collections::BTreeMap::new(),
+    }
+}
+
 fn readiness_probe_terminal(
     error: &SatelleError,
     persistence_failed: bool,
@@ -116,6 +245,49 @@ fn readiness_probe_terminal(
     }
 }
 
+pub(crate) fn verify_maintenance_postcheck(
+    observation: NativeProbeResult,
+    persistence_error: Option<SatelleError>,
+) -> (VerifiedMaintenancePostcheck, Option<SatelleError>) {
+    match (observation, persistence_error) {
+        (NativeProbeResult::Passed(evidence), None) => {
+            (VerifiedMaintenancePostcheck::passed(evidence), None)
+        }
+        (NativeProbeResult::Passed(_), Some(error)) => {
+            (VerifiedMaintenancePostcheck::unknown(), Some(error))
+        }
+        (
+            NativeProbeResult::Failed {
+                evidence,
+                reason,
+                error,
+            },
+            persistence_error,
+        ) => {
+            let terminal = readiness_probe_terminal(
+                &error,
+                persistence_error.is_some(),
+                "native_readiness_cancellation",
+                Some(ErrorCode::NativeReadinessTimeout),
+            );
+            if terminal == ReadinessProbeTerminal::OutcomeUnknown {
+                (
+                    VerifiedMaintenancePostcheck::unknown(),
+                    Some(persistence_error.unwrap_or(error)),
+                )
+            } else {
+                (
+                    VerifiedMaintenancePostcheck::failed(evidence, reason, terminal),
+                    Some(error),
+                )
+            }
+        }
+        (NativeProbeResult::UncachedFailure(error), _) => {
+            (VerifiedMaintenancePostcheck::unknown(), Some(error))
+        }
+    }
+}
+
 fn readiness_probe_recovery_pending(kind: ReadinessProbeKind) -> SatelleError {
     let mut error = SatelleError::computer_use_not_ready();
     error.details.insert(
@@ -135,7 +307,8 @@ pub(crate) enum RuntimeStartupState {
 pub(crate) struct RuntimeEngine {
     // This is the sole SQLite owner for the runtime. The mutex protects short
     // admission/read/commit sections only and is never held across adapter I/O.
-    storage: Mutex<Storage>,
+    storage: Arc<Mutex<Storage>>,
+    operator_log: Mutex<OperatorLogMirror>,
     adapter: Arc<dyn ComputerUseAdapter>,
     readiness_probe_driver: Option<Arc<dyn ReadinessProbeDriver>>,
     recovery: Mutex<RecoveryQueue>,
@@ -172,6 +345,7 @@ impl RuntimeSnapshot {
 impl RuntimeEngine {
     fn open(
         state_root: &Path,
+        operator_log_root: PathBuf,
         adapter: Arc<dyn ComputerUseAdapter>,
         readiness_probe_driver: Option<Arc<dyn ReadinessProbeDriver>>,
     ) -> Result<Arc<Self>, SatelleError> {
@@ -179,8 +353,15 @@ impl RuntimeEngine {
             ProcessIdentity::current().map_err(model::process_identity_failure)?;
         let storage =
             Storage::open_without_restart_recovery(state_root).map_err(model::storage_failure)?;
-        Ok(Arc::new(Self {
-            storage: Mutex::new(storage),
+        let mirrored_cursor = storage
+            .latest_log_cursor()
+            .map_err(model::storage_failure)?;
+        let engine = Arc::new(Self {
+            storage: Arc::new(Mutex::new(storage)),
+            operator_log: Mutex::new(OperatorLogMirror::new(
+                OperatorLogPolicy::new(operator_log_root),
+                mirrored_cursor,
+            )),
             adapter,
             readiness_probe_driver,
             recovery: Mutex::new(RecoveryQueue::new(Vec::new())),
@@ -188,7 +369,8 @@ impl RuntimeEngine {
             workers: Mutex::new(WorkerRegistry::default()),
             live_events: LiveEventHub::new(),
             process_identity,
-        }))
+        });
+        Ok(engine)
     }
 
     fn replay_admission(
@@ -279,12 +461,15 @@ impl RuntimeEngine {
             (outcome, provider_smoke_event)
         };
         self.finish_admission(
-            command.host,
-            command.prompt,
-            command.execution_mode,
-            command.dispatch,
+            AdmissionExecution {
+                host: command.host,
+                prompt: command.prompt,
+                execution_mode: command.execution_mode,
+                dispatch_preference: command.dispatch,
+                provider_smoke_event,
+            },
             outcome,
-            provider_smoke_event,
+            context.lease_owner().clone(),
         )
     }
 
@@ -335,12 +520,15 @@ impl RuntimeEngine {
             (outcome, provider_smoke_event)
         };
         self.finish_admission(
-            LOCAL_DEMO_HOST,
-            command.prompt,
-            command.execution_mode,
-            command.dispatch,
+            AdmissionExecution {
+                host: LOCAL_DEMO_HOST,
+                prompt: command.prompt,
+                execution_mode: command.execution_mode,
+                dispatch_preference: command.dispatch,
+                provider_smoke_event,
+            },
             outcome,
-            provider_smoke_event,
+            context.lease_owner().clone(),
         )
     }
 
@@ -381,7 +569,7 @@ impl RuntimeEngine {
         }
         let requires_live_provider_probe = provider_intent.experimental()
             && (provider_intent.refresh() || cached_provider.is_none());
-        let provider_probe_ref = if requires_live_provider_probe
+        let (provider_probe_ref, _provider_heartbeat) = if requires_live_provider_probe
             && self.readiness_probe_driver.is_some()
             && let Some(key) = cache_key.as_ref()
         {
@@ -398,9 +586,18 @@ impl RuntimeEngine {
             self.lock_storage()?
                 .begin_provider_probe(key, &provider_probe_ref, &owner)
                 .map_err(model::storage_failure)?;
-            Some(provider_probe_ref)
+            let heartbeat = match LeaseHeartbeatGuard::start(Arc::clone(&self.storage), &owner) {
+                Ok(heartbeat) => heartbeat,
+                Err(error) => {
+                    self.lock_storage()?
+                        .retain_provider_probe_recovery(&provider_probe_ref)
+                        .map_err(model::storage_failure)?;
+                    return Err(heartbeat_start_failure(error));
+                }
+            };
+            (Some(provider_probe_ref), Some(heartbeat))
         } else {
-            None
+            (None, None)
         };
 
         let persistence_error = std::cell::RefCell::new(None);
@@ -544,6 +741,15 @@ impl RuntimeEngine {
         self.lock_storage()?
             .begin_native_probe(key, &native_probe_ref, &owner)
             .map_err(model::storage_failure)?;
+        let _heartbeat = match LeaseHeartbeatGuard::start(Arc::clone(&self.storage), &owner) {
+            Ok(heartbeat) => heartbeat,
+            Err(error) => {
+                self.lock_storage()?
+                    .retain_native_probe_recovery(&native_probe_ref)
+                    .map_err(model::storage_failure)?;
+                return Err(heartbeat_start_failure(error));
+            }
+        };
 
         let persistence_error = std::cell::RefCell::new(None);
         let probe = {
@@ -692,12 +898,9 @@ impl RuntimeEngine {
 
     fn finish_admission(
         self: &Arc<Self>,
-        host: &str,
-        prompt: &str,
-        execution_mode: satelle_core::session::TurnExecutionMode,
-        dispatch_preference: request::DispatchPreference,
+        execution: AdmissionExecution<'_>,
         outcome: AdmissionOutcome,
-        provider_smoke_event: Option<satelle_core::SatelleEventBody>,
+        lease_owner: LeaseOwner,
     ) -> Result<RuntimeTurnOutcome, SatelleError> {
         match outcome {
             AdmissionOutcome::InProgress(session) | AdmissionOutcome::Complete(session) => {
@@ -707,19 +910,28 @@ impl RuntimeEngine {
                 session,
                 recovery_subject,
             } => {
+                let heartbeat =
+                    match LeaseHeartbeatGuard::start(Arc::clone(&self.storage), &lease_owner) {
+                        Ok(heartbeat) => heartbeat,
+                        Err(error) => {
+                            self.preserve_unknown_execution(&recovery_subject)?;
+                            return Err(heartbeat_start_failure(error));
+                        }
+                    };
                 let work = TurnWork {
                     session,
                     subject: recovery_subject,
+                    _heartbeat: heartbeat,
                 };
                 let admitted = model::turn_outcome(&work.session, Vec::new());
                 let plan = ExecutionPlan {
-                    host: host.to_string(),
-                    prompt: prompt.to_string(),
-                    execution_mode,
+                    host: execution.host.to_string(),
+                    prompt: execution.prompt.to_string(),
+                    execution_mode: execution.execution_mode,
                     work,
-                    provider_smoke_event,
+                    provider_smoke_event: execution.provider_smoke_event,
                 };
-                match dispatch_preference {
+                match execution.dispatch_preference {
                     request::DispatchPreference::Inline => self.execute(plan),
                     request::DispatchPreference::Detached => {
                         self.schedule(plan)?;
@@ -816,15 +1028,51 @@ impl RuntimeEngine {
             .map_err(model::storage_failure)
     }
 
-    fn lock_storage(&self) -> Result<MutexGuard<'_, Storage>, SatelleError> {
-        self.storage.lock().map_err(|_| {
-            model::integrity_failure("the runtime storage lock was poisoned by a failed operation")
-        })
+    fn lock_storage(&self) -> Result<RuntimeStorageGuard<'_>, SatelleError> {
+        self.storage
+            .lock()
+            .map(|storage| RuntimeStorageGuard {
+                storage,
+                operator_log: &self.operator_log,
+            })
+            .map_err(|_| {
+                model::integrity_failure(
+                    "the runtime storage lock was poisoned by a failed operation",
+                )
+            })
+    }
+}
+
+struct RuntimeStorageGuard<'a> {
+    storage: MutexGuard<'a, Storage>,
+    operator_log: &'a Mutex<OperatorLogMirror>,
+}
+
+impl Deref for RuntimeStorageGuard<'_> {
+    type Target = Storage;
+
+    fn deref(&self) -> &Self::Target {
+        &self.storage
+    }
+}
+
+impl DerefMut for RuntimeStorageGuard<'_> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.storage
+    }
+}
+
+impl Drop for RuntimeStorageGuard<'_> {
+    fn drop(&mut self) {
+        if let Ok(mut operator_log) = self.operator_log.lock() {
+            operator_log.flush_committed(&self.storage);
+        }
     }
 }
 
 struct LazyRuntime {
     state_root: Result<PathBuf, SatelleError>,
+    operator_log_root: Result<PathBuf, SatelleError>,
     engine: Option<Arc<RuntimeEngine>>,
 }
 
@@ -844,82 +1092,209 @@ impl std::fmt::Debug for RuntimeHandle {
 }
 
 impl RuntimeHandle {
-    pub(crate) fn begin_setup_run(&self, plan: &SetupRunPlan) -> Result<(), SatelleError> {
-        self.engine()?
-            .lock_storage()?
-            .begin_setup_run(plan)
-            .map_err(model::storage_failure)
+    pub(crate) fn begin_setup_run(
+        &self,
+        plan: &SetupRunPlan,
+    ) -> Result<MaintenanceOperationHandle, SatelleError> {
+        let engine = self.engine()?;
+        let capability = {
+            let mut storage = engine.lock_storage()?;
+            let acquired_at = time::OffsetDateTime::now_utc();
+            let owner = LeaseOwner::new(
+                plan.run_id(),
+                engine.process_identity.process_id(),
+                engine.process_identity.process_start_ref(),
+                engine.process_identity.boot_identity_ref(),
+                acquired_at,
+            )
+            .map_err(model::storage_failure)?;
+            storage
+                .begin_setup_run(plan, owner)
+                .map_err(model::storage_failure)?
+        };
+        let operation =
+            match MaintenanceOperationGuard::start(Arc::clone(&engine.storage), capability) {
+                Ok(operation) => operation,
+                Err((error, capability)) => {
+                    let owner = capability.lease_owner().clone();
+                    engine
+                        .lock_storage()?
+                        .retain_lease_recovery(&owner)
+                        .map_err(model::storage_failure)?;
+                    return Err(heartbeat_start_failure(error));
+                }
+            };
+        Ok(MaintenanceOperationHandle {
+            operation_id: plan.run_id().to_string(),
+            operation: Some(operation),
+        })
     }
 
     pub(crate) fn start_setup_action(
         &self,
-        run_id: &str,
+        operation: &MaintenanceOperationHandle,
         action_id: &str,
         started_at: time::OffsetDateTime,
     ) -> Result<(), SatelleError> {
-        self.engine()?
-            .lock_storage()?
-            .start_setup_action(run_id, action_id, started_at)
-            .map_err(model::storage_failure)
+        self.with_maintenance_operation(operation, |storage, capability| {
+            storage.start_setup_action(capability, action_id, started_at)
+        })
     }
 
     pub(crate) fn complete_setup_action_after_verified_postcondition(
         &self,
-        run_id: &str,
+        operation: &MaintenanceOperationHandle,
         action_id: &str,
         completed_at: time::OffsetDateTime,
     ) -> Result<(), SatelleError> {
-        self.engine()?
-            .lock_storage()?
-            .complete_setup_action_after_verified_postcondition(run_id, action_id, completed_at)
-            .map_err(model::storage_failure)
+        self.with_maintenance_operation(operation, |storage, capability| {
+            storage.complete_setup_action_after_verified_postcondition(
+                capability,
+                action_id,
+                completed_at,
+            )
+        })
     }
 
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn fail_setup_action(
         &self,
-        run_id: &str,
+        operation: &MaintenanceOperationHandle,
         action_id: &str,
         error_code: &str,
         exit_status: Option<i64>,
         recovery_hint: Option<&str>,
         failed_at: time::OffsetDateTime,
     ) -> Result<(), SatelleError> {
-        self.engine()?
-            .lock_storage()?
-            .fail_setup_action(
-                run_id,
+        self.with_maintenance_operation(operation, |storage, capability| {
+            storage.fail_setup_action(
+                capability,
                 action_id,
                 error_code,
                 exit_status,
                 recovery_hint,
                 failed_at,
             )
-            .map_err(model::storage_failure)
+        })
     }
 
     pub(crate) fn skip_setup_action(
         &self,
-        run_id: &str,
+        operation: &MaintenanceOperationHandle,
         action_id: &str,
         reason: SetupActionSkipReason,
         skipped_at: time::OffsetDateTime,
     ) -> Result<(), SatelleError> {
-        self.engine()?
+        self.with_maintenance_operation(operation, |storage, capability| {
+            storage.skip_setup_action(capability, action_id, reason, skipped_at)
+        })
+    }
+
+    pub(crate) fn run_maintenance_postcheck(
+        &self,
+        operation: &mut MaintenanceOperationHandle,
+        key: &ReadinessCacheKey,
+        postcheck_action_id: &str,
+    ) -> Result<SetupRunStatus, SatelleError> {
+        let driver = self.readiness_probe_driver.as_ref().ok_or_else(|| {
+            model::integrity_failure("the maintenance postcheck observer is unavailable")
+        })?;
+        let native_probe_ref = format!("maintenance-postcheck-{}", SessionId::new());
+        self.with_maintenance_operation(operation, |storage, capability| {
+            storage.begin_maintenance_postcheck(
+                key,
+                &native_probe_ref,
+                postcheck_action_id,
+                capability,
+            )
+        })?;
+
+        let persistence_error = std::cell::RefCell::new(None);
+        let observation = {
+            let mut persist_thread_ref = |value: &str| {
+                self.engine()
+                    .and_then(|engine| {
+                        let mut storage = engine.lock_storage()?;
+                        storage
+                            .persist_native_probe_upstream_ref(
+                                &native_probe_ref,
+                                ObservedUpstreamRef::thread(value)
+                                    .map_err(model::storage_failure)?,
+                            )
+                            .map_err(model::storage_failure)
+                    })
+                    .map_err(|error| {
+                        *persistence_error.borrow_mut() = Some(error);
+                    })
+            };
+            let mut persist_turn_ref = |value: &str| {
+                self.engine()
+                    .and_then(|engine| {
+                        let mut storage = engine.lock_storage()?;
+                        storage
+                            .persist_native_probe_upstream_ref(
+                                &native_probe_ref,
+                                ObservedUpstreamRef::turn(value).map_err(model::storage_failure)?,
+                            )
+                            .map_err(model::storage_failure)
+                    })
+                    .map_err(|error| {
+                        *persistence_error.borrow_mut() = Some(error);
+                    })
+            };
+            driver.run_native_probe(key, &mut persist_thread_ref, &mut persist_turn_ref)
+        };
+        let persistence_error = persistence_error.into_inner();
+        let (verified, terminal_error) =
+            verify_maintenance_postcheck(observation, persistence_error);
+        let engine = self.engine()?;
+        let guard = operation.operation().map_err(model::storage_failure)?;
+        let status = engine
             .lock_storage()?
-            .skip_setup_action(run_id, action_id, reason, skipped_at)
-            .map_err(model::storage_failure)
+            .finish_maintenance_postcheck(
+                guard.capability(),
+                &native_probe_ref,
+                postcheck_action_id,
+                key,
+                &verified,
+            )
+            .map_err(model::storage_failure)?;
+        operation.disarm();
+        if let Some(error) = terminal_error {
+            return Err(error);
+        }
+        status.ok_or_else(|| {
+            model::integrity_failure("a passed maintenance postcheck was not terminal")
+        })
     }
 
     pub(crate) fn finish_setup_run(
         &self,
-        run_id: &str,
+        operation: &mut MaintenanceOperationHandle,
         finished_at: time::OffsetDateTime,
     ) -> Result<SetupRunStatus, SatelleError> {
-        self.engine()?
+        let engine = self.engine()?;
+        let guard = operation.operation().map_err(model::storage_failure)?;
+        let status = engine
             .lock_storage()?
-            .finish_setup_run(run_id, finished_at)
-            .map_err(model::storage_failure)
+            .finish_setup_run_and_release_maintenance(guard.capability(), finished_at)
+            .map_err(model::storage_failure)?;
+        operation.disarm();
+        Ok(status)
+    }
+
+    fn with_maintenance_operation<T>(
+        &self,
+        operation: &MaintenanceOperationHandle,
+        mutate: impl FnOnce(
+            &mut Storage,
+            &crate::storage::MaintenanceLeaseCapability,
+        ) -> Result<T, crate::storage::StorageError>,
+    ) -> Result<T, SatelleError> {
+        let engine = self.engine()?;
+        let operation = operation.operation().map_err(model::storage_failure)?;
+        let mut storage = engine.lock_storage()?;
+        mutate(&mut storage, operation.capability()).map_err(model::storage_failure)
     }
 
     pub(crate) fn load_setup_run(
@@ -943,16 +1318,28 @@ impl RuntimeHandle {
             .map_err(model::storage_failure)
     }
 
+    pub(crate) fn reconcile_setup_maintenance(
+        &self,
+        observer: &mut dyn crate::SetupPostconditionObserver,
+    ) -> Result<Option<SetupRunStatus>, SatelleError> {
+        self.engine()?.reconcile_maintenance(observer)
+    }
+
     #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn new<A: ComputerUseAdapter>(
         state_root: Result<PathBuf, SatelleError>,
         adapter: A,
     ) -> Self {
+        let operator_log_root = state_root
+            .as_ref()
+            .map(|root| root.join("logs"))
+            .map_err(Clone::clone);
         Self {
             adapter: Arc::new(adapter),
             readiness_probe_driver: None,
             lazy: Arc::new(Mutex::new(LazyRuntime {
                 state_root,
+                operator_log_root,
                 engine: None,
             })),
         }
@@ -960,6 +1347,7 @@ impl RuntimeHandle {
 
     pub(crate) fn new_production(
         state_root: Result<PathBuf, SatelleError>,
+        operator_log_root: Result<PathBuf, SatelleError>,
         adapter: ProductionComputerUseAdapter,
     ) -> Self {
         let adapter = Arc::new(adapter);
@@ -970,13 +1358,14 @@ impl RuntimeHandle {
             readiness_probe_driver: Some(readiness_probe_driver),
             lazy: Arc::new(Mutex::new(LazyRuntime {
                 state_root,
+                operator_log_root,
                 engine: None,
             })),
         }
     }
 
     #[cfg(test)]
-    fn new_with_readiness_probe_driver<A, D>(
+    pub(crate) fn new_with_readiness_probe_driver<A, D>(
         state_root: Result<PathBuf, SatelleError>,
         adapter: A,
         readiness_probe_driver: D,
@@ -985,11 +1374,16 @@ impl RuntimeHandle {
         A: ComputerUseAdapter,
         D: ReadinessProbeDriver,
     {
+        let operator_log_root = state_root
+            .as_ref()
+            .map(|root| root.join("logs"))
+            .map_err(Clone::clone);
         Self {
             adapter: Arc::new(adapter),
             readiness_probe_driver: Some(Arc::new(readiness_probe_driver)),
             lazy: Arc::new(Mutex::new(LazyRuntime {
                 state_root,
+                operator_log_root,
                 engine: None,
             })),
         }
@@ -1413,8 +1807,10 @@ impl RuntimeHandle {
             return Ok(Arc::clone(engine));
         }
         let state_root = lazy.state_root.clone()?;
+        let operator_log_root = lazy.operator_log_root.clone()?;
         let engine = RuntimeEngine::open(
             &state_root,
+            operator_log_root,
             Arc::clone(&self.adapter),
             self.readiness_probe_driver.clone(),
         )?;

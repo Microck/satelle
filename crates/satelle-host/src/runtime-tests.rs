@@ -40,6 +40,25 @@ fn latest_turn_state(session: &PublicSession) -> TurnState {
 }
 
 #[test]
+fn runtime_mirrors_only_committed_normalized_log_entries() {
+    let state = crate::TestStateDir::new().expect("temporary state directory should exist");
+    let runtime = RuntimeHandle::new(Ok(state.path().to_path_buf()), FakeComputerUseAdapter);
+    let cursor = runtime
+        .append_log_for_tests(
+            time::OffsetDateTime::now_utc(),
+            crate::LogSource::Storage,
+            crate::LogSeverity::Info,
+        )
+        .expect("commit authoritative log entry");
+
+    let operator_log = std::fs::read_to_string(state.path().join("logs/satelle-host.log"))
+        .expect("read runtime-owned operator log mirror");
+    assert!(operator_log.contains(&format!("cursor={cursor}")));
+    assert!(operator_log.contains("event=store_opened subject=host"));
+    assert!(operator_log.contains("message=\"opened Host state store\""));
+}
+
+#[test]
 fn adapter_types_are_erased_at_the_runtime_handle_boundary() {
     let fake = RuntimeHandle::new(
         Err(SatelleError::invalid_usage("unused fake state root")),

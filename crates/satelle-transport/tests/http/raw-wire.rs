@@ -1,4 +1,5 @@
 use super::*;
+use satelle_test_contract::assert_privacy_canaries_absent;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 #[tokio::test]
@@ -26,6 +27,75 @@ async fn chunked_oversize_body_returns_typed_413_without_admission() {
             .session_count(),
         0
     );
+}
+
+#[test]
+fn chunked_non_empty_attachments_return_typed_413_without_admission() {
+    run_with_trace_capture(chunked_attachment_limit_and_log_privacy);
+}
+
+async fn chunked_attachment_limit_and_log_privacy(trace_capture: TraceCapture) {
+    let running = RunningServer::start(ApiScopes::CONTROL).await;
+    let authorization = bearer(&running.token);
+    let body_canary = "PRIVATE_CHUNKED_BODY_CANARY";
+    let attachment_name = "PRIVATE_CHUNKED_ATTACHMENT_NAME_CANARY";
+    let attachment_bytes = "PRIVATE_CHUNKED_ATTACHMENT_BYTES_CANARY";
+    let body = format!(
+        r#"{{"schema_version":"satelle.api.v2","prompt":7,"execution_mode":"standard","body_canary":"{body_canary}","attachments":[{{"name":"{attachment_name}","content":"{attachment_bytes}"}}]}}"#
+    );
+    let body = body.as_bytes();
+    let split = body.len() / 2;
+    let request_id = RequestId::new();
+    let request_head = format!(
+        "POST /v1/sessions HTTP/1.1\r\nHost: localhost\r\nAuthorization: {authorization}\r\nSatelle-Expected-Host-Identity: {}\r\nSatelle-Request-Id: {}\r\nSatelle-Protocol-Version: 3\r\nIdempotency-Key: attachment-limit-chunked\r\nContent-Type: application/json\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n{split:x}\r\n",
+        running.host_identity, request_id,
+    );
+    let mut request = request_head.into_bytes();
+    request.extend_from_slice(&body[..split]);
+    request.extend_from_slice(format!("\r\n{:x}\r\n", body.len() - split).as_bytes());
+    request.extend_from_slice(&body[split..]);
+    request.extend_from_slice(b"\r\n0\r\n\r\n");
+
+    let response = raw_request(running.server.local_addr(), &request).await;
+    assert_raw_attachment_limit_error(&response, &running.host_identity);
+    assert_eq!(
+        running
+            .service
+            .initialize_daemon()
+            .expect("read session count")
+            .session_count(),
+        0
+    );
+    let traces = trace_capture.bytes();
+    assert_captured_host_admission_dispatch(&traces);
+    assert_privacy_canaries_absent(
+        "Host Daemon tracing sink after chunked request",
+        &traces,
+        &[
+            body_canary,
+            attachment_name,
+            attachment_bytes,
+            authorization
+                .strip_prefix("Bearer ")
+                .expect("raw-wire Authorization fixture uses Bearer authentication"),
+            authorization.as_str(),
+        ],
+    );
+
+    // The public Host log page remains separate durable audit evidence.
+    assert_raw_returned_host_logs_exclude(
+        &running,
+        &[
+            body_canary,
+            attachment_name,
+            attachment_bytes,
+            authorization
+                .strip_prefix("Bearer ")
+                .expect("raw-wire Authorization fixture uses Bearer authentication"),
+            authorization.as_str(),
+        ],
+    )
+    .await;
 }
 
 #[tokio::test]
@@ -185,4 +255,44 @@ pub(super) fn assert_raw_api_error(response: &[u8], status: u16, code: &str) {
     let body: ApiError =
         serde_json::from_slice(&response[separator + 4..]).expect("decode raw API error");
     assert_eq!(body.code().as_str(), code);
+}
+
+fn assert_raw_attachment_limit_error(response: &[u8], host_identity: &str) {
+    assert_raw_api_error(response, 413, "payload-too-large");
+    let separator = response
+        .windows(4)
+        .position(|window| window == b"\r\n\r\n")
+        .expect("raw response has header terminator");
+    let body: Value =
+        serde_json::from_slice(&response[separator + 4..]).expect("decode raw attachment error");
+    assert_eq!(body["schema_version"], "satelle.error.v1");
+    assert_eq!(body["host_identity"], host_identity);
+    assert_eq!(body["code"], "payload-too-large");
+    assert_eq!(body["category"], "capacity");
+    assert_eq!(body["retryable"], false);
+    assert_eq!(
+        body["message"],
+        "the request exceeds the advertised attachment limit"
+    );
+    assert_eq!(body["details"], Value::Null);
+    assert_eq!(body["docs_url"], Value::Null);
+    assert_eq!(body["suggested_commands"], serde_json::json!([]));
+}
+
+async fn assert_raw_returned_host_logs_exclude(running: &RunningServer, canaries: &[&str]) {
+    let response = running
+        .request("/v1/logs?mode=tail&limit=200&minimum_severity=info")
+        .send()
+        .await
+        .expect("read Host logs after raw-wire request");
+    assert_eq!(response.status(), StatusCode::OK);
+    let bytes = response
+        .bytes()
+        .await
+        .expect("read Host log page after raw-wire request");
+    assert_privacy_canaries_absent(
+        "returned Host logs after raw-wire request",
+        &bytes,
+        canaries,
+    );
 }

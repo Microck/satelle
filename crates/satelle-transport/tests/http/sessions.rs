@@ -542,19 +542,6 @@ async fn mutation_validation_fails_before_execution_with_typed_errors() {
         .expect("send wrong schema");
     assert_api_error(wrong_schema, StatusCode::BAD_REQUEST, "unsupported-schema").await;
 
-    let unknown_field = running
-        .mutation("/v1/sessions", CREATE_KEY)
-        .json(&serde_json::json!({
-            "schema_version": "satelle.api.v2",
-            "prompt": "PRIVATE_UNKNOWN_FIELD_CANARY",
-            "execution_mode": "standard",
-            "attachments": []
-        }))
-        .send()
-        .await
-        .expect("send unknown field");
-    assert_api_error(unknown_field, StatusCode::BAD_REQUEST, "invalid-request").await;
-
     let wrong_content_type = running
         .mutation("/v1/sessions", CREATE_KEY)
         .header("Content-Type", "text/plain")
@@ -656,6 +643,363 @@ async fn mutation_validation_fails_before_execution_with_typed_errors() {
             .session_count(),
         0
     );
+}
+
+#[tokio::test]
+async fn fixed_size_attachments_precede_turn_request_deserialization() {
+    let running = RunningServer::start(ApiScopes::CONTROL).await;
+    let response = running
+        .mutation("/v1/sessions", "attachment-limit-fixed-size")
+        .json(&serde_json::json!({
+            "schema_version": "satelle.api.v2",
+            "prompt": "PRIVATE_ATTACHMENT_LIMIT_CANARY",
+            "attachments": [{"name": "private.txt", "content": "private"}]
+        }))
+        .send()
+        .await
+        .expect("send fixed-size attachment request");
+
+    assert_attachment_limit_error(response, &running.host_identity).await;
+    assert_eq!(
+        running
+            .service
+            .initialize_daemon()
+            .expect("read session count")
+            .session_count(),
+        0
+    );
+}
+
+#[tokio::test]
+async fn attachment_limit_preserves_decoder_error_precedence() {
+    let running = RunningServer::start(ApiScopes::CONTROL).await;
+    let oversized = format!(
+        r#"{{"schema_version":"satelle.api.v2","prompt":"PRIVATE_OVERSIZED_ATTACHMENT_CANARY","execution_mode":"standard","attachments":[{{"name":"private.txt"}}],"padding":"{}"}}"#,
+        "x".repeat(1_048_576)
+    );
+    let cases = [
+        (
+            "wrong-schema",
+            r#"{"schema_version":"satelle.api.v1","prompt":"PRIVATE_SCHEMA_ATTACHMENT_CANARY","execution_mode":"standard","attachments":[{"name":"private.txt"}]}"#.to_string(),
+            UNSUPPORTED_SCHEMA_ERROR,
+        ),
+        (
+            "duplicate-json-key",
+            r#"{"schema_version":"satelle.api.v2","prompt":"PRIVATE_DUPLICATE_ATTACHMENT_CANARY","prompt":"duplicate","execution_mode":"standard","attachments":[{"name":"private.txt"}]}"#.to_string(),
+            INVALID_JSON_ERROR,
+        ),
+        ("oversized-body", oversized, JSON_BODY_LIMIT_ERROR),
+    ];
+
+    for (name, body, expected) in cases {
+        let response = running
+            .mutation(
+                "/v1/sessions",
+                &format!("attachment-limit-precedence-{name}"),
+            )
+            .header("Content-Type", "application/json")
+            .body(body)
+            .send()
+            .await
+            .unwrap_or_else(|error| panic!("send {name} precedence request: {error}"));
+        assert_exact_api_error(response, &running.host_identity, expected).await;
+    }
+
+    assert_eq!(
+        running
+            .service
+            .initialize_daemon()
+            .expect("read session count")
+            .session_count(),
+        0
+    );
+}
+
+#[tokio::test]
+async fn empty_and_non_array_attachments_remain_operation_contract_errors() {
+    let running = RunningServer::start(ApiScopes::CONTROL).await;
+    for (name, attachments) in [
+        ("empty-array", serde_json::json!([])),
+        ("null", Value::Null),
+        ("object", serde_json::json!({"name": "private.txt"})),
+        ("string", serde_json::json!("private")),
+    ] {
+        let response = running
+            .mutation(
+                "/v1/sessions",
+                &format!("attachment-operation-contract-{name}"),
+            )
+            .json(&serde_json::json!({
+                "schema_version": "satelle.api.v2",
+                "prompt": "PRIVATE_ATTACHMENT_SHAPE_CANARY",
+                "execution_mode": "standard",
+                "attachments": attachments
+            }))
+            .send()
+            .await
+            .unwrap_or_else(|error| panic!("send {name} attachment request: {error}"));
+        assert_exact_api_error(response, &running.host_identity, OPERATION_CONTRACT_ERROR).await;
+    }
+
+    assert_eq!(
+        running
+            .service
+            .initialize_daemon()
+            .expect("read session count")
+            .session_count(),
+        0
+    );
+}
+
+#[tokio::test]
+async fn create_turn_attachments_precede_deserialization_without_admission() {
+    let running = RunningServer::start(ApiScopes::CONTROL).await;
+    let created: SessionResponse = running
+        .mutation("/v1/sessions", "attachment-limit-create-turn-session")
+        .json(&TurnRequest::new("PRIVATE_ATTACHMENT_BASE_TURN_CANARY"))
+        .send()
+        .await
+        .expect("create attachment-limit Session")
+        .json()
+        .await
+        .expect("decode attachment-limit Session");
+    let session_id = created.session().session_id().clone();
+    let before = wait_until_idle(&running, session_id.as_str()).await;
+    assert_eq!(before.session().turns().len(), 1);
+
+    let response = running
+        .mutation(
+            &format!("/v1/sessions/{session_id}/turns"),
+            "attachment-limit-create-turn",
+        )
+        .json(&serde_json::json!({
+            "schema_version": "satelle.api.v2",
+            "prompt": "PRIVATE_REJECTED_ATTACHMENT_TURN_CANARY",
+            "attachments": [{"name": "private.txt", "content": "private"}]
+        }))
+        .send()
+        .await
+        .expect("send attachment follow-up Turn");
+    assert_attachment_limit_error(response, &running.host_identity).await;
+
+    let after: SessionResponse = running
+        .request(&format!("/v1/sessions/{session_id}"))
+        .send()
+        .await
+        .expect("read Session after rejected attachment Turn")
+        .json()
+        .await
+        .expect("decode Session after rejected attachment Turn");
+    assert_eq!(after.session(), before.session());
+    assert_eq!(after.session().turns().len(), 1);
+}
+
+#[tokio::test]
+async fn controller_only_fields_fail_before_create_session_admission_and_digest() {
+    for field in ["attach", "detach"] {
+        let running = RunningServer::start(ApiScopes::CONTROL).await;
+        let idempotency_key = format!("controller-only-create-{field}");
+        let rejected = running
+            .mutation("/v1/sessions", &idempotency_key)
+            .json(&turn_request_with_controller_field(
+                field,
+                "PRIVATE_CONTROLLER_ONLY_CREATE_REJECTED_CANARY",
+            ))
+            .send()
+            .await
+            .unwrap_or_else(|error| panic!("send rejected {field} create: {error}"));
+        assert_exact_api_error(rejected, &running.host_identity, OPERATION_CONTRACT_ERROR).await;
+        assert_eq!(
+            running
+                .service
+                .initialize_daemon()
+                .expect("read rejected create Session count")
+                .session_count(),
+            0,
+            "Controller-only {field} reached create-session admission"
+        );
+
+        // Reusing the rejected request's key for the canonical payload proves
+        // the rejected field never reached idempotency digest persistence.
+        let accepted = running
+            .mutation("/v1/sessions", &idempotency_key)
+            .json(&TurnRequest::new(format!(
+                "PRIVATE_CONTROLLER_ONLY_CREATE_ACCEPTED_{field}_CANARY"
+            )))
+            .send()
+            .await
+            .unwrap_or_else(|error| panic!("send canonical create after {field}: {error}"));
+        assert_eq!(accepted.status(), StatusCode::ACCEPTED);
+        let accepted: SessionResponse = accepted
+            .json()
+            .await
+            .unwrap_or_else(|error| panic!("decode canonical create after {field}: {error}"));
+        assert_eq!(accepted.session().turns().len(), 1);
+        wait_until_idle(&running, accepted.session().session_id().as_str()).await;
+    }
+}
+
+#[tokio::test]
+async fn controller_only_fields_fail_before_create_turn_admission_and_digest() {
+    for field in ["attach", "detach"] {
+        let running = RunningServer::start(ApiScopes::CONTROL).await;
+        let created: SessionResponse = running
+            .mutation(
+                "/v1/sessions",
+                &format!("controller-only-turn-session-{field}"),
+            )
+            .json(&TurnRequest::new(format!(
+                "PRIVATE_CONTROLLER_ONLY_TURN_BASE_{field}_CANARY"
+            )))
+            .send()
+            .await
+            .unwrap_or_else(|error| panic!("create {field} Turn baseline: {error}"))
+            .json()
+            .await
+            .unwrap_or_else(|error| panic!("decode {field} Turn baseline: {error}"));
+        let session_id = created.session().session_id().clone();
+        let before = wait_until_idle(&running, session_id.as_str()).await;
+        assert_eq!(before.session().turns().len(), 1);
+
+        let idempotency_key = format!("controller-only-turn-{field}");
+        let rejected = running
+            .mutation(
+                &format!("/v1/sessions/{session_id}/turns"),
+                &idempotency_key,
+            )
+            .json(&turn_request_with_controller_field(
+                field,
+                "PRIVATE_CONTROLLER_ONLY_TURN_REJECTED_CANARY",
+            ))
+            .send()
+            .await
+            .unwrap_or_else(|error| panic!("send rejected {field} Turn: {error}"));
+        assert_exact_api_error(rejected, &running.host_identity, OPERATION_CONTRACT_ERROR).await;
+
+        let after_rejection: SessionResponse = running
+            .request(&format!("/v1/sessions/{session_id}"))
+            .send()
+            .await
+            .unwrap_or_else(|error| panic!("read Session after rejected {field} Turn: {error}"))
+            .json()
+            .await
+            .unwrap_or_else(|error| panic!("decode Session after rejected {field} Turn: {error}"));
+        assert_eq!(after_rejection.session(), before.session());
+        assert_eq!(after_rejection.session().turns().len(), 1);
+
+        // The same key remains available because ApiJson rejected the
+        // Controller-only field before Host admission and digest persistence.
+        let accepted = running
+            .mutation(
+                &format!("/v1/sessions/{session_id}/turns"),
+                &idempotency_key,
+            )
+            .json(&TurnRequest::new(format!(
+                "PRIVATE_CONTROLLER_ONLY_TURN_ACCEPTED_{field}_CANARY"
+            )))
+            .send()
+            .await
+            .unwrap_or_else(|error| panic!("send canonical Turn after {field}: {error}"));
+        assert_eq!(accepted.status(), StatusCode::ACCEPTED);
+        let accepted: SessionResponse = accepted
+            .json()
+            .await
+            .unwrap_or_else(|error| panic!("decode canonical Turn after {field}: {error}"));
+        assert_eq!(accepted.session().turns().len(), 2);
+        wait_until_idle(&running, session_id.as_str()).await;
+    }
+}
+
+#[test]
+fn accepted_and_rejected_request_material_never_reaches_transport_or_durable_logs() {
+    run_with_trace_capture(request_material_log_privacy);
+}
+
+async fn request_material_log_privacy(trace_capture: TraceCapture) {
+    let running = RunningServer::start(ApiScopes::CONTROL).await;
+    let accepted_prompt = "PRIVATE_ACCEPTED_LOG_PROMPT_CANARY";
+    let accepted_secret = "PRIVATE_ACCEPTED_LOG_SECRET_CANARY";
+    let accepted_request_id = RequestId::new();
+    let accepted = running
+        .mutation_with_request_id(
+            "/v1/sessions",
+            "request-log-privacy-accepted",
+            &accepted_request_id,
+        )
+        .json(&TurnRequest::new(format!(
+            "{accepted_prompt} secret={accepted_secret}"
+        )))
+        .send()
+        .await
+        .expect("send accepted request-log privacy fixture");
+    assert_eq!(accepted.status(), StatusCode::ACCEPTED);
+    let accepted: SessionResponse = accepted
+        .json()
+        .await
+        .expect("decode accepted request-log privacy fixture");
+    wait_until_idle(&running, accepted.session().session_id().as_str()).await;
+
+    let rejected_prompt = "PRIVATE_REJECTED_LOG_PROMPT_CANARY";
+    let rejected_body = "PRIVATE_REJECTED_LOG_BODY_CANARY";
+    let attachment_name = "PRIVATE_REJECTED_LOG_ATTACHMENT_NAME_CANARY";
+    let attachment_bytes = "PRIVATE_REJECTED_LOG_ATTACHMENT_BYTES_CANARY";
+    let rejected_request_id = RequestId::new();
+    let rejected = running
+        .mutation_with_request_id(
+            "/v1/sessions",
+            "request-log-privacy-rejected",
+            &rejected_request_id,
+        )
+        .json(&serde_json::json!({
+            "schema_version": "satelle.api.v2",
+            "prompt": rejected_prompt,
+            "execution_mode": "standard",
+            "body_canary": rejected_body,
+            "attachments": [{
+                "name": attachment_name,
+                "content": attachment_bytes
+            }]
+        }))
+        .send()
+        .await
+        .expect("send rejected request-log privacy fixture");
+    assert_attachment_limit_error(rejected, &running.host_identity).await;
+
+    let exposed_token = running.token.expose();
+    let raw_token = exposed_token.as_str().to_string();
+    let authorization = format!("Bearer {raw_token}");
+    let traces = trace_capture.bytes();
+    assert_captured_host_admission_dispatch(&traces);
+    assert_privacy_canaries_absent(
+        "Host Daemon tracing sink",
+        &traces,
+        &[
+            accepted_prompt,
+            accepted_secret,
+            rejected_prompt,
+            rejected_body,
+            attachment_name,
+            attachment_bytes,
+            raw_token.as_str(),
+            authorization.as_str(),
+        ],
+    );
+
+    // The public Host log page is a separate closed, durable audit surface.
+    assert_returned_host_logs_exclude(
+        &running,
+        &[
+            accepted_prompt,
+            accepted_secret,
+            rejected_prompt,
+            rejected_body,
+            attachment_name,
+            attachment_bytes,
+            raw_token.as_str(),
+            authorization.as_str(),
+        ],
+    )
+    .await;
 }
 
 #[tokio::test]
@@ -785,4 +1129,108 @@ async fn assert_api_error_message(
     let error: serde_json::Value = response.json().await.expect("decode API error");
     assert_eq!(error["code"], code);
     assert_eq!(error["message"], message);
+}
+
+async fn assert_attachment_limit_error(response: reqwest::Response, host_identity: &str) {
+    assert_exact_api_error(response, host_identity, ATTACHMENT_LIMIT_ERROR).await;
+}
+
+fn turn_request_with_controller_field(field: &str, prompt: &str) -> Value {
+    let mut request = serde_json::json!({
+        "schema_version": "satelle.api.v2",
+        "prompt": prompt,
+        "execution_mode": "standard"
+    });
+    request
+        .as_object_mut()
+        .expect("Turn request fixture is an object")
+        .insert(field.to_string(), serde_json::json!(true));
+    request
+}
+
+async fn assert_returned_host_logs_exclude(running: &RunningServer, canaries: &[&str]) {
+    let response = running
+        .request("/v1/logs?mode=tail&limit=200&minimum_severity=info")
+        .send()
+        .await
+        .expect("read Host logs after canary-bearing requests");
+    assert_eq!(response.status(), StatusCode::OK);
+    let bytes = response
+        .bytes()
+        .await
+        .expect("read Host log page after canary-bearing requests");
+    assert_privacy_canaries_absent("returned Host logs", &bytes, canaries);
+}
+
+#[derive(Clone, Copy)]
+struct ExpectedApiError {
+    status: StatusCode,
+    code: &'static str,
+    category: &'static str,
+    retryable: bool,
+    message: &'static str,
+}
+
+const ATTACHMENT_LIMIT_ERROR: ExpectedApiError = ExpectedApiError {
+    status: StatusCode::PAYLOAD_TOO_LARGE,
+    code: "payload-too-large",
+    category: "capacity",
+    retryable: false,
+    message: "the request exceeds the advertised attachment limit",
+};
+
+const JSON_BODY_LIMIT_ERROR: ExpectedApiError = ExpectedApiError {
+    status: StatusCode::PAYLOAD_TOO_LARGE,
+    code: "payload-too-large",
+    category: "capacity",
+    retryable: false,
+    message: "the request body exceeds the advertised JSON body limit",
+};
+
+const UNSUPPORTED_SCHEMA_ERROR: ExpectedApiError = ExpectedApiError {
+    status: StatusCode::BAD_REQUEST,
+    code: "unsupported-schema",
+    category: "invalid_request",
+    retryable: false,
+    message: "the request schema_version is unsupported",
+};
+
+const INVALID_JSON_ERROR: ExpectedApiError = ExpectedApiError {
+    status: StatusCode::BAD_REQUEST,
+    code: "invalid-request",
+    category: "invalid_request",
+    retryable: false,
+    message: "the request body must be valid JSON",
+};
+
+const OPERATION_CONTRACT_ERROR: ExpectedApiError = ExpectedApiError {
+    status: StatusCode::BAD_REQUEST,
+    code: "invalid-request",
+    category: "invalid_request",
+    retryable: false,
+    message: "the request body does not match the operation contract",
+};
+
+async fn assert_exact_api_error(
+    response: reqwest::Response,
+    host_identity: &str,
+    expected: ExpectedApiError,
+) {
+    assert_eq!(response.status(), expected.status);
+    assert_eq!(
+        response.headers()["content-type"],
+        "application/json; charset=utf-8"
+    );
+    assert_eq!(response.headers()["cache-control"], "no-store");
+    let error: Value = response.json().await.expect("decode exact API error");
+    serde_json::from_value::<ApiError>(error.clone()).expect("decode closed API error contract");
+    assert_eq!(error["schema_version"], "satelle.error.v1");
+    assert_eq!(error["host_identity"], host_identity);
+    assert_eq!(error["code"], expected.code);
+    assert_eq!(error["category"], expected.category);
+    assert_eq!(error["retryable"], expected.retryable);
+    assert_eq!(error["message"], expected.message);
+    assert_eq!(error["details"], Value::Null);
+    assert_eq!(error["docs_url"], Value::Null);
+    assert_eq!(error["suggested_commands"], serde_json::json!([]));
 }

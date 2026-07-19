@@ -1,18 +1,234 @@
 use super::RuntimeTurnOutcome;
 use super::adapter::{AdapterSubject, ExecuteRequest, UpstreamReference};
 use super::{RuntimeEngine, model};
-use crate::storage::{ObservedUpstreamRef, RecoverySubject, StorageErrorKind};
+use crate::storage::{
+    LeaseOwner, MaintenanceLeaseCapability, ObservedUpstreamRef, RecoverySubject, StorageErrorKind,
+};
 use satelle_core::session::{ExpectedRevisions, Session, TurnExecutionMode, TurnTransition};
 use satelle_core::{SatelleError, SatelleEvent, SessionId, TurnId};
-use std::sync::Arc;
 #[cfg(test)]
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{self, RecvTimeoutError, SyncSender};
+use std::sync::{Arc, Mutex};
 use time::OffsetDateTime;
 
-#[derive(Clone)]
+const LEASE_HEARTBEAT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
+
+fn refresh_once(
+    storage: &Arc<Mutex<crate::storage::Storage>>,
+    owner: &LeaseOwner,
+) -> Option<time::OffsetDateTime> {
+    let mut storage = storage.lock().ok()?;
+    // This is the single production timestamp boundary. A blocked mutex can
+    // never make a later write persist an earlier heartbeat.
+    let refreshed_at = time::OffsetDateTime::now_utc();
+    let _refresh = storage.refresh_lease_heartbeat(owner, refreshed_at);
+    Some(refreshed_at)
+}
+
+pub(super) struct LeaseHeartbeatGuard {
+    commands: SyncSender<HeartbeatCommand>,
+    handle: Option<std::thread::JoinHandle<()>>,
+    #[cfg(test)]
+    finished: Arc<AtomicBool>,
+    #[cfg(test)]
+    join_started: Option<SyncSender<()>>,
+}
+
+enum HeartbeatCommand {
+    Shutdown,
+    #[cfg(test)]
+    Refresh {
+        attempting: SyncSender<()>,
+        refreshed: SyncSender<time::OffsetDateTime>,
+    },
+    #[cfg(test)]
+    HoldExit {
+        reached: SyncSender<()>,
+        release: std::sync::mpsc::Receiver<()>,
+    },
+}
+
+impl LeaseHeartbeatGuard {
+    pub(super) fn start(
+        storage: Arc<Mutex<crate::storage::Storage>>,
+        owner: &LeaseOwner,
+    ) -> Result<Self, std::io::Error> {
+        let owner = owner.clone();
+        let (commands, receiver) = mpsc::sync_channel(1);
+        #[cfg(test)]
+        let finished = Arc::new(AtomicBool::new(false));
+        #[cfg(test)]
+        let thread_finished = Arc::clone(&finished);
+        let handle = std::thread::Builder::new()
+            .name(format!("satelle-lease-heartbeat-{}", owner.operation_id()))
+            .spawn(move || {
+                #[cfg(test)]
+                struct Completion(Arc<AtomicBool>);
+                #[cfg(test)]
+                impl Drop for Completion {
+                    fn drop(&mut self) {
+                        self.0.store(true, Ordering::Release);
+                    }
+                }
+                #[cfg(test)]
+                let _completion = Completion(thread_finished);
+                // Anchor refresh attempts to a fixed cadence. Waiting five
+                // seconds after each database write would make the actual
+                // heartbeat interval exceed five seconds by the write time.
+                let mut next_refresh_at = std::time::Instant::now();
+                loop {
+                    // Failure to refresh never changes ownership. The next
+                    // interval retries while the durable timestamp remains
+                    // available to a future diagnostic status surface.
+                    let _refreshed = refresh_once(&storage, &owner);
+                    next_refresh_at += LEASE_HEARTBEAT_INTERVAL;
+                    let wait = next_refresh_at.saturating_duration_since(std::time::Instant::now());
+                    match receiver.recv_timeout(wait) {
+                        Ok(HeartbeatCommand::Shutdown) | Err(RecvTimeoutError::Disconnected) => {
+                            return;
+                        }
+                        #[cfg(test)]
+                        Ok(HeartbeatCommand::Refresh {
+                            attempting,
+                            refreshed,
+                        }) => {
+                            let _attempting = attempting.send(());
+                            if let Some(refreshed_at) = refresh_once(&storage, &owner) {
+                                let _refreshed = refreshed.send(refreshed_at);
+                            }
+                        }
+                        #[cfg(test)]
+                        Ok(HeartbeatCommand::HoldExit { reached, release }) => {
+                            let _reached = reached.send(());
+                            let _released = release.recv();
+                            return;
+                        }
+                        Err(RecvTimeoutError::Timeout) => {}
+                    }
+                }
+            })?;
+        Ok(Self {
+            commands,
+            handle: Some(handle),
+            #[cfg(test)]
+            finished,
+            #[cfg(test)]
+            join_started: None,
+        })
+    }
+
+    #[cfg(test)]
+    fn request_refresh_for_test(
+        &self,
+    ) -> (
+        std::sync::mpsc::Receiver<()>,
+        std::sync::mpsc::Receiver<time::OffsetDateTime>,
+    ) {
+        let (attempting, attempted) = mpsc::sync_channel(1);
+        let (refreshed, refresh) = mpsc::sync_channel(1);
+        self.commands
+            .send(HeartbeatCommand::Refresh {
+                attempting,
+                refreshed,
+            })
+            .expect("live heartbeat thread receives a deterministic refresh request");
+        (attempted, refresh)
+    }
+
+    #[cfg(test)]
+    fn finished_probe_for_test(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.finished)
+    }
+
+    #[cfg(test)]
+    fn hold_worker_exit_for_test(
+        &mut self,
+    ) -> (
+        std::sync::mpsc::Receiver<()>,
+        SyncSender<()>,
+        std::sync::mpsc::Receiver<()>,
+    ) {
+        let (reached, exit_reached) = mpsc::sync_channel(1);
+        let (release_exit, release) = mpsc::sync_channel(1);
+        let (join_started, joining) = mpsc::sync_channel(1);
+        self.commands
+            .send(HeartbeatCommand::HoldExit { reached, release })
+            .expect("live heartbeat thread receives its deterministic exit barrier");
+        self.join_started = Some(join_started);
+        (exit_reached, release_exit, joining)
+    }
+}
+
+impl Drop for LeaseHeartbeatGuard {
+    fn drop(&mut self) {
+        let _sent = self.commands.send(HeartbeatCommand::Shutdown);
+        let Some(handle) = self.handle.take() else {
+            return;
+        };
+        #[cfg(test)]
+        if let Some(join_started) = self.join_started.take() {
+            let _joining = join_started.send(());
+        }
+        // The thread owns the final Storage Arc while it runs, so joining is
+        // what makes RuntimeEngine drop synchronously release the SQLite owner.
+        let _joined = handle.join();
+    }
+}
+
+pub(super) struct MaintenanceOperationGuard {
+    capability: Option<MaintenanceLeaseCapability>,
+    heartbeat: Option<LeaseHeartbeatGuard>,
+    storage: Arc<Mutex<crate::storage::Storage>>,
+}
+
+impl MaintenanceOperationGuard {
+    pub(super) fn start(
+        storage: Arc<Mutex<crate::storage::Storage>>,
+        capability: MaintenanceLeaseCapability,
+    ) -> Result<Self, (std::io::Error, MaintenanceLeaseCapability)> {
+        let heartbeat =
+            match LeaseHeartbeatGuard::start(Arc::clone(&storage), capability.lease_owner()) {
+                Ok(heartbeat) => heartbeat,
+                Err(error) => return Err((error, capability)),
+            };
+        Ok(Self {
+            capability: Some(capability),
+            heartbeat: Some(heartbeat),
+            storage,
+        })
+    }
+
+    pub(super) fn capability(&self) -> &MaintenanceLeaseCapability {
+        self.capability
+            .as_ref()
+            .expect("live maintenance operation owns its capability")
+    }
+
+    pub(super) fn disarm(&mut self) {
+        drop(self.heartbeat.take());
+        drop(self.capability.take());
+    }
+}
+
+impl Drop for MaintenanceOperationGuard {
+    fn drop(&mut self) {
+        // Stop refreshing before classifying the abandoned owner. Once this
+        // returns, no heartbeat thread can make the lost operation look live.
+        drop(self.heartbeat.take());
+        let Some(capability) = self.capability.take() else {
+            return;
+        };
+        if let Ok(mut storage) = self.storage.lock() {
+            let _retained = storage.retain_lease_recovery(capability.lease_owner());
+        }
+    }
+}
+
 pub(super) struct TurnWork {
     pub(super) session: satelle_core::session::Session,
     pub(super) subject: RecoverySubject,
+    pub(super) _heartbeat: LeaseHeartbeatGuard,
 }
 
 pub(super) struct ExecutionPlan {
@@ -51,31 +267,39 @@ impl WorkerRegistry {
 
 impl RuntimeEngine {
     pub(super) fn schedule(self: &Arc<Self>, plan: ExecutionPlan) -> Result<(), SatelleError> {
-        let admitted_work = plan.work.clone();
+        let admitted_session = plan.work.session.clone();
+        let admitted_subject = plan.work.subject.clone();
+        // Dispatch defaults are thread-local. Capture the request's effective
+        // subscriber before spawning so the detached prompt lifetime remains
+        // inside the same non-global tracing boundary as admission.
+        let dispatch = tracing::dispatcher::get_default(tracing::Dispatch::clone);
         let engine = Arc::clone(self);
         let mut workers = match self.workers.lock() {
             Ok(workers) => workers,
             Err(_) => {
                 let failure =
                     model::integrity_failure("the detached runtime worker registry was poisoned");
-                self.fail_unstarted_dispatch(&admitted_work)?;
+                self.fail_unstarted_dispatch(&admitted_session, &admitted_subject)?;
                 return Err(failure);
             }
         };
         if let Err(failure) = workers.reap_finished() {
             drop(workers);
-            self.fail_unstarted_dispatch(&admitted_work)?;
+            self.fail_unstarted_dispatch(&admitted_session, &admitted_subject)?;
             return Err(failure);
         }
         let spawned = std::thread::Builder::new()
             .name("satelle-runtime-turn".to_string())
             .spawn(move || {
-                let subject = plan.work.subject.clone();
-                let execution =
-                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| engine.execute(plan)));
-                if execution.is_err() {
-                    let _preserved = engine.preserve_unknown_execution(&subject);
-                }
+                tracing::dispatcher::with_default(&dispatch, move || {
+                    let subject = plan.work.subject.clone();
+                    let execution = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        engine.execute(plan)
+                    }));
+                    if execution.is_err() {
+                        let _preserved = engine.preserve_unknown_execution(&subject);
+                    }
+                });
             });
         match spawned {
             Ok(handle) => {
@@ -85,7 +309,7 @@ impl RuntimeEngine {
             Err(error) => {
                 drop(workers);
                 let failure = model::background_execution_failure(error);
-                self.fail_unstarted_dispatch(&admitted_work)?;
+                self.fail_unstarted_dispatch(&admitted_session, &admitted_subject)?;
                 Err(failure)
             }
         }
@@ -220,10 +444,14 @@ impl RuntimeEngine {
         }
     }
 
-    pub(super) fn fail_unstarted_dispatch(&self, work: &TurnWork) -> Result<(), SatelleError> {
-        let session_id = work.subject.session_id();
-        let turn_id = work.subject.turn_id();
-        let mut session = work.session.clone();
+    pub(super) fn fail_unstarted_dispatch(
+        &self,
+        admitted_session: &Session,
+        subject: &RecoverySubject,
+    ) -> Result<(), SatelleError> {
+        let session_id = subject.session_id();
+        let turn_id = subject.turn_id();
+        let mut session = admitted_session.clone();
         loop {
             let expected = model::expected_revisions(&session, turn_id)?;
             let mut storage = self.lock_storage()?;
@@ -291,4 +519,131 @@ pub(super) fn wait_for_background(workers: &Mutex<WorkerRegistry>) -> Result<(),
         })?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod heartbeat_tests {
+    use super::*;
+    use crate::storage::{LeaseOwner, SetupActionPlan, SetupOperationKind, SetupRunPlan, Storage};
+
+    #[test]
+    fn heartbeat_timestamp_is_captured_after_the_storage_mutex_and_drop_is_quiescent() {
+        let state = crate::TestStateDir::new().expect("temporary state directory should exist");
+        let (storage, _) = Storage::open(state.path()).expect("open storage");
+        let storage = Arc::new(Mutex::new(storage));
+        let acquired_at = time::OffsetDateTime::now_utc();
+        let owner = LeaseOwner::new(
+            "blocked-mutex-maintenance",
+            std::process::id(),
+            "blocked-mutex-process-start",
+            "blocked-mutex-boot",
+            acquired_at,
+        )
+        .unwrap();
+        let plan = SetupRunPlan::new(
+            owner.operation_id(),
+            SetupOperationKind::Repair,
+            None,
+            acquired_at,
+            vec![SetupActionPlan::new("repair-runtime", "Repair runtime", false).unwrap()],
+        )
+        .unwrap();
+        let _capability = storage
+            .lock()
+            .unwrap()
+            .begin_setup_run(&plan, owner.clone())
+            .unwrap();
+        let heartbeat = LeaseHeartbeatGuard::start(Arc::clone(&storage), &owner).unwrap();
+        let finished = heartbeat.finished_probe_for_test();
+
+        // Complete the worker's immediate startup refresh before taking the
+        // mutex. Otherwise this test can hold the mutex while waiting for a
+        // command that the worker cannot read until that first refresh ends.
+        let (startup_attempted, startup_refreshed) = heartbeat.request_refresh_for_test();
+        startup_attempted
+            .recv()
+            .expect("heartbeat accepts the deterministic startup refresh");
+        startup_refreshed
+            .recv()
+            .expect("heartbeat completes the deterministic startup refresh");
+
+        let locked_storage = storage.lock().unwrap();
+        let (attempted, refreshed) = heartbeat.request_refresh_for_test();
+        attempted
+            .recv()
+            .expect("heartbeat reaches the blocked storage mutex");
+        let mutex_released_at = time::OffsetDateTime::now_utc();
+        drop(locked_storage);
+        let refreshed_at = refreshed
+            .recv()
+            .expect("heartbeat completes after the mutex is released");
+        assert!(refreshed_at >= mutex_released_at);
+
+        drop(heartbeat);
+        assert!(
+            finished.load(Ordering::Acquire),
+            "guard drop joins the heartbeat thread before returning"
+        );
+    }
+
+    #[test]
+    fn heartbeat_drop_waits_for_the_real_worker_exit_barrier() {
+        let state = crate::TestStateDir::new().expect("temporary state directory should exist");
+        let (storage, _) = Storage::open(state.path()).expect("open storage");
+        let storage = Arc::new(Mutex::new(storage));
+        let acquired_at = time::OffsetDateTime::now_utc();
+        let owner = LeaseOwner::new(
+            "worker-exit-barrier",
+            std::process::id(),
+            "worker-exit-process-start",
+            "worker-exit-boot",
+            acquired_at,
+        )
+        .unwrap();
+        let plan = SetupRunPlan::new(
+            owner.operation_id(),
+            SetupOperationKind::Repair,
+            None,
+            acquired_at,
+            vec![SetupActionPlan::new("repair-runtime", "Repair runtime", false).unwrap()],
+        )
+        .unwrap();
+        let _capability = storage
+            .lock()
+            .unwrap()
+            .begin_setup_run(&plan, owner.clone())
+            .unwrap();
+        let mut heartbeat = LeaseHeartbeatGuard::start(Arc::clone(&storage), &owner).unwrap();
+        let finished = heartbeat.finished_probe_for_test();
+        let (exit_reached, release_exit, join_started) = heartbeat.hold_worker_exit_for_test();
+        exit_reached
+            .recv()
+            .expect("the real heartbeat worker reaches its held exit boundary");
+        let (drop_completed, dropped) = mpsc::sync_channel(1);
+        let drop_thread = std::thread::spawn(move || {
+            drop(heartbeat);
+            drop_completed
+                .send(())
+                .expect("drop completion receiver remains connected");
+        });
+        join_started
+            .recv()
+            .expect("guard Drop reaches the production join boundary");
+        assert_eq!(
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout),
+            dropped.recv_timeout(std::time::Duration::from_millis(100)),
+            "Drop must remain blocked while the real worker is held before exit"
+        );
+        release_exit
+            .send(())
+            .expect("release the real heartbeat worker exit boundary");
+        dropped
+            .recv()
+            .expect("Drop returns after the worker is allowed to exit");
+        drop_thread.join().expect("drop thread exits cleanly");
+        assert!(
+            finished.load(Ordering::Acquire),
+            "worker completion is acknowledged before Drop returns"
+        );
+    }
 }

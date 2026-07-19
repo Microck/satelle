@@ -1,5 +1,8 @@
 use super::*;
+use crate::DaemonLogEntry;
 use crate::{LogCursor, LogEvent, LogPageQuery, LogSeverity, LogSource};
+use std::fs;
+use std::path::Path;
 
 fn host_log(at: OffsetDateTime, source: LogSource, severity: LogSeverity) -> SafeLogRecord {
     SafeLogRecord::new(
@@ -10,6 +13,293 @@ fn host_log(at: OffsetDateTime, source: LogSource, severity: LogSeverity) -> Saf
         crate::LogSubject::Host,
     )
     .expect("Host log record is valid")
+}
+
+fn committed_host_log(
+    storage: &mut Storage,
+    at: OffsetDateTime,
+    source: LogSource,
+    severity: LogSeverity,
+) -> DaemonLogEntry {
+    let cursor = storage
+        .append_safe_log(&host_log(at, source, severity))
+        .expect("commit authoritative SQLite log");
+    storage
+        .committed_log_entry(cursor)
+        .expect("load authoritative committed Log Entry")
+}
+
+fn operator_log_cursors(path: &Path) -> Vec<String> {
+    fs::read_to_string(path)
+        .expect("read operator log generation")
+        .lines()
+        .map(|line| {
+            line.split_ascii_whitespace()
+                .find_map(|field| field.strip_prefix("cursor="))
+                .expect("operator log line has a cursor")
+                .to_string()
+        })
+        .collect()
+}
+
+fn cursor_strings(positions: &[u64]) -> Vec<String> {
+    positions
+        .iter()
+        .map(|position| LogCursor::from_position(*position).to_string())
+        .collect()
+}
+
+fn assert_sqlite_log_cursors(storage: &Storage, expected: &[u64]) {
+    assert_eq!(
+        storage
+            .logs_after(None, 10)
+            .expect("read authoritative SQLite logs")
+            .into_iter()
+            .map(|record| record.cursor())
+            .collect::<Vec<_>>(),
+        expected
+    );
+}
+
+#[test]
+fn operator_log_formats_the_authoritative_normalized_entry_only() {
+    let state = TempDir::new().expect("temporary state directory");
+    let (mut storage, _) = Storage::open(state.path()).expect("open storage");
+    let log_root = state.path().join("operator-logs");
+    let mut operator_log = OperatorLogSink::new(OperatorLogPolicy::new(log_root.clone()));
+
+    let authoritative_timestamp = at(1);
+    let _first = committed_host_log(
+        &mut storage,
+        authoritative_timestamp,
+        LogSource::Storage,
+        LogSeverity::Info,
+    );
+    let normalized = committed_host_log(
+        &mut storage,
+        at(0),
+        LogSource::Storage,
+        LogSeverity::Warning,
+    );
+    assert_eq!(normalized.timestamp(), authoritative_timestamp);
+
+    let outcome = operator_log.write_committed(&normalized);
+
+    assert!(matches!(outcome, OperatorLogWriteOutcome::Written));
+    assert_eq!(
+        fs::read_to_string(log_root.join("satelle-host.log")).expect("read operator log fixture"),
+        concat!(
+            "2026-01-02T03:04:01Z level=warn source=storage ",
+            "event=store_opened subject=host cursor=slc1_0000000000000002 ",
+            "message=\"opened Host state store\"\n",
+        )
+    );
+}
+
+#[test]
+fn operator_log_rotates_only_above_the_threshold_and_retains_newest_generations() {
+    let state = TempDir::new().expect("temporary state directory");
+    let (mut storage, _) = Storage::open(state.path()).expect("open storage");
+    let log_root = state.path().join("operator-logs");
+    let policy = OperatorLogPolicy::new(log_root.clone());
+    assert_eq!(policy.rotation_bytes_for_test(), 10 * 1024 * 1024);
+    assert_eq!(policy.retained_files_for_test(), 5);
+
+    let first = committed_host_log(
+        &mut storage,
+        at(0),
+        LogSource::HostDaemon,
+        LogSeverity::Warning,
+    );
+    let probe_root = state.path().join("operator-log-probe");
+    let mut probe = OperatorLogSink::new(OperatorLogPolicy::new(probe_root.clone()));
+    assert!(matches!(
+        probe.write_committed(&first),
+        OperatorLogWriteOutcome::Written
+    ));
+    let line_bytes = fs::metadata(probe_root.join("satelle-host.log"))
+        .expect("probe operator log metadata")
+        .len();
+    let threshold = line_bytes * 2;
+
+    let mut operator_log =
+        OperatorLogSink::new(OperatorLogPolicy::for_test(log_root.clone(), threshold, 5));
+    assert!(matches!(
+        operator_log.write_committed(&first),
+        OperatorLogWriteOutcome::Written
+    ));
+    let second = committed_host_log(
+        &mut storage,
+        at(0),
+        LogSource::HostDaemon,
+        LogSeverity::Warning,
+    );
+    assert!(matches!(
+        operator_log.write_committed(&second),
+        OperatorLogWriteOutcome::Written
+    ));
+    assert_eq!(
+        fs::metadata(log_root.join("satelle-host.log"))
+            .expect("current operator log metadata at threshold")
+            .len(),
+        threshold
+    );
+    assert!(!log_root.join("satelle-host.log.1").exists());
+
+    let third = committed_host_log(
+        &mut storage,
+        at(0),
+        LogSource::HostDaemon,
+        LogSeverity::Warning,
+    );
+    assert!(matches!(
+        operator_log.write_committed(&third),
+        OperatorLogWriteOutcome::Written
+    ));
+    assert_eq!(
+        operator_log_cursors(&log_root.join("satelle-host.log")),
+        cursor_strings(&[3])
+    );
+    assert_eq!(
+        operator_log_cursors(&log_root.join("satelle-host.log.1")),
+        cursor_strings(&[1, 2])
+    );
+
+    for _ in 4..=11 {
+        let entry = committed_host_log(
+            &mut storage,
+            at(0),
+            LogSource::HostDaemon,
+            LogSeverity::Warning,
+        );
+        assert!(matches!(
+            operator_log.write_committed(&entry),
+            OperatorLogWriteOutcome::Written
+        ));
+    }
+
+    assert_eq!(
+        operator_log_cursors(&log_root.join("satelle-host.log")),
+        cursor_strings(&[11])
+    );
+    assert_eq!(
+        operator_log_cursors(&log_root.join("satelle-host.log.1")),
+        cursor_strings(&[9, 10])
+    );
+    assert_eq!(
+        operator_log_cursors(&log_root.join("satelle-host.log.2")),
+        cursor_strings(&[7, 8])
+    );
+    assert_eq!(
+        operator_log_cursors(&log_root.join("satelle-host.log.3")),
+        cursor_strings(&[5, 6])
+    );
+    assert_eq!(
+        operator_log_cursors(&log_root.join("satelle-host.log.4")),
+        cursor_strings(&[3, 4])
+    );
+    assert!(!log_root.join("satelle-host.log.5").exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn operator_log_directory_and_rotated_files_are_owner_only() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let state = TempDir::new().expect("temporary state directory");
+    let (mut storage, _) = Storage::open(state.path()).expect("open storage");
+    let log_root = state.path().join("operator-logs");
+    let mut operator_log =
+        OperatorLogSink::new(OperatorLogPolicy::for_test(log_root.clone(), 1, 5));
+    for second in 1..=3 {
+        let entry = committed_host_log(
+            &mut storage,
+            at(second),
+            LogSource::Storage,
+            LogSeverity::Info,
+        );
+        assert!(matches!(
+            operator_log.write_committed(&entry),
+            OperatorLogWriteOutcome::Written
+        ));
+    }
+
+    assert_eq!(
+        fs::metadata(&log_root)
+            .expect("operator log root metadata")
+            .permissions()
+            .mode()
+            & 0o777,
+        0o700
+    );
+    for entry in fs::read_dir(&log_root).expect("read operator log root") {
+        assert_eq!(
+            entry
+                .expect("read operator log directory entry")
+                .metadata()
+                .expect("operator log file metadata")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+    }
+}
+
+#[test]
+fn operator_log_failures_are_coalesced_and_do_not_roll_back_sqlite() {
+    let state = TempDir::new().expect("temporary state directory");
+    let (mut storage, _) = Storage::open(state.path()).expect("open storage");
+    let unusable_log_root = state.path().join("not-a-directory");
+    fs::write(&unusable_log_root, b"occupied").expect("create unusable log root fixture");
+    let mut operator_log = OperatorLogSink::new(OperatorLogPolicy::new(unusable_log_root.clone()));
+
+    let first = committed_host_log(&mut storage, at(0), LogSource::Storage, LogSeverity::Info);
+    let first_outcome = operator_log.write_committed(&first);
+    assert_eq!(
+        first_outcome.failure_kind(),
+        Some(OperatorLogFailureKind::BoundaryUnavailable)
+    );
+    assert_sqlite_log_cursors(&storage, &[1]);
+
+    let second = committed_host_log(
+        &mut storage,
+        at(1),
+        LogSource::Storage,
+        LogSeverity::Warning,
+    );
+    let second_outcome = operator_log.write_committed(&second);
+    assert!(matches!(
+        second_outcome,
+        OperatorLogWriteOutcome::FailureCoalesced
+    ));
+    assert_sqlite_log_cursors(&storage, &[1, 2]);
+
+    fs::remove_file(&unusable_log_root).expect("repair operator log boundary");
+    let third = committed_host_log(&mut storage, at(2), LogSource::Storage, LogSeverity::Info);
+    assert!(matches!(
+        operator_log.write_committed(&third),
+        OperatorLogWriteOutcome::Written
+    ));
+    assert_sqlite_log_cursors(&storage, &[1, 2, 3]);
+    assert_eq!(
+        operator_log_cursors(&unusable_log_root.join("satelle-host.log")),
+        cursor_strings(&[3])
+    );
+
+    operator_log.release_handles_for_test();
+    fs::remove_file(unusable_log_root.join("satelle-host.log"))
+        .expect("remove repaired operator log file");
+    fs::remove_dir(&unusable_log_root).expect("remove repaired operator log root");
+    fs::write(&unusable_log_root, b"occupied again").expect("break operator log boundary again");
+    let fourth = committed_host_log(&mut storage, at(3), LogSource::Storage, LogSeverity::Error);
+    let fourth_outcome = operator_log.write_committed(&fourth);
+    assert_eq!(
+        fourth_outcome.failure_kind(),
+        Some(OperatorLogFailureKind::BoundaryUnavailable)
+    );
+    assert_sqlite_log_cursors(&storage, &[1, 2, 3, 4]);
+    assert!(unusable_log_root.is_file());
 }
 
 #[test]

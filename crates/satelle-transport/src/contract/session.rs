@@ -4,6 +4,7 @@ use satelle_core::session::{
 };
 use satelle_core::{SessionId, StopResult, StopResultOutcome, TurnId};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use serde_json::Value;
 use std::fmt;
 
 define_schema_token!(TurnRequestSchema, "satelle.api.v2");
@@ -13,6 +14,10 @@ define_schema_token!(SessionStopSchema, "satelle.session.stop.v1");
 
 pub(crate) trait ApiRequestContract {
     const SCHEMA_VERSION: &'static str;
+
+    fn exceeds_attachment_limit(_value: &Value) -> bool {
+        false
+    }
 }
 
 #[derive(Clone, Deserialize, PartialEq, Serialize)]
@@ -114,6 +119,17 @@ impl TurnRequest {
 
 impl ApiRequestContract for TurnRequest {
     const SCHEMA_VERSION: &'static str = TurnRequestSchema::TOKEN;
+
+    fn exceeds_attachment_limit(value: &Value) -> bool {
+        // Attachments remain outside the TurnRequest grammar. Inspect only a
+        // non-empty list so the advertised zero limit can fail as capacity.
+        value
+            .as_object()
+            .and_then(|object| object.get("attachments"))
+            .is_some_and(
+                |attachments| matches!(attachments, Value::Array(values) if !values.is_empty()),
+            )
+    }
 }
 
 impl fmt::Debug for TurnRequest {
@@ -487,6 +503,26 @@ mod tests {
             serde_json::to_value(StopRequest::new()).expect("serialize stop request"),
             serde_json::json!({"schema_version": "satelle.api.v1"})
         );
+    }
+
+    #[test]
+    fn controller_presentation_fields_are_absent_from_the_turn_request_contract() {
+        for field in ["attach", "detach"] {
+            let mut request = serde_json::json!({
+                "schema_version": "satelle.api.v2",
+                "prompt": "private prompt",
+                "execution_mode": "standard"
+            });
+            request
+                .as_object_mut()
+                .expect("Turn request fixture is an object")
+                .insert(field.to_string(), serde_json::json!(true));
+
+            assert!(
+                serde_json::from_value::<TurnRequest>(request).is_err(),
+                "Controller-only {field} must not enter the Host Turn request grammar"
+            );
+        }
     }
 
     #[test]

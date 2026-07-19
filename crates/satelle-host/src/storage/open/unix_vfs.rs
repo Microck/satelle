@@ -1,9 +1,19 @@
 use super::{StorageError, StorageErrorKind};
 use rusqlite::ffi;
+#[cfg(target_os = "macos")]
+use std::collections::BTreeMap;
 use std::ffi::{CStr, c_char, c_int, c_void};
 use std::fmt;
+#[cfg(target_os = "macos")]
+use std::fs::File;
+#[cfg(target_os = "macos")]
+use std::os::fd::{AsRawFd, RawFd};
+#[cfg(target_os = "macos")]
+use std::path::{Path, PathBuf};
 use std::ptr;
 use std::sync::OnceLock;
+#[cfg(target_os = "macos")]
+use std::sync::{Arc, Mutex};
 
 #[cfg(target_os = "macos")]
 mod macos;
@@ -14,8 +24,118 @@ const VFS_NAME: &CStr = c"satelle-unix-excl";
 const DELEGATE_NAME: &CStr = c"unix-excl";
 #[cfg(target_os = "linux")]
 const PINNED_PATH_PREFIX: &[u8] = b"/proc/self/fd/";
+#[cfg(target_os = "macos")]
+const VALIDATION_PATH_PREFIX: &[u8] = b"/.satelle-validation-fd/";
 
 static REGISTRATION: OnceLock<Result<(), RegistrationFailure>> = OnceLock::new();
+#[cfg(target_os = "macos")]
+static VALIDATION_FILES: OnceLock<Mutex<BTreeMap<RawFd, Arc<RegisteredValidationFile>>>> =
+    OnceLock::new();
+
+#[cfg(target_os = "macos")]
+struct RegisteredValidationFile {
+    _file: File,
+    delegated_path: Box<[u8]>,
+}
+
+#[cfg(target_os = "macos")]
+pub(super) struct ValidationFileRegistration {
+    descriptor: RawFd,
+    sqlite_path: PathBuf,
+}
+
+#[cfg(target_os = "macos")]
+impl ValidationFileRegistration {
+    pub(super) fn path(&self) -> &Path {
+        &self.sqlite_path
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl Drop for ValidationFileRegistration {
+    fn drop(&mut self) {
+        validation_files()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&self.descriptor);
+    }
+}
+
+#[cfg(target_os = "macos")]
+pub(super) fn register_validation_file(
+    file: &File,
+) -> Result<ValidationFileRegistration, StorageError> {
+    let retained = file
+        .try_clone()
+        .map_err(|source| StorageError::with_source(StorageErrorKind::OpenFailed, source))?;
+    let descriptor = retained.as_raw_fd();
+    #[cfg(target_os = "linux")]
+    let sqlite_path = PathBuf::from(format!("/proc/self/fd/{descriptor}"));
+    #[cfg(target_os = "macos")]
+    let sqlite_path = PathBuf::from(format!("/.satelle-validation-fd/{descriptor}"));
+    let registered = RegisteredValidationFile {
+        _file: retained,
+        delegated_path: {
+            #[cfg(target_os = "linux")]
+            let mut path = format!("/proc/self/fd/{descriptor}").into_bytes();
+            #[cfg(target_os = "macos")]
+            let mut path = format!("/dev/fd/{descriptor}").into_bytes();
+            path.extend_from_slice(&[0, 0]);
+            path.into_boxed_slice()
+        },
+    };
+    let replaced = validation_files()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(descriptor, Arc::new(registered));
+    if replaced.is_some() {
+        return Err(StorageError::new(StorageErrorKind::OpenFailed));
+    }
+    Ok(ValidationFileRegistration {
+        descriptor,
+        sqlite_path,
+    })
+}
+
+#[cfg(target_os = "macos")]
+fn validation_files() -> &'static Mutex<BTreeMap<RawFd, Arc<RegisteredValidationFile>>> {
+    VALIDATION_FILES.get_or_init(|| Mutex::new(BTreeMap::new()))
+}
+
+#[cfg(target_os = "macos")]
+fn validation_descriptor(path: &[u8]) -> Option<RawFd> {
+    let descriptor = path.strip_prefix(VALIDATION_PATH_PREFIX)?;
+    if descriptor.is_empty() || !descriptor.iter().all(u8::is_ascii_digit) {
+        return None;
+    }
+    let descriptor = std::str::from_utf8(descriptor)
+        .ok()?
+        .parse::<RawFd>()
+        .ok()?;
+    validation_files()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .contains_key(&descriptor)
+        .then_some(descriptor)
+}
+
+#[cfg(target_os = "macos")]
+fn registered_validation_file(path: &[u8]) -> Option<Arc<RegisteredValidationFile>> {
+    let descriptor = validation_descriptor(path)?;
+    validation_files()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(&descriptor)
+        .cloned()
+}
+
+#[cfg(target_os = "macos")]
+fn is_validation_namespace(path: &[u8]) -> bool {
+    let Some(descriptor) = path.strip_prefix(VALIDATION_PATH_PREFIX) else {
+        return false;
+    };
+    !descriptor.is_empty() && descriptor.iter().all(u8::is_ascii_digit)
+}
 
 /// Registers the descriptor-anchored VFS once and returns its stable name.
 ///
@@ -214,6 +334,9 @@ fn is_protected_leaf(leaf: &[u8]) -> bool {
         .iter()
         .any(|file_name| file_name.as_bytes() == leaf)
         || is_migration_backup_leaf(leaf)
+        || std::str::from_utf8(leaf)
+            .ok()
+            .is_some_and(super::is_restore_internal_sqlite_leaf)
 }
 
 fn is_migration_backup_leaf(leaf: &[u8]) -> bool {
@@ -247,7 +370,7 @@ fn is_migration_backup_leaf(leaf: &[u8]) -> bool {
 
 #[cfg(target_os = "macos")]
 fn is_pinned_path(path: &[u8]) -> bool {
-    macos::is_pinned_path(path)
+    validation_descriptor(path).is_some() || macos::is_pinned_path(path)
 }
 
 unsafe fn delegate_from(wrapper: *mut ffi::sqlite3_vfs) -> Option<*mut ffi::sqlite3_vfs> {
@@ -283,6 +406,14 @@ unsafe extern "C" fn forward_open(
     let Some(callback) = (unsafe { (*delegate).xOpen }) else {
         return ffi::SQLITE_IOERR;
     };
+    // SAFETY: the helper accepts only registered descriptor paths and retains
+    // the physical file and delegated path until the connection is closed.
+    #[cfg(target_os = "macos")]
+    if let Some(code) =
+        unsafe { open_validation_file(delegate, callback, name, file, flags, output_flags) }
+    {
+        return code;
+    }
     #[cfg(target_os = "macos")]
     // SAFETY: macos validates the callback inputs before handling only its
     // internal pinned-path namespace.
@@ -294,6 +425,58 @@ unsafe extern "C" fn forward_open(
     // SAFETY: SQLite supplied the remaining arguments according to xOpen's
     // callback contract; the delegate callback receives its own VFS pointer.
     unsafe { callback(delegate, name, file, flags, output_flags) }
+}
+
+#[cfg(target_os = "macos")]
+unsafe fn open_validation_file(
+    delegate: *mut ffi::sqlite3_vfs,
+    callback: unsafe extern "C" fn(
+        *mut ffi::sqlite3_vfs,
+        ffi::sqlite3_filename,
+        *mut ffi::sqlite3_file,
+        c_int,
+        *mut c_int,
+    ) -> c_int,
+    name: ffi::sqlite3_filename,
+    file: *mut ffi::sqlite3_file,
+    flags: c_int,
+    output_flags: *mut c_int,
+) -> Option<c_int> {
+    if name.is_null() {
+        return None;
+    }
+    // SAFETY: SQLite supplies xOpen with a NUL-terminated filename.
+    let path = unsafe { CStr::from_ptr(name) }.to_bytes();
+    let Some(registered) = registered_validation_file(path) else {
+        return is_validation_namespace(path).then_some(ffi::SQLITE_CANTOPEN);
+    };
+    if flags & (ffi::SQLITE_OPEN_CREATE | ffi::SQLITE_OPEN_DELETEONCLOSE) != 0
+        || flags & ffi::SQLITE_OPEN_READONLY == 0
+    {
+        return Some(ffi::SQLITE_CANTOPEN);
+    }
+    // The descriptor itself is the no-follow boundary, so applying SQLite's
+    // pathname no-follow flag to /proc/self/fd or /dev/fd would reject the
+    // descriptor link rather than protect the original leaf.
+    let delegated_flags = flags & !(ffi::SQLITE_OPEN_EXCLUSIVE | ffi::SQLITE_OPEN_NOFOLLOW);
+    // SAFETY: the registry retains both the file descriptor and double-NUL
+    // path until ValidationFileRegistration is dropped after SQLite closes.
+    let code = unsafe {
+        callback(
+            delegate,
+            registered.delegated_path.as_ptr().cast(),
+            file,
+            delegated_flags,
+            output_flags,
+        )
+    };
+    if code == ffi::SQLITE_OK && !output_flags.is_null() {
+        // SAFETY: SQLite supplied writable output storage.
+        unsafe {
+            *output_flags &= !(ffi::SQLITE_OPEN_EXCLUSIVE | ffi::SQLITE_OPEN_NOFOLLOW);
+        }
+    }
+    Some(code)
 }
 
 unsafe extern "C" fn forward_delete(
