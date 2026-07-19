@@ -2,7 +2,7 @@ use assert_cmd::cargo::CommandCargoExt;
 use satelle_host::{ApiBearerToken, test_support::TestStateDir};
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
-use std::io::Write;
+use std::io::{BufRead, BufReader, Write};
 use std::net::{SocketAddr, TcpListener};
 use std::path::Path;
 use std::process::{Child, ChildStdin, Command, Output, Stdio};
@@ -15,6 +15,7 @@ mod test_file;
 
 const SESSION_ID: &str = "rs_01890a5d-ac96-7b7c-8f89-37c3d0a66e11";
 const DIRECT_READ_CONNECTIONS: usize = 4;
+const TEST_INFRASTRUCTURE_DEADLOCK_LIMIT: Duration = Duration::from_secs(30);
 
 struct ImmediateCloseEndpoint {
     address: SocketAddr,
@@ -167,6 +168,60 @@ fn wait_with_open_stdin(mut child: Child, stdin: ChildStdin, timeout_message: &s
         }
         thread::sleep(Duration::from_millis(10));
     }
+}
+
+fn synchronize_pre_initialization_server(child: &mut Child, stdin: &mut ChildStdin) {
+    // RMCP permits ping before initialization. Waiting for its response proves
+    // that the child runtime, bounded framer, and protocol reader are all
+    // running before an EOF-independent exit deadline starts. This keeps slow
+    // Windows process startup out of the shutdown contract being measured.
+    stdin
+        .write_all(b"{\"jsonrpc\":\"2.0\",\"id\":0,\"method\":\"ping\"}\n")
+        .expect("write pre-initialization ping");
+    stdin.flush().expect("flush pre-initialization ping");
+
+    let mut stdout = child.stdout.take().expect("piped stdout");
+    let (response_sender, response_receiver) = mpsc::sync_channel(1);
+    let response_reader = thread::spawn(move || {
+        let mut response = String::new();
+        let read = BufReader::new(&mut stdout).read_line(&mut response);
+        let _ = response_sender.send((stdout, response, read));
+    });
+    let (stdout, response, read) = match response_receiver
+        .recv_timeout(TEST_INFRASTRUCTURE_DEADLOCK_LIMIT)
+    {
+        Ok(response) => response,
+        Err(mpsc::RecvTimeoutError::Timeout) => {
+            if child
+                .try_wait()
+                .expect("poll wedged MCP test process")
+                .is_none()
+            {
+                child.kill().expect("terminate wedged MCP test process");
+            }
+            child.wait().expect("reap wedged MCP test process");
+            response_reader
+                .join()
+                .expect("join MCP readiness response reader");
+            panic!(
+                "MCP test infrastructure exceeded its deadlock limit before the 2-second exit contract started"
+            );
+        }
+        Err(mpsc::RecvTimeoutError::Disconnected) => {
+            response_reader
+                .join()
+                .expect("join failed MCP readiness response reader");
+            panic!("MCP readiness response reader exited without a result");
+        }
+    };
+    response_reader
+        .join()
+        .expect("join MCP readiness response reader");
+    child.stdout = Some(stdout);
+    read.expect("read pre-initialization ping response");
+    let response: Value = serde_json::from_str(&response).expect("parse ping response");
+    assert_eq!(response["id"], 0);
+    assert_eq!(response["result"], json!({}));
 }
 
 fn seed_session(home: &Path) -> String {
@@ -756,6 +811,7 @@ fn initialization_failure_exits_while_client_stdin_remains_open() {
     let (mut command, _home) = mcp_command();
     let mut child = command.spawn().expect("spawn MCP server");
     let mut stdin = child.stdin.take().expect("piped stdin");
+    synchronize_pre_initialization_server(&mut child, &mut stdin);
     stdin
         .write_all(b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/list\",\"params\":{}}\n")
         .expect("write a request before initialization");
@@ -776,6 +832,7 @@ fn oversized_input_is_rejected_before_rmcp() {
     let (mut command, _home) = mcp_command();
     let mut child = command.spawn().expect("spawn MCP server");
     let mut stdin = child.stdin.take().expect("piped stdin");
+    synchronize_pre_initialization_server(&mut child, &mut stdin);
     let _ = stdin.write_all(&vec![b' '; 1_048_577]);
     let output = wait_with_open_stdin(
         child,

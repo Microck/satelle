@@ -665,7 +665,7 @@ fn concurrent_commands_retain_every_history_row() {
                 let mut command = satelle_command(&cache_root, &state_root);
                 start.wait();
                 command
-                    .args(["config", "check", "--json"])
+                    .args(["--error-format", "human", "config", "check", "--json"])
                     .output()
                     .expect("run concurrent config check")
             })
@@ -677,6 +677,11 @@ fn concurrent_commands_retain_every_history_row() {
         assert!(
             output.status.success(),
             "concurrent command failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            !String::from_utf8_lossy(&output.stderr).contains("command history was not recorded"),
+            "concurrent history write failed: {}",
             String::from_utf8_lossy(&output.stderr)
         );
     }

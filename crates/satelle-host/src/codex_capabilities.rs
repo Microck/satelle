@@ -1,9 +1,11 @@
 use command_group::{CommandGroup, GroupChild};
 use satelle_core::ControlPlaneFailureReason;
 use serde::Serialize;
+use serde_json::Value;
 use std::fmt;
 use std::io::ErrorKind;
-use std::io::Read;
+use std::io::{BufRead, BufReader, Read, Write};
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::mpsc;
 use std::thread;
@@ -20,6 +22,11 @@ mod control_plane_tests;
 const VERSION_OUTPUT_LIMIT: u64 = 129;
 const VERSION_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 const VERSION_PROBE_POLL_INTERVAL: Duration = Duration::from_millis(10);
+const APP_POLICY_MESSAGE_LIMIT: usize = 128;
+const APP_POLICY_LINE_LIMIT: u64 = 2 * 1024 * 1024;
+const APP_POLICY_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
+const APP_POLICY_SHUTDOWN_GRACE: Duration = Duration::from_millis(100);
+const LEGACY_APP_POLICY_LIMIT: u64 = 64 * 1024;
 
 /// Exact Codex release whose stable schema and native-host behavior define the
 /// Phase 0 compatibility contract. Later patches require fresh acceptance.
@@ -192,22 +199,26 @@ impl RequiredCapability {
 #[serde(rename_all = "snake_case")]
 pub(crate) enum EvidenceSurface {
     Stable,
+    Private,
     #[cfg(test)]
     Experimental,
     #[cfg(test)]
     Undocumented,
     Absent,
+    Incomplete,
 }
 
 impl EvidenceSurface {
     pub(crate) const fn as_str(self) -> &'static str {
         match self {
             Self::Stable => "stable",
+            Self::Private => "private",
             #[cfg(test)]
             Self::Experimental => "experimental",
             #[cfg(test)]
             Self::Undocumented => "undocumented",
             Self::Absent => "absent",
+            Self::Incomplete => "incomplete",
         }
     }
 }
@@ -414,8 +425,13 @@ pub(crate) fn discover_phase0(probe_timeout: Option<Duration>) -> Phase0Discover
     let (capabilities, control_plane_admission) = match codex_version {
         CodexVersionEvidence::Detected { version } if version == REQUIRED_CODEX_VERSION => {
             let probe = control_plane::probe_installed_control_plane(probe_timeout);
+            let mut capabilities = CapabilityMatrix::from_control_plane(probe);
+            if host_platform == HostPlatform::Windows {
+                capabilities.approval_observation.surface =
+                    probe_windows_app_policy(probe_timeout.unwrap_or(APP_POLICY_PROBE_TIMEOUT));
+            }
             (
-                CapabilityMatrix::from_control_plane(probe),
+                capabilities,
                 control_plane::ControlPlaneAdmission::from_probe(probe),
             )
         }
@@ -457,6 +473,479 @@ pub(crate) fn discover_phase0(probe_timeout: Option<Duration>) -> Phase0Discover
 #[cfg(all(test, target_os = "linux"))]
 pub(crate) fn discover_phase0_evidence() -> Phase0CapabilityEvidence {
     discover_phase0(None).evidence
+}
+
+/// Resolves the active Codex home through the installed app-server, then reads
+/// its Windows app policy. No path or configured app identifier crosses this
+/// closed evidence boundary.
+fn probe_windows_app_policy(timeout: Duration) -> EvidenceSurface {
+    probe_windows_app_policy_with(control_plane::installed_app_server_command(), timeout)
+}
+
+fn probe_windows_app_policy_with(mut command: Command, timeout: Duration) -> EvidenceSurface {
+    let deadline = Instant::now() + timeout;
+    if Instant::now() >= deadline {
+        return EvidenceSurface::Incomplete;
+    }
+
+    let mut child = match command
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .group_spawn()
+    {
+        Ok(child) => child,
+        Err(_) => return EvidenceSurface::Incomplete,
+    };
+    let Some(mut stdin) = child.inner().stdin.take() else {
+        let _ = terminate_group(&mut child);
+        return EvidenceSurface::Incomplete;
+    };
+    let Some(stdout) = child.inner().stdout.take() else {
+        let _ = terminate_group(&mut child);
+        return EvidenceSurface::Incomplete;
+    };
+
+    let (sender, receiver) = mpsc::channel();
+    let reader = thread::spawn(move || read_app_policy_messages(stdout, sender));
+    let initialized = write_json_line(
+        &mut stdin,
+        &serde_json::json!({
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "clientInfo": {
+                    "name": "satelle-host",
+                    "version": env!("CARGO_PKG_VERSION")
+                },
+                "capabilities": {"experimentalApi": false}
+            }
+        }),
+    );
+    let initialize_result = initialized
+        .then(|| next_app_policy_result(&receiver, 1, deadline))
+        .flatten();
+    let codex_home = initialize_result
+        .as_ref()
+        .filter(|result| result.get("platformOs").and_then(Value::as_str) == Some("windows"))
+        .and_then(|result| result.get("codexHome"))
+        .and_then(Value::as_str)
+        .map(PathBuf::from)
+        .filter(|path| path.is_absolute());
+
+    let initialized_sent = codex_home.is_some()
+        && write_json_line(&mut stdin, &serde_json::json!({"method": "initialized"}));
+    let config_read_sent = initialized_sent
+        && write_json_line(
+            &mut stdin,
+            &serde_json::json!({
+                "id": 2,
+                "method": "config/read",
+                "params": {"includeLayers": true}
+            }),
+        );
+    let config_result = config_read_sent
+        .then(|| next_app_policy_result(&receiver, 2, deadline))
+        .flatten();
+    let surface = codex_home
+        .as_deref()
+        .zip(config_result.as_ref())
+        .map(|(codex_home, result)| classify_windows_app_policy(codex_home, result))
+        .unwrap_or(EvidenceSurface::Incomplete);
+
+    let shutdown_deadline = Instant::now()
+        + deadline
+            .saturating_duration_since(Instant::now())
+            .min(APP_POLICY_SHUTDOWN_GRACE);
+    let status = wait_for_group(&mut child, shutdown_deadline);
+    let group_stopped = terminate_group(&mut child);
+    drop(stdin);
+    let reader_cleanup_deadline = Instant::now() + APP_POLICY_SHUTDOWN_GRACE;
+    while !reader.is_finished() && Instant::now() < reader_cleanup_deadline {
+        thread::sleep(VERSION_PROBE_POLL_INTERVAL);
+    }
+    let reader_stopped = reader.is_finished() && reader.join().is_ok();
+    if matches!(status, GroupWaitOutcome::Deadline) && group_stopped && reader_stopped {
+        surface
+    } else {
+        EvidenceSurface::Incomplete
+    }
+}
+
+fn write_json_line(writer: &mut impl Write, value: &Value) -> bool {
+    serde_json::to_writer(&mut *writer, value).is_ok()
+        && writer.write_all(b"\n").is_ok()
+        && writer.flush().is_ok()
+}
+
+fn read_app_policy_messages(
+    stdout: std::process::ChildStdout,
+    sender: mpsc::Sender<Result<Value, ()>>,
+) {
+    let mut reader = BufReader::new(stdout);
+    for _ in 0..APP_POLICY_MESSAGE_LIMIT {
+        let mut line = Vec::new();
+        let mut bounded = (&mut reader).take(APP_POLICY_LINE_LIMIT + 1);
+        let complete_line = matches!(
+            bounded.read_until(b'\n', &mut line),
+            Ok(read) if read > 0
+                && read <= APP_POLICY_LINE_LIMIT as usize
+                && line.last() == Some(&b'\n')
+        );
+        if !complete_line {
+            let _ = sender.send(Err(()));
+            return;
+        }
+        if sender
+            .send(serde_json::from_slice(&line).map_err(|_| ()))
+            .is_err()
+        {
+            return;
+        }
+    }
+    let _ = sender.send(Err(()));
+}
+
+fn next_app_policy_result(
+    receiver: &mpsc::Receiver<Result<Value, ()>>,
+    expected_id: u64,
+    deadline: Instant,
+) -> Option<Value> {
+    for _ in 0..APP_POLICY_MESSAGE_LIMIT {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return None;
+        }
+        let Ok(Ok(message)) = receiver.recv_timeout(remaining) else {
+            return None;
+        };
+        let object = message.as_object()?;
+        match object.get("id").and_then(Value::as_u64) {
+            Some(id) if id == expected_id => return object.get("result").cloned(),
+            Some(_) => return None,
+            None if object.get("method").and_then(Value::as_str).is_some() => continue,
+            None => return None,
+        }
+    }
+    None
+}
+
+/// Classifies only whether the supported current policy surface exists. App
+/// identifiers and paths are deliberately discarded. A legacy allow-list is
+/// private migration input, while the removed denied list has no effect.
+fn classify_windows_app_policy(codex_home: &Path, config_result: &Value) -> EvidenceSurface {
+    let Some(layers) = config_result.get("layers").and_then(Value::as_array) else {
+        return EvidenceSurface::Incomplete;
+    };
+    let expected_file = codex_home.join("config.toml");
+    let mut base_user_layer = None;
+    for layer in layers {
+        let Some(name) = layer.get("name").and_then(Value::as_object) else {
+            return EvidenceSurface::Incomplete;
+        };
+        if name.get("type").and_then(Value::as_str) != Some("user")
+            || !name.get("profile").is_none_or(Value::is_null)
+        {
+            continue;
+        }
+        let Some(file) = name.get("file").and_then(Value::as_str).map(PathBuf::from) else {
+            return EvidenceSurface::Incomplete;
+        };
+        if file != expected_file || base_user_layer.is_some() {
+            return EvidenceSurface::Incomplete;
+        }
+        if !layer.get("disabledReason").is_none_or(Value::is_null) {
+            return EvidenceSurface::Incomplete;
+        }
+        let Some(config) = layer.get("config") else {
+            return EvidenceSurface::Incomplete;
+        };
+        base_user_layer = Some(config);
+    }
+
+    let Some(config) = base_user_layer else {
+        return classify_legacy_windows_app_policy(codex_home);
+    };
+    let Some(config) = config.as_object() else {
+        return EvidenceSurface::Incomplete;
+    };
+    let Some(computer_use) = config.get("computer_use") else {
+        return classify_legacy_windows_app_policy(codex_home);
+    };
+    let Some(computer_use) = computer_use.as_object() else {
+        return EvidenceSurface::Incomplete;
+    };
+    let Some(windows) = computer_use.get("windows") else {
+        return classify_legacy_windows_app_policy(codex_home);
+    };
+    let Some(windows) = windows.as_object() else {
+        return EvidenceSurface::Incomplete;
+    };
+    match windows.get("always_allowed_app_ids") {
+        Some(app_ids)
+            if app_ids
+                .as_array()
+                .is_some_and(|app_ids| app_ids.iter().all(Value::is_string)) =>
+        {
+            EvidenceSurface::Stable
+        }
+        Some(_) => EvidenceSurface::Incomplete,
+        None => classify_legacy_windows_app_policy(codex_home),
+    }
+}
+
+/// Fact `80d` requires this Codex 0.144.0 migration input while upstream still
+/// documents the old file. Remove this branch when upstream drops that import
+/// path or the fact is retired; the current `config.toml` policy stays canonical.
+fn classify_legacy_windows_app_policy(codex_home: &Path) -> EvidenceSurface {
+    let path = codex_home.join("computer-use").join("config.toml");
+    let contents = match read_bounded_utf8(&path, LEGACY_APP_POLICY_LIMIT) {
+        Ok(Some(contents)) => contents,
+        Ok(None) => return EvidenceSurface::Absent,
+        Err(()) => return EvidenceSurface::Incomplete,
+    };
+    match toml_string_array_entries(&contents, "apps", "allowed") {
+        Ok(Some(true)) => EvidenceSurface::Private,
+        Ok(Some(false) | None) => EvidenceSurface::Absent,
+        Err(()) => EvidenceSurface::Incomplete,
+    }
+}
+
+fn read_bounded_utf8(path: &Path, limit: u64) -> Result<Option<String>, ()> {
+    let file = match std::fs::File::open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
+        Err(_) => return Err(()),
+    };
+    let mut bytes = Vec::new();
+    if file.take(limit + 1).read_to_end(&mut bytes).is_err() || bytes.len() > limit as usize {
+        return Err(());
+    }
+    String::from_utf8(bytes).map(Some).map_err(|_| ())
+}
+
+fn toml_string_array_entries(
+    contents: &str,
+    expected_table: &str,
+    expected_key: &str,
+) -> Result<Option<bool>, ()> {
+    let mut lines = contents.lines();
+    let mut in_expected_table = false;
+    let mut entries = None;
+
+    while let Some(raw_line) = lines.next() {
+        let line = match strip_toml_comment(raw_line) {
+            Ok(line) => line,
+            Err(()) if !in_expected_table => continue,
+            Err(()) => return Err(()),
+        };
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if trimmed.starts_with('[') {
+            if !trimmed.ends_with(']') {
+                return Err(());
+            }
+            in_expected_table = !trimmed.starts_with("[[")
+                && trimmed
+                    .strip_prefix('[')
+                    .and_then(|table| table.strip_suffix(']'))
+                    .is_some_and(|table| table.trim() == expected_table);
+            continue;
+        }
+        if !in_expected_table {
+            continue;
+        }
+        let Some((key, value)) = split_toml_assignment(trimmed)? else {
+            continue;
+        };
+        if !toml_key_matches(key.trim(), expected_key) {
+            continue;
+        }
+        if entries.is_some() {
+            return Err(());
+        }
+
+        let mut array = value.trim().to_string();
+        while !toml_array_is_closed(&array)? {
+            let next = lines.next().ok_or(())?;
+            array.push('\n');
+            array.push_str(&strip_toml_comment(next)?);
+        }
+        entries = Some(parse_toml_string_array(&array)?);
+    }
+
+    Ok(entries)
+}
+
+fn toml_key_matches(key: &str, expected: &str) -> bool {
+    key == expected
+        || key
+            .strip_prefix('"')
+            .and_then(|key| key.strip_suffix('"'))
+            .is_some_and(|key| key == expected)
+        || key
+            .strip_prefix('\'')
+            .and_then(|key| key.strip_suffix('\''))
+            .is_some_and(|key| key == expected)
+}
+
+fn strip_toml_comment(line: &str) -> Result<String, ()> {
+    let mut quote = None;
+    let mut escaped = false;
+    for (index, character) in line.char_indices() {
+        match quote {
+            Some('"') if escaped => escaped = false,
+            Some('"') if character == '\\' => escaped = true,
+            Some(active) if character == active => quote = None,
+            Some(_) => {}
+            None if matches!(character, '"' | '\'') => quote = Some(character),
+            None if character == '#' => return Ok(line[..index].to_string()),
+            None => {}
+        }
+    }
+    if quote.is_some() || escaped {
+        Err(())
+    } else {
+        Ok(line.to_string())
+    }
+}
+
+fn split_toml_assignment(line: &str) -> Result<Option<(&str, &str)>, ()> {
+    let mut quote = None;
+    let mut escaped = false;
+    for (index, character) in line.char_indices() {
+        match quote {
+            Some('"') if escaped => escaped = false,
+            Some('"') if character == '\\' => escaped = true,
+            Some(active) if character == active => quote = None,
+            Some(_) => {}
+            None if matches!(character, '"' | '\'') => quote = Some(character),
+            None if character == '=' => return Ok(Some((&line[..index], &line[index + 1..]))),
+            None => {}
+        }
+    }
+    if quote.is_some() || escaped {
+        Err(())
+    } else {
+        Ok(None)
+    }
+}
+
+fn toml_array_is_closed(value: &str) -> Result<bool, ()> {
+    let mut depth = 0_u32;
+    let mut quote = None;
+    let mut escaped = false;
+    for (index, character) in value.char_indices() {
+        match quote {
+            Some('"') if escaped => escaped = false,
+            Some('"') if character == '\\' => escaped = true,
+            Some(active) if character == active => quote = None,
+            Some(_) => {}
+            None if matches!(character, '"' | '\'') => quote = Some(character),
+            None if character == '[' => depth = depth.checked_add(1).ok_or(())?,
+            None if character == ']' => {
+                depth = depth.checked_sub(1).ok_or(())?;
+                if depth == 0 {
+                    return value[index + 1..]
+                        .trim()
+                        .is_empty()
+                        .then_some(true)
+                        .ok_or(());
+                }
+            }
+            None if depth == 0 && !character.is_whitespace() => return Err(()),
+            None => {}
+        }
+    }
+    if quote.is_some() || escaped || depth == 0 {
+        Err(())
+    } else {
+        Ok(false)
+    }
+}
+
+fn parse_toml_string_array(value: &str) -> Result<bool, ()> {
+    let mut characters = value.chars().peekable();
+    skip_toml_whitespace(&mut characters);
+    if characters.next() != Some('[') {
+        return Err(());
+    }
+    skip_toml_whitespace(&mut characters);
+    if characters.next_if_eq(&']').is_some() {
+        skip_toml_whitespace(&mut characters);
+        return characters.next().is_none().then_some(false).ok_or(());
+    }
+
+    loop {
+        let quote = characters
+            .next()
+            .filter(|character| matches!(character, '"' | '\''));
+        let Some(quote) = quote else {
+            return Err(());
+        };
+        parse_toml_string(&mut characters, quote)?;
+        skip_toml_whitespace(&mut characters);
+        match characters.next() {
+            Some(']') => break,
+            Some(',') => {
+                skip_toml_whitespace(&mut characters);
+                if characters.next_if_eq(&']').is_some() {
+                    break;
+                }
+            }
+            _ => return Err(()),
+        }
+    }
+    skip_toml_whitespace(&mut characters);
+    characters.next().is_none().then_some(true).ok_or(())
+}
+
+fn skip_toml_whitespace(characters: &mut std::iter::Peekable<std::str::Chars<'_>>) {
+    while characters
+        .next_if(|character| character.is_whitespace())
+        .is_some()
+    {}
+}
+
+fn parse_toml_string(
+    characters: &mut std::iter::Peekable<std::str::Chars<'_>>,
+    quote: char,
+) -> Result<(), ()> {
+    loop {
+        let character = characters.next().ok_or(())?;
+        if character == quote {
+            return Ok(());
+        }
+        if character == '\n' || character == '\r' || character.is_control() {
+            return Err(());
+        }
+        if quote == '"' && character == '\\' {
+            match characters.next().ok_or(())? {
+                'b' | 'e' | 'f' | 'n' | 'r' | 't' | '"' | '\\' => {}
+                'x' => consume_hex_escape(characters, 2)?,
+                'u' => consume_hex_escape(characters, 4)?,
+                'U' => consume_hex_escape(characters, 8)?,
+                _ => return Err(()),
+            }
+        }
+    }
+}
+
+fn consume_hex_escape(
+    characters: &mut std::iter::Peekable<std::str::Chars<'_>>,
+    digits: usize,
+) -> Result<(), ()> {
+    for _ in 0..digits {
+        if !characters
+            .next()
+            .is_some_and(|character| character.is_ascii_hexdigit())
+        {
+            return Err(());
+        }
+    }
+    Ok(())
 }
 
 /// Evaluates the complete Phase 0 capability contract. The evaluator reports

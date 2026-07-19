@@ -26,6 +26,10 @@ The product requirements are the following `.facts` entries:
   Linux is a Controller Platform, not a native Computer Use Host Platform.
 - `r7b`, `9uvm`, and `k0f`: native prompts remain operator-visible unless a
   stable callback exists, and capability probes outrank remembered docs.
+- `nhx`, `71g`, `80d`, and `zgl`: Windows app-policy discovery resolves the
+  active Codex home, recognizes the current allow-list, treats the legacy file
+  only as migration input, and does not turn sensitive-action prompts into a
+  policy guarantee.
 - `hbqw`, `b3i`, and `q0a`: YOLO applies the documented Codex approval and
   sandbox settings without extending into native or operating-system prompts.
 - `pr0`, `h2e`, and `sj4`: Satelle steer starts a follow-up Turn on the same
@@ -37,6 +41,8 @@ Upstream evidence:
 - [Codex 0.144.0 generated protocol schema](https://raw.githubusercontent.com/openai/codex/rust-v0.144.0/codex-rs/app-server-protocol/schema/json/codex_app_server_protocol.schemas.json)
 - [Current official Codex manual](https://developers.openai.com/codex/codex-manual.md),
   retrieved 2026-07-09 for current Computer Use platform and approval policy
+- [Current Computer Use guide](https://learn.chatgpt.com/docs/computer-use),
+  retrieved 2026-07-18 for Windows app-policy storage and migration behavior
 
 The version-tagged README and schema are authoritative for protocol shape. The
 current manual is authoritative only for current product availability and
@@ -99,6 +105,7 @@ Status meanings:
 | Lifecycle events | `thread/started`, `turn/started`, `item/started`, item deltas, `item/completed`, and `turn/completed` | available | Treat `item/completed` as the authoritative item result. The README notes that turn notifications currently carry an empty `items` array. |
 | Terminal outcome | `turn/completed` with `completed`, `interrupted`, or `failed` status | available | Normalize upstream status into Satelle's stable Turn state without exposing the upstream spelling. |
 | Generic approval callbacks | Stable server requests for command execution, file change, and permission approval | partial | These callbacks cover their documented action classes only. They are not evidence of native Computer Use app approval coverage. |
+| Windows persistent app policy | `initialize` supplies the active `codexHome`; `config/read` with layers includes the raw parsed user `config.toml` layer | partial | Match the base user layer to `codexHome/config.toml`, then report `stable` only for a string array at `[computer_use.windows].always_allowed_app_ids`. A legacy `[apps].allowed` list is `private` migration input. Missing policy is `absent`; malformed or unreadable evidence is `incomplete`. Never retain the path or app identifiers. The removed legacy `denied` list is not a fallback. |
 | Native Computer Use approval state | No documented native app or sensitive-action approval callback appears in the stable `ServerRequest` union | blocked | The current manual says Computer Use app approvals surface directly to the user. Satelle must surface an observable prompt as `action_required` or a manual-action-required blocker. If the prompt cannot be observed through a supported signal, return a typed missing-capability blocker. |
 | Native Computer Use readiness | `configRequirements/read` exposes only the managed `computerUse.allowLockedComputerUse` constraint | blocked | This field is policy, not proof of plugin installation, enablement, OS permissions, app approval, desktop availability, or action-path readiness. A live harmless action is mandatory. |
 | Harmless native action | A normal Codex Turn may invoke native Computer Use; app-server has no separate readiness-success request | blocked | Prove on a supported Host by observing the expected nonce and harmless visible action through the same path used for prompt Turns. Plugin presence alone is insufficient. |
@@ -165,8 +172,8 @@ workflow as supported. A missing-capability blocker must carry, at minimum:
   recovery;
 - the detected Codex version;
 - the detected Host platform;
-- whether the only observed surface is stable, experimental, undocumented, or
-  absent; and
+- whether the only observed surface is stable, private, experimental,
+  undocumented, absent, or incomplete; and
 - evidence suitable for diagnostics, without prompt content or secrets.
 
 The blocker is an internal adapter type. Its translation into Satelle public
@@ -186,6 +193,15 @@ permissions from app approvals:
   `[computer_use.windows].always_allowed_app_ids` in
   `$CODEX_HOME/config.toml`; and
 - app approvals may still require direct user action.
+
+The Windows Host probe obtains the active Codex home from the live app-server
+`initialize` response, not from a remembered default path. It reads the raw
+parsed base user layer through `config/read` and requires that layer to identify
+the resolved home's `config.toml`. Only when the current key is absent does it
+inspect `$CODEX_HOME/computer-use/config.toml`; `[apps].allowed` is private
+migration evidence, while `[apps].denied` is ignored because the current policy
+schema removed it. A stable app allow-list does not prove that Satelle can
+observe or resolve a later sensitive-action prompt.
 
 For Satelle MVP, macOS and Windows are candidate native Computer Use Host
 Platforms. Linux may run the Controller and test the generic app-server
