@@ -77,11 +77,37 @@ pub fn assert_json_error(
 
 pub fn assert_human_error(stderr: &[u8], expected_code: &str) {
     let raw = String::from_utf8_lossy(stderr);
-    let prefix = format!("error: {expected_code}\n");
-    assert!(raw.starts_with(&prefix), "unexpected human error: {raw}");
+    let lines = raw.lines().collect::<Vec<_>>();
     assert!(
-        !raw[prefix.len()..].trim().is_empty(),
-        "human errors must include a message"
+        lines
+            .first()
+            .is_some_and(|line| line.starts_with("error: ") && line.len() > "error: ".len()),
+        "human errors must lead with a user-visible outcome: {raw}"
+    );
+    let expected_cause_suffix = format!(" [{expected_code}]");
+    assert!(
+        lines.get(1).is_some_and(|line| {
+            line.starts_with("cause: ")
+                && line.ends_with(&expected_cause_suffix)
+                && line.len() > "cause: ".len() + expected_cause_suffix.len()
+        }),
+        "human errors must identify the typed cause after the outcome: {raw}"
+    );
+    assert!(
+        matches!(lines.len(), 3 | 4),
+        "human errors may contain only outcome, cause, optional state, and recovery: {raw}"
+    );
+    if lines.len() == 4 {
+        assert!(
+            lines[2].starts_with("state: ") && lines[2].len() > "state: ".len(),
+            "human error state must follow the cause and be non-empty: {raw}"
+        );
+    }
+    assert!(
+        lines
+            .last()
+            .is_some_and(|line| line.starts_with("next: ") && line.len() > "next: ".len()),
+        "human errors must include a recovery step: {raw}"
     );
     assert!(
         !raw.trim_start().starts_with('{'),

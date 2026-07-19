@@ -986,22 +986,22 @@
 - every satelle.error.v1 envelope includes schema_version, code, category, retryable, message, details, docs_url, and suggested_commands, using null for unavailable details or docs_url and an empty array for unavailable suggestions @spec @contract @mvp @implemented
 - satelle machine-readable error output is stable enough for AI clients and scripts to branch on code, category, retryable, and suggested_commands without parsing human text @spec @mvp @implemented
 - satelle JSON errors include a stable code, a human message, optional structured details, and actionable recovery guidance when the recovery path is known @implemented @mvp
-- satelle human error messages state the user-visible outcome first, explain the known cause, identify preserved state when relevant, and provide the next recovery step @spec @mvp
+- satelle human error messages state the user-visible outcome first, explain the known cause, identify preserved state when relevant, and provide the next recovery step @spec @mvp @implemented
 - satelle does not use generic failure messages when a specific failed host, transport, Codex, Computer Use, provider, config, or session check is known @spec @mvp
 - satelle separates user-facing error messages from diagnostic implementation details and exposes low-level details only when they help the user or agent act @spec @mvp @implemented
 - satelle typed error codes are the stable automation contract while human copy may improve for clarity without changing the code @spec @mvp @implemented
 - incompatible-control-plane uses exit 75 and recovery command satelle doctor --scope codex --refresh --json @implemented @contract @mvp
 - Host Daemon HTTP incompatible-control-plane errors use status 503, category readiness, and retryable false @implemented @contract @mvp
 - incompatible-control-plane details contain only operation, reason, required_capabilities, and missing_capabilities using stable Satelle tokens; reason is runtime_missing, version_malformed, version_unavailable, version_unsupported, schema_unavailable, handshake_unavailable, or required_capability_missing, and no upstream method name or raw probe output is exposed @implemented @contract @mvp
-- satelle uses a small fixed set of process exit codes for broad failure classes and keeps specific failure causes in typed JSON error codes @spec @mvp
-- satelle exit codes distinguish success, usage error, configuration error, unreachable host, host readiness failure, remote execution failure, and internal error @spec @mvp
+- satelle uses a small fixed set of process exit codes for broad failure classes and keeps specific failure causes in typed JSON error codes @spec @mvp @implemented
+- satelle exit codes distinguish success, usage error, configuration error, unreachable host, host readiness failure, remote execution failure, and internal error @spec @mvp @implemented
 - satelle exits 0 for success and clean user-declined no-op outcomes @spec @mvp
 - satelle exits 64 for usage errors @spec @mvp @implemented
 - satelle exits 66 for configuration errors @spec @mvp @implemented
 - satelle exits 69 for unreachable Host errors @spec @mvp @implemented
 - satelle exits 75 for Host readiness failures @spec @mvp @implemented
 - satelle exits 74 for remote execution failures @spec @mvp @implemented
-- satelle exits 70 for internal errors @spec @mvp
+- satelle exits 70 for internal errors @spec @mvp @implemented
 - satelle exits 130 when an attached command is interrupted by Ctrl-C after applying its interruption contract @spec @mvp
 - setup-consent-required and doctor-fix-consent-required use the usage-error exit class because required noninteractive consent was absent and no mutation occurred @spec @contract @mvp
 

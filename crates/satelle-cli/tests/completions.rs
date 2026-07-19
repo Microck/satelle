@@ -105,8 +105,9 @@ fn rejects_unsupported_shells_at_the_cli_boundary() {
         .failure()
         .stdout(predicate::str::is_empty())
         .stderr(
-            predicate::str::starts_with("error: invalid-usage\n")
+            predicate::str::starts_with("error: Command input was not accepted.\n")
                 .and(predicate::str::contains("invalid value 'nushell'"))
+                .and(predicate::str::contains("[invalid-usage]"))
                 .and(predicate::str::contains("powershell")),
         );
 }

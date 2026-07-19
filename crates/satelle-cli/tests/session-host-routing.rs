@@ -405,7 +405,7 @@ api_token = {{ kind = "file", path = "{}" }}
         .env("SATELLE_STATE_DIR", state.path())
         .args(["host", "status", "--json"])
         .assert()
-        .code(76)
+        .code(74)
         .get_output()
         .clone();
     assert_eq!(
@@ -434,7 +434,7 @@ api_token = {{ kind = "file", path = "{}" }}
         .env("SATELLE_STATE_DIR", state.path())
         .args(["host", "status", "--json"])
         .assert()
-        .code(76)
+        .code(74)
         .get_output()
         .clone();
     assert_eq!(
