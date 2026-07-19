@@ -15,6 +15,7 @@ mod test_file;
 
 const SESSION_ID: &str = "rs_01890a5d-ac96-7b7c-8f89-37c3d0a66e11";
 const DIRECT_READ_CONNECTIONS: usize = 4;
+const TEST_INFRASTRUCTURE_DEADLOCK_LIMIT: Duration = Duration::from_secs(30);
 
 struct ImmediateCloseEndpoint {
     address: SocketAddr,
@@ -179,11 +180,45 @@ fn synchronize_pre_initialization_server(child: &mut Child, stdin: &mut ChildStd
         .expect("write pre-initialization ping");
     stdin.flush().expect("flush pre-initialization ping");
 
-    let stdout = child.stdout.as_mut().expect("piped stdout");
-    let mut response = String::new();
-    BufReader::new(stdout)
-        .read_line(&mut response)
-        .expect("read pre-initialization ping response");
+    let mut stdout = child.stdout.take().expect("piped stdout");
+    let (response_sender, response_receiver) = mpsc::sync_channel(1);
+    let response_reader = thread::spawn(move || {
+        let mut response = String::new();
+        let read = BufReader::new(&mut stdout).read_line(&mut response);
+        let _ = response_sender.send((stdout, response, read));
+    });
+    let (stdout, response, read) = match response_receiver
+        .recv_timeout(TEST_INFRASTRUCTURE_DEADLOCK_LIMIT)
+    {
+        Ok(response) => response,
+        Err(mpsc::RecvTimeoutError::Timeout) => {
+            if child
+                .try_wait()
+                .expect("poll wedged MCP test process")
+                .is_none()
+            {
+                child.kill().expect("terminate wedged MCP test process");
+            }
+            child.wait().expect("reap wedged MCP test process");
+            response_reader
+                .join()
+                .expect("join MCP readiness response reader");
+            panic!(
+                "MCP test infrastructure exceeded its deadlock limit before the 2-second exit contract started"
+            );
+        }
+        Err(mpsc::RecvTimeoutError::Disconnected) => {
+            response_reader
+                .join()
+                .expect("join failed MCP readiness response reader");
+            panic!("MCP readiness response reader exited without a result");
+        }
+    };
+    response_reader
+        .join()
+        .expect("join MCP readiness response reader");
+    child.stdout = Some(stdout);
+    read.expect("read pre-initialization ping response");
     let response: Value = serde_json::from_str(&response).expect("parse ping response");
     assert_eq!(response["id"], 0);
     assert_eq!(response["result"], json!({}));

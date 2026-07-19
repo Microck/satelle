@@ -67,6 +67,7 @@ const EXPECTED_OPERATIONS: [&str; 14] = [
 const BLOCKING_SPAN_ATTRIBUTE_MARKER: &str = "trace-blocking-span-attribute-connected";
 const BLOCKING_SPAN_RECORD_MARKER: &str = "trace-blocking-span-record-connected";
 const BLOCKING_EVENT_MARKER: &str = "trace-blocking-event-connected";
+const TEST_INFRASTRUCTURE_DEADLOCK_LIMIT: Duration = Duration::from_secs(30);
 static TRACE_CAPTURE_LOCK: Mutex<()> = Mutex::new(());
 
 struct RunningServer {
@@ -2245,6 +2246,19 @@ async fn shutdown_handle_bounds_a_stalled_connection_and_releases_the_store() {
     let state = TestStateDir::new().expect("temporary state directory");
     let state_path = state.path().to_path_buf();
     let (ready_sender, ready_receiver) = tokio::sync::oneshot::channel();
+    let (cancel_setup, setup_cancelled) = tokio::sync::oneshot::channel();
+    let (cancel_watchdog, watchdog_cancelled) = std::sync::mpsc::sync_channel(1);
+    // Keep the causal readiness handoff free of the 50 ms product contract.
+    // This watchdog only cancels a wedged test setup so a broken fixture fails
+    // instead of hanging the suite forever.
+    let setup_watchdog = std::thread::spawn(move || {
+        if matches!(
+            watchdog_cancelled.recv_timeout(TEST_INFRASTRUCTURE_DEADLOCK_LIMIT),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+        ) {
+            let _ = cancel_setup.send(());
+        }
+    });
     let owner = std::thread::spawn(move || {
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
@@ -2252,16 +2266,25 @@ async fn shutdown_handle_bounds_a_stalled_connection_and_releases_the_store() {
             .expect("build owner runtime");
         let service = HostService::local_demo_for_tests_at(&state_path)
             .expect("construct first Host service");
-        let server = runtime
-            .block_on(DaemonServer::bind(
+        let server = runtime.block_on(async {
+            tokio::select! {
+                server = DaemonServer::bind(
                 service,
                 DaemonServerConfig::loopback(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
                     .with_shutdown_grace(Duration::from_millis(50)),
-            ))
-            .expect("bind first daemon");
-        ready_sender
+                ) => server.map(Some),
+                _ = setup_cancelled => Ok(None),
+            }
+        });
+        let Some(server) = server.expect("bind first daemon") else {
+            return;
+        };
+        if ready_sender
             .send((server.local_addr(), server.shutdown_handle()))
-            .expect("publish running daemon");
+            .is_err()
+        {
+            return;
+        }
         let error = runtime
             .block_on(server.wait())
             .expect_err("stalled connection exceeds the shutdown grace");
@@ -2273,7 +2296,22 @@ async fn shutdown_handle_bounds_a_stalled_connection_and_releases_the_store() {
     // Startup is not part of the shutdown deadline under test. Wait for the
     // owner handoff so slow scheduling cannot strand its runtime and store;
     // setup failures still disconnect the channel and fail this receive.
-    let (first_addr, shutdown) = ready_receiver.await.expect("receive running daemon");
+    let readiness = ready_receiver.await;
+    let _ = cancel_watchdog.send(());
+    setup_watchdog
+        .join()
+        .expect("test infrastructure watchdog exits");
+    let (first_addr, shutdown) = match readiness {
+        Ok(readiness) => readiness,
+        Err(_) => {
+            owner
+                .join()
+                .expect("daemon owner exits after setup cancellation");
+            panic!(
+                "daemon setup failed or exceeded the test infrastructure deadlock limit before the 50 ms shutdown contract started"
+            );
+        }
+    };
     let mut stalled = TcpStream::connect(first_addr)
         .await
         .expect("open stalled connection");
