@@ -39,6 +39,8 @@ enum HeartbeatCommand {
     Shutdown,
     #[cfg(test)]
     Refresh {
+        accepted: SyncSender<()>,
+        proceed: std::sync::mpsc::Receiver<()>,
         attempting: SyncSender<()>,
         refreshed: SyncSender<time::OffsetDateTime>,
     },
@@ -47,6 +49,14 @@ enum HeartbeatCommand {
         reached: SyncSender<()>,
         release: std::sync::mpsc::Receiver<()>,
     },
+}
+
+#[cfg(test)]
+struct RefreshScheduleForTest {
+    accepted: std::sync::mpsc::Receiver<()>,
+    proceed: SyncSender<()>,
+    attempting: std::sync::mpsc::Receiver<()>,
+    refreshed: std::sync::mpsc::Receiver<time::OffsetDateTime>,
 }
 
 impl LeaseHeartbeatGuard {
@@ -90,9 +100,13 @@ impl LeaseHeartbeatGuard {
                         }
                         #[cfg(test)]
                         Ok(HeartbeatCommand::Refresh {
+                            accepted,
+                            proceed,
                             attempting,
                             refreshed,
                         }) => {
+                            let _accepted = accepted.send(());
+                            let _proceeding = proceed.recv();
                             let _attempting = attempting.send(());
                             if let Some(refreshed_at) = refresh_once(&storage, &owner) {
                                 let _refreshed = refreshed.send(refreshed_at);
@@ -119,21 +133,25 @@ impl LeaseHeartbeatGuard {
     }
 
     #[cfg(test)]
-    fn request_refresh_for_test(
-        &self,
-    ) -> (
-        std::sync::mpsc::Receiver<()>,
-        std::sync::mpsc::Receiver<time::OffsetDateTime>,
-    ) {
+    fn request_refresh_for_test(&self) -> RefreshScheduleForTest {
+        let (accepted, acceptance) = mpsc::sync_channel(1);
+        let (proceed, proceeding) = mpsc::sync_channel(1);
         let (attempting, attempted) = mpsc::sync_channel(1);
         let (refreshed, refresh) = mpsc::sync_channel(1);
         self.commands
             .send(HeartbeatCommand::Refresh {
+                accepted,
+                proceed: proceeding,
                 attempting,
                 refreshed,
             })
             .expect("live heartbeat thread receives a deterministic refresh request");
-        (attempted, refresh)
+        RefreshScheduleForTest {
+            accepted: acceptance,
+            proceed,
+            attempting: attempted,
+            refreshed: refresh,
+        }
     }
 
     #[cfg(test)]
@@ -556,25 +574,27 @@ mod heartbeat_tests {
         let heartbeat = LeaseHeartbeatGuard::start(Arc::clone(&storage), &owner).unwrap();
         let finished = heartbeat.finished_probe_for_test();
 
-        // Complete the worker's immediate startup refresh before taking the
-        // mutex. Otherwise this test can hold the mutex while waiting for a
-        // command that the worker cannot read until that first refresh ends.
-        let (startup_attempted, startup_refreshed) = heartbeat.request_refresh_for_test();
-        startup_attempted
+        // Wait until the worker has consumed the command before taking the
+        // mutex. This keeps a cadence refresh from blocking command receipt.
+        let refresh = heartbeat.request_refresh_for_test();
+        refresh
+            .accepted
             .recv()
-            .expect("heartbeat accepts the deterministic startup refresh");
-        startup_refreshed
-            .recv()
-            .expect("heartbeat completes the deterministic startup refresh");
+            .expect("heartbeat accepts the deterministic refresh request");
 
         let locked_storage = storage.lock().unwrap();
-        let (attempted, refreshed) = heartbeat.request_refresh_for_test();
-        attempted
+        refresh
+            .proceed
+            .send(())
+            .expect("heartbeat is released toward the held storage mutex");
+        refresh
+            .attempting
             .recv()
             .expect("heartbeat reaches the blocked storage mutex");
         let mutex_released_at = time::OffsetDateTime::now_utc();
         drop(locked_storage);
-        let refreshed_at = refreshed
+        let refreshed_at = refresh
+            .refreshed
             .recv()
             .expect("heartbeat completes after the mutex is released");
         assert!(refreshed_at >= mutex_released_at);

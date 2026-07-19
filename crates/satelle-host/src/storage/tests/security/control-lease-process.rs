@@ -243,10 +243,44 @@ fn drain_stdout(
             return Ok(captured);
         }
         captured.push_str(&line);
-        if let Some(event) = line.trim().strip_prefix(PROBE_PREFIX) {
-            let _ = events.send(event.trim().to_owned());
+        if let Some(event) = probe_event(&line) {
+            let _ = events.send(event.to_owned());
         }
     }
+}
+
+fn probe_event(line: &str) -> Option<&str> {
+    line.split_whitespace()
+        .last()?
+        .strip_prefix(PROBE_PREFIX)
+        .filter(|event| !event.is_empty())
+}
+
+#[test]
+fn probe_event_accepts_a_libtest_prefixed_marker_without_near_matches() {
+    assert_eq!(
+        Some("READY"),
+        probe_event(
+            "test storage::tests::security::control_lease_process::probe_child ... \
+             SATELLE_CONTROL_LEASE:READY\n"
+        )
+    );
+    assert_eq!(
+        None,
+        probe_event("test probe_child ... SATELLE_CONTROL_LEASED:READY\n")
+    );
+    assert_eq!(
+        None,
+        probe_event("test probe_child ... XSATELLE_CONTROL_LEASE:READY\n")
+    );
+    assert_eq!(
+        None,
+        probe_event("test probe_child ... SATELLE_CONTROL_LEASE:\n")
+    );
+    assert_eq!(
+        None,
+        probe_event("test probe_child ... SATELLE_CONTROL_LEASE:READY trailing\n")
+    );
 }
 
 fn drain_stderr(mut stderr: std::process::ChildStderr) -> std::io::Result<String> {

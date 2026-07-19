@@ -2,6 +2,127 @@ use super::*;
 use crate::{LogCursor, LogPageQuery, LogSubject};
 
 const SESSION_RETENTION: time::Duration = time::Duration::days(7);
+const SETUP_LEDGER_RETENTION: time::Duration = time::Duration::days(30);
+
+fn terminal_setup_run(
+    storage: &mut Storage,
+    run_id: &str,
+    status: SetupRunStatus,
+    finished_at: OffsetDateTime,
+) {
+    let started_at = finished_at - time::Duration::seconds(4);
+    let plan = SetupRunPlan::new(
+        run_id,
+        SetupOperationKind::Setup,
+        None,
+        started_at,
+        vec![
+            SetupActionPlan::new("prepare", "Prepare host", true).unwrap(),
+            SetupActionPlan::new("configure", "Configure host", true).unwrap(),
+        ],
+    )
+    .unwrap();
+    let capability = storage
+        .begin_setup_run(&plan, maintenance_owner(run_id, started_at))
+        .unwrap();
+    storage
+        .start_setup_action(
+            &capability,
+            "prepare",
+            started_at + time::Duration::seconds(1),
+        )
+        .unwrap();
+    match status {
+        SetupRunStatus::Completed | SetupRunStatus::PartialFailure => storage
+            .complete_setup_action_after_verified_postcondition(
+                &capability,
+                "prepare",
+                started_at + time::Duration::seconds(2),
+            )
+            .unwrap(),
+        SetupRunStatus::Failed => storage
+            .fail_setup_action(
+                &capability,
+                "prepare",
+                "preparation-failed",
+                Some(1),
+                Some("retry setup"),
+                started_at + time::Duration::seconds(2),
+            )
+            .unwrap(),
+        SetupRunStatus::Running | SetupRunStatus::OutcomeUnknown => {
+            panic!("terminal setup fixture requires a known outcome")
+        }
+    }
+    match status {
+        SetupRunStatus::Completed => storage
+            .skip_setup_action(
+                &capability,
+                "configure",
+                SetupActionSkipReason::AlreadySatisfied,
+                finished_at,
+            )
+            .unwrap(),
+        SetupRunStatus::Failed => storage
+            .skip_setup_action(
+                &capability,
+                "configure",
+                SetupActionSkipReason::DependencyFailed,
+                finished_at,
+            )
+            .unwrap(),
+        SetupRunStatus::PartialFailure => {
+            storage
+                .start_setup_action(
+                    &capability,
+                    "configure",
+                    started_at + time::Duration::seconds(3),
+                )
+                .unwrap();
+            storage
+                .fail_setup_action(
+                    &capability,
+                    "configure",
+                    "configuration-failed",
+                    Some(1),
+                    Some("retry setup"),
+                    finished_at,
+                )
+                .unwrap()
+        }
+        SetupRunStatus::Running | SetupRunStatus::OutcomeUnknown => {
+            panic!("terminal setup fixture requires a known outcome")
+        }
+    }
+    assert_eq!(
+        status,
+        storage
+            .finish_setup_run_and_release_maintenance(&capability, finished_at)
+            .unwrap()
+    );
+}
+
+fn maintenance_owner(operation_id: &str, acquired_at: OffsetDateTime) -> LeaseOwner {
+    LeaseOwner::new(
+        operation_id,
+        std::process::id(),
+        "retention-process-start",
+        "retention-boot-identity",
+        acquired_at,
+    )
+    .unwrap()
+}
+
+fn setup_rows(storage: &Storage, table: &str, run_id: &str) -> i64 {
+    storage
+        .connection_for_test()
+        .query_row(
+            &format!("SELECT count(*) FROM {table} WHERE run_id = ?1"),
+            [run_id],
+            |row| row.get(0),
+        )
+        .unwrap()
+}
 
 fn terminal_session(
     storage: &mut Storage,
@@ -117,6 +238,135 @@ fn terminal_session_expires_only_after_the_exact_seven_day_boundary() {
         )
         .expect("maintain retention after the boundary");
     assert!(storage.load_session(session.id()).unwrap().is_none());
+}
+
+#[test]
+fn terminal_setup_ledgers_expire_only_after_the_exact_thirty_day_boundary() {
+    for status in [
+        SetupRunStatus::Completed,
+        SetupRunStatus::Failed,
+        SetupRunStatus::PartialFailure,
+    ] {
+        let state = TempDir::new().expect("temporary state directory");
+        let (mut storage, _) = Storage::open(state.path()).expect("open storage");
+        let run_id = format!("retention-{status:?}");
+        let finished_at = at(10);
+        terminal_setup_run(&mut storage, &run_id, status, finished_at);
+
+        storage
+            .prune_expired_session_metadata(finished_at + SETUP_LEDGER_RETENTION)
+            .unwrap();
+        assert_eq!(1, setup_rows(&storage, "setup_runs", &run_id));
+        assert_eq!(2, setup_rows(&storage, "setup_actions", &run_id));
+
+        storage
+            .prune_expired_session_metadata(
+                finished_at + SETUP_LEDGER_RETENTION + time::Duration::nanoseconds(1),
+            )
+            .unwrap();
+        assert_eq!(0, setup_rows(&storage, "setup_runs", &run_id));
+        assert_eq!(0, setup_rows(&storage, "setup_actions", &run_id));
+    }
+}
+
+#[test]
+fn setup_ledger_retention_preserves_recovery_work_and_unrelated_host_state() {
+    let state = TempDir::new().expect("temporary state directory");
+    let (mut storage, _) = Storage::open(state.path()).expect("open storage");
+    let terminal_at = at(10);
+    terminal_setup_run(
+        &mut storage,
+        "expired-terminal-setup",
+        SetupRunStatus::Completed,
+        terminal_at,
+    );
+    let observed_at = terminal_at + SETUP_LEDGER_RETENTION + time::Duration::nanoseconds(1);
+    let recent_terminal_at = observed_at - time::Duration::days(1);
+    let session = terminal_session(
+        &mut storage,
+        SESSION_1,
+        TURN_1,
+        recent_terminal_at - time::Duration::seconds(1),
+        recent_terminal_at,
+    );
+
+    let unknown_plan = SetupRunPlan::new(
+        "recovery-pending-setup",
+        SetupOperationKind::Repair,
+        None,
+        at(11),
+        vec![SetupActionPlan::new("repair", "Repair host", true).unwrap()],
+    )
+    .unwrap();
+    let unknown_capability = storage
+        .begin_setup_run(
+            &unknown_plan,
+            maintenance_owner("recovery-pending-setup", at(11)),
+        )
+        .unwrap();
+    storage
+        .start_setup_action(&unknown_capability, "repair", at(12))
+        .unwrap();
+    storage
+        .mark_interrupted_setup_actions_outcome_unknown(at(13))
+        .unwrap();
+
+    storage.prune_expired_session_metadata(observed_at).unwrap();
+
+    assert_eq!(
+        0,
+        setup_rows(&storage, "setup_runs", "expired-terminal-setup")
+    );
+    assert_eq!(
+        1,
+        setup_rows(&storage, "setup_runs", "recovery-pending-setup")
+    );
+    assert_eq!(
+        1,
+        setup_rows(&storage, "setup_actions", "recovery-pending-setup")
+    );
+    assert!(storage.load_session(session.id()).unwrap().is_some());
+}
+
+#[test]
+fn setup_ledger_cleanup_failure_rolls_back_shared_retention_work() {
+    let state = TempDir::new().expect("temporary state directory");
+    let (mut storage, _) = Storage::open(state.path()).expect("open storage");
+    let session = terminal_session(&mut storage, SESSION_1, TURN_1, at(0), at(1));
+    let setup_finished_at = at(10);
+    terminal_setup_run(
+        &mut storage,
+        "failing-retention-setup",
+        SetupRunStatus::Completed,
+        setup_finished_at,
+    );
+    storage
+        .connection_for_test()
+        .execute_batch(
+            "CREATE TRIGGER fail_setup_retention
+             BEFORE DELETE ON setup_runs
+             WHEN OLD.run_id = 'failing-retention-setup'
+             BEGIN
+                 SELECT RAISE(ABORT, 'forced setup retention failure');
+             END;",
+        )
+        .unwrap();
+
+    storage
+        .prune_expired_session_metadata(
+            setup_finished_at + SETUP_LEDGER_RETENTION + time::Duration::nanoseconds(1),
+        )
+        .expect_err("setup deletion must abort the entire retention transaction");
+
+    assert!(storage.load_session(session.id()).unwrap().is_some());
+    assert_eq!(
+        1,
+        setup_rows(&storage, "setup_runs", "failing-retention-setup")
+    );
+    assert_eq!(
+        2,
+        setup_rows(&storage, "setup_actions", "failing-retention-setup")
+    );
 }
 
 #[test]

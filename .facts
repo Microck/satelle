@@ -35,7 +35,7 @@
 - a Satelle Control Lease is the Host Daemon-owned exclusive right to operate one Host Identity and Desktop Binding through native Computer Use @spec @mvp
 - a Satelle Maintenance Lease is the Host Daemon-owned exclusive right to mutate daemon, runtime, service, or storage state for one Host @spec @mvp
 - a Satelle Bootstrap Lock is a user-scoped remote filesystem lock acquired through authenticated SSH bootstrap or by a reachable Host Daemon already holding the same operation's Maintenance Lease before remote daemon files can be replaced @spec @mvp
-- a Satelle Idempotency Record binds one API Principal, operation, idempotency key, request digest, and durable outcome @spec @mvp
+- a Satelle Idempotency Record binds one API Principal, operation, idempotency key, request digest, and durable outcome @mvp @implemented
 - a Satelle Readiness Result is a timestamped capability result whose validity is bounded by its cache key, expiry, and invalidation conditions @spec @mvp
 - Satelle YOLO Mode is an explicit unsafe execution mode that asks Codex to bypass Codex-controlled approvals and sandboxing where the compatible Codex control plane supports those settings @spec @mvp
 - a Satelle Provider Probe Surface is an ephemeral local UI served by the Host Daemon to verify that a selected model and provider can observe and act through native Computer Use @spec @mvp
@@ -48,7 +48,7 @@
 - a Satelle Doctor Probe is an individual diagnostic check with a stable probe id, scope, dependencies, resource locks, timeout, and cache policy @spec @mvp
 - a Satelle Doctor Event is a diagnostic-stream record with its own versioned schema and is distinct from a lifecycle Satelle Event @spec @mvp
 - a Satelle Log Entry is a normalized redacted Host Daemon-owned diagnostic record with timestamp, source, severity, Host, optional Session id, message, structured fields, and redaction metadata @spec @mvp
-- a Satelle Log Cursor is an opaque durable position used to resume normalized log delivery without acting as a Satelle Event replay cursor @spec @mvp
+- a Satelle Log Cursor is an opaque durable position used to resume normalized log delivery without acting as a Satelle Event replay cursor @mvp @implemented
 - a Satelle Operator Log File is a rotating plain-text mirror of redacted Satelle Log Entries for local inspection on the remote Host, not an authoritative store @spec @mvp
 - a Satelle Diagnostic Bundle is a redacted local archive for support and debugging that can include selected Host Daemon metadata, Doctor Findings, setup ledger summaries, recent Satelle Log Entries, and export metadata @spec @later
 - a Satelle Raw Diagnostic Export is a user-requested local diagnostic artifact that may include data excluded from normal Satelle diagnostics while preserving explicit consent, redaction, retention, and audit boundaries @spec @later
@@ -1386,7 +1386,7 @@
 - a Satelle Session has at most one nonterminal Turn @spec @mvp
 - a Satelle Session is active exactly when it references one nonterminal Turn @spec @mvp
 - satelle derives Session activity from the active Turn instead of storing an independently mutable duplicate status @spec @mvp
-- a Satelle Session remains steerable after a terminal Turn while its Host and internal Codex thread mapping remain available @spec @mvp
+- a Satelle Session remains steerable after a terminal Turn while its Host and internal Codex thread mapping remain available @mvp @implemented
 - id: ksl
   label: the Host Identity and Desktop Binding of a Satelle Session are immutable after Session creation
   command: cargo test --locked -p satelle-core --lib session::tests::policy_is_snapshotted_and_desktop_binding_is_immutable -- --exact
@@ -1401,17 +1401,17 @@
   command: cargo test --locked -p satelle-core --lib session::tests::public_json_has_exact_safe_allowlist -- --exact
   tags: [spec, contract, mvp, implemented, ci]
 - lifecycle Satelle Events include state_subject plus the corresponding session_state_revision or turn_state_revision, and Turn lifecycle events may include both revisions when one commit mutates both records @spec @contract @mvp
-- the Host Daemon passes the committed Turn Execution Policy to the Codex adapter before Turn start @spec @mvp
+- the Host Daemon passes the committed Turn Execution Policy to the Codex adapter before Turn start @mvp @implemented
 - the Codex adapter never infers YOLO, provider, model, timeout, or desktop target from CLI presentation fields @spec @mvp @implemented
 
 ## admission-and-leases
-- the Host Daemon acquires the selected Control Lease and creates the starting Turn in one SQLite transaction @spec @mvp
-- Control Lease ownership is keyed by Host Identity and Desktop Binding instead of a Client-selected Host Alias @spec @mvp
-- Host Aliases resolving to the same Host Identity and Desktop Binding share one Control Lease @spec @mvp
-- Control Lease acquisition conflicts report host-busy without creating a Session, Turn, Codex thread, or attachment staging record @spec @mvp
+- the Host Daemon acquires the selected Control Lease and creates the starting Turn in one SQLite transaction @mvp @implemented
+- Control Lease ownership is keyed by Host Identity and Desktop Binding instead of a Client-selected Host Alias @mvp @implemented
+- Host Aliases resolving to the same Host Identity and Desktop Binding share one Control Lease @mvp @implemented
+- Control Lease acquisition conflicts report host-busy without creating a Session, Turn, Codex thread, or attachment staging record @mvp @implemented
 - native Computer Use readiness smoke tests, provider smoke tests, and prompt Turns use the same exclusive Control Lease @spec @mvp @implemented
-- doctor refresh reports host-busy instead of operating the desktop while a prompt Turn owns the Control Lease @spec @mvp
-- the Host Daemon releases the Control Lease in the same transaction that persists a terminal Turn state @spec @mvp
+- doctor refresh reports host-busy instead of operating the desktop while a prompt Turn owns the Control Lease @mvp @implemented
+- the Host Daemon releases the Control Lease in the same transaction that persists a terminal Turn state @mvp @implemented
 - a standalone readiness or provider probe releases its Control Lease in the same transaction that persists the terminal Readiness Result only after the Codex adapter confirms that no upstream probe Turn remains active @spec @mvp @implemented
 - setup, repair, host update, storage migration, and service restart acquire a Maintenance Lease before mutation @spec @mvp
 - a Maintenance Lease cannot coexist with a Control Lease for the same Host except when the same maintenance operation owns a postcheck Control sublease @spec @mvp @implemented
@@ -1461,7 +1461,7 @@
   tags: [spec, mvp, implemented, ci]
 - a stop request that cannot confirm upstream cancellation reports stop-not-confirmed instead of persisting a false stopped state @mvp @implemented
 - stop-not-confirmed leaves the Turn nonterminal, preserves running when the same upstream Turn is known active or recovery_pending when its state is ambiguous, and retains the Control Lease @mvp @implemented
-- satelle stop is idempotent for the same Session, Turn, and idempotency key @spec @mvp
+- satelle stop is idempotent for the same Session, Turn, and idempotency key @mvp @implemented
 - transport disconnection does not stop a remote Turn @spec @mvp
 - satelle run and steer support --detach-on-interrupt to leave an already-created remote Turn running when the attached CLI receives Ctrl-C @spec @mvp
 - satelle reports a typed interrupt-mode-conflict usage error when --detach-on-interrupt and --detach are combined @spec @mvp
@@ -1486,7 +1486,7 @@
 - public turn_id fields always contain Satelle Turn identifiers and never upstream Codex turn identifiers @spec @contract @mvp
 - satelle sessions may have optional display names for human listing without making display names the primary identifier @spec @mvp
 - satelle never exposes Codex thread, turn, goal, app-server request, or provider request identifiers in public CLI, API, MCP, event, log, or diagnostic contracts @spec @mvp
-- satelle MVP allows multiple stored Sessions per Host but only one active native Computer Use Turn per Control Lease at a time @spec @mvp
+- satelle MVP allows multiple stored Sessions per Host but only one active native Computer Use Turn per Control Lease at a time @mvp @implemented
 - satelle run and steer report a typed host-busy error when they would start a second active Computer Use Turn for the same Control Lease @spec @mvp
 - satelle MVP does not automatically queue run or steer commands when a host is busy @implemented @mvp
 - satelle later explicit queueing is disabled by default and never changes MVP host-busy behavior unless the user opts in for the selected Host, selected profile, or specific run or steer command @spec @later
@@ -1523,14 +1523,14 @@
 - persisting an upstream Codex identifier does not change Session or Turn lifecycle state, state revisions, safe logs, idempotency outcomes, or Control Lease ownership @mvp @implemented
 - recording the same upstream Codex identifier again is idempotent, while recording a different identifier for the same Session or Turn fails closed without overwriting the original @mvp @implemented
 - satelle session records include enough host, readiness, provider, goal, and lifecycle metadata to survive transport changes without changing the public session identifier @spec @mvp
-- satelle Host Daemon is the canonical store for session metadata because it owns the Codex thread, app-server lifecycle, Computer Use readiness, logs, and recovery state @spec @mvp
+- satelle Host Daemon is the canonical store for session metadata because it owns the Codex thread, app-server lifecycle, Computer Use readiness, logs, and recovery state @mvp @implemented
 - satelle CLI may keep read-only convenience cache for recently used sessions but must refresh from the Host Daemon before reporting authoritative status @spec @mvp
 - satelle status reconnects to the session's remote host automatically when the local CLI has no active connection @spec @mvp @implemented
 - satelle status and logs are the MVP surfaces for later inspection after a user disconnects from a live event stream @implemented @mvp
 - satelle clients that reconnect after missing live Satelle Events read current session state and normalized logs instead of replaying missed events @spec @mvp
 - satelle status for SSH bootstrap hosts may restart the on-demand Host Daemon before reading stored remote session metadata @spec @mvp @implemented
 - satelle status reports a typed session-not-found error when the selected host cannot find the requested session metadata @implemented @mvp
-- a Session operation verifies that the requested Session belongs to the connected Host Identity @spec @mvp
+- a Session operation verifies that the requested Session belongs to the connected Host Identity @mvp @implemented
 - the local CLI uses its non-authoritative Session-to-Host cache only to select a candidate Host @spec @mvp
 - satelle requires --host when a Session identifier cannot be mapped to exactly one configured Host without probing unrelated Hosts @spec @mvp
 - satelle remote host retains minimal session metadata for 7 days by default @implemented @mvp
@@ -1600,8 +1600,8 @@
 - satelle later run and steer use --raw-protocol --output <path> as the prospective command-specific raw protocol capture request for that invocation @spec @later
 - a raw protocol capture begins only after its warning and consent complete and never reconstructs or labels protocol data for an earlier Turn from normal retained Session metadata @spec @later
 - satelle raw protocol diagnostic exports do not make raw Codex app-server protocol messages, provider request bodies, provider response bodies, full prompts, screenshots, desktop recordings, or full transcripts available through satelle logs, status, doctor, diagnostic bundles, Satelle Events, Satelle Operator Log Files, or setup action ledger summaries @spec @later
-- satelle stores minimal lifecycle metadata and structured errors by default instead of persisting desktop screenshots or full event transcripts @spec @mvp
-- satelle does not persist full Satelle Event streams by default @spec @mvp
+- satelle stores minimal lifecycle metadata and structured errors by default instead of persisting desktop screenshots or full event transcripts @mvp @implemented
+- satelle does not persist full Satelle Event streams by default @mvp @implemented
 - satelle MVP does not provide session recording modes, screenshot recording, full event transcript recording, desktop recording, or host-level recording defaults @spec @mvp
 - satelle MVP normal status, logs, run, and steer commands do not capture, display, persist, or export desktop snapshot imagery by default @implemented @mvp
 - satelle later exposes satelle desktop snapshot --host <alias> --output <path> as the only Desktop Snapshot Export command @spec @later
@@ -1744,10 +1744,10 @@
 - satelle setup action ledger entries for invocations that produce a setup or repair Raw Diagnostic Export may store only redacted export audit metadata or an export reference identifier, never raw stdout, raw stderr, artifact contents, staging paths containing raw material, or redaction-failed data @spec @later
 - satelle setup and repair Raw Diagnostic Exports are not included in normal setup action ledger summaries, satelle logs, satelle status, satelle doctor, Satelle Events, Satelle Operator Log Files, or diagnostic bundles unless the user explicitly invokes the command-specific raw export mode for that command @spec @later
 - satelle setup action ledger records follow the same SQLite migration, retention, repair, reset, and export rules as other Host Daemon metadata unless a more specific setup retention policy is configured @spec @mvp
-- satelle setup action ledger records are retained for 30 days by default @spec @mvp
+- satelle setup action ledger records are retained for 30 days by default @mvp @implemented
 - satelle setup action ledger retention can be configured per host or profile @spec @mvp
-- satelle setup action ledger retention cleanup deletes ledger metadata only and does not uninstall, roll back, or modify completed setup actions @spec @mvp
-- satelle normal prompt execution does not require retained setup action ledger records after the host passes current native Computer Use readiness checks @spec @mvp
+- satelle setup action ledger retention cleanup deletes ledger metadata only and does not uninstall, roll back, or modify completed setup actions @mvp @implemented
+- satelle normal prompt execution does not require retained setup action ledger records after the host passes current native Computer Use readiness checks @mvp @implemented
 - label: satelle repair uses retained setup action ledger records when available but can re-plan from live host probes when the relevant ledger records expired or are missing
   command: cargo test --locked -p satelle-host --lib storage::tests::setup_ledger::repair_replans_from_live_probes_when_ledger_history_is_missing -- --exact
   tags: [spec, mvp, implemented, ci]
@@ -1926,7 +1926,7 @@
 - satelle reports a typed yolo-blocked-by-native-approval error when native Computer Use blocks on a non-bypassable OS, app, or sensitive-action approval while YOLO mode is active @spec @mvp
 - id: htr
   label: satelle host trust atomically replaces the user-level configuration without changing its POSIX mode or Windows DACL and revalidates the replacement before reporting success
-  command: cargo test --locked -p satelle-cli --bin satelle host_trust::tests::host_identity_update_preserves_unrelated_toml_and_is_idempotent -- --exact
+  command: cargo test --locked -p satelle-cli --features test-support --bin satelle host_trust::tests::host_identity_update_preserves_unrelated_toml_and_is_idempotent -- --exact
   tags: [mvp, implemented]
 
 ## control-plane
