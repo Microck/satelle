@@ -263,9 +263,15 @@ fn snapshot_directory_tree(root: &Path) -> std::io::Result<BTreeMap<PathBuf, Dir
 }
 
 fn is_ignored_filesystem_event(kind: EventKind) -> bool {
+    // FSEvents reports some read-only config access as Metadata(Any). Stable metadata and bytes are
+    // still checked by the before/after snapshots, so this only filters backend-imprecise transient
+    // noise that cannot prove a mutation by itself.
     matches!(
         kind,
-        EventKind::Access(_) | EventKind::Modify(ModifyKind::Metadata(MetadataKind::AccessTime))
+        EventKind::Access(_)
+            | EventKind::Modify(ModifyKind::Metadata(
+                MetadataKind::AccessTime | MetadataKind::Any
+            ))
     )
 }
 
@@ -1542,6 +1548,13 @@ mod tests {
             b"public prefix PRIVATE_SECRET_CANARY public suffix",
             &["PRIVATE_PROMPT_CANARY", "PRIVATE_SECRET_CANARY"],
         );
+    }
+
+    #[test]
+    fn imprecise_metadata_events_are_deferred_to_the_stable_snapshot() {
+        assert!(is_ignored_filesystem_event(EventKind::Modify(
+            ModifyKind::Metadata(MetadataKind::Any),
+        )));
     }
 
     #[test]
