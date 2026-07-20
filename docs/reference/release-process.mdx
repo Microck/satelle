@@ -1,0 +1,135 @@
+---
+title: Release process
+description: Prepare, validate, publish, promote, recover, and audit a Satelle release.
+---
+
+Satelle releases start with a reviewed release pull request and finish only
+after the tag workflow validates the whole binary and npm package graph. A
+pull request merge never publishes packages or creates a final GitHub release.
+
+## Release tooling boundaries
+
+[Tegami](https://tegami.fuma-nama.dev/getting-started) 1.2.5 is the preferred
+changelog and versioning tool. It runs on Node.js 24 as isolated repository
+tooling under `npm/release-tooling`; neither Tegami nor Node.js is a runtime
+dependency of the Rust CLI or Host Daemon.
+
+Run the non-mutating validation before preparing a release:
+
+```sh
+npm ci --prefix npm/release-tooling --ignore-scripts
+npm run dry-run --prefix npm/release-tooling
+```
+
+The report records the Node.js and Tegami versions, Cargo package discovery,
+the temporary fixture's generated files, version and dependency updates, and
+the registry targets skipped by the dry run. The Cargo plugin is configured to
+avoid a duplicate dependent bump because all Satelle crates inherit one shared
+workspace version. Cargo package discovery and version updates stay enabled,
+while crates.io publication is disabled for MVP.
+
+Tegami publication remains gated. The release workflow builds binaries,
+creates archives, checksums them, attests them, and publishes npm artifacts
+outside Tegami. If the recorded Tegami dry run fails or its generated changes
+are not accepted in review, use the manual steps below and keep Tegami as the
+preferred workflow after the blocker is fixed.
+
+## Release pull request
+
+The release pull request must contain one reviewed version everywhere the
+release contract requires it: Rust workspace metadata, all eight npm package
+manifests, exact launcher dependency ranges, lockfiles, and Tegami changelog
+output. Run the repository release checks without publishing:
+
+```sh
+node npm/scripts/release.cjs check
+npm test
+```
+
+The GitHub Actions pull request run builds all six Controller targets, packs
+all eight npm packages, validates native binary formats and archive roots,
+compares archive and npm executable digests, creates `SHA256SUMS`, runs npm
+publish dry runs, and exercises install, upgrade, smoke, and uninstall paths.
+
+## Signed release tag
+
+After the release pull request merges, an authorized releaser creates a signed
+annotated tag at that merged default-branch commit:
+
+```sh
+git tag -s vX.Y.Z -m "Satelle vX.Y.Z"
+git push origin vX.Y.Z
+```
+
+The repository must have an active GitHub tag ruleset for `v*` that prevents
+unauthorized creation, updates, deletion, and force pushes. The workflow rejects
+an unsigned, lightweight, unverified, moved, version-mismatched, or wrong-target
+tag with `release-tag-not-trusted` before public publication.
+
+## Candidate publication and validation
+
+The tag workflow creates a draft GitHub release only after six archives pass
+validation and GitHub has produced and verified their Sigstore-backed artifact
+attestations. It publishes npm packages through
+[npm trusted publishing](https://docs.npmjs.com/trusted-publishers/) in this
+order:
+
+1. Six platform-native packages.
+2. `@microck/satelle`.
+3. `satelle`.
+
+Every package first uses the non-default `rc-vX.Y.Z` tag. The workflow records
+each immutable publication outside the runner. A retry verifies the registry
+version and integrity against `npm-artifacts.json`; it never republishes
+different bytes under an existing version and never moves the signed tag.
+
+All six Controller runners then clean-install both launcher identities with
+npm, pnpm, and Bun. Each installation must pass `satelle --version` and
+`satelle paths --json` before promotion starts. The GitHub release remains
+draft throughout candidate publication and validation.
+
+## Latest promotion
+
+npm OIDC currently authorizes package publication but not `npm dist-tag`.
+Configure `NPM_DIST_TAG_TOKEN` as a narrowly scoped release secret that can
+change dist-tags for the eight Satelle package identities. Do not grant it
+package publication rights beyond what npm requires for dist-tag maintenance.
+
+The workflow snapshots every prior `latest` value into an append-only promotion
+checkpoint before changing any tag. One non-cancelling repository-wide
+concurrency group serializes promotion and rollback across all versions. After
+each package, a new checkpoint is attached to the draft release.
+
+A retry re-reads npm. It accepts only the recorded prior state as pending or
+the candidate version as complete. Any other value raises
+`promotion-state-conflict` and is not overwritten. Immediately before
+completion, the workflow re-reads all eight `latest` tags and requires every
+one to equal the candidate. Only then does it publish the GitHub release.
+
+## Rollback recovery
+
+If promotion must be aborted while the GitHub release is still draft, dispatch
+the Release workflow with operation `rollback` and the existing `X.Y.Z`
+version. Recovery loads the latest durable checkpoint and restores tags in
+reverse dependency order. It removes `latest` when the checkpoint says the tag
+was previously absent.
+
+Rollback retries treat the candidate value as pending, the prior value as
+complete, and every other value as a conflict. A rolled-back, incomplete,
+conflicted, or rollback-mode record never permits the GitHub release to leave
+draft state. Recovery does not move the signed tag or republish package bytes.
+
+## External release gates
+
+Repository code cannot prove account and platform state. Before the first
+public release, an authorized maintainer must verify all of these outside the
+checkout:
+
+- The `v*` GitHub tag ruleset is active.
+- Each npm package identity exists and trusts `release.yml` for OIDC publish.
+- `NPM_DIST_TAG_TOKEN` has the minimum working dist-tag scope.
+- The security and legal language review covers remote desktop control, YOLO,
+  diagnostics, provider credentials, and user consent.
+- A real tag run produces and verifies attestations, publishes all candidates,
+  passes six-platform registry validation, promotes all tags, and publishes the
+  GitHub release.

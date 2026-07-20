@@ -171,8 +171,8 @@
 ## distribution
 - satelle is distributed as one satelle executable per target, and builds for native Computer Use Host targets contain both Controller commands and Host Daemon mode @spec @mvp
 - satelle publishes npm-registry packages as a first-class installation path for npm, pnpm, and bun users @spec @mvp
-- satelle publishes the npm-registry package with scope microck and package name satelle as the canonical package identity for the JavaScript launcher and platform-specific native optionalDependencies @spec @mvp
-- satelle publishes satelle as an unscoped npm-registry convenience package for shorter install commands @spec @mvp
+- satelle publishes the npm-registry package with scope microck and package name satelle as the canonical package identity for the JavaScript launcher and platform-specific native optionalDependencies @mvp @implemented
+- satelle publishes satelle as an unscoped npm-registry convenience package for shorter install commands @mvp @implemented
 - while Satelle's npm distribution is in the pre-publication state, public documentation treats the canonical scoped launcher package, unscoped satelle package, and all six scoped native packages as unavailable from the public npm registry @spec @mvp @release-gate @verification
 - label: repository manifests and local tarball tests validate intended post-publication npm behavior without establishing public registry availability
   command: SATELLE_REQUIRED_PACKAGE_MANAGERS=npm,pnpm,bun npm run check:npm
@@ -181,17 +181,17 @@
 - satelle release validation fails when scoped and unscoped npm-registry package versions, executable behavior, README install guidance, or provenance metadata diverge @spec @mvp @implemented
 - satelle npm-registry distribution exposes a satelle executable command that launches the Rust native binary instead of reimplementing the CLI in JavaScript @spec @mvp @implemented
 - satelle npm-registry distribution uses a thin JavaScript launcher or installer layer only for package-manager integration @spec @mvp @implemented
-- satelle npm, pnpm, and bun installation docs use the same scoped and unscoped npm-registry package identities across package managers instead of separate package identities per package manager @spec @mvp
-- after publication, npm installs the canonical scoped launcher package with `npm install --global <package> --include=optional` and exposes the `satelle` executable @spec @contract @mvp
-- after publication, pnpm installs the canonical scoped launcher package with `pnpm add --global <package>` and exposes the `satelle` executable @spec @contract @mvp
-- after publication, bun installs the canonical scoped launcher package with `bun add --global <package>` and exposes the `satelle` executable @spec @contract @mvp
+- satelle npm, pnpm, and bun installation docs use the same scoped and unscoped npm-registry package identities across package managers instead of separate package identities per package manager @mvp @implemented
+- after publication, npm installs the canonical scoped launcher package with `npm install --global <package> --include=optional` and exposes the `satelle` executable @contract @mvp @implemented
+- after publication, pnpm installs the canonical scoped launcher package with `pnpm add --global <package>` and exposes the `satelle` executable @contract @mvp @implemented
+- after publication, bun installs the canonical scoped launcher package with `bun add --global <package>` and exposes the `satelle` executable @contract @mvp @implemented
 - after publication, canonical npm one-shot execution uses `npm exec --package=<package> -- satelle <args>` @spec @contract @mvp @implemented
 - after publication, canonical npx one-shot execution uses `npx --package=<package> -- satelle <args>` @spec @contract @mvp @implemented
 - after publication, canonical pnpm one-shot execution uses `pnpm --package=<package> dlx satelle <args>` @spec @contract @mvp @implemented
 - after publication, with Bun 1.3.14 or newer, canonical bun one-shot execution uses `bunx --package <package> satelle <args>` @spec @contract @mvp @implemented
 - npm, npx, pnpm, and bun one-shot execution with Bun 1.3.14 or newer enters the same Satelle JavaScript launcher used by persistent npm-registry installations @spec @contract @mvp @implemented
 - the Satelle JavaScript launcher forwards every argument after `satelle` unchanged to the selected Rust executable @spec @contract @mvp @implemented
-- satelle installation documentation lists npm, pnpm, and bun npm-registry installs before non-npm methods because npm-registry distribution is the recommended local CLI install path @spec @mvp
+- satelle installation documentation lists npm, pnpm, and bun npm-registry installs before non-npm methods because npm-registry distribution is the recommended local CLI install path @mvp @implemented
 - satelle MVP first-party non-npm local install methods are a Unix shell installer, a Windows PowerShell installer, a Homebrew tap, a Scoop bucket, and direct GitHub release archive downloads @spec @mvp
 - satelle Unix shell installer supports curl and wget entrypoints that pipe a canonical HTTPS installer script into sh @spec @mvp @implemented
 - label: the Unix shell installer requires gh and jq in addition to curl or wget, fails before downloading when either verified prerequisite is unavailable, and uses jq to validate every required satelle.paths.v1 source member against the closed PathSource vocabulary
@@ -289,7 +289,7 @@
 - the single satelle executable contains Controller commands on every Controller target and Host Daemon mode on every native Computer Use Host target @spec @mvp
 - satelle MVP does not publish native packages for 32-bit platforms, mobile OS targets, BSD targets, AIX, illumos, PowerPC, RISC-V, s390x, loong64, or ARMv7 targets @spec @mvp
 - satelle unsupported npm local platform reports a typed unsupported-local-platform error instead of trying a best-effort binary download @spec @mvp @implemented
-- satelle release validation fails when any MVP Controller target matrix entry is missing from the top-level npm optionalDependencies, release artifacts, or integrity metadata @spec @mvp
+- satelle release validation fails when any MVP Controller target matrix entry is missing from the top-level npm optionalDependencies, release artifacts, or integrity metadata @mvp @implemented
 - satelle JavaScript launcher resolves the installed matching platform-specific native package at runtime and executes its native satelle binary @spec @mvp @implemented
 - satelle JavaScript launcher reports a typed native-binary-package-missing error when the matching platform-specific native package is absent @spec @mvp @implemented
 - satelle native-binary-package-missing error output tells users to reinstall without omitting optional dependencies or use the direct native binary installation path @spec @mvp @implemented
@@ -297,15 +297,15 @@
 - satelle JavaScript launcher does not run package-manager repair, reinstall, or mutation commands unless the user invokes an explicit repair command added for that purpose @spec @mvp @implemented
 - satelle native-binary-package-missing error output includes package-manager-specific reinstall guidance when the launcher can detect npm, pnpm, bun, or another package-manager owner from the installation layout @spec @mvp @implemented
 - satelle release versions align exactly across scoped and unscoped top-level npm packages, every platform-specific native npm package, the local CLI binary, and every version-matched remote Host binary artifact @spec @contract @mvp
-- satelle public release publishing is performed only by a GitHub Actions release workflow in MVP @spec @mvp
+- satelle public release publishing is performed only by a GitHub Actions release workflow in MVP @mvp @implemented
 - satelle local developer machines may build, test, package, and dry-run releases but do not publish npm packages, upload final public GitHub release assets, or mint public release provenance @spec @mvp @implemented
-- satelle public npm package publishing uses npm trusted publishing with OIDC instead of long-lived npm automation tokens when npm supports trusted publishing for the package @spec @mvp
-- satelle public npm package publishing runs on cloud-hosted CI runners capable of generating npm provenance attestations @spec @mvp
-- satelle public release workflow generates GitHub artifact attestations for each native binary artifact before publishing the release @spec @mvp
-- satelle public release workflow produces checksum and integrity metadata for every native binary artifact before publishing npm packages or GitHub release assets @spec @mvp
-- satelle public GitHub release workflow creates or updates a draft release, attaches all release assets and metadata, verifies the release artifact set, and publishes the release only after validation passes @spec @mvp
-- satelle first MVP public release does not require npm staged publishing because npm staged publishing requires each package to already exist on the npm registry before it can be staged @spec @mvp
-- when staged publishing is unavailable for brand-new package identities, satelle may publish initial npm package versions through trusted publishing under `rc-vX.Y.Z` only after prepublication validation passes @spec @mvp
+- satelle public npm package publishing uses npm trusted publishing with OIDC instead of long-lived npm automation tokens when npm supports trusted publishing for the package @mvp @implemented
+- satelle public npm package publishing runs on cloud-hosted CI runners capable of generating npm provenance attestations @mvp @implemented
+- satelle public release workflow generates GitHub artifact attestations for each native binary artifact before publishing the release @mvp @implemented
+- satelle public release workflow produces checksum and integrity metadata for every native binary artifact before publishing npm packages or GitHub release assets @mvp @implemented
+- satelle public GitHub release workflow creates or updates a draft release, attaches all release assets and metadata, verifies the release artifact set, and publishes the release only after validation passes @mvp @implemented
+- satelle first MVP public release does not require npm staged publishing because npm staged publishing requires each package to already exist on the npm registry before it can be staged @mvp @implemented
+- when staged publishing is unavailable for brand-new package identities, satelle may publish initial npm package versions through trusted publishing under `rc-vX.Y.Z` only after prepublication validation passes @mvp @implemented
 - satelle post-MVP npm staged publishing is adopted only after all Satelle npm package identities exist, trusted publishing is stable, release automation supports npm CLI 11.15.0 or newer and Node.js 22.14.0 or newer, and maintainers accept the required 2FA approval step @spec @later
 - satelle npm staged publishing, when adopted, is used as a human approval gate before npm package versions become installable rather than as a canary rollout, gradual rollout, or replacement for prepublish validation @spec @later
 - satelle npm staged publishing, when adopted, uses trusted publisher stage-only permission for CI so CI can run npm stage publish but cannot directly run npm publish for configured packages @spec @later
@@ -2269,17 +2269,17 @@
 - satelle generated command and schema reference is derived from the release binary or public domain types instead of manually duplicating field lists @mvp @implemented
 
 # release
-- satelle uses Tegami as the preferred changelog, versioning, and publishing workflow once release automation is introduced @spec @mvp
+- satelle uses Tegami as the preferred changelog, versioning, and publishing workflow once release automation is introduced @mvp @implemented
 - satelle public MVP release requires a documented security and legal language review for remote desktop control behavior, YOLO mode language, diagnostic export boundaries, provider credential handling, and user-consent wording before public publishing @spec @mvp
-- satelle Tegami setup uses the Cargo plugin for Rust workspace package discovery, version bumps, and dependency range updates without enabling crates.io publishing for the MVP public release @spec @mvp
-- satelle treats Tegami as release tooling and does not make Node.js or Tegami part of the runtime dependency chain for the Rust CLI or Host Daemon @spec @mvp
-- satelle may configure Tegami before the first public MVP release so changelog, versioning, and publish orchestration behavior can be validated early without making Tegami a runtime dependency @spec @mvp
+- satelle Tegami setup uses the Cargo plugin for Rust workspace package discovery, version bumps, and dependency range updates without enabling crates.io publishing for the MVP public release @mvp @implemented
+- satelle treats Tegami as release tooling and does not make Node.js or Tegami part of the runtime dependency chain for the Rust CLI or Host Daemon @mvp @implemented
+- satelle may configure Tegami before the first public MVP release so changelog, versioning, and publish orchestration behavior can be validated early without making Tegami a runtime dependency @mvp @implemented
 - satelle does not rely on Tegami for production publishing until a repo-local release dry run verifies Tegami's Node.js 24 requirement, Cargo plugin behavior, Rust workspace package discovery, changelog generation, version bump output, dependency range updates, and compatibility with Satelle GitHub release and npm-registry publishing artifacts @spec @mvp
 - satelle first MVP public release uses Tegami for changelog, versioning, and publishing orchestration only if the release dry run passes and the generated changes are reviewed before publishing @spec @mvp
-- satelle first MVP public release falls back to the documented manual release runbook when Tegami validation fails, while keeping Tegami as the preferred release workflow after the blocker is fixed @spec @mvp
-- satelle Tegami-driven MVP release workflow builds Satelle release artifacts outside Tegami or through an explicit Tegami hook because Tegami publishes package contents and does not replace Rust binary build, signing, checksum, or artifact-attestation steps @spec @mvp
-- satelle Tegami-driven MVP release workflow does not publish crates.io packages unless a later release fact explicitly enables crates.io publishing @spec @mvp
-- satelle Tegami validation records the checked Tegami version, Node.js version, Cargo plugin behavior, generated files, and skipped publish targets before production publishing is allowed @spec @mvp
+- satelle first MVP public release falls back to the documented manual release runbook when Tegami validation fails, while keeping Tegami as the preferred release workflow after the blocker is fixed @mvp @implemented
+- satelle Tegami-driven MVP release workflow builds Satelle release artifacts outside Tegami or through an explicit Tegami hook because Tegami publishes package contents and does not replace Rust binary build, signing, checksum, or artifact-attestation steps @mvp @implemented
+- satelle Tegami-driven MVP release workflow does not publish crates.io packages unless a later release fact explicitly enables crates.io publishing @mvp @implemented
+- satelle Tegami validation records the checked Tegami version, Node.js version, Cargo plugin behavior, generated files, and skipped publish targets before production publishing is allowed @mvp @implemented
 - satelle first MVP public release publishes GitHub release assets and npm-registry packages but does not publish a crates.io crate @spec @mvp
 - satelle release workflow may run cargo package or cargo publish --dry-run to validate future crates.io readiness without uploading a crate to crates.io @spec @mvp
 - satelle does not publish a placeholder crates.io package only to reserve the satelle crate name @spec @mvp
@@ -2291,19 +2291,19 @@
 - satelle crates.io publishing requires documented Cargo SemVer commitments, package owner policy, package contents policy, and CI-only publish controls before it can become part of a public release @spec @later
 - satelle crates.io package versions, when introduced, use the same Satelle release version as GitHub release assets and npm-registry packages @spec @later
 - satelle crates.io publication remains a later release milestone rather than an MVP release blocker @spec @later
-- satelle ordinary public release flow starts with a release pull request before any public package or binary publishing occurs @spec @mvp
+- satelle ordinary public release flow starts with a release pull request before any public package or binary publishing occurs @mvp @implemented
 - satelle release pull request updates version metadata, Tegami changelog output, package lockfiles, generated package manifests, and release configuration needed for the target version @spec @mvp
 - satelle release pull request verification builds and validates release candidate artifacts without publishing public npm packages or final GitHub release assets @spec @mvp @implemented
 - satelle public publish workflow is triggered by pushing a protected version tag matching vX.Y.Z after the release pull request has merged to the default branch @spec @mvp
-- satelle public publish workflow does not run from release pull request merge alone @spec @mvp
+- satelle public publish workflow does not run from release pull request merge alone @mvp @implemented
 - satelle public publish workflow verifies that the version tag, committed version metadata, Tegami changelog output, npm package metadata, native artifact metadata, and integrity metadata all describe the same version before publishing @spec @mvp
-- satelle release version tags are annotated Git tags instead of lightweight Git tags @spec @mvp
-- satelle release version tags are signed with a GitHub-verifiable GPG, SSH, or S/MIME signing identity controlled by an authorized releaser @spec @mvp
+- satelle release version tags are annotated Git tags instead of lightweight Git tags @mvp @implemented
+- satelle release version tags are signed with a GitHub-verifiable GPG, SSH, or S/MIME signing identity controlled by an authorized releaser @mvp @implemented
 - satelle repository uses an active GitHub tag ruleset for release tags matching v* to restrict tag creation, updates, deletion, and force pushes to authorized releasers or approved release automation @spec @mvp
 - satelle public publish workflow verifies the triggering release tag is annotated, signed, GitHub-verifiable, matches vX.Y.Z, and points at the default-branch commit produced by the merged release pull request before publishing @spec @mvp
 - satelle public publish workflow rejects lightweight, unsigned, unverified, moved, deleted, or wrong-target release tags with a typed release-tag-not-trusted error @spec @mvp
-- satelle authorized releasers may create and push signed release tags from local developer machines after the release pull request has merged because tag creation is a release trigger, not public artifact publishing @spec @mvp
-- satelle signed release tags and GitHub tag rulesets complement npm provenance, GitHub artifact attestations, and immutable release assets instead of replacing them @spec @mvp
+- satelle authorized releasers may create and push signed release tags from local developer machines after the release pull request has merged because tag creation is a release trigger, not public artifact publishing @mvp @implemented
+- satelle signed release tags and GitHub tag rulesets complement npm provenance, GitHub artifact attestations, and immutable release assets instead of replacing them @mvp @implemented
 - satelle workflow_dispatch release runs are limited to dry-run, diagnostics, or non-publishing recovery tasks in MVP @spec @mvp @implemented
 - satelle workflow_dispatch release runs do not publish public npm packages or final GitHub release assets in MVP @spec @mvp @implemented
 - satelle release archives use the canonical name satelle-v<version>-<target>.tar.gz on Unix targets and satelle-v<version>-<target>.zip on Windows targets @mvp @implemented
@@ -2326,25 +2326,25 @@
   command: node --test --test-name-pattern="PowerShell installer rejects nonzero and malformed nested paths payloads" npm/test/release-followup.test.cjs
   tags: [mvp, release-gate, verification, ci, release-followup, implemented]
 - satelle initially publishes every required npm package version under the non-default `rc-vX.Y.Z` dist-tag so no candidate becomes a default installation target before full-graph validation passes @spec @release-gate @verification @mvp
-- satelle initial npm publication publishes platform-native packages before the scoped top-level package and publishes the unscoped forwarding package last @spec @mvp
+- satelle initial npm publication publishes platform-native packages before the scoped top-level package and publishes the unscoped forwarding package last @mvp @implemented
 - release validation clean-installs the exact scoped and unscoped npm candidate versions with npm, pnpm, and bun on every Controller target before default dist-tag promotion @spec @release-gate @verification @mvp
-- the public GitHub release remains draft until every required npm candidate package is registry-visible under `rc-vX.Y.Z` and passes full-graph release validation @spec @mvp
+- the public GitHub release remains draft until every required npm candidate package is registry-visible under `rc-vX.Y.Z` and passes full-graph release validation @mvp @implemented
 - every existing npm default dist-tag remains on its previous version until every required candidate package passes full-graph release validation @spec @release-gate @verification @mvp
 - before changing any npm `latest` dist-tag, the public publish workflow stores a durable npm promotion record outside the ephemeral runner containing the candidate version, dependency-ordered package list, each package's prior `latest` value or absence, transaction mode, and per-package progress @spec @release-gate @verification @mvp
 - one repository-wide non-cancelling single-writer lock serializes npm `latest` promotion and rollback recovery across all Satelle release versions @spec @contract @release-gate @verification @mvp
 - npm promotion or rollback recovery refuses to start while any other npm promotion record is nonterminal @spec @contract @release-gate @verification @mvp
-- after full-graph release validation passes, the public publish workflow promotes each required npm package's candidate version to `latest` sequentially in dependency order and durably checkpoints the observed registry result after every package @spec @mvp
-- npm dist-tag promotion is not atomic across packages, so the registry may expose a dependency-ordered partial promotion until the transaction completes or rolls back @spec @contract @mvp
-- retrying an interrupted npm promotion re-reads every required package's `latest` tag and treats only the recorded prior value or absence as pending and the candidate version as completed; any other value stops recovery with a promotion-state-conflict without overwriting that value @spec @contract @mvp
+- after full-graph release validation passes, the public publish workflow promotes each required npm package's candidate version to `latest` sequentially in dependency order and durably checkpoints the observed registry result after every package @mvp @implemented
+- npm dist-tag promotion is not atomic across packages, so the registry may expose a dependency-ordered partial promotion until the transaction completes or rolls back @contract @mvp @implemented
+- retrying an interrupted npm promotion re-reads every required package's `latest` tag and treats only the recorded prior value or absence as pending and the candidate version as completed; any other value stops recovery with a promotion-state-conflict without overwriting that value @contract @mvp @implemented
 - immediately before marking an npm promotion transaction complete or publishing its GitHub release, the public publish workflow re-reads every required package's `latest` tag and requires every value to equal the candidate version @spec @contract @release-gate @verification @mvp
-- an authorized release abort changes the durable npm promotion transaction to rollback mode and restores changed `latest` tags in reverse dependency order to each recorded prior value, or removes `latest` when it was previously absent @spec @mvp
-- retrying npm promotion rollback treats an observed candidate `latest` value as a pending restoration and changes it to the recorded prior value or removes it when the prior value was absent @spec @contract @mvp
-- retrying npm promotion rollback treats an observed `latest` value already equal to the recorded prior value, or already absent when the prior value was absent, as a completed restoration and durably checkpoints it without another registry mutation @spec @contract @mvp
-- retrying npm promotion rollback treats any observed `latest` value other than the candidate or recorded prior state as a promotion-state-conflict and does not overwrite it @spec @contract @mvp
+- an authorized release abort changes the durable npm promotion transaction to rollback mode and restores changed `latest` tags in reverse dependency order to each recorded prior value, or removes `latest` when it was previously absent @mvp @implemented
+- retrying npm promotion rollback treats an observed candidate `latest` value as a pending restoration and changes it to the recorded prior value or removes it when the prior value was absent @contract @mvp @implemented
+- retrying npm promotion rollback treats an observed `latest` value already equal to the recorded prior value, or already absent when the prior value was absent, as a completed restoration and durably checkpoints it without another registry mutation @contract @mvp @implemented
+- retrying npm promotion rollback treats any observed `latest` value other than the candidate or recorded prior state as a promotion-state-conflict and does not overwrite it @contract @mvp @implemented
 - the public GitHub release remains draft and release publication fails while an npm promotion record is incomplete, conflicted, in rollback mode, or records a completed rollback @spec @release-gate @verification @mvp
-- a partial npm publication or validation failure stops later package publication and leaves every existing default dist-tag unchanged @spec @mvp
-- a partial npm publication or validation failure records which immutable candidate versions exist plus an idempotent recovery procedure before any npm promotion transaction may begin @spec @mvp
-- release recovery never moves the signed version tag or republishes different bytes under an already published package version @spec @mvp
+- a partial npm publication or validation failure stops later package publication and leaves every existing default dist-tag unchanged @mvp @implemented
+- a partial npm publication or validation failure records which immutable candidate versions exist plus an idempotent recovery procedure before any npm promotion transaction may begin @mvp @implemented
+- release recovery never moves the signed version tag or republishes different bytes under an already published package version @mvp @implemented
 - label: the release-candidate offline JSON smoke command is satelle paths --json and must emit schema_version satelle.paths.v1 before target-specific online smoke tests run
   command: cargo build --workspace --release --locked && cargo test --locked -p satelle-cli --test release-binary-contract release_binary_satisfies_offline_contract -- --exact --ignored
   tags: [release-gate, verification, mvp, spec, implemented, ci]

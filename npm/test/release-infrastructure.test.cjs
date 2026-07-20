@@ -32,6 +32,18 @@ const {
   createReleaseContext,
   zipInflateMaximumOutputLength,
 } = require(releaseScriptPath);
+const {
+  PromotionError,
+  auditRecords,
+  beginRollback,
+  checkpointOperation,
+  createPromotionRecord,
+  planRegistryOperation,
+} = require("../scripts/npm-promotion.cjs");
+const {
+  checkpointPublished,
+  createPublicationRecord,
+} = require("../scripts/npm-candidate-publication.cjs");
 
 const platformMatrix = readJson(
   path.join(repositoryRoot, "npm", "satelle", "platforms.json"),
@@ -2367,4 +2379,226 @@ test("local release CLI exposes no public publishing or promotion command", () =
       message: `unknown release command ${command}`,
     });
   }
+});
+
+test("npm promotion records preserve dependency order and prior latest tags", () => {
+  const packageNames = createReleaseContext(repositoryRoot).check().publicationOrder;
+  const previousLatest = Object.fromEntries(
+    packageNames.map((packageName, index) => [packageName, index === 0 ? null : "0.0.9"]),
+  );
+  const record = createPromotionRecord({
+    version: workspaceVersion(),
+    packageNames,
+    previousLatest,
+    now: "2026-07-19T12:00:00.000Z",
+  });
+
+  assert.equal(record.schemaVersion, "satelle.npm-promotion.v1");
+  assert.equal(record.candidateTag, `rc-v${workspaceVersion()}`);
+  assert.equal(record.mode, "promotion");
+  assert.equal(record.status, "in_progress");
+  assert.deepEqual(record.packages.map(({ name }) => name), packageNames);
+  assert.deepEqual(record.packages.map(({ previousLatest: latest }) => latest), [
+    null,
+    ...packageNames.slice(1).map(() => "0.0.9"),
+  ]);
+});
+
+test("npm promotion audit fails closed on a corrupt durable checkpoint", (context) => {
+  const records = mkdtempSync(path.join(tmpdir(), "satelle-promotion-audit-"));
+  context.after(() => rmSync(records, { recursive: true, force: true }));
+  writeFileSync(path.join(records, "17.json"), '{"schemaVersion":"corrupt"}\n');
+
+  assert.throws(
+    () => auditRecords(records, "1.2.3"),
+    (error) => error instanceof PromotionError && error.code === "promotion-record-invalid",
+  );
+
+  rmSync(path.join(records, "17.json"));
+  const packageState = {
+    version: "1.2.3",
+    packageNames: ["satelle"],
+    previousLatest: { satelle: "1.2.2" },
+  };
+  writeFileSync(
+    path.join(records, "18.json"),
+    `${JSON.stringify(createPromotionRecord({
+      ...packageState,
+      now: "2026-07-19T12:00:00.000Z",
+    }))}\n`,
+  );
+  writeFileSync(
+    path.join(records, "19.json"),
+    `${JSON.stringify(createPromotionRecord({
+      ...packageState,
+      now: "2026-07-19T12:00:01.000Z",
+    }))}\n`,
+  );
+  assert.throws(
+    () => auditRecords(records, "1.2.3"),
+    (error) => error instanceof PromotionError && error.code === "promotion-record-conflict",
+  );
+});
+
+test("npm promotion retries accept only the prior or candidate latest state", () => {
+  const record = createPromotionRecord({
+    version: "1.2.3",
+    packageNames: ["@microck/satelle-linux-x64-gnu", "@microck/satelle", "satelle"],
+    previousLatest: {
+      "@microck/satelle-linux-x64-gnu": null,
+      "@microck/satelle": "1.2.2",
+      satelle: "1.2.2",
+    },
+    now: "2026-07-19T12:00:00.000Z",
+  });
+
+  assert.deepEqual(planRegistryOperation(record, null), {
+    type: "set_latest",
+    packageName: "@microck/satelle-linux-x64-gnu",
+    version: "1.2.3",
+  });
+  let advanced = checkpointOperation(record, "1.2.3", {
+    now: "2026-07-19T12:00:01.000Z",
+  });
+  assert.deepEqual(planRegistryOperation(advanced, "1.2.3"), {
+    type: "checkpoint",
+    packageName: "@microck/satelle",
+  });
+  advanced = checkpointOperation(advanced, "1.2.3", {
+    now: "2026-07-19T12:00:02.000Z",
+  });
+
+  assert.throws(
+    () => planRegistryOperation(advanced, "9.9.9"),
+    (error) => error instanceof PromotionError && error.code === "promotion-state-conflict",
+  );
+});
+
+test("npm rollback restores latest tags in reverse order and checkpoints retry-safe states", () => {
+  let record = createPromotionRecord({
+    version: "1.2.3",
+    packageNames: ["native", "@microck/satelle", "satelle"],
+    previousLatest: { native: null, "@microck/satelle": "1.2.2", satelle: "1.2.2" },
+    now: "2026-07-19T12:00:00.000Z",
+  });
+  for (const packageName of ["native", "@microck/satelle", "satelle"]) {
+    assert.equal(planRegistryOperation(record, record.packages.find((entry) => entry.name === packageName).previousLatest).packageName, packageName);
+    record = checkpointOperation(record, "1.2.3", {
+      now: "2026-07-19T12:00:01.000Z",
+      allLatest: packageName === "satelle"
+        ? { native: "1.2.3", "@microck/satelle": "1.2.3", satelle: "1.2.3" }
+        : undefined,
+    });
+  }
+  assert.equal(record.status, "complete");
+
+  record = beginRollback(record, "2026-07-19T12:00:04.000Z");
+  assert.deepEqual(planRegistryOperation(record, "1.2.3"), {
+    type: "set_latest",
+    packageName: "satelle",
+    version: "1.2.2",
+  });
+  record = checkpointOperation(record, "1.2.2", {
+    now: "2026-07-19T12:00:05.000Z",
+  });
+  assert.deepEqual(planRegistryOperation(record, "1.2.2"), {
+    type: "checkpoint",
+    packageName: "@microck/satelle",
+  });
+  record = checkpointOperation(record, "1.2.2", {
+    now: "2026-07-19T12:00:06.000Z",
+  });
+  assert.deepEqual(planRegistryOperation(record, "1.2.3"), {
+    type: "remove_latest",
+    packageName: "native",
+  });
+  record = checkpointOperation(record, null, {
+    now: "2026-07-19T12:00:07.000Z",
+  });
+  assert.equal(record.status, "rolled_back");
+});
+
+test("npm candidate publication records enforce native-first dependency order", () => {
+  const release = createReleaseContext(repositoryRoot);
+  const plan = release.check();
+  const manifest = {
+    version: plan.version,
+    packages: plan.publicationOrder.map((packageName) => ({
+      package: packageName,
+      version: plan.version,
+      file: packageName === "satelle"
+        ? "npm-satelle-unscoped.tgz"
+        : packageName === "@microck/satelle"
+          ? "npm-satelle-scoped.tgz"
+          : `npm-${packageName.slice("@microck/satelle-".length)}.tgz`,
+      integrity: `sha512-${Buffer.from(packageName).toString("base64")}`,
+    })),
+  };
+  let record = createPublicationRecord(
+    plan.version,
+    manifest,
+    "2026-07-19T12:00:00.000Z",
+  );
+
+  assert.deepEqual(record.packages.map(({ name }) => name), plan.publicationOrder);
+  for (const packageName of plan.publicationOrder) {
+    record = checkpointPublished(record, packageName, "2026-07-19T12:00:01.000Z");
+  }
+  assert.equal(record.status, "complete");
+  assert.equal(record.packages.at(-2).name, "@microck/satelle");
+  assert.equal(record.packages.at(-1).name, "satelle");
+});
+
+test("registry mutation helpers reject local developer execution", () => {
+  for (const script of [
+    "npm-candidate-publication.cjs",
+    "npm-promotion.cjs",
+  ]) {
+    const child = spawnSync(
+      process.execPath,
+      [path.join(repositoryRoot, "npm", "scripts", script), "create", workspaceVersion()],
+      {
+        encoding: "utf8",
+        env: {
+          ...process.env,
+          GITHUB_ACTIONS: "false",
+          GITHUB_REF: "",
+          GITHUB_REPOSITORY: "",
+        },
+      },
+    );
+    assert.equal(child.status, 1, script);
+    assert.equal(JSON.parse(child.stderr).code, "release-automation-required");
+  }
+});
+
+test("release workflow gates draft publication on candidate validation and promotion", () => {
+  const workflow = readFileSync(
+    path.join(repositoryRoot, ".github", "workflows", "release.yml"),
+    "utf8",
+  );
+
+  assert.match(workflow, /group: .*satelle-npm-release-writer/);
+  assert.match(workflow, /publish-candidates:[\s\S]*id-token: write/);
+  assert.match(
+    workflow,
+    /npm-candidate-publication\.cjs advance[\s\S]*validate-registry-candidates:/,
+  );
+  assert.match(
+    workflow,
+    /validate-registry-candidates:[\s\S]*@microck\/satelle satelle[\s\S]*for manager in npm pnpm bun/,
+  );
+  assert.match(
+    workflow,
+    /promote-and-publish:[\s\S]*needs: \[collect, draft-release, validate-registry-candidates\]/,
+  );
+  assert.match(workflow, /NODE_AUTH_TOKEN: \$\{\{ secrets\.NPM_DIST_TAG_TOKEN \}\}/);
+  assert.match(
+    workflow,
+    /npm-promotion\.cjs advance[\s\S]*gh release edit .*--draft=false --latest/,
+  );
+  assert.match(
+    workflow,
+    /rollback-promotion:[\s\S]*npm-promotion\.cjs abort[\s\S]*npm-promotion\.cjs advance/,
+  );
 });

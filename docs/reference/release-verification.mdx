@@ -9,6 +9,32 @@ When publication starts, installers and direct archive users must authenticate
 an archive before executing it. `SHA256SUMS` is an integrity cross-check, not
 an authenticity root.
 
+## Distribution status
+
+The canonical npm launcher identity is `@microck/satelle`. The unscoped
+`satelle` package is a forwarding convenience package. Neither launcher nor
+any of the six `@microck/satelle-<target>` native packages is currently a
+public installation path.
+
+After all packages have been published and the release gates pass, the
+recommended persistent install commands will be:
+
+```sh
+npm install --global @microck/satelle --include=optional
+pnpm add --global @microck/satelle
+bun add --global @microck/satelle
+```
+
+The same package identities apply to npm, pnpm, and Bun. The shorter unscoped
+form will use `satelle` in place of `@microck/satelle`. Do not run these
+commands until a published release identifies the package version as
+available. Source builds remain the only live installation path today.
+
+Non-npm release paths follow after npm in the supported install order: the
+Unix installer, Windows installer, first-party Homebrew tap, first-party Scoop
+bucket, and verified direct archives. These paths are also unavailable until
+their public release locations exist and pass the same release gates.
+
 ## Installer entrypoints
 
 The Unix installer requires `gh` for signed-tag and Sigstore attestation

@@ -141,7 +141,7 @@ test("Windows drive-style npm archive paths reach tar only as basenames", {
   }
 });
 
-test("release workflow is dry-run safe and owns six-target release validation", () => {
+test("release workflow keeps diagnostics dry-run safe and gates signed-tag publication", () => {
   const workflow = readFileSync(
     path.join(repositoryRoot, ".github", "workflows", "release.yml"),
     "utf8",
@@ -158,19 +158,23 @@ test("release workflow is dry-run safe and owns six-target release validation", 
   }
   assert.match(workflow, /workflow_dispatch:/);
   assert.match(workflow, /npm publish[^\n]*--dry-run/);
-  assert.doesNotMatch(workflow, /npm publish(?![^\n]*--dry-run)/);
+  assert.match(workflow, /publish-candidates:\n[\s\S]*?if: startsWith\(github\.ref, 'refs\/tags\/v'\)/);
+  assert.match(workflow, /npm-candidate-publication\.cjs advance/);
   assert.doesNotMatch(workflow, /^\s+(?:validated|dist)\/npm-.*\.tgz \\?$/m);
   assert.match(workflow, /\.\/dist\/npm-satelle-scoped\.tgz/);
   assert.match(workflow, /\.\/dist\/npm-satelle-unscoped\.tgz/);
   assert.match(workflow, /dist\/npm-satelle-scoped\.tgz/);
   assert.match(workflow, /dist\/npm-satelle-unscoped\.tgz/);
-  assert.doesNotMatch(workflow, /gh release (?:create|upload|edit)/);
+  assert.match(workflow, /gh release create/);
+  assert.match(workflow, /gh release upload/);
+  assert.match(workflow, /gh release edit[^\n]*--draft=false --latest/);
   assert.match(workflow, /actions\/attest-build-provenance@/);
   assert.match(
     workflow,
     /attest:\n[\s\S]*?if: startsWith\(github\.ref, 'refs\/tags\/v'\)\n\s+needs: \[collect, lifecycle\]/,
   );
-  assert.match(workflow, /test "\$source_digest" = "\$GITHUB_SHA"/);
+  assert.match(workflow, /"\$source_digest" != "\$GITHUB_SHA"/);
+  assert.match(workflow, /release-tag-not-trusted/);
   assert.match(workflow, /permissions:\n\s+attestations: write\n\s+contents: read\n\s+id-token: write/);
   assert.match(workflow, /scripts\/install\.sh" --version/);
   assert.match(workflow, /: > "\$policy_log"/);
@@ -182,7 +186,7 @@ test("release workflow is dry-run safe and owns six-target release validation", 
   const hardenedCheckoutUses = workflow.match(
     /uses: actions\/checkout@[^\n]+\n\s+with:\n\s+persist-credentials: false/g,
   ) ?? [];
-  assert.equal(checkoutUses.length, 4);
+  assert.ok(checkoutUses.length >= 4);
   assert.equal(hardenedCheckoutUses.length, checkoutUses.length);
 });
 

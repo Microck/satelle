@@ -1,4 +1,4 @@
-name: Release candidate validation
+name: Release
 
 on:
   pull_request:
@@ -16,9 +16,22 @@ on:
     tags:
       - "v*.*.*"
   workflow_dispatch:
+    inputs:
+      operation:
+        description: Non-publishing release diagnostic or rollback recovery
+        required: true
+        type: choice
+        default: diagnostics
+        options:
+          - diagnostics
+          - rollback
+      version:
+        description: Existing release version for rollback recovery
+        required: false
+        type: string
 
 concurrency:
-  group: release-candidate-${{ github.ref }}
+  group: ${{ (startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'workflow_dispatch' && inputs.operation == 'rollback')) && 'satelle-npm-release-writer' || format('release-candidate-{0}', github.ref) }}
   cancel-in-progress: false
 
 permissions:
@@ -27,6 +40,7 @@ permissions:
 jobs:
   build:
     name: Build ${{ matrix.target }}
+    if: github.event_name != 'workflow_dispatch' || inputs.operation == 'diagnostics'
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 30
     strategy:
@@ -135,6 +149,12 @@ jobs:
       - name: Install npm workspace
         run: npm ci --ignore-scripts
 
+      - name: Validate Tegami Cargo release behavior
+        shell: bash
+        run: |
+          npm ci --prefix npm/release-tooling --ignore-scripts
+          node npm/release-tooling/dry-run.mts > tegami-validation.json
+
       - name: Download target artifacts
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
@@ -157,6 +177,16 @@ jobs:
 
       - name: Validate native archives and create SHA256SUMS
         run: node npm/scripts/release.cjs validate-native-release-archives dist validated
+
+      - name: Complete validated npm publication set
+        shell: bash
+        run: |
+          chmod u+w validated validated/npm
+          cp dist/npm-satelle-scoped.tgz validated/npm/
+          cp dist/npm-satelle-unscoped.tgz validated/npm/
+          cp dist/npm-artifacts.json validated/npm/
+          cp tegami-validation.json validated/
+          chmod a-w validated/npm/* validated/npm validated/tegami-validation.json validated
 
       - name: Run npm publication dry-runs sequentially
         shell: bash
@@ -222,7 +252,13 @@ jobs:
           tag_digest=${tag_ref#* }
           source_digest=$(gh api "repos/${{ github.repository }}/git/tags/$tag_digest" --jq 'select(.verification.verified == true and .object.type == "commit") | .object.sha')
           test -n "$source_digest"
-          test "$source_digest" = "$GITHUB_SHA"
+          default_branch=$(gh api "repos/${{ github.repository }}" --jq .default_branch)
+          default_head=$(gh api "repos/${{ github.repository }}/git/ref/heads/$default_branch" --jq .object.sha)
+          compare_status=$(gh api "repos/${{ github.repository }}/compare/${source_digest}...${default_head}" --jq .status)
+          if [ "$source_digest" != "$GITHUB_SHA" ] || { [ "$compare_status" != identical ] && [ "$compare_status" != ahead ]; }; then
+            printf '%s\n' '{"code":"release-tag-not-trusted","message":"signed release tag must point at a commit on the default branch"}' >&2
+            exit 1
+          fi
           printf 'source-digest=%s\n' "$source_digest" >> "$GITHUB_OUTPUT"
 
       - name: Attest every native archive
@@ -413,3 +449,316 @@ jobs:
           if ((Get-Content $PolicyLog -Raw) -notmatch "--deny-self-hosted-runners") { throw "attestation policy was not invoked" }
           & scripts/install.ps1 -Uninstall -BinDir $InstallRoot
           if (Test-Path (Join-Path $InstallRoot "satelle.exe")) { throw "installer uninstall failed" }
+
+  draft-release:
+    name: Create authenticated draft release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [attest, collect]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - name: Download validated release candidate
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: validated-release-candidate
+          path: validated
+
+      - name: Create or update draft release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_VERSION: ${{ needs.collect.outputs.version }}
+        shell: bash
+        run: |
+          if ! gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release create "$GITHUB_REF_NAME" \
+              --repo "$GITHUB_REPOSITORY" \
+              --draft \
+              --verify-tag \
+              --title "Satelle v${RELEASE_VERSION}" \
+              --generate-notes
+          fi
+          test "$(gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --json isDraft --jq .isDraft)" = true
+          gh release upload "$GITHUB_REF_NAME" \
+            --repo "$GITHUB_REPOSITORY" \
+            --clobber \
+            validated/tegami-validation.json \
+            validated/github/SHA256SUMS \
+            validated/github/satelle-*
+
+  publish-candidates:
+    name: Publish immutable npm candidates
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [collect, draft-release]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: write
+      id-token: write
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Install Node.js for npm trusted publishing
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24
+          registry-url: https://registry.npmjs.org
+          package-manager-cache: false
+
+      - name: Install OIDC-capable npm CLI
+        run: npm install --global npm@11.15.0
+
+      - name: Download validated release candidate
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: validated-release-candidate
+          path: validated
+
+      - name: Publish native, scoped, then unscoped candidate packages
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_VERSION: ${{ needs.collect.outputs.version }}
+        shell: bash
+        run: |
+          record="$RUNNER_TEMP/npm-candidate-publication.json"
+          checkpoint() {
+            sequence=$(node -e 'process.stdout.write(String(require(process.argv[1]).sequence))' "$record")
+            snapshot="$RUNNER_TEMP/npm-candidate-v${RELEASE_VERSION}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${sequence}.json"
+            cp "$record" "$snapshot"
+            gh release upload "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" "$snapshot"
+          }
+          node npm/scripts/npm-candidate-publication.cjs create \
+            "$RELEASE_VERSION" \
+            validated/npm/npm-artifacts.json \
+            "$record"
+          checkpoint
+          trap 'checkpoint' ERR
+          while [ "$(node -e 'process.stdout.write(require(process.argv[1]).status)' "$record")" != complete ]; do
+            node npm/scripts/npm-candidate-publication.cjs advance "$record" validated/npm
+            checkpoint
+          done
+          trap - ERR
+
+  validate-registry-candidates:
+    name: Validate npm candidates on ${{ matrix.target }}
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [collect, publish-candidates]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: linux-arm64-gnu
+            runner: ubuntu-24.04-arm
+          - target: linux-x64-gnu
+            runner: ubuntu-24.04
+          - target: darwin-arm64
+            runner: macos-15
+          - target: darwin-x64
+            runner: macos-15-intel
+          - target: win32-arm64-msvc
+            runner: windows-11-arm
+          - target: win32-x64-msvc
+            runner: windows-2025
+    steps:
+      - name: Install Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24
+          registry-url: https://registry.npmjs.org
+          package-manager-cache: false
+
+      - name: Install Bun
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+        with:
+          bun-version: 1.3.14
+
+      - name: Install pnpm
+        run: npm install --global pnpm@11.15.0
+
+      - name: Clean-install and smoke both launcher identities
+        env:
+          RELEASE_VERSION: ${{ needs.collect.outputs.version }}
+        shell: bash
+        run: |
+          root="$RUNNER_TEMP/satelle-registry-validation"
+          mkdir -p "$root"
+          smoke() {
+            binary=$1
+            test "$("$binary" --version)" = "satelle $RELEASE_VERSION"
+            "$binary" paths --json | node -e '
+              const value = JSON.parse(require("fs").readFileSync(0, "utf8"));
+              if (value.schema_version !== "satelle.paths.v1") process.exit(1);
+            '
+          }
+          for package_name in @microck/satelle satelle; do
+            package_label=$(printf '%s' "$package_name" | tr '/@' '__')
+            package_spec="${package_name}@${RELEASE_VERSION}"
+            for manager in npm pnpm bun; do
+              install_root="$root/${manager}-${package_label}"
+              mkdir -p "$install_root"
+              node -e 'require("fs").writeFileSync(process.argv[1], "{\"private\":true}\n")' "$install_root/package.json"
+              case "$manager" in
+                npm) npm install --prefix "$install_root" --include=optional --ignore-scripts --no-audit --no-fund "$package_spec" ;;
+                pnpm) pnpm --dir "$install_root" add --ignore-scripts "$package_spec" ;;
+                bun) bun --cwd "$install_root" add --ignore-scripts "$package_spec" ;;
+              esac
+              smoke "$install_root/node_modules/.bin/satelle"
+            done
+          done
+
+  promote-and-publish:
+    name: Promote npm graph and publish GitHub release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [collect, draft-release, validate-registry-candidates]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: write
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Install Node.js for npm dist-tag recovery
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24
+          registry-url: https://registry.npmjs.org
+          package-manager-cache: false
+
+      - name: Install pinned npm CLI
+        run: npm install --global npm@11.15.0
+
+      - name: Download validated release candidate
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: validated-release-candidate
+          path: validated
+
+      - name: Promote latest tags with durable checkpoints
+        env:
+          GH_TOKEN: ${{ github.token }}
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_DIST_TAG_TOKEN }}
+          RELEASE_VERSION: ${{ needs.collect.outputs.version }}
+        shell: bash
+        run: |
+          records="$RUNNER_TEMP/promotion-records"
+          record="$RUNNER_TEMP/npm-promotion.json"
+          mkdir -p "$records"
+          while read -r asset_id; do
+            [ -n "$asset_id" ] || continue
+            gh api \
+              -H 'Accept: application/octet-stream' \
+              "repos/$GITHUB_REPOSITORY/releases/assets/$asset_id" \
+              > "$records/${asset_id}.json"
+          done < <(gh api --paginate "repos/$GITHUB_REPOSITORY/releases?per_page=100" \
+            --jq '.[] | .assets[] | select(.name | startswith("npm-promotion-")) | .id')
+
+          current=$(node npm/scripts/npm-promotion.cjs audit-records "$records" "$RELEASE_VERSION")
+          current_file=$(printf '%s' "$current" | node -e '
+            const value = JSON.parse(require("fs").readFileSync(0, "utf8"));
+            process.stdout.write(value?.fileName ?? "");
+          ')
+          if [ -n "$current_file" ]; then
+            cp "$records/$current_file" "$record"
+          else
+            node npm/scripts/npm-promotion.cjs create \
+              "$RELEASE_VERSION" \
+              "$record" \
+              validated/npm/npm-artifacts.json
+          fi
+
+          checkpoint() {
+            sequence=$(node -e 'process.stdout.write(String(require(process.argv[1]).sequence))' "$record")
+            snapshot="$RUNNER_TEMP/npm-promotion-v${RELEASE_VERSION}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${sequence}.json"
+            cp "$record" "$snapshot"
+            gh release upload "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" "$snapshot"
+          }
+          checkpoint
+          trap 'checkpoint' ERR
+          while [ "$(node -e 'process.stdout.write(require(process.argv[1]).status)' "$record")" != complete ]; do
+            node npm/scripts/npm-promotion.cjs advance "$record"
+            checkpoint
+          done
+          trap - ERR
+
+      - name: Publish the fully promoted GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release edit "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --draft=false --latest
+
+  rollback-promotion:
+    name: Roll back an incomplete npm promotion
+    if: github.event_name == 'workflow_dispatch' && inputs.operation == 'rollback'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: write
+    env:
+      SATELLE_RELEASE_RECOVERY: "1"
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Install Node.js for npm dist-tag recovery
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24
+          registry-url: https://registry.npmjs.org
+          package-manager-cache: false
+
+      - name: Install pinned npm CLI
+        run: npm install --global npm@11.15.0
+
+      - name: Restore prior latest tags in reverse dependency order
+        env:
+          GH_TOKEN: ${{ github.token }}
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_DIST_TAG_TOKEN }}
+          RELEASE_VERSION: ${{ inputs.version }}
+        shell: bash
+        run: |
+          printf '%s' "$RELEASE_VERSION" | grep -Eq '^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$'
+          tag="v${RELEASE_VERSION}"
+          test "$(gh release view "$tag" --repo "$GITHUB_REPOSITORY" --json isDraft --jq .isDraft)" = true
+          records="$RUNNER_TEMP/promotion-records"
+          record="$RUNNER_TEMP/npm-promotion.json"
+          mkdir -p "$records"
+          while read -r asset_id; do
+            [ -n "$asset_id" ] || continue
+            gh api \
+              -H 'Accept: application/octet-stream' \
+              "repos/$GITHUB_REPOSITORY/releases/assets/$asset_id" \
+              > "$records/${asset_id}.json"
+          done < <(gh api "repos/$GITHUB_REPOSITORY/releases/tags/$tag" \
+            --jq '.assets[] | select(.name | startswith("npm-promotion-")) | .id')
+          current=$(node npm/scripts/npm-promotion.cjs audit-records "$records" "$RELEASE_VERSION")
+          current_file=$(printf '%s' "$current" | node -e '
+            const value = JSON.parse(require("fs").readFileSync(0, "utf8"));
+            if (!value?.fileName) process.exit(1);
+            process.stdout.write(value.fileName);
+          ')
+          cp "$records/$current_file" "$record"
+          node npm/scripts/npm-promotion.cjs abort "$record"
+
+          checkpoint() {
+            sequence=$(node -e 'process.stdout.write(String(require(process.argv[1]).sequence))' "$record")
+            snapshot="$RUNNER_TEMP/npm-promotion-v${RELEASE_VERSION}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${sequence}.json"
+            cp "$record" "$snapshot"
+            gh release upload "$tag" --repo "$GITHUB_REPOSITORY" "$snapshot"
+          }
+          checkpoint
+          trap 'checkpoint' ERR
+          while [ "$(node -e 'process.stdout.write(require(process.argv[1]).status)' "$record")" != rolled_back ]; do
+            node npm/scripts/npm-promotion.cjs advance "$record"
+            checkpoint
+          done
+          trap - ERR
