@@ -76,7 +76,7 @@ jobs:
         run: rustup toolchain install 1.97.0 --profile minimal --component clippy,rustfmt
 
       - name: Cache Rust build artifacts
-        uses: Swatinem/rust-cache@983d3da37c6a6c41d09b8d867f4d49b43d759d2c # v2.8.1
+        uses: Swatinem/rust-cache@v2
         with:
           workspaces: ". -> target"
 
@@ -105,13 +105,13 @@ jobs:
     timeout-minutes: 15
     steps:
       - name: Check out repository
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3c0 # v7.0.0
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
 
       - name: Install pinned Rust toolchain
         run: rustup toolchain install 1.97.0 --profile minimal --component clippy,rustfmt
 
       - name: Cache Rust build artifacts
-        uses: Swatinem/rust-cache@983d3da37c6a6c41d09b8d867f4d49b43d759d2c # v2.8.1
+        uses: Swatinem/rust-cache@v2
         with:
           workspaces: ". -> target"
 
