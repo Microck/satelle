@@ -69,6 +69,8 @@ fn validate_turn(turn: &PublicTurn) -> Result<(), &'static str> {
 #[serde(deny_unknown_fields)]
 struct PublicSessionWire {
     session_id: SessionId,
+    #[serde(deserialize_with = "Option::deserialize")]
+    display_name: Option<String>,
     session_state_revision: SessionStateRevision,
     #[serde(with = "time::serde::rfc3339")]
     created_at: OffsetDateTime,
@@ -86,6 +88,7 @@ impl<'de> Deserialize<'de> for PublicSession {
         let wire = PublicSessionWire::deserialize(deserializer)?;
         Self::try_from_parts(
             wire.session_id,
+            wire.display_name,
             wire.session_state_revision,
             wire.created_at,
             wire.updated_at,
@@ -99,6 +102,7 @@ impl<'de> Deserialize<'de> for PublicSession {
 impl PublicSession {
     pub(crate) fn try_from_parts(
         session_id: SessionId,
+        display_name: Option<String>,
         session_state_revision: SessionStateRevision,
         created_at: OffsetDateTime,
         updated_at: OffsetDateTime,
@@ -107,6 +111,7 @@ impl PublicSession {
     ) -> Result<Self, PublicSnapshotError> {
         let session = Self {
             session_id,
+            display_name,
             session_state_revision,
             created_at,
             updated_at,
@@ -204,6 +209,7 @@ mod tests {
     fn starting_session() -> Value {
         json!({
             "session_id": SESSION_ID,
+            "display_name": null,
             "session_state_revision": 1,
             "created_at": "2024-01-01T00:00:00Z",
             "updated_at": "2024-01-01T00:00:00Z",
@@ -256,6 +262,18 @@ mod tests {
                 "omitted nullable field {field} must be rejected"
             );
         }
+    }
+
+    #[test]
+    fn public_session_requires_nullable_display_name() {
+        let mut wire = starting_session();
+        assert!(
+            wire.as_object_mut()
+                .expect("Session fixture is an object")
+                .remove("display_name")
+                .is_some()
+        );
+        assert!(serde_json::from_value::<PublicSession>(wire).is_err());
     }
 
     #[test]

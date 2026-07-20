@@ -27,6 +27,7 @@ const DEADLOCK_GUARD_LIMIT: Duration = Duration::from_secs(30);
 const STABLE_DIGEST: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 const PRIVATE_UPSTREAM_THREAD_REF: &str = "PRIVATE_UPSTREAM_THREAD_REFERENCE_CANARY";
 const PRIVATE_UPSTREAM_TURN_REF: &str = "PRIVATE_UPSTREAM_TURN_REFERENCE_CANARY";
+const PRIVATE_UPSTREAM_GOAL_REF: &str = "PRIVATE_UPSTREAM_GOAL_REFERENCE_CANARY";
 
 fn latest_turn(session: &PublicSession) -> &PublicTurn {
     session
@@ -575,6 +576,8 @@ fn adapter_persists_upstream_refs_before_waiting_and_stop_keeps_them_durable() {
         .expect("the thread canary must be a valid private reference");
     let expected_turn_ref = PrivateUpstreamRef::new(PRIVATE_UPSTREAM_TURN_REF)
         .expect("the Turn canary must be a valid private reference");
+    let expected_goal_ref = PrivateUpstreamRef::new(PRIVATE_UPSTREAM_GOAL_REF)
+        .expect("the Goal canary must be a valid private reference");
     let durable_subject = engine
         .lock_storage()
         .expect("lock runtime storage")
@@ -588,6 +591,10 @@ fn adapter_persists_upstream_refs_before_waiting_and_stop_keeps_them_durable() {
         durable_subject.upstream_turn_ref(),
         Some(&expected_turn_ref)
     );
+    assert_eq!(
+        durable_subject.upstream_goal_ref(),
+        Some(&expected_goal_ref)
+    );
     let public_session = runtime
         .status(session.session_id().clone())
         .expect("read public Session while execution is waiting");
@@ -599,7 +606,11 @@ fn adapter_persists_upstream_refs_before_waiting_and_stop_keeps_them_durable() {
     assert_privacy_canaries_absent(
         "Host runtime status and log projection",
         public_json.as_bytes(),
-        &[PRIVATE_UPSTREAM_THREAD_REF, PRIVATE_UPSTREAM_TURN_REF],
+        &[
+            PRIVATE_UPSTREAM_THREAD_REF,
+            PRIVATE_UPSTREAM_TURN_REF,
+            PRIVATE_UPSTREAM_GOAL_REF,
+        ],
     );
 
     let stopped = runtime
@@ -625,6 +636,7 @@ fn adapter_persists_upstream_refs_before_waiting_and_stop_keeps_them_durable() {
         Some(&expected_thread_ref)
     );
     assert_eq!(final_subject.upstream_turn_ref(), Some(&expected_turn_ref));
+    assert_eq!(final_subject.upstream_goal_ref(), Some(&expected_goal_ref));
 }
 
 #[test]
@@ -1350,6 +1362,7 @@ impl super::ComputerUseAdapter for ReferencePersistingAdapter {
     ) -> Result<super::ExecuteResult, SatelleError> {
         request.persist_upstream_thread_ref(PRIVATE_UPSTREAM_THREAD_REF)?;
         request.persist_upstream_turn_ref(PRIVATE_UPSTREAM_TURN_REF)?;
+        request.persist_upstream_goal_ref(PRIVATE_UPSTREAM_GOAL_REF)?;
         self.references_recorded.signal();
         self.execute_release.wait();
         FakeComputerUseAdapter.execute(request)

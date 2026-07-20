@@ -376,6 +376,7 @@ impl AdmissionContext {
 pub(crate) enum ObservedUpstreamRef {
     Thread(PrivateUpstreamRef),
     Turn(PrivateUpstreamRef),
+    Goal(PrivateUpstreamRef),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -472,6 +473,10 @@ impl ObservedUpstreamRef {
     pub(crate) fn turn(value: impl Into<String>) -> Result<Self, StorageError> {
         Ok(Self::Turn(PrivateUpstreamRef::new(value)?))
     }
+
+    pub(crate) fn goal(value: impl Into<String>) -> Result<Self, StorageError> {
+        Ok(Self::Goal(PrivateUpstreamRef::new(value)?))
+    }
 }
 
 #[derive(Clone)]
@@ -484,6 +489,7 @@ pub(crate) struct RecoverySubject {
     request_token: PrivateRequestToken,
     upstream_thread_ref: Option<PrivateUpstreamRef>,
     upstream_turn_ref: Option<PrivateUpstreamRef>,
+    upstream_goal_ref: Option<PrivateUpstreamRef>,
 }
 
 impl RecoverySubject {
@@ -517,6 +523,10 @@ impl RecoverySubject {
 
     pub(crate) fn upstream_turn_ref(&self) -> Option<&PrivateUpstreamRef> {
         self.upstream_turn_ref.as_ref()
+    }
+
+    pub(crate) fn upstream_goal_ref(&self) -> Option<&PrivateUpstreamRef> {
+        self.upstream_goal_ref.as_ref()
     }
 }
 

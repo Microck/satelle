@@ -800,6 +800,12 @@ impl<'a> AdapterSubject<'a> {
             .map(crate::storage::PrivateUpstreamRef::as_str)
     }
 
+    pub(crate) fn upstream_goal_ref(self) -> Option<&'a str> {
+        self.subject
+            .upstream_goal_ref()
+            .map(crate::storage::PrivateUpstreamRef::as_str)
+    }
+
     pub fn has_request_token(self) -> bool {
         let _opaque_token = self.subject.request_token();
         true
@@ -860,6 +866,10 @@ impl<'a> ExecuteRequest<'a> {
             .map(crate::storage::PrivateUpstreamRef::as_str)
     }
 
+    pub fn upstream_goal_ref(&self) -> Option<&'a str> {
+        self.subject.upstream_goal_ref()
+    }
+
     pub const fn subject(&self) -> AdapterSubject<'a> {
         self.subject
     }
@@ -875,11 +885,16 @@ impl<'a> ExecuteRequest<'a> {
     pub fn persist_upstream_turn_ref(&self, value: &str) -> Result<(), SatelleError> {
         (self.persist_upstream_ref)(UpstreamReference::Turn(value.to_string()))
     }
+
+    pub fn persist_upstream_goal_ref(&self, value: &str) -> Result<(), SatelleError> {
+        (self.persist_upstream_ref)(UpstreamReference::Goal(value.to_string()))
+    }
 }
 
 pub(super) enum UpstreamReference {
     Thread(String),
     Turn(String),
+    Goal(String),
 }
 
 pub struct ExecuteResult {

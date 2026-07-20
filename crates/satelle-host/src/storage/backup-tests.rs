@@ -109,7 +109,7 @@ fn manifest_filename_digest_schema_and_compatibility_are_validated() {
 
     let original_manifest = manifest;
     let mut wrong_filename = original_manifest.clone();
-    wrong_filename.backup_file = "satelle.sqlite3.migration-v8-wrong.backup".to_owned();
+    wrong_filename.backup_file = "satelle.sqlite3.migration-v9-wrong.backup".to_owned();
     fixture.write_manifest(backup_file_name, &wrong_filename);
     assert_eq!(
         StorageErrorKind::InvalidInput,
@@ -194,7 +194,7 @@ fn validation_rejects_a_wrong_migration_checksum_with_a_matching_file_digest() {
         .expect("use a self-contained checksum-corruption transaction");
     connection
         .execute(
-            "UPDATE schema_migrations SET checksum = 'fnv1a64:0000000000000000' WHERE version = 8",
+            "UPDATE schema_migrations SET checksum = 'fnv1a64:0000000000000000' WHERE version = 9",
             [],
         )
         .expect("corrupt only the migration checksum");
@@ -290,15 +290,15 @@ fn restore_validation_rejects_symlink_nonregular_and_nonprivate_inputs() {
     let state_directory = fixture.state_directory();
     let candidates = [
         (
-            "satelle.sqlite3.migration-v8-0198a146-5ec2-7dd5-b51c-7d5e241e5890.backup",
+            "satelle.sqlite3.migration-v9-0198a146-5ec2-7dd5-b51c-7d5e241e5890.backup",
             "symlink",
         ),
         (
-            "satelle.sqlite3.migration-v8-0198a146-5ec2-7dd5-b51c-7d5e241e5891.backup",
+            "satelle.sqlite3.migration-v9-0198a146-5ec2-7dd5-b51c-7d5e241e5891.backup",
             "directory",
         ),
         (
-            "satelle.sqlite3.migration-v8-0198a146-5ec2-7dd5-b51c-7d5e241e5892.backup",
+            "satelle.sqlite3.migration-v9-0198a146-5ec2-7dd5-b51c-7d5e241e5892.backup",
             "nonprivate",
         ),
     ];
@@ -342,7 +342,7 @@ fn restore_validation_rejects_symlink_nonregular_and_nonprivate_inputs() {
 fn restore_validation_rejects_hardlinked_inputs() {
     let fixture = BackupFixture::new(1);
     let source_name = fixture.backup_file_name().to_owned();
-    let hardlink_name = "satelle.sqlite3.migration-v8-0198a146-5ec2-7dd5-b51c-7d5e241e5893.backup";
+    let hardlink_name = "satelle.sqlite3.migration-v9-0198a146-5ec2-7dd5-b51c-7d5e241e5893.backup";
     fs::hard_link(
         fixture.state_root.join(&source_name),
         fixture.state_root.join(hardlink_name),
@@ -367,7 +367,7 @@ fn restore_validation_rejects_windows_reparse_and_broadened_dacl_inputs() {
     let fixture = BackupFixture::new(1);
     let source_name = fixture.backup_file_name().to_owned();
     let source_manifest = fixture.manifest(&source_name);
-    let reparse_name = "satelle.sqlite3.migration-v8-0198a146-5ec2-7dd5-b51c-7d5e241e5894.backup";
+    let reparse_name = "satelle.sqlite3.migration-v9-0198a146-5ec2-7dd5-b51c-7d5e241e5894.backup";
     super::windows::create_file_symlink_for_test(
         &fixture.state_root.join(&source_name),
         &fixture.state_root.join(reparse_name),
@@ -378,7 +378,7 @@ fn restore_validation_rejects_windows_reparse_and_broadened_dacl_inputs() {
     fixture.write_manifest(reparse_name, &reparse_manifest);
 
     let broad_dacl_name =
-        "satelle.sqlite3.migration-v8-0198a146-5ec2-7dd5-b51c-7d5e241e5895.backup";
+        "satelle.sqlite3.migration-v9-0198a146-5ec2-7dd5-b51c-7d5e241e5895.backup";
     fs::copy(
         fixture.state_root.join(&source_name),
         fixture.state_root.join(broad_dacl_name),
@@ -962,7 +962,7 @@ fn cleanup_tombstone_names(fixture: &BackupFixture) -> Vec<String> {
 #[test]
 fn cleanup_deleting_names_round_trip_without_increasing_path_pressure() {
     let key = CleanupTombstoneKey {
-        schema_version: 8,
+        schema_version: 9,
         backup_id: Uuid::parse_str("0198a146-5ec2-7dd5-b51c-7d5e241e5880")
             .expect("valid version 7 backup id"),
         cleanup_id: Uuid::parse_str("0198a146-5ec2-7dd5-b51c-7d5e241e5881")
@@ -1504,8 +1504,8 @@ fn windows_handle_delete_unlinks_before_share_delete_handles_close() {
 #[test]
 fn cleanup_ignores_malformed_lookalikes_without_deleting_them() {
     let fixture = BackupFixture::new(3);
-    let malformed_name = "satelle.sqlite3.migration-v8-not-a-uuid.backup";
-    let invalid_name = "satelle.sqlite3.migration-v8-ffffffff-ffff-7fff-bfff-ffffffffffff.backup";
+    let malformed_name = "satelle.sqlite3.migration-v9-not-a-uuid.backup";
+    let invalid_name = "satelle.sqlite3.migration-v9-ffffffff-ffff-7fff-bfff-ffffffffffff.backup";
     let cleanup_lookalikes = [
         "satelle.sqlite3.cleanup~8~0198a146-5ec2-7dd5-b51c-7d5e241e5896~0198a146-5ec2-7dd5-b51c-7d5e241e5897~00000000000000000000000000000000~11111111111111111111111111111111~backup.tombstone",
         "satelle.sqlite3.cleanup~8~0198a146-5ec2-7dd5-b51c-7d5e241e5896~0198a146-5ec2-7dd5-b51c-7d5e241e5897~00000000000000000000000000000000~11111111111111111111111111111111~manifest.tombstone",

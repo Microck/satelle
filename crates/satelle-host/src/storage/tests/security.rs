@@ -10,14 +10,16 @@ mod control_lease_process;
 fn private_upstream_refs_are_isolated_from_public_rows_and_logs() {
     const UPSTREAM_THREAD: &str = "thread-private-canary-9090";
     const UPSTREAM_TURN: &str = "turn-private-canary-9090";
+    const UPSTREAM_GOAL: &str = "goal-private-canary-9090";
     const MODEL_REF: &str = "model-private-canary-9090";
     const PROVIDER_REF: &str = "provider-private-canary-9090";
 
     let state = TempDir::new().expect("temporary state directory");
     let (mut storage, _) = Storage::open(state.path()).expect("open storage");
     let desktop_binding = DesktopBindingRef::new("desktop-binding-1").unwrap();
-    let session = Session::start(
+    let session = Session::start_with_display_name(
         session_id(SESSION_1),
+        Some("Release desktop".to_string()),
         storage.host_identity().expect("load Host Identity"),
         desktop_binding.clone(),
         turn_id(TURN_1),
@@ -55,6 +57,13 @@ fn private_upstream_refs_are_isolated_from_public_rows_and_logs() {
         UPSTREAM_THREAD,
         UPSTREAM_TURN,
     );
+    storage
+        .record_upstream_ref(
+            session.id(),
+            &turn_id(TURN_1),
+            &ObservedUpstreamRef::goal(UPSTREAM_GOAL).unwrap(),
+        )
+        .expect("record private Goal reference");
     let cursor = storage
         .append_safe_log(
             &SafeLogRecord::new(
@@ -108,36 +117,46 @@ fn private_upstream_refs_are_isolated_from_public_rows_and_logs() {
     assert_privacy_canaries_absent(
         "storage public rows",
         public_rows.as_bytes(),
-        &[UPSTREAM_THREAD, UPSTREAM_TURN],
+        &[UPSTREAM_THREAD, UPSTREAM_TURN, UPSTREAM_GOAL],
     );
-    let private_refs: (String, String) = storage
+    let private_refs: (String, String, String) = storage
         .connection_for_test()
         .query_row(
-            "SELECT s.upstream_thread_ref, t.upstream_turn_ref FROM session_private_refs s JOIN turns u ON u.session_id = s.session_id JOIN turn_private_refs t ON t.turn_id = u.turn_id",
+            "SELECT s.upstream_thread_ref, t.upstream_turn_ref, s.upstream_goal_ref FROM session_private_refs s JOIN turns u ON u.session_id = s.session_id JOIN turn_private_refs t ON t.turn_id = u.turn_id",
             [],
-            |row| Ok((row.get(0)?, row.get(1)?)),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )
         .expect("read private refs");
     assert_eq!(
-        (UPSTREAM_THREAD.to_string(), UPSTREAM_TURN.to_string()),
+        (
+            UPSTREAM_THREAD.to_string(),
+            UPSTREAM_TURN.to_string(),
+            UPSTREAM_GOAL.to_string()
+        ),
         private_refs
     );
 
     // Exercise the actual storage-to-public conversion rather than a synthetic
     // public value. Internal adapter and policy identifiers must stop at this
     // boundary even though the private tables retain them for recovery.
-    let public_json = serde_json::to_string(
-        &storage
-            .load_session(session.id())
-            .expect("load stored Session")
-            .expect("stored Session exists")
-            .to_public(),
-    )
-    .expect("serialize public Session");
+    let restored = storage
+        .load_session(session.id())
+        .expect("load stored Session")
+        .expect("stored Session exists");
+    assert_eq!(Some("Release desktop"), restored.display_name());
+    let public_json =
+        serde_json::to_string(&restored.to_public()).expect("serialize public Session");
+    assert!(public_json.contains(r#""display_name":"Release desktop""#));
     assert_privacy_canaries_absent(
         "storage public Session",
         public_json.as_bytes(),
-        &[UPSTREAM_THREAD, UPSTREAM_TURN, MODEL_REF, PROVIDER_REF],
+        &[
+            UPSTREAM_THREAD,
+            UPSTREAM_TURN,
+            UPSTREAM_GOAL,
+            MODEL_REF,
+            PROVIDER_REF,
+        ],
     );
 }
 
@@ -207,6 +226,7 @@ fn lifecycle_schema_excludes_raw_content_and_replayable_event_history() {
             "session_state_revision",
             "created_at",
             "updated_at",
+            "display_name",
         ],
     );
     assert_table_columns(
@@ -249,6 +269,7 @@ fn lifecycle_schema_excludes_raw_content_and_replayable_event_history() {
             "host_identity_ref",
             "desktop_binding_ref",
             "upstream_thread_ref",
+            "upstream_goal_ref",
         ],
     );
     assert_table_columns(

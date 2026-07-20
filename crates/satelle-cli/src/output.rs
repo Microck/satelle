@@ -294,6 +294,7 @@ mod tests {
     fn starting_public_session() -> PublicSession {
         serde_json::from_value(json!({
             "session_id": "rs_01890a5d-ac96-7b7c-8f89-37c3d0a66e11",
+            "display_name": null,
             "session_state_revision": 1,
             "created_at": "2024-01-01T00:00:00Z",
             "updated_at": "2024-01-01T00:00:00Z",

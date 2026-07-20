@@ -44,7 +44,7 @@ pub(super) const PROTECTED_FILE_NAMES: [&str; 5] = [
 ];
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 const BACKUP_FORMAT_VERSION: u32 = 1;
-const MIGRATIONS: [Migration; 8] = [
+const MIGRATIONS: [Migration; 9] = [
     Migration {
         version: 1,
         sql: include_str!("0001_initial.sql"),
@@ -90,6 +90,12 @@ const MIGRATIONS: [Migration; 8] = [
     Migration {
         version: 8,
         sql: include_str!("0008_api_token_state.sql"),
+        seeds_sensitive_state: false,
+        irreversible: false,
+    },
+    Migration {
+        version: 9,
+        sql: include_str!("0009_session_metadata.sql"),
         seeds_sensitive_state: false,
         irreversible: false,
     },

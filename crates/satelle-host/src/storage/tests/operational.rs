@@ -31,12 +31,12 @@ fn begin_maintenance(
 }
 
 #[test]
-fn operational_evidence_schema_is_migrated_atomically_to_version_eight() {
+fn operational_evidence_schema_is_migrated_atomically_to_version_nine() {
     let state = TempDir::new().expect("temporary state directory");
     let (storage, _) = Storage::open(state.path()).expect("open storage");
     let connection = storage.connection_for_test();
 
-    assert_eq!(8_i64, pragma_integer(connection, "user_version"));
+    assert_eq!(9_i64, pragma_integer(connection, "user_version"));
     let versions = connection
         .prepare("SELECT version FROM schema_migrations ORDER BY version")
         .unwrap()
@@ -45,7 +45,9 @@ fn operational_evidence_schema_is_migrated_atomically_to_version_eight() {
         .collect::<Result<Vec<_>, _>>()
         .unwrap();
     assert_eq!(
-        vec![1_i64, 2_i64, 3_i64, 4_i64, 5_i64, 6_i64, 7_i64, 8_i64,],
+        vec![
+            1_i64, 2_i64, 3_i64, 4_i64, 5_i64, 6_i64, 7_i64, 8_i64, 9_i64,
+        ],
         versions
     );
     for table in [
@@ -88,8 +90,11 @@ fn version_seven_api_tokens_upgrade_to_explicit_active_state() {
     storage
         .connection_for_test()
         .execute_batch(
-            "ALTER TABLE api_tokens DROP COLUMN token_state;
-             DELETE FROM schema_migrations WHERE version = 8;
+            "DROP INDEX one_session_per_upstream_goal_ref;
+             ALTER TABLE sessions DROP COLUMN display_name;
+             ALTER TABLE session_private_refs DROP COLUMN upstream_goal_ref;
+             ALTER TABLE api_tokens DROP COLUMN token_state;
+             DELETE FROM schema_migrations WHERE version IN (8, 9);
              PRAGMA user_version = 7;",
         )
         .expect("recreate the version seven token schema");
@@ -97,7 +102,7 @@ fn version_seven_api_tokens_upgrade_to_explicit_active_state() {
 
     let (storage, _) = Storage::open(state.path()).expect("upgrade version seven storage");
     assert_eq!(
-        8_i64,
+        9_i64,
         pragma_integer(storage.connection_for_test(), "user_version")
     );
     let token_state: String = storage
@@ -1242,8 +1247,11 @@ fn version_one_store_upgrades_without_replacing_existing_state() {
              DROP TABLE setup_runs;
              DROP TABLE native_readiness_results;
              DROP TABLE provider_smoke_results;
+             DROP INDEX one_session_per_upstream_goal_ref;
+             ALTER TABLE sessions DROP COLUMN display_name;
+             ALTER TABLE session_private_refs DROP COLUMN upstream_goal_ref;
              ALTER TABLE api_tokens DROP COLUMN token_state;
-             DELETE FROM schema_migrations WHERE version IN (2, 3, 4, 5, 6, 7, 8);
+             DELETE FROM schema_migrations WHERE version IN (2, 3, 4, 5, 6, 7, 8, 9);
              PRAGMA user_version = 1;",
         )
         .unwrap();
@@ -1252,7 +1260,7 @@ fn version_one_store_upgrades_without_replacing_existing_state() {
     let (storage, _) = Storage::open(state.path()).expect("upgrade version one storage");
     assert_eq!(expected_host, storage.host_identity().unwrap());
     assert_eq!(
-        8_i64,
+        9_i64,
         pragma_integer(storage.connection_for_test(), "user_version")
     );
 
@@ -1341,8 +1349,11 @@ fn assert_version_one_corruption_rejected_before_migration(
              DROP TABLE setup_runs;
              DROP TABLE native_readiness_results;
              DROP TABLE provider_smoke_results;
+             DROP INDEX one_session_per_upstream_goal_ref;
+             ALTER TABLE sessions DROP COLUMN display_name;
+             ALTER TABLE session_private_refs DROP COLUMN upstream_goal_ref;
              ALTER TABLE api_tokens DROP COLUMN token_state;
-             DELETE FROM schema_migrations WHERE version IN (2, 3, 4, 5, 6, 7, 8);
+             DELETE FROM schema_migrations WHERE version IN (2, 3, 4, 5, 6, 7, 8, 9);
              PRAGMA user_version = 1;",
         )
         .expect("create a logically corrupt version one store");
@@ -1398,8 +1409,11 @@ fn failed_migration_rolls_back_partial_schema_and_preserves_existing_state() {
              DROP TABLE setup_runs;
              DROP TABLE native_readiness_results;
              DROP TABLE provider_smoke_results;
+             DROP INDEX one_session_per_upstream_goal_ref;
+             ALTER TABLE sessions DROP COLUMN display_name;
+             ALTER TABLE session_private_refs DROP COLUMN upstream_goal_ref;
              ALTER TABLE api_tokens DROP COLUMN token_state;
-             DELETE FROM schema_migrations WHERE version IN (2, 3, 4, 5, 6, 7, 8);
+             DELETE FROM schema_migrations WHERE version IN (2, 3, 4, 5, 6, 7, 8, 9);
              PRAGMA user_version = 1;
              CREATE TABLE migration_sentinel (value TEXT NOT NULL) STRICT;
              INSERT INTO migration_sentinel (value) VALUES ('preserve-me');

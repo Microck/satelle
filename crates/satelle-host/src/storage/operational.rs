@@ -640,6 +640,9 @@ impl Storage {
         let (column, value) = match observed {
             ObservedUpstreamRef::Thread(value) => ("upstream_thread_ref", value),
             ObservedUpstreamRef::Turn(value) => ("upstream_turn_ref", value),
+            ObservedUpstreamRef::Goal(_) => {
+                return Err(StorageError::new(StorageErrorKind::InvalidInput));
+            }
         };
         let sql = format!(
             "UPDATE control_leases SET {column} = COALESCE({column}, ?1)
