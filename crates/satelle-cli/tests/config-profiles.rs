@@ -839,3 +839,73 @@ variable = "SATELLE_TEST_PROVIDER_TOKEN"
     assert!(!stdout.contains(token_path.to_string_lossy().as_ref()));
     assert!(!stdout.contains("SATELLE_TEST_PROVIDER_TOKEN"));
 }
+
+#[test]
+fn config_explain_human_output_escapes_terminal_control_payloads() {
+    let osc52_payload = "\u{1b}]52;c;c2F0ZWxsZQ==\u{7}";
+    let host_alias = format!("remote{osc52_payload}");
+    let host_alias_literal = toml::Value::String(host_alias.clone()).to_string();
+    let model_alias = "model\u{8}alias";
+    let model_alias_literal = toml::Value::String(model_alias.to_string()).to_string();
+    let provider_alias = "provider\u{1b}[31mred";
+    let provider_alias_literal = toml::Value::String(provider_alias.to_string()).to_string();
+
+    let fixture = ConfigFixture::new(
+        &format!(
+            r#"
+default_host = {host_alias_literal}
+model_alias = {model_alias_literal}
+provider_alias = {provider_alias_literal}
+
+[hosts.{host_alias_literal}]
+transport = "local"
+adapter = "fake"
+
+[hosts.{host_alias_literal}.provider_auth.openai]
+kind = "environment"
+variable = "SATELLE_TEST_PROVIDER_TOKEN"
+"#
+        ),
+        "",
+    );
+
+    let human = fixture
+        .command()
+        .args(["config", "explain"])
+        .assert()
+        .success()
+        .get_output()
+        .clone();
+    let stdout = String::from_utf8(human.stdout).expect("human output is UTF-8");
+
+    assert!(
+        !stdout.contains('\u{1b}'),
+        "raw ESC byte reached human output: {stdout:?}"
+    );
+    assert!(
+        !stdout.contains('\u{7}'),
+        "raw BEL byte reached human output: {stdout:?}"
+    );
+    assert!(
+        !stdout.contains('\u{8}'),
+        "raw backspace byte reached human output: {stdout:?}"
+    );
+    assert!(stdout.contains(r"Selected host: remote\u001b]52;c;c2F0ZWxsZQ==\u0007"));
+    assert!(stdout.contains(r"effective.model_alias = model\balias"));
+    assert!(stdout.contains(r"effective.provider_alias = provider\u001b[31mred"));
+    assert!(stdout.contains(
+        r"effective.hosts.remote\u001b]52;c;c2F0ZWxsZQ==\u0007.provider_auth.openai = <redacted> (source: user_config; reason: secret_source_reference)"
+    ));
+
+    let json = fixture
+        .command()
+        .args(["config", "explain", "--json"])
+        .assert()
+        .success()
+        .get_output()
+        .clone();
+    let report = parse_json(&json.stdout);
+    assert_eq!(report["selected_host"], host_alias);
+    assert_eq!(report["effective"]["model_alias"], model_alias);
+    assert_eq!(report["effective"]["provider_alias"], provider_alias);
+}

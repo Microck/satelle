@@ -4491,6 +4491,14 @@ fn prompt_command_help_warns_about_argument_exposure_and_recommends_safer_source
             "missing stdin advice for {command}"
         );
         assert!(
+            stdout.contains("PROMPT_OR_DASH"),
+            "missing positional prompt metavariable for {command}"
+        );
+        assert!(
+            stdout.contains("PROMPT_OR_DASH set to '-'"),
+            "missing dash stdin guidance for {command}"
+        );
+        assert!(
             stdout.contains("--prompt-file"),
             "missing file advice for {command}"
         );

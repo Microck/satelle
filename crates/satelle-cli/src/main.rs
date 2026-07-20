@@ -2544,21 +2544,23 @@ fn config_explain(
     } else {
         println!(
             "Selected host: {}",
-            output["selected_host"].as_str().unwrap_or_default()
+            terminal_safe_config_text(output["selected_host"].as_str().unwrap_or_default())
         );
         println!(
             "User config: {}",
-            output["checked_files"][0].as_str().unwrap_or_default()
+            terminal_safe_config_text(output["checked_files"][0].as_str().unwrap_or_default())
         );
         println!(
             "Project config: {}",
-            output["checked_files"][1].as_str().unwrap_or_default()
+            terminal_safe_config_text(output["checked_files"][1].as_str().unwrap_or_default())
         );
         println!(
             "Default host: {}",
-            output["values"]["default_host"]
-                .as_str()
-                .unwrap_or_default()
+            terminal_safe_config_text(
+                output["values"]["default_host"]
+                    .as_str()
+                    .unwrap_or_default()
+            )
         );
         println!(
             "Host aliases: {}",
@@ -2573,14 +2575,17 @@ fn config_explain(
 fn print_config_value(path: &str, value: &serde_json::Value) {
     if let Some(object) = value.as_object() {
         if object.get("redacted").and_then(serde_json::Value::as_bool) == Some(true) {
+            let path = terminal_safe_config_text(path);
             let source = object
                 .get("source")
                 .and_then(serde_json::Value::as_str)
                 .unwrap_or("unknown");
+            let source = terminal_safe_config_text(source);
             let reason = object
                 .get("redaction_reason")
                 .and_then(serde_json::Value::as_str)
                 .unwrap_or("sensitive_value");
+            let reason = terminal_safe_config_text(reason);
             println!("{path} = <redacted> (source: {source}; reason: {reason})");
             return;
         }
@@ -2592,10 +2597,22 @@ fn print_config_value(path: &str, value: &serde_json::Value) {
     }
 
     let rendered = match value {
-        serde_json::Value::String(value) => value.clone(),
+        serde_json::Value::String(value) => terminal_safe_config_text(value),
         _ => serde_json::to_string(value).unwrap_or_else(|_| "<unavailable>".to_string()),
     };
+    let path = terminal_safe_config_text(path);
     println!("{path} = {rendered}");
+}
+
+fn terminal_safe_config_text(value: &str) -> String {
+    let escaped = serde_json::to_string(value).unwrap_or_else(|_| "\"<unavailable>\"".to_string());
+    let Some(unquoted) = escaped
+        .strip_prefix('"')
+        .and_then(|without_prefix| without_prefix.strip_suffix('"'))
+    else {
+        return escaped;
+    };
+    unquoted.to_string()
 }
 
 fn env_source(name: &str) -> serde_json::Value {
