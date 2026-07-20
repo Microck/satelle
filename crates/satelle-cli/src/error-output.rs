@@ -33,6 +33,7 @@ enum ErrorCategory {
     Readiness,
     Storage,
     RemoteExecution,
+    Interrupted,
     Capacity,
     RateLimit,
     NotFound,
@@ -48,7 +49,7 @@ struct ErrorContract {
 }
 
 impl ErrorCategory {
-    const ALL: [Self; 12] = [
+    const ALL: [Self; 13] = [
         Self::Authentication,
         Self::Authorization,
         Self::Conflict,
@@ -57,6 +58,7 @@ impl ErrorCategory {
         Self::Readiness,
         Self::Storage,
         Self::RemoteExecution,
+        Self::Interrupted,
         Self::Capacity,
         Self::RateLimit,
         Self::NotFound,
@@ -73,6 +75,7 @@ impl ErrorCategory {
             Self::Readiness => "readiness",
             Self::Storage => "storage",
             Self::RemoteExecution => "remote_execution",
+            Self::Interrupted => "interrupted",
             Self::Capacity => "capacity",
             Self::RateLimit => "rate_limit",
             Self::NotFound => "not_found",
@@ -266,17 +269,24 @@ fn error_contract(code: ErrorCode) -> ErrorContract {
         | ErrorCode::ComponentSelectionConflict
         | ErrorCode::UnsupportedUpdateComponent
         | ErrorCode::SetupConsentRequired
+        | ErrorCode::DoctorFixConsentRequired
         | ErrorCode::DoctorRefreshScopeRequired
         | ErrorCode::DoctorRefreshTimeoutWithoutRefresh
         | ErrorCode::InputRequired => ErrorContract {
             category: ErrorCategory::InvalidRequest,
             retryable: false,
-            outcome: if matches!(code, ErrorCode::SetupConsentRequired) {
-                "Setup was not applied."
-            } else {
-                "Command input was not accepted."
+            outcome: match code {
+                ErrorCode::SetupConsentRequired => "Setup was not applied.",
+                ErrorCode::DoctorFixConsentRequired => "Doctor fix was not applied.",
+                _ => "Command input was not accepted.",
             },
             default_recovery: "review satelle --help and retry with valid input",
+        },
+        ErrorCode::Interrupted => ErrorContract {
+            category: ErrorCategory::Interrupted,
+            retryable: true,
+            outcome: "The attached command was interrupted.",
+            default_recovery: "rerun the command or inspect the Session status",
         },
         ErrorCode::CertificateUntrusted
         | ErrorCode::CertificateHostnameMismatch
@@ -371,6 +381,8 @@ mod tests {
             (ErrorCode::AuthenticationFailed, 74),
             (ErrorCode::CertificateUntrusted, 74),
             (ErrorCode::StorageIntegrityFailed, 74),
+            (ErrorCode::DoctorFixConsentRequired, 64),
+            (ErrorCode::Interrupted, 130),
             (ErrorCode::NotImplemented, 70),
         ] {
             assert_eq!(
@@ -502,6 +514,32 @@ mod tests {
         let contract = error_contract(ErrorCode::NativeReadinessTimeout);
         assert_eq!(contract.category.as_str(), "readiness");
         assert!(contract.retryable);
+    }
+
+    #[test]
+    fn consent_and_interrupt_errors_have_stable_cli_contracts() {
+        let doctor_fix = SatelleError::doctor_fix_consent_required(
+            &["repair Host state".to_string()],
+            "satelle doctor --fix --yes",
+        );
+        assert_eq!(process_exit_code(&doctor_fix), ExitCode::from(64));
+        assert_eq!(
+            human_error(&doctor_fix),
+            [
+                "error: Doctor fix was not applied.",
+                "cause: doctor fix has planned mutations that require explicit consent; no changes were applied [doctor-fix-consent-required]",
+                "state: No changes were applied.",
+                "next: satelle doctor --fix --yes",
+            ]
+            .join("\n")
+        );
+
+        let interrupted = SatelleError::interrupted_attached_command();
+        let envelope = error_envelope(&interrupted);
+        assert_eq!(process_exit_code(&interrupted), ExitCode::from(130));
+        assert_eq!(envelope["code"], "interrupted");
+        assert_eq!(envelope["category"], "interrupted");
+        assert_eq!(envelope["retryable"], true);
     }
 
     #[test]

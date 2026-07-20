@@ -757,21 +757,21 @@
 - satelle MVP does not add stable --plain output modes to state-reporting commands unless a command-specific fact defines the plain format and compatibility contract @spec @mvp
 
 # implementation-quality
-- satelle is implemented as a small Rust workspace with separate crates for the binary entrypoints, shared domain model, Codex adapter, and transport boundary @spec @mvp
-- satelle avoids crate explosion by adding new crates only when they enforce a real ownership boundary or materially simplify testing and reuse @spec @mvp
-- satelle defines shared Satelle domain types as hand-written Rust structs first and may generate schemas or API documentation from those types after the contract stabilizes @spec @mvp
-- satelle implementation keeps CLI presentation, host configuration, transport, host daemon API, Codex app-server protocol, capability probing, and session lifecycle as separate ownership boundaries @spec @mvp
-- satelle command handlers delegate to typed orchestration code instead of embedding transport, Codex protocol, or Computer Use readiness logic inline @spec @mvp
-- satelle represents transport kinds, host readiness states, and provider Computer Use support with explicit typed models instead of stringly typed or nullable mode flags @spec @mvp
-- satelle avoids scattered platform-specific conditionals by routing OS-specific host checks through dedicated platform capability probes @spec @mvp
-- satelle rejects silent fallback behavior in favor of explicit unsupported-capability diagnostics and user-selected alternatives @spec @mvp
-- satelle decomposes implementation files when a file combines unrelated ownership boundaries; file length alone does not require a split @spec @mvp
-- satelle uses separate public API, persistence, and upstream-adapter data types so internal identifiers and sensitive storage fields cannot enter public output by ordinary serialization @spec @mvp
-- satelle public response types use enums and discriminated states instead of independent string and boolean fields that can represent contradictory state @spec @mvp
-- satelle derives redundant state such as Session activity and readiness summaries from canonical records instead of maintaining independently mutable copies @spec @mvp
-- satelle uses structured tracing for internal diagnostics across CLI, transport, Host Daemon, Codex adapter, and capability probes @spec @mvp
-- satelle keeps diagnostic logs separate from user-facing command output @spec @mvp
-- satelle supports configurable log verbosity through flags, environment variables, or config without changing JSON command output contracts @spec @mvp
+- satelle is implemented as a small Rust workspace with separate crates for the binary entrypoints, shared domain model, Codex adapter, and transport boundary @spec @mvp @implemented
+- satelle avoids crate explosion by adding new crates only when they enforce a real ownership boundary or materially simplify testing and reuse @spec @mvp @implemented
+- satelle defines shared Satelle domain types as hand-written Rust structs first and may generate schemas or API documentation from those types after the contract stabilizes @spec @mvp @implemented
+- satelle implementation keeps CLI presentation, host configuration, transport, host daemon API, Codex app-server protocol, capability probing, and session lifecycle as separate ownership boundaries @spec @mvp @implemented
+- satelle command handlers delegate to typed orchestration code instead of embedding transport, Codex protocol, or Computer Use readiness logic inline @spec @mvp @implemented
+- satelle represents transport kinds, host readiness states, and provider Computer Use support with explicit typed models instead of stringly typed or nullable mode flags @spec @mvp @implemented
+- satelle avoids scattered platform-specific conditionals by routing OS-specific host checks through dedicated platform capability probes @spec @mvp @implemented
+- satelle rejects silent fallback behavior in favor of explicit unsupported-capability diagnostics and user-selected alternatives @spec @mvp @implemented
+- satelle decomposes implementation files when a file combines unrelated ownership boundaries; file length alone does not require a split @spec @mvp @implemented
+- satelle uses separate public API, persistence, and upstream-adapter data types so internal identifiers and sensitive storage fields cannot enter public output by ordinary serialization @spec @mvp @implemented
+- satelle public response types use enums and discriminated states instead of independent string and boolean fields that can represent contradictory state @spec @mvp @implemented
+- satelle derives redundant state such as Session activity and readiness summaries from canonical records instead of maintaining independently mutable copies @spec @mvp @implemented
+- satelle uses structured tracing for internal diagnostics across CLI, transport, Host Daemon, Codex adapter, and capability probes @spec @mvp @implemented
+- satelle keeps diagnostic logs separate from user-facing command output @spec @mvp @implemented
+- satelle supports configurable log verbosity through flags, environment variables, or config without changing JSON command output contracts @spec @mvp @implemented
 
 # api
 
@@ -987,7 +987,7 @@
 - satelle machine-readable error output is stable enough for AI clients and scripts to branch on code, category, retryable, and suggested_commands without parsing human text @spec @mvp @implemented
 - satelle JSON errors include a stable code, a human message, optional structured details, and actionable recovery guidance when the recovery path is known @implemented @mvp
 - satelle human error messages state the user-visible outcome first, explain the known cause, identify preserved state when relevant, and provide the next recovery step @spec @mvp @implemented
-- satelle does not use generic failure messages when a specific failed host, transport, Codex, Computer Use, provider, config, or session check is known @spec @mvp
+- satelle does not use generic failure messages when a specific failed host, transport, Codex, Computer Use, provider, config, or session check is known @spec @mvp @implemented
 - satelle separates user-facing error messages from diagnostic implementation details and exposes low-level details only when they help the user or agent act @spec @mvp @implemented
 - satelle typed error codes are the stable automation contract while human copy may improve for clarity without changing the code @spec @mvp @implemented
 - incompatible-control-plane uses exit 75 and recovery command satelle doctor --scope codex --refresh --json @implemented @contract @mvp
@@ -995,15 +995,15 @@
 - incompatible-control-plane details contain only operation, reason, required_capabilities, and missing_capabilities using stable Satelle tokens; reason is runtime_missing, version_malformed, version_unavailable, version_unsupported, schema_unavailable, handshake_unavailable, or required_capability_missing, and no upstream method name or raw probe output is exposed @implemented @contract @mvp
 - satelle uses a small fixed set of process exit codes for broad failure classes and keeps specific failure causes in typed JSON error codes @spec @mvp @implemented
 - satelle exit codes distinguish success, usage error, configuration error, unreachable host, host readiness failure, remote execution failure, and internal error @spec @mvp @implemented
-- satelle exits 0 for success and clean user-declined no-op outcomes @spec @mvp
+- satelle exits 0 for success and clean user-declined no-op outcomes @spec @mvp @implemented
 - satelle exits 64 for usage errors @spec @mvp @implemented
 - satelle exits 66 for configuration errors @spec @mvp @implemented
 - satelle exits 69 for unreachable Host errors @spec @mvp @implemented
 - satelle exits 75 for Host readiness failures @spec @mvp @implemented
 - satelle exits 74 for remote execution failures @spec @mvp @implemented
 - satelle exits 70 for internal errors @spec @mvp @implemented
-- satelle exits 130 when an attached command is interrupted by Ctrl-C after applying its interruption contract @spec @mvp
-- setup-consent-required and doctor-fix-consent-required use the usage-error exit class because required noninteractive consent was absent and no mutation occurred @spec @contract @mvp
+- satelle exits 130 when an attached command is interrupted by Ctrl-C after applying its interruption contract @spec @mvp @implemented
+- setup-consent-required and doctor-fix-consent-required use the usage-error exit class because required noninteractive consent was absent and no mutation occurred @spec @contract @mvp @implemented
 
 # config
 - satelle uses TOML for human-edited configuration files @implemented @mvp
@@ -1336,8 +1336,8 @@
 
 # roadmap
 
-- every lifecycle-specification fact remains required project scope; MVP and later labels define delivery order rather than optionality @spec @mvp
-- roadmap phases are dependency gates, so a later phase does not replace unresolved acceptance criteria from an earlier phase @spec @mvp
+- every lifecycle-specification fact remains required project scope; MVP and later labels define delivery order rather than optionality @spec @mvp @implemented
+- roadmap phases are dependency gates, so a later phase does not replace unresolved acceptance criteria from an earlier phase @spec @mvp @implemented
 
 ## phase-0-upstream-contract
 - phase 0 is complete when one real supported Host exposes readiness and approval state, performs one harmless action, completes one attached native Codex Computer Use Turn through app-server, restores current Session state to a fresh Client after reconnect, starts one detached steer Turn, stops that Turn, and confirms its stopped state @spec @phase0 @mvp
@@ -2370,7 +2370,7 @@
   tags: [ci, mvp, implemented]
 
 ## contract-suites
-- the ci tag is reserved for command-bearing facts, while manual conformance and release-gate requirements use the verification tag until an executable mapping exists @spec @mvp
+- the ci tag is reserved for command-bearing facts, while manual conformance and release-gate requirements use the verification tag until an executable mapping exists @spec @mvp @implemented
 - every versioned JSON and NDJSON surface has contract tests for schema_version, required fields, enum tokens, stdout, stderr, and exit status @spec @verification @mvp
 - id: zox
   label: parser failures and semantic validation failures share the same human and JSON error conformance suite

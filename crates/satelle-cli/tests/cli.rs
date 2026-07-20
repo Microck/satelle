@@ -2211,9 +2211,19 @@ adapter = "codex"
 #[test]
 fn production_setup_with_consent_fails_closed_when_local_mutations_are_unsupported() {
     let sandbox = state_dir();
-    let config_file = sandbox.path().join("config.toml");
+    let operator_home = sandbox.path().join("operator/home");
+    let operator_config_file = operator_home.join("config/config.toml");
+    let operator_state_dir = sandbox.path().join("operator/state");
+    let operator_cache_dir = sandbox.path().join("operator/cache");
+    let operator_log_dir = sandbox.path().join("operator/logs");
+    fs::create_dir_all(
+        operator_config_file
+            .parent()
+            .expect("config file has a parent"),
+    )
+    .expect("operator config directory should be created before the mutation check");
     write_user_config(
-        &config_file,
+        &operator_config_file,
         r#"
 default_host = "local-demo"
 
@@ -2229,8 +2239,11 @@ adapter = "codex"
         sandbox.path(),
         || {
             production_satelle()
-                .env("SATELLE_CONFIG_FILE", &config_file)
-                .env("SATELLE_STATE_DIR", sandbox.path())
+                .env("SATELLE_HOME", &operator_home)
+                .env("SATELLE_CONFIG_FILE", &operator_config_file)
+                .env("SATELLE_STATE_DIR", &operator_state_dir)
+                .env("SATELLE_CACHE_DIR", &operator_cache_dir)
+                .env("SATELLE_LOG_DIR", &operator_log_dir)
                 .args(["setup", "--yes", "--host", "local-demo", "--json"])
                 .assert()
                 .code(70)
@@ -2365,6 +2378,48 @@ fn setup_no_input_json_requires_consent_without_mutating() {
     assert_eq!(
         error["suggested_commands"][0],
         "satelle setup --host local-demo --on-demand --no-input --json --yes"
+    );
+    assert!(!state.path().join("local-demo-state.json").exists());
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn setup_interactive_decline_exits_successfully_without_mutating_state() {
+    let state = state_dir();
+    let executable = assert_cmd::cargo::cargo_bin!("satelle");
+    let command_line = format!("{} setup --host local-demo", executable.display());
+
+    let output =
+        assert_directory_tree_unchanged("declined interactive satelle setup", state.path(), || {
+            let mut command = Command::new("script");
+            for name in [
+                "SATELLE_HOME",
+                "SATELLE_CONFIG_FILE",
+                "SATELLE_STATE_DIR",
+                "SATELLE_CACHE_DIR",
+                "SATELLE_LOG_DIR",
+                "SATELLE_HOST",
+                "SATELLE_PROFILE",
+                "SATELLE_ERROR_FORMAT",
+                TEST_SUPPORT_ADAPTER_ENV,
+            ] {
+                command.env_remove(name);
+            }
+            command
+                .env("SATELLE_STATE_DIR", state.path())
+                .env(TEST_SUPPORT_ADAPTER_ENV, "fake")
+                .args(["-qec", command_line.as_str(), "/dev/null"])
+                .write_stdin("n\n")
+                .assert()
+                .success()
+                .get_output()
+                .clone()
+        });
+
+    let output = String::from_utf8_lossy(&[output.stdout, output.stderr].concat()).to_string();
+    assert!(
+        output.contains("No changes applied."),
+        "decline output should report no mutation: {output}"
     );
     assert!(!state.path().join("local-demo-state.json").exists());
 }

@@ -20,7 +20,7 @@ use error_output::{ErrorFormat, parser_error, print_error, process_exit_code};
 use host_trust::{HostTrustReport, persist_host_identity};
 use logs::{LogsCommand, show_logs};
 use notify::{Config as NotifyConfig, Event, RecommendedWatcher, RecursiveMode, Watcher};
-use output::{OutputArgs, OutputFormat, SessionResultSchemaVersion, StatusReport};
+use output::{EventOutput, OutputArgs, OutputFormat, SessionResultSchemaVersion, StatusReport};
 use satelle_core::session::{
     EffectiveModelRef, HostIdentityRef, ProviderBindingRef, PublicSession, PublicTurn,
     TurnAdmissionPhase, TurnExecutionMode, TurnState,
@@ -733,6 +733,7 @@ fn try_main(cli: Cli, error_format: ErrorFormat) -> Result<(), CliFailure> {
         command,
     } = cli;
     let config = ConfigContext::new(profile.as_deref());
+    preflight_setup_before_history(&command, profile.as_deref())?;
     let history = start_command_history(&command, &config);
     let outcome = execute_command(command, no_color, profile.as_deref(), config);
 
@@ -752,6 +753,52 @@ fn try_main(cli: Cli, error_format: ErrorFormat) -> Result<(), CliFailure> {
     }
 
     outcome.map(|_| ())
+}
+
+fn preflight_setup_before_history(
+    command: &Command,
+    profile: Option<&str>,
+) -> Result<(), CliFailure> {
+    let Command::Setup(command) = command else {
+        return Ok(());
+    };
+    // The built-in local-demo production backend cannot apply setup mutations.
+    // Reject that reserved path before command-history or config reads can
+    // touch operator files on platforms that report read opens as changes.
+    command
+        .output_args
+        .resolve(EventOutput::None)
+        .map_err(failure)?;
+    if command.dry_run
+        || command.host.as_deref() != Some(LOCAL_DEMO_HOST)
+        || profile.is_some()
+        || std::env::var_os("SATELLE_PROFILE").is_some()
+        || command.expected_host_id.is_some()
+        || (command.on_demand && command.persistent)
+        || setup_components(&command.component).is_err()
+        || !uses_production_local_setup_backend()
+    {
+        return Ok(());
+    }
+
+    let setup_mode = if command.persistent {
+        "persistent"
+    } else {
+        "on_demand"
+    };
+    Err(failure(SatelleError::not_implemented(format!(
+        "{setup_mode} setup mutations are not supported by the local Host transport"
+    ))))
+}
+
+#[cfg(feature = "test-support")]
+fn uses_production_local_setup_backend() -> bool {
+    std::env::var_os("SATELLE_TEST_SUPPORT_ADAPTER").is_none()
+}
+
+#[cfg(not(feature = "test-support"))]
+fn uses_production_local_setup_backend() -> bool {
+    true
 }
 
 fn execute_command(
@@ -1606,10 +1653,8 @@ fn run_setup(
                     })
                 })?;
             if !confirmed {
-                return Err(failure(SatelleError::setup_consent_required(
-                    &report.planned_actions,
-                    &consent_recovery_command,
-                )));
+                println!("No changes applied.");
+                return Ok(());
             }
         }
 

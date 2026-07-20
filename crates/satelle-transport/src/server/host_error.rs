@@ -66,6 +66,7 @@ fn failure(error: &SatelleError) -> ApiFailure {
         | ErrorCode::ComponentSelectionConflict
         | ErrorCode::UnsupportedUpdateComponent
         | ErrorCode::SetupConsentRequired
+        | ErrorCode::DoctorFixConsentRequired
         | ErrorCode::DoctorRefreshScopeRequired
         | ErrorCode::DoctorRefreshTimeoutWithoutRefresh
         | ErrorCode::InputRequired => ApiFailure {
@@ -222,6 +223,9 @@ fn failure(error: &SatelleError) -> ApiFailure {
         // This is a Controller-local reachability error. If it ever reaches
         // the Host boundary, fail closed instead of inventing a wire code.
         | ErrorCode::DirectDaemonUnreachable
+        // Process interruption is a Controller-local process-exit contract.
+        // If it crosses the Host boundary, expose no extra API surface.
+        | ErrorCode::Interrupted
         | ErrorCode::SshHostKeyVerificationRequired => ApiFailure {
             status: StatusCode::INTERNAL_SERVER_ERROR,
             code: ApiErrorCode::InternalError,
