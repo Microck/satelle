@@ -70,10 +70,15 @@ jobs:
         os: [ubuntu-24.04, windows-2025, macos-15]
     steps:
       - name: Check out repository
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3c0 # v7.0.0
 
       - name: Install pinned Rust toolchain
         run: rustup toolchain install 1.97.0 --profile minimal --component clippy,rustfmt
+
+      - name: Cache Rust build artifacts
+        uses: Swatinem/rust-cache@983d3da37c6a6c41d09b8d867f4d49b43d759d2c # v2.8.1
+        with:
+          workspaces: ". -> target"
 
       - name: Check formatting
         run: cargo fmt --all -- --check
@@ -91,3 +96,30 @@ jobs:
 
       - name: Smoke-test release binary contracts
         run: cargo test --locked -p satelle-cli --test release-binary-contract release_binary_satisfies_offline_contract -- --exact --ignored
+
+  # Fast merge gate: ubuntu-only Rust checks. Required for PR merge.
+  # The full cross-platform matrix (above) runs but does not block merging.
+  rust-merge-gate:
+    name: Rust merge gate (ubuntu)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3c0 # v7.0.0
+
+      - name: Install pinned Rust toolchain
+        run: rustup toolchain install 1.97.0 --profile minimal --component clippy,rustfmt
+
+      - name: Cache Rust build artifacts
+        uses: Swatinem/rust-cache@983d3da37c6a6c41d09b8d867f4d49b43d759d2c # v2.8.1
+        with:
+          workspaces: ". -> target"
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Run Clippy
+        run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+
+      - name: Run tests
+        run: cargo test --workspace --all-targets --all-features --locked --no-fail-fast
