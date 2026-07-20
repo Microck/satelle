@@ -185,7 +185,10 @@ fn public_persistence_and_upstream_data_boundaries_do_not_collapse() {
 #[test]
 fn diagnostics_use_tracing_without_corrupting_user_output_contracts() {
     for (path, marker) in [
-        ("crates/satelle-cli/src/main.rs", "SATELLE_LOG"),
+        (
+            "crates/satelle-cli/src/main.rs",
+            ".with_env_var(\"SATELLE_LOG\")",
+        ),
         ("crates/satelle-cli/src/main.rs", "with_writer(io::stderr)"),
         ("crates/satelle-host/src/daemon.rs", "tracing::info!"),
         (

@@ -151,7 +151,10 @@ fn json_command_output_is_stable_when_diagnostic_verbosity_changes() {
         .clone();
 
     assert!(baseline.stderr.is_empty());
-    assert!(verbose.stderr.is_empty());
+    assert!(
+        String::from_utf8_lossy(&verbose.stderr).contains("Satelle diagnostics initialized"),
+        "SATELLE_LOG should enable debug diagnostics on stderr"
+    );
     assert_eq!(parse_json(&baseline.stdout), parse_json(&verbose.stdout));
 }
 

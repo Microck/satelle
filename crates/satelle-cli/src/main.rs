@@ -673,6 +673,7 @@ fn main() -> ExitCode {
     };
     let error_format =
         ErrorFormat::resolve(cli.error_format, cli.command.requests_machine_errors());
+    install_diagnostics(&cli.command);
 
     match try_main(cli, error_format) {
         Ok(()) => ExitCode::SUCCESS,
@@ -3452,7 +3453,6 @@ fn start_host_daemon(
             )));
         }
     };
-    install_host_daemon_diagnostics();
     let bind_addr = command.bind.parse::<SocketAddr>().map_err(|error| {
         failure(SatelleError {
             code: ErrorCode::InvalidUsage,
@@ -3661,16 +3661,28 @@ fn ssh_launch_readiness_timeouts(
     }
 }
 
-fn install_host_daemon_diagnostics() {
-    // Host start reserves stdout for its human or machine-readable readiness
-    // response. Send structured runtime diagnostics to stderr so token
-    // lifecycle events are observable without corrupting that protocol.
+fn install_diagnostics(command: &Command) {
+    let default_level = if matches!(
+        command,
+        Command::Host {
+            command: HostCommand::Start(_)
+        }
+    ) {
+        tracing_subscriber::filter::LevelFilter::INFO
+    } else {
+        tracing_subscriber::filter::LevelFilter::OFF
+    };
+    let filter = tracing_subscriber::EnvFilter::builder()
+        .with_default_directive(default_level.into())
+        .with_env_var("SATELLE_LOG")
+        .from_env_lossy();
     let _subscriber_already_installed = tracing_subscriber::fmt()
         .with_ansi(false)
         .with_target(true)
         .with_writer(io::stderr)
-        .with_max_level(tracing_subscriber::filter::LevelFilter::INFO)
+        .with_env_filter(filter)
         .try_init();
+    tracing::debug!("Satelle diagnostics initialized");
 }
 
 struct DaemonTlsFiles {
