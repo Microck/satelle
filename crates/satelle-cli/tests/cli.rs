@@ -2209,7 +2209,7 @@ adapter = "codex"
 }
 
 #[test]
-fn production_setup_with_consent_fails_closed_when_local_mutations_are_unsupported() {
+fn production_setup_with_default_host_fails_closed_before_operator_state_is_touched() {
     let sandbox = state_dir();
     let operator_home = sandbox.path().join("operator/home");
     let operator_config_file = operator_home.join("config/config.toml");
@@ -2235,7 +2235,7 @@ adapter = "codex"
     .expect("production config should be written");
 
     let output = assert_directory_tree_unchanged(
-        "satelle setup --yes with unsupported local mutations",
+        "satelle setup --yes with the unsupported default local host",
         sandbox.path(),
         || {
             production_satelle()
@@ -2244,7 +2244,7 @@ adapter = "codex"
                 .env("SATELLE_STATE_DIR", &operator_state_dir)
                 .env("SATELLE_CACHE_DIR", &operator_cache_dir)
                 .env("SATELLE_LOG_DIR", &operator_log_dir)
-                .args(["setup", "--yes", "--host", "local-demo", "--json"])
+                .args(["setup", "--yes", "--json"])
                 .assert()
                 .code(70)
                 .get_output()

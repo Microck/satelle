@@ -770,7 +770,7 @@ fn preflight_setup_before_history(
         .resolve(EventOutput::None)
         .map_err(failure)?;
     if command.dry_run
-        || command.host.as_deref() != Some(LOCAL_DEMO_HOST)
+        || command.host.as_deref().unwrap_or(LOCAL_DEMO_HOST) != LOCAL_DEMO_HOST
         || profile.is_some()
         || std::env::var_os("SATELLE_PROFILE").is_some()
         || command.expected_host_id.is_some()
