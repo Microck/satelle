@@ -83,7 +83,11 @@ impl EventType {
     pub const fn requires_turn_subject(self) -> bool {
         matches!(
             self,
-            Self::TurnCompleted | Self::TurnBlocked | Self::TurnFailed | Self::TurnStopped
+            Self::TurnStarted
+                | Self::TurnCompleted
+                | Self::TurnBlocked
+                | Self::TurnFailed
+                | Self::TurnStopped
         )
     }
 }
@@ -132,6 +136,13 @@ pub enum EventStateSubject {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum EventSubject {
+    /// Session identity for an event that does not report committed state.
+    SessionIdentity { session_id: SessionId },
+    /// Session and Turn identity for an event that does not report committed state.
+    TurnIdentity {
+        session_id: SessionId,
+        turn_id: TurnId,
+    },
     Session {
         session_id: SessionId,
         session_state_revision: SessionStateRevision,
@@ -180,13 +191,18 @@ impl SatelleEventBody {
         }
         if event_type.requires_turn_subject() && !matches!(subject, Some(EventSubject::Turn { .. }))
         {
-            return Err(SatelleEventError::TerminalEventRequiresTurn);
+            return Err(SatelleEventError::LifecycleEventRequiresTurn);
         }
         if event_type == EventType::CommandFailed && subject.is_some() {
             return Err(SatelleEventError::CommandFailedRequiresNoSubject);
         }
         let (session_id, turn_id, state_subject) = match subject {
             None => (None, None, None),
+            Some(EventSubject::SessionIdentity { session_id }) => (Some(session_id), None, None),
+            Some(EventSubject::TurnIdentity {
+                session_id,
+                turn_id,
+            }) => (Some(session_id), Some(turn_id), None),
             Some(EventSubject::Session {
                 session_id,
                 session_state_revision,
@@ -402,6 +418,11 @@ impl<'de> Deserialize<'de> for SatelleEvent {
         let wire = SatelleEventOwned::deserialize(deserializer)?;
         let subject = match (wire.session_id, wire.turn_id, wire.state_subject) {
             (None, None, None) => None,
+            (Some(session_id), None, None) => Some(EventSubject::SessionIdentity { session_id }),
+            (Some(session_id), Some(turn_id), None) => Some(EventSubject::TurnIdentity {
+                session_id,
+                turn_id,
+            }),
             (
                 Some(session_id),
                 None,
@@ -455,8 +476,8 @@ pub enum SatelleEventError {
     EmptyMessage,
     #[error("Satelle Event data must be a JSON object")]
     DataMustBeObject,
-    #[error("a Turn-terminal Satelle Event requires a Turn state subject")]
-    TerminalEventRequiresTurn,
+    #[error("a committed Turn lifecycle Satelle Event requires a Turn state subject")]
+    LifecycleEventRequiresTurn,
     #[error("a command_failed Satelle Event must not have a state subject")]
     CommandFailedRequiresNoSubject,
 }
@@ -507,6 +528,22 @@ mod tests {
                 "session_id": null,
                 "turn_id": null
             }
+        })
+    }
+
+    fn uncommitted_turn_progress_event() -> Value {
+        serde_json::json!({
+            "schema_version": "satelle.events.v2",
+            "type": "turn_progress",
+            "source": "codex_adapter",
+            "timestamp": "2026-07-10T12:00:00Z",
+            "seq": 2,
+            "session_id": "rs_01890a5d-ac96-7b7c-8f89-37c3d0a66e11",
+            "turn_id": "rt_01890a5d-ac96-7b7c-8f89-37c3d0a66e21",
+            "host": "host-01890a5d-ac96-7b7c-8f89-37c3d0a66e31",
+            "state_subject": null,
+            "message": "Turn is making progress",
+            "data": {"phase": "working"}
         })
     }
 
@@ -572,6 +609,47 @@ mod tests {
     }
 
     #[test]
+    fn non_lifecycle_events_keep_identity_without_claiming_committed_state() {
+        let turn_wire = uncommitted_turn_progress_event();
+        let turn_event: SatelleEvent = serde_json::from_value(turn_wire.clone())
+            .expect("decode Turn identity without a committed state subject");
+        assert!(turn_event.session_id().is_some());
+        assert!(turn_event.turn_id().is_some());
+        assert_eq!(turn_event.state_subject(), None);
+        assert_eq!(
+            serde_json::to_value(turn_event).expect("encode uncommitted Turn event"),
+            turn_wire
+        );
+
+        let mut session_wire = uncommitted_turn_progress_event();
+        session_wire["type"] = serde_json::json!("action_required");
+        session_wire["turn_id"] = Value::Null;
+        let session_event: SatelleEvent = serde_json::from_value(session_wire.clone())
+            .expect("decode Session identity without a committed state subject");
+        assert!(session_event.session_id().is_some());
+        assert_eq!(session_event.turn_id(), None);
+        assert_eq!(session_event.state_subject(), None);
+        assert_eq!(
+            serde_json::to_value(session_event).expect("encode uncommitted Session event"),
+            session_wire
+        );
+    }
+
+    #[test]
+    fn turn_started_requires_committed_turn_revisions() {
+        let mut wire = uncommitted_turn_progress_event();
+        wire["type"] = serde_json::json!("turn_started");
+
+        let error = serde_json::from_value::<SatelleEvent>(wire)
+            .expect_err("turn_started without committed revisions must be rejected");
+        assert!(
+            error
+                .to_string()
+                .contains("committed Turn lifecycle Satelle Event requires a Turn state subject")
+        );
+    }
+
+    #[test]
     fn turn_terminal_events_still_require_a_turn_subject() {
         let error = SatelleEventBody::new(
             EventType::TurnCompleted,
@@ -584,13 +662,15 @@ mod tests {
         )
         .expect_err("Turn terminal event without a Turn subject must be rejected");
 
-        assert_eq!(error, SatelleEventError::TerminalEventRequiresTurn);
+        assert_eq!(error, SatelleEventError::LifecycleEventRequiresTurn);
     }
 
     #[test]
     fn terminal_classification_distinguishes_stream_and_turn_requirements() {
         assert!(EventType::CommandFailed.is_terminal());
         assert!(!EventType::CommandFailed.requires_turn_subject());
+        assert!(!EventType::TurnStarted.is_terminal());
+        assert!(EventType::TurnStarted.requires_turn_subject());
 
         for event_type in [
             EventType::TurnCompleted,
@@ -606,7 +686,6 @@ mod tests {
             EventType::Preflight,
             EventType::Readiness,
             EventType::ProviderSmoke,
-            EventType::TurnStarted,
             EventType::TurnProgress,
             EventType::ActionRequired,
         ] {

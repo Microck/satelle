@@ -29,7 +29,7 @@
 - a Satelle Host Daemon is a remote-machine service that owns Host checks, Codex app-server lifecycle, capability probes, authoritative state, and Satelle Client connections @spec @mvp
 - a Satelle API Principal is one authenticated Client token identity with explicit permission scopes @spec @mvp
 - a Satelle Session is a durable Satelle-owned control record mapped internally to one Satelle Host and one upstream Codex thread @spec @mvp
-- a Satelle Turn is one run or steer execution attempt that belongs to exactly one Satelle Session @spec @mvp
+- a Satelle Turn is one run or steer execution attempt that belongs to exactly one Satelle Session @spec @mvp @implemented
 - a Satelle Goal is optional lifecycle metadata attached to a Session or upstream thread and does not replace Turn control @spec @mvp
 - a Satelle Execution Policy is the Host-enforced combination of approval, sandbox, timeout, provider, model, desktop, and experimental-feature choices for one Turn @spec @mvp
 - a Satelle Control Lease is the Host Daemon-owned exclusive right to operate one Host Identity and Desktop Binding through native Computer Use @spec @mvp
@@ -58,13 +58,13 @@
 - a Satelle Executable Credential Helper is a Host-Resolved Secret Source that runs a user-configured executable on the machine resolving provider authentication and returns secret material through the Satelle credential-helper protocol @spec @later
 - a Satelle Queued Turn Request is a Host Daemon-owned pending run or steer request waiting to start because the selected Control Lease is occupied @spec @later
 - a Satelle Platform-Native Log Sink is an OS-owned logging destination such as journald, Windows Event Log, or macOS unified logging that receives mirrored redacted Satelle Log Entries without becoming a Satelle-owned store @spec @later
-- a Satelle Path Set is the runtime-resolved collection of config, cache, local state, operator log, SQLite store, and recording artifact paths for one OS user on one machine @spec @mvp
+- a Satelle Path Set is the runtime-resolved collection of config, cache, local state, operator log, SQLite store, and recording artifact paths for one OS user on one machine @spec @mvp @implemented
 - a Satelle Desktop Binding is one configured remote OS user account whose compatible visible desktop sessions a Host Daemon is authorized to observe and control @spec @mvp
 - a Satelle Desktop Session is one active visible GUI session for a Desktop Binding that native Computer Use can observe and control @spec @mvp
 - a Satelle Desktop Session Preference is a Host-level selector that narrows one Desktop Binding to one compatible Desktop Session without changing the bound OS user @spec @mvp
 - a Satelle Native Desktop Session Selector is an advanced OS-specific selector copied from a Host Daemon session listing for one Computer Use Host Platform @spec @mvp
 - a Satelle Multi-User Broker permits an authorized API Principal to select among multiple Desktop Bindings owned by one Host Identity at request time while preserving per-user authorization, isolation, and audit boundaries @spec @later
-- a Satelle Secret Source is a typed reference to secret material stored outside Satelle config files, such as an operating-system credential store item, environment variable, file path, or remote-Host-owned provider auth store @spec @mvp
+- a Satelle Secret Source is a typed reference to secret material stored outside Satelle config files, such as an operating-system credential store item, environment variable, file path, or remote-Host-owned provider auth store @spec @mvp @implemented
 - a Satelle Host-Resolved Secret Source is a Secret Source descriptor containing only a non-secret lookup reference and resolved by the target Host Daemon on the machine running the selected provider binding @spec @mvp
 - a Satelle File Secret Source is a Secret Source whose value is a path to a file containing secret material on the machine resolving that provider authentication binding @spec @mvp
 - a Satelle Provider Binding maps requested model and provider intent to a concrete upstream model, provider endpoint, and Host-Resolved Secret Source @spec @mvp
@@ -373,8 +373,8 @@
 - an explicit satelle --events value overrides quiet-mode automatic event suppression except when detach mode is active @implemented @mvp
 - satelle reports a typed events-with-detach usage error when --events human or --events json is used with detach mode @implemented @mvp
 - satelle JSON event streaming writes one Satelle Event JSON object per line @implemented @mvp
-- satelle Satelle Event JSON objects contain exactly schema_version, type, source, timestamp, seq, session_id, turn_id, host, state_subject, message, and data @spec @contract @mvp
-- satelle Satelle Event state_subject is null for events without committed lifecycle state, a session subject containing kind and session_state_revision, or a turn subject containing kind, session_state_revision, and turn_state_revision @spec @contract @mvp
+- satelle Satelle Event JSON objects contain exactly schema_version, type, source, timestamp, seq, session_id, turn_id, host, state_subject, message, and data @spec @contract @mvp @implemented
+- satelle Satelle Event state_subject is null for events without committed lifecycle state, a session subject containing kind and session_state_revision, or a turn subject containing kind, session_state_revision, and turn_state_revision @spec @contract @mvp @implemented
 - satelle Satelle Event timestamps are UTC RFC 3339 strings @implemented @mvp
 - satelle Satelle Event seq values are monotonically increasing within a single attached event stream @implemented @mvp
 - satelle Satelle Event seq values are stream-local ordering numbers instead of durable event identifiers @implemented @mvp
@@ -847,10 +847,10 @@
 - a successful mutating API response is emitted only after the corresponding state and Idempotency Record are durably committed @mvp @implemented
 - the authenticated satelle.capabilities.v2 response advertises the effective JSON body, attachment, WebSocket, connection, operation-concurrency, failed-authentication, authenticated-read, and control-request limits that the Host Daemon enforces @contract @mvp @implemented
 - requests exceeding a body or attachment limit fail before prompt execution with a typed payload-too-large error @spec @mvp @implemented
-- requests exceeding an operation or connection capacity limit fail with a typed capacity-exceeded error @spec @mvp
+- requests exceeding an operation or connection capacity limit fail with a typed capacity-exceeded error @spec @mvp @implemented
 - failed authentication attempts are limited to 10 per minute per network source by default @mvp @implemented
 - failed-authentication rate limiting derives network source from the transport peer address and ignores Forwarded, X-Forwarded-For, and equivalent headers by default @mvp @implemented
-- Satelle trusts forwarded client addresses only from an explicit Host-owned trusted-proxy allowlist and derives the client source from the nearest untrusted hop @spec @mvp
+- Satelle trusts forwarded client addresses only from an explicit Host-owned trusted-proxy allowlist and derives the client source from the nearest untrusted hop @spec @mvp @implemented
 - authenticated read operations are limited to 600 requests per minute per API Principal by default @mvp @implemented
 - authenticated control and admin operations are limited to 120 requests per minute per API Principal by default @mvp @implemented
 - API rate limits are configurable only through Host-owned or user-level configuration and cannot be weakened by project-level configuration @spec @mvp
@@ -1353,7 +1353,7 @@
 ## phase-2-local-vertical-slice
 - phase 2 implements one real Host Daemon API, SQLite-backed authoritative state, transactional Control Lease acquisition, and the Codex adapter on one supported Computer Use Host Platform @spec @phase2 @mvp
 - phase 2 proves setup, doctor, run, status, steer, stop, logs, reconnect, restart recovery, redaction, and idempotency through the same public contracts @spec @phase2 @mvp
-- phase 2 transport conformance uses real HTTP and WebSocket connections even when the Host Daemon runs in the same test process @spec @phase2 @mvp
+- phase 2 transport conformance uses real HTTP and WebSocket connections even when the Host Daemon runs in the same test process @spec @phase2 @mvp @implemented
 
 ## phase-3-remote-mvp
 - phase 3 adds verified binary upload, SSH bootstrap, loopback tunneling, on-demand Host Daemon lifecycle, and the second MVP Computer Use Host Platform without changing the public Session model @spec @phase3 @mvp
@@ -1383,15 +1383,15 @@
   label: a terminal Satelle Turn never transitions to another Turn state
   command: cargo test --locked -p satelle-core --lib session::tests::transition_matrix_is_exhaustive -- --exact && cargo test --locked -p satelle-core --lib session::tests::stale_revision_cannot_overwrite_the_winning_terminal_state -- --exact
   tags: [spec, mvp, implemented, ci]
-- a Satelle Session has at most one nonterminal Turn @spec @mvp
-- a Satelle Session is active exactly when it references one nonterminal Turn @spec @mvp
-- satelle derives Session activity from the active Turn instead of storing an independently mutable duplicate status @spec @mvp
+- a Satelle Session has at most one nonterminal Turn @spec @mvp @implemented
+- a Satelle Session is active exactly when it references one nonterminal Turn @spec @mvp @implemented
+- satelle derives Session activity from the active Turn instead of storing an independently mutable duplicate status @spec @mvp @implemented
 - a Satelle Session remains steerable after a terminal Turn while its Host and internal Codex thread mapping remain available @mvp @implemented
 - id: ksl
   label: the Host Identity and Desktop Binding of a Satelle Session are immutable after Session creation
   command: cargo test --locked -p satelle-core --lib session::tests::policy_is_snapshotted_and_desktop_binding_is_immutable -- --exact
   tags: [spec, mvp, implemented, ci]
-- each Turn stores the effective model, Provider Binding, desktop target, approval policy, sandbox policy, timeout policy, and experimental-feature choices used for that Turn @spec @mvp
+- each Turn stores the effective model, Provider Binding, desktop target, approval policy, sandbox policy, timeout policy, and experimental-feature choices used for that Turn @spec @mvp @implemented
 - id: lwp
   label: every Session record has a monotonically increasing session_state_revision and every Turn record has a monotonically increasing turn_state_revision updated by each committed lifecycle mutation of that record
   command: cargo test --locked -p satelle-core --lib session::tests::each_turn_commit_checks_and_increments_both_revisions_once -- --exact && cargo test --locked -p satelle-core --lib session::tests::follow_up_preserves_history_and_at_most_one_turn_is_active -- --exact && cargo test --locked -p satelle-core --lib session::tests::stop_without_confirmation_retains_active_or_recovery_ownership -- --exact && cargo test --locked -p satelle-host --lib storage::tests::lifecycle::terminal_session_round_trips_with_follow_up_and_exact_snapshot -- --exact
@@ -1400,7 +1400,7 @@
   label: public Session responses include session_state_revision and public Turn responses include turn_state_revision
   command: cargo test --locked -p satelle-core --lib session::tests::public_json_has_exact_safe_allowlist -- --exact
   tags: [spec, contract, mvp, implemented, ci]
-- lifecycle Satelle Events include state_subject plus the corresponding session_state_revision or turn_state_revision, and Turn lifecycle events may include both revisions when one commit mutates both records @spec @contract @mvp
+- lifecycle Satelle Events include state_subject plus the corresponding session_state_revision or turn_state_revision, and Turn lifecycle events may include both revisions when one commit mutates both records @spec @contract @mvp @implemented
 - the Host Daemon passes the committed Turn Execution Policy to the Codex adapter before Turn start @mvp @implemented
 - the Codex adapter never infers YOLO, provider, model, timeout, or desktop target from CLI presentation fields @spec @mvp @implemented
 
@@ -1483,7 +1483,7 @@
 - satelle session identifiers are opaque unique IDs suitable for scripts instead of human-readable prompt-derived slugs @implemented @mvp
 - satelle Session identifiers use the exact rs_ prefix followed by a canonical lowercase UUIDv7 @contract @mvp @implemented
 - satelle Turn identifiers use the exact rt_ prefix followed by a canonical lowercase UUIDv7 @contract @mvp @implemented
-- public turn_id fields always contain Satelle Turn identifiers and never upstream Codex turn identifiers @spec @contract @mvp
+- public turn_id fields always contain Satelle Turn identifiers and never upstream Codex turn identifiers @spec @contract @mvp @implemented
 - satelle sessions may have optional display names for human listing without making display names the primary identifier @spec @mvp
 - satelle never exposes Codex thread, turn, goal, app-server request, or provider request identifiers in public CLI, API, MCP, event, log, or diagnostic contracts @spec @mvp
 - satelle MVP allows multiple stored Sessions per Host but only one active native Computer Use Turn per Control Lease at a time @mvp @implemented
@@ -1527,7 +1527,7 @@
 - satelle CLI may keep read-only convenience cache for recently used sessions but must refresh from the Host Daemon before reporting authoritative status @spec @mvp
 - satelle status reconnects to the session's remote host automatically when the local CLI has no active connection @spec @mvp @implemented
 - satelle status and logs are the MVP surfaces for later inspection after a user disconnects from a live event stream @implemented @mvp
-- satelle clients that reconnect after missing live Satelle Events read current session state and normalized logs instead of replaying missed events @spec @mvp
+- satelle clients that reconnect after missing live Satelle Events read current session state and normalized logs instead of replaying missed events @spec @mvp @implemented
 - satelle status for SSH bootstrap hosts may restart the on-demand Host Daemon before reading stored remote session metadata @spec @mvp @implemented
 - satelle status reports a typed session-not-found error when the selected host cannot find the requested session metadata @implemented @mvp
 - a Session operation verifies that the requested Session belongs to the connected Host Identity @mvp @implemented
@@ -1631,7 +1631,7 @@
 - satelle recording modes that capture visible desktop pixels warn that screenshots or desktop video may contain unredacted visible desktop content even when metadata and text artifacts are redacted @spec @later
 - satelle recording mode output reports every produced artifact path, retention expiry, and cleanup command so storage remains visible to the invoking user @spec @later
 - satelle recording modes record audit metadata in the Host Daemon SQLite store without storing screenshot bytes, desktop video bytes, full transcripts, raw prompts, provider request bodies, provider response bodies, or raw artifact contents in the audit record @spec @later
-- Host Daemon Session HTTP responses use the canonical PublicSession and PublicTurn lifecycle states and revisions and never embed Satelle Event streams or Controller-owned Host Alias fields @spec @contract @mvp
+- Host Daemon Session HTTP responses use the canonical PublicSession and PublicTurn lifecycle states and revisions and never embed Satelle Event streams or Controller-owned Host Alias fields @spec @contract @mvp @implemented
 - one upstream Codex thread identifier belongs to at most one Satelle Session, and recording it for another Session fails closed @implemented @mvp
 - one upstream Codex Turn identifier belongs to at most one Satelle Turn, and recording it for another Turn fails closed @implemented @mvp
 
@@ -1854,7 +1854,7 @@
 - admin scope authorizes control operations plus setup, repair, Host lifecycle, Host update, storage migration, token management, and destructive maintenance @spec @mvp
 - diagnostics_sensitive scope is required in addition to command-specific consent for Raw Diagnostic Export, recording, and Desktop Snapshot Export operations @spec @mvp
 - transport authorization never substitutes for mutation consent, provider-secret consent, raw-diagnostic consent, recording consent, desktop-snapshot consent, or YOLO selection @spec @mvp
-- a request with valid authentication but insufficient scope fails with a typed authorization-insufficient-scope error @spec @mvp
+- a request with valid authentication but insufficient scope fails with a typed authorization-insufficient-scope error @spec @mvp @implemented
 - Host Daemon bearer tokens contain at least 256 bits of cryptographically random entropy @spec @mvp @implemented
 - the Host Daemon stores only a one-way token verifier and non-secret token metadata @spec @mvp @implemented
 - a newly issued raw bearer token is returned exactly once @spec @mvp @implemented
@@ -1883,7 +1883,7 @@
   label: an unauthenticated liveness endpoint may reveal only that the Host Daemon process is alive
   command: cargo test --locked -p satelle-transport --test http liveness_is_exact_and_reveals_no_protected_metadata -- --exact
   tags: [spec, mvp, implemented, ci]
-- readiness details, versions, capabilities, Host Identity, and Session metadata require read scope @spec @mvp
+- readiness details, versions, capabilities, Host Identity, and Session metadata require read scope @spec @mvp @implemented
 - satelle MVP does not support mTLS client certificate authentication for direct Host Daemon transport @spec @mvp @implemented
 - satelle later supports optional mutual TLS as defense in depth in addition to scoped bearer-token authentication and authorization @spec @later
 - satelle mTLS does not replace bearer token authorization because mTLS authenticates the client connection while Satelle still needs application-layer operation scopes and audit metadata @spec @later

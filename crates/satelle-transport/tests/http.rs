@@ -29,7 +29,7 @@ use satelle_transport::{
     DaemonClientError, DaemonEventClient, DaemonServer, DaemonServerConfig, DaemonTlsConfig,
     DaemonTlsConfigError, DaemonTlsReloadError, DurableTokenActivationResponse,
     DurableTokenIssuanceResponse, EventSubscription, HostDesktopSessionsResponse,
-    HostStatusResponse, LiveResponse, LogsPageResponse, RequestId,
+    HostStatusResponse, LiveResponse, LogsPageResponse, RequestId, TrustedProxy,
 };
 use serde_json::Value;
 use std::cell::RefCell;
@@ -78,8 +78,29 @@ struct RunningServer {
     host_identity: String,
 }
 
+fn trusted_test_proxy_ranges() -> [TrustedProxy; 5] {
+    // Some CI and sandbox networks transparently route loopback HTTP through
+    // the machine's private address. These explicit ranges cover either real
+    // peer while keeping the documentation-origin ranges untrusted.
+    [
+        "127.0.0.0/8".parse().expect("parse loopback proxy range"),
+        "10.0.0.0/8".parse().expect("parse private proxy range"),
+        "172.16.0.0/12".parse().expect("parse private proxy range"),
+        "192.168.0.0/16".parse().expect("parse private proxy range"),
+        "::1/128".parse().expect("parse IPv6 loopback proxy range"),
+    ]
+}
+
 impl RunningServer {
     async fn start(scopes: ApiScopes) -> Self {
+        Self::start_with_config(
+            scopes,
+            DaemonServerConfig::loopback(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))),
+        )
+        .await
+    }
+
+    async fn start_with_config(scopes: ApiScopes, config: DaemonServerConfig) -> Self {
         let state = TestStateDir::new().expect("temporary state directory");
         let service = HostService::local_demo_for_tests_at(state.path())
             .expect("construct deterministic Host service");
@@ -89,12 +110,9 @@ impl RunningServer {
         service
             .register_api_token(&token, "principal-http-test", scopes, None)
             .expect("register API token");
-        let server = DaemonServer::bind(
-            service.clone(),
-            DaemonServerConfig::loopback(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))),
-        )
-        .await
-        .expect("bind daemon server");
+        let server = DaemonServer::bind(service.clone(), config)
+            .await
+            .expect("bind daemon server");
         Self {
             _state: state,
             service,
@@ -2495,6 +2513,99 @@ async fn failed_authentication_limit_uses_the_real_peer_address() {
     )
     .await;
     assert!((1..60_000).contains(&retry_after_ms));
+}
+
+#[tokio::test]
+async fn trusted_proxy_headers_use_the_nearest_untrusted_hop_for_auth_limits() {
+    let running = RunningServer::start_with_config(
+        ApiScopes::READ,
+        DaemonServerConfig::loopback(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
+            .with_trusted_proxies(trusted_test_proxy_ranges()),
+    )
+    .await;
+    // These requests must reach the listener directly. A developer's ambient
+    // HTTP proxy would otherwise become the real transport peer and correctly
+    // make the synthetic loopback proxy chain untrusted.
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .expect("build direct HTTP client");
+
+    for attempt in 0..10 {
+        let request = client
+            .get(running.url("/v1/host/status"))
+            .header("Satelle-Request-Id", RequestId::new().to_string());
+        let request = if attempt % 2 == 0 {
+            request.header(
+                "Forwarded",
+                "for=203.0.113.99, for=198.51.100.40, for=127.0.0.2",
+            )
+        } else {
+            request.header("X-Forwarded-For", "203.0.113.99, 198.51.100.40, 127.0.0.2")
+        };
+        let response = request.send().await.expect("send proxied auth failure");
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    // A different origin through the same trusted proxy chain has an
+    // independent budget. If Satelle keyed the limiter by either trusted
+    // proxy hop, this authenticated read would already be rate limited.
+    let token = running.token.expose();
+    let successful = client
+        .get(running.url("/v1/host/status"))
+        .header("Authorization", format!("Bearer {}", token.as_str()))
+        .header("Satelle-Expected-Host-Identity", &running.host_identity)
+        .header("Satelle-Request-Id", RequestId::new().to_string())
+        .header("X-Forwarded-For", "203.0.113.99, 198.51.100.41, 127.0.0.2")
+        .send()
+        .await
+        .expect("send independent proxied request");
+    let successful_status = successful.status();
+    let successful_body = successful.text().await.expect("read proxied response");
+    assert_eq!(
+        successful_status,
+        StatusCode::OK,
+        "unexpected proxied response: {successful_body}"
+    );
+
+    let limited = client
+        .get(running.url("/v1/host/status"))
+        .header("Satelle-Request-Id", RequestId::new().to_string())
+        .header("X-Forwarded-For", "203.0.113.99, 198.51.100.40, 127.0.0.2")
+        .send()
+        .await
+        .expect("send exhausted proxied request");
+    assert_rate_limited(limited, None).await;
+}
+
+#[tokio::test]
+async fn conflicting_forwarded_header_families_fall_back_to_the_transport_peer() {
+    let running = RunningServer::start_with_config(
+        ApiScopes::READ,
+        DaemonServerConfig::loopback(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
+            .with_trusted_proxies(trusted_test_proxy_ranges()),
+    )
+    .await;
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .expect("build direct HTTP client");
+
+    for attempt in 1..=11 {
+        let response = client
+            .get(running.url("/v1/host/status"))
+            .header("Satelle-Request-Id", RequestId::new().to_string())
+            .header("Forwarded", format!("for=192.0.2.{attempt}"))
+            .header("X-Forwarded-For", format!("198.51.100.{attempt}"))
+            .send()
+            .await
+            .expect("send conflicting forwarded identity");
+        if attempt <= 10 {
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        } else {
+            assert_rate_limited(response, None).await;
+        }
+    }
 }
 
 #[tokio::test]

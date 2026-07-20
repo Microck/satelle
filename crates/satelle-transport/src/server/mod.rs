@@ -30,6 +30,7 @@ use std::collections::HashMap;
 use std::fmt;
 use std::hash::Hash;
 use std::net::{IpAddr, SocketAddr};
+use std::str::FromStr;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use time::OffsetDateTime;
@@ -43,21 +44,23 @@ const RATE_WINDOW: Duration = Duration::from_secs(60);
 const MAX_RATE_KEYS: usize = 4096;
 const DEFAULT_SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DaemonServerConfig {
     bind_addr: SocketAddr,
     max_connections: usize,
     shutdown_grace: Duration,
     idle_timeout: Option<Duration>,
+    trusted_proxies: Arc<[TrustedProxy]>,
 }
 
 impl DaemonServerConfig {
-    pub const fn loopback(bind_addr: SocketAddr) -> Self {
+    pub fn loopback(bind_addr: SocketAddr) -> Self {
         Self {
             bind_addr,
             max_connections: DEFAULT_MAX_CONNECTIONS,
             shutdown_grace: DEFAULT_SHUTDOWN_GRACE,
             idle_timeout: None,
+            trusted_proxies: Arc::from([]),
         }
     }
 
@@ -75,6 +78,107 @@ impl DaemonServerConfig {
         self.idle_timeout = Some(idle_timeout);
         self
     }
+
+    /// Trusts forwarded client addresses only when the transport peer matches
+    /// one of these Host-owned exact addresses or CIDR ranges.
+    pub fn with_trusted_proxies(
+        mut self,
+        trusted_proxies: impl IntoIterator<Item = TrustedProxy>,
+    ) -> Self {
+        self.trusted_proxies = trusted_proxies.into_iter().collect();
+        self
+    }
+}
+
+/// One Host-owned proxy address or CIDR range allowed to supply forwarded
+/// client identity. The empty default keeps all proxy headers untrusted.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TrustedProxy {
+    network: IpAddr,
+    prefix_len: u8,
+}
+
+impl TrustedProxy {
+    pub const fn exact(address: IpAddr) -> Self {
+        Self {
+            network: address,
+            prefix_len: match address {
+                IpAddr::V4(_) => 32,
+                IpAddr::V6(_) => 128,
+            },
+        }
+    }
+
+    fn contains(self, address: IpAddr) -> bool {
+        match (self.network, address) {
+            (IpAddr::V4(network), IpAddr::V4(address)) => {
+                masked_v4(network, self.prefix_len) == masked_v4(address, self.prefix_len)
+            }
+            (IpAddr::V6(network), IpAddr::V6(address)) => {
+                masked_v6(network, self.prefix_len) == masked_v6(address, self.prefix_len)
+            }
+            (IpAddr::V4(_), IpAddr::V6(_)) | (IpAddr::V6(_), IpAddr::V4(_)) => false,
+        }
+    }
+}
+
+fn masked_v4(address: std::net::Ipv4Addr, prefix_len: u8) -> u32 {
+    let mask = if prefix_len == 0 {
+        0
+    } else {
+        u32::MAX << (32 - prefix_len)
+    };
+    u32::from(address) & mask
+}
+
+fn masked_v6(address: std::net::Ipv6Addr, prefix_len: u8) -> u128 {
+    let mask = if prefix_len == 0 {
+        0
+    } else {
+        u128::MAX << (128 - prefix_len)
+    };
+    u128::from(address) & mask
+}
+
+impl From<IpAddr> for TrustedProxy {
+    fn from(address: IpAddr) -> Self {
+        Self::exact(address)
+    }
+}
+
+impl FromStr for TrustedProxy {
+    type Err = TrustedProxyParseError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        let (address, prefix_len) = match value.split_once('/') {
+            Some((address, prefix_len)) => (address, Some(prefix_len)),
+            None => (value, None),
+        };
+        let network = address
+            .parse::<IpAddr>()
+            .map_err(|_| TrustedProxyParseError::InvalidAddress)?;
+        let maximum = if network.is_ipv4() { 32 } else { 128 };
+        let prefix_len = prefix_len
+            .map(str::parse::<u8>)
+            .transpose()
+            .map_err(|_| TrustedProxyParseError::InvalidPrefix)?
+            .unwrap_or(maximum);
+        if prefix_len > maximum {
+            return Err(TrustedProxyParseError::InvalidPrefix);
+        }
+        Ok(Self {
+            network,
+            prefix_len,
+        })
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
+pub enum TrustedProxyParseError {
+    #[error("the trusted proxy address is not a valid IP address")]
+    InvalidAddress,
+    #[error("the trusted proxy CIDR prefix is invalid for its address family")]
+    InvalidPrefix,
 }
 
 /// Fully validated Host-side TLS configuration. Construction validates every
@@ -349,6 +453,7 @@ impl DaemonServer {
             started_at: OffsetDateTime::now_utc(),
             capabilities,
             limits,
+            trusted_proxies: Arc::clone(&config.trusted_proxies),
             failed_auth_limit: FailedAuthLimiter::new(limits.failed_auth_attempts_per_minute()),
             authenticated_limit: FixedWindowLimiter::new(
                 limits.authenticated_requests_per_minute(),
@@ -656,6 +761,7 @@ pub(super) struct DaemonState {
     started_at: OffsetDateTime,
     capabilities: DaemonRuntimeCapabilities,
     limits: EffectiveLimits,
+    trusted_proxies: Arc<[TrustedProxy]>,
     failed_auth_limit: FailedAuthLimiter,
     authenticated_limit: FixedWindowLimiter<String>,
     control_limit: FixedWindowLimiter<String>,
