@@ -2262,6 +2262,83 @@ adapter = "codex"
 }
 
 #[test]
+fn production_setup_honors_environment_host_before_local_preflight() {
+    let sandbox = state_dir();
+    let operator_config_file = sandbox.path().join("operator/config.toml");
+    fs::create_dir_all(
+        operator_config_file
+            .parent()
+            .expect("config file has a parent"),
+    )
+    .expect("operator config directory should be created");
+    write_user_config(
+        &operator_config_file,
+        r#"
+default_host = "local-demo"
+
+[hosts.local-demo]
+transport = "local"
+adapter = "codex"
+"#,
+    )
+    .expect("production config should be written");
+
+    let output = assert_directory_tree_unchanged(
+        "satelle setup with an environment-selected host",
+        sandbox.path(),
+        || {
+            production_satelle()
+                .env("SATELLE_CONFIG_FILE", &operator_config_file)
+                .env("SATELLE_STATE_DIR", sandbox.path().join("operator/state"))
+                .env("SATELLE_HOST", "remote")
+                .args(["setup", "--yes", "--json"])
+                .assert()
+                .code(66)
+                .get_output()
+                .clone()
+        },
+    );
+
+    assert_eq!(parse_json_output(&output.stderr)["code"], "host-not-found");
+}
+
+#[test]
+fn production_setup_honors_configured_default_host_before_local_preflight() {
+    let sandbox = state_dir();
+    let operator_config_file = sandbox.path().join("operator/config.toml");
+    fs::create_dir_all(
+        operator_config_file
+            .parent()
+            .expect("config file has a parent"),
+    )
+    .expect("operator config directory should be created");
+    write_user_config(
+        &operator_config_file,
+        r#"
+default_host = "remote"
+"#,
+    )
+    .expect("production config should be written");
+
+    let output = assert_directory_tree_unchanged(
+        "satelle setup with a configured default host",
+        sandbox.path(),
+        || {
+            production_satelle()
+                .env("SATELLE_CONFIG_FILE", &operator_config_file)
+                .env("SATELLE_STATE_DIR", sandbox.path().join("operator/state"))
+                .args(["setup", "--yes", "--json"])
+                .assert()
+                .code(66)
+                .get_output()
+                .clone()
+        },
+    );
+
+    assert_eq!(parse_json_output(&output.stderr)["code"], "host-not-found");
+}
+
+#[test]
 fn setup_component_filters_default_repeat_and_reject_all_conflict() {
     let state = state_dir();
     let output = satelle()

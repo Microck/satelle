@@ -733,7 +733,7 @@ fn try_main(cli: Cli, error_format: ErrorFormat) -> Result<(), CliFailure> {
         command,
     } = cli;
     let config = ConfigContext::new(profile.as_deref());
-    preflight_setup_before_history(&command, profile.as_deref())?;
+    preflight_setup_before_history(&command, &config)?;
     let history = start_command_history(&command, &config);
     let outcome = execute_command(command, no_color, profile.as_deref(), config);
 
@@ -757,26 +757,27 @@ fn try_main(cli: Cli, error_format: ErrorFormat) -> Result<(), CliFailure> {
 
 fn preflight_setup_before_history(
     command: &Command,
-    profile: Option<&str>,
+    config: &ConfigContext<'_>,
 ) -> Result<(), CliFailure> {
     let Command::Setup(command) = command else {
         return Ok(());
     };
-    // The built-in local-demo production backend cannot apply setup mutations.
-    // Reject that reserved path before command-history or config reads can
-    // touch operator files on platforms that report read opens as changes.
+    // Resolve configured precedence, then reject the built-in local backend
+    // before command history can mutate operator state.
     command
         .output_args
         .resolve(EventOutput::None)
         .map_err(failure)?;
     if command.dry_run
-        || command.host.as_deref().unwrap_or(LOCAL_DEMO_HOST) != LOCAL_DEMO_HOST
-        || profile.is_some()
-        || std::env::var_os("SATELLE_PROFILE").is_some()
         || command.expected_host_id.is_some()
         || (command.on_demand && command.persistent)
         || setup_components(&command.component).is_err()
         || !uses_production_local_setup_backend()
+    {
+        return Ok(());
+    }
+    let host = config.resolve_host(command.host.as_deref())?;
+    if host.alias != LOCAL_DEMO_HOST || host.config.transport != satelle_core::TransportKind::Local
     {
         return Ok(());
     }
