@@ -1,4 +1,6 @@
-use assert_cmd::{Command, cargo::CommandCargoExt};
+use assert_cmd::Command;
+#[cfg(unix)]
+use assert_cmd::cargo::CommandCargoExt;
 use satelle_core::{DoctorSchemaVersion, HostSessionsSchemaVersion, SetupSchemaVersion};
 use satelle_host::test_support::TestStateDir;
 use serde_json::{Value, json};
