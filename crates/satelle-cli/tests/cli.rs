@@ -2484,6 +2484,7 @@ fn setup_interactive_decline_exits_successfully_without_mutating_state() {
             }
             command
                 .env("SATELLE_STATE_DIR", state.path())
+                .env("SATELLE_COMMAND_HISTORY", "false")
                 .env(TEST_SUPPORT_ADAPTER_ENV, "fake")
                 .args(["-qec", command_line.as_str(), "/dev/null"])
                 .write_stdin("n\n")
