@@ -2288,6 +2288,53 @@ adapter = "codex"
 }
 
 #[test]
+fn production_setup_with_aliased_local_host_fails_before_operator_state_is_touched() {
+    let sandbox = state_dir();
+    let operator_home = sandbox.path().join("operator/home");
+    let operator_config_file = operator_home.join("config/config.toml");
+    let operator_state_dir = sandbox.path().join("operator/state");
+    let operator_cache_dir = sandbox.path().join("operator/cache");
+    let operator_log_dir = sandbox.path().join("operator/logs");
+    fs::create_dir_all(
+        operator_config_file
+            .parent()
+            .expect("config file has a parent"),
+    )
+    .expect("operator config directory should be created");
+    write_user_config(
+        &operator_config_file,
+        r#"
+default_host = "workstation"
+
+[hosts.workstation]
+transport = "local"
+adapter = "codex"
+"#,
+    )
+    .expect("production config should be written");
+
+    let output = assert_directory_tree_unchanged(
+        "satelle setup with an aliased local Host",
+        sandbox.path(),
+        || {
+            production_satelle()
+                .env("SATELLE_HOME", &operator_home)
+                .env("SATELLE_CONFIG_FILE", &operator_config_file)
+                .env("SATELLE_STATE_DIR", &operator_state_dir)
+                .env("SATELLE_CACHE_DIR", &operator_cache_dir)
+                .env("SATELLE_LOG_DIR", &operator_log_dir)
+                .args(["setup", "--yes", "--json"])
+                .assert()
+                .code(70)
+                .get_output()
+                .clone()
+        },
+    );
+
+    assert_eq!(parse_json_output(&output.stderr)["code"], "not-implemented");
+}
+
+#[test]
 fn production_setup_validation_fails_before_operator_state_is_touched() {
     let sandbox = state_dir();
     let operator_home = sandbox.path().join("operator/home");

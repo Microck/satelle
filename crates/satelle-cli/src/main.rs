@@ -673,7 +673,7 @@ fn main() -> ExitCode {
     };
     let error_format =
         ErrorFormat::resolve(cli.error_format, cli.command.requests_machine_errors());
-    install_diagnostics(&cli.command);
+    install_diagnostics(&cli.command, error_format);
 
     match try_main(cli, error_format) {
         Ok(()) => ExitCode::SUCCESS,
@@ -793,8 +793,7 @@ fn preflight_setup_before_history(
             "setup --expected-host-id is only valid for an SSH Host Binding",
         )));
     }
-    if host.alias != LOCAL_DEMO_HOST || host.config.transport != satelle_core::TransportKind::Local
-    {
+    if host.config.transport != satelle_core::TransportKind::Local {
         return Ok(());
     }
 
@@ -3663,7 +3662,10 @@ fn ssh_launch_readiness_timeouts(
     }
 }
 
-fn install_diagnostics(command: &Command) {
+fn install_diagnostics(command: &Command, error_format: ErrorFormat) {
+    if error_format == ErrorFormat::Json {
+        return;
+    }
     let default_level = if matches!(
         command,
         Command::Host {
