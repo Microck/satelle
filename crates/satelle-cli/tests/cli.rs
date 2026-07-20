@@ -2288,6 +2288,53 @@ adapter = "codex"
 }
 
 #[test]
+fn production_setup_validation_fails_before_operator_state_is_touched() {
+    let sandbox = state_dir();
+    let operator_home = sandbox.path().join("operator/home");
+    let operator_config_file = operator_home.join("config/config.toml");
+    let operator_state_dir = sandbox.path().join("operator/state");
+    let operator_cache_dir = sandbox.path().join("operator/cache");
+    let operator_log_dir = sandbox.path().join("operator/logs");
+
+    for (description, arguments, expected_code) in [
+        (
+            "satelle setup with conflicting components",
+            vec![
+                "setup",
+                "--component",
+                "all",
+                "--component",
+                "codex",
+                "--yes",
+                "--json",
+            ],
+            "component-selection-conflict",
+        ),
+        (
+            "satelle setup with conflicting modes",
+            vec!["setup", "--on-demand", "--persistent", "--yes", "--json"],
+            "invalid-usage",
+        ),
+    ] {
+        let output = assert_directory_tree_unchanged(description, sandbox.path(), || {
+            production_satelle()
+                .env("SATELLE_HOME", &operator_home)
+                .env("SATELLE_CONFIG_FILE", &operator_config_file)
+                .env("SATELLE_STATE_DIR", &operator_state_dir)
+                .env("SATELLE_CACHE_DIR", &operator_cache_dir)
+                .env("SATELLE_LOG_DIR", &operator_log_dir)
+                .args(arguments)
+                .assert()
+                .code(64)
+                .get_output()
+                .clone()
+        });
+
+        assert_eq!(parse_json_output(&output.stderr)["code"], expected_code);
+    }
+}
+
+#[test]
 fn production_setup_honors_environment_host_before_local_preflight() {
     let sandbox = state_dir();
     let operator_config_file = sandbox.path().join("operator/config.toml");

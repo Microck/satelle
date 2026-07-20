@@ -769,11 +769,13 @@ fn preflight_setup_before_history(
         .output_args
         .resolve(EventOutput::None)
         .map_err(failure)?;
-    if command.dry_run
-        || (command.on_demand && command.persistent)
-        || setup_components(&command.component).is_err()
-        || !uses_production_local_setup_backend()
-    {
+    setup_components(&command.component).map_err(failure)?;
+    if command.on_demand && command.persistent {
+        return Err(failure(SatelleError::invalid_usage(
+            "--on-demand and --persistent cannot be combined",
+        )));
+    }
+    if command.dry_run || !uses_production_local_setup_backend() {
         return Ok(());
     }
     if let Some(expected) = command.expected_host_id.as_deref() {
