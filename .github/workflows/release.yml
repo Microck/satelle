@@ -51,7 +51,7 @@ jobs:
             executable: satelle
           - target: win32-arm64-msvc
             rust-target: aarch64-pc-windows-msvc
-            runner: windows-11-arm
+            runner: ["self-hosted", "ARM64", "yoga"]
             executable: satelle.exe
           - target: win32-x64-msvc
             rust-target: x86_64-pc-windows-msvc
