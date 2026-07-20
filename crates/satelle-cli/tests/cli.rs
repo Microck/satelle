@@ -2259,6 +2259,32 @@ adapter = "codex"
             .as_str()
             .is_some_and(|message| message.contains("setup mutations are not supported"))
     );
+
+    let output = assert_directory_tree_unchanged(
+        "satelle setup with a local expected Host identity",
+        sandbox.path(),
+        || {
+            production_satelle()
+                .env("SATELLE_HOME", &operator_home)
+                .env("SATELLE_CONFIG_FILE", &operator_config_file)
+                .env("SATELLE_STATE_DIR", &operator_state_dir)
+                .env("SATELLE_CACHE_DIR", &operator_cache_dir)
+                .env("SATELLE_LOG_DIR", &operator_log_dir)
+                .args([
+                    "setup",
+                    "--yes",
+                    "--json",
+                    "--expected-host-id",
+                    "host-test",
+                ])
+                .assert()
+                .code(64)
+                .get_output()
+                .clone()
+        },
+    );
+
+    assert_eq!(parse_json_output(&output.stderr)["code"], "invalid-usage");
 }
 
 #[test]
@@ -2290,6 +2316,7 @@ adapter = "codex"
             production_satelle()
                 .env("SATELLE_CONFIG_FILE", &operator_config_file)
                 .env("SATELLE_STATE_DIR", sandbox.path().join("operator/state"))
+                .env("SATELLE_CACHE_DIR", sandbox.path().join("operator/cache"))
                 .env("SATELLE_HOST", "remote")
                 .args(["setup", "--yes", "--json"])
                 .assert()
@@ -2327,6 +2354,7 @@ default_host = "remote"
             production_satelle()
                 .env("SATELLE_CONFIG_FILE", &operator_config_file)
                 .env("SATELLE_STATE_DIR", sandbox.path().join("operator/state"))
+                .env("SATELLE_CACHE_DIR", sandbox.path().join("operator/cache"))
                 .args(["setup", "--yes", "--json"])
                 .assert()
                 .code(66)

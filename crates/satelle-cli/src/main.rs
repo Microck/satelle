@@ -769,14 +769,27 @@ fn preflight_setup_before_history(
         .resolve(EventOutput::None)
         .map_err(failure)?;
     if command.dry_run
-        || command.expected_host_id.is_some()
         || (command.on_demand && command.persistent)
         || setup_components(&command.component).is_err()
         || !uses_production_local_setup_backend()
     {
         return Ok(());
     }
+    if let Some(expected) = command.expected_host_id.as_deref() {
+        HostIdentityRef::new(expected).map_err(|error| {
+            failure(SatelleError::invalid_usage(format!(
+                "--expected-host-id is invalid: {error}"
+            )))
+        })?;
+    }
     let host = config.resolve_host(command.host.as_deref())?;
+    if command.expected_host_id.is_some()
+        && host.config.transport != satelle_core::TransportKind::Ssh
+    {
+        return Err(failure(SatelleError::invalid_usage(
+            "setup --expected-host-id is only valid for an SSH Host Binding",
+        )));
+    }
     if host.alias != LOCAL_DEMO_HOST || host.config.transport != satelle_core::TransportKind::Local
     {
         return Ok(());
