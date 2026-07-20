@@ -1132,15 +1132,15 @@
 - satelle MVP Satelle Trusted Profiles require a non-empty explicit host alias allowlist for noninteractive mutation consent @spec @mvp @implemented
 - satelle MVP Satelle Trusted Profiles do not support all-hosts consent scopes, wildcard host scopes, glob host scopes, regex host scopes, project-host scopes, or default-host scopes @spec @mvp @implemented
 - satelle Satelle Trusted Profile host allowlists match the resolved target host alias selected for the command before remote mutation planning starts @spec @mvp
-- satelle reports a typed trusted-profile-host-allowlist-required configuration error when a Satelle Trusted Profile grants noninteractive mutation consent without at least one explicit host alias @spec @mvp
-- satelle reports a typed unsupported-trusted-profile-host-scope configuration error when a Satelle Trusted Profile uses an all-hosts, wildcard, glob, regex, project-host, or default-host scope @spec @mvp
+- satelle reports a typed trusted-profile-host-allowlist-required configuration error when a Satelle Trusted Profile grants noninteractive mutation consent without at least one explicit host alias @mvp @implemented
+- satelle reports a typed unsupported-trusted-profile-host-scope configuration error when a Satelle Trusted Profile uses an all-hosts, wildcard, glob, regex, project-host, or default-host scope @mvp @implemented
 - satelle MVP Satelle Trusted Profiles require a non-empty explicit Satelle Mutation Command Family allowlist for noninteractive mutation consent @spec @mvp @implemented
 - satelle MVP Satelle Trusted Profiles do not support all-mutating-command consent scopes, wildcard command scopes, glob command scopes, regex command scopes, or future-command scopes @spec @mvp @implemented
 - satelle MVP Satelle Mutation Command Family values are setup, repair, host_update, self_update_remotes, and doctor_fix @spec @mvp @implemented
 - satelle later adds config_repair and host_storage_migrate Satelle Mutation Command Family values when those commands become available @spec @later
 - satelle Satelle Trusted Profile command-family allowlists match the command family for the selected mutating command before remote mutation planning starts @spec @mvp
-- satelle reports a typed trusted-profile-command-allowlist-required configuration error when a Satelle Trusted Profile grants noninteractive mutation consent without at least one explicit Satelle Mutation Command Family @spec @mvp
-- satelle reports a typed unsupported-trusted-profile-command-scope configuration error when a Satelle Trusted Profile uses an all-mutating-command, wildcard, glob, regex, or future-command scope @spec @mvp
+- satelle reports a typed trusted-profile-command-allowlist-required configuration error when a Satelle Trusted Profile grants noninteractive mutation consent without at least one explicit Satelle Mutation Command Family @mvp @implemented
+- satelle reports a typed unsupported-trusted-profile-command-scope configuration error when a Satelle Trusted Profile uses an all-mutating-command, wildcard, glob, regex, or future-command scope @mvp @implemented
 - satelle does not apply Satelle Trusted Profile noninteractive mutation consent when either the resolved target host alias or the command family is outside the trusted profile allowlists @spec @mvp
 - satelle Satelle Trusted Profiles are durable user-level configuration records that remain active until the local OS user edits or removes them @spec @mvp @implemented
 - satelle MVP does not automatically expire Satelle Trusted Profiles by age, last use, CLI version, project, calendar date, or host update state @spec @mvp @implemented
@@ -1585,7 +1585,7 @@
 - satelle logs --follow validates target host identity and session scope before resuming after reconnect @spec @mvp @implemented
 - satelle logs --follow stops reconnecting and reports a typed logs-follow-identity-changed error when the reconnected host identity or requested session scope does not match the original target @spec @mvp
 - satelle logs --follow uses a default reconnect budget of 60 seconds per stream interruption @spec @mvp @implemented
-- satelle logs --follow stops after 10 stream interruptions in one command and reports a typed logs-follow-reconnect-exhausted error @spec @mvp
+- satelle logs --follow stops after 10 stream interruptions in one command and reports a typed logs-follow-reconnect-exhausted error @mvp @implemented
 - satelle logs --follow reconnect backoff starts at 250 milliseconds and caps at 5 seconds with jitter @spec @mvp @implemented
 - satelle logs --follow does not retry forever after the reconnect budget or interruption cap is exhausted @spec @mvp @implemented
 - satelle logs --follow reports a typed logs-follow-reconnect-exhausted error with the last delivered log cursor and a rerun command when reconnection fails within the budget @spec @mvp

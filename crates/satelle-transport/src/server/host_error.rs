@@ -43,6 +43,10 @@ fn failure(error: &SatelleError) -> ApiFailure {
         | ErrorCode::ConfigInterpolationNotSupported
         | ErrorCode::UnknownTimeoutKey
         | ErrorCode::DurationUnitRequired
+        | ErrorCode::TrustedProfileHostAllowlistRequired
+        | ErrorCode::UnsupportedTrustedProfileHostScope
+        | ErrorCode::TrustedProfileCommandAllowlistRequired
+        | ErrorCode::UnsupportedTrustedProfileCommandScope
         | ErrorCode::UnsupportedConfigComposition
         | ErrorCode::ProjectDaemonPathOverrideNotAllowed
         | ErrorCode::ProjectDesktopBindingNotAllowed
@@ -62,6 +66,7 @@ fn failure(error: &SatelleError) -> ApiFailure {
         | ErrorCode::OutputModeConflict
         | ErrorCode::LogTailLimitExceeded
         | ErrorCode::LogPositionConflict
+        | ErrorCode::LogsFollowReconnectExhausted
         | ErrorCode::ConcurrencyWithoutRemoteUpdate
         | ErrorCode::ComponentSelectionConflict
         | ErrorCode::UnsupportedUpdateComponent
@@ -369,6 +374,52 @@ mod tests {
         assert_eq!(mapped.status, StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(mapped.code, ApiErrorCode::IncompatibleControlPlane);
         assert_eq!(mapped.category, ApiErrorCategory::Readiness);
+        assert!(!mapped.retryable);
+        assert_eq!(mapped.details, None);
+        assert!(!mapped.message.contains("PRIVATE_"));
+    }
+
+    #[test]
+    fn trusted_profile_config_failures_remain_sanitized_invalid_requests() {
+        for code in [
+            ErrorCode::TrustedProfileHostAllowlistRequired,
+            ErrorCode::UnsupportedTrustedProfileHostScope,
+            ErrorCode::TrustedProfileCommandAllowlistRequired,
+            ErrorCode::UnsupportedTrustedProfileCommandScope,
+        ] {
+            let mapped = failure(&SatelleError {
+                code,
+                message: "PRIVATE_CONFIG_MESSAGE".to_string(),
+                recovery_command: None,
+                source_detail: Some("PRIVATE_CONFIG_SOURCE".to_string()),
+                details: BTreeMap::from([(
+                    "raw_config".to_string(),
+                    json!("PRIVATE_CONFIG_VALUE"),
+                )]),
+            });
+
+            assert_eq!(mapped.status, StatusCode::BAD_REQUEST);
+            assert_eq!(mapped.code, ApiErrorCode::InvalidRequest);
+            assert_eq!(mapped.category, ApiErrorCategory::InvalidRequest);
+            assert!(!mapped.retryable);
+            assert_eq!(mapped.details, None);
+            assert!(!mapped.message.contains("PRIVATE_"));
+        }
+    }
+
+    #[test]
+    fn logs_follow_reconnect_exhaustion_is_a_sanitized_invalid_request() {
+        let mapped = failure(&SatelleError {
+            code: ErrorCode::LogsFollowReconnectExhausted,
+            message: "PRIVATE_RECONNECT_MESSAGE".to_string(),
+            recovery_command: None,
+            source_detail: Some("PRIVATE_RECONNECT_SOURCE".to_string()),
+            details: BTreeMap::from([("last_error".to_string(), json!("PRIVATE_RECONNECT_VALUE"))]),
+        });
+
+        assert_eq!(mapped.status, StatusCode::BAD_REQUEST);
+        assert_eq!(mapped.code, ApiErrorCode::InvalidRequest);
+        assert_eq!(mapped.category, ApiErrorCategory::InvalidRequest);
         assert!(!mapped.retryable);
         assert_eq!(mapped.details, None);
         assert!(!mapped.message.contains("PRIVATE_"));

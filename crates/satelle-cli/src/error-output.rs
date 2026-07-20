@@ -260,6 +260,12 @@ fn error_contract(code: ErrorCode) -> ErrorContract {
                 default_recovery: "check the configured Host or Session identifier and retry",
             }
         }
+        ErrorCode::LogsFollowReconnectExhausted => ErrorContract {
+            category: ErrorCategory::InvalidRequest,
+            retryable: false,
+            outcome: "Logs follow reconnect attempts were exhausted.",
+            default_recovery: "rerun satelle logs --follow from the reported cursor",
+        },
         ErrorCode::InvalidUsage
         | ErrorCode::EventsWithDetach
         | ErrorCode::OutputModeConflict
@@ -298,6 +304,10 @@ fn error_contract(code: ErrorCode) -> ErrorContract {
         | ErrorCode::UnknownConfigKey
         | ErrorCode::ProfileNotFound
         | ErrorCode::ProjectProfileDefinitionNotAllowed
+        | ErrorCode::TrustedProfileHostAllowlistRequired
+        | ErrorCode::UnsupportedTrustedProfileHostScope
+        | ErrorCode::TrustedProfileCommandAllowlistRequired
+        | ErrorCode::UnsupportedTrustedProfileCommandScope
         | ErrorCode::ConfigInterpolationNotSupported
         | ErrorCode::UnknownTimeoutKey
         | ErrorCode::DurationUnitRequired
@@ -522,5 +532,43 @@ mod tests {
             assert_eq!(contract.category.as_str(), "remote_execution");
             assert!(!contract.retryable);
         }
+    }
+
+    #[test]
+    fn trusted_profile_validation_errors_are_non_retryable_config_failures() {
+        for code in [
+            ErrorCode::TrustedProfileHostAllowlistRequired,
+            ErrorCode::UnsupportedTrustedProfileHostScope,
+            ErrorCode::TrustedProfileCommandAllowlistRequired,
+            ErrorCode::UnsupportedTrustedProfileCommandScope,
+        ] {
+            let contract = error_contract(code);
+            assert_eq!(contract.category.as_str(), "invalid_request");
+            assert!(!contract.retryable);
+            assert_eq!(
+                process_exit_code(&error_with_code(code)),
+                ExitCode::from(66)
+            );
+        }
+    }
+
+    #[test]
+    fn logs_follow_reconnect_exhausted_is_a_non_retryable_machine_error() {
+        let error = SatelleError::logs_follow_reconnect_exhausted(
+            "office-mac",
+            None,
+            "slc1_000000000000002a",
+            &SatelleError::host_unreachable("office-mac"),
+        );
+        let envelope = error_envelope(&error);
+
+        assert_eq!(envelope["code"], "logs-follow-reconnect-exhausted");
+        assert_eq!(envelope["category"], "invalid_request");
+        assert_eq!(envelope["retryable"], false);
+        assert_eq!(
+            envelope["suggested_commands"],
+            json!(["satelle logs --host office-mac --follow --after slc1_000000000000002a"])
+        );
+        assert_eq!(process_exit_code(&error), ExitCode::from(66));
     }
 }

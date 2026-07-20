@@ -151,6 +151,17 @@ struct ReconnectState {
     interruptions: u8,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ReconnectDecision {
+    Retry,
+    ReturnOriginalError,
+    Exhausted,
+}
+
+trait FollowSleeper {
+    fn wait(&self, duration: StdDuration) -> Result<bool, SatelleError>;
+}
+
 impl LogReadPlan {
     fn resolve(command: &LogReadRequest) -> Result<Self, CliFailure> {
         if command.after.is_some() && command.since.is_some() {
@@ -386,6 +397,20 @@ impl LogReadPlan {
             cursor = Some(page.next_cursor());
         }
     }
+
+    fn reconnect_exhausted_error(
+        &self,
+        host_alias: &str,
+        cursor: LogCursor,
+        last_error: &SatelleError,
+    ) -> SatelleError {
+        SatelleError::logs_follow_reconnect_exhausted(
+            host_alias,
+            self.session_id.as_ref(),
+            cursor.to_string(),
+            last_error,
+        )
+    }
 }
 
 impl FollowWait {
@@ -399,7 +424,9 @@ impl FollowWait {
                 SatelleError::invalid_usage(format!("could not initialize logs follow: {error}"))
             })
     }
+}
 
+impl FollowSleeper for FollowWait {
     fn wait(&self, duration: StdDuration) -> Result<bool, SatelleError> {
         self.runtime.block_on(async {
             tokio::select! {
@@ -415,12 +442,16 @@ impl FollowWait {
 }
 
 impl ReconnectState {
-    fn begin_interruption(&mut self, enabled: bool, error: &SatelleError) -> bool {
+    fn begin_interruption(&mut self, enabled: bool, error: &SatelleError) -> ReconnectDecision {
         if !enabled || !is_retryable(error) {
-            return false;
+            return ReconnectDecision::ReturnOriginalError;
         }
         self.interruptions = self.interruptions.saturating_add(1);
-        self.interruptions <= MAX_STREAM_INTERRUPTS
+        if self.interruptions <= MAX_STREAM_INTERRUPTS {
+            ReconnectDecision::Retry
+        } else {
+            ReconnectDecision::Exhausted
+        }
     }
 }
 
@@ -458,6 +489,7 @@ pub(crate) fn show_logs(
         .map_err(failure)?;
     let mut reconnect = ReconnectState::default();
     let mut drain_without_wait = false;
+    let host_alias = host.alias.clone();
 
     loop {
         if !drain_without_wait && wait.wait(FOLLOW_POLL_INTERVAL).map_err(failure)? {
@@ -476,8 +508,16 @@ pub(crate) fn show_logs(
                     "logs follow connection lost after cursor {cursor}: {}",
                     stream_error.message
                 );
-                if !reconnect.begin_interruption(plan.reconnect, &stream_error) {
-                    return Err(failure(stream_error));
+                match reconnect.begin_interruption(plan.reconnect, &stream_error) {
+                    ReconnectDecision::Retry => {}
+                    ReconnectDecision::ReturnOriginalError => return Err(failure(stream_error)),
+                    ReconnectDecision::Exhausted => {
+                        return Err(failure(plan.reconnect_exhausted_error(
+                            &host_alias,
+                            cursor,
+                            &stream_error,
+                        )));
+                    }
                 }
 
                 let deadline = Instant::now() + RECONNECT_BUDGET;
@@ -486,7 +526,11 @@ pub(crate) fn show_logs(
                 loop {
                     let now = Instant::now();
                     if now >= deadline {
-                        return Err(failure(last_error));
+                        return Err(failure(plan.reconnect_exhausted_error(
+                            &host_alias,
+                            cursor,
+                            &last_error,
+                        )));
                     }
                     let delay =
                         reconnect_delay(attempt).min(deadline.saturating_duration_since(now));
@@ -608,10 +652,57 @@ mod tests {
 
         assert_eq!(RECONNECT_BUDGET, StdDuration::from_secs(60));
         for _ in 0..MAX_STREAM_INTERRUPTS {
-            assert!(state.begin_interruption(true, &transient));
+            assert_eq!(
+                state.begin_interruption(true, &transient),
+                ReconnectDecision::Retry
+            );
         }
-        assert!(!state.begin_interruption(true, &transient));
-        assert!(!state.begin_interruption(true, &transient));
+        assert_eq!(
+            state.begin_interruption(true, &transient),
+            ReconnectDecision::Exhausted
+        );
+        assert_eq!(
+            state.begin_interruption(true, &transient),
+            ReconnectDecision::Exhausted
+        );
+    }
+
+    #[test]
+    fn reconnect_exhaustion_reports_the_stable_code_cursor_and_rerun_command() {
+        let session_id = SessionId::parse("rs_01890a5d-ac96-7b7c-8f89-37c3d0a66e11")
+            .expect("test Session id is valid");
+        let plan = LogReadPlan {
+            session_id: Some(session_id),
+            sources: Vec::new(),
+            minimum_severity: LogSeverity::Info,
+            since: None,
+            position: LogPosition::Tail(DEFAULT_LOG_PAGE_LIMIT),
+            follow: true,
+            reconnect: true,
+        };
+        let cursor = LogCursor::parse("slc1_000000000000002a").expect("test cursor is valid");
+        let last_error = SatelleError::host_unreachable("office-mac");
+
+        let error = plan.reconnect_exhausted_error("office-mac", cursor, &last_error);
+
+        assert_eq!(error.code.as_str(), "logs-follow-reconnect-exhausted");
+        assert_eq!(
+            error.details.get("resume_cursor"),
+            Some(&serde_json::json!("slc1_000000000000002a"))
+        );
+        assert_eq!(
+            error.details.get("last_error"),
+            Some(&serde_json::json!({
+                "code": "host-unreachable",
+                "message": "host 'office-mac' is configured but unreachable",
+            }))
+        );
+        assert_eq!(
+            error.recovery_command.as_deref(),
+            Some(
+                "satelle logs --host office-mac --follow --after slc1_000000000000002a --session rs_01890a5d-ac96-7b7c-8f89-37c3d0a66e11"
+            )
+        );
     }
 
     #[test]
@@ -619,8 +710,17 @@ mod tests {
         let transient = SatelleError::host_unreachable("office-mac");
         let permanent = SatelleError::invalid_usage("bad selector");
 
-        assert!(!ReconnectState::default().begin_interruption(false, &transient));
-        assert!(!ReconnectState::default().begin_interruption(true, &permanent));
-        assert!(ReconnectState::default().begin_interruption(true, &transient));
+        assert_eq!(
+            ReconnectState::default().begin_interruption(false, &transient),
+            ReconnectDecision::ReturnOriginalError
+        );
+        assert_eq!(
+            ReconnectState::default().begin_interruption(true, &permanent),
+            ReconnectDecision::ReturnOriginalError
+        );
+        assert_eq!(
+            ReconnectState::default().begin_interruption(true, &transient),
+            ReconnectDecision::Retry
+        );
     }
 }

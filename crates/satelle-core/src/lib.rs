@@ -937,19 +937,19 @@ command_families = ["setup", "repair", "host_update", "self_update_remotes", "do
         for (raw, expected_code) in [
             (
                 "[trusted_profiles.maintenance]\ncommand_families = [\"setup\"]\n",
-                ErrorCode::ConfigError,
+                ErrorCode::TrustedProfileHostAllowlistRequired,
             ),
             (
                 "[trusted_profiles.maintenance]\nhosts = []\ncommand_families = [\"setup\"]\n",
-                ErrorCode::ConfigError,
+                ErrorCode::TrustedProfileHostAllowlistRequired,
             ),
             (
                 "[trusted_profiles.maintenance]\nhosts = [\"office-mac\"]\n",
-                ErrorCode::ConfigError,
+                ErrorCode::TrustedProfileCommandAllowlistRequired,
             ),
             (
                 "[trusted_profiles.maintenance]\nhosts = [\"office-mac\"]\ncommand_families = []\n",
-                ErrorCode::ConfigError,
+                ErrorCode::TrustedProfileCommandAllowlistRequired,
             ),
         ] {
             let error = parse_user_config(Path::new("/test/config.toml"), raw)
@@ -986,7 +986,7 @@ command_families = ["setup", "repair", "host_update", "self_update_remotes", "do
             );
             let error = parse_user_config(Path::new("/test/config.toml"), &raw)
                 .expect_err("reject unsupported host scope");
-            assert_eq!(error.code, ErrorCode::ConfigError);
+            assert_eq!(error.code, ErrorCode::UnsupportedTrustedProfileHostScope);
             assert_eq!(error.details.get("value"), Some(&serde_json::json!(scope)));
         }
     }
@@ -999,8 +999,37 @@ command_families = ["setup", "repair", "host_update", "self_update_remotes", "do
             );
             let error = parse_user_config(Path::new("/test/config.toml"), &raw)
                 .expect_err("reject unsupported command scope");
-            assert_eq!(error.code, ErrorCode::ConfigError);
+            assert_eq!(error.code, ErrorCode::UnsupportedTrustedProfileCommandScope);
             assert_eq!(error.details.get("value"), Some(&serde_json::json!(scope)));
+        }
+    }
+
+    #[test]
+    fn trusted_profile_validation_errors_have_stable_tokens_and_config_exit_class() {
+        for (code, token) in [
+            (
+                ErrorCode::TrustedProfileHostAllowlistRequired,
+                "trusted-profile-host-allowlist-required",
+            ),
+            (
+                ErrorCode::UnsupportedTrustedProfileHostScope,
+                "unsupported-trusted-profile-host-scope",
+            ),
+            (
+                ErrorCode::TrustedProfileCommandAllowlistRequired,
+                "trusted-profile-command-allowlist-required",
+            ),
+            (
+                ErrorCode::UnsupportedTrustedProfileCommandScope,
+                "unsupported-trusted-profile-command-scope",
+            ),
+        ] {
+            assert_eq!(code.as_str(), token);
+            assert_eq!(code.exit_code(), 66);
+            assert_eq!(
+                serde_json::to_value(code).expect("serialize Trusted Profile error code"),
+                serde_json::json!(token)
+            );
         }
     }
 
@@ -1232,7 +1261,7 @@ fn reject_trusted_profile_errors(path: &Path, value: &toml::Value) -> Result<(),
             return Err(SatelleError::trusted_profile_allowlist_required(
                 path,
                 &profile_path,
-                "hosts",
+                TrustedProfileAllowlist::Hosts,
             ));
         }
         for host in hosts.into_iter().flatten().filter_map(toml::Value::as_str) {
@@ -1241,6 +1270,7 @@ fn reject_trusted_profile_errors(path: &Path, value: &toml::Value) -> Result<(),
                     path,
                     &format!("{profile_path}.hosts"),
                     host,
+                    TrustedProfileAllowlist::Hosts,
                 ));
             }
         }
@@ -1252,7 +1282,7 @@ fn reject_trusted_profile_errors(path: &Path, value: &toml::Value) -> Result<(),
             return Err(SatelleError::trusted_profile_allowlist_required(
                 path,
                 &profile_path,
-                "command_families",
+                TrustedProfileAllowlist::CommandFamilies,
             ));
         }
         for command in commands
@@ -1268,12 +1298,42 @@ fn reject_trusted_profile_errors(path: &Path, value: &toml::Value) -> Result<(),
                     path,
                     &format!("{profile_path}.command_families"),
                     command,
+                    TrustedProfileAllowlist::CommandFamilies,
                 ));
             }
         }
     }
 
     Ok(())
+}
+
+#[derive(Clone, Copy)]
+enum TrustedProfileAllowlist {
+    Hosts,
+    CommandFamilies,
+}
+
+impl TrustedProfileAllowlist {
+    const fn name(self) -> &'static str {
+        match self {
+            Self::Hosts => "hosts",
+            Self::CommandFamilies => "command_families",
+        }
+    }
+
+    const fn required_error_code(self) -> ErrorCode {
+        match self {
+            Self::Hosts => ErrorCode::TrustedProfileHostAllowlistRequired,
+            Self::CommandFamilies => ErrorCode::TrustedProfileCommandAllowlistRequired,
+        }
+    }
+
+    const fn unsupported_scope_error_code(self) -> ErrorCode {
+        match self {
+            Self::Hosts => ErrorCode::UnsupportedTrustedProfileHostScope,
+            Self::CommandFamilies => ErrorCode::UnsupportedTrustedProfileCommandScope,
+        }
+    }
 }
 
 fn unsupported_host_scope(host: &str) -> bool {
@@ -1978,6 +2038,10 @@ pub enum ErrorCode {
     ConfigInterpolationNotSupported,
     UnknownTimeoutKey,
     DurationUnitRequired,
+    TrustedProfileHostAllowlistRequired,
+    UnsupportedTrustedProfileHostScope,
+    TrustedProfileCommandAllowlistRequired,
+    UnsupportedTrustedProfileCommandScope,
     UnsupportedConfigComposition,
     ProjectDaemonPathOverrideNotAllowed,
     ProjectDesktopBindingNotAllowed,
@@ -2028,6 +2092,7 @@ pub enum ErrorCode {
     LogTailLimitExceeded,
     LogPositionConflict,
     LogsCursorExpired,
+    LogsFollowReconnectExhausted,
     CapacityExceeded,
     ConcurrencyLimitExceeded,
     ConcurrencyWithoutRemoteUpdate,
@@ -2052,6 +2117,14 @@ impl ErrorCode {
             Self::ConfigInterpolationNotSupported => "config-interpolation-not-supported",
             Self::UnknownTimeoutKey => "unknown-timeout-key",
             Self::DurationUnitRequired => "duration-unit-required",
+            Self::TrustedProfileHostAllowlistRequired => "trusted-profile-host-allowlist-required",
+            Self::UnsupportedTrustedProfileHostScope => "unsupported-trusted-profile-host-scope",
+            Self::TrustedProfileCommandAllowlistRequired => {
+                "trusted-profile-command-allowlist-required"
+            }
+            Self::UnsupportedTrustedProfileCommandScope => {
+                "unsupported-trusted-profile-command-scope"
+            }
             Self::UnsupportedConfigComposition => "unsupported-config-composition",
             Self::ProjectDaemonPathOverrideNotAllowed => "project-daemon-path-override-not-allowed",
             Self::ProjectDesktopBindingNotAllowed => "project-desktop-binding-not-allowed",
@@ -2104,6 +2177,7 @@ impl ErrorCode {
             Self::LogTailLimitExceeded => "log-tail-limit-exceeded",
             Self::LogPositionConflict => "log-position-conflict",
             Self::LogsCursorExpired => "logs-cursor-expired",
+            Self::LogsFollowReconnectExhausted => "logs-follow-reconnect-exhausted",
             Self::CapacityExceeded => "capacity-exceeded",
             Self::ConcurrencyLimitExceeded => "concurrency-limit-exceeded",
             Self::ConcurrencyWithoutRemoteUpdate => "concurrency-without-remote-update",
@@ -2140,6 +2214,10 @@ impl ErrorCode {
             | Self::ConfigInterpolationNotSupported
             | Self::UnknownTimeoutKey
             | Self::DurationUnitRequired
+            | Self::TrustedProfileHostAllowlistRequired
+            | Self::UnsupportedTrustedProfileHostScope
+            | Self::TrustedProfileCommandAllowlistRequired
+            | Self::UnsupportedTrustedProfileCommandScope
             | Self::UnsupportedConfigComposition
             | Self::ProjectDaemonPathOverrideNotAllowed
             | Self::ProjectDesktopBindingNotAllowed
@@ -2158,7 +2236,8 @@ impl ErrorCode {
             | Self::DaemonPathOverrideNotAbsolute
             | Self::HostNotFound
             | Self::SessionNotFound
-            | Self::LogsCursorExpired => 66,
+            | Self::LogsCursorExpired
+            | Self::LogsFollowReconnectExhausted => 66,
             Self::HostUnreachable | Self::DirectDaemonUnreachable => 69,
             Self::CertificateUntrusted
             | Self::CertificateHostnameMismatch
@@ -2268,8 +2347,10 @@ impl SatelleError {
     fn trusted_profile_allowlist_required(
         config_file: &Path,
         profile_path: &str,
-        allowlist: &str,
+        allowlist: TrustedProfileAllowlist,
     ) -> Self {
+        let code = allowlist.required_error_code();
+        let allowlist = allowlist.name();
         let mut details = BTreeMap::new();
         details.insert(
             "file".to_string(),
@@ -2281,7 +2362,7 @@ impl SatelleError {
             Value::String(allowlist.to_string()),
         );
         Self {
-            code: ErrorCode::ConfigError,
+            code,
             message: format!(
                 "config file {} Trusted Profile at {profile_path} requires a non-empty {allowlist} allowlist",
                 config_file.display()
@@ -2294,7 +2375,13 @@ impl SatelleError {
         }
     }
 
-    fn unsupported_trusted_profile_scope(config_file: &Path, toml_path: &str, value: &str) -> Self {
+    fn unsupported_trusted_profile_scope(
+        config_file: &Path,
+        toml_path: &str,
+        value: &str,
+        allowlist: TrustedProfileAllowlist,
+    ) -> Self {
+        let code = allowlist.unsupported_scope_error_code();
         let mut details = BTreeMap::new();
         details.insert(
             "file".to_string(),
@@ -2303,7 +2390,7 @@ impl SatelleError {
         details.insert("path".to_string(), Value::String(toml_path.to_string()));
         details.insert("value".to_string(), Value::String(value.to_string()));
         Self {
-            code: ErrorCode::ConfigError,
+            code,
             message: format!(
                 "config file {} uses unsupported Trusted Profile scope '{value}' at {toml_path}",
                 config_file.display()
@@ -3022,6 +3109,51 @@ impl SatelleError {
         }
     }
 
+    pub fn logs_follow_reconnect_exhausted(
+        host: &str,
+        session_id: Option<&SessionId>,
+        resume_cursor: impl Into<String>,
+        last_error: &SatelleError,
+    ) -> Self {
+        let resume_cursor = resume_cursor.into();
+        let mut recovery_command =
+            format!("satelle logs --host {host} --follow --after {resume_cursor}");
+        if let Some(session_id) = session_id {
+            recovery_command.push_str(" --session ");
+            recovery_command.push_str(session_id.as_str());
+        }
+
+        let mut details = BTreeMap::new();
+        details.insert("host".to_string(), Value::String(host.to_string()));
+        details.insert(
+            "resume_cursor".to_string(),
+            Value::String(resume_cursor.clone()),
+        );
+        details.insert(
+            "last_error".to_string(),
+            object_value([
+                ("code", Value::String(last_error.code.as_str().to_string())),
+                ("message", Value::String(last_error.message.clone())),
+            ]),
+        );
+        if let Some(session_id) = session_id {
+            details.insert(
+                "session_id".to_string(),
+                Value::String(session_id.as_str().to_string()),
+            );
+        }
+
+        Self {
+            code: ErrorCode::LogsFollowReconnectExhausted,
+            message: format!(
+                "logs follow reconnect attempts were exhausted after cursor {resume_cursor}"
+            ),
+            recovery_command: Some(recovery_command),
+            source_detail: None,
+            details,
+        }
+    }
+
     pub fn concurrency_limit_exceeded(value: u8) -> Self {
         let mut details = BTreeMap::new();
         details.insert("concurrency".to_string(), Value::from(value));
@@ -3291,6 +3423,51 @@ mod error_contract_tests {
             );
             assert_eq!(error.exit_code(), 64);
         }
+    }
+
+    #[test]
+    fn logs_follow_reconnect_exhausted_has_a_stable_recovery_contract() {
+        assert_eq!(
+            ErrorCode::LogsFollowReconnectExhausted.as_str(),
+            "logs-follow-reconnect-exhausted"
+        );
+        assert_eq!(
+            serde_json::to_value(ErrorCode::LogsFollowReconnectExhausted)
+                .expect("serialize logs follow reconnect exhaustion code"),
+            serde_json::json!("logs-follow-reconnect-exhausted")
+        );
+        assert_eq!(ErrorCode::LogsFollowReconnectExhausted.exit_code(), 66);
+
+        let session_id = SessionId::parse("rs_01890a5d-ac96-7b7c-8f89-37c3d0a66e11")
+            .expect("test Session id is valid");
+        let last_error = SatelleError::host_unreachable("office-mac");
+        let error = SatelleError::logs_follow_reconnect_exhausted(
+            "office-mac",
+            Some(&session_id),
+            "slc1_000000000000002a",
+            &last_error,
+        );
+
+        assert_eq!(error.code, ErrorCode::LogsFollowReconnectExhausted);
+        assert_eq!(error.exit_code(), 66);
+        assert_eq!(
+            error.recovery_command.as_deref(),
+            Some(
+                "satelle logs --host office-mac --follow --after slc1_000000000000002a --session rs_01890a5d-ac96-7b7c-8f89-37c3d0a66e11"
+            )
+        );
+        assert_eq!(
+            error.details.get("resume_cursor"),
+            Some(&serde_json::json!("slc1_000000000000002a"))
+        );
+        assert_eq!(
+            error.details.get("last_error"),
+            Some(&serde_json::json!({
+                "code": "host-unreachable",
+                "message": "host 'office-mac' is configured but unreachable",
+            }))
+        );
+        assert_eq!(error.source_detail, None);
     }
 }
 
