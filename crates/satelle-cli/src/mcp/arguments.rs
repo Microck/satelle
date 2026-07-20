@@ -102,6 +102,10 @@ impl LogsInput {
             after: self.after,
             source: self.source,
             level: self.level,
+            // MCP tools return finite result objects. Streaming follow remains a CLI record-stream
+            // contract because stdio JSON-RPC needs one bounded response per request.
+            follow: false,
+            no_reconnect: false,
         }
     }
 }

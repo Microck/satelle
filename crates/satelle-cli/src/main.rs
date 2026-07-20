@@ -15,10 +15,11 @@ mod tailscale_serve;
 mod transport;
 
 use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum};
+use cliclack::{Theme, ThemeState};
 use completions::{CompletionsCommand, run_completions};
 use error_output::{ErrorFormat, parser_error, print_error, process_exit_code};
 use host_trust::{HostTrustReport, persist_host_identity};
-use logs::{LogsCommand, show_logs};
+use logs::{LogsCommand, LogsOutcome, show_logs};
 use notify::{Config as NotifyConfig, Event, RecommendedWatcher, RecursiveMode, Watcher};
 use output::{OutputArgs, OutputFormat, SessionResultSchemaVersion, StatusReport};
 use satelle_core::session::{
@@ -26,14 +27,13 @@ use satelle_core::session::{
     TurnAdmissionPhase, TurnExecutionMode, TurnState,
 };
 use satelle_core::{
-    BEACON_CORAL, CLI_NAME, DaemonPathOverrides, DesktopSessionPreference, DoctorEventRecord,
-    DoctorOptions, DoctorReport, ERROR_RED, ErrorCode, EventSource, EventType, HostConfig,
-    HostSessionsReport, LOCAL_DEMO_HOST, OwnerOnlyDirectory, PRODUCT_NAME, ProfileField,
-    RELAY_ROSE, ResolvedConfig, SUCCESS_GREEN, SatelleError, SatelleEvent, SatelleEventBody,
-    SecureFileError, SessionId, SetupMode, SetupReport, SetupRequiredInput, load_config,
-    open_or_create_owner_only_directory, open_or_create_owner_only_file, open_owner_only_directory,
-    read_owner_controlled_config_file, read_owner_only_secret_config_file, resolve_path_set,
-    utc_now,
+    BEACON_CORAL, DaemonPathOverrides, DesktopSessionPreference, DoctorEventRecord, DoctorOptions,
+    DoctorReport, ERROR_RED, ErrorCode, EventSource, EventType, HostConfig, HostSessionsReport,
+    LOCAL_DEMO_HOST, OwnerOnlyDirectory, PRODUCT_NAME, ProfileField, RELAY_ROSE, ResolvedConfig,
+    SUCCESS_GREEN, SatelleError, SatelleEvent, SatelleEventBody, SecureFileError, SessionId,
+    SetupMode, SetupReport, SetupRequiredInput, load_config, open_or_create_owner_only_directory,
+    open_or_create_owner_only_file, open_owner_only_directory, read_owner_controlled_config_file,
+    read_owner_only_secret_config_file, resolve_path_set, utc_now,
 };
 use satelle_host::{
     ApiBearerToken, HostService, ProviderComputerUseIntent, contains_api_bearer_token,
@@ -496,6 +496,9 @@ struct SelfUpdateCommand {
 }
 
 #[derive(Args, Debug)]
+#[command(
+    after_long_help = "Security: a positional prompt may be retained in shell history or visible in local process metadata. Use standard input with PROMPT_OR_DASH set to '-' or --prompt-file for sensitive prompt text."
+)]
 struct RunCommand {
     #[arg(long)]
     host: Option<String>,
@@ -534,6 +537,9 @@ struct RunCommand {
 }
 
 #[derive(Args, Debug)]
+#[command(
+    after_long_help = "Security: a positional prompt may be retained in shell history or visible in local process metadata. Use standard input with PROMPT_OR_DASH set to '-' or --prompt-file for sensitive prompt text."
+)]
 struct SteerCommand {
     session_id: String,
     #[arg(long)]
@@ -622,6 +628,33 @@ struct CliFailure {
     history_session_id: Option<Box<SessionId>>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CommandExit {
+    Success,
+    Interrupted,
+}
+
+struct CommandOutcome {
+    session_id: Option<SessionId>,
+    exit: CommandExit,
+}
+
+impl CommandOutcome {
+    fn complete(session_id: Option<SessionId>) -> Self {
+        Self {
+            session_id,
+            exit: CommandExit::Success,
+        }
+    }
+
+    fn interrupted() -> Self {
+        Self {
+            session_id: None,
+            exit: CommandExit::Interrupted,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, ValueEnum)]
 enum SetupComponent {
     Transport,
@@ -675,7 +708,8 @@ fn main() -> ExitCode {
         ErrorFormat::resolve(cli.error_format, cli.command.requests_machine_errors());
 
     match try_main(cli, error_format) {
-        Ok(()) => ExitCode::SUCCESS,
+        Ok(CommandExit::Success) => ExitCode::SUCCESS,
+        Ok(CommandExit::Interrupted) => ExitCode::from(130),
         Err(failure) => {
             print_error(&failure.error, error_format);
             process_exit_code(&failure.error)
@@ -725,7 +759,7 @@ fn parser_error_format(args: &[std::ffi::OsString]) -> ErrorFormat {
     ErrorFormat::resolve(configured, machine_selector)
 }
 
-fn try_main(cli: Cli, error_format: ErrorFormat) -> Result<(), CliFailure> {
+fn try_main(cli: Cli, error_format: ErrorFormat) -> Result<CommandExit, CliFailure> {
     let Cli {
         no_color,
         profile,
@@ -737,8 +771,17 @@ fn try_main(cli: Cli, error_format: ErrorFormat) -> Result<(), CliFailure> {
     let outcome = execute_command(command, no_color, profile.as_deref(), config);
 
     if let Some(history) = history {
+        if outcome
+            .as_ref()
+            .is_ok_and(|outcome| outcome.exit == CommandExit::Interrupted)
+        {
+            // SIGINT is a process outcome, not a successful command completion. Until command
+            // history has an interruption outcome token, omitting the row is more truthful than
+            // recording a success or inventing an unrelated error code.
+            return outcome.map(|outcome| outcome.exit);
+        }
         let session_id = match &outcome {
-            Ok(session_id) => session_id.as_ref(),
+            Ok(outcome) => outcome.session_id.as_ref(),
             Err(failure) => failure.history_session_id.as_deref(),
         };
         let error_code = outcome.as_ref().err().map(|failure| failure.error.code);
@@ -751,7 +794,7 @@ fn try_main(cli: Cli, error_format: ErrorFormat) -> Result<(), CliFailure> {
         }
     }
 
-    outcome.map(|_| ())
+    outcome.map(|outcome| outcome.exit)
 }
 
 fn execute_command(
@@ -759,7 +802,7 @@ fn execute_command(
     no_color: bool,
     profile: Option<&str>,
     config: ConfigContext<'_>,
-) -> Result<Option<SessionId>, CliFailure> {
+) -> Result<CommandOutcome, CliFailure> {
     let early_lifecycle_host = explicit_lifecycle_json_host(&command).map(str::to_owned);
     let (output_args, event_output) = command.output_request();
     let output = match output_args.resolve(event_output) {
@@ -777,26 +820,50 @@ fn execute_command(
     let human_style = HumanStyle::detect(no_color);
 
     match command {
-        Command::Completions(command) => run_completions(command).map_err(failure).map(|_| None),
-        Command::Setup(command) => run_setup(command, human_style, config, output).map(|_| None),
-        Command::Repair(command) => run_repair(command).map(|_| None),
-        Command::Doctor(command) => run_doctor(command, config, output).map(|_| None),
-        Command::Config { command } => run_config(command, config, output).map(|_| None),
-        Command::Paths(command) => show_paths(command, output).map(|_| None),
-        Command::Host { command } => run_host(command, config, output).map(|_| None),
-        Command::SelfCtl { command } => run_self(command).map(|_| None),
-        Command::Run(command) => run_prompt(command, config, output).map(Some),
-        Command::Steer(command) => steer_prompt(command, config, output).map(Some),
-        Command::Status(command) => show_status(command, config, output).map(|_| None),
-        Command::Stop(command) => stop_session(command, config, output).map(|_| None),
-        Command::Logs(command) => show_logs(command, config, output).map(|_| None),
+        Command::Completions(command) => run_completions(command)
+            .map_err(failure)
+            .map(|_| CommandOutcome::complete(None)),
+        Command::Setup(command) => {
+            run_setup(command, human_style, config, output).map(|_| CommandOutcome::complete(None))
+        }
+        Command::Repair(command) => run_repair(command).map(|_| CommandOutcome::complete(None)),
+        Command::Doctor(command) => {
+            run_doctor(command, config, output).map(|_| CommandOutcome::complete(None))
+        }
+        Command::Config { command } => {
+            run_config(command, config, output).map(|_| CommandOutcome::complete(None))
+        }
+        Command::Paths(command) => {
+            show_paths(command, output).map(|_| CommandOutcome::complete(None))
+        }
+        Command::Host { command } => {
+            run_host(command, config, output).map(|_| CommandOutcome::complete(None))
+        }
+        Command::SelfCtl { command } => run_self(command).map(|_| CommandOutcome::complete(None)),
+        Command::Run(command) => run_prompt(command, config, output)
+            .map(|session| CommandOutcome::complete(Some(session))),
+        Command::Steer(command) => steer_prompt(command, config, output)
+            .map(|session| CommandOutcome::complete(Some(session))),
+        Command::Status(command) => {
+            show_status(command, config, output).map(|_| CommandOutcome::complete(None))
+        }
+        Command::Stop(command) => {
+            stop_session(command, config, output).map(|_| CommandOutcome::complete(None))
+        }
+        Command::Logs(command) => show_logs(command, config, output).map(|outcome| match outcome {
+            LogsOutcome::Complete => CommandOutcome::complete(None),
+            LogsOutcome::Interrupted => CommandOutcome::interrupted(),
+        }),
         Command::Mcp {
             command: McpCommand::Serve,
-        } => mcp::serve(profile).map(|_| None),
+        } => mcp::serve(profile).map(|_| CommandOutcome::complete(None)),
         Command::Mcp {
             command: McpCommand::Install(command),
-        } => run_mcp_install(command, profile, &config, output).map(|_| None),
-        Command::Support { command } => run_support(command).map(|_| None),
+        } => run_mcp_install(command, profile, &config, output)
+            .map(|_| CommandOutcome::complete(None)),
+        Command::Support { command } => {
+            run_support(command).map(|_| CommandOutcome::complete(None))
+        }
     }
 }
 
@@ -2497,8 +2564,38 @@ fn config_explain(
             "Host aliases: {}",
             output["values"]["host_count"].as_u64().unwrap_or_default()
         );
+        println!("Effective configuration:");
+        print_config_value("effective", &output["effective"]);
         Ok(())
     }
+}
+
+fn print_config_value(path: &str, value: &serde_json::Value) {
+    if let Some(object) = value.as_object() {
+        if object.get("redacted").and_then(serde_json::Value::as_bool) == Some(true) {
+            let source = object
+                .get("source")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("unknown");
+            let reason = object
+                .get("redaction_reason")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("sensitive_value");
+            println!("{path} = <redacted> (source: {source}; reason: {reason})");
+            return;
+        }
+
+        for (key, child) in object {
+            print_config_value(&format!("{path}.{key}"), child);
+        }
+        return;
+    }
+
+    let rendered = match value {
+        serde_json::Value::String(value) => value.clone(),
+        _ => serde_json::to_string(value).unwrap_or_else(|_| "<unavailable>".to_string()),
+    };
+    println!("{path} = {rendered}");
 }
 
 fn env_source(name: &str) -> serde_json::Value {
@@ -5529,6 +5626,146 @@ struct HumanStyle {
     color: bool,
 }
 
+#[derive(Clone, Copy)]
+struct SatelleTheme {
+    color: bool,
+}
+
+impl SatelleTheme {
+    fn colorize(self, hex: &str, text: &str) -> String {
+        if self.color {
+            let rgb = match hex {
+                BEACON_CORAL => "255;94;91",
+                RELAY_ROSE => "255;143;177",
+                SUCCESS_GREEN => "166;226;46",
+                ERROR_RED => "255;77;109",
+                _ => unreachable!("Satelle prompt colors come from the fixed brand palette"),
+            };
+            format!("\x1b[38;2;{rgb}m{text}\x1b[0m")
+        } else {
+            text.to_string()
+        }
+    }
+}
+
+impl Theme for SatelleTheme {
+    fn format_intro(&self, title: &str) -> String {
+        format!(
+            "{}  {title}\n{}\n",
+            self.colorize(BEACON_CORAL, "\u{250c}"),
+            self.colorize(BEACON_CORAL, "\u{2502}")
+        )
+    }
+
+    fn format_outro(&self, message: &str) -> String {
+        format!("{}  {message}\n", self.colorize(SUCCESS_GREEN, "\u{2514}"))
+    }
+
+    fn format_outro_cancel(&self, message: &str) -> String {
+        format!(
+            "{}  {}\n",
+            self.colorize(ERROR_RED, "\u{2514}"),
+            self.colorize(ERROR_RED, message)
+        )
+    }
+
+    fn state_symbol(&self, state: &ThemeState) -> String {
+        match state {
+            ThemeState::Active => self.colorize(BEACON_CORAL, "\u{25c6}"),
+            ThemeState::Submit => self.colorize(SUCCESS_GREEN, "\u{25c6}"),
+            ThemeState::Cancel | ThemeState::Error(_) => self.colorize(ERROR_RED, "\u{25a0}"),
+        }
+    }
+
+    fn radio_symbol(&self, state: &ThemeState, selected: bool) -> String {
+        match (state, selected) {
+            (ThemeState::Active, true) => self.colorize(BEACON_CORAL, "\u{25cf}"),
+            (ThemeState::Active, false) => "\u{25cb}".to_string(),
+            _ => String::new(),
+        }
+    }
+
+    fn checkbox_symbol(&self, state: &ThemeState, selected: bool, active: bool) -> String {
+        match (state, selected, active) {
+            (ThemeState::Error(_), true, _) => self.colorize(ERROR_RED, "\u{25a0}"),
+            (ThemeState::Active, true, _) => self.colorize(BEACON_CORAL, "\u{25a0}"),
+            (ThemeState::Active | ThemeState::Error(_), false, true) => "\u{25a1}".to_string(),
+            _ => String::new(),
+        }
+    }
+
+    fn info_symbol(&self) -> String {
+        self.colorize(RELAY_ROSE, "\u{25c6}")
+    }
+
+    fn format_header(&self, state: &ThemeState, prompt: &str) -> String {
+        prompt
+            .lines()
+            .enumerate()
+            .map(|(index, line)| {
+                let symbol = if index == 0 {
+                    self.state_symbol(state)
+                } else {
+                    self.colorize(BEACON_CORAL, "\u{2502}")
+                };
+                format!("{symbol}  {line}\n")
+            })
+            .collect()
+    }
+
+    fn format_footer_with_message(&self, state: &ThemeState, message: &str) -> String {
+        match state {
+            ThemeState::Active => {
+                format!("{}  {message}\n", self.colorize(BEACON_CORAL, "\u{2514}"))
+            }
+            ThemeState::Cancel => format!(
+                "{}  Operation cancelled.\n",
+                self.colorize(ERROR_RED, "\u{2514}")
+            ),
+            ThemeState::Submit => {
+                format!("{}\n", self.colorize(SUCCESS_GREEN, "\u{2502}"))
+            }
+            ThemeState::Error(error) => format!(
+                "{}  {}\n",
+                self.colorize(ERROR_RED, "\u{2514}"),
+                self.colorize(ERROR_RED, error)
+            ),
+        }
+    }
+
+    fn format_confirm(&self, state: &ThemeState, confirm: bool) -> String {
+        let yes = if confirm {
+            self.colorize(BEACON_CORAL, "\u{25cf} Yes")
+        } else {
+            "\u{25cb} Yes".to_string()
+        };
+        let no = if confirm {
+            "\u{25cb} No".to_string()
+        } else {
+            self.colorize(BEACON_CORAL, "\u{25cf} No")
+        };
+        let divider = matches!(state, ThemeState::Active)
+            .then_some(" / ")
+            .unwrap_or("");
+        format!(
+            "{}  {yes}{divider}{no}\n",
+            self.colorize(BEACON_CORAL, "\u{2502}")
+        )
+    }
+
+    fn error_symbol(&self) -> String {
+        self.colorize(ERROR_RED, "\u{25a0}")
+    }
+
+    fn active_symbol(&self) -> String {
+        self.colorize(BEACON_CORAL, "\u{25c6}")
+    }
+
+    fn submit_symbol(&self) -> String {
+        self.colorize(SUCCESS_GREEN, "\u{25c6}")
+    }
+}
+
 impl HumanStyle {
     fn detect(no_color_flag: bool) -> Self {
         let color = !no_color_flag
@@ -5537,12 +5774,64 @@ impl HumanStyle {
                 .map(|term| term != "dumb")
                 .unwrap_or(true);
 
-        let _palette = (BEACON_CORAL, RELAY_ROSE, SUCCESS_GREEN, ERROR_RED, CLI_NAME);
+        cliclack::set_theme(SatelleTheme { color });
 
         Self { color }
     }
 
     fn color_enabled(&self) -> bool {
         self.color
+    }
+}
+
+#[cfg(test)]
+mod human_style_tests {
+    use super::*;
+
+    #[test]
+    fn satelle_theme_uses_the_brand_and_state_palette() {
+        let theme = SatelleTheme { color: true };
+
+        assert!(
+            theme
+                .state_symbol(&ThemeState::Active)
+                .contains("38;2;255;94;91")
+        );
+        assert!(
+            theme
+                .state_symbol(&ThemeState::Submit)
+                .contains("38;2;166;226;46")
+        );
+        assert!(
+            theme
+                .state_symbol(&ThemeState::Error("failed".to_string()))
+                .contains("38;2;255;77;109")
+        );
+        assert!(theme.info_symbol().contains("38;2;255;143;177"));
+    }
+
+    #[test]
+    fn satelle_theme_emits_no_ansi_when_color_is_disabled() {
+        let theme = SatelleTheme { color: false };
+
+        assert!(!theme.state_symbol(&ThemeState::Active).contains("\x1b["));
+        assert!(!theme.info_symbol().contains("\x1b["));
+        assert!(!theme.error_symbol().contains("\x1b["));
+        assert!(!theme.format_intro("Satelle setup").contains("\x1b["));
+        assert!(
+            !theme
+                .format_header(&ThemeState::Active, "Apply changes?")
+                .contains("\x1b[")
+        );
+        assert!(
+            !theme
+                .format_confirm(&ThemeState::Active, false)
+                .contains("\x1b[")
+        );
+        assert!(
+            !theme
+                .format_footer_with_message(&ThemeState::Cancel, "")
+                .contains("\x1b[")
+        );
     }
 }

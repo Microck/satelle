@@ -1,8 +1,12 @@
-use assert_cmd::Command;
+use assert_cmd::{Command, cargo::CommandCargoExt};
 use satelle_core::{DoctorSchemaVersion, HostSessionsSchemaVersion, SetupSchemaVersion};
 use satelle_host::test_support::TestStateDir;
 use serde_json::{Value, json};
 use std::collections::BTreeSet;
+#[cfg(unix)]
+use std::process::{Command as StdCommand, Stdio};
+#[cfg(unix)]
+use std::{thread, time::Duration};
 
 const TEST_SUPPORT_ADAPTER_ENV: &str = "SATELLE_TEST_SUPPORT_ADAPTER";
 
@@ -22,6 +26,33 @@ fn satelle() -> Command {
         command.env_remove(name);
     }
     command.env(TEST_SUPPORT_ADAPTER_ENV, "fake");
+    command
+}
+
+#[cfg(unix)]
+fn following_satelle(state: &TestStateDir, extra_args: &[&str]) -> StdCommand {
+    let mut command = StdCommand::cargo_bin("satelle").expect("satelle binary should build");
+    for name in [
+        "SATELLE_HOME",
+        "SATELLE_CONFIG_FILE",
+        "SATELLE_STATE_DIR",
+        "SATELLE_CACHE_DIR",
+        "SATELLE_LOG_DIR",
+        "SATELLE_HOST",
+        "SATELLE_PROFILE",
+        "SATELLE_ERROR_FORMAT",
+        TEST_SUPPORT_ADAPTER_ENV,
+    ] {
+        command.env_remove(name);
+    }
+    command
+        .env("SATELLE_STATE_DIR", state.path())
+        .env(TEST_SUPPORT_ADAPTER_ENV, "fake")
+        .args(["logs", "--host", "local-demo", "--json", "--follow"])
+        .args(extra_args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
     command
 }
 
@@ -377,6 +408,117 @@ fn logs_json_lines_use_the_exact_entry_v1_contract() {
             Some("host" | "turn")
         ));
     }
+}
+
+#[cfg(unix)]
+#[test]
+fn logs_json_follow_streams_entry_contract_and_interrupts_cleanly() {
+    let state = TestStateDir::new().expect("secure temp state directory should be created");
+    json_report(
+        &state,
+        vec!["run", "--host", "local-demo", "--json", "Inspect"],
+    );
+    let mut child = following_satelle(&state, &[])
+        .spawn()
+        .expect("spawn logs follow process");
+
+    thread::sleep(Duration::from_millis(500));
+    assert!(
+        child
+            .try_wait()
+            .expect("poll logs follow process")
+            .is_none(),
+        "an empty initial log set must remain attached"
+    );
+
+    rustix::process::kill_process(
+        rustix::process::Pid::from_child(&child),
+        rustix::process::Signal::INT,
+    )
+    .expect("interrupt logs follow process");
+    let output = child
+        .wait_with_output()
+        .expect("collect interrupted logs follow output");
+
+    assert_eq!(output.status.code(), Some(130));
+    assert!(output.stderr.is_empty());
+    let records = output
+        .stdout
+        .split(|byte| *byte == b'\n')
+        .filter(|line| !line.is_empty())
+        .map(|line| serde_json::from_slice::<Value>(line).expect("parse follow NDJSON record"))
+        .collect::<Vec<_>>();
+    assert!(
+        !records.is_empty(),
+        "follow must emit matching entries before remaining attached"
+    );
+    assert!(
+        records
+            .iter()
+            .all(|record| record["schema_version"] == "satelle.logs.entry.v1")
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn empty_json_logs_are_finite_without_follow_and_attached_with_follow() {
+    let state = TestStateDir::new().expect("secure temp state directory should be created");
+    let missing_session = "rs_01890a5d-ac96-7b7c-8f89-37c3d0a66e11";
+    let finite = satelle()
+        .env("SATELLE_STATE_DIR", state.path())
+        .args(["logs", "--session", missing_session, "--json"])
+        .assert()
+        .success()
+        .get_output()
+        .clone();
+    assert!(finite.stdout.is_empty());
+    assert!(finite.stderr.is_empty());
+
+    let mut child = following_satelle(&state, &["--session", missing_session])
+        .spawn()
+        .expect("spawn empty logs follow process");
+    thread::sleep(Duration::from_millis(500));
+    assert!(
+        child
+            .try_wait()
+            .expect("poll empty logs follow process")
+            .is_none(),
+        "empty follow must remain attached"
+    );
+    rustix::process::kill_process(
+        rustix::process::Pid::from_child(&child),
+        rustix::process::Signal::INT,
+    )
+    .expect("interrupt empty logs follow process");
+    let output = child
+        .wait_with_output()
+        .expect("collect empty logs follow output");
+    assert_eq!(output.status.code(), Some(130));
+    assert!(output.stdout.is_empty());
+    assert!(output.stderr.is_empty());
+}
+
+#[test]
+fn logs_help_exposes_follow_alias_and_reconnect_control() {
+    let output = satelle()
+        .args(["logs", "--help"])
+        .assert()
+        .success()
+        .get_output()
+        .clone();
+    let help = String::from_utf8_lossy(&output.stdout);
+
+    assert!(help.contains("-f, --follow"));
+    assert!(help.contains("--no-reconnect"));
+
+    let without_follow = satelle()
+        .args(["logs", "--no-reconnect"])
+        .assert()
+        .failure()
+        .get_output()
+        .clone();
+    assert!(without_follow.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&without_follow.stderr).contains("--follow"));
 }
 
 #[test]

@@ -102,6 +102,10 @@ pub(crate) fn process_exit_code(error: &SatelleError) -> ExitCode {
     ExitCode::from(error.exit_code() as u8)
 }
 
+pub(crate) fn is_retryable(error: &SatelleError) -> bool {
+    error_contract(error.code).retryable
+}
+
 pub(crate) fn print_error(error: &SatelleError, format: ErrorFormat) {
     match format {
         ErrorFormat::Json => {

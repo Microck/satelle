@@ -4468,6 +4468,36 @@ fn config_explain_supports_secret_references_but_not_show_secrets() {
 }
 
 #[test]
+fn prompt_command_help_warns_about_argument_exposure_and_recommends_safer_sources() {
+    for command in ["run", "steer"] {
+        let output = satelle()
+            .args([command, "--help"])
+            .assert()
+            .success()
+            .get_output()
+            .clone();
+        let stdout = String::from_utf8(output.stdout).expect("help output is UTF-8");
+
+        assert!(
+            stdout.contains("shell history"),
+            "missing warning for {command}"
+        );
+        assert!(
+            stdout.contains("process metadata"),
+            "missing process warning for {command}"
+        );
+        assert!(
+            stdout.contains("standard input"),
+            "missing stdin advice for {command}"
+        );
+        assert!(
+            stdout.contains("--prompt-file"),
+            "missing file advice for {command}"
+        );
+    }
+}
+
+#[test]
 fn timeout_configuration_uses_nested_explicit_unit_keys() {
     let state = state_dir();
     let project = state.path().join("project");

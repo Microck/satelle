@@ -786,3 +786,56 @@ ca_bundle = "relative-ca.pem"
     assert_eq!(invalid["code"], "secret-file-path-not-absolute");
     assert_eq!(invalid["details"]["path"], "hosts.remote.ca_bundle");
 }
+
+#[test]
+fn config_explain_human_output_flattens_effective_values_but_redacts_secret_references() {
+    let token_path = std::env::temp_dir().join("satelle-human-explain-token");
+    let token_path_literal =
+        toml::Value::String(token_path.to_string_lossy().into_owned()).to_string();
+    let ca_bundle_path = std::env::temp_dir().join("satelle-human-explain-ca.pem");
+    let ca_bundle_path_literal =
+        toml::Value::String(ca_bundle_path.to_string_lossy().into_owned()).to_string();
+    let fixture = ConfigFixture::new(
+        &format!(
+            r#"
+default_host = "remote"
+
+[hosts.remote]
+transport = "direct"
+adapter = "codex"
+address = "https://windows.example.test"
+expected_host_id = "host-windows-11"
+api_token = {{ kind = "file", path = {token_path_literal} }}
+ca_bundle = {ca_bundle_path_literal}
+
+[hosts.remote.provider_auth.openai]
+kind = "environment"
+variable = "SATELLE_TEST_PROVIDER_TOKEN"
+"#
+        ),
+        "",
+    );
+
+    let output = fixture
+        .command()
+        .args(["config", "explain"])
+        .assert()
+        .success()
+        .get_output()
+        .clone();
+    let stdout = String::from_utf8(output.stdout).expect("human output is UTF-8");
+
+    assert!(stdout.contains("effective.hosts.remote.address = https://windows.example.test"));
+    assert!(stdout.contains(&format!(
+        "effective.hosts.remote.ca_bundle = {}",
+        ca_bundle_path.display()
+    )));
+    assert!(stdout.contains(
+        "effective.hosts.remote.api_token = <redacted> (source: user_config; reason: secret_source_reference)"
+    ));
+    assert!(stdout.contains(
+        "effective.hosts.remote.provider_auth.openai = <redacted> (source: user_config; reason: secret_source_reference)"
+    ));
+    assert!(!stdout.contains(token_path.to_string_lossy().as_ref()));
+    assert!(!stdout.contains("SATELLE_TEST_PROVIDER_TOKEN"));
+}

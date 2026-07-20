@@ -86,10 +86,10 @@
 - Satelle's default dark brand surface is Orbit Ink #0F0D17 / oklch(0.167 0.021 293.174) @implemented @mvp
 - Satelle's primary light text color is Platinum #D6D8E0 / oklch(0.883 0.011 274.878) @implemented @mvp
 - Satelle's secondary accent color is Relay Rose #FF8FB1 / oklch(0.779 0.139 1.409) @implemented @mvp
-- Satelle cliclack prompts use Beacon Coral for prompt glyphs, active selections, and primary brand emphasis @spec @mvp
-- Satelle cliclack prompts use Relay Rose only for sparse highlights so normal CLI screens do not become one-note pink @spec @mvp
-- Satelle cliclack prompts use #A6E22E / oklch(0.841 0.204 127.286) for success states and #FF4D6D / oklch(0.679 0.213 14.719) for error or cancel states @spec @mvp
-- Satelle color output respects terminal no-color and dumb-terminal conventions by falling back to plain text without changing command behavior @spec @mvp
+- Satelle cliclack prompts use Beacon Coral for prompt glyphs, active selections, and primary brand emphasis @spec @mvp @implemented
+- Satelle cliclack prompts use Relay Rose only for sparse highlights so normal CLI screens do not become one-note pink @spec @mvp @implemented
+- Satelle cliclack prompts use #A6E22E / oklch(0.841 0.204 127.286) for success states and #FF4D6D / oklch(0.679 0.213 14.719) for error or cancel states @spec @mvp @implemented
+- Satelle color output respects terminal no-color and dumb-terminal conventions by falling back to plain text without changing command behavior @spec @mvp @implemented
 
 # cli
 
@@ -327,8 +327,8 @@
 - satelle run and steer accept exactly one prompt source: a positional prompt, the positional value - for standard input, or --prompt-file <path> @spec @contract @mvp
 - conflicting prompt sources report a typed prompt-source-conflict usage error @spec @mvp
 - satelle run treats a single dash prompt argument as an instruction to read prompt text from standard input @implemented @mvp
-- satelle help warns that prompt command arguments may be retained by shell history or visible in local process metadata @spec @mvp
-- satelle recommends standard input or prompt files for sensitive prompt input @spec @mvp
+- satelle help warns that prompt command arguments may be retained by shell history or visible in local process metadata @spec @mvp @implemented
+- satelle recommends standard input or prompt files for sensitive prompt input @spec @mvp @implemented
 - satelle never sends raw prompt text through SSH command arguments, remote process arguments, environment variables, logs, or bootstrap diagnostics @spec @mvp
 - satelle run supports image attachments in MVP when the remote Codex app-server protocol supports image or localImage user input @spec @mvp
 - satelle run and steer use repeatable --image <local-path> as the exact local image attachment option @spec @contract @mvp
@@ -1040,11 +1040,11 @@
 - satelle config explain supports --host and applies the --profile overlay to the explained effective configuration without changing stored defaults @spec @mvp @implemented
 - satelle config explain human output is optimized for debugging precedence and should not duplicate the full validation checklist from satelle config check @implemented @mvp
 - satelle config explain --json emits one final JSON object with schema_version, status, selected_host, selected_profile, checked_files, sources, effective, values, and not_checked fields @implemented @mvp
-- satelle config explain redacts schema-marked sensitive, secret, credential, token, auth-command, and secret-source fields by default in both human and JSON output @spec @mvp
+- satelle config explain redacts schema-marked sensitive, secret, credential, token, auth-command, and secret-source fields by default in both human and JSON output @spec @mvp @implemented
 - satelle config explain never reads, resolves, or prints secret material from environment variables, files, keychains, credential helpers, command output, provider auth stores, or remote-host owned configuration @implemented @mvp
-- satelle config explain prints schema-marked non-secret effective values exactly as parsed and merged unless that value is inside a redacted sensitive object @spec @mvp
-- satelle config explain shows redacted fields as <redacted> in human output and as value null with redacted true and redaction_reason in JSON output @spec @mvp
-- satelle config explain reports the winning source for redacted fields without revealing the redacted value @spec @mvp
+- satelle config explain prints schema-marked non-secret effective values exactly as parsed and merged unless that value is inside a redacted sensitive object @spec @mvp @implemented
+- satelle config explain shows redacted fields as <redacted> in human output and as value null with redacted true and redaction_reason in JSON output @spec @mvp @implemented
+- satelle config explain reports the winning source for redacted fields without revealing the redacted value @spec @mvp @implemented
 - satelle config explain supports --show-secret-references to reveal non-secret secret-source descriptors such as environment variable names or credential store item names when the schema marks those descriptors revealable @implemented @mvp
 - satelle config explain --show-secret-references never reveals raw secret values, secret file contents, command output, bearer tokens, or provider credentials @implemented @mvp
 - satelle config explain does not support a --show-secrets flag in MVP @implemented @mvp
@@ -1565,7 +1565,7 @@
 - satelle logs defaults to --tail 200 when neither --tail nor --since is provided @implemented @mvp
 - satelle logs accepts --tail values from 1 through 10000 and reports a typed log-tail-limit-exceeded usage error for larger values @implemented @mvp
 - satelle logs supports --since <duration-or-rfc3339> to show only matching log entries at or after the requested time @implemented @mvp
-- satelle logs supports -f and --follow to continue streaming new matching log entries after the initial result set @spec @mvp
+- satelle logs supports -f and --follow to continue streaming new matching log entries after the initial result set @spec @mvp @implemented
 - satelle logs supports repeatable --source <host_daemon|storage|codex_adapter> filters @spec @mvp @implemented
 - satelle logs without --source includes all MVP log sources that pass the default redaction policy @implemented @mvp
 - satelle logs supports --level <info|warn|error> as a minimum severity filter @spec @mvp @implemented
@@ -1574,24 +1574,24 @@
 - satelle logs uses stdout as the data output contract instead of adding file destination flags in MVP @implemented @mvp
 - satelle logs human output writes log entries to stdout and diagnostics or command errors to stderr @implemented @mvp
 - satelle logs --json emits the initial matching set as one LF-terminated satelle.logs.entry.v1 JSON record per entry without a top-level wrapper @spec @contract @mvp @implemented
-- satelle logs --json without --follow exits 0 with empty stdout when no entries match, while satelle logs --json --follow remains attached waiting for later matching entries until interrupted or failed @spec @contract @mvp
+- satelle logs --json without --follow exits 0 with empty stdout when no entries match, while satelle logs --json --follow remains attached waiting for later matching entries until interrupted or failed @spec @contract @mvp @implemented
 - satelle logs JSON records use the exact satelle.logs.entry.v1 fields defined by the Host Daemon contract and add no CLI-only wrapper, target, or structured-fields properties @spec @contract @mvp @implemented
 - satelle logs supports --after <log_cursor> to return entries strictly after one previously delivered Log Cursor @spec @mvp @implemented
 - satelle logs reports a typed log-position-conflict usage error when --after is combined with --since or an explicit --tail @spec @mvp @implemented
-- satelle logs --json --follow continues the same newline-delimited satelle.logs.entry.v1 record stream after the initial matching set @spec @contract @mvp
-- satelle logs --follow exits 130 when interrupted by Ctrl-C and does not treat the interrupt as a remote host failure @spec @mvp
-- satelle logs --follow automatically attempts to reconnect when the log stream ends because of transient transport loss or Host Daemon restart @spec @mvp
-- satelle logs --follow resumes after reconnect by querying stored Satelle Log Entries newer than the last delivered log cursor instead of replaying missed live Satelle Events @spec @mvp
-- satelle logs --follow validates target host identity and session scope before resuming after reconnect @spec @mvp
+- satelle logs --json --follow continues the same newline-delimited satelle.logs.entry.v1 record stream after the initial matching set @spec @contract @mvp @implemented
+- satelle logs --follow exits 130 when interrupted by Ctrl-C and does not treat the interrupt as a remote host failure @spec @mvp @implemented
+- satelle logs --follow automatically attempts to reconnect when the log stream ends because of transient transport loss or Host Daemon restart @spec @mvp @implemented
+- satelle logs --follow resumes after reconnect by querying stored Satelle Log Entries newer than the last delivered log cursor instead of replaying missed live Satelle Events @spec @mvp @implemented
+- satelle logs --follow validates target host identity and session scope before resuming after reconnect @spec @mvp @implemented
 - satelle logs --follow stops reconnecting and reports a typed logs-follow-identity-changed error when the reconnected host identity or requested session scope does not match the original target @spec @mvp
-- satelle logs --follow uses a default reconnect budget of 60 seconds per stream interruption @spec @mvp
+- satelle logs --follow uses a default reconnect budget of 60 seconds per stream interruption @spec @mvp @implemented
 - satelle logs --follow stops after 10 stream interruptions in one command and reports a typed logs-follow-reconnect-exhausted error @spec @mvp
-- satelle logs --follow reconnect backoff starts at 250 milliseconds and caps at 5 seconds with jitter @spec @mvp
-- satelle logs --follow does not retry forever after the reconnect budget or interruption cap is exhausted @spec @mvp
+- satelle logs --follow reconnect backoff starts at 250 milliseconds and caps at 5 seconds with jitter @spec @mvp @implemented
+- satelle logs --follow does not retry forever after the reconnect budget or interruption cap is exhausted @spec @mvp @implemented
 - satelle logs --follow reports a typed logs-follow-reconnect-exhausted error with the last delivered log cursor and a rerun command when reconnection fails within the budget @spec @mvp
-- satelle logs --follow writes reconnect notices and reconnect failures to stderr while preserving stdout for log entries or JSON log-entry objects @spec @mvp
-- satelle logs --json --follow does not emit reconnect control records to stdout in MVP @spec @mvp
-- satelle logs --follow supports --no-reconnect to fail immediately on stream loss after reporting the last delivered log cursor @spec @mvp
+- satelle logs --follow writes reconnect notices and reconnect failures to stderr while preserving stdout for log entries or JSON log-entry objects @spec @mvp @implemented
+- satelle logs --json --follow does not emit reconnect control records to stdout in MVP @spec @mvp @implemented
+- satelle logs --follow supports --no-reconnect to fail immediately on stream loss after reporting the last delivered log cursor @spec @mvp @implemented
 - satelle logs show Satelle daemon events and normalized Codex event summaries by default @spec @mvp
 - satelle MVP logs command exposes normalized daemon events, session lifecycle changes, readiness summaries, provider smoke-test summaries, and structured errors instead of raw protocol payloads @spec @mvp
 - satelle logs do not expose raw Codex app-server protocol messages by default @implemented @mvp
@@ -1691,7 +1691,7 @@
 - satelle SQLite Satelle Log Entry retention can be configured per host or profile @spec @mvp
 - each persisted Satelle Log Entry receives a monotonic Log Cursor in its Host Daemon store @spec @mvp @implemented
 - logs pagination resumes strictly after the last delivered Log Cursor @spec @mvp @implemented
-- logs follow reconnection uses a Log Cursor instead of timestamp alone @spec @mvp
+- logs follow reconnection uses a Log Cursor instead of timestamp alone @spec @mvp @implemented
 - a Log Cursor older than retained log history reports a typed logs-cursor-expired error and identifies the earliest available cursor @spec @mvp @implemented
 - label: satelle stores the Satelle Setup Action Ledger in the remote Host Daemon SQLite store instead of storing it only on the local CLI machine
   command: cargo test --locked -p satelle-host --lib storage::tests::setup_ledger::setup_action_ledger_migrates_and_persists_ordered_state_transitions -- --exact
