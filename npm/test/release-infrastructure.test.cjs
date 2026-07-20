@@ -2518,6 +2518,44 @@ test("npm rollback restores latest tags in reverse order and checkpoints retry-s
   assert.equal(record.status, "rolled_back");
 });
 
+test("npm promotion refuses to advance conflicted or rolled-back records", () => {
+  const record = createPromotionRecord({
+    version: "1.2.3",
+    packageNames: ["native", "@microck/satelle", "satelle"],
+    previousLatest: { native: null, "@microck/satelle": "1.2.2", satelle: "1.2.2" },
+    now: "2026-07-19T12:00:00.000Z",
+  });
+
+  const conflicted = {
+    ...record,
+    status: "conflicted",
+    conflict: { code: "promotion-state-conflict", message: "operator intervention required" },
+  };
+  assert.throws(
+    () => planRegistryOperation(conflicted, null),
+    (error) =>
+      error instanceof PromotionError &&
+      error.code === "promotion-state-conflict" &&
+      error.message.includes("conflicted"),
+  );
+
+  const rolledBack = beginRollback(record, "2026-07-19T12:00:04.000Z");
+  for (const packageName of ["satelle", "@microck/satelle", "native"]) {
+    const prior = rolledBack.packages.find((entry) => entry.name === packageName).previousLatest;
+    rolledBack.packages.find((entry) => entry.name === packageName).restorationStatus = "restored";
+    assert.equal(prior, packageName === "native" ? null : "1.2.2");
+  }
+  rolledBack.status = "rolled_back";
+
+  assert.throws(
+    () => planRegistryOperation(rolledBack, null),
+    (error) =>
+      error instanceof PromotionError &&
+      error.code === "promotion-state-conflict" &&
+      error.message.includes("rolled_back"),
+  );
+});
+
 test("npm candidate publication records enforce native-first dependency order", () => {
   const release = createReleaseContext(repositoryRoot);
   const plan = release.check();

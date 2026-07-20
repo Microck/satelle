@@ -123,7 +123,19 @@ function pendingEntry(record) {
     .find((entry) => entry.restorationStatus === "pending");
 }
 
+function assertAdvanceableRecord(record) {
+  validatePromotionRecord(record);
+  const expectedStatus = record.mode === "promotion" ? "in_progress" : "rolling_back";
+  if (record.status !== expectedStatus) {
+    fail(
+      "promotion-state-conflict",
+      `npm promotion record is ${record.status}; expected ${expectedStatus} before registry mutation`,
+    );
+  }
+}
+
 function planRegistryOperation(record, observedLatest) {
+  assertAdvanceableRecord(record);
   if (!validLatest(observedLatest)) {
     fail("promotion-state-conflict", "npm returned a non-version latest value");
   }
@@ -155,6 +167,7 @@ function planRegistryOperation(record, observedLatest) {
 }
 
 function checkpointOperation(record, observedLatest, options = {}) {
+  assertAdvanceableRecord(record);
   const entry = pendingEntry(record);
   if (!entry) return structuredClone(record);
   const expected = record.mode === "promotion" ? record.version : entry.previousLatest;
