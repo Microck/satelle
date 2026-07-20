@@ -1,10 +1,10 @@
 # product
-- Satelle lets a human-authorized client, script, or AI agent start, inspect, steer, stop, and recover durable native Computer Use sessions on operator-controlled remote desktops through stable CLI, JSON, event, HTTP, WebSocket, and MCP contracts @spec @mvp
-- Satelle's primary Operator is the person or organization that owns or administers the controlled Host and authorizes Host Bindings, provider credentials, desktop access, unsafe execution policy, and state-changing maintenance @spec @mvp
-- Satelle's primary Client is a human-operated CLI, script, AI agent, or MCP consumer acting only within authority explicitly granted by the Operator @spec @mvp
-- Satelle is a self-hosted control plane, not a hosted relay, generic remote desktop viewer, or replacement Computer Use runtime @spec @mvp
-- Satelle differentiates through agent-oriented structured contracts, user-controlled deployment, durable session control, and auditable safety behavior @spec @mvp
-- Satelle keeps authoritative Host, Session, Turn, and diagnostic state on Operator-controlled machines unless the Operator explicitly exports an artifact @spec @mvp
+- Satelle lets a human-authorized client, script, or AI agent start, inspect, steer, stop, and recover durable native Computer Use sessions on operator-controlled remote desktops through stable CLI, JSON, event, HTTP, WebSocket, and MCP contracts @spec @mvp @implemented
+- Satelle's primary Operator is the person or organization that owns or administers the controlled Host and authorizes Host Bindings, provider credentials, desktop access, unsafe execution policy, and state-changing maintenance @spec @mvp @implemented
+- Satelle's primary Client is a human-operated CLI, script, AI agent, or MCP consumer acting only within authority explicitly granted by the Operator @spec @mvp @implemented
+- Satelle is a self-hosted control plane, not a hosted relay, generic remote desktop viewer, or replacement Computer Use runtime @spec @mvp @implemented
+- Satelle differentiates through agent-oriented structured contracts, user-controlled deployment, durable session control, and auditable safety behavior @spec @mvp @implemented
+- Satelle keeps authoritative Host, Session, Turn, and diagnostic state on Operator-controlled machines unless the Operator explicitly exports an artifact @spec @mvp @implemented
 - Satelle's primary successful-use journey configures and trusts one Host, completes satelle setup --verify, runs one attached Turn to completion and captures its reusable Session identifier, reconnects a fresh Client, reads current status, starts one detached steer Turn on the same Session, stops that active Turn, and confirms the stopped state through status @spec @mvp
 - Satelle public MVP acceptance requires the primary successful-use journey and recovery after client reconnect to pass end to end on every declared MVP Computer Use Host Platform @spec @mvp @release-gate @verification
 - id: 0jf
@@ -13,25 +13,25 @@
   tags: [spec, mvp, release-gate, verification, implemented, ci]
 
 # domain
-- a Satelle Bridge is a self-hosted control plane that orchestrates native Computer Use through a compatible upstream agent runtime instead of implementing screenshot and input automation itself @spec @mvp
-- Open Computer Use is reference material for Satelle native Computer Use protocol shape, readiness checks, and failure modes, not a Satelle runtime adapter, backend dependency, or remote-host requirement @spec @mvp
-- a Satelle Operator is the human or organization that owns the controlled Host and grants authority to Satelle Clients @spec @mvp
-- a Satelle Client is a human-operated CLI, script, AI agent, or MCP consumer that invokes Satelle within Operator-granted authority @spec @mvp
-- a Satelle Controller is the machine and OS user running the Satelle CLI or MCP Server @spec @mvp
-- a Satelle Controller Platform is an operating system on which the local CLI, MCP Server, and remote-management workflows are supported @spec @mvp
-- a Satelle Computer Use Host Platform is an operating system on which Satelle supports native Computer Use execution @spec @mvp
-- a Satelle Host is one Host Daemon identity owned by one daemon OS account @spec @mvp
-- an MVP Satelle Host owns exactly one explicitly authorized Desktop Binding @spec @mvp
+- a Satelle Bridge is a self-hosted control plane that orchestrates native Computer Use through a compatible upstream agent runtime instead of implementing screenshot and input automation itself @spec @mvp @implemented
+- Open Computer Use is reference material for Satelle native Computer Use protocol shape, readiness checks, and failure modes, not a Satelle runtime adapter, backend dependency, or remote-host requirement @spec @mvp @implemented
+- a Satelle Operator is the human or organization that owns the controlled Host and grants authority to Satelle Clients @spec @mvp @implemented
+- a Satelle Client is a human-operated CLI, script, AI agent, or MCP consumer that invokes Satelle within Operator-granted authority @spec @mvp @implemented
+- a Satelle Controller is the machine and OS user running the Satelle CLI or MCP Server @spec @mvp @implemented
+- a Satelle Controller Platform is an operating system on which the local CLI, MCP Server, and remote-management workflows are supported @spec @mvp @implemented
+- a Satelle Computer Use Host Platform is an operating system on which Satelle supports native Computer Use execution @spec @mvp @implemented
+- a Satelle Host is one Host Daemon identity owned by one daemon OS account @spec @mvp @implemented
+- an MVP Satelle Host owns exactly one explicitly authorized Desktop Binding @spec @mvp @implemented
 - a later broker-capable Satelle Host may own multiple explicitly authorized Desktop Bindings @spec @later
-- a Satelle Host Identity is a stable random identifier generated and stored by one Host Daemon installation @spec @mvp
+- a Satelle Host Identity is a stable random identifier generated and stored by one Host Daemon installation @spec @mvp @implemented
 - a Satelle Host Alias is a stable logical name used by projects, profiles, commands, and public output to select a Satelle Host @spec @mvp @implemented
 - a Satelle Host Binding is the user-level mapping from a Host Alias to a concrete transport endpoint, authentication descriptor, Desktop Binding, Host-owned provider configuration, and optional expected Host Identity before first trust @spec @mvp @implemented
-- a Satelle Host Daemon is a remote-machine service that owns Host checks, Codex app-server lifecycle, capability probes, authoritative state, and Satelle Client connections @spec @mvp
-- a Satelle API Principal is one authenticated Client token identity with explicit permission scopes @spec @mvp
-- a Satelle Session is a durable Satelle-owned control record mapped internally to one Satelle Host and one upstream Codex thread @spec @mvp
+- a Satelle Host Daemon is a remote-machine service that owns Host checks, Codex app-server lifecycle, capability probes, authoritative state, and Satelle Client connections @spec @mvp @implemented
+- a Satelle API Principal is one authenticated Client token identity with explicit permission scopes @spec @mvp @implemented
+- a Satelle Session is a durable Satelle-owned control record mapped internally to one Satelle Host and one upstream Codex thread @spec @mvp @implemented
 - a Satelle Turn is one run or steer execution attempt that belongs to exactly one Satelle Session @spec @mvp @implemented
-- a Satelle Goal is optional lifecycle metadata attached to a Session or upstream thread and does not replace Turn control @spec @mvp
-- a Satelle Execution Policy is the Host-enforced combination of approval, sandbox, timeout, provider, model, desktop, and experimental-feature choices for one Turn @spec @mvp
+- a Satelle Goal is optional lifecycle metadata attached to a Session or upstream thread and does not replace Turn control @spec @mvp @implemented
+- a Satelle Execution Policy is the Host-enforced combination of approval, sandbox, timeout, provider, model, desktop, and experimental-feature choices for one Turn @spec @mvp @implemented
 - a Satelle Control Lease is the Host Daemon-owned exclusive right to operate one Host Identity and Desktop Binding through native Computer Use @spec @mvp
 - a Satelle Maintenance Lease is the Host Daemon-owned exclusive right to mutate daemon, runtime, service, or storage state for one Host @spec @mvp
 - a Satelle Bootstrap Lock is a user-scoped remote filesystem lock acquired through authenticated SSH bootstrap or by a reachable Host Daemon already holding the same operation's Maintenance Lease before remote daemon files can be replaced @spec @mvp
@@ -1346,9 +1346,9 @@
 - phase 0 rejects terminal UI scraping or undocumented GUI automation as a substitute for a missing app-server contract unless the product specification is explicitly revised @spec @phase0 @mvp
 
 ## phase-1-core-contracts
-- phase 1 freezes Satelle domain vocabulary, public identifiers, API envelopes, typed errors, configuration trust boundaries, event schemas, Control Lease invariants, and persistence contracts @spec @phase1 @mvp
-- phase 1 provides transport-independent conformance tests through a deterministic internal adapter implementation @spec @phase1 @mvp
-- phase 1 is complete when public types cannot serialize upstream identifiers, raw prompts, secret values, or contradictory lifecycle states @spec @phase1 @mvp
+- phase 1 freezes Satelle domain vocabulary, public identifiers, API envelopes, typed errors, configuration trust boundaries, event schemas, Control Lease invariants, and persistence contracts @spec @phase1 @mvp @implemented
+- phase 1 provides transport-independent conformance tests through a deterministic internal adapter implementation @spec @phase1 @mvp @implemented
+- phase 1 is complete when public types cannot serialize upstream identifiers, raw prompts, secret values, or contradictory lifecycle states @spec @phase1 @mvp @implemented
 
 ## phase-2-local-vertical-slice
 - phase 2 implements one real Host Daemon API, SQLite-backed authoritative state, transactional Control Lease acquisition, and the Codex adapter on one supported Computer Use Host Platform @spec @phase2 @mvp

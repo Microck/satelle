@@ -8,6 +8,7 @@ use thiserror::Error;
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 
+mod authority;
 #[path = "control-plane.rs"]
 pub mod control_plane;
 #[path = "direct-host-binding.rs"]
@@ -21,6 +22,18 @@ mod project_config;
 mod secure_file;
 pub mod session;
 
+pub use authority::{
+    ApiPermissionScope, ApiPrincipalModel, ArtifactExportPolicy, AuthoritativeStateSubject,
+    AuthorityModelError, AuthorityRoles, BridgeBoundary, BridgeControlPlane, ClientAuthority,
+    ClientAuthorizationBoundary, ComputerUseHostPlatform, ControllerAuthority, ControllerPlatform,
+    ControllerSurface, CorePublicModel, DaemonOsAccount, DeploymentBoundary,
+    ExecutionPolicyAuthority, GoalAuthority, HostAuthorityModel, HostDaemonAccountAuthority,
+    HostDaemonIdentityAuthority, HostDaemonResponsibility, HostDesktopBindingCardinality,
+    LifecycleAuthorityModel, OpenComputerUseRole, OperatorAuthority, PhaseOneConformance,
+    PhaseOneContractFreeze, PhaseOneSubject, PlatformSupport, PrincipalRef,
+    ProductAuthorityBoundary, ProductDifferentiator, PublicPayloadGuard, SatelleHost,
+    SessionMappingAuthority, SessionWorkflow, TurnCardinalityAuthority, UpstreamRuntimeBoundary,
+};
 pub use control_plane::{
     ControlPlaneCapability, ControlPlaneCapabilitySet, ControlPlaneFailureReason,
     ControlPlaneOperation, IncompatibleControlPlaneDetails, IncompatibleControlPlaneDetailsError,
