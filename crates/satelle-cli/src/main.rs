@@ -20,7 +20,7 @@ use error_output::{ErrorFormat, parser_error, print_error, process_exit_code};
 use host_trust::{HostTrustReport, persist_host_identity};
 use logs::{LogsCommand, show_logs};
 use notify::{Config as NotifyConfig, Event, RecommendedWatcher, RecursiveMode, Watcher};
-use output::{OutputArgs, OutputFormat, SessionResultSchemaVersion, StatusReport};
+use output::{EventOutput, OutputArgs, OutputFormat, SessionResultSchemaVersion, StatusReport};
 use satelle_core::session::{
     EffectiveModelRef, HostIdentityRef, ProviderBindingRef, PublicSession, PublicTurn,
     TurnAdmissionPhase, TurnExecutionMode, TurnState,
@@ -673,6 +673,7 @@ fn main() -> ExitCode {
     };
     let error_format =
         ErrorFormat::resolve(cli.error_format, cli.command.requests_machine_errors());
+    install_diagnostics(&cli.command, error_format);
 
     match try_main(cli, error_format) {
         Ok(()) => ExitCode::SUCCESS,
@@ -733,6 +734,7 @@ fn try_main(cli: Cli, error_format: ErrorFormat) -> Result<(), CliFailure> {
         command,
     } = cli;
     let config = ConfigContext::new(profile.as_deref());
+    preflight_setup_before_history(&command, &config)?;
     let history = start_command_history(&command, &config);
     let outcome = execute_command(command, no_color, profile.as_deref(), config);
 
@@ -752,6 +754,67 @@ fn try_main(cli: Cli, error_format: ErrorFormat) -> Result<(), CliFailure> {
     }
 
     outcome.map(|_| ())
+}
+
+fn preflight_setup_before_history(
+    command: &Command,
+    config: &ConfigContext<'_>,
+) -> Result<(), CliFailure> {
+    let Command::Setup(command) = command else {
+        return Ok(());
+    };
+    // Resolve configured precedence, then reject the built-in local backend
+    // before command history can mutate operator state.
+    command
+        .output_args
+        .resolve(EventOutput::None)
+        .map_err(failure)?;
+    setup_components(&command.component).map_err(failure)?;
+    if command.on_demand && command.persistent {
+        return Err(failure(SatelleError::invalid_usage(
+            "--on-demand and --persistent cannot be combined",
+        )));
+    }
+    if command.dry_run || !uses_production_local_setup_backend() {
+        return Ok(());
+    }
+    if let Some(expected) = command.expected_host_id.as_deref() {
+        HostIdentityRef::new(expected).map_err(|error| {
+            failure(SatelleError::invalid_usage(format!(
+                "--expected-host-id is invalid: {error}"
+            )))
+        })?;
+    }
+    let host = config.resolve_host(command.host.as_deref())?;
+    if command.expected_host_id.is_some()
+        && host.config.transport != satelle_core::TransportKind::Ssh
+    {
+        return Err(failure(SatelleError::invalid_usage(
+            "setup --expected-host-id is only valid for an SSH Host Binding",
+        )));
+    }
+    if host.config.transport != satelle_core::TransportKind::Local {
+        return Ok(());
+    }
+
+    let setup_mode = if command.persistent {
+        "persistent"
+    } else {
+        "on_demand"
+    };
+    Err(failure(SatelleError::not_implemented(format!(
+        "{setup_mode} setup mutations are not supported by the local Host transport"
+    ))))
+}
+
+#[cfg(feature = "test-support")]
+fn uses_production_local_setup_backend() -> bool {
+    std::env::var_os("SATELLE_TEST_SUPPORT_ADAPTER").is_none()
+}
+
+#[cfg(not(feature = "test-support"))]
+fn uses_production_local_setup_backend() -> bool {
+    true
 }
 
 fn execute_command(
@@ -1606,10 +1669,8 @@ fn run_setup(
                     })
                 })?;
             if !confirmed {
-                return Err(failure(SatelleError::setup_consent_required(
-                    &report.planned_actions,
-                    &consent_recovery_command,
-                )));
+                println!("No changes applied.");
+                return Ok(());
             }
         }
 
@@ -3393,7 +3454,6 @@ fn start_host_daemon(
             )));
         }
     };
-    install_host_daemon_diagnostics();
     let bind_addr = command.bind.parse::<SocketAddr>().map_err(|error| {
         failure(SatelleError {
             code: ErrorCode::InvalidUsage,
@@ -3602,16 +3662,31 @@ fn ssh_launch_readiness_timeouts(
     }
 }
 
-fn install_host_daemon_diagnostics() {
-    // Host start reserves stdout for its human or machine-readable readiness
-    // response. Send structured runtime diagnostics to stderr so token
-    // lifecycle events are observable without corrupting that protocol.
+fn install_diagnostics(command: &Command, error_format: ErrorFormat) {
+    if error_format == ErrorFormat::Json {
+        return;
+    }
+    let default_level = if matches!(
+        command,
+        Command::Host {
+            command: HostCommand::Start(_)
+        }
+    ) {
+        tracing_subscriber::filter::LevelFilter::INFO
+    } else {
+        tracing_subscriber::filter::LevelFilter::OFF
+    };
+    let filter = tracing_subscriber::EnvFilter::builder()
+        .with_default_directive(default_level.into())
+        .with_env_var("SATELLE_LOG")
+        .from_env_lossy();
     let _subscriber_already_installed = tracing_subscriber::fmt()
         .with_ansi(false)
         .with_target(true)
         .with_writer(io::stderr)
-        .with_max_level(tracing_subscriber::filter::LevelFilter::INFO)
+        .with_env_filter(filter)
         .try_init();
+    tracing::debug!("Satelle diagnostics initialized");
 }
 
 struct DaemonTlsFiles {

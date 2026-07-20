@@ -1051,6 +1051,7 @@ fn blocker_for(
 fn probe_codex_version(timeout: Duration) -> CodexVersionEvidence {
     let mut command = Command::new("codex");
     command.arg("--version");
+    tracing::debug!("probing Codex runtime version");
     probe_codex_version_command(command, timeout)
 }
 
@@ -1063,8 +1064,14 @@ fn probe_codex_version_command(mut command: Command, timeout: Duration) -> Codex
         .group_spawn()
     {
         Ok(child) => child,
-        Err(error) if error.kind() == ErrorKind::NotFound => return CodexVersionEvidence::Missing,
-        Err(_) => return CodexVersionEvidence::Unavailable,
+        Err(error) if error.kind() == ErrorKind::NotFound => {
+            tracing::debug!("Codex runtime version probe found no executable");
+            return CodexVersionEvidence::Missing;
+        }
+        Err(_) => {
+            tracing::debug!("Codex runtime version probe could not start");
+            return CodexVersionEvidence::Unavailable;
+        }
     };
     let Some(stdout) = child.inner().stdout.take() else {
         let _ = terminate_group(&mut child);

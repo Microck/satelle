@@ -2209,11 +2209,21 @@ adapter = "codex"
 }
 
 #[test]
-fn production_setup_with_consent_fails_closed_when_local_mutations_are_unsupported() {
+fn production_setup_with_default_host_fails_closed_before_operator_state_is_touched() {
     let sandbox = state_dir();
-    let config_file = sandbox.path().join("config.toml");
+    let operator_home = sandbox.path().join("operator/home");
+    let operator_config_file = operator_home.join("config/config.toml");
+    let operator_state_dir = sandbox.path().join("operator/state");
+    let operator_cache_dir = sandbox.path().join("operator/cache");
+    let operator_log_dir = sandbox.path().join("operator/logs");
+    fs::create_dir_all(
+        operator_config_file
+            .parent()
+            .expect("config file has a parent"),
+    )
+    .expect("operator config directory should be created before the mutation check");
     write_user_config(
-        &config_file,
+        &operator_config_file,
         r#"
 default_host = "local-demo"
 
@@ -2225,13 +2235,16 @@ adapter = "codex"
     .expect("production config should be written");
 
     let output = assert_directory_tree_unchanged(
-        "satelle setup --yes with unsupported local mutations",
+        "satelle setup --yes with the unsupported default local host",
         sandbox.path(),
         || {
             production_satelle()
-                .env("SATELLE_CONFIG_FILE", &config_file)
-                .env("SATELLE_STATE_DIR", sandbox.path())
-                .args(["setup", "--yes", "--host", "local-demo", "--json"])
+                .env("SATELLE_HOME", &operator_home)
+                .env("SATELLE_CONFIG_FILE", &operator_config_file)
+                .env("SATELLE_STATE_DIR", &operator_state_dir)
+                .env("SATELLE_CACHE_DIR", &operator_cache_dir)
+                .env("SATELLE_LOG_DIR", &operator_log_dir)
+                .args(["setup", "--yes", "--json"])
                 .assert()
                 .code(70)
                 .get_output()
@@ -2246,6 +2259,205 @@ adapter = "codex"
             .as_str()
             .is_some_and(|message| message.contains("setup mutations are not supported"))
     );
+
+    let output = assert_directory_tree_unchanged(
+        "satelle setup with a local expected Host identity",
+        sandbox.path(),
+        || {
+            production_satelle()
+                .env("SATELLE_HOME", &operator_home)
+                .env("SATELLE_CONFIG_FILE", &operator_config_file)
+                .env("SATELLE_STATE_DIR", &operator_state_dir)
+                .env("SATELLE_CACHE_DIR", &operator_cache_dir)
+                .env("SATELLE_LOG_DIR", &operator_log_dir)
+                .args([
+                    "setup",
+                    "--yes",
+                    "--json",
+                    "--expected-host-id",
+                    "host-test",
+                ])
+                .assert()
+                .code(64)
+                .get_output()
+                .clone()
+        },
+    );
+
+    assert_eq!(parse_json_output(&output.stderr)["code"], "invalid-usage");
+}
+
+#[test]
+fn production_setup_with_aliased_local_host_fails_before_operator_state_is_touched() {
+    let sandbox = state_dir();
+    let operator_home = sandbox.path().join("operator/home");
+    let operator_config_file = operator_home.join("config/config.toml");
+    let operator_state_dir = sandbox.path().join("operator/state");
+    let operator_cache_dir = sandbox.path().join("operator/cache");
+    let operator_log_dir = sandbox.path().join("operator/logs");
+    fs::create_dir_all(
+        operator_config_file
+            .parent()
+            .expect("config file has a parent"),
+    )
+    .expect("operator config directory should be created");
+    write_user_config(
+        &operator_config_file,
+        r#"
+default_host = "workstation"
+
+[hosts.workstation]
+transport = "local"
+adapter = "codex"
+"#,
+    )
+    .expect("production config should be written");
+
+    let output = assert_directory_tree_unchanged(
+        "satelle setup with an aliased local Host",
+        sandbox.path(),
+        || {
+            production_satelle()
+                .env("SATELLE_HOME", &operator_home)
+                .env("SATELLE_CONFIG_FILE", &operator_config_file)
+                .env("SATELLE_STATE_DIR", &operator_state_dir)
+                .env("SATELLE_CACHE_DIR", &operator_cache_dir)
+                .env("SATELLE_LOG_DIR", &operator_log_dir)
+                .args(["setup", "--yes", "--json"])
+                .assert()
+                .code(70)
+                .get_output()
+                .clone()
+        },
+    );
+
+    assert_eq!(parse_json_output(&output.stderr)["code"], "not-implemented");
+}
+
+#[test]
+fn production_setup_validation_fails_before_operator_state_is_touched() {
+    let sandbox = state_dir();
+    let operator_home = sandbox.path().join("operator/home");
+    let operator_config_file = operator_home.join("config/config.toml");
+    let operator_state_dir = sandbox.path().join("operator/state");
+    let operator_cache_dir = sandbox.path().join("operator/cache");
+    let operator_log_dir = sandbox.path().join("operator/logs");
+
+    for (description, arguments, expected_code) in [
+        (
+            "satelle setup with conflicting components",
+            vec![
+                "setup",
+                "--component",
+                "all",
+                "--component",
+                "codex",
+                "--yes",
+                "--json",
+            ],
+            "component-selection-conflict",
+        ),
+        (
+            "satelle setup with conflicting modes",
+            vec!["setup", "--on-demand", "--persistent", "--yes", "--json"],
+            "invalid-usage",
+        ),
+    ] {
+        let output = assert_directory_tree_unchanged(description, sandbox.path(), || {
+            production_satelle()
+                .env("SATELLE_HOME", &operator_home)
+                .env("SATELLE_CONFIG_FILE", &operator_config_file)
+                .env("SATELLE_STATE_DIR", &operator_state_dir)
+                .env("SATELLE_CACHE_DIR", &operator_cache_dir)
+                .env("SATELLE_LOG_DIR", &operator_log_dir)
+                .args(arguments)
+                .assert()
+                .code(64)
+                .get_output()
+                .clone()
+        });
+
+        assert_eq!(parse_json_output(&output.stderr)["code"], expected_code);
+    }
+}
+
+#[test]
+fn production_setup_honors_environment_host_before_local_preflight() {
+    let sandbox = state_dir();
+    let operator_config_file = sandbox.path().join("operator/config.toml");
+    fs::create_dir_all(
+        operator_config_file
+            .parent()
+            .expect("config file has a parent"),
+    )
+    .expect("operator config directory should be created");
+    write_user_config(
+        &operator_config_file,
+        r#"
+default_host = "local-demo"
+
+[hosts.local-demo]
+transport = "local"
+adapter = "codex"
+"#,
+    )
+    .expect("production config should be written");
+
+    let output = assert_directory_tree_unchanged(
+        "satelle setup with an environment-selected host",
+        sandbox.path(),
+        || {
+            production_satelle()
+                .env("SATELLE_CONFIG_FILE", &operator_config_file)
+                .env("SATELLE_STATE_DIR", sandbox.path().join("operator/state"))
+                .env("SATELLE_CACHE_DIR", sandbox.path().join("operator/cache"))
+                .env("SATELLE_HOST", "remote")
+                .args(["setup", "--yes", "--json"])
+                .assert()
+                .code(66)
+                .get_output()
+                .clone()
+        },
+    );
+
+    assert_eq!(parse_json_output(&output.stderr)["code"], "host-not-found");
+}
+
+#[test]
+fn production_setup_honors_configured_default_host_before_local_preflight() {
+    let sandbox = state_dir();
+    let operator_config_file = sandbox.path().join("operator/config.toml");
+    fs::create_dir_all(
+        operator_config_file
+            .parent()
+            .expect("config file has a parent"),
+    )
+    .expect("operator config directory should be created");
+    write_user_config(
+        &operator_config_file,
+        r#"
+default_host = "remote"
+"#,
+    )
+    .expect("production config should be written");
+
+    let output = assert_directory_tree_unchanged(
+        "satelle setup with a configured default host",
+        sandbox.path(),
+        || {
+            production_satelle()
+                .env("SATELLE_CONFIG_FILE", &operator_config_file)
+                .env("SATELLE_STATE_DIR", sandbox.path().join("operator/state"))
+                .env("SATELLE_CACHE_DIR", sandbox.path().join("operator/cache"))
+                .args(["setup", "--yes", "--json"])
+                .assert()
+                .code(66)
+                .get_output()
+                .clone()
+        },
+    );
+
+    assert_eq!(parse_json_output(&output.stderr)["code"], "host-not-found");
 }
 
 #[test]
@@ -2365,6 +2577,49 @@ fn setup_no_input_json_requires_consent_without_mutating() {
     assert_eq!(
         error["suggested_commands"][0],
         "satelle setup --host local-demo --on-demand --no-input --json --yes"
+    );
+    assert!(!state.path().join("local-demo-state.json").exists());
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn setup_interactive_decline_exits_successfully_without_mutating_state() {
+    let state = state_dir();
+    let executable = assert_cmd::cargo::cargo_bin!("satelle");
+    let command_line = format!("{} setup --host local-demo", executable.display());
+
+    let output =
+        assert_directory_tree_unchanged("declined interactive satelle setup", state.path(), || {
+            let mut command = Command::new("script");
+            for name in [
+                "SATELLE_HOME",
+                "SATELLE_CONFIG_FILE",
+                "SATELLE_STATE_DIR",
+                "SATELLE_CACHE_DIR",
+                "SATELLE_LOG_DIR",
+                "SATELLE_HOST",
+                "SATELLE_PROFILE",
+                "SATELLE_ERROR_FORMAT",
+                TEST_SUPPORT_ADAPTER_ENV,
+            ] {
+                command.env_remove(name);
+            }
+            command
+                .env("SATELLE_STATE_DIR", state.path())
+                .env("SATELLE_COMMAND_HISTORY", "false")
+                .env(TEST_SUPPORT_ADAPTER_ENV, "fake")
+                .args(["-qec", command_line.as_str(), "/dev/null"])
+                .write_stdin("n\n")
+                .assert()
+                .success()
+                .get_output()
+                .clone()
+        });
+
+    let output = String::from_utf8_lossy(&[output.stdout, output.stderr].concat()).to_string();
+    assert!(
+        output.contains("No changes applied."),
+        "decline output should report no mutation: {output}"
     );
     assert!(!state.path().join("local-demo-state.json").exists());
 }

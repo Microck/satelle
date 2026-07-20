@@ -12,6 +12,7 @@ fn satelle() -> Command {
         "SATELLE_CONFIG_FILE",
         "SATELLE_STATE_DIR",
         "SATELLE_CACHE_DIR",
+        "SATELLE_LOG",
         "SATELLE_LOG_DIR",
         "SATELLE_HOST",
         "SATELLE_PROFILE",
@@ -41,6 +42,7 @@ adapter = "codex"
     let output = satelle()
         .env("SATELLE_CONFIG_FILE", config_file)
         .env("SATELLE_STATE_DIR", sandbox.path())
+        .env("SATELLE_LOG", "satelle=debug")
         .args(["setup", "--yes", "--host", "local-demo", "--json"])
         .assert()
         .code(70)

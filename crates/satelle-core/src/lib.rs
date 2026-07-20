@@ -2047,7 +2047,9 @@ pub enum ErrorCode {
     ComponentSelectionConflict,
     UnsupportedUpdateComponent,
     SetupConsentRequired,
+    DoctorFixConsentRequired,
     InputRequired,
+    Interrupted,
     NotImplemented,
 }
 
@@ -2123,7 +2125,9 @@ impl ErrorCode {
             Self::ComponentSelectionConflict => "component-selection-conflict",
             Self::UnsupportedUpdateComponent => "unsupported-update-component",
             Self::SetupConsentRequired => "setup-consent-required",
+            Self::DoctorFixConsentRequired => "doctor-fix-consent-required",
             Self::InputRequired => "input-required",
+            Self::Interrupted => "interrupted",
             Self::NotImplemented => "not-implemented",
         }
     }
@@ -2141,9 +2145,11 @@ impl ErrorCode {
             | Self::ComponentSelectionConflict
             | Self::UnsupportedUpdateComponent
             | Self::SetupConsentRequired
+            | Self::DoctorFixConsentRequired
             | Self::InputRequired
             | Self::DoctorRefreshScopeRequired
             | Self::DoctorRefreshTimeoutWithoutRefresh => 64,
+            Self::Interrupted => 130,
             Self::CompletionInstallFailed | Self::CompletionProfileUpdateFailed => 73,
             Self::ConfigError
             | Self::ConfigNotFound
@@ -3149,6 +3155,40 @@ impl SatelleError {
         }
     }
 
+    pub fn doctor_fix_consent_required(
+        planned_actions: &[String],
+        recovery_command: impl Into<String>,
+    ) -> Self {
+        let mut details = BTreeMap::new();
+        details.insert(
+            "planned_actions".to_string(),
+            Value::Array(planned_actions.iter().cloned().map(Value::String).collect()),
+        );
+        details.insert("applied_actions".to_string(), Value::Array(Vec::new()));
+        details.insert("mutated".to_string(), Value::Bool(false));
+
+        Self {
+            code: ErrorCode::DoctorFixConsentRequired,
+            message:
+                "doctor fix has planned mutations that require explicit consent; no changes were applied"
+                    .to_string(),
+            recovery_command: Some(recovery_command.into()),
+            source_detail: None,
+            details,
+        }
+    }
+
+    pub fn interrupted_attached_command() -> Self {
+        Self {
+            code: ErrorCode::Interrupted,
+            message: "attached command was interrupted after applying the interruption contract"
+                .to_string(),
+            recovery_command: Some("rerun the command or inspect the Session status".to_string()),
+            source_detail: None,
+            details: BTreeMap::new(),
+        }
+    }
+
     pub fn not_implemented(feature: impl Into<String>) -> Self {
         Self {
             code: ErrorCode::NotImplemented,
@@ -3233,6 +3273,8 @@ mod error_contract_tests {
             (ErrorCode::StopNotConfirmed, 75),
             (ErrorCode::StoreInUse, 74),
             (ErrorCode::StorageBusy, 74),
+            (ErrorCode::DoctorFixConsentRequired, 64),
+            (ErrorCode::Interrupted, 130),
         ] {
             assert_eq!(
                 code.exit_code(),
@@ -3272,6 +3314,118 @@ mod error_contract_tests {
             BTreeMap::from([("host".to_string(), serde_json::json!("remote"))])
         );
         assert_eq!(error.exit_code(), 69);
+    }
+
+    #[test]
+    fn consent_required_errors_are_usage_noops() {
+        for (error, expected_code, expected_message, expected_action, expected_recovery) in [
+            (
+                SatelleError::setup_consent_required(
+                    &["install host daemon".to_string()],
+                    "satelle setup --yes",
+                ),
+                ErrorCode::SetupConsentRequired,
+                "setup has planned mutations that require explicit consent; no changes were applied",
+                "install host daemon",
+                "satelle setup --yes",
+            ),
+            (
+                SatelleError::doctor_fix_consent_required(
+                    &["repair Host state".to_string()],
+                    "satelle doctor --fix --yes",
+                ),
+                ErrorCode::DoctorFixConsentRequired,
+                "doctor fix has planned mutations that require explicit consent; no changes were applied",
+                "repair Host state",
+                "satelle doctor --fix --yes",
+            ),
+        ] {
+            assert_eq!(error.code, expected_code);
+            assert_eq!(error.message, expected_message);
+            assert_eq!(error.exit_code(), 64);
+            assert_eq!(error.recovery_command.as_deref(), Some(expected_recovery));
+            assert_eq!(
+                error.details.get("planned_actions"),
+                Some(&serde_json::json!([expected_action]))
+            );
+            assert_eq!(
+                error.details.get("applied_actions"),
+                Some(&serde_json::json!([]))
+            );
+            assert_eq!(
+                error.details.get("mutated"),
+                Some(&serde_json::json!(false))
+            );
+            assert_eq!(error.source_detail, None);
+        }
+    }
+
+    #[test]
+    fn interrupted_attached_command_has_a_stable_exit_class() {
+        let error = SatelleError::interrupted_attached_command();
+
+        assert_eq!(ErrorCode::Interrupted.as_str(), "interrupted");
+        assert_eq!(
+            serde_json::to_value(ErrorCode::Interrupted).expect("serialize interrupt code"),
+            serde_json::json!("interrupted")
+        );
+        assert_eq!(error.exit_code(), 130);
+        assert_eq!(error.source_detail, None);
+        assert_eq!(
+            error.recovery_command.as_deref(),
+            Some("rerun the command or inspect the Session status")
+        );
+        assert!(error.details.is_empty());
+        assert!(error.message.contains("interrupted"));
+    }
+
+    #[test]
+    fn known_failures_keep_specific_user_facing_attribution() {
+        let incompatible_control_plane = SatelleError::incompatible_control_plane(
+            IncompatibleControlPlaneDetails::new(
+                ControlPlaneOperation::Run,
+                ControlPlaneFailureReason::RequiredCapabilityMissing,
+                &[ControlPlaneCapability::EventObservation],
+            )
+            .expect("valid incompatible control-plane details"),
+        );
+        let session_id = SessionId::new();
+        let session_attribution = format!("session '{}'", session_id.as_str());
+
+        for (surface, error, expected) in [
+            (
+                "host",
+                SatelleError::host_unreachable("remote"),
+                "host 'remote'",
+            ),
+            (
+                "transport",
+                SatelleError::direct_daemon_unreachable("remote"),
+                "direct Host Daemon",
+            ),
+            ("Codex", incompatible_control_plane, "Codex control plane"),
+            (
+                "Computer Use",
+                SatelleError::native_readiness_timeout(),
+                "native Computer Use",
+            ),
+            (
+                "provider",
+                SatelleError::unsupported_provider_computer_use(),
+                "selected provider",
+            ),
+            (
+                "session",
+                SatelleError::session_not_found(&session_id),
+                session_attribution.as_str(),
+            ),
+        ] {
+            assert!(
+                error.message.contains(expected),
+                "{surface} failure should name {expected:?}: {}",
+                error.message
+            );
+        }
     }
 
     #[test]

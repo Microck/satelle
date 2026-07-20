@@ -130,6 +130,45 @@ fn format_json_is_an_exact_json_alias_and_explicit_human_is_unchanged() {
 }
 
 #[test]
+fn json_command_output_is_stable_when_diagnostic_verbosity_changes() {
+    let state = state_dir();
+    let baseline = satelle()
+        .env("SATELLE_HOME", state.path())
+        .env_remove("SATELLE_LOG")
+        .args(["paths", "--json"])
+        .assert()
+        .success()
+        .get_output()
+        .clone();
+
+    let verbose = satelle()
+        .env("SATELLE_HOME", state.path())
+        .env("SATELLE_LOG", "satelle=debug")
+        .args(["paths", "--json"])
+        .assert()
+        .success()
+        .get_output()
+        .clone();
+
+    assert!(baseline.stderr.is_empty());
+    assert!(verbose.stderr.is_empty());
+    assert_eq!(parse_json(&baseline.stdout), parse_json(&verbose.stdout));
+
+    let human_verbose = satelle()
+        .env("SATELLE_HOME", state.path())
+        .env("SATELLE_LOG", "satelle=debug")
+        .args(["paths"])
+        .assert()
+        .success()
+        .get_output()
+        .clone();
+    assert!(
+        String::from_utf8_lossy(&human_verbose.stderr).contains("Satelle diagnostics initialized"),
+        "SATELLE_LOG should enable debug diagnostics on stderr"
+    );
+}
+
+#[test]
 fn final_result_selectors_and_json_event_streams_report_typed_conflicts() {
     for format in ["human", "json"] {
         assert_output_conflict(&["paths", "--json", "--format", format], true);

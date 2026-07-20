@@ -281,6 +281,10 @@ impl ProductionComputerUseAdapter {
         };
         let mut persist_thread_ref = |_value: &str| Ok(());
         let mut persist_turn_ref = |_value: &str| Ok(());
+        tracing::debug!(
+            adapter = NATIVE_ADAPTER,
+            "starting native Computer Use readiness smoke test"
+        );
         match self.run_native_smoke(&mut persist_thread_ref, &mut persist_turn_ref) {
             Ok(()) => self.readiness_from_evidence(
                 &key,
@@ -1005,6 +1009,11 @@ impl ComputerUseAdapter for ProductionComputerUseAdapter {
             .and_then(|path| prepare_working_directory(path))?;
         let control = CodexSessionControl::new(deadline);
         let _active_execution = self.register_execution(request.subject(), control.clone())?;
+        tracing::debug!(
+            session_id = %request.subject().session_id(),
+            turn_id = %request.subject().turn_id(),
+            "starting Codex native Computer Use execution"
+        );
 
         // Preserve the original storage failure outside the protocol layer so
         // a private-reference conflict is not misclassified as transport I/O.
