@@ -272,41 +272,63 @@ Options:
 Usage: satelle run [OPTIONS] [PROMPT_OR_DASH]
 
 Arguments:
-  [PROMPT_OR_DASH]  
+  [PROMPT_OR_DASH]
+          
 
 Options:
       --host <HOST>
           
+
       --no-color
           Disable colored human output
+
       --detach
           
+
       --profile <NAME>
           Apply a named user-level configuration profile
+
       --error-format <FORMAT>
-          Format diagnostics as human-readable text or JSON [env: SATELLE_ERROR_FORMAT=] [possible values: human, json]
+          Format diagnostics as human-readable text or JSON
+          
+          [env: SATELLE_ERROR_FORMAT=]
+          [possible values: human, json]
+
       --quiet
           
+
       --verbose
           
+
       --experimental-provider-computer-use
           Experimental: attempt non-OpenAI provider Computer Use; behavior may not work correctly and still requires a live provider Computer Use smoke test
+
       --refresh-provider-smoke-test
           Refresh the cached provider Computer Use smoke-test result before execution; this does not enable experimental provider Computer Use
+
       --yolo
           Enable YOLO mode for this command; Codex-controlled approvals may be auto-accepted when supported
+
       --no-yolo
           Disable YOLO mode for this command
+
       --events <EVENTS>
-          [default: auto] [possible values: auto, human, json, none]
+          [default: auto]
+          [possible values: auto, human, json, none]
+
       --prompt-file <PROMPT_FILE>
           
+
       --format <FORMAT>
           [possible values: human, json]
+
       --json
           Alias for --format json
+
   -h, --help
-          Print help
+          Print help (see a summary with '-h')
+
+Security: a positional prompt may be retained in shell history or visible in local process metadata. Use standard input with PROMPT_OR_DASH set to '-' or --prompt-file for sensitive prompt text.
 ```
 
 ## `satelle steer`
@@ -315,42 +337,66 @@ Options:
 Usage: satelle steer [OPTIONS] <SESSION_ID> [PROMPT_OR_DASH]
 
 Arguments:
-  <SESSION_ID>      
-  [PROMPT_OR_DASH]  
+  <SESSION_ID>
+          
+
+  [PROMPT_OR_DASH]
+          
 
 Options:
       --host <HOST>
           
+
       --no-color
           Disable colored human output
+
       --detach
           
+
       --profile <NAME>
           Apply a named user-level configuration profile
+
       --error-format <FORMAT>
-          Format diagnostics as human-readable text or JSON [env: SATELLE_ERROR_FORMAT=] [possible values: human, json]
+          Format diagnostics as human-readable text or JSON
+          
+          [env: SATELLE_ERROR_FORMAT=]
+          [possible values: human, json]
+
       --quiet
           
+
       --verbose
           
+
       --experimental-provider-computer-use
           Experimental: attempt non-OpenAI provider Computer Use; behavior may not work correctly and still requires a live provider Computer Use smoke test
+
       --refresh-provider-smoke-test
           Refresh the cached provider Computer Use smoke-test result before execution; this does not enable experimental provider Computer Use
+
       --yolo
           Enable YOLO mode for this command; Codex-controlled approvals may be auto-accepted when supported
+
       --no-yolo
           Disable YOLO mode for this command
+
       --events <EVENTS>
-          [default: auto] [possible values: auto, human, json, none]
+          [default: auto]
+          [possible values: auto, human, json, none]
+
       --prompt-file <PROMPT_FILE>
           
+
       --format <FORMAT>
           [possible values: human, json]
+
       --json
           Alias for --format json
+
   -h, --help
-          Print help
+          Print help (see a summary with '-h')
+
+Security: a positional prompt may be retained in shell history or visible in local process metadata. Use standard input with PROMPT_OR_DASH set to '-' or --prompt-file for sensitive prompt text.
 ```
 
 ## `satelle status`
@@ -405,6 +451,8 @@ Options:
       --after <LOG_CURSOR>           Return entries strictly after this opaque cursor; conflicts with --since and --tail
       --source <SOURCE>              Include a source: host_daemon, storage, or codex_adapter; repeat to select multiple
       --level <SEVERITY>             Set minimum severity: info, warn, or error (default: info)
+  -f, --follow                       Continue streaming matching entries until interrupted or failed
+      --no-reconnect                 Fail immediately if a follow stream loses its Host connection
       --format <FORMAT>              [possible values: human, json]
       --json                         Alias for --format json
   -h, --help                         Print help
