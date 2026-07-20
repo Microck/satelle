@@ -35,6 +35,31 @@ pub struct DaemonRuntimeStatus {
     recovery_pending_turn_count: usize,
 }
 
+/// Authoritative Host state used when a Client reconnects after losing its
+/// live event stream. Satelle Events remain process-local; durable recovery
+/// combines the current Session snapshot with normalized logs after the last
+/// cursor the Client received.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DaemonSessionReconnect {
+    host_identity: String,
+    session: PublicSession,
+    logs: crate::DaemonLogPage,
+}
+
+impl DaemonSessionReconnect {
+    pub fn host_identity(&self) -> &str {
+        &self.host_identity
+    }
+
+    pub const fn session(&self) -> &PublicSession {
+        &self.session
+    }
+
+    pub const fn logs(&self) -> &crate::DaemonLogPage {
+        &self.logs
+    }
+}
+
 impl DaemonRuntimeStatus {
     pub fn host_identity(&self) -> &str {
         &self.host_identity
@@ -334,6 +359,28 @@ impl HostService {
         query: &crate::LogPageQuery,
     ) -> Result<crate::DaemonLogPage, SatelleError> {
         self.runtime.log_page(query)
+    }
+
+    /// Restores durable Client context without pretending that missed live
+    /// events can be replayed. Host Identity comes from the same authoritative
+    /// runtime that owns the current Session and cursor-addressed log history.
+    pub fn daemon_session_reconnect(
+        &self,
+        session_id: &SessionId,
+        after: Option<crate::LogCursor>,
+        limit: usize,
+    ) -> Result<DaemonSessionReconnect, SatelleError> {
+        let query = crate::LogPageQuery::forward(after, limit)
+            .map_err(|error| SatelleError::invalid_usage(error.to_string()))?
+            .with_session(session_id.clone());
+        let status = self.daemon_runtime_status()?;
+        let session = self.session_status(session_id)?;
+        let logs = self.daemon_log_page(&query)?;
+        Ok(DaemonSessionReconnect {
+            host_identity: status.host_identity,
+            session,
+            logs,
+        })
     }
 
     pub fn subscribe_live_events(&self) -> Result<crate::LiveEventSubscription, SatelleError> {
@@ -1259,3 +1306,7 @@ mod tests {
         ));
     }
 }
+
+#[cfg(test)]
+#[path = "daemon-reconnect-tests.rs"]
+mod reconnect_tests;
