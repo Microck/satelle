@@ -1028,10 +1028,11 @@ fn cancellation_ledger_matches_every_operation_identity_dimension() {
 }
 
 #[test]
-fn admission_winning_late_cancellation_clears_the_provisional_recovery_record() {
+fn admission_winning_late_cancellation_skips_provisional_recovery_persistence() {
     let capacity = Arc::new(OperationCapacity::default());
     let committed = Latch::default();
     let release = Latch::default();
+    let persistence_calls = Arc::new(AtomicUsize::new(0));
     let admitted_session = coordinator_result_session();
     let session_id = admitted_session.session_id().clone();
     let turn_id = admitted_session.turns()[0].turn_id().clone();
@@ -1064,16 +1065,14 @@ fn admission_winning_late_cancellation_clears_the_provisional_recovery_record() 
     );
 
     let cancellation_capacity = Arc::clone(&capacity);
-    let cancellation_session = admitted_session.clone();
-    let cancellation_turn_id = turn_id.clone();
+    let cancellation_persistence_calls = Arc::clone(&persistence_calls);
     let cancellation = std::thread::spawn(move || {
-        cancellation_capacity.cancel(
+        cancellation_capacity.cancel_durable(
             operation_request("principal-a", "admission-wins", DIGEST_A),
-            || {
-                Ok(Some(OperationOutcome::admission(
-                    cancellation_session.clone(),
-                    cancellation_turn_id.clone(),
-                )))
+            || Ok(crate::operation_capacity::DurableAdmissionOutcome::Missing),
+            |_| {
+                cancellation_persistence_calls.fetch_add(1, Ordering::SeqCst);
+                Ok(crate::operation_capacity::DurableAdmissionOutcome::Missing)
             },
         )
     });
@@ -1100,6 +1099,11 @@ fn admission_winning_late_cancellation_clears_the_provisional_recovery_record() 
         }
         _ => panic!("the committed admission must win late cancellation"),
     }
+    assert_eq!(
+        persistence_calls.load(Ordering::SeqCst),
+        0,
+        "a cancellation request cannot persist recovery after admission commits"
+    );
 
     let replay_session = admitted_session.clone();
     let replay_turn_id = turn_id.clone();

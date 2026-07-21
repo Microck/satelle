@@ -37,6 +37,10 @@ impl AdmissionCancellation {
     }
 
     pub fn request(&self) {
+        let _ = self.request_state();
+    }
+
+    pub(crate) fn request_state(&self) -> AdmissionCancellationState {
         let _commit = self
             .inner
             .commit
@@ -50,6 +54,7 @@ impl AdmissionCancellation {
         if *state == AdmissionCancellationState::Open {
             *state = AdmissionCancellationState::Requested;
         }
+        state.clone()
     }
 
     pub(crate) fn is_requested(&self) -> bool {

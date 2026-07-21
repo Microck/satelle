@@ -376,6 +376,7 @@ impl OperationCapacity {
                             &mut persist_cancellation,
                         );
                     }
+                    CancellationRegistration::AdmissionCommitted => {}
                     CancellationRegistration::Requested => {
                         match persist_cancellation(AdmissionCancellationOutcome::RecoveryPending)? {
                             DurableAdmissionOutcome::Admitted(outcome) => {
@@ -440,6 +441,7 @@ impl OperationCapacity {
                         &mut persist_cancellation,
                     );
                 }
+                CancellationRegistration::AdmissionCommitted => {}
                 CancellationRegistration::Requested => {
                     match persist_cancellation(AdmissionCancellationOutcome::RecoveryPending)? {
                         DurableAdmissionOutcome::Admitted(outcome) => {
@@ -766,8 +768,15 @@ impl InFlight {
         if let Some(result) = stored.as_ref() {
             return CancellationRegistration::Completed(result.clone());
         }
-        self.cancellation.request();
-        CancellationRegistration::Requested
+        match self.cancellation.request_state() {
+            AdmissionCancellationState::Admitted { .. } => {
+                CancellationRegistration::AdmissionCommitted
+            }
+            AdmissionCancellationState::Open
+            | AdmissionCancellationState::Requested
+            | AdmissionCancellationState::Cancelled
+            | AdmissionCancellationState::RecoveryPending => CancellationRegistration::Requested,
+        }
     }
 
     fn complete_locked(
@@ -798,6 +807,7 @@ impl InFlight {
 
 enum CancellationRegistration {
     Requested,
+    AdmissionCommitted,
     Completed(SharedResult),
 }
 
