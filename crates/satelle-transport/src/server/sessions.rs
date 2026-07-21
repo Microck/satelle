@@ -41,7 +41,9 @@ pub(super) async fn create_session(
         return cancellation_response(&state, &authorized, cancellation);
     }
     let session = match host_call(&state, &authorized, move || {
-        service.admit_run(&intent, &authority)
+        service
+            .admit_run(&intent, &authority)
+            .map_err(admission_wire_error)
     })
     .await
     {
@@ -89,7 +91,9 @@ pub(super) async fn create_turn(
         return cancellation_response(&state, &authorized, cancellation);
     }
     let session = match host_call(&state, &authorized, move || {
-        service.admit_steer(&session_id, &intent, &authority)
+        service
+            .admit_steer(&session_id, &intent, &authority)
+            .map_err(admission_wire_error)
     })
     .await
     {
@@ -281,6 +285,14 @@ where
     }
 }
 
+fn admission_wire_error(error: SatelleError) -> SatelleError {
+    if error.code == satelle_core::ErrorCode::Interrupted {
+        SatelleError::state_conflict()
+    } else {
+        error
+    }
+}
+
 fn turn_intent(request: TurnRequest) -> Result<TurnIntent, TurnIntentError> {
     let TurnRequestParts {
         prompt,
@@ -412,5 +424,14 @@ mod admission_action_tests {
 
         headers.insert(ADMISSION_ACTION_HEADER, HeaderValue::from_static("Cancel"));
         assert_eq!(admission_action(&headers), Err(()));
+    }
+
+    #[test]
+    fn interrupted_admission_maps_to_wire_safe_conflict() {
+        let mapped = admission_wire_error(SatelleError::interrupted_attached_command());
+        assert_eq!(mapped.code, satelle_core::ErrorCode::StateConflict);
+
+        let unchanged = admission_wire_error(SatelleError::invalid_usage("invalid admission"));
+        assert_eq!(unchanged.code, satelle_core::ErrorCode::InvalidUsage);
     }
 }
