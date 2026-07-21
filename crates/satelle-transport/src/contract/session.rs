@@ -241,7 +241,9 @@ pub struct AdmissionCancellationResponse {
     request_id: RequestId,
     host_identity: String,
     outcome: AdmissionCancellationOutcome,
+    #[serde(deserialize_with = "Option::deserialize")]
     session_id: Option<SessionId>,
+    #[serde(deserialize_with = "Option::deserialize")]
     turn_id: Option<TurnId>,
 }
 
@@ -667,6 +669,33 @@ mod tests {
                 .expect("wire types remain decodable for client validation")
                 .validate()
         );
+
+        for outcome in ["cancelled", "recovery_pending"] {
+            let terminal = serde_json::json!({
+                "schema_version": "satelle.admission.cancel.v1",
+                "request_id": "01890a5d-ac96-7b7c-8f89-37c3d0a66e01",
+                "host_identity": "host-test",
+                "outcome": outcome,
+                "session_id": null,
+                "turn_id": null
+            });
+            let decoded = serde_json::from_value::<AdmissionCancellationResponse>(terminal.clone())
+                .expect("decode complete terminal cancellation response");
+            assert!(decoded.validate());
+            assert_eq!(serde_json::to_value(decoded).unwrap(), terminal);
+
+            for field in ["session_id", "turn_id"] {
+                let mut missing = terminal.clone();
+                missing
+                    .as_object_mut()
+                    .expect("cancellation response is an object")
+                    .remove(field);
+                assert!(
+                    serde_json::from_value::<AdmissionCancellationResponse>(missing).is_err(),
+                    "missing nullable {field} must be rejected for {outcome}"
+                );
+            }
+        }
 
         let mut cancelled_with_handles = base;
         cancelled_with_handles["outcome"] = serde_json::json!("cancelled");
