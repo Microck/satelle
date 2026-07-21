@@ -171,11 +171,12 @@ impl RuntimeEngine {
             .maintenance_lease_state()
             .map_err(model::storage_failure)?;
         match maintenance {
-            Some(MaintenanceLeaseState::Active { operation_id }) => {
-                Err(maintenance_host_busy(&operation_id, false))
-            }
+            Some(MaintenanceLeaseState::Active {
+                operation_id,
+                freshness,
+            }) => Err(maintenance_host_busy(&operation_id, false, Some(freshness))),
             Some(MaintenanceLeaseState::RecoveryPending(subject)) => {
-                Err(maintenance_host_busy(subject.operation_id(), true))
+                Err(maintenance_host_busy(subject.operation_id(), true, None))
             }
             None => Ok(()),
         }
@@ -191,9 +192,10 @@ impl RuntimeEngine {
             .map_err(model::storage_failure)?
         {
             Some(MaintenanceLeaseState::RecoveryPending(subject)) => subject,
-            Some(MaintenanceLeaseState::Active { operation_id }) => {
-                return Err(maintenance_host_busy(&operation_id, false));
-            }
+            Some(MaintenanceLeaseState::Active {
+                operation_id,
+                freshness,
+            }) => return Err(maintenance_host_busy(&operation_id, false, Some(freshness))),
             None => return Ok(None),
         };
         let verified = verify_setup_postconditions(&subject, observer)?;
@@ -349,7 +351,11 @@ impl RuntimeEngine {
     }
 }
 
-fn maintenance_host_busy(operation_id: &str, recovery_pending: bool) -> SatelleError {
+fn maintenance_host_busy(
+    operation_id: &str,
+    recovery_pending: bool,
+    freshness: Option<crate::storage::LeaseFreshness>,
+) -> SatelleError {
     let mut details = std::collections::BTreeMap::new();
     details.insert(
         "reason".to_string(),
@@ -367,6 +373,18 @@ fn maintenance_host_busy(operation_id: &str, recovery_pending: bool) -> SatelleE
             "active".to_string()
         }),
     );
+    if let Some(freshness) = freshness {
+        details.insert(
+            "lease_freshness".to_string(),
+            serde_json::Value::String(
+                match freshness {
+                    crate::storage::LeaseFreshness::Fresh => "fresh",
+                    crate::storage::LeaseFreshness::Stale => "stale",
+                }
+                .to_string(),
+            ),
+        );
+    }
     details.insert("retryable".to_string(), serde_json::Value::Bool(true));
     details.insert(
         "operation_id".to_string(),

@@ -15,6 +15,7 @@ mod tests;
 // Admission needs an initial expiry, then the terminal commit resets it so the
 // full replay window begins only after the operation has finished.
 pub(crate) const IDEMPOTENCY_RETENTION: time::Duration = time::Duration::hours(24);
+pub(crate) const DEFAULT_LEASE_STALE_AFTER: time::Duration = time::Duration::seconds(30);
 
 pub(crate) use self::auth::{ApiTokenRegistration, SensitiveRequestDigest};
 use self::codec::{
@@ -289,10 +290,28 @@ impl LeaseOwner {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum LeaseFreshness {
+    Fresh,
+    Stale,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "later API packets consume these frozen mutation classes"
+    )
+)]
 pub(crate) enum IdempotentOperation {
     Run,
     Steer,
     Stop,
+    Setup,
+    Repair,
+    HostUpdate,
+    StorageMigration,
+    DestructiveMaintenance,
 }
 
 #[derive(Clone)]

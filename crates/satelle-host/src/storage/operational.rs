@@ -1,8 +1,9 @@
 use super::codec::unix_timestamp_nanos;
 use super::{
-    LeaseOwner, MaintenanceLeaseCapability, MaintenanceLeaseState, MaintenanceRecoverySubject,
-    ObservedUpstreamRef, PrivateUpstreamRef, ProbeRecoverySubject, ReadinessProbeKind,
-    ReadinessProbeTerminal, SetupRunStatus, Storage, StorageError, StorageErrorKind,
+    DEFAULT_LEASE_STALE_AFTER, LeaseFreshness, LeaseOwner, MaintenanceLeaseCapability,
+    MaintenanceLeaseState, MaintenanceRecoverySubject, ObservedUpstreamRef, PrivateUpstreamRef,
+    ProbeRecoverySubject, ReadinessProbeKind, ReadinessProbeTerminal, SetupRunStatus, Storage,
+    StorageError, StorageErrorKind,
 };
 use crate::runtime::VerifiedMaintenancePostcheck;
 use crate::{
@@ -20,7 +21,7 @@ impl Storage {
             .connection
             .query_row(
                 "SELECT operation_id, owner_process_id, owner_process_start_ref,
-                        owner_boot_identity_ref, acquired_at, lease_state,
+                        owner_boot_identity_ref, acquired_at, heartbeat_at, lease_state,
                         EXISTS(
                             SELECT 1 FROM control_leases
                             WHERE control_leases.operation_id = maintenance_leases.operation_id
@@ -36,7 +37,8 @@ impl Storage {
                         row.get::<_, String>(3)?,
                         row.get::<_, String>(4)?,
                         row.get::<_, String>(5)?,
-                        row.get::<_, bool>(6)?,
+                        row.get::<_, String>(6)?,
+                        row.get::<_, bool>(7)?,
                     ))
                 },
             )
@@ -48,6 +50,7 @@ impl Storage {
             process_start,
             boot_identity,
             acquired_at,
+            heartbeat_at,
             state,
             has_postcheck,
         )) = lease
@@ -55,7 +58,13 @@ impl Storage {
             return Ok(None);
         };
         if state == "active" {
-            return Ok(Some(MaintenanceLeaseState::Active { operation_id }));
+            return Ok(Some(MaintenanceLeaseState::Active {
+                operation_id,
+                freshness: classify_lease_freshness(
+                    &heartbeat_at,
+                    time::OffsetDateTime::now_utc(),
+                )?,
+            }));
         }
         if state != "recovery_pending" {
             return Err(StorageError::new(StorageErrorKind::InvalidStoredState));
@@ -1389,4 +1398,19 @@ fn require_idempotent_write(changed: usize) -> Result<(), StorageError> {
 
 fn operation_failed(source: rusqlite::Error) -> StorageError {
     super::open::sqlite_error(StorageErrorKind::OperationFailed, source)
+}
+
+pub(super) fn classify_lease_freshness(
+    heartbeat_at: &str,
+    observed_at: time::OffsetDateTime,
+) -> Result<LeaseFreshness, StorageError> {
+    let heartbeat_at = super::codec::parse_time(heartbeat_at)?;
+    let stale_after = heartbeat_at
+        .checked_add(DEFAULT_LEASE_STALE_AFTER)
+        .ok_or_else(|| StorageError::new(StorageErrorKind::InvalidStoredState))?;
+    Ok(if observed_at > stale_after {
+        LeaseFreshness::Stale
+    } else {
+        LeaseFreshness::Fresh
+    })
 }

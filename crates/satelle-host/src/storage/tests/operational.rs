@@ -31,12 +31,12 @@ fn begin_maintenance(
 }
 
 #[test]
-fn operational_evidence_schema_is_migrated_atomically_to_version_ten() {
+fn operational_evidence_schema_is_migrated_atomically_to_version_eleven() {
     let state = TempDir::new().expect("temporary state directory");
     let (storage, _) = Storage::open(state.path()).expect("open storage");
     let connection = storage.connection_for_test();
 
-    assert_eq!(10_i64, pragma_integer(connection, "user_version"));
+    assert_eq!(11_i64, pragma_integer(connection, "user_version"));
     let versions = connection
         .prepare("SELECT version FROM schema_migrations ORDER BY version")
         .unwrap()
@@ -46,15 +46,18 @@ fn operational_evidence_schema_is_migrated_atomically_to_version_ten() {
         .unwrap();
     assert_eq!(
         vec![
-            1_i64, 2_i64, 3_i64, 4_i64, 5_i64, 6_i64, 7_i64, 8_i64, 9_i64, 10_i64,
+            1_i64, 2_i64, 3_i64, 4_i64, 5_i64, 6_i64, 7_i64, 8_i64, 9_i64, 10_i64, 11_i64,
         ],
         versions
     );
     for table in [
+        "sessions",
+        "turns",
         "native_readiness_results",
         "provider_smoke_results",
         "setup_runs",
         "setup_actions",
+        "logs",
     ] {
         let exists: bool = connection
             .query_row(
@@ -69,6 +72,210 @@ fn operational_evidence_schema_is_migrated_atomically_to_version_ten() {
 }
 
 #[test]
+fn version_ten_operation_rows_upgrade_without_data_loss_or_foreign_key_damage() {
+    let state = TempDir::new().expect("temporary state directory");
+    let (mut storage, _) = Storage::open(state.path()).expect("open current storage");
+    let operation_id = "preserved-setup";
+    let plan = SetupRunPlan::new(
+        operation_id,
+        SetupOperationKind::Setup,
+        None,
+        at(1),
+        vec![SetupActionPlan::new("preserved-action", "Preserve action", false).unwrap()],
+    )
+    .unwrap();
+    let _capability = storage
+        .begin_setup_run(&plan, lease_owner(operation_id, at(1)))
+        .expect("persist a version ten setup ledger");
+    storage
+        .connection_for_test()
+        .execute(
+            "INSERT INTO idempotency_records (
+                principal_ref, operation, idempotency_key, operation_id,
+                request_digest, digest_schema_version, hmac_key_version,
+                status, durable_outcome, created_at, expires_at
+             ) VALUES ('preserved-principal', 'run', 'preserved-key',
+                       'preserved-operation', ?1, 1, 1, 'in_progress',
+                       'v1.turn.starting', ?2, ?3)",
+            params![
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                at(1).format(&Rfc3339).unwrap(),
+                at(2).format(&Rfc3339).unwrap(),
+            ],
+        )
+        .expect("persist a version ten idempotency record");
+    storage
+        .connection_for_test()
+        .execute("DELETE FROM schema_migrations WHERE version = 11", [])
+        .expect("remove version eleven history");
+    storage
+        .connection_for_test()
+        .pragma_update(None, "user_version", 10)
+        .expect("mark version ten source schema");
+    drop(storage);
+
+    let upgraded = Storage::open_without_restart_recovery(state.path())
+        .expect("upgrade populated version ten storage");
+    let connection = upgraded.connection_for_test();
+    assert_eq!(11_i64, pragma_integer(connection, "user_version"));
+    assert_eq!(
+        ("run".to_string(), "in_progress".to_string()),
+        connection
+            .query_row(
+                "SELECT operation, status FROM idempotency_records
+                 WHERE principal_ref = 'preserved-principal'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("load migrated idempotency record")
+    );
+    assert_eq!(
+        (
+            "setup".to_string(),
+            "preserved-action".to_string(),
+            "planned".to_string(),
+        ),
+        connection
+            .query_row(
+                "SELECT setup_runs.operation_kind, setup_actions.action_id,
+                        setup_actions.status
+                 FROM setup_runs
+                 JOIN setup_actions ON setup_actions.run_id = setup_runs.run_id
+                 WHERE setup_runs.run_id = ?1",
+                [operation_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("load migrated setup ledger")
+    );
+    let foreign_key_violations = connection
+        .prepare("PRAGMA foreign_key_check")
+        .expect("prepare foreign-key check")
+        .query_map([], |_| Ok(()))
+        .expect("run foreign-key check")
+        .count();
+    assert_eq!(0, foreign_key_violations);
+}
+
+#[test]
+fn durable_operation_vocabularies_are_closed_over_pr04_mutations() {
+    let state = TempDir::new().expect("temporary state directory");
+    let (storage, _) = Storage::open(state.path()).expect("open storage");
+    let connection = storage.connection_for_test();
+    let idempotent_operations = [
+        (IdempotentOperation::Run, "run"),
+        (IdempotentOperation::Steer, "steer"),
+        (IdempotentOperation::Stop, "stop"),
+        (IdempotentOperation::Setup, "setup"),
+        (IdempotentOperation::Repair, "repair"),
+        (IdempotentOperation::HostUpdate, "host_update"),
+        (IdempotentOperation::StorageMigration, "storage_migration"),
+        (
+            IdempotentOperation::DestructiveMaintenance,
+            "destructive_maintenance",
+        ),
+    ];
+    for (operation, token) in idempotent_operations {
+        assert_eq!(
+            token,
+            crate::storage::codec::idempotent_operation_token(operation)
+        );
+        connection
+            .execute(
+                "INSERT INTO idempotency_records (
+                    principal_ref, operation, idempotency_key, operation_id,
+                    request_digest, digest_schema_version, hmac_key_version,
+                    status, durable_outcome, created_at, expires_at
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, 1, 1, 'in_progress',
+                           'v1.turn.starting', ?6, ?7)",
+                params![
+                    format!("principal-{token}"),
+                    token,
+                    format!("key-{token}"),
+                    format!("operation-{token}"),
+                    "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                    at(1).format(&Rfc3339).unwrap(),
+                    at(2).format(&Rfc3339).unwrap(),
+                ],
+            )
+            .unwrap_or_else(|error| panic!("persist {token}: {error}"));
+    }
+    assert!(
+        connection
+            .execute(
+                "INSERT INTO idempotency_records (
+                    principal_ref, operation, idempotency_key, operation_id,
+                    request_digest, digest_schema_version, hmac_key_version,
+                    status, durable_outcome, created_at, expires_at
+                 ) VALUES ('principal-unknown', 'unknown', 'key-unknown',
+                           'operation-unknown', ?1, 1, 1, 'in_progress',
+                           'v1.turn.starting', ?2, ?3)",
+                params![
+                    "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                    at(1).format(&Rfc3339).unwrap(),
+                    at(2).format(&Rfc3339).unwrap(),
+                ],
+            )
+            .is_err()
+    );
+
+    for (kind, token) in [
+        (SetupOperationKind::Setup, "setup"),
+        (SetupOperationKind::Repair, "repair"),
+        (SetupOperationKind::HostUpdate, "host_update"),
+        (SetupOperationKind::StorageMigration, "storage_migration"),
+        (SetupOperationKind::ServiceRestart, "service_restart"),
+    ] {
+        let state = TempDir::new().expect("maintenance state directory");
+        let (mut storage, _) = Storage::open(state.path()).expect("open maintenance storage");
+        let operation_id = format!("maintenance-{token}");
+        let plan = SetupRunPlan::new(
+            &operation_id,
+            kind,
+            None,
+            at(1),
+            vec![SetupActionPlan::new("mutate", "Mutate host state", false).unwrap()],
+        )
+        .unwrap();
+        let capability = storage
+            .begin_setup_run(&plan, lease_owner(&operation_id, at(1)))
+            .expect("acquire Maintenance Lease before mutation");
+        let stored = storage
+            .load_setup_run(&operation_id)
+            .unwrap()
+            .expect("load durable maintenance run");
+        assert_eq!(kind, stored.operation_kind());
+        assert_eq!(
+            (token.to_string(), 1_i64, "planned".to_string()),
+            storage
+                .connection_for_test()
+                .query_row(
+                    "SELECT operation_kind,
+                            (SELECT count(*) FROM maintenance_leases
+                             WHERE operation_id = setup_runs.run_id),
+                            (SELECT status FROM setup_actions
+                             WHERE setup_actions.run_id = setup_runs.run_id)
+                     FROM setup_runs WHERE run_id = ?1",
+                    [&operation_id],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .unwrap()
+        );
+        storage
+            .start_setup_action(&capability, "mutate", at(2))
+            .expect("the acquired capability authorizes the first mutation");
+        assert!(
+            storage
+                .connection_for_test()
+                .execute(
+                    "UPDATE setup_runs SET operation_kind = 'unknown' WHERE run_id = ?1",
+                    [&operation_id],
+                )
+                .is_err()
+        );
+    }
+}
+
+#[test]
 fn newer_schema_history_is_rejected_without_downgrade() {
     let state = TempDir::new().expect("temporary state directory");
     let (storage, _) = Storage::open(state.path()).expect("open current storage");
@@ -76,13 +283,13 @@ fn newer_schema_history_is_rejected_without_downgrade() {
         .connection_for_test()
         .execute(
             "INSERT INTO schema_migrations (version, checksum, applied_at)
-             VALUES (11, ?1, '2026-07-21T00:00:00Z')",
+             VALUES (12, ?1, '2026-07-21T00:00:00Z')",
             ["aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"],
         )
         .expect("insert future migration");
     storage
         .connection_for_test()
-        .pragma_update(None, "user_version", 11)
+        .pragma_update(None, "user_version", 12)
         .expect("mark future schema");
     drop(storage);
 
@@ -93,7 +300,7 @@ fn newer_schema_history_is_rejected_without_downgrade() {
     assert_eq!(error.kind(), StorageErrorKind::MigrationIntegrity);
     let connection = Connection::open(state.path().join(DATABASE_FILE_NAME))
         .expect("future database remains readable");
-    assert_eq!(pragma_integer(&connection, "user_version"), 11);
+    assert_eq!(pragma_integer(&connection, "user_version"), 12);
 }
 
 #[test]
@@ -123,7 +330,7 @@ fn version_seven_api_tokens_upgrade_to_explicit_active_state() {
              ALTER TABLE sessions DROP COLUMN display_name;
              ALTER TABLE session_private_refs DROP COLUMN upstream_goal_ref;
              ALTER TABLE api_tokens DROP COLUMN token_state;
-             DELETE FROM schema_migrations WHERE version IN (8, 9, 10);
+             DELETE FROM schema_migrations WHERE version IN (8, 9, 10, 11);
              PRAGMA user_version = 7;",
         )
         .expect("recreate the version seven token schema");
@@ -131,7 +338,7 @@ fn version_seven_api_tokens_upgrade_to_explicit_active_state() {
 
     let (storage, _) = Storage::open(state.path()).expect("upgrade version seven storage");
     assert_eq!(
-        10_i64,
+        11_i64,
         pragma_integer(storage.connection_for_test(), "user_version")
     );
     let token_state: String = storage
@@ -851,6 +1058,108 @@ fn paired_heartbeat_refresh_updates_both_rows_or_rolls_back() {
 }
 
 #[test]
+fn thirty_second_staleness_never_releases_or_weakens_lease_exclusion() {
+    let control_state = TempDir::new().expect("control state directory");
+    let (mut control, _) = Storage::open(control_state.path()).expect("open control storage");
+    let first = initial_session(&control, SESSION_1, TURN_1, at(0));
+    control
+        .begin_session(
+            &first,
+            &admission(IdempotentOperation::Run, "stale-control", TURN_1, at(0)),
+        )
+        .expect("acquire Control Lease");
+    let control_heartbeat: String = control
+        .connection_for_test()
+        .query_row("SELECT heartbeat_at FROM control_leases", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    for observed_at in [at(29), at(30)] {
+        assert_eq!(
+            LeaseFreshness::Fresh,
+            crate::storage::operational::classify_lease_freshness(&control_heartbeat, observed_at)
+                .unwrap()
+        );
+    }
+    assert_eq!(
+        LeaseFreshness::Stale,
+        crate::storage::operational::classify_lease_freshness(&control_heartbeat, at(31)).unwrap()
+    );
+    let competing = initial_session(&control, SESSION_2, TURN_2, at(31));
+    assert_eq!(
+        StorageErrorKind::LeaseConflict,
+        control
+            .begin_session(
+                &competing,
+                &admission(
+                    IdempotentOperation::Run,
+                    "stale-control-contender",
+                    TURN_2,
+                    at(31),
+                ),
+            )
+            .expect_err("stale Control ownership still blocks admission")
+            .kind()
+    );
+    assert_eq!(
+        1_i64,
+        control
+            .connection_for_test()
+            .query_row("SELECT count(*) FROM control_leases", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap()
+    );
+
+    let maintenance_state = TempDir::new().expect("maintenance state directory");
+    let (mut maintenance, _) =
+        Storage::open(maintenance_state.path()).expect("open maintenance storage");
+    let capability = begin_maintenance(&mut maintenance, "stale-maintenance", None, at(0));
+    let maintenance_heartbeat: String = maintenance
+        .connection_for_test()
+        .query_row("SELECT heartbeat_at FROM maintenance_leases", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(
+        LeaseFreshness::Fresh,
+        crate::storage::operational::classify_lease_freshness(&maintenance_heartbeat, at(30),)
+            .unwrap()
+    );
+    assert_eq!(
+        LeaseFreshness::Stale,
+        crate::storage::operational::classify_lease_freshness(&maintenance_heartbeat, at(31),)
+            .unwrap()
+    );
+    let competing_plan = SetupRunPlan::new(
+        "stale-maintenance-contender",
+        SetupOperationKind::ServiceRestart,
+        None,
+        at(31),
+        vec![SetupActionPlan::new("restart", "Restart service", false).unwrap()],
+    )
+    .unwrap();
+    assert_eq!(
+        StorageErrorKind::LeaseConflict,
+        maintenance
+            .begin_setup_run(
+                &competing_plan,
+                lease_owner("stale-maintenance-contender", at(31)),
+            )
+            .expect_err("stale Maintenance ownership still blocks mutation")
+            .kind()
+    );
+    assert_eq!(
+        capability.operation_id(),
+        maintenance
+            .connection_for_test()
+            .query_row("SELECT operation_id FROM maintenance_leases", [], |row| row
+                .get::<_, String>(0),)
+            .unwrap()
+    );
+}
+
+#[test]
 fn maintenance_postcheck_finalization_commits_readiness_ledger_and_release_atomically() {
     let state = TempDir::new().expect("temporary state directory");
     let (mut storage, _) = Storage::open(state.path()).expect("open storage");
@@ -1282,7 +1591,7 @@ fn version_one_store_upgrades_without_replacing_existing_state() {
              ALTER TABLE sessions DROP COLUMN display_name;
              ALTER TABLE session_private_refs DROP COLUMN upstream_goal_ref;
              ALTER TABLE api_tokens DROP COLUMN token_state;
-             DELETE FROM schema_migrations WHERE version IN (2, 3, 4, 5, 6, 7, 8, 9, 10);
+             DELETE FROM schema_migrations WHERE version IN (2, 3, 4, 5, 6, 7, 8, 9, 10, 11);
              PRAGMA user_version = 1;",
         )
         .unwrap();
@@ -1291,7 +1600,7 @@ fn version_one_store_upgrades_without_replacing_existing_state() {
     let (storage, _) = Storage::open(state.path()).expect("upgrade version one storage");
     assert_eq!(expected_host, storage.host_identity().unwrap());
     assert_eq!(
-        10_i64,
+        11_i64,
         pragma_integer(storage.connection_for_test(), "user_version")
     );
 
@@ -1385,7 +1694,7 @@ fn assert_version_one_corruption_rejected_before_migration(
              ALTER TABLE sessions DROP COLUMN display_name;
              ALTER TABLE session_private_refs DROP COLUMN upstream_goal_ref;
              ALTER TABLE api_tokens DROP COLUMN token_state;
-             DELETE FROM schema_migrations WHERE version IN (2, 3, 4, 5, 6, 7, 8, 9, 10);
+             DELETE FROM schema_migrations WHERE version IN (2, 3, 4, 5, 6, 7, 8, 9, 10, 11);
              PRAGMA user_version = 1;",
         )
         .expect("create a logically corrupt version one store");
@@ -1446,7 +1755,7 @@ fn failed_migration_rolls_back_partial_schema_and_preserves_existing_state() {
              ALTER TABLE sessions DROP COLUMN display_name;
              ALTER TABLE session_private_refs DROP COLUMN upstream_goal_ref;
              ALTER TABLE api_tokens DROP COLUMN token_state;
-             DELETE FROM schema_migrations WHERE version IN (2, 3, 4, 5, 6, 7, 8, 9, 10);
+             DELETE FROM schema_migrations WHERE version IN (2, 3, 4, 5, 6, 7, 8, 9, 10, 11);
              PRAGMA user_version = 1;
              CREATE TABLE migration_sentinel (value TEXT NOT NULL) STRICT;
              INSERT INTO migration_sentinel (value) VALUES ('preserve-me');

@@ -396,25 +396,31 @@ pub(super) fn ensure_control_lease_available(
     host_identity: &HostIdentityRef,
     desktop_binding: &DesktopBindingRef,
 ) -> Result<(), StorageError> {
-    let maintenance: i64 = transaction
+    let maintenance_heartbeat: Option<String> = transaction
         .query_row(
-            "SELECT EXISTS(SELECT 1 FROM maintenance_leases WHERE host_identity_ref = ?1)",
+            "SELECT heartbeat_at FROM maintenance_leases WHERE host_identity_ref = ?1",
             [host_identity.as_str()],
             |row| row.get(0),
         )
+        .optional()
         .map_err(|source| sqlite_error(StorageErrorKind::OperationFailed, source))?;
-    let control: Option<(String, Option<String>)> = transaction
+    let control: Option<(String, Option<String>, String)> = transaction
         .query_row(
-            "SELECT owner_kind, session_id FROM control_leases WHERE host_identity_ref = ?1 AND desktop_binding_ref = ?2",
+            "SELECT owner_kind, session_id, heartbeat_at FROM control_leases
+             WHERE host_identity_ref = ?1 AND desktop_binding_ref = ?2",
             params![host_identity.as_str(), desktop_binding.as_str()],
-            |row| Ok((row.get(0)?, row.get(1)?)),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )
         .optional()
         .map_err(|source| sqlite_error(StorageErrorKind::OperationFailed, source))?;
-    if maintenance != 0 {
+    if let Some(heartbeat_at) = maintenance_heartbeat {
+        let _freshness =
+            super::operational::classify_lease_freshness(&heartbeat_at, OffsetDateTime::now_utc())?;
         return Err(StorageError::new(StorageErrorKind::LeaseConflict));
     }
-    if let Some((owner_kind, session_id)) = control {
+    if let Some((owner_kind, session_id, heartbeat_at)) = control {
+        let _freshness =
+            super::operational::classify_lease_freshness(&heartbeat_at, OffsetDateTime::now_utc())?;
         if matches!(owner_kind.as_str(), "provider_probe" | "native_probe") && session_id.is_none()
         {
             return Err(StorageError::new(StorageErrorKind::LeaseConflict));
