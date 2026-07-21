@@ -69,7 +69,7 @@ fn validate_turn(turn: &PublicTurn) -> Result<(), &'static str> {
 #[serde(deny_unknown_fields)]
 struct PublicSessionWire {
     session_id: SessionId,
-    #[serde(deserialize_with = "Option::deserialize")]
+    #[serde(default, deserialize_with = "Option::deserialize")]
     display_name: Option<String>,
     session_state_revision: SessionStateRevision,
     #[serde(with = "time::serde::rfc3339")]
@@ -265,7 +265,7 @@ mod tests {
     }
 
     #[test]
-    fn public_session_requires_nullable_display_name() {
+    fn public_session_v1_accepts_an_omitted_display_name() {
         let mut wire = starting_session();
         assert!(
             wire.as_object_mut()
@@ -273,7 +273,9 @@ mod tests {
                 .remove("display_name")
                 .is_some()
         );
-        assert!(serde_json::from_value::<PublicSession>(wire).is_err());
+        let session =
+            serde_json::from_value::<PublicSession>(wire).expect("decode a pre-display-name v1");
+        assert_eq!(None, session.display_name());
     }
 
     #[test]

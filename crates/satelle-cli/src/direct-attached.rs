@@ -1,6 +1,7 @@
 use super::{
     AttachedTurnOutcome, DirectTransport, InterruptSource, ProcessInterrupt,
     direct_admission_error, direct_event_error, direct_transport_error,
+    unconfirmed_interrupt_error,
 };
 use satelle_core::session::{PublicSession, TurnAdmissionFailure, TurnState, TurnStateRevision};
 use satelle_core::{
@@ -752,7 +753,7 @@ impl DirectTransport {
             .await
         {
             Ok(_) => SatelleError::interrupted_attached_command(),
-            Err(stop_error) => unconfirmed_stop_interruption(&self.alias, &session_id, stop_error),
+            Err(stop_error) => unconfirmed_interrupt_error(&self.alias, &session_id, stop_error),
         }
     }
 }
@@ -800,35 +801,6 @@ fn interrupted_admission_with_session(
         "status_error_code".to_string(),
         serde_json::Value::String(source.code.as_str().to_string()),
     );
-    error
-}
-
-fn unconfirmed_stop_interruption(
-    alias: &str,
-    session_id: &SessionId,
-    stop_error: SatelleError,
-) -> SatelleError {
-    let status_command = format!("satelle status {session_id} --host {alias}");
-    let mut error = SatelleError::interrupted_attached_command();
-    error.message = format!(
-        "attached command was interrupted, but stop could not be confirmed for Session {session_id}"
-    );
-    error.recovery_command = Some(status_command.clone());
-    error.details.insert(
-        "session_id".to_string(),
-        serde_json::Value::String(session_id.to_string()),
-    );
-    error.details.insert(
-        "status_command".to_string(),
-        serde_json::Value::String(status_command),
-    );
-    error.details.insert(
-        "stop_error_code".to_string(),
-        serde_json::Value::String(stop_error.code.as_str().to_string()),
-    );
-    for (key, value) in stop_error.details {
-        error.details.insert(key, value);
-    }
     error
 }
 
@@ -894,7 +866,7 @@ mod interrupt_output_tests {
             ]),
         };
 
-        let error = unconfirmed_stop_interruption("remote-host", &session_id, stop_error);
+        let error = unconfirmed_interrupt_error("remote-host", &session_id, stop_error);
 
         assert_eq!(error.code, ErrorCode::Interrupted);
         assert_eq!(error.exit_code(), 130);

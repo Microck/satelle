@@ -46,10 +46,11 @@ impl InterruptSource for TestInterrupt {
     fn wait(&self) -> InterruptFuture<'_> {
         Box::pin(async move {
             loop {
+                let notified = self.changed.notified();
                 if self.signalled.load(Ordering::Acquire) {
                     return Ok(());
                 }
-                self.changed.notified().await;
+                notified.await;
             }
         })
     }

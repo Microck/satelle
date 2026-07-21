@@ -242,9 +242,11 @@ impl DaemonClient {
         let (request_builder, request_id) =
             self.mutation_request("/v1/sessions", idempotency_key)?;
         let response: AdmissionCancellationResponse = self.send_authenticated(
-            request_builder
-                .header("Satelle-Admission-Action", "cancel")
-                .json(request),
+            self.admission_request(
+                request_builder
+                    .header("Satelle-Admission-Action", "cancel")
+                    .json(request),
+            ),
             request_id,
             StatusCode::OK,
         )?;
@@ -276,9 +278,11 @@ impl DaemonClient {
         let path = format!("/v1/sessions/{session_id}/turns");
         let (request_builder, request_id) = self.mutation_request(&path, idempotency_key)?;
         let response: AdmissionCancellationResponse = self.send_authenticated(
-            request_builder
-                .header("Satelle-Admission-Action", "cancel")
-                .json(request),
+            self.admission_request(
+                request_builder
+                    .header("Satelle-Admission-Action", "cancel")
+                    .json(request),
+            ),
             request_id,
             StatusCode::OK,
         )?;
