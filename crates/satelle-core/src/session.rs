@@ -533,6 +533,7 @@ impl PublicTurn {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct PublicSession {
     session_id: SessionId,
+    #[serde(skip_serializing)]
     display_name: Option<String>,
     session_state_revision: SessionStateRevision,
     #[serde(with = "time::serde::rfc3339")]
@@ -2040,7 +2041,6 @@ mod tests {
             &[
                 "activity",
                 "created_at",
-                "display_name",
                 "session_id",
                 "session_state_revision",
                 "turns",
@@ -2103,6 +2103,11 @@ mod tests {
 
         assert_eq!(Some("Release desktop"), named.display_name());
         assert_eq!(Some("Release desktop"), named.to_public().display_name());
+        let public_json = serde_json::to_value(named.to_public()).unwrap();
+        assert!(
+            public_json.get("display_name").is_none(),
+            "session v1 must not emit its post-v1 display name"
+        );
         assert_eq!(Some("Release desktop"), named.snapshot().display_name());
         assert_eq!(
             named,

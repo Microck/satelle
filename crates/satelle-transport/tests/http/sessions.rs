@@ -145,6 +145,7 @@ async fn admission_action_is_an_exact_optional_singleton_and_absence_preserves_a
     let body = admitted.bytes().await.expect("read admission response");
     let json: Value = serde_json::from_slice(&body).expect("parse admission response");
     assert_eq!(json["schema_version"], "satelle.session.v1");
+    assert!(json.get("display_name").is_none());
     assert!(json.get("outcome").is_none());
     serde_json::from_slice::<SessionResponse>(&body).expect("decode legacy admission response");
 }

@@ -237,9 +237,14 @@ mod tests {
         let session = serde_json::from_value::<PublicSession>(expected.clone())
             .expect("decode coherent public Session");
         assert_eq!(session.session_id().as_str(), SESSION_ID);
+        let mut serialized = expected;
+        serialized
+            .as_object_mut()
+            .expect("Session fixture is an object")
+            .remove("display_name");
         assert_eq!(
             serde_json::to_value(session).expect("serialize public Session"),
-            expected,
+            serialized,
             "public lifecycle serialization must not expose private upstream or policy fields"
         );
     }

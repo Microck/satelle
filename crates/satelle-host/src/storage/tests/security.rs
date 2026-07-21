@@ -146,7 +146,7 @@ fn private_upstream_refs_are_isolated_from_public_rows_and_logs() {
     assert_eq!(Some("Release desktop"), restored.display_name());
     let public_json =
         serde_json::to_string(&restored.to_public()).expect("serialize public Session");
-    assert!(public_json.contains(r#""display_name":"Release desktop""#));
+    assert!(!public_json.contains("display_name"));
     assert_privacy_canaries_absent(
         "storage public Session",
         public_json.as_bytes(),
