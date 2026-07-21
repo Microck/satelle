@@ -842,6 +842,28 @@ fn probe_cancellation_observation(
     }
 }
 
+fn preflight_cancellation_observation(result: &AdapterPreflight) -> StopObservation {
+    match result {
+        AdapterPreflight::ProviderFailed { error, .. }
+        | AdapterPreflight::UncachedFailure(error) => probe_cancellation_observation(
+            probe_dispatch_possible(error),
+            error,
+            "provider_smoke_cancellation",
+        ),
+        AdapterPreflight::Failed {
+            error,
+            dispatch_possible,
+            ..
+        } => probe_cancellation_observation(
+            *dispatch_possible,
+            error,
+            "native_readiness_cancellation",
+        ),
+        AdapterPreflight::Cancelled(observation) => *observation,
+        AdapterPreflight::Ready(_) => StopObservation::UpstreamInactiveConfirmed,
+    }
+}
+
 fn provider_smoke_session_failure(error: CodexSessionError) -> SatelleError {
     let (code, reason) = match error {
         CodexSessionError::Timeout => (
@@ -1237,18 +1259,7 @@ impl ReadinessProbeDriver for ProductionComputerUseAdapter {
             &mut persistence,
         );
         if cancellation.is_requested() {
-            let observation = match &result {
-                AdapterPreflight::ProviderFailed { error, .. }
-                | AdapterPreflight::Failed { error, .. }
-                | AdapterPreflight::UncachedFailure(error) => probe_cancellation_observation(
-                    probe_dispatch_possible(error),
-                    error,
-                    "provider_smoke_cancellation",
-                ),
-                AdapterPreflight::Cancelled(observation) => *observation,
-                AdapterPreflight::Ready(_) => StopObservation::UpstreamInactiveConfirmed,
-            };
-            AdapterPreflight::Cancelled(observation)
+            AdapterPreflight::Cancelled(preflight_cancellation_observation(&result))
         } else {
             result
         }
@@ -1737,6 +1748,53 @@ mod tests {
                 "provider_smoke_cancellation",
             ),
             StopObservation::OutcomeUnknown
+        );
+    }
+
+    #[test]
+    fn cancelled_native_preflight_uses_native_terminal_detail() {
+        let desktop_binding = DesktopBindingRef::new("desktop-native-cancellation").unwrap();
+        let policy = ExecutionPolicy::new(
+            EffectiveModelRef::new("model-native-cancellation").unwrap(),
+            ProviderBindingRef::new("provider-native-cancellation").unwrap(),
+            DesktopTarget::new(desktop_binding.clone()),
+            ApprovalPolicy::OnRequest,
+            SandboxPolicy::WorkspaceWrite,
+            TimeoutPolicy::bounded_seconds(120).unwrap(),
+            ExperimentalFeatureChoices::new(FeatureChoice::Enabled, FeatureChoice::Enabled),
+        );
+        let key = ReadinessCacheKey::new(
+            NATIVE_ADAPTER,
+            desktop_binding,
+            policy,
+            "0.144.0",
+            "codex-native-0.144.0",
+            None::<String>,
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        )
+        .unwrap();
+        let observed_at = time::OffsetDateTime::UNIX_EPOCH;
+        let evidence = key
+            .evidence(
+                "native-readiness-cancelled",
+                observed_at,
+                observed_at + time::Duration::hours(24),
+            )
+            .unwrap();
+        let failure =
+            native_readiness_timeout_after_cancellation(StopObservation::CancellationConfirmed);
+        let result = AdapterPreflight::Failed {
+            key,
+            evidence,
+            reason: failure.reason,
+            error: mark_probe_dispatch_possible(*failure.error, failure.dispatch_possible),
+            dispatch_possible: failure.dispatch_possible,
+        };
+
+        assert_eq!(
+            preflight_cancellation_observation(&result),
+            StopObservation::CancellationConfirmed
         );
     }
 
