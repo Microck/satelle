@@ -335,11 +335,37 @@ impl LocalTransport {
             tokio::select! {
                 biased;
                 signal = interrupt.wait() => {
-                    signal.map_err(|error| {
-                        TurnAdmissionFailure::not_admitted(SatelleError::host_unreachable(
-                            &format!("{alias} ({error})"),
-                        ))
-                    })?;
+                    if let Err(error) = signal {
+                        cancellation.request();
+                        let wait_error =
+                            SatelleError::host_unreachable(&format!("{alias} ({error})"));
+                        let result = operation.await.map_err(|_| {
+                            TurnAdmissionFailure::admission_unknown(wait_error.clone())
+                        })?;
+                        return Err(match result {
+                            Ok(outcome) => match cancellation.admitted_handle() {
+                                Some((_, turn_id)) => TurnAdmissionFailure::admitted(
+                                    wait_error,
+                                    outcome.session,
+                                    turn_id,
+                                ),
+                                None => TurnAdmissionFailure::admission_unknown(wait_error),
+                            },
+                            Err(TurnAdmissionFailure::NotAdmitted(_)) => {
+                                TurnAdmissionFailure::not_admitted(wait_error)
+                            }
+                            Err(TurnAdmissionFailure::AdmissionUnknown(_)) => {
+                                TurnAdmissionFailure::admission_unknown(wait_error)
+                            }
+                            Err(TurnAdmissionFailure::Admitted {
+                                session, turn_id, ..
+                            }) => TurnAdmissionFailure::admitted(
+                                wait_error,
+                                *session,
+                                turn_id,
+                            ),
+                        });
+                    }
                     cancellation.request();
                     let Some((admitted_session_id, turn_id)) = cancellation.admitted_handle() else {
                         let result = operation.await.map_err(|_| {

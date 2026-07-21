@@ -56,6 +56,19 @@ impl InterruptSource for TestInterrupt {
     }
 }
 
+struct FailingWaitInterrupt {
+    operation_started: TestLatch,
+}
+
+impl InterruptSource for FailingWaitInterrupt {
+    fn wait(&self) -> InterruptFuture<'_> {
+        Box::pin(async move {
+            self.operation_started.wait();
+            Err(std::io::Error::other("injected interrupt listener failure"))
+        })
+    }
+}
+
 #[derive(Clone, Default)]
 struct ArmOrderInterrupt {
     armed: Arc<AtomicBool>,
@@ -1039,6 +1052,62 @@ fn injected_interrupt_before_local_run_admission_cancels_without_creating_a_turn
         0
     );
     assert_eq!(adapter.stop_calls.load(Ordering::SeqCst), 0);
+}
+
+#[test]
+fn local_interrupt_wait_failure_reconciles_the_spawned_operation() {
+    let state = TestStateDir::new().expect("temporary state directory");
+    let adapter = InterruptLifecycleAdapter::default();
+    adapter.block_preflight();
+    let service = HostService::with_adapter_for_tests_at(state.path(), adapter.clone())
+        .expect("construct interrupt lifecycle Host");
+    let transport = LocalTransport::new(LOCAL_DEMO_HOST.to_string(), service.clone());
+    let interrupt = FailingWaitInterrupt {
+        operation_started: adapter.preflight_started.clone(),
+    };
+    let (result_sender, result_receiver) = mpsc::sync_channel(1);
+    let command = thread::spawn(move || {
+        let result = transport.attached_with_interrupt(
+            None,
+            TurnIntent::new(
+                "reconcile failed local interrupt listener",
+                satelle_core::session::TurnExecutionMode::Standard,
+            )
+            .expect("construct run intent"),
+            false,
+            &interrupt,
+        );
+        result_sender
+            .send(result)
+            .expect("test result receiver remains connected");
+    });
+    assert!(
+        adapter.preflight_started.wait_for(Duration::from_secs(2)),
+        "preflight must be active before the listener fails"
+    );
+    if let Ok(result) = result_receiver.recv_timeout(Duration::from_millis(100)) {
+        adapter.preflight_release.signal();
+        let _ = command.join();
+        panic!("listener failure returned before reconciling the operation: {result:?}");
+    }
+
+    adapter.preflight_release.signal();
+    let failure = result_receiver
+        .recv_timeout(Duration::from_secs(2))
+        .expect("operation must reconcile after preflight exits")
+        .expect_err("listener failure must fail the attached command");
+    command.join().expect("command thread must not panic");
+
+    assert_eq!(failure.phase(), TurnAdmissionPhase::NotAdmitted);
+    assert_eq!(failure.error().code, ErrorCode::HostUnreachable);
+    assert_eq!(
+        service
+            .daemon_runtime_status()
+            .expect("read Host status")
+            .session_count(),
+        0,
+        "failed interrupt observation must not leave a local Session running"
+    );
 }
 
 #[test]
