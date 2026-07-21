@@ -39,7 +39,7 @@
 - a Satelle Readiness Result is a timestamped capability result whose validity is bounded by its cache key, expiry, and invalidation conditions @spec @mvp
 - Satelle YOLO Mode is an explicit unsafe execution mode that asks Codex to bypass Codex-controlled approvals and sandboxing where the compatible Codex control plane supports those settings @spec @mvp
 - a Satelle Provider Probe Surface is an ephemeral local UI served by the Host Daemon to verify that a selected model and provider can observe and act through native Computer Use @spec @mvp
-- a Satelle Event is a stable JSON lifecycle record emitted by attached run and steer commands or Host Daemon event streams @spec @mvp
+- a Satelle Event is a stable JSON lifecycle record emitted by attached run and steer commands or Host Daemon event streams @spec @mvp @implemented
 - a Satelle Setup Action Ledger is the Host Daemon-owned record of setup, repair, update, migration, and other specified maintenance action plans, status changes, partial failures, and recovery metadata for a controlled Host @spec @mvp
 - a Satelle Setup Component is a named onboarding responsibility that setup can plan, report, and selectively target without changing the default setup contract @spec @mvp
 - a Satelle Trusted Profile is a user-level profile explicitly allowed by the local OS user to supply noninteractive mutation consent for configured command families and Host Aliases @spec @mvp
@@ -123,7 +123,7 @@
 - satelle --events json remains an NDJSON event-stream selector and is not an alias for final-result --format json @mvp @implemented
 - satelle run and steer report a typed output-mode-conflict usage error when --events json is combined with --json or any explicit --format value @contract @mvp @implemented
 - satelle doctor reports a typed output-mode-conflict usage error when --events is combined with --json or any explicit --format value @contract @mvp @implemented
-- satelle run, steer, stop, status, setup, repair, doctor, config check, config explain, self update, host update, paths, and host sessions JSON results include a top-level schema_version @spec @contract @mvp
+- satelle run, steer, stop, status, setup, repair, doctor, config check, config explain, self update, host update, paths, and host sessions JSON results include a top-level schema_version @spec @contract @mvp @implemented
 - satelle run JSON v2 uses schema_version satelle.run.v2 @contract @mvp @implemented
 - satelle steer JSON v2 uses schema_version satelle.steer.v2 @contract @mvp @implemented
 - id: i3f
@@ -387,12 +387,12 @@
 - satelle Satelle Event stream-terminal types are command_failed, turn_completed, turn_blocked, turn_failed, and turn_stopped @implemented @mvp
 - when attached satelle run or steer with --events json fails after a nonempty Host Alias is known from explicit selection or successful resolution, its final stdout record is exactly one command_failed Satelle Event with source cli and null envelope session_id, turn_id, and state_subject @contract @mvp @implemented
 - command_failed Satelle Event data contains the originating SatelleError as code, message, recovery_command, source_detail, and details, plus admission_phase with exactly not_admitted, admission_unknown, or admitted and durable session_id and turn_id; absent recovery_command or source_detail is null, absent details is an empty object, admitted failures contain their durable identifiers, and other failures contain null identifiers @contract @mvp @implemented
-- satelle does not remove fields, change field meanings, or rename enum tokens within one Satelle Event schema_version @spec @mvp
-- satelle may add optional Satelle Event fields or event types within one schema_version only when older consumers can ignore them safely @spec @mvp
-- satelle breaking Satelle Event wire changes require a new schema_version @spec @mvp
+- satelle does not remove fields, change field meanings, or rename enum tokens within one Satelle Event schema_version @spec @mvp @implemented
+- satelle may add optional Satelle Event fields or event types within one schema_version only when older consumers can ignore them safely @spec @mvp @implemented
+- satelle breaking Satelle Event wire changes require a new schema_version @spec @mvp @implemented
 - satelle run JSON final-output mode without JSON event streaming emits one final JSON object instead of newline-delimited event objects @implemented @mvp
 - satelle run JSON event streaming emits newline-delimited JSON event objects and includes a terminal event containing the final outcome or typed error details @implemented @mvp
-- satelle run and steer --events json emit exactly one terminal event as the final stdout record and do not emit a separate final-result JSON object after that event @spec @contract @mvp
+- satelle run and steer --events json emit exactly one terminal event as the final stdout record and do not emit a separate final-result JSON object after that event @spec @contract @mvp @implemented
 - satelle detach mode returns immediately with the session identifier and does not attach to the live event stream @implemented @mvp
 - satelle JSON output reports effective timeout values as numeric millisecond fields with names ending in _timeout_ms instead of requiring automation to parse human duration strings @implemented @mvp
 - satelle run prints a concise non-blocking preflight summary by default before starting execution on a ready host @spec @mvp
@@ -429,7 +429,7 @@
 - satelle help text for --experimental-provider-computer-use states that the mode is experimental, non-OpenAI provider behavior may not work correctly, and a live provider Computer Use smoke test is still required @implemented @mvp
 - satelle steer can add a new turn to the same Satelle session and underlying Codex thread after the previous turn or goal completed @implemented @mvp
 - satelle steer updates session lifecycle metadata to reflect the new active turn while preserving previous turn history @implemented @mvp
-- satelle stop stops the active Turn in a Session by default without stopping the Host Daemon lifecycle @spec @mvp
+- satelle stop stops the active Turn in a Session by default without stopping the Host Daemon lifecycle @spec @mvp @implemented
 - id: hav
   label: satelle stop preserves the Session and records the active Turn as stopped instead of deleting the Session
   command: cargo test --locked -p satelle-cli --features test-support --test cli stopping_detached_turn_returns_exact_stop_contract -- --exact
@@ -783,11 +783,11 @@
 - every Host Daemon JSON response and error declares one Satelle API schema version @spec @mvp @implemented
 - satelle rejects unsupported API schema versions before executing an operation @spec @mvp @implemented
 - satelle rejects incompatible CLI and Host Daemon protocol versions before executing a mutating request @spec @contract @mvp @implemented
-- authenticated Host Daemon mutations require exactly one Satelle-Protocol-Version header whose value is a canonical unsigned decimal without leading zeroes, and MVP supports only value 2 @spec @contract @mvp @implemented
+- authenticated Host Daemon mutations require exactly one Satelle-Protocol-Version header whose value is a canonical unsigned decimal without leading zeroes, and MVP supports only value 4 @spec @contract @mvp @implemented
 - protocol compatibility is checked after authentication, control-scope authorization, request correlation, and Host Identity pinning but before mutation query or cookie validation, control rate limiting, idempotency validation, request-body decoding, or Host calls @spec @contract @mvp @implemented
 - missing, malformed, duplicate, and unsupported Satelle-Protocol-Version values return HTTP 426 with code incompatible-protocol, category compatibility, retryable false, and schema_version satelle.error.v1 @spec @contract @mvp @implemented
-- incompatible-protocol details contain exactly reason, supported_versions, and received_version; reason is missing, malformed, duplicate, or unsupported, supported_versions is ["2"], received_version is the validated canonical unsupported token or null, and arbitrary header bytes are never reflected @spec @contract @mvp @implemented
-- DaemonClient sends Satelle-Protocol-Version 2 on every mutating request and does not require the header for authenticated reads used to diagnose or recover version skew @spec @contract @mvp @implemented
+- incompatible-protocol details contain exactly reason, supported_versions, and received_version; reason is missing, malformed, duplicate, or unsupported, supported_versions is ["4"], received_version is the validated canonical unsupported token or null, and arbitrary header bytes are never reflected @spec @contract @mvp @implemented
+- DaemonClient sends Satelle-Protocol-Version 4 on every mutating request and does not require the header for authenticated reads used to diagnose or recover version skew @spec @contract @mvp @implemented
 - POST /v1/sessions, POST /v1/sessions/{session_id}/turns, POST /v1/sessions/{session_id}/stop, POST /v1/setup/api-token, POST /v1/setup/api-token/{token_id}/activate, and POST /v1/setup/api-token/{token_id}/abort enforce protocol compatibility, and future POST /v1/doctor routes use the same mutation gate when implemented @spec @contract @mvp @implemented
 - satelle API JSON decoding rejects unknown fields instead of ignoring misspelled security, authority, or execution-policy fields @spec @mvp @implemented
 - satelle API endpoints reject unsupported content types before reading operation data @spec @mvp @implemented
@@ -1462,12 +1462,12 @@
 - a stop request that cannot confirm upstream cancellation reports stop-not-confirmed instead of persisting a false stopped state @mvp @implemented
 - stop-not-confirmed leaves the Turn nonterminal, preserves running when the same upstream Turn is known active or recovery_pending when its state is ambiguous, and retains the Control Lease @mvp @implemented
 - satelle stop is idempotent for the same Session, Turn, and idempotency key @mvp @implemented
-- transport disconnection does not stop a remote Turn @spec @mvp
-- satelle run and steer support --detach-on-interrupt to leave an already-created remote Turn running when the attached CLI receives Ctrl-C @spec @mvp
-- satelle reports a typed interrupt-mode-conflict usage error when --detach-on-interrupt and --detach are combined @spec @mvp
-- interrupting an attached run or steer command after Turn creation sends a stop request before the CLI exits unless --detach-on-interrupt was selected @spec @mvp
-- interrupting run or steer before Turn creation requests cancellation of any active readiness or provider probe without sending a stop request for a nonexistent prompt Turn; it releases the Control Lease only after probe termination is confirmed and otherwise leaves recovery_pending ownership for reconciliation @spec @mvp
-- an attached CLI that cannot confirm stop after interruption prints the Session identifier and a status recovery command before exiting 130 @spec @mvp
+- transport disconnection does not stop a remote Turn @spec @mvp @implemented
+- satelle run and steer support --detach-on-interrupt to leave an already-created remote Turn running when the attached CLI receives Ctrl-C @spec @mvp @implemented
+- satelle reports a typed interrupt-mode-conflict usage error when --detach-on-interrupt and --detach are combined @spec @mvp @implemented
+- interrupting an attached run or steer command after Turn creation sends a stop request before the CLI exits unless --detach-on-interrupt was selected @spec @mvp @implemented
+- interrupting run or steer before Turn creation requests cancellation of any active readiness or provider probe without sending a stop request for a nonexistent prompt Turn; it releases the Control Lease only after probe termination is confirmed and otherwise leaves recovery_pending ownership for reconciliation @spec @mvp @implemented
+- an attached CLI that cannot confirm stop after interruption prints the Session identifier and a status recovery command before exiting 130 @spec @mvp @implemented
 - id: zpt
   label: Host Daemon startup marks every stored nonterminal Turn as recovery_pending before accepting a new Turn for the same Control Lease
   command: cargo test --locked -p satelle-host --lib runtime::tests::unknown_restart_work_blocks_new_admission_until_stop_resolves_it -- --exact
@@ -1479,15 +1479,15 @@
 - the Host Daemon never admits a new Turn while previous Turn ownership remains ambiguous @mvp @implemented
 
 ## public-identity-and-retention
-- satelle exposes Satelle-owned Session identifiers to CLI users and JSON output consumers instead of exposing Codex thread IDs as the public Session contract @spec @mvp
+- satelle exposes Satelle-owned Session identifiers to CLI users and JSON output consumers instead of exposing Codex thread IDs as the public Session contract @spec @mvp @implemented
 - satelle session identifiers are opaque unique IDs suitable for scripts instead of human-readable prompt-derived slugs @implemented @mvp
 - satelle Session identifiers use the exact rs_ prefix followed by a canonical lowercase UUIDv7 @contract @mvp @implemented
 - satelle Turn identifiers use the exact rt_ prefix followed by a canonical lowercase UUIDv7 @contract @mvp @implemented
 - public turn_id fields always contain Satelle Turn identifiers and never upstream Codex turn identifiers @spec @contract @mvp @implemented
-- satelle sessions may have optional display names for human listing without making display names the primary identifier @spec @mvp
-- satelle never exposes Codex thread, turn, goal, app-server request, or provider request identifiers in public CLI, API, MCP, event, log, or diagnostic contracts @spec @mvp
+- satelle sessions may have optional display names for human listing without making display names the primary identifier @spec @mvp @implemented
+- satelle never exposes Codex thread, turn, goal, app-server request, or provider request identifiers in public CLI, API, MCP, event, log, or diagnostic contracts @spec @mvp @implemented
 - satelle MVP allows multiple stored Sessions per Host but only one active native Computer Use Turn per Control Lease at a time @mvp @implemented
-- satelle run and steer report a typed host-busy error when they would start a second active Computer Use Turn for the same Control Lease @spec @mvp
+- satelle run and steer report a typed host-busy error when they would start a second active Computer Use Turn for the same Control Lease @spec @mvp @implemented
 - satelle MVP does not automatically queue run or steer commands when a host is busy @implemented @mvp
 - satelle later explicit queueing is disabled by default and never changes MVP host-busy behavior unless the user opts in for the selected Host, selected profile, or specific run or steer command @spec @later
 - satelle run and steer use --queue as the exact per-command queue opt-in @spec @later
@@ -1518,7 +1518,7 @@
 - queued prompt payloads and attachments are deleted after Turn admission, cancellation, expiry, or bounded crash-recovery cleanup @spec @later
 - satelle queue status and logs expose queued position, enqueue time, expiry time, and normalized pre-start failure without exposing raw prompt or attachment content @spec @later
 - Satelle Events distinguish turn_queued, queue_position_changed, turn_dequeued, turn_queue_cancelled, turn_queue_expired, and turn_queue_validation_failed @spec @later
-- satelle maps each Satelle session to the underlying Codex thread, turn, and goal identifiers inside the Host Daemon adapter layer @spec @mvp
+- satelle maps each Satelle session to the underlying Codex thread, turn, and goal identifiers inside the Host Daemon adapter layer @spec @mvp @implemented
 - the Host Daemon durably persists each newly observed upstream Codex thread or Turn identifier before the Codex adapter continues waiting for later upstream work @mvp @implemented
 - persisting an upstream Codex identifier does not change Session or Turn lifecycle state, state revisions, safe logs, idempotency outcomes, or Control Lease ownership @mvp @implemented
 - recording the same upstream Codex identifier again is idempotent, while recording a different identifier for the same Session or Turn fails closed without overwriting the original @mvp @implemented
@@ -1940,7 +1940,7 @@
 - incompatible-control-plane admission maps run to session_creation, turn_start, and event_observation; steer to steering and event_observation; and an active stop to cancellation and event_observation @implemented @contract @mvp
 - ordinary durable Session status reads and already-terminal stop outcomes do not require live Codex control-plane admission @implemented @contract @mvp
 - upstream restart recovery admission requires both status and steering before external Codex observation @implemented @contract @mvp
-- optional Codex goal methods are capability-gated and never block core Session and Turn control when goals are unavailable @spec @mvp
+- optional Codex goal methods are capability-gated and never block core Session and Turn control when goals are unavailable @spec @mvp @implemented
 - unknown app-server notifications are ignored or normalized without changing committed Satelle state @spec @mvp @implemented
 - raw app-server messages never enter normal logs, errors, events, or SQLite records @spec @mvp @implemented
 - satelle reports a typed incompatible-control-plane error when the remote Codex runtime cannot expose the required app-server protocol @implemented @mvp
@@ -1971,7 +1971,7 @@
 - satelle persistent service installation may reuse the same host binary that on-demand bootstrap uses @spec @mvp
 - satelle clients communicate with a Satelle-specific API instead of speaking the Codex app-server protocol directly @spec @mvp @implemented
 - satelle Host Daemon treats the Codex app-server protocol as an internal adapter boundary behind the Satelle API @spec @mvp @implemented
-- satelle API exposes host readiness, sessions, goals, turns, state, logs, and errors as Satelle concepts independent from Codex protocol details @spec @mvp
+- satelle API exposes host readiness, sessions, goals, turns, state, logs, and errors as Satelle concepts independent from Codex protocol details @spec @mvp @implemented
 - a first Satelle Turn starts one Codex thread, while a follow-up Turn resumes the Session's persisted private Codex thread reference before starting another Codex turn @implemented @mvp
 - the runtime passes the committed Turn Execution Policy and any persisted private Codex thread reference to the adapter before app-server execution begins @spec @mvp @implemented
 - the private Codex app-server process starts in an owner-private Host Daemon working directory whose canonical path is outside every detected project checkout, including when configured ancestors are symlinks @implemented @mvp
