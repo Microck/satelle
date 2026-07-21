@@ -1561,6 +1561,55 @@ fn identical_follower_receives_the_exact_pre_durable_leader_error() {
 }
 
 #[test]
+fn retry_joins_the_published_result_before_capacity_clears() {
+    let capacity = Arc::new(OperationCapacity::default());
+    capacity.pause_next_result_before_clear();
+
+    let leader_capacity = Arc::clone(&capacity);
+    let leader = std::thread::spawn(move || {
+        leader_capacity.execute(
+            operation_request("principal-a", "key-a", DIGEST_A),
+            || Ok(None),
+            || {
+                Err(crate::runtime::integrity_error(
+                    "the authoritative pre-durable failure",
+                ))
+            },
+        )
+    });
+    assert!(
+        capacity.wait_for_result_before_clear(WAIT_LIMIT),
+        "the leader must publish its result before releasing capacity"
+    );
+
+    let retry_capacity = Arc::clone(&capacity);
+    let retry = std::thread::spawn(move || {
+        retry_capacity.execute(
+            operation_request("principal-a", "key-a", DIGEST_A),
+            || Ok(None),
+            || panic!("an identical retry must not become a second leader"),
+        )
+    });
+    if !capacity.wait_for_follower_registration(WAIT_LIMIT) {
+        capacity.release_result_before_clear();
+        let _ = leader.join();
+        let _ = retry.join();
+        panic!("the retry did not join the published in-flight result");
+    }
+    capacity.release_result_before_clear();
+
+    let leader_error = match leader.join().expect("leader thread must not panic") {
+        Ok(_) => panic!("leader operation must fail"),
+        Err(error) => error,
+    };
+    let retry_error = match retry.join().expect("retry thread must not panic") {
+        Ok(_) => panic!("retry must share the leader failure"),
+        Err(error) => error,
+    };
+    assert_same_error(&leader_error, &retry_error);
+}
+
+#[test]
 fn matching_in_memory_request_wins_over_an_in_progress_durable_replay() {
     let capacity = Arc::new(OperationCapacity::default());
     let durable_starting = coordinator_result_session();

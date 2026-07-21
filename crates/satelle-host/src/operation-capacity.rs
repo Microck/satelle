@@ -76,6 +76,8 @@ pub(crate) struct OperationCapacity {
     test_cancellations: Mutex<Vec<(OperationRequest, AdmissionCancellationOutcome)>>,
     #[cfg(test)]
     cancellation_request_pause: TestCancellationRequestPause,
+    #[cfg(test)]
+    result_publication_pause: TestCancellationRequestPause,
 }
 
 impl fmt::Debug for OperationCapacity {
@@ -98,6 +100,8 @@ impl Default for OperationCapacity {
             test_cancellations: Mutex::new(Vec::new()),
             #[cfg(test)]
             cancellation_request_pause: TestCancellationRequestPause::default(),
+            #[cfg(test)]
+            result_publication_pause: TestCancellationRequestPause::default(),
         }
     }
 }
@@ -639,6 +643,21 @@ impl OperationCapacity {
     pub(crate) fn release_cancellation_before_request(&self) {
         self.cancellation_request_pause.release();
     }
+
+    #[cfg(test)]
+    pub(crate) fn pause_next_result_before_clear(&self) {
+        self.result_publication_pause.arm();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn wait_for_result_before_clear(&self, timeout: std::time::Duration) -> bool {
+        self.result_publication_pause.wait_until_paused(timeout)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn release_result_before_clear(&self) {
+        self.result_publication_pause.release();
+    }
 }
 
 #[cfg(test)]
@@ -903,8 +922,10 @@ impl<'a> CapacityLeader<'a> {
         {
             result = Err(error);
         }
-        self.capacity.finalize_and_clear(&self.entry);
         self.entry.complete_locked(&mut stored, result.clone());
+        #[cfg(test)]
+        self.capacity.result_publication_pause.pause_if_armed();
+        self.capacity.finalize_and_clear(&self.entry);
         self.finished = true;
         result
     }
@@ -916,13 +937,15 @@ impl Drop for CapacityLeader<'_> {
             return;
         }
         let mut stored = self.entry.lock_result();
-        self.capacity.finalize_and_clear(&self.entry);
         self.entry.complete_locked(
             &mut stored,
             Err(crate::runtime::integrity_error(
                 "the in-flight operation terminated before producing a result",
             )),
         );
+        #[cfg(test)]
+        self.capacity.result_publication_pause.pause_if_armed();
+        self.capacity.finalize_and_clear(&self.entry);
     }
 }
 
