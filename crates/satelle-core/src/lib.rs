@@ -647,6 +647,12 @@ pub fn resolve_invocation_profile(
     Ok(Some(selected_profile))
 }
 
+pub fn load_user_api_rate_limits(user_config_path: &Path) -> Result<ApiRateLimits, SatelleError> {
+    Ok(read_user_config_file(user_config_path)?
+        .and_then(|config| config.config.api_rate_limits)
+        .unwrap_or_default())
+}
+
 pub fn load_config(cwd: &Path, flag_profile: Option<&str>) -> Result<ResolvedConfig, SatelleError> {
     let paths = resolve_path_set(cwd)?;
     let user_config_path = paths.config_file;
@@ -1037,6 +1043,38 @@ websocket_inbound_messages_per_minute = 67
                 .expect_err("reject a zero API rate limit");
             assert_eq!(error.code, ErrorCode::ConfigError, "key={key}");
         }
+    }
+
+    #[test]
+    fn user_rate_limit_loader_reads_only_the_explicit_user_file() {
+        let root = tempfile::tempdir().expect("create config root");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700))
+                .expect("secure config root");
+        }
+        let config_root = root.path().join("config");
+        let _config_root =
+            open_or_create_owner_only_directory(&config_root).expect("create config boundary");
+        let user_config = config_root.join("user.toml");
+        let mut user_file =
+            open_or_create_owner_only_file(&user_config).expect("create user config");
+        std::io::Write::write_all(
+            &mut user_file,
+            b"[api_rate_limits]\ncontrol_requests_per_minute = 45\n",
+        )
+        .expect("write user rate policy");
+        drop(user_file);
+        std::fs::write(
+            root.path().join("project.toml"),
+            "default_host = \"missing\"\n",
+        )
+        .expect("write unrelated invalid project selection");
+
+        let limits =
+            load_user_api_rate_limits(&user_config).expect("load only user-owned rate policy");
+        assert_eq!(limits.control_requests_per_minute(), 45);
     }
 
     #[test]

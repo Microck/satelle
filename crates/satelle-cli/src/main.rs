@@ -31,9 +31,9 @@ use satelle_core::{
     HostSessionsReport, LOCAL_DEMO_HOST, OwnerOnlyDirectory, PRODUCT_NAME, ProfileField,
     RELAY_ROSE, ResolvedConfig, SUCCESS_GREEN, SatelleError, SatelleEvent, SatelleEventBody,
     SecureFileError, SessionId, SetupMode, SetupReport, SetupRequiredInput, load_config,
-    open_or_create_owner_only_directory, open_or_create_owner_only_file, open_owner_only_directory,
-    read_owner_controlled_config_file, read_owner_only_secret_config_file, resolve_path_set,
-    utc_now,
+    load_user_api_rate_limits, open_or_create_owner_only_directory, open_or_create_owner_only_file,
+    open_owner_only_directory, read_owner_controlled_config_file,
+    read_owner_only_secret_config_file, resolve_path_set, utc_now,
 };
 use satelle_host::{
     ApiBearerToken, HostService, ProviderComputerUseIntent, contains_api_bearer_token,
@@ -3485,7 +3485,9 @@ fn start_host_daemon(
         })
     })?;
     let tls = daemon_tls_config(&command)?;
-    let api_rate_limits = config.load()?.config.api_rate_limits.unwrap_or_default();
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let user_config_path = resolve_path_set(&cwd).map_err(failure)?.config_file;
+    let api_rate_limits = load_user_api_rate_limits(&user_config_path).map_err(failure)?;
 
     // Durable SSH relaunch must reopen the same default state store used by
     // bootstrap token issuance. The Controller has already resolved the idle
