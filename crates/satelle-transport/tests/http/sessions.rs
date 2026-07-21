@@ -16,6 +16,33 @@ const CROSS_SESSION_TURN_KEY: &str = "01890a5d-ac96-7b7c-8f89-37c3d0a66f05";
 const STALE_STOP_KEY: &str = "01890a5d-ac96-7b7c-8f89-37c3d0a66f06";
 
 #[tokio::test]
+async fn cancelled_admission_replay_returns_a_stable_conflict() {
+    let running = RunningServer::start(ApiScopes::CONTROL).await;
+    let request = TurnRequest::new("PRIVATE_CANCELLED_ADMISSION_REPLAY_CANARY");
+    let cancelled: AdmissionCancellationResponse = running
+        .mutation("/v1/sessions", CREATE_KEY)
+        .header("Satelle-Admission-Action", "cancel")
+        .json(&request)
+        .send()
+        .await
+        .expect("cancel run admission")
+        .json()
+        .await
+        .expect("decode run cancellation");
+    assert_eq!(cancelled.outcome(), AdmissionCancellationOutcome::Cancelled);
+
+    let replay = running
+        .mutation("/v1/sessions", CREATE_KEY)
+        .json(&request)
+        .send()
+        .await
+        .expect("replay cancelled admission");
+    assert_eq!(replay.status(), StatusCode::CONFLICT);
+    let error: ApiError = replay.json().await.expect("decode replay conflict");
+    assert_eq!(error.code(), satelle_transport::ApiErrorCode::StateConflict);
+}
+
+#[tokio::test]
 async fn existing_admission_routes_return_exact_committed_handles_when_cancel_arrives_late() {
     let running = RunningServer::start(ApiScopes::CONTROL).await;
     let run_request = TurnRequest::new("PRIVATE_LATE_RUN_CANCELLATION_CANARY");

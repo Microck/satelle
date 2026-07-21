@@ -209,7 +209,7 @@ impl OperationCapacity {
             match replayed {
                 DurableAdmissionOutcome::Admitted(replayed) => return Ok(replayed),
                 DurableAdmissionOutcome::Cancelled | DurableAdmissionOutcome::RecoveryPending => {
-                    return Err(SatelleError::interrupted_attached_command());
+                    return Err(SatelleError::state_conflict());
                 }
                 DurableAdmissionOutcome::Missing => {}
             }

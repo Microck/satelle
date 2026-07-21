@@ -38,7 +38,7 @@ fn cancellation_registered_before_run_uses_the_same_gate_and_prevents_admission(
     let admission_error = service
         .admit_run(&intent("cancel before run registration"), &mutation)
         .expect_err("the registered cancellation must prevent durable admission");
-    assert_eq!(admission_error.code, ErrorCode::Interrupted);
+    assert_eq!(admission_error.code, ErrorCode::StateConflict);
     assert_eq!(
         service
             .daemon_runtime_status()
@@ -79,7 +79,7 @@ fn durable_cancellations_survive_pressure_restart_and_digest_conflicts() {
     let delayed = restarted
         .admit_run(&intent("durable cancellation 0"), &original)
         .expect_err("oldest unexpired cancellation must survive pressure and restart");
-    assert_eq!(delayed.code, ErrorCode::Interrupted);
+    assert_eq!(delayed.code, ErrorCode::StateConflict);
 }
 
 #[test]
@@ -123,7 +123,7 @@ fn cancellation_registered_before_steer_prevents_follow_up_admission() {
             &mutation,
         )
         .expect_err("the registered cancellation must prevent follow-up admission");
-    assert_eq!(admission_error.code, ErrorCode::Interrupted);
+    assert_eq!(admission_error.code, ErrorCode::StateConflict);
     assert_eq!(
         service
             .runtime
@@ -744,6 +744,21 @@ fn unresolved_operation_cancellation_is_recovery_pending_not_confirmed_cancelled
             .expect("the terminal cancellation outcome must replay"),
         crate::operation_capacity::AdmissionCancellationOutcome::RecoveryPending
     ));
+    let invoked = AtomicBool::new(false);
+    let replay_error = match capacity.execute_interruptible(
+        operation_request("principal-a", "ambiguous-cancel", DIGEST_A),
+        AdmissionCancellation::new(),
+        || Ok(None),
+        |_| {
+            invoked.store(true, Ordering::SeqCst);
+            Ok(admission_outcome(coordinator_result_session()))
+        },
+    ) {
+        Ok(_) => panic!("a recovery-pending admission must remain blocked"),
+        Err(error) => error,
+    };
+    assert_eq!(replay_error.code, ErrorCode::StateConflict);
+    assert!(!invoked.load(Ordering::SeqCst));
     capacity
         .execute_exclusive(|| Ok(()))
         .expect("recovery-pending replay must not retain mutation capacity");
@@ -789,7 +804,7 @@ fn cancellation_without_admission_returns_and_reclaims_capacity() {
         Ok(_) => panic!("the late admission must remain cancelled"),
         Err(error) => error,
     };
-    assert_eq!(error.code, ErrorCode::Interrupted);
+    assert_eq!(error.code, ErrorCode::StateConflict);
     assert!(!invoked.load(Ordering::SeqCst));
 }
 
@@ -844,7 +859,7 @@ fn admission_failure_before_cancellation_registration_cannot_escape_cancellation
         Ok(_) => panic!("the late exact admission must remain cancelled"),
         Err(error) => error,
     };
-    assert_eq!(error.code, ErrorCode::Interrupted);
+    assert_eq!(error.code, ErrorCode::StateConflict);
 }
 
 #[test]
