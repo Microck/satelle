@@ -1106,7 +1106,7 @@ fn injected_interrupt_after_local_run_admission_confirms_stop_before_exit_130() 
 }
 
 #[test]
-fn injected_interrupt_after_local_steer_admission_detaches_without_stop() {
+fn local_transport_rejects_detach_on_interrupt_before_admission() {
     let state = TestStateDir::new().expect("temporary state directory");
     let adapter = InterruptLifecycleAdapter::default();
     let service = HostService::with_adapter_for_tests_at(state.path(), adapter.clone())
@@ -1122,64 +1122,36 @@ fn injected_interrupt_after_local_steer_admission_detaches_without_stop() {
         )
         .expect("seed Session")
         .session;
-    adapter.execute_finished.reset();
-    adapter.block_execute();
+    let turn_count = seed.turns().len();
 
     let transport = LocalTransport::new(LOCAL_DEMO_HOST.to_string(), service.clone());
     let interrupt = TestInterrupt::default();
-    let command_interrupt = interrupt.clone();
-    let session_id = seed.session_id().clone();
-    let (result_sender, result_receiver) = mpsc::sync_channel(1);
-    let command = thread::spawn(move || {
-        let result = transport.attached_with_interrupt(
-            Some(session_id),
+    let failure = transport
+        .attached_with_interrupt(
+            Some(seed.session_id().clone()),
             TurnIntent::new(
-                "detach admitted local steer",
+                "reject local detach-on-interrupt",
                 satelle_core::session::TurnExecutionMode::Standard,
             )
             .expect("construct steer intent"),
             true,
-            &command_interrupt,
-        );
-        result_sender
-            .send(result)
-            .expect("test result receiver remains connected");
-    });
-    assert!(
-        adapter.execute_started.wait_for(Duration::from_secs(2)),
-        "steer execution must start after durable admission"
-    );
-
-    interrupt.signal();
-    let result = result_receiver
-        .recv_timeout(Duration::from_secs(2))
-        .expect("detach-on-interrupt must return without waiting for execution");
-    let failure = match result {
-        Err(failure) => failure,
-        Ok(_) => panic!("detached interruption must preserve exit 130"),
-    };
-    assert_eq!(failure.phase(), TurnAdmissionPhase::Admitted);
-    assert_eq!(failure.error().code, ErrorCode::Interrupted);
-    assert_eq!(failure.error().exit_code(), 130);
+            &interrupt,
+        )
+        .expect_err("local transport cannot durably detach in-process work");
+    assert_eq!(failure.phase(), TurnAdmissionPhase::NotAdmitted);
+    assert_eq!(failure.error().code, ErrorCode::InvalidUsage);
+    assert_eq!(failure.error().exit_code(), 64);
+    assert!(failure.durable_handles().is_none());
     assert_eq!(adapter.stop_calls.load(Ordering::SeqCst), 0);
-    let (session_id, _) = failure
-        .durable_handles()
-        .expect("detached interruption retains durable handles");
-    assert!(
+    assert_eq!(
         service
-            .session_status(session_id)
-            .expect("detached Session remains readable")
-            .activity()
-            != &SessionActivity::Idle,
-        "detach-on-interrupt leaves admitted work active"
+            .session_status(seed.session_id())
+            .expect("seed Session remains readable")
+            .turns()
+            .len(),
+        turn_count,
+        "local rejection must happen before Turn admission"
     );
-
-    adapter.execute_release.signal();
-    assert!(
-        adapter.execute_finished.wait_for(Duration::from_secs(2)),
-        "detached worker must finish after explicit test release"
-    );
-    command.join().expect("command thread must not panic");
 }
 
 #[path = "transport-reconnect-tests.rs"]

@@ -280,6 +280,13 @@ impl LocalTransport {
         detach_on_interrupt: bool,
         interrupt: &dyn InterruptSource,
     ) -> Result<TurnOutcome, TurnAdmissionFailure> {
+        if detach_on_interrupt {
+            return Err(TurnAdmissionFailure::not_admitted(
+                SatelleError::invalid_usage(
+                    "--detach-on-interrupt requires a remote Host transport",
+                ),
+            ));
+        }
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
