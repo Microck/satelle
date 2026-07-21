@@ -431,7 +431,15 @@ impl DirectTransport {
                                 self.run_admission_error(),
                             )
                             .await;
-                        Ok((admission.await, Some(cancelled)))
+                        match cancelled {
+                            Ok(cancelled) => {
+                                let interrupted = TurnAdmissionFailure::not_admitted(
+                                    pre_admission_interruption_error(Some(cancelled.outcome())),
+                                );
+                                Ok((Err(interrupted), Some(Ok(cancelled))))
+                            }
+                            Err(error) => Ok((admission.await, Some(Err(error)))),
+                        }
                     }
                     admitted = &mut admission => Ok((admitted, None)),
                 }
@@ -584,7 +592,15 @@ impl DirectTransport {
                             ),
                             direct_admission_error,
                         ).await;
-                        Ok((admission.await, Some(cancelled)))
+                        match cancelled {
+                            Ok(cancelled) => {
+                                let interrupted = TurnAdmissionFailure::not_admitted(
+                                    pre_admission_interruption_error(Some(cancelled.outcome())),
+                                );
+                                Ok((Err(interrupted), Some(Ok(cancelled))))
+                            }
+                            Err(error) => Ok((admission.await, Some(Err(error)))),
+                        }
                     }
                     admitted = &mut admission => Ok((admitted, None)),
                 }

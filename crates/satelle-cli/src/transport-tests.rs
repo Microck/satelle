@@ -1443,7 +1443,6 @@ fn install_replay_admitted_status_failure_peer(
         )
         .expect("write replay-admitted cancellation response");
         drop(cancellation);
-        drop(admission);
 
         let (mut stop, _) = listener
             .accept()
@@ -1468,6 +1467,7 @@ fn install_replay_admitted_status_failure_peer(
             "status read must follow the stop attempt: {status_headers}"
         );
         drop(status);
+        drop(admission);
     });
     let token = ApiBearerToken::generate().expect("generate replay-admitted token");
     let client = DaemonClient::loopback(address, token, &fixture.host_identity)
