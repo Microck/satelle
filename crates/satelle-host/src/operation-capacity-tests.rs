@@ -1577,10 +1577,11 @@ fn retry_joins_the_published_result_before_capacity_clears() {
             },
         )
     });
-    assert!(
-        capacity.wait_for_result_before_clear(WAIT_LIMIT),
-        "the leader must publish its result before releasing capacity"
-    );
+    if !capacity.wait_for_result_before_clear(WAIT_LIMIT) {
+        capacity.release_result_before_clear();
+        let _ = leader.join();
+        panic!("the leader must publish its result before releasing capacity");
+    }
 
     let retry_capacity = Arc::clone(&capacity);
     let retry = std::thread::spawn(move || {
