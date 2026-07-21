@@ -22,7 +22,7 @@ use axum::routing::{get, post};
 use listener::{ConnectionActivity, ConnectionContext, LimitedTcpListener};
 use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName};
-use satelle_core::SatelleError;
+use satelle_core::{ApiRateLimits, SatelleError};
 use satelle_host::{DaemonRuntimeCapabilities, HostService};
 use serde::Serialize;
 use serde_json::Value;
@@ -51,6 +51,7 @@ pub struct DaemonServerConfig {
     shutdown_grace: Duration,
     idle_timeout: Option<Duration>,
     trusted_proxies: Arc<[TrustedProxy]>,
+    api_rate_limits: ApiRateLimits,
 }
 
 impl DaemonServerConfig {
@@ -61,6 +62,7 @@ impl DaemonServerConfig {
             shutdown_grace: DEFAULT_SHUTDOWN_GRACE,
             idle_timeout: None,
             trusted_proxies: Arc::from([]),
+            api_rate_limits: ApiRateLimits::default(),
         }
     }
 
@@ -76,6 +78,11 @@ impl DaemonServerConfig {
 
     pub const fn with_idle_timeout(mut self, idle_timeout: Duration) -> Self {
         self.idle_timeout = Some(idle_timeout);
+        self
+    }
+
+    pub const fn with_api_rate_limits(mut self, api_rate_limits: ApiRateLimits) -> Self {
+        self.api_rate_limits = api_rate_limits;
         self
     }
 
@@ -445,7 +452,7 @@ impl DaemonServer {
             .local_addr()
             .map_err(DaemonServerError::BindFailed)?;
         let shutdown_service = service.clone();
-        let limits = effective_limits(config.max_connections);
+        let limits = effective_limits(config.max_connections, config.api_rate_limits);
         let (shutdown, mut receiver) = watch::channel(false);
         let state = Arc::new(DaemonState {
             service: Arc::new(service),

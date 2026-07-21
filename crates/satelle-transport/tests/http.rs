@@ -19,7 +19,9 @@ use reqwest::StatusCode;
 use rustls::RootCertStore;
 use rustls::pki_types::ServerName;
 use satelle_core::session::TurnExecutionMode;
-use satelle_core::{ApiTokenSource, DirectHostBinding, ErrorCode, SatelleConfig, TransportKind};
+use satelle_core::{
+    ApiRateLimits, ApiTokenSource, DirectHostBinding, ErrorCode, SatelleConfig, TransportKind,
+};
 use satelle_host::{
     ApiBearerToken, ApiScopes, HostService, MutationAuthority, TurnIntent,
     test_support::TestStateDir,
@@ -36,6 +38,7 @@ use std::cell::RefCell;
 use std::fmt::Write as _;
 use std::future::Future;
 use std::net::{Ipv4Addr, SocketAddr};
+use std::num::NonZeroUsize;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -1216,6 +1219,89 @@ async fn capabilities_are_truthful_and_unknown_routes_are_typed() {
     let error: ApiError = unknown.json().await.expect("decode not-found error");
     assert_eq!(error.code().as_str(), "route-not-found");
     assert_eq!(error.host_identity(), Some(running.host_identity.as_str()));
+}
+
+#[tokio::test]
+async fn custom_api_rate_limits_are_advertised_and_enforced() {
+    let limit = |value| NonZeroUsize::new(value).expect("test rate limit is nonzero");
+    let advertised = ApiRateLimits::new(limit(2), limit(3), limit(4), limit(5));
+    let running = RunningServer::start_with_config(
+        ApiScopes::ADMIN,
+        DaemonServerConfig::loopback(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
+            .with_api_rate_limits(advertised),
+    )
+    .await;
+    let capabilities = running
+        .request("/v1/capabilities")
+        .send()
+        .await
+        .expect("request custom capabilities")
+        .json::<CapabilitiesResponse>()
+        .await
+        .expect("decode custom capabilities");
+    assert_eq!(capabilities.limits().failed_auth_attempts_per_minute(), 2);
+    assert_eq!(capabilities.limits().authenticated_requests_per_minute(), 3);
+    assert_eq!(capabilities.limits().control_requests_per_minute(), 4);
+    assert_eq!(
+        capabilities
+            .limits()
+            .websocket_inbound_messages_per_minute(),
+        5
+    );
+
+    for attempt in 1..=3 {
+        let response = running
+            .request("/v1/host/status")
+            .send()
+            .await
+            .expect("request custom authenticated limit");
+        if attempt <= 2 {
+            assert_eq!(response.status(), StatusCode::OK);
+        } else {
+            assert_rate_limited(response, Some(&running.host_identity)).await;
+        }
+    }
+
+    let failed_auth = RunningServer::start_with_config(
+        ApiScopes::READ,
+        DaemonServerConfig::loopback(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
+            .with_api_rate_limits(advertised),
+    )
+    .await;
+    let client = reqwest::Client::new();
+    for attempt in 1..=3 {
+        let response = client
+            .get(failed_auth.url("/v1/host/status"))
+            .header("Satelle-Request-Id", RequestId::new().to_string())
+            .send()
+            .await
+            .expect("request custom failed-authentication limit");
+        if attempt <= 2 {
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        } else {
+            assert_rate_limited(response, None).await;
+        }
+    }
+
+    let control_limits = ApiRateLimits::new(limit(10), limit(10), limit(2), limit(10));
+    let control = RunningServer::start_with_config(
+        ApiScopes::CONTROL,
+        DaemonServerConfig::loopback(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
+            .with_api_rate_limits(control_limits),
+    )
+    .await;
+    for attempt in 1..=3 {
+        let response = control
+            .mutation("/v1/sessions", "custom-control-rate-limit")
+            .send()
+            .await
+            .expect("request custom control limit");
+        if attempt <= 2 {
+            assert_eq!(response.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
+        } else {
+            assert_rate_limited(response, Some(&control.host_identity)).await;
+        }
+    }
 }
 
 #[tokio::test]

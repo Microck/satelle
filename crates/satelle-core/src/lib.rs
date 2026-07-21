@@ -3,6 +3,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
+use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use thiserror::Error;
 use time::OffsetDateTime;
@@ -73,6 +74,8 @@ pub struct SatelleConfig {
     pub experimental_provider_computer_use: Option<bool>,
     pub yolo: Option<bool>,
     pub command_history: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_rate_limits: Option<ApiRateLimits>,
     #[serde(default)]
     pub hosts: BTreeMap<String, HostConfig>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
@@ -120,6 +123,7 @@ impl SatelleConfig {
             experimental_provider_computer_use: None,
             yolo: None,
             command_history: None,
+            api_rate_limits: None,
             hosts,
             trusted_profiles: BTreeMap::new(),
         }
@@ -144,6 +148,9 @@ impl SatelleConfig {
         if higher.command_history.is_some() {
             self.command_history = higher.command_history;
         }
+        if higher.api_rate_limits.is_some() {
+            self.api_rate_limits = higher.api_rate_limits;
+        }
 
         for (alias, host) in higher.hosts {
             self.hosts.insert(alias, host);
@@ -154,6 +161,78 @@ impl SatelleConfig {
 
         self
     }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ApiRateLimits {
+    #[serde(default = "default_failed_auth_attempts_per_minute")]
+    failed_auth_attempts_per_minute: NonZeroUsize,
+    #[serde(default = "default_authenticated_requests_per_minute")]
+    authenticated_requests_per_minute: NonZeroUsize,
+    #[serde(default = "default_control_requests_per_minute")]
+    control_requests_per_minute: NonZeroUsize,
+    #[serde(default = "default_websocket_inbound_messages_per_minute")]
+    websocket_inbound_messages_per_minute: NonZeroUsize,
+}
+
+impl ApiRateLimits {
+    pub const fn new(
+        failed_auth_attempts_per_minute: NonZeroUsize,
+        authenticated_requests_per_minute: NonZeroUsize,
+        control_requests_per_minute: NonZeroUsize,
+        websocket_inbound_messages_per_minute: NonZeroUsize,
+    ) -> Self {
+        Self {
+            failed_auth_attempts_per_minute,
+            authenticated_requests_per_minute,
+            control_requests_per_minute,
+            websocket_inbound_messages_per_minute,
+        }
+    }
+
+    pub const fn failed_auth_attempts_per_minute(self) -> usize {
+        self.failed_auth_attempts_per_minute.get()
+    }
+
+    pub const fn authenticated_requests_per_minute(self) -> usize {
+        self.authenticated_requests_per_minute.get()
+    }
+
+    pub const fn control_requests_per_minute(self) -> usize {
+        self.control_requests_per_minute.get()
+    }
+
+    pub const fn websocket_inbound_messages_per_minute(self) -> usize {
+        self.websocket_inbound_messages_per_minute.get()
+    }
+}
+
+impl Default for ApiRateLimits {
+    fn default() -> Self {
+        Self::new(
+            default_failed_auth_attempts_per_minute(),
+            default_authenticated_requests_per_minute(),
+            default_control_requests_per_minute(),
+            default_websocket_inbound_messages_per_minute(),
+        )
+    }
+}
+
+fn default_failed_auth_attempts_per_minute() -> NonZeroUsize {
+    NonZeroUsize::new(10).expect("the default failed-authentication rate is nonzero")
+}
+
+fn default_authenticated_requests_per_minute() -> NonZeroUsize {
+    NonZeroUsize::new(600).expect("the default authenticated request rate is nonzero")
+}
+
+fn default_control_requests_per_minute() -> NonZeroUsize {
+    NonZeroUsize::new(120).expect("the default control request rate is nonzero")
+}
+
+fn default_websocket_inbound_messages_per_minute() -> NonZeroUsize {
+    NonZeroUsize::new(120).expect("the default WebSocket inbound message rate is nonzero")
 }
 
 /// Durable user-owned consent for an exact set of hosts and mutation workflows.
@@ -902,6 +981,88 @@ struct ParsedUserConfig {
     config: SatelleConfig,
     default_profile: Option<String>,
     profiles: BTreeMap<String, profiles::ProfileConfig>,
+}
+
+#[cfg(test)]
+mod api_rate_limit_config_tests {
+    use super::*;
+
+    #[test]
+    fn user_config_accepts_all_api_rate_limits_and_defaults_omitted_fields() {
+        let parsed = parse_user_config(
+            Path::new("/test/config.toml"),
+            r#"
+[api_rate_limits]
+failed_auth_attempts_per_minute = 7
+authenticated_requests_per_minute = 321
+control_requests_per_minute = 45
+websocket_inbound_messages_per_minute = 67
+"#,
+        )
+        .expect("parse user-owned API rate limits");
+        let limits = parsed
+            .config
+            .api_rate_limits
+            .expect("retain user-owned API rate limits");
+
+        assert_eq!(limits.failed_auth_attempts_per_minute(), 7);
+        assert_eq!(limits.authenticated_requests_per_minute(), 321);
+        assert_eq!(limits.control_requests_per_minute(), 45);
+        assert_eq!(limits.websocket_inbound_messages_per_minute(), 67);
+
+        let partial = parse_user_config(
+            Path::new("/test/config.toml"),
+            "[api_rate_limits]\ncontrol_requests_per_minute = 30\n",
+        )
+        .expect("default omitted API rate limits")
+        .config
+        .api_rate_limits
+        .expect("retain partial user-owned API rate limits");
+        assert_eq!(partial.failed_auth_attempts_per_minute(), 10);
+        assert_eq!(partial.authenticated_requests_per_minute(), 600);
+        assert_eq!(partial.control_requests_per_minute(), 30);
+        assert_eq!(partial.websocket_inbound_messages_per_minute(), 120);
+    }
+
+    #[test]
+    fn user_config_rejects_zero_api_rate_limits() {
+        for key in [
+            "failed_auth_attempts_per_minute",
+            "authenticated_requests_per_minute",
+            "control_requests_per_minute",
+            "websocket_inbound_messages_per_minute",
+        ] {
+            let raw = format!("[api_rate_limits]\n{key} = 0\n");
+            let error = parse_user_config(Path::new("/test/config.toml"), &raw)
+                .expect_err("reject a zero API rate limit");
+            assert_eq!(error.code, ErrorCode::ConfigError, "key={key}");
+        }
+    }
+
+    #[test]
+    fn higher_user_config_replaces_the_complete_api_rate_policy() {
+        let base = parse_user_config(
+            Path::new("/test/base.toml"),
+            "[api_rate_limits]\nfailed_auth_attempts_per_minute = 25\n",
+        )
+        .expect("parse base API rate limits")
+        .config;
+        let higher = parse_user_config(
+            Path::new("/test/higher.toml"),
+            "[api_rate_limits]\ncontrol_requests_per_minute = 25\n",
+        )
+        .expect("parse higher API rate limits")
+        .config;
+
+        let merged = base
+            .merge(higher)
+            .api_rate_limits
+            .expect("retain higher API rate policy");
+        assert_eq!(merged.failed_auth_attempts_per_minute(), 10);
+        assert_eq!(merged.authenticated_requests_per_minute(), 600);
+        assert_eq!(merged.control_requests_per_minute(), 25);
+        assert_eq!(merged.websocket_inbound_messages_per_minute(), 120);
+    }
 }
 
 #[cfg(test)]
@@ -1774,6 +1935,7 @@ fn reject_unknown_user_config_keys(path: &Path, value: &toml::Value) -> Result<(
             "experimental_provider_computer_use",
             "yolo",
             "command_history",
+            "api_rate_limits",
             "profile",
             "profiles",
             "hosts",
@@ -1781,6 +1943,20 @@ fn reject_unknown_user_config_keys(path: &Path, value: &toml::Value) -> Result<(
         ],
         &mut unknown_keys,
     );
+
+    if let Some(rate_limits) = table.get("api_rate_limits").and_then(toml::Value::as_table) {
+        collect_unknown_keys_for_table(
+            "api_rate_limits",
+            rate_limits,
+            &[
+                "failed_auth_attempts_per_minute",
+                "authenticated_requests_per_minute",
+                "control_requests_per_minute",
+                "websocket_inbound_messages_per_minute",
+            ],
+            &mut unknown_keys,
+        );
+    }
 
     if let Some(profiles) = table
         .get("trusted_profiles")

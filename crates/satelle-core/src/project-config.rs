@@ -675,3 +675,35 @@ impl SatelleError {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn project_config_cannot_define_or_weaken_api_rate_limits() {
+        let root = tempfile::tempdir().expect("create project config root");
+        let path = root.path().join("config.toml");
+        fs::write(
+            &path,
+            r#"
+[api_rate_limits]
+failed_auth_attempts_per_minute = 1
+authenticated_requests_per_minute = 1
+control_requests_per_minute = 1
+websocket_inbound_messages_per_minute = 1
+"#,
+        )
+        .expect("write project API rate-limit attempt");
+
+        let error = match read(&path) {
+            Err(error) => error,
+            Ok(_) => panic!("project configuration cannot own API rate limits"),
+        };
+        assert_eq!(error.code, ErrorCode::UnknownConfigKey);
+        assert_eq!(
+            error.details.get("path"),
+            Some(&serde_json::json!("api_rate_limits"))
+        );
+    }
+}

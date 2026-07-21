@@ -3485,6 +3485,7 @@ fn start_host_daemon(
         })
     })?;
     let tls = daemon_tls_config(&command)?;
+    let api_rate_limits = config.load()?.config.api_rate_limits.unwrap_or_default();
 
     // Durable SSH relaunch must reopen the same default state store used by
     // bootstrap token issuance. The Controller has already resolved the idle
@@ -3564,7 +3565,8 @@ fn start_host_daemon(
         .build()
         .map_err(|error| daemon_process_failure("runtime-create-failed", error.to_string()))?;
     runtime.block_on(async move {
-        let mut server_config = DaemonServerConfig::loopback(bind_addr);
+        let mut server_config =
+            DaemonServerConfig::loopback(bind_addr).with_api_rate_limits(api_rate_limits);
         if let Some(idle_timeout) = idle_timeout {
             server_config = server_config.with_idle_timeout(idle_timeout);
         }

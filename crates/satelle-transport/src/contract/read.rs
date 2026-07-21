@@ -1,5 +1,5 @@
 use super::{AuthenticatedResponseContract, RequestId, define_schema_token};
-use satelle_core::DesktopSessionRecord;
+use satelle_core::{ApiRateLimits, DesktopSessionRecord};
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 
@@ -402,7 +402,10 @@ impl AuthenticatedResponseContract for HostDesktopSessionsResponse {
     }
 }
 
-pub(crate) fn effective_limits(http_connections: usize) -> EffectiveLimits {
+pub(crate) fn effective_limits(
+    http_connections: usize,
+    api_rate_limits: ApiRateLimits,
+) -> EffectiveLimits {
     EffectiveLimits {
         json_body_bytes: 1_048_576,
         http_connections,
@@ -410,13 +413,14 @@ pub(crate) fn effective_limits(http_connections: usize) -> EffectiveLimits {
         attachment_count: 0,
         attachment_bytes_each: 0,
         attachment_bytes_total: 0,
-        failed_auth_attempts_per_minute: 10,
-        authenticated_requests_per_minute: 600,
-        control_requests_per_minute: 120,
+        failed_auth_attempts_per_minute: api_rate_limits.failed_auth_attempts_per_minute(),
+        authenticated_requests_per_minute: api_rate_limits.authenticated_requests_per_minute(),
+        control_requests_per_minute: api_rate_limits.control_requests_per_minute(),
         websocket_connections_per_principal: 4,
         websocket_message_bytes: 65_536,
         websocket_subscriptions_per_connection: 16,
-        websocket_inbound_messages_per_minute: 120,
+        websocket_inbound_messages_per_minute: api_rate_limits
+            .websocket_inbound_messages_per_minute(),
         websocket_outbound_queue_messages: 256,
         websocket_ping_interval_ms: 15_000,
         websocket_idle_timeout_ms: 45_000,
