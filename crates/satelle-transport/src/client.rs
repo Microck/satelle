@@ -1,9 +1,9 @@
 use crate::contract::{
-    ApiError, ApiErrorCode, AuthenticatedResponseContract, CapabilitiesResponse,
-    DurableTokenActivationResponse, DurableTokenConfirmationResponse, DurableTokenIssuanceResponse,
-    HostDesktopSessionsResponse, HostStatusResponse, LiveResponse, LogsPageResponse,
-    PROTOCOL_VERSION, PROTOCOL_VERSION_HEADER, RequestId, SessionResponse, StopRequest,
-    StopResponse, TurnRequest,
+    AdmissionCancellationResponse, ApiError, ApiErrorCode, AuthenticatedResponseContract,
+    CapabilitiesResponse, DurableTokenActivationResponse, DurableTokenConfirmationResponse,
+    DurableTokenIssuanceResponse, HostDesktopSessionsResponse, HostStatusResponse, LiveResponse,
+    LogsPageResponse, PROTOCOL_VERSION, PROTOCOL_VERSION_HEADER, RequestId, SessionResponse,
+    StopRequest, StopResponse, TurnRequest,
 };
 use crate::transport_tls::{
     ReqwestTrustError, TlsFailureKind, classify_tls_error, configure_reqwest_trust,
@@ -234,6 +234,27 @@ impl DaemonClient {
         self.send_authenticated(request, request_id, StatusCode::ACCEPTED)
     }
 
+    pub fn cancel_session_admission(
+        &self,
+        request: &TurnRequest,
+        idempotency_key: &str,
+    ) -> Result<AdmissionCancellationResponse, DaemonClientError> {
+        let (request_builder, request_id) =
+            self.mutation_request("/v1/sessions", idempotency_key)?;
+        let response: AdmissionCancellationResponse = self.send_authenticated(
+            request_builder
+                .header("Satelle-Admission-Action", "cancel")
+                .json(request),
+            request_id,
+            StatusCode::OK,
+        )?;
+        if response.validate() {
+            Ok(response)
+        } else {
+            Err(DaemonClientError::ResponseContractViolation)
+        }
+    }
+
     pub fn create_turn(
         &self,
         session_id: &SessionId,
@@ -244,6 +265,28 @@ impl DaemonClient {
         let (request_builder, request_id) = self.mutation_request(&path, idempotency_key)?;
         let request = self.admission_request(request_builder.json(request));
         self.send_authenticated(request, request_id, StatusCode::ACCEPTED)
+    }
+
+    pub fn cancel_turn_admission(
+        &self,
+        session_id: &SessionId,
+        request: &TurnRequest,
+        idempotency_key: &str,
+    ) -> Result<AdmissionCancellationResponse, DaemonClientError> {
+        let path = format!("/v1/sessions/{session_id}/turns");
+        let (request_builder, request_id) = self.mutation_request(&path, idempotency_key)?;
+        let response: AdmissionCancellationResponse = self.send_authenticated(
+            request_builder
+                .header("Satelle-Admission-Action", "cancel")
+                .json(request),
+            request_id,
+            StatusCode::OK,
+        )?;
+        if response.validate() {
+            Ok(response)
+        } else {
+            Err(DaemonClientError::ResponseContractViolation)
+        }
     }
 
     fn admission_request(&self, request: RequestBuilder) -> RequestBuilder {
@@ -267,8 +310,29 @@ impl DaemonClient {
         session_id: &SessionId,
         idempotency_key: &str,
     ) -> Result<StopResponse, DaemonClientError> {
+        self.stop_session_inner(session_id, None, idempotency_key)
+    }
+
+    pub fn stop_session_for_turn(
+        &self,
+        session_id: &SessionId,
+        expected_turn_id: &satelle_core::TurnId,
+        idempotency_key: &str,
+    ) -> Result<StopResponse, DaemonClientError> {
+        self.stop_session_inner(session_id, Some(expected_turn_id), idempotency_key)
+    }
+
+    fn stop_session_inner(
+        &self,
+        session_id: &SessionId,
+        expected_turn_id: Option<&satelle_core::TurnId>,
+        idempotency_key: &str,
+    ) -> Result<StopResponse, DaemonClientError> {
         let path = format!("/v1/sessions/{session_id}/stop");
-        let (request, request_id) = self.mutation_request(&path, idempotency_key)?;
+        let (mut request, request_id) = self.mutation_request(&path, idempotency_key)?;
+        if let Some(expected_turn_id) = expected_turn_id {
+            request = request.header("Satelle-Expected-Turn-Id", expected_turn_id.as_str());
+        }
         self.send_authenticated(
             request.json(&StopRequest::new()),
             request_id,

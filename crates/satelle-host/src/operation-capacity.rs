@@ -1,12 +1,13 @@
+use crate::runtime::{AdmissionCancellation, AdmissionCancellationState};
 use crate::runtime::{RequestIdentity, RuntimeStopOutcome};
 use crate::storage::IdempotentOperation;
-use satelle_core::SatelleError;
 use satelle_core::session::PublicSession;
+use satelle_core::{SatelleError, TurnId};
 use std::fmt;
 #[cfg(test)]
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Condvar, Mutex, MutexGuard};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 const RESOURCE: &str = "operation-concurrency";
 const LIMIT: usize = 1;
@@ -18,14 +19,21 @@ type SharedResult = Result<OperationOutcome, SatelleError>;
 /// type-erased follower results while preserving one Host-global slot.
 #[derive(Clone)]
 pub(crate) enum OperationOutcome {
-    Session(PublicSession),
+    Admission {
+        session: PublicSession,
+        turn_id: TurnId,
+    },
     Stop(RuntimeStopOutcome),
 }
 
 impl OperationOutcome {
+    pub(crate) fn admission(session: PublicSession, turn_id: TurnId) -> Self {
+        Self::Admission { session, turn_id }
+    }
+
     pub(crate) fn into_session(self) -> Result<PublicSession, SatelleError> {
         match self {
-            Self::Session(session) => Ok(session),
+            Self::Admission { session, .. } => Ok(session),
             Self::Stop(_) => Err(crate::runtime::integrity_error(
                 "the operation-capacity result had the wrong response type",
             )),
@@ -35,8 +43,19 @@ impl OperationOutcome {
     pub(crate) fn into_stop(self) -> Result<RuntimeStopOutcome, SatelleError> {
         match self {
             Self::Stop(outcome) => Ok(outcome),
-            Self::Session(_) => Err(crate::runtime::integrity_error(
+            Self::Admission { .. } => Err(crate::runtime::integrity_error(
                 "the operation-capacity result had the wrong response type",
+            )),
+        }
+    }
+
+    fn into_admission_cancellation(self) -> Result<AdmissionCancellationOutcome, SatelleError> {
+        match self {
+            Self::Admission { session, turn_id } => {
+                Ok(AdmissionCancellationOutcome::Admitted { session, turn_id })
+            }
+            Self::Stop(_) => Err(crate::runtime::integrity_error(
+                "an admission cancellation received a stop result",
             )),
         }
     }
@@ -48,10 +67,15 @@ impl OperationOutcome {
 /// performs only an in-memory install, join, conflict, or rejection decision.
 /// Registered followers retain the shared entry after the global slot clears.
 pub(crate) struct OperationCapacity {
+    identity_gate: RwLock<()>,
     state: Mutex<CapacityState>,
     generation: AtomicU64,
     #[cfg(test)]
     registration_changed: Condvar,
+    #[cfg(test)]
+    test_cancellations: Mutex<Vec<(OperationRequest, AdmissionCancellationOutcome)>>,
+    #[cfg(test)]
+    cancellation_request_pause: TestCancellationRequestPause,
 }
 
 impl fmt::Debug for OperationCapacity {
@@ -65,15 +89,32 @@ impl fmt::Debug for OperationCapacity {
 impl Default for OperationCapacity {
     fn default() -> Self {
         Self {
+            identity_gate: RwLock::new(()),
             state: Mutex::new(CapacityState::default()),
             generation: AtomicU64::new(0),
             #[cfg(test)]
             registration_changed: Condvar::new(),
+            #[cfg(test)]
+            test_cancellations: Mutex::new(Vec::new()),
+            #[cfg(test)]
+            cancellation_request_pause: TestCancellationRequestPause::default(),
         }
     }
 }
 
 impl OperationCapacity {
+    pub(crate) fn lock_identity_read(&self) -> Result<RwLockReadGuard<'_, ()>, SatelleError> {
+        self.identity_gate
+            .read()
+            .map_err(|_| crate::runtime::integrity_error("the request-identity gate was poisoned"))
+    }
+
+    pub(crate) fn lock_identity_write(&self) -> Result<RwLockWriteGuard<'_, ()>, SatelleError> {
+        self.identity_gate
+            .write()
+            .map_err(|_| crate::runtime::integrity_error("the request-identity gate was poisoned"))
+    }
+
     pub(crate) fn activity_snapshot(&self) -> Result<(bool, u64), SatelleError> {
         let state = self.lock()?;
         Ok((
@@ -88,6 +129,57 @@ impl OperationCapacity {
         mut replay: impl FnMut() -> Result<Option<OperationOutcome>, SatelleError>,
         operation: impl FnOnce() -> SharedResult,
     ) -> SharedResult {
+        self.execute_interruptible_durable(
+            request.clone(),
+            AdmissionCancellation::new(),
+            || {
+                if let Some(outcome) = replay()? {
+                    return Ok(DurableAdmissionOutcome::Admitted(outcome));
+                }
+                #[cfg(test)]
+                {
+                    self.test_cancellation(&request)
+                }
+                #[cfg(not(test))]
+                Ok(DurableAdmissionOutcome::Missing)
+            },
+            |_| Ok(DurableAdmissionOutcome::Missing),
+            |_| operation(),
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn execute_interruptible(
+        &self,
+        request: OperationRequest,
+        cancellation: AdmissionCancellation,
+        mut replay: impl FnMut() -> Result<Option<OperationOutcome>, SatelleError>,
+        operation: impl FnOnce(AdmissionCancellation) -> SharedResult,
+    ) -> SharedResult {
+        self.execute_interruptible_durable(
+            request.clone(),
+            cancellation,
+            || {
+                if let Some(outcome) = replay()? {
+                    return Ok(DurableAdmissionOutcome::Admitted(outcome));
+                }
+                self.test_cancellation(&request)
+            },
+            |outcome| self.record_test_cancellation(request.clone(), outcome),
+            operation,
+        )
+    }
+
+    pub(crate) fn execute_interruptible_durable(
+        &self,
+        request: OperationRequest,
+        cancellation: AdmissionCancellation,
+        mut resolve: impl FnMut() -> Result<DurableAdmissionOutcome, SatelleError>,
+        mut persist_cancellation: impl FnMut(
+            AdmissionCancellationOutcome,
+        ) -> Result<DurableAdmissionOutcome, SatelleError>,
+        operation: impl FnOnce(AdmissionCancellation) -> SharedResult,
+    ) -> SharedResult {
         loop {
             // An exact in-memory request owns the authoritative result until
             // it clears. Durable state may already contain an intermediate
@@ -96,7 +188,7 @@ impl OperationCapacity {
             let (observed_generation, follower) = {
                 let state = self.lock()?;
                 let observed_generation = self.generation.load(Ordering::Acquire);
-                let follower = self.matching_active(&state, &request)?;
+                let follower = self.matching_entry(&state, &request)?;
                 (observed_generation, follower)
             };
             if let Some(follower) = follower {
@@ -106,26 +198,33 @@ impl OperationCapacity {
             // The generation makes the replay probe and capacity decision one
             // optimistic read. SQLite work remains outside the mutex, while a
             // concurrent install or clear discards the probe and starts again.
-            let replayed = replay()?;
+            let replayed = resolve()?;
             if self.generation.load(Ordering::Acquire) != observed_generation {
                 continue;
             }
-            if let Some(replayed) = replayed {
-                return Ok(replayed);
+            match replayed {
+                DurableAdmissionOutcome::Admitted(replayed) => return Ok(replayed),
+                DurableAdmissionOutcome::Cancelled | DurableAdmissionOutcome::RecoveryPending => {
+                    return Err(SatelleError::interrupted_attached_command());
+                }
+                DurableAdmissionOutcome::Missing => {}
             }
 
             let role = {
                 let mut state = self.lock()?;
                 if self.generation.load(Ordering::Acquire) != observed_generation {
                     None
-                } else if let Some(follower) = self.matching_active(&state, &request)? {
-                    Some(Role::Follower(follower))
+                } else if let Some(active) = self.matching_entry(&state, &request)? {
+                    Some(Role::Follower(active))
                 } else {
                     Some(match &state.active {
                         None => {
-                            let entry = Arc::new(InFlight::new(request.clone()));
+                            let entry =
+                                Arc::new(InFlight::new(request.clone(), cancellation.clone()));
                             state.active = Some(ActiveOperation::Idempotent(Arc::clone(&entry)));
                             self.generation.fetch_add(1, Ordering::Release);
+                            #[cfg(test)]
+                            self.registration_changed.notify_all();
                             Role::Leader(entry)
                         }
                         Some(_) => {
@@ -139,10 +238,281 @@ impl OperationCapacity {
             };
 
             return match role {
-                Role::Leader(entry) => CapacityLeader::new(self, entry).run(operation),
+                Role::Leader(entry) => {
+                    CapacityLeader::new(self, entry).run(operation, &mut persist_cancellation)
+                }
                 Role::Follower(entry) => entry.wait(),
             };
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn cancel(
+        &self,
+        request: OperationRequest,
+        mut replay: impl FnMut() -> Result<Option<OperationOutcome>, SatelleError>,
+    ) -> Result<AdmissionCancellationOutcome, SatelleError> {
+        self.cancel_durable(
+            request.clone(),
+            || {
+                if let Some(outcome) = replay()? {
+                    return Ok(DurableAdmissionOutcome::Admitted(outcome));
+                }
+                self.test_cancellation(&request)
+            },
+            |outcome| self.record_test_cancellation(request.clone(), outcome),
+        )
+    }
+
+    #[cfg(test)]
+    fn test_cancellation(
+        &self,
+        request: &OperationRequest,
+    ) -> Result<DurableAdmissionOutcome, SatelleError> {
+        let cancellations = self.test_cancellations.lock().map_err(|_| {
+            crate::runtime::integrity_error("the test cancellation lock was poisoned")
+        })?;
+        let Some((stored, outcome)) = cancellations
+            .iter()
+            .find(|(stored, _)| stored.same_base(request))
+        else {
+            return Ok(DurableAdmissionOutcome::Missing);
+        };
+        if stored != request {
+            return Err(crate::runtime::idempotency_conflict());
+        }
+        Ok(match outcome {
+            AdmissionCancellationOutcome::Cancelled
+            | AdmissionCancellationOutcome::ReconciledCancelled => {
+                DurableAdmissionOutcome::Cancelled
+            }
+            AdmissionCancellationOutcome::RecoveryPending => {
+                DurableAdmissionOutcome::RecoveryPending
+            }
+            AdmissionCancellationOutcome::Admitted { .. } => DurableAdmissionOutcome::Missing,
+        })
+    }
+
+    #[cfg(test)]
+    fn record_test_cancellation(
+        &self,
+        request: OperationRequest,
+        outcome: AdmissionCancellationOutcome,
+    ) -> Result<DurableAdmissionOutcome, SatelleError> {
+        let mut cancellations = self.test_cancellations.lock().map_err(|_| {
+            crate::runtime::integrity_error("the test cancellation lock was poisoned")
+        })?;
+        let stored_outcome = if let Some((stored, stored_outcome)) = cancellations
+            .iter_mut()
+            .find(|(stored, _)| stored.same_base(&request))
+        {
+            if stored != &request {
+                return Err(crate::runtime::idempotency_conflict());
+            }
+            match outcome {
+                AdmissionCancellationOutcome::RecoveryPending => {
+                    *stored_outcome = AdmissionCancellationOutcome::RecoveryPending;
+                }
+                AdmissionCancellationOutcome::ReconciledCancelled => {
+                    *stored_outcome = AdmissionCancellationOutcome::Cancelled;
+                }
+                AdmissionCancellationOutcome::Cancelled
+                | AdmissionCancellationOutcome::Admitted { .. } => {}
+            }
+            stored_outcome.clone()
+        } else {
+            let outcome = match outcome {
+                AdmissionCancellationOutcome::ReconciledCancelled => {
+                    AdmissionCancellationOutcome::Cancelled
+                }
+                outcome => outcome,
+            };
+            cancellations.push((request, outcome.clone()));
+            outcome
+        };
+        Ok(match stored_outcome {
+            AdmissionCancellationOutcome::Cancelled
+            | AdmissionCancellationOutcome::ReconciledCancelled => {
+                DurableAdmissionOutcome::Cancelled
+            }
+            AdmissionCancellationOutcome::RecoveryPending => {
+                DurableAdmissionOutcome::RecoveryPending
+            }
+            AdmissionCancellationOutcome::Admitted { .. } => DurableAdmissionOutcome::Missing,
+        })
+    }
+
+    pub(crate) fn cancel_durable(
+        &self,
+        request: OperationRequest,
+        mut resolve: impl FnMut() -> Result<DurableAdmissionOutcome, SatelleError>,
+        mut persist_cancellation: impl FnMut(
+            AdmissionCancellationOutcome,
+        ) -> Result<DurableAdmissionOutcome, SatelleError>,
+    ) -> Result<AdmissionCancellationOutcome, SatelleError> {
+        let entry = loop {
+            let (observed_generation, active) = {
+                let state = self.lock()?;
+                (
+                    self.generation.load(Ordering::Acquire),
+                    self.matching_entry(&state, &request)?,
+                )
+            };
+            if let Some(active) = active {
+                #[cfg(test)]
+                self.cancellation_request_pause.pause_if_armed();
+                let registration = active.request_cancellation();
+                #[cfg(test)]
+                self.registration_changed.notify_all();
+                match registration {
+                    CancellationRegistration::Completed(result) => {
+                        return completed_cancellation_outcome(
+                            result,
+                            &mut resolve,
+                            &mut persist_cancellation,
+                        );
+                    }
+                    CancellationRegistration::Requested => {
+                        match persist_cancellation(AdmissionCancellationOutcome::RecoveryPending)? {
+                            DurableAdmissionOutcome::Admitted(outcome) => {
+                                return outcome.into_admission_cancellation();
+                            }
+                            DurableAdmissionOutcome::Missing
+                            | DurableAdmissionOutcome::Cancelled
+                            | DurableAdmissionOutcome::RecoveryPending => {}
+                        }
+                    }
+                }
+                break active;
+            }
+            match resolve()? {
+                DurableAdmissionOutcome::Admitted(outcome) => {
+                    return outcome.into_admission_cancellation();
+                }
+                DurableAdmissionOutcome::Cancelled => {
+                    return Ok(AdmissionCancellationOutcome::Cancelled);
+                }
+                DurableAdmissionOutcome::RecoveryPending => {
+                    return Ok(AdmissionCancellationOutcome::RecoveryPending);
+                }
+                DurableAdmissionOutcome::Missing => {}
+            }
+            if self.generation.load(Ordering::Acquire) != observed_generation {
+                continue;
+            }
+            let persisted = persist_cancellation(AdmissionCancellationOutcome::Cancelled)?;
+            let active = {
+                let state = self.lock()?;
+                // Persistence and registration linearize through this
+                // generation advance. An admission that resolved Missing
+                // before the tombstone but has not installed yet must retry
+                // its durable resolve after taking the capacity mutex.
+                self.generation.fetch_add(1, Ordering::Release);
+                self.matching_entry(&state, &request)?
+            };
+            let Some(active) = active else {
+                return match persisted {
+                    DurableAdmissionOutcome::Admitted(outcome) => {
+                        outcome.into_admission_cancellation()
+                    }
+                    DurableAdmissionOutcome::Cancelled | DurableAdmissionOutcome::Missing => {
+                        Ok(AdmissionCancellationOutcome::Cancelled)
+                    }
+                    DurableAdmissionOutcome::RecoveryPending => {
+                        Ok(AdmissionCancellationOutcome::RecoveryPending)
+                    }
+                };
+            };
+            #[cfg(test)]
+            self.cancellation_request_pause.pause_if_armed();
+            let registration = active.request_cancellation();
+            #[cfg(test)]
+            self.registration_changed.notify_all();
+            match registration {
+                CancellationRegistration::Completed(result) => {
+                    return completed_cancellation_outcome(
+                        result,
+                        &mut resolve,
+                        &mut persist_cancellation,
+                    );
+                }
+                CancellationRegistration::Requested => {
+                    match persist_cancellation(AdmissionCancellationOutcome::RecoveryPending)? {
+                        DurableAdmissionOutcome::Admitted(outcome) => {
+                            return outcome.into_admission_cancellation();
+                        }
+                        DurableAdmissionOutcome::Missing
+                        | DurableAdmissionOutcome::Cancelled
+                        | DurableAdmissionOutcome::RecoveryPending => {}
+                    }
+                }
+            }
+            break active;
+        };
+        let outcome = match entry.wait() {
+            Ok(outcome) => outcome.into_admission_cancellation(),
+            Err(_) => match entry.cancellation.state() {
+                AdmissionCancellationState::Cancelled => {
+                    Ok(AdmissionCancellationOutcome::Cancelled)
+                }
+                AdmissionCancellationState::Admitted { .. } => match resolve()? {
+                    DurableAdmissionOutcome::Admitted(outcome) => {
+                        outcome.into_admission_cancellation()
+                    }
+                    DurableAdmissionOutcome::Missing
+                    | DurableAdmissionOutcome::Cancelled
+                    | DurableAdmissionOutcome::RecoveryPending => {
+                        Err(crate::runtime::integrity_error(
+                            "an admitted cancellation had no durable admission replay",
+                        ))
+                    }
+                },
+                AdmissionCancellationState::Open
+                | AdmissionCancellationState::Requested
+                | AdmissionCancellationState::RecoveryPending => {
+                    Ok(AdmissionCancellationOutcome::RecoveryPending)
+                }
+            },
+        }?;
+        if matches!(
+            outcome,
+            AdmissionCancellationOutcome::Cancelled | AdmissionCancellationOutcome::RecoveryPending
+        ) {
+            let persisted_outcome = match outcome {
+                AdmissionCancellationOutcome::Cancelled => {
+                    AdmissionCancellationOutcome::ReconciledCancelled
+                }
+                _ => outcome.clone(),
+            };
+            match persist_cancellation(persisted_outcome)? {
+                DurableAdmissionOutcome::Admitted(admitted) => {
+                    return admitted.into_admission_cancellation();
+                }
+                DurableAdmissionOutcome::RecoveryPending => {
+                    return Ok(AdmissionCancellationOutcome::RecoveryPending);
+                }
+                DurableAdmissionOutcome::Cancelled => {
+                    return Ok(AdmissionCancellationOutcome::Cancelled);
+                }
+                DurableAdmissionOutcome::Missing => {}
+            }
+        }
+        Ok(outcome)
+    }
+
+    fn finalize_and_clear(&self, entry: &Arc<InFlight>) {
+        let mut state = match self.state.lock() {
+            Ok(state) => state,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if state.active.as_ref().is_some_and(
+            |active| matches!(active, ActiveOperation::Idempotent(active) if Arc::ptr_eq(active, entry)),
+        ) {
+            state.active = None;
+            self.generation.fetch_add(1, Ordering::Release);
+        }
+        #[cfg(test)]
+        self.registration_changed.notify_all();
     }
 
     /// Runs a mutation whose durable idempotency is owned by another boundary
@@ -158,11 +528,13 @@ impl OperationCapacity {
             }
             state.active = Some(ActiveOperation::Exclusive);
             self.generation.fetch_add(1, Ordering::Release);
+            #[cfg(test)]
+            self.registration_changed.notify_all();
         }
         ExclusiveCapacityLeader::new(self).run(operation)
     }
 
-    fn matching_active(
+    fn matching_entry(
         &self,
         state: &CapacityState,
         request: &OperationRequest,
@@ -188,25 +560,6 @@ impl OperationCapacity {
         self.state.lock().map_err(|_| {
             crate::runtime::integrity_error("the operation-capacity lock was poisoned")
         })
-    }
-
-    fn clear(&self, entry: &Arc<InFlight>) {
-        let mut state = match self.state.lock() {
-            Ok(state) => state,
-            Err(poisoned) => poisoned.into_inner(),
-        };
-        if state
-            .active
-            .as_ref()
-            .is_some_and(|active| {
-                matches!(active, ActiveOperation::Idempotent(active) if Arc::ptr_eq(active, entry))
-            })
-        {
-            state.active = None;
-            self.generation.fetch_add(1, Ordering::Release);
-        }
-        #[cfg(test)]
-        self.registration_changed.notify_all();
     }
 
     fn clear_exclusive(&self) {
@@ -245,6 +598,105 @@ impl OperationCapacity {
                 if active.followers.load(Ordering::SeqCst) > 0
         )
     }
+
+    #[cfg(test)]
+    pub(crate) fn wait_for_cancellation_request(&self, timeout: std::time::Duration) -> bool {
+        let Ok(state) = self.state.lock() else {
+            return false;
+        };
+        let Ok((state, _)) =
+            self.registration_changed
+                .wait_timeout_while(state, timeout, |state| {
+                    !matches!(
+                        state.active.as_ref(),
+                        Some(ActiveOperation::Idempotent(active))
+                            if active.cancellation.is_requested()
+                    )
+                })
+        else {
+            return false;
+        };
+        matches!(
+            state.active.as_ref(),
+            Some(ActiveOperation::Idempotent(active)) if active.cancellation.is_requested()
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn pause_next_cancellation_before_request(&self) {
+        self.cancellation_request_pause.arm();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn wait_for_cancellation_before_request(
+        &self,
+        timeout: std::time::Duration,
+    ) -> bool {
+        self.cancellation_request_pause.wait_until_paused(timeout)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn release_cancellation_before_request(&self) {
+        self.cancellation_request_pause.release();
+    }
+}
+
+#[cfg(test)]
+#[derive(Default)]
+struct TestCancellationRequestPause {
+    state: Mutex<TestCancellationRequestPauseState>,
+    changed: Condvar,
+}
+
+#[cfg(test)]
+#[derive(Default)]
+struct TestCancellationRequestPauseState {
+    armed: bool,
+    paused: bool,
+    released: bool,
+}
+
+#[cfg(test)]
+impl TestCancellationRequestPause {
+    fn arm(&self) {
+        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        *state = TestCancellationRequestPauseState {
+            armed: true,
+            paused: false,
+            released: false,
+        };
+    }
+
+    fn pause_if_armed(&self) {
+        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        if !state.armed {
+            return;
+        }
+        state.paused = true;
+        self.changed.notify_all();
+        while !state.released {
+            state = self
+                .changed
+                .wait(state)
+                .unwrap_or_else(|error| error.into_inner());
+        }
+        state.armed = false;
+    }
+
+    fn wait_until_paused(&self, timeout: std::time::Duration) -> bool {
+        let state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        let (state, _) = self
+            .changed
+            .wait_timeout_while(state, timeout, |state| !state.paused)
+            .unwrap_or_else(|error| error.into_inner());
+        state.paused
+    }
+
+    fn release(&self) {
+        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        state.released = true;
+        self.changed.notify_all();
+    }
 }
 
 #[derive(Default)]
@@ -264,6 +716,7 @@ enum Role {
 
 struct InFlight {
     request: OperationRequest,
+    cancellation: AdmissionCancellation,
     result: Mutex<Option<SharedResult>>,
     completed: Condvar,
     #[cfg(test)]
@@ -271,9 +724,10 @@ struct InFlight {
 }
 
 impl InFlight {
-    fn new(request: OperationRequest) -> Self {
+    fn new(request: OperationRequest, cancellation: AdmissionCancellation) -> Self {
         Self {
             request,
+            cancellation,
             result: Mutex::new(None),
             completed: Condvar::new(),
             #[cfg(test)]
@@ -281,13 +735,29 @@ impl InFlight {
         }
     }
 
-    fn complete(&self, result: SharedResult) {
-        let mut stored = match self.result.lock() {
+    fn lock_result(&self) -> MutexGuard<'_, Option<SharedResult>> {
+        match self.result.lock() {
             Ok(stored) => stored,
             Err(poisoned) => poisoned.into_inner(),
-        };
+        }
+    }
+
+    fn request_cancellation(&self) -> CancellationRegistration {
+        let stored = self.lock_result();
+        if let Some(result) = stored.as_ref() {
+            return CancellationRegistration::Completed(result.clone());
+        }
+        self.cancellation.request();
+        CancellationRegistration::Requested
+    }
+
+    fn complete_locked(
+        &self,
+        stored: &mut MutexGuard<'_, Option<SharedResult>>,
+        result: SharedResult,
+    ) {
         if stored.is_none() {
-            *stored = Some(result);
+            **stored = Some(result);
         }
         self.completed.notify_all();
     }
@@ -305,6 +775,59 @@ impl InFlight {
             })?;
         }
     }
+}
+
+enum CancellationRegistration {
+    Requested,
+    Completed(SharedResult),
+}
+
+fn completed_cancellation_outcome(
+    result: SharedResult,
+    resolve: &mut impl FnMut() -> Result<DurableAdmissionOutcome, SatelleError>,
+    persist_cancellation: &mut impl FnMut(
+        AdmissionCancellationOutcome,
+    ) -> Result<DurableAdmissionOutcome, SatelleError>,
+) -> Result<AdmissionCancellationOutcome, SatelleError> {
+    if let Ok(outcome) = result {
+        return outcome.into_admission_cancellation();
+    }
+    match resolve()? {
+        DurableAdmissionOutcome::Admitted(outcome) => outcome.into_admission_cancellation(),
+        DurableAdmissionOutcome::RecoveryPending => {
+            Ok(AdmissionCancellationOutcome::RecoveryPending)
+        }
+        DurableAdmissionOutcome::Cancelled => Ok(AdmissionCancellationOutcome::Cancelled),
+        DurableAdmissionOutcome::Missing => {
+            match persist_cancellation(AdmissionCancellationOutcome::Cancelled)? {
+                DurableAdmissionOutcome::Admitted(outcome) => outcome.into_admission_cancellation(),
+                DurableAdmissionOutcome::RecoveryPending => {
+                    Ok(AdmissionCancellationOutcome::RecoveryPending)
+                }
+                DurableAdmissionOutcome::Cancelled | DurableAdmissionOutcome::Missing => {
+                    Ok(AdmissionCancellationOutcome::Cancelled)
+                }
+            }
+        }
+    }
+}
+
+#[derive(Clone)]
+pub(crate) enum AdmissionCancellationOutcome {
+    Cancelled,
+    ReconciledCancelled,
+    Admitted {
+        session: PublicSession,
+        turn_id: TurnId,
+    },
+    RecoveryPending,
+}
+
+pub(crate) enum DurableAdmissionOutcome {
+    Missing,
+    Admitted(OperationOutcome),
+    Cancelled,
+    RecoveryPending,
 }
 
 #[derive(Clone, Eq, PartialEq)]
@@ -351,10 +874,37 @@ impl<'a> CapacityLeader<'a> {
         }
     }
 
-    fn run(mut self, operation: impl FnOnce() -> SharedResult) -> SharedResult {
-        let result = operation();
-        self.entry.complete(result.clone());
-        self.capacity.clear(&self.entry);
+    fn run(
+        mut self,
+        operation: impl FnOnce(AdmissionCancellation) -> SharedResult,
+        persist_cancellation: &mut impl FnMut(
+            AdmissionCancellationOutcome,
+        ) -> Result<DurableAdmissionOutcome, SatelleError>,
+    ) -> SharedResult {
+        let mut result = operation(self.entry.cancellation.clone());
+        let mut stored = self.entry.lock_result();
+        let cancellation_outcome = match self.entry.cancellation.state() {
+            AdmissionCancellationState::Cancelled => {
+                Some(AdmissionCancellationOutcome::ReconciledCancelled)
+            }
+            AdmissionCancellationState::Requested => {
+                self.entry
+                    .cancellation
+                    .finish(AdmissionCancellationState::Cancelled);
+                Some(AdmissionCancellationOutcome::ReconciledCancelled)
+            }
+            AdmissionCancellationState::RecoveryPending => {
+                Some(AdmissionCancellationOutcome::RecoveryPending)
+            }
+            AdmissionCancellationState::Open | AdmissionCancellationState::Admitted { .. } => None,
+        };
+        if let Some(outcome) = cancellation_outcome
+            && let Err(error) = persist_cancellation(outcome)
+        {
+            result = Err(error);
+        }
+        self.capacity.finalize_and_clear(&self.entry);
+        self.entry.complete_locked(&mut stored, result.clone());
         self.finished = true;
         result
     }
@@ -365,10 +915,14 @@ impl Drop for CapacityLeader<'_> {
         if self.finished {
             return;
         }
-        self.entry.complete(Err(crate::runtime::integrity_error(
-            "the in-flight operation terminated before producing a result",
-        )));
-        self.capacity.clear(&self.entry);
+        let mut stored = self.entry.lock_result();
+        self.capacity.finalize_and_clear(&self.entry);
+        self.entry.complete_locked(
+            &mut stored,
+            Err(crate::runtime::integrity_error(
+                "the in-flight operation terminated before producing a result",
+            )),
+        );
     }
 }
 

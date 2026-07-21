@@ -11,6 +11,7 @@ define_schema_token!(TurnRequestSchema, "satelle.api.v2");
 define_schema_token!(StopRequestSchema, "satelle.api.v1");
 define_schema_token!(SessionSchema, "satelle.session.v1");
 define_schema_token!(SessionStopSchema, "satelle.session.stop.v1");
+define_schema_token!(AdmissionCancellationSchema, "satelle.admission.cancel.v1");
 
 pub(crate) trait ApiRequestContract {
     const SCHEMA_VERSION: &'static str;
@@ -222,6 +223,100 @@ impl AuthenticatedResponseContract for SessionResponse {
 
     fn host_identity(&self) -> &str {
         self.host_identity()
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AdmissionCancellationOutcome {
+    Cancelled,
+    Admitted,
+    RecoveryPending,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct AdmissionCancellationResponse {
+    schema_version: AdmissionCancellationSchema,
+    request_id: RequestId,
+    host_identity: String,
+    outcome: AdmissionCancellationOutcome,
+    session_id: Option<SessionId>,
+    turn_id: Option<TurnId>,
+}
+
+impl AdmissionCancellationResponse {
+    pub(crate) fn cancelled(request_id: RequestId, host_identity: String) -> Self {
+        Self {
+            schema_version: AdmissionCancellationSchema,
+            request_id,
+            host_identity,
+            outcome: AdmissionCancellationOutcome::Cancelled,
+            session_id: None,
+            turn_id: None,
+        }
+    }
+
+    pub(crate) fn admitted(
+        request_id: RequestId,
+        host_identity: String,
+        session_id: SessionId,
+        turn_id: TurnId,
+    ) -> Self {
+        Self {
+            schema_version: AdmissionCancellationSchema,
+            request_id,
+            host_identity,
+            outcome: AdmissionCancellationOutcome::Admitted,
+            session_id: Some(session_id),
+            turn_id: Some(turn_id),
+        }
+    }
+
+    pub(crate) fn recovery_pending(request_id: RequestId, host_identity: String) -> Self {
+        Self {
+            schema_version: AdmissionCancellationSchema,
+            request_id,
+            host_identity,
+            outcome: AdmissionCancellationOutcome::RecoveryPending,
+            session_id: None,
+            turn_id: None,
+        }
+    }
+
+    pub const fn outcome(&self) -> AdmissionCancellationOutcome {
+        self.outcome
+    }
+
+    pub const fn session_id(&self) -> Option<&SessionId> {
+        self.session_id.as_ref()
+    }
+
+    pub const fn turn_id(&self) -> Option<&TurnId> {
+        self.turn_id.as_ref()
+    }
+
+    pub(crate) fn validate(&self) -> bool {
+        matches!(
+            (self.outcome, &self.session_id, &self.turn_id),
+            (AdmissionCancellationOutcome::Admitted, Some(_), Some(_))
+                | (
+                    AdmissionCancellationOutcome::Cancelled
+                        | AdmissionCancellationOutcome::RecoveryPending,
+                    None,
+                    None
+                )
+        )
+    }
+}
+
+impl AuthenticatedResponseContract for AdmissionCancellationResponse {
+    fn request_id(&self) -> &RequestId {
+        &self.request_id
+    }
+
+    fn host_identity(&self) -> &str {
+        &self.host_identity
     }
 }
 
@@ -549,6 +644,37 @@ mod tests {
             "turns":[{"session_id":"rs_01890a5d-ac96-7b7c-8f89-37c3d0a66e11","turn_id":"rt_01890a5d-ac96-7b7c-8f89-37c3d0a66e21","turn_state_revision":1,"state":"starting","started_at":"2024-01-01T00:00:00Z","updated_at":"2024-01-01T00:00:00Z","terminal_at":null,"safe_summary":null}]
         }"#;
         assert!(serde_json::from_str::<SessionResponse>(duplicate).is_err());
+    }
+
+    #[test]
+    fn admission_cancellation_response_requires_handles_only_for_admitted() {
+        let base = serde_json::json!({
+            "schema_version": "satelle.admission.cancel.v1",
+            "request_id": "01890a5d-ac96-7b7c-8f89-37c3d0a66e01",
+            "host_identity": "host-test",
+            "outcome": "admitted",
+            "session_id": "rs_01890a5d-ac96-7b7c-8f89-37c3d0a66e11",
+            "turn_id": "rt_01890a5d-ac96-7b7c-8f89-37c3d0a66e21"
+        });
+        let admitted = serde_json::from_value::<AdmissionCancellationResponse>(base.clone())
+            .expect("decode admitted cancellation response");
+        assert!(admitted.validate());
+
+        let mut missing_turn = base.clone();
+        missing_turn["turn_id"] = serde_json::Value::Null;
+        assert!(
+            !serde_json::from_value::<AdmissionCancellationResponse>(missing_turn)
+                .expect("wire types remain decodable for client validation")
+                .validate()
+        );
+
+        let mut cancelled_with_handles = base;
+        cancelled_with_handles["outcome"] = serde_json::json!("cancelled");
+        assert!(
+            !serde_json::from_value::<AdmissionCancellationResponse>(cancelled_with_handles)
+                .expect("wire types remain decodable for client validation")
+                .validate()
+        );
     }
 
     #[test]

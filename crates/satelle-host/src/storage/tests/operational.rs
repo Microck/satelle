@@ -31,12 +31,12 @@ fn begin_maintenance(
 }
 
 #[test]
-fn operational_evidence_schema_is_migrated_atomically_to_version_nine() {
+fn operational_evidence_schema_is_migrated_atomically_to_version_ten() {
     let state = TempDir::new().expect("temporary state directory");
     let (storage, _) = Storage::open(state.path()).expect("open storage");
     let connection = storage.connection_for_test();
 
-    assert_eq!(9_i64, pragma_integer(connection, "user_version"));
+    assert_eq!(10_i64, pragma_integer(connection, "user_version"));
     let versions = connection
         .prepare("SELECT version FROM schema_migrations ORDER BY version")
         .unwrap()
@@ -46,7 +46,7 @@ fn operational_evidence_schema_is_migrated_atomically_to_version_nine() {
         .unwrap();
     assert_eq!(
         vec![
-            1_i64, 2_i64, 3_i64, 4_i64, 5_i64, 6_i64, 7_i64, 8_i64, 9_i64,
+            1_i64, 2_i64, 3_i64, 4_i64, 5_i64, 6_i64, 7_i64, 8_i64, 9_i64, 10_i64,
         ],
         versions
     );
@@ -66,6 +66,34 @@ fn operational_evidence_schema_is_migrated_atomically_to_version_nine() {
         assert!(exists, "missing operational evidence table {table}");
     }
     assert!(migration_backups(state.path()).is_empty());
+}
+
+#[test]
+fn newer_schema_history_is_rejected_without_downgrade() {
+    let state = TempDir::new().expect("temporary state directory");
+    let (storage, _) = Storage::open(state.path()).expect("open current storage");
+    storage
+        .connection_for_test()
+        .execute(
+            "INSERT INTO schema_migrations (version, checksum, applied_at)
+             VALUES (11, ?1, '2026-07-21T00:00:00Z')",
+            ["aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"],
+        )
+        .expect("insert future migration");
+    storage
+        .connection_for_test()
+        .pragma_update(None, "user_version", 11)
+        .expect("mark future schema");
+    drop(storage);
+
+    let error = match Storage::open(state.path()) {
+        Ok(_) => panic!("future schema must not be downgraded"),
+        Err(error) => error,
+    };
+    assert_eq!(error.kind(), StorageErrorKind::MigrationIntegrity);
+    let connection = Connection::open(state.path().join(DATABASE_FILE_NAME))
+        .expect("future database remains readable");
+    assert_eq!(pragma_integer(&connection, "user_version"), 11);
 }
 
 #[test]
@@ -90,11 +118,12 @@ fn version_seven_api_tokens_upgrade_to_explicit_active_state() {
     storage
         .connection_for_test()
         .execute_batch(
-            "DROP INDEX one_session_per_upstream_goal_ref;
+            "DROP TABLE admission_cancellations;
+             DROP INDEX one_session_per_upstream_goal_ref;
              ALTER TABLE sessions DROP COLUMN display_name;
              ALTER TABLE session_private_refs DROP COLUMN upstream_goal_ref;
              ALTER TABLE api_tokens DROP COLUMN token_state;
-             DELETE FROM schema_migrations WHERE version IN (8, 9);
+             DELETE FROM schema_migrations WHERE version IN (8, 9, 10);
              PRAGMA user_version = 7;",
         )
         .expect("recreate the version seven token schema");
@@ -102,7 +131,7 @@ fn version_seven_api_tokens_upgrade_to_explicit_active_state() {
 
     let (storage, _) = Storage::open(state.path()).expect("upgrade version seven storage");
     assert_eq!(
-        9_i64,
+        10_i64,
         pragma_integer(storage.connection_for_test(), "user_version")
     );
     let token_state: String = storage
@@ -1039,6 +1068,7 @@ fn failed_maintenance_postcheck_commits_failure_ledger_and_release_atomically() 
             evidence,
             reason: "readiness postcondition failed",
             error: satelle_core::SatelleError::computer_use_not_ready(),
+            dispatch_possible: false,
         },
         None,
     );
@@ -1243,7 +1273,8 @@ fn version_one_store_upgrades_without_replacing_existing_state() {
     storage
         .connection_for_test()
         .execute_batch(
-            "DROP TABLE setup_actions;
+            "DROP TABLE admission_cancellations;
+             DROP TABLE setup_actions;
              DROP TABLE setup_runs;
              DROP TABLE native_readiness_results;
              DROP TABLE provider_smoke_results;
@@ -1251,7 +1282,7 @@ fn version_one_store_upgrades_without_replacing_existing_state() {
              ALTER TABLE sessions DROP COLUMN display_name;
              ALTER TABLE session_private_refs DROP COLUMN upstream_goal_ref;
              ALTER TABLE api_tokens DROP COLUMN token_state;
-             DELETE FROM schema_migrations WHERE version IN (2, 3, 4, 5, 6, 7, 8, 9);
+             DELETE FROM schema_migrations WHERE version IN (2, 3, 4, 5, 6, 7, 8, 9, 10);
              PRAGMA user_version = 1;",
         )
         .unwrap();
@@ -1260,7 +1291,7 @@ fn version_one_store_upgrades_without_replacing_existing_state() {
     let (storage, _) = Storage::open(state.path()).expect("upgrade version one storage");
     assert_eq!(expected_host, storage.host_identity().unwrap());
     assert_eq!(
-        9_i64,
+        10_i64,
         pragma_integer(storage.connection_for_test(), "user_version")
     );
 
@@ -1345,7 +1376,8 @@ fn assert_version_one_corruption_rejected_before_migration(
     storage
         .connection_for_test()
         .execute_batch(
-            "DROP TABLE setup_actions;
+            "DROP TABLE admission_cancellations;
+             DROP TABLE setup_actions;
              DROP TABLE setup_runs;
              DROP TABLE native_readiness_results;
              DROP TABLE provider_smoke_results;
@@ -1353,7 +1385,7 @@ fn assert_version_one_corruption_rejected_before_migration(
              ALTER TABLE sessions DROP COLUMN display_name;
              ALTER TABLE session_private_refs DROP COLUMN upstream_goal_ref;
              ALTER TABLE api_tokens DROP COLUMN token_state;
-             DELETE FROM schema_migrations WHERE version IN (2, 3, 4, 5, 6, 7, 8, 9);
+             DELETE FROM schema_migrations WHERE version IN (2, 3, 4, 5, 6, 7, 8, 9, 10);
              PRAGMA user_version = 1;",
         )
         .expect("create a logically corrupt version one store");
@@ -1405,7 +1437,8 @@ fn failed_migration_rolls_back_partial_schema_and_preserves_existing_state() {
     storage
         .connection_for_test()
         .execute_batch(
-            "DROP TABLE setup_actions;
+            "DROP TABLE admission_cancellations;
+             DROP TABLE setup_actions;
              DROP TABLE setup_runs;
              DROP TABLE native_readiness_results;
              DROP TABLE provider_smoke_results;
@@ -1413,7 +1446,7 @@ fn failed_migration_rolls_back_partial_schema_and_preserves_existing_state() {
              ALTER TABLE sessions DROP COLUMN display_name;
              ALTER TABLE session_private_refs DROP COLUMN upstream_goal_ref;
              ALTER TABLE api_tokens DROP COLUMN token_state;
-             DELETE FROM schema_migrations WHERE version IN (2, 3, 4, 5, 6, 7, 8, 9);
+             DELETE FROM schema_migrations WHERE version IN (2, 3, 4, 5, 6, 7, 8, 9, 10);
              PRAGMA user_version = 1;
              CREATE TABLE migration_sentinel (value TEXT NOT NULL) STRICT;
              INSERT INTO migration_sentinel (value) VALUES ('preserve-me');

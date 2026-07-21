@@ -1756,6 +1756,44 @@ fn events_json_with_detach_fails_with_typed_usage_error() {
 }
 
 #[test]
+fn run_and_steer_reject_conflicting_interrupt_modes_before_admission() {
+    let state = state_dir();
+    let session_id = SessionId::new();
+    for arguments in [
+        vec![
+            "run".to_string(),
+            "--host".to_string(),
+            "local-demo".to_string(),
+            "--detach".to_string(),
+            "--detach-on-interrupt".to_string(),
+            "--json".to_string(),
+            "Do not admit this run".to_string(),
+        ],
+        vec![
+            "steer".to_string(),
+            session_id.to_string(),
+            "--detach".to_string(),
+            "--detach-on-interrupt".to_string(),
+            "--json".to_string(),
+            "Do not admit this steer".to_string(),
+        ],
+    ] {
+        let output = satelle()
+            .env("SATELLE_STATE_DIR", state.path())
+            .args(arguments)
+            .assert()
+            .code(64)
+            .stdout(predicate::str::is_empty())
+            .get_output()
+            .clone();
+        let error = parse_json_output(&output.stderr);
+        assert_eq!(error["schema_version"], "satelle.error.v1");
+        assert_eq!(error["code"], "interrupt-mode-conflict");
+    }
+    assert!(!state.path().join("satelle.sqlite3").exists());
+}
+
+#[test]
 fn detach_returns_starting_session_without_event_streaming() {
     let state = state_dir();
     let output = satelle()

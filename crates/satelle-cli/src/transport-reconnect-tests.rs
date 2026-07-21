@@ -463,6 +463,10 @@ fn serve_reconciliation_response(
     let request = read_http_headers(&mut connection);
     let request = String::from_utf8(request).expect("HTTP request headers are UTF-8");
     let request_line = request.lines().next().expect("HTTP request line");
+    assert!(
+        request_line.starts_with("GET "),
+        "event transport loss must reconcile with reads and never issue stop: {request_line}"
+    );
     let is_logs = request_line.starts_with("GET /v1/logs?");
     let request_id = request
         .lines()
@@ -586,7 +590,7 @@ fn transient_http_reconciliation_failure_retains_the_reconnected_stream() {
 }
 
 #[test]
-fn subscribed_replacements_that_close_before_events_exhaust_the_reconnect_budget() {
+fn transport_disconnect_never_stops_active_work_and_exhausts_the_reconnect_budget() {
     let mut fixture = DirectFixture::start();
     let intent = satelle_host::TurnIntent::new(
         "build active reconciliation fixture",

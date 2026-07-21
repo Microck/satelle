@@ -45,6 +45,7 @@ impl Storage {
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|source| sqlite_error(StorageErrorKind::OperationFailed, source))?;
         prune_expired_logs(&transaction, observed_at)?;
+        prune_expired_admission_cancellations(&transaction, observed_at)?;
         let candidates =
             terminal_session_candidates(&transaction, session_cutoff, session_cutoff_nanos)?;
 
@@ -74,6 +75,9 @@ fn retention_needs_pruning(
     if logs_need_pruning(connection, observed_at)? {
         return Ok(true);
     }
+    if admission_cancellations_need_pruning(connection, observed_at)? {
+        return Ok(true);
+    }
     for session_id in terminal_session_candidates(connection, session_cutoff, session_cutoff_nanos)?
     {
         if idempotency_records_allow_deletion(connection, &session_id, observed_at)? {
@@ -81,6 +85,68 @@ fn retention_needs_pruning(
         }
     }
     Ok(!terminal_setup_run_candidates(connection, setup_cutoff)?.is_empty())
+}
+
+fn admission_cancellations_need_pruning(
+    connection: &Connection,
+    observed_at: OffsetDateTime,
+) -> Result<bool, StorageError> {
+    let mut statement = connection
+        .prepare("SELECT expires_at FROM admission_cancellations WHERE outcome = 'cancelled'")
+        .map_err(|source| sqlite_error(StorageErrorKind::OperationFailed, source))?;
+    let rows = statement
+        .query_map([], |row| row.get::<_, String>(0))
+        .map_err(|source| sqlite_error(StorageErrorKind::OperationFailed, source))?;
+    for row in rows {
+        let expires_at =
+            row.map_err(|source| sqlite_error(StorageErrorKind::OperationFailed, source))?;
+        if parse_stored_time(&expires_at)? <= observed_at {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn prune_expired_admission_cancellations(
+    transaction: &Transaction<'_>,
+    observed_at: OffsetDateTime,
+) -> Result<(), StorageError> {
+    let mut statement = transaction
+        .prepare(
+            "SELECT principal_ref, operation, idempotency_key, expires_at
+             FROM admission_cancellations
+             WHERE outcome = 'cancelled'",
+        )
+        .map_err(|source| sqlite_error(StorageErrorKind::OperationFailed, source))?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+            ))
+        })
+        .map_err(|source| sqlite_error(StorageErrorKind::OperationFailed, source))?;
+    let mut expired = Vec::new();
+    for row in rows {
+        let (principal_ref, operation, key, expires_at) =
+            row.map_err(|source| sqlite_error(StorageErrorKind::OperationFailed, source))?;
+        if parse_stored_time(&expires_at)? <= observed_at {
+            expired.push((principal_ref, operation, key));
+        }
+    }
+    drop(statement);
+    for (principal_ref, operation, key) in expired {
+        transaction
+            .execute(
+                "DELETE FROM admission_cancellations
+                 WHERE principal_ref = ?1 AND operation = ?2 AND idempotency_key = ?3",
+                params![principal_ref, operation, key],
+            )
+            .map_err(|source| sqlite_error(StorageErrorKind::OperationFailed, source))?;
+    }
+    Ok(())
 }
 
 fn terminal_session_candidates(

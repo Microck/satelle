@@ -159,9 +159,20 @@ pub(super) fn stop_result(
             StopResult::already_terminal(session_id.clone(), turn_id, (*state).into())
                 .map_err(|_| integrity_failure("invalid terminal stop result"))
         }
-        crate::storage::StopCommitOutcome::NotConfirmed { ownership, changed } => Err(
-            stop_not_confirmed(*ownership, *changed, session_id, &turn_id),
-        ),
+        crate::storage::StopCommitOutcome::NotConfirmed { ownership, changed } => {
+            Err(stop_not_confirmed(
+                *ownership,
+                *changed,
+                session_id,
+                &turn_id,
+                commit.session().session_state_revision(),
+                commit
+                    .session()
+                    .turn(&turn_id)
+                    .ok_or_else(|| integrity_failure("unconfirmed stop Turn is missing"))?
+                    .turn_state_revision(),
+            ))
+        }
     }
 }
 
@@ -180,6 +191,8 @@ fn stop_not_confirmed(
     changed: bool,
     session_id: &SessionId,
     turn_id: &TurnId,
+    session_state_revision: satelle_core::session::SessionStateRevision,
+    turn_state_revision: satelle_core::session::TurnStateRevision,
 ) -> SatelleError {
     let ownership = match ownership {
         RetainedOwnership::Active => "active",
@@ -196,6 +209,14 @@ fn stop_not_confirmed(
         Value::String(ownership.to_string()),
     );
     details.insert("state_changed".to_string(), Value::Bool(changed));
+    details.insert(
+        "session_state_revision".to_string(),
+        Value::from(session_state_revision.get()),
+    );
+    details.insert(
+        "turn_state_revision".to_string(),
+        Value::from(turn_state_revision.get()),
+    );
     details.insert("retryable".to_string(), Value::Bool(true));
     SatelleError {
         code: ErrorCode::StopNotConfirmed,
@@ -213,6 +234,7 @@ pub(super) fn storage_failure(error: StorageError) -> SatelleError {
     match error.kind() {
         StorageErrorKind::InvalidInput => SatelleError::invalid_usage(error.to_string()),
         StorageErrorKind::IdempotencyConflict => idempotency_conflict(),
+        StorageErrorKind::AdmissionCancelled => SatelleError::interrupted_attached_command(),
         StorageErrorKind::Busy => SatelleError::storage_busy(),
         StorageErrorKind::StoreInUse => SatelleError::store_in_use(),
         StorageErrorKind::StateConflict => SatelleError::state_conflict(),

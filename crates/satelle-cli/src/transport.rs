@@ -9,14 +9,17 @@ use satelle_core::{
     persist_new_owner_only_secret_file, read_owner_only_secret_file, read_trusted_ca_bundle_file,
 };
 use satelle_host::{
-    ApiBearerToken, ApiScopes, DaemonLogPage, HostService, HostStatus, LogCursor, LogPageQuery,
-    admission_request_timeout,
+    AdmissionCancellation, ApiBearerToken, ApiScopes, DaemonLogPage, HostService, HostStatus,
+    LogCursor, LogPageQuery, TurnIntent, TurnOutcome, admission_request_timeout,
 };
 use satelle_transport::{
     ApiError, ApiErrorCode, DaemonClient, DaemonClientError, DaemonEventClient, DaemonEventError,
     TurnRequest,
 };
-use std::sync::Arc;
+use std::future::Future;
+use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use std::{fs, path::Path};
 use uuid::Uuid;
@@ -25,6 +28,88 @@ const SSH_DAEMON_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const SSH_DAEMON_LAUNCH_TIMEOUT: Duration = Duration::from_secs(30);
 const SSH_DAEMON_LAUNCH_POLL_INTERVAL: Duration = Duration::from_millis(100);
 pub(crate) const SSH_BOOTSTRAP_LOCK_READY: &str = "satelle-bootstrap-lock-v1";
+
+type InterruptFuture<'a> = Pin<Box<dyn Future<Output = Result<(), std::io::Error>> + Send + 'a>>;
+
+trait InterruptSource: Send + Sync {
+    fn arm(&self) -> InterruptFuture<'_> {
+        Box::pin(async { Ok(()) })
+    }
+
+    fn wait(&self) -> InterruptFuture<'_>;
+}
+
+#[derive(Default)]
+struct ProcessInterrupt {
+    inner: Arc<ProcessInterruptInner>,
+}
+
+#[derive(Default)]
+struct ProcessInterruptInner {
+    started: AtomicBool,
+    armed: AtomicBool,
+    result: Mutex<Option<Result<(), Arc<std::io::Error>>>>,
+    armed_changed: tokio::sync::Notify,
+    changed: tokio::sync::Notify,
+}
+
+impl InterruptSource for ProcessInterrupt {
+    fn arm(&self) -> InterruptFuture<'_> {
+        Box::pin(async move {
+            if !self.inner.started.swap(true, Ordering::AcqRel) {
+                let inner = Arc::clone(&self.inner);
+                tokio::spawn(async move {
+                    let mut signal = Box::pin(tokio::signal::ctrl_c());
+                    let first_poll =
+                        std::future::poll_fn(|context| match signal.as_mut().poll(context) {
+                            std::task::Poll::Ready(result) => std::task::Poll::Ready(Some(result)),
+                            std::task::Poll::Pending => std::task::Poll::Ready(None),
+                        })
+                        .await;
+                    inner.armed.store(true, Ordering::Release);
+                    inner.armed_changed.notify_waiters();
+                    let result = match first_poll {
+                        Some(result) => result,
+                        None => signal.await,
+                    }
+                    .map_err(Arc::new);
+                    *inner
+                        .result
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(result);
+                    inner.changed.notify_waiters();
+                });
+            }
+            loop {
+                let armed = self.inner.armed_changed.notified();
+                if self.inner.armed.load(Ordering::Acquire) {
+                    return Ok(());
+                }
+                armed.await;
+            }
+        })
+    }
+
+    fn wait(&self) -> InterruptFuture<'_> {
+        Box::pin(async move {
+            self.arm().await?;
+            loop {
+                let changed = self.inner.changed.notified();
+                let result = self
+                    .inner
+                    .result
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .clone();
+                if let Some(result) = result {
+                    return result
+                        .map_err(|error| std::io::Error::new(error.kind(), error.to_string()));
+                }
+                changed.await;
+            }
+        })
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, clap::ValueEnum)]
 pub(crate) enum SshBootstrapScope {
@@ -147,6 +232,7 @@ pub(crate) trait TransportClient {
     fn run(
         &self,
         request: &TurnRequest,
+        detach_on_interrupt: bool,
         on_event: &mut dyn FnMut(SatelleEvent) -> Result<(), SatelleError>,
     ) -> Result<AttachedTurnOutcome, TurnAdmissionFailure>;
     fn run_detached(&self, request: &TurnRequest) -> Result<PublicSession, SatelleError>;
@@ -154,6 +240,7 @@ pub(crate) trait TransportClient {
         &self,
         session_id: &SessionId,
         request: &TurnRequest,
+        detach_on_interrupt: bool,
         on_event: &mut dyn FnMut(SatelleEvent) -> Result<(), SatelleError>,
     ) -> Result<AttachedTurnOutcome, TurnAdmissionFailure>;
     fn steer_detached(
@@ -175,6 +262,214 @@ impl LocalTransport {
     fn new(alias: String, service: HostService) -> Self {
         Self { alias, service }
     }
+
+    fn attached(
+        &self,
+        session_id: Option<SessionId>,
+        intent: TurnIntent,
+        detach_on_interrupt: bool,
+    ) -> Result<TurnOutcome, TurnAdmissionFailure> {
+        let interrupt = ProcessInterrupt::default();
+        self.attached_with_interrupt(session_id, intent, detach_on_interrupt, &interrupt)
+    }
+
+    fn attached_with_interrupt(
+        &self,
+        session_id: Option<SessionId>,
+        intent: TurnIntent,
+        detach_on_interrupt: bool,
+        interrupt: &dyn InterruptSource,
+    ) -> Result<TurnOutcome, TurnAdmissionFailure> {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|error| {
+                TurnAdmissionFailure::not_admitted(SatelleError::host_unreachable(&format!(
+                    "{} ({error})",
+                    self.alias
+                )))
+            })?;
+        runtime.block_on(interrupt.arm()).map_err(|error| {
+            TurnAdmissionFailure::not_admitted(SatelleError::host_unreachable(&format!(
+                "{} ({error})",
+                self.alias
+            )))
+        })?;
+        let service = self.service.clone();
+        let operation_service = service.clone();
+        let alias = self.alias.clone();
+        let operation_alias = alias.clone();
+        let cancellation = AdmissionCancellation::new();
+        let operation_cancellation = cancellation.clone();
+        let (operation_sender, mut operation) = tokio::sync::oneshot::channel();
+        std::thread::Builder::new()
+            .name("satelle-local-attached".to_string())
+            .spawn(move || {
+                let result = match session_id {
+                    Some(session_id) => operation_service.steer_with_cancellation(
+                        &session_id,
+                        &intent,
+                        operation_cancellation,
+                    ),
+                    None => operation_service.run_with_cancellation(
+                        &operation_alias,
+                        &intent,
+                        operation_cancellation,
+                    ),
+                };
+                let _ = operation_sender.send(result);
+            })
+            .map_err(|error| {
+                TurnAdmissionFailure::not_admitted(SatelleError::host_unreachable(&format!(
+                    "{alias} ({error})"
+                )))
+            })?;
+        runtime.block_on(async move {
+            tokio::select! {
+                biased;
+                signal = interrupt.wait() => {
+                    signal.map_err(|error| {
+                        TurnAdmissionFailure::not_admitted(SatelleError::host_unreachable(
+                            &format!("{alias} ({error})"),
+                        ))
+                    })?;
+                    cancellation.request();
+                    let Some((admitted_session_id, turn_id)) = cancellation.admitted_handle() else {
+                        let result = operation.await.map_err(|_| {
+                            TurnAdmissionFailure::admission_unknown(
+                                interrupted_admission_race_error(&alias),
+                            )
+                        })?;
+                        return match result {
+                            Ok(_) => Err(TurnAdmissionFailure::admission_unknown(
+                                interrupted_admission_race_error(&alias),
+                            )),
+                            Err(failure) => Err(local_interrupted_admission_failure(failure)),
+                        };
+                    };
+                    let interruption = if detach_on_interrupt {
+                        SatelleError::interrupted_attached_command()
+                    } else {
+                        match service.stop_expected_turn(&admitted_session_id, &turn_id) {
+                            Ok(_) => SatelleError::interrupted_attached_command(),
+                            Err(error) => unconfirmed_interrupt_error(
+                                &alias,
+                                &admitted_session_id,
+                                error,
+                            ),
+                        }
+                    };
+                    let session = service.status(&admitted_session_id).map_err(|status_error| {
+                        TurnAdmissionFailure::admission_unknown(
+                            interrupted_status_error(
+                                &alias,
+                                &admitted_session_id,
+                                interruption.clone(),
+                                status_error,
+                            ),
+                        )
+                    })?;
+                    Err(TurnAdmissionFailure::admitted(
+                        interruption,
+                        session,
+                        turn_id,
+                    ))
+                }
+                result = &mut operation => result.map_err(|error| {
+                    TurnAdmissionFailure::not_admitted(SatelleError::host_unreachable(
+                        &format!("{alias} ({error})"),
+                    ))
+                })?,
+            }
+        })
+    }
+}
+
+fn local_interrupted_admission_failure(failure: TurnAdmissionFailure) -> TurnAdmissionFailure {
+    match failure {
+        TurnAdmissionFailure::NotAdmitted(error) => {
+            TurnAdmissionFailure::not_admitted(local_pre_admission_interruption(*error))
+        }
+        TurnAdmissionFailure::AdmissionUnknown(error) => {
+            TurnAdmissionFailure::admission_unknown(local_pre_admission_interruption(*error))
+        }
+        failure @ TurnAdmissionFailure::Admitted { .. } => failure,
+    }
+}
+
+fn unconfirmed_interrupt_error(
+    alias: &str,
+    session_id: &SessionId,
+    stop_error: SatelleError,
+) -> SatelleError {
+    let status_command = format!("satelle status {session_id} --host {alias}");
+    let mut error = SatelleError::interrupted_attached_command();
+    error.message = format!(
+        "attached command was interrupted, but stop could not be confirmed for Session {session_id}"
+    );
+    error.recovery_command = Some(status_command.clone());
+    error.details.insert(
+        "session_id".to_string(),
+        serde_json::Value::String(session_id.to_string()),
+    );
+    error.details.insert(
+        "status_command".to_string(),
+        serde_json::Value::String(status_command),
+    );
+    error.details.insert(
+        "stop_error_code".to_string(),
+        serde_json::Value::String(stop_error.code.as_str().to_string()),
+    );
+    for (key, value) in stop_error.details {
+        error.details.insert(key, value);
+    }
+    error
+}
+
+fn interrupted_status_error(
+    alias: &str,
+    session_id: &SessionId,
+    mut interruption: SatelleError,
+    status_error: SatelleError,
+) -> SatelleError {
+    let status_command = format!("satelle status {session_id} --host {alias}");
+    interruption.message = format!(
+        "{}; status could not be read for Session {session_id}",
+        interruption.message
+    );
+    interruption.recovery_command = Some(status_command.clone());
+    interruption.details.insert(
+        "session_id".to_string(),
+        serde_json::Value::String(session_id.to_string()),
+    );
+    interruption.details.insert(
+        "status_command".to_string(),
+        serde_json::Value::String(status_command),
+    );
+    interruption.details.insert(
+        "status_error_code".to_string(),
+        serde_json::Value::String(status_error.code.as_str().to_string()),
+    );
+    interruption
+}
+
+fn local_pre_admission_interruption(source: SatelleError) -> SatelleError {
+    let mut error = SatelleError::interrupted_attached_command();
+    if let Some(ownership) = source.details.get("ownership") {
+        error
+            .details
+            .insert("ownership".to_string(), ownership.clone());
+    }
+    error
+}
+
+fn interrupted_admission_race_error(alias: &str) -> SatelleError {
+    let mut error = SatelleError::interrupted_attached_command();
+    error.message =
+        "attached command was interrupted, but local admission state could not be reconciled"
+            .to_string();
+    error.recovery_command = Some(format!("satelle host sessions --host {alias}"));
+    error
 }
 
 impl TransportClient for LocalTransport {
@@ -216,10 +511,11 @@ impl TransportClient for LocalTransport {
     fn run(
         &self,
         request: &TurnRequest,
+        detach_on_interrupt: bool,
         on_event: &mut dyn FnMut(SatelleEvent) -> Result<(), SatelleError>,
     ) -> Result<AttachedTurnOutcome, TurnAdmissionFailure> {
         let intent = local_turn_intent(request).map_err(TurnAdmissionFailure::not_admitted)?;
-        let outcome = self.service.run(&self.alias, &intent)?;
+        let outcome = self.attached(None, intent, detach_on_interrupt)?;
         let turn_id = outcome
             .session
             .turns()
@@ -252,10 +548,11 @@ impl TransportClient for LocalTransport {
         &self,
         session_id: &SessionId,
         request: &TurnRequest,
+        detach_on_interrupt: bool,
         on_event: &mut dyn FnMut(SatelleEvent) -> Result<(), SatelleError>,
     ) -> Result<AttachedTurnOutcome, TurnAdmissionFailure> {
         let intent = local_turn_intent(request).map_err(TurnAdmissionFailure::not_admitted)?;
-        let outcome = self.service.steer(session_id, &intent)?;
+        let outcome = self.attached(Some(session_id.clone()), intent, detach_on_interrupt)?;
         let turn_id = outcome
             .session
             .turns()
@@ -1118,6 +1415,7 @@ impl TransportClient for SshSetupTransport {
     fn run(
         &self,
         _request: &TurnRequest,
+        _detach_on_interrupt: bool,
         _on_event: &mut dyn FnMut(SatelleEvent) -> Result<(), SatelleError>,
     ) -> Result<AttachedTurnOutcome, TurnAdmissionFailure> {
         Err(TurnAdmissionFailure::not_admitted(self.unsupported("run")))
@@ -1131,6 +1429,7 @@ impl TransportClient for SshSetupTransport {
         &self,
         _session_id: &SessionId,
         _request: &TurnRequest,
+        _detach_on_interrupt: bool,
         _on_event: &mut dyn FnMut(SatelleEvent) -> Result<(), SatelleError>,
     ) -> Result<AttachedTurnOutcome, TurnAdmissionFailure> {
         Err(TurnAdmissionFailure::not_admitted(
@@ -1216,10 +1515,11 @@ impl TransportClient for DirectTransport {
     fn run(
         &self,
         request: &TurnRequest,
+        detach_on_interrupt: bool,
         on_event: &mut dyn FnMut(SatelleEvent) -> Result<(), SatelleError>,
     ) -> Result<AttachedTurnOutcome, TurnAdmissionFailure> {
         self.event_runtime
-            .block_on(self.run_attached(request, on_event))
+            .block_on(self.run_attached(request, detach_on_interrupt, on_event))
     }
 
     fn run_detached(&self, request: &TurnRequest) -> Result<PublicSession, SatelleError> {
@@ -1233,10 +1533,15 @@ impl TransportClient for DirectTransport {
         &self,
         session_id: &SessionId,
         request: &TurnRequest,
+        detach_on_interrupt: bool,
         on_event: &mut dyn FnMut(SatelleEvent) -> Result<(), SatelleError>,
     ) -> Result<AttachedTurnOutcome, TurnAdmissionFailure> {
-        self.event_runtime
-            .block_on(self.steer_attached(session_id, request, on_event))
+        self.event_runtime.block_on(self.steer_attached(
+            session_id,
+            request,
+            detach_on_interrupt,
+            on_event,
+        ))
     }
 
     fn steer_detached(
@@ -1700,6 +2005,9 @@ fn direct_logs_error(host: &str, error: DaemonClientError) -> SatelleError {
 // safely. Validate that recovery boundary at the transport boundary instead
 // of collapsing it into the generic remote API error used for other codes.
 fn map_api_error(host: &str, error: &ApiError) -> SatelleError {
+    if error.code() == ApiErrorCode::StopNotConfirmed {
+        return map_stop_not_confirmed_api_error(host, error);
+    }
     if error.code() != ApiErrorCode::LogsCursorExpired {
         return api_code_error(host, error.code());
     }
@@ -1730,6 +2038,63 @@ fn map_api_error(host: &str, error: &ApiError) -> SatelleError {
         earliest_available_cursor.map(|cursor| cursor.to_string()),
         resume_cursor.to_string(),
     )
+}
+
+fn map_stop_not_confirmed_api_error(host: &str, error: &ApiError) -> SatelleError {
+    let Some(details) = error.details().and_then(serde_json::Value::as_object) else {
+        return SatelleError::remote_api_error(host, "invalid-daemon-response");
+    };
+    if details.len() != 7 {
+        return SatelleError::remote_api_error(host, "invalid-daemon-response");
+    }
+    let Some(session_id) = details
+        .get("session_id")
+        .and_then(serde_json::Value::as_str)
+        .and_then(|value| SessionId::parse(value).ok())
+    else {
+        return SatelleError::remote_api_error(host, "invalid-daemon-response");
+    };
+    let Some(_turn_id) = details
+        .get("turn_id")
+        .and_then(serde_json::Value::as_str)
+        .and_then(|value| TurnId::parse(value).ok())
+    else {
+        return SatelleError::remote_api_error(host, "invalid-daemon-response");
+    };
+    if !matches!(
+        details.get("ownership").and_then(serde_json::Value::as_str),
+        Some("active" | "recovery_pending")
+    ) || details
+        .get("state_changed")
+        .and_then(serde_json::Value::as_bool)
+        .is_none()
+        || details
+            .get("session_state_revision")
+            .and_then(serde_json::Value::as_u64)
+            .and_then(|value| satelle_core::session::SessionStateRevision::new(value).ok())
+            .is_none()
+        || details
+            .get("turn_state_revision")
+            .and_then(serde_json::Value::as_u64)
+            .and_then(|value| satelle_core::session::TurnStateRevision::new(value).ok())
+            .is_none()
+        || details
+            .get("retryable")
+            .and_then(serde_json::Value::as_bool)
+            != Some(true)
+    {
+        return SatelleError::remote_api_error(host, "invalid-daemon-response");
+    }
+    SatelleError {
+        code: ErrorCode::StopNotConfirmed,
+        message: "stop was not confirmed; Satelle retained control of the Turn".to_string(),
+        recovery_command: Some(format!(
+            "satelle status {} --host {host}",
+            session_id.as_str()
+        )),
+        source_detail: None,
+        details: details.clone().into_iter().collect(),
+    }
 }
 
 fn direct_admission_error(host: &str, error: DaemonClientError) -> TurnAdmissionFailure {

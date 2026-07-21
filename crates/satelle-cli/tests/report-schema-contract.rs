@@ -13,6 +13,7 @@ fn satelle() -> Command {
         "SATELLE_CONFIG_FILE",
         "SATELLE_STATE_DIR",
         "SATELLE_CACHE_DIR",
+        "SATELLE_LOG",
         "SATELLE_LOG_DIR",
         "SATELLE_HOST",
         "SATELLE_PROFILE",
@@ -48,6 +49,81 @@ fn assert_report_contract(report: &Value, schema_version: &str, expected_fields:
         .collect::<BTreeSet<_>>();
     let expected_fields = expected_fields.iter().copied().collect::<BTreeSet<_>>();
     assert_eq!(actual_fields, expected_fields);
+}
+
+fn json_command_result(state: &TestStateDir, args: Vec<&str>) -> Value {
+    let output = satelle()
+        .env("SATELLE_STATE_DIR", state.path())
+        .args(args)
+        .assert()
+        .get_output()
+        .clone();
+    let result = match (output.stdout.is_empty(), output.stderr.is_empty()) {
+        (false, true) => &output.stdout,
+        (true, false) => &output.stderr,
+        _ => panic!("a JSON command must emit exactly one result stream"),
+    };
+    serde_json::from_slice(result).expect("command result should be one JSON object")
+}
+
+#[test]
+fn every_named_json_command_result_has_a_top_level_schema_version() {
+    let state = TestStateDir::new().expect("secure temp state directory should be created");
+    let run = json_command_result(
+        &state,
+        vec!["run", "--host", "local-demo", "--json", "Inspect"],
+    );
+    let session_id = run["session_id"]
+        .as_str()
+        .expect("run should return a Session identifier")
+        .to_string();
+
+    let command_results = [
+        run,
+        json_command_result(
+            &state,
+            vec!["steer", &session_id, "--json", "Continue inspection"],
+        ),
+        json_command_result(&state, vec!["stop", &session_id, "--json"]),
+        json_command_result(&state, vec!["status", &session_id, "--json"]),
+        json_command_result(
+            &state,
+            vec!["setup", "--host", "local-demo", "--dry-run", "--json"],
+        ),
+        json_command_result(
+            &state,
+            vec!["repair", "--host", "local-demo", "--dry-run", "--json"],
+        ),
+        json_command_result(&state, vec!["doctor", "--host", "local-demo", "--json"]),
+        json_command_result(&state, vec!["config", "check", "--json"]),
+        json_command_result(&state, vec!["config", "explain", "--json"]),
+        json_command_result(&state, vec!["self", "update", "--dry-run", "--json"]),
+        json_command_result(
+            &state,
+            vec!["host", "update", "--host", "local-demo", "--json"],
+        ),
+        json_command_result(&state, vec!["paths", "--json"]),
+        json_command_result(
+            &state,
+            vec![
+                "host",
+                "sessions",
+                "--host",
+                "local-demo",
+                "--no-bootstrap",
+                "--json",
+            ],
+        ),
+    ];
+
+    for result in command_results {
+        assert!(
+            result
+                .get("schema_version")
+                .is_some_and(serde_json::Value::is_string),
+            "JSON result lacks a top-level schema_version: {result}"
+        );
+    }
 }
 
 #[test]

@@ -2037,6 +2037,7 @@ pub enum ErrorCode {
     DoctorRefreshTimeoutWithoutRefresh,
     SessionNotFound,
     EventsWithDetach,
+    InterruptModeConflict,
     OutputModeConflict,
     LogTailLimitExceeded,
     LogPositionConflict,
@@ -2115,6 +2116,7 @@ impl ErrorCode {
             Self::DoctorRefreshTimeoutWithoutRefresh => "refresh-timeout-without-refresh",
             Self::SessionNotFound => "session-not-found",
             Self::EventsWithDetach => "events-with-detach",
+            Self::InterruptModeConflict => "interrupt-mode-conflict",
             Self::OutputModeConflict => "output-mode-conflict",
             Self::LogTailLimitExceeded => "log-tail-limit-exceeded",
             Self::LogPositionConflict => "log-position-conflict",
@@ -2137,6 +2139,7 @@ impl ErrorCode {
             Self::InvalidUsage
             | Self::IdempotencyKeyConflict
             | Self::EventsWithDetach
+            | Self::InterruptModeConflict
             | Self::OutputModeConflict
             | Self::LogTailLimitExceeded
             | Self::LogPositionConflict
@@ -2930,6 +2933,16 @@ impl SatelleError {
             code: ErrorCode::EventsWithDetach,
             message: "--events human and --events json require an attached run".to_string(),
             recovery_command: Some("remove --detach or use --events none".to_string()),
+            source_detail: None,
+            details: BTreeMap::new(),
+        }
+    }
+
+    pub fn interrupt_mode_conflict() -> Self {
+        Self {
+            code: ErrorCode::InterruptModeConflict,
+            message: "--detach-on-interrupt cannot be combined with --detach".to_string(),
+            recovery_command: Some("remove --detach or remove --detach-on-interrupt".to_string()),
             source_detail: None,
             details: BTreeMap::new(),
         }

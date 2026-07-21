@@ -34,7 +34,11 @@ impl RuntimeEngine {
         let outcome = loop {
             let target = self
                 .lock_storage()?
-                .stop_admission_target(&command.session_id, &idempotency)
+                .stop_admission_target(
+                    &command.session_id,
+                    &idempotency,
+                    command.expected_turn_id.as_ref(),
+                )
                 .map_err(|error| model::storage_failure_for_session(error, &command.session_id))?;
             if target.requires_control_plane() {
                 self.adapter.admit_operation(ControlPlaneOperation::Stop)?;
@@ -45,7 +49,12 @@ impl RuntimeEngine {
                 .begin_stop(&command.session_id, &turn_id, &idempotency)
             {
                 Ok(outcome) => break outcome,
-                Err(error) if error.kind() == StorageErrorKind::StateConflict => continue,
+                Err(error)
+                    if error.kind() == StorageErrorKind::StateConflict
+                        && command.expected_turn_id.is_none() =>
+                {
+                    continue;
+                }
                 Err(error) => {
                     return Err(model::storage_failure_for_session(
                         error,

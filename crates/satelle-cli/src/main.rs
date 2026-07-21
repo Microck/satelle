@@ -502,6 +502,8 @@ struct RunCommand {
     #[arg(long)]
     detach: bool,
     #[arg(long)]
+    detach_on_interrupt: bool,
+    #[arg(long)]
     quiet: bool,
     #[arg(long)]
     verbose: bool,
@@ -540,6 +542,8 @@ struct SteerCommand {
     host: Option<String>,
     #[arg(long)]
     detach: bool,
+    #[arg(long)]
+    detach_on_interrupt: bool,
     #[arg(long)]
     quiet: bool,
     #[arg(long)]
@@ -705,6 +709,13 @@ mod process_boundary_tests {
         assert!(process_has_disallowed_bearer_token(&[exposed
             .as_str()
             .into()]));
+    }
+
+    #[test]
+    fn detach_interrupt_mode_conflict_is_typed_usage() {
+        let failure = validate_interrupt_mode(true, true).expect_err("detach modes must conflict");
+        assert_eq!(failure.error.code, ErrorCode::InterruptModeConflict);
+        assert_eq!(failure.error.exit_code(), 64);
     }
 }
 
@@ -4892,6 +4903,7 @@ fn run_prompt(
     format: OutputFormat,
 ) -> Result<SessionId, CliFailure> {
     let json = format.is_json();
+    validate_interrupt_mode(command.detach, command.detach_on_interrupt)?;
     validate_event_mode(command.detach, command.events)?;
     let effective_mode = effective_event_mode(command.events, command.detach, command.quiet, json);
     let mut event_output = TurnEventOutput::new(effective_mode, command.verbose);
@@ -4969,8 +4981,9 @@ fn run_prompt(
     event_output
         .emit_preflight(&host.alias, "run", &host.config.transport)
         .map_err(failure)?;
-    let outcome = match transport.run(&request, &mut |event| event_output.emit(&host.alias, event))
-    {
+    let outcome = match transport.run(&request, command.detach_on_interrupt, &mut |event| {
+        event_output.emit(&host.alias, event)
+    }) {
         Ok(outcome) => outcome,
         Err(attached_failure) => {
             let history_session_id = attached_failure
@@ -5013,6 +5026,7 @@ fn steer_prompt(
     format: OutputFormat,
 ) -> Result<SessionId, CliFailure> {
     let json = format.is_json();
+    validate_interrupt_mode(command.detach, command.detach_on_interrupt)?;
     validate_event_mode(command.detach, command.events)?;
     let effective_mode = effective_event_mode(command.events, command.detach, command.quiet, json);
     let mut event_output = TurnEventOutput::new(effective_mode, command.verbose);
@@ -5097,9 +5111,12 @@ fn steer_prompt(
     event_output
         .emit_preflight(&host.alias, "steer", &host.config.transport)
         .map_err(failure)?;
-    let outcome = match transport.steer(&session_id, &request, &mut |event| {
-        event_output.emit(&host.alias, event)
-    }) {
+    let outcome = match transport.steer(
+        &session_id,
+        &request,
+        command.detach_on_interrupt,
+        &mut |event| event_output.emit(&host.alias, event),
+    ) {
         Ok(outcome) => outcome,
         Err(attached_failure) => {
             let history_session_id = attached_failure
@@ -5206,6 +5223,13 @@ fn validate_event_mode(detach: bool, mode: EventMode) -> Result<(), CliFailure> 
         return Err(failure(SatelleError::events_with_detach()));
     }
 
+    Ok(())
+}
+
+fn validate_interrupt_mode(detach: bool, detach_on_interrupt: bool) -> Result<(), CliFailure> {
+    if detach && detach_on_interrupt {
+        return Err(failure(SatelleError::interrupt_mode_conflict()));
+    }
     Ok(())
 }
 
@@ -5404,26 +5428,7 @@ impl TurnEventOutput {
         if self.mode != EffectiveEventMode::Json {
             return Ok(());
         }
-        let (session_id, turn_id) = durable_handles.unzip();
-        let body = SatelleEventBody::new(
-            EventType::CommandFailed,
-            EventSource::Cli,
-            OffsetDateTime::now_utc(),
-            host,
-            None,
-            error.message.clone(),
-            json!({
-                "code": error.code.as_str(),
-                "message": &error.message,
-                "recovery_command": &error.recovery_command,
-                "source_detail": &error.source_detail,
-                "details": &error.details,
-                "admission_phase": admission_phase.as_str(),
-                "session_id": session_id,
-                "turn_id": turn_id,
-            }),
-        )
-        .map_err(|error| SatelleError::invalid_usage(error.to_string()))?;
+        let body = command_failed_event_body(host, error, admission_phase, durable_handles)?;
         self.emit_body(body)
     }
 
@@ -5463,6 +5468,34 @@ impl TurnEventOutput {
             EffectiveEventMode::None => Ok(()),
         }
     }
+}
+
+fn command_failed_event_body(
+    host: &str,
+    error: &SatelleError,
+    admission_phase: TurnAdmissionPhase,
+    durable_handles: Option<(&SessionId, &satelle_core::TurnId)>,
+) -> Result<SatelleEventBody, SatelleError> {
+    let (session_id, turn_id) = durable_handles.unzip();
+    SatelleEventBody::new(
+        EventType::CommandFailed,
+        EventSource::Cli,
+        OffsetDateTime::now_utc(),
+        host,
+        None,
+        error.message.clone(),
+        json!({
+            "code": error.code.as_str(),
+            "message": &error.message,
+            "recovery_command": &error.recovery_command,
+            "source_detail": &error.source_detail,
+            "details": &error.details,
+            "admission_phase": admission_phase.as_str(),
+            "session_id": session_id,
+            "turn_id": turn_id,
+        }),
+    )
+    .map_err(|error| SatelleError::invalid_usage(error.to_string()))
 }
 
 fn event_output_error(error: io::Error) -> SatelleError {
@@ -5596,6 +5629,31 @@ mod admitted_session_failure_tests {
         );
 
         assert_eq!(failure.history_session_id.as_deref(), Some(&session_id));
+    }
+
+    fn assert_unknown_machine_event(host: &str) {
+        let body = command_failed_event_body(
+            host,
+            &SatelleError::interrupted_attached_command(),
+            TurnAdmissionPhase::AdmissionUnknown,
+            None,
+        )
+        .expect("construct command-failed event");
+
+        assert_eq!(body.event_type(), EventType::CommandFailed);
+        assert_eq!(body.data()["admission_phase"], "admission_unknown");
+        assert!(body.data()["session_id"].is_null());
+        assert!(body.data()["turn_id"].is_null());
+    }
+
+    #[test]
+    fn run_machine_event_preserves_unknown_admission_phase() {
+        assert_unknown_machine_event("run-host");
+    }
+
+    #[test]
+    fn steer_machine_event_preserves_unknown_admission_phase() {
+        assert_unknown_machine_event("steer-host");
     }
 }
 

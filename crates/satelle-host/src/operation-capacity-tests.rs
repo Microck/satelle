@@ -1,19 +1,1171 @@
 use crate::operation_capacity::{OperationCapacity, OperationOutcome, OperationRequest};
 use crate::runtime::{
-    AdapterReadiness, AdapterSubject, ComputerUseAdapter, ExecuteRequest, ExecuteResult,
-    RecoveryObservation, RequestIdentity, RuntimeHandle,
+    AdapterReadiness, AdapterSubject, AdmissionCancellation, ComputerUseAdapter, ExecuteRequest,
+    ExecuteResult, RecoveryObservation, RequestIdentity, RuntimeHandle,
 };
 use crate::storage::IdempotentOperation;
 use crate::test_runtime::FakeComputerUseAdapter;
 use crate::{ApiBearerToken, ApiScopes, HostMode, HostService, MutationAuthority, TurnIntent};
 use satelle_core::session::{PublicSession, StopObservation, TurnExecutionMode};
-use satelle_core::{ErrorCode, SatelleError};
+use satelle_core::{ControlPlaneOperation, ErrorCode, SatelleError, SessionId, TurnId};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, mpsc};
 use std::time::Duration;
 
 const WAIT_LIMIT: Duration = Duration::from_secs(2);
+
+#[test]
+fn cancellation_registered_before_run_uses_the_same_gate_and_prevents_admission() {
+    let state = crate::TestStateDir::new().expect("temporary state directory");
+    let service = service(state.path(), ControlledAdapter::default());
+    let mutation = authority(&service, "interrupt-principal", "cancel-first-run");
+    assert!(matches!(
+        service
+            .cancel_run_admission(&intent("cancel before run registration"), &mutation,)
+            .expect("cancellation must return without waiting for admission"),
+        crate::AdmissionCancellationResult::Cancelled
+    ));
+    assert!(
+        service
+            .operation_capacity
+            .activity_snapshot()
+            .expect("capacity remains readable")
+            .0,
+        "cancellation-first registration must not occupy mutation capacity"
+    );
+
+    let admission_error = service
+        .admit_run(&intent("cancel before run registration"), &mutation)
+        .expect_err("the registered cancellation must prevent durable admission");
+    assert_eq!(admission_error.code, ErrorCode::Interrupted);
+    assert_eq!(
+        service
+            .daemon_runtime_status()
+            .expect("runtime status remains available")
+            .session_count(),
+        0
+    );
+}
+
+#[test]
+fn durable_cancellations_survive_pressure_restart_and_digest_conflicts() {
+    let state = crate::TestStateDir::new().expect("temporary state directory");
+    let host = service(state.path(), ControlledAdapter::default());
+    let principal = "durable-cancellation-principal";
+    let token = ApiBearerToken::generate().expect("generate API token");
+    let principal = host
+        .register_api_token(&token, principal, ApiScopes::CONTROL, None)
+        .expect("register API principal");
+    for index in 0..1_025 {
+        let prompt = format!("durable cancellation {index}");
+        let mutation = MutationAuthority::new(principal.clone(), format!("durable-cancel-{index}"))
+            .expect("construct mutation authority");
+        assert!(matches!(
+            host.cancel_run_admission(&intent(&prompt), &mutation)
+                .expect("persist cancellation tombstone"),
+            crate::AdmissionCancellationResult::Cancelled
+        ));
+    }
+    let original = MutationAuthority::new(principal, "durable-cancel-0")
+        .expect("construct original mutation authority");
+    let conflict = host
+        .admit_run(&intent("different durable cancellation digest"), &original)
+        .expect_err("same base key with a different digest must conflict");
+    assert_eq!(conflict.code, ErrorCode::IdempotencyKeyConflict);
+    drop(host);
+
+    let restarted = service(state.path(), ControlledAdapter::default());
+    let delayed = restarted
+        .admit_run(&intent("durable cancellation 0"), &original)
+        .expect_err("oldest unexpired cancellation must survive pressure and restart");
+    assert_eq!(delayed.code, ErrorCode::Interrupted);
+}
+
+#[test]
+fn cancellation_registered_before_steer_prevents_follow_up_admission() {
+    let state = crate::TestStateDir::new().expect("temporary state directory");
+    let service = service(state.path(), ControlledAdapter::default());
+    let seed_authority = authority(&service, "interrupt-principal", "cancel-first-steer-seed");
+    let session = service
+        .admit_run(&intent("seed cancellation-first steer"), &seed_authority)
+        .expect("seed Session");
+    service
+        .runtime
+        .wait_for_background()
+        .expect("seed Turn completes");
+    let initial_turn_count = session.turns().len();
+
+    let mutation = authority(&service, "interrupt-principal", "cancel-first-steer");
+    assert!(matches!(
+        service
+            .cancel_steer_admission(
+                session.session_id(),
+                &intent("cancel before steer registration"),
+                &mutation,
+            )
+            .expect("cancellation must return without waiting for admission"),
+        crate::AdmissionCancellationResult::Cancelled
+    ));
+    assert!(
+        service
+            .operation_capacity
+            .activity_snapshot()
+            .expect("capacity remains readable")
+            .0,
+        "steer cancellation-first registration must not occupy mutation capacity"
+    );
+
+    let admission_error = service
+        .admit_steer(
+            session.session_id(),
+            &intent("cancel before steer registration"),
+            &mutation,
+        )
+        .expect_err("the registered cancellation must prevent follow-up admission");
+    assert_eq!(admission_error.code, ErrorCode::Interrupted);
+    assert_eq!(
+        service
+            .runtime
+            .status(session.session_id().clone())
+            .expect("seed Session remains readable")
+            .turns()
+            .len(),
+        initial_turn_count
+    );
+}
+
+#[test]
+fn expected_turn_stop_never_retargets_a_newer_active_turn() {
+    let state = crate::TestStateDir::new().expect("temporary state directory");
+    let adapter = ControlledAdapter::default();
+    let service = service(state.path(), adapter.clone());
+    let seed = service
+        .admit_run(
+            &intent("seed expected-Turn stop"),
+            &authority(&service, "expected-turn-principal", "expected-turn-seed"),
+        )
+        .expect("seed Session");
+    let old_turn_id = seed
+        .turns()
+        .last()
+        .expect("seed Session has a Turn")
+        .turn_id()
+        .clone();
+    service
+        .runtime
+        .wait_for_background()
+        .expect("seed Turn completes");
+
+    adapter.block_execution.store(true, Ordering::SeqCst);
+    let steered = service
+        .admit_steer(
+            seed.session_id(),
+            &intent("new active Turn"),
+            &authority(&service, "expected-turn-principal-2", "expected-turn-steer"),
+        )
+        .expect("admit newer Turn");
+    let new_turn_id = steered
+        .turns()
+        .last()
+        .expect("steered Session has a Turn")
+        .turn_id()
+        .clone();
+    assert!(adapter.execute_started.wait_for(WAIT_LIMIT));
+
+    let error = service
+        .stop_expected_turn(seed.session_id(), &old_turn_id)
+        .expect_err("stale expected Turn must not retarget");
+    assert_eq!(error.code, ErrorCode::StateConflict);
+    assert_eq!(adapter.stop_calls.load(Ordering::SeqCst), 0);
+    let current = service
+        .session_status(seed.session_id())
+        .expect("read current Session");
+    assert!(
+        !current
+            .turns()
+            .iter()
+            .find(|turn| turn.turn_id() == &new_turn_id)
+            .expect("new Turn remains present")
+            .state()
+            .is_terminal()
+    );
+    adapter.execute_release.signal();
+    service
+        .runtime
+        .wait_for_background()
+        .expect("new Turn completes");
+}
+
+#[test]
+fn cancellation_registered_during_preflight_prevents_durable_turn_admission() {
+    let state = crate::TestStateDir::new().expect("temporary state directory");
+    let adapter = ControlledAdapter::default();
+    adapter.block_next_preflight();
+    let service = service(state.path(), adapter.clone());
+    let mutation = authority(&service, "interrupt-principal", "interrupt-run");
+    let leader_service = service.clone();
+    let leader_authority = mutation.clone();
+    let leader = std::thread::spawn(move || {
+        leader_service.admit_run(&intent("cancel before admission"), &leader_authority)
+    });
+    assert!(
+        adapter.preflight_started.wait_for(WAIT_LIMIT),
+        "the readiness preflight must be active before cancellation"
+    );
+
+    let cancellation_service = service.clone();
+    let cancellation = std::thread::spawn(move || {
+        cancellation_service.cancel_run_admission(&intent("cancel before admission"), &mutation)
+    });
+    assert!(
+        service
+            .operation_capacity
+            .wait_for_cancellation_request(WAIT_LIMIT),
+        "cancellation must request the matching admission before preflight resumes"
+    );
+
+    adapter.preflight_release.signal();
+    let admission_error = leader
+        .join()
+        .expect("admission thread must not panic")
+        .expect_err("cancellation must win before durable admission");
+    assert_eq!(admission_error.code, ErrorCode::Interrupted);
+    match cancellation
+        .join()
+        .expect("cancellation thread must not panic")
+        .expect("cancellation must return a typed outcome")
+    {
+        crate::AdmissionCancellationResult::Cancelled => {}
+        crate::AdmissionCancellationResult::RecoveryPending => {
+            panic!("pre-dispatch cancellation must not retain recovery ownership")
+        }
+        crate::AdmissionCancellationResult::Admitted { .. } => {
+            panic!("the commit gate must prevent admission")
+        }
+    }
+    assert_eq!(
+        service
+            .daemon_runtime_status()
+            .expect("runtime status remains available")
+            .session_count(),
+        0
+    );
+}
+
+#[test]
+fn active_cancellation_requests_before_slow_tombstone_persistence() {
+    let capacity = Arc::new(OperationCapacity::default());
+    let request = operation_request("principal-a", "slow-active-persistence", DIGEST_A);
+    let operation_started = Latch::default();
+    let operation_release = Latch::default();
+    let persistence_started = Latch::default();
+    let persistence_release = Latch::default();
+    let expected = admission_outcome(coordinator_result_session());
+
+    let operation_capacity = Arc::clone(&capacity);
+    let operation_request = request.clone();
+    let started_signal = operation_started.clone();
+    let operation_release_wait = operation_release.clone();
+    let operation_expected = expected.clone();
+    let operation = std::thread::spawn(move || {
+        operation_capacity.execute_interruptible_durable(
+            operation_request,
+            AdmissionCancellation::new(),
+            || Ok(crate::operation_capacity::DurableAdmissionOutcome::Missing),
+            |outcome| match outcome {
+                crate::operation_capacity::AdmissionCancellationOutcome::ReconciledCancelled => {
+                    Ok(crate::operation_capacity::DurableAdmissionOutcome::Cancelled)
+                }
+                crate::operation_capacity::AdmissionCancellationOutcome::RecoveryPending => {
+                    Ok(crate::operation_capacity::DurableAdmissionOutcome::RecoveryPending)
+                }
+                _ => Ok(crate::operation_capacity::DurableAdmissionOutcome::Missing),
+            },
+            |cancellation| {
+                started_signal.signal();
+                operation_release_wait.wait();
+                cancellation
+                    .with_commit_gate(SessionId::new(), TurnId::new(), || Ok(operation_expected))
+            },
+        )
+    });
+    assert!(operation_started.wait_for(WAIT_LIMIT));
+
+    let cancellation_capacity = Arc::clone(&capacity);
+    let persistence_started_signal = persistence_started.clone();
+    let persistence_release_wait = persistence_release.clone();
+    let cancellation = std::thread::spawn(move || {
+        let mut persistence_call = 0_u8;
+        cancellation_capacity.cancel_durable(
+            request,
+            || Ok(crate::operation_capacity::DurableAdmissionOutcome::Missing),
+            |outcome| {
+                persistence_call += 1;
+                if persistence_call == 1 {
+                    assert!(matches!(
+                        outcome,
+                        crate::operation_capacity::AdmissionCancellationOutcome::RecoveryPending
+                    ));
+                    persistence_started_signal.signal();
+                    persistence_release_wait.wait();
+                }
+                Ok(match outcome {
+                    crate::operation_capacity::AdmissionCancellationOutcome::RecoveryPending => {
+                        crate::operation_capacity::DurableAdmissionOutcome::RecoveryPending
+                    }
+                    crate::operation_capacity::AdmissionCancellationOutcome::Cancelled
+                    | crate::operation_capacity::AdmissionCancellationOutcome::ReconciledCancelled => {
+                        crate::operation_capacity::DurableAdmissionOutcome::Cancelled
+                    }
+                    crate::operation_capacity::AdmissionCancellationOutcome::Admitted { .. } => {
+                        unreachable!("the persistence seam receives only cancellation outcomes")
+                    }
+                })
+            },
+        )
+    });
+    assert!(
+        persistence_started.wait_for(WAIT_LIMIT),
+        "durable persistence must remain blocked after the token is requested"
+    );
+    assert!(
+        capacity.wait_for_cancellation_request(WAIT_LIMIT),
+        "the exact active token must be requested before persistence"
+    );
+
+    operation_release.signal();
+    let operation_error = match operation.join().expect("operation thread must not panic") {
+        Ok(_) => panic!("the commit gate must reject the cancelled admission"),
+        Err(error) => error,
+    };
+    assert_eq!(operation_error.code, ErrorCode::Interrupted);
+    persistence_release.signal();
+    assert!(matches!(
+        cancellation
+            .join()
+            .expect("cancellation thread must not panic")
+            .expect("cancellation must finish after persistence resumes"),
+        crate::operation_capacity::AdmissionCancellationOutcome::Cancelled
+    ));
+}
+
+#[test]
+fn local_precommit_failure_racing_with_cancellation_is_reconciled_cancelled() {
+    let capacity = Arc::new(OperationCapacity::default());
+    let request = operation_request("principal-a", "precommit-storage-failure", DIGEST_A);
+    let storage_write_started = Latch::default();
+    let storage_write_release = Latch::default();
+
+    let operation_capacity = Arc::clone(&capacity);
+    let operation_request = request.clone();
+    let storage_write_started_signal = storage_write_started.clone();
+    let storage_write_release_wait = storage_write_release.clone();
+    let operation = std::thread::spawn(move || {
+        let wait_capacity = Arc::clone(&operation_capacity);
+        operation_capacity.execute_interruptible_durable(
+            operation_request,
+            AdmissionCancellation::new(),
+            || Ok(crate::operation_capacity::DurableAdmissionOutcome::Missing),
+            |outcome| {
+                Ok(match outcome {
+                    crate::operation_capacity::AdmissionCancellationOutcome::ReconciledCancelled => {
+                        crate::operation_capacity::DurableAdmissionOutcome::Cancelled
+                    }
+                    crate::operation_capacity::AdmissionCancellationOutcome::RecoveryPending => {
+                        crate::operation_capacity::DurableAdmissionOutcome::RecoveryPending
+                    }
+                    _ => crate::operation_capacity::DurableAdmissionOutcome::Missing,
+                })
+            },
+            |cancellation| {
+                let result = cancellation.with_commit_gate(
+                    SessionId::new(),
+                    TurnId::new(),
+                    || {
+                        storage_write_started_signal.signal();
+                        storage_write_release_wait.wait();
+                        Err(crate::runtime::integrity_error(
+                            "synthetic precommit storage failure",
+                        ))
+                    },
+                );
+                assert!(
+                    wait_capacity.wait_for_cancellation_request(WAIT_LIMIT),
+                    "cancellation must become Requested after the failing commit gate unlocks"
+                );
+                result
+            },
+        )
+    });
+    assert!(
+        storage_write_started.wait_for(WAIT_LIMIT),
+        "the synthetic storage write must hold the commit gate"
+    );
+
+    let cancellation_capacity = Arc::clone(&capacity);
+    let cancellation = std::thread::spawn(move || {
+        cancellation_capacity.cancel_durable(
+            request,
+            || Ok(crate::operation_capacity::DurableAdmissionOutcome::Missing),
+            |outcome| {
+                Ok(match outcome {
+                    crate::operation_capacity::AdmissionCancellationOutcome::RecoveryPending => {
+                        crate::operation_capacity::DurableAdmissionOutcome::RecoveryPending
+                    }
+                    crate::operation_capacity::AdmissionCancellationOutcome::Cancelled
+                    | crate::operation_capacity::AdmissionCancellationOutcome::ReconciledCancelled => {
+                        crate::operation_capacity::DurableAdmissionOutcome::Cancelled
+                    }
+                    crate::operation_capacity::AdmissionCancellationOutcome::Admitted { .. } => {
+                        unreachable!("the persistence seam receives only cancellation outcomes")
+                    }
+                })
+            },
+        )
+    });
+    storage_write_release.signal();
+    assert!(
+        operation
+            .join()
+            .expect("operation thread must not panic")
+            .is_err(),
+        "the synthetic precommit storage failure must remain the admission result"
+    );
+    assert!(matches!(
+        cancellation
+            .join()
+            .expect("cancellation thread must not panic")
+            .expect("known local failure must reconcile cancellation"),
+        crate::operation_capacity::AdmissionCancellationOutcome::Cancelled
+    ));
+    capacity
+        .execute_exclusive(|| Ok(()))
+        .expect("known local failure must release Host mutation capacity");
+}
+
+#[test]
+fn completion_linearizes_before_a_cloned_late_cancellation_request() {
+    #[derive(Clone, Copy)]
+    enum Completion {
+        KnownPrecommitFailure,
+        PossibleDispatch,
+        Admitted,
+    }
+
+    for completion in [
+        Completion::KnownPrecommitFailure,
+        Completion::PossibleDispatch,
+        Completion::Admitted,
+    ] {
+        let capacity = Arc::new(OperationCapacity::default());
+        let request = operation_request(
+            "principal-completion-race",
+            match completion {
+                Completion::KnownPrecommitFailure => "completion-known-failure",
+                Completion::PossibleDispatch => "completion-possible-dispatch",
+                Completion::Admitted => "completion-admitted",
+            },
+            DIGEST_A,
+        );
+        let operation_started = Latch::default();
+        let operation_release = Latch::default();
+        let durable_state = Arc::new(AtomicUsize::new(0));
+        let admitted_session = coordinator_result_session();
+        let admitted_turn_id = admitted_session.turns()[0].turn_id().clone();
+
+        capacity.pause_next_cancellation_before_request();
+        let operation_capacity = Arc::clone(&capacity);
+        let operation_request = request.clone();
+        let operation_started_signal = operation_started.clone();
+        let operation_release_wait = operation_release.clone();
+        let operation_durable_state = Arc::clone(&durable_state);
+        let operation_session = admitted_session.clone();
+        let operation_turn_id = admitted_turn_id.clone();
+        let operation = std::thread::spawn(move || {
+            operation_capacity.execute_interruptible_durable(
+                operation_request,
+                AdmissionCancellation::new(),
+                || match operation_durable_state.load(Ordering::SeqCst) {
+                    0 => Ok(crate::operation_capacity::DurableAdmissionOutcome::Missing),
+                    1 => Ok(crate::operation_capacity::DurableAdmissionOutcome::Cancelled),
+                    2 => Ok(crate::operation_capacity::DurableAdmissionOutcome::RecoveryPending),
+                    _ => unreachable!("the synthetic durable state is closed"),
+                },
+                |outcome| {
+                    let state = match outcome {
+                        crate::operation_capacity::AdmissionCancellationOutcome::Cancelled
+                        | crate::operation_capacity::AdmissionCancellationOutcome::ReconciledCancelled => 1,
+                        crate::operation_capacity::AdmissionCancellationOutcome::RecoveryPending => 2,
+                        crate::operation_capacity::AdmissionCancellationOutcome::Admitted { .. } => {
+                            unreachable!("the persistence seam receives only cancellation outcomes")
+                        }
+                    };
+                    operation_durable_state.store(state, Ordering::SeqCst);
+                    Ok(match state {
+                        1 => crate::operation_capacity::DurableAdmissionOutcome::Cancelled,
+                        2 => crate::operation_capacity::DurableAdmissionOutcome::RecoveryPending,
+                        _ => unreachable!("the synthetic durable state is closed"),
+                    })
+                },
+                |cancellation| {
+                    operation_started_signal.signal();
+                    operation_release_wait.wait();
+                    match completion {
+                        Completion::KnownPrecommitFailure => Err(crate::runtime::integrity_error(
+                            "synthetic known precommit failure",
+                        )),
+                        Completion::PossibleDispatch => {
+                            cancellation.finish(
+                                crate::runtime::AdmissionCancellationState::RecoveryPending,
+                            );
+                            Err(crate::runtime::integrity_error(
+                                "synthetic possible dispatch failure",
+                            ))
+                        }
+                        Completion::Admitted => {
+                            cancellation.with_commit_gate(
+                                operation_session.session_id().clone(),
+                                operation_turn_id.clone(),
+                                || Ok(()),
+                            )?;
+                            Ok(OperationOutcome::admission(
+                                operation_session,
+                                operation_turn_id,
+                            ))
+                        }
+                    }
+                },
+            )
+        });
+        assert!(operation_started.wait_for(WAIT_LIMIT));
+
+        let cancellation_capacity = Arc::clone(&capacity);
+        let cancellation_request = request.clone();
+        let cancellation_durable_state = Arc::clone(&durable_state);
+        let cancellation = std::thread::spawn(move || {
+            cancellation_capacity.cancel_durable(
+                cancellation_request,
+                || match cancellation_durable_state.load(Ordering::SeqCst) {
+                    0 => Ok(crate::operation_capacity::DurableAdmissionOutcome::Missing),
+                    1 => Ok(crate::operation_capacity::DurableAdmissionOutcome::Cancelled),
+                    2 => Ok(crate::operation_capacity::DurableAdmissionOutcome::RecoveryPending),
+                    _ => unreachable!("the synthetic durable state is closed"),
+                },
+                |outcome| {
+                    let state = match outcome {
+                        crate::operation_capacity::AdmissionCancellationOutcome::Cancelled
+                        | crate::operation_capacity::AdmissionCancellationOutcome::ReconciledCancelled => 1,
+                        crate::operation_capacity::AdmissionCancellationOutcome::RecoveryPending => 2,
+                        crate::operation_capacity::AdmissionCancellationOutcome::Admitted { .. } => {
+                            unreachable!("the persistence seam receives only cancellation outcomes")
+                        }
+                    };
+                    cancellation_durable_state.store(state, Ordering::SeqCst);
+                    Ok(match state {
+                        1 => crate::operation_capacity::DurableAdmissionOutcome::Cancelled,
+                        2 => crate::operation_capacity::DurableAdmissionOutcome::RecoveryPending,
+                        _ => unreachable!("the synthetic durable state is closed"),
+                    })
+                },
+            )
+        });
+        assert!(
+            capacity.wait_for_cancellation_before_request(WAIT_LIMIT),
+            "the canceller must clone the active entry before completion"
+        );
+
+        operation_release.signal();
+        let operation_result = operation.join().expect("operation thread must not panic");
+        capacity.release_cancellation_before_request();
+        let cancellation_result = cancellation
+            .join()
+            .expect("cancellation thread must not panic")
+            .expect("late cancellation must resolve deterministically");
+
+        match completion {
+            Completion::KnownPrecommitFailure => {
+                assert!(operation_result.is_err());
+                assert!(matches!(
+                    cancellation_result,
+                    crate::operation_capacity::AdmissionCancellationOutcome::Cancelled
+                ));
+                assert_eq!(durable_state.load(Ordering::SeqCst), 1);
+            }
+            Completion::PossibleDispatch => {
+                assert!(operation_result.is_err());
+                assert!(matches!(
+                    cancellation_result,
+                    crate::operation_capacity::AdmissionCancellationOutcome::RecoveryPending
+                ));
+                assert_eq!(durable_state.load(Ordering::SeqCst), 2);
+            }
+            Completion::Admitted => {
+                operation_result.expect("the synthetic admission completes");
+                match cancellation_result {
+                    crate::operation_capacity::AdmissionCancellationOutcome::Admitted {
+                        session,
+                        turn_id,
+                    } => {
+                        assert_eq!(session.session_id(), admitted_session.session_id());
+                        assert_eq!(turn_id, admitted_turn_id);
+                    }
+                    _ => panic!("the completed admission must win late cancellation"),
+                }
+                assert_eq!(durable_state.load(Ordering::SeqCst), 0);
+            }
+        }
+    }
+}
+
+#[test]
+fn adapter_admission_rejection_racing_with_cancellation_releases_capacity() {
+    let state = crate::TestStateDir::new().expect("temporary state directory");
+    let adapter = ControlledAdapter::default();
+    adapter.block_next_admission_rejection();
+    let service = service(state.path(), adapter.clone());
+    let mutation = authority(&service, "rejected-principal", "rejected-admission");
+
+    let admission_service = service.clone();
+    let admission_authority = mutation.clone();
+    let admission = std::thread::spawn(move || {
+        admission_service.admit_run(
+            &intent("adapter rejects before dispatch"),
+            &admission_authority,
+        )
+    });
+    assert!(adapter.admission_started.wait_for(WAIT_LIMIT));
+
+    let cancellation_service = service.clone();
+    let cancellation = std::thread::spawn(move || {
+        cancellation_service
+            .cancel_run_admission(&intent("adapter rejects before dispatch"), &mutation)
+    });
+    assert!(
+        service
+            .operation_capacity
+            .wait_for_cancellation_request(WAIT_LIMIT)
+    );
+    adapter.admission_release.signal();
+
+    assert_eq!(
+        admission
+            .join()
+            .expect("admission thread must not panic")
+            .expect_err("adapter admission rejection must fail locally")
+            .code,
+        ErrorCode::ComputerUseNotReady
+    );
+    assert!(matches!(
+        cancellation
+            .join()
+            .expect("cancellation thread must not panic")
+            .expect("local rejection must reconcile cancellation"),
+        crate::AdmissionCancellationResult::Cancelled
+    ));
+    assert!(
+        service
+            .operation_capacity
+            .activity_snapshot()
+            .expect("capacity remains readable")
+            .0
+    );
+    let lease_count: i64 = rusqlite::Connection::open(state.path().join("satelle.sqlite3"))
+        .expect("open authoritative store for lease inspection")
+        .query_row("SELECT count(*) FROM control_leases", [], |row| row.get(0))
+        .expect("count retained leases");
+    assert_eq!(
+        lease_count, 0,
+        "pre-dispatch rejection must retain no lease"
+    );
+}
+
+#[test]
+fn unresolved_operation_cancellation_is_recovery_pending_not_confirmed_cancelled() {
+    let capacity = Arc::new(OperationCapacity::default());
+    let operation_started = Latch::default();
+    let operation_release = Latch::default();
+    let operation_capacity = Arc::clone(&capacity);
+    let started_signal = operation_started.clone();
+    let release_wait = operation_release.clone();
+    let operation = std::thread::spawn(move || {
+        operation_capacity.execute_interruptible(
+            operation_request("principal-a", "ambiguous-cancel", DIGEST_A),
+            AdmissionCancellation::new(),
+            || Ok(None),
+            |cancellation| {
+                started_signal.signal();
+                release_wait.wait();
+                assert!(cancellation.is_requested());
+                cancellation.finish(crate::runtime::AdmissionCancellationState::RecoveryPending);
+                Err(crate::runtime::integrity_error(
+                    "the interrupted operation ended without a terminal cancellation observation",
+                ))
+            },
+        )
+    });
+    assert!(
+        operation_started.wait_for(WAIT_LIMIT),
+        "the operation must be active before cancellation"
+    );
+
+    let cancellation_capacity = Arc::clone(&capacity);
+    let cancellation = std::thread::spawn(move || {
+        cancellation_capacity.cancel(
+            operation_request("principal-a", "ambiguous-cancel", DIGEST_A),
+            || Ok(None),
+        )
+    });
+    assert!(
+        capacity.wait_for_cancellation_request(WAIT_LIMIT),
+        "cancellation must request the active operation before it terminates"
+    );
+    operation_release.signal();
+    if operation
+        .join()
+        .expect("operation thread must not panic")
+        .is_ok()
+    {
+        panic!("the synthetic operation must remain ambiguous");
+    }
+    assert!(matches!(
+        cancellation
+            .join()
+            .expect("cancellation thread must not panic")
+            .expect("ambiguous cancellation returns a typed outcome"),
+        crate::operation_capacity::AdmissionCancellationOutcome::RecoveryPending
+    ));
+    assert!(matches!(
+        capacity
+            .cancel(
+                operation_request("principal-a", "ambiguous-cancel", DIGEST_A),
+                || Ok(None),
+            )
+            .expect("the terminal cancellation outcome must replay"),
+        crate::operation_capacity::AdmissionCancellationOutcome::RecoveryPending
+    ));
+    capacity
+        .execute_exclusive(|| Ok(()))
+        .expect("recovery-pending replay must not retain mutation capacity");
+}
+
+#[test]
+fn cancellation_without_admission_returns_and_reclaims_capacity() {
+    let capacity = OperationCapacity::default();
+    let request = operation_request("principal-a", "never-admitted", DIGEST_A);
+
+    assert!(matches!(
+        capacity
+            .cancel(request.clone(), || Ok(None))
+            .expect("cancellation-first registration returns immediately"),
+        crate::operation_capacity::AdmissionCancellationOutcome::Cancelled
+    ));
+    assert!(
+        capacity
+            .activity_snapshot()
+            .expect("capacity remains readable")
+            .0
+    );
+    capacity
+        .execute_exclusive(|| Ok(()))
+        .expect("cancellation-first registration must not retain mutation capacity");
+    assert!(matches!(
+        capacity
+            .cancel(request.clone(), || Ok(None))
+            .expect("an exact repeated cancellation replays"),
+        crate::operation_capacity::AdmissionCancellationOutcome::Cancelled
+    ));
+
+    let invoked = AtomicBool::new(false);
+    let error = match capacity.execute_interruptible(
+        request,
+        AdmissionCancellation::new(),
+        || Ok(None),
+        |_| {
+            invoked.store(true, Ordering::SeqCst);
+            Ok(admission_outcome(coordinator_result_session()))
+        },
+    ) {
+        Ok(_) => panic!("the late admission must remain cancelled"),
+        Err(error) => error,
+    };
+    assert_eq!(error.code, ErrorCode::Interrupted);
+    assert!(!invoked.load(Ordering::SeqCst));
+}
+
+#[test]
+fn admission_failure_before_cancellation_registration_cannot_escape_cancellation() {
+    let capacity = Arc::new(OperationCapacity::default());
+    let replay_started = Latch::default();
+    let replay_release = Latch::default();
+    let cancellation_capacity = Arc::clone(&capacity);
+    let replay_started_signal = replay_started.clone();
+    let replay_release_wait = replay_release.clone();
+    let cancellation = std::thread::spawn(move || {
+        cancellation_capacity.cancel(
+            operation_request("principal-a", "failed-before-register", DIGEST_A),
+            || {
+                replay_started_signal.signal();
+                replay_release_wait.wait();
+                Ok(None)
+            },
+        )
+    });
+    assert!(
+        replay_started.wait_for(WAIT_LIMIT),
+        "cancellation must finish its initial capacity probe"
+    );
+
+    let failed = capacity.execute(
+        operation_request("principal-a", "failed-before-register", DIGEST_A),
+        || Ok(None),
+        || {
+            Err(crate::runtime::integrity_error(
+                "synthetic immediate admission failure",
+            ))
+        },
+    );
+    assert!(failed.is_err());
+    replay_release.signal();
+    assert!(matches!(
+        cancellation
+            .join()
+            .expect("cancellation thread must not panic")
+            .expect("cancellation must linearize after the failed admission"),
+        crate::operation_capacity::AdmissionCancellationOutcome::Cancelled
+    ));
+
+    let late = capacity.execute(
+        operation_request("principal-a", "failed-before-register", DIGEST_A),
+        || Ok(None),
+        || Ok(admission_outcome(coordinator_result_session())),
+    );
+    let error = match late {
+        Ok(_) => panic!("the late exact admission must remain cancelled"),
+        Err(error) => error,
+    };
+    assert_eq!(error.code, ErrorCode::Interrupted);
+}
+
+#[test]
+fn cancellation_persistence_linearizes_with_late_active_install_and_upgrades_ambiguity() {
+    let capacity = Arc::new(OperationCapacity::default());
+    let request = operation_request("principal-a", "persist-install-race", DIGEST_A);
+    let durable_state = Arc::new(AtomicUsize::new(0));
+    let persistence_started = Latch::default();
+    let admission_resolved_missing = Latch::default();
+    let cancellation_persisted = Latch::default();
+    let operation_started = Latch::default();
+    let operation_release = Latch::default();
+
+    let cancellation_capacity = Arc::clone(&capacity);
+    let cancellation_request = request.clone();
+    let cancellation_state = Arc::clone(&durable_state);
+    let cancellation_persistence_started = persistence_started.clone();
+    let cancellation_admission_resolved = admission_resolved_missing.clone();
+    let cancellation_persisted_signal = cancellation_persisted.clone();
+    let cancellation_operation_started = operation_started.clone();
+    let cancellation = std::thread::spawn(move || {
+        cancellation_capacity.cancel_durable(
+            cancellation_request,
+            || Ok(crate::operation_capacity::DurableAdmissionOutcome::Missing),
+            |outcome| match outcome {
+                crate::operation_capacity::AdmissionCancellationOutcome::Cancelled => {
+                    cancellation_persistence_started.signal();
+                    cancellation_admission_resolved.wait();
+                    cancellation_state.store(1, Ordering::SeqCst);
+                    cancellation_persisted_signal.signal();
+                    cancellation_operation_started.wait();
+                    Ok(crate::operation_capacity::DurableAdmissionOutcome::Cancelled)
+                }
+                crate::operation_capacity::AdmissionCancellationOutcome::RecoveryPending => {
+                    cancellation_state.store(2, Ordering::SeqCst);
+                    Ok(crate::operation_capacity::DurableAdmissionOutcome::RecoveryPending)
+                }
+                crate::operation_capacity::AdmissionCancellationOutcome::ReconciledCancelled => {
+                    cancellation_state.store(1, Ordering::SeqCst);
+                    Ok(crate::operation_capacity::DurableAdmissionOutcome::Cancelled)
+                }
+                crate::operation_capacity::AdmissionCancellationOutcome::Admitted { .. } => {
+                    unreachable!("the synthetic persistence seam only receives cancellations")
+                }
+            },
+        )
+    });
+    assert!(
+        persistence_started.wait_for(WAIT_LIMIT),
+        "cancellation must enter persistence before admission resolves"
+    );
+
+    let admission_capacity = Arc::clone(&capacity);
+    let admission_state = Arc::clone(&durable_state);
+    let admission_resolved_signal = admission_resolved_missing.clone();
+    let admission_cancellation_persisted = cancellation_persisted.clone();
+    let admission_operation_started = operation_started.clone();
+    let admission_operation_release = operation_release.clone();
+    let admission = std::thread::spawn(move || {
+        admission_capacity.execute_interruptible_durable(
+            request,
+            AdmissionCancellation::new(),
+            || {
+                let observed = admission_state.load(Ordering::SeqCst);
+                admission_resolved_signal.signal();
+                admission_cancellation_persisted.wait();
+                assert_eq!(
+                    observed, 0,
+                    "admission must have resolved Missing before cancellation persisted"
+                );
+                Ok(crate::operation_capacity::DurableAdmissionOutcome::Missing)
+            },
+            |_| {
+                admission_state.store(2, Ordering::SeqCst);
+                Ok(crate::operation_capacity::DurableAdmissionOutcome::RecoveryPending)
+            },
+            |cancellation| {
+                admission_operation_started.signal();
+                admission_operation_release.wait();
+                cancellation.finish(crate::runtime::AdmissionCancellationState::RecoveryPending);
+                Err(crate::runtime::integrity_error(
+                    "the possibly dispatched admission remained ambiguous",
+                ))
+            },
+        )
+    });
+
+    assert!(
+        operation_started.wait_for(WAIT_LIMIT),
+        "the admission must install before cancellation rechecks capacity"
+    );
+    assert!(
+        capacity.wait_for_cancellation_request(WAIT_LIMIT),
+        "cancellation must find and signal the active admission after persistence"
+    );
+    operation_release.signal();
+    assert!(
+        admission
+            .join()
+            .expect("admission thread must not panic")
+            .is_err(),
+        "the synthetic active admission must remain ambiguous"
+    );
+    assert!(matches!(
+        cancellation
+            .join()
+            .expect("cancellation thread must not panic")
+            .expect("cancellation returns a typed outcome"),
+        crate::operation_capacity::AdmissionCancellationOutcome::RecoveryPending
+    ));
+    assert_eq!(
+        durable_state.load(Ordering::SeqCst),
+        2,
+        "the cancellation-first tombstone must atomically upgrade to recovery_pending"
+    );
+}
+
+#[test]
+fn cancellation_ledger_matches_every_operation_identity_dimension() {
+    let capacity = OperationCapacity::default();
+    let original = operation_request("principal-a", "identity-key", DIGEST_A);
+    assert!(matches!(
+        capacity
+            .cancel(original.clone(), || Ok(None))
+            .expect("the original cancellation registers"),
+        crate::operation_capacity::AdmissionCancellationOutcome::Cancelled
+    ));
+    assert!(matches!(
+        capacity
+            .cancel(original.clone(), || Ok(None))
+            .expect("the exact cancellation replays"),
+        crate::operation_capacity::AdmissionCancellationOutcome::Cancelled
+    ));
+
+    for request in [
+        operation_request("principal-b", "identity-key", DIGEST_A),
+        operation_request("principal-a", "different-key", DIGEST_A),
+        operation_request_for(
+            IdempotentOperation::Steer,
+            "principal-a",
+            "identity-key",
+            DIGEST_A,
+        ),
+    ] {
+        assert!(
+            capacity
+                .execute(
+                    request,
+                    || Ok(None),
+                    || Ok(admission_outcome(coordinator_result_session())),
+                )
+                .is_ok(),
+            "a principal, key, or operation mismatch must not consume the cancellation"
+        );
+    }
+
+    let digest_conflict = capacity.cancel(
+        operation_request("principal-a", "identity-key", DIGEST_CONFLICT),
+        || Ok(None),
+    );
+    let error = match digest_conflict {
+        Ok(_) => panic!("a changed digest on the same base must conflict"),
+        Err(error) => error,
+    };
+    assert_eq!(error.code, ErrorCode::IdempotencyKeyConflict);
+}
+
+#[test]
+fn admission_winning_late_cancellation_clears_the_provisional_recovery_record() {
+    let capacity = Arc::new(OperationCapacity::default());
+    let committed = Latch::default();
+    let release = Latch::default();
+    let admitted_session = coordinator_result_session();
+    let session_id = admitted_session.session_id().clone();
+    let turn_id = admitted_session.turns()[0].turn_id().clone();
+    let operation_capacity = Arc::clone(&capacity);
+    let operation_session = admitted_session.clone();
+    let operation_turn_id = turn_id.clone();
+    let committed_signal = committed.clone();
+    let release_wait = release.clone();
+    let operation = std::thread::spawn(move || {
+        operation_capacity.execute_interruptible(
+            operation_request("principal-a", "admission-wins", DIGEST_A),
+            AdmissionCancellation::new(),
+            || Ok(None),
+            |cancellation| {
+                cancellation
+                    .with_commit_gate(session_id, operation_turn_id.clone(), || Ok(()))
+                    .expect("the admission commit wins before cancellation");
+                committed_signal.signal();
+                release_wait.wait();
+                Ok(OperationOutcome::admission(
+                    operation_session,
+                    operation_turn_id,
+                ))
+            },
+        )
+    });
+    assert!(
+        committed.wait_for(WAIT_LIMIT),
+        "the admission must commit before cancellation"
+    );
+
+    let cancellation_capacity = Arc::clone(&capacity);
+    let cancellation_session = admitted_session.clone();
+    let cancellation_turn_id = turn_id.clone();
+    let cancellation = std::thread::spawn(move || {
+        cancellation_capacity.cancel(
+            operation_request("principal-a", "admission-wins", DIGEST_A),
+            || {
+                Ok(Some(OperationOutcome::admission(
+                    cancellation_session.clone(),
+                    cancellation_turn_id.clone(),
+                )))
+            },
+        )
+    });
+    assert!(
+        capacity.wait_for_follower_registration(WAIT_LIMIT),
+        "late cancellation must join the committed admission"
+    );
+    release.signal();
+    operation
+        .join()
+        .expect("operation thread must not panic")
+        .expect("the committed admission succeeds");
+    match cancellation
+        .join()
+        .expect("cancellation thread must not panic")
+        .expect("late cancellation returns an admitted outcome")
+    {
+        crate::operation_capacity::AdmissionCancellationOutcome::Admitted {
+            session,
+            turn_id: admitted_turn_id,
+        } => {
+            assert_eq!(session.session_id(), admitted_session.session_id());
+            assert_eq!(admitted_turn_id, turn_id);
+        }
+        _ => panic!("the committed admission must win late cancellation"),
+    }
+
+    let replay_session = admitted_session.clone();
+    let replay_turn_id = turn_id.clone();
+    assert!(
+        capacity
+            .execute(
+                operation_request("principal-a", "admission-wins", DIGEST_A),
+                || {
+                    Ok(Some(OperationOutcome::admission(
+                        replay_session.clone(),
+                        replay_turn_id.clone(),
+                    )))
+                },
+                || panic!("the exact admission must replay"),
+            )
+            .is_ok(),
+        "the provisional recovery record must not block exact admission replay"
+    );
+    assert!(matches!(
+        capacity
+            .cancel(
+                operation_request("principal-a", "admission-wins", DIGEST_A),
+                || {
+                    Ok(Some(OperationOutcome::admission(
+                        admitted_session.clone(),
+                        turn_id.clone(),
+                    )))
+                },
+            )
+            .expect("repeated cancellation must use durable admitted replay"),
+        crate::operation_capacity::AdmissionCancellationOutcome::Admitted { .. }
+    ));
+}
+
+#[test]
+fn cancellation_replay_returns_the_exact_original_turn_handle() {
+    let state = crate::TestStateDir::new().expect("temporary state directory");
+    let service = service(state.path(), ControlledAdapter::default());
+    let run_authority = authority(&service, "interrupt-principal", "original-run");
+    let original = service
+        .admit_run(&intent("original run"), &run_authority)
+        .expect("the original run is admitted");
+    let original_turn_id = original
+        .turns()
+        .last()
+        .expect("the original run has one Turn")
+        .turn_id()
+        .clone();
+    service
+        .runtime
+        .wait_for_background()
+        .expect("the original run completes");
+
+    let steer_authority = authority(&service, "interrupt-principal", "later-steer");
+    let later = service
+        .admit_steer(
+            original.session_id(),
+            &intent("later steer"),
+            &steer_authority,
+        )
+        .expect("a later Turn is admitted");
+    assert_ne!(
+        later
+            .turns()
+            .last()
+            .expect("the later Session has a target Turn")
+            .turn_id(),
+        &original_turn_id
+    );
+
+    let cancellation = service
+        .cancel_run_admission(&intent("original run"), &run_authority)
+        .expect("the durable run replay is available");
+    match cancellation {
+        crate::AdmissionCancellationResult::Admitted { session, turn_id } => {
+            assert_eq!(session.session_id(), original.session_id());
+            assert_eq!(turn_id, original_turn_id);
+        }
+        _ => panic!("the committed run must return an admitted cancellation result"),
+    }
+}
 
 #[test]
 fn one_host_global_slot_is_shared_by_clones_and_principals() {
@@ -84,6 +1236,203 @@ fn setup_token_issuance_shares_the_host_global_slot() {
         .runtime
         .wait_for_background()
         .expect("run execution must finish");
+}
+
+#[test]
+fn hmac_rotation_waits_for_active_admission_identity_cancellation() {
+    let state = crate::TestStateDir::new().expect("temporary state directory");
+    let adapter = ControlledAdapter::default();
+    adapter.block_next_preflight();
+    let service = service(state.path(), adapter.clone());
+    let mutation = authority(&service, "rotation-principal", "rotation-active-run");
+    let leader_service = service.clone();
+    let leader_mutation = mutation.clone();
+    let leader = std::thread::spawn(move || {
+        leader_service.admit_run(
+            &intent("cancel active admission before HMAC rotation"),
+            &leader_mutation,
+        )
+    });
+    assert!(
+        adapter.preflight_started.wait_for(WAIT_LIMIT),
+        "the admission must retain its request identity while occupying capacity"
+    );
+
+    let cancellation_service = service.clone();
+    let cancellation = std::thread::spawn(move || {
+        cancellation_service.cancel_run_admission(
+            &intent("cancel active admission before HMAC rotation"),
+            &mutation,
+        )
+    });
+    assert!(
+        service
+            .operation_capacity
+            .wait_for_cancellation_request(WAIT_LIMIT),
+        "cancellation must signal the active identity before rotation"
+    );
+    let rotation_service = service.clone();
+    let rotation = std::thread::spawn(move || rotation_service.rotate_idempotency_hmac_key());
+    adapter.preflight_release.signal();
+    assert_eq!(
+        leader
+            .join()
+            .expect("admission thread must not panic")
+            .expect_err("cancellation must prevent admission")
+            .code,
+        ErrorCode::Interrupted
+    );
+    assert!(matches!(
+        cancellation
+            .join()
+            .expect("cancellation thread must not panic")
+            .expect("cancellation must return a typed result"),
+        crate::AdmissionCancellationResult::Cancelled
+    ));
+    assert_eq!(
+        rotation
+            .join()
+            .expect("rotation thread must not panic")
+            .expect("rotation may proceed after cancellation resolves"),
+        2
+    );
+}
+
+#[test]
+fn identical_stop_and_hmac_rotation_preserve_lock_ordering() {
+    let state = crate::TestStateDir::new().expect("temporary state directory");
+    let adapter = ControlledAdapter::default();
+    adapter.block_execution.store(true, Ordering::SeqCst);
+    adapter.block_stop.store(true, Ordering::SeqCst);
+    let service = service(state.path(), adapter.clone());
+    let session = service
+        .admit_run(
+            &intent("active turn for stop rotation"),
+            &authority(&service, "stop-rotation-principal", "stop-rotation-run"),
+        )
+        .expect("admit active turn");
+    assert!(adapter.execute_started.wait_for(WAIT_LIMIT));
+    let stop_authority = authority(
+        &service,
+        "stop-rotation-principal",
+        "stop-rotation-identity",
+    );
+
+    let leader_service = service.clone();
+    let leader_session_id = session.session_id().clone();
+    let leader_authority = stop_authority.clone();
+    let leader = std::thread::spawn(move || {
+        leader_service.admit_stop(&leader_session_id, &leader_authority)
+    });
+    assert!(adapter.stop_started.wait_for(WAIT_LIMIT));
+
+    let rotation_started = Latch::default();
+    let rotation_started_signal = rotation_started.clone();
+    let rotation_service = service.clone();
+    let rotation = std::thread::spawn(move || {
+        rotation_started_signal.signal();
+        rotation_service.rotate_idempotency_hmac_key()
+    });
+    assert!(rotation_started.wait_for(WAIT_LIMIT));
+
+    let follower_service = service.clone();
+    let follower_session_id = session.session_id().clone();
+    let follower = std::thread::spawn(move || {
+        follower_service.admit_stop(&follower_session_id, &stop_authority)
+    });
+
+    adapter.stop_release.signal();
+    let first = leader
+        .join()
+        .expect("stop leader thread must not panic")
+        .expect("stop leader must finish");
+    assert_eq!(
+        rotation
+            .join()
+            .expect("rotation thread must not panic")
+            .expect("rotation must wait for the stop read gate before taking capacity"),
+        2
+    );
+    let replayed = follower
+        .join()
+        .expect("identical stop thread must not panic")
+        .expect("identical stop must derive its original request identity");
+    assert_eq!(first, replayed);
+    assert_eq!(adapter.stop_calls.load(Ordering::SeqCst), 1);
+
+    adapter.execute_release.signal();
+    service
+        .runtime
+        .wait_for_background()
+        .expect("active execution must finish after stop");
+}
+
+#[test]
+fn identical_requests_remain_one_identity_across_an_attempted_hmac_rotation() {
+    let state = crate::TestStateDir::new().expect("temporary state directory");
+    let adapter = ControlledAdapter::default();
+    adapter.block_next_preflight();
+    let service = service(state.path(), adapter.clone());
+    let mutation = authority(&service, "rotation-principal", "rotation-identical-run");
+
+    let leader_service = service.clone();
+    let leader_mutation = mutation.clone();
+    let leader = std::thread::spawn(move || {
+        leader_service.admit_run(
+            &intent("identity held through registration"),
+            &leader_mutation,
+        )
+    });
+    assert!(
+        adapter.preflight_started.wait_for(WAIT_LIMIT),
+        "the first request must hold its derived identity through active registration"
+    );
+
+    let rotation_started = Latch::default();
+    let rotation_started_signal = rotation_started.clone();
+    let rotation_service = service.clone();
+    let rotation = std::thread::spawn(move || {
+        rotation_started_signal.signal();
+        rotation_service.rotate_idempotency_hmac_key()
+    });
+    assert!(
+        rotation_started.wait_for(WAIT_LIMIT),
+        "rotation must be attempted while the first identity is active"
+    );
+
+    let follower_started = Latch::default();
+    let follower_started_signal = follower_started.clone();
+    let follower_service = service.clone();
+    let follower = std::thread::spawn(move || {
+        follower_started_signal.signal();
+        follower_service.admit_run(&intent("identity held through registration"), &mutation)
+    });
+    assert!(
+        follower_started.wait_for(WAIT_LIMIT),
+        "the identical request must attempt derivation across the pending rotation"
+    );
+
+    adapter.preflight_release.signal();
+    let admitted = leader
+        .join()
+        .expect("leader thread must not panic")
+        .expect("leader admission must finish");
+    assert_eq!(
+        rotation
+            .join()
+            .expect("rotation thread must not panic")
+            .expect("rotation must complete after identity registration"),
+        2
+    );
+    let replayed = follower
+        .join()
+        .expect("follower thread must not panic")
+        .expect("identical request must preserve its operation identity");
+    assert_same_session_and_turn_handles(&admitted, &replayed);
+    service
+        .runtime
+        .wait_for_background()
+        .expect("detached execution must finish");
 }
 
 #[test]
@@ -247,7 +1596,7 @@ fn matching_in_memory_request_wins_over_an_in_progress_durable_replay() {
             operation_request("principal-a", "key-a", DIGEST_A),
             || {
                 follower_replay_calls.fetch_add(1, Ordering::SeqCst);
-                Ok(Some(OperationOutcome::Session(durable_starting.clone())))
+                Ok(Some(admission_outcome(durable_starting.clone())))
             },
             || panic!("an identical duplicate must not become a second leader"),
         )
@@ -693,7 +2042,7 @@ fn stale_probe_after_handoff(expectation: StaleProbeExpectation) -> StaleProbeSc
                     assert!(duplicate_durable.load(Ordering::SeqCst));
                     match expectation {
                         StaleProbeExpectation::Replay => {
-                            Ok(Some(OperationOutcome::Session(duplicate_expected.clone())))
+                            Ok(Some(admission_outcome(duplicate_expected.clone())))
                         }
                         StaleProbeExpectation::Conflict => {
                             Err(crate::runtime::idempotency_conflict())
@@ -725,7 +2074,7 @@ fn stale_probe_after_handoff(expectation: StaleProbeExpectation) -> StaleProbeSc
                     leader_started_signal.signal();
                     release_leader_wait.wait();
                     leader_durable.store(true, Ordering::SeqCst);
-                    Ok(OperationOutcome::Session(leader_expected))
+                    Ok(admission_outcome(leader_expected))
                 },
             )
             .and_then(OperationOutcome::into_session)
@@ -755,7 +2104,7 @@ fn stale_probe_after_handoff(expectation: StaleProbeExpectation) -> StaleProbeSc
                 || {
                     occupant_started_signal.signal();
                     release_occupant_wait.wait();
-                    Ok(OperationOutcome::Session(occupant_expected))
+                    Ok(admission_outcome(occupant_expected))
                 },
             )
             .and_then(OperationOutcome::into_session)
@@ -787,8 +2136,17 @@ const DIGEST_B: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
 const DIGEST_CONFLICT: &str = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
 
 fn operation_request(principal: &str, key: &str, digest: &str) -> OperationRequest {
+    operation_request_for(IdempotentOperation::Run, principal, key, digest)
+}
+
+fn operation_request_for(
+    operation: IdempotentOperation,
+    principal: &str,
+    key: &str,
+    digest: &str,
+) -> OperationRequest {
     let identity = RequestIdentity::authenticated(principal, key, digest, 1, 1);
-    OperationRequest::new(IdempotentOperation::Run, &identity)
+    OperationRequest::new(operation, &identity)
 }
 
 fn coordinator_result_session() -> PublicSession {
@@ -856,6 +2214,9 @@ fn assert_same_session_and_turn_handles(
 
 #[derive(Clone, Default)]
 struct ControlledAdapter {
+    block_admission_rejection: Arc<AtomicBool>,
+    admission_started: Latch,
+    admission_release: Latch,
     block_preflight: Arc<AtomicBool>,
     fail_next_preflight: Arc<AtomicBool>,
     preflight_calls: Arc<AtomicUsize>,
@@ -873,12 +2234,25 @@ struct ControlledAdapter {
 }
 
 impl ControlledAdapter {
+    fn block_next_admission_rejection(&self) {
+        self.block_admission_rejection.store(true, Ordering::SeqCst);
+    }
+
     fn block_next_preflight(&self) {
         self.block_preflight.store(true, Ordering::SeqCst);
     }
 }
 
 impl ComputerUseAdapter for ControlledAdapter {
+    fn admit_operation(&self, operation: ControlPlaneOperation) -> Result<(), SatelleError> {
+        if self.block_admission_rejection.swap(false, Ordering::SeqCst) {
+            self.admission_started.signal();
+            self.admission_release.wait();
+            return Err(SatelleError::computer_use_not_ready());
+        }
+        FakeComputerUseAdapter.admit_operation(operation)
+    }
+
     fn preflight(
         &self,
         host: &str,
@@ -922,6 +2296,16 @@ impl ComputerUseAdapter for ControlledAdapter {
     ) -> Result<RecoveryObservation, SatelleError> {
         FakeComputerUseAdapter.observe_recovery(subject)
     }
+}
+
+fn admission_outcome(session: PublicSession) -> OperationOutcome {
+    let turn_id = session
+        .turns()
+        .last()
+        .expect("test Session contains a Turn")
+        .turn_id()
+        .clone();
+    OperationOutcome::admission(session, turn_id)
 }
 
 #[derive(Clone, Default)]

@@ -196,6 +196,7 @@ fn lifecycle_schema_excludes_raw_content_and_replayable_event_history() {
     assert_eq!(
         tables,
         [
+            "admission_cancellations",
             "api_tokens",
             "control_leases",
             "daemon_identity",
@@ -216,6 +217,22 @@ fn lifecycle_schema_excludes_raw_content_and_replayable_event_history() {
             "turn_private_refs",
             "turns",
         ]
+    );
+
+    assert_table_columns(
+        &storage,
+        "admission_cancellations",
+        &[
+            "principal_ref",
+            "operation",
+            "idempotency_key",
+            "request_digest",
+            "digest_schema_version",
+            "hmac_key_version",
+            "outcome",
+            "created_at",
+            "expires_at",
+        ],
     );
 
     assert_table_columns(

@@ -1,6 +1,6 @@
 use super::{
-    AttachedTurnOutcome, DirectTransport, direct_admission_error, direct_event_error,
-    direct_transport_error,
+    AttachedTurnOutcome, DirectTransport, InterruptSource, ProcessInterrupt,
+    direct_admission_error, direct_event_error, direct_transport_error,
 };
 use satelle_core::session::{PublicSession, TurnAdmissionFailure, TurnState, TurnStateRevision};
 use satelle_core::{
@@ -9,7 +9,8 @@ use satelle_core::{
 };
 use satelle_host::{LogPageQuery, LogSubject};
 use satelle_transport::{
-    DaemonClientError, DaemonEventError, DaemonEventStream, EventSubscription, TurnRequest,
+    AdmissionCancellationOutcome, AdmissionCancellationResponse, DaemonClientError,
+    DaemonEventError, DaemonEventStream, EventSubscription, TurnRequest,
 };
 use std::collections::VecDeque;
 use std::sync::Arc;
@@ -360,26 +361,103 @@ impl DirectTransport {
     pub(super) async fn run_attached(
         &self,
         request: &TurnRequest,
+        detach_on_interrupt: bool,
         on_event: &mut dyn FnMut(SatelleEvent) -> Result<(), SatelleError>,
     ) -> Result<AttachedTurnOutcome, TurnAdmissionFailure> {
-        let mut stream = self
-            .event_client
-            .connect_events(vec![EventSubscription::Host])
+        let interrupt = ProcessInterrupt::default();
+        self.run_attached_with_interrupt(request, detach_on_interrupt, on_event, &interrupt)
             .await
-            .map_err(|error| TurnAdmissionFailure::not_admitted(self.run_event_error(error)))?;
+    }
+
+    pub(super) async fn run_attached_with_interrupt(
+        &self,
+        request: &TurnRequest,
+        detach_on_interrupt: bool,
+        on_event: &mut dyn FnMut(SatelleEvent) -> Result<(), SatelleError>,
+        interrupt: &dyn InterruptSource,
+    ) -> Result<AttachedTurnOutcome, TurnAdmissionFailure> {
+        interrupt.arm().await.map_err(|_| {
+            TurnAdmissionFailure::not_admitted(SatelleError::host_unreachable(&self.alias))
+        })?;
+        let connection = self
+            .event_client
+            .connect_events(vec![EventSubscription::Host]);
+        tokio::pin!(connection);
+        let mut stream = tokio::select! {
+            biased;
+            signal = interrupt.wait() => {
+                signal.map_err(|_| TurnAdmissionFailure::not_admitted(
+                    SatelleError::host_unreachable(&self.alias),
+                ))?;
+                return Err(TurnAdmissionFailure::not_admitted(
+                    pre_admission_interruption_error(None),
+                ));
+            }
+            connected = &mut connection => connected
+                .map_err(|error| TurnAdmissionFailure::not_admitted(self.run_event_error(error)))?,
+        };
         let request = request.clone();
+        let cancellation_request = request.clone();
         let idempotency_key = Self::idempotency_key();
+        let cancellation_key = idempotency_key.clone();
         let (admitted, buffered_events, initial_connection_error) = stream
-            .buffer_events_until(self.blocking_admission_http(
-                move |client| {
-                    client
-                        .create_session(&request, &idempotency_key)
-                        .map(|response| response.session().clone())
-                },
-                self.run_admission_error(),
-            ))
+            .buffer_events_until(async {
+                let admission = self.blocking_admission_http(
+                    move |client| {
+                        client
+                            .create_session(&request, &idempotency_key)
+                            .map(|response| response.session().clone())
+                    },
+                    self.run_admission_error(),
+                );
+                tokio::pin!(admission);
+                tokio::select! {
+                    biased;
+                    signal = interrupt.wait() => {
+                        signal.map_err(|_| {
+                            TurnAdmissionFailure::admission_unknown(
+                                SatelleError::host_unreachable(&self.alias),
+                            )
+                        })?;
+                        let cancelled = self
+                            .blocking_admission_http(
+                                move |client| {
+                                    client.cancel_session_admission(
+                                        &cancellation_request,
+                                        &cancellation_key,
+                                    )
+                                },
+                                self.run_admission_error(),
+                            )
+                            .await;
+                        Ok((admission.await, Some(cancelled)))
+                    }
+                    admitted = &mut admission => Ok((admitted, None)),
+                }
+            })
             .await;
-        let admitted = admitted?;
+        let (admitted, interruption) = admitted?;
+        let admitted = match (admitted, interruption.as_ref()) {
+            (Ok(admitted), _) => admitted,
+            (Err(_), Some(Ok(cancelled)))
+                if cancelled.outcome() == AdmissionCancellationOutcome::Admitted =>
+            {
+                return Err(self
+                    .interrupted_replayed_admission(cancelled, None, detach_on_interrupt)
+                    .await);
+            }
+            (Err(_), Some(Ok(cancelled))) => {
+                return Err(TurnAdmissionFailure::not_admitted(
+                    pre_admission_interruption_error(Some(cancelled.outcome())),
+                ));
+            }
+            (Err(_), Some(Err(_))) => {
+                return Err(TurnAdmissionFailure::admission_unknown(
+                    interrupted_admission_unknown(&self.alias),
+                ));
+            }
+            (Err(error), None) => return Err(error),
+        };
         let turn_id = admitted
             .turns()
             .last()
@@ -387,46 +465,156 @@ impl DirectTransport {
             .turn_id()
             .clone();
         let admitted_snapshot = admitted.clone();
-        self.follow_turn(
+        if interruption.is_some() {
+            let error = self
+                .interrupt_admitted(&admitted, &turn_id, detach_on_interrupt)
+                .await;
+            return Err(TurnAdmissionFailure::admitted(
+                error,
+                admitted_snapshot,
+                turn_id,
+            ));
+        }
+        let following = self.follow_turn(
             stream,
             admitted,
             buffered_events,
             initial_connection_error,
             on_event,
-        )
-        .await
-        .map_err(|error| TurnAdmissionFailure::admitted(error, admitted_snapshot, turn_id))
+        );
+        tokio::pin!(following);
+        tokio::select! {
+            biased;
+            signal = interrupt.wait() => {
+                signal.map_err(|_| TurnAdmissionFailure::admitted(
+                    SatelleError::host_unreachable(&self.alias),
+                    admitted_snapshot.clone(),
+                    turn_id.clone(),
+                ))?;
+                let error = self.interrupt_admitted(
+                    &admitted_snapshot,
+                    &turn_id,
+                    detach_on_interrupt,
+                ).await;
+                Err(TurnAdmissionFailure::admitted(error, admitted_snapshot, turn_id))
+            }
+            outcome = &mut following => outcome
+                .map_err(|error| TurnAdmissionFailure::admitted(error, admitted_snapshot, turn_id)),
+        }
     }
 
     pub(super) async fn steer_attached(
         &self,
         session_id: &SessionId,
         request: &TurnRequest,
+        detach_on_interrupt: bool,
         on_event: &mut dyn FnMut(SatelleEvent) -> Result<(), SatelleError>,
     ) -> Result<AttachedTurnOutcome, TurnAdmissionFailure> {
-        let mut stream = self
+        let interrupt = ProcessInterrupt::default();
+        self.steer_attached_with_interrupt(
+            session_id,
+            request,
+            detach_on_interrupt,
+            on_event,
+            &interrupt,
+        )
+        .await
+    }
+
+    pub(super) async fn steer_attached_with_interrupt(
+        &self,
+        session_id: &SessionId,
+        request: &TurnRequest,
+        detach_on_interrupt: bool,
+        on_event: &mut dyn FnMut(SatelleEvent) -> Result<(), SatelleError>,
+        interrupt: &dyn InterruptSource,
+    ) -> Result<AttachedTurnOutcome, TurnAdmissionFailure> {
+        interrupt.arm().await.map_err(|_| {
+            TurnAdmissionFailure::not_admitted(SatelleError::host_unreachable(&self.alias))
+        })?;
+        let connection = self
             .event_client
             .connect_events(vec![EventSubscription::Session {
                 session_id: session_id.clone(),
-            }])
-            .await
-            .map_err(|error| {
+            }]);
+        tokio::pin!(connection);
+        let mut stream = tokio::select! {
+            biased;
+            signal = interrupt.wait() => {
+                signal.map_err(|_| TurnAdmissionFailure::not_admitted(
+                    SatelleError::host_unreachable(&self.alias),
+                ))?;
+                return Err(TurnAdmissionFailure::not_admitted(
+                    pre_admission_interruption_error(None),
+                ));
+            }
+            connected = &mut connection => connected.map_err(|error| {
                 TurnAdmissionFailure::not_admitted(direct_event_error(&self.alias, error))
-            })?;
+            })?,
+        };
         let admitted_session_id = session_id.clone();
         let request = request.clone();
+        let cancellation_request = request.clone();
         let idempotency_key = Self::idempotency_key();
+        let cancellation_key = idempotency_key.clone();
+        let cancellation_session_id = session_id.clone();
         let (admitted, buffered_events, initial_connection_error) = stream
-            .buffer_events_until(self.blocking_admission_http(
-                move |client| {
-                    client
-                        .create_turn(&admitted_session_id, &request, &idempotency_key)
-                        .map(|response| response.session().clone())
-                },
-                direct_admission_error,
-            ))
+            .buffer_events_until(async {
+                let admission = self.blocking_admission_http(
+                    move |client| {
+                        client
+                            .create_turn(&admitted_session_id, &request, &idempotency_key)
+                            .map(|response| response.session().clone())
+                    },
+                    direct_admission_error,
+                );
+                tokio::pin!(admission);
+                tokio::select! {
+                    biased;
+                    signal = interrupt.wait() => {
+                        signal.map_err(|_| TurnAdmissionFailure::admission_unknown(
+                            SatelleError::host_unreachable(&self.alias),
+                        ))?;
+                        let cancelled = self.blocking_admission_http(
+                            move |client| client.cancel_turn_admission(
+                                &cancellation_session_id,
+                                &cancellation_request,
+                                &cancellation_key,
+                            ),
+                            direct_admission_error,
+                        ).await;
+                        Ok((admission.await, Some(cancelled)))
+                    }
+                    admitted = &mut admission => Ok((admitted, None)),
+                }
+            })
             .await;
-        let admitted = admitted?;
+        let (admitted, interruption) = admitted?;
+        let admitted = match (admitted, interruption.as_ref()) {
+            (Ok(admitted), _) => admitted,
+            (Err(_), Some(Ok(cancelled)))
+                if cancelled.outcome() == AdmissionCancellationOutcome::Admitted =>
+            {
+                return Err(self
+                    .interrupted_replayed_admission(
+                        cancelled,
+                        Some(session_id),
+                        detach_on_interrupt,
+                    )
+                    .await);
+            }
+            (Err(_), Some(Ok(cancelled))) => {
+                return Err(TurnAdmissionFailure::not_admitted(
+                    pre_admission_interruption_error(Some(cancelled.outcome())),
+                ));
+            }
+            (Err(_), Some(Err(_))) => {
+                return Err(TurnAdmissionFailure::admission_unknown(
+                    interrupted_admission_unknown(&self.alias),
+                ));
+            }
+            (Err(error), None) => return Err(error),
+        };
         if admitted.session_id() != session_id || admitted.turns().is_empty() {
             return Err(TurnAdmissionFailure::admission_unknown(
                 self.invalid_response(),
@@ -439,16 +627,209 @@ impl DirectTransport {
             .turn_id()
             .clone();
         let admitted_snapshot = admitted.clone();
-        self.follow_turn(
+        if interruption.is_some() {
+            let error = self
+                .interrupt_admitted(&admitted, &turn_id, detach_on_interrupt)
+                .await;
+            return Err(TurnAdmissionFailure::admitted(
+                error,
+                admitted_snapshot,
+                turn_id,
+            ));
+        }
+        let following = self.follow_turn(
             stream,
             admitted,
             buffered_events,
             initial_connection_error,
             on_event,
-        )
-        .await
-        .map_err(|error| TurnAdmissionFailure::admitted(error, admitted_snapshot, turn_id))
+        );
+        tokio::pin!(following);
+        tokio::select! {
+            biased;
+            signal = interrupt.wait() => {
+                signal.map_err(|_| TurnAdmissionFailure::admitted(
+                    SatelleError::host_unreachable(&self.alias),
+                    admitted_snapshot.clone(),
+                    turn_id.clone(),
+                ))?;
+                let error = self.interrupt_admitted(
+                    &admitted_snapshot,
+                    &turn_id,
+                    detach_on_interrupt,
+                ).await;
+                Err(TurnAdmissionFailure::admitted(error, admitted_snapshot, turn_id))
+            }
+            outcome = &mut following => outcome
+                .map_err(|error| TurnAdmissionFailure::admitted(error, admitted_snapshot, turn_id)),
+        }
     }
+
+    async fn interrupted_replayed_admission(
+        &self,
+        response: &AdmissionCancellationResponse,
+        expected_session_id: Option<&SessionId>,
+        detach_on_interrupt: bool,
+    ) -> TurnAdmissionFailure {
+        let session_id = response
+            .session_id()
+            .cloned()
+            .ok_or_else(|| TurnAdmissionFailure::admission_unknown(self.invalid_response()));
+        let turn_id = response
+            .turn_id()
+            .cloned()
+            .ok_or_else(|| TurnAdmissionFailure::admission_unknown(self.invalid_response()));
+        let (session_id, turn_id) = match (session_id, turn_id) {
+            (Ok(session_id), Ok(turn_id))
+                if expected_session_id.is_none_or(|expected| expected == &session_id) =>
+            {
+                (session_id, turn_id)
+            }
+            _ => return TurnAdmissionFailure::admission_unknown(self.invalid_response()),
+        };
+        let interruption = if detach_on_interrupt {
+            SatelleError::interrupted_attached_command()
+        } else {
+            self.interrupt_admitted_ids(&session_id, &turn_id).await
+        };
+        let read_session_id = session_id.clone();
+        let session = match self
+            .blocking_http(move |client| client.read_session(&read_session_id))
+            .await
+            .map(|response| response.session().clone())
+        {
+            Ok(session) => session,
+            Err(error) => {
+                return TurnAdmissionFailure::admission_unknown(
+                    interrupted_admission_with_session(&self.alias, &session_id, error),
+                );
+            }
+        };
+        if session.session_id() != &session_id
+            || !session
+                .turns()
+                .iter()
+                .any(|turn| turn.turn_id() == &turn_id)
+        {
+            return TurnAdmissionFailure::admission_unknown(interrupted_admission_with_session(
+                &self.alias,
+                &session_id,
+                self.invalid_response(),
+            ));
+        }
+        TurnAdmissionFailure::admitted(interruption, session, turn_id)
+    }
+
+    async fn interrupt_admitted(
+        &self,
+        session: &PublicSession,
+        turn_id: &TurnId,
+        detach_on_interrupt: bool,
+    ) -> SatelleError {
+        if detach_on_interrupt {
+            return SatelleError::interrupted_attached_command();
+        }
+        self.interrupt_admitted_ids(session.session_id(), turn_id)
+            .await
+    }
+
+    async fn interrupt_admitted_ids(
+        &self,
+        session_id: &SessionId,
+        turn_id: &TurnId,
+    ) -> SatelleError {
+        let session_id = session_id.clone();
+        let stop_session_id = session_id.clone();
+        let stop_turn_id = turn_id.clone();
+        match self
+            .blocking_http(move |client| {
+                client.stop_session_for_turn(
+                    &stop_session_id,
+                    &stop_turn_id,
+                    &format!("interrupt-{}", uuid::Uuid::now_v7()),
+                )
+            })
+            .await
+        {
+            Ok(_) => SatelleError::interrupted_attached_command(),
+            Err(stop_error) => unconfirmed_stop_interruption(&self.alias, &session_id, stop_error),
+        }
+    }
+}
+
+fn pre_admission_interruption_error(outcome: Option<AdmissionCancellationOutcome>) -> SatelleError {
+    let mut error = SatelleError::interrupted_attached_command();
+    if outcome == Some(AdmissionCancellationOutcome::RecoveryPending) {
+        error.details.insert(
+            "ownership".to_string(),
+            serde_json::Value::String("recovery_pending".to_string()),
+        );
+    }
+    error
+}
+
+fn interrupted_admission_unknown(alias: &str) -> SatelleError {
+    let mut error = SatelleError::interrupted_attached_command();
+    error.message =
+        "attached command was interrupted, but admission cancellation could not be confirmed"
+            .to_string();
+    error.recovery_command = Some(format!("satelle host sessions --host {alias}"));
+    error
+}
+
+fn interrupted_admission_with_session(
+    alias: &str,
+    session_id: &SessionId,
+    source: SatelleError,
+) -> SatelleError {
+    let status_command = format!("satelle status {session_id} --host {alias}");
+    let mut error = SatelleError::interrupted_attached_command();
+    error.message = format!(
+        "attached command was interrupted after Session {session_id} was admitted, but its status could not be read"
+    );
+    error.recovery_command = Some(status_command.clone());
+    error.details.insert(
+        "session_id".to_string(),
+        serde_json::Value::String(session_id.to_string()),
+    );
+    error.details.insert(
+        "status_command".to_string(),
+        serde_json::Value::String(status_command),
+    );
+    error.details.insert(
+        "status_error_code".to_string(),
+        serde_json::Value::String(source.code.as_str().to_string()),
+    );
+    error
+}
+
+fn unconfirmed_stop_interruption(
+    alias: &str,
+    session_id: &SessionId,
+    stop_error: SatelleError,
+) -> SatelleError {
+    let status_command = format!("satelle status {session_id} --host {alias}");
+    let mut error = SatelleError::interrupted_attached_command();
+    error.message = format!(
+        "attached command was interrupted, but stop could not be confirmed for Session {session_id}"
+    );
+    error.recovery_command = Some(status_command.clone());
+    error.details.insert(
+        "session_id".to_string(),
+        serde_json::Value::String(session_id.to_string()),
+    );
+    error.details.insert(
+        "status_command".to_string(),
+        serde_json::Value::String(status_command),
+    );
+    error.details.insert(
+        "stop_error_code".to_string(),
+        serde_json::Value::String(stop_error.code.as_str().to_string()),
+    );
+    for (key, value) in stop_error.details {
+        error.details.insert(key, value);
+    }
+    error
 }
 
 fn target_event_revision(
@@ -484,4 +865,59 @@ pub(super) fn event_error_allows_reconciliation(error: &DaemonEventError) -> boo
 
 pub(super) fn reconciliation_error_allows_retry(error: &SatelleError) -> bool {
     error.code == ErrorCode::HostUnreachable
+}
+
+#[cfg(test)]
+mod interrupt_output_tests {
+    use super::*;
+
+    #[test]
+    fn unconfirmed_stop_preserves_interrupt_exit_and_recovery_details() {
+        let session_id = SessionId::new();
+        let turn_id = TurnId::new();
+        let stop_error = SatelleError {
+            code: ErrorCode::StopNotConfirmed,
+            message: "stop not confirmed".to_string(),
+            recovery_command: None,
+            source_detail: None,
+            details: std::collections::BTreeMap::from([
+                ("session_id".to_string(), serde_json::json!(session_id)),
+                ("turn_id".to_string(), serde_json::json!(turn_id)),
+                (
+                    "ownership".to_string(),
+                    serde_json::json!("recovery_pending"),
+                ),
+                ("state_changed".to_string(), serde_json::json!(true)),
+                ("session_state_revision".to_string(), serde_json::json!(3)),
+                ("turn_state_revision".to_string(), serde_json::json!(2)),
+                ("retryable".to_string(), serde_json::json!(true)),
+            ]),
+        };
+
+        let error = unconfirmed_stop_interruption("remote-host", &session_id, stop_error);
+
+        assert_eq!(error.code, ErrorCode::Interrupted);
+        assert_eq!(error.exit_code(), 130);
+        assert!(error.message.contains(session_id.as_str()));
+        assert_eq!(
+            error.recovery_command.as_deref(),
+            Some(format!("satelle status {session_id} --host remote-host").as_str())
+        );
+        assert_eq!(error.details["session_id"], session_id.as_str());
+        assert_eq!(error.details["turn_id"], turn_id.as_str());
+        assert_eq!(error.details["ownership"], "recovery_pending");
+        assert_eq!(error.details["session_state_revision"], 3);
+        assert_eq!(error.details["turn_state_revision"], 2);
+        assert_eq!(error.details["stop_error_code"], "stop-not-confirmed");
+    }
+
+    #[test]
+    fn ambiguous_probe_cancellation_reports_recovery_pending_ownership() {
+        let error =
+            pre_admission_interruption_error(Some(AdmissionCancellationOutcome::RecoveryPending));
+
+        assert_eq!(error.code, ErrorCode::Interrupted);
+        assert_eq!(error.exit_code(), 130);
+        assert_eq!(error.details["ownership"], "recovery_pending");
+    }
 }
