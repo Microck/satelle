@@ -143,6 +143,27 @@ async fn inbound_allowance_is_shared_across_token_ids_for_one_principal() {
 }
 
 #[tokio::test]
+async fn custom_inbound_message_allowance_is_enforced() {
+    let limit = |value| NonZeroUsize::new(value).expect("test rate limit is nonzero");
+    let running = RunningServer::start_with_config(
+        ApiScopes::READ,
+        DaemonServerConfig::loopback(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
+            .with_api_rate_limits(ApiRateLimits::new(
+                limit(10),
+                limit(10),
+                limit(10),
+                limit(2),
+            )),
+    )
+    .await;
+    let mut socket = connect_events(&running).await;
+
+    send_pongs(&mut socket, 2).await;
+    send_subscribe(&mut socket, vec![EventSubscription::Host]).await;
+    expect_control_failure(&mut socket, satelle_transport::WsCloseReason::RateLimited).await;
+}
+
+#[tokio::test]
 async fn every_non_close_frame_kind_consumes_inbound_allowance() {
     let running = RunningServer::start(ApiScopes::READ).await;
     let mut survivor = connect_events(&running).await;

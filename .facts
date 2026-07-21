@@ -32,8 +32,8 @@
 - a Satelle Turn is one run or steer execution attempt that belongs to exactly one Satelle Session @spec @mvp @implemented
 - a Satelle Goal is optional lifecycle metadata attached to a Session or upstream thread and does not replace Turn control @spec @mvp @implemented
 - a Satelle Execution Policy is the Host-enforced combination of approval, sandbox, timeout, provider, model, desktop, and experimental-feature choices for one Turn @spec @mvp @implemented
-- a Satelle Control Lease is the Host Daemon-owned exclusive right to operate one Host Identity and Desktop Binding through native Computer Use @spec @mvp
-- a Satelle Maintenance Lease is the Host Daemon-owned exclusive right to mutate daemon, runtime, service, or storage state for one Host @spec @mvp
+- a Satelle Control Lease is the Host Daemon-owned exclusive right to operate one Host Identity and Desktop Binding through native Computer Use @spec @mvp @implemented
+- a Satelle Maintenance Lease is the Host Daemon-owned exclusive right to mutate daemon, runtime, service, or storage state for one Host @spec @mvp @implemented
 - a Satelle Bootstrap Lock is a user-scoped remote filesystem lock acquired through authenticated SSH bootstrap or by a reachable Host Daemon already holding the same operation's Maintenance Lease before remote daemon files can be replaced @spec @mvp
 - a Satelle Idempotency Record binds one API Principal, operation, idempotency key, request digest, and durable outcome @mvp @implemented
 - a Satelle Readiness Result is a timestamped capability result whose validity is bounded by its cache key, expiry, and invalidation conditions @spec @mvp
@@ -827,11 +827,11 @@
 
 ## idempotency-and-capacity
 - satelle mutating Host Daemon API requests use the Idempotency-Key HTTP header @mvp @implemented
-- run, steer, stop, setup, repair, host update, storage migration, and destructive maintenance API requests require an idempotency key @spec @mvp
+- run, steer, stop, setup, repair, host update, storage migration, and destructive maintenance API requests require an idempotency key @spec @mvp @implemented
 - satelle CLI generates a UUIDv7 idempotency key when the caller does not supply one @mvp @implemented
 - an Idempotency Record digest covers the full canonical typed operation payload after defaults and normalization, excludes only transport authentication credentials, request_id, tracing metadata, and the idempotency key itself, and includes operation payload secrets through the sensitive HMAC path without storing their raw values @contract @mvp @implemented
 - prompt-bearing or otherwise sensitive idempotency digests use HMAC-SHA-256 with a Host Daemon-owned key and are never returned through public APIs or logs @mvp @implemented
-- idempotency HMAC keys inherit the token-verifier sensitive-state boundary, survive Host Daemon restart and migration restore for at least the maximum Idempotency Record retention window, and are never exposed through public APIs, logs, or diagnostics @spec @mvp
+- idempotency HMAC keys inherit the token-verifier sensitive-state boundary, survive Host Daemon restart and migration restore for at least the maximum Idempotency Record retention window, and are never exposed through public APIs, logs, or diagnostics @spec @mvp @implemented
 - each Idempotency Record stores non-secret digest-schema and HMAC-key versions, and retired HMAC keys remain available until every record using them expires @mvp @implemented
 - an Idempotency Record durable outcome never contains raw bearer-token material or another one-time secret @contract @mvp @implemented
 - the operation-concurrency limit is one Host-global capacity budget shared by every API Principal, bearer token, transport, and connection for that Host Daemon @spec @contract @mvp @implemented
@@ -853,7 +853,7 @@
 - Satelle trusts forwarded client addresses only from an explicit Host-owned trusted-proxy allowlist and derives the client source from the nearest untrusted hop @spec @mvp @implemented
 - authenticated read operations are limited to 600 requests per minute per API Principal by default @mvp @implemented
 - authenticated control and admin operations are limited to 120 requests per minute per API Principal by default @mvp @implemented
-- API rate limits are configurable only through Host-owned or user-level configuration and cannot be weakened by project-level configuration @spec @mvp
+- API rate limits are configurable only through Host-owned or user-level configuration and cannot be weakened by project-level configuration @spec @mvp @implemented
 - rate-limited responses use the typed rate-limited error and include retry_after_ms when retry timing is known @contract @mvp @implemented
 - satelle Host Daemon does not log raw HTTP request bodies, Authorization headers, prompt text, or attachment bytes @spec @mvp @implemented
 - Host Daemon run and steer HTTP operations always return after durable asynchronous Turn admission; attach and detach are Controller presentation behaviors and are excluded from the operation payload and idempotency digest @spec @contract @mvp @implemented
@@ -1413,7 +1413,7 @@
 - doctor refresh reports host-busy instead of operating the desktop while a prompt Turn owns the Control Lease @mvp @implemented
 - the Host Daemon releases the Control Lease in the same transaction that persists a terminal Turn state @mvp @implemented
 - a standalone readiness or provider probe releases its Control Lease in the same transaction that persists the terminal Readiness Result only after the Codex adapter confirms that no upstream probe Turn remains active @spec @mvp @implemented
-- setup, repair, host update, storage migration, and service restart acquire a Maintenance Lease before mutation @spec @mvp
+- setup, repair, host update, storage migration, and service restart acquire a Maintenance Lease before mutation @spec @mvp @implemented
 - a Maintenance Lease cannot coexist with a Control Lease for the same Host except when the same maintenance operation owns a postcheck Control sublease @spec @mvp @implemented
 - Turn admission requires both the selected Control Lease and absence of a Maintenance Lease for the same Host @spec @mvp @implemented
 - a maintenance operation that requires a live Computer Use postcheck retains its Maintenance Lease and atomically acquires an operation-owned postcheck Control sublease before running the probe @spec @mvp @implemented
@@ -1423,14 +1423,14 @@
 - a maintenance operation with a live postcheck releases its postcheck Control sublease and Maintenance Lease only in the transaction that commits the final Readiness Result and final action-ledger state @spec @mvp @implemented
 - Control and Maintenance Leases contain an operation id, owner process identity, acquisition time, and heartbeat time @spec @mvp @implemented
 - lease owner process identity includes a process-start discriminator and operating-system boot identity instead of relying on a reusable process id alone @spec @mvp @implemented
-- the Host Daemon refreshes live Control and Maintenance Lease heartbeats at least every 5 seconds, and a missing heartbeat becomes stale after 30 seconds by default without permitting automatic lease release @spec @mvp
+- the Host Daemon refreshes live Control and Maintenance Lease heartbeats at least every 5 seconds, and a missing heartbeat becomes stale after 30 seconds by default without permitting automatic lease release @spec @mvp @implemented
 - Host Daemon startup treats an orphaned Control or Maintenance Lease as recovery_pending and blocks conflicting admission until reconciliation completes @spec @mvp @implemented
 - label: an orphaned non-Turn Control Lease for a readiness or provider probe is classified outcome_unknown, reconciled against its probe process and upstream capability state, and resolved to a durable terminal Readiness Result before lease release
   command: cargo test --locked -p satelle-host --lib runtime::tests::unknown_provider_probe_ownership_blocks_probe_and_prompt_until_terminal_reconciliation -- --exact && cargo test --locked -p satelle-host --lib runtime::tests::unknown_native_probe_timeout_blocks_until_terminal_reconciliation -- --exact
   tags: [spec, mvp, implemented, ci]
 - an orphaned Maintenance Lease operation is classified outcome_unknown and reconciled from its action postconditions before retry or release @spec @mvp @implemented
 - lease expiry alone never proves that an external Computer Use or maintenance side effect stopped @spec @mvp @implemented
-- timeout expiry, a cancellation request, transport loss, adapter failure, or lease expiry never by itself proves that an upstream Computer Use execution stopped and never by itself permits Control Lease release @spec @mvp
+- timeout expiry, a cancellation request, transport loss, adapter failure, or lease expiry never by itself proves that an upstream Computer Use execution stopped and never by itself permits Control Lease release @spec @mvp @implemented
 - initial setup, missing-daemon repair, and Host binary replacement acquire a Bootstrap Lock before mutating remote files or starting a replacement Host Daemon @spec @mvp
 - a Bootstrap Lock uses atomic filesystem creation under the remote OS user's Satelle state boundary @spec @mvp
 - a Bootstrap Lock records a non-secret operation id, Controller identity when known, acquisition time, and heartbeat time @spec @mvp
@@ -1638,7 +1638,7 @@
 # storage
 
 ## transactional-integrity
-- satelle Host Daemon uses SQLite on the remote host as the canonical local store for session metadata, turn lifecycle, readiness cache, provider Computer Use smoke results, setup action ledgers, and normalized log summaries @spec @mvp
+- satelle Host Daemon uses SQLite on the remote host as the canonical local store for session metadata, turn lifecycle, readiness cache, provider Computer Use smoke results, setup action ledgers, and normalized log summaries @spec @mvp @implemented
 - one Host Daemon process holds an exclusive ownership lock for one SQLite store while serving requests @mvp @implemented
 - a second Host Daemon process for the same SQLite store fails with a typed store-in-use error before accepting API requests @mvp @implemented
 - satelle enables SQLite foreign-key enforcement for every Host Daemon connection @mvp @implemented

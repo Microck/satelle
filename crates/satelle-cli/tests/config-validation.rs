@@ -8,6 +8,97 @@ mod config_fixture;
 use config_fixture::{ConfigFixture, assert_same_file, parse_json};
 
 #[test]
+fn api_rate_limits_are_user_owned_and_nonzero() {
+    let fixture = ConfigFixture::new(
+        r#"
+[api_rate_limits]
+failed_auth_attempts_per_minute = 7
+authenticated_requests_per_minute = 321
+control_requests_per_minute = 45
+websocket_inbound_messages_per_minute = 67
+"#,
+        "",
+    );
+    fixture
+        .command()
+        .args(["config", "check", "--json"])
+        .assert()
+        .success();
+
+    fixture.write_user_config(
+        r#"
+[api_rate_limits]
+control_requests_per_minute = 0
+"#,
+    );
+    let zero = fixture
+        .command()
+        .args(["config", "check", "--json"])
+        .assert()
+        .code(66)
+        .get_output()
+        .clone();
+    let zero = parse_json(&zero.stderr);
+    assert_eq!(zero["code"], "configuration-error");
+    fixture
+        .command()
+        .args([
+            "host",
+            "start",
+            "--foreground",
+            "--bind",
+            "127.0.0.1:0",
+            "--json",
+        ])
+        .assert()
+        .code(66);
+
+    fixture.write_user_config(
+        r#"
+[api_rate_limits]
+failed_auth_attempts_per_minute = 50
+authenticated_requests_per_minute = 1000
+control_requests_per_minute = 200
+websocket_inbound_messages_per_minute = 200
+"#,
+    );
+    fixture.write_project_config(
+        r#"
+[api_rate_limits]
+failed_auth_attempts_per_minute = 1
+"#,
+    );
+    let project = fixture
+        .command()
+        .args(["config", "check", "--json"])
+        .assert()
+        .code(66)
+        .get_output()
+        .clone();
+    let project = parse_json(&project.stderr);
+    assert_eq!(project["code"], "unknown-config-key");
+    assert_eq!(project["details"]["path"], "api_rate_limits");
+
+    fixture.write_project_config("default_host = \"missing\"\n");
+    let foreground = fixture
+        .command()
+        .args([
+            "host",
+            "start",
+            "--foreground",
+            "--bind",
+            "192.0.2.1:0",
+            "--json",
+        ])
+        .assert()
+        .code(64)
+        .get_output()
+        .clone();
+    let foreground = parse_json(&foreground.stderr);
+    assert_eq!(foreground["code"], "invalid-usage");
+}
+
+#[test]
 fn config_check_validates_files_before_enumerating_only_selectable_contexts() {
     let fixture = ConfigFixture::new(
         r#"

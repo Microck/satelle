@@ -54,6 +54,9 @@ enum StartedActionOutcome<'a> {
 pub enum SetupOperationKind {
     Setup,
     Repair,
+    HostUpdate,
+    StorageMigration,
+    ServiceRestart,
 }
 
 impl SetupOperationKind {
@@ -61,6 +64,9 @@ impl SetupOperationKind {
         match self {
             Self::Setup => "setup",
             Self::Repair => "repair",
+            Self::HostUpdate => "host_update",
+            Self::StorageMigration => "storage_migration",
+            Self::ServiceRestart => "service_restart",
         }
     }
 
@@ -68,6 +74,9 @@ impl SetupOperationKind {
         match value {
             "setup" => Ok(Self::Setup),
             "repair" => Ok(Self::Repair),
+            "host_update" => Ok(Self::HostUpdate),
+            "storage_migration" => Ok(Self::StorageMigration),
+            "service_restart" => Ok(Self::ServiceRestart),
             _ => Err(StorageError::new(StorageErrorKind::InvalidStoredState)),
         }
     }
@@ -506,7 +515,10 @@ impl MaintenanceRecoverySubject {
 }
 
 pub(crate) enum MaintenanceLeaseState {
-    Active { operation_id: String },
+    Active {
+        operation_id: String,
+        freshness: super::LeaseFreshness,
+    },
     RecoveryPending(Box<MaintenanceRecoverySubject>),
 }
 
@@ -817,6 +829,9 @@ impl Storage {
         let unsatisfied_code = match subject.operation_kind() {
             SetupOperationKind::Setup => "setup_postcondition_unsatisfied",
             SetupOperationKind::Repair => "repair_postcondition_unsatisfied",
+            SetupOperationKind::HostUpdate => "host_update_postcondition_unsatisfied",
+            SetupOperationKind::StorageMigration => "storage_migration_postcondition_unsatisfied",
+            SetupOperationKind::ServiceRestart => "service_restart_postcondition_unsatisfied",
         };
         let owner = &subject.owner;
         let transaction = self

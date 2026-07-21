@@ -31,9 +31,9 @@ use satelle_core::{
     HostSessionsReport, LOCAL_DEMO_HOST, OwnerOnlyDirectory, PRODUCT_NAME, ProfileField,
     RELAY_ROSE, ResolvedConfig, SUCCESS_GREEN, SatelleError, SatelleEvent, SatelleEventBody,
     SecureFileError, SessionId, SetupMode, SetupReport, SetupRequiredInput, load_config,
-    open_or_create_owner_only_directory, open_or_create_owner_only_file, open_owner_only_directory,
-    read_owner_controlled_config_file, read_owner_only_secret_config_file, resolve_path_set,
-    utc_now,
+    load_user_api_rate_limits, open_or_create_owner_only_directory, open_or_create_owner_only_file,
+    open_owner_only_directory, read_owner_controlled_config_file,
+    read_owner_only_secret_config_file, resolve_path_set, utc_now,
 };
 use satelle_host::{
     ApiBearerToken, HostService, ProviderComputerUseIntent, contains_api_bearer_token,
@@ -3485,6 +3485,9 @@ fn start_host_daemon(
         })
     })?;
     let tls = daemon_tls_config(&command)?;
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let user_config_path = resolve_path_set(&cwd).map_err(failure)?.config_file;
+    let api_rate_limits = load_user_api_rate_limits(&user_config_path).map_err(failure)?;
 
     // Durable SSH relaunch must reopen the same default state store used by
     // bootstrap token issuance. The Controller has already resolved the idle
@@ -3564,7 +3567,8 @@ fn start_host_daemon(
         .build()
         .map_err(|error| daemon_process_failure("runtime-create-failed", error.to_string()))?;
     runtime.block_on(async move {
-        let mut server_config = DaemonServerConfig::loopback(bind_addr);
+        let mut server_config =
+            DaemonServerConfig::loopback(bind_addr).with_api_rate_limits(api_rate_limits);
         if let Some(idle_timeout) = idle_timeout {
             server_config = server_config.with_idle_timeout(idle_timeout);
         }

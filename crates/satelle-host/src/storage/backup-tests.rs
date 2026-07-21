@@ -81,6 +81,95 @@ impl BackupFixture {
 }
 
 #[test]
+fn migration_backup_restore_preserves_active_and_retired_idempotency_hmac_keys() {
+    const PAYLOAD: &[u8] = b"deterministic migration restore HMAC payload";
+
+    let test_state = crate::TestStateDir::new().expect("create test state directory");
+    let state_root = test_state.path().to_path_buf();
+    let (mut storage, recovery) =
+        crate::storage::Storage::open(&state_root).expect("open source store");
+    assert!(recovery.is_empty());
+
+    let retired_digest = storage
+        .digest_idempotency_payload(PAYLOAD)
+        .expect("digest payload with initial HMAC key");
+    assert_eq!(1, retired_digest.key_version());
+    let rotated_at = OffsetDateTime::now_utc();
+    assert_eq!(
+        2,
+        storage
+            .rotate_idempotency_hmac_key(rotated_at)
+            .expect("rotate initial HMAC key")
+    );
+    let active_digest = storage
+        .digest_idempotency_payload(PAYLOAD)
+        .expect("digest payload with active HMAC key");
+    assert_eq!(2, active_digest.key_version());
+    assert_eq!(
+        retired_digest,
+        storage
+            .digest_idempotency_payload_with_key(PAYLOAD, retired_digest.key_version())
+            .expect("reproduce digest with retired HMAC key")
+    );
+
+    create_migration_backup(
+        &storage.connection,
+        &state_root,
+        &storage._state_directory,
+        MIGRATIONS.last().expect("migration registry").version,
+    )
+    .expect("create migration backup containing both HMAC keys");
+    let backup_file_name = fs::read_dir(&state_root)
+        .expect("read state directory")
+        .map(|entry| entry.expect("read state entry").file_name())
+        .filter_map(|name| name.into_string().ok())
+        .find(|name| parse_migration_backup_file_name(name).is_some())
+        .expect("migration backup filename");
+
+    assert_eq!(
+        3,
+        storage
+            .rotate_idempotency_hmac_key(rotated_at + time::Duration::seconds(1))
+            .expect("rotate active HMAC key after backup")
+    );
+    let post_backup_digest = storage
+        .digest_idempotency_payload(PAYLOAD)
+        .expect("digest payload with post-backup HMAC key");
+    assert_eq!(3, post_backup_digest.key_version());
+    drop(storage);
+
+    let state_directory =
+        prepare_state_root(&state_root).expect("prepare state directory for restore");
+    let validated = validate_migration_backup(&state_root, &state_directory, &backup_file_name)
+        .expect("validate HMAC migration backup");
+    activate_migration_backup(&state_root, &state_directory, &validated)
+        .expect("activate HMAC migration backup");
+    drop(state_directory);
+
+    let (restored, recovery) =
+        crate::storage::Storage::open(&state_root).expect("reopen restored store");
+    assert!(recovery.is_empty());
+    assert_eq!(
+        active_digest,
+        restored
+            .digest_idempotency_payload(PAYLOAD)
+            .expect("reproduce digest with restored active HMAC key")
+    );
+    assert_eq!(
+        retired_digest,
+        restored
+            .digest_idempotency_payload_with_key(PAYLOAD, retired_digest.key_version())
+            .expect("reproduce digest with restored retired HMAC key")
+    );
+    assert!(
+        restored
+            .digest_idempotency_payload_with_key(PAYLOAD, post_backup_digest.key_version())
+            .is_err(),
+        "post-backup HMAC key version must be absent after restore"
+    );
+}
+
+#[test]
 fn manifest_filename_digest_schema_and_compatibility_are_validated() {
     let fixture = BackupFixture::new(1);
     let state_directory = fixture.state_directory();
@@ -290,15 +379,15 @@ fn restore_validation_rejects_symlink_nonregular_and_nonprivate_inputs() {
     let state_directory = fixture.state_directory();
     let candidates = [
         (
-            "satelle.sqlite3.migration-v10-0198a146-5ec2-7dd5-b51c-7d5e241e5890.backup",
+            "satelle.sqlite3.migration-v11-0198a146-5ec2-7dd5-b51c-7d5e241e5890.backup",
             "symlink",
         ),
         (
-            "satelle.sqlite3.migration-v10-0198a146-5ec2-7dd5-b51c-7d5e241e5891.backup",
+            "satelle.sqlite3.migration-v11-0198a146-5ec2-7dd5-b51c-7d5e241e5891.backup",
             "directory",
         ),
         (
-            "satelle.sqlite3.migration-v10-0198a146-5ec2-7dd5-b51c-7d5e241e5892.backup",
+            "satelle.sqlite3.migration-v11-0198a146-5ec2-7dd5-b51c-7d5e241e5892.backup",
             "nonprivate",
         ),
     ];
@@ -342,7 +431,7 @@ fn restore_validation_rejects_symlink_nonregular_and_nonprivate_inputs() {
 fn restore_validation_rejects_hardlinked_inputs() {
     let fixture = BackupFixture::new(1);
     let source_name = fixture.backup_file_name().to_owned();
-    let hardlink_name = "satelle.sqlite3.migration-v10-0198a146-5ec2-7dd5-b51c-7d5e241e5893.backup";
+    let hardlink_name = "satelle.sqlite3.migration-v11-0198a146-5ec2-7dd5-b51c-7d5e241e5893.backup";
     fs::hard_link(
         fixture.state_root.join(&source_name),
         fixture.state_root.join(hardlink_name),
@@ -367,7 +456,7 @@ fn restore_validation_rejects_windows_reparse_and_broadened_dacl_inputs() {
     let fixture = BackupFixture::new(1);
     let source_name = fixture.backup_file_name().to_owned();
     let source_manifest = fixture.manifest(&source_name);
-    let reparse_name = "satelle.sqlite3.migration-v10-0198a146-5ec2-7dd5-b51c-7d5e241e5894.backup";
+    let reparse_name = "satelle.sqlite3.migration-v11-0198a146-5ec2-7dd5-b51c-7d5e241e5894.backup";
     super::windows::create_file_symlink_for_test(
         &fixture.state_root.join(&source_name),
         &fixture.state_root.join(reparse_name),
@@ -378,7 +467,7 @@ fn restore_validation_rejects_windows_reparse_and_broadened_dacl_inputs() {
     fixture.write_manifest(reparse_name, &reparse_manifest);
 
     let broad_dacl_name =
-        "satelle.sqlite3.migration-v10-0198a146-5ec2-7dd5-b51c-7d5e241e5895.backup";
+        "satelle.sqlite3.migration-v11-0198a146-5ec2-7dd5-b51c-7d5e241e5895.backup";
     fs::copy(
         fixture.state_root.join(&source_name),
         fixture.state_root.join(broad_dacl_name),

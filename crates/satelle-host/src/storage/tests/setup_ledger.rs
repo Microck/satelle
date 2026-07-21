@@ -621,7 +621,7 @@ fn maintenance_delete_failure_rolls_back_normal_and_recovery_terminal_ledgers() 
     );
     assert!(matches!(
         normal.maintenance_lease_state().unwrap(),
-        Some(crate::storage::MaintenanceLeaseState::Active { operation_id })
+        Some(crate::storage::MaintenanceLeaseState::Active { operation_id, .. })
             if operation_id == normal_plan.run_id()
     ));
 

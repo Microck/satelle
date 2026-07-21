@@ -44,7 +44,7 @@ pub(super) const PROTECTED_FILE_NAMES: [&str; 5] = [
 ];
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 const BACKUP_FORMAT_VERSION: u32 = 1;
-const MIGRATIONS: [Migration; 10] = [
+const MIGRATIONS: [Migration; 11] = [
     Migration {
         version: 1,
         sql: include_str!("0001_initial.sql"),
@@ -102,6 +102,12 @@ const MIGRATIONS: [Migration; 10] = [
     Migration {
         version: 10,
         sql: include_str!("0010_admission_cancellations.sql"),
+        seeds_sensitive_state: false,
+        irreversible: false,
+    },
+    Migration {
+        version: 11,
+        sql: include_str!("0011_operation_classes.sql"),
         seeds_sensitive_state: false,
         irreversible: false,
     },

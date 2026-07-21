@@ -466,6 +466,11 @@ pub(super) fn idempotent_operation_token(operation: IdempotentOperation) -> &'st
         IdempotentOperation::Run => "run",
         IdempotentOperation::Steer => "steer",
         IdempotentOperation::Stop => "stop",
+        IdempotentOperation::Setup => "setup",
+        IdempotentOperation::Repair => "repair",
+        IdempotentOperation::HostUpdate => "host_update",
+        IdempotentOperation::StorageMigration => "storage_migration",
+        IdempotentOperation::DestructiveMaintenance => "destructive_maintenance",
     }
 }
 
