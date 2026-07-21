@@ -3,13 +3,152 @@ use reqwest::Method;
 use satelle_core::StopResultOutcome;
 use satelle_core::session::{SessionActivity, TurnExecutionMode};
 use satelle_test_contract::assert_privacy_canaries_absent;
-use satelle_transport::{SessionResponse, StopRequest, StopResponse, TurnRequest};
+use satelle_transport::{
+    AdmissionCancellationOutcome, AdmissionCancellationResponse, SessionResponse, StopRequest,
+    StopResponse, TurnRequest,
+};
 
 const CREATE_KEY: &str = "01890a5d-ac96-7b7c-8f89-37c3d0a66f01";
 const STEER_KEY: &str = "01890a5d-ac96-7b7c-8f89-37c3d0a66f02";
 const STOP_KEY: &str = "01890a5d-ac96-7b7c-8f89-37c3d0a66f03";
 const SECOND_CREATE_KEY: &str = "01890a5d-ac96-7b7c-8f89-37c3d0a66f04";
 const CROSS_SESSION_TURN_KEY: &str = "01890a5d-ac96-7b7c-8f89-37c3d0a66f05";
+const STALE_STOP_KEY: &str = "01890a5d-ac96-7b7c-8f89-37c3d0a66f06";
+
+#[tokio::test]
+async fn cancelled_admission_replay_returns_a_stable_conflict() {
+    let running = RunningServer::start(ApiScopes::CONTROL).await;
+    let request = TurnRequest::new("PRIVATE_CANCELLED_ADMISSION_REPLAY_CANARY");
+    let cancelled: AdmissionCancellationResponse = running
+        .mutation("/v1/sessions", CREATE_KEY)
+        .header("Satelle-Admission-Action", "cancel")
+        .json(&request)
+        .send()
+        .await
+        .expect("cancel run admission")
+        .json()
+        .await
+        .expect("decode run cancellation");
+    assert_eq!(cancelled.outcome(), AdmissionCancellationOutcome::Cancelled);
+
+    let replay = running
+        .mutation("/v1/sessions", CREATE_KEY)
+        .json(&request)
+        .send()
+        .await
+        .expect("replay cancelled admission");
+    assert_eq!(replay.status(), StatusCode::CONFLICT);
+    let error: ApiError = replay.json().await.expect("decode replay conflict");
+    assert_eq!(error.code(), satelle_transport::ApiErrorCode::StateConflict);
+}
+
+#[tokio::test]
+async fn existing_admission_routes_return_exact_committed_handles_when_cancel_arrives_late() {
+    let running = RunningServer::start(ApiScopes::CONTROL).await;
+    let run_request = TurnRequest::new("PRIVATE_LATE_RUN_CANCELLATION_CANARY");
+    let created: SessionResponse = running
+        .mutation("/v1/sessions", CREATE_KEY)
+        .json(&run_request)
+        .send()
+        .await
+        .expect("create Session")
+        .json()
+        .await
+        .expect("decode Session");
+    let session_id = created.session().session_id().clone();
+    let run_turn_id = created.session().turns()[0].turn_id().clone();
+
+    let cancelled_run: AdmissionCancellationResponse = running
+        .mutation("/v1/sessions", CREATE_KEY)
+        .header("Satelle-Admission-Action", "cancel")
+        .json(&run_request)
+        .send()
+        .await
+        .expect("cancel committed run admission")
+        .json()
+        .await
+        .expect("decode run cancellation");
+    assert_eq!(
+        cancelled_run.outcome(),
+        AdmissionCancellationOutcome::Admitted
+    );
+    assert_eq!(cancelled_run.session_id(), Some(&session_id));
+    assert_eq!(cancelled_run.turn_id(), Some(&run_turn_id));
+
+    wait_until_idle(&running, session_id.as_str()).await;
+    let steer_request = TurnRequest::new("PRIVATE_LATE_STEER_CANCELLATION_CANARY");
+    let steered: SessionResponse = running
+        .mutation(&format!("/v1/sessions/{session_id}/turns"), STEER_KEY)
+        .json(&steer_request)
+        .send()
+        .await
+        .expect("create follow-up Turn")
+        .json()
+        .await
+        .expect("decode follow-up Turn");
+    let steer_turn_id = steered
+        .session()
+        .turns()
+        .last()
+        .expect("steer response contains its target Turn")
+        .turn_id()
+        .clone();
+
+    let cancelled_steer: AdmissionCancellationResponse = running
+        .mutation(&format!("/v1/sessions/{session_id}/turns"), STEER_KEY)
+        .header("Satelle-Admission-Action", "cancel")
+        .json(&steer_request)
+        .send()
+        .await
+        .expect("cancel committed steer admission")
+        .json()
+        .await
+        .expect("decode steer cancellation");
+    assert_eq!(
+        cancelled_steer.outcome(),
+        AdmissionCancellationOutcome::Admitted
+    );
+    assert_eq!(cancelled_steer.session_id(), Some(&session_id));
+    assert_eq!(cancelled_steer.turn_id(), Some(&steer_turn_id));
+}
+
+#[tokio::test]
+async fn admission_action_is_an_exact_optional_singleton_and_absence_preserves_admission_wire() {
+    let running = RunningServer::start(ApiScopes::CONTROL).await;
+    let request = TurnRequest::new("PRIVATE_ADMISSION_ACTION_VALIDATION_CANARY");
+    let invalid = running
+        .mutation("/v1/sessions", CREATE_KEY)
+        .header("Satelle-Admission-Action", "Cancel")
+        .json(&request)
+        .send()
+        .await
+        .expect("send invalid admission action");
+    assert_eq!(invalid.status(), StatusCode::BAD_REQUEST);
+    let error: ApiError = invalid.json().await.expect("decode invalid action error");
+    assert_eq!(error.code().as_str(), "invalid-request");
+    assert_eq!(
+        running
+            .service
+            .initialize_daemon()
+            .expect("read state after invalid action")
+            .session_count(),
+        0
+    );
+
+    let admitted = running
+        .mutation("/v1/sessions", CREATE_KEY)
+        .json(&request)
+        .send()
+        .await
+        .expect("admit without the optional action header");
+    assert_eq!(admitted.status(), StatusCode::ACCEPTED);
+    let body = admitted.bytes().await.expect("read admission response");
+    let json: Value = serde_json::from_slice(&body).expect("parse admission response");
+    assert_eq!(json["schema_version"], "satelle.session.v1");
+    assert!(json.get("display_name").is_none());
+    assert!(json.get("outcome").is_none());
+    serde_json::from_slice::<SessionResponse>(&body).expect("decode legacy admission response");
+}
 
 #[tokio::test]
 async fn session_routes_complete_the_durable_reconnect_journey() {
@@ -477,6 +616,7 @@ async fn daemon_client_drives_the_complete_session_control_contract() {
             )
             .expect("create Session through DaemonClient");
         let session_id = created.session().session_id().clone();
+        let original_turn_id = created.session().turns()[0].turn_id().clone();
 
         let conflict = client
             .create_session(
@@ -504,8 +644,25 @@ async fn daemon_client_drives_the_complete_session_control_contract() {
         assert_eq!(steered.session().turns().len(), 2);
         wait_until_idle_with_client(&client, &session_id);
 
+        let stale = client
+            .stop_session_for_turn(&session_id, &original_turn_id, STALE_STOP_KEY)
+            .expect_err("stale expected Turn must not retarget the newer Turn");
+        match stale {
+            DaemonClientError::Api { status, error } => {
+                assert_eq!(status, StatusCode::CONFLICT);
+                assert_eq!(error.code(), satelle_transport::ApiErrorCode::StateConflict);
+            }
+            other => panic!("expected stale-Turn conflict, got {other:?}"),
+        }
+        let latest_turn_id = steered
+            .session()
+            .turns()
+            .last()
+            .expect("steered Session has latest Turn")
+            .turn_id()
+            .clone();
         let stopped = client
-            .stop_session(&session_id, STOP_KEY)
+            .stop_session_for_turn(&session_id, &latest_turn_id, STOP_KEY)
             .expect("stop Session through DaemonClient");
         assert_eq!(stopped.result().session_id(), &session_id);
         assert_eq!(
@@ -523,7 +680,7 @@ async fn mutation_validation_fails_before_execution_with_typed_errors() {
 
     let missing_key = running
         .protected_request(Method::POST, "/v1/sessions")
-        .header("Satelle-Protocol-Version", "3")
+        .header("Satelle-Protocol-Version", "4")
         .json(&TurnRequest::new("PRIVATE_MISSING_KEY_CANARY"))
         .send()
         .await
@@ -1102,7 +1259,7 @@ fn protected_at(
         .header("Satelle-Expected-Host-Identity", host_identity)
         .header("Satelle-Request-Id", RequestId::new().to_string());
     if is_mutation {
-        request.header("Satelle-Protocol-Version", "3")
+        request.header("Satelle-Protocol-Version", "4")
     } else {
         request
     }

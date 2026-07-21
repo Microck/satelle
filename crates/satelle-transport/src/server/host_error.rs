@@ -59,6 +59,7 @@ fn failure(error: &SatelleError) -> ApiFailure {
         | ErrorCode::PathOverrideNotAbsolute
         | ErrorCode::DaemonPathOverrideNotAbsolute
         | ErrorCode::EventsWithDetach
+        | ErrorCode::InterruptModeConflict
         | ErrorCode::OutputModeConflict
         | ErrorCode::LogTailLimitExceeded
         | ErrorCode::LogPositionConflict
@@ -270,7 +271,7 @@ fn validated_control_plane_details(error: &SatelleError) -> Option<serde_json::V
 }
 
 fn validated_stop_not_confirmed_details(error: &SatelleError) -> Option<serde_json::Value> {
-    if error.details.len() != 5 {
+    if error.details.len() != 7 {
         return None;
     }
     let session_id = error.details.get("session_id")?.as_str()?;
@@ -282,6 +283,16 @@ fn validated_stop_not_confirmed_details(error: &SatelleError) -> Option<serde_js
         return None;
     }
     let state_changed = error.details.get("state_changed")?.as_bool()?;
+    let session_state_revision = error
+        .details
+        .get("session_state_revision")?
+        .as_u64()
+        .and_then(|value| satelle_core::session::SessionStateRevision::new(value).ok())?;
+    let turn_state_revision = error
+        .details
+        .get("turn_state_revision")?
+        .as_u64()
+        .and_then(|value| satelle_core::session::TurnStateRevision::new(value).ok())?;
     if !error.details.get("retryable")?.as_bool()? {
         return None;
     }
@@ -290,6 +301,8 @@ fn validated_stop_not_confirmed_details(error: &SatelleError) -> Option<serde_js
         "turn_id": turn_id,
         "ownership": ownership,
         "state_changed": state_changed,
+        "session_state_revision": session_state_revision,
+        "turn_state_revision": turn_state_revision,
         "retryable": true
     }))
 }
@@ -456,6 +469,8 @@ mod tests {
                 ("turn_id".to_string(), json!(turn_id)),
                 ("ownership".to_string(), json!("recovery_pending")),
                 ("state_changed".to_string(), json!(true)),
+                ("session_state_revision".to_string(), json!(3)),
+                ("turn_state_revision".to_string(), json!(2)),
                 ("retryable".to_string(), json!(true)),
             ]),
         });
@@ -472,6 +487,8 @@ mod tests {
                 "turn_id": turn_id,
                 "ownership": "recovery_pending",
                 "state_changed": true,
+                "session_state_revision": 3,
+                "turn_state_revision": 2,
                 "retryable": true
             }))
         );

@@ -533,6 +533,8 @@ impl PublicTurn {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct PublicSession {
     session_id: SessionId,
+    #[serde(skip_serializing)]
+    display_name: Option<String>,
     session_state_revision: SessionStateRevision,
     #[serde(with = "time::serde::rfc3339")]
     created_at: OffsetDateTime,
@@ -549,6 +551,10 @@ pub struct PublicSnapshotError;
 impl PublicSession {
     pub fn session_id(&self) -> &SessionId {
         &self.session_id
+    }
+
+    pub fn display_name(&self) -> Option<&str> {
+        self.display_name.as_deref()
     }
 
     pub fn session_state_revision(&self) -> SessionStateRevision {
@@ -912,6 +918,7 @@ impl TurnSnapshot {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SessionSnapshot {
     id: SessionId,
+    display_name: Option<String>,
     revision: SessionStateRevision,
     host_identity: HostIdentityRef,
     desktop_binding: DesktopBindingRef,
@@ -930,8 +937,32 @@ impl SessionSnapshot {
         updated_at: OffsetDateTime,
         turns: Vec<TurnSnapshot>,
     ) -> Self {
+        Self::new_with_display_name(
+            id,
+            None,
+            revision,
+            host_identity,
+            desktop_binding,
+            created_at,
+            updated_at,
+            turns,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_with_display_name(
+        id: SessionId,
+        display_name: Option<String>,
+        revision: SessionStateRevision,
+        host_identity: HostIdentityRef,
+        desktop_binding: DesktopBindingRef,
+        created_at: OffsetDateTime,
+        updated_at: OffsetDateTime,
+        turns: Vec<TurnSnapshot>,
+    ) -> Self {
         Self {
             id,
+            display_name,
             revision,
             host_identity,
             desktop_binding,
@@ -943,6 +974,10 @@ impl SessionSnapshot {
 
     pub fn id(&self) -> &SessionId {
         &self.id
+    }
+
+    pub fn display_name(&self) -> Option<&str> {
+        self.display_name.as_deref()
     }
 
     pub fn session_state_revision(&self) -> SessionStateRevision {
@@ -1060,6 +1095,7 @@ pub(super) fn terminal_summary_matches(state: TurnState, summary: Option<SafeSum
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Session {
     id: SessionId,
+    display_name: Option<String>,
     revision: SessionStateRevision,
     host_identity: HostIdentityRef,
     desktop_binding: DesktopBindingRef,
@@ -1077,11 +1113,33 @@ impl Session {
         execution_policy: ExecutionPolicy,
         at: OffsetDateTime,
     ) -> Result<Self, LifecycleError> {
+        Self::start_with_display_name(
+            id,
+            None,
+            host_identity,
+            desktop_binding,
+            turn_id,
+            execution_policy,
+            at,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn start_with_display_name(
+        id: SessionId,
+        display_name: Option<String>,
+        host_identity: HostIdentityRef,
+        desktop_binding: DesktopBindingRef,
+        turn_id: TurnId,
+        execution_policy: ExecutionPolicy,
+        at: OffsetDateTime,
+    ) -> Result<Self, LifecycleError> {
         if execution_policy.desktop_target().binding() != &desktop_binding {
             return Err(LifecycleError::DesktopTargetMismatch);
         }
         Ok(Self {
             id,
+            display_name,
             revision: SessionStateRevision::initial(),
             host_identity,
             desktop_binding,
@@ -1093,6 +1151,10 @@ impl Session {
 
     pub fn id(&self) -> &SessionId {
         &self.id
+    }
+
+    pub fn display_name(&self) -> Option<&str> {
+        self.display_name.as_deref()
     }
 
     pub fn session_state_revision(&self) -> SessionStateRevision {
@@ -1120,8 +1182,9 @@ impl Session {
     }
 
     pub fn snapshot(&self) -> SessionSnapshot {
-        SessionSnapshot::new(
+        SessionSnapshot::new_with_display_name(
             self.id.clone(),
+            self.display_name.clone(),
             self.revision,
             self.host_identity.clone(),
             self.desktop_binding.clone(),
@@ -1151,6 +1214,7 @@ impl Session {
             .map_err(|reason| LifecycleError::InvalidSnapshot { reason })?;
         Ok(Self {
             id: snapshot.id,
+            display_name: snapshot.display_name,
             revision: snapshot.revision,
             host_identity: snapshot.host_identity,
             desktop_binding: snapshot.desktop_binding,
@@ -1217,6 +1281,7 @@ impl Session {
     pub fn to_public(&self) -> PublicSession {
         PublicSession {
             session_id: self.id.clone(),
+            display_name: self.display_name.clone(),
             session_state_revision: self.revision,
             created_at: self.created_at,
             updated_at: self.updated_at,
@@ -2011,6 +2076,7 @@ mod tests {
             "upstream",
             "request_id",
             "goal_id",
+            "goal_ref",
             "model",
             "provider_binding",
             "approval_policy",
@@ -2020,6 +2086,33 @@ mod tests {
         }
         assert!(json.contains(SESSION_ID));
         assert!(json.contains(TURN_1));
+    }
+
+    #[test]
+    fn optional_display_name_survives_public_and_persistence_snapshots() {
+        let named = Session::start_with_display_name(
+            SessionId::parse(SESSION_ID).unwrap(),
+            Some("Release desktop".to_string()),
+            host(),
+            desktop(),
+            turn_1(),
+            default_policy(),
+            at(0),
+        )
+        .unwrap();
+
+        assert_eq!(Some("Release desktop"), named.display_name());
+        assert_eq!(Some("Release desktop"), named.to_public().display_name());
+        let public_json = serde_json::to_value(named.to_public()).unwrap();
+        assert!(
+            public_json.get("display_name").is_none(),
+            "session v1 must not emit its post-v1 display name"
+        );
+        assert_eq!(Some("Release desktop"), named.snapshot().display_name());
+        assert_eq!(
+            named,
+            Session::restore(named.snapshot()).expect("restore named Session")
+        );
     }
 
     #[test]

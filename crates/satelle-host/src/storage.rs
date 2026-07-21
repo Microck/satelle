@@ -18,8 +18,9 @@ pub(crate) const IDEMPOTENCY_RETENTION: time::Duration = time::Duration::hours(2
 
 pub(crate) use self::auth::{ApiTokenRegistration, SensitiveRequestDigest};
 use self::codec::{
-    idempotent_operation_token, load_required_session, load_session_at_operation_outcome,
-    load_session_from_connection, turn_idempotency_token, validated_private_reference,
+    format_time, idempotent_operation_token, load_required_session,
+    load_session_at_operation_outcome, load_session_from_connection, parse_time,
+    turn_idempotency_token, validated_private_reference,
 };
 pub(crate) use self::logs::LogPageStorageError;
 use self::logs::canonical_log;
@@ -114,6 +115,7 @@ pub(crate) enum StorageErrorKind {
     LeaseConflict,
     StateConflict,
     IdempotencyConflict,
+    AdmissionCancelled,
     PrivateReferenceConflict,
     OperationFailed,
 }
@@ -139,6 +141,7 @@ impl fmt::Display for StorageErrorKind {
             Self::LeaseConflict => "the selected Satelle Control Lease is already owned",
             Self::StateConflict => "the stored Satelle lifecycle state changed concurrently",
             Self::IdempotencyConflict => "the idempotency key was reused for a different request",
+            Self::AdmissionCancelled => "the admission was cancelled before it committed",
             Self::PrivateReferenceConflict => {
                 "an observed private runtime reference conflicts with stored state"
             }
@@ -376,6 +379,7 @@ impl AdmissionContext {
 pub(crate) enum ObservedUpstreamRef {
     Thread(PrivateUpstreamRef),
     Turn(PrivateUpstreamRef),
+    Goal(PrivateUpstreamRef),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -472,6 +476,10 @@ impl ObservedUpstreamRef {
     pub(crate) fn turn(value: impl Into<String>) -> Result<Self, StorageError> {
         Ok(Self::Turn(PrivateUpstreamRef::new(value)?))
     }
+
+    pub(crate) fn goal(value: impl Into<String>) -> Result<Self, StorageError> {
+        Ok(Self::Goal(PrivateUpstreamRef::new(value)?))
+    }
 }
 
 #[derive(Clone)]
@@ -484,6 +492,7 @@ pub(crate) struct RecoverySubject {
     request_token: PrivateRequestToken,
     upstream_thread_ref: Option<PrivateUpstreamRef>,
     upstream_turn_ref: Option<PrivateUpstreamRef>,
+    upstream_goal_ref: Option<PrivateUpstreamRef>,
 }
 
 impl RecoverySubject {
@@ -518,6 +527,10 @@ impl RecoverySubject {
     pub(crate) fn upstream_turn_ref(&self) -> Option<&PrivateUpstreamRef> {
         self.upstream_turn_ref.as_ref()
     }
+
+    pub(crate) fn upstream_goal_ref(&self) -> Option<&PrivateUpstreamRef> {
+        self.upstream_goal_ref.as_ref()
+    }
 }
 
 impl fmt::Debug for RecoverySubject {
@@ -540,6 +553,36 @@ pub(crate) enum AdmissionOutcome {
     },
     InProgress(Session),
     Complete(Session),
+}
+
+pub(crate) enum DurableAdmissionState {
+    Missing,
+    Admitted(Box<AdmissionReplay>),
+    Cancelled,
+    RecoveryPending,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum DurableCancellationOutcome {
+    Cancelled,
+    RecoveryPending,
+}
+
+impl DurableCancellationOutcome {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Cancelled => "cancelled",
+            Self::RecoveryPending => "recovery_pending",
+        }
+    }
+
+    fn parse(value: &str) -> Result<Self, StorageError> {
+        match value {
+            "cancelled" => Ok(Self::Cancelled),
+            "recovery_pending" => Ok(Self::RecoveryPending),
+            _ => Err(StorageError::new(StorageErrorKind::InvalidStoredState)),
+        }
+    }
 }
 
 /// A durable idempotency replay and the exact handles stored with that record.
@@ -665,6 +708,54 @@ fn validate_replayed_turn_outcome(
         return Err(StorageError::new(StorageErrorKind::InvalidStoredState));
     }
     Ok(())
+}
+
+fn matching_admission_cancellation(
+    connection: &Connection,
+    input: &IdempotencyInput,
+    observed_at: OffsetDateTime,
+) -> Result<Option<DurableCancellationOutcome>, StorageError> {
+    let record = connection
+        .query_row(
+            "SELECT request_digest, digest_schema_version, hmac_key_version, outcome, expires_at
+             FROM admission_cancellations
+             WHERE principal_ref = ?1 AND operation = ?2 AND idempotency_key = ?3",
+            rusqlite::params![
+                input.principal_ref.as_str(),
+                idempotent_operation_token(input.operation),
+                input.key.as_str(),
+            ],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(|source| sqlite_error(StorageErrorKind::OperationFailed, source))?;
+    let Some((digest, digest_schema_version, hmac_key_version, outcome, expires_at)) = record
+    else {
+        return Ok(None);
+    };
+    let outcome = DurableCancellationOutcome::parse(&outcome)?;
+    if outcome == DurableCancellationOutcome::Cancelled && parse_time(&expires_at)? <= observed_at {
+        return Ok(None);
+    }
+    if digest != input.request_digest
+        || digest_schema_version != i64::from(input.digest_schema_version)
+        || hmac_key_version != i64::from(input.hmac_key_version)
+    {
+        return Err(StorageError::new(StorageErrorKind::IdempotencyConflict));
+    }
+    // A recovery-pending tombstone records unresolved upstream ownership, not
+    // a completed cancellation guarantee. It cannot expire into Missing:
+    // callers must reconcile ownership and use a new idempotency key rather
+    // than treating elapsed retention time as proof that nothing dispatched.
+    Ok(Some(outcome))
 }
 
 pub(crate) struct Storage {
@@ -833,6 +924,173 @@ impl Storage {
             .transpose()
     }
 
+    pub(crate) fn resolve_admission_operation(
+        &self,
+        operation: IdempotentOperation,
+        idempotency: &IdempotencyInput,
+        expected_session_id: Option<&SessionId>,
+        observed_at: OffsetDateTime,
+    ) -> Result<DurableAdmissionState, StorageError> {
+        require_operation(idempotency, operation)?;
+        if let Some(record) = matching_idempotency(&self.connection, idempotency)? {
+            return replay_admission(&self.connection, &record, expected_session_id)
+                .map(Box::new)
+                .map(DurableAdmissionState::Admitted);
+        }
+        matching_admission_cancellation(&self.connection, idempotency, observed_at).map(|outcome| {
+            match outcome {
+                Some(DurableCancellationOutcome::Cancelled) => DurableAdmissionState::Cancelled,
+                Some(DurableCancellationOutcome::RecoveryPending) => {
+                    DurableAdmissionState::RecoveryPending
+                }
+                None => DurableAdmissionState::Missing,
+            }
+        })
+    }
+
+    pub(crate) fn record_admission_cancellation(
+        &mut self,
+        operation: IdempotentOperation,
+        idempotency: &IdempotencyInput,
+        expected_session_id: Option<&SessionId>,
+        outcome: DurableCancellationOutcome,
+        observed_at: OffsetDateTime,
+    ) -> Result<DurableAdmissionState, StorageError> {
+        self.record_admission_cancellation_inner(
+            operation,
+            idempotency,
+            expected_session_id,
+            outcome,
+            observed_at,
+            false,
+        )
+    }
+
+    pub(crate) fn reconcile_admission_cancellation(
+        &mut self,
+        operation: IdempotentOperation,
+        idempotency: &IdempotencyInput,
+        expected_session_id: Option<&SessionId>,
+        outcome: DurableCancellationOutcome,
+        observed_at: OffsetDateTime,
+    ) -> Result<DurableAdmissionState, StorageError> {
+        self.record_admission_cancellation_inner(
+            operation,
+            idempotency,
+            expected_session_id,
+            outcome,
+            observed_at,
+            true,
+        )
+    }
+
+    fn record_admission_cancellation_inner(
+        &mut self,
+        operation: IdempotentOperation,
+        idempotency: &IdempotencyInput,
+        expected_session_id: Option<&SessionId>,
+        outcome: DurableCancellationOutcome,
+        observed_at: OffsetDateTime,
+        reconciled: bool,
+    ) -> Result<DurableAdmissionState, StorageError> {
+        require_operation(idempotency, operation)?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|source| sqlite_error(StorageErrorKind::OperationFailed, source))?;
+        if let Some(record) = matching_idempotency(&transaction, idempotency)? {
+            let replay = replay_admission(&transaction, &record, expected_session_id)?;
+            transaction
+                .commit()
+                .map_err(|source| sqlite_error(StorageErrorKind::OperationFailed, source))?;
+            return Ok(DurableAdmissionState::Admitted(Box::new(replay)));
+        }
+        let existing = matching_admission_cancellation(&transaction, idempotency, observed_at)?;
+        let state = match existing {
+            Some(DurableCancellationOutcome::RecoveryPending)
+                if reconciled && outcome == DurableCancellationOutcome::Cancelled =>
+            {
+                transaction
+                    .execute(
+                        "UPDATE admission_cancellations
+                         SET outcome = 'cancelled', created_at = ?4, expires_at = ?5
+                         WHERE principal_ref = ?1 AND operation = ?2 AND idempotency_key = ?3",
+                        rusqlite::params![
+                            idempotency.principal_ref.as_str(),
+                            idempotent_operation_token(idempotency.operation),
+                            idempotency.key.as_str(),
+                            format_time(observed_at)?,
+                            format_time(observed_at + IDEMPOTENCY_RETENTION)?,
+                        ],
+                    )
+                    .map_err(|source| sqlite_error(StorageErrorKind::OperationFailed, source))?;
+                DurableAdmissionState::Cancelled
+            }
+            Some(DurableCancellationOutcome::RecoveryPending) => {
+                DurableAdmissionState::RecoveryPending
+            }
+            Some(DurableCancellationOutcome::Cancelled)
+                if outcome == DurableCancellationOutcome::RecoveryPending =>
+            {
+                transaction
+                    .execute(
+                        "UPDATE admission_cancellations SET outcome = 'recovery_pending'
+                         WHERE principal_ref = ?1 AND operation = ?2 AND idempotency_key = ?3",
+                        rusqlite::params![
+                            idempotency.principal_ref.as_str(),
+                            idempotent_operation_token(idempotency.operation),
+                            idempotency.key.as_str(),
+                        ],
+                    )
+                    .map_err(|source| sqlite_error(StorageErrorKind::OperationFailed, source))?;
+                DurableAdmissionState::RecoveryPending
+            }
+            Some(DurableCancellationOutcome::Cancelled) => DurableAdmissionState::Cancelled,
+            None => {
+                transaction
+                    .execute(
+                        "DELETE FROM admission_cancellations
+                         WHERE principal_ref = ?1 AND operation = ?2 AND idempotency_key = ?3",
+                        rusqlite::params![
+                            idempotency.principal_ref.as_str(),
+                            idempotent_operation_token(idempotency.operation),
+                            idempotency.key.as_str(),
+                        ],
+                    )
+                    .map_err(|source| sqlite_error(StorageErrorKind::OperationFailed, source))?;
+                transaction
+                    .execute(
+                        "INSERT INTO admission_cancellations
+                         (principal_ref, operation, idempotency_key, request_digest,
+                          digest_schema_version, hmac_key_version, outcome, created_at, expires_at)
+                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                        rusqlite::params![
+                            idempotency.principal_ref.as_str(),
+                            idempotent_operation_token(idempotency.operation),
+                            idempotency.key.as_str(),
+                            idempotency.request_digest.as_str(),
+                            i64::from(idempotency.digest_schema_version),
+                            i64::from(idempotency.hmac_key_version),
+                            outcome.as_str(),
+                            format_time(observed_at)?,
+                            format_time(observed_at + IDEMPOTENCY_RETENTION)?,
+                        ],
+                    )
+                    .map_err(|source| sqlite_error(StorageErrorKind::OperationFailed, source))?;
+                match outcome {
+                    DurableCancellationOutcome::Cancelled => DurableAdmissionState::Cancelled,
+                    DurableCancellationOutcome::RecoveryPending => {
+                        DurableAdmissionState::RecoveryPending
+                    }
+                }
+            }
+        };
+        transaction
+            .commit()
+            .map_err(|source| sqlite_error(StorageErrorKind::OperationFailed, source))?;
+        Ok(state)
+    }
+
     pub(crate) fn idempotency_hmac_key_version(
         &self,
         principal_ref: &str,
@@ -848,6 +1106,27 @@ impl Storage {
             )
             .optional()
             .map_err(|source| sqlite_error(StorageErrorKind::OperationFailed, source))?;
+        let version = match version {
+            Some(version) => Some(version),
+            None => {
+                let observed_at = format_time(OffsetDateTime::now_utc())?;
+                self.connection
+                    .query_row(
+                        "SELECT hmac_key_version FROM admission_cancellations
+                         WHERE principal_ref = ?1 AND operation = ?2 AND idempotency_key = ?3
+                           AND (outcome = 'recovery_pending' OR expires_at > ?4)",
+                        rusqlite::params![
+                            principal_ref,
+                            idempotent_operation_token(operation),
+                            key,
+                            observed_at,
+                        ],
+                        |row| row.get(0),
+                    )
+                    .optional()
+                    .map_err(|source| sqlite_error(StorageErrorKind::OperationFailed, source))?
+            }
+        };
         version
             .map(|version| {
                 u16::try_from(version)
@@ -894,6 +1173,15 @@ impl Storage {
                 .commit()
                 .map_err(|source| sqlite_error(StorageErrorKind::OperationFailed, source))?;
             return Ok(outcome);
+        }
+        if matching_admission_cancellation(
+            &transaction,
+            &context.idempotency,
+            context.idempotency.created_at,
+        )?
+        .is_some()
+        {
+            return Err(StorageError::new(StorageErrorKind::AdmissionCancelled));
         }
 
         ensure_control_lease_available(
@@ -958,6 +1246,15 @@ impl Storage {
                 .commit()
                 .map_err(|source| sqlite_error(StorageErrorKind::OperationFailed, source))?;
             return Ok(outcome);
+        }
+        if matching_admission_cancellation(
+            &transaction,
+            &context.idempotency,
+            context.idempotency.created_at,
+        )?
+        .is_some()
+        {
+            return Err(StorageError::new(StorageErrorKind::AdmissionCancelled));
         }
 
         let mut session = load_required_session(&transaction, session_id)?;

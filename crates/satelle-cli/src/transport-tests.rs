@@ -1,5 +1,9 @@
 use super::*;
-use satelle_core::session::{StopObservation, TurnAdmissionPhase, TurnState};
+use satelle_core::session::{
+    ApprovalPolicy, DesktopBindingRef, DesktopTarget, EffectiveModelRef, ExecutionPolicy,
+    ExperimentalFeatureChoices, FeatureChoice, ProviderBindingRef, SandboxPolicy, SessionActivity,
+    StopObservation, TimeoutPolicy, TurnAdmissionPhase, TurnState, TurnTransition,
+};
 use satelle_core::{
     ApiTokenSource, ErrorCode, EventSource, EventSubject, EventType, SatelleConfig,
     SatelleEventBody, TransportKind,
@@ -7,14 +11,14 @@ use satelle_core::{
 use satelle_host::{
     AdapterReadiness, AdapterSubject, ApiScopes, ComputerUseAdapter, ExecuteRequest, ExecuteResult,
     LogCursor, LogPageQuery, LogSeverity, LogSource, ProviderComputerUseIntent,
-    RecoveryObservation, test_support::TestStateDir,
+    ProviderSmokeEvidence, ReadinessEvidence, RecoveryObservation, test_support::TestStateDir,
 };
 use satelle_transport::{DaemonServer, DaemonServerConfig};
 use std::io::{Read, Write};
 use std::net::{Ipv4Addr, SocketAddr, TcpListener};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Mutex, mpsc};
+use std::sync::{Condvar, Mutex, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
 use tokio_tungstenite::tungstenite::Error as WebSocketError;
@@ -23,6 +27,245 @@ use tokio_tungstenite::tungstenite::error::ProtocolError;
 #[derive(Clone)]
 struct RecordingProviderIntentAdapter {
     observed: Arc<Mutex<Option<ProviderComputerUseIntent>>>,
+}
+
+#[derive(Clone, Default)]
+struct TestInterrupt {
+    signalled: Arc<AtomicBool>,
+    changed: Arc<tokio::sync::Notify>,
+}
+
+impl TestInterrupt {
+    fn signal(&self) {
+        self.signalled.store(true, Ordering::Release);
+        self.changed.notify_waiters();
+    }
+}
+
+impl InterruptSource for TestInterrupt {
+    fn wait(&self) -> InterruptFuture<'_> {
+        Box::pin(async move {
+            loop {
+                let notified = self.changed.notified();
+                if self.signalled.load(Ordering::Acquire) {
+                    return Ok(());
+                }
+                notified.await;
+            }
+        })
+    }
+}
+
+struct FailingWaitInterrupt {
+    operation_started: TestLatch,
+}
+
+impl InterruptSource for FailingWaitInterrupt {
+    fn wait(&self) -> InterruptFuture<'_> {
+        Box::pin(async move {
+            self.operation_started.wait();
+            Err(std::io::Error::other("injected interrupt listener failure"))
+        })
+    }
+}
+
+#[derive(Clone, Default)]
+struct ArmOrderInterrupt {
+    armed: Arc<AtomicBool>,
+}
+
+impl InterruptSource for ArmOrderInterrupt {
+    fn arm(&self) -> InterruptFuture<'_> {
+        Box::pin(async move {
+            self.armed.store(true, Ordering::Release);
+            Ok(())
+        })
+    }
+
+    fn wait(&self) -> InterruptFuture<'_> {
+        Box::pin(async move {
+            assert!(
+                self.armed.load(Ordering::Acquire),
+                "interrupt wait must never begin before synchronous arming completes"
+            );
+            std::future::pending().await
+        })
+    }
+}
+
+#[derive(Clone)]
+struct ArmCheckingAdapter {
+    armed: Arc<AtomicBool>,
+}
+
+impl ComputerUseAdapter for ArmCheckingAdapter {
+    fn preflight(
+        &self,
+        _host: &str,
+        _intent: &ProviderComputerUseIntent,
+    ) -> Result<AdapterReadiness, SatelleError> {
+        assert!(
+            self.armed.load(Ordering::Acquire),
+            "the SIGINT source must be armed before the local admission thread starts"
+        );
+        lifecycle_readiness()
+    }
+
+    fn execute(&self, _request: ExecuteRequest<'_>) -> Result<ExecuteResult, SatelleError> {
+        Ok(ExecuteResult::new(TurnTransition::Completed, Vec::new()))
+    }
+
+    fn observe_stop(&self, _subject: AdapterSubject<'_>) -> Result<StopObservation, SatelleError> {
+        Ok(StopObservation::UpstreamInactiveConfirmed)
+    }
+
+    fn observe_recovery(
+        &self,
+        _subject: AdapterSubject<'_>,
+    ) -> Result<RecoveryObservation, SatelleError> {
+        Ok(RecoveryObservation::Completed)
+    }
+}
+
+#[derive(Clone, Default)]
+struct TestLatch {
+    state: Arc<(Mutex<bool>, Condvar)>,
+}
+
+impl TestLatch {
+    fn signal(&self) {
+        let (lock, changed) = &*self.state;
+        let mut state = lock.lock().expect("test latch lock");
+        *state = true;
+        changed.notify_all();
+    }
+
+    fn wait(&self) {
+        let (lock, changed) = &*self.state;
+        let state = lock.lock().expect("test latch lock");
+        drop(
+            changed
+                .wait_while(state, |state| !*state)
+                .expect("test latch wait"),
+        );
+    }
+
+    fn wait_for(&self, timeout: Duration) -> bool {
+        let (lock, changed) = &*self.state;
+        let state = lock.lock().expect("test latch lock");
+        let (state, _) = changed
+            .wait_timeout_while(state, timeout, |state| !*state)
+            .expect("test latch timed wait");
+        *state
+    }
+
+    fn reset(&self) {
+        let (lock, _) = &*self.state;
+        *lock.lock().expect("test latch lock") = false;
+    }
+}
+
+#[derive(Clone, Default)]
+struct InterruptLifecycleAdapter {
+    preflight_started: TestLatch,
+    preflight_release: TestLatch,
+    block_preflight: Arc<AtomicBool>,
+    execute_started: TestLatch,
+    execute_release: TestLatch,
+    execute_finished: TestLatch,
+    block_execute: Arc<AtomicBool>,
+    stop_calls: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl InterruptLifecycleAdapter {
+    fn block_preflight(&self) {
+        self.block_preflight.store(true, Ordering::Release);
+    }
+
+    fn block_execute(&self) {
+        self.block_execute.store(true, Ordering::Release);
+    }
+}
+
+impl ComputerUseAdapter for InterruptLifecycleAdapter {
+    fn preflight(
+        &self,
+        _host: &str,
+        _intent: &ProviderComputerUseIntent,
+    ) -> Result<AdapterReadiness, SatelleError> {
+        if self.block_preflight.swap(false, Ordering::AcqRel) {
+            self.preflight_started.signal();
+            self.preflight_release.wait();
+        }
+        lifecycle_readiness()
+    }
+
+    fn execute(&self, _request: ExecuteRequest<'_>) -> Result<ExecuteResult, SatelleError> {
+        if self.block_execute.load(Ordering::Acquire) {
+            self.execute_started.signal();
+            self.execute_release.wait();
+        }
+        self.execute_finished.signal();
+        Ok(ExecuteResult::new(TurnTransition::Completed, Vec::new()))
+    }
+
+    fn observe_stop(&self, _subject: AdapterSubject<'_>) -> Result<StopObservation, SatelleError> {
+        self.stop_calls.fetch_add(1, Ordering::SeqCst);
+        self.execute_release.signal();
+        Ok(StopObservation::CancellationConfirmed)
+    }
+
+    fn observe_recovery(
+        &self,
+        _subject: AdapterSubject<'_>,
+    ) -> Result<RecoveryObservation, SatelleError> {
+        Ok(RecoveryObservation::Unknown)
+    }
+}
+
+fn lifecycle_readiness() -> Result<AdapterReadiness, SatelleError> {
+    let desktop_binding = DesktopBindingRef::new("interrupt-test-desktop")
+        .map_err(|error| SatelleError::not_implemented(format!("test desktop binding: {error}")))?;
+    let execution_policy = ExecutionPolicy::new(
+        EffectiveModelRef::new("interrupt-test-model")
+            .map_err(|error| SatelleError::not_implemented(format!("test model: {error}")))?,
+        ProviderBindingRef::new("interrupt-test-provider")
+            .map_err(|error| SatelleError::not_implemented(format!("test provider: {error}")))?,
+        DesktopTarget::new(desktop_binding.clone()),
+        ApprovalPolicy::OnRequest,
+        SandboxPolicy::WorkspaceWrite,
+        TimeoutPolicy::bounded_seconds(120)
+            .map_err(|error| SatelleError::not_implemented(format!("test timeout: {error}")))?,
+        ExperimentalFeatureChoices::new(FeatureChoice::Enabled, FeatureChoice::Enabled),
+    );
+    let observed_at = time::OffsetDateTime::now_utc();
+    let evidence = ReadinessEvidence::new(
+        format!("interrupt-readiness-{}", SessionId::new()),
+        "interrupt-test-codex",
+        "interrupt-test-runtime",
+        Some("interrupt-test-plugin"),
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        observed_at,
+        observed_at + time::Duration::minutes(5),
+    )
+    .map_err(|error| SatelleError::not_implemented(format!("test evidence: {error}")))?;
+    let provider_evidence = ProviderSmokeEvidence::new(
+        format!("interrupt-provider-{}", SessionId::new()),
+        "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+        observed_at,
+        observed_at + time::Duration::hours(1),
+    )
+    .map_err(|error| SatelleError::not_implemented(format!("test provider evidence: {error}")))?;
+    AdapterReadiness::ready(
+        "interrupt-test",
+        "interrupt test readiness",
+        desktop_binding,
+        execution_policy,
+        evidence,
+        Some(provider_evidence),
+    )
+    .map_err(|error| SatelleError::not_implemented(format!("test readiness: {error}")))
 }
 
 fn ssh_setup_host(api_token: Option<ApiTokenSource>) -> SelectedHost {
@@ -702,7 +945,7 @@ fn local_turn_request_provider_intent_reaches_host_preflight() {
         true,
     );
 
-    let failure = match transport.run(&request, &mut |_| Ok(())) {
+    let failure = match transport.run(&request, false, &mut |_| Ok(())) {
         Err(failure) => failure,
         Ok(_) => panic!("provider preflight should reject the recording adapter"),
     };
@@ -717,6 +960,267 @@ fn local_turn_request_provider_intent_reaches_host_preflight() {
     assert_eq!(observed.provider().unwrap().as_str(), "provider-explicit");
     assert!(observed.experimental());
     assert!(observed.refresh());
+}
+
+#[test]
+fn process_interrupt_arm_returns_only_after_ctrl_c_listener_is_polled() {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("construct signal test runtime");
+    let interrupt = ProcessInterrupt::default();
+
+    runtime
+        .block_on(interrupt.arm())
+        .expect("arm process interrupt");
+
+    assert!(interrupt.inner.started.load(Ordering::Acquire));
+    assert!(
+        interrupt.inner.armed.load(Ordering::Acquire),
+        "arm must not return until the ctrl_c future has completed its first poll"
+    );
+}
+
+#[test]
+fn local_attached_arms_interrupt_before_starting_admission_thread() {
+    let state = TestStateDir::new().expect("temporary state directory");
+    let interrupt = ArmOrderInterrupt::default();
+    let service = HostService::with_adapter_for_tests_at(
+        state.path(),
+        ArmCheckingAdapter {
+            armed: Arc::clone(&interrupt.armed),
+        },
+    )
+    .expect("construct arm-order Host");
+    let transport = LocalTransport::new(LOCAL_DEMO_HOST.to_string(), service);
+
+    transport
+        .attached_with_interrupt(
+            None,
+            TurnIntent::new(
+                "prove interrupt arming order",
+                satelle_core::session::TurnExecutionMode::Standard,
+            )
+            .expect("construct arm-order intent"),
+            false,
+            &interrupt,
+        )
+        .expect("attached operation must complete after the arm-order assertion");
+}
+
+#[test]
+fn injected_interrupt_before_local_run_admission_cancels_without_creating_a_turn() {
+    let state = TestStateDir::new().expect("temporary state directory");
+    let adapter = InterruptLifecycleAdapter::default();
+    adapter.block_preflight();
+    let service = HostService::with_adapter_for_tests_at(state.path(), adapter.clone())
+        .expect("construct interrupt lifecycle Host");
+    let transport = LocalTransport::new(LOCAL_DEMO_HOST.to_string(), service.clone());
+    let interrupt = TestInterrupt::default();
+    let command_interrupt = interrupt.clone();
+    let command = thread::spawn(move || {
+        transport.attached_with_interrupt(
+            None,
+            TurnIntent::new(
+                "cancel before local run admission",
+                satelle_core::session::TurnExecutionMode::Standard,
+            )
+            .expect("construct run intent"),
+            false,
+            &command_interrupt,
+        )
+    });
+    assert!(
+        adapter.preflight_started.wait_for(Duration::from_secs(2)),
+        "preflight must be active before interruption"
+    );
+
+    interrupt.signal();
+    adapter.preflight_release.signal();
+    let failure = match command.join().expect("command thread must not panic") {
+        Err(failure) => failure,
+        Ok(_) => panic!("pre-admission interruption must fail the attached command"),
+    };
+    assert_eq!(failure.phase(), TurnAdmissionPhase::NotAdmitted);
+    assert_eq!(failure.error().code, ErrorCode::Interrupted);
+    assert_eq!(failure.error().exit_code(), 130);
+    assert_eq!(
+        service
+            .daemon_runtime_status()
+            .expect("read Host status")
+            .session_count(),
+        0
+    );
+    assert_eq!(adapter.stop_calls.load(Ordering::SeqCst), 0);
+}
+
+#[test]
+fn local_interrupt_wait_failure_reconciles_the_spawned_operation() {
+    let state = TestStateDir::new().expect("temporary state directory");
+    let adapter = InterruptLifecycleAdapter::default();
+    adapter.block_preflight();
+    let service = HostService::with_adapter_for_tests_at(state.path(), adapter.clone())
+        .expect("construct interrupt lifecycle Host");
+    let transport = LocalTransport::new(LOCAL_DEMO_HOST.to_string(), service.clone());
+    let interrupt = FailingWaitInterrupt {
+        operation_started: adapter.preflight_started.clone(),
+    };
+    let (result_sender, result_receiver) = mpsc::sync_channel(1);
+    let command = thread::spawn(move || {
+        let result = transport.attached_with_interrupt(
+            None,
+            TurnIntent::new(
+                "reconcile failed local interrupt listener",
+                satelle_core::session::TurnExecutionMode::Standard,
+            )
+            .expect("construct run intent"),
+            false,
+            &interrupt,
+        );
+        result_sender
+            .send(result)
+            .expect("test result receiver remains connected");
+    });
+    assert!(
+        adapter.preflight_started.wait_for(Duration::from_secs(2)),
+        "preflight must be active before the listener fails"
+    );
+    if let Ok(result) = result_receiver.recv_timeout(Duration::from_millis(100)) {
+        adapter.preflight_release.signal();
+        let _ = command.join();
+        panic!("listener failure returned before reconciling the operation: {result:?}");
+    }
+
+    adapter.preflight_release.signal();
+    let failure = result_receiver
+        .recv_timeout(Duration::from_secs(2))
+        .expect("operation must reconcile after preflight exits")
+        .expect_err("listener failure must fail the attached command");
+    command.join().expect("command thread must not panic");
+
+    assert_eq!(failure.phase(), TurnAdmissionPhase::NotAdmitted);
+    assert_eq!(failure.error().code, ErrorCode::HostUnreachable);
+    assert_eq!(
+        service
+            .daemon_runtime_status()
+            .expect("read Host status")
+            .session_count(),
+        0,
+        "failed interrupt observation must not leave a local Session running"
+    );
+}
+
+#[test]
+fn local_interruption_preserves_admission_unknown_phase() {
+    let failure = local_interrupted_admission_failure(TurnAdmissionFailure::admission_unknown(
+        SatelleError::host_unreachable("local"),
+    ));
+
+    assert_eq!(failure.phase(), TurnAdmissionPhase::AdmissionUnknown);
+    assert_eq!(failure.error().code, ErrorCode::Interrupted);
+    assert!(failure.durable_handles().is_none());
+}
+
+#[test]
+fn injected_interrupt_after_local_run_admission_confirms_stop_before_exit_130() {
+    let state = TestStateDir::new().expect("temporary state directory");
+    let adapter = InterruptLifecycleAdapter::default();
+    adapter.block_execute();
+    let service = HostService::with_adapter_for_tests_at(state.path(), adapter.clone())
+        .expect("construct interrupt lifecycle Host");
+    let transport = LocalTransport::new(LOCAL_DEMO_HOST.to_string(), service.clone());
+    let interrupt = TestInterrupt::default();
+    let command_interrupt = interrupt.clone();
+    let command = thread::spawn(move || {
+        transport.attached_with_interrupt(
+            None,
+            TurnIntent::new(
+                "interrupt admitted local run",
+                satelle_core::session::TurnExecutionMode::Standard,
+            )
+            .expect("construct run intent"),
+            false,
+            &command_interrupt,
+        )
+    });
+    assert!(
+        adapter.execute_started.wait_for(Duration::from_secs(2)),
+        "execution must start after durable admission"
+    );
+
+    interrupt.signal();
+    let failure = match command.join().expect("command thread must not panic") {
+        Err(failure) => failure,
+        Ok(_) => panic!("post-admission interruption must fail with exit 130"),
+    };
+    assert_eq!(failure.phase(), TurnAdmissionPhase::Admitted);
+    assert_eq!(failure.error().code, ErrorCode::Interrupted);
+    assert_eq!(failure.error().exit_code(), 130);
+    assert_eq!(adapter.stop_calls.load(Ordering::SeqCst), 1);
+    let (session_id, _) = failure
+        .durable_handles()
+        .expect("admitted interruption retains durable handles");
+    let status = service
+        .session_status(session_id)
+        .expect("stopped Session remains readable");
+    assert_eq!(status.activity(), &SessionActivity::Idle);
+    assert!(
+        status
+            .turns()
+            .last()
+            .expect("interrupted run has its Turn")
+            .state()
+            .is_terminal()
+    );
+}
+
+#[test]
+fn local_transport_rejects_detach_on_interrupt_before_admission() {
+    let state = TestStateDir::new().expect("temporary state directory");
+    let adapter = InterruptLifecycleAdapter::default();
+    let service = HostService::with_adapter_for_tests_at(state.path(), adapter.clone())
+        .expect("construct interrupt lifecycle Host");
+    let seed = service
+        .run(
+            LOCAL_DEMO_HOST,
+            &TurnIntent::new(
+                "seed local steer interruption",
+                satelle_core::session::TurnExecutionMode::Standard,
+            )
+            .expect("construct seed intent"),
+        )
+        .expect("seed Session")
+        .session;
+    let turn_count = seed.turns().len();
+
+    let transport = LocalTransport::new(LOCAL_DEMO_HOST.to_string(), service.clone());
+    let interrupt = TestInterrupt::default();
+    let failure = transport
+        .attached_with_interrupt(
+            Some(seed.session_id().clone()),
+            TurnIntent::new(
+                "reject local detach-on-interrupt",
+                satelle_core::session::TurnExecutionMode::Standard,
+            )
+            .expect("construct steer intent"),
+            true,
+            &interrupt,
+        )
+        .expect_err("local transport cannot durably detach in-process work");
+    assert_eq!(failure.phase(), TurnAdmissionPhase::NotAdmitted);
+    assert_eq!(failure.error().code, ErrorCode::InvalidUsage);
+    assert_eq!(failure.error().exit_code(), 64);
+    assert!(failure.durable_handles().is_none());
+    assert_eq!(adapter.stop_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        service
+            .session_status(seed.session_id())
+            .expect("seed Session remains readable")
+            .turns()
+            .len(),
+        turn_count,
+        "local rejection must happen before Turn admission"
+    );
 }
 
 #[path = "transport-reconnect-tests.rs"]
@@ -774,6 +1278,17 @@ impl DirectFixture {
         let state = TestStateDir::new().expect("temporary state directory");
         let service = HostService::local_demo_for_tests_at(state.path())
             .expect("construct deterministic Host service");
+        Self::bind(state, service)
+    }
+
+    fn start_with_adapter(adapter: impl ComputerUseAdapter) -> Self {
+        let state = TestStateDir::new().expect("temporary state directory");
+        let service = HostService::with_adapter_for_tests_at(state.path(), adapter)
+            .expect("construct adapter-backed Host service");
+        Self::bind(state, service)
+    }
+
+    fn bind(state: TestStateDir, service: HostService) -> Self {
         let initialized = service.initialize_daemon().expect("initialize Host state");
         let host_identity = initialized.host_identity().to_string();
         let (http_token, event_token) =
@@ -836,6 +1351,176 @@ impl Drop for DirectFixture {
     }
 }
 
+fn install_silent_event_peer(
+    fixture: &mut DirectFixture,
+    interrupt: TestInterrupt,
+) -> (TestLatch, thread::JoinHandle<()>) {
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("bind silent event listener");
+    let address = listener.local_addr().expect("read silent event address");
+    let release = TestLatch::default();
+    let peer_release = release.clone();
+    let peer = thread::spawn(move || {
+        let (_socket, _) = listener.accept().expect("accept event connection");
+        interrupt.signal();
+        peer_release.wait();
+    });
+    let token = ApiBearerToken::generate().expect("generate silent event token");
+    fixture
+        .transport
+        .as_mut()
+        .expect("fixture transport is present")
+        .event_client = DaemonEventClient::loopback(address, token, &fixture.host_identity)
+        .expect("construct silent event client");
+    (release, peer)
+}
+
+fn install_ambiguous_admission_peer(
+    fixture: &mut DirectFixture,
+    interrupt: TestInterrupt,
+) -> thread::JoinHandle<()> {
+    let listener =
+        TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("bind ambiguous admission listener");
+    let address = listener
+        .local_addr()
+        .expect("read ambiguous admission address");
+    let peer = thread::spawn(move || {
+        let (admission, _) = listener.accept().expect("accept admission request");
+        interrupt.signal();
+        let (cancellation, _) = listener.accept().expect("accept cancellation request");
+        drop(cancellation);
+        drop(admission);
+    });
+    let token = ApiBearerToken::generate().expect("generate ambiguous admission token");
+    let client = DaemonClient::loopback(address, token, &fixture.host_identity)
+        .expect("construct ambiguous admission client");
+    fixture
+        .transport
+        .as_mut()
+        .expect("fixture transport is present")
+        .client = Arc::new(client);
+    peer
+}
+
+fn install_replay_admitted_status_failure_peer(
+    fixture: &mut DirectFixture,
+    interrupt: TestInterrupt,
+    admission_path: String,
+    session_id: satelle_core::SessionId,
+    turn_id: satelle_core::TurnId,
+) -> thread::JoinHandle<()> {
+    fn read_headers(stream: &mut std::net::TcpStream) -> String {
+        stream
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .expect("bound synthetic HTTP request read");
+        let mut request = Vec::new();
+        while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+            let mut chunk = [0_u8; 1024];
+            let count = stream
+                .read(&mut chunk)
+                .expect("read synthetic HTTP request");
+            assert_ne!(count, 0, "request closed before headers completed");
+            request.extend_from_slice(&chunk[..count]);
+        }
+        String::from_utf8(request).expect("synthetic request headers are UTF-8")
+    }
+
+    fn request_id(headers: &str) -> &str {
+        headers
+            .lines()
+            .find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                name.eq_ignore_ascii_case("satelle-request-id")
+                    .then_some(value.trim())
+            })
+            .expect("request carries a request ID")
+    }
+
+    let listener =
+        TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("bind replay-admitted HTTP peer");
+    let address = listener
+        .local_addr()
+        .expect("read replay-admitted HTTP address");
+    let host_identity = fixture.host_identity.clone();
+    let expected_stop_path = format!("/v1/sessions/{session_id}/stop");
+    let expected_status_path = format!("/v1/sessions/{session_id}");
+    let expected_turn_header = format!("satelle-expected-turn-id: {turn_id}");
+    let peer = thread::spawn(move || {
+        let (mut admission, _) = listener.accept().expect("accept admission request");
+        let admission_headers = read_headers(&mut admission);
+        assert!(
+            admission_headers.starts_with(&format!("POST {admission_path} HTTP/1.1")),
+            "unexpected admission request: {admission_headers}"
+        );
+        interrupt.signal();
+
+        let (mut cancellation, _) = listener.accept().expect("accept cancellation request");
+        let cancellation_headers = read_headers(&mut cancellation);
+        assert!(
+            cancellation_headers.starts_with(&format!("POST {admission_path} HTTP/1.1")),
+            "unexpected cancellation request: {cancellation_headers}"
+        );
+        assert!(
+            cancellation_headers
+                .to_ascii_lowercase()
+                .contains("satelle-admission-action: cancel")
+        );
+        let cancellation_request_id = request_id(&cancellation_headers);
+        let body = serde_json::json!({
+            "schema_version": "satelle.admission.cancel.v1",
+            "request_id": cancellation_request_id,
+            "host_identity": host_identity,
+            "outcome": "admitted",
+            "session_id": session_id,
+            "turn_id": turn_id,
+        })
+        .to_string();
+        write!(
+            cancellation,
+            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nsatelle-request-id: {}\r\nsatelle-host-identity: {}\r\nconnection: close\r\n\r\n{}",
+            body.len(),
+            cancellation_request_id,
+            host_identity,
+            body,
+        )
+        .expect("write replay-admitted cancellation response");
+        drop(cancellation);
+
+        let (mut stop, _) = listener
+            .accept()
+            .expect("accept expected-Turn stop request");
+        let stop_headers = read_headers(&mut stop);
+        assert!(
+            stop_headers.starts_with(&format!("POST {expected_stop_path} HTTP/1.1")),
+            "stop must precede status read: {stop_headers}"
+        );
+        assert!(
+            stop_headers
+                .to_ascii_lowercase()
+                .contains(&expected_turn_header),
+            "stop must target the exact replayed Turn: {stop_headers}"
+        );
+        drop(stop);
+
+        let (mut status, _) = listener.accept().expect("accept status request after stop");
+        let status_headers = read_headers(&mut status);
+        assert!(
+            status_headers.starts_with(&format!("GET {expected_status_path} HTTP/1.1")),
+            "status read must follow the stop attempt: {status_headers}"
+        );
+        drop(status);
+        drop(admission);
+    });
+    let token = ApiBearerToken::generate().expect("generate replay-admitted token");
+    let client = DaemonClient::loopback(address, token, &fixture.host_identity)
+        .expect("construct replay-admitted HTTP client");
+    fixture
+        .transport
+        .as_mut()
+        .expect("fixture transport is present")
+        .client = Arc::new(client);
+    peer
+}
+
 #[test]
 fn attached_run_reports_direct_daemon_unreachable_after_wss_subscription_succeeds() {
     let mut fixture = DirectFixture::start();
@@ -866,11 +1551,11 @@ fn attached_run_reports_direct_daemon_unreachable_after_wss_subscription_succeed
         .expect("fixture transport is present")
         .client = Arc::new(disconnected_client);
 
-    let failure = match fixture
-        .transport()
-        .run(&TurnRequest::new("must not be admitted"), &mut |_| {
-            panic!("an unadmitted run must not emit events")
-        }) {
+    let failure = match fixture.transport().run(
+        &TurnRequest::new("must not be admitted"),
+        false,
+        &mut |_| panic!("an unadmitted run must not emit events"),
+    ) {
         Ok(_) => panic!("the disconnected HTTP client must fail run admission"),
         Err(failure) => failure,
     };
@@ -879,6 +1564,375 @@ fn attached_run_reports_direct_daemon_unreachable_after_wss_subscription_succeed
     assert_eq!(failure.error().code, ErrorCode::DirectDaemonUnreachable);
     assert!(failure.durable_handles().is_none());
     drop(subscribed_stream);
+}
+
+#[test]
+fn direct_attached_arms_interrupt_before_event_connection() {
+    let mut fixture = DirectFixture::start();
+    let interrupt = ArmOrderInterrupt::default();
+    let listener =
+        TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("bind arm-order event listener");
+    let address = listener.local_addr().expect("read arm-order event address");
+    let armed = Arc::clone(&interrupt.armed);
+    let peer = thread::spawn(move || {
+        let (socket, _) = listener.accept().expect("accept event connection");
+        assert!(
+            armed.load(Ordering::Acquire),
+            "interrupt arming must complete before direct event connection"
+        );
+        drop(socket);
+    });
+    let token = ApiBearerToken::generate().expect("generate arm-order event token");
+    fixture
+        .transport
+        .as_mut()
+        .expect("fixture transport is present")
+        .event_client = DaemonEventClient::loopback(address, token, &fixture.host_identity)
+        .expect("construct arm-order event client");
+
+    let failure = match fixture.transport().event_runtime.block_on(
+        fixture.transport().run_attached_with_interrupt(
+            &TurnRequest::new("prove direct interrupt arm order"),
+            false,
+            &mut |_| Ok(()),
+            &interrupt,
+        ),
+    ) {
+        Ok(_) => panic!("the synthetic event peer must close after checking arm order"),
+        Err(failure) => failure,
+    };
+    assert_eq!(failure.phase(), TurnAdmissionPhase::NotAdmitted);
+    peer.join().expect("arm-order event peer must not panic");
+}
+
+#[test]
+fn interrupt_during_direct_run_event_connection_is_terminal_before_admission() {
+    let mut fixture = DirectFixture::start();
+    let interrupt = TestInterrupt::default();
+    let (release, peer) = install_silent_event_peer(&mut fixture, interrupt.clone());
+
+    let failure = match fixture.transport().event_runtime.block_on(
+        fixture.transport().run_attached_with_interrupt(
+            &TurnRequest::new("interrupt blocked event connection"),
+            false,
+            &mut |_| Ok(()),
+            &interrupt,
+        ),
+    ) {
+        Err(failure) => failure,
+        Ok(_) => panic!("connection-boundary interruption must terminate the command"),
+    };
+    release.signal();
+    peer.join().expect("silent event peer must not panic");
+
+    assert_eq!(failure.phase(), TurnAdmissionPhase::NotAdmitted);
+    assert_eq!(failure.error().code, ErrorCode::Interrupted);
+    assert_eq!(failure.error().exit_code(), 130);
+    assert!(failure.durable_handles().is_none());
+    assert_eq!(
+        fixture
+            .service
+            .daemon_runtime_status()
+            .expect("read runtime status")
+            .session_count(),
+        0
+    );
+}
+
+#[test]
+fn interrupt_during_direct_steer_event_connection_is_terminal_before_admission() {
+    let mut fixture = DirectFixture::start();
+    let seed = fixture
+        .transport()
+        .run_detached(&TurnRequest::new("seed blocked steer connection"))
+        .expect("seed Session");
+    let interrupt = TestInterrupt::default();
+    let (release, peer) = install_silent_event_peer(&mut fixture, interrupt.clone());
+
+    let failure = match fixture.transport().event_runtime.block_on(
+        fixture.transport().steer_attached_with_interrupt(
+            seed.session_id(),
+            &TurnRequest::new("interrupt blocked steer connection"),
+            false,
+            &mut |_| Ok(()),
+            &interrupt,
+        ),
+    ) {
+        Err(failure) => failure,
+        Ok(_) => panic!("steer connection-boundary interruption must terminate the command"),
+    };
+    release.signal();
+    peer.join().expect("silent event peer must not panic");
+
+    assert_eq!(failure.phase(), TurnAdmissionPhase::NotAdmitted);
+    assert_eq!(failure.error().code, ErrorCode::Interrupted);
+    assert_eq!(failure.error().exit_code(), 130);
+    assert!(failure.durable_handles().is_none());
+    assert_eq!(
+        fixture
+            .service
+            .session_status(seed.session_id())
+            .expect("seed Session remains readable")
+            .turns()
+            .len(),
+        1
+    );
+}
+
+#[test]
+fn direct_run_preserves_unknown_phase_when_admission_and_cancellation_disconnect() {
+    let mut fixture = DirectFixture::start();
+    let interrupt = TestInterrupt::default();
+    let peer = install_ambiguous_admission_peer(&mut fixture, interrupt.clone());
+
+    let failure = match fixture.transport().event_runtime.block_on(
+        fixture.transport().run_attached_with_interrupt(
+            &TurnRequest::new("ambiguous direct run interruption"),
+            false,
+            &mut |_| Ok(()),
+            &interrupt,
+        ),
+    ) {
+        Err(failure) => failure,
+        Ok(_) => panic!("disconnected admission and cancellation must remain ambiguous"),
+    };
+    peer.join()
+        .expect("ambiguous admission peer must not panic");
+
+    assert_eq!(failure.phase(), TurnAdmissionPhase::AdmissionUnknown);
+    assert_eq!(failure.error().code, ErrorCode::Interrupted);
+    assert!(failure.durable_handles().is_none());
+}
+
+#[test]
+fn direct_steer_preserves_unknown_phase_when_admission_and_cancellation_disconnect() {
+    let mut fixture = DirectFixture::start();
+    let seed = fixture
+        .transport()
+        .run_detached(&TurnRequest::new("seed ambiguous direct steer"))
+        .expect("seed Session");
+    let interrupt = TestInterrupt::default();
+    let peer = install_ambiguous_admission_peer(&mut fixture, interrupt.clone());
+
+    let failure = match fixture.transport().event_runtime.block_on(
+        fixture.transport().steer_attached_with_interrupt(
+            seed.session_id(),
+            &TurnRequest::new("ambiguous direct steer interruption"),
+            false,
+            &mut |_| Ok(()),
+            &interrupt,
+        ),
+    ) {
+        Err(failure) => failure,
+        Ok(_) => panic!("disconnected steer admission and cancellation must remain ambiguous"),
+    };
+    peer.join()
+        .expect("ambiguous admission peer must not panic");
+
+    assert_eq!(failure.phase(), TurnAdmissionPhase::AdmissionUnknown);
+    assert_eq!(failure.error().code, ErrorCode::Interrupted);
+    assert!(failure.durable_handles().is_none());
+}
+
+#[test]
+fn replay_admitted_run_stops_exact_turn_before_failed_status_read() {
+    let mut fixture = DirectFixture::start();
+    let interrupt = TestInterrupt::default();
+    let session_id = satelle_core::SessionId::new();
+    let turn_id = satelle_core::TurnId::new();
+    let peer = install_replay_admitted_status_failure_peer(
+        &mut fixture,
+        interrupt.clone(),
+        "/v1/sessions".to_string(),
+        session_id.clone(),
+        turn_id,
+    );
+
+    let failure = match fixture.transport().event_runtime.block_on(
+        fixture.transport().run_attached_with_interrupt(
+            &TurnRequest::new("replay admitted run with failed status"),
+            false,
+            &mut |_| Ok(()),
+            &interrupt,
+        ),
+    ) {
+        Err(failure) => failure,
+        Ok(_) => panic!("lost admission response must remain interrupted"),
+    };
+    peer.join()
+        .expect("replay-admitted run peer must not panic");
+
+    assert_eq!(failure.phase(), TurnAdmissionPhase::AdmissionUnknown);
+    assert_eq!(failure.error().code, ErrorCode::Interrupted);
+    assert_eq!(failure.error().details["session_id"], session_id.as_str());
+    assert!(
+        failure
+            .error()
+            .recovery_command
+            .as_deref()
+            .is_some_and(|command| command.contains(&format!("status {session_id}"))),
+        "failed status read must preserve Session-scoped recovery guidance"
+    );
+}
+
+#[test]
+fn replay_admitted_steer_stops_exact_turn_before_failed_status_read() {
+    let mut fixture = DirectFixture::start();
+    let seed = fixture
+        .transport()
+        .run_detached(&TurnRequest::new("seed replay-admitted steer"))
+        .expect("seed Session");
+    let interrupt = TestInterrupt::default();
+    let session_id = seed.session_id().clone();
+    let turn_id = satelle_core::TurnId::new();
+    let peer = install_replay_admitted_status_failure_peer(
+        &mut fixture,
+        interrupt.clone(),
+        format!("/v1/sessions/{session_id}/turns"),
+        session_id.clone(),
+        turn_id,
+    );
+
+    let failure = match fixture.transport().event_runtime.block_on(
+        fixture.transport().steer_attached_with_interrupt(
+            &session_id,
+            &TurnRequest::new("replay admitted steer with failed status"),
+            false,
+            &mut |_| Ok(()),
+            &interrupt,
+        ),
+    ) {
+        Err(failure) => failure,
+        Ok(_) => panic!("lost steer admission response must remain interrupted"),
+    };
+    peer.join()
+        .expect("replay-admitted steer peer must not panic");
+
+    assert_eq!(failure.phase(), TurnAdmissionPhase::AdmissionUnknown);
+    assert_eq!(failure.error().code, ErrorCode::Interrupted);
+    assert_eq!(failure.error().details["session_id"], session_id.as_str());
+    assert!(
+        failure
+            .error()
+            .recovery_command
+            .as_deref()
+            .is_some_and(|command| command.contains(&format!("status {session_id}"))),
+        "failed status read must preserve Session-scoped recovery guidance"
+    );
+}
+
+#[test]
+fn injected_interrupt_after_direct_run_admission_confirms_stop_before_exit_130() {
+    let adapter = InterruptLifecycleAdapter::default();
+    adapter.block_execute();
+    let fixture = DirectFixture::start_with_adapter(adapter.clone());
+    let interrupt = TestInterrupt::default();
+    let coordinator_interrupt = interrupt.clone();
+    let coordinator_adapter = adapter.clone();
+    let coordinator = thread::spawn(move || {
+        assert!(
+            coordinator_adapter
+                .execute_started
+                .wait_for(Duration::from_secs(2)),
+            "direct run must be durably admitted before interruption"
+        );
+        coordinator_interrupt.signal();
+    });
+
+    let failure = match fixture.transport().event_runtime.block_on(
+        fixture.transport().run_attached_with_interrupt(
+            &TurnRequest::new("interrupt admitted direct run"),
+            false,
+            &mut |_| Ok(()),
+            &interrupt,
+        ),
+    ) {
+        Err(failure) => failure,
+        Ok(_) => panic!("post-admission interruption must preserve exit 130"),
+    };
+    coordinator
+        .join()
+        .expect("coordinator thread must not panic");
+    assert_eq!(failure.phase(), TurnAdmissionPhase::Admitted);
+    assert_eq!(failure.error().code, ErrorCode::Interrupted);
+    assert_eq!(failure.error().exit_code(), 130);
+    assert_eq!(adapter.stop_calls.load(Ordering::SeqCst), 1);
+    let (session_id, _) = failure
+        .durable_handles()
+        .expect("direct interruption retains durable handles");
+    assert_eq!(
+        fixture
+            .service
+            .session_status(session_id)
+            .expect("stopped direct Session remains readable")
+            .activity(),
+        &SessionActivity::Idle
+    );
+}
+
+#[test]
+fn injected_interrupt_after_direct_steer_admission_detaches_without_stop() {
+    let adapter = InterruptLifecycleAdapter::default();
+    let fixture = DirectFixture::start_with_adapter(adapter.clone());
+    let seed = fixture
+        .transport()
+        .run_detached(&TurnRequest::new("seed direct steer interruption"))
+        .expect("seed Session");
+    assert!(
+        adapter.execute_finished.wait_for(Duration::from_secs(2)),
+        "seed direct Turn must finish before steer"
+    );
+    adapter.execute_finished.reset();
+    adapter.block_execute();
+    let interrupt = TestInterrupt::default();
+    let coordinator_interrupt = interrupt.clone();
+    let coordinator_adapter = adapter.clone();
+    let coordinator = thread::spawn(move || {
+        assert!(
+            coordinator_adapter
+                .execute_started
+                .wait_for(Duration::from_secs(2)),
+            "direct steer must be durably admitted before interruption"
+        );
+        coordinator_interrupt.signal();
+    });
+
+    let failure = match fixture.transport().event_runtime.block_on(
+        fixture.transport().steer_attached_with_interrupt(
+            seed.session_id(),
+            &TurnRequest::new("detach admitted direct steer"),
+            true,
+            &mut |_| Ok(()),
+            &interrupt,
+        ),
+    ) {
+        Err(failure) => failure,
+        Ok(_) => panic!("detach-on-interrupt must preserve exit 130"),
+    };
+    coordinator
+        .join()
+        .expect("coordinator thread must not panic");
+    assert_eq!(failure.phase(), TurnAdmissionPhase::Admitted);
+    assert_eq!(failure.error().code, ErrorCode::Interrupted);
+    assert_eq!(failure.error().exit_code(), 130);
+    assert_eq!(adapter.stop_calls.load(Ordering::SeqCst), 0);
+    let (session_id, _) = failure
+        .durable_handles()
+        .expect("detached direct interruption retains durable handles");
+    assert_ne!(
+        fixture
+            .service
+            .session_status(session_id)
+            .expect("detached direct Session remains readable")
+            .activity(),
+        &SessionActivity::Idle
+    );
+
+    adapter.execute_release.signal();
+    assert!(
+        adapter.execute_finished.wait_for(Duration::from_secs(2)),
+        "detached direct worker must finish after explicit test release"
+    );
 }
 
 #[test]
@@ -1121,7 +2175,7 @@ fn direct_attached_run_and_steer_follow_committed_host_events() {
     let mut run_events = Vec::new();
     let run_outcome = fixture
         .transport()
-        .run(&TurnRequest::new("first turn"), &mut |event| {
+        .run(&TurnRequest::new("first turn"), false, &mut |event| {
             run_events.push(event);
             Ok(())
         })
@@ -1201,6 +2255,7 @@ fn direct_attached_run_and_steer_follow_committed_host_events() {
         .steer(
             run.session_id(),
             &TurnRequest::new("follow-up turn"),
+            false,
             &mut |event| {
                 steer_events.push(event);
                 Ok(())
@@ -1439,4 +2494,93 @@ fn admission_failures_preserve_definitive_and_ambiguous_phases() {
     );
     assert_eq!(api_failure.phase(), TurnAdmissionPhase::AdmissionUnknown);
     assert!(api_failure.durable_handles().is_none());
+}
+
+#[test]
+fn stop_not_confirmed_api_details_are_validated_and_preserved() {
+    let session_id = SessionId::new();
+    let turn_id = TurnId::new();
+    let details = serde_json::json!({
+        "session_id": session_id,
+        "turn_id": turn_id,
+        "ownership": "recovery_pending",
+        "state_changed": true,
+        "session_state_revision": 3,
+        "turn_state_revision": 2,
+        "retryable": true
+    });
+    let api_error = |details: serde_json::Value| {
+        serde_json::from_value::<satelle_transport::ApiError>(serde_json::json!({
+            "schema_version": "satelle.error.v1",
+            "request_id": satelle_transport::RequestId::new().to_string(),
+            "host_identity": "host-direct-test",
+            "code": "stop-not-confirmed",
+            "category": "conflict",
+            "retryable": true,
+            "message": "stop was not confirmed",
+            "details": details,
+            "docs_url": null,
+            "suggested_commands": []
+        }))
+        .expect("deserialize stop-not-confirmed API error")
+    };
+
+    let mapped = map_api_error("direct-test", &api_error(details.clone()));
+    assert_eq!(mapped.code, ErrorCode::StopNotConfirmed);
+    assert_eq!(mapped.details["ownership"], "recovery_pending");
+    assert_eq!(mapped.details["turn_id"], turn_id.as_str());
+    assert_eq!(mapped.details["session_state_revision"], 3);
+    assert_eq!(mapped.details["turn_state_revision"], 2);
+
+    let mut malformed = Vec::new();
+    let mut missing_revision = details.clone();
+    missing_revision
+        .as_object_mut()
+        .expect("details object")
+        .remove("turn_state_revision");
+    malformed.push(missing_revision);
+    let mut zero_revision = details.clone();
+    zero_revision["session_state_revision"] = serde_json::json!(0);
+    malformed.push(zero_revision);
+    let mut bad_owner = details.clone();
+    bad_owner["ownership"] = serde_json::json!("unknown");
+    malformed.push(bad_owner);
+    let mut extra = details;
+    extra["private"] = serde_json::json!("must-not-cross");
+    malformed.push(extra);
+
+    for invalid in malformed {
+        let mapped = map_api_error("direct-test", &api_error(invalid));
+        assert_eq!(mapped.code, ErrorCode::RemoteExecution);
+        assert_eq!(
+            mapped.details.get("remote_code"),
+            Some(&serde_json::json!("invalid-daemon-response"))
+        );
+    }
+}
+
+#[test]
+fn failed_local_status_preserves_interrupt_exit_and_session_recovery_command() {
+    let session_id = SessionId::new();
+    let interrupted = unconfirmed_interrupt_error(
+        "local-demo",
+        &session_id,
+        SatelleError::host_unreachable("local-demo"),
+    );
+    let error = interrupted_status_error(
+        "local-demo",
+        &session_id,
+        interrupted,
+        SatelleError::host_unreachable("local-demo"),
+    );
+
+    assert_eq!(error.code, ErrorCode::Interrupted);
+    assert_eq!(error.exit_code(), 130);
+    assert!(error.message.contains(session_id.as_str()));
+    assert_eq!(
+        error.recovery_command.as_deref(),
+        Some(format!("satelle status {session_id} --host local-demo").as_str())
+    );
+    assert_eq!(error.details["session_id"], session_id.as_str());
+    assert_eq!(error.details["status_error_code"], "host-unreachable");
 }

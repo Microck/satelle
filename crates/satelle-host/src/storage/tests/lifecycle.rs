@@ -206,6 +206,7 @@ fn upstream_reference_observation_is_lifecycle_neutral_idempotent_and_conflict_s
 
     let thread_ref = ObservedUpstreamRef::thread("thread-private-1").unwrap();
     let turn_ref = ObservedUpstreamRef::turn("turn-private-1").unwrap();
+    let goal_ref = ObservedUpstreamRef::goal("goal-private-1").unwrap();
     storage
         .record_upstream_ref(admitted.id(), &turn_id(TURN_1), &thread_ref)
         .expect("persist the first observed thread reference");
@@ -213,11 +214,17 @@ fn upstream_reference_observation_is_lifecycle_neutral_idempotent_and_conflict_s
         .record_upstream_ref(admitted.id(), &turn_id(TURN_1), &turn_ref)
         .expect("persist the first observed Turn reference");
     storage
+        .record_upstream_ref(admitted.id(), &turn_id(TURN_1), &goal_ref)
+        .expect("persist the first observed Goal reference");
+    storage
         .record_upstream_ref(admitted.id(), &turn_id(TURN_1), &thread_ref)
         .expect("recording the same thread reference must be idempotent");
     storage
         .record_upstream_ref(admitted.id(), &turn_id(TURN_1), &turn_ref)
         .expect("recording the same Turn reference must be idempotent");
+    storage
+        .record_upstream_ref(admitted.id(), &turn_id(TURN_1), &goal_ref)
+        .expect("recording the same Goal reference must be idempotent");
 
     let conflicting_thread = storage
         .record_upstream_ref(
@@ -243,6 +250,18 @@ fn upstream_reference_observation_is_lifecycle_neutral_idempotent_and_conflict_s
         conflicting_turn.kind()
     );
 
+    let conflicting_goal = storage
+        .record_upstream_ref(
+            admitted.id(),
+            &turn_id(TURN_1),
+            &ObservedUpstreamRef::goal("goal-private-conflict").unwrap(),
+        )
+        .expect_err("a different Goal reference must fail closed");
+    assert_eq!(
+        StorageErrorKind::PrivateReferenceConflict,
+        conflicting_goal.kind()
+    );
+
     let restored = storage
         .load_session(admitted.id())
         .expect("load Session after reference observation")
@@ -260,8 +279,10 @@ fn upstream_reference_observation_is_lifecycle_neutral_idempotent_and_conflict_s
         .expect("reload the final reference-bearing subject");
     let expected_thread_ref = PrivateUpstreamRef::new("thread-private-1").unwrap();
     let expected_turn_ref = PrivateUpstreamRef::new("turn-private-1").unwrap();
+    let expected_goal_ref = PrivateUpstreamRef::new("goal-private-1").unwrap();
     assert_eq!(Some(&expected_thread_ref), refs.upstream_thread_ref());
     assert_eq!(Some(&expected_turn_ref), refs.upstream_turn_ref());
+    assert_eq!(Some(&expected_goal_ref), refs.upstream_goal_ref());
     assert!(matches!(
         storage
             .begin_session(&session, &context)
@@ -366,6 +387,13 @@ fn upstream_references_cannot_alias_distinct_sessions_or_turns() {
         "turn-private-shared",
     );
     storage
+        .record_upstream_ref(
+            first.id(),
+            &turn_id(TURN_1),
+            &ObservedUpstreamRef::goal("goal-private-shared").unwrap(),
+        )
+        .expect("record first Session Goal reference");
+    storage
         .commit_lifecycle(
             first.id(),
             &turn_id(TURN_1),
@@ -412,11 +440,24 @@ fn upstream_references_cannot_alias_distinct_sessions_or_turns() {
         turn_error.kind()
     );
 
+    let goal_error = storage
+        .record_upstream_ref(
+            second.id(),
+            &turn_id(TURN_2),
+            &ObservedUpstreamRef::goal("goal-private-shared").unwrap(),
+        )
+        .expect_err("one upstream Goal must not belong to two Sessions");
+    assert_eq!(
+        StorageErrorKind::PrivateReferenceConflict,
+        goal_error.kind()
+    );
+
     let second_refs = storage
         .recovery_subject(second.id(), &turn_id(TURN_2))
         .expect("reload the second subject");
     assert!(second_refs.upstream_thread_ref().is_none());
     assert!(second_refs.upstream_turn_ref().is_none());
+    assert!(second_refs.upstream_goal_ref().is_none());
 }
 
 #[test]

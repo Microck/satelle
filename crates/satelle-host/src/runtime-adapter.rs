@@ -275,10 +275,12 @@ pub enum ProviderSmokeSource {
 
 pub(crate) enum NativeProbeResult {
     Passed(ReadinessEvidence),
+    Cancelled(StopObservation),
     Failed {
         evidence: ReadinessEvidence,
         reason: &'static str,
         error: SatelleError,
+        dispatch_possible: bool,
     },
     UncachedFailure(SatelleError),
 }
@@ -287,6 +289,7 @@ pub(crate) trait ReadinessProbeDriver: Send + Sync + 'static {
     fn run_native_probe(
         &self,
         key: &ReadinessCacheKey,
+        cancellation: &super::request::AdmissionCancellation,
         persist_thread_ref: &mut dyn FnMut(&str) -> Result<(), ()>,
         persist_turn_ref: &mut dyn FnMut(&str) -> Result<(), ()>,
     ) -> NativeProbeResult;
@@ -298,6 +301,7 @@ pub(crate) trait ReadinessProbeDriver: Send + Sync + 'static {
         cached: Option<ReadinessEvidence>,
         cached_provider: Option<ProviderSmokeResult>,
         provider_intent: &ProviderComputerUseIntent,
+        cancellation: &super::request::AdmissionCancellation,
         persist_thread_ref: &mut dyn FnMut(&str) -> Result<(), ()>,
         persist_turn_ref: &mut dyn FnMut(&str) -> Result<(), ()>,
     ) -> AdapterPreflight;
@@ -454,11 +458,13 @@ impl std::fmt::Debug for ReadinessCacheKey {
 /// reaches the Host store.
 pub enum AdapterPreflight {
     Ready(AdapterReadiness),
+    Cancelled(StopObservation),
     Failed {
         key: ReadinessCacheKey,
         evidence: ReadinessEvidence,
         reason: &'static str,
         error: SatelleError,
+        dispatch_possible: bool,
     },
     ProviderFailed {
         key: ReadinessCacheKey,
@@ -473,10 +479,27 @@ impl AdapterPreflight {
     pub(crate) fn into_result(self) -> Result<AdapterReadiness, SatelleError> {
         match self {
             Self::Ready(readiness) => Ok(readiness),
+            Self::Cancelled(observation) => Err(admission_cancelled_error(observation)),
             Self::Failed { error, .. } | Self::ProviderFailed { error, .. } => Err(error),
             Self::UncachedFailure(error) => Err(error),
         }
     }
+}
+
+pub(crate) fn admission_cancelled_error(observation: StopObservation) -> SatelleError {
+    let mut error = SatelleError::interrupted_attached_command();
+    let outcome = match observation {
+        StopObservation::CancellationConfirmed | StopObservation::UpstreamInactiveConfirmed => {
+            "confirmed"
+        }
+        StopObservation::UpstreamStillActive => "upstream_still_active",
+        StopObservation::OutcomeUnknown => "outcome_unknown",
+    };
+    error.details.insert(
+        "admission_cancellation".to_string(),
+        serde_json::Value::String(outcome.to_string()),
+    );
+    error
 }
 
 impl ReadinessEvidence {
@@ -800,6 +823,12 @@ impl<'a> AdapterSubject<'a> {
             .map(crate::storage::PrivateUpstreamRef::as_str)
     }
 
+    pub(crate) fn upstream_goal_ref(self) -> Option<&'a str> {
+        self.subject
+            .upstream_goal_ref()
+            .map(crate::storage::PrivateUpstreamRef::as_str)
+    }
+
     pub fn has_request_token(self) -> bool {
         let _opaque_token = self.subject.request_token();
         true
@@ -860,6 +889,10 @@ impl<'a> ExecuteRequest<'a> {
             .map(crate::storage::PrivateUpstreamRef::as_str)
     }
 
+    pub fn upstream_goal_ref(&self) -> Option<&'a str> {
+        self.subject.upstream_goal_ref()
+    }
+
     pub const fn subject(&self) -> AdapterSubject<'a> {
         self.subject
     }
@@ -875,11 +908,16 @@ impl<'a> ExecuteRequest<'a> {
     pub fn persist_upstream_turn_ref(&self, value: &str) -> Result<(), SatelleError> {
         (self.persist_upstream_ref)(UpstreamReference::Turn(value.to_string()))
     }
+
+    pub fn persist_upstream_goal_ref(&self, value: &str) -> Result<(), SatelleError> {
+        (self.persist_upstream_ref)(UpstreamReference::Goal(value.to_string()))
+    }
 }
 
 pub(super) enum UpstreamReference {
     Thread(String),
     Turn(String),
+    Goal(String),
 }
 
 pub struct ExecuteResult {

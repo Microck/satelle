@@ -1,5 +1,17 @@
 use super::*;
+use satelle_core::session::{
+    ApprovalPolicy, DesktopBindingRef, DesktopTarget, EffectiveModelRef, ExecutionPolicy,
+    ExperimentalFeatureChoices, FeatureChoice, ProviderBindingRef, SandboxPolicy, SessionActivity,
+    StopObservation, TimeoutPolicy, TurnState, TurnTransition,
+};
+use satelle_host::{
+    AdapterReadiness, AdapterSubject, ComputerUseAdapter, ExecuteRequest, ExecuteResult,
+    ProviderComputerUseIntent, ProviderSmokeEvidence, ReadinessEvidence, RecoveryObservation,
+};
 use satelle_test_contract::assert_privacy_canaries_absent;
+use satelle_transport::{SessionResponse, TurnRequest};
+use std::sync::Condvar;
+use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 #[tokio::test]
@@ -8,7 +20,7 @@ async fn chunked_oversize_body_returns_typed_413_without_admission() {
     let authorization = bearer(&running.token);
     let payload_bytes = 1_048_577;
     let head = format!(
-        "POST /v1/sessions HTTP/1.1\r\nHost: localhost\r\nAuthorization: {authorization}\r\nSatelle-Expected-Host-Identity: {}\r\nSatelle-Request-Id: {}\r\nSatelle-Protocol-Version: 3\r\nIdempotency-Key: raw-chunked-limit\r\nContent-Type: application/json\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n{payload_bytes:x}\r\n",
+        "POST /v1/sessions HTTP/1.1\r\nHost: localhost\r\nAuthorization: {authorization}\r\nSatelle-Expected-Host-Identity: {}\r\nSatelle-Request-Id: {}\r\nSatelle-Protocol-Version: 4\r\nIdempotency-Key: raw-chunked-limit\r\nContent-Type: application/json\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n{payload_bytes:x}\r\n",
         running.host_identity,
         RequestId::new(),
     );
@@ -47,7 +59,7 @@ async fn chunked_attachment_limit_and_log_privacy(trace_capture: TraceCapture) {
     let split = body.len() / 2;
     let request_id = RequestId::new();
     let request_head = format!(
-        "POST /v1/sessions HTTP/1.1\r\nHost: localhost\r\nAuthorization: {authorization}\r\nSatelle-Expected-Host-Identity: {}\r\nSatelle-Request-Id: {}\r\nSatelle-Protocol-Version: 3\r\nIdempotency-Key: attachment-limit-chunked\r\nContent-Type: application/json\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n{split:x}\r\n",
+        "POST /v1/sessions HTTP/1.1\r\nHost: localhost\r\nAuthorization: {authorization}\r\nSatelle-Expected-Host-Identity: {}\r\nSatelle-Request-Id: {}\r\nSatelle-Protocol-Version: 4\r\nIdempotency-Key: attachment-limit-chunked\r\nContent-Type: application/json\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n{split:x}\r\n",
         running.host_identity, request_id,
     );
     let mut request = request_head.into_bytes();
@@ -124,7 +136,7 @@ async fn bearer_tokens_in_http_trailers_are_rejected_without_admission() {
     let body =
         br#"{"schema_version":"satelle.api.v2","prompt":"safe","execution_mode":"standard"}"#;
     let mutation_request = format!(
-        "POST /v1/sessions HTTP/1.1\r\nHost: localhost\r\nAuthorization: {}\r\nSatelle-Expected-Host-Identity: {}\r\nSatelle-Request-Id: {}\r\nSatelle-Protocol-Version: 3\r\nIdempotency-Key: trailer-carrier\r\nContent-Type: application/json\r\nTransfer-Encoding: chunked\r\nTrailer: X-Api-Token\r\nConnection: close\r\n\r\n{:x}\r\n{}\r\n0\r\nX-Api-Token: {}\r\n\r\n",
+        "POST /v1/sessions HTTP/1.1\r\nHost: localhost\r\nAuthorization: {}\r\nSatelle-Expected-Host-Identity: {}\r\nSatelle-Request-Id: {}\r\nSatelle-Protocol-Version: 4\r\nIdempotency-Key: trailer-carrier\r\nContent-Type: application/json\r\nTransfer-Encoding: chunked\r\nTrailer: X-Api-Token\r\nConnection: close\r\n\r\n{:x}\r\n{}\r\n0\r\nX-Api-Token: {}\r\n\r\n",
         bearer(&running.token),
         running.host_identity,
         RequestId::new(),
@@ -166,7 +178,7 @@ async fn stalled_upload_cannot_hold_daemon_shutdown_open_forever() {
         .await
         .expect("open stalled request connection");
     let partial = format!(
-        "POST /v1/sessions HTTP/1.1\r\nHost: localhost\r\nAuthorization: {}\r\nSatelle-Expected-Host-Identity: {}\r\nSatelle-Request-Id: {}\r\nSatelle-Protocol-Version: 3\r\nIdempotency-Key: stalled-shutdown\r\nContent-Type: application/json\r\nContent-Length: 1000\r\n\r\n{{",
+        "POST /v1/sessions HTTP/1.1\r\nHost: localhost\r\nAuthorization: {}\r\nSatelle-Expected-Host-Identity: {}\r\nSatelle-Request-Id: {}\r\nSatelle-Protocol-Version: 4\r\nIdempotency-Key: stalled-shutdown\r\nContent-Type: application/json\r\nContent-Length: 1000\r\n\r\n{{",
         bearer(&token),
         initialized.host_identity(),
         RequestId::new(),
@@ -183,6 +195,300 @@ async fn stalled_upload_cannot_hold_daemon_shutdown_open_forever() {
     assert_eq!(error.code(), "shutdown-timeout");
     assert!(TcpStream::connect(address).await.is_err());
     drop(held);
+}
+
+#[tokio::test]
+async fn dropped_admission_response_is_recovered_without_stopping_or_duplicate_turns() {
+    const IDEMPOTENCY_KEY: &str = "01890a5d-ac96-7b7c-8f89-37c3d0a66f10";
+
+    let state = TestStateDir::new().expect("temporary state directory");
+    let admission = AdmissionBarrier::default();
+    let _admission_guard = AdmissionReleaseGuard(admission.clone());
+    let service = HostService::with_adapter_for_tests_at(
+        state.path(),
+        ControlledAdmissionAdapter {
+            admission: admission.clone(),
+        },
+    )
+    .expect("construct controlled Host service");
+    let initialized = service.initialize_daemon().expect("initialize Host state");
+    let host_identity = initialized.host_identity().to_string();
+    let token = ApiBearerToken::generate().expect("generate API token");
+    service
+        .register_api_token(
+            &token,
+            "principal-dropped-response",
+            ApiScopes::CONTROL,
+            None,
+        )
+        .expect("register API token");
+    let server = DaemonServer::bind(
+        service.clone(),
+        DaemonServerConfig::loopback(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))),
+    )
+    .await
+    .expect("bind daemon server");
+    let running = RunningServer {
+        _state: state,
+        service,
+        server,
+        token,
+        host_identity,
+    };
+    let request = TurnRequest::new("PRIVATE_DROPPED_RESPONSE_CANARY");
+    let body = serde_json::to_vec(&request).expect("encode admission request");
+    let head = format!(
+        "POST /v1/sessions HTTP/1.1\r\nHost: localhost\r\nAuthorization: {}\r\nSatelle-Expected-Host-Identity: {}\r\nSatelle-Request-Id: {}\r\nSatelle-Protocol-Version: 4\r\nIdempotency-Key: {IDEMPOTENCY_KEY}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        bearer(&running.token),
+        running.host_identity,
+        RequestId::new(),
+        body.len(),
+    );
+    let mut stream = TcpStream::connect(running.server.local_addr())
+        .await
+        .expect("connect raw admission client");
+    stream
+        .write_all(head.as_bytes())
+        .await
+        .expect("write admission head");
+    stream.write_all(&body).await.expect("write admission body");
+    stream
+        .flush()
+        .await
+        .expect("flush complete admission request");
+    let admission_wait = admission.clone();
+    tokio::time::timeout(
+        Duration::from_secs(2),
+        tokio::task::spawn_blocking(move || admission_wait.wait_until_entered()),
+    )
+    .await
+    .expect("POST admission must enter its blocked preflight")
+    .expect("preflight barrier waiter must not panic");
+    let pending = running
+        .service
+        .initialize_daemon()
+        .expect("read daemon state while admission is blocked");
+    assert_eq!(
+        pending.session_count(),
+        0,
+        "blocked preflight proves durable admission has not completed"
+    );
+    let mut response_probe = [0_u8; 1];
+    let pending_read = stream.try_read(&mut response_probe);
+    assert!(
+        pending_read
+            .as_ref()
+            .is_err_and(|error| error.kind() == std::io::ErrorKind::WouldBlock),
+        "the HTTP response must still be pending at the disconnect barrier: {pending_read:?}"
+    );
+    drop(stream);
+    admission.release();
+
+    let replay: SessionResponse = running
+        .mutation("/v1/sessions", IDEMPOTENCY_KEY)
+        .json(&request)
+        .send()
+        .await
+        .expect("replay admission after losing its response")
+        .json()
+        .await
+        .expect("decode replayed admission");
+    assert_eq!(replay.session().turns().len(), 1);
+    let session_id = replay.session().session_id().clone();
+    let turn_id = replay.session().turns()[0].turn_id().clone();
+    let terminal = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let session = running
+                .service
+                .status(&session_id)
+                .expect("read authoritative Session state");
+            if matches!(session.activity(), SessionActivity::Idle) {
+                break session;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the admitted Turn must eventually finish");
+    assert_eq!(terminal.turns().len(), 1);
+    assert_eq!(terminal.turns()[0].turn_id(), &turn_id);
+    assert_ne!(terminal.turns()[0].state(), TurnState::Stopped);
+    assert_eq!(
+        admission.preflight_calls(),
+        1,
+        "the disconnected request and exact replay must share one admission"
+    );
+    assert_eq!(
+        admission.execute_calls(),
+        1,
+        "the exact replay must not dispatch a duplicate Turn"
+    );
+    assert_eq!(
+        admission.stop_calls(),
+        0,
+        "disconnecting a pending admission response must not attempt a stop"
+    );
+
+    let recovered: SessionResponse = running
+        .request(&format!("/v1/sessions/{session_id}"))
+        .send()
+        .await
+        .expect("read Session after reconnect")
+        .json()
+        .await
+        .expect("decode reconnected Session");
+    assert_eq!(recovered.session(), &terminal);
+    assert_eq!(
+        running
+            .service
+            .initialize_daemon()
+            .expect("read final daemon state")
+            .session_count(),
+        1
+    );
+}
+
+#[derive(Clone, Default)]
+struct AdmissionBarrier {
+    entered: Arc<(Mutex<bool>, Condvar)>,
+    release: Arc<(Mutex<bool>, Condvar)>,
+    preflight_calls: Arc<AtomicUsize>,
+    execute_calls: Arc<AtomicUsize>,
+    stop_calls: Arc<AtomicUsize>,
+}
+
+impl AdmissionBarrier {
+    fn block_preflight(&self) {
+        self.preflight_calls.fetch_add(1, AtomicOrdering::SeqCst);
+        let (lock, changed) = &*self.entered;
+        *lock.lock().unwrap_or_else(|poison| poison.into_inner()) = true;
+        changed.notify_all();
+        let (lock, changed) = &*self.release;
+        let mut released = lock.lock().unwrap_or_else(|poison| poison.into_inner());
+        while !*released {
+            released = changed
+                .wait(released)
+                .unwrap_or_else(|poison| poison.into_inner());
+        }
+    }
+
+    fn wait_until_entered(&self) {
+        let (lock, changed) = &*self.entered;
+        let mut entered = lock.lock().unwrap_or_else(|poison| poison.into_inner());
+        while !*entered {
+            entered = changed
+                .wait(entered)
+                .unwrap_or_else(|poison| poison.into_inner());
+        }
+    }
+
+    fn release(&self) {
+        let (lock, changed) = &*self.release;
+        *lock.lock().unwrap_or_else(|poison| poison.into_inner()) = true;
+        changed.notify_all();
+    }
+
+    fn preflight_calls(&self) -> usize {
+        self.preflight_calls.load(AtomicOrdering::SeqCst)
+    }
+
+    fn execute_calls(&self) -> usize {
+        self.execute_calls.load(AtomicOrdering::SeqCst)
+    }
+
+    fn stop_calls(&self) -> usize {
+        self.stop_calls.load(AtomicOrdering::SeqCst)
+    }
+}
+
+struct AdmissionReleaseGuard(AdmissionBarrier);
+
+impl Drop for AdmissionReleaseGuard {
+    fn drop(&mut self) {
+        self.0.release();
+    }
+}
+
+#[derive(Clone)]
+struct ControlledAdmissionAdapter {
+    admission: AdmissionBarrier,
+}
+
+impl ComputerUseAdapter for ControlledAdmissionAdapter {
+    fn preflight(
+        &self,
+        _host: &str,
+        _provider_intent: &ProviderComputerUseIntent,
+    ) -> Result<AdapterReadiness, satelle_core::SatelleError> {
+        self.admission.block_preflight();
+        let desktop_binding =
+            DesktopBindingRef::new("raw-wire-controlled-desktop").expect("valid desktop binding");
+        let execution_policy = ExecutionPolicy::new(
+            EffectiveModelRef::new("raw-wire-controlled-model").expect("valid model binding"),
+            ProviderBindingRef::new("raw-wire-controlled-provider")
+                .expect("valid provider binding"),
+            DesktopTarget::new(desktop_binding.clone()),
+            ApprovalPolicy::OnRequest,
+            SandboxPolicy::WorkspaceWrite,
+            TimeoutPolicy::bounded_seconds(120).expect("valid timeout policy"),
+            ExperimentalFeatureChoices::new(FeatureChoice::Enabled, FeatureChoice::Enabled),
+        );
+        let observed_at = time::OffsetDateTime::now_utc();
+        let evidence = ReadinessEvidence::new(
+            format!("raw-wire-readiness-{}", satelle_core::SessionId::new()),
+            "raw-wire-controlled-codex",
+            "raw-wire-controlled-runtime",
+            Some("raw-wire-controlled-plugin"),
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            observed_at,
+            observed_at + time::Duration::minutes(5),
+        )
+        .expect("valid readiness evidence");
+        let provider_evidence = ProviderSmokeEvidence::new(
+            format!("raw-wire-provider-{}", satelle_core::SessionId::new()),
+            "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+            observed_at,
+            observed_at + time::Duration::hours(24),
+        )
+        .expect("valid provider evidence");
+        AdapterReadiness::ready(
+            "raw-wire-controlled",
+            "controlled adapter is ready",
+            desktop_binding,
+            execution_policy,
+            evidence,
+            Some(provider_evidence),
+        )
+        .map_err(|error| satelle_core::SatelleError::invalid_usage(error.to_string()))
+    }
+
+    fn execute(
+        &self,
+        _request: ExecuteRequest<'_>,
+    ) -> Result<ExecuteResult, satelle_core::SatelleError> {
+        self.admission
+            .execute_calls
+            .fetch_add(1, AtomicOrdering::SeqCst);
+        Ok(ExecuteResult::new(TurnTransition::Completed, Vec::new()))
+    }
+
+    fn observe_stop(
+        &self,
+        _subject: AdapterSubject<'_>,
+    ) -> Result<StopObservation, satelle_core::SatelleError> {
+        self.admission
+            .stop_calls
+            .fetch_add(1, AtomicOrdering::SeqCst);
+        Ok(StopObservation::UpstreamInactiveConfirmed)
+    }
+
+    fn observe_recovery(
+        &self,
+        _subject: AdapterSubject<'_>,
+    ) -> Result<RecoveryObservation, satelle_core::SatelleError> {
+        Ok(RecoveryObservation::Unknown)
+    }
 }
 
 pub(super) async fn raw_request(address: SocketAddr, request: &[u8]) -> Vec<u8> {
@@ -221,7 +527,7 @@ async fn duplicate_header_case(header: DuplicateHeader, status: u16, code: &str)
         ),
     };
     let mut request = format!(
-        "POST /v1/sessions HTTP/1.1\r\nHost: localhost\r\nSatelle-Expected-Host-Identity: {}\r\nSatelle-Request-Id: {}\r\nSatelle-Protocol-Version: 3\r\nContent-Length: {}\r\n{duplicated}Connection: close\r\n\r\n",
+        "POST /v1/sessions HTTP/1.1\r\nHost: localhost\r\nSatelle-Expected-Host-Identity: {}\r\nSatelle-Request-Id: {}\r\nSatelle-Protocol-Version: 4\r\nContent-Length: {}\r\n{duplicated}Connection: close\r\n\r\n",
         running.host_identity,
         RequestId::new(),
         body.len(),

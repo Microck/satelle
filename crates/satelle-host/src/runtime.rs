@@ -23,7 +23,10 @@ pub use adapter::{
 };
 pub(crate) use adapter::{NativeProbeResult, ReadinessProbeDriver};
 pub(crate) use codex_adapter::ProductionComputerUseAdapter;
-pub(crate) use request::{RequestIdentity, RunCommand, SteerCommand, StopCommand};
+pub use request::AdmissionCancellation;
+pub(crate) use request::{
+    AdmissionCancellationState, RequestIdentity, RunCommand, SteerCommand, StopCommand,
+};
 pub(crate) use stop::RuntimeStopOutcome;
 use worker::{
     ExecutionPlan, LeaseHeartbeatGuard, MaintenanceOperationGuard, TurnWork, WorkerRegistry,
@@ -194,9 +197,16 @@ pub(crate) struct RuntimeAdmissionReplay {
     turn_id: TurnId,
 }
 
+pub(crate) enum RuntimeAdmissionState {
+    Missing,
+    Admitted(RuntimeAdmissionReplay),
+    Cancelled,
+    RecoveryPending,
+}
+
 impl RuntimeAdmissionReplay {
-    pub(crate) fn into_session(self) -> PublicSession {
-        self.outcome.session
+    pub(crate) fn into_parts(self) -> (PublicSession, TurnId) {
+        (self.outcome.session, self.turn_id)
     }
 }
 
@@ -245,6 +255,32 @@ fn readiness_probe_terminal(
     }
 }
 
+fn probe_dispatch_possible(error: &SatelleError) -> bool {
+    error
+        .details
+        .get("probe_dispatch_possible")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false)
+}
+
+fn readiness_probe_terminal_with_dispatch(
+    error: &SatelleError,
+    persistence_failed: bool,
+    cancellation_detail: &str,
+    timeout_code: Option<ErrorCode>,
+    dispatch_possible: bool,
+) -> ReadinessProbeTerminal {
+    let cancellation_confirmed = error
+        .details
+        .get(cancellation_detail)
+        .and_then(serde_json::Value::as_str)
+        == Some("confirmed");
+    if dispatch_possible && !cancellation_confirmed {
+        return ReadinessProbeTerminal::OutcomeUnknown;
+    }
+    readiness_probe_terminal(error, persistence_failed, cancellation_detail, timeout_code)
+}
+
 pub(crate) fn verify_maintenance_postcheck(
     observation: NativeProbeResult,
     persistence_error: Option<SatelleError>,
@@ -261,14 +297,16 @@ pub(crate) fn verify_maintenance_postcheck(
                 evidence,
                 reason,
                 error,
+                dispatch_possible,
             },
             persistence_error,
         ) => {
-            let terminal = readiness_probe_terminal(
+            let terminal = readiness_probe_terminal_with_dispatch(
                 &error,
                 persistence_error.is_some(),
                 "native_readiness_cancellation",
                 Some(ErrorCode::NativeReadinessTimeout),
+                dispatch_possible,
             );
             if terminal == ReadinessProbeTerminal::OutcomeUnknown {
                 (
@@ -283,6 +321,20 @@ pub(crate) fn verify_maintenance_postcheck(
             }
         }
         (NativeProbeResult::UncachedFailure(error), _) => {
+            (VerifiedMaintenancePostcheck::unknown(), Some(error))
+        }
+        (NativeProbeResult::Cancelled(observation), persistence_error) => {
+            let error = persistence_error.unwrap_or_else(|| {
+                if matches!(
+                    observation,
+                    satelle_core::session::StopObservation::CancellationConfirmed
+                        | satelle_core::session::StopObservation::UpstreamInactiveConfirmed
+                ) {
+                    SatelleError::interrupted_attached_command()
+                } else {
+                    readiness_probe_recovery_pending(ReadinessProbeKind::Native)
+                }
+            });
             (VerifiedMaintenancePostcheck::unknown(), Some(error))
         }
     }
@@ -404,6 +456,87 @@ impl RuntimeEngine {
             .transpose()
     }
 
+    fn resolve_admission_operation(
+        &self,
+        operation: IdempotentOperation,
+        identity: &RequestIdentity,
+        expected_session_id: Option<&SessionId>,
+    ) -> Result<RuntimeAdmissionState, SatelleError> {
+        let requested_at = time::OffsetDateTime::now_utc();
+        self.maintain_session_retention(requested_at)?;
+        let idempotency = model::idempotency(operation, identity, requested_at)?;
+        let state = self
+            .lock_storage()?
+            .resolve_admission_operation(operation, &idempotency, expected_session_id, requested_at)
+            .map_err(model::storage_failure)?;
+        self.runtime_admission_state(state)
+    }
+
+    fn record_admission_cancellation(
+        &self,
+        operation: IdempotentOperation,
+        identity: &RequestIdentity,
+        expected_session_id: Option<&SessionId>,
+        outcome: crate::storage::DurableCancellationOutcome,
+        reconciled: bool,
+    ) -> Result<RuntimeAdmissionState, SatelleError> {
+        let requested_at = time::OffsetDateTime::now_utc();
+        self.maintain_session_retention(requested_at)?;
+        let idempotency = model::idempotency(operation, identity, requested_at)?;
+        let mut storage = self.lock_storage()?;
+        let state = if reconciled {
+            storage.reconcile_admission_cancellation(
+                operation,
+                &idempotency,
+                expected_session_id,
+                outcome,
+                requested_at,
+            )
+        } else {
+            storage.record_admission_cancellation(
+                operation,
+                &idempotency,
+                expected_session_id,
+                outcome,
+                requested_at,
+            )
+        }
+        .map_err(model::storage_failure)?;
+        self.runtime_admission_state(state)
+    }
+
+    fn runtime_admission_state(
+        &self,
+        state: crate::storage::DurableAdmissionState,
+    ) -> Result<RuntimeAdmissionState, SatelleError> {
+        match state {
+            crate::storage::DurableAdmissionState::Missing => Ok(RuntimeAdmissionState::Missing),
+            crate::storage::DurableAdmissionState::Cancelled => {
+                Ok(RuntimeAdmissionState::Cancelled)
+            }
+            crate::storage::DurableAdmissionState::RecoveryPending => {
+                Ok(RuntimeAdmissionState::RecoveryPending)
+            }
+            crate::storage::DurableAdmissionState::Admitted(replay) => {
+                let (outcome, _session_id, turn_id) = (*replay).into_parts();
+                let outcome = match outcome {
+                    AdmissionOutcome::InProgress(session) | AdmissionOutcome::Complete(session) => {
+                        model::turn_outcome(&session, Vec::new())
+                    }
+                    AdmissionOutcome::Execute { .. } => {
+                        return Err(model::integrity_failure(
+                            "a stored idempotency replay requested new adapter execution",
+                        ));
+                    }
+                };
+                Ok(RuntimeAdmissionState::Admitted(RuntimeAdmissionReplay {
+                    outcome,
+                    turn_id,
+                }))
+            }
+        }
+    }
+
     fn initialize_restart_recovery(&self) -> Result<(), SatelleError> {
         let mut initialized = self.restart_recovery_initialized.lock().map_err(|_| {
             model::integrity_failure("the restart recovery initialization lock was poisoned")
@@ -448,18 +581,22 @@ impl RuntimeEngine {
             &command.identity,
             &self.process_identity,
         )?;
-        let (outcome, provider_smoke_event) = {
-            let mut storage = self.lock_storage()?;
-            let outcome = storage
-                .begin_session(&initial, &context)
-                .map_err(model::storage_failure)?;
-            let mut provider_smoke_event = None;
-            if let AdmissionOutcome::Execute { session, .. } = &outcome {
-                self.publish_committed_turn(session, &turn_id);
-                provider_smoke_event = self.publish_provider_smoke(&readiness, session, &turn_id);
-            }
-            (outcome, provider_smoke_event)
-        };
+        let (outcome, provider_smoke_event) =
+            command
+                .cancellation
+                .with_commit_gate(session_id.clone(), turn_id.clone(), || {
+                    let mut storage = self.lock_storage()?;
+                    let outcome = storage
+                        .begin_session(&initial, &context)
+                        .map_err(model::storage_failure)?;
+                    let mut provider_smoke_event = None;
+                    if let AdmissionOutcome::Execute { session, .. } = &outcome {
+                        self.publish_committed_turn(session, &turn_id);
+                        provider_smoke_event =
+                            self.publish_provider_smoke(&readiness, session, &turn_id);
+                    }
+                    Ok((outcome, provider_smoke_event))
+                })?;
         self.finish_admission(
             AdmissionExecution {
                 host: command.host,
@@ -499,26 +636,31 @@ impl RuntimeEngine {
             &command.identity,
             &self.process_identity,
         )?;
-        let (outcome, provider_smoke_event) = {
-            let mut storage = self.lock_storage()?;
-            let outcome = storage
-                .begin_follow_up(
-                    &command.session_id,
-                    existing.session_state_revision(),
-                    turn_id.clone(),
-                    execution_policy,
-                    started_at,
-                    self.adapter.requires_upstream_thread_for_follow_up(),
-                    &context,
-                )
-                .map_err(model::storage_failure)?;
-            let mut provider_smoke_event = None;
-            if let AdmissionOutcome::Execute { session, .. } = &outcome {
-                self.publish_committed_turn(session, &turn_id);
-                provider_smoke_event = self.publish_provider_smoke(&readiness, session, &turn_id);
-            }
-            (outcome, provider_smoke_event)
-        };
+        let (outcome, provider_smoke_event) = command.cancellation.with_commit_gate(
+            command.session_id.clone(),
+            turn_id.clone(),
+            || {
+                let mut storage = self.lock_storage()?;
+                let outcome = storage
+                    .begin_follow_up(
+                        &command.session_id,
+                        existing.session_state_revision(),
+                        turn_id.clone(),
+                        execution_policy,
+                        started_at,
+                        self.adapter.requires_upstream_thread_for_follow_up(),
+                        &context,
+                    )
+                    .map_err(model::storage_failure)?;
+                let mut provider_smoke_event = None;
+                if let AdmissionOutcome::Execute { session, .. } = &outcome {
+                    self.publish_committed_turn(session, &turn_id);
+                    provider_smoke_event =
+                        self.publish_provider_smoke(&readiness, session, &turn_id);
+                }
+                Ok((outcome, provider_smoke_event))
+            },
+        )?;
         self.finish_admission(
             AdmissionExecution {
                 host: LOCAL_DEMO_HOST,
@@ -536,7 +678,12 @@ impl RuntimeEngine {
         &self,
         host: &str,
         provider_intent: &ProviderComputerUseIntent,
+        cancellation: &AdmissionCancellation,
     ) -> Result<AdapterReadiness, SatelleError> {
+        if cancellation.is_requested() {
+            cancellation.finish(AdmissionCancellationState::Cancelled);
+            return Err(SatelleError::interrupted_attached_command());
+        }
         let cache_key = self.adapter.readiness_cache_key(host, provider_intent)?;
         if let (Some(key), Some(driver)) =
             (cache_key.as_ref(), self.readiness_probe_driver.as_ref())
@@ -565,7 +712,7 @@ impl RuntimeEngine {
             && let (Some(key), Some(driver)) =
                 (cache_key.as_ref(), self.readiness_probe_driver.as_ref())
         {
-            cached = Some(self.run_live_native_probe(key, driver.as_ref())?);
+            cached = Some(self.run_live_native_probe(key, driver.as_ref(), cancellation)?);
         }
         let requires_live_provider_probe = provider_intent.experimental()
             && (provider_intent.refresh() || cached_provider.is_none());
@@ -592,6 +739,7 @@ impl RuntimeEngine {
                     self.lock_storage()?
                         .retain_provider_probe_recovery(&provider_probe_ref)
                         .map_err(model::storage_failure)?;
+                    cancellation.finish(AdmissionCancellationState::RecoveryPending);
                     return Err(heartbeat_start_failure(error));
                 }
             };
@@ -638,6 +786,7 @@ impl RuntimeEngine {
                         cached,
                         cached_provider,
                         provider_intent,
+                        cancellation,
                         &mut persist_thread_ref,
                         &mut persist_turn_ref,
                     ),
@@ -650,6 +799,30 @@ impl RuntimeEngine {
         let persistence_failed = persistence_error.into_inner().is_some();
 
         match preflight {
+            AdapterPreflight::Cancelled(observation) => {
+                let terminal = matches!(
+                    observation,
+                    satelle_core::session::StopObservation::CancellationConfirmed
+                        | satelle_core::session::StopObservation::UpstreamInactiveConfirmed
+                );
+                if let Some(provider_probe_ref) = provider_probe_ref.as_deref() {
+                    if terminal {
+                        self.lock_storage()?
+                            .release_provider_probe(provider_probe_ref)
+                            .map_err(model::storage_failure)?;
+                    } else {
+                        self.lock_storage()?
+                            .retain_provider_probe_recovery(provider_probe_ref)
+                            .map_err(model::storage_failure)?;
+                    }
+                }
+                cancellation.finish(if terminal {
+                    AdmissionCancellationState::Cancelled
+                } else {
+                    AdmissionCancellationState::RecoveryPending
+                });
+                Err(adapter::admission_cancelled_error(observation))
+            }
             AdapterPreflight::Ready(readiness) => {
                 self.lock_storage()?
                     .store_preflight_successes(
@@ -672,14 +845,26 @@ impl RuntimeEngine {
                 evidence,
                 reason,
                 error,
+                dispatch_possible,
             } => {
                 self.lock_storage()?
                     .store_preflight_failure(&key, &evidence, reason)
                     .map_err(model::storage_failure)?;
                 if let Some(provider_probe_ref) = provider_probe_ref.as_deref() {
-                    self.lock_storage()?
-                        .release_provider_probe(provider_probe_ref)
-                        .map_err(model::storage_failure)?;
+                    if dispatch_possible || persistence_failed {
+                        self.lock_storage()?
+                            .retain_provider_probe_recovery(provider_probe_ref)
+                            .map_err(model::storage_failure)?;
+                    } else {
+                        self.lock_storage()?
+                            .release_provider_probe(provider_probe_ref)
+                            .map_err(model::storage_failure)?;
+                    }
+                }
+                if dispatch_possible || persistence_failed {
+                    cancellation.finish(AdmissionCancellationState::RecoveryPending);
+                } else if cancellation.is_requested() {
+                    cancellation.finish(AdmissionCancellationState::Cancelled);
                 }
                 Err(error)
             }
@@ -689,13 +874,14 @@ impl RuntimeEngine {
                 failure,
                 error,
             } => {
+                let terminal = readiness_probe_terminal_with_dispatch(
+                    &error,
+                    persistence_failed,
+                    "provider_smoke_cancellation",
+                    Some(ErrorCode::ProviderSmokeTestTimeout),
+                    probe_dispatch_possible(&error),
+                );
                 if let Some(provider_probe_ref) = provider_probe_ref.as_deref() {
-                    let terminal = readiness_probe_terminal(
-                        &error,
-                        persistence_failed,
-                        "provider_smoke_cancellation",
-                        Some(ErrorCode::ProviderSmokeTestTimeout),
-                    );
                     self.lock_storage()?
                         .finish_provider_probe_failure(
                             provider_probe_ref,
@@ -710,13 +896,30 @@ impl RuntimeEngine {
                         .store_provider_smoke_failure(&key, &readiness, &failure)
                         .map_err(model::storage_failure)?;
                 }
+                if terminal == ReadinessProbeTerminal::OutcomeUnknown {
+                    cancellation.finish(AdmissionCancellationState::RecoveryPending);
+                } else if cancellation.is_requested() {
+                    cancellation.finish(AdmissionCancellationState::Cancelled);
+                }
                 Err(error)
             }
             AdapterPreflight::UncachedFailure(error) => {
+                let recovery_pending = probe_dispatch_possible(&error) || persistence_failed;
                 if let Some(provider_probe_ref) = provider_probe_ref.as_deref() {
-                    self.lock_storage()?
-                        .retain_provider_probe_recovery(provider_probe_ref)
-                        .map_err(model::storage_failure)?;
+                    if recovery_pending {
+                        self.lock_storage()?
+                            .retain_provider_probe_recovery(provider_probe_ref)
+                            .map_err(model::storage_failure)?;
+                    } else {
+                        self.lock_storage()?
+                            .release_provider_probe(provider_probe_ref)
+                            .map_err(model::storage_failure)?;
+                    }
+                }
+                if recovery_pending {
+                    cancellation.finish(AdmissionCancellationState::RecoveryPending);
+                } else if cancellation.is_requested() {
+                    cancellation.finish(AdmissionCancellationState::Cancelled);
                 }
                 Err(error)
             }
@@ -727,6 +930,7 @@ impl RuntimeEngine {
         &self,
         key: &ReadinessCacheKey,
         driver: &dyn ReadinessProbeDriver,
+        cancellation: &AdmissionCancellation,
     ) -> Result<ReadinessEvidence, SatelleError> {
         let native_probe_ref = format!("native-probe-{}", SessionId::new());
         let now = time::OffsetDateTime::now_utc();
@@ -747,6 +951,7 @@ impl RuntimeEngine {
                 self.lock_storage()?
                     .retain_native_probe_recovery(&native_probe_ref)
                     .map_err(model::storage_failure)?;
+                cancellation.finish(AdmissionCancellationState::RecoveryPending);
                 return Err(heartbeat_start_failure(error));
             }
         };
@@ -782,11 +987,38 @@ impl RuntimeEngine {
                         *persistence_error.borrow_mut() = Some(error);
                     })
             };
-            driver.run_native_probe(key, &mut persist_thread_ref, &mut persist_turn_ref)
+            driver.run_native_probe(
+                key,
+                cancellation,
+                &mut persist_thread_ref,
+                &mut persist_turn_ref,
+            )
         };
         let persistence_failed = persistence_error.into_inner().is_some();
 
         match probe {
+            NativeProbeResult::Cancelled(observation) => {
+                let terminal = matches!(
+                    observation,
+                    satelle_core::session::StopObservation::CancellationConfirmed
+                        | satelle_core::session::StopObservation::UpstreamInactiveConfirmed
+                );
+                if terminal {
+                    self.lock_storage()?
+                        .release_native_probe(&native_probe_ref)
+                        .map_err(model::storage_failure)?;
+                } else {
+                    self.lock_storage()?
+                        .retain_native_probe_recovery(&native_probe_ref)
+                        .map_err(model::storage_failure)?;
+                }
+                cancellation.finish(if terminal {
+                    AdmissionCancellationState::Cancelled
+                } else {
+                    AdmissionCancellationState::RecoveryPending
+                });
+                Err(adapter::admission_cancelled_error(observation))
+            }
             NativeProbeResult::Passed(evidence) if !persistence_failed => {
                 self.lock_storage()?
                     .finish_native_probe_success(&native_probe_ref, key, &evidence)
@@ -797,18 +1029,21 @@ impl RuntimeEngine {
                 self.lock_storage()?
                     .retain_native_probe_recovery(&native_probe_ref)
                     .map_err(model::storage_failure)?;
+                cancellation.finish(AdmissionCancellationState::RecoveryPending);
                 Err(readiness_probe_recovery_pending(ReadinessProbeKind::Native))
             }
             NativeProbeResult::Failed {
                 evidence,
                 reason,
                 error,
+                dispatch_possible,
             } => {
-                let terminal = readiness_probe_terminal(
+                let terminal = readiness_probe_terminal_with_dispatch(
                     &error,
                     persistence_failed,
                     "native_readiness_cancellation",
                     Some(ErrorCode::NativeReadinessTimeout),
+                    dispatch_possible,
                 );
                 self.lock_storage()?
                     .finish_native_probe_failure(
@@ -819,12 +1054,20 @@ impl RuntimeEngine {
                         terminal,
                     )
                     .map_err(model::storage_failure)?;
+                if terminal == ReadinessProbeTerminal::OutcomeUnknown {
+                    cancellation.finish(AdmissionCancellationState::RecoveryPending);
+                } else if cancellation.is_requested() {
+                    cancellation.finish(AdmissionCancellationState::Cancelled);
+                }
                 Err(error)
             }
             NativeProbeResult::UncachedFailure(error) => {
                 self.lock_storage()?
                     .release_native_probe(&native_probe_ref)
                     .map_err(model::storage_failure)?;
+                if cancellation.is_requested() {
+                    cancellation.finish(AdmissionCancellationState::Cancelled);
+                }
                 Err(error)
             }
         }
@@ -1242,7 +1485,12 @@ impl RuntimeHandle {
                         *persistence_error.borrow_mut() = Some(error);
                     })
             };
-            driver.run_native_probe(key, &mut persist_thread_ref, &mut persist_turn_ref)
+            driver.run_native_probe(
+                key,
+                &AdmissionCancellation::new(),
+                &mut persist_thread_ref,
+                &mut persist_turn_ref,
+            )
         };
         let persistence_error = persistence_error.into_inner();
         let (verified, terminal_error) =
@@ -1401,6 +1649,33 @@ impl RuntimeHandle {
         engine.replay_admission(operation, identity, expected_session_id)
     }
 
+    pub(crate) fn resolve_admission_operation(
+        &self,
+        operation: IdempotentOperation,
+        identity: &RequestIdentity,
+        expected_session_id: Option<&SessionId>,
+    ) -> Result<RuntimeAdmissionState, SatelleError> {
+        self.engine()?
+            .resolve_admission_operation(operation, identity, expected_session_id)
+    }
+
+    pub(crate) fn record_admission_cancellation(
+        &self,
+        operation: IdempotentOperation,
+        identity: &RequestIdentity,
+        expected_session_id: Option<&SessionId>,
+        outcome: crate::storage::DurableCancellationOutcome,
+        reconciled: bool,
+    ) -> Result<RuntimeAdmissionState, SatelleError> {
+        self.engine()?.record_admission_cancellation(
+            operation,
+            identity,
+            expected_session_id,
+            outcome,
+            reconciled,
+        )
+    }
+
     pub(crate) fn run(
         &self,
         command: RunCommand<'_>,
@@ -1449,7 +1724,11 @@ impl RuntimeHandle {
                 error,
             );
         }
-        let readiness = match engine.preflight(command.host, &command.provider_intent) {
+        let readiness = match engine.preflight(
+            command.host,
+            &command.provider_intent,
+            &command.cancellation,
+        ) {
             Ok(readiness) => readiness,
             Err(error) => {
                 return self.resolve_precommit_failure(
@@ -1529,7 +1808,11 @@ impl RuntimeHandle {
                 error,
             );
         }
-        let readiness = match engine.preflight(LOCAL_DEMO_HOST, &command.provider_intent) {
+        let readiness = match engine.preflight(
+            LOCAL_DEMO_HOST,
+            &command.provider_intent,
+            &command.cancellation,
+        ) {
             Ok(readiness) => readiness,
             Err(error) => {
                 return self.resolve_precommit_failure(
@@ -1630,7 +1913,8 @@ impl RuntimeHandle {
         host: &str,
         provider_intent: &ProviderComputerUseIntent,
     ) -> Result<AdapterReadiness, SatelleError> {
-        self.engine()?.preflight(host, provider_intent)
+        self.engine()?
+            .preflight(host, provider_intent, &AdmissionCancellation::new())
     }
 
     pub(crate) fn daemon_workers_idle(&self) -> Result<bool, SatelleError> {

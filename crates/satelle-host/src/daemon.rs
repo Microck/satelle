@@ -1,5 +1,6 @@
 use crate::codex_capabilities::BlockerReason;
-use crate::runtime::{RunCommand, SteerCommand, StopCommand};
+use crate::operation_capacity::AdmissionCancellationOutcome;
+use crate::runtime::{AdmissionCancellation, RunCommand, SteerCommand, StopCommand};
 use crate::storage::{ApiTokenRegistration, IdempotentOperation};
 use crate::{
     ApiBearerToken, ApiPrincipal, ApiScopes, HostMode, HostService, ProductionCapabilitySnapshot,
@@ -8,7 +9,9 @@ use satelle_core::session::{
     EffectiveModelRef, ProviderBindingRef, PublicSession, SessionStateRevision, TurnExecutionMode,
     TurnStateRevision,
 };
-use satelle_core::{DesktopSessionRecord, LOCAL_DEMO_HOST, SatelleError, SessionId, StopResult};
+use satelle_core::{
+    DesktopSessionRecord, LOCAL_DEMO_HOST, SatelleError, SessionId, StopResult, TurnId,
+};
 use serde::Serialize;
 use std::fmt;
 use thiserror::Error;
@@ -244,6 +247,15 @@ pub struct StopAdmission {
     turn_state_revision: TurnStateRevision,
 }
 
+pub enum AdmissionCancellationResult {
+    Cancelled,
+    Admitted {
+        session: PublicSession,
+        turn_id: TurnId,
+    },
+    RecoveryPending,
+}
+
 impl StopAdmission {
     pub const fn result(&self) -> &StopResult {
         &self.result
@@ -293,6 +305,8 @@ struct CanonicalTurnCreate<'a> {
 struct CanonicalSessionStop<'a> {
     operation: &'static str,
     session_id: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    expected_turn_id: Option<&'a str>,
 }
 
 #[derive(Serialize)]
@@ -608,13 +622,24 @@ impl HostService {
     /// Rotates the active request-digest key while retaining every older key
     /// still referenced by an Idempotency Record.
     pub fn rotate_idempotency_hmac_key(&self) -> Result<u16, SatelleError> {
-        self.runtime.rotate_idempotency_hmac_key()
+        let _identity_gate = self.operation_capacity.lock_identity_write()?;
+        self.operation_capacity
+            .execute_exclusive(|| self.runtime.rotate_idempotency_hmac_key())
     }
 
     pub fn admit_run(
         &self,
         intent: &TurnIntent,
         authority: &MutationAuthority,
+    ) -> Result<PublicSession, SatelleError> {
+        self.admit_run_with_cancellation(intent, authority, AdmissionCancellation::new())
+    }
+
+    pub fn admit_run_with_cancellation(
+        &self,
+        intent: &TurnIntent,
+        authority: &MutationAuthority,
+        cancellation: AdmissionCancellation,
     ) -> Result<PublicSession, SatelleError> {
         let canonical_payload = canonical_payload(
             &CanonicalSessionCreate {
@@ -634,6 +659,7 @@ impl HostService {
             },
             TURN_IDEMPOTENCY_DIGEST_SCHEMA_VERSION,
         )?;
+        let _identity_gate = self.operation_capacity.lock_identity_read()?;
         let identity = self.runtime.authenticated_request_identity(
             &authority.principal,
             IdempotentOperation::Run,
@@ -643,24 +669,30 @@ impl HostService {
         )?;
         let operation_identity = identity.clone();
         self.operation_capacity
-            .execute(
+            .execute_interruptible_durable(
                 crate::operation_capacity::OperationRequest::new(
                     IdempotentOperation::Run,
                     &identity,
                 ),
+                cancellation.clone(),
                 || {
                     self.runtime
-                        .replay_admission_if_present(IdempotentOperation::Run, &identity, None)
-                        .map(|replay| {
-                            replay.map(|replay| {
-                                crate::operation_capacity::OperationOutcome::Session(
-                                    replay.into_session(),
-                                )
-                            })
-                        })
+                        .resolve_admission_operation(IdempotentOperation::Run, &identity, None)
+                        .map(durable_admission_outcome)
                 },
-                || {
-                    crate::runtime::admitted_session(
+                |outcome| {
+                    self.runtime
+                        .record_admission_cancellation(
+                            IdempotentOperation::Run,
+                            &identity,
+                            None,
+                            durable_cancellation_outcome(&outcome),
+                            cancellation_is_reconciled(&outcome),
+                        )
+                        .map(durable_admission_outcome)
+                },
+                |registered_cancellation| {
+                    let session = crate::runtime::admitted_session(
                         self.runtime.run(
                             RunCommand::detached_with_identity(
                                 LOCAL_DEMO_HOST,
@@ -668,10 +700,19 @@ impl HostService {
                                 operation_identity,
                             )
                             .with_execution_mode(intent.execution_mode)
-                            .with_provider_intent(intent.provider_intent.clone()),
+                            .with_provider_intent(intent.provider_intent.clone())
+                            .with_cancellation(registered_cancellation),
                         ),
-                    )
-                    .map(crate::operation_capacity::OperationOutcome::Session)
+                    )?;
+                    let turn_id = session
+                        .turns()
+                        .last()
+                        .expect("a newly admitted run contains its target Turn")
+                        .turn_id()
+                        .clone();
+                    Ok(crate::operation_capacity::OperationOutcome::admission(
+                        session, turn_id,
+                    ))
                 },
             )?
             .into_session()
@@ -682,6 +723,21 @@ impl HostService {
         session_id: &SessionId,
         intent: &TurnIntent,
         authority: &MutationAuthority,
+    ) -> Result<PublicSession, SatelleError> {
+        self.admit_steer_with_cancellation(
+            session_id,
+            intent,
+            authority,
+            AdmissionCancellation::new(),
+        )
+    }
+
+    pub fn admit_steer_with_cancellation(
+        &self,
+        session_id: &SessionId,
+        intent: &TurnIntent,
+        authority: &MutationAuthority,
+        cancellation: AdmissionCancellation,
     ) -> Result<PublicSession, SatelleError> {
         let canonical_payload = canonical_payload(
             &CanonicalTurnCreate {
@@ -702,6 +758,7 @@ impl HostService {
             },
             TURN_IDEMPOTENCY_DIGEST_SCHEMA_VERSION,
         )?;
+        let _identity_gate = self.operation_capacity.lock_identity_read()?;
         let identity = self.runtime.authenticated_request_identity(
             &authority.principal,
             IdempotentOperation::Steer,
@@ -711,28 +768,34 @@ impl HostService {
         )?;
         let operation_identity = identity.clone();
         self.operation_capacity
-            .execute(
+            .execute_interruptible_durable(
                 crate::operation_capacity::OperationRequest::new(
                     IdempotentOperation::Steer,
                     &identity,
                 ),
+                cancellation.clone(),
                 || {
                     self.runtime
-                        .replay_admission_if_present(
+                        .resolve_admission_operation(
                             IdempotentOperation::Steer,
                             &identity,
                             Some(session_id),
                         )
-                        .map(|replay| {
-                            replay.map(|replay| {
-                                crate::operation_capacity::OperationOutcome::Session(
-                                    replay.into_session(),
-                                )
-                            })
-                        })
+                        .map(durable_admission_outcome)
                 },
-                || {
-                    crate::runtime::admitted_session(
+                |outcome| {
+                    self.runtime
+                        .record_admission_cancellation(
+                            IdempotentOperation::Steer,
+                            &identity,
+                            Some(session_id),
+                            durable_cancellation_outcome(&outcome),
+                            cancellation_is_reconciled(&outcome),
+                        )
+                        .map(durable_admission_outcome)
+                },
+                |registered_cancellation| {
+                    let session = crate::runtime::admitted_session(
                         self.runtime.steer(
                             SteerCommand::detached_with_identity(
                                 session_id.clone(),
@@ -740,13 +803,142 @@ impl HostService {
                                 operation_identity,
                             )
                             .with_execution_mode(intent.execution_mode)
-                            .with_provider_intent(intent.provider_intent.clone()),
+                            .with_provider_intent(intent.provider_intent.clone())
+                            .with_cancellation(registered_cancellation),
                         ),
-                    )
-                    .map(crate::operation_capacity::OperationOutcome::Session)
+                    )?;
+                    let turn_id = session
+                        .turns()
+                        .last()
+                        .expect("a newly admitted steer contains its target Turn")
+                        .turn_id()
+                        .clone();
+                    Ok(crate::operation_capacity::OperationOutcome::admission(
+                        session, turn_id,
+                    ))
                 },
             )?
             .into_session()
+    }
+
+    pub fn cancel_run_admission(
+        &self,
+        intent: &TurnIntent,
+        authority: &MutationAuthority,
+    ) -> Result<AdmissionCancellationResult, SatelleError> {
+        let canonical_payload = canonical_payload(
+            &CanonicalSessionCreate {
+                operation: "session_create",
+                prompt: &intent.prompt,
+                execution_mode: intent.execution_mode,
+                model: intent
+                    .provider_intent
+                    .model()
+                    .map(EffectiveModelRef::as_str),
+                provider: intent
+                    .provider_intent
+                    .provider()
+                    .map(ProviderBindingRef::as_str),
+                experimental_provider_computer_use: intent.provider_intent.experimental(),
+                refresh_provider_smoke_test: intent.provider_intent.refresh(),
+            },
+            TURN_IDEMPOTENCY_DIGEST_SCHEMA_VERSION,
+        )?;
+        let _identity_gate = self.operation_capacity.lock_identity_read()?;
+        let identity = self.runtime.authenticated_request_identity(
+            &authority.principal,
+            IdempotentOperation::Run,
+            &authority.idempotency_key,
+            canonical_payload.as_slice(),
+            canonical_payload.digest_schema_version,
+        )?;
+        self.operation_capacity
+            .cancel_durable(
+                crate::operation_capacity::OperationRequest::new(
+                    IdempotentOperation::Run,
+                    &identity,
+                ),
+                || {
+                    self.runtime
+                        .resolve_admission_operation(IdempotentOperation::Run, &identity, None)
+                        .map(durable_admission_outcome)
+                },
+                |outcome| {
+                    self.runtime
+                        .record_admission_cancellation(
+                            IdempotentOperation::Run,
+                            &identity,
+                            None,
+                            durable_cancellation_outcome(&outcome),
+                            cancellation_is_reconciled(&outcome),
+                        )
+                        .map(durable_admission_outcome)
+                },
+            )
+            .map(admission_cancellation_result)
+    }
+
+    pub fn cancel_steer_admission(
+        &self,
+        session_id: &SessionId,
+        intent: &TurnIntent,
+        authority: &MutationAuthority,
+    ) -> Result<AdmissionCancellationResult, SatelleError> {
+        let canonical_payload = canonical_payload(
+            &CanonicalTurnCreate {
+                operation: "turn_create",
+                session_id: session_id.as_str(),
+                prompt: &intent.prompt,
+                execution_mode: intent.execution_mode,
+                model: intent
+                    .provider_intent
+                    .model()
+                    .map(EffectiveModelRef::as_str),
+                provider: intent
+                    .provider_intent
+                    .provider()
+                    .map(ProviderBindingRef::as_str),
+                experimental_provider_computer_use: intent.provider_intent.experimental(),
+                refresh_provider_smoke_test: intent.provider_intent.refresh(),
+            },
+            TURN_IDEMPOTENCY_DIGEST_SCHEMA_VERSION,
+        )?;
+        let _identity_gate = self.operation_capacity.lock_identity_read()?;
+        let identity = self.runtime.authenticated_request_identity(
+            &authority.principal,
+            IdempotentOperation::Steer,
+            &authority.idempotency_key,
+            canonical_payload.as_slice(),
+            canonical_payload.digest_schema_version,
+        )?;
+        self.operation_capacity
+            .cancel_durable(
+                crate::operation_capacity::OperationRequest::new(
+                    IdempotentOperation::Steer,
+                    &identity,
+                ),
+                || {
+                    self.runtime
+                        .resolve_admission_operation(
+                            IdempotentOperation::Steer,
+                            &identity,
+                            Some(session_id),
+                        )
+                        .map(durable_admission_outcome)
+                },
+                |outcome| {
+                    self.runtime
+                        .record_admission_cancellation(
+                            IdempotentOperation::Steer,
+                            &identity,
+                            Some(session_id),
+                            durable_cancellation_outcome(&outcome),
+                            cancellation_is_reconciled(&outcome),
+                        )
+                        .map(durable_admission_outcome)
+                },
+            )
+            .map(admission_cancellation_result)
     }
 
     pub fn admit_stop(
@@ -754,13 +946,33 @@ impl HostService {
         session_id: &SessionId,
         authority: &MutationAuthority,
     ) -> Result<StopAdmission, SatelleError> {
+        self.admit_stop_inner(session_id, None, authority)
+    }
+
+    pub fn admit_stop_expected_turn(
+        &self,
+        session_id: &SessionId,
+        expected_turn_id: &TurnId,
+        authority: &MutationAuthority,
+    ) -> Result<StopAdmission, SatelleError> {
+        self.admit_stop_inner(session_id, Some(expected_turn_id), authority)
+    }
+
+    fn admit_stop_inner(
+        &self,
+        session_id: &SessionId,
+        expected_turn_id: Option<&TurnId>,
+        authority: &MutationAuthority,
+    ) -> Result<StopAdmission, SatelleError> {
         let canonical_payload = canonical_payload(
             &CanonicalSessionStop {
                 operation: "session_stop",
                 session_id: session_id.as_str(),
+                expected_turn_id: expected_turn_id.map(TurnId::as_str),
             },
             STOP_IDEMPOTENCY_DIGEST_SCHEMA_VERSION,
         )?;
+        let _identity_gate = self.operation_capacity.lock_identity_read()?;
         let identity = self.runtime.authenticated_request_identity(
             &authority.principal,
             IdempotentOperation::Stop,
@@ -783,11 +995,16 @@ impl HostService {
                         })
                 },
                 || {
-                    self.runtime
-                        .stop_with_snapshot(StopCommand::with_identity(
+                    let command = match expected_turn_id {
+                        Some(turn_id) => StopCommand::for_turn_with_identity(
                             session_id.clone(),
+                            turn_id.clone(),
                             operation_identity,
-                        ))
+                        ),
+                        None => StopCommand::with_identity(session_id.clone(), operation_identity),
+                    };
+                    self.runtime
+                        .stop_with_snapshot(command)
                         .map(crate::operation_capacity::OperationOutcome::Stop)
                 },
             )?
@@ -884,6 +1101,66 @@ fn stop_admission(outcome: crate::runtime::RuntimeStopOutcome) -> StopAdmission 
     }
 }
 
+fn admission_cancellation_result(
+    outcome: AdmissionCancellationOutcome,
+) -> AdmissionCancellationResult {
+    match outcome {
+        AdmissionCancellationOutcome::Cancelled
+        | AdmissionCancellationOutcome::ReconciledCancelled => {
+            AdmissionCancellationResult::Cancelled
+        }
+        AdmissionCancellationOutcome::Admitted { session, turn_id } => {
+            AdmissionCancellationResult::Admitted { session, turn_id }
+        }
+        AdmissionCancellationOutcome::RecoveryPending => {
+            AdmissionCancellationResult::RecoveryPending
+        }
+    }
+}
+
+fn durable_cancellation_outcome(
+    outcome: &AdmissionCancellationOutcome,
+) -> crate::storage::DurableCancellationOutcome {
+    match outcome {
+        AdmissionCancellationOutcome::Cancelled
+        | AdmissionCancellationOutcome::ReconciledCancelled => {
+            crate::storage::DurableCancellationOutcome::Cancelled
+        }
+        AdmissionCancellationOutcome::RecoveryPending => {
+            crate::storage::DurableCancellationOutcome::RecoveryPending
+        }
+        AdmissionCancellationOutcome::Admitted { .. } => {
+            unreachable!("an admitted outcome is never persisted as a cancellation")
+        }
+    }
+}
+
+fn cancellation_is_reconciled(outcome: &AdmissionCancellationOutcome) -> bool {
+    matches!(outcome, AdmissionCancellationOutcome::ReconciledCancelled)
+}
+
+fn durable_admission_outcome(
+    state: crate::runtime::RuntimeAdmissionState,
+) -> crate::operation_capacity::DurableAdmissionOutcome {
+    match state {
+        crate::runtime::RuntimeAdmissionState::Missing => {
+            crate::operation_capacity::DurableAdmissionOutcome::Missing
+        }
+        crate::runtime::RuntimeAdmissionState::Cancelled => {
+            crate::operation_capacity::DurableAdmissionOutcome::Cancelled
+        }
+        crate::runtime::RuntimeAdmissionState::RecoveryPending => {
+            crate::operation_capacity::DurableAdmissionOutcome::RecoveryPending
+        }
+        crate::runtime::RuntimeAdmissionState::Admitted(replay) => {
+            let (session, turn_id) = replay.into_parts();
+            crate::operation_capacity::DurableAdmissionOutcome::Admitted(
+                crate::operation_capacity::OperationOutcome::admission(session, turn_id),
+            )
+        }
+    }
+}
+
 fn canonical_payload<T: Serialize>(
     value: &T,
     digest_schema_version: u16,
@@ -964,6 +1241,7 @@ mod tests {
             &CanonicalSessionStop {
                 operation: "session_stop",
                 session_id: "rs_01890a5d-ac96-7b7c-8f89-37c3d0a66e11",
+                expected_turn_id: None,
             },
             STOP_IDEMPOTENCY_DIGEST_SCHEMA_VERSION,
         )
@@ -977,6 +1255,28 @@ mod tests {
                 "payload": {
                     "operation": "session_stop",
                     "session_id": "rs_01890a5d-ac96-7b7c-8f89-37c3d0a66e11"
+                }
+            })
+        );
+        let guarded_stop = canonical_payload(
+            &CanonicalSessionStop {
+                operation: "session_stop",
+                session_id: "rs_01890a5d-ac96-7b7c-8f89-37c3d0a66e11",
+                expected_turn_id: Some("rt_01890a5d-ac96-7b7c-8f89-37c3d0a66e21"),
+            },
+            STOP_IDEMPOTENCY_DIGEST_SCHEMA_VERSION,
+        )
+        .expect("serialize guarded stop idempotency payload");
+        assert_ne!(stop.as_slice(), guarded_stop.as_slice());
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(guarded_stop.as_slice())
+                .expect("decode guarded stop payload"),
+            serde_json::json!({
+                "digest_schema_version": 1,
+                "payload": {
+                    "operation": "session_stop",
+                    "session_id": "rs_01890a5d-ac96-7b7c-8f89-37c3d0a66e11",
+                    "expected_turn_id": "rt_01890a5d-ac96-7b7c-8f89-37c3d0a66e21"
                 }
             })
         );

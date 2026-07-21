@@ -27,6 +27,7 @@ const DEADLOCK_GUARD_LIMIT: Duration = Duration::from_secs(30);
 const STABLE_DIGEST: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 const PRIVATE_UPSTREAM_THREAD_REF: &str = "PRIVATE_UPSTREAM_THREAD_REFERENCE_CANARY";
 const PRIVATE_UPSTREAM_TURN_REF: &str = "PRIVATE_UPSTREAM_TURN_REFERENCE_CANARY";
+const PRIVATE_UPSTREAM_GOAL_REF: &str = "PRIVATE_UPSTREAM_GOAL_REFERENCE_CANARY";
 
 fn latest_turn(session: &PublicSession) -> &PublicTurn {
     session
@@ -243,6 +244,91 @@ fn active_provider_probe_blocks_without_external_reconciliation() {
 }
 
 #[test]
+fn provider_probe_failure_before_dispatch_releases_control() {
+    let state = crate::TestStateDir::new().expect("temporary state directory should exist");
+    let adapter = ProviderProbeRecoveryAdapter::new([]).with_provider_dispatch_possible(false);
+    let runtime = RuntimeHandle::new_with_readiness_probe_driver(
+        Ok(state.path().to_path_buf()),
+        adapter.clone(),
+        adapter,
+    );
+    let provider_intent = ProviderComputerUseIntent::new(None, None, true, true);
+
+    runtime
+        .refresh_provider_smoke(LOCAL_DEMO_HOST, &provider_intent)
+        .expect_err("synthetic pre-dispatch provider failure must fail the probe");
+
+    let engine = runtime.engine().expect("runtime engine should be open");
+    let storage = engine.lock_storage().unwrap();
+    let status: String = storage
+        .connection_for_test()
+        .query_row("SELECT status FROM provider_smoke_results", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    let leases: i64 = storage
+        .connection_for_test()
+        .query_row(
+            "SELECT count(*) FROM control_leases WHERE owner_kind = 'provider_probe'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!("timed_out", status);
+    assert_eq!(0, leases);
+}
+
+#[test]
+fn native_probe_ordinary_failure_preserves_only_possible_dispatch() {
+    for (behavior, expected_status, expected_leases) in [
+        (
+            NativeProbeBehavior::FailedBeforeDispatch,
+            "timed_out",
+            0_i64,
+        ),
+        (
+            NativeProbeBehavior::FailedAfterDispatch,
+            "outcome_unknown",
+            1_i64,
+        ),
+    ] {
+        let state = crate::TestStateDir::new().expect("temporary state directory should exist");
+        let adapter = ProviderProbeRecoveryAdapter::with_native_results([], [behavior]);
+        let runtime = RuntimeHandle::new_with_readiness_probe_driver(
+            Ok(state.path().to_path_buf()),
+            adapter.clone(),
+            adapter,
+        );
+
+        runtime
+            .run(RunCommand::attached(
+                LOCAL_DEMO_HOST,
+                "classify ordinary native probe failure",
+            ))
+            .expect_err("synthetic native probe failure must block admission");
+
+        let engine = runtime.engine().expect("runtime engine should be open");
+        let storage = engine.lock_storage().unwrap();
+        let status: String = storage
+            .connection_for_test()
+            .query_row("SELECT status FROM native_readiness_results", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        let leases: i64 = storage
+            .connection_for_test()
+            .query_row(
+                "SELECT count(*) FROM control_leases WHERE owner_kind = 'native_probe'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(expected_status, status);
+        assert_eq!(expected_leases, leases);
+    }
+}
+
+#[test]
 fn confirmed_native_probe_timeout_is_terminal_and_releases_control() {
     let state = crate::TestStateDir::new().expect("temporary state directory should exist");
     let adapter = ProviderProbeRecoveryAdapter::with_native_results(
@@ -298,7 +384,7 @@ fn confirmed_native_probe_timeout_is_terminal_and_releases_control() {
 }
 
 #[test]
-fn native_probe_timeout_without_cancellation_detail_uses_typed_terminal_fallback() {
+fn native_probe_timeout_without_terminal_evidence_retains_recovery() {
     let state = crate::TestStateDir::new().expect("temporary state directory should exist");
     let adapter = ProviderProbeRecoveryAdapter::with_native_results(
         [],
@@ -315,7 +401,7 @@ fn native_probe_timeout_without_cancellation_detail_uses_typed_terminal_fallback
             LOCAL_DEMO_HOST,
             "native-timeout-without-cancellation-detail",
         ))
-        .expect_err("the typed timeout must terminate even without cancellation detail");
+        .expect_err("a dispatched timeout without terminal evidence must fail closed");
     assert_eq!(error.error().code, ErrorCode::NativeReadinessTimeout);
     assert!(
         !error
@@ -340,8 +426,8 @@ fn native_probe_timeout_without_cancellation_detail_uses_typed_terminal_fallback
             |row| row.get(0),
         )
         .unwrap();
-    assert_eq!("timed_out", status);
-    assert_eq!(0, leases);
+    assert_eq!("outcome_unknown", status);
+    assert_eq!(1, leases);
 }
 
 #[test]
@@ -575,6 +661,8 @@ fn adapter_persists_upstream_refs_before_waiting_and_stop_keeps_them_durable() {
         .expect("the thread canary must be a valid private reference");
     let expected_turn_ref = PrivateUpstreamRef::new(PRIVATE_UPSTREAM_TURN_REF)
         .expect("the Turn canary must be a valid private reference");
+    let expected_goal_ref = PrivateUpstreamRef::new(PRIVATE_UPSTREAM_GOAL_REF)
+        .expect("the Goal canary must be a valid private reference");
     let durable_subject = engine
         .lock_storage()
         .expect("lock runtime storage")
@@ -588,6 +676,10 @@ fn adapter_persists_upstream_refs_before_waiting_and_stop_keeps_them_durable() {
         durable_subject.upstream_turn_ref(),
         Some(&expected_turn_ref)
     );
+    assert_eq!(
+        durable_subject.upstream_goal_ref(),
+        Some(&expected_goal_ref)
+    );
     let public_session = runtime
         .status(session.session_id().clone())
         .expect("read public Session while execution is waiting");
@@ -599,7 +691,11 @@ fn adapter_persists_upstream_refs_before_waiting_and_stop_keeps_them_durable() {
     assert_privacy_canaries_absent(
         "Host runtime status and log projection",
         public_json.as_bytes(),
-        &[PRIVATE_UPSTREAM_THREAD_REF, PRIVATE_UPSTREAM_TURN_REF],
+        &[
+            PRIVATE_UPSTREAM_THREAD_REF,
+            PRIVATE_UPSTREAM_TURN_REF,
+            PRIVATE_UPSTREAM_GOAL_REF,
+        ],
     );
 
     let stopped = runtime
@@ -625,6 +721,7 @@ fn adapter_persists_upstream_refs_before_waiting_and_stop_keeps_them_durable() {
         Some(&expected_thread_ref)
     );
     assert_eq!(final_subject.upstream_turn_ref(), Some(&expected_turn_ref));
+    assert_eq!(final_subject.upstream_goal_ref(), Some(&expected_goal_ref));
 }
 
 #[test]
@@ -952,6 +1049,7 @@ struct ProviderProbeRecoveryAdapter {
     observation_calls: Arc<AtomicUsize>,
     native_results: Arc<Mutex<VecDeque<NativeProbeBehavior>>>,
     native_probe_calls: Arc<AtomicUsize>,
+    provider_dispatch_possible: Arc<AtomicBool>,
 }
 
 #[derive(Clone, Copy)]
@@ -960,6 +1058,8 @@ enum NativeProbeBehavior {
     TimedOutConfirmed,
     TimedOutUnknown,
     TimedOutWithoutCancellationDetail,
+    FailedBeforeDispatch,
+    FailedAfterDispatch,
 }
 
 impl ProviderProbeRecoveryAdapter {
@@ -969,6 +1069,7 @@ impl ProviderProbeRecoveryAdapter {
             observation_calls: Arc::new(AtomicUsize::new(0)),
             native_results: Arc::new(Mutex::new(VecDeque::new())),
             native_probe_calls: Arc::new(AtomicUsize::new(0)),
+            provider_dispatch_possible: Arc::new(AtomicBool::new(true)),
         }
     }
 
@@ -1015,6 +1116,12 @@ impl ProviderProbeRecoveryAdapter {
     fn readiness() -> ReadinessEvidence {
         Self::readiness_with_id("provider-probe-native-result")
     }
+
+    fn with_provider_dispatch_possible(self, possible: bool) -> Self {
+        self.provider_dispatch_possible
+            .store(possible, Ordering::SeqCst);
+        self
+    }
 }
 
 impl ComputerUseAdapter for ProviderProbeRecoveryAdapter {
@@ -1057,6 +1164,7 @@ impl ReadinessProbeDriver for ProviderProbeRecoveryAdapter {
     fn run_native_probe(
         &self,
         _key: &ReadinessCacheKey,
+        _cancellation: &super::AdmissionCancellation,
         persist_thread_ref: &mut dyn FnMut(&str) -> Result<(), ()>,
         persist_turn_ref: &mut dyn FnMut(&str) -> Result<(), ()>,
     ) -> NativeProbeResult {
@@ -1071,8 +1179,17 @@ impl ReadinessProbeDriver for ProviderProbeRecoveryAdapter {
         {
             NativeProbeBehavior::Passed => NativeProbeResult::Passed(evidence),
             behavior => {
-                persist_thread_ref(PRIVATE_UPSTREAM_THREAD_REF).unwrap();
-                persist_turn_ref(PRIVATE_UPSTREAM_TURN_REF).unwrap();
+                let dispatch_possible = matches!(
+                    behavior,
+                    NativeProbeBehavior::TimedOutConfirmed
+                        | NativeProbeBehavior::TimedOutUnknown
+                        | NativeProbeBehavior::TimedOutWithoutCancellationDetail
+                        | NativeProbeBehavior::FailedAfterDispatch
+                );
+                if dispatch_possible {
+                    persist_thread_ref(PRIVATE_UPSTREAM_THREAD_REF).unwrap();
+                    persist_turn_ref(PRIVATE_UPSTREAM_TURN_REF).unwrap();
+                }
                 let mut error = SatelleError::native_readiness_timeout();
                 error.details.insert(
                     "reason".to_string(),
@@ -1082,6 +1199,8 @@ impl ReadinessProbeDriver for ProviderProbeRecoveryAdapter {
                     NativeProbeBehavior::TimedOutConfirmed => Some("confirmed"),
                     NativeProbeBehavior::TimedOutUnknown => Some("outcome_unknown"),
                     NativeProbeBehavior::TimedOutWithoutCancellationDetail => None,
+                    NativeProbeBehavior::FailedBeforeDispatch
+                    | NativeProbeBehavior::FailedAfterDispatch => None,
                     NativeProbeBehavior::Passed => unreachable!(),
                 };
                 if let Some(cancellation) = cancellation {
@@ -1094,6 +1213,7 @@ impl ReadinessProbeDriver for ProviderProbeRecoveryAdapter {
                     evidence,
                     reason: "native_readiness_timed_out",
                     error,
+                    dispatch_possible,
                 }
             }
         }
@@ -1105,11 +1225,15 @@ impl ReadinessProbeDriver for ProviderProbeRecoveryAdapter {
         _cached: Option<ReadinessEvidence>,
         _cached_provider: Option<super::ProviderSmokeResult>,
         _provider_intent: &ProviderComputerUseIntent,
+        _cancellation: &super::AdmissionCancellation,
         persist_thread_ref: &mut dyn FnMut(&str) -> Result<(), ()>,
         persist_turn_ref: &mut dyn FnMut(&str) -> Result<(), ()>,
     ) -> AdapterPreflight {
-        persist_thread_ref(PRIVATE_UPSTREAM_THREAD_REF).unwrap();
-        persist_turn_ref(PRIVATE_UPSTREAM_TURN_REF).unwrap();
+        let dispatch_possible = self.provider_dispatch_possible.load(Ordering::SeqCst);
+        if dispatch_possible {
+            persist_thread_ref(PRIVATE_UPSTREAM_THREAD_REF).unwrap();
+            persist_turn_ref(PRIVATE_UPSTREAM_TURN_REF).unwrap();
+        }
         let key = Self::key();
         let readiness = Self::readiness();
         let now = time::OffsetDateTime::now_utc();
@@ -1129,9 +1253,15 @@ impl ReadinessProbeDriver for ProviderProbeRecoveryAdapter {
             source_detail: None,
             details: std::collections::BTreeMap::new(),
         };
+        if dispatch_possible {
+            error.details.insert(
+                "provider_smoke_cancellation".to_string(),
+                serde_json::Value::String("outcome_unknown".to_string()),
+            );
+        }
         error.details.insert(
-            "provider_smoke_cancellation".to_string(),
-            serde_json::Value::String("outcome_unknown".to_string()),
+            "probe_dispatch_possible".to_string(),
+            serde_json::Value::Bool(dispatch_possible),
         );
         AdapterPreflight::ProviderFailed {
             key,
@@ -1350,6 +1480,7 @@ impl super::ComputerUseAdapter for ReferencePersistingAdapter {
     ) -> Result<super::ExecuteResult, SatelleError> {
         request.persist_upstream_thread_ref(PRIVATE_UPSTREAM_THREAD_REF)?;
         request.persist_upstream_turn_ref(PRIVATE_UPSTREAM_TURN_REF)?;
+        request.persist_upstream_goal_ref(PRIVATE_UPSTREAM_GOAL_REF)?;
         self.references_recorded.signal();
         self.execute_release.wait();
         FakeComputerUseAdapter.execute(request)

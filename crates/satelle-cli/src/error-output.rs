@@ -261,6 +261,7 @@ fn error_contract(code: ErrorCode) -> ErrorContract {
         }
         ErrorCode::InvalidUsage
         | ErrorCode::EventsWithDetach
+        | ErrorCode::InterruptModeConflict
         | ErrorCode::OutputModeConflict
         | ErrorCode::LogTailLimitExceeded
         | ErrorCode::LogPositionConflict

@@ -166,10 +166,14 @@ impl Storage {
         &self,
         session_id: &SessionId,
         idempotency: &IdempotencyInput,
+        expected_turn_id: Option<&TurnId>,
     ) -> Result<StopAdmissionTarget, StorageError> {
         require_operation(idempotency, IdempotentOperation::Stop)?;
         if let Some(record) = matching_idempotency(&self.connection, idempotency)? {
             let turn_id = stop_record_turn_id(&record, session_id)?;
+            if expected_turn_id.is_some_and(|expected| expected != &turn_id) {
+                return Err(StorageError::new(StorageErrorKind::IdempotencyConflict));
+            }
             let session = load_required_session(&self.connection, session_id)?;
             let turn = session
                 .turn(&turn_id)
@@ -195,6 +199,9 @@ impl Storage {
             .turns()
             .last()
             .ok_or_else(|| StorageError::new(StorageErrorKind::InvalidStoredState))?;
+        if expected_turn_id.is_some_and(|expected| expected != turn.id()) {
+            return Err(StorageError::new(StorageErrorKind::StateConflict));
+        }
         Ok(StopAdmissionTarget {
             turn_id: turn.id().clone(),
             requires_control_plane: !turn.state().is_terminal(),

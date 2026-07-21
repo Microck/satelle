@@ -195,9 +195,10 @@ pub(super) fn insert_initial_session(
     }
     transaction
         .execute(
-            "INSERT INTO sessions (session_id, session_state_revision, created_at, updated_at) VALUES (?1, ?2, ?3, ?4)",
+            "INSERT INTO sessions (session_id, display_name, session_state_revision, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5)",
             params![
                 session.id().as_str(),
+                session.display_name(),
                 format_revision(session.session_state_revision()),
                 format_time(session.created_at())?,
                 format_time(session.updated_at())?,
@@ -368,6 +369,17 @@ pub(super) fn merge_observed_reference(
                        WHERE existing.turn_id <> ?2 AND existing.upstream_turn_ref = ?1 \
                    )",
                 params![turn_ref.0.as_str(), turn_id.as_str()],
+            ),
+        ObservedUpstreamRef::Goal(goal_ref) => transaction
+            .execute(
+                "UPDATE session_private_refs SET upstream_goal_ref = COALESCE(upstream_goal_ref, ?1) \
+                 WHERE session_id = ?2 \
+                   AND (upstream_goal_ref IS NULL OR upstream_goal_ref = ?1) \
+                   AND NOT EXISTS ( \
+                       SELECT 1 FROM session_private_refs AS existing \
+                       WHERE existing.session_id <> ?2 AND existing.upstream_goal_ref = ?1 \
+                   )",
+                params![goal_ref.0.as_str(), session_id.as_str()],
             ),
     }
     .map_err(|source| sqlite_error(StorageErrorKind::OperationFailed, source))?;
@@ -570,19 +582,20 @@ pub(super) fn load_recovery_subject(
     let turn = session
         .turn(turn_id)
         .ok_or_else(|| StorageError::new(StorageErrorKind::InvalidStoredState))?;
-    let (request_token, upstream_thread_ref, upstream_turn_ref): (
+    let (request_token, upstream_thread_ref, upstream_turn_ref, upstream_goal_ref): (
         String,
+        Option<String>,
         Option<String>,
         Option<String>,
     ) = connection
         .query_row(
-            "SELECT t.request_token, s.upstream_thread_ref, t.upstream_turn_ref \
+            "SELECT t.request_token, s.upstream_thread_ref, t.upstream_turn_ref, s.upstream_goal_ref \
              FROM turn_private_refs t \
              JOIN turns u ON u.turn_id = t.turn_id \
              JOIN session_private_refs s ON s.session_id = u.session_id \
              WHERE u.session_id = ?1 AND u.turn_id = ?2",
             params![session.id().as_str(), turn_id.as_str()],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
         )
         .map_err(|source| sqlite_error(StorageErrorKind::InvalidStoredState, source))?;
     Ok(RecoverySubject {
@@ -599,6 +612,7 @@ pub(super) fn load_recovery_subject(
             .map(PrivateUpstreamRef::new)
             .transpose()?,
         upstream_turn_ref: upstream_turn_ref.map(PrivateUpstreamRef::new).transpose()?,
+        upstream_goal_ref: upstream_goal_ref.map(PrivateUpstreamRef::new).transpose()?,
     })
 }
 

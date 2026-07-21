@@ -18,6 +18,7 @@ const TURN_3: &str = "rt_01890a5d-ac96-7b7c-8f89-37c3d0a66e23";
 
 mod atomicity;
 mod auth;
+mod cancellation;
 mod lifecycle;
 mod logs;
 mod operational;

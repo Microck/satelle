@@ -247,6 +247,11 @@ impl CodexSessionFailure {
     pub(crate) const fn turn_dispatch_attempted(self) -> bool {
         self.turn_dispatch_attempted
     }
+
+    #[cfg(test)]
+    pub(crate) const fn before_turn_dispatch_for_test(error: CodexSessionError) -> Self {
+        Self::before_turn_dispatch(error)
+    }
 }
 
 pub(crate) fn run_codex_session(
@@ -279,6 +284,7 @@ pub(crate) fn run_codex_session_with_timeout_cancellation(
     command: Command,
     mut request: CodexSessionRequest<'_>,
     cancellation_grace: Duration,
+    admission_cancellation: Option<crate::AdmissionCancellation>,
 ) -> TimedCodexSessionRun {
     let timeout_deadline = request.deadline;
     let cancellation_deadline = timeout_deadline
@@ -291,21 +297,39 @@ pub(crate) fn run_codex_session_with_timeout_cancellation(
     let (finished_sender, finished_receiver) = mpsc::channel();
     let cancellation_control = control.clone();
     let watchdog = std::thread::spawn(move || {
-        let remaining = timeout_deadline.saturating_duration_since(Instant::now());
-        match finished_receiver.recv_timeout(remaining) {
-            Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => None,
-            Err(mpsc::RecvTimeoutError::Timeout) => {
+        loop {
+            if admission_cancellation
+                .as_ref()
+                .is_some_and(crate::AdmissionCancellation::is_requested)
+            {
                 let observation = cancellation_control.interrupt();
                 if matches!(
                     observation,
                     StopObservation::CancellationConfirmed
                         | StopObservation::UpstreamInactiveConfirmed
                 ) {
-                    // The exchange deliberately waits for this acknowledgement
-                    // before releasing its contained app-server process group.
                     cancellation_control.stop_committed();
                 }
-                Some(observation)
+                return Some(observation);
+            }
+            let now = Instant::now();
+            if now >= timeout_deadline {
+                let observation = cancellation_control.interrupt();
+                if matches!(
+                    observation,
+                    StopObservation::CancellationConfirmed
+                        | StopObservation::UpstreamInactiveConfirmed
+                ) {
+                    cancellation_control.stop_committed();
+                }
+                return Some(observation);
+            }
+            let wait = timeout_deadline
+                .saturating_duration_since(now)
+                .min(CONTROL_POLL_INTERVAL);
+            match finished_receiver.recv_timeout(wait) {
+                Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => return None,
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
             }
         }
     });

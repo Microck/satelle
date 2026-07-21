@@ -39,7 +39,8 @@ struct ProviderSmokeAttemptFailure {
 
 struct NativeSmokeFailure {
     reason: &'static str,
-    error: SatelleError,
+    error: Box<SatelleError>,
+    dispatch_possible: bool,
 }
 
 struct ProviderProbePersistence<'a> {
@@ -209,6 +210,7 @@ impl ProductionComputerUseAdapter {
         .map_err(|_| adapter_failure("readiness_key_invalid"))
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn readiness_from_evidence(
         &self,
         key: &ReadinessCacheKey,
@@ -216,6 +218,7 @@ impl ProductionComputerUseAdapter {
         cached_provider: Option<ProviderSmokeResult>,
         refresh_provider: bool,
         provider_smoke_timeout: Option<Duration>,
+        cancellation: Option<&super::request::AdmissionCancellation>,
         persistence: &mut ProviderProbePersistence<'_>,
     ) -> AdapterPreflight {
         match self.run_required_provider_smoke(
@@ -223,6 +226,7 @@ impl ProductionComputerUseAdapter {
             cached_provider,
             refresh_provider,
             provider_smoke_timeout,
+            cancellation,
             persistence,
         ) {
             Ok(provider_smoke_evidence) => AdapterReadiness::ready(
@@ -261,6 +265,7 @@ impl ProductionComputerUseAdapter {
         cached_provider: Option<ProviderSmokeResult>,
         refresh_provider: bool,
         provider_smoke_timeout: Option<Duration>,
+        cancellation: Option<&super::request::AdmissionCancellation>,
         persistence: &mut ProviderProbePersistence<'_>,
     ) -> AdapterPreflight {
         let observed_at = time::OffsetDateTime::now_utc();
@@ -285,26 +290,29 @@ impl ProductionComputerUseAdapter {
             adapter = NATIVE_ADAPTER,
             "starting native Computer Use readiness smoke test"
         );
-        match self.run_native_smoke(&mut persist_thread_ref, &mut persist_turn_ref) {
+        match self.run_native_smoke(cancellation, &mut persist_thread_ref, &mut persist_turn_ref) {
             Ok(()) => self.readiness_from_evidence(
                 &key,
                 evidence,
                 cached_provider,
                 refresh_provider,
                 provider_smoke_timeout,
+                cancellation,
                 persistence,
             ),
             Err(failure) => AdapterPreflight::Failed {
                 key,
                 evidence,
                 reason: failure.reason,
-                error: failure.error,
+                error: mark_probe_dispatch_possible(*failure.error, failure.dispatch_possible),
+                dispatch_possible: failure.dispatch_possible,
             },
         }
     }
 
     fn run_native_smoke(
         &self,
+        cancellation: Option<&super::request::AdmissionCancellation>,
         persist_thread_ref: &mut dyn FnMut(&str) -> Result<(), ()>,
         persist_turn_ref: &mut dyn FnMut(&str) -> Result<(), ()>,
     ) -> Result<(), NativeSmokeFailure> {
@@ -343,18 +351,9 @@ impl ProductionComputerUseAdapter {
                 control: None,
             },
             READINESS_CANCELLATION_GRACE,
+            cancellation.cloned(),
         );
-        if let Some(observation) = run.cancellation {
-            return Err(native_readiness_timeout_after_cancellation(observation));
-        }
-        let terminal = run.result.map_err(|failure| {
-            let reason = match failure.error() {
-                CodexSessionError::Timeout => "native_readiness_timed_out",
-                CodexSessionError::Persistence => "native_readiness_persistence_failed",
-                _ => "native_readiness_session_failed",
-            };
-            native_smoke_failure(reason)
-        })?;
+        let terminal = classify_native_probe_run(run)?;
         if terminal != CodexSessionTerminal::Completed {
             return Err(native_smoke_failure("native_readiness_session_failed"));
         }
@@ -369,6 +368,7 @@ impl ProductionComputerUseAdapter {
         cached_provider: Option<ProviderSmokeResult>,
         refresh: bool,
         timeout_override: Option<Duration>,
+        cancellation: Option<&super::request::AdmissionCancellation>,
         persistence: &mut ProviderProbePersistence<'_>,
     ) -> Result<Option<ProviderSmokeEvidence>, ProviderSmokeAttemptFailure> {
         if key
@@ -395,7 +395,7 @@ impl ProductionComputerUseAdapter {
         } else {
             ProviderSmokeSource::Live
         };
-        self.run_live_provider_smoke(key, source, timeout_override, persistence)
+        self.run_live_provider_smoke(key, source, timeout_override, cancellation, persistence)
             .map(Some)
             .map_err(|error| {
                 let observed_at = time::OffsetDateTime::now_utc();
@@ -438,20 +438,25 @@ impl ProductionComputerUseAdapter {
         key: &ReadinessCacheKey,
         source: ProviderSmokeSource,
         timeout_override: Option<Duration>,
+        cancellation: Option<&super::request::AdmissionCancellation>,
         persistence: &mut ProviderProbePersistence<'_>,
     ) -> Result<ProviderSmokeEvidence, SatelleError> {
         let timeout = timeout_override.unwrap_or(self.provider_smoke_timeout);
         let probe = crate::provider_probe::ProviderProbeSurface::start(timeout)
-            .map_err(provider_smoke_failure)?;
+            .map_err(|error| mark_probe_dispatch_possible(provider_smoke_failure(error), false))?;
         let page_url = probe.page_url().to_string();
         let deadline = Instant::now().checked_add(timeout).ok_or_else(|| {
-            provider_smoke_failure(crate::provider_probe::ProviderProbeError::TimedOut)
+            mark_probe_dispatch_possible(
+                provider_smoke_failure(crate::provider_probe::ProviderProbeError::TimedOut),
+                false,
+            )
         })?;
         let working_directory = self
             .working_directory
             .as_ref()
             .map_err(Clone::clone)
-            .and_then(|path| prepare_working_directory(path))?;
+            .and_then(|path| prepare_working_directory(path))
+            .map_err(|error| mark_probe_dispatch_possible(error, false))?;
         let prompt = format!(
             "Use native Computer Use only to open {page_url} in the approved visible browser. Read the nonce shown on the page, drag the marker into the drop target, and stop. Do not use shell, file, or network tools."
         );
@@ -474,21 +479,18 @@ impl ProductionComputerUseAdapter {
                 control: None,
             },
             READINESS_CANCELLATION_GRACE,
+            cancellation.cloned(),
         );
-        if let Some(observation) = run.cancellation {
-            return Err(provider_smoke_timeout_after_cancellation(observation));
-        }
-        let terminal = run
-            .result
-            .map_err(|failure| provider_smoke_session_failure(failure.error()))?;
+        let terminal = classify_provider_probe_run(run)?;
         if terminal != CodexSessionTerminal::Completed {
-            return Err(provider_smoke_session_failure(
-                CodexSessionError::ResponseError,
+            return Err(mark_probe_dispatch_possible(
+                provider_smoke_session_failure(CodexSessionError::ResponseError),
+                false,
             ));
         }
         probe
             .wait_for_completion()
-            .map_err(provider_smoke_failure)?;
+            .map_err(|error| mark_probe_dispatch_possible(provider_smoke_failure(error), false))?;
 
         let observed_at = time::OffsetDateTime::now_utc();
         let expires_at = observed_at + self.provider_smoke_success_ttl;
@@ -608,6 +610,7 @@ impl ProductionComputerUseAdapter {
         provider_intent: &ProviderComputerUseIntent,
         cached: Option<ReadinessEvidence>,
         cached_provider: Option<ProviderSmokeResult>,
+        cancellation: Option<&super::request::AdmissionCancellation>,
         persistence: &mut ProviderProbePersistence<'_>,
     ) -> AdapterPreflight {
         let key = match self.native_readiness_key(provider_intent) {
@@ -623,6 +626,7 @@ impl ProductionComputerUseAdapter {
                 cached_provider,
                 provider_intent.refresh(),
                 provider_intent.provider_smoke_timeout(),
+                cancellation,
                 persistence,
             ),
             None => self.live_native_preflight(
@@ -630,6 +634,7 @@ impl ProductionComputerUseAdapter {
                 cached_provider,
                 provider_intent.refresh(),
                 provider_intent.provider_smoke_timeout(),
+                cancellation,
                 persistence,
             ),
         }
@@ -754,8 +759,36 @@ fn native_readiness_failure(reason: &'static str) -> SatelleError {
 fn native_smoke_failure(reason: &'static str) -> NativeSmokeFailure {
     NativeSmokeFailure {
         reason,
-        error: native_readiness_failure(reason),
+        error: Box::new(native_readiness_failure(reason)),
+        dispatch_possible: false,
     }
+}
+
+fn native_smoke_session_failure(failure: CodexSessionFailure) -> NativeSmokeFailure {
+    let reason = match failure.error() {
+        CodexSessionError::Timeout => "native_readiness_timed_out",
+        CodexSessionError::Persistence => "native_readiness_persistence_failed",
+        _ => "native_readiness_session_failed",
+    };
+    NativeSmokeFailure {
+        reason,
+        error: Box::new(native_readiness_failure(reason)),
+        dispatch_possible: failure.turn_dispatch_attempted(),
+    }
+}
+
+fn classify_native_probe_run(
+    run: crate::codex_session::TimedCodexSessionRun,
+) -> Result<CodexSessionTerminal, NativeSmokeFailure> {
+    if let Err(failure) = &run.result
+        && !failure.turn_dispatch_attempted()
+    {
+        return Err(native_smoke_session_failure(*failure));
+    }
+    if let Some(observation) = run.cancellation {
+        return Err(native_readiness_timeout_after_cancellation(observation));
+    }
+    run.result.map_err(native_smoke_session_failure)
 }
 
 fn native_readiness_timeout_after_cancellation(observation: StopObservation) -> NativeSmokeFailure {
@@ -775,7 +808,60 @@ fn native_readiness_timeout_after_cancellation(observation: StopObservation) -> 
         "native_readiness_cancellation".to_string(),
         Value::String(cancellation.to_string()),
     );
-    NativeSmokeFailure { reason, error }
+    NativeSmokeFailure {
+        reason,
+        error: Box::new(error),
+        dispatch_possible: true,
+    }
+}
+
+fn mark_probe_dispatch_possible(mut error: SatelleError, possible: bool) -> SatelleError {
+    error
+        .details
+        .insert("probe_dispatch_possible".to_string(), Value::Bool(possible));
+    error
+}
+
+fn probe_dispatch_possible(error: &SatelleError) -> bool {
+    error
+        .details
+        .get("probe_dispatch_possible")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+}
+
+fn probe_cancellation_observation(
+    dispatch_possible: bool,
+    error: &SatelleError,
+    cancellation_detail: &str,
+) -> StopObservation {
+    if dispatch_possible {
+        stop_observation_from_detail(error, cancellation_detail)
+    } else {
+        StopObservation::UpstreamInactiveConfirmed
+    }
+}
+
+fn preflight_cancellation_observation(result: &AdapterPreflight) -> StopObservation {
+    match result {
+        AdapterPreflight::ProviderFailed { error, .. }
+        | AdapterPreflight::UncachedFailure(error) => probe_cancellation_observation(
+            probe_dispatch_possible(error),
+            error,
+            "provider_smoke_cancellation",
+        ),
+        AdapterPreflight::Failed {
+            error,
+            dispatch_possible,
+            ..
+        } => probe_cancellation_observation(
+            *dispatch_possible,
+            error,
+            "native_readiness_cancellation",
+        ),
+        AdapterPreflight::Cancelled(observation) => *observation,
+        AdapterPreflight::Ready(_) => StopObservation::UpstreamInactiveConfirmed,
+    }
 }
 
 fn provider_smoke_session_failure(error: CodexSessionError) -> SatelleError {
@@ -836,6 +922,27 @@ fn provider_smoke_session_failure(error: CodexSessionError) -> SatelleError {
     provider_smoke_error(code, reason)
 }
 
+fn provider_probe_session_failure(failure: CodexSessionFailure) -> SatelleError {
+    mark_probe_dispatch_possible(
+        provider_smoke_session_failure(failure.error()),
+        failure.turn_dispatch_attempted(),
+    )
+}
+
+fn classify_provider_probe_run(
+    run: crate::codex_session::TimedCodexSessionRun,
+) -> Result<CodexSessionTerminal, SatelleError> {
+    if let Err(failure) = &run.result
+        && !failure.turn_dispatch_attempted()
+    {
+        return Err(provider_probe_session_failure(*failure));
+    }
+    if let Some(observation) = run.cancellation {
+        return Err(provider_smoke_timeout_after_cancellation(observation));
+    }
+    run.result.map_err(provider_probe_session_failure)
+}
+
 fn provider_smoke_timeout_after_cancellation(observation: StopObservation) -> SatelleError {
     let mut error = provider_smoke_session_failure(CodexSessionError::Timeout);
     let cancellation = match observation {
@@ -849,7 +956,7 @@ fn provider_smoke_timeout_after_cancellation(observation: StopObservation) -> Sa
         "provider_smoke_cancellation".to_string(),
         Value::String(cancellation.to_string()),
     );
-    error
+    mark_probe_dispatch_possible(error, true)
 }
 
 fn provider_smoke_failure(error: crate::provider_probe::ProviderProbeError) -> SatelleError {
@@ -990,7 +1097,13 @@ impl ComputerUseAdapter for ProductionComputerUseAdapter {
             persist_thread_ref: &mut persist_thread_ref,
             persist_turn_ref: &mut persist_turn_ref,
         };
-        self.preflight_terminal_inner(provider_intent, cached, cached_provider, &mut persistence)
+        self.preflight_terminal_inner(
+            provider_intent,
+            cached,
+            cached_provider,
+            None,
+            &mut persistence,
+        )
     }
 
     fn execute(&self, request: ExecuteRequest<'_>) -> Result<ExecuteResult, SatelleError> {
@@ -1085,6 +1198,7 @@ impl ReadinessProbeDriver for ProductionComputerUseAdapter {
     fn run_native_probe(
         &self,
         key: &ReadinessCacheKey,
+        cancellation: &super::request::AdmissionCancellation,
         persist_thread_ref: &mut dyn FnMut(&str) -> Result<(), ()>,
         persist_turn_ref: &mut dyn FnMut(&str) -> Result<(), ()>,
     ) -> NativeProbeResult {
@@ -1104,12 +1218,21 @@ impl ReadinessProbeDriver for ProductionComputerUseAdapter {
                 ));
             }
         };
-        match self.run_native_smoke(persist_thread_ref, persist_turn_ref) {
+        match self.run_native_smoke(Some(cancellation), persist_thread_ref, persist_turn_ref) {
             Ok(()) => NativeProbeResult::Passed(evidence),
+            Err(failure) if cancellation.is_requested() => {
+                let observation = probe_cancellation_observation(
+                    failure.dispatch_possible,
+                    &failure.error,
+                    "native_readiness_cancellation",
+                );
+                NativeProbeResult::Cancelled(observation)
+            }
             Err(failure) => NativeProbeResult::Failed {
                 evidence,
                 reason: failure.reason,
-                error: failure.error,
+                error: *failure.error,
+                dispatch_possible: failure.dispatch_possible,
             },
         }
     }
@@ -1120,6 +1243,7 @@ impl ReadinessProbeDriver for ProductionComputerUseAdapter {
         cached: Option<ReadinessEvidence>,
         cached_provider: Option<ProviderSmokeResult>,
         provider_intent: &ProviderComputerUseIntent,
+        cancellation: &super::request::AdmissionCancellation,
         persist_thread_ref: &mut dyn FnMut(&str) -> Result<(), ()>,
         persist_turn_ref: &mut dyn FnMut(&str) -> Result<(), ()>,
     ) -> AdapterPreflight {
@@ -1127,7 +1251,18 @@ impl ReadinessProbeDriver for ProductionComputerUseAdapter {
             persist_thread_ref,
             persist_turn_ref,
         };
-        self.preflight_terminal_inner(provider_intent, cached, cached_provider, &mut persistence)
+        let result = self.preflight_terminal_inner(
+            provider_intent,
+            cached,
+            cached_provider,
+            Some(cancellation),
+            &mut persistence,
+        );
+        if cancellation.is_requested() {
+            AdapterPreflight::Cancelled(preflight_cancellation_observation(&result))
+        } else {
+            result
+        }
     }
 
     fn observe_readiness_probe(
@@ -1161,6 +1296,15 @@ fn stop_observation(
             CodexTurnStatus::Completed | CodexTurnStatus::Interrupted | CodexTurnStatus::Failed,
         ) => StopObservation::UpstreamInactiveConfirmed,
         None => StopObservation::OutcomeUnknown,
+    }
+}
+
+fn stop_observation_from_detail(error: &SatelleError, field: &str) -> StopObservation {
+    match error.details.get(field).and_then(Value::as_str) {
+        Some("confirmed") => StopObservation::CancellationConfirmed,
+        Some("upstream_still_active") => StopObservation::UpstreamStillActive,
+        Some("outcome_unknown") | None => StopObservation::OutcomeUnknown,
+        Some(_) => StopObservation::OutcomeUnknown,
     }
 }
 
@@ -1324,6 +1468,40 @@ mod tests {
     use super::*;
 
     #[test]
+    fn native_probe_pre_dispatch_result_wins_simultaneous_watchdog_cancellation() {
+        let failure = classify_native_probe_run(crate::codex_session::TimedCodexSessionRun {
+            result: Err(CodexSessionFailure::before_turn_dispatch_for_test(
+                CodexSessionError::Persistence,
+            )),
+            cancellation: Some(StopObservation::OutcomeUnknown),
+        })
+        .expect_err("known pre-dispatch failure must win the watchdog race");
+
+        assert_eq!(failure.reason, "native_readiness_persistence_failed");
+        assert!(!failure.dispatch_possible);
+    }
+
+    #[test]
+    fn provider_probe_pre_dispatch_result_wins_simultaneous_watchdog_cancellation() {
+        let failure = classify_provider_probe_run(crate::codex_session::TimedCodexSessionRun {
+            result: Err(CodexSessionFailure::before_turn_dispatch_for_test(
+                CodexSessionError::Persistence,
+            )),
+            cancellation: Some(StopObservation::OutcomeUnknown),
+        })
+        .expect_err("known pre-dispatch failure must win the watchdog race");
+
+        assert_eq!(
+            failure.details["probe_dispatch_possible"],
+            serde_json::Value::Bool(false)
+        );
+        assert!(
+            !failure.details.contains_key("provider_smoke_cancellation"),
+            "the unconfirmed watchdog observation must not replace terminal startup evidence"
+        );
+    }
+
+    #[test]
     fn control_plane_failure_precedes_execution_readiness_for_run_and_steer() {
         let evidence = crate::codex_capabilities::Phase0CapabilityEvidence {
             codex_version: crate::codex_capabilities::CodexVersionEvidence::Detected {
@@ -1480,6 +1658,147 @@ mod tests {
     }
 
     #[test]
+    fn probe_cancellation_distinguishes_prelaunch_and_postdispatch_failures() {
+        let native_prelaunch = native_smoke_session_failure(CodexSessionFailure::after_exchange(
+            CodexSessionError::Spawn,
+            false,
+        ));
+        assert_eq!(
+            probe_cancellation_observation(
+                native_prelaunch.dispatch_possible,
+                &native_prelaunch.error,
+                "native_readiness_cancellation",
+            ),
+            StopObservation::UpstreamInactiveConfirmed
+        );
+
+        let native_postdispatch = native_smoke_session_failure(
+            CodexSessionFailure::after_exchange(CodexSessionError::Write, true),
+        );
+        assert_eq!(
+            probe_cancellation_observation(
+                native_postdispatch.dispatch_possible,
+                &native_postdispatch.error,
+                "native_readiness_cancellation",
+            ),
+            StopObservation::OutcomeUnknown
+        );
+
+        let provider_prelaunch = provider_probe_session_failure(
+            CodexSessionFailure::after_exchange(CodexSessionError::Spawn, false),
+        );
+        assert_eq!(
+            probe_cancellation_observation(
+                probe_dispatch_possible(&provider_prelaunch),
+                &provider_prelaunch,
+                "provider_smoke_cancellation",
+            ),
+            StopObservation::UpstreamInactiveConfirmed
+        );
+
+        let provider_postdispatch = provider_probe_session_failure(
+            CodexSessionFailure::after_exchange(CodexSessionError::Write, true),
+        );
+        assert_eq!(
+            probe_cancellation_observation(
+                probe_dispatch_possible(&provider_postdispatch),
+                &provider_postdispatch,
+                "provider_smoke_cancellation",
+            ),
+            StopObservation::OutcomeUnknown
+        );
+
+        let native_cancelled_before_dispatch =
+            native_readiness_timeout_after_cancellation(StopObservation::UpstreamInactiveConfirmed);
+        assert_eq!(
+            probe_cancellation_observation(
+                native_cancelled_before_dispatch.dispatch_possible,
+                &native_cancelled_before_dispatch.error,
+                "native_readiness_cancellation",
+            ),
+            StopObservation::CancellationConfirmed
+        );
+        let native_cancelled_after_dispatch =
+            native_readiness_timeout_after_cancellation(StopObservation::OutcomeUnknown);
+        assert_eq!(
+            probe_cancellation_observation(
+                native_cancelled_after_dispatch.dispatch_possible,
+                &native_cancelled_after_dispatch.error,
+                "native_readiness_cancellation",
+            ),
+            StopObservation::OutcomeUnknown
+        );
+
+        let provider_cancelled_before_dispatch =
+            provider_smoke_timeout_after_cancellation(StopObservation::UpstreamInactiveConfirmed);
+        assert_eq!(
+            probe_cancellation_observation(
+                probe_dispatch_possible(&provider_cancelled_before_dispatch),
+                &provider_cancelled_before_dispatch,
+                "provider_smoke_cancellation",
+            ),
+            StopObservation::CancellationConfirmed
+        );
+        let provider_cancelled_after_dispatch =
+            provider_smoke_timeout_after_cancellation(StopObservation::OutcomeUnknown);
+        assert_eq!(
+            probe_cancellation_observation(
+                probe_dispatch_possible(&provider_cancelled_after_dispatch),
+                &provider_cancelled_after_dispatch,
+                "provider_smoke_cancellation",
+            ),
+            StopObservation::OutcomeUnknown
+        );
+    }
+
+    #[test]
+    fn cancelled_native_preflight_uses_native_terminal_detail() {
+        let desktop_binding = DesktopBindingRef::new("desktop-native-cancellation").unwrap();
+        let policy = ExecutionPolicy::new(
+            EffectiveModelRef::new("model-native-cancellation").unwrap(),
+            ProviderBindingRef::new("provider-native-cancellation").unwrap(),
+            DesktopTarget::new(desktop_binding.clone()),
+            ApprovalPolicy::OnRequest,
+            SandboxPolicy::WorkspaceWrite,
+            TimeoutPolicy::bounded_seconds(120).unwrap(),
+            ExperimentalFeatureChoices::new(FeatureChoice::Enabled, FeatureChoice::Enabled),
+        );
+        let key = ReadinessCacheKey::new(
+            NATIVE_ADAPTER,
+            desktop_binding,
+            policy,
+            "0.144.0",
+            "codex-native-0.144.0",
+            None::<String>,
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        )
+        .unwrap();
+        let observed_at = time::OffsetDateTime::UNIX_EPOCH;
+        let evidence = key
+            .evidence(
+                "native-readiness-cancelled",
+                observed_at,
+                observed_at + time::Duration::hours(24),
+            )
+            .unwrap();
+        let failure =
+            native_readiness_timeout_after_cancellation(StopObservation::CancellationConfirmed);
+        let result = AdapterPreflight::Failed {
+            key,
+            evidence,
+            reason: failure.reason,
+            error: mark_probe_dispatch_possible(*failure.error, failure.dispatch_possible),
+            dispatch_possible: failure.dispatch_possible,
+        };
+
+        assert_eq!(
+            preflight_cancellation_observation(&result),
+            StopObservation::CancellationConfirmed
+        );
+    }
+
+    #[test]
     fn matching_provider_smoke_results_skip_or_block_without_a_live_probe() {
         let adapter = ProductionComputerUseAdapter::new(
             Arc::new(RwLock::new(crate::ProductionCapabilitySnapshot::collect(
@@ -1531,6 +1850,7 @@ mod tests {
                     Some(ProviderSmokeResult::Passed(provider.clone())),
                     false,
                     None,
+                    None,
                     &mut persistence,
                 )
                 .unwrap(),
@@ -1552,6 +1872,7 @@ mod tests {
                 &key,
                 Some(ProviderSmokeResult::Failed(provider_failure.clone())),
                 false,
+                None,
                 None,
                 &mut persistence,
             )
@@ -1746,6 +2067,32 @@ mod tests {
             persisted_before_dispatch.transition(),
             Some(TurnTransition::Failed)
         );
+    }
+
+    #[test]
+    fn readiness_failures_use_codex_dispatch_attempt_consistently() {
+        for attempted in [false, true] {
+            let failure =
+                CodexSessionFailure::after_exchange(CodexSessionError::PrematureExit, attempted);
+            assert_eq!(
+                native_smoke_session_failure(failure).dispatch_possible,
+                attempted
+            );
+            assert_eq!(
+                probe_dispatch_possible(&provider_probe_session_failure(failure)),
+                attempted
+            );
+        }
+
+        assert!(
+            !native_smoke_failure("native_readiness_action_not_observed").dispatch_possible,
+            "terminal native smoke evidence must not retain possible upstream dispatch"
+        );
+        let terminal_provider = mark_probe_dispatch_possible(
+            provider_smoke_session_failure(CodexSessionError::ResponseError),
+            false,
+        );
+        assert!(!probe_dispatch_possible(&terminal_provider));
     }
 
     #[test]

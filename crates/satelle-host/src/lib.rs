@@ -31,8 +31,9 @@ use codex_capabilities::{
     RequiredCapability, discover_phase0, evaluate_phase0_support,
 };
 pub use daemon::{
-    DaemonActivitySnapshot, DaemonRuntimeCapabilities, DaemonRuntimeStatus, DaemonSessionReconnect,
-    MutationAuthority, MutationAuthorityError, StopAdmission, TurnIntent, TurnIntentError,
+    AdmissionCancellationResult, DaemonActivitySnapshot, DaemonRuntimeCapabilities,
+    DaemonRuntimeStatus, DaemonSessionReconnect, MutationAuthority, MutationAuthorityError,
+    StopAdmission, TurnIntent, TurnIntentError,
 };
 pub use live_events::{LiveEventReceiveError, LiveEventSubscription};
 pub use log_page::{
@@ -41,10 +42,11 @@ pub use log_page::{
 };
 use operation_capacity::OperationCapacity;
 pub use runtime::{
-    AdapterPreflight, AdapterReadiness, AdapterSubject, ComputerUseAdapter, EvidenceError,
-    ExecuteRequest, ExecuteResult, MaintenanceOperationHandle, ProviderComputerUseIntent,
-    ProviderSmokeEvidence, ProviderSmokeFailureEvidence, ProviderSmokeResult, ProviderSmokeSource,
-    ReadinessCacheKey, ReadinessEvidence, RecoveryObservation,
+    AdapterPreflight, AdapterReadiness, AdapterSubject, AdmissionCancellation, ComputerUseAdapter,
+    EvidenceError, ExecuteRequest, ExecuteResult, MaintenanceOperationHandle,
+    ProviderComputerUseIntent, ProviderSmokeEvidence, ProviderSmokeFailureEvidence,
+    ProviderSmokeResult, ProviderSmokeSource, ReadinessCacheKey, ReadinessEvidence,
+    RecoveryObservation,
 };
 use runtime::{ProductionComputerUseAdapter, RunCommand, RuntimeHandle, SteerCommand, StopCommand};
 use satelle_core::session::{PublicSession, TurnAdmissionFailure};
@@ -52,7 +54,8 @@ use satelle_core::{
     DaemonPathOverrides, DoctorFinding, DoctorFixability, DoctorOptions, DoctorProbeResult,
     DoctorReport, DoctorSchemaVersion, DoctorSummary, HostConfig, HostSessionsReport,
     HostSessionsSchemaVersion, LOCAL_DEMO_HOST, SatelleError, SatelleEvent, SessionId,
-    SetupReadinessSummary, SetupReport, SetupSchemaVersion, StopResult, object_value, utc_now,
+    SetupReadinessSummary, SetupReport, SetupSchemaVersion, StopResult, TurnId, object_value,
+    utc_now,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -536,6 +539,22 @@ impl HostService {
             .map(crate::runtime::RuntimeTurnOutcome::into_command_outcome)
     }
 
+    pub fn run_with_cancellation(
+        &self,
+        host: &str,
+        intent: &TurnIntent,
+        cancellation: AdmissionCancellation,
+    ) -> Result<TurnOutcome, TurnAdmissionFailure> {
+        self.runtime
+            .run(
+                RunCommand::attached(host, intent.prompt())
+                    .with_execution_mode(intent.execution_mode())
+                    .with_provider_intent(intent.provider_intent().clone())
+                    .with_cancellation(cancellation),
+            )
+            .map(crate::runtime::RuntimeTurnOutcome::into_command_outcome)
+    }
+
     pub fn run_detached(
         &self,
         host: &str,
@@ -546,6 +565,22 @@ impl HostService {
                 RunCommand::detached(host, intent.prompt())
                     .with_execution_mode(intent.execution_mode())
                     .with_provider_intent(intent.provider_intent().clone()),
+            ),
+        )
+    }
+
+    pub fn run_detached_with_cancellation(
+        &self,
+        host: &str,
+        intent: &TurnIntent,
+        cancellation: AdmissionCancellation,
+    ) -> Result<PublicSession, SatelleError> {
+        crate::runtime::admitted_session(
+            self.runtime.run(
+                RunCommand::detached(host, intent.prompt())
+                    .with_execution_mode(intent.execution_mode())
+                    .with_provider_intent(intent.provider_intent().clone())
+                    .with_cancellation(cancellation),
             ),
         )
     }
@@ -564,6 +599,22 @@ impl HostService {
             .map(crate::runtime::RuntimeTurnOutcome::into_command_outcome)
     }
 
+    pub fn steer_with_cancellation(
+        &self,
+        session_id: &SessionId,
+        intent: &TurnIntent,
+        cancellation: AdmissionCancellation,
+    ) -> Result<TurnOutcome, TurnAdmissionFailure> {
+        self.runtime
+            .steer(
+                SteerCommand::attached(session_id.clone(), intent.prompt())
+                    .with_execution_mode(intent.execution_mode())
+                    .with_provider_intent(intent.provider_intent().clone())
+                    .with_cancellation(cancellation),
+            )
+            .map(crate::runtime::RuntimeTurnOutcome::into_command_outcome)
+    }
+
     pub fn steer_detached(
         &self,
         session_id: &SessionId,
@@ -578,12 +629,39 @@ impl HostService {
         )
     }
 
+    pub fn steer_detached_with_cancellation(
+        &self,
+        session_id: &SessionId,
+        intent: &TurnIntent,
+        cancellation: AdmissionCancellation,
+    ) -> Result<PublicSession, SatelleError> {
+        crate::runtime::admitted_session(
+            self.runtime.steer(
+                SteerCommand::detached(session_id.clone(), intent.prompt())
+                    .with_execution_mode(intent.execution_mode())
+                    .with_provider_intent(intent.provider_intent().clone())
+                    .with_cancellation(cancellation),
+            ),
+        )
+    }
+
     pub fn status(&self, session_id: &SessionId) -> Result<PublicSession, SatelleError> {
         self.runtime.status(session_id.clone())
     }
 
     pub fn stop(&self, session_id: &SessionId) -> Result<StopResult, SatelleError> {
         self.runtime.stop(StopCommand::new(session_id.clone()))
+    }
+
+    pub fn stop_expected_turn(
+        &self,
+        session_id: &SessionId,
+        expected_turn_id: &TurnId,
+    ) -> Result<StopResult, SatelleError> {
+        self.runtime.stop(StopCommand::for_turn(
+            session_id.clone(),
+            expected_turn_id.clone(),
+        ))
     }
 
     pub fn host_sessions(

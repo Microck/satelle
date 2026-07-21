@@ -151,6 +151,22 @@ fn required_method_set_is_exact_and_missing_capabilities_are_typed() {
 }
 
 #[test]
+fn unavailable_goal_methods_do_not_block_core_session_and_turn_control() {
+    let probe = run_fixture("required");
+
+    for operation in [
+        ControlPlaneOperation::Run,
+        ControlPlaneOperation::Steer,
+        ControlPlaneOperation::Stop,
+        ControlPlaneOperation::Status,
+    ] {
+        ControlPlaneAdmission::from_probe(probe)
+            .admit(operation)
+            .expect("optional goal methods must not gate core control");
+    }
+}
+
+#[test]
 fn recovery_requires_status_and_steering_capabilities() {
     let probe = run_fixture("missing-steering");
     let error = ControlPlaneAdmission::from_probe(probe)

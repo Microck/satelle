@@ -424,6 +424,7 @@ impl RuntimeEngine {
         let observed = match reference {
             UpstreamReference::Thread(value) => ObservedUpstreamRef::thread(value),
             UpstreamReference::Turn(value) => ObservedUpstreamRef::turn(value),
+            UpstreamReference::Goal(value) => ObservedUpstreamRef::goal(value),
         }
         .map_err(model::storage_failure)?;
         self.lock_storage()?

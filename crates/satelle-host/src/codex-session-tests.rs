@@ -633,6 +633,7 @@ fn timed_provider_exchange_requests_correlated_upstream_cancellation() {
             control: None,
         },
         Duration::from_secs(1),
+        None,
     );
 
     assert_eq!(

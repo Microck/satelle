@@ -30,6 +30,7 @@ pub(super) fn validated_private_reference(value: String) -> Result<String, Stora
 
 #[derive(Debug)]
 struct RawSessionRow {
+    display_name: Option<String>,
     revision: String,
     host_identity_ref: String,
     desktop_binding_ref: String,
@@ -99,17 +100,18 @@ fn load_session(
 ) -> Result<Option<Session>, StorageError> {
     let row = connection
         .query_row(
-            "SELECT s.session_state_revision, p.host_identity_ref, p.desktop_binding_ref, s.created_at, s.updated_at \
+            "SELECT s.display_name, s.session_state_revision, p.host_identity_ref, p.desktop_binding_ref, s.created_at, s.updated_at \
              FROM sessions s JOIN session_private_refs p ON p.session_id = s.session_id \
              WHERE s.session_id = ?1",
             [session_id.as_str()],
             |row| {
                 Ok(RawSessionRow {
-                    revision: row.get(0)?,
-                    host_identity_ref: row.get(1)?,
-                    desktop_binding_ref: row.get(2)?,
-                    created_at: row.get(3)?,
-                    updated_at: row.get(4)?,
+                    display_name: row.get(0)?,
+                    revision: row.get(1)?,
+                    host_identity_ref: row.get(2)?,
+                    desktop_binding_ref: row.get(3)?,
+                    created_at: row.get(4)?,
+                    updated_at: row.get(5)?,
                 })
             },
         )
@@ -167,8 +169,9 @@ fn load_session(
                 .and_then(parse_turn_row)
         })
         .collect::<Result<Vec<_>, _>>()?;
-    let snapshot = SessionSnapshot::new(
+    let snapshot = SessionSnapshot::new_with_display_name(
         session_id.clone(),
+        row.display_name,
         parse_session_revision(&row.revision)?,
         HostIdentityRef::new(row.host_identity_ref)
             .map_err(|_| StorageError::new(StorageErrorKind::InvalidStoredState))?,
