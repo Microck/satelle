@@ -501,6 +501,7 @@ struct RunCommand {
     host: Option<String>,
     #[arg(long)]
     detach: bool,
+    /// Leave an admitted Turn running when the attached command is interrupted
     #[arg(long)]
     detach_on_interrupt: bool,
     #[arg(long)]
@@ -542,6 +543,7 @@ struct SteerCommand {
     host: Option<String>,
     #[arg(long)]
     detach: bool,
+    /// Leave an admitted Turn running when the attached command is interrupted
     #[arg(long)]
     detach_on_interrupt: bool,
     #[arg(long)]
