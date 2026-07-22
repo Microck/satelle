@@ -591,7 +591,12 @@ fn persisted_pending_setup_token_self_activates_on_the_running_daemon() {
         })
     ));
 
-    let verification = verify_durable_setup_token(
+    assert_eq!(
+        inspect_durable_setup_token(&pending_client, interrupted_id.as_str())
+            .expect("inspect the persisted pending token"),
+        ExistingTokenInspection::RequiresActivation
+    );
+    let verification = activate_durable_setup_token(
         &pending_client,
         interrupted_id.clone(),
         "interrupted-setup-activate",
@@ -670,13 +675,9 @@ fn durable_verification_and_bootstrap_handoff_use_distinct_clients() {
     let durable_client = DaemonClient::loopback(address, durable_token, &host_identity)
         .expect("construct durable verification client");
 
-    let verification = verify_durable_setup_token(
-        &durable_client,
-        durable_token_id,
-        "verify-distinct-client-authority",
-    )
-    .expect("durable client verifies its durable credential");
-    assert_eq!(verification, ExistingTokenVerification::Reusable);
+    let inspection = inspect_durable_setup_token(&durable_client, durable_token_id.as_str())
+        .expect("durable client verifies its durable credential");
+    assert_eq!(inspection, ExistingTokenInspection::Reusable);
 
     let durable_handoff_error = durable_client
         .begin_bootstrap_maintenance("distinct-client-handoff", "missing_daemon_repair")
@@ -793,20 +794,31 @@ fn reusable_setup_token_keeps_the_healthy_durable_daemon_running_without_bootstr
 
 #[cfg(unix)]
 #[test]
-fn rejected_durable_setup_token_enters_the_bootstrap_handoff_path() {
+fn authentication_rejected_by_live_daemon_enters_bootstrap_fallback() {
     with_bootstrap_handoff_test_context(|bootstrap_client, fake_ssh| {
+        let state = TestStateDir::new().expect("temporary durable state directory");
+        let service = HostService::local_demo_for_tests_at(state.path())
+            .expect("construct durable Host service");
+        let initialized = service.initialize_daemon().expect("initialize Host state");
+        let host_identity = initialized.host_identity().to_string();
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .expect("construct daemon runtime");
+        let server = runtime
+            .block_on(DaemonServer::bind(
+                service,
+                DaemonServerConfig::loopback(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))),
+            ))
+            .expect("bind loopback daemon");
+        let unissued_token = ApiBearerToken::generate().expect("generate valid unissued token");
+        let unissued_token_id = unissued_token.token_id().to_string();
+        let unissued_client =
+            DaemonClient::loopback(server.local_addr(), unissued_token, &host_identity)
+                .expect("construct unissued-token client");
         let transport =
             SshSetupTransport::new(&ssh_setup_host(None)).expect("construct SSH setup transport");
-        let unavailable_address = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
-            .expect("reserve unavailable durable daemon address")
-            .local_addr()
-            .expect("read unavailable durable daemon address");
-        let unavailable_durable_client = DaemonClient::loopback(
-            unavailable_address,
-            ApiBearerToken::generate().expect("generate unavailable durable token"),
-            "unavailable-durable-host-identity",
-        )
-        .expect("construct unavailable durable client");
         let mut bootstrap_lock = acquire_bootstrap_lock_for_operation_with_ssh(
             "bootstrap-required-host",
             "fake-ssh-host",
@@ -819,8 +831,8 @@ fn rejected_durable_setup_token_enters_the_bootstrap_handoff_path() {
 
         let verification = transport
             .verify_existing_token_with_bootstrap_fallback(
-                &unavailable_durable_client,
-                "not-the-bootstrap-token-id",
+                &unissued_client,
+                unissued_token_id.as_str(),
                 "reject-bootstrap-token-as-durable",
                 &mut bootstrap_lock,
                 |bootstrap_lock| {
@@ -834,24 +846,93 @@ fn rejected_durable_setup_token_enters_the_bootstrap_handoff_path() {
                         bootstrap_client,
                         bootstrap_lock,
                     )?;
-                    Ok(ExistingTokenVerification::AuthenticationRejected {
-                        token_id: "not-the-bootstrap-token-id".to_string(),
-                    })
+                    Ok(ExistingTokenVerification::Reusable)
                 },
             )
             .expect("enter bootstrap after durable authentication rejection");
 
-        assert!(matches!(
-            verification,
-            ExistingTokenVerification::AuthenticationRejected { token_id }
-                if token_id == "not-the-bootstrap-token-id"
-        ));
+        assert_eq!(verification, ExistingTokenVerification::Reusable);
         assert!(bootstrap_called.load(Ordering::SeqCst));
+        let durable_commit = format!(
+            "{} durable_token_verification ",
+            bootstrap_lock::MUTATION_COMMITTED
+        );
+        assert!(
+            bootstrap_lock
+                .exchanged_lock_lines()
+                .iter()
+                .any(|line| line.starts_with(&durable_commit)),
+            "the live daemon's explicit rejection must close the activation attempt"
+        );
         assert!(
             bootstrap_lock
                 .exchanged_lock_lines()
                 .iter()
                 .any(|line| line.contains("maintenance_handoff_complete"))
+        );
+        bootstrap_lock
+            .release_committed_handoff()
+            .expect("release the completed bootstrap handoff");
+
+        drop(server);
+    });
+}
+
+#[cfg(unix)]
+#[test]
+fn durable_confirmation_transport_failure_falls_back_without_open_mutation() {
+    with_bootstrap_handoff_test_context(|bootstrap_client, fake_ssh| {
+        let transport =
+            SshSetupTransport::new(&ssh_setup_host(None)).expect("construct SSH setup transport");
+        let unavailable_listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .expect("reserve unavailable durable daemon address");
+        let unavailable_address = unavailable_listener
+            .local_addr()
+            .expect("read unavailable durable daemon address");
+        drop(unavailable_listener);
+        let unavailable_durable_client = DaemonClient::loopback_with_timeout(
+            unavailable_address,
+            ApiBearerToken::generate().expect("generate unavailable durable token"),
+            "unavailable-durable-host-identity",
+            Duration::from_secs(1),
+        )
+        .expect("construct unavailable durable client");
+        let mut bootstrap_lock = acquire_bootstrap_lock_for_operation_with_ssh(
+            "transport-fallback-host",
+            "fake-ssh-host",
+            "bootstrap-after-durable-transport".to_string(),
+            bootstrap_lock::OperationKind::InitialSetup,
+            fake_ssh,
+        )
+        .expect("acquire setup lock");
+
+        let verification = transport
+            .verify_existing_token_with_bootstrap_fallback(
+                &unavailable_durable_client,
+                "unavailable-durable-token-id",
+                "transport-bootstrap-token",
+                &mut bootstrap_lock,
+                |bootstrap_lock| {
+                    bootstrap_lock
+                        .mark_mutation_started("daemon_start")
+                        .map_err(|_| SatelleError::host_unreachable("transport-fallback-host"))?;
+                    commit_verified_bootstrap_mutation("transport-fallback-host", bootstrap_lock)?;
+                    complete_bootstrap_handoff(
+                        "transport-fallback-host",
+                        bootstrap_client,
+                        bootstrap_lock,
+                    )?;
+                    Ok(ExistingTokenVerification::Reusable)
+                },
+            )
+            .expect("enter bootstrap after read-only durable transport failure");
+
+        assert_eq!(verification, ExistingTokenVerification::Reusable);
+        assert!(
+            bootstrap_lock
+                .exchanged_lock_lines()
+                .iter()
+                .all(|line| { !line.contains("durable_token_verification") })
         );
         bootstrap_lock
             .release_committed_handoff()
@@ -1116,12 +1197,23 @@ fn committed_prior_mutation_recovers_after_controller_loss_for_both_phase_shapes
             commit_verified_bootstrap_mutation("prior-commit-recovery-host", &mut bootstrap_lock)
                 .expect("commit the verified prior mutation");
             if phase == "daemon_start" {
-                let former_post_launch_failure =
-                    Err::<(), _>(SatelleError::host_unreachable("prior-commit-recovery-host"));
-                assert!(
-                    former_post_launch_failure.is_err(),
-                    "fallible tunnel, client, or token work may fail after launch readiness"
-                );
+                let unavailable_listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+                    .expect("reserve unavailable post-launch daemon address");
+                let unavailable_address = unavailable_listener
+                    .local_addr()
+                    .expect("read unavailable post-launch daemon address");
+                drop(unavailable_listener);
+                let unavailable_client = DaemonClient::loopback_with_timeout(
+                    unavailable_address,
+                    ApiBearerToken::generate().expect("generate post-launch probe token"),
+                    "post-launch-host-identity",
+                    Duration::from_secs(1),
+                )
+                .expect("construct post-launch daemon client");
+                assert!(matches!(
+                    unavailable_client.capabilities(),
+                    Err(DaemonClientError::Transport(_))
+                ));
             }
             drop(bootstrap_lock);
 

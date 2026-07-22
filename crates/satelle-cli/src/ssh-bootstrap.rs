@@ -1469,16 +1469,56 @@ printf 'removed=%s\nretained=%s\n' "$removed" "$retained""#,
         if self.is_windows() {
             let script = format!(
                 concat!(
-                    "{}$binary = (Resolve-Path -LiteralPath {}).Path; ",
+                    "{}Add-Type -TypeDefinition '",
+                    "using System; using System.Runtime.InteropServices; ",
+                    "public static class SatelleBootstrapNative {{ ",
+                    "[DllImport(\"kernel32.dll\", SetLastError=true)] ",
+                    "public static extern IntPtr GetStdHandle(int stream); ",
+                    "[DllImport(\"kernel32.dll\", SetLastError=true)] ",
+                    "public static extern bool GetHandleInformation(IntPtr handle, out uint flags); ",
+                    "[DllImport(\"kernel32.dll\", SetLastError=true)] ",
+                    "public static extern bool SetStdHandle(int stream, IntPtr handle); ",
+                    "[DllImport(\"kernel32.dll\", SetLastError=true)] ",
+                    "public static extern bool SetHandleInformation(IntPtr handle, uint mask, uint flags); ",
+                    "}}'; ",
+                    "$originalInput = [SatelleBootstrapNative]::GetStdHandle(-10); ",
+                    "$originalOutput = [SatelleBootstrapNative]::GetStdHandle(-11); ",
+                    "$originalError = [SatelleBootstrapNative]::GetStdHandle(-12); ",
+                    "[uint32]$inputFlags = 0; [uint32]$outputFlags = 0; [uint32]$errorFlags = 0; ",
+                    "if (-not [SatelleBootstrapNative]::GetHandleInformation($originalInput,[ref]$inputFlags)) {{ exit 1 }}; ",
+                    "if (-not [SatelleBootstrapNative]::GetHandleInformation($originalOutput,[ref]$outputFlags)) {{ exit 1 }}; ",
+                    "if (-not [SatelleBootstrapNative]::GetHandleInformation($originalError,[ref]$errorFlags)) {{ exit 1 }}; ",
+                    "$nullOutput = [IO.File]::Open('NUL',[IO.FileMode]::Open,[IO.FileAccess]::Write,[IO.FileShare]::ReadWrite); ",
+                    "$nullHandle = $nullOutput.SafeFileHandle.DangerousGetHandle(); ",
+                    "$binary = (Resolve-Path -LiteralPath {}).Path; ",
+                    "$process = $null; try {{ ",
+                    "if (-not [SatelleBootstrapNative]::SetHandleInformation($originalInput,1,0)) {{ throw 'stdin inheritance' }}; ",
+                    "if (-not [SatelleBootstrapNative]::SetHandleInformation($originalOutput,1,0)) {{ throw 'stdout inheritance' }}; ",
+                    "if (-not [SatelleBootstrapNative]::SetHandleInformation($originalError,1,0)) {{ throw 'stderr inheritance' }}; ",
+                    "if (-not [SatelleBootstrapNative]::SetHandleInformation($nullHandle,1,1)) {{ throw 'null inheritance' }}; ",
+                    "if (-not [SatelleBootstrapNative]::SetStdHandle(-11,$nullHandle)) {{ throw 'stdout sink' }}; ",
+                    "if (-not [SatelleBootstrapNative]::SetStdHandle(-12,$nullHandle)) {{ throw 'stderr sink' }}; ",
                     "$startInfo = New-Object System.Diagnostics.ProcessStartInfo; ",
                     "$startInfo.FileName = $binary; $startInfo.Arguments = 'host start {} --json'; ",
                     "$startInfo.UseShellExecute = $false; $startInfo.CreateNoWindow = $true; ",
                     "$startInfo.RedirectStandardInput = $true; ",
+                    "$startInfo.RedirectStandardOutput = $false; ",
+                    "$startInfo.RedirectStandardError = $false; ",
                     "$process = New-Object System.Diagnostics.Process; $process.StartInfo = $startInfo; ",
-                    "if (-not $process.Start()) {{ exit 1 }}; ",
+                    "if (-not $process.Start()) {{ throw 'process start' }}; ",
                     "$token = [Console]::In.ReadLine(); ",
-                    "if ([String]::IsNullOrEmpty($token)) {{ $process.Kill(); exit 1 }}; ",
-                    "$process.StandardInput.WriteLine($token); $process.StandardInput.Close()"
+                    "if ([String]::IsNullOrEmpty($token)) {{ $process.Kill(); throw 'bootstrap token' }}; ",
+                    "$process.StandardInput.WriteLine($token); $process.StandardInput.Close() ",
+                    "}} finally {{ ",
+                    "$restoreInput = [SatelleBootstrapNative]::SetStdHandle(-10,$originalInput); ",
+                    "$restoreOutput = [SatelleBootstrapNative]::SetStdHandle(-11,$originalOutput); ",
+                    "$restoreError = [SatelleBootstrapNative]::SetStdHandle(-12,$originalError); ",
+                    "$restoreInputFlags = [SatelleBootstrapNative]::SetHandleInformation($originalInput,1,($inputFlags -band 1)); ",
+                    "$restoreOutputFlags = [SatelleBootstrapNative]::SetHandleInformation($originalOutput,1,($outputFlags -band 1)); ",
+                    "$restoreErrorFlags = [SatelleBootstrapNative]::SetHandleInformation($originalError,1,($errorFlags -band 1)); ",
+                    "$nullOutput.Dispose(); if ($null -ne $process) {{ $process.Dispose() }}; ",
+                    "if (-not ($restoreInput -and $restoreOutput -and $restoreError -and $restoreInputFlags -and $restoreOutputFlags -and $restoreErrorFlags)) {{ throw 'standard handle restore' }} ",
+                    "}}"
                 ),
                 powershell_environment(environment),
                 powershell_quote(remote_binary),
@@ -3651,6 +3691,103 @@ mod tests {
         assert!(detached_script.contains("RedirectStandardInput = $true"));
         assert!(detached_script.contains("StandardInput.WriteLine($token)"));
         assert!(detached_script.contains("host start"));
+    }
+
+    #[test]
+    fn windows_durable_launch_inherits_persistent_null_output_handles() {
+        let command = RemoteTarget::WindowsX64Msvc.durable_start_command(
+            "AppData/Local/Satelle/satelle.exe",
+            Duration::from_secs(75),
+            Duration::from_millis(2_500),
+            Duration::from_millis(7_500),
+        );
+        let script = decode_powershell_command(&command).expect("decode durable command");
+
+        for required in [
+            "Add-Type -TypeDefinition",
+            "DllImport(\"kernel32.dll\", SetLastError=true)",
+            "GetStdHandle(int stream)",
+            "GetHandleInformation(IntPtr handle, out uint flags)",
+            "SetHandleInformation(IntPtr handle, uint mask, uint flags)",
+            "$originalInput = [SatelleBootstrapNative]::GetStdHandle(-10)",
+            "$originalOutput = [SatelleBootstrapNative]::GetStdHandle(-11)",
+            "$originalError = [SatelleBootstrapNative]::GetStdHandle(-12)",
+            "GetHandleInformation($originalInput,[ref]$inputFlags)",
+            "GetHandleInformation($originalOutput,[ref]$outputFlags)",
+            "GetHandleInformation($originalError,[ref]$errorFlags)",
+            "$nullOutput = [IO.File]::Open('NUL'",
+            "$nullOutput.SafeFileHandle.DangerousGetHandle()",
+            "SetHandleInformation($originalInput,1,0)",
+            "SetHandleInformation($originalOutput,1,0)",
+            "SetHandleInformation($originalError,1,0)",
+            "SetHandleInformation($nullHandle,1,1)",
+            "SetStdHandle(-11,$nullHandle)",
+            "SetStdHandle(-12,$nullHandle)",
+            "$startInfo.UseShellExecute = $false",
+            "$startInfo.RedirectStandardInput = $true",
+            "$startInfo.RedirectStandardOutput = $false",
+            "$startInfo.RedirectStandardError = $false",
+            "$token = [Console]::In.ReadLine()",
+            "$process.StandardInput.WriteLine($token)",
+            "$process.StandardInput.Close()",
+            "finally {",
+            "SetStdHandle(-10,$originalInput)",
+            "SetStdHandle(-11,$originalOutput)",
+            "SetStdHandle(-12,$originalError)",
+            "SetHandleInformation($originalInput,1,($inputFlags -band 1))",
+            "SetHandleInformation($originalOutput,1,($outputFlags -band 1))",
+            "SetHandleInformation($originalError,1,($errorFlags -band 1))",
+            "$nullOutput.Dispose()",
+            "$process.Dispose()",
+        ] {
+            assert!(script.contains(required), "missing {required:?}: {script}");
+        }
+
+        for output_setup in [
+            "SetHandleInformation($originalInput,1,0)",
+            "SetHandleInformation($originalOutput,1,0)",
+            "SetHandleInformation($originalError,1,0)",
+            "SetHandleInformation($nullHandle,1,1)",
+            "SetStdHandle(-11,$nullHandle)",
+            "SetStdHandle(-12,$nullHandle)",
+            "$startInfo.RedirectStandardOutput = $false",
+            "$startInfo.RedirectStandardError = $false",
+        ] {
+            assert_occurs_before(&script, output_setup, "$process.Start()");
+        }
+        assert_occurs_before(
+            &script,
+            "$process.StandardInput.WriteLine($token)",
+            "$process.StandardInput.Close()",
+        );
+        assert_occurs_before(
+            &script,
+            "$process.StandardInput.Close()",
+            "SetStdHandle(-10,$originalInput)",
+        );
+        for restoration in [
+            "SetStdHandle(-10,$originalInput)",
+            "SetStdHandle(-11,$originalOutput)",
+            "SetStdHandle(-12,$originalError)",
+            "SetHandleInformation($originalInput,1,($inputFlags -band 1))",
+            "SetHandleInformation($originalOutput,1,($outputFlags -band 1))",
+            "SetHandleInformation($originalError,1,($errorFlags -band 1))",
+        ] {
+            assert_occurs_before(&script, restoration, "$nullOutput.Dispose()");
+        }
+        assert_occurs_before(
+            &script,
+            "$process.StandardInput.Close()",
+            "$nullOutput.Dispose()",
+        );
+        assert!(script.contains("$startInfo.FileName = $binary"));
+        assert!(!script.contains("RedirectStandardOutput = $true"));
+        assert!(!script.contains("RedirectStandardError = $true"));
+        assert!(!script.contains("StandardOutput.Close()"));
+        assert!(!script.contains("StandardError.Close()"));
+        assert!(!script.contains("cmd.exe"));
+        assert!(!script.contains("$token = '"));
+        assert!(!script.contains("SATELLE_BOOTSTRAP_TOKEN"));
     }
 
     #[test]

@@ -755,6 +755,12 @@ enum ExistingTokenVerification {
     AuthenticationRejected { token_id: String },
 }
 
+#[derive(Debug, Eq, PartialEq)]
+enum ExistingTokenInspection {
+    Reusable,
+    RequiresActivation,
+}
+
 #[derive(Clone, Copy)]
 enum SetupApplication {
     Planned { existing_token_file: bool },
@@ -1047,20 +1053,31 @@ impl SshSetupTransport {
                     SSH_DAEMON_REQUEST_TIMEOUT,
                 )
                 .map_err(|error| direct_transport_error(&self.alias, error))?;
-                bootstrap_lock
-                    .mark_mutation_started("durable_token_verification")
-                    .map_err(|_| SatelleError::host_unreachable(&self.alias))?;
-                let verification = verify_durable_setup_token(
-                    &durable_client,
-                    token_id.clone(),
-                    &activation_idempotency_key,
-                )
-                .map_err(|error| direct_transport_error(&self.alias, error))?;
+                let verification =
+                    match inspect_durable_setup_token(&durable_client, token_id.as_str())
+                        .map_err(|error| direct_transport_error(&self.alias, error))?
+                    {
+                        ExistingTokenInspection::Reusable => ExistingTokenVerification::Reusable,
+                        ExistingTokenInspection::RequiresActivation => {
+                            bootstrap_lock
+                                .mark_mutation_started("durable_token_verification")
+                                .map_err(|_| SatelleError::host_unreachable(&self.alias))?;
+                            let verification = activate_durable_setup_token(
+                                &durable_client,
+                                token_id.clone(),
+                                &activation_idempotency_key,
+                            )
+                            .map_err(|error| direct_transport_error(&self.alias, error))?;
+                            // Both activation and an explicit authentication rejection
+                            // are known terminal outcomes for this exact attempt.
+                            commit_verified_bootstrap_mutation(&self.alias, bootstrap_lock)?;
+                            verification
+                        }
+                    };
                 if !matches!(
                     verification,
                     ExistingTokenVerification::AuthenticationRejected { .. }
                 ) {
-                    commit_verified_bootstrap_mutation(&self.alias, bootstrap_lock)?;
                     complete_bootstrap_handoff(&self.alias, &bootstrap_client, bootstrap_lock)?;
                 }
                 Ok(verification)
@@ -1078,21 +1095,30 @@ impl SshSetupTransport {
             &mut ssh_bootstrap::SshBootstrapLock,
         ) -> Result<ExistingTokenVerification, SatelleError>,
     ) -> Result<ExistingTokenVerification, SatelleError> {
-        bootstrap_lock
-            .mark_mutation_started("durable_token_verification")
-            .map_err(|_| SatelleError::host_unreachable(&self.alias))?;
-        match verify_durable_setup_token(
-            durable_client,
-            token_id.to_string(),
-            activation_idempotency_key,
-        ) {
-            Ok(verification @ ExistingTokenVerification::Reusable)
-            | Ok(verification @ ExistingTokenVerification::ActivatedPending) => {
+        match inspect_durable_setup_token(durable_client, token_id) {
+            Ok(ExistingTokenInspection::Reusable) => Ok(ExistingTokenVerification::Reusable),
+            Ok(ExistingTokenInspection::RequiresActivation) => {
+                bootstrap_lock
+                    .mark_mutation_started("durable_token_verification")
+                    .map_err(|_| SatelleError::host_unreachable(&self.alias))?;
+                let verification = activate_durable_setup_token(
+                    durable_client,
+                    token_id.to_string(),
+                    activation_idempotency_key,
+                )
+                .map_err(|error| direct_transport_error(&self.alias, error))?;
+                // An explicit rejection proves that this activation attempt did
+                // not mutate the daemon. Commit that known outcome before the
+                // bootstrap fallback opens its next fenced phase.
                 commit_verified_bootstrap_mutation(&self.alias, bootstrap_lock)?;
-                Ok(verification)
+                match verification {
+                    ExistingTokenVerification::AuthenticationRejected { .. } => {
+                        bootstrap_verification(bootstrap_lock)
+                    }
+                    verification => Ok(verification),
+                }
             }
-            Ok(ExistingTokenVerification::AuthenticationRejected { .. })
-            | Err(DaemonClientError::Transport(_)) => bootstrap_verification(bootstrap_lock),
+            Err(DaemonClientError::Transport(_)) => bootstrap_verification(bootstrap_lock),
             Err(error) => Err(direct_transport_error(&self.alias, error)),
         }
     }
@@ -1300,50 +1326,57 @@ fn open_setup_token_lock(token_path: &Path) -> Result<fs::File, SatelleError> {
         .map_err(|error| setup_token_lock_error(token_path, error))
 }
 
-fn verify_durable_setup_token(
+fn inspect_durable_setup_token(
     client: &DaemonClient,
-    token_id: String,
-    activation_idempotency_key: &str,
-) -> Result<ExistingTokenVerification, DaemonClientError> {
+    token_id: &str,
+) -> Result<ExistingTokenInspection, DaemonClientError> {
     match client.confirm_durable_setup_token() {
         Ok(confirmation)
             if confirmation.token_id() == token_id
                 && confirmation.setup_active()
                 && confirmation.control_scoped() =>
         {
-            Ok(ExistingTokenVerification::Reusable)
+            Ok(ExistingTokenInspection::Reusable)
         }
         Ok(_) => Err(DaemonClientError::ResponseContractViolation),
         Err(DaemonClientError::Api { error, .. })
             if error.code() == ApiErrorCode::AuthenticationFailed =>
         {
-            // A pending setup credential is rejected everywhere except exact
-            // self-activation. Recover on the daemon that already owns the
-            // state store instead of starting a competing bootstrap process.
-            let activation =
-                match client.activate_durable_setup_token(&token_id, activation_idempotency_key) {
-                    Ok(activation) => activation,
-                    Err(DaemonClientError::Api { error, .. })
-                        if error.code() == ApiErrorCode::AuthenticationFailed =>
-                    {
-                        return Ok(ExistingTokenVerification::AuthenticationRejected { token_id });
-                    }
-                    Err(error) => return Err(error),
-                };
-            if !activation.active() || activation.token_id() != token_id {
-                return Err(DaemonClientError::ResponseContractViolation);
-            }
-            let confirmation = client.confirm_durable_setup_token()?;
-            if confirmation.token_id() == token_id
-                && confirmation.setup_active()
-                && confirmation.control_scoped()
-            {
-                Ok(ExistingTokenVerification::ActivatedPending)
-            } else {
-                Err(DaemonClientError::ResponseContractViolation)
-            }
+            Ok(ExistingTokenInspection::RequiresActivation)
         }
         Err(error) => Err(error),
+    }
+}
+
+fn activate_durable_setup_token(
+    client: &DaemonClient,
+    token_id: String,
+    activation_idempotency_key: &str,
+) -> Result<ExistingTokenVerification, DaemonClientError> {
+    // A pending setup credential is rejected everywhere except exact
+    // self-activation. The caller fences this mutating request separately from
+    // the read-only inspection above.
+    let activation =
+        match client.activate_durable_setup_token(token_id.as_str(), activation_idempotency_key) {
+            Ok(activation) => activation,
+            Err(DaemonClientError::Api { error, .. })
+                if error.code() == ApiErrorCode::AuthenticationFailed =>
+            {
+                return Ok(ExistingTokenVerification::AuthenticationRejected { token_id });
+            }
+            Err(error) => return Err(error),
+        };
+    if !activation.active() || activation.token_id() != token_id {
+        return Err(DaemonClientError::ResponseContractViolation);
+    }
+    let confirmation = client.confirm_durable_setup_token()?;
+    if confirmation.token_id() == token_id
+        && confirmation.setup_active()
+        && confirmation.control_scoped()
+    {
+        Ok(ExistingTokenVerification::ActivatedPending)
+    } else {
+        Err(DaemonClientError::ResponseContractViolation)
     }
 }
 
@@ -1873,7 +1906,7 @@ fn durable_ssh_clients(
     Ok((client, event_client))
 }
 
-#[cfg(all(test, feature = "test-support"))]
+#[cfg(test)]
 fn relaunch_durable_daemon_under_lock<T>(
     host: &str,
     mut confirm_lock_ownership: impl FnMut() -> Result<(), SatelleError>,
@@ -2577,6 +2610,6 @@ mod bootstrap_ordering_tests {
     }
 }
 
-#[cfg(all(test, feature = "test-support"))]
+#[cfg(test)]
 #[path = "transport-tests.rs"]
 mod tests;
