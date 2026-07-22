@@ -819,6 +819,14 @@ fn router(state: Arc<DaemonState>) -> Router {
     let setup_routes = Router::new()
         .route("/v1/setup/api-token", post(setup::issue_api_token))
         .route(
+            "/v1/maintenance/bootstrap/{operation_id}/complete",
+            post(setup::complete_bootstrap_maintenance),
+        )
+        .route(
+            "/v1/maintenance/bootstrap/{operation_id}/{operation_kind}/begin",
+            post(setup::begin_bootstrap_maintenance),
+        )
+        .route(
             "/v1/setup/api-token/{token_id}/activate",
             post(setup::activate_api_token),
         )

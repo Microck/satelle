@@ -1373,6 +1373,44 @@ impl RuntimeHandle {
         })
     }
 
+    pub(crate) fn adopt_recovery_maintenance(
+        &self,
+        operation_id: &str,
+    ) -> Result<MaintenanceOperationHandle, SatelleError> {
+        let engine = self.engine()?;
+        let capability = {
+            let mut storage = engine.lock_storage()?;
+            let acquired_at = time::OffsetDateTime::now_utc();
+            let owner = LeaseOwner::new(
+                operation_id,
+                engine.process_identity.process_id(),
+                engine.process_identity.process_start_ref(),
+                engine.process_identity.boot_identity_ref(),
+                acquired_at,
+            )
+            .map_err(model::storage_failure)?;
+            storage
+                .adopt_recovery_maintenance(operation_id, owner)
+                .map_err(model::storage_failure)?
+        };
+        let operation =
+            match MaintenanceOperationGuard::start(Arc::clone(&engine.storage), capability) {
+                Ok(operation) => operation,
+                Err((error, capability)) => {
+                    let owner = capability.lease_owner().clone();
+                    engine
+                        .lock_storage()?
+                        .retain_lease_recovery(&owner)
+                        .map_err(model::storage_failure)?;
+                    return Err(heartbeat_start_failure(error));
+                }
+            };
+        Ok(MaintenanceOperationHandle {
+            operation_id: operation_id.to_string(),
+            operation: Some(operation),
+        })
+    }
+
     pub(crate) fn start_setup_action(
         &self,
         operation: &MaintenanceOperationHandle,

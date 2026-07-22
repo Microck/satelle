@@ -59,7 +59,7 @@ use satelle_core::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use std::sync::{Arc, RwLock, RwLockReadGuard};
+use std::sync::{Arc, Mutex, RwLock, RwLockReadGuard};
 use std::time::Instant;
 pub use storage::{
     SetupActionPlan, SetupActionRecord, SetupActionSkipReason, SetupActionStatus,
@@ -105,12 +105,87 @@ use test_support::TestStateDir;
 #[path = "operation-capacity-tests.rs"]
 mod operation_capacity_tests;
 
+#[cfg(test)]
+mod bootstrap_maintenance_tests {
+    use super::*;
+
+    #[test]
+    fn bootstrap_maintenance_is_idempotent_and_completes_durably() {
+        let state = TestStateDir::new().expect("create state directory");
+        let service =
+            HostService::local_demo_for_tests_at(state.path()).expect("create Host service");
+        service
+            .acquire_bootstrap_maintenance("bootstrap-operation-1", SetupOperationKind::Repair)
+            .expect("acquire maintenance");
+        service
+            .acquire_bootstrap_maintenance("bootstrap-operation-1", SetupOperationKind::Repair)
+            .expect("repeat same-operation handoff");
+        assert!(
+            service
+                .acquire_bootstrap_maintenance("bootstrap-operation-2", SetupOperationKind::Repair,)
+                .is_err()
+        );
+        service
+            .complete_bootstrap_maintenance("bootstrap-operation-1")
+            .expect("complete maintenance");
+        service
+            .complete_bootstrap_maintenance("bootstrap-operation-1")
+            .expect("repeat completed handoff");
+        service
+            .acquire_bootstrap_maintenance("bootstrap-operation-1", SetupOperationKind::Repair)
+            .expect("repeat completed acquisition");
+        assert!(
+            service
+                .acquire_bootstrap_maintenance(
+                    "bootstrap-operation-1",
+                    SetupOperationKind::HostUpdate,
+                )
+                .is_err()
+        );
+        assert_eq!(
+            service
+                .load_setup_run("bootstrap-operation-1")
+                .expect("load setup run")
+                .expect("stored setup run")
+                .status(),
+            SetupRunStatus::Completed
+        );
+    }
+
+    #[test]
+    fn replacement_service_adopts_the_same_recovery_operation() {
+        let state = TestStateDir::new().expect("create state directory");
+        {
+            let original =
+                HostService::local_demo_for_tests_at(state.path()).expect("create original Host");
+            original
+                .acquire_bootstrap_maintenance(
+                    "bootstrap-operation-recovery",
+                    SetupOperationKind::HostUpdate,
+                )
+                .expect("acquire original maintenance");
+        }
+        let replacement =
+            HostService::local_demo_for_tests_at(state.path()).expect("create replacement Host");
+        replacement
+            .acquire_bootstrap_maintenance(
+                "bootstrap-operation-recovery",
+                SetupOperationKind::HostUpdate,
+            )
+            .expect("adopt recovery maintenance");
+        replacement
+            .complete_bootstrap_maintenance("bootstrap-operation-recovery")
+            .expect("complete adopted maintenance");
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct HostService {
     runtime: RuntimeHandle,
     operation_capacity: Arc<OperationCapacity>,
     mode: HostMode,
     bootstrap_auth: Option<Arc<EphemeralApiAuthenticator>>,
+    bootstrap_maintenance: Arc<Mutex<Option<MaintenanceOperationHandle>>>,
 }
 
 #[derive(Clone, Debug)]
@@ -186,6 +261,7 @@ impl HostService {
             operation_capacity: Arc::new(OperationCapacity::default()),
             mode: HostMode::TestFake,
             bootstrap_auth: None,
+            bootstrap_maintenance: Arc::new(Mutex::new(None)),
         })
     }
 
@@ -197,6 +273,92 @@ impl HostService {
         plan: &SetupRunPlan,
     ) -> Result<MaintenanceOperationHandle, SatelleError> {
         self.runtime.begin_setup_run(plan)
+    }
+
+    pub fn acquire_bootstrap_maintenance(
+        &self,
+        operation_id: &str,
+        operation_kind: SetupOperationKind,
+    ) -> Result<(), SatelleError> {
+        let mut slot = self
+            .bootstrap_maintenance
+            .lock()
+            .map_err(|_| SatelleError::state_conflict())?;
+        if let Some(operation) = slot.as_ref() {
+            return if operation.operation_id() == operation_id {
+                Ok(())
+            } else {
+                Err(SatelleError::state_conflict())
+            };
+        }
+        if let Some(run) = self.runtime.load_setup_run(operation_id)?
+            && run.operation_kind() == operation_kind
+            && run.status() == SetupRunStatus::Completed
+            && run.actions().iter().any(|action| {
+                action.action_id() == "bootstrap-handoff"
+                    && action.status() == SetupActionStatus::Completed
+            })
+        {
+            return Ok(());
+        }
+        let operation = if self.runtime.load_setup_run(operation_id)?.is_some() {
+            self.runtime.adopt_recovery_maintenance(operation_id)?
+        } else {
+            let action = SetupActionPlan::new("bootstrap-handoff", "Bootstrap Lock handoff", true)?;
+            let plan = SetupRunPlan::new(
+                operation_id,
+                operation_kind,
+                None,
+                time::OffsetDateTime::now_utc(),
+                vec![action],
+            )?;
+            let operation = self.runtime.begin_setup_run(&plan)?;
+            self.runtime.start_setup_action(
+                &operation,
+                "bootstrap-handoff",
+                time::OffsetDateTime::now_utc(),
+            )?;
+            operation
+        };
+        *slot = Some(operation);
+        Ok(())
+    }
+
+    pub fn complete_bootstrap_maintenance(&self, operation_id: &str) -> Result<(), SatelleError> {
+        let mut slot = self
+            .bootstrap_maintenance
+            .lock()
+            .map_err(|_| SatelleError::state_conflict())?;
+        let Some(operation) = slot.as_mut() else {
+            let completed = self
+                .runtime
+                .load_setup_run(operation_id)?
+                .is_some_and(|run| {
+                    run.status() == SetupRunStatus::Completed
+                        && run.actions().iter().any(|action| {
+                            action.action_id() == "bootstrap-handoff"
+                                && action.status() == SetupActionStatus::Completed
+                        })
+                });
+            return if completed {
+                Ok(())
+            } else {
+                Err(SatelleError::state_conflict())
+            };
+        };
+        if operation.operation_id() != operation_id {
+            return Err(SatelleError::state_conflict());
+        }
+        self.runtime
+            .complete_setup_action_after_verified_postcondition(
+                operation,
+                "bootstrap-handoff",
+                time::OffsetDateTime::now_utc(),
+            )?;
+        self.runtime
+            .finish_setup_run(operation, time::OffsetDateTime::now_utc())?;
+        *slot = None;
+        Ok(())
     }
 
     /// Durably marks one planned action as started before external mutation.
@@ -353,6 +515,7 @@ impl HostService {
             operation_capacity: Arc::new(OperationCapacity::default()),
             mode: HostMode::Production { snapshot },
             bootstrap_auth: None,
+            bootstrap_maintenance: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -387,6 +550,7 @@ impl HostService {
             operation_capacity: Arc::new(OperationCapacity::default()),
             mode: HostMode::TestFake,
             bootstrap_auth: None,
+            bootstrap_maintenance: Arc::new(Mutex::new(None)),
         })
     }
 
@@ -398,6 +562,7 @@ impl HostService {
             operation_capacity: Arc::new(OperationCapacity::default()),
             mode: HostMode::TestFake,
             bootstrap_auth: None,
+            bootstrap_maintenance: Arc::new(Mutex::new(None)),
         })
     }
 
@@ -409,6 +574,7 @@ impl HostService {
             operation_capacity: Arc::new(OperationCapacity::default()),
             mode: HostMode::TestFake,
             bootstrap_auth: None,
+            bootstrap_maintenance: Arc::new(Mutex::new(None)),
         })
     }
 

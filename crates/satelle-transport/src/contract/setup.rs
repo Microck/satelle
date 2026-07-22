@@ -14,6 +14,49 @@ define_schema_token!(
     DurableTokenActivationSchema,
     "satelle.setup-api-token-activation.v1"
 );
+define_schema_token!(
+    BootstrapMaintenanceSchema,
+    "satelle.bootstrap-maintenance.v1"
+);
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BootstrapMaintenanceResponse {
+    schema_version: BootstrapMaintenanceSchema,
+    request_id: RequestId,
+    host_identity: String,
+    operation_id: String,
+    reconciled: bool,
+}
+
+impl BootstrapMaintenanceResponse {
+    pub(crate) fn new(request_id: RequestId, host_identity: String, operation_id: String) -> Self {
+        Self {
+            schema_version: BootstrapMaintenanceSchema,
+            request_id,
+            host_identity,
+            operation_id,
+            reconciled: true,
+        }
+    }
+
+    pub fn operation_id(&self) -> &str {
+        &self.operation_id
+    }
+
+    pub const fn reconciled(&self) -> bool {
+        self.reconciled
+    }
+}
+
+impl AuthenticatedResponseContract for BootstrapMaintenanceResponse {
+    fn request_id(&self) -> &RequestId {
+        &self.request_id
+    }
+
+    fn host_identity(&self) -> &str {
+        &self.host_identity
+    }
+}
 
 #[derive(Serialize, Deserialize)]
 pub struct DurableTokenIssuanceResponse {
@@ -212,5 +255,21 @@ mod tests {
         );
         assert_eq!(encoded["setup_active"], true);
         assert_eq!(encoded["control_scoped"], true);
+    }
+
+    #[test]
+    fn bootstrap_maintenance_schema_carries_the_reconciled_operation() {
+        let response = BootstrapMaintenanceResponse::new(
+            RequestId::new(),
+            "host-test".to_string(),
+            "bootstrap-operation-1".to_string(),
+        );
+        let encoded = serde_json::to_value(&response).expect("encode maintenance response");
+        assert_eq!(
+            encoded["schema_version"],
+            "satelle.bootstrap-maintenance.v1"
+        );
+        assert_eq!(encoded["operation_id"], "bootstrap-operation-1");
+        assert_eq!(encoded["reconciled"], true);
     }
 }

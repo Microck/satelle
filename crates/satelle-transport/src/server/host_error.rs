@@ -113,7 +113,7 @@ fn failure(error: &SatelleError) -> ApiFailure {
                     .unwrap_or(serde_json::Value::Null)
             })),
         },
-        ErrorCode::HostBusy => ApiFailure {
+        ErrorCode::BootstrapBusy | ErrorCode::HostBusy => ApiFailure {
             status: StatusCode::CONFLICT,
             code: ApiErrorCode::HostBusy,
             category: ApiErrorCategory::Conflict,

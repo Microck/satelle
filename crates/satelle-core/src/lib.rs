@@ -2223,6 +2223,7 @@ pub enum ErrorCode {
     DaemonPathOverrideNotAbsolute,
     HostNotFound,
     HostUnreachable,
+    BootstrapBusy,
     DirectDaemonUnreachable,
     SshHostKeyVerificationRequired,
     CertificateUntrusted,
@@ -2302,6 +2303,7 @@ impl ErrorCode {
             Self::DaemonPathOverrideNotAbsolute => "daemon-path-override-not-absolute",
             Self::HostNotFound => "host-not-found",
             Self::HostUnreachable => "host-unreachable",
+            Self::BootstrapBusy => "bootstrap-busy",
             Self::DirectDaemonUnreachable => "direct-daemon-unreachable",
             Self::SshHostKeyVerificationRequired => "ssh-host-key-verification-required",
             Self::CertificateUntrusted => "certificate-untrusted",
@@ -2409,7 +2411,8 @@ impl ErrorCode {
             | Self::RemoteExecution
             | Self::StorageBusy
             | Self::StorageIntegrityFailed => 74,
-            Self::CapacityExceeded
+            Self::BootstrapBusy
+            | Self::CapacityExceeded
             | Self::HostBusy
             | Self::IncompatibleControlPlane
             | Self::ComputerUseNotReady
@@ -2931,6 +2934,26 @@ impl SatelleError {
             code: ErrorCode::HostUnreachable,
             message: format!("host '{alias}' is configured but unreachable"),
             recovery_command: Some("satelle config check --json".to_string()),
+            source_detail: None,
+            details,
+        }
+    }
+
+    pub fn bootstrap_busy(alias: &str, operation_id: Option<&str>) -> Self {
+        let mut details = BTreeMap::new();
+        details.insert("host".to_string(), Value::String(alias.to_string()));
+        if let Some(operation_id) = operation_id {
+            details.insert(
+                "operation_id".to_string(),
+                Value::String(operation_id.to_string()),
+            );
+        }
+        Self {
+            code: ErrorCode::BootstrapBusy,
+            message: format!("host '{alias}' already has an active bootstrap operation"),
+            recovery_command: Some(format!(
+                "wait for recovery or reconcile the active operation, then retry for host '{alias}'"
+            )),
             source_detail: None,
             details,
         }

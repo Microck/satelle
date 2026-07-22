@@ -640,6 +640,86 @@ impl Storage {
         Ok(MaintenanceLeaseCapability::new(owner))
     }
 
+    pub(crate) fn adopt_recovery_maintenance(
+        &mut self,
+        operation_id: &str,
+        owner: LeaseOwner,
+    ) -> Result<MaintenanceLeaseCapability, StorageError> {
+        let operation_id = validated_private_reference(operation_id.to_string())?;
+        if operation_id != owner.operation_id {
+            return Err(StorageError::new(StorageErrorKind::InvalidInput));
+        }
+        let host_identity = self.host_identity()?;
+        let acquired_at = format_time(owner.acquired_at)?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|source| sqlite_error(StorageErrorKind::OperationFailed, source))?;
+        let recovery_run: i64 = transaction
+            .query_row(
+                "SELECT EXISTS(
+                    SELECT 1 FROM setup_runs
+                    WHERE run_id = ?1 AND status = 'outcome_unknown'
+                )",
+                [operation_id.as_str()],
+                |row| row.get(0),
+            )
+            .map_err(|source| sqlite_error(StorageErrorKind::OperationFailed, source))?;
+        if recovery_run == 0 {
+            return Err(StorageError::new(StorageErrorKind::StateConflict));
+        }
+        require_one_transition(
+            transaction
+                .execute(
+                    "UPDATE setup_runs
+                     SET status = 'running', finished_at = NULL
+                     WHERE run_id = ?1 AND status = 'outcome_unknown'",
+                    [operation_id.as_str()],
+                )
+                .map_err(|source| sqlite_error(StorageErrorKind::OperationFailed, source))?,
+        )?;
+        require_one_transition(
+            transaction
+                .execute(
+                    "UPDATE setup_actions
+                     SET status = 'started', finished_at = NULL, recovery_hint = NULL
+                     WHERE run_id = ?1
+                       AND action_id = 'bootstrap-handoff'
+                       AND status = 'outcome_unknown'",
+                    [operation_id.as_str()],
+                )
+                .map_err(|source| sqlite_error(StorageErrorKind::OperationFailed, source))?,
+        )?;
+        require_one_transition(
+            transaction
+                .execute(
+                    "UPDATE maintenance_leases
+                     SET owner_process_id = ?3,
+                         owner_process_start_ref = ?4,
+                         owner_boot_identity_ref = ?5,
+                         acquired_at = ?6,
+                         heartbeat_at = ?6,
+                         lease_state = 'active'
+                     WHERE host_identity_ref = ?1
+                       AND operation_id = ?2
+                       AND lease_state = 'recovery_pending'",
+                    params![
+                        host_identity.as_str(),
+                        operation_id.as_str(),
+                        i64::from(owner.process_id),
+                        owner.process_start_ref.as_str(),
+                        owner.boot_identity_ref.as_str(),
+                        acquired_at,
+                    ],
+                )
+                .map_err(|source| sqlite_error(StorageErrorKind::OperationFailed, source))?,
+        )?;
+        transaction
+            .commit()
+            .map_err(|source| sqlite_error(StorageErrorKind::OperationFailed, source))?;
+        Ok(MaintenanceLeaseCapability::new(owner))
+    }
+
     pub(crate) fn start_setup_action(
         &mut self,
         capability: &MaintenanceLeaseCapability,

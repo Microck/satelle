@@ -1030,6 +1030,7 @@ impl HostService {
             ),
             mode: HostMode::TestFake,
             bootstrap_auth: None,
+            bootstrap_maintenance: std::sync::Arc::new(std::sync::Mutex::new(None)),
         })
     }
 
@@ -1060,6 +1061,7 @@ impl HostService {
             ),
             mode: HostMode::TestFake,
             bootstrap_auth: None,
+            bootstrap_maintenance: std::sync::Arc::new(std::sync::Mutex::new(None)),
         })
     }
 }

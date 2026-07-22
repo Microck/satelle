@@ -1,3 +1,5 @@
+#[path = "bootstrap-lock.rs"]
+mod bootstrap_lock;
 #[path = "command-history.rs"]
 mod command_history;
 mod completions;
@@ -45,7 +47,7 @@ use satelle_transport::{
 use serde_json::json;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
-use std::io::{self, BufRead, IsTerminal, Read, Write};
+use std::io::{self, IsTerminal, Read, Write};
 use std::net::SocketAddr;
 use std::path::{Component, Path, PathBuf};
 use std::process::ExitCode;
@@ -329,9 +331,6 @@ struct PathsCommand {
 #[derive(Subcommand, Debug)]
 enum HostCommand {
     Start(HostStartCommand),
-    /// Internal SSH setup lock held only while stdin remains connected.
-    #[command(hide = true)]
-    BootstrapLock,
     /// Internal owner-local request for a running SSH daemon to release its store.
     #[command(hide = true)]
     ReleaseState,
@@ -341,6 +340,7 @@ enum HostCommand {
     Stop(HostLifecycleCommand),
     Restart(HostLifecycleCommand),
     Update(HostUpdateCommand),
+    Cleanup(HostCleanupCommand),
     Sessions(HostSessionsCommand),
     Storage {
         #[command(subcommand)]
@@ -397,8 +397,32 @@ struct HostStartCommand {
     /// Internal Controller-resolved idle timeout for a durable SSH launch.
     #[arg(long, hide = true, value_name = "MILLISECONDS")]
     on_demand_idle_timeout_ms: Option<u64>,
+    /// Internal Maintenance Lease operation shared with the Bootstrap Lock.
+    #[arg(long, hide = true, requires = "bootstrap_operation_kind")]
+    bootstrap_operation_id: Option<String>,
+    /// Internal Maintenance Lease class shared with the Bootstrap Lock.
+    #[arg(long, hide = true, value_enum, requires = "bootstrap_operation_id")]
+    bootstrap_operation_kind: Option<BootstrapMaintenanceKind>,
     #[command(flatten)]
     output_args: OutputArgs,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+#[value(rename_all = "snake_case")]
+enum BootstrapMaintenanceKind {
+    InitialSetup,
+    MissingDaemonRepair,
+    HostBinaryReplacement,
+}
+
+impl BootstrapMaintenanceKind {
+    const fn setup_operation_kind(self) -> satelle_host::SetupOperationKind {
+        match self {
+            Self::InitialSetup => satelle_host::SetupOperationKind::Setup,
+            Self::MissingDaemonRepair => satelle_host::SetupOperationKind::Repair,
+            Self::HostBinaryReplacement => satelle_host::SetupOperationKind::HostUpdate,
+        }
+    }
 }
 
 #[derive(Args, Debug)]
@@ -435,6 +459,14 @@ struct HostUpdateCommand {
     yes: bool,
     #[arg(long)]
     no_input: bool,
+    #[command(flatten)]
+    output_args: OutputArgs,
+}
+
+#[derive(Args, Debug)]
+struct HostCleanupCommand {
+    #[arg(long)]
+    host: Option<String>,
     #[command(flatten)]
     output_args: OutputArgs,
 }
@@ -1090,7 +1122,7 @@ fn history_target(command: &Command) -> Option<HistoryTarget<'_>> {
                 },
         } if command.dry_run => return None,
         Command::Host {
-            command: HostCommand::BootstrapLock | HostCommand::ReleaseState,
+            command: HostCommand::ReleaseState,
         } => return None,
         Command::Host { command } => HistoryTarget {
             family: "host",
@@ -1103,7 +1135,6 @@ fn history_target(command: &Command) -> Option<HistoryTarget<'_>> {
             },
             explicit_host: match command {
                 HostCommand::Start(_) => None,
-                HostCommand::BootstrapLock => None,
                 HostCommand::ReleaseState => None,
                 HostCommand::Trust(command) => Some(command.host.as_str()),
                 HostCommand::Status(command) => command.host.as_deref(),
@@ -1112,6 +1143,7 @@ fn history_target(command: &Command) -> Option<HistoryTarget<'_>> {
                 }
                 HostCommand::Update(command) => (command.host.len() == 1 && !command.all_remotes)
                     .then(|| command.host[0].as_str()),
+                HostCommand::Cleanup(command) => command.host.as_deref(),
                 HostCommand::Sessions(command) => command.host.as_deref(),
                 HostCommand::Storage {
                     command: HostStorageCommand::Migrate(command),
@@ -1474,6 +1506,8 @@ mod history_target_tests {
                 bootstrap_native_readiness_timeout_ms: None,
                 bootstrap_provider_smoke_timeout_ms: None,
                 on_demand_idle_timeout_ms: None,
+                bootstrap_operation_id: None,
+                bootstrap_operation_kind: None,
                 output_args: OutputArgs::default(),
             }),
         }
@@ -1543,6 +1577,35 @@ mod history_target_tests {
         };
         assert_eq!(command.on_demand_idle_timeout_ms, Some(75_000));
         assert!(!command.bootstrap_token_stdin);
+    }
+
+    #[test]
+    fn host_cleanup_parses_host_selection_and_machine_output() {
+        let cli = Cli::try_parse_from(["satelle", "host", "cleanup", "--host", "remote", "--json"])
+            .expect("parse Host cleanup command");
+        let Command::Host {
+            command: HostCommand::Cleanup(command),
+        } = cli.command
+        else {
+            panic!("expected Host cleanup command");
+        };
+        assert_eq!(command.host.as_deref(), Some("remote"));
+        assert_eq!(
+            command
+                .output_args
+                .resolve(EventOutput::None)
+                .expect("resolve cleanup output"),
+            OutputFormat::Json
+        );
+
+        let report = transport::CacheCleanupReport {
+            removed_entries: 3,
+            retained_entries: 2,
+        };
+        assert_eq!(
+            serde_json::to_value(report).expect("serialize cleanup report"),
+            serde_json::json!({"removed_entries": 3, "retained_entries": 2})
+        );
     }
 }
 
@@ -3015,7 +3078,6 @@ fn run_host(
     let json = format.is_json();
     match command {
         HostCommand::Start(command) => start_host_daemon(command, config, format),
-        HostCommand::BootstrapLock => hold_ssh_bootstrap_lock(),
         HostCommand::ReleaseState => release_ssh_state_owner(),
         HostCommand::Trust(command) => trust_host(command, config, format),
         HostCommand::Status(command) => {
@@ -3038,61 +3100,25 @@ fn run_host(
             command.host.as_deref().unwrap_or(LOCAL_DEMO_HOST)
         )))),
         HostCommand::Update(command) => run_host_update(command),
+        HostCommand::Cleanup(command) => run_host_cleanup(command, config, format),
         HostCommand::Sessions(command) => show_host_sessions(command, config, format),
         HostCommand::Storage { command } => run_host_storage(command),
     }
 }
 
-fn hold_ssh_bootstrap_lock() -> Result<(), CliFailure> {
-    let state_root = satelle_core::state_dir().map_err(failure)?;
-    drop(
-        open_or_create_owner_only_directory(&state_root)
-            .map_err(|error| ssh_bootstrap_lock_failure(&state_root, error))?,
-    );
-    let lock_path = state_root.join("bootstrap.lock");
-    let lock = open_or_create_owner_only_file(&lock_path)
-        .map_err(|error| ssh_bootstrap_lock_failure(&lock_path, error))?;
-    lock.lock()
-        .map_err(|error| ssh_bootstrap_lock_failure(&lock_path, error))?;
-
-    serve_ssh_bootstrap_lock_protocol(io::stdin().lock(), io::stdout().lock())
-        .map_err(|error| ssh_bootstrap_lock_failure(&lock_path, error))?;
-    Ok(())
-}
-
-fn serve_ssh_bootstrap_lock_protocol(
-    input: impl BufRead,
-    mut output: impl Write,
-) -> io::Result<()> {
-    writeln!(output, "{}", transport::SSH_BOOTSTRAP_LOCK_READY)?;
-    output.flush()?;
-    for line in input.lines() {
-        writeln!(output, "{}", line?)?;
-        output.flush()?;
-    }
-    Ok(())
-}
-
-#[cfg(test)]
-mod ssh_bootstrap_lock_tests {
-    use super::*;
-
-    #[test]
-    fn lock_protocol_echoes_challenges_only_after_readiness() {
-        let mut output = Vec::new();
-        serve_ssh_bootstrap_lock_protocol(
-            io::Cursor::new(b"challenge-one\nchallenge-two\n"),
-            &mut output,
-        )
-        .expect("serve lock protocol");
-
-        assert_eq!(
-            String::from_utf8(output).expect("UTF-8 lock protocol"),
-            format!(
-                "{}\nchallenge-one\nchallenge-two\n",
-                transport::SSH_BOOTSTRAP_LOCK_READY
-            )
-        );
+fn run_host_cleanup(
+    command: HostCleanupCommand,
+    config: ConfigContext<'_>,
+    format: OutputFormat,
+) -> Result<(), CliFailure> {
+    let host = config.resolve_host(command.host.as_deref())?;
+    let report = transport::cleanup_ssh_host_cache(&host).map_err(failure)?;
+    if format.is_json() {
+        print_json(&report).map_err(failure)
+    } else {
+        println!("Removed cache entries: {}", report.removed_entries);
+        println!("Retained cache entries: {}", report.retained_entries);
+        Ok(())
     }
 }
 
@@ -3300,16 +3326,6 @@ mod ssh_state_release_tests {
     }
 }
 
-fn ssh_bootstrap_lock_failure(path: &Path, error: impl std::fmt::Display) -> CliFailure {
-    failure(SatelleError::config_error(
-        format!(
-            "could not hold the SSH bootstrap lock at '{}': {error}",
-            path.display()
-        ),
-        None,
-    ))
-}
-
 fn trust_host(
     command: HostTrustCommand,
     config_context: ConfigContext<'_>,
@@ -3453,6 +3469,32 @@ fn start_host_daemon(
             "the resolved on-demand idle timeout must be positive",
         )));
     }
+    if command.bootstrap_operation_id.is_some() != command.bootstrap_operation_kind.is_some() {
+        return Err(failure(SatelleError::invalid_usage(
+            "Bootstrap Lock handoff requires both operation id and operation kind",
+        )));
+    }
+    if let (Some(operation_id), Some(operation_kind)) = (
+        command.bootstrap_operation_id.as_deref(),
+        command.bootstrap_operation_kind,
+    ) {
+        bootstrap_lock::Request::new(
+            operation_id,
+            match operation_kind {
+                BootstrapMaintenanceKind::InitialSetup => {
+                    bootstrap_lock::OperationKind::InitialSetup
+                }
+                BootstrapMaintenanceKind::MissingDaemonRepair => {
+                    bootstrap_lock::OperationKind::MissingDaemonRepair
+                }
+                BootstrapMaintenanceKind::HostBinaryReplacement => {
+                    bootstrap_lock::OperationKind::HostBinaryReplacement
+                }
+            },
+            None,
+        )
+        .map_err(|error| failure(SatelleError::invalid_usage(error.to_string())))?;
+    }
     let bootstrap_scopes = match (command.bootstrap_token_stdin, command.bootstrap_scope) {
         (true, Some(scope)) => Some(scope.api_scopes()),
         (true, None) => {
@@ -3552,6 +3594,14 @@ fn start_host_daemon(
             None => HostService::production(),
         },
     };
+    if let (Some(operation_id), Some(operation_kind)) = (
+        command.bootstrap_operation_id.as_deref(),
+        command.bootstrap_operation_kind,
+    ) {
+        service
+            .acquire_bootstrap_maintenance(operation_id, operation_kind.setup_operation_kind())
+            .map_err(failure)?;
+    }
     // The service retained only the verifier. Zeroize the raw bootstrap token
     // before the listener starts accepting requests.
     drop(bootstrap_token);
@@ -4152,6 +4202,8 @@ mod daemon_tls_watcher_tests {
             bootstrap_native_readiness_timeout_ms: None,
             bootstrap_provider_smoke_timeout_ms: None,
             on_demand_idle_timeout_ms: None,
+            bootstrap_operation_id: None,
+            bootstrap_operation_kind: None,
             output_args: OutputArgs::default(),
         }
     }

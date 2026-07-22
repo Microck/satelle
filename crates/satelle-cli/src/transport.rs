@@ -1,4 +1,4 @@
-use crate::{CliFailure, SelectedHost, failure, on_demand_idle_timeout};
+use crate::{CliFailure, SelectedHost, bootstrap_lock, failure, on_demand_idle_timeout};
 use satelle_core::session::{PublicSession, TurnAdmissionFailure};
 use satelle_core::{
     ApiTokenSource, DaemonPathOverrides, DirectHostBinding, DoctorOptions, DoctorReport, ErrorCode,
@@ -27,8 +27,6 @@ use uuid::Uuid;
 const SSH_DAEMON_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const SSH_DAEMON_LAUNCH_TIMEOUT: Duration = Duration::from_secs(30);
 const SSH_DAEMON_LAUNCH_POLL_INTERVAL: Duration = Duration::from_millis(100);
-pub(crate) const SSH_BOOTSTRAP_LOCK_READY: &str = "satelle-bootstrap-lock-v1";
-
 type InterruptFuture<'a> = Pin<Box<dyn Future<Output = Result<(), std::io::Error>> + Send + 'a>>;
 
 trait InterruptSource: Send + Sync {
@@ -163,6 +161,7 @@ mod ssh_bootstrap;
 #[path = "ssh-tunnel.rs"]
 mod ssh_tunnel;
 
+pub(crate) use ssh_bootstrap::CacheCleanupReport;
 use ssh_bootstrap::SshBootstrapProcess;
 use ssh_tunnel::SshTunnel;
 
@@ -995,6 +994,7 @@ impl SshSetupTransport {
     fn verify_existing_token(
         &self,
         host_config: &satelle_core::HostConfig,
+        bootstrap_lock: &mut ssh_bootstrap::SshBootstrapLock,
     ) -> Result<ExistingTokenVerification, SatelleError> {
         let ApiTokenSource::File { path } = self
             .binding
@@ -1021,7 +1021,10 @@ impl SshSetupTransport {
         .map_err(|error| direct_transport_error(&self.alias, error))?;
         let bootstrap_token =
             ApiBearerToken::generate().map_err(|_| SatelleError::host_unreachable(&self.alias))?;
-        verify_durable_setup_token_with_launch(
+        bootstrap_lock
+            .mark_mutation_started("durable_token_verification")
+            .map_err(|_| SatelleError::host_unreachable(&self.alias))?;
+        let verification = verify_durable_setup_token_with_launch(
             &client,
             token_id,
             &activation_idempotency_key,
@@ -1034,16 +1037,25 @@ impl SshSetupTransport {
                     &bootstrap_token,
                     host_config,
                     SshBootstrapScope::Admin,
+                    bootstrap_lock,
                 )
                 .map_err(|error| map_ssh_daemon_bootstrap_error(&self.alias, error))
             },
-        )
+        )?;
+        if !matches!(
+            verification,
+            ExistingTokenVerification::AuthenticationRejected { .. }
+        ) {
+            complete_bootstrap_handoff(&self.alias, &client, bootstrap_lock)?;
+        }
+        Ok(verification)
     }
 
     fn recover_interrupted_token(
         &self,
         token_id: &str,
         host_config: &satelle_core::HostConfig,
+        bootstrap_lock: &mut ssh_bootstrap::SshBootstrapLock,
     ) -> Result<(), SatelleError> {
         let ApiTokenSource::File { path } = self
             .binding
@@ -1056,6 +1068,7 @@ impl SshSetupTransport {
             admission_request_timeout(&self.host_config),
             &self.host_config,
             host_config,
+            bootstrap_lock,
         )?;
         rollback_setup_token(
             &bootstrap_client,
@@ -1066,7 +1079,11 @@ impl SshSetupTransport {
         )
     }
 
-    fn provision_token(&self, host_config: &satelle_core::HostConfig) -> Result<(), SatelleError> {
+    fn provision_token(
+        &self,
+        host_config: &satelle_core::HostConfig,
+        bootstrap_lock: &mut ssh_bootstrap::SshBootstrapLock,
+    ) -> Result<(), SatelleError> {
         let ApiTokenSource::File { path } = self
             .binding
             .api_token()
@@ -1078,6 +1095,7 @@ impl SshSetupTransport {
             admission_request_timeout(&self.host_config),
             &self.host_config,
             host_config,
+            bootstrap_lock,
         )?;
         let issuance_idempotency_key = Uuid::now_v7().to_string();
         let issuance = bootstrap_client
@@ -1178,7 +1196,7 @@ impl SshSetupTransport {
             .err()
             .unwrap_or(error));
         }
-        Ok(())
+        complete_bootstrap_handoff(&self.alias, &bootstrap_client, bootstrap_lock)
     }
 }
 
@@ -1385,15 +1403,11 @@ impl TransportClient for SshSetupTransport {
             .api_token()
             .expect("setup apply follows a plan with a token-file descriptor");
         let _token_lock = acquire_setup_token_lock(path)?;
-        let mut bootstrap_lock = ssh_bootstrap::SshBootstrapLock::acquire(
+        let mut bootstrap_lock = acquire_bootstrap_lock(
+            &self.alias,
             self.binding.destination(),
-        )
-        .map_err(|error| match error {
-            ssh_bootstrap::SshBootstrapError::HostKeyVerificationRequired => {
-                SatelleError::ssh_host_key_verification_required(&self.alias)
-            }
-            _ => SatelleError::host_unreachable(&self.alias),
-        })?;
+            LockFirstOperationKind::InitialSetup,
+        )?;
         confirm_bootstrap_lock(&self.alias, &mut bootstrap_lock)?;
         // Planning intentionally does not lock or mutate. Re-read only after
         // acquiring both the token-path lock and the remote Host lock so another
@@ -1401,7 +1415,7 @@ impl TransportClient for SshSetupTransport {
         // replacement credential.
         let existing_token_file = self.token_file_exists()?;
         let application = if existing_token_file {
-            match self.verify_existing_token(&host_config)? {
+            match self.verify_existing_token(&host_config, &mut bootstrap_lock)? {
                 ExistingTokenVerification::Reusable => SetupApplication::AppliedReusableToken,
                 ExistingTokenVerification::ActivatedPending => {
                     SetupApplication::AppliedPendingActivation
@@ -1409,16 +1423,19 @@ impl TransportClient for SshSetupTransport {
                 ExistingTokenVerification::AuthenticationRejected { token_id } => {
                     // The owner-local release handshake stops any daemon that
                     // still owns the canonical store before admin recovery.
-                    self.recover_interrupted_token(&token_id, &host_config)?;
-                    self.provision_token(&host_config)?;
+                    self.recover_interrupted_token(&token_id, &host_config, &mut bootstrap_lock)?;
+                    self.provision_token(&host_config, &mut bootstrap_lock)?;
                     SetupApplication::AppliedNewToken
                 }
             }
         } else {
-            self.provision_token(&host_config)?;
+            self.provision_token(&host_config, &mut bootstrap_lock)?;
             SetupApplication::AppliedNewToken
         };
         confirm_bootstrap_lock(&self.alias, &mut bootstrap_lock)?;
+        bootstrap_lock
+            .release_after_handoff()
+            .map_err(|_| SatelleError::host_unreachable(&self.alias))?;
         Ok(self.setup_report(
             false,
             setup_mode,
@@ -1781,32 +1798,37 @@ fn durable_ssh_clients(
         .map_err(|error| direct_transport_error(alias, error))?
         .with_admission_timeout(admission_timeout),
     );
-    let mut bootstrap_lock =
-        ssh_bootstrap::SshBootstrapLock::acquire(destination).map_err(|error| match error {
-            ssh_bootstrap::SshBootstrapError::HostKeyVerificationRequired => {
-                SatelleError::ssh_host_key_verification_required(alias)
-            }
-            _ => SatelleError::host_unreachable(alias),
-        })?;
-    relaunch_durable_daemon_under_lock(
+    let mut bootstrap_lock = acquire_bootstrap_lock(
         alias,
-        || confirm_bootstrap_lock(alias, &mut bootstrap_lock),
-        || client.capabilities(),
-        || {
+        destination,
+        LockFirstOperationKind::MissingDaemonRepair,
+    )?;
+    confirm_bootstrap_lock(alias, &mut bootstrap_lock)?;
+    match client.capabilities() {
+        Ok(_) => {}
+        Err(DaemonClientError::Transport(_)) => {
             SshBootstrapProcess::launch_durable(
                 destination,
                 on_demand_idle_timeout(host_config),
                 host_config,
+                &mut bootstrap_lock,
             )
-            .map_err(|error| map_ssh_daemon_bootstrap_error(alias, error))
-        },
-    )?;
+            .map_err(|error| map_ssh_daemon_bootstrap_error(alias, error))?;
+            wait_for_durable_daemon(alias, || client.capabilities())?;
+        }
+        Err(error) => return Err(direct_transport_error(alias, error)),
+    }
+    complete_bootstrap_handoff(alias, &client, &mut bootstrap_lock)?;
+    bootstrap_lock
+        .release_after_handoff()
+        .map_err(|_| SatelleError::host_unreachable(alias))?;
     let event_client =
         DaemonEventClient::loopback(tunnel_addr, event_token, expected_host_identity)
             .map_err(|error| direct_event_error(alias, error))?;
     Ok((client, event_client))
 }
 
+#[cfg(all(test, feature = "test-support"))]
 fn relaunch_durable_daemon_under_lock<T>(
     host: &str,
     mut confirm_lock_ownership: impl FnMut() -> Result<(), SatelleError>,
@@ -1838,6 +1860,90 @@ fn confirm_bootstrap_lock(
         .map_err(|_| SatelleError::host_unreachable(host))
 }
 
+fn complete_bootstrap_handoff(
+    host: &str,
+    client: &DaemonClient,
+    bootstrap_lock: &mut ssh_bootstrap::SshBootstrapLock,
+) -> Result<(), SatelleError> {
+    bootstrap_lock
+        .mark_mutation_started("maintenance_handoff_begin")
+        .map_err(|_| SatelleError::host_unreachable(host))?;
+    let begun = client
+        .begin_bootstrap_maintenance(
+            bootstrap_lock.operation_id(),
+            bootstrap_lock.operation_kind().as_str(),
+        )
+        .map_err(|error| direct_transport_error(host, error))?;
+    if !begun.reconciled() || begun.operation_id() != bootstrap_lock.operation_id() {
+        return Err(SatelleError::remote_api_error(
+            host,
+            "invalid-bootstrap-maintenance-handoff",
+        ));
+    }
+    bootstrap_lock
+        .mark_mutation_started("maintenance_handoff_complete")
+        .map_err(|_| SatelleError::host_unreachable(host))?;
+    let handoff = client
+        .complete_bootstrap_maintenance(bootstrap_lock.operation_id())
+        .map_err(|error| direct_transport_error(host, error))?;
+    if !handoff.reconciled() || handoff.operation_id() != bootstrap_lock.operation_id() {
+        return Err(SatelleError::remote_api_error(
+            host,
+            "invalid-bootstrap-maintenance-handoff",
+        ));
+    }
+    confirm_bootstrap_lock(host, bootstrap_lock)
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum LockFirstOperationKind {
+    InitialSetup,
+    MissingDaemonRepair,
+}
+
+impl LockFirstOperationKind {
+    const fn operation_kind(self) -> bootstrap_lock::OperationKind {
+        match self {
+            Self::InitialSetup => bootstrap_lock::OperationKind::InitialSetup,
+            Self::MissingDaemonRepair => bootstrap_lock::OperationKind::MissingDaemonRepair,
+        }
+    }
+}
+
+fn acquire_bootstrap_lock(
+    alias: &str,
+    destination: &str,
+    operation_kind: LockFirstOperationKind,
+) -> Result<ssh_bootstrap::SshBootstrapLock, SatelleError> {
+    let operation_id = format!("bootstrap-{}", Uuid::now_v7());
+    acquire_bootstrap_lock_for_operation(
+        alias,
+        destination,
+        operation_id,
+        operation_kind.operation_kind(),
+    )
+}
+
+fn acquire_bootstrap_lock_for_operation(
+    alias: &str,
+    destination: &str,
+    operation_id: String,
+    operation_kind: bootstrap_lock::OperationKind,
+) -> Result<ssh_bootstrap::SshBootstrapLock, SatelleError> {
+    let controller_identity = Some(format!("controller-pid-{}", std::process::id()));
+    let request = bootstrap_lock::Request::new(operation_id, operation_kind, controller_identity)
+        .map_err(|error| SatelleError::invalid_usage(error.to_string()))?;
+    ssh_bootstrap::SshBootstrapLock::acquire(destination, request).map_err(|error| match error {
+        ssh_bootstrap::SshBootstrapError::HostKeyVerificationRequired => {
+            SatelleError::ssh_host_key_verification_required(alias)
+        }
+        ssh_bootstrap::SshBootstrapError::BootstrapBusy => {
+            SatelleError::bootstrap_busy(alias, None)
+        }
+        _ => SatelleError::host_unreachable(alias),
+    })
+}
+
 fn bootstrap_ssh_clients(
     alias: &str,
     destination: &str,
@@ -1847,12 +1953,23 @@ fn bootstrap_ssh_clients(
     host_config: &satelle_core::HostConfig,
     bootstrap_scope: SshBootstrapScope,
 ) -> Result<(Arc<DaemonClient>, DaemonEventClient, SshBootstrapProcess), SatelleError> {
+    let mut bootstrap_lock = acquire_bootstrap_lock(
+        alias,
+        destination,
+        LockFirstOperationKind::MissingDaemonRepair,
+    )?;
+    confirm_bootstrap_lock(alias, &mut bootstrap_lock)?;
     let bootstrap_token =
         ApiBearerToken::generate().map_err(|_| SatelleError::host_unreachable(alias))?;
     let raw_bootstrap_token = bootstrap_token.expose();
-    let bootstrap =
-        SshBootstrapProcess::launch(destination, &bootstrap_token, host_config, bootstrap_scope)
-            .map_err(|error| map_ssh_daemon_bootstrap_error(alias, error))?;
+    let bootstrap = SshBootstrapProcess::launch(
+        destination,
+        &bootstrap_token,
+        host_config,
+        bootstrap_scope,
+        &mut bootstrap_lock,
+    )
+    .map_err(|error| map_ssh_daemon_bootstrap_error(alias, error))?;
     let http_token = ApiBearerToken::parse(raw_bootstrap_token.as_str())
         .map_err(|_| SatelleError::host_unreachable(alias))?;
     let event_token = ApiBearerToken::parse(raw_bootstrap_token.as_str())
@@ -1870,6 +1987,10 @@ fn bootstrap_ssh_clients(
     client
         .capabilities()
         .map_err(|error| direct_transport_error(alias, error))?;
+    complete_bootstrap_handoff(alias, &client, &mut bootstrap_lock)?;
+    bootstrap_lock
+        .release_after_handoff()
+        .map_err(|_| SatelleError::host_unreachable(alias))?;
     let event_client =
         DaemonEventClient::loopback(tunnel_addr, event_token, expected_host_identity)
             .map_err(|error| direct_event_error(alias, error))?;
@@ -1883,6 +2004,7 @@ fn setup_bootstrap_client(
     admission_timeout: Duration,
     previous_host_config: &satelle_core::HostConfig,
     host_config: &satelle_core::HostConfig,
+    bootstrap_lock: &mut ssh_bootstrap::SshBootstrapLock,
 ) -> Result<(Arc<DaemonClient>, SshTunnel, SshBootstrapProcess), SatelleError> {
     let bootstrap_token =
         ApiBearerToken::generate().map_err(|_| SatelleError::host_unreachable(alias))?;
@@ -1896,6 +2018,7 @@ fn setup_bootstrap_client(
         host_config,
         previous_host_config,
         SshBootstrapScope::Admin,
+        bootstrap_lock,
     )
     .map_err(|error| map_ssh_daemon_bootstrap_error(alias, error))?;
     let tunnel =
@@ -2310,6 +2433,24 @@ pub(crate) fn discover_direct_host_identity(host: &SelectedHost) -> Result<Strin
         .map_err(|error| direct_transport_error(&host.alias, error))
 }
 
+pub(crate) fn cleanup_ssh_host_cache(
+    host: &SelectedHost,
+) -> Result<CacheCleanupReport, SatelleError> {
+    if host.config.transport != TransportKind::Ssh {
+        return Err(SatelleError::invalid_usage(
+            "host cleanup requires an SSH Host Binding",
+        ));
+    }
+    let mut binding_config = host.config.clone();
+    if binding_config.expected_host_id.is_none() {
+        binding_config.expected_host_id = Some(format!("cleanup-{}", Uuid::now_v7()));
+    }
+    let binding = SshHostBinding::from_host_config_for_bootstrap(&binding_config)
+        .map_err(|error| SatelleError::config_error(error.to_string(), None))?;
+    ssh_bootstrap::cleanup_host_cache(binding.destination())
+        .map_err(|error| map_ssh_daemon_bootstrap_error(&host.alias, error))
+}
+
 pub(crate) fn discover_ssh_host_identity(
     host: &SelectedHost,
     daemon_path_overrides: &DaemonPathOverrides,
@@ -2324,13 +2465,11 @@ pub(crate) fn discover_ssh_host_identity(
     probe_config.expected_host_id = Some(probe_identity.clone());
     let binding = SshHostBinding::from_host_config_for_bootstrap(&probe_config)
         .map_err(|error| SatelleError::config_error(error.to_string(), None))?;
-    let mut bootstrap_lock = ssh_bootstrap::SshBootstrapLock::acquire(binding.destination())
-        .map_err(|error| match error {
-            ssh_bootstrap::SshBootstrapError::HostKeyVerificationRequired => {
-                SatelleError::ssh_host_key_verification_required(&host.alias)
-            }
-            _ => SatelleError::host_unreachable(&host.alias),
-        })?;
+    let mut bootstrap_lock = acquire_bootstrap_lock(
+        &host.alias,
+        binding.destination(),
+        LockFirstOperationKind::InitialSetup,
+    )?;
     confirm_bootstrap_lock(&host.alias, &mut bootstrap_lock)?;
     let mut selected_host_config = host.config.clone();
     selected_host_config.daemon_home = daemon_path_overrides.home.clone();
@@ -2345,12 +2484,32 @@ pub(crate) fn discover_ssh_host_identity(
         admission_request_timeout(&host.config),
         &host.config,
         &selected_host_config,
+        &mut bootstrap_lock,
     )?;
     let identity = client
         .discover_host_identity()
         .map_err(|error| direct_transport_error(&host.alias, error))?;
-    confirm_bootstrap_lock(&host.alias, &mut bootstrap_lock)?;
+    complete_bootstrap_handoff(&host.alias, &client, &mut bootstrap_lock)?;
+    bootstrap_lock
+        .release_after_handoff()
+        .map_err(|_| SatelleError::host_unreachable(&host.alias))?;
     Ok(identity)
+}
+
+#[cfg(test)]
+mod bootstrap_ordering_tests {
+    use super::*;
+    #[test]
+    fn lock_first_acquisition_is_closed_to_setup_and_missing_daemon_repair() {
+        assert_eq!(
+            LockFirstOperationKind::InitialSetup.operation_kind(),
+            bootstrap_lock::OperationKind::InitialSetup
+        );
+        assert_eq!(
+            LockFirstOperationKind::MissingDaemonRepair.operation_kind(),
+            bootstrap_lock::OperationKind::MissingDaemonRepair
+        );
+    }
 }
 
 #[cfg(all(test, feature = "test-support"))]
