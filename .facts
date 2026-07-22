@@ -334,8 +334,8 @@
 - satelle run and steer use repeatable --image <local-path> as the exact local image attachment option @spec @contract @mvp
 - satelle image attachment paths provided to CLI commands are interpreted as local CLI machine paths by default @spec @mvp
 - satelle uploads local image attachments to the remote Host Daemon before passing them to Codex as supported image input @spec @mvp
-- the authenticated capabilities response advertises maximum attachment count, per-attachment bytes, aggregate attachment bytes, and supported media types @spec @mvp
-- attachment upload verifies declared size, actual size, media type, and content digest before Turn start @spec @mvp
+- when the remote Codex app-server supports image or localImage input, the authenticated capabilities response advertises a maximum of 2 attachments, 5242880 bytes per attachment, 10485760 aggregate attachment bytes, and exactly image/png and image/jpeg; otherwise it advertises zero attachment limits and no supported attachment media types @spec @mvp
+- before decoding attachments, satelle validates the whole request against the advertised count, declared sizes, encoded-length bounds, and declared media types; after decoding, it validates actual per-attachment and aggregate bytes, sniffed media types, and content digests, and starts no Turn when any attachment fails @spec @mvp
 - Host Daemon attachment staging uses generated filenames instead of Client-provided path components @spec @mvp
 - attachment staging files are private to the daemon OS user @spec @mvp
 - satelle rejects path traversal, device files, directories, and unsupported symlinks as attachment inputs @spec @mvp
@@ -445,7 +445,7 @@
 - satelle setup presents Host Daemon install or update plans with current version, target version, target platform, artifact digest, install path, and restart impact before mutating the remote host @spec @mvp
 - satelle setup applies Host Daemon install or update actions through the same final confirmation, --yes, --no-input --yes, --dry-run, action ledger, and partial-failure rules used by other setup mutations @spec @mvp
 - satelle setup defaults setup_mode to on_demand when no CLI flag or user-level host setting selects a mode @spec @mvp
-- satelle installs or configures a persistent user-level Host Daemon service only when --persistent or user-level setup_mode = persistent selects persistent mode @spec @mvp
+- satelle installs or configures a persistent user-level Host Daemon service only when --persistent or user-level setup_mode = persistent selects persistent mode; on Windows, persistent mode uses a least-privilege per-user Task Scheduler logon task for the authenticated bootstrap OS account and reports service_scope = login_session @spec @mvp
 - satelle setup does not silently install a persistent Host Daemon service; the service install or configuration action is shown in the setup plan and follows the normal confirmation, --yes, --no-input --yes, and --dry-run rules @spec @mvp
 - satelle setup prefers a user-level or login-session service over a privileged system service for native Computer Use hosts because visible desktop control usually belongs to the signed-in user session @spec @mvp
 - satelle setup uses a privileged system service only when the requested host mode requires it and the setup plan states the privilege, service account, and desktop-session implications before mutation @spec @mvp
@@ -1945,7 +1945,7 @@
 - raw app-server messages never enter normal logs, errors, events, or SQLite records @spec @mvp @implemented
 - satelle reports a typed incompatible-control-plane error when the remote Codex runtime cannot expose the required app-server protocol @implemented @mvp
 - satelle does not expose app-server over a public unauthenticated listener @spec @mvp @implemented
-- satelle MVP requires a standalone installer-managed Codex runtime on the remote host instead of treating npm-installed Codex as a supported remote runtime @spec @mvp
+- satelle MVP accepts the official OpenAI standalone Codex 0.144.0 runtime only when an owner-only Satelle receipt verifies its immutable package, binary, target, version, and Codex home; the Host launches only that receipt-recorded binary with that Codex home and never accepts npm-installed, mutable-alias, shim, or PATH-resolved Codex @spec @mvp
 - satelle target architecture includes a Satelle Host Daemon running on the controlled remote machine and a local satelle CLI acting as the client @spec @mvp
 - satelle Host Daemon binds to loopback by default even when installed as a persistent service @spec @mvp
 - satelle Host Daemon non-loopback binding is an explicit configuration choice that requires the direct transport security requirements @spec @mvp
