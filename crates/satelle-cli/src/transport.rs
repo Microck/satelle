@@ -1006,15 +1006,15 @@ impl SshSetupTransport {
             .map_err(|error| SatelleError::config_error(error.to_string(), None))?;
         let token_id = http_token.token_id().to_string();
         let activation_idempotency_key = Uuid::now_v7().to_string();
-        let (bootstrap_client, tunnel, _bootstrap) = setup_bootstrap_client(
-            &self.alias,
-            self.binding.destination(),
-            &self.binding.expected_host_identity().to_string(),
-            &self.host_config,
-            host_config,
-            SshBootstrapScope::Read,
-            bootstrap_lock,
-        )?;
+        // An existing durable token belongs to the canonical daemon. Verify it
+        // there before entering bootstrap, because launching an ephemeral Host
+        // may release the canonical state owner even when that daemon is healthy.
+        let tunnel = SshTunnel::open(self.binding.destination()).map_err(|error| match error {
+            ssh_tunnel::SshTunnelError::HostKeyVerificationRequired => {
+                SatelleError::ssh_host_key_verification_required(&self.alias)
+            }
+            _ => SatelleError::host_unreachable(&self.alias),
+        })?;
         let durable_client = DaemonClient::loopback_with_timeout(
             tunnel.local_addr(),
             http_token,
@@ -1022,20 +1022,79 @@ impl SshSetupTransport {
             SSH_DAEMON_REQUEST_TIMEOUT,
         )
         .map_err(|error| direct_transport_error(&self.alias, error))?;
+
+        self.verify_existing_token_with_bootstrap_fallback(
+            &durable_client,
+            &token_id,
+            &activation_idempotency_key,
+            bootstrap_lock,
+            |bootstrap_lock| {
+                let http_token = ApiBearerToken::parse(raw_token.as_str())
+                    .map_err(|error| SatelleError::config_error(error.to_string(), None))?;
+                let (bootstrap_client, bootstrap_tunnel, _bootstrap) = setup_bootstrap_client(
+                    &self.alias,
+                    self.binding.destination(),
+                    &self.binding.expected_host_identity().to_string(),
+                    &self.host_config,
+                    host_config,
+                    SshBootstrapScope::Read,
+                    bootstrap_lock,
+                )?;
+                let durable_client = DaemonClient::loopback_with_timeout(
+                    bootstrap_tunnel.local_addr(),
+                    http_token,
+                    self.binding.expected_host_identity().to_string(),
+                    SSH_DAEMON_REQUEST_TIMEOUT,
+                )
+                .map_err(|error| direct_transport_error(&self.alias, error))?;
+                bootstrap_lock
+                    .mark_mutation_started("durable_token_verification")
+                    .map_err(|_| SatelleError::host_unreachable(&self.alias))?;
+                let verification = verify_durable_setup_token(
+                    &durable_client,
+                    token_id.clone(),
+                    &activation_idempotency_key,
+                )
+                .map_err(|error| direct_transport_error(&self.alias, error))?;
+                if !matches!(
+                    verification,
+                    ExistingTokenVerification::AuthenticationRejected { .. }
+                ) {
+                    commit_verified_bootstrap_mutation(&self.alias, bootstrap_lock)?;
+                    complete_bootstrap_handoff(&self.alias, &bootstrap_client, bootstrap_lock)?;
+                }
+                Ok(verification)
+            },
+        )
+    }
+
+    fn verify_existing_token_with_bootstrap_fallback(
+        &self,
+        durable_client: &DaemonClient,
+        token_id: &str,
+        activation_idempotency_key: &str,
+        bootstrap_lock: &mut ssh_bootstrap::SshBootstrapLock,
+        bootstrap_verification: impl FnOnce(
+            &mut ssh_bootstrap::SshBootstrapLock,
+        ) -> Result<ExistingTokenVerification, SatelleError>,
+    ) -> Result<ExistingTokenVerification, SatelleError> {
         bootstrap_lock
             .mark_mutation_started("durable_token_verification")
             .map_err(|_| SatelleError::host_unreachable(&self.alias))?;
-        let verification =
-            verify_durable_setup_token(&durable_client, token_id, &activation_idempotency_key)
-                .map_err(|error| direct_transport_error(&self.alias, error))?;
-        if !matches!(
-            verification,
-            ExistingTokenVerification::AuthenticationRejected { .. }
+        match verify_durable_setup_token(
+            durable_client,
+            token_id.to_string(),
+            activation_idempotency_key,
         ) {
-            commit_verified_bootstrap_mutation(&self.alias, bootstrap_lock)?;
-            complete_bootstrap_handoff(&self.alias, &bootstrap_client, bootstrap_lock)?;
+            Ok(verification @ ExistingTokenVerification::Reusable)
+            | Ok(verification @ ExistingTokenVerification::ActivatedPending) => {
+                commit_verified_bootstrap_mutation(&self.alias, bootstrap_lock)?;
+                Ok(verification)
+            }
+            Ok(ExistingTokenVerification::AuthenticationRejected { .. })
+            | Err(DaemonClientError::Transport(_)) => bootstrap_verification(bootstrap_lock),
+            Err(error) => Err(direct_transport_error(&self.alias, error)),
         }
-        Ok(verification)
     }
 
     fn recover_interrupted_token(

@@ -700,6 +700,166 @@ fn durable_verification_and_bootstrap_handoff_use_distinct_clients() {
 }
 
 #[cfg(unix)]
+#[test]
+fn reusable_setup_token_keeps_the_healthy_durable_daemon_running_without_bootstrap() {
+    with_bootstrap_handoff_test_context(|_, fake_ssh| {
+        let state = TestStateDir::new().expect("temporary durable state directory");
+        let service = HostService::local_demo_for_tests_at(state.path())
+            .expect("construct durable Host service");
+        let initialized = service.initialize_daemon().expect("initialize Host state");
+        let host_identity = initialized.host_identity().to_string();
+        let (durable_token, durable_principal) = service
+            .issue_pending_api_token(
+                ApiScopes::CONTROL,
+                time::OffsetDateTime::now_utc() + time::Duration::minutes(5),
+            )
+            .expect("issue durable setup token");
+        let durable_token_id = durable_principal.token_id().to_string();
+        service
+            .activate_api_token(&durable_token_id)
+            .expect("activate durable setup token");
+        let raw_token = durable_token.expose();
+        let token_path = state.path().join("reusable-setup.token");
+        persist_new_owner_only_secret_file(&token_path, raw_token.as_str())
+            .expect("persist reusable setup token");
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .expect("construct durable daemon runtime");
+        let server = runtime
+            .block_on(DaemonServer::bind(
+                service,
+                DaemonServerConfig::loopback(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))),
+            ))
+            .expect("bind durable loopback daemon");
+        let durable_client = DaemonClient::loopback(
+            server.local_addr(),
+            ApiBearerToken::parse(raw_token.as_str()).expect("parse reusable setup token"),
+            &host_identity,
+        )
+        .expect("construct durable setup client");
+        let transport = SshSetupTransport::new(&ssh_setup_host(Some(ApiTokenSource::File {
+            path: token_path,
+        })))
+        .expect("construct SSH setup transport");
+        let mut bootstrap_lock = acquire_bootstrap_lock_for_operation_with_ssh(
+            "reusable-token-host",
+            "fake-ssh-host",
+            "verify-reusable-token-before-bootstrap".to_string(),
+            bootstrap_lock::OperationKind::InitialSetup,
+            fake_ssh,
+        )
+        .expect("acquire setup lock");
+        let bootstrap_called = AtomicBool::new(false);
+
+        let verification = transport
+            .verify_existing_token_with_bootstrap_fallback(
+                &durable_client,
+                &durable_token_id,
+                "verify-reusable-token",
+                &mut bootstrap_lock,
+                |_| {
+                    bootstrap_called.store(true, Ordering::SeqCst);
+                    Err(SatelleError::host_unreachable("reusable-token-host"))
+                },
+            )
+            .expect("reuse the healthy durable daemon token");
+
+        assert_eq!(verification, ExistingTokenVerification::Reusable);
+        assert!(!bootstrap_called.load(Ordering::SeqCst));
+        assert!(bootstrap_lock.exchanged_lock_lines().iter().all(|line| {
+            !line.contains("maintenance_handoff") && !line.contains("daemon_start")
+        }));
+        bootstrap_lock
+            .release_committed_handoff()
+            .expect("release the committed durable verification");
+        let report = transport.setup_report(
+            false,
+            "on_demand".to_string(),
+            vec!["transport".to_string()],
+            DaemonPathOverrides::default(),
+            SetupApplication::AppliedReusableToken,
+        );
+        assert_eq!(report.status, "applied");
+        assert!(!report.mutated);
+        durable_client
+            .capabilities()
+            .expect("the canonical durable daemon remains reachable after the report");
+
+        drop(server);
+    });
+}
+
+#[cfg(unix)]
+#[test]
+fn rejected_durable_setup_token_enters_the_bootstrap_handoff_path() {
+    with_bootstrap_handoff_test_context(|bootstrap_client, fake_ssh| {
+        let transport =
+            SshSetupTransport::new(&ssh_setup_host(None)).expect("construct SSH setup transport");
+        let unavailable_address = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .expect("reserve unavailable durable daemon address")
+            .local_addr()
+            .expect("read unavailable durable daemon address");
+        let unavailable_durable_client = DaemonClient::loopback(
+            unavailable_address,
+            ApiBearerToken::generate().expect("generate unavailable durable token"),
+            "unavailable-durable-host-identity",
+        )
+        .expect("construct unavailable durable client");
+        let mut bootstrap_lock = acquire_bootstrap_lock_for_operation_with_ssh(
+            "bootstrap-required-host",
+            "fake-ssh-host",
+            "bootstrap-after-durable-rejection".to_string(),
+            bootstrap_lock::OperationKind::InitialSetup,
+            fake_ssh,
+        )
+        .expect("acquire setup lock");
+        let bootstrap_called = AtomicBool::new(false);
+
+        let verification = transport
+            .verify_existing_token_with_bootstrap_fallback(
+                &unavailable_durable_client,
+                "not-the-bootstrap-token-id",
+                "reject-bootstrap-token-as-durable",
+                &mut bootstrap_lock,
+                |bootstrap_lock| {
+                    bootstrap_called.store(true, Ordering::SeqCst);
+                    bootstrap_lock
+                        .mark_mutation_started("daemon_start")
+                        .map_err(|_| SatelleError::host_unreachable("bootstrap-required-host"))?;
+                    commit_verified_bootstrap_mutation("bootstrap-required-host", bootstrap_lock)?;
+                    complete_bootstrap_handoff(
+                        "bootstrap-required-host",
+                        bootstrap_client,
+                        bootstrap_lock,
+                    )?;
+                    Ok(ExistingTokenVerification::AuthenticationRejected {
+                        token_id: "not-the-bootstrap-token-id".to_string(),
+                    })
+                },
+            )
+            .expect("enter bootstrap after durable authentication rejection");
+
+        assert!(matches!(
+            verification,
+            ExistingTokenVerification::AuthenticationRejected { token_id }
+                if token_id == "not-the-bootstrap-token-id"
+        ));
+        assert!(bootstrap_called.load(Ordering::SeqCst));
+        assert!(
+            bootstrap_lock
+                .exchanged_lock_lines()
+                .iter()
+                .any(|line| line.contains("maintenance_handoff_complete"))
+        );
+        bootstrap_lock
+            .release_committed_handoff()
+            .expect("release the completed bootstrap handoff");
+    });
+}
+
+#[cfg(unix)]
 fn acquire_bootstrap_lock_for_operation_with_ssh(
     alias: &str,
     destination: &str,
