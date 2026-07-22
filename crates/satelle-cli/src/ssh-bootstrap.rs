@@ -888,11 +888,38 @@ $observedPhase = (Get-Content -LiteralPath (Join-Path $claimPath 'mutation_phase
 $observedAttempt = (Get-Content -LiteralPath (Join-Path $claimPath 'mutation_attempt') -Raw).Trim()
 if (($state -cne 'mutation_started') -or ($observedPhase -cne $phase) -or ($observedAttempt -cne $attempt)) {{ exit 75 }}
 [IO.File]::Open((Join-Path $claimPath ('execution_started.' + $attempt)), [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None).Dispose()
-Invoke-Expression $innerCommand
-if ($LASTEXITCODE -ne 0) {{ exit $LASTEXITCODE }}
-if ($phase -cne 'daemon_start') {{
-  [IO.File]::Open((Join-Path $claimPath ('execution_succeeded.' + $attempt)), [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None).Dispose()
-}}"#,
+$status = 0
+try {{
+  Invoke-Expression $innerCommand
+  if ($null -ne $LASTEXITCODE) {{ $status = $LASTEXITCODE }}
+}} catch {{
+  $status = 1
+}}
+$terminalClaimExact = $false
+try {{
+  $terminalClaimItem = Get-Item -LiteralPath $claimPath -Force -ErrorAction Stop
+  $terminalStartedItem = Get-Item -LiteralPath (Join-Path $claimPath ('execution_started.' + $attempt)) -Force -ErrorAction Stop
+  $terminalClaimExact = $terminalClaimItem.PSIsContainer -and
+    (($terminalClaimItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -eq 0) -and
+    (-not $terminalStartedItem.PSIsContainer) -and
+    (($terminalStartedItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -eq 0) -and
+    (-not (Test-Path -LiteralPath (Join-Path $claimPath ('execution_retiring.' + $attempt)))) -and
+    ((((Get-Content -LiteralPath (Join-Path $claimPath 'operation_id') -Raw).Trim()) -ceq $operationId)) -and
+    ((((Get-Content -LiteralPath (Join-Path $claimPath 'claim_identity') -Raw).Trim()) -ceq $claimIdentity)) -and
+    ((((Get-Content -LiteralPath (Join-Path $claimPath 'state') -Raw).Trim()) -ceq 'mutation_started')) -and
+    ((((Get-Content -LiteralPath (Join-Path $claimPath 'mutation_phase') -Raw).Trim()) -ceq $phase)) -and
+    ((((Get-Content -LiteralPath (Join-Path $claimPath 'mutation_attempt') -Raw).Trim()) -ceq $attempt))
+}} catch {{
+  $terminalClaimExact = $false
+}}
+if ($terminalClaimExact) {{
+  if ($status -eq 0) {{
+    [IO.File]::Open((Join-Path $claimPath ('execution_succeeded.' + $attempt)), [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None).Dispose()
+  }} elseif ($phase -ceq 'daemon_start') {{
+    [IO.File]::Open((Join-Path $claimPath ('execution_failed.' + $attempt)), [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None).Dispose()
+  }}
+}}
+exit $status"#,
             ));
         }
 
@@ -915,19 +942,35 @@ gate="$(dd bs=1 count={execute_gate_length} 2>/dev/null)" || exit 75
 state_root="${{SATELLE_STATE_DIR:-${{XDG_STATE_HOME:-$HOME/.local/state}}/satelle}}"
 lock_root="$state_root/bootstrap.lock"
 claim_path="$lock_root/$claim_basename"
-[ -d "$claim_path" ] && [ ! -L "$claim_path" ] || exit 75
-[ "$(cat "$claim_path/operation_id" 2>/dev/null)" = "$operation_id" ] || exit 75
-[ "$(cat "$claim_path/claim_identity" 2>/dev/null)" = "$claim_identity" ] || exit 75
-[ "$(cat "$claim_path/state" 2>/dev/null)" = mutation_started ] || exit 75
-[ "$(cat "$claim_path/mutation_phase" 2>/dev/null)" = "$phase" ] || exit 75
-[ "$(cat "$claim_path/mutation_attempt" 2>/dev/null)" = "$attempt" ] || exit 75
+exact_claim_attempt() {{
+  [ -d "$claim_path" ] && [ ! -L "$claim_path" ] &&
+  [ "$(cat "$claim_path/operation_id" 2>/dev/null)" = "$operation_id" ] &&
+  [ "$(cat "$claim_path/claim_identity" 2>/dev/null)" = "$claim_identity" ] &&
+  [ "$(cat "$claim_path/state" 2>/dev/null)" = mutation_started ] &&
+  [ "$(cat "$claim_path/mutation_phase" 2>/dev/null)" = "$phase" ] &&
+  [ "$(cat "$claim_path/mutation_attempt" 2>/dev/null)" = "$attempt" ]
+}}
+exact_terminal_attempt() {{
+  exact_claim_attempt &&
+  [ -d "$claim_path/execution_started.$attempt" ] &&
+  [ ! -L "$claim_path/execution_started.$attempt" ] &&
+  [ ! -e "$claim_path/execution_retiring.$attempt" ] &&
+  [ ! -L "$claim_path/execution_retiring.$attempt" ]
+}}
+exact_claim_attempt || exit 75
 mkdir "$claim_path/execution_started.$attempt" || exit 75
 set +e
 eval "$inner_command"
 status=$?
 set -e
-[ "$status" -eq 0 ] || exit "$status"
-if [ "$phase" != daemon_start ]; then mkdir "$claim_path/execution_succeeded.$attempt" || exit 75; fi"#,
+if exact_terminal_attempt; then
+  if [ "$status" -eq 0 ]; then
+    mkdir "$claim_path/execution_succeeded.$attempt" || exit 75
+  elif [ "$phase" = daemon_start ]; then
+    mkdir "$claim_path/execution_failed.$attempt" || exit 75
+  fi
+fi
+exit "$status""#,
             execute_gate_length = MUTATION_EXECUTE.len() + 1,
         );
         format!("sh -c {}", posix_quote(&script))
@@ -3713,6 +3756,10 @@ mod tests {
         assert!(posix.contains(MUTATION_EXECUTE));
         assert!(posix.contains("execution_started.$attempt"));
         assert!(posix.contains("execution_succeeded.$attempt"));
+        assert!(posix.contains("execution_failed.$attempt"));
+        assert!(posix.contains("exact_terminal_attempt"));
+        assert!(posix.contains("[ -d \"$claim_path/execution_started.$attempt\" ]"));
+        assert!(posix.contains("[ ! -e \"$claim_path/execution_retiring.$attempt\" ]"));
         assert!(posix.contains("claim_path=\"$lock_root/$claim_basename\""));
         assert!(!posix.contains("for candidate in"));
 
@@ -3736,6 +3783,11 @@ mod tests {
         assert!(script.contains(MUTATION_EXECUTE));
         assert!(script.contains("execution_started."));
         assert!(script.contains("execution_succeeded."));
+        assert!(script.contains("execution_failed."));
+        assert!(script.contains("$terminalClaimExact"));
+        assert!(script.contains("$terminalClaimItem.PSIsContainer"));
+        assert!(script.contains("$terminalStartedItem.PSIsContainer"));
+        assert!(script.contains("execution_retiring."));
         assert!(script.contains("[IO.FileMode]::CreateNew"));
         assert!(script.contains("[IO.FileShare]::None).Dispose()"));
         assert!(
@@ -3746,6 +3798,104 @@ mod tests {
         assert!(script.contains("[IO.FileAttributes]::ReparsePoint"));
         assert!(!script.contains("$claims = @("));
         assert!(script.contains("Invoke-Expression $innerCommand"));
+        assert_occurs_before(
+            &script,
+            "Invoke-Expression $innerCommand",
+            "$terminalClaimExact = $false",
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn posix_daemon_start_terminal_marker_requires_exact_postexecution_claim() {
+        let state = tempfile::tempdir().expect("temporary state");
+        let operation_id = "daemon-start-operation";
+        let identity = "0123456789abcdef0123456789abcdef";
+        let basename = "claim.daemon-start-operation.0123456789abcdef";
+        let claim = state.path().join("bootstrap.lock").join(basename);
+        fs::create_dir_all(&claim).expect("create claim");
+        fs::write(claim.join("operation_id"), operation_id).expect("write operation id");
+        fs::write(claim.join("claim_identity"), identity).expect("write claim identity");
+
+        for (attempt, exit_code, advance_phase, retire_attempt) in [
+            ("11111111111111111111111111111111", 0, false, false),
+            ("22222222222222222222222222222222", 23, false, false),
+            ("33333333333333333333333333333333", 0, true, false),
+            ("44444444444444444444444444444444", 0, false, true),
+        ] {
+            fs::write(claim.join("state"), "mutation_started").expect("write claim state");
+            fs::write(claim.join("mutation_phase"), "daemon_start").expect("write mutation phase");
+            fs::write(claim.join("mutation_attempt"), attempt).expect("write mutation attempt");
+            let inner_command = if advance_phase {
+                format!(
+                    "printf '%s\\n' maintenance_handoff_begin >{}",
+                    posix_quote(
+                        claim
+                            .join("mutation_phase")
+                            .to_str()
+                            .expect("UTF-8 temporary path")
+                    )
+                )
+            } else if retire_attempt {
+                format!(
+                    "mv {} {}",
+                    posix_quote(
+                        claim
+                            .join(format!("execution_started.{attempt}"))
+                            .to_str()
+                            .expect("UTF-8 started marker path")
+                    ),
+                    posix_quote(
+                        claim
+                            .join(format!("execution_retiring.{attempt}"))
+                            .to_str()
+                            .expect("UTF-8 retiring marker path")
+                    )
+                )
+            } else {
+                format!("sh -c 'exit {exit_code}'")
+            };
+            let fenced = RemoteTarget::LinuxX64Gnu.fenced_mutation_command(
+                operation_id,
+                identity,
+                basename,
+                "daemon_start",
+                attempt,
+                &inner_command,
+            );
+            let mut child = Command::new("sh")
+                .arg("-c")
+                .arg(fenced)
+                .env("SATELLE_STATE_DIR", state.path())
+                .stdin(Stdio::piped())
+                .spawn()
+                .expect("run daemon start fence");
+            writeln!(
+                child.stdin.as_mut().expect("piped daemon fence stdin"),
+                "{MUTATION_EXECUTE}"
+            )
+            .expect("write execution gate");
+            drop(child.stdin.take());
+
+            assert_eq!(
+                child.wait().expect("wait for daemon start fence").code(),
+                Some(exit_code)
+            );
+            assert_eq!(
+                claim
+                    .join(format!("execution_succeeded.{attempt}"))
+                    .is_dir(),
+                exit_code == 0 && !advance_phase && !retire_attempt,
+            );
+            assert_eq!(
+                claim.join(format!("execution_failed.{attempt}")).is_dir(),
+                exit_code != 0 && !advance_phase && !retire_attempt,
+            );
+            assert_eq!(
+                claim.join(format!("execution_retiring.{attempt}")).is_dir(),
+                retire_attempt,
+            );
+        }
     }
 
     #[cfg(target_os = "linux")]
