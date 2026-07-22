@@ -377,6 +377,16 @@ pub fn assert_directory_tree_unchanged<T>(
                 root.display()
             )
         });
+
+    // FSEvents may deliver fixture activity after watcher registration. A
+    // create/remove readiness cycle establishes an ordered boundary without
+    // leaving the sentinel visible to the guarded operation.
+    let readiness_barrier = MutationBarrier::create(operation, &root);
+    let readiness_path = readiness_barrier.path().to_path_buf();
+    let _ = observe_transient_mutations(operation, &root, &readiness_path, &event_receiver);
+    readiness_barrier.remove(operation);
+    let _ = observe_transient_mutations(operation, &root, &readiness_path, &event_receiver);
+
     let result = run();
     let barrier = MutationBarrier::create(operation, &root);
     let mut changed_paths =
