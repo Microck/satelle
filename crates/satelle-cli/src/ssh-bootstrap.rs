@@ -1723,7 +1723,7 @@ printf 'removed=%s\nretained=%s\n' "$removed" "$retained""#,
             powershell_encoded_command(&script)
         } else {
             let script = format!(
-                "{}exec 3<&0; nohup {remote_binary} host start {timeout_args} --json <&3 3<&- >/dev/null 2>&1 & exec 3<&-",
+                "exec 3<&0; {}nohup {remote_binary} host start {timeout_args} --json <&3 3<&- >/dev/null 2>&1 & exec 3<&-",
                 posix_environment(environment),
             );
             format!("sh -c {}", posix_quote(&script))
@@ -4513,6 +4513,125 @@ mod tests {
         assert!(configured.contains("nohup /tmp/satelle host start"));
     }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn posix_durable_launch_passes_path_overrides_and_token_to_daemon() {
+        let state = tempfile::tempdir().expect("temporary state");
+        let operation_id = "durable-daemon-start-operation";
+        let identity = "0123456789abcdef0123456789abcdef";
+        let basename = "claim.durable-daemon-start-operation.0123456789abcdef";
+        let attempt = "11111111111111111111111111111111";
+        let claim = state.path().join("bootstrap.lock").join(basename);
+        fs::create_dir_all(&claim).expect("create claim");
+        fs::write(claim.join("operation_id"), operation_id).expect("write operation id");
+        fs::write(claim.join("claim_identity"), identity).expect("write claim identity");
+        fs::write(claim.join("state"), "mutation_started").expect("write claim state");
+        fs::write(claim.join("mutation_phase"), "daemon_start").expect("write mutation phase");
+        fs::write(claim.join("mutation_attempt"), attempt).expect("write mutation attempt");
+
+        let selected_home = state.path().join("selected home");
+        let selected_state = state.path().join("selected state");
+        fs::create_dir_all(&selected_home).expect("create selected home");
+        fs::create_dir_all(&selected_state).expect("create selected state");
+        let observation = state.path().join("durable-observation");
+        assert!(
+            Command::new("mkfifo")
+                .arg(&observation)
+                .status()
+                .expect("create observation fifo")
+                .success()
+        );
+
+        let daemon = state.path().join("durable-satelle");
+        fs::write(
+            &daemon,
+            format!(
+                "#!/bin/sh\n[ \"$1\" = host ] && [ \"$2\" = start ] || exit 64\nIFS= read -r token || token='<missing>'\nprintf '%s\\n%s\\n%s\\n' \"$SATELLE_HOME\" \"$SATELLE_STATE_DIR\" \"$token\" > {}\n[ \"$token\" != '<missing>' ]\n",
+                posix_quote(observation.to_str().expect("UTF-8 observation path")),
+            ),
+        )
+        .expect("write durable daemon");
+        fs::set_permissions(&daemon, fs::Permissions::from_mode(0o700))
+            .expect("make durable daemon executable");
+
+        let environment = [
+            ("SATELLE_HOME", selected_home.as_path()),
+            ("SATELLE_STATE_DIR", selected_state.as_path()),
+        ];
+        let durable = RemoteTarget::LinuxX64Gnu.durable_start_command_with_environment(
+            daemon.to_str().expect("UTF-8 durable daemon path"),
+            Duration::from_secs(1),
+            Duration::from_secs(1),
+            Duration::from_secs(1),
+            &environment,
+        );
+        assert_occurs_before(&durable, "exec 3<&0", POSIX_DAEMON_ENVIRONMENT_CLEAR);
+        assert_occurs_before(&durable, "SATELLE_STATE_DIR=", "nohup ");
+
+        let fenced = RemoteTarget::LinuxX64Gnu.fenced_mutation_command(
+            operation_id,
+            identity,
+            basename,
+            "daemon_start",
+            attempt,
+            &durable,
+        );
+        let observation_reader_path = observation.clone();
+        let (observation_sender, observation_receiver) = std::sync::mpsc::sync_channel(1);
+        let observation_reader = std::thread::spawn(move || {
+            observation_sender
+                .send(fs::read_to_string(observation_reader_path))
+                .expect("send durable observation");
+        });
+        let mut child = Command::new("sh")
+            .arg("-c")
+            .arg(fenced)
+            .env("SATELLE_STATE_DIR", state.path())
+            .stdin(Stdio::piped())
+            .spawn()
+            .expect("run durable daemon fence");
+        writeln!(
+            child.stdin.as_mut().expect("piped durable fence stdin"),
+            "{MUTATION_EXECUTE}\nexpected-bootstrap-token"
+        )
+        .expect("write durable execution gate and token");
+        drop(child.stdin.take());
+
+        assert!(child.wait().expect("wait for durable fence").success());
+        let observed = match observation_receiver.recv_timeout(Duration::from_secs(5)) {
+            Ok(observed) => observed.expect("read durable observation"),
+            Err(error) => {
+                drop(
+                    fs::OpenOptions::new()
+                        .write(true)
+                        .open(&observation)
+                        .expect("unblock observation reader"),
+                );
+                observation_reader
+                    .join()
+                    .expect("join unblocked observation reader");
+                panic!("durable daemon did not publish its observation: {error}");
+            }
+        };
+        observation_reader
+            .join()
+            .expect("join durable observation reader");
+        assert_eq!(
+            observed,
+            format!(
+                "{}\n{}\nexpected-bootstrap-token\n",
+                selected_home.display(),
+                selected_state.display(),
+            )
+        );
+        assert!(
+            claim
+                .join(format!("execution_succeeded.{attempt}"))
+                .is_dir()
+        );
+        assert!(!claim.join(format!("execution_failed.{attempt}")).exists());
+    }
+
     #[test]
     fn remote_daemon_path_environment_is_embedded_in_windows_durable_launch() {
         let empty = RemoteTarget::WindowsX64Msvc.durable_start_command_with_environment(
@@ -4658,9 +4777,9 @@ mod tests {
                 provider_timeout,
             ),
             concat!(
-                "sh -c 'unset SATELLE_HOME SATELLE_CONFIG_FILE SATELLE_STATE_DIR ",
+                "sh -c 'exec 3<&0; unset SATELLE_HOME SATELLE_CONFIG_FILE SATELLE_STATE_DIR ",
                 "SATELLE_CACHE_DIR SATELLE_LOG_DIR; ",
-                "exec 3<&0; nohup /tmp/satelle host start --bootstrap-token-stdin ",
+                "nohup /tmp/satelle host start --bootstrap-token-stdin ",
                 "--bootstrap-scope read --on-demand-idle-timeout-ms 75000 ",
                 "--bootstrap-native-readiness-timeout-ms 2500 ",
                 "--bootstrap-provider-smoke-timeout-ms 7500 --json ",
