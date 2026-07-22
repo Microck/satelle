@@ -797,6 +797,8 @@ fn completed_bootstrap_handoff_commit_allows_recovery_after_controller_loss() {
         bootstrap_lock
             .mark_mutation_started("daemon_start")
             .expect("record the verified daemon start");
+        commit_verified_bootstrap_mutation("crash-window-host", &mut bootstrap_lock)
+            .expect("commit the verified daemon start");
         complete_bootstrap_handoff("crash-window-host", client, &mut bootstrap_lock)
             .expect("complete the bootstrap maintenance handoff");
 
@@ -832,6 +834,8 @@ fn successful_bootstrap_handoff_release_does_not_repeat_the_completion_commit() 
         bootstrap_lock
             .mark_mutation_started("daemon_start")
             .expect("record the verified daemon start");
+        commit_verified_bootstrap_mutation("successful-release-host", &mut bootstrap_lock)
+            .expect("commit the verified daemon start");
         complete_bootstrap_handoff("successful-release-host", client, &mut bootstrap_lock)
             .expect("complete and commit the bootstrap maintenance handoff");
         bootstrap_lock
@@ -849,6 +853,19 @@ fn successful_bootstrap_handoff_release_does_not_repeat_the_completion_commit() 
         next_lock
             .release_unmodified()
             .expect("release the next bootstrap lock");
+
+        for phase in ["daemon_start", "maintenance_handoff_complete"] {
+            let committed = format!("{} {phase} ", bootstrap_lock::MUTATION_COMMITTED);
+            assert_eq!(
+                bootstrap_lock
+                    .exchanged_lock_lines()
+                    .iter()
+                    .filter(|line| line.starts_with(&committed))
+                    .count(),
+                1,
+                "{phase} must have exactly one commit owner"
+            );
+        }
     });
 }
 
@@ -874,6 +891,8 @@ fn prior_mutation_commit_precedes_maintenance_handoff_begin_for_both_phase_shape
             bootstrap_lock
                 .mark_mutation_started(phase)
                 .expect("record the verified prior mutation");
+            commit_verified_bootstrap_mutation("ordered-handoff-host", &mut bootstrap_lock)
+                .expect("commit the verified prior mutation at its owner boundary");
             complete_bootstrap_handoff("ordered-handoff-host", client, &mut bootstrap_lock)
                 .expect("complete the bootstrap maintenance handoff");
             bootstrap_lock
@@ -898,6 +917,15 @@ fn prior_mutation_commit_precedes_maintenance_handoff_begin_for_both_phase_shape
             assert!(
                 prior_commit_index < maintenance_begin_index,
                 "{phase} must be committed before maintenance handoff begins"
+            );
+            assert_eq!(
+                bootstrap_lock
+                    .exchanged_lock_lines()
+                    .iter()
+                    .filter(|line| line.starts_with(&prior_commit))
+                    .count(),
+                1,
+                "{phase} must not be committed again by maintenance handoff"
             );
         }
     });
@@ -925,9 +953,16 @@ fn committed_prior_mutation_recovers_after_controller_loss_for_both_phase_shapes
             bootstrap_lock
                 .mark_mutation_started(phase)
                 .expect("record the verified prior mutation");
-            bootstrap_lock
-                .commit_current_mutation()
+            commit_verified_bootstrap_mutation("prior-commit-recovery-host", &mut bootstrap_lock)
                 .expect("commit the verified prior mutation");
+            if phase == "daemon_start" {
+                let former_post_launch_failure =
+                    Err::<(), _>(SatelleError::host_unreachable("prior-commit-recovery-host"));
+                assert!(
+                    former_post_launch_failure.is_err(),
+                    "fallible tunnel, client, or token work may fail after launch readiness"
+                );
+            }
             drop(bootstrap_lock);
 
             let mut recovered_lock = acquire_bootstrap_lock_for_operation_with_ssh(

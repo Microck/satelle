@@ -1032,6 +1032,7 @@ impl SshSetupTransport {
             verification,
             ExistingTokenVerification::AuthenticationRejected { .. }
         ) {
+            commit_verified_bootstrap_mutation(&self.alias, bootstrap_lock)?;
             complete_bootstrap_handoff(&self.alias, &bootstrap_client, bootstrap_lock)?;
         }
         Ok(verification)
@@ -1790,6 +1791,7 @@ fn durable_ssh_clients(
             )
             .map_err(|error| map_ssh_daemon_bootstrap_error(alias, error))?;
             wait_for_durable_daemon(alias, || client.capabilities())?;
+            commit_verified_bootstrap_mutation(alias, &mut bootstrap_lock)?;
             let bootstrap_token = ApiBearerToken::parse(raw_bootstrap_token.as_str())
                 .map_err(|_| SatelleError::host_unreachable(alias))?;
             let bootstrap_client = DaemonClient::loopback_with_timeout(
@@ -1844,14 +1846,20 @@ fn confirm_bootstrap_lock(
         .map_err(|_| SatelleError::host_unreachable(host))
 }
 
+fn commit_verified_bootstrap_mutation(
+    host: &str,
+    bootstrap_lock: &mut ssh_bootstrap::SshBootstrapLock,
+) -> Result<(), SatelleError> {
+    bootstrap_lock
+        .commit_current_mutation()
+        .map_err(|_| SatelleError::host_unreachable(host))
+}
+
 fn complete_bootstrap_handoff(
     host: &str,
     client: &DaemonClient,
     bootstrap_lock: &mut ssh_bootstrap::SshBootstrapLock,
 ) -> Result<(), SatelleError> {
-    bootstrap_lock
-        .commit_current_mutation()
-        .map_err(|_| SatelleError::host_unreachable(host))?;
     bootstrap_lock
         .mark_mutation_started("maintenance_handoff_begin")
         .map_err(|_| SatelleError::host_unreachable(host))?;
@@ -1980,6 +1988,7 @@ fn bootstrap_ssh_clients(
     client
         .capabilities()
         .map_err(|error| direct_transport_error(alias, error))?;
+    commit_verified_bootstrap_mutation(alias, &mut bootstrap_lock)?;
     complete_bootstrap_handoff(alias, &client, &mut bootstrap_lock)?;
     bootstrap_lock
         .release_committed_handoff()
@@ -2014,6 +2023,10 @@ fn setup_bootstrap_client(
         bootstrap_lock,
     )
     .map_err(|error| map_ssh_daemon_bootstrap_error(alias, error))?;
+    // launch_ephemeral returns only after the fenced process publishes and
+    // validates its ready address. Commit that verified daemon_start before
+    // tunnel/client/token work creates a new Controller-loss window.
+    commit_verified_bootstrap_mutation(alias, bootstrap_lock)?;
     let tunnel =
         SshTunnel::open_to(destination, bootstrap.remote_port()).map_err(|error| match error {
             ssh_tunnel::SshTunnelError::HostKeyVerificationRequired => {

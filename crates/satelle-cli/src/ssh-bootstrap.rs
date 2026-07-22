@@ -1488,11 +1488,14 @@ printf 'removed=%s\nretained=%s\n' "$removed" "$retained""#,
             );
             powershell_encoded_command(&script)
         } else {
-            let script = format!(
-                "{}exec {remote_binary} host release-state",
+            // The fence wrapper must remain alive to record the successful
+            // release. Running the binary directly also keeps it as the
+            // wrapper's child instead of inserting another shell process.
+            format!(
+                "{}{remote_binary} host release-state",
                 posix_environment(environment),
-            );
-            format!("sh -c {}", posix_quote(&script))
+                remote_binary = posix_quote(remote_binary),
+            )
         }
     }
 
@@ -3335,6 +3338,79 @@ mod tests {
         assert!(script.contains("Invoke-Expression $innerCommand"));
     }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn posix_release_fence_retains_wrapper_ownership_and_records_only_success() {
+        let state = tempfile::tempdir().expect("temporary state");
+        let operation_id = "release-operation";
+        let identity = "0123456789abcdef0123456789abcdef";
+        let basename = "claim.release-operation.0123456789abcdef";
+        let claim = state.path().join("bootstrap.lock").join(basename);
+        fs::create_dir_all(&claim).expect("create claim");
+        fs::write(claim.join("operation_id"), operation_id).expect("write operation id");
+        fs::write(claim.join("claim_identity"), identity).expect("write claim identity");
+
+        for (attempt, exit_code) in [("successful-attempt", 0), ("failed-attempt", 23)] {
+            fs::write(claim.join("state"), "mutation_started").expect("write claim state");
+            fs::write(claim.join("mutation_phase"), "state_owner_release")
+                .expect("write mutation phase");
+            fs::write(claim.join("mutation_attempt"), attempt).expect("write mutation attempt");
+
+            let observed_parent = state.path().join(format!("parent-{attempt}"));
+            let release_binary = state.path().join(format!("release-{attempt}"));
+            fs::write(
+                &release_binary,
+                format!(
+                    "#!/bin/sh\ntr '\\000' ' ' </proc/$PPID/cmdline >{}\nexit {exit_code}\n",
+                    posix_quote(observed_parent.to_str().expect("UTF-8 temporary path")),
+                ),
+            )
+            .expect("write release executable");
+            fs::set_permissions(&release_binary, fs::Permissions::from_mode(0o700))
+                .expect("make release executable");
+
+            let release = RemoteTarget::LinuxX64Gnu
+                .release_state_command(release_binary.to_str().expect("UTF-8 temporary path"));
+            assert!(!release.contains("exec "));
+            assert!(!release.starts_with("sh -c "));
+            let fenced = RemoteTarget::LinuxX64Gnu.fenced_mutation_command(
+                operation_id,
+                identity,
+                basename,
+                "state_owner_release",
+                attempt,
+                &release,
+            );
+            let mut child = Command::new("sh")
+                .arg("-c")
+                .arg(fenced)
+                .env("SATELLE_STATE_DIR", state.path())
+                .stdin(Stdio::piped())
+                .spawn()
+                .expect("run release fence");
+            writeln!(
+                child.stdin.as_mut().expect("piped release fence stdin"),
+                "{MUTATION_EXECUTE}"
+            )
+            .expect("write execution gate");
+            drop(child.stdin.take());
+            let status = child.wait().expect("wait for release fence");
+
+            assert_eq!(status.code(), Some(exit_code));
+            let parent = fs::read_to_string(&observed_parent).expect("read observed parent");
+            assert!(
+                parent.contains("operation_id='release-operation'"),
+                "release binary was not a direct child of the fence wrapper: {parent}"
+            );
+            assert_eq!(
+                claim
+                    .join(format!("execution_succeeded.{attempt}"))
+                    .is_dir(),
+                exit_code == 0,
+            );
+        }
+    }
+
     #[test]
     fn bootstrap_ready_returns_only_the_exact_published_claim_basename() {
         let identity = "0123456789abcdef0123456789abcdef";
@@ -3404,9 +3480,9 @@ mod tests {
         assert_eq!(
             RemoteTarget::LinuxX64Gnu.release_state_command(".cache/satelle/satelle"),
             concat!(
-                "sh -c 'unset SATELLE_HOME SATELLE_CONFIG_FILE SATELLE_STATE_DIR ",
+                "unset SATELLE_HOME SATELLE_CONFIG_FILE SATELLE_STATE_DIR ",
                 "SATELLE_CACHE_DIR SATELLE_LOG_DIR; ",
-                "exec .cache/satelle/satelle host release-state'"
+                "'.cache/satelle/satelle' host release-state"
             )
         );
         let windows =

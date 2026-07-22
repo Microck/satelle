@@ -1559,11 +1559,14 @@ mod history_target_tests {
     }
 
     #[test]
-    fn durable_ssh_idle_timeout_is_an_explicit_internal_argument() {
+    fn durable_ssh_idle_timeout_accepts_bootstrap_handoff_mode() {
         let cli = Cli::try_parse_from([
             "satelle",
             "host",
             "start",
+            "--bootstrap-token-stdin",
+            "--bootstrap-scope",
+            "read",
             "--on-demand-idle-timeout-ms",
             "75000",
         ])
@@ -1576,7 +1579,61 @@ mod history_target_tests {
             panic!("expected Host start command");
         };
         assert_eq!(command.on_demand_idle_timeout_ms, Some(75_000));
-        assert!(!command.bootstrap_token_stdin);
+        assert!(command.bootstrap_token_stdin);
+        validate_host_start_mode(&command)
+            .expect("durable SSH relaunch accepts its process-local bootstrap credential");
+    }
+
+    #[test]
+    fn host_start_mode_validation_preserves_incompatible_combinations() {
+        let cases = [
+            (
+                vec![
+                    "--foreground",
+                    "--bootstrap-token-stdin",
+                    "--bootstrap-scope",
+                    "read",
+                ],
+                "SSH bootstrap tokens are valid only for on-demand Host Daemons",
+            ),
+            (
+                vec![
+                    "--bootstrap-token-stdin",
+                    "--bootstrap-scope",
+                    "read",
+                    "--tls-cert",
+                    "cert.pem",
+                    "--tls-key",
+                    "key.pem",
+                ],
+                "SSH bootstrap Host Daemons use loopback plaintext inside the authenticated tunnel and do not accept TLS files",
+            ),
+            (
+                vec!["--foreground", "--on-demand-idle-timeout-ms", "75000"],
+                "the resolved on-demand idle timeout is valid only for durable on-demand Host Daemons",
+            ),
+            (
+                vec!["--on-demand-idle-timeout-ms", "0"],
+                "the resolved on-demand idle timeout must be positive",
+            ),
+        ];
+
+        for (arguments, expected_message) in cases {
+            let cli =
+                Cli::try_parse_from(["satelle", "host", "start"].into_iter().chain(arguments))
+                    .expect("parse internal Host start command");
+            let Command::Host {
+                command: HostCommand::Start(command),
+            } = cli.command
+            else {
+                panic!("expected Host start command");
+            };
+
+            let error = validate_host_start_mode(&command)
+                .expect_err("incompatible Host start mode must fail");
+            assert_eq!(error.code, ErrorCode::InvalidUsage);
+            assert_eq!(error.message, expected_message);
+        }
     }
 
     #[test]
@@ -3442,33 +3499,36 @@ fn trust_host(
     }
 }
 
+fn validate_host_start_mode(command: &HostStartCommand) -> Result<(), SatelleError> {
+    if command.foreground && command.bootstrap_token_stdin {
+        return Err(SatelleError::invalid_usage(
+            "SSH bootstrap tokens are valid only for on-demand Host Daemons",
+        ));
+    }
+    if command.bootstrap_token_stdin && (command.tls_cert.is_some() || command.tls_key.is_some()) {
+        return Err(SatelleError::invalid_usage(
+            "SSH bootstrap Host Daemons use loopback plaintext inside the authenticated tunnel and do not accept TLS files",
+        ));
+    }
+    if command.on_demand_idle_timeout_ms.is_some() && command.foreground {
+        return Err(SatelleError::invalid_usage(
+            "the resolved on-demand idle timeout is valid only for durable on-demand Host Daemons",
+        ));
+    }
+    if command.on_demand_idle_timeout_ms == Some(0) {
+        return Err(SatelleError::invalid_usage(
+            "the resolved on-demand idle timeout must be positive",
+        ));
+    }
+    Ok(())
+}
+
 fn start_host_daemon(
     command: HostStartCommand,
     config: ConfigContext<'_>,
     format: OutputFormat,
 ) -> Result<(), CliFailure> {
-    if command.foreground && command.bootstrap_token_stdin {
-        return Err(failure(SatelleError::invalid_usage(
-            "SSH bootstrap tokens are valid only for on-demand Host Daemons",
-        )));
-    }
-    if command.bootstrap_token_stdin && (command.tls_cert.is_some() || command.tls_key.is_some()) {
-        return Err(failure(SatelleError::invalid_usage(
-            "SSH bootstrap Host Daemons use loopback plaintext inside the authenticated tunnel and do not accept TLS files",
-        )));
-    }
-    if command.on_demand_idle_timeout_ms.is_some()
-        && (command.foreground || command.bootstrap_token_stdin)
-    {
-        return Err(failure(SatelleError::invalid_usage(
-            "the resolved on-demand idle timeout is valid only for durable on-demand Host Daemons",
-        )));
-    }
-    if command.on_demand_idle_timeout_ms == Some(0) {
-        return Err(failure(SatelleError::invalid_usage(
-            "the resolved on-demand idle timeout must be positive",
-        )));
-    }
+    validate_host_start_mode(&command).map_err(failure)?;
     if command.bootstrap_operation_id.is_some() != command.bootstrap_operation_kind.is_some() {
         return Err(failure(SatelleError::invalid_usage(
             "Bootstrap Lock handoff requires both operation id and operation kind",
@@ -4710,6 +4770,7 @@ mod on_demand_idle_timeout_tests {
         assert!(should_resolve_on_demand_host(false, false, false));
         assert!(!should_resolve_on_demand_host(false, false, true));
         assert!(!should_resolve_on_demand_host(false, true, false));
+        assert!(!should_resolve_on_demand_host(false, true, true));
         assert!(!should_resolve_on_demand_host(true, false, false));
     }
 
