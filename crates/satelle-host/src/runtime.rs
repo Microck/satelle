@@ -54,6 +54,13 @@ use std::ops::{Deref, DerefMut};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
 
+#[cfg(test)]
+thread_local! {
+    static FAIL_NEXT_MAINTENANCE_START_AND_RETAIN: std::cell::Cell<bool> = const {
+        std::cell::Cell::new(false)
+    };
+}
+
 #[derive(Debug)]
 pub(crate) struct RuntimeTurnOutcome {
     pub(crate) session: PublicSession,
@@ -229,6 +236,43 @@ fn heartbeat_start_failure(error: std::io::Error) -> SatelleError {
         recovery_command: Some("retry after verifying Host process resources".to_string()),
         source_detail: None,
         details: std::collections::BTreeMap::new(),
+    }
+}
+
+fn start_maintenance_operation_guard(
+    engine: &Arc<RuntimeEngine>,
+    capability: crate::storage::MaintenanceLeaseCapability,
+) -> Result<MaintenanceOperationGuard, SatelleError> {
+    #[cfg(test)]
+    if FAIL_NEXT_MAINTENANCE_START_AND_RETAIN.with(|fail| fail.replace(false)) {
+        let operation_id = capability.operation_id().to_string();
+        engine
+            .lock_storage()?
+            .force_bootstrap_retain_conflict_for_test(&operation_id)
+            .map_err(model::storage_failure)?;
+        return retain_after_heartbeat_start_failure(
+            engine,
+            std::io::Error::other("forced maintenance heartbeat startup failure"),
+            capability,
+        );
+    }
+    match MaintenanceOperationGuard::start(Arc::clone(&engine.storage), capability) {
+        Ok(operation) => Ok(operation),
+        Err((error, capability)) => retain_after_heartbeat_start_failure(engine, error, capability),
+    }
+}
+
+fn retain_after_heartbeat_start_failure(
+    engine: &Arc<RuntimeEngine>,
+    heartbeat_error: std::io::Error,
+    capability: crate::storage::MaintenanceLeaseCapability,
+) -> Result<MaintenanceOperationGuard, SatelleError> {
+    let owner = capability.lease_owner().clone();
+    match engine.lock_storage()?.retain_lease_recovery(&owner) {
+        Ok(()) => Err(heartbeat_start_failure(heartbeat_error)),
+        Err(recovery_error) => Err(model::integrity_failure(format!(
+            "the Host lease heartbeat driver could not start and the committed maintenance operation could not enter recovery_pending: heartbeat={heartbeat_error}; recovery={recovery_error}"
+        ))),
     }
 }
 
@@ -1339,6 +1383,28 @@ impl RuntimeHandle {
         &self,
         plan: &SetupRunPlan,
     ) -> Result<MaintenanceOperationHandle, SatelleError> {
+        self.begin_maintenance_operation(plan, Storage::begin_setup_run)
+    }
+
+    pub(crate) fn begin_bootstrap_maintenance(
+        &self,
+        plan: &SetupRunPlan,
+    ) -> Result<MaintenanceOperationHandle, SatelleError> {
+        self.begin_maintenance_operation(plan, Storage::begin_bootstrap_maintenance)
+    }
+
+    fn begin_maintenance_operation(
+        &self,
+        plan: &SetupRunPlan,
+        begin: impl FnOnce(
+            &mut Storage,
+            &SetupRunPlan,
+            LeaseOwner,
+        ) -> Result<
+            crate::storage::MaintenanceLeaseCapability,
+            crate::storage::StorageError,
+        >,
+    ) -> Result<MaintenanceOperationHandle, SatelleError> {
         let engine = self.engine()?;
         let capability = {
             let mut storage = engine.lock_storage()?;
@@ -1351,22 +1417,9 @@ impl RuntimeHandle {
                 acquired_at,
             )
             .map_err(model::storage_failure)?;
-            storage
-                .begin_setup_run(plan, owner)
-                .map_err(model::storage_failure)?
+            begin(&mut storage, plan, owner).map_err(model::storage_failure)?
         };
-        let operation =
-            match MaintenanceOperationGuard::start(Arc::clone(&engine.storage), capability) {
-                Ok(operation) => operation,
-                Err((error, capability)) => {
-                    let owner = capability.lease_owner().clone();
-                    engine
-                        .lock_storage()?
-                        .retain_lease_recovery(&owner)
-                        .map_err(model::storage_failure)?;
-                    return Err(heartbeat_start_failure(error));
-                }
-            };
+        let operation = start_maintenance_operation_guard(&engine, capability)?;
         Ok(MaintenanceOperationHandle {
             operation_id: plan.run_id().to_string(),
             operation: Some(operation),
@@ -1393,18 +1446,7 @@ impl RuntimeHandle {
                 .adopt_recovery_maintenance(operation_id, owner)
                 .map_err(model::storage_failure)?
         };
-        let operation =
-            match MaintenanceOperationGuard::start(Arc::clone(&engine.storage), capability) {
-                Ok(operation) => operation,
-                Err((error, capability)) => {
-                    let owner = capability.lease_owner().clone();
-                    engine
-                        .lock_storage()?
-                        .retain_lease_recovery(&owner)
-                        .map_err(model::storage_failure)?;
-                    return Err(heartbeat_start_failure(error));
-                }
-            };
+        let operation = start_maintenance_operation_guard(&engine, capability)?;
         Ok(MaintenanceOperationHandle {
             operation_id: operation_id.to_string(),
             operation: Some(operation),
@@ -1564,6 +1606,21 @@ impl RuntimeHandle {
         let status = engine
             .lock_storage()?
             .finish_setup_run_and_release_maintenance(guard.capability(), finished_at)
+            .map_err(model::storage_failure)?;
+        operation.disarm();
+        Ok(status)
+    }
+
+    pub(crate) fn complete_bootstrap_maintenance(
+        &self,
+        operation: &mut MaintenanceOperationHandle,
+        finished_at: time::OffsetDateTime,
+    ) -> Result<SetupRunStatus, SatelleError> {
+        let engine = self.engine()?;
+        let guard = operation.operation().map_err(model::storage_failure)?;
+        let status = engine
+            .lock_storage()?
+            .complete_bootstrap_maintenance(guard.capability(), finished_at)
             .map_err(model::storage_failure)?;
         operation.disarm();
         Ok(status)
@@ -2113,6 +2170,16 @@ impl RuntimeHandle {
         });
         assert!(poisoner.join().is_err());
         Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fail_next_maintenance_start_and_retain_for_tests(&self) {
+        FAIL_NEXT_MAINTENANCE_START_AND_RETAIN.with(|fail| {
+            assert!(
+                !fail.replace(true),
+                "maintenance failpoint was already armed"
+            );
+        });
     }
 
     fn engine(&self) -> Result<Arc<RuntimeEngine>, SatelleError> {

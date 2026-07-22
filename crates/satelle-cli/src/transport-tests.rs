@@ -15,7 +15,9 @@ use satelle_host::{
 };
 use satelle_transport::{DaemonServer, DaemonServerConfig};
 use std::io::{Read, Write};
-use std::net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream};
+#[cfg(unix)]
+use std::net::TcpStream;
+use std::net::{Ipv4Addr, SocketAddr, TcpListener};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Condvar, Mutex, mpsc};
@@ -1330,7 +1332,7 @@ fn connection_capacity_rejection_is_terminal_for_the_exact_lock_attempt() {
         )
         .expect_err("HTTP connection capacity rejects maintenance before its handler");
 
-        assert_eq!(error.code, ErrorCode::CapacityExceeded);
+        assert_eq!(error.code, ErrorCode::RemoteExecution);
         assert!(
             ledger
                 .load_setup_run(operation_id)

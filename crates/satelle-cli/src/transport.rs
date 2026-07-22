@@ -2520,19 +2520,6 @@ fn api_code_error(host: &str, code: ApiErrorCode) -> SatelleError {
         ApiErrorCode::HostIdentityMismatch => SatelleError::host_identity_mismatch(host),
         ApiErrorCode::HostUnreachable => SatelleError::host_unreachable(host),
         ApiErrorCode::StateConflict => SatelleError::state_conflict(),
-        ApiErrorCode::CapacityExceeded => SatelleError {
-            code: ErrorCode::CapacityExceeded,
-            message: format!("Host '{host}' has no HTTP connection capacity available"),
-            recovery_command: Some("retry after an active Host connection closes".to_string()),
-            source_detail: None,
-            details: std::collections::BTreeMap::from([
-                (
-                    "host".to_string(),
-                    serde_json::Value::String(host.to_string()),
-                ),
-                ("retryable".to_string(), serde_json::Value::Bool(true)),
-            ]),
-        },
         ApiErrorCode::NativeReadinessTimeout => SatelleError::native_readiness_timeout(),
         ApiErrorCode::ProviderSmokeTestTimeout => SatelleError::provider_smoke_test_timeout(),
         ApiErrorCode::UnsupportedProviderComputerUse => {

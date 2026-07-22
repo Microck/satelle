@@ -340,6 +340,61 @@ mod bootstrap_maintenance_tests {
         assert_eq!(SetupRunStatus::Completed, run.status());
         assert_eq!(SetupActionStatus::Completed, run.actions()[0].status());
     }
+
+    #[test]
+    fn bootstrap_heartbeat_recovery_transition_failure_is_nonterminal_and_recoverable() {
+        let state = TestStateDir::new().expect("create state directory");
+        let operation_id = "bootstrap-operation-heartbeat-retain-failure";
+        {
+            let original =
+                HostService::local_demo_for_tests_at(state.path()).expect("create original Host");
+            original
+                .runtime
+                .fail_next_maintenance_start_and_retain_for_tests();
+            let error = original
+                .acquire_bootstrap_maintenance(operation_id, SetupOperationKind::Repair)
+                .expect_err("forced heartbeat and retain failure must reject acquisition");
+            assert_eq!(satelle_core::ErrorCode::StorageIntegrityFailed, error.code);
+            assert_ne!(satelle_core::ErrorCode::StateConflict, error.code);
+            let run = original
+                .load_setup_run(operation_id)
+                .expect("load committed bootstrap run")
+                .expect("committed bootstrap run exists");
+            assert_eq!(SetupRunStatus::Running, run.status());
+            assert_eq!(SetupActionStatus::Started, run.actions()[0].status());
+        }
+
+        {
+            let replacement = HostService::local_demo_for_tests_at(state.path())
+                .expect("create replacement Host");
+            replacement
+                .runtime
+                .fail_next_maintenance_start_and_retain_for_tests();
+            let error = replacement
+                .acquire_bootstrap_maintenance(operation_id, SetupOperationKind::Repair)
+                .expect_err("forced adoption heartbeat and retain failure must reject acquisition");
+            assert_eq!(satelle_core::ErrorCode::StorageIntegrityFailed, error.code);
+            assert_ne!(satelle_core::ErrorCode::StateConflict, error.code);
+        }
+
+        let final_service =
+            HostService::local_demo_for_tests_at(state.path()).expect("create final Host");
+        final_service
+            .acquire_bootstrap_maintenance(operation_id, SetupOperationKind::Repair)
+            .expect("adopt the retained operation after both failures");
+        final_service
+            .complete_bootstrap_maintenance(operation_id)
+            .expect("complete the recovered bootstrap operation");
+        let completed = final_service
+            .load_setup_run(operation_id)
+            .expect("load completed bootstrap run")
+            .expect("completed bootstrap run exists");
+        assert_eq!(SetupRunStatus::Completed, completed.status());
+        assert_eq!(
+            SetupActionStatus::Completed,
+            completed.actions()[0].status()
+        );
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -486,13 +541,7 @@ impl HostService {
                 time::OffsetDateTime::now_utc(),
                 vec![action],
             )?;
-            let operation = self.runtime.begin_setup_run(&plan)?;
-            self.runtime.start_setup_action(
-                &operation,
-                "bootstrap-handoff",
-                time::OffsetDateTime::now_utc(),
-            )?;
-            operation
+            self.runtime.begin_bootstrap_maintenance(&plan)?
         };
         *slot = Some(operation);
         Ok(())
@@ -523,30 +572,8 @@ impl HostService {
         if operation.operation_id() != operation_id {
             return Err(SatelleError::state_conflict());
         }
-        let run = self
-            .runtime
-            .load_setup_run(operation_id)?
-            .ok_or_else(SatelleError::state_conflict)?;
-        let action_status = run
-            .actions()
-            .iter()
-            .find(|action| action.action_id() == "bootstrap-handoff")
-            .map(SetupActionRecord::status)
-            .ok_or_else(SatelleError::state_conflict)?;
-        match action_status {
-            SetupActionStatus::Started => {
-                self.runtime
-                    .complete_setup_action_after_verified_postcondition(
-                        operation,
-                        "bootstrap-handoff",
-                        time::OffsetDateTime::now_utc(),
-                    )?;
-            }
-            SetupActionStatus::Completed => {}
-            _ => return Err(SatelleError::state_conflict()),
-        }
         self.runtime
-            .finish_setup_run(operation, time::OffsetDateTime::now_utc())?;
+            .complete_bootstrap_maintenance(operation, time::OffsetDateTime::now_utc())?;
         *slot = None;
         Ok(())
     }
