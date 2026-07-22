@@ -937,8 +937,9 @@ claim_basename={claim_basename}
 phase={phase}
 attempt={attempt}
 inner_command={command}
-gate="$(dd bs=1 count={execute_gate_length} 2>/dev/null)" || exit 75
-[ "$gate" = '{MUTATION_EXECUTE}' ] || exit 75
+gate="$(dd bs=1 count={execute_gate_length} 2>/dev/null && printf x)" || exit 75
+[ "$gate" = '{MUTATION_EXECUTE}
+x' ] || exit 75
 state_root="${{SATELLE_STATE_DIR:-${{XDG_STATE_HOME:-$HOME/.local/state}}/satelle}}"
 lock_root="$state_root/bootstrap.lock"
 claim_path="$lock_root/$claim_basename"
@@ -979,9 +980,11 @@ exit "$status""#,
     fn upload_command(self, staged: &str, digest: &str) -> String {
         if self.is_windows() {
             let cleanup = self.windows_staged_failure_cleanup(staged);
+            let ancestry_guard = self.windows_cache_directory_guard(remote_parent(staged));
             return powershell_encoded_command(&format!(
                 r#"$ErrorActionPreference = 'Stop'
 {cleanup}
+{ancestry_guard}
 $digestMismatch = $false
 try {{
 $inputStream = [Console]::OpenStandardInput()
@@ -998,6 +1001,7 @@ if ((Get-FileHash -Algorithm SHA256 -LiteralPath $path).Hash.ToLowerInvariant() 
   throw $originalFailure
 }}"#,
                 cleanup = cleanup,
+                ancestry_guard = ancestry_guard,
                 digest = powershell_quote(digest),
                 digest_mismatch_exit_code = STAGED_DIGEST_MISMATCH_EXIT_CODE,
             ));
@@ -1013,9 +1017,10 @@ if ((Get-FileHash -Algorithm SHA256 -LiteralPath $path).Hash.ToLowerInvariant() 
 
     fn create_directory_command(self, directory: &str) -> String {
         if self.is_windows() {
+            let ancestry_guard = self.windows_cache_directory_guard(directory);
             let script = format!(
                 concat!(
-                    "$ErrorActionPreference='Stop'; ",
+                    "$ErrorActionPreference='Stop'; {ancestry_guard}",
                     "$separator=[IO.Path]::DirectorySeparatorChar; ",
                     "$root=[IO.Path]::GetFullPath(({}).Replace('/', $separator)); ",
                     "$path=[IO.Path]::GetFullPath(({}).Replace('/', $separator)); ",
@@ -1027,6 +1032,7 @@ if ((Get-FileHash -Algorithm SHA256 -LiteralPath $path).Hash.ToLowerInvariant() 
                     "$currentPath=[IO.Path]::GetFullPath($current.FullName); ",
                     "if (-not [StringComparer]::OrdinalIgnoreCase.Equals($currentPath,$root) -and ",
                     "-not $currentPath.StartsWith($rootPrefix,[StringComparison]::OrdinalIgnoreCase)) {{ exit 1 }}; ",
+                    "if (($current.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {{ exit 1 }}; ",
                     "$acl=Get-Acl -LiteralPath $currentPath; $acl.SetAccessRuleProtection($true,$false); ",
                     "foreach ($rule in @($acl.Access)) {{ [void]$acl.RemoveAccessRuleAll($rule) }}; ",
                     "$rule=New-Object System.Security.AccessControl.FileSystemAccessRule(",
@@ -1038,6 +1044,7 @@ if ((Get-FileHash -Algorithm SHA256 -LiteralPath $path).Hash.ToLowerInvariant() 
                 ),
                 powershell_quote(self.remote_cache_root()),
                 powershell_quote(directory),
+                ancestry_guard = ancestry_guard,
             );
             powershell_encoded_command(&script)
         } else {
@@ -1053,22 +1060,28 @@ if ((Get-FileHash -Algorithm SHA256 -LiteralPath $path).Hash.ToLowerInvariant() 
     fn promote_command(self, staged: &str, final_path: &str) -> String {
         if self.is_windows() {
             let cleanup = self.windows_staged_failure_cleanup(staged);
+            let staged_guard = self.windows_cache_leaf_guard(staged);
+            let final_parent_guard = self.windows_cache_directory_guard(remote_parent(final_path));
             let script = format!(
                 concat!(
-                    "$ErrorActionPreference='Stop'; {cleanup}",
-                    "try {{ Move-Item -Force -LiteralPath $path -Destination {}; ",
-                    "$acl=Get-Acl -LiteralPath {}; $acl.SetAccessRuleProtection($true,$false); ",
+                    "$ErrorActionPreference='Stop'; {cleanup}{staged_guard}{final_parent_guard}",
+                    "$finalPath={}; if (Test-Path -LiteralPath $finalPath) {{ ",
+                    "$finalItem=Get-Item -LiteralPath $finalPath -Force -ErrorAction Stop; ",
+                    "if (($finalItem -isnot [IO.FileInfo]) -or $finalItem.PSIsContainer -or ",
+                    "(($finalItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0)) {{ exit 1 }} }}; ",
+                    "try {{ Move-Item -Force -LiteralPath $path -Destination $finalPath; ",
+                    "$acl=Get-Acl -LiteralPath $finalPath; $acl.SetAccessRuleProtection($true,$false); ",
                     "foreach ($rule in @($acl.Access)) {{ [void]$acl.RemoveAccessRuleAll($rule) }}; ",
                     "$rule=New-Object System.Security.AccessControl.FileSystemAccessRule(",
                     "[System.Security.Principal.WindowsIdentity]::GetCurrent().Name,'FullControl','Allow'); ",
-                    "$acl.SetAccessRule($rule); Set-Acl -LiteralPath {} -AclObject $acl }} catch {{ ",
+                    "$acl.SetAccessRule($rule); Set-Acl -LiteralPath $finalPath -AclObject $acl }} catch {{ ",
                     "$originalFailure=$_; try {{ Remove-ExactStagedOnFailure }} catch {{ exit 75 }}; ",
                     "throw $originalFailure }}",
                 ),
                 powershell_quote(final_path),
-                powershell_quote(final_path),
-                powershell_quote(final_path),
                 cleanup = cleanup,
+                staged_guard = staged_guard,
+                final_parent_guard = final_parent_guard,
             );
             powershell_encoded_command(&script)
         } else {
@@ -1082,34 +1095,80 @@ if ((Get-FileHash -Algorithm SHA256 -LiteralPath $path).Hash.ToLowerInvariant() 
         }
     }
 
-    fn windows_cache_leaf_guard(self, remote_path: &str) -> String {
+    fn windows_cache_path_context(self, remote_path: &str, failure_exit_code: u8) -> String {
         debug_assert!(self.is_windows());
         format!(
             concat!(
                 "$separator=[IO.Path]::DirectorySeparatorChar; ",
                 "$root=[IO.Path]::GetFullPath(({}).Replace('/', $separator)); ",
                 "$path=[IO.Path]::GetFullPath(({}).Replace('/', $separator)); ",
+                "$anchor=[IO.Path]::GetFullPath([IO.Path]::GetPathRoot($root)); ",
+                "$anchorPrefix=$anchor.TrimEnd($separator)+$separator; ",
+                "if (-not [StringComparer]::OrdinalIgnoreCase.Equals($root,$anchor) -and ",
+                "-not $root.StartsWith($anchorPrefix,[StringComparison]::OrdinalIgnoreCase)) {{ exit {failure_exit_code} }}; ",
                 "$rootPrefix=$root.TrimEnd($separator)+$separator; ",
                 "if (-not [StringComparer]::OrdinalIgnoreCase.Equals($path,$root) -and ",
-                "-not $path.StartsWith($rootPrefix,[StringComparison]::OrdinalIgnoreCase)) {{ exit 1 }}; ",
+                "-not $path.StartsWith($rootPrefix,[StringComparison]::OrdinalIgnoreCase)) {{ exit {failure_exit_code} }}; ",
+            ),
+            powershell_quote(self.remote_cache_root()),
+            powershell_quote(remote_path),
+            failure_exit_code = failure_exit_code,
+        )
+    }
+
+    fn windows_cache_directory_guard(self, directory: &str) -> String {
+        self.windows_cache_directory_guard_with_exit(directory, 1)
+    }
+
+    fn windows_cache_directory_guard_with_exit(
+        self,
+        directory: &str,
+        failure_exit_code: u8,
+    ) -> String {
+        let path_context = self.windows_cache_path_context(directory, failure_exit_code);
+        format!(
+            concat!(
+                "& {{ {path_context}",
+                "$currentPath=$path; while ($true) {{ ",
+                "if (Test-Path -LiteralPath $currentPath) {{ ",
+                "$current=Get-Item -LiteralPath $currentPath -Force -ErrorAction Stop; ",
+                "if (-not $current.PSIsContainer -or ",
+                "(($current.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0)) {{ exit {failure_exit_code} }} }}; ",
+                "if ([StringComparer]::OrdinalIgnoreCase.Equals($currentPath,$anchor)) {{ break }}; ",
+                "$parentPath=[IO.Path]::GetDirectoryName($currentPath); ",
+                "if ([String]::IsNullOrEmpty($parentPath) -or ",
+                "[StringComparer]::OrdinalIgnoreCase.Equals($parentPath,$currentPath)) {{ exit {failure_exit_code} }}; ",
+                "$currentPath=$parentPath }} }}; ",
+            ),
+            path_context = path_context,
+            failure_exit_code = failure_exit_code,
+        )
+    }
+
+    fn windows_cache_leaf_guard(self, remote_path: &str) -> String {
+        let path_context = self.windows_cache_path_context(remote_path, 1);
+        format!(
+            concat!(
+                "{path_context}",
                 "$item=Get-Item -LiteralPath $path -Force -ErrorAction Stop; ",
                 "if (($item -isnot [IO.FileInfo]) -or $item.PSIsContainer -or ",
                 "(($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0)) {{ exit 1 }}; ",
                 "$current=$item; while ($true) {{ ",
                 "$currentPath=[IO.Path]::GetFullPath($current.FullName); ",
-                "if (-not [StringComparer]::OrdinalIgnoreCase.Equals($currentPath,$root) -and ",
-                "-not $currentPath.StartsWith($rootPrefix,[StringComparison]::OrdinalIgnoreCase)) {{ exit 1 }}; ",
+                "if (-not [StringComparer]::OrdinalIgnoreCase.Equals($currentPath,$anchor) -and ",
+                "-not $currentPath.StartsWith($anchorPrefix,[StringComparison]::OrdinalIgnoreCase)) {{ exit 1 }}; ",
                 "if (($current.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {{ exit 1 }}; ",
-                "if ([StringComparer]::OrdinalIgnoreCase.Equals($currentPath,$root)) {{ break }}; ",
+                "if ([StringComparer]::OrdinalIgnoreCase.Equals($currentPath,$anchor)) {{ break }}; ",
                 "$current=$current.Parent; if ($null -eq $current) {{ exit 1 }} }}; ",
             ),
-            powershell_quote(self.remote_cache_root()),
-            powershell_quote(remote_path),
+            path_context = path_context,
         )
     }
 
     fn windows_staged_failure_cleanup(self, staged: &str) -> String {
         debug_assert!(self.is_windows());
+        let ancestry_guard =
+            self.windows_cache_directory_guard_with_exit(remote_parent(staged), 75);
         format!(
             r#"$separator=[IO.Path]::DirectorySeparatorChar
 $root=[IO.Path]::GetFullPath(({}).Replace('/', $separator))
@@ -1138,10 +1197,12 @@ function Remove-ExactStagedOnFailure {{
     $current=$current.Parent
     if ($null -eq $current) {{ exit 75 }}
   }}
+  {ancestry_guard}
   Remove-Item -LiteralPath $path -Force -ErrorAction Stop
 }}"#,
             powershell_quote(self.remote_cache_root()),
             powershell_quote(staged),
+            ancestry_guard = ancestry_guard,
         )
     }
 
@@ -1789,6 +1850,13 @@ fn powershell_environment(environment: &[(&'static str, &Path)]) -> String {
 
 fn powershell_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "''"))
+}
+
+fn remote_parent(remote_path: &str) -> &str {
+    remote_path
+        .rsplit_once('/')
+        .map(|(parent, _)| parent)
+        .expect("remote cache paths always contain a parent directory")
 }
 
 fn powershell_encoded_command(script: &str) -> String {
@@ -3930,6 +3998,94 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
+    fn posix_execution_gate_requires_newline_and_preserves_following_binary_stdin() {
+        let state = tempfile::tempdir().expect("temporary state");
+        let operation_id = "gate-operation";
+        let identity = "0123456789abcdef0123456789abcdef";
+        let basename = "claim.gate-operation.0123456789abcdef";
+        let claim = state.path().join("bootstrap.lock").join(basename);
+        fs::create_dir_all(&claim).expect("create claim");
+        fs::write(claim.join("operation_id"), operation_id).expect("write operation id");
+        fs::write(claim.join("claim_identity"), identity).expect("write claim identity");
+        fs::write(claim.join("state"), "mutation_started").expect("write claim state");
+        fs::write(claim.join("mutation_phase"), "cache_upload").expect("write mutation phase");
+
+        let run = |attempt: &str, input: &[u8], output: &Path| {
+            fs::write(claim.join("mutation_attempt"), attempt).expect("write mutation attempt");
+            let inner_command = format!(
+                "cat > {}",
+                posix_quote(output.to_str().expect("UTF-8 output path"))
+            );
+            let fenced = RemoteTarget::LinuxX64Gnu.fenced_mutation_command(
+                operation_id,
+                identity,
+                basename,
+                "cache_upload",
+                attempt,
+                &inner_command,
+            );
+            let mut child = Command::new("sh")
+                .arg("-c")
+                .arg(fenced)
+                .env("SATELLE_STATE_DIR", state.path())
+                .stdin(Stdio::piped())
+                .spawn()
+                .expect("run fenced mutation");
+            child
+                .stdin
+                .as_mut()
+                .expect("piped mutation stdin")
+                .write_all(input)
+                .expect("write mutation input");
+            drop(child.stdin.take());
+            child.wait().expect("wait for fenced mutation")
+        };
+
+        let rejected_attempt = "missing-newline";
+        let rejected_output = state.path().join("rejected-output");
+        let rejected = run(
+            rejected_attempt,
+            MUTATION_EXECUTE.as_bytes(),
+            &rejected_output,
+        );
+        assert_eq!(rejected.code(), Some(75));
+        assert!(!rejected_output.exists());
+        assert!(
+            !claim
+                .join(format!("execution_started.{rejected_attempt}"))
+                .exists()
+        );
+        assert!(
+            !claim
+                .join(format!("execution_succeeded.{rejected_attempt}"))
+                .exists()
+        );
+
+        let accepted_attempt = "valid-newline";
+        let accepted_output = state.path().join("accepted-output");
+        let payload = b"token-line\n\0binary-after-gate\xff\n";
+        let mut valid_input = format!("{MUTATION_EXECUTE}\n").into_bytes();
+        valid_input.extend_from_slice(payload);
+        let accepted = run(accepted_attempt, &valid_input, &accepted_output);
+        assert!(accepted.success());
+        assert_eq!(
+            fs::read(accepted_output).expect("read accepted payload"),
+            payload
+        );
+        assert!(
+            claim
+                .join(format!("execution_started.{accepted_attempt}"))
+                .is_dir()
+        );
+        assert!(
+            claim
+                .join(format!("execution_succeeded.{accepted_attempt}"))
+                .is_dir()
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
     fn posix_release_fence_retains_wrapper_ownership_and_records_only_success() {
         let state = tempfile::tempdir().expect("temporary state");
         let operation_id = "release-operation";
@@ -4030,6 +4186,81 @@ mod tests {
         assert!(script.contains("[StringComparer]::OrdinalIgnoreCase.Equals"));
         assert!(script.contains("StartsWith($rootPrefix,[StringComparison]::OrdinalIgnoreCase)"));
         assert!(script.contains("Set-Acl -LiteralPath $currentPath"));
+    }
+
+    #[test]
+    fn windows_cache_mutations_preflight_existing_ancestor_reparse_points() {
+        let directory = "AppData/Local/Satelle/host/v1/windows-x64";
+        let staged = format!("{directory}/.satelle-upload-attempt.exe");
+        let final_path = format!("{directory}/satelle.exe");
+
+        let create = decode_powershell_command(
+            &RemoteTarget::WindowsX64Msvc.create_directory_command(directory),
+        )
+        .expect("decode directory command");
+        let upload = decode_powershell_command(
+            &RemoteTarget::WindowsX64Msvc.upload_command(&staged, &"00".repeat(32)),
+        )
+        .expect("decode upload command");
+        let promote = decode_powershell_command(
+            &RemoteTarget::WindowsX64Msvc.promote_command(&staged, &final_path),
+        )
+        .expect("decode promotion command");
+
+        for script in [&create, &upload, &promote] {
+            for required in [
+                "[IO.Path]::GetFullPath",
+                "[IO.Path]::GetPathRoot($root)",
+                "$anchorPrefix=$anchor.TrimEnd($separator)+$separator",
+                "$root.StartsWith($anchorPrefix,[StringComparison]::OrdinalIgnoreCase)",
+                "[StringComparer]::OrdinalIgnoreCase.Equals",
+                "StartsWith($rootPrefix,[StringComparison]::OrdinalIgnoreCase)",
+                "Test-Path -LiteralPath $currentPath",
+                "$current=Get-Item -LiteralPath $currentPath -Force -ErrorAction Stop",
+                "($current.Attributes -band [IO.FileAttributes]::ReparsePoint)",
+                "$parentPath=[IO.Path]::GetDirectoryName($currentPath)",
+                "[StringComparer]::OrdinalIgnoreCase.Equals($currentPath,$anchor)",
+            ] {
+                assert!(script.contains(required), "missing {required:?}: {script}");
+            }
+        }
+
+        assert_occurs_before(
+            &create,
+            "Test-Path -LiteralPath $currentPath",
+            "New-Item -ItemType Directory",
+        );
+        assert_occurs_before(
+            &upload,
+            "Test-Path -LiteralPath $currentPath",
+            "$outputStream = [IO.File]::Open",
+        );
+        assert_occurs_before(
+            &promote,
+            "$item=Get-Item -LiteralPath $path -Force -ErrorAction Stop",
+            "Move-Item -Force",
+        );
+        assert_occurs_before(
+            &promote,
+            "Test-Path -LiteralPath $currentPath",
+            "Move-Item -Force",
+        );
+        assert_occurs_before(
+            &promote,
+            "$finalItem=Get-Item -LiteralPath $finalPath -Force -ErrorAction Stop",
+            "Move-Item -Force",
+        );
+        assert_occurs_before(
+            &upload,
+            "[StringComparer]::OrdinalIgnoreCase.Equals($currentPath,$anchor)",
+            "Remove-Item -LiteralPath $path",
+        );
+        assert!(upload.matches("[IO.Path]::GetPathRoot($root)").count() >= 2);
+        assert!(promote.matches("[IO.Path]::GetPathRoot($root)").count() >= 3);
+        assert!(promote.contains("$finalItem -isnot [IO.FileInfo]"));
+        assert!(
+            promote.contains("($finalItem.Attributes -band [IO.FileAttributes]::ReparsePoint)")
+        );
     }
 
     #[test]
