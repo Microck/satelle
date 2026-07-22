@@ -1850,6 +1850,9 @@ fn complete_bootstrap_handoff(
     bootstrap_lock: &mut ssh_bootstrap::SshBootstrapLock,
 ) -> Result<(), SatelleError> {
     bootstrap_lock
+        .commit_current_mutation()
+        .map_err(|_| SatelleError::host_unreachable(host))?;
+    bootstrap_lock
         .mark_mutation_started("maintenance_handoff_begin")
         .map_err(|_| SatelleError::host_unreachable(host))?;
     let begun = client
