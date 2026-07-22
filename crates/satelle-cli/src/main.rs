@@ -1819,14 +1819,6 @@ fn run_setup(
         .map_or(setup_mode_selection.mode, |decision| decision.setup_mode)
         .as_str()
         .to_string();
-    let consent_recovery_command = setup_consent_recovery_command(
-        &command,
-        config.flag_profile,
-        &setup_mode,
-        &daemon_path_overrides,
-        first_ssh_trust,
-    );
-
     let tailscale_serve_setup = command.component.as_slice() == [SetupComponent::Transport]
         && tailscale_serve::applies_to(&host.config);
     let mut transport = if tailscale_serve_setup {
@@ -1863,6 +1855,13 @@ fn run_setup(
 
     if !command.dry_run && report.required_input.is_empty() {
         if !command.yes && (command.no_input || json || !io::stdin().is_terminal()) {
+            let consent_recovery_command = setup_consent_recovery_command(
+                &command,
+                config.flag_profile,
+                &report.setup_mode,
+                &daemon_path_overrides,
+                first_ssh_trust,
+            );
             return Err(failure(SatelleError::setup_consent_required(
                 &report.planned_actions,
                 &consent_recovery_command,

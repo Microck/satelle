@@ -778,6 +778,20 @@ pub(super) async fn require_setup_mutation(
     require_mutation(&state, request, next, authorized).await
 }
 
+pub(super) async fn require_protocol_read(
+    State(state): State<Arc<DaemonState>>,
+    request: Request,
+    next: Next,
+) -> Response {
+    let Some(authorized) = request.extensions().get::<AuthorizedRequest>().cloned() else {
+        return missing_authorization_context();
+    };
+    if let Err(failure) = validate_protocol_version(request.headers()) {
+        return incompatible_protocol(&state, &authorized, failure);
+    }
+    next.run(request).await
+}
+
 async fn require_mutation(
     state: &DaemonState,
     mut request: Request,

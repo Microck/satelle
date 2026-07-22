@@ -1195,13 +1195,19 @@ fn first_trust_artifact_probe_rebinds_to_discovered_identity_and_reports_current
             ApiScopes::ADMIN,
             time::OffsetDateTime::now_utc() + time::Duration::minutes(5),
         );
-    service.initialize_daemon().expect("initialize Host state");
+    let initialized = service.initialize_daemon().expect("initialize Host state");
+    let host_identity = initialized.host_identity().to_string();
     let (_runtime, server) = spawn_loopback_daemon(service);
     let mut host = ssh_setup_host(Some(ApiTokenSource::File {
         path: daemon_state.path().join("configured.token"),
     }));
     host.config.expected_host_id = None;
     let transport = SshSetupTransport::new(&host).expect("construct first-trust transport");
+    assert_ne!(
+        transport.binding.expected_host_identity().to_string(),
+        host_identity,
+        "first trust must begin with a fresh probe identity"
+    );
 
     let observation = transport
         .observe_current_daemon_at(
@@ -1216,6 +1222,11 @@ fn first_trust_artifact_probe_rebinds_to_discovered_identity_and_reports_current
         Some(env!("CARGO_PKG_VERSION"))
     );
     assert!(observation.protocol_compatible);
+    assert_eq!(
+        observation.validated_host_identity.as_deref(),
+        Some(host_identity.as_str()),
+        "the authenticated capabilities response must use the discovered Host identity"
+    );
     drop(server);
 }
 

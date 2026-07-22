@@ -911,6 +911,8 @@ pub(crate) struct PersistentServiceLifecycleReport {
 struct CurrentDaemonArtifactObservation {
     current_version: Option<String>,
     protocol_compatible: bool,
+    #[cfg(test)]
+    validated_host_identity: Option<String>,
 }
 
 impl SshSetupTransport {
@@ -942,6 +944,8 @@ impl SshSetupTransport {
             current_daemon_artifact: cfg!(test).then_some(CurrentDaemonArtifactObservation {
                 current_version: None,
                 protocol_compatible: true,
+                #[cfg(test)]
+                validated_host_identity: None,
             }),
         })
     }
@@ -1075,11 +1079,28 @@ impl SshSetupTransport {
             }
             capabilities => capabilities,
         };
+        self.current_daemon_observation_from_capabilities(capabilities)
+    }
+
+    fn current_daemon_observation_from_capabilities(
+        &self,
+        capabilities: Result<satelle_transport::CapabilitiesResponse, DaemonClientError>,
+    ) -> Result<CurrentDaemonArtifactObservation, SatelleError> {
         match capabilities {
             Ok(capabilities) => Ok(CurrentDaemonArtifactObservation {
                 current_version: Some(capabilities.daemon_version().to_string()),
                 protocol_compatible: true,
+                #[cfg(test)]
+                validated_host_identity: Some(capabilities.host_identity().to_string()),
             }),
+            Err(DaemonClientError::CapabilitiesProtocolMismatch { daemon_version }) => {
+                Ok(CurrentDaemonArtifactObservation {
+                    current_version: Some(daemon_version),
+                    protocol_compatible: false,
+                    #[cfg(test)]
+                    validated_host_identity: None,
+                })
+            }
             Err(DaemonClientError::Api { status: _, error })
                 if error.code() == ApiErrorCode::IncompatibleProtocol =>
             {
@@ -1097,6 +1118,8 @@ impl SshSetupTransport {
                 Ok(CurrentDaemonArtifactObservation {
                     current_version: Some(current_version),
                     protocol_compatible: false,
+                    #[cfg(test)]
+                    validated_host_identity: None,
                 })
             }
             Err(DaemonClientError::Api { status: _, error })
@@ -1111,6 +1134,8 @@ impl SshSetupTransport {
                 Ok(CurrentDaemonArtifactObservation {
                     current_version: None,
                     protocol_compatible: true,
+                    #[cfg(test)]
+                    validated_host_identity: None,
                 })
             }
             Err(error) => Err(direct_transport_error(&self.alias, error)),
@@ -3845,6 +3870,9 @@ fn direct_transport_error(host: &str, error: DaemonClientError) -> SatelleError 
         DaemonClientError::CertificateExpired(_) => SatelleError::certificate_expired(host),
         DaemonClientError::TlsVersionUnsupported(_) => SatelleError::tls_version_unsupported(host),
         DaemonClientError::TlsHandshake(_) => SatelleError::tls_handshake_failed(host),
+        DaemonClientError::CapabilitiesProtocolMismatch { .. } => {
+            api_code_error(host, ApiErrorCode::IncompatibleProtocol)
+        }
         DaemonClientError::Transport(_) => SatelleError::host_unreachable(host),
         DaemonClientError::InvalidHostIdentityHeader
         | DaemonClientError::InvalidCaBundle(_)
@@ -4411,6 +4439,7 @@ mod bootstrap_ordering_tests {
         let observation = CurrentDaemonArtifactObservation {
             current_version: Some("0.0.0".to_string()),
             protocol_compatible: true,
+            validated_host_identity: None,
         };
 
         let report = transport
@@ -4440,10 +4469,20 @@ mod bootstrap_ordering_tests {
     #[test]
     fn setup_report_uses_protocol_incompatible_pre_mutation_daemon_observation() {
         let transport = setup_transport_for_report();
-        let observation = CurrentDaemonArtifactObservation {
-            current_version: Some(env!("CARGO_PKG_VERSION").to_string()),
-            protocol_compatible: false,
-        };
+        let observation = transport
+            .current_daemon_observation_from_capabilities(Err(
+                DaemonClientError::CapabilitiesProtocolMismatch {
+                    daemon_version: env!("CARGO_PKG_VERSION").to_string(),
+                },
+            ))
+            .expect("map an authenticated protocol mismatch to the planning observation");
+
+        assert_eq!(
+            observation.current_version.as_deref(),
+            Some(env!("CARGO_PKG_VERSION"))
+        );
+        assert!(!observation.protocol_compatible);
+        assert_eq!(observation.validated_host_identity, None);
 
         let report = transport
             .setup_report_for_target(
@@ -4474,6 +4513,7 @@ mod bootstrap_ordering_tests {
         let observation = CurrentDaemonArtifactObservation {
             current_version: Some("0.0.0".to_string()),
             protocol_compatible: true,
+            validated_host_identity: None,
         };
 
         let report = transport

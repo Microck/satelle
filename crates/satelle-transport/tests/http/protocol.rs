@@ -38,7 +38,7 @@ async fn protocol_version_gate_is_exact_sanitized_and_precedes_mutation_work() {
         .expect("build duplicate protocol request");
     duplicate_request.headers_mut().append(
         reqwest::header::HeaderName::from_static("satelle-protocol-version"),
-        reqwest::header::HeaderValue::from_static("4"),
+        reqwest::header::HeaderValue::from_static("5"),
     );
     let duplicate_lines = reqwest::Client::new()
         .execute(duplicate_request)
@@ -48,14 +48,23 @@ async fn protocol_version_gate_is_exact_sanitized_and_precedes_mutation_work() {
 
     let coalesced_duplicate =
         mutation_without_protocol(&running, "/v1/sessions", "protocol-duplicate-coalesced")
-            .header("Satelle-Protocol-Version", "4, 4")
+            .header("Satelle-Protocol-Version", "5, 5")
             .json(&TurnRequest::new("PRIVATE_PROTOCOL_COALESCED_CANARY"))
             .send()
             .await
             .expect("send coalesced duplicate protocol version");
     assert_protocol_error(&running, coalesced_duplicate, "duplicate", None).await;
 
-    for token in ["0", "1", "2", "3", "65535", "65536", "99999999999999999999"] {
+    for token in [
+        "0",
+        "1",
+        "2",
+        "3",
+        "4",
+        "65535",
+        "65536",
+        "99999999999999999999",
+    ] {
         let unsupported = mutation_without_protocol(&running, "/v1/sessions", "protocol-boundary")
             .header("Satelle-Protocol-Version", token)
             .json(&TurnRequest::new("PRIVATE_PROTOCOL_BOUNDARY_CANARY"))
@@ -69,7 +78,7 @@ async fn protocol_version_gate_is_exact_sanitized_and_precedes_mutation_work() {
     // exposed. Send this case at the wire layer because reqwest deliberately
     // prevents callers from constructing padded header values.
     let whitespace_request = format!(
-        "POST /v1/sessions HTTP/1.1\r\nHost: localhost\r\nAuthorization: {}\r\nSatelle-Expected-Host-Identity: {}\r\nSatelle-Request-Id: {}\r\nSatelle-Protocol-Version:   4 \r\nIdempotency-Key:\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        "POST /v1/sessions HTTP/1.1\r\nHost: localhost\r\nAuthorization: {}\r\nSatelle-Expected-Host-Identity: {}\r\nSatelle-Request-Id: {}\r\nSatelle-Protocol-Version:   5 \r\nIdempotency-Key:\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
         bearer(&running.token),
         running.host_identity,
         RequestId::new(),
@@ -115,6 +124,35 @@ async fn protocol_version_gate_is_exact_sanitized_and_precedes_mutation_work() {
         0,
         "protocol rejection must happen before Host mutation"
     );
+}
+
+#[tokio::test]
+async fn capabilities_handshake_rejects_old_and_missing_clients() {
+    let running = RunningServer::start(ApiScopes::READ).await;
+
+    let missing = running
+        .protected_request(Method::GET, "/v1/capabilities")
+        .send()
+        .await
+        .expect("send capabilities request without protocol version");
+    assert_protocol_error(&running, missing, "missing", None).await;
+
+    let old = running
+        .protected_request(Method::GET, "/v1/capabilities")
+        .header("Satelle-Protocol-Version", "4")
+        .send()
+        .await
+        .expect("send capabilities request with old protocol version");
+    assert_protocol_error(&running, old, "unsupported", Some("4")).await;
+
+    let current = running
+        .protected_request(Method::GET, "/v1/capabilities")
+        .header("Satelle-Protocol-Version", "5")
+        .send()
+        .await
+        .expect("send capabilities request with current protocol version");
+    assert_eq!(current.status(), StatusCode::OK);
+    assert_eq!(current.headers()["satelle-protocol-version"], "5");
 }
 
 #[tokio::test]
@@ -174,7 +212,7 @@ async fn assert_protocol_error(
             "details": {
                 "daemon_version": env!("CARGO_PKG_VERSION"),
                 "reason": reason,
-                "supported_versions": ["4"],
+                "supported_versions": ["5"],
                 "received_version": received_version,
             },
             "docs_url": null,

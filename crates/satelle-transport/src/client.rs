@@ -134,7 +134,27 @@ impl DaemonClient {
 
     pub fn capabilities(&self) -> Result<CapabilitiesResponse, DaemonClientError> {
         let (request, request_id) = self.protected_request(Method::GET, "/v1/capabilities")?;
-        self.send_authenticated(request, request_id, StatusCode::OK)
+        let response = request
+            .header(PROTOCOL_VERSION_HEADER, PROTOCOL_VERSION)
+            .send()
+            .map_err(classify_request_error)?;
+        let protocol_matches = response
+            .headers()
+            .get(PROTOCOL_VERSION_HEADER)
+            .and_then(|value| value.to_str().ok())
+            == Some(PROTOCOL_VERSION);
+        let capabilities: CapabilitiesResponse = decode_authenticated(
+            response,
+            StatusCode::OK,
+            &request_id,
+            &self.expected_host_identity,
+        )?;
+        if !protocol_matches {
+            return Err(DaemonClientError::CapabilitiesProtocolMismatch {
+                daemon_version: capabilities.daemon_version().to_string(),
+            });
+        }
+        Ok(capabilities)
     }
 
     pub fn confirm_durable_setup_token(
@@ -538,6 +558,9 @@ pub enum DaemonClientError {
     ResponseRequestIdMismatch,
     ResponseHostIdentityMismatch,
     ResponseContractViolation,
+    CapabilitiesProtocolMismatch {
+        daemon_version: String,
+    },
 }
 
 impl fmt::Display for DaemonClientError {
@@ -574,6 +597,9 @@ impl fmt::Display for DaemonClientError {
             }
             Self::ResponseContractViolation => {
                 "the Host Daemon response violated the requested operation contract"
+            }
+            Self::CapabilitiesProtocolMismatch { .. } => {
+                "the CLI and Host Daemon protocol versions are incompatible"
             }
         })
     }
@@ -882,6 +908,63 @@ mod tests {
         assert_eq!(response.host_identity(), "host-windows-11");
         assert_eq!(response.session_count(), 3);
         server.join().expect("join TLS server");
+    }
+
+    #[test]
+    fn capabilities_rejects_an_authenticated_daemon_without_the_current_protocol() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind legacy daemon fixture");
+        let address = listener.local_addr().expect("read legacy daemon address");
+        let token = ApiBearerToken::generate().expect("generate daemon token");
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept capabilities client");
+            let mut request = Vec::new();
+            let mut chunk = [0_u8; 1024];
+            while !request.windows(4).any(|bytes| bytes == b"\r\n\r\n") {
+                let read = stream.read(&mut chunk).expect("read capabilities request");
+                assert_ne!(read, 0, "capabilities request ended before its headers");
+                request.extend_from_slice(&chunk[..read]);
+            }
+            let request = String::from_utf8(request).expect("request headers should be UTF-8");
+            assert!(request.starts_with("GET /v1/capabilities HTTP/1.1\r\n"));
+            assert_eq!(
+                header_value(&request, PROTOCOL_VERSION_HEADER),
+                Some(PROTOCOL_VERSION)
+            );
+            let request_id = RequestId::parse(
+                header_value(&request, "satelle-request-id")
+                    .expect("capabilities request carries its request ID"),
+            )
+            .expect("request ID is canonical");
+            let body = serde_json::to_string(&CapabilitiesResponse::new(
+                request_id,
+                "host-legacy-protocol".to_string(),
+                "0.0.9".to_string(),
+                true,
+                true,
+                true,
+                crate::contract::effective_limits(128, satelle_core::ApiRateLimits::default()),
+            ))
+            .expect("encode legacy capabilities response");
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            )
+            .expect("write legacy capabilities response");
+            stream.flush().expect("flush legacy capabilities response");
+        });
+
+        let client = DaemonClient::loopback(address, token, "host-legacy-protocol")
+            .expect("construct capabilities client");
+        let error = client
+            .capabilities()
+            .expect_err("a response without the current protocol header must fail closed");
+        assert!(matches!(
+            error,
+            DaemonClientError::CapabilitiesProtocolMismatch { daemon_version }
+                if daemon_version == "0.0.9"
+        ));
+        server.join().expect("join legacy daemon fixture");
     }
 
     #[test]

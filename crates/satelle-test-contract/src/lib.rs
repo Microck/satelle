@@ -2,12 +2,10 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     fmt::Debug,
     fs,
+    io::Write,
     path::{Path, PathBuf},
     process::Output,
-    sync::{
-        atomic::{AtomicU64, Ordering},
-        mpsc::{self, RecvTimeoutError},
-    },
+    sync::mpsc::{self, RecvTimeoutError},
     time::{Duration, Instant},
 };
 
@@ -17,8 +15,7 @@ use std::os::unix::fs::MetadataExt;
 use std::os::windows::fs::MetadataExt;
 
 use notify::{
-    Config, Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher,
-    event::{MetadataKind, ModifyKind},
+    Config, Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher, event::ModifyKind,
 };
 use serde_json::{Value, json};
 
@@ -164,54 +161,54 @@ struct DirectoryTreeEntry {
 }
 
 const MUTATION_BARRIER_TIMEOUT: Duration = Duration::from_secs(5);
-static MUTATION_BARRIER_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 struct MutationBarrier {
+    file: tempfile::NamedTempFile,
     path: PathBuf,
-    armed: bool,
 }
 
 impl MutationBarrier {
-    fn create(operation: &str, root: &Path) -> Self {
-        let sequence = MUTATION_BARRIER_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-        let path = root.join(format!(
-            ".satelle-mutation-barrier-{}-{sequence}",
-            std::process::id()
-        ));
-        fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&path)
+    fn create(operation: &str) -> Self {
+        let file = tempfile::Builder::new()
+            .prefix("satelle-mutation-barrier-")
+            .tempfile()
             .unwrap_or_else(|error| {
-                panic!(
-                    "{operation} could not create mutation watcher barrier {}: {error}",
-                    path.display()
-                )
+                panic!("{operation} could not create mutation watcher barrier: {error}")
             });
-        Self { path, armed: true }
+        let path = fs::canonicalize(file.path()).unwrap_or_else(|error| {
+            panic!(
+                "{operation} could not resolve mutation watcher barrier {}: {error}",
+                file.path().display()
+            )
+        });
+        Self { file, path }
     }
 
     fn path(&self) -> &Path {
         &self.path
     }
 
-    fn remove(mut self, operation: &str) {
-        fs::remove_file(&self.path).unwrap_or_else(|error| {
+    fn signal(&mut self, operation: &str) {
+        self.file
+            .as_file_mut()
+            .write_all(b"ready")
+            .and_then(|()| self.file.as_file_mut().flush())
+            .unwrap_or_else(|error| {
+                panic!(
+                    "{operation} could not signal mutation watcher barrier {}: {error}",
+                    self.path.display()
+                )
+            });
+    }
+
+    fn remove(self, operation: &str) {
+        let path = self.path.clone();
+        self.file.close().unwrap_or_else(|error| {
             panic!(
                 "{operation} could not remove mutation watcher barrier {}: {error}",
-                self.path.display()
+                path.display()
             )
         });
-        self.armed = false;
-    }
-}
-
-impl Drop for MutationBarrier {
-    fn drop(&mut self) {
-        if self.armed {
-            // Cleanup during unwinding must not replace the original watcher failure.
-            let _ = fs::remove_file(&self.path);
-        }
     }
 }
 
@@ -263,22 +260,27 @@ fn snapshot_directory_tree(root: &Path) -> std::io::Result<BTreeMap<PathBuf, Dir
 }
 
 fn is_ignored_filesystem_event(kind: EventKind) -> bool {
-    match kind {
-        EventKind::Access(_)
-        | EventKind::Modify(ModifyKind::Metadata(MetadataKind::AccessTime)) => true,
-        // macOS FSEvents coalesces ordinary reads into a coarse metadata event.
-        // The final snapshot still detects persistent permission or ownership
-        // changes, while create, data, rename, and remove events stay visible.
-        #[cfg(target_os = "macos")]
-        EventKind::Modify(ModifyKind::Metadata(MetadataKind::Any)) => true,
-        _ => false,
-    }
+    matches!(
+        kind,
+        EventKind::Access(_) | EventKind::Modify(ModifyKind::Metadata(_))
+    )
+}
+
+fn is_barrier_signal(event: &Event, barrier_path: &Path) -> bool {
+    matches!(
+        event.kind,
+        EventKind::Modify(ModifyKind::Data(_) | ModifyKind::Any | ModifyKind::Other)
+    ) && event
+        .paths
+        .iter()
+        .any(|path| path.as_path() == barrier_path)
 }
 
 fn observe_transient_mutations(
     operation: &str,
     root: &Path,
-    barrier_path: &Path,
+    barrier_paths: &[&Path],
+    expected_barrier_path: &Path,
     events: &mpsc::Receiver<notify::Result<Event>>,
 ) -> BTreeSet<PathBuf> {
     let deadline = Instant::now() + MUTATION_BARRIER_TIMEOUT;
@@ -302,12 +304,16 @@ fn observe_transient_mutations(
                     );
                 }
                 let ignored = is_ignored_filesystem_event(event.kind);
-                barrier_observed = !ignored && event.paths.iter().any(|path| path == barrier_path);
+                barrier_observed = !ignored && is_barrier_signal(&event, expected_barrier_path);
                 if ignored {
                     continue;
                 }
                 let mut event_path_observed = false;
-                for path in event.paths.iter().filter(|path| *path != barrier_path) {
+                for path in event
+                    .paths
+                    .iter()
+                    .filter(|path| !barrier_paths.contains(&path.as_path()))
+                {
                     if let Ok(relative_path) = path.strip_prefix(root) {
                         changed_paths.insert(relative_path.to_path_buf());
                         event_path_observed = true;
@@ -336,10 +342,11 @@ fn observe_transient_mutations(
 
 /// Runs an operation and asserts that its directory tree remains byte-for-byte unchanged.
 ///
-/// Native filesystem events detect transient writes while final snapshots record relative paths,
-/// entry kinds, regular-file bytes, symlink targets, and the stable access metadata exposed by the
-/// standard library. Symlinks are never followed, and volatile timestamps are intentionally
-/// ignored.
+/// Native filesystem events detect transient create, data, name, and remove mutations. Final
+/// snapshots record relative paths, entry kinds, regular-file bytes, symlink targets, and the
+/// stable access metadata exposed by the standard library. Symlinks are never followed. Access
+/// events, metadata-only events, and volatile timestamps are intentionally ignored because native
+/// backends report ordinary reads through platform-specific metadata event variants.
 pub fn assert_directory_tree_unchanged<T>(
     operation: &str,
     root: impl AsRef<Path>,
@@ -360,6 +367,11 @@ pub fn assert_directory_tree_unchanged<T>(
         })
     };
     let before = snapshot();
+    // Both barriers exist before the watcher starts and live outside the protected tree. Signaling
+    // them flushes event delivery without creating a directory entry that could be mistaken for
+    // application work.
+    let mut readiness_barrier = MutationBarrier::create(operation);
+    let mut completion_barrier = MutationBarrier::create(operation);
     let (event_sender, event_receiver) = mpsc::channel();
     let mut watcher =
         RecommendedWatcher::new(event_sender, Config::default().with_follow_symlinks(false))
@@ -377,27 +389,51 @@ pub fn assert_directory_tree_unchanged<T>(
                 root.display()
             )
         });
-
-    // FSEvents may deliver fixture activity after watcher registration. A
-    // create/remove readiness cycle establishes an ordered boundary without
-    // leaving the sentinel visible to the guarded operation.
-    let readiness_barrier = MutationBarrier::create(operation, &root);
-    let readiness_path = readiness_barrier.path().to_path_buf();
-    let _ = observe_transient_mutations(operation, &root, &readiness_path, &event_receiver);
-    readiness_barrier.remove(operation);
-    let _ = observe_transient_mutations(operation, &root, &readiness_path, &event_receiver);
-
+    for barrier_path in [readiness_barrier.path(), completion_barrier.path()] {
+        watcher
+            .watch(barrier_path, RecursiveMode::NonRecursive)
+            .unwrap_or_else(|error| {
+                panic!(
+                    "{operation} could not watch mutation barrier {}: {error}",
+                    barrier_path.display()
+                )
+            });
+    }
+    readiness_barrier.signal(operation);
+    // Discard events queued while the native watcher was starting. Observing the readiness signal
+    // establishes that subsequent protected-tree events belong to the operation interval.
+    let _ = observe_transient_mutations(
+        operation,
+        &root,
+        &[readiness_barrier.path(), completion_barrier.path()],
+        readiness_barrier.path(),
+        &event_receiver,
+    );
     let result = run();
-    let barrier = MutationBarrier::create(operation, &root);
-    let mut changed_paths =
-        observe_transient_mutations(operation, &root, barrier.path(), &event_receiver);
+    completion_barrier.signal(operation);
+    let mut changed_paths = observe_transient_mutations(
+        operation,
+        &root,
+        &[readiness_barrier.path(), completion_barrier.path()],
+        completion_barrier.path(),
+        &event_receiver,
+    );
     watcher.unwatch(&root).unwrap_or_else(|error| {
         panic!(
             "{operation} could not stop mutation watcher for {}: {error}",
             root.display()
         )
     });
-    barrier.remove(operation);
+    for barrier_path in [readiness_barrier.path(), completion_barrier.path()] {
+        watcher.unwatch(barrier_path).unwrap_or_else(|error| {
+            panic!(
+                "{operation} could not stop mutation barrier watcher for {}: {error}",
+                barrier_path.display()
+            )
+        });
+    }
+    readiness_barrier.remove(operation);
+    completion_barrier.remove(operation);
     let after = snapshot();
     changed_paths.extend(
         before
@@ -1538,6 +1574,8 @@ pub fn assert_versioned_payload_contract<E: Debug>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use notify::event::{AccessKind, CreateKind, DataChange, MetadataKind, RemoveKind, RenameMode};
+    use std::sync::atomic::{AtomicU64, Ordering};
 
     static TEMP_TREE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
@@ -1582,6 +1620,70 @@ mod tests {
 
         assert!(message.contains("maintenance dry run mutated directory tree"));
         assert!(message.contains("unexpected-state.json"));
+    }
+
+    #[test]
+    fn directory_tree_event_filter_ignores_only_access_and_metadata() {
+        for kind in [
+            EventKind::Access(AccessKind::Any),
+            EventKind::Modify(ModifyKind::Metadata(MetadataKind::Any)),
+            EventKind::Modify(ModifyKind::Metadata(MetadataKind::AccessTime)),
+            EventKind::Modify(ModifyKind::Metadata(MetadataKind::WriteTime)),
+            EventKind::Modify(ModifyKind::Metadata(MetadataKind::Permissions)),
+            EventKind::Modify(ModifyKind::Metadata(MetadataKind::Ownership)),
+            EventKind::Modify(ModifyKind::Metadata(MetadataKind::Extended)),
+            EventKind::Modify(ModifyKind::Metadata(MetadataKind::Other)),
+        ] {
+            assert!(is_ignored_filesystem_event(kind), "{kind:?}");
+        }
+
+        for kind in [
+            EventKind::Any,
+            EventKind::Create(CreateKind::File),
+            EventKind::Modify(ModifyKind::Any),
+            EventKind::Modify(ModifyKind::Data(DataChange::Content)),
+            EventKind::Modify(ModifyKind::Name(RenameMode::Any)),
+            EventKind::Modify(ModifyKind::Other),
+            EventKind::Remove(RemoveKind::File),
+            EventKind::Other,
+        ] {
+            assert!(!is_ignored_filesystem_event(kind), "{kind:?}");
+        }
+    }
+
+    #[test]
+    fn directory_tree_assertion_does_not_report_its_own_barriers() {
+        let sequence = TEMP_TREE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let tree = std::env::temp_dir().join(format!(
+            "satelle-test-contract-{}-{sequence}",
+            std::process::id()
+        ));
+        fs::create_dir(&tree).expect("temporary directory tree should be created");
+
+        assert_directory_tree_unchanged("read-only no-op", &tree, || {});
+
+        fs::remove_dir(&tree).expect("temporary directory tree should be removed");
+    }
+
+    #[test]
+    fn directory_tree_assertion_accepts_nested_reads() {
+        let sequence = TEMP_TREE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let tree = std::env::temp_dir().join(format!(
+            "satelle-test-contract-{}-{sequence}",
+            std::process::id()
+        ));
+        let config = tree.join("operator/home/config/config.toml");
+        fs::create_dir_all(config.parent().expect("config path should have a parent"))
+            .expect("nested config directory should be created");
+        fs::write(&config, b"default_host = \"workstation\"\n")
+            .expect("config fixture should be written");
+
+        let bytes = assert_directory_tree_unchanged("nested config read", &tree, || {
+            fs::read(&config).expect("config fixture should be readable")
+        });
+
+        assert_eq!(bytes, b"default_host = \"workstation\"\n");
+        fs::remove_dir_all(&tree).expect("temporary directory tree should be removed");
     }
 
     #[test]
@@ -1644,28 +1746,73 @@ mod tests {
     }
 
     #[test]
-    fn mutation_barrier_is_removed_during_unwind() {
+    fn directory_tree_assertion_reports_transient_data_changes() {
         let sequence = TEMP_TREE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
         let tree = std::env::temp_dir().join(format!(
             "satelle-test-contract-{}-{sequence}",
             std::process::id()
         ));
         fs::create_dir(&tree).expect("temporary directory tree should be created");
+        let canary = tree.join("transient-data.txt");
+        fs::write(&canary, b"original").expect("data canary should be written");
+        let failure = std::panic::catch_unwind(|| {
+            assert_directory_tree_unchanged("maintenance dry run", &tree, || {
+                fs::write(&canary, b"changed").expect("data canary should be changed");
+                fs::write(&canary, b"original").expect("data canary should be restored");
+            });
+        });
+        fs::remove_dir_all(&tree).expect("temporary directory tree should be removed");
+        let failure = failure.expect_err("a transient data change must fail the assertion");
+        let message = failure
+            .downcast_ref::<String>()
+            .expect("assertion panic should contain a string message");
+
+        assert!(message.contains("maintenance dry run mutated directory tree"));
+        assert!(message.contains("transient-data.txt"));
+    }
+
+    #[test]
+    fn directory_tree_assertion_reports_transient_renames() {
+        let sequence = TEMP_TREE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let tree = std::env::temp_dir().join(format!(
+            "satelle-test-contract-{}-{sequence}",
+            std::process::id()
+        ));
+        fs::create_dir(&tree).expect("temporary directory tree should be created");
+        let original = tree.join("rename-canary.txt");
+        let moved = tree.join("rename-canary-moved.txt");
+        fs::write(&original, b"unchanged").expect("rename canary should be written");
+        let failure = std::panic::catch_unwind(|| {
+            assert_directory_tree_unchanged("maintenance dry run", &tree, || {
+                fs::rename(&original, &moved).expect("rename canary should be moved");
+                fs::rename(&moved, &original).expect("rename canary should be restored");
+            });
+        });
+        fs::remove_dir_all(&tree).expect("temporary directory tree should be removed");
+        let failure = failure.expect_err("a transient rename must fail the unchanged assertion");
+        let message = failure
+            .downcast_ref::<String>()
+            .expect("assertion panic should contain a string message");
+
+        assert!(message.contains("maintenance dry run mutated directory tree"));
+        assert!(message.contains("rename-canary"));
+    }
+
+    #[test]
+    fn mutation_barrier_is_removed_during_unwind() {
+        let barrier = MutationBarrier::create("maintenance dry run");
+        let barrier_path = barrier.path().to_owned();
 
         let failure = std::panic::catch_unwind(|| {
-            let _barrier = MutationBarrier::create("maintenance dry run", &tree);
+            let _barrier = barrier;
             panic!("deliberate unwind after mutation barrier creation");
         });
 
         assert!(failure.is_err(), "the deliberate panic should unwind");
-        assert_eq!(
-            fs::read_dir(&tree)
-                .expect("temporary directory tree should be readable")
-                .count(),
-            0,
+        assert!(
+            !barrier_path.exists(),
             "the mutation barrier should be removed during unwind"
         );
-        fs::remove_dir(&tree).expect("temporary directory tree should be removed");
     }
 
     #[rustfmt::skip]

@@ -9,7 +9,8 @@ mod setup;
 
 use crate::contract::{
     ApiError, ApiErrorCategory, ApiErrorCode, CapabilitiesResponse, EffectiveLimits,
-    HostDesktopSessionsResponse, HostStatusResponse, LiveResponse, RequestId, effective_limits,
+    HostDesktopSessionsResponse, HostStatusResponse, LiveResponse, PROTOCOL_VERSION,
+    PROTOCOL_VERSION_HEADER, RequestId, effective_limits,
 };
 use auth::{AuthorizedRequest, REQUEST_ID_HEADER};
 use axum::Router;
@@ -806,8 +807,17 @@ fn router(state: Arc<DaemonState>) -> Router {
             Arc::clone(&state),
             auth::reject_public_bearer_carriers,
         ));
-    let bodyless_read_routes = Router::new()
+    let capabilities_route = Router::new()
         .route("/v1/capabilities", get(capabilities))
+        .route_layer(middleware::from_fn_with_state(
+            Arc::clone(&state),
+            auth::require_empty_read,
+        ))
+        .route_layer(middleware::from_fn_with_state(
+            Arc::clone(&state),
+            auth::require_protocol_read,
+        ));
+    let bodyless_read_routes = Router::new()
         .route("/v1/setup/api-token/current", get(setup::confirm_api_token))
         .route("/v1/host/status", get(host_status))
         .route("/v1/host/desktop-sessions", get(host_desktop_sessions))
@@ -823,13 +833,13 @@ fn router(state: Arc<DaemonState>) -> Router {
             Arc::clone(&state),
             auth::require_query_read,
         ));
-    let read_routes =
-        bodyless_read_routes
-            .merge(logs_route)
-            .route_layer(middleware::from_fn_with_state(
-                Arc::clone(&state),
-                auth::require_read,
-            ));
+    let read_routes = bodyless_read_routes
+        .merge(capabilities_route)
+        .merge(logs_route)
+        .route_layer(middleware::from_fn_with_state(
+            Arc::clone(&state),
+            auth::require_read,
+        ));
     let bootstrap_maintenance_routes = Router::new()
         .route(
             "/v1/maintenance/bootstrap/{operation_id}/complete",
@@ -951,12 +961,17 @@ async fn capabilities(
         state.capabilities.provider_computer_use(),
         state.limits,
     );
-    authenticated_json_response(
+    let mut response = authenticated_json_response(
         StatusCode::OK,
         &response,
         authorized.request_id(),
         &state.host_identity,
-    )
+    );
+    response.headers_mut().insert(
+        axum::http::HeaderName::from_static(PROTOCOL_VERSION_HEADER),
+        HeaderValue::from_static(PROTOCOL_VERSION),
+    );
+    response
 }
 
 async fn host_status(
