@@ -895,7 +895,7 @@ if ((Get-FileHash -Algorithm SHA256 -LiteralPath {staged}).Hash.ToLowerInvariant
             powershell_encoded_command(&script)
         } else {
             let script = format!(
-                "set -eu; umask 077; mkdir -p {directory}; current={}; while :; do chmod 700 \"$current\"; [ \"$current\" = {} ] && break; current=\"${{current%/*}}\"; done",
+                "set -eu; umask 077; directory={}; root={}; mkdir -p \"$directory\"; current=\"$directory\"; while :; do chmod 700 \"$current\"; [ \"$current\" = \"$root\" ] && break; current=\"${{current%/*}}\"; done",
                 posix_quote(directory),
                 posix_quote(self.remote_cache_root()),
             );
@@ -2430,6 +2430,40 @@ mod tests {
             assert!(directory.contains(&format!("/v{}/", env!("CARGO_PKG_VERSION"))));
             assert!(directory.ends_with(target.id()));
             assert!(directory.starts_with(target.remote_cache_root()));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn posix_directory_creation_hardens_pre_existing_cache_descendants() {
+        let home = tempfile::tempdir().expect("temporary remote home");
+        let cache_root = home.path().join(".cache/satelle/host");
+        let version = cache_root.join(format!("v{}", env!("CARGO_PKG_VERSION")));
+        let directory = version.join("linux-x64-gnu");
+        fs::create_dir_all(&directory).expect("create cache directory");
+        for path in [&cache_root, &version, &directory] {
+            fs::set_permissions(path, fs::Permissions::from_mode(0o777))
+                .expect("broaden cache directory permissions");
+        }
+
+        let status = Command::new("sh")
+            .arg("-c")
+            .arg(
+                RemoteTarget::LinuxX64Gnu
+                    .create_directory_command(&RemoteTarget::LinuxX64Gnu.remote_directory()),
+            )
+            .current_dir(home.path())
+            .status()
+            .expect("run cache directory creation");
+        assert!(status.success());
+
+        for path in [&directory, &version, &cache_root] {
+            let mode = fs::metadata(path)
+                .expect("read cache directory metadata")
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(mode, 0o700, "{} was not owner-only", path.display());
         }
     }
 

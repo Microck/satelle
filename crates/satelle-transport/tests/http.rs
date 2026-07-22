@@ -1535,6 +1535,8 @@ async fn read_scoped_ssh_bootstrap_can_handoff_maintenance_without_setup_authori
     let state = TestStateDir::new().expect("temporary state directory");
     let bootstrap_token = ApiBearerToken::generate().expect("generate bootstrap token");
     let durable_read_token = ApiBearerToken::generate().expect("generate durable read token");
+    let durable_control_token = ApiBearerToken::generate().expect("generate durable control token");
+    let durable_admin_token = ApiBearerToken::generate().expect("generate durable admin token");
     let service = HostService::local_demo_for_tests_at(state.path())
         .expect("construct deterministic Host service")
         .with_ssh_bootstrap_auth_for_tests(
@@ -1545,6 +1547,22 @@ async fn read_scoped_ssh_bootstrap_can_handoff_maintenance_without_setup_authori
     service
         .register_api_token(&durable_read_token, "durable-read", ApiScopes::READ, None)
         .expect("register durable read token");
+    service
+        .register_api_token(
+            &durable_control_token,
+            "durable-control",
+            ApiScopes::CONTROL,
+            None,
+        )
+        .expect("register durable control token");
+    service
+        .register_api_token(
+            &durable_admin_token,
+            "durable-admin",
+            ApiScopes::ADMIN,
+            None,
+        )
+        .expect("register durable admin token");
     let host_identity = service
         .initialize_daemon()
         .expect("initialize Host state")
@@ -1559,6 +1577,61 @@ async fn read_scoped_ssh_bootstrap_can_handoff_maintenance_without_setup_authori
     let address = server.local_addr();
 
     tokio::task::spawn_blocking(move || {
+        const MAINTENANCE_PRINCIPAL_REQUIRED: &str =
+            "bootstrap maintenance requires an SSH bootstrap principal";
+
+        let assert_insufficient_scope =
+            |error: DaemonClientError, action: &str, expected_message: Option<&str>| match error {
+                DaemonClientError::Api { status, error } => {
+                    assert_eq!(status, StatusCode::FORBIDDEN, "{action}");
+                    assert_eq!(
+                        error.code().as_str(),
+                        ErrorCode::AuthorizationInsufficientScope.as_str(),
+                        "{action}"
+                    );
+                    let serialized = serde_json::to_value(error.as_ref())
+                        .expect("serialize authorization error");
+                    assert_eq!(
+                        serialized["retryable"],
+                        serde_json::Value::Bool(false),
+                        "{action}"
+                    );
+                    if let Some(expected_message) = expected_message {
+                        assert_eq!(
+                            serialized["category"],
+                            serde_json::Value::String("authorization".to_string()),
+                            "{action}"
+                        );
+                        assert_eq!(
+                            serialized["message"],
+                            serde_json::Value::String(expected_message.to_string()),
+                            "{action}"
+                        );
+                    }
+                }
+                other => panic!("{action}: expected forbidden authorization error, got {other:?}"),
+            };
+        let assert_durable_handoff_forbidden =
+            |client: &DaemonClient, operation_id: &str, credential: &str| {
+                let begin_error = client
+                    .begin_bootstrap_maintenance(operation_id, "missing_daemon_repair")
+                    .expect_err("durable credentials cannot begin bootstrap maintenance");
+                assert_insufficient_scope(
+                    begin_error,
+                    &format!("{credential} bootstrap maintenance begin"),
+                    Some(MAINTENANCE_PRINCIPAL_REQUIRED),
+                );
+
+                let complete_error = client
+                    .complete_bootstrap_maintenance(operation_id)
+                    .expect_err("durable credentials cannot complete bootstrap maintenance");
+                assert_insufficient_scope(
+                    complete_error,
+                    &format!("{credential} bootstrap maintenance complete"),
+                    Some(MAINTENANCE_PRINCIPAL_REQUIRED),
+                );
+            };
+
         let bootstrap_client = DaemonClient::loopback(address, bootstrap_token, &host_identity)
             .expect("construct read-scoped bootstrap client");
         let operation_id = "read-bootstrap-handoff";
@@ -1571,43 +1644,38 @@ async fn read_scoped_ssh_bootstrap_can_handoff_maintenance_without_setup_authori
         let setup_error = bootstrap_client
             .issue_durable_setup_token("read-bootstrap-setup-attempt")
             .expect_err("read-scoped SSH bootstrap cannot mint setup credentials");
-        match setup_error {
-            DaemonClientError::Api { status, error } => {
-                assert_eq!(status, StatusCode::FORBIDDEN);
-                assert_eq!(
-                    error.code().as_str(),
-                    ErrorCode::AuthorizationInsufficientScope.as_str()
-                );
-                assert_eq!(
-                    serde_json::to_value(error.as_ref()).expect("serialize setup error")
-                        ["retryable"],
-                    serde_json::Value::Bool(false)
-                );
-            }
-            other => panic!("expected forbidden setup API error, got {other:?}"),
-        }
+        assert_insufficient_scope(
+            setup_error,
+            "read-scoped SSH bootstrap setup-token issuance",
+            None,
+        );
 
         let durable_read_client =
             DaemonClient::loopback(address, durable_read_token, &host_identity)
                 .expect("construct durable read client");
-        let handoff_error = durable_read_client
-            .begin_bootstrap_maintenance("durable-read-handoff", "missing_daemon_repair")
-            .expect_err("ordinary durable read credentials cannot begin maintenance");
-        match handoff_error {
-            DaemonClientError::Api { status, error } => {
-                assert_eq!(status, StatusCode::FORBIDDEN);
-                assert_eq!(
-                    error.code().as_str(),
-                    ErrorCode::AuthorizationInsufficientScope.as_str()
-                );
-                assert_eq!(
-                    serde_json::to_value(error.as_ref()).expect("serialize handoff error")
-                        ["retryable"],
-                    serde_json::Value::Bool(false)
-                );
-            }
-            other => panic!("expected forbidden handoff API error, got {other:?}"),
-        }
+        assert_durable_handoff_forbidden(
+            &durable_read_client,
+            "durable-read-handoff",
+            "durable read credential",
+        );
+
+        let durable_control_client =
+            DaemonClient::loopback(address, durable_control_token, &host_identity)
+                .expect("construct durable control client");
+        assert_durable_handoff_forbidden(
+            &durable_control_client,
+            "durable-control-handoff",
+            "durable control credential",
+        );
+
+        let durable_admin_client =
+            DaemonClient::loopback(address, durable_admin_token, &host_identity)
+                .expect("construct durable admin client");
+        assert_durable_handoff_forbidden(
+            &durable_admin_client,
+            "durable-admin-handoff",
+            "durable admin credential",
+        );
     })
     .await
     .expect("join bootstrap maintenance client operations");

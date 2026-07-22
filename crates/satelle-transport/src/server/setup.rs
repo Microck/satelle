@@ -44,7 +44,7 @@ pub(super) async fn complete_bootstrap_maintenance(
     Path(operation_id): Path<String>,
 ) -> Response {
     if !bootstrap_maintenance_principal_is_authorized(&authorized) {
-        return bootstrap_required(&state, &authorized);
+        return bootstrap_maintenance_principal_required(&state, &authorized);
     }
     let service = Arc::clone(&state.service);
     let operation = operation_id.clone();
@@ -72,7 +72,7 @@ pub(super) async fn begin_bootstrap_maintenance(
     Path((operation_id, operation_kind)): Path<(String, String)>,
 ) -> Response {
     if !bootstrap_maintenance_principal_is_authorized(&authorized) {
-        return bootstrap_required(&state, &authorized);
+        return bootstrap_maintenance_principal_required(&state, &authorized);
     }
     let operation_kind = match operation_kind.as_str() {
         "initial_setup" => SetupOperationKind::Setup,
@@ -344,6 +344,24 @@ fn bootstrap_required(state: &DaemonState, authorized: &AuthorizedRequest) -> Re
     )
 }
 
+fn bootstrap_maintenance_principal_required(
+    state: &DaemonState,
+    authorized: &AuthorizedRequest,
+) -> Response {
+    api_error_response(
+        authorized.request_id().clone(),
+        Some(state.host_identity.clone()),
+        ApiFailure {
+            status: StatusCode::FORBIDDEN,
+            code: ApiErrorCode::AuthorizationInsufficientScope,
+            category: ApiErrorCategory::Authorization,
+            retryable: false,
+            message: "bootstrap maintenance requires an SSH bootstrap principal",
+            details: None,
+        },
+    )
+}
+
 fn durable_setup_credential_required(
     state: &DaemonState,
     authorized: &AuthorizedRequest,
@@ -371,10 +389,7 @@ fn setup_principal_is_authorized(authorized: &AuthorizedRequest) -> bool {
 // public Read/Control/Admin hierarchy. A process-local SSH bootstrap principal
 // needs it even when the daemon exposes only read operations to that client.
 fn bootstrap_maintenance_principal_is_authorized(authorized: &AuthorizedRequest) -> bool {
-    let principal = authorized.principal();
-    principal.is_ssh_bootstrap()
-        || principal.scopes().allows(ApiScopes::ADMIN)
-        || principal.scopes().allows(ApiScopes::CONTROL)
+    authorized.principal().is_ssh_bootstrap()
 }
 
 fn setup_principal_can_activate(authorized: &AuthorizedRequest, token_id: &str) -> bool {
