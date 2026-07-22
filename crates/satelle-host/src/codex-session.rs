@@ -1,3 +1,4 @@
+use base64::Engine as _;
 use satelle_core::session::StopObservation;
 use satelle_core::session::TurnExecutionMode;
 use serde_json::{Map, Value, json};
@@ -86,6 +87,9 @@ pub(crate) struct CodexSessionRequest<'a> {
     pub(crate) persist_thread_ref: &'a mut dyn FnMut(&str) -> Result<(), ()>,
     pub(crate) persist_turn_ref: &'a mut dyn FnMut(&str) -> Result<(), ()>,
     pub(crate) control: Option<CodexSessionControl>,
+    pub(crate) goal_set_supported: bool,
+    pub(crate) image_input_mode: crate::codex_capabilities::CodexImageInputMode,
+    pub(crate) attachments: &'a [crate::attachment::StagedImage],
 }
 
 impl CodexSessionRequest<'_> {
@@ -369,11 +373,12 @@ pub(crate) fn read_codex_turn(
 
 struct SessionExchange<'a> {
     request: CodexSessionRequest<'a>,
-    responses: [bool; 5],
+    responses: [bool; 6],
     thread_ref: Option<String>,
     thread_observed: bool,
     turn_ref: Option<String>,
     turn_dispatch_attempted: bool,
+    goal_dispatch_attempted: bool,
     terminal: Option<CodexSessionTerminal>,
     control: Option<mpsc::Receiver<ControlCommand>>,
     pending_interrupt: Option<mpsc::Sender<StopObservation>>,
@@ -390,10 +395,11 @@ impl<'a> SessionExchange<'a> {
         Self {
             thread_ref: request.existing_thread_ref.map(str::to_owned),
             request,
-            responses: [false; 5],
+            responses: [false; 6],
             thread_observed: false,
             turn_ref: None,
             turn_dispatch_attempted: false,
+            goal_dispatch_attempted: false,
             terminal: None,
             control,
             pending_interrupt: None,
@@ -427,12 +433,23 @@ impl<'a> SessionExchange<'a> {
             if self.controlled_stop {
                 return self.wait_for_stop_commit(writer);
             }
-            if !self.controlled_stop && !self.turn_dispatch_attempted && self.thread_observed {
+            if !self.controlled_stop
+                && self.thread_observed
+                && self.goal_required()
+                && !self.goal_dispatch_attempted
+            {
+                self.write_goal_request(writer)?;
+            }
+            if !self.controlled_stop
+                && !self.turn_dispatch_attempted
+                && self.thread_observed
+                && (!self.goal_required() || self.responses[3])
+            {
                 self.write_turn_request(writer)?;
             }
             if !self.controlled_stop
                 && self.responses[2]
-                && self.responses[3]
+                && self.responses[self.turn_request_id()]
                 && let Some(terminal) = self.terminal
             {
                 return Ok(terminal);
@@ -518,7 +535,7 @@ impl<'a> SessionExchange<'a> {
         };
         writer.write_after_queue(
             &json!({
-                "id": 4,
+                "id": self.interrupt_request_id(),
                 "method": "turn/interrupt",
                 "params": {"threadId": thread_ref, "turnId": turn_ref}
             }),
@@ -619,12 +636,13 @@ impl<'a> SessionExchange<'a> {
             .get("id")
             .and_then(Value::as_u64)
             .and_then(|id| usize::try_from(id).ok())
-            .filter(|id| (1..=4).contains(id))
+            .filter(|id| (1..=5).contains(id))
             .ok_or(CodexSessionError::UnexpectedResponse)?;
         if self.responses[id] {
             return Err(CodexSessionError::DuplicateResponse);
         }
-        if object.contains_key("error") && id == 4 && self.interrupt_sent {
+        if object.contains_key("error") && id == self.interrupt_request_id() && self.interrupt_sent
+        {
             if let Some(reply) = self.pending_interrupt.take() {
                 let _ = reply.send(StopObservation::OutcomeUnknown);
             }
@@ -644,21 +662,43 @@ impl<'a> SessionExchange<'a> {
                 let thread_ref = nested_id(result, "thread")?;
                 self.observe_thread(thread_ref)?;
             }
-            3 if self.turn_dispatch_attempted => {
-                let turn = result
-                    .get("turn")
+            3 if self.goal_dispatch_attempted => {
+                let goal = result
+                    .get("goal")
                     .and_then(Value::as_object)
                     .ok_or(CodexSessionError::MalformedMessage)?;
-                if turn.get("status").and_then(Value::as_str) != Some("inProgress") {
-                    return Err(CodexSessionError::MalformedMessage);
+                self.correlate_thread(required_string(goal, "threadId")?)?;
+                if required_string(goal, "objective")? != self.request.prompt {
+                    return Err(CodexSessionError::ConflictingIdentity);
                 }
-                let turn_ref = required_string(turn, "id")?;
-                self.observe_turn(turn_ref)?;
             }
-            4 if self.interrupt_sent => {}
+            3 if self.turn_dispatch_attempted && !self.goal_required() => {
+                self.consume_turn_start_response(result)?;
+            }
+            4 if self.turn_dispatch_attempted && self.goal_required() => {
+                self.consume_turn_start_response(result)?;
+            }
+            4 if self.interrupt_sent && !self.goal_required() => {}
+            5 if self.interrupt_sent && self.goal_required() => {}
             _ => return Err(CodexSessionError::UnexpectedResponse),
         }
         self.responses[id] = true;
+        Ok(())
+    }
+
+    fn consume_turn_start_response(
+        &mut self,
+        result: &Map<String, Value>,
+    ) -> Result<(), CodexSessionError> {
+        let turn = result
+            .get("turn")
+            .and_then(Value::as_object)
+            .ok_or(CodexSessionError::MalformedMessage)?;
+        if turn.get("status").and_then(Value::as_str) != Some("inProgress") {
+            return Err(CodexSessionError::MalformedMessage);
+        }
+        let turn_ref = required_string(turn, "id")?;
+        self.observe_turn(turn_ref)?;
         Ok(())
     }
 
@@ -799,11 +839,32 @@ impl<'a> SessionExchange<'a> {
 
     fn write_turn_request(&mut self, writer: &ProtocolWriter) -> Result<(), CodexSessionError> {
         let thread_ref = self.thread_ref.as_deref().ok_or(CodexSessionError::Write)?;
+        let mut input = vec![json!({"type": "text", "text": self.request.prompt})];
+        for attachment in self.request.attachments {
+            let image = match self.request.image_input_mode {
+                crate::codex_capabilities::CodexImageInputMode::Local => {
+                    let path = attachment.path().to_str().ok_or(CodexSessionError::Write)?;
+                    json!({"type": "localImage", "path": path})
+                }
+                crate::codex_capabilities::CodexImageInputMode::Inline => {
+                    let encoded =
+                        base64::engine::general_purpose::STANDARD.encode(attachment.bytes());
+                    json!({
+                        "type": "image",
+                        "url": format!("data:{};base64,{encoded}", attachment.media_type())
+                    })
+                }
+                crate::codex_capabilities::CodexImageInputMode::Unsupported => {
+                    return Err(CodexSessionError::Write);
+                }
+            };
+            input.push(image);
+        }
         let request = json!({
-            "id": 3,
+            "id": self.turn_request_id(),
             "method": "turn/start",
             "params": {
-                "input": [{"type": "text", "text": self.request.prompt}],
+                "input": input,
                 "threadId": thread_ref,
                 "model": self.request.model,
                 "approvalPolicy": self.request.approval_policy.as_protocol_value(),
@@ -817,6 +878,30 @@ impl<'a> SessionExchange<'a> {
             // writer sent none of the turn request bytes.
             self.turn_dispatch_attempted = true;
         })
+    }
+
+    fn goal_required(&self) -> bool {
+        self.request.goal_set_supported && self.request.existing_thread_ref.is_none()
+    }
+
+    fn turn_request_id(&self) -> usize {
+        if self.goal_required() { 4 } else { 3 }
+    }
+
+    fn interrupt_request_id(&self) -> usize {
+        if self.goal_required() { 5 } else { 4 }
+    }
+
+    fn write_goal_request(&mut self, writer: &ProtocolWriter) -> Result<(), CodexSessionError> {
+        let thread_ref = self.thread_ref.as_deref().ok_or(CodexSessionError::Write)?;
+        writer.write_after_queue(
+            &json!({
+                "id": 3,
+                "method": "thread/goal/set",
+                "params": {"threadId": thread_ref, "objective": self.request.prompt}
+            }),
+            || self.goal_dispatch_attempted = true,
+        )
     }
 }
 

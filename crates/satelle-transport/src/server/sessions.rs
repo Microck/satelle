@@ -20,7 +20,7 @@ pub(super) async fn create_session(
     headers: HeaderMap,
     ApiJson(request): ApiJson<TurnRequest>,
 ) -> Response {
-    let intent = match turn_intent(request) {
+    let intent = match turn_intent(request, state.capabilities.image_attachments()) {
         Ok(intent) => intent,
         Err(error) => return invalid_turn_request(&state, &authorized, error),
     };
@@ -70,7 +70,7 @@ pub(super) async fn create_turn(
     SessionPath(session_id): SessionPath,
     ApiJson(request): ApiJson<TurnRequest>,
 ) -> Response {
-    let intent = match turn_intent(request) {
+    let intent = match turn_intent(request, state.capabilities.image_attachments()) {
         Ok(intent) => intent,
         Err(error) => return invalid_turn_request(&state, &authorized, error),
     };
@@ -293,7 +293,13 @@ fn admission_wire_error(error: SatelleError) -> SatelleError {
     }
 }
 
-fn turn_intent(request: TurnRequest) -> Result<TurnIntent, TurnIntentError> {
+fn turn_intent(
+    request: TurnRequest,
+    image_attachments_supported: bool,
+) -> Result<TurnIntent, TurnIntentError> {
+    if !image_attachments_supported && !request.attachments().is_empty() {
+        return Err(TurnIntentError::InvalidAttachments);
+    }
     let TurnRequestParts {
         prompt,
         execution_mode,
@@ -301,16 +307,32 @@ fn turn_intent(request: TurnRequest) -> Result<TurnIntent, TurnIntentError> {
         provider,
         experimental_provider_computer_use,
         refresh_provider_smoke_test,
+        attachments,
+        turn_execution_timeout_ms,
     } = request.into_parts();
+    let attachments = attachments
+        .into_iter()
+        .map(|attachment| {
+            satelle_host::AttachmentUpload::new(
+                attachment.media_type(),
+                attachment.size_bytes(),
+                attachment.sha256(),
+                attachment.data_base64(),
+            )
+        })
+        .collect();
 
-    TurnIntent::new(prompt, execution_mode).and_then(|intent| {
-        intent.with_provider_intent(
-            model,
-            provider,
-            experimental_provider_computer_use,
-            refresh_provider_smoke_test,
-        )
-    })
+    TurnIntent::new(prompt, execution_mode)
+        .and_then(|intent| {
+            intent.with_provider_intent(
+                model,
+                provider,
+                experimental_provider_computer_use,
+                refresh_provider_smoke_test,
+            )
+        })
+        .and_then(|intent| intent.with_turn_execution_timeout_ms(turn_execution_timeout_ms))
+        .and_then(|intent| intent.with_attachments(attachments))
 }
 
 fn invalid_turn_request(
@@ -322,6 +344,10 @@ fn invalid_turn_request(
         TurnIntentError::EmptyPrompt => "prompt must not be empty",
         TurnIntentError::InvalidModel => "model override is invalid",
         TurnIntentError::InvalidProvider => "provider override is invalid",
+        TurnIntentError::InvalidTurnExecutionTimeout => {
+            "Turn execution timeout must be a whole number of seconds from 1s through 24h"
+        }
+        TurnIntentError::InvalidAttachments => "image attachments failed integrity validation",
     };
     request_error(state, authorized, message)
 }

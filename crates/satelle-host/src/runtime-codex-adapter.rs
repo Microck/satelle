@@ -183,8 +183,7 @@ impl ProductionComputerUseAdapter {
             DesktopTarget::new(desktop_binding.clone()),
             ApprovalPolicy::OnRequest,
             SandboxPolicy::WorkspaceWrite,
-            TimeoutPolicy::bounded_seconds(120)
-                .map_err(|_| adapter_failure("timeout_policy_invalid"))?,
+            host_turn_timeout_ceiling()?,
             ExperimentalFeatureChoices::new(
                 FeatureChoice::Enabled,
                 if provider_intent.experimental() {
@@ -357,6 +356,9 @@ impl ProductionComputerUseAdapter {
                 persist_thread_ref,
                 persist_turn_ref,
                 control: None,
+                goal_set_supported: false,
+                image_input_mode: crate::codex_capabilities::CodexImageInputMode::Unsupported,
+                attachments: &[],
             },
             READINESS_CANCELLATION_GRACE,
             cancellation.cloned(),
@@ -485,6 +487,9 @@ impl ProductionComputerUseAdapter {
                 persist_thread_ref: persistence.persist_thread_ref,
                 persist_turn_ref: persistence.persist_turn_ref,
                 control: None,
+                goal_set_supported: false,
+                image_input_mode: crate::codex_capabilities::CodexImageInputMode::Unsupported,
+                attachments: &[],
             },
             READINESS_CANCELLATION_GRACE,
             cancellation.cloned(),
@@ -1149,6 +1154,19 @@ impl ComputerUseAdapter for ProductionComputerUseAdapter {
                 *persistence_error.borrow_mut() = Some(error);
             })
         };
+        let snapshot = crate::read_production_snapshot(&self.snapshot)?;
+        let goal_set_supported = snapshot.goal_set_supported();
+        let image_input_mode = snapshot.image_input_mode();
+        if !request.attachments().is_empty()
+            && matches!(
+                image_input_mode,
+                crate::codex_capabilities::CodexImageInputMode::Unsupported
+            )
+        {
+            return Err(SatelleError::invalid_usage(
+                "the selected Codex protocol does not support image input",
+            ));
+        }
         let result = run_codex_session(
             preserve_managed_codex_error(crate::codex_capabilities::installed_app_server_command())?,
             CodexSessionRequest {
@@ -1164,6 +1182,9 @@ impl ComputerUseAdapter for ProductionComputerUseAdapter {
                 persist_thread_ref: &mut persist_thread_ref,
                 persist_turn_ref: &mut persist_turn_ref,
                 control: Some(control),
+                goal_set_supported,
+                image_input_mode,
+                attachments: request.attachments(),
             },
         );
         finish_execution(result, persistence_error.into_inner())
@@ -1477,6 +1498,11 @@ fn preserve_managed_codex_error(
     command
 }
 
+fn host_turn_timeout_ceiling() -> Result<TimeoutPolicy, SatelleError> {
+    TimeoutPolicy::bounded_seconds((satelle_core::MAX_TURN_EXECUTION_TIMEOUT_MS / 1_000) as u32)
+        .map_err(|_| adapter_failure("timeout_policy_invalid"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1502,6 +1528,11 @@ mod tests {
             propagated.details["reason"],
             Value::String("immutable_binary_digest_mismatch".to_string())
         );
+    }
+
+    #[test]
+    fn production_host_timeout_ceiling_allows_resolved_limits_through_24_hours() {
+        assert_eq!(host_turn_timeout_ceiling().unwrap().seconds(), 24 * 60 * 60);
     }
 
     #[test]

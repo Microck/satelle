@@ -24,7 +24,7 @@ use crate::EphemeralApiAuthenticator;
 use std::sync::Arc;
 
 const MAX_IDEMPOTENCY_KEY_BYTES: usize = 256;
-const TURN_IDEMPOTENCY_DIGEST_SCHEMA_VERSION: u16 = 3;
+const TURN_IDEMPOTENCY_DIGEST_SCHEMA_VERSION: u16 = 4;
 const STOP_IDEMPOTENCY_DIGEST_SCHEMA_VERSION: u16 = 1;
 const DURABLE_SETUP_PRINCIPAL_PREFIX: &str = "controller-setup";
 
@@ -89,6 +89,7 @@ pub struct DaemonRuntimeCapabilities {
     codex_runtime: bool,
     native_computer_use: bool,
     provider_computer_use: bool,
+    image_attachments: bool,
 }
 
 /// Volatile activity used only to decide whether an on-demand daemon may exit.
@@ -168,12 +169,13 @@ pub enum MutationAuthorityError {
     InvalidIdempotencyKey,
 }
 
-/// Prompt and non-secret provider intent accepted by the Host API. Attachments
-/// remain absent until their full vertical slice exists.
+/// Prompt, provider intent, and verified image bytes accepted by the Host API.
 pub struct TurnIntent {
     prompt: String,
     execution_mode: TurnExecutionMode,
     provider_intent: crate::ProviderComputerUseIntent,
+    turn_execution_timeout: Option<satelle_core::session::TimeoutPolicy>,
+    attachments: Vec<crate::attachment::VerifiedImageAttachment>,
 }
 
 impl TurnIntent {
@@ -189,6 +191,13 @@ impl TurnIntent {
             prompt,
             execution_mode,
             provider_intent: crate::ProviderComputerUseIntent::host_default(),
+            turn_execution_timeout: Some(
+                satelle_core::session::TimeoutPolicy::bounded_seconds(
+                    (satelle_core::DEFAULT_TURN_EXECUTION_TIMEOUT_MS / 1_000) as u32,
+                )
+                .map_err(|_| TurnIntentError::InvalidTurnExecutionTimeout)?,
+            ),
+            attachments: Vec::new(),
         })
     }
 
@@ -212,6 +221,37 @@ impl TurnIntent {
         Ok(self)
     }
 
+    pub fn with_turn_execution_timeout_ms(
+        mut self,
+        timeout_ms: Option<u64>,
+    ) -> Result<Self, TurnIntentError> {
+        self.turn_execution_timeout = timeout_ms
+            .or(Some(satelle_core::DEFAULT_TURN_EXECUTION_TIMEOUT_MS))
+            .map(|timeout_ms| {
+                if timeout_ms == 0
+                    || timeout_ms > satelle_core::MAX_TURN_EXECUTION_TIMEOUT_MS
+                    || timeout_ms % 1_000 != 0
+                {
+                    return Err(TurnIntentError::InvalidTurnExecutionTimeout);
+                }
+                let seconds = u32::try_from(timeout_ms / 1_000)
+                    .map_err(|_| TurnIntentError::InvalidTurnExecutionTimeout)?;
+                satelle_core::session::TimeoutPolicy::bounded_seconds(seconds)
+                    .map_err(|_| TurnIntentError::InvalidTurnExecutionTimeout)
+            })
+            .transpose()?;
+        Ok(self)
+    }
+
+    pub fn with_attachments(
+        mut self,
+        attachments: Vec<crate::AttachmentUpload>,
+    ) -> Result<Self, TurnIntentError> {
+        self.attachments = crate::attachment::verify_uploads(attachments)
+            .map_err(|()| TurnIntentError::InvalidAttachments)?;
+        Ok(self)
+    }
+
     pub(crate) fn prompt(&self) -> &str {
         &self.prompt
     }
@@ -232,6 +272,7 @@ impl fmt::Debug for TurnIntent {
             .field("prompt_bytes", &self.prompt.len())
             .field("execution_mode", &self.execution_mode)
             .field("provider_intent", &self.provider_intent)
+            .field("attachment_count", &self.attachments.len())
             .finish_non_exhaustive()
     }
 }
@@ -244,6 +285,10 @@ pub enum TurnIntentError {
     InvalidModel,
     #[error("the provider override is invalid")]
     InvalidProvider,
+    #[error("the Turn execution timeout must be a whole number of seconds from 1s through 24h")]
+    InvalidTurnExecutionTimeout,
+    #[error("the image attachments failed bounded media or integrity validation")]
+    InvalidAttachments,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -293,6 +338,8 @@ struct CanonicalSessionCreate<'a> {
     provider: Option<&'a str>,
     experimental_provider_computer_use: bool,
     refresh_provider_smoke_test: bool,
+    turn_execution_timeout_seconds: Option<u32>,
+    attachments: &'a [CanonicalAttachment<'a>],
 }
 
 #[derive(Serialize)]
@@ -305,6 +352,25 @@ struct CanonicalTurnCreate<'a> {
     provider: Option<&'a str>,
     experimental_provider_computer_use: bool,
     refresh_provider_smoke_test: bool,
+    turn_execution_timeout_seconds: Option<u32>,
+    attachments: &'a [CanonicalAttachment<'a>],
+}
+
+#[derive(Serialize)]
+struct CanonicalAttachment<'a> {
+    media_type: &'a str,
+    size_bytes: usize,
+    sha256: String,
+}
+
+impl<'a> From<&'a crate::attachment::VerifiedImageAttachment> for CanonicalAttachment<'a> {
+    fn from(attachment: &'a crate::attachment::VerifiedImageAttachment) -> Self {
+        Self {
+            media_type: attachment.media_type(),
+            size_bytes: attachment.size_bytes(),
+            sha256: attachment.sha256_hex(),
+        }
+    }
 }
 
 #[derive(Serialize)]
@@ -343,6 +409,10 @@ impl DaemonRuntimeCapabilities {
 
     pub const fn provider_computer_use(self) -> bool {
         self.provider_computer_use
+    }
+
+    pub const fn image_attachments(self) -> bool {
+        self.image_attachments
     }
 }
 
@@ -435,6 +505,7 @@ impl HostService {
                 codex_runtime: false,
                 native_computer_use: false,
                 provider_computer_use: false,
+                image_attachments: true,
             }),
         }
     }
@@ -665,6 +736,14 @@ impl HostService {
                     .map(ProviderBindingRef::as_str),
                 experimental_provider_computer_use: intent.provider_intent.experimental(),
                 refresh_provider_smoke_test: intent.provider_intent.refresh(),
+                turn_execution_timeout_seconds: intent
+                    .turn_execution_timeout
+                    .map(satelle_core::session::TimeoutPolicy::seconds),
+                attachments: &intent
+                    .attachments
+                    .iter()
+                    .map(CanonicalAttachment::from)
+                    .collect::<Vec<_>>(),
             },
             TURN_IDEMPOTENCY_DIGEST_SCHEMA_VERSION,
         )?;
@@ -710,6 +789,8 @@ impl HostService {
                             )
                             .with_execution_mode(intent.execution_mode)
                             .with_provider_intent(intent.provider_intent.clone())
+                            .with_turn_execution_timeout(intent.turn_execution_timeout)
+                            .with_attachments(intent.attachments.clone())
                             .with_cancellation(registered_cancellation),
                         ),
                     )?;
@@ -764,6 +845,14 @@ impl HostService {
                     .map(ProviderBindingRef::as_str),
                 experimental_provider_computer_use: intent.provider_intent.experimental(),
                 refresh_provider_smoke_test: intent.provider_intent.refresh(),
+                turn_execution_timeout_seconds: intent
+                    .turn_execution_timeout
+                    .map(satelle_core::session::TimeoutPolicy::seconds),
+                attachments: &intent
+                    .attachments
+                    .iter()
+                    .map(CanonicalAttachment::from)
+                    .collect::<Vec<_>>(),
             },
             TURN_IDEMPOTENCY_DIGEST_SCHEMA_VERSION,
         )?;
@@ -813,6 +902,8 @@ impl HostService {
                             )
                             .with_execution_mode(intent.execution_mode)
                             .with_provider_intent(intent.provider_intent.clone())
+                            .with_turn_execution_timeout(intent.turn_execution_timeout)
+                            .with_attachments(intent.attachments.clone())
                             .with_cancellation(registered_cancellation),
                         ),
                     )?;
@@ -850,6 +941,14 @@ impl HostService {
                     .map(ProviderBindingRef::as_str),
                 experimental_provider_computer_use: intent.provider_intent.experimental(),
                 refresh_provider_smoke_test: intent.provider_intent.refresh(),
+                turn_execution_timeout_seconds: intent
+                    .turn_execution_timeout
+                    .map(satelle_core::session::TimeoutPolicy::seconds),
+                attachments: &intent
+                    .attachments
+                    .iter()
+                    .map(CanonicalAttachment::from)
+                    .collect::<Vec<_>>(),
             },
             TURN_IDEMPOTENCY_DIGEST_SCHEMA_VERSION,
         )?;
@@ -909,6 +1008,14 @@ impl HostService {
                     .map(ProviderBindingRef::as_str),
                 experimental_provider_computer_use: intent.provider_intent.experimental(),
                 refresh_provider_smoke_test: intent.provider_intent.refresh(),
+                turn_execution_timeout_seconds: intent
+                    .turn_execution_timeout
+                    .map(satelle_core::session::TimeoutPolicy::seconds),
+                attachments: &intent
+                    .attachments
+                    .iter()
+                    .map(CanonicalAttachment::from)
+                    .collect::<Vec<_>>(),
             },
             TURN_IDEMPOTENCY_DIGEST_SCHEMA_VERSION,
         )?;
@@ -1092,6 +1199,10 @@ fn production_capabilities(
         codex_runtime,
         native_computer_use,
         provider_computer_use: false,
+        image_attachments: !matches!(
+            snapshot.image_input_mode(),
+            crate::codex_capabilities::CodexImageInputMode::Unsupported
+        ),
     }
 }
 
@@ -1216,6 +1327,21 @@ mod tests {
     use std::sync::Arc;
 
     #[test]
+    fn turn_intent_defaults_to_30_minutes_and_accepts_a_resolved_hour() {
+        let default = TurnIntent::new("prompt", TurnExecutionMode::Standard).unwrap();
+        assert_eq!(default.turn_execution_timeout.unwrap().seconds(), 30 * 60);
+
+        let configured = TurnIntent::new("prompt", TurnExecutionMode::Standard)
+            .unwrap()
+            .with_turn_execution_timeout_ms(Some(60 * 60 * 1_000))
+            .unwrap();
+        assert_eq!(
+            configured.turn_execution_timeout.unwrap().seconds(),
+            60 * 60
+        );
+    }
+
+    #[test]
     fn idempotency_digest_versions_change_only_for_turn_payloads() {
         let turn = canonical_payload(
             &CanonicalSessionCreate {
@@ -1226,16 +1352,18 @@ mod tests {
                 provider: Some("provider-test"),
                 experimental_provider_computer_use: true,
                 refresh_provider_smoke_test: true,
+                turn_execution_timeout_seconds: Some(30 * 60),
+                attachments: &[],
             },
             TURN_IDEMPOTENCY_DIGEST_SCHEMA_VERSION,
         )
         .expect("serialize Turn idempotency payload");
-        assert_eq!(turn.digest_schema_version, 3);
+        assert_eq!(turn.digest_schema_version, 4);
         assert_eq!(
             serde_json::from_slice::<serde_json::Value>(turn.as_slice())
                 .expect("decode Turn payload"),
             serde_json::json!({
-                "digest_schema_version": 3,
+                "digest_schema_version": 4,
                 "payload": {
                     "operation": "session_create",
                     "prompt": "PRIVATE_DIGEST_VERSION_PROMPT",
@@ -1243,7 +1371,9 @@ mod tests {
                     "model": "model-test",
                     "provider": "provider-test",
                     "experimental_provider_computer_use": true,
-                    "refresh_provider_smoke_test": true
+                    "refresh_provider_smoke_test": true,
+                    "turn_execution_timeout_seconds": 1800,
+                    "attachments": []
                 }
             })
         );

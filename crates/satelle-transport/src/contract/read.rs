@@ -207,6 +207,7 @@ pub struct CapabilitiesResponse {
     operations: Vec<Operation>,
     runtime_capabilities: RuntimeCapabilities,
     limits: EffectiveLimits,
+    supported_attachment_media_types: Vec<String>,
 }
 
 impl CapabilitiesResponse {
@@ -218,8 +219,19 @@ impl CapabilitiesResponse {
         codex_runtime: bool,
         native_computer_use: bool,
         provider_computer_use: bool,
+        image_attachments: bool,
         limits: EffectiveLimits,
     ) -> Self {
+        let limits = if image_attachments {
+            limits
+        } else {
+            EffectiveLimits {
+                attachment_count: 0,
+                attachment_bytes_each: 0,
+                attachment_bytes_total: 0,
+                ..limits
+            }
+        };
         Self {
             schema_version: CapabilitiesSchema,
             request_id,
@@ -251,6 +263,14 @@ impl CapabilitiesResponse {
                 provider_computer_use,
             },
             limits,
+            supported_attachment_media_types: if image_attachments {
+                super::SUPPORTED_IMAGE_MEDIA_TYPES
+                    .iter()
+                    .map(|media_type| (*media_type).to_string())
+                    .collect()
+            } else {
+                Vec::new()
+            },
         }
     }
 
@@ -275,6 +295,10 @@ impl CapabilitiesResponse {
 
     pub const fn limits(&self) -> EffectiveLimits {
         self.limits
+    }
+
+    pub fn supported_attachment_media_types(&self) -> &[String] {
+        &self.supported_attachment_media_types
     }
 }
 
@@ -410,9 +434,9 @@ pub(crate) fn effective_limits(
         json_body_bytes: 1_048_576,
         http_connections,
         operation_concurrency: 1,
-        attachment_count: 0,
-        attachment_bytes_each: 0,
-        attachment_bytes_total: 0,
+        attachment_count: super::MAX_IMAGE_ATTACHMENT_COUNT,
+        attachment_bytes_each: super::MAX_IMAGE_ATTACHMENT_BYTES,
+        attachment_bytes_total: super::MAX_IMAGE_ATTACHMENT_BYTES_TOTAL,
         failed_auth_attempts_per_minute: api_rate_limits.failed_auth_attempts_per_minute(),
         authenticated_requests_per_minute: api_rate_limits.authenticated_requests_per_minute(),
         control_requests_per_minute: api_rate_limits.control_requests_per_minute(),

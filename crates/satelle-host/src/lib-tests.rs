@@ -25,6 +25,7 @@ fn admission_request_timeout_tracks_both_configured_readiness_phases() {
     config.timeouts = Some(satelle_core::TimeoutConfig {
         native_readiness: satelle_core::ExplicitDuration::parse("2s"),
         provider_smoke_test: satelle_core::ExplicitDuration::parse("3s"),
+        turn_execution: None,
     });
     assert_eq!(
         admission_request_timeout(&config),

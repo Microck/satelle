@@ -13,7 +13,9 @@ use std::time::{Duration, Instant};
 
 #[path = "runtime-codex.rs"]
 mod control_plane;
-pub(crate) use control_plane::{ControlPlaneAdmission, installed_app_server_command};
+pub(crate) use control_plane::{
+    CodexImageInputMode, ControlPlaneAdmission, installed_app_server_command,
+};
 
 #[cfg(test)]
 #[path = "runtime-codex-tests.rs"]

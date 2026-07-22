@@ -18,7 +18,11 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 async fn chunked_oversize_body_returns_typed_413_without_admission() {
     let running = RunningServer::start(ApiScopes::CONTROL).await;
     let authorization = bearer(&running.token);
-    let payload_bytes = 1_048_577;
+    let body = format!(
+        r#"{{"schema_version":"satelle.api.v2","prompt":"{}"}}"#,
+        "x".repeat(1_048_576)
+    );
+    let payload_bytes = body.len();
     let head = format!(
         "POST /v1/sessions HTTP/1.1\r\nHost: localhost\r\nAuthorization: {authorization}\r\nSatelle-Expected-Host-Identity: {}\r\nSatelle-Request-Id: {}\r\nSatelle-Protocol-Version: 5\r\nIdempotency-Key: raw-chunked-limit\r\nContent-Type: application/json\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n{payload_bytes:x}\r\n",
         running.host_identity,
@@ -26,11 +30,38 @@ async fn chunked_oversize_body_returns_typed_413_without_admission() {
     );
     let mut request = Vec::with_capacity(head.len() + payload_bytes + 16);
     request.extend_from_slice(head.as_bytes());
-    request.resize(request.len() + payload_bytes, b'x');
+    request.extend_from_slice(body.as_bytes());
     request.extend_from_slice(b"\r\n0\r\n\r\n");
 
     let response = raw_request(running.server.local_addr(), &request).await;
     assert_raw_api_error(&response, 413, "payload-too-large");
+    assert_eq!(
+        running
+            .service
+            .initialize_daemon()
+            .expect("read session count")
+            .session_count(),
+        0
+    );
+}
+
+#[tokio::test]
+async fn unauthenticated_attachment_sized_body_is_rejected_before_body_admission() {
+    let running = RunningServer::start(ApiScopes::CONTROL).await;
+    let body = format!(
+        r#"{{"schema_version":"satelle.api.v2","prompt":"{}"}}"#,
+        "x".repeat(1_048_576)
+    );
+    let head = format!(
+        "POST /v1/sessions HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        body.len()
+    );
+    let mut request = head.into_bytes();
+    request.extend_from_slice(body.as_bytes());
+
+    let response = raw_request(running.server.local_addr(), &request).await;
+
+    assert_raw_api_error(&response, 401, "authentication-failed");
     assert_eq!(
         running
             .service

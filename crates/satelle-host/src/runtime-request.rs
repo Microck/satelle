@@ -213,6 +213,8 @@ pub(crate) struct RunCommand<'a> {
     pub(super) execution_mode: TurnExecutionMode,
     pub(super) provider_intent: ProviderComputerUseIntent,
     pub(super) cancellation: AdmissionCancellation,
+    pub(super) turn_execution_timeout: Option<satelle_core::session::TimeoutPolicy>,
+    pub(super) attachments: Vec<crate::attachment::VerifiedImageAttachment>,
 }
 
 #[derive(Clone, Copy)]
@@ -239,6 +241,8 @@ impl<'a> RunCommand<'a> {
             execution_mode: TurnExecutionMode::Standard,
             provider_intent: ProviderComputerUseIntent::host_default(),
             cancellation: AdmissionCancellation::new(),
+            turn_execution_timeout: None,
+            attachments: Vec::new(),
         }
     }
 
@@ -259,6 +263,8 @@ impl<'a> RunCommand<'a> {
             execution_mode: TurnExecutionMode::Standard,
             provider_intent: ProviderComputerUseIntent::host_default(),
             cancellation: AdmissionCancellation::new(),
+            turn_execution_timeout: None,
+            attachments: Vec::new(),
         }
     }
 
@@ -279,6 +285,22 @@ impl<'a> RunCommand<'a> {
         self.cancellation = cancellation;
         self
     }
+
+    pub(crate) fn with_turn_execution_timeout(
+        mut self,
+        timeout: Option<satelle_core::session::TimeoutPolicy>,
+    ) -> Self {
+        self.turn_execution_timeout = timeout;
+        self
+    }
+
+    pub(crate) fn with_attachments(
+        mut self,
+        attachments: Vec<crate::attachment::VerifiedImageAttachment>,
+    ) -> Self {
+        self.attachments = attachments;
+        self
+    }
 }
 
 pub(crate) struct SteerCommand<'a> {
@@ -289,6 +311,8 @@ pub(crate) struct SteerCommand<'a> {
     pub(super) execution_mode: TurnExecutionMode,
     pub(super) provider_intent: ProviderComputerUseIntent,
     pub(super) cancellation: AdmissionCancellation,
+    pub(super) turn_execution_timeout: Option<satelle_core::session::TimeoutPolicy>,
+    pub(super) attachments: Vec<crate::attachment::VerifiedImageAttachment>,
 }
 
 impl<'a> SteerCommand<'a> {
@@ -309,6 +333,8 @@ impl<'a> SteerCommand<'a> {
             execution_mode: TurnExecutionMode::Standard,
             provider_intent: ProviderComputerUseIntent::host_default(),
             cancellation: AdmissionCancellation::new(),
+            turn_execution_timeout: None,
+            attachments: Vec::new(),
         }
     }
 
@@ -329,6 +355,8 @@ impl<'a> SteerCommand<'a> {
             execution_mode: TurnExecutionMode::Standard,
             provider_intent: ProviderComputerUseIntent::host_default(),
             cancellation: AdmissionCancellation::new(),
+            turn_execution_timeout: None,
+            attachments: Vec::new(),
         }
     }
 
@@ -347,6 +375,22 @@ impl<'a> SteerCommand<'a> {
 
     pub(crate) fn with_cancellation(mut self, cancellation: AdmissionCancellation) -> Self {
         self.cancellation = cancellation;
+        self
+    }
+
+    pub(crate) fn with_turn_execution_timeout(
+        mut self,
+        timeout: Option<satelle_core::session::TimeoutPolicy>,
+    ) -> Self {
+        self.turn_execution_timeout = timeout;
+        self
+    }
+
+    pub(crate) fn with_attachments(
+        mut self,
+        attachments: Vec<crate::attachment::VerifiedImageAttachment>,
+    ) -> Self {
+        self.attachments = attachments;
         self
     }
 }

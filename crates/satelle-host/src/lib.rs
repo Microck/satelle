@@ -1,5 +1,6 @@
 #[path = "api-auth.rs"]
 mod api_auth;
+mod attachment;
 mod codex_capabilities;
 #[path = "codex-install.rs"]
 mod codex_install;
@@ -28,6 +29,7 @@ use api_auth::EphemeralApiAuthenticator;
 pub use api_auth::{
     ApiBearerToken, ApiBearerTokenError, ApiPrincipal, ApiScopes, contains_api_bearer_token,
 };
+pub use attachment::AttachmentUpload;
 use codex_capabilities::{
     BlockerReason, CodexVersionEvidence, Phase0CapabilityBlocker, Phase0SupportVerdict,
     RequiredCapability, discover_phase0, evaluate_phase0_support,
@@ -652,6 +654,14 @@ impl ProductionCapabilitySnapshot {
             finished_at: utc_now(),
             duration_ms,
         }
+    }
+
+    pub(crate) const fn goal_set_supported(&self) -> bool {
+        self.control_plane_admission.goal_set()
+    }
+
+    pub(crate) const fn image_input_mode(&self) -> codex_capabilities::CodexImageInputMode {
+        self.control_plane_admission.image_input()
     }
 }
 

@@ -255,6 +255,7 @@ pub(super) struct ExecutionPlan {
     pub(super) execution_mode: TurnExecutionMode,
     pub(super) work: TurnWork,
     pub(super) provider_smoke_event: Option<satelle_core::SatelleEventBody>,
+    pub(super) attachments: crate::attachment::StagedAttachments,
 }
 
 #[derive(Default)]
@@ -375,6 +376,7 @@ impl RuntimeEngine {
             execution_policy,
             AdapterSubject::new(&plan.work.subject),
             &persist_upstream_ref,
+            plan.attachments.images(),
         ))?;
         let Some(transition) = result.transition() else {
             let session = self

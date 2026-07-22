@@ -842,6 +842,7 @@ pub struct ExecuteRequest<'a> {
     execution_policy: &'a ExecutionPolicy,
     subject: AdapterSubject<'a>,
     persist_upstream_ref: &'a dyn Fn(UpstreamReference) -> Result<(), SatelleError>,
+    attachments: &'a [crate::attachment::StagedImage],
 }
 
 impl<'a> ExecuteRequest<'a> {
@@ -852,6 +853,7 @@ impl<'a> ExecuteRequest<'a> {
         execution_policy: &'a ExecutionPolicy,
         subject: AdapterSubject<'a>,
         persist_upstream_ref: &'a dyn Fn(UpstreamReference) -> Result<(), SatelleError>,
+        attachments: &'a [crate::attachment::StagedImage],
     ) -> Self {
         Self {
             host,
@@ -860,6 +862,7 @@ impl<'a> ExecuteRequest<'a> {
             execution_policy,
             subject,
             persist_upstream_ref,
+            attachments,
         }
     }
 
@@ -869,6 +872,10 @@ impl<'a> ExecuteRequest<'a> {
 
     pub const fn prompt(&self) -> &'a str {
         self.prompt
+    }
+
+    pub(crate) const fn attachments(&self) -> &'a [crate::attachment::StagedImage] {
+        self.attachments
     }
 
     pub const fn execution_mode(&self) -> satelle_core::session::TurnExecutionMode {

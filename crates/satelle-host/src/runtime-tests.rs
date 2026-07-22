@@ -7,6 +7,8 @@ use super::{
 };
 use crate::storage::{LeaseOwner, PrivateUpstreamRef, ProbeRecoverySubject};
 use crate::test_runtime::FakeComputerUseAdapter;
+use crate::{AttachmentUpload, attachment::verify_uploads};
+use base64::Engine as _;
 use satelle_core::session::{
     ApprovalPolicy, DesktopBindingRef, DesktopTarget, EffectiveModelRef, ExecutionPolicy,
     ExperimentalFeatureChoices, FeatureChoice, ProviderBindingRef, PublicSession, PublicTurn,
@@ -17,6 +19,7 @@ use satelle_core::{
     IncompatibleControlPlaneDetails, LOCAL_DEMO_HOST, SatelleError,
 };
 use satelle_test_contract::assert_privacy_canaries_absent;
+use sha2::Digest as _;
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, mpsc};
@@ -38,6 +41,71 @@ fn latest_turn(session: &PublicSession) -> &PublicTurn {
 
 fn latest_turn_state(session: &PublicSession) -> TurnState {
     latest_turn(session).state()
+}
+
+fn verified_png() -> Vec<crate::attachment::VerifiedImageAttachment> {
+    let bytes = b"\x89PNG\r\n\x1a\nPRIVATE_RUNTIME_ATTACHMENT_CANARY";
+    let digest = sha2::Sha256::digest(bytes)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    verify_uploads(vec![AttachmentUpload::new(
+        "image/png",
+        bytes.len() as u64,
+        digest,
+        base64::engine::general_purpose::STANDARD.encode(bytes),
+    )])
+    .expect("verify the runtime image fixture")
+}
+
+fn staged_file_count(state_root: &std::path::Path) -> usize {
+    std::fs::read_dir(state_root.join("attachments"))
+        .expect("read attachment staging directory")
+        .count()
+}
+
+#[test]
+fn commit_gate_rejection_drops_staged_attachments() {
+    let state = crate::TestStateDir::new().expect("temporary state directory should exist");
+    let runtime = RuntimeHandle::new(Ok(state.path().to_path_buf()), FakeComputerUseAdapter);
+    let engine = runtime.engine().expect("runtime engine should open");
+    let readiness = FakeComputerUseAdapter
+        .preflight(LOCAL_DEMO_HOST, &ProviderComputerUseIntent::host_default())
+        .expect("fake adapter preflight");
+    let cancellation = super::AdmissionCancellation::new();
+    cancellation.request();
+
+    let error = engine
+        .run(
+            RunCommand::attached(LOCAL_DEMO_HOST, "PRIVATE_REJECTED_IMAGE")
+                .with_cancellation(cancellation)
+                .with_attachments(verified_png()),
+            readiness,
+        )
+        .expect_err("the commit gate should reject requested cancellation");
+
+    assert_eq!(error.code, ErrorCode::Interrupted);
+    assert_eq!(staged_file_count(state.path()), 0);
+    assert_eq!(runtime.snapshot().unwrap().session_count(), 0);
+}
+
+#[test]
+fn detached_completion_keeps_then_removes_staged_attachments() {
+    let state = crate::TestStateDir::new().expect("temporary state directory should exist");
+    let adapter = BlockingExecutionAndStopAdapter::default();
+    let runtime = RuntimeHandle::new(Ok(state.path().to_path_buf()), adapter.clone());
+
+    runtime
+        .run(
+            RunCommand::detached(LOCAL_DEMO_HOST, "PRIVATE_DETACHED_IMAGE")
+                .with_attachments(verified_png()),
+        )
+        .expect("detached image Turn should be admitted");
+    adapter.execute_started.wait();
+    assert_eq!(staged_file_count(state.path()), 1);
+    adapter.execute_release.signal();
+    runtime.wait_for_background().expect("worker should finish");
+    assert_eq!(staged_file_count(state.path()), 0);
 }
 
 #[test]
@@ -558,13 +626,14 @@ fn reads_and_stop_remain_available_during_slow_execution_and_stop_observation() 
     ]);
     let runtime = RuntimeHandle::new(Ok(state.path().to_path_buf()), adapter.clone());
     let session = runtime
-        .run(RunCommand::detached(
-            LOCAL_DEMO_HOST,
-            "PRIVATE_BLOCKING_EXECUTION",
-        ))
+        .run(
+            RunCommand::detached(LOCAL_DEMO_HOST, "PRIVATE_BLOCKING_EXECUTION")
+                .with_attachments(verified_png()),
+        )
         .expect("detached work should be admitted")
         .session;
     adapter.execute_started.wait();
+    assert_eq!(staged_file_count(state.path()), 1);
 
     let (read_sender, read_receiver) = mpsc::sync_channel(1);
     let read_runtime = runtime.clone();
@@ -631,6 +700,7 @@ fn reads_and_stop_remain_available_during_slow_execution_and_stop_observation() 
     runtime
         .wait_for_background()
         .expect("the losing execution worker should finish");
+    assert_eq!(staged_file_count(state.path()), 0);
     let final_status = runtime
         .status(session.session_id().clone())
         .expect("the terminal stop compare-and-swap should win");
@@ -804,15 +874,16 @@ fn detached_adapter_error_enters_recovery_without_a_restart() {
     let state = crate::TestStateDir::new().expect("temporary state directory should exist");
     let runtime = RuntimeHandle::new(Ok(state.path().to_path_buf()), FailFirstAdapter::default());
     let session = runtime
-        .run(RunCommand::detached(
-            LOCAL_DEMO_HOST,
-            "PRIVATE_UNKNOWN_EXECUTION",
-        ))
+        .run(
+            RunCommand::detached(LOCAL_DEMO_HOST, "PRIVATE_UNKNOWN_EXECUTION")
+                .with_attachments(verified_png()),
+        )
         .expect("detached work should be durably admitted")
         .session;
     runtime
         .wait_for_background()
         .expect("the failed detached worker should be reaped");
+    assert_eq!(staged_file_count(state.path()), 0);
 
     assert_eq!(
         runtime
@@ -833,6 +904,29 @@ fn detached_adapter_error_enters_recovery_without_a_restart() {
             .startup_state()
             .expect("confirmed stop should clear recovery"),
         RuntimeStartupState::Ready
+    );
+}
+
+#[test]
+fn detached_worker_panic_drops_staged_attachments() {
+    let state = crate::TestStateDir::new().expect("temporary state directory should exist");
+    let runtime = RuntimeHandle::new(Ok(state.path().to_path_buf()), PanickingExecutionAdapter);
+    let session = runtime
+        .run(
+            RunCommand::detached(LOCAL_DEMO_HOST, "PRIVATE_PANICKING_IMAGE")
+                .with_attachments(verified_png()),
+        )
+        .expect("panicking detached work should first be admitted")
+        .session;
+
+    runtime
+        .wait_for_background()
+        .expect("the panicking worker should be contained and reaped");
+
+    assert_eq!(staged_file_count(state.path()), 0);
+    assert_eq!(
+        latest_turn_state(&runtime.status(session.session_id().clone()).unwrap()),
+        TurnState::RecoveryPending
     );
 }
 
@@ -1027,6 +1121,37 @@ struct FailFirstAdapter {
     reject_replayed_stop: bool,
     follow_up_started: Latch,
     follow_up_release: Latch,
+}
+
+#[derive(Clone, Copy)]
+struct PanickingExecutionAdapter;
+
+impl ComputerUseAdapter for PanickingExecutionAdapter {
+    fn preflight(
+        &self,
+        host: &str,
+        provider_intent: &ProviderComputerUseIntent,
+    ) -> Result<AdapterReadiness, SatelleError> {
+        FakeComputerUseAdapter.preflight(host, provider_intent)
+    }
+
+    fn execute(&self, _request: ExecuteRequest<'_>) -> Result<ExecuteResult, SatelleError> {
+        panic!("PRIVATE_ADAPTER_PANIC_CANARY")
+    }
+
+    fn observe_stop(
+        &self,
+        subject: super::AdapterSubject<'_>,
+    ) -> Result<StopObservation, SatelleError> {
+        FakeComputerUseAdapter.observe_stop(subject)
+    }
+
+    fn observe_recovery(
+        &self,
+        subject: super::AdapterSubject<'_>,
+    ) -> Result<RecoveryObservation, SatelleError> {
+        FakeComputerUseAdapter.observe_recovery(subject)
+    }
 }
 
 impl FailFirstAdapter {

@@ -44,7 +44,11 @@ where
                 },
             ));
         }
-        let limit = state.limits.json_body_bytes();
+        let limit = state
+            .limits
+            .json_body_bytes()
+            .checked_add(T::MAX_BASE64_BODY_ALLOWANCE)
+            .ok_or_else(internal_context_error)?;
         // Always let the bounded reader consume through the limit. Rejecting
         // from Content-Length alone can reset an in-flight Windows upload
         // before the client receives Satelle's typed 413 response.
@@ -107,6 +111,17 @@ where
                 state,
                 &authorized,
                 "the request exceeds the advertised attachment limit",
+            ));
+        }
+        let non_attachment_bytes = body
+            .bytes
+            .len()
+            .saturating_sub(T::attachment_data_base64_bytes(&value));
+        if non_attachment_bytes > state.limits.json_body_bytes() {
+            return Err(payload_too_large(
+                state,
+                &authorized,
+                "the request body exceeds the advertised JSON body limit",
             ));
         }
         let decoded = serde_json::from_value(value).map_err(|_| {

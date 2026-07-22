@@ -2321,6 +2321,7 @@ name = "satelle-cli"
 version = "0.1.0"
 dependencies = [
  "assert_cmd",
+ "base64",
  "clap",
  "clap_complete",
  "cliclack",
@@ -2416,6 +2417,7 @@ name = "satelle-transport"
 version = "0.1.0"
 dependencies = [
  "axum",
+ "base64",
  "futures-util",
  "http-body-util",
  "percent-encoding",
@@ -2428,6 +2430,7 @@ dependencies = [
  "satelle-test-contract",
  "serde",
  "serde_json",
+ "sha2",
  "thiserror",
  "time",
  "tokio",

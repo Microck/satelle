@@ -1278,7 +1278,7 @@ fn run_and_steer_accept_prompt_file_and_stdin_sources() {
         ])
         .assert()
         .failure()
-        .stderr(predicate::str::contains("invalid-usage"));
+        .stderr(predicate::str::contains("prompt-source-conflict"));
 }
 
 #[test]
@@ -1624,6 +1624,10 @@ fn run_help_has_events_modes_without_a_watch_option() {
         assert!(stdout.contains("--events <EVENTS>"));
         assert!(stdout.contains("--quiet"));
         assert!(stdout.contains("--verbose"));
+        assert!(stdout.contains("--timeout <DURATION>"));
+        assert!(stdout.contains("shell history"));
+        assert!(stdout.contains("local process metadata"));
+        assert!(stdout.contains("stdin or --prompt-file"));
         assert!(stdout.contains("auto"));
         assert!(stdout.contains("human"));
         assert!(stdout.contains("json"));
@@ -1639,6 +1643,48 @@ fn run_help_has_events_modes_without_a_watch_option() {
     let stdout = String::from_utf8_lossy(&output.stdout);
 
     assert!(!stdout.contains("--watch"));
+}
+
+#[test]
+fn run_timeout_is_bounded_and_reported_in_milliseconds() {
+    let state = state_dir();
+    let output = satelle()
+        .env("SATELLE_STATE_DIR", state.path())
+        .args([
+            "run",
+            "--host",
+            "local-demo",
+            "--timeout",
+            "10s",
+            "--json",
+            "Use a short timeout",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .clone();
+    let report = parse_json_output(&output.stdout);
+    assert_eq!(
+        report["effective_timeouts"]["turn_execution_timeout_ms"],
+        10_000
+    );
+
+    for invalid in ["30", "500ms", "25h"] {
+        satelle()
+            .env("SATELLE_STATE_DIR", state.path())
+            .args([
+                "run",
+                "--host",
+                "local-demo",
+                "--timeout",
+                invalid,
+                "--json",
+                "Reject the invalid timeout",
+            ])
+            .assert()
+            .failure()
+            .stderr(predicate::str::contains("invalid-usage"));
+    }
 }
 
 #[test]

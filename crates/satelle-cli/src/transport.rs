@@ -217,6 +217,9 @@ pub(crate) struct AttachedTurnOutcome {
 /// The command surface is intentionally exhaustive. A new transport operation
 /// must be implemented or explicitly rejected by every backend.
 pub(crate) trait TransportClient {
+    fn supported_image_media_types(&self) -> Result<Vec<String>, SatelleError> {
+        Ok(Vec::new())
+    }
     fn setup(
         &self,
         dry_run: bool,
@@ -509,6 +512,18 @@ fn interrupted_admission_race_error(alias: &str) -> SatelleError {
 }
 
 impl TransportClient for LocalTransport {
+    fn supported_image_media_types(&self) -> Result<Vec<String>, SatelleError> {
+        let capabilities = self.service.daemon_runtime_capabilities()?;
+        Ok(if capabilities.image_attachments() {
+            satelle_transport::SUPPORTED_IMAGE_MEDIA_TYPES
+                .iter()
+                .map(|value| (*value).to_string())
+                .collect()
+        } else {
+            Vec::new()
+        })
+    }
+
     fn setup(
         &self,
         dry_run: bool,
@@ -681,6 +696,18 @@ fn map_ssh_daemon_bootstrap_error(
 }
 
 fn local_turn_intent(request: &TurnRequest) -> Result<satelle_host::TurnIntent, SatelleError> {
+    let attachments = request
+        .attachments()
+        .iter()
+        .map(|attachment| {
+            satelle_host::AttachmentUpload::new(
+                attachment.media_type(),
+                attachment.size_bytes(),
+                attachment.sha256(),
+                attachment.data_base64(),
+            )
+        })
+        .collect();
     satelle_host::TurnIntent::new(request.prompt(), request.execution_mode())
         .and_then(|intent| {
             intent.with_provider_intent(
@@ -690,6 +717,10 @@ fn local_turn_intent(request: &TurnRequest) -> Result<satelle_host::TurnIntent, 
                 request.refresh_provider_smoke_test(),
             )
         })
+        .and_then(|intent| {
+            intent.with_turn_execution_timeout_ms(request.turn_execution_timeout_ms())
+        })
+        .and_then(|intent| intent.with_attachments(attachments))
         .map_err(|error| SatelleError::invalid_usage(error.to_string()))
 }
 
@@ -3128,6 +3159,15 @@ impl TransportClient for SshSetupTransport {
 }
 
 impl TransportClient for DirectTransport {
+    fn supported_image_media_types(&self) -> Result<Vec<String>, SatelleError> {
+        Ok(self
+            .client
+            .capabilities()
+            .map_err(|error| direct_transport_error(&self.alias, error))?
+            .supported_attachment_media_types()
+            .to_vec())
+    }
+
     fn setup(
         &self,
         _dry_run: bool,

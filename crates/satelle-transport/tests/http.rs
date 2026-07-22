@@ -1215,9 +1215,19 @@ async fn capabilities_are_truthful_and_unknown_routes_are_typed() {
     assert_eq!(capabilities.limits().json_body_bytes(), 1_048_576);
     assert_eq!(capabilities.limits().http_connections(), 128);
     assert_eq!(capabilities.limits().operation_concurrency(), 1);
-    assert_eq!(capabilities.limits().attachment_count(), 0);
-    assert_eq!(capabilities.limits().attachment_bytes_each(), 0);
-    assert_eq!(capabilities.limits().attachment_bytes_total(), 0);
+    assert_eq!(capabilities.limits().attachment_count(), 4);
+    assert_eq!(
+        capabilities.limits().attachment_bytes_each(),
+        5 * 1024 * 1024
+    );
+    assert_eq!(
+        capabilities.limits().attachment_bytes_total(),
+        10 * 1024 * 1024
+    );
+    assert_eq!(
+        capabilities.supported_attachment_media_types(),
+        ["image/gif", "image/jpeg", "image/png", "image/webp"]
+    );
     assert_eq!(capabilities.limits().failed_auth_attempts_per_minute(), 10);
     assert_eq!(
         capabilities.limits().authenticated_requests_per_minute(),

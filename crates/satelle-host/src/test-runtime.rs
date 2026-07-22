@@ -148,7 +148,7 @@ impl ComputerUseAdapter for FakeComputerUseAdapter {
             DesktopTarget::new(desktop_binding.clone()),
             ApprovalPolicy::OnRequest,
             SandboxPolicy::WorkspaceWrite,
-            TimeoutPolicy::bounded_seconds(120)
+            TimeoutPolicy::bounded_seconds(30 * 60)
                 .map_err(|_| adapter_configuration_error("timeout policy"))?,
             ExperimentalFeatureChoices::new(FeatureChoice::Enabled, FeatureChoice::Enabled),
         );
