@@ -304,6 +304,42 @@ mod bootstrap_maintenance_tests {
         assert_eq!(SetupOperationKind::Repair, run.operation_kind());
         assert_eq!(SetupRunStatus::Running, run.status());
     }
+
+    #[test]
+    fn poisoned_bootstrap_maintenance_mutex_recovers_acquire_and_complete() {
+        let state = TestStateDir::new().expect("create state directory");
+        let service =
+            HostService::local_demo_for_tests_at(state.path()).expect("create Host service");
+        let poisoned = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _slot = service
+                .bootstrap_maintenance
+                .lock()
+                .expect("bootstrap maintenance mutex starts healthy");
+            panic!("poison bootstrap maintenance mutex");
+        }));
+        assert!(poisoned.is_err(), "test must poison the real shared mutex");
+
+        let operation_id = "bootstrap-operation-poison-recovery";
+        service
+            .acquire_bootstrap_maintenance(operation_id, SetupOperationKind::Repair)
+            .expect("poisoned mutex must not prevent acquisition");
+        service
+            .acquire_bootstrap_maintenance(operation_id, SetupOperationKind::Repair)
+            .expect("same-operation retry remains idempotent after poison");
+        service
+            .complete_bootstrap_maintenance(operation_id)
+            .expect("poisoned mutex must not prevent completion");
+        service
+            .complete_bootstrap_maintenance(operation_id)
+            .expect("completed retry remains idempotent after poison");
+
+        let run = service
+            .load_setup_run(operation_id)
+            .expect("load completed setup run")
+            .expect("completed setup run exists");
+        assert_eq!(SetupRunStatus::Completed, run.status());
+        assert_eq!(SetupActionStatus::Completed, run.actions()[0].status());
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -410,7 +446,7 @@ impl HostService {
         let mut slot = self
             .bootstrap_maintenance
             .lock()
-            .map_err(|_| SatelleError::state_conflict())?;
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         if let Some(operation) = slot.as_ref() {
             if operation.operation_id() != operation_id {
                 return Err(SatelleError::state_conflict());
@@ -466,7 +502,7 @@ impl HostService {
         let mut slot = self
             .bootstrap_maintenance
             .lock()
-            .map_err(|_| SatelleError::state_conflict())?;
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let Some(operation) = slot.as_mut() else {
             let completed = self
                 .runtime
