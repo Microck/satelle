@@ -1,0 +1,110 @@
+---
+title: Install Satelle
+description: Choose a Satelle installation method and keep its owner responsible for updates.
+---
+
+Satelle 0.1.0 is pre-release software. Build it from source today. The package
+names and commands below define the installation contract for publication;
+they are not evidence that a public package, installer, tap, bucket, or release
+archive exists.
+
+## Build the current source tree
+
+Install Rust 1.97.0, then build the single native executable from the repository
+root:
+
+```sh
+cargo build --release --locked -p satelle-cli
+```
+
+The result is `target/release/satelle` on Unix-like systems and
+`target/release/satelle.exe` on Windows. Each target gets one executable.
+Controller commands are present on every supported Controller target, and
+native Computer Use Host targets use the same executable for Host Daemon mode.
+
+## Use an npm-registry package after publication
+
+The npm registry will be a first-class installation path and the recommended
+local CLI installation path. npm, pnpm, and Bun all use the same canonical
+package identity. They do not use package-manager-specific Satelle package
+names.
+
+Use npm:
+
+```sh
+npm install --global @microck/satelle --include=optional
+```
+
+Use pnpm:
+
+```sh
+pnpm add --global @microck/satelle
+```
+
+Use Bun:
+
+```sh
+bun add --global @microck/satelle
+```
+
+Each command exposes `satelle`. The unscoped `satelle` convenience package may
+replace `@microck/satelle` in any of these commands after publication. It
+forwards to the canonical scoped launcher instead of owning separate native
+selection logic.
+
+### Reserved npm identities
+
+None of these eight npm package identities is available from the public npm registry yet.
+
+| Role | Package identity |
+| --- | --- |
+| Canonical launcher | `@microck/satelle` |
+| Unscoped convenience package | `satelle` |
+| Linux ARM64 native binary | `@microck/satelle-linux-arm64-gnu` |
+| Linux x64 native binary | `@microck/satelle-linux-x64-gnu` |
+| macOS ARM64 native binary | `@microck/satelle-darwin-arm64` |
+| macOS x64 native binary | `@microck/satelle-darwin-x64` |
+| Windows ARM64 native binary | `@microck/satelle-win32-arm64-msvc` |
+| Windows x64 native binary | `@microck/satelle-win32-x64-msvc` |
+
+The launcher selects its version-matched native optional dependency. Ordinary
+execution uses that installed local binary and does not fetch a replacement.
+
+## Use a non-npm method
+
+Satelle MVP defines these first-party non-npm installation methods:
+
+1. Unix shell installer using `curl` or `wget`.
+2. Windows PowerShell installer using `Invoke-RestMethod`.
+3. First-party Homebrew tap.
+4. First-party Scoop bucket.
+5. Direct GitHub release archive download.
+
+None is published yet. Satelle does not invent placeholder URLs or coordinates
+for unpublished installers, the Homebrew tap, or the Scoop bucket. After
+publication, direct archives and both installers must follow the [release
+archive verification contract](/docs/reference/release-verification).
+
+The first-party Homebrew tap remains the canonical Homebrew path until Satelle
+is accepted into Homebrew core and core updates prove reliable. The first-party
+Scoop bucket remains the canonical Scoop path until a Scoop Main manifest is
+accepted and its updates prove they do not lag normal Satelle releases.
+
+Satelle MVP does not make `.deb`, `.rpm`, AUR, WinGet, Chocolatey, Nixpkgs,
+MacPorts, Homebrew core, or Scoop Main publication a release blocker.
+
+## Use the installation owner's lifecycle
+
+npm, Homebrew, and Scoop own the upgrade and uninstall flow for installations
+they create. Use the same package manager to update or remove Satelle; do not
+use Satelle self-update for a package-manager-owned executable.
+
+## Understand cache and offline behavior
+
+Satelle does not maintain a package cache for npm-registry packages. npm, pnpm,
+and Bun own cache behavior for persistent installation and one-shot execution.
+Cold offline npm-registry installation and one-shot execution are not guaranteed.
+
+An already installed JavaScript launcher resolves only its local,
+version-matched native package during ordinary execution. This local resolution
+does not turn the package manager's cache into Satelle-owned state.

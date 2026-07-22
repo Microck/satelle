@@ -9,6 +9,10 @@ execution, Session state, logs, desktop access, and provider credentials.
 > 0.1.0. The npm package names reserved by this repository are not published
 > installation paths yet.
 
+The [installation guide](docs/how-to/install-satelle.mdx) lists the reserved
+package identities, the post-publication commands, and the currently available
+source-build path without presenting unpublished packages as usable.
+
 ## Run the shortest successful flow
 
 Install Rust 1.97.0 and Codex 0.144.0 on a candidate macOS or Windows Host,
@@ -118,7 +122,7 @@ The public documentation follows the Diataxis structure:
 
 - [Tutorial](docs/tutorial/first-session.mdx): complete a first durable Session.
 - [How-to guides](docs/how-to/): set up Hosts, connect remotely, operate
-  Sessions, and diagnose failures.
+  Sessions, review installation methods, and diagnose failures.
 - [Reference](docs/reference/): inspect command, configuration, and provider
   authentication machinery.
 - [Explanation](docs/explanation/): understand security boundaries, Trusted

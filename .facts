@@ -169,11 +169,11 @@
 - satelle notify --dry-run emits the redacted versioned webhook payloads without making network requests @spec @later
 
 ## distribution
-- satelle is distributed as one satelle executable per target, and builds for native Computer Use Host targets contain both Controller commands and Host Daemon mode @spec @mvp
-- satelle publishes npm-registry packages as a first-class installation path for npm, pnpm, and bun users @spec @mvp
-- satelle publishes the npm-registry package with scope microck and package name satelle as the canonical package identity for the JavaScript launcher and platform-specific native optionalDependencies @spec @mvp
-- satelle publishes satelle as an unscoped npm-registry convenience package for shorter install commands @spec @mvp
-- while Satelle's npm distribution is in the pre-publication state, public documentation treats the canonical scoped launcher package, unscoped satelle package, and all six scoped native packages as unavailable from the public npm registry @spec @mvp @release-gate @verification
+- satelle is distributed as one satelle executable per target, and builds for native Computer Use Host targets contain both Controller commands and Host Daemon mode @spec @mvp @implemented
+- satelle publishes npm-registry packages as a first-class installation path for npm, pnpm, and bun users @spec @mvp @implemented
+- satelle publishes the npm-registry package with scope microck and package name satelle as the canonical package identity for the JavaScript launcher and platform-specific native optionalDependencies @spec @mvp @implemented
+- satelle publishes satelle as an unscoped npm-registry convenience package for shorter install commands @spec @mvp @implemented
+- while Satelle's npm distribution is in the pre-publication state, public documentation treats the canonical scoped launcher package, unscoped satelle package, and all six scoped native packages as unavailable from the public npm registry @spec @mvp @release-gate @verification @implemented
 - label: repository manifests and local tarball tests validate intended post-publication npm behavior without establishing public registry availability
   command: SATELLE_REQUIRED_PACKAGE_MANAGERS=npm,pnpm,bun npm run check:npm
   tags: [spec, mvp, release-gate, verification, implemented, ci]
@@ -181,18 +181,18 @@
 - satelle release validation fails when scoped and unscoped npm-registry package versions, executable behavior, README install guidance, or provenance metadata diverge @spec @mvp @implemented
 - satelle npm-registry distribution exposes a satelle executable command that launches the Rust native binary instead of reimplementing the CLI in JavaScript @spec @mvp @implemented
 - satelle npm-registry distribution uses a thin JavaScript launcher or installer layer only for package-manager integration @spec @mvp @implemented
-- satelle npm, pnpm, and bun installation docs use the same scoped and unscoped npm-registry package identities across package managers instead of separate package identities per package manager @spec @mvp
-- after publication, npm installs the canonical scoped launcher package with `npm install --global <package> --include=optional` and exposes the `satelle` executable @spec @contract @mvp
-- after publication, pnpm installs the canonical scoped launcher package with `pnpm add --global <package>` and exposes the `satelle` executable @spec @contract @mvp
-- after publication, bun installs the canonical scoped launcher package with `bun add --global <package>` and exposes the `satelle` executable @spec @contract @mvp
+- satelle npm, pnpm, and bun installation docs use the same scoped and unscoped npm-registry package identities across package managers instead of separate package identities per package manager @spec @mvp @implemented
+- after publication, npm installs the canonical scoped launcher package with `npm install --global <package> --include=optional` and exposes the `satelle` executable @spec @contract @mvp @implemented
+- after publication, pnpm installs the canonical scoped launcher package with `pnpm add --global <package>` and exposes the `satelle` executable @spec @contract @mvp @implemented
+- after publication, bun installs the canonical scoped launcher package with `bun add --global <package>` and exposes the `satelle` executable @spec @contract @mvp @implemented
 - after publication, canonical npm one-shot execution uses `npm exec --package=<package> -- satelle <args>` @spec @contract @mvp @implemented
 - after publication, canonical npx one-shot execution uses `npx --package=<package> -- satelle <args>` @spec @contract @mvp @implemented
 - after publication, canonical pnpm one-shot execution uses `pnpm --package=<package> dlx satelle <args>` @spec @contract @mvp @implemented
 - after publication, with Bun 1.3.14 or newer, canonical bun one-shot execution uses `bunx --package <package> satelle <args>` @spec @contract @mvp @implemented
 - npm, npx, pnpm, and bun one-shot execution with Bun 1.3.14 or newer enters the same Satelle JavaScript launcher used by persistent npm-registry installations @spec @contract @mvp @implemented
 - the Satelle JavaScript launcher forwards every argument after `satelle` unchanged to the selected Rust executable @spec @contract @mvp @implemented
-- satelle installation documentation lists npm, pnpm, and bun npm-registry installs before non-npm methods because npm-registry distribution is the recommended local CLI install path @spec @mvp
-- satelle MVP first-party non-npm local install methods are a Unix shell installer, a Windows PowerShell installer, a Homebrew tap, a Scoop bucket, and direct GitHub release archive downloads @spec @mvp
+- satelle installation documentation lists npm, pnpm, and bun npm-registry installs before non-npm methods because npm-registry distribution is the recommended local CLI install path @spec @mvp @implemented
+- satelle MVP first-party non-npm local install methods are a Unix shell installer, a Windows PowerShell installer, a Homebrew tap, a Scoop bucket, and direct GitHub release archive downloads @spec @mvp @implemented
 - satelle Unix shell installer supports curl and wget entrypoints that pipe a canonical HTTPS installer script into sh @spec @mvp @implemented
 - label: the Unix shell installer requires gh and jq in addition to curl or wget, fails before downloading when either verified prerequisite is unavailable, and uses jq to validate every required satelle.paths.v1 source member against the closed PathSource vocabulary
   id: 9ih
@@ -208,9 +208,9 @@
 - satelle direct GitHub release archive installation guidance requires the same canonical release archive attestation and SHA256SUMS verification as the install scripts @spec @contract @mvp @implemented
 - satelle install scripts install to a user-writable bin directory by default and do not require root, administrator, or system-wide installation for ordinary use @spec @mvp @implemented
 - satelle install scripts do not modify shell profiles, PATH, or PowerShell profiles unless the user explicitly opts in with a flag or interactive consent @spec @mvp @implemented
-- satelle Homebrew distribution uses a first-party tap in MVP instead of making Homebrew core acceptance a release blocker @spec @mvp
-- satelle Scoop distribution uses a first-party Scoop bucket in MVP instead of making Scoop Main acceptance a release blocker @spec @mvp
-- satelle package-manager installs through npm, Homebrew, or Scoop rely on the package manager's own upgrade and uninstall flow instead of Satelle self-updating those installations @spec @mvp
+- satelle Homebrew distribution uses a first-party tap in MVP instead of making Homebrew core acceptance a release blocker @spec @mvp @implemented
+- satelle Scoop distribution uses a first-party Scoop bucket in MVP instead of making Scoop Main acceptance a release blocker @spec @mvp @implemented
+- satelle package-manager installs through npm, Homebrew, or Scoop rely on the package manager's own upgrade and uninstall flow instead of Satelle self-updating those installations @spec @mvp @implemented
 - satelle install scripts and direct archive install guidance create or document a local installation receipt that records install_method, binary_path, version, target, artifact_digest, and installed_at metadata @spec @mvp @implemented
 - satelle exposes satelle self update for binaries installed by the Satelle install scripts or direct GitHub release archive flow when the installation receipt identifies Satelle as the binary owner @spec @mvp
 - satelle self update is disabled for npm, pnpm, bun, Homebrew, Scoop, and other package-manager-owned installations @spec @mvp
@@ -261,19 +261,19 @@
 - satelle self update configured-remote update flow JSON summary includes status, changed, local_update, remote_hosts, aggregate_counts, failed_hosts, and recovery_commands fields @spec @mvp
 - satelle post-MVP official package repository submissions are prioritized by user demand, repository acceptance fit, maintainer ownership, release automation compatibility, update latency, uninstall semantics, and support burden rather than pursued as a bulk checklist @spec @later
 - satelle post-MVP first official package repository candidates are WinGet and Scoop Main because their manifest models can reference versioned Windows release artifacts and checksums that Satelle already publishes @spec @later
-- satelle keeps the first-party Scoop bucket as the canonical Scoop installation path until a Scoop Main manifest is accepted and release automation proves Scoop Main updates do not lag normal Satelle releases @spec @mvp
+- satelle keeps the first-party Scoop bucket as the canonical Scoop installation path until a Scoop Main manifest is accepted and release automation proves Scoop Main updates do not lag normal Satelle releases @spec @mvp @implemented
 - satelle post-MVP Homebrew core submission is attempted only when Satelle can provide a source-build formula that passes Homebrew-supported macOS CI, disables Satelle self-update for Homebrew installs, and satisfies Homebrew stability and notability expectations @spec @later
-- satelle keeps the first-party Homebrew tap as the canonical Homebrew installation path until Homebrew core accepts Satelle and core updates prove reliable across releases @spec @mvp
+- satelle keeps the first-party Homebrew tap as the canonical Homebrew installation path until Homebrew core accepts Satelle and core updates prove reliable across releases @spec @mvp @implemented
 - satelle post-MVP Chocolatey submission is considered after WinGet and Scoop Main only when Chocolatey moderation, validator requirements, checksum rules, install scripts, uninstall behavior, and maintainer response expectations are documented @spec @later
 - satelle post-MVP AUR, Debian package repository, RPM package repository, Nixpkgs, and MacPorts submissions are considered only after clear user demand or committed ecosystem maintainer ownership justifies their source-build policy, review, maintenance, and release-lag obligations @spec @later
-- satelle MVP does not publish .deb, .rpm, AUR, WinGet, Chocolatey, Nixpkgs, MacPorts, Homebrew core, or Scoop Main packages as release blockers @spec @mvp
+- satelle MVP does not publish .deb, .rpm, AUR, WinGet, Chocolatey, Nixpkgs, MacPorts, Homebrew core, or Scoop Main packages as release blockers @spec @mvp @implemented
 - satelle npm-registry distribution uses version-matched platform-specific native binary packages for supported local CLI platforms instead of bundling every OS and architecture binary into the top-level package @spec @mvp @implemented
 - satelle top-level npm-registry package declares version-matched platform-specific native binary packages as optionalDependencies instead of downloading the local native binary during ordinary package installation @spec @mvp @implemented
 - satelle scoped launcher, unscoped forwarder, and native platform npm-registry packages define no consumer preinstall, install, or postinstall lifecycle scripts @spec @mvp @implemented
 - satelle native-package prepack validation is a package-assembly guard invoked by npm packing, including local pack tests, and is not a consumer installation hook @spec @mvp @implemented
-- satelle does not maintain a package cache for npm-registry packages @spec @contract @mvp
-- npm, pnpm, and bun own cache behavior for Satelle package installation and one-shot runner execution @spec @contract @mvp
-- satelle does not guarantee cold offline npm-registry installation or one-shot runner execution @spec @contract @mvp
+- satelle does not maintain a package cache for npm-registry packages @spec @contract @mvp @implemented
+- npm, pnpm, and bun own cache behavior for Satelle package installation and one-shot runner execution @spec @contract @mvp @implemented
+- satelle does not guarantee cold offline npm-registry installation or one-shot runner execution @spec @contract @mvp @implemented
 - an installed Satelle JavaScript launcher resolves its native executable only from the local version-matched optional dependency and does not contact the public npm registry during ordinary execution @spec @contract @mvp @implemented
 - satelle platform-specific native npm packages declare npm ecosystem platform constraints such as os, cpu, and libc where supported by the target package manager @spec @mvp @implemented
 - satelle MVP supports Linux, macOS, and Windows as Controller Platforms independently from the narrower Computer Use Host Platform matrix @spec @mvp
