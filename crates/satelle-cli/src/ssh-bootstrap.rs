@@ -36,6 +36,7 @@ const BOOTSTRAP_LOCK_EXIT_GRACE: Duration = Duration::from_millis(500);
 const BOOTSTRAP_LOCK_EXIT_POLL: Duration = Duration::from_millis(10);
 const RELEASE_BASE_URL: &str = "https://github.com/Microck/satelle/releases/download";
 const CACHE_CLEANUP_PROTOCOL: &str = "satelle-cache-cleanup-v1";
+const STAGED_DIGEST_MISMATCH_EXIT_CODE: i32 = 65;
 const POSIX_CACHE_DIRECTORY_GUARD: &str = r#"safe_cache_directory() {
   expected_root=$1
   expected_directory=$2
@@ -60,6 +61,20 @@ const POSIX_CACHE_DIRECTORY_GUARD: &str = r#"safe_cache_directory() {
   done
   return 0
 }"#;
+const POSIX_STAGED_FAILURE_CLEANUP: &str = r#"cleanup_staged_on_failure() {
+  original_status=$?
+  trap - EXIT
+  [ "$original_status" -ne 0 ] || return 0
+  safe_cache_directory "$root" "$staged_directory" || exit 75
+  if [ ! -e "$staged" ] && [ ! -L "$staged" ]; then exit "$original_status"; fi
+  [ -f "$staged" ] && [ ! -L "$staged" ] || exit 75
+  uid=$(id -u) || exit 75
+  owner=$(stat -c %u "$staged" 2>/dev/null || stat -f %u "$staged") || exit 75
+  [ "$owner" = "$uid" ] || exit 75
+  rm -f -- "$staged" || exit 75
+  exit "$original_status"
+}
+trap cleanup_staged_on_failure EXIT"#;
 const DAEMON_PATH_ENVIRONMENT_VARIABLES: [&str; 5] = [
     "SATELLE_HOME",
     "SATELLE_CONFIG_FILE",
@@ -920,19 +935,32 @@ if [ "$phase" != daemon_start ]; then mkdir "$claim_path/execution_succeeded.$at
 
     fn upload_command(self, staged: &str, digest: &str) -> String {
         if self.is_windows() {
-            let staged = powershell_quote(staged);
+            let cleanup = self.windows_staged_failure_cleanup(staged);
             return powershell_encoded_command(&format!(
                 r#"$ErrorActionPreference = 'Stop'
+{cleanup}
+$digestMismatch = $false
+try {{
 $inputStream = [Console]::OpenStandardInput()
-$outputStream = [IO.File]::Open({staged}, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)
+$outputStream = [IO.File]::Open($path, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)
 try {{ $inputStream.CopyTo($outputStream) }} finally {{ $outputStream.Dispose() }}
-if ((Get-FileHash -Algorithm SHA256 -LiteralPath {staged}).Hash.ToLowerInvariant() -cne {digest}) {{ exit 1 }}"#,
-                staged = staged,
+if ((Get-FileHash -Algorithm SHA256 -LiteralPath $path).Hash.ToLowerInvariant() -cne {digest}) {{
+  $digestMismatch = $true
+  throw 'staged artifact digest mismatch'
+}}
+}} catch {{
+  $originalFailure = $_
+  try {{ Remove-ExactStagedOnFailure }} catch {{ exit 75 }}
+  if ($digestMismatch) {{ exit {digest_mismatch_exit_code} }}
+  throw $originalFailure
+}}"#,
+                cleanup = cleanup,
                 digest = powershell_quote(digest),
+                digest_mismatch_exit_code = STAGED_DIGEST_MISMATCH_EXIT_CODE,
             ));
         }
         let script = format!(
-            "set -eu\numask 077\n{POSIX_CACHE_DIRECTORY_GUARD}\nroot={}\npath={}\nexpected={}\ndirectory=${{path%/*}}\nsafe_cache_directory \"$root\" \"$directory\"\n[ ! -e \"$path\" ] && [ ! -L \"$path\" ] || exit 1\nset -C\ncat >\"$path\"\nif command -v sha256sum >/dev/null 2>&1; then actual=$(sha256sum \"$path\" | awk '{{print $1}}'); elif command -v shasum >/dev/null 2>&1; then actual=$(shasum -a 256 \"$path\" | awk '{{print $1}}'); else actual=$(openssl dgst -sha256 \"$path\" | awk '{{print $NF}}'); fi\n[ \"$actual\" = \"$expected\" ]",
+            "set -eu\numask 077\n{POSIX_CACHE_DIRECTORY_GUARD}\nroot={}\nstaged={}\nexpected={}\nstaged_directory=${{staged%/*}}\n{POSIX_STAGED_FAILURE_CLEANUP}\nsafe_cache_directory \"$root\" \"$staged_directory\"\n[ ! -e \"$staged\" ] && [ ! -L \"$staged\" ] || exit 1\nset -C\ncat >\"$staged\"\nif command -v sha256sum >/dev/null 2>&1; then actual=$(sha256sum \"$staged\" | awk '{{print $1}}'); elif command -v shasum >/dev/null 2>&1; then actual=$(shasum -a 256 \"$staged\" | awk '{{print $1}}'); else actual=$(openssl dgst -sha256 \"$staged\" | awk '{{print $NF}}'); fi\n[ \"$actual\" = \"$expected\" ] || exit {STAGED_DIGEST_MISMATCH_EXIT_CODE}",
             posix_quote(self.remote_cache_root()),
             posix_quote(staged),
             posix_quote(digest),
@@ -981,24 +1009,28 @@ if ((Get-FileHash -Algorithm SHA256 -LiteralPath {staged}).Hash.ToLowerInvariant
 
     fn promote_command(self, staged: &str, final_path: &str) -> String {
         if self.is_windows() {
+            let cleanup = self.windows_staged_failure_cleanup(staged);
             let script = format!(
                 concat!(
-                    "$ErrorActionPreference='Stop'; Move-Item -Force -LiteralPath {} -Destination {}; ",
+                    "$ErrorActionPreference='Stop'; {cleanup}",
+                    "try {{ Move-Item -Force -LiteralPath $path -Destination {}; ",
                     "$acl=Get-Acl -LiteralPath {}; $acl.SetAccessRuleProtection($true,$false); ",
                     "foreach ($rule in @($acl.Access)) {{ [void]$acl.RemoveAccessRuleAll($rule) }}; ",
                     "$rule=New-Object System.Security.AccessControl.FileSystemAccessRule(",
                     "[System.Security.Principal.WindowsIdentity]::GetCurrent().Name,'FullControl','Allow'); ",
-                    "$acl.SetAccessRule($rule); Set-Acl -LiteralPath {} -AclObject $acl",
+                    "$acl.SetAccessRule($rule); Set-Acl -LiteralPath {} -AclObject $acl }} catch {{ ",
+                    "$originalFailure=$_; try {{ Remove-ExactStagedOnFailure }} catch {{ exit 75 }}; ",
+                    "throw $originalFailure }}",
                 ),
-                powershell_quote(staged),
                 powershell_quote(final_path),
                 powershell_quote(final_path),
                 powershell_quote(final_path),
+                cleanup = cleanup,
             );
             powershell_encoded_command(&script)
         } else {
             let script = format!(
-                "set -eu\n{POSIX_CACHE_DIRECTORY_GUARD}\nroot={}\nstaged={}\nfinal_path={}\nstaged_directory=${{staged%/*}}\nfinal_directory=${{final_path%/*}}\nsafe_cache_directory \"$root\" \"$staged_directory\"\nsafe_cache_directory \"$root\" \"$final_directory\"\n[ -f \"$staged\" ] && [ ! -L \"$staged\" ] || exit 1\n[ ! -L \"$final_path\" ] || exit 1\nmv -f \"$staged\" \"$final_path\"",
+                "set -eu\n{POSIX_CACHE_DIRECTORY_GUARD}\nroot={}\nstaged={}\nfinal_path={}\nstaged_directory=${{staged%/*}}\nfinal_directory=${{final_path%/*}}\n{POSIX_STAGED_FAILURE_CLEANUP}\nsafe_cache_directory \"$root\" \"$staged_directory\"\nsafe_cache_directory \"$root\" \"$final_directory\"\n[ -f \"$staged\" ] && [ ! -L \"$staged\" ] || exit 1\n[ ! -L \"$final_path\" ] || exit 1\nmv -f \"$staged\" \"$final_path\"",
                 posix_quote(self.remote_cache_root()),
                 posix_quote(staged),
                 posix_quote(final_path),
@@ -1030,6 +1062,43 @@ if ((Get-FileHash -Algorithm SHA256 -LiteralPath {staged}).Hash.ToLowerInvariant
             ),
             powershell_quote(self.remote_cache_root()),
             powershell_quote(remote_path),
+        )
+    }
+
+    fn windows_staged_failure_cleanup(self, staged: &str) -> String {
+        debug_assert!(self.is_windows());
+        format!(
+            r#"$separator=[IO.Path]::DirectorySeparatorChar
+$root=[IO.Path]::GetFullPath(({}).Replace('/', $separator))
+$path=[IO.Path]::GetFullPath(({}).Replace('/', $separator))
+$rootPrefix=$root.TrimEnd($separator)+$separator
+$identity=[System.Security.Principal.WindowsIdentity]::GetCurrent().Name
+function Remove-ExactStagedOnFailure {{
+  if (-not [StringComparer]::OrdinalIgnoreCase.Equals($path,$root) -and
+      -not $path.StartsWith($rootPrefix,[StringComparison]::OrdinalIgnoreCase)) {{ exit 75 }}
+  if (-not (Test-Path -LiteralPath $path)) {{ return }}
+  $item=Get-Item -LiteralPath $path -Force -ErrorAction Stop
+  if (($item -isnot [IO.FileInfo]) -or $item.PSIsContainer -or
+      (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0)) {{ exit 75 }}
+  $current=$item
+  while ($true) {{
+    $currentPath=[IO.Path]::GetFullPath($current.FullName)
+    if (-not [StringComparer]::OrdinalIgnoreCase.Equals($currentPath,$root) -and
+        -not $currentPath.StartsWith($rootPrefix,[StringComparison]::OrdinalIgnoreCase)) {{ exit 75 }}
+    if (($current.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {{ exit 75 }}
+    $acl=Get-Acl -LiteralPath $current.FullName
+    if ($acl.Owner -ne $identity) {{ exit 75 }}
+    foreach ($rule in $acl.Access) {{
+      if ($rule.AccessControlType -eq 'Allow' -and $rule.IdentityReference.Value -ne $identity) {{ exit 75 }}
+    }}
+    if ([StringComparer]::OrdinalIgnoreCase.Equals($currentPath,$root)) {{ break }}
+    $current=$current.Parent
+    if ($null -eq $current) {{ exit 75 }}
+  }}
+  Remove-Item -LiteralPath $path -Force -ErrorAction Stop
+}}"#,
+            powershell_quote(self.remote_cache_root()),
+            powershell_quote(staged),
         )
     }
 
@@ -1219,26 +1288,36 @@ printf 'removed=%s\nretained=%s\n' "$removed" "$retained""#,
         }
     }
 
-    fn prepare_staged_command(self, staged: &str) -> Option<String> {
+    fn prepare_staged_command(self, staged: &str, digest: &str) -> Option<String> {
         if self.is_windows() {
             let safety_guard = self.windows_cache_leaf_guard(staged);
+            let cleanup = self.windows_staged_failure_cleanup(staged);
             let script = format!(
                 concat!(
-                    "$ErrorActionPreference='Stop'; {safety_guard}",
+                    "$ErrorActionPreference='Stop'; {cleanup}$digestMismatch=$false; try {{ ",
+                    "{safety_guard}",
+                    "if ((Get-FileHash -Algorithm SHA256 -LiteralPath $path).Hash.ToLowerInvariant() -cne {digest}) {{ ",
+                    "$digestMismatch=$true; throw 'staged artifact digest mismatch' }}; ",
                     "$acl=Get-Acl -LiteralPath $path; $acl.SetAccessRuleProtection($true,$false); ",
                     "foreach ($rule in @($acl.Access)) {{ [void]$acl.RemoveAccessRuleAll($rule) }}; ",
                     "$rule=New-Object System.Security.AccessControl.FileSystemAccessRule(",
                     "[System.Security.Principal.WindowsIdentity]::GetCurrent().Name,'FullControl','Allow'); ",
-                    "$acl.SetAccessRule($rule); Set-Acl -LiteralPath $path -AclObject $acl",
+                    "$acl.SetAccessRule($rule); Set-Acl -LiteralPath $path -AclObject $acl }} catch {{ ",
+                    "$originalFailure=$_; try {{ Remove-ExactStagedOnFailure }} catch {{ exit 75 }}; ",
+                    "if ($digestMismatch) {{ exit {digest_mismatch_exit_code} }}; throw $originalFailure }}",
                 ),
+                cleanup = cleanup,
                 safety_guard = safety_guard,
+                digest = powershell_quote(digest),
+                digest_mismatch_exit_code = STAGED_DIGEST_MISMATCH_EXIT_CODE,
             );
             Some(powershell_encoded_command(&script))
         } else {
             let script = format!(
-                "set -eu\n{POSIX_CACHE_DIRECTORY_GUARD}\nroot={}\npath={}\ndirectory=${{path%/*}}\nsafe_cache_directory \"$root\" \"$directory\"\n[ -f \"$path\" ] && [ ! -L \"$path\" ] || exit 1\nchmod 700 \"$path\"",
+                "set -eu\n{POSIX_CACHE_DIRECTORY_GUARD}\nroot={}\nstaged={}\nexpected={}\nstaged_directory=${{staged%/*}}\n{POSIX_STAGED_FAILURE_CLEANUP}\nsafe_cache_directory \"$root\" \"$staged_directory\"\n[ -f \"$staged\" ] && [ ! -L \"$staged\" ] || exit 1\nif command -v sha256sum >/dev/null 2>&1; then actual=$(sha256sum \"$staged\" | awk '{{print $1}}'); elif command -v shasum >/dev/null 2>&1; then actual=$(shasum -a 256 \"$staged\" | awk '{{print $1}}'); else actual=$(openssl dgst -sha256 \"$staged\" | awk '{{print $NF}}'); fi\n[ \"$actual\" = \"$expected\" ] || exit {STAGED_DIGEST_MISMATCH_EXIT_CODE}\nchmod 700 \"$staged\"",
                 posix_quote(self.remote_cache_root()),
                 posix_quote(staged),
+                posix_quote(digest),
             );
             Some(format!("sh -c {}", posix_quote(&script)))
         }
@@ -2111,23 +2190,12 @@ fn stage_artifact_with_digest(
         &command,
         Some(FencedMutationInput::Artifact(input)),
     )?;
-    require_success(copy)?;
+    require_staged_mutation_success(copy)?;
 
-    let remote_digest = run_ssh_command(destination, &target.digest_command(&staged))?;
-    if !remote_digest.status.success() {
-        return Err(if remote_digest.stderr.host_key_verification_failed() {
-            SshBootstrapError::HostKeyVerificationRequired
-        } else {
-            SshBootstrapError::RemoteOperationFailed
-        });
-    }
-    if parse_digest_output(&remote_digest.stdout)? != local_digest {
-        return Err(SshBootstrapError::UploadedIntegrityMismatch);
-    }
-    if let Some(command) = target.prepare_staged_command(&staged) {
+    if let Some(command) = target.prepare_staged_command(&staged, &local_digest_hex) {
         let command =
             bootstrap_lock.fenced_command(target, "cache_staging_permissions", &command)?;
-        require_success(run_fenced_ssh_command(destination, &command, None)?)?;
+        require_staged_mutation_success(run_fenced_ssh_command(destination, &command, None)?)?;
     }
     Ok(staged)
 }
@@ -2314,6 +2382,14 @@ fn run_program_with_output_limit<const N: usize>(
 
 fn require_success(output: CommandOutput) -> Result<(), SshBootstrapError> {
     require_success_output(output).map(drop)
+}
+
+fn require_staged_mutation_success(output: CommandOutput) -> Result<(), SshBootstrapError> {
+    if output.status.code() == Some(STAGED_DIGEST_MISMATCH_EXIT_CODE) {
+        Err(SshBootstrapError::UploadedIntegrityMismatch)
+    } else {
+        require_success(output)
+    }
 }
 
 fn require_success_output(output: CommandOutput) -> Result<CommandOutput, SshBootstrapError> {
@@ -2741,7 +2817,7 @@ mod tests {
             fs::set_permissions(&escaped_staged, fs::Permissions::from_mode(0o600))
                 .expect("set escaped staged permissions");
             let prepare = RemoteTarget::LinuxX64Gnu
-                .prepare_staged_command(&staged)
+                .prepare_staged_command(&staged, &"00".repeat(32))
                 .expect("POSIX staging command");
             assert!(!run_posix_cache_command(home.path(), &prepare, None).success());
             let promote = RemoteTarget::LinuxX64Gnu
@@ -2785,7 +2861,7 @@ mod tests {
         assert!(run_posix_cache_command(home.path(), &upload, Some(payload)).success());
 
         let prepare = RemoteTarget::LinuxX64Gnu
-            .prepare_staged_command(&staged)
+            .prepare_staged_command(&staged, &digest)
             .expect("POSIX staging command");
         assert!(run_posix_cache_command(home.path(), &prepare, None).success());
         assert_eq!(
@@ -2803,6 +2879,93 @@ mod tests {
         assert_eq!(
             fs::read(home.path().join(final_path)).expect("read promoted artifact"),
             payload
+        );
+        assert!(!home.path().join(staged).exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn posix_failed_staged_mutations_remove_only_the_exact_owned_attempt() {
+        let home = tempfile::tempdir().expect("temporary remote home");
+        let remote_directory = RemoteTarget::LinuxX64Gnu.remote_directory();
+        let create = RemoteTarget::LinuxX64Gnu.create_directory_command(&remote_directory);
+        assert!(run_posix_cache_command(home.path(), &create, None).success());
+
+        let digest_mismatch = format!("{remote_directory}/.satelle-upload-digest-mismatch");
+        let upload = RemoteTarget::LinuxX64Gnu.upload_command(&digest_mismatch, &"00".repeat(32));
+        assert!(!run_posix_cache_command(home.path(), &upload, Some(b"artifact")).success());
+        assert!(!home.path().join(&digest_mismatch).exists());
+
+        let final_path = format!("{remote_directory}/satelle");
+        fs::write(home.path().join(&final_path), b"existing final").expect("write existing final");
+        let staged_verification =
+            format!("{remote_directory}/.satelle-upload-staging-verification");
+        fs::write(home.path().join(&staged_verification), b"staged artifact")
+            .expect("write staged verification artifact");
+        fs::set_permissions(
+            home.path().join(&staged_verification),
+            fs::Permissions::from_mode(0o600),
+        )
+        .expect("secure staged verification artifact");
+        let prepare = RemoteTarget::LinuxX64Gnu
+            .prepare_staged_command(&staged_verification, &"00".repeat(32))
+            .expect("POSIX staging command");
+        let status = run_posix_cache_command(home.path(), &prepare, None);
+        assert_eq!(status.code(), Some(STAGED_DIGEST_MISMATCH_EXIT_CODE));
+        assert!(!home.path().join(&staged_verification).exists());
+        assert_eq!(
+            fs::read(home.path().join(&final_path)).expect("read existing final"),
+            b"existing final"
+        );
+        fs::remove_file(home.path().join(&final_path)).expect("remove existing final");
+
+        let outside = tempfile::tempdir().expect("outside directory");
+        let outside_final = outside.path().join("final");
+        fs::write(&outside_final, b"outside final").expect("write outside final");
+        symlink(&outside_final, home.path().join(&final_path)).expect("symlink final path");
+
+        for attempt in ["first", "second"] {
+            let staged = format!("{remote_directory}/.satelle-upload-{attempt}");
+            fs::write(home.path().join(&staged), attempt).expect("write staged attempt");
+            fs::set_permissions(home.path().join(&staged), fs::Permissions::from_mode(0o700))
+                .expect("secure staged attempt");
+            let promote = RemoteTarget::LinuxX64Gnu.promote_command(&staged, &final_path);
+            assert!(!run_posix_cache_command(home.path(), &promote, None).success());
+            assert!(!home.path().join(staged).exists());
+            assert_eq!(
+                fs::read(&outside_final).expect("read outside final"),
+                b"outside final"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn posix_staged_cleanup_fences_when_exact_leaf_safety_is_uncertain() {
+        let home = tempfile::tempdir().expect("temporary remote home");
+        let outside = tempfile::tempdir().expect("outside directory");
+        let remote_directory = RemoteTarget::LinuxX64Gnu.remote_directory();
+        let create = RemoteTarget::LinuxX64Gnu.create_directory_command(&remote_directory);
+        assert!(run_posix_cache_command(home.path(), &create, None).success());
+
+        let outside_file = outside.path().join("artifact");
+        fs::write(&outside_file, b"outside").expect("write outside artifact");
+        let staged = format!("{remote_directory}/.satelle-upload-unsafe");
+        symlink(&outside_file, home.path().join(&staged)).expect("symlink staged leaf");
+        let promote = RemoteTarget::LinuxX64Gnu
+            .promote_command(&staged, &format!("{remote_directory}/satelle"));
+        let status = run_posix_cache_command(home.path(), &promote, None);
+
+        assert_eq!(status.code(), Some(75));
+        assert_eq!(
+            fs::read(&outside_file).expect("read outside artifact"),
+            b"outside"
+        );
+        assert!(
+            fs::symlink_metadata(home.path().join(staged))
+                .expect("staged symlink metadata")
+                .file_type()
+                .is_symlink()
         );
     }
 
@@ -2832,7 +2995,7 @@ mod tests {
             RemoteTarget::LinuxX64Gnu.remote_directory()
         );
         let command = RemoteTarget::LinuxX64Gnu
-            .prepare_staged_command(&staged)
+            .prepare_staged_command(&staged, &"00".repeat(32))
             .expect("POSIX staging command");
         assert!(!run_posix_cache_command(home.path(), &command, None).success());
         assert_eq!(
@@ -2914,7 +3077,7 @@ mod tests {
         let upload = RemoteTarget::LinuxX64Gnu.upload_command(&staged, &"00".repeat(32));
         assert!(!run_posix_cache_command(home.path(), &upload, Some(b"replacement")).success());
         let chmod = RemoteTarget::LinuxX64Gnu
-            .prepare_staged_command(&staged)
+            .prepare_staged_command(&staged, &"00".repeat(32))
             .expect("POSIX staging command");
         assert!(!run_posix_cache_command(home.path(), &chmod, None).success());
         let promote = RemoteTarget::LinuxX64Gnu.promote_command(
@@ -3005,7 +3168,7 @@ mod tests {
     fn windows_staged_acl_requires_a_contained_regular_non_reparse_file() {
         let staged = "AppData/Local/Satelle/host/v1/windows-x64/.satelle-upload-attempt.exe";
         let command = RemoteTarget::WindowsX64Msvc
-            .prepare_staged_command(staged)
+            .prepare_staged_command(staged, &"00".repeat(32))
             .expect("Windows staging command");
         let script = decode_powershell_command(&command).expect("decode staging command");
 
@@ -3037,6 +3200,39 @@ mod tests {
             .expect("staged ACL read");
         assert!(leaf_check < acl_read);
         assert!(ancestor_check < acl_read);
+    }
+
+    #[test]
+    fn windows_staged_mutations_cleanup_only_the_exact_owned_attempt_on_failure() {
+        let staged = "AppData/Local/Satelle/host/v1/windows-x64/.satelle-upload-attempt.exe";
+        let commands = [
+            RemoteTarget::WindowsX64Msvc.upload_command(staged, &"00".repeat(32)),
+            RemoteTarget::WindowsX64Msvc
+                .prepare_staged_command(staged, &"00".repeat(32))
+                .expect("Windows staging command"),
+            RemoteTarget::WindowsX64Msvc.promote_command(
+                staged,
+                "AppData/Local/Satelle/host/v1/windows-x64/satelle.exe",
+            ),
+        ];
+
+        for command in commands {
+            let script = decode_powershell_command(&command).expect("decode staged mutation");
+            for required in [
+                "catch",
+                "Remove-Item -LiteralPath $path -Force -ErrorAction Stop",
+                "WindowsIdentity]::GetCurrent().Name",
+                "$acl.Owner -ne $identity",
+                "[IO.FileAttributes]::ReparsePoint",
+                "exit 75",
+                "throw $originalFailure",
+            ] {
+                assert!(script.contains(required), "missing {required:?}: {script}");
+            }
+            assert!(script.contains(staged));
+            assert!(!script.contains("Get-ChildItem"));
+            assert!(!script.contains(".satelle-upload-*"));
+        }
     }
 
     #[cfg(unix)]

@@ -233,14 +233,14 @@ foreach ($item in @(Get-ChildItem -LiteralPath $lockRoot -Force -ErrorAction Sto
     if ($_.Exception.Response) {{ $daemonActive = @([int]$_.Exception.Response.StatusCode) -in @(200, 401, 403, 429) }}
   }}
   $requiresCommit = $mutationPhase -in @('daemon_start', 'durable_token_verification', 'maintenance_handoff_begin', 'maintenance_handoff_complete')
-  if (($processActive -or $serviceActive -or $daemonActive) -and
-      ($claimState -ne 'live') -and
-      -not ($requiresCommit -and $executionCommitted)) {{ Fail-Busy }}
   Record-Recovery $observed 'stale heartbeat postcondition probes' $processActive $binaryPresent $serviceActive $daemonActive
-  $reconciled = ($claimState -ceq 'live') -or (-not $executionStarted) -or
-    ($requiresCommit -and $executionCommitted) -or
+  $terminalEvidence = ($requiresCommit -and $executionCommitted) -or
     ((-not $requiresCommit) -and $executionSucceeded)
+  $reconciled = ($claimState -ceq 'live') -or (-not $executionStarted) -or $terminalEvidence
   if (-not $reconciled) {{ Fail-Busy }}
+  if (($processActive -or $serviceActive -or $daemonActive) -and
+      $executionStarted -and
+      -not $terminalEvidence) {{ Fail-Busy }}
   $quarantineRoot = Join-Path $stateRoot ('bootstrap.quarantine.' + [Guid]::NewGuid().ToString('N'))
   New-Item -ItemType Directory -Path $quarantineRoot -ErrorAction Stop | Out-Null
   Set-OwnerOnly $quarantineRoot
@@ -522,21 +522,23 @@ for competitor in "$lock_root"/*; do
   fi
   requires_commit=false
   case "$mutation_phase" in daemon_start|durable_token_verification|maintenance_handoff_begin|maintenance_handoff_complete) requires_commit=true;; esac
-  if [ "$process_active" = true ] || [ "$service_active" = true ] || [ "$daemon_active" = true ]; then
-    if [ "$claim_state" != live ]; then
-      if [ "$requires_commit" = false ] || [ "$execution_committed" = false ]; then busy; fi
-    fi
-  fi
   record_recovery "$observed" "$process_active" "$binary_present" "$service_active" "$daemon_active"
-  reconciled=false
-  if [ "$claim_state" = live ] || [ "$execution_started" = false ]; then
-    reconciled=true
-  elif [ "$requires_commit" = true ] && [ "$execution_committed" = true ]; then
-    reconciled=true
+  terminal_evidence=false
+  if [ "$requires_commit" = true ] && [ "$execution_committed" = true ]; then
+    terminal_evidence=true
   elif [ "$requires_commit" = false ] && [ "$execution_succeeded" = true ]; then
+    terminal_evidence=true
+  fi
+  reconciled=false
+  if [ "$claim_state" = live ] || [ "$execution_started" = false ] || [ "$terminal_evidence" = true ]; then
     reconciled=true
   fi
   [ "$reconciled" = true ] || busy
+  if [ "$process_active" = true ] || [ "$service_active" = true ] || [ "$daemon_active" = true ]; then
+    if [ "$execution_started" = true ]; then
+      [ "$terminal_evidence" = true ] || busy
+    fi
+  fi
   quarantine_root="$(mktemp -d "$state_root/bootstrap.quarantine.XXXXXX")" || busy
   chmod 700 "$quarantine_root"
   quarantined_claim="$quarantine_root/claim"
@@ -826,8 +828,8 @@ mod tests {
             "execution_started.",
             "execution_succeeded.",
             "execution_committed.",
-            "($claimState -ne 'live')",
-            "-not ($requiresCommit -and $executionCommitted)",
+            "$executionStarted -and",
+            "$terminalEvidence",
             "Finalize-InterruptedClaim",
             "recovery_pending",
             "clean_failed",
@@ -842,6 +844,22 @@ mod tests {
         assert!(script.contains(
             "$claimOperationKind -notin @('initial_setup', 'missing_daemon_repair', 'host_binary_replacement')"
         ));
+    }
+
+    #[test]
+    fn windows_active_daemon_fence_distinguishes_preexecution_and_started_claims() {
+        let script = request().windows_script();
+        assert!(script.contains(
+            "$terminalEvidence = ($requiresCommit -and $executionCommitted) -or\n    ((-not $requiresCommit) -and $executionSucceeded)"
+        ));
+        assert!(script.contains(
+            "if (($processActive -or $serviceActive -or $daemonActive) -and\n      $executionStarted -and\n      -not $terminalEvidence) { Fail-Busy }"
+        ));
+        assert!(
+            script.contains(
+                "$reconciled = ($claimState -ceq 'live') -or (-not $executionStarted) -or"
+            )
+        );
     }
 
     #[test]
@@ -1110,7 +1128,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn active_daemon_allows_clean_stale_claim_recovery_but_fences_started_claim() {
+    fn active_daemon_recovers_preexecution_claims_but_fences_execution_started_claim() {
         let clean_home = tempfile::tempdir().expect("temporary clean state home");
         let clean_root = clean_home.path().join("satelle");
         let clean_lock = clean_root.join("bootstrap.lock");
@@ -1138,28 +1156,65 @@ mod tests {
         replacement.exchange(RELEASE);
         assert!(replacement.close().success());
 
+        let attempt = "0123456789abcdef0123456789abcdef";
+        let write_stale_started_claim = |lock_root: &std::path::Path| {
+            let claim = lock_root.join("claim.operation-1.stale");
+            write_claim(
+                &claim,
+                "operation-1",
+                "2000-01-01T00:00:00Z",
+                "mutation_started",
+            );
+            fs::write(claim.join("operation_kind"), "missing_daemon_repair\n")
+                .expect("write operation kind");
+            fs::write(claim.join("mutation_phase"), "cache_promotion\n")
+                .expect("write mutation phase");
+            fs::write(claim.join("mutation_attempt"), format!("{attempt}\n"))
+                .expect("write mutation attempt");
+            claim
+        };
+
+        let preexecution_home = tempfile::tempdir().expect("temporary preexecution state home");
+        let preexecution_root = preexecution_home.path().join("satelle");
+        let preexecution_lock = preexecution_root.join("bootstrap.lock");
+        write_stale_started_claim(&preexecution_lock);
+        let active_probe_path = path_with_active_daemon_probe(preexecution_home.path());
+        let mut replacement = RunningProtocol::start_with_path(
+            &replacement_request,
+            preexecution_home.path(),
+            Some(&active_probe_path),
+        );
+        assert_ready_line(&replacement.read_line());
+        assert!(
+            fs::read_to_string(preexecution_root.join("bootstrap-recovery-operation-1.json"))
+                .expect("preexecution stale recovery record")
+                .contains("\"daemon_probe\":true")
+        );
+        replacement.exchange(RELEASE);
+        assert!(replacement.close().success());
+
+        let succeeded_home = tempfile::tempdir().expect("temporary succeeded state home");
+        let succeeded_lock = succeeded_home.path().join("satelle/bootstrap.lock");
+        let succeeded_claim = write_stale_started_claim(&succeeded_lock);
+        fs::create_dir(succeeded_claim.join(format!("execution_started.{attempt}")))
+            .expect("record exact execution start");
+        fs::create_dir(succeeded_claim.join(format!("execution_succeeded.{attempt}")))
+            .expect("record exact execution success");
+        let active_probe_path = path_with_active_daemon_probe(succeeded_home.path());
+        let mut recovered = RunningProtocol::start_with_path(
+            &replacement_request,
+            succeeded_home.path(),
+            Some(&active_probe_path),
+        );
+        assert_ready_line(&recovered.read_line());
+        recovered.exchange(RELEASE);
+        assert!(recovered.close().success());
+
         let started_home = tempfile::tempdir().expect("temporary started state home");
         let started_lock = started_home.path().join("satelle/bootstrap.lock");
-        let started_claim = started_lock.join("claim.operation-1.stale");
-        let attempt = "0123456789abcdef0123456789abcdef";
-        write_claim(
-            &started_claim,
-            "operation-1",
-            "2000-01-01T00:00:00Z",
-            "mutation_started",
-        );
-        fs::write(
-            started_claim.join("operation_kind"),
-            "missing_daemon_repair\n",
-        )
-        .expect("write operation kind");
-        fs::write(started_claim.join("mutation_phase"), "cache_promotion\n")
-            .expect("write mutation phase");
-        fs::write(
-            started_claim.join("mutation_attempt"),
-            format!("{attempt}\n"),
-        )
-        .expect("write mutation attempt");
+        let started_claim = write_stale_started_claim(&started_lock);
+        fs::create_dir(started_claim.join(format!("execution_started.{attempt}")))
+            .expect("record exact execution start");
         let active_probe_path = path_with_active_daemon_probe(started_home.path());
         let mut contender = RunningProtocol::start_with_path(
             &replacement_request,
