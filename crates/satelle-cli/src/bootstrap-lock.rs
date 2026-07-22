@@ -11,7 +11,6 @@ const STALE_AFTER_SECONDS: u64 = 30;
 pub(super) enum OperationKind {
     InitialSetup,
     MissingDaemonRepair,
-    HostBinaryReplacement,
 }
 
 impl OperationKind {
@@ -19,7 +18,6 @@ impl OperationKind {
         match self {
             Self::InitialSetup => "initial_setup",
             Self::MissingDaemonRepair => "missing_daemon_repair",
-            Self::HostBinaryReplacement => "host_binary_replacement",
         }
     }
 }
@@ -278,7 +276,7 @@ foreach ($item in @(Get-ChildItem -LiteralPath $lockRoot -Force -ErrorAction Sto
       $claimOperationKind = (Get-Content -LiteralPath (Join-Path $item.FullName 'operation_kind') -Raw).Trim()
       $mutationPhase = (Get-Content -LiteralPath (Join-Path $item.FullName 'mutation_phase') -Raw).Trim()
       $mutationAttempt = (Get-Content -LiteralPath (Join-Path $item.FullName 'mutation_attempt') -Raw).Trim()
-      if ($claimOperationKind -cnotin @('initial_setup', 'missing_daemon_repair', 'host_binary_replacement') -or
+      if ($claimOperationKind -cnotin @('initial_setup', 'missing_daemon_repair') -or
           $mutationPhase -cnotin @('cache_directory_creation', 'cache_upload', 'cache_staging_permissions', 'cache_promotion', 'daemon_start', 'state_owner_release', 'durable_token_verification', 'maintenance_handoff_begin', 'maintenance_handoff_complete') -or
           $mutationAttempt -notmatch '^[0-9a-f]{{32}}$') {{ Fail-Busy }}
       $executionStarted = Test-Path -LiteralPath (Join-Path $item.FullName ('execution_started.' + $mutationAttempt)) -PathType Leaf
@@ -354,7 +352,7 @@ foreach ($item in @(Get-ChildItem -LiteralPath $lockRoot -Force -ErrorAction Sto
   $terminalEvidence = ($requiresCommit -and $executionCommitted) -or
     ((-not $requiresCommit) -and $executionSucceeded)
   $failedDaemonStart = ($claimState -cin @('mutation_started', 'recovery_pending')) -and
-    ($claimOperationKind -cin @('initial_setup', 'missing_daemon_repair', 'host_binary_replacement')) -and
+    ($claimOperationKind -cin @('initial_setup', 'missing_daemon_repair')) -and
     ($mutationPhase -ceq 'daemon_start') -and
     $executionStarted -and ($executionSucceeded -xor $executionFailed) -and
     (-not $executionCommitted) -and (-not $unexpectedExecutionEvidence) -and
@@ -774,7 +772,7 @@ for competitor in "$lock_root"/*; do
     claim_operation_kind="$(cat "$competitor/operation_kind" 2>/dev/null)" || busy
     mutation_phase="$(cat "$competitor/mutation_phase" 2>/dev/null)" || busy
     mutation_attempt="$(cat "$competitor/mutation_attempt" 2>/dev/null)" || busy
-    case "$claim_operation_kind" in initial_setup|missing_daemon_repair|host_binary_replacement) ;; *) busy;; esac
+    case "$claim_operation_kind" in initial_setup|missing_daemon_repair) ;; *) busy;; esac
     case "$mutation_phase" in cache_directory_creation|cache_upload|cache_staging_permissions|cache_promotion|daemon_start|state_owner_release|durable_token_verification|maintenance_handoff_begin|maintenance_handoff_complete) ;; *) busy;; esac
     [ "${{#mutation_attempt}}" -eq 32 ] || busy
     case "$mutation_attempt" in *[!0-9a-f]*) busy;; esac
@@ -878,7 +876,7 @@ for competitor in "$lock_root"/*; do
     terminal_evidence=true
   fi
   operation_allows_daemon_start=false
-  case "$claim_operation_kind" in initial_setup|missing_daemon_repair|host_binary_replacement) operation_allows_daemon_start=true;; esac
+  case "$claim_operation_kind" in initial_setup|missing_daemon_repair) operation_allows_daemon_start=true;; esac
   launcher_terminal_evidence=false
   if [ "$execution_succeeded" = true ] && [ "$execution_failed" = false ]; then
     launcher_terminal_evidence=true
@@ -1311,11 +1309,13 @@ mod tests {
     }
 
     #[test]
-    fn windows_stale_recovery_operation_kind_allowlist_is_closed_and_accepts_replacement() {
+    fn windows_stale_recovery_operation_kind_allowlist_is_closed() {
         let script = request().windows_script();
-        assert!(script.contains(
-            "$claimOperationKind -cnotin @('initial_setup', 'missing_daemon_repair', 'host_binary_replacement')"
-        ));
+        assert!(
+            script.contains(
+                "$claimOperationKind -cnotin @('initial_setup', 'missing_daemon_repair')"
+            )
+        );
     }
 
     #[test]
@@ -2458,49 +2458,6 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn posix_protocol_recovers_stale_host_binary_replacement() {
-        let state_home = tempfile::tempdir().expect("temporary state home");
-        let lock_root = state_home.path().join("satelle/bootstrap.lock");
-        let stale_claim = lock_root.join("claim.operation-1.stale");
-        let attempt = "0123456789abcdef0123456789abcdef";
-        write_claim(
-            &stale_claim,
-            "operation-1",
-            "2000-01-01T00:00:00Z",
-            "recovery_pending",
-        );
-        fs::write(
-            stale_claim.join("operation_kind"),
-            "host_binary_replacement\n",
-        )
-        .expect("write replacement operation kind");
-        fs::write(stale_claim.join("mutation_phase"), "cache_promotion\n")
-            .expect("write mutation phase");
-        fs::write(stale_claim.join("mutation_attempt"), format!("{attempt}\n"))
-            .expect("write mutation attempt");
-        fs::create_dir(stale_claim.join(format!("execution_started.{attempt}")))
-            .expect("record mutation start");
-        fs::create_dir(stale_claim.join(format!("execution_succeeded.{attempt}")))
-            .expect("record mutation success");
-
-        let replacement_request =
-            Request::new("operation-2", OperationKind::HostBinaryReplacement, None)
-                .expect("valid replacement");
-        let mut replacement = RunningProtocol::start(&replacement_request, state_home.path());
-        assert_ready_line(&replacement.read_line());
-        assert_eq!(
-            fs::read_to_string(only_claim(&lock_root).join("operation_id"))
-                .expect("replacement operation")
-                .trim(),
-            "operation-2"
-        );
-
-        replacement.exchange(RELEASE);
-        assert!(replacement.close().success());
-    }
-
-    #[cfg(unix)]
-    #[test]
     fn posix_protocol_rejects_unknown_stale_operation_kind() {
         let state_home = tempfile::tempdir().expect("temporary state home");
         let lock_root = state_home.path().join("satelle/bootstrap.lock");
@@ -2524,7 +2481,7 @@ mod tests {
             .expect("record mutation success");
 
         let mut contender = RunningProtocol::start(
-            &Request::new("operation-2", OperationKind::HostBinaryReplacement, None)
+            &Request::new("operation-2", OperationKind::MissingDaemonRepair, None)
                 .expect("valid contender"),
             state_home.path(),
         );
@@ -2687,10 +2644,6 @@ mod tests {
         assert_eq!(
             OperationKind::MissingDaemonRepair.as_str(),
             "missing_daemon_repair"
-        );
-        assert_eq!(
-            OperationKind::HostBinaryReplacement.as_str(),
-            "host_binary_replacement"
         );
     }
 }

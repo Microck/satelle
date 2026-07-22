@@ -397,32 +397,8 @@ struct HostStartCommand {
     /// Internal Controller-resolved idle timeout for a durable SSH launch.
     #[arg(long, hide = true, value_name = "MILLISECONDS")]
     on_demand_idle_timeout_ms: Option<u64>,
-    /// Internal Maintenance Lease operation shared with the Bootstrap Lock.
-    #[arg(long, hide = true, requires = "bootstrap_operation_kind")]
-    bootstrap_operation_id: Option<String>,
-    /// Internal Maintenance Lease class shared with the Bootstrap Lock.
-    #[arg(long, hide = true, value_enum, requires = "bootstrap_operation_id")]
-    bootstrap_operation_kind: Option<BootstrapMaintenanceKind>,
     #[command(flatten)]
     output_args: OutputArgs,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
-#[value(rename_all = "snake_case")]
-enum BootstrapMaintenanceKind {
-    InitialSetup,
-    MissingDaemonRepair,
-    HostBinaryReplacement,
-}
-
-impl BootstrapMaintenanceKind {
-    const fn setup_operation_kind(self) -> satelle_host::SetupOperationKind {
-        match self {
-            Self::InitialSetup => satelle_host::SetupOperationKind::Setup,
-            Self::MissingDaemonRepair => satelle_host::SetupOperationKind::Repair,
-            Self::HostBinaryReplacement => satelle_host::SetupOperationKind::HostUpdate,
-        }
-    }
 }
 
 #[derive(Args, Debug)]
@@ -1506,8 +1482,6 @@ mod history_target_tests {
                 bootstrap_native_readiness_timeout_ms: None,
                 bootstrap_provider_smoke_timeout_ms: None,
                 on_demand_idle_timeout_ms: None,
-                bootstrap_operation_id: None,
-                bootstrap_operation_kind: None,
                 output_args: OutputArgs::default(),
             }),
         }
@@ -1556,6 +1530,25 @@ mod history_target_tests {
         };
         assert!(command.bootstrap_token_stdin);
         assert_eq!(command.bootstrap_scope, Some(SshBootstrapScope::Read));
+    }
+
+    #[test]
+    fn bootstrap_maintenance_is_not_a_host_start_argument() {
+        let error = Cli::try_parse_from([
+            "satelle",
+            "host",
+            "start",
+            "--bootstrap-token-stdin",
+            "--bootstrap-scope",
+            "read",
+            "--bootstrap-operation-id",
+            "operation-1",
+            "--bootstrap-operation-kind",
+            "missing_daemon_repair",
+        ])
+        .expect_err("maintenance starts only through the authenticated handoff API");
+
+        assert_eq!(error.kind(), clap::error::ErrorKind::UnknownArgument);
     }
 
     #[test]
@@ -3523,38 +3516,63 @@ fn validate_host_start_mode(command: &HostStartCommand) -> Result<(), SatelleErr
     Ok(())
 }
 
+async fn bind_host_daemon(
+    service: HostService,
+    server_config: DaemonServerConfig,
+    tls: Option<DaemonTlsFiles>,
+) -> Result<(DaemonServer, Option<DaemonTlsWatcher>), CliFailure> {
+    match tls {
+        Some(tls) => {
+            let DaemonTlsFiles {
+                certificate_path,
+                private_key_path,
+                config,
+            } = tls;
+            let server = DaemonServer::bind_tls(service, server_config, config)
+                .await
+                .map_err(daemon_server_failure)?;
+            let reloader = server
+                .tls_reloader()
+                .expect("a TLS listener always exposes its reload handle");
+            let watcher = DaemonTlsWatcher::start(certificate_path, private_key_path, reloader)?;
+            Ok((server, Some(watcher)))
+        }
+        None => Ok((
+            DaemonServer::bind(service, server_config)
+                .await
+                .map_err(daemon_server_failure)?,
+            None,
+        )),
+    }
+}
+
 fn start_host_daemon(
     command: HostStartCommand,
     config: ConfigContext<'_>,
     format: OutputFormat,
 ) -> Result<(), CliFailure> {
+    start_host_daemon_with(
+        command,
+        config,
+        format,
+        read_ssh_bootstrap_token,
+        HostService::production_for_ssh_bootstrap,
+    )
+}
+
+fn start_host_daemon_with(
+    command: HostStartCommand,
+    config: ConfigContext<'_>,
+    format: OutputFormat,
+    read_bootstrap_token: impl FnOnce() -> Result<ApiBearerToken, CliFailure>,
+    build_bootstrap_service: impl FnOnce(
+        &ApiBearerToken,
+        satelle_host::ApiScopes,
+        OffsetDateTime,
+        &HostConfig,
+    ) -> HostService,
+) -> Result<(), CliFailure> {
     validate_host_start_mode(&command).map_err(failure)?;
-    if command.bootstrap_operation_id.is_some() != command.bootstrap_operation_kind.is_some() {
-        return Err(failure(SatelleError::invalid_usage(
-            "Bootstrap Lock handoff requires both operation id and operation kind",
-        )));
-    }
-    if let (Some(operation_id), Some(operation_kind)) = (
-        command.bootstrap_operation_id.as_deref(),
-        command.bootstrap_operation_kind,
-    ) {
-        bootstrap_lock::Request::new(
-            operation_id,
-            match operation_kind {
-                BootstrapMaintenanceKind::InitialSetup => {
-                    bootstrap_lock::OperationKind::InitialSetup
-                }
-                BootstrapMaintenanceKind::MissingDaemonRepair => {
-                    bootstrap_lock::OperationKind::MissingDaemonRepair
-                }
-                BootstrapMaintenanceKind::HostBinaryReplacement => {
-                    bootstrap_lock::OperationKind::HostBinaryReplacement
-                }
-            },
-            None,
-        )
-        .map_err(|error| failure(SatelleError::invalid_usage(error.to_string())))?;
-    }
     let bootstrap_scopes = match (command.bootstrap_token_stdin, command.bootstrap_scope) {
         (true, Some(scope)) => Some(scope.api_scopes()),
         (true, None) => {
@@ -3615,7 +3633,7 @@ fn start_host_daemon(
     };
     let bootstrap_token = command
         .bootstrap_token_stdin
-        .then(read_ssh_bootstrap_token)
+        .then(read_bootstrap_token)
         .transpose()?;
     let forwarded_readiness_timeouts = ssh_launch_readiness_timeouts(
         command.bootstrap_native_readiness_timeout_ms,
@@ -3634,7 +3652,7 @@ fn start_host_daemon(
                 .remove(LOCAL_DEMO_HOST)
                 .expect("the built-in local Host config exists");
             host_config.timeouts = forwarded_readiness_timeouts;
-            HostService::production_for_ssh_bootstrap(
+            build_bootstrap_service(
                 token,
                 bootstrap_scopes.expect("bootstrap token has a validated scope"),
                 OffsetDateTime::now_utc() + time::Duration::minutes(15),
@@ -3654,14 +3672,6 @@ fn start_host_daemon(
             None => HostService::production(),
         },
     };
-    if let (Some(operation_id), Some(operation_kind)) = (
-        command.bootstrap_operation_id.as_deref(),
-        command.bootstrap_operation_kind,
-    ) {
-        service
-            .acquire_bootstrap_maintenance(operation_id, operation_kind.setup_operation_kind())
-            .map_err(failure)?;
-    }
     // The service retained only the verifier. Zeroize the raw bootstrap token
     // before the listener starts accepting requests.
     drop(bootstrap_token);
@@ -3682,30 +3692,7 @@ fn start_host_daemon(
         if let Some(idle_timeout) = idle_timeout {
             server_config = server_config.with_idle_timeout(idle_timeout);
         }
-        let (server, _tls_reload_watcher) = match tls {
-            Some(tls) => {
-                let DaemonTlsFiles {
-                    certificate_path,
-                    private_key_path,
-                    config,
-                } = tls;
-                let server = DaemonServer::bind_tls(service, server_config, config)
-                    .await
-                    .map_err(daemon_server_failure)?;
-                let reloader = server
-                    .tls_reloader()
-                    .expect("a TLS listener always exposes its reload handle");
-                let watcher =
-                    DaemonTlsWatcher::start(certificate_path, private_key_path, reloader)?;
-                (server, Some(watcher))
-            }
-            None => (
-                DaemonServer::bind(service, server_config)
-                    .await
-                    .map_err(daemon_server_failure)?,
-                None,
-            ),
-        };
+        let (server, _tls_reload_watcher) = bind_host_daemon(service, server_config, tls).await?;
 
         let ready = json!({
             "schema_version": "satelle.host.start.v1",
@@ -4262,8 +4249,6 @@ mod daemon_tls_watcher_tests {
             bootstrap_native_readiness_timeout_ms: None,
             bootstrap_provider_smoke_timeout_ms: None,
             on_demand_idle_timeout_ms: None,
-            bootstrap_operation_id: None,
-            bootstrap_operation_kind: None,
             output_args: OutputArgs::default(),
         }
     }
@@ -4741,6 +4726,184 @@ fn on_demand_idle_timeout(config: &HostConfig) -> Duration {
         .map_or(DEFAULT_ON_DEMAND_IDLE_TIMEOUT, |timeout| {
             Duration::from_millis(timeout.milliseconds())
         })
+}
+
+#[cfg(test)]
+mod bootstrap_startup_tests {
+    use super::*;
+    use satelle_host::{ApiScopes, test_support::TestStateDir};
+    use std::net::Ipv4Addr;
+
+    fn bootstrap_service(state: &TestStateDir, token: &ApiBearerToken) -> HostService {
+        HostService::local_demo_for_tests_at(state.path())
+            .expect("construct bootstrap Host service")
+            .with_ssh_bootstrap_auth_for_tests(
+                token,
+                ApiScopes::READ,
+                OffsetDateTime::now_utc() + time::Duration::minutes(15),
+            )
+    }
+
+    #[tokio::test]
+    async fn failed_start_host_daemon_does_not_strand_maintenance() {
+        const OPERATION_ID: &str = "bind-failure-must-not-acquire";
+
+        let state = TestStateDir::new().expect("create temporary state directory");
+        let token = ApiBearerToken::generate().expect("generate bootstrap token");
+        let service = bootstrap_service(&state, &token);
+        let occupied =
+            std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("occupy a loopback port");
+        let address = occupied.local_addr().expect("read occupied address");
+        let start_token = ApiBearerToken::parse(token.expose().as_str())
+            .expect("parse bootstrap token for failed startup");
+        let start_service = service.clone();
+        let command = HostStartCommand {
+            bind: address.to_string(),
+            tls_cert: None,
+            tls_key: None,
+            foreground: false,
+            bootstrap_token_stdin: true,
+            bootstrap_scope: Some(SshBootstrapScope::Read),
+            bootstrap_native_readiness_timeout_ms: None,
+            bootstrap_provider_smoke_timeout_ms: None,
+            on_demand_idle_timeout_ms: Some(75_000),
+            output_args: OutputArgs::default(),
+        };
+        let start_result = std::thread::spawn(move || {
+            start_host_daemon_with(
+                command,
+                ConfigContext::new(None),
+                OutputFormat::Json,
+                move || Ok(start_token),
+                move |_, _, _, _| start_service,
+            )
+        })
+        .join()
+        .expect("join failed startup thread");
+        assert!(
+            start_result.is_err(),
+            "occupied address must reject startup"
+        );
+        assert!(
+            service
+                .load_setup_run(OPERATION_ID)
+                .expect("read setup ledger after failed bind")
+                .is_none(),
+            "startup failure must not create a setup run before authenticated begin"
+        );
+
+        let host_identity = service
+            .initialize_daemon()
+            .expect("initialize bootstrap Host after failed bind")
+            .host_identity()
+            .to_string();
+        let (server, _tls_reload_watcher) = bind_host_daemon(
+            service.clone(),
+            DaemonServerConfig::loopback(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))),
+            None,
+        )
+        .await
+        .expect("bind replacement bootstrap Host");
+        let address = server.local_addr();
+        tokio::task::spawn_blocking(move || {
+            let client = satelle_transport::DaemonClient::loopback(address, token, host_identity)
+                .expect("construct replacement bootstrap client");
+            client
+                .begin_bootstrap_maintenance(OPERATION_ID, "missing_daemon_repair")
+                .expect("later authenticated begin is not blocked by failed startup");
+            client
+                .complete_bootstrap_maintenance(OPERATION_ID)
+                .expect("complete replacement bootstrap maintenance");
+        })
+        .await
+        .expect("join replacement handoff requests");
+        assert_eq!(
+            service
+                .load_setup_run(OPERATION_ID)
+                .expect("read replacement setup run")
+                .expect("later begin persists setup run")
+                .status(),
+            satelle_host::SetupRunStatus::Completed
+        );
+        server
+            .shutdown()
+            .await
+            .expect("stop replacement bootstrap Host");
+    }
+
+    #[tokio::test]
+    async fn bootstrap_maintenance_starts_only_at_authenticated_begin_and_completes() {
+        const OPERATION_ID: &str = "authenticated-handoff";
+
+        let state = TestStateDir::new().expect("create temporary state directory");
+        let token = ApiBearerToken::generate().expect("generate bootstrap token");
+        let service = bootstrap_service(&state, &token);
+        let host_identity = service
+            .initialize_daemon()
+            .expect("initialize bootstrap Host")
+            .host_identity()
+            .to_string();
+        let server = DaemonServer::bind(
+            service.clone(),
+            DaemonServerConfig::loopback(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))),
+        )
+        .await
+        .expect("bind bootstrap Host");
+        assert!(
+            service
+                .load_setup_run(OPERATION_ID)
+                .expect("read setup ledger before handoff")
+                .is_none(),
+            "listener readiness alone must not acquire maintenance"
+        );
+
+        let address = server.local_addr();
+        let raw_token = token.expose();
+        let completion_host_identity = host_identity.clone();
+        tokio::task::spawn_blocking(move || {
+            let client = satelle_transport::DaemonClient::loopback(address, token, host_identity)
+                .expect("construct bootstrap client");
+            client
+                .begin_bootstrap_maintenance(OPERATION_ID, "missing_daemon_repair")
+                .expect("begin authenticated bootstrap maintenance");
+        })
+        .await
+        .expect("join begin handoff request");
+        assert_eq!(
+            service
+                .load_setup_run(OPERATION_ID)
+                .expect("read begun setup run")
+                .expect("begin persists setup run")
+                .status(),
+            satelle_host::SetupRunStatus::Running
+        );
+
+        let address = server.local_addr();
+        let completion_token = ApiBearerToken::parse(raw_token.as_str())
+            .expect("parse bootstrap token for completion");
+        tokio::task::spawn_blocking(move || {
+            let client = satelle_transport::DaemonClient::loopback(
+                address,
+                completion_token,
+                completion_host_identity,
+            )
+            .expect("construct completion bootstrap client");
+            client
+                .complete_bootstrap_maintenance(OPERATION_ID)
+                .expect("complete authenticated bootstrap maintenance");
+        })
+        .await
+        .expect("join complete handoff request");
+        assert_eq!(
+            service
+                .load_setup_run(OPERATION_ID)
+                .expect("read completed setup run")
+                .expect("completed setup run remains durable")
+                .status(),
+            satelle_host::SetupRunStatus::Completed
+        );
+        server.shutdown().await.expect("stop bootstrap Host");
+    }
 }
 
 #[cfg(test)]

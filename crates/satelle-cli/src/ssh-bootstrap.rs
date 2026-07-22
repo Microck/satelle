@@ -107,12 +107,6 @@ pub(crate) struct CacheCleanupReport {
 }
 
 #[derive(Clone, Copy)]
-pub(super) struct BootstrapMaintenanceContext<'a> {
-    pub(super) operation_id: &'a str,
-    pub(super) operation_kind: bootstrap_lock::OperationKind,
-}
-
-#[derive(Clone, Copy)]
 struct ReadinessTimeouts {
     native: Duration,
     provider: Duration,
@@ -154,7 +148,6 @@ impl<'a> BootstrapLaunchMode<'a> {
 struct BootstrapStartContext<'a> {
     bootstrap_scope: SshBootstrapScope,
     bind: &'a str,
-    maintenance: BootstrapMaintenanceContext<'a>,
 }
 
 impl SshBootstrapLock {
@@ -451,18 +444,12 @@ impl SshBootstrapProcess {
         bootstrap_scope: SshBootstrapScope,
         bootstrap_lock: &mut SshBootstrapLock,
     ) -> Result<Self, SshBootstrapError> {
-        let operation_id = bootstrap_lock.operation_id().to_string();
-        let maintenance = BootstrapMaintenanceContext {
-            operation_id: &operation_id,
-            operation_kind: bootstrap_lock.operation_kind(),
-        };
         Self::launch_bound(
             destination,
             token,
             host_config,
             bootstrap_scope,
             BootstrapLaunchMode::Durable,
-            maintenance,
             bootstrap_lock,
         )
     }
@@ -475,11 +462,6 @@ impl SshBootstrapProcess {
         bootstrap_scope: SshBootstrapScope,
         bootstrap_lock: &mut SshBootstrapLock,
     ) -> Result<Self, SshBootstrapError> {
-        let operation_id = bootstrap_lock.operation_id().to_string();
-        let maintenance = BootstrapMaintenanceContext {
-            operation_id: &operation_id,
-            operation_kind: bootstrap_lock.operation_kind(),
-        };
         Self::launch_bound(
             destination,
             token,
@@ -488,7 +470,6 @@ impl SshBootstrapProcess {
             BootstrapLaunchMode::Ephemeral {
                 previous_host_config,
             },
-            maintenance,
             bootstrap_lock,
         )
     }
@@ -499,7 +480,6 @@ impl SshBootstrapProcess {
         host_config: &HostConfig,
         bootstrap_scope: SshBootstrapScope,
         launch_mode: BootstrapLaunchMode<'_>,
-        maintenance: BootstrapMaintenanceContext<'_>,
         bootstrap_lock: &mut SshBootstrapLock,
     ) -> Result<Self, SshBootstrapError> {
         let target = RemoteTarget::probe(destination)?;
@@ -518,7 +498,6 @@ impl SshBootstrapProcess {
             BootstrapStartContext {
                 bootstrap_scope,
                 bind: launch_mode.bind(),
-                maintenance,
             },
         );
         if let Some(release_command) = release_command {
@@ -547,23 +526,17 @@ impl SshBootstrapProcess {
         host_config: &HostConfig,
         bootstrap_lock: &mut SshBootstrapLock,
     ) -> Result<(), SshBootstrapError> {
-        let operation_id = bootstrap_lock.operation_id().to_string();
-        let maintenance = BootstrapMaintenanceContext {
-            operation_id: &operation_id,
-            operation_kind: bootstrap_lock.operation_kind(),
-        };
         let target = RemoteTarget::probe(destination)?;
         let environment = target.validated_daemon_environment(host_config)?;
         let artifact = DownloadedArtifact::fetch(target)?;
         let remote_binary = upload_artifact(destination, target, artifact.path(), bootstrap_lock)?;
         let (native_timeout, provider_timeout) = readiness_probe_timeouts(host_config);
-        let command = target.durable_start_command_with_maintenance(
+        let command = target.durable_start_command_with_environment(
             &remote_binary,
             idle_timeout,
             native_timeout,
             provider_timeout,
             &environment,
-            maintenance,
         );
         let command = bootstrap_lock.fenced_command(target, "daemon_start", &command)?;
         require_success(run_fenced_ssh_command(
@@ -702,13 +675,12 @@ impl RemoteTarget {
             self.release_state_command_with_environment(remote_binary, environment)
         });
         let (native, provider) = readiness_probe_timeouts(host_config);
-        let start_command = self.start_command_with_maintenance(
+        let start_command = self.start_command_with_environment(
             remote_binary,
             start_context.bootstrap_scope,
             ReadinessTimeouts { native, provider },
             start_context.bind,
             environment,
-            start_context.maintenance,
         );
         (release_command, start_command)
     }
@@ -1453,7 +1425,6 @@ printf 'removed=%s\nretained=%s\n' "$removed" "$retained""#,
         )
     }
 
-    #[cfg(test)]
     fn start_command_with_environment(
         self,
         remote_binary: &str,
@@ -1462,53 +1433,8 @@ printf 'removed=%s\nretained=%s\n' "$removed" "$retained""#,
         bind: &str,
         environment: &[(&'static str, &Path)],
     ) -> String {
-        self.start_command_with_optional_maintenance(
-            remote_binary,
-            bootstrap_scope,
-            readiness_timeouts,
-            bind,
-            environment,
-            None,
-        )
-    }
-
-    fn start_command_with_maintenance(
-        self,
-        remote_binary: &str,
-        bootstrap_scope: SshBootstrapScope,
-        readiness_timeouts: ReadinessTimeouts,
-        bind: &str,
-        environment: &[(&'static str, &Path)],
-        maintenance: BootstrapMaintenanceContext<'_>,
-    ) -> String {
-        self.start_command_with_optional_maintenance(
-            remote_binary,
-            bootstrap_scope,
-            readiness_timeouts,
-            bind,
-            environment,
-            Some(maintenance),
-        )
-    }
-
-    fn start_command_with_optional_maintenance(
-        self,
-        remote_binary: &str,
-        bootstrap_scope: SshBootstrapScope,
-        readiness_timeouts: ReadinessTimeouts,
-        bind: &str,
-        environment: &[(&'static str, &Path)],
-        maintenance: Option<BootstrapMaintenanceContext<'_>>,
-    ) -> String {
-        let maintenance_args = maintenance.map_or_else(String::new, |maintenance| {
-            format!(
-                " --bootstrap-operation-id {} --bootstrap-operation-kind {}",
-                maintenance.operation_id,
-                maintenance.operation_kind.as_str()
-            )
-        });
         let timeout_args = format!(
-            "--bind {bind} --bootstrap-scope {} --bootstrap-native-readiness-timeout-ms {} --bootstrap-provider-smoke-timeout-ms {}{maintenance_args}",
+            "--bind {bind} --bootstrap-scope {} --bootstrap-native-readiness-timeout-ms {} --bootstrap-provider-smoke-timeout-ms {}",
             bootstrap_scope.as_cli_value(),
             readiness_timeouts.native.as_millis(),
             readiness_timeouts.provider.as_millis(),
@@ -1601,7 +1527,6 @@ printf 'removed=%s\nretained=%s\n' "$removed" "$retained""#,
         })
     }
 
-    #[cfg(test)]
     fn durable_start_command_with_environment(
         self,
         remote_binary: &str,
@@ -1610,53 +1535,8 @@ printf 'removed=%s\nretained=%s\n' "$removed" "$retained""#,
         provider_timeout: Duration,
         environment: &[(&'static str, &Path)],
     ) -> String {
-        self.durable_start_command_with_optional_maintenance(
-            remote_binary,
-            idle_timeout,
-            native_timeout,
-            provider_timeout,
-            environment,
-            None,
-        )
-    }
-
-    fn durable_start_command_with_maintenance(
-        self,
-        remote_binary: &str,
-        idle_timeout: Duration,
-        native_timeout: Duration,
-        provider_timeout: Duration,
-        environment: &[(&'static str, &Path)],
-        maintenance: BootstrapMaintenanceContext<'_>,
-    ) -> String {
-        self.durable_start_command_with_optional_maintenance(
-            remote_binary,
-            idle_timeout,
-            native_timeout,
-            provider_timeout,
-            environment,
-            Some(maintenance),
-        )
-    }
-
-    fn durable_start_command_with_optional_maintenance(
-        self,
-        remote_binary: &str,
-        idle_timeout: Duration,
-        native_timeout: Duration,
-        provider_timeout: Duration,
-        environment: &[(&'static str, &Path)],
-        maintenance: Option<BootstrapMaintenanceContext<'_>>,
-    ) -> String {
-        let maintenance_args = maintenance.map_or_else(String::new, |maintenance| {
-            format!(
-                " --bootstrap-operation-id {} --bootstrap-operation-kind {}",
-                maintenance.operation_id,
-                maintenance.operation_kind.as_str()
-            )
-        });
         let timeout_args = format!(
-            "--bootstrap-token-stdin --bootstrap-scope {} --on-demand-idle-timeout-ms {} --bootstrap-native-readiness-timeout-ms {} --bootstrap-provider-smoke-timeout-ms {}{maintenance_args}",
+            "--bootstrap-token-stdin --bootstrap-scope {} --on-demand-idle-timeout-ms {} --bootstrap-native-readiness-timeout-ms {} --bootstrap-provider-smoke-timeout-ms {}",
             SshBootstrapScope::Read.as_cli_value(),
             idle_timeout.as_millis(),
             native_timeout.as_millis(),
@@ -3723,6 +3603,8 @@ mod tests {
         assert!(script.contains("--bootstrap-scope control"));
         assert!(script.contains("--bootstrap-native-readiness-timeout-ms 2500"));
         assert!(script.contains("--bootstrap-provider-smoke-timeout-ms 7500"));
+        assert!(!script.contains("--bootstrap-operation-id"));
+        assert!(!script.contains("--bootstrap-operation-kind"));
     }
 
     #[test]
@@ -3785,10 +3667,6 @@ mod tests {
             BootstrapStartContext {
                 bootstrap_scope: SshBootstrapScope::Admin,
                 bind: "127.0.0.1:0",
-                maintenance: BootstrapMaintenanceContext {
-                    operation_id: "test-operation",
-                    operation_kind: bootstrap_lock::OperationKind::InitialSetup,
-                },
             },
         );
         let release = release.expect("a setup bootstrap releases the prior state owner");
@@ -4799,6 +4677,8 @@ mod tests {
         assert!(script.contains("--bootstrap-scope read"));
         assert!(script.contains("--bootstrap-native-readiness-timeout-ms 2500"));
         assert!(script.contains("--bootstrap-provider-smoke-timeout-ms 7500"));
+        assert!(!script.contains("--bootstrap-operation-id"));
+        assert!(!script.contains("--bootstrap-operation-kind"));
         assert!(script.contains("RedirectStandardInput = $true"));
         assert!(script.contains("StandardInput.WriteLine($token)"));
     }
