@@ -139,8 +139,25 @@ impl SshBootstrapLock {
         destination: &str,
         request: bootstrap_lock::Request,
     ) -> Result<Self, SshBootstrapError> {
-        let target = RemoteTarget::probe(destination)?;
-        let mut child = Command::new("ssh")
+        Self::acquire_with_program(destination, request, OsStr::new("ssh"))
+    }
+
+    #[cfg(test)]
+    pub(super) fn acquire_for_tests(
+        destination: &str,
+        request: bootstrap_lock::Request,
+        ssh_program: &Path,
+    ) -> Result<Self, SshBootstrapError> {
+        Self::acquire_with_program(destination, request, ssh_program.as_os_str())
+    }
+
+    fn acquire_with_program(
+        destination: &str,
+        request: bootstrap_lock::Request,
+        ssh_program: &OsStr,
+    ) -> Result<Self, SshBootstrapError> {
+        let target = RemoteTarget::probe_with_program(destination, ssh_program)?;
+        let mut child = Command::new(ssh_program)
             .arg("-T")
             .arg(destination)
             .arg(target.bootstrap_lock_command(&request))
@@ -674,7 +691,15 @@ impl RemoteTarget {
     }
 
     fn probe(destination: &str) -> Result<Self, SshBootstrapError> {
-        let windows = run_ssh_command(
+        Self::probe_with_program(destination, OsStr::new("ssh"))
+    }
+
+    fn probe_with_program(
+        destination: &str,
+        ssh_program: &OsStr,
+    ) -> Result<Self, SshBootstrapError> {
+        let windows = run_ssh_command_with_program(
+            ssh_program,
             destination,
             "cmd.exe /d /c \"echo satelle-platform-v1&&echo windows&&echo %PROCESSOR_ARCHITECTURE%\"",
         )?;
@@ -682,7 +707,8 @@ impl RemoteTarget {
             return Self::parse_probe(&windows.stdout);
         }
 
-        let unix = run_ssh_command(
+        let unix = run_ssh_command_with_program(
+            ssh_program,
             destination,
             "sh -c 'printf \"satelle-platform-v1\\n\"; uname -s; uname -m; if [ \"$(uname -s)\" = Linux ]; then getconf GNU_LIBC_VERSION 2>/dev/null || true; fi'",
         )?;
@@ -2075,7 +2101,23 @@ fn run_ssh_command(
     destination: &str,
     remote_command: &str,
 ) -> Result<CommandOutput, SshBootstrapError> {
-    run_ssh_command_with_output_limit(destination, remote_command, PROBE_OUTPUT_LIMIT)
+    run_ssh_command_with_program(OsStr::new("ssh"), destination, remote_command)
+}
+
+fn run_ssh_command_with_program(
+    ssh_program: &OsStr,
+    destination: &str,
+    remote_command: &str,
+) -> Result<CommandOutput, SshBootstrapError> {
+    run_program_with_output_limit(
+        ssh_program,
+        [
+            OsStr::new("-T"),
+            OsStr::new(destination),
+            OsStr::new(remote_command),
+        ],
+        PROBE_OUTPUT_LIMIT,
+    )
 }
 
 fn run_ssh_command_with_output_limit(
@@ -2162,7 +2204,7 @@ fn run_fenced_ssh_command(
 }
 
 fn run_program_with_output_limit<const N: usize>(
-    program: &str,
+    program: impl AsRef<OsStr>,
     arguments: [&OsStr; N],
     output_limit: usize,
 ) -> Result<CommandOutput, SshBootstrapError> {

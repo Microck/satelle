@@ -700,18 +700,32 @@ fn durable_verification_and_bootstrap_handoff_use_distinct_clients() {
 }
 
 #[cfg(unix)]
-fn with_bootstrap_handoff_test_context(test: impl FnOnce(&DaemonClient)) {
+fn acquire_bootstrap_lock_for_operation_with_ssh(
+    alias: &str,
+    destination: &str,
+    operation_id: String,
+    operation_kind: bootstrap_lock::OperationKind,
+    ssh_program: &std::path::Path,
+) -> Result<ssh_bootstrap::SshBootstrapLock, SatelleError> {
+    let controller_identity = Some(format!("controller-pid-{}", std::process::id()));
+    let request = bootstrap_lock::Request::new(operation_id, operation_kind, controller_identity)
+        .map_err(|error| SatelleError::invalid_usage(error.to_string()))?;
+    ssh_bootstrap::SshBootstrapLock::acquire_for_tests(destination, request, ssh_program).map_err(
+        |error| match error {
+            ssh_bootstrap::SshBootstrapError::HostKeyVerificationRequired => {
+                SatelleError::ssh_host_key_verification_required(alias)
+            }
+            ssh_bootstrap::SshBootstrapError::BootstrapBusy => {
+                SatelleError::bootstrap_busy(alias, None)
+            }
+            _ => SatelleError::host_unreachable(alias),
+        },
+    )
+}
+
+#[cfg(unix)]
+fn with_bootstrap_handoff_test_context(test: impl FnOnce(&DaemonClient, &std::path::Path)) {
     use std::os::unix::fs::PermissionsExt as _;
-
-    struct PathRestore(std::ffi::OsString);
-
-    impl Drop for PathRestore {
-        fn drop(&mut self) {
-            // SAFETY: nextest runs each test in a separate process, and this
-            // guard restores PATH before that process exits.
-            unsafe { std::env::set_var("PATH", &self.0) };
-        }
-    }
 
     let state = TestStateDir::new().expect("temporary state directory");
     let bootstrap_token = ApiBearerToken::generate().expect("generate bootstrap token");
@@ -763,31 +777,21 @@ esac
     permissions.set_mode(0o700);
     std::fs::set_permissions(&fake_ssh, permissions).expect("make fake SSH executable");
 
-    let original_path = std::env::var_os("PATH").expect("test process has PATH");
-    let path_restore = PathRestore(original_path.clone());
-    let path = std::env::join_paths(
-        std::iter::once(fake_bin.clone()).chain(std::env::split_paths(&original_path)),
-    )
-    .expect("construct fake SSH PATH");
-    // SAFETY: nextest isolates this test in its own process, and path_restore
-    // restores the original value on every exit path.
-    unsafe { std::env::set_var("PATH", path) };
+    test(&client, &fake_ssh);
 
-    test(&client);
-
-    drop(path_restore);
     drop(server);
 }
 
 #[cfg(unix)]
 #[test]
 fn completed_bootstrap_handoff_commit_allows_recovery_after_controller_loss() {
-    with_bootstrap_handoff_test_context(|client| {
-        let mut bootstrap_lock = acquire_bootstrap_lock_for_operation(
+    with_bootstrap_handoff_test_context(|client, fake_ssh| {
+        let mut bootstrap_lock = acquire_bootstrap_lock_for_operation_with_ssh(
             "crash-window-host",
             "fake-ssh-host",
             "completed-handoff-before-controller-loss".to_string(),
             bootstrap_lock::OperationKind::MissingDaemonRepair,
+            fake_ssh,
         )
         .expect("acquire the initial bootstrap lock");
         bootstrap_lock
@@ -799,11 +803,12 @@ fn completed_bootstrap_handoff_commit_allows_recovery_after_controller_loss() {
         // Losing the Controller channel before RELEASE must reconcile the exact
         // completed attempt instead of leaving the remote fence permanently busy.
         drop(bootstrap_lock);
-        let mut recovered_lock = acquire_bootstrap_lock_for_operation(
+        let mut recovered_lock = acquire_bootstrap_lock_for_operation_with_ssh(
             "crash-window-host",
             "fake-ssh-host",
             "controller-after-completed-handoff".to_string(),
             bootstrap_lock::OperationKind::MissingDaemonRepair,
+            fake_ssh,
         )
         .expect("a new Controller can acquire after the completed handoff");
         recovered_lock
@@ -815,12 +820,13 @@ fn completed_bootstrap_handoff_commit_allows_recovery_after_controller_loss() {
 #[cfg(unix)]
 #[test]
 fn successful_bootstrap_handoff_release_does_not_repeat_the_completion_commit() {
-    with_bootstrap_handoff_test_context(|client| {
-        let mut bootstrap_lock = acquire_bootstrap_lock_for_operation(
+    with_bootstrap_handoff_test_context(|client, fake_ssh| {
+        let mut bootstrap_lock = acquire_bootstrap_lock_for_operation_with_ssh(
             "successful-release-host",
             "fake-ssh-host",
             "completed-handoff-before-release".to_string(),
             bootstrap_lock::OperationKind::MissingDaemonRepair,
+            fake_ssh,
         )
         .expect("acquire the bootstrap lock");
         bootstrap_lock
@@ -832,11 +838,12 @@ fn successful_bootstrap_handoff_release_does_not_repeat_the_completion_commit() 
             .release_committed_handoff()
             .expect("release without committing the completion attempt twice");
 
-        let mut next_lock = acquire_bootstrap_lock_for_operation(
+        let mut next_lock = acquire_bootstrap_lock_for_operation_with_ssh(
             "successful-release-host",
             "fake-ssh-host",
             "controller-after-successful-release".to_string(),
             bootstrap_lock::OperationKind::MissingDaemonRepair,
+            fake_ssh,
         )
         .expect("successful release removes the prior claim");
         next_lock
@@ -848,7 +855,7 @@ fn successful_bootstrap_handoff_release_does_not_repeat_the_completion_commit() 
 #[cfg(unix)]
 #[test]
 fn prior_mutation_commit_precedes_maintenance_handoff_begin_for_both_phase_shapes() {
-    with_bootstrap_handoff_test_context(|client| {
+    with_bootstrap_handoff_test_context(|client, fake_ssh| {
         for (phase, operation_id) in [
             ("daemon_start", "ordered-daemon-start"),
             (
@@ -856,11 +863,12 @@ fn prior_mutation_commit_precedes_maintenance_handoff_begin_for_both_phase_shape
                 "ordered-durable-token-verification",
             ),
         ] {
-            let mut bootstrap_lock = acquire_bootstrap_lock_for_operation(
+            let mut bootstrap_lock = acquire_bootstrap_lock_for_operation_with_ssh(
                 "ordered-handoff-host",
                 "fake-ssh-host",
                 operation_id.to_string(),
                 bootstrap_lock::OperationKind::MissingDaemonRepair,
+                fake_ssh,
             )
             .expect("acquire the bootstrap lock");
             bootstrap_lock
@@ -898,7 +906,7 @@ fn prior_mutation_commit_precedes_maintenance_handoff_begin_for_both_phase_shape
 #[cfg(unix)]
 #[test]
 fn committed_prior_mutation_recovers_after_controller_loss_for_both_phase_shapes() {
-    with_bootstrap_handoff_test_context(|_| {
+    with_bootstrap_handoff_test_context(|_, fake_ssh| {
         for (phase, operation_id) in [
             ("daemon_start", "lost-after-committed-daemon-start"),
             (
@@ -906,11 +914,12 @@ fn committed_prior_mutation_recovers_after_controller_loss_for_both_phase_shapes
                 "lost-after-committed-durable-verification",
             ),
         ] {
-            let mut bootstrap_lock = acquire_bootstrap_lock_for_operation(
+            let mut bootstrap_lock = acquire_bootstrap_lock_for_operation_with_ssh(
                 "prior-commit-recovery-host",
                 "fake-ssh-host",
                 operation_id.to_string(),
                 bootstrap_lock::OperationKind::MissingDaemonRepair,
+                fake_ssh,
             )
             .expect("acquire the bootstrap lock");
             bootstrap_lock
@@ -921,11 +930,12 @@ fn committed_prior_mutation_recovers_after_controller_loss_for_both_phase_shapes
                 .expect("commit the verified prior mutation");
             drop(bootstrap_lock);
 
-            let mut recovered_lock = acquire_bootstrap_lock_for_operation(
+            let mut recovered_lock = acquire_bootstrap_lock_for_operation_with_ssh(
                 "prior-commit-recovery-host",
                 "fake-ssh-host",
                 format!("controller-after-{operation_id}"),
                 bootstrap_lock::OperationKind::MissingDaemonRepair,
+                fake_ssh,
             )
             .expect("a new Controller can acquire after committed controller loss");
             recovered_lock

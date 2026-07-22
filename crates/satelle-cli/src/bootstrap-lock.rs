@@ -234,7 +234,8 @@ foreach ($item in @(Get-ChildItem -LiteralPath $lockRoot -Force -ErrorAction Sto
   }}
   $requiresCommit = $mutationPhase -in @('daemon_start', 'durable_token_verification', 'maintenance_handoff_begin', 'maintenance_handoff_complete')
   if (($processActive -or $serviceActive -or $daemonActive) -and
-      -not ($claimState -ne 'live' -and $requiresCommit -and $executionCommitted)) {{ Fail-Busy }}
+      ($claimState -ne 'live') -and
+      -not ($requiresCommit -and $executionCommitted)) {{ Fail-Busy }}
   Record-Recovery $observed 'stale heartbeat postcondition probes' $processActive $binaryPresent $serviceActive $daemonActive
   $reconciled = ($claimState -ceq 'live') -or (-not $executionStarted) -or
     ($requiresCommit -and $executionCommitted) -or
@@ -522,7 +523,9 @@ for competitor in "$lock_root"/*; do
   requires_commit=false
   case "$mutation_phase" in daemon_start|durable_token_verification|maintenance_handoff_begin|maintenance_handoff_complete) requires_commit=true;; esac
   if [ "$process_active" = true ] || [ "$service_active" = true ] || [ "$daemon_active" = true ]; then
-    if [ "$claim_state" = live ] || [ "$requires_commit" = false ] || [ "$execution_committed" = false ]; then busy; fi
+    if [ "$claim_state" != live ]; then
+      if [ "$requires_commit" = false ] || [ "$execution_committed" = false ]; then busy; fi
+    fi
   fi
   record_recovery "$observed" "$process_active" "$binary_present" "$service_active" "$daemon_active"
   reconciled=false
@@ -823,6 +826,8 @@ mod tests {
             "execution_started.",
             "execution_succeeded.",
             "execution_committed.",
+            "($claimState -ne 'live')",
+            "-not ($requiresCommit -and $executionCommitted)",
             "Finalize-InterruptedClaim",
             "recovery_pending",
             "clean_failed",
@@ -890,16 +895,27 @@ mod tests {
     #[cfg(unix)]
     impl RunningProtocol {
         fn start(request: &Request, state_home: &std::path::Path) -> Self {
-            let mut child = Command::new("sh")
+            Self::start_with_path(request, state_home, None)
+        }
+
+        fn start_with_path(
+            request: &Request,
+            state_home: &std::path::Path,
+            path: Option<&std::ffi::OsStr>,
+        ) -> Self {
+            let mut command = Command::new("sh");
+            command
                 .arg("-c")
                 .arg(request.posix_script())
                 .env("XDG_STATE_HOME", state_home)
                 .env("XDG_CACHE_HOME", state_home.join("cache"))
                 .stdin(Stdio::piped())
                 .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .spawn()
-                .expect("spawn Bootstrap Lock protocol");
+                .stderr(Stdio::piped());
+            if let Some(path) = path {
+                command.env("PATH", path);
+            }
+            let mut child = command.spawn().expect("spawn Bootstrap Lock protocol");
             let stdin = child.stdin.take().expect("piped stdin");
             let stdout = BufReader::new(child.stdout.take().expect("piped stdout"));
             Self {
@@ -948,6 +964,23 @@ mod tests {
         );
         assert!(basename.starts_with("claim."));
         assert!(!basename.ends_with(".closing"));
+    }
+
+    #[cfg(unix)]
+    fn path_with_active_daemon_probe(root: &std::path::Path) -> std::ffi::OsString {
+        let bin = root.join("probe-bin");
+        fs::create_dir(&bin).expect("create probe bin");
+        let curl = bin.join("curl");
+        fs::write(&curl, "#!/bin/sh\nprintf '200'\n").expect("write daemon probe");
+        let mut permissions = fs::metadata(&curl)
+            .expect("daemon probe metadata")
+            .permissions();
+        permissions.set_mode(0o700);
+        fs::set_permissions(&curl, permissions).expect("make daemon probe executable");
+
+        let inherited = std::env::var_os("PATH").unwrap_or_default();
+        std::env::join_paths(std::iter::once(bin).chain(std::env::split_paths(&inherited)))
+            .expect("prepend daemon probe to PATH")
     }
 
     #[cfg(unix)]
@@ -1073,6 +1106,74 @@ mod tests {
 
         replacement.exchange(RELEASE);
         assert!(replacement.close().success());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn active_daemon_allows_clean_stale_claim_recovery_but_fences_started_claim() {
+        let clean_home = tempfile::tempdir().expect("temporary clean state home");
+        let clean_root = clean_home.path().join("satelle");
+        let clean_lock = clean_root.join("bootstrap.lock");
+        write_claim(
+            &clean_lock.join("claim.operation-1.stale"),
+            "operation-1",
+            "2000-01-01T00:00:00Z",
+            "live",
+        );
+        let active_probe_path = path_with_active_daemon_probe(clean_home.path());
+        let replacement_request =
+            Request::new("operation-2", OperationKind::MissingDaemonRepair, None)
+                .expect("valid replacement");
+        let mut replacement = RunningProtocol::start_with_path(
+            &replacement_request,
+            clean_home.path(),
+            Some(&active_probe_path),
+        );
+        assert_ready_line(&replacement.read_line());
+        assert!(
+            fs::read_to_string(clean_root.join("bootstrap-recovery-operation-1.json"))
+                .expect("clean stale recovery record")
+                .contains("\"daemon_probe\":true")
+        );
+        replacement.exchange(RELEASE);
+        assert!(replacement.close().success());
+
+        let started_home = tempfile::tempdir().expect("temporary started state home");
+        let started_lock = started_home.path().join("satelle/bootstrap.lock");
+        let started_claim = started_lock.join("claim.operation-1.stale");
+        let attempt = "0123456789abcdef0123456789abcdef";
+        write_claim(
+            &started_claim,
+            "operation-1",
+            "2000-01-01T00:00:00Z",
+            "mutation_started",
+        );
+        fs::write(
+            started_claim.join("operation_kind"),
+            "missing_daemon_repair\n",
+        )
+        .expect("write operation kind");
+        fs::write(started_claim.join("mutation_phase"), "cache_promotion\n")
+            .expect("write mutation phase");
+        fs::write(
+            started_claim.join("mutation_attempt"),
+            format!("{attempt}\n"),
+        )
+        .expect("write mutation attempt");
+        let active_probe_path = path_with_active_daemon_probe(started_home.path());
+        let mut contender = RunningProtocol::start_with_path(
+            &replacement_request,
+            started_home.path(),
+            Some(&active_probe_path),
+        );
+        assert_eq!(contender.read_line(), BUSY);
+        assert_eq!(contender.close().code(), Some(75));
+        assert_eq!(
+            fs::read_to_string(only_claim(&started_lock).join("operation_id"))
+                .expect("started claim remains fenced")
+                .trim(),
+            "operation-1"
+        );
     }
 
     #[cfg(unix)]
