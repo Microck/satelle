@@ -1966,6 +1966,43 @@ fn commit_verified_bootstrap_mutation(
         .map_err(|_| SatelleError::host_unreachable(host))
 }
 
+fn bootstrap_maintenance_rejection_precedes_mutation(error: &DaemonClientError) -> bool {
+    let DaemonClientError::Api { status, error } = error else {
+        return false;
+    };
+    matches!(
+        (status.as_u16(), error.code()),
+        (401, ApiErrorCode::AuthenticationFailed)
+            | (403, ApiErrorCode::AuthorizationInsufficientScope)
+            | (409, ApiErrorCode::HostIdentityMismatch)
+            | (400 | 408, ApiErrorCode::InvalidRequest)
+            | (413, ApiErrorCode::PayloadTooLarge)
+            | (426, ApiErrorCode::IncompatibleProtocol)
+            | (429, ApiErrorCode::RateLimited)
+    )
+}
+
+fn reconcile_bootstrap_maintenance_response<T>(
+    host: &str,
+    response: Result<T, DaemonClientError>,
+    bootstrap_lock: &mut ssh_bootstrap::SshBootstrapLock,
+) -> Result<T, SatelleError> {
+    match response {
+        Ok(response) => Ok(response),
+        Err(error) => {
+            // These exact status/code pairs are emitted only before the
+            // maintenance handler reaches its ledger mutation. Commit the
+            // known nonmutation outcome so lock recovery can close this exact
+            // attempt. Every transport, response, and handler error remains
+            // uncommitted because its mutation outcome is not proven.
+            if bootstrap_maintenance_rejection_precedes_mutation(&error) {
+                commit_verified_bootstrap_mutation(host, bootstrap_lock)?;
+            }
+            Err(direct_transport_error(host, error))
+        }
+    }
+}
+
 fn complete_bootstrap_handoff(
     host: &str,
     client: &DaemonClient,
@@ -1974,12 +2011,14 @@ fn complete_bootstrap_handoff(
     bootstrap_lock
         .mark_mutation_started("maintenance_handoff_begin")
         .map_err(|_| SatelleError::host_unreachable(host))?;
-    let begun = client
-        .begin_bootstrap_maintenance(
+    let begun = reconcile_bootstrap_maintenance_response(
+        host,
+        client.begin_bootstrap_maintenance(
             bootstrap_lock.operation_id(),
             bootstrap_lock.operation_kind().as_str(),
-        )
-        .map_err(|error| direct_transport_error(host, error))?;
+        ),
+        bootstrap_lock,
+    )?;
     if !begun.reconciled() || begun.operation_id() != bootstrap_lock.operation_id() {
         return Err(SatelleError::remote_api_error(
             host,
@@ -1992,9 +2031,11 @@ fn complete_bootstrap_handoff(
     bootstrap_lock
         .mark_mutation_started("maintenance_handoff_complete")
         .map_err(|_| SatelleError::host_unreachable(host))?;
-    let handoff = client
-        .complete_bootstrap_maintenance(bootstrap_lock.operation_id())
-        .map_err(|error| direct_transport_error(host, error))?;
+    let handoff = reconcile_bootstrap_maintenance_response(
+        host,
+        client.complete_bootstrap_maintenance(bootstrap_lock.operation_id()),
+        bootstrap_lock,
+    )?;
     if !handoff.reconciled() || handoff.operation_id() != bootstrap_lock.operation_id() {
         return Err(SatelleError::remote_api_error(
             host,

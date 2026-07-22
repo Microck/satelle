@@ -698,7 +698,7 @@ fn durable_verification_and_bootstrap_handoff_use_distinct_clients() {
 #[cfg(unix)]
 #[test]
 fn reusable_setup_token_keeps_the_healthy_durable_daemon_running_without_bootstrap() {
-    with_bootstrap_handoff_test_context(|_, fake_ssh, _, _| {
+    with_bootstrap_handoff_test_context(|_, fake_ssh, _, _, _| {
         let state = TestStateDir::new().expect("temporary durable state directory");
         let service = HostService::local_demo_for_tests_at(state.path())
             .expect("construct durable Host service");
@@ -790,7 +790,7 @@ fn reusable_setup_token_keeps_the_healthy_durable_daemon_running_without_bootstr
 #[cfg(unix)]
 #[test]
 fn authentication_rejected_by_live_daemon_enters_bootstrap_fallback() {
-    with_bootstrap_handoff_test_context(|bootstrap_client, fake_ssh, _, _| {
+    with_bootstrap_handoff_test_context(|bootstrap_client, fake_ssh, _, _, _| {
         let state = TestStateDir::new().expect("temporary durable state directory");
         let service = HostService::local_demo_for_tests_at(state.path())
             .expect("construct durable Host service");
@@ -866,7 +866,7 @@ fn authentication_rejected_by_live_daemon_enters_bootstrap_fallback() {
 #[cfg(unix)]
 #[test]
 fn durable_confirmation_transport_failure_falls_back_without_open_mutation() {
-    with_bootstrap_handoff_test_context(|bootstrap_client, fake_ssh, _, _| {
+    with_bootstrap_handoff_test_context(|bootstrap_client, fake_ssh, _, _, _| {
         let transport =
             SshSetupTransport::new(&ssh_setup_host(None)).expect("construct SSH setup transport");
         let unavailable_listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
@@ -951,7 +951,7 @@ fn acquire_bootstrap_lock_for_operation_with_ssh(
 
 #[cfg(unix)]
 fn with_bootstrap_handoff_test_context(
-    test: impl FnOnce(&DaemonClient, &std::path::Path, SocketAddr, &str),
+    test: impl FnOnce(&DaemonClient, &std::path::Path, SocketAddr, &str, &HostService),
 ) {
     use std::os::unix::fs::PermissionsExt as _;
 
@@ -966,6 +966,7 @@ fn with_bootstrap_handoff_test_context(
         );
     let initialized = service.initialize_daemon().expect("initialize Host state");
     let host_identity = initialized.host_identity().to_string();
+    let ledger = service.clone();
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
         .enable_all()
@@ -1005,7 +1006,13 @@ esac
     permissions.set_mode(0o700);
     std::fs::set_permissions(&fake_ssh, permissions).expect("make fake SSH executable");
 
-    test(&client, &fake_ssh, server.local_addr(), &host_identity);
+    test(
+        &client,
+        &fake_ssh,
+        server.local_addr(),
+        &host_identity,
+        &ledger,
+    );
 
     drop(server);
 }
@@ -1014,7 +1021,7 @@ esac
 #[test]
 fn rejected_durable_token_is_reported_after_launched_daemon_handoff_is_terminal() {
     with_bootstrap_handoff_test_context(
-        |bootstrap_client, fake_ssh, daemon_address, host_identity| {
+        |bootstrap_client, fake_ssh, daemon_address, host_identity, _| {
             let durable_client = DaemonClient::loopback(
                 daemon_address,
                 ApiBearerToken::generate().expect("generate valid unissued durable token"),
@@ -1085,8 +1092,281 @@ fn rejected_durable_token_is_reported_after_launched_daemon_handoff_is_terminal(
 
 #[cfg(unix)]
 #[test]
+fn prehandler_handoff_rejection_is_terminal_without_mutating_the_ledger() {
+    with_bootstrap_handoff_test_context(|_, fake_ssh, _, _, _| {
+        let daemon_state = TestStateDir::new().expect("temporary rejected daemon state");
+        let service = HostService::local_demo_for_tests_at(daemon_state.path())
+            .expect("construct rejected Host service");
+        let initialized = service.initialize_daemon().expect("initialize Host state");
+        let host_identity = initialized.host_identity().to_string();
+        let ledger = service.clone();
+        let (_runtime, server) = spawn_loopback_daemon(service);
+        let rejected_client = DaemonClient::loopback(
+            server.local_addr(),
+            ApiBearerToken::generate().expect("generate unissued bootstrap token"),
+            &host_identity,
+        )
+        .expect("construct rejected bootstrap client");
+        let operation_id = "prehandler-rejected-handoff";
+        let mut bootstrap_lock = acquire_bootstrap_lock_for_operation_with_ssh(
+            "prehandler-rejected-host",
+            "fake-ssh-host",
+            operation_id.to_string(),
+            bootstrap_lock::OperationKind::MissingDaemonRepair,
+            fake_ssh,
+        )
+        .expect("acquire bootstrap lock");
+        bootstrap_lock
+            .mark_mutation_started("daemon_start")
+            .expect("record verified daemon start");
+        commit_verified_bootstrap_mutation("prehandler-rejected-host", &mut bootstrap_lock)
+            .expect("commit verified daemon start");
+
+        let error = complete_bootstrap_handoff(
+            "prehandler-rejected-host",
+            &rejected_client,
+            &mut bootstrap_lock,
+        )
+        .expect_err("authentication middleware rejects the handoff");
+
+        assert_eq!(error.code, ErrorCode::AuthenticationFailed);
+        assert!(
+            ledger
+                .load_setup_run(operation_id)
+                .expect("read maintenance ledger")
+                .is_none(),
+            "pre-handler rejection must not create a maintenance run"
+        );
+        let begin_commit = format!(
+            "{} maintenance_handoff_begin ",
+            bootstrap_lock::MUTATION_COMMITTED
+        );
+        assert_eq!(
+            bootstrap_lock
+                .exchanged_lock_lines()
+                .iter()
+                .filter(|line| line.starts_with(&begin_commit))
+                .count(),
+            1,
+            "the exact rejected attempt must have one terminal owner"
+        );
+        assert!(
+            bootstrap_lock
+                .exchanged_lock_lines()
+                .iter()
+                .all(|line| !line.contains("maintenance_handoff_complete")),
+            "begin rejection must not open the complete phase"
+        );
+        drop(bootstrap_lock);
+
+        let lock_state_root = fake_ssh
+            .parent()
+            .and_then(std::path::Path::parent)
+            .expect("fake SSH state root");
+        let terminal = std::fs::read_to_string(
+            lock_state_root.join(format!("bootstrap-operation-{operation_id}.json")),
+        )
+        .expect("read rejected handoff terminal record");
+        assert!(terminal.contains("\"terminal_state\":\"reconciled_failed\""));
+        let mut recovered_lock = acquire_bootstrap_lock_for_operation_with_ssh(
+            "prehandler-rejected-host",
+            "fake-ssh-host",
+            "controller-after-prehandler-rejection".to_string(),
+            bootstrap_lock::OperationKind::MissingDaemonRepair,
+            fake_ssh,
+        )
+        .expect("a new Controller acquires immediately after definite rejection");
+        recovered_lock
+            .release_unmodified()
+            .expect("release recovered bootstrap lock");
+
+        drop(server);
+    });
+}
+
+#[cfg(unix)]
+#[test]
+fn prehandler_complete_rejection_does_not_complete_the_maintenance_ledger() {
+    with_bootstrap_handoff_test_context(
+        |bootstrap_client, fake_ssh, daemon_address, host_identity, ledger| {
+            let rejected_client = DaemonClient::loopback(
+                daemon_address,
+                ApiBearerToken::generate().expect("generate unissued completion token"),
+                host_identity,
+            )
+            .expect("construct rejected completion client");
+            let operation_id = "prehandler-rejected-completion";
+            let mut bootstrap_lock = acquire_bootstrap_lock_for_operation_with_ssh(
+                "prehandler-complete-host",
+                "fake-ssh-host",
+                operation_id.to_string(),
+                bootstrap_lock::OperationKind::MissingDaemonRepair,
+                fake_ssh,
+            )
+            .expect("acquire bootstrap lock");
+            bootstrap_lock
+                .mark_mutation_started("daemon_start")
+                .expect("record verified daemon start");
+            commit_verified_bootstrap_mutation("prehandler-complete-host", &mut bootstrap_lock)
+                .expect("commit verified daemon start");
+            bootstrap_lock
+                .mark_mutation_started("maintenance_handoff_begin")
+                .expect("record maintenance begin");
+            let begun = bootstrap_client
+                .begin_bootstrap_maintenance(operation_id, "missing_daemon_repair")
+                .expect("authorized client begins maintenance");
+            assert!(begun.reconciled());
+            commit_verified_bootstrap_mutation("prehandler-complete-host", &mut bootstrap_lock)
+                .expect("commit accepted maintenance begin");
+            bootstrap_lock
+                .mark_mutation_started("maintenance_handoff_complete")
+                .expect("record maintenance completion");
+
+            let completion = rejected_client.complete_bootstrap_maintenance(operation_id);
+            let error = reconcile_bootstrap_maintenance_response(
+                "prehandler-complete-host",
+                completion,
+                &mut bootstrap_lock,
+            )
+            .expect_err("authentication middleware rejects completion");
+
+            assert_eq!(error.code, ErrorCode::AuthenticationFailed);
+            assert_eq!(
+                ledger
+                    .load_setup_run(operation_id)
+                    .expect("read maintenance ledger")
+                    .expect("maintenance run remains present")
+                    .status(),
+                satelle_host::SetupRunStatus::Running,
+                "pre-handler rejection must not complete the maintenance run"
+            );
+            let completion_commit = format!(
+                "{} maintenance_handoff_complete ",
+                bootstrap_lock::MUTATION_COMMITTED
+            );
+            assert_eq!(
+                bootstrap_lock
+                    .exchanged_lock_lines()
+                    .iter()
+                    .filter(|line| line.starts_with(&completion_commit))
+                    .count(),
+                1,
+                "the exact rejected completion has one terminal owner"
+            );
+            drop(bootstrap_lock);
+
+            let mut recovered_lock = acquire_bootstrap_lock_for_operation_with_ssh(
+                "prehandler-complete-host",
+                "fake-ssh-host",
+                "controller-after-prehandler-complete-rejection".to_string(),
+                bootstrap_lock::OperationKind::MissingDaemonRepair,
+                fake_ssh,
+            )
+            .expect("a new Controller acquires after definite completion rejection");
+            recovered_lock
+                .release_unmodified()
+                .expect("release recovered bootstrap lock");
+        },
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn handoff_transport_uncertainty_remains_recovery_pending_and_fenced() {
+    with_bootstrap_handoff_test_context(|_, fake_ssh, _, _, _| {
+        assert!(
+            !bootstrap_maintenance_rejection_precedes_mutation(
+                &DaemonClientError::ResponseContractViolation
+            ),
+            "response-contract uncertainty must not be treated as pre-handler rejection"
+        );
+        let unavailable_listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .expect("reserve unavailable handoff address");
+        let unavailable_address = unavailable_listener
+            .local_addr()
+            .expect("read unavailable handoff address");
+        drop(unavailable_listener);
+        let unavailable_client = DaemonClient::loopback_with_timeout(
+            unavailable_address,
+            ApiBearerToken::generate().expect("generate unavailable bootstrap token"),
+            "unavailable-handoff-host-identity",
+            Duration::from_secs(1),
+        )
+        .expect("construct unavailable bootstrap client");
+        let operation_id = "uncertain-handoff-transport";
+        let mut bootstrap_lock = acquire_bootstrap_lock_for_operation_with_ssh(
+            "uncertain-handoff-host",
+            "fake-ssh-host",
+            operation_id.to_string(),
+            bootstrap_lock::OperationKind::MissingDaemonRepair,
+            fake_ssh,
+        )
+        .expect("acquire bootstrap lock");
+        bootstrap_lock
+            .mark_mutation_started("daemon_start")
+            .expect("record verified daemon start");
+        commit_verified_bootstrap_mutation("uncertain-handoff-host", &mut bootstrap_lock)
+            .expect("commit verified daemon start");
+
+        let error = complete_bootstrap_handoff(
+            "uncertain-handoff-host",
+            &unavailable_client,
+            &mut bootstrap_lock,
+        )
+        .expect_err("transport loss leaves the handoff outcome uncertain");
+
+        assert_eq!(error.code, ErrorCode::HostUnreachable);
+        let begin_commit = format!(
+            "{} maintenance_handoff_begin ",
+            bootstrap_lock::MUTATION_COMMITTED
+        );
+        assert!(
+            bootstrap_lock
+                .exchanged_lock_lines()
+                .iter()
+                .all(|line| !line.starts_with(&begin_commit)),
+            "transport uncertainty must not be committed"
+        );
+        drop(bootstrap_lock);
+
+        let lock_root = fake_ssh
+            .parent()
+            .and_then(std::path::Path::parent)
+            .expect("fake SSH state root")
+            .join("bootstrap.lock");
+        let claim = std::fs::read_dir(&lock_root)
+            .expect("read bootstrap lock root")
+            .map(|entry| entry.expect("read bootstrap claim").path())
+            .find(|path| {
+                path.file_name()
+                    .and_then(std::ffi::OsStr::to_str)
+                    .is_some_and(|name| name.starts_with("claim."))
+            })
+            .expect("uncertain claim remains");
+        assert_eq!(
+            std::fs::read_to_string(claim.join("state"))
+                .expect("read uncertain claim state")
+                .trim(),
+            "recovery_pending"
+        );
+        let contender = acquire_bootstrap_lock_for_operation_with_ssh(
+            "uncertain-handoff-host",
+            "fake-ssh-host",
+            "controller-during-uncertain-handoff".to_string(),
+            bootstrap_lock::OperationKind::MissingDaemonRepair,
+            fake_ssh,
+        );
+        let Err(contender) = contender else {
+            panic!("a new Controller must remain fenced from an uncertain handoff");
+        };
+        assert_eq!(contender.code, ErrorCode::BootstrapBusy);
+    });
+}
+
+#[cfg(unix)]
+#[test]
 fn completed_bootstrap_handoff_commit_allows_recovery_after_controller_loss() {
-    with_bootstrap_handoff_test_context(|client, fake_ssh, _, _| {
+    with_bootstrap_handoff_test_context(|client, fake_ssh, _, _, _| {
         let mut bootstrap_lock = acquire_bootstrap_lock_for_operation_with_ssh(
             "crash-window-host",
             "fake-ssh-host",
@@ -1123,7 +1403,7 @@ fn completed_bootstrap_handoff_commit_allows_recovery_after_controller_loss() {
 #[cfg(unix)]
 #[test]
 fn successful_bootstrap_handoff_release_does_not_repeat_the_completion_commit() {
-    with_bootstrap_handoff_test_context(|client, fake_ssh, _, _| {
+    with_bootstrap_handoff_test_context(|client, fake_ssh, _, _, _| {
         let mut bootstrap_lock = acquire_bootstrap_lock_for_operation_with_ssh(
             "successful-release-host",
             "fake-ssh-host",
@@ -1173,7 +1453,7 @@ fn successful_bootstrap_handoff_release_does_not_repeat_the_completion_commit() 
 #[cfg(unix)]
 #[test]
 fn prior_mutation_commit_precedes_maintenance_handoff_begin_for_both_phase_shapes() {
-    with_bootstrap_handoff_test_context(|client, fake_ssh, _, _| {
+    with_bootstrap_handoff_test_context(|client, fake_ssh, _, _, _| {
         for (phase, operation_id) in [
             ("daemon_start", "ordered-daemon-start"),
             (
@@ -1235,7 +1515,7 @@ fn prior_mutation_commit_precedes_maintenance_handoff_begin_for_both_phase_shape
 #[cfg(unix)]
 #[test]
 fn committed_prior_mutation_recovers_after_controller_loss_for_both_phase_shapes() {
-    with_bootstrap_handoff_test_context(|_, fake_ssh, _, _| {
+    with_bootstrap_handoff_test_context(|_, fake_ssh, _, _, _| {
         for (phase, operation_id) in [
             ("daemon_start", "lost-after-committed-daemon-start"),
             (
