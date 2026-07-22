@@ -1,14 +1,14 @@
 use super::auth::AuthorizedRequest;
 use super::{ApiFailure, DaemonState, api_error_response, authenticated_json_response, host_error};
 use crate::contract::{
-    ApiErrorCategory, ApiErrorCode, DURABLE_SETUP_PENDING_TTL, DurableTokenActivationResponse,
-    DurableTokenConfirmationResponse, DurableTokenIssuanceResponse,
+    ApiErrorCategory, ApiErrorCode, BootstrapMaintenanceResponse, DURABLE_SETUP_PENDING_TTL,
+    DurableTokenActivationResponse, DurableTokenConfirmationResponse, DurableTokenIssuanceResponse,
 };
 use axum::extract::{Extension, Path, State};
 use axum::http::StatusCode;
 use axum::response::Response;
 use satelle_core::SatelleError;
-use satelle_host::{ApiScopes, MutationAuthority};
+use satelle_host::{ApiScopes, MutationAuthority, SetupOperationKind};
 use std::sync::Arc;
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
@@ -36,6 +36,76 @@ enum SetupTokenMutationOutcome {
     Conflict,
     HostError(SatelleError),
     TaskFailure,
+}
+
+pub(super) async fn complete_bootstrap_maintenance(
+    State(state): State<Arc<DaemonState>>,
+    Extension(authorized): Extension<AuthorizedRequest>,
+    Path(operation_id): Path<String>,
+) -> Response {
+    if !bootstrap_maintenance_principal_is_authorized(&authorized) {
+        return bootstrap_maintenance_principal_required(&state, &authorized);
+    }
+    let service = Arc::clone(&state.service);
+    let operation = operation_id.clone();
+    match tokio::task::spawn_blocking(move || service.complete_bootstrap_maintenance(&operation))
+        .await
+    {
+        Ok(Ok(())) => authenticated_json_response(
+            StatusCode::OK,
+            &BootstrapMaintenanceResponse::new(
+                authorized.request_id().clone(),
+                state.host_identity.clone(),
+                operation_id,
+            ),
+            authorized.request_id(),
+            &state.host_identity,
+        ),
+        Ok(Err(error)) => host_error::response(&state, &authorized, &error),
+        Err(_) => host_error::task_failure(&state, &authorized),
+    }
+}
+
+pub(super) async fn begin_bootstrap_maintenance(
+    State(state): State<Arc<DaemonState>>,
+    Extension(authorized): Extension<AuthorizedRequest>,
+    Path((operation_id, operation_kind)): Path<(String, String)>,
+) -> Response {
+    if !bootstrap_maintenance_principal_is_authorized(&authorized) {
+        return bootstrap_maintenance_principal_required(&state, &authorized);
+    }
+    let operation_kind = match operation_kind.as_str() {
+        "initial_setup" => SetupOperationKind::Setup,
+        "missing_daemon_repair" => SetupOperationKind::Repair,
+        "host_binary_replacement" => SetupOperationKind::HostUpdate,
+        _ => {
+            return host_error::response(
+                &state,
+                &authorized,
+                &SatelleError::invalid_usage("invalid Bootstrap Lock operation kind"),
+            );
+        }
+    };
+    let service = Arc::clone(&state.service);
+    let operation = operation_id.clone();
+    match tokio::task::spawn_blocking(move || {
+        service.acquire_bootstrap_maintenance(&operation, operation_kind)
+    })
+    .await
+    {
+        Ok(Ok(())) => authenticated_json_response(
+            StatusCode::OK,
+            &BootstrapMaintenanceResponse::new(
+                authorized.request_id().clone(),
+                state.host_identity.clone(),
+                operation_id,
+            ),
+            authorized.request_id(),
+            &state.host_identity,
+        ),
+        Ok(Err(error)) => host_error::response(&state, &authorized, &error),
+        Err(_) => host_error::task_failure(&state, &authorized),
+    }
 }
 
 pub(super) async fn issue_api_token(
@@ -274,6 +344,24 @@ fn bootstrap_required(state: &DaemonState, authorized: &AuthorizedRequest) -> Re
     )
 }
 
+fn bootstrap_maintenance_principal_required(
+    state: &DaemonState,
+    authorized: &AuthorizedRequest,
+) -> Response {
+    api_error_response(
+        authorized.request_id().clone(),
+        Some(state.host_identity.clone()),
+        ApiFailure {
+            status: StatusCode::FORBIDDEN,
+            code: ApiErrorCode::AuthorizationInsufficientScope,
+            category: ApiErrorCategory::Authorization,
+            retryable: false,
+            message: "bootstrap maintenance requires an SSH bootstrap principal",
+            details: None,
+        },
+    )
+}
+
 fn durable_setup_credential_required(
     state: &DaemonState,
     authorized: &AuthorizedRequest,
@@ -295,6 +383,13 @@ fn durable_setup_credential_required(
 fn setup_principal_is_authorized(authorized: &AuthorizedRequest) -> bool {
     authorized.principal().is_ssh_bootstrap()
         && authorized.principal().scopes().allows(ApiScopes::ADMIN)
+}
+
+// Bootstrap maintenance is an internal handoff capability, not part of the
+// public Read/Control/Admin hierarchy. A process-local SSH bootstrap principal
+// needs it even when the daemon exposes only read operations to that client.
+fn bootstrap_maintenance_principal_is_authorized(authorized: &AuthorizedRequest) -> bool {
+    authorized.principal().is_ssh_bootstrap()
 }
 
 fn setup_principal_can_activate(authorized: &AuthorizedRequest, token_id: &str) -> bool {

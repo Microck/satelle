@@ -1550,3 +1550,119 @@ fn repair_uses_each_actions_most_recent_retained_ledger_entry() {
         repair.actions()[0].previous_status()
     );
 }
+
+#[test]
+fn bootstrap_begin_rolls_back_run_action_and_lease_when_action_start_fails() {
+    let state = TempDir::new().expect("temporary state directory");
+    let (mut storage, _) = Storage::open(state.path()).expect("open storage");
+    storage
+        .connection_for_test()
+        .execute_batch(
+            "CREATE TRIGGER fail_bootstrap_action_start
+             BEFORE UPDATE OF status ON setup_actions
+             WHEN NEW.run_id = 'bootstrap-begin-rollback' AND NEW.status = 'started'
+             BEGIN SELECT RAISE(ABORT, 'forced bootstrap action start failure'); END;",
+        )
+        .unwrap();
+    let plan = SetupRunPlan::new(
+        "bootstrap-begin-rollback",
+        SetupOperationKind::Repair,
+        None,
+        at(1),
+        vec![SetupActionPlan::new("bootstrap-handoff", "Bootstrap Lock handoff", true).unwrap()],
+    )
+    .unwrap();
+
+    storage
+        .begin_bootstrap_maintenance(&plan, maintenance_owner(plan.run_id(), plan.started_at()))
+        .expect_err("action-start failure must roll back the whole bootstrap acquisition");
+
+    for table in ["setup_runs", "setup_actions", "maintenance_leases"] {
+        let count: i64 = storage
+            .connection_for_test()
+            .query_row(&format!("SELECT count(*) FROM {table}"), [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(0, count, "bootstrap acquisition left rows in {table}");
+    }
+}
+
+#[test]
+fn bootstrap_completion_delete_failure_rolls_back_action_run_and_lease() {
+    let state = TempDir::new().expect("temporary state directory");
+    let (mut storage, _) = Storage::open(state.path()).expect("open storage");
+    let plan = SetupRunPlan::new(
+        "bootstrap-complete-rollback",
+        SetupOperationKind::Repair,
+        None,
+        at(1),
+        vec![SetupActionPlan::new("bootstrap-handoff", "Bootstrap Lock handoff", true).unwrap()],
+    )
+    .unwrap();
+    let capability = storage
+        .begin_bootstrap_maintenance(&plan, maintenance_owner(plan.run_id(), plan.started_at()))
+        .expect("begin bootstrap maintenance");
+    storage
+        .connection_for_test()
+        .execute_batch(
+            "CREATE TRIGGER fail_bootstrap_maintenance_delete
+             BEFORE DELETE ON maintenance_leases
+             BEGIN SELECT RAISE(ABORT, 'forced bootstrap maintenance delete failure'); END;",
+        )
+        .unwrap();
+
+    storage
+        .complete_bootstrap_maintenance(&capability, at(2))
+        .expect_err("lease-delete failure must roll back bootstrap completion");
+
+    let run = storage
+        .load_setup_run(plan.run_id())
+        .unwrap()
+        .expect("bootstrap run remains durable");
+    assert_eq!(SetupRunStatus::Running, run.status());
+    assert_eq!(SetupActionStatus::Started, run.actions()[0].status());
+    assert!(matches!(
+        storage.maintenance_lease_state().unwrap(),
+        Some(crate::storage::MaintenanceLeaseState::Active { operation_id, .. })
+            if operation_id == plan.run_id()
+    ));
+}
+
+#[test]
+fn bootstrap_completion_finalizes_an_already_completed_recovery() {
+    let state = TempDir::new().expect("temporary state directory");
+    let (mut storage, _) = Storage::open(state.path()).expect("open storage");
+    let plan = SetupRunPlan::new(
+        "bootstrap-completed-recovery",
+        SetupOperationKind::HostUpdate,
+        None,
+        at(1),
+        vec![SetupActionPlan::new("bootstrap-handoff", "Bootstrap Lock handoff", true).unwrap()],
+    )
+    .unwrap();
+    let capability = storage
+        .begin_bootstrap_maintenance(&plan, maintenance_owner(plan.run_id(), plan.started_at()))
+        .expect("begin bootstrap maintenance");
+    storage
+        .complete_setup_action_after_verified_postcondition(&capability, "bootstrap-handoff", at(2))
+        .expect("persist action completion before interruption");
+    storage
+        .retain_lease_recovery(capability.lease_owner())
+        .expect("retain interrupted bootstrap ownership");
+    let adopted = storage
+        .adopt_recovery_maintenance(plan.run_id(), maintenance_owner(plan.run_id(), at(3)))
+        .expect("adopt completed bootstrap action");
+
+    storage
+        .complete_bootstrap_maintenance(&adopted, at(4))
+        .expect("atomically finish the recovered completed action");
+
+    let run = storage
+        .load_setup_run(plan.run_id())
+        .unwrap()
+        .expect("completed bootstrap run exists");
+    assert_eq!(SetupRunStatus::Completed, run.status());
+    assert_eq!(SetupActionStatus::Completed, run.actions()[0].status());
+    assert!(storage.maintenance_lease_state().unwrap().is_none());
+}

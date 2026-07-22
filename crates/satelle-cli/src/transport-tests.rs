@@ -15,18 +15,35 @@ use satelle_host::{
 };
 use satelle_transport::{DaemonServer, DaemonServerConfig};
 use std::io::{Read, Write};
+#[cfg(unix)]
+use std::net::TcpStream;
 use std::net::{Ipv4Addr, SocketAddr, TcpListener};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Condvar, Mutex, mpsc};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use tokio_tungstenite::tungstenite::Error as WebSocketError;
 use tokio_tungstenite::tungstenite::error::ProtocolError;
 
 #[derive(Clone)]
 struct RecordingProviderIntentAdapter {
     observed: Arc<Mutex<Option<ProviderComputerUseIntent>>>,
+}
+
+fn spawn_loopback_daemon(service: HostService) -> (tokio::runtime::Runtime, DaemonServer) {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .expect("construct daemon runtime");
+    let server = runtime
+        .block_on(DaemonServer::bind(
+            service,
+            DaemonServerConfig::loopback(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))),
+        ))
+        .expect("bind loopback daemon");
+    (runtime, server)
 }
 
 #[derive(Clone, Default)]
@@ -544,17 +561,7 @@ fn persisted_pending_setup_token_self_activates_on_the_running_daemon() {
         );
     let initialized = service.initialize_daemon().expect("initialize Host state");
     let host_identity = initialized.host_identity().to_string();
-    let runtime = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(2)
-        .enable_all()
-        .build()
-        .expect("construct daemon runtime");
-    let server = runtime
-        .block_on(DaemonServer::bind(
-            service,
-            DaemonServerConfig::loopback(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))),
-        ))
-        .expect("bind loopback daemon");
+    let (_runtime, server) = spawn_loopback_daemon(service);
     let address = server.local_addr();
     let bootstrap_client = DaemonClient::loopback(address, bootstrap_token, &host_identity)
         .expect("construct bootstrap client");
@@ -591,14 +598,15 @@ fn persisted_pending_setup_token_self_activates_on_the_running_daemon() {
         })
     ));
 
-    let verification = verify_durable_setup_token_with_launch(
+    assert_eq!(
+        inspect_durable_setup_token(&pending_client, interrupted_id.as_str())
+            .expect("inspect the persisted pending token"),
+        ExistingTokenInspection::RequiresActivation
+    );
+    let verification = activate_durable_setup_token(
         &pending_client,
         interrupted_id.clone(),
         "interrupted-setup-activate",
-        "remote",
-        || -> Result<(), SatelleError> {
-            panic!("recovery must use the daemon that already owns the state store")
-        },
     )
     .expect("activate the persisted pending token on the running daemon");
     assert_eq!(verification, ExistingTokenVerification::ActivatedPending);
@@ -635,129 +643,1231 @@ fn persisted_pending_setup_token_self_activates_on_the_running_daemon() {
 }
 
 #[test]
-fn durable_verification_relaunches_after_an_established_tunnel_closes() {
-    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("bind loopback test tunnel");
-    let address = listener.local_addr().expect("read loopback test address");
-    let token = ApiBearerToken::generate().expect("generate durable test token");
-    let token_id = token.token_id().to_string();
-    let response_token_id = token_id.clone();
-    let (launch_sender, launch_receiver) = mpsc::channel();
-    let probe_running = Arc::new(AtomicBool::new(false));
-    let server_probe_running = Arc::clone(&probe_running);
-
-    let tunnel = thread::spawn(move || {
-        fn read_request_headers(stream: &mut std::net::TcpStream) -> String {
-            stream
-                .set_read_timeout(Some(Duration::from_secs(2)))
-                .expect("bound request read timeout");
-            let mut request = Vec::new();
-            while !request.ends_with(b"\r\n\r\n") {
-                let mut chunk = [0_u8; 1024];
-                let count = stream.read(&mut chunk).expect("read test request");
-                assert_ne!(count, 0, "request closed before its headers completed");
-                request.extend_from_slice(&chunk[..count]);
-            }
-            String::from_utf8(request).expect("HTTP request headers are UTF-8")
-        }
-
-        // Model an SSH local forwarder whose remote connection is refused:
-        // the local TCP connection succeeds, but no valid HTTP response is
-        // possible. Returning bytes prevents the HTTP client from retrying
-        // this idempotent GET before Satelle can relaunch the daemon.
-        listener
-            .set_nonblocking(true)
-            .expect("poll forwarded requests and launch signal");
-        let deadline = Instant::now() + Duration::from_secs(5);
-        loop {
-            match launch_receiver.try_recv() {
-                Ok(()) => break,
-                Err(mpsc::TryRecvError::Empty) => {}
-                Err(mpsc::TryRecvError::Disconnected) => {
-                    panic!("durable daemon relaunch sender disconnected")
-                }
-            }
-            match listener.accept() {
-                Ok((mut stream, _)) => {
-                    let _request = read_request_headers(&mut stream);
-                    stream
-                        .write_all(b"remote daemon refused the forwarded connection\r\n")
-                        .expect("write invalid forwarded response");
-                }
-                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                    thread::sleep(Duration::from_millis(5));
-                }
-                Err(error) => panic!("accept forwarded request: {error}"),
-            }
-            assert!(
-                Instant::now() < deadline,
-                "durable daemon relaunch must be requested"
-            );
-        }
-        listener
-            .set_nonblocking(false)
-            .expect("accept relaunched request");
-        let (mut stream, _) = listener.accept().expect("accept relaunched request");
-        assert!(
-            server_probe_running.load(Ordering::SeqCst),
-            "the launched probe must remain alive through token verification"
+fn durable_verification_and_bootstrap_handoff_use_distinct_clients() {
+    let state = TestStateDir::new().expect("temporary state directory");
+    let bootstrap_token = ApiBearerToken::generate().expect("generate bootstrap token");
+    let service = HostService::local_demo_for_tests_at(state.path())
+        .expect("construct Host service")
+        .with_ssh_bootstrap_auth_for_tests(
+            &bootstrap_token,
+            ApiScopes::READ,
+            time::OffsetDateTime::now_utc() + time::Duration::minutes(5),
         );
-        let request = read_request_headers(&mut stream);
-        let request_id = request
-            .lines()
-            .find_map(|line| {
-                line.split_once(':').and_then(|(name, value)| {
-                    name.eq_ignore_ascii_case("Satelle-Request-Id")
-                        .then(|| value.trim())
-                })
-            })
-            .expect("authenticated request carries a request ID");
-        let body = format!(
-            "{{\"schema_version\":\"satelle.setup-api-token-confirmation.v1\",\"request_id\":\"{request_id}\",\"host_identity\":\"host-setup-test\",\"token_id\":\"{response_token_id}\",\"setup_active\":true,\"control_scoped\":true}}"
-        );
-        write!(
-            stream,
-            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-            body.len(),
-            body
+    let initialized = service.initialize_daemon().expect("initialize Host state");
+    let host_identity = initialized.host_identity().to_string();
+    let (durable_token, durable_principal) = service
+        .issue_pending_api_token(
+            ApiScopes::CONTROL,
+            time::OffsetDateTime::now_utc() + time::Duration::minutes(5),
         )
-        .expect("write relaunched daemon response");
+        .expect("issue pending durable setup token");
+    let durable_token_id = durable_principal.token_id().to_string();
+    service
+        .activate_api_token(&durable_token_id)
+        .expect("activate durable setup token");
+    let (_runtime, server) = spawn_loopback_daemon(service);
+    let address = server.local_addr();
+    let bootstrap_client = DaemonClient::loopback(address, bootstrap_token, &host_identity)
+        .expect("construct operation-bound bootstrap client");
+    let durable_client = DaemonClient::loopback(address, durable_token, &host_identity)
+        .expect("construct durable verification client");
+
+    let inspection = inspect_durable_setup_token(&durable_client, durable_token_id.as_str())
+        .expect("durable client verifies its durable credential");
+    assert_eq!(inspection, ExistingTokenInspection::Reusable);
+
+    let durable_handoff_error = durable_client
+        .begin_bootstrap_maintenance("distinct-client-handoff", "missing_daemon_repair")
+        .expect_err("durable client cannot begin bootstrap maintenance");
+    assert!(matches!(
+        durable_handoff_error,
+        DaemonClientError::Api { error, .. }
+            if error.code() == ApiErrorCode::AuthorizationInsufficientScope
+    ));
+
+    let begun = bootstrap_client
+        .begin_bootstrap_maintenance("distinct-client-handoff", "missing_daemon_repair")
+        .expect("bootstrap client begins maintenance");
+    assert!(begun.reconciled());
+    let completed = bootstrap_client
+        .complete_bootstrap_maintenance("distinct-client-handoff")
+        .expect("bootstrap client completes maintenance");
+    assert!(completed.reconciled());
+
+    drop(server);
+}
+
+#[cfg(unix)]
+#[test]
+fn reusable_setup_token_keeps_the_healthy_durable_daemon_running_without_bootstrap() {
+    with_bootstrap_handoff_test_context(|_, fake_ssh, _, _, _| {
+        let state = TestStateDir::new().expect("temporary durable state directory");
+        let service = HostService::local_demo_for_tests_at(state.path())
+            .expect("construct durable Host service");
+        let initialized = service.initialize_daemon().expect("initialize Host state");
+        let host_identity = initialized.host_identity().to_string();
+        let (durable_token, durable_principal) = service
+            .issue_pending_api_token(
+                ApiScopes::CONTROL,
+                time::OffsetDateTime::now_utc() + time::Duration::minutes(5),
+            )
+            .expect("issue durable setup token");
+        let durable_token_id = durable_principal.token_id().to_string();
+        service
+            .activate_api_token(&durable_token_id)
+            .expect("activate durable setup token");
+        let raw_token = durable_token.expose();
+        let token_path = state.path().join("reusable-setup.token");
+        persist_new_owner_only_secret_file(&token_path, raw_token.as_str())
+            .expect("persist reusable setup token");
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .expect("construct durable daemon runtime");
+        let server = runtime
+            .block_on(DaemonServer::bind(
+                service,
+                DaemonServerConfig::loopback(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))),
+            ))
+            .expect("bind durable loopback daemon");
+        let durable_client = DaemonClient::loopback(
+            server.local_addr(),
+            ApiBearerToken::parse(raw_token.as_str()).expect("parse reusable setup token"),
+            &host_identity,
+        )
+        .expect("construct durable setup client");
+        let transport = SshSetupTransport::new(&ssh_setup_host(Some(ApiTokenSource::File {
+            path: token_path,
+        })))
+        .expect("construct SSH setup transport");
+        let mut bootstrap_lock = acquire_bootstrap_lock_for_operation_with_ssh(
+            "reusable-token-host",
+            "fake-ssh-host",
+            "verify-reusable-token-before-bootstrap".to_string(),
+            bootstrap_lock::OperationKind::InitialSetup,
+            fake_ssh,
+        )
+        .expect("acquire setup lock");
+        let bootstrap_called = AtomicBool::new(false);
+
+        let verification = transport
+            .verify_existing_token_with_bootstrap_fallback(
+                &durable_client,
+                &durable_token_id,
+                "verify-reusable-token",
+                &mut bootstrap_lock,
+                |_| {
+                    bootstrap_called.store(true, Ordering::SeqCst);
+                    Err(SatelleError::host_unreachable("reusable-token-host"))
+                },
+            )
+            .expect("reuse the healthy durable daemon token");
+
+        assert_eq!(verification, ExistingTokenVerification::Reusable);
+        assert!(!bootstrap_called.load(Ordering::SeqCst));
+        assert!(bootstrap_lock.exchanged_lock_lines().iter().all(|line| {
+            !line.contains("maintenance_handoff") && !line.contains("daemon_start")
+        }));
+        bootstrap_lock
+            .release_committed_handoff()
+            .expect("release the committed durable verification");
+        let report = transport.setup_report(
+            false,
+            "on_demand".to_string(),
+            vec!["transport".to_string()],
+            DaemonPathOverrides::default(),
+            SetupApplication::AppliedReusableToken,
+        );
+        assert_eq!(report.status, "applied");
+        assert!(!report.mutated);
+        durable_client
+            .capabilities()
+            .expect("the canonical durable daemon remains reachable after the report");
+
+        drop(server);
     });
+}
 
-    let client = DaemonClient::loopback_with_timeout(
-        address,
-        token,
-        "host-setup-test",
-        Duration::from_secs(2),
-    )
-    .expect("construct loopback durable client");
-    struct ProbeGuard(Arc<AtomicBool>);
+#[cfg(unix)]
+#[test]
+fn authentication_rejected_by_live_daemon_enters_bootstrap_fallback() {
+    with_bootstrap_handoff_test_context(|bootstrap_client, fake_ssh, _, _, _| {
+        let state = TestStateDir::new().expect("temporary durable state directory");
+        let service = HostService::local_demo_for_tests_at(state.path())
+            .expect("construct durable Host service");
+        let initialized = service.initialize_daemon().expect("initialize Host state");
+        let host_identity = initialized.host_identity().to_string();
+        let (_runtime, server) = spawn_loopback_daemon(service);
+        let unissued_token = ApiBearerToken::generate().expect("generate valid unissued token");
+        let unissued_token_id = unissued_token.token_id().to_string();
+        let unissued_client =
+            DaemonClient::loopback(server.local_addr(), unissued_token, &host_identity)
+                .expect("construct unissued-token client");
+        let transport =
+            SshSetupTransport::new(&ssh_setup_host(None)).expect("construct SSH setup transport");
+        let mut bootstrap_lock = acquire_bootstrap_lock_for_operation_with_ssh(
+            "bootstrap-required-host",
+            "fake-ssh-host",
+            "bootstrap-after-durable-rejection".to_string(),
+            bootstrap_lock::OperationKind::InitialSetup,
+            fake_ssh,
+        )
+        .expect("acquire setup lock");
+        let bootstrap_called = AtomicBool::new(false);
 
-    impl Drop for ProbeGuard {
-        fn drop(&mut self) {
-            self.0.store(false, Ordering::SeqCst);
-        }
-    }
+        let verification = transport
+            .verify_existing_token_with_bootstrap_fallback(
+                &unissued_client,
+                unissued_token_id.as_str(),
+                "reject-bootstrap-token-as-durable",
+                &mut bootstrap_lock,
+                |bootstrap_lock| {
+                    bootstrap_called.store(true, Ordering::SeqCst);
+                    bootstrap_lock
+                        .mark_mutation_started("daemon_start")
+                        .map_err(|_| SatelleError::host_unreachable("bootstrap-required-host"))?;
+                    commit_verified_bootstrap_mutation("bootstrap-required-host", bootstrap_lock)?;
+                    complete_bootstrap_handoff(
+                        "bootstrap-required-host",
+                        bootstrap_client,
+                        bootstrap_lock,
+                    )?;
+                    Ok(ExistingTokenVerification::Reusable)
+                },
+            )
+            .expect("enter bootstrap after durable authentication rejection");
 
-    let mut launch_count = 0;
-    verify_durable_setup_token_with_launch(
-        &client,
-        token_id,
-        "relaunch-activation",
-        "remote",
-        || -> Result<ProbeGuard, SatelleError> {
-            launch_count += 1;
-            probe_running.store(true, Ordering::SeqCst);
-            launch_sender.send(()).expect("signal daemon relaunch");
-            Ok(ProbeGuard(Arc::clone(&probe_running)))
+        assert_eq!(verification, ExistingTokenVerification::Reusable);
+        assert!(bootstrap_called.load(Ordering::SeqCst));
+        let durable_commit = format!(
+            "{} durable_token_verification ",
+            bootstrap_lock::MUTATION_COMMITTED
+        );
+        assert!(
+            bootstrap_lock
+                .exchanged_lock_lines()
+                .iter()
+                .any(|line| line.starts_with(&durable_commit)),
+            "the live daemon's explicit rejection must close the activation attempt"
+        );
+        assert!(
+            bootstrap_lock
+                .exchanged_lock_lines()
+                .iter()
+                .any(|line| line.contains("maintenance_handoff_complete"))
+        );
+        bootstrap_lock
+            .release_committed_handoff()
+            .expect("release the completed bootstrap handoff");
+
+        drop(server);
+    });
+}
+
+#[cfg(unix)]
+#[test]
+fn durable_confirmation_transport_failure_falls_back_without_open_mutation() {
+    with_bootstrap_handoff_test_context(|bootstrap_client, fake_ssh, _, _, _| {
+        let transport =
+            SshSetupTransport::new(&ssh_setup_host(None)).expect("construct SSH setup transport");
+        let unavailable_listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .expect("reserve unavailable durable daemon address");
+        let unavailable_address = unavailable_listener
+            .local_addr()
+            .expect("read unavailable durable daemon address");
+        drop(unavailable_listener);
+        let unavailable_durable_client = DaemonClient::loopback_with_timeout(
+            unavailable_address,
+            ApiBearerToken::generate().expect("generate unavailable durable token"),
+            "unavailable-durable-host-identity",
+            Duration::from_secs(1),
+        )
+        .expect("construct unavailable durable client");
+        let mut bootstrap_lock = acquire_bootstrap_lock_for_operation_with_ssh(
+            "transport-fallback-host",
+            "fake-ssh-host",
+            "bootstrap-after-durable-transport".to_string(),
+            bootstrap_lock::OperationKind::InitialSetup,
+            fake_ssh,
+        )
+        .expect("acquire setup lock");
+
+        let verification = transport
+            .verify_existing_token_with_bootstrap_fallback(
+                &unavailable_durable_client,
+                "unavailable-durable-token-id",
+                "transport-bootstrap-token",
+                &mut bootstrap_lock,
+                |bootstrap_lock| {
+                    bootstrap_lock
+                        .mark_mutation_started("daemon_start")
+                        .map_err(|_| SatelleError::host_unreachable("transport-fallback-host"))?;
+                    commit_verified_bootstrap_mutation("transport-fallback-host", bootstrap_lock)?;
+                    complete_bootstrap_handoff(
+                        "transport-fallback-host",
+                        bootstrap_client,
+                        bootstrap_lock,
+                    )?;
+                    Ok(ExistingTokenVerification::Reusable)
+                },
+            )
+            .expect("enter bootstrap after read-only durable transport failure");
+
+        assert_eq!(verification, ExistingTokenVerification::Reusable);
+        assert!(
+            bootstrap_lock
+                .exchanged_lock_lines()
+                .iter()
+                .all(|line| { !line.contains("durable_token_verification") })
+        );
+        bootstrap_lock
+            .release_committed_handoff()
+            .expect("release the completed bootstrap handoff");
+    });
+}
+
+#[cfg(unix)]
+fn acquire_bootstrap_lock_for_operation_with_ssh(
+    alias: &str,
+    destination: &str,
+    operation_id: String,
+    operation_kind: bootstrap_lock::OperationKind,
+    ssh_program: &std::path::Path,
+) -> Result<ssh_bootstrap::SshBootstrapLock, SatelleError> {
+    let controller_identity = Some(format!("controller-pid-{}", std::process::id()));
+    let request = bootstrap_lock::Request::new(operation_id, operation_kind, controller_identity)
+        .map_err(|error| SatelleError::invalid_usage(error.to_string()))?;
+    ssh_bootstrap::SshBootstrapLock::acquire_for_tests(destination, request, ssh_program).map_err(
+        |error| match error {
+            ssh_bootstrap::SshBootstrapError::HostKeyVerificationRequired => {
+                SatelleError::ssh_host_key_verification_required(alias)
+            }
+            ssh_bootstrap::SshBootstrapError::BootstrapBusy => {
+                SatelleError::bootstrap_busy(alias, None)
+            }
+            _ => SatelleError::host_unreachable(alias),
         },
     )
-    .expect("retry durable verification after relaunch");
-    assert_eq!(launch_count, 1);
-    assert!(
-        !probe_running.load(Ordering::SeqCst),
-        "the verification probe must stop before recovery can bootstrap"
+}
+
+#[cfg(unix)]
+fn with_bootstrap_handoff_test_context(
+    test: impl FnOnce(&DaemonClient, &std::path::Path, SocketAddr, &str, &HostService),
+) {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let state = TestStateDir::new().expect("temporary state directory");
+    let bootstrap_token = ApiBearerToken::generate().expect("generate bootstrap token");
+    let service = HostService::local_demo_for_tests_at(state.path())
+        .expect("construct Host service")
+        .with_ssh_bootstrap_auth_for_tests(
+            &bootstrap_token,
+            ApiScopes::READ,
+            time::OffsetDateTime::now_utc() + time::Duration::minutes(5),
+        );
+    let initialized = service.initialize_daemon().expect("initialize Host state");
+    let host_identity = initialized.host_identity().to_string();
+    let ledger = service.clone();
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .expect("construct daemon runtime");
+    let server = runtime
+        .block_on(DaemonServer::bind(
+            service,
+            DaemonServerConfig::loopback(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))),
+        ))
+        .expect("bind loopback daemon");
+    let client = DaemonClient::loopback(server.local_addr(), bootstrap_token, &host_identity)
+        .expect("construct operation-bound bootstrap client");
+
+    let fake_bin = state.path().join("fake-bin");
+    std::fs::create_dir(&fake_bin).expect("create fake SSH directory");
+    let fake_ssh = fake_bin.join("ssh");
+    std::fs::write(
+        &fake_ssh,
+        format!(
+            r#"#!/bin/sh
+command=
+for argument in "$@"; do command=$argument; done
+case "$command" in
+  cmd.exe*) exit 1 ;;
+  *"uname -s"*) printf '%s\n' satelle-platform-v1 Linux x86_64 'glibc 2.31' ;;
+  *) export SATELLE_STATE_DIR='{}'; exec sh -c "$command" ;;
+esac
+"#,
+            state.path().display()
+        ),
+    )
+    .expect("write fake SSH executable");
+    let mut permissions = std::fs::metadata(&fake_ssh)
+        .expect("read fake SSH metadata")
+        .permissions();
+    permissions.set_mode(0o700);
+    std::fs::set_permissions(&fake_ssh, permissions).expect("make fake SSH executable");
+
+    test(
+        &client,
+        &fake_ssh,
+        server.local_addr(),
+        &host_identity,
+        &ledger,
     );
-    tunnel.join().expect("test tunnel exits cleanly");
+
+    drop(server);
+}
+
+#[cfg(unix)]
+#[test]
+fn rejected_durable_token_is_reported_after_launched_daemon_handoff_is_terminal() {
+    with_bootstrap_handoff_test_context(
+        |bootstrap_client, fake_ssh, daemon_address, host_identity, _| {
+            let durable_client = DaemonClient::loopback(
+                daemon_address,
+                ApiBearerToken::generate().expect("generate valid unissued durable token"),
+                host_identity,
+            )
+            .expect("construct rejected durable client");
+            let mut bootstrap_lock = acquire_bootstrap_lock_for_operation_with_ssh(
+                "rejected-post-launch-token-host",
+                "fake-ssh-host",
+                "rejected-durable-token-after-launch".to_string(),
+                bootstrap_lock::OperationKind::MissingDaemonRepair,
+                fake_ssh,
+            )
+            .expect("acquire bootstrap lock");
+            bootstrap_lock
+                .mark_mutation_started("daemon_start")
+                .expect("record the simulated verified daemon launch");
+
+            let error = finish_durable_daemon_launch(
+                "rejected-post-launch-token-host",
+                &durable_client,
+                bootstrap_client,
+                &mut bootstrap_lock,
+            )
+            .expect_err("the stale durable token remains rejected after safe handoff");
+
+            assert_eq!(error.code, ErrorCode::AuthenticationFailed);
+            for phase in [
+                "daemon_start",
+                "maintenance_handoff_begin",
+                "maintenance_handoff_complete",
+            ] {
+                let committed = format!("{} {phase} ", bootstrap_lock::MUTATION_COMMITTED);
+                assert_eq!(
+                    bootstrap_lock
+                        .exchanged_lock_lines()
+                        .iter()
+                        .filter(|line| line.starts_with(&committed))
+                        .count(),
+                    1,
+                    "{phase} has one exact commit owner before auth failure is surfaced"
+                );
+            }
+            assert_eq!(
+                bootstrap_lock
+                    .exchanged_lock_lines()
+                    .iter()
+                    .filter(|line| line.as_str() == bootstrap_lock::RELEASE)
+                    .count(),
+                1,
+                "the completed handoff releases before durable authentication is reported"
+            );
+
+            let mut recovered_lock = acquire_bootstrap_lock_for_operation_with_ssh(
+                "rejected-post-launch-token-host",
+                "fake-ssh-host",
+                "controller-after-rejected-durable-token".to_string(),
+                bootstrap_lock::OperationKind::MissingDaemonRepair,
+                fake_ssh,
+            )
+            .expect("durable authentication failure must not strand the bootstrap lock");
+            recovered_lock
+                .release_unmodified()
+                .expect("release recovered bootstrap lock");
+        },
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn first_trust_path_rebind_handoff_uses_the_discovered_host_identity() {
+    with_bootstrap_handoff_test_context(|_, fake_ssh, _, _, _| {
+        let daemon_state = TestStateDir::new().expect("temporary first-trust daemon state");
+        let bootstrap_token = ApiBearerToken::generate().expect("generate bootstrap token");
+        let service = HostService::local_demo_for_tests_at(daemon_state.path())
+            .expect("construct first-trust Host service")
+            .with_ssh_bootstrap_auth_for_tests(
+                &bootstrap_token,
+                ApiScopes::ADMIN,
+                time::OffsetDateTime::now_utc() + time::Duration::minutes(5),
+            );
+        let initialized = service.initialize_daemon().expect("initialize Host state");
+        let host_identity = initialized.host_identity().to_string();
+        let raw_bootstrap_token = bootstrap_token.expose();
+        let (_runtime, server) = spawn_loopback_daemon(service);
+        let probe_identity = "first-trust-path-rebind-probe";
+        let probe_client = DaemonClient::loopback(
+            server.local_addr(),
+            ApiBearerToken::parse(raw_bootstrap_token.as_str())
+                .expect("parse identity probe token"),
+            probe_identity,
+        )
+        .expect("construct temporary identity probe client");
+        let handoff_token = ApiBearerToken::parse(raw_bootstrap_token.as_str())
+            .expect("parse identity-pinned handoff token");
+        let discovered_identity = probe_client
+            .discover_host_identity()
+            .expect("discover the reachable Host identity through the false probe pin");
+        assert_eq!(discovered_identity, host_identity);
+
+        let operation_id = "first-trust-path-rebind-handoff";
+        let mut bootstrap_lock = acquire_bootstrap_lock_for_operation_with_ssh(
+            "first-trust-path-rebind-host",
+            "fake-ssh-host",
+            operation_id.to_string(),
+            bootstrap_lock::OperationKind::InitialSetup,
+            fake_ssh,
+        )
+        .expect("acquire first-trust bootstrap lock");
+        bootstrap_lock
+            .mark_mutation_started("daemon_start")
+            .expect("record verified discovery daemon start");
+        commit_verified_bootstrap_mutation("first-trust-path-rebind-host", &mut bootstrap_lock)
+            .expect("commit discovery daemon start");
+
+        let probe_error = probe_client
+            .begin_bootstrap_maintenance(operation_id, "initial_setup")
+            .expect_err("the false probe identity cannot perform maintenance");
+        assert!(matches!(
+            probe_error,
+            DaemonClientError::Api { error, .. }
+                if error.code() == ApiErrorCode::HostIdentityMismatch
+        ));
+        complete_discovered_bootstrap_handoff(
+            "first-trust-path-rebind-host",
+            server.local_addr(),
+            handoff_token,
+            &discovered_identity,
+            &mut bootstrap_lock,
+        )
+        .expect("the learned identity completes the first-trust handoff");
+        bootstrap_lock
+            .release_committed_handoff()
+            .expect("release completed first-trust handoff");
+
+        for phase in ["maintenance_handoff_begin", "maintenance_handoff_complete"] {
+            let committed = format!("{} {phase} ", bootstrap_lock::MUTATION_COMMITTED);
+            assert_eq!(
+                bootstrap_lock
+                    .exchanged_lock_lines()
+                    .iter()
+                    .filter(|line| line.starts_with(&committed))
+                    .count(),
+                1,
+                "{phase} commits under the discovered identity"
+            );
+        }
+        drop(server);
+    });
+}
+
+#[cfg(unix)]
+#[test]
+fn conflicting_maintenance_begin_is_terminal_for_the_exact_lock_attempt() {
+    with_bootstrap_handoff_test_context(|bootstrap_client, fake_ssh, _, _, ledger| {
+        let competing_operation = "already-active-maintenance";
+        bootstrap_client
+            .begin_bootstrap_maintenance(competing_operation, "missing_daemon_repair")
+            .expect("begin competing maintenance operation");
+
+        let operation_id = "state-conflict-maintenance-begin";
+        let mut bootstrap_lock = acquire_bootstrap_lock_for_operation_with_ssh(
+            "state-conflict-handoff-host",
+            "fake-ssh-host",
+            operation_id.to_string(),
+            bootstrap_lock::OperationKind::MissingDaemonRepair,
+            fake_ssh,
+        )
+        .expect("acquire bootstrap lock");
+        bootstrap_lock
+            .mark_mutation_started("daemon_start")
+            .expect("record verified daemon start");
+        commit_verified_bootstrap_mutation("state-conflict-handoff-host", &mut bootstrap_lock)
+            .expect("commit verified daemon start");
+
+        let error = complete_bootstrap_handoff(
+            "state-conflict-handoff-host",
+            bootstrap_client,
+            &mut bootstrap_lock,
+        )
+        .expect_err("the active competing operation rejects this exact begin");
+
+        assert_eq!(error.code, ErrorCode::StateConflict);
+        assert!(
+            ledger
+                .load_setup_run(operation_id)
+                .expect("read rejected operation ledger")
+                .is_none(),
+            "the conflicting exact operation must not mutate the ledger"
+        );
+        let begin_commit = format!(
+            "{} maintenance_handoff_begin ",
+            bootstrap_lock::MUTATION_COMMITTED
+        );
+        assert_eq!(
+            bootstrap_lock
+                .exchanged_lock_lines()
+                .iter()
+                .filter(|line| line.starts_with(&begin_commit))
+                .count(),
+            1,
+            "the known StateConflict outcome closes the exact begin attempt"
+        );
+        assert!(
+            bootstrap_lock
+                .exchanged_lock_lines()
+                .iter()
+                .all(|line| !line.contains("maintenance_handoff_complete")),
+            "a rejected begin must not open the complete phase"
+        );
+        drop(bootstrap_lock);
+
+        let mut recovered_lock = acquire_bootstrap_lock_for_operation_with_ssh(
+            "state-conflict-handoff-host",
+            "fake-ssh-host",
+            "controller-after-state-conflict".to_string(),
+            bootstrap_lock::OperationKind::MissingDaemonRepair,
+            fake_ssh,
+        )
+        .expect("a new Controller acquires after the terminal conflict");
+        recovered_lock
+            .release_unmodified()
+            .expect("release recovered bootstrap lock");
+        bootstrap_client
+            .complete_bootstrap_maintenance(competing_operation)
+            .expect("complete competing maintenance fixture");
+    });
+}
+
+#[cfg(unix)]
+#[test]
+fn connection_capacity_rejection_is_terminal_for_the_exact_lock_attempt() {
+    with_bootstrap_handoff_test_context(|_, fake_ssh, _, _, _| {
+        let daemon_state = TestStateDir::new().expect("temporary capacity daemon state");
+        let bootstrap_token = ApiBearerToken::generate().expect("generate bootstrap token");
+        let service = HostService::local_demo_for_tests_at(daemon_state.path())
+            .expect("construct capacity Host service")
+            .with_ssh_bootstrap_auth_for_tests(
+                &bootstrap_token,
+                ApiScopes::READ,
+                time::OffsetDateTime::now_utc() + time::Duration::minutes(5),
+            );
+        let initialized = service.initialize_daemon().expect("initialize Host state");
+        let host_identity = initialized.host_identity().to_string();
+        let ledger = service.clone();
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .expect("construct capacity daemon runtime");
+        let server = runtime
+            .block_on(DaemonServer::bind(
+                service,
+                DaemonServerConfig::loopback(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
+                    .with_max_connections(1),
+            ))
+            .expect("bind capacity-limited daemon");
+        let capacity_client =
+            DaemonClient::loopback(server.local_addr(), bootstrap_token, &host_identity)
+                .expect("construct capacity-rejected bootstrap client");
+
+        // Complete one real request on the sole admitted connection, then keep
+        // that HTTP/1.1 socket open so the next connection enters the server's
+        // bounded typed-rejection lane.
+        let mut occupant = TcpStream::connect(server.local_addr())
+            .expect("open the sole admitted Host connection");
+        occupant
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .expect("bound the occupancy probe read");
+        occupant
+            .write_all(
+                b"GET /v1/live HTTP/1.1\r\nHost: localhost\r\nConnection: keep-alive\r\n\r\n",
+            )
+            .expect("send occupancy probe");
+        let mut response_head = Vec::new();
+        let mut chunk = [0_u8; 512];
+        while !response_head.windows(4).any(|window| window == b"\r\n\r\n") {
+            let count = occupant.read(&mut chunk).expect("read occupancy response");
+            assert!(count > 0, "occupancy response must contain HTTP headers");
+            response_head.extend_from_slice(&chunk[..count]);
+        }
+        assert!(
+            response_head.starts_with(b"HTTP/1.1 200"),
+            "the held connection must consume normal server capacity"
+        );
+
+        let operation_id = "connection-capacity-maintenance-begin";
+        let mut bootstrap_lock = acquire_bootstrap_lock_for_operation_with_ssh(
+            "capacity-handoff-host",
+            "fake-ssh-host",
+            operation_id.to_string(),
+            bootstrap_lock::OperationKind::MissingDaemonRepair,
+            fake_ssh,
+        )
+        .expect("acquire bootstrap lock");
+        bootstrap_lock
+            .mark_mutation_started("daemon_start")
+            .expect("record verified daemon start");
+        commit_verified_bootstrap_mutation("capacity-handoff-host", &mut bootstrap_lock)
+            .expect("commit verified daemon start");
+
+        let error = complete_bootstrap_handoff(
+            "capacity-handoff-host",
+            &capacity_client,
+            &mut bootstrap_lock,
+        )
+        .expect_err("HTTP connection capacity rejects maintenance before its handler");
+
+        assert_eq!(error.code, ErrorCode::RemoteExecution);
+        assert!(
+            ledger
+                .load_setup_run(operation_id)
+                .expect("read capacity-rejected operation ledger")
+                .is_none(),
+            "capacity rejection must occur before maintenance ledger mutation"
+        );
+        let begin_commit = format!(
+            "{} maintenance_handoff_begin ",
+            bootstrap_lock::MUTATION_COMMITTED
+        );
+        assert_eq!(
+            bootstrap_lock
+                .exchanged_lock_lines()
+                .iter()
+                .filter(|line| line.starts_with(&begin_commit))
+                .count(),
+            1,
+            "the exact capacity-rejected attempt has one terminal owner"
+        );
+        assert!(
+            bootstrap_lock
+                .exchanged_lock_lines()
+                .iter()
+                .all(|line| !line.contains("maintenance_handoff_complete")),
+            "capacity-rejected begin must not open the complete phase"
+        );
+        drop(bootstrap_lock);
+
+        let lock_state_root = fake_ssh
+            .parent()
+            .and_then(std::path::Path::parent)
+            .expect("fake SSH state root");
+        let terminal = std::fs::read_to_string(
+            lock_state_root.join(format!("bootstrap-operation-{operation_id}.json")),
+        )
+        .expect("read capacity-rejected terminal record");
+        assert!(terminal.contains("\"terminal_state\":\"reconciled_failed\""));
+        let mut recovered_lock = acquire_bootstrap_lock_for_operation_with_ssh(
+            "capacity-handoff-host",
+            "fake-ssh-host",
+            "controller-after-capacity-rejection".to_string(),
+            bootstrap_lock::OperationKind::MissingDaemonRepair,
+            fake_ssh,
+        )
+        .expect("a new Controller acquires after terminal capacity rejection");
+        recovered_lock
+            .release_unmodified()
+            .expect("release recovered bootstrap lock");
+
+        drop(occupant);
+        drop(server);
+    });
+}
+
+#[cfg(unix)]
+#[test]
+fn prehandler_handoff_rejection_is_terminal_without_mutating_the_ledger() {
+    with_bootstrap_handoff_test_context(|_, fake_ssh, _, _, _| {
+        let daemon_state = TestStateDir::new().expect("temporary rejected daemon state");
+        let service = HostService::local_demo_for_tests_at(daemon_state.path())
+            .expect("construct rejected Host service");
+        let initialized = service.initialize_daemon().expect("initialize Host state");
+        let host_identity = initialized.host_identity().to_string();
+        let ledger = service.clone();
+        let (_runtime, server) = spawn_loopback_daemon(service);
+        let rejected_client = DaemonClient::loopback(
+            server.local_addr(),
+            ApiBearerToken::generate().expect("generate unissued bootstrap token"),
+            &host_identity,
+        )
+        .expect("construct rejected bootstrap client");
+        let operation_id = "prehandler-rejected-handoff";
+        let mut bootstrap_lock = acquire_bootstrap_lock_for_operation_with_ssh(
+            "prehandler-rejected-host",
+            "fake-ssh-host",
+            operation_id.to_string(),
+            bootstrap_lock::OperationKind::MissingDaemonRepair,
+            fake_ssh,
+        )
+        .expect("acquire bootstrap lock");
+        bootstrap_lock
+            .mark_mutation_started("daemon_start")
+            .expect("record verified daemon start");
+        commit_verified_bootstrap_mutation("prehandler-rejected-host", &mut bootstrap_lock)
+            .expect("commit verified daemon start");
+
+        let error = complete_bootstrap_handoff(
+            "prehandler-rejected-host",
+            &rejected_client,
+            &mut bootstrap_lock,
+        )
+        .expect_err("authentication middleware rejects the handoff");
+
+        assert_eq!(error.code, ErrorCode::AuthenticationFailed);
+        assert!(
+            ledger
+                .load_setup_run(operation_id)
+                .expect("read maintenance ledger")
+                .is_none(),
+            "pre-handler rejection must not create a maintenance run"
+        );
+        let begin_commit = format!(
+            "{} maintenance_handoff_begin ",
+            bootstrap_lock::MUTATION_COMMITTED
+        );
+        assert_eq!(
+            bootstrap_lock
+                .exchanged_lock_lines()
+                .iter()
+                .filter(|line| line.starts_with(&begin_commit))
+                .count(),
+            1,
+            "the exact rejected attempt must have one terminal owner"
+        );
+        assert!(
+            bootstrap_lock
+                .exchanged_lock_lines()
+                .iter()
+                .all(|line| !line.contains("maintenance_handoff_complete")),
+            "begin rejection must not open the complete phase"
+        );
+        drop(bootstrap_lock);
+
+        let lock_state_root = fake_ssh
+            .parent()
+            .and_then(std::path::Path::parent)
+            .expect("fake SSH state root");
+        let terminal = std::fs::read_to_string(
+            lock_state_root.join(format!("bootstrap-operation-{operation_id}.json")),
+        )
+        .expect("read rejected handoff terminal record");
+        assert!(terminal.contains("\"terminal_state\":\"reconciled_failed\""));
+        let mut recovered_lock = acquire_bootstrap_lock_for_operation_with_ssh(
+            "prehandler-rejected-host",
+            "fake-ssh-host",
+            "controller-after-prehandler-rejection".to_string(),
+            bootstrap_lock::OperationKind::MissingDaemonRepair,
+            fake_ssh,
+        )
+        .expect("a new Controller acquires immediately after definite rejection");
+        recovered_lock
+            .release_unmodified()
+            .expect("release recovered bootstrap lock");
+
+        drop(server);
+    });
+}
+
+#[cfg(unix)]
+#[test]
+fn prehandler_complete_rejection_does_not_complete_the_maintenance_ledger() {
+    with_bootstrap_handoff_test_context(
+        |bootstrap_client, fake_ssh, daemon_address, host_identity, ledger| {
+            let rejected_client = DaemonClient::loopback(
+                daemon_address,
+                ApiBearerToken::generate().expect("generate unissued completion token"),
+                host_identity,
+            )
+            .expect("construct rejected completion client");
+            let operation_id = "prehandler-rejected-completion";
+            let mut bootstrap_lock = acquire_bootstrap_lock_for_operation_with_ssh(
+                "prehandler-complete-host",
+                "fake-ssh-host",
+                operation_id.to_string(),
+                bootstrap_lock::OperationKind::MissingDaemonRepair,
+                fake_ssh,
+            )
+            .expect("acquire bootstrap lock");
+            bootstrap_lock
+                .mark_mutation_started("daemon_start")
+                .expect("record verified daemon start");
+            commit_verified_bootstrap_mutation("prehandler-complete-host", &mut bootstrap_lock)
+                .expect("commit verified daemon start");
+            bootstrap_lock
+                .mark_mutation_started("maintenance_handoff_begin")
+                .expect("record maintenance begin");
+            let begun = bootstrap_client
+                .begin_bootstrap_maintenance(operation_id, "missing_daemon_repair")
+                .expect("authorized client begins maintenance");
+            assert!(begun.reconciled());
+            commit_verified_bootstrap_mutation("prehandler-complete-host", &mut bootstrap_lock)
+                .expect("commit accepted maintenance begin");
+            bootstrap_lock
+                .mark_mutation_started("maintenance_handoff_complete")
+                .expect("record maintenance completion");
+
+            let completion = rejected_client.complete_bootstrap_maintenance(operation_id);
+            let error = reconcile_bootstrap_maintenance_response(
+                "prehandler-complete-host",
+                completion,
+                &mut bootstrap_lock,
+            )
+            .expect_err("authentication middleware rejects completion");
+
+            assert_eq!(error.code, ErrorCode::AuthenticationFailed);
+            assert_eq!(
+                ledger
+                    .load_setup_run(operation_id)
+                    .expect("read maintenance ledger")
+                    .expect("maintenance run remains present")
+                    .status(),
+                satelle_host::SetupRunStatus::Running,
+                "pre-handler rejection must not complete the maintenance run"
+            );
+            let completion_commit = format!(
+                "{} maintenance_handoff_complete ",
+                bootstrap_lock::MUTATION_COMMITTED
+            );
+            assert_eq!(
+                bootstrap_lock
+                    .exchanged_lock_lines()
+                    .iter()
+                    .filter(|line| line.starts_with(&completion_commit))
+                    .count(),
+                1,
+                "the exact rejected completion has one terminal owner"
+            );
+            drop(bootstrap_lock);
+
+            let mut recovered_lock = acquire_bootstrap_lock_for_operation_with_ssh(
+                "prehandler-complete-host",
+                "fake-ssh-host",
+                "controller-after-prehandler-complete-rejection".to_string(),
+                bootstrap_lock::OperationKind::MissingDaemonRepair,
+                fake_ssh,
+            )
+            .expect("a new Controller acquires after definite completion rejection");
+            recovered_lock
+                .release_unmodified()
+                .expect("release recovered bootstrap lock");
+        },
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn handoff_transport_uncertainty_remains_recovery_pending_and_fenced() {
+    with_bootstrap_handoff_test_context(|_, fake_ssh, _, _, _| {
+        assert!(
+            !bootstrap_maintenance_rejection_precedes_mutation(
+                &DaemonClientError::ResponseContractViolation
+            ),
+            "response-contract uncertainty must not be treated as pre-handler rejection"
+        );
+        let unavailable_listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .expect("reserve unavailable handoff address");
+        let unavailable_address = unavailable_listener
+            .local_addr()
+            .expect("read unavailable handoff address");
+        drop(unavailable_listener);
+        let unavailable_client = DaemonClient::loopback_with_timeout(
+            unavailable_address,
+            ApiBearerToken::generate().expect("generate unavailable bootstrap token"),
+            "unavailable-handoff-host-identity",
+            Duration::from_secs(1),
+        )
+        .expect("construct unavailable bootstrap client");
+        let operation_id = "uncertain-handoff-transport";
+        let mut bootstrap_lock = acquire_bootstrap_lock_for_operation_with_ssh(
+            "uncertain-handoff-host",
+            "fake-ssh-host",
+            operation_id.to_string(),
+            bootstrap_lock::OperationKind::MissingDaemonRepair,
+            fake_ssh,
+        )
+        .expect("acquire bootstrap lock");
+        bootstrap_lock
+            .mark_mutation_started("daemon_start")
+            .expect("record verified daemon start");
+        commit_verified_bootstrap_mutation("uncertain-handoff-host", &mut bootstrap_lock)
+            .expect("commit verified daemon start");
+
+        let error = complete_bootstrap_handoff(
+            "uncertain-handoff-host",
+            &unavailable_client,
+            &mut bootstrap_lock,
+        )
+        .expect_err("transport loss leaves the handoff outcome uncertain");
+
+        assert_eq!(error.code, ErrorCode::HostUnreachable);
+        let begin_commit = format!(
+            "{} maintenance_handoff_begin ",
+            bootstrap_lock::MUTATION_COMMITTED
+        );
+        assert!(
+            bootstrap_lock
+                .exchanged_lock_lines()
+                .iter()
+                .all(|line| !line.starts_with(&begin_commit)),
+            "transport uncertainty must not be committed"
+        );
+        drop(bootstrap_lock);
+
+        let lock_root = fake_ssh
+            .parent()
+            .and_then(std::path::Path::parent)
+            .expect("fake SSH state root")
+            .join("bootstrap.lock");
+        let claim = std::fs::read_dir(&lock_root)
+            .expect("read bootstrap lock root")
+            .map(|entry| entry.expect("read bootstrap claim").path())
+            .find(|path| {
+                path.file_name()
+                    .and_then(std::ffi::OsStr::to_str)
+                    .is_some_and(|name| name.starts_with("claim."))
+            })
+            .expect("uncertain claim remains");
+        assert_eq!(
+            std::fs::read_to_string(claim.join("state"))
+                .expect("read uncertain claim state")
+                .trim(),
+            "recovery_pending"
+        );
+        let contender = acquire_bootstrap_lock_for_operation_with_ssh(
+            "uncertain-handoff-host",
+            "fake-ssh-host",
+            "controller-during-uncertain-handoff".to_string(),
+            bootstrap_lock::OperationKind::MissingDaemonRepair,
+            fake_ssh,
+        );
+        let Err(contender) = contender else {
+            panic!("a new Controller must remain fenced from an uncertain handoff");
+        };
+        assert_eq!(contender.code, ErrorCode::BootstrapBusy);
+    });
+}
+
+#[cfg(unix)]
+#[test]
+fn completed_bootstrap_handoff_commit_allows_recovery_after_controller_loss() {
+    with_bootstrap_handoff_test_context(|client, fake_ssh, _, _, _| {
+        let mut bootstrap_lock = acquire_bootstrap_lock_for_operation_with_ssh(
+            "crash-window-host",
+            "fake-ssh-host",
+            "completed-handoff-before-controller-loss".to_string(),
+            bootstrap_lock::OperationKind::MissingDaemonRepair,
+            fake_ssh,
+        )
+        .expect("acquire the initial bootstrap lock");
+        bootstrap_lock
+            .mark_mutation_started("daemon_start")
+            .expect("record the verified daemon start");
+        commit_verified_bootstrap_mutation("crash-window-host", &mut bootstrap_lock)
+            .expect("commit the verified daemon start");
+        complete_bootstrap_handoff("crash-window-host", client, &mut bootstrap_lock)
+            .expect("complete the bootstrap maintenance handoff");
+
+        // Losing the Controller channel before RELEASE must reconcile the exact
+        // completed attempt instead of leaving the remote fence permanently busy.
+        drop(bootstrap_lock);
+        let mut recovered_lock = acquire_bootstrap_lock_for_operation_with_ssh(
+            "crash-window-host",
+            "fake-ssh-host",
+            "controller-after-completed-handoff".to_string(),
+            bootstrap_lock::OperationKind::MissingDaemonRepair,
+            fake_ssh,
+        )
+        .expect("a new Controller can acquire after the completed handoff");
+        recovered_lock
+            .release_unmodified()
+            .expect("release the recovered bootstrap lock");
+    });
+}
+
+#[cfg(unix)]
+#[test]
+fn successful_bootstrap_handoff_release_does_not_repeat_the_completion_commit() {
+    with_bootstrap_handoff_test_context(|client, fake_ssh, _, _, _| {
+        let mut bootstrap_lock = acquire_bootstrap_lock_for_operation_with_ssh(
+            "successful-release-host",
+            "fake-ssh-host",
+            "completed-handoff-before-release".to_string(),
+            bootstrap_lock::OperationKind::MissingDaemonRepair,
+            fake_ssh,
+        )
+        .expect("acquire the bootstrap lock");
+        bootstrap_lock
+            .mark_mutation_started("daemon_start")
+            .expect("record the verified daemon start");
+        commit_verified_bootstrap_mutation("successful-release-host", &mut bootstrap_lock)
+            .expect("commit the verified daemon start");
+        complete_bootstrap_handoff("successful-release-host", client, &mut bootstrap_lock)
+            .expect("complete and commit the bootstrap maintenance handoff");
+        bootstrap_lock
+            .release_committed_handoff()
+            .expect("release without committing the completion attempt twice");
+
+        let mut next_lock = acquire_bootstrap_lock_for_operation_with_ssh(
+            "successful-release-host",
+            "fake-ssh-host",
+            "controller-after-successful-release".to_string(),
+            bootstrap_lock::OperationKind::MissingDaemonRepair,
+            fake_ssh,
+        )
+        .expect("successful release removes the prior claim");
+        next_lock
+            .release_unmodified()
+            .expect("release the next bootstrap lock");
+
+        for phase in ["daemon_start", "maintenance_handoff_complete"] {
+            let committed = format!("{} {phase} ", bootstrap_lock::MUTATION_COMMITTED);
+            assert_eq!(
+                bootstrap_lock
+                    .exchanged_lock_lines()
+                    .iter()
+                    .filter(|line| line.starts_with(&committed))
+                    .count(),
+                1,
+                "{phase} must have exactly one commit owner"
+            );
+        }
+    });
+}
+
+#[cfg(unix)]
+#[test]
+fn prior_mutation_commit_precedes_maintenance_handoff_begin_for_both_phase_shapes() {
+    with_bootstrap_handoff_test_context(|client, fake_ssh, _, _, _| {
+        for (phase, operation_id) in [
+            ("daemon_start", "ordered-daemon-start"),
+            (
+                "durable_token_verification",
+                "ordered-durable-token-verification",
+            ),
+        ] {
+            let mut bootstrap_lock = acquire_bootstrap_lock_for_operation_with_ssh(
+                "ordered-handoff-host",
+                "fake-ssh-host",
+                operation_id.to_string(),
+                bootstrap_lock::OperationKind::MissingDaemonRepair,
+                fake_ssh,
+            )
+            .expect("acquire the bootstrap lock");
+            bootstrap_lock
+                .mark_mutation_started(phase)
+                .expect("record the verified prior mutation");
+            commit_verified_bootstrap_mutation("ordered-handoff-host", &mut bootstrap_lock)
+                .expect("commit the verified prior mutation at its owner boundary");
+            complete_bootstrap_handoff("ordered-handoff-host", client, &mut bootstrap_lock)
+                .expect("complete the bootstrap maintenance handoff");
+            bootstrap_lock
+                .release_committed_handoff()
+                .expect("release the committed handoff");
+
+            let prior_commit = format!("{} {phase} ", bootstrap_lock::MUTATION_COMMITTED);
+            let maintenance_begin = format!(
+                "{} maintenance_handoff_begin ",
+                bootstrap_lock::MUTATION_STARTED
+            );
+            let prior_commit_index = bootstrap_lock
+                .exchanged_lock_lines()
+                .iter()
+                .position(|line| line.starts_with(&prior_commit))
+                .expect("the prior mutation is committed");
+            let maintenance_begin_index = bootstrap_lock
+                .exchanged_lock_lines()
+                .iter()
+                .position(|line| line.starts_with(&maintenance_begin))
+                .expect("the maintenance begin attempt is recorded");
+            assert!(
+                prior_commit_index < maintenance_begin_index,
+                "{phase} must be committed before maintenance handoff begins"
+            );
+            assert_eq!(
+                bootstrap_lock
+                    .exchanged_lock_lines()
+                    .iter()
+                    .filter(|line| line.starts_with(&prior_commit))
+                    .count(),
+                1,
+                "{phase} must not be committed again by maintenance handoff"
+            );
+        }
+    });
+}
+
+#[cfg(unix)]
+#[test]
+fn committed_prior_mutation_recovers_after_controller_loss_for_both_phase_shapes() {
+    with_bootstrap_handoff_test_context(|_, fake_ssh, _, _, _| {
+        for (phase, operation_id) in [
+            ("daemon_start", "lost-after-committed-daemon-start"),
+            (
+                "durable_token_verification",
+                "lost-after-committed-durable-verification",
+            ),
+        ] {
+            let mut bootstrap_lock = acquire_bootstrap_lock_for_operation_with_ssh(
+                "prior-commit-recovery-host",
+                "fake-ssh-host",
+                operation_id.to_string(),
+                bootstrap_lock::OperationKind::MissingDaemonRepair,
+                fake_ssh,
+            )
+            .expect("acquire the bootstrap lock");
+            bootstrap_lock
+                .mark_mutation_started(phase)
+                .expect("record the verified prior mutation");
+            commit_verified_bootstrap_mutation("prior-commit-recovery-host", &mut bootstrap_lock)
+                .expect("commit the verified prior mutation");
+            if phase == "daemon_start" {
+                let unavailable_listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+                    .expect("reserve unavailable post-launch daemon address");
+                let unavailable_address = unavailable_listener
+                    .local_addr()
+                    .expect("read unavailable post-launch daemon address");
+                drop(unavailable_listener);
+                let unavailable_client = DaemonClient::loopback_with_timeout(
+                    unavailable_address,
+                    ApiBearerToken::generate().expect("generate post-launch probe token"),
+                    "post-launch-host-identity",
+                    Duration::from_secs(1),
+                )
+                .expect("construct post-launch daemon client");
+                assert!(matches!(
+                    unavailable_client.capabilities(),
+                    Err(DaemonClientError::Transport(_))
+                ));
+            }
+            drop(bootstrap_lock);
+
+            let mut recovered_lock = acquire_bootstrap_lock_for_operation_with_ssh(
+                "prior-commit-recovery-host",
+                "fake-ssh-host",
+                format!("controller-after-{operation_id}"),
+                bootstrap_lock::OperationKind::MissingDaemonRepair,
+                fake_ssh,
+            )
+            .expect("a new Controller can acquire after committed controller loss");
+            recovered_lock
+                .release_unmodified()
+                .expect("release the recovered bootstrap lock");
+        }
+    });
 }
 
 #[test]

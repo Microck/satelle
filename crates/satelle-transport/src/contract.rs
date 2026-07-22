@@ -25,8 +25,8 @@ pub use session::{
     StopResponse, TurnRequest,
 };
 pub use setup::{
-    DURABLE_SETUP_PENDING_TTL, DurableTokenActivationResponse, DurableTokenConfirmationResponse,
-    DurableTokenIssuanceResponse,
+    BootstrapMaintenanceResponse, DURABLE_SETUP_PENDING_TTL, DurableTokenActivationResponse,
+    DurableTokenConfirmationResponse, DurableTokenIssuanceResponse,
 };
 
 pub(crate) const PROTOCOL_VERSION_HEADER: &str = "satelle-protocol-version";

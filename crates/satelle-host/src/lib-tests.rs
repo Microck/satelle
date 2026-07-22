@@ -42,6 +42,7 @@ fn configured_remote_alias_reaches_execution_and_session_keeps_host_identity() {
         operation_capacity: Arc::new(OperationCapacity::default()),
         mode: HostMode::TestFake,
         bootstrap_auth: None,
+        bootstrap_maintenance: Arc::new(Mutex::new(None)),
     };
 
     let outcome = service
@@ -94,6 +95,7 @@ fn configured_remote_alias_is_accepted_by_host_diagnostics() {
         operation_capacity: Arc::new(OperationCapacity::default()),
         mode: HostMode::TestFake,
         bootstrap_auth: None,
+        bootstrap_maintenance: Arc::new(Mutex::new(None)),
     };
     let doctor = service
         .doctor(REMOTE_HOST_ALIAS, None, DoctorOptions::default())
@@ -188,6 +190,7 @@ fn unsupported_or_unproven_production_execution_is_blocked_without_state_admissi
             operation_capacity: Arc::new(OperationCapacity::default()),
             mode: HostMode::Production { snapshot },
             bootstrap_auth: None,
+            bootstrap_maintenance: Arc::new(Mutex::new(None)),
         };
         let session_id = SessionId::new();
 
@@ -300,6 +303,7 @@ fn attached_adapter_failures_return_exact_durable_run_and_steer_handles() {
         operation_capacity: Arc::new(OperationCapacity::default()),
         mode: HostMode::TestFake,
         bootstrap_auth: None,
+        bootstrap_maintenance: Arc::new(Mutex::new(None)),
     };
     let run_failure = run_service
         .run(
@@ -331,6 +335,7 @@ fn attached_adapter_failures_return_exact_durable_run_and_steer_handles() {
         operation_capacity: Arc::new(OperationCapacity::default()),
         mode: HostMode::TestFake,
         bootstrap_auth: None,
+        bootstrap_maintenance: Arc::new(Mutex::new(None)),
     };
     let initial = seeded
         .run(
@@ -348,6 +353,7 @@ fn attached_adapter_failures_return_exact_durable_run_and_steer_handles() {
         operation_capacity: Arc::new(OperationCapacity::default()),
         mode: HostMode::TestFake,
         bootstrap_auth: None,
+        bootstrap_maintenance: Arc::new(Mutex::new(None)),
     };
     let steer_failure = steer_service
         .steer(
@@ -405,6 +411,7 @@ fn refreshed_production_snapshot_updates_admission_surfaces_but_not_desktop_disc
         operation_capacity: Arc::new(OperationCapacity::default()),
         mode: HostMode::Production { snapshot },
         bootstrap_auth: None,
+        bootstrap_maintenance: Arc::new(Mutex::new(None)),
     };
     let clone = service.clone();
 

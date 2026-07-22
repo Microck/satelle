@@ -2223,6 +2223,7 @@ pub enum ErrorCode {
     DaemonPathOverrideNotAbsolute,
     HostNotFound,
     HostUnreachable,
+    BootstrapBusy,
     DirectDaemonUnreachable,
     SshHostKeyVerificationRequired,
     CertificateUntrusted,
@@ -2302,6 +2303,7 @@ impl ErrorCode {
             Self::DaemonPathOverrideNotAbsolute => "daemon-path-override-not-absolute",
             Self::HostNotFound => "host-not-found",
             Self::HostUnreachable => "host-unreachable",
+            Self::BootstrapBusy => "bootstrap-busy",
             Self::DirectDaemonUnreachable => "direct-daemon-unreachable",
             Self::SshHostKeyVerificationRequired => "ssh-host-key-verification-required",
             Self::CertificateUntrusted => "certificate-untrusted",
@@ -2409,7 +2411,8 @@ impl ErrorCode {
             | Self::RemoteExecution
             | Self::StorageBusy
             | Self::StorageIntegrityFailed => 74,
-            Self::CapacityExceeded
+            Self::BootstrapBusy
+            | Self::CapacityExceeded
             | Self::HostBusy
             | Self::IncompatibleControlPlane
             | Self::ComputerUseNotReady
@@ -2936,6 +2939,26 @@ impl SatelleError {
         }
     }
 
+    pub fn bootstrap_busy(alias: &str, operation_id: Option<&str>) -> Self {
+        let mut details = BTreeMap::new();
+        details.insert("host".to_string(), Value::String(alias.to_string()));
+        if let Some(operation_id) = operation_id {
+            details.insert(
+                "operation_id".to_string(),
+                Value::String(operation_id.to_string()),
+            );
+        }
+        Self {
+            code: ErrorCode::BootstrapBusy,
+            message: format!("host '{alias}' already has an active bootstrap operation"),
+            recovery_command: Some(format!(
+                "wait for recovery or reconcile the active operation, then retry for host '{alias}'"
+            )),
+            source_detail: None,
+            details,
+        }
+    }
+
     pub fn direct_daemon_unreachable(alias: &str) -> Self {
         let mut details = BTreeMap::new();
         details.insert("host".to_string(), Value::String(alias.to_string()));
@@ -3434,6 +3457,39 @@ impl SatelleError {
 #[cfg(test)]
 mod error_contract_tests {
     use super::*;
+
+    #[test]
+    fn bootstrap_busy_has_a_stable_typed_contract() {
+        assert_eq!(ErrorCode::BootstrapBusy.as_str(), "bootstrap-busy");
+        assert_eq!(ErrorCode::BootstrapBusy.exit_code(), 75);
+
+        let error = SatelleError::bootstrap_busy("remote", Some("bootstrap-operation"));
+        assert_eq!(error.code, ErrorCode::BootstrapBusy);
+        assert_eq!(error.exit_code(), 75);
+        assert_eq!(
+            error.message,
+            "host 'remote' already has an active bootstrap operation"
+        );
+        assert_eq!(
+            error.recovery_command.as_deref(),
+            Some(
+                "wait for recovery or reconcile the active operation, then retry for host 'remote'"
+            )
+        );
+        assert_eq!(error.source_detail, None);
+        assert_eq!(
+            error.details.get("host"),
+            Some(&Value::String("remote".to_string()))
+        );
+        assert_eq!(
+            error.details.get("operation_id"),
+            Some(&Value::String("bootstrap-operation".to_string()))
+        );
+
+        let without_operation = SatelleError::bootstrap_busy("remote", None);
+        assert_eq!(without_operation.details.len(), 1);
+        assert!(!without_operation.details.contains_key("operation_id"));
+    }
 
     #[test]
     fn native_readiness_timeout_has_a_stable_readiness_contract() {

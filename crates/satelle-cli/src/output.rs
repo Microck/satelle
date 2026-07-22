@@ -203,7 +203,7 @@ impl HostCommand {
     const fn output_request(&self) -> (OutputArgs, EventOutput) {
         match self {
             Self::Start(command) => (command.output_args, EventOutput::None),
-            Self::BootstrapLock | Self::ReleaseState => (
+            Self::ReleaseState => (
                 OutputArgs {
                     format: None,
                     json: false,
@@ -216,6 +216,7 @@ impl HostCommand {
                 (command.output_args, EventOutput::None)
             }
             Self::Update(command) => (command.output_args, EventOutput::None),
+            Self::Cleanup(command) => (command.output_args, EventOutput::None),
             Self::Sessions(command) => (command.output_args, EventOutput::None),
             Self::Storage { command } => command.output_request(),
         }

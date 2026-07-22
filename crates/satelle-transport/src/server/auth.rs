@@ -755,7 +755,7 @@ fn invalid_read_shape(
 
 pub(super) async fn require_control(
     State(state): State<Arc<DaemonState>>,
-    mut request: Request,
+    request: Request,
     next: Next,
 ) -> Response {
     let Some(authorized) = request.extensions().get::<AuthorizedRequest>().cloned() else {
@@ -764,8 +764,28 @@ pub(super) async fn require_control(
     if !authorized.principal().scopes().allows(ApiScopes::CONTROL) {
         return insufficient_scope(&state, &authorized, "control");
     }
+    require_mutation(&state, request, next, authorized).await
+}
+
+pub(super) async fn require_setup_mutation(
+    State(state): State<Arc<DaemonState>>,
+    request: Request,
+    next: Next,
+) -> Response {
+    let Some(authorized) = request.extensions().get::<AuthorizedRequest>().cloned() else {
+        return missing_authorization_context();
+    };
+    require_mutation(&state, request, next, authorized).await
+}
+
+async fn require_mutation(
+    state: &DaemonState,
+    mut request: Request,
+    next: Next,
+    authorized: AuthorizedRequest,
+) -> Response {
     if let Err(failure) = validate_protocol_version(request.headers()) {
-        return incompatible_protocol(&state, &authorized, failure);
+        return incompatible_protocol(state, &authorized, failure);
     }
     if request.uri().query().is_some() || request.headers().contains_key(COOKIE) {
         return api_error_response(
@@ -793,12 +813,12 @@ pub(super) async fn require_control(
         );
     }
     let Some(idempotency_key) = single_header(request.headers(), IDEMPOTENCY_KEY_HEADER) else {
-        return invalid_idempotency_key(&state, &authorized);
+        return invalid_idempotency_key(state, &authorized);
     };
     let authority =
         match MutationAuthority::new(authorized.principal().clone(), idempotency_key.to_string()) {
             Ok(authority) => authority,
-            Err(_) => return invalid_idempotency_key(&state, &authorized),
+            Err(_) => return invalid_idempotency_key(state, &authorized),
         };
     request.extensions_mut().insert(authority);
     next.run(request).await

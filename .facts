@@ -1432,18 +1432,18 @@
 - lease expiry alone never proves that an external Computer Use or maintenance side effect stopped @spec @mvp @implemented
 - timeout expiry, a cancellation request, transport loss, adapter failure, or lease expiry never by itself proves that an upstream Computer Use execution stopped and never by itself permits Control Lease release @spec @mvp @implemented
 - initial setup, missing-daemon repair, and Host binary replacement acquire a Bootstrap Lock before mutating remote files or starting a replacement Host Daemon @spec @mvp
-- a Bootstrap Lock uses atomic filesystem creation under the remote OS user's Satelle state boundary @spec @mvp
-- a Bootstrap Lock records a non-secret operation id, Controller identity when known, acquisition time, and heartbeat time @spec @mvp
-- a Controller refreshes its owned Bootstrap Lock heartbeat at least every 5 seconds while the bootstrap operation remains live @spec @mvp
-- concurrent Bootstrap Lock acquisition fails with a typed bootstrap-busy error before remote mutation @spec @mvp
-- every Bootstrap Lock mutation verifies immediately beforehand that the lock still contains the same operation id, and an owner that loses that check aborts without further mutation @spec @mvp
-- stale Bootstrap Lock recovery probes remote process, binary, service, and Host Daemon state before the lock can be removed or replaced @spec @mvp
-- stale Bootstrap Lock removal or replacement uses compare-and-set against the observed operation id after the required postcondition probes, so a recovered owner cannot delete a newer lock @spec @mvp
-- initial setup and missing-daemon repair acquire Bootstrap Lock, start the Host Daemon, obtain a Maintenance Lease carrying the same operation id, and release Bootstrap Lock only after that handoff is durable @spec @mvp
+- a Bootstrap Lock uses atomic filesystem creation under the remote OS user's Satelle state boundary @spec @mvp @implemented
+- a Bootstrap Lock records a non-secret operation id, Controller identity when known, acquisition time, and heartbeat time @spec @mvp @implemented
+- a Controller refreshes its owned Bootstrap Lock heartbeat at least every 5 seconds while the bootstrap operation remains live @spec @mvp @implemented
+- concurrent Bootstrap Lock acquisition fails with a typed bootstrap-busy error before remote mutation @spec @mvp @implemented
+- every Bootstrap Lock mutation verifies immediately beforehand that the lock still contains the same operation id, and an owner that loses that check aborts without further mutation @spec @mvp @implemented
+- stale Bootstrap Lock recovery probes remote process, binary, service, and Host Daemon state before the lock can be removed or replaced @spec @mvp @implemented
+- stale Bootstrap Lock removal or replacement uses compare-and-set against the observed operation id after the required postcondition probes, so a recovered owner cannot delete a newer lock @spec @mvp @implemented
+- initial setup and missing-daemon repair acquire Bootstrap Lock, start the Host Daemon, obtain a Maintenance Lease carrying the same operation id, and release Bootstrap Lock only after that handoff is durable @spec @mvp @implemented
 - Host binary replacement on a reachable daemon first obtains a Maintenance Lease, then obtains Bootstrap Lock with the same operation id before stopping or replacing the daemon @spec @mvp
 - the replacement Host Daemon reconciles and adopts that maintenance operation before Bootstrap Lock release, and no workflow acquires these locks in the opposite order for the same operation class @spec @mvp
-- a Bootstrap Lock operation that fails before any remote mutation or managed process starts records a clean failure and releases the lock @spec @mvp
-- a Bootstrap Lock operation that may have mutated remote state or started a managed process preserves the lock and recovery metadata until postcondition reconciliation proves the outcome @spec @mvp
+- a Bootstrap Lock operation that fails before any remote mutation or managed process starts records a clean failure and releases the lock @spec @mvp @implemented
+- a Bootstrap Lock operation that may have mutated remote state or started a managed process preserves the lock and recovery metadata until postcondition reconciliation proves the outcome @spec @mvp @implemented
 
 ## stop-and-recovery
 - satelle stop transitions a starting, running, or recovery_pending Turn to stopped only after the adapter confirms cancellation or otherwise proves that the same upstream Turn is no longer active @mvp @implemented
@@ -1962,13 +1962,13 @@
 - satelle MVP can bootstrap the remote host component by uploading a matching self-contained host binary to the remote machine when a supported transport can copy and execute files @spec @mvp @implemented
 - satelle MVP does not require Satelle to already be installed on the remote host before prompt execution when bootstrap upload is available @spec @mvp @implemented
 - satelle bootstrap invokes the uploaded binary in host-daemon mode on the remote machine @spec @mvp @implemented
-- satelle stores uploaded on-demand host binaries in a user-scoped versioned cache directory on the remote machine instead of temporary directories or global install paths @spec @mvp
-- uploaded Host binary cache directories and files are owner-only, and bootstrap rejects a cached binary before execution when it is not a regular file, is a symlink, or is group- or other-writable @spec @mvp
-- satelle remote binary cache paths include the Satelle version and target platform so different client and host builds do not overwrite each other @spec @mvp
-- satelle MVP never deletes uploaded Host binary cache entries automatically @spec @mvp
-- satelle provides an explicit host cleanup command that removes only remote on-demand binary cache entries proven unused by running or persistent Host Daemons and retains the current version plus at least one previous compatible version by default @spec @mvp
-- satelle automatic cache cleanup does not remove binaries used by persistent host service installations @spec @mvp
-- satelle persistent service installation may reuse the same host binary that on-demand bootstrap uses @spec @mvp
+- satelle stores uploaded on-demand host binaries in a user-scoped versioned cache directory on the remote machine instead of temporary directories or global install paths @spec @mvp @implemented
+- uploaded Host binary cache directories and files are owner-only, and bootstrap rejects a cached binary before execution when it is not a regular file, is a symlink, or is group- or other-writable @spec @mvp @implemented
+- satelle remote binary cache paths include the Satelle version and target platform so different client and host builds do not overwrite each other @spec @mvp @implemented
+- satelle MVP never deletes uploaded Host binary cache entries automatically @spec @mvp @implemented
+- satelle provides an explicit host cleanup command that removes only remote on-demand binary cache entries proven unused by running or persistent Host Daemons and retains the current version plus at least one previous compatible version by default @spec @mvp @implemented
+- satelle automatic cache cleanup does not remove binaries used by persistent host service installations @spec @mvp @implemented
+- satelle persistent service installation may reuse the same host binary that on-demand bootstrap uses @spec @mvp @implemented
 - satelle clients communicate with a Satelle-specific API instead of speaking the Codex app-server protocol directly @spec @mvp @implemented
 - satelle Host Daemon treats the Codex app-server protocol as an internal adapter boundary behind the Satelle API @spec @mvp @implemented
 - satelle API exposes host readiness, sessions, goals, turns, state, logs, and errors as Satelle concepts independent from Codex protocol details @spec @mvp @implemented

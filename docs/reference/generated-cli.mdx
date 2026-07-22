@@ -239,6 +239,7 @@ Commands:
   stop      
   restart   
   update    
+  cleanup   
   sessions  
   storage   
   help      Print this message or the help of the given subcommand(s)
@@ -583,6 +584,21 @@ Options:
       --yes                    
       --no-input               
       --format <FORMAT>        [possible values: human, json]
+      --json                   Alias for --format json
+  -h, --help                   Print help
+```
+
+## `satelle host cleanup`
+
+```text
+Usage: satelle host cleanup [OPTIONS]
+
+Options:
+      --host <HOST>            
+      --no-color               Disable colored human output
+      --format <FORMAT>        [possible values: human, json]
+      --profile <NAME>         Apply a named user-level configuration profile
+      --error-format <FORMAT>  Format diagnostics as human-readable text or JSON [env: SATELLE_ERROR_FORMAT=] [possible values: human, json]
       --json                   Alias for --format json
   -h, --help                   Print help
 ```

@@ -1,9 +1,9 @@
 use crate::contract::{
     AdmissionCancellationResponse, ApiError, ApiErrorCode, AuthenticatedResponseContract,
-    CapabilitiesResponse, DurableTokenActivationResponse, DurableTokenConfirmationResponse,
-    DurableTokenIssuanceResponse, HostDesktopSessionsResponse, HostStatusResponse, LiveResponse,
-    LogsPageResponse, PROTOCOL_VERSION, PROTOCOL_VERSION_HEADER, RequestId, SessionResponse,
-    StopRequest, StopResponse, TurnRequest,
+    BootstrapMaintenanceResponse, CapabilitiesResponse, DurableTokenActivationResponse,
+    DurableTokenConfirmationResponse, DurableTokenIssuanceResponse, HostDesktopSessionsResponse,
+    HostStatusResponse, LiveResponse, LogsPageResponse, PROTOCOL_VERSION, PROTOCOL_VERSION_HEADER,
+    RequestId, SessionResponse, StopRequest, StopResponse, TurnRequest,
 };
 use crate::transport_tls::{
     ReqwestTrustError, TlsFailureKind, classify_tls_error, configure_reqwest_trust,
@@ -215,6 +215,25 @@ impl DaemonClient {
     ) -> Result<DurableTokenActivationResponse, DaemonClientError> {
         let path = format!("/v1/setup/api-token/{token_id}/abort");
         let (request, request_id) = self.mutation_request(&path, idempotency_key)?;
+        self.send_authenticated(request, request_id, StatusCode::OK)
+    }
+
+    pub fn complete_bootstrap_maintenance(
+        &self,
+        operation_id: &str,
+    ) -> Result<BootstrapMaintenanceResponse, DaemonClientError> {
+        let path = format!("/v1/maintenance/bootstrap/{operation_id}/complete");
+        let (request, request_id) = self.mutation_request(&path, operation_id)?;
+        self.send_authenticated(request, request_id, StatusCode::OK)
+    }
+
+    pub fn begin_bootstrap_maintenance(
+        &self,
+        operation_id: &str,
+        operation_kind: &str,
+    ) -> Result<BootstrapMaintenanceResponse, DaemonClientError> {
+        let path = format!("/v1/maintenance/bootstrap/{operation_id}/{operation_kind}/begin");
+        let (request, request_id) = self.mutation_request(&path, operation_id)?;
         self.send_authenticated(request, request_id, StatusCode::OK)
     }
 

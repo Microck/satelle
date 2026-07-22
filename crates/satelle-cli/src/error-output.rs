@@ -192,14 +192,15 @@ fn error_contract(code: ErrorCode) -> ErrorContract {
             outcome: "The request conflicted with an earlier operation.",
             default_recovery: "retry with a new idempotency key",
         },
-        ErrorCode::HostBusy | ErrorCode::StateConflict | ErrorCode::StopNotConfirmed => {
-            ErrorContract {
-                category: ErrorCategory::Conflict,
-                retryable: true,
-                outcome: "The requested state change was not applied.",
-                default_recovery: "check the current Host and Session status, then retry",
-            }
-        }
+        ErrorCode::BootstrapBusy
+        | ErrorCode::HostBusy
+        | ErrorCode::StateConflict
+        | ErrorCode::StopNotConfirmed => ErrorContract {
+            category: ErrorCategory::Conflict,
+            retryable: true,
+            outcome: "The requested state change was not applied.",
+            default_recovery: "check the current Host and Session status, then retry",
+        },
         ErrorCode::IncompatibleControlPlane
         | ErrorCode::ComputerUseNotReady
         | ErrorCode::UnsupportedProviderComputerUse

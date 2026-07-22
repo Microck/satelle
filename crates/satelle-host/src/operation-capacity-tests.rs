@@ -2238,6 +2238,7 @@ fn service(state_root: &Path, adapter: ControlledAdapter) -> HostService {
         mode: HostMode::TestFake,
         operation_capacity: Arc::new(OperationCapacity::default()),
         bootstrap_auth: None,
+        bootstrap_maintenance: Arc::new(Mutex::new(None)),
     }
 }
 

@@ -555,85 +555,215 @@ impl Storage {
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|source| sqlite_error(StorageErrorKind::OperationFailed, source))?;
-        let maintenance_exists: i64 = transaction
-            .query_row(
-                "SELECT EXISTS(SELECT 1 FROM maintenance_leases WHERE host_identity_ref = ?1)",
-                [host_identity.as_str()],
-                |row| row.get(0),
+        begin_setup_run_in_transaction(&transaction, plan, &owner, host_identity.as_str())?;
+        transaction
+            .commit()
+            .map_err(|source| sqlite_error(StorageErrorKind::OperationFailed, source))?;
+        Ok(MaintenanceLeaseCapability::new(owner))
+    }
+
+    pub(crate) fn begin_bootstrap_maintenance(
+        &mut self,
+        plan: &SetupRunPlan,
+        owner: LeaseOwner,
+    ) -> Result<MaintenanceLeaseCapability, StorageError> {
+        if plan.run_id != owner.operation_id
+            || plan.actions.len() != 1
+            || plan.actions[0].action_id != "bootstrap-handoff"
+        {
+            return Err(StorageError::new(StorageErrorKind::InvalidInput));
+        }
+        let host_identity = self.host_identity()?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|source| sqlite_error(StorageErrorKind::OperationFailed, source))?;
+        begin_setup_run_in_transaction(&transaction, plan, &owner, host_identity.as_str())?;
+        let started = transaction
+            .execute(
+                "UPDATE setup_actions
+                 SET status = 'started', started_at = ?2
+                 WHERE run_id = ?1
+                   AND action_id = 'bootstrap-handoff'
+                   AND status = 'planned'",
+                params![plan.run_id, format_time(owner.acquired_at)?],
             )
             .map_err(|source| sqlite_error(StorageErrorKind::OperationFailed, source))?;
-        if maintenance_exists != 0 {
-            return Err(StorageError::new(StorageErrorKind::LeaseConflict));
+        require_one_transition(started)?;
+        transaction
+            .commit()
+            .map_err(|source| sqlite_error(StorageErrorKind::OperationFailed, source))?;
+        Ok(MaintenanceLeaseCapability::new(owner))
+    }
+
+    pub(crate) fn complete_bootstrap_maintenance(
+        &mut self,
+        capability: &MaintenanceLeaseCapability,
+        finished_at: OffsetDateTime,
+    ) -> Result<SetupRunStatus, StorageError> {
+        let run_id = capability.operation_id();
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|source| sqlite_error(StorageErrorKind::OperationFailed, source))?;
+        require_active_maintenance_owner(&transaction, capability)?;
+        let action_status = transaction
+            .query_row(
+                "SELECT status FROM setup_actions
+                 WHERE run_id = ?1 AND action_id = 'bootstrap-handoff'",
+                [run_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(|source| sqlite_error(StorageErrorKind::OperationFailed, source))?
+            .ok_or_else(|| StorageError::new(StorageErrorKind::StateConflict))?;
+        match SetupActionStatus::parse(&action_status)? {
+            SetupActionStatus::Started => {
+                require_run_and_predecessor_times(
+                    &transaction,
+                    run_id,
+                    "bootstrap-handoff",
+                    finished_at,
+                )?;
+                let completed = transaction
+                    .execute(
+                        "UPDATE setup_actions
+                         SET status = 'completed', finished_at = ?2
+                         WHERE run_id = ?1
+                           AND action_id = 'bootstrap-handoff'
+                           AND status = 'started'
+                           AND EXISTS (
+                               SELECT 1 FROM setup_runs
+                               WHERE setup_runs.run_id = setup_actions.run_id
+                                 AND setup_runs.status = 'running'
+                           )",
+                        params![run_id, format_time(finished_at)?],
+                    )
+                    .map_err(|source| sqlite_error(StorageErrorKind::OperationFailed, source))?;
+                require_one_transition(completed)?;
+            }
+            SetupActionStatus::Completed => {}
+            _ => return Err(StorageError::new(StorageErrorKind::StateConflict)),
         }
-        // Planning and execution are separate API calls. Reserving mutation
-        // scope inside the write transaction closes the race between callers
-        // that both planned before either persisted its run.
-        if active_setup_run_in_scope(&transaction, plan.desktop_binding.as_ref())? {
+        let status = finish_setup_run_in_transaction(&transaction, run_id, finished_at)?;
+        if status != SetupRunStatus::Completed {
             return Err(StorageError::new(StorageErrorKind::StateConflict));
         }
-        let control_exists: i64 = transaction
-            .query_row(
-                "SELECT EXISTS(SELECT 1 FROM control_leases WHERE host_identity_ref = ?1)",
-                [host_identity.as_str()],
-                |row| row.get(0),
+        release_active_maintenance_in_transaction(&transaction, capability)?;
+        transaction
+            .commit()
+            .map_err(|source| sqlite_error(StorageErrorKind::OperationFailed, source))?;
+        Ok(status)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn force_bootstrap_retain_conflict_for_test(
+        &mut self,
+        operation_id: &str,
+    ) -> Result<(), StorageError> {
+        let operation_id = validated_private_reference(operation_id.to_string())?;
+        let changed = self
+            .connection
+            .execute(
+                "UPDATE maintenance_leases
+                 SET lease_state = 'recovery_pending'
+                 WHERE operation_id = ?1 AND lease_state = 'active'",
+                [operation_id],
             )
             .map_err(|source| sqlite_error(StorageErrorKind::OperationFailed, source))?;
-        if control_exists != 0 {
-            return Err(StorageError::new(StorageErrorKind::LeaseConflict));
+        require_one_transition(changed)
+    }
+
+    pub(crate) fn adopt_recovery_maintenance(
+        &mut self,
+        operation_id: &str,
+        owner: LeaseOwner,
+    ) -> Result<MaintenanceLeaseCapability, StorageError> {
+        let operation_id = validated_private_reference(operation_id.to_string())?;
+        if operation_id != owner.operation_id {
+            return Err(StorageError::new(StorageErrorKind::InvalidInput));
         }
-        transaction
-            .execute(
-                "INSERT INTO setup_runs (
-                    run_id, host_identity_ref, desktop_binding_ref, satelle_version,
-                    operation_kind, status, started_at, finished_at
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, 'running', ?6, NULL)",
-                params![
-                    plan.run_id,
-                    host_identity.as_str(),
-                    plan.desktop_binding.as_ref().map(DesktopBindingRef::as_str),
-                    env!("CARGO_PKG_VERSION"),
-                    plan.operation_kind.as_str(),
-                    format_time(plan.started_at)?,
-                ],
+        let host_identity = self.host_identity()?;
+        let acquired_at = format_time(owner.acquired_at)?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|source| sqlite_error(StorageErrorKind::OperationFailed, source))?;
+        let action_status = transaction
+            .query_row(
+                "SELECT setup_actions.status
+                 FROM setup_actions
+                 JOIN setup_runs USING (run_id)
+                 WHERE setup_runs.run_id = ?1
+                   AND setup_runs.status = 'outcome_unknown'
+                   AND setup_actions.action_id = 'bootstrap-handoff'",
+                [operation_id.as_str()],
+                |row| row.get::<_, String>(0),
             )
-            .map_err(setup_write_error)?;
-        for (order, action) in plan.actions.iter().enumerate() {
-            let order = i64::try_from(order)
-                .map_err(|_| StorageError::new(StorageErrorKind::InvalidInput))?;
+            .optional()
+            .map_err(|source| sqlite_error(StorageErrorKind::OperationFailed, source))?
+            .ok_or_else(|| StorageError::new(StorageErrorKind::StateConflict))?;
+        let parsed_action_status = SetupActionStatus::parse(&action_status)?;
+        if !matches!(
+            parsed_action_status,
+            SetupActionStatus::Planned
+                | SetupActionStatus::Started
+                | SetupActionStatus::OutcomeUnknown
+                | SetupActionStatus::Completed
+        ) {
+            return Err(StorageError::new(StorageErrorKind::StateConflict));
+        }
+        require_one_transition(
             transaction
                 .execute(
-                    "INSERT INTO setup_actions (
-                        run_id, action_id, action_order, action_label, status,
-                        started_at, finished_at, retry_safe, error_code, exit_status,
-                        recovery_hint, skip_reason
-                     ) VALUES (?1, ?2, ?3, ?4, 'planned', NULL, NULL, ?5, NULL, NULL, NULL, NULL)",
+                    "UPDATE setup_runs
+                     SET status = 'running', finished_at = NULL
+                     WHERE run_id = ?1 AND status = 'outcome_unknown'",
+                    [operation_id.as_str()],
+                )
+                .map_err(|source| sqlite_error(StorageErrorKind::OperationFailed, source))?,
+        )?;
+        if parsed_action_status != SetupActionStatus::Completed {
+            require_one_transition(
+                transaction
+                    .execute(
+                        "UPDATE setup_actions
+                         SET status = 'started',
+                             started_at = coalesce(started_at, ?2),
+                             finished_at = NULL,
+                             recovery_hint = NULL
+                         WHERE run_id = ?1
+                           AND action_id = 'bootstrap-handoff'
+                           AND status = ?3",
+                        params![operation_id.as_str(), acquired_at, action_status],
+                    )
+                    .map_err(|source| sqlite_error(StorageErrorKind::OperationFailed, source))?,
+            )?;
+        }
+        require_one_transition(
+            transaction
+                .execute(
+                    "UPDATE maintenance_leases
+                     SET owner_process_id = ?3,
+                         owner_process_start_ref = ?4,
+                         owner_boot_identity_ref = ?5,
+                         acquired_at = ?6,
+                         heartbeat_at = ?6,
+                         lease_state = 'active'
+                     WHERE host_identity_ref = ?1
+                       AND operation_id = ?2
+                       AND lease_state = 'recovery_pending'",
                     params![
-                        plan.run_id,
-                        action.action_id,
-                        order,
-                        action.label,
-                        i64::from(action.retry_safe),
+                        host_identity.as_str(),
+                        operation_id.as_str(),
+                        i64::from(owner.process_id),
+                        owner.process_start_ref.as_str(),
+                        owner.boot_identity_ref.as_str(),
+                        acquired_at,
                     ],
                 )
-                .map_err(setup_write_error)?;
-        }
-        transaction
-            .execute(
-                "INSERT INTO maintenance_leases (
-                    host_identity_ref, operation_id, owner_process_id,
-                    owner_process_start_ref, owner_boot_identity_ref,
-                    acquired_at, heartbeat_at, lease_state
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6, 'active')",
-                params![
-                    host_identity.as_str(),
-                    owner.operation_id.as_str(),
-                    i64::from(owner.process_id),
-                    owner.process_start_ref.as_str(),
-                    owner.boot_identity_ref.as_str(),
-                    format_time(owner.acquired_at)?,
-                ],
-            )
-            .map_err(|source| sqlite_error(StorageErrorKind::LeaseConflict, source))?;
+                .map_err(|source| sqlite_error(StorageErrorKind::OperationFailed, source))?,
+        )?;
         transaction
             .commit()
             .map_err(|source| sqlite_error(StorageErrorKind::OperationFailed, source))?;
@@ -766,7 +896,6 @@ impl Storage {
         capability: &MaintenanceLeaseCapability,
         finished_at: OffsetDateTime,
     ) -> Result<SetupRunStatus, StorageError> {
-        let owner = capability.lease_owner();
         let run_id = capability.operation_id();
         let transaction = self
             .connection
@@ -774,29 +903,7 @@ impl Storage {
             .map_err(|source| sqlite_error(StorageErrorKind::OperationFailed, source))?;
         require_active_maintenance_owner(&transaction, capability)?;
         let status = finish_setup_run_in_transaction(&transaction, run_id, finished_at)?;
-        let released = transaction
-            .execute(
-                "DELETE FROM maintenance_leases
-                 WHERE operation_id = ?1
-                   AND owner_process_id = ?2
-                   AND owner_process_start_ref = ?3
-                   AND owner_boot_identity_ref = ?4
-                   AND acquired_at = ?5
-                   AND lease_state = 'active'
-                   AND NOT EXISTS (
-                       SELECT 1 FROM control_leases
-                       WHERE control_leases.operation_id = maintenance_leases.operation_id
-                   )",
-                params![
-                    run_id,
-                    i64::from(owner.process_id),
-                    owner.process_start_ref.as_str(),
-                    owner.boot_identity_ref.as_str(),
-                    format_time(owner.acquired_at)?,
-                ],
-            )
-            .map_err(|source| sqlite_error(StorageErrorKind::OperationFailed, source))?;
-        require_one_transition(released)?;
+        release_active_maintenance_in_transaction(&transaction, capability)?;
         transaction
             .commit()
             .map_err(|source| sqlite_error(StorageErrorKind::OperationFailed, source))?;
@@ -1409,6 +1516,123 @@ pub(super) fn mark_setup_run_outcome_unknown_in_transaction(
         )
         .map_err(|source| sqlite_error(StorageErrorKind::OperationFailed, source))?;
     require_one_transition(changed)
+}
+
+fn begin_setup_run_in_transaction(
+    transaction: &Transaction<'_>,
+    plan: &SetupRunPlan,
+    owner: &LeaseOwner,
+    host_identity: &str,
+) -> Result<(), StorageError> {
+    let maintenance_exists: i64 = transaction
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM maintenance_leases WHERE host_identity_ref = ?1)",
+            [host_identity],
+            |row| row.get(0),
+        )
+        .map_err(|source| sqlite_error(StorageErrorKind::OperationFailed, source))?;
+    if maintenance_exists != 0 {
+        return Err(StorageError::new(StorageErrorKind::LeaseConflict));
+    }
+    // Planning and execution are separate API calls. Reserving mutation scope
+    // here closes the race between callers that planned before either wrote.
+    if active_setup_run_in_scope(transaction, plan.desktop_binding.as_ref())? {
+        return Err(StorageError::new(StorageErrorKind::StateConflict));
+    }
+    let control_exists: i64 = transaction
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM control_leases WHERE host_identity_ref = ?1)",
+            [host_identity],
+            |row| row.get(0),
+        )
+        .map_err(|source| sqlite_error(StorageErrorKind::OperationFailed, source))?;
+    if control_exists != 0 {
+        return Err(StorageError::new(StorageErrorKind::LeaseConflict));
+    }
+    transaction
+        .execute(
+            "INSERT INTO setup_runs (
+                run_id, host_identity_ref, desktop_binding_ref, satelle_version,
+                operation_kind, status, started_at, finished_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, 'running', ?6, NULL)",
+            params![
+                plan.run_id,
+                host_identity,
+                plan.desktop_binding.as_ref().map(DesktopBindingRef::as_str),
+                env!("CARGO_PKG_VERSION"),
+                plan.operation_kind.as_str(),
+                format_time(plan.started_at)?,
+            ],
+        )
+        .map_err(setup_write_error)?;
+    for (order, action) in plan.actions.iter().enumerate() {
+        let order =
+            i64::try_from(order).map_err(|_| StorageError::new(StorageErrorKind::InvalidInput))?;
+        transaction
+            .execute(
+                "INSERT INTO setup_actions (
+                    run_id, action_id, action_order, action_label, status,
+                    started_at, finished_at, retry_safe, error_code, exit_status,
+                    recovery_hint, skip_reason
+                 ) VALUES (?1, ?2, ?3, ?4, 'planned', NULL, NULL, ?5, NULL, NULL, NULL, NULL)",
+                params![
+                    plan.run_id,
+                    action.action_id,
+                    order,
+                    action.label,
+                    i64::from(action.retry_safe),
+                ],
+            )
+            .map_err(setup_write_error)?;
+    }
+    transaction
+        .execute(
+            "INSERT INTO maintenance_leases (
+                host_identity_ref, operation_id, owner_process_id,
+                owner_process_start_ref, owner_boot_identity_ref,
+                acquired_at, heartbeat_at, lease_state
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6, 'active')",
+            params![
+                host_identity,
+                owner.operation_id.as_str(),
+                i64::from(owner.process_id),
+                owner.process_start_ref.as_str(),
+                owner.boot_identity_ref.as_str(),
+                format_time(owner.acquired_at)?,
+            ],
+        )
+        .map_err(|source| sqlite_error(StorageErrorKind::LeaseConflict, source))?;
+    Ok(())
+}
+
+fn release_active_maintenance_in_transaction(
+    transaction: &Transaction<'_>,
+    capability: &MaintenanceLeaseCapability,
+) -> Result<(), StorageError> {
+    let owner = capability.lease_owner();
+    let released = transaction
+        .execute(
+            "DELETE FROM maintenance_leases
+             WHERE operation_id = ?1
+               AND owner_process_id = ?2
+               AND owner_process_start_ref = ?3
+               AND owner_boot_identity_ref = ?4
+               AND acquired_at = ?5
+               AND lease_state = 'active'
+               AND NOT EXISTS (
+                   SELECT 1 FROM control_leases
+                   WHERE control_leases.operation_id = maintenance_leases.operation_id
+               )",
+            params![
+                capability.operation_id(),
+                i64::from(owner.process_id),
+                owner.process_start_ref.as_str(),
+                owner.boot_identity_ref.as_str(),
+                format_time(owner.acquired_at)?,
+            ],
+        )
+        .map_err(|source| sqlite_error(StorageErrorKind::OperationFailed, source))?;
+    require_one_transition(released)
 }
 
 fn active_setup_run_in_scope(
