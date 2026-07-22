@@ -232,7 +232,90 @@ impl DaemonClient {
         operation_id: &str,
         operation_kind: &str,
     ) -> Result<BootstrapMaintenanceResponse, DaemonClientError> {
-        let path = format!("/v1/maintenance/bootstrap/{operation_id}/{operation_kind}/begin");
+        let path = format!(
+            "/v1/maintenance/bootstrap/{operation_id}/{operation_kind}/on_demand_handoff/begin"
+        );
+        let (request, request_id) = self.mutation_request(&path, operation_id)?;
+        self.send_authenticated(request, request_id, StatusCode::OK)
+    }
+
+    pub fn begin_persistent_service_maintenance(
+        &self,
+        operation_id: &str,
+        operation_kind: &str,
+    ) -> Result<BootstrapMaintenanceResponse, DaemonClientError> {
+        let path = format!(
+            "/v1/maintenance/bootstrap/{operation_id}/{operation_kind}/persistent_host_service/begin"
+        );
+        let (request, request_id) = self.mutation_request(&path, operation_id)?;
+        self.send_authenticated(request, request_id, StatusCode::OK)
+    }
+
+    pub fn begin_persistent_host_stop_maintenance(
+        &self,
+        operation_id: &str,
+    ) -> Result<BootstrapMaintenanceResponse, DaemonClientError> {
+        let path = format!(
+            "/v1/maintenance/bootstrap/{operation_id}/service_restart/persistent_host_stop/begin"
+        );
+        let (request, request_id) = self.mutation_request(&path, operation_id)?;
+        self.send_authenticated(request, request_id, StatusCode::OK)
+    }
+
+    pub fn begin_persistent_host_restart_maintenance(
+        &self,
+        operation_id: &str,
+    ) -> Result<BootstrapMaintenanceResponse, DaemonClientError> {
+        let path = format!(
+            "/v1/maintenance/bootstrap/{operation_id}/service_restart/persistent_host_restart/begin"
+        );
+        let (request, request_id) = self.mutation_request(&path, operation_id)?;
+        self.send_authenticated(request, request_id, StatusCode::OK)
+    }
+
+    pub fn start_persistent_service_action(
+        &self,
+        operation_id: &str,
+        action_id: &str,
+    ) -> Result<BootstrapMaintenanceResponse, DaemonClientError> {
+        let path = format!(
+            "/v1/maintenance/bootstrap/{operation_id}/persistent-host-service/{action_id}/start"
+        );
+        let (request, request_id) = self.mutation_request(&path, operation_id)?;
+        self.send_authenticated(request, request_id, StatusCode::OK)
+    }
+
+    pub fn complete_persistent_service_action(
+        &self,
+        operation_id: &str,
+        action_id: &str,
+    ) -> Result<BootstrapMaintenanceResponse, DaemonClientError> {
+        let path = format!(
+            "/v1/maintenance/bootstrap/{operation_id}/persistent-host-service/{action_id}/complete"
+        );
+        let (request, request_id) = self.mutation_request(&path, operation_id)?;
+        self.send_authenticated(request, request_id, StatusCode::OK)
+    }
+
+    pub fn fail_persistent_service_action(
+        &self,
+        operation_id: &str,
+        action_id: &str,
+        failure_kind: &str,
+    ) -> Result<BootstrapMaintenanceResponse, DaemonClientError> {
+        let path = format!(
+            "/v1/maintenance/bootstrap/{operation_id}/persistent-host-service/{action_id}/fail/{failure_kind}"
+        );
+        let (request, request_id) = self.mutation_request(&path, operation_id)?;
+        self.send_authenticated(request, request_id, StatusCode::OK)
+    }
+
+    pub fn finish_persistent_service_maintenance(
+        &self,
+        operation_id: &str,
+    ) -> Result<BootstrapMaintenanceResponse, DaemonClientError> {
+        let path =
+            format!("/v1/maintenance/bootstrap/{operation_id}/persistent-host-service/finish");
         let (request, request_id) = self.mutation_request(&path, operation_id)?;
         self.send_authenticated(request, request_id, StatusCode::OK)
     }

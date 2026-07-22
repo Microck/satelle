@@ -26,6 +26,13 @@ use std::time::Duration;
 use tokio_tungstenite::tungstenite::Error as WebSocketError;
 use tokio_tungstenite::tungstenite::error::ProtocolError;
 
+fn setup_selection(mode: satelle_core::SetupMode) -> SetupModeSelection {
+    SetupModeSelection::new(
+        mode,
+        satelle_core::daemon_service::SetupModeSource::SetupFlag,
+    )
+}
+
 #[derive(Clone)]
 struct RecordingProviderIntentAdapter {
     observed: Arc<Mutex<Option<ProviderComputerUseIntent>>>,
@@ -312,7 +319,7 @@ fn ssh_setup_plan_reaches_explicit_trust_for_an_unpinned_host() {
     let report = transport
         .setup(
             true,
-            "on_demand".to_string(),
+            setup_selection(satelle_core::SetupMode::OnDemand),
             vec!["transport".to_string()],
             DaemonPathOverrides::default(),
         )
@@ -341,7 +348,7 @@ fn ssh_setup_plan_requires_an_external_token_file_without_mutating() {
     let report = transport
         .setup(
             true,
-            "on_demand".to_string(),
+            setup_selection(satelle_core::SetupMode::OnDemand),
             vec!["transport".to_string()],
             DaemonPathOverrides::default(),
         )
@@ -377,7 +384,7 @@ fn ssh_setup_plan_declares_one_durable_token_handoff() {
     let report = transport
         .setup(
             true,
-            "on_demand".to_string(),
+            setup_selection(satelle_core::SetupMode::OnDemand),
             vec!["transport".to_string()],
             DaemonPathOverrides::default(),
         )
@@ -414,7 +421,7 @@ fn ssh_setup_plan_declares_verified_release_bootstrap_without_storage_migration(
     let report = transport
         .setup(
             true,
-            "on_demand".to_string(),
+            setup_selection(satelle_core::SetupMode::OnDemand),
             vec!["transport".to_string()],
             overrides,
         )
@@ -523,7 +530,7 @@ fn ssh_setup_rerun_reuses_an_existing_secure_token_destination() {
     let report = transport
         .setup(
             true,
-            "on_demand".to_string(),
+            setup_selection(satelle_core::SetupMode::OnDemand),
             vec!["transport".to_string()],
             DaemonPathOverrides::default(),
         )
@@ -1884,7 +1891,7 @@ fn ssh_setup_rejects_unimplemented_components_before_mutating() {
         let error = transport
             .setup(
                 false,
-                "on_demand".to_string(),
+                setup_selection(satelle_core::SetupMode::OnDemand),
                 components,
                 DaemonPathOverrides::default(),
             )
@@ -1895,20 +1902,123 @@ fn ssh_setup_rejects_unimplemented_components_before_mutating() {
 }
 
 #[test]
-fn ssh_setup_rejects_persistent_mode_before_mutating() {
+fn ssh_setup_rejects_explicit_persistent_linux_before_mutating() {
     let path = std::env::temp_dir().join("satelle-persistent-setup.token");
     let transport = SshSetupTransport::new(&ssh_setup_host(Some(ApiTokenSource::File { path })))
         .expect("construct setup");
     let error = transport
         .setup(
             false,
-            "persistent".to_string(),
+            setup_selection(satelle_core::SetupMode::Persistent),
             vec!["transport".to_string()],
             DaemonPathOverrides::default(),
         )
-        .expect_err("persistent SSH setup must install a service before it can succeed");
+        .expect_err("explicit persistent Linux setup must fail closed");
 
-    assert_eq!(error.code, ErrorCode::NotImplemented);
+    assert_eq!(error.code, ErrorCode::PersistentServiceUnsupported);
+    assert_eq!(
+        error.details.get("platform"),
+        Some(&serde_json::json!("linux"))
+    );
+    assert_eq!(
+        error.details.get("mutated"),
+        Some(&serde_json::json!(false))
+    );
+}
+
+#[test]
+fn ssh_setup_falls_back_only_for_inherited_persistent_linux() {
+    let path = std::env::temp_dir().join("satelle-inherited-persistent-setup.token");
+    let transport = SshSetupTransport::new(&ssh_setup_host(Some(ApiTokenSource::File { path })))
+        .expect("construct setup");
+    let report = transport
+        .setup(
+            true,
+            SetupModeSelection::new(
+                satelle_core::SetupMode::Persistent,
+                satelle_core::daemon_service::SetupModeSource::UserConfig,
+            ),
+            vec!["transport".to_string()],
+            DaemonPathOverrides::default(),
+        )
+        .expect("inherited persistent Linux mode must produce an on-demand fallback plan");
+
+    assert_eq!(report.setup_mode, "on_demand");
+    assert!(!report.service_persistent);
+    assert_eq!(report.service_scope, "on_demand");
+    assert_eq!(report.target_platform.as_deref(), Some("linux-x64-gnu"));
+    assert!(
+        report
+            .fallback_reason
+            .is_some_and(|reason| reason.contains("unsupported"))
+    );
+}
+
+#[test]
+fn ssh_setup_plans_windows_task_scheduler_login_session_service() {
+    let path = std::env::temp_dir().join("satelle-windows-persistent-setup.token");
+    let transport = SshSetupTransport::new(&ssh_setup_host(Some(ApiTokenSource::File { path })))
+        .expect("construct setup")
+        .with_remote_target_for_tests(ssh_bootstrap::RemoteTarget::WindowsX64Msvc);
+    let report = transport
+        .setup(
+            true,
+            setup_selection(satelle_core::SetupMode::Persistent),
+            vec!["transport".to_string()],
+            DaemonPathOverrides {
+                state_dir: Some(PathBuf::from(r"C:\Satelle\state")),
+                log_dir: Some(PathBuf::from(r"C:\Satelle\logs")),
+                ..DaemonPathOverrides::default()
+            },
+        )
+        .expect("Windows persistent setup must produce a service plan");
+
+    assert_eq!(report.setup_mode, "persistent");
+    assert!(report.service_persistent);
+    assert_eq!(report.service_scope, "login_session");
+    assert_eq!(report.target_platform.as_deref(), Some("win32-x64-msvc"));
+    let service = report.service_plan.expect("service plan");
+    assert_eq!(
+        service.manager,
+        satelle_core::daemon_service::DaemonServiceManager::WindowsTaskScheduler
+    );
+    assert!(!service.privileged);
+    let artifact = report.host_artifact.expect("Host artifact plan");
+    assert_eq!(artifact.current_version, None);
+    assert_eq!(artifact.target_version, env!("CARGO_PKG_VERSION"));
+    assert_eq!(artifact.target_platform, "win32-x64-msvc");
+    assert_eq!(
+        artifact.artifact_digest,
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    );
+    assert!(
+        artifact
+            .install_path
+            .starts_with(r"C:\Users\operator\AppData\Local\Satelle\host")
+    );
+    assert!(artifact.install_path.ends_with(".exe"));
+    assert!(artifact.restart_impact.contains("persistent Host Daemon"));
+    let current_paths = report
+        .current_daemon_paths
+        .expect("current daemon Path Set");
+    assert_eq!(
+        current_paths.state_root,
+        r"C:\Users\operator\AppData\Local\Microck\Satelle\data\state"
+    );
+    let planned_paths = report
+        .planned_daemon_paths
+        .expect("planned daemon Path Set");
+    assert_eq!(planned_paths.state_root, r"C:\Satelle\state");
+    assert_eq!(planned_paths.operator_log_root, r"C:\Satelle\logs");
+    assert!(
+        planned_paths
+            .required_directories()
+            .contains(&r"C:\Satelle\state".to_string())
+    );
+    assert!(report.planned_actions.iter().any(|action| {
+        action.contains("windows_task_scheduler")
+            && action.contains("authenticated loopback readiness")
+    }));
 }
 
 #[test]
@@ -1923,7 +2033,7 @@ fn ssh_setup_path_overrides_wait_for_required_token_input_without_mutating() {
     let report = transport
         .setup(
             false,
-            "on_demand".to_string(),
+            setup_selection(satelle_core::SetupMode::OnDemand),
             vec!["transport".to_string()],
             overrides,
         )
@@ -1989,7 +2099,7 @@ fn ssh_setup_path_change_does_not_reuse_an_existing_store_token() {
     let report = transport
         .setup(
             false,
-            "on_demand".to_string(),
+            setup_selection(satelle_core::SetupMode::OnDemand),
             vec!["transport".to_string()],
             overrides,
         )

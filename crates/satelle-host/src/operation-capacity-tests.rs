@@ -7,7 +7,9 @@ use crate::storage::IdempotentOperation;
 use crate::test_runtime::FakeComputerUseAdapter;
 use crate::{ApiBearerToken, ApiScopes, HostMode, HostService, MutationAuthority, TurnIntent};
 use satelle_core::session::{PublicSession, StopObservation, TurnExecutionMode};
-use satelle_core::{ControlPlaneOperation, ErrorCode, SatelleError, SessionId, TurnId};
+use satelle_core::{
+    ControlPlaneOperation, ErrorCode, LOCAL_DEMO_HOST, SatelleError, SessionId, TurnId,
+};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, mpsc};
@@ -1494,6 +1496,120 @@ fn daemon_activity_snapshot_tracks_live_host_operations() {
         .expect("read finished daemon activity");
     assert!(finished.is_idle());
     assert_ne!(finished.generation(), active.generation());
+}
+
+#[test]
+fn daemon_activity_snapshot_tracks_detached_turn_work_after_admission() {
+    let state = crate::TestStateDir::new().expect("temporary state directory");
+    let adapter = ControlledAdapter::default();
+    adapter.block_execution.store(true, Ordering::SeqCst);
+    let service = service(state.path(), adapter.clone());
+    let request_authority = authority(&service, "principal-queued", "queued-turn-request");
+
+    service
+        .admit_run(&intent("queued Turn remains live"), &request_authority)
+        .expect("admit detached Turn");
+    assert!(adapter.execute_started.wait_for(WAIT_LIMIT));
+    assert!(
+        service
+            .operation_capacity
+            .activity_snapshot()
+            .expect("capacity remains readable")
+            .0,
+        "the admission slot must be clear while detached Turn work remains"
+    );
+    assert!(
+        !service
+            .daemon_activity_snapshot()
+            .expect("read detached Turn activity")
+            .is_idle(),
+        "queued or executing detached Turn work must keep the daemon alive"
+    );
+
+    adapter.execute_release.signal();
+    service
+        .runtime
+        .wait_for_background()
+        .expect("detached Turn must finish");
+    assert!(
+        service
+            .daemon_activity_snapshot()
+            .expect("read finished Turn activity")
+            .is_idle()
+    );
+}
+
+#[test]
+fn daemon_activity_snapshot_tracks_control_probes() {
+    let state = crate::TestStateDir::new().expect("temporary state directory");
+    let adapter = ControlledAdapter::default();
+    adapter.block_next_preflight();
+    let service = service(state.path(), adapter.clone());
+    let provider_intent = intent("control probe").provider_intent().clone();
+    let initial = service
+        .daemon_activity_snapshot()
+        .expect("read initial activity");
+    let probe_runtime = service.runtime.clone();
+    let probe = std::thread::spawn(move || {
+        probe_runtime.refresh_provider_smoke(LOCAL_DEMO_HOST, &provider_intent)
+    });
+    assert!(adapter.preflight_started.wait_for(WAIT_LIMIT));
+
+    let active = service
+        .daemon_activity_snapshot()
+        .expect("read control probe activity");
+    assert!(!active.is_idle());
+    assert_ne!(active.generation(), initial.generation());
+
+    adapter.preflight_release.signal();
+    probe
+        .join()
+        .expect("control probe thread must not panic")
+        .expect("control probe must finish");
+    let finished = service
+        .daemon_activity_snapshot()
+        .expect("read finished control probe activity");
+    assert!(finished.is_idle());
+    assert_ne!(finished.generation(), active.generation());
+}
+
+#[test]
+fn daemon_activity_snapshot_tracks_active_maintenance_only() {
+    let state = crate::TestStateDir::new().expect("temporary state directory");
+    let service = service(state.path(), ControlledAdapter::default());
+    let plan = crate::storage::SetupRunPlan::new(
+        "daemon-activity-maintenance",
+        crate::storage::SetupOperationKind::Repair,
+        None,
+        time::OffsetDateTime::UNIX_EPOCH,
+        vec![
+            crate::storage::SetupActionPlan::new("repair-runtime", "Repair runtime", false)
+                .expect("construct setup action"),
+        ],
+    )
+    .expect("construct setup plan");
+    let initial = service
+        .daemon_activity_snapshot()
+        .expect("read initial activity");
+
+    let operation = service
+        .begin_setup_run(&plan)
+        .expect("begin maintenance operation");
+    let active = service
+        .daemon_activity_snapshot()
+        .expect("read maintenance activity");
+    assert!(!active.is_idle());
+    assert_ne!(active.generation(), initial.generation());
+
+    drop(operation);
+    let retained = service
+        .daemon_activity_snapshot()
+        .expect("read retained maintenance record activity");
+    assert!(
+        retained.is_idle(),
+        "a retained durable recovery record is not a live maintenance operation"
+    );
+    assert_ne!(retained.generation(), active.generation());
 }
 
 #[test]

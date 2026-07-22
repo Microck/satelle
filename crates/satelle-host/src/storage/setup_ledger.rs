@@ -567,9 +567,27 @@ impl Storage {
         plan: &SetupRunPlan,
         owner: LeaseOwner,
     ) -> Result<MaintenanceLeaseCapability, StorageError> {
+        let action_ids = plan
+            .actions
+            .iter()
+            .map(|action| action.action_id.as_str())
+            .collect::<Vec<_>>();
+        let on_demand_handoff = action_ids == ["bootstrap-handoff"];
+        let persistent_host_service = action_ids
+            == [
+                "bootstrap-handoff",
+                "path-set-directories",
+                "service-config",
+                "service-registration",
+                "service-start-or-restart",
+            ];
+        let persistent_host_stop = action_ids == ["service-stop"];
+        let persistent_host_restart = action_ids == ["service-restart"];
         if plan.run_id != owner.operation_id
-            || plan.actions.len() != 1
-            || plan.actions[0].action_id != "bootstrap-handoff"
+            || (!on_demand_handoff
+                && !persistent_host_service
+                && !persistent_host_stop
+                && !persistent_host_restart)
         {
             return Err(StorageError::new(StorageErrorKind::InvalidInput));
         }
@@ -579,17 +597,19 @@ impl Storage {
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|source| sqlite_error(StorageErrorKind::OperationFailed, source))?;
         begin_setup_run_in_transaction(&transaction, plan, &owner, host_identity.as_str())?;
-        let started = transaction
-            .execute(
-                "UPDATE setup_actions
-                 SET status = 'started', started_at = ?2
-                 WHERE run_id = ?1
-                   AND action_id = 'bootstrap-handoff'
-                   AND status = 'planned'",
-                params![plan.run_id, format_time(owner.acquired_at)?],
-            )
-            .map_err(|source| sqlite_error(StorageErrorKind::OperationFailed, source))?;
-        require_one_transition(started)?;
+        if on_demand_handoff {
+            let started = transaction
+                .execute(
+                    "UPDATE setup_actions
+                     SET status = 'started', started_at = ?2
+                     WHERE run_id = ?1
+                       AND action_id = 'bootstrap-handoff'
+                       AND status = 'planned'",
+                    params![plan.run_id, format_time(owner.acquired_at)?],
+                )
+                .map_err(|source| sqlite_error(StorageErrorKind::OperationFailed, source))?;
+            require_one_transition(started)?;
+        }
         transaction
             .commit()
             .map_err(|source| sqlite_error(StorageErrorKind::OperationFailed, source))?;

@@ -12,6 +12,8 @@ use time::format_description::well_known::Rfc3339;
 mod authority;
 #[path = "control-plane.rs"]
 pub mod control_plane;
+#[path = "daemon-service.rs"]
+pub mod daemon_service;
 #[path = "direct-host-binding.rs"]
 mod direct_host_binding;
 mod events;
@@ -2262,6 +2264,7 @@ pub enum ErrorCode {
     ConcurrencyWithoutRemoteUpdate,
     ComponentSelectionConflict,
     UnsupportedUpdateComponent,
+    PersistentServiceUnsupported,
     SetupConsentRequired,
     DoctorFixConsentRequired,
     InputRequired,
@@ -2342,6 +2345,7 @@ impl ErrorCode {
             Self::ConcurrencyWithoutRemoteUpdate => "concurrency-without-remote-update",
             Self::ComponentSelectionConflict => "component-selection-conflict",
             Self::UnsupportedUpdateComponent => "unsupported-update-component",
+            Self::PersistentServiceUnsupported => "persistent-service-unsupported",
             Self::SetupConsentRequired => "setup-consent-required",
             Self::DoctorFixConsentRequired => "doctor-fix-consent-required",
             Self::InputRequired => "input-required",
@@ -2363,6 +2367,7 @@ impl ErrorCode {
             | Self::ConcurrencyWithoutRemoteUpdate
             | Self::ComponentSelectionConflict
             | Self::UnsupportedUpdateComponent
+            | Self::PersistentServiceUnsupported
             | Self::SetupConsentRequired
             | Self::DoctorFixConsentRequired
             | Self::InputRequired
@@ -2894,6 +2899,25 @@ impl SatelleError {
             recovery_command: Some(format!("set {flag} to an absolute path or omit it")),
             source_detail: None,
             details,
+        }
+    }
+
+    pub fn persistent_service_unsupported(platform: &str) -> Self {
+        Self {
+            code: ErrorCode::PersistentServiceUnsupported,
+            message: format!(
+                "persistent Host Daemon services are not supported on {platform} in the Satelle MVP"
+            ),
+            recovery_command: Some("rerun satelle setup with --on-demand".to_string()),
+            source_detail: None,
+            details: BTreeMap::from([
+                ("platform".to_string(), Value::String(platform.to_string())),
+                (
+                    "requested_setup_mode".to_string(),
+                    Value::String("persistent".to_string()),
+                ),
+                ("mutated".to_string(), Value::Bool(false)),
+            ]),
         }
     }
 
@@ -4070,6 +4094,11 @@ pub struct SetupReport {
     pub service_persistent: bool,
     pub service_scope: String,
     pub fallback_reason: Option<String>,
+    pub target_platform: Option<String>,
+    pub host_artifact: Option<daemon_service::DaemonArtifactPlan>,
+    pub service_plan: Option<daemon_service::DaemonServicePlan>,
+    pub current_daemon_paths: Option<daemon_service::DaemonResolvedPathSet>,
+    pub planned_daemon_paths: Option<daemon_service::DaemonResolvedPathSet>,
     pub setup_components: Vec<String>,
     pub planned_actions: Vec<String>,
     pub applied_actions: Vec<String>,

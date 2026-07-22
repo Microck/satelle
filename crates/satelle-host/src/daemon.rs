@@ -96,7 +96,13 @@ pub struct DaemonRuntimeCapabilities {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct DaemonActivitySnapshot {
     idle: bool,
-    generation: u64,
+    generation: DaemonActivityGeneration,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DaemonActivityGeneration {
+    operations: u64,
+    runtime: u64,
 }
 
 impl DaemonActivitySnapshot {
@@ -104,7 +110,7 @@ impl DaemonActivitySnapshot {
         self.idle
     }
 
-    pub const fn generation(self) -> u64 {
+    pub const fn generation(self) -> DaemonActivityGeneration {
         self.generation
     }
 }
@@ -360,11 +366,14 @@ impl HostService {
     }
 
     pub fn daemon_activity_snapshot(&self) -> Result<DaemonActivitySnapshot, SatelleError> {
-        let workers_idle = self.runtime.daemon_workers_idle()?;
+        let (runtime_idle, runtime_generation) = self.runtime.daemon_activity_snapshot()?;
         let (operations_idle, generation) = self.operation_capacity.activity_snapshot()?;
         Ok(DaemonActivitySnapshot {
-            idle: workers_idle && operations_idle,
-            generation,
+            idle: runtime_idle && operations_idle,
+            generation: DaemonActivityGeneration {
+                operations: generation,
+                runtime: runtime_generation,
+            },
         })
     }
 

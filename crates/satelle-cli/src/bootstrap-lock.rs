@@ -11,6 +11,7 @@ const STALE_AFTER_SECONDS: u64 = 30;
 pub(super) enum OperationKind {
     InitialSetup,
     MissingDaemonRepair,
+    ServiceRestart,
 }
 
 impl OperationKind {
@@ -18,6 +19,7 @@ impl OperationKind {
         match self {
             Self::InitialSetup => "initial_setup",
             Self::MissingDaemonRepair => "missing_daemon_repair",
+            Self::ServiceRestart => "service_restart",
         }
     }
 }

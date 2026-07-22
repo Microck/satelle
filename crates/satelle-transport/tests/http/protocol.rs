@@ -172,6 +172,7 @@ async fn assert_protocol_error(
             "retryable": false,
             "message": "the CLI and Host Daemon protocol versions are incompatible",
             "details": {
+                "daemon_version": env!("CARGO_PKG_VERSION"),
                 "reason": reason,
                 "supported_versions": ["4"],
                 "received_version": received_version,

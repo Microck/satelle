@@ -270,6 +270,7 @@ fn error_contract(code: ErrorCode) -> ErrorContract {
         | ErrorCode::ConcurrencyWithoutRemoteUpdate
         | ErrorCode::ComponentSelectionConflict
         | ErrorCode::UnsupportedUpdateComponent
+        | ErrorCode::PersistentServiceUnsupported
         | ErrorCode::SetupConsentRequired
         | ErrorCode::DoctorFixConsentRequired
         | ErrorCode::DoctorRefreshScopeRequired

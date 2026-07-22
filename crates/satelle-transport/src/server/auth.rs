@@ -892,6 +892,7 @@ fn incompatible_protocol(
             retryable: false,
             message: "the CLI and Host Daemon protocol versions are incompatible",
             details: Some(serde_json::json!({
+                "daemon_version": env!("CARGO_PKG_VERSION"),
                 "reason": failure.reason(),
                 "supported_versions": [PROTOCOL_VERSION],
                 "received_version": failure.received_version(),

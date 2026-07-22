@@ -23,6 +23,11 @@ use host_trust::{HostTrustReport, persist_host_identity};
 use logs::{LogsCommand, show_logs};
 use notify::{Config as NotifyConfig, Event, RecommendedWatcher, RecursiveMode, Watcher};
 use output::{EventOutput, OutputArgs, OutputFormat, SessionResultSchemaVersion, StatusReport};
+#[cfg(any(windows, test))]
+use satelle_core::daemon_service::WindowsServiceConfigV1;
+use satelle_core::daemon_service::{
+    DaemonServicePlatform, PersistentServiceDecision, SetupModeSelection, SetupModeSource,
+};
 use satelle_core::session::{
     EffectiveModelRef, HostIdentityRef, ProviderBindingRef, PublicSession, PublicTurn,
     TurnAdmissionPhase, TurnExecutionMode, TurnState,
@@ -63,6 +68,7 @@ use transport::{
 const CONFIG_CHECK_SCHEMA_VERSION: &str = "satelle.config.check.v1";
 const CONFIG_EXPLAIN_SCHEMA_VERSION: &str = "satelle.config.explain.v1";
 const PATHS_SCHEMA_VERSION: &str = "satelle.paths.v1";
+const DEFAULT_HOST_BIND: &str = "127.0.0.1:3001";
 const DEFAULT_ON_DEMAND_IDLE_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 const SSH_STATE_RELEASE_REQUEST: &str = "ssh-state-release.request";
 const SSH_STATE_RELEASE_REQUESTER_LOCK: &str = "ssh-state-release.requester.lock";
@@ -371,7 +377,7 @@ struct HostTrustCommand {
 
 #[derive(Args, Debug)]
 struct HostStartCommand {
-    #[arg(long, default_value = "127.0.0.1:3001")]
+    #[arg(long, default_value = DEFAULT_HOST_BIND)]
     bind: String,
     /// PEM certificate chain for Host-terminated HTTPS and WSS.
     #[arg(long, value_name = "PATH", requires = "tls_key")]
@@ -397,6 +403,24 @@ struct HostStartCommand {
     /// Internal Controller-resolved idle timeout for a durable SSH launch.
     #[arg(long, hide = true, value_name = "MILLISECONDS")]
     on_demand_idle_timeout_ms: Option<u64>,
+    /// Internal owner-only configuration used by the per-user Windows task.
+    #[arg(
+        long,
+        hide = true,
+        value_name = "PATH",
+        conflicts_with_all = [
+            "bind",
+            "tls_cert",
+            "tls_key",
+            "foreground",
+            "bootstrap_token_stdin",
+            "bootstrap_scope",
+            "bootstrap_native_readiness_timeout_ms",
+            "bootstrap_provider_smoke_timeout_ms",
+            "on_demand_idle_timeout_ms"
+        ]
+    )]
+    service_config: Option<PathBuf>,
     #[command(flatten)]
     output_args: OutputArgs,
 }
@@ -1104,7 +1128,9 @@ fn history_target(command: &Command) -> Option<HistoryTarget<'_>> {
             family: "host",
             selects_host: match command {
                 HostCommand::Start(command) => {
-                    !command.foreground && !command.bootstrap_token_stdin
+                    !command.foreground
+                        && !command.bootstrap_token_stdin
+                        && command.service_config.is_none()
                 }
                 HostCommand::Update(command) => command.host.len() == 1 && !command.all_remotes,
                 _ => true,
@@ -1482,6 +1508,7 @@ mod history_target_tests {
                 bootstrap_native_readiness_timeout_ms: None,
                 bootstrap_provider_smoke_timeout_ms: None,
                 on_demand_idle_timeout_ms: None,
+                service_config: None,
                 output_args: OutputArgs::default(),
             }),
         }
@@ -1575,6 +1602,55 @@ mod history_target_tests {
         assert!(command.bootstrap_token_stdin);
         validate_host_start_mode(&command)
             .expect("durable SSH relaunch accepts its process-local bootstrap credential");
+    }
+
+    #[test]
+    fn windows_service_config_is_an_internal_non_host_selecting_start_mode() {
+        let cli = Cli::try_parse_from([
+            "satelle",
+            "host",
+            "start",
+            "--service-config",
+            r"C:\Users\owner\AppData\Local\Satelle\service\host-1.json",
+        ])
+        .expect("parse internal Windows service start command");
+        assert!(
+            !history_target(&cli.command)
+                .expect("Host start history target")
+                .selects_host
+        );
+        let Command::Host {
+            command: HostCommand::Start(command),
+        } = cli.command
+        else {
+            panic!("expected Host start command");
+        };
+        assert!(command.service_config.is_some());
+        validate_host_start_mode(&command).expect("service config is a valid closed start mode");
+    }
+
+    #[test]
+    fn windows_service_config_rejects_competing_start_inputs() {
+        for arguments in [
+            vec!["--foreground"],
+            vec!["--bind", "127.0.0.1:4001"],
+            vec!["--on-demand-idle-timeout-ms", "75000"],
+            vec!["--bootstrap-token-stdin", "--bootstrap-scope", "read"],
+        ] {
+            let error = Cli::try_parse_from(
+                [
+                    "satelle",
+                    "host",
+                    "start",
+                    "--service-config",
+                    "service.json",
+                ]
+                .into_iter()
+                .chain(arguments),
+            )
+            .expect_err("service config must reject competing start inputs");
+            assert_eq!(error.kind(), clap::error::ErrorKind::ArgumentConflict);
+        }
     }
 
     #[test]
@@ -1722,7 +1798,27 @@ fn run_setup(
         .component
         .iter()
         .any(|component| component == &SetupComponent::ProviderAuth);
-    let setup_mode = setup_mode(&command, &host.config).map_err(failure)?;
+    let setup_mode_selection = setup_mode(&command, &host.config).map_err(failure)?;
+    let local_service_decision = (host.config.transport == satelle_core::TransportKind::Local)
+        .then(|| {
+            PersistentServiceDecision::resolve(
+                setup_mode_selection,
+                current_daemon_service_platform(),
+            )
+        });
+    if local_service_decision
+        .as_ref()
+        .is_some_and(|decision| decision.explicit_persistent_unsupported)
+    {
+        return Err(failure(SatelleError::persistent_service_unsupported(
+            current_daemon_service_platform().as_str(),
+        )));
+    }
+    let setup_mode = local_service_decision
+        .as_ref()
+        .map_or(setup_mode_selection.mode, |decision| decision.setup_mode)
+        .as_str()
+        .to_string();
     let consent_recovery_command = setup_consent_recovery_command(
         &command,
         config.flag_profile,
@@ -1753,12 +1849,15 @@ fn run_setup(
             .expect("ordinary setup transport is present")
             .setup(
                 true,
-                setup_mode.clone(),
+                setup_mode_selection,
                 setup_components.clone(),
                 daemon_path_overrides.clone(),
             )
             .map_err(failure)?
     };
+    if let Some(decision) = &local_service_decision {
+        apply_service_decision_to_report(&mut report, decision);
+    }
     report.dry_run = command.dry_run;
     add_setup_required_inputs(&mut report, &host.config, explicit_provider_auth);
 
@@ -1827,9 +1926,17 @@ fn run_setup(
             transport
                 .as_ref()
                 .expect("ordinary setup transport is present")
-                .setup(false, setup_mode, setup_components, daemon_path_overrides)
+                .setup(
+                    false,
+                    setup_mode_selection,
+                    setup_components,
+                    daemon_path_overrides,
+                )
                 .map_err(failure)?
         };
+        if let Some(decision) = &local_service_decision {
+            apply_service_decision_to_report(&mut report, decision);
+        }
         add_setup_required_inputs(&mut report, &host.config, explicit_provider_auth);
         if first_ssh_trust {
             report.planned_actions.insert(
@@ -2040,24 +2147,57 @@ fn setup_components(components: &[SetupComponent]) -> Result<Vec<String>, Satell
         .collect())
 }
 
-fn setup_mode(command: &SetupCommand, host_config: &HostConfig) -> Result<String, SatelleError> {
+fn setup_mode(
+    command: &SetupCommand,
+    host_config: &HostConfig,
+) -> Result<SetupModeSelection, SatelleError> {
     if command.on_demand && command.persistent {
         return Err(SatelleError::invalid_usage(
             "--on-demand and --persistent cannot be combined",
         ));
     }
     if command.on_demand {
-        return Ok("on_demand".to_string());
+        return Ok(SetupModeSelection::new(
+            SetupMode::OnDemand,
+            SetupModeSource::SetupFlag,
+        ));
     }
     if command.persistent {
-        return Ok("persistent".to_string());
+        return Ok(SetupModeSelection::new(
+            SetupMode::Persistent,
+            SetupModeSource::SetupFlag,
+        ));
     }
 
-    Ok(host_config
-        .setup_mode
-        .unwrap_or(SetupMode::OnDemand)
-        .as_str()
-        .to_string())
+    Ok(host_config.setup_mode.map_or_else(
+        || SetupModeSelection::new(SetupMode::OnDemand, SetupModeSource::Default),
+        |mode| SetupModeSelection::new(mode, SetupModeSource::UserConfig),
+    ))
+}
+
+fn apply_service_decision_to_report(
+    report: &mut SetupReport,
+    decision: &PersistentServiceDecision,
+) {
+    report.setup_mode = decision.setup_mode.as_str().to_string();
+    report.service_persistent = decision.service_persistent;
+    report.service_scope.clone_from(&decision.service_scope);
+    report.fallback_reason.clone_from(&decision.fallback_reason);
+}
+
+fn current_daemon_service_platform() -> DaemonServicePlatform {
+    #[cfg(target_os = "macos")]
+    {
+        DaemonServicePlatform::Macos
+    }
+    #[cfg(target_os = "windows")]
+    {
+        DaemonServicePlatform::Windows
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    {
+        DaemonServicePlatform::Linux
+    }
 }
 
 fn setup_consent_recovery_command(
@@ -3141,18 +3281,75 @@ fn run_host(
                 Ok(())
             }
         }
-        HostCommand::Stop(command) => Err(failure(SatelleError::not_implemented(format!(
-            "host stop is not implemented yet for host {}",
-            command.host.as_deref().unwrap_or(LOCAL_DEMO_HOST)
-        )))),
-        HostCommand::Restart(command) => Err(failure(SatelleError::not_implemented(format!(
-            "host restart is not implemented yet for host {}",
-            command.host.as_deref().unwrap_or(LOCAL_DEMO_HOST)
-        )))),
+        HostCommand::Stop(command) => run_host_lifecycle(
+            command,
+            transport::SshPersistentServiceLifecycle::Stop,
+            config,
+            format,
+        ),
+        HostCommand::Restart(command) => run_host_lifecycle(
+            command,
+            transport::SshPersistentServiceLifecycle::Restart,
+            config,
+            format,
+        ),
         HostCommand::Update(command) => run_host_update(command),
         HostCommand::Cleanup(command) => run_host_cleanup(command, config, format),
         HostCommand::Sessions(command) => show_host_sessions(command, config, format),
         HostCommand::Storage { command } => run_host_storage(command),
+    }
+}
+
+fn run_host_lifecycle(
+    command: HostLifecycleCommand,
+    lifecycle: transport::SshPersistentServiceLifecycle,
+    config: ConfigContext<'_>,
+    format: OutputFormat,
+) -> Result<(), CliFailure> {
+    let host = config.resolve_host(command.host.as_deref())?;
+    let action = lifecycle.as_str();
+    let planned_actions = vec![format!(
+        "{action} the persistent Host service on '{}' through SSH and verify its exact postconditions",
+        host.alias
+    )];
+    let recovery_command = format!("satelle host {action} --host {} --yes", host.alias);
+    if !command.yes && (command.no_input || format.is_json() || !io::stdin().is_terminal()) {
+        return Err(failure(SatelleError::setup_consent_required(
+            &planned_actions,
+            recovery_command,
+        )));
+    }
+    if !command.yes {
+        let confirmed = cliclack::confirm(format!(
+            "{} the persistent Host service on '{}'?",
+            lifecycle.prompt_verb(),
+            host.alias
+        ))
+        .initial_value(false)
+        .interact()
+        .map_err(|source| {
+            failure(SatelleError {
+                code: ErrorCode::InvalidUsage,
+                message: format!("could not read Host service {action} confirmation"),
+                recovery_command: Some(recovery_command.clone()),
+                source_detail: Some(source.to_string()),
+                details: BTreeMap::new(),
+            })
+        })?;
+        if !confirmed {
+            println!("No changes applied.");
+            return Ok(());
+        }
+    }
+    let report = transport::manage_ssh_persistent_service(&host, lifecycle).map_err(failure)?;
+    if format.is_json() {
+        print_json(&report).map_err(failure)
+    } else {
+        println!("Host: {}", report.host);
+        println!("Action: {}", report.action);
+        println!("Status: {}", report.status);
+        println!("Service manager: {}", report.service_manager);
+        Ok(())
     }
 }
 
@@ -3493,6 +3690,21 @@ fn trust_host(
 }
 
 fn validate_host_start_mode(command: &HostStartCommand) -> Result<(), SatelleError> {
+    if command.service_config.is_some()
+        && (command.bind != DEFAULT_HOST_BIND
+            || command.foreground
+            || command.tls_cert.is_some()
+            || command.tls_key.is_some()
+            || command.bootstrap_token_stdin
+            || command.bootstrap_scope.is_some()
+            || command.bootstrap_native_readiness_timeout_ms.is_some()
+            || command.bootstrap_provider_smoke_timeout_ms.is_some()
+            || command.on_demand_idle_timeout_ms.is_some())
+    {
+        return Err(SatelleError::invalid_usage(
+            "--service-config is an internal Windows service input and cannot be combined with ordinary Host start options",
+        ));
+    }
     if command.foreground && command.bootstrap_token_stdin {
         return Err(SatelleError::invalid_usage(
             "SSH bootstrap tokens are valid only for on-demand Host Daemons",
@@ -3561,7 +3773,7 @@ fn start_host_daemon(
 }
 
 fn start_host_daemon_with(
-    command: HostStartCommand,
+    #[allow(unused_mut)] mut command: HostStartCommand,
     config: ConfigContext<'_>,
     format: OutputFormat,
     read_bootstrap_token: impl FnOnce() -> Result<ApiBearerToken, CliFailure>,
@@ -3573,6 +3785,24 @@ fn start_host_daemon_with(
     ) -> HostService,
 ) -> Result<(), CliFailure> {
     validate_host_start_mode(&command).map_err(failure)?;
+    if command.service_config.is_some() {
+        #[cfg(not(windows))]
+        return Err(failure(SatelleError::invalid_usage(
+            "--service-config is supported only for the per-user Windows Host service",
+        )));
+
+        #[cfg(windows)]
+        {
+            let service_config_path = command
+                .service_config
+                .as_deref()
+                .expect("service config presence was checked");
+            let service_config = read_windows_service_config(service_config_path)?;
+            apply_windows_service_environment(&service_config);
+            command.bind = service_config.bind().to_string();
+            command.foreground = true;
+        }
+    }
     let bootstrap_scopes = match (command.bootstrap_token_stdin, command.bootstrap_scope) {
         (true, Some(scope)) => Some(scope.api_scopes()),
         (true, None) => {
@@ -3750,6 +3980,132 @@ fn start_host_daemon_with(
         state_release_task.abort();
         result
     })
+}
+
+#[cfg(any(windows, test))]
+fn read_windows_service_config(path: &Path) -> Result<WindowsServiceConfigV1, CliFailure> {
+    if !path.is_absolute() {
+        return Err(failure(SatelleError::invalid_usage(
+            "Windows Host service config path must be absolute",
+        )));
+    }
+    let raw = read_owner_only_secret_config_file(path).map_err(|error| {
+        failure(SatelleError::config_error(
+            format!(
+                "Windows Host service config '{}' is unavailable or does not satisfy the owner-only security policy",
+                path.display()
+            ),
+            Some(error.to_string()),
+        ))
+    })?;
+    serde_json::from_str(raw.as_str()).map_err(|error| {
+        failure(SatelleError::config_error(
+            format!(
+                "Windows Host service config '{}' is invalid",
+                path.display()
+            ),
+            Some(error.to_string()),
+        ))
+    })
+}
+
+#[cfg(test)]
+mod windows_service_config_tests {
+    use super::*;
+
+    fn write_owner_only_config(path: &Path, contents: &str) {
+        let mut file = open_or_create_owner_only_file(path).expect("create owner-only config");
+        file.write_all(contents.as_bytes())
+            .expect("write owner-only config");
+        file.sync_all().expect("sync owner-only config");
+    }
+
+    #[test]
+    fn reads_the_closed_service_schema_from_an_owner_only_file() {
+        let state = satelle_host::test_support::TestStateDir::new()
+            .expect("create owner-only test directory");
+        let path = state.path().join("service.json");
+        let overrides = DaemonPathOverrides {
+            home: Some(PathBuf::from(r"C:\Users\owner\AppData\Local\Satelle")),
+            config_file: Some(PathBuf::from(
+                r"C:\Users\owner\AppData\Local\Satelle\config\config.toml",
+            )),
+            state_dir: Some(PathBuf::from(r"C:\Users\owner\AppData\Local\Satelle\state")),
+            cache_dir: Some(PathBuf::from(r"C:\Users\owner\AppData\Local\Satelle\cache")),
+            log_dir: Some(PathBuf::from(r"C:\Users\owner\AppData\Local\Satelle\logs")),
+            sources: BTreeMap::new(),
+        };
+        let expected = WindowsServiceConfigV1::new("127.0.0.1:3001", &overrides)
+            .expect("build service config");
+        write_owner_only_config(
+            &path,
+            &serde_json::to_string(&expected).expect("serialize service config"),
+        );
+
+        let observed = match read_windows_service_config(&path) {
+            Ok(config) => config,
+            Err(failure) => panic!("read service config: {}", failure.error),
+        };
+
+        assert_eq!(observed, expected);
+        assert_eq!(
+            observed.daemon_arguments(),
+            ["host", "start", "--foreground", "--bind", "127.0.0.1:3001"]
+        );
+        assert_eq!(observed.environment().len(), 5);
+    }
+
+    #[test]
+    fn rejects_a_relative_service_config_path() {
+        let error = read_windows_service_config(Path::new("service.json"))
+            .expect_err("service startup must not resolve config relative to its working directory")
+            .error;
+
+        assert_eq!(error.code, ErrorCode::InvalidUsage);
+        assert!(error.message.contains("must be absolute"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejects_a_service_config_that_is_not_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let state = satelle_host::test_support::TestStateDir::new()
+            .expect("create owner-only test directory");
+        let path = state.path().join("service.json");
+        fs::write(&path, "{}").expect("write unsafe config");
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644))
+            .expect("broaden config permissions");
+
+        let error = read_windows_service_config(&path)
+            .expect_err("group-readable service config must fail closed")
+            .error;
+
+        assert!(error.message.contains("owner-only security policy"));
+    }
+}
+
+#[cfg(windows)]
+fn apply_windows_service_environment(config: &WindowsServiceConfigV1) {
+    const PATH_OVERRIDES: [&str; 5] = [
+        "SATELLE_HOME",
+        "SATELLE_CONFIG_FILE",
+        "SATELLE_STATE_DIR",
+        "SATELLE_CACHE_DIR",
+        "SATELLE_LOG_DIR",
+    ];
+
+    // This runs on the initial process thread before the Tokio runtime, Host
+    // service, or any worker thread exists. Clearing the full allowlist first
+    // prevents ambient task state from becoming a second configuration source.
+    unsafe {
+        for key in PATH_OVERRIDES {
+            std::env::remove_var(key);
+        }
+        for (key, value) in config.environment() {
+            std::env::set_var(key, value);
+        }
+    }
 }
 
 const fn should_resolve_on_demand_host(
@@ -4249,6 +4605,7 @@ mod daemon_tls_watcher_tests {
             bootstrap_native_readiness_timeout_ms: None,
             bootstrap_provider_smoke_timeout_ms: None,
             on_demand_idle_timeout_ms: None,
+            service_config: None,
             output_args: OutputArgs::default(),
         }
     }
@@ -4767,6 +5124,7 @@ mod bootstrap_startup_tests {
             bootstrap_native_readiness_timeout_ms: None,
             bootstrap_provider_smoke_timeout_ms: None,
             on_demand_idle_timeout_ms: Some(75_000),
+            service_config: None,
             output_args: OutputArgs::default(),
         };
         let start_result = std::thread::spawn(move || {

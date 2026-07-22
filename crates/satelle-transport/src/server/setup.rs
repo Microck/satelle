@@ -8,7 +8,7 @@ use axum::extract::{Extension, Path, State};
 use axum::http::StatusCode;
 use axum::response::Response;
 use satelle_core::SatelleError;
-use satelle_host::{ApiScopes, MutationAuthority, SetupOperationKind};
+use satelle_host::{ApiScopes, HostService, MutationAuthority, SetupOperationKind};
 use std::sync::Arc;
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
@@ -69,15 +69,13 @@ pub(super) async fn complete_bootstrap_maintenance(
 pub(super) async fn begin_bootstrap_maintenance(
     State(state): State<Arc<DaemonState>>,
     Extension(authorized): Extension<AuthorizedRequest>,
-    Path((operation_id, operation_kind)): Path<(String, String)>,
+    Path((operation_id, operation_kind, plan_kind)): Path<(String, String, String)>,
 ) -> Response {
-    if !bootstrap_maintenance_principal_is_authorized(&authorized) {
-        return bootstrap_maintenance_principal_required(&state, &authorized);
-    }
     let operation_kind = match operation_kind.as_str() {
         "initial_setup" => SetupOperationKind::Setup,
         "missing_daemon_repair" => SetupOperationKind::Repair,
         "host_binary_replacement" => SetupOperationKind::HostUpdate,
+        "service_restart" => SetupOperationKind::ServiceRestart,
         _ => {
             return host_error::response(
                 &state,
@@ -86,13 +84,112 @@ pub(super) async fn begin_bootstrap_maintenance(
             );
         }
     };
+    let plan_kind = match satelle_host::BootstrapMaintenancePlanKind::parse(&plan_kind) {
+        Ok(plan_kind) => plan_kind,
+        Err(error) => return host_error::response(&state, &authorized, &error),
+    };
+    let authorized_for_plan = match plan_kind {
+        satelle_host::BootstrapMaintenancePlanKind::OnDemandHandoff => {
+            bootstrap_maintenance_principal_is_authorized(&authorized)
+        }
+        satelle_host::BootstrapMaintenancePlanKind::PersistentHostService
+        | satelle_host::BootstrapMaintenancePlanKind::PersistentHostStop
+        | satelle_host::BootstrapMaintenancePlanKind::PersistentHostRestart => {
+            persistent_service_maintenance_principal_is_authorized(&authorized)
+        }
+    };
+    if !authorized_for_plan {
+        return bootstrap_maintenance_principal_required(&state, &authorized);
+    }
     let service = Arc::clone(&state.service);
     let operation = operation_id.clone();
     match tokio::task::spawn_blocking(move || {
-        service.acquire_bootstrap_maintenance(&operation, operation_kind)
+        service.acquire_bootstrap_maintenance_plan(&operation, operation_kind, plan_kind)
     })
     .await
     {
+        Ok(Ok(())) => authenticated_json_response(
+            StatusCode::OK,
+            &BootstrapMaintenanceResponse::new(
+                authorized.request_id().clone(),
+                state.host_identity.clone(),
+                operation_id,
+            ),
+            authorized.request_id(),
+            &state.host_identity,
+        ),
+        Ok(Err(error)) => host_error::response(&state, &authorized, &error),
+        Err(_) => host_error::task_failure(&state, &authorized),
+    }
+}
+
+pub(super) async fn start_persistent_service_action(
+    State(state): State<Arc<DaemonState>>,
+    Extension(authorized): Extension<AuthorizedRequest>,
+    Path((operation_id, action_id)): Path<(String, String)>,
+) -> Response {
+    run_persistent_service_transition(
+        state,
+        authorized,
+        operation_id,
+        move |service, operation| service.start_bootstrap_service_action(operation, &action_id),
+    )
+    .await
+}
+
+pub(super) async fn complete_persistent_service_action(
+    State(state): State<Arc<DaemonState>>,
+    Extension(authorized): Extension<AuthorizedRequest>,
+    Path((operation_id, action_id)): Path<(String, String)>,
+) -> Response {
+    run_persistent_service_transition(
+        state,
+        authorized,
+        operation_id,
+        move |service, operation| service.complete_bootstrap_service_action(operation, &action_id),
+    )
+    .await
+}
+
+pub(super) async fn fail_persistent_service_action(
+    State(state): State<Arc<DaemonState>>,
+    Extension(authorized): Extension<AuthorizedRequest>,
+    Path((operation_id, action_id, failure_kind)): Path<(String, String, String)>,
+) -> Response {
+    run_persistent_service_transition(
+        state,
+        authorized,
+        operation_id,
+        move |service, operation| {
+            service.fail_bootstrap_service_action(operation, &action_id, &failure_kind)
+        },
+    )
+    .await
+}
+
+pub(super) async fn finish_persistent_service_maintenance(
+    State(state): State<Arc<DaemonState>>,
+    Extension(authorized): Extension<AuthorizedRequest>,
+    Path(operation_id): Path<String>,
+) -> Response {
+    run_persistent_service_transition(state, authorized, operation_id, |service, operation| {
+        service.finish_bootstrap_service_maintenance(operation)
+    })
+    .await
+}
+
+async fn run_persistent_service_transition(
+    state: Arc<DaemonState>,
+    authorized: AuthorizedRequest,
+    operation_id: String,
+    transition: impl FnOnce(&HostService, &str) -> Result<(), SatelleError> + Send + 'static,
+) -> Response {
+    if !persistent_service_maintenance_principal_is_authorized(&authorized) {
+        return bootstrap_maintenance_principal_required(&state, &authorized);
+    }
+    let service = Arc::clone(&state.service);
+    let operation = operation_id.clone();
+    match tokio::task::spawn_blocking(move || transition(&service, &operation)).await {
         Ok(Ok(())) => authenticated_json_response(
             StatusCode::OK,
             &BootstrapMaintenanceResponse::new(
@@ -390,6 +487,12 @@ fn setup_principal_is_authorized(authorized: &AuthorizedRequest) -> bool {
 // needs it even when the daemon exposes only read operations to that client.
 fn bootstrap_maintenance_principal_is_authorized(authorized: &AuthorizedRequest) -> bool {
     authorized.principal().is_ssh_bootstrap()
+}
+
+fn persistent_service_maintenance_principal_is_authorized(authorized: &AuthorizedRequest) -> bool {
+    let principal = authorized.principal();
+    (principal.is_ssh_bootstrap() && principal.scopes().allows(ApiScopes::ADMIN))
+        || (principal.is_durable_setup_active() && principal.scopes() == ApiScopes::CONTROL)
 }
 
 fn setup_principal_can_activate(authorized: &AuthorizedRequest, token_id: &str) -> bool {

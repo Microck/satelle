@@ -24,6 +24,7 @@ use super::bootstrap_lock;
 use super::ssh_tunnel::{SshStderrClassification, classify_stderr};
 
 const PROBE_OUTPUT_LIMIT: usize = 4096;
+const SERVICE_DEFINITION_LIMIT: usize = 64 * 1024;
 const TAILSCALE_SERVE_STATUS_OUTPUT_LIMIT: usize = 1024 * 1024;
 const START_OUTPUT_LIMIT: u64 = 16 * 1024;
 const MANIFEST_LIMIT: u64 = 1024 * 1024;
@@ -489,9 +490,17 @@ impl SshBootstrapProcess {
             .map(|previous_host_config| target.validated_daemon_environment(previous_host_config))
             .transpose()?;
         let artifact = DownloadedArtifact::fetch(target)?;
-        let remote_binary = upload_artifact(destination, target, artifact.path(), bootstrap_lock)?;
+        let directory = target.remote_directory();
+        let remote_binary = upload_artifact(
+            destination,
+            target,
+            artifact.path(),
+            &directory,
+            artifact.release_digest(),
+            bootstrap_lock,
+        )?;
         let (release_command, start_command) = target.state_owner_handoff_commands(
-            &remote_binary,
+            remote_binary.remote_path(),
             release_environment.as_deref(),
             host_config,
             &environment,
@@ -529,10 +538,18 @@ impl SshBootstrapProcess {
         let target = RemoteTarget::probe(destination)?;
         let environment = target.validated_daemon_environment(host_config)?;
         let artifact = DownloadedArtifact::fetch(target)?;
-        let remote_binary = upload_artifact(destination, target, artifact.path(), bootstrap_lock)?;
+        let directory = target.remote_directory();
+        let remote_binary = upload_artifact(
+            destination,
+            target,
+            artifact.path(),
+            &directory,
+            artifact.release_digest(),
+            bootstrap_lock,
+        )?;
         let (native_timeout, provider_timeout) = readiness_probe_timeouts(host_config);
         let command = target.durable_start_command_with_environment(
-            &remote_binary,
+            remote_binary.remote_path(),
             idle_timeout,
             native_timeout,
             provider_timeout,
@@ -653,7 +670,7 @@ impl Drop for SshBootstrapProcess {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum RemoteTarget {
+pub(super) enum RemoteTarget {
     LinuxArm64Gnu,
     LinuxX64Gnu,
     DarwinArm64,
@@ -685,7 +702,7 @@ impl RemoteTarget {
         (release_command, start_command)
     }
 
-    fn probe(destination: &str) -> Result<Self, SshBootstrapError> {
+    pub(super) fn probe(destination: &str) -> Result<Self, SshBootstrapError> {
         Self::probe_with_program(destination, OsStr::new("ssh"))
     }
 
@@ -744,7 +761,7 @@ impl RemoteTarget {
         }
     }
 
-    const fn id(self) -> &'static str {
+    pub(super) const fn id(self) -> &'static str {
         match self {
             Self::LinuxArm64Gnu => "linux-arm64-gnu",
             Self::LinuxX64Gnu => "linux-x64-gnu",
@@ -752,6 +769,22 @@ impl RemoteTarget {
             Self::DarwinX64 => "darwin-x64",
             Self::WindowsArm64Msvc => "win32-arm64-msvc",
             Self::WindowsX64Msvc => "win32-x64-msvc",
+        }
+    }
+
+    pub(super) const fn service_platform(
+        self,
+    ) -> satelle_core::daemon_service::DaemonServicePlatform {
+        match self {
+            Self::DarwinArm64 | Self::DarwinX64 => {
+                satelle_core::daemon_service::DaemonServicePlatform::Macos
+            }
+            Self::WindowsArm64Msvc | Self::WindowsX64Msvc => {
+                satelle_core::daemon_service::DaemonServicePlatform::Windows
+            }
+            Self::LinuxArm64Gnu | Self::LinuxX64Gnu => {
+                satelle_core::daemon_service::DaemonServicePlatform::Linux
+            }
         }
     }
 
@@ -789,6 +822,48 @@ impl RemoteTarget {
             write!(&mut digest_hex, "{byte:02x}").expect("writing to a String cannot fail");
         }
         format!("{directory}/satelle-{digest_hex}.exe")
+    }
+
+    pub(super) fn planned_install_path(
+        self,
+        directories: &RemoteUserDirectories,
+        digest: &[u8; 32],
+    ) -> Result<String, SshBootstrapError> {
+        let directory = self.artifact_directory(directories)?;
+        Ok(self.promoted_executable_path(&directory, digest))
+    }
+
+    fn artifact_directory(
+        self,
+        directories: &RemoteUserDirectories,
+    ) -> Result<String, SshBootstrapError> {
+        if directories.target != self {
+            return Err(SshBootstrapError::InvalidPersistentServiceDefinition);
+        }
+        let cache_root = if self.is_windows() {
+            join_target_path(
+                self,
+                directories
+                    .local_app_data
+                    .as_deref()
+                    .ok_or(SshBootstrapError::InvalidPersistentServiceDefinition)?,
+                "Satelle/host",
+            )
+        } else if matches!(self, Self::DarwinArm64 | Self::DarwinX64) {
+            join_target_path(self, &directories.home, "Library/Caches/Satelle/host")
+        } else {
+            let cache = directories
+                .xdg_cache_home
+                .as_deref()
+                .map(str::to_string)
+                .unwrap_or_else(|| join_target_path(self, &directories.home, ".cache"));
+            join_target_path(self, &cache, "satelle/host")
+        };
+        Ok(join_target_path(
+            self,
+            &cache_root,
+            &format!("v{}/{}", env!("CARGO_PKG_VERSION"), self.id()),
+        ))
     }
 
     fn remote_directory(self) -> String {
@@ -1663,6 +1738,1468 @@ printf 'removed=%s\nretained=%s\n' "$removed" "$retained""#,
     }
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct RemoteUserDirectories {
+    target: RemoteTarget,
+    home: String,
+    local_app_data: Option<String>,
+    roaming_app_data: Option<String>,
+    xdg_config_home: Option<String>,
+    xdg_cache_home: Option<String>,
+    xdg_state_home: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct UploadedHostArtifact {
+    remote_path: String,
+    binary_sha256: String,
+}
+
+impl UploadedHostArtifact {
+    pub(super) fn remote_path(&self) -> &str {
+        &self.remote_path
+    }
+
+    pub(super) fn binary_sha256(&self) -> &str {
+        &self.binary_sha256
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct VerifiedCurrentWindowsTask {
+    definition: satelle_core::daemon_service::WindowsTaskDefinition,
+    executable_sha256: String,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum PersistentServiceObservation {
+    Absent,
+    Matching,
+    Drifted,
+    Running,
+    Stopped,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum LoopbackListenerObservation {
+    Present,
+    Absent,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct LaunchdServiceDefinition {
+    plist_path: String,
+    contents: String,
+}
+
+impl LaunchdServiceDefinition {
+    pub(super) fn plist_path(&self) -> &str {
+        &self.plist_path
+    }
+
+    pub(super) fn contents(&self) -> &str {
+        &self.contents
+    }
+}
+
+/// Executes persistent-service mutations only through the active bootstrap
+/// fence. Transport orchestration selects phases and postconditions, while
+/// this type owns target-native quoting, publication, and service-manager I/O.
+pub(super) struct PersistentServiceRemote<'a> {
+    destination: &'a str,
+    target: RemoteTarget,
+    directories: &'a RemoteUserDirectories,
+    bootstrap_lock: &'a mut SshBootstrapLock,
+}
+
+impl<'a> PersistentServiceRemote<'a> {
+    pub(super) fn new(
+        destination: &'a str,
+        target: RemoteTarget,
+        directories: &'a RemoteUserDirectories,
+        bootstrap_lock: &'a mut SshBootstrapLock,
+    ) -> Result<Self, SshBootstrapError> {
+        if target.service_platform() == satelle_core::daemon_service::DaemonServicePlatform::Linux
+            || directories.target != target
+        {
+            return Err(SshBootstrapError::PersistentServiceUnsupported);
+        }
+        Ok(Self {
+            destination,
+            target,
+            directories,
+            bootstrap_lock,
+        })
+    }
+
+    pub(super) fn install_current_host_artifact(
+        &mut self,
+    ) -> Result<UploadedHostArtifact, SshBootstrapError> {
+        let artifact = DownloadedArtifact::fetch(self.target)?;
+        let directory = self.target.artifact_directory(self.directories)?;
+        upload_artifact(
+            self.destination,
+            self.target,
+            artifact.path(),
+            &directory,
+            artifact.release_digest(),
+            self.bootstrap_lock,
+        )
+    }
+
+    pub(super) fn ensure_owner_only_directories(
+        &mut self,
+        directories: &[String],
+    ) -> Result<(), SshBootstrapError> {
+        if directories.is_empty()
+            || directories
+                .iter()
+                .any(|path| !target_path_is_absolute(self.target, path))
+        {
+            return Err(SshBootstrapError::InvalidPersistentServiceDefinition);
+        }
+        let command = persistent_directory_command(self.target, directories);
+        self.mutate("persistent_path_directories", &command, None)
+    }
+
+    pub(super) fn prepare_windows_task(
+        &self,
+        host_id: &str,
+        artifact: &UploadedHostArtifact,
+    ) -> Result<satelle_core::daemon_service::WindowsTaskDefinition, SshBootstrapError> {
+        self.require_platform(satelle_core::daemon_service::DaemonServicePlatform::Windows)?;
+        let account = self.observe_windows_account()?;
+        let executable = self.observe_windows_executable(artifact)?;
+        satelle_core::daemon_service::WindowsTaskDefinition::for_host(
+            host_id,
+            &account,
+            &executable,
+        )
+        .map_err(|_| SshBootstrapError::InvalidPersistentServiceDefinition)
+    }
+
+    pub(super) fn current_windows_task_definition(
+        &self,
+        host_id: &str,
+    ) -> Result<VerifiedCurrentWindowsTask, SshBootstrapError> {
+        self.require_platform(satelle_core::daemon_service::DaemonServicePlatform::Windows)?;
+        let artifact = DownloadedArtifact::fetch(self.target)?;
+        let remote_path = self
+            .target
+            .planned_install_path(self.directories, &artifact.release_digest())?;
+        let binary_sha256: String = sha256_file(artifact.path())?
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        let definition = self.prepare_windows_task(
+            host_id,
+            &UploadedHostArtifact {
+                remote_path,
+                binary_sha256: binary_sha256.clone(),
+            },
+        )?;
+        Ok(VerifiedCurrentWindowsTask {
+            definition,
+            executable_sha256: binary_sha256,
+        })
+    }
+
+    pub(super) fn publish_windows_service_config(
+        &mut self,
+        task: &satelle_core::daemon_service::WindowsTaskDefinition,
+        config: &satelle_core::daemon_service::WindowsServiceConfigV1,
+    ) -> Result<(), SshBootstrapError> {
+        self.require_platform(satelle_core::daemon_service::DaemonServicePlatform::Windows)?;
+        let contents = serde_json::to_vec_pretty(config)
+            .map_err(|_| SshBootstrapError::InvalidPersistentServiceDefinition)?;
+        self.publish_definition(&task.service_config_path, &contents)
+    }
+
+    pub(super) fn register_windows_task(
+        &mut self,
+        task: &satelle_core::daemon_service::WindowsTaskDefinition,
+    ) -> Result<(), SshBootstrapError> {
+        self.require_platform(satelle_core::daemon_service::DaemonServicePlatform::Windows)?;
+        self.mutate(
+            "persistent_service_register",
+            &windows_task_register_command(task),
+            None,
+        )
+    }
+
+    pub(super) fn observe_windows_task(
+        &self,
+        task: &satelle_core::daemon_service::WindowsTaskDefinition,
+    ) -> Result<PersistentServiceObservation, SshBootstrapError> {
+        self.require_platform(satelle_core::daemon_service::DaemonServicePlatform::Windows)?;
+        self.observe(&windows_task_observe_command(task))
+    }
+
+    pub(super) fn start_windows_task(
+        &mut self,
+        task: &satelle_core::daemon_service::WindowsTaskDefinition,
+    ) -> Result<(), SshBootstrapError> {
+        self.windows_task_mutation("persistent_service_start", task, "start")
+    }
+
+    pub(super) fn restart_windows_task(
+        &mut self,
+        task: &satelle_core::daemon_service::WindowsTaskDefinition,
+    ) -> Result<(), SshBootstrapError> {
+        self.windows_task_mutation("persistent_service_restart", task, "restart")
+    }
+
+    pub(super) fn restart_current_windows_task(
+        &mut self,
+        task: &VerifiedCurrentWindowsTask,
+    ) -> Result<(), SshBootstrapError> {
+        self.require_platform(satelle_core::daemon_service::DaemonServicePlatform::Windows)?;
+        self.mutate(
+            "persistent_service_restart",
+            &windows_task_lifecycle_command(task, "restart"),
+            None,
+        )
+    }
+
+    pub(super) fn stop_current_windows_task(
+        &mut self,
+        task: &VerifiedCurrentWindowsTask,
+    ) -> Result<(), SshBootstrapError> {
+        self.require_platform(satelle_core::daemon_service::DaemonServicePlatform::Windows)?;
+        self.mutate(
+            "persistent_service_stop",
+            &windows_task_lifecycle_command(task, "stop"),
+            None,
+        )
+    }
+
+    pub(super) fn observe_current_windows_task(
+        &self,
+        task: &VerifiedCurrentWindowsTask,
+    ) -> Result<PersistentServiceObservation, SshBootstrapError> {
+        self.require_platform(satelle_core::daemon_service::DaemonServicePlatform::Windows)?;
+        self.observe(&windows_task_lifecycle_command(task, "observe"))
+    }
+
+    pub(super) fn launchd_definition(
+        &self,
+        artifact: &UploadedHostArtifact,
+        overrides: &DaemonPathOverrides,
+    ) -> Result<LaunchdServiceDefinition, SshBootstrapError> {
+        self.require_platform(satelle_core::daemon_service::DaemonServicePlatform::Macos)?;
+        let binary = self.absolute_artifact_path(artifact);
+        let contents = satelle_core::daemon_service::render_launchd_user_plist(
+            Path::new(&binary),
+            "127.0.0.1:3001",
+            overrides,
+        )
+        .map_err(|_| SshBootstrapError::InvalidPersistentServiceDefinition)?;
+        Ok(LaunchdServiceDefinition {
+            plist_path: join_target_path(
+                self.target,
+                &self.directories.home,
+                "Library/LaunchAgents/dev.microck.satelle.host.plist",
+            ),
+            contents,
+        })
+    }
+
+    pub(super) fn publish_launchd_definition(
+        &mut self,
+        definition: &LaunchdServiceDefinition,
+    ) -> Result<(), SshBootstrapError> {
+        self.require_platform(satelle_core::daemon_service::DaemonServicePlatform::Macos)?;
+        self.publish_definition(definition.plist_path(), definition.contents().as_bytes())
+    }
+
+    pub(super) fn register_launchd(
+        &mut self,
+        definition: &LaunchdServiceDefinition,
+    ) -> Result<(), SshBootstrapError> {
+        self.require_platform(satelle_core::daemon_service::DaemonServicePlatform::Macos)?;
+        self.mutate(
+            "persistent_service_register",
+            &launchd_register_command(definition.plist_path()),
+            None,
+        )
+    }
+
+    pub(super) fn observe_launchd(
+        &self,
+        definition: &LaunchdServiceDefinition,
+    ) -> Result<PersistentServiceObservation, SshBootstrapError> {
+        self.require_platform(satelle_core::daemon_service::DaemonServicePlatform::Macos)?;
+        self.observe(&launchd_observe_command(definition))
+    }
+
+    pub(super) fn kickstart_launchd(&mut self) -> Result<(), SshBootstrapError> {
+        self.launchd_mutation("persistent_service_start", "kickstart")
+    }
+
+    pub(super) fn restart_launchd(&mut self) -> Result<(), SshBootstrapError> {
+        self.require_platform(satelle_core::daemon_service::DaemonServicePlatform::Macos)?;
+        let plist_path = join_target_path(
+            self.target,
+            &self.directories.home,
+            "Library/LaunchAgents/dev.microck.satelle.host.plist",
+        );
+        self.mutate(
+            "persistent_service_restart",
+            &launchd_register_command(&plist_path),
+            None,
+        )
+    }
+
+    pub(super) fn bootout_launchd(&mut self) -> Result<(), SshBootstrapError> {
+        self.launchd_mutation("persistent_service_stop", "bootout")
+    }
+
+    pub(super) fn observe_launchd_runtime(
+        &self,
+    ) -> Result<PersistentServiceObservation, SshBootstrapError> {
+        self.require_platform(satelle_core::daemon_service::DaemonServicePlatform::Macos)?;
+        self.observe(&launchd_lifecycle_command("observe_runtime"))
+    }
+
+    pub(super) fn observe_loopback_listener(
+        &self,
+    ) -> Result<LoopbackListenerObservation, SshBootstrapError> {
+        let output = require_success_output(run_ssh_command_with_output_limit(
+            self.destination,
+            &loopback_listener_observation_command(self.target),
+            PROBE_OUTPUT_LIMIT,
+        )?)?;
+        parse_loopback_listener_observation(&output.stdout)
+    }
+
+    pub(super) fn observe_canonical_daemon_path_overrides(
+        &self,
+        host_id: &str,
+    ) -> Result<DaemonPathOverrides, SshBootstrapError> {
+        let command =
+            service_path_overrides_observation_command(self.target, self.directories, host_id)?;
+        let output = require_success_output(run_ssh_command_with_output_limit(
+            self.destination,
+            &command,
+            SERVICE_DEFINITION_LIMIT,
+        )?)?;
+        parse_service_path_overrides(self.target, &output.stdout)
+    }
+
+    fn observe_windows_account(
+        &self,
+    ) -> Result<satelle_core::daemon_service::AuthenticatedWindowsAccount, SshBootstrapError> {
+        let expected_local_app_data = self
+            .directories
+            .local_app_data
+            .as_deref()
+            .ok_or(SshBootstrapError::InvalidServiceObservation)?;
+        let output = require_success_output(run_ssh_command_with_output_limit(
+            self.destination,
+            &windows_account_observation_command(),
+            PROBE_OUTPUT_LIMIT,
+        )?)?;
+        let observation: WindowsAccountObservation = serde_json::from_slice(&output.stdout)
+            .map_err(|_| SshBootstrapError::InvalidServiceObservation)?;
+        if observation.protocol != "satelle-windows-account-v1"
+            || !same_windows_path_text(
+                &observation.requested_local_app_data,
+                expected_local_app_data,
+            )
+        {
+            return Err(SshBootstrapError::InvalidServiceObservation);
+        }
+        satelle_core::daemon_service::AuthenticatedWindowsAccount::from_observation(
+            &observation.requested_sid,
+            &observation.observed_sid,
+            &observation.requested_local_app_data,
+            &observation.observed_local_app_data,
+        )
+        .map_err(|_| SshBootstrapError::InvalidServiceObservation)
+    }
+
+    fn observe_windows_executable(
+        &self,
+        artifact: &UploadedHostArtifact,
+    ) -> Result<satelle_core::daemon_service::VerifiedWindowsExecutable, SshBootstrapError> {
+        let requested_path = self.absolute_artifact_path(artifact);
+        let output = require_success_output(run_ssh_command_with_output_limit(
+            self.destination,
+            &windows_executable_observation_command(&requested_path),
+            PROBE_OUTPUT_LIMIT,
+        )?)?;
+        let observation: WindowsExecutableObservation = serde_json::from_slice(&output.stdout)
+            .map_err(|_| SshBootstrapError::InvalidServiceObservation)?;
+        if observation.protocol != "satelle-windows-executable-v1"
+            || !same_windows_path_text(&requested_path, &observation.requested_path)
+        {
+            return Err(SshBootstrapError::InvalidServiceObservation);
+        }
+        let kind = match observation.kind.as_str() {
+            "regular_file" => satelle_core::daemon_service::WindowsObservedPathKind::RegularFile,
+            "reparse_point" => satelle_core::daemon_service::WindowsObservedPathKind::ReparsePoint,
+            "directory" => satelle_core::daemon_service::WindowsObservedPathKind::Directory,
+            "missing" => satelle_core::daemon_service::WindowsObservedPathKind::Missing,
+            _ => return Err(SshBootstrapError::InvalidServiceObservation),
+        };
+        satelle_core::daemon_service::VerifiedWindowsExecutable::from_observation(
+            &observation.requested_path,
+            &observation.canonical_path,
+            kind,
+            artifact.binary_sha256(),
+            &observation.sha256,
+        )
+        .map_err(|_| SshBootstrapError::InvalidServiceObservation)
+    }
+
+    fn windows_task_mutation(
+        &mut self,
+        phase: &str,
+        task: &satelle_core::daemon_service::WindowsTaskDefinition,
+        action: &str,
+    ) -> Result<(), SshBootstrapError> {
+        self.require_platform(satelle_core::daemon_service::DaemonServicePlatform::Windows)?;
+        self.mutate(phase, &windows_task_instance_command(task, action), None)
+    }
+
+    fn launchd_mutation(&mut self, phase: &str, action: &str) -> Result<(), SshBootstrapError> {
+        self.require_platform(satelle_core::daemon_service::DaemonServicePlatform::Macos)?;
+        self.mutate(phase, &launchd_lifecycle_command(action), None)
+    }
+
+    fn publish_definition(
+        &mut self,
+        remote_path: &str,
+        contents: &[u8],
+    ) -> Result<(), SshBootstrapError> {
+        if contents.is_empty() || contents.len() > SERVICE_DEFINITION_LIMIT {
+            return Err(SshBootstrapError::ServiceDefinitionTooLarge);
+        }
+        if !target_path_is_absolute(self.target, remote_path) {
+            return Err(SshBootstrapError::InvalidPersistentServiceDefinition);
+        }
+        let command = service_definition_publish_command(self.target, remote_path);
+        self.mutate(
+            "persistent_service_definition",
+            &command,
+            Some(FencedMutationInput::ServiceDefinition(contents)),
+        )
+    }
+
+    fn mutate(
+        &mut self,
+        phase: &str,
+        command: &str,
+        input: Option<FencedMutationInput<'_>>,
+    ) -> Result<(), SshBootstrapError> {
+        let command = self
+            .bootstrap_lock
+            .fenced_command(self.target, phase, command)?;
+        require_success(run_fenced_ssh_command(self.destination, &command, input)?)
+    }
+
+    fn observe(&self, command: &str) -> Result<PersistentServiceObservation, SshBootstrapError> {
+        let output = require_success_output(run_ssh_command_with_output_limit(
+            self.destination,
+            command,
+            PROBE_OUTPUT_LIMIT,
+        )?)?;
+        parse_persistent_service_observation(&output.stdout)
+    }
+
+    fn require_platform(
+        &self,
+        expected: satelle_core::daemon_service::DaemonServicePlatform,
+    ) -> Result<(), SshBootstrapError> {
+        (self.target.service_platform() == expected)
+            .then_some(())
+            .ok_or(SshBootstrapError::PersistentServiceUnsupported)
+    }
+
+    fn absolute_artifact_path(&self, artifact: &UploadedHostArtifact) -> String {
+        if target_path_is_absolute(self.target, artifact.remote_path()) {
+            artifact.remote_path().to_string()
+        } else {
+            join_target_path(self.target, &self.directories.home, artifact.remote_path())
+        }
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WindowsAccountObservation {
+    protocol: String,
+    requested_sid: String,
+    observed_sid: String,
+    requested_local_app_data: String,
+    observed_local_app_data: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WindowsExecutableObservation {
+    protocol: String,
+    requested_path: String,
+    canonical_path: String,
+    kind: String,
+    sha256: String,
+}
+
+fn windows_account_observation_command() -> String {
+    powershell_encoded_command(
+        r#"$ErrorActionPreference='Stop'
+$whoami=whoami.exe /user /fo csv /nh | ConvertFrom-Csv -Header Name,Sid
+$identity=[Security.Principal.WindowsIdentity]::GetCurrent()
+$result=[ordered]@{
+  protocol='satelle-windows-account-v1'
+  requested_sid=$whoami.Sid
+  observed_sid=$identity.User.Value
+  requested_local_app_data=$env:LOCALAPPDATA
+  observed_local_app_data=[Environment]::GetFolderPath([Environment+SpecialFolder]::LocalApplicationData)
+}
+$result | ConvertTo-Json -Compress"#,
+    )
+}
+
+fn windows_executable_observation_command(requested_path: &str) -> String {
+    let script = format!(
+        r#"$ErrorActionPreference='Stop'
+$requested=[IO.Path]::GetFullPath(({}).Replace('/',[IO.Path]::DirectorySeparatorChar))
+$kind='missing'; $canonical=''; $sha=''
+if (Test-Path -LiteralPath $requested) {{
+  $item=Get-Item -LiteralPath $requested -Force
+  $canonical=[IO.Path]::GetFullPath($item.FullName)
+  if ($item.PSIsContainer) {{ $kind='directory' }}
+  elseif (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {{ $kind='reparse_point' }}
+  else {{
+    $current=$item.Directory
+    while ($null -ne $current) {{
+      if (($current.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {{ $kind='reparse_point'; break }}
+      $current=$current.Parent
+    }}
+    if ($kind -ne 'reparse_point') {{
+      $kind='regular_file'
+      $sha=(Get-FileHash -Algorithm SHA256 -LiteralPath $requested).Hash.ToLowerInvariant()
+    }}
+  }}
+}}
+[ordered]@{{protocol='satelle-windows-executable-v1';requested_path=$requested;canonical_path=$canonical;kind=$kind;sha256=$sha}} | ConvertTo-Json -Compress"#,
+        powershell_quote(requested_path),
+    );
+    powershell_encoded_command(&script)
+}
+
+fn persistent_directory_command(target: RemoteTarget, directories: &[String]) -> String {
+    if target.is_windows() {
+        let paths = directories
+            .iter()
+            .map(|path| powershell_quote(path))
+            .collect::<Vec<_>>()
+            .join(",");
+        powershell_encoded_command(&format!(
+            r#"$ErrorActionPreference='Stop'
+$identity=[Security.Principal.WindowsIdentity]::GetCurrent()
+foreach ($path in @({paths})) {{
+  $full=[IO.Path]::GetFullPath($path.Replace('/',[IO.Path]::DirectorySeparatorChar))
+  if (-not (Test-Path -LiteralPath $full)) {{ New-Item -ItemType Directory -Path $full -Force | Out-Null }}
+  $item=Get-Item -LiteralPath $full -Force
+  if (-not $item.PSIsContainer -or (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0)) {{ exit 1 }}
+  $security=New-Object Security.AccessControl.DirectorySecurity
+  $security.SetOwner($identity.User)
+  $security.SetAccessRuleProtection($true,$false)
+  $rule=New-Object Security.AccessControl.FileSystemAccessRule($identity.User,'FullControl','ContainerInherit,ObjectInherit','None','Allow')
+  $security.AddAccessRule($rule)
+  Set-Acl -LiteralPath $full -AclObject $security
+}}"#,
+        ))
+    } else {
+        let paths = directories
+            .iter()
+            .map(|path| posix_quote(path))
+            .collect::<Vec<_>>()
+            .join(" ");
+        format!(
+            "set -eu\numask 077\nuid=$(id -u)\nfor path in {paths}; do mkdir -p -- \"$path\"; chmod 700 -- \"$path\"; test -d \"$path\" && test ! -L \"$path\"; owner=$(stat -c %u \"$path\" 2>/dev/null || stat -f %u \"$path\"); [ \"$owner\" = \"$uid\" ]; done"
+        )
+    }
+}
+
+fn service_definition_publish_command(target: RemoteTarget, remote_path: &str) -> String {
+    if target.is_windows() {
+        let script = format!(
+            r#"$ErrorActionPreference='Stop'
+$path=[IO.Path]::GetFullPath(({}).Replace('/',[IO.Path]::DirectorySeparatorChar))
+$parent=Split-Path -Parent $path
+$contents=[Console]::In.ReadToEnd()
+if ([Text.Encoding]::UTF8.GetByteCount($contents) -gt {SERVICE_DEFINITION_LIMIT}) {{ exit 1 }}
+if (-not (Test-Path -LiteralPath $parent)) {{ exit 1 }}
+$parentItem=Get-Item -LiteralPath $parent -Force
+if (-not $parentItem.PSIsContainer -or (($parentItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0)) {{ exit 1 }}
+$temporary=Join-Path $parent ('.satelle-definition-'+[Guid]::NewGuid().ToString('N'))
+[IO.File]::WriteAllText($temporary,$contents,(New-Object Text.UTF8Encoding($false)))
+$identity=[Security.Principal.WindowsIdentity]::GetCurrent()
+$security=New-Object Security.AccessControl.FileSecurity
+$security.SetOwner($identity.User); $security.SetAccessRuleProtection($true,$false)
+$security.AddAccessRule((New-Object Security.AccessControl.FileSystemAccessRule($identity.User,'FullControl','Allow')))
+Set-Acl -LiteralPath $temporary -AclObject $security
+Move-Item -LiteralPath $temporary -Destination $path -Force"#,
+            powershell_quote(remote_path),
+        );
+        powershell_encoded_command(&script)
+    } else {
+        let parent = remote_path
+            .rsplit_once('/')
+            .map(|(parent, _)| parent)
+            .unwrap_or("/");
+        format!(
+            "set -eu\numask 077\npath={}\nparent={}\ntest -d \"$parent\" && test ! -L \"$parent\"\ntemporary=\"$parent/.satelle-definition-$$\"\ntrap 'rm -f -- \"$temporary\"' EXIT\ncat >\"$temporary\"\n[ \"$(wc -c <\"$temporary\")\" -le {SERVICE_DEFINITION_LIMIT} ]\nchmod 600 \"$temporary\"\nmv -f -- \"$temporary\" \"$path\"\ntrap - EXIT",
+            posix_quote(remote_path),
+            posix_quote(parent),
+        )
+    }
+}
+
+fn windows_task_parts(
+    task: &satelle_core::daemon_service::WindowsTaskDefinition,
+) -> Result<(&str, &str), SshBootstrapError> {
+    let name = task
+        .task_path
+        .strip_prefix(r"\Satelle\")
+        .filter(|name| !name.is_empty() && !name.contains('\\'))
+        .ok_or(SshBootstrapError::InvalidPersistentServiceDefinition)?;
+    Ok((r"\Satelle\", name))
+}
+
+fn windows_task_arguments(task: &satelle_core::daemon_service::WindowsTaskDefinition) -> String {
+    task.arguments
+        .iter()
+        .map(|argument| {
+            if argument.contains([' ', '\t', '"']) {
+                format!("\"{}\"", argument.replace('"', "\\\""))
+            } else {
+                argument.clone()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn xml_escape_text(value: &str) -> String {
+    value
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&apos;")
+}
+
+fn windows_task_xml(
+    task: &satelle_core::daemon_service::WindowsTaskDefinition,
+) -> Result<String, SshBootstrapError> {
+    windows_task_parts(task)?;
+    if task.logon_type != "InteractiveToken"
+        || task.run_level != "LeastPrivilege"
+        || task.stores_password
+        || task.multiple_instances_policy != "IgnoreNew"
+        || task.principal_sid != task.trigger_user_sid
+    {
+        return Err(SshBootstrapError::InvalidPersistentServiceDefinition);
+    }
+    Ok(format!(
+        concat!(
+            "<?xml version=\"1.0\" encoding=\"UTF-16\"?>",
+            "<Task version=\"1.4\" xmlns=\"http://schemas.microsoft.com/windows/2004/02/mit/task\">",
+            "<Triggers><LogonTrigger><Enabled>true</Enabled><UserId>{sid}</UserId></LogonTrigger></Triggers>",
+            "<Principals><Principal id=\"Author\"><UserId>{sid}</UserId>",
+            "<LogonType>InteractiveToken</LogonType><RunLevel>LeastPrivilege</RunLevel></Principal></Principals>",
+            "<Settings><MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>",
+            "<DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>",
+            "<StopIfGoingOnBatteries>false</StopIfGoingOnBatteries><Enabled>true</Enabled></Settings>",
+            "<Actions Context=\"Author\"><Exec><Command>{executable}</Command>",
+            "<Arguments>{arguments}</Arguments></Exec></Actions></Task>"
+        ),
+        sid = xml_escape_text(&task.principal_sid),
+        executable = xml_escape_text(&task.executable),
+        arguments = xml_escape_text(&windows_task_arguments(task)),
+    ))
+}
+
+fn windows_task_register_command(
+    task: &satelle_core::daemon_service::WindowsTaskDefinition,
+) -> String {
+    let (task_path, task_name) = windows_task_parts(task).expect("core task path is validated");
+    let xml = windows_task_xml(task).expect("core task definition is validated");
+    powershell_encoded_command(&format!(
+        "$ErrorActionPreference='Stop'; Register-ScheduledTask -TaskPath {} -TaskName {} -Xml {} -Force | Out-Null",
+        powershell_quote(task_path),
+        powershell_quote(task_name),
+        powershell_quote(&xml),
+    ))
+}
+
+fn windows_task_definition_match_expression(
+    task: &satelle_core::daemon_service::WindowsTaskDefinition,
+) -> String {
+    format!(
+        concat!(
+            "($xml.DocumentElement.GetAttribute('version') -eq '1.4') -and ",
+            "($xml.DocumentElement.NamespaceURI -eq 'http://schemas.microsoft.com/windows/2004/02/mit/task') -and ",
+            "(@($root.Principals.Principal).Count -eq 1) -and ",
+            "($root.Principals.Principal.id -eq 'Author') -and ",
+            "($root.Principals.Principal.UserId -eq {principal_sid}) -and ",
+            "($root.Principals.Principal.LogonType -eq 'InteractiveToken') -and ",
+            "($root.Principals.Principal.RunLevel -eq 'LeastPrivilege') -and ",
+            "(@($root.Triggers.ChildNodes).Count -eq 1) -and ",
+            "(@($root.Triggers.LogonTrigger).Count -eq 1) -and ",
+            "(@($root.Triggers.LogonTrigger.ChildNodes).Count -eq 2) -and ",
+            "($root.Triggers.LogonTrigger.Enabled -eq 'true') -and ",
+            "($root.Triggers.LogonTrigger.UserId -eq {trigger_sid}) -and ",
+            "($root.Settings.MultipleInstancesPolicy -eq 'IgnoreNew') -and ",
+            "($root.Settings.DisallowStartIfOnBatteries -eq 'false') -and ",
+            "($root.Settings.StopIfGoingOnBatteries -eq 'false') -and ",
+            "($root.Settings.Enabled -eq 'true') -and ",
+            "($root.Actions.Context -eq 'Author') -and ",
+            "(@($root.Actions.ChildNodes).Count -eq 1) -and ",
+            "(@($root.Actions.Exec).Count -eq 1) -and ",
+            "(@($root.Actions.Exec.ChildNodes).Count -eq 2) -and ",
+            "($root.Actions.Exec.Command -eq {executable}) -and ",
+            "($root.Actions.Exec.Arguments -eq {arguments})"
+        ),
+        principal_sid = powershell_quote(&task.principal_sid),
+        trigger_sid = powershell_quote(&task.trigger_user_sid),
+        executable = powershell_quote(&task.executable),
+        arguments = powershell_quote(&windows_task_arguments(task)),
+    )
+}
+
+fn windows_task_observe_command(
+    task: &satelle_core::daemon_service::WindowsTaskDefinition,
+) -> String {
+    let (task_path, task_name) = windows_task_parts(task).expect("core task path is validated");
+    let definition_matches = windows_task_definition_match_expression(task);
+    let script = format!(
+        r#"$ErrorActionPreference='Stop'
+$task=Get-ScheduledTask -TaskPath {} -TaskName {} -ErrorAction SilentlyContinue
+if ($null -eq $task) {{ Write-Output 'satelle-persistent-service-v1'; Write-Output 'absent'; exit 0 }}
+[xml]$xml=Export-ScheduledTask -TaskPath {} -TaskName {}
+$root=$xml.Task
+$matching={}
+Write-Output 'satelle-persistent-service-v1'
+if ($matching) {{ Write-Output 'matching' }} else {{ Write-Output 'drifted' }}"#,
+        powershell_quote(task_path),
+        powershell_quote(task_name),
+        powershell_quote(task_path),
+        powershell_quote(task_name),
+        definition_matches,
+    );
+    powershell_encoded_command(&script)
+}
+
+fn windows_task_instance_command(
+    task: &satelle_core::daemon_service::WindowsTaskDefinition,
+    action: &str,
+) -> String {
+    let (task_path, task_name) = windows_task_parts(task).expect("core task path is validated");
+    let lookup = format!(
+        "-TaskPath {} -TaskName {}",
+        powershell_quote(task_path),
+        powershell_quote(task_name)
+    );
+    let script = match action {
+        "start" => format!("$ErrorActionPreference='Stop'; Start-ScheduledTask {lookup}"),
+        "restart" => format!(
+            "$ErrorActionPreference='Stop'; Stop-ScheduledTask {lookup} -ErrorAction SilentlyContinue; Start-ScheduledTask {lookup}"
+        ),
+        "stop" => format!("$ErrorActionPreference='Stop'; Stop-ScheduledTask {lookup}"),
+        "observe_stopped" => format!(
+            "$task=Get-ScheduledTask {lookup} -ErrorAction SilentlyContinue; Write-Output 'satelle-persistent-service-v1'; if ($null -eq $task -or $task.State -ne 'Running') {{ Write-Output 'stopped' }} else {{ Write-Output 'running' }}"
+        ),
+        _ => unreachable!("closed Windows task action"),
+    };
+    powershell_encoded_command(&script)
+}
+
+fn windows_task_lifecycle_command(task: &VerifiedCurrentWindowsTask, action: &str) -> String {
+    let (task_path, task_name) =
+        windows_task_parts(&task.definition).expect("core task path is validated");
+    let lookup = format!(
+        "-TaskPath {} -TaskName {}",
+        powershell_quote(task_path),
+        powershell_quote(task_name),
+    );
+    let definition_matches = windows_task_definition_match_expression(&task.definition);
+    let (missing, operation) = match action {
+        "observe" => (
+            "Write-Output 'satelle-persistent-service-v1'; Write-Output 'absent'; exit 0",
+            concat!(
+                "Write-Output 'satelle-persistent-service-v1'; ",
+                "if (-not $matching) { Write-Output 'drifted' } ",
+                "elseif ($task.State -eq 'Running') { Write-Output 'running' } ",
+                "else { Write-Output 'stopped' }",
+            )
+            .to_string(),
+        ),
+        "restart" => (
+            "exit 75",
+            format!(
+                "if (-not $matching) {{ exit 75 }}; Stop-ScheduledTask {lookup} -ErrorAction SilentlyContinue; Start-ScheduledTask {lookup}"
+            ),
+        ),
+        "stop" => (
+            "exit 75",
+            format!("if (-not $matching) {{ exit 75 }}; Stop-ScheduledTask {lookup}"),
+        ),
+        _ => unreachable!("closed Windows task lifecycle action"),
+    };
+    let script = format!(
+        r#"$ErrorActionPreference='Stop'
+$task=Get-ScheduledTask {lookup} -ErrorAction SilentlyContinue
+if ($null -eq $task) {{ {missing} }}
+[xml]$xml=Export-ScheduledTask {lookup}
+$root=$xml.Task
+$command=[string]$root.Actions.Exec.Command
+$executableIsExact=$false
+try {{
+  $item=Get-Item -LiteralPath $command -Force -ErrorAction Stop
+  $canonical=[IO.Path]::GetFullPath($item.FullName)
+  $requested=[IO.Path]::GetFullPath($command)
+  $digest=(Get-FileHash -Algorithm SHA256 -LiteralPath $command).Hash.ToLowerInvariant()
+  $executableIsExact=($item -is [IO.FileInfo]) -and (-not $item.PSIsContainer) -and
+    (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -eq 0) -and
+    [StringComparer]::OrdinalIgnoreCase.Equals($requested,$canonical) -and
+    ($digest -ceq {expected_digest})
+}} catch {{ $executableIsExact=$false }}
+$matching=$executableIsExact -and ({definition_matches})
+{operation}"#,
+        lookup = lookup,
+        missing = missing,
+        expected_digest = powershell_quote(&task.executable_sha256),
+        definition_matches = definition_matches,
+        operation = operation,
+    );
+    powershell_encoded_command(&script)
+}
+
+#[cfg(test)]
+fn canonical_windows_task_command(
+    host_id: &str,
+    local_app_data: &str,
+    action: &str,
+) -> Result<String, SshBootstrapError> {
+    if host_id.is_empty() || host_id.contains(['\\', '/', '\0']) {
+        return Err(SshBootstrapError::InvalidPersistentServiceDefinition);
+    }
+    let task_name = format!("Host-{host_id}");
+    let service_config_path = join_target_path(
+        RemoteTarget::WindowsX64Msvc,
+        local_app_data,
+        &format!("Satelle/service/{host_id}.json"),
+    );
+    let service_config_argument = if service_config_path.contains([' ', '\t', '"']) {
+        format!("\"{}\"", service_config_path.replace('"', "\\\""))
+    } else {
+        service_config_path
+    };
+    let expected_arguments = format!("host start --service-config {service_config_argument}");
+    let lookup = format!(
+        "-TaskPath {} -TaskName {}",
+        powershell_quote(r"\Satelle\"),
+        powershell_quote(&task_name),
+    );
+    let (missing, operation) = match action {
+        "observe" => (
+            "Write-Output 'satelle-persistent-service-v1'; Write-Output 'absent'; exit 0",
+            concat!(
+                "Write-Output 'satelle-persistent-service-v1'; ",
+                "if (-not $matching) { Write-Output 'drifted' } ",
+                "elseif ($task.State -eq 'Running') { Write-Output 'running' } ",
+                "else { Write-Output 'stopped' }",
+            )
+            .to_string(),
+        ),
+        "restart" => (
+            "exit 75",
+            format!(
+                "if (-not $matching) {{ exit 75 }}; Stop-ScheduledTask {lookup} -ErrorAction SilentlyContinue; Start-ScheduledTask {lookup}"
+            ),
+        ),
+        "stop" => (
+            "exit 75",
+            format!("if (-not $matching) {{ exit 75 }}; Stop-ScheduledTask {lookup}"),
+        ),
+        _ => return Err(SshBootstrapError::InvalidPersistentServiceDefinition),
+    };
+    let script = format!(
+        r#"$ErrorActionPreference='Stop'
+$task=Get-ScheduledTask {lookup} -ErrorAction SilentlyContinue
+if ($null -eq $task) {{ {missing} }}
+[xml]$xml=Export-ScheduledTask {lookup}
+$root=$xml.Task
+$sid=[Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+$command=[string]$root.Actions.Exec.Command
+$executableIsSafe=$false
+try {{
+  $item=Get-Item -LiteralPath $command -Force -ErrorAction Stop
+  $canonical=[IO.Path]::GetFullPath($item.FullName)
+  $requested=[IO.Path]::GetFullPath($command)
+  $executableIsSafe=($item -is [IO.FileInfo]) -and (-not $item.PSIsContainer) -and
+    (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -eq 0) -and
+    [StringComparer]::OrdinalIgnoreCase.Equals($requested,$canonical)
+}} catch {{ $executableIsSafe=$false }}
+$matching=$executableIsSafe -and
+  ($root.Principals.Principal.UserId -eq $sid) -and
+  ($root.Principals.Principal.LogonType -eq 'InteractiveToken') -and
+  ($root.Principals.Principal.RunLevel -eq 'LeastPrivilege') -and
+  ($root.Triggers.LogonTrigger.UserId -eq $sid) -and
+  ($root.Settings.MultipleInstancesPolicy -eq 'IgnoreNew') -and
+  ($root.Actions.Exec.Arguments -eq {expected_arguments})
+{operation}"#,
+        lookup = lookup,
+        missing = missing,
+        expected_arguments = powershell_quote(&expected_arguments),
+        operation = operation,
+    );
+    Ok(powershell_encoded_command(&script))
+}
+
+fn service_path_overrides_observation_command(
+    target: RemoteTarget,
+    directories: &RemoteUserDirectories,
+    host_id: &str,
+) -> Result<String, SshBootstrapError> {
+    if host_id.is_empty() || host_id.contains(['\\', '/', '\0']) || directories.target != target {
+        return Err(SshBootstrapError::InvalidPersistentServiceDefinition);
+    }
+    if target.is_windows() {
+        let local_app_data = directories
+            .local_app_data
+            .as_deref()
+            .ok_or(SshBootstrapError::InvalidPersistentServiceDefinition)?;
+        let config_path = join_target_path(
+            target,
+            local_app_data,
+            &format!("Satelle/service/{host_id}.json"),
+        );
+        let service_directory = config_path
+            .rsplit_once('\\')
+            .map(|(parent, _)| parent)
+            .ok_or(SshBootstrapError::InvalidPersistentServiceDefinition)?;
+        let expected_argument = if config_path.contains([' ', '\t', '"']) {
+            format!("\"{}\"", config_path.replace('"', "\\\""))
+        } else {
+            config_path.clone()
+        };
+        let expected_arguments = format!("host start --service-config {expected_argument}");
+        let task_name = format!("Host-{host_id}");
+        let script = format!(
+            r#"$ErrorActionPreference='Stop'
+$task=Get-ScheduledTask -TaskPath '\Satelle\' -TaskName {task_name} -ErrorAction Stop
+[xml]$xml=Export-ScheduledTask -TaskPath '\Satelle\' -TaskName {task_name}
+if ($xml.Task.Actions.Exec.Arguments -ne {expected_arguments}) {{ exit 75 }}
+$identity=[Security.Principal.WindowsIdentity]::GetCurrent().Name
+$path={config_path}
+$serviceDirectory={service_directory}
+foreach ($candidate in @($serviceDirectory,$path)) {{
+  $item=Get-Item -LiteralPath $candidate -Force -ErrorAction Stop
+  if (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {{ exit 75 }}
+  $acl=Get-Acl -LiteralPath $candidate
+  if ($acl.Owner -ne $identity) {{ exit 75 }}
+  foreach ($rule in $acl.Access) {{
+    if ($rule.AccessControlType -eq 'Allow' -and $rule.IdentityReference.Value -ne $identity) {{ exit 75 }}
+  }}
+}}
+$file=Get-Item -LiteralPath $path -Force
+if (($file -isnot [IO.FileInfo]) -or $file.PSIsContainer -or $file.Length -eq 0 -or $file.Length -gt {limit}) {{ exit 75 }}
+[Console]::Out.Write([IO.File]::ReadAllText($file.FullName,[Text.UTF8Encoding]::new($false,$true)))"#,
+            task_name = powershell_quote(&task_name),
+            expected_arguments = powershell_quote(&expected_arguments),
+            config_path = powershell_quote(&config_path),
+            service_directory = powershell_quote(service_directory),
+            limit = SERVICE_DEFINITION_LIMIT,
+        );
+        return Ok(powershell_encoded_command(&script));
+    }
+    if target.service_platform() != satelle_core::daemon_service::DaemonServicePlatform::Macos {
+        return Err(SshBootstrapError::PersistentServiceUnsupported);
+    }
+    let plist_path = join_target_path(
+        target,
+        &directories.home,
+        "Library/LaunchAgents/dev.microck.satelle.host.plist",
+    );
+    let plist_directory = plist_path
+        .rsplit_once('/')
+        .map(|(parent, _)| parent)
+        .ok_or(SshBootstrapError::InvalidPersistentServiceDefinition)?;
+    Ok(format!(
+        "set -eu\npath={}\ndirectory={}\nuid=$(id -u)\n[ -d \"$directory\" ] && [ ! -L \"$directory\" ]\n[ -f \"$path\" ] && [ ! -L \"$path\" ]\n[ \"$(stat -f %u \"$directory\")\" = \"$uid\" ] && [ \"$(stat -f %Lp \"$directory\")\" = 700 ]\n[ \"$(stat -f %u \"$path\")\" = \"$uid\" ] && [ \"$(stat -f %Lp \"$path\")\" = 600 ]\nsize=$(stat -f %z \"$path\")\n[ \"$size\" -gt 0 ] && [ \"$size\" -le {} ]\ncat \"$path\"",
+        posix_quote(&plist_path),
+        posix_quote(plist_directory),
+        SERVICE_DEFINITION_LIMIT,
+    ))
+}
+
+fn parse_service_path_overrides(
+    target: RemoteTarget,
+    output: &[u8],
+) -> Result<DaemonPathOverrides, SshBootstrapError> {
+    if target.is_windows() {
+        let config: satelle_core::daemon_service::WindowsServiceConfigV1 =
+            serde_json::from_slice(output)
+                .map_err(|_| SshBootstrapError::InvalidServiceObservation)?;
+        if config.bind() != "127.0.0.1:3001" {
+            return Err(SshBootstrapError::InvalidServiceObservation);
+        }
+        return daemon_path_overrides_from_environment(target, config.environment());
+    }
+    if target.service_platform() != satelle_core::daemon_service::DaemonServicePlatform::Macos {
+        return Err(SshBootstrapError::PersistentServiceUnsupported);
+    }
+    parse_launchd_path_overrides(output)
+}
+
+fn daemon_path_overrides_from_environment(
+    target: RemoteTarget,
+    environment: &std::collections::BTreeMap<String, String>,
+) -> Result<DaemonPathOverrides, SshBootstrapError> {
+    let mut overrides = DaemonPathOverrides::default();
+    for (key, value) in environment {
+        if !target_path_is_absolute(target, value) {
+            return Err(SshBootstrapError::InvalidServiceObservation);
+        }
+        let path = Some(PathBuf::from(value));
+        match key.as_str() {
+            "SATELLE_HOME" => overrides.home = path,
+            "SATELLE_CONFIG_FILE" => overrides.config_file = path,
+            "SATELLE_STATE_DIR" => overrides.state_dir = path,
+            "SATELLE_CACHE_DIR" => overrides.cache_dir = path,
+            "SATELLE_LOG_DIR" => overrides.log_dir = path,
+            _ => return Err(SshBootstrapError::InvalidServiceObservation),
+        }
+    }
+    Ok(overrides)
+}
+
+fn parse_launchd_path_overrides(output: &[u8]) -> Result<DaemonPathOverrides, SshBootstrapError> {
+    const PREFIX: &str = concat!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>",
+        "<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" ",
+        "\"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">",
+        "<plist version=\"1.0\"><dict>",
+        "<key>Label</key><string>dev.microck.satelle.host</string>",
+        "<key>ProgramArguments</key><array><string>",
+    );
+    const ARGUMENTS: &str = concat!(
+        "</string><string>host</string><string>start</string>",
+        "<string>--foreground</string><string>--bind</string>",
+        "<string>127.0.0.1:3001</string></array>",
+        "<key>EnvironmentVariables</key><dict>",
+    );
+    const SUFFIX: &str = concat!(
+        "</dict><key>RunAtLoad</key><true/><key>KeepAlive</key><true/>",
+        "</dict></plist>",
+    );
+    let text =
+        std::str::from_utf8(output).map_err(|_| SshBootstrapError::InvalidServiceObservation)?;
+    let body = text
+        .strip_prefix(PREFIX)
+        .ok_or(SshBootstrapError::InvalidServiceObservation)?;
+    let (binary, body) = body
+        .split_once(ARGUMENTS)
+        .ok_or(SshBootstrapError::InvalidServiceObservation)?;
+    let binary = decode_plist_text(binary)?;
+    if !target_path_is_absolute(RemoteTarget::DarwinArm64, &binary) {
+        return Err(SshBootstrapError::InvalidServiceObservation);
+    }
+    let environment = body
+        .strip_suffix(SUFFIX)
+        .ok_or(SshBootstrapError::InvalidServiceObservation)?;
+    let mut entries = std::collections::BTreeMap::new();
+    let mut remaining = environment;
+    while !remaining.is_empty() {
+        let entry = remaining
+            .strip_prefix("<key>")
+            .ok_or(SshBootstrapError::InvalidServiceObservation)?;
+        let (key, entry) = entry
+            .split_once("</key><string>")
+            .ok_or(SshBootstrapError::InvalidServiceObservation)?;
+        let (value, rest) = entry
+            .split_once("</string>")
+            .ok_or(SshBootstrapError::InvalidServiceObservation)?;
+        let key = decode_plist_text(key)?;
+        let value = decode_plist_text(value)?;
+        if entries.insert(key, value).is_some() || entries.len() > 5 {
+            return Err(SshBootstrapError::InvalidServiceObservation);
+        }
+        remaining = rest;
+    }
+    daemon_path_overrides_from_environment(RemoteTarget::DarwinArm64, &entries)
+}
+
+fn decode_plist_text(value: &str) -> Result<String, SshBootstrapError> {
+    let mut decoded = String::with_capacity(value.len());
+    let mut remaining = value;
+    while let Some(index) = remaining.find('&') {
+        if remaining[..index].contains('<') {
+            return Err(SshBootstrapError::InvalidServiceObservation);
+        }
+        decoded.push_str(&remaining[..index]);
+        let entity = &remaining[index..];
+        let (replacement, length) = if entity.starts_with("&amp;") {
+            ('&', 5)
+        } else if entity.starts_with("&lt;") {
+            ('<', 4)
+        } else if entity.starts_with("&gt;") {
+            ('>', 4)
+        } else if entity.starts_with("&quot;") {
+            ('"', 6)
+        } else if entity.starts_with("&apos;") {
+            ('\'', 6)
+        } else {
+            return Err(SshBootstrapError::InvalidServiceObservation);
+        };
+        decoded.push(replacement);
+        remaining = &entity[length..];
+    }
+    if remaining.contains('<') {
+        return Err(SshBootstrapError::InvalidServiceObservation);
+    }
+    decoded.push_str(remaining);
+    Ok(decoded)
+}
+
+const LAUNCHD_LABEL: &str = "dev.microck.satelle.host";
+
+fn launchd_register_command(plist_path: &str) -> String {
+    format!(
+        "set -eu\ndomain=gui/$(id -u)\nlaunchctl bootout \"$domain/{LAUNCHD_LABEL}\" 2>/dev/null || true\nlaunchctl bootstrap \"$domain\" {}",
+        posix_quote(plist_path),
+    )
+}
+
+fn launchd_observe_command(definition: &LaunchdServiceDefinition) -> String {
+    let digest = Sha256::digest(definition.contents.as_bytes())
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    format!(
+        "set -eu\npath={}\nexpected={}\nif ! launchctl print \"gui/$(id -u)/{LAUNCHD_LABEL}\" >/dev/null 2>&1; then printf 'satelle-persistent-service-v1\\nabsent\\n'; exit 0; fi\nactual=$(shasum -a 256 \"$path\" | awk '{{print $1}}')\nprintf 'satelle-persistent-service-v1\\n'\nif [ \"$actual\" = \"$expected\" ]; then printf 'matching\\n'; else printf 'drifted\\n'; fi",
+        posix_quote(definition.plist_path()),
+        posix_quote(&digest),
+    )
+}
+
+fn launchd_lifecycle_command(action: &str) -> String {
+    match action {
+        "kickstart" => format!("set -eu\nlaunchctl kickstart -k \"gui/$(id -u)/{LAUNCHD_LABEL}\""),
+        "bootout" => format!("set -eu\nlaunchctl bootout \"gui/$(id -u)/{LAUNCHD_LABEL}\""),
+        "observe_absent" => format!(
+            "printf 'satelle-persistent-service-v1\\n'; if launchctl print \"gui/$(id -u)/{LAUNCHD_LABEL}\" >/dev/null 2>&1; then printf 'running\\n'; else printf 'absent\\n'; fi"
+        ),
+        "observe_runtime" => format!(
+            "set -eu\noutput=$(launchctl print \"gui/$(id -u)/{LAUNCHD_LABEL}\" 2>/dev/null) || {{ printf 'satelle-persistent-service-v1\\nabsent\\n'; exit 0; }}\nprintf 'satelle-persistent-service-v1\\n'\nif printf '%s\\n' \"$output\" | grep -Eq '^[[:space:]]*state = running[[:space:]]*$'; then printf 'running\\n'; else printf 'stopped\\n'; fi"
+        ),
+        _ => unreachable!("closed launchd action"),
+    }
+}
+
+fn loopback_listener_observation_command(target: RemoteTarget) -> String {
+    if target.is_windows() {
+        powershell_encoded_command(
+            r#"$ErrorActionPreference='Stop'
+$client=[Net.Sockets.TcpClient]::new()
+try {
+  $pending=$client.BeginConnect('127.0.0.1',3001,$null,$null)
+  if (-not $pending.AsyncWaitHandle.WaitOne(2000)) { exit 70 }
+  try {
+    $client.EndConnect($pending)
+    Write-Output 'satelle-loopback-listener-v1'
+    Write-Output 'present'
+  } catch [Net.Sockets.SocketException] {
+    if ($_.Exception.SocketErrorCode -ne [Net.Sockets.SocketError]::ConnectionRefused) { exit 71 }
+    Write-Output 'satelle-loopback-listener-v1'
+    Write-Output 'absent'
+  }
+} finally { $client.Dispose() }"#,
+        )
+    } else {
+        "set -eu\noutput=$(LC_ALL=C /usr/bin/nc -G 2 -z 127.0.0.1 3001 2>&1) && { printf 'satelle-loopback-listener-v1\\npresent\\n'; exit 0; }\ncase \"$output\" in *'Connection refused'*) printf 'satelle-loopback-listener-v1\\nabsent\\n';; *) exit 70;; esac".to_string()
+    }
+}
+
+fn parse_persistent_service_observation(
+    output: &[u8],
+) -> Result<PersistentServiceObservation, SshBootstrapError> {
+    let text =
+        std::str::from_utf8(output).map_err(|_| SshBootstrapError::InvalidServiceObservation)?;
+    let mut lines = text.lines().map(str::trim);
+    if lines.next() != Some("satelle-persistent-service-v1") {
+        return Err(SshBootstrapError::InvalidServiceObservation);
+    }
+    let observation = match lines.next() {
+        Some("absent") => PersistentServiceObservation::Absent,
+        Some("matching") => PersistentServiceObservation::Matching,
+        Some("drifted") => PersistentServiceObservation::Drifted,
+        Some("running") => PersistentServiceObservation::Running,
+        Some("stopped") => PersistentServiceObservation::Stopped,
+        _ => return Err(SshBootstrapError::InvalidServiceObservation),
+    };
+    if lines.next().is_some() {
+        return Err(SshBootstrapError::InvalidServiceObservation);
+    }
+    Ok(observation)
+}
+
+fn parse_loopback_listener_observation(
+    output: &[u8],
+) -> Result<LoopbackListenerObservation, SshBootstrapError> {
+    let text =
+        std::str::from_utf8(output).map_err(|_| SshBootstrapError::InvalidServiceObservation)?;
+    let mut lines = text.lines().map(str::trim);
+    if lines.next() != Some("satelle-loopback-listener-v1") {
+        return Err(SshBootstrapError::InvalidServiceObservation);
+    }
+    let observation = match lines.next() {
+        Some("present") => LoopbackListenerObservation::Present,
+        Some("absent") => LoopbackListenerObservation::Absent,
+        _ => return Err(SshBootstrapError::InvalidServiceObservation),
+    };
+    if lines.next().is_some() {
+        return Err(SshBootstrapError::InvalidServiceObservation);
+    }
+    Ok(observation)
+}
+
+fn target_path_is_absolute(target: RemoteTarget, path: &str) -> bool {
+    if target.is_windows() {
+        is_windows_absolute_path(path)
+    } else {
+        path.starts_with('/') && !path.split('/').any(|part| part == "..")
+    }
+}
+
+fn same_windows_path_text(left: &str, right: &str) -> bool {
+    let normalize = |value: &str| {
+        value
+            .replace('/', "\\")
+            .trim_start_matches(r"\\?\")
+            .trim_end_matches('\\')
+            .to_ascii_lowercase()
+    };
+    normalize(left) == normalize(right)
+}
+
+impl RemoteUserDirectories {
+    pub(super) fn probe(
+        destination: &str,
+        target: RemoteTarget,
+    ) -> Result<Self, SshBootstrapError> {
+        let output = if target.is_windows() {
+            let script = "$ErrorActionPreference = 'Stop'; [Console]::Out.WriteLine('satelle-user-dirs-v1'); [Console]::Out.WriteLine('HOME=' + $env:USERPROFILE); [Console]::Out.WriteLine('LOCALAPPDATA=' + $env:LOCALAPPDATA); [Console]::Out.WriteLine('APPDATA=' + $env:APPDATA)";
+            run_ssh_command(destination, &powershell_encoded_command(script))?
+        } else {
+            run_ssh_command(
+                destination,
+                "sh -c 'printf \"satelle-user-dirs-v1\\nHOME=%s\\nXDG_CONFIG_HOME=%s\\nXDG_CACHE_HOME=%s\\nXDG_STATE_HOME=%s\\n\" \"$HOME\" \"${XDG_CONFIG_HOME:-}\" \"${XDG_CACHE_HOME:-}\" \"${XDG_STATE_HOME:-}\"'",
+            )?
+        };
+        if !output.status.success() {
+            return Err(SshBootstrapError::PlatformProbeFailed);
+        }
+        Self::parse(target, &output.stdout)
+    }
+
+    pub(super) fn for_tests(target: RemoteTarget) -> Self {
+        match target.service_platform() {
+            satelle_core::daemon_service::DaemonServicePlatform::Windows => Self {
+                target,
+                home: r"C:\Users\operator".to_string(),
+                local_app_data: Some(r"C:\Users\operator\AppData\Local".to_string()),
+                roaming_app_data: Some(r"C:\Users\operator\AppData\Roaming".to_string()),
+                xdg_config_home: None,
+                xdg_cache_home: None,
+                xdg_state_home: None,
+            },
+            satelle_core::daemon_service::DaemonServicePlatform::Macos => Self {
+                target,
+                home: "/Users/operator".to_string(),
+                local_app_data: None,
+                roaming_app_data: None,
+                xdg_config_home: None,
+                xdg_cache_home: None,
+                xdg_state_home: None,
+            },
+            satelle_core::daemon_service::DaemonServicePlatform::Linux => Self {
+                target,
+                home: "/home/operator".to_string(),
+                local_app_data: None,
+                roaming_app_data: None,
+                xdg_config_home: None,
+                xdg_cache_home: None,
+                xdg_state_home: None,
+            },
+        }
+    }
+
+    pub(super) fn resolved_path_set(&self) -> satelle_core::daemon_service::DaemonResolvedPathSet {
+        use satelle_core::daemon_service::DaemonServicePlatform;
+
+        let (config_file, cache_root, state_root, operator_log_root) = match self
+            .target
+            .service_platform()
+        {
+            DaemonServicePlatform::Windows => {
+                let local = self
+                    .local_app_data
+                    .as_deref()
+                    .expect("validated Windows directories include LOCALAPPDATA");
+                let roaming = self
+                    .roaming_app_data
+                    .as_deref()
+                    .expect("validated Windows directories include APPDATA");
+                (
+                    join_target_path(self.target, roaming, "Microck/Satelle/config/config.toml"),
+                    join_target_path(self.target, local, "Microck/Satelle/cache"),
+                    join_target_path(self.target, local, "Microck/Satelle/data/state"),
+                    join_target_path(self.target, local, "Microck/Satelle/data/state/logs"),
+                )
+            }
+            DaemonServicePlatform::Macos => (
+                join_target_path(
+                    self.target,
+                    &self.home,
+                    "Library/Application Support/dev.Microck.Satelle/config.toml",
+                ),
+                join_target_path(
+                    self.target,
+                    &self.home,
+                    "Library/Caches/dev.Microck.Satelle",
+                ),
+                join_target_path(
+                    self.target,
+                    &self.home,
+                    "Library/Application Support/dev.Microck.Satelle/state",
+                ),
+                join_target_path(self.target, &self.home, "Library/Logs/dev.Microck.Satelle"),
+            ),
+            DaemonServicePlatform::Linux => {
+                let config = self.xdg_config_home.as_deref().unwrap_or("");
+                let cache = self.xdg_cache_home.as_deref().unwrap_or("");
+                let state = self.xdg_state_home.as_deref().unwrap_or("");
+                let config = if config.is_empty() {
+                    join_target_path(self.target, &self.home, ".config")
+                } else {
+                    config.to_string()
+                };
+                let cache = if cache.is_empty() {
+                    join_target_path(self.target, &self.home, ".cache")
+                } else {
+                    cache.to_string()
+                };
+                let state = if state.is_empty() {
+                    join_target_path(self.target, &self.home, ".local/state")
+                } else {
+                    state.to_string()
+                };
+                (
+                    join_target_path(self.target, &config, "satelle/config.toml"),
+                    join_target_path(self.target, &cache, "satelle"),
+                    join_target_path(self.target, &state, "satelle"),
+                    join_target_path(self.target, &state, "satelle/logs"),
+                )
+            }
+        };
+
+        satelle_core::daemon_service::DaemonResolvedPathSet {
+            sqlite_store: join_target_path(self.target, &state_root, "satelle.sqlite3"),
+            recording_root: join_target_path(self.target, &state_root, "recordings"),
+            install_receipt: join_target_path(self.target, &state_root, "install-receipt.json"),
+            config_file,
+            cache_root,
+            state_root,
+            operator_log_root,
+        }
+    }
+
+    fn parse(target: RemoteTarget, output: &[u8]) -> Result<Self, SshBootstrapError> {
+        let text = std::str::from_utf8(output).map_err(|_| SshBootstrapError::InvalidProbe)?;
+        let mut lines = text.lines().map(str::trim_end);
+        if lines.next() != Some("satelle-user-dirs-v1") {
+            return Err(SshBootstrapError::InvalidProbe);
+        }
+        let home = required_directory(target, lines.next(), "HOME=")?;
+        let directories = if target.is_windows() {
+            Self {
+                target,
+                home,
+                local_app_data: Some(required_directory(target, lines.next(), "LOCALAPPDATA=")?),
+                roaming_app_data: Some(required_directory(target, lines.next(), "APPDATA=")?),
+                xdg_config_home: None,
+                xdg_cache_home: None,
+                xdg_state_home: None,
+            }
+        } else {
+            Self {
+                target,
+                home,
+                local_app_data: None,
+                roaming_app_data: None,
+                xdg_config_home: optional_directory(target, lines.next(), "XDG_CONFIG_HOME=")?,
+                xdg_cache_home: optional_directory(target, lines.next(), "XDG_CACHE_HOME=")?,
+                xdg_state_home: optional_directory(target, lines.next(), "XDG_STATE_HOME=")?,
+            }
+        };
+        if lines.next().is_some() {
+            return Err(SshBootstrapError::InvalidProbe);
+        }
+        Ok(directories)
+    }
+}
+
+fn required_directory(
+    target: RemoteTarget,
+    line: Option<&str>,
+    prefix: &str,
+) -> Result<String, SshBootstrapError> {
+    optional_directory(target, line, prefix)?.ok_or(SshBootstrapError::InvalidProbe)
+}
+
+fn optional_directory(
+    target: RemoteTarget,
+    line: Option<&str>,
+    prefix: &str,
+) -> Result<Option<String>, SshBootstrapError> {
+    let value = line
+        .and_then(|line| line.strip_prefix(prefix))
+        .ok_or(SshBootstrapError::InvalidProbe)?;
+    if value.is_empty() {
+        return Ok(None);
+    }
+    let absolute = if target.is_windows() {
+        let bytes = value.as_bytes();
+        (bytes.len() >= 3
+            && bytes[0].is_ascii_alphabetic()
+            && bytes[1] == b':'
+            && matches!(bytes[2], b'\\' | b'/'))
+            || value.starts_with(r"\\")
+    } else {
+        value.starts_with('/')
+    };
+    absolute
+        .then(|| value.to_string())
+        .map(Some)
+        .ok_or(SshBootstrapError::InvalidProbe)
+}
+
+fn join_target_path(target: RemoteTarget, base: &str, suffix: &str) -> String {
+    let separator = if target.is_windows() { '\\' } else { '/' };
+    let base = base.trim_end_matches(['/', '\\']);
+    let suffix = suffix
+        .trim_matches(['/', '\\'])
+        .replace(['/', '\\'], &separator.to_string());
+    format!("{base}{separator}{suffix}")
+}
+
 fn daemon_environment(host_config: &HostConfig) -> Vec<(&'static str, &Path)> {
     [
         ("SATELLE_HOME", host_config.daemon_home.as_deref()),
@@ -1739,8 +3276,8 @@ fn powershell_quote(value: &str) -> String {
 
 fn remote_parent(remote_path: &str) -> &str {
     remote_path
-        .rsplit_once('/')
-        .map(|(parent, _)| parent)
+        .rfind(['/', '\\'])
+        .map(|separator| &remote_path[..separator])
         .expect("remote cache paths always contain a parent directory")
 }
 
@@ -1879,10 +3416,16 @@ fn is_glibc(value: Option<&str>) -> bool {
 struct DownloadedArtifact {
     _directory: TempDir,
     binary: PathBuf,
+    release_digest: [u8; 32],
 }
 
-impl DownloadedArtifact {
-    fn fetch(target: RemoteTarget) -> Result<Self, SshBootstrapError> {
+#[derive(Clone, Copy)]
+pub(super) struct ReleaseArtifactMetadata {
+    digest: [u8; 32],
+}
+
+impl ReleaseArtifactMetadata {
+    pub(super) fn fetch(target: RemoteTarget) -> Result<Self, SshBootstrapError> {
         let version = env!("CARGO_PKG_VERSION");
         let filename = format!(
             "satelle-v{version}-{}.{}",
@@ -1901,7 +3444,43 @@ impl DownloadedArtifact {
             .and_then(Response::error_for_status)
             .map_err(SshBootstrapError::Http)?;
         let manifest = read_response_bounded(manifest, MANIFEST_LIMIT)?;
-        let expected_digest = manifest_digest(&manifest, &filename)?;
+        Ok(Self {
+            digest: manifest_digest(&manifest, &filename)?,
+        })
+    }
+
+    pub(super) const fn from_digest(digest: [u8; 32]) -> Self {
+        Self { digest }
+    }
+
+    pub(super) const fn digest(self) -> [u8; 32] {
+        self.digest
+    }
+
+    pub(super) fn digest_hex(self) -> String {
+        let mut digest = String::with_capacity(64);
+        for byte in self.digest {
+            write!(&mut digest, "{byte:02x}").expect("writing to a String cannot fail");
+        }
+        digest
+    }
+}
+
+impl DownloadedArtifact {
+    fn fetch(target: RemoteTarget) -> Result<Self, SshBootstrapError> {
+        let version = env!("CARGO_PKG_VERSION");
+        let filename = format!(
+            "satelle-v{version}-{}.{}",
+            target.id(),
+            target.archive_extension()
+        );
+        let release_url = format!("{RELEASE_BASE_URL}/v{version}");
+        let client = Client::builder()
+            .timeout(DOWNLOAD_TIMEOUT)
+            .user_agent(format!("satelle/{version}"))
+            .build()
+            .map_err(SshBootstrapError::Http)?;
+        let expected_digest = ReleaseArtifactMetadata::fetch(target)?.digest();
 
         let mut archive = NamedTempFile::new().map_err(SshBootstrapError::LocalFile)?;
         let mut response = client
@@ -1946,11 +3525,16 @@ impl DownloadedArtifact {
         Ok(Self {
             _directory: directory,
             binary,
+            release_digest: expected_digest,
         })
     }
 
     fn path(&self) -> &Path {
         &self.binary
+    }
+
+    const fn release_digest(&self) -> [u8; 32] {
+        self.release_digest
     }
 }
 
@@ -2053,18 +3637,23 @@ fn upload_artifact(
     destination: &str,
     target: RemoteTarget,
     local_binary: &Path,
+    directory: &str,
+    address_digest: [u8; 32],
     bootstrap_lock: &mut SshBootstrapLock,
-) -> Result<String, SshBootstrapError> {
+) -> Result<UploadedHostArtifact, SshBootstrapError> {
     let local_digest = sha256_file(local_binary)?;
-    let directory = target.remote_directory();
-    let shared_path = target.shared_executable_path(&directory);
+    let local_digest_hex = local_digest
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    let shared_path = target.shared_executable_path(directory);
     let final_path = if target.is_windows() {
-        if remote_artifact_matches(destination, target, &shared_path, &local_digest)? {
-            return Ok(shared_path);
-        }
-        let content_addressed_path = target.promoted_executable_path(&directory, &local_digest);
+        let content_addressed_path = target.promoted_executable_path(directory, &address_digest);
         if remote_artifact_matches(destination, target, &content_addressed_path, &local_digest)? {
-            return Ok(content_addressed_path);
+            return Ok(UploadedHostArtifact {
+                remote_path: content_addressed_path,
+                binary_sha256: local_digest_hex,
+            });
         }
         content_addressed_path
     } else {
@@ -2075,6 +3664,7 @@ fn upload_artifact(
         target,
         local_binary,
         local_digest,
+        directory,
         bootstrap_lock,
     )?;
     let command = bootstrap_lock.fenced_command(
@@ -2085,7 +3675,10 @@ fn upload_artifact(
     let promote = run_fenced_ssh_command(destination, &command, None)?;
     require_success(promote)?;
     if remote_artifact_matches(destination, target, &final_path, &local_digest)? {
-        Ok(final_path)
+        Ok(UploadedHostArtifact {
+            remote_path: final_path,
+            binary_sha256: local_digest_hex,
+        })
     } else {
         Err(SshBootstrapError::RemoteCacheEntryRejected)
     }
@@ -2155,9 +3748,9 @@ fn stage_artifact_with_digest(
     target: RemoteTarget,
     local_binary: &Path,
     local_digest: [u8; 32],
+    directory: &str,
     bootstrap_lock: &mut SshBootstrapLock,
 ) -> Result<String, SshBootstrapError> {
-    let directory = target.remote_directory();
     let staged_suffix = if target.is_windows() { ".exe" } else { "" };
     let staged = format!(
         "{directory}/.satelle-upload-{}{staged_suffix}",
@@ -2170,7 +3763,7 @@ fn stage_artifact_with_digest(
     let command = bootstrap_lock.fenced_command(
         target,
         "cache_directory_creation",
-        &target.create_directory_command(&directory),
+        &target.create_directory_command(directory),
     )?;
     let create = run_fenced_ssh_command(destination, &command, None)?;
     require_success(create)?;
@@ -2234,6 +3827,7 @@ struct CommandOutput {
 enum FencedMutationInput<'a> {
     Artifact(File),
     BootstrapToken(&'a ApiBearerToken),
+    ServiceDefinition(&'a [u8]),
 }
 
 fn run_ssh_command(
@@ -2319,6 +3913,7 @@ fn run_fenced_ssh_command(
             let raw_token = token.expose();
             writeln!(stdin, "{}", raw_token.as_str())
         }
+        Some(FencedMutationInput::ServiceDefinition(contents)) => stdin.write_all(contents),
         None => Ok(()),
     });
     if let Err(error) = input_result {
@@ -2594,6 +4189,14 @@ pub(super) enum SshBootstrapError {
     UploadedIntegrityMismatch,
     #[error("the remote Host binary cache entry is not an owner-only regular file")]
     RemoteCacheEntryRejected,
+    #[error("persistent Host service setup is unsupported on this remote platform")]
+    PersistentServiceUnsupported,
+    #[error("the persistent Host service definition is invalid")]
+    InvalidPersistentServiceDefinition,
+    #[error("the persistent Host service observation is invalid")]
+    InvalidServiceObservation,
+    #[error("the persistent Host service definition exceeded its size limit")]
+    ServiceDefinitionTooLarge,
     #[error("the remote Host returned an invalid cache-cleanup result")]
     InvalidCacheCleanupResponse,
     #[error("the remote Host returned an invalid SHA-256 result")]
@@ -2633,6 +4236,407 @@ mod tests {
     use super::*;
     #[cfg(unix)]
     use std::os::unix::fs::{PermissionsExt, symlink};
+
+    fn persistent_windows_task() -> satelle_core::daemon_service::WindowsTaskDefinition {
+        satelle_core::daemon_service::WindowsTaskDefinition {
+            task_path: r"\Satelle\Host-host-123".to_string(),
+            principal_sid: "S-1-5-21-1000-1001-1002-1003".to_string(),
+            logon_type: "InteractiveToken".to_string(),
+            run_level: "LeastPrivilege".to_string(),
+            trigger_user_sid: "S-1-5-21-1000-1001-1002-1003".to_string(),
+            stores_password: false,
+            multiple_instances_policy: "IgnoreNew".to_string(),
+            executable:
+                r"C:\Users\operator\AppData\Local\Satelle\host\v0.1.0\win32-x64-msvc\satelle.exe"
+                    .to_string(),
+            arguments: vec![
+                "host".to_string(),
+                "start".to_string(),
+                "--service-config".to_string(),
+                r"C:\Users\operator\AppData\Local\Satelle\service\host-123.json".to_string(),
+            ],
+            service_config_path: r"C:\Users\operator\AppData\Local\Satelle\service\host-123.json"
+                .to_string(),
+        }
+    }
+
+    #[test]
+    fn persistent_service_windows_identity_and_binary_observations_are_independent() {
+        let account = decode_powershell_command(&windows_account_observation_command())
+            .expect("decode Windows account observation");
+        assert!(account.contains("whoami.exe /user /fo csv /nh"));
+        assert!(account.contains("WindowsIdentity]::GetCurrent()"));
+        assert!(account.contains("$env:LOCALAPPDATA"));
+        assert!(account.contains("GetFolderPath"));
+
+        let executable = decode_powershell_command(&windows_executable_observation_command(
+            r"C:\Users\operator\AppData\Local\Satelle\satelle.exe",
+        ))
+        .expect("decode Windows executable observation");
+        assert!(executable.contains("GetFullPath"));
+        assert!(executable.contains("Get-FileHash -Algorithm SHA256"));
+        assert!(executable.contains("ReparsePoint"));
+        assert!(executable.contains("$current=$item.Directory"));
+    }
+
+    #[test]
+    fn persistent_service_windows_task_xml_is_exact_user_login_contract() {
+        let task = persistent_windows_task();
+        let xml = windows_task_xml(&task).expect("valid Windows task XML");
+        assert!(xml.contains("<UserId>S-1-5-21-1000-1001-1002-1003</UserId>"));
+        assert!(xml.contains("<LogonType>InteractiveToken</LogonType>"));
+        assert!(xml.contains("<RunLevel>LeastPrivilege</RunLevel>"));
+        assert!(xml.contains("<MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>"));
+        assert!(xml.contains("--service-config C:\\Users\\operator"));
+        assert!(!xml.contains("Password"));
+        assert!(!xml.contains("HighestAvailable"));
+        assert!(!xml.contains("SYSTEM"));
+
+        let register = decode_powershell_command(&windows_task_register_command(&task))
+            .expect("decode task registration");
+        assert!(register.contains("Register-ScheduledTask"));
+        assert!(register.contains(r"'\Satelle\'"));
+        assert!(register.contains("'Host-host-123'"));
+
+        let observe = decode_powershell_command(&windows_task_observe_command(&task))
+            .expect("decode task observation");
+        assert!(observe.contains("Export-ScheduledTask"));
+        assert!(observe.contains("InteractiveToken"));
+        assert!(observe.contains("LeastPrivilege"));
+        assert!(observe.contains("IgnoreNew"));
+    }
+
+    #[test]
+    fn persistent_service_windows_task_lifecycle_is_exact_and_observable() {
+        let task = persistent_windows_task();
+        let start = decode_powershell_command(&windows_task_instance_command(&task, "start"))
+            .expect("decode start");
+        let restart = decode_powershell_command(&windows_task_instance_command(&task, "restart"))
+            .expect("decode restart");
+        let stop = decode_powershell_command(&windows_task_instance_command(&task, "stop"))
+            .expect("decode stop");
+        let absent =
+            decode_powershell_command(&windows_task_instance_command(&task, "observe_stopped"))
+                .expect("decode stopped observation");
+        assert!(start.contains("Start-ScheduledTask"));
+        assert!(restart.contains("Stop-ScheduledTask"));
+        assert!(restart.contains("Start-ScheduledTask"));
+        assert!(stop.contains("Stop-ScheduledTask"));
+        assert!(absent.contains("$task.State -ne 'Running'"));
+        for script in [&start, &restart, &stop, &absent] {
+            assert!(script.contains(r"'\Satelle\'"));
+            assert!(script.contains("'Host-host-123'"));
+        }
+    }
+
+    #[test]
+    fn persistent_service_windows_canonical_lifecycle_revalidates_before_mutation() {
+        let restart = decode_powershell_command(
+            &canonical_windows_task_command(
+                "host-123",
+                r"C:\Users\Satelle Operator\AppData\Local",
+                "restart",
+            )
+            .expect("canonical restart command"),
+        )
+        .expect("decode canonical restart");
+        assert!(restart.contains(r"'\Satelle\'"));
+        assert!(restart.contains("'Host-host-123'"));
+        assert!(restart.contains("WindowsIdentity]::GetCurrent().User.Value"));
+        assert!(restart.contains("InteractiveToken"));
+        assert!(restart.contains("LeastPrivilege"));
+        assert!(restart.contains("IgnoreNew"));
+        assert!(restart.contains("ReparsePoint"));
+        assert!(restart.contains(
+            r#"host start --service-config "C:\Users\Satelle Operator\AppData\Local\Satelle\service\host-123.json""#
+        ));
+        assert!(restart.contains("if ($null -eq $task) { exit 75 }"));
+        assert!(restart.contains("if (-not $matching) { exit 75 }"));
+        assert!(restart.contains("Stop-ScheduledTask"));
+        assert!(restart.contains("Start-ScheduledTask"));
+
+        let observe = decode_powershell_command(
+            &canonical_windows_task_command(
+                "host-123",
+                r"C:\Users\operator\AppData\Local",
+                "observe",
+            )
+            .expect("canonical observation command"),
+        )
+        .expect("decode canonical observation");
+        assert!(observe.contains("Write-Output 'absent'; exit 0"));
+        assert!(observe.contains("$task.State -eq 'Running'"));
+        assert!(observe.contains("Write-Output 'stopped'"));
+        assert!(canonical_windows_task_command("bad\\host", r"C:\Users\operator", "stop").is_err());
+    }
+
+    #[test]
+    fn persistent_service_windows_current_task_lifecycle_binds_definition_and_digest() {
+        let task = VerifiedCurrentWindowsTask {
+            definition: persistent_windows_task(),
+            executable_sha256: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                .to_string(),
+        };
+        let restart = decode_powershell_command(&windows_task_lifecycle_command(&task, "restart"))
+            .expect("decode exact current-task restart");
+        assert!(restart.contains("Get-FileHash -Algorithm SHA256"));
+        assert!(restart.contains(&task.executable_sha256));
+        assert!(restart.contains(&task.definition.executable));
+        assert!(restart.contains(&windows_task_arguments(&task.definition)));
+        assert!(restart.contains("LogonTrigger.ChildNodes).Count -eq 2"));
+        assert!(restart.contains("LogonTrigger.Enabled -eq 'true'"));
+        assert!(restart.contains("Settings.Enabled -eq 'true'"));
+        assert!(restart.contains("DisallowStartIfOnBatteries -eq 'false'"));
+        assert!(restart.contains("StopIfGoingOnBatteries -eq 'false'"));
+        assert!(restart.contains("Actions.ChildNodes).Count -eq 1"));
+        assert!(restart.contains("Actions.Exec.ChildNodes).Count -eq 2"));
+        assert!(restart.contains("if (-not $matching) { exit 75 }"));
+        assert!(restart.contains("Stop-ScheduledTask"));
+        assert!(restart.contains("Start-ScheduledTask"));
+
+        let observe = decode_powershell_command(&windows_task_lifecycle_command(&task, "observe"))
+            .expect("decode exact current-task observation");
+        assert!(observe.contains("Write-Output 'drifted'"));
+        assert!(observe.contains("$task.State -eq 'Running'"));
+        assert!(observe.contains("Write-Output 'stopped'"));
+    }
+
+    #[test]
+    fn persistent_service_definitions_are_bounded_atomic_and_owner_only() {
+        let windows = decode_powershell_command(&service_definition_publish_command(
+            RemoteTarget::WindowsX64Msvc,
+            r"C:\Users\operator\AppData\Local\Satelle\service\host-123.json",
+        ))
+        .expect("decode Windows publication");
+        assert!(windows.contains(&SERVICE_DEFINITION_LIMIT.to_string()));
+        assert!(windows.contains("FileSecurity"));
+        assert!(windows.contains("SetAccessRuleProtection($true,$false)"));
+        assert!(windows.contains("Move-Item"));
+
+        let posix = service_definition_publish_command(
+            RemoteTarget::DarwinArm64,
+            "/Users/operator/Library/LaunchAgents/dev.microck.satelle.host.plist",
+        );
+        assert!(posix.contains(&SERVICE_DEFINITION_LIMIT.to_string()));
+        assert!(posix.contains("umask 077"));
+        assert!(posix.contains("chmod 600"));
+        assert!(posix.contains("mv -f"));
+    }
+
+    #[test]
+    fn persistent_service_directory_creation_is_owner_only_and_reparse_safe() {
+        let windows = decode_powershell_command(&persistent_directory_command(
+            RemoteTarget::WindowsX64Msvc,
+            &[r"C:\Users\operator\AppData\Local\Satelle\service".to_string()],
+        ))
+        .expect("decode Windows directory creation");
+        assert!(windows.contains("ReparsePoint"));
+        assert!(windows.contains("DirectorySecurity"));
+        assert!(windows.contains("SetOwner"));
+        assert!(windows.contains("SetAccessRuleProtection($true,$false)"));
+
+        let posix = persistent_directory_command(
+            RemoteTarget::DarwinArm64,
+            &["/Users/operator/Library/LaunchAgents".to_string()],
+        );
+        assert!(posix.contains("umask 077"));
+        assert!(posix.contains("chmod 700"));
+        assert!(posix.contains("test ! -L"));
+        assert!(posix.contains("stat -f %u"));
+    }
+
+    #[test]
+    fn persistent_service_launchd_commands_stay_in_authenticated_gui_domain() {
+        let definition = LaunchdServiceDefinition {
+            plist_path: "/Users/operator/Library/LaunchAgents/dev.microck.satelle.host.plist"
+                .to_string(),
+            contents: "<plist>satelle</plist>".to_string(),
+        };
+        let register = launchd_register_command(definition.plist_path());
+        let observe = launchd_observe_command(&definition);
+        let kickstart = launchd_lifecycle_command("kickstart");
+        let bootout = launchd_lifecycle_command("bootout");
+        let absent = launchd_lifecycle_command("observe_absent");
+        for command in [&register, &observe, &kickstart, &bootout, &absent] {
+            assert!(command.contains("gui/$(id -u)"));
+            assert!(command.contains(LAUNCHD_LABEL));
+            assert!(!command.contains("sudo"));
+            assert!(!command.contains("system/"));
+            assert!(!command.contains("LaunchDaemons"));
+        }
+        assert!(register.contains("launchctl bootstrap"));
+        assert!(kickstart.contains("launchctl kickstart -k"));
+        assert!(bootout.contains("launchctl bootout"));
+        assert!(absent.contains("launchctl print"));
+    }
+
+    #[test]
+    fn persistent_service_launchd_runtime_requires_actual_running_state() {
+        let runtime = launchd_lifecycle_command("observe_runtime");
+        assert!(runtime.contains("gui/$(id -u)"));
+        assert!(runtime.contains("state = running"));
+        assert!(runtime.contains("printf 'running\\n'"));
+        assert!(runtime.contains("printf 'stopped\\n'"));
+        assert!(runtime.contains("absent\\n"));
+    }
+
+    #[test]
+    fn persistent_service_loopback_probe_distinguishes_absence_from_probe_errors() {
+        let windows = decode_powershell_command(&loopback_listener_observation_command(
+            RemoteTarget::WindowsX64Msvc,
+        ))
+        .expect("decode Windows listener probe");
+        assert!(windows.contains("BeginConnect('127.0.0.1',3001"));
+        assert!(windows.contains("WaitOne(2000)"));
+        assert!(windows.contains("ConnectionRefused"));
+        assert!(windows.contains("exit 70"));
+        assert!(windows.contains("exit 71"));
+
+        let macos = loopback_listener_observation_command(RemoteTarget::DarwinArm64);
+        assert!(macos.contains("/usr/bin/nc -G 2 -z 127.0.0.1 3001"));
+        assert!(macos.contains("Connection refused"));
+        assert!(macos.contains("*) exit 70"));
+
+        assert_eq!(
+            parse_loopback_listener_observation(b"satelle-loopback-listener-v1\npresent\n")
+                .unwrap(),
+            LoopbackListenerObservation::Present
+        );
+        assert_eq!(
+            parse_loopback_listener_observation(b"satelle-loopback-listener-v1\nabsent\n").unwrap(),
+            LoopbackListenerObservation::Absent
+        );
+        assert!(
+            parse_loopback_listener_observation(b"satelle-loopback-listener-v1\ntimeout\n")
+                .is_err()
+        );
+        assert!(
+            parse_loopback_listener_observation(
+                b"satelle-loopback-listener-v1\nabsent\nssh-error\n"
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn persistent_service_path_override_observation_is_owner_only_and_canonical() {
+        let windows_directories = RemoteUserDirectories {
+            target: RemoteTarget::WindowsX64Msvc,
+            home: r"C:\Users\operator".to_string(),
+            local_app_data: Some(r"C:\Users\operator\AppData\Local".to_string()),
+            roaming_app_data: Some(r"C:\Users\operator\AppData\Roaming".to_string()),
+            xdg_config_home: None,
+            xdg_cache_home: None,
+            xdg_state_home: None,
+        };
+        let windows = decode_powershell_command(
+            &service_path_overrides_observation_command(
+                RemoteTarget::WindowsX64Msvc,
+                &windows_directories,
+                "host-123",
+            )
+            .expect("Windows override observation"),
+        )
+        .expect("decode Windows override observation");
+        assert!(windows.contains("Export-ScheduledTask"));
+        assert!(windows.contains("Host-host-123"));
+        assert!(windows.contains("host start --service-config"));
+        assert!(windows.contains("ReparsePoint"));
+        assert!(windows.contains("$acl.Owner -ne $identity"));
+        assert!(windows.contains("$rule.IdentityReference.Value -ne $identity"));
+        assert!(windows.contains(&SERVICE_DEFINITION_LIMIT.to_string()));
+
+        let macos_directories = RemoteUserDirectories {
+            target: RemoteTarget::DarwinArm64,
+            home: "/Users/operator".to_string(),
+            local_app_data: None,
+            roaming_app_data: None,
+            xdg_config_home: None,
+            xdg_cache_home: None,
+            xdg_state_home: None,
+        };
+        let macos = service_path_overrides_observation_command(
+            RemoteTarget::DarwinArm64,
+            &macos_directories,
+            "host-123",
+        )
+        .expect("macOS override observation");
+        assert!(macos.contains("[ ! -L"));
+        assert!(macos.contains("stat -f %u"));
+        assert!(macos.contains("stat -f %Lp"));
+        assert!(macos.contains("= 700"));
+        assert!(macos.contains("= 600"));
+        assert!(macos.contains(&SERVICE_DEFINITION_LIMIT.to_string()));
+    }
+
+    #[test]
+    fn persistent_service_path_override_parsers_are_closed() {
+        let windows = br#"{
+          "schema":"satelle.host-service.v1",
+          "daemon_arguments":["host","start","--foreground","--bind","127.0.0.1:3001"],
+          "environment":{"SATELLE_STATE_DIR":"C:\\Users\\operator\\AppData\\Local\\Satelle\\state"}
+        }"#;
+        let parsed = parse_service_path_overrides(RemoteTarget::WindowsX64Msvc, windows)
+            .expect("valid Windows service config");
+        assert_eq!(
+            parsed.state_dir.as_deref(),
+            Some(Path::new(r"C:\Users\operator\AppData\Local\Satelle\state"))
+        );
+        assert!(
+            parse_service_path_overrides(
+                RemoteTarget::WindowsX64Msvc,
+                br#"{"schema":"satelle.host-service.v1","daemon_arguments":["host","start","--foreground","--bind","127.0.0.1:3001"],"environment":{"OTHER":"C:\\safe"}}"#,
+            )
+            .is_err()
+        );
+
+        let overrides = DaemonPathOverrides {
+            state_dir: Some(PathBuf::from(
+                "/Users/operator/Library/Application Support/Satelle",
+            )),
+            log_dir: Some(PathBuf::from("/Users/operator/Library/Logs/Satelle & Host")),
+            ..DaemonPathOverrides::default()
+        };
+        let plist = satelle_core::daemon_service::render_launchd_user_plist(
+            Path::new("/Users/operator/Applications/Satelle & Host/satelle"),
+            "127.0.0.1:3001",
+            &overrides,
+        )
+        .expect("valid launchd plist");
+        let parsed = parse_service_path_overrides(RemoteTarget::DarwinArm64, plist.as_bytes())
+            .expect("valid launchd service config");
+        assert_eq!(parsed.state_dir, overrides.state_dir);
+        assert_eq!(parsed.log_dir, overrides.log_dir);
+
+        let unknown_key = plist.replace(
+            "<key>EnvironmentVariables</key><dict>",
+            "<key>EnvironmentVariables</key><dict><key>OTHER</key><string>/tmp</string>",
+        );
+        assert!(
+            parse_service_path_overrides(RemoteTarget::DarwinArm64, unknown_key.as_bytes())
+                .is_err()
+        );
+        let wrong_bind = plist.replace("127.0.0.1:3001", "127.0.0.1:3002");
+        assert!(
+            parse_service_path_overrides(RemoteTarget::DarwinArm64, wrong_bind.as_bytes()).is_err()
+        );
+    }
+
+    #[test]
+    fn persistent_service_observation_protocol_is_closed() {
+        assert_eq!(
+            parse_persistent_service_observation(b"satelle-persistent-service-v1\nmatching\n")
+                .unwrap(),
+            PersistentServiceObservation::Matching
+        );
+        assert!(
+            parse_persistent_service_observation(
+                b"satelle-persistent-service-v1\nmatching\nextra\n"
+            )
+            .is_err()
+        );
+        assert!(parse_persistent_service_observation(b"matching\n").is_err());
+    }
 
     const POSIX_DAEMON_ENVIRONMENT_CLEAR: &str = concat!(
         "unset SATELLE_HOME SATELLE_CONFIG_FILE SATELLE_STATE_DIR ",

@@ -395,6 +395,11 @@ fn report(host_alias: &str, setup_mode: &str, dry_run: bool, changed: bool) -> S
         service_persistent: false,
         service_scope: "remote_user".to_string(),
         fallback_reason: None,
+        target_platform: None,
+        host_artifact: None,
+        service_plan: None,
+        current_daemon_paths: None,
+        planned_daemon_paths: None,
         setup_components: vec!["transport".to_string()],
         planned_actions: vec![format!(
             "run remotely through system OpenSSH: {PLANNED_COMMAND}; preserve unrelated Tailscale Serve handlers"
