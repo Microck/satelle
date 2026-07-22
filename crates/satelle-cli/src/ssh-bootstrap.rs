@@ -960,7 +960,7 @@ exact_terminal_attempt() {{
 exact_claim_attempt || exit 75
 mkdir "$claim_path/execution_started.$attempt" || exit 75
 set +e
-eval "$inner_command"
+( eval "$inner_command" )
 status=$?
 set -e
 if exact_terminal_attempt; then
@@ -3816,6 +3816,14 @@ mod tests {
         fs::create_dir_all(&claim).expect("create claim");
         fs::write(claim.join("operation_id"), operation_id).expect("write operation id");
         fs::write(claim.join("claim_identity"), identity).expect("write claim identity");
+        let failing_daemon = state.path().join("failing-satelle");
+        fs::write(
+            &failing_daemon,
+            "#!/bin/sh\n[ \"$1\" = host ] && [ \"$2\" = start ] || exit 64\nIFS= read -r token || exit 65\ncase \"$token\" in successful-bootstrap-token) exit 0;; expected-bootstrap-token) exit 23;; *) exit 66;; esac\n",
+        )
+        .expect("write failing daemon");
+        fs::set_permissions(&failing_daemon, fs::Permissions::from_mode(0o700))
+            .expect("make failing daemon executable");
 
         for (attempt, exit_code, advance_phase, retire_attempt) in [
             ("11111111111111111111111111111111", 0, false, false),
@@ -3853,8 +3861,18 @@ mod tests {
                     )
                 )
             } else {
-                format!("sh -c 'exit {exit_code}'")
+                RemoteTarget::LinuxX64Gnu.start_command(
+                    failing_daemon.to_str().expect("UTF-8 failing daemon path"),
+                    SshBootstrapScope::Read,
+                    Duration::from_secs(1),
+                    Duration::from_secs(1),
+                    "127.0.0.1:0",
+                )
             };
+            if !advance_phase && !retire_attempt {
+                assert!(inner_command.contains("exec "));
+                assert!(inner_command.contains("host start --bootstrap-token-stdin"));
+            }
             let fenced = RemoteTarget::LinuxX64Gnu.fenced_mutation_command(
                 operation_id,
                 identity,
@@ -3875,6 +3893,18 @@ mod tests {
                 "{MUTATION_EXECUTE}"
             )
             .expect("write execution gate");
+            if !advance_phase && !retire_attempt {
+                writeln!(
+                    child.stdin.as_mut().expect("piped daemon fence stdin"),
+                    "{}",
+                    if exit_code == 0 {
+                        "successful-bootstrap-token"
+                    } else {
+                        "expected-bootstrap-token"
+                    }
+                )
+                .expect("write bootstrap token");
+            }
             drop(child.stdin.take());
 
             assert_eq!(
