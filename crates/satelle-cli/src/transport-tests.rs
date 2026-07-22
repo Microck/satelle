@@ -1092,6 +1092,167 @@ fn rejected_durable_token_is_reported_after_launched_daemon_handoff_is_terminal(
 
 #[cfg(unix)]
 #[test]
+fn first_trust_path_rebind_handoff_uses_the_discovered_host_identity() {
+    with_bootstrap_handoff_test_context(|_, fake_ssh, _, _, _| {
+        let daemon_state = TestStateDir::new().expect("temporary first-trust daemon state");
+        let bootstrap_token = ApiBearerToken::generate().expect("generate bootstrap token");
+        let service = HostService::local_demo_for_tests_at(daemon_state.path())
+            .expect("construct first-trust Host service")
+            .with_ssh_bootstrap_auth_for_tests(
+                &bootstrap_token,
+                ApiScopes::ADMIN,
+                time::OffsetDateTime::now_utc() + time::Duration::minutes(5),
+            );
+        let initialized = service.initialize_daemon().expect("initialize Host state");
+        let host_identity = initialized.host_identity().to_string();
+        let raw_bootstrap_token = bootstrap_token.expose();
+        let (_runtime, server) = spawn_loopback_daemon(service);
+        let probe_identity = "first-trust-path-rebind-probe";
+        let probe_client = DaemonClient::loopback(
+            server.local_addr(),
+            ApiBearerToken::parse(raw_bootstrap_token.as_str())
+                .expect("parse identity probe token"),
+            probe_identity,
+        )
+        .expect("construct temporary identity probe client");
+        let handoff_token = ApiBearerToken::parse(raw_bootstrap_token.as_str())
+            .expect("parse identity-pinned handoff token");
+        let discovered_identity = probe_client
+            .discover_host_identity()
+            .expect("discover the reachable Host identity through the false probe pin");
+        assert_eq!(discovered_identity, host_identity);
+
+        let operation_id = "first-trust-path-rebind-handoff";
+        let mut bootstrap_lock = acquire_bootstrap_lock_for_operation_with_ssh(
+            "first-trust-path-rebind-host",
+            "fake-ssh-host",
+            operation_id.to_string(),
+            bootstrap_lock::OperationKind::InitialSetup,
+            fake_ssh,
+        )
+        .expect("acquire first-trust bootstrap lock");
+        bootstrap_lock
+            .mark_mutation_started("daemon_start")
+            .expect("record verified discovery daemon start");
+        commit_verified_bootstrap_mutation("first-trust-path-rebind-host", &mut bootstrap_lock)
+            .expect("commit discovery daemon start");
+
+        let probe_error = probe_client
+            .begin_bootstrap_maintenance(operation_id, "initial_setup")
+            .expect_err("the false probe identity cannot perform maintenance");
+        assert!(matches!(
+            probe_error,
+            DaemonClientError::Api { error, .. }
+                if error.code() == ApiErrorCode::HostIdentityMismatch
+        ));
+        complete_discovered_bootstrap_handoff(
+            "first-trust-path-rebind-host",
+            server.local_addr(),
+            handoff_token,
+            &discovered_identity,
+            &mut bootstrap_lock,
+        )
+        .expect("the learned identity completes the first-trust handoff");
+        bootstrap_lock
+            .release_committed_handoff()
+            .expect("release completed first-trust handoff");
+
+        for phase in ["maintenance_handoff_begin", "maintenance_handoff_complete"] {
+            let committed = format!("{} {phase} ", bootstrap_lock::MUTATION_COMMITTED);
+            assert_eq!(
+                bootstrap_lock
+                    .exchanged_lock_lines()
+                    .iter()
+                    .filter(|line| line.starts_with(&committed))
+                    .count(),
+                1,
+                "{phase} commits under the discovered identity"
+            );
+        }
+        drop(server);
+    });
+}
+
+#[cfg(unix)]
+#[test]
+fn conflicting_maintenance_begin_is_terminal_for_the_exact_lock_attempt() {
+    with_bootstrap_handoff_test_context(|bootstrap_client, fake_ssh, _, _, ledger| {
+        let competing_operation = "already-active-maintenance";
+        bootstrap_client
+            .begin_bootstrap_maintenance(competing_operation, "missing_daemon_repair")
+            .expect("begin competing maintenance operation");
+
+        let operation_id = "state-conflict-maintenance-begin";
+        let mut bootstrap_lock = acquire_bootstrap_lock_for_operation_with_ssh(
+            "state-conflict-handoff-host",
+            "fake-ssh-host",
+            operation_id.to_string(),
+            bootstrap_lock::OperationKind::MissingDaemonRepair,
+            fake_ssh,
+        )
+        .expect("acquire bootstrap lock");
+        bootstrap_lock
+            .mark_mutation_started("daemon_start")
+            .expect("record verified daemon start");
+        commit_verified_bootstrap_mutation("state-conflict-handoff-host", &mut bootstrap_lock)
+            .expect("commit verified daemon start");
+
+        let error = complete_bootstrap_handoff(
+            "state-conflict-handoff-host",
+            bootstrap_client,
+            &mut bootstrap_lock,
+        )
+        .expect_err("the active competing operation rejects this exact begin");
+
+        assert_eq!(error.code, ErrorCode::StateConflict);
+        assert!(
+            ledger
+                .load_setup_run(operation_id)
+                .expect("read rejected operation ledger")
+                .is_none(),
+            "the conflicting exact operation must not mutate the ledger"
+        );
+        let begin_commit = format!(
+            "{} maintenance_handoff_begin ",
+            bootstrap_lock::MUTATION_COMMITTED
+        );
+        assert_eq!(
+            bootstrap_lock
+                .exchanged_lock_lines()
+                .iter()
+                .filter(|line| line.starts_with(&begin_commit))
+                .count(),
+            1,
+            "the known StateConflict outcome closes the exact begin attempt"
+        );
+        assert!(
+            bootstrap_lock
+                .exchanged_lock_lines()
+                .iter()
+                .all(|line| !line.contains("maintenance_handoff_complete")),
+            "a rejected begin must not open the complete phase"
+        );
+        drop(bootstrap_lock);
+
+        let mut recovered_lock = acquire_bootstrap_lock_for_operation_with_ssh(
+            "state-conflict-handoff-host",
+            "fake-ssh-host",
+            "controller-after-state-conflict".to_string(),
+            bootstrap_lock::OperationKind::MissingDaemonRepair,
+            fake_ssh,
+        )
+        .expect("a new Controller acquires after the terminal conflict");
+        recovered_lock
+            .release_unmodified()
+            .expect("release recovered bootstrap lock");
+        bootstrap_client
+            .complete_bootstrap_maintenance(competing_operation)
+            .expect("complete competing maintenance fixture");
+    });
+}
+
+#[cfg(unix)]
+#[test]
 fn prehandler_handoff_rejection_is_terminal_without_mutating_the_ledger() {
     with_bootstrap_handoff_test_context(|_, fake_ssh, _, _, _| {
         let daemon_state = TestStateDir::new().expect("temporary rejected daemon state");

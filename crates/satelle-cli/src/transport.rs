@@ -1037,15 +1037,16 @@ impl SshSetupTransport {
             |bootstrap_lock| {
                 let http_token = ApiBearerToken::parse(raw_token.as_str())
                     .map_err(|error| SatelleError::config_error(error.to_string(), None))?;
-                let (bootstrap_client, bootstrap_tunnel, _bootstrap) = setup_bootstrap_client(
-                    &self.alias,
-                    self.binding.destination(),
-                    &self.binding.expected_host_identity().to_string(),
-                    &self.host_config,
-                    host_config,
-                    SshBootstrapScope::Read,
-                    bootstrap_lock,
-                )?;
+                let (bootstrap_client, bootstrap_tunnel, _bootstrap, _handoff_token) =
+                    setup_bootstrap_client(
+                        &self.alias,
+                        self.binding.destination(),
+                        &self.binding.expected_host_identity().to_string(),
+                        &self.host_config,
+                        host_config,
+                        SshBootstrapScope::Read,
+                        bootstrap_lock,
+                    )?;
                 let durable_client = DaemonClient::loopback_with_timeout(
                     bootstrap_tunnel.local_addr(),
                     http_token,
@@ -1133,7 +1134,7 @@ impl SshSetupTransport {
             .binding
             .api_token()
             .expect("setup recovery requires a file descriptor");
-        let (bootstrap_client, _tunnel, _bootstrap) = setup_bootstrap_client(
+        let (bootstrap_client, _tunnel, _bootstrap, _handoff_token) = setup_bootstrap_client(
             &self.alias,
             self.binding.destination(),
             &self.binding.expected_host_identity().to_string(),
@@ -1160,7 +1161,7 @@ impl SshSetupTransport {
             .binding
             .api_token()
             .expect("setup apply follows a plan with a token-file descriptor");
-        let (bootstrap_client, tunnel, _bootstrap) = setup_bootstrap_client(
+        let (bootstrap_client, tunnel, _bootstrap, _handoff_token) = setup_bootstrap_client(
             &self.alias,
             self.binding.destination(),
             &self.binding.expected_host_identity().to_string(),
@@ -1979,6 +1980,7 @@ fn bootstrap_maintenance_rejection_precedes_mutation(error: &DaemonClientError) 
             | (413, ApiErrorCode::PayloadTooLarge)
             | (426, ApiErrorCode::IncompatibleProtocol)
             | (429, ApiErrorCode::RateLimited)
+            | (409, ApiErrorCode::StateConflict)
     )
 }
 
@@ -2159,7 +2161,15 @@ fn setup_bootstrap_client(
     host_config: &satelle_core::HostConfig,
     bootstrap_scope: SshBootstrapScope,
     bootstrap_lock: &mut ssh_bootstrap::SshBootstrapLock,
-) -> Result<(Arc<DaemonClient>, SshTunnel, SshBootstrapProcess), SatelleError> {
+) -> Result<
+    (
+        Arc<DaemonClient>,
+        SshTunnel,
+        SshBootstrapProcess,
+        ApiBearerToken,
+    ),
+    SatelleError,
+> {
     let bootstrap_token =
         ApiBearerToken::generate().map_err(|_| SatelleError::host_unreachable(alias))?;
     let raw_bootstrap_token = bootstrap_token.expose();
@@ -2188,6 +2198,8 @@ fn setup_bootstrap_client(
         })?;
     let http_token = ApiBearerToken::parse(raw_bootstrap_token.as_str())
         .map_err(|_| SatelleError::host_unreachable(alias))?;
+    let handoff_token = ApiBearerToken::parse(raw_bootstrap_token.as_str())
+        .map_err(|_| SatelleError::host_unreachable(alias))?;
     let client = Arc::new(
         DaemonClient::loopback_with_timeout(
             tunnel.local_addr(),
@@ -2198,7 +2210,28 @@ fn setup_bootstrap_client(
         .map_err(|error| direct_transport_error(alias, error))?
         .with_admission_timeout(admission_request_timeout(previous_host_config)),
     );
-    Ok((client, tunnel, bootstrap))
+    Ok((client, tunnel, bootstrap, handoff_token))
+}
+
+fn complete_discovered_bootstrap_handoff(
+    alias: &str,
+    tunnel_addr: std::net::SocketAddr,
+    bootstrap_token: ApiBearerToken,
+    discovered_host_identity: &str,
+    bootstrap_lock: &mut ssh_bootstrap::SshBootstrapLock,
+) -> Result<(), SatelleError> {
+    // Identity discovery intentionally starts with a false probe pin. Rebuild
+    // the client with the authenticated identity learned from that mismatch;
+    // reusing the probe client would make the maintenance response fail its
+    // Host identity contract.
+    let handoff_client = DaemonClient::loopback_with_timeout(
+        tunnel_addr,
+        bootstrap_token,
+        discovered_host_identity,
+        SSH_DAEMON_REQUEST_TIMEOUT,
+    )
+    .map_err(|error| direct_transport_error(alias, error))?;
+    complete_bootstrap_handoff(alias, &handoff_client, bootstrap_lock)
 }
 
 fn direct_event_error(host: &str, error: DaemonEventError) -> SatelleError {
@@ -2485,6 +2518,7 @@ fn api_code_error(host: &str, code: ApiErrorCode) -> SatelleError {
         }
         ApiErrorCode::HostIdentityMismatch => SatelleError::host_identity_mismatch(host),
         ApiErrorCode::HostUnreachable => SatelleError::host_unreachable(host),
+        ApiErrorCode::StateConflict => SatelleError::state_conflict(),
         ApiErrorCode::NativeReadinessTimeout => SatelleError::native_readiness_timeout(),
         ApiErrorCode::ProviderSmokeTestTimeout => SatelleError::provider_smoke_test_timeout(),
         ApiErrorCode::UnsupportedProviderComputerUse => {
@@ -2635,7 +2669,7 @@ pub(crate) fn discover_ssh_host_identity(
     selected_host_config.daemon_state_dir = daemon_path_overrides.state_dir.clone();
     selected_host_config.daemon_cache_dir = daemon_path_overrides.cache_dir.clone();
     selected_host_config.daemon_log_dir = daemon_path_overrides.log_dir.clone();
-    let (client, _tunnel, _bootstrap) = setup_bootstrap_client(
+    let (client, tunnel, _bootstrap, handoff_token) = setup_bootstrap_client(
         &host.alias,
         binding.destination(),
         &probe_identity,
@@ -2647,7 +2681,13 @@ pub(crate) fn discover_ssh_host_identity(
     let identity = client
         .discover_host_identity()
         .map_err(|error| direct_transport_error(&host.alias, error))?;
-    complete_bootstrap_handoff(&host.alias, &client, &mut bootstrap_lock)?;
+    complete_discovered_bootstrap_handoff(
+        &host.alias,
+        tunnel.local_addr(),
+        handoff_token,
+        &identity,
+        &mut bootstrap_lock,
+    )?;
     bootstrap_lock
         .release_committed_handoff()
         .map_err(|_| SatelleError::host_unreachable(&host.alias))?;
