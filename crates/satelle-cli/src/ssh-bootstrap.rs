@@ -913,13 +913,16 @@ try {{
   $terminalClaimExact = $false
 }}
 if ($terminalClaimExact) {{
-  if ($status -eq 0) {{
+  if (($status -eq 0) -or
+      (($status -eq {digest_mismatch_exit_code}) -and
+       (($phase -ceq 'cache_upload') -or ($phase -ceq 'cache_staging_permissions')))) {{
     [IO.File]::Open((Join-Path $claimPath ('execution_succeeded.' + $attempt)), [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None).Dispose()
   }} elseif ($phase -ceq 'daemon_start') {{
     [IO.File]::Open((Join-Path $claimPath ('execution_failed.' + $attempt)), [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None).Dispose()
   }}
 }}
 exit $status"#,
+                digest_mismatch_exit_code = STAGED_DIGEST_MISMATCH_EXIT_CODE,
             ));
         }
 
@@ -965,7 +968,8 @@ set +e
 status=$?
 set -e
 if exact_terminal_attempt; then
-  if [ "$status" -eq 0 ]; then
+  if [ "$status" -eq 0 ] || {{ [ "$status" -eq {digest_mismatch_exit_code} ] &&
+       {{ [ "$phase" = cache_upload ] || [ "$phase" = cache_staging_permissions ]; }}; }}; then
     mkdir "$claim_path/execution_succeeded.$attempt" || exit 75
   elif [ "$phase" = daemon_start ]; then
     mkdir "$claim_path/execution_failed.$attempt" || exit 75
@@ -973,6 +977,7 @@ if exact_terminal_attempt; then
 fi
 exit "$status""#,
             execute_gate_length = MUTATION_EXECUTE.len() + 1,
+            digest_mismatch_exit_code = STAGED_DIGEST_MISMATCH_EXIT_CODE,
         );
         format!("sh -c {}", posix_quote(&script))
     }
@@ -3080,6 +3085,131 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn known_clean_digest_failures_retire_before_immediate_retry() {
+        for phase in ["cache_upload", "cache_staging_permissions"] {
+            let home = tempfile::tempdir().expect("temporary remote home");
+            let state = home.path().join("state");
+            let fake_ssh = home.path().join("ssh");
+            fs::write(
+                &fake_ssh,
+                format!(
+                    concat!(
+                        "#!/bin/sh\n",
+                        "remote_command=$3\n",
+                        "case \"$remote_command\" in cmd.exe*) exit 1;; esac\n",
+                        "cd {}\n",
+                        "export HOME={}\n",
+                        "export SATELLE_STATE_DIR={}\n",
+                        "exec sh -c \"$remote_command\"\n",
+                    ),
+                    posix_quote(home.path().to_str().expect("UTF-8 home path")),
+                    posix_quote(home.path().to_str().expect("UTF-8 home path")),
+                    posix_quote(state.to_str().expect("UTF-8 state path")),
+                ),
+            )
+            .expect("write fake SSH");
+            fs::set_permissions(&fake_ssh, fs::Permissions::from_mode(0o700))
+                .expect("make fake SSH executable");
+
+            let request = bootstrap_lock::Request::new(
+                format!("digest-failure-{phase}"),
+                bootstrap_lock::OperationKind::MissingDaemonRepair,
+                None,
+            )
+            .expect("valid bootstrap request");
+            let mut bootstrap_lock =
+                SshBootstrapLock::acquire_for_tests("test-host", request, &fake_ssh)
+                    .expect("acquire bootstrap lock");
+            let target = RemoteTarget::LinuxX64Gnu;
+            let directory = target.remote_directory();
+            assert!(
+                run_posix_cache_command(
+                    home.path(),
+                    &target.create_directory_command(&directory),
+                    None,
+                )
+                .success()
+            );
+            let staged = format!("{directory}/.satelle-upload-{phase}");
+            let (inner_command, payload): (String, &[u8]) = if phase == "cache_upload" {
+                (
+                    target.upload_command(&staged, &"00".repeat(32)),
+                    b"artifact",
+                )
+            } else {
+                fs::write(home.path().join(&staged), b"artifact").expect("write staged artifact");
+                fs::set_permissions(home.path().join(&staged), fs::Permissions::from_mode(0o600))
+                    .expect("secure staged artifact");
+                (
+                    target
+                        .prepare_staged_command(&staged, &"00".repeat(32))
+                        .expect("POSIX staging command"),
+                    b"",
+                )
+            };
+            let fenced = bootstrap_lock
+                .fenced_command(target, phase, &inner_command)
+                .expect("start digest mismatch attempt");
+            let run_fenced = |command: &str, payload: &[u8]| {
+                let mut child = Command::new("sh")
+                    .arg("-c")
+                    .arg(command)
+                    .current_dir(home.path())
+                    .env("HOME", home.path())
+                    .env("SATELLE_STATE_DIR", &state)
+                    .stdin(Stdio::piped())
+                    .spawn()
+                    .expect("run fenced mutation");
+                writeln!(
+                    child.stdin.as_mut().expect("piped mutation stdin"),
+                    "{MUTATION_EXECUTE}"
+                )
+                .expect("write execution gate");
+                child
+                    .stdin
+                    .as_mut()
+                    .expect("piped mutation stdin")
+                    .write_all(payload)
+                    .expect("write mutation payload");
+                drop(child.stdin.take());
+                child.wait().expect("wait for fenced mutation")
+            };
+            let mismatch_status = run_fenced(&fenced, payload);
+            assert_eq!(
+                mismatch_status.code(),
+                Some(STAGED_DIGEST_MISMATCH_EXIT_CODE)
+            );
+            assert!(matches!(
+                require_staged_mutation_success(CommandOutput {
+                    status: mismatch_status,
+                    stdout: Vec::new(),
+                    stderr: SshStderrClassification::default(),
+                }),
+                Err(SshBootstrapError::UploadedIntegrityMismatch)
+            ));
+            assert!(!home.path().join(&staged).exists());
+
+            let retry = bootstrap_lock
+                .fenced_command(target, phase, "sh -c 'exit 0'")
+                .expect("known-clean attempt permits immediate retry");
+            assert!(run_fenced(&retry, b"").success());
+            drop(bootstrap_lock);
+
+            let retry_request = bootstrap_lock::Request::new(
+                format!("digest-reacquire-{phase}"),
+                bootstrap_lock::OperationKind::MissingDaemonRepair,
+                None,
+            )
+            .expect("valid retry request");
+            let mut retry_lock =
+                SshBootstrapLock::acquire_for_tests("test-host", retry_request, &fake_ssh)
+                    .expect("completed retry does not leave BootstrapBusy");
+            retry_lock.release_unmodified().expect("release retry lock");
+        }
+    }
+
     #[cfg(unix)]
     #[test]
     fn posix_staging_chmod_rejects_a_symlinked_version_without_outside_mutation() {
@@ -3825,6 +3955,9 @@ mod tests {
         assert!(posix.contains("execution_started.$attempt"));
         assert!(posix.contains("execution_succeeded.$attempt"));
         assert!(posix.contains("execution_failed.$attempt"));
+        assert!(posix.contains("[ \"$status\" -eq 65 ]"));
+        assert!(posix.contains("[ \"$phase\" = cache_upload ]"));
+        assert!(posix.contains("[ \"$phase\" = cache_staging_permissions ]"));
         assert!(posix.contains("exact_terminal_attempt"));
         assert!(posix.contains("[ -d \"$claim_path/execution_started.$attempt\" ]"));
         assert!(posix.contains("[ ! -e \"$claim_path/execution_retiring.$attempt\" ]"));
@@ -3852,6 +3985,9 @@ mod tests {
         assert!(script.contains("execution_started."));
         assert!(script.contains("execution_succeeded."));
         assert!(script.contains("execution_failed."));
+        assert!(script.contains("$status -eq 65"));
+        assert!(script.contains("$phase -ceq 'cache_upload'"));
+        assert!(script.contains("$phase -ceq 'cache_staging_permissions'"));
         assert!(script.contains("$terminalClaimExact"));
         assert!(script.contains("$terminalClaimItem.PSIsContainer"));
         assert!(script.contains("$terminalStartedItem.PSIsContainer"));
