@@ -267,13 +267,11 @@ fn is_ignored_filesystem_event(kind: EventKind) -> bool {
 }
 
 fn is_barrier_signal(event: &Event, barrier_path: &Path) -> bool {
-    matches!(
-        event.kind,
-        EventKind::Modify(ModifyKind::Data(_) | ModifyKind::Any | ModifyKind::Other)
-    ) && event
-        .paths
-        .iter()
-        .any(|path| path.as_path() == barrier_path)
+    matches!(event.kind, EventKind::Modify(_))
+        && event
+            .paths
+            .iter()
+            .any(|path| path.as_path() == barrier_path)
 }
 
 fn observe_transient_mutations(
@@ -303,8 +301,14 @@ fn observe_transient_mutations(
                         root.display()
                     );
                 }
+                // The private barrier lives outside the protected tree. Some native backends
+                // report its write as a metadata modification, so recognize the exact barrier
+                // path before applying protected-tree event suppression.
+                barrier_observed = is_barrier_signal(&event, expected_barrier_path);
+                if barrier_observed {
+                    continue;
+                }
                 let ignored = is_ignored_filesystem_event(event.kind);
-                barrier_observed = !ignored && is_barrier_signal(&event, expected_barrier_path);
                 if ignored {
                     continue;
                 }
@@ -1649,6 +1653,25 @@ mod tests {
         ] {
             assert!(!is_ignored_filesystem_event(kind), "{kind:?}");
         }
+    }
+
+    #[test]
+    fn mutation_barrier_accepts_platform_specific_modify_events() {
+        let barrier_path = PathBuf::from("mutation-barrier");
+
+        for kind in [
+            EventKind::Modify(ModifyKind::Data(DataChange::Any)),
+            EventKind::Modify(ModifyKind::Any),
+            EventKind::Modify(ModifyKind::Metadata(MetadataKind::Any)),
+            EventKind::Modify(ModifyKind::Other),
+        ] {
+            let event = Event::new(kind).add_path(barrier_path.clone());
+            assert!(is_barrier_signal(&event, &barrier_path), "{kind:?}");
+        }
+
+        let wrong_path =
+            Event::new(EventKind::Modify(ModifyKind::Any)).add_path(PathBuf::from("other-path"));
+        assert!(!is_barrier_signal(&wrong_path, &barrier_path));
     }
 
     #[test]
