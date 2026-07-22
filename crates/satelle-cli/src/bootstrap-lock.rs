@@ -3,6 +3,8 @@ pub(super) const BUSY: &str = "satelle-bootstrap-busy-v1";
 pub(super) const HEARTBEAT: &str = "satelle-bootstrap-heartbeat-v1";
 pub(super) const RELEASE: &str = "satelle-bootstrap-release-v1";
 pub(super) const MUTATION_STARTED: &str = "satelle-bootstrap-mutation-started-v1";
+pub(super) const MUTATION_COMMITTED: &str = "satelle-bootstrap-mutation-committed-v1";
+pub(super) const MUTATION_EXECUTING: &str = "satelle-bootstrap-mutation-executing-v1";
 const STALE_AFTER_SECONDS: u64 = 30;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -79,6 +81,8 @@ $claimPath = $null
 $claimIdentity = $null
 $claimPublished = $false
 $mutationStarted = $false
+$mutationAttempt = $null
+$mutationPhase = $null
 $released = $false
 function Set-OwnerOnly([string]$Path) {{
   $acl = Get-Acl -LiteralPath $Path
@@ -132,6 +136,32 @@ function Record-Recovery([string]$Observed, [string]$Reason, [bool]$Process, [bo
     ConvertTo-Json -Compress | Set-Content -LiteralPath $record -Encoding UTF8
   Set-OwnerOnly $record
 }}
+function Finalize-InterruptedClaim {{
+  $closingPath = $claimPath + '.closing'
+  try {{ [IO.Directory]::Move($claimPath, $closingPath) }} catch {{ return }}
+  $currentStarted = $mutationAttempt -and
+    (Test-Path -LiteralPath (Join-Path $closingPath ('execution_started.' + $mutationAttempt)) -PathType Leaf)
+  $currentReconciled = -not $currentStarted
+  if ($currentStarted) {{
+    $requiresCommit = $mutationPhase -in @('daemon_start', 'durable_token_verification', 'maintenance_handoff_begin', 'maintenance_handoff_complete')
+    $marker = if ($requiresCommit) {{ 'execution_committed.' }} else {{ 'execution_succeeded.' }}
+    $currentReconciled = Test-Path -LiteralPath (Join-Path $closingPath ($marker + $mutationAttempt)) -PathType Leaf
+  }}
+  if ($currentReconciled) {{
+    $failure = Join-Path $stateRoot ('bootstrap-operation-' + $operationId + '.json')
+    $anyStarted = @(Get-ChildItem -LiteralPath $closingPath -File -Filter 'execution_started.*' -ErrorAction SilentlyContinue).Count -gt 0
+    $terminal = if ($anyStarted) {{ 'reconciled_failed' }} else {{ 'clean_failed' }}
+    $failedPhase = if ($anyStarted) {{ 'after_reconciled_remote_mutation' }} else {{ 'before_remote_mutation' }}
+    @{{schema_version='satelle.bootstrap-operation.v1';operation_id=$operationId;operation_kind=$operationKind;terminal_state=$terminal;failed_phase=$failedPhase;observed_at=[DateTimeOffset]::UtcNow.ToString('O')}} |
+      ConvertTo-Json -Compress | Set-Content -LiteralPath $failure -Encoding UTF8
+    Set-OwnerOnly $failure
+    Remove-Item -LiteralPath $closingPath -Recurse -Force
+    return
+  }}
+  Write-Value $closingPath 'state' 'recovery_pending'
+  Write-Value $closingPath 'recovery_reason' 'controller channel closed after remote mutation'
+  try {{ [IO.Directory]::Move($closingPath, $claimPath) }} catch {{}}
+}}
 try {{
   New-Item -ItemType Directory -Force -Path $stateRoot | Out-Null
   Set-OwnerOnly $stateRoot
@@ -170,13 +200,24 @@ foreach ($item in @(Get-ChildItem -LiteralPath $lockRoot -Force -ErrorAction Sto
     $heartbeat = (Get-Content -LiteralPath (Join-Path $item.FullName 'heartbeat_at') -Raw).Trim()
     $heartbeatTime = [DateTimeOffset]::Parse($heartbeat)
     $claimState = (Get-Content -LiteralPath (Join-Path $item.FullName 'state') -Raw).Trim()
+    $observedIdentity = (Get-Content -LiteralPath (Join-Path $item.FullName 'claim_identity') -Raw).Trim()
+    if ($observedIdentity -notmatch '^[0-9a-f]{{32}}$') {{ Fail-Busy }}
     $claimOperationKind = $null
     $mutationPhase = $null
+    $mutationAttempt = $null
+    $executionStarted = $false
+    $executionSucceeded = $false
+    $executionCommitted = $false
     if ($claimState -ne 'live') {{
       $claimOperationKind = (Get-Content -LiteralPath (Join-Path $item.FullName 'operation_kind') -Raw).Trim()
       $mutationPhase = (Get-Content -LiteralPath (Join-Path $item.FullName 'mutation_phase') -Raw).Trim()
+      $mutationAttempt = (Get-Content -LiteralPath (Join-Path $item.FullName 'mutation_attempt') -Raw).Trim()
       if ($claimOperationKind -notin @('initial_setup', 'missing_daemon_repair') -or
-          $mutationPhase -notin @('cache_directory_creation', 'cache_upload', 'cache_staging_permissions', 'cache_promotion', 'daemon_start', 'state_owner_release')) {{ Fail-Busy }}
+          $mutationPhase -notin @('cache_directory_creation', 'cache_upload', 'cache_staging_permissions', 'cache_promotion', 'daemon_start', 'state_owner_release', 'durable_token_verification', 'maintenance_handoff_begin', 'maintenance_handoff_complete') -or
+          $mutationAttempt -notmatch '^[0-9a-f]{{32}}$') {{ Fail-Busy }}
+      $executionStarted = Test-Path -LiteralPath (Join-Path $item.FullName ('execution_started.' + $mutationAttempt)) -PathType Leaf
+      $executionSucceeded = Test-Path -LiteralPath (Join-Path $item.FullName ('execution_succeeded.' + $mutationAttempt)) -PathType Leaf
+      $executionCommitted = Test-Path -LiteralPath (Join-Path $item.FullName ('execution_committed.' + $mutationAttempt)) -PathType Leaf
     }}
   }} catch {{ Fail-Busy }}
   if (([DateTimeOffset]::UtcNow - $heartbeatTime).TotalSeconds -le {STALE_AFTER_SECONDS}) {{ Fail-Busy }}
@@ -191,9 +232,14 @@ foreach ($item in @(Get-ChildItem -LiteralPath $lockRoot -Force -ErrorAction Sto
   }} catch {{
     if ($_.Exception.Response) {{ $daemonActive = @([int]$_.Exception.Response.StatusCode) -in @(200, 401, 403, 429) }}
   }}
-  if ($processActive -or $serviceActive -or $daemonActive) {{ Fail-Busy }}
+  $requiresCommit = $mutationPhase -in @('daemon_start', 'durable_token_verification', 'maintenance_handoff_begin', 'maintenance_handoff_complete')
+  if (($processActive -or $serviceActive -or $daemonActive) -and
+      -not ($claimState -ne 'live' -and $requiresCommit -and $executionCommitted)) {{ Fail-Busy }}
   Record-Recovery $observed 'stale heartbeat postcondition probes' $processActive $binaryPresent $serviceActive $daemonActive
-  if ($claimState -ne 'live') {{ Fail-Busy }}
+  $reconciled = ($claimState -ceq 'live') -or (-not $executionStarted) -or
+    ($requiresCommit -and $executionCommitted) -or
+    ((-not $requiresCommit) -and $executionSucceeded)
+  if (-not $reconciled) {{ Fail-Busy }}
   $quarantineRoot = Join-Path $stateRoot ('bootstrap.quarantine.' + [Guid]::NewGuid().ToString('N'))
   New-Item -ItemType Directory -Path $quarantineRoot -ErrorAction Stop | Out-Null
   Set-OwnerOnly $quarantineRoot
@@ -206,19 +252,30 @@ foreach ($item in @(Get-ChildItem -LiteralPath $lockRoot -Force -ErrorAction Sto
     $movedOperation = Read-Operation $quarantinedClaim
     $movedHeartbeat = (Get-Content -LiteralPath (Join-Path $quarantinedClaim 'heartbeat_at') -Raw).Trim()
     $movedState = (Get-Content -LiteralPath (Join-Path $quarantinedClaim 'state') -Raw).Trim()
+    $movedIdentity = (Get-Content -LiteralPath (Join-Path $quarantinedClaim 'claim_identity') -Raw).Trim()
     $movedOperationKind = $null
     $movedMutationPhase = $null
+    $movedMutationAttempt = $null
+    $movedExecutionStarted = $false
+    $movedExecutionSucceeded = $false
+    $movedExecutionCommitted = $false
     if ($movedState -ne 'live') {{
       $movedOperationKind = (Get-Content -LiteralPath (Join-Path $quarantinedClaim 'operation_kind') -Raw).Trim()
       $movedMutationPhase = (Get-Content -LiteralPath (Join-Path $quarantinedClaim 'mutation_phase') -Raw).Trim()
+      $movedMutationAttempt = (Get-Content -LiteralPath (Join-Path $quarantinedClaim 'mutation_attempt') -Raw).Trim()
+      $movedExecutionStarted = Test-Path -LiteralPath (Join-Path $quarantinedClaim ('execution_started.' + $movedMutationAttempt)) -PathType Leaf
+      $movedExecutionSucceeded = Test-Path -LiteralPath (Join-Path $quarantinedClaim ('execution_succeeded.' + $movedMutationAttempt)) -PathType Leaf
+      $movedExecutionCommitted = Test-Path -LiteralPath (Join-Path $quarantinedClaim ('execution_committed.' + $movedMutationAttempt)) -PathType Leaf
     }}
   }} catch {{
     Restore-Competitor $item.FullName $quarantineRoot $quarantinedClaim
     Fail-Busy
   }}
-  if (($movedOperation -cne $observed) -or ($movedHeartbeat -cne $heartbeat) -or
+  if (($movedOperation -cne $observed) -or ($movedIdentity -cne $observedIdentity) -or ($movedHeartbeat -cne $heartbeat) -or
       ($movedState -cne $claimState) -or ($movedOperationKind -cne $claimOperationKind) -or
-      ($movedMutationPhase -cne $mutationPhase)) {{
+      ($movedMutationPhase -cne $mutationPhase) -or ($movedMutationAttempt -cne $mutationAttempt) -or
+      ($movedExecutionStarted -ne $executionStarted) -or ($movedExecutionSucceeded -ne $executionSucceeded) -or
+      ($movedExecutionCommitted -ne $executionCommitted)) {{
     Restore-Competitor $item.FullName $quarantineRoot $quarantinedClaim
     Fail-Busy
   }}
@@ -228,7 +285,7 @@ foreach ($item in @(Get-ChildItem -LiteralPath $lockRoot -Force -ErrorAction Sto
   if (-not [StringComparer]::OrdinalIgnoreCase.Equals($item.FullName, $claimPath)) {{ Fail-Busy }}
 }}
 if (-not (Same-Owner)) {{ Fail-Busy }}
-Write-Output '{READY}'
+Write-Output ('{READY} ' + $claimIdentity + ' ' + [IO.Path]::GetFileName($claimPath))
 try {{
   while (($line = [Console]::In.ReadLine()) -ne $null) {{
     if (-not (Same-Owner)) {{ exit 75 }}
@@ -237,11 +294,26 @@ try {{
       continue
     }}
     if ($line.StartsWith('{MUTATION_STARTED} ')) {{
-      $phase = $line.Substring({mutation_prefix_length})
-      if ($phase -notmatch '^[A-Za-z0-9_-]{{1,128}}$') {{ exit 64 }}
-      Write-Value $claimPath 'state' 'mutation_started'
+      $parts = @($line.Substring({mutation_prefix_length}).Split(' ', [StringSplitOptions]::RemoveEmptyEntries))
+      if ($parts.Count -ne 2) {{ exit 64 }}
+      $phase = $parts[0]
+      $attempt = $parts[1]
+      if ($phase -notmatch '^[A-Za-z0-9_-]{{1,128}}$' -or $attempt -notmatch '^[0-9a-f]{{32}}$') {{ exit 64 }}
       Write-Value $claimPath 'mutation_phase' $phase
+      Write-Value $claimPath 'mutation_attempt' $attempt
+      Write-Value $claimPath 'state' 'mutation_started'
       $mutationStarted = $true
+      $mutationPhase = $phase
+      $mutationAttempt = $attempt
+    }} elseif ($line.StartsWith('{MUTATION_EXECUTING} ')) {{
+      $parts = @($line.Substring({executing_prefix_length}).Split(' ', [StringSplitOptions]::RemoveEmptyEntries))
+      if ($parts.Count -ne 2 -or $parts[0] -cne $mutationPhase -or $parts[1] -cne $mutationAttempt) {{ exit 75 }}
+      [IO.File]::Open((Join-Path $claimPath ('execution_started.' + $mutationAttempt)), [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None).Dispose()
+    }} elseif ($line.StartsWith('{MUTATION_COMMITTED} ')) {{
+      $parts = @($line.Substring({commit_prefix_length}).Split(' ', [StringSplitOptions]::RemoveEmptyEntries))
+      if ($parts.Count -ne 2 -or $parts[0] -cne $mutationPhase -or $parts[1] -cne $mutationAttempt -or
+          -not (Test-Path -LiteralPath (Join-Path $claimPath ('execution_started.' + $mutationAttempt)) -PathType Leaf)) {{ exit 75 }}
+      [IO.File]::Open((Join-Path $claimPath ('execution_committed.' + $mutationAttempt)), [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None).Dispose()
     }} elseif ($line -ceq '{RELEASE}') {{
       if (-not (Same-Owner)) {{ exit 75 }}
       Remove-OwnClaim
@@ -255,8 +327,7 @@ try {{
 }} finally {{
   if (-not $released -and (Same-Owner)) {{
     if ($mutationStarted) {{
-      Write-Value $claimPath 'state' 'recovery_pending'
-      Write-Value $claimPath 'recovery_reason' 'controller channel closed after remote mutation'
+      Finalize-InterruptedClaim
     }} else {{
       $failure = Join-Path $stateRoot ('bootstrap-operation-' + $operationId + '.json')
       @{{schema_version='satelle.bootstrap-operation.v1';operation_id=$operationId;operation_kind=$operationKind;terminal_state='clean_failed';failed_phase='before_remote_mutation';observed_at=[DateTimeOffset]::UtcNow.ToString('O')}} |
@@ -267,6 +338,8 @@ try {{
   }}
 }}"#,
             mutation_prefix_length = MUTATION_STARTED.len() + 1,
+            executing_prefix_length = MUTATION_EXECUTING.len() + 1,
+            commit_prefix_length = MUTATION_COMMITTED.len() + 1,
         )
     }
 
@@ -291,6 +364,8 @@ claim_path=
 claim_identity=
 claim_published=false
 mutation_started=false
+mutation_attempt=
+mutation_phase=
 released=false
 write_value() {{ printf '%s\n' "$2" >"$1/$3"; chmod 600 "$1/$3"; }}
 read_operation() {{ cat "$1/operation_id" 2>/dev/null; }}
@@ -310,12 +385,43 @@ record_recovery() {{
   printf '{{"schema_version":"satelle.bootstrap-recovery.v1","operation_id":"%s","reason":"stale heartbeat postcondition probes","process_probe":%s,"binary_probe":%s,"service_probe":%s,"daemon_probe":%s,"observed_at":"%s"}}\n' "$1" "$2" "$3" "$4" "$5" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" >"$record"
   chmod 600 "$record"
 }}
+finalize_interrupted_claim() {{
+  closing_path="$claim_path.closing"
+  mv "$claim_path" "$closing_path" 2>/dev/null || return
+  current_started=false
+  [ -n "$mutation_attempt" ] && [ -d "$closing_path/execution_started.$mutation_attempt" ] && current_started=true
+  current_reconciled=true
+  if [ "$current_started" = true ]; then
+    current_reconciled=false
+    requires_commit=false
+    case "$mutation_phase" in daemon_start|durable_token_verification|maintenance_handoff_begin|maintenance_handoff_complete) requires_commit=true;; esac
+    if [ "$requires_commit" = true ]; then
+      [ -d "$closing_path/execution_committed.$mutation_attempt" ] && current_reconciled=true
+    else
+      [ -d "$closing_path/execution_succeeded.$mutation_attempt" ] && current_reconciled=true
+    fi
+  fi
+  if [ "$current_reconciled" = true ]; then
+    any_started=false
+    for started in "$closing_path"/execution_started.*; do [ -d "$started" ] && any_started=true; done
+    terminal_state=clean_failed
+    failed_phase=before_remote_mutation
+    if [ "$any_started" = true ]; then terminal_state=reconciled_failed; failed_phase=after_reconciled_remote_mutation; fi
+    failure="$state_root/bootstrap-operation-$operation_id.json"
+    printf '{{"schema_version":"satelle.bootstrap-operation.v1","operation_id":"%s","operation_kind":"%s","terminal_state":"%s","failed_phase":"%s","observed_at":"%s"}}\n' "$operation_id" "$operation_kind" "$terminal_state" "$failed_phase" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" >"$failure"
+    chmod 600 "$failure"
+    rm -rf "$closing_path"
+    return
+  fi
+  write_value "$closing_path" recovery_pending state
+  write_value "$closing_path" 'controller channel closed after remote mutation' recovery_reason
+  mv "$closing_path" "$claim_path" 2>/dev/null || true
+}}
 cleanup() {{
   if [ -n "$pending_path" ] && [ -d "$pending_path" ]; then rm -rf "$pending_path"; fi
   if [ "$claim_published" = true ] && [ "$released" = false ] && same_owner; then
     if [ "$mutation_started" = true ]; then
-      write_value "$claim_path" recovery_pending state
-      write_value "$claim_path" 'controller channel closed after remote mutation' recovery_reason
+      finalize_interrupted_claim
     else
       failure="$state_root/bootstrap-operation-$operation_id.json"
       printf '{{"schema_version":"satelle.bootstrap-operation.v1","operation_id":"%s","operation_kind":"%s","terminal_state":"clean_failed","failed_phase":"before_remote_mutation","observed_at":"%s"}}\n' "$operation_id" "$operation_kind" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" >"$failure"
@@ -377,16 +483,29 @@ for competitor in "$lock_root"/*; do
   heartbeat="$(cat "$competitor/heartbeat_at" 2>/dev/null)" || busy
   heartbeat_epoch="$(date -u -d "$heartbeat" +%s 2>/dev/null || date -j -u -f '%Y-%m-%dT%H:%M:%SZ' "$heartbeat" +%s 2>/dev/null)" || busy
   claim_state="$(cat "$competitor/state" 2>/dev/null)" || busy
+  observed_identity="$(cat "$competitor/claim_identity" 2>/dev/null)" || busy
+  [ "${{#observed_identity}}" -eq 32 ] || busy
+  case "$observed_identity" in *[!0-9a-f]*) busy;; esac
   now_epoch="$(date -u +%s)"
   [ "$((now_epoch - heartbeat_epoch))" -gt {STALE_AFTER_SECONDS} ] || busy
   case "$claim_state" in live|mutation_started|recovery_pending) ;; *) busy;; esac
   claim_operation_kind=
   mutation_phase=
+  mutation_attempt=
+  execution_started=false
+  execution_succeeded=false
+  execution_committed=false
   if [ "$claim_state" != live ]; then
     claim_operation_kind="$(cat "$competitor/operation_kind" 2>/dev/null)" || busy
     mutation_phase="$(cat "$competitor/mutation_phase" 2>/dev/null)" || busy
+    mutation_attempt="$(cat "$competitor/mutation_attempt" 2>/dev/null)" || busy
     case "$claim_operation_kind" in initial_setup|missing_daemon_repair) ;; *) busy;; esac
-    case "$mutation_phase" in cache_directory_creation|cache_upload|cache_staging_permissions|cache_promotion|daemon_start|state_owner_release) ;; *) busy;; esac
+    case "$mutation_phase" in cache_directory_creation|cache_upload|cache_staging_permissions|cache_promotion|daemon_start|state_owner_release|durable_token_verification|maintenance_handoff_begin|maintenance_handoff_complete) ;; *) busy;; esac
+    [ "${{#mutation_attempt}}" -eq 32 ] || busy
+    case "$mutation_attempt" in *[!0-9a-f]*) busy;; esac
+    [ -d "$competitor/execution_started.$mutation_attempt" ] && execution_started=true
+    [ -d "$competitor/execution_succeeded.$mutation_attempt" ] && execution_succeeded=true
+    [ -d "$competitor/execution_committed.$mutation_attempt" ] && execution_committed=true
   fi
   process_active=false
   if ps -eo pid=,comm=,args= 2>/dev/null | awk -v self="$$" -v parent="$PPID" '$1 != self && $1 != parent && ($2 == "satelle" || $2 == "satelle.exe") && $0 ~ /host start/ {{ found=1 }} END {{ exit !found }}'; then process_active=true; fi
@@ -400,9 +519,21 @@ for competitor in "$lock_root"/*; do
     status="$(curl -sS -o /dev/null -w '%{{http_code}}' --max-time 2 http://127.0.0.1:3001/v1/capabilities 2>/dev/null || true)"
     case "$status" in 200|401|403|429) daemon_active=true;; esac
   fi
-  if [ "$process_active" = true ] || [ "$service_active" = true ] || [ "$daemon_active" = true ]; then busy; fi
+  requires_commit=false
+  case "$mutation_phase" in daemon_start|durable_token_verification|maintenance_handoff_begin|maintenance_handoff_complete) requires_commit=true;; esac
+  if [ "$process_active" = true ] || [ "$service_active" = true ] || [ "$daemon_active" = true ]; then
+    if [ "$claim_state" = live ] || [ "$requires_commit" = false ] || [ "$execution_committed" = false ]; then busy; fi
+  fi
   record_recovery "$observed" "$process_active" "$binary_present" "$service_active" "$daemon_active"
-  [ "$claim_state" = live ] || busy
+  reconciled=false
+  if [ "$claim_state" = live ] || [ "$execution_started" = false ]; then
+    reconciled=true
+  elif [ "$requires_commit" = true ] && [ "$execution_committed" = true ]; then
+    reconciled=true
+  elif [ "$requires_commit" = false ] && [ "$execution_succeeded" = true ]; then
+    reconciled=true
+  fi
+  [ "$reconciled" = true ] || busy
   quarantine_root="$(mktemp -d "$state_root/bootstrap.quarantine.XXXXXX")" || busy
   chmod 700 "$quarantine_root"
   quarantined_claim="$quarantine_root/claim"
@@ -410,15 +541,26 @@ for competitor in "$lock_root"/*; do
   moved_operation="$(read_operation "$quarantined_claim")" || {{ restore_competitor; busy; }}
   moved_heartbeat="$(cat "$quarantined_claim/heartbeat_at" 2>/dev/null)" || {{ restore_competitor; busy; }}
   moved_state="$(cat "$quarantined_claim/state" 2>/dev/null)" || {{ restore_competitor; busy; }}
+  moved_identity="$(cat "$quarantined_claim/claim_identity" 2>/dev/null)" || {{ restore_competitor; busy; }}
   moved_operation_kind=
   moved_mutation_phase=
+  moved_mutation_attempt=
+  moved_execution_started=false
+  moved_execution_succeeded=false
+  moved_execution_committed=false
   if [ "$moved_state" != live ]; then
     moved_operation_kind="$(cat "$quarantined_claim/operation_kind" 2>/dev/null)" || {{ restore_competitor; busy; }}
     moved_mutation_phase="$(cat "$quarantined_claim/mutation_phase" 2>/dev/null)" || {{ restore_competitor; busy; }}
+    moved_mutation_attempt="$(cat "$quarantined_claim/mutation_attempt" 2>/dev/null)" || {{ restore_competitor; busy; }}
+    [ -d "$quarantined_claim/execution_started.$moved_mutation_attempt" ] && moved_execution_started=true
+    [ -d "$quarantined_claim/execution_succeeded.$moved_mutation_attempt" ] && moved_execution_succeeded=true
+    [ -d "$quarantined_claim/execution_committed.$moved_mutation_attempt" ] && moved_execution_committed=true
   fi
-  if [ "$moved_operation" != "$observed" ] || [ "$moved_heartbeat" != "$heartbeat" ] ||
+  if [ "$moved_operation" != "$observed" ] || [ "$moved_identity" != "$observed_identity" ] || [ "$moved_heartbeat" != "$heartbeat" ] ||
      [ "$moved_state" != "$claim_state" ] || [ "$moved_operation_kind" != "$claim_operation_kind" ] ||
-     [ "$moved_mutation_phase" != "$mutation_phase" ]; then
+     [ "$moved_mutation_phase" != "$mutation_phase" ] || [ "$moved_mutation_attempt" != "$mutation_attempt" ] ||
+     [ "$moved_execution_started" != "$execution_started" ] || [ "$moved_execution_succeeded" != "$execution_succeeded" ] ||
+     [ "$moved_execution_committed" != "$execution_committed" ]; then
     restore_competitor
     busy
   fi
@@ -429,7 +571,7 @@ for competitor in "$lock_root"/*; do
   [ "$competitor" = "$claim_path" ] || busy
 done
 same_owner || busy
-printf '%s\n' '{READY}'
+printf '%s %s %s\n' '{READY}' "$claim_identity" "${{claim_path##*/}}"
 while IFS= read -r line; do
   same_owner || exit 75
   if [ "$line" = '{HEARTBEAT}' ]; then
@@ -438,11 +580,33 @@ while IFS= read -r line; do
   fi
   case "$line" in
     '{MUTATION_STARTED} '*)
-      phase="${{line#'{MUTATION_STARTED} '}}"
+      payload="${{line#'{MUTATION_STARTED} '}}"
+      set -- $payload
+      [ "$#" -eq 2 ] || exit 64
+      phase="$1"
+      attempt="$2"
       case "$phase" in *[!A-Za-z0-9_-]*|'') exit 64;; esac
-      write_value "$claim_path" mutation_started state
+      [ "${{#attempt}}" -eq 32 ] || exit 64
+      case "$attempt" in *[!0-9a-f]*) exit 64;; esac
       write_value "$claim_path" "$phase" mutation_phase
+      write_value "$claim_path" "$attempt" mutation_attempt
+      write_value "$claim_path" mutation_started state
       mutation_started=true
+      mutation_phase="$phase"
+      mutation_attempt="$attempt"
+      ;;
+    '{MUTATION_COMMITTED} '*)
+      payload="${{line#'{MUTATION_COMMITTED} '}}"
+      set -- $payload
+      [ "$#" -eq 2 ] && [ "$1" = "$mutation_phase" ] && [ "$2" = "$mutation_attempt" ] || exit 75
+      [ -d "$claim_path/execution_started.$mutation_attempt" ] || exit 75
+      mkdir "$claim_path/execution_committed.$mutation_attempt" || exit 75
+      ;;
+    '{MUTATION_EXECUTING} '*)
+      payload="${{line#'{MUTATION_EXECUTING} '}}"
+      set -- $payload
+      [ "$#" -eq 2 ] && [ "$1" = "$mutation_phase" ] && [ "$2" = "$mutation_attempt" ] || exit 75
+      mkdir "$claim_path/execution_started.$mutation_attempt" || exit 75
       ;;
     '{RELEASE}')
       same_owner || exit 75
@@ -495,9 +659,39 @@ fn powershell_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "''"))
 }
 
-pub(super) fn mutation_started_line(phase: &str) -> Result<String, InvalidRequest> {
-    validated_token(phase.to_string(), "mutation phase")
-        .map(|phase| format!("{MUTATION_STARTED} {phase}"))
+pub(super) fn mutation_started_line(phase: &str, attempt: &str) -> Result<String, InvalidRequest> {
+    let phase = validated_token(phase.to_string(), "mutation phase")?;
+    let attempt = validated_identity(attempt, "mutation attempt")?;
+    Ok(format!("{MUTATION_STARTED} {phase} {attempt}"))
+}
+
+pub(super) fn mutation_committed_line(
+    phase: &str,
+    attempt: &str,
+) -> Result<String, InvalidRequest> {
+    let phase = validated_token(phase.to_string(), "mutation phase")?;
+    let attempt = validated_identity(attempt, "mutation attempt")?;
+    Ok(format!("{MUTATION_COMMITTED} {phase} {attempt}"))
+}
+
+pub(super) fn mutation_executing_line(
+    phase: &str,
+    attempt: &str,
+) -> Result<String, InvalidRequest> {
+    let phase = validated_token(phase.to_string(), "mutation phase")?;
+    let attempt = validated_identity(attempt, "mutation attempt")?;
+    Ok(format!("{MUTATION_EXECUTING} {phase} {attempt}"))
+}
+
+fn validated_identity<'a>(value: &'a str, field: &'static str) -> Result<&'a str, InvalidRequest> {
+    if value.len() != 32
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err(InvalidRequest { field });
+    }
+    Ok(value)
 }
 
 #[cfg(test)]
@@ -551,6 +745,11 @@ mod tests {
             .expect("write operation id");
         fs::write(path.join("heartbeat_at"), format!("{heartbeat}\n")).expect("write heartbeat");
         fs::write(path.join("state"), format!("{state}\n")).expect("write claim state");
+        fs::write(
+            path.join("claim_identity"),
+            "0123456789abcdef0123456789abcdef\n",
+        )
+        .expect("write claim identity");
     }
 
     #[test]
@@ -587,6 +786,10 @@ mod tests {
             "/v1/capabilities",
             "read_operation \"$competitor\"",
             "remove_own_claim",
+            "execution_started.",
+            "execution_succeeded.",
+            "execution_committed.",
+            "finalize_interrupted_claim",
             "recovery_pending",
             "clean_failed",
         ] {
@@ -617,6 +820,10 @@ mod tests {
             "/v1/capabilities",
             "catch { Fail-Busy }",
             "Remove-OwnClaim",
+            "execution_started.",
+            "execution_succeeded.",
+            "execution_committed.",
+            "Finalize-InterruptedClaim",
             "recovery_pending",
             "clean_failed",
         ] {
@@ -625,12 +832,43 @@ mod tests {
     }
 
     #[test]
+    fn interrupted_cleanup_renames_before_observing_execution_markers() {
+        let posix = request().posix_script();
+        let posix_rename = posix
+            .find("mv \"$claim_path\" \"$closing_path\"")
+            .expect("POSIX cleanup atomically renames the exact claim");
+        let posix_observe = posix
+            .find("$closing_path/execution_started.$mutation_attempt")
+            .expect("POSIX cleanup observes the moved marker");
+        assert!(posix_rename < posix_observe);
+
+        let windows = request().windows_script();
+        let windows_rename = windows
+            .find("[IO.Directory]::Move($claimPath, $closingPath)")
+            .expect("Windows cleanup atomically renames the exact claim");
+        let windows_observe = windows
+            .find("$closingPath ('execution_started.' + $mutationAttempt)")
+            .expect("Windows cleanup observes the moved marker");
+        assert!(windows_rename < windows_observe);
+    }
+
+    #[test]
     fn every_remote_mutation_protocol_line_has_one_closed_token() {
+        let attempt = "0123456789abcdef0123456789abcdef";
         assert_eq!(
-            mutation_started_line("cache_promotion").unwrap(),
-            "satelle-bootstrap-mutation-started-v1 cache_promotion"
+            mutation_started_line("cache_promotion", attempt).unwrap(),
+            format!("satelle-bootstrap-mutation-started-v1 cache_promotion {attempt}")
         );
-        assert!(mutation_started_line("invalid phase").is_err());
+        assert!(mutation_started_line("invalid phase", attempt).is_err());
+        assert!(mutation_started_line("cache_promotion", "invalid").is_err());
+        assert_eq!(
+            mutation_committed_line("daemon_start", attempt).unwrap(),
+            format!("satelle-bootstrap-mutation-committed-v1 daemon_start {attempt}")
+        );
+        assert_eq!(
+            mutation_executing_line("maintenance_handoff_begin", attempt).unwrap(),
+            format!("satelle-bootstrap-mutation-executing-v1 maintenance_handoff_begin {attempt}")
+        );
         assert_eq!(RELEASE, "satelle-bootstrap-release-v1");
     }
 
@@ -684,13 +922,34 @@ mod tests {
     }
 
     #[cfg(unix)]
+    fn assert_ready_line(line: &str) {
+        let mut fields = line.split(' ');
+        assert_eq!(fields.next(), Some(READY));
+        let identity = fields
+            .next()
+            .expect("ready response carries its claim generation");
+        let basename = fields
+            .next()
+            .expect("ready response carries its exact published claim");
+        assert!(fields.next().is_none());
+        assert_eq!(identity.len(), 32);
+        assert!(
+            identity
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        );
+        assert!(basename.starts_with("claim."));
+        assert!(!basename.ends_with(".closing"));
+    }
+
+    #[cfg(unix)]
     #[test]
     fn posix_protocol_serializes_owners_and_releases_cleanly() {
         let state_home = tempfile::tempdir().expect("temporary state home");
         let state_root = state_home.path().join("satelle");
         let lock_root = state_root.join("bootstrap.lock");
         let mut owner = RunningProtocol::start(&request(), state_home.path());
-        assert_eq!(owner.read_line(), READY);
+        assert_ready_line(&owner.read_line());
         assert_eq!(
             fs::metadata(&lock_root)
                 .expect("stable lock root metadata")
@@ -730,7 +989,7 @@ mod tests {
         let state_home = tempfile::tempdir().expect("temporary state home");
         let lock_root = state_home.path().join("satelle/bootstrap.lock");
         let mut owner = RunningProtocol::start(&request(), state_home.path());
-        assert_eq!(owner.read_line(), READY);
+        assert_ready_line(&owner.read_line());
         let foreign = lock_root.join("claim.operation-2.foreign");
         write_claim(&foreign, "operation-2", "2000-01-01T00:00:00Z", "live");
 
@@ -752,7 +1011,7 @@ mod tests {
         let lock_root = state_root.join("bootstrap.lock");
 
         let mut clean = RunningProtocol::start(&request(), state_home.path());
-        assert_eq!(clean.read_line(), READY);
+        assert_ready_line(&clean.read_line());
         assert!(clean.close().success());
         assert!(claim_directories(&lock_root).is_empty());
         let clean_record =
@@ -761,9 +1020,13 @@ mod tests {
         assert!(clean_record.contains("\"terminal_state\":\"clean_failed\""));
 
         let mut uncertain = RunningProtocol::start(&request(), state_home.path());
-        assert_eq!(uncertain.read_line(), READY);
-        uncertain
-            .exchange(&mutation_started_line("cache_promotion").expect("valid mutation phase"));
+        assert_ready_line(&uncertain.read_line());
+        let attempt = "0123456789abcdef0123456789abcdef";
+        uncertain.exchange(
+            &mutation_started_line("cache_promotion", attempt).expect("valid mutation phase"),
+        );
+        fs::create_dir(only_claim(&lock_root).join(format!("execution_started.{attempt}")))
+            .expect("record remote mutation start");
         assert!(uncertain.close().success());
         let uncertain_claim = only_claim(&lock_root);
         assert_eq!(
@@ -787,7 +1050,7 @@ mod tests {
             Request::new("operation-2", OperationKind::MissingDaemonRepair, None)
                 .expect("valid replacement");
         let mut replacement = RunningProtocol::start(&replacement_request, state_home.path());
-        assert_eq!(replacement.read_line(), READY);
+        assert_ready_line(&replacement.read_line());
         assert_eq!(
             fs::read_to_string(only_claim(&lock_root).join("operation_id"))
                 .expect("replacement operation")
@@ -799,6 +1062,7 @@ mod tests {
                 .join("bootstrap-recovery-operation-1.json")
                 .exists()
         );
+
         replacement.exchange(RELEASE);
         assert!(replacement.close().success());
     }
@@ -810,9 +1074,13 @@ mod tests {
         let state_root = state_home.path().join("satelle");
         let lock_root = state_root.join("bootstrap.lock");
         let mut uncertain = RunningProtocol::start(&request(), state_home.path());
-        assert_eq!(uncertain.read_line(), READY);
-        uncertain
-            .exchange(&mutation_started_line("cache_promotion").expect("valid mutation phase"));
+        assert_ready_line(&uncertain.read_line());
+        let attempt = "0123456789abcdef0123456789abcdef";
+        uncertain.exchange(
+            &mutation_started_line("cache_promotion", attempt).expect("valid mutation phase"),
+        );
+        fs::create_dir(only_claim(&lock_root).join(format!("execution_started.{attempt}")))
+            .expect("record remote mutation start");
         assert!(uncertain.close().success());
         fs::write(
             only_claim(&lock_root).join("heartbeat_at"),
@@ -838,6 +1106,82 @@ mod tests {
                 .join("bootstrap-recovery-operation-1.json")
                 .exists()
         );
+
+        let old_claim = only_claim(&lock_root);
+        fs::create_dir(old_claim.join(format!("execution_succeeded.{attempt}")))
+            .expect("record the exact phase postcondition");
+        let mut reconciler = RunningProtocol::start(
+            &Request::new("operation-3", OperationKind::MissingDaemonRepair, None)
+                .expect("valid reconciler"),
+            state_home.path(),
+        );
+        assert_ready_line(&reconciler.read_line());
+        assert_eq!(
+            fs::read_to_string(only_claim(&lock_root).join("operation_id"))
+                .expect("reconciled replacement operation")
+                .trim(),
+            "operation-3"
+        );
+        reconciler.exchange(RELEASE);
+        assert!(reconciler.close().success());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn posix_protocol_releases_a_definite_prestart_failure_cleanly() {
+        let state_home = tempfile::tempdir().expect("temporary state home");
+        let state_root = state_home.path().join("satelle");
+        let lock_root = state_root.join("bootstrap.lock");
+        let attempt = "0123456789abcdef0123456789abcdef";
+        let mut owner = RunningProtocol::start(&request(), state_home.path());
+        assert_ready_line(&owner.read_line());
+        owner.exchange(&mutation_started_line("cache_upload", attempt).unwrap());
+        assert!(owner.close().success());
+        assert!(claim_directories(&lock_root).is_empty());
+        let record = fs::read_to_string(state_root.join("bootstrap-operation-operation-1.json"))
+            .expect("clean failure record");
+        assert!(record.contains("\"terminal_state\":\"clean_failed\""));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn posix_protocol_reconciles_only_the_exact_successful_generation() {
+        let state_home = tempfile::tempdir().expect("temporary state home");
+        let state_root = state_home.path().join("satelle");
+        let lock_root = state_root.join("bootstrap.lock");
+        let attempt = "0123456789abcdef0123456789abcdef";
+        let mut owner = RunningProtocol::start(&request(), state_home.path());
+        assert_ready_line(&owner.read_line());
+        owner.exchange(&mutation_started_line("cache_promotion", attempt).unwrap());
+        let claim = only_claim(&lock_root);
+        fs::create_dir(claim.join(format!("execution_started.{attempt}"))).unwrap();
+        fs::create_dir(claim.join(format!("execution_succeeded.{attempt}"))).unwrap();
+        assert!(owner.close().success());
+        assert!(claim_directories(&lock_root).is_empty());
+        let record = fs::read_to_string(state_root.join("bootstrap-operation-operation-1.json"))
+            .expect("reconciled failure record");
+        assert!(record.contains("\"terminal_state\":\"reconciled_failed\""));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn posix_protocol_commits_the_exact_maintenance_handoff_attempt() {
+        let state_home = tempfile::tempdir().expect("temporary state home");
+        let lock_root = state_home.path().join("satelle/bootstrap.lock");
+        let attempt = "0123456789abcdef0123456789abcdef";
+        let phase = "maintenance_handoff_complete";
+        let mut owner = RunningProtocol::start(&request(), state_home.path());
+        assert_ready_line(&owner.read_line());
+        owner.exchange(&mutation_started_line(phase, attempt).unwrap());
+        owner.exchange(&mutation_executing_line(phase, attempt).unwrap());
+        owner.exchange(&mutation_committed_line(phase, attempt).unwrap());
+        assert!(
+            only_claim(&lock_root)
+                .join(format!("execution_committed.{attempt}"))
+                .is_dir()
+        );
+        owner.exchange(RELEASE);
+        assert!(owner.close().success());
     }
 
     #[test]

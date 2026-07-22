@@ -1431,7 +1431,7 @@
 - an orphaned Maintenance Lease operation is classified outcome_unknown and reconciled from its action postconditions before retry or release @spec @mvp @implemented
 - lease expiry alone never proves that an external Computer Use or maintenance side effect stopped @spec @mvp @implemented
 - timeout expiry, a cancellation request, transport loss, adapter failure, or lease expiry never by itself proves that an upstream Computer Use execution stopped and never by itself permits Control Lease release @spec @mvp @implemented
-- initial setup, missing-daemon repair, and Host binary replacement acquire a Bootstrap Lock before mutating remote files or starting a replacement Host Daemon @spec @mvp @implemented
+- initial setup, missing-daemon repair, and Host binary replacement acquire a Bootstrap Lock before mutating remote files or starting a replacement Host Daemon @spec @mvp
 - a Bootstrap Lock uses atomic filesystem creation under the remote OS user's Satelle state boundary @spec @mvp @implemented
 - a Bootstrap Lock records a non-secret operation id, Controller identity when known, acquisition time, and heartbeat time @spec @mvp @implemented
 - a Controller refreshes its owned Bootstrap Lock heartbeat at least every 5 seconds while the bootstrap operation remains live @spec @mvp @implemented
@@ -1443,7 +1443,7 @@
 - Host binary replacement on a reachable daemon first obtains a Maintenance Lease, then obtains Bootstrap Lock with the same operation id before stopping or replacing the daemon @spec @mvp
 - the replacement Host Daemon reconciles and adopts that maintenance operation before Bootstrap Lock release, and no workflow acquires these locks in the opposite order for the same operation class @spec @mvp
 - a Bootstrap Lock operation that fails before any remote mutation or managed process starts records a clean failure and releases the lock @spec @mvp @implemented
-- a Bootstrap Lock operation that may have mutated remote state or started a managed process preserves the lock and recovery metadata until postcondition reconciliation proves the outcome @spec @mvp
+- a Bootstrap Lock operation that may have mutated remote state or started a managed process preserves the lock and recovery metadata until postcondition reconciliation proves the outcome @spec @mvp @implemented
 
 ## stop-and-recovery
 - satelle stop transitions a starting, running, or recovery_pending Turn to stopped only after the adapter confirms cancellation or otherwise proves that the same upstream Turn is no longer active @mvp @implemented

@@ -816,8 +816,7 @@ fn router(state: Arc<DaemonState>) -> Router {
                 Arc::clone(&state),
                 auth::require_read,
             ));
-    let setup_routes = Router::new()
-        .route("/v1/setup/api-token", post(setup::issue_api_token))
+    let bootstrap_maintenance_routes = Router::new()
         .route(
             "/v1/maintenance/bootstrap/{operation_id}/complete",
             post(setup::complete_bootstrap_maintenance),
@@ -826,6 +825,12 @@ fn router(state: Arc<DaemonState>) -> Router {
             "/v1/maintenance/bootstrap/{operation_id}/{operation_kind}/begin",
             post(setup::begin_bootstrap_maintenance),
         )
+        .route_layer(middleware::from_fn_with_state(
+            Arc::clone(&state),
+            auth::require_empty_setup_mutation,
+        ));
+    let setup_routes = Router::new()
+        .route("/v1/setup/api-token", post(setup::issue_api_token))
         .route(
             "/v1/setup/api-token/{token_id}/activate",
             post(setup::activate_api_token),
@@ -854,6 +859,7 @@ fn router(state: Arc<DaemonState>) -> Router {
             auth::require_control,
         ));
     let protected = read_routes
+        .merge(bootstrap_maintenance_routes)
         .merge(control_routes)
         .method_not_allowed_fallback(protected_method_not_allowed)
         .fallback(protected_not_found)

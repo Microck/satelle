@@ -1531,6 +1531,75 @@ async fn setup_token_mutations_reject_bodies_before_changing_token_state() {
 }
 
 #[tokio::test]
+async fn read_scoped_ssh_bootstrap_can_handoff_maintenance_without_setup_authority() {
+    let state = TestStateDir::new().expect("temporary state directory");
+    let bootstrap_token = ApiBearerToken::generate().expect("generate bootstrap token");
+    let durable_read_token = ApiBearerToken::generate().expect("generate durable read token");
+    let service = HostService::local_demo_for_tests_at(state.path())
+        .expect("construct deterministic Host service")
+        .with_ssh_bootstrap_auth_for_tests(
+            &bootstrap_token,
+            ApiScopes::READ,
+            time::OffsetDateTime::now_utc() + time::Duration::minutes(15),
+        );
+    service
+        .register_api_token(&durable_read_token, "durable-read", ApiScopes::READ, None)
+        .expect("register durable read token");
+    let host_identity = service
+        .initialize_daemon()
+        .expect("initialize Host state")
+        .host_identity()
+        .to_string();
+    let server = DaemonServer::bind(
+        service,
+        DaemonServerConfig::loopback(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))),
+    )
+    .await
+    .expect("bind bootstrap server");
+    let address = server.local_addr();
+
+    tokio::task::spawn_blocking(move || {
+        let bootstrap_client = DaemonClient::loopback(address, bootstrap_token, &host_identity)
+            .expect("construct read-scoped bootstrap client");
+        let operation_id = "read-bootstrap-handoff";
+        bootstrap_client
+            .begin_bootstrap_maintenance(operation_id, "missing_daemon_repair")
+            .expect("read-scoped SSH bootstrap begins its maintenance handoff");
+        bootstrap_client
+            .complete_bootstrap_maintenance(operation_id)
+            .expect("read-scoped SSH bootstrap completes its maintenance handoff");
+        let setup_error = bootstrap_client
+            .issue_durable_setup_token("read-bootstrap-setup-attempt")
+            .expect_err("read-scoped SSH bootstrap cannot mint setup credentials");
+        assert!(matches!(
+            setup_error,
+            DaemonClientError::Api {
+                status: StatusCode::FORBIDDEN,
+                ..
+            }
+        ));
+
+        let durable_read_client =
+            DaemonClient::loopback(address, durable_read_token, &host_identity)
+                .expect("construct durable read client");
+        let handoff_error = durable_read_client
+            .begin_bootstrap_maintenance("durable-read-handoff", "missing_daemon_repair")
+            .expect_err("ordinary durable read credentials cannot begin maintenance");
+        assert!(matches!(
+            handoff_error,
+            DaemonClientError::Api {
+                status: StatusCode::FORBIDDEN,
+                ..
+            }
+        ));
+    })
+    .await
+    .expect("join bootstrap maintenance client operations");
+
+    server.shutdown().await.expect("stop bootstrap server");
+}
+
+#[tokio::test]
 async fn ssh_bootstrap_issues_and_activates_one_durable_restart_credential() {
     let state = TestStateDir::new().expect("temporary state directory");
     let bootstrap_token = ApiBearerToken::generate().expect("generate bootstrap token");

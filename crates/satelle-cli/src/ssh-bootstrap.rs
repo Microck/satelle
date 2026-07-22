@@ -4,7 +4,7 @@ use satelle_core::{DaemonPathOverrides, HostConfig};
 use satelle_host::{ApiBearerToken, readiness_probe_timeouts};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::ffi::{OsStr, OsString};
+use std::ffi::OsStr;
 use std::fmt::Write as _;
 use std::fs::{self, File};
 use std::io::{self, BufRead, BufReader, Read, Write};
@@ -31,6 +31,7 @@ const ARCHIVE_LIMIT: u64 = 256 * 1024 * 1024;
 const PROCESS_TIMEOUT: Duration = Duration::from_secs(30);
 const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(60);
 const BOOTSTRAP_LOCK_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
+const MUTATION_EXECUTE: &str = "satelle-bootstrap-execute-v1";
 const BOOTSTRAP_LOCK_EXIT_GRACE: Duration = Duration::from_millis(500);
 const BOOTSTRAP_LOCK_EXIT_POLL: Duration = Duration::from_millis(10);
 const RELEASE_BASE_URL: &str = "https://github.com/Microck/satelle/releases/download";
@@ -52,6 +53,10 @@ pub(super) struct SshBootstrapLock {
     heartbeat: Option<JoinHandle<()>>,
     operation_id: String,
     operation_kind: bootstrap_lock::OperationKind,
+    claim_identity: String,
+    claim_basename: String,
+    mutation_phase: Option<String>,
+    mutation_attempt: Option<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -155,12 +160,15 @@ impl SshBootstrapLock {
                 return Err(error);
             }
         };
-        if let Err(error) = ready {
-            let error = terminate_child(&mut child, error);
-            let _ = stdout_reader.join();
-            let classification = stderr_reader.join().unwrap_or_default();
-            return Err(classify_bootstrap_lock_ready_error(error, classification));
-        }
+        let ready_claim = match ready {
+            Ok(ready_claim) => ready_claim,
+            Err(error) => {
+                let error = terminate_child(&mut child, error);
+                let _ = stdout_reader.join();
+                let classification = stderr_reader.join().unwrap_or_default();
+                return Err(classify_bootstrap_lock_ready_error(error, classification));
+            }
+        };
         if child
             .try_wait()
             .map_err(SshBootstrapError::InspectSsh)?
@@ -216,6 +224,10 @@ impl SshBootstrapLock {
             heartbeat: Some(heartbeat),
             operation_id: request.operation_id().to_string(),
             operation_kind: request.operation_kind(),
+            claim_identity: ready_claim.identity,
+            claim_basename: ready_claim.basename,
+            mutation_phase: None,
+            mutation_attempt: None,
         })
     }
 
@@ -232,12 +244,56 @@ impl SshBootstrapLock {
     }
 
     pub(super) fn mark_mutation_started(&mut self, phase: &str) -> Result<(), SshBootstrapError> {
-        let line = bootstrap_lock::mutation_started_line(phase)
+        let attempt = Uuid::now_v7().simple().to_string();
+        self.mark_mutation_attempt_started(phase, &attempt)?;
+        let executing = bootstrap_lock::mutation_executing_line(phase, &attempt)
             .map_err(SshBootstrapError::InvalidBootstrapLockRequest)?;
-        self.exchange_lock_line(line)
+        self.exchange_lock_line(executing)
+    }
+
+    fn mark_mutation_attempt_started(
+        &mut self,
+        phase: &str,
+        attempt: &str,
+    ) -> Result<(), SshBootstrapError> {
+        let line = bootstrap_lock::mutation_started_line(phase, attempt)
+            .map_err(SshBootstrapError::InvalidBootstrapLockRequest)?;
+        self.exchange_lock_line(line)?;
+        self.mutation_phase = Some(phase.to_string());
+        self.mutation_attempt = Some(attempt.to_string());
+        Ok(())
+    }
+
+    fn fenced_command(
+        &mut self,
+        target: RemoteTarget,
+        phase: &str,
+        command: &str,
+    ) -> Result<String, SshBootstrapError> {
+        let attempt = Uuid::now_v7().simple().to_string();
+        self.mark_mutation_attempt_started(phase, &attempt)?;
+        Ok(target.fenced_mutation_command(
+            &self.operation_id,
+            &self.claim_identity,
+            &self.claim_basename,
+            phase,
+            &attempt,
+            command,
+        ))
     }
 
     pub(super) fn release_after_handoff(&mut self) -> Result<(), SshBootstrapError> {
+        let phase = self
+            .mutation_phase
+            .as_deref()
+            .ok_or(SshBootstrapError::BootstrapLockLost)?;
+        let attempt = self
+            .mutation_attempt
+            .as_deref()
+            .ok_or(SshBootstrapError::BootstrapLockLost)?;
+        let committed = bootstrap_lock::mutation_committed_line(phase, attempt)
+            .map_err(SshBootstrapError::InvalidBootstrapLockRequest)?;
+        self.exchange_lock_line(committed)?;
         self.exchange_lock_line(bootstrap_lock::RELEASE.to_string())
     }
 
@@ -250,14 +306,16 @@ impl SshBootstrapLock {
         {
             return Err(SshBootstrapError::BootstrapLockLost);
         }
-        let mut stdin = self
-            .stdin
-            .lock()
-            .map_err(|_| SshBootstrapError::BootstrapLockLost)?;
-        let stdin = stdin.as_mut().ok_or(SshBootstrapError::BootstrapLockLost)?;
-        writeln!(stdin, "{challenge}")
-            .and_then(|()| stdin.flush())
-            .map_err(SshBootstrapError::BootstrapLockProtocol)?;
+        {
+            let mut stdin = self
+                .stdin
+                .lock()
+                .map_err(|_| SshBootstrapError::BootstrapLockLost)?;
+            let stdin = stdin.as_mut().ok_or(SshBootstrapError::BootstrapLockLost)?;
+            writeln!(stdin, "{challenge}")
+                .and_then(|()| stdin.flush())
+                .map_err(SshBootstrapError::BootstrapLockProtocol)?;
+        }
         match self.response_receiver.recv_timeout(PROCESS_TIMEOUT) {
             Ok(response) if response == challenge => Ok(()),
             Ok(_) => Err(SshBootstrapError::InvalidBootstrapLockResponse),
@@ -384,10 +442,12 @@ impl SshBootstrapProcess {
             },
         );
         if let Some(release_command) = release_command {
-            bootstrap_lock.mark_mutation_started("state_owner_release")?;
-            require_success(run_ssh_command(destination, &release_command)?)?;
+            let command =
+                bootstrap_lock.fenced_command(target, "state_owner_release", &release_command)?;
+            require_success(run_fenced_ssh_command(destination, &command, None)?)?;
         }
-        bootstrap_lock.mark_mutation_started("daemon_start")?;
+        let start_command =
+            bootstrap_lock.fenced_command(target, "daemon_start", &start_command)?;
         Self::spawn(
             destination,
             start_command,
@@ -424,8 +484,8 @@ impl SshBootstrapProcess {
             &environment,
             maintenance,
         );
-        bootstrap_lock.mark_mutation_started("daemon_start")?;
-        require_success(run_ssh_command(destination, &command)?)
+        let command = bootstrap_lock.fenced_command(target, "daemon_start", &command)?;
+        require_success(run_fenced_ssh_command(destination, &command, None)?)
     }
 
     fn spawn(
@@ -439,29 +499,10 @@ impl SshBootstrapProcess {
             .arg("-T")
             .arg(destination)
             .arg(start_command)
-            .stdin(if token.is_some() {
-                Stdio::piped()
-            } else {
-                Stdio::null()
-            })
+            .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
         let mut child = command.spawn().map_err(SshBootstrapError::SpawnSsh)?;
-        if let Some(token) = token {
-            let mut stdin = child
-                .stdin
-                .take()
-                .expect("bootstrap SSH stdin was configured as piped");
-            let raw_token = token.expose();
-            stdin
-                .write_all(raw_token.as_bytes())
-                .and_then(|()| stdin.write_all(b"\n"))
-                .map_err(|error| {
-                    terminate_child(&mut child, SshBootstrapError::WriteToken(error))
-                })?;
-            drop(stdin);
-        }
-
         let stdout = child
             .stdout
             .take()
@@ -470,12 +511,39 @@ impl SshBootstrapProcess {
             .stderr
             .take()
             .expect("bootstrap SSH stderr was configured as piped");
-        let stderr_reader = spawn_stderr_reader(stderr)?;
+        let stderr_reader =
+            spawn_stderr_reader(stderr).map_err(|error| terminate_child(&mut child, error))?;
         let (ready_sender, ready_receiver) = mpsc::sync_channel(1);
-        let stdout_reader = thread::Builder::new()
+        let stdout_reader = match thread::Builder::new()
             .name("satelle-ssh-bootstrap-stdout".to_string())
             .spawn(move || drain_bootstrap_stdout(stdout, ready_sender))
-            .map_err(|error| terminate_child(&mut child, SshBootstrapError::ReaderThread(error)))?;
+        {
+            Ok(reader) => reader,
+            Err(error) => {
+                let error = terminate_child(&mut child, SshBootstrapError::ReaderThread(error));
+                let _ = stderr_reader.join();
+                return Err(error);
+            }
+        };
+        let mut stdin = child
+            .stdin
+            .take()
+            .expect("bootstrap SSH stdin was configured as piped");
+        let write_result = writeln!(stdin, "{MUTATION_EXECUTE}").and_then(|()| {
+            if let Some(token) = token {
+                let raw_token = token.expose();
+                writeln!(stdin, "{}", raw_token.as_str())
+            } else {
+                Ok(())
+            }
+        });
+        if let Err(error) = write_result {
+            let error = terminate_child(&mut child, SshBootstrapError::WriteToken(error));
+            let _ = stdout_reader.join();
+            let _ = stderr_reader.join();
+            return Err(error);
+        }
+        drop(stdin);
 
         let ready = ready_receiver
             .recv_timeout(PROCESS_TIMEOUT)
@@ -678,21 +746,144 @@ impl RemoteTarget {
         }
     }
 
+    fn fenced_mutation_command(
+        self,
+        operation_id: &str,
+        claim_identity: &str,
+        claim_basename: &str,
+        phase: &str,
+        attempt: &str,
+        command: &str,
+    ) -> String {
+        if self.is_windows() {
+            let operation_id = powershell_quote(operation_id);
+            let claim_identity = powershell_quote(claim_identity);
+            let claim_basename = powershell_quote(claim_basename);
+            let phase = powershell_quote(phase);
+            let attempt = powershell_quote(attempt);
+            let command = powershell_quote(command);
+            return powershell_encoded_command(&format!(
+                r#"$ErrorActionPreference = 'Stop'
+$operationId = {operation_id}
+$claimIdentity = {claim_identity}
+$claimBasename = {claim_basename}
+$phase = {phase}
+$attempt = {attempt}
+$innerCommand = {command}
+$expectedGate = '{MUTATION_EXECUTE}'
+$gateBytes = [Text.Encoding]::UTF8.GetBytes($expectedGate + "`n")
+$inputStream = [Console]::OpenStandardInput()
+$observedGate = New-Object byte[] $gateBytes.Length
+$offset = 0
+while ($offset -lt $observedGate.Length) {{
+  $count = $inputStream.Read($observedGate, $offset, $observedGate.Length - $offset)
+  if ($count -eq 0) {{ exit 75 }}
+  $offset += $count
+}}
+if ([Convert]::ToBase64String($gateBytes) -cne [Convert]::ToBase64String($observedGate)) {{ exit 75 }}
+$stateRoot = if ($env:SATELLE_STATE_DIR) {{ $env:SATELLE_STATE_DIR }} else {{ Join-Path $env:LOCALAPPDATA 'Satelle\state' }}
+$lockRoot = Join-Path $stateRoot 'bootstrap.lock'
+$claimPath = Join-Path $lockRoot $claimBasename
+$claimItem = Get-Item -LiteralPath $claimPath -Force -ErrorAction Stop
+if (-not $claimItem.PSIsContainer -or
+    (($claimItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0)) {{ exit 75 }}
+if ((((Get-Content -LiteralPath (Join-Path $claimPath 'operation_id') -Raw).Trim()) -cne $operationId) -or
+    (((Get-Content -LiteralPath (Join-Path $claimPath 'claim_identity') -Raw).Trim()) -cne $claimIdentity)) {{ exit 75 }}
+$state = (Get-Content -LiteralPath (Join-Path $claimPath 'state') -Raw).Trim()
+$observedPhase = (Get-Content -LiteralPath (Join-Path $claimPath 'mutation_phase') -Raw).Trim()
+$observedAttempt = (Get-Content -LiteralPath (Join-Path $claimPath 'mutation_attempt') -Raw).Trim()
+if (($state -cne 'mutation_started') -or ($observedPhase -cne $phase) -or ($observedAttempt -cne $attempt)) {{ exit 75 }}
+[IO.File]::Open((Join-Path $claimPath ('execution_started.' + $attempt)), [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None).Dispose()
+Invoke-Expression $innerCommand
+if ($LASTEXITCODE -ne 0) {{ exit $LASTEXITCODE }}
+if ($phase -cne 'daemon_start') {{
+  [IO.File]::Open((Join-Path $claimPath ('execution_succeeded.' + $attempt)), [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None).Dispose()
+}}"#,
+            ));
+        }
+
+        let operation_id = posix_quote(operation_id);
+        let claim_identity = posix_quote(claim_identity);
+        let claim_basename = posix_quote(claim_basename);
+        let phase = posix_quote(phase);
+        let attempt = posix_quote(attempt);
+        let command = posix_quote(command);
+        let script = format!(
+            r#"set -eu
+operation_id={operation_id}
+claim_identity={claim_identity}
+claim_basename={claim_basename}
+phase={phase}
+attempt={attempt}
+inner_command={command}
+gate="$(dd bs=1 count={execute_gate_length} 2>/dev/null)" || exit 75
+[ "$gate" = '{MUTATION_EXECUTE}' ] || exit 75
+state_root="${{SATELLE_STATE_DIR:-${{XDG_STATE_HOME:-$HOME/.local/state}}/satelle}}"
+lock_root="$state_root/bootstrap.lock"
+claim_path="$lock_root/$claim_basename"
+[ -d "$claim_path" ] && [ ! -L "$claim_path" ] || exit 75
+[ "$(cat "$claim_path/operation_id" 2>/dev/null)" = "$operation_id" ] || exit 75
+[ "$(cat "$claim_path/claim_identity" 2>/dev/null)" = "$claim_identity" ] || exit 75
+[ "$(cat "$claim_path/state" 2>/dev/null)" = mutation_started ] || exit 75
+[ "$(cat "$claim_path/mutation_phase" 2>/dev/null)" = "$phase" ] || exit 75
+[ "$(cat "$claim_path/mutation_attempt" 2>/dev/null)" = "$attempt" ] || exit 75
+mkdir "$claim_path/execution_started.$attempt" || exit 75
+set +e
+eval "$inner_command"
+status=$?
+set -e
+[ "$status" -eq 0 ] || exit "$status"
+if [ "$phase" != daemon_start ]; then mkdir "$claim_path/execution_succeeded.$attempt" || exit 75; fi"#,
+            execute_gate_length = MUTATION_EXECUTE.len() + 1,
+        );
+        format!("sh -c {}", posix_quote(&script))
+    }
+
+    fn upload_command(self, staged: &str, digest: &str) -> String {
+        if self.is_windows() {
+            let staged = powershell_quote(staged);
+            return powershell_encoded_command(&format!(
+                r#"$ErrorActionPreference = 'Stop'
+$inputStream = [Console]::OpenStandardInput()
+$outputStream = [IO.File]::Open({staged}, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)
+try {{ $inputStream.CopyTo($outputStream) }} finally {{ $outputStream.Dispose() }}
+if ((Get-FileHash -Algorithm SHA256 -LiteralPath {staged}).Hash.ToLowerInvariant() -cne {digest}) {{ exit 1 }}"#,
+                staged = staged,
+                digest = powershell_quote(digest),
+            ));
+        }
+        let script = format!(
+            "set -eu; umask 077; path={}; expected={}; cat >\"$path\"; if command -v sha256sum >/dev/null 2>&1; then actual=$(sha256sum \"$path\" | awk '{{print $1}}'); elif command -v shasum >/dev/null 2>&1; then actual=$(shasum -a 256 \"$path\" | awk '{{print $1}}'); else actual=$(openssl dgst -sha256 \"$path\" | awk '{{print $NF}}'); fi; [ \"$actual\" = \"$expected\" ]",
+            posix_quote(staged),
+            posix_quote(digest),
+        );
+        format!("sh -c {}", posix_quote(&script))
+    }
+
     fn create_directory_command(self, directory: &str) -> String {
         if self.is_windows() {
             let script = format!(
                 concat!(
-                    "$ErrorActionPreference='Stop'; $root={}; $path={}; $current=''; ",
-                    "foreach ($part in $path.Split('/')) {{ ",
-                    "$current=if ($current) {{ Join-Path $current $part }} else {{ $part }}; ",
-                    "if (-not (Test-Path -LiteralPath $current)) {{ New-Item -ItemType Directory -Path $current | Out-Null }}; ",
-                    "if ($current -eq $root -or $current.StartsWith($root + [IO.Path]::DirectorySeparatorChar)) {{ ",
-                    "$acl=Get-Acl -LiteralPath $current; $acl.SetAccessRuleProtection($true,$false); ",
+                    "$ErrorActionPreference='Stop'; ",
+                    "$separator=[IO.Path]::DirectorySeparatorChar; ",
+                    "$root=[IO.Path]::GetFullPath(({}).Replace('/', $separator)); ",
+                    "$path=[IO.Path]::GetFullPath(({}).Replace('/', $separator)); ",
+                    "$rootPrefix=$root.TrimEnd($separator)+$separator; ",
+                    "if (-not [StringComparer]::OrdinalIgnoreCase.Equals($path,$root) -and ",
+                    "-not $path.StartsWith($rootPrefix,[StringComparison]::OrdinalIgnoreCase)) {{ exit 1 }}; ",
+                    "New-Item -ItemType Directory -Force -Path $path | Out-Null; ",
+                    "$current=Get-Item -LiteralPath $path; while ($true) {{ ",
+                    "$currentPath=[IO.Path]::GetFullPath($current.FullName); ",
+                    "if (-not [StringComparer]::OrdinalIgnoreCase.Equals($currentPath,$root) -and ",
+                    "-not $currentPath.StartsWith($rootPrefix,[StringComparison]::OrdinalIgnoreCase)) {{ exit 1 }}; ",
+                    "$acl=Get-Acl -LiteralPath $currentPath; $acl.SetAccessRuleProtection($true,$false); ",
                     "foreach ($rule in @($acl.Access)) {{ [void]$acl.RemoveAccessRuleAll($rule) }}; ",
                     "$rule=New-Object System.Security.AccessControl.FileSystemAccessRule(",
                     "[System.Security.Principal.WindowsIdentity]::GetCurrent().Name,'FullControl',",
                     "'ContainerInherit,ObjectInherit','None','Allow'); ",
-                    "$acl.SetAccessRule($rule); Set-Acl -LiteralPath $current -AclObject $acl }} }}",
+                    "$acl.SetAccessRule($rule); Set-Acl -LiteralPath $currentPath -AclObject $acl; ",
+                    "if ([StringComparer]::OrdinalIgnoreCase.Equals($currentPath,$root)) {{ break }}; ",
+                    "$current=$current.Parent; if ($null -eq $current) {{ exit 1 }} }}",
                 ),
                 powershell_quote(self.remote_cache_root()),
                 powershell_quote(directory),
@@ -700,7 +891,7 @@ impl RemoteTarget {
             powershell_encoded_command(&script)
         } else {
             let script = format!(
-                "umask 077; mkdir -p {directory}; current={}; while :; do chmod 700 \"$current\"; [ \"$current\" = {} ] && break; current=\"${{current%/*}}\"; done",
+                "set -eu; umask 077; mkdir -p {directory}; current={}; while :; do chmod 700 \"$current\"; [ \"$current\" = {} ] && break; current=\"${{current%/*}}\"; done",
                 posix_quote(directory),
                 posix_quote(self.remote_cache_root()),
             );
@@ -726,7 +917,7 @@ impl RemoteTarget {
             );
             powershell_encoded_command(&script)
         } else {
-            format!("sh -c 'mv -f {staged} {final_path}; chmod 700 {final_path}'")
+            format!("sh -c 'mv -f {staged} {final_path} && chmod 700 {final_path}'")
         }
     }
 
@@ -1649,8 +1840,12 @@ fn upload_artifact(
         local_digest,
         bootstrap_lock,
     )?;
-    bootstrap_lock.mark_mutation_started("cache_promotion")?;
-    let promote = run_ssh_command(destination, &target.promote_command(&staged, &final_path))?;
+    let command = bootstrap_lock.fenced_command(
+        target,
+        "cache_promotion",
+        &target.promote_command(&staged, &final_path),
+    )?;
+    let promote = run_fenced_ssh_command(destination, &command, None)?;
     require_success(promote)?;
     if remote_artifact_matches(destination, target, &final_path, &local_digest)? {
         Ok(final_path)
@@ -1731,20 +1926,25 @@ fn stage_artifact_with_digest(
         "{directory}/.satelle-upload-{}{staged_suffix}",
         Uuid::now_v7().hyphenated()
     );
-    bootstrap_lock.mark_mutation_started("cache_directory_creation")?;
-    let create = run_ssh_command(destination, &target.create_directory_command(&directory))?;
+    let local_digest_hex = local_digest
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    let command = bootstrap_lock.fenced_command(
+        target,
+        "cache_directory_creation",
+        &target.create_directory_command(&directory),
+    )?;
+    let create = run_fenced_ssh_command(destination, &command, None)?;
     require_success(create)?;
 
-    bootstrap_lock.mark_mutation_started("cache_upload")?;
-    let remote_spec = OsString::from(format!("{destination}:{staged}"));
-    let copy = run_program(
-        "scp",
-        [
-            OsStr::new("-q"),
-            local_binary.as_os_str(),
-            remote_spec.as_os_str(),
-        ],
+    let input = File::open(local_binary).map_err(SshBootstrapError::LocalFile)?;
+    let command = bootstrap_lock.fenced_command(
+        target,
+        "cache_upload",
+        &target.upload_command(&staged, &local_digest_hex),
     )?;
+    let copy = run_fenced_ssh_command(destination, &command, Some(input))?;
     require_success(copy)?;
 
     let remote_digest = run_ssh_command(destination, &target.digest_command(&staged))?;
@@ -1759,8 +1959,9 @@ fn stage_artifact_with_digest(
         return Err(SshBootstrapError::UploadedIntegrityMismatch);
     }
     if let Some(command) = target.prepare_staged_command(&staged) {
-        bootstrap_lock.mark_mutation_started("cache_staging_permissions")?;
-        require_success(run_ssh_command(destination, &command)?)?;
+        let command =
+            bootstrap_lock.fenced_command(target, "cache_staging_permissions", &command)?;
+        require_success(run_fenced_ssh_command(destination, &command, None)?)?;
     }
     Ok(staged)
 }
@@ -1823,11 +2024,70 @@ fn run_ssh_command_with_output_limit(
     )
 }
 
-fn run_program<const N: usize>(
-    program: &str,
-    arguments: [&OsStr; N],
+fn run_fenced_ssh_command(
+    destination: &str,
+    remote_command: &str,
+    mut input: Option<File>,
 ) -> Result<CommandOutput, SshBootstrapError> {
-    run_program_with_output_limit(program, arguments, PROBE_OUTPUT_LIMIT)
+    let mut child = Command::new("ssh")
+        .arg("-T")
+        .arg(destination)
+        .arg(remote_command)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(SshBootstrapError::SpawnSsh)?;
+    let stdout = child
+        .stdout
+        .take()
+        .expect("SSH upload stdout was configured as piped");
+    let stdout_reader = thread::Builder::new()
+        .name("satelle-ssh-upload-stdout".to_string())
+        .spawn(move || read_bounded(stdout, PROBE_OUTPUT_LIMIT))
+        .map_err(|error| terminate_child(&mut child, SshBootstrapError::ReaderThread(error)))?;
+    let stderr = child
+        .stderr
+        .take()
+        .expect("SSH upload stderr was configured as piped");
+    let stderr_reader = match spawn_stderr_reader(stderr) {
+        Ok(reader) => reader,
+        Err(error) => {
+            let error = terminate_child(&mut child, error);
+            let _ = stdout_reader.join();
+            return Err(error);
+        }
+    };
+    let mut stdin = child
+        .stdin
+        .take()
+        .expect("fenced SSH stdin was configured as piped");
+    let input_result = writeln!(stdin, "{MUTATION_EXECUTE}").and_then(|()| {
+        if let Some(input) = input.as_mut() {
+            io::copy(input, &mut stdin).map(drop)
+        } else {
+            Ok(())
+        }
+    });
+    if let Err(error) = input_result {
+        let error = terminate_child(&mut child, SshBootstrapError::WriteMutationInput(error));
+        let _ = stdout_reader.join();
+        let _ = stderr_reader.join();
+        return Err(error);
+    }
+    drop(stdin);
+    let status = child.wait().map_err(SshBootstrapError::WaitSsh)?;
+    let stdout = stdout_reader
+        .join()
+        .map_err(|_| SshBootstrapError::ReaderPanicked)??;
+    let stderr = stderr_reader
+        .join()
+        .map_err(|_| SshBootstrapError::ReaderPanicked)?;
+    Ok(CommandOutput {
+        status,
+        stdout,
+        stderr,
+    })
 }
 
 fn run_program_with_output_limit<const N: usize>(
@@ -1916,7 +2176,7 @@ fn drain_bootstrap_stdout(
 
 fn drain_bootstrap_lock_stdout(
     stdout: ChildStdout,
-    ready_sender: mpsc::SyncSender<Result<(), SshBootstrapError>>,
+    ready_sender: mpsc::SyncSender<Result<BootstrapLockReady, SshBootstrapError>>,
     response_sender: mpsc::Sender<String>,
 ) {
     let mut reader = BufReader::new(stdout);
@@ -1936,15 +2196,46 @@ fn drain_bootstrap_lock_stdout(
     }
 }
 
-fn read_bootstrap_lock_ready(reader: &mut impl BufRead) -> Result<(), SshBootstrapError> {
+struct BootstrapLockReady {
+    identity: String,
+    basename: String,
+}
+
+fn read_bootstrap_lock_ready(
+    reader: &mut impl BufRead,
+) -> Result<BootstrapLockReady, SshBootstrapError> {
     let mut ready = String::new();
     reader
-        .take(128)
+        .take(256)
         .read_line(&mut ready)
         .map_err(SshBootstrapError::ReadProcess)?;
-    if ready.trim_end() == bootstrap_lock::READY {
-        Ok(())
-    } else if ready.trim_end() == bootstrap_lock::BUSY {
+    let ready = ready.trim_end();
+    if let Some(fields) = ready
+        .strip_prefix(bootstrap_lock::READY)
+        .and_then(|ready| ready.strip_prefix(' '))
+    {
+        let mut fields = fields.split(' ');
+        let identity = fields.next().unwrap_or_default();
+        let basename = fields.next().unwrap_or_default();
+        if fields.next().is_none()
+            && identity.len() == 32
+            && identity
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+            && basename.starts_with("claim.")
+            && !basename.ends_with(".closing")
+            && basename.len() <= 192
+            && basename.bytes().all(|byte| {
+                byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'@')
+            })
+        {
+            return Ok(BootstrapLockReady {
+                identity: identity.to_string(),
+                basename: basename.to_string(),
+            });
+        }
+        Err(SshBootstrapError::InvalidBootstrapLockResponse)
+    } else if ready == bootstrap_lock::BUSY {
         Err(SshBootstrapError::BootstrapBusy)
     } else {
         Err(SshBootstrapError::InvalidBootstrapLockResponse)
@@ -2015,6 +2306,8 @@ pub(super) enum SshBootstrapError {
     ProcessOutputTooLarge,
     #[error("could not write the bootstrap token to daemon stdin")]
     WriteToken(#[source] io::Error),
+    #[error("could not stream a fenced remote mutation to system OpenSSH")]
+    WriteMutationInput(#[source] io::Error),
     #[error("the remote platform probe failed")]
     PlatformProbeFailed,
     #[error("the remote platform probe returned an invalid response")]
@@ -2648,6 +2941,128 @@ mod tests {
         assert!(script.contains("New-Item -ItemType Directory -Force -Path $lockRoot"));
         assert!(script.contains("[IO.Directory]::Move($pendingPath, $claimPath)"));
         assert!(!script.contains("host bootstrap-lock"));
+    }
+
+    #[test]
+    fn remote_mutations_verify_the_exact_claim_generation_before_execution() {
+        let identity = "0123456789abcdef0123456789abcdef";
+        let attempt = "fedcba9876543210fedcba9876543210";
+        let basename = "claim.repair-operation.0123456789abcdef";
+        let posix = RemoteTarget::LinuxX64Gnu.fenced_mutation_command(
+            "repair-operation",
+            identity,
+            basename,
+            "cache_upload",
+            attempt,
+            "sh -c 'cat >/tmp/staged'",
+        );
+        assert!(posix.contains("repair-operation"));
+        assert!(posix.contains(identity));
+        assert!(posix.contains(basename));
+        assert!(posix.contains("cache_upload"));
+        assert!(posix.contains("mutation_started"));
+        assert!(posix.contains("mutation_phase"));
+        assert!(posix.contains("mutation_attempt"));
+        assert!(posix.contains(attempt));
+        assert!(posix.contains(MUTATION_EXECUTE));
+        assert!(posix.contains("execution_started.$attempt"));
+        assert!(posix.contains("execution_succeeded.$attempt"));
+        assert!(posix.contains("claim_path=\"$lock_root/$claim_basename\""));
+        assert!(!posix.contains("for candidate in"));
+
+        let windows = RemoteTarget::WindowsX64Msvc.fenced_mutation_command(
+            "repair-operation",
+            identity,
+            basename,
+            "cache_upload",
+            attempt,
+            "cmd.exe /d /c exit 0",
+        );
+        let script = decode_powershell_command(&windows).expect("decode fenced mutation command");
+        assert!(script.contains("repair-operation"));
+        assert!(script.contains(identity));
+        assert!(script.contains(basename));
+        assert!(script.contains("cache_upload"));
+        assert!(script.contains("mutation_started"));
+        assert!(script.contains("mutation_phase"));
+        assert!(script.contains("mutation_attempt"));
+        assert!(script.contains(attempt));
+        assert!(script.contains(MUTATION_EXECUTE));
+        assert!(script.contains("execution_started."));
+        assert!(script.contains("execution_succeeded."));
+        assert!(script.contains("[IO.FileMode]::CreateNew"));
+        assert!(script.contains("[IO.FileShare]::None).Dispose()"));
+        assert!(
+            !script
+                .contains("New-Item -ItemType Directory -Path (Join-Path $claimPath ('execution_")
+        );
+        assert!(script.contains("$claimPath = Join-Path $lockRoot $claimBasename"));
+        assert!(script.contains("[IO.FileAttributes]::ReparsePoint"));
+        assert!(!script.contains("$claims = @("));
+        assert!(script.contains("Invoke-Expression $innerCommand"));
+    }
+
+    #[test]
+    fn bootstrap_ready_returns_only_the_exact_published_claim_basename() {
+        let identity = "0123456789abcdef0123456789abcdef";
+        let basename = "claim.repair-operation.0123456789abcdef";
+        let mut valid =
+            std::io::Cursor::new(format!("{} {identity} {basename}\n", bootstrap_lock::READY));
+        let ready = read_bootstrap_lock_ready(&mut valid).expect("valid exact claim");
+        assert_eq!(ready.identity, identity);
+        assert_eq!(ready.basename, basename);
+
+        for invalid in [
+            format!("{} {identity} {basename}.closing\n", bootstrap_lock::READY),
+            format!("{} {identity} ../{basename}\n", bootstrap_lock::READY),
+            format!("{} {identity}\n", bootstrap_lock::READY),
+        ] {
+            assert!(read_bootstrap_lock_ready(&mut std::io::Cursor::new(invalid)).is_err());
+        }
+    }
+
+    #[test]
+    fn windows_cache_hardening_uses_canonical_case_insensitive_containment() {
+        let command = RemoteTarget::WindowsX64Msvc
+            .create_directory_command("AppData/Local/Satelle/host/v1/windows-x64");
+        let script = decode_powershell_command(&command).expect("decode cache hardening command");
+        assert!(script.contains("[IO.Path]::GetFullPath"));
+        assert!(script.contains(".Replace('/', $separator)"));
+        assert!(script.contains("[StringComparer]::OrdinalIgnoreCase.Equals"));
+        assert!(script.contains("StartsWith($rootPrefix,[StringComparison]::OrdinalIgnoreCase)"));
+        assert!(script.contains("Set-Acl -LiteralPath $currentPath"));
+    }
+
+    #[test]
+    fn atomic_attempt_marker_creation_cannot_recreate_a_missing_claim_parent() {
+        let state = tempfile::tempdir().expect("temporary state");
+        let missing_claim = state
+            .path()
+            .join("bootstrap.lock/claim.operation.generation");
+        let marker = missing_claim.join("execution_started.attempt");
+        let error = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&marker)
+            .expect_err("atomic leaf creation requires the exact claim parent");
+        assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
+        assert!(!missing_claim.exists());
+    }
+
+    #[test]
+    fn artifact_upload_receivers_stream_ssh_stdin_without_scp() {
+        let digest = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        let posix = RemoteTarget::LinuxX64Gnu.upload_command("/tmp/staged", digest);
+        assert!(posix.contains("cat >"));
+        assert!(posix.contains(digest));
+        assert!(!posix.contains("scp"));
+
+        let windows = RemoteTarget::WindowsX64Msvc.upload_command("C:/Satelle/staged.exe", digest);
+        let script = decode_powershell_command(&windows).expect("decode upload receiver");
+        assert!(script.contains("[Console]::OpenStandardInput()"));
+        assert!(script.contains("[IO.FileMode]::CreateNew"));
+        assert!(script.contains("Get-FileHash"));
+        assert!(!script.contains("scp"));
     }
 
     #[test]

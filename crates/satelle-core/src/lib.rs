@@ -3459,6 +3459,39 @@ mod error_contract_tests {
     use super::*;
 
     #[test]
+    fn bootstrap_busy_has_a_stable_typed_contract() {
+        assert_eq!(ErrorCode::BootstrapBusy.as_str(), "bootstrap-busy");
+        assert_eq!(ErrorCode::BootstrapBusy.exit_code(), 75);
+
+        let error = SatelleError::bootstrap_busy("remote", Some("bootstrap-operation"));
+        assert_eq!(error.code, ErrorCode::BootstrapBusy);
+        assert_eq!(error.exit_code(), 75);
+        assert_eq!(
+            error.message,
+            "host 'remote' already has an active bootstrap operation"
+        );
+        assert_eq!(
+            error.recovery_command.as_deref(),
+            Some(
+                "wait for recovery or reconcile the active operation, then retry for host 'remote'"
+            )
+        );
+        assert_eq!(error.source_detail, None);
+        assert_eq!(
+            error.details.get("host"),
+            Some(&Value::String("remote".to_string()))
+        );
+        assert_eq!(
+            error.details.get("operation_id"),
+            Some(&Value::String("bootstrap-operation".to_string()))
+        );
+
+        let without_operation = SatelleError::bootstrap_busy("remote", None);
+        assert_eq!(without_operation.details.len(), 1);
+        assert!(!without_operation.details.contains_key("operation_id"));
+    }
+
+    #[test]
     fn native_readiness_timeout_has_a_stable_readiness_contract() {
         assert_eq!(
             ErrorCode::NativeReadinessTimeout.as_str(),

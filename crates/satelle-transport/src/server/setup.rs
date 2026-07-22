@@ -43,8 +43,7 @@ pub(super) async fn complete_bootstrap_maintenance(
     Extension(authorized): Extension<AuthorizedRequest>,
     Path(operation_id): Path<String>,
 ) -> Response {
-    let scopes = authorized.principal().scopes();
-    if !scopes.allows(ApiScopes::ADMIN) && !scopes.allows(ApiScopes::CONTROL) {
+    if !bootstrap_maintenance_principal_is_authorized(&authorized) {
         return bootstrap_required(&state, &authorized);
     }
     let service = Arc::clone(&state.service);
@@ -72,8 +71,7 @@ pub(super) async fn begin_bootstrap_maintenance(
     Extension(authorized): Extension<AuthorizedRequest>,
     Path((operation_id, operation_kind)): Path<(String, String)>,
 ) -> Response {
-    let scopes = authorized.principal().scopes();
-    if !scopes.allows(ApiScopes::ADMIN) && !scopes.allows(ApiScopes::CONTROL) {
+    if !bootstrap_maintenance_principal_is_authorized(&authorized) {
         return bootstrap_required(&state, &authorized);
     }
     let operation_kind = match operation_kind.as_str() {
@@ -367,6 +365,16 @@ fn durable_setup_credential_required(
 fn setup_principal_is_authorized(authorized: &AuthorizedRequest) -> bool {
     authorized.principal().is_ssh_bootstrap()
         && authorized.principal().scopes().allows(ApiScopes::ADMIN)
+}
+
+// Bootstrap maintenance is an internal handoff capability, not part of the
+// public Read/Control/Admin hierarchy. A process-local SSH bootstrap principal
+// needs it even when the daemon exposes only read operations to that client.
+fn bootstrap_maintenance_principal_is_authorized(authorized: &AuthorizedRequest) -> bool {
+    let principal = authorized.principal();
+    principal.is_ssh_bootstrap()
+        || principal.scopes().allows(ApiScopes::ADMIN)
+        || principal.scopes().allows(ApiScopes::CONTROL)
 }
 
 fn setup_principal_can_activate(authorized: &AuthorizedRequest, token_id: &str) -> bool {
