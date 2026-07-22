@@ -298,8 +298,8 @@ impl SshBootstrapLock {
         ))
     }
 
-    pub(super) fn release_after_handoff(&mut self) -> Result<(), SshBootstrapError> {
-        self.commit_current_mutation()?;
+    /// Releases a handoff whose exact completion attempt was already committed.
+    pub(super) fn release_committed_handoff(&mut self) -> Result<(), SshBootstrapError> {
         self.exchange_lock_line(bootstrap_lock::RELEASE.to_string())
     }
 

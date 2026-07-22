@@ -699,6 +699,146 @@ fn durable_verification_and_bootstrap_handoff_use_distinct_clients() {
     drop(server);
 }
 
+#[cfg(unix)]
+fn with_bootstrap_handoff_test_context(test: impl FnOnce(&DaemonClient)) {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    struct PathRestore(std::ffi::OsString);
+
+    impl Drop for PathRestore {
+        fn drop(&mut self) {
+            // SAFETY: nextest runs each test in a separate process, and this
+            // guard restores PATH before that process exits.
+            unsafe { std::env::set_var("PATH", &self.0) };
+        }
+    }
+
+    let state = TestStateDir::new().expect("temporary state directory");
+    let bootstrap_token = ApiBearerToken::generate().expect("generate bootstrap token");
+    let service = HostService::local_demo_for_tests_at(state.path())
+        .expect("construct Host service")
+        .with_ssh_bootstrap_auth_for_tests(
+            &bootstrap_token,
+            ApiScopes::READ,
+            time::OffsetDateTime::now_utc() + time::Duration::minutes(5),
+        );
+    let initialized = service.initialize_daemon().expect("initialize Host state");
+    let host_identity = initialized.host_identity().to_string();
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .expect("construct daemon runtime");
+    let server = runtime
+        .block_on(DaemonServer::bind(
+            service,
+            DaemonServerConfig::loopback(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))),
+        ))
+        .expect("bind loopback daemon");
+    let client = DaemonClient::loopback(server.local_addr(), bootstrap_token, &host_identity)
+        .expect("construct operation-bound bootstrap client");
+
+    let fake_bin = state.path().join("fake-bin");
+    std::fs::create_dir(&fake_bin).expect("create fake SSH directory");
+    let fake_ssh = fake_bin.join("ssh");
+    std::fs::write(
+        &fake_ssh,
+        format!(
+            r#"#!/bin/sh
+command=
+for argument in "$@"; do command=$argument; done
+case "$command" in
+  cmd.exe*) exit 1 ;;
+  *"uname -s"*) printf '%s\n' satelle-platform-v1 Linux x86_64 'glibc 2.31' ;;
+  *) export SATELLE_STATE_DIR='{}'; exec sh -c "$command" ;;
+esac
+"#,
+            state.path().display()
+        ),
+    )
+    .expect("write fake SSH executable");
+    let mut permissions = std::fs::metadata(&fake_ssh)
+        .expect("read fake SSH metadata")
+        .permissions();
+    permissions.set_mode(0o700);
+    std::fs::set_permissions(&fake_ssh, permissions).expect("make fake SSH executable");
+
+    let original_path = std::env::var_os("PATH").expect("test process has PATH");
+    let path_restore = PathRestore(original_path.clone());
+    let path = std::env::join_paths(
+        std::iter::once(fake_bin.clone()).chain(std::env::split_paths(&original_path)),
+    )
+    .expect("construct fake SSH PATH");
+    // SAFETY: nextest isolates this test in its own process, and path_restore
+    // restores the original value on every exit path.
+    unsafe { std::env::set_var("PATH", path) };
+
+    test(&client);
+
+    drop(path_restore);
+    drop(server);
+}
+
+#[cfg(unix)]
+#[test]
+fn completed_bootstrap_handoff_commit_allows_recovery_after_controller_loss() {
+    with_bootstrap_handoff_test_context(|client| {
+        let mut bootstrap_lock = acquire_bootstrap_lock_for_operation(
+            "crash-window-host",
+            "fake-ssh-host",
+            "completed-handoff-before-controller-loss".to_string(),
+            bootstrap_lock::OperationKind::MissingDaemonRepair,
+        )
+        .expect("acquire the initial bootstrap lock");
+        complete_bootstrap_handoff("crash-window-host", client, &mut bootstrap_lock)
+            .expect("complete the bootstrap maintenance handoff");
+
+        // Losing the Controller channel before RELEASE must reconcile the exact
+        // completed attempt instead of leaving the remote fence permanently busy.
+        drop(bootstrap_lock);
+        let mut recovered_lock = acquire_bootstrap_lock_for_operation(
+            "crash-window-host",
+            "fake-ssh-host",
+            "controller-after-completed-handoff".to_string(),
+            bootstrap_lock::OperationKind::MissingDaemonRepair,
+        )
+        .expect("a new Controller can acquire after the completed handoff");
+        recovered_lock
+            .release_unmodified()
+            .expect("release the recovered bootstrap lock");
+    });
+}
+
+#[cfg(unix)]
+#[test]
+fn successful_bootstrap_handoff_release_does_not_repeat_the_completion_commit() {
+    with_bootstrap_handoff_test_context(|client| {
+        let mut bootstrap_lock = acquire_bootstrap_lock_for_operation(
+            "successful-release-host",
+            "fake-ssh-host",
+            "completed-handoff-before-release".to_string(),
+            bootstrap_lock::OperationKind::MissingDaemonRepair,
+        )
+        .expect("acquire the bootstrap lock");
+        complete_bootstrap_handoff("successful-release-host", client, &mut bootstrap_lock)
+            .expect("complete and commit the bootstrap maintenance handoff");
+        bootstrap_lock
+            .release_committed_handoff()
+            .expect("release without committing the completion attempt twice");
+
+        let mut next_lock = acquire_bootstrap_lock_for_operation(
+            "successful-release-host",
+            "fake-ssh-host",
+            "controller-after-successful-release".to_string(),
+            bootstrap_lock::OperationKind::MissingDaemonRepair,
+        )
+        .expect("successful release removes the prior claim");
+        next_lock
+            .release_unmodified()
+            .expect("release the next bootstrap lock");
+    });
+}
+
 #[test]
 fn ssh_setup_rejects_unimplemented_components_before_mutating() {
     let path = std::env::temp_dir().join("satelle-unsupported-setup.token");

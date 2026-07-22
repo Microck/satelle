@@ -1401,7 +1401,7 @@ impl TransportClient for SshSetupTransport {
         };
         confirm_bootstrap_lock(&self.alias, &mut bootstrap_lock)?;
         bootstrap_lock
-            .release_after_handoff()
+            .release_committed_handoff()
             .map_err(|_| SatelleError::host_unreachable(&self.alias))?;
         Ok(self.setup_report(
             false,
@@ -1801,7 +1801,7 @@ fn durable_ssh_clients(
             .map_err(|error| direct_transport_error(alias, error))?;
             complete_bootstrap_handoff(alias, &bootstrap_client, &mut bootstrap_lock)?;
             bootstrap_lock
-                .release_after_handoff()
+                .release_committed_handoff()
                 .map_err(|_| SatelleError::host_unreachable(alias))?;
         }
         Err(error) => return Err(direct_transport_error(alias, error)),
@@ -1879,6 +1879,9 @@ fn complete_bootstrap_handoff(
             "invalid-bootstrap-maintenance-handoff",
         ));
     }
+    bootstrap_lock
+        .commit_current_mutation()
+        .map_err(|_| SatelleError::host_unreachable(host))?;
     confirm_bootstrap_lock(host, bootstrap_lock)
 }
 
@@ -1976,7 +1979,7 @@ fn bootstrap_ssh_clients(
         .map_err(|error| direct_transport_error(alias, error))?;
     complete_bootstrap_handoff(alias, &client, &mut bootstrap_lock)?;
     bootstrap_lock
-        .release_after_handoff()
+        .release_committed_handoff()
         .map_err(|_| SatelleError::host_unreachable(alias))?;
     let event_client =
         DaemonEventClient::loopback(tunnel_addr, event_token, expected_host_identity)
@@ -2478,7 +2481,7 @@ pub(crate) fn discover_ssh_host_identity(
         .map_err(|error| direct_transport_error(&host.alias, error))?;
     complete_bootstrap_handoff(&host.alias, &client, &mut bootstrap_lock)?;
     bootstrap_lock
-        .release_after_handoff()
+        .release_committed_handoff()
         .map_err(|_| SatelleError::host_unreachable(&host.alias))?;
     Ok(identity)
 }
