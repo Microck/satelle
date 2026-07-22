@@ -351,13 +351,32 @@ fn invalid_receipt(reason: &'static str) -> SatelleError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use satelle_core::open_or_create_owner_only_file;
     use serde_json::{Map, Value};
+    use std::io::Write;
     use tempfile::TempDir;
 
     #[cfg(windows)]
     const BINARY_NAME: &str = "codex.exe";
     #[cfg(not(windows))]
     const BINARY_NAME: &str = "codex";
+
+    #[cfg(windows)]
+    const FIXTURE_TARGET: &str = "x86_64-pc-windows-msvc";
+    #[cfg(not(windows))]
+    const FIXTURE_TARGET: &str = "x86_64-apple-darwin";
+
+    #[cfg(windows)]
+    const FIXTURE_OTHER_TARGET: &str = "aarch64-pc-windows-msvc";
+    #[cfg(not(windows))]
+    const FIXTURE_OTHER_TARGET: &str = "aarch64-apple-darwin";
+
+    #[cfg(windows)]
+    const FIXTURE_ARTIFACT_SHA256: &str =
+        "4046964ac24104bb79217077a86c96b20edae5a5f548a71442a164d3f9598a35";
+    #[cfg(not(windows))]
+    const FIXTURE_ARTIFACT_SHA256: &str =
+        "1056c80958863b13debd5daee5eb7b9bd6f86236a1171d21b009e2dceea8763e";
 
     struct ReceiptFixture {
         _root: TempDir,
@@ -372,13 +391,15 @@ mod tests {
     impl ReceiptFixture {
         fn new() -> Self {
             let root = tempfile::tempdir().expect("temporary receipt root");
-            let state_root = root.path().join("state");
-            let codex_home = root.path().join("codex-home");
+            let canonical_root =
+                fs::canonicalize(root.path()).expect("canonical temporary receipt root");
+            let state_root = canonical_root.join("state");
+            let codex_home = canonical_root.join("codex-home");
             let package_root = codex_home
                 .join("packages")
                 .join("standalone")
                 .join("releases")
-                .join("0.144.0-x86_64-apple-darwin");
+                .join(format!("{CODEX_VERSION}-{FIXTURE_TARGET}"));
             let binary_path = package_root.join("bin").join(BINARY_NAME);
             fs::create_dir_all(binary_path.parent().expect("binary parent"))
                 .expect("create package");
@@ -395,10 +416,12 @@ mod tests {
                 "schema": RECEIPT_SCHEMA,
                 "manager": RECEIPT_MANAGER,
                 "version": CODEX_VERSION,
-                "target": "x86_64-apple-darwin",
+                "target": FIXTURE_TARGET,
                 "release_tag": CODEX_RELEASE_TAG,
-                "artifact_url": "https://github.com/openai/codex/releases/download/rust-v0.144.0/codex-package-x86_64-apple-darwin.tar.gz",
-                "artifact_sha256": "1056c80958863b13debd5daee5eb7b9bd6f86236a1171d21b009e2dceea8763e",
+                "artifact_url": format!(
+                    "https://github.com/openai/codex/releases/download/{CODEX_RELEASE_TAG}/codex-package-{FIXTURE_TARGET}.tar.gz"
+                ),
+                "artifact_sha256": FIXTURE_ARTIFACT_SHA256,
                 "codex_home": codex_home,
                 "immutable_package_root": package_root,
                 "immutable_binary_path": binary_path,
@@ -424,28 +447,20 @@ mod tests {
         }
 
         fn write_receipt(&mut self) {
-            fs::write(
-                &self.receipt_path,
-                serde_json::to_vec_pretty(&self.receipt).expect("serialize receipt"),
-            )
-            .expect("write receipt");
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                fs::set_permissions(&self.receipt_path, fs::Permissions::from_mode(0o600))
-                    .expect("secure receipt");
-            }
+            let bytes = serde_json::to_vec_pretty(&self.receipt).expect("serialize receipt");
+            let mut file = open_or_create_owner_only_file(&self.receipt_path)
+                .expect("open owner-only receipt");
+            file.set_len(0).expect("truncate receipt");
+            file.write_all(&bytes).expect("write receipt");
         }
     }
 
     #[test]
     fn verified_receipt_returns_exact_immutable_binary_and_codex_home() {
         let fixture = ReceiptFixture::new();
-        let runtime = admit_managed_codex_from_state_root_for_target(
-            &fixture.state_root,
-            "x86_64-apple-darwin",
-        )
-        .expect("admit managed Codex");
+        let runtime =
+            admit_managed_codex_from_state_root_for_target(&fixture.state_root, FIXTURE_TARGET)
+                .expect("admit managed Codex");
         assert_eq!(runtime.binary_path(), fixture.binary_path);
         assert_eq!(runtime.codex_home(), fixture.codex_home);
         let command = runtime.command().expect("verified command");
@@ -460,11 +475,8 @@ mod tests {
         let mut fixture = ReceiptFixture::new();
         fs::remove_file(&fixture.receipt_path).expect("remove receipt");
         assert!(
-            admit_managed_codex_from_state_root_for_target(
-                &fixture.state_root,
-                "x86_64-apple-darwin"
-            )
-            .is_err()
+            admit_managed_codex_from_state_root_for_target(&fixture.state_root, FIXTURE_TARGET)
+                .is_err()
         );
         fixture.write_receipt();
         #[cfg(unix)]
@@ -473,11 +485,8 @@ mod tests {
             fs::set_permissions(&fixture.receipt_path, fs::Permissions::from_mode(0o644))
                 .expect("make receipt unsafe");
             assert!(
-                admit_managed_codex_from_state_root_for_target(
-                    &fixture.state_root,
-                    "x86_64-apple-darwin"
-                )
-                .is_err()
+                admit_managed_codex_from_state_root_for_target(&fixture.state_root, FIXTURE_TARGET)
+                    .is_err()
             );
         }
     }
@@ -491,11 +500,8 @@ mod tests {
                 .insert(field.to_string(), json!("wrong"));
             fixture.write_receipt();
             assert!(
-                admit_managed_codex_from_state_root_for_target(
-                    &fixture.state_root,
-                    "x86_64-apple-darwin"
-                )
-                .is_err(),
+                admit_managed_codex_from_state_root_for_target(&fixture.state_root, FIXTURE_TARGET)
+                    .is_err(),
                 "accepted wrong {field}"
             );
         }
@@ -518,11 +524,8 @@ mod tests {
             .insert("immutable_package_root".to_string(), json!(current));
         fixture.write_receipt();
         assert!(
-            admit_managed_codex_from_state_root_for_target(
-                &fixture.state_root,
-                "x86_64-apple-darwin"
-            )
-            .is_err()
+            admit_managed_codex_from_state_root_for_target(&fixture.state_root, FIXTURE_TARGET)
+                .is_err()
         );
     }
 
@@ -531,22 +534,17 @@ mod tests {
         let fixture = ReceiptFixture::new();
         fs::write(&fixture.binary_path, b"drifted binary").expect("replace binary bytes");
         assert!(
-            admit_managed_codex_from_state_root_for_target(
-                &fixture.state_root,
-                "x86_64-apple-darwin"
-            )
-            .is_err()
+            admit_managed_codex_from_state_root_for_target(&fixture.state_root, FIXTURE_TARGET)
+                .is_err()
         );
     }
 
     #[test]
     fn admitted_runtime_rechecks_binary_before_every_child_command() {
         let fixture = ReceiptFixture::new();
-        let runtime = admit_managed_codex_from_state_root_for_target(
-            &fixture.state_root,
-            "x86_64-apple-darwin",
-        )
-        .expect("admit managed Codex");
+        let runtime =
+            admit_managed_codex_from_state_root_for_target(&fixture.state_root, FIXTURE_TARGET)
+                .expect("admit managed Codex");
 
         fs::write(&fixture.binary_path, b"mutated after admission")
             .expect("mutate admitted binary");
@@ -583,7 +581,7 @@ mod tests {
         wrong_package.write_receipt();
         let package_error = admit_managed_codex_from_state_root_for_target(
             &wrong_package.state_root,
-            "x86_64-apple-darwin",
+            FIXTURE_TARGET,
         )
         .expect_err("a receipt cannot relabel an arbitrary package as version 0.144.0");
         assert_eq!(
@@ -600,7 +598,7 @@ mod tests {
         wrong_binary.write_receipt();
         let binary_error = admit_managed_codex_from_state_root_for_target(
             &wrong_binary.state_root,
-            "x86_64-apple-darwin",
+            FIXTURE_TARGET,
         )
         .expect_err("a receipt cannot select a second executable from the package");
         assert_eq!(
@@ -615,11 +613,9 @@ mod tests {
         let npm_shim = fixture.state_root.join("node_modules").join(".bin");
         fs::create_dir_all(&npm_shim).expect("create npm shim directory");
         fs::write(npm_shim.join(BINARY_NAME), b"npm shim").expect("write npm shim");
-        let runtime = admit_managed_codex_from_state_root_for_target(
-            &fixture.state_root,
-            "x86_64-apple-darwin",
-        )
-        .expect("receipt identity wins");
+        let runtime =
+            admit_managed_codex_from_state_root_for_target(&fixture.state_root, FIXTURE_TARGET)
+                .expect("receipt identity wins");
         assert_eq!(runtime.binary_path(), fixture.binary_path);
     }
 
@@ -629,7 +625,7 @@ mod tests {
         assert!(
             admit_managed_codex_from_state_root_for_target(
                 &fixture.state_root,
-                "aarch64-apple-darwin"
+                FIXTURE_OTHER_TARGET
             )
             .is_err()
         );
@@ -639,11 +635,8 @@ mod tests {
             .insert("artifact_sha256".to_string(), json!("11".repeat(32)));
         fixture.write_receipt();
         assert!(
-            admit_managed_codex_from_state_root_for_target(
-                &fixture.state_root,
-                "x86_64-apple-darwin"
-            )
-            .is_err()
+            admit_managed_codex_from_state_root_for_target(&fixture.state_root, FIXTURE_TARGET)
+                .is_err()
         );
     }
 

@@ -381,21 +381,28 @@ impl DaemonServicePlan {
     }
 }
 
+fn is_absolute_posix_path(value: &str) -> bool {
+    value.starts_with('/') && !value.split('/').any(|component| component == "..")
+}
+
 pub fn render_launchd_user_plist(
     binary: &Path,
     bind: &str,
     overrides: &DaemonPathOverrides,
 ) -> Result<String, WindowsServiceDefinitionError> {
+    let binary = binary
+        .to_str()
+        .filter(|path| is_absolute_posix_path(path))
+        .ok_or(WindowsServiceDefinitionError::InvalidServiceConfig)?;
     let bind = bind
         .parse::<SocketAddr>()
         .map_err(|_| WindowsServiceDefinitionError::InvalidServiceConfig)?;
-    if !binary.is_absolute() || !bind.ip().is_loopback() {
+    if !bind.ip().is_loopback() {
         return Err(WindowsServiceDefinitionError::InvalidServiceConfig);
     }
     let mut environment = String::new();
     for entry in overrides.entries() {
-        let path = Path::new(&entry.value);
-        if !path.is_absolute() {
+        if !is_absolute_posix_path(&entry.value) {
             return Err(WindowsServiceDefinitionError::InvalidServiceConfig);
         }
         write!(
@@ -420,7 +427,7 @@ pub fn render_launchd_user_plist(
             "<key>RunAtLoad</key><true/><key>KeepAlive</key><true/>",
             "</dict></plist>"
         ),
-        xml_escape(&binary.display().to_string()),
+        xml_escape(binary),
         xml_escape(&bind.to_string()),
         environment
     ))

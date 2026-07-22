@@ -11,6 +11,7 @@ const STALE_AFTER_SECONDS: u64 = 30;
 pub(super) enum OperationKind {
     InitialSetup,
     MissingDaemonRepair,
+    ServiceStop,
     ServiceRestart,
 }
 
@@ -19,6 +20,7 @@ impl OperationKind {
         match self {
             Self::InitialSetup => "initial_setup",
             Self::MissingDaemonRepair => "missing_daemon_repair",
+            Self::ServiceStop => "service_stop",
             Self::ServiceRestart => "service_restart",
         }
     }
@@ -2647,5 +2649,18 @@ mod tests {
             OperationKind::MissingDaemonRepair.as_str(),
             "missing_daemon_repair"
         );
+        assert_eq!(OperationKind::ServiceStop.as_str(), "service_stop");
+        assert_eq!(OperationKind::ServiceRestart.as_str(), "service_restart");
+    }
+
+    #[test]
+    fn service_stop_request_scripts_persist_stop_specific_operation_kind() {
+        let request = Request::new("service-stop-operation", OperationKind::ServiceStop, None)
+            .expect("valid service stop request");
+
+        for script in [request.posix_command(), request.windows_script()] {
+            assert!(script.contains("service_stop"));
+            assert!(!script.contains("service_restart"));
+        }
     }
 }

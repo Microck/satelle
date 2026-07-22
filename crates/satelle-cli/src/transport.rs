@@ -890,6 +890,13 @@ impl SshPersistentServiceLifecycle {
             Self::Restart => "service-restart",
         }
     }
+
+    const fn bootstrap_operation(self) -> bootstrap_lock::OperationKind {
+        match self {
+            Self::Stop => bootstrap_lock::OperationKind::ServiceStop,
+            Self::Restart => bootstrap_lock::OperationKind::ServiceRestart,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, serde::Serialize)]
@@ -1004,20 +1011,71 @@ impl SshSetupTransport {
             }
             _ => SatelleError::host_unreachable(&self.alias),
         })?;
-        let authenticated_probe = !self.requires_first_trust && existing_token_file;
-        let token = if authenticated_probe {
+        let token = if existing_token_file {
             self.read_configured_durable_token()?
         } else {
             ApiBearerToken::generate().map_err(|_| SatelleError::host_unreachable(&self.alias))?
         };
+        self.observe_current_daemon_at(tunnel.local_addr(), token)
+    }
+
+    fn observe_current_daemon_at(
+        &self,
+        address: std::net::SocketAddr,
+        token: ApiBearerToken,
+    ) -> Result<CurrentDaemonArtifactObservation, SatelleError> {
+        // Keep a zeroizing copy only when first trust may need to reconstruct
+        // the non-Clone token for a client bound to the discovered identity.
+        let exposed_token = self.requires_first_trust.then(|| token.expose());
         let client = DaemonClient::loopback_with_timeout(
-            tunnel.local_addr(),
+            address,
             token,
             self.binding.expected_host_identity().to_string(),
             SSH_DAEMON_REQUEST_TIMEOUT,
         )
         .map_err(|error| direct_transport_error(&self.alias, error))?;
-        match client.capabilities() {
+        let capabilities = match client.capabilities() {
+            Err(DaemonClientError::Api { status: _, error })
+                if self.requires_first_trust
+                    && error.code() == ApiErrorCode::HostIdentityMismatch =>
+            {
+                // Identity discovery validates the structured mismatch but does
+                // not persist trust. The configured credential still has to
+                // authenticate the rebound capabilities request.
+                let observed_identity =
+                    client
+                        .discover_host_identity()
+                        .map_err(|error| match error {
+                            DaemonClientError::Api { status: _, error }
+                                if matches!(
+                                    error.code(),
+                                    ApiErrorCode::AuthenticationFailed
+                                        | ApiErrorCode::HostIdentityMismatch
+                                ) =>
+                            {
+                                self.unauthenticated_daemon_version_error()
+                            }
+                            error => direct_transport_error(&self.alias, error),
+                        })?;
+                let token = ApiBearerToken::parse(
+                    exposed_token
+                        .as_ref()
+                        .expect("first trust retains the configured probe token")
+                        .as_str(),
+                )
+                .map_err(|_| SatelleError::host_unreachable(&self.alias))?;
+                let rebound_client = DaemonClient::loopback_with_timeout(
+                    address,
+                    token,
+                    observed_identity,
+                    SSH_DAEMON_REQUEST_TIMEOUT,
+                )
+                .map_err(|error| direct_transport_error(&self.alias, error))?;
+                rebound_client.capabilities()
+            }
+            capabilities => capabilities,
+        };
+        match capabilities {
             Ok(capabilities) => Ok(CurrentDaemonArtifactObservation {
                 current_version: Some(capabilities.daemon_version().to_string()),
                 protocol_compatible: true,
@@ -1047,13 +1105,7 @@ impl SshSetupTransport {
                     ApiErrorCode::AuthenticationFailed | ApiErrorCode::HostIdentityMismatch
                 ) =>
             {
-                Err(SatelleError::config_error(
-                    format!(
-                        "host '{}' has a reachable Host Daemon whose version cannot be authenticated; restore its durable credential or stop it before replacing the Host artifact",
-                        self.alias
-                    ),
-                    None,
-                ))
+                Err(self.unauthenticated_daemon_version_error())
             }
             Err(DaemonClientError::Transport(error)) if error.is_connect() => {
                 Ok(CurrentDaemonArtifactObservation {
@@ -1063,6 +1115,16 @@ impl SshSetupTransport {
             }
             Err(error) => Err(direct_transport_error(&self.alias, error)),
         }
+    }
+
+    fn unauthenticated_daemon_version_error(&self) -> SatelleError {
+        SatelleError::config_error(
+            format!(
+                "host '{}' has a reachable Host Daemon whose version cannot be authenticated; restore its durable credential or stop it before replacing the Host artifact",
+                self.alias
+            ),
+            None,
+        )
     }
 
     #[cfg(test)]
@@ -2202,7 +2264,7 @@ pub(crate) fn manage_ssh_persistent_service(
         &transport.alias,
         transport.binding.destination(),
         operation_id,
-        bootstrap_lock::OperationKind::ServiceRestart,
+        lifecycle.bootstrap_operation(),
     )?;
     confirm_bootstrap_lock(&transport.alias, &mut bootstrap_lock)?;
 

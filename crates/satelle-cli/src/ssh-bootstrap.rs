@@ -2352,7 +2352,7 @@ Move-Item -LiteralPath $temporary -Destination $path -Force"#,
             .map(|(parent, _)| parent)
             .unwrap_or("/");
         format!(
-            "set -eu\numask 077\npath={}\nparent={}\ntest -d \"$parent\" && test ! -L \"$parent\"\ntemporary=\"$parent/.satelle-definition-$$\"\ntrap 'rm -f -- \"$temporary\"' EXIT\ncat >\"$temporary\"\n[ \"$(wc -c <\"$temporary\")\" -le {SERVICE_DEFINITION_LIMIT} ]\nchmod 600 \"$temporary\"\nmv -f -- \"$temporary\" \"$path\"\ntrap - EXIT",
+            "set -eu\numask 077\npath={}\nparent={}\ntest -d \"$parent\" && test ! -L \"$parent\"\ntemporary=\"$parent/.satelle-definition-$$\"\ntrap 'rm -f -- \"$temporary\"' EXIT\n[ ! -e \"$temporary\" ] && [ ! -L \"$temporary\" ]\nset -C\ncat >\"$temporary\"\n[ \"$(wc -c <\"$temporary\")\" -le {SERVICE_DEFINITION_LIMIT} ]\nchmod 600 \"$temporary\"\nmv -f -- \"$temporary\" \"$path\"\ntrap - EXIT",
             posix_quote(remote_path),
             posix_quote(parent),
         )
@@ -4419,6 +4419,8 @@ mod tests {
         );
         assert!(posix.contains(&SERVICE_DEFINITION_LIMIT.to_string()));
         assert!(posix.contains("umask 077"));
+        assert!(posix.contains("[ ! -e \"$temporary\" ] && [ ! -L \"$temporary\" ]"));
+        assert!(posix.contains("set -C"));
         assert!(posix.contains("chmod 600"));
         assert!(posix.contains("mv -f"));
     }

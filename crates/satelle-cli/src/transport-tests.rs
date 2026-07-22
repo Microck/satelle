@@ -1184,6 +1184,87 @@ fn first_trust_path_rebind_handoff_uses_the_discovered_host_identity() {
 
 #[cfg(unix)]
 #[test]
+fn first_trust_artifact_probe_rebinds_to_discovered_identity_and_reports_current_version() {
+    let daemon_state = TestStateDir::new().expect("temporary first-trust daemon state");
+    let configured_token = ApiBearerToken::generate().expect("generate configured token");
+    let raw_configured_token = configured_token.expose();
+    let service = HostService::local_demo_for_tests_at(daemon_state.path())
+        .expect("construct first-trust Host service")
+        .with_ssh_bootstrap_auth_for_tests(
+            &configured_token,
+            ApiScopes::ADMIN,
+            time::OffsetDateTime::now_utc() + time::Duration::minutes(5),
+        );
+    service.initialize_daemon().expect("initialize Host state");
+    let (_runtime, server) = spawn_loopback_daemon(service);
+    let mut host = ssh_setup_host(Some(ApiTokenSource::File {
+        path: daemon_state.path().join("configured.token"),
+    }));
+    host.config.expected_host_id = None;
+    let transport = SshSetupTransport::new(&host).expect("construct first-trust transport");
+
+    let observation = transport
+        .observe_current_daemon_at(
+            server.local_addr(),
+            ApiBearerToken::parse(raw_configured_token.as_str())
+                .expect("parse configured probe token"),
+        )
+        .expect("authenticated first-trust probe must rebind to the discovered identity");
+
+    assert_eq!(
+        observation.current_version.as_deref(),
+        Some(env!("CARGO_PKG_VERSION"))
+    );
+    assert!(observation.protocol_compatible);
+    drop(server);
+}
+
+#[cfg(unix)]
+#[test]
+fn first_trust_artifact_probe_rejects_an_unauthenticated_reachable_daemon() {
+    let daemon_state = TestStateDir::new().expect("temporary first-trust daemon state");
+    let configured_token = ApiBearerToken::generate().expect("generate configured token");
+    let service = HostService::local_demo_for_tests_at(daemon_state.path())
+        .expect("construct first-trust Host service")
+        .with_ssh_bootstrap_auth_for_tests(
+            &configured_token,
+            ApiScopes::ADMIN,
+            time::OffsetDateTime::now_utc() + time::Duration::minutes(5),
+        );
+    service.initialize_daemon().expect("initialize Host state");
+    let (_runtime, server) = spawn_loopback_daemon(service);
+    let mut host = ssh_setup_host(Some(ApiTokenSource::File {
+        path: daemon_state.path().join("configured.token"),
+    }));
+    host.config.expected_host_id = None;
+    let transport = SshSetupTransport::new(&host).expect("construct first-trust transport");
+
+    let error = transport
+        .observe_current_daemon_at(
+            server.local_addr(),
+            ApiBearerToken::generate().expect("generate rejected probe token"),
+        )
+        .expect_err("an unauthenticated daemon version must remain fail-closed");
+
+    assert_eq!(error.code, ErrorCode::ConfigError);
+    assert!(error.message.contains("version cannot be authenticated"));
+    drop(server);
+}
+
+#[test]
+fn persistent_service_lifecycle_uses_distinct_bootstrap_operations() {
+    assert_eq!(
+        SshPersistentServiceLifecycle::Stop.bootstrap_operation(),
+        bootstrap_lock::OperationKind::ServiceStop
+    );
+    assert_eq!(
+        SshPersistentServiceLifecycle::Restart.bootstrap_operation(),
+        bootstrap_lock::OperationKind::ServiceRestart
+    );
+}
+
+#[cfg(unix)]
+#[test]
 fn conflicting_maintenance_begin_is_terminal_for_the_exact_lock_attempt() {
     with_bootstrap_handoff_test_context(|bootstrap_client, fake_ssh, _, _, ledger| {
         let competing_operation = "already-active-maintenance";

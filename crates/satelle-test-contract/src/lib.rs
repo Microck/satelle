@@ -263,10 +263,16 @@ fn snapshot_directory_tree(root: &Path) -> std::io::Result<BTreeMap<PathBuf, Dir
 }
 
 fn is_ignored_filesystem_event(kind: EventKind) -> bool {
-    matches!(
-        kind,
-        EventKind::Access(_) | EventKind::Modify(ModifyKind::Metadata(MetadataKind::AccessTime))
-    )
+    match kind {
+        EventKind::Access(_)
+        | EventKind::Modify(ModifyKind::Metadata(MetadataKind::AccessTime)) => true,
+        // macOS FSEvents coalesces ordinary reads into a coarse metadata event.
+        // The final snapshot still detects persistent permission or ownership
+        // changes, while create, data, rename, and remove events stay visible.
+        #[cfg(target_os = "macos")]
+        EventKind::Modify(ModifyKind::Metadata(MetadataKind::Any)) => true,
+        _ => false,
+    }
 }
 
 fn observe_transient_mutations(
