@@ -15,7 +15,7 @@ use satelle_host::{
 };
 use satelle_transport::{DaemonServer, DaemonServerConfig};
 use std::io::{Read, Write};
-use std::net::{Ipv4Addr, SocketAddr, TcpListener};
+use std::net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Condvar, Mutex, mpsc};
@@ -1248,6 +1248,141 @@ fn conflicting_maintenance_begin_is_terminal_for_the_exact_lock_attempt() {
         bootstrap_client
             .complete_bootstrap_maintenance(competing_operation)
             .expect("complete competing maintenance fixture");
+    });
+}
+
+#[cfg(unix)]
+#[test]
+fn connection_capacity_rejection_is_terminal_for_the_exact_lock_attempt() {
+    with_bootstrap_handoff_test_context(|_, fake_ssh, _, _, _| {
+        let daemon_state = TestStateDir::new().expect("temporary capacity daemon state");
+        let bootstrap_token = ApiBearerToken::generate().expect("generate bootstrap token");
+        let service = HostService::local_demo_for_tests_at(daemon_state.path())
+            .expect("construct capacity Host service")
+            .with_ssh_bootstrap_auth_for_tests(
+                &bootstrap_token,
+                ApiScopes::READ,
+                time::OffsetDateTime::now_utc() + time::Duration::minutes(5),
+            );
+        let initialized = service.initialize_daemon().expect("initialize Host state");
+        let host_identity = initialized.host_identity().to_string();
+        let ledger = service.clone();
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .expect("construct capacity daemon runtime");
+        let server = runtime
+            .block_on(DaemonServer::bind(
+                service,
+                DaemonServerConfig::loopback(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
+                    .with_max_connections(1),
+            ))
+            .expect("bind capacity-limited daemon");
+        let capacity_client =
+            DaemonClient::loopback(server.local_addr(), bootstrap_token, &host_identity)
+                .expect("construct capacity-rejected bootstrap client");
+
+        // Complete one real request on the sole admitted connection, then keep
+        // that HTTP/1.1 socket open so the next connection enters the server's
+        // bounded typed-rejection lane.
+        let mut occupant = TcpStream::connect(server.local_addr())
+            .expect("open the sole admitted Host connection");
+        occupant
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .expect("bound the occupancy probe read");
+        occupant
+            .write_all(
+                b"GET /v1/live HTTP/1.1\r\nHost: localhost\r\nConnection: keep-alive\r\n\r\n",
+            )
+            .expect("send occupancy probe");
+        let mut response_head = Vec::new();
+        let mut chunk = [0_u8; 512];
+        while !response_head.windows(4).any(|window| window == b"\r\n\r\n") {
+            let count = occupant.read(&mut chunk).expect("read occupancy response");
+            assert!(count > 0, "occupancy response must contain HTTP headers");
+            response_head.extend_from_slice(&chunk[..count]);
+        }
+        assert!(
+            response_head.starts_with(b"HTTP/1.1 200"),
+            "the held connection must consume normal server capacity"
+        );
+
+        let operation_id = "connection-capacity-maintenance-begin";
+        let mut bootstrap_lock = acquire_bootstrap_lock_for_operation_with_ssh(
+            "capacity-handoff-host",
+            "fake-ssh-host",
+            operation_id.to_string(),
+            bootstrap_lock::OperationKind::MissingDaemonRepair,
+            fake_ssh,
+        )
+        .expect("acquire bootstrap lock");
+        bootstrap_lock
+            .mark_mutation_started("daemon_start")
+            .expect("record verified daemon start");
+        commit_verified_bootstrap_mutation("capacity-handoff-host", &mut bootstrap_lock)
+            .expect("commit verified daemon start");
+
+        let error = complete_bootstrap_handoff(
+            "capacity-handoff-host",
+            &capacity_client,
+            &mut bootstrap_lock,
+        )
+        .expect_err("HTTP connection capacity rejects maintenance before its handler");
+
+        assert_eq!(error.code, ErrorCode::CapacityExceeded);
+        assert!(
+            ledger
+                .load_setup_run(operation_id)
+                .expect("read capacity-rejected operation ledger")
+                .is_none(),
+            "capacity rejection must occur before maintenance ledger mutation"
+        );
+        let begin_commit = format!(
+            "{} maintenance_handoff_begin ",
+            bootstrap_lock::MUTATION_COMMITTED
+        );
+        assert_eq!(
+            bootstrap_lock
+                .exchanged_lock_lines()
+                .iter()
+                .filter(|line| line.starts_with(&begin_commit))
+                .count(),
+            1,
+            "the exact capacity-rejected attempt has one terminal owner"
+        );
+        assert!(
+            bootstrap_lock
+                .exchanged_lock_lines()
+                .iter()
+                .all(|line| !line.contains("maintenance_handoff_complete")),
+            "capacity-rejected begin must not open the complete phase"
+        );
+        drop(bootstrap_lock);
+
+        let lock_state_root = fake_ssh
+            .parent()
+            .and_then(std::path::Path::parent)
+            .expect("fake SSH state root");
+        let terminal = std::fs::read_to_string(
+            lock_state_root.join(format!("bootstrap-operation-{operation_id}.json")),
+        )
+        .expect("read capacity-rejected terminal record");
+        assert!(terminal.contains("\"terminal_state\":\"reconciled_failed\""));
+        let mut recovered_lock = acquire_bootstrap_lock_for_operation_with_ssh(
+            "capacity-handoff-host",
+            "fake-ssh-host",
+            "controller-after-capacity-rejection".to_string(),
+            bootstrap_lock::OperationKind::MissingDaemonRepair,
+            fake_ssh,
+        )
+        .expect("a new Controller acquires after terminal capacity rejection");
+        recovered_lock
+            .release_unmodified()
+            .expect("release recovered bootstrap lock");
+
+        drop(occupant);
+        drop(server);
     });
 }
 
