@@ -1571,13 +1571,21 @@ async fn read_scoped_ssh_bootstrap_can_handoff_maintenance_without_setup_authori
         let setup_error = bootstrap_client
             .issue_durable_setup_token("read-bootstrap-setup-attempt")
             .expect_err("read-scoped SSH bootstrap cannot mint setup credentials");
-        assert!(matches!(
-            setup_error,
-            DaemonClientError::Api {
-                status: StatusCode::FORBIDDEN,
-                ..
+        match setup_error {
+            DaemonClientError::Api { status, error } => {
+                assert_eq!(status, StatusCode::FORBIDDEN);
+                assert_eq!(
+                    error.code().as_str(),
+                    ErrorCode::AuthorizationInsufficientScope.as_str()
+                );
+                assert_eq!(
+                    serde_json::to_value(error.as_ref()).expect("serialize setup error")
+                        ["retryable"],
+                    serde_json::Value::Bool(false)
+                );
             }
-        ));
+            other => panic!("expected forbidden setup API error, got {other:?}"),
+        }
 
         let durable_read_client =
             DaemonClient::loopback(address, durable_read_token, &host_identity)
@@ -1585,13 +1593,21 @@ async fn read_scoped_ssh_bootstrap_can_handoff_maintenance_without_setup_authori
         let handoff_error = durable_read_client
             .begin_bootstrap_maintenance("durable-read-handoff", "missing_daemon_repair")
             .expect_err("ordinary durable read credentials cannot begin maintenance");
-        assert!(matches!(
-            handoff_error,
-            DaemonClientError::Api {
-                status: StatusCode::FORBIDDEN,
-                ..
+        match handoff_error {
+            DaemonClientError::Api { status, error } => {
+                assert_eq!(status, StatusCode::FORBIDDEN);
+                assert_eq!(
+                    error.code().as_str(),
+                    ErrorCode::AuthorizationInsufficientScope.as_str()
+                );
+                assert_eq!(
+                    serde_json::to_value(error.as_ref()).expect("serialize handoff error")
+                        ["retryable"],
+                    serde_json::Value::Bool(false)
+                );
             }
-        ));
+            other => panic!("expected forbidden handoff API error, got {other:?}"),
+        }
     })
     .await
     .expect("join bootstrap maintenance client operations");

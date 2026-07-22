@@ -1881,6 +1881,9 @@ fn complete_bootstrap_handoff(
         ));
     }
     bootstrap_lock
+        .commit_current_mutation()
+        .map_err(|_| SatelleError::host_unreachable(host))?;
+    bootstrap_lock
         .mark_mutation_started("maintenance_handoff_complete")
         .map_err(|_| SatelleError::host_unreachable(host))?;
     let handoff = client

@@ -1184,6 +1184,32 @@ mod tests {
         assert!(owner.close().success());
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn posix_protocol_reconciles_committed_maintenance_begin_if_controller_closes() {
+        let state_home = tempfile::tempdir().expect("temporary state home");
+        let state_root = state_home.path().join("satelle");
+        let lock_root = state_root.join("bootstrap.lock");
+        let attempt = "0123456789abcdef0123456789abcdef";
+        let phase = "maintenance_handoff_begin";
+        let mut owner = RunningProtocol::start(&request(), state_home.path());
+        assert_ready_line(&owner.read_line());
+        owner.exchange(&mutation_started_line(phase, attempt).unwrap());
+        owner.exchange(&mutation_executing_line(phase, attempt).unwrap());
+        owner.exchange(&mutation_committed_line(phase, attempt).unwrap());
+        assert!(
+            only_claim(&lock_root)
+                .join(format!("execution_committed.{attempt}"))
+                .is_dir()
+        );
+
+        assert!(owner.close().success());
+        assert!(claim_directories(&lock_root).is_empty());
+        let record = fs::read_to_string(state_root.join("bootstrap-operation-operation-1.json"))
+            .expect("reconciled failure record");
+        assert!(record.contains("\"terminal_state\":\"reconciled_failed\""));
+    }
+
     #[test]
     fn operation_kinds_are_closed_and_exact() {
         assert_eq!(OperationKind::InitialSetup.as_str(), "initial_setup");

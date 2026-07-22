@@ -283,6 +283,11 @@ impl SshBootstrapLock {
     }
 
     pub(super) fn release_after_handoff(&mut self) -> Result<(), SshBootstrapError> {
+        self.commit_current_mutation()?;
+        self.exchange_lock_line(bootstrap_lock::RELEASE.to_string())
+    }
+
+    pub(super) fn commit_current_mutation(&mut self) -> Result<(), SshBootstrapError> {
         let phase = self
             .mutation_phase
             .as_deref()
@@ -293,8 +298,7 @@ impl SshBootstrapLock {
             .ok_or(SshBootstrapError::BootstrapLockLost)?;
         let committed = bootstrap_lock::mutation_committed_line(phase, attempt)
             .map_err(SshBootstrapError::InvalidBootstrapLockRequest)?;
-        self.exchange_lock_line(committed)?;
-        self.exchange_lock_line(bootstrap_lock::RELEASE.to_string())
+        self.exchange_lock_line(committed)
     }
 
     fn exchange_lock_line(&mut self, challenge: String) -> Result<(), SshBootstrapError> {
