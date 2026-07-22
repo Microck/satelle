@@ -842,6 +842,10 @@ fn router(state: Arc<DaemonState>) -> Router {
         .route_layer(middleware::from_fn_with_state(
             Arc::clone(&state),
             auth::require_empty_setup_mutation,
+        ))
+        .route_layer(middleware::from_fn_with_state(
+            Arc::clone(&state),
+            auth::require_setup_mutation,
         ));
     let control_routes = Router::new()
         .route("/v1/sessions", post(sessions::create_session))
@@ -853,13 +857,13 @@ fn router(state: Arc<DaemonState>) -> Router {
             "/v1/sessions/{session_id}/stop",
             post(sessions::stop_session),
         )
-        .merge(setup_routes)
         .route_layer(middleware::from_fn_with_state(
             Arc::clone(&state),
             auth::require_control,
         ));
     let protected = read_routes
         .merge(bootstrap_maintenance_routes)
+        .merge(setup_routes)
         .merge(control_routes)
         .method_not_allowed_fallback(protected_method_not_allowed)
         .fallback(protected_not_found)

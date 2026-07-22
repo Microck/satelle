@@ -655,17 +655,28 @@ impl Storage {
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|source| sqlite_error(StorageErrorKind::OperationFailed, source))?;
-        let recovery_run: i64 = transaction
+        let action_status = transaction
             .query_row(
-                "SELECT EXISTS(
-                    SELECT 1 FROM setup_runs
-                    WHERE run_id = ?1 AND status = 'outcome_unknown'
-                )",
+                "SELECT setup_actions.status
+                 FROM setup_actions
+                 JOIN setup_runs USING (run_id)
+                 WHERE setup_runs.run_id = ?1
+                   AND setup_runs.status = 'outcome_unknown'
+                   AND setup_actions.action_id = 'bootstrap-handoff'",
                 [operation_id.as_str()],
-                |row| row.get(0),
+                |row| row.get::<_, String>(0),
             )
-            .map_err(|source| sqlite_error(StorageErrorKind::OperationFailed, source))?;
-        if recovery_run == 0 {
+            .optional()
+            .map_err(|source| sqlite_error(StorageErrorKind::OperationFailed, source))?
+            .ok_or_else(|| StorageError::new(StorageErrorKind::StateConflict))?;
+        let parsed_action_status = SetupActionStatus::parse(&action_status)?;
+        if !matches!(
+            parsed_action_status,
+            SetupActionStatus::Planned
+                | SetupActionStatus::Started
+                | SetupActionStatus::OutcomeUnknown
+                | SetupActionStatus::Completed
+        ) {
             return Err(StorageError::new(StorageErrorKind::StateConflict));
         }
         require_one_transition(
@@ -678,18 +689,23 @@ impl Storage {
                 )
                 .map_err(|source| sqlite_error(StorageErrorKind::OperationFailed, source))?,
         )?;
-        require_one_transition(
-            transaction
-                .execute(
-                    "UPDATE setup_actions
-                     SET status = 'started', finished_at = NULL, recovery_hint = NULL
-                     WHERE run_id = ?1
-                       AND action_id = 'bootstrap-handoff'
-                       AND status = 'outcome_unknown'",
-                    [operation_id.as_str()],
-                )
-                .map_err(|source| sqlite_error(StorageErrorKind::OperationFailed, source))?,
-        )?;
+        if parsed_action_status != SetupActionStatus::Completed {
+            require_one_transition(
+                transaction
+                    .execute(
+                        "UPDATE setup_actions
+                         SET status = 'started',
+                             started_at = coalesce(started_at, ?2),
+                             finished_at = NULL,
+                             recovery_hint = NULL
+                         WHERE run_id = ?1
+                           AND action_id = 'bootstrap-handoff'
+                           AND status = ?3",
+                        params![operation_id.as_str(), acquired_at, action_status],
+                    )
+                    .map_err(|source| sqlite_error(StorageErrorKind::OperationFailed, source))?,
+            )?;
+        }
         require_one_transition(
             transaction
                 .execute(

@@ -20,7 +20,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Condvar, Mutex, mpsc};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use tokio_tungstenite::tungstenite::Error as WebSocketError;
 use tokio_tungstenite::tungstenite::error::ProtocolError;
 
@@ -591,14 +591,10 @@ fn persisted_pending_setup_token_self_activates_on_the_running_daemon() {
         })
     ));
 
-    let verification = verify_durable_setup_token_with_launch(
+    let verification = verify_durable_setup_token(
         &pending_client,
         interrupted_id.clone(),
         "interrupted-setup-activate",
-        "remote",
-        || -> Result<(), SatelleError> {
-            panic!("recovery must use the daemon that already owns the state store")
-        },
     )
     .expect("activate the persisted pending token on the running daemon");
     assert_eq!(verification, ExistingTokenVerification::ActivatedPending);
@@ -635,129 +631,72 @@ fn persisted_pending_setup_token_self_activates_on_the_running_daemon() {
 }
 
 #[test]
-fn durable_verification_relaunches_after_an_established_tunnel_closes() {
-    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("bind loopback test tunnel");
-    let address = listener.local_addr().expect("read loopback test address");
-    let token = ApiBearerToken::generate().expect("generate durable test token");
-    let token_id = token.token_id().to_string();
-    let response_token_id = token_id.clone();
-    let (launch_sender, launch_receiver) = mpsc::channel();
-    let probe_running = Arc::new(AtomicBool::new(false));
-    let server_probe_running = Arc::clone(&probe_running);
-
-    let tunnel = thread::spawn(move || {
-        fn read_request_headers(stream: &mut std::net::TcpStream) -> String {
-            stream
-                .set_read_timeout(Some(Duration::from_secs(2)))
-                .expect("bound request read timeout");
-            let mut request = Vec::new();
-            while !request.ends_with(b"\r\n\r\n") {
-                let mut chunk = [0_u8; 1024];
-                let count = stream.read(&mut chunk).expect("read test request");
-                assert_ne!(count, 0, "request closed before its headers completed");
-                request.extend_from_slice(&chunk[..count]);
-            }
-            String::from_utf8(request).expect("HTTP request headers are UTF-8")
-        }
-
-        // Model an SSH local forwarder whose remote connection is refused:
-        // the local TCP connection succeeds, but no valid HTTP response is
-        // possible. Returning bytes prevents the HTTP client from retrying
-        // this idempotent GET before Satelle can relaunch the daemon.
-        listener
-            .set_nonblocking(true)
-            .expect("poll forwarded requests and launch signal");
-        let deadline = Instant::now() + Duration::from_secs(5);
-        loop {
-            match launch_receiver.try_recv() {
-                Ok(()) => break,
-                Err(mpsc::TryRecvError::Empty) => {}
-                Err(mpsc::TryRecvError::Disconnected) => {
-                    panic!("durable daemon relaunch sender disconnected")
-                }
-            }
-            match listener.accept() {
-                Ok((mut stream, _)) => {
-                    let _request = read_request_headers(&mut stream);
-                    stream
-                        .write_all(b"remote daemon refused the forwarded connection\r\n")
-                        .expect("write invalid forwarded response");
-                }
-                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                    thread::sleep(Duration::from_millis(5));
-                }
-                Err(error) => panic!("accept forwarded request: {error}"),
-            }
-            assert!(
-                Instant::now() < deadline,
-                "durable daemon relaunch must be requested"
-            );
-        }
-        listener
-            .set_nonblocking(false)
-            .expect("accept relaunched request");
-        let (mut stream, _) = listener.accept().expect("accept relaunched request");
-        assert!(
-            server_probe_running.load(Ordering::SeqCst),
-            "the launched probe must remain alive through token verification"
+fn durable_verification_and_bootstrap_handoff_use_distinct_clients() {
+    let state = TestStateDir::new().expect("temporary state directory");
+    let bootstrap_token = ApiBearerToken::generate().expect("generate bootstrap token");
+    let service = HostService::local_demo_for_tests_at(state.path())
+        .expect("construct Host service")
+        .with_ssh_bootstrap_auth_for_tests(
+            &bootstrap_token,
+            ApiScopes::READ,
+            time::OffsetDateTime::now_utc() + time::Duration::minutes(5),
         );
-        let request = read_request_headers(&mut stream);
-        let request_id = request
-            .lines()
-            .find_map(|line| {
-                line.split_once(':').and_then(|(name, value)| {
-                    name.eq_ignore_ascii_case("Satelle-Request-Id")
-                        .then(|| value.trim())
-                })
-            })
-            .expect("authenticated request carries a request ID");
-        let body = format!(
-            "{{\"schema_version\":\"satelle.setup-api-token-confirmation.v1\",\"request_id\":\"{request_id}\",\"host_identity\":\"host-setup-test\",\"token_id\":\"{response_token_id}\",\"setup_active\":true,\"control_scoped\":true}}"
-        );
-        write!(
-            stream,
-            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-            body.len(),
-            body
+    let initialized = service.initialize_daemon().expect("initialize Host state");
+    let host_identity = initialized.host_identity().to_string();
+    let (durable_token, durable_principal) = service
+        .issue_pending_api_token(
+            ApiScopes::CONTROL,
+            time::OffsetDateTime::now_utc() + time::Duration::minutes(5),
         )
-        .expect("write relaunched daemon response");
-    });
+        .expect("issue pending durable setup token");
+    let durable_token_id = durable_principal.token_id().to_string();
+    service
+        .activate_api_token(&durable_token_id)
+        .expect("activate durable setup token");
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .expect("construct daemon runtime");
+    let server = runtime
+        .block_on(DaemonServer::bind(
+            service,
+            DaemonServerConfig::loopback(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))),
+        ))
+        .expect("bind loopback daemon");
+    let address = server.local_addr();
+    let bootstrap_client = DaemonClient::loopback(address, bootstrap_token, &host_identity)
+        .expect("construct operation-bound bootstrap client");
+    let durable_client = DaemonClient::loopback(address, durable_token, &host_identity)
+        .expect("construct durable verification client");
 
-    let client = DaemonClient::loopback_with_timeout(
-        address,
-        token,
-        "host-setup-test",
-        Duration::from_secs(2),
+    let verification = verify_durable_setup_token(
+        &durable_client,
+        durable_token_id,
+        "verify-distinct-client-authority",
     )
-    .expect("construct loopback durable client");
-    struct ProbeGuard(Arc<AtomicBool>);
+    .expect("durable client verifies its durable credential");
+    assert_eq!(verification, ExistingTokenVerification::Reusable);
 
-    impl Drop for ProbeGuard {
-        fn drop(&mut self) {
-            self.0.store(false, Ordering::SeqCst);
-        }
-    }
+    let durable_handoff_error = durable_client
+        .begin_bootstrap_maintenance("distinct-client-handoff", "missing_daemon_repair")
+        .expect_err("durable client cannot begin bootstrap maintenance");
+    assert!(matches!(
+        durable_handoff_error,
+        DaemonClientError::Api { error, .. }
+            if error.code() == ApiErrorCode::AuthorizationInsufficientScope
+    ));
 
-    let mut launch_count = 0;
-    verify_durable_setup_token_with_launch(
-        &client,
-        token_id,
-        "relaunch-activation",
-        "remote",
-        || -> Result<ProbeGuard, SatelleError> {
-            launch_count += 1;
-            probe_running.store(true, Ordering::SeqCst);
-            launch_sender.send(()).expect("signal daemon relaunch");
-            Ok(ProbeGuard(Arc::clone(&probe_running)))
-        },
-    )
-    .expect("retry durable verification after relaunch");
-    assert_eq!(launch_count, 1);
-    assert!(
-        !probe_running.load(Ordering::SeqCst),
-        "the verification probe must stop before recovery can bootstrap"
-    );
-    tunnel.join().expect("test tunnel exits cleanly");
+    let begun = bootstrap_client
+        .begin_bootstrap_maintenance("distinct-client-handoff", "missing_daemon_repair")
+        .expect("bootstrap client begins maintenance");
+    assert!(begun.reconciled());
+    let completed = bootstrap_client
+        .complete_bootstrap_maintenance("distinct-client-handoff")
+        .expect("bootstrap client completes maintenance");
+    assert!(completed.reconciled());
+
+    drop(server);
 }
 
 #[test]

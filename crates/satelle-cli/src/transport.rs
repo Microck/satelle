@@ -1006,47 +1006,33 @@ impl SshSetupTransport {
             .map_err(|error| SatelleError::config_error(error.to_string(), None))?;
         let token_id = http_token.token_id().to_string();
         let activation_idempotency_key = Uuid::now_v7().to_string();
-        let tunnel = SshTunnel::open(self.binding.destination()).map_err(|error| match error {
-            ssh_tunnel::SshTunnelError::HostKeyVerificationRequired => {
-                SatelleError::ssh_host_key_verification_required(&self.alias)
-            }
-            _ => SatelleError::host_unreachable(&self.alias),
-        })?;
-        let client = DaemonClient::loopback_with_timeout(
+        let (bootstrap_client, tunnel, _bootstrap) = setup_bootstrap_client(
+            &self.alias,
+            self.binding.destination(),
+            &self.binding.expected_host_identity().to_string(),
+            &self.host_config,
+            host_config,
+            SshBootstrapScope::Read,
+            bootstrap_lock,
+        )?;
+        let durable_client = DaemonClient::loopback_with_timeout(
             tunnel.local_addr(),
             http_token,
             self.binding.expected_host_identity().to_string(),
             SSH_DAEMON_REQUEST_TIMEOUT,
         )
         .map_err(|error| direct_transport_error(&self.alias, error))?;
-        let bootstrap_token =
-            ApiBearerToken::generate().map_err(|_| SatelleError::host_unreachable(&self.alias))?;
         bootstrap_lock
             .mark_mutation_started("durable_token_verification")
             .map_err(|_| SatelleError::host_unreachable(&self.alias))?;
-        let verification = verify_durable_setup_token_with_launch(
-            &client,
-            token_id,
-            &activation_idempotency_key,
-            &self.alias,
-            || {
-                // If no daemon is listening, a foreground admin bootstrap owns
-                // the store while this token is verified or recovered.
-                SshBootstrapProcess::launch(
-                    self.binding.destination(),
-                    &bootstrap_token,
-                    host_config,
-                    SshBootstrapScope::Admin,
-                    bootstrap_lock,
-                )
-                .map_err(|error| map_ssh_daemon_bootstrap_error(&self.alias, error))
-            },
-        )?;
+        let verification =
+            verify_durable_setup_token(&durable_client, token_id, &activation_idempotency_key)
+                .map_err(|error| direct_transport_error(&self.alias, error))?;
         if !matches!(
             verification,
             ExistingTokenVerification::AuthenticationRejected { .. }
         ) {
-            complete_bootstrap_handoff(&self.alias, &client, bootstrap_lock)?;
+            complete_bootstrap_handoff(&self.alias, &bootstrap_client, bootstrap_lock)?;
         }
         Ok(verification)
     }
@@ -1065,9 +1051,9 @@ impl SshSetupTransport {
             &self.alias,
             self.binding.destination(),
             &self.binding.expected_host_identity().to_string(),
-            admission_request_timeout(&self.host_config),
             &self.host_config,
             host_config,
+            SshBootstrapScope::Admin,
             bootstrap_lock,
         )?;
         rollback_setup_token(
@@ -1092,9 +1078,9 @@ impl SshSetupTransport {
             &self.alias,
             self.binding.destination(),
             &self.binding.expected_host_identity().to_string(),
-            admission_request_timeout(&self.host_config),
             &self.host_config,
             host_config,
+            SshBootstrapScope::Admin,
             bootstrap_lock,
         )?;
         let issuance_idempotency_key = Uuid::now_v7().to_string();
@@ -1298,25 +1284,6 @@ fn verify_durable_setup_token(
             }
         }
         Err(error) => Err(error),
-    }
-}
-
-fn verify_durable_setup_token_with_launch<T>(
-    client: &DaemonClient,
-    token_id: String,
-    activation_idempotency_key: &str,
-    host: &str,
-    launch: impl FnOnce() -> Result<T, SatelleError>,
-) -> Result<ExistingTokenVerification, SatelleError> {
-    match verify_durable_setup_token(client, token_id.clone(), activation_idempotency_key) {
-        Ok(verification) => Ok(verification),
-        Err(DaemonClientError::Transport(_)) => {
-            let _probe = launch()?;
-            wait_for_durable_daemon(host, || {
-                verify_durable_setup_token(client, token_id.clone(), activation_idempotency_key)
-            })
-        }
-        Err(error) => Err(direct_transport_error(host, error)),
     }
 }
 
@@ -1805,23 +1772,40 @@ fn durable_ssh_clients(
     )?;
     confirm_bootstrap_lock(alias, &mut bootstrap_lock)?;
     match client.capabilities() {
-        Ok(_) => {}
+        Ok(_) => {
+            bootstrap_lock
+                .release_unmodified()
+                .map_err(|_| SatelleError::host_unreachable(alias))?;
+        }
         Err(DaemonClientError::Transport(_)) => {
+            let bootstrap_token =
+                ApiBearerToken::generate().map_err(|_| SatelleError::host_unreachable(alias))?;
+            let raw_bootstrap_token = bootstrap_token.expose();
             SshBootstrapProcess::launch_durable(
                 destination,
+                &bootstrap_token,
                 on_demand_idle_timeout(host_config),
                 host_config,
                 &mut bootstrap_lock,
             )
             .map_err(|error| map_ssh_daemon_bootstrap_error(alias, error))?;
             wait_for_durable_daemon(alias, || client.capabilities())?;
+            let bootstrap_token = ApiBearerToken::parse(raw_bootstrap_token.as_str())
+                .map_err(|_| SatelleError::host_unreachable(alias))?;
+            let bootstrap_client = DaemonClient::loopback_with_timeout(
+                tunnel_addr,
+                bootstrap_token,
+                expected_host_identity,
+                SSH_DAEMON_REQUEST_TIMEOUT,
+            )
+            .map_err(|error| direct_transport_error(alias, error))?;
+            complete_bootstrap_handoff(alias, &bootstrap_client, &mut bootstrap_lock)?;
+            bootstrap_lock
+                .release_after_handoff()
+                .map_err(|_| SatelleError::host_unreachable(alias))?;
         }
         Err(error) => return Err(direct_transport_error(alias, error)),
     }
-    complete_bootstrap_handoff(alias, &client, &mut bootstrap_lock)?;
-    bootstrap_lock
-        .release_after_handoff()
-        .map_err(|_| SatelleError::host_unreachable(alias))?;
     let event_client =
         DaemonEventClient::loopback(tunnel_addr, event_token, expected_host_identity)
             .map_err(|error| direct_event_error(alias, error))?;
@@ -2004,9 +1988,9 @@ fn setup_bootstrap_client(
     alias: &str,
     destination: &str,
     expected_host_identity: &str,
-    admission_timeout: Duration,
     previous_host_config: &satelle_core::HostConfig,
     host_config: &satelle_core::HostConfig,
+    bootstrap_scope: SshBootstrapScope,
     bootstrap_lock: &mut ssh_bootstrap::SshBootstrapLock,
 ) -> Result<(Arc<DaemonClient>, SshTunnel, SshBootstrapProcess), SatelleError> {
     let bootstrap_token =
@@ -2020,7 +2004,7 @@ fn setup_bootstrap_client(
         &bootstrap_token,
         host_config,
         previous_host_config,
-        SshBootstrapScope::Admin,
+        bootstrap_scope,
         bootstrap_lock,
     )
     .map_err(|error| map_ssh_daemon_bootstrap_error(alias, error))?;
@@ -2041,7 +2025,7 @@ fn setup_bootstrap_client(
             SSH_DAEMON_REQUEST_TIMEOUT,
         )
         .map_err(|error| direct_transport_error(alias, error))?
-        .with_admission_timeout(admission_timeout),
+        .with_admission_timeout(admission_request_timeout(previous_host_config)),
     );
     Ok((client, tunnel, bootstrap))
 }
@@ -2484,9 +2468,9 @@ pub(crate) fn discover_ssh_host_identity(
         &host.alias,
         binding.destination(),
         &probe_identity,
-        admission_request_timeout(&host.config),
         &host.config,
         &selected_host_config,
+        SshBootstrapScope::Admin,
         &mut bootstrap_lock,
     )?;
     let identity = client

@@ -1579,6 +1579,8 @@ async fn read_scoped_ssh_bootstrap_can_handoff_maintenance_without_setup_authori
     tokio::task::spawn_blocking(move || {
         const MAINTENANCE_PRINCIPAL_REQUIRED: &str =
             "bootstrap maintenance requires an SSH bootstrap principal";
+        const ADMIN_BOOTSTRAP_REQUIRED: &str =
+            "durable setup credentials require an admin-scoped SSH bootstrap principal";
 
         let assert_insufficient_scope =
             |error: DaemonClientError, action: &str, expected_message: Option<&str>| match error {
@@ -1647,7 +1649,7 @@ async fn read_scoped_ssh_bootstrap_can_handoff_maintenance_without_setup_authori
         assert_insufficient_scope(
             setup_error,
             "read-scoped SSH bootstrap setup-token issuance",
-            None,
+            Some(ADMIN_BOOTSTRAP_REQUIRED),
         );
 
         let durable_read_client =

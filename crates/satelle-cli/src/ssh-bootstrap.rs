@@ -36,6 +36,22 @@ const BOOTSTRAP_LOCK_EXIT_GRACE: Duration = Duration::from_millis(500);
 const BOOTSTRAP_LOCK_EXIT_POLL: Duration = Duration::from_millis(10);
 const RELEASE_BASE_URL: &str = "https://github.com/Microck/satelle/releases/download";
 const CACHE_CLEANUP_PROTOCOL: &str = "satelle-cache-cleanup-v1";
+const POSIX_CACHE_DIRECTORY_GUARD: &str = r#"safe_cache_directory() {
+  expected_root=$1
+  expected_directory=$2
+  case "$expected_directory" in "$expected_root"|"$expected_root"/*) ;; *) return 1;; esac
+  current=$expected_root
+  suffix=${expected_directory#"$expected_root"}
+  while :; do
+    [ ! -L "$current" ] || return 1
+    if [ -e "$current" ]; then [ -d "$current" ] || return 1; fi
+    [ -z "$suffix" ] && return 0
+    suffix=${suffix#/}
+    component=${suffix%%/*}
+    current=$current/$component
+    if [ "$suffix" = "$component" ]; then suffix=; else suffix=${suffix#*/}; fi
+  done
+}"#;
 const DAEMON_PATH_ENVIRONMENT_VARIABLES: [&str; 5] = [
     "SATELLE_HOME",
     "SATELLE_CONFIG_FILE",
@@ -287,6 +303,13 @@ impl SshBootstrapLock {
         self.exchange_lock_line(bootstrap_lock::RELEASE.to_string())
     }
 
+    pub(super) fn release_unmodified(&mut self) -> Result<(), SshBootstrapError> {
+        if self.mutation_phase.is_some() || self.mutation_attempt.is_some() {
+            return Err(SshBootstrapError::BootstrapLockLost);
+        }
+        self.exchange_lock_line(bootstrap_lock::RELEASE.to_string())
+    }
+
     pub(super) fn commit_current_mutation(&mut self) -> Result<(), SshBootstrapError> {
         let phase = self
             .mutation_phase
@@ -466,6 +489,7 @@ impl SshBootstrapProcess {
 
     pub(super) fn launch_durable(
         destination: &str,
+        token: &ApiBearerToken,
         idle_timeout: Duration,
         host_config: &HostConfig,
         bootstrap_lock: &mut SshBootstrapLock,
@@ -489,7 +513,11 @@ impl SshBootstrapProcess {
             maintenance,
         );
         let command = bootstrap_lock.fenced_command(target, "daemon_start", &command)?;
-        require_success(run_fenced_ssh_command(destination, &command, None)?)
+        require_success(run_fenced_ssh_command(
+            destination,
+            &command,
+            Some(FencedMutationInput::BootstrapToken(token)),
+        )?)
     }
 
     fn spawn(
@@ -857,7 +885,8 @@ if ((Get-FileHash -Algorithm SHA256 -LiteralPath {staged}).Hash.ToLowerInvariant
             ));
         }
         let script = format!(
-            "set -eu; umask 077; path={}; expected={}; cat >\"$path\"; if command -v sha256sum >/dev/null 2>&1; then actual=$(sha256sum \"$path\" | awk '{{print $1}}'); elif command -v shasum >/dev/null 2>&1; then actual=$(shasum -a 256 \"$path\" | awk '{{print $1}}'); else actual=$(openssl dgst -sha256 \"$path\" | awk '{{print $NF}}'); fi; [ \"$actual\" = \"$expected\" ]",
+            "set -eu\numask 077\n{POSIX_CACHE_DIRECTORY_GUARD}\nroot={}\npath={}\nexpected={}\ndirectory=${{path%/*}}\nsafe_cache_directory \"$root\" \"$directory\"\n[ ! -e \"$path\" ] && [ ! -L \"$path\" ] || exit 1\nset -C\ncat >\"$path\"\nif command -v sha256sum >/dev/null 2>&1; then actual=$(sha256sum \"$path\" | awk '{{print $1}}'); elif command -v shasum >/dev/null 2>&1; then actual=$(shasum -a 256 \"$path\" | awk '{{print $1}}'); else actual=$(openssl dgst -sha256 \"$path\" | awk '{{print $NF}}'); fi\n[ \"$actual\" = \"$expected\" ]",
+            posix_quote(self.remote_cache_root()),
             posix_quote(staged),
             posix_quote(digest),
         );
@@ -895,9 +924,9 @@ if ((Get-FileHash -Algorithm SHA256 -LiteralPath {staged}).Hash.ToLowerInvariant
             powershell_encoded_command(&script)
         } else {
             let script = format!(
-                "set -eu; umask 077; directory={}; root={}; mkdir -p \"$directory\"; current=\"$directory\"; while :; do chmod 700 \"$current\"; [ \"$current\" = \"$root\" ] && break; current=\"${{current%/*}}\"; done",
-                posix_quote(directory),
+                "set -eu\numask 077\n{POSIX_CACHE_DIRECTORY_GUARD}\nroot={}\ndirectory={}\nsafe_cache_directory \"$root\" \"$directory\"\nmkdir -p \"$directory\"\nsafe_cache_directory \"$root\" \"$directory\"\ncurrent=\"$directory\"\nwhile :; do chmod 700 \"$current\"; [ \"$current\" = \"$root\" ] && break; current=\"${{current%/*}}\"; done",
                 posix_quote(self.remote_cache_root()),
+                posix_quote(directory),
             );
             format!("sh -c {}", posix_quote(&script))
         }
@@ -921,7 +950,13 @@ if ((Get-FileHash -Algorithm SHA256 -LiteralPath {staged}).Hash.ToLowerInvariant
             );
             powershell_encoded_command(&script)
         } else {
-            format!("sh -c 'mv -f {staged} {final_path} && chmod 700 {final_path}'")
+            let script = format!(
+                "set -eu\n{POSIX_CACHE_DIRECTORY_GUARD}\nroot={}\nstaged={}\nfinal_path={}\nstaged_directory=${{staged%/*}}\nfinal_directory=${{final_path%/*}}\nsafe_cache_directory \"$root\" \"$staged_directory\"\nsafe_cache_directory \"$root\" \"$final_directory\"\n[ -f \"$staged\" ] && [ ! -L \"$staged\" ] || exit 1\n[ ! -L \"$final_path\" ] || exit 1\nmv -f \"$staged\" \"$final_path\"",
+                posix_quote(self.remote_cache_root()),
+                posix_quote(staged),
+                posix_quote(final_path),
+            );
+            format!("sh -c {}", posix_quote(&script))
         }
     }
 
@@ -948,12 +983,15 @@ if ((Get-FileHash -Algorithm SHA256 -LiteralPath {staged}).Hash.ToLowerInvariant
         } else {
             let script = format!(
                 concat!(
-                    "path={path}; root={root}; current=\"$path\"; uid=$(id -u); ",
+                    "path={path}; root={root}; uid=$(id -u); ",
                     "test -f \"$path\" && test ! -L \"$path\" || exit 1; ",
-                    "while :; do test ! -L \"$current\" || exit 1; ",
+                    "owner=$(stat -c %u \"$path\" 2>/dev/null || stat -f %u \"$path\") || exit 1; ",
+                    "mode=$(stat -c %a \"$path\" 2>/dev/null || stat -f %Lp \"$path\") || exit 1; ",
+                    "[ \"$owner\" = \"$uid\" ] || exit 1; case \"$mode\" in 500|700) ;; *) exit 1;; esac; ",
+                    "current=\"${{path%/*}}\"; while :; do test -d \"$current\" && test ! -L \"$current\" || exit 1; ",
                     "owner=$(stat -c %u \"$current\" 2>/dev/null || stat -f %u \"$current\") || exit 1; ",
                     "mode=$(stat -c %a \"$current\" 2>/dev/null || stat -f %Lp \"$current\") || exit 1; ",
-                    "[ \"$owner\" = \"$uid\" ] || exit 1; case \"$mode\" in *00) ;; *) exit 1;; esac; ",
+                    "[ \"$owner\" = \"$uid\" ] && [ \"$mode\" = 700 ] || exit 1; ",
                     "[ \"$current\" = \"$root\" ] && break; current=\"${{current%/*}}\"; ",
                     "[ -n \"$current\" ] || exit 1; done",
                 ),
@@ -1126,7 +1164,12 @@ printf 'removed=%s\nretained=%s\n' "$removed" "$retained""#,
             );
             Some(powershell_encoded_command(&script))
         } else {
-            Some(format!("sh -c 'chmod 700 {staged}'"))
+            let script = format!(
+                "set -eu\n{POSIX_CACHE_DIRECTORY_GUARD}\nroot={}\npath={}\ndirectory=${{path%/*}}\nsafe_cache_directory \"$root\" \"$directory\"\n[ -f \"$path\" ] && [ ! -L \"$path\" ] || exit 1\nchmod 700 \"$path\"",
+                posix_quote(self.remote_cache_root()),
+                posix_quote(staged),
+            );
+            Some(format!("sh -c {}", posix_quote(&script)))
         }
     }
 
@@ -1354,7 +1397,8 @@ printf 'removed=%s\nretained=%s\n' "$removed" "$retained""#,
             )
         });
         let timeout_args = format!(
-            "--on-demand-idle-timeout-ms {} --bootstrap-native-readiness-timeout-ms {} --bootstrap-provider-smoke-timeout-ms {}{maintenance_args}",
+            "--bootstrap-token-stdin --bootstrap-scope {} --on-demand-idle-timeout-ms {} --bootstrap-native-readiness-timeout-ms {} --bootstrap-provider-smoke-timeout-ms {}{maintenance_args}",
+            SshBootstrapScope::Read.as_cli_value(),
             idle_timeout.as_millis(),
             native_timeout.as_millis(),
             provider_timeout.as_millis(),
@@ -1363,15 +1407,15 @@ printf 'removed=%s\nretained=%s\n' "$removed" "$retained""#,
             let script = format!(
                 concat!(
                     "{}$binary = (Resolve-Path -LiteralPath {}).Path; ",
-                    "$command = '\"' + $binary + '\" host start {} --json'; ",
-                    "$environment = [System.Environment]::GetEnvironmentVariables('Process')",
-                    ".GetEnumerator() | ForEach-Object {{ \"$($_.Key)=$($_.Value)\" }}; ",
-                    "$startup = New-CimInstance -ClassName Win32_ProcessStartup -ClientOnly ",
-                    "-Property @{{ EnvironmentVariables = @($environment) }}; ",
-                    "$created = Invoke-CimMethod -ClassName Win32_Process -MethodName Create ",
-                    "-Arguments @{{ CommandLine = $command; ",
-                    "ProcessStartupInformation = $startup }}; ",
-                    "if ($created.ReturnValue -ne 0) {{ exit $created.ReturnValue }}"
+                    "$startInfo = New-Object System.Diagnostics.ProcessStartInfo; ",
+                    "$startInfo.FileName = $binary; $startInfo.Arguments = 'host start {} --json'; ",
+                    "$startInfo.UseShellExecute = $false; $startInfo.CreateNoWindow = $true; ",
+                    "$startInfo.RedirectStandardInput = $true; ",
+                    "$process = New-Object System.Diagnostics.Process; $process.StartInfo = $startInfo; ",
+                    "if (-not $process.Start()) {{ exit 1 }}; ",
+                    "$token = [Console]::In.ReadLine(); ",
+                    "if ([String]::IsNullOrEmpty($token)) {{ $process.Kill(); exit 1 }}; ",
+                    "$process.StandardInput.WriteLine($token); $process.StandardInput.Close()"
                 ),
                 powershell_environment(environment),
                 powershell_quote(remote_binary),
@@ -1380,7 +1424,7 @@ printf 'removed=%s\nretained=%s\n' "$removed" "$retained""#,
             powershell_encoded_command(&script)
         } else {
             let script = format!(
-                "{}nohup {remote_binary} host start {timeout_args} --json </dev/null >/dev/null 2>&1 &",
+                "{}exec 3<&0; nohup {remote_binary} host start {timeout_args} --json <&3 3<&- >/dev/null 2>&1 & exec 3<&-",
                 posix_environment(environment),
             );
             format!("sh -c {}", posix_quote(&script))
@@ -1948,7 +1992,11 @@ fn stage_artifact_with_digest(
         "cache_upload",
         &target.upload_command(&staged, &local_digest_hex),
     )?;
-    let copy = run_fenced_ssh_command(destination, &command, Some(input))?;
+    let copy = run_fenced_ssh_command(
+        destination,
+        &command,
+        Some(FencedMutationInput::Artifact(input)),
+    )?;
     require_success(copy)?;
 
     let remote_digest = run_ssh_command(destination, &target.digest_command(&staged))?;
@@ -2005,6 +2053,11 @@ struct CommandOutput {
     stderr: SshStderrClassification,
 }
 
+enum FencedMutationInput<'a> {
+    Artifact(File),
+    BootstrapToken(&'a ApiBearerToken),
+}
+
 fn run_ssh_command(
     destination: &str,
     remote_command: &str,
@@ -2031,7 +2084,7 @@ fn run_ssh_command_with_output_limit(
 fn run_fenced_ssh_command(
     destination: &str,
     remote_command: &str,
-    mut input: Option<File>,
+    mut input: Option<FencedMutationInput<'_>>,
 ) -> Result<CommandOutput, SshBootstrapError> {
     let mut child = Command::new("ssh")
         .arg("-T")
@@ -2066,12 +2119,13 @@ fn run_fenced_ssh_command(
         .stdin
         .take()
         .expect("fenced SSH stdin was configured as piped");
-    let input_result = writeln!(stdin, "{MUTATION_EXECUTE}").and_then(|()| {
-        if let Some(input) = input.as_mut() {
-            io::copy(input, &mut stdin).map(drop)
-        } else {
-            Ok(())
+    let input_result = writeln!(stdin, "{MUTATION_EXECUTE}").and_then(|()| match input.as_mut() {
+        Some(FencedMutationInput::Artifact(input)) => io::copy(input, &mut stdin).map(drop),
+        Some(FencedMutationInput::BootstrapToken(token)) => {
+            let raw_token = token.expose();
+            writeln!(stdin, "{}", raw_token.as_str())
         }
+        None => Ok(()),
     });
     if let Err(error) = input_result {
         let error = terminate_child(&mut child, SshBootstrapError::WriteMutationInput(error));
@@ -2403,6 +2457,27 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    fn run_posix_cache_command(home: &Path, command: &str, input: Option<&[u8]>) -> ExitStatus {
+        let mut child = Command::new("sh")
+            .arg("-c")
+            .arg(command)
+            .current_dir(home)
+            .stdin(Stdio::piped())
+            .spawn()
+            .expect("run POSIX cache command");
+        if let Some(input) = input {
+            child
+                .stdin
+                .as_mut()
+                .expect("piped cache command stdin")
+                .write_all(input)
+                .expect("write cache command input");
+        }
+        drop(child.stdin.take());
+        child.wait().expect("wait for POSIX cache command")
+    }
+
     #[test]
     fn windows_promotes_to_a_reusable_content_addressed_executable() {
         let digest = [0x1a; 32];
@@ -2469,6 +2544,164 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn posix_directory_creation_rejects_a_symlinked_cache_root_without_outside_mutation() {
+        let home = tempfile::tempdir().expect("temporary remote home");
+        let outside = tempfile::tempdir().expect("outside directory");
+        fs::create_dir_all(home.path().join(".cache/satelle")).expect("create cache parent");
+        fs::set_permissions(outside.path(), fs::Permissions::from_mode(0o755))
+            .expect("set outside permissions");
+        symlink(outside.path(), home.path().join(".cache/satelle/host"))
+            .expect("symlink cache root");
+
+        let command = RemoteTarget::LinuxX64Gnu
+            .create_directory_command(&RemoteTarget::LinuxX64Gnu.remote_directory());
+        assert!(!run_posix_cache_command(home.path(), &command, None).success());
+        assert!(
+            !outside
+                .path()
+                .join(format!("v{}/linux-x64-gnu", env!("CARGO_PKG_VERSION")))
+                .exists()
+        );
+        assert_eq!(
+            fs::metadata(outside.path())
+                .expect("outside metadata")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o755
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn posix_staging_chmod_rejects_a_symlinked_version_without_outside_mutation() {
+        let home = tempfile::tempdir().expect("temporary remote home");
+        let outside = tempfile::tempdir().expect("outside version directory");
+        let cache_root = home.path().join(".cache/satelle/host");
+        fs::create_dir_all(&cache_root).expect("create cache root");
+        fs::set_permissions(&cache_root, fs::Permissions::from_mode(0o700))
+            .expect("secure cache root");
+        let target = outside.path().join("linux-x64-gnu");
+        fs::create_dir(&target).expect("create outside target");
+        let outside_staged = target.join(".satelle-upload-test");
+        fs::write(&outside_staged, b"outside").expect("write outside staged file");
+        fs::set_permissions(&outside_staged, fs::Permissions::from_mode(0o600))
+            .expect("set outside staged permissions");
+        symlink(
+            outside.path(),
+            cache_root.join(format!("v{}", env!("CARGO_PKG_VERSION"))),
+        )
+        .expect("symlink cache version");
+
+        let staged = format!(
+            "{}/.satelle-upload-test",
+            RemoteTarget::LinuxX64Gnu.remote_directory()
+        );
+        let command = RemoteTarget::LinuxX64Gnu
+            .prepare_staged_command(&staged)
+            .expect("POSIX staging command");
+        assert!(!run_posix_cache_command(home.path(), &command, None).success());
+        assert_eq!(
+            fs::metadata(&outside_staged)
+                .expect("outside staged metadata")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+        assert_eq!(
+            fs::read(outside_staged).expect("read outside staged file"),
+            b"outside"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn posix_promotion_rejects_a_symlinked_target_directory_without_outside_mutation() {
+        let home = tempfile::tempdir().expect("temporary remote home");
+        let outside = tempfile::tempdir().expect("outside target directory");
+        let version = home.path().join(format!(
+            ".cache/satelle/host/v{}",
+            env!("CARGO_PKG_VERSION")
+        ));
+        fs::create_dir_all(&version).expect("create cache version");
+        for directory in [home.path().join(".cache/satelle/host"), version.clone()] {
+            fs::set_permissions(directory, fs::Permissions::from_mode(0o700))
+                .expect("secure cache directory");
+        }
+        let outside_staged = outside.path().join(".satelle-upload-test");
+        let outside_final = outside.path().join("satelle");
+        fs::write(&outside_staged, b"staged").expect("write outside staged file");
+        fs::write(&outside_final, b"final").expect("write outside final file");
+        symlink(outside.path(), version.join("linux-x64-gnu")).expect("symlink target directory");
+
+        let directory = RemoteTarget::LinuxX64Gnu.remote_directory();
+        let command = RemoteTarget::LinuxX64Gnu.promote_command(
+            &format!("{directory}/.satelle-upload-test"),
+            &format!("{directory}/satelle"),
+        );
+        assert!(!run_posix_cache_command(home.path(), &command, None).success());
+        assert_eq!(
+            fs::read(outside_staged).expect("read staged file"),
+            b"staged"
+        );
+        assert_eq!(fs::read(outside_final).expect("read final file"), b"final");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn posix_staged_leaf_symlinks_cannot_upload_chmod_or_promote_outside_the_cache() {
+        let home = tempfile::tempdir().expect("temporary remote home");
+        let outside = tempfile::tempdir().expect("outside directory");
+        let directory = home.path().join(format!(
+            ".cache/satelle/host/v{}/linux-x64-gnu",
+            env!("CARGO_PKG_VERSION")
+        ));
+        fs::create_dir_all(&directory).expect("create cache target");
+        for directory in [
+            home.path().join(".cache/satelle/host"),
+            home.path().join(format!(
+                ".cache/satelle/host/v{}",
+                env!("CARGO_PKG_VERSION")
+            )),
+            directory.clone(),
+        ] {
+            fs::set_permissions(directory, fs::Permissions::from_mode(0o700))
+                .expect("secure cache directory");
+        }
+        let outside_file = outside.path().join("artifact");
+        fs::write(&outside_file, b"outside").expect("write outside artifact");
+        let staged = format!(
+            "{}/.satelle-upload-test",
+            RemoteTarget::LinuxX64Gnu.remote_directory()
+        );
+        symlink(&outside_file, home.path().join(&staged)).expect("symlink staged artifact");
+
+        let upload = RemoteTarget::LinuxX64Gnu.upload_command(&staged, &"00".repeat(32));
+        assert!(!run_posix_cache_command(home.path(), &upload, Some(b"replacement")).success());
+        let chmod = RemoteTarget::LinuxX64Gnu
+            .prepare_staged_command(&staged)
+            .expect("POSIX staging command");
+        assert!(!run_posix_cache_command(home.path(), &chmod, None).success());
+        let promote = RemoteTarget::LinuxX64Gnu.promote_command(
+            &staged,
+            &format!("{}/satelle", RemoteTarget::LinuxX64Gnu.remote_directory()),
+        );
+        assert!(!run_posix_cache_command(home.path(), &promote, None).success());
+        assert_eq!(
+            fs::read(outside_file).expect("read outside artifact"),
+            b"outside"
+        );
+        assert!(
+            fs::symlink_metadata(home.path().join(staged))
+                .expect("staged symlink metadata")
+                .file_type()
+                .is_symlink()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn posix_cache_validation_rejects_links_types_and_broad_permissions() {
         let root = tempfile::tempdir().expect("temporary remote home");
         let directory = root.path().join(".cache/satelle/host/v1/linux-x64-gnu");
@@ -2496,6 +2729,13 @@ mod tests {
                 .expect("run cache validation")
                 .success()
         };
+        assert!(validate());
+
+        fs::set_permissions(&binary, fs::Permissions::from_mode(0o600))
+            .expect("remove execute permission");
+        assert!(!validate());
+        fs::set_permissions(&binary, fs::Permissions::from_mode(0o500))
+            .expect("set read and execute permissions");
         assert!(validate());
 
         fs::set_permissions(&binary, fs::Permissions::from_mode(0o720))
@@ -3092,6 +3332,7 @@ mod tests {
         let digest = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
         let posix = RemoteTarget::LinuxX64Gnu.upload_command("/tmp/staged", digest);
         assert!(posix.contains("cat >"));
+        assert!(posix.contains("set -C"));
         assert!(posix.contains(digest));
         assert!(!posix.contains("scp"));
 
@@ -3213,9 +3454,9 @@ mod tests {
             "SetEnvironmentVariable('SATELLE_STATE_DIR'",
             "$env:SATELLE_STATE_DIR =",
         );
-        assert!(detached_script.contains("Win32_ProcessStartup"));
-        assert!(detached_script.contains("EnvironmentVariables = @($environment)"));
-        assert!(detached_script.contains("ProcessStartupInformation = $startup"));
+        assert!(detached_script.contains("System.Diagnostics.ProcessStartInfo"));
+        assert!(detached_script.contains("RedirectStandardInput = $true"));
+        assert!(detached_script.contains("StandardInput.WriteLine($token)"));
         assert!(detached_script.contains("host start"));
     }
 
@@ -3234,10 +3475,11 @@ mod tests {
             concat!(
                 "sh -c 'unset SATELLE_HOME SATELLE_CONFIG_FILE SATELLE_STATE_DIR ",
                 "SATELLE_CACHE_DIR SATELLE_LOG_DIR; ",
-                "nohup /tmp/satelle host start --on-demand-idle-timeout-ms 75000 ",
+                "exec 3<&0; nohup /tmp/satelle host start --bootstrap-token-stdin ",
+                "--bootstrap-scope read --on-demand-idle-timeout-ms 75000 ",
                 "--bootstrap-native-readiness-timeout-ms 2500 ",
                 "--bootstrap-provider-smoke-timeout-ms 7500 --json ",
-                "</dev/null >/dev/null 2>&1 &'"
+                "<&3 3<&- >/dev/null 2>&1 & exec 3<&-'"
             )
         );
         let windows = RemoteTarget::WindowsX64Msvc.durable_start_command(
@@ -3249,8 +3491,11 @@ mod tests {
         let script = decode_powershell_command(&windows).expect("decode durable command");
         assert_powershell_clears_daemon_environment(&script);
         assert!(script.contains("--on-demand-idle-timeout-ms 75000"));
+        assert!(script.contains("--bootstrap-token-stdin"));
+        assert!(script.contains("--bootstrap-scope read"));
         assert!(script.contains("--bootstrap-native-readiness-timeout-ms 2500"));
         assert!(script.contains("--bootstrap-provider-smoke-timeout-ms 7500"));
-        assert!(script.contains("ProcessStartupInformation = $startup"));
+        assert!(script.contains("RedirectStandardInput = $true"));
+        assert!(script.contains("StandardInput.WriteLine($token)"));
     }
 }

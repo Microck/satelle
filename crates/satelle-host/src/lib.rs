@@ -109,6 +109,20 @@ mod operation_capacity_tests;
 mod bootstrap_maintenance_tests {
     use super::*;
 
+    fn bootstrap_plan(operation_id: &str, operation_kind: SetupOperationKind) -> SetupRunPlan {
+        SetupRunPlan::new(
+            operation_id,
+            operation_kind,
+            None,
+            time::OffsetDateTime::now_utc(),
+            vec![
+                SetupActionPlan::new("bootstrap-handoff", "Bootstrap Lock handoff", true)
+                    .expect("valid bootstrap action"),
+            ],
+        )
+        .expect("valid bootstrap plan")
+    }
+
     #[test]
     fn bootstrap_maintenance_is_idempotent_and_completes_durably() {
         let state = TestStateDir::new().expect("create state directory");
@@ -176,6 +190,119 @@ mod bootstrap_maintenance_tests {
         replacement
             .complete_bootstrap_maintenance("bootstrap-operation-recovery")
             .expect("complete adopted maintenance");
+    }
+
+    #[test]
+    fn replacement_adopts_a_handoff_crashed_before_action_start() {
+        let state = TestStateDir::new().expect("create state directory");
+        let operation_id = "bootstrap-operation-planned-recovery";
+        {
+            let original =
+                HostService::local_demo_for_tests_at(state.path()).expect("create original Host");
+            let _operation = original
+                .begin_setup_run(&bootstrap_plan(operation_id, SetupOperationKind::Repair))
+                .expect("persist setup run before action start");
+        }
+
+        let replacement =
+            HostService::local_demo_for_tests_at(state.path()).expect("create replacement Host");
+        replacement
+            .acquire_bootstrap_maintenance(operation_id, SetupOperationKind::Repair)
+            .expect("adopt planned bootstrap handoff");
+        replacement
+            .acquire_bootstrap_maintenance(operation_id, SetupOperationKind::Repair)
+            .expect("repeat adopted bootstrap handoff");
+        let adopted = replacement
+            .load_setup_run(operation_id)
+            .expect("load adopted setup run")
+            .expect("adopted setup run exists");
+        assert_eq!(SetupRunStatus::Running, adopted.status());
+        assert_eq!(SetupActionStatus::Started, adopted.actions()[0].status());
+
+        replacement
+            .complete_bootstrap_maintenance(operation_id)
+            .expect("complete adopted bootstrap handoff");
+        replacement
+            .complete_bootstrap_maintenance(operation_id)
+            .expect("repeat completed bootstrap handoff");
+    }
+
+    #[test]
+    fn replacement_adopts_a_handoff_crashed_after_action_completion() {
+        let state = TestStateDir::new().expect("create state directory");
+        let operation_id = "bootstrap-operation-completed-recovery";
+        {
+            let original =
+                HostService::local_demo_for_tests_at(state.path()).expect("create original Host");
+            let operation = original
+                .begin_setup_run(&bootstrap_plan(
+                    operation_id,
+                    SetupOperationKind::HostUpdate,
+                ))
+                .expect("persist setup run");
+            original
+                .start_setup_action(
+                    &operation,
+                    "bootstrap-handoff",
+                    time::OffsetDateTime::now_utc(),
+                )
+                .expect("start bootstrap handoff");
+            original
+                .complete_setup_action_after_verified_postcondition(
+                    &operation,
+                    "bootstrap-handoff",
+                    time::OffsetDateTime::now_utc(),
+                )
+                .expect("complete bootstrap handoff before crash");
+        }
+
+        let replacement =
+            HostService::local_demo_for_tests_at(state.path()).expect("create replacement Host");
+        replacement
+            .acquire_bootstrap_maintenance(operation_id, SetupOperationKind::HostUpdate)
+            .expect("adopt completed bootstrap handoff");
+        replacement
+            .acquire_bootstrap_maintenance(operation_id, SetupOperationKind::HostUpdate)
+            .expect("repeat adopted bootstrap handoff");
+        let adopted = replacement
+            .load_setup_run(operation_id)
+            .expect("load adopted setup run")
+            .expect("adopted setup run exists");
+        assert_eq!(SetupRunStatus::Running, adopted.status());
+        assert_eq!(SetupActionStatus::Completed, adopted.actions()[0].status());
+
+        replacement
+            .complete_bootstrap_maintenance(operation_id)
+            .expect("finish recovered completed handoff");
+        replacement
+            .complete_bootstrap_maintenance(operation_id)
+            .expect("repeat completed bootstrap handoff");
+    }
+
+    #[test]
+    fn active_bootstrap_retry_rejects_operation_kind_mismatch() {
+        let state = TestStateDir::new().expect("create state directory");
+        let service =
+            HostService::local_demo_for_tests_at(state.path()).expect("create Host service");
+        let operation_id = "bootstrap-operation-active-kind";
+        service
+            .acquire_bootstrap_maintenance(operation_id, SetupOperationKind::Repair)
+            .expect("acquire repair maintenance");
+        service
+            .acquire_bootstrap_maintenance(operation_id, SetupOperationKind::Repair)
+            .expect("same-kind active retry is idempotent");
+        assert!(
+            service
+                .acquire_bootstrap_maintenance(operation_id, SetupOperationKind::HostUpdate)
+                .is_err(),
+            "same operation id cannot change its persisted operation kind"
+        );
+        let run = service
+            .load_setup_run(operation_id)
+            .expect("load active setup run")
+            .expect("active setup run exists");
+        assert_eq!(SetupOperationKind::Repair, run.operation_kind());
+        assert_eq!(SetupRunStatus::Running, run.status());
     }
 }
 
@@ -285,23 +412,34 @@ impl HostService {
             .lock()
             .map_err(|_| SatelleError::state_conflict())?;
         if let Some(operation) = slot.as_ref() {
-            return if operation.operation_id() == operation_id {
+            if operation.operation_id() != operation_id {
+                return Err(SatelleError::state_conflict());
+            }
+            let run = self
+                .runtime
+                .load_setup_run(operation_id)?
+                .ok_or_else(SatelleError::state_conflict)?;
+            return if run.operation_kind() == operation_kind {
                 Ok(())
             } else {
                 Err(SatelleError::state_conflict())
             };
         }
-        if let Some(run) = self.runtime.load_setup_run(operation_id)?
-            && run.operation_kind() == operation_kind
-            && run.status() == SetupRunStatus::Completed
-            && run.actions().iter().any(|action| {
-                action.action_id() == "bootstrap-handoff"
-                    && action.status() == SetupActionStatus::Completed
-            })
-        {
-            return Ok(());
+        let existing_run = self.runtime.load_setup_run(operation_id)?;
+        if let Some(run) = existing_run.as_ref() {
+            if run.operation_kind() != operation_kind {
+                return Err(SatelleError::state_conflict());
+            }
+            if run.status() == SetupRunStatus::Completed
+                && run.actions().iter().any(|action| {
+                    action.action_id() == "bootstrap-handoff"
+                        && action.status() == SetupActionStatus::Completed
+                })
+            {
+                return Ok(());
+            }
         }
-        let operation = if self.runtime.load_setup_run(operation_id)?.is_some() {
+        let operation = if existing_run.is_some() {
             self.runtime.adopt_recovery_maintenance(operation_id)?
         } else {
             let action = SetupActionPlan::new("bootstrap-handoff", "Bootstrap Lock handoff", true)?;
@@ -349,12 +487,28 @@ impl HostService {
         if operation.operation_id() != operation_id {
             return Err(SatelleError::state_conflict());
         }
-        self.runtime
-            .complete_setup_action_after_verified_postcondition(
-                operation,
-                "bootstrap-handoff",
-                time::OffsetDateTime::now_utc(),
-            )?;
+        let run = self
+            .runtime
+            .load_setup_run(operation_id)?
+            .ok_or_else(SatelleError::state_conflict)?;
+        let action_status = run
+            .actions()
+            .iter()
+            .find(|action| action.action_id() == "bootstrap-handoff")
+            .map(SetupActionRecord::status)
+            .ok_or_else(SatelleError::state_conflict)?;
+        match action_status {
+            SetupActionStatus::Started => {
+                self.runtime
+                    .complete_setup_action_after_verified_postcondition(
+                        operation,
+                        "bootstrap-handoff",
+                        time::OffsetDateTime::now_utc(),
+                    )?;
+            }
+            SetupActionStatus::Completed => {}
+            _ => return Err(SatelleError::state_conflict()),
+        }
         self.runtime
             .finish_setup_run(operation, time::OffsetDateTime::now_utc())?;
         *slot = None;
