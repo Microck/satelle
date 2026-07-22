@@ -2,7 +2,6 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     fmt::Debug,
     fs,
-    io::Write,
     path::{Path, PathBuf},
     process::Output,
     sync::mpsc::{self, RecvTimeoutError},
@@ -163,8 +162,8 @@ struct DirectoryTreeEntry {
 const MUTATION_BARRIER_TIMEOUT: Duration = Duration::from_secs(5);
 
 struct MutationBarrier {
-    file: tempfile::NamedTempFile,
-    path: PathBuf,
+    path: tempfile::TempPath,
+    canonical_path: PathBuf,
 }
 
 impl MutationBarrier {
@@ -175,38 +174,39 @@ impl MutationBarrier {
             .unwrap_or_else(|error| {
                 panic!("{operation} could not create mutation watcher barrier: {error}")
             });
-        let path = fs::canonicalize(file.path()).unwrap_or_else(|error| {
+        let canonical_path = fs::canonicalize(file.path()).unwrap_or_else(|error| {
             panic!(
                 "{operation} could not resolve mutation watcher barrier {}: {error}",
                 file.path().display()
             )
         });
-        Self { file, path }
+        Self {
+            path: file.into_temp_path(),
+            canonical_path,
+        }
     }
 
     fn path(&self) -> &Path {
-        &self.path
+        &self.canonical_path
     }
 
-    fn signal(&mut self, operation: &str) {
-        self.file
-            .as_file_mut()
-            .write_all(b"ready")
-            .and_then(|()| self.file.as_file_mut().flush())
-            .unwrap_or_else(|error| {
-                panic!(
-                    "{operation} could not signal mutation watcher barrier {}: {error}",
-                    self.path.display()
-                )
-            });
+    fn signal(&self, operation: &str) {
+        // Opening and closing a fresh handle is required for Windows and macOS backends, which
+        // may defer the watched-file notification until the writing handle closes.
+        fs::write(&self.canonical_path, b"ready").unwrap_or_else(|error| {
+            panic!(
+                "{operation} could not signal mutation watcher barrier {}: {error}",
+                self.canonical_path.display()
+            )
+        });
     }
 
     fn remove(self, operation: &str) {
-        let path = self.path.clone();
-        self.file.close().unwrap_or_else(|error| {
+        let canonical_path = self.canonical_path.clone();
+        self.path.close().unwrap_or_else(|error| {
             panic!(
                 "{operation} could not remove mutation watcher barrier {}: {error}",
-                path.display()
+                canonical_path.display()
             )
         });
     }
@@ -267,11 +267,10 @@ fn is_ignored_filesystem_event(kind: EventKind) -> bool {
 }
 
 fn is_barrier_signal(event: &Event, barrier_path: &Path) -> bool {
-    matches!(event.kind, EventKind::Modify(_))
-        && event
-            .paths
-            .iter()
-            .any(|path| path.as_path() == barrier_path)
+    event
+        .paths
+        .iter()
+        .any(|path| path.as_path() == barrier_path)
 }
 
 fn observe_transient_mutations(
@@ -312,7 +311,6 @@ fn observe_transient_mutations(
                 if ignored {
                     continue;
                 }
-                let mut event_path_observed = false;
                 for path in event
                     .paths
                     .iter()
@@ -320,10 +318,11 @@ fn observe_transient_mutations(
                 {
                     if let Ok(relative_path) = path.strip_prefix(root) {
                         changed_paths.insert(relative_path.to_path_buf());
-                        event_path_observed = true;
+                    } else {
+                        changed_paths.insert(PathBuf::from("."));
                     }
                 }
-                if !barrier_observed && !event_path_observed {
+                if event.paths.is_empty() {
                     changed_paths.insert(PathBuf::from("."));
                 }
             }
@@ -374,8 +373,8 @@ pub fn assert_directory_tree_unchanged<T>(
     // Both barriers exist before the watcher starts and live outside the protected tree. Signaling
     // them flushes event delivery without creating a directory entry that could be mistaken for
     // application work.
-    let mut readiness_barrier = MutationBarrier::create(operation);
-    let mut completion_barrier = MutationBarrier::create(operation);
+    let readiness_barrier = MutationBarrier::create(operation);
+    let completion_barrier = MutationBarrier::create(operation);
     let (event_sender, event_receiver) = mpsc::channel();
     let mut watcher =
         RecommendedWatcher::new(event_sender, Config::default().with_follow_symlinks(false))
@@ -1656,10 +1655,12 @@ mod tests {
     }
 
     #[test]
-    fn mutation_barrier_accepts_platform_specific_modify_events() {
+    fn mutation_barrier_accepts_platform_specific_events() {
         let barrier_path = PathBuf::from("mutation-barrier");
 
         for kind in [
+            EventKind::Access(AccessKind::Any),
+            EventKind::Create(CreateKind::File),
             EventKind::Modify(ModifyKind::Data(DataChange::Any)),
             EventKind::Modify(ModifyKind::Any),
             EventKind::Modify(ModifyKind::Metadata(MetadataKind::Any)),
