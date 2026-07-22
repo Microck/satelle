@@ -1,4 +1,4 @@
 {
   "title": "How-to guides",
-  "pages": ["setup-host", "operate-session", "diagnose", "connect-remote"]
+  "pages": ["install-satelle", "setup-host", "operate-session", "diagnose", "connect-remote"]
 }

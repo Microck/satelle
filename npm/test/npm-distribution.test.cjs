@@ -60,6 +60,125 @@ function readJson(filePath) {
   return JSON.parse(readFileSync(filePath, "utf8"));
 }
 
+test("installation docs freeze package identities, ownership, and cache contracts", () => {
+  const installationGuide = readFileSync(
+    path.join(repositoryRoot, "docs", "how-to", "install-satelle.mdx"),
+    "utf8",
+  );
+  const readme = readFileSync(path.join(repositoryRoot, "README.md"), "utf8");
+  const documentationIndex = readFileSync(path.join(repositoryRoot, "docs", "index.mdx"), "utf8");
+  const normalizedInstallationGuide = installationGuide.replace(/\s+/g, " ");
+  const canonicalManifest = readJson(path.join(canonicalPackageRoot, "package.json"));
+  const unscopedManifest = readJson(
+    path.join(repositoryRoot, "npm", "satelle-unscoped", "package.json"),
+  );
+  const packageIdentities = [
+    canonicalManifest.name,
+    unscopedManifest.name,
+    ...Object.values(platformMatrix).map(({ packageName }) => packageName),
+  ];
+
+  assert.equal(new Set(packageIdentities).size, 8);
+  assert.match(
+    installationGuide,
+    /None of these eight npm package identities is available from the public npm registry yet\./,
+  );
+  for (const packageName of packageIdentities) {
+    assert.ok(installationGuide.includes(`\`${packageName}\``), packageName);
+  }
+
+  const platformNames = {
+    darwin: "macOS",
+    linux: "Linux",
+    win32: "Windows",
+  };
+  const architectureNames = {
+    arm64: "ARM64",
+    x64: "x64",
+  };
+  for (const target of Object.values(platformMatrix)) {
+    const documentedRole = `${platformNames[target.os]} ${architectureNames[target.cpu]} native binary`;
+    assert.ok(
+      installationGuide.includes(`| ${documentedRole} | \`${target.packageName}\` |`),
+      `${documentedRole}: ${target.packageName}`,
+    );
+  }
+
+  const packageManagerCommands = [
+    `npm install --global ${canonicalManifest.name} --include=optional`,
+    `pnpm add --global ${canonicalManifest.name}`,
+    `bun add --global ${canonicalManifest.name}`,
+  ];
+  const nonNpmMethodsHeading = installationGuide.indexOf("## Use a non-npm method");
+  assert.notEqual(nonNpmMethodsHeading, -1);
+  for (const command of packageManagerCommands) {
+    const commandPosition = installationGuide.indexOf(command);
+    assert.notEqual(commandPosition, -1, command);
+    assert.ok(commandPosition < nonNpmMethodsHeading, command);
+  }
+
+  const nonNpmMethods = [
+    "Unix shell installer using `curl` or `wget`.",
+    "Windows PowerShell installer using `Invoke-RestMethod`.",
+    "First-party Homebrew tap.",
+    "First-party Scoop bucket.",
+    "Direct GitHub release archive download.",
+  ];
+  for (const [index, method] of nonNpmMethods.entries()) {
+    const documentedMethod = `${index + 1}. ${method}`;
+    const methodPosition = installationGuide.indexOf(documentedMethod);
+    assert.notEqual(methodPosition, -1, documentedMethod);
+    assert.ok(methodPosition > nonNpmMethodsHeading, documentedMethod);
+  }
+
+  assert.match(
+    normalizedInstallationGuide,
+    /npm, Homebrew, and Scoop own the upgrade and uninstall flow/,
+  );
+  assert.match(
+    normalizedInstallationGuide,
+    /The first-party Homebrew tap remains the canonical Homebrew path until Satelle is accepted into Homebrew core and core updates prove reliable\./,
+  );
+  assert.match(
+    normalizedInstallationGuide,
+    /The first-party Scoop bucket remains the canonical Scoop path until a Scoop Main manifest is accepted and its updates prove they do not lag normal Satelle releases\./,
+  );
+  assert.match(
+    normalizedInstallationGuide,
+    /None is published yet\. Satelle does not invent placeholder URLs or coordinates/,
+  );
+  assert.doesNotMatch(installationGuide, /\b(?:brew|scoop) install\b/);
+  assert.match(
+    normalizedInstallationGuide,
+    /Satelle does not maintain a package cache for npm-registry packages\./,
+  );
+  assert.match(
+    normalizedInstallationGuide,
+    /npm, pnpm, and Bun own cache behavior for persistent installation and one-shot execution\./,
+  );
+  assert.match(
+    normalizedInstallationGuide,
+    /Cold offline npm-registry installation and one-shot execution are not guaranteed\./,
+  );
+  for (const excludedEcosystem of [
+    ".deb",
+    ".rpm",
+    "AUR",
+    "WinGet",
+    "Chocolatey",
+    "Nixpkgs",
+    "MacPorts",
+    "Homebrew core",
+    "Scoop Main",
+  ]) {
+    assert.ok(installationGuide.includes(excludedEcosystem), excludedEcosystem);
+  }
+
+  for (const publicEntryPoint of [readme, documentationIndex]) {
+    assert.ok(publicEntryPoint.includes("install-satelle"));
+  }
+});
+
 function npmSpawnOptions(options = {}) {
   return process.platform === "win32" ? { ...options, shell: true } : options;
 }
