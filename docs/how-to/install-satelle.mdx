@@ -96,13 +96,8 @@ MacPorts, Homebrew core, or Scoop Main publication a release blocker.
 ## Use the installation owner's lifecycle
 
 npm, Homebrew, and Scoop own the upgrade and uninstall flow for installations
-they create. pnpm and Bun follow the same package-manager ownership rule. Use
-the same package manager to update or remove Satelle; do not use Satelle
-self-update for a package-manager-owned executable.
-
-Install scripts and direct release archives are Satelle-owned installation
-paths. Their verified installation receipt distinguishes them from
-package-manager-owned files.
+they create. Use the same package manager to update or remove Satelle; do not
+use Satelle self-update for a package-manager-owned executable.
 
 ## Understand cache and offline behavior
 
