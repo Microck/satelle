@@ -73,6 +73,8 @@ pub(super) struct SshBootstrapLock {
     claim_basename: String,
     mutation_phase: Option<String>,
     mutation_attempt: Option<String>,
+    #[cfg(test)]
+    exchanged_lock_lines: Vec<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -244,6 +246,8 @@ impl SshBootstrapLock {
             claim_basename: ready_claim.basename,
             mutation_phase: None,
             mutation_attempt: None,
+            #[cfg(test)]
+            exchanged_lock_lines: Vec::new(),
         })
     }
 
@@ -324,6 +328,11 @@ impl SshBootstrapLock {
         self.exchange_lock_line(committed)
     }
 
+    #[cfg(test)]
+    pub(super) fn exchanged_lock_lines(&self) -> &[String] {
+        &self.exchanged_lock_lines
+    }
+
     fn exchange_lock_line(&mut self, challenge: String) -> Result<(), SshBootstrapError> {
         if self
             .child
@@ -344,7 +353,11 @@ impl SshBootstrapLock {
                 .map_err(SshBootstrapError::BootstrapLockProtocol)?;
         }
         match self.response_receiver.recv_timeout(PROCESS_TIMEOUT) {
-            Ok(response) if response == challenge => Ok(()),
+            Ok(response) if response == challenge => {
+                #[cfg(test)]
+                self.exchanged_lock_lines.push(challenge);
+                Ok(())
+            }
             Ok(_) => Err(SshBootstrapError::InvalidBootstrapLockResponse),
             Err(_) => Err(SshBootstrapError::BootstrapLockLost),
         }

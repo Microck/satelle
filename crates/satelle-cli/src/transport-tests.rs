@@ -700,7 +700,7 @@ fn durable_verification_and_bootstrap_handoff_use_distinct_clients() {
 }
 
 #[cfg(unix)]
-fn with_bootstrap_handoff_test_context(test: impl FnOnce(&DaemonClient, &std::path::Path)) {
+fn with_bootstrap_handoff_test_context(test: impl FnOnce(&DaemonClient)) {
     use std::os::unix::fs::PermissionsExt as _;
 
     struct PathRestore(std::ffi::OsString);
@@ -741,7 +741,6 @@ fn with_bootstrap_handoff_test_context(test: impl FnOnce(&DaemonClient, &std::pa
     let fake_bin = state.path().join("fake-bin");
     std::fs::create_dir(&fake_bin).expect("create fake SSH directory");
     let fake_ssh = fake_bin.join("ssh");
-    let lock_transcript = state.path().join("bootstrap-lock-transcript");
     std::fs::write(
         &fake_ssh,
         format!(
@@ -751,11 +750,10 @@ for argument in "$@"; do command=$argument; done
 case "$command" in
   cmd.exe*) exit 1 ;;
   *"uname -s"*) printf '%s\n' satelle-platform-v1 Linux x86_64 'glibc 2.31' ;;
-  *) export SATELLE_STATE_DIR='{}'; tee -a '{}' | sh -c "$command" ;;
+  *) export SATELLE_STATE_DIR='{}'; exec sh -c "$command" ;;
 esac
 "#,
-            state.path().display(),
-            lock_transcript.display()
+            state.path().display()
         ),
     )
     .expect("write fake SSH executable");
@@ -775,7 +773,7 @@ esac
     // restores the original value on every exit path.
     unsafe { std::env::set_var("PATH", path) };
 
-    test(&client, &lock_transcript);
+    test(&client);
 
     drop(path_restore);
     drop(server);
@@ -784,7 +782,7 @@ esac
 #[cfg(unix)]
 #[test]
 fn completed_bootstrap_handoff_commit_allows_recovery_after_controller_loss() {
-    with_bootstrap_handoff_test_context(|client, _| {
+    with_bootstrap_handoff_test_context(|client| {
         let mut bootstrap_lock = acquire_bootstrap_lock_for_operation(
             "crash-window-host",
             "fake-ssh-host",
@@ -817,7 +815,7 @@ fn completed_bootstrap_handoff_commit_allows_recovery_after_controller_loss() {
 #[cfg(unix)]
 #[test]
 fn successful_bootstrap_handoff_release_does_not_repeat_the_completion_commit() {
-    with_bootstrap_handoff_test_context(|client, _| {
+    with_bootstrap_handoff_test_context(|client| {
         let mut bootstrap_lock = acquire_bootstrap_lock_for_operation(
             "successful-release-host",
             "fake-ssh-host",
@@ -850,7 +848,7 @@ fn successful_bootstrap_handoff_release_does_not_repeat_the_completion_commit() 
 #[cfg(unix)]
 #[test]
 fn prior_mutation_commit_precedes_maintenance_handoff_begin_for_both_phase_shapes() {
-    with_bootstrap_handoff_test_context(|client, lock_transcript| {
+    with_bootstrap_handoff_test_context(|client| {
         for (phase, operation_id) in [
             ("daemon_start", "ordered-daemon-start"),
             (
@@ -858,7 +856,6 @@ fn prior_mutation_commit_precedes_maintenance_handoff_begin_for_both_phase_shape
                 "ordered-durable-token-verification",
             ),
         ] {
-            std::fs::write(lock_transcript, "").expect("reset lock transcript");
             let mut bootstrap_lock = acquire_bootstrap_lock_for_operation(
                 "ordered-handoff-host",
                 "fake-ssh-host",
@@ -875,19 +872,19 @@ fn prior_mutation_commit_precedes_maintenance_handoff_begin_for_both_phase_shape
                 .release_committed_handoff()
                 .expect("release the committed handoff");
 
-            let transcript =
-                std::fs::read_to_string(lock_transcript).expect("read bootstrap lock transcript");
             let prior_commit = format!("{} {phase} ", bootstrap_lock::MUTATION_COMMITTED);
             let maintenance_begin = format!(
                 "{} maintenance_handoff_begin ",
                 bootstrap_lock::MUTATION_STARTED
             );
-            let prior_commit_index = transcript
-                .lines()
+            let prior_commit_index = bootstrap_lock
+                .exchanged_lock_lines()
+                .iter()
                 .position(|line| line.starts_with(&prior_commit))
                 .expect("the prior mutation is committed");
-            let maintenance_begin_index = transcript
-                .lines()
+            let maintenance_begin_index = bootstrap_lock
+                .exchanged_lock_lines()
+                .iter()
                 .position(|line| line.starts_with(&maintenance_begin))
                 .expect("the maintenance begin attempt is recorded");
             assert!(
@@ -901,7 +898,7 @@ fn prior_mutation_commit_precedes_maintenance_handoff_begin_for_both_phase_shape
 #[cfg(unix)]
 #[test]
 fn committed_prior_mutation_recovers_after_controller_loss_for_both_phase_shapes() {
-    with_bootstrap_handoff_test_context(|_, _| {
+    with_bootstrap_handoff_test_context(|_| {
         for (phase, operation_id) in [
             ("daemon_start", "lost-after-committed-daemon-start"),
             (
