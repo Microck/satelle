@@ -999,24 +999,47 @@ if ((Get-FileHash -Algorithm SHA256 -LiteralPath {staged}).Hash.ToLowerInvariant
         }
     }
 
+    fn windows_cache_leaf_guard(self, remote_path: &str) -> String {
+        debug_assert!(self.is_windows());
+        format!(
+            concat!(
+                "$separator=[IO.Path]::DirectorySeparatorChar; ",
+                "$root=[IO.Path]::GetFullPath(({}).Replace('/', $separator)); ",
+                "$path=[IO.Path]::GetFullPath(({}).Replace('/', $separator)); ",
+                "$rootPrefix=$root.TrimEnd($separator)+$separator; ",
+                "if (-not [StringComparer]::OrdinalIgnoreCase.Equals($path,$root) -and ",
+                "-not $path.StartsWith($rootPrefix,[StringComparison]::OrdinalIgnoreCase)) {{ exit 1 }}; ",
+                "$item=Get-Item -LiteralPath $path -Force -ErrorAction Stop; ",
+                "if (($item -isnot [IO.FileInfo]) -or $item.PSIsContainer -or ",
+                "(($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0)) {{ exit 1 }}; ",
+                "$current=$item; while ($true) {{ ",
+                "$currentPath=[IO.Path]::GetFullPath($current.FullName); ",
+                "if (-not [StringComparer]::OrdinalIgnoreCase.Equals($currentPath,$root) -and ",
+                "-not $currentPath.StartsWith($rootPrefix,[StringComparison]::OrdinalIgnoreCase)) {{ exit 1 }}; ",
+                "if (($current.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {{ exit 1 }}; ",
+                "if ([StringComparer]::OrdinalIgnoreCase.Equals($currentPath,$root)) {{ break }}; ",
+                "$current=$current.Parent; if ($null -eq $current) {{ exit 1 }} }}; ",
+            ),
+            powershell_quote(self.remote_cache_root()),
+            powershell_quote(remote_path),
+        )
+    }
+
     fn cache_validation_command(self, remote_path: &str) -> String {
         if self.is_windows() {
+            let safety_guard = self.windows_cache_leaf_guard(remote_path);
             let script = format!(
                 concat!(
-                    "$ErrorActionPreference='Stop'; $root={}; $path={}; ",
+                    "$ErrorActionPreference='Stop'; {safety_guard}",
                     "$identity=[System.Security.Principal.WindowsIdentity]::GetCurrent().Name; ",
-                    "$item=Get-Item -LiteralPath $path; ",
-                    "if ($item.PSIsContainer -or (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0)) {{ exit 1 }}; ",
                     "$current=$item; while ($true) {{ ",
-                    "if (($current.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {{ exit 1 }}; ",
                     "$acl=Get-Acl -LiteralPath $current.FullName; if ($acl.Owner -ne $identity) {{ exit 1 }}; ",
                     "foreach ($rule in $acl.Access) {{ if ($rule.AccessControlType -eq 'Allow' -and ",
                     "$rule.IdentityReference.Value -ne $identity) {{ exit 1 }} }}; ",
-                    "if ($current.FullName -eq (Get-Item -LiteralPath $root).FullName) {{ break }}; ",
+                    "if ([StringComparer]::OrdinalIgnoreCase.Equals([IO.Path]::GetFullPath($current.FullName),$root)) {{ break }}; ",
                     "$current=$current.Parent; if ($null -eq $current) {{ exit 1 }} }}",
                 ),
-                powershell_quote(self.remote_cache_root()),
-                powershell_quote(remote_path),
+                safety_guard = safety_guard,
             );
             powershell_encoded_command(&script)
         } else {
@@ -1190,16 +1213,17 @@ printf 'removed=%s\nretained=%s\n' "$removed" "$retained""#,
 
     fn prepare_staged_command(self, staged: &str) -> Option<String> {
         if self.is_windows() {
+            let safety_guard = self.windows_cache_leaf_guard(staged);
             let script = format!(
                 concat!(
-                    "$acl=Get-Acl -LiteralPath {}; $acl.SetAccessRuleProtection($true,$false); ",
+                    "$ErrorActionPreference='Stop'; {safety_guard}",
+                    "$acl=Get-Acl -LiteralPath $path; $acl.SetAccessRuleProtection($true,$false); ",
                     "foreach ($rule in @($acl.Access)) {{ [void]$acl.RemoveAccessRuleAll($rule) }}; ",
                     "$rule=New-Object System.Security.AccessControl.FileSystemAccessRule(",
                     "[System.Security.Principal.WindowsIdentity]::GetCurrent().Name,'FullControl','Allow'); ",
-                    "$acl.SetAccessRule($rule); Set-Acl -LiteralPath {} -AclObject $acl",
+                    "$acl.SetAccessRule($rule); Set-Acl -LiteralPath $path -AclObject $acl",
                 ),
-                powershell_quote(staged),
-                powershell_quote(staged),
+                safety_guard = safety_guard,
             );
             Some(powershell_encoded_command(&script))
         } else {
@@ -2823,6 +2847,44 @@ mod tests {
         ] {
             assert!(script.contains(required), "missing {required:?}");
         }
+    }
+
+    #[test]
+    fn windows_staged_acl_requires_a_contained_regular_non_reparse_file() {
+        let staged = "AppData/Local/Satelle/host/v1/windows-x64/.satelle-upload-attempt.exe";
+        let command = RemoteTarget::WindowsX64Msvc
+            .prepare_staged_command(staged)
+            .expect("Windows staging command");
+        let script = decode_powershell_command(&command).expect("decode staging command");
+
+        for required in [
+            "$root=[IO.Path]::GetFullPath(('AppData/Local/Satelle/host').Replace('/', $separator))",
+            "$path=[IO.Path]::GetFullPath(('AppData/Local/Satelle/host/v1/windows-x64/.satelle-upload-attempt.exe').Replace('/', $separator))",
+            "[StringComparer]::OrdinalIgnoreCase.Equals($path,$root)",
+            "$path.StartsWith($rootPrefix,[StringComparison]::OrdinalIgnoreCase)",
+            "$item=Get-Item -LiteralPath $path -Force -ErrorAction Stop",
+            "$item -isnot [IO.FileInfo]",
+            "$item.PSIsContainer",
+            "($item.Attributes -band [IO.FileAttributes]::ReparsePoint)",
+            "($current.Attributes -band [IO.FileAttributes]::ReparsePoint)",
+            "[StringComparer]::OrdinalIgnoreCase.Equals($currentPath,$root)",
+            "$current=$current.Parent; if ($null -eq $current) { exit 1 }",
+            "Set-Acl -LiteralPath $path -AclObject $acl",
+        ] {
+            assert!(script.contains(required), "missing {required:?}: {script}");
+        }
+
+        let leaf_check = script
+            .find("$item -isnot [IO.FileInfo]")
+            .expect("leaf type check");
+        let ancestor_check = script
+            .find("($current.Attributes -band [IO.FileAttributes]::ReparsePoint)")
+            .expect("ancestor reparse check");
+        let acl_read = script
+            .find("$acl=Get-Acl -LiteralPath $path")
+            .expect("staged ACL read");
+        assert!(leaf_check < acl_read);
+        assert!(ancestor_check < acl_read);
     }
 
     #[cfg(unix)]

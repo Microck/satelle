@@ -23,7 +23,7 @@ use satelle_core::{
     ApiRateLimits, ApiTokenSource, DirectHostBinding, ErrorCode, SatelleConfig, TransportKind,
 };
 use satelle_host::{
-    ApiBearerToken, ApiScopes, HostService, MutationAuthority, TurnIntent,
+    ApiBearerToken, ApiScopes, HostService, MutationAuthority, SetupOperationKind, TurnIntent,
     test_support::TestStateDir,
 };
 use satelle_transport::{
@@ -1526,6 +1526,393 @@ async fn setup_token_mutations_reject_bodies_before_changing_token_state() {
         .expect("decode successful abort after rejection");
     assert!(!aborted.active());
     assert_eq!(aborted.token_id(), second_abort_token_id);
+
+    server.shutdown().await.expect("stop bootstrap server");
+}
+
+#[tokio::test]
+async fn bootstrap_maintenance_routes_enforce_the_mutation_contract_before_ledger_changes() {
+    let state = TestStateDir::new().expect("temporary state directory");
+    let bootstrap_token = ApiBearerToken::generate().expect("generate bootstrap token");
+    let service = HostService::local_demo_for_tests_at(state.path())
+        .expect("construct deterministic Host service")
+        .with_ssh_bootstrap_auth_for_tests(
+            &bootstrap_token,
+            ApiScopes::READ,
+            time::OffsetDateTime::now_utc() + time::Duration::minutes(15),
+        );
+    let host_identity = service
+        .initialize_daemon()
+        .expect("initialize Host state")
+        .host_identity()
+        .to_string();
+    let server = DaemonServer::bind(
+        service,
+        DaemonServerConfig::loopback(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))),
+    )
+    .await
+    .expect("bind bootstrap server");
+    let address = server.local_addr();
+    let client = reqwest::Client::new();
+    let authenticated_request = |path: &str| {
+        client
+            .post(format!("http://{address}{path}"))
+            .header("Authorization", bearer(&bootstrap_token))
+            .header("Satelle-Expected-Host-Identity", &host_identity)
+            .header("Satelle-Request-Id", RequestId::new().to_string())
+    };
+
+    let invalid_begin_cases = [
+        (
+            "malformed-protocol",
+            Some("v4"),
+            Some("malformed-protocol-key"),
+            false,
+            false,
+            StatusCode::UPGRADE_REQUIRED,
+            ApiErrorCode::IncompatibleProtocol,
+        ),
+        (
+            "down-level-protocol",
+            Some("3"),
+            Some("down-level-protocol-key"),
+            false,
+            false,
+            StatusCode::UPGRADE_REQUIRED,
+            ApiErrorCode::IncompatibleProtocol,
+        ),
+        (
+            "missing-idempotency",
+            Some("4"),
+            None,
+            false,
+            false,
+            StatusCode::BAD_REQUEST,
+            ApiErrorCode::InvalidRequest,
+        ),
+        (
+            "query",
+            Some("4"),
+            Some("query-key"),
+            true,
+            false,
+            StatusCode::BAD_REQUEST,
+            ApiErrorCode::InvalidRequest,
+        ),
+        (
+            "cookie",
+            Some("4"),
+            Some("cookie-key"),
+            false,
+            true,
+            StatusCode::BAD_REQUEST,
+            ApiErrorCode::InvalidRequest,
+        ),
+    ];
+
+    for (case, protocol, idempotency_key, query, cookie, expected_status, expected_code) in
+        invalid_begin_cases
+    {
+        let operation_id = format!("rejected-begin-{case}");
+        let query_suffix = if query { "?forbidden=true" } else { "" };
+        let invalid_path = format!(
+            "/v1/maintenance/bootstrap/{operation_id}/missing_daemon_repair/begin{query_suffix}"
+        );
+        let mut request = authenticated_request(&invalid_path);
+        if let Some(protocol) = protocol {
+            request = request.header("Satelle-Protocol-Version", protocol);
+        }
+        if let Some(idempotency_key) = idempotency_key {
+            request = request.header("Idempotency-Key", idempotency_key);
+        }
+        if cookie {
+            request = request.header("Cookie", "forbidden=true");
+        }
+        let rejection = request
+            .send()
+            .await
+            .expect("send invalid maintenance begin");
+        assert_eq!(rejection.status(), expected_status, "{case}");
+        let error: ApiError = rejection.json().await.expect("decode begin rejection");
+        assert_eq!(error.code(), expected_code, "{case}");
+
+        // A different operation kind for the same ID succeeds only if the
+        // rejected request never created a setup ledger entry.
+        let accepted_path = format!("/v1/maintenance/bootstrap/{operation_id}/initial_setup/begin");
+        let accepted = setup_mutation_request(
+            &client,
+            address,
+            &bootstrap_token,
+            &host_identity,
+            &accepted_path,
+            &operation_id,
+        )
+        .send()
+        .await
+        .expect("begin maintenance after rejected request");
+        assert_eq!(accepted.status(), StatusCode::OK, "{case}");
+        let completed = setup_mutation_request(
+            &client,
+            address,
+            &bootstrap_token,
+            &host_identity,
+            &format!("/v1/maintenance/bootstrap/{operation_id}/complete"),
+            &operation_id,
+        )
+        .send()
+        .await
+        .expect("complete accepted maintenance request");
+        assert_eq!(completed.status(), StatusCode::OK, "{case}");
+    }
+
+    let active_operation = "rejected-complete-active";
+    let begin_active = setup_mutation_request(
+        &client,
+        address,
+        &bootstrap_token,
+        &host_identity,
+        &format!("/v1/maintenance/bootstrap/{active_operation}/initial_setup/begin"),
+        active_operation,
+    )
+    .send()
+    .await
+    .expect("begin operation used for complete rejections");
+    assert_eq!(begin_active.status(), StatusCode::OK);
+
+    let invalid_complete_cases = [
+        (
+            "malformed-protocol",
+            Some("v4"),
+            Some("complete-malformed-protocol-key"),
+            false,
+            false,
+            StatusCode::UPGRADE_REQUIRED,
+            ApiErrorCode::IncompatibleProtocol,
+        ),
+        (
+            "down-level-protocol",
+            Some("3"),
+            Some("complete-down-level-protocol-key"),
+            false,
+            false,
+            StatusCode::UPGRADE_REQUIRED,
+            ApiErrorCode::IncompatibleProtocol,
+        ),
+        (
+            "missing-idempotency",
+            Some("4"),
+            None,
+            false,
+            false,
+            StatusCode::BAD_REQUEST,
+            ApiErrorCode::InvalidRequest,
+        ),
+        (
+            "query",
+            Some("4"),
+            Some("complete-query-key"),
+            true,
+            false,
+            StatusCode::BAD_REQUEST,
+            ApiErrorCode::InvalidRequest,
+        ),
+        (
+            "cookie",
+            Some("4"),
+            Some("complete-cookie-key"),
+            false,
+            true,
+            StatusCode::BAD_REQUEST,
+            ApiErrorCode::InvalidRequest,
+        ),
+    ];
+
+    for (case, protocol, idempotency_key, query, cookie, expected_status, expected_code) in
+        invalid_complete_cases
+    {
+        let query_suffix = if query { "?forbidden=true" } else { "" };
+        let path = format!("/v1/maintenance/bootstrap/{active_operation}/complete{query_suffix}");
+        let mut request = authenticated_request(&path);
+        if let Some(protocol) = protocol {
+            request = request.header("Satelle-Protocol-Version", protocol);
+        }
+        if let Some(idempotency_key) = idempotency_key {
+            request = request.header("Idempotency-Key", idempotency_key);
+        }
+        if cookie {
+            request = request.header("Cookie", "forbidden=true");
+        }
+        let rejection = request
+            .send()
+            .await
+            .expect("send invalid maintenance complete");
+        assert_eq!(rejection.status(), expected_status, "{case}");
+        let error: ApiError = rejection.json().await.expect("decode complete rejection");
+        assert_eq!(error.code(), expected_code, "{case}");
+    }
+
+    // Every rejected completion must leave the first operation active. A
+    // different valid operation therefore conflicts until the valid complete.
+    let competing_operation = "blocked-after-complete-rejections";
+    let conflict = setup_mutation_request(
+        &client,
+        address,
+        &bootstrap_token,
+        &host_identity,
+        &format!("/v1/maintenance/bootstrap/{competing_operation}/missing_daemon_repair/begin"),
+        competing_operation,
+    )
+    .send()
+    .await
+    .expect("attempt competing maintenance operation");
+    assert_eq!(conflict.status(), StatusCode::CONFLICT);
+
+    let complete_active = setup_mutation_request(
+        &client,
+        address,
+        &bootstrap_token,
+        &host_identity,
+        &format!("/v1/maintenance/bootstrap/{active_operation}/complete"),
+        active_operation,
+    )
+    .send()
+    .await
+    .expect("complete active operation with a valid request");
+    assert_eq!(complete_active.status(), StatusCode::OK);
+    let begin_competing = setup_mutation_request(
+        &client,
+        address,
+        &bootstrap_token,
+        &host_identity,
+        &format!("/v1/maintenance/bootstrap/{competing_operation}/missing_daemon_repair/begin"),
+        competing_operation,
+    )
+    .send()
+    .await
+    .expect("begin competing operation after valid completion");
+    assert_eq!(begin_competing.status(), StatusCode::OK);
+    let complete_competing = setup_mutation_request(
+        &client,
+        address,
+        &bootstrap_token,
+        &host_identity,
+        &format!("/v1/maintenance/bootstrap/{competing_operation}/complete"),
+        competing_operation,
+    )
+    .send()
+    .await
+    .expect("complete competing operation");
+    assert_eq!(complete_competing.status(), StatusCode::OK);
+
+    server.shutdown().await.expect("stop bootstrap server");
+}
+
+#[tokio::test]
+async fn bootstrap_maintenance_routes_share_the_control_mutation_rate_limit() {
+    let limit = |value| NonZeroUsize::new(value).expect("test rate limit is nonzero");
+    let state = TestStateDir::new().expect("temporary state directory");
+    let bootstrap_token = ApiBearerToken::generate().expect("generate bootstrap token");
+    let service = HostService::local_demo_for_tests_at(state.path())
+        .expect("construct deterministic Host service")
+        .with_ssh_bootstrap_auth_for_tests(
+            &bootstrap_token,
+            ApiScopes::READ,
+            time::OffsetDateTime::now_utc() + time::Duration::minutes(15),
+        );
+    let host_identity = service
+        .initialize_daemon()
+        .expect("initialize Host state")
+        .host_identity()
+        .to_string();
+    let rates = ApiRateLimits::new(limit(10), limit(10), limit(2), limit(10));
+    let server = DaemonServer::bind(
+        service.clone(),
+        DaemonServerConfig::loopback(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
+            .with_api_rate_limits(rates),
+    )
+    .await
+    .expect("bind rate-limited bootstrap server");
+    let address = server.local_addr();
+    let client = reqwest::Client::new();
+
+    let admitted_operation = "rate-limit-admitted";
+    let begin_admitted = setup_mutation_request(
+        &client,
+        address,
+        &bootstrap_token,
+        &host_identity,
+        &format!("/v1/maintenance/bootstrap/{admitted_operation}/missing_daemon_repair/begin"),
+        admitted_operation,
+    )
+    .send()
+    .await
+    .expect("send admitted begin request");
+    assert_eq!(begin_admitted.status(), StatusCode::OK);
+    let complete_admitted = setup_mutation_request(
+        &client,
+        address,
+        &bootstrap_token,
+        &host_identity,
+        &format!("/v1/maintenance/bootstrap/{admitted_operation}/complete"),
+        admitted_operation,
+    )
+    .send()
+    .await
+    .expect("send admitted complete request");
+    assert_eq!(complete_admitted.status(), StatusCode::OK);
+
+    let rejected_begin_operation = "rate-limited-begin";
+    let rejected_begin = setup_mutation_request(
+        &client,
+        address,
+        &bootstrap_token,
+        &host_identity,
+        &format!(
+            "/v1/maintenance/bootstrap/{rejected_begin_operation}/missing_daemon_repair/begin"
+        ),
+        rejected_begin_operation,
+    )
+    .send()
+    .await
+    .expect("send rate-limited begin request");
+    assert_rate_limited(rejected_begin, Some(&host_identity)).await;
+
+    // Acquiring the same ID under a different kind proves the rejected HTTP
+    // begin did not create a ledger entry.
+    service
+        .acquire_bootstrap_maintenance(rejected_begin_operation, SetupOperationKind::Setup)
+        .expect("rate-limited begin left the operation ID unused");
+    service
+        .complete_bootstrap_maintenance(rejected_begin_operation)
+        .expect("complete directly arranged maintenance operation");
+
+    let rejected_complete_operation = "rate-limited-complete";
+    service
+        .acquire_bootstrap_maintenance(rejected_complete_operation, SetupOperationKind::Setup)
+        .expect("arrange active operation for rate-limited completion");
+    let rejected_complete = setup_mutation_request(
+        &client,
+        address,
+        &bootstrap_token,
+        &host_identity,
+        &format!("/v1/maintenance/bootstrap/{rejected_complete_operation}/complete"),
+        rejected_complete_operation,
+    )
+    .send()
+    .await
+    .expect("send rate-limited complete request");
+    assert_rate_limited(rejected_complete, Some(&host_identity)).await;
+
+    let error = service
+        .acquire_bootstrap_maintenance(
+            "blocked-by-rate-limited-complete",
+            SetupOperationKind::Repair,
+        )
+        .expect_err("rate-limited completion must leave the active ledger entry intact");
+    assert_eq!(error.code, ErrorCode::StateConflict);
+    service
+        .complete_bootstrap_maintenance(rejected_complete_operation)
+        .expect("complete active operation after rate-limit proof");
 
     server.shutdown().await.expect("stop bootstrap server");
 }

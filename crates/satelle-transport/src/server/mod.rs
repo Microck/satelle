@@ -828,6 +828,10 @@ fn router(state: Arc<DaemonState>) -> Router {
         .route_layer(middleware::from_fn_with_state(
             Arc::clone(&state),
             auth::require_empty_setup_mutation,
+        ))
+        .route_layer(middleware::from_fn_with_state(
+            Arc::clone(&state),
+            auth::require_setup_mutation,
         ));
     let setup_routes = Router::new()
         .route("/v1/setup/api-token", post(setup::issue_api_token))
