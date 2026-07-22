@@ -4803,7 +4803,7 @@ mod bootstrap_startup_tests {
             None,
         )
         .await
-        .expect("bind replacement bootstrap Host");
+        .unwrap_or_else(|_| panic!("bind replacement bootstrap Host"));
         let address = server.local_addr();
         tokio::task::spawn_blocking(move || {
             let client = satelle_transport::DaemonClient::loopback(address, token, host_identity)
