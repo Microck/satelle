@@ -40,17 +40,25 @@ const POSIX_CACHE_DIRECTORY_GUARD: &str = r#"safe_cache_directory() {
   expected_root=$1
   expected_directory=$2
   case "$expected_directory" in "$expected_root"|"$expected_root"/*) ;; *) return 1;; esac
-  current=$expected_root
-  suffix=${expected_directory#"$expected_root"}
-  while :; do
-    [ ! -L "$current" ] || return 1
-    if [ -e "$current" ]; then [ -d "$current" ] || return 1; fi
-    [ -z "$suffix" ] && return 0
-    suffix=${suffix#/}
+  case "$expected_root" in /*) return 1;; esac
+  uid=$(id -u) || return 1
+  current=.
+  owner=$(stat -c %u "$current" 2>/dev/null || stat -f %u "$current") || return 1
+  [ "$owner" = "$uid" ] || return 1
+  suffix=$expected_directory
+  while [ -n "$suffix" ]; do
     component=${suffix%%/*}
+    case "$component" in ''|.|..) return 1;; esac
     current=$current/$component
+    [ ! -L "$current" ] || return 1
+    if [ -e "$current" ]; then
+      [ -d "$current" ] || return 1
+      owner=$(stat -c %u "$current" 2>/dev/null || stat -f %u "$current") || return 1
+      [ "$owner" = "$uid" ] || return 1
+    fi
     if [ "$suffix" = "$component" ]; then suffix=; else suffix=${suffix#*/}; fi
   done
+  return 0
 }"#;
 const DAEMON_PATH_ENVIRONMENT_VARIABLES: [&str; 5] = [
     "SATELLE_HOME",
@@ -2691,6 +2699,110 @@ mod tests {
                 .mode()
                 & 0o777,
             0o755
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn posix_cache_mutations_reject_symlinked_cache_ancestors_without_outside_mutation() {
+        for ancestor in [".cache", ".cache/satelle"] {
+            let home = tempfile::tempdir().expect("temporary remote home");
+            let outside = tempfile::tempdir().expect("outside directory");
+            let link = home.path().join(ancestor);
+            fs::create_dir_all(link.parent().expect("cache ancestor parent"))
+                .expect("create cache ancestor parent");
+            symlink(outside.path(), &link).expect("symlink cache ancestor");
+
+            let escaped_root = if ancestor == ".cache" {
+                outside.path().join("satelle/host")
+            } else {
+                outside.path().join("host")
+            };
+            let escaped_directory = escaped_root
+                .join(format!("v{}", env!("CARGO_PKG_VERSION")))
+                .join("linux-x64-gnu");
+            let remote_directory = RemoteTarget::LinuxX64Gnu.remote_directory();
+
+            let create = RemoteTarget::LinuxX64Gnu.create_directory_command(&remote_directory);
+            assert!(!run_posix_cache_command(home.path(), &create, None).success());
+            assert!(!escaped_directory.exists());
+
+            fs::create_dir_all(&escaped_directory).expect("create escaped cache fixture");
+            let staged = format!("{remote_directory}/.satelle-upload-test");
+            let escaped_staged = escaped_directory.join(".satelle-upload-test");
+            let escaped_final = escaped_directory.join("satelle");
+            fs::write(&escaped_final, b"outside final").expect("write escaped final file");
+
+            let upload = RemoteTarget::LinuxX64Gnu.upload_command(&staged, &"00".repeat(32));
+            assert!(!run_posix_cache_command(home.path(), &upload, Some(b"replacement")).success());
+            assert!(!escaped_staged.exists());
+
+            fs::write(&escaped_staged, b"outside staged").expect("write escaped staged file");
+            fs::set_permissions(&escaped_staged, fs::Permissions::from_mode(0o600))
+                .expect("set escaped staged permissions");
+            let prepare = RemoteTarget::LinuxX64Gnu
+                .prepare_staged_command(&staged)
+                .expect("POSIX staging command");
+            assert!(!run_posix_cache_command(home.path(), &prepare, None).success());
+            let promote = RemoteTarget::LinuxX64Gnu
+                .promote_command(&staged, &format!("{remote_directory}/satelle"));
+            assert!(!run_posix_cache_command(home.path(), &promote, None).success());
+
+            assert_eq!(
+                fs::read(&escaped_staged).expect("read escaped staged file"),
+                b"outside staged"
+            );
+            assert_eq!(
+                fs::metadata(&escaped_staged)
+                    .expect("escaped staged metadata")
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o600
+            );
+            assert_eq!(
+                fs::read(&escaped_final).expect("read escaped final file"),
+                b"outside final"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn posix_cache_mutations_accept_valid_owner_controlled_ancestors() {
+        let home = tempfile::tempdir().expect("temporary remote home");
+        let remote_directory = RemoteTarget::LinuxX64Gnu.remote_directory();
+        let create = RemoteTarget::LinuxX64Gnu.create_directory_command(&remote_directory);
+        assert!(run_posix_cache_command(home.path(), &create, None).success());
+
+        let staged = format!("{remote_directory}/.satelle-upload-test");
+        let payload = b"verified artifact";
+        let digest = Sha256::digest(payload)
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        let upload = RemoteTarget::LinuxX64Gnu.upload_command(&staged, &digest);
+        assert!(run_posix_cache_command(home.path(), &upload, Some(payload)).success());
+
+        let prepare = RemoteTarget::LinuxX64Gnu
+            .prepare_staged_command(&staged)
+            .expect("POSIX staging command");
+        assert!(run_posix_cache_command(home.path(), &prepare, None).success());
+        assert_eq!(
+            fs::metadata(home.path().join(&staged))
+                .expect("staged metadata")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
+
+        let final_path = format!("{remote_directory}/satelle");
+        let promote = RemoteTarget::LinuxX64Gnu.promote_command(&staged, &final_path);
+        assert!(run_posix_cache_command(home.path(), &promote, None).success());
+        assert_eq!(
+            fs::read(home.path().join(final_path)).expect("read promoted artifact"),
+            payload
         );
     }
 

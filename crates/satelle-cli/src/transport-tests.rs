@@ -29,6 +29,21 @@ struct RecordingProviderIntentAdapter {
     observed: Arc<Mutex<Option<ProviderComputerUseIntent>>>,
 }
 
+fn spawn_loopback_daemon(service: HostService) -> (tokio::runtime::Runtime, DaemonServer) {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .expect("construct daemon runtime");
+    let server = runtime
+        .block_on(DaemonServer::bind(
+            service,
+            DaemonServerConfig::loopback(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))),
+        ))
+        .expect("bind loopback daemon");
+    (runtime, server)
+}
+
 #[derive(Clone, Default)]
 struct TestInterrupt {
     signalled: Arc<AtomicBool>,
@@ -544,17 +559,7 @@ fn persisted_pending_setup_token_self_activates_on_the_running_daemon() {
         );
     let initialized = service.initialize_daemon().expect("initialize Host state");
     let host_identity = initialized.host_identity().to_string();
-    let runtime = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(2)
-        .enable_all()
-        .build()
-        .expect("construct daemon runtime");
-    let server = runtime
-        .block_on(DaemonServer::bind(
-            service,
-            DaemonServerConfig::loopback(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))),
-        ))
-        .expect("bind loopback daemon");
+    let (_runtime, server) = spawn_loopback_daemon(service);
     let address = server.local_addr();
     let bootstrap_client = DaemonClient::loopback(address, bootstrap_token, &host_identity)
         .expect("construct bootstrap client");
@@ -658,17 +663,7 @@ fn durable_verification_and_bootstrap_handoff_use_distinct_clients() {
     service
         .activate_api_token(&durable_token_id)
         .expect("activate durable setup token");
-    let runtime = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(2)
-        .enable_all()
-        .build()
-        .expect("construct daemon runtime");
-    let server = runtime
-        .block_on(DaemonServer::bind(
-            service,
-            DaemonServerConfig::loopback(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))),
-        ))
-        .expect("bind loopback daemon");
+    let (_runtime, server) = spawn_loopback_daemon(service);
     let address = server.local_addr();
     let bootstrap_client = DaemonClient::loopback(address, bootstrap_token, &host_identity)
         .expect("construct operation-bound bootstrap client");
@@ -703,7 +698,7 @@ fn durable_verification_and_bootstrap_handoff_use_distinct_clients() {
 #[cfg(unix)]
 #[test]
 fn reusable_setup_token_keeps_the_healthy_durable_daemon_running_without_bootstrap() {
-    with_bootstrap_handoff_test_context(|_, fake_ssh| {
+    with_bootstrap_handoff_test_context(|_, fake_ssh, _, _| {
         let state = TestStateDir::new().expect("temporary durable state directory");
         let service = HostService::local_demo_for_tests_at(state.path())
             .expect("construct durable Host service");
@@ -795,23 +790,13 @@ fn reusable_setup_token_keeps_the_healthy_durable_daemon_running_without_bootstr
 #[cfg(unix)]
 #[test]
 fn authentication_rejected_by_live_daemon_enters_bootstrap_fallback() {
-    with_bootstrap_handoff_test_context(|bootstrap_client, fake_ssh| {
+    with_bootstrap_handoff_test_context(|bootstrap_client, fake_ssh, _, _| {
         let state = TestStateDir::new().expect("temporary durable state directory");
         let service = HostService::local_demo_for_tests_at(state.path())
             .expect("construct durable Host service");
         let initialized = service.initialize_daemon().expect("initialize Host state");
         let host_identity = initialized.host_identity().to_string();
-        let runtime = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(2)
-            .enable_all()
-            .build()
-            .expect("construct daemon runtime");
-        let server = runtime
-            .block_on(DaemonServer::bind(
-                service,
-                DaemonServerConfig::loopback(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))),
-            ))
-            .expect("bind loopback daemon");
+        let (_runtime, server) = spawn_loopback_daemon(service);
         let unissued_token = ApiBearerToken::generate().expect("generate valid unissued token");
         let unissued_token_id = unissued_token.token_id().to_string();
         let unissued_client =
@@ -881,7 +866,7 @@ fn authentication_rejected_by_live_daemon_enters_bootstrap_fallback() {
 #[cfg(unix)]
 #[test]
 fn durable_confirmation_transport_failure_falls_back_without_open_mutation() {
-    with_bootstrap_handoff_test_context(|bootstrap_client, fake_ssh| {
+    with_bootstrap_handoff_test_context(|bootstrap_client, fake_ssh, _, _| {
         let transport =
             SshSetupTransport::new(&ssh_setup_host(None)).expect("construct SSH setup transport");
         let unavailable_listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
@@ -965,7 +950,9 @@ fn acquire_bootstrap_lock_for_operation_with_ssh(
 }
 
 #[cfg(unix)]
-fn with_bootstrap_handoff_test_context(test: impl FnOnce(&DaemonClient, &std::path::Path)) {
+fn with_bootstrap_handoff_test_context(
+    test: impl FnOnce(&DaemonClient, &std::path::Path, SocketAddr, &str),
+) {
     use std::os::unix::fs::PermissionsExt as _;
 
     let state = TestStateDir::new().expect("temporary state directory");
@@ -1018,15 +1005,88 @@ esac
     permissions.set_mode(0o700);
     std::fs::set_permissions(&fake_ssh, permissions).expect("make fake SSH executable");
 
-    test(&client, &fake_ssh);
+    test(&client, &fake_ssh, server.local_addr(), &host_identity);
 
     drop(server);
 }
 
 #[cfg(unix)]
 #[test]
+fn rejected_durable_token_is_reported_after_launched_daemon_handoff_is_terminal() {
+    with_bootstrap_handoff_test_context(
+        |bootstrap_client, fake_ssh, daemon_address, host_identity| {
+            let durable_client = DaemonClient::loopback(
+                daemon_address,
+                ApiBearerToken::generate().expect("generate valid unissued durable token"),
+                host_identity,
+            )
+            .expect("construct rejected durable client");
+            let mut bootstrap_lock = acquire_bootstrap_lock_for_operation_with_ssh(
+                "rejected-post-launch-token-host",
+                "fake-ssh-host",
+                "rejected-durable-token-after-launch".to_string(),
+                bootstrap_lock::OperationKind::MissingDaemonRepair,
+                fake_ssh,
+            )
+            .expect("acquire bootstrap lock");
+            bootstrap_lock
+                .mark_mutation_started("daemon_start")
+                .expect("record the simulated verified daemon launch");
+
+            let error = finish_durable_daemon_launch(
+                "rejected-post-launch-token-host",
+                &durable_client,
+                bootstrap_client,
+                &mut bootstrap_lock,
+            )
+            .expect_err("the stale durable token remains rejected after safe handoff");
+
+            assert_eq!(error.code, ErrorCode::AuthenticationFailed);
+            for phase in [
+                "daemon_start",
+                "maintenance_handoff_begin",
+                "maintenance_handoff_complete",
+            ] {
+                let committed = format!("{} {phase} ", bootstrap_lock::MUTATION_COMMITTED);
+                assert_eq!(
+                    bootstrap_lock
+                        .exchanged_lock_lines()
+                        .iter()
+                        .filter(|line| line.starts_with(&committed))
+                        .count(),
+                    1,
+                    "{phase} has one exact commit owner before auth failure is surfaced"
+                );
+            }
+            assert_eq!(
+                bootstrap_lock
+                    .exchanged_lock_lines()
+                    .iter()
+                    .filter(|line| line.as_str() == bootstrap_lock::RELEASE)
+                    .count(),
+                1,
+                "the completed handoff releases before durable authentication is reported"
+            );
+
+            let mut recovered_lock = acquire_bootstrap_lock_for_operation_with_ssh(
+                "rejected-post-launch-token-host",
+                "fake-ssh-host",
+                "controller-after-rejected-durable-token".to_string(),
+                bootstrap_lock::OperationKind::MissingDaemonRepair,
+                fake_ssh,
+            )
+            .expect("durable authentication failure must not strand the bootstrap lock");
+            recovered_lock
+                .release_unmodified()
+                .expect("release recovered bootstrap lock");
+        },
+    );
+}
+
+#[cfg(unix)]
+#[test]
 fn completed_bootstrap_handoff_commit_allows_recovery_after_controller_loss() {
-    with_bootstrap_handoff_test_context(|client, fake_ssh| {
+    with_bootstrap_handoff_test_context(|client, fake_ssh, _, _| {
         let mut bootstrap_lock = acquire_bootstrap_lock_for_operation_with_ssh(
             "crash-window-host",
             "fake-ssh-host",
@@ -1063,7 +1123,7 @@ fn completed_bootstrap_handoff_commit_allows_recovery_after_controller_loss() {
 #[cfg(unix)]
 #[test]
 fn successful_bootstrap_handoff_release_does_not_repeat_the_completion_commit() {
-    with_bootstrap_handoff_test_context(|client, fake_ssh| {
+    with_bootstrap_handoff_test_context(|client, fake_ssh, _, _| {
         let mut bootstrap_lock = acquire_bootstrap_lock_for_operation_with_ssh(
             "successful-release-host",
             "fake-ssh-host",
@@ -1113,7 +1173,7 @@ fn successful_bootstrap_handoff_release_does_not_repeat_the_completion_commit() 
 #[cfg(unix)]
 #[test]
 fn prior_mutation_commit_precedes_maintenance_handoff_begin_for_both_phase_shapes() {
-    with_bootstrap_handoff_test_context(|client, fake_ssh| {
+    with_bootstrap_handoff_test_context(|client, fake_ssh, _, _| {
         for (phase, operation_id) in [
             ("daemon_start", "ordered-daemon-start"),
             (
@@ -1175,7 +1235,7 @@ fn prior_mutation_commit_precedes_maintenance_handoff_begin_for_both_phase_shape
 #[cfg(unix)]
 #[test]
 fn committed_prior_mutation_recovers_after_controller_loss_for_both_phase_shapes() {
-    with_bootstrap_handoff_test_context(|_, fake_ssh| {
+    with_bootstrap_handoff_test_context(|_, fake_ssh, _, _| {
         for (phase, operation_id) in [
             ("daemon_start", "lost-after-committed-daemon-start"),
             (

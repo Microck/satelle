@@ -1882,8 +1882,6 @@ fn durable_ssh_clients(
                 &mut bootstrap_lock,
             )
             .map_err(|error| map_ssh_daemon_bootstrap_error(alias, error))?;
-            wait_for_durable_daemon(alias, || client.capabilities())?;
-            commit_verified_bootstrap_mutation(alias, &mut bootstrap_lock)?;
             let bootstrap_token = ApiBearerToken::parse(raw_bootstrap_token.as_str())
                 .map_err(|_| SatelleError::host_unreachable(alias))?;
             let bootstrap_client = DaemonClient::loopback_with_timeout(
@@ -1893,10 +1891,7 @@ fn durable_ssh_clients(
                 SSH_DAEMON_REQUEST_TIMEOUT,
             )
             .map_err(|error| direct_transport_error(alias, error))?;
-            complete_bootstrap_handoff(alias, &bootstrap_client, &mut bootstrap_lock)?;
-            bootstrap_lock
-                .release_committed_handoff()
-                .map_err(|_| SatelleError::host_unreachable(alias))?;
+            finish_durable_daemon_launch(alias, &client, &bootstrap_client, &mut bootstrap_lock)?;
         }
         Err(error) => return Err(direct_transport_error(alias, error)),
     }
@@ -1904,6 +1899,30 @@ fn durable_ssh_clients(
         DaemonEventClient::loopback(tunnel_addr, event_token, expected_host_identity)
             .map_err(|error| direct_event_error(alias, error))?;
     Ok((client, event_client))
+}
+
+fn finish_durable_daemon_launch(
+    alias: &str,
+    durable_client: &DaemonClient,
+    bootstrap_client: &DaemonClient,
+    bootstrap_lock: &mut ssh_bootstrap::SshBootstrapLock,
+) -> Result<(), SatelleError> {
+    // The daemon was launched with the operation-bound bootstrap credential.
+    // Prove that exact authority and Host identity before committing daemon_start;
+    // a stale durable credential cannot safely prove the launch it did not own.
+    wait_for_durable_daemon(alias, || bootstrap_client.capabilities())?;
+    commit_verified_bootstrap_mutation(alias, bootstrap_lock)?;
+    complete_bootstrap_handoff(alias, bootstrap_client, bootstrap_lock)?;
+    bootstrap_lock
+        .release_committed_handoff()
+        .map_err(|_| SatelleError::host_unreachable(alias))?;
+
+    // Only after the launch and maintenance handoff are terminal do we surface
+    // the durable credential's independent authentication or scope result.
+    durable_client
+        .capabilities()
+        .map(|_| ())
+        .map_err(|error| direct_transport_error(alias, error))
 }
 
 #[cfg(test)]
