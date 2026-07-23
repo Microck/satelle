@@ -101,6 +101,16 @@ fn terminal_session_round_trips_with_follow_up_and_exact_snapshot() {
         .expect("load Session")
         .expect("stored Session");
     assert_eq!(expected, restored.snapshot());
+    assert_eq!(
+        "desktop-session-1",
+        restored
+            .turn(&turn_id(TURN_2))
+            .expect("restored follow-up Turn")
+            .execution_policy()
+            .desktop_target()
+            .session_id(),
+        "the admitted native Desktop Session identity must round-trip"
+    );
 }
 
 #[test]

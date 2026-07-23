@@ -194,7 +194,7 @@ impl ProductionComputerUseAdapter {
         let execution_policy = ExecutionPolicy::new(
             effective_model,
             provider_binding,
-            DesktopTarget::new(desktop_binding.clone()),
+            DesktopTarget::new(desktop_binding.clone(), desktop.session_id.clone()),
             ApprovalPolicy::OnRequest,
             SandboxPolicy::WorkspaceWrite,
             host_turn_timeout_ceiling()?,
@@ -531,9 +531,9 @@ impl ProductionComputerUseAdapter {
         .map_err(|_| adapter_failure("provider_smoke_evidence_invalid"))
     }
 
-    fn resolve_configured_desktop_binding(&self) -> Result<DesktopBindingRef, SatelleError> {
+    fn resolve_configured_desktop_target(&self) -> Result<DesktopTarget, SatelleError> {
         self.native_readiness_key(&ProviderComputerUseIntent::host_default())
-            .map(|key| key.desktop_binding().clone())
+            .map(|key| key.execution_policy().desktop_target().clone())
     }
 
     fn register_execution(
@@ -1135,9 +1135,9 @@ impl ComputerUseAdapter for ProductionComputerUseAdapter {
 
     fn execute(&self, request: ExecuteRequest<'_>) -> Result<ExecuteResult, SatelleError> {
         let policy = request.execution_policy();
-        dispatch_with_configured_desktop_binding(
+        dispatch_with_configured_desktop_target(
             policy,
-            || self.resolve_configured_desktop_binding(),
+            || self.resolve_configured_desktop_target(),
             || {
                 let approval_policy = codex_approval_policy(policy.approval_policy())?;
                 let sandbox_policy = codex_sandbox_policy(policy.sandbox_policy());
@@ -1446,13 +1446,13 @@ fn codex_sandbox_policy(policy: SandboxPolicy) -> CodexSandboxPolicy {
     }
 }
 
-fn dispatch_with_configured_desktop_binding<T>(
+fn dispatch_with_configured_desktop_target<T>(
     policy: &ExecutionPolicy,
-    resolve_configured: impl FnOnce() -> Result<DesktopBindingRef, SatelleError>,
+    resolve_configured: impl FnOnce() -> Result<DesktopTarget, SatelleError>,
     dispatch: impl FnOnce() -> Result<T, SatelleError>,
 ) -> Result<T, SatelleError> {
     let configured = resolve_configured()?;
-    if policy.desktop_target().binding() != &configured {
+    if policy.desktop_target() != &configured {
         return Err(SatelleError::desktop_session_unavailable(Some(
             policy.desktop_target().binding().as_str(),
         )));
@@ -1588,11 +1588,14 @@ fn host_turn_timeout_ceiling() -> Result<TimeoutPolicy, SatelleError> {
 mod tests {
     use super::*;
 
-    fn execution_policy_for(desktop_binding: &str) -> ExecutionPolicy {
+    fn execution_policy_for(desktop_binding: &str, desktop_session_id: &str) -> ExecutionPolicy {
         ExecutionPolicy::new(
             EffectiveModelRef::new(DEFAULT_MODEL_BINDING).unwrap(),
             ProviderBindingRef::new(DEFAULT_PROVIDER_BINDING).unwrap(),
-            DesktopTarget::new(DesktopBindingRef::new(desktop_binding).unwrap()),
+            DesktopTarget::new(
+                DesktopBindingRef::new(desktop_binding).unwrap(),
+                desktop_session_id,
+            ),
             ApprovalPolicy::OnRequest,
             SandboxPolicy::WorkspaceWrite,
             TimeoutPolicy::bounded_seconds(120).unwrap(),
@@ -1603,9 +1606,14 @@ mod tests {
     #[test]
     fn configured_desktop_mismatch_is_rejected_before_codex_dispatch() {
         let dispatch_attempted = std::cell::Cell::new(false);
-        let error = dispatch_with_configured_desktop_binding(
-            &execution_policy_for("admitted-desktop"),
-            || Ok(DesktopBindingRef::new("configured-desktop").unwrap()),
+        let error = dispatch_with_configured_desktop_target(
+            &execution_policy_for("admitted-desktop", "admitted-session"),
+            || {
+                Ok(DesktopTarget::new(
+                    DesktopBindingRef::new("configured-desktop").unwrap(),
+                    "configured-session",
+                ))
+            },
             || {
                 dispatch_attempted.set(true);
                 Ok(())
@@ -1619,6 +1627,53 @@ mod tests {
             !dispatch_attempted.get(),
             "Desktop Binding enforcement must run before Codex dispatch"
         );
+    }
+
+    #[test]
+    fn configured_desktop_session_mismatch_is_rejected_before_codex_dispatch() {
+        let dispatch_attempted = std::cell::Cell::new(false);
+        let error = dispatch_with_configured_desktop_target(
+            &execution_policy_for("configured-desktop", "admitted-session"),
+            || {
+                Ok(DesktopTarget::new(
+                    DesktopBindingRef::new("configured-desktop").unwrap(),
+                    "different-session",
+                ))
+            },
+            || {
+                dispatch_attempted.set(true);
+                Ok(())
+            },
+        )
+        .expect_err("a changed Desktop Session must block Codex dispatch");
+
+        assert_eq!(error.code, ErrorCode::DesktopSessionUnavailable);
+        assert_eq!(error.details["desktop_user"], "configured-desktop");
+        assert!(
+            !dispatch_attempted.get(),
+            "Desktop Session enforcement must run before Codex dispatch"
+        );
+    }
+
+    #[test]
+    fn exact_configured_desktop_target_dispatches() {
+        let dispatch_attempted = std::cell::Cell::new(false);
+        dispatch_with_configured_desktop_target(
+            &execution_policy_for("configured-desktop", "configured-session"),
+            || {
+                Ok(DesktopTarget::new(
+                    DesktopBindingRef::new("configured-desktop").unwrap(),
+                    "configured-session",
+                ))
+            },
+            || {
+                dispatch_attempted.set(true);
+                Ok(())
+            },
+        )
+        .expect("an unchanged Desktop Target must dispatch");
+
+        assert!(dispatch_attempted.get());
     }
 
     #[test]
@@ -1939,7 +1994,7 @@ mod tests {
         let policy = ExecutionPolicy::new(
             EffectiveModelRef::new("model-native-cancellation").unwrap(),
             ProviderBindingRef::new("provider-native-cancellation").unwrap(),
-            DesktopTarget::new(desktop_binding.clone()),
+            DesktopTarget::new(desktop_binding.clone(), "native-cancellation-session"),
             ApprovalPolicy::OnRequest,
             SandboxPolicy::WorkspaceWrite,
             TimeoutPolicy::bounded_seconds(120).unwrap(),
@@ -1992,7 +2047,7 @@ mod tests {
         let policy = ExecutionPolicy::new(
             EffectiveModelRef::new("model-provider-cache").unwrap(),
             ProviderBindingRef::new("provider-cache").unwrap(),
-            DesktopTarget::new(desktop_binding.clone()),
+            DesktopTarget::new(desktop_binding.clone(), "provider-cache-session"),
             ApprovalPolicy::OnRequest,
             SandboxPolicy::WorkspaceWrite,
             TimeoutPolicy::bounded_seconds(120).unwrap(),

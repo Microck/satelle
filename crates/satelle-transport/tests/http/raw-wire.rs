@@ -458,7 +458,10 @@ impl ComputerUseAdapter for ControlledAdmissionAdapter {
             EffectiveModelRef::new("raw-wire-controlled-model").expect("valid model binding"),
             ProviderBindingRef::new("raw-wire-controlled-provider")
                 .expect("valid provider binding"),
-            DesktopTarget::new(desktop_binding.clone()),
+            DesktopTarget::new(
+                desktop_binding.clone(),
+                "raw-wire-controlled-desktop-session",
+            ),
             ApprovalPolicy::OnRequest,
             SandboxPolicy::WorkspaceWrite,
             TimeoutPolicy::bounded_seconds(120).expect("valid timeout policy"),

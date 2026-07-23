@@ -255,7 +255,7 @@ fn lifecycle_readiness() -> Result<AdapterReadiness, SatelleError> {
             .map_err(|error| SatelleError::not_implemented(format!("test model: {error}")))?,
         ProviderBindingRef::new("interrupt-test-provider")
             .map_err(|error| SatelleError::not_implemented(format!("test provider: {error}")))?,
-        DesktopTarget::new(desktop_binding.clone()),
+        DesktopTarget::new(desktop_binding.clone(), "interrupt-test-desktop-session"),
         ApprovalPolicy::OnRequest,
         SandboxPolicy::WorkspaceWrite,
         TimeoutPolicy::bounded_seconds(120)

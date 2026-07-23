@@ -69,6 +69,68 @@ impl super::ComputerUseAdapter for DispatchInspectingAdapter {
     }
 }
 
+#[derive(Clone)]
+struct DesktopTargetInspectingAdapter {
+    observed_target: Arc<Mutex<Option<satelle_core::session::DesktopTarget>>>,
+}
+
+impl super::ComputerUseAdapter for DesktopTargetInspectingAdapter {
+    fn preflight(
+        &self,
+        host: &str,
+        provider_intent: &crate::ProviderComputerUseIntent,
+    ) -> Result<AdapterReadiness, SatelleError> {
+        FakeComputerUseAdapter.preflight(host, provider_intent)
+    }
+
+    fn execute(&self, request: ExecuteRequest<'_>) -> Result<ExecuteResult, SatelleError> {
+        *self.observed_target.lock().expect("target observer lock") =
+            Some(request.execution_policy().desktop_target().clone());
+        FakeComputerUseAdapter.execute(request)
+    }
+
+    fn observe_stop(&self, subject: AdapterSubject<'_>) -> Result<StopObservation, SatelleError> {
+        FakeComputerUseAdapter.observe_stop(subject)
+    }
+
+    fn observe_recovery(
+        &self,
+        subject: AdapterSubject<'_>,
+    ) -> Result<RecoveryObservation, SatelleError> {
+        FakeComputerUseAdapter.observe_recovery(subject)
+    }
+}
+
+#[test]
+fn admitted_desktop_target_reaches_the_detached_worker_unchanged() {
+    let state = crate::TestStateDir::new().expect("temporary state directory should exist");
+    let observed_target = Arc::new(Mutex::new(None));
+    let runtime = RuntimeHandle::new(
+        Ok(state.path().to_path_buf()),
+        DesktopTargetInspectingAdapter {
+            observed_target: Arc::clone(&observed_target),
+        },
+    );
+
+    runtime
+        .run(RunCommand::detached(
+            LOCAL_DEMO_HOST,
+            "PRIVATE_DESKTOP_TARGET_CANARY",
+        ))
+        .expect("detached work should be admitted");
+    runtime
+        .wait_for_background()
+        .expect("detached worker should finish before target inspection");
+
+    let target = observed_target
+        .lock()
+        .expect("target observer lock")
+        .clone()
+        .expect("the worker must receive the admitted target");
+    assert_eq!("local-demo-desktop-v1", target.binding().as_str());
+    assert_eq!("local-demo-session-v1", target.session_id());
+}
+
 impl tracing::Subscriber for DetachedExecutionMarkerSubscriber {
     fn enabled(&self, _metadata: &tracing::Metadata<'_>) -> bool {
         true
@@ -223,7 +285,10 @@ fn assert_host_postcheck_outcome(suffix: &str, fixture: MaintenanceProbeFixture)
     let policy = satelle_core::session::ExecutionPolicy::new(
         satelle_core::session::EffectiveModelRef::new("computer-use-preview").unwrap(),
         satelle_core::session::ProviderBindingRef::new("openai").unwrap(),
-        satelle_core::session::DesktopTarget::new(desktop_binding.clone()),
+        satelle_core::session::DesktopTarget::new(
+            desktop_binding.clone(),
+            format!("desktop-postcheck-session-{suffix}"),
+        ),
         satelle_core::session::ApprovalPolicy::OnRequest,
         satelle_core::session::SandboxPolicy::WorkspaceWrite,
         satelle_core::session::TimeoutPolicy::bounded_seconds(120).unwrap(),

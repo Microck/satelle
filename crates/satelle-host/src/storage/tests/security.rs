@@ -26,7 +26,7 @@ fn private_upstream_refs_are_isolated_from_public_rows_and_logs() {
         ExecutionPolicy::new(
             EffectiveModelRef::new(MODEL_REF).unwrap(),
             ProviderBindingRef::new(PROVIDER_REF).unwrap(),
-            DesktopTarget::new(desktop_binding),
+            DesktopTarget::new(desktop_binding, "security-desktop-session"),
             ApprovalPolicy::OnRequest,
             SandboxPolicy::WorkspaceWrite,
             TimeoutPolicy::bounded_seconds(120).unwrap(),
@@ -302,6 +302,7 @@ fn lifecycle_schema_excludes_raw_content_and_replayable_event_history() {
             "effective_model_ref",
             "provider_binding_ref",
             "desktop_binding_ref",
+            "desktop_session_id",
             "approval_policy",
             "sandbox_policy",
             "timeout_seconds",

@@ -1809,16 +1809,41 @@ impl PendingSetupDesktopSelection {
     }
 }
 
-fn partition_setup_components(setup_components: &[String]) -> (Vec<String>, bool) {
+fn partition_setup_components(
+    setup_components: &[String],
+    ssh_transport: bool,
+    path_rebind: bool,
+) -> (Vec<String>, bool) {
     let desktop_selected = setup_components
         .iter()
         .any(|component| matches!(component.as_str(), "desktop" | "all"));
-    let host_components = setup_components
+    let mut host_components = setup_components
         .iter()
         .filter(|component| component.as_str() != "desktop")
         .cloned()
-        .collect();
+        .collect::<Vec<_>>();
+    if ssh_transport && host_components == ["all"] {
+        // SSH setup currently owns only the authenticated transport handoff.
+        // Keep the user-facing `all` selection intact in the final report, but
+        // do not send that aggregate CLI selector to the transport-only backend.
+        host_components = vec!["transport".to_string()];
+    } else if ssh_transport && path_rebind && host_components.is_empty() {
+        // Selecting new daemon paths requires the transport handoff even when
+        // desktop selection is the only explicit setup component.
+        host_components.push("transport".to_string());
+    }
     (host_components, desktop_selected)
+}
+
+fn setup_transport_if_required<T, E>(
+    required: bool,
+    build: impl FnOnce() -> Result<T, E>,
+) -> Result<Option<T>, E> {
+    if required {
+        build().map(Some)
+    } else {
+        Ok(None)
+    }
 }
 
 fn run_host_setup_if_required<T>(
@@ -1833,12 +1858,15 @@ fn run_host_setup_if_required<T>(
     }
 }
 
-fn run_host_setup_after_desktop_preflight<T>(
+fn run_host_setup_after_desktop_preflight<C, T>(
     desktop_preflight: Result<(), CliFailure>,
-    host_setup: impl FnOnce() -> Result<T, CliFailure>,
+    setup_config: &mut C,
+    persist_desktop_selection: impl FnOnce(&mut C) -> Result<(), CliFailure>,
+    host_setup: impl FnOnce(&C) -> Result<T, CliFailure>,
 ) -> Result<T, CliFailure> {
     desktop_preflight?;
-    host_setup()
+    persist_desktop_selection(setup_config)?;
+    host_setup(setup_config)
 }
 
 fn cli_owned_setup_report(
@@ -2041,7 +2069,9 @@ fn run_setup(
     let first_ssh_trust = host.config.transport == satelle_core::TransportKind::Ssh
         && (host.config.expected_host_id.is_none() || path_rebind);
     let setup_components = setup_components(&command.component).map_err(failure)?;
-    let (host_setup_components, desktop_setup) = partition_setup_components(&setup_components);
+    let ssh_transport = host.config.transport == satelle_core::TransportKind::Ssh;
+    let (host_setup_components, desktop_setup) =
+        partition_setup_components(&setup_components, ssh_transport, path_rebind);
     let explicit_provider_auth = command
         .component
         .iter()
@@ -2069,14 +2099,12 @@ fn run_setup(
         .to_string();
     let tailscale_serve_setup = command.component.as_slice() == [SetupComponent::Transport]
         && tailscale_serve::applies_to(&host.config);
-    let host_setup_required = !host_setup_components.is_empty()
-        || path_rebind
-        || host.config.transport == satelle_core::TransportKind::Ssh;
+    let host_setup_required = !host_setup_components.is_empty();
     let interactive_selection = !command.no_input && !json && io::stdin().is_terminal();
     let mut transport = if tailscale_serve_setup || !host_setup_required {
         None
     } else {
-        Some(transport_for_setup(&host)?)
+        setup_transport_if_required(host_setup_required, || transport_for_setup(&host))?
     };
     let mut report = if tailscale_serve_setup {
         tailscale_serve::configure(
@@ -2200,7 +2228,8 @@ fn run_setup(
                 println!("No changes applied.");
                 return Ok(());
             };
-            transport = Some(transport_for_setup(&host)?);
+            transport =
+                setup_transport_if_required(host_setup_required, || transport_for_setup(&host))?;
             Some(discovery)
         } else {
             None
@@ -2244,58 +2273,68 @@ fn run_setup(
             Ok(())
         })();
 
-        report = run_host_setup_after_desktop_preflight(desktop_preflight, || {
-            if tailscale_serve_setup {
-                tailscale_serve::configure(
-                    &host.alias,
-                    &host.config,
-                    &daemon_path_overrides,
-                    false,
-                    &setup_mode,
-                )
-                .map_err(failure)
-            } else {
-                run_host_setup_if_required(
-                    host_setup_required,
-                    || {
-                        report.dry_run = false;
-                        report
-                    },
-                    || {
-                        transport
-                            .as_ref()
-                            .expect("Host-owned setup transport is present")
-                            .setup(
-                                false,
-                                setup_mode_selection,
-                                host_setup_components,
-                                daemon_path_overrides,
-                            )
-                    },
-                )
-                .map_err(failure)
-            }
-        })?;
+        let mut persisted_desktop_action = None;
+        report = run_host_setup_after_desktop_preflight(
+            desktop_preflight,
+            &mut host.config,
+            |host_config| {
+                if let Some(selection) = &desktop_selection {
+                    persist_desktop_selection(
+                        &user_config_path,
+                        &host.alias,
+                        &selection.desktop_user,
+                        Some(&selection.preference),
+                    )
+                    .map_err(failure)?;
+                    host_config.desktop_user = Some(selection.desktop_user.clone());
+                    host_config.desktop_session_preference = Some(selection.preference.clone());
+                    host_config.desktop_session_native_selector = None;
+                    persisted_desktop_action = Some(selection.action(&host.alias));
+                }
+                Ok(())
+            },
+            |host_config| {
+                if tailscale_serve_setup {
+                    tailscale_serve::configure(
+                        &host.alias,
+                        host_config,
+                        &daemon_path_overrides,
+                        false,
+                        &setup_mode,
+                    )
+                    .map_err(failure)
+                } else {
+                    run_host_setup_if_required(
+                        host_setup_required,
+                        || {
+                            report.dry_run = false;
+                            report
+                        },
+                        || {
+                            transport
+                                .as_ref()
+                                .expect("Host-owned setup transport is present")
+                                .setup(
+                                    false,
+                                    setup_mode_selection,
+                                    host_setup_components,
+                                    daemon_path_overrides,
+                                )
+                        },
+                    )
+                    .map_err(failure)
+                }
+            },
+        )?;
         report.setup_components.clone_from(&setup_components);
         if let Some(decision) = &local_service_decision {
             apply_service_decision_to_report(&mut report, decision);
         }
         add_setup_required_inputs(&mut report, &host.config, explicit_provider_auth);
-        if let Some(selection) = &desktop_selection {
-            let action = selection.action(&host.alias);
+        if let Some(action) = persisted_desktop_action {
             if !report.planned_actions.contains(&action) {
                 report.planned_actions.push(action.clone());
             }
-            persist_desktop_selection(
-                &user_config_path,
-                &host.alias,
-                &selection.desktop_user,
-                Some(&selection.preference),
-            )
-            .map_err(failure)?;
-            host.config.desktop_user = Some(selection.desktop_user.clone());
-            host.config.desktop_session_preference = Some(selection.preference.clone());
-            host.config.desktop_session_native_selector = None;
             report.applied_actions.push(action);
             report.mutated = true;
             if report.status == "planned" {
@@ -6965,6 +7004,34 @@ mod setup_desktop_binding_tests {
     }
 
     #[test]
+    fn setup_component_partition_preserves_cli_and_host_ownership() {
+        assert_eq!(
+            partition_setup_components(&["desktop".to_string()], true, false),
+            (Vec::new(), true)
+        );
+        assert_eq!(
+            partition_setup_components(&["all".to_string()], false, false),
+            (vec!["all".to_string()], true)
+        );
+        assert_eq!(
+            partition_setup_components(&["all".to_string()], false, true),
+            (vec!["all".to_string()], true)
+        );
+    }
+
+    #[test]
+    fn ssh_all_and_path_rebind_normalize_to_the_transport_subplan() {
+        assert_eq!(
+            partition_setup_components(&["all".to_string()], true, false),
+            (vec!["transport".to_string()], true)
+        );
+        assert_eq!(
+            partition_setup_components(&["desktop".to_string()], true, true),
+            (vec!["transport".to_string()], true)
+        );
+    }
+
+    #[test]
     fn execution_desktop_probe_requires_an_explicit_policy() {
         let mut config = host_config();
         assert!(!desktop_policy_is_active(
@@ -6994,10 +7061,19 @@ mod setup_desktop_binding_tests {
     }
 
     #[test]
-    fn empty_host_subplan_never_calls_host_mutation() {
+    fn empty_ssh_desktop_subplan_never_constructs_or_calls_host_mutation() {
+        let (host_components, desktop_selected) =
+            partition_setup_components(&["desktop".to_string()], true, false);
+        let host_setup_required = !host_components.is_empty();
+        let constructed = std::cell::Cell::new(false);
+        let transport = setup_transport_if_required(host_setup_required, || {
+            constructed.set(true);
+            Ok::<_, CliFailure>("SSH setup transport")
+        })
+        .unwrap_or_else(|_| panic!("skipping transport construction cannot fail"));
         let called = std::cell::Cell::new(false);
         let result = run_host_setup_if_required(
-            false,
+            host_setup_required,
             || "cli-owned",
             || {
                 called.set(true);
@@ -7007,17 +7083,23 @@ mod setup_desktop_binding_tests {
         .expect("an empty Host subplan should use the CLI-owned result");
 
         assert_eq!(result, "cli-owned");
+        assert!(desktop_selected);
+        assert!(transport.is_none());
+        assert!(!constructed.get());
         assert!(!called.get());
     }
 
     #[test]
     fn failed_desktop_preflight_blocks_host_mutation() {
         let called = std::cell::Cell::new(false);
+        let mut setup_config = ();
         let result = run_host_setup_after_desktop_preflight(
             Err(failure(SatelleError::invalid_usage(
                 "desktop preflight failed",
             ))),
-            || {
+            &mut setup_config,
+            |_| Ok(()),
+            |_| {
                 called.set(true);
                 Ok(())
             },
@@ -7025,6 +7107,45 @@ mod setup_desktop_binding_tests {
 
         assert!(result.is_err());
         assert!(!called.get());
+    }
+
+    #[test]
+    fn desktop_persistence_precedes_host_apply_and_failure_blocks_it() {
+        let events = std::cell::RefCell::new(Vec::new());
+        let mut setup_config = ();
+        run_host_setup_after_desktop_preflight(
+            Ok(()),
+            &mut setup_config,
+            |_| {
+                events.borrow_mut().push("persist");
+                Ok(())
+            },
+            |_| {
+                events.borrow_mut().push("host");
+                Ok(())
+            },
+        )
+        .unwrap_or_else(|_| panic!("successful desktop persistence should permit Host apply"));
+        assert_eq!(*events.borrow(), ["persist", "host"]);
+
+        let host_called = std::cell::Cell::new(false);
+        let mut setup_config = ();
+        let result = run_host_setup_after_desktop_preflight(
+            Ok(()),
+            &mut setup_config,
+            |_| {
+                Err(failure(SatelleError::config_error(
+                    "desktop selection was not persisted",
+                    None,
+                )))
+            },
+            |_| {
+                host_called.set(true);
+                Ok(())
+            },
+        );
+        assert!(result.is_err());
+        assert!(!host_called.get());
     }
 }
 

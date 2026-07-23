@@ -1212,7 +1212,7 @@ impl ProviderProbeRecoveryAdapter {
         let policy = ExecutionPolicy::new(
             EffectiveModelRef::new("provider-probe-model").unwrap(),
             ProviderBindingRef::new("provider-probe-binding").unwrap(),
-            DesktopTarget::new(desktop.clone()),
+            DesktopTarget::new(desktop.clone(), "provider-probe-desktop-session"),
             ApprovalPolicy::OnRequest,
             SandboxPolicy::WorkspaceWrite,
             TimeoutPolicy::bounded_seconds(120).unwrap(),

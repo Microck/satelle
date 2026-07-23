@@ -762,7 +762,7 @@ mod tests {
     fn mvp_turn_requests_cannot_route_across_desktop_bindings() {
         for field in ["desktop_user", "desktop_binding", "desktop_session"] {
             let mut request = serde_json::json!({
-                "schema_version": "satelle.api.v2",
+                "schema_version": "satelle.api.v3",
                 "prompt": "private prompt",
                 "execution_mode": "standard"
             });

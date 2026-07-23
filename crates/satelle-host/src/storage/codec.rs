@@ -51,6 +51,7 @@ struct RawTurnRow {
     effective_model_ref: String,
     provider_binding_ref: String,
     desktop_binding_ref: String,
+    desktop_session_id: String,
     approval_policy: String,
     sandbox_policy: String,
     timeout_seconds: i64,
@@ -128,8 +129,8 @@ fn load_session(
     let mut statement = connection
         .prepare(
             "SELECT t.turn_id, t.turn_state_revision, t.state, t.started_at, t.updated_at, t.terminal_at, t.safe_summary, \
-                    r.request_token, p.effective_model_ref, p.provider_binding_ref, p.desktop_binding_ref, p.approval_policy, \
-                    p.sandbox_policy, p.timeout_seconds, p.computer_use_enabled, p.provider_computer_use_enabled \
+                    r.request_token, p.effective_model_ref, p.provider_binding_ref, p.desktop_binding_ref, p.desktop_session_id, \
+                    p.approval_policy, p.sandbox_policy, p.timeout_seconds, p.computer_use_enabled, p.provider_computer_use_enabled \
              FROM turns t \
              JOIN turn_private_refs r ON r.turn_id = t.turn_id \
              JOIN turn_policies p ON p.turn_id = t.turn_id \
@@ -156,11 +157,12 @@ fn load_session(
                 effective_model_ref: row.get(8)?,
                 provider_binding_ref: row.get(9)?,
                 desktop_binding_ref: row.get(10)?,
-                approval_policy: row.get(11)?,
-                sandbox_policy: row.get(12)?,
-                timeout_seconds: row.get(13)?,
-                computer_use_enabled: row.get(14)?,
-                provider_computer_use_enabled: row.get(15)?,
+                desktop_session_id: row.get(11)?,
+                approval_policy: row.get(12)?,
+                sandbox_policy: row.get(13)?,
+                timeout_seconds: row.get(14)?,
+                computer_use_enabled: row.get(15)?,
+                provider_computer_use_enabled: row.get(16)?,
             })
         })
         .map_err(|source| sqlite_error(StorageErrorKind::OperationFailed, source))?
@@ -359,6 +361,7 @@ fn parse_turn_row(row: RawTurnRow) -> Result<TurnSnapshot, StorageError> {
         DesktopTarget::new(
             DesktopBindingRef::new(row.desktop_binding_ref)
                 .map_err(|_| StorageError::new(StorageErrorKind::InvalidStoredState))?,
+            row.desktop_session_id,
         ),
         parse_approval_policy(&row.approval_policy)?,
         parse_sandbox_policy(&row.sandbox_policy)?,

@@ -124,6 +124,7 @@ CREATE TABLE turn_policies (
     effective_model_ref TEXT NOT NULL,
     provider_binding_ref TEXT NOT NULL,
     desktop_binding_ref TEXT NOT NULL,
+    desktop_session_id TEXT NOT NULL,
     approval_policy TEXT NOT NULL
         CHECK (approval_policy IN ('untrusted', 'on_failure', 'on_request', 'never')),
     sandbox_policy TEXT NOT NULL

@@ -176,7 +176,10 @@ fn execution_policy() -> ExecutionPolicy {
     ExecutionPolicy::new(
         EffectiveModelRef::new("model-retention").unwrap(),
         ProviderBindingRef::new("provider-retention").unwrap(),
-        DesktopTarget::new(DesktopBindingRef::new("desktop-binding-retention").unwrap()),
+        DesktopTarget::new(
+            DesktopBindingRef::new("desktop-binding-retention").unwrap(),
+            "desktop-session-retention",
+        ),
         ApprovalPolicy::OnRequest,
         SandboxPolicy::WorkspaceWrite,
         TimeoutPolicy::bounded_seconds(120).unwrap(),
