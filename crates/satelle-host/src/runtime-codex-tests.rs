@@ -238,8 +238,11 @@ fn schema_and_handshake_share_one_hard_deadline() {
         started.elapsed() < Duration::from_millis(6_500),
         "schema discovery and the handshake used separate timeout budgets"
     );
+    let admission = ControlPlaneAdmission::from_probe(probe);
+    assert!(!admission.goal_set());
+    assert_eq!(admission.image_input(), CodexImageInputMode::Unsupported);
     assert_eq!(
-        ControlPlaneAdmission::from_probe(probe)
+        admission
             .admit(ControlPlaneOperation::Run)
             .expect_err("the incomplete handshake must remain blocked")
             .details["reason"],

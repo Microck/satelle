@@ -280,10 +280,10 @@ pub(crate) fn run_codex_session(
     run_exchange(command, working_directory, deadline, &mut exchange)
 }
 
-/// Runs a provider probe until its user-visible timeout, then uses the same
-/// correlated control channel as a normal Turn stop to request upstream
-/// cancellation. The exchange deadline includes a short grace period so the
-/// app server can confirm that the probe Turn is no longer active.
+/// Runs an exchange until its user-visible timeout, then uses its registered
+/// correlated control channel to request upstream cancellation. The exchange
+/// deadline includes a short grace period so the app server can confirm that
+/// the Turn is no longer active.
 pub(crate) fn run_codex_session_with_timeout_cancellation(
     command: Command,
     mut request: CodexSessionRequest<'_>,
@@ -294,7 +294,10 @@ pub(crate) fn run_codex_session_with_timeout_cancellation(
     let cancellation_deadline = timeout_deadline
         .checked_add(cancellation_grace)
         .unwrap_or(timeout_deadline);
-    let control = CodexSessionControl::new(cancellation_deadline);
+    let control = request
+        .control
+        .clone()
+        .unwrap_or_else(|| CodexSessionControl::new(cancellation_deadline));
     request.deadline = cancellation_deadline;
     request.control = Some(control.clone());
 

@@ -8,7 +8,7 @@ use crate::READINESS_CANCELLATION_GRACE;
 use crate::codex_session::{
     CodexApprovalPolicy, CodexSandboxPolicy, CodexSessionControl, CodexSessionError,
     CodexSessionFailure, CodexSessionRequest, CodexSessionTerminal, CodexTurnReadRequest,
-    CodexTurnStatus, read_codex_turn, run_codex_session,
+    CodexTurnStatus, TimedCodexSessionRun, read_codex_turn,
     run_codex_session_with_timeout_cancellation,
 };
 use command_group::{CommandGroup, GroupChild};
@@ -1128,12 +1128,15 @@ impl ComputerUseAdapter for ProductionComputerUseAdapter {
         let deadline = Instant::now()
             .checked_add(timeout)
             .ok_or_else(|| adapter_failure("timeout_unrepresentable"))?;
+        let cancellation_deadline = deadline
+            .checked_add(READINESS_CANCELLATION_GRACE)
+            .unwrap_or(deadline);
         let working_directory = self
             .working_directory
             .as_ref()
             .map_err(Clone::clone)
             .and_then(|path| prepare_working_directory(path))?;
-        let control = CodexSessionControl::new(deadline);
+        let control = CodexSessionControl::new(cancellation_deadline);
         let _active_execution = self.register_execution(request.subject(), control.clone())?;
         tracing::debug!(
             session_id = %request.subject().session_id(),
@@ -1167,7 +1170,7 @@ impl ComputerUseAdapter for ProductionComputerUseAdapter {
                 "the selected Codex protocol does not support image input",
             ));
         }
-        let result = run_codex_session(
+        let run = run_codex_session_with_timeout_cancellation(
             preserve_managed_codex_error(crate::codex_capabilities::installed_app_server_command())?,
             CodexSessionRequest {
                 working_directory: &working_directory,
@@ -1186,8 +1189,10 @@ impl ComputerUseAdapter for ProductionComputerUseAdapter {
                 image_input_mode,
                 attachments: request.attachments(),
             },
+            READINESS_CANCELLATION_GRACE,
+            None,
         );
-        finish_execution(result, persistence_error.into_inner())
+        finish_timed_turn_execution(run, persistence_error.into_inner())
     }
 
     fn observe_stop(&self, subject: AdapterSubject<'_>) -> Result<StopObservation, SatelleError> {
@@ -1459,6 +1464,42 @@ fn finish_execution(
         return Err(error);
     }
     terminal_result(result)
+}
+
+fn finish_timed_turn_execution(
+    run: TimedCodexSessionRun,
+    persistence_error: Option<SatelleError>,
+) -> Result<ExecuteResult, SatelleError> {
+    let Some(cancellation) = run.cancellation else {
+        return finish_execution(run.result, persistence_error);
+    };
+    if let (Err(failure), Some(error)) = (&run.result, persistence_error)
+        && failure.turn_dispatch_attempted()
+    {
+        return Err(error);
+    }
+    if matches!(
+        &run.result,
+        Err(failure) if failure.error() == CodexSessionError::Containment
+    ) {
+        return Err(session_failure(CodexSessionError::Containment));
+    }
+    if matches!(
+        cancellation,
+        StopObservation::CancellationConfirmed | StopObservation::UpstreamInactiveConfirmed
+    ) {
+        return Ok(ExecuteResult::new(TurnTransition::Failed, Vec::new()));
+    }
+    match run.result {
+        result @ Ok(
+            CodexSessionTerminal::Completed
+            | CodexSessionTerminal::Interrupted
+            | CodexSessionTerminal::Failed,
+        ) => terminal_result(result),
+        Ok(CodexSessionTerminal::StoppedByControl) | Err(_) => {
+            Err(session_failure(CodexSessionError::Timeout))
+        }
+    }
 }
 
 fn session_failure(error: CodexSessionError) -> SatelleError {
@@ -2004,6 +2045,31 @@ mod tests {
                 .transition()
                 .is_none()
         );
+    }
+
+    #[test]
+    fn timed_turn_requires_confirmed_upstream_cancellation_before_failing_terminally() {
+        let confirmed = finish_timed_turn_execution(
+            TimedCodexSessionRun {
+                result: Ok(CodexSessionTerminal::StoppedByControl),
+                cancellation: Some(StopObservation::UpstreamInactiveConfirmed),
+            },
+            None,
+        )
+        .expect("confirmed timeout cancellation is terminal");
+        assert_eq!(confirmed.transition(), Some(TurnTransition::Failed));
+
+        let error = match finish_timed_turn_execution(
+            TimedCodexSessionRun {
+                result: Ok(CodexSessionTerminal::StoppedByControl),
+                cancellation: Some(StopObservation::OutcomeUnknown),
+            },
+            None,
+        ) {
+            Err(error) => error,
+            Ok(_) => panic!("unconfirmed timeout cancellation must enter recovery"),
+        };
+        assert_eq!(error.details["reason"], serde_json::json!("timeout"));
     }
 
     #[test]

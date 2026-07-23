@@ -412,13 +412,13 @@ fn reject_profile_duration_errors(
             return Err(SatelleError::duration_unit_required(path, &timeout_path));
         };
         if key == "turn_execution" {
-            let Some(duration) = super::TurnExecutionDuration::parse(value) else {
+            let Some(seconds) = super::parse_turn_execution_seconds(value) else {
                 return Err(SatelleError::turn_duration_unit_required(
                     path,
                     &timeout_path,
                 ));
             };
-            if duration.milliseconds() > super::MAX_TURN_EXECUTION_TIMEOUT_MS {
+            if seconds > super::MAX_TURN_EXECUTION_TIMEOUT_MS / 1_000 {
                 return Err(SatelleError::turn_timeout_config_limit_exceeded(
                     path,
                     &timeout_path,
@@ -530,6 +530,26 @@ mod timeout_profile_tests {
             .hosts
             .remove(super::super::LOCAL_DEMO_HOST)
             .expect("default local Host")
+    }
+
+    #[test]
+    fn profile_turn_timeout_above_the_hard_limit_reports_the_limit() {
+        let path = Path::new("user-config.toml");
+        let table = toml::from_str::<toml::Table>("[timeouts]\nturn_execution = \"25h\"\n")
+            .expect("parse invalid profile timeout fixture");
+
+        let error = reject_profile_duration_errors(path, "profiles.fast", &table)
+            .expect_err("a profile Turn timeout above 24h must fail");
+
+        assert_eq!(error.code, ErrorCode::ConfigError);
+        assert_eq!(
+            error.details["path"],
+            serde_json::json!("profiles.fast.timeouts.turn_execution")
+        );
+        assert_eq!(
+            error.details["maximum_timeout_ms"],
+            serde_json::json!(super::super::MAX_TURN_EXECUTION_TIMEOUT_MS)
+        );
     }
 
     #[test]

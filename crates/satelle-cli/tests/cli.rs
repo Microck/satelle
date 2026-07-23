@@ -1624,6 +1624,10 @@ fn run_help_has_events_modes_without_a_watch_option() {
         assert!(stdout.contains("--events <EVENTS>"));
         assert!(stdout.contains("--quiet"));
         assert!(stdout.contains("--verbose"));
+        assert!(stdout.contains("--image <LOCAL_PATH>"));
+        assert!(stdout.contains("local PNG or JPEG image"));
+        assert!(stdout.contains("maximum 2, 5 MiB each, 10 MiB total"));
+        assert!(stdout.contains("Host capabilities"));
         assert!(stdout.contains("--timeout <DURATION>"));
         assert!(stdout.contains("shell history"));
         assert!(stdout.contains("local process metadata"));

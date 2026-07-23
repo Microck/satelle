@@ -89,12 +89,13 @@ impl ControlPlaneAdmission {
     }
 
     pub(crate) const fn goal_set(self) -> bool {
-        matches!(self, Self::Probed(probe) if probe.goal_set)
+        matches!(self, Self::Probed(probe) if probe.handshake_completed && probe.goal_set)
     }
 
     pub(crate) const fn image_input(self) -> CodexImageInputMode {
         match self {
-            Self::Probed(probe) => probe.image_input,
+            Self::Probed(probe) if probe.handshake_completed => probe.image_input,
+            Self::Probed(_) => CodexImageInputMode::Unsupported,
             Self::NotApplicable | Self::Unavailable(_) => CodexImageInputMode::Unsupported,
         }
     }

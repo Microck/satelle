@@ -565,7 +565,11 @@ struct RunCommand {
         help = "Read prompt text from a local file; recommended for sensitive prompt input"
     )]
     prompt_file: Option<PathBuf>,
-    #[arg(long = "image", value_name = "LOCAL_PATH")]
+    #[arg(
+        long = "image",
+        value_name = "LOCAL_PATH",
+        help = "Attach a local PNG or JPEG image (maximum 2, 5 MiB each, 10 MiB total); accepted media types depend on Host capabilities"
+    )]
     images: Vec<PathBuf>,
     #[arg(
         long,
@@ -621,7 +625,11 @@ struct SteerCommand {
         help = "Read prompt text from a local file; recommended for sensitive prompt input"
     )]
     prompt_file: Option<PathBuf>,
-    #[arg(long = "image", value_name = "LOCAL_PATH")]
+    #[arg(
+        long = "image",
+        value_name = "LOCAL_PATH",
+        help = "Attach a local PNG or JPEG image (maximum 2, 5 MiB each, 10 MiB total); accepted media types depend on Host capabilities"
+    )]
     images: Vec<PathBuf>,
     #[arg(
         long,

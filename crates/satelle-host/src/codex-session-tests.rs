@@ -715,6 +715,9 @@ fn timed_provider_exchange_requests_correlated_upstream_cancellation() {
         Ok(())
     };
 
+    let timeout_deadline = Instant::now() + Duration::from_millis(100);
+    let cancellation_grace = Duration::from_secs(1);
+    let registered_control = CodexSessionControl::new(timeout_deadline + cancellation_grace);
     let run = run_codex_session_with_timeout_cancellation(
         command,
         CodexSessionRequest {
@@ -726,15 +729,15 @@ fn timed_provider_exchange_requests_correlated_upstream_cancellation() {
             execution_mode: TurnExecutionMode::Standard,
             approval_policy: CodexApprovalPolicy::OnRequest,
             sandbox_policy: CodexSandboxPolicy::WorkspaceWrite,
-            deadline: Instant::now() + Duration::from_millis(100),
+            deadline: timeout_deadline,
             persist_thread_ref: &mut persist_thread,
             persist_turn_ref: &mut persist_turn,
-            control: None,
+            control: Some(registered_control.clone()),
             goal_set_supported: false,
             image_input_mode: crate::codex_capabilities::CodexImageInputMode::Unsupported,
             attachments: &[],
         },
-        Duration::from_secs(1),
+        cancellation_grace,
         None,
     );
 
@@ -743,6 +746,10 @@ fn timed_provider_exchange_requests_correlated_upstream_cancellation() {
         Some(StopObservation::UpstreamInactiveConfirmed)
     );
     assert_eq!(run.result, Ok(CodexSessionTerminal::StoppedByControl));
+    assert!(matches!(
+        registered_control.claim_receiver(),
+        Err(CodexSessionError::Control)
+    ));
     let requests = read_to_string(log_path).expect("provider timeout protocol log");
     assert!(requests.contains(r#""method":"turn/interrupt""#));
     assert!(requests.contains(r#""threadId":"thread-1""#));
