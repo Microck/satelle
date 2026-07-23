@@ -1,5 +1,6 @@
 use super::*;
 use serde_json::{Value, json};
+use sha2::Digest as _;
 use std::fs::{OpenOptions, read_to_string};
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -54,7 +55,7 @@ fn main() {
             output.flush().unwrap();
         }
         "eof" => return,
-        "timeout" => hang(),
+        "timeout" | "timeout-local-image" => hang(),
         _ => {}
     }
     if matches!(scenario.as_str(), "wrong-id" | "out-of-order" | "malformed" | "non-object" | "oversized" | "unterminated") {
@@ -112,7 +113,14 @@ fn main() {
         send(&mut output, &thread_response);
         if thread_id == "thread-1" { wait_for(&thread_marker); }
         if scenario == "blocked-write" { hang(); }
-        receive(&mut input, &log);
+        let next_request = receive(&mut input, &log);
+        if scenario == "goal" {
+            assert!(next_request.contains(r#""id":3"#));
+            assert!(next_request.contains(r#""method":"thread/goal/set""#));
+            assert!(next_request.contains(r#""threadId":"thread-1""#));
+            send(&mut output, r#"{"id":3,"result":{"goal":{"threadId":"thread-1","objective":"perform the harmless action PRIVATE_PROMPT_CANARY","status":"active","createdAt":1,"updatedAt":1,"tokensUsed":0,"timeUsedSeconds":0,"tokenBudget":null}}}"#);
+            receive(&mut input, &log);
+        }
     }
 
     match scenario.as_str() {
@@ -124,7 +132,11 @@ fn main() {
         _ => {}
     }
 
-    send(&mut output, r#"{"id":3,"result":{"turn":{"id":"turn-1","status":"inProgress"}}}"#);
+    if scenario == "goal" {
+        send(&mut output, r#"{"id":4,"result":{"turn":{"id":"turn-1","status":"inProgress"}}}"#);
+    } else {
+        send(&mut output, r#"{"id":3,"result":{"turn":{"id":"turn-1","status":"inProgress"}}}"#);
+    }
     wait_for(&turn_marker);
     if scenario == "controlled-interrupt" {
         let interrupt = receive(&mut input, &log);
@@ -259,6 +271,7 @@ struct ScenarioResult {
     persisted_threads: Vec<String>,
     persisted_turns: Vec<String>,
     child_working_directory: PathBuf,
+    staged_image_path: Option<PathBuf>,
     _fixture: CompiledFixture,
     directory: tempfile::TempDir,
 }
@@ -355,6 +368,12 @@ fn run_scenario_with_options(
 ) -> ScenarioResult {
     let fixture = compile_fixture();
     let directory = tempfile::tempdir().expect("scenario directory");
+    #[cfg(unix)]
+    std::fs::set_permissions(
+        directory.path(),
+        std::os::unix::fs::PermissionsExt::from_mode(0o700),
+    )
+    .expect("make scenario directory owner-only");
     let log_path = directory.path().join("requests.jsonl");
     let cwd_log_path = directory.path().join("child-cwd");
     let thread_marker = directory.path().join("thread-persisted");
@@ -387,6 +406,31 @@ fn run_scenario_with_options(
         touch(&turn_marker);
         Ok(())
     };
+    let uses_local_image = matches!(scenario, "local-image" | "timeout-local-image");
+    let staged = if uses_local_image {
+        let bytes = b"\x89PNG\r\n\x1a\nfixture";
+        let digest = sha2::Sha256::digest(bytes)
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        let verified = crate::attachment::verify_uploads(vec![crate::AttachmentUpload::new(
+            "image/png",
+            bytes.len() as u64,
+            digest,
+            base64::engine::general_purpose::STANDARD.encode(bytes),
+        )])
+        .expect("verify local image fixture");
+        crate::attachment::AttachmentStore::open(directory.path().join("attachments"))
+            .expect("open attachment fixture store")
+            .stage(verified)
+            .expect("stage local image fixture")
+    } else {
+        crate::attachment::StagedAttachments::default()
+    };
+    let staged_image_path = staged
+        .images()
+        .first()
+        .map(|image| image.path().to_path_buf());
     let session_started = Instant::now();
     let session_result = run_codex_session(
         command,
@@ -403,8 +447,16 @@ fn run_scenario_with_options(
             persist_thread_ref: &mut persist_thread,
             persist_turn_ref: &mut persist_turn,
             control: None,
+            goal_set_supported: scenario == "goal",
+            image_input_mode: if uses_local_image {
+                crate::codex_capabilities::CodexImageInputMode::Local
+            } else {
+                crate::codex_capabilities::CodexImageInputMode::Unsupported
+            },
+            attachments: staged.images(),
         },
     );
+    drop(staged);
     let session_elapsed = session_started.elapsed();
     let turn_dispatch_attempted = session_result
         .as_ref()
@@ -426,6 +478,7 @@ fn run_scenario_with_options(
         child_working_directory: PathBuf::from(
             std::fs::read_to_string(cwd_log_path).expect("child working-directory record"),
         ),
+        staged_image_path,
         _fixture: fixture,
         directory,
     }
@@ -484,6 +537,49 @@ fn first_thread_uses_exact_policy_order_and_persists_refs() {
         "threadId":"thread-1","model":"gpt-fixture","approvalPolicy":"on-request",
         "sandboxPolicy":{"type":"workspaceWrite","writableRoots":[run.directory.path()],"networkAccess":false,
             "excludeTmpdirEnvVar":true,"excludeSlashTmp":true}}})
+    );
+}
+
+#[test]
+fn supported_goal_is_confirmed_before_the_first_turn() {
+    let run = run_scenario("goal", None, Duration::from_secs(3));
+    assert_eq!(run.result, Ok(CodexSessionTerminal::Completed));
+    assert_eq!(run.requests.len(), 5);
+    assert_eq!(run.requests[2]["method"], "thread/start");
+    assert_eq!(run.requests[3]["id"], 3);
+    assert_eq!(run.requests[3]["method"], "thread/goal/set");
+    assert_eq!(run.requests[3]["params"]["threadId"], "thread-1");
+    assert_eq!(
+        run.requests[3]["params"]["objective"],
+        "perform the harmless action PRIVATE_PROMPT_CANARY"
+    );
+    assert_eq!(run.requests[4]["id"], 4);
+    assert_eq!(run.requests[4]["method"], "turn/start");
+}
+
+#[test]
+fn staged_images_are_sent_as_daemon_local_image_inputs() {
+    let run = run_scenario("local-image", None, Duration::from_secs(3));
+    assert_eq!(run.result, Ok(CodexSessionTerminal::Completed));
+    assert_eq!(run.requests[3]["method"], "turn/start");
+    assert_eq!(run.requests[3]["params"]["input"][0]["type"], "text");
+    assert_eq!(run.requests[3]["params"]["input"][1]["type"], "localImage");
+    let image_path = run.requests[3]["params"]["input"][1]["path"]
+        .as_str()
+        .expect("local image path");
+    assert!(Path::new(image_path).starts_with(run.directory.path()));
+    assert!(!run.requests[3].to_string().contains("data:image"));
+}
+
+#[test]
+fn timeout_drops_staged_local_images() {
+    let run = run_scenario("timeout-local-image", None, Duration::from_millis(500));
+
+    assert_eq!(run.result, Err(CodexSessionError::Timeout));
+    assert!(
+        !run.staged_image_path
+            .expect("timeout scenario staged an image")
+            .exists()
     );
 }
 
@@ -567,6 +663,9 @@ fn live_interrupt_waits_for_the_durable_stop_acknowledgement() {
                 persist_thread_ref: &mut persist_thread,
                 persist_turn_ref: &mut persist_turn,
                 control: Some(session_control),
+                goal_set_supported: false,
+                image_input_mode: crate::codex_capabilities::CodexImageInputMode::Unsupported,
+                attachments: &[],
             },
         )
     });
@@ -616,6 +715,9 @@ fn timed_provider_exchange_requests_correlated_upstream_cancellation() {
         Ok(())
     };
 
+    let timeout_deadline = Instant::now() + Duration::from_millis(100);
+    let cancellation_grace = Duration::from_secs(1);
+    let registered_control = CodexSessionControl::new(timeout_deadline + cancellation_grace);
     let run = run_codex_session_with_timeout_cancellation(
         command,
         CodexSessionRequest {
@@ -627,12 +729,15 @@ fn timed_provider_exchange_requests_correlated_upstream_cancellation() {
             execution_mode: TurnExecutionMode::Standard,
             approval_policy: CodexApprovalPolicy::OnRequest,
             sandbox_policy: CodexSandboxPolicy::WorkspaceWrite,
-            deadline: Instant::now() + Duration::from_millis(100),
+            deadline: timeout_deadline,
             persist_thread_ref: &mut persist_thread,
             persist_turn_ref: &mut persist_turn,
-            control: None,
+            control: Some(registered_control.clone()),
+            goal_set_supported: false,
+            image_input_mode: crate::codex_capabilities::CodexImageInputMode::Unsupported,
+            attachments: &[],
         },
-        Duration::from_secs(1),
+        cancellation_grace,
         None,
     );
 
@@ -641,6 +746,10 @@ fn timed_provider_exchange_requests_correlated_upstream_cancellation() {
         Some(StopObservation::UpstreamInactiveConfirmed)
     );
     assert_eq!(run.result, Ok(CodexSessionTerminal::StoppedByControl));
+    assert!(matches!(
+        registered_control.claim_receiver(),
+        Err(CodexSessionError::Control)
+    ));
     let requests = read_to_string(log_path).expect("provider timeout protocol log");
     assert!(requests.contains(r#""method":"turn/interrupt""#));
     assert!(requests.contains(r#""threadId":"thread-1""#));

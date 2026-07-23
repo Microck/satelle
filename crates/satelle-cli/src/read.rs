@@ -119,7 +119,10 @@ pub(super) fn config_explain_report(
         "values": {
             "default_host": config.config.default_host,
             "host_count": config.config.hosts.len(),
-            "effective_timeouts": super::effective_timeouts_json(&selected_host_config),
+            "effective_timeouts": super::effective_timeouts_json(
+                &selected_host_config,
+                super::configured_turn_execution_timeout_ms(&selected_host_config),
+            ),
             "daemon_path_overrides": daemon_path_overrides_json(&selected_host_config),
             "model_provider": model_provider_config_json(config, &selected_host),
             "experimental_provider_computer_use": experimental_provider_computer_use_json(

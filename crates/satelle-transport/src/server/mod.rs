@@ -959,6 +959,7 @@ async fn capabilities(
         state.capabilities.codex_runtime(),
         state.capabilities.native_computer_use(),
         state.capabilities.provider_computer_use(),
+        state.capabilities.image_attachments(),
         state.limits,
     );
     let mut response = authenticated_json_response(

@@ -560,11 +560,29 @@ struct RunCommand {
     no_yolo: bool,
     #[arg(long, value_enum, default_value_t = EventMode::Auto)]
     events: EventMode,
-    #[arg(long)]
+    #[arg(
+        long,
+        help = "Read prompt text from a local file; recommended for sensitive prompt input"
+    )]
     prompt_file: Option<PathBuf>,
+    #[arg(
+        long = "image",
+        value_name = "LOCAL_PATH",
+        help = "Attach a local PNG or JPEG image (maximum 2, 5 MiB each, 10 MiB total); accepted media types depend on Host capabilities"
+    )]
+    images: Vec<PathBuf>,
+    #[arg(
+        long,
+        value_name = "DURATION",
+        help = "Shorten this Turn's execution timeout (for example 30s, 5m, or 1h; maximum 24h)"
+    )]
+    timeout: Option<String>,
     #[command(flatten)]
     output_args: OutputArgs,
-    #[arg(value_name = "PROMPT_OR_DASH")]
+    #[arg(
+        value_name = "PROMPT_OR_DASH",
+        help = "Prompt text or '-' for stdin. Prompt arguments may be retained by shell history or visible in local process metadata; use stdin or --prompt-file for sensitive input"
+    )]
     prompt: Option<String>,
 }
 
@@ -602,11 +620,29 @@ struct SteerCommand {
     no_yolo: bool,
     #[arg(long, value_enum, default_value_t = EventMode::Auto)]
     events: EventMode,
-    #[arg(long)]
+    #[arg(
+        long,
+        help = "Read prompt text from a local file; recommended for sensitive prompt input"
+    )]
     prompt_file: Option<PathBuf>,
+    #[arg(
+        long = "image",
+        value_name = "LOCAL_PATH",
+        help = "Attach a local PNG or JPEG image (maximum 2, 5 MiB each, 10 MiB total); accepted media types depend on Host capabilities"
+    )]
+    images: Vec<PathBuf>,
+    #[arg(
+        long,
+        value_name = "DURATION",
+        help = "Shorten this Turn's execution timeout (for example 30s, 5m, or 1h; maximum 24h)"
+    )]
+    timeout: Option<String>,
     #[command(flatten)]
     output_args: OutputArgs,
-    #[arg(value_name = "PROMPT_OR_DASH")]
+    #[arg(
+        value_name = "PROMPT_OR_DASH",
+        help = "Prompt text or '-' for stdin. Prompt arguments may be retained by shell history or visible in local process metadata; use stdin or --prompt-file for sensitive input"
+    )]
     prompt: Option<String>,
 }
 
@@ -4123,6 +4159,7 @@ fn ssh_launch_readiness_timeouts(
         (Some(native), Some(provider)) => Ok(Some(satelle_core::TimeoutConfig {
             native_readiness: satelle_core::ExplicitDuration::parse(&format!("{native}ms")),
             provider_smoke_test: satelle_core::ExplicitDuration::parse(&format!("{provider}ms")),
+            turn_execution: None,
         })),
         (None, None) => Ok(None),
         _ => Err(SatelleError::invalid_usage(
@@ -5536,6 +5573,160 @@ fn report_not_admitted<T>(
     }
 }
 
+fn load_image_attachments(
+    paths: &[PathBuf],
+    supported_media_types: Vec<String>,
+) -> Result<Vec<satelle_transport::ImageAttachment>, CliFailure> {
+    use base64::Engine as _;
+    use sha2::Digest as _;
+
+    if paths.len() > satelle_transport::MAX_IMAGE_ATTACHMENT_COUNT {
+        return Err(failure(SatelleError::invalid_usage(
+            "at most two image attachments may be supplied",
+        )));
+    }
+    if !paths.is_empty() && supported_media_types.is_empty() {
+        return Err(failure(SatelleError::invalid_usage(
+            "the selected Host does not advertise image attachment support",
+        )));
+    }
+
+    let mut total = 0_usize;
+    paths
+        .iter()
+        .enumerate()
+        .map(|(index, path)| {
+            let number = index + 1;
+            let bytes = satelle_core::read_bounded_regular_file_no_follow(
+                path,
+                satelle_transport::MAX_IMAGE_ATTACHMENT_BYTES,
+            )
+            .map_err(|error| match error {
+                satelle_core::SecureFileError::TooLarge => {
+                    image_input_error(number, "exceeds the per-image byte limit")
+                }
+                _ => image_input_error(number, "is unavailable or unsafe"),
+            })?;
+            total = total
+                .checked_add(bytes.len())
+                .ok_or_else(|| image_input_error(number, "exceeds the aggregate byte limit"))?;
+            if total > satelle_transport::MAX_IMAGE_ATTACHMENT_BYTES_TOTAL {
+                return Err(image_input_error(
+                    number,
+                    "exceeds the aggregate byte limit",
+                ));
+            }
+            let media_type = sniff_local_image_media_type(&bytes)
+                .ok_or_else(|| image_input_error(number, "has an unsupported media type"))?;
+            if !supported_media_types
+                .iter()
+                .any(|value| value == media_type)
+            {
+                return Err(image_input_error(
+                    number,
+                    "is not supported by the selected Host",
+                ));
+            }
+            let digest = sha2::Sha256::digest(&bytes);
+            let sha256: String = digest.iter().map(|byte| format!("{byte:02x}")).collect();
+            let data_base64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
+            Ok(satelle_transport::ImageAttachment::new(
+                media_type,
+                bytes.len() as u64,
+                sha256,
+                data_base64,
+            ))
+        })
+        .collect()
+}
+
+fn image_input_error(number: usize, reason: &str) -> CliFailure {
+    failure(SatelleError::invalid_usage(format!(
+        "image attachment {number} {reason}"
+    )))
+}
+
+fn sniff_local_image_media_type(bytes: &[u8]) -> Option<&'static str> {
+    if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+        Some("image/png")
+    } else if bytes.starts_with(b"\xff\xd8\xff") {
+        Some("image/jpeg")
+    } else {
+        None
+    }
+}
+
+#[test]
+fn image_loader_accepts_a_relative_png_with_truthful_metadata() {
+    use base64::Engine as _;
+    use sha2::Digest as _;
+
+    let directory = tempfile::tempdir_in(".").expect("create image fixture directory");
+    let path = directory.path().join("fixture.png");
+    let bytes = b"\x89PNG\r\n\x1a\nfixture";
+    std::fs::write(&path, bytes).expect("write image fixture");
+    let path = path
+        .strip_prefix(std::env::current_dir().expect("resolve Controller cwd"))
+        .expect("fixture is inside the Controller cwd")
+        .to_path_buf();
+    assert!(!path.is_absolute());
+
+    let attachments = match load_image_attachments(&[path], vec!["image/png".to_string()]) {
+        Ok(attachments) => attachments,
+        Err(_) => panic!("load supported image fixture"),
+    };
+
+    assert_eq!(attachments.len(), 1);
+    assert_eq!(attachments[0].media_type(), "image/png");
+    assert_eq!(attachments[0].size_bytes(), bytes.len() as u64);
+    assert_eq!(
+        attachments[0].data_base64(),
+        base64::engine::general_purpose::STANDARD.encode(bytes)
+    );
+    assert_eq!(
+        attachments[0].sha256(),
+        sha2::Sha256::digest(bytes)
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>()
+    );
+}
+
+#[test]
+fn image_loader_rejects_parent_traversal_before_file_access() {
+    assert!(
+        load_image_attachments(
+            &[PathBuf::from("../PRIVATE_PATH_MUST_NOT_BE_READ.png")],
+            vec!["image/png".to_string()]
+        )
+        .is_err()
+    );
+}
+
+#[test]
+fn image_loader_checks_the_count_before_reading_files() {
+    let paths = vec![PathBuf::from("not-read"); satelle_transport::MAX_IMAGE_ATTACHMENT_COUNT + 1];
+
+    assert!(load_image_attachments(&paths, vec!["image/png".to_string()]).is_err());
+}
+
+#[cfg(unix)]
+#[test]
+fn image_loader_rejects_symlinks() {
+    let directory = tempfile::tempdir().expect("create image fixture directory");
+    let target = directory.path().join("target.png");
+    let link = directory.path().join("private-link.png");
+    std::fs::write(&target, b"\x89PNG\r\n\x1a\nfixture").expect("write image fixture");
+    std::os::unix::fs::symlink(&target, &link).expect("create image fixture symlink");
+    let link = directory
+        .path()
+        .canonicalize()
+        .expect("canonicalize fixture directory")
+        .join("private-link.png");
+
+    assert!(load_image_attachments(&[link], vec!["image/png".to_string()]).is_err());
+}
+
 fn run_prompt(
     command: RunCommand,
     config_context: ConfigContext<'_>,
@@ -5584,7 +5775,26 @@ fn run_prompt(
             return Err(transport_failure);
         }
     };
-    let effective_timeouts = effective_timeouts_json(&host.config);
+    let turn_execution_timeout_ms = report_not_admitted(
+        &mut event_output,
+        explicit_host_alias,
+        resolve_turn_execution_timeout_ms(&host.config, command.timeout.as_deref()),
+    )?;
+    let supported_image_media_types = if command.images.is_empty() {
+        Vec::new()
+    } else {
+        report_not_admitted(
+            &mut event_output,
+            explicit_host_alias,
+            transport.supported_image_media_types().map_err(failure),
+        )?
+    };
+    let attachments = report_not_admitted(
+        &mut event_output,
+        explicit_host_alias,
+        load_image_attachments(&command.images, supported_image_media_types),
+    )?;
+    let effective_timeouts = effective_timeouts_json(&host.config, turn_execution_timeout_ms);
     let yolo_policy = resolve_yolo_policy(
         config,
         &host.alias,
@@ -5604,7 +5814,9 @@ fn run_prompt(
             config.config.provider_alias.clone(),
             experimental_provider_computer_use,
             command.refresh_provider_smoke_test,
-        );
+        )
+        .with_turn_execution_timeout_ms(turn_execution_timeout_ms);
+    let request = request.with_attachments(attachments);
     if command.detach {
         let session = transport.run_detached(&request).map_err(failure)?;
         return print_detached_session(
@@ -5712,7 +5924,26 @@ fn steer_prompt(
             return Err(transport_failure);
         }
     };
-    let effective_timeouts = effective_timeouts_json(&host.config);
+    let turn_execution_timeout_ms = report_not_admitted(
+        &mut event_output,
+        explicit_host_alias,
+        resolve_turn_execution_timeout_ms(&host.config, command.timeout.as_deref()),
+    )?;
+    let supported_image_media_types = if command.images.is_empty() {
+        Vec::new()
+    } else {
+        report_not_admitted(
+            &mut event_output,
+            explicit_host_alias,
+            transport.supported_image_media_types().map_err(failure),
+        )?
+    };
+    let attachments = report_not_admitted(
+        &mut event_output,
+        explicit_host_alias,
+        load_image_attachments(&command.images, supported_image_media_types),
+    )?;
+    let effective_timeouts = effective_timeouts_json(&host.config, turn_execution_timeout_ms);
     let yolo_policy = resolve_yolo_policy(
         config,
         &host.alias,
@@ -5732,7 +5963,9 @@ fn steer_prompt(
             config.config.provider_alias.clone(),
             experimental_provider_computer_use,
             command.refresh_provider_smoke_test,
-        );
+        )
+        .with_turn_execution_timeout_ms(turn_execution_timeout_ms);
+    let request = request.with_attachments(attachments);
     if command.detach {
         let session = transport
             .steer_detached(&session_id, &request)
@@ -5837,7 +6070,10 @@ fn stop_session(
     }
 }
 
-fn effective_timeouts_json(host_config: &satelle_core::HostConfig) -> serde_json::Value {
+fn effective_timeouts_json(
+    host_config: &satelle_core::HostConfig,
+    turn_execution_timeout_ms: u64,
+) -> serde_json::Value {
     let timeouts = host_config.timeouts.as_ref();
     json!({
         "native_readiness_timeout_ms": timeouts
@@ -5846,6 +6082,7 @@ fn effective_timeouts_json(host_config: &satelle_core::HostConfig) -> serde_json
         "provider_smoke_test_timeout_ms": timeouts
             .and_then(|timeouts| timeouts.provider_smoke_test.as_ref())
             .map(|duration| duration.milliseconds()),
+        "turn_execution_timeout_ms": turn_execution_timeout_ms,
         "provider_smoke_success_cache_ttl_ms": host_config
             .provider_smoke_success_cache_ttl
             .as_ref()
@@ -5855,6 +6092,33 @@ fn effective_timeouts_json(host_config: &satelle_core::HostConfig) -> serde_json
             .as_ref()
             .map(|duration| duration.milliseconds()),
     })
+}
+
+fn resolve_turn_execution_timeout_ms(
+    host_config: &satelle_core::HostConfig,
+    command_timeout: Option<&str>,
+) -> Result<u64, CliFailure> {
+    let configured = configured_turn_execution_timeout_ms(host_config);
+    let Some(command_timeout) = command_timeout else {
+        return Ok(configured);
+    };
+    let requested = satelle_core::TurnExecutionDuration::parse(command_timeout).ok_or_else(|| {
+        failure(SatelleError::invalid_usage(
+            "--timeout requires a duration from 1s through 24h with an explicit s, m, or h unit",
+        ))
+    })?;
+    Ok(configured.min(requested.milliseconds()))
+}
+
+fn configured_turn_execution_timeout_ms(host_config: &satelle_core::HostConfig) -> u64 {
+    host_config
+        .timeouts
+        .as_ref()
+        .and_then(|timeouts| timeouts.turn_execution.as_ref())
+        .map_or(
+            satelle_core::DEFAULT_TURN_EXECUTION_TIMEOUT_MS,
+            satelle_core::TurnExecutionDuration::milliseconds,
+        )
 }
 
 fn validate_event_mode(detach: bool, mode: EventMode) -> Result<(), CliFailure> {
@@ -5874,9 +6138,7 @@ fn validate_interrupt_mode(detach: bool, detach_on_interrupt: bool) -> Result<()
 
 fn read_prompt(prompt: Option<String>, prompt_file: Option<PathBuf>) -> Result<String, CliFailure> {
     if prompt.is_some() && prompt_file.is_some() {
-        return Err(failure(SatelleError::invalid_usage(
-            "pass either PROMPT_OR_DASH or --prompt-file, not both",
-        )));
+        return Err(failure(SatelleError::prompt_source_conflict()));
     }
 
     let value = if let Some(prompt_file) = prompt_file {

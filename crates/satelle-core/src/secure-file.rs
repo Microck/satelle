@@ -218,6 +218,90 @@ pub fn read_trusted_ca_bundle_file(path: &Path) -> Result<String, SecureFileErro
         .map_err(|_| SecureFileError::NotUtf8)
 }
 
+/// Reads a user-selected regular file through one no-follow handle. Path
+/// components are resolved beneath pinned directory handles, so validation and
+/// reading cannot observe different filesystem objects.
+pub fn read_bounded_regular_file_no_follow(
+    path: &Path,
+    maximum_bytes: usize,
+) -> Result<Vec<u8>, SecureFileError> {
+    let limit = maximum_bytes
+        .checked_add(1)
+        .and_then(|limit| u64::try_from(limit).ok())
+        .ok_or(SecureFileError::TooLarge)?;
+    let mut file = open_regular_file_no_follow(path)?;
+    let mut bytes = Vec::new();
+    Read::by_ref(&mut file)
+        .take(limit)
+        .read_to_end(&mut bytes)
+        .map_err(|_| SecureFileError::UnsafeOrUnavailable)?;
+    if bytes.len() > maximum_bytes {
+        return Err(SecureFileError::TooLarge);
+    }
+    Ok(bytes)
+}
+
+#[cfg(unix)]
+fn open_regular_file_no_follow(path: &Path) -> Result<File, SecureFileError> {
+    use rustix::fs::{FileType, Mode, OFlags};
+    use std::path::Component;
+
+    let absolute = path.is_absolute();
+    let mut names = Vec::new();
+    for component in path.components() {
+        match component {
+            Component::RootDir if absolute => {}
+            Component::CurDir => {}
+            Component::Normal(name) => names.push(name),
+            Component::Prefix(_) | Component::RootDir | Component::ParentDir => {
+                return Err(SecureFileError::UnsafeOrUnavailable);
+            }
+        }
+    }
+    let (leaf, parents) = names
+        .split_last()
+        .ok_or(SecureFileError::UnsafeOrUnavailable)?;
+    let flags = unix_directory_search_flags()?;
+    let mut directory = rustix::fs::open(
+        if absolute {
+            Path::new("/")
+        } else {
+            Path::new(".")
+        },
+        flags,
+        Mode::empty(),
+    )
+    .map_err(|_| SecureFileError::UnsafeOrUnavailable)?;
+    for parent in parents {
+        let child = rustix::fs::openat(&directory, *parent, flags, Mode::empty())
+            .map_err(|_| SecureFileError::UnsafeOrUnavailable)?;
+        let metadata =
+            rustix::fs::fstat(&child).map_err(|_| SecureFileError::UnsafeOrUnavailable)?;
+        if FileType::from_raw_mode(metadata.st_mode) != FileType::Directory {
+            return Err(SecureFileError::UnsafeOrUnavailable);
+        }
+        directory = child;
+    }
+    let descriptor = rustix::fs::openat(
+        &directory,
+        *leaf,
+        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC | OFlags::NONBLOCK,
+        Mode::empty(),
+    )
+    .map_err(|_| SecureFileError::UnsafeOrUnavailable)?;
+    let metadata =
+        rustix::fs::fstat(&descriptor).map_err(|_| SecureFileError::UnsafeOrUnavailable)?;
+    if FileType::from_raw_mode(metadata.st_mode) != FileType::RegularFile {
+        return Err(SecureFileError::UnsafeOrUnavailable);
+    }
+    Ok(File::from(descriptor))
+}
+
+#[cfg(windows)]
+fn open_regular_file_no_follow(path: &Path) -> Result<File, SecureFileError> {
+    windows::open_regular_file_no_follow(path)
+}
+
 /// Creates a regular file with Satelle's owner-only policy, or opens an
 /// existing file only when it already satisfies that policy.
 #[cfg(unix)]
@@ -254,6 +338,44 @@ pub fn open_or_create_owner_only_file(path: &Path) -> Result<File, SecureFileErr
     if created {
         rustix::fs::fchmod(&descriptor, Mode::RUSR | Mode::WUSR)
             .map_err(|_| SecureFileError::UnsafeOrUnavailable)?;
+    }
+    Ok(File::from(descriptor))
+}
+
+/// Creates a new regular file under a pinned owner-only parent and fails if
+/// any filesystem entry already occupies the generated name.
+#[cfg(unix)]
+pub fn open_new_owner_only_file(path: &Path) -> Result<File, SecureFileError> {
+    use rustix::fs::{AtFlags, FileType, Mode, OFlags};
+
+    let parent = path.parent().ok_or(SecureFileError::UnsafeOrUnavailable)?;
+    let directory = open_or_create_owner_only_directory(parent)?;
+    let file_name = path
+        .file_name()
+        .ok_or(SecureFileError::UnsafeOrUnavailable)?;
+    let descriptor = rustix::fs::openat(
+        &directory,
+        file_name,
+        OFlags::RDWR | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::RUSR | Mode::WUSR,
+    )
+    .map_err(|_| SecureFileError::UnsafeOrUnavailable)?;
+    let validated = (|| {
+        let metadata =
+            rustix::fs::fstat(&descriptor).map_err(|_| SecureFileError::UnsafeOrUnavailable)?;
+        if FileType::from_raw_mode(metadata.st_mode) != FileType::RegularFile
+            || metadata.st_uid != rustix::process::geteuid().as_raw()
+            || metadata.st_nlink != 1
+        {
+            return Err(SecureFileError::UnsafeOrUnavailable);
+        }
+        require_no_macos_extended_acl(&descriptor)?;
+        rustix::fs::fchmod(&descriptor, Mode::RUSR | Mode::WUSR)
+            .map_err(|_| SecureFileError::UnsafeOrUnavailable)
+    })();
+    if let Err(error) = validated {
+        let _ = rustix::fs::unlinkat(&directory, file_name, AtFlags::empty());
+        return Err(error);
     }
     Ok(File::from(descriptor))
 }
@@ -582,6 +704,13 @@ pub fn open_or_create_owner_only_file(path: &Path) -> Result<File, SecureFileErr
 }
 
 #[cfg(windows)]
+pub fn open_new_owner_only_file(path: &Path) -> Result<File, SecureFileError> {
+    let parent = path.parent().ok_or(SecureFileError::UnsafeOrUnavailable)?;
+    let _directory = open_or_create_owner_only_directory(parent)?;
+    windows::open_new_owner_only_file(path)
+}
+
+#[cfg(windows)]
 pub fn open_or_create_owner_only_directory(
     path: &Path,
 ) -> Result<OwnerOnlyDirectory, SecureFileError> {
@@ -597,6 +726,11 @@ pub fn open_owner_only_directory(path: &Path) -> Result<OwnerOnlyDirectory, Secu
 pub fn open_or_create_owner_only_file(_path: &Path) -> Result<File, SecureFileError> {
     // Satelle cannot claim owner-only persistence on a platform without an
     // implemented file-security policy.
+    Err(SecureFileError::UnsafeOrUnavailable)
+}
+
+#[cfg(not(any(unix, windows)))]
+pub fn open_new_owner_only_file(_path: &Path) -> Result<File, SecureFileError> {
     Err(SecureFileError::UnsafeOrUnavailable)
 }
 
@@ -685,7 +819,8 @@ mod windows {
     use std::ptr::{null, null_mut};
     use windows_sys::Wdk::Foundation::OBJECT_ATTRIBUTES;
     use windows_sys::Wdk::Storage::FileSystem::{
-        FILE_DIRECTORY_FILE, FILE_OPEN, FILE_OPEN_IF, FILE_OPEN_REPARSE_POINT, NtCreateFile,
+        FILE_DIRECTORY_FILE, FILE_NON_DIRECTORY_FILE, FILE_OPEN, FILE_OPEN_IF,
+        FILE_OPEN_REPARSE_POINT, FILE_SYNCHRONOUS_IO_NONALERT, NtCreateFile,
     };
     use windows_sys::Win32::Foundation::{
         GENERIC_ALL, GENERIC_EXECUTE, GENERIC_READ, GENERIC_WRITE, HANDLE, HLOCAL,
@@ -704,14 +839,15 @@ mod windows {
         WinBuiltinAdministratorsSid, WinLocalSystemSid,
     };
     use windows_sys::Win32::Storage::FileSystem::{
-        BY_HANDLE_FILE_INFORMATION, CreateFileW, DELETE, FILE_ALL_ACCESS, FILE_APPEND_DATA,
-        FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_NORMAL, FILE_ATTRIBUTE_REPARSE_POINT,
-        FILE_ATTRIBUTE_TAG_INFO, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
-        FILE_GENERIC_EXECUTE, FILE_GENERIC_READ, FILE_GENERIC_WRITE, FILE_READ_ATTRIBUTES,
-        FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_TYPE_DISK, FILE_WRITE_ATTRIBUTES, FILE_WRITE_DATA,
-        FILE_WRITE_EA, FileAttributeTagInfo, GetFileInformationByHandle,
+        BY_HANDLE_FILE_INFORMATION, CREATE_NEW, CreateFileW, DELETE, FILE_ALL_ACCESS,
+        FILE_APPEND_DATA, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_NORMAL,
+        FILE_ATTRIBUTE_REPARSE_POINT, FILE_ATTRIBUTE_TAG_INFO, FILE_DISPOSITION_INFO,
+        FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_GENERIC_EXECUTE,
+        FILE_GENERIC_READ, FILE_GENERIC_WRITE, FILE_READ_ATTRIBUTES, FILE_SHARE_READ,
+        FILE_SHARE_WRITE, FILE_TYPE_DISK, FILE_WRITE_ATTRIBUTES, FILE_WRITE_DATA, FILE_WRITE_EA,
+        FileAttributeTagInfo, FileDispositionInfo, GetFileInformationByHandle,
         GetFileInformationByHandleEx, GetFileType, GetVolumeInformationByHandleW, OPEN_ALWAYS,
-        OPEN_EXISTING, READ_CONTROL, WRITE_DAC, WRITE_OWNER,
+        OPEN_EXISTING, READ_CONTROL, SetFileInformationByHandle, WRITE_DAC, WRITE_OWNER,
     };
     use windows_sys::Win32::System::IO::IO_STATUS_BLOCK;
     use windows_sys::Win32::System::SystemServices::{
@@ -730,17 +866,33 @@ mod windows {
         | GENERIC_ALL;
 
     pub(super) fn open_or_create_owner_only_file(path: &Path) -> Result<File, SecureFileError> {
+        open_owner_only_file(path, OPEN_ALWAYS)
+    }
+
+    pub(super) fn open_new_owner_only_file(path: &Path) -> Result<File, SecureFileError> {
+        open_owner_only_file(path, CREATE_NEW)
+    }
+
+    fn open_owner_only_file(
+        path: &Path,
+        creation_disposition: u32,
+    ) -> Result<File, SecureFileError> {
         let process_sid = current_user_sid()?;
         let descriptor = PrivateDescriptor::new(&process_sid, "")?;
         let attributes = descriptor.security_attributes();
         let wide = wide_path(path)?;
+        let create_new = creation_disposition == CREATE_NEW;
         let raw = unsafe {
             CreateFileW(
                 wide.as_ptr(),
-                FILE_GENERIC_READ | FILE_GENERIC_WRITE | READ_CONTROL | WRITE_DAC,
+                FILE_GENERIC_READ
+                    | FILE_GENERIC_WRITE
+                    | READ_CONTROL
+                    | WRITE_DAC
+                    | if create_new { DELETE } else { 0 },
                 FILE_SHARE_READ | FILE_SHARE_WRITE,
                 &attributes,
-                OPEN_ALWAYS,
+                creation_disposition,
                 FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT,
                 null_mut(),
             )
@@ -749,13 +901,56 @@ mod windows {
             return Err(SecureFileError::UnsafeOrUnavailable);
         }
         let handle = unsafe { OwnedHandle::from_raw_handle(raw) };
-        require_persistent_acls(&handle)?;
-        require_regular_single_link(&handle)?;
+        let validated = (|| {
+            require_persistent_acls(&handle)?;
+            require_regular_single_link(&handle)?;
+            verify_security(&handle, &process_sid, SecurityPolicy::OwnerOnly)
+        })();
+        if let Err(error) = validated {
+            if create_new {
+                let disposition = FILE_DISPOSITION_INFO { DeleteFile: true };
+                unsafe {
+                    SetFileInformationByHandle(
+                        raw_handle(&handle),
+                        FileDispositionInfo,
+                        (&disposition as *const FILE_DISPOSITION_INFO).cast(),
+                        size_of::<FILE_DISPOSITION_INFO>() as u32,
+                    );
+                }
+            }
+            return Err(error);
+        }
+        Ok(File::from(handle))
+    }
 
-        // SECURITY_ATTRIBUTES applies the policy atomically on creation.
-        // Existing files are verified as-is so an earlier broad ACL and any
-        // already-open handles can never be normalized into apparent safety.
-        verify_security(&handle, &process_sid, SecurityPolicy::OwnerOnly)?;
+    pub(super) fn open_regular_file_no_follow(path: &Path) -> Result<File, SecureFileError> {
+        let (root, names) = if path.is_absolute() {
+            windows_directory_components(path)?
+        } else {
+            let names = path
+                .components()
+                .filter_map(|component| match component {
+                    Component::CurDir => None,
+                    Component::Normal(name) => Some(Ok(name.to_os_string())),
+                    Component::Prefix(_) | Component::RootDir | Component::ParentDir => {
+                        Some(Err(SecureFileError::UnsafeOrUnavailable))
+                    }
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            (PathBuf::from("."), names)
+        };
+        let (leaf, parents) = names
+            .split_last()
+            .ok_or(SecureFileError::UnsafeOrUnavailable)?;
+        let mut directory = open_absolute_directory(&root)?;
+        require_directory(&directory)?;
+        for parent in parents {
+            let child = open_relative_directory(&directory, parent, false, null())?;
+            require_directory(&child)?;
+            directory = child;
+        }
+        let handle = open_relative_regular_file(&directory, leaf)?;
+        require_regular_file(&handle)?;
         Ok(File::from(handle))
     }
 
@@ -915,6 +1110,52 @@ mod windows {
         Ok(unsafe { OwnedHandle::from_raw_handle(raw) })
     }
 
+    fn open_relative_regular_file(
+        parent: &OwnedHandle,
+        name: &OsString,
+    ) -> Result<OwnedHandle, SecureFileError> {
+        let mut wide = name.encode_wide().collect::<Vec<_>>();
+        let byte_length = wide
+            .len()
+            .checked_mul(size_of::<u16>())
+            .and_then(|length| u16::try_from(length).ok())
+            .ok_or(SecureFileError::UnsafeOrUnavailable)?;
+        let object_name = UNICODE_STRING {
+            Length: byte_length,
+            MaximumLength: byte_length,
+            Buffer: wide.as_mut_ptr(),
+        };
+        let object_attributes = OBJECT_ATTRIBUTES {
+            Length: size_of::<OBJECT_ATTRIBUTES>() as u32,
+            RootDirectory: raw_handle(parent),
+            ObjectName: &object_name,
+            Attributes: OBJ_CASE_INSENSITIVE | OBJ_DONT_REPARSE,
+            SecurityDescriptor: null_mut(),
+            SecurityQualityOfService: null(),
+        };
+        let mut raw = INVALID_HANDLE_VALUE;
+        let mut io_status = IO_STATUS_BLOCK::default();
+        let status = unsafe {
+            NtCreateFile(
+                &mut raw,
+                FILE_GENERIC_READ,
+                &object_attributes,
+                &mut io_status,
+                null(),
+                FILE_ATTRIBUTE_NORMAL,
+                FILE_SHARE_READ,
+                FILE_OPEN,
+                FILE_NON_DIRECTORY_FILE | FILE_OPEN_REPARSE_POINT | FILE_SYNCHRONOUS_IO_NONALERT,
+                null(),
+                0,
+            )
+        };
+        if status < 0 || raw == INVALID_HANDLE_VALUE {
+            return Err(SecureFileError::UnsafeOrUnavailable);
+        }
+        Ok(unsafe { OwnedHandle::from_raw_handle(raw) })
+    }
+
     pub(super) fn open_secure_file(
         path: &Path,
         policy: SecurityPolicy,
@@ -943,6 +1184,17 @@ mod windows {
     }
 
     fn require_regular_single_link(handle: &OwnedHandle) -> Result<(), SecureFileError> {
+        require_regular_file(handle)?;
+        let mut information = BY_HANDLE_FILE_INFORMATION::default();
+        if unsafe { GetFileInformationByHandle(raw_handle(handle), &mut information) } == 0
+            || information.nNumberOfLinks != 1
+        {
+            return Err(SecureFileError::UnsafeOrUnavailable);
+        }
+        Ok(())
+    }
+
+    fn require_regular_file(handle: &OwnedHandle) -> Result<(), SecureFileError> {
         if unsafe { GetFileType(raw_handle(handle)) } != FILE_TYPE_DISK {
             return Err(SecureFileError::UnsafeOrUnavailable);
         }
@@ -958,12 +1210,6 @@ mod windows {
         if loaded == 0
             || attributes.FileAttributes & (FILE_ATTRIBUTE_REPARSE_POINT | FILE_ATTRIBUTE_DIRECTORY)
                 != 0
-        {
-            return Err(SecureFileError::UnsafeOrUnavailable);
-        }
-        let mut information = BY_HANDLE_FILE_INFORMATION::default();
-        if unsafe { GetFileInformationByHandle(raw_handle(handle), &mut information) } == 0
-            || information.nNumberOfLinks != 1
         {
             return Err(SecureFileError::UnsafeOrUnavailable);
         }
@@ -2054,6 +2300,42 @@ mod tests {
             read_owner_only_secret_file(&token),
             Err(SecureFileError::NotUtf8)
         );
+    }
+
+    #[test]
+    fn bounded_user_file_reader_accepts_relative_regular_files_and_rejects_traversal() {
+        let cwd = std::env::current_dir().expect("resolve test cwd");
+        let directory = tempfile::tempdir_in(&cwd).expect("create cwd fixture directory");
+        let absolute = directory.path().join("fixture.png");
+        fs::write(&absolute, b"fixture").expect("write user-file fixture");
+        let relative = absolute.strip_prefix(&cwd).expect("fixture is beneath cwd");
+
+        assert_eq!(
+            read_bounded_regular_file_no_follow(relative, 7),
+            Ok(b"fixture".to_vec())
+        );
+        assert_eq!(
+            read_bounded_regular_file_no_follow(relative, 6),
+            Err(SecureFileError::TooLarge)
+        );
+        assert_eq!(
+            read_bounded_regular_file_no_follow(Path::new("../fixture"), 7),
+            Err(SecureFileError::UnsafeOrUnavailable)
+        );
+        assert_eq!(
+            read_bounded_regular_file_no_follow(directory.path(), 7),
+            Err(SecureFileError::UnsafeOrUnavailable)
+        );
+
+        #[cfg(unix)]
+        {
+            let link = directory.path().join("fixture-link.png");
+            std::os::unix::fs::symlink(&absolute, &link).expect("create user-file symlink");
+            assert_eq!(
+                read_bounded_regular_file_no_follow(&link, 7),
+                Err(SecureFileError::UnsafeOrUnavailable)
+            );
+        }
     }
 
     #[cfg(windows)]

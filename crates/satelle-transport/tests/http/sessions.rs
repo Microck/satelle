@@ -1,12 +1,14 @@
 use super::*;
+use base64::Engine as _;
 use reqwest::Method;
 use satelle_core::StopResultOutcome;
 use satelle_core::session::{SessionActivity, TurnExecutionMode};
 use satelle_test_contract::assert_privacy_canaries_absent;
 use satelle_transport::{
-    AdmissionCancellationOutcome, AdmissionCancellationResponse, SessionResponse, StopRequest,
-    StopResponse, TurnRequest,
+    AdmissionCancellationOutcome, AdmissionCancellationResponse, ImageAttachment, SessionResponse,
+    StopRequest, StopResponse, TurnRequest,
 };
+use sha2::Digest as _;
 
 const CREATE_KEY: &str = "01890a5d-ac96-7b7c-8f89-37c3d0a66f01";
 const STEER_KEY: &str = "01890a5d-ac96-7b7c-8f89-37c3d0a66f02";
@@ -318,6 +320,166 @@ async fn mutation_replays_preserve_operation_boundaries_and_reject_digest_drift(
         .await
         .expect("decode boundary replay");
     assert_eq!(boundary_replay.session().turns().len(), 1);
+}
+
+#[tokio::test]
+async fn turn_timeout_is_part_of_the_admission_identity() {
+    let running = RunningServer::start(ApiScopes::CONTROL).await;
+    let request =
+        TurnRequest::new("PRIVATE_TURN_TIMEOUT_CANARY").with_turn_execution_timeout_ms(10_000);
+    let created: SessionResponse = running
+        .mutation("/v1/sessions", "turn-timeout-identity")
+        .json(&request)
+        .send()
+        .await
+        .expect("create timeout-bounded Session")
+        .json()
+        .await
+        .expect("decode timeout-bounded Session");
+    assert_eq!(created.session().turns().len(), 1);
+
+    let conflict = running
+        .mutation("/v1/sessions", "turn-timeout-identity")
+        .json(
+            &TurnRequest::new("PRIVATE_TURN_TIMEOUT_CANARY").with_turn_execution_timeout_ms(11_000),
+        )
+        .send()
+        .await
+        .expect("replay with changed timeout");
+    assert_eq!(conflict.status(), StatusCode::CONFLICT);
+}
+
+#[tokio::test]
+async fn host_turn_timeout_is_authoritative_for_direct_requests() {
+    let state = TestStateDir::new().expect("temporary state directory");
+    let service = HostService::local_demo_for_tests_at(state.path())
+        .expect("construct deterministic Host service")
+        .with_turn_execution_timeout_for_tests(5 * 60);
+    let running = RunningServer::start_with_service(
+        ApiScopes::CONTROL,
+        DaemonServerConfig::loopback(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))),
+        state,
+        service,
+    )
+    .await;
+
+    for (key, request, equivalent) in [
+        (
+            "host-timeout-omitted",
+            TurnRequest::new("PRIVATE_HOST_TIMEOUT_OMITTED_CANARY"),
+            TurnRequest::new("PRIVATE_HOST_TIMEOUT_OMITTED_CANARY")
+                .with_turn_execution_timeout_ms(5 * 60 * 1_000),
+        ),
+        (
+            "host-timeout-longer",
+            TurnRequest::new("PRIVATE_HOST_TIMEOUT_LONGER_CANARY")
+                .with_turn_execution_timeout_ms(60 * 60 * 1_000),
+            TurnRequest::new("PRIVATE_HOST_TIMEOUT_LONGER_CANARY")
+                .with_turn_execution_timeout_ms(5 * 60 * 1_000),
+        ),
+    ] {
+        let admitted: SessionResponse = running
+            .mutation("/v1/sessions", key)
+            .json(&request)
+            .send()
+            .await
+            .expect("send timeout-bounded direct request")
+            .json()
+            .await
+            .expect("decode timeout-bounded Session");
+        let replayed: SessionResponse = running
+            .mutation("/v1/sessions", key)
+            .json(&equivalent)
+            .send()
+            .await
+            .expect("replay an equivalent Host-bounded direct request")
+            .json()
+            .await
+            .expect("decode equivalent timeout-bounded Session");
+        assert_eq!(
+            replayed.session().session_id(),
+            admitted.session().session_id(),
+            "request={key}"
+        );
+    }
+
+    let shorter = TurnRequest::new("PRIVATE_HOST_TIMEOUT_SHORTER_CANARY")
+        .with_turn_execution_timeout_ms(2 * 60 * 1_000);
+    let admitted = running
+        .mutation("/v1/sessions", "host-timeout-shorter")
+        .json(&shorter)
+        .send()
+        .await
+        .expect("admit a shorter timeout")
+        .error_for_status()
+        .expect("shorter timeout is accepted");
+    drop(admitted);
+    let changed = running
+        .mutation("/v1/sessions", "host-timeout-shorter")
+        .json(
+            &TurnRequest::new("PRIVATE_HOST_TIMEOUT_SHORTER_CANARY")
+                .with_turn_execution_timeout_ms(5 * 60 * 1_000),
+        )
+        .send()
+        .await
+        .expect("replay with a different effective timeout");
+    assert_eq!(changed.status(), StatusCode::CONFLICT);
+}
+
+#[tokio::test]
+async fn unsupported_image_runtime_enforces_advertised_zero_before_decode() {
+    let state = TestStateDir::new().expect("temporary state directory");
+    let service = HostService::local_demo_for_tests_at(state.path())
+        .expect("construct deterministic Host service")
+        .without_image_attachments_for_tests();
+    let running = RunningServer::start_with_service(
+        ApiScopes::CONTROL,
+        DaemonServerConfig::loopback(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))),
+        state,
+        service,
+    )
+    .await;
+
+    let capabilities: CapabilitiesResponse = running
+        .request("/v1/capabilities")
+        .send()
+        .await
+        .expect("read unsupported-runtime capabilities")
+        .json()
+        .await
+        .expect("decode unsupported-runtime capabilities");
+    assert_eq!(capabilities.limits().attachment_count(), 0);
+    assert!(capabilities.supported_attachment_media_types().is_empty());
+
+    let bytes = b"\x89PNG\r\n\x1a\nPRIVATE_UNSUPPORTED_IMAGE_CANARY";
+    let digest = sha2::Sha256::digest(bytes)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    let request =
+        TurnRequest::new("PRIVATE_UNSUPPORTED_IMAGE_PROMPT_CANARY").with_attachments(vec![
+            ImageAttachment::new(
+                "image/png",
+                bytes.len() as u64,
+                digest,
+                base64::engine::general_purpose::STANDARD.encode(bytes),
+            ),
+        ]);
+    let rejected = running
+        .mutation("/v1/sessions", "unsupported-runtime-image")
+        .json(&request)
+        .send()
+        .await
+        .expect("send unsupported-runtime image request");
+    assert_attachment_limit_error(rejected, &running.host_identity).await;
+    assert_eq!(
+        running
+            .service
+            .initialize_daemon()
+            .expect("read unsupported-runtime session count")
+            .session_count(),
+        0
+    );
 }
 
 #[tokio::test]
@@ -680,7 +842,7 @@ async fn mutation_validation_fails_before_execution_with_typed_errors() {
 
     let missing_key = running
         .protected_request(Method::POST, "/v1/sessions")
-        .header("Satelle-Protocol-Version", "5")
+        .header("Satelle-Protocol-Version", "6")
         .json(&TurnRequest::new("PRIVATE_MISSING_KEY_CANARY"))
         .send()
         .await
@@ -703,7 +865,7 @@ async fn mutation_validation_fails_before_execution_with_typed_errors() {
         .mutation("/v1/sessions", CREATE_KEY)
         .header("Content-Type", "text/plain")
         .body(
-            r#"{"schema_version":"satelle.api.v2","prompt":"private","execution_mode":"standard"}"#,
+            r#"{"schema_version":"satelle.api.v3","prompt":"private","execution_mode":"standard"}"#,
         )
         .send()
         .await
@@ -718,7 +880,7 @@ async fn mutation_validation_fails_before_execution_with_typed_errors() {
     let duplicate_prompt = running
         .mutation("/v1/sessions", "duplicate-json-field-key")
         .header("Content-Type", "application/json")
-        .body(r#"{"schema_version":"satelle.api.v2","prompt":"first","prompt":"second","execution_mode":"standard"}"#)
+        .body(r#"{"schema_version":"satelle.api.v3","prompt":"first","prompt":"second","execution_mode":"standard"}"#)
         .send()
         .await
         .expect("send duplicate JSON field");
@@ -780,11 +942,17 @@ async fn mutation_validation_fails_before_execution_with_typed_errors() {
 
     let oversized = running
         .mutation("/v1/sessions", CREATE_KEY)
-        .header("Content-Type", "application/json")
-        .body(vec![b'x'; 1_048_577])
+        .json(
+            &TurnRequest::new("private").with_attachments(vec![ImageAttachment::new(
+                "image/png",
+                5_242_881,
+                "0".repeat(64),
+                "",
+            )]),
+        )
         .send()
         .await
-        .expect("send oversized body");
+        .expect("send oversized attachment");
     assert_api_error(
         oversized,
         StatusCode::PAYLOAD_TOO_LARGE,
@@ -808,7 +976,7 @@ async fn fixed_size_attachments_precede_turn_request_deserialization() {
     let response = running
         .mutation("/v1/sessions", "attachment-limit-fixed-size")
         .json(&serde_json::json!({
-            "schema_version": "satelle.api.v2",
+            "schema_version": "satelle.api.v3",
             "prompt": "PRIVATE_ATTACHMENT_LIMIT_CANARY",
             "attachments": [{"name": "private.txt", "content": "private"}]
         }))
@@ -831,21 +999,21 @@ async fn fixed_size_attachments_precede_turn_request_deserialization() {
 async fn attachment_limit_preserves_decoder_error_precedence() {
     let running = RunningServer::start(ApiScopes::CONTROL).await;
     let oversized = format!(
-        r#"{{"schema_version":"satelle.api.v2","prompt":"PRIVATE_OVERSIZED_ATTACHMENT_CANARY","execution_mode":"standard","attachments":[{{"name":"private.txt"}}],"padding":"{}"}}"#,
+        r#"{{"schema_version":"satelle.api.v3","prompt":"PRIVATE_OVERSIZED_ATTACHMENT_CANARY","execution_mode":"standard","attachments":[{{"name":"private.txt"}}],"padding":"{}"}}"#,
         "x".repeat(1_048_576)
     );
     let cases = [
         (
             "wrong-schema",
-            r#"{"schema_version":"satelle.api.v1","prompt":"PRIVATE_SCHEMA_ATTACHMENT_CANARY","execution_mode":"standard","attachments":[{"name":"private.txt"}]}"#.to_string(),
+            r#"{"schema_version":"satelle.api.v2","prompt":"PRIVATE_SCHEMA_ATTACHMENT_CANARY","execution_mode":"standard","attachments":[{"name":"private.txt"}]}"#.to_string(),
             UNSUPPORTED_SCHEMA_ERROR,
         ),
         (
             "duplicate-json-key",
-            r#"{"schema_version":"satelle.api.v2","prompt":"PRIVATE_DUPLICATE_ATTACHMENT_CANARY","prompt":"duplicate","execution_mode":"standard","attachments":[{"name":"private.txt"}]}"#.to_string(),
+            r#"{"schema_version":"satelle.api.v3","prompt":"PRIVATE_DUPLICATE_ATTACHMENT_CANARY","prompt":"duplicate","execution_mode":"standard","attachments":[{"name":"private.txt"}]}"#.to_string(),
             INVALID_JSON_ERROR,
         ),
-        ("oversized-body", oversized, JSON_BODY_LIMIT_ERROR),
+        ("oversized-body", oversized, ATTACHMENT_LIMIT_ERROR),
     ];
 
     for (name, body, expected) in cases {
@@ -873,10 +1041,72 @@ async fn attachment_limit_preserves_decoder_error_precedence() {
 }
 
 #[tokio::test]
-async fn empty_and_non_array_attachments_remain_operation_contract_errors() {
+async fn attachment_base64_is_the_only_allowance_above_the_json_budget() {
     let running = RunningServer::start(ApiScopes::CONTROL).await;
+
+    let oversized_prompt = "p".repeat(1_048_576);
+    let response = running
+        .mutation("/v1/sessions", "oversized-non-attachment-json")
+        .json(&TurnRequest::new(oversized_prompt))
+        .send()
+        .await
+        .expect("send oversized prompt");
+    assert_exact_api_error(response, &running.host_identity, JSON_BODY_LIMIT_ERROR).await;
+
+    let bytes = {
+        let mut bytes = vec![0_u8; 900_000];
+        bytes[..8].copy_from_slice(b"\x89PNG\r\n\x1a\n");
+        bytes
+    };
+    let digest = sha2::Sha256::digest(&bytes)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    let attachment = ImageAttachment::new(
+        "image/png",
+        bytes.len() as u64,
+        digest,
+        base64::engine::general_purpose::STANDARD.encode(&bytes),
+    );
+    let request = TurnRequest::new("PRIVATE_VALID_LARGE_ATTACHMENT")
+        .with_attachments(vec![attachment.clone()]);
+    assert!(serde_json::to_vec(&request).unwrap().len() > 1_048_576);
+    let accepted = running
+        .mutation("/v1/sessions", "valid-large-attachment")
+        .json(&request)
+        .send()
+        .await
+        .expect("send valid large attachment");
+    assert_eq!(accepted.status(), StatusCode::ACCEPTED);
+
+    let hidden_oversized_prompt =
+        TurnRequest::new("p".repeat(1_048_576)).with_attachments(vec![attachment]);
+    let rejected = running
+        .mutation("/v1/sessions", "attachment-does-not-hide-prompt")
+        .json(&hidden_oversized_prompt)
+        .send()
+        .await
+        .expect("send attachment with oversized prompt");
+    assert_exact_api_error(rejected, &running.host_identity, JSON_BODY_LIMIT_ERROR).await;
+}
+
+#[tokio::test]
+async fn empty_attachments_are_allowed_but_other_shapes_remain_contract_errors() {
+    let running = RunningServer::start(ApiScopes::CONTROL).await;
+    let empty_response = running
+        .mutation("/v1/sessions", "attachment-operation-contract-empty-array")
+        .json(&serde_json::json!({
+            "schema_version": "satelle.api.v3",
+            "prompt": "PRIVATE_ATTACHMENT_SHAPE_CANARY",
+            "execution_mode": "standard",
+            "attachments": []
+        }))
+        .send()
+        .await
+        .expect("send empty attachment request");
+    assert_eq!(empty_response.status(), StatusCode::ACCEPTED);
+
     for (name, attachments) in [
-        ("empty-array", serde_json::json!([])),
         ("null", Value::Null),
         ("object", serde_json::json!({"name": "private.txt"})),
         ("string", serde_json::json!("private")),
@@ -887,7 +1117,7 @@ async fn empty_and_non_array_attachments_remain_operation_contract_errors() {
                 &format!("attachment-operation-contract-{name}"),
             )
             .json(&serde_json::json!({
-                "schema_version": "satelle.api.v2",
+                "schema_version": "satelle.api.v3",
                 "prompt": "PRIVATE_ATTACHMENT_SHAPE_CANARY",
                 "execution_mode": "standard",
                 "attachments": attachments
@@ -904,7 +1134,7 @@ async fn empty_and_non_array_attachments_remain_operation_contract_errors() {
             .initialize_daemon()
             .expect("read session count")
             .session_count(),
-        0
+        1
     );
 }
 
@@ -930,7 +1160,7 @@ async fn create_turn_attachments_precede_deserialization_without_admission() {
             "attachment-limit-create-turn",
         )
         .json(&serde_json::json!({
-            "schema_version": "satelle.api.v2",
+            "schema_version": "satelle.api.v3",
             "prompt": "PRIVATE_REJECTED_ATTACHMENT_TURN_CANARY",
             "attachments": [{"name": "private.txt", "content": "private"}]
         }))
@@ -1108,7 +1338,7 @@ async fn request_material_log_privacy(trace_capture: TraceCapture) {
             &rejected_request_id,
         )
         .json(&serde_json::json!({
-            "schema_version": "satelle.api.v2",
+            "schema_version": "satelle.api.v3",
             "prompt": rejected_prompt,
             "execution_mode": "standard",
             "body_canary": rejected_body,
@@ -1259,7 +1489,7 @@ fn protected_at(
         .header("Satelle-Expected-Host-Identity", host_identity)
         .header("Satelle-Request-Id", RequestId::new().to_string());
     if is_mutation {
-        request.header("Satelle-Protocol-Version", "5")
+        request.header("Satelle-Protocol-Version", "6")
     } else {
         request
     }
@@ -1294,7 +1524,7 @@ async fn assert_attachment_limit_error(response: reqwest::Response, host_identit
 
 fn turn_request_with_controller_field(field: &str, prompt: &str) -> Value {
     let mut request = serde_json::json!({
-        "schema_version": "satelle.api.v2",
+        "schema_version": "satelle.api.v3",
         "prompt": prompt,
         "execution_mode": "standard"
     });

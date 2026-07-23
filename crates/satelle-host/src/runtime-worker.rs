@@ -255,6 +255,7 @@ pub(super) struct ExecutionPlan {
     pub(super) execution_mode: TurnExecutionMode,
     pub(super) work: TurnWork,
     pub(super) provider_smoke_event: Option<satelle_core::SatelleEventBody>,
+    pub(super) attachments: crate::attachment::StagedAttachments,
 }
 
 #[derive(Default)]
@@ -335,14 +336,20 @@ impl RuntimeEngine {
 
     pub(super) fn execute(&self, plan: ExecutionPlan) -> Result<RuntimeTurnOutcome, SatelleError> {
         let subject = plan.work.subject.clone();
-        let outcome = self.execute_once(plan);
-        if outcome.is_err() {
-            self.preserve_unknown_execution(&subject)?;
+        match self.execute_once(plan) {
+            Ok((outcome, None)) => Ok(outcome),
+            Ok((_, Some(error))) => Err(error),
+            Err(error) => {
+                self.preserve_unknown_execution(&subject)?;
+                Err(error)
+            }
         }
-        outcome
     }
 
-    fn execute_once(&self, mut plan: ExecutionPlan) -> Result<RuntimeTurnOutcome, SatelleError> {
+    fn execute_once(
+        &self,
+        mut plan: ExecutionPlan,
+    ) -> Result<(RuntimeTurnOutcome, Option<SatelleError>), SatelleError> {
         let session_id = plan.work.subject.session_id().clone();
         let turn_id = plan.work.subject.turn_id().clone();
         let expected = model::expected_revisions(&plan.work.session, &turn_id)?;
@@ -355,7 +362,7 @@ impl RuntimeEngine {
         )?;
         plan.work.session = running;
         if !running_committed {
-            return Ok(model::turn_outcome(&plan.work.session, Vec::new()));
+            return Ok((model::turn_outcome(&plan.work.session, Vec::new()), None));
         }
 
         // No runtime or SQLite mutex is held while the external adapter works.
@@ -375,6 +382,7 @@ impl RuntimeEngine {
             execution_policy,
             AdapterSubject::new(&plan.work.subject),
             &persist_upstream_ref,
+            plan.attachments.images(),
         ))?;
         let Some(transition) = result.transition() else {
             let session = self
@@ -390,7 +398,7 @@ impl RuntimeEngine {
                     "controlled execution returned before stop was durable",
                 ));
             }
-            return Ok(model::turn_outcome(&session, Vec::new()));
+            return Ok((model::turn_outcome(&session, Vec::new()), None));
         };
         if matches!(
             transition,
@@ -408,12 +416,15 @@ impl RuntimeEngine {
             transition,
             model::monotonic_now(&plan.work.session),
         )?;
+        let terminal_error = execution_committed
+            .then(|| result.terminal_error().cloned())
+            .flatten();
         let events = if execution_committed {
             prepend_provider_smoke_event(plan.provider_smoke_event, result.into_events())?
         } else {
             Vec::new()
         };
-        Ok(model::turn_outcome(&session, events))
+        Ok((model::turn_outcome(&session, events), terminal_error))
     }
 
     fn persist_upstream_ref(

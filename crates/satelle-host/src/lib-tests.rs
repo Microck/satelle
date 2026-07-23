@@ -3,12 +3,174 @@ use crate::codex_capabilities::{
     CapabilityMatrix, CodexVersionEvidence, HostPlatform, Phase0CapabilityEvidence,
     REQUIRED_CODEX_VERSION,
 };
+use base64::Engine as _;
 use satelle_core::session::TurnExecutionMode;
-use satelle_core::session::{StopObservation, TurnState};
+use satelle_core::session::{StopObservation, TurnState, TurnTransition};
 use satelle_core::{ErrorCode, SatelleError};
+use sha2::{Digest as _, Sha256};
 
 fn turn_intent(prompt: &str) -> TurnIntent {
     TurnIntent::new(prompt, TurnExecutionMode::Standard).expect("valid test Turn intent")
+}
+
+#[derive(Clone)]
+struct RecordingTurnExtrasAdapter {
+    observations: Arc<Mutex<Vec<(usize, u32)>>>,
+}
+
+impl ComputerUseAdapter for RecordingTurnExtrasAdapter {
+    fn preflight(
+        &self,
+        host: &str,
+        provider_intent: &ProviderComputerUseIntent,
+    ) -> Result<AdapterReadiness, SatelleError> {
+        FakeComputerUseAdapter.preflight(host, provider_intent)
+    }
+
+    fn execute(&self, request: ExecuteRequest<'_>) -> Result<ExecuteResult, SatelleError> {
+        self.observations.lock().expect("lock observations").push((
+            request.attachments().len(),
+            request.execution_policy().timeout_policy().seconds(),
+        ));
+        Ok(ExecuteResult::new(TurnTransition::Completed, Vec::new()))
+    }
+
+    fn observe_stop(&self, subject: AdapterSubject<'_>) -> Result<StopObservation, SatelleError> {
+        FakeComputerUseAdapter.observe_stop(subject)
+    }
+
+    fn observe_recovery(
+        &self,
+        subject: AdapterSubject<'_>,
+    ) -> Result<RecoveryObservation, SatelleError> {
+        FakeComputerUseAdapter.observe_recovery(subject)
+    }
+}
+
+fn turn_intent_with_extras(prompt: &str, timeout_seconds: u64) -> TurnIntent {
+    let bytes = b"\x89PNG\r\n\x1a\n";
+    let digest = Sha256::digest(bytes);
+    let sha256 = digest
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    turn_intent(prompt)
+        .with_turn_execution_timeout_ms(Some(timeout_seconds * 1_000))
+        .expect("valid Turn timeout")
+        .with_attachments(vec![AttachmentUpload::new(
+            "image/png",
+            u64::try_from(bytes.len()).expect("image size fits u64"),
+            sha256,
+            base64::engine::general_purpose::STANDARD.encode(bytes),
+        )])
+        .expect("valid image attachment")
+}
+
+#[test]
+fn local_host_run_and_steer_forward_attachments_and_host_clamped_timeout() {
+    let state = TestStateDir::new().expect("temporary state directory");
+    let observations = Arc::new(Mutex::new(Vec::new()));
+    let service = HostService {
+        runtime: RuntimeHandle::new(
+            Ok(state.path().to_path_buf()),
+            RecordingTurnExtrasAdapter {
+                observations: Arc::clone(&observations),
+            },
+        ),
+        operation_capacity: Arc::new(OperationCapacity::default()),
+        turn_execution_timeout: crate::configured_turn_execution_timeout(
+            &satelle_core::SatelleConfig::defaults().hosts[LOCAL_DEMO_HOST],
+        ),
+        mode: HostMode::TestFake {
+            image_attachments: true,
+        },
+        bootstrap_auth: None,
+        bootstrap_maintenance: Arc::new(Mutex::new(None)),
+    }
+    .with_turn_execution_timeout_for_tests(5);
+
+    let session = service
+        .run(
+            LOCAL_DEMO_HOST,
+            &turn_intent_with_extras("local run extras", 3),
+        )
+        .expect("run local Turn")
+        .session;
+    service
+        .steer(
+            session.session_id(),
+            &turn_intent_with_extras("local steer extras", 7),
+        )
+        .expect("steer local Turn");
+
+    assert_eq!(
+        *observations.lock().expect("lock observations"),
+        [(1, 3), (1, 5)],
+        "run must preserve a shorter timeout and steer must clamp to the Host limit"
+    );
+}
+
+#[test]
+fn unsupported_image_capability_rejects_direct_run_and_steer_before_admission() {
+    let state = TestStateDir::new().expect("temporary state directory");
+    let observations = Arc::new(Mutex::new(Vec::new()));
+    let service = HostService {
+        runtime: RuntimeHandle::new(
+            Ok(state.path().to_path_buf()),
+            RecordingTurnExtrasAdapter {
+                observations: Arc::clone(&observations),
+            },
+        ),
+        operation_capacity: Arc::new(OperationCapacity::default()),
+        turn_execution_timeout: crate::configured_turn_execution_timeout(
+            &satelle_core::SatelleConfig::defaults().hosts[LOCAL_DEMO_HOST],
+        ),
+        mode: HostMode::TestFake {
+            image_attachments: false,
+        },
+        bootstrap_auth: None,
+        bootstrap_maintenance: Arc::new(Mutex::new(None)),
+    };
+    let image_intent = turn_intent_with_extras("unsupported image", 3);
+
+    let run_failure = service
+        .run(LOCAL_DEMO_HOST, &image_intent)
+        .expect_err("attached image run must be rejected");
+    assert!(matches!(
+        run_failure,
+        TurnAdmissionFailure::NotAdmitted(error) if error.code == ErrorCode::InvalidUsage
+    ));
+    let detached_run_error = service
+        .run_detached(LOCAL_DEMO_HOST, &image_intent)
+        .expect_err("detached image run must be rejected");
+    assert_eq!(detached_run_error.code, ErrorCode::InvalidUsage);
+    assert!(
+        !state.path().join("attachments").exists(),
+        "unsupported images must be rejected before the attachment store opens"
+    );
+    assert!(observations.lock().expect("lock observations").is_empty());
+
+    let initial = service
+        .run(LOCAL_DEMO_HOST, &turn_intent("image-free run"))
+        .expect("image-free run remains supported")
+        .session;
+    let steer_failure = service
+        .steer(initial.session_id(), &image_intent)
+        .expect_err("attached image steer must be rejected");
+    assert!(matches!(
+        steer_failure,
+        TurnAdmissionFailure::NotAdmitted(error) if error.code == ErrorCode::InvalidUsage
+    ));
+    let detached_steer_error = service
+        .steer_detached(initial.session_id(), &image_intent)
+        .expect_err("detached image steer must be rejected");
+    assert_eq!(detached_steer_error.code, ErrorCode::InvalidUsage);
+
+    let status = service
+        .status(initial.session_id())
+        .expect("seed Session remains readable");
+    assert_eq!(status.turns().len(), 1);
+    assert_eq!(observations.lock().expect("lock observations").len(), 1);
 }
 
 #[test]
@@ -25,6 +187,7 @@ fn admission_request_timeout_tracks_both_configured_readiness_phases() {
     config.timeouts = Some(satelle_core::TimeoutConfig {
         native_readiness: satelle_core::ExplicitDuration::parse("2s"),
         provider_smoke_test: satelle_core::ExplicitDuration::parse("3s"),
+        turn_execution: None,
     });
     assert_eq!(
         admission_request_timeout(&config),
@@ -40,7 +203,12 @@ fn configured_remote_alias_reaches_execution_and_session_keeps_host_identity() {
     let service = HostService {
         runtime: RuntimeHandle::new(Ok(state.path().to_path_buf()), FakeComputerUseAdapter),
         operation_capacity: Arc::new(OperationCapacity::default()),
-        mode: HostMode::TestFake,
+        turn_execution_timeout: crate::configured_turn_execution_timeout(
+            &satelle_core::SatelleConfig::defaults().hosts[LOCAL_DEMO_HOST],
+        ),
+        mode: HostMode::TestFake {
+            image_attachments: true,
+        },
         bootstrap_auth: None,
         bootstrap_maintenance: Arc::new(Mutex::new(None)),
     };
@@ -93,7 +261,12 @@ fn configured_remote_alias_is_accepted_by_host_diagnostics() {
     let service = HostService {
         runtime: RuntimeHandle::new(Ok(state.path().to_path_buf()), FakeComputerUseAdapter),
         operation_capacity: Arc::new(OperationCapacity::default()),
-        mode: HostMode::TestFake,
+        turn_execution_timeout: crate::configured_turn_execution_timeout(
+            &satelle_core::SatelleConfig::defaults().hosts[LOCAL_DEMO_HOST],
+        ),
+        mode: HostMode::TestFake {
+            image_attachments: true,
+        },
         bootstrap_auth: None,
         bootstrap_maintenance: Arc::new(Mutex::new(None)),
     };
@@ -188,6 +361,9 @@ fn unsupported_or_unproven_production_execution_is_blocked_without_state_admissi
         let service = HostService {
             runtime: RuntimeHandle::new(Ok(state.path().to_path_buf()), adapter),
             operation_capacity: Arc::new(OperationCapacity::default()),
+            turn_execution_timeout: crate::configured_turn_execution_timeout(
+                &satelle_core::SatelleConfig::defaults().hosts[LOCAL_DEMO_HOST],
+            ),
             mode: HostMode::Production { snapshot },
             bootstrap_auth: None,
             bootstrap_maintenance: Arc::new(Mutex::new(None)),
@@ -301,7 +477,12 @@ fn attached_adapter_failures_return_exact_durable_run_and_steer_handles() {
     let run_service = HostService {
         runtime: RuntimeHandle::new(Ok(run_state.path().to_path_buf()), FailingExecutionAdapter),
         operation_capacity: Arc::new(OperationCapacity::default()),
-        mode: HostMode::TestFake,
+        turn_execution_timeout: crate::configured_turn_execution_timeout(
+            &satelle_core::SatelleConfig::defaults().hosts[LOCAL_DEMO_HOST],
+        ),
+        mode: HostMode::TestFake {
+            image_attachments: true,
+        },
         bootstrap_auth: None,
         bootstrap_maintenance: Arc::new(Mutex::new(None)),
     };
@@ -333,7 +514,12 @@ fn attached_adapter_failures_return_exact_durable_run_and_steer_handles() {
     let seeded = HostService {
         runtime: RuntimeHandle::new(Ok(steer_state.path().to_path_buf()), FakeComputerUseAdapter),
         operation_capacity: Arc::new(OperationCapacity::default()),
-        mode: HostMode::TestFake,
+        turn_execution_timeout: crate::configured_turn_execution_timeout(
+            &satelle_core::SatelleConfig::defaults().hosts[LOCAL_DEMO_HOST],
+        ),
+        mode: HostMode::TestFake {
+            image_attachments: true,
+        },
         bootstrap_auth: None,
         bootstrap_maintenance: Arc::new(Mutex::new(None)),
     };
@@ -351,7 +537,12 @@ fn attached_adapter_failures_return_exact_durable_run_and_steer_handles() {
             FailingExecutionAdapter,
         ),
         operation_capacity: Arc::new(OperationCapacity::default()),
-        mode: HostMode::TestFake,
+        turn_execution_timeout: crate::configured_turn_execution_timeout(
+            &satelle_core::SatelleConfig::defaults().hosts[LOCAL_DEMO_HOST],
+        ),
+        mode: HostMode::TestFake {
+            image_attachments: true,
+        },
         bootstrap_auth: None,
         bootstrap_maintenance: Arc::new(Mutex::new(None)),
     };
@@ -409,6 +600,9 @@ fn refreshed_production_snapshot_updates_admission_surfaces_but_not_desktop_disc
     let service = HostService {
         runtime: RuntimeHandle::new(Ok(state.path().to_path_buf()), adapter),
         operation_capacity: Arc::new(OperationCapacity::default()),
+        turn_execution_timeout: crate::configured_turn_execution_timeout(
+            &satelle_core::SatelleConfig::defaults().hosts[LOCAL_DEMO_HOST],
+        ),
         mode: HostMode::Production { snapshot },
         bootstrap_auth: None,
         bootstrap_maintenance: Arc::new(Mutex::new(None)),

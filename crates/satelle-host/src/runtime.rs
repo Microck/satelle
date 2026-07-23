@@ -77,6 +77,7 @@ struct AdmissionExecution<'a> {
     execution_mode: satelle_core::session::TurnExecutionMode,
     dispatch_preference: request::DispatchPreference,
     provider_smoke_event: Option<satelle_core::SatelleEventBody>,
+    attachments: crate::attachment::StagedAttachments,
 }
 
 /// Exclusive in-process authority for one live setup or repair operation.
@@ -418,6 +419,7 @@ pub(crate) struct RuntimeEngine {
     workers: Mutex<WorkerRegistry>,
     live_events: LiveEventHub,
     process_identity: ProcessIdentity,
+    attachment_store: crate::attachment::AttachmentStore,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -455,6 +457,8 @@ impl RuntimeEngine {
             ProcessIdentity::current().map_err(model::process_identity_failure)?;
         let storage =
             Storage::open_without_restart_recovery(state_root).map_err(model::storage_failure)?;
+        let attachment_store =
+            crate::attachment::AttachmentStore::open(state_root.join("attachments"))?;
         let mirrored_cursor = storage
             .latest_log_cursor()
             .map_err(model::storage_failure)?;
@@ -471,6 +475,7 @@ impl RuntimeEngine {
             workers: Mutex::new(WorkerRegistry::default()),
             live_events: LiveEventHub::new(),
             process_identity,
+            attachment_store,
         });
         Ok(engine)
     }
@@ -616,7 +621,7 @@ impl RuntimeEngine {
         let host_identity = self.host_identity()?;
         let execution_policy = readiness
             .execution_policy()
-            .for_turn_mode(command.execution_mode);
+            .for_turn(command.execution_mode, command.turn_execution_timeout);
         let initial = model::initial_session(
             session_id.clone(),
             turn_id.clone(),
@@ -631,6 +636,7 @@ impl RuntimeEngine {
             &command.identity,
             &self.process_identity,
         )?;
+        let attachments = self.attachment_store.stage(command.attachments)?;
         let (outcome, provider_smoke_event) =
             command
                 .cancellation
@@ -654,6 +660,7 @@ impl RuntimeEngine {
                 execution_mode: command.execution_mode,
                 dispatch_preference: command.dispatch,
                 provider_smoke_event,
+                attachments,
             },
             outcome,
             context.lease_owner().clone(),
@@ -679,13 +686,14 @@ impl RuntimeEngine {
         let started_at = model::monotonic_now(&existing);
         let execution_policy = readiness
             .execution_policy()
-            .for_turn_mode(command.execution_mode);
+            .for_turn(command.execution_mode, command.turn_execution_timeout);
         let context = model::admission(
             IdempotentOperation::Steer,
             started_at,
             &command.identity,
             &self.process_identity,
         )?;
+        let attachments = self.attachment_store.stage(command.attachments)?;
         let (outcome, provider_smoke_event) = command.cancellation.with_commit_gate(
             command.session_id.clone(),
             turn_id.clone(),
@@ -718,6 +726,7 @@ impl RuntimeEngine {
                 execution_mode: command.execution_mode,
                 dispatch_preference: command.dispatch,
                 provider_smoke_event,
+                attachments,
             },
             outcome,
             context.lease_owner().clone(),
@@ -1223,6 +1232,7 @@ impl RuntimeEngine {
                     execution_mode: execution.execution_mode,
                     work,
                     provider_smoke_event: execution.provider_smoke_event,
+                    attachments: execution.attachments,
                 };
                 match execution.dispatch_preference {
                     request::DispatchPreference::Inline => self.execute(plan),

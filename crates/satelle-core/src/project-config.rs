@@ -163,11 +163,10 @@ impl ParsedProjectConfig {
                     .hosts
                     .get_mut(alias)
                     .expect("project host intents were validated before application");
-                host.timeouts = Some(
-                    host.timeouts
-                        .take()
-                        .map_or_else(|| timeouts.clone(), |base| base.merge(timeouts.clone())),
-                );
+                host.timeouts = Some(host.timeouts.take().map_or_else(
+                    || TimeoutConfig::default_profile_overlay(timeouts.clone()),
+                    |base| base.merge(timeouts.clone()),
+                ));
             }
         }
 

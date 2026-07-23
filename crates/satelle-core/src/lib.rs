@@ -51,8 +51,9 @@ pub use events::{
 pub use ids::{IdParseError, SESSION_ID_PATTERN, SessionId, TurnId};
 pub use profiles::{ProfileField, ProfileSelectionSource, SelectedProfile};
 pub use secure_file::{
-    OwnerOnlyDirectory, SecureFileError, open_or_create_owner_only_directory,
-    open_or_create_owner_only_file, open_owner_only_directory, persist_new_owner_only_secret_file,
+    OwnerOnlyDirectory, SecureFileError, open_new_owner_only_file,
+    open_or_create_owner_only_directory, open_or_create_owner_only_file, open_owner_only_directory,
+    persist_new_owner_only_secret_file, read_bounded_regular_file_no_follow,
     read_owner_controlled_config_file, read_owner_only_secret_config_file,
     read_owner_only_secret_file, read_trusted_ca_bundle_file,
 };
@@ -312,6 +313,7 @@ impl SetupMode {
 pub struct TimeoutConfig {
     pub native_readiness: Option<ExplicitDuration>,
     pub provider_smoke_test: Option<ExplicitDuration>,
+    pub turn_execution: Option<TurnExecutionDuration>,
 }
 
 impl TimeoutConfig {
@@ -322,7 +324,26 @@ impl TimeoutConfig {
         if higher.provider_smoke_test.is_some() {
             self.provider_smoke_test = higher.provider_smoke_test;
         }
+        if let Some(higher_timeout) = higher.turn_execution {
+            let current_limit = self.turn_execution.as_ref().map_or(
+                DEFAULT_TURN_EXECUTION_TIMEOUT_MS,
+                TurnExecutionDuration::milliseconds,
+            );
+            if higher_timeout.milliseconds() < current_limit {
+                self.turn_execution = Some(higher_timeout);
+            }
+        }
         self
+    }
+
+    fn default_profile_overlay(profile: TimeoutConfig) -> Self {
+        Self {
+            native_readiness: profile.native_readiness,
+            provider_smoke_test: profile.provider_smoke_test,
+            turn_execution: profile
+                .turn_execution
+                .filter(|duration| duration.milliseconds() < DEFAULT_TURN_EXECUTION_TIMEOUT_MS),
+        }
     }
 }
 
@@ -370,6 +391,65 @@ impl ExplicitDuration {
 
     pub fn milliseconds(&self) -> u64 {
         self.milliseconds
+    }
+}
+
+pub const DEFAULT_TURN_EXECUTION_TIMEOUT_MS: u64 = 30 * 60 * 1_000;
+pub const MAX_TURN_EXECUTION_TIMEOUT_MS: u64 = 24 * 60 * 60 * 1_000;
+
+/// A finite Turn deadline. It deliberately has its own grammar so supporting
+/// hour-scale prompt execution does not broaden unrelated probe timeouts.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TurnExecutionDuration {
+    raw: String,
+    seconds: u32,
+}
+
+impl TurnExecutionDuration {
+    pub fn parse(value: &str) -> Option<Self> {
+        let seconds = parse_turn_execution_seconds(value)?;
+        if seconds > MAX_TURN_EXECUTION_TIMEOUT_MS / 1_000 {
+            return None;
+        }
+        Some(Self {
+            raw: value.to_string(),
+            seconds: u32::try_from(seconds).ok()?,
+        })
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.raw
+    }
+
+    pub fn milliseconds(&self) -> u64 {
+        u64::from(self.seconds) * 1_000
+    }
+
+    pub fn seconds(&self) -> u32 {
+        self.seconds
+    }
+}
+
+impl Serialize for TurnExecutionDuration {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_str(&self.raw)
+    }
+}
+
+impl<'de> Deserialize<'de> for TurnExecutionDuration {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        Self::parse(&value).ok_or_else(|| {
+            serde::de::Error::custom(
+                "Turn execution timeout values require s, m, or h units and must not exceed 24h",
+            )
+        })
     }
 }
 
@@ -1596,7 +1676,7 @@ fn reject_interpolation(path: &Path, value: &toml::Value) -> Result<(), SatelleE
         }
 
         if let Some(timeout_table) = host_table.get("timeouts").and_then(toml::Value::as_table) {
-            for key in ["native_readiness", "provider_smoke_test"] {
+            for key in ["native_readiness", "provider_smoke_test", "turn_execution"] {
                 collect_interpolation_for_value(
                     &format!("{host_path}.timeouts.{key}"),
                     timeout_table.get(key),
@@ -1812,14 +1892,29 @@ fn reject_timeout_config_errors(path: &Path, value: &toml::Value) -> Result<(), 
 
         for (key, value) in timeouts {
             let timeout_path = format!("{host_path}.timeouts.{key}");
-            if !["native_readiness", "provider_smoke_test"].contains(&key.as_str()) {
+            if !["native_readiness", "provider_smoke_test", "turn_execution"]
+                .contains(&key.as_str())
+            {
                 return Err(SatelleError::unknown_timeout_key(path, &timeout_path, key));
             }
 
             let Some(value) = value.as_str() else {
                 return Err(SatelleError::duration_unit_required(path, &timeout_path));
             };
-            if ExplicitDuration::parse(value).is_none() {
+            if key == "turn_execution" {
+                let Some(seconds) = parse_turn_execution_seconds(value) else {
+                    return Err(SatelleError::turn_duration_unit_required(
+                        path,
+                        &timeout_path,
+                    ));
+                };
+                if seconds > MAX_TURN_EXECUTION_TIMEOUT_MS / 1_000 {
+                    return Err(SatelleError::turn_timeout_config_limit_exceeded(
+                        path,
+                        &timeout_path,
+                    ));
+                }
+            } else if ExplicitDuration::parse(value).is_none() {
                 return Err(SatelleError::duration_unit_required(path, &timeout_path));
             }
         }
@@ -2129,8 +2224,74 @@ fn parse_duration_millis(value: &str) -> Option<u64> {
     None
 }
 
+fn parse_turn_execution_seconds(value: &str) -> Option<u64> {
+    if let Some(seconds) = value.strip_suffix('s') {
+        return parse_positive_u64(seconds);
+    }
+    if let Some(minutes) = value.strip_suffix('m') {
+        return parse_positive_u64(minutes)?.checked_mul(60);
+    }
+    if let Some(hours) = value.strip_suffix('h') {
+        return parse_positive_u64(hours)?.checked_mul(60 * 60);
+    }
+    None
+}
+
 fn parse_positive_u64(value: &str) -> Option<u64> {
     value.parse::<u64>().ok().filter(|value| *value > 0)
+}
+
+#[cfg(test)]
+mod pr08_turn_duration_tests {
+    use super::*;
+
+    #[test]
+    fn turn_duration_hours_do_not_broaden_other_timeout_fields() {
+        assert!(ExplicitDuration::parse("1h").is_none());
+        assert_eq!(
+            TurnExecutionDuration::parse("1h")
+                .expect("Turn hours are valid")
+                .milliseconds(),
+            3_600_000
+        );
+        assert!(TurnExecutionDuration::parse("500ms").is_none());
+        assert!(TurnExecutionDuration::parse("25h").is_none());
+    }
+
+    #[test]
+    fn project_timeout_overlay_only_shortens_the_user_limit() {
+        let base = TimeoutConfig {
+            native_readiness: None,
+            provider_smoke_test: None,
+            turn_execution: TurnExecutionDuration::parse("10m"),
+        };
+        let longer = TimeoutConfig {
+            native_readiness: None,
+            provider_smoke_test: None,
+            turn_execution: TurnExecutionDuration::parse("20m"),
+        };
+        let shorter = TimeoutConfig {
+            native_readiness: None,
+            provider_smoke_test: None,
+            turn_execution: TurnExecutionDuration::parse("5m"),
+        };
+
+        assert_eq!(
+            base.clone()
+                .merge(longer)
+                .turn_execution
+                .expect("base limit remains")
+                .as_str(),
+            "10m"
+        );
+        assert_eq!(
+            base.merge(shorter)
+                .turn_execution
+                .expect("shorter project limit wins")
+                .as_str(),
+            "5m"
+        );
+    }
 }
 
 fn collect_unknown_keys_for_table(
@@ -2197,6 +2358,7 @@ fn edit_distance(left: &str, right: &str) -> usize {
 #[serde(rename_all = "kebab-case")]
 pub enum ErrorCode {
     InvalidUsage,
+    PromptSourceConflict,
     CompletionInstallFailed,
     CompletionProfileUpdateFailed,
     ConfigError,
@@ -2276,6 +2438,7 @@ impl ErrorCode {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::InvalidUsage => "invalid-usage",
+            Self::PromptSourceConflict => "prompt-source-conflict",
             Self::CompletionInstallFailed => "completion-install-failed",
             Self::CompletionProfileUpdateFailed => "completion-profile-update-failed",
             Self::ConfigError => "configuration-error",
@@ -2357,6 +2520,7 @@ impl ErrorCode {
     pub fn exit_code(self) -> i32 {
         match self {
             Self::InvalidUsage
+            | Self::PromptSourceConflict
             | Self::IdempotencyKeyConflict
             | Self::EventsWithDetach
             | Self::InterruptModeConflict
@@ -2456,6 +2620,19 @@ impl SatelleError {
             code: ErrorCode::InvalidUsage,
             message: message.into(),
             recovery_command: Some("satelle --help".to_string()),
+            source_detail: None,
+            details: BTreeMap::new(),
+        }
+    }
+
+    pub fn prompt_source_conflict() -> Self {
+        Self {
+            code: ErrorCode::PromptSourceConflict,
+            message: "pass exactly one prompt source: PROMPT_OR_DASH or --prompt-file".to_string(),
+            recovery_command: Some(
+                "pass a positional prompt, use '-' for standard input, or pass --prompt-file"
+                    .to_string(),
+            ),
             source_detail: None,
             details: BTreeMap::new(),
         }
@@ -2686,7 +2863,7 @@ impl SatelleError {
     }
 
     pub fn unknown_timeout_key(config_file: &Path, toml_path: &str, key: &str) -> Self {
-        let accepted_keys = ["native_readiness", "provider_smoke_test"];
+        let accepted_keys = ["native_readiness", "provider_smoke_test", "turn_execution"];
         let mut details = BTreeMap::new();
         details.insert(
             "file".to_string(),
@@ -2717,7 +2894,8 @@ impl SatelleError {
                 config_file.display()
             ),
             recovery_command: Some(
-                "use timeouts.native_readiness or timeouts.provider_smoke_test".to_string(),
+                "use timeouts.native_readiness, timeouts.provider_smoke_test, or timeouts.turn_execution"
+                    .to_string(),
             ),
             source_detail: None,
             details,
@@ -2748,6 +2926,61 @@ impl SatelleError {
                 config_file.display()
             ),
             recovery_command: Some("use an explicit duration such as 120s or 2m".to_string()),
+            source_detail: None,
+            details,
+        }
+    }
+
+    fn turn_timeout_config_limit_exceeded(config_file: &Path, toml_path: &str) -> Self {
+        let mut details = BTreeMap::new();
+        details.insert(
+            "file".to_string(),
+            Value::String(config_file.display().to_string()),
+        );
+        details.insert("path".to_string(), Value::String(toml_path.to_string()));
+        details.insert(
+            "maximum_timeout_ms".to_string(),
+            Value::from(MAX_TURN_EXECUTION_TIMEOUT_MS),
+        );
+        Self {
+            code: ErrorCode::ConfigError,
+            message: format!(
+                "config file {} has a Turn execution timeout above the 24 hour hard maximum at {toml_path}",
+                config_file.display()
+            ),
+            recovery_command: Some(
+                "set timeouts.turn_execution to a finite duration no greater than 24h".to_string(),
+            ),
+            source_detail: None,
+            details,
+        }
+    }
+
+    fn turn_duration_unit_required(config_file: &Path, toml_path: &str) -> Self {
+        let mut details = BTreeMap::new();
+        details.insert(
+            "file".to_string(),
+            Value::String(config_file.display().to_string()),
+        );
+        details.insert("path".to_string(), Value::String(toml_path.to_string()));
+        details.insert(
+            "accepted_units".to_string(),
+            Value::Array(
+                ["s", "m", "h"]
+                    .into_iter()
+                    .map(|unit| Value::String(unit.to_string()))
+                    .collect(),
+            ),
+        );
+        Self {
+            code: ErrorCode::DurationUnitRequired,
+            message: format!(
+                "config file {} requires an explicit Turn timeout unit at {toml_path}",
+                config_file.display()
+            ),
+            recovery_command: Some(
+                "use a Turn execution duration such as 30s, 30m, or 1h".to_string(),
+            ),
             source_detail: None,
             details,
         }

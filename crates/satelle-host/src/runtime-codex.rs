@@ -34,6 +34,15 @@ pub(crate) struct ControlPlaneProbe {
     operations: ControlPlaneCapabilitySet,
     schema_available: bool,
     handshake_completed: bool,
+    goal_set: bool,
+    image_input: CodexImageInputMode,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum CodexImageInputMode {
+    Unsupported,
+    Inline,
+    Local,
 }
 
 impl ControlPlaneProbe {
@@ -42,6 +51,8 @@ impl ControlPlaneProbe {
             operations: ControlPlaneCapabilitySet::EMPTY,
             schema_available: false,
             handshake_completed: false,
+            goal_set: false,
+            image_input: CodexImageInputMode::Unsupported,
         }
     }
 
@@ -75,6 +86,18 @@ impl ControlPlaneAdmission {
 
     pub(crate) const fn from_probe(probe: ControlPlaneProbe) -> Self {
         Self::Probed(probe)
+    }
+
+    pub(crate) const fn goal_set(self) -> bool {
+        matches!(self, Self::Probed(probe) if probe.handshake_completed && probe.goal_set)
+    }
+
+    pub(crate) const fn image_input(self) -> CodexImageInputMode {
+        match self {
+            Self::Probed(probe) if probe.handshake_completed => probe.image_input,
+            Self::Probed(_) => CodexImageInputMode::Unsupported,
+            Self::NotApplicable | Self::Unavailable(_) => CodexImageInputMode::Unsupported,
+        }
     }
 
     pub(crate) fn admit(self, operation: ControlPlaneOperation) -> Result<(), SatelleError> {
@@ -252,6 +275,14 @@ where
         return ControlPlaneProbe::unavailable();
     };
     let operations = schema.operation_capabilities();
+    let goal_set = schema.client_requests.declares("thread/goal/set");
+    let image_input = if schema.client_requests.declares_user_input("localImage") {
+        CodexImageInputMode::Local
+    } else if schema.client_requests.declares_user_input("image") {
+        CodexImageInputMode::Inline
+    } else {
+        CodexImageInputMode::Unsupported
+    };
     let handshake_declared = schema.client_requests.declares("initialize")
         && schema.client_notifications.declares("initialized");
     let handshake_completed = handshake_declared && handshake(schema_dir.path(), deadline);
@@ -260,6 +291,8 @@ where
         operations,
         schema_available: true,
         handshake_completed,
+        goal_set,
+        image_input,
     }
 }
 
@@ -322,6 +355,52 @@ impl MethodSchema {
     fn declares(&self, expected: &str) -> bool {
         declares_method(&self.0, expected)
     }
+
+    fn declares_user_input(&self, expected: &str) -> bool {
+        let Some(request) = request_variant(&self.0, "turn/start") else {
+            return false;
+        };
+        let Some(params) = resolve_schema(&self.0, request.pointer("/properties/params")) else {
+            return false;
+        };
+        let Some(input) = resolve_schema(&self.0, params.pointer("/properties/input/items")) else {
+            return false;
+        };
+        input
+            .get("oneOf")
+            .and_then(Value::as_array)
+            .is_some_and(|variants| {
+                variants.iter().any(|variant| {
+                    resolve_schema(&self.0, Some(variant))
+                        .and_then(|variant| variant.pointer("/properties/type"))
+                        .is_some_and(|kind| schema_string_value(kind, expected))
+                })
+            })
+    }
+}
+
+fn request_variant<'a>(root: &'a Value, method: &str) -> Option<&'a Value> {
+    root.get("oneOf")?.as_array()?.iter().find(|variant| {
+        variant
+            .pointer("/properties/method")
+            .is_some_and(|kind| schema_string_value(kind, method))
+    })
+}
+
+fn resolve_schema<'a>(root: &'a Value, value: Option<&'a Value>) -> Option<&'a Value> {
+    let value = value?;
+    match value.get("$ref").and_then(Value::as_str) {
+        Some(reference) => root.pointer(reference.strip_prefix('#')?),
+        None => Some(value),
+    }
+}
+
+fn schema_string_value(value: &Value, expected: &str) -> bool {
+    value.get("const").and_then(Value::as_str) == Some(expected)
+        || value
+            .get("enum")
+            .and_then(Value::as_array)
+            .is_some_and(|values| values.iter().any(|value| value.as_str() == Some(expected)))
 }
 
 fn declares_method(value: &Value, expected: &str) -> bool {

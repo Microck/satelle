@@ -479,6 +479,60 @@ impl ExecutionPolicy {
             experimental_features: self.experimental_features,
         }
     }
+
+    /// Resolves Controller intent against the Host-owned ceiling before the
+    /// immutable policy is committed with the Turn.
+    pub fn for_turn(
+        &self,
+        mode: TurnExecutionMode,
+        requested_timeout: Option<TimeoutPolicy>,
+    ) -> Self {
+        let mut policy = self.for_turn_mode(mode);
+        if let Some(requested_timeout) = requested_timeout {
+            policy.timeout_policy = TimeoutPolicy(policy.timeout_policy.0.min(requested_timeout.0));
+        }
+        policy
+    }
+}
+
+#[cfg(test)]
+mod pr08_timeout_policy_tests {
+    use super::*;
+
+    #[test]
+    fn requested_turn_timeout_can_only_shorten_host_policy() {
+        let desktop = DesktopTarget::new(DesktopBindingRef::new("timeout-desktop").unwrap());
+        let policy = ExecutionPolicy::new(
+            EffectiveModelRef::new("timeout-model").unwrap(),
+            ProviderBindingRef::new("timeout-provider").unwrap(),
+            desktop,
+            ApprovalPolicy::OnRequest,
+            SandboxPolicy::WorkspaceWrite,
+            TimeoutPolicy::bounded_seconds(1_800).unwrap(),
+            ExperimentalFeatureChoices::new(FeatureChoice::Enabled, FeatureChoice::Disabled),
+        );
+
+        assert_eq!(
+            policy
+                .for_turn(
+                    TurnExecutionMode::Standard,
+                    Some(TimeoutPolicy::bounded_seconds(10).unwrap()),
+                )
+                .timeout_policy()
+                .seconds(),
+            10
+        );
+        assert_eq!(
+            policy
+                .for_turn(
+                    TurnExecutionMode::Standard,
+                    Some(TimeoutPolicy::bounded_seconds(3_600).unwrap()),
+                )
+                .timeout_policy()
+                .seconds(),
+            1_800
+        );
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]

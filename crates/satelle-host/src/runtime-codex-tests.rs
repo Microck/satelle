@@ -1,5 +1,6 @@
 use super::control_plane::{
-    ControlPlaneAdmission, configure_app_server_command, probe_control_plane_with,
+    CodexImageInputMode, ControlPlaneAdmission, configure_app_server_command,
+    probe_control_plane_with,
 };
 use satelle_core::{ControlPlaneCapability, ControlPlaneOperation, ErrorCode};
 use serde_json::json;
@@ -167,6 +168,30 @@ fn unavailable_goal_methods_do_not_block_core_session_and_turn_control() {
 }
 
 #[test]
+fn goal_and_local_image_are_detected_from_canonical_schema_paths() {
+    let admission = ControlPlaneAdmission::from_probe(run_fixture("goal-local-image"));
+
+    assert!(admission.goal_set());
+    assert_eq!(admission.image_input(), CodexImageInputMode::Local);
+}
+
+#[test]
+fn inline_image_is_detected_when_local_image_is_absent() {
+    let admission = ControlPlaneAdmission::from_probe(run_fixture("inline-image"));
+
+    assert!(admission.goal_set());
+    assert_eq!(admission.image_input(), CodexImageInputMode::Inline);
+}
+
+#[test]
+fn optional_capability_decoys_outside_canonical_paths_are_ignored() {
+    let admission = ControlPlaneAdmission::from_probe(run_fixture("optional-decoy"));
+
+    assert!(!admission.goal_set());
+    assert_eq!(admission.image_input(), CodexImageInputMode::Unsupported);
+}
+
+#[test]
 fn recovery_requires_status_and_steering_capabilities() {
     let probe = run_fixture("missing-steering");
     let error = ControlPlaneAdmission::from_probe(probe)
@@ -213,8 +238,11 @@ fn schema_and_handshake_share_one_hard_deadline() {
         started.elapsed() < Duration::from_millis(6_500),
         "schema discovery and the handshake used separate timeout budgets"
     );
+    let admission = ControlPlaneAdmission::from_probe(probe);
+    assert!(!admission.goal_set());
+    assert_eq!(admission.image_input(), CodexImageInputMode::Unsupported);
     assert_eq!(
-        ControlPlaneAdmission::from_probe(probe)
+        admission
             .admit(ControlPlaneOperation::Run)
             .expect_err("the incomplete handshake must remain blocked")
             .details["reason"],
@@ -444,12 +472,23 @@ fn schema_fixture_child() {
     if include_cancellation {
         client_methods.push("turn/interrupt");
     }
+    if matches!(mode.to_str(), Some("goal-local-image" | "inline-image")) {
+        client_methods.push("thread/goal/set");
+    }
     client_methods.push(RAW_SCHEMA_CANARY);
 
-    write_method_schema(
+    let image_types: &[&str] = match mode.to_str() {
+        Some("goal-local-image") => &["image", "localImage"],
+        Some("inline-image") => &["image"],
+        _ => &[],
+    };
+
+    write_client_request_schema(
         &schema_dir.join("ClientRequest.json"),
         &client_methods,
         (mode == "decoy-cancellation").then_some("turn/interrupt"),
+        image_types,
+        mode == "optional-decoy",
     );
     write_method_schema(
         &schema_dir.join("ClientNotification.json"),
@@ -468,6 +507,68 @@ fn schema_fixture_child() {
         ],
         None,
     );
+}
+
+fn write_client_request_schema(
+    path: &Path,
+    methods: &[&str],
+    nested_decoy: Option<&str>,
+    image_types: &[&str],
+    optional_decoys: bool,
+) {
+    let variants = methods
+        .iter()
+        .map(|method| {
+            let mut variant = json!({
+                "type": "object",
+                "properties": {"method": {"type": "string", "enum": [method]}}
+            });
+            if *method == "turn/start" && !image_types.is_empty() {
+                variant["properties"]["params"] = json!({"$ref": "#/definitions/TurnStartParams"});
+            }
+            variant
+        })
+        .collect::<Vec<_>>();
+    let input_variants = image_types
+        .iter()
+        .map(|input_type| match *input_type {
+            "image" => json!({"$ref": "#/definitions/ImageInput"}),
+            "localImage" => json!({"$ref": "#/definitions/LocalImageInput"}),
+            _ => unreachable!("the fixture only defines supported image variants"),
+        })
+        .collect::<Vec<_>>();
+    let mut unused_methods = nested_decoy.into_iter().collect::<Vec<_>>();
+    if optional_decoys {
+        unused_methods.push("thread/goal/set");
+    }
+    let unused_payload = if optional_decoys {
+        json!({
+            "properties": {
+                "method": {"enum": unused_methods},
+                "attachments": {"items": {"oneOf": [
+                    {"properties": {"type": {"const": "image"}}},
+                    {"properties": {"type": {"const": "localImage"}}}
+                ]}}
+            }
+        })
+    } else {
+        json!({"properties": {"method": {"enum": unused_methods}}})
+    };
+    serde_json::to_writer(
+        File::create(path).expect("create fixture schema"),
+        &json!({
+            "oneOf": variants,
+            "definitions": {
+                "TurnStartParams": {
+                    "properties": {"input": {"items": {"oneOf": input_variants}}}
+                },
+                "ImageInput": {"properties": {"type": {"const": "image"}}},
+                "LocalImageInput": {"properties": {"type": {"const": "localImage"}}},
+                "UnusedPayload": unused_payload
+            }
+        }),
+    )
+    .expect("write fixture schema");
 }
 
 fn write_method_schema(path: &Path, methods: &[&str], nested_decoy: Option<&str>) {

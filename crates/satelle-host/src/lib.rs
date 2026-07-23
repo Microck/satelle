@@ -1,5 +1,6 @@
 #[path = "api-auth.rs"]
 mod api_auth;
+mod attachment;
 mod codex_capabilities;
 #[path = "codex-install.rs"]
 mod codex_install;
@@ -28,6 +29,7 @@ use api_auth::EphemeralApiAuthenticator;
 pub use api_auth::{
     ApiBearerToken, ApiBearerTokenError, ApiPrincipal, ApiScopes, contains_api_bearer_token,
 };
+pub use attachment::AttachmentUpload;
 use codex_capabilities::{
     BlockerReason, CodexVersionEvidence, Phase0CapabilityBlocker, Phase0SupportVerdict,
     RequiredCapability, discover_phase0, evaluate_phase0_support,
@@ -612,6 +614,7 @@ mod bootstrap_maintenance_tests {
 pub struct HostService {
     runtime: RuntimeHandle,
     operation_capacity: Arc<OperationCapacity>,
+    turn_execution_timeout: satelle_core::session::TimeoutPolicy,
     mode: HostMode,
     bootstrap_auth: Option<Arc<EphemeralApiAuthenticator>>,
     bootstrap_maintenance: Arc<Mutex<Option<MaintenanceOperationHandle>>>,
@@ -623,7 +626,20 @@ enum HostMode {
         snapshot: Arc<RwLock<ProductionCapabilitySnapshot>>,
     },
     #[cfg(any(test, feature = "test-support"))]
-    TestFake,
+    TestFake { image_attachments: bool },
+}
+
+fn configured_turn_execution_timeout(config: &HostConfig) -> satelle_core::session::TimeoutPolicy {
+    let seconds = config
+        .timeouts
+        .as_ref()
+        .and_then(|timeouts| timeouts.turn_execution.as_ref())
+        .map_or(
+            (satelle_core::DEFAULT_TURN_EXECUTION_TIMEOUT_MS / 1_000) as u32,
+            satelle_core::TurnExecutionDuration::seconds,
+        );
+    satelle_core::session::TimeoutPolicy::bounded_seconds(seconds)
+        .expect("validated Turn execution configuration has a nonzero timeout")
 }
 
 #[derive(Clone, Debug)]
@@ -652,6 +668,21 @@ impl ProductionCapabilitySnapshot {
             finished_at: utc_now(),
             duration_ms,
         }
+    }
+
+    pub(crate) const fn goal_set_supported(&self) -> bool {
+        self.control_plane_admission.goal_set()
+    }
+
+    pub(crate) const fn image_input_mode(&self) -> codex_capabilities::CodexImageInputMode {
+        self.control_plane_admission.image_input()
+    }
+
+    pub(crate) const fn image_attachments_supported(&self) -> bool {
+        !matches!(
+            self.image_input_mode(),
+            codex_capabilities::CodexImageInputMode::Unsupported
+        )
     }
 }
 
@@ -688,7 +719,12 @@ impl HostService {
                 driver,
             ),
             operation_capacity: Arc::new(OperationCapacity::default()),
-            mode: HostMode::TestFake,
+            turn_execution_timeout: configured_turn_execution_timeout(
+                &satelle_core::SatelleConfig::defaults().hosts[LOCAL_DEMO_HOST],
+            ),
+            mode: HostMode::TestFake {
+                image_attachments: true,
+            },
             bootstrap_auth: None,
             bootstrap_maintenance: Arc::new(Mutex::new(None)),
         })
@@ -1092,6 +1128,7 @@ impl HostService {
         Self {
             runtime: RuntimeHandle::new_production(state_root, operator_log_root, adapter),
             operation_capacity: Arc::new(OperationCapacity::default()),
+            turn_execution_timeout: configured_turn_execution_timeout(config),
             mode: HostMode::Production { snapshot },
             bootstrap_auth: None,
             bootstrap_maintenance: Arc::new(Mutex::new(None)),
@@ -1127,7 +1164,12 @@ impl HostService {
         Ok(Self {
             runtime: RuntimeHandle::new(satelle_core::state_dir(), FakeComputerUseAdapter),
             operation_capacity: Arc::new(OperationCapacity::default()),
-            mode: HostMode::TestFake,
+            turn_execution_timeout: configured_turn_execution_timeout(
+                &satelle_core::SatelleConfig::defaults().hosts[LOCAL_DEMO_HOST],
+            ),
+            mode: HostMode::TestFake {
+                image_attachments: true,
+            },
             bootstrap_auth: None,
             bootstrap_maintenance: Arc::new(Mutex::new(None)),
         })
@@ -1139,7 +1181,12 @@ impl HostService {
         Ok(Self {
             runtime: RuntimeHandle::new(satelle_core::state_dir(), PendingComputerUseAdapter),
             operation_capacity: Arc::new(OperationCapacity::default()),
-            mode: HostMode::TestFake,
+            turn_execution_timeout: configured_turn_execution_timeout(
+                &satelle_core::SatelleConfig::defaults().hosts[LOCAL_DEMO_HOST],
+            ),
+            mode: HostMode::TestFake {
+                image_attachments: true,
+            },
             bootstrap_auth: None,
             bootstrap_maintenance: Arc::new(Mutex::new(None)),
         })
@@ -1151,7 +1198,12 @@ impl HostService {
         Ok(Self {
             runtime: RuntimeHandle::new(satelle_core::state_dir(), FailingComputerUseAdapter),
             operation_capacity: Arc::new(OperationCapacity::default()),
-            mode: HostMode::TestFake,
+            turn_execution_timeout: configured_turn_execution_timeout(
+                &satelle_core::SatelleConfig::defaults().hosts[LOCAL_DEMO_HOST],
+            ),
+            mode: HostMode::TestFake {
+                image_attachments: true,
+            },
             bootstrap_auth: None,
             bootstrap_maintenance: Arc::new(Mutex::new(None)),
         })
@@ -1202,7 +1254,7 @@ impl HostService {
                 production_doctor_report(host, scope, &*read_production_snapshot(snapshot)?)
             }
             #[cfg(any(test, feature = "test-support"))]
-            HostMode::TestFake => {
+            HostMode::TestFake { .. } => {
                 self.fake_doctor(host, scope, options, &FakeComputerUseAdapter)?
             }
         };
@@ -1241,7 +1293,7 @@ impl HostService {
                 daemon_path_overrides,
             )),
             #[cfg(any(test, feature = "test-support"))]
-            HostMode::TestFake => self.setup_fake(
+            HostMode::TestFake { .. } => self.setup_fake(
                 host,
                 dry_run,
                 setup_mode,
@@ -1259,7 +1311,7 @@ impl HostService {
                 sessions: 0,
             }),
             #[cfg(any(test, feature = "test-support"))]
-            HostMode::TestFake => {
+            HostMode::TestFake { .. } => {
                 let snapshot = self.runtime.reconcile_and_snapshot()?;
                 Ok(HostStatus {
                     running: true,
@@ -1270,17 +1322,55 @@ impl HostService {
         }
     }
 
+    fn ensure_image_attachments_supported(&self, intent: &TurnIntent) -> Result<(), SatelleError> {
+        if intent.attachments().is_empty() {
+            return Ok(());
+        }
+        let supported = match &self.mode {
+            HostMode::Production { snapshot } => {
+                read_production_snapshot(snapshot)?.image_attachments_supported()
+            }
+            #[cfg(any(test, feature = "test-support"))]
+            HostMode::TestFake { image_attachments } => *image_attachments,
+        };
+        if supported {
+            Ok(())
+        } else {
+            Err(SatelleError::invalid_usage(
+                "the selected Codex protocol does not support image input",
+            ))
+        }
+    }
+
+    fn run_command<'a>(&self, command: RunCommand<'a>, intent: &TurnIntent) -> RunCommand<'a> {
+        command
+            .with_execution_mode(intent.execution_mode())
+            .with_provider_intent(intent.provider_intent().clone())
+            .with_turn_execution_timeout(Some(self.effective_turn_execution_timeout(intent)))
+            .with_attachments(intent.attachments().to_vec())
+    }
+
+    fn steer_command<'a>(
+        &self,
+        command: SteerCommand<'a>,
+        intent: &TurnIntent,
+    ) -> SteerCommand<'a> {
+        command
+            .with_execution_mode(intent.execution_mode())
+            .with_provider_intent(intent.provider_intent().clone())
+            .with_turn_execution_timeout(Some(self.effective_turn_execution_timeout(intent)))
+            .with_attachments(intent.attachments().to_vec())
+    }
+
     pub fn run(
         &self,
         host: &str,
         intent: &TurnIntent,
     ) -> Result<TurnOutcome, TurnAdmissionFailure> {
+        self.ensure_image_attachments_supported(intent)
+            .map_err(TurnAdmissionFailure::not_admitted)?;
         self.runtime
-            .run(
-                RunCommand::attached(host, intent.prompt())
-                    .with_execution_mode(intent.execution_mode())
-                    .with_provider_intent(intent.provider_intent().clone()),
-            )
+            .run(self.run_command(RunCommand::attached(host, intent.prompt()), intent))
             .map(crate::runtime::RuntimeTurnOutcome::into_command_outcome)
     }
 
@@ -1290,11 +1380,11 @@ impl HostService {
         intent: &TurnIntent,
         cancellation: AdmissionCancellation,
     ) -> Result<TurnOutcome, TurnAdmissionFailure> {
+        self.ensure_image_attachments_supported(intent)
+            .map_err(TurnAdmissionFailure::not_admitted)?;
         self.runtime
             .run(
-                RunCommand::attached(host, intent.prompt())
-                    .with_execution_mode(intent.execution_mode())
-                    .with_provider_intent(intent.provider_intent().clone())
+                self.run_command(RunCommand::attached(host, intent.prompt()), intent)
                     .with_cancellation(cancellation),
             )
             .map(crate::runtime::RuntimeTurnOutcome::into_command_outcome)
@@ -1305,12 +1395,10 @@ impl HostService {
         host: &str,
         intent: &TurnIntent,
     ) -> Result<PublicSession, SatelleError> {
+        self.ensure_image_attachments_supported(intent)?;
         crate::runtime::admitted_session(
-            self.runtime.run(
-                RunCommand::detached(host, intent.prompt())
-                    .with_execution_mode(intent.execution_mode())
-                    .with_provider_intent(intent.provider_intent().clone()),
-            ),
+            self.runtime
+                .run(self.run_command(RunCommand::detached(host, intent.prompt()), intent)),
         )
     }
 
@@ -1320,11 +1408,10 @@ impl HostService {
         intent: &TurnIntent,
         cancellation: AdmissionCancellation,
     ) -> Result<PublicSession, SatelleError> {
+        self.ensure_image_attachments_supported(intent)?;
         crate::runtime::admitted_session(
             self.runtime.run(
-                RunCommand::detached(host, intent.prompt())
-                    .with_execution_mode(intent.execution_mode())
-                    .with_provider_intent(intent.provider_intent().clone())
+                self.run_command(RunCommand::detached(host, intent.prompt()), intent)
                     .with_cancellation(cancellation),
             ),
         )
@@ -1335,12 +1422,13 @@ impl HostService {
         session_id: &SessionId,
         intent: &TurnIntent,
     ) -> Result<TurnOutcome, TurnAdmissionFailure> {
+        self.ensure_image_attachments_supported(intent)
+            .map_err(TurnAdmissionFailure::not_admitted)?;
         self.runtime
-            .steer(
-                SteerCommand::attached(session_id.clone(), intent.prompt())
-                    .with_execution_mode(intent.execution_mode())
-                    .with_provider_intent(intent.provider_intent().clone()),
-            )
+            .steer(self.steer_command(
+                SteerCommand::attached(session_id.clone(), intent.prompt()),
+                intent,
+            ))
             .map(crate::runtime::RuntimeTurnOutcome::into_command_outcome)
     }
 
@@ -1350,12 +1438,15 @@ impl HostService {
         intent: &TurnIntent,
         cancellation: AdmissionCancellation,
     ) -> Result<TurnOutcome, TurnAdmissionFailure> {
+        self.ensure_image_attachments_supported(intent)
+            .map_err(TurnAdmissionFailure::not_admitted)?;
         self.runtime
             .steer(
-                SteerCommand::attached(session_id.clone(), intent.prompt())
-                    .with_execution_mode(intent.execution_mode())
-                    .with_provider_intent(intent.provider_intent().clone())
-                    .with_cancellation(cancellation),
+                self.steer_command(
+                    SteerCommand::attached(session_id.clone(), intent.prompt()),
+                    intent,
+                )
+                .with_cancellation(cancellation),
             )
             .map(crate::runtime::RuntimeTurnOutcome::into_command_outcome)
     }
@@ -1365,13 +1456,11 @@ impl HostService {
         session_id: &SessionId,
         intent: &TurnIntent,
     ) -> Result<PublicSession, SatelleError> {
-        crate::runtime::admitted_session(
-            self.runtime.steer(
-                SteerCommand::detached(session_id.clone(), intent.prompt())
-                    .with_execution_mode(intent.execution_mode())
-                    .with_provider_intent(intent.provider_intent().clone()),
-            ),
-        )
+        self.ensure_image_attachments_supported(intent)?;
+        crate::runtime::admitted_session(self.runtime.steer(self.steer_command(
+            SteerCommand::detached(session_id.clone(), intent.prompt()),
+            intent,
+        )))
     }
 
     pub fn steer_detached_with_cancellation(
@@ -1380,12 +1469,14 @@ impl HostService {
         intent: &TurnIntent,
         cancellation: AdmissionCancellation,
     ) -> Result<PublicSession, SatelleError> {
+        self.ensure_image_attachments_supported(intent)?;
         crate::runtime::admitted_session(
             self.runtime.steer(
-                SteerCommand::detached(session_id.clone(), intent.prompt())
-                    .with_execution_mode(intent.execution_mode())
-                    .with_provider_intent(intent.provider_intent().clone())
-                    .with_cancellation(cancellation),
+                self.steer_command(
+                    SteerCommand::detached(session_id.clone(), intent.prompt()),
+                    intent,
+                )
+                .with_cancellation(cancellation),
             ),
         )
     }

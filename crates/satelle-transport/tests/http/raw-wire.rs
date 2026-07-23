@@ -18,19 +18,50 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 async fn chunked_oversize_body_returns_typed_413_without_admission() {
     let running = RunningServer::start(ApiScopes::CONTROL).await;
     let authorization = bearer(&running.token);
-    let payload_bytes = 1_048_577;
+    let body = format!(
+        r#"{{"schema_version":"satelle.api.v3","prompt":"{}"}}"#,
+        "x".repeat(1_048_576)
+    );
+    let payload_bytes = body.len();
     let head = format!(
-        "POST /v1/sessions HTTP/1.1\r\nHost: localhost\r\nAuthorization: {authorization}\r\nSatelle-Expected-Host-Identity: {}\r\nSatelle-Request-Id: {}\r\nSatelle-Protocol-Version: 5\r\nIdempotency-Key: raw-chunked-limit\r\nContent-Type: application/json\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n{payload_bytes:x}\r\n",
+        "POST /v1/sessions HTTP/1.1\r\nHost: localhost\r\nAuthorization: {authorization}\r\nSatelle-Expected-Host-Identity: {}\r\nSatelle-Request-Id: {}\r\nSatelle-Protocol-Version: 6\r\nIdempotency-Key: raw-chunked-limit\r\nContent-Type: application/json\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n{payload_bytes:x}\r\n",
         running.host_identity,
         RequestId::new(),
     );
     let mut request = Vec::with_capacity(head.len() + payload_bytes + 16);
     request.extend_from_slice(head.as_bytes());
-    request.resize(request.len() + payload_bytes, b'x');
+    request.extend_from_slice(body.as_bytes());
     request.extend_from_slice(b"\r\n0\r\n\r\n");
 
     let response = raw_request(running.server.local_addr(), &request).await;
     assert_raw_api_error(&response, 413, "payload-too-large");
+    assert_eq!(
+        running
+            .service
+            .initialize_daemon()
+            .expect("read session count")
+            .session_count(),
+        0
+    );
+}
+
+#[tokio::test]
+async fn unauthenticated_attachment_sized_body_is_rejected_before_body_admission() {
+    let running = RunningServer::start(ApiScopes::CONTROL).await;
+    let body = format!(
+        r#"{{"schema_version":"satelle.api.v3","prompt":"{}"}}"#,
+        "x".repeat(1_048_576)
+    );
+    let head = format!(
+        "POST /v1/sessions HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        body.len()
+    );
+    let mut request = head.into_bytes();
+    request.extend_from_slice(body.as_bytes());
+
+    let response = raw_request(running.server.local_addr(), &request).await;
+
+    assert_raw_api_error(&response, 401, "authentication-failed");
     assert_eq!(
         running
             .service
@@ -53,13 +84,13 @@ async fn chunked_attachment_limit_and_log_privacy(trace_capture: TraceCapture) {
     let attachment_name = "PRIVATE_CHUNKED_ATTACHMENT_NAME_CANARY";
     let attachment_bytes = "PRIVATE_CHUNKED_ATTACHMENT_BYTES_CANARY";
     let body = format!(
-        r#"{{"schema_version":"satelle.api.v2","prompt":7,"execution_mode":"standard","body_canary":"{body_canary}","attachments":[{{"name":"{attachment_name}","content":"{attachment_bytes}"}}]}}"#
+        r#"{{"schema_version":"satelle.api.v3","prompt":7,"execution_mode":"standard","body_canary":"{body_canary}","attachments":[{{"name":"{attachment_name}","content":"{attachment_bytes}"}}]}}"#
     );
     let body = body.as_bytes();
     let split = body.len() / 2;
     let request_id = RequestId::new();
     let request_head = format!(
-        "POST /v1/sessions HTTP/1.1\r\nHost: localhost\r\nAuthorization: {authorization}\r\nSatelle-Expected-Host-Identity: {}\r\nSatelle-Request-Id: {}\r\nSatelle-Protocol-Version: 5\r\nIdempotency-Key: attachment-limit-chunked\r\nContent-Type: application/json\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n{split:x}\r\n",
+        "POST /v1/sessions HTTP/1.1\r\nHost: localhost\r\nAuthorization: {authorization}\r\nSatelle-Expected-Host-Identity: {}\r\nSatelle-Request-Id: {}\r\nSatelle-Protocol-Version: 6\r\nIdempotency-Key: attachment-limit-chunked\r\nContent-Type: application/json\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n{split:x}\r\n",
         running.host_identity, request_id,
     );
     let mut request = request_head.into_bytes();
@@ -134,9 +165,9 @@ async fn bearer_tokens_in_http_trailers_are_rejected_without_admission() {
     assert_raw_api_error(&response, 400, "invalid-request");
 
     let body =
-        br#"{"schema_version":"satelle.api.v2","prompt":"safe","execution_mode":"standard"}"#;
+        br#"{"schema_version":"satelle.api.v3","prompt":"safe","execution_mode":"standard"}"#;
     let mutation_request = format!(
-        "POST /v1/sessions HTTP/1.1\r\nHost: localhost\r\nAuthorization: {}\r\nSatelle-Expected-Host-Identity: {}\r\nSatelle-Request-Id: {}\r\nSatelle-Protocol-Version: 5\r\nIdempotency-Key: trailer-carrier\r\nContent-Type: application/json\r\nTransfer-Encoding: chunked\r\nTrailer: X-Api-Token\r\nConnection: close\r\n\r\n{:x}\r\n{}\r\n0\r\nX-Api-Token: {}\r\n\r\n",
+        "POST /v1/sessions HTTP/1.1\r\nHost: localhost\r\nAuthorization: {}\r\nSatelle-Expected-Host-Identity: {}\r\nSatelle-Request-Id: {}\r\nSatelle-Protocol-Version: 6\r\nIdempotency-Key: trailer-carrier\r\nContent-Type: application/json\r\nTransfer-Encoding: chunked\r\nTrailer: X-Api-Token\r\nConnection: close\r\n\r\n{:x}\r\n{}\r\n0\r\nX-Api-Token: {}\r\n\r\n",
         bearer(&running.token),
         running.host_identity,
         RequestId::new(),
@@ -178,7 +209,7 @@ async fn stalled_upload_cannot_hold_daemon_shutdown_open_forever() {
         .await
         .expect("open stalled request connection");
     let partial = format!(
-        "POST /v1/sessions HTTP/1.1\r\nHost: localhost\r\nAuthorization: {}\r\nSatelle-Expected-Host-Identity: {}\r\nSatelle-Request-Id: {}\r\nSatelle-Protocol-Version: 5\r\nIdempotency-Key: stalled-shutdown\r\nContent-Type: application/json\r\nContent-Length: 1000\r\n\r\n{{",
+        "POST /v1/sessions HTTP/1.1\r\nHost: localhost\r\nAuthorization: {}\r\nSatelle-Expected-Host-Identity: {}\r\nSatelle-Request-Id: {}\r\nSatelle-Protocol-Version: 6\r\nIdempotency-Key: stalled-shutdown\r\nContent-Type: application/json\r\nContent-Length: 1000\r\n\r\n{{",
         bearer(&token),
         initialized.host_identity(),
         RequestId::new(),
@@ -238,7 +269,7 @@ async fn dropped_admission_response_is_recovered_without_stopping_or_duplicate_t
     let request = TurnRequest::new("PRIVATE_DROPPED_RESPONSE_CANARY");
     let body = serde_json::to_vec(&request).expect("encode admission request");
     let head = format!(
-        "POST /v1/sessions HTTP/1.1\r\nHost: localhost\r\nAuthorization: {}\r\nSatelle-Expected-Host-Identity: {}\r\nSatelle-Request-Id: {}\r\nSatelle-Protocol-Version: 5\r\nIdempotency-Key: {IDEMPOTENCY_KEY}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        "POST /v1/sessions HTTP/1.1\r\nHost: localhost\r\nAuthorization: {}\r\nSatelle-Expected-Host-Identity: {}\r\nSatelle-Request-Id: {}\r\nSatelle-Protocol-Version: 6\r\nIdempotency-Key: {IDEMPOTENCY_KEY}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
         bearer(&running.token),
         running.host_identity,
         RequestId::new(),
@@ -514,7 +545,7 @@ enum DuplicateHeader {
 async fn duplicate_header_case(header: DuplicateHeader, status: u16, code: &str) {
     let running = RunningServer::start(ApiScopes::CONTROL).await;
     let authorization = bearer(&running.token);
-    let body = br#"{"schema_version":"satelle.api.v2","prompt":"PRIVATE_RAW_HEADER_CANARY","execution_mode":"standard"}"#;
+    let body = br#"{"schema_version":"satelle.api.v3","prompt":"PRIVATE_RAW_HEADER_CANARY","execution_mode":"standard"}"#;
     let duplicated = match header {
         DuplicateHeader::Authorization => format!(
             "Authorization: {authorization}\r\nAuthorization: {authorization}\r\nIdempotency-Key: duplicate-auth\r\nContent-Type: application/json\r\n"
@@ -527,7 +558,7 @@ async fn duplicate_header_case(header: DuplicateHeader, status: u16, code: &str)
         ),
     };
     let mut request = format!(
-        "POST /v1/sessions HTTP/1.1\r\nHost: localhost\r\nSatelle-Expected-Host-Identity: {}\r\nSatelle-Request-Id: {}\r\nSatelle-Protocol-Version: 5\r\nContent-Length: {}\r\n{duplicated}Connection: close\r\n\r\n",
+        "POST /v1/sessions HTTP/1.1\r\nHost: localhost\r\nSatelle-Expected-Host-Identity: {}\r\nSatelle-Request-Id: {}\r\nSatelle-Protocol-Version: 6\r\nContent-Length: {}\r\n{duplicated}Connection: close\r\n\r\n",
         running.host_identity,
         RequestId::new(),
         body.len(),

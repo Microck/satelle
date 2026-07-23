@@ -35,6 +35,7 @@ pub(super) fn task_failure(state: &DaemonState, authorized: &AuthorizedRequest) 
 fn failure(error: &SatelleError) -> ApiFailure {
     match error.code {
         ErrorCode::InvalidUsage
+        | ErrorCode::PromptSourceConflict
         | ErrorCode::ConfigError
         | ErrorCode::ConfigNotFound
         | ErrorCode::UnknownConfigKey

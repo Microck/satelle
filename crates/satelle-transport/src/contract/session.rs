@@ -7,17 +7,31 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::Value;
 use std::fmt;
 
-define_schema_token!(TurnRequestSchema, "satelle.api.v2");
+define_schema_token!(TurnRequestSchema, "satelle.api.v3");
 define_schema_token!(StopRequestSchema, "satelle.api.v1");
 define_schema_token!(SessionSchema, "satelle.session.v1");
 define_schema_token!(SessionStopSchema, "satelle.session.stop.v1");
 define_schema_token!(AdmissionCancellationSchema, "satelle.admission.cancel.v1");
 
+pub const MAX_IMAGE_ATTACHMENT_COUNT: usize = 2;
+pub const MAX_IMAGE_ATTACHMENT_BYTES: usize = 5 * 1_024 * 1_024;
+pub const MAX_IMAGE_ATTACHMENT_BYTES_TOTAL: usize = 10 * 1_024 * 1_024;
+pub(crate) const MAX_IMAGE_ATTACHMENT_BASE64_BYTES: usize =
+    4 * MAX_IMAGE_ATTACHMENT_BYTES.div_ceil(3);
+pub(crate) const MAX_IMAGE_ATTACHMENT_BASE64_BYTES_TOTAL: usize =
+    4 * ((MAX_IMAGE_ATTACHMENT_BYTES_TOTAL + 2 * MAX_IMAGE_ATTACHMENT_COUNT) / 3);
+pub const SUPPORTED_IMAGE_MEDIA_TYPES: &[&str] = &["image/jpeg", "image/png"];
+
 pub(crate) trait ApiRequestContract {
     const SCHEMA_VERSION: &'static str;
+    const MAX_BASE64_BODY_ALLOWANCE: usize = 0;
 
-    fn exceeds_attachment_limit(_value: &Value) -> bool {
+    fn exceeds_attachment_limit(_value: &Value, _image_attachments_supported: bool) -> bool {
         false
+    }
+
+    fn attachment_data_base64_bytes(_value: &Value) -> usize {
+        0
     }
 }
 
@@ -35,6 +49,10 @@ pub struct TurnRequest {
     experimental_provider_computer_use: bool,
     #[serde(default, skip_serializing_if = "is_false")]
     refresh_provider_smoke_test: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    attachments: Vec<ImageAttachment>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    turn_execution_timeout_ms: Option<u64>,
 }
 
 pub(crate) struct TurnRequestParts {
@@ -44,6 +62,60 @@ pub(crate) struct TurnRequestParts {
     pub(crate) provider: Option<String>,
     pub(crate) experimental_provider_computer_use: bool,
     pub(crate) refresh_provider_smoke_test: bool,
+    pub(crate) attachments: Vec<ImageAttachment>,
+    pub(crate) turn_execution_timeout_ms: Option<u64>,
+}
+
+#[derive(Clone, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ImageAttachment {
+    media_type: String,
+    size_bytes: u64,
+    sha256: String,
+    data_base64: String,
+}
+
+impl ImageAttachment {
+    pub fn new(
+        media_type: impl Into<String>,
+        size_bytes: u64,
+        sha256: impl Into<String>,
+        data_base64: impl Into<String>,
+    ) -> Self {
+        Self {
+            media_type: media_type.into(),
+            size_bytes,
+            sha256: sha256.into(),
+            data_base64: data_base64.into(),
+        }
+    }
+
+    pub fn media_type(&self) -> &str {
+        &self.media_type
+    }
+
+    pub const fn size_bytes(&self) -> u64 {
+        self.size_bytes
+    }
+
+    pub fn sha256(&self) -> &str {
+        &self.sha256
+    }
+
+    pub fn data_base64(&self) -> &str {
+        &self.data_base64
+    }
+}
+
+impl fmt::Debug for ImageAttachment {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ImageAttachment")
+            .field("media_type", &self.media_type)
+            .field("size_bytes", &self.size_bytes)
+            .field("data", &"[redacted]")
+            .finish()
+    }
 }
 
 fn is_false(value: &bool) -> bool {
@@ -60,6 +132,8 @@ impl TurnRequest {
             provider: None,
             experimental_provider_computer_use: false,
             refresh_provider_smoke_test: false,
+            attachments: Vec::new(),
+            turn_execution_timeout_ms: None,
         }
     }
 
@@ -79,6 +153,16 @@ impl TurnRequest {
         self.provider = provider;
         self.experimental_provider_computer_use = experimental_provider_computer_use;
         self.refresh_provider_smoke_test = refresh_provider_smoke_test;
+        self
+    }
+
+    pub fn with_attachments(mut self, attachments: Vec<ImageAttachment>) -> Self {
+        self.attachments = attachments;
+        self
+    }
+
+    pub fn with_turn_execution_timeout_ms(mut self, timeout_ms: u64) -> Self {
+        self.turn_execution_timeout_ms = Some(timeout_ms);
         self
     }
 
@@ -106,6 +190,14 @@ impl TurnRequest {
         self.refresh_provider_smoke_test
     }
 
+    pub fn attachments(&self) -> &[ImageAttachment] {
+        &self.attachments
+    }
+
+    pub const fn turn_execution_timeout_ms(&self) -> Option<u64> {
+        self.turn_execution_timeout_ms
+    }
+
     pub(crate) fn into_parts(self) -> TurnRequestParts {
         TurnRequestParts {
             prompt: self.prompt,
@@ -114,22 +206,63 @@ impl TurnRequest {
             provider: self.provider,
             experimental_provider_computer_use: self.experimental_provider_computer_use,
             refresh_provider_smoke_test: self.refresh_provider_smoke_test,
+            attachments: self.attachments,
+            turn_execution_timeout_ms: self.turn_execution_timeout_ms,
         }
     }
 }
 
 impl ApiRequestContract for TurnRequest {
     const SCHEMA_VERSION: &'static str = TurnRequestSchema::TOKEN;
+    const MAX_BASE64_BODY_ALLOWANCE: usize = MAX_IMAGE_ATTACHMENT_BASE64_BYTES_TOTAL;
 
-    fn exceeds_attachment_limit(value: &Value) -> bool {
-        // Attachments remain outside the TurnRequest grammar. Inspect only a
-        // non-empty list so the advertised zero limit can fail as capacity.
+    fn exceeds_attachment_limit(value: &Value, image_attachments_supported: bool) -> bool {
         value
             .as_object()
             .and_then(|object| object.get("attachments"))
-            .is_some_and(
-                |attachments| matches!(attachments, Value::Array(values) if !values.is_empty()),
-            )
+            .is_some_and(|attachments| match attachments {
+                Value::Array(values) => {
+                    (!image_attachments_supported && !values.is_empty())
+                        || values.len() > MAX_IMAGE_ATTACHMENT_COUNT
+                        || values.iter().any(|value| {
+                            let size = value.get("size_bytes").and_then(Value::as_u64);
+                            let media_type = value.get("media_type").and_then(Value::as_str);
+                            let data_base64 = value.get("data_base64").and_then(Value::as_str);
+                            size.is_none_or(|size| size > MAX_IMAGE_ATTACHMENT_BYTES as u64)
+                                || media_type.is_none_or(|media_type| {
+                                    !SUPPORTED_IMAGE_MEDIA_TYPES.contains(&media_type)
+                                })
+                                || data_base64.is_none_or(|value| {
+                                    value.len() > MAX_IMAGE_ATTACHMENT_BASE64_BYTES
+                                })
+                        })
+                        || values
+                            .iter()
+                            .try_fold(0_u64, |total, value| {
+                                total.checked_add(value.get("size_bytes")?.as_u64()?)
+                            })
+                            .is_none_or(|total| total > MAX_IMAGE_ATTACHMENT_BYTES_TOTAL as u64)
+                        || values
+                            .iter()
+                            .try_fold(0_usize, |total, value| {
+                                total.checked_add(value.get("data_base64")?.as_str()?.len())
+                            })
+                            .is_none_or(|total| total > MAX_IMAGE_ATTACHMENT_BASE64_BYTES_TOTAL)
+                }
+                _ => false,
+            })
+    }
+
+    fn attachment_data_base64_bytes(value: &Value) -> usize {
+        value
+            .as_object()
+            .and_then(|object| object.get("attachments"))
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|attachment| attachment.get("data_base64")?.as_str())
+            .map(str::len)
+            .sum()
     }
 }
 
@@ -149,6 +282,8 @@ impl fmt::Debug for TurnRequest {
                 "refresh_provider_smoke_test",
                 &self.refresh_provider_smoke_test,
             )
+            .field("attachment_count", &self.attachments.len())
+            .field("turn_execution_timeout_ms", &self.turn_execution_timeout_ms)
             .finish_non_exhaustive()
     }
 }
@@ -547,7 +682,7 @@ mod tests {
         assert_eq!(
             serde_json::to_value(request).expect("serialize request"),
             serde_json::json!({
-                "schema_version": "satelle.api.v2",
+                "schema_version": "satelle.api.v3",
                 "prompt": "private prompt",
                 "execution_mode": "standard"
             })
@@ -558,7 +693,7 @@ mod tests {
             )
             .expect("serialize YOLO request"),
             serde_json::json!({
-                "schema_version": "satelle.api.v2",
+                "schema_version": "satelle.api.v3",
                 "prompt": "private prompt",
                 "execution_mode": "yolo"
             })
@@ -572,7 +707,7 @@ mod tests {
             ))
             .expect("serialize provider intent"),
             serde_json::json!({
-                "schema_version": "satelle.api.v2",
+                "schema_version": "satelle.api.v3",
                 "prompt": "private prompt",
                 "execution_mode": "standard",
                 "model": "model-explicit",
@@ -583,17 +718,17 @@ mod tests {
         );
         assert!(
             serde_json::from_value::<TurnRequest>(serde_json::json!({
-                "schema_version": "satelle.api.v2",
+                "schema_version": "satelle.api.v3",
                 "prompt": "private prompt"
             }))
             .is_err()
         );
         assert!(
             serde_json::from_value::<TurnRequest>(serde_json::json!({
-                "schema_version": "satelle.api.v2",
+                "schema_version": "satelle.api.v3",
                 "prompt": "private prompt",
                 "execution_mode": "standard",
-                "attachments": []
+                "controller_only": true
             }))
             .is_err()
         );
@@ -607,7 +742,7 @@ mod tests {
     fn controller_presentation_fields_are_absent_from_the_turn_request_contract() {
         for field in ["attach", "detach"] {
             let mut request = serde_json::json!({
-                "schema_version": "satelle.api.v2",
+                "schema_version": "satelle.api.v3",
                 "prompt": "private prompt",
                 "execution_mode": "standard"
             });

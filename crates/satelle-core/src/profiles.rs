@@ -21,7 +21,7 @@ const PROFILE_KEYS: &[&str] = &[
     "provider_smoke_failure_cache_ttl",
     "daemon_idle_timeout",
 ];
-const TIMEOUT_KEYS: &[&str] = &["native_readiness", "provider_smoke_test"];
+const TIMEOUT_KEYS: &[&str] = &["native_readiness", "provider_smoke_test", "turn_execution"];
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -113,11 +113,10 @@ impl ProfileConfig {
         source: ProfileSelectionSource,
     ) {
         if let Some(timeouts) = &self.timeouts {
-            host.timeouts = Some(
-                host.timeouts
-                    .take()
-                    .map_or_else(|| timeouts.clone(), |base| base.merge(timeouts.clone())),
-            );
+            host.timeouts = Some(host.timeouts.take().map_or_else(
+                || TimeoutConfig::default_profile_overlay(timeouts.clone()),
+                |base| base.merge(timeouts.clone()),
+            ));
         }
         if let Some(ttl) = &self.native_readiness_cache_ttl {
             host.native_readiness_cache_ttl = Some(ttl.clone());
@@ -412,7 +411,20 @@ fn reject_profile_duration_errors(
         let Some(value) = value.as_str() else {
             return Err(SatelleError::duration_unit_required(path, &timeout_path));
         };
-        if ExplicitDuration::parse(value).is_none() {
+        if key == "turn_execution" {
+            let Some(seconds) = super::parse_turn_execution_seconds(value) else {
+                return Err(SatelleError::turn_duration_unit_required(
+                    path,
+                    &timeout_path,
+                ));
+            };
+            if seconds > super::MAX_TURN_EXECUTION_TIMEOUT_MS / 1_000 {
+                return Err(SatelleError::turn_timeout_config_limit_exceeded(
+                    path,
+                    &timeout_path,
+                ));
+            }
+        } else if ExplicitDuration::parse(value).is_none() {
             return Err(SatelleError::duration_unit_required(path, &timeout_path));
         }
     }
@@ -496,6 +508,131 @@ impl SatelleError {
             ),
             source_detail: None,
             details,
+        }
+    }
+}
+
+#[cfg(test)]
+mod timeout_profile_tests {
+    use super::*;
+
+    fn profile(raw_timeouts: &str) -> ProfileConfig {
+        toml::from_str(&format!("[timeouts]\n{raw_timeouts}"))
+            .expect("parse profile timeout fixture")
+    }
+
+    fn timeout_config(raw: &str) -> TimeoutConfig {
+        toml::from_str(raw).expect("parse base timeout fixture")
+    }
+
+    fn base_host() -> HostConfig {
+        super::super::SatelleConfig::defaults()
+            .hosts
+            .remove(super::super::LOCAL_DEMO_HOST)
+            .expect("default local Host")
+    }
+
+    #[test]
+    fn profile_turn_timeout_above_the_hard_limit_reports_the_limit() {
+        let path = Path::new("user-config.toml");
+        let table = toml::from_str::<toml::Table>("[timeouts]\nturn_execution = \"25h\"\n")
+            .expect("parse invalid profile timeout fixture");
+
+        let error = reject_profile_duration_errors(path, "profiles.fast", &table)
+            .expect_err("a profile Turn timeout above 24h must fail");
+
+        assert_eq!(error.code, ErrorCode::ConfigError);
+        assert_eq!(
+            error.details["path"],
+            serde_json::json!("profiles.fast.timeouts.turn_execution")
+        );
+        assert_eq!(
+            error.details["maximum_timeout_ms"],
+            serde_json::json!(super::super::MAX_TURN_EXECUTION_TIMEOUT_MS)
+        );
+    }
+
+    #[test]
+    fn every_profile_source_can_only_shorten_turn_execution() {
+        let profile = profile(
+            "native_readiness = \"20s\"\nprovider_smoke_test = \"30s\"\nturn_execution = \"1h\"\n",
+        );
+
+        for source in [
+            ProfileSelectionSource::UserConfig,
+            ProfileSelectionSource::Environment,
+            ProfileSelectionSource::CliFlag,
+            ProfileSelectionSource::ProjectConfig,
+        ] {
+            let mut host = base_host();
+            host.timeouts = Some(timeout_config(
+                "native_readiness = \"5s\"\nprovider_smoke_test = \"6s\"\nturn_execution = \"10m\"\n",
+            ));
+
+            profile.apply_to_host(super::super::LOCAL_DEMO_HOST, &mut host, source);
+
+            let timeouts = host.timeouts.expect("retain merged profile timeouts");
+            assert_eq!(
+                timeouts.native_readiness.unwrap().milliseconds(),
+                20_000,
+                "source={source:?}"
+            );
+            assert_eq!(
+                timeouts.provider_smoke_test.unwrap().milliseconds(),
+                30_000,
+                "source={source:?}"
+            );
+            assert_eq!(
+                timeouts.turn_execution.unwrap().milliseconds(),
+                10 * 60 * 1_000,
+                "source={source:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn every_profile_source_respects_the_implicit_30_minute_default() {
+        let lengthening = profile(
+            "native_readiness = \"20s\"\nprovider_smoke_test = \"30s\"\nturn_execution = \"1h\"\n",
+        );
+        let shortening = profile("turn_execution = \"10m\"\n");
+
+        for source in [
+            ProfileSelectionSource::UserConfig,
+            ProfileSelectionSource::Environment,
+            ProfileSelectionSource::CliFlag,
+            ProfileSelectionSource::ProjectConfig,
+        ] {
+            let mut host = base_host();
+            lengthening.apply_to_host(super::super::LOCAL_DEMO_HOST, &mut host, source);
+            let timeouts = host
+                .timeouts
+                .as_ref()
+                .expect("retain unrelated profile timeouts");
+            assert!(timeouts.turn_execution.is_none(), "source={source:?}");
+            assert_eq!(
+                timeouts.native_readiness.as_ref().unwrap().milliseconds(),
+                20_000
+            );
+            assert_eq!(
+                timeouts
+                    .provider_smoke_test
+                    .as_ref()
+                    .unwrap()
+                    .milliseconds(),
+                30_000
+            );
+
+            shortening.apply_to_host(super::super::LOCAL_DEMO_HOST, &mut host, source);
+            assert_eq!(
+                host.timeouts
+                    .unwrap()
+                    .turn_execution
+                    .unwrap()
+                    .milliseconds(),
+                10 * 60 * 1_000,
+                "source={source:?}"
+            );
         }
     }
 }

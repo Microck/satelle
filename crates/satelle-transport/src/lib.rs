@@ -11,9 +11,11 @@ pub use contract::{
     AdmissionCancellationOutcome, AdmissionCancellationResponse, ApiError, ApiErrorCode,
     CapabilitiesResponse, DURABLE_SETUP_PENDING_TTL, DurableTokenActivationResponse,
     DurableTokenConfirmationResponse, DurableTokenIssuanceResponse, EventSubscription,
-    HostDesktopSessionsResponse, HostStatusResponse, LiveResponse, LogsPageResponse, RequestId,
-    SessionResponse, StopRequest, StopResponse, SubscribeRequest, SubscribeRequestError,
-    SubscribedResponse, TurnRequest, WsCloseReason, WsControlError, WsServerControl,
+    HostDesktopSessionsResponse, HostStatusResponse, ImageAttachment, LiveResponse,
+    LogsPageResponse, MAX_IMAGE_ATTACHMENT_BYTES, MAX_IMAGE_ATTACHMENT_BYTES_TOTAL,
+    MAX_IMAGE_ATTACHMENT_COUNT, RequestId, SUPPORTED_IMAGE_MEDIA_TYPES, SessionResponse,
+    StopRequest, StopResponse, SubscribeRequest, SubscribeRequestError, SubscribedResponse,
+    TurnRequest, WsCloseReason, WsControlError, WsServerControl,
 };
 pub use server::{
     DaemonServer, DaemonServerConfig, DaemonServerError, DaemonShutdownHandle, DaemonTlsConfig,

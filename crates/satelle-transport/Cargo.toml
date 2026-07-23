@@ -27,7 +27,9 @@ x509-parser.workspace = true
 zeroize.workspace = true
 
 [dev-dependencies]
+base64.workspace = true
 rcgen = "=0.14.8"
 reqwest = { workspace = true, features = ["http2", "stream"] }
 satelle-host = { path = "../satelle-host", features = ["test-support"] }
 satelle-test-contract = { path = "../satelle-test-contract" }
+sha2.workspace = true

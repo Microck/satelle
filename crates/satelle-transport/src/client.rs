@@ -138,23 +138,29 @@ impl DaemonClient {
             .header(PROTOCOL_VERSION_HEADER, PROTOCOL_VERSION)
             .send()
             .map_err(classify_request_error)?;
-        let protocol_matches = response
-            .headers()
-            .get(PROTOCOL_VERSION_HEADER)
-            .and_then(|value| value.to_str().ok())
-            == Some(PROTOCOL_VERSION);
-        let capabilities: CapabilitiesResponse = decode_authenticated(
+        if response.status() == StatusCode::OK {
+            validate_authenticated_response_headers(
+                &response,
+                &request_id,
+                &self.expected_host_identity,
+            )?;
+            let protocol_versions = response.headers().get_all(PROTOCOL_VERSION_HEADER);
+            let mut protocol_versions = protocol_versions.iter();
+            let protocol_matches = protocol_versions
+                .next()
+                .and_then(|value| value.to_str().ok())
+                == Some(PROTOCOL_VERSION)
+                && protocol_versions.next().is_none();
+            if !protocol_matches {
+                return Err(DaemonClientError::CapabilitiesProtocolMismatch);
+            }
+        }
+        decode_authenticated(
             response,
             StatusCode::OK,
             &request_id,
             &self.expected_host_identity,
-        )?;
-        if !protocol_matches {
-            return Err(DaemonClientError::CapabilitiesProtocolMismatch {
-                daemon_version: capabilities.daemon_version().to_string(),
-            });
-        }
-        Ok(capabilities)
+        )
     }
 
     pub fn confirm_durable_setup_token(
@@ -558,9 +564,7 @@ pub enum DaemonClientError {
     ResponseRequestIdMismatch,
     ResponseHostIdentityMismatch,
     ResponseContractViolation,
-    CapabilitiesProtocolMismatch {
-        daemon_version: String,
-    },
+    CapabilitiesProtocolMismatch,
 }
 
 impl fmt::Display for DaemonClientError {
@@ -598,7 +602,7 @@ impl fmt::Display for DaemonClientError {
             Self::ResponseContractViolation => {
                 "the Host Daemon response violated the requested operation contract"
             }
-            Self::CapabilitiesProtocolMismatch { .. } => {
+            Self::CapabilitiesProtocolMismatch => {
                 "the CLI and Host Daemon protocol versions are incompatible"
             }
         })
@@ -657,6 +661,26 @@ fn decode_unpinned<T: DeserializeOwned>(
         status: actual,
         error: Box::new(error),
     })
+}
+
+fn validate_authenticated_response_headers(
+    response: &Response,
+    request_id: &RequestId,
+    expected_host_identity: &str,
+) -> Result<(), DaemonClientError> {
+    if !response_has_single_header_value(response, "satelle-request-id", request_id.as_str()) {
+        return Err(DaemonClientError::ResponseRequestIdMismatch);
+    }
+    if !response_has_single_header_value(response, "satelle-host-identity", expected_host_identity)
+    {
+        return Err(DaemonClientError::ResponseHostIdentityMismatch);
+    }
+    Ok(())
+}
+
+fn response_has_single_header_value(response: &Response, name: &str, expected: &str) -> bool {
+    let mut values = response.headers().get_all(name).iter();
+    values.next().and_then(|value| value.to_str().ok()) == Some(expected) && values.next().is_none()
 }
 
 fn decode_authenticated<T: DeserializeOwned + AuthenticatedResponseContract>(
@@ -911,60 +935,143 @@ mod tests {
     }
 
     #[test]
-    fn capabilities_rejects_an_authenticated_daemon_without_the_current_protocol() {
-        let listener = TcpListener::bind("127.0.0.1:0").expect("bind legacy daemon fixture");
-        let address = listener.local_addr().expect("read legacy daemon address");
-        let token = ApiBearerToken::generate().expect("generate daemon token");
-        let server = std::thread::spawn(move || {
-            let (mut stream, _) = listener.accept().expect("accept capabilities client");
-            let mut request = Vec::new();
-            let mut chunk = [0_u8; 1024];
-            while !request.windows(4).any(|bytes| bytes == b"\r\n\r\n") {
-                let read = stream.read(&mut chunk).expect("read capabilities request");
-                assert_ne!(read, 0, "capabilities request ended before its headers");
-                request.extend_from_slice(&chunk[..read]);
-            }
-            let request = String::from_utf8(request).expect("request headers should be UTF-8");
-            assert!(request.starts_with("GET /v1/capabilities HTTP/1.1\r\n"));
-            assert_eq!(
-                header_value(&request, PROTOCOL_VERSION_HEADER),
-                Some(PROTOCOL_VERSION)
-            );
-            let request_id = RequestId::parse(
-                header_value(&request, "satelle-request-id")
-                    .expect("capabilities request carries its request ID"),
-            )
-            .expect("request ID is canonical");
-            let body = serde_json::to_string(&CapabilitiesResponse::new(
-                request_id,
-                "host-legacy-protocol".to_string(),
-                "0.0.9".to_string(),
-                true,
-                true,
-                true,
-                crate::contract::effective_limits(128, satelle_core::ApiRateLimits::default()),
-            ))
-            .expect("encode legacy capabilities response");
-            write!(
-                stream,
-                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                body.len()
-            )
-            .expect("write legacy capabilities response");
-            stream.flush().expect("flush legacy capabilities response");
-        });
+    fn capabilities_rejects_protocol_mismatch_before_decoding_the_current_schema() {
+        for protocol_header in ["", "Satelle-Protocol-Version: 5\r\n"] {
+            let listener = TcpListener::bind("127.0.0.1:0").expect("bind legacy daemon fixture");
+            let address = listener.local_addr().expect("read legacy daemon address");
+            let token = ApiBearerToken::generate().expect("generate daemon token");
+            let server = std::thread::spawn(move || {
+                let (mut stream, _) = listener.accept().expect("accept capabilities client");
+                let mut request = Vec::new();
+                let mut chunk = [0_u8; 1024];
+                while !request.windows(4).any(|bytes| bytes == b"\r\n\r\n") {
+                    let read = stream.read(&mut chunk).expect("read capabilities request");
+                    assert_ne!(read, 0, "capabilities request ended before its headers");
+                    request.extend_from_slice(&chunk[..read]);
+                }
+                let request = String::from_utf8(request).expect("request headers should be UTF-8");
+                assert!(request.starts_with("GET /v1/capabilities HTTP/1.1\r\n"));
+                assert_eq!(
+                    header_value(&request, PROTOCOL_VERSION_HEADER),
+                    Some(PROTOCOL_VERSION)
+                );
+                let request_id = header_value(&request, "satelle-request-id")
+                    .expect("request must carry a request ID");
+                let body = r#"{"schema_version":"satelle.capabilities.v2"}"#;
+                write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\n{protocol_header}Satelle-Request-Id: {request_id}\r\nSatelle-Host-Identity: host-legacy-protocol\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                )
+                .expect("write legacy capabilities response");
+                stream.flush().expect("flush legacy capabilities response");
+            });
 
-        let client = DaemonClient::loopback(address, token, "host-legacy-protocol")
-            .expect("construct capabilities client");
-        let error = client
-            .capabilities()
-            .expect_err("a response without the current protocol header must fail closed");
-        assert!(matches!(
-            error,
-            DaemonClientError::CapabilitiesProtocolMismatch { daemon_version }
-                if daemon_version == "0.0.9"
-        ));
-        server.join().expect("join legacy daemon fixture");
+            let client = DaemonClient::loopback(address, token, "host-legacy-protocol")
+                .expect("construct capabilities client");
+            let error = client
+                .capabilities()
+                .expect_err("a response without the current protocol header must fail closed");
+            assert!(matches!(
+                error,
+                DaemonClientError::CapabilitiesProtocolMismatch
+            ));
+            server.join().expect("join legacy daemon fixture");
+        }
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum CapabilitiesResponseContextViolation {
+        MissingRequestId,
+        DuplicateRequestId,
+        WrongRequestId,
+        MissingHostIdentity,
+        DuplicateHostIdentity,
+        WrongHostIdentity,
+    }
+
+    #[test]
+    fn capabilities_authenticates_success_headers_before_protocol_or_body() {
+        for violation in [
+            CapabilitiesResponseContextViolation::MissingRequestId,
+            CapabilitiesResponseContextViolation::DuplicateRequestId,
+            CapabilitiesResponseContextViolation::WrongRequestId,
+            CapabilitiesResponseContextViolation::MissingHostIdentity,
+            CapabilitiesResponseContextViolation::DuplicateHostIdentity,
+            CapabilitiesResponseContextViolation::WrongHostIdentity,
+        ] {
+            let listener =
+                TcpListener::bind("127.0.0.1:0").expect("bind capabilities response fixture");
+            let address = listener
+                .local_addr()
+                .expect("read capabilities response fixture address");
+            let token = ApiBearerToken::generate().expect("generate daemon token");
+            let server = std::thread::spawn(move || {
+                let (mut stream, _) = listener.accept().expect("accept capabilities client");
+                let mut request = Vec::new();
+                let mut chunk = [0_u8; 1024];
+                while !request.windows(4).any(|bytes| bytes == b"\r\n\r\n") {
+                    let read = stream.read(&mut chunk).expect("read capabilities request");
+                    assert_ne!(read, 0, "capabilities request ended before its headers");
+                    request.extend_from_slice(&chunk[..read]);
+                }
+                let request = String::from_utf8(request).expect("request headers should be UTF-8");
+                let request_id = header_value(&request, "satelle-request-id")
+                    .expect("request must carry a request ID");
+                let request_id_headers = match violation {
+                    CapabilitiesResponseContextViolation::MissingRequestId => String::new(),
+                    CapabilitiesResponseContextViolation::DuplicateRequestId => format!(
+                        "Satelle-Request-Id: {request_id}\r\nSatelle-Request-Id: {request_id}\r\n"
+                    ),
+                    CapabilitiesResponseContextViolation::WrongRequestId => {
+                        format!("Satelle-Request-Id: {}\r\n", RequestId::new())
+                    }
+                    _ => format!("Satelle-Request-Id: {request_id}\r\n"),
+                };
+                let host_identity_headers = match violation {
+                    CapabilitiesResponseContextViolation::MissingHostIdentity => String::new(),
+                    CapabilitiesResponseContextViolation::DuplicateHostIdentity => {
+                        "Satelle-Host-Identity: host-expected\r\nSatelle-Host-Identity: host-expected\r\n"
+                            .to_string()
+                    }
+                    CapabilitiesResponseContextViolation::WrongHostIdentity => {
+                        "Satelle-Host-Identity: host-other\r\n".to_string()
+                    }
+                    _ => "Satelle-Host-Identity: host-expected\r\n".to_string(),
+                };
+                let body = r#"{"schema_version":"satelle.capabilities.v2"}"#;
+                write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\n{request_id_headers}{host_identity_headers}Content-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                )
+                .expect("write capabilities response");
+                stream.flush().expect("flush capabilities response");
+            });
+
+            let client = DaemonClient::loopback(address, token, "host-expected")
+                .expect("construct capabilities client");
+            let error = client.capabilities().expect_err(
+                "response authentication must fail before protocol negotiation or body decoding",
+            );
+            let expected_error = match violation {
+                CapabilitiesResponseContextViolation::MissingRequestId
+                | CapabilitiesResponseContextViolation::DuplicateRequestId
+                | CapabilitiesResponseContextViolation::WrongRequestId => {
+                    matches!(&error, DaemonClientError::ResponseRequestIdMismatch)
+                }
+                CapabilitiesResponseContextViolation::MissingHostIdentity
+                | CapabilitiesResponseContextViolation::DuplicateHostIdentity
+                | CapabilitiesResponseContextViolation::WrongHostIdentity => {
+                    matches!(&error, DaemonClientError::ResponseHostIdentityMismatch)
+                }
+            };
+            assert!(
+                expected_error,
+                "unexpected error for {violation:?}: {error:?}"
+            );
+            server.join().expect("join capabilities response fixture");
+        }
     }
 
     #[test]
