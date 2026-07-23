@@ -930,6 +930,7 @@ pub(super) enum UpstreamReference {
 pub struct ExecuteResult {
     outcome: ExecuteOutcome,
     events: Vec<SatelleEvent>,
+    terminal_error: Option<SatelleError>,
 }
 
 enum ExecuteOutcome {
@@ -951,6 +952,15 @@ impl ExecuteResult {
         Self {
             outcome: ExecuteOutcome::Terminal(transition),
             events,
+            terminal_error: None,
+        }
+    }
+
+    pub(crate) fn terminal_failure(error: SatelleError) -> Self {
+        Self {
+            outcome: ExecuteOutcome::Terminal(TurnTransition::Failed),
+            events: Vec::new(),
+            terminal_error: Some(error),
         }
     }
 
@@ -958,6 +968,7 @@ impl ExecuteResult {
         Self {
             outcome: ExecuteOutcome::StoppedByControl,
             events: Vec::new(),
+            terminal_error: None,
         }
     }
 
@@ -970,6 +981,10 @@ impl ExecuteResult {
 
     pub(super) fn into_events(self) -> Vec<SatelleEvent> {
         self.events
+    }
+
+    pub(super) fn terminal_error(&self) -> Option<&SatelleError> {
+        self.terminal_error.as_ref()
     }
 }
 

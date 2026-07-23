@@ -1484,18 +1484,22 @@ fn finish_timed_turn_execution(
     ) {
         return Err(session_failure(CodexSessionError::Containment));
     }
-    if matches!(
-        cancellation,
-        StopObservation::CancellationConfirmed | StopObservation::UpstreamInactiveConfirmed
-    ) {
-        return Ok(ExecuteResult::new(TurnTransition::Failed, Vec::new()));
-    }
     match run.result {
         result @ Ok(
             CodexSessionTerminal::Completed
             | CodexSessionTerminal::Interrupted
             | CodexSessionTerminal::Failed,
         ) => terminal_result(result),
+        Ok(CodexSessionTerminal::StoppedByControl) | Err(_)
+            if matches!(
+                cancellation,
+                StopObservation::CancellationConfirmed | StopObservation::UpstreamInactiveConfirmed
+            ) =>
+        {
+            Ok(ExecuteResult::terminal_failure(session_failure(
+                CodexSessionError::Timeout,
+            )))
+        }
         Ok(CodexSessionTerminal::StoppedByControl) | Err(_) => {
             Err(session_failure(CodexSessionError::Timeout))
         }
@@ -2048,7 +2052,7 @@ mod tests {
     }
 
     #[test]
-    fn timed_turn_requires_confirmed_upstream_cancellation_before_failing_terminally() {
+    fn timed_turn_preserves_terminal_results_and_returns_confirmed_timeout_error() {
         let confirmed = finish_timed_turn_execution(
             TimedCodexSessionRun {
                 result: Ok(CodexSessionTerminal::StoppedByControl),
@@ -2058,6 +2062,22 @@ mod tests {
         )
         .expect("confirmed timeout cancellation is terminal");
         assert_eq!(confirmed.transition(), Some(TurnTransition::Failed));
+        let timeout = confirmed
+            .terminal_error()
+            .expect("confirmed deadline cancellation must remain typed");
+        assert_eq!(timeout.code, ErrorCode::RemoteExecution);
+        assert_eq!(timeout.details["reason"], serde_json::json!("timeout"));
+
+        let completed = finish_timed_turn_execution(
+            TimedCodexSessionRun {
+                result: Ok(CodexSessionTerminal::Completed),
+                cancellation: Some(StopObservation::CancellationConfirmed),
+            },
+            None,
+        )
+        .expect("a definitive completion wins the cancellation race");
+        assert_eq!(completed.transition(), Some(TurnTransition::Completed));
+        assert!(completed.terminal_error().is_none());
 
         let error = match finish_timed_turn_execution(
             TimedCodexSessionRun {
