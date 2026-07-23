@@ -1393,10 +1393,13 @@ impl SshSetupTransport {
                 provider_auth: "not_checked".to_string(),
             },
             daemon_path_overrides: path_override_entries,
-            mutated: matches!(
-                application,
-                SetupApplication::AppliedNewToken | SetupApplication::AppliedPendingActivation
-            ),
+            mutated: applied
+                && (service_persistent
+                    || matches!(
+                        application,
+                        SetupApplication::AppliedNewToken
+                            | SetupApplication::AppliedPendingActivation
+                    )),
             native_computer_use_readiness: "not_checked".to_string(),
             next_command,
         }
@@ -4537,6 +4540,7 @@ mod bootstrap_ordering_tests {
             satelle_core::daemon_service::DaemonArtifactAction::UpdateOlder
         );
         assert!(!report.applied_actions.is_empty());
+        assert!(report.mutated);
     }
 }
 

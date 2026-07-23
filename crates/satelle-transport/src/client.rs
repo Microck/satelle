@@ -276,7 +276,7 @@ impl DaemonClient {
         operation_id: &str,
     ) -> Result<BootstrapMaintenanceResponse, DaemonClientError> {
         let path = format!(
-            "/v1/maintenance/bootstrap/{operation_id}/service_restart/persistent_host_stop/begin"
+            "/v1/maintenance/bootstrap/{operation_id}/service_stop/persistent_host_stop/begin"
         );
         let (request, request_id) = self.mutation_request(&path, operation_id)?;
         self.send_authenticated(request, request_id, StatusCode::OK)

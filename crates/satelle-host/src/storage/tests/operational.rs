@@ -223,6 +223,7 @@ fn durable_operation_vocabularies_are_closed_over_pr04_mutations() {
         (SetupOperationKind::Repair, "repair"),
         (SetupOperationKind::HostUpdate, "host_update"),
         (SetupOperationKind::StorageMigration, "storage_migration"),
+        (SetupOperationKind::ServiceStop, "service_stop"),
         (SetupOperationKind::ServiceRestart, "service_restart"),
     ] {
         let state = TempDir::new().expect("maintenance state directory");

@@ -75,6 +75,7 @@ pub(super) async fn begin_bootstrap_maintenance(
         "initial_setup" => SetupOperationKind::Setup,
         "missing_daemon_repair" => SetupOperationKind::Repair,
         "host_binary_replacement" => SetupOperationKind::HostUpdate,
+        "service_stop" => SetupOperationKind::ServiceStop,
         "service_restart" => SetupOperationKind::ServiceRestart,
         _ => {
             return host_error::response(

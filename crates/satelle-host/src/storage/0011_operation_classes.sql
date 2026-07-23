@@ -104,6 +104,7 @@ CREATE TABLE setup_runs (
             'repair',
             'host_update',
             'storage_migration',
+            'service_stop',
             'service_restart'
         )),
     status TEXT NOT NULL

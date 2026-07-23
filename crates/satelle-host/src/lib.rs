@@ -154,12 +154,12 @@ impl BootstrapMaintenancePlanKind {
 
     fn accepts_operation_kind(self, operation_kind: SetupOperationKind) -> bool {
         match self {
-            Self::PersistentHostStop | Self::PersistentHostRestart => {
-                operation_kind == SetupOperationKind::ServiceRestart
-            }
-            Self::OnDemandHandoff | Self::PersistentHostService => {
-                operation_kind != SetupOperationKind::ServiceRestart
-            }
+            Self::PersistentHostStop => operation_kind == SetupOperationKind::ServiceStop,
+            Self::PersistentHostRestart => operation_kind == SetupOperationKind::ServiceRestart,
+            Self::OnDemandHandoff | Self::PersistentHostService => !matches!(
+                operation_kind,
+                SetupOperationKind::ServiceStop | SetupOperationKind::ServiceRestart
+            ),
         }
     }
 
@@ -234,35 +234,33 @@ mod bootstrap_maintenance_tests {
     }
 
     #[test]
-    fn persistent_lifecycle_plans_are_exact_service_restart_operations() {
+    fn persistent_lifecycle_plans_require_their_exact_operation_kind() {
         let state = TestStateDir::new().expect("create state directory");
         let service =
             HostService::local_demo_for_tests_at(state.path()).expect("create Host service");
 
-        for (operation_id, plan_kind, expected_action) in [
+        for (operation_id, operation_kind, plan_kind, expected_action) in [
             (
                 "persistent-host-stop",
+                SetupOperationKind::ServiceStop,
                 BootstrapMaintenancePlanKind::PersistentHostStop,
                 "service-stop",
             ),
             (
                 "persistent-host-restart",
+                SetupOperationKind::ServiceRestart,
                 BootstrapMaintenancePlanKind::PersistentHostRestart,
                 "service-restart",
             ),
         ] {
             service
-                .acquire_bootstrap_maintenance_plan(
-                    operation_id,
-                    SetupOperationKind::ServiceRestart,
-                    plan_kind,
-                )
+                .acquire_bootstrap_maintenance_plan(operation_id, operation_kind, plan_kind)
                 .expect("acquire exact lifecycle plan");
             let planned = service
                 .load_setup_run(operation_id)
                 .expect("load lifecycle run")
                 .expect("lifecycle run exists");
-            assert_eq!(SetupOperationKind::ServiceRestart, planned.operation_kind());
+            assert_eq!(operation_kind, planned.operation_kind());
             assert_eq!(1, planned.actions().len());
             assert_eq!(expected_action, planned.actions()[0].action_id());
             assert_eq!(SetupActionStatus::Planned, planned.actions()[0].status());
@@ -302,7 +300,27 @@ mod bootstrap_maintenance_tests {
                     BootstrapMaintenancePlanKind::PersistentHostStop,
                 )
                 .is_err(),
-            "lifecycle plans must use the durable service_restart operation kind"
+            "persistent Host stop must reject the setup operation kind"
+        );
+        assert!(
+            service
+                .acquire_bootstrap_maintenance_plan(
+                    "stop-with-restart-kind",
+                    SetupOperationKind::ServiceRestart,
+                    BootstrapMaintenancePlanKind::PersistentHostStop,
+                )
+                .is_err(),
+            "persistent Host stop must reject the restart operation kind"
+        );
+        assert!(
+            service
+                .acquire_bootstrap_maintenance_plan(
+                    "restart-with-stop-kind",
+                    SetupOperationKind::ServiceStop,
+                    BootstrapMaintenancePlanKind::PersistentHostRestart,
+                )
+                .is_err(),
+            "persistent Host restart must reject the stop operation kind"
         );
         assert!(
             service

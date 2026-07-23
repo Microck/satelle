@@ -56,6 +56,7 @@ pub enum SetupOperationKind {
     Repair,
     HostUpdate,
     StorageMigration,
+    ServiceStop,
     ServiceRestart,
 }
 
@@ -66,6 +67,7 @@ impl SetupOperationKind {
             Self::Repair => "repair",
             Self::HostUpdate => "host_update",
             Self::StorageMigration => "storage_migration",
+            Self::ServiceStop => "service_stop",
             Self::ServiceRestart => "service_restart",
         }
     }
@@ -76,6 +78,7 @@ impl SetupOperationKind {
             "repair" => Ok(Self::Repair),
             "host_update" => Ok(Self::HostUpdate),
             "storage_migration" => Ok(Self::StorageMigration),
+            "service_stop" => Ok(Self::ServiceStop),
             "service_restart" => Ok(Self::ServiceRestart),
             _ => Err(StorageError::new(StorageErrorKind::InvalidStoredState)),
         }
@@ -958,6 +961,7 @@ impl Storage {
             SetupOperationKind::Repair => "repair_postcondition_unsatisfied",
             SetupOperationKind::HostUpdate => "host_update_postcondition_unsatisfied",
             SetupOperationKind::StorageMigration => "storage_migration_postcondition_unsatisfied",
+            SetupOperationKind::ServiceStop => "service_stop_postcondition_unsatisfied",
             SetupOperationKind::ServiceRestart => "service_restart_postcondition_unsatisfied",
         };
         let owner = &subject.owner;

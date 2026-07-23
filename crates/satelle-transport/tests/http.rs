@@ -2268,18 +2268,23 @@ async fn persistent_host_lifecycle_maintenance_uses_exact_single_action_plans() 
     .await
     .expect("run lifecycle clients");
 
-    for (operation_id, expected_action) in [
-        ("persistent-host-stop-lifecycle", "service-stop"),
-        ("persistent-host-restart-lifecycle", "service-restart"),
+    for (operation_id, expected_action, expected_operation_kind) in [
+        (
+            "persistent-host-stop-lifecycle",
+            "service-stop",
+            satelle_host::SetupOperationKind::ServiceStop,
+        ),
+        (
+            "persistent-host-restart-lifecycle",
+            "service-restart",
+            satelle_host::SetupOperationKind::ServiceRestart,
+        ),
     ] {
         let run = service
             .load_setup_run(operation_id)
             .expect("load lifecycle run")
             .expect("lifecycle run exists");
-        assert_eq!(
-            run.operation_kind(),
-            satelle_host::SetupOperationKind::ServiceRestart
-        );
+        assert_eq!(run.operation_kind(), expected_operation_kind);
         assert_eq!(run.status(), satelle_host::SetupRunStatus::Completed);
         assert_eq!(1, run.actions().len());
         assert_eq!(expected_action, run.actions()[0].action_id());

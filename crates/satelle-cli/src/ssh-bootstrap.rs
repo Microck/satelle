@@ -866,6 +866,25 @@ impl RemoteTarget {
         ))
     }
 
+    fn artifact_upload_directory(
+        self,
+        directories: &RemoteUserDirectories,
+    ) -> Result<String, SshBootstrapError> {
+        let install_directory = self.artifact_directory(directories)?;
+        if !matches!(self, Self::DarwinArm64 | Self::DarwinX64) {
+            return Ok(install_directory);
+        }
+
+        // SSH starts in the remote user's home, so the guarded relative cache path and the
+        // absolute path required by launchd identify the same artifact without widening the
+        // cache writer to arbitrary absolute paths.
+        let upload_directory = self.remote_directory();
+        if install_directory != join_target_path(self, &directories.home, &upload_directory) {
+            return Err(SshBootstrapError::InvalidPersistentServiceDefinition);
+        }
+        Ok(upload_directory)
+    }
+
     fn remote_directory(self) -> String {
         let version = env!("CARGO_PKG_VERSION");
         format!("{}/v{version}/{}", self.remote_cache_root(), self.id())
@@ -1836,15 +1855,23 @@ impl<'a> PersistentServiceRemote<'a> {
         &mut self,
     ) -> Result<UploadedHostArtifact, SshBootstrapError> {
         let artifact = DownloadedArtifact::fetch(self.target)?;
-        let directory = self.target.artifact_directory(self.directories)?;
-        upload_artifact(
+        let directory = self.target.artifact_upload_directory(self.directories)?;
+        let mut uploaded = upload_artifact(
             self.destination,
             self.target,
             artifact.path(),
             &directory,
             artifact.release_digest(),
             self.bootstrap_lock,
-        )
+        )?;
+        if matches!(
+            self.target,
+            RemoteTarget::DarwinArm64 | RemoteTarget::DarwinX64
+        ) {
+            uploaded.remote_path =
+                join_target_path(self.target, &self.directories.home, &uploaded.remote_path);
+        }
+        Ok(uploaded)
     }
 
     pub(super) fn ensure_owner_only_directories(
@@ -4714,6 +4741,37 @@ mod tests {
             assert!(directory.ends_with(target.id()));
             assert!(directory.starts_with(target.remote_cache_root()));
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn macos_persistent_artifact_uses_guarded_home_relative_upload_path() {
+        let target = RemoteTarget::DarwinArm64;
+        let directories = RemoteUserDirectories::for_tests(target);
+        let upload_directory = target
+            .artifact_upload_directory(&directories)
+            .expect("derive macOS upload directory");
+        assert_eq!(upload_directory, target.remote_directory());
+        assert_eq!(
+            target
+                .planned_install_path(&directories, &[0; 32])
+                .expect("derive absolute launchd artifact path"),
+            join_target_path(
+                target,
+                &directories.home,
+                &target.shared_executable_path(&upload_directory),
+            )
+        );
+
+        let home = tempfile::tempdir().expect("temporary macOS SSH home");
+        let status = Command::new("sh")
+            .arg("-c")
+            .arg(target.create_directory_command(&upload_directory))
+            .current_dir(home.path())
+            .status()
+            .expect("run guarded macOS cache creation");
+        assert!(status.success());
+        assert!(home.path().join(upload_directory).is_dir());
     }
 
     #[cfg(unix)]
