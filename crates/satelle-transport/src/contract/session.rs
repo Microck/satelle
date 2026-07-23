@@ -7,27 +7,26 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::Value;
 use std::fmt;
 
-define_schema_token!(TurnRequestSchema, "satelle.api.v2");
+define_schema_token!(TurnRequestSchema, "satelle.api.v3");
 define_schema_token!(StopRequestSchema, "satelle.api.v1");
 define_schema_token!(SessionSchema, "satelle.session.v1");
 define_schema_token!(SessionStopSchema, "satelle.session.stop.v1");
 define_schema_token!(AdmissionCancellationSchema, "satelle.admission.cancel.v1");
 
-pub const MAX_IMAGE_ATTACHMENT_COUNT: usize = 4;
+pub const MAX_IMAGE_ATTACHMENT_COUNT: usize = 2;
 pub const MAX_IMAGE_ATTACHMENT_BYTES: usize = 5 * 1_024 * 1_024;
 pub const MAX_IMAGE_ATTACHMENT_BYTES_TOTAL: usize = 10 * 1_024 * 1_024;
 pub(crate) const MAX_IMAGE_ATTACHMENT_BASE64_BYTES: usize =
     4 * MAX_IMAGE_ATTACHMENT_BYTES.div_ceil(3);
 pub(crate) const MAX_IMAGE_ATTACHMENT_BASE64_BYTES_TOTAL: usize =
     4 * ((MAX_IMAGE_ATTACHMENT_BYTES_TOTAL + 2 * MAX_IMAGE_ATTACHMENT_COUNT) / 3);
-pub const SUPPORTED_IMAGE_MEDIA_TYPES: &[&str] =
-    &["image/gif", "image/jpeg", "image/png", "image/webp"];
+pub const SUPPORTED_IMAGE_MEDIA_TYPES: &[&str] = &["image/jpeg", "image/png"];
 
 pub(crate) trait ApiRequestContract {
     const SCHEMA_VERSION: &'static str;
     const MAX_BASE64_BODY_ALLOWANCE: usize = 0;
 
-    fn exceeds_attachment_limit(_value: &Value) -> bool {
+    fn exceeds_attachment_limit(_value: &Value, _image_attachments_supported: bool) -> bool {
         false
     }
 
@@ -217,13 +216,14 @@ impl ApiRequestContract for TurnRequest {
     const SCHEMA_VERSION: &'static str = TurnRequestSchema::TOKEN;
     const MAX_BASE64_BODY_ALLOWANCE: usize = MAX_IMAGE_ATTACHMENT_BASE64_BYTES_TOTAL;
 
-    fn exceeds_attachment_limit(value: &Value) -> bool {
+    fn exceeds_attachment_limit(value: &Value, image_attachments_supported: bool) -> bool {
         value
             .as_object()
             .and_then(|object| object.get("attachments"))
             .is_some_and(|attachments| match attachments {
                 Value::Array(values) => {
-                    values.len() > MAX_IMAGE_ATTACHMENT_COUNT
+                    (!image_attachments_supported && !values.is_empty())
+                        || values.len() > MAX_IMAGE_ATTACHMENT_COUNT
                         || values.iter().any(|value| {
                             let size = value.get("size_bytes").and_then(Value::as_u64);
                             let media_type = value.get("media_type").and_then(Value::as_str);
@@ -682,7 +682,7 @@ mod tests {
         assert_eq!(
             serde_json::to_value(request).expect("serialize request"),
             serde_json::json!({
-                "schema_version": "satelle.api.v2",
+                "schema_version": "satelle.api.v3",
                 "prompt": "private prompt",
                 "execution_mode": "standard"
             })
@@ -693,7 +693,7 @@ mod tests {
             )
             .expect("serialize YOLO request"),
             serde_json::json!({
-                "schema_version": "satelle.api.v2",
+                "schema_version": "satelle.api.v3",
                 "prompt": "private prompt",
                 "execution_mode": "yolo"
             })
@@ -707,7 +707,7 @@ mod tests {
             ))
             .expect("serialize provider intent"),
             serde_json::json!({
-                "schema_version": "satelle.api.v2",
+                "schema_version": "satelle.api.v3",
                 "prompt": "private prompt",
                 "execution_mode": "standard",
                 "model": "model-explicit",
@@ -718,17 +718,17 @@ mod tests {
         );
         assert!(
             serde_json::from_value::<TurnRequest>(serde_json::json!({
-                "schema_version": "satelle.api.v2",
+                "schema_version": "satelle.api.v3",
                 "prompt": "private prompt"
             }))
             .is_err()
         );
         assert!(
             serde_json::from_value::<TurnRequest>(serde_json::json!({
-                "schema_version": "satelle.api.v2",
+                "schema_version": "satelle.api.v3",
                 "prompt": "private prompt",
                 "execution_mode": "standard",
-                "attachments": []
+                "controller_only": true
             }))
             .is_err()
         );
@@ -742,7 +742,7 @@ mod tests {
     fn controller_presentation_fields_are_absent_from_the_turn_request_contract() {
         for field in ["attach", "detach"] {
             let mut request = serde_json::json!({
-                "schema_version": "satelle.api.v2",
+                "schema_version": "satelle.api.v3",
                 "prompt": "private prompt",
                 "execution_mode": "standard"
             });

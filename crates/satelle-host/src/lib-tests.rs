@@ -41,7 +41,12 @@ fn configured_remote_alias_reaches_execution_and_session_keeps_host_identity() {
     let service = HostService {
         runtime: RuntimeHandle::new(Ok(state.path().to_path_buf()), FakeComputerUseAdapter),
         operation_capacity: Arc::new(OperationCapacity::default()),
-        mode: HostMode::TestFake,
+        turn_execution_timeout: crate::configured_turn_execution_timeout(
+            &satelle_core::SatelleConfig::defaults().hosts[LOCAL_DEMO_HOST],
+        ),
+        mode: HostMode::TestFake {
+            image_attachments: true,
+        },
         bootstrap_auth: None,
         bootstrap_maintenance: Arc::new(Mutex::new(None)),
     };
@@ -94,7 +99,12 @@ fn configured_remote_alias_is_accepted_by_host_diagnostics() {
     let service = HostService {
         runtime: RuntimeHandle::new(Ok(state.path().to_path_buf()), FakeComputerUseAdapter),
         operation_capacity: Arc::new(OperationCapacity::default()),
-        mode: HostMode::TestFake,
+        turn_execution_timeout: crate::configured_turn_execution_timeout(
+            &satelle_core::SatelleConfig::defaults().hosts[LOCAL_DEMO_HOST],
+        ),
+        mode: HostMode::TestFake {
+            image_attachments: true,
+        },
         bootstrap_auth: None,
         bootstrap_maintenance: Arc::new(Mutex::new(None)),
     };
@@ -189,6 +199,9 @@ fn unsupported_or_unproven_production_execution_is_blocked_without_state_admissi
         let service = HostService {
             runtime: RuntimeHandle::new(Ok(state.path().to_path_buf()), adapter),
             operation_capacity: Arc::new(OperationCapacity::default()),
+            turn_execution_timeout: crate::configured_turn_execution_timeout(
+                &satelle_core::SatelleConfig::defaults().hosts[LOCAL_DEMO_HOST],
+            ),
             mode: HostMode::Production { snapshot },
             bootstrap_auth: None,
             bootstrap_maintenance: Arc::new(Mutex::new(None)),
@@ -302,7 +315,12 @@ fn attached_adapter_failures_return_exact_durable_run_and_steer_handles() {
     let run_service = HostService {
         runtime: RuntimeHandle::new(Ok(run_state.path().to_path_buf()), FailingExecutionAdapter),
         operation_capacity: Arc::new(OperationCapacity::default()),
-        mode: HostMode::TestFake,
+        turn_execution_timeout: crate::configured_turn_execution_timeout(
+            &satelle_core::SatelleConfig::defaults().hosts[LOCAL_DEMO_HOST],
+        ),
+        mode: HostMode::TestFake {
+            image_attachments: true,
+        },
         bootstrap_auth: None,
         bootstrap_maintenance: Arc::new(Mutex::new(None)),
     };
@@ -334,7 +352,12 @@ fn attached_adapter_failures_return_exact_durable_run_and_steer_handles() {
     let seeded = HostService {
         runtime: RuntimeHandle::new(Ok(steer_state.path().to_path_buf()), FakeComputerUseAdapter),
         operation_capacity: Arc::new(OperationCapacity::default()),
-        mode: HostMode::TestFake,
+        turn_execution_timeout: crate::configured_turn_execution_timeout(
+            &satelle_core::SatelleConfig::defaults().hosts[LOCAL_DEMO_HOST],
+        ),
+        mode: HostMode::TestFake {
+            image_attachments: true,
+        },
         bootstrap_auth: None,
         bootstrap_maintenance: Arc::new(Mutex::new(None)),
     };
@@ -352,7 +375,12 @@ fn attached_adapter_failures_return_exact_durable_run_and_steer_handles() {
             FailingExecutionAdapter,
         ),
         operation_capacity: Arc::new(OperationCapacity::default()),
-        mode: HostMode::TestFake,
+        turn_execution_timeout: crate::configured_turn_execution_timeout(
+            &satelle_core::SatelleConfig::defaults().hosts[LOCAL_DEMO_HOST],
+        ),
+        mode: HostMode::TestFake {
+            image_attachments: true,
+        },
         bootstrap_auth: None,
         bootstrap_maintenance: Arc::new(Mutex::new(None)),
     };
@@ -410,6 +438,9 @@ fn refreshed_production_snapshot_updates_admission_surfaces_but_not_desktop_disc
     let service = HostService {
         runtime: RuntimeHandle::new(Ok(state.path().to_path_buf()), adapter),
         operation_capacity: Arc::new(OperationCapacity::default()),
+        turn_execution_timeout: crate::configured_turn_execution_timeout(
+            &satelle_core::SatelleConfig::defaults().hosts[LOCAL_DEMO_HOST],
+        ),
         mode: HostMode::Production { snapshot },
         bootstrap_auth: None,
         bootstrap_maintenance: Arc::new(Mutex::new(None)),

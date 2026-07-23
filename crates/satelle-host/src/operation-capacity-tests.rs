@@ -2351,8 +2351,13 @@ fn coordinator_result_session() -> PublicSession {
 fn service(state_root: &Path, adapter: ControlledAdapter) -> HostService {
     HostService {
         runtime: RuntimeHandle::new(Ok(state_root.to_path_buf()), adapter),
-        mode: HostMode::TestFake,
         operation_capacity: Arc::new(OperationCapacity::default()),
+        turn_execution_timeout: crate::configured_turn_execution_timeout(
+            &satelle_core::SatelleConfig::defaults().hosts[satelle_core::LOCAL_DEMO_HOST],
+        ),
+        mode: HostMode::TestFake {
+            image_attachments: true,
+        },
         bootstrap_auth: None,
         bootstrap_maintenance: Arc::new(Mutex::new(None)),
     }

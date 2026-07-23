@@ -191,12 +191,7 @@ impl TurnIntent {
             prompt,
             execution_mode,
             provider_intent: crate::ProviderComputerUseIntent::host_default(),
-            turn_execution_timeout: Some(
-                satelle_core::session::TimeoutPolicy::bounded_seconds(
-                    (satelle_core::DEFAULT_TURN_EXECUTION_TIMEOUT_MS / 1_000) as u32,
-                )
-                .map_err(|_| TurnIntentError::InvalidTurnExecutionTimeout)?,
-            ),
+            turn_execution_timeout: None,
             attachments: Vec::new(),
         })
     }
@@ -226,7 +221,6 @@ impl TurnIntent {
         timeout_ms: Option<u64>,
     ) -> Result<Self, TurnIntentError> {
         self.turn_execution_timeout = timeout_ms
-            .or(Some(satelle_core::DEFAULT_TURN_EXECUTION_TIMEOUT_MS))
             .map(|timeout_ms| {
                 if timeout_ms == 0
                     || timeout_ms > satelle_core::MAX_TURN_EXECUTION_TIMEOUT_MS
@@ -501,11 +495,11 @@ impl HostService {
                 ))
             }
             #[cfg(any(test, feature = "test-support"))]
-            HostMode::TestFake => Ok(DaemonRuntimeCapabilities {
+            HostMode::TestFake { image_attachments } => Ok(DaemonRuntimeCapabilities {
                 codex_runtime: false,
                 native_computer_use: false,
                 provider_computer_use: false,
-                image_attachments: true,
+                image_attachments: *image_attachments,
             }),
         }
     }
@@ -516,7 +510,7 @@ impl HostService {
         match &self.mode {
             HostMode::Production { .. } => crate::desktop_sessions::discover(),
             #[cfg(any(test, feature = "test-support"))]
-            HostMode::TestFake => Ok(self.desktop_sessions_fake()),
+            HostMode::TestFake { .. } => Ok(self.desktop_sessions_fake()),
         }
     }
 
@@ -721,6 +715,7 @@ impl HostService {
         authority: &MutationAuthority,
         cancellation: AdmissionCancellation,
     ) -> Result<PublicSession, SatelleError> {
+        let turn_execution_timeout = self.effective_turn_execution_timeout(intent);
         let canonical_payload = canonical_payload(
             &CanonicalSessionCreate {
                 operation: "session_create",
@@ -736,9 +731,7 @@ impl HostService {
                     .map(ProviderBindingRef::as_str),
                 experimental_provider_computer_use: intent.provider_intent.experimental(),
                 refresh_provider_smoke_test: intent.provider_intent.refresh(),
-                turn_execution_timeout_seconds: intent
-                    .turn_execution_timeout
-                    .map(satelle_core::session::TimeoutPolicy::seconds),
+                turn_execution_timeout_seconds: Some(turn_execution_timeout.seconds()),
                 attachments: &intent
                     .attachments
                     .iter()
@@ -789,7 +782,7 @@ impl HostService {
                             )
                             .with_execution_mode(intent.execution_mode)
                             .with_provider_intent(intent.provider_intent.clone())
-                            .with_turn_execution_timeout(intent.turn_execution_timeout)
+                            .with_turn_execution_timeout(Some(turn_execution_timeout))
                             .with_attachments(intent.attachments.clone())
                             .with_cancellation(registered_cancellation),
                         ),
@@ -829,6 +822,7 @@ impl HostService {
         authority: &MutationAuthority,
         cancellation: AdmissionCancellation,
     ) -> Result<PublicSession, SatelleError> {
+        let turn_execution_timeout = self.effective_turn_execution_timeout(intent);
         let canonical_payload = canonical_payload(
             &CanonicalTurnCreate {
                 operation: "turn_create",
@@ -845,9 +839,7 @@ impl HostService {
                     .map(ProviderBindingRef::as_str),
                 experimental_provider_computer_use: intent.provider_intent.experimental(),
                 refresh_provider_smoke_test: intent.provider_intent.refresh(),
-                turn_execution_timeout_seconds: intent
-                    .turn_execution_timeout
-                    .map(satelle_core::session::TimeoutPolicy::seconds),
+                turn_execution_timeout_seconds: Some(turn_execution_timeout.seconds()),
                 attachments: &intent
                     .attachments
                     .iter()
@@ -902,7 +894,7 @@ impl HostService {
                             )
                             .with_execution_mode(intent.execution_mode)
                             .with_provider_intent(intent.provider_intent.clone())
-                            .with_turn_execution_timeout(intent.turn_execution_timeout)
+                            .with_turn_execution_timeout(Some(turn_execution_timeout))
                             .with_attachments(intent.attachments.clone())
                             .with_cancellation(registered_cancellation),
                         ),
@@ -926,6 +918,7 @@ impl HostService {
         intent: &TurnIntent,
         authority: &MutationAuthority,
     ) -> Result<AdmissionCancellationResult, SatelleError> {
+        let turn_execution_timeout = self.effective_turn_execution_timeout(intent);
         let canonical_payload = canonical_payload(
             &CanonicalSessionCreate {
                 operation: "session_create",
@@ -941,9 +934,7 @@ impl HostService {
                     .map(ProviderBindingRef::as_str),
                 experimental_provider_computer_use: intent.provider_intent.experimental(),
                 refresh_provider_smoke_test: intent.provider_intent.refresh(),
-                turn_execution_timeout_seconds: intent
-                    .turn_execution_timeout
-                    .map(satelle_core::session::TimeoutPolicy::seconds),
+                turn_execution_timeout_seconds: Some(turn_execution_timeout.seconds()),
                 attachments: &intent
                     .attachments
                     .iter()
@@ -992,6 +983,7 @@ impl HostService {
         intent: &TurnIntent,
         authority: &MutationAuthority,
     ) -> Result<AdmissionCancellationResult, SatelleError> {
+        let turn_execution_timeout = self.effective_turn_execution_timeout(intent);
         let canonical_payload = canonical_payload(
             &CanonicalTurnCreate {
                 operation: "turn_create",
@@ -1008,9 +1000,7 @@ impl HostService {
                     .map(ProviderBindingRef::as_str),
                 experimental_provider_computer_use: intent.provider_intent.experimental(),
                 refresh_provider_smoke_test: intent.provider_intent.refresh(),
-                turn_execution_timeout_seconds: intent
-                    .turn_execution_timeout
-                    .map(satelle_core::session::TimeoutPolicy::seconds),
+                turn_execution_timeout_seconds: Some(turn_execution_timeout.seconds()),
                 attachments: &intent
                     .attachments
                     .iter()
@@ -1132,6 +1122,21 @@ impl HostService {
         self.runtime.status(session_id.clone())
     }
 
+    fn effective_turn_execution_timeout(
+        &self,
+        intent: &TurnIntent,
+    ) -> satelle_core::session::TimeoutPolicy {
+        let requested = intent
+            .turn_execution_timeout
+            .unwrap_or(self.turn_execution_timeout);
+        satelle_core::session::TimeoutPolicy::bounded_seconds(
+            requested
+                .seconds()
+                .min(self.turn_execution_timeout.seconds()),
+        )
+        .expect("typed Turn timeout policies are always nonzero")
+    }
+
     #[cfg(any(test, feature = "test-support"))]
     pub fn local_demo_for_tests_at(
         state_root: impl Into<std::path::PathBuf>,
@@ -1144,7 +1149,12 @@ impl HostService {
             operation_capacity: std::sync::Arc::new(
                 crate::operation_capacity::OperationCapacity::default(),
             ),
-            mode: HostMode::TestFake,
+            turn_execution_timeout: crate::configured_turn_execution_timeout(
+                &satelle_core::SatelleConfig::defaults().hosts[satelle_core::LOCAL_DEMO_HOST],
+            ),
+            mode: HostMode::TestFake {
+                image_attachments: true,
+            },
             bootstrap_auth: None,
             bootstrap_maintenance: std::sync::Arc::new(std::sync::Mutex::new(None)),
         })
@@ -1165,6 +1175,24 @@ impl HostService {
     }
 
     #[doc(hidden)]
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn with_turn_execution_timeout_for_tests(mut self, seconds: u32) -> Self {
+        self.turn_execution_timeout =
+            satelle_core::session::TimeoutPolicy::bounded_seconds(seconds)
+                .expect("test Turn execution timeout must be nonzero");
+        self
+    }
+
+    #[doc(hidden)]
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn without_image_attachments_for_tests(mut self) -> Self {
+        self.mode = HostMode::TestFake {
+            image_attachments: false,
+        };
+        self
+    }
+
+    #[doc(hidden)]
     #[cfg(feature = "test-support")]
     pub fn with_adapter_for_tests_at<A: crate::ComputerUseAdapter>(
         state_root: impl Into<std::path::PathBuf>,
@@ -1175,7 +1203,12 @@ impl HostService {
             operation_capacity: std::sync::Arc::new(
                 crate::operation_capacity::OperationCapacity::default(),
             ),
-            mode: HostMode::TestFake,
+            turn_execution_timeout: crate::configured_turn_execution_timeout(
+                &satelle_core::SatelleConfig::defaults().hosts[satelle_core::LOCAL_DEMO_HOST],
+            ),
+            mode: HostMode::TestFake {
+                image_attachments: true,
+            },
             bootstrap_auth: None,
             bootstrap_maintenance: std::sync::Arc::new(std::sync::Mutex::new(None)),
         })
@@ -1327,17 +1360,23 @@ mod tests {
     use std::sync::Arc;
 
     #[test]
-    fn turn_intent_defaults_to_30_minutes_and_accepts_a_resolved_hour() {
-        let default = TurnIntent::new("prompt", TurnExecutionMode::Standard).unwrap();
-        assert_eq!(default.turn_execution_timeout.unwrap().seconds(), 30 * 60);
-
-        let configured = TurnIntent::new("prompt", TurnExecutionMode::Standard)
+    fn host_turn_timeout_resolves_omitted_and_longer_requests_before_admission() {
+        let state = crate::TestStateDir::new().expect("temporary Host state directory");
+        let service = HostService::local_demo_for_tests_at(state.path())
+            .unwrap()
+            .with_turn_execution_timeout_for_tests(5 * 60);
+        let omitted = TurnIntent::new("prompt", TurnExecutionMode::Standard).unwrap();
+        let longer = TurnIntent::new("prompt", TurnExecutionMode::Standard)
             .unwrap()
             .with_turn_execution_timeout_ms(Some(60 * 60 * 1_000))
             .unwrap();
         assert_eq!(
-            configured.turn_execution_timeout.unwrap().seconds(),
-            60 * 60
+            service.effective_turn_execution_timeout(&omitted).seconds(),
+            5 * 60
+        );
+        assert_eq!(
+            service.effective_turn_execution_timeout(&longer).seconds(),
+            5 * 60
         );
     }
 

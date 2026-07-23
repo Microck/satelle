@@ -942,6 +942,7 @@ mod tests {
                 true,
                 true,
                 true,
+                true,
                 crate::contract::effective_limits(128, satelle_core::ApiRateLimits::default()),
             ))
             .expect("encode legacy capabilities response");

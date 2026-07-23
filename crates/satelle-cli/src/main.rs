@@ -5574,7 +5574,7 @@ fn load_image_attachments(
 
     if paths.len() > satelle_transport::MAX_IMAGE_ATTACHMENT_COUNT {
         return Err(failure(SatelleError::invalid_usage(
-            "at most four image attachments may be supplied",
+            "at most two image attachments may be supplied",
         )));
     }
     if !paths.is_empty() && supported_media_types.is_empty() {
@@ -5643,10 +5643,6 @@ fn sniff_local_image_media_type(bytes: &[u8]) -> Option<&'static str> {
         Some("image/png")
     } else if bytes.starts_with(b"\xff\xd8\xff") {
         Some("image/jpeg")
-    } else if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
-        Some("image/gif")
-    } else if bytes.len() >= 12 && &bytes[..4] == b"RIFF" && &bytes[8..12] == b"WEBP" {
-        Some("image/webp")
     } else {
         None
     }

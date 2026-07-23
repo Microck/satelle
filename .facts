@@ -322,39 +322,39 @@
 - satelle native repair refuses installs owned by package managers it cannot identify safely and reports the direct native binary install path instead @spec @later
 
 ## execution
-- satelle optimizes equally for one-shot prompt execution and ongoing session/thread control @spec @mvp
-- satelle one-shot prompt execution creates a remote Codex thread, sets the thread goal to the prompt objective when the supported app-server protocol exposes goal methods, starts the first turn, and returns both the outcome and the reusable session identifier @spec @mvp
-- satelle run and steer accept exactly one prompt source: a positional prompt, the positional value - for standard input, or --prompt-file <path> @spec @contract @mvp
-- conflicting prompt sources report a typed prompt-source-conflict usage error @spec @mvp
+- satelle optimizes equally for one-shot prompt execution and ongoing session/thread control @spec @mvp @implemented
+- satelle one-shot prompt execution creates a remote Codex thread, sets the thread goal to the prompt objective when the supported app-server protocol exposes goal methods, starts the first turn, and returns both the outcome and the reusable session identifier @spec @mvp @implemented
+- satelle run and steer accept exactly one prompt source: a positional prompt, the positional value - for standard input, or --prompt-file <path> @spec @contract @mvp @implemented
+- conflicting prompt sources report a typed prompt-source-conflict usage error @spec @mvp @implemented
 - satelle run treats a single dash prompt argument as an instruction to read prompt text from standard input @implemented @mvp
-- satelle help warns that prompt command arguments may be retained by shell history or visible in local process metadata @spec @mvp
-- satelle recommends standard input or prompt files for sensitive prompt input @spec @mvp
-- satelle never sends raw prompt text through SSH command arguments, remote process arguments, environment variables, logs, or bootstrap diagnostics @spec @mvp
-- satelle run supports image attachments in MVP when the remote Codex app-server protocol supports image or localImage user input @spec @mvp
-- satelle run and steer use repeatable --image <local-path> as the exact local image attachment option @spec @contract @mvp
-- satelle image attachment paths provided to CLI commands are interpreted as local CLI machine paths by default @spec @mvp
-- satelle uploads local image attachments to the remote Host Daemon before passing them to Codex as supported image input @spec @mvp
-- when the remote Codex app-server supports image or localImage input, the authenticated capabilities response advertises a maximum of 2 attachments, 5242880 bytes per attachment, 10485760 aggregate attachment bytes, and exactly image/png and image/jpeg; otherwise it advertises zero attachment limits and no supported attachment media types @spec @mvp
-- before decoding attachments, satelle validates the whole request against the advertised count, declared sizes, encoded-length bounds, and declared media types; after decoding, it validates actual per-attachment and aggregate bytes, sniffed media types, and content digests, and starts no Turn when any attachment fails @spec @mvp
-- Host Daemon attachment staging uses generated filenames instead of Client-provided path components @spec @mvp
-- attachment staging files are private to the daemon OS user @spec @mvp
-- satelle rejects path traversal, device files, directories, and unsupported symlinks as attachment inputs @spec @mvp
-- attachment staging is deleted after terminal Turn state, rejected Turn admission, cancellation, timeout, or bounded crash-recovery cleanup @spec @mvp
-- attachment cleanup failure creates a redacted cleanup diagnostic without exposing attachment content @spec @mvp
-- satelle deletes uploaded image attachments from the remote host after the turn by default @spec @mvp
-- satelle MVP does not retain uploaded image attachments after the turn for logs, status, diagnostics, setup ledgers, diagnostic bundles, or recording artifacts @spec @mvp
-- satelle MVP does not support remote-host path image attachments because attachment paths are interpreted as local CLI machine paths by default @spec @mvp
+- satelle help warns that prompt command arguments may be retained by shell history or visible in local process metadata @spec @mvp @implemented
+- satelle recommends standard input or prompt files for sensitive prompt input @spec @mvp @implemented
+- satelle never sends raw prompt text through SSH command arguments, remote process arguments, environment variables, logs, or bootstrap diagnostics @spec @mvp @implemented
+- satelle run supports image attachments in MVP when the remote Codex app-server protocol supports image or localImage user input @spec @mvp @implemented
+- satelle run and steer use repeatable --image <local-path> as the exact local image attachment option @spec @contract @mvp @implemented
+- satelle image attachment paths provided to CLI commands are interpreted as local CLI machine paths by default @spec @mvp @implemented
+- satelle uploads local image attachments to the remote Host Daemon before passing them to Codex as supported image input @spec @mvp @implemented
+- when the remote Codex app-server supports image or localImage input, the authenticated capabilities response advertises a maximum of 2 attachments, 5242880 bytes per attachment, 10485760 aggregate attachment bytes, and exactly image/png and image/jpeg; otherwise it advertises zero attachment limits and no supported attachment media types @spec @mvp @implemented
+- before decoding attachments, satelle validates the whole request against the advertised count, declared sizes, encoded-length bounds, and declared media types; after decoding, it validates actual per-attachment and aggregate bytes, sniffed media types, and content digests, and starts no Turn when any attachment fails @spec @mvp @implemented
+- Host Daemon attachment staging uses generated filenames instead of Client-provided path components @spec @mvp @implemented
+- attachment staging files are private to the daemon OS user @spec @mvp @implemented
+- satelle rejects path traversal, device files, directories, and unsupported symlinks as attachment inputs @spec @mvp @implemented
+- attachment staging is deleted after terminal Turn state, rejected Turn admission, cancellation, timeout, or bounded crash-recovery cleanup @spec @mvp @implemented
+- attachment cleanup failure creates a redacted cleanup diagnostic without exposing attachment content @spec @mvp @implemented
+- satelle deletes uploaded image attachments from the remote host after the turn by default @spec @mvp @implemented
+- satelle MVP does not retain uploaded image attachments after the turn for logs, status, diagnostics, setup ledgers, diagnostic bundles, or recording artifacts @spec @mvp @implemented
+- satelle MVP does not support remote-host path image attachments because attachment paths are interpreted as local CLI machine paths by default @spec @mvp @implemented
 - satelle post-MVP remote-host path image attachments use an explicit --remote-image <path> option rather than overloading ordinary image attachment paths or SSH-style host:path syntax @spec @later
 - satelle later --remote-image resolves paths on the selected remote Host and never on the local CLI machine @spec @later
 - satelle later --remote-image rejects use when no remote Host resolves unambiguously before path validation @spec @later
 - satelle later --remote-image validates remote file existence, readability by the Host Daemon OS user, supported image media type, and size limits before starting the Codex Turn @spec @later
 - satelle later --remote-image does not copy the remote image back to the local CLI machine during normal execution @spec @later
 - satelle later --remote-image follows the same no-retention default as uploaded local image attachments for logs, status, diagnostics, setup ledgers, diagnostic bundles, and recording artifacts @spec @later
-- satelle MVP does not support arbitrary file attachments until file transfer, storage, and remote path semantics are specified @spec @mvp
-- satelle run waits by default until the selected remote Turn reaches a terminal status such as completed, blocked, failed, or stopped @spec @mvp
-- prompt Turns use a 30 minute default and maximum execution timeout, configurable through timeouts.turn_execution as a human duration string with explicit units and a finite hard maximum of 24 hours @spec @mvp
-- satelle run and steer accept --timeout <duration> as the exact per-Turn execution-timeout override; the override may shorten but never lengthen the resolved user-level or Host-owned limit and rejects bare integers or values above 24 hours @spec @contract @mvp
-- project-level configuration may request a shorter finite Turn timeout but cannot disable or lengthen the user-level or Host-owned Turn timeout limit @spec @mvp
+- satelle MVP does not support arbitrary file attachments until file transfer, storage, and remote path semantics are specified @spec @mvp @implemented
+- satelle run waits by default until the selected remote Turn reaches a terminal status such as completed, blocked, failed, or stopped @spec @mvp @implemented
+- prompt Turns use a 30 minute default and maximum execution timeout, configurable through timeouts.turn_execution as a human duration string with explicit units and a finite hard maximum of 24 hours @spec @mvp @implemented
+- satelle run and steer accept --timeout <duration> as the exact per-Turn execution-timeout override; the override may shorten but never lengthen the resolved user-level or Host-owned limit and rejects bare integers or values above 24 hours @spec @contract @mvp @implemented
+- project-level configuration may request a shorter finite Turn timeout but cannot disable or lengthen the user-level or Host-owned Turn timeout limit @spec @mvp @implemented
 - when a Turn exceeds its effective execution timeout, Satelle requests upstream cancellation and reports a typed turn-timeout failure @spec @mvp @implemented
 - Satelle commits failed with turn-timeout and releases the Control Lease only after upstream cancellation or another terminal upstream state is confirmed; otherwise the Turn becomes recovery_pending and retains the lease @spec @mvp @implemented
 - satelle run supports a detach option that returns after starting the turn and prints the reusable session identifier @implemented @mvp

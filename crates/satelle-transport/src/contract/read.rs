@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 
 define_schema_token!(LiveSchema, "satelle.live.v1");
-define_schema_token!(CapabilitiesSchema, "satelle.capabilities.v2");
+define_schema_token!(CapabilitiesSchema, "satelle.capabilities.v3");
 define_schema_token!(HostStatusSchema, "satelle.host.status.v1");
 define_schema_token!(
     HostDesktopSessionsSchema,

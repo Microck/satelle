@@ -614,6 +614,7 @@ mod bootstrap_maintenance_tests {
 pub struct HostService {
     runtime: RuntimeHandle,
     operation_capacity: Arc<OperationCapacity>,
+    turn_execution_timeout: satelle_core::session::TimeoutPolicy,
     mode: HostMode,
     bootstrap_auth: Option<Arc<EphemeralApiAuthenticator>>,
     bootstrap_maintenance: Arc<Mutex<Option<MaintenanceOperationHandle>>>,
@@ -625,7 +626,20 @@ enum HostMode {
         snapshot: Arc<RwLock<ProductionCapabilitySnapshot>>,
     },
     #[cfg(any(test, feature = "test-support"))]
-    TestFake,
+    TestFake { image_attachments: bool },
+}
+
+fn configured_turn_execution_timeout(config: &HostConfig) -> satelle_core::session::TimeoutPolicy {
+    let seconds = config
+        .timeouts
+        .as_ref()
+        .and_then(|timeouts| timeouts.turn_execution.as_ref())
+        .map_or(
+            (satelle_core::DEFAULT_TURN_EXECUTION_TIMEOUT_MS / 1_000) as u32,
+            satelle_core::TurnExecutionDuration::seconds,
+        );
+    satelle_core::session::TimeoutPolicy::bounded_seconds(seconds)
+        .expect("validated Turn execution configuration has a nonzero timeout")
 }
 
 #[derive(Clone, Debug)]
@@ -698,7 +712,12 @@ impl HostService {
                 driver,
             ),
             operation_capacity: Arc::new(OperationCapacity::default()),
-            mode: HostMode::TestFake,
+            turn_execution_timeout: configured_turn_execution_timeout(
+                &satelle_core::SatelleConfig::defaults().hosts[LOCAL_DEMO_HOST],
+            ),
+            mode: HostMode::TestFake {
+                image_attachments: true,
+            },
             bootstrap_auth: None,
             bootstrap_maintenance: Arc::new(Mutex::new(None)),
         })
@@ -1102,6 +1121,7 @@ impl HostService {
         Self {
             runtime: RuntimeHandle::new_production(state_root, operator_log_root, adapter),
             operation_capacity: Arc::new(OperationCapacity::default()),
+            turn_execution_timeout: configured_turn_execution_timeout(config),
             mode: HostMode::Production { snapshot },
             bootstrap_auth: None,
             bootstrap_maintenance: Arc::new(Mutex::new(None)),
@@ -1137,7 +1157,12 @@ impl HostService {
         Ok(Self {
             runtime: RuntimeHandle::new(satelle_core::state_dir(), FakeComputerUseAdapter),
             operation_capacity: Arc::new(OperationCapacity::default()),
-            mode: HostMode::TestFake,
+            turn_execution_timeout: configured_turn_execution_timeout(
+                &satelle_core::SatelleConfig::defaults().hosts[LOCAL_DEMO_HOST],
+            ),
+            mode: HostMode::TestFake {
+                image_attachments: true,
+            },
             bootstrap_auth: None,
             bootstrap_maintenance: Arc::new(Mutex::new(None)),
         })
@@ -1149,7 +1174,12 @@ impl HostService {
         Ok(Self {
             runtime: RuntimeHandle::new(satelle_core::state_dir(), PendingComputerUseAdapter),
             operation_capacity: Arc::new(OperationCapacity::default()),
-            mode: HostMode::TestFake,
+            turn_execution_timeout: configured_turn_execution_timeout(
+                &satelle_core::SatelleConfig::defaults().hosts[LOCAL_DEMO_HOST],
+            ),
+            mode: HostMode::TestFake {
+                image_attachments: true,
+            },
             bootstrap_auth: None,
             bootstrap_maintenance: Arc::new(Mutex::new(None)),
         })
@@ -1161,7 +1191,12 @@ impl HostService {
         Ok(Self {
             runtime: RuntimeHandle::new(satelle_core::state_dir(), FailingComputerUseAdapter),
             operation_capacity: Arc::new(OperationCapacity::default()),
-            mode: HostMode::TestFake,
+            turn_execution_timeout: configured_turn_execution_timeout(
+                &satelle_core::SatelleConfig::defaults().hosts[LOCAL_DEMO_HOST],
+            ),
+            mode: HostMode::TestFake {
+                image_attachments: true,
+            },
             bootstrap_auth: None,
             bootstrap_maintenance: Arc::new(Mutex::new(None)),
         })
@@ -1212,7 +1247,7 @@ impl HostService {
                 production_doctor_report(host, scope, &*read_production_snapshot(snapshot)?)
             }
             #[cfg(any(test, feature = "test-support"))]
-            HostMode::TestFake => {
+            HostMode::TestFake { .. } => {
                 self.fake_doctor(host, scope, options, &FakeComputerUseAdapter)?
             }
         };
@@ -1251,7 +1286,7 @@ impl HostService {
                 daemon_path_overrides,
             )),
             #[cfg(any(test, feature = "test-support"))]
-            HostMode::TestFake => self.setup_fake(
+            HostMode::TestFake { .. } => self.setup_fake(
                 host,
                 dry_run,
                 setup_mode,
@@ -1269,7 +1304,7 @@ impl HostService {
                 sessions: 0,
             }),
             #[cfg(any(test, feature = "test-support"))]
-            HostMode::TestFake => {
+            HostMode::TestFake { .. } => {
                 let snapshot = self.runtime.reconcile_and_snapshot()?;
                 Ok(HostStatus {
                     running: true,

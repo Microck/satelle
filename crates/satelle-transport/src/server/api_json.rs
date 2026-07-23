@@ -106,7 +106,7 @@ where
                 },
             ));
         }
-        if T::exceeds_attachment_limit(&value) {
+        if T::exceeds_attachment_limit(&value, state.capabilities.image_attachments()) {
             return Err(payload_too_large(
                 state,
                 &authorized,

@@ -6,7 +6,7 @@ use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-const MAX_ATTACHMENTS: usize = 4;
+const MAX_ATTACHMENTS: usize = 2;
 const MAX_ATTACHMENT_BYTES: usize = 5 * 1024 * 1024;
 const MAX_TOTAL_BYTES: usize = 10 * 1024 * 1024;
 const MAX_STALE_FILES_PER_START: usize = 1024;
@@ -126,10 +126,6 @@ fn sniff_media_type(bytes: &[u8]) -> Option<&'static str> {
         Some("image/png")
     } else if bytes.starts_with(b"\xff\xd8\xff") {
         Some("image/jpeg")
-    } else if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
-        Some("image/gif")
-    } else if bytes.len() >= 12 && &bytes[..4] == b"RIFF" && &bytes[8..12] == b"WEBP" {
-        Some("image/webp")
     } else {
         None
     }
@@ -236,8 +232,6 @@ fn extension_for(media_type: &str) -> &'static str {
     match media_type {
         "image/png" => "png",
         "image/jpeg" => "jpg",
-        "image/gif" => "gif",
-        "image/webp" => "webp",
         _ => unreachable!("verified media type"),
     }
 }
@@ -336,6 +330,15 @@ mod tests {
         let png = b"\x89PNG\r\n\x1a\nfixture";
         assert!(verify_uploads(vec![upload(png, "image/jpeg", None)]).is_err());
         assert!(verify_uploads(vec![upload(png, "image/png", Some("00".repeat(32)))]).is_err());
+        assert!(verify_uploads(vec![upload(b"GIF89a-fake", "image/gif", None)]).is_err());
+        assert!(
+            verify_uploads(vec![
+                upload(png, "image/png", None),
+                upload(png, "image/png", None),
+                upload(png, "image/png", None),
+            ])
+            .is_err()
+        );
     }
 
     #[test]
