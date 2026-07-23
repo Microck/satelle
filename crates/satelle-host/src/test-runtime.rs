@@ -4,7 +4,7 @@ mod diagnostics;
 use crate::HostService;
 use crate::runtime::{
     AdapterReadiness, AdapterSubject, ComputerUseAdapter, ExecuteRequest, ExecuteResult,
-    ProviderSmokeEvidence, ProviderSmokeSource, ReadinessEvidence, RecoveryObservation,
+    ProviderSmokeEvidence, ProviderSmokeSource, RecoveryObservation,
 };
 use satelle_core::session::{
     ApprovalPolicy, DesktopBindingRef, DesktopTarget, EffectiveModelRef, ExecutionPolicy,
@@ -153,17 +153,26 @@ impl ComputerUseAdapter for FakeComputerUseAdapter {
             ExperimentalFeatureChoices::new(FeatureChoice::Enabled, FeatureChoice::Enabled),
         );
         let observed_at = time::OffsetDateTime::now_utc();
-        let evidence = ReadinessEvidence::new(
-            format!("readiness-{}", satelle_core::SessionId::new()),
+        let readiness_key = crate::ReadinessCacheKey::new(
+            "fake",
+            desktop_binding.clone(),
+            execution_policy.clone(),
             "fake-codex-v1",
             "fake-native-runtime-v1",
             Some("fake-plugin-v1"),
             "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
             "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
-            observed_at,
-            observed_at + time::Duration::minutes(5),
+            crate::ReadinessObservationState::Unknown,
+            crate::ReadinessObservationState::Unknown,
         )
-        .map_err(|_| adapter_configuration_error("readiness evidence"))?;
+        .map_err(|_| adapter_configuration_error("readiness cache key"))?;
+        let evidence = readiness_key
+            .evidence(
+                format!("readiness-{}", satelle_core::SessionId::new()),
+                observed_at,
+                observed_at + time::Duration::minutes(5),
+            )
+            .map_err(|_| adapter_configuration_error("readiness evidence"))?;
         let provider_evidence = ProviderSmokeEvidence::new(
             format!("provider-smoke-{}", satelle_core::SessionId::new()),
             "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",

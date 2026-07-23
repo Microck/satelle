@@ -5,13 +5,18 @@ CREATE TABLE native_readiness_results (
     host_identity_ref TEXT NOT NULL
         REFERENCES daemon_identity(host_identity_ref) ON DELETE CASCADE,
     desktop_binding_ref TEXT NOT NULL,
+    desktop_session_ref TEXT NOT NULL,
     adapter_ref TEXT NOT NULL,
     status TEXT NOT NULL CHECK (status IN ('passed', 'failed')),
     failure_reason TEXT,
     codex_version TEXT NOT NULL,
     native_runtime_version TEXT NOT NULL,
     plugin_version TEXT,
+    os_permission_state TEXT NOT NULL
+        CHECK (os_permission_state IN ('granted', 'denied', 'unknown')),
     os_permission_fingerprint TEXT NOT NULL,
+    app_approval_state TEXT NOT NULL
+        CHECK (app_approval_state IN ('granted', 'denied', 'unknown')),
     app_approval_fingerprint TEXT NOT NULL,
     observed_at INTEGER NOT NULL,
     expires_at INTEGER NOT NULL,
@@ -26,11 +31,14 @@ CREATE INDEX native_readiness_reuse
 ON native_readiness_results (
     host_identity_ref,
     desktop_binding_ref,
+    desktop_session_ref,
     adapter_ref,
     codex_version,
     native_runtime_version,
     plugin_version,
+    os_permission_state,
     os_permission_fingerprint,
+    app_approval_state,
     app_approval_fingerprint,
     status,
     expires_at

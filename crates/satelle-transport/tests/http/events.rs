@@ -289,7 +289,7 @@ async fn event_socket_streams_only_post_subscription_commits_in_order() {
     let admitted: SessionResponse = admitted.json().await.expect("decode admitted Session");
 
     let mut events = Vec::new();
-    for _ in 0..4 {
+    for _ in 0..5 {
         let frame = next_text(&mut socket).await;
         assert_privacy_canaries_absent(
             "WebSocket raw event frame",
@@ -304,6 +304,7 @@ async fn event_socket_streams_only_post_subscription_commits_in_order() {
             .map(SatelleEvent::event_type)
             .collect::<Vec<_>>(),
         [
+            EventType::Readiness,
             EventType::TurnStarted,
             EventType::ProviderSmoke,
             EventType::TurnProgress,
@@ -312,7 +313,21 @@ async fn event_socket_streams_only_post_subscription_commits_in_order() {
     );
     assert_eq!(
         events.iter().map(SatelleEvent::seq).collect::<Vec<_>>(),
-        [1, 2, 3, 4]
+        [1, 2, 3, 4, 5]
+    );
+    let readiness = &events[0];
+    assert_eq!(readiness.data()["source"], "live");
+    assert_eq!(readiness.data()["status"], "passed");
+    let file_management = readiness.data()["checks"]
+        .as_array()
+        .expect("readiness carries structured checks")
+        .iter()
+        .find(|check| check["kind"] == "file_management")
+        .expect("readiness includes file-management status");
+    assert_eq!(file_management["status"], "not_evaluated");
+    assert_eq!(
+        file_management["reason"],
+        "not_required_for_prompt_admission"
     );
     assert!(events.iter().all(|event| {
         event.session_id() == Some(admitted.session().session_id())
@@ -620,7 +635,7 @@ async fn replacing_event_subscriptions_filters_live_events_without_resetting_seq
         .await
         .expect("admit visible follow-up for prior scope");
     assert_eq!(prior_follow_up.status(), StatusCode::ACCEPTED);
-    for expected_sequence in 1..=4 {
+    for expected_sequence in 1..=5 {
         let event = serde_json::from_str::<SatelleEvent>(&next_text(&mut socket).await)
             .expect("decode prior matching event");
         assert_eq!(event.seq(), expected_sequence);
@@ -673,7 +688,7 @@ async fn replacing_event_subscriptions_filters_live_events_without_resetting_seq
     assert_eq!(follow_up.status(), StatusCode::ACCEPTED);
 
     let mut events = Vec::new();
-    for _ in 0..4 {
+    for _ in 0..5 {
         events.push(
             serde_json::from_str::<SatelleEvent>(&next_text(&mut socket).await)
                 .expect("decode matching event"),
@@ -681,7 +696,7 @@ async fn replacing_event_subscriptions_filters_live_events_without_resetting_seq
     }
     assert_eq!(
         events.iter().map(SatelleEvent::seq).collect::<Vec<_>>(),
-        [5, 6, 7, 8]
+        [6, 7, 8, 9, 10]
     );
     assert!(
         events
@@ -730,7 +745,7 @@ async fn replacing_event_subscriptions_filters_live_events_without_resetting_seq
         .expect("admit overlapping-scope follow-up");
     assert_eq!(overlap_follow_up.status(), StatusCode::ACCEPTED);
     let mut overlap_events = Vec::new();
-    for _ in 0..4 {
+    for _ in 0..5 {
         overlap_events.push(
             serde_json::from_str::<SatelleEvent>(&next_text(&mut socket).await)
                 .expect("decode overlapping-scope event"),
@@ -741,7 +756,7 @@ async fn replacing_event_subscriptions_filters_live_events_without_resetting_seq
             .iter()
             .map(SatelleEvent::seq)
             .collect::<Vec<_>>(),
-        [9, 10, 11, 12]
+        [11, 12, 13, 14, 15]
     );
     assert!(
         tokio::time::timeout(Duration::from_millis(100), next_text(&mut socket))
@@ -847,6 +862,24 @@ async fn daemon_event_client_validates_the_subscription_and_event_stream() {
         .expect("admit client-observed Session");
     assert_eq!(admitted.status(), StatusCode::ACCEPTED);
 
+    let readiness = events
+        .next_event()
+        .await
+        .expect("receive native readiness event");
+    assert_eq!(readiness.event_type(), EventType::Readiness);
+    assert_eq!(readiness.data()["source"], "live");
+    assert_eq!(readiness.data()["status"], "passed");
+    let file_management = readiness.data()["checks"]
+        .as_array()
+        .expect("readiness carries structured checks")
+        .iter()
+        .find(|check| check["kind"] == "file_management")
+        .expect("readiness includes file-management status");
+    assert_eq!(file_management["status"], "not_evaluated");
+    assert_eq!(
+        file_management["reason"],
+        "not_required_for_prompt_admission"
+    );
     assert_eq!(
         events
             .next_event()

@@ -1,5 +1,5 @@
 use super::*;
-use crate::runtime::NativeProbeResult;
+use crate::runtime::{NativeProbeResult, ReadinessObservationState, ReadinessSource};
 use crate::storage::{
     LeaseOwner, MaintenanceLeaseCapability, SetupActionPlan, SetupOperationKind, SetupRunPlan,
     SetupRunStatus,
@@ -1571,6 +1571,8 @@ fn readiness_key(desktop_binding: &str) -> ReadinessCacheKey {
         None::<String>,
         "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
         "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        ReadinessObservationState::Unknown,
+        ReadinessObservationState::Unknown,
     )
     .unwrap()
 }
@@ -1862,6 +1864,84 @@ fn file_digest(path: &Path) -> String {
 }
 
 #[test]
+fn native_readiness_pass_is_not_reused_for_a_different_exact_desktop_session() {
+    let state = TempDir::new().expect("temporary state directory");
+    let (mut storage, _) = Storage::open(state.path()).expect("open storage");
+    let key = readiness_key("shared-desktop-binding");
+    let evidence = key
+        .evidence("exact-session-pass", at(1), at(6))
+        .expect("construct exact-session readiness evidence");
+    storage
+        .store_preflight_successes(
+            key.adapter(),
+            key.desktop_binding(),
+            key.execution_policy(),
+            &evidence,
+            None,
+        )
+        .expect("persist native readiness pass");
+
+    storage
+        .connection_for_test()
+        .execute(
+            "UPDATE native_readiness_results
+             SET desktop_session_ref = 'different-exact-desktop-session'
+             WHERE status = 'passed'",
+            [],
+        )
+        .expect("simulate the stored pass belonging to a different exact desktop session");
+
+    assert!(
+        storage
+            .load_reusable_readiness(&key, at(2))
+            .expect("query exact native readiness cache key")
+            .is_none(),
+        "a desktop binding alone must not authorize reuse across exact desktop sessions"
+    );
+}
+
+#[test]
+fn native_readiness_pass_is_invalidated_by_an_observation_state_change() {
+    let state = TempDir::new().expect("temporary state directory");
+    let (mut storage, _) = Storage::open(state.path()).expect("open storage");
+    let key = readiness_key("observation-state-desktop");
+    assert_eq!(
+        ReadinessObservationState::Unknown,
+        key.os_permission_state()
+    );
+    let evidence = key
+        .evidence("observation-state-pass", at(1), at(6))
+        .expect("construct observation-state readiness evidence");
+    storage
+        .store_preflight_successes(
+            key.adapter(),
+            key.desktop_binding(),
+            key.execution_policy(),
+            &evidence,
+            None,
+        )
+        .expect("persist native readiness pass");
+
+    storage
+        .connection_for_test()
+        .execute(
+            "UPDATE native_readiness_results
+             SET os_permission_state = 'denied'
+             WHERE status = 'passed'",
+            [],
+        )
+        .expect("simulate a detectable OS permission observation change");
+
+    assert!(
+        storage
+            .load_reusable_readiness(&key, at(2))
+            .expect("query exact native readiness cache key")
+            .is_none(),
+        "a detectable observation-state change must invalidate native readiness reuse"
+    );
+}
+
+#[test]
 fn readiness_and_provider_results_round_trip_without_raw_evidence() {
     let state = TempDir::new().expect("temporary state directory");
     let (mut storage, _) = Storage::open(state.path()).expect("open storage");
@@ -1879,17 +1959,6 @@ fn readiness_and_provider_results_round_trip_without_raw_evidence() {
         TimeoutPolicy::bounded_seconds(120).unwrap(),
         ExperimentalFeatureChoices::new(FeatureChoice::Enabled, FeatureChoice::Enabled),
     );
-    let readiness = ReadinessEvidence::new(
-        "readiness-1",
-        "0.144.0",
-        "1.0.0",
-        Some("plugin-1.0.0"),
-        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-        "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
-        observed_at,
-        expires_at,
-    )
-    .unwrap();
     let cache_key = ReadinessCacheKey::new(
         "codex-native-computer-use",
         desktop.clone(),
@@ -1899,8 +1968,12 @@ fn readiness_and_provider_results_round_trip_without_raw_evidence() {
         Some("plugin-1.0.0"),
         "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
         "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        ReadinessObservationState::Unknown,
+        ReadinessObservationState::Unknown,
     )
     .unwrap();
+    let readiness =
+        ReadinessEvidence::new(&cache_key, "readiness-1", observed_at, expires_at).unwrap();
     let provider = ProviderSmokeEvidence::new(
         "provider-smoke-1",
         cache_key.provider_config_fingerprint(),
@@ -1926,8 +1999,22 @@ fn readiness_and_provider_results_round_trip_without_raw_evidence() {
             Some(&provider),
         )
         .expect("replaying identical evidence is idempotent");
+    let persisted_source_columns: i64 = storage
+        .connection_for_test()
+        .query_row(
+            "SELECT count(*)
+             FROM pragma_table_info('native_readiness_results')
+             WHERE name = 'source'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("inspect persisted native readiness columns");
     assert_eq!(
-        Some(readiness.clone()),
+        0, persisted_source_columns,
+        "readiness source is transient provenance and must not be persisted"
+    );
+    assert_eq!(
+        Some(readiness.clone().with_source(ReadinessSource::Cache)),
         storage
             .load_reusable_readiness(&cache_key, observed_at)
             .expect("matching success is reusable before expiry")
@@ -1955,17 +2042,9 @@ fn readiness_and_provider_results_round_trip_without_raw_evidence() {
             .is_none()
     );
 
-    let second_readiness = ReadinessEvidence::new(
-        "readiness-2",
-        "0.144.0",
-        "1.0.0",
-        Some("plugin-1.0.0"),
-        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-        "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
-        observed_at,
-        expires_at,
-    )
-    .unwrap();
+    let second_readiness = cache_key
+        .evidence("readiness-2", observed_at, expires_at)
+        .unwrap();
     let conflicting_provider = ProviderSmokeEvidence::new(
         "provider-smoke-1",
         cache_key.provider_config_fingerprint(),
@@ -2064,15 +2143,18 @@ fn readiness_and_provider_results_round_trip_without_raw_evidence() {
 
 #[test]
 fn operational_fingerprints_reject_non_digest_values() {
-    let error = ReadinessEvidence::new(
-        "readiness-1",
+    let key = readiness_key("fingerprint-rejection");
+    let error = ReadinessCacheKey::new(
+        key.adapter(),
+        key.desktop_binding().clone(),
+        key.execution_policy().clone(),
         "0.144.0",
         "1.0.0",
         Some("plugin-1.0.0"),
         "raw-provider-secret",
         "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
-        at(1),
-        at(2),
+        key.os_permission_state(),
+        key.app_approval_state(),
     )
     .expect_err("fingerprints must be fixed-size lowercase digests");
     assert_eq!(EvidenceError::InvalidFingerprint, error);

@@ -271,8 +271,8 @@ async fn assert_transport_conformance(
     .await
     .expect("join blocking API conformance runner");
 
-    let mut events = Vec::with_capacity(4);
-    for _ in 0..4 {
+    let mut events = Vec::with_capacity(5);
+    for _ in 0..5 {
         events.push(
             event_stream
                 .next_event()
@@ -286,6 +286,7 @@ async fn assert_transport_conformance(
             .map(|event| event.event_type())
             .collect::<Vec<_>>(),
         [
+            EventType::Readiness,
             EventType::TurnStarted,
             EventType::ProviderSmoke,
             EventType::TurnProgress,
@@ -294,7 +295,21 @@ async fn assert_transport_conformance(
     );
     assert_eq!(
         events.iter().map(|event| event.seq()).collect::<Vec<_>>(),
-        [1, 2, 3, 4]
+        [1, 2, 3, 4, 5]
+    );
+    let readiness = &events[0];
+    assert_eq!(readiness.data()["source"], "live");
+    assert_eq!(readiness.data()["status"], "passed");
+    let file_management = readiness.data()["checks"]
+        .as_array()
+        .expect("readiness carries structured checks")
+        .iter()
+        .find(|check| check["kind"] == "file_management")
+        .expect("readiness includes file-management status");
+    assert_eq!(file_management["status"], "not_evaluated");
+    assert_eq!(
+        file_management["reason"],
+        "not_required_for_prompt_admission"
     );
     assert!(events.iter().all(|event| {
         event.session_id() == Some(&session_id)

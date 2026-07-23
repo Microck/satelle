@@ -79,6 +79,8 @@ pub struct AdapterReadiness {
     execution_policy: ExecutionPolicy,
     evidence: ReadinessEvidence,
     provider_smoke_evidence: Option<ProviderSmokeEvidence>,
+    source: ReadinessSource,
+    checks: Vec<NativeReadinessCheck>,
 }
 
 impl std::fmt::Debug for AdapterReadiness {
@@ -89,7 +91,126 @@ impl std::fmt::Debug for AdapterReadiness {
             .field("adapter", &self.adapter)
             .field("desktop_binding", &self.desktop_binding)
             .field("execution_policy", &self.execution_policy)
+            .field("source", &self.source)
+            .field("checks", &self.checks)
             .finish_non_exhaustive()
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ReadinessSource {
+    Cache,
+    Live,
+}
+
+impl ReadinessSource {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Cache => "cache",
+            Self::Live => "live",
+        }
+    }
+}
+
+/// Direct observation state for a native readiness prerequisite.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ReadinessObservationState {
+    /// The prerequisite was directly observed as granted.
+    Granted,
+    /// The prerequisite was directly observed as denied.
+    Denied,
+    /// The prerequisite cannot be observed through a stable surface.
+    Unknown,
+}
+
+impl ReadinessObservationState {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Granted => "granted",
+            Self::Denied => "denied",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum NativeReadinessCheckKind {
+    CodexRuntime,
+    Authentication,
+    NativeComputerUse,
+    OsPermissions,
+    AppApproval,
+    ControlPlane,
+    PointerClick,
+    PointerDrag,
+    FileManagement,
+}
+
+impl NativeReadinessCheckKind {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::CodexRuntime => "codex_runtime",
+            Self::Authentication => "authentication",
+            Self::NativeComputerUse => "native_computer_use",
+            Self::OsPermissions => "os_permissions",
+            Self::AppApproval => "app_approval",
+            Self::ControlPlane => "control_plane",
+            Self::PointerClick => "pointer_click",
+            Self::PointerDrag => "pointer_drag",
+            Self::FileManagement => "file_management",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum NativeReadinessCheckStatus {
+    Passed,
+    Failed,
+    ManualActionRequired,
+    NotEvaluated,
+}
+
+impl NativeReadinessCheckStatus {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Passed => "passed",
+            Self::Failed => "failed",
+            Self::ManualActionRequired => "manual_action_required",
+            Self::NotEvaluated => "not_evaluated",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct NativeReadinessCheck {
+    kind: NativeReadinessCheckKind,
+    status: NativeReadinessCheckStatus,
+    reason: &'static str,
+}
+
+impl NativeReadinessCheck {
+    pub(crate) const fn new(
+        kind: NativeReadinessCheckKind,
+        status: NativeReadinessCheckStatus,
+        reason: &'static str,
+    ) -> Self {
+        Self {
+            kind,
+            status,
+            reason,
+        }
+    }
+
+    pub(crate) const fn kind(&self) -> NativeReadinessCheckKind {
+        self.kind
+    }
+
+    pub(crate) const fn status(&self) -> NativeReadinessCheckStatus {
+        self.status
+    }
+
+    pub(crate) const fn reason(&self) -> &'static str {
+        self.reason
     }
 }
 
@@ -326,11 +447,18 @@ impl ProviderSmokeSource {
 #[derive(Clone, Eq, PartialEq)]
 pub struct ReadinessEvidence {
     window: EvidenceWindow,
+    source: ReadinessSource,
+    adapter: &'static str,
+    desktop_binding: DesktopBindingRef,
+    execution_policy: ExecutionPolicy,
+    desktop_session_ref: String,
     codex_version: String,
     native_runtime_version: String,
     plugin_version: Option<String>,
     os_permission_fingerprint: String,
     app_approval_fingerprint: String,
+    os_permission_state: ReadinessObservationState,
+    app_approval_state: ReadinessObservationState,
 }
 
 /// Stable inputs that must still match before a successful native readiness
@@ -341,11 +469,14 @@ pub struct ReadinessCacheKey {
     adapter: &'static str,
     desktop_binding: DesktopBindingRef,
     execution_policy: ExecutionPolicy,
+    desktop_session_ref: String,
     codex_version: String,
     native_runtime_version: String,
     plugin_version: Option<String>,
     os_permission_fingerprint: String,
     app_approval_fingerprint: String,
+    os_permission_state: ReadinessObservationState,
+    app_approval_state: ReadinessObservationState,
 }
 
 impl ReadinessCacheKey {
@@ -359,17 +490,24 @@ impl ReadinessCacheKey {
         plugin_version: Option<impl Into<String>>,
         os_permission_fingerprint: impl Into<String>,
         app_approval_fingerprint: impl Into<String>,
+        os_permission_state: ReadinessObservationState,
+        app_approval_state: ReadinessObservationState,
     ) -> Result<Self, EvidenceError> {
         normalized_identifier(adapter)?;
+        let desktop_session_ref =
+            normalized_identifier(execution_policy.desktop_target().session_id())?;
         Ok(Self {
             adapter,
             desktop_binding,
             execution_policy,
+            desktop_session_ref,
             codex_version: normalized_identifier(codex_version)?,
             native_runtime_version: normalized_identifier(native_runtime_version)?,
             plugin_version: plugin_version.map(normalized_identifier).transpose()?,
             os_permission_fingerprint: fingerprint(os_permission_fingerprint)?,
             app_approval_fingerprint: fingerprint(app_approval_fingerprint)?,
+            os_permission_state,
+            app_approval_state,
         })
     }
 
@@ -383,6 +521,10 @@ impl ReadinessCacheKey {
 
     pub(crate) fn execution_policy(&self) -> &ExecutionPolicy {
         &self.execution_policy
+    }
+
+    pub(crate) fn desktop_session_ref(&self) -> &str {
+        &self.desktop_session_ref
     }
 
     pub(crate) fn codex_version(&self) -> &str {
@@ -403,6 +545,28 @@ impl ReadinessCacheKey {
 
     pub(crate) fn app_approval_fingerprint(&self) -> &str {
         &self.app_approval_fingerprint
+    }
+
+    pub(crate) const fn os_permission_state(&self) -> ReadinessObservationState {
+        self.os_permission_state
+    }
+
+    pub(crate) const fn app_approval_state(&self) -> ReadinessObservationState {
+        self.app_approval_state
+    }
+
+    pub(crate) fn matches_evidence(&self, evidence: &ReadinessEvidence) -> bool {
+        self.adapter == evidence.adapter
+            && self.desktop_binding == evidence.desktop_binding
+            && self.execution_policy == evidence.execution_policy
+            && self.desktop_session_ref == evidence.desktop_session_ref
+            && self.codex_version == evidence.codex_version
+            && self.native_runtime_version == evidence.native_runtime_version
+            && self.plugin_version == evidence.plugin_version
+            && self.os_permission_fingerprint == evidence.os_permission_fingerprint
+            && self.app_approval_fingerprint == evidence.app_approval_fingerprint
+            && self.os_permission_state == evidence.os_permission_state
+            && self.app_approval_state == evidence.app_approval_state
     }
 
     /// Binds reusable provider evidence to the exact provider/model/runtime
@@ -430,16 +594,7 @@ impl ReadinessCacheKey {
         observed_at: time::OffsetDateTime,
         expires_at: time::OffsetDateTime,
     ) -> Result<ReadinessEvidence, EvidenceError> {
-        ReadinessEvidence::new(
-            result_id,
-            self.codex_version.clone(),
-            self.native_runtime_version.clone(),
-            self.plugin_version.clone(),
-            self.os_permission_fingerprint.clone(),
-            self.app_approval_fingerprint.clone(),
-            observed_at,
-            expires_at,
-        )
+        ReadinessEvidence::new(self, result_id, observed_at, expires_at)
     }
 }
 
@@ -503,29 +658,46 @@ pub(crate) fn admission_cancelled_error(observation: StopObservation) -> Satelle
 }
 
 impl ReadinessEvidence {
-    #[allow(clippy::too_many_arguments)]
+    /// Creates native readiness evidence from one exact, validated cache
+    /// identity and a bounded validity window.
     pub fn new(
+        key: &ReadinessCacheKey,
         result_id: impl Into<String>,
-        codex_version: impl Into<String>,
-        native_runtime_version: impl Into<String>,
-        plugin_version: Option<impl Into<String>>,
-        os_permission_fingerprint: impl Into<String>,
-        app_approval_fingerprint: impl Into<String>,
         observed_at: time::OffsetDateTime,
         expires_at: time::OffsetDateTime,
     ) -> Result<Self, EvidenceError> {
         Ok(Self {
             window: EvidenceWindow::new(result_id, observed_at, expires_at)?,
-            codex_version: normalized_identifier(codex_version)?,
-            native_runtime_version: normalized_identifier(native_runtime_version)?,
-            plugin_version: plugin_version.map(normalized_identifier).transpose()?,
-            os_permission_fingerprint: fingerprint(os_permission_fingerprint)?,
-            app_approval_fingerprint: fingerprint(app_approval_fingerprint)?,
+            source: ReadinessSource::Live,
+            adapter: key.adapter,
+            desktop_binding: key.desktop_binding.clone(),
+            execution_policy: key.execution_policy.clone(),
+            desktop_session_ref: key.desktop_session_ref.clone(),
+            codex_version: key.codex_version.clone(),
+            native_runtime_version: key.native_runtime_version.clone(),
+            plugin_version: key.plugin_version.clone(),
+            os_permission_fingerprint: key.os_permission_fingerprint.clone(),
+            app_approval_fingerprint: key.app_approval_fingerprint.clone(),
+            os_permission_state: key.os_permission_state,
+            app_approval_state: key.app_approval_state,
         })
     }
 
     pub(crate) fn result_id(&self) -> &str {
         &self.window.result_id
+    }
+
+    pub(crate) const fn with_source(mut self, source: ReadinessSource) -> Self {
+        self.source = source;
+        self
+    }
+
+    pub(crate) const fn source(&self) -> ReadinessSource {
+        self.source
+    }
+
+    pub(crate) fn desktop_session_ref(&self) -> &str {
+        &self.desktop_session_ref
     }
 
     pub(crate) fn codex_version(&self) -> &str {
@@ -546,6 +718,14 @@ impl ReadinessEvidence {
 
     pub(crate) fn app_approval_fingerprint(&self) -> &str {
         &self.app_approval_fingerprint
+    }
+
+    pub(crate) const fn os_permission_state(&self) -> ReadinessObservationState {
+        self.os_permission_state
+    }
+
+    pub(crate) const fn app_approval_state(&self) -> ReadinessObservationState {
+        self.app_approval_state
     }
 
     pub(crate) const fn observed_at(&self) -> time::OffsetDateTime {
@@ -586,6 +766,7 @@ impl AdapterReadiness {
         {
             return Err(EvidenceError::InconsistentPolicy);
         }
+        let source = evidence.source();
         Ok(Self {
             ready: true,
             adapter,
@@ -594,7 +775,14 @@ impl AdapterReadiness {
             execution_policy,
             evidence,
             provider_smoke_evidence,
+            source,
+            checks: successful_native_readiness_checks(),
         })
+    }
+
+    pub(crate) fn with_source(mut self, source: ReadinessSource) -> Self {
+        self.source = source;
+        self
     }
 
     pub const fn is_ready(&self) -> bool {
@@ -624,6 +812,44 @@ impl AdapterReadiness {
     pub(crate) fn provider_smoke_evidence(&self) -> Option<&ProviderSmokeEvidence> {
         self.provider_smoke_evidence.as_ref()
     }
+
+    pub(crate) const fn source(&self) -> ReadinessSource {
+        self.source
+    }
+
+    pub(crate) fn checks(&self) -> &[NativeReadinessCheck] {
+        &self.checks
+    }
+}
+
+fn successful_native_readiness_checks() -> Vec<NativeReadinessCheck> {
+    use NativeReadinessCheckKind::{
+        AppApproval, Authentication, CodexRuntime, ControlPlane, FileManagement, NativeComputerUse,
+        OsPermissions, PointerClick, PointerDrag,
+    };
+
+    [
+        (CodexRuntime, "codex_runtime_available"),
+        (Authentication, "authentication_available"),
+        (NativeComputerUse, "native_computer_use_available"),
+        (OsPermissions, "os_permissions_live_proven"),
+        (AppApproval, "app_approval_live_proven"),
+        (ControlPlane, "control_plane_admitted"),
+        (PointerClick, "pointer_click_confirmed"),
+        (PointerDrag, "pointer_drag_confirmed"),
+    ]
+    .into_iter()
+    .map(|(kind, reason)| NativeReadinessCheck {
+        kind,
+        status: NativeReadinessCheckStatus::Passed,
+        reason,
+    })
+    .chain(std::iter::once(NativeReadinessCheck {
+        kind: FileManagement,
+        status: NativeReadinessCheckStatus::NotEvaluated,
+        reason: "not_required_for_prompt_admission",
+    }))
+    .collect()
 }
 
 fn normalized_identifier(value: impl Into<String>) -> Result<String, EvidenceError> {
@@ -665,32 +891,35 @@ mod evidence_tests {
     #[test]
     fn public_evidence_boundary_validates_and_redacts_values() {
         let observed_at = time::OffsetDateTime::UNIX_EPOCH;
-        let evidence = ReadinessEvidence::new(
-            "readiness-private-id",
-            "0.144.0",
-            "1.0.0",
-            Some("plugin-1.0.0"),
-            FINGERPRINT_A,
-            FINGERPRINT_B,
-            observed_at,
-            observed_at + time::Duration::minutes(5),
-        )
-        .unwrap();
+        let key = readiness_key(
+            "boundary-session",
+            ReadinessObservationState::Unknown,
+            ReadinessObservationState::Unknown,
+        );
+        let evidence = key
+            .evidence(
+                "readiness-private-id",
+                observed_at,
+                observed_at + time::Duration::minutes(5),
+            )
+            .unwrap();
         let debug = format!("{evidence:?}");
         assert!(!debug.contains("readiness-private-id"));
         assert!(!debug.contains(FINGERPRINT_A));
 
         assert_eq!(
             EvidenceError::InvalidFingerprint,
-            ReadinessEvidence::new(
-                "readiness-2",
+            ReadinessCacheKey::new(
+                key.adapter,
+                key.desktop_binding.clone(),
+                key.execution_policy.clone(),
                 "0.144.0",
                 "1.0.0",
                 None::<String>,
                 "raw-secret",
                 FINGERPRINT_B,
-                observed_at,
-                observed_at + time::Duration::minutes(5),
+                key.os_permission_state,
+                key.app_approval_state,
             )
             .unwrap_err()
         );
@@ -732,17 +961,209 @@ mod evidence_tests {
         );
     }
 
+    #[test]
+    fn native_readiness_reports_a_closed_live_check_set() {
+        let desktop = DesktopBindingRef::new("desktop-checks").unwrap();
+        let policy = policy(desktop.clone(), FeatureChoice::Disabled);
+        let checks = vec![
+            NativeReadinessCheck {
+                kind: NativeReadinessCheckKind::CodexRuntime,
+                status: NativeReadinessCheckStatus::Passed,
+                reason: "codex_runtime_available",
+            },
+            NativeReadinessCheck {
+                kind: NativeReadinessCheckKind::Authentication,
+                status: NativeReadinessCheckStatus::Passed,
+                reason: "authentication_available",
+            },
+            NativeReadinessCheck {
+                kind: NativeReadinessCheckKind::NativeComputerUse,
+                status: NativeReadinessCheckStatus::Passed,
+                reason: "native_computer_use_available",
+            },
+            NativeReadinessCheck {
+                kind: NativeReadinessCheckKind::OsPermissions,
+                status: NativeReadinessCheckStatus::Passed,
+                reason: "os_permissions_live_proven",
+            },
+            NativeReadinessCheck {
+                kind: NativeReadinessCheckKind::AppApproval,
+                status: NativeReadinessCheckStatus::Passed,
+                reason: "app_approval_live_proven",
+            },
+            NativeReadinessCheck {
+                kind: NativeReadinessCheckKind::ControlPlane,
+                status: NativeReadinessCheckStatus::Passed,
+                reason: "control_plane_admitted",
+            },
+            NativeReadinessCheck {
+                kind: NativeReadinessCheckKind::PointerClick,
+                status: NativeReadinessCheckStatus::Passed,
+                reason: "pointer_click_confirmed",
+            },
+            NativeReadinessCheck {
+                kind: NativeReadinessCheckKind::PointerDrag,
+                status: NativeReadinessCheckStatus::Passed,
+                reason: "pointer_drag_confirmed",
+            },
+            NativeReadinessCheck {
+                kind: NativeReadinessCheckKind::FileManagement,
+                status: NativeReadinessCheckStatus::NotEvaluated,
+                reason: "not_required_for_prompt_admission",
+            },
+        ];
+
+        let readiness =
+            AdapterReadiness::ready("test", "ready", desktop, policy, readiness_evidence(), None)
+                .unwrap();
+
+        assert_eq!(readiness.source, ReadinessSource::Live);
+        assert_eq!(readiness.checks, checks);
+        assert_eq!(ReadinessSource::Cache.as_str(), "cache");
+        assert_eq!(
+            NativeReadinessCheckStatus::ManualActionRequired.as_str(),
+            "manual_action_required"
+        );
+        assert_eq!(NativeReadinessCheckStatus::Failed.as_str(), "failed");
+    }
+
+    #[test]
+    fn adapter_readiness_preserves_cached_evidence_source() {
+        let desktop = DesktopBindingRef::new("desktop-cache-source").unwrap();
+        let policy = policy(desktop.clone(), FeatureChoice::Disabled);
+        let readiness = AdapterReadiness::ready(
+            "test",
+            "ready",
+            desktop,
+            policy,
+            readiness_evidence().with_source(ReadinessSource::Cache),
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(readiness.source(), ReadinessSource::Cache);
+        assert_eq!(readiness.evidence().source(), ReadinessSource::Cache);
+    }
+
+    #[test]
+    fn native_readiness_cache_identity_includes_session_and_observation_states() {
+        let granted = readiness_key(
+            "session-a",
+            ReadinessObservationState::Granted,
+            ReadinessObservationState::Unknown,
+        );
+        let other_session = readiness_key(
+            "session-b",
+            ReadinessObservationState::Granted,
+            ReadinessObservationState::Unknown,
+        );
+        let denied_permission = readiness_key(
+            "session-a",
+            ReadinessObservationState::Denied,
+            ReadinessObservationState::Unknown,
+        );
+        let granted_app = readiness_key(
+            "session-a",
+            ReadinessObservationState::Granted,
+            ReadinessObservationState::Granted,
+        );
+
+        assert_ne!(
+            granted.desktop_session_ref,
+            other_session.desktop_session_ref
+        );
+        assert_ne!(
+            granted.os_permission_state,
+            denied_permission.os_permission_state
+        );
+        assert_ne!(granted.app_approval_state, granted_app.app_approval_state);
+    }
+
+    #[test]
+    fn native_readiness_cache_key_matches_only_exact_evidence_identity() {
+        let observed_at = time::OffsetDateTime::UNIX_EPOCH;
+        let key = readiness_key(
+            "match-session",
+            ReadinessObservationState::Granted,
+            ReadinessObservationState::Unknown,
+        );
+        let evidence = key
+            .evidence(
+                "readiness-match",
+                observed_at,
+                observed_at + time::Duration::minutes(5),
+            )
+            .unwrap();
+
+        assert!(key.matches_evidence(&evidence));
+        assert!(
+            !readiness_key(
+                "other-session",
+                ReadinessObservationState::Granted,
+                ReadinessObservationState::Unknown,
+            )
+            .matches_evidence(&evidence)
+        );
+        assert!(
+            !readiness_key(
+                "match-session",
+                ReadinessObservationState::Denied,
+                ReadinessObservationState::Unknown,
+            )
+            .matches_evidence(&evidence)
+        );
+        assert!(
+            !readiness_key(
+                "match-session",
+                ReadinessObservationState::Granted,
+                ReadinessObservationState::Granted,
+            )
+            .matches_evidence(&evidence)
+        );
+    }
+
     fn readiness_evidence() -> ReadinessEvidence {
         let observed_at = time::OffsetDateTime::UNIX_EPOCH;
-        ReadinessEvidence::new(
+        readiness_key(
+            "readiness-evidence-session",
+            ReadinessObservationState::Unknown,
+            ReadinessObservationState::Unknown,
+        )
+        .evidence(
             "readiness-1",
+            observed_at,
+            observed_at + time::Duration::minutes(5),
+        )
+        .unwrap()
+    }
+
+    fn readiness_key(
+        desktop_session_ref: &str,
+        os_permission_state: ReadinessObservationState,
+        app_approval_state: ReadinessObservationState,
+    ) -> ReadinessCacheKey {
+        let desktop = DesktopBindingRef::new("desktop-cache-identity").unwrap();
+        let policy = ExecutionPolicy::new(
+            EffectiveModelRef::new("model-cache-identity").unwrap(),
+            ProviderBindingRef::new("provider-cache-identity").unwrap(),
+            DesktopTarget::new(desktop.clone(), desktop_session_ref),
+            ApprovalPolicy::OnRequest,
+            SandboxPolicy::WorkspaceWrite,
+            TimeoutPolicy::bounded_seconds(120).unwrap(),
+            ExperimentalFeatureChoices::new(FeatureChoice::Enabled, FeatureChoice::Disabled),
+        );
+
+        ReadinessCacheKey::new(
+            "test",
+            desktop,
+            policy,
             "0.144.0",
             "1.0.0",
             None::<String>,
             FINGERPRINT_A,
             FINGERPRINT_B,
-            observed_at,
-            observed_at + time::Duration::minutes(5),
+            os_permission_state,
+            app_approval_state,
         )
         .unwrap()
     }

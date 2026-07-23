@@ -7,7 +7,7 @@ use super::{
 };
 use crate::storage::{LeaseOwner, PrivateUpstreamRef, ProbeRecoverySubject};
 use crate::test_runtime::FakeComputerUseAdapter;
-use crate::{AttachmentUpload, attachment::verify_uploads};
+use crate::{AttachmentUpload, ReadinessObservationState, attachment::verify_uploads};
 use base64::Engine as _;
 use satelle_core::session::{
     ApprovalPolicy, DesktopBindingRef, DesktopTarget, EffectiveModelRef, ExecutionPolicy,
@@ -16,7 +16,7 @@ use satelle_core::session::{
 };
 use satelle_core::{
     ControlPlaneFailureReason, ControlPlaneOperation, ErrorCode, EventType,
-    IncompatibleControlPlaneDetails, LOCAL_DEMO_HOST, SatelleError,
+    IncompatibleControlPlaneDetails, LOCAL_DEMO_HOST, SatelleError, SessionId,
 };
 use satelle_test_contract::assert_privacy_canaries_absent;
 use sha2::Digest as _;
@@ -171,22 +171,53 @@ fn blocked_preflight_opens_authoritative_state_without_admitting_work() {
 }
 
 #[test]
-fn provider_smoke_preflight_event_reports_safe_live_provenance() {
+fn native_readiness_precedes_turn_admission_and_provider_smoke() {
     let state = crate::TestStateDir::new().expect("temporary state directory should exist");
     let runtime = RuntimeHandle::new(Ok(state.path().to_path_buf()), FakeComputerUseAdapter);
+    let mut live_events = runtime
+        .subscribe_live_events()
+        .expect("subscribe before native preflight");
 
-    let outcome = runtime
+    runtime
         .run(RunCommand::attached(
             LOCAL_DEMO_HOST,
             "PRIVATE_PROVIDER_PROVENANCE_CANARY",
         ))
         .expect("fake provider preflight and Turn should succeed");
-    let provider = outcome
-        .events
-        .first()
-        .expect("provider preflight should be the first attached event");
+    let readiness = live_events
+        .try_recv()
+        .expect("native readiness should be the first live event");
 
-    assert_eq!(provider.seq(), 1);
+    assert_eq!(readiness.event_type(), EventType::Readiness);
+    assert_eq!(readiness.data()["status"], "passed");
+    assert_eq!(readiness.data()["source"], "live");
+    let checks = readiness.data()["checks"]
+        .as_array()
+        .expect("readiness event carries structured checks");
+    for kind in ["pointer_click", "pointer_drag"] {
+        let check = checks
+            .iter()
+            .find(|check| check["kind"] == kind)
+            .unwrap_or_else(|| panic!("readiness includes {kind} check"));
+        assert_eq!(check["status"], "passed");
+    }
+    let file_management = checks
+        .iter()
+        .find(|check| check["kind"] == "file_management")
+        .expect("readiness includes the nonblocking file-management check");
+    assert_eq!(file_management["status"], "not_evaluated");
+    assert_eq!(
+        file_management["reason"],
+        "not_required_for_prompt_admission"
+    );
+
+    let turn_started = live_events
+        .try_recv()
+        .expect("Turn admission should follow native readiness");
+    assert_eq!(turn_started.event_type(), EventType::TurnStarted);
+    let provider = live_events
+        .try_recv()
+        .expect("provider smoke should follow Turn admission");
     assert_eq!(provider.event_type(), EventType::ProviderSmoke);
     assert_eq!(provider.data()["status"], "passed");
     assert_eq!(provider.data()["source"], "live");
@@ -194,7 +225,6 @@ fn provider_smoke_preflight_event_reports_safe_live_provenance() {
     assert!(provider.data()["expires_at"].is_string());
     assert!(provider.data()["age_ms"].is_u64());
     assert!(provider.data().get("provider_config_fingerprint").is_none());
-    assert_eq!(outcome.events[1].seq(), 2);
 }
 
 #[test]
@@ -394,6 +424,138 @@ fn native_probe_ordinary_failure_preserves_only_possible_dispatch() {
         assert_eq!(expected_status, status);
         assert_eq!(expected_leases, leases);
     }
+}
+
+#[test]
+fn manual_action_native_failure_is_retained_but_never_reused() {
+    let state = crate::TestStateDir::new().expect("temporary state directory should exist");
+    let adapter = ProviderProbeRecoveryAdapter::with_native_results(
+        [],
+        [
+            NativeProbeBehavior::ManualActionRequired,
+            NativeProbeBehavior::Passed,
+        ],
+    );
+    let runtime = RuntimeHandle::new_with_readiness_probe_driver(
+        Ok(state.path().to_path_buf()),
+        adapter.clone(),
+        adapter.clone(),
+    );
+
+    let failure = runtime
+        .run(RunCommand::attached(
+            LOCAL_DEMO_HOST,
+            "blocked-by-manual-native-action",
+        ))
+        .expect_err("a denied native prerequisite must block admission");
+    assert_eq!(failure.error().code, ErrorCode::ComputerUseNotReady);
+    assert_eq!(
+        failure.error().details["native_readiness"]["status"],
+        "manual_action_required"
+    );
+    assert_eq!(adapter.native_probe_calls.load(Ordering::SeqCst), 1);
+
+    let engine = runtime.engine().expect("runtime engine should be open");
+    let storage = engine.lock_storage().unwrap();
+    let (status, reason): (String, String) = storage
+        .connection_for_test()
+        .query_row(
+            "SELECT status, failure_reason FROM native_readiness_results",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    drop(storage);
+    assert_eq!(status, "failed");
+    assert_eq!(reason, "native_readiness_manual_action_required");
+
+    runtime
+        .run(RunCommand::attached(
+            LOCAL_DEMO_HOST,
+            "retry-after-manual-native-action",
+        ))
+        .expect("a retained failure must not suppress a fresh live probe");
+    assert_eq!(adapter.native_probe_calls.load(Ordering::SeqCst), 2);
+}
+
+#[test]
+fn exact_readiness_reuse_reports_live_then_cache_source() {
+    let state = crate::TestStateDir::new().expect("temporary state directory should exist");
+    let adapter =
+        ProviderProbeRecoveryAdapter::with_native_results([], [NativeProbeBehavior::Passed]);
+    let runtime = RuntimeHandle::new_with_readiness_probe_driver(
+        Ok(state.path().to_path_buf()),
+        adapter.clone(),
+        adapter.clone(),
+    );
+    let mut first_live_events = runtime
+        .subscribe_live_events()
+        .expect("subscribe before the initial native probe");
+
+    runtime
+        .run(RunCommand::attached(
+            LOCAL_DEMO_HOST,
+            "initial-live-native-readiness",
+        ))
+        .expect("the first admission proves native readiness live");
+    let first_readiness = first_live_events
+        .try_recv()
+        .expect("initial readiness is emitted first");
+    assert_eq!(first_readiness.event_type(), EventType::Readiness);
+    assert_eq!(first_readiness.data()["source"], "live");
+
+    let mut cached_live_events = runtime
+        .subscribe_live_events()
+        .expect("subscribe before exact readiness reuse");
+    runtime
+        .run(RunCommand::attached(
+            LOCAL_DEMO_HOST,
+            "reuse-exact-native-readiness",
+        ))
+        .expect("the second admission reuses the exact stored pass");
+    let cached_readiness = cached_live_events
+        .try_recv()
+        .expect("reused readiness is emitted first");
+    assert_eq!(cached_readiness.event_type(), EventType::Readiness);
+    assert_eq!(cached_readiness.data()["source"], "cache");
+    assert_eq!(adapter.native_probe_calls.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn fresh_readiness_replacing_cached_candidate_reports_live_source() {
+    let state = crate::TestStateDir::new().expect("temporary state directory should exist");
+    let adapter =
+        ProviderProbeRecoveryAdapter::with_native_results([], [NativeProbeBehavior::Passed]);
+    let runtime = RuntimeHandle::new_with_readiness_probe_driver(
+        Ok(state.path().to_path_buf()),
+        adapter.clone(),
+        adapter.clone(),
+    );
+
+    runtime
+        .run(RunCommand::attached(
+            LOCAL_DEMO_HOST,
+            "seed-exact-native-readiness-cache",
+        ))
+        .expect("the first live probe seeds an exact reusable pass");
+    adapter.replace_cached_readiness_with_live();
+    let mut live_events = runtime
+        .subscribe_live_events()
+        .expect("subscribe before the cached-candidate admission");
+
+    runtime
+        .run(RunCommand::attached(
+            LOCAL_DEMO_HOST,
+            "replace-cached-native-readiness",
+        ))
+        .expect("fresh readiness after a cached candidate admits the prompt");
+    let readiness = live_events
+        .try_recv()
+        .expect("fresh replacement readiness is emitted first");
+
+    assert_eq!(readiness.event_type(), EventType::Readiness);
+    assert_eq!(readiness.data()["source"], "live");
+    assert_eq!(adapter.cached_replacement_calls.load(Ordering::SeqCst), 1);
 }
 
 #[test]
@@ -1175,11 +1337,14 @@ struct ProviderProbeRecoveryAdapter {
     native_results: Arc<Mutex<VecDeque<NativeProbeBehavior>>>,
     native_probe_calls: Arc<AtomicUsize>,
     provider_dispatch_possible: Arc<AtomicBool>,
+    replace_cached_readiness: Arc<AtomicBool>,
+    cached_replacement_calls: Arc<AtomicUsize>,
 }
 
 #[derive(Clone, Copy)]
 enum NativeProbeBehavior {
     Passed,
+    ManualActionRequired,
     TimedOutConfirmed,
     TimedOutUnknown,
     TimedOutWithoutCancellationDetail,
@@ -1195,6 +1360,8 @@ impl ProviderProbeRecoveryAdapter {
             native_results: Arc::new(Mutex::new(VecDeque::new())),
             native_probe_calls: Arc::new(AtomicUsize::new(0)),
             provider_dispatch_possible: Arc::new(AtomicBool::new(true)),
+            replace_cached_readiness: Arc::new(AtomicBool::new(false)),
+            cached_replacement_calls: Arc::new(AtomicUsize::new(0)),
         }
     }
 
@@ -1227,6 +1394,8 @@ impl ProviderProbeRecoveryAdapter {
             None::<String>,
             "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
             "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            ReadinessObservationState::Unknown,
+            ReadinessObservationState::Unknown,
         )
         .unwrap()
     }
@@ -1247,6 +1416,31 @@ impl ProviderProbeRecoveryAdapter {
             .store(possible, Ordering::SeqCst);
         self
     }
+
+    fn replace_cached_readiness_with_live(&self) {
+        self.replace_cached_readiness.store(true, Ordering::SeqCst);
+    }
+
+    fn adapter_readiness(evidence: ReadinessEvidence) -> AdapterReadiness {
+        let key = Self::key();
+        let now = time::OffsetDateTime::now_utc();
+        let provider_evidence = super::ProviderSmokeEvidence::new(
+            format!("provider-probe-smoke-{}", SessionId::new()),
+            key.provider_config_fingerprint(),
+            now,
+            now + time::Duration::hours(24),
+        )
+        .unwrap();
+        AdapterReadiness::ready(
+            key.adapter(),
+            "provider probe test readiness",
+            key.desktop_binding().clone(),
+            key.execution_policy().clone(),
+            evidence,
+            Some(provider_evidence),
+        )
+        .unwrap()
+    }
 }
 
 impl ComputerUseAdapter for ProviderProbeRecoveryAdapter {
@@ -1264,6 +1458,23 @@ impl ComputerUseAdapter for ProviderProbeRecoveryAdapter {
         _provider_intent: &ProviderComputerUseIntent,
     ) -> Result<Option<ReadinessCacheKey>, SatelleError> {
         Ok(Some(Self::key()))
+    }
+
+    fn preflight_terminal(
+        &self,
+        _host: &str,
+        cached: Option<ReadinessEvidence>,
+        _cached_provider: Option<super::ProviderSmokeResult>,
+        _provider_intent: &ProviderComputerUseIntent,
+    ) -> AdapterPreflight {
+        let evidence = cached.expect("the runtime supplies live or reusable native evidence");
+        if self.replace_cached_readiness.load(Ordering::SeqCst) {
+            self.cached_replacement_calls.fetch_add(1, Ordering::SeqCst);
+            return AdapterPreflight::Ready(Self::adapter_readiness(Self::readiness_with_id(
+                "fresh-live-after-cached-candidate",
+            )));
+        }
+        AdapterPreflight::Ready(Self::adapter_readiness(evidence))
     }
 
     fn execute(&self, request: ExecuteRequest<'_>) -> Result<ExecuteResult, SatelleError> {
@@ -1303,6 +1514,33 @@ impl ReadinessProbeDriver for ProviderProbeRecoveryAdapter {
             .unwrap_or(NativeProbeBehavior::Passed)
         {
             NativeProbeBehavior::Passed => NativeProbeResult::Passed(evidence),
+            NativeProbeBehavior::ManualActionRequired => {
+                let mut error = SatelleError::computer_use_not_ready();
+                error.details.insert(
+                    "reason".to_string(),
+                    serde_json::Value::String(
+                        "native_readiness_manual_action_required".to_string(),
+                    ),
+                );
+                error.details.insert(
+                    "native_readiness".to_string(),
+                    serde_json::json!({
+                        "source": "live",
+                        "status": "manual_action_required",
+                        "checks": [{
+                            "kind": "os_permissions",
+                            "status": "manual_action_required",
+                            "reason": "observation_denied"
+                        }],
+                    }),
+                );
+                NativeProbeResult::Failed {
+                    evidence,
+                    reason: "native_readiness_manual_action_required",
+                    error,
+                    dispatch_possible: false,
+                }
+            }
             behavior => {
                 let dispatch_possible = matches!(
                     behavior,
@@ -1326,7 +1564,9 @@ impl ReadinessProbeDriver for ProviderProbeRecoveryAdapter {
                     NativeProbeBehavior::TimedOutWithoutCancellationDetail => None,
                     NativeProbeBehavior::FailedBeforeDispatch
                     | NativeProbeBehavior::FailedAfterDispatch => None,
-                    NativeProbeBehavior::Passed => unreachable!(),
+                    NativeProbeBehavior::Passed | NativeProbeBehavior::ManualActionRequired => {
+                        unreachable!()
+                    }
                 };
                 if let Some(cancellation) = cancellation {
                     error.details.insert(
