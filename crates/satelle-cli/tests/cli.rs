@@ -4990,7 +4990,7 @@ native_readiness = 120
     );
     assert_eq!(
         error["details"]["supported_units"],
-        serde_json::json!(["ms", "s", "m"])
+        serde_json::json!(["ms", "s", "m", "h"])
     );
 
     fs::write(
@@ -5021,7 +5021,7 @@ provider_timeout = "120s"
     assert_eq!(error["details"]["key"], "provider_timeout");
     assert_eq!(
         error["details"]["accepted_keys"],
-        serde_json::json!(["native_readiness", "provider_smoke_test"])
+        serde_json::json!(["native_readiness", "provider_smoke_test", "turn_execution"])
     );
 }
 
