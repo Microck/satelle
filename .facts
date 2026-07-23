@@ -459,13 +459,13 @@
 - satelle setup uses a privileged system service only when the requested host mode requires it and the setup plan states the privilege, service account, and desktop-session implications before mutation @spec @mvp @implemented
 - satelle MVP binds each concrete host alias to one Satelle Desktop Binding instead of selecting a desktop user per run @spec @mvp @implemented
 - before first trust, a user-level Host Binding may set expected_host_id = null so setup can discover but not silently pre-trust the reachable Host Identity @spec @mvp @implemented
-- satelle setup defaults the Satelle Desktop Binding to the authenticated bootstrap OS account when that account has a compatible active desktop session @spec @mvp
-- satelle setup supports setup-time desktop binding selection through an interactive prompt or user-level host configuration when multiple candidate desktop users are visible @spec @mvp
-- satelle setup with --no-input reports a typed desktop-binding-required diagnostic when multiple candidate desktop users are visible and no desktop_user binding is configured @spec @mvp
-- satelle setup reports a typed desktop-session-unavailable diagnostic when the bound desktop_user does not have a compatible active desktop session for native Computer Use @spec @mvp
-- satelle setup automatically selects the bound desktop_user's active Satelle Desktop Session only when exactly one compatible session is visible @spec @mvp
-- satelle setup prompts for a Satelle Desktop Session Preference when multiple compatible sessions are visible and stdin is interactive @spec @mvp
-- satelle setup with --no-input reports a typed desktop-session-ambiguous diagnostic when multiple compatible sessions are visible and no desktop_session_preference is configured @spec @mvp
+- satelle setup defaults the Satelle Desktop Binding to the authenticated bootstrap OS account when that account has a compatible active desktop session @mvp @implemented
+- satelle setup supports setup-time desktop binding selection through an interactive prompt or user-level host configuration when multiple candidate desktop users are visible @mvp @implemented
+- satelle setup with --no-input reports a typed desktop-binding-required diagnostic when multiple candidate desktop users are visible and no desktop_user binding is configured @mvp @implemented
+- satelle setup reports a typed desktop-session-unavailable diagnostic when the bound desktop_user does not have a compatible active desktop session for native Computer Use @mvp @implemented
+- satelle setup automatically selects the bound desktop_user's active Satelle Desktop Session only when exactly one compatible session is visible @mvp @implemented
+- satelle setup prompts for a Satelle Desktop Session Preference when multiple compatible sessions are visible and stdin is interactive @mvp @implemented
+- satelle setup with --no-input reports a typed desktop-session-ambiguous diagnostic when multiple compatible sessions are visible and no desktop_session_preference is configured @mvp @implemented
 - label: satelle run and steer report a typed desktop-session-ambiguous diagnostic instead of picking a session when multiple compatible sessions match the bound desktop_user and no configured preference resolves to exactly one session
   command: cargo test --locked -p satelle-core --lib desktop_selection_tests::automatic_and_only_selection_never_hide_ambiguity -- --exact && cargo test --locked -p satelle-cli --features test-support --test cli run_and_steer_fail_before_admission_when_desktop_selection_is_invalid -- --exact
   tags: [spec, mvp, implemented]
@@ -496,7 +496,7 @@
 - label: satelle reports a typed desktop-session-native-selector-unmatched diagnostic when a Satelle Native Desktop Session Selector does not resolve to exactly one active compatible session
   command: cargo test --locked -p satelle-core --lib desktop_selection_tests -- --test-threads=1
   tags: [spec, mvp, implemented]
-- satelle Host Daemon refuses native Computer Use sessions for desktop sessions that do not match its configured Satelle Desktop Binding @spec @mvp
+- satelle Host Daemon refuses native Computer Use sessions for desktop sessions that do not match its configured Satelle Desktop Binding @mvp @implemented
 - label: satelle MVP supports multiple users on one physical machine only through separate per-user Host Daemon installations, Host Identities, Host Aliases, and Desktop Bindings running under their respective OS accounts
   command: cargo test --locked -p satelle-cli --features test-support --test cli user_host_config_accepts_desktop_binding_and_daemon_path_fields -- --exact && cargo test --locked -p satelle-transport --lib contract::session::tests::mvp_turn_requests_cannot_route_across_desktop_bindings -- --exact
   tags: [spec, mvp, implemented]

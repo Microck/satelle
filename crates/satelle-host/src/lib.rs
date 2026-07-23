@@ -1116,15 +1116,18 @@ impl HostService {
             .provider_smoke_failure_cache_ttl
             .as_ref()
             .map_or(DEFAULT_PROVIDER_SMOKE_FAILURE_TTL, duration_to_time);
-        let adapter = ProductionComputerUseAdapter::with_readiness_policy(
-            Arc::clone(&snapshot),
-            working_directory,
-            timeout,
-            ttl,
+        let policy = runtime::ProductionAdapterPolicy {
+            native_readiness_timeout: timeout,
+            native_readiness_ttl: ttl,
             provider_smoke_timeout,
             provider_smoke_success_ttl,
             provider_smoke_failure_ttl,
-            satelle_core::DesktopSelectionPolicy::from_host_config(config),
+            desktop_selection: satelle_core::DesktopSelectionPolicy::from_host_config(config),
+        };
+        let adapter = ProductionComputerUseAdapter::with_readiness_policy(
+            Arc::clone(&snapshot),
+            working_directory,
+            policy,
         );
         Self {
             runtime: RuntimeHandle::new_production(state_root, operator_log_root, adapter),
@@ -1512,7 +1515,7 @@ impl HostService {
                 crate::codex_capabilities::HostPlatform::current().as_str()
             }
             #[cfg(any(test, feature = "test-support"))]
-            HostMode::TestFake => "local-demo",
+            HostMode::TestFake { .. } => "local-demo",
         };
         let bootstrap_actions = if no_bootstrap {
             Vec::new()
@@ -1522,7 +1525,7 @@ impl HostService {
         Ok(HostSessionsReport {
             schema_version: HostSessionsSchemaVersion::V1,
             host: host.to_string(),
-            platform: platform.to_string(),
+            detected_platform: platform.to_string(),
             connection_mode: "direct".to_string(),
             bootstrapped: false,
             bootstrap_actions,

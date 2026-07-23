@@ -89,6 +89,15 @@ pub(crate) struct ProductionComputerUseAdapter {
     desktop_selection: DesktopSelectionPolicy,
 }
 
+pub(crate) struct ProductionAdapterPolicy {
+    pub(crate) native_readiness_timeout: Duration,
+    pub(crate) native_readiness_ttl: time::Duration,
+    pub(crate) provider_smoke_timeout: Duration,
+    pub(crate) provider_smoke_success_ttl: time::Duration,
+    pub(crate) provider_smoke_failure_ttl: time::Duration,
+    pub(crate) desktop_selection: DesktopSelectionPolicy,
+}
+
 #[derive(Clone)]
 struct ActiveCodexExecution {
     session_id: satelle_core::SessionId,
@@ -141,23 +150,18 @@ impl ProductionComputerUseAdapter {
     pub(crate) fn with_readiness_policy(
         snapshot: Arc<RwLock<crate::ProductionCapabilitySnapshot>>,
         working_directory: Result<PathBuf, SatelleError>,
-        timeout: Duration,
-        ttl: time::Duration,
-        provider_smoke_timeout: Duration,
-        provider_smoke_success_ttl: time::Duration,
-        provider_smoke_failure_ttl: time::Duration,
-        desktop_selection: DesktopSelectionPolicy,
+        policy: ProductionAdapterPolicy,
     ) -> Self {
         Self {
             snapshot,
             working_directory,
             active_execution: Arc::new(Mutex::new(None)),
-            native_readiness_timeout: timeout,
-            native_readiness_ttl: ttl,
-            provider_smoke_timeout,
-            provider_smoke_success_ttl,
-            provider_smoke_failure_ttl,
-            desktop_selection,
+            native_readiness_timeout: policy.native_readiness_timeout,
+            native_readiness_ttl: policy.native_readiness_ttl,
+            provider_smoke_timeout: policy.provider_smoke_timeout,
+            provider_smoke_success_ttl: policy.provider_smoke_success_ttl,
+            provider_smoke_failure_ttl: policy.provider_smoke_failure_ttl,
+            desktop_selection: policy.desktop_selection,
         }
     }
 
@@ -527,7 +531,7 @@ impl ProductionComputerUseAdapter {
         .map_err(|_| adapter_failure("provider_smoke_evidence_invalid"))
     }
 
-    fn ensure_platform_admitted(&self) -> Result<DesktopBindingRef, SatelleError> {
+    fn resolve_configured_desktop_binding(&self) -> Result<DesktopBindingRef, SatelleError> {
         self.native_readiness_key(&ProviderComputerUseIntent::host_default())
             .map(|key| key.desktop_binding().clone())
     }
@@ -1130,80 +1134,87 @@ impl ComputerUseAdapter for ProductionComputerUseAdapter {
     }
 
     fn execute(&self, request: ExecuteRequest<'_>) -> Result<ExecuteResult, SatelleError> {
-        let admitted_desktop_binding = self.ensure_platform_admitted()?;
         let policy = request.execution_policy();
-        ensure_execution_desktop_binding(&admitted_desktop_binding, policy)?;
-        let approval_policy = codex_approval_policy(policy.approval_policy())?;
-        let sandbox_policy = codex_sandbox_policy(policy.sandbox_policy());
-        let timeout = Duration::from_secs(u64::from(policy.timeout_policy().seconds()));
-        let deadline = Instant::now()
-            .checked_add(timeout)
-            .ok_or_else(|| adapter_failure("timeout_unrepresentable"))?;
-        let cancellation_deadline = deadline
-            .checked_add(READINESS_CANCELLATION_GRACE)
-            .unwrap_or(deadline);
-        let working_directory = self
-            .working_directory
-            .as_ref()
-            .map_err(Clone::clone)
-            .and_then(|path| prepare_working_directory(path))?;
-        let control = CodexSessionControl::new(cancellation_deadline);
-        let _active_execution = self.register_execution(request.subject(), control.clone())?;
-        tracing::debug!(
-            session_id = %request.subject().session_id(),
-            turn_id = %request.subject().turn_id(),
-            "starting Codex native Computer Use execution"
-        );
+        dispatch_with_configured_desktop_binding(
+            policy,
+            || self.resolve_configured_desktop_binding(),
+            || {
+                let approval_policy = codex_approval_policy(policy.approval_policy())?;
+                let sandbox_policy = codex_sandbox_policy(policy.sandbox_policy());
+                let timeout = Duration::from_secs(u64::from(policy.timeout_policy().seconds()));
+                let deadline = Instant::now()
+                    .checked_add(timeout)
+                    .ok_or_else(|| adapter_failure("timeout_unrepresentable"))?;
+                let cancellation_deadline = deadline
+                    .checked_add(READINESS_CANCELLATION_GRACE)
+                    .unwrap_or(deadline);
+                let working_directory = self
+                    .working_directory
+                    .as_ref()
+                    .map_err(Clone::clone)
+                    .and_then(|path| prepare_working_directory(path))?;
+                let control = CodexSessionControl::new(cancellation_deadline);
+                let _active_execution =
+                    self.register_execution(request.subject(), control.clone())?;
+                tracing::debug!(
+                    session_id = %request.subject().session_id(),
+                    turn_id = %request.subject().turn_id(),
+                    "starting Codex native Computer Use execution"
+                );
 
-        // Preserve the original storage failure outside the protocol layer so
-        // a private-reference conflict is not misclassified as transport I/O.
-        let persistence_error = RefCell::new(None);
-        let mut persist_thread_ref = |value: &str| {
-            request.persist_upstream_thread_ref(value).map_err(|error| {
-                *persistence_error.borrow_mut() = Some(error);
-            })
-        };
-        let mut persist_turn_ref = |value: &str| {
-            request.persist_upstream_turn_ref(value).map_err(|error| {
-                *persistence_error.borrow_mut() = Some(error);
-            })
-        };
-        let snapshot = crate::read_production_snapshot(&self.snapshot)?;
-        let goal_set_supported = snapshot.goal_set_supported();
-        let image_input_mode = snapshot.image_input_mode();
-        if !request.attachments().is_empty()
-            && matches!(
-                image_input_mode,
-                crate::codex_capabilities::CodexImageInputMode::Unsupported
-            )
-        {
-            return Err(SatelleError::invalid_usage(
-                "the selected Codex protocol does not support image input",
-            ));
-        }
-        let run = run_codex_session_with_timeout_cancellation(
-            preserve_managed_codex_error(crate::codex_capabilities::installed_app_server_command())?,
-            CodexSessionRequest {
-                working_directory: &working_directory,
-                prompt: request.prompt(),
-                existing_thread_ref: request.upstream_thread_ref(),
-                model: model_override(policy.effective_model().as_str()),
-                model_provider: provider_override(policy.provider_binding().as_str()),
-                execution_mode: request.execution_mode(),
-                approval_policy,
-                sandbox_policy,
-                deadline,
-                persist_thread_ref: &mut persist_thread_ref,
-                persist_turn_ref: &mut persist_turn_ref,
-                control: Some(control),
-                goal_set_supported,
-                image_input_mode,
-                attachments: request.attachments(),
+                // Preserve the original storage failure outside the protocol layer so
+                // a private-reference conflict is not misclassified as transport I/O.
+                let persistence_error = RefCell::new(None);
+                let mut persist_thread_ref = |value: &str| {
+                    request.persist_upstream_thread_ref(value).map_err(|error| {
+                        *persistence_error.borrow_mut() = Some(error);
+                    })
+                };
+                let mut persist_turn_ref = |value: &str| {
+                    request.persist_upstream_turn_ref(value).map_err(|error| {
+                        *persistence_error.borrow_mut() = Some(error);
+                    })
+                };
+                let snapshot = crate::read_production_snapshot(&self.snapshot)?;
+                let goal_set_supported = snapshot.goal_set_supported();
+                let image_input_mode = snapshot.image_input_mode();
+                if !request.attachments().is_empty()
+                    && matches!(
+                        image_input_mode,
+                        crate::codex_capabilities::CodexImageInputMode::Unsupported
+                    )
+                {
+                    return Err(SatelleError::invalid_usage(
+                        "the selected Codex protocol does not support image input",
+                    ));
+                }
+                let run = run_codex_session_with_timeout_cancellation(
+                    preserve_managed_codex_error(
+                        crate::codex_capabilities::installed_app_server_command(),
+                    )?,
+                    CodexSessionRequest {
+                        working_directory: &working_directory,
+                        prompt: request.prompt(),
+                        existing_thread_ref: request.upstream_thread_ref(),
+                        model: model_override(policy.effective_model().as_str()),
+                        model_provider: provider_override(policy.provider_binding().as_str()),
+                        execution_mode: request.execution_mode(),
+                        approval_policy,
+                        sandbox_policy,
+                        deadline,
+                        persist_thread_ref: &mut persist_thread_ref,
+                        persist_turn_ref: &mut persist_turn_ref,
+                        control: Some(control),
+                        goal_set_supported,
+                        image_input_mode,
+                        attachments: request.attachments(),
+                    },
+                    READINESS_CANCELLATION_GRACE,
+                    None,
+                );
+                finish_timed_turn_execution(run, persistence_error.into_inner())
             },
-            READINESS_CANCELLATION_GRACE,
-            None,
-        );
-        finish_timed_turn_execution(run, persistence_error.into_inner())
+        )
     }
 
     fn observe_stop(&self, subject: AdapterSubject<'_>) -> Result<StopObservation, SatelleError> {
@@ -1435,16 +1446,18 @@ fn codex_sandbox_policy(policy: SandboxPolicy) -> CodexSandboxPolicy {
     }
 }
 
-fn ensure_execution_desktop_binding(
-    admitted: &DesktopBindingRef,
+fn dispatch_with_configured_desktop_binding<T>(
     policy: &ExecutionPolicy,
-) -> Result<(), SatelleError> {
-    if policy.desktop_target().binding() != admitted {
+    resolve_configured: impl FnOnce() -> Result<DesktopBindingRef, SatelleError>,
+    dispatch: impl FnOnce() -> Result<T, SatelleError>,
+) -> Result<T, SatelleError> {
+    let configured = resolve_configured()?;
+    if policy.desktop_target().binding() != &configured {
         return Err(SatelleError::desktop_session_unavailable(Some(
             policy.desktop_target().binding().as_str(),
         )));
     }
-    Ok(())
+    dispatch()
 }
 
 fn terminal_result(
@@ -1588,17 +1601,24 @@ mod tests {
     }
 
     #[test]
-    fn execution_is_rejected_outside_the_admitted_desktop_binding() {
-        let admitted = DesktopBindingRef::new("operator").unwrap();
-        assert!(
-            ensure_execution_desktop_binding(&admitted, &execution_policy_for("operator")).is_ok()
-        );
+    fn configured_desktop_mismatch_is_rejected_before_codex_dispatch() {
+        let dispatch_attempted = std::cell::Cell::new(false);
+        let error = dispatch_with_configured_desktop_binding(
+            &execution_policy_for("admitted-desktop"),
+            || Ok(DesktopBindingRef::new("configured-desktop").unwrap()),
+            || {
+                dispatch_attempted.set(true);
+                Ok(())
+            },
+        )
+        .expect_err("a changed Desktop Binding must block Codex dispatch");
 
-        let error =
-            ensure_execution_desktop_binding(&admitted, &execution_policy_for("someone-else"))
-                .expect_err("execution cannot escape its admitted Desktop Binding");
         assert_eq!(error.code, ErrorCode::DesktopSessionUnavailable);
-        assert_eq!(error.details["desktop_user"], "someone-else");
+        assert_eq!(error.details["desktop_user"], "admitted-desktop");
+        assert!(
+            !dispatch_attempted.get(),
+            "Desktop Binding enforcement must run before Codex dispatch"
+        );
     }
 
     #[test]

@@ -5050,7 +5050,6 @@ fn host_sessions_lists_local_demo_metadata_only() {
 
     assert_eq!(report["schema_version"], "satelle.host.sessions.v1");
     assert_eq!(report["host"], "local-demo");
-    assert_eq!(report["platform"], "local-demo");
     assert_eq!(report["connection_mode"], "direct");
     assert_eq!(report["bootstrapped"], false);
     assert_eq!(report["bootstrap_actions"], serde_json::json!([]));
@@ -5098,6 +5097,116 @@ fn host_sessions_lists_local_demo_metadata_only() {
         .stdout(predicate::str::contains(
             "Native selectors: local-demo:console:active",
         ));
+}
+
+#[test]
+fn setup_persists_the_deterministic_desktop_binding_atomically() {
+    let state = state_dir();
+    let user_config = state.path().join("desktop-setup-config.toml");
+    write_user_config(
+        &user_config,
+        r#"
+default_host = "local-demo"
+
+[hosts.local-demo]
+transport = "local"
+adapter = "fake"
+"#,
+    )
+    .expect("write desktop setup user config");
+
+    let output = satelle()
+        .env("SATELLE_CONFIG_FILE", &user_config)
+        .env("SATELLE_STATE_DIR", state.path())
+        .args([
+            "setup",
+            "--host",
+            "local-demo",
+            "--component",
+            "desktop",
+            "--no-input",
+            "--yes",
+            "--json",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .clone();
+    let report = parse_json_output(&output.stdout);
+    assert!(
+        report["planned_actions"]
+            .as_array()
+            .expect("planned actions")
+            .iter()
+            .any(|action| action
+                .as_str()
+                .is_some_and(|action| action.contains("desktop_user")))
+    );
+    assert!(
+        report["applied_actions"]
+            .as_array()
+            .expect("applied actions")
+            .iter()
+            .any(|action| action
+                .as_str()
+                .is_some_and(|action| action.contains("desktop_user")))
+    );
+
+    let persisted = fs::read_to_string(&user_config).expect("read persisted user config");
+    let persisted =
+        toml::from_str::<toml::Value>(&persisted).expect("persisted user config should parse");
+    assert_eq!(
+        persisted["hosts"]["local-demo"]["desktop_user"].as_str(),
+        Some("local-demo-user")
+    );
+    assert_eq!(
+        persisted["hosts"]["local-demo"]["desktop_session_preference"].as_str(),
+        Some("only")
+    );
+}
+
+#[test]
+fn setup_unavailable_desktop_binding_preserves_user_config() {
+    let state = state_dir();
+    let user_config = state.path().join("desktop-unavailable-config.toml");
+    write_user_config(
+        &user_config,
+        r#"
+default_host = "local-demo"
+
+[hosts.local-demo]
+transport = "local"
+adapter = "fake"
+desktop_user = "missing-user"
+"#,
+    )
+    .expect("write unavailable desktop user config");
+    let before = fs::read(&user_config).expect("read original user config");
+
+    let output = satelle()
+        .env("SATELLE_CONFIG_FILE", &user_config)
+        .env("SATELLE_STATE_DIR", state.path())
+        .args([
+            "setup",
+            "--host",
+            "local-demo",
+            "--component",
+            "desktop",
+            "--no-input",
+            "--yes",
+            "--json",
+        ])
+        .assert()
+        .failure()
+        .get_output()
+        .clone();
+    let error = parse_json_output(&output.stderr);
+    assert_eq!(error["code"], "desktop-session-unavailable");
+    assert_eq!(error["details"]["desktop_user"], "missing-user");
+    assert_eq!(
+        fs::read(&user_config).expect("read unchanged user config"),
+        before
+    );
 }
 
 #[test]

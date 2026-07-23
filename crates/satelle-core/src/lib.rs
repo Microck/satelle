@@ -4234,7 +4234,7 @@ mod desktop_selection_tests {
         HostSessionsReport {
             schema_version: HostSessionsSchemaVersion::V1,
             host: "desktop-test".to_string(),
-            platform: "windows".to_string(),
+            detected_platform: "windows".to_string(),
             connection_mode: "direct".to_string(),
             bootstrapped: false,
             bootstrap_actions: Vec::new(),
@@ -4812,7 +4812,8 @@ pub enum HostSessionsSchemaVersion {
 pub struct HostSessionsReport {
     pub schema_version: HostSessionsSchemaVersion,
     pub host: String,
-    pub platform: String,
+    #[serde(skip)]
+    pub detected_platform: String,
     pub connection_mode: String,
     pub bootstrapped: bool,
     pub bootstrap_actions: Vec<String>,
@@ -4838,7 +4839,7 @@ pub fn resolve_desktop_session<'a>(
     report: &'a HostSessionsReport,
     policy: &DesktopSelectionPolicy,
 ) -> Result<&'a DesktopSessionRecord, SatelleError> {
-    resolve_desktop_session_for(&report.platform, &report.sessions, policy)
+    resolve_desktop_session_for(&report.detected_platform, &report.sessions, policy)
 }
 
 pub fn resolve_desktop_session_for<'a>(

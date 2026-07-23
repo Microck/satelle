@@ -24,7 +24,7 @@ pub use adapter::{
     ReadinessEvidence, RecoveryObservation,
 };
 pub(crate) use adapter::{NativeProbeResult, ReadinessProbeDriver};
-pub(crate) use codex_adapter::ProductionComputerUseAdapter;
+pub(crate) use codex_adapter::{ProductionAdapterPolicy, ProductionComputerUseAdapter};
 pub use request::AdmissionCancellation;
 pub(crate) use request::{
     AdmissionCancellationState, RequestIdentity, RunCommand, SteerCommand, StopCommand,

@@ -1760,6 +1760,7 @@ printf 'removed=%s\nretained=%s\n' "$removed" "$retained""#,
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) struct RemoteUserDirectories {
     target: RemoteTarget,
+    authenticated_user: String,
     home: String,
     local_app_data: Option<String>,
     roaming_app_data: Option<String>,
@@ -3022,12 +3023,12 @@ impl RemoteUserDirectories {
         target: RemoteTarget,
     ) -> Result<Self, SshBootstrapError> {
         let output = if target.is_windows() {
-            let script = "$ErrorActionPreference = 'Stop'; [Console]::Out.WriteLine('satelle-user-dirs-v1'); [Console]::Out.WriteLine('HOME=' + $env:USERPROFILE); [Console]::Out.WriteLine('LOCALAPPDATA=' + $env:LOCALAPPDATA); [Console]::Out.WriteLine('APPDATA=' + $env:APPDATA)";
+            let script = "$ErrorActionPreference = 'Stop'; [Console]::Out.WriteLine('satelle-user-dirs-v2'); [Console]::Out.WriteLine('USER=' + $env:USERNAME); [Console]::Out.WriteLine('HOME=' + $env:USERPROFILE); [Console]::Out.WriteLine('LOCALAPPDATA=' + $env:LOCALAPPDATA); [Console]::Out.WriteLine('APPDATA=' + $env:APPDATA)";
             run_ssh_command(destination, &powershell_encoded_command(script))?
         } else {
             run_ssh_command(
                 destination,
-                "sh -c 'printf \"satelle-user-dirs-v1\\nHOME=%s\\nXDG_CONFIG_HOME=%s\\nXDG_CACHE_HOME=%s\\nXDG_STATE_HOME=%s\\n\" \"$HOME\" \"${XDG_CONFIG_HOME:-}\" \"${XDG_CACHE_HOME:-}\" \"${XDG_STATE_HOME:-}\"'",
+                "sh -c 'user=$(id -un) || exit 1; printf \"satelle-user-dirs-v2\\nUSER=%s\\nHOME=%s\\nXDG_CONFIG_HOME=%s\\nXDG_CACHE_HOME=%s\\nXDG_STATE_HOME=%s\\n\" \"$user\" \"$HOME\" \"${XDG_CONFIG_HOME:-}\" \"${XDG_CACHE_HOME:-}\" \"${XDG_STATE_HOME:-}\"'",
             )?
         };
         if !output.status.success() {
@@ -3040,6 +3041,7 @@ impl RemoteUserDirectories {
         match target.service_platform() {
             satelle_core::daemon_service::DaemonServicePlatform::Windows => Self {
                 target,
+                authenticated_user: "operator".to_string(),
                 home: r"C:\Users\operator".to_string(),
                 local_app_data: Some(r"C:\Users\operator\AppData\Local".to_string()),
                 roaming_app_data: Some(r"C:\Users\operator\AppData\Roaming".to_string()),
@@ -3049,6 +3051,7 @@ impl RemoteUserDirectories {
             },
             satelle_core::daemon_service::DaemonServicePlatform::Macos => Self {
                 target,
+                authenticated_user: "operator".to_string(),
                 home: "/Users/operator".to_string(),
                 local_app_data: None,
                 roaming_app_data: None,
@@ -3058,6 +3061,7 @@ impl RemoteUserDirectories {
             },
             satelle_core::daemon_service::DaemonServicePlatform::Linux => Self {
                 target,
+                authenticated_user: "operator".to_string(),
                 home: "/home/operator".to_string(),
                 local_app_data: None,
                 roaming_app_data: None,
@@ -3066,6 +3070,10 @@ impl RemoteUserDirectories {
                 xdg_state_home: None,
             },
         }
+    }
+
+    pub(super) fn authenticated_user(&self) -> &str {
+        &self.authenticated_user
     }
 
     pub(super) fn resolved_path_set(&self) -> satelle_core::daemon_service::DaemonResolvedPathSet {
@@ -3151,13 +3159,15 @@ impl RemoteUserDirectories {
     fn parse(target: RemoteTarget, output: &[u8]) -> Result<Self, SshBootstrapError> {
         let text = std::str::from_utf8(output).map_err(|_| SshBootstrapError::InvalidProbe)?;
         let mut lines = text.lines().map(str::trim_end);
-        if lines.next() != Some("satelle-user-dirs-v1") {
+        if lines.next() != Some("satelle-user-dirs-v2") {
             return Err(SshBootstrapError::InvalidProbe);
         }
+        let authenticated_user = required_probe_text(lines.next(), "USER=")?;
         let home = required_directory(target, lines.next(), "HOME=")?;
         let directories = if target.is_windows() {
             Self {
                 target,
+                authenticated_user,
                 home,
                 local_app_data: Some(required_directory(target, lines.next(), "LOCALAPPDATA=")?),
                 roaming_app_data: Some(required_directory(target, lines.next(), "APPDATA=")?),
@@ -3168,6 +3178,7 @@ impl RemoteUserDirectories {
         } else {
             Self {
                 target,
+                authenticated_user,
                 home,
                 local_app_data: None,
                 roaming_app_data: None,
@@ -3180,6 +3191,47 @@ impl RemoteUserDirectories {
             return Err(SshBootstrapError::InvalidProbe);
         }
         Ok(directories)
+    }
+}
+
+fn required_probe_text(line: Option<&str>, prefix: &str) -> Result<String, SshBootstrapError> {
+    let value = line
+        .and_then(|line| line.strip_prefix(prefix))
+        .ok_or(SshBootstrapError::InvalidProbe)?;
+    if value.is_empty() || value.chars().any(char::is_control) {
+        return Err(SshBootstrapError::InvalidProbe);
+    }
+    Ok(value.to_string())
+}
+
+#[cfg(test)]
+mod remote_user_directories_tests {
+    use super::*;
+
+    #[test]
+    fn authenticated_probe_user_is_independent_of_ssh_destination_text() {
+        let directories = RemoteUserDirectories::parse(
+            RemoteTarget::LinuxX64Gnu,
+            b"satelle-user-dirs-v2\nUSER=alias-resolved-user\nHOME=/home/alias-resolved-user\nXDG_CONFIG_HOME=\nXDG_CACHE_HOME=\nXDG_STATE_HOME=\n",
+        )
+        .expect("authenticated SSH probe output should parse");
+
+        assert_eq!(directories.authenticated_user(), "alias-resolved-user");
+    }
+
+    #[test]
+    fn authenticated_probe_rejects_the_old_or_missing_user_contract() {
+        for output in [
+            b"satelle-user-dirs-v1\nHOME=/home/operator\nXDG_CONFIG_HOME=\nXDG_CACHE_HOME=\nXDG_STATE_HOME=\n"
+                .as_slice(),
+            b"satelle-user-dirs-v2\nUSER=\nHOME=/home/operator\nXDG_CONFIG_HOME=\nXDG_CACHE_HOME=\nXDG_STATE_HOME=\n"
+                .as_slice(),
+        ] {
+            assert!(matches!(
+                RemoteUserDirectories::parse(RemoteTarget::LinuxX64Gnu, output),
+                Err(SshBootstrapError::InvalidProbe)
+            ));
+        }
     }
 }
 
@@ -4551,6 +4603,7 @@ mod tests {
     fn persistent_service_path_override_observation_is_owner_only_and_canonical() {
         let windows_directories = RemoteUserDirectories {
             target: RemoteTarget::WindowsX64Msvc,
+            authenticated_user: "operator".to_string(),
             home: r"C:\Users\operator".to_string(),
             local_app_data: Some(r"C:\Users\operator\AppData\Local".to_string()),
             roaming_app_data: Some(r"C:\Users\operator\AppData\Roaming".to_string()),
@@ -4577,6 +4630,7 @@ mod tests {
 
         let macos_directories = RemoteUserDirectories {
             target: RemoteTarget::DarwinArm64,
+            authenticated_user: "operator".to_string(),
             home: "/Users/operator".to_string(),
             local_app_data: None,
             roaming_app_data: None,

@@ -197,7 +197,6 @@ fn readiness_reports_use_their_canonical_v1_schema_tokens() {
                 "connection_mode",
                 "host",
                 "host_daemon_version",
-                "platform",
                 "schema_version",
                 "sessions",
             ][..],

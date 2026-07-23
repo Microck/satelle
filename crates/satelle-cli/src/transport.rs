@@ -20,6 +20,7 @@ use satelle_transport::{
     ApiError, ApiErrorCode, DaemonClient, DaemonClientError, DaemonEventClient, DaemonEventError,
     TurnRequest,
 };
+use std::collections::BTreeSet;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -3213,7 +3214,7 @@ impl TransportClient for DirectTransport {
         Ok(HostSessionsReport {
             schema_version: HostSessionsSchemaVersion::V1,
             host: self.alias.clone(),
-            platform: capabilities.platform().to_string(),
+            detected_platform: capabilities.platform().to_string(),
             connection_mode: self.mode.to_string(),
             bootstrapped: false,
             bootstrap_actions: Vec::new(),
@@ -3813,25 +3814,23 @@ fn setup_bootstrap_client(
     Ok((client, tunnel, bootstrap, handoff_token))
 }
 
-fn complete_discovered_bootstrap_handoff(
+fn discovered_bootstrap_client(
     alias: &str,
     tunnel_addr: std::net::SocketAddr,
     bootstrap_token: ApiBearerToken,
     discovered_host_identity: &str,
-    bootstrap_lock: &mut ssh_bootstrap::SshBootstrapLock,
-) -> Result<(), SatelleError> {
+) -> Result<DaemonClient, SatelleError> {
     // Identity discovery intentionally starts with a false probe pin. Rebuild
     // the client with the authenticated identity learned from that mismatch;
     // reusing the probe client would make the maintenance response fail its
     // Host identity contract.
-    let handoff_client = DaemonClient::loopback_with_timeout(
+    DaemonClient::loopback_with_timeout(
         tunnel_addr,
         bootstrap_token,
         discovered_host_identity,
         SSH_DAEMON_REQUEST_TIMEOUT,
     )
-    .map_err(|error| direct_transport_error(alias, error))?;
-    complete_bootstrap_handoff(alias, &handoff_client, bootstrap_lock)
+    .map_err(|error| direct_transport_error(alias, error))
 }
 
 fn direct_event_error(host: &str, error: DaemonEventError) -> SatelleError {
@@ -3958,6 +3957,18 @@ fn map_api_error(host: &str, error: &ApiError) -> SatelleError {
     if error.code() == ApiErrorCode::StopNotConfirmed {
         return map_stop_not_confirmed_api_error(host, error);
     }
+    if matches!(
+        error.code(),
+        ApiErrorCode::DesktopBindingRequired
+            | ApiErrorCode::DesktopSessionUnavailable
+            | ApiErrorCode::DesktopSessionAmbiguous
+            | ApiErrorCode::DesktopSessionPreferenceUnmatched
+            | ApiErrorCode::DesktopSessionConsoleUnavailable
+            | ApiErrorCode::DesktopSessionNativeSelectorWrongPlatform
+            | ApiErrorCode::DesktopSessionNativeSelectorUnmatched
+    ) {
+        return map_desktop_selection_api_error(host, error);
+    }
     if error.code() != ApiErrorCode::LogsCursorExpired {
         return api_code_error(host, error.code());
     }
@@ -3988,6 +3999,121 @@ fn map_api_error(host: &str, error: &ApiError) -> SatelleError {
         earliest_available_cursor.map(|cursor| cursor.to_string()),
         resume_cursor.to_string(),
     )
+}
+
+fn map_desktop_selection_api_error(host: &str, error: &ApiError) -> SatelleError {
+    let invalid = || SatelleError::remote_api_error(host, "invalid-daemon-response");
+    let details = match error.details() {
+        Some(details) => match details.as_object() {
+            Some(details) => details,
+            None => return invalid(),
+        },
+        None if error.code() == ApiErrorCode::DesktopSessionUnavailable => {
+            return SatelleError::desktop_session_unavailable(None);
+        }
+        None => return invalid(),
+    };
+    let exact_string = |key: &str, expected_len: usize| {
+        (details.len() == expected_len)
+            .then(|| details.get(key)?.as_str())
+            .flatten()
+            .filter(|value| !value.is_empty())
+    };
+
+    match error.code() {
+        ApiErrorCode::DesktopBindingRequired => {
+            if details.len() != 1 {
+                return invalid();
+            }
+            let Some(users) = details
+                .get("candidate_desktop_users")
+                .and_then(serde_json::Value::as_array)
+            else {
+                return invalid();
+            };
+            let users = users
+                .iter()
+                .map(|user| user.as_str().filter(|user| !user.is_empty()))
+                .collect::<Option<BTreeSet<_>>>();
+            match users {
+                Some(users) if users.len() >= 2 => SatelleError::desktop_binding_required(&users),
+                _ => invalid(),
+            }
+        }
+        ApiErrorCode::DesktopSessionUnavailable if details.is_empty() => {
+            SatelleError::desktop_session_unavailable(None)
+        }
+        ApiErrorCode::DesktopSessionUnavailable => exact_string("desktop_user", 1)
+            .map(|user| SatelleError::desktop_session_unavailable(Some(user)))
+            .unwrap_or_else(invalid),
+        ApiErrorCode::DesktopSessionAmbiguous => exact_string("desktop_user", 1)
+            .map(SatelleError::desktop_session_ambiguous)
+            .unwrap_or_else(invalid),
+        ApiErrorCode::DesktopSessionPreferenceUnmatched => {
+            if details.len() != 2 {
+                return invalid();
+            }
+            match (
+                details
+                    .get("desktop_user")
+                    .and_then(serde_json::Value::as_str)
+                    .filter(|value| !value.is_empty()),
+                details
+                    .get("desktop_session_preference")
+                    .and_then(serde_json::Value::as_str)
+                    .filter(|value| matches!(*value, "only" | "console")),
+            ) {
+                (Some(user), Some(preference)) => {
+                    SatelleError::desktop_session_preference_unmatched(user, preference)
+                }
+                _ => invalid(),
+            }
+        }
+        ApiErrorCode::DesktopSessionConsoleUnavailable => {
+            if details.len() != 2
+                || details
+                    .get("desktop_session_preference")
+                    .and_then(serde_json::Value::as_str)
+                    != Some("console")
+            {
+                return invalid();
+            }
+            details
+                .get("desktop_user")
+                .and_then(serde_json::Value::as_str)
+                .filter(|value| !value.is_empty())
+                .map(SatelleError::desktop_session_console_unavailable)
+                .unwrap_or_else(invalid)
+        }
+        ApiErrorCode::DesktopSessionNativeSelectorWrongPlatform => {
+            if details.len() != 2 {
+                return invalid();
+            }
+            match (
+                details
+                    .get("configured_platform")
+                    .and_then(serde_json::Value::as_str)
+                    .filter(|value| !value.is_empty()),
+                details
+                    .get("detected_platform")
+                    .and_then(serde_json::Value::as_str)
+                    .filter(|value| !value.is_empty()),
+            ) {
+                (Some(configured), Some(detected)) => {
+                    SatelleError::desktop_session_native_selector_wrong_platform(
+                        configured, detected,
+                    )
+                }
+                _ => invalid(),
+            }
+        }
+        ApiErrorCode::DesktopSessionNativeSelectorUnmatched => {
+            exact_string("desktop_session_native_selector", 1)
+                .map(SatelleError::desktop_session_native_selector_unmatched)
+                .unwrap_or_else(invalid)
+        }
+        _ => invalid(),
+    }
 }
 
 fn map_stop_not_confirmed_api_error(host: &str, error: &ApiError) -> SatelleError {
@@ -4103,6 +4229,13 @@ fn api_error_is_definitively_not_admitted(code: ApiErrorCode) -> bool {
             | ApiErrorCode::IncompatibleProtocol
             | ApiErrorCode::IncompatibleControlPlane
             | ApiErrorCode::ComputerUseNotReady
+            | ApiErrorCode::DesktopBindingRequired
+            | ApiErrorCode::DesktopSessionUnavailable
+            | ApiErrorCode::DesktopSessionAmbiguous
+            | ApiErrorCode::DesktopSessionPreferenceUnmatched
+            | ApiErrorCode::DesktopSessionConsoleUnavailable
+            | ApiErrorCode::DesktopSessionNativeSelectorWrongPlatform
+            | ApiErrorCode::DesktopSessionNativeSelectorUnmatched
             | ApiErrorCode::NativeReadinessTimeout
             | ApiErrorCode::ProviderSmokeTestTimeout
             | ApiErrorCode::UnsupportedProviderComputerUse
@@ -4246,10 +4379,27 @@ pub(crate) fn cleanup_ssh_host_cache(
         .map_err(|error| map_ssh_daemon_bootstrap_error(&host.alias, error))
 }
 
-pub(crate) fn discover_ssh_host_identity(
+pub(crate) struct SshHostDiscovery {
+    pub(crate) identity: String,
+    pub(crate) authenticated_user: String,
+    pub(crate) sessions: HostSessionsReport,
+}
+
+pub(crate) fn authenticated_ssh_bootstrap_user(
+    host: &SelectedHost,
+) -> Result<String, SatelleError> {
+    let transport = SshSetupTransport::new(host)?;
+    let target = transport.remote_target()?;
+    Ok(transport
+        .remote_directories(target)?
+        .authenticated_user()
+        .to_string())
+}
+
+pub(crate) fn discover_ssh_host(
     host: &SelectedHost,
     daemon_path_overrides: &DaemonPathOverrides,
-) -> Result<String, SatelleError> {
+) -> Result<SshHostDiscovery, SatelleError> {
     if host.config.transport != TransportKind::Ssh {
         return Err(SatelleError::invalid_usage(
             "SSH Host identity discovery requires an SSH Host Binding",
@@ -4260,6 +4410,13 @@ pub(crate) fn discover_ssh_host_identity(
     probe_config.expected_host_id = Some(probe_identity.clone());
     let binding = SshHostBinding::from_host_config_for_bootstrap(&probe_config)
         .map_err(|error| SatelleError::config_error(error.to_string(), None))?;
+    let target = ssh_bootstrap::RemoteTarget::probe(binding.destination())
+        .map_err(|error| map_ssh_daemon_bootstrap_error(&host.alias, error))?;
+    let authenticated_user =
+        ssh_bootstrap::RemoteUserDirectories::probe(binding.destination(), target)
+            .map_err(|error| map_ssh_daemon_bootstrap_error(&host.alias, error))?
+            .authenticated_user()
+            .to_string();
     let mut bootstrap_lock = acquire_bootstrap_lock(
         &host.alias,
         binding.destination(),
@@ -4284,17 +4441,35 @@ pub(crate) fn discover_ssh_host_identity(
     let identity = client
         .discover_host_identity()
         .map_err(|error| direct_transport_error(&host.alias, error))?;
-    complete_discovered_bootstrap_handoff(
-        &host.alias,
-        tunnel.local_addr(),
-        handoff_token,
-        &identity,
-        &mut bootstrap_lock,
-    )?;
+    let authenticated_client =
+        discovered_bootstrap_client(&host.alias, tunnel.local_addr(), handoff_token, &identity)?;
+    let capabilities = authenticated_client
+        .capabilities()
+        .map_err(|error| direct_transport_error(&host.alias, error))?;
+    let desktop_sessions = authenticated_client
+        .desktop_sessions()
+        .map_err(|error| direct_transport_error(&host.alias, error))?;
+    let sessions = HostSessionsReport {
+        schema_version: HostSessionsSchemaVersion::V1,
+        host: host.alias.clone(),
+        detected_platform: capabilities.platform().to_string(),
+        connection_mode: "ssh-bootstrap".to_string(),
+        bootstrapped: true,
+        bootstrap_actions: vec![
+            "started an authenticated temporary Host Daemon for first-trust inspection".to_string(),
+        ],
+        host_daemon_version: capabilities.daemon_version().to_string(),
+        sessions: desktop_sessions.sessions().to_vec(),
+    };
+    complete_bootstrap_handoff(&host.alias, &authenticated_client, &mut bootstrap_lock)?;
     bootstrap_lock
         .release_committed_handoff()
         .map_err(|_| SatelleError::host_unreachable(&host.alias))?;
-    Ok(identity)
+    Ok(SshHostDiscovery {
+        identity,
+        authenticated_user,
+        sessions,
+    })
 }
 
 #[cfg(test)]

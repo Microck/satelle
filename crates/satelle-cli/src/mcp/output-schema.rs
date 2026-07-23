@@ -152,7 +152,6 @@ pub(super) fn host_sessions() -> Value {
         "satelle.host.sessions.v1",
         json!({
             "host": {"type": "string"},
-            "platform": {"type": "string"},
             "connection_mode": {"type": "string"},
             "bootstrapped": {"type": "boolean"},
             "bootstrap_actions": string_array(),
@@ -161,7 +160,6 @@ pub(super) fn host_sessions() -> Value {
         }),
         &[
             "host",
-            "platform",
             "connection_mode",
             "bootstrapped",
             "bootstrap_actions",
