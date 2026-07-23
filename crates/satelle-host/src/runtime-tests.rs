@@ -3,11 +3,14 @@ use super::{
     AdapterPreflight, AdapterReadiness, ComputerUseAdapter, ExecuteRequest, ExecuteResult,
     LogPageQuery, ProviderComputerUseIntent, ProviderSmokeFailureEvidence, ReadinessCacheKey,
     ReadinessEvidence, RecoveryObservation, RequestIdentity, RunCommand, RuntimeHandle,
-    RuntimeStartupState, SteerCommand, StopCommand,
+    RuntimeProviderPolicy, RuntimeStartupState, SteerCommand, StopCommand,
 };
 use crate::storage::{LeaseOwner, PrivateUpstreamRef, ProbeRecoverySubject};
 use crate::test_runtime::FakeComputerUseAdapter;
-use crate::{AttachmentUpload, ReadinessObservationState, attachment::verify_uploads};
+use crate::{
+    AttachmentUpload, ProductionComputerUseAdapter, ProviderSmokeEvidence,
+    ReadinessObservationState, attachment::verify_uploads,
+};
 use base64::Engine as _;
 use satelle_core::session::{
     ApprovalPolicy, DesktopBindingRef, DesktopTarget, EffectiveModelRef, ExecutionPolicy,
@@ -62,6 +65,49 @@ fn staged_file_count(state_root: &std::path::Path) -> usize {
     std::fs::read_dir(state_root.join("attachments"))
         .expect("read attachment staging directory")
         .count()
+}
+
+fn host_config_with_provider_binding(secret_variable: &str) -> satelle_core::HostConfig {
+    let mut config = satelle_core::SatelleConfig::defaults()
+        .hosts
+        .remove(LOCAL_DEMO_HOST)
+        .expect("the built-in local Host config exists");
+    config.provider_bindings = std::collections::BTreeMap::from([(
+        "openai".to_string(),
+        std::collections::BTreeMap::from([(
+            "review".to_string(),
+            satelle_core::ProviderBindingConfig {
+                model: "host-review-model".to_string(),
+                model_provider: "openai".to_string(),
+                endpoint: None,
+                auth_source: Some("host-auth".to_string()),
+            },
+        )]),
+    )]);
+    config.provider_auth = std::collections::BTreeMap::from([(
+        "host-auth".to_string(),
+        satelle_core::ProviderSecretSource::Environment {
+            variable: secret_variable.to_string(),
+        },
+    )]);
+    config
+}
+
+fn production_runtime_with_host_policy(
+    state_root: &std::path::Path,
+    config: &satelle_core::HostConfig,
+) -> RuntimeHandle {
+    let snapshot = Arc::new(std::sync::RwLock::new(
+        crate::ProductionCapabilitySnapshot::collect(None),
+    ));
+    let adapter =
+        ProductionComputerUseAdapter::new(snapshot, Ok(state_root.join("codex-app-server-work")));
+    RuntimeHandle::new_production(
+        Ok(state_root.to_path_buf()),
+        Ok(state_root.join("logs")),
+        adapter,
+        RuntimeProviderPolicy::from_host_config(config),
+    )
 }
 
 #[test]
@@ -228,6 +274,272 @@ fn native_readiness_precedes_turn_admission_and_provider_smoke() {
 }
 
 #[test]
+fn implicit_non_openai_cache_miss_runs_live_provider_smoke_before_execute() {
+    let state = crate::TestStateDir::new().expect("temporary state directory should exist");
+    let adapter = ProviderProbeRecoveryAdapter::new([]).with_provider_dispatch_possible(false);
+    let runtime = RuntimeHandle::new_with_readiness_probe_driver(
+        Ok(state.path().to_path_buf()),
+        adapter.clone(),
+        adapter.clone(),
+    );
+
+    let error = runtime
+        .run(RunCommand::attached(
+            LOCAL_DEMO_HOST,
+            "prompt-blocked-until-implicit-provider-is-validated",
+        ))
+        .expect_err("a non-OpenAI cache miss must run and fail the live provider smoke");
+
+    assert_eq!(error.error().code, ErrorCode::ProviderSmokeTestTimeout);
+    assert_eq!(adapter.provider_probe_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        adapter.execute_calls.load(Ordering::SeqCst),
+        0,
+        "prompt execution must remain blocked until live provider validation passes"
+    );
+}
+
+#[test]
+fn host_config_binding_precedes_colliding_persisted_user_config_without_secret_resolution() {
+    let state = crate::TestStateDir::new().expect("temporary state directory should exist");
+    let host_secret_variable = format!(
+        "SATELLE_HOST_PRECEDENCE_SECRET_{}",
+        uuid::Uuid::now_v7().simple()
+    );
+    let user_secret_variable = format!(
+        "SATELLE_USER_PRECEDENCE_SECRET_{}",
+        uuid::Uuid::now_v7().simple()
+    );
+    let runtime = production_runtime_with_host_policy(
+        state.path(),
+        &host_config_with_provider_binding(&host_secret_variable),
+    );
+    let persisted_user_binding = satelle_core::ResolvedProviderBinding::from_authorization(
+        satelle_core::ProviderBindingAuthorization::new(
+            "review",
+            "openai",
+            "persisted-user-model",
+            "openai",
+        )
+        .with_auth_source(satelle_core::ProviderSecretSource::Environment {
+            variable: user_secret_variable,
+        }),
+        satelle_core::ProviderBindingSource::UserConfig,
+    );
+    runtime
+        .authorize_provider_binding(&persisted_user_binding)
+        .expect("persist the colliding UserConfig binding");
+    let intent = ProviderComputerUseIntent::new(
+        Some(EffectiveModelRef::new("review").expect("valid model alias")),
+        Some(ProviderBindingRef::new("openai").expect("valid provider alias")),
+        false,
+    );
+
+    let resolved = runtime
+        .resolve_provider_binding(LOCAL_DEMO_HOST, &intent)
+        .expect("Host config must win without resolving either missing secret");
+
+    assert_eq!(
+        resolved.source(),
+        satelle_core::ProviderBindingSource::HostOwned
+    );
+    assert_eq!(resolved.model(), "host-review-model");
+    assert_eq!(resolved.model_provider(), "openai");
+    assert_eq!(
+        resolved.auth_source(),
+        Some(&satelle_core::ProviderSecretSource::Environment {
+            variable: host_secret_variable,
+        })
+    );
+}
+
+#[test]
+fn partial_and_missing_alias_pairs_fail_before_adapter_or_secret_resolution() {
+    let state = crate::TestStateDir::new().expect("temporary state directory should exist");
+    let secret_variable = format!(
+        "SATELLE_UNREAD_PROVIDER_SECRET_{}",
+        uuid::Uuid::now_v7().simple()
+    );
+    let runtime = production_runtime_with_host_policy(
+        state.path(),
+        &host_config_with_provider_binding(&secret_variable),
+    );
+    let model = || EffectiveModelRef::new("review").expect("valid model alias");
+    let provider = || ProviderBindingRef::new("openai").expect("valid provider alias");
+    let missing_model =
+        || EffectiveModelRef::new("missing-review").expect("valid missing model alias");
+
+    for intent in [
+        ProviderComputerUseIntent::new(Some(model()), None, false),
+        ProviderComputerUseIntent::new(None, Some(provider()), false),
+        ProviderComputerUseIntent::new(Some(missing_model()), Some(provider()), false),
+    ] {
+        let error = runtime
+            .resolve_provider_binding(LOCAL_DEMO_HOST, &intent)
+            .expect_err("an incomplete or absent exact pair must fail closed");
+        assert_eq!(error.code, ErrorCode::ModelProviderBindingMissing);
+        assert!(
+            !serde_json::to_string(&error)
+                .expect("serialize alias failure")
+                .contains(&secret_variable)
+        );
+    }
+}
+
+#[test]
+fn replacing_or_deleting_persisted_binding_prevents_restored_digest_cache_reuse() {
+    let state = crate::TestStateDir::new().expect("temporary state directory should exist");
+    let adapter = ProviderProbeRecoveryAdapter::new([]);
+    let runtime = RuntimeHandle::new(Ok(state.path().to_path_buf()), adapter);
+    let first_binding = satelle_core::ResolvedProviderBinding::from_authorization(
+        satelle_core::ProviderBindingAuthorization::new(
+            "review",
+            "openai",
+            "first-concrete-model",
+            "openai",
+        ),
+        satelle_core::ProviderBindingSource::UserConfig,
+    );
+    runtime
+        .authorize_provider_binding(&first_binding)
+        .expect("persist the first UserConfig binding");
+    let first_key = ProviderProbeRecoveryAdapter::key().with_provider_binding(&first_binding);
+    let observed_at = time::OffsetDateTime::now_utc();
+    let readiness = first_key
+        .evidence(
+            "first-binding-readiness",
+            observed_at,
+            observed_at + time::Duration::minutes(5),
+        )
+        .unwrap();
+    let provider = ProviderSmokeEvidence::new(
+        "first-binding-provider-smoke",
+        first_key.provider_config_fingerprint(),
+        observed_at,
+        observed_at + time::Duration::hours(24),
+    )
+    .unwrap();
+    runtime
+        .engine()
+        .expect("open runtime storage")
+        .lock_storage()
+        .unwrap()
+        .store_preflight_successes(
+            first_key.adapter(),
+            first_key.desktop_binding(),
+            first_key.execution_policy(),
+            &readiness,
+            Some(&provider),
+        )
+        .unwrap();
+    let intent = ProviderComputerUseIntent::new(
+        Some(EffectiveModelRef::new("review").expect("valid model alias")),
+        Some(ProviderBindingRef::new("openai").expect("valid provider alias")),
+        false,
+    );
+    assert!(
+        runtime
+            .cached_provider_smoke(LOCAL_DEMO_HOST, &intent)
+            .expect("read the first binding cache")
+            .is_some()
+    );
+
+    let replacement = satelle_core::ResolvedProviderBinding::from_authorization(
+        satelle_core::ProviderBindingAuthorization::new(
+            "review",
+            "openai",
+            "replacement-concrete-model",
+            "openai",
+        ),
+        satelle_core::ProviderBindingSource::UserConfig,
+    );
+    runtime
+        .authorize_provider_binding(&replacement)
+        .expect("replace the persisted UserConfig binding");
+
+    assert_ne!(first_binding.binding_digest(), replacement.binding_digest());
+    assert!(
+        runtime
+            .cached_provider_smoke(LOCAL_DEMO_HOST, &intent)
+            .expect("look up the replacement binding cache")
+            .is_none(),
+        "the replacement binding must not reuse evidence keyed by the old digest"
+    );
+
+    runtime
+        .authorize_provider_binding(&first_binding)
+        .expect("restore the original binding after replacement");
+    drop(runtime);
+    let runtime = RuntimeHandle::new(
+        Ok(state.path().to_path_buf()),
+        ProviderProbeRecoveryAdapter::new([]),
+    );
+    assert!(
+        runtime
+            .cached_provider_smoke(LOCAL_DEMO_HOST, &intent)
+            .expect("look up the restored original binding cache after restart")
+            .is_none(),
+        "restoring the original digest after replacement must not revive old smoke evidence"
+    );
+
+    let restored_readiness = first_key
+        .evidence(
+            "restored-binding-readiness",
+            observed_at,
+            observed_at + time::Duration::minutes(5),
+        )
+        .unwrap();
+    let restored_provider = ProviderSmokeEvidence::new(
+        "restored-binding-provider-smoke",
+        first_key.provider_config_fingerprint(),
+        observed_at,
+        observed_at + time::Duration::hours(24),
+    )
+    .unwrap();
+    runtime
+        .engine()
+        .expect("open runtime storage")
+        .lock_storage()
+        .unwrap()
+        .store_preflight_successes(
+            first_key.adapter(),
+            first_key.desktop_binding(),
+            first_key.execution_policy(),
+            &restored_readiness,
+            Some(&restored_provider),
+        )
+        .unwrap();
+    assert!(
+        runtime
+            .cached_provider_smoke(LOCAL_DEMO_HOST, &intent)
+            .expect("read the freshly stored original binding cache")
+            .is_some(),
+        "the delete regression requires reusable evidence before deletion"
+    );
+
+    assert!(
+        runtime
+            .delete_provider_binding("review", "openai")
+            .expect("delete the restored binding")
+    );
+    runtime
+        .authorize_provider_binding(&first_binding)
+        .expect("restore the identical binding after deletion");
+    drop(runtime);
+    let runtime = RuntimeHandle::new(
+        Ok(state.path().to_path_buf()),
+        ProviderProbeRecoveryAdapter::new([]),
+    );
+    assert!(
+        runtime
+            .cached_provider_smoke(LOCAL_DEMO_HOST, &intent)
+            .expect("look up the restored deleted binding cache after restart")
+            .is_none(),
+        "restoring an identical digest after deletion must not revive old smoke evidence"
+    );
+}
+
+#[test]
 fn unknown_provider_probe_ownership_blocks_probe_and_prompt_until_terminal_reconciliation() {
     let state = crate::TestStateDir::new().expect("temporary state directory should exist");
     let adapter = ProviderProbeRecoveryAdapter::new([
@@ -240,7 +552,7 @@ fn unknown_provider_probe_ownership_blocks_probe_and_prompt_until_terminal_recon
         adapter.clone(),
         adapter,
     );
-    let provider_intent = ProviderComputerUseIntent::new(None, None, true, true);
+    let provider_intent = ProviderComputerUseIntent::new(None, None, true);
 
     let first = runtime
         .refresh_provider_smoke(LOCAL_DEMO_HOST, &provider_intent)
@@ -350,7 +662,7 @@ fn provider_probe_failure_before_dispatch_releases_control() {
         adapter.clone(),
         adapter,
     );
-    let provider_intent = ProviderComputerUseIntent::new(None, None, true, true);
+    let provider_intent = ProviderComputerUseIntent::new(None, None, true);
 
     runtime
         .refresh_provider_smoke(LOCAL_DEMO_HOST, &provider_intent)
@@ -391,7 +703,7 @@ fn native_probe_ordinary_failure_preserves_only_possible_dispatch() {
         ),
     ] {
         let state = crate::TestStateDir::new().expect("temporary state directory should exist");
-        let adapter = ProviderProbeRecoveryAdapter::with_native_results([], [behavior]);
+        let adapter = ProviderProbeRecoveryAdapter::with_native_only_results([], [behavior]);
         let runtime = RuntimeHandle::new_with_readiness_probe_driver(
             Ok(state.path().to_path_buf()),
             adapter.clone(),
@@ -429,7 +741,7 @@ fn native_probe_ordinary_failure_preserves_only_possible_dispatch() {
 #[test]
 fn manual_action_native_failure_is_retained_but_never_reused() {
     let state = crate::TestStateDir::new().expect("temporary state directory should exist");
-    let adapter = ProviderProbeRecoveryAdapter::with_native_results(
+    let adapter = ProviderProbeRecoveryAdapter::with_native_only_results(
         [],
         [
             NativeProbeBehavior::ManualActionRequired,
@@ -482,7 +794,7 @@ fn manual_action_native_failure_is_retained_but_never_reused() {
 fn exact_readiness_reuse_reports_live_then_cache_source() {
     let state = crate::TestStateDir::new().expect("temporary state directory should exist");
     let adapter =
-        ProviderProbeRecoveryAdapter::with_native_results([], [NativeProbeBehavior::Passed]);
+        ProviderProbeRecoveryAdapter::with_native_only_results([], [NativeProbeBehavior::Passed]);
     let runtime = RuntimeHandle::new_with_readiness_probe_driver(
         Ok(state.path().to_path_buf()),
         adapter.clone(),
@@ -525,7 +837,7 @@ fn exact_readiness_reuse_reports_live_then_cache_source() {
 fn fresh_readiness_replacing_cached_candidate_reports_live_source() {
     let state = crate::TestStateDir::new().expect("temporary state directory should exist");
     let adapter =
-        ProviderProbeRecoveryAdapter::with_native_results([], [NativeProbeBehavior::Passed]);
+        ProviderProbeRecoveryAdapter::with_native_only_results([], [NativeProbeBehavior::Passed]);
     let runtime = RuntimeHandle::new_with_readiness_probe_driver(
         Ok(state.path().to_path_buf()),
         adapter.clone(),
@@ -561,7 +873,7 @@ fn fresh_readiness_replacing_cached_candidate_reports_live_source() {
 #[test]
 fn confirmed_native_probe_timeout_is_terminal_and_releases_control() {
     let state = crate::TestStateDir::new().expect("temporary state directory should exist");
-    let adapter = ProviderProbeRecoveryAdapter::with_native_results(
+    let adapter = ProviderProbeRecoveryAdapter::with_native_only_results(
         [],
         [
             NativeProbeBehavior::TimedOutConfirmed,
@@ -616,7 +928,7 @@ fn confirmed_native_probe_timeout_is_terminal_and_releases_control() {
 #[test]
 fn native_probe_timeout_without_terminal_evidence_retains_recovery() {
     let state = crate::TestStateDir::new().expect("temporary state directory should exist");
-    let adapter = ProviderProbeRecoveryAdapter::with_native_results(
+    let adapter = ProviderProbeRecoveryAdapter::with_native_only_results(
         [],
         [NativeProbeBehavior::TimedOutWithoutCancellationDetail],
     );
@@ -663,7 +975,7 @@ fn native_probe_timeout_without_terminal_evidence_retains_recovery() {
 #[test]
 fn unknown_native_probe_timeout_blocks_until_terminal_reconciliation() {
     let state = crate::TestStateDir::new().expect("temporary state directory should exist");
-    let adapter = ProviderProbeRecoveryAdapter::with_native_results(
+    let adapter = ProviderProbeRecoveryAdapter::with_native_only_results(
         [
             RecoveryObservation::Running,
             RecoveryObservation::Running,
@@ -1336,9 +1648,12 @@ struct ProviderProbeRecoveryAdapter {
     observation_calls: Arc<AtomicUsize>,
     native_results: Arc<Mutex<VecDeque<NativeProbeBehavior>>>,
     native_probe_calls: Arc<AtomicUsize>,
+    provider_probe_calls: Arc<AtomicUsize>,
+    execute_calls: Arc<AtomicUsize>,
     provider_dispatch_possible: Arc<AtomicBool>,
     replace_cached_readiness: Arc<AtomicBool>,
     cached_replacement_calls: Arc<AtomicUsize>,
+    native_only: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -1359,9 +1674,12 @@ impl ProviderProbeRecoveryAdapter {
             observation_calls: Arc::new(AtomicUsize::new(0)),
             native_results: Arc::new(Mutex::new(VecDeque::new())),
             native_probe_calls: Arc::new(AtomicUsize::new(0)),
+            provider_probe_calls: Arc::new(AtomicUsize::new(0)),
+            execute_calls: Arc::new(AtomicUsize::new(0)),
             provider_dispatch_possible: Arc::new(AtomicBool::new(true)),
             replace_cached_readiness: Arc::new(AtomicBool::new(false)),
             cached_replacement_calls: Arc::new(AtomicUsize::new(0)),
+            native_only: false,
         }
     }
 
@@ -1371,6 +1689,15 @@ impl ProviderProbeRecoveryAdapter {
     ) -> Self {
         let adapter = Self::new(observations);
         *adapter.native_results.lock().unwrap() = results.into_iter().collect();
+        adapter
+    }
+
+    fn with_native_only_results(
+        observations: impl IntoIterator<Item = RecoveryObservation>,
+        results: impl IntoIterator<Item = NativeProbeBehavior>,
+    ) -> Self {
+        let mut adapter = Self::with_native_results(observations, results);
+        adapter.native_only = true;
         adapter
     }
 
@@ -1400,15 +1727,49 @@ impl ProviderProbeRecoveryAdapter {
         .unwrap()
     }
 
-    fn readiness_with_id(result_id: impl Into<String>) -> ReadinessEvidence {
+    fn native_only_key() -> ReadinessCacheKey {
+        let desktop = DesktopBindingRef::new("provider-probe-desktop").unwrap();
+        let policy = ExecutionPolicy::new(
+            EffectiveModelRef::new("provider-probe-model").unwrap(),
+            ProviderBindingRef::new("provider-probe-binding").unwrap(),
+            DesktopTarget::new(desktop.clone(), "provider-probe-desktop-session"),
+            ApprovalPolicy::OnRequest,
+            SandboxPolicy::WorkspaceWrite,
+            TimeoutPolicy::bounded_seconds(120).unwrap(),
+            ExperimentalFeatureChoices::new(FeatureChoice::Enabled, FeatureChoice::Disabled),
+        );
+        ReadinessCacheKey::new(
+            "provider-probe-test",
+            desktop,
+            policy,
+            "codex-test",
+            "native-test",
+            None::<String>,
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            ReadinessObservationState::Unknown,
+            ReadinessObservationState::Unknown,
+        )
+        .unwrap()
+    }
+
+    fn effective_key(&self) -> ReadinessCacheKey {
+        if self.native_only {
+            Self::native_only_key()
+        } else {
+            Self::key()
+        }
+    }
+
+    fn readiness_with_id(&self, result_id: impl Into<String>) -> ReadinessEvidence {
         let now = time::OffsetDateTime::now_utc();
-        Self::key()
+        self.effective_key()
             .evidence(result_id, now, now + time::Duration::minutes(5))
             .unwrap()
     }
 
-    fn readiness() -> ReadinessEvidence {
-        Self::readiness_with_id("provider-probe-native-result")
+    fn readiness(&self) -> ReadinessEvidence {
+        self.readiness_with_id("provider-probe-native-result")
     }
 
     fn with_provider_dispatch_possible(self, possible: bool) -> Self {
@@ -1421,8 +1782,20 @@ impl ProviderProbeRecoveryAdapter {
         self.replace_cached_readiness.store(true, Ordering::SeqCst);
     }
 
-    fn adapter_readiness(evidence: ReadinessEvidence) -> AdapterReadiness {
-        let key = Self::key();
+    fn adapter_readiness(&self, evidence: ReadinessEvidence) -> AdapterReadiness {
+        let key = self.effective_key();
+        if self.native_only {
+            return AdapterReadiness::ready(
+                key.adapter(),
+                "provider probe test readiness",
+                key.desktop_binding().clone(),
+                key.execution_policy().clone(),
+                evidence,
+                None,
+                None,
+            )
+            .unwrap();
+        }
         let now = time::OffsetDateTime::now_utc();
         let provider_evidence = super::ProviderSmokeEvidence::new(
             format!("provider-probe-smoke-{}", SessionId::new()),
@@ -1438,6 +1811,15 @@ impl ProviderProbeRecoveryAdapter {
             key.execution_policy().clone(),
             evidence,
             Some(provider_evidence),
+            Some(satelle_core::ResolvedProviderBinding::from_authorization(
+                satelle_core::ProviderBindingAuthorization::new(
+                    "provider-probe-model",
+                    "provider-probe",
+                    "provider-probe-model",
+                    "openai",
+                ),
+                satelle_core::ProviderBindingSource::HostOwned,
+            )),
         )
         .unwrap()
     }
@@ -1455,9 +1837,14 @@ impl ComputerUseAdapter for ProviderProbeRecoveryAdapter {
     fn readiness_cache_key(
         &self,
         _host: &str,
-        _provider_intent: &ProviderComputerUseIntent,
+        provider_intent: &ProviderComputerUseIntent,
     ) -> Result<Option<ReadinessCacheKey>, SatelleError> {
-        Ok(Some(Self::key()))
+        Ok(Some(
+            provider_intent.resolved_provider_binding().map_or_else(
+                || self.effective_key(),
+                |binding| self.effective_key().with_provider_binding(binding),
+            ),
+        ))
     }
 
     fn preflight_terminal(
@@ -1470,14 +1857,15 @@ impl ComputerUseAdapter for ProviderProbeRecoveryAdapter {
         let evidence = cached.expect("the runtime supplies live or reusable native evidence");
         if self.replace_cached_readiness.load(Ordering::SeqCst) {
             self.cached_replacement_calls.fetch_add(1, Ordering::SeqCst);
-            return AdapterPreflight::Ready(Self::adapter_readiness(Self::readiness_with_id(
-                "fresh-live-after-cached-candidate",
-            )));
+            return AdapterPreflight::Ready(
+                self.adapter_readiness(self.readiness_with_id("fresh-live-after-cached-candidate")),
+            );
         }
-        AdapterPreflight::Ready(Self::adapter_readiness(evidence))
+        AdapterPreflight::Ready(self.adapter_readiness(evidence))
     }
 
     fn execute(&self, request: ExecuteRequest<'_>) -> Result<ExecuteResult, SatelleError> {
+        self.execute_calls.fetch_add(1, Ordering::SeqCst);
         FakeComputerUseAdapter.execute(request)
     }
 
@@ -1505,7 +1893,7 @@ impl ReadinessProbeDriver for ProviderProbeRecoveryAdapter {
         persist_turn_ref: &mut dyn FnMut(&str) -> Result<(), ()>,
     ) -> NativeProbeResult {
         let call = self.native_probe_calls.fetch_add(1, Ordering::SeqCst);
-        let evidence = Self::readiness_with_id(format!("native-probe-result-{call}"));
+        let evidence = self.readiness_with_id(format!("native-probe-result-{call}"));
         match self
             .native_results
             .lock()
@@ -1594,13 +1982,14 @@ impl ReadinessProbeDriver for ProviderProbeRecoveryAdapter {
         persist_thread_ref: &mut dyn FnMut(&str) -> Result<(), ()>,
         persist_turn_ref: &mut dyn FnMut(&str) -> Result<(), ()>,
     ) -> AdapterPreflight {
+        self.provider_probe_calls.fetch_add(1, Ordering::SeqCst);
         let dispatch_possible = self.provider_dispatch_possible.load(Ordering::SeqCst);
         if dispatch_possible {
             persist_thread_ref(PRIVATE_UPSTREAM_THREAD_REF).unwrap();
             persist_turn_ref(PRIVATE_UPSTREAM_TURN_REF).unwrap();
         }
-        let key = Self::key();
-        let readiness = Self::readiness();
+        let key = self.effective_key();
+        let readiness = self.readiness();
         let now = time::OffsetDateTime::now_utc();
         let failure = ProviderSmokeFailureEvidence::new(
             "provider-probe-outcome-unknown",

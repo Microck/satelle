@@ -778,6 +778,36 @@ pub(super) async fn require_setup_mutation(
     require_mutation(&state, request, next, authorized).await
 }
 
+pub(super) async fn require_bootstrap_admin_mutation(
+    State(state): State<Arc<DaemonState>>,
+    request: Request,
+    next: Next,
+) -> Response {
+    let Some(authorized) = request.extensions().get::<AuthorizedRequest>().cloned() else {
+        return missing_authorization_context();
+    };
+    let principal = authorized.principal();
+    if !principal.is_ssh_bootstrap() || !principal.scopes().allows(ApiScopes::ADMIN) {
+        return insufficient_scope(&state, &authorized, "bootstrap admin");
+    }
+    require_mutation(&state, request, next, authorized).await
+}
+
+pub(super) async fn require_setup_or_control_mutation(
+    State(state): State<Arc<DaemonState>>,
+    request: Request,
+    next: Next,
+) -> Response {
+    let Some(authorized) = request.extensions().get::<AuthorizedRequest>().cloned() else {
+        return missing_authorization_context();
+    };
+    let principal = authorized.principal();
+    if !principal.scopes().allows(ApiScopes::CONTROL) && !principal.is_ssh_bootstrap() {
+        return insufficient_scope(&state, &authorized, "setup or control");
+    }
+    require_mutation(&state, request, next, authorized).await
+}
+
 pub(super) async fn require_protocol_read(
     State(state): State<Arc<DaemonState>>,
     request: Request,
@@ -945,6 +975,9 @@ fn insufficient_scope(
             retryable: false,
             message: match scope {
                 "control" => "the API Principal does not have control scope",
+                "bootstrap admin" => {
+                    "durable setup credentials require an admin-scoped SSH bootstrap principal"
+                }
                 _ => "the API Principal does not have read scope",
             },
             details: None,

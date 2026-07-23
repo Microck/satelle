@@ -215,6 +215,11 @@ pub(crate) struct AttachedTurnOutcome {
     pub(crate) provider_smoke: Option<serde_json::Value>,
 }
 
+pub(crate) struct ProviderDescriptorValidationReport {
+    pub(crate) resolved_binding: satelle_core::PublicResolvedProviderBinding,
+    pub(crate) validation: satelle_core::ProviderAuthValidationResult,
+}
+
 /// The command surface is intentionally exhaustive. A new transport operation
 /// must be implemented or explicitly rejected by every backend.
 pub(crate) trait TransportClient {
@@ -234,6 +239,21 @@ pub(crate) trait TransportClient {
         options: DoctorOptions,
         provider_intent: &satelle_host::ProviderComputerUseIntent,
     ) -> Result<DoctorReport, SatelleError>;
+    fn authorize_provider_binding(
+        &self,
+        authorization: &satelle_core::ProviderBindingAuthorization,
+    ) -> Result<satelle_core::PublicResolvedProviderBinding, SatelleError>;
+    fn delete_provider_binding(
+        &self,
+        model_alias: &str,
+        provider_alias: &str,
+    ) -> Result<bool, SatelleError>;
+    fn validate_provider_descriptor(
+        &self,
+        model_alias: &str,
+        provider_alias: &str,
+        mode: satelle_core::ProviderAuthValidationMode,
+    ) -> Result<ProviderDescriptorValidationReport, SatelleError>;
     fn host_status(&self) -> Result<HostStatus, SatelleError>;
     fn host_sessions(&self, no_bootstrap: bool) -> Result<HostSessionsReport, SatelleError>;
     fn run(
@@ -552,6 +572,49 @@ impl TransportClient for LocalTransport {
             .doctor_with_provider_intent(&self.alias, scope, options, provider_intent)
     }
 
+    fn validate_provider_descriptor(
+        &self,
+        model_alias: &str,
+        provider_alias: &str,
+        mode: satelle_core::ProviderAuthValidationMode,
+    ) -> Result<ProviderDescriptorValidationReport, SatelleError> {
+        let validation = self.service.validate_provider_descriptor(
+            &self.alias,
+            model_alias,
+            provider_alias,
+            mode,
+        )?;
+        Ok(ProviderDescriptorValidationReport {
+            resolved_binding: satelle_core::PublicResolvedProviderBinding::from(
+                validation.resolved_binding(),
+            ),
+            validation: validation.validation(),
+        })
+    }
+
+    fn authorize_provider_binding(
+        &self,
+        authorization: &satelle_core::ProviderBindingAuthorization,
+    ) -> Result<satelle_core::PublicResolvedProviderBinding, SatelleError> {
+        self.service
+            .authorize_provider_binding(
+                &self.alias,
+                authorization.requested_model_alias(),
+                authorization.requested_provider_alias(),
+                authorization.clone(),
+            )
+            .map(|binding| satelle_core::PublicResolvedProviderBinding::from(&binding))
+    }
+
+    fn delete_provider_binding(
+        &self,
+        model_alias: &str,
+        provider_alias: &str,
+    ) -> Result<bool, SatelleError> {
+        self.service
+            .delete_provider_binding(model_alias, provider_alias)
+    }
+
     fn host_status(&self) -> Result<HostStatus, SatelleError> {
         self.service.host_status()
     }
@@ -711,12 +774,12 @@ fn local_turn_intent(request: &TurnRequest) -> Result<satelle_host::TurnIntent, 
         .collect();
     satelle_host::TurnIntent::new(request.prompt(), request.execution_mode())
         .and_then(|intent| {
-            intent.with_provider_intent(
+            let intent = intent.with_provider_intent(
                 request.model().map(str::to_string),
                 request.provider().map(str::to_string),
-                request.experimental_provider_computer_use(),
                 request.refresh_provider_smoke_test(),
-            )
+            )?;
+            Ok(intent)
         })
         .and_then(|intent| {
             intent.with_turn_execution_timeout_ms(request.turn_execution_timeout_ms())
@@ -3105,6 +3168,30 @@ impl TransportClient for SshSetupTransport {
         Err(self.unsupported("doctor"))
     }
 
+    fn validate_provider_descriptor(
+        &self,
+        _model_alias: &str,
+        _provider_alias: &str,
+        _mode: satelle_core::ProviderAuthValidationMode,
+    ) -> Result<ProviderDescriptorValidationReport, SatelleError> {
+        Err(self.unsupported("provider descriptor validation"))
+    }
+
+    fn authorize_provider_binding(
+        &self,
+        _authorization: &satelle_core::ProviderBindingAuthorization,
+    ) -> Result<satelle_core::PublicResolvedProviderBinding, SatelleError> {
+        Err(self.unsupported("provider binding authorization"))
+    }
+
+    fn delete_provider_binding(
+        &self,
+        _model_alias: &str,
+        _provider_alias: &str,
+    ) -> Result<bool, SatelleError> {
+        Err(self.unsupported("provider binding deletion"))
+    }
+
     fn host_status(&self) -> Result<HostStatus, SatelleError> {
         Err(self.unsupported("host status"))
     }
@@ -3186,6 +3273,57 @@ impl TransportClient for DirectTransport {
         _provider_intent: &satelle_host::ProviderComputerUseIntent,
     ) -> Result<DoctorReport, SatelleError> {
         Err(self.unsupported("doctor"))
+    }
+
+    fn validate_provider_descriptor(
+        &self,
+        model_alias: &str,
+        provider_alias: &str,
+        mode: satelle_core::ProviderAuthValidationMode,
+    ) -> Result<ProviderDescriptorValidationReport, SatelleError> {
+        let response = self
+            .client
+            .validate_provider_descriptor(
+                provider_alias,
+                model_alias,
+                &satelle_transport::ProviderDescriptorValidationRequest::new(mode),
+                &format!("provider-validation-{}", Uuid::now_v7()),
+            )
+            .map_err(|error| direct_transport_error(&self.alias, error))?;
+        Ok(ProviderDescriptorValidationReport {
+            resolved_binding: response.resolved_binding().clone(),
+            validation: response.validation(),
+        })
+    }
+
+    fn authorize_provider_binding(
+        &self,
+        authorization: &satelle_core::ProviderBindingAuthorization,
+    ) -> Result<satelle_core::PublicResolvedProviderBinding, SatelleError> {
+        self.client
+            .authorize_provider_binding(
+                authorization.requested_provider_alias(),
+                authorization.requested_model_alias(),
+                &satelle_transport::ProviderBindingAuthorizationRequest::new(authorization.clone()),
+                &format!("provider-authorization-{}", Uuid::now_v7()),
+            )
+            .map(|response| response.binding().clone())
+            .map_err(|error| direct_transport_error(&self.alias, error))
+    }
+
+    fn delete_provider_binding(
+        &self,
+        model_alias: &str,
+        provider_alias: &str,
+    ) -> Result<bool, SatelleError> {
+        self.client
+            .delete_provider_binding(
+                provider_alias,
+                model_alias,
+                &format!("provider-deletion-{}", Uuid::now_v7()),
+            )
+            .map(|response| response.deleted())
+            .map_err(|error| direct_transport_error(&self.alias, error))
     }
 
     fn host_status(&self) -> Result<HostStatus, SatelleError> {
@@ -4239,6 +4377,10 @@ fn api_error_is_definitively_not_admitted(code: ApiErrorCode) -> bool {
             | ApiErrorCode::NativeReadinessTimeout
             | ApiErrorCode::ProviderSmokeTestTimeout
             | ApiErrorCode::UnsupportedProviderComputerUse
+            | ApiErrorCode::ExperimentalProviderOptInRequired
+            | ApiErrorCode::ModelProviderBindingMissing
+            | ApiErrorCode::ProviderSecretResolutionFailed
+            | ApiErrorCode::ExperimentalProviderNotValidated
             | ApiErrorCode::CapacityExceeded
             | ApiErrorCode::RateLimited
             | ApiErrorCode::RouteNotFound
@@ -4260,7 +4402,33 @@ fn api_code_error(host: &str, code: ApiErrorCode) -> SatelleError {
         ApiErrorCode::UnsupportedProviderComputerUse => {
             SatelleError::unsupported_provider_computer_use()
         }
+        ApiErrorCode::ExperimentalProviderOptInRequired => provider_api_error(
+            ErrorCode::ExperimentalProviderOptInRequired,
+            "experimental provider Computer Use is not enabled",
+        ),
+        ApiErrorCode::ModelProviderBindingMissing => provider_api_error(
+            ErrorCode::ModelProviderBindingMissing,
+            "the requested model and provider binding is not configured",
+        ),
+        ApiErrorCode::ProviderSecretResolutionFailed => provider_api_error(
+            ErrorCode::ProviderSecretResolutionFailed,
+            "the Host could not resolve provider authentication",
+        ),
+        ApiErrorCode::ExperimentalProviderNotValidated => provider_api_error(
+            ErrorCode::ExperimentalProviderNotValidated,
+            "the selected provider did not pass live validation",
+        ),
         code => SatelleError::remote_api_error(host, code.as_str()),
+    }
+}
+
+fn provider_api_error(code: ErrorCode, message: &str) -> SatelleError {
+    SatelleError {
+        code,
+        message: message.to_string(),
+        recovery_command: Some("run satelle doctor --scope provider --refresh --json".to_string()),
+        source_detail: None,
+        details: std::collections::BTreeMap::new(),
     }
 }
 
@@ -4276,9 +4444,12 @@ fn local_host_service(host_config: &satelle_core::HostConfig) -> Result<HostServ
         Ok(value) if value == "failing" => {
             return HostService::failing_local_demo_for_tests().map_err(failure);
         }
+        Ok(value) if value == "resolved-secret-canary" => {
+            return HostService::resolved_secret_canary_local_demo_for_tests().map_err(failure);
+        }
         Ok(_) => {
             return Err(failure(SatelleError::invalid_usage(
-                "SATELLE_TEST_SUPPORT_ADAPTER must be exactly 'fake', 'pending', 'failing', or unset",
+                "SATELLE_TEST_SUPPORT_ADAPTER must be exactly 'fake', 'pending', 'failing', 'resolved-secret-canary', or unset",
             )));
         }
         Err(std::env::VarError::NotUnicode(_)) => {

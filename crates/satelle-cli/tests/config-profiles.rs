@@ -350,19 +350,46 @@ fn config_check_all_enumerates_only_selectable_contexts() {
     let fixture = ConfigFixture::new(
         r#"
 default_host = "user-host"
+model_alias = "base-model"
+provider_alias = "openai"
 
 [hosts.user-host]
 transport = "local"
 adapter = "fake"
 allow_project_selection = true
 
+[hosts.user-host.provider_bindings.openai.base-model]
+model = "base-model"
+model_provider = "openai"
+
+[hosts.user-host.provider_bindings.openai.audit-model]
+model = "audit-model"
+model_provider = "openai"
+
+[hosts.local-demo]
+transport = "local"
+adapter = "fake"
+
+[hosts.local-demo.provider_bindings.openai.base-model]
+model = "base-model"
+model_provider = "openai"
+
 [hosts.work-host]
 transport = "local"
 adapter = "fake"
 allow_project_selection = true
 
+[hosts.work-host.provider_bindings.openai.base-model]
+model = "base-model"
+model_provider = "openai"
+
+[hosts.work-host.provider_bindings.openai.work-model]
+model = "work-model"
+model_provider = "openai"
+
 [profiles.work]
 host = "work-host"
+model_alias = "work-model"
 
 [profiles.audit]
 model_alias = "audit-model"

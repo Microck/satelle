@@ -10,7 +10,8 @@ use satelle_core::session::{
     TurnStateRevision,
 };
 use satelle_core::{
-    DesktopSessionRecord, LOCAL_DEMO_HOST, SatelleError, SessionId, StopResult, TurnId,
+    DesktopSessionRecord, LOCAL_DEMO_HOST, ProviderAuthValidationMode,
+    PublicProviderDescriptorValidation, SatelleError, SessionId, StopResult, TurnId,
 };
 use serde::Serialize;
 use std::fmt;
@@ -24,8 +25,10 @@ use crate::EphemeralApiAuthenticator;
 use std::sync::Arc;
 
 const MAX_IDEMPOTENCY_KEY_BYTES: usize = 256;
-const TURN_IDEMPOTENCY_DIGEST_SCHEMA_VERSION: u16 = 4;
+const TURN_IDEMPOTENCY_DIGEST_SCHEMA_VERSION: u16 = 5;
 const STOP_IDEMPOTENCY_DIGEST_SCHEMA_VERSION: u16 = 1;
+const PROVIDER_DESCRIPTOR_VALIDATION_DIGEST_SCHEMA_VERSION: u16 = 2;
+const PROVIDER_BINDING_MUTATION_DIGEST_SCHEMA_VERSION: u16 = 1;
 const DURABLE_SETUP_PRINCIPAL_PREFIX: &str = "controller-setup";
 
 /// A diagnostic-safe snapshot captured from the daemon-owned runtime after
@@ -200,7 +203,6 @@ impl TurnIntent {
         mut self,
         model: Option<String>,
         provider: Option<String>,
-        experimental: bool,
         refresh: bool,
     ) -> Result<Self, TurnIntentError> {
         let model = model
@@ -211,8 +213,7 @@ impl TurnIntent {
             .map(ProviderBindingRef::new)
             .transpose()
             .map_err(|_| TurnIntentError::InvalidProvider)?;
-        self.provider_intent =
-            crate::ProviderComputerUseIntent::new(model, provider, experimental, refresh);
+        self.provider_intent = crate::ProviderComputerUseIntent::new(model, provider, refresh);
         Ok(self)
     }
 
@@ -334,7 +335,6 @@ struct CanonicalSessionCreate<'a> {
     execution_mode: TurnExecutionMode,
     model: Option<&'a str>,
     provider: Option<&'a str>,
-    experimental_provider_computer_use: bool,
     refresh_provider_smoke_test: bool,
     turn_execution_timeout_seconds: Option<u32>,
     attachments: &'a [CanonicalAttachment<'a>],
@@ -348,7 +348,6 @@ struct CanonicalTurnCreate<'a> {
     execution_mode: TurnExecutionMode,
     model: Option<&'a str>,
     provider: Option<&'a str>,
-    experimental_provider_computer_use: bool,
     refresh_provider_smoke_test: bool,
     turn_execution_timeout_seconds: Option<u32>,
     attachments: &'a [CanonicalAttachment<'a>],
@@ -377,6 +376,29 @@ struct CanonicalSessionStop<'a> {
     session_id: &'a str,
     #[serde(skip_serializing_if = "Option::is_none")]
     expected_turn_id: Option<&'a str>,
+}
+
+#[derive(Serialize)]
+struct CanonicalProviderDescriptorValidation<'a> {
+    operation: &'static str,
+    host: &'a str,
+    model_alias: &'a str,
+    provider_alias: &'a str,
+    mode: ProviderAuthValidationMode,
+}
+
+#[derive(Serialize)]
+struct CanonicalProviderBindingAuthorization<'a> {
+    operation: &'static str,
+    host: &'a str,
+    authorization: &'a satelle_core::ProviderBindingAuthorization,
+}
+
+#[derive(Serialize)]
+struct CanonicalProviderBindingDeletion<'a> {
+    operation: &'static str,
+    model_alias: &'a str,
+    provider_alias: &'a str,
 }
 
 #[derive(Serialize)]
@@ -705,6 +727,125 @@ impl HostService {
             .execute_exclusive(|| self.runtime.rotate_idempotency_hmac_key())
     }
 
+    pub fn validate_provider_descriptor_idempotent(
+        &self,
+        host: &str,
+        model_alias: &str,
+        provider_alias: &str,
+        mode: ProviderAuthValidationMode,
+        authority: &MutationAuthority,
+    ) -> Result<PublicProviderDescriptorValidation, SatelleError> {
+        let canonical_payload = canonical_payload(
+            &CanonicalProviderDescriptorValidation {
+                operation: "provider_descriptor_validation",
+                host,
+                model_alias,
+                provider_alias,
+                mode,
+            },
+            PROVIDER_DESCRIPTOR_VALIDATION_DIGEST_SCHEMA_VERSION,
+        )?;
+        let _identity_gate = self.operation_capacity.lock_identity_read()?;
+        let identity = self.runtime.authenticated_request_identity(
+            &authority.principal,
+            IdempotentOperation::ProviderDescriptorValidation,
+            &authority.idempotency_key,
+            canonical_payload.as_slice(),
+            canonical_payload.digest_schema_version,
+        )?;
+        if let Some(replay) = self
+            .runtime
+            .claim_provider_descriptor_validation(&identity)?
+        {
+            return Ok(replay);
+        }
+        let validation =
+            match self.validate_provider_descriptor(host, model_alias, provider_alias, mode) {
+                Ok(validation) => validation,
+                Err(error) => {
+                    self.runtime
+                        .fail_provider_descriptor_validation(&identity, &error)?;
+                    return Err(error);
+                }
+            };
+        let public_validation = PublicProviderDescriptorValidation::from(&validation);
+        self.runtime
+            .complete_provider_descriptor_validation(&identity, &public_validation)?;
+        Ok(public_validation)
+    }
+
+    pub fn authorize_provider_binding_idempotent(
+        &self,
+        host: &str,
+        model_alias: &str,
+        provider_alias: &str,
+        authorization: satelle_core::ProviderBindingAuthorization,
+        authority: &MutationAuthority,
+    ) -> Result<satelle_core::PublicResolvedProviderBinding, SatelleError> {
+        let canonical_payload = canonical_payload(
+            &CanonicalProviderBindingAuthorization {
+                operation: "provider_binding_authorization",
+                host,
+                authorization: &authorization,
+            },
+            PROVIDER_BINDING_MUTATION_DIGEST_SCHEMA_VERSION,
+        )?;
+        let _identity_gate = self.operation_capacity.lock_identity_read()?;
+        let identity = self.runtime.authenticated_request_identity(
+            &authority.principal,
+            IdempotentOperation::ProviderBindingAuthorization,
+            &authority.idempotency_key,
+            canonical_payload.as_slice(),
+            canonical_payload.digest_schema_version,
+        )?;
+        self.runtime
+            .authorize_provider_binding_idempotent(&identity, || {
+                self.prepare_provider_binding_authorization(
+                    host,
+                    model_alias,
+                    provider_alias,
+                    authorization,
+                )
+            })
+    }
+
+    pub fn delete_provider_binding_idempotent(
+        &self,
+        model_alias: &str,
+        provider_alias: &str,
+        authority: &MutationAuthority,
+    ) -> Result<bool, SatelleError> {
+        let canonical_payload = canonical_payload(
+            &CanonicalProviderBindingDeletion {
+                operation: "provider_binding_deletion",
+                model_alias,
+                provider_alias,
+            },
+            PROVIDER_BINDING_MUTATION_DIGEST_SCHEMA_VERSION,
+        )?;
+        let _identity_gate = self.operation_capacity.lock_identity_read()?;
+        let identity = self.runtime.authenticated_request_identity(
+            &authority.principal,
+            IdempotentOperation::ProviderBindingDeletion,
+            &authority.idempotency_key,
+            canonical_payload.as_slice(),
+            canonical_payload.digest_schema_version,
+        )?;
+        self.runtime.delete_provider_binding_idempotent(
+            &identity,
+            model_alias,
+            provider_alias,
+            || {
+                satelle_core::session::EffectiveModelRef::new(model_alias)
+                    .map_err(|_| SatelleError::config_error("the model alias is invalid", None))?;
+                satelle_core::session::ProviderBindingRef::new(provider_alias).map_err(|_| {
+                    SatelleError::config_error("the provider alias is invalid", None)
+                })?;
+                Ok(())
+            },
+        )
+    }
+
     pub fn admit_run(
         &self,
         intent: &TurnIntent,
@@ -734,7 +875,6 @@ impl HostService {
                     .provider_intent
                     .provider()
                     .map(ProviderBindingRef::as_str),
-                experimental_provider_computer_use: intent.provider_intent.experimental(),
                 refresh_provider_smoke_test: intent.provider_intent.refresh(),
                 turn_execution_timeout_seconds: Some(turn_execution_timeout.seconds()),
                 attachments: &intent
@@ -843,7 +983,6 @@ impl HostService {
                     .provider_intent
                     .provider()
                     .map(ProviderBindingRef::as_str),
-                experimental_provider_computer_use: intent.provider_intent.experimental(),
                 refresh_provider_smoke_test: intent.provider_intent.refresh(),
                 turn_execution_timeout_seconds: Some(turn_execution_timeout.seconds()),
                 attachments: &intent
@@ -938,7 +1077,6 @@ impl HostService {
                     .provider_intent
                     .provider()
                     .map(ProviderBindingRef::as_str),
-                experimental_provider_computer_use: intent.provider_intent.experimental(),
                 refresh_provider_smoke_test: intent.provider_intent.refresh(),
                 turn_execution_timeout_seconds: Some(turn_execution_timeout.seconds()),
                 attachments: &intent
@@ -1004,7 +1142,6 @@ impl HostService {
                     .provider_intent
                     .provider()
                     .map(ProviderBindingRef::as_str),
-                experimental_provider_computer_use: intent.provider_intent.experimental(),
                 refresh_provider_smoke_test: intent.provider_intent.refresh(),
                 turn_execution_timeout_seconds: Some(turn_execution_timeout.seconds()),
                 attachments: &intent
@@ -1392,7 +1529,6 @@ mod tests {
                 execution_mode: TurnExecutionMode::Yolo,
                 model: Some("model-test"),
                 provider: Some("provider-test"),
-                experimental_provider_computer_use: true,
                 refresh_provider_smoke_test: true,
                 turn_execution_timeout_seconds: Some(30 * 60),
                 attachments: &[],
@@ -1400,19 +1536,18 @@ mod tests {
             TURN_IDEMPOTENCY_DIGEST_SCHEMA_VERSION,
         )
         .expect("serialize Turn idempotency payload");
-        assert_eq!(turn.digest_schema_version, 4);
+        assert_eq!(turn.digest_schema_version, 5);
         assert_eq!(
             serde_json::from_slice::<serde_json::Value>(turn.as_slice())
                 .expect("decode Turn payload"),
             serde_json::json!({
-                "digest_schema_version": 4,
+                "digest_schema_version": 5,
                 "payload": {
                     "operation": "session_create",
                     "prompt": "PRIVATE_DIGEST_VERSION_PROMPT",
                     "execution_mode": "yolo",
                     "model": "model-test",
                     "provider": "provider-test",
-                    "experimental_provider_computer_use": true,
                     "refresh_provider_smoke_test": true,
                     "turn_execution_timeout_seconds": 1800,
                     "attachments": []

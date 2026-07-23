@@ -30,13 +30,137 @@ fn begin_maintenance(
         .expect("setup admission atomically acquires maintenance ownership")
 }
 
+fn rebuild_idempotency_records_as_pre_v11_fixture(connection: &Connection) {
+    // Lowering migration metadata alone leaves the future table shape in place.
+    // A historical fixture must restore the exact predecessor schema that
+    // migration 11 receives from real version 1 through version 10 stores.
+    connection
+        .execute_batch(
+            "CREATE TABLE idempotency_records_pre_v11_fixture (
+                principal_ref TEXT NOT NULL,
+                operation TEXT NOT NULL CHECK (operation IN ('run', 'steer', 'stop')),
+                idempotency_key TEXT NOT NULL,
+                operation_id TEXT NOT NULL,
+                request_digest TEXT NOT NULL
+                    CHECK (
+                        length(request_digest) = 64
+                        AND request_digest NOT GLOB '*[^0-9a-f]*'
+                    ),
+                digest_schema_version INTEGER NOT NULL CHECK (digest_schema_version > 0),
+                hmac_key_version INTEGER NOT NULL CHECK (hmac_key_version > 0),
+                status TEXT NOT NULL CHECK (status IN ('in_progress', 'terminal')),
+                durable_outcome TEXT NOT NULL CHECK (durable_outcome IN (
+                    'v1.turn.starting',
+                    'v1.turn.running',
+                    'v1.turn.recovery_pending',
+                    'v1.turn.completed',
+                    'v1.turn.blocked',
+                    'v1.turn.failed',
+                    'v1.turn.stopped',
+                    'v1.stop.pending',
+                    'v1.stop.stopped_from_starting',
+                    'v1.stop.stopped_from_running',
+                    'v1.stop.stopped_from_recovery_pending',
+                    'v1.stop.already_completed',
+                    'v1.stop.already_blocked',
+                    'v1.stop.already_failed',
+                    'v1.stop.already_stopped',
+                    'v1.stop.not_confirmed_active_changed',
+                    'v1.stop.not_confirmed_active_unchanged',
+                    'v1.stop.not_confirmed_recovery_pending_changed',
+                    'v1.stop.not_confirmed_recovery_pending_unchanged'
+                )),
+                session_id TEXT REFERENCES sessions(session_id) ON DELETE RESTRICT,
+                turn_id TEXT REFERENCES turns(turn_id) ON DELETE RESTRICT,
+                result_session_state_revision TEXT
+                    CHECK (
+                        result_session_state_revision IS NULL
+                        OR (
+                            length(result_session_state_revision) = 16
+                            AND result_session_state_revision NOT GLOB '*[^0-9a-f]*'
+                            AND result_session_state_revision <> '0000000000000000'
+                        )
+                    ),
+                result_session_updated_at TEXT,
+                created_at TEXT NOT NULL,
+                completed_at TEXT,
+                expires_at TEXT NOT NULL,
+                FOREIGN KEY (hmac_key_version)
+                    REFERENCES idempotency_hmac_keys(key_version) ON DELETE RESTRICT,
+                PRIMARY KEY (principal_ref, operation, idempotency_key),
+                CHECK (
+                    (status = 'in_progress' AND completed_at IS NULL)
+                    OR (status = 'terminal' AND completed_at IS NOT NULL)
+                ),
+                CHECK (
+                    operation = 'stop'
+                    OR (
+                        status = 'in_progress'
+                        AND result_session_state_revision IS NULL
+                        AND result_session_updated_at IS NULL
+                    )
+                    OR (
+                        status = 'terminal'
+                        AND result_session_state_revision IS NOT NULL
+                        AND result_session_updated_at IS NOT NULL
+                    )
+                )
+            ) STRICT;
+
+            INSERT INTO idempotency_records_pre_v11_fixture (
+                principal_ref,
+                operation,
+                idempotency_key,
+                operation_id,
+                request_digest,
+                digest_schema_version,
+                hmac_key_version,
+                status,
+                durable_outcome,
+                session_id,
+                turn_id,
+                result_session_state_revision,
+                result_session_updated_at,
+                created_at,
+                completed_at,
+                expires_at
+            )
+            SELECT
+                principal_ref,
+                operation,
+                idempotency_key,
+                operation_id,
+                request_digest,
+                digest_schema_version,
+                hmac_key_version,
+                status,
+                durable_outcome,
+                session_id,
+                turn_id,
+                result_session_state_revision,
+                result_session_updated_at,
+                created_at,
+                completed_at,
+                expires_at
+            FROM idempotency_records;
+
+            DROP TABLE idempotency_records;
+            ALTER TABLE idempotency_records_pre_v11_fixture
+                RENAME TO idempotency_records;
+
+            CREATE INDEX idempotency_expiry
+                ON idempotency_records(expires_at);",
+        )
+        .expect("restore the exact pre-version-eleven idempotency schema");
+}
+
 #[test]
-fn operational_evidence_schema_is_migrated_atomically_to_version_eleven() {
+fn operational_evidence_schema_is_migrated_atomically_to_version_twelve() {
     let state = TempDir::new().expect("temporary state directory");
     let (storage, _) = Storage::open(state.path()).expect("open storage");
     let connection = storage.connection_for_test();
 
-    assert_eq!(11_i64, pragma_integer(connection, "user_version"));
+    assert_eq!(12_i64, pragma_integer(connection, "user_version"));
     let versions = connection
         .prepare("SELECT version FROM schema_migrations ORDER BY version")
         .unwrap()
@@ -46,7 +170,7 @@ fn operational_evidence_schema_is_migrated_atomically_to_version_eleven() {
         .unwrap();
     assert_eq!(
         vec![
-            1_i64, 2_i64, 3_i64, 4_i64, 5_i64, 6_i64, 7_i64, 8_i64, 9_i64, 10_i64, 11_i64,
+            1_i64, 2_i64, 3_i64, 4_i64, 5_i64, 6_i64, 7_i64, 8_i64, 9_i64, 10_i64, 11_i64, 12_i64,
         ],
         versions
     );
@@ -58,6 +182,7 @@ fn operational_evidence_schema_is_migrated_atomically_to_version_eleven() {
         "setup_runs",
         "setup_actions",
         "logs",
+        "authorized_provider_bindings",
     ] {
         let exists: bool = connection
             .query_row(
@@ -104,10 +229,18 @@ fn version_ten_operation_rows_upgrade_without_data_loss_or_foreign_key_damage() 
             ],
         )
         .expect("persist a version ten idempotency record");
+    rebuild_idempotency_records_as_pre_v11_fixture(storage.connection_for_test());
     storage
         .connection_for_test()
-        .execute("DELETE FROM schema_migrations WHERE version = 11", [])
-        .expect("remove version eleven history");
+        .execute("DROP TABLE authorized_provider_bindings", [])
+        .expect("remove version twelve provider bindings table");
+    storage
+        .connection_for_test()
+        .execute(
+            "DELETE FROM schema_migrations WHERE version IN (11, 12)",
+            [],
+        )
+        .expect("remove version eleven and twelve history");
     storage
         .connection_for_test()
         .pragma_update(None, "user_version", 10)
@@ -117,7 +250,7 @@ fn version_ten_operation_rows_upgrade_without_data_loss_or_foreign_key_damage() 
     let upgraded = Storage::open_without_restart_recovery(state.path())
         .expect("upgrade populated version ten storage");
     let connection = upgraded.connection_for_test();
-    assert_eq!(11_i64, pragma_integer(connection, "user_version"));
+    assert_eq!(12_i64, pragma_integer(connection, "user_version"));
     assert_eq!(
         ("run".to_string(), "in_progress".to_string()),
         connection
@@ -284,13 +417,13 @@ fn newer_schema_history_is_rejected_without_downgrade() {
         .connection_for_test()
         .execute(
             "INSERT INTO schema_migrations (version, checksum, applied_at)
-             VALUES (12, ?1, '2026-07-21T00:00:00Z')",
+             VALUES (13, ?1, '2026-07-21T00:00:00Z')",
             ["aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"],
         )
         .expect("insert future migration");
     storage
         .connection_for_test()
-        .pragma_update(None, "user_version", 12)
+        .pragma_update(None, "user_version", 13)
         .expect("mark future schema");
     drop(storage);
 
@@ -301,7 +434,7 @@ fn newer_schema_history_is_rejected_without_downgrade() {
     assert_eq!(error.kind(), StorageErrorKind::MigrationIntegrity);
     let connection = Connection::open(state.path().join(DATABASE_FILE_NAME))
         .expect("future database remains readable");
-    assert_eq!(pragma_integer(&connection, "user_version"), 12);
+    assert_eq!(pragma_integer(&connection, "user_version"), 13);
 }
 
 #[test]
@@ -323,6 +456,7 @@ fn version_seven_api_tokens_upgrade_to_explicit_active_state() {
             .expect("construct existing token registration"),
         )
         .expect("register existing token");
+    rebuild_idempotency_records_as_pre_v11_fixture(storage.connection_for_test());
     storage
         .connection_for_test()
         .execute_batch(
@@ -331,7 +465,8 @@ fn version_seven_api_tokens_upgrade_to_explicit_active_state() {
              ALTER TABLE sessions DROP COLUMN display_name;
              ALTER TABLE session_private_refs DROP COLUMN upstream_goal_ref;
              ALTER TABLE api_tokens DROP COLUMN token_state;
-             DELETE FROM schema_migrations WHERE version IN (8, 9, 10, 11);
+             DROP TABLE authorized_provider_bindings;
+             DELETE FROM schema_migrations WHERE version IN (8, 9, 10, 11, 12);
              PRAGMA user_version = 7;",
         )
         .expect("recreate the version seven token schema");
@@ -339,7 +474,7 @@ fn version_seven_api_tokens_upgrade_to_explicit_active_state() {
 
     let (storage, _) = Storage::open(state.path()).expect("upgrade version seven storage");
     assert_eq!(
-        11_i64,
+        12_i64,
         pragma_integer(storage.connection_for_test(), "user_version")
     );
     let token_state: String = storage
@@ -1582,6 +1717,7 @@ fn version_one_store_upgrades_without_replacing_existing_state() {
     let state = TempDir::new().expect("temporary state directory");
     let (storage, _) = Storage::open(state.path()).expect("open storage");
     let expected_host = storage.host_identity().unwrap();
+    rebuild_idempotency_records_as_pre_v11_fixture(storage.connection_for_test());
     storage
         .connection_for_test()
         .execute_batch(
@@ -1594,7 +1730,8 @@ fn version_one_store_upgrades_without_replacing_existing_state() {
              ALTER TABLE sessions DROP COLUMN display_name;
              ALTER TABLE session_private_refs DROP COLUMN upstream_goal_ref;
              ALTER TABLE api_tokens DROP COLUMN token_state;
-             DELETE FROM schema_migrations WHERE version IN (2, 3, 4, 5, 6, 7, 8, 9, 10, 11);
+             DROP TABLE authorized_provider_bindings;
+             DELETE FROM schema_migrations WHERE version IN (2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12);
              PRAGMA user_version = 1;",
         )
         .unwrap();
@@ -1603,7 +1740,7 @@ fn version_one_store_upgrades_without_replacing_existing_state() {
     let (storage, _) = Storage::open(state.path()).expect("upgrade version one storage");
     assert_eq!(expected_host, storage.host_identity().unwrap());
     assert_eq!(
-        11_i64,
+        12_i64,
         pragma_integer(storage.connection_for_test(), "user_version")
     );
 
@@ -1697,7 +1834,8 @@ fn assert_version_one_corruption_rejected_before_migration(
              ALTER TABLE sessions DROP COLUMN display_name;
              ALTER TABLE session_private_refs DROP COLUMN upstream_goal_ref;
              ALTER TABLE api_tokens DROP COLUMN token_state;
-             DELETE FROM schema_migrations WHERE version IN (2, 3, 4, 5, 6, 7, 8, 9, 10, 11);
+             DROP TABLE authorized_provider_bindings;
+             DELETE FROM schema_migrations WHERE version IN (2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12);
              PRAGMA user_version = 1;",
         )
         .expect("create a logically corrupt version one store");
@@ -1724,6 +1862,7 @@ fn assert_version_one_corruption_rejected_before_migration(
         "native_readiness_results",
         "provider_smoke_successes",
         "provider_smoke_results",
+        "authorized_provider_bindings",
         "setup_runs",
         "setup_actions",
     ] {
@@ -1758,7 +1897,8 @@ fn failed_migration_rolls_back_partial_schema_and_preserves_existing_state() {
              ALTER TABLE sessions DROP COLUMN display_name;
              ALTER TABLE session_private_refs DROP COLUMN upstream_goal_ref;
              ALTER TABLE api_tokens DROP COLUMN token_state;
-             DELETE FROM schema_migrations WHERE version IN (2, 3, 4, 5, 6, 7, 8, 9, 10, 11);
+             DROP TABLE authorized_provider_bindings;
+             DELETE FROM schema_migrations WHERE version IN (2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12);
              PRAGMA user_version = 1;
              CREATE TABLE migration_sentinel (value TEXT NOT NULL) STRICT;
              INSERT INTO migration_sentinel (value) VALUES ('preserve-me');
@@ -1812,6 +1952,7 @@ fn failed_migration_rolls_back_partial_schema_and_preserves_existing_state() {
         "native_readiness_results",
         "provider_smoke_successes",
         "provider_smoke_results",
+        "authorized_provider_bindings",
         "setup_runs",
         "setup_actions",
     ] {
@@ -1943,8 +2084,14 @@ fn native_readiness_pass_is_invalidated_by_an_observation_state_change() {
 
 #[test]
 fn readiness_and_provider_results_round_trip_without_raw_evidence() {
+    const PROVIDER_SECRET_CANARY: &str = "PRIVATE_RESOLVED_PROVIDER_SECRET_CANARY";
+
     let state = TempDir::new().expect("temporary state directory");
     let (mut storage, _) = Storage::open(state.path()).expect("open storage");
+    let resolved_secret =
+        crate::provider_auth::ResolvedProviderSecret::for_test(PROVIDER_SECRET_CANARY);
+    assert!(!format!("{resolved_secret:?}").contains(PROVIDER_SECRET_CANARY));
+    drop(resolved_secret);
     let observed_at = at(1);
     // Fixed-width integer timestamps must preserve a valid subsecond window.
     // Variable-width RFC3339 text would compare these two instants backward.
@@ -2139,6 +2286,204 @@ fn readiness_and_provider_results_round_trip_without_raw_evidence() {
     let bytes = fs::read(state.path().join(DATABASE_FILE_NAME)).unwrap();
     assert!(!contains_bytes(&bytes, b"raw stdout"));
     assert!(!contains_bytes(&bytes, b"raw stderr"));
+    assert!(
+        !contains_bytes(&bytes, PROVIDER_SECRET_CANARY.as_bytes()),
+        "resolved provider material must not enter readiness or provider-smoke rows"
+    );
+    for suffix in ["-wal", "-shm"] {
+        let path = state.path().join(format!("{DATABASE_FILE_NAME}{suffix}"));
+        if let Ok(bytes) = fs::read(path) {
+            assert!(
+                !contains_bytes(&bytes, PROVIDER_SECRET_CANARY.as_bytes()),
+                "resolved provider material must not enter SQLite sidecar files"
+            );
+        }
+    }
+}
+
+#[test]
+fn authorized_provider_binding_round_trips_replaces_restarts_and_deletes() {
+    let state = TempDir::new().expect("create state directory");
+    let (mut storage, _) = Storage::open(state.path()).expect("open storage");
+
+    let initial = satelle_core::ResolvedProviderBinding::from_authorization(
+        satelle_core::ProviderBindingAuthorization::new(
+            "review-model",
+            "review-provider",
+            "gpt-initial",
+            "openai",
+        )
+        .with_endpoint("https://provider-one.invalid/v1")
+        .with_auth_source(satelle_core::ProviderSecretSource::Environment {
+            variable: "SATELLE_PROVIDER_ONE_TOKEN".to_string(),
+        })
+        .with_experimental_provider_computer_use(true),
+        satelle_core::ProviderBindingSource::UserConfig,
+    );
+    let initial_digest = initial.binding_digest().to_string();
+
+    storage
+        .authorize_provider_binding(&initial, at(1))
+        .expect("authorize initial provider binding");
+
+    let loaded_initial = storage
+        .load_authorized_provider_binding("review-model", "review-provider")
+        .expect("load initial provider binding")
+        .expect("initial provider binding exists");
+    assert_eq!(loaded_initial.requested_model_alias(), "review-model");
+    assert_eq!(loaded_initial.requested_provider_alias(), "review-provider");
+    assert_eq!(loaded_initial.model(), "gpt-initial");
+    assert_eq!(loaded_initial.model_provider(), "openai");
+    assert_eq!(
+        loaded_initial.endpoint(),
+        Some("https://provider-one.invalid/v1")
+    );
+    assert_eq!(
+        loaded_initial.auth_source(),
+        Some(&satelle_core::ProviderSecretSource::Environment {
+            variable: "SATELLE_PROVIDER_ONE_TOKEN".to_string(),
+        })
+    );
+    assert_eq!(
+        loaded_initial.source(),
+        satelle_core::ProviderBindingSource::UserConfig
+    );
+    assert!(loaded_initial.experimental_provider_computer_use());
+    assert_eq!(loaded_initial.binding_digest(), initial_digest);
+    assert!(loaded_initial.has_valid_binding_digest());
+
+    let replacement = satelle_core::ResolvedProviderBinding::from_authorization(
+        satelle_core::ProviderBindingAuthorization::new(
+            "review-model",
+            "review-provider",
+            "gpt-replacement",
+            "openai-compatible",
+        )
+        .with_endpoint("https://provider-two.invalid/v1")
+        .with_auth_source(satelle_core::ProviderSecretSource::File {
+            path: PathBuf::from("/run/secrets/provider-two"),
+        }),
+        satelle_core::ProviderBindingSource::UserConfig,
+    );
+    let replacement_digest = replacement.binding_digest().to_string();
+    assert_ne!(replacement_digest, initial_digest);
+
+    storage
+        .authorize_provider_binding(&replacement, at(2))
+        .expect("replace authorized provider binding");
+
+    let loaded_replacement = storage
+        .load_authorized_provider_binding("review-model", "review-provider")
+        .expect("load replacement provider binding")
+        .expect("replacement provider binding exists");
+    assert_eq!(loaded_replacement.requested_model_alias(), "review-model");
+    assert_eq!(
+        loaded_replacement.requested_provider_alias(),
+        "review-provider"
+    );
+    assert_eq!(loaded_replacement.model(), "gpt-replacement");
+    assert_eq!(loaded_replacement.model_provider(), "openai-compatible");
+    assert_eq!(
+        loaded_replacement.endpoint(),
+        Some("https://provider-two.invalid/v1")
+    );
+    assert_eq!(
+        loaded_replacement.auth_source(),
+        Some(&satelle_core::ProviderSecretSource::File {
+            path: PathBuf::from("/run/secrets/provider-two"),
+        })
+    );
+    assert_eq!(
+        loaded_replacement.source(),
+        satelle_core::ProviderBindingSource::UserConfig
+    );
+    assert!(!loaded_replacement.experimental_provider_computer_use());
+    assert_eq!(loaded_replacement.binding_digest(), replacement_digest);
+    assert!(loaded_replacement.has_valid_binding_digest());
+
+    drop(storage);
+    let (mut storage, _) = Storage::open(state.path()).expect("reopen storage");
+
+    let loaded_after_restart = storage
+        .load_authorized_provider_binding("review-model", "review-provider")
+        .expect("load provider binding after restart")
+        .expect("provider binding survives restart");
+    assert_eq!(loaded_after_restart, loaded_replacement);
+    assert_eq!(loaded_after_restart.binding_digest(), replacement_digest);
+    assert_eq!(
+        storage
+            .load_authorized_provider_binding("other-model", "review-provider")
+            .expect("look up another model alias"),
+        None
+    );
+    assert_eq!(
+        storage
+            .load_authorized_provider_binding("review-model", "other-provider")
+            .expect("look up another provider alias"),
+        None
+    );
+
+    assert!(
+        storage
+            .delete_authorized_provider_binding("review-model", "review-provider")
+            .expect("delete provider binding")
+    );
+    assert!(
+        !storage
+            .delete_authorized_provider_binding("review-model", "review-provider")
+            .expect("delete absent provider binding")
+    );
+    assert_eq!(
+        storage
+            .load_authorized_provider_binding("review-model", "review-provider")
+            .expect("load deleted provider binding"),
+        None
+    );
+
+    drop(storage);
+    let (storage, _) = Storage::open(state.path()).expect("reopen storage after deletion");
+    assert_eq!(
+        storage
+            .load_authorized_provider_binding("review-model", "review-provider")
+            .expect("load deleted provider binding after restart"),
+        None
+    );
+}
+
+#[test]
+fn authorized_provider_binding_tampered_digest_fails_closed() {
+    let state = TempDir::new().expect("create state directory");
+    let (mut storage, _) = Storage::open(state.path()).expect("open storage");
+    let binding = satelle_core::ResolvedProviderBinding::from_authorization(
+        satelle_core::ProviderBindingAuthorization::new(
+            "review-model",
+            "review-provider",
+            "gpt-authorized",
+            "openai",
+        )
+        .with_auth_source(satelle_core::ProviderSecretSource::Environment {
+            variable: "SATELLE_PROVIDER_TOKEN".to_string(),
+        }),
+        satelle_core::ProviderBindingSource::UserConfig,
+    );
+
+    storage
+        .authorize_provider_binding(&binding, at(1))
+        .expect("authorize provider binding");
+    storage
+        .connection_for_test()
+        .execute(
+            "UPDATE authorized_provider_bindings
+             SET binding_digest = ?1
+             WHERE model_alias = ?2 AND provider_alias = ?3",
+            rusqlite::params!["0".repeat(64), "review-model", "review-provider"],
+        )
+        .expect("tamper with the stored binding digest");
+
+    let error = storage
+        .load_authorized_provider_binding("review-model", "review-provider")
+        .expect_err("a mismatched stored digest must fail closed");
+    assert_eq!(error.kind(), StorageErrorKind::InvalidStoredState);
 }
 
 #[test]

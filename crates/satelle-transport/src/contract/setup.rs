@@ -1,4 +1,10 @@
+use super::session::ApiRequestContract;
 use super::{AuthenticatedResponseContract, RequestId, define_schema_token};
+use satelle_core::{
+    ProviderAuthObservationSource, ProviderAuthValidationMode, ProviderAuthValidationOutcome,
+    ProviderAuthValidationResult, ProviderBindingAuthorization, PublicProviderDescriptorValidation,
+    PublicResolvedProviderBinding,
+};
 use serde::{Deserialize, Serialize};
 use std::fmt;
 use zeroize::{Zeroize, Zeroizing};
@@ -18,6 +24,211 @@ define_schema_token!(
     BootstrapMaintenanceSchema,
     "satelle.bootstrap-maintenance.v1"
 );
+define_schema_token!(
+    ProviderBindingAuthorizationSchema,
+    "satelle.provider-binding-authorization.v1"
+);
+define_schema_token!(
+    ProviderBindingAuthorizationResponseSchema,
+    "satelle.provider-binding-authorization-response.v1"
+);
+define_schema_token!(
+    ProviderBindingDeletionResponseSchema,
+    "satelle.provider-binding-deletion-response.v1"
+);
+define_schema_token!(
+    ProviderDescriptorValidationSchema,
+    "satelle.provider-binding-validation.v3"
+);
+define_schema_token!(
+    ProviderDescriptorValidationResponseSchema,
+    "satelle.provider-binding-validation-response.v3"
+);
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProviderBindingAuthorizationRequest {
+    schema_version: ProviderBindingAuthorizationSchema,
+    #[serde(flatten)]
+    authorization: ProviderBindingAuthorization,
+}
+
+impl ProviderBindingAuthorizationRequest {
+    pub fn new(authorization: ProviderBindingAuthorization) -> Self {
+        Self {
+            schema_version: ProviderBindingAuthorizationSchema,
+            authorization,
+        }
+    }
+
+    pub fn authorization(&self) -> &ProviderBindingAuthorization {
+        &self.authorization
+    }
+
+    pub fn into_authorization(self) -> ProviderBindingAuthorization {
+        self.authorization
+    }
+}
+
+impl ApiRequestContract for ProviderBindingAuthorizationRequest {
+    const SCHEMA_VERSION: &'static str = ProviderBindingAuthorizationSchema::TOKEN;
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProviderDescriptorValidationRequest {
+    schema_version: ProviderDescriptorValidationSchema,
+    mode: ProviderAuthValidationMode,
+}
+
+impl ProviderDescriptorValidationRequest {
+    pub fn new(mode: ProviderAuthValidationMode) -> Self {
+        Self {
+            schema_version: ProviderDescriptorValidationSchema,
+            mode,
+        }
+    }
+
+    pub const fn mode(&self) -> ProviderAuthValidationMode {
+        self.mode
+    }
+}
+
+impl ApiRequestContract for ProviderDescriptorValidationRequest {
+    const SCHEMA_VERSION: &'static str = ProviderDescriptorValidationSchema::TOKEN;
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProviderBindingAuthorizationResponse {
+    schema_version: ProviderBindingAuthorizationResponseSchema,
+    request_id: RequestId,
+    host_identity: String,
+    binding: PublicResolvedProviderBinding,
+}
+
+impl ProviderBindingAuthorizationResponse {
+    pub(crate) fn new(
+        request_id: RequestId,
+        host_identity: String,
+        binding: PublicResolvedProviderBinding,
+    ) -> Self {
+        Self {
+            schema_version: ProviderBindingAuthorizationResponseSchema,
+            request_id,
+            host_identity,
+            binding,
+        }
+    }
+
+    pub fn binding(&self) -> &PublicResolvedProviderBinding {
+        &self.binding
+    }
+}
+
+impl AuthenticatedResponseContract for ProviderBindingAuthorizationResponse {
+    fn request_id(&self) -> &RequestId {
+        &self.request_id
+    }
+
+    fn host_identity(&self) -> &str {
+        &self.host_identity
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProviderBindingDeletionResponse {
+    schema_version: ProviderBindingDeletionResponseSchema,
+    request_id: RequestId,
+    host_identity: String,
+    deleted: bool,
+}
+
+impl ProviderBindingDeletionResponse {
+    pub(crate) fn new(request_id: RequestId, host_identity: String, deleted: bool) -> Self {
+        Self {
+            schema_version: ProviderBindingDeletionResponseSchema,
+            request_id,
+            host_identity,
+            deleted,
+        }
+    }
+
+    pub const fn deleted(&self) -> bool {
+        self.deleted
+    }
+}
+
+impl AuthenticatedResponseContract for ProviderBindingDeletionResponse {
+    fn request_id(&self) -> &RequestId {
+        &self.request_id
+    }
+
+    fn host_identity(&self) -> &str {
+        &self.host_identity
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProviderDescriptorValidationResponse {
+    schema_version: ProviderDescriptorValidationResponseSchema,
+    request_id: RequestId,
+    host_identity: String,
+    resolved_binding: PublicResolvedProviderBinding,
+    validation: ProviderAuthValidationResult,
+}
+
+impl ProviderDescriptorValidationResponse {
+    pub(crate) fn new(
+        request_id: RequestId,
+        host_identity: String,
+        result: &PublicProviderDescriptorValidation,
+    ) -> Self {
+        Self {
+            schema_version: ProviderDescriptorValidationResponseSchema,
+            request_id,
+            host_identity,
+            resolved_binding: result.resolved_binding().clone(),
+            validation: result.validation(),
+        }
+    }
+
+    pub fn resolved_binding(&self) -> &PublicResolvedProviderBinding {
+        &self.resolved_binding
+    }
+
+    pub fn model(&self) -> &str {
+        self.resolved_binding.model()
+    }
+
+    pub fn model_provider(&self) -> &str {
+        self.resolved_binding.model_provider()
+    }
+
+    pub const fn outcome(&self) -> ProviderAuthValidationOutcome {
+        self.validation.outcome()
+    }
+
+    pub const fn observation_source(&self) -> ProviderAuthObservationSource {
+        self.validation.observation_source()
+    }
+
+    pub const fn validation(&self) -> ProviderAuthValidationResult {
+        self.validation
+    }
+}
+
+impl AuthenticatedResponseContract for ProviderDescriptorValidationResponse {
+    fn request_id(&self) -> &RequestId {
+        &self.request_id
+    }
+
+    fn host_identity(&self) -> &str {
+        &self.host_identity
+    }
+}
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct BootstrapMaintenanceResponse {
@@ -214,6 +425,52 @@ impl AuthenticatedResponseContract for DurableTokenActivationResponse {
 
     fn host_identity(&self) -> &str {
         &self.host_identity
+    }
+}
+
+#[cfg(test)]
+mod provider_binding_contract_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn authorization_is_explicit_and_validation_is_alias_scoped() {
+        let authorization = ProviderBindingAuthorizationRequest::new(
+            ProviderBindingAuthorization::new("vision", "open_ai", "gpt-5.6", "openai")
+                .with_experimental_provider_computer_use(true),
+        );
+        assert_eq!(
+            serde_json::to_value(authorization).unwrap(),
+            json!({
+                "schema_version": "satelle.provider-binding-authorization.v1",
+                "requested_model_alias": "vision",
+                "requested_provider_alias": "open_ai",
+                "model": "gpt-5.6",
+                "model_provider": "openai",
+                "experimental_provider_computer_use": true
+            })
+        );
+
+        assert_eq!(
+            serde_json::to_value(ProviderDescriptorValidationRequest::new(
+                ProviderAuthValidationMode::RefreshProviderSmoke,
+            ))
+            .unwrap(),
+            json!({
+                "schema_version": "satelle.provider-binding-validation.v3",
+                "mode": "refresh_provider_smoke"
+            })
+        );
+    }
+
+    #[test]
+    fn validation_rejects_caller_binding_material() {
+        let request = json!({
+            "schema_version": "satelle.provider-binding-validation.v3",
+            "mode": "cached",
+            "endpoint": "https://attacker.example"
+        });
+        assert!(serde_json::from_value::<ProviderDescriptorValidationRequest>(request).is_err());
     }
 }
 

@@ -5,7 +5,7 @@ use crate::storage::{
     LeaseOwner, MaintenanceLeaseCapability, ObservedUpstreamRef, RecoverySubject, StorageErrorKind,
 };
 use satelle_core::session::{ExpectedRevisions, Session, TurnExecutionMode, TurnTransition};
-use satelle_core::{SatelleError, SatelleEvent, SessionId, TurnId};
+use satelle_core::{ResolvedProviderBinding, SatelleError, SatelleEvent, SessionId, TurnId};
 #[cfg(test)]
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError, SyncSender};
@@ -255,6 +255,7 @@ pub(super) struct ExecutionPlan {
     pub(super) execution_mode: TurnExecutionMode,
     pub(super) work: TurnWork,
     pub(super) provider_smoke_event: Option<satelle_core::SatelleEventBody>,
+    pub(super) resolved_provider_binding: Option<ResolvedProviderBinding>,
     pub(super) attachments: crate::attachment::StagedAttachments,
 }
 
@@ -375,15 +376,18 @@ impl RuntimeEngine {
             .turn(&turn_id)
             .ok_or_else(|| model::integrity_failure("the executing Turn is missing"))?
             .execution_policy();
-        let result = self.adapter.execute(ExecuteRequest::new(
-            &plan.host,
-            &plan.prompt,
-            plan.execution_mode,
-            execution_policy,
-            AdapterSubject::new(&plan.work.subject),
-            &persist_upstream_ref,
-            plan.attachments.images(),
-        ))?;
+        let result = self.adapter.execute(
+            ExecuteRequest::new(
+                &plan.host,
+                &plan.prompt,
+                plan.execution_mode,
+                execution_policy,
+                AdapterSubject::new(&plan.work.subject),
+                &persist_upstream_ref,
+                plan.attachments.images(),
+            )
+            .with_resolved_provider_binding(plan.resolved_provider_binding.as_ref()),
+        )?;
         let Some(transition) = result.transition() else {
             let session = self
                 .lock_storage()?

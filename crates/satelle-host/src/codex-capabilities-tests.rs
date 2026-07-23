@@ -44,18 +44,31 @@ fn main() {
     line.clear();
     input.read_line(&mut line).expect("read config request");
     assert!(line.contains("\"method\":\"config/read\""));
-    assert!(line.contains("\"includeLayers\":true"));
+    if mode == "defaults" {
+        assert!(line.contains("\"includeLayers\":false"));
+    } else {
+        assert!(line.contains("\"includeLayers\":true"));
+    }
 
-    let config = match mode.as_str() {
-        "stable" => r#"{"computer_use":{"windows":{"always_allowed_app_ids":["fixture-paint.exe"]}}}"#,
-        "legacy" => "{}",
+    let (effective_config, origins, layer_config) = match mode.as_str() {
+        "stable" => (
+            "{}",
+            "{}",
+            r#"{"computer_use":{"windows":{"always_allowed_app_ids":["fixture-paint.exe"]}}}"#,
+        ),
+        "legacy" => ("{}", "{}", "{}"),
+        "defaults" => (
+            r#"{"model":"gpt-effective","model_provider":"openai-effective"}"#,
+            r#"{"model":{"type":"user","file":"PRIVATE_PATH_CANARY"},"model_provider":{"type":"sessionFlags","hash":"PRIVATE_HASH_CANARY"}}"#,
+            r#"{"private_flattened_canary":"PRIVATE_LAYER_CANARY"}"#,
+        ),
         _ => std::process::exit(2),
     };
     let config_file = std::path::Path::new(&codex_home).join("config.toml");
     writeln!(
         output,
-        "{{\"id\":2,\"result\":{{\"config\":{{}},\"origins\":{{}},\"layers\":[{{\"name\":{{\"type\":\"user\",\"file\":\"{}\",\"profile\":null}},\"version\":\"fixture\",\"config\":{config},\"disabledReason\":null}}]}}}}",
-        json_escape(&config_file.display().to_string())
+        "{{\"id\":2,\"result\":{{\"config\":{effective_config},\"origins\":{origins},\"layers\":[{{\"name\":{{\"type\":\"user\",\"file\":\"{}\",\"profile\":null}},\"version\":\"fixture\",\"config\":{layer_config},\"disabledReason\":null}}]}}}}",
+        json_escape(&config_file.display().to_string()),
     )
     .expect("write config response");
     output.flush().expect("flush config response");
@@ -172,6 +185,29 @@ fn windows_config_read_result(
             "disabledReason": null,
         }]
     })
+}
+
+#[test]
+fn effective_defaults_probe_keeps_only_the_model_pair_and_closed_origins() {
+    let fixture = compile_windows_app_policy_fixture();
+    let codex_home = tempfile::tempdir().expect("create deterministic Codex home");
+    let defaults = probe_effective_codex_defaults_with(
+        windows_app_policy_fixture_command(&fixture, "defaults", codex_home.path()),
+        Duration::from_secs(3),
+    )
+    .expect("read effective Codex defaults");
+
+    assert_eq!(defaults.model(), "gpt-effective");
+    assert_eq!(defaults.model_provider(), "openai-effective");
+    assert_eq!(defaults.model_origin(), CodexConfigOriginClass::User);
+    assert_eq!(
+        defaults.model_provider_origin(),
+        CodexConfigOriginClass::Session
+    );
+    let debug = format!("{defaults:?}");
+    assert!(!debug.contains("PRIVATE_PATH_CANARY"));
+    assert!(!debug.contains("PRIVATE_HASH_CANARY"));
+    assert!(!debug.contains("PRIVATE_LAYER_CANARY"));
 }
 
 #[test]

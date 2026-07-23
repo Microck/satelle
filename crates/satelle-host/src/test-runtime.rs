@@ -133,9 +133,31 @@ impl ComputerUseAdapter for PendingComputerUseAdapter {
 }
 
 impl ComputerUseAdapter for FakeComputerUseAdapter {
-    fn preflight(
+    fn resolve_provider_binding(
         &self,
         _host: &str,
+        provider_intent: &crate::ProviderComputerUseIntent,
+    ) -> Result<satelle_core::ResolvedProviderBinding, SatelleError> {
+        let binding = provider_intent
+            .resolved_provider_binding()
+            .cloned()
+            .unwrap_or_else(|| {
+                satelle_core::ResolvedProviderBinding::from_authorization(
+                    satelle_core::ProviderBindingAuthorization::new(
+                        "fake-model-v1",
+                        "fake-provider-v1",
+                        "fake-model-v1",
+                        "fake-provider-v1",
+                    ),
+                    satelle_core::ProviderBindingSource::HostOwned,
+                )
+            });
+        Ok(binding)
+    }
+
+    fn preflight(
+        &self,
+        host: &str,
         provider_intent: &crate::ProviderComputerUseIntent,
     ) -> Result<AdapterReadiness, SatelleError> {
         let desktop_binding = DesktopBindingRef::new("local-demo-desktop-v1")
@@ -185,6 +207,7 @@ impl ComputerUseAdapter for FakeComputerUseAdapter {
         } else {
             ProviderSmokeSource::Live
         });
+        let resolved_binding = self.resolve_provider_binding(host, provider_intent)?;
         AdapterReadiness::ready(
             "fake",
             "fake native computer-use adapter is ready for local demo",
@@ -192,6 +215,7 @@ impl ComputerUseAdapter for FakeComputerUseAdapter {
             execution_policy,
             evidence,
             Some(provider_evidence),
+            Some(resolved_binding),
         )
         .map_err(|_| adapter_configuration_error("preflight evidence policy"))
     }

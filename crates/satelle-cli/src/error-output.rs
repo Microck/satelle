@@ -210,7 +210,9 @@ fn error_contract(code: ErrorCode) -> ErrorContract {
         | ErrorCode::DesktopSessionConsoleUnavailable
         | ErrorCode::DesktopSessionNativeSelectorWrongPlatform
         | ErrorCode::DesktopSessionNativeSelectorUnmatched
-        | ErrorCode::DoctorReadinessBlockersFound => ErrorContract {
+        | ErrorCode::DoctorReadinessBlockersFound
+        | ErrorCode::ProviderSecretResolutionFailed
+        | ErrorCode::ExperimentalProviderNotValidated => ErrorContract {
             category: ErrorCategory::Readiness,
             retryable: false,
             outcome: "The Host is not ready for this command.",
@@ -283,6 +285,8 @@ fn error_contract(code: ErrorCode) -> ErrorContract {
         | ErrorCode::DesktopBindingRequired
         | ErrorCode::DoctorRefreshScopeRequired
         | ErrorCode::DoctorRefreshTimeoutWithoutRefresh
+        | ErrorCode::ExperimentalProviderOptInRequired
+        | ErrorCode::ModelProviderBindingMissing
         | ErrorCode::InputRequired => ErrorContract {
             category: ErrorCategory::InvalidRequest,
             retryable: false,

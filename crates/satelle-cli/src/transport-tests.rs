@@ -1,4 +1,5 @@
 use super::*;
+use crate::{ProviderSelection, projected_experimental_provider_computer_use};
 use satelle_core::session::{
     ApprovalPolicy, DesktopBindingRef, DesktopTarget, EffectiveModelRef, ExecutionPolicy,
     ExperimentalFeatureChoices, FeatureChoice, ProviderBindingRef, SandboxPolicy, SessionActivity,
@@ -291,6 +292,15 @@ fn lifecycle_readiness() -> Result<AdapterReadiness, SatelleError> {
         observed_at + time::Duration::hours(1),
     )
     .map_err(|error| SatelleError::not_implemented(format!("test provider evidence: {error}")))?;
+    let resolved_binding = satelle_core::ResolvedProviderBinding::from_authorization(
+        satelle_core::ProviderBindingAuthorization::new(
+            "interrupt-test-model",
+            "interrupt-test-provider",
+            "interrupt-test-model",
+            "interrupt-test-provider",
+        ),
+        satelle_core::ProviderBindingSource::HostOwned,
+    );
     AdapterReadiness::ready(
         "interrupt-test",
         "interrupt test readiness",
@@ -298,6 +308,7 @@ fn lifecycle_readiness() -> Result<AdapterReadiness, SatelleError> {
         execution_policy,
         evidence,
         Some(provider_evidence),
+        Some(resolved_binding),
     )
     .map_err(|error| SatelleError::not_implemented(format!("test readiness: {error}")))
 }
@@ -2238,7 +2249,7 @@ impl ComputerUseAdapter for RecordingProviderIntentAdapter {
     }
 
     fn execute(&self, _request: ExecuteRequest<'_>) -> Result<ExecuteResult, SatelleError> {
-        unreachable!("failed preflight must prevent adapter execution")
+        Ok(ExecuteResult::new(TurnTransition::Completed, Vec::new()))
     }
 
     fn observe_stop(&self, _subject: AdapterSubject<'_>) -> Result<StopObservation, SatelleError> {
@@ -2265,10 +2276,20 @@ fn local_turn_request_provider_intent_reaches_host_preflight() {
     )
     .unwrap();
     let transport = LocalTransport::new(LOCAL_DEMO_HOST.to_string(), service);
+    transport
+        .authorize_provider_binding(
+            &satelle_core::ProviderBindingAuthorization::new(
+                "model-explicit",
+                "provider-explicit",
+                "resolved-model",
+                "resolved-provider",
+            )
+            .with_experimental_provider_computer_use(true),
+        )
+        .expect("authorize the exact aliases before Host preflight");
     let request = TurnRequest::new("provider intent probe").with_provider_intent(
         Some("model-explicit".to_string()),
         Some("provider-explicit".to_string()),
-        true,
         true,
     );
 
@@ -2285,7 +2306,108 @@ fn local_turn_request_provider_intent_reaches_host_preflight() {
     let observed = observed.as_ref().expect("adapter observed provider intent");
     assert_eq!(observed.model().unwrap().as_str(), "model-explicit");
     assert_eq!(observed.provider().unwrap().as_str(), "provider-explicit");
-    assert!(observed.experimental());
+    assert!(observed.refresh());
+}
+
+#[test]
+fn turn_request_wire_carries_only_provider_aliases_and_refresh_intent() {
+    let request = TurnRequest::new("alias-only wire probe").with_provider_intent(
+        Some("model-alias".to_string()),
+        Some("provider-alias".to_string()),
+        true,
+    );
+    let wire = serde_json::to_value(&request).expect("serialize Turn request");
+    let wire = wire.as_object().expect("Turn request wire object");
+
+    assert_eq!(wire["model"], "model-alias");
+    assert_eq!(wire["provider"], "provider-alias");
+    assert_eq!(wire["refresh_provider_smoke_test"], true);
+    for forbidden in [
+        "provider_binding_candidate",
+        "model_provider",
+        "endpoint",
+        "auth_source",
+        "source",
+        "resolved_secret",
+        "experimental",
+    ] {
+        assert!(
+            !wire.contains_key(forbidden),
+            "Controller Turn request must not carry Host-owned field {forbidden}"
+        );
+    }
+}
+
+#[test]
+fn setup_authorization_is_revalidated_by_alias_before_alias_only_turn_preflight() {
+    let state = TestStateDir::new().expect("temporary state directory");
+    let observed = Arc::new(Mutex::new(None));
+    let service = HostService::with_adapter_for_tests_at(
+        state.path(),
+        RecordingProviderIntentAdapter {
+            observed: Arc::clone(&observed),
+        },
+    )
+    .expect("construct recording Host service");
+    let transport = LocalTransport::new(LOCAL_DEMO_HOST.to_string(), service);
+    let authorization =
+        satelle_core::ProviderBindingAuthorization::new("review", "openai", "gpt-5.2", "openai");
+
+    transport
+        .authorize_provider_binding(&authorization)
+        .expect("setup authorizes the alias-scoped Provider Binding");
+    let validation = transport
+        .validate_provider_descriptor(
+            "review",
+            "openai",
+            satelle_core::ProviderAuthValidationMode::Cached,
+        )
+        .expect("the distinct post-setup preflight resolves the authorized aliases");
+    let resolved =
+        serde_json::to_value(&validation.resolved_binding).expect("serialize resolved binding");
+    assert_eq!(resolved["requested_model_alias"], "review");
+    assert_eq!(resolved["requested_provider_alias"], "openai");
+    assert_eq!(resolved["model"], "gpt-5.2");
+    assert_eq!(resolved["model_provider"], "openai");
+    assert_eq!(resolved["source"], "user_config");
+
+    let request = TurnRequest::new("post-setup alias preflight").with_provider_intent(
+        Some("review".to_string()),
+        Some("openai".to_string()),
+        true,
+    );
+    let wire = serde_json::to_value(&request).expect("serialize alias-only Turn request");
+    let wire = wire.as_object().expect("Turn request wire object");
+    for forbidden in [
+        "provider_binding_authorization",
+        "provider_binding_candidate",
+        "resolved_provider_binding",
+        "model_provider",
+        "endpoint",
+        "auth_source",
+        "source",
+        "resolved_secret",
+    ] {
+        assert!(
+            !wire.contains_key(forbidden),
+            "post-setup Turn request must not carry Host-owned field {forbidden}"
+        );
+    }
+
+    let failure = match transport.run(&request, false, &mut |_| Ok(())) {
+        Err(failure) => failure,
+        Ok(_) => panic!("recording adapter should reject after the second preflight"),
+    };
+    assert_eq!(
+        failure.error().code,
+        ErrorCode::UnsupportedProviderComputerUse
+    );
+    let observed = observed.lock().expect("recorded provider intent");
+    let observed = observed
+        .as_ref()
+        .expect("second preflight observed alias-only intent");
+    assert_eq!(observed.model().unwrap().as_str(), "review");
+    assert_eq!(observed.provider().unwrap().as_str(), "openai");
     assert!(observed.refresh());
 }
 
@@ -2676,6 +2798,65 @@ impl Drop for DirectFixture {
             }
         }
     }
+}
+
+#[test]
+fn host_provider_validation_drives_conflicting_controller_projection() {
+    let fixture = DirectFixture::start();
+    let controller_selection = ProviderSelection {
+        requested_model_alias: Some("review".to_string()),
+        requested_provider_alias: Some("openai".to_string()),
+        authorization: Some(
+            satelle_core::ProviderBindingAuthorization::new(
+                "review",
+                "openai",
+                "controller-model-canary",
+                "controller-provider-canary",
+            )
+            .with_experimental_provider_computer_use(true),
+        ),
+        auth_source_name: None,
+        experimental_provider_computer_use: true,
+    };
+    fixture
+        .service
+        .authorize_provider_binding(
+            LOCAL_DEMO_HOST,
+            "review",
+            "openai",
+            satelle_core::ProviderBindingAuthorization::new(
+                "review",
+                "openai",
+                "host-model",
+                "openai",
+            ),
+        )
+        .expect("preauthorize the Host-owned provider binding");
+
+    let validation = fixture
+        .transport()
+        .validate_provider_descriptor(
+            "review",
+            "openai",
+            satelle_core::ProviderAuthValidationMode::Cached,
+        )
+        .expect("validate the requested aliases over HTTP");
+
+    assert_eq!(validation.resolved_binding.model(), "host-model");
+    assert_eq!(validation.resolved_binding.model_provider(), "openai");
+    assert_eq!(
+        validation.resolved_binding.source(),
+        satelle_core::ProviderBindingSource::UserConfig
+    );
+    assert!(
+        !validation
+            .resolved_binding
+            .experimental_provider_computer_use()
+    );
+    assert!(!projected_experimental_provider_computer_use(
+        &controller_selection,
+        Some(&validation),
+    ));
 }
 
 fn install_silent_event_peer(
@@ -4014,6 +4195,56 @@ fn desktop_selection_api_errors_round_trip_only_validated_details() {
         mapped.details.get("remote_code"),
         Some(&serde_json::json!("invalid-daemon-response"))
     );
+}
+
+#[test]
+fn provider_binding_api_errors_preserve_typed_remote_codes() {
+    let api_error = |code: ApiErrorCode| {
+        serde_json::from_value::<satelle_transport::ApiError>(serde_json::json!({
+            "schema_version": "satelle.error.v1",
+            "request_id": satelle_transport::RequestId::new().to_string(),
+            "host_identity": "host-direct-test",
+            "code": code.as_str(),
+            "category": "readiness",
+            "retryable": false,
+            "message": "Provider Binding preflight failed",
+            "details": null,
+            "docs_url": null,
+            "suggested_commands": []
+        }))
+        .expect("deserialize Provider Binding API error")
+    };
+    let cases = [
+        (
+            ApiErrorCode::ModelProviderBindingMissing,
+            ErrorCode::ModelProviderBindingMissing,
+        ),
+        (
+            ApiErrorCode::ExperimentalProviderOptInRequired,
+            ErrorCode::ExperimentalProviderOptInRequired,
+        ),
+        (
+            ApiErrorCode::ProviderSecretResolutionFailed,
+            ErrorCode::ProviderSecretResolutionFailed,
+        ),
+        (
+            ApiErrorCode::ExperimentalProviderNotValidated,
+            ErrorCode::ExperimentalProviderNotValidated,
+        ),
+    ];
+
+    for (remote_code, expected_code) in cases {
+        let failure = direct_admission_error(
+            "direct-test",
+            DaemonClientError::Api {
+                status: 422_u16.try_into().expect("422 is a valid HTTP status"),
+                error: Box::new(api_error(remote_code)),
+            },
+        );
+
+        assert_eq!(failure.phase(), TurnAdmissionPhase::NotAdmitted);
+        assert_eq!(failure.error().code, expected_code);
+    }
 }
 
 #[test]

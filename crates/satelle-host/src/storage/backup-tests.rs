@@ -379,15 +379,15 @@ fn restore_validation_rejects_symlink_nonregular_and_nonprivate_inputs() {
     let state_directory = fixture.state_directory();
     let candidates = [
         (
-            "satelle.sqlite3.migration-v11-0198a146-5ec2-7dd5-b51c-7d5e241e5890.backup",
+            "satelle.sqlite3.migration-v12-0198a146-5ec2-7dd5-b51c-7d5e241e5890.backup",
             "symlink",
         ),
         (
-            "satelle.sqlite3.migration-v11-0198a146-5ec2-7dd5-b51c-7d5e241e5891.backup",
+            "satelle.sqlite3.migration-v12-0198a146-5ec2-7dd5-b51c-7d5e241e5891.backup",
             "directory",
         ),
         (
-            "satelle.sqlite3.migration-v11-0198a146-5ec2-7dd5-b51c-7d5e241e5892.backup",
+            "satelle.sqlite3.migration-v12-0198a146-5ec2-7dd5-b51c-7d5e241e5892.backup",
             "nonprivate",
         ),
     ];
@@ -431,7 +431,7 @@ fn restore_validation_rejects_symlink_nonregular_and_nonprivate_inputs() {
 fn restore_validation_rejects_hardlinked_inputs() {
     let fixture = BackupFixture::new(1);
     let source_name = fixture.backup_file_name().to_owned();
-    let hardlink_name = "satelle.sqlite3.migration-v11-0198a146-5ec2-7dd5-b51c-7d5e241e5893.backup";
+    let hardlink_name = "satelle.sqlite3.migration-v12-0198a146-5ec2-7dd5-b51c-7d5e241e5893.backup";
     fs::hard_link(
         fixture.state_root.join(&source_name),
         fixture.state_root.join(hardlink_name),
@@ -456,7 +456,7 @@ fn restore_validation_rejects_windows_reparse_and_broadened_dacl_inputs() {
     let fixture = BackupFixture::new(1);
     let source_name = fixture.backup_file_name().to_owned();
     let source_manifest = fixture.manifest(&source_name);
-    let reparse_name = "satelle.sqlite3.migration-v11-0198a146-5ec2-7dd5-b51c-7d5e241e5894.backup";
+    let reparse_name = "satelle.sqlite3.migration-v12-0198a146-5ec2-7dd5-b51c-7d5e241e5894.backup";
     super::windows::create_file_symlink_for_test(
         &fixture.state_root.join(&source_name),
         &fixture.state_root.join(reparse_name),
@@ -467,7 +467,7 @@ fn restore_validation_rejects_windows_reparse_and_broadened_dacl_inputs() {
     fixture.write_manifest(reparse_name, &reparse_manifest);
 
     let broad_dacl_name =
-        "satelle.sqlite3.migration-v11-0198a146-5ec2-7dd5-b51c-7d5e241e5895.backup";
+        "satelle.sqlite3.migration-v12-0198a146-5ec2-7dd5-b51c-7d5e241e5895.backup";
     fs::copy(
         fixture.state_root.join(&source_name),
         fixture.state_root.join(broad_dacl_name),

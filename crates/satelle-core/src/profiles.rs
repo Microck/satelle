@@ -14,6 +14,7 @@ const PROFILE_KEYS: &[&str] = &[
     "model_alias",
     "provider_alias",
     "experimental_provider_computer_use",
+    "experimental_provider_computer_use_by_provider",
     "yolo",
     "timeouts",
     "native_readiness_cache_ttl",
@@ -68,6 +69,8 @@ pub(super) struct ProfileConfig {
     model_alias: Option<String>,
     provider_alias: Option<String>,
     experimental_provider_computer_use: Option<bool>,
+    #[serde(default)]
+    experimental_provider_computer_use_by_provider: BTreeMap<String, bool>,
     yolo: Option<bool>,
     timeouts: Option<TimeoutConfig>,
     native_readiness_cache_ttl: Option<ExplicitDuration>,
@@ -104,6 +107,13 @@ impl ProfileConfig {
         {
             config.experimental_provider_computer_use = Some(enabled);
         }
+        if source.allows_user_policy() {
+            for (provider_alias, enabled) in &self.experimental_provider_computer_use_by_provider {
+                config
+                    .experimental_provider_computer_use_by_provider
+                    .insert(provider_alias.clone(), *enabled);
+            }
+        }
     }
 
     pub(super) fn apply_to_host(
@@ -134,6 +144,12 @@ impl ProfileConfig {
             && let Some(enabled) = self.experimental_provider_computer_use
         {
             host.experimental_provider_computer_use = Some(enabled);
+        }
+        if source.allows_user_policy() {
+            for (provider_alias, enabled) in &self.experimental_provider_computer_use_by_provider {
+                host.experimental_provider_computer_use_by_provider
+                    .insert(provider_alias.clone(), *enabled);
+            }
         }
         if self.host.as_deref() == Some(alias)
             && self.yolo_applies(source)

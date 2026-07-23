@@ -1,3 +1,4 @@
+use crate::provider_auth::ResolvedProviderSecret;
 use base64::Engine as _;
 use satelle_core::session::StopObservation;
 use satelle_core::session::TurnExecutionMode;
@@ -18,10 +19,12 @@ use codex_process::{CodexExchange, ProtocolWriter, ReadEvent, run_exchange};
 
 #[cfg(test)]
 #[path = "codex-session-tests.rs"]
-mod tests;
+pub(crate) mod tests;
 
 const CONTROL_POLL_INTERVAL: Duration = Duration::from_millis(5);
 const CONTROL_RESPONSE_TIMEOUT: Duration = Duration::from_secs(5);
+const PROVIDER_CHILD_ID: &str = "satelle_runtime";
+const PROVIDER_CHILD_SECRET_ENV: &str = "SATELLE_CODEX_API_KEY";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum CodexApprovalPolicy {
@@ -80,6 +83,8 @@ pub(crate) struct CodexSessionRequest<'a> {
     pub(crate) existing_thread_ref: Option<&'a str>,
     pub(crate) model: Option<&'a str>,
     pub(crate) model_provider: Option<&'a str>,
+    pub(crate) provider_endpoint: Option<&'a str>,
+    pub(crate) provider_secret: Option<ResolvedProviderSecret>,
     pub(crate) execution_mode: TurnExecutionMode,
     pub(crate) approval_policy: CodexApprovalPolicy,
     pub(crate) sandbox_policy: CodexSandboxPolicy,
@@ -104,8 +109,13 @@ impl CodexSessionRequest<'_> {
 pub(crate) enum CodexSessionTerminal {
     Completed,
     Interrupted,
-    Failed,
+    Failed(CodexFailedTurnKind),
     StoppedByControl,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum CodexFailedTurnKind {
+    Other,
 }
 
 pub(crate) struct TimedCodexSessionRun {
@@ -259,12 +269,44 @@ impl CodexSessionFailure {
 }
 
 pub(crate) fn run_codex_session(
-    command: Command,
+    mut command: Command,
     request: CodexSessionRequest<'_>,
 ) -> Result<CodexSessionTerminal, CodexSessionFailure> {
     if Instant::now() >= request.deadline {
         return Err(CodexSessionFailure::before_turn_dispatch(
             CodexSessionError::Timeout,
+        ));
+    }
+    if let Some(endpoint) = request.provider_endpoint {
+        let Some(model) = request.model else {
+            return Err(CodexSessionFailure::before_turn_dispatch(
+                CodexSessionError::Write,
+            ));
+        };
+        let toml_model = serde_json::to_string(model)
+            .map_err(|_| CodexSessionFailure::before_turn_dispatch(CodexSessionError::Write))?;
+        let toml_endpoint = serde_json::to_string(endpoint)
+            .map_err(|_| CodexSessionFailure::before_turn_dispatch(CodexSessionError::Write))?;
+        for override_value in [
+            format!("model={toml_model}"),
+            format!("model_provider=\"{PROVIDER_CHILD_ID}\""),
+            format!("model_providers.{PROVIDER_CHILD_ID}.name=\"Satelle\""),
+            format!("model_providers.{PROVIDER_CHILD_ID}.base_url={toml_endpoint}"),
+            format!("model_providers.{PROVIDER_CHILD_ID}.env_key=\"{PROVIDER_CHILD_SECRET_ENV}\""),
+            format!("model_providers.{PROVIDER_CHILD_ID}.wire_api=\"responses\""),
+            format!("model_providers.{PROVIDER_CHILD_ID}.requires_openai_auth=false"),
+            format!("shell_environment_policy.exclude=[\"{PROVIDER_CHILD_SECRET_ENV}\"]"),
+        ] {
+            command.arg("-c").arg(override_value);
+        }
+        if let Some(secret) = request.provider_secret.as_ref() {
+            secret.expose_to_provider(|value| {
+                command.env(PROVIDER_CHILD_SECRET_ENV, value);
+            });
+        }
+    } else if request.provider_secret.is_some() {
+        return Err(CodexSessionFailure::before_turn_dispatch(
+            CodexSessionError::Write,
         ));
     }
     let working_directory = request.working_directory;
@@ -736,7 +778,7 @@ impl<'a> SessionExchange<'a> {
                 let terminal = match required_string(turn, "status")? {
                     "completed" => CodexSessionTerminal::Completed,
                     "interrupted" => CodexSessionTerminal::Interrupted,
-                    "failed" => CodexSessionTerminal::Failed,
+                    "failed" => CodexSessionTerminal::Failed(failed_turn_kind(turn)),
                     _ => return Err(CodexSessionError::MalformedMessage),
                 };
                 if self.terminal.is_some_and(|observed| observed != terminal) {
@@ -906,6 +948,13 @@ impl<'a> SessionExchange<'a> {
             || self.goal_dispatch_attempted = true,
         )
     }
+}
+
+fn failed_turn_kind(_turn: &Map<String, Value>) -> CodexFailedTurnKind {
+    // Generic Codex HTTP and response-stream failures describe upstream
+    // provider transport. They do not prove that the browser failed to reach
+    // Satelle's local Provider Probe Surface.
+    CodexFailedTurnKind::Other
 }
 
 impl CodexExchange for SessionExchange<'_> {

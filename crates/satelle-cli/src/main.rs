@@ -19,7 +19,10 @@ mod transport;
 use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum};
 use completions::{CompletionsCommand, run_completions};
 use error_output::{ErrorFormat, parser_error, print_error, process_exit_code};
-use host_trust::{HostTrustReport, persist_desktop_selection, persist_host_identity};
+use host_trust::{
+    HostTrustReport, persist_desktop_selection, persist_host_identity,
+    persist_provider_auth_descriptor,
+};
 use logs::{LogsCommand, show_logs};
 use notify::{Config as NotifyConfig, Event, RecommendedWatcher, RecursiveMode, Watcher};
 use output::{EventOutput, OutputArgs, OutputFormat, SessionResultSchemaVersion, StatusReport};
@@ -36,19 +39,19 @@ use satelle_core::{
     BEACON_CORAL, CLI_NAME, DaemonPathOverrides, DesktopSelectionPolicy, DesktopSessionPreference,
     DoctorEventRecord, DoctorOptions, DoctorReport, ERROR_RED, ErrorCode, EventSource, EventType,
     HostConfig, HostSessionsReport, LOCAL_DEMO_HOST, OwnerOnlyDirectory, PRODUCT_NAME,
-    ProfileField, RELAY_ROSE, ResolvedConfig, SUCCESS_GREEN, SatelleError, SatelleEvent,
-    SatelleEventBody, SecureFileError, SessionId, SetupMode, SetupReadinessSummary, SetupReport,
-    SetupRequiredInput, SetupSchemaVersion, load_config, load_user_api_rate_limits,
-    open_or_create_owner_only_directory, open_or_create_owner_only_file, open_owner_only_directory,
-    read_owner_controlled_config_file, read_owner_only_secret_config_file, resolve_desktop_session,
-    resolve_path_set, utc_now,
+    ProfileField, ProviderSecretSource, RELAY_ROSE, ResolvedConfig, SUCCESS_GREEN, SatelleError,
+    SatelleEvent, SatelleEventBody, SecureFileError, SessionId, SetupMode, SetupReadinessSummary,
+    SetupReport, SetupRequiredInput, SetupSchemaVersion, load_config, load_config_without_profile,
+    load_user_api_rate_limits, open_or_create_owner_only_directory, open_or_create_owner_only_file,
+    open_owner_only_directory, read_owner_controlled_config_file,
+    read_owner_only_secret_config_file, resolve_desktop_session, resolve_path_set, utc_now,
 };
 use satelle_host::{
     ApiBearerToken, HostService, ProviderComputerUseIntent, contains_api_bearer_token,
 };
 use satelle_transport::{
     DaemonServer, DaemonServerConfig, DaemonServerError, DaemonTlsConfig, DaemonTlsConfigError,
-    DaemonTlsReloadError, DaemonTlsReloader, TurnRequest,
+    DaemonTlsReloadError, DaemonTlsReloader, ProviderBindingAuthorization, TurnRequest,
 };
 use serde_json::json;
 use std::collections::{BTreeMap, BTreeSet};
@@ -64,6 +67,7 @@ use tailscale::transport_doctor_report;
 use transport::{
     AttachedTurnOutcome, SshBootstrapScope, SshHostDiscovery, authenticated_ssh_bootstrap_user,
     discover_direct_host_identity, discover_ssh_host, transport_for, transport_for_setup,
+    transport_for_with_ssh_bootstrap,
 };
 
 const CONFIG_CHECK_SCHEMA_VERSION: &str = "satelle.config.check.v1";
@@ -116,6 +120,7 @@ struct Cli {
 #[derive(Clone)]
 struct ConfigContext<'a> {
     flag_profile: Option<&'a str>,
+    select_profile: bool,
     resolved: Arc<OnceLock<Result<ResolvedConfig, SatelleError>>>,
 }
 
@@ -135,6 +140,15 @@ impl<'a> ConfigContext<'a> {
     fn new(flag_profile: Option<&'a str>) -> Self {
         Self {
             flag_profile,
+            select_profile: true,
+            resolved: Arc::new(OnceLock::new()),
+        }
+    }
+
+    fn without_profile() -> Self {
+        Self {
+            flag_profile: None,
+            select_profile: false,
             resolved: Arc::new(OnceLock::new()),
         }
     }
@@ -142,7 +156,11 @@ impl<'a> ConfigContext<'a> {
     fn load(&self) -> Result<&ResolvedConfig, CliFailure> {
         let resolved = self.resolved.get_or_init(|| {
             let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-            load_config(&cwd, self.flag_profile)
+            if self.select_profile {
+                load_config(&cwd, self.flag_profile)
+            } else {
+                load_config_without_profile(&cwd)
+            }
         });
         resolved.as_ref().map_err(|error| failure(error.clone()))
     }
@@ -532,6 +550,10 @@ struct SelfUpdateCommand {
 struct RunCommand {
     #[arg(long)]
     host: Option<String>,
+    #[arg(long, value_name = "ALIAS")]
+    model: Option<String>,
+    #[arg(long, value_name = "ALIAS")]
+    provider: Option<String>,
     #[arg(long)]
     detach: bool,
     /// Leave an admitted Turn running when the attached command is interrupted
@@ -592,6 +614,10 @@ struct SteerCommand {
     session_id: String,
     #[arg(long)]
     host: Option<String>,
+    #[arg(long, value_name = "ALIAS")]
+    model: Option<String>,
+    #[arg(long, value_name = "ALIAS")]
+    provider: Option<String>,
     #[arg(long)]
     detach: bool,
     /// Leave an admitted Turn running when the attached command is interrupted
@@ -1344,6 +1370,7 @@ mod mcp_install_cli_tests {
         );
         let config = ConfigContext {
             flag_profile: None,
+            select_profile: true,
             resolved,
         };
         // The invalid target selection proves the installer reached its own
@@ -1819,7 +1846,7 @@ fn partition_setup_components(
         .any(|component| matches!(component.as_str(), "desktop" | "all"));
     let mut host_components = setup_components
         .iter()
-        .filter(|component| component.as_str() != "desktop")
+        .filter(|component| !matches!(component.as_str(), "desktop" | "provider-auth"))
         .cloned()
         .collect::<Vec<_>>();
     if ssh_transport && host_components == ["all"] {
@@ -2069,13 +2096,12 @@ fn run_setup(
     let first_ssh_trust = host.config.transport == satelle_core::TransportKind::Ssh
         && (host.config.expected_host_id.is_none() || path_rebind);
     let setup_components = setup_components(&command.component).map_err(failure)?;
+    let provider_auth_setup = setup_components
+        .iter()
+        .any(|component| component == "all" || component == "provider-auth");
     let ssh_transport = host.config.transport == satelle_core::TransportKind::Ssh;
     let (host_setup_components, desktop_setup) =
         partition_setup_components(&setup_components, ssh_transport, path_rebind);
-    let explicit_provider_auth = command
-        .component
-        .iter()
-        .any(|component| component == &SetupComponent::ProviderAuth);
     let setup_mode_selection = setup_mode(&command, &host.config).map_err(failure)?;
     let local_service_decision = (host.config.transport == satelle_core::TransportKind::Local)
         .then(|| {
@@ -2101,6 +2127,11 @@ fn run_setup(
         && tailscale_serve::applies_to(&host.config);
     let host_setup_required = !host_setup_components.is_empty();
     let interactive_selection = !command.no_input && !json && io::stdin().is_terminal();
+    let mut provider_selection =
+        resolve_provider_selection(resolved, &host, None, None, false, false)?;
+    let mut provider_auth_validation = None;
+    let mut pending_provider_auth = None;
+    let mut pending_provider_binding_authorization = None;
     let mut transport = if tailscale_serve_setup || !host_setup_required {
         None
     } else {
@@ -2138,7 +2169,15 @@ fn run_setup(
         apply_service_decision_to_report(&mut report, decision);
     }
     report.dry_run = command.dry_run;
-    add_setup_required_inputs(&mut report, &host.config, explicit_provider_auth);
+    if let Some((auth_source_name, _)) = &pending_provider_auth {
+        report.planned_actions.push(format!(
+            "save provider authentication descriptor reference '{auth_source_name}' for Host '{}'",
+            host.alias
+        ));
+    }
+    if command.dry_run {
+        add_setup_required_inputs(&mut report, &provider_selection, provider_auth_setup);
+    }
     let mut desktop_selection = None;
     if desktop_setup
         && !command.dry_run
@@ -2169,6 +2208,89 @@ fn run_setup(
         report.planned_actions.push(
             "inspect compatible desktop sessions through the authenticated Host Daemon".to_string(),
         );
+    }
+
+    if first_ssh_trust {
+        report.planned_actions.insert(
+            0,
+            "bootstrap the temporary Host Daemon, discover its Host Identity, and persist explicit trust"
+                .to_string(),
+        );
+    }
+
+    if provider_auth_setup && !command.dry_run && report.required_input.is_empty() {
+        let provider_aliases = match (
+            provider_selection.requested_model_alias.as_deref(),
+            provider_selection.requested_provider_alias.as_deref(),
+        ) {
+            (Some(model_alias), Some(provider_alias)) => Some((model_alias, provider_alias)),
+            _ => {
+                report.readiness_summary.provider_auth = "host_owned".to_string();
+                None
+            }
+        };
+        if let Some((model_alias, provider_alias)) = provider_aliases {
+            if first_ssh_trust {
+                report.planned_actions.push(format!(
+                    "validate provider binding '{provider_alias}/{model_alias}' on Host '{}'",
+                    host.alias
+                ));
+            } else {
+                let provider_transport = transport_for(&host)?;
+                match provider_transport.validate_provider_descriptor(
+                    model_alias,
+                    provider_alias,
+                    satelle_core::ProviderAuthValidationMode::Cached,
+                ) {
+                    Ok(validation) => {
+                        provider_auth_validation = Some(accept_setup_provider_auth_validation(
+                            &mut report,
+                            validation,
+                        )?);
+                    }
+                    Err(error) if error.code == ErrorCode::ModelProviderBindingMissing => {
+                        provider_selection =
+                            resolve_provider_selection(resolved, &host, None, None, false, true)?;
+                    }
+                    Err(error) => return Err(failure(error)),
+                }
+            }
+
+            if provider_auth_validation.is_none() && provider_selection.authorization.is_some() {
+                if interactive_selection
+                    && provider_selection
+                        .authorization
+                        .as_ref()
+                        .and_then(ProviderBindingAuthorization::auth_source)
+                        .is_none()
+                    && let Some(auth_source_name) = provider_selection.auth_source_name.clone()
+                {
+                    let descriptor = prompt_provider_auth_descriptor(&auth_source_name)?;
+                    host.config
+                        .provider_auth
+                        .insert(auth_source_name.clone(), descriptor.clone());
+                    pending_provider_auth = Some((auth_source_name.clone(), descriptor));
+                    report.planned_actions.push(format!(
+                        "save provider authentication descriptor reference '{auth_source_name}' for Host '{}'",
+                        host.alias
+                    ));
+                    provider_selection =
+                        resolve_provider_selection(resolved, &host, None, None, false, true)?;
+                }
+                add_setup_required_inputs(&mut report, &provider_selection, provider_auth_setup);
+                if report.required_input.is_empty()
+                    && let Some(authorization) = provider_selection.authorization.as_ref()
+                {
+                    pending_provider_binding_authorization = Some(authorization.clone());
+                    report.planned_actions.push(format!(
+                        "authorize provider binding '{}/{}' on Host '{}'",
+                        authorization.requested_provider_alias(),
+                        authorization.requested_model_alias(),
+                        host.alias
+                    ));
+                }
+            }
+        }
     }
 
     if !command.dry_run && report.required_input.is_empty() {
@@ -2273,64 +2395,163 @@ fn run_setup(
             Ok(())
         })();
 
+        desktop_preflight?;
         let mut persisted_desktop_action = None;
-        report = run_host_setup_after_desktop_preflight(
-            desktop_preflight,
-            &mut host.config,
-            |host_config| {
-                if let Some(selection) = &desktop_selection {
-                    persist_desktop_selection(
-                        &user_config_path,
-                        &host.alias,
-                        &selection.desktop_user,
-                        Some(&selection.preference),
-                    )
-                    .map_err(failure)?;
-                    host_config.desktop_user = Some(selection.desktop_user.clone());
-                    host_config.desktop_session_preference = Some(selection.preference.clone());
-                    host_config.desktop_session_native_selector = None;
-                    persisted_desktop_action = Some(selection.action(&host.alias));
+        let mut persisted_provider_auth_action = None;
+        if report.required_input.is_empty() {
+            report = run_host_setup_after_desktop_preflight(
+                Ok(()),
+                &mut host.config,
+                |host_config| {
+                    if let Some(selection) = &desktop_selection {
+                        persist_desktop_selection(
+                            &user_config_path,
+                            &host.alias,
+                            &selection.desktop_user,
+                            Some(&selection.preference),
+                        )
+                        .map_err(failure)?;
+                        host_config.desktop_user = Some(selection.desktop_user.clone());
+                        host_config.desktop_session_preference = Some(selection.preference.clone());
+                        host_config.desktop_session_native_selector = None;
+                        persisted_desktop_action = Some(selection.action(&host.alias));
+                    }
+                    Ok(())
+                },
+                |host_config| {
+                    if tailscale_serve_setup {
+                        tailscale_serve::configure(
+                            &host.alias,
+                            host_config,
+                            &daemon_path_overrides,
+                            false,
+                            &setup_mode,
+                        )
+                        .map_err(failure)
+                    } else {
+                        run_host_setup_if_required(
+                            host_setup_required,
+                            || {
+                                report.dry_run = false;
+                                report
+                            },
+                            || {
+                                transport
+                                    .as_ref()
+                                    .expect("Host-owned setup transport is present")
+                                    .setup(
+                                        false,
+                                        setup_mode_selection,
+                                        host_setup_components,
+                                        daemon_path_overrides,
+                                    )
+                            },
+                        )
+                        .map_err(failure)
+                    }
+                },
+            )?;
+        }
+
+        if provider_auth_setup
+            && report.required_input.is_empty()
+            && provider_auth_validation.is_none()
+            && let (Some(model_alias), Some(provider_alias)) = (
+                provider_selection.requested_model_alias.as_deref(),
+                provider_selection.requested_provider_alias.as_deref(),
+            )
+        {
+            let provider_transport = if host.config.transport == satelle_core::TransportKind::Ssh {
+                transport_for_with_ssh_bootstrap(&host, Some(SshBootstrapScope::Admin))?
+            } else {
+                transport_for(&host)?
+            };
+            match provider_transport.validate_provider_descriptor(
+                model_alias,
+                provider_alias,
+                satelle_core::ProviderAuthValidationMode::Cached,
+            ) {
+                Ok(validation) => {
+                    provider_auth_validation = Some(accept_setup_provider_auth_validation(
+                        &mut report,
+                        validation,
+                    )?);
                 }
-                Ok(())
-            },
-            |host_config| {
-                if tailscale_serve_setup {
-                    tailscale_serve::configure(
-                        &host.alias,
-                        host_config,
-                        &daemon_path_overrides,
-                        false,
-                        &setup_mode,
-                    )
-                    .map_err(failure)
-                } else {
-                    run_host_setup_if_required(
-                        host_setup_required,
-                        || {
-                            report.dry_run = false;
-                            report
-                        },
-                        || {
-                            transport
-                                .as_ref()
-                                .expect("Host-owned setup transport is present")
-                                .setup(
-                                    false,
-                                    setup_mode_selection,
-                                    host_setup_components,
-                                    daemon_path_overrides,
+                Err(error) if error.code == ErrorCode::ModelProviderBindingMissing => {
+                    let Some(authorization) = pending_provider_binding_authorization.as_ref()
+                    else {
+                        return Err(failure(error));
+                    };
+                    provider_transport
+                        .authorize_provider_binding(authorization)
+                        .map_err(failure)?;
+                    let validation = (|| {
+                        let validation = provider_transport
+                            .validate_provider_descriptor(
+                                authorization.requested_model_alias(),
+                                authorization.requested_provider_alias(),
+                                satelle_core::ProviderAuthValidationMode::RefreshProviderSmoke,
+                            )
+                            .map_err(failure)?;
+                        accept_setup_provider_auth_validation(&mut report, validation)
+                    })();
+                    let validation = match validation {
+                        Ok(validation) => validation,
+                        Err(error) => {
+                            provider_transport
+                                .delete_provider_binding(
+                                    authorization.requested_model_alias(),
+                                    authorization.requested_provider_alias(),
                                 )
-                        },
-                    )
-                    .map_err(failure)
+                                .map_err(failure)?;
+                            return Err(error);
+                        }
+                    };
+                    if let Some((auth_source_name, descriptor)) = &pending_provider_auth
+                        && let Err(error) = persist_provider_auth_descriptor(
+                            &user_config_path,
+                            &host.alias,
+                            auth_source_name,
+                            descriptor,
+                        )
+                    {
+                        provider_transport
+                            .delete_provider_binding(
+                                authorization.requested_model_alias(),
+                                authorization.requested_provider_alias(),
+                            )
+                            .map_err(failure)?;
+                        return Err(failure(error));
+                    }
+                    if let Some((auth_source_name, descriptor)) = &pending_provider_auth {
+                        host.config
+                            .provider_auth
+                            .insert(auth_source_name.clone(), descriptor.clone());
+                        persisted_provider_auth_action = Some(format!(
+                            "saved provider authentication descriptor reference '{auth_source_name}' for Host '{}'",
+                            host.alias
+                        ));
+                    }
+                    provider_auth_validation = Some(validation);
                 }
-            },
-        )?;
+                Err(error) => return Err(failure(error)),
+            }
+        }
+
         report.setup_components.clone_from(&setup_components);
         if let Some(decision) = &local_service_decision {
             apply_service_decision_to_report(&mut report, decision);
         }
-        add_setup_required_inputs(&mut report, &host.config, explicit_provider_auth);
+        if provider_auth_validation.is_none() {
+            add_setup_required_inputs(&mut report, &provider_selection, provider_auth_setup);
+        }
+        if let Some(action) = persisted_provider_auth_action {
+            report.applied_actions.push(action);
+            report.mutated = true;
+            if report.status == "planned" {
+                report.status = "applied".to_string();
+            }
+        }
         if let Some(action) = persisted_desktop_action {
             if !report.planned_actions.contains(&action) {
                 report.planned_actions.push(action.clone());
@@ -2342,10 +2563,6 @@ fn run_setup(
             }
         }
         if first_ssh_trust {
-            report.planned_actions.insert(
-                0,
-                "discover and explicitly trust the reachable Host Identity".to_string(),
-            );
             report.applied_actions.insert(
                 0,
                 "discovered and explicitly trusted the reachable Host Identity".to_string(),
@@ -2367,7 +2584,20 @@ fn run_setup(
     }
 
     if json {
-        print_json(&report).map_err(failure)
+        let mut output = serde_json::to_value(&report)
+            .map_err(|error| failure(SatelleError::invalid_usage(error.to_string())))?;
+        if provider_auth_setup
+            && let Some(validation) = provider_auth_validation_json(
+                &provider_selection,
+                provider_auth_validation.as_ref(),
+            )
+        {
+            output
+                .as_object_mut()
+                .expect("a Setup report serializes as an object")
+                .insert("provider_auth_validation".to_string(), validation);
+        }
+        print_json(&output).map_err(failure)
     } else {
         print_setup_human(&report);
         Ok(())
@@ -2446,27 +2676,150 @@ fn trust_first_ssh_host_during_setup(
     Ok(Some(discovery))
 }
 
+fn accept_setup_provider_auth_validation(
+    report: &mut SetupReport,
+    validation: transport::ProviderDescriptorValidationReport,
+) -> Result<transport::ProviderDescriptorValidationReport, CliFailure> {
+    use satelle_core::ProviderAuthValidationOutcome::{ConfiguredDeferred, Resolved};
+
+    let outcome = validation.validation.outcome();
+    report.readiness_summary.provider_auth = outcome.as_str().to_string();
+    if matches!(outcome, ConfiguredDeferred | Resolved) {
+        return Ok(validation);
+    }
+    Err(failure(SatelleError::config_error(
+        format!(
+            "the Host rejected the provider authentication descriptor: {}",
+            outcome.as_str()
+        ),
+        None,
+    )))
+}
+
 fn add_setup_required_inputs(
     report: &mut SetupReport,
-    host_config: &HostConfig,
-    explicit_provider_auth: bool,
+    provider_selection: &ProviderSelection,
+    provider_auth_setup: bool,
 ) {
-    if !explicit_provider_auth || !host_config.provider_auth.is_empty() {
+    if !provider_auth_setup {
+        return;
+    }
+    let Some(authorization) = provider_selection.authorization.as_ref() else {
+        report.readiness_summary.provider_auth = "host_owned".to_string();
+        return;
+    };
+    let Some(auth_source_name) = provider_selection.auth_source_name.as_deref() else {
+        report.readiness_summary.provider_auth = "not_required".to_string();
+        return;
+    };
+    if authorization.auth_source().is_some() {
+        report.readiness_summary.provider_auth = "configured_deferred".to_string();
         return;
     }
 
     report.status = "input_required".to_string();
-    report.readiness_summary.provider_auth = "secret_source_required".to_string();
+    report.readiness_summary.provider_auth = "missing_descriptor".to_string();
     report.required_input.push(SetupRequiredInput {
         component: "provider-auth".to_string(),
         input_kind: "provider_secret_source_descriptor".to_string(),
-        reason: "provider authentication setup needs a host-resolved Secret Source descriptor; raw provider secrets are not accepted through noninteractive setup".to_string(),
-        recovery_command: "add [hosts.<alias>.provider_auth.<provider>] to user-level config, then rerun satelle setup --component provider-auth --no-input --json".to_string(),
+        reason: format!(
+            "the effective provider binding requires host-resolved Secret Source descriptor '{auth_source_name}'; raw provider secrets are not accepted through setup"
+        ),
+        recovery_command: format!(
+            "add [hosts.<alias>.provider_auth.{auth_source_name}] to user-level config, then rerun satelle setup --no-input --json"
+        ),
     });
     report.recovery_commands.push(
         "add a host-resolved provider_auth Secret Source descriptor to user-level config"
             .to_string(),
     );
+}
+
+fn provider_auth_validation_json(
+    provider_selection: &ProviderSelection,
+    validation: Option<&transport::ProviderDescriptorValidationReport>,
+) -> Option<serde_json::Value> {
+    if let Some(validation) = validation {
+        return Some(json!({
+            "resolved_codex_model": validation.resolved_binding.model(),
+            "resolved_model_provider": validation.resolved_binding.model_provider(),
+            "provider_binding_source": validation.resolved_binding.source().as_str(),
+            "auth_source_name": provider_selection.auth_source_name,
+            "outcome": validation.validation.outcome().as_str(),
+            "source": validation.validation.observation_source().as_str(),
+        }));
+    }
+    let authorization = provider_selection.authorization.as_ref()?;
+    let auth_source_name = provider_selection.auth_source_name.as_deref()?;
+    Some(json!({
+        "resolved_codex_model": null,
+        "resolved_model_provider": null,
+        "provider_binding_source": null,
+        "auth_source_name": auth_source_name,
+        "outcome": if authorization.auth_source().is_some() {
+            "configured_deferred"
+        } else {
+            "missing_descriptor"
+        },
+        "source": "deferred",
+    }))
+}
+
+fn prompt_provider_auth_descriptor(
+    auth_source_name: &str,
+) -> Result<ProviderSecretSource, CliFailure> {
+    let kind = cliclack::select(format!(
+        "How should Host resolve provider authentication '{auth_source_name}'?"
+    ))
+    .item(
+        "environment",
+        "Environment variable",
+        "Host reads a named environment variable",
+    )
+    .item("file", "File", "Host reads an absolute secret file path")
+    .interact()
+    .map_err(|source| {
+        failure(SatelleError::invalid_usage(format!(
+            "could not read provider authentication descriptor kind: {source}"
+        )))
+    })?;
+    match kind {
+        "environment" => {
+            let variable: String = cliclack::input("Environment variable name")
+                .interact()
+                .map_err(|source| {
+                    failure(SatelleError::invalid_usage(format!(
+                        "could not read provider authentication environment variable name: {source}"
+                    )))
+                })?;
+            let variable = variable.trim();
+            if variable.is_empty() {
+                return Err(failure(SatelleError::input_required(
+                    "provider authentication environment variable name is required",
+                )));
+            }
+            Ok(ProviderSecretSource::Environment {
+                variable: variable.to_string(),
+            })
+        }
+        "file" => {
+            let path: String = cliclack::input("Absolute provider secret file path")
+                .interact()
+                .map_err(|source| {
+                    failure(SatelleError::invalid_usage(format!(
+                        "could not read provider authentication file path: {source}"
+                    )))
+                })?;
+            let path = PathBuf::from(path.trim());
+            if path.as_os_str().is_empty() {
+                return Err(failure(SatelleError::invalid_usage(
+                    "provider authentication file path is required",
+                )));
+            }
+            Ok(ProviderSecretSource::File { path })
+        }
+        _ => unreachable!("provider authentication prompt exposes only supported descriptor kinds"),
+    }
 }
 
 fn daemon_path_overrides(command: &SetupCommand, host_config: &HostConfig) -> DaemonPathOverrides {
@@ -3372,6 +3725,7 @@ fn daemon_path_overrides_json(host_config: &HostConfig) -> serde_json::Value {
 fn model_provider_config_json(
     config: &satelle_core::ResolvedConfig,
     selected_host: &str,
+    selected_host_config: &HostConfig,
 ) -> serde_json::Value {
     let model_alias_source =
         if config.profile_overrides_for_host(ProfileField::ModelAlias, selected_host) {
@@ -3394,26 +3748,43 @@ fn model_provider_config_json(
             )
         };
 
+    let binding = config
+        .config
+        .provider_alias
+        .as_deref()
+        .zip(config.config.model_alias.as_deref())
+        .and_then(|(provider, model)| selected_host_config.provider_binding(provider, model));
+    let binding_status = match (
+        config.config.model_alias.as_ref(),
+        config.config.provider_alias.as_ref(),
+        binding,
+    ) {
+        (None, None, _) => "host_default",
+        (Some(_), Some(_), Some(_)) => "resolved",
+        _ => "binding_missing",
+    };
+
     json!({
         "requested_model_alias": config.config.model_alias,
         "requested_provider_alias": config.config.provider_alias,
-        "resolved_codex_model": serde_json::Value::Null,
-        "resolved_model_provider": serde_json::Value::Null,
-        "binding_status": if config.config.model_alias.is_some() || config.config.provider_alias.is_some() {
-            "binding_required"
-        } else {
-            "host_default"
-        },
+        "resolved_codex_model": binding.map(|binding| binding.model.as_str()),
+        "resolved_model_provider": binding.map(|binding| binding.model_provider.as_str()),
+        "provider_binding_source": binding.map(|_| "user_config"),
+        "binding_status": binding_status,
         "model_alias_source": model_alias_source,
         "provider_alias_source": provider_alias_source,
         "contributing_config_files": [
             config.user_config_path,
             config.project_config_path,
         ],
-        "winning_source": model_alias_source
-            .as_str()
-            .or_else(|| provider_alias_source.as_str())
-            .unwrap_or("host_default"),
+        "winning_source": if binding.is_some() {
+            "user_config"
+        } else {
+            model_alias_source
+                .as_str()
+                .or_else(|| provider_alias_source.as_str())
+                .unwrap_or("host_default")
+        },
     })
 }
 
@@ -3422,6 +3793,33 @@ fn experimental_provider_computer_use_json(
     selected_host: &str,
     selected_host_config: &HostConfig,
 ) -> serde_json::Value {
+    if let Some(provider_alias) = config.config.provider_alias.as_deref() {
+        if let Some(active) = selected_host_config
+            .experimental_provider_computer_use_by_provider
+            .get(provider_alias)
+        {
+            return json!({
+                "active": active,
+                "source": "user_config_host_or_profile",
+                "host": selected_host,
+                "provider_alias": provider_alias,
+                "selected_by_cli_flag": false,
+            });
+        }
+        if let Some(active) = config
+            .config
+            .experimental_provider_computer_use_by_provider
+            .get(provider_alias)
+        {
+            return json!({
+                "active": active,
+                "source": "user_config_global",
+                "host": selected_host,
+                "provider_alias": provider_alias,
+                "selected_by_cli_flag": false,
+            });
+        }
+    }
     if config
         .profile_overrides_for_host(ProfileField::ExperimentalProviderComputerUse, selected_host)
     {
@@ -3521,19 +3919,192 @@ fn resolve_yolo_policy(
 
 fn resolve_experimental_provider_computer_use(
     command_flag: bool,
+    provider_alias: Option<&str>,
     host_config: &HostConfig,
     config: &satelle_core::ResolvedConfig,
 ) -> bool {
-    command_flag
-        || host_config
-            .experimental_provider_computer_use
-            .or(config.config.experimental_provider_computer_use)
-            .unwrap_or(false)
+    if command_flag {
+        return true;
+    }
+    if let Some(provider_alias) = provider_alias
+        && let Some(active) = host_config
+            .experimental_provider_computer_use_by_provider
+            .get(provider_alias)
+            .or_else(|| {
+                config
+                    .config
+                    .experimental_provider_computer_use_by_provider
+                    .get(provider_alias)
+            })
+    {
+        return *active;
+    }
+    host_config
+        .experimental_provider_computer_use
+        .or(config.config.experimental_provider_computer_use)
+        .unwrap_or(false)
+}
+
+#[derive(Clone, Debug)]
+struct ProviderSelection {
+    requested_model_alias: Option<String>,
+    requested_provider_alias: Option<String>,
+    authorization: Option<ProviderBindingAuthorization>,
+    auth_source_name: Option<String>,
+    experimental_provider_computer_use: bool,
+}
+
+impl ProviderSelection {
+    fn provider_smoke_status(&self, refresh: bool) -> &'static str {
+        if self.requested_model_alias.is_none() && self.requested_provider_alias.is_none() {
+            "host_owned"
+        } else if refresh {
+            "refresh_required"
+        } else {
+            "required"
+        }
+    }
+
+    fn missing_auth_source_name(&self) -> Option<&str> {
+        self.auth_source_name.as_deref().filter(|_| {
+            self.authorization
+                .as_ref()
+                .is_some_and(|authorization| authorization.auth_source().is_none())
+        })
+    }
+}
+
+fn projected_experimental_provider_computer_use(
+    provider_selection: &ProviderSelection,
+    provider_validation: Option<&transport::ProviderDescriptorValidationReport>,
+) -> bool {
+    provider_validation.map_or(
+        provider_selection.experimental_provider_computer_use,
+        |validation| {
+            validation
+                .resolved_binding
+                .experimental_provider_computer_use()
+        },
+    )
+}
+
+fn resolve_provider_selection(
+    config: &ResolvedConfig,
+    host: &SelectedHost,
+    model_override: Option<&str>,
+    provider_override: Option<&str>,
+    command_experimental: bool,
+    require_local_binding: bool,
+) -> Result<ProviderSelection, CliFailure> {
+    let requested_model_alias = model_override
+        .map(str::to_string)
+        .or_else(|| config.config.model_alias.clone());
+    let requested_provider_alias = provider_override
+        .map(str::to_string)
+        .or_else(|| config.config.provider_alias.clone());
+    let experimental_provider_computer_use = resolve_experimental_provider_computer_use(
+        command_experimental,
+        requested_provider_alias.as_deref(),
+        &host.config,
+        config,
+    );
+
+    let (Some(model_alias), Some(provider_alias)) = (
+        requested_model_alias.as_deref(),
+        requested_provider_alias.as_deref(),
+    ) else {
+        if requested_model_alias.is_none() && requested_provider_alias.is_none() {
+            return Ok(ProviderSelection {
+                requested_model_alias,
+                requested_provider_alias,
+                authorization: None,
+                auth_source_name: None,
+                experimental_provider_computer_use,
+            });
+        }
+        return Err(provider_selection_error(
+            ErrorCode::ModelProviderBindingMissing,
+            &host.alias,
+            requested_model_alias.as_deref(),
+            requested_provider_alias.as_deref(),
+            "model and provider aliases must resolve as one exact Host Binding pair",
+            "set both model_alias and provider_alias, or pass both --model and --provider",
+        ));
+    };
+    let Some(binding) = host.config.provider_binding(provider_alias, model_alias) else {
+        if !require_local_binding {
+            return Ok(ProviderSelection {
+                requested_model_alias,
+                requested_provider_alias,
+                authorization: None,
+                auth_source_name: None,
+                experimental_provider_computer_use,
+            });
+        }
+        return Err(provider_selection_error(
+            ErrorCode::ModelProviderBindingMissing,
+            &host.alias,
+            Some(model_alias),
+            Some(provider_alias),
+            "the selected Host has no exact binding for the requested model and provider aliases",
+            "add the exact provider_bindings entry to the selected user-level Host Binding",
+        ));
+    };
+
+    let mut authorization = ProviderBindingAuthorization::new(
+        model_alias,
+        provider_alias,
+        &binding.model,
+        &binding.model_provider,
+    )
+    .with_experimental_provider_computer_use(experimental_provider_computer_use);
+    if let Some(endpoint) = binding.endpoint.as_deref() {
+        authorization = authorization.with_endpoint(endpoint);
+    }
+    if let Some(auth_source) = binding.auth_source.as_deref()
+        && let Some(descriptor) = host.config.provider_auth.get(auth_source)
+    {
+        authorization = authorization.with_auth_source(descriptor.clone());
+    }
+    Ok(ProviderSelection {
+        requested_model_alias,
+        requested_provider_alias,
+        authorization: Some(authorization),
+        auth_source_name: binding.auth_source.clone(),
+        experimental_provider_computer_use,
+    })
+}
+
+fn provider_selection_error(
+    code: ErrorCode,
+    host: &str,
+    requested_model_alias: Option<&str>,
+    requested_provider_alias: Option<&str>,
+    message: &str,
+    recovery_command: &str,
+) -> CliFailure {
+    let mut details = BTreeMap::new();
+    details.insert("host".to_string(), json!(host));
+    details.insert(
+        "requested_model_alias".to_string(),
+        json!(requested_model_alias),
+    );
+    details.insert(
+        "requested_provider_alias".to_string(),
+        json!(requested_provider_alias),
+    );
+    failure(SatelleError {
+        code,
+        message: message.to_string(),
+        recovery_command: Some(recovery_command.to_string()),
+        source_detail: None,
+        details,
+    })
 }
 
 fn doctor_provider_intent(
     config: &ResolvedConfig,
-    host_config: &HostConfig,
+    _host_config: &HostConfig,
     refresh: bool,
     probe_timeout: Option<std::time::Duration>,
 ) -> Result<ProviderComputerUseIntent, SatelleError> {
@@ -3551,12 +4122,7 @@ fn doctor_provider_intent(
         .map(ProviderBindingRef::new)
         .transpose()
         .map_err(|_| SatelleError::invalid_usage("the selected provider alias is invalid"))?;
-    let intent = ProviderComputerUseIntent::new(
-        model,
-        provider,
-        resolve_experimental_provider_computer_use(false, host_config, config),
-        refresh,
-    );
+    let intent = ProviderComputerUseIntent::new(model, provider, refresh);
     Ok(match probe_timeout {
         Some(timeout) => intent.with_provider_smoke_timeout(timeout),
         None => intent,
@@ -6089,6 +6655,95 @@ fn image_loader_rejects_symlinks() {
     assert!(load_image_attachments(&[link], vec!["image/png".to_string()]).is_err());
 }
 
+#[test]
+fn image_loader_rejects_unsupported_media_and_oversized_files() {
+    let directory = tempfile::tempdir_in(".").expect("create image fixture directory");
+    let cwd = std::env::current_dir().expect("resolve Controller cwd");
+
+    let unsupported = directory.path().join("unsupported.gif");
+    std::fs::write(&unsupported, b"GIF89a-private").expect("write unsupported image");
+    let unsupported = unsupported
+        .strip_prefix(&cwd)
+        .expect("fixture is inside Controller cwd")
+        .to_path_buf();
+    assert!(
+        load_image_attachments(
+            &[unsupported],
+            vec!["image/png".to_string(), "image/jpeg".to_string()],
+        )
+        .is_err()
+    );
+
+    let oversized = directory.path().join("oversized.png");
+    let file = std::fs::File::create(&oversized).expect("create oversized image");
+    file.set_len((satelle_transport::MAX_IMAGE_ATTACHMENT_BYTES + 1) as u64)
+        .expect("size oversized image");
+    let oversized = oversized
+        .strip_prefix(&cwd)
+        .expect("fixture is inside Controller cwd")
+        .to_path_buf();
+    assert!(load_image_attachments(&[oversized], vec!["image/png".to_string()]).is_err());
+}
+
+#[test]
+fn turn_request_construction_carries_only_provider_aliases_and_refresh() {
+    let candidate =
+        ProviderBindingAuthorization::new("vision", "anthropic", "claude-sonnet", "anthropic")
+            .with_endpoint("https://provider.example.test")
+            .with_auth_source(ProviderSecretSource::Environment {
+                variable: "ANTHROPIC_API_KEY".to_string(),
+            })
+            .with_experimental_provider_computer_use(true);
+    let selection = ProviderSelection {
+        requested_model_alias: Some("vision".to_string()),
+        requested_provider_alias: Some("anthropic".to_string()),
+        authorization: Some(candidate),
+        auth_source_name: None,
+        experimental_provider_computer_use: true,
+    };
+
+    // `quiet` is deliberately absent from this request boundary. It controls
+    // presentation only and cannot remove binding or smoke-test requirements.
+    let request = build_turn_request(
+        "inspect the desktop".to_string(),
+        TurnExecutionMode::Standard,
+        &selection,
+        true,
+        satelle_core::DEFAULT_TURN_EXECUTION_TIMEOUT_MS,
+    );
+
+    assert_eq!(
+        serde_json::to_value(request).expect("TurnRequest should serialize"),
+        json!({
+            "schema_version": "satelle.api.v5",
+            "prompt": "inspect the desktop",
+            "execution_mode": "standard",
+            "model": "vision",
+            "provider": "anthropic",
+            "refresh_provider_smoke_test": true,
+            "turn_execution_timeout_ms": satelle_core::DEFAULT_TURN_EXECUTION_TIMEOUT_MS,
+        })
+    );
+}
+
+fn print_experimental_provider_warning(
+    validation: &transport::ProviderDescriptorValidationReport,
+    quiet: bool,
+    machine_output: bool,
+) {
+    let binding = &validation.resolved_binding;
+    if binding.experimental_provider_computer_use()
+        && !quiet
+        && !machine_output
+        && (!binding.model_provider().eq_ignore_ascii_case("openai")
+            || binding.endpoint().is_some())
+    {
+        eprintln!(
+            "Warning: non-OpenAI provider Computer Use is experimental and requires a live provider smoke test when no matching cached pass exists."
+        );
+    }
+}
+
 fn run_prompt(
     command: RunCommand,
     config_context: ConfigContext<'_>,
@@ -6118,12 +6773,31 @@ fn run_prompt(
             .map(SelectedHost::from)
             .map_err(failure),
     )?;
+    let provider_selection = report_not_admitted(
+        &mut event_output,
+        Some(&host.alias),
+        resolve_provider_selection(
+            config,
+            &host,
+            command.model.as_deref(),
+            command.provider.as_deref(),
+            command.experimental_provider_computer_use,
+            false,
+        ),
+    )?;
     let transport = match transport_for(&host) {
         Ok(transport) => transport,
         Err(transport_failure) => {
             if !command.detach {
                 event_output
-                    .emit_preflight(&host.alias, "run", &host.config.transport)
+                    .emit_preflight(
+                        &host.alias,
+                        "run",
+                        &host.config.transport,
+                        &provider_selection,
+                        None,
+                        command.refresh_provider_smoke_test,
+                    )
                     .map_err(failure)?;
                 event_output
                     .emit_command_failed(
@@ -6137,6 +6811,28 @@ fn run_prompt(
             return Err(transport_failure);
         }
     };
+    let provider_validation = report_not_admitted(
+        &mut event_output,
+        Some(&host.alias),
+        transport
+            .validate_provider_descriptor(
+                provider_selection
+                    .requested_model_alias
+                    .as_deref()
+                    .unwrap_or("codex-default"),
+                provider_selection
+                    .requested_provider_alias
+                    .as_deref()
+                    .unwrap_or("codex-default"),
+                satelle_core::ProviderAuthValidationMode::Cached,
+            )
+            .map_err(failure),
+    )?;
+    print_experimental_provider_warning(
+        &provider_validation,
+        command.quiet,
+        json || effective_mode == EffectiveEventMode::Json,
+    );
     report_not_admitted(
         &mut event_output,
         Some(&host.alias),
@@ -6169,35 +6865,39 @@ fn run_prompt(
         command.yolo,
         command.no_yolo,
     );
-    let experimental_provider_computer_use = resolve_experimental_provider_computer_use(
-        command.experimental_provider_computer_use,
-        &host.config,
-        config,
-    );
-    let request = TurnRequest::new(prompt)
-        .with_execution_mode(yolo_policy.execution_mode())
-        .with_provider_intent(
-            config.config.model_alias.clone(),
-            config.config.provider_alias.clone(),
-            experimental_provider_computer_use,
-            command.refresh_provider_smoke_test,
-        )
-        .with_turn_execution_timeout_ms(turn_execution_timeout_ms);
-    let request = request.with_attachments(attachments);
+    let request = build_turn_request(
+        prompt,
+        yolo_policy.execution_mode(),
+        &provider_selection,
+        command.refresh_provider_smoke_test,
+        turn_execution_timeout_ms,
+    )
+    .with_attachments(attachments);
     if command.detach {
         let session = transport.run_detached(&request).map_err(failure)?;
         return print_detached_session(
             session,
-            &host.alias,
-            effective_timeouts,
-            &yolo_policy,
-            SessionResultSchemaVersion::RunV2,
-            json,
+            DetachedOutputOptions {
+                host: &host.alias,
+                effective_timeouts,
+                yolo_policy: &yolo_policy,
+                provider_selection: &provider_selection,
+                provider_validation: &provider_validation,
+                schema_version: SessionResultSchemaVersion::RunV2,
+                json,
+            },
         );
     }
 
     event_output
-        .emit_preflight(&host.alias, "run", &host.config.transport)
+        .emit_preflight(
+            &host.alias,
+            "run",
+            &host.config.transport,
+            &provider_selection,
+            Some(&provider_validation),
+            command.refresh_provider_smoke_test,
+        )
         .map_err(failure)?;
     let outcome = match transport.run(&request, command.detach_on_interrupt, &mut |event| {
         event_output.emit(&host.alias, event)
@@ -6232,6 +6932,8 @@ fn run_prompt(
             host: &host.alias,
             effective_timeouts,
             yolo_policy: &yolo_policy,
+            provider_selection: &provider_selection,
+            provider_validation: &provider_validation,
             schema_version: SessionResultSchemaVersion::RunV2,
             json,
         },
@@ -6272,12 +6974,31 @@ fn steer_prompt(
             .map(SelectedHost::from)
             .map_err(failure),
     )?;
+    let provider_selection = report_not_admitted(
+        &mut event_output,
+        Some(&host.alias),
+        resolve_provider_selection(
+            config,
+            &host,
+            command.model.as_deref(),
+            command.provider.as_deref(),
+            command.experimental_provider_computer_use,
+            false,
+        ),
+    )?;
     let transport = match transport_for(&host) {
         Ok(transport) => transport,
         Err(transport_failure) => {
             if !command.detach {
                 event_output
-                    .emit_preflight(&host.alias, "steer", &host.config.transport)
+                    .emit_preflight(
+                        &host.alias,
+                        "steer",
+                        &host.config.transport,
+                        &provider_selection,
+                        None,
+                        command.refresh_provider_smoke_test,
+                    )
                     .map_err(failure)?;
                 event_output
                     .emit_command_failed(
@@ -6291,6 +7012,28 @@ fn steer_prompt(
             return Err(transport_failure);
         }
     };
+    let provider_validation = report_not_admitted(
+        &mut event_output,
+        Some(&host.alias),
+        transport
+            .validate_provider_descriptor(
+                provider_selection
+                    .requested_model_alias
+                    .as_deref()
+                    .unwrap_or("codex-default"),
+                provider_selection
+                    .requested_provider_alias
+                    .as_deref()
+                    .unwrap_or("codex-default"),
+                satelle_core::ProviderAuthValidationMode::Cached,
+            )
+            .map_err(failure),
+    )?;
+    print_experimental_provider_warning(
+        &provider_validation,
+        command.quiet,
+        json || effective_mode == EffectiveEventMode::Json,
+    );
     report_not_admitted(
         &mut event_output,
         Some(&host.alias),
@@ -6323,37 +7066,41 @@ fn steer_prompt(
         command.yolo,
         command.no_yolo,
     );
-    let experimental_provider_computer_use = resolve_experimental_provider_computer_use(
-        command.experimental_provider_computer_use,
-        &host.config,
-        config,
-    );
-    let request = TurnRequest::new(prompt)
-        .with_execution_mode(yolo_policy.execution_mode())
-        .with_provider_intent(
-            config.config.model_alias.clone(),
-            config.config.provider_alias.clone(),
-            experimental_provider_computer_use,
-            command.refresh_provider_smoke_test,
-        )
-        .with_turn_execution_timeout_ms(turn_execution_timeout_ms);
-    let request = request.with_attachments(attachments);
+    let request = build_turn_request(
+        prompt,
+        yolo_policy.execution_mode(),
+        &provider_selection,
+        command.refresh_provider_smoke_test,
+        turn_execution_timeout_ms,
+    )
+    .with_attachments(attachments);
     if command.detach {
         let session = transport
             .steer_detached(&session_id, &request)
             .map_err(failure)?;
         return print_detached_session(
             session,
-            &host.alias,
-            effective_timeouts,
-            &yolo_policy,
-            SessionResultSchemaVersion::SteerV2,
-            json,
+            DetachedOutputOptions {
+                host: &host.alias,
+                effective_timeouts,
+                yolo_policy: &yolo_policy,
+                provider_selection: &provider_selection,
+                provider_validation: &provider_validation,
+                schema_version: SessionResultSchemaVersion::SteerV2,
+                json,
+            },
         );
     }
 
     event_output
-        .emit_preflight(&host.alias, "steer", &host.config.transport)
+        .emit_preflight(
+            &host.alias,
+            "steer",
+            &host.config.transport,
+            &provider_selection,
+            Some(&provider_validation),
+            command.refresh_provider_smoke_test,
+        )
         .map_err(failure)?;
     let outcome = match transport.steer(
         &session_id,
@@ -6391,10 +7138,29 @@ fn steer_prompt(
             host: &host.alias,
             effective_timeouts,
             yolo_policy: &yolo_policy,
+            provider_selection: &provider_selection,
+            provider_validation: &provider_validation,
             schema_version: SessionResultSchemaVersion::SteerV2,
             json,
         },
     )
+}
+
+fn build_turn_request(
+    prompt: String,
+    execution_mode: TurnExecutionMode,
+    provider_selection: &ProviderSelection,
+    refresh_provider_smoke_test: bool,
+    turn_execution_timeout_ms: u64,
+) -> TurnRequest {
+    TurnRequest::new(prompt)
+        .with_execution_mode(execution_mode)
+        .with_provider_intent(
+            provider_selection.requested_model_alias.clone(),
+            provider_selection.requested_provider_alias.clone(),
+            refresh_provider_smoke_test,
+        )
+        .with_turn_execution_timeout_ms(turn_execution_timeout_ms)
 }
 
 fn show_status(
@@ -6560,6 +7326,8 @@ struct TurnOutputOptions<'a> {
     host: &'a str,
     effective_timeouts: serde_json::Value,
     yolo_policy: &'a YoloPolicy,
+    provider_selection: &'a ProviderSelection,
+    provider_validation: &'a transport::ProviderDescriptorValidationReport,
     schema_version: SessionResultSchemaVersion,
     json: bool,
 }
@@ -6584,12 +7352,27 @@ fn print_turn_session(
     }
 
     if options.json {
+        let provider_smoke_test_status = provider_smoke
+            .as_ref()
+            .and_then(|provider_smoke| provider_smoke.get("status"))
+            .cloned()
+            .unwrap_or_else(|| json!(options.provider_validation.validation.outcome().as_str()));
         print_json(&json!({
             "schema_version": options.schema_version,
             "session_id": session.session_id(),
             "status": target_turn.state(),
             "effective_timeouts": options.effective_timeouts,
             "provider_smoke": provider_smoke,
+            "requested_model_alias": options.provider_selection.requested_model_alias,
+            "requested_provider_alias": options.provider_selection.requested_provider_alias,
+            "resolved_codex_model": options.provider_validation.resolved_binding.model(),
+            "resolved_model_provider": options.provider_validation.resolved_binding.model_provider(),
+            "provider_binding_source": options.provider_validation.resolved_binding.source().as_str(),
+            "experimental_provider_computer_use": projected_experimental_provider_computer_use(
+                options.provider_selection,
+                Some(options.provider_validation),
+            ),
+            "provider_smoke_test_status": provider_smoke_test_status,
             "yolo": yolo_state_json(options.yolo_policy),
             "latest_turn": target_turn,
         }))
@@ -6603,32 +7386,48 @@ fn print_turn_session(
     Ok(session_id)
 }
 
-fn print_detached_session(
-    session: PublicSession,
-    host: &str,
+struct DetachedOutputOptions<'a> {
+    host: &'a str,
     effective_timeouts: serde_json::Value,
-    yolo_policy: &YoloPolicy,
+    yolo_policy: &'a YoloPolicy,
+    provider_selection: &'a ProviderSelection,
+    provider_validation: &'a transport::ProviderDescriptorValidationReport,
     schema_version: SessionResultSchemaVersion,
     json: bool,
+}
+
+fn print_detached_session(
+    session: PublicSession,
+    options: DetachedOutputOptions<'_>,
 ) -> Result<SessionId, CliFailure> {
     let session_id = session.session_id().clone();
     let latest_turn = latest_turn(&session);
-    if json {
+    if options.json {
         print_json(&json!({
-            "schema_version": schema_version,
+            "schema_version": options.schema_version,
             "session_id": session.session_id(),
-            "host": host,
+            "host": options.host,
             "status": latest_turn.state(),
             "created_at": session.created_at().format(&Rfc3339).expect("a public Session timestamp is RFC 3339 representable"),
             "updated_at": session.updated_at().format(&Rfc3339).expect("a public Session timestamp is RFC 3339 representable"),
-            "effective_timeouts": effective_timeouts,
-            "yolo": yolo_state_json(yolo_policy),
+            "effective_timeouts": options.effective_timeouts,
+            "requested_model_alias": options.provider_selection.requested_model_alias,
+            "requested_provider_alias": options.provider_selection.requested_provider_alias,
+            "resolved_codex_model": options.provider_validation.resolved_binding.model(),
+            "resolved_model_provider": options.provider_validation.resolved_binding.model_provider(),
+            "provider_binding_source": options.provider_validation.resolved_binding.source().as_str(),
+            "experimental_provider_computer_use": projected_experimental_provider_computer_use(
+                options.provider_selection,
+                Some(options.provider_validation),
+            ),
+            "provider_smoke_test_status": options.provider_validation.validation.outcome().as_str(),
+            "yolo": yolo_state_json(options.yolo_policy),
             "turns": session.turns(),
         }))
         .map_err(|error| failure_for_admitted_session(error, &session_id))?;
     } else {
-        if yolo_policy.active {
-            println!("YOLO mode: active ({})", yolo_policy.source);
+        if options.yolo_policy.active {
+            println!("YOLO mode: active ({})", options.yolo_policy.source);
         }
         println!("Session: {}", session.session_id());
         println!("Status: {}", status_label(latest_turn.state()));
@@ -6663,6 +7462,9 @@ impl TurnEventOutput {
         host: &str,
         operation: &str,
         transport: &satelle_core::TransportKind,
+        provider_selection: &ProviderSelection,
+        provider_validation: Option<&transport::ProviderDescriptorValidationReport>,
+        refresh_provider_smoke_test: bool,
     ) -> Result<(), SatelleError> {
         if self.mode == EffectiveEventMode::None {
             return Ok(());
@@ -6677,6 +7479,19 @@ impl TurnEventOutput {
             json!({
                 "operation": operation,
                 "transport": transport,
+                "requested_model_alias": provider_selection.requested_model_alias,
+                "requested_provider_alias": provider_selection.requested_provider_alias,
+                "resolved_codex_model": provider_validation.map(|validation| validation.resolved_binding.model()),
+                "resolved_model_provider": provider_validation.map(|validation| validation.resolved_binding.model_provider()),
+                "provider_binding_source": provider_validation.map(|validation| validation.resolved_binding.source().as_str()),
+                "experimental_provider_computer_use": projected_experimental_provider_computer_use(
+                    provider_selection,
+                    provider_validation,
+                ),
+                "provider_smoke_test_status": provider_validation.map_or_else(
+                    || provider_selection.provider_smoke_status(refresh_provider_smoke_test),
+                    |validation| validation.validation.outcome().as_str(),
+                ),
             }),
         )
         .map_err(|error| SatelleError::invalid_usage(error.to_string()))?;
@@ -7089,6 +7904,18 @@ mod setup_desktop_binding_tests {
         assert_eq!(
             partition_setup_components(&["all".to_string()], false, true),
             (vec!["all".to_string()], true)
+        );
+        assert_eq!(
+            partition_setup_components(&["provider-auth".to_string()], false, false),
+            (Vec::new(), false)
+        );
+        assert_eq!(
+            partition_setup_components(
+                &["desktop".to_string(), "provider-auth".to_string()],
+                false,
+                false,
+            ),
+            (Vec::new(), true)
         );
     }
 
