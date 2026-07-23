@@ -66,6 +66,7 @@ fn failure(error: &SatelleError) -> ApiFailure {
         | ErrorCode::ConcurrencyWithoutRemoteUpdate
         | ErrorCode::ComponentSelectionConflict
         | ErrorCode::UnsupportedUpdateComponent
+        | ErrorCode::PersistentServiceUnsupported
         | ErrorCode::SetupConsentRequired
         | ErrorCode::DoctorFixConsentRequired
         | ErrorCode::DoctorRefreshScopeRequired

@@ -1,5 +1,5 @@
 use super::control_plane::{
-    ControlPlaneAdmission, installed_app_server_command, probe_control_plane_with,
+    ControlPlaneAdmission, configure_app_server_command, probe_control_plane_with,
 };
 use satelle_core::{ControlPlaneCapability, ControlPlaneOperation, ErrorCode};
 use serde_json::json;
@@ -238,7 +238,7 @@ fn handshake_ignores_unknown_notifications() {
 
 #[test]
 fn installed_app_server_is_private_stdio_only() {
-    let command = installed_app_server_command();
+    let command = configure_app_server_command(Command::new("receipt-recorded-codex"));
     let arguments = command
         .get_args()
         .map(|argument| argument.to_string_lossy().into_owned())

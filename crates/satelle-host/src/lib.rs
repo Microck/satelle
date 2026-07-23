@@ -1,6 +1,8 @@
 #[path = "api-auth.rs"]
 mod api_auth;
 mod codex_capabilities;
+#[path = "codex-install.rs"]
+mod codex_install;
 #[path = "codex-session.rs"]
 mod codex_session;
 mod daemon;
@@ -75,6 +77,114 @@ pub use storage::{
 pub trait SetupPostconditionObserver {
     fn observe(&mut self, action: &SetupActionRecord) -> Result<bool, SatelleError>;
 }
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BootstrapMaintenancePlanKind {
+    OnDemandHandoff,
+    PersistentHostService,
+    PersistentHostStop,
+    PersistentHostRestart,
+}
+
+impl BootstrapMaintenancePlanKind {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::OnDemandHandoff => "on_demand_handoff",
+            Self::PersistentHostService => "persistent_host_service",
+            Self::PersistentHostStop => "persistent_host_stop",
+            Self::PersistentHostRestart => "persistent_host_restart",
+        }
+    }
+
+    pub fn parse(value: &str) -> Result<Self, SatelleError> {
+        match value {
+            "on_demand_handoff" => Ok(Self::OnDemandHandoff),
+            "persistent_host_service" => Ok(Self::PersistentHostService),
+            "persistent_host_stop" => Ok(Self::PersistentHostStop),
+            "persistent_host_restart" => Ok(Self::PersistentHostRestart),
+            _ => Err(SatelleError::invalid_usage(
+                "invalid Bootstrap maintenance plan kind",
+            )),
+        }
+    }
+
+    fn actions(self) -> Result<Vec<SetupActionPlan>, SatelleError> {
+        let actions = match self {
+            Self::OnDemandHandoff => vec![SetupActionPlan::new(
+                "bootstrap-handoff",
+                "Bootstrap Lock handoff",
+                true,
+            )?],
+            Self::PersistentHostService => vec![
+                SetupActionPlan::new("bootstrap-handoff", "Bootstrap Lock handoff", true)?,
+                SetupActionPlan::new(
+                    "path-set-directories",
+                    "Create the resolved daemon directories",
+                    true,
+                )?,
+                SetupActionPlan::new(
+                    "service-config",
+                    "Publish the owner-only service configuration",
+                    true,
+                )?,
+                SetupActionPlan::new(
+                    "service-registration",
+                    "Reconcile the user service registration",
+                    true,
+                )?,
+                SetupActionPlan::new(
+                    "service-start-or-restart",
+                    "Start or restart the registered Host service",
+                    true,
+                )?,
+            ],
+            Self::PersistentHostStop => vec![SetupActionPlan::new(
+                "service-stop",
+                "Stop the registered Host service",
+                true,
+            )?],
+            Self::PersistentHostRestart => vec![SetupActionPlan::new(
+                "service-restart",
+                "Restart the registered Host service",
+                true,
+            )?],
+        };
+        Ok(actions)
+    }
+
+    fn accepts_operation_kind(self, operation_kind: SetupOperationKind) -> bool {
+        match self {
+            Self::PersistentHostStop => operation_kind == SetupOperationKind::ServiceStop,
+            Self::PersistentHostRestart => operation_kind == SetupOperationKind::ServiceRestart,
+            Self::OnDemandHandoff | Self::PersistentHostService => !matches!(
+                operation_kind,
+                SetupOperationKind::ServiceStop | SetupOperationKind::ServiceRestart
+            ),
+        }
+    }
+
+    fn matches_run(self, run: &SetupRunRecord) -> Result<bool, SatelleError> {
+        let expected = self.actions()?;
+        Ok(run
+            .actions()
+            .iter()
+            .map(SetupActionRecord::action_id)
+            .eq(expected.iter().map(SetupActionPlan::action_id)))
+    }
+}
+
+fn persistent_service_action(action_id: &str) -> bool {
+    matches!(
+        action_id,
+        "bootstrap-handoff"
+            | "path-set-directories"
+            | "service-config"
+            | "service-registration"
+            | "service-start-or-restart"
+            | "service-stop"
+            | "service-restart"
+    )
+}
 #[cfg(any(test, feature = "test-support"))]
 use test_runtime::FakeComputerUseAdapter;
 #[cfg(feature = "test-support")]
@@ -121,6 +231,107 @@ mod bootstrap_maintenance_tests {
             ],
         )
         .expect("valid bootstrap plan")
+    }
+
+    #[test]
+    fn persistent_lifecycle_plans_require_their_exact_operation_kind() {
+        let state = TestStateDir::new().expect("create state directory");
+        let service =
+            HostService::local_demo_for_tests_at(state.path()).expect("create Host service");
+
+        for (operation_id, operation_kind, plan_kind, expected_action) in [
+            (
+                "persistent-host-stop",
+                SetupOperationKind::ServiceStop,
+                BootstrapMaintenancePlanKind::PersistentHostStop,
+                "service-stop",
+            ),
+            (
+                "persistent-host-restart",
+                SetupOperationKind::ServiceRestart,
+                BootstrapMaintenancePlanKind::PersistentHostRestart,
+                "service-restart",
+            ),
+        ] {
+            service
+                .acquire_bootstrap_maintenance_plan(operation_id, operation_kind, plan_kind)
+                .expect("acquire exact lifecycle plan");
+            let planned = service
+                .load_setup_run(operation_id)
+                .expect("load lifecycle run")
+                .expect("lifecycle run exists");
+            assert_eq!(operation_kind, planned.operation_kind());
+            assert_eq!(1, planned.actions().len());
+            assert_eq!(expected_action, planned.actions()[0].action_id());
+            assert_eq!(SetupActionStatus::Planned, planned.actions()[0].status());
+
+            let mismatched_action = if expected_action == "service-stop" {
+                "service-restart"
+            } else {
+                "service-stop"
+            };
+            assert!(
+                service
+                    .start_bootstrap_service_action(operation_id, mismatched_action)
+                    .is_err(),
+                "a lifecycle plan must reject the other lifecycle action"
+            );
+            service
+                .start_bootstrap_service_action(operation_id, expected_action)
+                .expect("start exact lifecycle action");
+            service
+                .complete_bootstrap_service_action(operation_id, expected_action)
+                .expect("complete exact lifecycle action");
+            service
+                .finish_bootstrap_service_maintenance(operation_id)
+                .expect("finish lifecycle plan");
+            let completed = service
+                .load_setup_run(operation_id)
+                .expect("load completed lifecycle run")
+                .expect("completed lifecycle run exists");
+            assert_eq!(SetupRunStatus::Completed, completed.status());
+        }
+
+        assert!(
+            service
+                .acquire_bootstrap_maintenance_plan(
+                    "stop-with-setup-kind",
+                    SetupOperationKind::Setup,
+                    BootstrapMaintenancePlanKind::PersistentHostStop,
+                )
+                .is_err(),
+            "persistent Host stop must reject the setup operation kind"
+        );
+        assert!(
+            service
+                .acquire_bootstrap_maintenance_plan(
+                    "stop-with-restart-kind",
+                    SetupOperationKind::ServiceRestart,
+                    BootstrapMaintenancePlanKind::PersistentHostStop,
+                )
+                .is_err(),
+            "persistent Host stop must reject the restart operation kind"
+        );
+        assert!(
+            service
+                .acquire_bootstrap_maintenance_plan(
+                    "restart-with-stop-kind",
+                    SetupOperationKind::ServiceStop,
+                    BootstrapMaintenancePlanKind::PersistentHostRestart,
+                )
+                .is_err(),
+            "persistent Host restart must reject the stop operation kind"
+        );
+        assert!(
+            service
+                .acquire_bootstrap_maintenance_plan(
+                    "service-restart-with-setup-plan",
+                    SetupOperationKind::ServiceRestart,
+                    BootstrapMaintenancePlanKind::PersistentHostService,
+                )
+                .is_err(),
+            "service_restart must not admit the multi-action setup plan"
+        );
     }
 
     #[test]
@@ -498,6 +709,24 @@ impl HostService {
         operation_id: &str,
         operation_kind: SetupOperationKind,
     ) -> Result<(), SatelleError> {
+        self.acquire_bootstrap_maintenance_plan(
+            operation_id,
+            operation_kind,
+            BootstrapMaintenancePlanKind::OnDemandHandoff,
+        )
+    }
+
+    pub fn acquire_bootstrap_maintenance_plan(
+        &self,
+        operation_id: &str,
+        operation_kind: SetupOperationKind,
+        plan_kind: BootstrapMaintenancePlanKind,
+    ) -> Result<(), SatelleError> {
+        if !plan_kind.accepts_operation_kind(operation_kind) {
+            return Err(SatelleError::invalid_usage(
+                "maintenance plan and operation kind do not match",
+            ));
+        }
         let mut slot = self
             .bootstrap_maintenance
             .lock()
@@ -510,7 +739,7 @@ impl HostService {
                 .runtime
                 .load_setup_run(operation_id)?
                 .ok_or_else(SatelleError::state_conflict)?;
-            return if run.operation_kind() == operation_kind {
+            return if run.operation_kind() == operation_kind && plan_kind.matches_run(&run)? {
                 Ok(())
             } else {
                 Err(SatelleError::state_conflict())
@@ -518,32 +747,165 @@ impl HostService {
         }
         let existing_run = self.runtime.load_setup_run(operation_id)?;
         if let Some(run) = existing_run.as_ref() {
-            if run.operation_kind() != operation_kind {
+            if run.operation_kind() != operation_kind || !plan_kind.matches_run(run)? {
                 return Err(SatelleError::state_conflict());
             }
-            if run.status() == SetupRunStatus::Completed
-                && run.actions().iter().any(|action| {
-                    action.action_id() == "bootstrap-handoff"
-                        && action.status() == SetupActionStatus::Completed
-                })
-            {
+            if run.status() == SetupRunStatus::Completed {
                 return Ok(());
             }
         }
         let operation = if existing_run.is_some() {
             self.runtime.adopt_recovery_maintenance(operation_id)?
         } else {
-            let action = SetupActionPlan::new("bootstrap-handoff", "Bootstrap Lock handoff", true)?;
             let plan = SetupRunPlan::new(
                 operation_id,
                 operation_kind,
                 None,
                 time::OffsetDateTime::now_utc(),
-                vec![action],
+                plan_kind.actions()?,
             )?;
             self.runtime.begin_bootstrap_maintenance(&plan)?
         };
         *slot = Some(operation);
+        Ok(())
+    }
+
+    pub fn start_bootstrap_service_action(
+        &self,
+        operation_id: &str,
+        action_id: &str,
+    ) -> Result<(), SatelleError> {
+        if !persistent_service_action(action_id) {
+            return Err(SatelleError::invalid_usage(
+                "invalid persistent Host service action",
+            ));
+        }
+        let slot = self
+            .bootstrap_maintenance
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let operation = slot.as_ref().ok_or_else(SatelleError::state_conflict)?;
+        if operation.operation_id() != operation_id {
+            return Err(SatelleError::state_conflict());
+        }
+        self.runtime
+            .start_setup_action(operation, action_id, time::OffsetDateTime::now_utc())
+    }
+
+    pub fn complete_bootstrap_service_action(
+        &self,
+        operation_id: &str,
+        action_id: &str,
+    ) -> Result<(), SatelleError> {
+        if !persistent_service_action(action_id) {
+            return Err(SatelleError::invalid_usage(
+                "invalid persistent Host service action",
+            ));
+        }
+        let slot = self
+            .bootstrap_maintenance
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let operation = slot.as_ref().ok_or_else(SatelleError::state_conflict)?;
+        if operation.operation_id() != operation_id {
+            return Err(SatelleError::state_conflict());
+        }
+        self.runtime
+            .complete_setup_action_after_verified_postcondition(
+                operation,
+                action_id,
+                time::OffsetDateTime::now_utc(),
+            )
+    }
+
+    pub fn fail_bootstrap_service_action(
+        &self,
+        operation_id: &str,
+        action_id: &str,
+        failure_kind: &str,
+    ) -> Result<(), SatelleError> {
+        if !persistent_service_action(action_id) {
+            return Err(SatelleError::invalid_usage(
+                "invalid persistent Host service action",
+            ));
+        }
+        let (error_code, recovery_hint) = match failure_kind {
+            "remote_command_failed" => (
+                "remote_command_failed",
+                "rerun persistent setup after correcting the reported remote command failure",
+            ),
+            "postcondition_failed" => (
+                "postcondition_failed",
+                "inspect the user service definition, then rerun persistent setup",
+            ),
+            "readiness_failed" => (
+                "readiness_failed",
+                "inspect the user service and loopback listener, then rerun persistent setup",
+            ),
+            "listener_still_reachable" => (
+                "listener_still_reachable",
+                "inspect the user service and loopback listener, then retry the Host stop",
+            ),
+            _ => {
+                return Err(SatelleError::invalid_usage(
+                    "invalid persistent Host service failure kind",
+                ));
+            }
+        };
+        let slot = self
+            .bootstrap_maintenance
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let operation = slot.as_ref().ok_or_else(SatelleError::state_conflict)?;
+        if operation.operation_id() != operation_id {
+            return Err(SatelleError::state_conflict());
+        }
+        let failed_at = time::OffsetDateTime::now_utc();
+        self.runtime.fail_setup_action(
+            operation,
+            action_id,
+            error_code,
+            None,
+            Some(recovery_hint),
+            failed_at,
+        )?;
+        let run = self
+            .runtime
+            .load_setup_run(operation_id)?
+            .ok_or_else(SatelleError::state_conflict)?;
+        let failed_index = run
+            .actions()
+            .iter()
+            .position(|action| action.action_id() == action_id)
+            .ok_or_else(SatelleError::state_conflict)?;
+        for (offset, action) in run.actions()[failed_index + 1..].iter().enumerate() {
+            if action.status() == SetupActionStatus::Planned {
+                self.runtime.skip_setup_action(
+                    operation,
+                    action.action_id(),
+                    SetupActionSkipReason::DependencyFailed,
+                    failed_at + time::Duration::nanoseconds((offset + 1) as i64),
+                )?;
+            }
+        }
+        Ok(())
+    }
+
+    pub fn finish_bootstrap_service_maintenance(
+        &self,
+        operation_id: &str,
+    ) -> Result<(), SatelleError> {
+        let mut slot = self
+            .bootstrap_maintenance
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let operation = slot.as_mut().ok_or_else(SatelleError::state_conflict)?;
+        if operation.operation_id() != operation_id {
+            return Err(SatelleError::state_conflict());
+        }
+        self.runtime
+            .finish_setup_run(operation, time::OffsetDateTime::now_utc())?;
+        *slot = None;
         Ok(())
     }
 
@@ -1597,6 +1959,11 @@ fn production_setup_report(
         service_persistent,
         service_scope: service_scope.to_string(),
         fallback_reason: None,
+        target_platform: None,
+        host_artifact: None,
+        service_plan: None,
+        current_daemon_paths: None,
+        planned_daemon_paths: None,
         setup_components,
         planned_actions,
         applied_actions: Vec::new(),

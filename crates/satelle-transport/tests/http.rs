@@ -131,12 +131,13 @@ impl RunningServer {
 
     fn request(&self, path: &str) -> reqwest::RequestBuilder {
         self.protected_request(reqwest::Method::GET, path)
+            .header("Satelle-Protocol-Version", "5")
     }
 
     fn mutation(&self, path: &str, idempotency_key: &str) -> reqwest::RequestBuilder {
         self.protected_request(reqwest::Method::POST, path)
             .header("Idempotency-Key", idempotency_key)
-            .header("Satelle-Protocol-Version", "4")
+            .header("Satelle-Protocol-Version", "5")
     }
 
     fn mutation_with_request_id(
@@ -147,7 +148,7 @@ impl RunningServer {
     ) -> reqwest::RequestBuilder {
         self.protected_request_with_request_id(reqwest::Method::POST, path, request_id)
             .header("Idempotency-Key", idempotency_key)
-            .header("Satelle-Protocol-Version", "4")
+            .header("Satelle-Protocol-Version", "5")
     }
 
     fn protected_request(&self, method: reqwest::Method, path: &str) -> reqwest::RequestBuilder {
@@ -353,7 +354,7 @@ fn setup_mutation_request(
         .header("Satelle-Expected-Host-Identity", host_identity)
         .header("Satelle-Request-Id", RequestId::new().to_string())
         .header("Idempotency-Key", idempotency_key)
-        .header("Satelle-Protocol-Version", "4")
+        .header("Satelle-Protocol-Version", "5")
 }
 
 fn replacement_token(token_id: &str) -> ApiBearerToken {
@@ -496,6 +497,43 @@ async fn idle_server_waits_for_timeout_and_connected_clients() {
     tokio::time::timeout(idle_timeout + Duration::from_millis(150), waiting)
         .await
         .expect("server should exit after the client disconnects and timeout elapses")
+        .expect("idle shutdown should be graceful");
+}
+
+#[tokio::test]
+async fn idle_server_rechecks_activity_arriving_at_expiry() {
+    let state = TestStateDir::new().expect("temporary state directory");
+    let service = HostService::local_demo_for_tests_at(state.path())
+        .expect("construct deterministic Host service");
+    let idle_timeout = Duration::from_millis(80);
+    let server = DaemonServer::bind(
+        service,
+        DaemonServerConfig::loopback(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
+            .with_idle_timeout(idle_timeout),
+    )
+    .await
+    .expect("bind idle server");
+    let address = server.local_addr();
+    let mut waiting = Box::pin(server.wait());
+    let connector = tokio::spawn(async move {
+        tokio::time::sleep(idle_timeout + Duration::from_millis(5)).await;
+        TcpStream::connect(address)
+            .await
+            .expect("connect during final idle confirmation")
+    });
+
+    assert!(
+        tokio::time::timeout(idle_timeout + Duration::from_millis(50), &mut waiting)
+            .await
+            .is_err(),
+        "activity accepted after the first expiry snapshot must cancel shutdown"
+    );
+    let client = connector.await.expect("expiry connector must not panic");
+    drop(client);
+
+    tokio::time::timeout(idle_timeout + Duration::from_millis(150), waiting)
+        .await
+        .expect("server should exit after the boundary client disconnects")
         .expect("idle shutdown should be graceful");
 }
 
@@ -1583,7 +1621,7 @@ async fn bootstrap_maintenance_routes_enforce_the_mutation_contract_before_ledge
         ),
         (
             "missing-idempotency",
-            Some("4"),
+            Some("5"),
             None,
             false,
             false,
@@ -1592,7 +1630,7 @@ async fn bootstrap_maintenance_routes_enforce_the_mutation_contract_before_ledge
         ),
         (
             "query",
-            Some("4"),
+            Some("5"),
             Some("query-key"),
             true,
             false,
@@ -1601,7 +1639,7 @@ async fn bootstrap_maintenance_routes_enforce_the_mutation_contract_before_ledge
         ),
         (
             "cookie",
-            Some("4"),
+            Some("5"),
             Some("cookie-key"),
             false,
             true,
@@ -1616,7 +1654,7 @@ async fn bootstrap_maintenance_routes_enforce_the_mutation_contract_before_ledge
         let operation_id = format!("rejected-begin-{case}");
         let query_suffix = if query { "?forbidden=true" } else { "" };
         let invalid_path = format!(
-            "/v1/maintenance/bootstrap/{operation_id}/missing_daemon_repair/begin{query_suffix}"
+            "/v1/maintenance/bootstrap/{operation_id}/missing_daemon_repair/on_demand_handoff/begin{query_suffix}"
         );
         let mut request = authenticated_request(&invalid_path);
         if let Some(protocol) = protocol {
@@ -1635,10 +1673,22 @@ async fn bootstrap_maintenance_routes_enforce_the_mutation_contract_before_ledge
         assert_eq!(rejection.status(), expected_status, "{case}");
         let error: ApiError = rejection.json().await.expect("decode begin rejection");
         assert_eq!(error.code(), expected_code, "{case}");
+        if expected_code == ApiErrorCode::IncompatibleProtocol {
+            assert_eq!(
+                error
+                    .details()
+                    .and_then(|details| details.get("daemon_version"))
+                    .and_then(serde_json::Value::as_str),
+                Some(env!("CARGO_PKG_VERSION")),
+                "{case}"
+            );
+        }
 
         // A different operation kind for the same ID succeeds only if the
         // rejected request never created a setup ledger entry.
-        let accepted_path = format!("/v1/maintenance/bootstrap/{operation_id}/initial_setup/begin");
+        let accepted_path = format!(
+            "/v1/maintenance/bootstrap/{operation_id}/initial_setup/on_demand_handoff/begin"
+        );
         let accepted = setup_mutation_request(
             &client,
             address,
@@ -1671,7 +1721,9 @@ async fn bootstrap_maintenance_routes_enforce_the_mutation_contract_before_ledge
         address,
         &bootstrap_token,
         &host_identity,
-        &format!("/v1/maintenance/bootstrap/{active_operation}/initial_setup/begin"),
+        &format!(
+            "/v1/maintenance/bootstrap/{active_operation}/initial_setup/on_demand_handoff/begin"
+        ),
         active_operation,
     )
     .send()
@@ -1700,7 +1752,7 @@ async fn bootstrap_maintenance_routes_enforce_the_mutation_contract_before_ledge
         ),
         (
             "missing-idempotency",
-            Some("4"),
+            Some("5"),
             None,
             false,
             false,
@@ -1709,7 +1761,7 @@ async fn bootstrap_maintenance_routes_enforce_the_mutation_contract_before_ledge
         ),
         (
             "query",
-            Some("4"),
+            Some("5"),
             Some("complete-query-key"),
             true,
             false,
@@ -1718,7 +1770,7 @@ async fn bootstrap_maintenance_routes_enforce_the_mutation_contract_before_ledge
         ),
         (
             "cookie",
-            Some("4"),
+            Some("5"),
             Some("complete-cookie-key"),
             false,
             true,
@@ -1759,7 +1811,9 @@ async fn bootstrap_maintenance_routes_enforce_the_mutation_contract_before_ledge
         address,
         &bootstrap_token,
         &host_identity,
-        &format!("/v1/maintenance/bootstrap/{competing_operation}/missing_daemon_repair/begin"),
+        &format!(
+            "/v1/maintenance/bootstrap/{competing_operation}/missing_daemon_repair/on_demand_handoff/begin"
+        ),
         competing_operation,
     )
     .send()
@@ -1784,7 +1838,9 @@ async fn bootstrap_maintenance_routes_enforce_the_mutation_contract_before_ledge
         address,
         &bootstrap_token,
         &host_identity,
-        &format!("/v1/maintenance/bootstrap/{competing_operation}/missing_daemon_repair/begin"),
+        &format!(
+            "/v1/maintenance/bootstrap/{competing_operation}/missing_daemon_repair/on_demand_handoff/begin"
+        ),
         competing_operation,
     )
     .send()
@@ -1803,6 +1859,440 @@ async fn bootstrap_maintenance_routes_enforce_the_mutation_contract_before_ledge
     .await
     .expect("complete competing operation");
     assert_eq!(complete_competing.status(), StatusCode::OK);
+
+    server.shutdown().await.expect("stop bootstrap server");
+}
+
+#[tokio::test]
+async fn persistent_host_service_maintenance_routes_enforce_action_order() {
+    let state = TestStateDir::new().expect("temporary state directory");
+    let bootstrap_token = ApiBearerToken::generate().expect("generate bootstrap token");
+    let service = HostService::local_demo_for_tests_at(state.path())
+        .expect("construct deterministic Host service")
+        .with_ssh_bootstrap_auth_for_tests(
+            &bootstrap_token,
+            ApiScopes::ADMIN,
+            time::OffsetDateTime::now_utc() + time::Duration::minutes(15),
+        );
+    let host_identity = service
+        .initialize_daemon()
+        .expect("initialize Host state")
+        .host_identity()
+        .to_string();
+    let server = DaemonServer::bind(
+        service.clone(),
+        DaemonServerConfig::loopback(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))),
+    )
+    .await
+    .expect("bind bootstrap server");
+    let address = server.local_addr();
+    let client = reqwest::Client::new();
+    let operation_id = "persistent-host-service-order";
+    let action_ids = [
+        "bootstrap-handoff",
+        "path-set-directories",
+        "service-config",
+        "service-registration",
+        "service-start-or-restart",
+    ];
+
+    let begin = setup_mutation_request(
+        &client,
+        address,
+        &bootstrap_token,
+        &host_identity,
+        &format!(
+            "/v1/maintenance/bootstrap/{operation_id}/initial_setup/persistent_host_service/begin"
+        ),
+        operation_id,
+    )
+    .send()
+    .await
+    .expect("begin persistent Host service maintenance");
+    let begin_status = begin.status();
+    let begin_body = begin.text().await.expect("read maintenance begin response");
+    assert_eq!(begin_status, StatusCode::OK, "{begin_body}");
+
+    let unknown = setup_mutation_request(
+        &client,
+        address,
+        &bootstrap_token,
+        &host_identity,
+        &format!(
+            "/v1/maintenance/bootstrap/{operation_id}/persistent-host-service/unknown-action/start"
+        ),
+        operation_id,
+    )
+    .send()
+    .await
+    .expect("reject unknown persistent service action");
+    assert_eq!(unknown.status(), StatusCode::BAD_REQUEST);
+    let after_unknown = service
+        .load_setup_run(operation_id)
+        .expect("load persistent service ledger")
+        .expect("persistent service ledger exists");
+    assert!(
+        after_unknown
+            .actions()
+            .iter()
+            .all(|action| action.status() == satelle_host::SetupActionStatus::Planned),
+        "an unknown action ID must not advance the ledger"
+    );
+
+    let out_of_order = setup_mutation_request(
+        &client,
+        address,
+        &bootstrap_token,
+        &host_identity,
+        &format!(
+            "/v1/maintenance/bootstrap/{operation_id}/persistent-host-service/service-config/start"
+        ),
+        operation_id,
+    )
+    .send()
+    .await
+    .expect("reject out-of-order persistent service action");
+    assert_eq!(out_of_order.status(), StatusCode::CONFLICT);
+    let after_out_of_order = service
+        .load_setup_run(operation_id)
+        .expect("load persistent service ledger")
+        .expect("persistent service ledger exists");
+    assert!(
+        after_out_of_order
+            .actions()
+            .iter()
+            .all(|action| action.status() == satelle_host::SetupActionStatus::Planned),
+        "an out-of-order transition must not advance the ledger"
+    );
+
+    for (index, action_id) in action_ids.iter().enumerate() {
+        let start = setup_mutation_request(
+            &client,
+            address,
+            &bootstrap_token,
+            &host_identity,
+            &format!(
+                "/v1/maintenance/bootstrap/{operation_id}/persistent-host-service/{action_id}/start"
+            ),
+            operation_id,
+        )
+        .send()
+        .await
+        .expect("start persistent service action");
+        assert_eq!(start.status(), StatusCode::OK, "start {action_id}");
+        let started = service
+            .load_setup_run(operation_id)
+            .expect("load persistent service ledger")
+            .expect("persistent service ledger exists");
+        assert_eq!(
+            started.actions()[index].status(),
+            satelle_host::SetupActionStatus::Started,
+            "start {action_id} must advance only the current action"
+        );
+
+        let complete = setup_mutation_request(
+            &client,
+            address,
+            &bootstrap_token,
+            &host_identity,
+            &format!(
+                "/v1/maintenance/bootstrap/{operation_id}/persistent-host-service/{action_id}/complete"
+            ),
+            operation_id,
+        )
+        .send()
+        .await
+        .expect("complete persistent service action");
+        assert_eq!(complete.status(), StatusCode::OK, "complete {action_id}");
+        let completed = service
+            .load_setup_run(operation_id)
+            .expect("load persistent service ledger")
+            .expect("persistent service ledger exists");
+        assert_eq!(
+            completed.actions()[index].status(),
+            satelle_host::SetupActionStatus::Completed,
+            "complete {action_id} must advance the current action"
+        );
+        assert!(
+            completed.actions()[..=index]
+                .iter()
+                .all(|action| action.status() == satelle_host::SetupActionStatus::Completed)
+        );
+        assert!(
+            completed.actions()[index + 1..]
+                .iter()
+                .all(|action| action.status() == satelle_host::SetupActionStatus::Planned)
+        );
+    }
+
+    let finish = setup_mutation_request(
+        &client,
+        address,
+        &bootstrap_token,
+        &host_identity,
+        &format!("/v1/maintenance/bootstrap/{operation_id}/persistent-host-service/finish"),
+        operation_id,
+    )
+    .send()
+    .await
+    .expect("finish persistent Host service maintenance");
+    assert_eq!(finish.status(), StatusCode::OK);
+    let finished = service
+        .load_setup_run(operation_id)
+        .expect("load persistent service ledger")
+        .expect("persistent service ledger exists");
+    assert_eq!(finished.status(), satelle_host::SetupRunStatus::Completed);
+    assert!(
+        finished
+            .actions()
+            .iter()
+            .zip(action_ids)
+            .all(|(action, id)| {
+                action.action_id() == id
+                    && action.status() == satelle_host::SetupActionStatus::Completed
+            })
+    );
+
+    let failed_operation_id = "persistent-host-service-failure";
+    let begin_failed = setup_mutation_request(
+        &client,
+        address,
+        &bootstrap_token,
+        &host_identity,
+        &format!(
+            "/v1/maintenance/bootstrap/{failed_operation_id}/initial_setup/persistent_host_service/begin"
+        ),
+        failed_operation_id,
+    )
+    .send()
+    .await
+    .expect("begin persistent service failure proof");
+    assert_eq!(begin_failed.status(), StatusCode::OK);
+    let start_failed = setup_mutation_request(
+        &client,
+        address,
+        &bootstrap_token,
+        &host_identity,
+        &format!(
+            "/v1/maintenance/bootstrap/{failed_operation_id}/persistent-host-service/bootstrap-handoff/start"
+        ),
+        failed_operation_id,
+    )
+    .send()
+    .await
+    .expect("start persistent service failure proof");
+    assert_eq!(start_failed.status(), StatusCode::OK);
+    let complete_first = setup_mutation_request(
+        &client,
+        address,
+        &bootstrap_token,
+        &host_identity,
+        &format!(
+            "/v1/maintenance/bootstrap/{failed_operation_id}/persistent-host-service/bootstrap-handoff/complete"
+        ),
+        failed_operation_id,
+    )
+    .send()
+    .await
+    .expect("complete first persistent service action");
+    assert_eq!(complete_first.status(), StatusCode::OK);
+    let start_second = setup_mutation_request(
+        &client,
+        address,
+        &bootstrap_token,
+        &host_identity,
+        &format!(
+            "/v1/maintenance/bootstrap/{failed_operation_id}/persistent-host-service/path-set-directories/start"
+        ),
+        failed_operation_id,
+    )
+    .send()
+    .await
+    .expect("start failing persistent service action");
+    assert_eq!(start_second.status(), StatusCode::OK);
+    let fail = setup_mutation_request(
+        &client,
+        address,
+        &bootstrap_token,
+        &host_identity,
+        &format!(
+            "/v1/maintenance/bootstrap/{failed_operation_id}/persistent-host-service/path-set-directories/fail/remote_command_failed"
+        ),
+        failed_operation_id,
+    )
+    .send()
+    .await
+    .expect("record persistent service failure");
+    assert_eq!(fail.status(), StatusCode::OK);
+    let finish_failed = setup_mutation_request(
+        &client,
+        address,
+        &bootstrap_token,
+        &host_identity,
+        &format!("/v1/maintenance/bootstrap/{failed_operation_id}/persistent-host-service/finish"),
+        failed_operation_id,
+    )
+    .send()
+    .await
+    .expect("finish failed persistent service run");
+    assert_eq!(finish_failed.status(), StatusCode::OK);
+    let failed = service
+        .load_setup_run(failed_operation_id)
+        .expect("load failed persistent service ledger")
+        .expect("failed persistent service ledger exists");
+    assert_eq!(
+        failed.status(),
+        satelle_host::SetupRunStatus::PartialFailure
+    );
+    assert_eq!(
+        failed.actions()[0].status(),
+        satelle_host::SetupActionStatus::Completed
+    );
+    assert_eq!(
+        failed.actions()[1].status(),
+        satelle_host::SetupActionStatus::Failed
+    );
+    assert!(
+        failed.actions()[2..]
+            .iter()
+            .all(|action| action.status() == satelle_host::SetupActionStatus::Skipped)
+    );
+
+    server.shutdown().await.expect("stop bootstrap server");
+}
+
+#[tokio::test]
+async fn persistent_host_lifecycle_maintenance_uses_exact_single_action_plans() {
+    let state = TestStateDir::new().expect("temporary state directory");
+    let bootstrap_token = ApiBearerToken::generate().expect("generate bootstrap token");
+    let service = HostService::local_demo_for_tests_at(state.path())
+        .expect("construct deterministic Host service")
+        .with_ssh_bootstrap_auth_for_tests(
+            &bootstrap_token,
+            ApiScopes::ADMIN,
+            time::OffsetDateTime::now_utc() + time::Duration::minutes(15),
+        );
+    let host_identity = service
+        .initialize_daemon()
+        .expect("initialize Host state")
+        .host_identity()
+        .to_string();
+    let server = DaemonServer::bind(
+        service.clone(),
+        DaemonServerConfig::loopback(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))),
+    )
+    .await
+    .expect("bind bootstrap server");
+    let address = server.local_addr();
+
+    let mismatched_operation = "lifecycle-stop-with-setup-kind";
+    let mismatch = setup_mutation_request(
+        &reqwest::Client::new(),
+        address,
+        &bootstrap_token,
+        &host_identity,
+        &format!(
+            "/v1/maintenance/bootstrap/{mismatched_operation}/initial_setup/persistent_host_stop/begin"
+        ),
+        mismatched_operation,
+    )
+    .send()
+    .await
+    .expect("send mismatched lifecycle operation");
+    assert_eq!(mismatch.status(), StatusCode::BAD_REQUEST);
+    assert!(
+        service
+            .load_setup_run(mismatched_operation)
+            .expect("load rejected lifecycle operation")
+            .is_none(),
+        "a mismatched lifecycle operation must not create a ledger run"
+    );
+
+    let client_identity = host_identity.clone();
+    tokio::task::spawn_blocking(move || {
+        let bootstrap_client =
+            DaemonClient::loopback(address, bootstrap_token, client_identity.clone())
+                .expect("construct bootstrap client");
+        let issuance = bootstrap_client
+            .issue_durable_setup_token("issue-lifecycle-control-token")
+            .expect("issue lifecycle control token");
+        let token_id = issuance.token_id().to_string();
+        let durable_token = ApiBearerToken::parse(
+            issuance
+                .into_bearer_token()
+                .expect("first issuance carries the token secret")
+                .as_str(),
+        )
+        .expect("parse lifecycle control token");
+        bootstrap_client
+            .activate_durable_setup_token(&token_id, "activate-lifecycle-control-token")
+            .expect("activate lifecycle control token");
+        let durable_client =
+            DaemonClient::loopback(address, durable_token, client_identity.clone())
+                .expect("construct durable lifecycle client");
+
+        let stop_operation = "persistent-host-stop-lifecycle";
+        durable_client
+            .begin_persistent_host_stop_maintenance(stop_operation)
+            .expect("active durable control token begins Host stop");
+        durable_client
+            .start_persistent_service_action(stop_operation, "service-restart")
+            .expect_err("Host stop rejects the restart action");
+        durable_client
+            .start_persistent_service_action(stop_operation, "service-stop")
+            .expect("start Host stop action");
+        durable_client
+            .complete_persistent_service_action(stop_operation, "service-stop")
+            .expect("complete Host stop action");
+        durable_client
+            .finish_persistent_service_maintenance(stop_operation)
+            .expect("finish Host stop maintenance");
+
+        let restart_operation = "persistent-host-restart-lifecycle";
+        bootstrap_client
+            .begin_persistent_host_restart_maintenance(restart_operation)
+            .expect("admin bootstrap begins Host restart");
+        bootstrap_client
+            .start_persistent_service_action(restart_operation, "service-stop")
+            .expect_err("Host restart rejects the stop action");
+        bootstrap_client
+            .start_persistent_service_action(restart_operation, "service-restart")
+            .expect("start Host restart action");
+        bootstrap_client
+            .complete_persistent_service_action(restart_operation, "service-restart")
+            .expect("complete Host restart action");
+        bootstrap_client
+            .finish_persistent_service_maintenance(restart_operation)
+            .expect("finish Host restart maintenance");
+    })
+    .await
+    .expect("run lifecycle clients");
+
+    for (operation_id, expected_action, expected_operation_kind) in [
+        (
+            "persistent-host-stop-lifecycle",
+            "service-stop",
+            satelle_host::SetupOperationKind::ServiceStop,
+        ),
+        (
+            "persistent-host-restart-lifecycle",
+            "service-restart",
+            satelle_host::SetupOperationKind::ServiceRestart,
+        ),
+    ] {
+        let run = service
+            .load_setup_run(operation_id)
+            .expect("load lifecycle run")
+            .expect("lifecycle run exists");
+        assert_eq!(run.operation_kind(), expected_operation_kind);
+        assert_eq!(run.status(), satelle_host::SetupRunStatus::Completed);
+        assert_eq!(1, run.actions().len());
+        assert_eq!(expected_action, run.actions()[0].action_id());
+        assert_eq!(
+            satelle_host::SetupActionStatus::Completed,
+            run.actions()[0].status()
+        );
+    }
 
     server.shutdown().await.expect("stop bootstrap server");
 }
@@ -1841,7 +2331,9 @@ async fn bootstrap_maintenance_routes_share_the_control_mutation_rate_limit() {
         address,
         &bootstrap_token,
         &host_identity,
-        &format!("/v1/maintenance/bootstrap/{admitted_operation}/missing_daemon_repair/begin"),
+        &format!(
+            "/v1/maintenance/bootstrap/{admitted_operation}/missing_daemon_repair/on_demand_handoff/begin"
+        ),
         admitted_operation,
     )
     .send()
@@ -1868,7 +2360,7 @@ async fn bootstrap_maintenance_routes_share_the_control_mutation_rate_limit() {
         &bootstrap_token,
         &host_identity,
         &format!(
-            "/v1/maintenance/bootstrap/{rejected_begin_operation}/missing_daemon_repair/begin"
+            "/v1/maintenance/bootstrap/{rejected_begin_operation}/missing_daemon_repair/on_demand_handoff/begin"
         ),
         rejected_begin_operation,
     )

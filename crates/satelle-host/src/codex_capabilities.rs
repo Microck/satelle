@@ -421,14 +421,29 @@ pub(crate) fn discover_phase0(probe_timeout: Option<Duration>) -> Phase0Discover
         };
     }
 
-    let codex_version = probe_codex_version(probe_timeout.unwrap_or(VERSION_PROBE_TIMEOUT));
+    let Ok(runtime) = crate::codex_install::admit_managed_codex_for_current_process() else {
+        return Phase0Discovery {
+            evidence: Phase0CapabilityEvidence {
+                codex_version: CodexVersionEvidence::Missing,
+                host_platform,
+                capabilities: CapabilityMatrix::unproven(),
+            },
+            control_plane_admission: control_plane::ControlPlaneAdmission::unavailable(
+                ControlPlaneFailureReason::RuntimeMissing,
+            ),
+        };
+    };
+    let codex_version =
+        probe_codex_version(&runtime, probe_timeout.unwrap_or(VERSION_PROBE_TIMEOUT));
     let (capabilities, control_plane_admission) = match codex_version {
         CodexVersionEvidence::Detected { version } if version == REQUIRED_CODEX_VERSION => {
-            let probe = control_plane::probe_installed_control_plane(probe_timeout);
+            let probe = control_plane::probe_installed_control_plane(&runtime, probe_timeout);
             let mut capabilities = CapabilityMatrix::from_control_plane(probe);
             if host_platform == HostPlatform::Windows {
-                capabilities.approval_observation.surface =
-                    probe_windows_app_policy(probe_timeout.unwrap_or(APP_POLICY_PROBE_TIMEOUT));
+                capabilities.approval_observation.surface = probe_windows_app_policy(
+                    &runtime,
+                    probe_timeout.unwrap_or(APP_POLICY_PROBE_TIMEOUT),
+                );
             }
             (
                 capabilities,
@@ -478,8 +493,17 @@ pub(crate) fn discover_phase0_evidence() -> Phase0CapabilityEvidence {
 /// Resolves the active Codex home through the installed app-server, then reads
 /// its Windows app policy. No path or configured app identifier crosses this
 /// closed evidence boundary.
-fn probe_windows_app_policy(timeout: Duration) -> EvidenceSurface {
-    probe_windows_app_policy_with(control_plane::installed_app_server_command(), timeout)
+fn probe_windows_app_policy(
+    runtime: &crate::codex_install::VerifiedCodexRuntime,
+    timeout: Duration,
+) -> EvidenceSurface {
+    let Ok(command) = runtime
+        .command()
+        .map(control_plane::configure_app_server_command)
+    else {
+        return EvidenceSurface::Incomplete;
+    };
+    probe_windows_app_policy_with(command, timeout)
 }
 
 fn probe_windows_app_policy_with(mut command: Command, timeout: Duration) -> EvidenceSurface {
@@ -1048,8 +1072,13 @@ fn blocker_for(
     }
 }
 
-fn probe_codex_version(timeout: Duration) -> CodexVersionEvidence {
-    let mut command = Command::new("codex");
+fn probe_codex_version(
+    runtime: &crate::codex_install::VerifiedCodexRuntime,
+    timeout: Duration,
+) -> CodexVersionEvidence {
+    let Ok(mut command) = runtime.command() else {
+        return CodexVersionEvidence::Unavailable;
+    };
     command.arg("--version");
     tracing::debug!("probing Codex runtime version");
     probe_codex_version_command(command, timeout)

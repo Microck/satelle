@@ -20,7 +20,7 @@ async fn chunked_oversize_body_returns_typed_413_without_admission() {
     let authorization = bearer(&running.token);
     let payload_bytes = 1_048_577;
     let head = format!(
-        "POST /v1/sessions HTTP/1.1\r\nHost: localhost\r\nAuthorization: {authorization}\r\nSatelle-Expected-Host-Identity: {}\r\nSatelle-Request-Id: {}\r\nSatelle-Protocol-Version: 4\r\nIdempotency-Key: raw-chunked-limit\r\nContent-Type: application/json\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n{payload_bytes:x}\r\n",
+        "POST /v1/sessions HTTP/1.1\r\nHost: localhost\r\nAuthorization: {authorization}\r\nSatelle-Expected-Host-Identity: {}\r\nSatelle-Request-Id: {}\r\nSatelle-Protocol-Version: 5\r\nIdempotency-Key: raw-chunked-limit\r\nContent-Type: application/json\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n{payload_bytes:x}\r\n",
         running.host_identity,
         RequestId::new(),
     );
@@ -59,7 +59,7 @@ async fn chunked_attachment_limit_and_log_privacy(trace_capture: TraceCapture) {
     let split = body.len() / 2;
     let request_id = RequestId::new();
     let request_head = format!(
-        "POST /v1/sessions HTTP/1.1\r\nHost: localhost\r\nAuthorization: {authorization}\r\nSatelle-Expected-Host-Identity: {}\r\nSatelle-Request-Id: {}\r\nSatelle-Protocol-Version: 4\r\nIdempotency-Key: attachment-limit-chunked\r\nContent-Type: application/json\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n{split:x}\r\n",
+        "POST /v1/sessions HTTP/1.1\r\nHost: localhost\r\nAuthorization: {authorization}\r\nSatelle-Expected-Host-Identity: {}\r\nSatelle-Request-Id: {}\r\nSatelle-Protocol-Version: 5\r\nIdempotency-Key: attachment-limit-chunked\r\nContent-Type: application/json\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n{split:x}\r\n",
         running.host_identity, request_id,
     );
     let mut request = request_head.into_bytes();
@@ -136,7 +136,7 @@ async fn bearer_tokens_in_http_trailers_are_rejected_without_admission() {
     let body =
         br#"{"schema_version":"satelle.api.v2","prompt":"safe","execution_mode":"standard"}"#;
     let mutation_request = format!(
-        "POST /v1/sessions HTTP/1.1\r\nHost: localhost\r\nAuthorization: {}\r\nSatelle-Expected-Host-Identity: {}\r\nSatelle-Request-Id: {}\r\nSatelle-Protocol-Version: 4\r\nIdempotency-Key: trailer-carrier\r\nContent-Type: application/json\r\nTransfer-Encoding: chunked\r\nTrailer: X-Api-Token\r\nConnection: close\r\n\r\n{:x}\r\n{}\r\n0\r\nX-Api-Token: {}\r\n\r\n",
+        "POST /v1/sessions HTTP/1.1\r\nHost: localhost\r\nAuthorization: {}\r\nSatelle-Expected-Host-Identity: {}\r\nSatelle-Request-Id: {}\r\nSatelle-Protocol-Version: 5\r\nIdempotency-Key: trailer-carrier\r\nContent-Type: application/json\r\nTransfer-Encoding: chunked\r\nTrailer: X-Api-Token\r\nConnection: close\r\n\r\n{:x}\r\n{}\r\n0\r\nX-Api-Token: {}\r\n\r\n",
         bearer(&running.token),
         running.host_identity,
         RequestId::new(),
@@ -178,7 +178,7 @@ async fn stalled_upload_cannot_hold_daemon_shutdown_open_forever() {
         .await
         .expect("open stalled request connection");
     let partial = format!(
-        "POST /v1/sessions HTTP/1.1\r\nHost: localhost\r\nAuthorization: {}\r\nSatelle-Expected-Host-Identity: {}\r\nSatelle-Request-Id: {}\r\nSatelle-Protocol-Version: 4\r\nIdempotency-Key: stalled-shutdown\r\nContent-Type: application/json\r\nContent-Length: 1000\r\n\r\n{{",
+        "POST /v1/sessions HTTP/1.1\r\nHost: localhost\r\nAuthorization: {}\r\nSatelle-Expected-Host-Identity: {}\r\nSatelle-Request-Id: {}\r\nSatelle-Protocol-Version: 5\r\nIdempotency-Key: stalled-shutdown\r\nContent-Type: application/json\r\nContent-Length: 1000\r\n\r\n{{",
         bearer(&token),
         initialized.host_identity(),
         RequestId::new(),
@@ -238,7 +238,7 @@ async fn dropped_admission_response_is_recovered_without_stopping_or_duplicate_t
     let request = TurnRequest::new("PRIVATE_DROPPED_RESPONSE_CANARY");
     let body = serde_json::to_vec(&request).expect("encode admission request");
     let head = format!(
-        "POST /v1/sessions HTTP/1.1\r\nHost: localhost\r\nAuthorization: {}\r\nSatelle-Expected-Host-Identity: {}\r\nSatelle-Request-Id: {}\r\nSatelle-Protocol-Version: 4\r\nIdempotency-Key: {IDEMPOTENCY_KEY}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        "POST /v1/sessions HTTP/1.1\r\nHost: localhost\r\nAuthorization: {}\r\nSatelle-Expected-Host-Identity: {}\r\nSatelle-Request-Id: {}\r\nSatelle-Protocol-Version: 5\r\nIdempotency-Key: {IDEMPOTENCY_KEY}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
         bearer(&running.token),
         running.host_identity,
         RequestId::new(),
@@ -527,7 +527,7 @@ async fn duplicate_header_case(header: DuplicateHeader, status: u16, code: &str)
         ),
     };
     let mut request = format!(
-        "POST /v1/sessions HTTP/1.1\r\nHost: localhost\r\nSatelle-Expected-Host-Identity: {}\r\nSatelle-Request-Id: {}\r\nSatelle-Protocol-Version: 4\r\nContent-Length: {}\r\n{duplicated}Connection: close\r\n\r\n",
+        "POST /v1/sessions HTTP/1.1\r\nHost: localhost\r\nSatelle-Expected-Host-Identity: {}\r\nSatelle-Request-Id: {}\r\nSatelle-Protocol-Version: 5\r\nContent-Length: {}\r\n{duplicated}Connection: close\r\n\r\n",
         running.host_identity,
         RequestId::new(),
         body.len(),

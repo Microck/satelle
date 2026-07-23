@@ -2931,12 +2931,23 @@ fn setup_mode_flags_are_reported_in_json() {
             "--json",
         ])
         .assert()
-        .success()
         .get_output()
         .clone();
-    let report = parse_json_output(&output.stdout);
-    assert_eq!(report["setup_mode"], "persistent");
-    assert_eq!(report["service_persistent"], true);
+    #[cfg(target_os = "linux")]
+    {
+        assert_eq!(output.status.code(), Some(64));
+        let error = parse_json_output(&output.stderr);
+        assert_eq!(error["code"], "persistent-service-unsupported");
+        assert_eq!(error["details"]["platform"], "linux");
+        assert_eq!(error["details"]["mutated"], false);
+    }
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    {
+        assert!(output.status.success());
+        let report = parse_json_output(&output.stdout);
+        assert_eq!(report["setup_mode"], "persistent");
+        assert_eq!(report["service_persistent"], true);
+    }
 
     let user_config = state.path().join("setup-mode-config.toml");
     write_user_config(
@@ -2960,6 +2971,17 @@ setup_mode = "persistent"
         .get_output()
         .clone();
     let report = parse_json_output(&output.stdout);
+    #[cfg(target_os = "linux")]
+    {
+        assert_eq!(report["setup_mode"], "on_demand");
+        assert_eq!(report["service_persistent"], false);
+        assert!(
+            report["fallback_reason"]
+                .as_str()
+                .is_some_and(|reason| reason.contains("unsupported on Linux"))
+        );
+    }
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
     assert_eq!(report["setup_mode"], "persistent");
 
     let output = satelle()
@@ -5111,8 +5133,6 @@ fn future_cli_surfaces_parse_and_return_typed_not_implemented() {
     let state = state_dir();
     for args in [
         vec!["repair", "--host", "local-demo", "--dry-run", "--json"],
-        vec!["host", "stop", "--host", "local-demo", "--json"],
-        vec!["host", "restart", "--host", "local-demo", "--json"],
         vec![
             "host",
             "storage",
@@ -5139,6 +5159,27 @@ fn future_cli_surfaces_parse_and_return_typed_not_implemented() {
             .assert()
             .failure()
             .stderr(predicate::str::contains(r#""code": "not-implemented""#));
+    }
+}
+
+#[test]
+fn host_service_lifecycle_requires_explicit_consent_before_mutation() {
+    let state = state_dir();
+    for action in ["stop", "restart"] {
+        let output = satelle()
+            .env("SATELLE_STATE_DIR", state.path())
+            .args(["host", action, "--host", "local-demo", "--json"])
+            .assert()
+            .failure()
+            .get_output()
+            .clone();
+        let error = parse_json_output(&output.stderr);
+        assert_eq!(error["code"], "setup-consent-required");
+        assert_eq!(error["details"]["mutated"], false);
+        assert_eq!(
+            error["suggested_commands"],
+            serde_json::json!([format!("satelle host {action} --host local-demo --yes")])
+        );
     }
 }
 

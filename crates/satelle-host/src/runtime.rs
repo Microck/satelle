@@ -2,6 +2,8 @@
 mod adapter;
 #[path = "runtime-codex-adapter.rs"]
 mod codex_adapter;
+#[path = "daemon-activity.rs"]
+mod daemon_activity;
 #[path = "runtime-events.rs"]
 mod events;
 #[path = "runtime-model.rs"]
@@ -31,6 +33,8 @@ pub(crate) use stop::RuntimeStopOutcome;
 use worker::{
     ExecutionPlan, LeaseHeartbeatGuard, MaintenanceOperationGuard, TurnWork, WorkerRegistry,
 };
+
+use daemon_activity::{DaemonActivity, DaemonActivityGuard};
 
 use crate::live_events::LiveEventHub;
 use crate::process_identity::ProcessIdentity;
@@ -83,6 +87,7 @@ struct AdmissionExecution<'a> {
 pub struct MaintenanceOperationHandle {
     operation_id: String,
     operation: Option<MaintenanceOperationGuard>,
+    activity: Option<DaemonActivityGuard>,
 }
 
 impl MaintenanceOperationHandle {
@@ -101,6 +106,7 @@ impl MaintenanceOperationHandle {
             operation.disarm();
         }
         drop(self.operation.take());
+        drop(self.activity.take());
     }
 }
 
@@ -1367,6 +1373,7 @@ struct LazyRuntime {
 pub(crate) struct RuntimeHandle {
     adapter: Arc<dyn ComputerUseAdapter>,
     readiness_probe_driver: Option<Arc<dyn ReadinessProbeDriver>>,
+    activity: Arc<DaemonActivity>,
     lazy: Arc<Mutex<LazyRuntime>>,
 }
 
@@ -1405,6 +1412,7 @@ impl RuntimeHandle {
             crate::storage::StorageError,
         >,
     ) -> Result<MaintenanceOperationHandle, SatelleError> {
+        let activity = self.activity.begin();
         let engine = self.engine()?;
         let capability = {
             let mut storage = engine.lock_storage()?;
@@ -1423,6 +1431,7 @@ impl RuntimeHandle {
         Ok(MaintenanceOperationHandle {
             operation_id: plan.run_id().to_string(),
             operation: Some(operation),
+            activity: Some(activity),
         })
     }
 
@@ -1430,6 +1439,7 @@ impl RuntimeHandle {
         &self,
         operation_id: &str,
     ) -> Result<MaintenanceOperationHandle, SatelleError> {
+        let activity = self.activity.begin();
         let engine = self.engine()?;
         let capability = {
             let mut storage = engine.lock_storage()?;
@@ -1450,6 +1460,7 @@ impl RuntimeHandle {
         Ok(MaintenanceOperationHandle {
             operation_id: operation_id.to_string(),
             operation: Some(operation),
+            activity: Some(activity),
         })
     }
 
@@ -1680,6 +1691,7 @@ impl RuntimeHandle {
         Self {
             adapter: Arc::new(adapter),
             readiness_probe_driver: None,
+            activity: Arc::new(DaemonActivity::default()),
             lazy: Arc::new(Mutex::new(LazyRuntime {
                 state_root,
                 operator_log_root,
@@ -1699,6 +1711,7 @@ impl RuntimeHandle {
         Self {
             adapter: computer_use_adapter,
             readiness_probe_driver: Some(readiness_probe_driver),
+            activity: Arc::new(DaemonActivity::default()),
             lazy: Arc::new(Mutex::new(LazyRuntime {
                 state_root,
                 operator_log_root,
@@ -1724,6 +1737,7 @@ impl RuntimeHandle {
         Self {
             adapter: Arc::new(adapter),
             readiness_probe_driver: Some(Arc::new(readiness_probe_driver)),
+            activity: Arc::new(DaemonActivity::default()),
             lazy: Arc::new(Mutex::new(LazyRuntime {
                 state_root,
                 operator_log_root,
@@ -2008,12 +2022,19 @@ impl RuntimeHandle {
         host: &str,
         provider_intent: &ProviderComputerUseIntent,
     ) -> Result<AdapterReadiness, SatelleError> {
+        let _activity = self.activity.begin();
         self.engine()?
             .preflight(host, provider_intent, &AdmissionCancellation::new())
     }
 
     pub(crate) fn daemon_workers_idle(&self) -> Result<bool, SatelleError> {
         self.engine()?.reap_finished_workers()
+    }
+
+    pub(crate) fn daemon_activity_snapshot(&self) -> Result<(bool, u64), SatelleError> {
+        let workers_idle = self.engine()?.reap_finished_workers()?;
+        let activity = self.activity.snapshot();
+        Ok((workers_idle && activity.is_idle(), activity.generation()))
     }
 
     pub(crate) fn subscribe_live_events(

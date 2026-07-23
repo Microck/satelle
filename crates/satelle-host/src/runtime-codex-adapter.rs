@@ -334,8 +334,16 @@ impl ProductionComputerUseAdapter {
         let prompt = format!(
             "Use native Computer Use, not shell or file tools, to click the button labeled {nonce} in the visible 'Satelle Native Readiness' window. Stop after clicking it."
         );
+        let command =
+            crate::codex_capabilities::installed_app_server_command().map_err(|error| {
+                NativeSmokeFailure {
+                    reason: "managed_codex_receipt_invalid",
+                    error: Box::new(error),
+                    dispatch_possible: false,
+                }
+            })?;
         let run = run_codex_session_with_timeout_cancellation(
-            crate::codex_capabilities::installed_app_server_command(),
+            command,
             CodexSessionRequest {
                 working_directory: &working_directory,
                 prompt: &prompt,
@@ -461,7 +469,7 @@ impl ProductionComputerUseAdapter {
             "Use native Computer Use only to open {page_url} in the approved visible browser. Read the nonce shown on the page, drag the marker into the drop target, and stop. Do not use shell, file, or network tools."
         );
         let run = run_codex_session_with_timeout_cancellation(
-            crate::codex_capabilities::installed_app_server_command(),
+            preserve_managed_codex_error(crate::codex_capabilities::installed_app_server_command())?,
             CodexSessionRequest {
                 working_directory: &working_directory,
                 prompt: &prompt,
@@ -567,7 +575,7 @@ impl ProductionComputerUseAdapter {
             .and_then(|path| prepare_working_directory(path).ok())?;
         let deadline = Instant::now().checked_add(Duration::from_secs(5))?;
         read_codex_turn(
-            crate::codex_capabilities::installed_app_server_command(),
+            crate::codex_capabilities::installed_app_server_command().ok()?,
             CodexTurnReadRequest {
                 working_directory: &working_directory,
                 thread_ref,
@@ -594,7 +602,7 @@ impl ProductionComputerUseAdapter {
             .and_then(|path| prepare_working_directory(path).ok())?;
         let deadline = Instant::now().checked_add(Duration::from_secs(5))?;
         read_codex_turn(
-            crate::codex_capabilities::installed_app_server_command(),
+            crate::codex_capabilities::installed_app_server_command().ok()?,
             CodexTurnReadRequest {
                 working_directory: &working_directory,
                 thread_ref,
@@ -1142,7 +1150,7 @@ impl ComputerUseAdapter for ProductionComputerUseAdapter {
             })
         };
         let result = run_codex_session(
-            crate::codex_capabilities::installed_app_server_command(),
+            preserve_managed_codex_error(crate::codex_capabilities::installed_app_server_command())?,
             CodexSessionRequest {
                 working_directory: &working_directory,
                 prompt: request.prompt(),
@@ -1463,9 +1471,38 @@ fn adapter_failure(reason: &'static str) -> SatelleError {
     }
 }
 
+fn preserve_managed_codex_error(
+    command: Result<Command, SatelleError>,
+) -> Result<Command, SatelleError> {
+    command
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn production_adapter_preserves_managed_codex_integrity_errors() {
+        let integrity_error = SatelleError {
+            code: ErrorCode::StorageIntegrityFailed,
+            message: "managed Codex integrity failed".to_string(),
+            recovery_command: None,
+            source_detail: None,
+            details: std::collections::BTreeMap::from([(
+                "reason".to_string(),
+                Value::String("immutable_binary_digest_mismatch".to_string()),
+            )]),
+        };
+
+        let propagated = preserve_managed_codex_error(Err(integrity_error))
+            .expect_err("the adapter must not replace an integrity error");
+
+        assert_eq!(propagated.code, ErrorCode::StorageIntegrityFailed);
+        assert_eq!(
+            propagated.details["reason"],
+            Value::String("immutable_binary_digest_mismatch".to_string())
+        );
+    }
 
     #[test]
     fn native_probe_pre_dispatch_result_wins_simultaneous_watchdog_cancellation() {

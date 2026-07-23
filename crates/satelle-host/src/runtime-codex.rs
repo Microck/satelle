@@ -177,23 +177,36 @@ impl super::CapabilityMatrix {
     }
 }
 
-pub(super) fn probe_installed_control_plane(timeout: Option<Duration>) -> ControlPlaneProbe {
-    let schema_command = |schema_dir: &Path| {
-        let mut command = Command::new("codex");
-        command
+pub(super) fn probe_installed_control_plane(
+    runtime: &crate::codex_install::VerifiedCodexRuntime,
+    timeout: Option<Duration>,
+) -> ControlPlaneProbe {
+    let Ok(mut schema_command) = runtime.command() else {
+        return ControlPlaneProbe::unavailable();
+    };
+    let schema_command = move |schema_dir: &Path| {
+        schema_command
             .args(["app-server", "generate-json-schema", "--out"])
             .arg(schema_dir);
-        command
+        schema_command
     };
+    let Ok(mut app_server_command) = runtime.command() else {
+        return ControlPlaneProbe::unavailable();
+    };
+    app_server_command.args(["app-server", "--listen", "stdio://"]);
     probe_control_plane_with(
         schema_command,
-        installed_app_server_command(),
+        app_server_command,
         timeout.unwrap_or(PROBE_TIMEOUT),
     )
 }
 
-pub(crate) fn installed_app_server_command() -> Command {
-    let mut command = Command::new("codex");
+pub(crate) fn installed_app_server_command() -> Result<Command, SatelleError> {
+    let runtime = crate::codex_install::admit_managed_codex_for_current_process()?;
+    Ok(configure_app_server_command(runtime.command()?))
+}
+
+pub(crate) fn configure_app_server_command(mut command: Command) -> Command {
     // The Host owns this process through private pipes. No socket or public
     // listener exists at the upstream protocol seam.
     command.args(["app-server", "--listen", "stdio://"]);

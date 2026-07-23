@@ -8,3 +8,4 @@ publish = false
 [dependencies]
 notify.workspace = true
 serde_json.workspace = true
+tempfile.workspace = true

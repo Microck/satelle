@@ -30,9 +30,9 @@ pub use setup::{
 };
 
 pub(crate) const PROTOCOL_VERSION_HEADER: &str = "satelle-protocol-version";
-// Expected-Turn stop targeting is safety-critical. Bump the exact-match mutation protocol so
-// older v3 daemons cannot silently ignore the header and stop a newer Turn.
-pub(crate) const PROTOCOL_VERSION: &str = "4";
+// Persistent maintenance changes the route and authorization contract. Bump the exact-match
+// protocol so either side detects a v4 peer before using a maintenance route it cannot represent.
+pub(crate) const PROTOCOL_VERSION: &str = "5";
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::fmt;

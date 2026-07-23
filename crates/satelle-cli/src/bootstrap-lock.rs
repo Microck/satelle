@@ -6,11 +6,55 @@ pub(super) const MUTATION_STARTED: &str = "satelle-bootstrap-mutation-started-v1
 pub(super) const MUTATION_COMMITTED: &str = "satelle-bootstrap-mutation-committed-v1";
 pub(super) const MUTATION_EXECUTING: &str = "satelle-bootstrap-mutation-executing-v1";
 const STALE_AFTER_SECONDS: u64 = 30;
+const COMMIT_REQUIRED_MUTATION_PHASES: &[&str] = &[
+    "daemon_start",
+    "durable_token_verification",
+    "maintenance_handoff_begin",
+    "maintenance_handoff_complete",
+    "service_lifecycle_maintenance_begin",
+    "persistent_maintenance_begin",
+    "persistent_action_start",
+    "persistent_action_complete",
+    "persistent_action_fail",
+    "persistent_maintenance_finish",
+];
+const SUCCESS_MUTATION_PHASES: &[&str] = &[
+    "cache_directory_creation",
+    "cache_upload",
+    "cache_staging_permissions",
+    "cache_promotion",
+    "state_owner_release",
+    "persistent_service_definition",
+    "persistent_service_register",
+    "persistent_service_start",
+    "persistent_service_restart",
+    "persistent_service_stop",
+];
+const RECOVERABLE_OPERATION_KINDS: &[&str] = &[
+    "initial_setup",
+    "missing_daemon_repair",
+    "service_stop",
+    "service_restart",
+];
+
+fn powershell_list(values: &[&str]) -> String {
+    values
+        .iter()
+        .map(|value| format!("'{value}'"))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn posix_pattern(values: &[&str]) -> String {
+    values.join("|")
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum OperationKind {
     InitialSetup,
     MissingDaemonRepair,
+    ServiceStop,
+    ServiceRestart,
 }
 
 impl OperationKind {
@@ -18,6 +62,8 @@ impl OperationKind {
         match self {
             Self::InitialSetup => "initial_setup",
             Self::MissingDaemonRepair => "missing_daemon_repair",
+            Self::ServiceStop => "service_stop",
+            Self::ServiceRestart => "service_restart",
         }
     }
 }
@@ -66,6 +112,15 @@ impl Request {
                 .as_deref()
                 .unwrap_or("controller-identity-unknown"),
         );
+        let recoverable_mutation_phases = COMMIT_REQUIRED_MUTATION_PHASES
+            .iter()
+            .chain(SUCCESS_MUTATION_PHASES)
+            .copied()
+            .collect::<Vec<_>>();
+        let powershell_commit_required_phases = powershell_list(COMMIT_REQUIRED_MUTATION_PHASES);
+        let powershell_success_phases = powershell_list(SUCCESS_MUTATION_PHASES);
+        let powershell_recoverable_phases = powershell_list(&recoverable_mutation_phases);
+        let powershell_recoverable_operation_kinds = powershell_list(RECOVERABLE_OPERATION_KINDS);
         format!(
             r#"$ErrorActionPreference = 'Stop'
 $operationId = {operation_id}
@@ -145,8 +200,8 @@ function Get-ExecutionMarkers([string]$Root) {{
   }})
 }}
 function Retire-TerminalAttempt([string]$PriorPhase, [string]$PriorAttempt) {{
-  $priorRequiresCommit = $PriorPhase -cin @('daemon_start', 'durable_token_verification', 'maintenance_handoff_begin', 'maintenance_handoff_complete')
-  $priorUsesSuccess = $PriorPhase -cin @('cache_directory_creation', 'cache_upload', 'cache_staging_permissions', 'cache_promotion', 'state_owner_release')
+  $priorRequiresCommit = $PriorPhase -cin @({powershell_commit_required_phases})
+  $priorUsesSuccess = $PriorPhase -cin @({powershell_success_phases})
   if (-not $priorRequiresCommit -and -not $priorUsesSuccess) {{ return $false }}
   $startedName = 'execution_started.' + $PriorAttempt
   $retiringName = 'execution_retiring.' + $PriorAttempt
@@ -183,7 +238,7 @@ function Finalize-InterruptedClaim {{
     (Test-Path -LiteralPath (Join-Path $closingPath ('execution_started.' + $mutationAttempt)) -PathType Leaf)
   $currentRetiring = $mutationAttempt -and
     (Test-Path -LiteralPath (Join-Path $closingPath ('execution_retiring.' + $mutationAttempt)) -PathType Leaf)
-  $requiresCommit = $mutationPhase -cin @('daemon_start', 'durable_token_verification', 'maintenance_handoff_begin', 'maintenance_handoff_complete')
+  $requiresCommit = $mutationPhase -cin @({powershell_commit_required_phases})
   $marker = if ($requiresCommit) {{ 'execution_committed.' }} else {{ 'execution_succeeded.' }}
   $allowedClosingMarkers = @()
   if ($currentStarted) {{ $allowedClosingMarkers += 'execution_started.' + $mutationAttempt }}
@@ -276,15 +331,15 @@ foreach ($item in @(Get-ChildItem -LiteralPath $lockRoot -Force -ErrorAction Sto
       $claimOperationKind = (Get-Content -LiteralPath (Join-Path $item.FullName 'operation_kind') -Raw).Trim()
       $mutationPhase = (Get-Content -LiteralPath (Join-Path $item.FullName 'mutation_phase') -Raw).Trim()
       $mutationAttempt = (Get-Content -LiteralPath (Join-Path $item.FullName 'mutation_attempt') -Raw).Trim()
-      if ($claimOperationKind -cnotin @('initial_setup', 'missing_daemon_repair') -or
-          $mutationPhase -cnotin @('cache_directory_creation', 'cache_upload', 'cache_staging_permissions', 'cache_promotion', 'daemon_start', 'state_owner_release', 'durable_token_verification', 'maintenance_handoff_begin', 'maintenance_handoff_complete') -or
+      if ($claimOperationKind -cnotin @({powershell_recoverable_operation_kinds}) -or
+          $mutationPhase -cnotin @({powershell_recoverable_phases}) -or
           $mutationAttempt -notmatch '^[0-9a-f]{{32}}$') {{ Fail-Busy }}
       $executionStarted = Test-Path -LiteralPath (Join-Path $item.FullName ('execution_started.' + $mutationAttempt)) -PathType Leaf
       $executionRetiring = Test-Path -LiteralPath (Join-Path $item.FullName ('execution_retiring.' + $mutationAttempt)) -PathType Leaf
       $executionSucceeded = Test-Path -LiteralPath (Join-Path $item.FullName ('execution_succeeded.' + $mutationAttempt)) -PathType Leaf
       $executionFailed = Test-Path -LiteralPath (Join-Path $item.FullName ('execution_failed.' + $mutationAttempt)) -PathType Leaf
       $executionCommitted = Test-Path -LiteralPath (Join-Path $item.FullName ('execution_committed.' + $mutationAttempt)) -PathType Leaf
-      $requiresCommit = $mutationPhase -cin @('daemon_start', 'durable_token_verification', 'maintenance_handoff_begin', 'maintenance_handoff_complete')
+      $requiresCommit = $mutationPhase -cin @({powershell_commit_required_phases})
       $expectedTerminalMarker = if ($requiresCommit) {{ 'execution_committed.' + $mutationAttempt }} else {{ 'execution_succeeded.' + $mutationAttempt }}
       $expectedExecutionMarkers = @('execution_started.' + $mutationAttempt, 'execution_retiring.' + $mutationAttempt, $expectedTerminalMarker)
       if ($mutationPhase -ceq 'daemon_start') {{
@@ -396,7 +451,7 @@ foreach ($item in @(Get-ChildItem -LiteralPath $lockRoot -Force -ErrorAction Sto
       $movedExecutionSucceeded = Test-Path -LiteralPath (Join-Path $quarantinedClaim ('execution_succeeded.' + $movedMutationAttempt)) -PathType Leaf
       $movedExecutionFailed = Test-Path -LiteralPath (Join-Path $quarantinedClaim ('execution_failed.' + $movedMutationAttempt)) -PathType Leaf
       $movedExecutionCommitted = Test-Path -LiteralPath (Join-Path $quarantinedClaim ('execution_committed.' + $movedMutationAttempt)) -PathType Leaf
-      $movedRequiresCommit = $movedMutationPhase -cin @('daemon_start', 'durable_token_verification', 'maintenance_handoff_begin', 'maintenance_handoff_complete')
+      $movedRequiresCommit = $movedMutationPhase -cin @({powershell_commit_required_phases})
       $movedExpectedTerminalMarker = if ($movedRequiresCommit) {{ 'execution_committed.' + $movedMutationAttempt }} else {{ 'execution_succeeded.' + $movedMutationAttempt }}
       $movedExpectedExecutionMarkers = @('execution_started.' + $movedMutationAttempt, 'execution_retiring.' + $movedMutationAttempt, $movedExpectedTerminalMarker)
       if ($movedMutationPhase -ceq 'daemon_start') {{
@@ -558,6 +613,15 @@ try {{
                 .as_deref()
                 .unwrap_or("controller-identity-unknown"),
         );
+        let recoverable_mutation_phases = COMMIT_REQUIRED_MUTATION_PHASES
+            .iter()
+            .chain(SUCCESS_MUTATION_PHASES)
+            .copied()
+            .collect::<Vec<_>>();
+        let posix_commit_required_phases = posix_pattern(COMMIT_REQUIRED_MUTATION_PHASES);
+        let posix_success_phases = posix_pattern(SUCCESS_MUTATION_PHASES);
+        let posix_recoverable_phases = posix_pattern(&recoverable_mutation_phases);
+        let posix_recoverable_operation_kinds = posix_pattern(RECOVERABLE_OPERATION_KINDS);
         format!(
             r#"set -eu
 operation_id={operation_id}
@@ -604,8 +668,8 @@ retire_terminal_attempt() {{
   prior_phase=$1
   prior_attempt=$2
   case "$prior_phase" in
-    daemon_start|durable_token_verification|maintenance_handoff_begin|maintenance_handoff_complete) terminal_kind=execution_committed;;
-    cache_directory_creation|cache_upload|cache_staging_permissions|cache_promotion|state_owner_release) terminal_kind=execution_succeeded;;
+    {posix_commit_required_phases}) terminal_kind=execution_committed;;
+    {posix_success_phases}) terminal_kind=execution_succeeded;;
     *) return 1;;
   esac
   started_path="$claim_path/execution_started.$prior_attempt"
@@ -638,7 +702,7 @@ finalize_interrupted_claim() {{
   current_retiring=false
   [ -n "$mutation_attempt" ] && [ -d "$closing_path/execution_retiring.$mutation_attempt" ] && current_retiring=true
   requires_commit=false
-  case "$mutation_phase" in daemon_start|durable_token_verification|maintenance_handoff_begin|maintenance_handoff_complete) requires_commit=true;; esac
+  case "$mutation_phase" in {posix_commit_required_phases}) requires_commit=true;; esac
   if [ "$requires_commit" = true ]; then terminal_kind=execution_committed; else terminal_kind=execution_succeeded; fi
   started_path="$closing_path/execution_started.$mutation_attempt"
   retiring_path="$closing_path/execution_retiring.$mutation_attempt"
@@ -772,11 +836,11 @@ for competitor in "$lock_root"/*; do
     claim_operation_kind="$(cat "$competitor/operation_kind" 2>/dev/null)" || busy
     mutation_phase="$(cat "$competitor/mutation_phase" 2>/dev/null)" || busy
     mutation_attempt="$(cat "$competitor/mutation_attempt" 2>/dev/null)" || busy
-    case "$claim_operation_kind" in initial_setup|missing_daemon_repair) ;; *) busy;; esac
-    case "$mutation_phase" in cache_directory_creation|cache_upload|cache_staging_permissions|cache_promotion|daemon_start|state_owner_release|durable_token_verification|maintenance_handoff_begin|maintenance_handoff_complete) ;; *) busy;; esac
+    case "$claim_operation_kind" in {posix_recoverable_operation_kinds}) ;; *) busy;; esac
+    case "$mutation_phase" in {posix_recoverable_phases}) ;; *) busy;; esac
     [ "${{#mutation_attempt}}" -eq 32 ] || busy
     case "$mutation_attempt" in *[!0-9a-f]*) busy;; esac
-    case "$mutation_phase" in daemon_start|durable_token_verification|maintenance_handoff_begin|maintenance_handoff_complete) requires_commit=true;; esac
+    case "$mutation_phase" in {posix_commit_required_phases}) requires_commit=true;; esac
     if [ "$requires_commit" = true ]; then expected_terminal_kind=execution_committed; else expected_terminal_kind=execution_succeeded; fi
     expected_terminal_path="$competitor/$expected_terminal_kind.$mutation_attempt"
     [ -d "$competitor/execution_started.$mutation_attempt" ] && [ ! -L "$competitor/execution_started.$mutation_attempt" ] && execution_started=true
@@ -928,7 +992,7 @@ for competitor in "$lock_root"/*; do
     moved_operation_kind="$(cat "$quarantined_claim/operation_kind" 2>/dev/null)" || {{ restore_competitor; busy; }}
     moved_mutation_phase="$(cat "$quarantined_claim/mutation_phase" 2>/dev/null)" || {{ restore_competitor; busy; }}
     moved_mutation_attempt="$(cat "$quarantined_claim/mutation_attempt" 2>/dev/null)" || {{ restore_competitor; busy; }}
-    case "$moved_mutation_phase" in daemon_start|durable_token_verification|maintenance_handoff_begin|maintenance_handoff_complete) moved_requires_commit=true;; esac
+    case "$moved_mutation_phase" in {posix_commit_required_phases}) moved_requires_commit=true;; esac
     if [ "$moved_requires_commit" = true ]; then moved_expected_terminal_kind=execution_committed; else moved_expected_terminal_kind=execution_succeeded; fi
     moved_expected_terminal_path="$quarantined_claim/$moved_expected_terminal_kind.$moved_mutation_attempt"
     [ -d "$quarantined_claim/execution_started.$moved_mutation_attempt" ] && [ ! -L "$quarantined_claim/execution_started.$moved_mutation_attempt" ] && moved_execution_started=true
@@ -1313,7 +1377,7 @@ mod tests {
         let script = request().windows_script();
         assert!(
             script.contains(
-                "$claimOperationKind -cnotin @('initial_setup', 'missing_daemon_repair')"
+                "$claimOperationKind -cnotin @('initial_setup', 'missing_daemon_repair', 'service_stop', 'service_restart')"
             )
         );
     }
@@ -2639,11 +2703,160 @@ mod tests {
     }
 
     #[test]
+    fn persistent_phase_vocabulary_is_closed_in_both_lock_protocols() {
+        assert_eq!(
+            COMMIT_REQUIRED_MUTATION_PHASES,
+            &[
+                "daemon_start",
+                "durable_token_verification",
+                "maintenance_handoff_begin",
+                "maintenance_handoff_complete",
+                "service_lifecycle_maintenance_begin",
+                "persistent_maintenance_begin",
+                "persistent_action_start",
+                "persistent_action_complete",
+                "persistent_action_fail",
+                "persistent_maintenance_finish",
+            ]
+        );
+        assert_eq!(
+            SUCCESS_MUTATION_PHASES,
+            &[
+                "cache_directory_creation",
+                "cache_upload",
+                "cache_staging_permissions",
+                "cache_promotion",
+                "state_owner_release",
+                "persistent_service_definition",
+                "persistent_service_register",
+                "persistent_service_start",
+                "persistent_service_restart",
+                "persistent_service_stop",
+            ]
+        );
+        assert_eq!(
+            RECOVERABLE_OPERATION_KINDS,
+            &[
+                "initial_setup",
+                "missing_daemon_repair",
+                "service_stop",
+                "service_restart",
+            ]
+        );
+
+        let posix = request().posix_script();
+        let windows = request().windows_script();
+        for phase in &COMMIT_REQUIRED_MUTATION_PHASES[4..] {
+            assert_eq!(posix.matches(phase).count(), 5, "POSIX {phase}");
+            assert_eq!(windows.matches(phase).count(), 5, "Windows {phase}");
+        }
+        for phase in &SUCCESS_MUTATION_PHASES[5..] {
+            assert_eq!(posix.matches(phase).count(), 2, "POSIX {phase}");
+            assert_eq!(windows.matches(phase).count(), 2, "Windows {phase}");
+        }
+        assert!(posix.contains(
+            "case \"$claim_operation_kind\" in initial_setup|missing_daemon_repair|service_stop|service_restart)"
+        ));
+        assert!(windows.contains(
+            "$claimOperationKind -cnotin @('initial_setup', 'missing_daemon_repair', 'service_stop', 'service_restart')"
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn persistent_phases_advance_and_recover_with_their_exact_terminal_proof() {
+        let first_attempt = "0123456789abcdef0123456789abcdef";
+        let second_attempt = "fedcba9876543210fedcba9876543210";
+        let phases = COMMIT_REQUIRED_MUTATION_PHASES[4..]
+            .iter()
+            .map(|phase| (*phase, "execution_committed"))
+            .chain(
+                SUCCESS_MUTATION_PHASES[5..]
+                    .iter()
+                    .map(|phase| (*phase, "execution_succeeded")),
+            );
+
+        for (phase, terminal_marker) in phases {
+            let phase_home = tempfile::tempdir().expect("temporary persistent phase home");
+            let lock_root = phase_home.path().join("satelle/bootstrap.lock");
+            let mut owner = RunningProtocol::start(&request(), phase_home.path());
+            assert_ready_line(&owner.read_line());
+            owner.exchange(&mutation_started_line(phase, first_attempt).unwrap());
+            if terminal_marker == "execution_committed" {
+                owner.exchange(&mutation_executing_line(phase, first_attempt).unwrap());
+                owner.exchange(&mutation_committed_line(phase, first_attempt).unwrap());
+            } else {
+                let claim = only_claim(&lock_root);
+                fs::create_dir(claim.join(format!("execution_started.{first_attempt}"))).unwrap();
+                fs::create_dir(claim.join(format!("execution_succeeded.{first_attempt}"))).unwrap();
+            }
+            owner.exchange(
+                &mutation_started_line("cache_directory_creation", second_attempt).unwrap(),
+            );
+            let advanced_claim = only_claim(&lock_root);
+            assert!(
+                !advanced_claim
+                    .join(format!("execution_started.{first_attempt}"))
+                    .exists(),
+                "{phase} must retire its started marker"
+            );
+            assert!(
+                !advanced_claim
+                    .join(format!("{terminal_marker}.{first_attempt}"))
+                    .exists(),
+                "{phase} must retire its terminal marker"
+            );
+            owner.exchange(RELEASE);
+            assert!(owner.close().success(), "{phase} phase advance");
+
+            let stale_home = tempfile::tempdir().expect("temporary persistent stale home");
+            let stale_lock = stale_home.path().join("satelle/bootstrap.lock");
+            let stale_claim = write_stale_mutation_claim(&stale_lock, phase, first_attempt);
+            fs::create_dir(stale_claim.join(format!("execution_started.{first_attempt}"))).unwrap();
+            fs::create_dir(stale_claim.join(format!("{terminal_marker}.{first_attempt}"))).unwrap();
+            let replacement = Request::new(
+                "replacement-operation",
+                OperationKind::MissingDaemonRepair,
+                None,
+            )
+            .expect("valid replacement request");
+            let mut recovered = RunningProtocol::start(&replacement, stale_home.path());
+            let response = recovered.read_line();
+            assert!(
+                response.starts_with(READY),
+                "{phase} stale recovery returned {response:?}"
+            );
+            assert_ready_line(&response);
+            recovered.exchange(RELEASE);
+            assert!(recovered.close().success(), "{phase} stale recovery");
+        }
+    }
+
+    #[test]
     fn operation_kinds_are_closed_and_exact() {
         assert_eq!(OperationKind::InitialSetup.as_str(), "initial_setup");
         assert_eq!(
             OperationKind::MissingDaemonRepair.as_str(),
             "missing_daemon_repair"
+        );
+        assert_eq!(OperationKind::ServiceStop.as_str(), "service_stop");
+        assert_eq!(OperationKind::ServiceRestart.as_str(), "service_restart");
+    }
+
+    #[test]
+    fn service_stop_request_scripts_persist_stop_specific_operation_kind() {
+        let request = Request::new("service-stop-operation", OperationKind::ServiceStop, None)
+            .expect("valid service stop request");
+
+        assert!(
+            request
+                .posix_script()
+                .contains("operation_kind='service_stop'")
+        );
+        assert!(
+            request
+                .windows_script()
+                .contains("$operationKind = 'service_stop'")
         );
     }
 }
