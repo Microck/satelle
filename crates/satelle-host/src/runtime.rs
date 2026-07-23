@@ -21,9 +21,9 @@ pub use adapter::{
     AdapterPreflight, AdapterReadiness, AdapterSubject, ComputerUseAdapter, EvidenceError,
     ExecuteRequest, ExecuteResult, ProviderComputerUseIntent, ProviderSmokeEvidence,
     ProviderSmokeFailureEvidence, ProviderSmokeResult, ProviderSmokeSource, ReadinessCacheKey,
-    ReadinessEvidence, RecoveryObservation,
+    ReadinessEvidence, ReadinessObservationState, RecoveryObservation,
 };
-pub(crate) use adapter::{NativeProbeResult, ReadinessProbeDriver};
+pub(crate) use adapter::{NativeProbeResult, ReadinessProbeDriver, ReadinessSource};
 pub(crate) use codex_adapter::{ProductionAdapterPolicy, ProductionComputerUseAdapter};
 pub use request::AdmissionCancellation;
 pub(crate) use request::{
@@ -647,6 +647,7 @@ impl RuntimeEngine {
                         .map_err(model::storage_failure)?;
                     let mut provider_smoke_event = None;
                     if let AdmissionOutcome::Execute { session, .. } = &outcome {
+                        self.publish_native_readiness(&readiness, session, &turn_id);
                         self.publish_committed_turn(session, &turn_id);
                         provider_smoke_event =
                             self.publish_provider_smoke(&readiness, session, &turn_id);
@@ -712,6 +713,7 @@ impl RuntimeEngine {
                     .map_err(model::storage_failure)?;
                 let mut provider_smoke_event = None;
                 if let AdmissionOutcome::Execute { session, .. } = &outcome {
+                    self.publish_native_readiness(&readiness, session, &turn_id);
                     self.publish_committed_turn(session, &turn_id);
                     provider_smoke_event =
                         self.publish_provider_smoke(&readiness, session, &turn_id);

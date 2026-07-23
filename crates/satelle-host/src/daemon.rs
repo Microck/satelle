@@ -1829,11 +1829,29 @@ mod tests {
                 .map(|event| event.event_type())
                 .collect::<Vec<_>>(),
             [
+                satelle_core::EventType::Readiness,
                 satelle_core::EventType::TurnStarted,
                 satelle_core::EventType::ProviderSmoke,
                 satelle_core::EventType::TurnProgress,
                 satelle_core::EventType::TurnCompleted,
             ]
+        );
+        let readiness = events
+            .first()
+            .expect("native readiness event should be live before Turn admission");
+        assert_eq!(readiness.data()["source"], "live");
+        assert_eq!(readiness.data()["status"], "passed");
+        let checks = readiness.data()["checks"]
+            .as_array()
+            .expect("native readiness carries structured checks");
+        let file_management = checks
+            .iter()
+            .find(|check| check["kind"] == "file_management")
+            .expect("native readiness includes file-management status");
+        assert_eq!(file_management["status"], "not_evaluated");
+        assert_eq!(
+            file_management["reason"],
+            "not_required_for_prompt_admission"
         );
         let provider = events
             .iter()

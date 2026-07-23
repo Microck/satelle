@@ -45,12 +45,13 @@ pub use log_page::{
     LogPageQueryError, LogSeverity, LogSource, LogSubject,
 };
 use operation_capacity::OperationCapacity;
+pub(crate) use runtime::ReadinessSource;
 pub use runtime::{
     AdapterPreflight, AdapterReadiness, AdapterSubject, AdmissionCancellation, ComputerUseAdapter,
     EvidenceError, ExecuteRequest, ExecuteResult, MaintenanceOperationHandle,
     ProviderComputerUseIntent, ProviderSmokeEvidence, ProviderSmokeFailureEvidence,
     ProviderSmokeResult, ProviderSmokeSource, ReadinessCacheKey, ReadinessEvidence,
-    RecoveryObservation,
+    ReadinessObservationState, RecoveryObservation,
 };
 use runtime::{ProductionComputerUseAdapter, RunCommand, RuntimeHandle, SteerCommand, StopCommand};
 use satelle_core::session::{PublicSession, TurnAdmissionFailure};

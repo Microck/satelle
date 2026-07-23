@@ -220,7 +220,10 @@ impl DirectTransport {
                         && event.seq() > previous_stream_sequence.saturating_add(1);
                     previous_stream_sequence = event.seq();
                     let event_revision = target_event_revision(&event, &session_id, &turn_id);
-                    if event.event_type() == satelle_core::EventType::ProviderSmoke {
+                    if matches!(
+                        event.event_type(),
+                        satelle_core::EventType::ProviderSmoke | satelle_core::EventType::Readiness
+                    ) {
                         on_event(event)?;
                         continue;
                     }

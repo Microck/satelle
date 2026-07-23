@@ -36,7 +36,7 @@
 - a Satelle Maintenance Lease is the Host Daemon-owned exclusive right to mutate daemon, runtime, service, or storage state for one Host @spec @mvp @implemented
 - a Satelle Bootstrap Lock is a user-scoped remote filesystem lock acquired through authenticated SSH bootstrap or by a reachable Host Daemon already holding the same operation's Maintenance Lease before remote daemon files can be replaced @spec @mvp
 - a Satelle Idempotency Record binds one API Principal, operation, idempotency key, request digest, and durable outcome @mvp @implemented
-- a Satelle Readiness Result is a timestamped capability result whose validity is bounded by its cache key, expiry, and invalidation conditions @spec @mvp
+- a Satelle Readiness Result is a timestamped capability result whose validity is bounded by its cache key, expiry, and invalidation conditions @spec @mvp @implemented
 - Satelle YOLO Mode is an explicit unsafe execution mode that asks Codex to bypass Codex-controlled approvals and sandboxing where the compatible Codex control plane supports those settings @spec @mvp
 - a Satelle Provider Probe Surface is an ephemeral local UI served by the Host Daemon to verify that a selected model and provider can observe and act through native Computer Use @spec @mvp
 - a Satelle Event is a stable JSON lifecycle record emitted by attached run and steer commands or Host Daemon event streams @spec @mvp @implemented
@@ -403,17 +403,17 @@
 - satelle run and steer --events json emit exactly one terminal event as the final stdout record and do not emit a separate final-result JSON object after that event @spec @contract @mvp @implemented
 - satelle detach mode returns immediately with the session identifier and does not attach to the live event stream @implemented @mvp
 - satelle JSON output reports effective timeout values as numeric millisecond fields with names ending in _timeout_ms instead of requiring automation to parse human duration strings @implemented @mvp
-- satelle run prints a concise non-blocking preflight summary by default before starting execution on a ready host @spec @mvp
+- satelle run prints a concise non-blocking preflight summary by default before starting execution on a ready host @spec @mvp @implemented
 - satelle run supports --quiet to suppress the preflight summary for automation @implemented @mvp
 - satelle run supports a verbose option that expands preflight output into detailed host, readiness, transport, and provider diagnostics @implemented @mvp
-- satelle run and steer automatically run the native Computer Use readiness smoke test during preflight when no valid matching native readiness cache entry exists, including first use after setup @spec @mvp
-- satelle run and steer do not require the user to run satelle doctor --scope computer-use --refresh before first prompt execution @spec @mvp
-- satelle run and steer do not start the prompt turn until native Computer Use readiness passes through a valid cache entry or a live harmless readiness smoke test @spec @mvp
-- satelle native Computer Use readiness checks distinguish pointer click support from click-and-drag support instead of treating a successful click as full pointer readiness @spec @mvp
-- satelle readiness and diagnostics treat file-management workflows as a distinct Computer Use capability area rather than assuming general desktop readiness covers file selection, file movement, uploads, downloads, and save dialogs @spec @mvp
-- satelle quiet output may suppress native readiness smoke-test progress text but does not skip native readiness smoke tests required for prompt execution @spec @mvp
-- satelle run and steer JSON event streaming emits readiness events that distinguish native readiness cache hits, live native readiness smoke tests, passes, failures, and manual-action-required blockers before turn_started @spec @mvp
-- satelle native readiness smoke-test failures block prompt execution and include a typed error plus a recommended diagnostic or repair command @spec @mvp
+- satelle run and steer automatically run the native Computer Use readiness smoke test during preflight when no valid matching native readiness cache entry exists, including first use after setup @spec @mvp @implemented
+- satelle run and steer do not require the user to run satelle doctor --scope computer-use --refresh before first prompt execution @spec @mvp @implemented
+- satelle run and steer do not start the prompt turn until native Computer Use readiness passes through a valid cache entry or a live harmless readiness smoke test @spec @mvp @implemented
+- satelle native Computer Use readiness checks distinguish pointer click support from click-and-drag support instead of treating a successful click as full pointer readiness @spec @mvp @implemented
+- satelle readiness and diagnostics treat file-management workflows as a distinct Computer Use capability area rather than assuming general desktop readiness covers file selection, file movement, uploads, downloads, and save dialogs @spec @mvp @implemented
+- satelle quiet output may suppress native readiness smoke-test progress text but does not skip native readiness smoke tests required for prompt execution @spec @mvp @implemented
+- satelle run and steer JSON event streaming emits readiness events that distinguish native readiness cache hits, live native readiness smoke tests, passes, failures, and manual-action-required blockers before turn_started @spec @mvp @implemented
+- satelle native readiness smoke-test failures block prompt execution and include a typed error plus a recommended diagnostic or repair command @spec @mvp @implemented
 - satelle run and steer automatically run the required provider Computer Use smoke test during preflight when experimental provider Computer Use is active and no valid matching provider smoke-test cache entry exists @spec @mvp @implemented
 - satelle run and steer do not start a prompt Turn until a required live provider Computer Use smoke test passes or a valid matching provider smoke-test cache entry exists @spec @mvp @implemented
 - satelle Provider Probe Surface includes a harmless click-and-drag task before caching provider Computer Use readiness for providers that claim pointer control support @spec @mvp
@@ -2032,20 +2032,20 @@
 - private Codex app-server protocol failures expose only closed sanitized reasons and never raw messages, item payloads, prompts, thread identifiers, or turn identifiers @implemented @mvp
 
 ## capabilities
-- satelle reports Codex runtime availability, native Computer Use availability, and model-provider compatibility as separate host capabilities @spec @mvp
-- satelle validates native Computer Use with a host-side action-path smoke test instead of only checking that a plugin or feature flag exists @spec @mvp
-- satelle MVP readiness requires native Codex Computer Use to be installed, enabled, and passing the host-side smoke test @spec @mvp
+- satelle reports Codex runtime availability, native Computer Use availability, and model-provider compatibility as separate host capabilities @spec @mvp @implemented
+- satelle validates native Computer Use with a host-side action-path smoke test instead of only checking that a plugin or feature flag exists @spec @mvp @implemented
+- satelle MVP readiness requires native Codex Computer Use to be installed, enabled, and passing the host-side smoke test @spec @mvp @implemented
 - the Host Daemon caches every terminal native Computer Use Readiness Result @spec @mvp @implemented
-- a matching successful native Computer Use Readiness Result no older than 5 minutes is sufficient for native readiness during prompt preflight unless an invalidation condition applies @spec @mvp
+- a matching successful native Computer Use Readiness Result no older than 5 minutes is sufficient for native readiness during prompt preflight unless an invalidation condition applies @spec @mvp @implemented
 - satelle native Computer Use readiness cache time-to-live values are configurable per host or profile @spec @mvp @implemented
-- satelle Host Daemon is the canonical store for readiness cache entries because it observes the remote runtime directly @spec @mvp
-- satelle CLI may keep read-only readiness cache entries for convenience but must refresh from the Host Daemon before reporting authoritative readiness @spec @mvp
-- satelle revalidates host reachability, native Computer Use readiness, and provider Computer Use compatibility before starting prompt execution @spec @mvp
-- satelle does not use native Computer Use readiness cache entries to skip live host reachability or Codex app-server control-plane availability checks before prompt execution @spec @mvp
-- satelle does not treat stale cached readiness results as sufficient authorization to start a remote run @spec @mvp
-- satelle treats missing, stale, or invalidated native Computer Use readiness cache entries as requiring a live harmless native Computer Use smoke test before prompt execution @spec @mvp
-- satelle invalidates native Computer Use readiness cache entries when the target host, OS user or desktop session, Codex version, native Computer Use runtime version, Computer Use plugin version, detectable OS permission state, or detectable app approval state changes @spec @mvp
-- satelle retains failed native Computer Use readiness cache entries for diagnostics but does not treat a cached failure as the only current blocker when the host and Codex control plane are reachable for a fresh prompt execution attempt @spec @mvp
+- satelle Host Daemon is the canonical store for readiness cache entries because it observes the remote runtime directly @spec @mvp @implemented
+- satelle CLI may keep read-only readiness cache entries for convenience but must refresh from the Host Daemon before reporting authoritative readiness @spec @mvp @implemented
+- satelle revalidates host reachability, native Computer Use readiness, and provider Computer Use compatibility before starting prompt execution @spec @mvp @implemented
+- satelle does not use native Computer Use readiness cache entries to skip live host reachability or Codex app-server control-plane availability checks before prompt execution @spec @mvp @implemented
+- satelle does not treat stale cached readiness results as sufficient authorization to start a remote run @spec @mvp @implemented
+- satelle treats missing, stale, or invalidated native Computer Use readiness cache entries as requiring a live harmless native Computer Use smoke test before prompt execution @spec @mvp @implemented
+- satelle invalidates native Computer Use readiness cache entries when the target host, OS user or desktop session, Codex version, native Computer Use runtime version, Computer Use plugin version, detectable OS permission state, or detectable app approval state changes @spec @mvp @implemented
+- satelle retains failed native Computer Use readiness cache entries for diagnostics but does not treat a cached failure as the only current blocker when the host and Codex control plane are reachable for a fresh prompt execution attempt @spec @mvp @implemented
 - label: satelle native Computer Use readiness smoke tests use a 120 second timeout by default
   command: cargo test --locked -p satelle-host --lib tests::admission_request_timeout_tracks_both_configured_readiness_phases -- --exact
   tags: [spec, mvp, implemented, ci]
@@ -2070,11 +2070,11 @@
 - label: satelle does not allow prompt execution or remote-control flows on hosts that fail native Codex Computer Use readiness
   command: cargo test --locked -p satelle-host --lib tests::unsupported_or_unproven_production_execution_is_blocked_before_admission -- --exact
   tags: [spec, mvp, implemented, ci]
-- satelle may keep a host that lacks native Codex Computer Use only for diagnostics, installation, and repair flows @spec @mvp
+- satelle may keep a host that lacks native Codex Computer Use only for diagnostics, installation, and repair flows @spec @mvp @implemented
 - satelle host capability checks are OS-aware for Windows, Linux, and macOS instead of assuming one platform's Codex or Computer Use behavior applies to every platform @mvp @implemented
 - satelle treats cross-platform host support as successful configuration, diagnostics, and capability reporting, not as a guarantee that native Codex Computer Use is available on every operating system @mvp @implemented
-- satelle Computer Use readiness checks verify standalone Codex installation, authentication, native Computer Use availability, required OS permissions, app-server or remote-control startup, and a harmless observable Computer Use action @spec @mvp
-- satelle Computer Use readiness checks return structured pass/fail reasons for each checked prerequisite @spec @mvp
+- satelle Computer Use readiness checks verify standalone Codex installation, authentication, native Computer Use availability, required OS permissions, app-server or remote-control startup, and a harmless observable Computer Use action @spec @mvp @implemented
+- satelle Computer Use readiness checks return structured pass/fail reasons for each checked prerequisite @spec @mvp @implemented
 - satelle treats configured model and provider values as requested intent rather than proof that the provider supports native Computer Use @mvp @implemented
 - satelle proves selected model-provider Computer Use compatibility with a host-side provider smoke test before prompt execution @mvp @implemented
 - satelle provider smoke tests run through the same remote Codex control plane and native Computer Use path that prompt execution will use @mvp @implemented

@@ -287,7 +287,7 @@ async fn failing_sockets_do_not_interrupt_an_unrelated_live_subscriber() {
     .await;
 
     let mut events = Vec::new();
-    for _ in 0..4 {
+    for _ in 0..5 {
         events.push(
             serde_json::from_str::<SatelleEvent>(&next_text(&mut subscriber).await)
                 .expect("decode live event after unrelated socket failures"),
@@ -299,6 +299,7 @@ async fn failing_sockets_do_not_interrupt_an_unrelated_live_subscriber() {
             .map(SatelleEvent::event_type)
             .collect::<Vec<_>>(),
         [
+            EventType::Readiness,
             EventType::TurnStarted,
             EventType::ProviderSmoke,
             EventType::TurnProgress,
@@ -307,7 +308,21 @@ async fn failing_sockets_do_not_interrupt_an_unrelated_live_subscriber() {
     );
     assert_eq!(
         events.iter().map(SatelleEvent::seq).collect::<Vec<_>>(),
-        [1, 2, 3, 4]
+        [1, 2, 3, 4, 5]
+    );
+    let readiness = &events[0];
+    assert_eq!(readiness.data()["source"], "live");
+    assert_eq!(readiness.data()["status"], "passed");
+    let file_management = readiness.data()["checks"]
+        .as_array()
+        .expect("readiness carries structured checks")
+        .iter()
+        .find(|check| check["kind"] == "file_management")
+        .expect("readiness includes file-management status");
+    assert_eq!(file_management["status"], "not_evaluated");
+    assert_eq!(
+        file_management["reason"],
+        "not_required_for_prompt_admission"
     );
     assert!(
         events

@@ -306,6 +306,8 @@ fn assert_host_postcheck_outcome(suffix: &str, fixture: MaintenanceProbeFixture)
         None::<String>,
         "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
         "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        crate::ReadinessObservationState::Unknown,
+        crate::ReadinessObservationState::Unknown,
     )
     .unwrap();
     let plan = crate::storage::SetupRunPlan::new(

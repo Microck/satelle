@@ -5,6 +5,52 @@ use serde_json::json;
 use time::format_description::well_known::Rfc3339;
 
 impl RuntimeEngine {
+    /// Publishes the successful native preflight before the admitted Turn so
+    /// attached clients can distinguish native readiness from provider
+    /// readiness without inferring either result from later execution events.
+    pub(super) fn publish_native_readiness(
+        &self,
+        readiness: &AdapterReadiness,
+        session: &Session,
+        turn_id: &TurnId,
+    ) -> SatelleEventBody {
+        let turn = session
+            .turn(turn_id)
+            .expect("an admitted native preflight retains its Turn");
+        let checks = readiness
+            .checks()
+            .iter()
+            .map(|check| {
+                json!({
+                    "kind": check.kind().as_str(),
+                    "status": check.status().as_str(),
+                    "reason": check.reason(),
+                })
+            })
+            .collect::<Vec<_>>();
+        let event = SatelleEventBody::new(
+            EventType::Readiness,
+            EventSource::HostDaemon,
+            time::OffsetDateTime::now_utc(),
+            session.host_identity().as_str(),
+            Some(EventSubject::Turn {
+                session_id: session.id().clone(),
+                turn_id: turn_id.clone(),
+                session_state_revision: session.session_state_revision(),
+                turn_state_revision: turn.turn_state_revision(),
+            }),
+            "native Computer Use preflight passed",
+            json!({
+                "status": "passed",
+                "source": readiness.source().as_str(),
+                "checks": checks,
+            }),
+        )
+        .expect("typed native readiness produces a valid safe preflight event");
+        self.live_events.publish(event.clone());
+        event
+    }
+
     /// Publishes one live observation of state that SQLite has already
     /// committed. Callers retain the storage mutex through this synchronous,
     /// nonblocking send so events preserve commit order across workers.

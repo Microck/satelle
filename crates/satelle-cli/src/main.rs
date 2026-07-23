@@ -6208,7 +6208,7 @@ fn run_prompt(
                 .durable_handles()
                 .map(|(session_id, _)| Box::new(session_id.clone()));
             event_output
-                .emit_command_failed(
+                .emit_admission_failure(
                     &host.alias,
                     attached_failure.error(),
                     attached_failure.phase(),
@@ -6367,7 +6367,7 @@ fn steer_prompt(
                 .durable_handles()
                 .map(|(session_id, _)| Box::new(session_id.clone()));
             event_output
-                .emit_command_failed(
+                .emit_admission_failure(
                     &host.alias,
                     attached_failure.error(),
                     attached_failure.phase(),
@@ -6705,6 +6705,22 @@ impl TurnEventOutput {
         self.emit_body(body)
     }
 
+    fn emit_admission_failure(
+        &mut self,
+        host: &str,
+        error: &SatelleError,
+        admission_phase: TurnAdmissionPhase,
+        durable_handles: Option<(&SessionId, &satelle_core::TurnId)>,
+    ) -> Result<(), SatelleError> {
+        if self.mode != EffectiveEventMode::Json {
+            return Ok(());
+        }
+        for body in admission_failure_event_bodies(host, error, admission_phase, durable_handles)? {
+            self.emit_body(body)?;
+        }
+        Ok(())
+    }
+
     fn emit_body(&mut self, body: SatelleEventBody) -> Result<(), SatelleError> {
         if self.mode == EffectiveEventMode::None {
             return Ok(());
@@ -6741,6 +6757,63 @@ impl TurnEventOutput {
             EffectiveEventMode::None => Ok(()),
         }
     }
+}
+
+fn admission_failure_event_bodies(
+    host: &str,
+    error: &SatelleError,
+    admission_phase: TurnAdmissionPhase,
+    durable_handles: Option<(&SessionId, &satelle_core::TurnId)>,
+) -> Result<Vec<SatelleEventBody>, SatelleError> {
+    let mut bodies = Vec::with_capacity(2);
+    if let Some(body) = native_readiness_failure_event_body(host, error)? {
+        bodies.push(body);
+    }
+    bodies.push(command_failed_event_body(
+        host,
+        error,
+        admission_phase,
+        durable_handles,
+    )?);
+    Ok(bodies)
+}
+
+fn native_readiness_failure_event_body(
+    host: &str,
+    error: &SatelleError,
+) -> Result<Option<SatelleEventBody>, SatelleError> {
+    let Some(readiness) = error
+        .details
+        .get("native_readiness")
+        .filter(|readiness| readiness.is_object())
+    else {
+        return Ok(None);
+    };
+    let Some((event_type, message)) = readiness
+        .get("status")
+        .and_then(serde_json::Value::as_str)
+        .and_then(|status| match status {
+            "failed" => Some((EventType::Readiness, "native Computer Use readiness failed")),
+            "manual_action_required" => Some((
+                EventType::ActionRequired,
+                "native Computer Use readiness requires manual action",
+            )),
+            _ => None,
+        })
+    else {
+        return Ok(None);
+    };
+    SatelleEventBody::new(
+        event_type,
+        EventSource::Cli,
+        OffsetDateTime::now_utc(),
+        host,
+        None,
+        message,
+        readiness.clone(),
+    )
+    .map(Some)
+    .map_err(|error| SatelleError::invalid_usage(error.to_string()))
 }
 
 fn command_failed_event_body(
@@ -7153,6 +7226,36 @@ mod setup_desktop_binding_tests {
 mod admitted_session_failure_tests {
     use super::*;
 
+    fn native_readiness_error(status: &str) -> SatelleError {
+        let mut error = SatelleError::native_readiness_timeout();
+        error.details.insert(
+            "native_readiness".to_string(),
+            json!({
+                "source": "live",
+                "status": status,
+                "checks": [{
+                    "kind": "pointer_drag",
+                    "status": status,
+                    "reason": "pointer_drag_not_confirmed",
+                }],
+            }),
+        );
+        error
+    }
+
+    fn admission_event_types(error: &SatelleError) -> Vec<EventType> {
+        admission_failure_event_bodies(
+            "readiness-host",
+            error,
+            TurnAdmissionPhase::NotAdmitted,
+            None,
+        )
+        .expect("construct admission failure events")
+        .iter()
+        .map(SatelleEventBody::event_type)
+        .collect()
+    }
+
     #[test]
     fn retains_the_durable_session_id() {
         let session_id = SessionId::new();
@@ -7187,6 +7290,70 @@ mod admitted_session_failure_tests {
     #[test]
     fn steer_machine_event_preserves_unknown_admission_phase() {
         assert_unknown_machine_event("steer-host");
+    }
+
+    #[test]
+    fn failed_native_readiness_precedes_command_failure() {
+        let error = native_readiness_error("failed");
+        let bodies = admission_failure_event_bodies(
+            "readiness-host",
+            &error,
+            TurnAdmissionPhase::NotAdmitted,
+            None,
+        )
+        .expect("construct admission failure events");
+
+        assert_eq!(
+            bodies
+                .iter()
+                .map(SatelleEventBody::event_type)
+                .collect::<Vec<_>>(),
+            [EventType::Readiness, EventType::CommandFailed]
+        );
+        assert_eq!(bodies[0].data(), &error.details["native_readiness"]);
+    }
+
+    #[test]
+    fn manual_native_readiness_precedes_command_failure() {
+        let error = native_readiness_error("manual_action_required");
+
+        assert_eq!(
+            admission_event_types(&error),
+            [EventType::ActionRequired, EventType::CommandFailed]
+        );
+    }
+
+    #[test]
+    fn missing_or_malformed_native_readiness_emits_only_command_failure() {
+        let missing = SatelleError::native_readiness_timeout();
+        let mut malformed = missing.clone();
+        malformed.details.insert(
+            "native_readiness".to_string(),
+            json!({"source": "live", "status": "unexpected", "checks": []}),
+        );
+
+        for error in [&missing, &malformed] {
+            assert_eq!(admission_event_types(error), [EventType::CommandFailed]);
+        }
+    }
+
+    #[test]
+    fn none_event_mode_returns_without_emitting_or_changing_sequence() {
+        let transport_calls = std::cell::Cell::new(0_u8);
+        let mut event_output = TurnEventOutput::new(EffectiveEventMode::None, false);
+        transport_calls.set(transport_calls.get() + 1);
+
+        event_output
+            .emit_admission_failure(
+                "readiness-host",
+                &native_readiness_error("failed"),
+                TurnAdmissionPhase::NotAdmitted,
+                None,
+            )
+            .expect("none mode must suppress output without failing");
+
+        assert_eq!(transport_calls.get(), 1);
+        assert_eq!(event_output.next_sequence, 1);
     }
 }
 

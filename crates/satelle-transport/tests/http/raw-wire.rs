@@ -468,13 +468,22 @@ impl ComputerUseAdapter for ControlledAdmissionAdapter {
             ExperimentalFeatureChoices::new(FeatureChoice::Enabled, FeatureChoice::Enabled),
         );
         let observed_at = time::OffsetDateTime::now_utc();
-        let evidence = ReadinessEvidence::new(
-            format!("raw-wire-readiness-{}", satelle_core::SessionId::new()),
+        let readiness_key = satelle_host::ReadinessCacheKey::new(
+            "raw-wire-controlled",
+            desktop_binding.clone(),
+            execution_policy.clone(),
             "raw-wire-controlled-codex",
             "raw-wire-controlled-runtime",
             Some("raw-wire-controlled-plugin"),
             "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
             "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            satelle_host::ReadinessObservationState::Unknown,
+            satelle_host::ReadinessObservationState::Unknown,
+        )
+        .expect("valid readiness cache key");
+        let evidence = ReadinessEvidence::new(
+            &readiness_key,
+            format!("raw-wire-readiness-{}", satelle_core::SessionId::new()),
             observed_at,
             observed_at + time::Duration::minutes(5),
         )

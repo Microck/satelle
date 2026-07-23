@@ -1,8 +1,10 @@
 use super::adapter::{
-    AdapterPreflight, AdapterReadiness, AdapterSubject, ComputerUseAdapter, ExecuteRequest,
-    ExecuteResult, NativeProbeResult, ProviderComputerUseIntent, ProviderSmokeEvidence,
-    ProviderSmokeFailureEvidence, ProviderSmokeResult, ProviderSmokeSource, ReadinessCacheKey,
-    ReadinessEvidence, ReadinessProbeDriver, RecoveryObservation,
+    AdapterPreflight, AdapterReadiness, AdapterSubject, ComputerUseAdapter, EvidenceError,
+    ExecuteRequest, ExecuteResult, NativeProbeResult, NativeReadinessCheck,
+    NativeReadinessCheckKind, NativeReadinessCheckStatus, ProviderComputerUseIntent,
+    ProviderSmokeEvidence, ProviderSmokeFailureEvidence, ProviderSmokeResult, ProviderSmokeSource,
+    ReadinessCacheKey, ReadinessEvidence, ReadinessObservationState, ReadinessProbeDriver,
+    ReadinessSource, RecoveryObservation,
 };
 use crate::READINESS_CANCELLATION_GRACE;
 use crate::codex_session::{
@@ -174,11 +176,13 @@ impl ProductionComputerUseAdapter {
             .control_plane_admission
             .admit(ControlPlaneOperation::Run)?;
         let version = supported_execution_version(&snapshot)?;
+        let app_policy_surface = snapshot.evidence.capabilities.approval_observation.surface;
         drop(snapshot);
 
         let desktops = crate::desktop_sessions::discover()?;
         let platform = crate::codex_capabilities::HostPlatform::current().as_str();
         let desktop = resolve_desktop_session_for(platform, &desktops, &self.desktop_selection)?;
+        let observations = native_prerequisite_observations(platform, desktop, app_policy_surface);
         let desktop_binding = DesktopBindingRef::new(desktop.desktop_user.clone())
             .map_err(|_| adapter_failure("desktop_binding_invalid"))?;
         let effective_model = provider_intent
@@ -207,7 +211,6 @@ impl ProductionComputerUseAdapter {
                 },
             ),
         );
-        let platform = crate::codex_capabilities::HostPlatform::current().as_str();
         let codex_version = version.to_string();
         let native_runtime_version = format!("codex-native-{codex_version}");
         ReadinessCacheKey::new(
@@ -217,8 +220,22 @@ impl ProductionComputerUseAdapter {
             codex_version,
             native_runtime_version,
             None::<String>,
-            readiness_fingerprint("os-permission", platform, &desktop.session_id),
-            readiness_fingerprint("app-approval", platform, &desktop.session_id),
+            readiness_fingerprint(
+                "os-permission",
+                platform,
+                &desktop.session_id,
+                observations.os_permission_state,
+                &observations.os_fingerprint_material,
+            ),
+            readiness_fingerprint(
+                "app-approval",
+                platform,
+                &desktop.session_id,
+                observations.app_approval_state,
+                &observations.app_fingerprint_material,
+            ),
+            observations.os_permission_state,
+            observations.app_approval_state,
         )
         .map_err(|_| adapter_failure("readiness_key_invalid"))
     }
@@ -228,6 +245,7 @@ impl ProductionComputerUseAdapter {
         &self,
         key: &ReadinessCacheKey,
         evidence: ReadinessEvidence,
+        source: ReadinessSource,
         cached_provider: Option<ProviderSmokeResult>,
         refresh_provider: bool,
         provider_smoke_timeout: Option<Duration>,
@@ -242,20 +260,17 @@ impl ProductionComputerUseAdapter {
             cancellation,
             persistence,
         ) {
-            Ok(provider_smoke_evidence) => AdapterReadiness::ready(
-                key.adapter(),
-                "native Computer Use passed the Host action-path smoke test",
-                key.desktop_binding().clone(),
-                key.execution_policy().clone(),
-                evidence,
-                provider_smoke_evidence,
-            )
-            .map_or_else(
-                |_| {
-                    AdapterPreflight::UncachedFailure(adapter_failure("readiness_evidence_invalid"))
-                },
-                AdapterPreflight::Ready,
-            ),
+            Ok(provider_smoke_evidence) => {
+                native_readiness_from_evidence(key, evidence, provider_smoke_evidence, source)
+                    .map_or_else(
+                        |_| {
+                            AdapterPreflight::UncachedFailure(adapter_failure(
+                                "readiness_evidence_invalid",
+                            ))
+                        },
+                        AdapterPreflight::Ready,
+                    )
+            }
             Err(ProviderSmokeAttemptFailure {
                 evidence: Some(failure),
                 error,
@@ -297,6 +312,15 @@ impl ProductionComputerUseAdapter {
                 ));
             }
         };
+        if let Some(error) = native_observation_blocker(&key) {
+            return AdapterPreflight::Failed {
+                key,
+                evidence,
+                reason: "native_readiness_manual_action_required",
+                error,
+                dispatch_possible: false,
+            };
+        }
         let mut persist_thread_ref = |_value: &str| Ok(());
         let mut persist_turn_ref = |_value: &str| Ok(());
         tracing::debug!(
@@ -307,6 +331,7 @@ impl ProductionComputerUseAdapter {
             Ok(()) => self.readiness_from_evidence(
                 &key,
                 evidence,
+                ReadinessSource::Live,
                 cached_provider,
                 refresh_provider,
                 provider_smoke_timeout,
@@ -344,9 +369,7 @@ impl ProductionComputerUseAdapter {
                 prepare_working_directory(path)
                     .map_err(|_| native_smoke_failure("working_directory_unavailable"))
             })?;
-        let prompt = format!(
-            "Use native Computer Use, not shell or file tools, to click the button labeled {nonce} in the visible 'Satelle Native Readiness' window. Stop after clicking it."
-        );
+        let prompt = native_readiness_prompt(&nonce);
         let command =
             crate::codex_capabilities::installed_app_server_command().map_err(|error| {
                 NativeSmokeFailure {
@@ -646,16 +669,21 @@ impl ProductionComputerUseAdapter {
         };
         let cached_provider =
             provider_cache_for_preflight(cached_provider, provider_intent.refresh());
+        let cached = matching_cached_evidence(&key, cached);
         match cached {
-            Some(evidence) => self.readiness_from_evidence(
-                &key,
-                evidence,
-                cached_provider,
-                provider_intent.refresh(),
-                provider_intent.provider_smoke_timeout(),
-                cancellation,
-                persistence,
-            ),
+            Some(evidence) => {
+                let source = evidence.source();
+                self.readiness_from_evidence(
+                    &key,
+                    evidence,
+                    source,
+                    cached_provider,
+                    provider_intent.refresh(),
+                    provider_intent.provider_smoke_timeout(),
+                    cancellation,
+                    persistence,
+                )
+            }
             None => self.live_native_preflight(
                 key,
                 cached_provider,
@@ -666,6 +694,23 @@ impl ProductionComputerUseAdapter {
             ),
         }
     }
+}
+
+fn native_readiness_from_evidence(
+    key: &ReadinessCacheKey,
+    evidence: ReadinessEvidence,
+    provider_smoke_evidence: Option<ProviderSmokeEvidence>,
+    source: ReadinessSource,
+) -> Result<AdapterReadiness, EvidenceError> {
+    AdapterReadiness::ready(
+        key.adapter(),
+        "native Computer Use passed the Host action-path smoke test",
+        key.desktop_binding().clone(),
+        key.execution_policy().clone(),
+        evidence,
+        provider_smoke_evidence,
+    )
+    .map(|readiness| readiness.with_source(source))
 }
 
 struct NativeActionTarget {
@@ -708,16 +753,7 @@ impl Drop for NativeActionTarget {
 
 #[cfg(windows)]
 fn native_action_command(nonce: &str, _timeout: Duration) -> Result<Command, &'static str> {
-    let script = format!(
-        "$ErrorActionPreference='Stop'; Add-Type -AssemblyName PresentationFramework; \
-         $window=New-Object Windows.Window; $window.Title='Satelle Native Readiness'; \
-         $window.Width=520; $window.Height=180; $window.Topmost=$true; \
-         $button=New-Object Windows.Controls.Button; $button.Content='{nonce}'; \
-         $button.FontSize=24; $button.Margin=20; \
-         $button.Add_Click({{$window.Tag='passed'; $window.Close()}}); \
-         $window.Content=$button; [void]$window.ShowDialog(); \
-         if ($window.Tag -eq 'passed') {{ exit 0 }} else {{ exit 1 }}"
-    );
+    let script = windows_native_readiness_target_source(nonce);
     let mut command = Command::new("powershell.exe");
     command.args(["-NoLogo", "-NoProfile", "-STA", "-Command", &script]);
     Ok(command)
@@ -725,14 +761,17 @@ fn native_action_command(nonce: &str, _timeout: Duration) -> Result<Command, &'s
 
 #[cfg(target_os = "macos")]
 fn native_action_command(nonce: &str, timeout: Duration) -> Result<Command, &'static str> {
-    let timeout = timeout.as_secs().max(1);
-    let script = format!(
-        "tell application \"System Events\" to set probeResult to display dialog \"Click the readiness button\" with title \"Satelle Native Readiness\" buttons {{\"Cancel\", \"{nonce}\"}} default button \"{nonce}\" cancel button \"Cancel\" giving up after {timeout}\n\
-         if gave up of probeResult then error \"native readiness timed out\" number 1\n\
-         if button returned of probeResult is not \"{nonce}\" then error \"native readiness action not observed\" number 2"
-    );
+    let script = macos_native_readiness_target_source(nonce);
     let mut command = Command::new("/usr/bin/osascript");
-    command.args(["-e", &script]);
+    command.args([
+        "-l",
+        "JavaScript",
+        "-e",
+        &format!(
+            "const readinessTimeoutSeconds = {};\n{script}",
+            timeout.as_secs().max(1)
+        ),
+    ]);
     Ok(command)
 }
 
@@ -741,14 +780,281 @@ fn native_action_command(_nonce: &str, _timeout: Duration) -> Result<Command, &'
     Err("unsupported_host_platform")
 }
 
-fn readiness_fingerprint(domain: &str, platform: &str, desktop: &str) -> String {
+fn native_readiness_prompt(nonce: &str) -> String {
+    format!(
+        "Use native Computer Use, not shell or file tools, in the private topmost 'Satelle Native Readiness' window. Independently click the button labeled {nonce}, then drag the 'Drag from here' control into the 'Drop here' target. Stop only after both actions are complete."
+    )
+}
+
+#[cfg(any(test, windows))]
+fn windows_native_readiness_target_source(nonce: &str) -> String {
+    r#"
+$ErrorActionPreference='Stop'
+Add-Type -AssemblyName PresentationFramework
+$window=New-Object Windows.Window
+$window.Title='Satelle Native Readiness'
+$window.Width=640
+$window.Height=300
+$window.Topmost=$true
+$window.ShowInTaskbar=$false
+$window.WindowStartupLocation='CenterScreen'
+$window.Tag='failed'
+
+$clickConfirmed=$false
+$dragConfirmed=$false
+$dragStarted=$false
+$dragMoved=$false
+
+$grid=New-Object Windows.Controls.Grid
+$grid.Margin=20
+1..3 | ForEach-Object {
+    $row=New-Object Windows.Controls.RowDefinition
+    $row.Height='*'
+    [void]$grid.RowDefinitions.Add($row)
+}
+
+$instructions=New-Object Windows.Controls.TextBlock
+$instructions.Text='Complete both independent pointer actions'
+$instructions.FontSize=18
+$instructions.HorizontalAlignment='Center'
+[Windows.Controls.Grid]::SetRow($instructions,0)
+[void]$grid.Children.Add($instructions)
+
+$clickButton=New-Object Windows.Controls.Button
+$clickButton.Name='pointer_click_confirmed'
+$clickButton.Content='__NONCE__'
+$clickButton.FontSize=22
+$clickButton.Margin=8
+$clickButton.Add_Click({
+    $script:clickConfirmed=$true
+    if ($clickConfirmed -and $dragConfirmed) {
+        $window.Tag='passed'
+        $window.Close()
+    }
+})
+[Windows.Controls.Grid]::SetRow($clickButton,1)
+[void]$grid.Children.Add($clickButton)
+
+$dragGrid=New-Object Windows.Controls.Grid
+1..2 | ForEach-Object {
+    $column=New-Object Windows.Controls.ColumnDefinition
+    $column.Width='*'
+    [void]$dragGrid.ColumnDefinitions.Add($column)
+}
+$dragSource=New-Object Windows.Controls.Button
+$dragSource.Content='Drag from here'
+$dragSource.Margin=12
+$dragSource.Add_MouseDown({
+    $script:dragStarted=$true
+    $script:dragMoved=$false
+    [void]$dragSource.CaptureMouse()
+})
+$dragSource.Add_MouseMove({
+    param($sender,$event)
+    if ($dragStarted -and $event.LeftButton -eq 'Pressed') {
+        $script:dragMoved=$true
+    }
+})
+$dragSource.Add_MouseUp({
+    param($sender,$event)
+    $point=$event.GetPosition($dropTarget)
+    $inside=$point.X -ge 0 -and $point.Y -ge 0 -and
+        $point.X -le $dropTarget.ActualWidth -and $point.Y -le $dropTarget.ActualHeight
+    $dragSource.ReleaseMouseCapture()
+    if ($dragStarted -and $dragMoved -and $inside) {
+        $script:dragConfirmed=$true
+    }
+    $script:dragStarted=$false
+    if ($clickConfirmed -and $dragConfirmed) {
+        $window.Tag='passed'
+        $window.Close()
+    }
+})
+[Windows.Controls.Grid]::SetColumn($dragSource,0)
+[void]$dragGrid.Children.Add($dragSource)
+
+$dropTarget=New-Object Windows.Controls.Border
+$dropTarget.Name='pointer_drag_confirmed'
+$dropTarget.BorderBrush='DarkGreen'
+$dropTarget.BorderThickness=3
+$dropTarget.CornerRadius=8
+$dropTarget.Margin=12
+$dropLabel=New-Object Windows.Controls.TextBlock
+$dropLabel.Text='Drop here'
+$dropLabel.FontSize=20
+$dropLabel.HorizontalAlignment='Center'
+$dropLabel.VerticalAlignment='Center'
+$dropTarget.Child=$dropLabel
+[Windows.Controls.Grid]::SetColumn($dropTarget,1)
+[void]$dragGrid.Children.Add($dropTarget)
+
+[Windows.Controls.Grid]::SetRow($dragGrid,2)
+[void]$grid.Children.Add($dragGrid)
+$window.Content=$grid
+[void]$window.ShowDialog()
+if ($window.Tag -eq 'passed') { exit 0 } else { exit 1 }
+"#
+    .replace("__NONCE__", nonce)
+}
+
+#[cfg(any(test, target_os = "macos"))]
+fn macos_native_readiness_target_source(nonce: &str) -> String {
+    r#"
+ObjC.import('Cocoa')
+ObjC.import('stdlib')
+
+const app = $.NSApplication.sharedApplication
+app.setActivationPolicy($.NSApplicationActivationPolicyAccessory)
+const style = $.NSWindowStyleMaskTitled | $.NSWindowStyleMaskClosable
+const panel = $.NSPanel.alloc.initWithContentRectStyleMaskBackingDefer(
+    $.NSMakeRect(0, 0, 640, 300),
+    style,
+    $.NSBackingStoreBuffered,
+    false
+)
+panel.title = 'Satelle Native Readiness'
+panel.level = $.NSFloatingWindowLevel
+panel.hidesOnDeactivate = false
+panel.center
+
+function makeButton(title, frame) {
+    const button = $.NSButton.alloc.initWithFrame(frame)
+    button.title = title
+    button.bezelStyle = $.NSBezelStyleRounded
+    panel.contentView.addSubview(button)
+    return button
+}
+
+const clickButton = makeButton('__NONCE__', $.NSMakeRect(170, 170, 300, 60))
+clickButton.identifier = 'pointer_click_confirmed'
+const dragSource = makeButton('Drag from here', $.NSMakeRect(70, 55, 200, 65))
+const dropTarget = makeButton('Drop here', $.NSMakeRect(370, 55, 200, 65))
+dropTarget.identifier = 'pointer_drag_confirmed'
+
+panel.orderFrontRegardless
+app.activateIgnoringOtherApps(true)
+
+let clickConfirmed = false
+let dragConfirmed = false
+let clickStarted = false
+let dragStarted = false
+let dragMoved = false
+const deadline = Date.now() + readinessTimeoutSeconds * 1000
+
+function contains(rect, point) {
+    return point.x >= rect.origin.x &&
+        point.y >= rect.origin.y &&
+        point.x <= rect.origin.x + rect.size.width &&
+        point.y <= rect.origin.y + rect.size.height
+}
+
+const eventMask = $.NSEventMaskLeftMouseDown |
+    $.NSEventMaskLeftMouseDragged |
+    $.NSEventMaskLeftMouseUp
+const localHandler = ObjC.block(['id', ['id']], function(event) {
+    if (Number(event.window.windowNumber) !== Number(panel.windowNumber)) {
+        return event
+    }
+    const point = event.locationInWindow
+    const eventType = Number(event.type)
+    if (eventType === Number($.NSEventTypeLeftMouseDown)) {
+        clickStarted = contains(clickButton.frame, point)
+        dragStarted = contains(dragSource.frame, point)
+        dragMoved = false
+    } else if (eventType === Number($.NSEventTypeLeftMouseDragged) && dragStarted) {
+        dragMoved = true
+    } else if (eventType === Number($.NSEventTypeLeftMouseUp)) {
+        clickConfirmed = clickConfirmed || (clickStarted && contains(clickButton.frame, point))
+        dragConfirmed = dragConfirmed ||
+            (dragStarted && dragMoved && contains(dropTarget.frame, point))
+        clickStarted = false
+        dragStarted = false
+    }
+    return event
+})
+const localMonitor = $.NSEvent.addLocalMonitorForEventsMatchingMaskHandler(
+    eventMask,
+    localHandler
+)
+
+while (Date.now() < deadline && !(clickConfirmed && dragConfirmed)) {
+    $.NSRunLoop.currentRunLoop.runUntilDate($.NSDate.dateWithTimeIntervalSinceNow(0.01))
+}
+
+$.NSEvent.removeMonitor(localMonitor)
+panel.close
+$.exit(clickConfirmed && dragConfirmed ? 0 : 1)
+"#
+    .replace("__NONCE__", nonce)
+}
+
+struct NativePrerequisiteObservations {
+    os_permission_state: ReadinessObservationState,
+    app_approval_state: ReadinessObservationState,
+    os_fingerprint_material: String,
+    app_fingerprint_material: String,
+}
+
+fn native_prerequisite_observations(
+    platform: &str,
+    desktop: &satelle_core::DesktopSessionRecord,
+    app_policy_surface: crate::codex_capabilities::EvidenceSurface,
+) -> NativePrerequisiteObservations {
+    let os_permission_state = if platform == "windows" {
+        // Desktop resolution already proved this exact session is active,
+        // visible, and has one unambiguous console/remote ownership mode.
+        ReadinessObservationState::Granted
+    } else {
+        // macOS preflight APIs describe the calling Host process, not the
+        // managed Codex process that drives the desktop. Reporting that value
+        // as Codex permission would create a false grant or false denial.
+        ReadinessObservationState::Unknown
+    };
+    NativePrerequisiteObservations {
+        os_permission_state,
+        app_approval_state: ReadinessObservationState::Unknown,
+        os_fingerprint_material: format!(
+            "{}:{}:{}:{}",
+            desktop.state, desktop.session_kind, desktop.is_console, desktop.is_remote
+        ),
+        app_fingerprint_material: app_policy_fingerprint_material(platform, app_policy_surface),
+    }
+}
+
+fn app_policy_fingerprint_material(
+    platform: &str,
+    observed: crate::codex_capabilities::EvidenceSurface,
+) -> String {
+    if platform != "windows" {
+        return "app_policy:not_observable".to_string();
+    }
+    let classified = match observed {
+        crate::codex_capabilities::EvidenceSurface::Stable => "stable",
+        crate::codex_capabilities::EvidenceSurface::Absent => "absent",
+        crate::codex_capabilities::EvidenceSurface::Incomplete => "incomplete",
+        _ => "incomplete",
+    };
+    format!("windows_app_policy:{classified}")
+}
+
+fn readiness_fingerprint(
+    domain: &str,
+    platform: &str,
+    desktop: &str,
+    state: ReadinessObservationState,
+    observation: &str,
+) -> String {
     let mut digest = Sha256::new();
-    digest.update(b"satelle-native-readiness-v1\0");
+    digest.update(b"satelle-native-readiness-v2\0");
     digest.update(domain.as_bytes());
     digest.update([0]);
     digest.update(platform.as_bytes());
     digest.update([0]);
     digest.update(desktop.as_bytes());
+    digest.update([0]);
+    digest.update(state.as_str().as_bytes());
+    digest.update([0]);
+    digest.update(observation.as_bytes());
     digest
         .finalize()
         .iter()
@@ -771,9 +1077,70 @@ fn provider_cache_for_preflight(
     if refresh { None } else { cached }
 }
 
+fn matching_cached_evidence(
+    key: &ReadinessCacheKey,
+    cached: Option<ReadinessEvidence>,
+) -> Option<ReadinessEvidence> {
+    cached.filter(|evidence| !key_has_denied_observation(key) && key.matches_evidence(evidence))
+}
+
 fn native_readiness_failure(reason: &'static str) -> SatelleError {
     let mut details = std::collections::BTreeMap::new();
     details.insert("reason".to_string(), Value::String(reason.to_string()));
+    details.insert(
+        "native_readiness".to_string(),
+        serde_json::json!({
+            "source": "live",
+            "status": NativeReadinessCheckStatus::Failed.as_str(),
+            "checks": [
+                readiness_check(
+                    NativeReadinessCheckKind::CodexRuntime,
+                    NativeReadinessCheckStatus::Passed,
+                    "codex_runtime_available",
+                ),
+                readiness_check(
+                    NativeReadinessCheckKind::Authentication,
+                    NativeReadinessCheckStatus::Passed,
+                    "authentication_available",
+                ),
+                readiness_check(
+                    NativeReadinessCheckKind::NativeComputerUse,
+                    NativeReadinessCheckStatus::Passed,
+                    "native_computer_use_available",
+                ),
+                readiness_check(
+                    NativeReadinessCheckKind::OsPermissions,
+                    NativeReadinessCheckStatus::NotEvaluated,
+                    "live_proof_not_completed",
+                ),
+                readiness_check(
+                    NativeReadinessCheckKind::AppApproval,
+                    NativeReadinessCheckStatus::NotEvaluated,
+                    "live_proof_not_completed",
+                ),
+                readiness_check(
+                    NativeReadinessCheckKind::ControlPlane,
+                    NativeReadinessCheckStatus::Passed,
+                    "control_plane_admitted",
+                ),
+                readiness_check(
+                    NativeReadinessCheckKind::PointerClick,
+                    NativeReadinessCheckStatus::Failed,
+                    reason,
+                ),
+                readiness_check(
+                    NativeReadinessCheckKind::PointerDrag,
+                    NativeReadinessCheckStatus::Failed,
+                    reason,
+                ),
+                readiness_check(
+                    NativeReadinessCheckKind::FileManagement,
+                    NativeReadinessCheckStatus::NotEvaluated,
+                    "not_required_for_prompt_admission",
+                ),
+            ],
+        }),
+    );
     SatelleError {
         code: ErrorCode::ComputerUseNotReady,
         message: "native Computer Use did not pass the Host action-path smoke test".to_string(),
@@ -781,6 +1148,136 @@ fn native_readiness_failure(reason: &'static str) -> SatelleError {
         source_detail: None,
         details,
     }
+}
+
+fn native_readiness_manual_action_failure(
+    os_permission_state: ReadinessObservationState,
+    app_approval_state: ReadinessObservationState,
+) -> SatelleError {
+    let os_status = observation_check_status(os_permission_state);
+    let app_status = observation_check_status(app_approval_state);
+    let checks = serde_json::json!([
+        readiness_check(
+            NativeReadinessCheckKind::CodexRuntime,
+            NativeReadinessCheckStatus::Passed,
+            "codex_runtime_available",
+        ),
+        readiness_check(
+            NativeReadinessCheckKind::Authentication,
+            NativeReadinessCheckStatus::Passed,
+            "authentication_available",
+        ),
+        readiness_check(
+            NativeReadinessCheckKind::NativeComputerUse,
+            NativeReadinessCheckStatus::Passed,
+            "native_computer_use_available",
+        ),
+        readiness_check(
+            NativeReadinessCheckKind::OsPermissions,
+            os_status.0,
+            os_status.1
+        ),
+        readiness_check(
+            NativeReadinessCheckKind::AppApproval,
+            app_status.0,
+            app_status.1
+        ),
+        readiness_check(
+            NativeReadinessCheckKind::ControlPlane,
+            NativeReadinessCheckStatus::Passed,
+            "control_plane_admitted",
+        ),
+        readiness_check(
+            NativeReadinessCheckKind::PointerClick,
+            NativeReadinessCheckStatus::NotEvaluated,
+            "blocked_by_prerequisite",
+        ),
+        readiness_check(
+            NativeReadinessCheckKind::PointerDrag,
+            NativeReadinessCheckStatus::NotEvaluated,
+            "blocked_by_prerequisite",
+        ),
+        readiness_check(
+            NativeReadinessCheckKind::FileManagement,
+            NativeReadinessCheckStatus::NotEvaluated,
+            "not_required_for_prompt_admission",
+        ),
+    ]);
+    let mut details = std::collections::BTreeMap::new();
+    details.insert(
+        "reason".to_string(),
+        Value::String("native_readiness_manual_action_required".to_string()),
+    );
+    details.insert(
+        "native_readiness".to_string(),
+        serde_json::json!({
+            "source": "live",
+            "status": NativeReadinessCheckStatus::ManualActionRequired.as_str(),
+            "checks": checks,
+        }),
+    );
+    SatelleError {
+        code: ErrorCode::ComputerUseNotReady,
+        message: "native Computer Use requires a manual permission or app approval change"
+            .to_string(),
+        recovery_command: Some("satelle doctor --scope computer-use --refresh --json".to_string()),
+        source_detail: None,
+        details,
+    }
+}
+
+fn key_has_denied_observation(key: &ReadinessCacheKey) -> bool {
+    key.os_permission_state() == ReadinessObservationState::Denied
+        || key.app_approval_state() == ReadinessObservationState::Denied
+}
+
+fn native_observation_blocker(key: &ReadinessCacheKey) -> Option<SatelleError> {
+    key_has_denied_observation(key).then(|| {
+        native_readiness_manual_action_failure(key.os_permission_state(), key.app_approval_state())
+    })
+}
+
+fn denied_native_probe_result(
+    key: &ReadinessCacheKey,
+    evidence: &ReadinessEvidence,
+) -> Option<NativeProbeResult> {
+    native_observation_blocker(key).map(|error| NativeProbeResult::Failed {
+        evidence: evidence.clone(),
+        reason: "native_readiness_manual_action_required",
+        error,
+        dispatch_possible: false,
+    })
+}
+
+fn observation_check_status(
+    state: ReadinessObservationState,
+) -> (NativeReadinessCheckStatus, &'static str) {
+    match state {
+        ReadinessObservationState::Granted => {
+            (NativeReadinessCheckStatus::Passed, "observation_granted")
+        }
+        ReadinessObservationState::Denied => (
+            NativeReadinessCheckStatus::ManualActionRequired,
+            "observation_denied",
+        ),
+        ReadinessObservationState::Unknown => (
+            NativeReadinessCheckStatus::NotEvaluated,
+            "observation_unknown",
+        ),
+    }
+}
+
+fn readiness_check(
+    kind: NativeReadinessCheckKind,
+    status: NativeReadinessCheckStatus,
+    reason: &'static str,
+) -> Value {
+    let check = NativeReadinessCheck::new(kind, status, reason);
+    serde_json::json!({
+        "kind": check.kind().as_str(),
+        "status": check.status().as_str(),
+        "reason": check.reason(),
+    })
 }
 
 fn native_smoke_failure(reason: &'static str) -> NativeSmokeFailure {
@@ -1274,6 +1771,9 @@ impl ReadinessProbeDriver for ProductionComputerUseAdapter {
                 ));
             }
         };
+        if let Some(result) = denied_native_probe_result(key, &evidence) {
+            return result;
+        }
         match self.run_native_smoke(Some(cancellation), persist_thread_ref, persist_turn_ref) {
             Ok(()) => NativeProbeResult::Passed(evidence),
             Err(failure) if cancellation.is_requested() => {
@@ -1601,6 +2101,27 @@ mod tests {
             TimeoutPolicy::bounded_seconds(120).unwrap(),
             ExperimentalFeatureChoices::new(FeatureChoice::Enabled, FeatureChoice::Disabled),
         )
+    }
+
+    fn native_readiness_test_key(
+        desktop_session_id: &str,
+        os_permission_state: ReadinessObservationState,
+        app_approval_state: ReadinessObservationState,
+    ) -> ReadinessCacheKey {
+        let desktop_binding = DesktopBindingRef::new("readiness-test-desktop").unwrap();
+        ReadinessCacheKey::new(
+            NATIVE_ADAPTER,
+            desktop_binding.clone(),
+            execution_policy_for(desktop_binding.as_str(), desktop_session_id),
+            "0.144.0",
+            "codex-native-0.144.0",
+            None::<String>,
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            os_permission_state,
+            app_approval_state,
+        )
+        .unwrap()
     }
 
     #[test]
@@ -2009,6 +2530,8 @@ mod tests {
             None::<String>,
             "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
             "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            ReadinessObservationState::Unknown,
+            ReadinessObservationState::Unknown,
         )
         .unwrap();
         let observed_at = time::OffsetDateTime::UNIX_EPOCH;
@@ -2062,6 +2585,8 @@ mod tests {
             None::<String>,
             "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
             "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            ReadinessObservationState::Unknown,
+            ReadinessObservationState::Unknown,
         )
         .unwrap();
         let observed_at = time::OffsetDateTime::now_utc();
@@ -2455,5 +2980,190 @@ mod tests {
             let serialized = serde_json::to_string(&public).unwrap();
             assert!(!serialized.contains("PRIVATE_RAW_PROTOCOL_CANARY"));
         }
+    }
+
+    #[test]
+    fn native_readiness_targets_require_independent_click_and_drag_confirmation() {
+        let windows = windows_native_readiness_target_source("readiness-nonce");
+        assert!(windows.contains("Topmost"));
+        assert!(windows.contains("ShowInTaskbar"));
+        assert!(windows.contains("MouseDown"));
+        assert!(windows.contains("MouseMove"));
+        assert!(windows.contains("MouseUp"));
+        assert!(windows.contains("pointer_click_confirmed"));
+        assert!(windows.contains("pointer_drag_confirmed"));
+        assert!(windows.contains("$clickConfirmed -and $dragConfirmed"));
+
+        let macos = macos_native_readiness_target_source("readiness-nonce");
+        assert!(macos.contains("NSFloatingWindowLevel"));
+        assert!(macos.contains("addLocalMonitorForEventsMatchingMaskHandler"));
+        assert!(macos.contains("event.window.windowNumber"));
+        assert!(macos.contains("NSEventTypeLeftMouseDown"));
+        assert!(macos.contains("NSEventTypeLeftMouseDragged"));
+        assert!(macos.contains("NSEventTypeLeftMouseUp"));
+        assert!(!macos.contains("NSEvent.mouseLocation"));
+        assert!(!macos.contains("NSEvent.pressedMouseButtons"));
+        assert!(macos.contains("pointer_click_confirmed"));
+        assert!(macos.contains("pointer_drag_confirmed"));
+        assert!(macos.contains("clickConfirmed && dragConfirmed"));
+    }
+
+    #[test]
+    fn mismatched_cached_native_evidence_becomes_one_live_branch_miss() {
+        let observed_at = time::OffsetDateTime::UNIX_EPOCH;
+        let current = native_readiness_test_key(
+            "current-session",
+            ReadinessObservationState::Granted,
+            ReadinessObservationState::Unknown,
+        );
+        let stale = native_readiness_test_key(
+            "stale-session",
+            ReadinessObservationState::Granted,
+            ReadinessObservationState::Unknown,
+        );
+        let stale_evidence = stale
+            .evidence(
+                "stale-readiness",
+                observed_at,
+                observed_at + time::Duration::minutes(5),
+            )
+            .unwrap();
+
+        assert!(matching_cached_evidence(&current, Some(stale_evidence)).is_none());
+        let live_evidence = current
+            .evidence(
+                "live-readiness",
+                observed_at,
+                observed_at + time::Duration::minutes(5),
+            )
+            .unwrap();
+        let live =
+            native_readiness_from_evidence(&current, live_evidence, None, ReadinessSource::Live)
+                .unwrap();
+        assert_eq!(live.source(), ReadinessSource::Live);
+
+        let matching_evidence = current
+            .evidence(
+                "current-readiness",
+                observed_at,
+                observed_at + time::Duration::minutes(5),
+            )
+            .unwrap()
+            .with_source(ReadinessSource::Cache);
+        let matching_evidence = matching_cached_evidence(&current, Some(matching_evidence))
+            .expect("an exact cache hit must remain on the single cached branch");
+        let cached = native_readiness_from_evidence(
+            &current,
+            matching_evidence,
+            None,
+            ReadinessSource::Cache,
+        )
+        .unwrap();
+        assert_eq!(cached.source(), ReadinessSource::Cache);
+    }
+
+    #[test]
+    fn denied_observation_keeps_the_exact_key_and_retained_failure_evidence() {
+        let key = native_readiness_test_key(
+            "denied-session",
+            ReadinessObservationState::Denied,
+            ReadinessObservationState::Unknown,
+        );
+        let observed_at = time::OffsetDateTime::UNIX_EPOCH;
+        let evidence = key
+            .evidence(
+                "denied-readiness",
+                observed_at,
+                observed_at + time::Duration::minutes(5),
+            )
+            .unwrap();
+
+        let result = denied_native_probe_result(&key, &evidence)
+            .expect("a denied observation must become a retained live failure");
+        let NativeProbeResult::Failed {
+            evidence: retained,
+            reason,
+            error,
+            dispatch_possible,
+        } = result
+        else {
+            panic!("denied readiness must not dispatch or become uncached");
+        };
+        assert!(retained == evidence);
+        assert_eq!(reason, "native_readiness_manual_action_required");
+        assert!(!dispatch_possible);
+        assert_eq!(
+            error.details["native_readiness"]["status"],
+            "manual_action_required"
+        );
+    }
+
+    #[test]
+    fn windows_app_policy_fingerprint_uses_only_the_existing_closed_surface() {
+        use crate::codex_capabilities::EvidenceSurface;
+
+        let desktop = satelle_core::DesktopSessionRecord {
+            session_id: "PRIVATE_SESSION_ID_CANARY".to_string(),
+            desktop_user: "operator".to_string(),
+            state: "active".to_string(),
+            session_kind: "visible_desktop".to_string(),
+            is_console: true,
+            is_remote: false,
+            display_summary: "PRIVATE_DISPLAY_CANARY".to_string(),
+            portable_selectors: vec!["active".to_string(), "console".to_string()],
+            native_selectors: vec!["PRIVATE_NATIVE_SELECTOR_CANARY".to_string()],
+            selected_by_current_config: true,
+        };
+        let stable = native_prerequisite_observations("windows", &desktop, EvidenceSurface::Stable);
+        let absent = native_prerequisite_observations("windows", &desktop, EvidenceSurface::Absent);
+        let incomplete =
+            native_prerequisite_observations("windows", &desktop, EvidenceSurface::Incomplete);
+        let private =
+            native_prerequisite_observations("windows", &desktop, EvidenceSurface::Private);
+
+        assert_eq!(stable.app_fingerprint_material, "windows_app_policy:stable");
+        assert_eq!(absent.app_fingerprint_material, "windows_app_policy:absent");
+        assert_eq!(
+            incomplete.app_fingerprint_material,
+            "windows_app_policy:incomplete"
+        );
+        assert_eq!(
+            private.app_fingerprint_material,
+            "windows_app_policy:incomplete"
+        );
+        for material in [
+            &stable.app_fingerprint_material,
+            &absent.app_fingerprint_material,
+            &incomplete.app_fingerprint_material,
+        ] {
+            assert!(!material.contains("PRIVATE_"));
+        }
+        let fingerprint = |material: &str| {
+            readiness_fingerprint(
+                "app-approval",
+                "windows",
+                &desktop.session_id,
+                ReadinessObservationState::Unknown,
+                material,
+            )
+        };
+        assert_ne!(
+            fingerprint(&stable.app_fingerprint_material),
+            fingerprint(&absent.app_fingerprint_material)
+        );
+        assert_ne!(
+            fingerprint(&absent.app_fingerprint_material),
+            fingerprint(&incomplete.app_fingerprint_material)
+        );
+    }
+
+    #[test]
+    fn native_readiness_prompt_names_both_required_actions_and_private_target() {
+        let prompt = native_readiness_prompt("readiness-nonce");
+
+        assert!(prompt.contains("private"));
+        assert!(prompt.contains("click"));
+        assert!(prompt.contains("drag"));
+        assert!(prompt.contains("readiness-nonce"));
     }
 }

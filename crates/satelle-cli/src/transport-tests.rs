@@ -11,7 +11,8 @@ use satelle_core::{
 use satelle_host::{
     AdapterReadiness, AdapterSubject, ApiScopes, ComputerUseAdapter, ExecuteRequest, ExecuteResult,
     LogCursor, LogPageQuery, LogSeverity, LogSource, ProviderComputerUseIntent,
-    ProviderSmokeEvidence, ReadinessEvidence, RecoveryObservation, test_support::TestStateDir,
+    ProviderSmokeEvidence, ReadinessCacheKey, ReadinessEvidence, ReadinessObservationState,
+    RecoveryObservation, test_support::TestStateDir,
 };
 use satelle_transport::{DaemonServer, DaemonServerConfig};
 use std::io::{Read, Write};
@@ -263,13 +264,22 @@ fn lifecycle_readiness() -> Result<AdapterReadiness, SatelleError> {
         ExperimentalFeatureChoices::new(FeatureChoice::Enabled, FeatureChoice::Enabled),
     );
     let observed_at = time::OffsetDateTime::now_utc();
-    let evidence = ReadinessEvidence::new(
-        format!("interrupt-readiness-{}", SessionId::new()),
+    let readiness_key = ReadinessCacheKey::new(
+        "interrupt-test",
+        desktop_binding.clone(),
+        execution_policy.clone(),
         "interrupt-test-codex",
         "interrupt-test-runtime",
         Some("interrupt-test-plugin"),
         "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
         "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        ReadinessObservationState::Unknown,
+        ReadinessObservationState::Unknown,
+    )
+    .map_err(|error| SatelleError::not_implemented(format!("test readiness key: {error}")))?;
+    let evidence = ReadinessEvidence::new(
+        &readiness_key,
+        format!("interrupt-readiness-{}", SessionId::new()),
         observed_at,
         observed_at + time::Duration::minutes(5),
     )
@@ -3505,11 +3515,29 @@ fn direct_attached_run_and_steer_follow_committed_host_events() {
             .map(SatelleEvent::event_type)
             .collect::<Vec<_>>(),
         [
+            EventType::Readiness,
             EventType::TurnStarted,
             EventType::ProviderSmoke,
             EventType::TurnProgress,
             EventType::TurnCompleted,
         ]
+    );
+    let run_readiness = run_events
+        .first()
+        .expect("native readiness precedes Turn admission");
+    assert_eq!(run_readiness.data()["status"], "passed");
+    assert_eq!(run_readiness.data()["source"], "live");
+    let run_readiness_checks = run_readiness.data()["checks"]
+        .as_array()
+        .expect("native readiness carries structured checks");
+    let run_file_management = run_readiness_checks
+        .iter()
+        .find(|check| check["kind"] == "file_management")
+        .expect("native readiness includes file-management status");
+    assert_eq!(run_file_management["status"], "not_evaluated");
+    assert_eq!(
+        run_file_management["reason"],
+        "not_required_for_prompt_admission"
     );
     assert_eq!(
         run_outcome.provider_smoke.as_ref().unwrap()["source"],
@@ -3592,11 +3620,29 @@ fn direct_attached_run_and_steer_follow_committed_host_events() {
             .map(SatelleEvent::event_type)
             .collect::<Vec<_>>(),
         [
+            EventType::Readiness,
             EventType::TurnStarted,
             EventType::ProviderSmoke,
             EventType::TurnProgress,
             EventType::TurnCompleted,
         ]
+    );
+    let steer_readiness = steer_events
+        .first()
+        .expect("native readiness precedes follow-up Turn admission");
+    assert_eq!(steer_readiness.data()["status"], "passed");
+    assert_eq!(steer_readiness.data()["source"], "live");
+    let steer_readiness_checks = steer_readiness.data()["checks"]
+        .as_array()
+        .expect("follow-up native readiness carries structured checks");
+    let steer_file_management = steer_readiness_checks
+        .iter()
+        .find(|check| check["kind"] == "file_management")
+        .expect("follow-up readiness includes file-management status");
+    assert_eq!(steer_file_management["status"], "not_evaluated");
+    assert_eq!(
+        steer_file_management["reason"],
+        "not_required_for_prompt_admission"
     );
     assert_eq!(
         steer_outcome.provider_smoke.as_ref().unwrap()["source"],
