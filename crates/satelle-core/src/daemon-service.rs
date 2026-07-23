@@ -273,9 +273,9 @@ impl DaemonArtifactPlan {
             return Err(DaemonArtifactPlanError::InvalidArtifactMetadata);
         }
         let action = match current {
-            None => DaemonArtifactAction::Install,
             Some(current) if current < target => DaemonArtifactAction::UpdateOlder,
-            Some(_) if !protocol_compatible => DaemonArtifactAction::UpdateProtocolIncompatible,
+            _ if !protocol_compatible => DaemonArtifactAction::UpdateProtocolIncompatible,
+            None => DaemonArtifactAction::Install,
             Some(_) => DaemonArtifactAction::ReuseCurrent,
         };
         let restart_impact = match (action, persistent_service) {
@@ -1056,6 +1056,21 @@ mod tests {
         .expect("protocol-incompatible host is replaceable");
         assert_eq!(
             incompatible.action,
+            DaemonArtifactAction::UpdateProtocolIncompatible
+        );
+
+        let unknown_version_incompatible = DaemonArtifactPlan::new(
+            None,
+            false,
+            "0.1.0",
+            "darwin-arm64",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "/Users/operator/Library/Caches/Satelle/host/v0.1.0/satelle".to_string(),
+            true,
+        )
+        .expect("protocol-incompatible host with an unknown version is replaceable");
+        assert_eq!(
+            unknown_version_incompatible.action,
             DaemonArtifactAction::UpdateProtocolIncompatible
         );
 

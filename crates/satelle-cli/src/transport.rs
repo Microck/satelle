@@ -1124,9 +1124,9 @@ impl SshSetupTransport {
                 #[cfg(test)]
                 validated_host_identity: Some(capabilities.host_identity().to_string()),
             }),
-            Err(DaemonClientError::CapabilitiesProtocolMismatch { daemon_version }) => {
+            Err(DaemonClientError::CapabilitiesProtocolMismatch) => {
                 Ok(CurrentDaemonArtifactObservation {
-                    current_version: Some(daemon_version),
+                    current_version: None,
                     protocol_compatible: false,
                     #[cfg(test)]
                     validated_host_identity: None,
@@ -3913,7 +3913,7 @@ fn direct_transport_error(host: &str, error: DaemonClientError) -> SatelleError 
         DaemonClientError::CertificateExpired(_) => SatelleError::certificate_expired(host),
         DaemonClientError::TlsVersionUnsupported(_) => SatelleError::tls_version_unsupported(host),
         DaemonClientError::TlsHandshake(_) => SatelleError::tls_handshake_failed(host),
-        DaemonClientError::CapabilitiesProtocolMismatch { .. } => {
+        DaemonClientError::CapabilitiesProtocolMismatch => {
             api_code_error(host, ApiErrorCode::IncompatibleProtocol)
         }
         DaemonClientError::Transport(_) => SatelleError::host_unreachable(host),
@@ -4514,16 +4514,11 @@ mod bootstrap_ordering_tests {
         let transport = setup_transport_for_report();
         let observation = transport
             .current_daemon_observation_from_capabilities(Err(
-                DaemonClientError::CapabilitiesProtocolMismatch {
-                    daemon_version: env!("CARGO_PKG_VERSION").to_string(),
-                },
+                DaemonClientError::CapabilitiesProtocolMismatch,
             ))
             .expect("map an authenticated protocol mismatch to the planning observation");
 
-        assert_eq!(
-            observation.current_version.as_deref(),
-            Some(env!("CARGO_PKG_VERSION"))
-        );
+        assert_eq!(observation.current_version, None);
         assert!(!observation.protocol_compatible);
         assert_eq!(observation.validated_host_identity, None);
 
