@@ -71,20 +71,29 @@ pub(crate) fn verify_uploads(
     if uploads.len() > MAX_ATTACHMENTS {
         return Err(());
     }
-    let mut total = 0_usize;
+    let mut declared_total = 0_usize;
+    let mut decoded_total = 0_usize;
     uploads
         .into_iter()
         .map(|upload| {
-            let bytes = base64::engine::general_purpose::STANDARD
-                .decode(upload.data_base64.as_bytes())
-                .map_err(|_| ())?;
-            if bytes.len() > MAX_ATTACHMENT_BYTES
-                || u64::try_from(bytes.len()).map_err(|_| ())? != upload.size_bytes
+            let declared_size = usize::try_from(upload.size_bytes).map_err(|_| ())?;
+            if declared_size > MAX_ATTACHMENT_BYTES {
+                return Err(());
+            }
+            declared_total = declared_total.checked_add(declared_size).ok_or(())?;
+            if declared_total > MAX_TOTAL_BYTES
+                || upload.data_base64.len() > declared_size.div_ceil(3).checked_mul(4).ok_or(())?
             {
                 return Err(());
             }
-            total = total.checked_add(bytes.len()).ok_or(())?;
-            if total > MAX_TOTAL_BYTES {
+            let bytes = base64::engine::general_purpose::STANDARD
+                .decode(upload.data_base64.as_bytes())
+                .map_err(|_| ())?;
+            if bytes.len() > MAX_ATTACHMENT_BYTES || bytes.len() != declared_size {
+                return Err(());
+            }
+            decoded_total = decoded_total.checked_add(bytes.len()).ok_or(())?;
+            if decoded_total > MAX_TOTAL_BYTES {
                 return Err(());
             }
             let media_type = sniff_media_type(&bytes).ok_or(())?;
@@ -339,6 +348,22 @@ mod tests {
             ])
             .is_err()
         );
+    }
+
+    #[test]
+    fn verification_bounds_declarations_and_encoded_data_before_decode() {
+        let oversized_declaration = AttachmentUpload::new(
+            "image/png",
+            (MAX_ATTACHMENT_BYTES + 1) as u64,
+            "00".repeat(32),
+            "",
+        );
+        assert!(verify_uploads(vec![oversized_declaration]).is_err());
+
+        let oversized_encoding =
+            AttachmentUpload::new("image/png", 8, "00".repeat(32), "A".repeat(16));
+        assert_eq!(8_usize.div_ceil(3) * 4, 12);
+        assert!(verify_uploads(vec![oversized_encoding]).is_err());
     }
 
     #[test]
