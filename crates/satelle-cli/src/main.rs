@@ -2113,6 +2113,7 @@ fn run_setup(
     add_setup_required_inputs(&mut report, &host.config, explicit_provider_auth);
     let mut desktop_selection = None;
     if desktop_setup
+        && !command.dry_run
         && report.required_input.is_empty()
         && (host.config.transport != satelle_core::TransportKind::Ssh || !first_ssh_trust)
     {
@@ -2133,6 +2134,7 @@ fn run_setup(
             report.planned_actions.push(selection.action(&host.alias));
         }
     } else if desktop_setup
+        && !command.dry_run
         && report.required_input.is_empty()
         && host.config.transport == satelle_core::TransportKind::Ssh
     {
@@ -5773,13 +5775,19 @@ fn resolve_execution_desktop(
     transport: &dyn transport::TransportClient,
     host: &SelectedHost,
 ) -> Result<(), CliFailure> {
+    let policy = DesktopSelectionPolicy::from_host_config(&host.config);
+    if !desktop_policy_is_active(&policy) {
+        return Ok(());
+    }
+
     let report = transport.host_sessions(true).map_err(failure)?;
-    resolve_desktop_session(
-        &report,
-        &DesktopSelectionPolicy::from_host_config(&host.config),
-    )
-    .map(|_| ())
-    .map_err(failure)
+    resolve_desktop_session(&report, &policy)
+        .map(|_| ())
+        .map_err(failure)
+}
+
+fn desktop_policy_is_active(policy: &DesktopSelectionPolicy) -> bool {
+    policy.desktop_user.is_some() || policy.preference.is_some() || policy.native_selector.is_some()
 }
 
 fn run_host_update(command: HostUpdateCommand) -> Result<(), CliFailure> {
@@ -6954,6 +6962,35 @@ mod setup_desktop_binding_tests {
 
         assert_eq!(selection.desktop_user, "alias-resolved-user");
         assert_eq!(selection.preference, DesktopSessionPreference::Only);
+    }
+
+    #[test]
+    fn execution_desktop_probe_requires_an_explicit_policy() {
+        let mut config = host_config();
+        assert!(!desktop_policy_is_active(
+            &DesktopSelectionPolicy::from_host_config(&config)
+        ));
+
+        config.desktop_user = Some("operator".to_string());
+        assert!(desktop_policy_is_active(
+            &DesktopSelectionPolicy::from_host_config(&config)
+        ));
+
+        config.desktop_user = None;
+        config.desktop_session_preference = Some(DesktopSessionPreference::Only);
+        assert!(desktop_policy_is_active(
+            &DesktopSelectionPolicy::from_host_config(&config)
+        ));
+
+        config.desktop_session_preference = None;
+        config.desktop_session_native_selector = Some(satelle_core::DesktopSessionNativeSelector {
+            platform: "windows".to_string(),
+            kind: "wts-session".to_string(),
+            value: "7".to_string(),
+        });
+        assert!(desktop_policy_is_active(
+            &DesktopSelectionPolicy::from_host_config(&config)
+        ));
     }
 
     #[test]
