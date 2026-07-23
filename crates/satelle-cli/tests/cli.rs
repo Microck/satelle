@@ -5050,6 +5050,7 @@ fn host_sessions_lists_local_demo_metadata_only() {
 
     assert_eq!(report["schema_version"], "satelle.host.sessions.v1");
     assert_eq!(report["host"], "local-demo");
+    assert_eq!(report["platform"], "local-demo");
     assert_eq!(report["connection_mode"], "direct");
     assert_eq!(report["bootstrapped"], false);
     assert_eq!(report["bootstrap_actions"], serde_json::json!([]));
@@ -5176,6 +5177,136 @@ adapter = "fake"
             "{case}"
         );
     }
+}
+
+#[test]
+fn run_and_steer_fail_before_admission_when_desktop_selection_is_invalid() {
+    let state = state_dir();
+    let user_config = state.path().join("user-config.toml");
+    let cases = [
+        (
+            "unavailable binding",
+            r#"desktop_user = "another-user""#,
+            "desktop-session-unavailable",
+        ),
+        (
+            "unmatched only preference",
+            r#"
+desktop_user = "another-user"
+desktop_session_preference = "only"
+"#,
+            "desktop-session-preference-unmatched",
+        ),
+        (
+            "unavailable console preference",
+            r#"
+desktop_user = "another-user"
+desktop_session_preference = "console"
+"#,
+            "desktop-session-console-unavailable",
+        ),
+        (
+            "wrong native selector platform",
+            r#"
+desktop_user = "local-demo-user"
+
+[hosts.local-demo.desktop_session_native_selector]
+platform = "windows"
+kind = "wts-session"
+value = "7"
+"#,
+            "desktop-session-native-selector-wrong-platform",
+        ),
+        (
+            "unmatched native selector",
+            r#"
+desktop_user = "local-demo-user"
+
+[hosts.local-demo.desktop_session_native_selector]
+platform = "local-demo"
+kind = "console"
+value = "inactive"
+"#,
+            "desktop-session-native-selector-unmatched",
+        ),
+    ];
+
+    for (case, desktop_config, expected_code) in cases {
+        write_user_config(
+            &user_config,
+            format!(
+                r#"
+default_host = "local-demo"
+
+[hosts.local-demo]
+transport = "local"
+adapter = "fake"
+{desktop_config}
+"#
+            ),
+        )
+        .expect("user config should be written");
+
+        let output = satelle()
+            .env("SATELLE_CONFIG_FILE", &user_config)
+            .env("SATELLE_STATE_DIR", state.path())
+            .args(["run", "--detach", "--json", "Open the browser"])
+            .assert()
+            .code(75)
+            .get_output()
+            .clone();
+        let error = parse_json_output(&output.stderr);
+        assert_eq!(error["code"], expected_code, "{case}");
+    }
+
+    write_user_config(
+        &user_config,
+        r#"
+default_host = "local-demo"
+
+[hosts.local-demo]
+transport = "local"
+adapter = "fake"
+desktop_user = "local-demo-user"
+desktop_session_preference = "only"
+"#,
+    )
+    .expect("user config should be written");
+    let output = satelle()
+        .env("SATELLE_CONFIG_FILE", &user_config)
+        .env("SATELLE_STATE_DIR", state.path())
+        .args(["run", "--detach", "--json", "Open the browser"])
+        .assert()
+        .success()
+        .get_output()
+        .clone();
+    let session_id = parse_json_output(&output.stdout)["session_id"]
+        .as_str()
+        .expect("detached run returns a Session identifier")
+        .to_string();
+
+    write_user_config(
+        &user_config,
+        r#"
+default_host = "local-demo"
+
+[hosts.local-demo]
+transport = "local"
+adapter = "fake"
+desktop_user = "another-user"
+"#,
+    )
+    .expect("user config should be written");
+    let output = satelle()
+        .env("SATELLE_CONFIG_FILE", &user_config)
+        .env("SATELLE_STATE_DIR", state.path())
+        .args(["steer", &session_id, "--detach", "--json", "Open settings"])
+        .assert()
+        .code(75)
+        .get_output()
+        .clone();
+    let error = parse_json_output(&output.stderr);
+    assert_eq!(error["code"], "desktop-session-unavailable");
 }
 
 #[test]

@@ -3262,6 +3262,7 @@ fn direct_host_sessions_read_daemon_metadata_without_bootstrap() {
 
     assert_eq!(direct.schema_version, HostSessionsSchemaVersion::V1);
     assert_eq!(direct.host, "direct-test");
+    assert_eq!(direct.platform, local.platform);
     assert_eq!(direct.connection_mode, "direct");
     assert!(!direct.bootstrapped);
     assert!(direct.bootstrap_actions.is_empty());

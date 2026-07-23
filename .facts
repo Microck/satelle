@@ -59,10 +59,18 @@
 - a Satelle Queued Turn Request is a Host Daemon-owned pending run or steer request waiting to start because the selected Control Lease is occupied @spec @later
 - a Satelle Platform-Native Log Sink is an OS-owned logging destination such as journald, Windows Event Log, or macOS unified logging that receives mirrored redacted Satelle Log Entries without becoming a Satelle-owned store @spec @later
 - a Satelle Path Set is the runtime-resolved collection of config, cache, local state, operator log, SQLite store, and recording artifact paths for one OS user on one machine @spec @mvp @implemented
-- a Satelle Desktop Binding is one configured remote OS user account whose compatible visible desktop sessions a Host Daemon is authorized to observe and control @spec @mvp
-- a Satelle Desktop Session is one active visible GUI session for a Desktop Binding that native Computer Use can observe and control @spec @mvp
-- a Satelle Desktop Session Preference is a Host-level selector that narrows one Desktop Binding to one compatible Desktop Session without changing the bound OS user @spec @mvp
-- a Satelle Native Desktop Session Selector is an advanced OS-specific selector copied from a Host Daemon session listing for one Computer Use Host Platform @spec @mvp
+- label: a Satelle Desktop Binding is one configured remote OS user account whose compatible visible desktop sessions a Host Daemon is authorized to observe and control
+  command: cargo test --locked -p satelle-core --lib desktop_selection_tests -- --test-threads=1
+  tags: [spec, mvp, implemented]
+- label: a Satelle Desktop Session is one active visible GUI session for a Desktop Binding that native Computer Use can observe and control
+  command: cargo test --locked -p satelle-core --lib desktop_selection_tests -- --test-threads=1
+  tags: [spec, mvp, implemented]
+- label: a Satelle Desktop Session Preference is a Host-level selector that narrows one Desktop Binding to one compatible Desktop Session without changing the bound OS user
+  command: cargo test --locked -p satelle-core --lib desktop_selection_tests -- --test-threads=1
+  tags: [spec, mvp, implemented]
+- label: a Satelle Native Desktop Session Selector is an advanced OS-specific selector copied from a Host Daemon session listing for one Computer Use Host Platform
+  command: cargo test --locked -p satelle-core --lib desktop_selection_tests -- --test-threads=1
+  tags: [spec, mvp, implemented]
 - a Satelle Multi-User Broker permits an authorized API Principal to select among multiple Desktop Bindings owned by one Host Identity at request time while preserving per-user authorization, isolation, and audit boundaries @spec @later
 - a Satelle Secret Source is a typed reference to secret material stored outside Satelle config files, such as an operating-system credential store item, environment variable, file path, or remote-Host-owned provider auth store @spec @mvp @implemented
 - a Satelle Host-Resolved Secret Source is a Secret Source descriptor containing only a non-secret lookup reference and resolved by the target Host Daemon on the machine running the selected provider binding @spec @mvp
@@ -458,21 +466,43 @@
 - satelle setup automatically selects the bound desktop_user's active Satelle Desktop Session only when exactly one compatible session is visible @spec @mvp
 - satelle setup prompts for a Satelle Desktop Session Preference when multiple compatible sessions are visible and stdin is interactive @spec @mvp
 - satelle setup with --no-input reports a typed desktop-session-ambiguous diagnostic when multiple compatible sessions are visible and no desktop_session_preference is configured @spec @mvp
-- satelle run and steer report a typed desktop-session-ambiguous diagnostic instead of picking a session when multiple compatible sessions match the bound desktop_user and no configured preference resolves to exactly one session @spec @mvp
-- satelle run and steer report a typed desktop-session-preference-unmatched diagnostic when the configured desktop_session_preference does not resolve to one active compatible session @spec @mvp
-- satelle MVP does not default to the physical console session when multiple compatible sessions are visible because that can control the wrong desktop @spec @mvp
+- label: satelle run and steer report a typed desktop-session-ambiguous diagnostic instead of picking a session when multiple compatible sessions match the bound desktop_user and no configured preference resolves to exactly one session
+  command: cargo test --locked -p satelle-core --lib desktop_selection_tests::automatic_and_only_selection_never_hide_ambiguity -- --exact && cargo test --locked -p satelle-cli --features test-support --test cli run_and_steer_fail_before_admission_when_desktop_selection_is_invalid -- --exact
+  tags: [spec, mvp, implemented]
+- label: satelle run and steer report a typed desktop-session-preference-unmatched diagnostic when the configured desktop_session_preference does not resolve to one active compatible session
+  command: cargo test --locked -p satelle-cli --features test-support --test cli run_and_steer_fail_before_admission_when_desktop_selection_is_invalid -- --exact
+  tags: [spec, mvp, implemented]
+- label: satelle MVP does not default to the physical console session when multiple compatible sessions are visible because that can control the wrong desktop
+  command: cargo test --locked -p satelle-core --lib desktop_selection_tests -- --test-threads=1
+  tags: [spec, mvp, implemented]
 - satelle MVP portable desktop_session_preference values are only and console @implemented @mvp
-- satelle treats desktop_session_preference = only as selecting a Satelle Desktop Session only when exactly one compatible session is visible @spec @mvp
-- satelle treats desktop_session_preference = console as selecting the OS-reported physical console session only when that session belongs to the bound desktop_user and is compatible with native Computer Use @spec @mvp
-- satelle reports a typed desktop-session-console-unavailable diagnostic when desktop_session_preference = console has no matching compatible console session @spec @mvp
+- label: satelle treats desktop_session_preference = only as selecting a Satelle Desktop Session only when exactly one compatible session is visible
+  command: cargo test --locked -p satelle-core --lib desktop_selection_tests -- --test-threads=1
+  tags: [spec, mvp, implemented]
+- label: satelle treats desktop_session_preference = console as selecting the OS-reported physical console session only when that session belongs to the bound desktop_user and is compatible with native Computer Use
+  command: cargo test --locked -p satelle-core --lib desktop_selection_tests -- --test-threads=1
+  tags: [spec, mvp, implemented]
+- label: satelle reports a typed desktop-session-console-unavailable diagnostic when desktop_session_preference = console has no matching compatible console session
+  command: cargo test --locked -p satelle-core --lib desktop_selection_tests -- --test-threads=1
+  tags: [spec, mvp, implemented]
 - satelle MVP supports Satelle Native Desktop Session Selector configuration as an advanced escape hatch separate from portable desktop_session_preference values @implemented @mvp
 - satelle rejects host configuration that sets both desktop_session_preference and a Satelle Native Desktop Session Selector for the same concrete host alias @implemented @mvp
-- satelle reports a typed desktop-session-selector-conflict diagnostic when both portable and native session selectors are configured for one concrete host alias @spec @mvp
-- satelle reports a typed desktop-session-native-selector-wrong-platform diagnostic when a Satelle Native Desktop Session Selector platform does not match the detected remote operating system @spec @mvp
-- satelle reports a typed desktop-session-native-selector-unmatched diagnostic when a Satelle Native Desktop Session Selector does not resolve to exactly one active compatible session @spec @mvp
+- label: satelle reports a typed desktop-session-selector-conflict diagnostic when both portable and native session selectors are configured for one concrete host alias
+  command: cargo test --locked -p satelle-cli --features test-support --test cli config_rejects_portable_and_native_desktop_selectors_together -- --exact
+  tags: [spec, mvp, implemented]
+- label: satelle reports a typed desktop-session-native-selector-wrong-platform diagnostic when a Satelle Native Desktop Session Selector platform does not match the detected remote operating system
+  command: cargo test --locked -p satelle-core --lib desktop_selection_tests -- --test-threads=1
+  tags: [spec, mvp, implemented]
+- label: satelle reports a typed desktop-session-native-selector-unmatched diagnostic when a Satelle Native Desktop Session Selector does not resolve to exactly one active compatible session
+  command: cargo test --locked -p satelle-core --lib desktop_selection_tests -- --test-threads=1
+  tags: [spec, mvp, implemented]
 - satelle Host Daemon refuses native Computer Use sessions for desktop sessions that do not match its configured Satelle Desktop Binding @spec @mvp
-- satelle MVP supports multiple users on one physical machine only through separate per-user Host Daemon installations, Host Identities, Host Aliases, and Desktop Bindings running under their respective OS accounts @spec @mvp
-- satelle MVP does not provide a Satelle Multi-User Broker for one host alias to route across multiple Satelle Desktop Bindings @spec @mvp
+- label: satelle MVP supports multiple users on one physical machine only through separate per-user Host Daemon installations, Host Identities, Host Aliases, and Desktop Bindings running under their respective OS accounts
+  command: cargo test --locked -p satelle-cli --features test-support --test cli user_host_config_accepts_desktop_binding_and_daemon_path_fields -- --exact && cargo test --locked -p satelle-transport --lib contract::session::tests::mvp_turn_requests_cannot_route_across_desktop_bindings -- --exact
+  tags: [spec, mvp, implemented]
+- label: satelle MVP does not provide a Satelle Multi-User Broker for one host alias to route across multiple Satelle Desktop Bindings
+  command: cargo test --locked -p satelle-transport --lib contract::session::tests::mvp_turn_requests_cannot_route_across_desktop_bindings -- --exact
+  tags: [spec, mvp, implemented]
 - a later Satelle Multi-User Broker fronts one Host Identity and routes an authorized Host Alias and API Principal to one of multiple explicitly authorized Desktop Bindings @spec @later
 - satelle post-MVP Satelle Multi-User Broker requires per-user authorization, separate Desktop Binding identity, session isolation, provider-auth isolation, path-set isolation, log attribution, audit records, and explicit user or session selection before prompt execution @spec @later
 - satelle post-MVP Satelle Multi-User Broker does not allow a daemon running as one OS user to control another OS user's desktop session unless the target operating system and native Computer Use runtime expose a supported secure handoff for that user @spec @later
@@ -1107,7 +1137,9 @@
 - satelle host sessions metadata may include display resolution, display server or session type, seat or display identifier, remote state, console state, lock or active state when available, and native selector labels @implemented @mvp
 - satelle host sessions human output marks the session selected by current host configuration, portable selector matches, and available native selectors @implemented @mvp
 - satelle host sessions --json includes session_id, desktop_user, state, session_kind, is_console, is_remote, display_summary, portable_selectors, native_selectors, and selected_by_current_config fields @implemented @mvp
-- satelle Native Desktop Session Selector values must be copied from native_selectors reported by satelle host sessions for the same host platform @spec @mvp
+- label: satelle Native Desktop Session Selector values must be copied from native_selectors reported by satelle host sessions for the same host platform
+  command: cargo test --locked -p satelle-cli --features test-support --test cli host_sessions_marks_only_the_session_selected_by_effective_host_config -- --exact
+  tags: [spec, mvp, implemented]
 - satelle discovers project-level configuration by walking upward from the current working directory to the nearest .satelle/config.toml @implemented @mvp
 - satelle project-level configuration discovery works outside Git repositories @implemented @mvp
 - satelle treats a Git repository root as a helpful boundary for project discovery when present but does not require Git for project configuration @spec @mvp @implemented

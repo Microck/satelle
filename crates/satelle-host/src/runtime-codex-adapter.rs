@@ -17,7 +17,10 @@ use satelle_core::session::{
     ExperimentalFeatureChoices, FeatureChoice, ProviderBindingRef, SandboxPolicy, StopObservation,
     TimeoutPolicy, TurnExecutionMode, TurnState, TurnTransition,
 };
-use satelle_core::{ControlPlaneOperation, ErrorCode, SatelleError};
+use satelle_core::{
+    ControlPlaneOperation, DesktopSelectionPolicy, ErrorCode, SatelleError,
+    resolve_desktop_session_for,
+};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::cell::RefCell;
@@ -83,6 +86,7 @@ pub(crate) struct ProductionComputerUseAdapter {
     provider_smoke_timeout: Duration,
     provider_smoke_success_ttl: time::Duration,
     provider_smoke_failure_ttl: time::Duration,
+    desktop_selection: DesktopSelectionPolicy,
 }
 
 #[derive(Clone)]
@@ -126,6 +130,11 @@ impl ProductionComputerUseAdapter {
             provider_smoke_timeout: Duration::from_secs(120),
             provider_smoke_success_ttl: crate::DEFAULT_PROVIDER_SMOKE_SUCCESS_TTL,
             provider_smoke_failure_ttl: crate::DEFAULT_PROVIDER_SMOKE_FAILURE_TTL,
+            desktop_selection: DesktopSelectionPolicy {
+                desktop_user: None,
+                preference: None,
+                native_selector: None,
+            },
         }
     }
 
@@ -137,6 +146,7 @@ impl ProductionComputerUseAdapter {
         provider_smoke_timeout: Duration,
         provider_smoke_success_ttl: time::Duration,
         provider_smoke_failure_ttl: time::Duration,
+        desktop_selection: DesktopSelectionPolicy,
     ) -> Self {
         Self {
             snapshot,
@@ -147,6 +157,7 @@ impl ProductionComputerUseAdapter {
             provider_smoke_timeout,
             provider_smoke_success_ttl,
             provider_smoke_failure_ttl,
+            desktop_selection,
         }
     }
 
@@ -161,11 +172,10 @@ impl ProductionComputerUseAdapter {
         let version = supported_execution_version(&snapshot)?;
         drop(snapshot);
 
-        let desktop = crate::desktop_sessions::discover()?
-            .into_iter()
-            .next()
-            .ok_or_else(SatelleError::computer_use_not_ready)?;
-        let desktop_binding = DesktopBindingRef::new(desktop.session_id.clone())
+        let desktops = crate::desktop_sessions::discover()?;
+        let platform = crate::codex_capabilities::HostPlatform::current().as_str();
+        let desktop = resolve_desktop_session_for(platform, &desktops, &self.desktop_selection)?;
+        let desktop_binding = DesktopBindingRef::new(desktop.desktop_user.clone())
             .map_err(|_| adapter_failure("desktop_binding_invalid"))?;
         let effective_model = provider_intent
             .model()
@@ -517,9 +527,9 @@ impl ProductionComputerUseAdapter {
         .map_err(|_| adapter_failure("provider_smoke_evidence_invalid"))
     }
 
-    fn ensure_platform_admitted(&self) -> Result<(), SatelleError> {
+    fn ensure_platform_admitted(&self) -> Result<DesktopBindingRef, SatelleError> {
         self.native_readiness_key(&ProviderComputerUseIntent::host_default())
-            .map(|_| ())
+            .map(|key| key.desktop_binding().clone())
     }
 
     fn register_execution(
@@ -1120,8 +1130,9 @@ impl ComputerUseAdapter for ProductionComputerUseAdapter {
     }
 
     fn execute(&self, request: ExecuteRequest<'_>) -> Result<ExecuteResult, SatelleError> {
-        self.ensure_platform_admitted()?;
+        let admitted_desktop_binding = self.ensure_platform_admitted()?;
         let policy = request.execution_policy();
+        ensure_execution_desktop_binding(&admitted_desktop_binding, policy)?;
         let approval_policy = codex_approval_policy(policy.approval_policy())?;
         let sandbox_policy = codex_sandbox_policy(policy.sandbox_policy());
         let timeout = Duration::from_secs(u64::from(policy.timeout_policy().seconds()));
@@ -1424,6 +1435,18 @@ fn codex_sandbox_policy(policy: SandboxPolicy) -> CodexSandboxPolicy {
     }
 }
 
+fn ensure_execution_desktop_binding(
+    admitted: &DesktopBindingRef,
+    policy: &ExecutionPolicy,
+) -> Result<(), SatelleError> {
+    if policy.desktop_target().binding() != admitted {
+        return Err(SatelleError::desktop_session_unavailable(Some(
+            policy.desktop_target().binding().as_str(),
+        )));
+    }
+    Ok(())
+}
+
 fn terminal_result(
     result: Result<CodexSessionTerminal, CodexSessionFailure>,
 ) -> Result<ExecuteResult, SatelleError> {
@@ -1551,6 +1574,32 @@ fn host_turn_timeout_ceiling() -> Result<TimeoutPolicy, SatelleError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn execution_policy_for(desktop_binding: &str) -> ExecutionPolicy {
+        ExecutionPolicy::new(
+            EffectiveModelRef::new(DEFAULT_MODEL_BINDING).unwrap(),
+            ProviderBindingRef::new(DEFAULT_PROVIDER_BINDING).unwrap(),
+            DesktopTarget::new(DesktopBindingRef::new(desktop_binding).unwrap()),
+            ApprovalPolicy::OnRequest,
+            SandboxPolicy::WorkspaceWrite,
+            TimeoutPolicy::bounded_seconds(120).unwrap(),
+            ExperimentalFeatureChoices::new(FeatureChoice::Enabled, FeatureChoice::Disabled),
+        )
+    }
+
+    #[test]
+    fn execution_is_rejected_outside_the_admitted_desktop_binding() {
+        let admitted = DesktopBindingRef::new("operator").unwrap();
+        assert!(
+            ensure_execution_desktop_binding(&admitted, &execution_policy_for("operator")).is_ok()
+        );
+
+        let error =
+            ensure_execution_desktop_binding(&admitted, &execution_policy_for("someone-else"))
+                .expect_err("execution cannot escape its admitted Desktop Binding");
+        assert_eq!(error.code, ErrorCode::DesktopSessionUnavailable);
+        assert_eq!(error.details["desktop_user"], "someone-else");
+    }
 
     #[test]
     fn production_adapter_preserves_managed_codex_integrity_errors() {

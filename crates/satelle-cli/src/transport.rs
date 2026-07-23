@@ -3213,6 +3213,7 @@ impl TransportClient for DirectTransport {
         Ok(HostSessionsReport {
             schema_version: HostSessionsSchemaVersion::V1,
             host: self.alias.clone(),
+            platform: capabilities.platform().to_string(),
             connection_mode: self.mode.to_string(),
             bootstrapped: false,
             bootstrap_actions: Vec::new(),

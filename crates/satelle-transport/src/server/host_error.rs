@@ -57,6 +57,7 @@ fn failure(error: &SatelleError) -> ApiFailure {
         | ErrorCode::UnsupportedSecretSourceKind
         | ErrorCode::SecretFilePathNotAbsolute
         | ErrorCode::DesktopSessionSelectorConflict
+        | ErrorCode::DesktopBindingRequired
         | ErrorCode::PathOverrideNotAbsolute
         | ErrorCode::DaemonPathOverrideNotAbsolute
         | ErrorCode::EventsWithDetach
@@ -155,7 +156,14 @@ fn failure(error: &SatelleError) -> ApiFailure {
             message: "the Codex control plane cannot admit this operation",
             details: validated_control_plane_details(error),
         },
-        ErrorCode::ComputerUseNotReady | ErrorCode::DoctorReadinessBlockersFound => ApiFailure {
+        ErrorCode::ComputerUseNotReady
+        | ErrorCode::DesktopSessionUnavailable
+        | ErrorCode::DesktopSessionAmbiguous
+        | ErrorCode::DesktopSessionPreferenceUnmatched
+        | ErrorCode::DesktopSessionConsoleUnavailable
+        | ErrorCode::DesktopSessionNativeSelectorWrongPlatform
+        | ErrorCode::DesktopSessionNativeSelectorUnmatched
+        | ErrorCode::DoctorReadinessBlockersFound => ApiFailure {
             status: StatusCode::SERVICE_UNAVAILABLE,
             code: ApiErrorCode::ComputerUseNotReady,
             category: ApiErrorCategory::Readiness,

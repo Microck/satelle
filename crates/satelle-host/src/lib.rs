@@ -1124,6 +1124,7 @@ impl HostService {
             provider_smoke_timeout,
             provider_smoke_success_ttl,
             provider_smoke_failure_ttl,
+            satelle_core::DesktopSelectionPolicy::from_host_config(config),
         );
         Self {
             runtime: RuntimeHandle::new_production(state_root, operator_log_root, adapter),
@@ -1506,6 +1507,13 @@ impl HostService {
         no_bootstrap: bool,
     ) -> Result<HostSessionsReport, SatelleError> {
         let sessions = self.daemon_desktop_sessions()?;
+        let platform = match &self.mode {
+            HostMode::Production { .. } => {
+                crate::codex_capabilities::HostPlatform::current().as_str()
+            }
+            #[cfg(any(test, feature = "test-support"))]
+            HostMode::TestFake => "local-demo",
+        };
         let bootstrap_actions = if no_bootstrap {
             Vec::new()
         } else {
@@ -1514,6 +1522,7 @@ impl HostService {
         Ok(HostSessionsReport {
             schema_version: HostSessionsSchemaVersion::V1,
             host: host.to_string(),
+            platform: platform.to_string(),
             connection_mode: "direct".to_string(),
             bootstrapped: false,
             bootstrap_actions,

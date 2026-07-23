@@ -33,14 +33,14 @@ use satelle_core::session::{
     TurnAdmissionPhase, TurnExecutionMode, TurnState,
 };
 use satelle_core::{
-    BEACON_CORAL, CLI_NAME, DaemonPathOverrides, DesktopSessionPreference, DoctorEventRecord,
+    BEACON_CORAL, CLI_NAME, DaemonPathOverrides, DesktopSelectionPolicy, DoctorEventRecord,
     DoctorOptions, DoctorReport, ERROR_RED, ErrorCode, EventSource, EventType, HostConfig,
     HostSessionsReport, LOCAL_DEMO_HOST, OwnerOnlyDirectory, PRODUCT_NAME, ProfileField,
     RELAY_ROSE, ResolvedConfig, SUCCESS_GREEN, SatelleError, SatelleEvent, SatelleEventBody,
     SecureFileError, SessionId, SetupMode, SetupReport, SetupRequiredInput, load_config,
     load_user_api_rate_limits, open_or_create_owner_only_directory, open_or_create_owner_only_file,
     open_owner_only_directory, read_owner_controlled_config_file,
-    read_owner_only_secret_config_file, resolve_path_set, utc_now,
+    read_owner_only_secret_config_file, resolve_desktop_session, resolve_path_set, utc_now,
 };
 use satelle_host::{
     ApiBearerToken, HostService, ProviderComputerUseIntent, contains_api_bearer_token,
@@ -5429,42 +5429,30 @@ fn apply_current_desktop_selection(report: &mut HostSessionsReport, host: &HostC
         session.selected_by_current_config = false;
     }
 
-    let native_selector = host
-        .desktop_session_native_selector
-        .as_ref()
-        .map(|selector| format!("{}:{}:{}", selector.platform, selector.kind, selector.value));
-    let selected_index = {
-        let mut matches = report
+    let policy = DesktopSelectionPolicy::from_host_config(host);
+    if let Ok(selected) = resolve_desktop_session(report, &policy) {
+        let selected_id = selected.session_id.clone();
+        if let Some(session) = report
             .sessions
-            .iter()
-            .enumerate()
-            .filter(|(_, session)| {
-                host.desktop_user
-                    .as_deref()
-                    .is_none_or(|user| user == session.desktop_user)
-            })
-            .filter(|(_, session)| {
-                if let Some(selector) = &native_selector {
-                    session.native_selectors.contains(selector)
-                } else {
-                    match host.desktop_session_preference {
-                        Some(DesktopSessionPreference::Console) => session.is_console,
-                        Some(DesktopSessionPreference::Only) | None => true,
-                    }
-                }
-            })
-            .map(|(index, _)| index);
-        let first = matches.next();
-        if matches.next().is_some() {
-            None
-        } else {
-            first
+            .iter_mut()
+            .find(|session| session.session_id == selected_id)
+        {
+            session.selected_by_current_config = true;
         }
-    };
-
-    if let Some(index) = selected_index {
-        report.sessions[index].selected_by_current_config = true;
     }
+}
+
+fn resolve_execution_desktop(
+    transport: &dyn transport::TransportClient,
+    host: &SelectedHost,
+) -> Result<(), CliFailure> {
+    let report = transport.host_sessions(true).map_err(failure)?;
+    resolve_desktop_session(
+        &report,
+        &DesktopSelectionPolicy::from_host_config(&host.config),
+    )
+    .map(|_| ())
+    .map_err(failure)
 }
 
 fn run_host_update(command: HostUpdateCommand) -> Result<(), CliFailure> {
@@ -5775,6 +5763,11 @@ fn run_prompt(
             return Err(transport_failure);
         }
     };
+    report_not_admitted(
+        &mut event_output,
+        Some(&host.alias),
+        resolve_execution_desktop(transport.as_ref(), &host),
+    )?;
     let turn_execution_timeout_ms = report_not_admitted(
         &mut event_output,
         explicit_host_alias,
@@ -5924,6 +5917,11 @@ fn steer_prompt(
             return Err(transport_failure);
         }
     };
+    report_not_admitted(
+        &mut event_output,
+        Some(&host.alias),
+        resolve_execution_desktop(transport.as_ref(), &host),
+    )?;
     let turn_execution_timeout_ms = report_not_admitted(
         &mut event_output,
         explicit_host_alias,

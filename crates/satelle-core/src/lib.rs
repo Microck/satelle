@@ -362,6 +362,23 @@ pub struct DesktopSessionNativeSelector {
     pub value: String,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DesktopSelectionPolicy {
+    pub desktop_user: Option<String>,
+    pub preference: Option<DesktopSessionPreference>,
+    pub native_selector: Option<DesktopSessionNativeSelector>,
+}
+
+impl DesktopSelectionPolicy {
+    pub fn from_host_config(config: &HostConfig) -> Self {
+        Self {
+            desktop_user: config.desktop_user.clone(),
+            preference: config.desktop_session_preference.clone(),
+            native_selector: config.desktop_session_native_selector.clone(),
+        }
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "kind", rename_all = "kebab-case")]
 pub enum ProviderSecretSource {
@@ -2382,6 +2399,13 @@ pub enum ErrorCode {
     UnsupportedSecretSourceKind,
     SecretFilePathNotAbsolute,
     DesktopSessionSelectorConflict,
+    DesktopBindingRequired,
+    DesktopSessionUnavailable,
+    DesktopSessionAmbiguous,
+    DesktopSessionPreferenceUnmatched,
+    DesktopSessionConsoleUnavailable,
+    DesktopSessionNativeSelectorWrongPlatform,
+    DesktopSessionNativeSelectorUnmatched,
     PlatformDirectoriesUnavailable,
     PathOverrideNotAbsolute,
     DaemonPathOverrideNotAbsolute,
@@ -2464,6 +2488,17 @@ impl ErrorCode {
             Self::UnsupportedSecretSourceKind => "unsupported-secret-source-kind",
             Self::SecretFilePathNotAbsolute => "secret-file-path-not-absolute",
             Self::DesktopSessionSelectorConflict => "desktop-session-selector-conflict",
+            Self::DesktopBindingRequired => "desktop-binding-required",
+            Self::DesktopSessionUnavailable => "desktop-session-unavailable",
+            Self::DesktopSessionAmbiguous => "desktop-session-ambiguous",
+            Self::DesktopSessionPreferenceUnmatched => "desktop-session-preference-unmatched",
+            Self::DesktopSessionConsoleUnavailable => "desktop-session-console-unavailable",
+            Self::DesktopSessionNativeSelectorWrongPlatform => {
+                "desktop-session-native-selector-wrong-platform"
+            }
+            Self::DesktopSessionNativeSelectorUnmatched => {
+                "desktop-session-native-selector-unmatched"
+            }
             Self::PlatformDirectoriesUnavailable => "platform-directories-unavailable",
             Self::PathOverrideNotAbsolute => "path-override-not-absolute",
             Self::DaemonPathOverrideNotAbsolute => "daemon-path-override-not-absolute",
@@ -2535,6 +2570,7 @@ impl ErrorCode {
             | Self::SetupConsentRequired
             | Self::DoctorFixConsentRequired
             | Self::InputRequired
+            | Self::DesktopBindingRequired
             | Self::DoctorRefreshScopeRequired
             | Self::DoctorRefreshTimeoutWithoutRefresh => 64,
             Self::Interrupted => 130,
@@ -2588,6 +2624,12 @@ impl ErrorCode {
             | Self::NativeReadinessTimeout
             | Self::ProviderSmokeTestTimeout
             | Self::UnsupportedProviderComputerUse
+            | Self::DesktopSessionUnavailable
+            | Self::DesktopSessionAmbiguous
+            | Self::DesktopSessionPreferenceUnmatched
+            | Self::DesktopSessionConsoleUnavailable
+            | Self::DesktopSessionNativeSelectorWrongPlatform
+            | Self::DesktopSessionNativeSelectorUnmatched
             | Self::DoctorReadinessBlockersFound
             | Self::StateConflict
             | Self::StopNotConfirmed => 75,
@@ -3096,6 +3138,126 @@ impl SatelleError {
             ),
             source_detail: None,
             details,
+        }
+    }
+
+    pub fn desktop_binding_required(users: &BTreeSet<&str>) -> Self {
+        Self {
+            code: ErrorCode::DesktopBindingRequired,
+            message:
+                "multiple compatible desktop users are visible and no Desktop Binding is configured"
+                    .to_string(),
+            recovery_command: Some(
+                "set hosts.<alias>.desktop_user in user-level configuration".to_string(),
+            ),
+            source_detail: None,
+            details: BTreeMap::from([(
+                "candidate_desktop_users".to_string(),
+                Value::Array(
+                    users
+                        .iter()
+                        .map(|user| Value::String((*user).to_string()))
+                        .collect(),
+                ),
+            )]),
+        }
+    }
+
+    pub fn desktop_session_unavailable(desktop_user: Option<&str>) -> Self {
+        Self {
+            code: ErrorCode::DesktopSessionUnavailable,
+            message: desktop_user.map_or_else(
+                || "no compatible active Desktop Session is visible".to_string(),
+                |user| format!("Desktop Binding '{user}' has no compatible active Desktop Session"),
+            ),
+            recovery_command: Some("satelle host sessions --host <alias> --json".to_string()),
+            source_detail: None,
+            details: desktop_user
+                .map(|user| {
+                    BTreeMap::from([("desktop_user".to_string(), Value::String(user.to_string()))])
+                })
+                .unwrap_or_default(),
+        }
+    }
+
+    pub fn desktop_session_ambiguous(desktop_user: &str) -> Self {
+        desktop_selection_error(
+            ErrorCode::DesktopSessionAmbiguous,
+            format!(
+                "Desktop Binding '{desktop_user}' has multiple compatible active Desktop Sessions"
+            ),
+            desktop_user,
+            None,
+            "set desktop_session_preference or desktop_session_native_selector in user-level configuration",
+        )
+    }
+
+    pub fn desktop_session_preference_unmatched(desktop_user: &str, preference: &str) -> Self {
+        desktop_selection_error(
+            ErrorCode::DesktopSessionPreferenceUnmatched,
+            format!(
+                "desktop_session_preference '{preference}' does not resolve to exactly one compatible active Desktop Session for '{desktop_user}'"
+            ),
+            desktop_user,
+            Some(("desktop_session_preference", preference)),
+            "inspect satelle host sessions and update desktop_session_preference",
+        )
+    }
+
+    pub fn desktop_session_console_unavailable(desktop_user: &str) -> Self {
+        desktop_selection_error(
+            ErrorCode::DesktopSessionConsoleUnavailable,
+            format!(
+                "Desktop Binding '{desktop_user}' has no compatible active physical console session"
+            ),
+            desktop_user,
+            Some(("desktop_session_preference", "console")),
+            "inspect satelle host sessions and choose an available selector",
+        )
+    }
+
+    pub fn desktop_session_native_selector_wrong_platform(
+        configured_platform: &str,
+        detected_platform: &str,
+    ) -> Self {
+        Self {
+            code: ErrorCode::DesktopSessionNativeSelectorWrongPlatform,
+            message: format!(
+                "desktop_session_native_selector platform '{configured_platform}' does not match detected Host platform '{detected_platform}'"
+            ),
+            recovery_command: Some(
+                "copy a native_selectors value from satelle host sessions --host <alias> --json"
+                    .to_string(),
+            ),
+            source_detail: None,
+            details: BTreeMap::from([
+                (
+                    "configured_platform".to_string(),
+                    Value::String(configured_platform.to_string()),
+                ),
+                (
+                    "detected_platform".to_string(),
+                    Value::String(detected_platform.to_string()),
+                ),
+            ]),
+        }
+    }
+
+    pub fn desktop_session_native_selector_unmatched(selector: &str) -> Self {
+        Self {
+            code: ErrorCode::DesktopSessionNativeSelectorUnmatched,
+            message: format!(
+                "desktop_session_native_selector '{selector}' does not resolve to exactly one compatible active Desktop Session"
+            ),
+            recovery_command: Some(
+                "copy a native_selectors value from satelle host sessions --host <alias> --json"
+                    .to_string(),
+            ),
+            source_detail: None,
+            details: BTreeMap::from([(
+                "desktop_session_native_selector".to_string(),
+                Value::String(selector.to_string()),
+            )]),
         }
     }
 
@@ -4018,6 +4180,231 @@ fn host_access_error(
     }
 }
 
+fn desktop_selection_error(
+    code: ErrorCode,
+    message: String,
+    desktop_user: &str,
+    selection: Option<(&str, &str)>,
+    recovery_command: &str,
+) -> SatelleError {
+    let mut details = BTreeMap::from([(
+        "desktop_user".to_string(),
+        Value::String(desktop_user.to_string()),
+    )]);
+    if let Some((key, value)) = selection {
+        details.insert(key.to_string(), Value::String(value.to_string()));
+    }
+    SatelleError {
+        code,
+        message,
+        recovery_command: Some(recovery_command.to_string()),
+        source_detail: None,
+        details,
+    }
+}
+
+#[cfg(test)]
+mod desktop_selection_tests {
+    use super::*;
+
+    fn session(
+        id: &str,
+        user: &str,
+        is_console: bool,
+        native_selector: &str,
+    ) -> DesktopSessionRecord {
+        DesktopSessionRecord {
+            session_id: id.to_string(),
+            desktop_user: user.to_string(),
+            state: "active".to_string(),
+            session_kind: "visible_desktop".to_string(),
+            is_console,
+            is_remote: !is_console,
+            display_summary: id.to_string(),
+            portable_selectors: vec![
+                "active".to_string(),
+                if is_console { "console" } else { "remote" }.to_string(),
+            ],
+            native_selectors: vec![native_selector.to_string()],
+            selected_by_current_config: false,
+        }
+    }
+
+    fn report(sessions: Vec<DesktopSessionRecord>) -> HostSessionsReport {
+        HostSessionsReport {
+            schema_version: HostSessionsSchemaVersion::V1,
+            host: "desktop-test".to_string(),
+            platform: "windows".to_string(),
+            connection_mode: "direct".to_string(),
+            bootstrapped: false,
+            bootstrap_actions: Vec::new(),
+            host_daemon_version: "0.1.0".to_string(),
+            sessions,
+        }
+    }
+
+    fn policy(user: Option<&str>) -> DesktopSelectionPolicy {
+        DesktopSelectionPolicy {
+            desktop_user: user.map(str::to_string),
+            preference: None,
+            native_selector: None,
+        }
+    }
+
+    #[test]
+    fn desktop_binding_defaults_only_for_one_visible_user() {
+        let one_user = report(vec![
+            session("console", "operator", true, "windows:wts-session:3"),
+            session("remote", "operator", false, "windows:wts-session:7"),
+        ]);
+        assert_eq!(
+            resolve_desktop_session(
+                &one_user,
+                &DesktopSelectionPolicy {
+                    preference: Some(DesktopSessionPreference::Console),
+                    ..policy(None)
+                }
+            )
+            .unwrap()
+            .session_id,
+            "console"
+        );
+
+        let multiple_users = report(vec![
+            session("alice", "alice", true, "windows:wts-session:3"),
+            session("bob", "bob", false, "windows:wts-session:7"),
+        ]);
+        let error = resolve_desktop_session(&multiple_users, &policy(None)).unwrap_err();
+        assert_eq!(error.code, ErrorCode::DesktopBindingRequired);
+        assert_eq!(
+            error.details["candidate_desktop_users"],
+            serde_json::json!(["alice", "bob"])
+        );
+    }
+
+    #[test]
+    fn automatic_and_only_selection_never_hide_ambiguity() {
+        let sessions = report(vec![
+            session("console", "operator", true, "windows:wts-session:3"),
+            session("remote", "operator", false, "windows:wts-session:7"),
+        ]);
+        let automatic = resolve_desktop_session(&sessions, &policy(Some("operator"))).unwrap_err();
+        assert_eq!(automatic.code, ErrorCode::DesktopSessionAmbiguous);
+
+        let only = resolve_desktop_session(
+            &sessions,
+            &DesktopSelectionPolicy {
+                preference: Some(DesktopSessionPreference::Only),
+                ..policy(Some("operator"))
+            },
+        )
+        .unwrap_err();
+        assert_eq!(only.code, ErrorCode::DesktopSessionPreferenceUnmatched);
+    }
+
+    #[test]
+    fn console_preference_is_scoped_to_the_bound_user() {
+        let sessions = report(vec![
+            session(
+                "other-console",
+                "someone-else",
+                true,
+                "windows:wts-session:3",
+            ),
+            session("bound-remote", "operator", false, "windows:wts-session:7"),
+        ]);
+        let error = resolve_desktop_session(
+            &sessions,
+            &DesktopSelectionPolicy {
+                preference: Some(DesktopSessionPreference::Console),
+                ..policy(Some("operator"))
+            },
+        )
+        .unwrap_err();
+        assert_eq!(error.code, ErrorCode::DesktopSessionConsoleUnavailable);
+    }
+
+    #[test]
+    fn native_selector_requires_same_platform_and_one_listed_value() {
+        let sessions = report(vec![session(
+            "remote",
+            "operator",
+            false,
+            "windows:wts-session:7",
+        )]);
+        let matching = DesktopSessionNativeSelector {
+            platform: "windows".to_string(),
+            kind: "wts-session".to_string(),
+            value: "7".to_string(),
+        };
+        assert_eq!(
+            resolve_desktop_session(
+                &sessions,
+                &DesktopSelectionPolicy {
+                    native_selector: Some(matching.clone()),
+                    ..policy(Some("operator"))
+                }
+            )
+            .unwrap()
+            .session_id,
+            "remote"
+        );
+
+        let wrong_platform = DesktopSessionNativeSelector {
+            platform: "macos".to_string(),
+            ..matching.clone()
+        };
+        let error = resolve_desktop_session(
+            &sessions,
+            &DesktopSelectionPolicy {
+                native_selector: Some(wrong_platform),
+                ..policy(Some("operator"))
+            },
+        )
+        .unwrap_err();
+        assert_eq!(
+            error.code,
+            ErrorCode::DesktopSessionNativeSelectorWrongPlatform
+        );
+
+        let unmatched = DesktopSessionNativeSelector {
+            value: "99".to_string(),
+            ..matching
+        };
+        let error = resolve_desktop_session(
+            &sessions,
+            &DesktopSelectionPolicy {
+                native_selector: Some(unmatched),
+                ..policy(Some("operator"))
+            },
+        )
+        .unwrap_err();
+        assert_eq!(error.code, ErrorCode::DesktopSessionNativeSelectorUnmatched);
+    }
+
+    #[test]
+    fn unavailable_bound_user_is_distinct_from_unmatched_preference() {
+        let sessions = report(vec![session(
+            "other",
+            "someone-else",
+            true,
+            "windows:wts-session:3",
+        )]);
+        let error = resolve_desktop_session(&sessions, &policy(Some("operator"))).unwrap_err();
+        assert_eq!(error.code, ErrorCode::DesktopSessionUnavailable);
+
+        let error = resolve_desktop_session(
+            &sessions,
+            &DesktopSelectionPolicy {
+                preference: Some(DesktopSessionPreference::Only),
+                ..policy(Some("operator"))
+            },
+        )
+        .unwrap_err();
+        assert_eq!(error.code, ErrorCode::DesktopSessionPreferenceUnmatched);
+    }
+}
+
 impl From<IdParseError> for SatelleError {
     fn from(error: IdParseError) -> Self {
         Self {
@@ -4425,6 +4812,7 @@ pub enum HostSessionsSchemaVersion {
 pub struct HostSessionsReport {
     pub schema_version: HostSessionsSchemaVersion,
     pub host: String,
+    pub platform: String,
     pub connection_mode: String,
     pub bootstrapped: bool,
     pub bootstrap_actions: Vec<String>,
@@ -4444,6 +4832,105 @@ pub struct DesktopSessionRecord {
     pub portable_selectors: Vec<String>,
     pub native_selectors: Vec<String>,
     pub selected_by_current_config: bool,
+}
+
+pub fn resolve_desktop_session<'a>(
+    report: &'a HostSessionsReport,
+    policy: &DesktopSelectionPolicy,
+) -> Result<&'a DesktopSessionRecord, SatelleError> {
+    resolve_desktop_session_for(&report.platform, &report.sessions, policy)
+}
+
+pub fn resolve_desktop_session_for<'a>(
+    platform: &str,
+    sessions: &'a [DesktopSessionRecord],
+    policy: &DesktopSelectionPolicy,
+) -> Result<&'a DesktopSessionRecord, SatelleError> {
+    let compatible = sessions
+        .iter()
+        .filter(|session| {
+            session.state == "active"
+                && session.session_kind == "visible_desktop"
+                && session.is_console != session.is_remote
+                && !session.desktop_user.is_empty()
+        })
+        .collect::<Vec<_>>();
+
+    let desktop_user = match policy.desktop_user.as_deref() {
+        Some(desktop_user) => desktop_user,
+        None => {
+            let users = compatible
+                .iter()
+                .map(|session| session.desktop_user.as_str())
+                .collect::<BTreeSet<_>>();
+            match users.len() {
+                0 => return Err(SatelleError::desktop_session_unavailable(None)),
+                1 => users
+                    .into_iter()
+                    .next()
+                    .expect("one compatible desktop user exists"),
+                _ => return Err(SatelleError::desktop_binding_required(&users)),
+            }
+        }
+    };
+    let bound = compatible
+        .into_iter()
+        .filter(|session| session.desktop_user == desktop_user)
+        .collect::<Vec<_>>();
+
+    if let Some(selector) = &policy.native_selector {
+        if selector.platform != platform {
+            return Err(
+                SatelleError::desktop_session_native_selector_wrong_platform(
+                    &selector.platform,
+                    platform,
+                ),
+            );
+        }
+        let selector_value = format!("{}:{}:{}", selector.platform, selector.kind, selector.value);
+        return exact_desktop_match(
+            bound.into_iter().filter(|session| {
+                session
+                    .native_selectors
+                    .iter()
+                    .any(|candidate| candidate == &selector_value)
+            }),
+            || SatelleError::desktop_session_native_selector_unmatched(&selector_value),
+            || SatelleError::desktop_session_native_selector_unmatched(&selector_value),
+        );
+    }
+
+    match policy.preference {
+        Some(DesktopSessionPreference::Only) => exact_desktop_match(
+            bound.into_iter(),
+            || SatelleError::desktop_session_preference_unmatched(desktop_user, "only"),
+            || SatelleError::desktop_session_preference_unmatched(desktop_user, "only"),
+        ),
+        Some(DesktopSessionPreference::Console) => exact_desktop_match(
+            bound.into_iter().filter(|session| session.is_console),
+            || SatelleError::desktop_session_console_unavailable(desktop_user),
+            || SatelleError::desktop_session_preference_unmatched(desktop_user, "console"),
+        ),
+        None => exact_desktop_match(
+            bound.into_iter(),
+            || SatelleError::desktop_session_unavailable(Some(desktop_user)),
+            || SatelleError::desktop_session_ambiguous(desktop_user),
+        ),
+    }
+}
+
+fn exact_desktop_match<'a>(
+    mut matches: impl Iterator<Item = &'a DesktopSessionRecord>,
+    empty: impl FnOnce() -> SatelleError,
+    multiple: impl FnOnce() -> SatelleError,
+) -> Result<&'a DesktopSessionRecord, SatelleError> {
+    let Some(selected) = matches.next() else {
+        return Err(empty());
+    };
+    if matches.next().is_some() {
+        return Err(multiple());
+    }
+    Ok(selected)
 }
 
 #[cfg(any(test, feature = "test-support"))]
