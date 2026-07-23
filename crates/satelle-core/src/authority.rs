@@ -1105,7 +1105,7 @@ mod tests {
         ExecutionPolicy::new(
             EffectiveModelRef::new("computer-use-model").unwrap(),
             ProviderBindingRef::new("provider-binding-a").unwrap(),
-            DesktopTarget::new(desktop()),
+            DesktopTarget::new(desktop(), "authority-desktop-session"),
             ApprovalPolicy::OnRequest,
             SandboxPolicy::WorkspaceWrite,
             TimeoutPolicy::bounded_seconds(300).unwrap(),

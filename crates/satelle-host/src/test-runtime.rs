@@ -145,7 +145,7 @@ impl ComputerUseAdapter for FakeComputerUseAdapter {
                 .map_err(|_| adapter_configuration_error("model binding"))?,
             ProviderBindingRef::new("fake-provider-v1")
                 .map_err(|_| adapter_configuration_error("provider binding"))?,
-            DesktopTarget::new(desktop_binding.clone()),
+            DesktopTarget::new(desktop_binding.clone(), "local-demo-session-v1"),
             ApprovalPolicy::OnRequest,
             SandboxPolicy::WorkspaceWrite,
             TimeoutPolicy::bounded_seconds(30 * 60)

@@ -19,7 +19,7 @@ mod transport;
 use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum};
 use completions::{CompletionsCommand, run_completions};
 use error_output::{ErrorFormat, parser_error, print_error, process_exit_code};
-use host_trust::{HostTrustReport, persist_host_identity};
+use host_trust::{HostTrustReport, persist_desktop_selection, persist_host_identity};
 use logs::{LogsCommand, show_logs};
 use notify::{Config as NotifyConfig, Event, RecommendedWatcher, RecursiveMode, Watcher};
 use output::{EventOutput, OutputArgs, OutputFormat, SessionResultSchemaVersion, StatusReport};
@@ -33,14 +33,15 @@ use satelle_core::session::{
     TurnAdmissionPhase, TurnExecutionMode, TurnState,
 };
 use satelle_core::{
-    BEACON_CORAL, CLI_NAME, DaemonPathOverrides, DesktopSessionPreference, DoctorEventRecord,
-    DoctorOptions, DoctorReport, ERROR_RED, ErrorCode, EventSource, EventType, HostConfig,
-    HostSessionsReport, LOCAL_DEMO_HOST, OwnerOnlyDirectory, PRODUCT_NAME, ProfileField,
-    RELAY_ROSE, ResolvedConfig, SUCCESS_GREEN, SatelleError, SatelleEvent, SatelleEventBody,
-    SecureFileError, SessionId, SetupMode, SetupReport, SetupRequiredInput, load_config,
-    load_user_api_rate_limits, open_or_create_owner_only_directory, open_or_create_owner_only_file,
-    open_owner_only_directory, read_owner_controlled_config_file,
-    read_owner_only_secret_config_file, resolve_path_set, utc_now,
+    BEACON_CORAL, CLI_NAME, DaemonPathOverrides, DesktopSelectionPolicy, DesktopSessionPreference,
+    DoctorEventRecord, DoctorOptions, DoctorReport, ERROR_RED, ErrorCode, EventSource, EventType,
+    HostConfig, HostSessionsReport, LOCAL_DEMO_HOST, OwnerOnlyDirectory, PRODUCT_NAME,
+    ProfileField, RELAY_ROSE, ResolvedConfig, SUCCESS_GREEN, SatelleError, SatelleEvent,
+    SatelleEventBody, SecureFileError, SessionId, SetupMode, SetupReadinessSummary, SetupReport,
+    SetupRequiredInput, SetupSchemaVersion, load_config, load_user_api_rate_limits,
+    open_or_create_owner_only_directory, open_or_create_owner_only_file, open_owner_only_directory,
+    read_owner_controlled_config_file, read_owner_only_secret_config_file, resolve_desktop_session,
+    resolve_path_set, utc_now,
 };
 use satelle_host::{
     ApiBearerToken, HostService, ProviderComputerUseIntent, contains_api_bearer_token,
@@ -61,8 +62,8 @@ use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 use tailscale::transport_doctor_report;
 use transport::{
-    AttachedTurnOutcome, SshBootstrapScope, discover_direct_host_identity,
-    discover_ssh_host_identity, transport_for, transport_for_setup,
+    AttachedTurnOutcome, SshBootstrapScope, SshHostDiscovery, authenticated_ssh_bootstrap_user,
+    discover_direct_host_identity, discover_ssh_host, transport_for, transport_for_setup,
 };
 
 const CONFIG_CHECK_SCHEMA_VERSION: &str = "satelle.config.check.v1";
@@ -1789,6 +1790,244 @@ fn explicit_lifecycle_json_host(command: &Command) -> Option<&str> {
     }
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct PendingSetupDesktopSelection {
+    desktop_user: String,
+    preference: DesktopSessionPreference,
+}
+
+impl PendingSetupDesktopSelection {
+    fn action(&self, host_alias: &str) -> String {
+        let preference = match self.preference {
+            DesktopSessionPreference::Only => "only",
+            DesktopSessionPreference::Console => "console",
+        };
+        format!(
+            "set Host Binding {host_alias} desktop_user to '{}' and desktop_session_preference to '{preference}'",
+            self.desktop_user
+        )
+    }
+}
+
+fn partition_setup_components(
+    setup_components: &[String],
+    ssh_transport: bool,
+    path_rebind: bool,
+) -> (Vec<String>, bool) {
+    let desktop_selected = setup_components
+        .iter()
+        .any(|component| matches!(component.as_str(), "desktop" | "all"));
+    let mut host_components = setup_components
+        .iter()
+        .filter(|component| component.as_str() != "desktop")
+        .cloned()
+        .collect::<Vec<_>>();
+    if ssh_transport && host_components == ["all"] {
+        // SSH setup currently owns only the authenticated transport handoff.
+        // Keep the user-facing `all` selection intact in the final report, but
+        // do not send that aggregate CLI selector to the transport-only backend.
+        host_components = vec!["transport".to_string()];
+    } else if ssh_transport && path_rebind && host_components.is_empty() {
+        // Selecting new daemon paths requires the transport handoff even when
+        // desktop selection is the only explicit setup component.
+        host_components.push("transport".to_string());
+    }
+    (host_components, desktop_selected)
+}
+
+fn setup_transport_if_required<T, E>(
+    required: bool,
+    build: impl FnOnce() -> Result<T, E>,
+) -> Result<Option<T>, E> {
+    if required {
+        build().map(Some)
+    } else {
+        Ok(None)
+    }
+}
+
+fn run_host_setup_if_required<T>(
+    required: bool,
+    cli_owned_result: impl FnOnce() -> T,
+    host_owned_setup: impl FnOnce() -> Result<T, SatelleError>,
+) -> Result<T, SatelleError> {
+    if required {
+        host_owned_setup()
+    } else {
+        Ok(cli_owned_result())
+    }
+}
+
+fn run_host_setup_after_desktop_preflight<C, T>(
+    desktop_preflight: Result<(), CliFailure>,
+    setup_config: &mut C,
+    persist_desktop_selection: impl FnOnce(&mut C) -> Result<(), CliFailure>,
+    host_setup: impl FnOnce(&C) -> Result<T, CliFailure>,
+) -> Result<T, CliFailure> {
+    desktop_preflight?;
+    persist_desktop_selection(setup_config)?;
+    host_setup(setup_config)
+}
+
+fn cli_owned_setup_report(
+    host: &str,
+    dry_run: bool,
+    setup_mode: &str,
+    setup_components: Vec<String>,
+) -> SetupReport {
+    let service_persistent = setup_mode == "persistent";
+    SetupReport {
+        schema_version: SetupSchemaVersion::V1,
+        host: host.to_string(),
+        dry_run,
+        status: "planned".to_string(),
+        setup_mode: setup_mode.to_string(),
+        service_persistent,
+        service_scope: if service_persistent {
+            "user".to_string()
+        } else {
+            "on_demand".to_string()
+        },
+        fallback_reason: None,
+        target_platform: None,
+        host_artifact: None,
+        service_plan: None,
+        current_daemon_paths: None,
+        planned_daemon_paths: None,
+        setup_components,
+        planned_actions: Vec::new(),
+        applied_actions: Vec::new(),
+        required_input: Vec::new(),
+        recovery_commands: Vec::new(),
+        readiness_summary: SetupReadinessSummary {
+            transport: "not_checked".to_string(),
+            host_daemon: "not_checked".to_string(),
+            codex_runtime: "not_checked".to_string(),
+            native_computer_use: "not_checked".to_string(),
+            provider_auth: "not_checked".to_string(),
+        },
+        daemon_path_overrides: Vec::new(),
+        mutated: false,
+        native_computer_use_readiness: "not_checked".to_string(),
+        next_command: "satelle doctor --scope computer-use --refresh --json".to_string(),
+    }
+}
+
+fn resolve_setup_desktop_selection(
+    report: &HostSessionsReport,
+    host_config: &HostConfig,
+    interactive: bool,
+    authenticated_bootstrap_user: Option<&str>,
+) -> Result<Option<PendingSetupDesktopSelection>, SatelleError> {
+    let mut policy = DesktopSelectionPolicy::from_host_config(host_config);
+    if policy.desktop_user.is_none()
+        && let Some(authenticated_user) = authenticated_bootstrap_user
+    {
+        let bootstrap_policy = DesktopSelectionPolicy {
+            desktop_user: Some(authenticated_user.to_string()),
+            preference: None,
+            native_selector: None,
+        };
+        match resolve_desktop_session(report, &bootstrap_policy) {
+            Ok(_) => policy.desktop_user = bootstrap_policy.desktop_user,
+            Err(error) if error.code == ErrorCode::DesktopSessionAmbiguous => {
+                policy.desktop_user = bootstrap_policy.desktop_user;
+            }
+            Err(_) => {}
+        }
+    }
+
+    loop {
+        match resolve_desktop_session(report, &policy) {
+            Ok(session) => {
+                if policy.native_selector.is_some() {
+                    return Ok(None);
+                }
+                let preference = policy
+                    .preference
+                    .clone()
+                    .unwrap_or(DesktopSessionPreference::Only);
+                let selection = PendingSetupDesktopSelection {
+                    desktop_user: session.desktop_user.clone(),
+                    preference,
+                };
+                if host_config.desktop_user.as_deref() == Some(selection.desktop_user.as_str())
+                    && host_config.desktop_session_preference.as_ref()
+                        == Some(&selection.preference)
+                {
+                    return Ok(None);
+                }
+                return Ok(Some(selection));
+            }
+            Err(error) if error.code == ErrorCode::DesktopBindingRequired && interactive => {
+                let candidates = error
+                    .details
+                    .get("candidate_desktop_users")
+                    .and_then(serde_json::Value::as_array)
+                    .expect("the desktop-binding-required contract contains candidates")
+                    .iter()
+                    .map(|candidate| {
+                        candidate
+                            .as_str()
+                            .expect("candidate desktop users are strings")
+                            .to_string()
+                    })
+                    .collect::<Vec<_>>();
+                let mut prompt = cliclack::select("Choose the Desktop Binding for this Host");
+                for candidate in candidates {
+                    prompt = prompt.item(
+                        candidate.clone(),
+                        candidate,
+                        "active compatible desktop user",
+                    );
+                }
+                policy.desktop_user = Some(prompt.interact().map_err(|source| {
+                    SatelleError::invalid_usage(format!(
+                        "could not read Desktop Binding selection: {source}"
+                    ))
+                })?);
+            }
+            Err(error) if error.code == ErrorCode::DesktopSessionAmbiguous && interactive => {
+                let desktop_user = policy
+                    .desktop_user
+                    .clone()
+                    .or_else(|| {
+                        error
+                            .details
+                            .get("desktop_user")
+                            .and_then(serde_json::Value::as_str)
+                            .map(str::to_string)
+                    })
+                    .expect("desktop-session-ambiguous identifies its Desktop Binding");
+                let console_policy = DesktopSelectionPolicy {
+                    desktop_user: Some(desktop_user),
+                    preference: Some(DesktopSessionPreference::Console),
+                    native_selector: None,
+                };
+                if resolve_desktop_session(report, &console_policy).is_err() {
+                    return Err(error);
+                }
+                policy = console_policy;
+                policy.preference = Some(
+                    cliclack::select("Choose the Desktop Session Preference")
+                        .item(
+                            DesktopSessionPreference::Console,
+                            "console",
+                            "the compatible physical console session",
+                        )
+                        .interact()
+                        .map_err(|source| {
+                            SatelleError::invalid_usage(format!(
+                                "could not read Desktop Session Preference selection: {source}"
+                            ))
+                        })?,
+                );
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
 fn run_setup(
     command: SetupCommand,
     style: HumanStyle,
@@ -1830,6 +2069,9 @@ fn run_setup(
     let first_ssh_trust = host.config.transport == satelle_core::TransportKind::Ssh
         && (host.config.expected_host_id.is_none() || path_rebind);
     let setup_components = setup_components(&command.component).map_err(failure)?;
+    let ssh_transport = host.config.transport == satelle_core::TransportKind::Ssh;
+    let (host_setup_components, desktop_setup) =
+        partition_setup_components(&setup_components, ssh_transport, path_rebind);
     let explicit_provider_auth = command
         .component
         .iter()
@@ -1857,10 +2099,12 @@ fn run_setup(
         .to_string();
     let tailscale_serve_setup = command.component.as_slice() == [SetupComponent::Transport]
         && tailscale_serve::applies_to(&host.config);
-    let mut transport = if tailscale_serve_setup {
+    let host_setup_required = !host_setup_components.is_empty();
+    let interactive_selection = !command.no_input && !json && io::stdin().is_terminal();
+    let mut transport = if tailscale_serve_setup || !host_setup_required {
         None
     } else {
-        Some(transport_for_setup(&host)?)
+        setup_transport_if_required(host_setup_required, || transport_for_setup(&host))?
     };
     let mut report = if tailscale_serve_setup {
         tailscale_serve::configure(
@@ -1872,22 +2116,60 @@ fn run_setup(
         )
         .map_err(failure)?
     } else {
-        transport
-            .as_ref()
-            .expect("ordinary setup transport is present")
-            .setup(
-                true,
-                setup_mode_selection,
-                setup_components.clone(),
-                daemon_path_overrides.clone(),
-            )
-            .map_err(failure)?
+        run_host_setup_if_required(
+            host_setup_required,
+            || cli_owned_setup_report(&host.alias, true, &setup_mode, setup_components.clone()),
+            || {
+                transport
+                    .as_ref()
+                    .expect("Host-owned setup transport is present")
+                    .setup(
+                        true,
+                        setup_mode_selection,
+                        host_setup_components.clone(),
+                        daemon_path_overrides.clone(),
+                    )
+            },
+        )
+        .map_err(failure)?
     };
+    report.setup_components.clone_from(&setup_components);
     if let Some(decision) = &local_service_decision {
         apply_service_decision_to_report(&mut report, decision);
     }
     report.dry_run = command.dry_run;
     add_setup_required_inputs(&mut report, &host.config, explicit_provider_auth);
+    let mut desktop_selection = None;
+    if desktop_setup
+        && !command.dry_run
+        && report.required_input.is_empty()
+        && (host.config.transport != satelle_core::TransportKind::Ssh || !first_ssh_trust)
+    {
+        let authenticated_bootstrap_user = (host.config.transport
+            == satelle_core::TransportKind::Ssh)
+            .then(|| authenticated_ssh_bootstrap_user(&host))
+            .transpose()
+            .map_err(failure)?;
+        let sessions = transport_for(&host)?.host_sessions(true).map_err(failure)?;
+        desktop_selection = resolve_setup_desktop_selection(
+            &sessions,
+            &host.config,
+            interactive_selection,
+            authenticated_bootstrap_user.as_deref(),
+        )
+        .map_err(failure)?;
+        if let Some(selection) = &desktop_selection {
+            report.planned_actions.push(selection.action(&host.alias));
+        }
+    } else if desktop_setup
+        && !command.dry_run
+        && report.required_input.is_empty()
+        && host.config.transport == satelle_core::TransportKind::Ssh
+    {
+        report.planned_actions.push(
+            "inspect compatible desktop sessions through the authenticated Host Daemon".to_string(),
+        );
+    }
 
     if !command.dry_run && report.required_input.is_empty() {
         if !command.yes && (command.no_input || json || !io::stdin().is_terminal()) {
@@ -1934,45 +2216,131 @@ fn run_setup(
             }
         }
 
-        if first_ssh_trust {
-            if !trust_first_ssh_host_during_setup(
+        let first_ssh_discovery = if first_ssh_trust {
+            let Some(discovery) = trust_first_ssh_host_during_setup(
                 &command,
                 json,
                 &user_config_path,
                 &daemon_path_overrides,
                 &mut host,
-            )? {
+            )?
+            else {
                 println!("No changes applied.");
                 return Ok(());
-            }
-            transport = Some(transport_for_setup(&host)?);
-        }
-
-        report = if tailscale_serve_setup {
-            tailscale_serve::configure(
-                &host.alias,
-                &host.config,
-                &daemon_path_overrides,
-                false,
-                &setup_mode,
-            )
-            .map_err(failure)?
+            };
+            transport =
+                setup_transport_if_required(host_setup_required, || transport_for_setup(&host))?;
+            Some(discovery)
         } else {
-            transport
-                .as_ref()
-                .expect("ordinary setup transport is present")
-                .setup(
-                    false,
-                    setup_mode_selection,
-                    setup_components,
-                    daemon_path_overrides,
-                )
-                .map_err(failure)?
+            None
         };
+
+        let desktop_preflight = (|| {
+            if desktop_setup
+                && report.required_input.is_empty()
+                && let Some(discovery) = &first_ssh_discovery
+            {
+                desktop_selection = resolve_setup_desktop_selection(
+                    &discovery.sessions,
+                    &host.config,
+                    interactive_selection,
+                    Some(&discovery.authenticated_user),
+                )
+                .map_err(failure)?;
+            }
+            if let Some(selection) = &desktop_selection {
+                let action = selection.action(&host.alias);
+                if !report.planned_actions.contains(&action) {
+                    report.planned_actions.push(action.clone());
+                }
+                if !command.yes {
+                    println!("Plan: {action}");
+                    let confirmed = cliclack::confirm("Save this desktop selection?")
+                        .initial_value(false)
+                        .interact()
+                        .map_err(|source| {
+                            failure(SatelleError::invalid_usage(format!(
+                                "could not read desktop selection confirmation: {source}"
+                            )))
+                        })?;
+                    if !confirmed {
+                        return Err(failure(SatelleError::input_required(
+                            "desktop selection was not saved",
+                        )));
+                    }
+                }
+            }
+            Ok(())
+        })();
+
+        let mut persisted_desktop_action = None;
+        report = run_host_setup_after_desktop_preflight(
+            desktop_preflight,
+            &mut host.config,
+            |host_config| {
+                if let Some(selection) = &desktop_selection {
+                    persist_desktop_selection(
+                        &user_config_path,
+                        &host.alias,
+                        &selection.desktop_user,
+                        Some(&selection.preference),
+                    )
+                    .map_err(failure)?;
+                    host_config.desktop_user = Some(selection.desktop_user.clone());
+                    host_config.desktop_session_preference = Some(selection.preference.clone());
+                    host_config.desktop_session_native_selector = None;
+                    persisted_desktop_action = Some(selection.action(&host.alias));
+                }
+                Ok(())
+            },
+            |host_config| {
+                if tailscale_serve_setup {
+                    tailscale_serve::configure(
+                        &host.alias,
+                        host_config,
+                        &daemon_path_overrides,
+                        false,
+                        &setup_mode,
+                    )
+                    .map_err(failure)
+                } else {
+                    run_host_setup_if_required(
+                        host_setup_required,
+                        || {
+                            report.dry_run = false;
+                            report
+                        },
+                        || {
+                            transport
+                                .as_ref()
+                                .expect("Host-owned setup transport is present")
+                                .setup(
+                                    false,
+                                    setup_mode_selection,
+                                    host_setup_components,
+                                    daemon_path_overrides,
+                                )
+                        },
+                    )
+                    .map_err(failure)
+                }
+            },
+        )?;
+        report.setup_components.clone_from(&setup_components);
         if let Some(decision) = &local_service_decision {
             apply_service_decision_to_report(&mut report, decision);
         }
         add_setup_required_inputs(&mut report, &host.config, explicit_provider_auth);
+        if let Some(action) = persisted_desktop_action {
+            if !report.planned_actions.contains(&action) {
+                report.planned_actions.push(action.clone());
+            }
+            report.applied_actions.push(action);
+            report.mutated = true;
+            if report.status == "planned" {
+                report.status = "applied".to_string();
+            }
+        }
         if first_ssh_trust {
             report.planned_actions.insert(
                 0,
@@ -2012,10 +2380,10 @@ fn trust_first_ssh_host_during_setup(
     user_config_path: &Path,
     daemon_path_overrides: &DaemonPathOverrides,
     host: &mut SelectedHost,
-) -> Result<bool, CliFailure> {
-    let observed_identity =
-        discover_ssh_host_identity(host, daemon_path_overrides).map_err(failure)?;
-    HostIdentityRef::new(&observed_identity).map_err(|_| {
+) -> Result<Option<SshHostDiscovery>, CliFailure> {
+    let discovery = discover_ssh_host(host, daemon_path_overrides).map_err(failure)?;
+    let observed_identity = &discovery.identity;
+    HostIdentityRef::new(observed_identity.clone()).map_err(|_| {
         failure(SatelleError::remote_api_error(
             &host.alias,
             "invalid-daemon-response",
@@ -2029,7 +2397,7 @@ fn trust_first_ssh_host_during_setup(
         return Err(failure(SatelleError::host_identity_mismatch(&host.alias)));
     }
     if host.config.expected_host_id.as_deref() == Some(observed_identity.as_str()) {
-        return Ok(true);
+        return Ok(Some(discovery));
     }
 
     let noninteractive = command.no_input || json || !io::stdin().is_terminal();
@@ -2069,13 +2437,13 @@ fn trust_first_ssh_host_during_setup(
                 )))
             })?;
         if !confirmed {
-            return Ok(false);
+            return Ok(None);
         }
     }
 
-    persist_host_identity(user_config_path, &host.alias, &observed_identity).map_err(failure)?;
-    host.config.expected_host_id = Some(observed_identity);
-    Ok(true)
+    persist_host_identity(user_config_path, &host.alias, observed_identity).map_err(failure)?;
+    host.config.expected_host_id = Some(observed_identity.clone());
+    Ok(Some(discovery))
 }
 
 fn add_setup_required_inputs(
@@ -5429,42 +5797,36 @@ fn apply_current_desktop_selection(report: &mut HostSessionsReport, host: &HostC
         session.selected_by_current_config = false;
     }
 
-    let native_selector = host
-        .desktop_session_native_selector
-        .as_ref()
-        .map(|selector| format!("{}:{}:{}", selector.platform, selector.kind, selector.value));
-    let selected_index = {
-        let mut matches = report
+    let policy = DesktopSelectionPolicy::from_host_config(host);
+    if let Ok(selected) = resolve_desktop_session(report, &policy) {
+        let selected_id = selected.session_id.clone();
+        if let Some(session) = report
             .sessions
-            .iter()
-            .enumerate()
-            .filter(|(_, session)| {
-                host.desktop_user
-                    .as_deref()
-                    .is_none_or(|user| user == session.desktop_user)
-            })
-            .filter(|(_, session)| {
-                if let Some(selector) = &native_selector {
-                    session.native_selectors.contains(selector)
-                } else {
-                    match host.desktop_session_preference {
-                        Some(DesktopSessionPreference::Console) => session.is_console,
-                        Some(DesktopSessionPreference::Only) | None => true,
-                    }
-                }
-            })
-            .map(|(index, _)| index);
-        let first = matches.next();
-        if matches.next().is_some() {
-            None
-        } else {
-            first
+            .iter_mut()
+            .find(|session| session.session_id == selected_id)
+        {
+            session.selected_by_current_config = true;
         }
-    };
-
-    if let Some(index) = selected_index {
-        report.sessions[index].selected_by_current_config = true;
     }
+}
+
+fn resolve_execution_desktop(
+    transport: &dyn transport::TransportClient,
+    host: &SelectedHost,
+) -> Result<(), CliFailure> {
+    let policy = DesktopSelectionPolicy::from_host_config(&host.config);
+    if !desktop_policy_is_active(&policy) {
+        return Ok(());
+    }
+
+    let report = transport.host_sessions(true).map_err(failure)?;
+    resolve_desktop_session(&report, &policy)
+        .map(|_| ())
+        .map_err(failure)
+}
+
+fn desktop_policy_is_active(policy: &DesktopSelectionPolicy) -> bool {
+    policy.desktop_user.is_some() || policy.preference.is_some() || policy.native_selector.is_some()
 }
 
 fn run_host_update(command: HostUpdateCommand) -> Result<(), CliFailure> {
@@ -5775,6 +6137,11 @@ fn run_prompt(
             return Err(transport_failure);
         }
     };
+    report_not_admitted(
+        &mut event_output,
+        Some(&host.alias),
+        resolve_execution_desktop(transport.as_ref(), &host),
+    )?;
     let turn_execution_timeout_ms = report_not_admitted(
         &mut event_output,
         explicit_host_alias,
@@ -5924,6 +6291,11 @@ fn steer_prompt(
             return Err(transport_failure);
         }
     };
+    report_not_admitted(
+        &mut event_output,
+        Some(&host.alias),
+        resolve_execution_desktop(transport.as_ref(), &host),
+    )?;
     let turn_execution_timeout_ms = report_not_admitted(
         &mut event_output,
         explicit_host_alias,
@@ -6514,6 +6886,266 @@ fn failure_for_admitted_session(error: SatelleError, session_id: &SessionId) -> 
     CliFailure {
         error,
         history_session_id: Some(Box::new(session_id.clone())),
+    }
+}
+
+#[cfg(test)]
+mod setup_desktop_binding_tests {
+    use super::*;
+    use satelle_core::{DesktopSessionRecord, HostSessionsSchemaVersion};
+
+    fn host_config() -> HostConfig {
+        toml::from_str("transport = \"local\"\nadapter = \"fake\"\n")
+            .expect("test Host Binding should parse")
+    }
+
+    fn session(id: &str, user: &str, is_console: bool) -> DesktopSessionRecord {
+        DesktopSessionRecord {
+            session_id: id.to_string(),
+            desktop_user: user.to_string(),
+            state: "active".to_string(),
+            session_kind: "visible_desktop".to_string(),
+            is_console,
+            is_remote: !is_console,
+            display_summary: id.to_string(),
+            portable_selectors: vec!["active".to_string()],
+            native_selectors: Vec::new(),
+            selected_by_current_config: false,
+        }
+    }
+
+    fn report(sessions: Vec<DesktopSessionRecord>) -> HostSessionsReport {
+        HostSessionsReport {
+            schema_version: HostSessionsSchemaVersion::V1,
+            host: "setup-test".to_string(),
+            detected_platform: "windows".to_string(),
+            connection_mode: "direct".to_string(),
+            bootstrapped: false,
+            bootstrap_actions: Vec::new(),
+            host_daemon_version: "test".to_string(),
+            sessions,
+        }
+    }
+
+    #[test]
+    fn deterministic_session_persists_concrete_binding_and_only_preference() {
+        let selection = resolve_setup_desktop_selection(
+            &report(vec![session("console", "alice", true)]),
+            &host_config(),
+            false,
+            None,
+        )
+        .expect("one compatible session should resolve")
+        .expect("the inferred selection must be persisted");
+
+        assert_eq!(selection.desktop_user, "alice");
+        assert_eq!(selection.preference, DesktopSessionPreference::Only);
+    }
+
+    #[test]
+    fn noninteractive_setup_preserves_binding_and_session_ambiguity() {
+        let binding_error = resolve_setup_desktop_selection(
+            &report(vec![
+                session("alice-console", "alice", true),
+                session("bob-console", "bob", true),
+            ]),
+            &host_config(),
+            false,
+            None,
+        )
+        .expect_err("multiple users require a Desktop Binding");
+        assert_eq!(binding_error.code, ErrorCode::DesktopBindingRequired);
+
+        let session_error = resolve_setup_desktop_selection(
+            &report(vec![
+                session("alice-console", "alice", true),
+                session("alice-remote", "alice", false),
+            ]),
+            &host_config(),
+            false,
+            None,
+        )
+        .expect_err("multiple sessions require a Desktop Session Preference");
+        assert_eq!(session_error.code, ErrorCode::DesktopSessionAmbiguous);
+    }
+
+    #[test]
+    fn unavailable_configured_binding_is_not_rewritten() {
+        let mut config = host_config();
+        config.desktop_user = Some("missing".to_string());
+        let error = resolve_setup_desktop_selection(
+            &report(vec![session("console", "alice", true)]),
+            &config,
+            false,
+            None,
+        )
+        .expect_err("a missing configured user must fail");
+
+        assert_eq!(error.code, ErrorCode::DesktopSessionUnavailable);
+        assert_eq!(config.desktop_user.as_deref(), Some("missing"));
+    }
+
+    #[test]
+    fn authenticated_ssh_user_is_the_default_among_multiple_desktop_users() {
+        let selection = resolve_setup_desktop_selection(
+            &report(vec![
+                session("alice-console", "alice", true),
+                session("alias-console", "alias-resolved-user", true),
+            ]),
+            &host_config(),
+            false,
+            Some("alias-resolved-user"),
+        )
+        .expect("the authenticated SSH user should resolve")
+        .expect("the authenticated SSH default should be persisted");
+
+        assert_eq!(selection.desktop_user, "alias-resolved-user");
+        assert_eq!(selection.preference, DesktopSessionPreference::Only);
+    }
+
+    #[test]
+    fn setup_component_partition_preserves_cli_and_host_ownership() {
+        assert_eq!(
+            partition_setup_components(&["desktop".to_string()], true, false),
+            (Vec::new(), true)
+        );
+        assert_eq!(
+            partition_setup_components(&["all".to_string()], false, false),
+            (vec!["all".to_string()], true)
+        );
+        assert_eq!(
+            partition_setup_components(&["all".to_string()], false, true),
+            (vec!["all".to_string()], true)
+        );
+    }
+
+    #[test]
+    fn ssh_all_and_path_rebind_normalize_to_the_transport_subplan() {
+        assert_eq!(
+            partition_setup_components(&["all".to_string()], true, false),
+            (vec!["transport".to_string()], true)
+        );
+        assert_eq!(
+            partition_setup_components(&["desktop".to_string()], true, true),
+            (vec!["transport".to_string()], true)
+        );
+    }
+
+    #[test]
+    fn execution_desktop_probe_requires_an_explicit_policy() {
+        let mut config = host_config();
+        assert!(!desktop_policy_is_active(
+            &DesktopSelectionPolicy::from_host_config(&config)
+        ));
+
+        config.desktop_user = Some("operator".to_string());
+        assert!(desktop_policy_is_active(
+            &DesktopSelectionPolicy::from_host_config(&config)
+        ));
+
+        config.desktop_user = None;
+        config.desktop_session_preference = Some(DesktopSessionPreference::Only);
+        assert!(desktop_policy_is_active(
+            &DesktopSelectionPolicy::from_host_config(&config)
+        ));
+
+        config.desktop_session_preference = None;
+        config.desktop_session_native_selector = Some(satelle_core::DesktopSessionNativeSelector {
+            platform: "windows".to_string(),
+            kind: "wts-session".to_string(),
+            value: "7".to_string(),
+        });
+        assert!(desktop_policy_is_active(
+            &DesktopSelectionPolicy::from_host_config(&config)
+        ));
+    }
+
+    #[test]
+    fn empty_ssh_desktop_subplan_never_constructs_or_calls_host_mutation() {
+        let (host_components, desktop_selected) =
+            partition_setup_components(&["desktop".to_string()], true, false);
+        let host_setup_required = !host_components.is_empty();
+        let constructed = std::cell::Cell::new(false);
+        let transport = setup_transport_if_required(host_setup_required, || {
+            constructed.set(true);
+            Ok::<_, CliFailure>("SSH setup transport")
+        })
+        .unwrap_or_else(|_| panic!("skipping transport construction cannot fail"));
+        let called = std::cell::Cell::new(false);
+        let result = run_host_setup_if_required(
+            host_setup_required,
+            || "cli-owned",
+            || {
+                called.set(true);
+                Ok("host-owned")
+            },
+        )
+        .expect("an empty Host subplan should use the CLI-owned result");
+
+        assert_eq!(result, "cli-owned");
+        assert!(desktop_selected);
+        assert!(transport.is_none());
+        assert!(!constructed.get());
+        assert!(!called.get());
+    }
+
+    #[test]
+    fn failed_desktop_preflight_blocks_host_mutation() {
+        let called = std::cell::Cell::new(false);
+        let mut setup_config = ();
+        let result = run_host_setup_after_desktop_preflight(
+            Err(failure(SatelleError::invalid_usage(
+                "desktop preflight failed",
+            ))),
+            &mut setup_config,
+            |_| Ok(()),
+            |_| {
+                called.set(true);
+                Ok(())
+            },
+        );
+
+        assert!(result.is_err());
+        assert!(!called.get());
+    }
+
+    #[test]
+    fn desktop_persistence_precedes_host_apply_and_failure_blocks_it() {
+        let events = std::cell::RefCell::new(Vec::new());
+        let mut setup_config = ();
+        run_host_setup_after_desktop_preflight(
+            Ok(()),
+            &mut setup_config,
+            |_| {
+                events.borrow_mut().push("persist");
+                Ok(())
+            },
+            |_| {
+                events.borrow_mut().push("host");
+                Ok(())
+            },
+        )
+        .unwrap_or_else(|_| panic!("successful desktop persistence should permit Host apply"));
+        assert_eq!(*events.borrow(), ["persist", "host"]);
+
+        let host_called = std::cell::Cell::new(false);
+        let mut setup_config = ();
+        let result = run_host_setup_after_desktop_preflight(
+            Ok(()),
+            &mut setup_config,
+            |_| {
+                Err(failure(SatelleError::config_error(
+                    "desktop selection was not persisted",
+                    None,
+                )))
+            },
+            |_| {
+                host_called.set(true);
+                Ok(())
+            },
+        );
+        assert!(result.is_err());
+        assert!(!host_called.get());
     }
 }
 

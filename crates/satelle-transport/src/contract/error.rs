@@ -25,6 +25,13 @@ pub enum ApiErrorCode {
     IncompatibleProtocol,
     IncompatibleControlPlane,
     ComputerUseNotReady,
+    DesktopBindingRequired,
+    DesktopSessionUnavailable,
+    DesktopSessionAmbiguous,
+    DesktopSessionPreferenceUnmatched,
+    DesktopSessionConsoleUnavailable,
+    DesktopSessionNativeSelectorWrongPlatform,
+    DesktopSessionNativeSelectorUnmatched,
     NativeReadinessTimeout,
     ProviderSmokeTestTimeout,
     UnsupportedProviderComputerUse,
@@ -59,6 +66,17 @@ impl ApiErrorCode {
             Self::IncompatibleProtocol => "incompatible-protocol",
             Self::IncompatibleControlPlane => "incompatible-control-plane",
             Self::ComputerUseNotReady => "computer-use-not-ready",
+            Self::DesktopBindingRequired => "desktop-binding-required",
+            Self::DesktopSessionUnavailable => "desktop-session-unavailable",
+            Self::DesktopSessionAmbiguous => "desktop-session-ambiguous",
+            Self::DesktopSessionPreferenceUnmatched => "desktop-session-preference-unmatched",
+            Self::DesktopSessionConsoleUnavailable => "desktop-session-console-unavailable",
+            Self::DesktopSessionNativeSelectorWrongPlatform => {
+                "desktop-session-native-selector-wrong-platform"
+            }
+            Self::DesktopSessionNativeSelectorUnmatched => {
+                "desktop-session-native-selector-unmatched"
+            }
             Self::NativeReadinessTimeout => "native-readiness-timeout",
             Self::ProviderSmokeTestTimeout => "provider-smoke-test-timeout",
             Self::UnsupportedProviderComputerUse => "unsupported-provider-computer-use",
@@ -118,6 +136,43 @@ mod tests {
             serde_json::to_value(ApiErrorCode::NativeReadinessTimeout).unwrap(),
             json!("native-readiness-timeout")
         );
+    }
+
+    #[test]
+    fn desktop_selection_codes_have_exact_public_tokens() {
+        for (code, token) in [
+            (
+                ApiErrorCode::DesktopBindingRequired,
+                "desktop-binding-required",
+            ),
+            (
+                ApiErrorCode::DesktopSessionUnavailable,
+                "desktop-session-unavailable",
+            ),
+            (
+                ApiErrorCode::DesktopSessionAmbiguous,
+                "desktop-session-ambiguous",
+            ),
+            (
+                ApiErrorCode::DesktopSessionPreferenceUnmatched,
+                "desktop-session-preference-unmatched",
+            ),
+            (
+                ApiErrorCode::DesktopSessionConsoleUnavailable,
+                "desktop-session-console-unavailable",
+            ),
+            (
+                ApiErrorCode::DesktopSessionNativeSelectorWrongPlatform,
+                "desktop-session-native-selector-wrong-platform",
+            ),
+            (
+                ApiErrorCode::DesktopSessionNativeSelectorUnmatched,
+                "desktop-session-native-selector-unmatched",
+            ),
+        ] {
+            assert_eq!(code.as_str(), token);
+            assert_eq!(serde_json::to_value(code).unwrap(), json!(token));
+        }
     }
 
     #[test]

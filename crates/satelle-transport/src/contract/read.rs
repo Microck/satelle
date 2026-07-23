@@ -92,6 +92,15 @@ impl PlatformOs {
             Self::Other
         }
     }
+
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Linux => "linux",
+            Self::Macos => "macos",
+            Self::Windows => "windows",
+            Self::Other => "other",
+        }
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -280,6 +289,10 @@ impl CapabilitiesResponse {
 
     pub fn daemon_version(&self) -> &str {
         &self.daemon_version
+    }
+
+    pub const fn platform(&self) -> &'static str {
+        self.platform.os.as_str()
     }
 
     pub const fn request_id(&self) -> &RequestId {

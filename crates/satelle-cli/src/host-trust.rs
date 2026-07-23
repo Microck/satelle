@@ -1,4 +1,6 @@
-use satelle_core::{ErrorCode, SatelleError, read_owner_controlled_config_file};
+use satelle_core::{
+    DesktopSessionPreference, ErrorCode, SatelleError, read_owner_controlled_config_file,
+};
 use serde::Serialize;
 use std::fs;
 #[cfg(unix)]
@@ -106,6 +108,72 @@ pub(crate) fn persist_host_identity(
         return Ok(false);
     }
     host.insert("expected_host_id", value(observed_identity));
+    persist_config(config_path, document.to_string().as_bytes())?;
+    Ok(true)
+}
+
+pub(crate) fn persist_desktop_selection(
+    config_path: &Path,
+    host_alias: &str,
+    desktop_user: &str,
+    preference: Option<&DesktopSessionPreference>,
+) -> Result<bool, SatelleError> {
+    let original = read_owner_controlled_config_file(config_path).map_err(|error| {
+        trust_config_error(
+            config_path,
+            "could not read the user configuration securely",
+            Some(error.to_string()),
+        )
+    })?;
+    let mut document = original.parse::<DocumentMut>().map_err(|error| {
+        trust_config_error(
+            config_path,
+            "could not parse the user configuration for desktop selection",
+            Some(error.to_string()),
+        )
+    })?;
+    let hosts = document
+        .get_mut("hosts")
+        .and_then(toml_edit::Item::as_table_like_mut)
+        .ok_or_else(|| {
+            trust_config_error(
+                config_path,
+                "the user configuration does not contain a hosts table",
+                None,
+            )
+        })?;
+    let host = hosts
+        .get_mut(host_alias)
+        .and_then(toml_edit::Item::as_table_like_mut)
+        .ok_or_else(|| {
+            trust_config_error(
+                config_path,
+                &format!("the user configuration does not contain Host Binding {host_alias}"),
+                None,
+            )
+        })?;
+    let preference = preference.map(|value| match value {
+        DesktopSessionPreference::Only => "only",
+        DesktopSessionPreference::Console => "console",
+    });
+    let unchanged = host.get("desktop_user").and_then(toml_edit::Item::as_str)
+        == Some(desktop_user)
+        && host
+            .get("desktop_session_preference")
+            .and_then(toml_edit::Item::as_str)
+            == preference
+        && host.get("desktop_session_native_selector").is_none();
+    if unchanged {
+        return Ok(false);
+    }
+
+    host.insert("desktop_user", value(desktop_user));
+    if let Some(preference) = preference {
+        host.insert("desktop_session_preference", value(preference));
+    } else {
+        host.remove("desktop_session_preference");
+    }
+    host.remove("desktop_session_native_selector");
     persist_config(config_path, document.to_string().as_bytes())?;
     Ok(true)
 }

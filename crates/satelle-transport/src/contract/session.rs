@@ -759,6 +759,26 @@ mod tests {
     }
 
     #[test]
+    fn mvp_turn_requests_cannot_route_across_desktop_bindings() {
+        for field in ["desktop_user", "desktop_binding", "desktop_session"] {
+            let mut request = serde_json::json!({
+                "schema_version": "satelle.api.v3",
+                "prompt": "private prompt",
+                "execution_mode": "standard"
+            });
+            request
+                .as_object_mut()
+                .expect("Turn request fixture is an object")
+                .insert(field.to_string(), serde_json::json!("someone-else"));
+
+            assert!(
+                serde_json::from_value::<TurnRequest>(request).is_err(),
+                "MVP Turn requests must not select {field}"
+            );
+        }
+    }
+
+    #[test]
     fn session_response_rejects_unknown_and_duplicate_envelope_fields() {
         serde_json::from_value::<SessionResponse>(starting_session_response())
             .expect("decode coherent Session response");

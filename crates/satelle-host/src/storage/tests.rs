@@ -42,7 +42,10 @@ fn policy() -> ExecutionPolicy {
     ExecutionPolicy::new(
         EffectiveModelRef::new("model-1").unwrap(),
         ProviderBindingRef::new("provider-1").unwrap(),
-        DesktopTarget::new(DesktopBindingRef::new("desktop-binding-1").unwrap()),
+        DesktopTarget::new(
+            DesktopBindingRef::new("desktop-binding-1").unwrap(),
+            "desktop-session-1",
+        ),
         ApprovalPolicy::OnRequest,
         SandboxPolicy::WorkspaceWrite,
         TimeoutPolicy::bounded_seconds(120).unwrap(),

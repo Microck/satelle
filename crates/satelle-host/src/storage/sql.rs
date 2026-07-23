@@ -257,13 +257,14 @@ pub(super) fn insert_turn(
     let policy = turn.execution_policy();
     transaction
         .execute(
-            "INSERT INTO turn_policies (turn_id, effective_model_ref, provider_binding_ref, desktop_binding_ref, approval_policy, sandbox_policy, timeout_seconds, computer_use_enabled, provider_computer_use_enabled) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            "INSERT INTO turn_policies (turn_id, effective_model_ref, provider_binding_ref, desktop_binding_ref, desktop_session_id, approval_policy, sandbox_policy, timeout_seconds, computer_use_enabled, provider_computer_use_enabled) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
             params![
                 turn.id().as_str(),
                 policy.effective_model().as_str(),
                 policy.provider_binding().as_str(),
                 policy.desktop_target().binding().as_str(),
+                policy.desktop_target().session_id(),
                 approval_policy_token(policy.approval_policy()),
                 sandbox_policy_token(policy.sandbox_policy()),
                 i64::from(policy.timeout_policy().seconds()),

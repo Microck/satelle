@@ -1556,7 +1556,7 @@ fn readiness_key(desktop_binding: &str) -> ReadinessCacheKey {
     let policy = ExecutionPolicy::new(
         EffectiveModelRef::new("computer-use-preview").unwrap(),
         ProviderBindingRef::new("openai").unwrap(),
-        DesktopTarget::new(desktop.clone()),
+        DesktopTarget::new(desktop.clone(), "readiness-key-desktop-session"),
         ApprovalPolicy::OnRequest,
         SandboxPolicy::WorkspaceWrite,
         TimeoutPolicy::bounded_seconds(120).unwrap(),
@@ -1873,7 +1873,7 @@ fn readiness_and_provider_results_round_trip_without_raw_evidence() {
     let policy = ExecutionPolicy::new(
         EffectiveModelRef::new("computer-use-preview").unwrap(),
         ProviderBindingRef::new("openai").unwrap(),
-        DesktopTarget::new(desktop.clone()),
+        DesktopTarget::new(desktop.clone(), "operational-desktop-session"),
         ApprovalPolicy::OnRequest,
         SandboxPolicy::WorkspaceWrite,
         TimeoutPolicy::bounded_seconds(120).unwrap(),

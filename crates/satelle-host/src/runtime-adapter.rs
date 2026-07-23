@@ -762,7 +762,7 @@ mod evidence_tests {
         ExecutionPolicy::new(
             EffectiveModelRef::new("model-1").unwrap(),
             ProviderBindingRef::new("provider-1").unwrap(),
-            DesktopTarget::new(desktop),
+            DesktopTarget::new(desktop, "adapter-test-desktop-session"),
             ApprovalPolicy::OnRequest,
             SandboxPolicy::WorkspaceWrite,
             TimeoutPolicy::bounded_seconds(120).unwrap(),

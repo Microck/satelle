@@ -204,6 +204,12 @@ fn error_contract(code: ErrorCode) -> ErrorContract {
         ErrorCode::IncompatibleControlPlane
         | ErrorCode::ComputerUseNotReady
         | ErrorCode::UnsupportedProviderComputerUse
+        | ErrorCode::DesktopSessionUnavailable
+        | ErrorCode::DesktopSessionAmbiguous
+        | ErrorCode::DesktopSessionPreferenceUnmatched
+        | ErrorCode::DesktopSessionConsoleUnavailable
+        | ErrorCode::DesktopSessionNativeSelectorWrongPlatform
+        | ErrorCode::DesktopSessionNativeSelectorUnmatched
         | ErrorCode::DoctorReadinessBlockersFound => ErrorContract {
             category: ErrorCategory::Readiness,
             retryable: false,
@@ -274,6 +280,7 @@ fn error_contract(code: ErrorCode) -> ErrorContract {
         | ErrorCode::PersistentServiceUnsupported
         | ErrorCode::SetupConsentRequired
         | ErrorCode::DoctorFixConsentRequired
+        | ErrorCode::DesktopBindingRequired
         | ErrorCode::DoctorRefreshScopeRequired
         | ErrorCode::DoctorRefreshTimeoutWithoutRefresh
         | ErrorCode::InputRequired => ErrorContract {

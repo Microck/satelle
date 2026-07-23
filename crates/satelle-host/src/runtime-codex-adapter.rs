@@ -17,7 +17,10 @@ use satelle_core::session::{
     ExperimentalFeatureChoices, FeatureChoice, ProviderBindingRef, SandboxPolicy, StopObservation,
     TimeoutPolicy, TurnExecutionMode, TurnState, TurnTransition,
 };
-use satelle_core::{ControlPlaneOperation, ErrorCode, SatelleError};
+use satelle_core::{
+    ControlPlaneOperation, DesktopSelectionPolicy, ErrorCode, SatelleError,
+    resolve_desktop_session_for,
+};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::cell::RefCell;
@@ -83,6 +86,16 @@ pub(crate) struct ProductionComputerUseAdapter {
     provider_smoke_timeout: Duration,
     provider_smoke_success_ttl: time::Duration,
     provider_smoke_failure_ttl: time::Duration,
+    desktop_selection: DesktopSelectionPolicy,
+}
+
+pub(crate) struct ProductionAdapterPolicy {
+    pub(crate) native_readiness_timeout: Duration,
+    pub(crate) native_readiness_ttl: time::Duration,
+    pub(crate) provider_smoke_timeout: Duration,
+    pub(crate) provider_smoke_success_ttl: time::Duration,
+    pub(crate) provider_smoke_failure_ttl: time::Duration,
+    pub(crate) desktop_selection: DesktopSelectionPolicy,
 }
 
 #[derive(Clone)]
@@ -126,27 +139,29 @@ impl ProductionComputerUseAdapter {
             provider_smoke_timeout: Duration::from_secs(120),
             provider_smoke_success_ttl: crate::DEFAULT_PROVIDER_SMOKE_SUCCESS_TTL,
             provider_smoke_failure_ttl: crate::DEFAULT_PROVIDER_SMOKE_FAILURE_TTL,
+            desktop_selection: DesktopSelectionPolicy {
+                desktop_user: None,
+                preference: None,
+                native_selector: None,
+            },
         }
     }
 
     pub(crate) fn with_readiness_policy(
         snapshot: Arc<RwLock<crate::ProductionCapabilitySnapshot>>,
         working_directory: Result<PathBuf, SatelleError>,
-        timeout: Duration,
-        ttl: time::Duration,
-        provider_smoke_timeout: Duration,
-        provider_smoke_success_ttl: time::Duration,
-        provider_smoke_failure_ttl: time::Duration,
+        policy: ProductionAdapterPolicy,
     ) -> Self {
         Self {
             snapshot,
             working_directory,
             active_execution: Arc::new(Mutex::new(None)),
-            native_readiness_timeout: timeout,
-            native_readiness_ttl: ttl,
-            provider_smoke_timeout,
-            provider_smoke_success_ttl,
-            provider_smoke_failure_ttl,
+            native_readiness_timeout: policy.native_readiness_timeout,
+            native_readiness_ttl: policy.native_readiness_ttl,
+            provider_smoke_timeout: policy.provider_smoke_timeout,
+            provider_smoke_success_ttl: policy.provider_smoke_success_ttl,
+            provider_smoke_failure_ttl: policy.provider_smoke_failure_ttl,
+            desktop_selection: policy.desktop_selection,
         }
     }
 
@@ -161,11 +176,10 @@ impl ProductionComputerUseAdapter {
         let version = supported_execution_version(&snapshot)?;
         drop(snapshot);
 
-        let desktop = crate::desktop_sessions::discover()?
-            .into_iter()
-            .next()
-            .ok_or_else(SatelleError::computer_use_not_ready)?;
-        let desktop_binding = DesktopBindingRef::new(desktop.session_id.clone())
+        let desktops = crate::desktop_sessions::discover()?;
+        let platform = crate::codex_capabilities::HostPlatform::current().as_str();
+        let desktop = resolve_desktop_session_for(platform, &desktops, &self.desktop_selection)?;
+        let desktop_binding = DesktopBindingRef::new(desktop.desktop_user.clone())
             .map_err(|_| adapter_failure("desktop_binding_invalid"))?;
         let effective_model = provider_intent
             .model()
@@ -180,7 +194,7 @@ impl ProductionComputerUseAdapter {
         let execution_policy = ExecutionPolicy::new(
             effective_model,
             provider_binding,
-            DesktopTarget::new(desktop_binding.clone()),
+            DesktopTarget::new(desktop_binding.clone(), desktop.session_id.clone()),
             ApprovalPolicy::OnRequest,
             SandboxPolicy::WorkspaceWrite,
             host_turn_timeout_ceiling()?,
@@ -517,9 +531,9 @@ impl ProductionComputerUseAdapter {
         .map_err(|_| adapter_failure("provider_smoke_evidence_invalid"))
     }
 
-    fn ensure_platform_admitted(&self) -> Result<(), SatelleError> {
+    fn resolve_configured_desktop_target(&self) -> Result<DesktopTarget, SatelleError> {
         self.native_readiness_key(&ProviderComputerUseIntent::host_default())
-            .map(|_| ())
+            .map(|key| key.execution_policy().desktop_target().clone())
     }
 
     fn register_execution(
@@ -1120,79 +1134,87 @@ impl ComputerUseAdapter for ProductionComputerUseAdapter {
     }
 
     fn execute(&self, request: ExecuteRequest<'_>) -> Result<ExecuteResult, SatelleError> {
-        self.ensure_platform_admitted()?;
         let policy = request.execution_policy();
-        let approval_policy = codex_approval_policy(policy.approval_policy())?;
-        let sandbox_policy = codex_sandbox_policy(policy.sandbox_policy());
-        let timeout = Duration::from_secs(u64::from(policy.timeout_policy().seconds()));
-        let deadline = Instant::now()
-            .checked_add(timeout)
-            .ok_or_else(|| adapter_failure("timeout_unrepresentable"))?;
-        let cancellation_deadline = deadline
-            .checked_add(READINESS_CANCELLATION_GRACE)
-            .unwrap_or(deadline);
-        let working_directory = self
-            .working_directory
-            .as_ref()
-            .map_err(Clone::clone)
-            .and_then(|path| prepare_working_directory(path))?;
-        let control = CodexSessionControl::new(cancellation_deadline);
-        let _active_execution = self.register_execution(request.subject(), control.clone())?;
-        tracing::debug!(
-            session_id = %request.subject().session_id(),
-            turn_id = %request.subject().turn_id(),
-            "starting Codex native Computer Use execution"
-        );
+        dispatch_with_configured_desktop_target(
+            policy,
+            || self.resolve_configured_desktop_target(),
+            || {
+                let approval_policy = codex_approval_policy(policy.approval_policy())?;
+                let sandbox_policy = codex_sandbox_policy(policy.sandbox_policy());
+                let timeout = Duration::from_secs(u64::from(policy.timeout_policy().seconds()));
+                let deadline = Instant::now()
+                    .checked_add(timeout)
+                    .ok_or_else(|| adapter_failure("timeout_unrepresentable"))?;
+                let cancellation_deadline = deadline
+                    .checked_add(READINESS_CANCELLATION_GRACE)
+                    .unwrap_or(deadline);
+                let working_directory = self
+                    .working_directory
+                    .as_ref()
+                    .map_err(Clone::clone)
+                    .and_then(|path| prepare_working_directory(path))?;
+                let control = CodexSessionControl::new(cancellation_deadline);
+                let _active_execution =
+                    self.register_execution(request.subject(), control.clone())?;
+                tracing::debug!(
+                    session_id = %request.subject().session_id(),
+                    turn_id = %request.subject().turn_id(),
+                    "starting Codex native Computer Use execution"
+                );
 
-        // Preserve the original storage failure outside the protocol layer so
-        // a private-reference conflict is not misclassified as transport I/O.
-        let persistence_error = RefCell::new(None);
-        let mut persist_thread_ref = |value: &str| {
-            request.persist_upstream_thread_ref(value).map_err(|error| {
-                *persistence_error.borrow_mut() = Some(error);
-            })
-        };
-        let mut persist_turn_ref = |value: &str| {
-            request.persist_upstream_turn_ref(value).map_err(|error| {
-                *persistence_error.borrow_mut() = Some(error);
-            })
-        };
-        let snapshot = crate::read_production_snapshot(&self.snapshot)?;
-        let goal_set_supported = snapshot.goal_set_supported();
-        let image_input_mode = snapshot.image_input_mode();
-        if !request.attachments().is_empty()
-            && matches!(
-                image_input_mode,
-                crate::codex_capabilities::CodexImageInputMode::Unsupported
-            )
-        {
-            return Err(SatelleError::invalid_usage(
-                "the selected Codex protocol does not support image input",
-            ));
-        }
-        let run = run_codex_session_with_timeout_cancellation(
-            preserve_managed_codex_error(crate::codex_capabilities::installed_app_server_command())?,
-            CodexSessionRequest {
-                working_directory: &working_directory,
-                prompt: request.prompt(),
-                existing_thread_ref: request.upstream_thread_ref(),
-                model: model_override(policy.effective_model().as_str()),
-                model_provider: provider_override(policy.provider_binding().as_str()),
-                execution_mode: request.execution_mode(),
-                approval_policy,
-                sandbox_policy,
-                deadline,
-                persist_thread_ref: &mut persist_thread_ref,
-                persist_turn_ref: &mut persist_turn_ref,
-                control: Some(control),
-                goal_set_supported,
-                image_input_mode,
-                attachments: request.attachments(),
+                // Preserve the original storage failure outside the protocol layer so
+                // a private-reference conflict is not misclassified as transport I/O.
+                let persistence_error = RefCell::new(None);
+                let mut persist_thread_ref = |value: &str| {
+                    request.persist_upstream_thread_ref(value).map_err(|error| {
+                        *persistence_error.borrow_mut() = Some(error);
+                    })
+                };
+                let mut persist_turn_ref = |value: &str| {
+                    request.persist_upstream_turn_ref(value).map_err(|error| {
+                        *persistence_error.borrow_mut() = Some(error);
+                    })
+                };
+                let snapshot = crate::read_production_snapshot(&self.snapshot)?;
+                let goal_set_supported = snapshot.goal_set_supported();
+                let image_input_mode = snapshot.image_input_mode();
+                if !request.attachments().is_empty()
+                    && matches!(
+                        image_input_mode,
+                        crate::codex_capabilities::CodexImageInputMode::Unsupported
+                    )
+                {
+                    return Err(SatelleError::invalid_usage(
+                        "the selected Codex protocol does not support image input",
+                    ));
+                }
+                let run = run_codex_session_with_timeout_cancellation(
+                    preserve_managed_codex_error(
+                        crate::codex_capabilities::installed_app_server_command(),
+                    )?,
+                    CodexSessionRequest {
+                        working_directory: &working_directory,
+                        prompt: request.prompt(),
+                        existing_thread_ref: request.upstream_thread_ref(),
+                        model: model_override(policy.effective_model().as_str()),
+                        model_provider: provider_override(policy.provider_binding().as_str()),
+                        execution_mode: request.execution_mode(),
+                        approval_policy,
+                        sandbox_policy,
+                        deadline,
+                        persist_thread_ref: &mut persist_thread_ref,
+                        persist_turn_ref: &mut persist_turn_ref,
+                        control: Some(control),
+                        goal_set_supported,
+                        image_input_mode,
+                        attachments: request.attachments(),
+                    },
+                    READINESS_CANCELLATION_GRACE,
+                    None,
+                );
+                finish_timed_turn_execution(run, persistence_error.into_inner())
             },
-            READINESS_CANCELLATION_GRACE,
-            None,
-        );
-        finish_timed_turn_execution(run, persistence_error.into_inner())
+        )
     }
 
     fn observe_stop(&self, subject: AdapterSubject<'_>) -> Result<StopObservation, SatelleError> {
@@ -1424,6 +1446,20 @@ fn codex_sandbox_policy(policy: SandboxPolicy) -> CodexSandboxPolicy {
     }
 }
 
+fn dispatch_with_configured_desktop_target<T>(
+    policy: &ExecutionPolicy,
+    resolve_configured: impl FnOnce() -> Result<DesktopTarget, SatelleError>,
+    dispatch: impl FnOnce() -> Result<T, SatelleError>,
+) -> Result<T, SatelleError> {
+    let configured = resolve_configured()?;
+    if policy.desktop_target() != &configured {
+        return Err(SatelleError::desktop_session_unavailable(Some(
+            policy.desktop_target().binding().as_str(),
+        )));
+    }
+    dispatch()
+}
+
 fn terminal_result(
     result: Result<CodexSessionTerminal, CodexSessionFailure>,
 ) -> Result<ExecuteResult, SatelleError> {
@@ -1551,6 +1587,94 @@ fn host_turn_timeout_ceiling() -> Result<TimeoutPolicy, SatelleError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn execution_policy_for(desktop_binding: &str, desktop_session_id: &str) -> ExecutionPolicy {
+        ExecutionPolicy::new(
+            EffectiveModelRef::new(DEFAULT_MODEL_BINDING).unwrap(),
+            ProviderBindingRef::new(DEFAULT_PROVIDER_BINDING).unwrap(),
+            DesktopTarget::new(
+                DesktopBindingRef::new(desktop_binding).unwrap(),
+                desktop_session_id,
+            ),
+            ApprovalPolicy::OnRequest,
+            SandboxPolicy::WorkspaceWrite,
+            TimeoutPolicy::bounded_seconds(120).unwrap(),
+            ExperimentalFeatureChoices::new(FeatureChoice::Enabled, FeatureChoice::Disabled),
+        )
+    }
+
+    #[test]
+    fn configured_desktop_mismatch_is_rejected_before_codex_dispatch() {
+        let dispatch_attempted = std::cell::Cell::new(false);
+        let error = dispatch_with_configured_desktop_target(
+            &execution_policy_for("admitted-desktop", "admitted-session"),
+            || {
+                Ok(DesktopTarget::new(
+                    DesktopBindingRef::new("configured-desktop").unwrap(),
+                    "configured-session",
+                ))
+            },
+            || {
+                dispatch_attempted.set(true);
+                Ok(())
+            },
+        )
+        .expect_err("a changed Desktop Binding must block Codex dispatch");
+
+        assert_eq!(error.code, ErrorCode::DesktopSessionUnavailable);
+        assert_eq!(error.details["desktop_user"], "admitted-desktop");
+        assert!(
+            !dispatch_attempted.get(),
+            "Desktop Binding enforcement must run before Codex dispatch"
+        );
+    }
+
+    #[test]
+    fn configured_desktop_session_mismatch_is_rejected_before_codex_dispatch() {
+        let dispatch_attempted = std::cell::Cell::new(false);
+        let error = dispatch_with_configured_desktop_target(
+            &execution_policy_for("configured-desktop", "admitted-session"),
+            || {
+                Ok(DesktopTarget::new(
+                    DesktopBindingRef::new("configured-desktop").unwrap(),
+                    "different-session",
+                ))
+            },
+            || {
+                dispatch_attempted.set(true);
+                Ok(())
+            },
+        )
+        .expect_err("a changed Desktop Session must block Codex dispatch");
+
+        assert_eq!(error.code, ErrorCode::DesktopSessionUnavailable);
+        assert_eq!(error.details["desktop_user"], "configured-desktop");
+        assert!(
+            !dispatch_attempted.get(),
+            "Desktop Session enforcement must run before Codex dispatch"
+        );
+    }
+
+    #[test]
+    fn exact_configured_desktop_target_dispatches() {
+        let dispatch_attempted = std::cell::Cell::new(false);
+        dispatch_with_configured_desktop_target(
+            &execution_policy_for("configured-desktop", "configured-session"),
+            || {
+                Ok(DesktopTarget::new(
+                    DesktopBindingRef::new("configured-desktop").unwrap(),
+                    "configured-session",
+                ))
+            },
+            || {
+                dispatch_attempted.set(true);
+                Ok(())
+            },
+        )
+        .expect("an unchanged Desktop Target must dispatch");
+
+        assert!(dispatch_attempted.get());
+    }
 
     #[test]
     fn production_adapter_preserves_managed_codex_integrity_errors() {
@@ -1870,7 +1994,7 @@ mod tests {
         let policy = ExecutionPolicy::new(
             EffectiveModelRef::new("model-native-cancellation").unwrap(),
             ProviderBindingRef::new("provider-native-cancellation").unwrap(),
-            DesktopTarget::new(desktop_binding.clone()),
+            DesktopTarget::new(desktop_binding.clone(), "native-cancellation-session"),
             ApprovalPolicy::OnRequest,
             SandboxPolicy::WorkspaceWrite,
             TimeoutPolicy::bounded_seconds(120).unwrap(),
@@ -1923,7 +2047,7 @@ mod tests {
         let policy = ExecutionPolicy::new(
             EffectiveModelRef::new("model-provider-cache").unwrap(),
             ProviderBindingRef::new("provider-cache").unwrap(),
-            DesktopTarget::new(desktop_binding.clone()),
+            DesktopTarget::new(desktop_binding.clone(), "provider-cache-session"),
             ApprovalPolicy::OnRequest,
             SandboxPolicy::WorkspaceWrite,
             TimeoutPolicy::bounded_seconds(120).unwrap(),

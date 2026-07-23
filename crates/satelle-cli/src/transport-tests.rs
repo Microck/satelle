@@ -255,7 +255,7 @@ fn lifecycle_readiness() -> Result<AdapterReadiness, SatelleError> {
             .map_err(|error| SatelleError::not_implemented(format!("test model: {error}")))?,
         ProviderBindingRef::new("interrupt-test-provider")
             .map_err(|error| SatelleError::not_implemented(format!("test provider: {error}")))?,
-        DesktopTarget::new(desktop_binding.clone()),
+        DesktopTarget::new(desktop_binding.clone(), "interrupt-test-desktop-session"),
         ApprovalPolicy::OnRequest,
         SandboxPolicy::WorkspaceWrite,
         TimeoutPolicy::bounded_seconds(120)
@@ -1154,11 +1154,16 @@ fn first_trust_path_rebind_handoff_uses_the_discovered_host_identity() {
             DaemonClientError::Api { error, .. }
                 if error.code() == ApiErrorCode::HostIdentityMismatch
         ));
-        complete_discovered_bootstrap_handoff(
+        let handoff_client = discovered_bootstrap_client(
             "first-trust-path-rebind-host",
             server.local_addr(),
             handoff_token,
             &discovered_identity,
+        )
+        .expect("construct the identity-pinned handoff client");
+        complete_bootstrap_handoff(
+            "first-trust-path-rebind-host",
+            &handoff_client,
             &mut bootstrap_lock,
         )
         .expect("the learned identity completes the first-trust handoff");
@@ -3262,6 +3267,7 @@ fn direct_host_sessions_read_daemon_metadata_without_bootstrap() {
 
     assert_eq!(direct.schema_version, HostSessionsSchemaVersion::V1);
     assert_eq!(direct.host, "direct-test");
+    assert_eq!(direct.detected_platform, std::env::consts::OS);
     assert_eq!(direct.connection_mode, "direct");
     assert!(!direct.bootstrapped);
     assert!(direct.bootstrap_actions.is_empty());
@@ -3730,6 +3736,13 @@ fn admission_failures_preserve_definitive_and_ambiguous_phases() {
         ApiErrorCode::IncompatibleProtocol,
         ApiErrorCode::IncompatibleControlPlane,
         ApiErrorCode::ComputerUseNotReady,
+        ApiErrorCode::DesktopBindingRequired,
+        ApiErrorCode::DesktopSessionUnavailable,
+        ApiErrorCode::DesktopSessionAmbiguous,
+        ApiErrorCode::DesktopSessionPreferenceUnmatched,
+        ApiErrorCode::DesktopSessionConsoleUnavailable,
+        ApiErrorCode::DesktopSessionNativeSelectorWrongPlatform,
+        ApiErrorCode::DesktopSessionNativeSelectorUnmatched,
         ApiErrorCode::NativeReadinessTimeout,
         ApiErrorCode::ProviderSmokeTestTimeout,
         ApiErrorCode::UnsupportedProviderComputerUse,
@@ -3869,6 +3882,92 @@ fn stop_not_confirmed_api_details_are_validated_and_preserved() {
             Some(&serde_json::json!("invalid-daemon-response"))
         );
     }
+}
+
+#[test]
+fn desktop_selection_api_errors_round_trip_only_validated_details() {
+    let api_error = |code: ApiErrorCode, details: serde_json::Value| {
+        serde_json::from_value::<satelle_transport::ApiError>(serde_json::json!({
+            "schema_version": "satelle.error.v1",
+            "request_id": satelle_transport::RequestId::new().to_string(),
+            "host_identity": "host-direct-test",
+            "code": code.as_str(),
+            "category": "readiness",
+            "retryable": false,
+            "message": "desktop selection failed",
+            "details": details,
+            "docs_url": null,
+            "suggested_commands": []
+        }))
+        .expect("deserialize desktop selection API error")
+    };
+    let cases = [
+        (
+            ApiErrorCode::DesktopBindingRequired,
+            serde_json::json!({"candidate_desktop_users": ["alice", "bob"]}),
+            ErrorCode::DesktopBindingRequired,
+        ),
+        (
+            ApiErrorCode::DesktopSessionUnavailable,
+            serde_json::json!({"desktop_user": "alice"}),
+            ErrorCode::DesktopSessionUnavailable,
+        ),
+        (
+            ApiErrorCode::DesktopSessionAmbiguous,
+            serde_json::json!({"desktop_user": "alice"}),
+            ErrorCode::DesktopSessionAmbiguous,
+        ),
+        (
+            ApiErrorCode::DesktopSessionPreferenceUnmatched,
+            serde_json::json!({
+                "desktop_user": "alice",
+                "desktop_session_preference": "only"
+            }),
+            ErrorCode::DesktopSessionPreferenceUnmatched,
+        ),
+        (
+            ApiErrorCode::DesktopSessionConsoleUnavailable,
+            serde_json::json!({
+                "desktop_user": "alice",
+                "desktop_session_preference": "console"
+            }),
+            ErrorCode::DesktopSessionConsoleUnavailable,
+        ),
+        (
+            ApiErrorCode::DesktopSessionNativeSelectorWrongPlatform,
+            serde_json::json!({
+                "configured_platform": "macos",
+                "detected_platform": "windows"
+            }),
+            ErrorCode::DesktopSessionNativeSelectorWrongPlatform,
+        ),
+        (
+            ApiErrorCode::DesktopSessionNativeSelectorUnmatched,
+            serde_json::json!({
+                "desktop_session_native_selector": "windows:wts-session:7"
+            }),
+            ErrorCode::DesktopSessionNativeSelectorUnmatched,
+        ),
+    ];
+
+    for (code, details, expected) in cases {
+        let mapped = map_api_error("direct-test", &api_error(code, details));
+        assert_eq!(mapped.code, expected);
+    }
+
+    let malformed = api_error(
+        ApiErrorCode::DesktopSessionAmbiguous,
+        serde_json::json!({
+            "desktop_user": "alice",
+            "private": "must-not-cross"
+        }),
+    );
+    let mapped = map_api_error("direct-test", &malformed);
+    assert_eq!(mapped.code, ErrorCode::RemoteExecution);
+    assert_eq!(
+        mapped.details.get("remote_code"),
+        Some(&serde_json::json!("invalid-daemon-response"))
+    );
 }
 
 #[test]

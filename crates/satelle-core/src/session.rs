@@ -387,16 +387,30 @@ impl TimeoutPolicy {
     }
 }
 
+/// The exact desktop authorized for one Turn.
+///
+/// The binding remains the durable lease owner, while the native session ID
+/// freezes the live Desktop Session selected during readiness and admission.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct DesktopTarget(DesktopBindingRef);
+pub struct DesktopTarget {
+    binding: DesktopBindingRef,
+    session_id: String,
+}
 
 impl DesktopTarget {
-    pub fn new(binding: DesktopBindingRef) -> Self {
-        Self(binding)
+    pub fn new(binding: DesktopBindingRef, session_id: impl Into<String>) -> Self {
+        Self {
+            binding,
+            session_id: session_id.into(),
+        }
     }
 
     pub fn binding(&self) -> &DesktopBindingRef {
-        &self.0
+        &self.binding
+    }
+
+    pub fn session_id(&self) -> &str {
+        &self.session_id
     }
 }
 
@@ -501,7 +515,10 @@ mod pr08_timeout_policy_tests {
 
     #[test]
     fn requested_turn_timeout_can_only_shorten_host_policy() {
-        let desktop = DesktopTarget::new(DesktopBindingRef::new("timeout-desktop").unwrap());
+        let desktop = DesktopTarget::new(
+            DesktopBindingRef::new("timeout-desktop").unwrap(),
+            "timeout-desktop-session",
+        );
         let policy = ExecutionPolicy::new(
             EffectiveModelRef::new("timeout-model").unwrap(),
             ProviderBindingRef::new("timeout-provider").unwrap(),
@@ -2791,7 +2808,7 @@ mod tests {
         ExecutionPolicy::new(
             EffectiveModelRef::new("computer-use-model").unwrap(),
             ProviderBindingRef::new("provider-binding-a").unwrap(),
-            DesktopTarget::new(desktop),
+            DesktopTarget::new(desktop, "test-desktop-session"),
             approval,
             SandboxPolicy::WorkspaceWrite,
             TimeoutPolicy::bounded_seconds(300).unwrap(),

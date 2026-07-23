@@ -80,6 +80,14 @@ fn failure(error: &SatelleError) -> ApiFailure {
             message: "the Host rejected the operation input",
             details: None,
         },
+        ErrorCode::DesktopBindingRequired => ApiFailure {
+            status: StatusCode::BAD_REQUEST,
+            code: ApiErrorCode::DesktopBindingRequired,
+            category: ApiErrorCategory::InvalidRequest,
+            retryable: false,
+            message: "a Desktop Binding is required before native Computer Use can start",
+            details: validated_candidate_desktop_users_details(error),
+        },
         ErrorCode::IdempotencyKeyConflict => ApiFailure {
             status: StatusCode::CONFLICT,
             code: ApiErrorCode::IdempotencyKeyConflict,
@@ -162,6 +170,63 @@ fn failure(error: &SatelleError) -> ApiFailure {
             retryable: false,
             message: "native Computer Use is not ready on this Host",
             details: None,
+        },
+        ErrorCode::DesktopSessionUnavailable => ApiFailure {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            code: ApiErrorCode::DesktopSessionUnavailable,
+            category: ApiErrorCategory::Readiness,
+            retryable: false,
+            message: "no compatible active Desktop Session is available",
+            details: validated_optional_desktop_user_details(error),
+        },
+        ErrorCode::DesktopSessionAmbiguous => ApiFailure {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            code: ApiErrorCode::DesktopSessionAmbiguous,
+            category: ApiErrorCategory::Readiness,
+            retryable: false,
+            message: "the Desktop Binding resolves to multiple compatible active Desktop Sessions",
+            details: validated_string_details(error, &["desktop_user"]),
+        },
+        ErrorCode::DesktopSessionPreferenceUnmatched => ApiFailure {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            code: ApiErrorCode::DesktopSessionPreferenceUnmatched,
+            category: ApiErrorCategory::Readiness,
+            retryable: false,
+            message: "the desktop session preference does not select exactly one compatible active Desktop Session",
+            details: validated_string_details(
+                error,
+                &["desktop_user", "desktop_session_preference"],
+            ),
+        },
+        ErrorCode::DesktopSessionConsoleUnavailable => ApiFailure {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            code: ApiErrorCode::DesktopSessionConsoleUnavailable,
+            category: ApiErrorCategory::Readiness,
+            retryable: false,
+            message: "no compatible active physical console session is available for the Desktop Binding",
+            details: validated_string_details(
+                error,
+                &["desktop_user", "desktop_session_preference"],
+            ),
+        },
+        ErrorCode::DesktopSessionNativeSelectorWrongPlatform => ApiFailure {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            code: ApiErrorCode::DesktopSessionNativeSelectorWrongPlatform,
+            category: ApiErrorCategory::Readiness,
+            retryable: false,
+            message: "the configured native desktop session selector targets another Host platform",
+            details: validated_string_details(
+                error,
+                &["configured_platform", "detected_platform"],
+            ),
+        },
+        ErrorCode::DesktopSessionNativeSelectorUnmatched => ApiFailure {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            code: ApiErrorCode::DesktopSessionNativeSelectorUnmatched,
+            category: ApiErrorCategory::Readiness,
+            retryable: false,
+            message: "the native desktop session selector does not select exactly one compatible active Desktop Session",
+            details: validated_string_details(error, &["desktop_session_native_selector"]),
         },
         ErrorCode::NativeReadinessTimeout => ApiFailure {
             status: StatusCode::GATEWAY_TIMEOUT,
@@ -309,6 +374,48 @@ fn validated_stop_not_confirmed_details(error: &SatelleError) -> Option<serde_js
     }))
 }
 
+fn validated_candidate_desktop_users_details(error: &SatelleError) -> Option<serde_json::Value> {
+    if error.details.len() != 1 {
+        return None;
+    }
+    let users = error
+        .details
+        .get("candidate_desktop_users")?
+        .as_array()?
+        .iter()
+        .map(serde_json::Value::as_str)
+        .collect::<Option<Vec<_>>>()?;
+    if users.len() < 2 || users.iter().any(|user| user.is_empty()) {
+        return None;
+    }
+    Some(serde_json::json!({ "candidate_desktop_users": users }))
+}
+
+fn validated_optional_desktop_user_details(error: &SatelleError) -> Option<serde_json::Value> {
+    if error.details.is_empty() {
+        return None;
+    }
+    validated_string_details(error, &["desktop_user"])
+}
+
+fn validated_string_details(error: &SatelleError, keys: &[&str]) -> Option<serde_json::Value> {
+    if error.details.len() != keys.len() {
+        return None;
+    }
+    let mut details = serde_json::Map::new();
+    for key in keys {
+        let value = error.details.get(*key)?.as_str()?;
+        if value.is_empty() {
+            return None;
+        }
+        details.insert(
+            (*key).to_string(),
+            serde_json::Value::String(value.to_string()),
+        );
+    }
+    Some(serde_json::Value::Object(details))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -317,7 +424,7 @@ mod tests {
         IncompatibleControlPlaneDetails,
     };
     use serde_json::json;
-    use std::collections::BTreeMap;
+    use std::collections::{BTreeMap, BTreeSet};
 
     #[test]
     fn incompatible_control_plane_is_a_sanitized_readiness_failure() {
@@ -391,6 +498,106 @@ mod tests {
         assert!(!mapped.retryable);
         assert_eq!(mapped.details, None);
         assert!(!mapped.message.contains("PRIVATE_"));
+    }
+
+    #[test]
+    fn desktop_binding_required_has_a_distinct_sanitized_invalid_request_contract() {
+        let mapped = failure(&SatelleError::desktop_binding_required(&BTreeSet::from([
+            "alice", "bob",
+        ])));
+
+        assert_eq!(mapped.status, StatusCode::BAD_REQUEST);
+        assert_eq!(mapped.code, ApiErrorCode::DesktopBindingRequired);
+        assert_eq!(mapped.category, ApiErrorCategory::InvalidRequest);
+        assert!(!mapped.retryable);
+        assert_eq!(
+            mapped.details,
+            Some(json!({ "candidate_desktop_users": ["alice", "bob"] }))
+        );
+    }
+
+    #[test]
+    fn desktop_session_failures_keep_distinct_sanitized_readiness_contracts() {
+        for (error, expected_code, expected_details) in [
+            (
+                SatelleError::desktop_session_unavailable(Some("alice")),
+                ApiErrorCode::DesktopSessionUnavailable,
+                Some(json!({ "desktop_user": "alice" })),
+            ),
+            (
+                SatelleError::desktop_session_ambiguous("alice"),
+                ApiErrorCode::DesktopSessionAmbiguous,
+                Some(json!({ "desktop_user": "alice" })),
+            ),
+            (
+                SatelleError::desktop_session_preference_unmatched("alice", "only"),
+                ApiErrorCode::DesktopSessionPreferenceUnmatched,
+                Some(json!({
+                    "desktop_user": "alice",
+                    "desktop_session_preference": "only"
+                })),
+            ),
+            (
+                SatelleError::desktop_session_console_unavailable("alice"),
+                ApiErrorCode::DesktopSessionConsoleUnavailable,
+                Some(json!({
+                    "desktop_user": "alice",
+                    "desktop_session_preference": "console"
+                })),
+            ),
+            (
+                SatelleError::desktop_session_native_selector_wrong_platform("windows", "linux"),
+                ApiErrorCode::DesktopSessionNativeSelectorWrongPlatform,
+                Some(json!({
+                    "configured_platform": "windows",
+                    "detected_platform": "linux"
+                })),
+            ),
+            (
+                SatelleError::desktop_session_native_selector_unmatched("windows:wts-session:3"),
+                ApiErrorCode::DesktopSessionNativeSelectorUnmatched,
+                Some(json!({
+                    "desktop_session_native_selector": "windows:wts-session:3"
+                })),
+            ),
+        ] {
+            let mapped = failure(&error);
+
+            assert_eq!(mapped.status, StatusCode::SERVICE_UNAVAILABLE);
+            assert_eq!(mapped.code, expected_code);
+            assert_eq!(mapped.category, ApiErrorCategory::Readiness);
+            assert!(!mapped.retryable);
+            assert_eq!(mapped.details, expected_details);
+        }
+
+        let unavailable = failure(&SatelleError::desktop_session_unavailable(None));
+        assert_eq!(unavailable.code, ApiErrorCode::DesktopSessionUnavailable);
+        assert_eq!(unavailable.details, None);
+    }
+
+    #[test]
+    fn malformed_desktop_selection_details_do_not_cross_the_http_boundary() {
+        let mut malformed_binding =
+            SatelleError::desktop_binding_required(&BTreeSet::from(["alice", "bob"]));
+        malformed_binding
+            .details
+            .insert("candidate_desktop_users".to_string(), json!(["alice", 7]));
+        assert_eq!(failure(&malformed_binding).details, None);
+
+        for mut error in [
+            SatelleError::desktop_session_unavailable(Some("alice")),
+            SatelleError::desktop_session_ambiguous("alice"),
+            SatelleError::desktop_session_preference_unmatched("alice", "only"),
+            SatelleError::desktop_session_console_unavailable("alice"),
+            SatelleError::desktop_session_native_selector_wrong_platform("windows", "linux"),
+            SatelleError::desktop_session_native_selector_unmatched("windows:wts-session:3"),
+        ] {
+            error.details.insert(
+                "private_canary".to_string(),
+                json!("PRIVATE_DETAILS_CANARY"),
+            );
+            assert_eq!(failure(&error).details, None);
+        }
     }
 
     #[test]
