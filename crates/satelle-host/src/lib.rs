@@ -677,6 +677,13 @@ impl ProductionCapabilitySnapshot {
     pub(crate) const fn image_input_mode(&self) -> codex_capabilities::CodexImageInputMode {
         self.control_plane_admission.image_input()
     }
+
+    pub(crate) const fn image_attachments_supported(&self) -> bool {
+        !matches!(
+            self.image_input_mode(),
+            codex_capabilities::CodexImageInputMode::Unsupported
+        )
+    }
 }
 
 fn read_production_snapshot(
@@ -1315,6 +1322,26 @@ impl HostService {
         }
     }
 
+    fn ensure_image_attachments_supported(&self, intent: &TurnIntent) -> Result<(), SatelleError> {
+        if intent.attachments().is_empty() {
+            return Ok(());
+        }
+        let supported = match &self.mode {
+            HostMode::Production { snapshot } => {
+                read_production_snapshot(snapshot)?.image_attachments_supported()
+            }
+            #[cfg(any(test, feature = "test-support"))]
+            HostMode::TestFake { image_attachments } => *image_attachments,
+        };
+        if supported {
+            Ok(())
+        } else {
+            Err(SatelleError::invalid_usage(
+                "the selected Codex protocol does not support image input",
+            ))
+        }
+    }
+
     fn run_command<'a>(&self, command: RunCommand<'a>, intent: &TurnIntent) -> RunCommand<'a> {
         command
             .with_execution_mode(intent.execution_mode())
@@ -1340,6 +1367,8 @@ impl HostService {
         host: &str,
         intent: &TurnIntent,
     ) -> Result<TurnOutcome, TurnAdmissionFailure> {
+        self.ensure_image_attachments_supported(intent)
+            .map_err(TurnAdmissionFailure::not_admitted)?;
         self.runtime
             .run(self.run_command(RunCommand::attached(host, intent.prompt()), intent))
             .map(crate::runtime::RuntimeTurnOutcome::into_command_outcome)
@@ -1351,6 +1380,8 @@ impl HostService {
         intent: &TurnIntent,
         cancellation: AdmissionCancellation,
     ) -> Result<TurnOutcome, TurnAdmissionFailure> {
+        self.ensure_image_attachments_supported(intent)
+            .map_err(TurnAdmissionFailure::not_admitted)?;
         self.runtime
             .run(
                 self.run_command(RunCommand::attached(host, intent.prompt()), intent)
@@ -1364,6 +1395,7 @@ impl HostService {
         host: &str,
         intent: &TurnIntent,
     ) -> Result<PublicSession, SatelleError> {
+        self.ensure_image_attachments_supported(intent)?;
         crate::runtime::admitted_session(
             self.runtime
                 .run(self.run_command(RunCommand::detached(host, intent.prompt()), intent)),
@@ -1376,6 +1408,7 @@ impl HostService {
         intent: &TurnIntent,
         cancellation: AdmissionCancellation,
     ) -> Result<PublicSession, SatelleError> {
+        self.ensure_image_attachments_supported(intent)?;
         crate::runtime::admitted_session(
             self.runtime.run(
                 self.run_command(RunCommand::detached(host, intent.prompt()), intent)
@@ -1389,6 +1422,8 @@ impl HostService {
         session_id: &SessionId,
         intent: &TurnIntent,
     ) -> Result<TurnOutcome, TurnAdmissionFailure> {
+        self.ensure_image_attachments_supported(intent)
+            .map_err(TurnAdmissionFailure::not_admitted)?;
         self.runtime
             .steer(self.steer_command(
                 SteerCommand::attached(session_id.clone(), intent.prompt()),
@@ -1403,6 +1438,8 @@ impl HostService {
         intent: &TurnIntent,
         cancellation: AdmissionCancellation,
     ) -> Result<TurnOutcome, TurnAdmissionFailure> {
+        self.ensure_image_attachments_supported(intent)
+            .map_err(TurnAdmissionFailure::not_admitted)?;
         self.runtime
             .steer(
                 self.steer_command(
@@ -1419,6 +1456,7 @@ impl HostService {
         session_id: &SessionId,
         intent: &TurnIntent,
     ) -> Result<PublicSession, SatelleError> {
+        self.ensure_image_attachments_supported(intent)?;
         crate::runtime::admitted_session(self.runtime.steer(self.steer_command(
             SteerCommand::detached(session_id.clone(), intent.prompt()),
             intent,
@@ -1431,6 +1469,7 @@ impl HostService {
         intent: &TurnIntent,
         cancellation: AdmissionCancellation,
     ) -> Result<PublicSession, SatelleError> {
+        self.ensure_image_attachments_supported(intent)?;
         crate::runtime::admitted_session(
             self.runtime.steer(
                 self.steer_command(

@@ -719,6 +719,7 @@ impl HostService {
         authority: &MutationAuthority,
         cancellation: AdmissionCancellation,
     ) -> Result<PublicSession, SatelleError> {
+        self.ensure_image_attachments_supported(intent)?;
         let turn_execution_timeout = self.effective_turn_execution_timeout(intent);
         let canonical_payload = canonical_payload(
             &CanonicalSessionCreate {
@@ -826,6 +827,7 @@ impl HostService {
         authority: &MutationAuthority,
         cancellation: AdmissionCancellation,
     ) -> Result<PublicSession, SatelleError> {
+        self.ensure_image_attachments_supported(intent)?;
         let turn_execution_timeout = self.effective_turn_execution_timeout(intent);
         let canonical_payload = canonical_payload(
             &CanonicalTurnCreate {
@@ -1236,10 +1238,7 @@ fn production_capabilities(
         codex_runtime,
         native_computer_use,
         provider_computer_use: false,
-        image_attachments: !matches!(
-            snapshot.image_input_mode(),
-            crate::codex_capabilities::CodexImageInputMode::Unsupported
-        ),
+        image_attachments: snapshot.image_attachments_supported(),
     }
 }
 
@@ -1610,6 +1609,75 @@ mod tests {
                 .expires_at(),
             None
         );
+    }
+
+    #[test]
+    fn unsupported_image_capability_does_not_claim_idempotency_or_accept_detached_turns() {
+        let state = crate::TestStateDir::new().expect("temporary state directory");
+        let service = HostService::local_demo_for_tests_at(state.path())
+            .expect("construct deterministic service")
+            .without_image_attachments_for_tests();
+        service.initialize_daemon().expect("initialize daemon");
+        let token = ApiBearerToken::generate().expect("generate API token");
+        let principal = service
+            .register_api_token(&token, "principal-image-test", ApiScopes::CONTROL, None)
+            .expect("register API token");
+        let image = || {
+            crate::AttachmentUpload::new(
+                "image/png",
+                8,
+                "4c4b6a3be1314ab86138bef4314dde022e600960d8689a2c8f8631802d20dab6",
+                "iVBORw0KGgo=",
+            )
+        };
+
+        let run_prompt = "PRIVATE_UNSUPPORTED_IMAGE_RUN";
+        let image_run = TurnIntent::new(run_prompt, TurnExecutionMode::Standard)
+            .expect("construct image run")
+            .with_attachments(vec![image()])
+            .expect("verify image run");
+        let run_authority =
+            MutationAuthority::new(principal.clone(), "01890a5d-ac96-7b7c-8f89-37c3d0a66e80")
+                .expect("construct run authority");
+        let run_error = service
+            .admit_run(&image_run, &run_authority)
+            .expect_err("unsupported detached image run must be rejected");
+        assert_eq!(run_error.code, satelle_core::ErrorCode::InvalidUsage);
+        assert_eq!(
+            service
+                .daemon_runtime_status()
+                .expect("read daemon status")
+                .session_count(),
+            0
+        );
+        let image_free_run = TurnIntent::new(run_prompt, TurnExecutionMode::Standard)
+            .expect("construct image-free run");
+        let session = service
+            .admit_run(&image_free_run, &run_authority)
+            .expect("rejected image run must not claim its idempotency key");
+        service
+            .runtime
+            .wait_for_background()
+            .expect("finish image-free run");
+
+        let steer_prompt = "PRIVATE_UNSUPPORTED_IMAGE_STEER";
+        let image_steer = TurnIntent::new(steer_prompt, TurnExecutionMode::Standard)
+            .expect("construct image steer")
+            .with_attachments(vec![image()])
+            .expect("verify image steer");
+        let steer_authority =
+            MutationAuthority::new(principal, "01890a5d-ac96-7b7c-8f89-37c3d0a66e81")
+                .expect("construct steer authority");
+        let steer_error = service
+            .admit_steer(session.session_id(), &image_steer, &steer_authority)
+            .expect_err("unsupported detached image steer must be rejected");
+        assert_eq!(steer_error.code, satelle_core::ErrorCode::InvalidUsage);
+        let image_free_steer = TurnIntent::new(steer_prompt, TurnExecutionMode::Standard)
+            .expect("construct image-free steer");
+        let steered = service
+            .admit_steer(session.session_id(), &image_free_steer, &steer_authority)
+            .expect("rejected image steer must not claim its idempotency key");
+        assert_eq!(steered.turns().len(), 2);
     }
 
     #[test]
