@@ -2912,7 +2912,7 @@ impl SatelleError {
         details.insert(
             "supported_units".to_string(),
             Value::Array(
-                ["ms", "s", "m", "h"]
+                ["ms", "s", "m"]
                     .into_iter()
                     .map(|unit| Value::String(unit.to_string()))
                     .collect(),
@@ -2925,7 +2925,7 @@ impl SatelleError {
                 "config file {} has a timeout at {toml_path} without an explicit supported unit",
                 config_file.display()
             ),
-            recovery_command: Some("use an explicit duration such as 120s, 2m, or 1h".to_string()),
+            recovery_command: Some("use an explicit duration such as 120s or 2m".to_string()),
             source_detail: None,
             details,
         }

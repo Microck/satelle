@@ -3,12 +3,111 @@ use crate::codex_capabilities::{
     CapabilityMatrix, CodexVersionEvidence, HostPlatform, Phase0CapabilityEvidence,
     REQUIRED_CODEX_VERSION,
 };
+use base64::Engine as _;
 use satelle_core::session::TurnExecutionMode;
-use satelle_core::session::{StopObservation, TurnState};
+use satelle_core::session::{StopObservation, TurnState, TurnTransition};
 use satelle_core::{ErrorCode, SatelleError};
+use sha2::{Digest as _, Sha256};
 
 fn turn_intent(prompt: &str) -> TurnIntent {
     TurnIntent::new(prompt, TurnExecutionMode::Standard).expect("valid test Turn intent")
+}
+
+#[derive(Clone)]
+struct RecordingTurnExtrasAdapter {
+    observations: Arc<Mutex<Vec<(usize, u32)>>>,
+}
+
+impl ComputerUseAdapter for RecordingTurnExtrasAdapter {
+    fn preflight(
+        &self,
+        host: &str,
+        provider_intent: &ProviderComputerUseIntent,
+    ) -> Result<AdapterReadiness, SatelleError> {
+        FakeComputerUseAdapter.preflight(host, provider_intent)
+    }
+
+    fn execute(&self, request: ExecuteRequest<'_>) -> Result<ExecuteResult, SatelleError> {
+        self.observations.lock().expect("lock observations").push((
+            request.attachments().len(),
+            request.execution_policy().timeout_policy().seconds(),
+        ));
+        Ok(ExecuteResult::new(TurnTransition::Completed, Vec::new()))
+    }
+
+    fn observe_stop(&self, subject: AdapterSubject<'_>) -> Result<StopObservation, SatelleError> {
+        FakeComputerUseAdapter.observe_stop(subject)
+    }
+
+    fn observe_recovery(
+        &self,
+        subject: AdapterSubject<'_>,
+    ) -> Result<RecoveryObservation, SatelleError> {
+        FakeComputerUseAdapter.observe_recovery(subject)
+    }
+}
+
+fn turn_intent_with_extras(prompt: &str, timeout_seconds: u64) -> TurnIntent {
+    let bytes = b"\x89PNG\r\n\x1a\n";
+    let digest = Sha256::digest(bytes);
+    let sha256 = digest
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    turn_intent(prompt)
+        .with_turn_execution_timeout_ms(Some(timeout_seconds * 1_000))
+        .expect("valid Turn timeout")
+        .with_attachments(vec![AttachmentUpload::new(
+            "image/png",
+            u64::try_from(bytes.len()).expect("image size fits u64"),
+            sha256,
+            base64::engine::general_purpose::STANDARD.encode(bytes),
+        )])
+        .expect("valid image attachment")
+}
+
+#[test]
+fn local_host_run_and_steer_forward_attachments_and_host_clamped_timeout() {
+    let state = TestStateDir::new().expect("temporary state directory");
+    let observations = Arc::new(Mutex::new(Vec::new()));
+    let service = HostService {
+        runtime: RuntimeHandle::new(
+            Ok(state.path().to_path_buf()),
+            RecordingTurnExtrasAdapter {
+                observations: Arc::clone(&observations),
+            },
+        ),
+        operation_capacity: Arc::new(OperationCapacity::default()),
+        turn_execution_timeout: crate::configured_turn_execution_timeout(
+            &satelle_core::SatelleConfig::defaults().hosts[LOCAL_DEMO_HOST],
+        ),
+        mode: HostMode::TestFake {
+            image_attachments: true,
+        },
+        bootstrap_auth: None,
+        bootstrap_maintenance: Arc::new(Mutex::new(None)),
+    }
+    .with_turn_execution_timeout_for_tests(5);
+
+    let session = service
+        .run(
+            LOCAL_DEMO_HOST,
+            &turn_intent_with_extras("local run extras", 3),
+        )
+        .expect("run local Turn")
+        .session;
+    service
+        .steer(
+            session.session_id(),
+            &turn_intent_with_extras("local steer extras", 7),
+        )
+        .expect("steer local Turn");
+
+    assert_eq!(
+        *observations.lock().expect("lock observations"),
+        [(1, 3), (1, 5)],
+        "run must preserve a shorter timeout and steer must clamp to the Host limit"
+    );
 }
 
 #[test]

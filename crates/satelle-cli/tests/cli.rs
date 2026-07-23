@@ -4990,7 +4990,7 @@ native_readiness = 120
     );
     assert_eq!(
         error["details"]["supported_units"],
-        serde_json::json!(["ms", "s", "m", "h"])
+        serde_json::json!(["ms", "s", "m"])
     );
 
     fs::write(

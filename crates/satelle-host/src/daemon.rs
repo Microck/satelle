@@ -257,6 +257,10 @@ impl TurnIntent {
     pub(crate) fn provider_intent(&self) -> &crate::ProviderComputerUseIntent {
         &self.provider_intent
     }
+
+    pub(crate) fn attachments(&self) -> &[crate::attachment::VerifiedImageAttachment] {
+        &self.attachments
+    }
 }
 
 impl fmt::Debug for TurnIntent {
@@ -1122,7 +1126,7 @@ impl HostService {
         self.runtime.status(session_id.clone())
     }
 
-    fn effective_turn_execution_timeout(
+    pub(crate) fn effective_turn_execution_timeout(
         &self,
         intent: &TurnIntent,
     ) -> satelle_core::session::TimeoutPolicy {

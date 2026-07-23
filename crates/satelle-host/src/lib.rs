@@ -1315,17 +1315,33 @@ impl HostService {
         }
     }
 
+    fn run_command<'a>(&self, command: RunCommand<'a>, intent: &TurnIntent) -> RunCommand<'a> {
+        command
+            .with_execution_mode(intent.execution_mode())
+            .with_provider_intent(intent.provider_intent().clone())
+            .with_turn_execution_timeout(Some(self.effective_turn_execution_timeout(intent)))
+            .with_attachments(intent.attachments().to_vec())
+    }
+
+    fn steer_command<'a>(
+        &self,
+        command: SteerCommand<'a>,
+        intent: &TurnIntent,
+    ) -> SteerCommand<'a> {
+        command
+            .with_execution_mode(intent.execution_mode())
+            .with_provider_intent(intent.provider_intent().clone())
+            .with_turn_execution_timeout(Some(self.effective_turn_execution_timeout(intent)))
+            .with_attachments(intent.attachments().to_vec())
+    }
+
     pub fn run(
         &self,
         host: &str,
         intent: &TurnIntent,
     ) -> Result<TurnOutcome, TurnAdmissionFailure> {
         self.runtime
-            .run(
-                RunCommand::attached(host, intent.prompt())
-                    .with_execution_mode(intent.execution_mode())
-                    .with_provider_intent(intent.provider_intent().clone()),
-            )
+            .run(self.run_command(RunCommand::attached(host, intent.prompt()), intent))
             .map(crate::runtime::RuntimeTurnOutcome::into_command_outcome)
     }
 
@@ -1337,9 +1353,7 @@ impl HostService {
     ) -> Result<TurnOutcome, TurnAdmissionFailure> {
         self.runtime
             .run(
-                RunCommand::attached(host, intent.prompt())
-                    .with_execution_mode(intent.execution_mode())
-                    .with_provider_intent(intent.provider_intent().clone())
+                self.run_command(RunCommand::attached(host, intent.prompt()), intent)
                     .with_cancellation(cancellation),
             )
             .map(crate::runtime::RuntimeTurnOutcome::into_command_outcome)
@@ -1351,11 +1365,8 @@ impl HostService {
         intent: &TurnIntent,
     ) -> Result<PublicSession, SatelleError> {
         crate::runtime::admitted_session(
-            self.runtime.run(
-                RunCommand::detached(host, intent.prompt())
-                    .with_execution_mode(intent.execution_mode())
-                    .with_provider_intent(intent.provider_intent().clone()),
-            ),
+            self.runtime
+                .run(self.run_command(RunCommand::detached(host, intent.prompt()), intent)),
         )
     }
 
@@ -1367,9 +1378,7 @@ impl HostService {
     ) -> Result<PublicSession, SatelleError> {
         crate::runtime::admitted_session(
             self.runtime.run(
-                RunCommand::detached(host, intent.prompt())
-                    .with_execution_mode(intent.execution_mode())
-                    .with_provider_intent(intent.provider_intent().clone())
+                self.run_command(RunCommand::detached(host, intent.prompt()), intent)
                     .with_cancellation(cancellation),
             ),
         )
@@ -1381,11 +1390,10 @@ impl HostService {
         intent: &TurnIntent,
     ) -> Result<TurnOutcome, TurnAdmissionFailure> {
         self.runtime
-            .steer(
-                SteerCommand::attached(session_id.clone(), intent.prompt())
-                    .with_execution_mode(intent.execution_mode())
-                    .with_provider_intent(intent.provider_intent().clone()),
-            )
+            .steer(self.steer_command(
+                SteerCommand::attached(session_id.clone(), intent.prompt()),
+                intent,
+            ))
             .map(crate::runtime::RuntimeTurnOutcome::into_command_outcome)
     }
 
@@ -1397,10 +1405,11 @@ impl HostService {
     ) -> Result<TurnOutcome, TurnAdmissionFailure> {
         self.runtime
             .steer(
-                SteerCommand::attached(session_id.clone(), intent.prompt())
-                    .with_execution_mode(intent.execution_mode())
-                    .with_provider_intent(intent.provider_intent().clone())
-                    .with_cancellation(cancellation),
+                self.steer_command(
+                    SteerCommand::attached(session_id.clone(), intent.prompt()),
+                    intent,
+                )
+                .with_cancellation(cancellation),
             )
             .map(crate::runtime::RuntimeTurnOutcome::into_command_outcome)
     }
@@ -1410,13 +1419,10 @@ impl HostService {
         session_id: &SessionId,
         intent: &TurnIntent,
     ) -> Result<PublicSession, SatelleError> {
-        crate::runtime::admitted_session(
-            self.runtime.steer(
-                SteerCommand::detached(session_id.clone(), intent.prompt())
-                    .with_execution_mode(intent.execution_mode())
-                    .with_provider_intent(intent.provider_intent().clone()),
-            ),
-        )
+        crate::runtime::admitted_session(self.runtime.steer(self.steer_command(
+            SteerCommand::detached(session_id.clone(), intent.prompt()),
+            intent,
+        )))
     }
 
     pub fn steer_detached_with_cancellation(
@@ -1427,10 +1433,11 @@ impl HostService {
     ) -> Result<PublicSession, SatelleError> {
         crate::runtime::admitted_session(
             self.runtime.steer(
-                SteerCommand::detached(session_id.clone(), intent.prompt())
-                    .with_execution_mode(intent.execution_mode())
-                    .with_provider_intent(intent.provider_intent().clone())
-                    .with_cancellation(cancellation),
+                self.steer_command(
+                    SteerCommand::detached(session_id.clone(), intent.prompt()),
+                    intent,
+                )
+                .with_cancellation(cancellation),
             ),
         )
     }
