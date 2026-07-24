@@ -6,6 +6,7 @@ use satelle_core::{
     PublicResolvedProviderBinding,
 };
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use std::fmt;
 use zeroize::{Zeroize, Zeroizing};
 
@@ -45,12 +46,54 @@ define_schema_token!(
     "satelle.provider-binding-validation-response.v3"
 );
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct ProviderBindingAuthorizationRequest {
     schema_version: ProviderBindingAuthorizationSchema,
     #[serde(flatten)]
     authorization: ProviderBindingAuthorization,
+}
+
+const PROVIDER_BINDING_AUTHORIZATION_REQUEST_FIELDS: &[&str] = &[
+    "schema_version",
+    "requested_model_alias",
+    "requested_provider_alias",
+    "model",
+    "model_provider",
+    "endpoint",
+    "auth_source",
+    "experimental_provider_computer_use",
+];
+
+impl<'de> Deserialize<'de> for ProviderBindingAuthorizationRequest {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let fields = serde_json::Map::<String, Value>::deserialize(deserializer)?;
+        if let Some(unknown) = fields
+            .keys()
+            .find(|field| !PROVIDER_BINDING_AUTHORIZATION_REQUEST_FIELDS.contains(&field.as_str()))
+        {
+            return Err(serde::de::Error::unknown_field(
+                unknown,
+                PROVIDER_BINDING_AUTHORIZATION_REQUEST_FIELDS,
+            ));
+        }
+
+        #[derive(Deserialize)]
+        struct WireRequest {
+            schema_version: ProviderBindingAuthorizationSchema,
+            #[serde(flatten)]
+            authorization: ProviderBindingAuthorization,
+        }
+
+        let request: WireRequest =
+            serde_json::from_value(Value::Object(fields)).map_err(serde::de::Error::custom)?;
+        Ok(Self {
+            schema_version: request.schema_version,
+            authorization: request.authorization,
+        })
+    }
 }
 
 impl ProviderBindingAuthorizationRequest {
@@ -477,6 +520,23 @@ mod provider_binding_contract_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn provider_binding_authorization_rejects_unknown_top_level_fields() {
+        let error =
+            serde_json::from_value::<ProviderBindingAuthorizationRequest>(serde_json::json!({
+                "schema_version": "satelle.provider-binding-authorization.v1",
+                "requested_model_alias": "default",
+                "requested_provider_alias": "openai",
+                "model": "gpt-5",
+                "model_provider": "openai",
+                "experimental_provider_computer_use": false,
+                "bogus": true,
+            }))
+            .expect_err("unknown authorization request field must be rejected");
+
+        assert!(error.to_string().contains("unknown field `bogus`"));
+    }
 
     #[test]
     fn issuance_schema_is_exact_and_the_secret_moves_into_zeroizing_storage() {

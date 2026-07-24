@@ -10,6 +10,7 @@ CREATE TABLE provider_smoke_results (
     codex_version TEXT NOT NULL,
     native_runtime_version TEXT NOT NULL,
     provider_config_fingerprint TEXT NOT NULL,
+    provider_credential_fingerprint TEXT NOT NULL,
     status TEXT NOT NULL CHECK (status IN ('passed', 'failed')),
     failure_code TEXT,
     failure_reason TEXT,

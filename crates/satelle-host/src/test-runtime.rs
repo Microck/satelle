@@ -198,6 +198,7 @@ impl ComputerUseAdapter for FakeComputerUseAdapter {
         let provider_evidence = ProviderSmokeEvidence::new(
             format!("provider-smoke-{}", satelle_core::SessionId::new()),
             "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+            "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
             observed_at,
             observed_at + time::Duration::hours(24),
         )

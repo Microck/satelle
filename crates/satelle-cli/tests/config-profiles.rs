@@ -19,12 +19,20 @@ yolo = false
 transport = "local"
 adapter = "fake"
 
+[hosts.base-host.provider_bindings.base-provider.base-model]
+model = "base-model"
+model_provider = "base-provider"
+
 [hosts.work-host]
 transport = "local"
 adapter = "fake"
 daemon_idle_timeout = "12m"
 provider_smoke_success_cache_ttl = "1080m"
 provider_smoke_failure_cache_ttl = "8m"
+
+[hosts.work-host.provider_bindings.work-provider.work-model]
+model = "work-model"
+model_provider = "work-provider"
 
 [hosts.work-host.timeouts]
 provider_smoke_test = "11s"
@@ -450,8 +458,13 @@ allow_project_selection = true
 [profiles.unsafe]
 host = "local-demo"
 model_alias = "profile-model"
+provider_alias = "profile-provider"
 experimental_provider_computer_use = true
 yolo = true
+
+[hosts.local-demo.provider_bindings.profile-provider.profile-model]
+model = "profile-model"
+model_provider = "openai"
 "#,
         r#"
 profile = "unsafe"
@@ -501,6 +514,26 @@ profile = "unsafe"
         true
     );
     assert_eq!(explicit["effective"]["hosts"]["local-demo"]["yolo"], true);
+
+    fixture
+        .command()
+        .args([
+            "setup",
+            "--profile",
+            "unsafe",
+            "--component",
+            "provider-auth",
+            "--no-input",
+            "--yes",
+            "--json",
+        ])
+        .assert()
+        .success();
+    fixture
+        .command()
+        .args(["host", "release-state"])
+        .assert()
+        .success();
 
     let run = fixture
         .command()

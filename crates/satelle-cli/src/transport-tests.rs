@@ -288,6 +288,7 @@ fn lifecycle_readiness() -> Result<AdapterReadiness, SatelleError> {
     let provider_evidence = ProviderSmokeEvidence::new(
         format!("interrupt-provider-{}", SessionId::new()),
         "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+        "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
         observed_at,
         observed_at + time::Duration::hours(1),
     )

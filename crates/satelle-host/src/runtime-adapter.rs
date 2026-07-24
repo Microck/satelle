@@ -266,6 +266,7 @@ impl EvidenceWindow {
 pub struct ProviderSmokeEvidence {
     window: EvidenceWindow,
     provider_config_fingerprint: String,
+    provider_credential_fingerprint: String,
     source: ProviderSmokeSource,
 }
 
@@ -273,12 +274,14 @@ impl ProviderSmokeEvidence {
     pub fn new(
         result_id: impl Into<String>,
         provider_config_fingerprint: impl Into<String>,
+        provider_credential_fingerprint: impl Into<String>,
         observed_at: time::OffsetDateTime,
         expires_at: time::OffsetDateTime,
     ) -> Result<Self, EvidenceError> {
         Ok(Self {
             window: EvidenceWindow::new(result_id, observed_at, expires_at)?,
             provider_config_fingerprint: fingerprint(provider_config_fingerprint)?,
+            provider_credential_fingerprint: fingerprint(provider_credential_fingerprint)?,
             source: ProviderSmokeSource::Live,
         })
     }
@@ -294,6 +297,10 @@ impl ProviderSmokeEvidence {
 
     pub(crate) fn provider_config_fingerprint(&self) -> &str {
         &self.provider_config_fingerprint
+    }
+
+    pub(crate) fn provider_credential_fingerprint(&self) -> &str {
+        &self.provider_credential_fingerprint
     }
 
     pub(crate) const fn observed_at(&self) -> time::OffsetDateTime {
@@ -324,6 +331,7 @@ impl std::fmt::Debug for ProviderSmokeEvidence {
 pub struct ProviderSmokeFailureEvidence {
     window: EvidenceWindow,
     provider_config_fingerprint: String,
+    provider_credential_fingerprint: String,
     error_code: ErrorCode,
     failure_reason: String,
     source: ProviderSmokeSource,
@@ -333,6 +341,7 @@ impl ProviderSmokeFailureEvidence {
     pub fn new(
         result_id: impl Into<String>,
         provider_config_fingerprint: impl Into<String>,
+        provider_credential_fingerprint: impl Into<String>,
         error_code: ErrorCode,
         failure_reason: impl Into<String>,
         observed_at: time::OffsetDateTime,
@@ -341,6 +350,7 @@ impl ProviderSmokeFailureEvidence {
         Ok(Self {
             window: EvidenceWindow::new(result_id, observed_at, expires_at)?,
             provider_config_fingerprint: fingerprint(provider_config_fingerprint)?,
+            provider_credential_fingerprint: fingerprint(provider_credential_fingerprint)?,
             error_code,
             failure_reason: normalized_identifier(failure_reason)?,
             source: ProviderSmokeSource::Live,
@@ -358,6 +368,10 @@ impl ProviderSmokeFailureEvidence {
 
     pub(crate) fn provider_config_fingerprint(&self) -> &str {
         &self.provider_config_fingerprint
+    }
+
+    pub(crate) fn provider_credential_fingerprint(&self) -> &str {
+        &self.provider_credential_fingerprint
     }
 
     pub(crate) const fn error_code(&self) -> ErrorCode {
@@ -395,6 +409,15 @@ impl std::fmt::Debug for ProviderSmokeFailureEvidence {
 pub enum ProviderSmokeResult {
     Passed(ProviderSmokeEvidence),
     Failed(ProviderSmokeFailureEvidence),
+}
+
+impl ProviderSmokeResult {
+    pub(crate) fn provider_credential_fingerprint(&self) -> &str {
+        match self {
+            Self::Passed(evidence) => evidence.provider_credential_fingerprint(),
+            Self::Failed(evidence) => evidence.provider_credential_fingerprint(),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -960,8 +983,25 @@ mod evidence_tests {
         );
         assert_eq!(
             EvidenceError::InvalidWindow,
-            ProviderSmokeEvidence::new("provider-1", FINGERPRINT_A, observed_at, observed_at,)
-                .unwrap_err()
+            ProviderSmokeEvidence::new(
+                "provider-1",
+                FINGERPRINT_A,
+                FINGERPRINT_B,
+                observed_at,
+                observed_at,
+            )
+            .unwrap_err()
+        );
+        assert_eq!(
+            EvidenceError::InvalidFingerprint,
+            ProviderSmokeEvidence::new(
+                "provider-1",
+                FINGERPRINT_A,
+                "raw-secret",
+                observed_at,
+                observed_at + time::Duration::minutes(1),
+            )
+            .unwrap_err()
         );
     }
 
@@ -1218,6 +1258,7 @@ mod evidence_tests {
         ProviderSmokeEvidence::new(
             "provider-1",
             FINGERPRINT_A,
+            FINGERPRINT_B,
             observed_at,
             observed_at + time::Duration::hours(24),
         )

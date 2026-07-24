@@ -2124,6 +2124,7 @@ fn readiness_and_provider_results_round_trip_without_raw_evidence() {
     let provider = ProviderSmokeEvidence::new(
         "provider-smoke-1",
         cache_key.provider_config_fingerprint(),
+        "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
         observed_at,
         expires_at,
     )
@@ -2195,6 +2196,7 @@ fn readiness_and_provider_results_round_trip_without_raw_evidence() {
     let conflicting_provider = ProviderSmokeEvidence::new(
         "provider-smoke-1",
         cache_key.provider_config_fingerprint(),
+        "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
         observed_at,
         expires_at + time::Duration::minutes(1),
     )
@@ -2225,6 +2227,7 @@ fn readiness_and_provider_results_round_trip_without_raw_evidence() {
     let provider_failure = ProviderSmokeFailureEvidence::new(
         "provider-smoke-failure-1",
         cache_key.provider_config_fingerprint(),
+        "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
         satelle_core::ErrorCode::UnsupportedProviderComputerUse,
         "provider_smoke_provider_rejected",
         failure_observed_at,
@@ -2282,6 +2285,29 @@ fn readiness_and_provider_results_round_trip_without_raw_evidence() {
         .collect::<Result<Vec<_>, _>>()
         .unwrap();
     assert_eq!(vec!["failed"], provider_statuses);
+    assert!(
+        storage
+            .connection_for_test()
+            .execute(
+                "UPDATE provider_smoke_results
+                 SET provider_credential_fingerprint = NULL",
+                [],
+            )
+            .is_err(),
+        "the canonical provider-smoke schema requires a credential fingerprint"
+    );
+    storage
+        .connection_for_test()
+        .execute(
+            "UPDATE provider_smoke_results
+             SET provider_credential_fingerprint = 'not-a-fingerprint'",
+            [],
+        )
+        .expect("inject a malformed stored credential fingerprint");
+    let malformed = storage
+        .load_reusable_provider_smoke(&cache_key, failure_observed_at)
+        .expect_err("malformed credential fingerprints must fail closed");
+    assert_eq!(StorageErrorKind::InvalidStoredState, malformed.kind());
     storage.checkpoint_for_test();
     let bytes = fs::read(state.path().join(DATABASE_FILE_NAME)).unwrap();
     assert!(!contains_bytes(&bytes, b"raw stdout"));

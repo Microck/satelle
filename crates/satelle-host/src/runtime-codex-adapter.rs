@@ -60,6 +60,15 @@ struct ProviderProbePersistence<'a> {
     persist_turn_ref: &'a mut dyn FnMut(&str) -> Result<(), ()>,
 }
 
+struct ProviderSmokeInvocation<'a> {
+    key: &'a ReadinessCacheKey,
+    binding: &'a ResolvedProviderBinding,
+    provider_secret: Option<ResolvedProviderSecret>,
+    provider_credential_fingerprint: &'a str,
+    source: ProviderSmokeSource,
+    timeout_override: Option<Duration>,
+}
+
 fn supported_execution_version(
     snapshot: &crate::ProductionCapabilitySnapshot,
 ) -> Result<crate::codex_capabilities::CodexVersion, SatelleError> {
@@ -340,19 +349,21 @@ impl ProductionComputerUseAdapter {
                     AdapterPreflight::Ready,
                 )
             }
-            Err(ProviderSmokeAttemptFailure {
-                evidence: Some(failure),
-                error,
-            }) => AdapterPreflight::ProviderFailed {
-                key: key.clone(),
-                readiness: evidence,
-                failure,
-                error: *error,
-            },
-            Err(ProviderSmokeAttemptFailure {
-                evidence: None,
-                error,
-            }) => AdapterPreflight::UncachedFailure(*error),
+            Err(failure) => {
+                let ProviderSmokeAttemptFailure {
+                    evidence: provider_failure_evidence,
+                    error,
+                } = *failure;
+                match provider_failure_evidence {
+                    Some(failure) => AdapterPreflight::ProviderFailed {
+                        key: key.clone(),
+                        readiness: evidence,
+                        failure,
+                        error: *error,
+                    },
+                    None => AdapterPreflight::UncachedFailure(*error),
+                }
+            }
         }
     }
 
@@ -488,7 +499,7 @@ impl ProductionComputerUseAdapter {
         cached_provider: Option<ProviderSmokeResult>,
         provider_intent: &ProviderComputerUseIntent,
         persistence: &mut ProviderProbePersistence<'_>,
-    ) -> Result<Option<ProviderSmokeEvidence>, ProviderSmokeAttemptFailure> {
+    ) -> Result<Option<ProviderSmokeEvidence>, Box<ProviderSmokeAttemptFailure>> {
         if key
             .execution_policy()
             .experimental_features()
@@ -497,13 +508,24 @@ impl ProductionComputerUseAdapter {
         {
             return Ok(None);
         }
-        match cached_provider {
+        let provider_secret = resolve_provider_child_secret(binding).map_err(|error| {
+            Box::new(ProviderSmokeAttemptFailure {
+                evidence: None,
+                error: Box::new(error),
+            })
+        })?;
+        let provider_credential_fingerprint =
+            crate::provider_auth::provider_smoke_credential_fingerprint(
+                binding.binding_digest(),
+                provider_secret.as_ref(),
+            );
+        match matching_provider_cache(cached_provider, &provider_credential_fingerprint) {
             Some(ProviderSmokeResult::Passed(evidence)) => return Ok(Some(evidence)),
             Some(ProviderSmokeResult::Failed(failure)) => {
-                return Err(ProviderSmokeAttemptFailure {
+                return Err(Box::new(ProviderSmokeAttemptFailure {
                     evidence: None,
                     error: Box::new(provider_smoke_error_from_failure(&failure)),
-                });
+                }));
             }
             None => {}
         }
@@ -514,10 +536,14 @@ impl ProductionComputerUseAdapter {
             ProviderSmokeSource::Live
         };
         self.run_live_provider_smoke(
-            key,
-            binding,
-            source,
-            provider_intent.provider_smoke_timeout(),
+            ProviderSmokeInvocation {
+                key,
+                binding,
+                provider_secret,
+                provider_credential_fingerprint: &provider_credential_fingerprint,
+                source,
+                timeout_override: provider_intent.provider_smoke_timeout(),
+            },
             persistence,
         )
         .map(Some)
@@ -529,6 +555,7 @@ impl ProductionComputerUseAdapter {
                     ProviderSmokeFailureEvidence::new(
                         format!("provider-smoke-{}", satelle_core::SessionId::new()),
                         key.provider_config_fingerprint(),
+                        provider_credential_fingerprint,
                         error.code,
                         error
                             .details
@@ -550,44 +577,37 @@ impl ProductionComputerUseAdapter {
                 ),
                 None => error,
             };
-            ProviderSmokeAttemptFailure {
+            Box::new(ProviderSmokeAttemptFailure {
                 evidence,
                 error: Box::new(error),
-            }
+            })
         })
     }
 
     fn run_live_provider_smoke(
         &self,
-        key: &ReadinessCacheKey,
-        binding: &ResolvedProviderBinding,
-        source: ProviderSmokeSource,
-        timeout_override: Option<Duration>,
+        invocation: ProviderSmokeInvocation<'_>,
         persistence: &mut ProviderProbePersistence<'_>,
     ) -> Result<ProviderSmokeEvidence, SatelleError> {
-        self.run_live_provider_smoke_with_app_server(
-            key,
-            binding,
-            source,
-            timeout_override,
-            persistence,
-            || {
-                preserve_managed_codex_error(
-                    crate::codex_capabilities::installed_app_server_command(),
-                )
-            },
-        )
+        self.run_live_provider_smoke_with_app_server(invocation, persistence, || {
+            preserve_managed_codex_error(crate::codex_capabilities::installed_app_server_command())
+        })
     }
 
     fn run_live_provider_smoke_with_app_server(
         &self,
-        key: &ReadinessCacheKey,
-        binding: &ResolvedProviderBinding,
-        source: ProviderSmokeSource,
-        timeout_override: Option<Duration>,
+        invocation: ProviderSmokeInvocation<'_>,
         persistence: &mut ProviderProbePersistence<'_>,
         app_server_command: impl FnOnce() -> Result<Command, SatelleError>,
     ) -> Result<ProviderSmokeEvidence, SatelleError> {
+        let ProviderSmokeInvocation {
+            key,
+            binding,
+            provider_secret,
+            provider_credential_fingerprint,
+            source,
+            timeout_override,
+        } = invocation;
         let timeout = timeout_override.unwrap_or(self.provider_smoke_timeout);
         let probe = crate::provider_probe::ProviderProbeSurface::start(timeout)
             .map_err(|error| mark_probe_dispatch_possible(provider_smoke_failure(error), false))?;
@@ -607,7 +627,6 @@ impl ProductionComputerUseAdapter {
         let prompt = format!(
             "Use native Computer Use only to open {page_url} in the approved visible browser. Read the nonce shown on the page, drag the marker into the drop target, and stop. Do not use shell, file, or network tools."
         );
-        let provider_secret = resolve_provider_child_secret(binding)?;
         let run = run_codex_session_with_timeout_cancellation(
             app_server_command()?,
             provider_smoke_session_request(
@@ -642,6 +661,7 @@ impl ProductionComputerUseAdapter {
         ProviderSmokeEvidence::new(
             format!("provider-smoke-{}", satelle_core::SessionId::new()),
             key.provider_config_fingerprint(),
+            provider_credential_fingerprint,
             observed_at,
             expires_at,
         )
@@ -1302,6 +1322,15 @@ fn provider_cache_for_preflight(
     refresh: bool,
 ) -> Option<ProviderSmokeResult> {
     if refresh { None } else { cached }
+}
+
+fn matching_provider_cache(
+    cached: Option<ProviderSmokeResult>,
+    provider_credential_fingerprint: &str,
+) -> Option<ProviderSmokeResult> {
+    cached.filter(|result| {
+        result.provider_credential_fingerprint() == provider_credential_fingerprint
+    })
 }
 
 fn matching_cached_evidence(
@@ -2990,14 +3019,6 @@ mod tests {
             "endpoint changes must invalidate provider smoke evidence"
         );
         let observed_at = time::OffsetDateTime::now_utc();
-        let provider = ProviderSmokeEvidence::new(
-            "provider-smoke-cached",
-            key.provider_config_fingerprint(),
-            observed_at,
-            observed_at + time::Duration::hours(24),
-        )
-        .unwrap()
-        .with_source(ProviderSmokeSource::Cache);
         let mut persist_thread_ref = |_value: &str| Ok(());
         let mut persist_turn_ref = |_value: &str| Ok(());
         let mut persistence = ProviderProbePersistence {
@@ -3007,6 +3028,20 @@ mod tests {
         };
         let provider_intent = ProviderComputerUseIntent::new(None, None, false);
         let binding = resolved_provider_binding_for_test("model-provider-cache", "provider-cache");
+        let provider_credential_fingerprint =
+            crate::provider_auth::provider_smoke_credential_fingerprint(
+                binding.binding_digest(),
+                None,
+            );
+        let provider = ProviderSmokeEvidence::new(
+            "provider-smoke-cached",
+            key.provider_config_fingerprint(),
+            &provider_credential_fingerprint,
+            observed_at,
+            observed_at + time::Duration::hours(24),
+        )
+        .unwrap()
+        .with_source(ProviderSmokeSource::Cache);
 
         assert_eq!(
             adapter
@@ -3018,12 +3053,13 @@ mod tests {
                     &mut persistence,
                 )
                 .unwrap(),
-            Some(provider)
+            Some(provider.clone())
         );
 
         let provider_failure = ProviderSmokeFailureEvidence::new(
             "provider-smoke-failed",
             key.provider_config_fingerprint(),
+            &provider_credential_fingerprint,
             ErrorCode::UnsupportedProviderComputerUse,
             "provider_smoke_provider_rejected",
             observed_at,
@@ -3057,10 +3093,30 @@ mod tests {
         assert!(cached_failure.error.details["provider_smoke_expires_at"].is_string());
         assert!(cached_failure.error.details["provider_smoke_age_ms"].is_u64());
 
+        let rotated_credential_fingerprint =
+            "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd";
+        assert!(
+            matching_provider_cache(
+                Some(ProviderSmokeResult::Passed(provider.clone())),
+                rotated_credential_fingerprint,
+            )
+            .is_none(),
+            "a rotated credential must turn a cached pass into a live-smoke miss"
+        );
+        assert!(
+            matching_provider_cache(
+                Some(ProviderSmokeResult::Failed(provider_failure.clone())),
+                rotated_credential_fingerprint,
+            )
+            .is_none(),
+            "a rotated credential must turn a cached failure into a live-smoke miss"
+        );
+
         let refreshed_pass = ProviderSmokeResult::Passed(
             ProviderSmokeEvidence::new(
                 "provider-smoke-refresh-pass",
                 key.provider_config_fingerprint(),
+                &provider_credential_fingerprint,
                 observed_at,
                 observed_at + time::Duration::hours(24),
             )
@@ -3120,6 +3176,11 @@ mod tests {
         )
         .unwrap()
         .with_provider_binding(&binding);
+        let provider_credential_fingerprint =
+            crate::provider_auth::provider_smoke_credential_fingerprint(
+                binding.binding_digest(),
+                None,
+            );
 
         for (scenario, should_pass) in [
             ("provider-probe-responses", true),
@@ -3151,10 +3212,14 @@ mod tests {
                 persist_turn_ref: &mut persist_turn_ref,
             };
             let outcome = adapter.run_live_provider_smoke_with_app_server(
-                &key,
-                &binding,
-                ProviderSmokeSource::Live,
-                Some(Duration::from_secs(2)),
+                ProviderSmokeInvocation {
+                    key: &key,
+                    binding: &binding,
+                    provider_secret: None,
+                    provider_credential_fingerprint: &provider_credential_fingerprint,
+                    source: ProviderSmokeSource::Live,
+                    timeout_override: Some(Duration::from_secs(2)),
+                },
                 &mut persistence,
                 || Ok(command),
             );

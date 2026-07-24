@@ -491,6 +491,7 @@ impl ComputerUseAdapter for ControlledAdmissionAdapter {
         let provider_evidence = ProviderSmokeEvidence::new(
             format!("raw-wire-provider-{}", satelle_core::SessionId::new()),
             "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+            "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
             observed_at,
             observed_at + time::Duration::hours(24),
         )

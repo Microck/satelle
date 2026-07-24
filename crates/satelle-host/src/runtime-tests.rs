@@ -338,6 +338,9 @@ fn host_config_binding_precedes_colliding_persisted_user_config_without_secret_r
     let resolved = runtime
         .resolve_provider_binding(LOCAL_DEMO_HOST, &intent)
         .expect("Host config must win without resolving either missing secret");
+    let crate::ProviderBindingResolution::Ready(resolved) = resolved else {
+        panic!("Host config binding must be ready");
+    };
 
     assert_eq!(
         resolved.source(),
@@ -415,6 +418,7 @@ fn replacing_or_deleting_persisted_binding_prevents_restored_digest_cache_reuse(
     let provider = ProviderSmokeEvidence::new(
         "first-binding-provider-smoke",
         first_key.provider_config_fingerprint(),
+        "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
         observed_at,
         observed_at + time::Duration::hours(24),
     )
@@ -492,6 +496,7 @@ fn replacing_or_deleting_persisted_binding_prevents_restored_digest_cache_reuse(
     let restored_provider = ProviderSmokeEvidence::new(
         "restored-binding-provider-smoke",
         first_key.provider_config_fingerprint(),
+        "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
         observed_at,
         observed_at + time::Duration::hours(24),
     )
@@ -1800,6 +1805,7 @@ impl ProviderProbeRecoveryAdapter {
         let provider_evidence = super::ProviderSmokeEvidence::new(
             format!("provider-probe-smoke-{}", SessionId::new()),
             key.provider_config_fingerprint(),
+            "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
             now,
             now + time::Duration::hours(24),
         )
@@ -1994,6 +2000,7 @@ impl ReadinessProbeDriver for ProviderProbeRecoveryAdapter {
         let failure = ProviderSmokeFailureEvidence::new(
             "provider-probe-outcome-unknown",
             key.provider_config_fingerprint(),
+            "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
             ErrorCode::ProviderSmokeTestTimeout,
             "provider_smoke_timed_out",
             now,

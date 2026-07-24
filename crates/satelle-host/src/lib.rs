@@ -51,9 +51,9 @@ pub(crate) use runtime::ReadinessSource;
 pub use runtime::{
     AdapterPreflight, AdapterReadiness, AdapterSubject, AdmissionCancellation, ComputerUseAdapter,
     EvidenceError, ExecuteRequest, ExecuteResult, MaintenanceOperationHandle,
-    ProviderComputerUseIntent, ProviderSmokeEvidence, ProviderSmokeFailureEvidence,
-    ProviderSmokeResult, ProviderSmokeSource, ReadinessCacheKey, ReadinessEvidence,
-    ReadinessObservationState, RecoveryObservation,
+    ProviderBindingResolution, ProviderComputerUseIntent, ProviderSmokeEvidence,
+    ProviderSmokeFailureEvidence, ProviderSmokeResult, ProviderSmokeSource, ReadinessCacheKey,
+    ReadinessEvidence, ReadinessObservationState, RecoveryObservation,
 };
 use runtime::{ProductionComputerUseAdapter, RunCommand, RuntimeHandle, SteerCommand, StopCommand};
 use satelle_core::session::{PublicSession, TurnAdmissionFailure};
@@ -1392,13 +1392,23 @@ impl HostService {
             return Err(SatelleError::invalid_usage("unsupported doctor scope"));
         }
         let mut provider_auth_evidence = if matches!(scope, Some("provider" | "all")) {
-            let binding = self
-                .runtime
-                .resolve_provider_binding(host, provider_intent)?;
-            Some((
-                provider_auth::diagnose_provider_secret(binding.auth_source(), None, false),
-                satelle_core::ProviderAuthObservationSource::Deferred,
-            ))
+            let evidence = match self.resolve_provider_binding(host, provider_intent)? {
+                ProviderBindingResolution::Ready(binding) => match binding.auth_source() {
+                    Some(source) => (
+                        provider_auth::diagnose_provider_secret(Some(source), None, false),
+                        satelle_core::ProviderAuthObservationSource::Deferred,
+                    ),
+                    None => (
+                        satelle_core::ProviderAuthValidationOutcome::Resolved,
+                        satelle_core::ProviderAuthObservationSource::Cached,
+                    ),
+                },
+                ProviderBindingResolution::MissingDescriptor { .. } => (
+                    satelle_core::ProviderAuthValidationOutcome::MissingDescriptor,
+                    satelle_core::ProviderAuthObservationSource::Deferred,
+                ),
+            };
+            Some(evidence)
         } else {
             None
         };
@@ -1465,6 +1475,14 @@ impl HostService {
 
     /// Reports cached provider-auth evidence without resolving a secret, or
     /// delegates an explicit live refresh to the normal provider-smoke path.
+    pub fn resolve_provider_binding(
+        &self,
+        host: &str,
+        provider_intent: &ProviderComputerUseIntent,
+    ) -> Result<ProviderBindingResolution, SatelleError> {
+        self.runtime.resolve_provider_binding(host, provider_intent)
+    }
+
     pub fn authorize_provider_binding(
         &self,
         host: &str,
@@ -1552,16 +1570,31 @@ impl HostService {
                 matches!(mode, ProviderAuthValidationMode::RefreshProviderSmoke),
             )
         };
-        let resolved_binding = self.runtime.resolve_provider_binding(host, &intent)?;
-        let deferred_outcome =
-            provider_auth::diagnose_provider_secret(resolved_binding.auth_source(), None, false);
+        let (resolved_binding, deferred_outcome, deferred_source) =
+            match self.resolve_provider_binding(host, &intent)? {
+                ProviderBindingResolution::Ready(binding) => {
+                    let (outcome, source) = match binding.auth_source() {
+                        Some(source) => (
+                            provider_auth::diagnose_provider_secret(Some(source), None, false),
+                            ProviderAuthObservationSource::Deferred,
+                        ),
+                        None => (
+                            ProviderAuthValidationOutcome::Resolved,
+                            ProviderAuthObservationSource::Cached,
+                        ),
+                    };
+                    (binding, outcome, source)
+                }
+                ProviderBindingResolution::MissingDescriptor { binding, .. } => (
+                    binding,
+                    ProviderAuthValidationOutcome::MissingDescriptor,
+                    ProviderAuthObservationSource::Deferred,
+                ),
+            };
         if deferred_outcome != ProviderAuthValidationOutcome::ConfiguredDeferred {
             return Ok(ProviderDescriptorValidation::new(
                 resolved_binding,
-                ProviderAuthValidationResult::new(
-                    deferred_outcome,
-                    ProviderAuthObservationSource::Deferred,
-                ),
+                ProviderAuthValidationResult::new(deferred_outcome, deferred_source),
             ));
         }
 

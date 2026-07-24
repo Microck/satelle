@@ -94,6 +94,30 @@ struct AdmissionExecution<'a> {
     attachments: crate::attachment::StagedAttachments,
 }
 
+/// The Host's closed resolution result for one exact model/provider pair.
+///
+/// A named but unavailable descriptor stays observable to setup and
+/// diagnostics without pretending that the binding is execution-ready.
+#[derive(Clone, Debug)]
+pub enum ProviderBindingResolution {
+    Ready(ResolvedProviderBinding),
+    MissingDescriptor {
+        binding: ResolvedProviderBinding,
+        auth_source_name: String,
+    },
+}
+
+impl ProviderBindingResolution {
+    fn into_ready(self) -> Result<ResolvedProviderBinding, SatelleError> {
+        match self {
+            Self::Ready(binding) => Ok(binding),
+            Self::MissingDescriptor {
+                auth_source_name, ..
+            } => Err(provider_secret_source_missing(&auth_source_name)),
+        }
+    }
+}
+
 /// Exclusive in-process authority for one live setup or repair operation.
 ///
 /// The handle is intentionally non-Clone. Dropping it without a successful
@@ -1093,29 +1117,42 @@ impl RuntimeEngine {
         &self,
         provider_intent: &ProviderComputerUseIntent,
     ) -> Result<ProviderComputerUseIntent, SatelleError> {
-        let requested_pair = match (provider_intent.model(), provider_intent.provider()) {
-            (None, None) => return Ok(provider_intent.clone()),
-            (Some(model), Some(provider)) => (model.as_str(), provider.as_str()),
-            _ => return Err(model_provider_binding_missing(provider_intent)),
+        let Some(resolution) = self.resolve_requested_provider_binding(provider_intent)? else {
+            return Ok(provider_intent.clone());
         };
-        let binding = match self.resolve_remote_host_binding(requested_pair.0, requested_pair.1)? {
-            Some(binding) => binding,
-            None => self
-                .lock_storage()?
-                .load_authorized_provider_binding(requested_pair.0, requested_pair.1)
-                .map_err(model::storage_failure)?
-                .ok_or_else(|| model_provider_binding_missing(provider_intent))?,
-        };
+        let binding = resolution.into_ready()?;
         Ok(provider_intent
             .clone()
             .with_resolved_provider_binding(binding))
+    }
+
+    fn resolve_requested_provider_binding(
+        &self,
+        provider_intent: &ProviderComputerUseIntent,
+    ) -> Result<Option<ProviderBindingResolution>, SatelleError> {
+        let requested_pair = match (provider_intent.model(), provider_intent.provider()) {
+            (None, None) => return Ok(None),
+            (Some(model), Some(provider)) => (model.as_str(), provider.as_str()),
+            _ => return Err(model_provider_binding_missing(provider_intent)),
+        };
+        if let Some(resolution) =
+            self.resolve_remote_host_binding(requested_pair.0, requested_pair.1)?
+        {
+            return Ok(Some(resolution));
+        }
+        let binding = self
+            .lock_storage()?
+            .load_authorized_provider_binding(requested_pair.0, requested_pair.1)
+            .map_err(model::storage_failure)?
+            .ok_or_else(|| model_provider_binding_missing(provider_intent))?;
+        Ok(Some(ProviderBindingResolution::Ready(binding)))
     }
 
     fn resolve_remote_host_binding(
         &self,
         model_alias: &str,
         provider_alias: &str,
-    ) -> Result<Option<ResolvedProviderBinding>, SatelleError> {
+    ) -> Result<Option<ProviderBindingResolution>, SatelleError> {
         let Some(binding) = self
             .provider_policy
             .provider_bindings
@@ -1133,15 +1170,23 @@ impl RuntimeEngine {
         if let Some(endpoint) = binding.endpoint.as_deref() {
             authorization = authorization.with_endpoint(endpoint);
         }
-        if let Some(auth_source_name) = binding.auth_source.as_deref() {
-            let descriptor = self
-                .provider_policy
-                .provider_auth
-                .get(auth_source_name)
-                .cloned()
-                .ok_or_else(|| provider_secret_source_missing(auth_source_name))?;
-            authorization = authorization.with_auth_source(descriptor);
-        }
+        let missing_auth_source_name =
+            if let Some(auth_source_name) = binding.auth_source.as_deref() {
+                match self
+                    .provider_policy
+                    .provider_auth
+                    .get(auth_source_name)
+                    .cloned()
+                {
+                    Some(descriptor) => {
+                        authorization = authorization.with_auth_source(descriptor);
+                        None
+                    }
+                    None => Some(auth_source_name.to_string()),
+                }
+            } else {
+                None
+            };
         let experimental = self
             .provider_policy
             .experimental_provider_computer_use_by_provider
@@ -1151,23 +1196,30 @@ impl RuntimeEngine {
             .unwrap_or(false);
         authorization = authorization.with_experimental_provider_computer_use(experimental);
         crate::validate_provider_binding_authorization(&authorization)?;
-        Ok(Some(ResolvedProviderBinding::from_authorization(
+        let binding = ResolvedProviderBinding::from_authorization(
             authorization,
             ProviderBindingSource::HostOwned,
-        )))
+        );
+        Ok(Some(match missing_auth_source_name {
+            Some(auth_source_name) => ProviderBindingResolution::MissingDescriptor {
+                binding,
+                auth_source_name,
+            },
+            None => ProviderBindingResolution::Ready(binding),
+        }))
     }
 
     fn resolve_provider_binding(
         &self,
         host: &str,
         provider_intent: &ProviderComputerUseIntent,
-    ) -> Result<ResolvedProviderBinding, SatelleError> {
-        let provider_intent = self.authorize_provider_intent(provider_intent)?;
-        if let Some(binding) = provider_intent.resolved_provider_binding() {
-            return Ok(binding.clone());
+    ) -> Result<ProviderBindingResolution, SatelleError> {
+        if let Some(resolution) = self.resolve_requested_provider_binding(provider_intent)? {
+            return Ok(resolution);
         }
         self.adapter
-            .resolve_provider_binding(host, &provider_intent)
+            .resolve_provider_binding(host, provider_intent)
+            .map(ProviderBindingResolution::Ready)
     }
 
     pub(crate) fn authorize_provider_binding(
@@ -1917,6 +1969,29 @@ impl RuntimeHandle {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn new_with_provider_policy<A: ComputerUseAdapter>(
+        state_root: Result<PathBuf, SatelleError>,
+        adapter: A,
+        provider_policy: RuntimeProviderPolicy,
+    ) -> Self {
+        let operator_log_root = state_root
+            .as_ref()
+            .map(|root| root.join("logs"))
+            .map_err(Clone::clone);
+        Self {
+            adapter: Arc::new(adapter),
+            readiness_probe_driver: None,
+            activity: Arc::new(DaemonActivity::default()),
+            lazy: Arc::new(Mutex::new(LazyRuntime {
+                state_root,
+                operator_log_root,
+                engine: None,
+                provider_policy,
+            })),
+        }
+    }
+
     pub(crate) fn new_production(
         state_root: Result<PathBuf, SatelleError>,
         operator_log_root: Result<PathBuf, SatelleError>,
@@ -2251,7 +2326,7 @@ impl RuntimeHandle {
         &self,
         host: &str,
         provider_intent: &ProviderComputerUseIntent,
-    ) -> Result<satelle_core::ResolvedProviderBinding, SatelleError> {
+    ) -> Result<ProviderBindingResolution, SatelleError> {
         self.engine()?
             .resolve_provider_binding(host, provider_intent)
     }

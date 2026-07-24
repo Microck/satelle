@@ -2243,10 +2243,11 @@ fn run_setup(
                     satelle_core::ProviderAuthValidationMode::Cached,
                 ) {
                     Ok(validation) => {
-                        provider_auth_validation = Some(accept_setup_provider_auth_validation(
+                        provider_auth_validation = accept_setup_provider_auth_validation(
                             &mut report,
+                            &provider_selection,
                             validation,
-                        )?);
+                        )?;
                     }
                     Err(error) if error.code == ErrorCode::ModelProviderBindingMissing => {
                         provider_selection =
@@ -2256,7 +2257,10 @@ fn run_setup(
                 }
             }
 
-            if provider_auth_validation.is_none() && provider_selection.authorization.is_some() {
+            if provider_auth_validation.is_none()
+                && report.required_input.is_empty()
+                && provider_selection.authorization.is_some()
+            {
                 if interactive_selection
                     && provider_selection
                         .authorization
@@ -2466,47 +2470,70 @@ fn run_setup(
             } else {
                 transport_for(&host)?
             };
-            match provider_transport.validate_provider_descriptor(
+            let pending_authorization = match provider_transport.validate_provider_descriptor(
                 model_alias,
                 provider_alias,
                 satelle_core::ProviderAuthValidationMode::Cached,
             ) {
                 Ok(validation) => {
-                    provider_auth_validation = Some(accept_setup_provider_auth_validation(
+                    provider_auth_validation = accept_setup_provider_auth_validation(
                         &mut report,
+                        &provider_selection,
                         validation,
-                    )?);
+                    )?;
+                    if provider_auth_validation.is_none() {
+                        pending_provider_binding_authorization.as_ref()
+                    } else {
+                        None
+                    }
                 }
                 Err(error) if error.code == ErrorCode::ModelProviderBindingMissing => {
                     let Some(authorization) = pending_provider_binding_authorization.as_ref()
                     else {
                         return Err(failure(error));
                     };
-                    provider_transport
-                        .authorize_provider_binding(authorization)
+                    Some(authorization)
+                }
+                Err(error) => return Err(failure(error)),
+            };
+            if let Some(authorization) = pending_authorization {
+                provider_transport
+                    .authorize_provider_binding(authorization)
+                    .map_err(failure)?;
+                let validation = (|| {
+                    let validation = provider_transport
+                        .validate_provider_descriptor(
+                            authorization.requested_model_alias(),
+                            authorization.requested_provider_alias(),
+                            satelle_core::ProviderAuthValidationMode::RefreshProviderSmoke,
+                        )
                         .map_err(failure)?;
-                    let validation = (|| {
-                        let validation = provider_transport
-                            .validate_provider_descriptor(
+                    accept_setup_provider_auth_validation(
+                        &mut report,
+                        &provider_selection,
+                        validation,
+                    )
+                })();
+                let validation = match validation {
+                    Ok(validation) => validation,
+                    Err(error) => {
+                        provider_transport
+                            .delete_provider_binding(
                                 authorization.requested_model_alias(),
                                 authorization.requested_provider_alias(),
-                                satelle_core::ProviderAuthValidationMode::RefreshProviderSmoke,
                             )
                             .map_err(failure)?;
-                        accept_setup_provider_auth_validation(&mut report, validation)
-                    })();
-                    let validation = match validation {
-                        Ok(validation) => validation,
-                        Err(error) => {
-                            provider_transport
-                                .delete_provider_binding(
-                                    authorization.requested_model_alias(),
-                                    authorization.requested_provider_alias(),
-                                )
-                                .map_err(failure)?;
-                            return Err(error);
-                        }
-                    };
+                        return Err(error);
+                    }
+                };
+                if validation.is_none() {
+                    provider_transport
+                        .delete_provider_binding(
+                            authorization.requested_model_alias(),
+                            authorization.requested_provider_alias(),
+                        )
+                        .map_err(failure)?;
+                } else {
                     if let Some((auth_source_name, descriptor)) = &pending_provider_auth
                         && let Err(error) = persist_provider_auth_descriptor(
                             &user_config_path,
@@ -2532,9 +2559,18 @@ fn run_setup(
                             host.alias
                         ));
                     }
-                    provider_auth_validation = Some(validation);
+                    report.applied_actions.push(format!(
+                        "authorize provider binding '{}/{}' on Host '{}'",
+                        authorization.requested_provider_alias(),
+                        authorization.requested_model_alias(),
+                        host.alias
+                    ));
+                    report.mutated = true;
+                    if report.status == "planned" {
+                        report.status = "applied".to_string();
+                    }
                 }
-                Err(error) => return Err(failure(error)),
+                provider_auth_validation = validation;
             }
         }
 
@@ -2542,7 +2578,7 @@ fn run_setup(
         if let Some(decision) = &local_service_decision {
             apply_service_decision_to_report(&mut report, decision);
         }
-        if provider_auth_validation.is_none() {
+        if provider_auth_validation.is_none() && report.required_input.is_empty() {
             add_setup_required_inputs(&mut report, &provider_selection, provider_auth_setup);
         }
         if let Some(action) = persisted_provider_auth_action {
@@ -2678,14 +2714,41 @@ fn trust_first_ssh_host_during_setup(
 
 fn accept_setup_provider_auth_validation(
     report: &mut SetupReport,
+    provider_selection: &ProviderSelection,
     validation: transport::ProviderDescriptorValidationReport,
-) -> Result<transport::ProviderDescriptorValidationReport, CliFailure> {
-    use satelle_core::ProviderAuthValidationOutcome::{ConfiguredDeferred, Resolved};
+) -> Result<Option<transport::ProviderDescriptorValidationReport>, CliFailure> {
+    use satelle_core::ProviderAuthValidationOutcome::{
+        ConfiguredDeferred, MissingDescriptor, Resolved,
+    };
+
+    if provider_selection.auth_source_name.is_some()
+        && provider_selection
+            .authorization
+            .as_ref()
+            .and_then(ProviderBindingAuthorization::auth_source)
+            .is_none()
+    {
+        add_missing_provider_descriptor_required_input(report, provider_selection);
+        return Ok(None);
+    }
+    if let Some(authorization) = provider_selection.authorization.as_ref() {
+        let current_binding = satelle_core::ResolvedProviderBinding::from_authorization(
+            authorization.clone(),
+            satelle_core::ProviderBindingSource::UserConfig,
+        );
+        if current_binding.binding_digest() != validation.resolved_binding.binding_digest() {
+            return Ok(None);
+        }
+    }
 
     let outcome = validation.validation.outcome();
     report.readiness_summary.provider_auth = outcome.as_str().to_string();
     if matches!(outcome, ConfiguredDeferred | Resolved) {
-        return Ok(validation);
+        return Ok(Some(validation));
+    }
+    if outcome == MissingDescriptor {
+        add_missing_provider_descriptor_required_input(report, provider_selection);
+        return Ok(None);
     }
     Err(failure(SatelleError::config_error(
         format!(
@@ -2694,6 +2757,31 @@ fn accept_setup_provider_auth_validation(
         ),
         None,
     )))
+}
+
+fn add_missing_provider_descriptor_required_input(
+    report: &mut SetupReport,
+    provider_selection: &ProviderSelection,
+) {
+    let Some(auth_source_name) = provider_selection.auth_source_name.as_deref() else {
+        return;
+    };
+    report.status = "input_required".to_string();
+    report.readiness_summary.provider_auth = "missing_descriptor".to_string();
+    report.required_input.push(SetupRequiredInput {
+        component: "provider-auth".to_string(),
+        input_kind: "provider_secret_source_descriptor".to_string(),
+        reason: format!(
+            "the effective provider binding requires host-resolved Secret Source descriptor '{auth_source_name}'; raw provider secrets are not accepted through setup"
+        ),
+        recovery_command: format!(
+            "add [hosts.<alias>.provider_auth.{auth_source_name}] to user-level config, then rerun satelle setup --no-input --json"
+        ),
+    });
+    report.recovery_commands.push(
+        "add a host-resolved provider_auth Secret Source descriptor to user-level config"
+            .to_string(),
+    );
 }
 
 fn add_setup_required_inputs(
@@ -6811,23 +6899,50 @@ fn run_prompt(
             return Err(transport_failure);
         }
     };
-    let provider_validation = report_not_admitted(
-        &mut event_output,
-        Some(&host.alias),
-        transport
-            .validate_provider_descriptor(
-                provider_selection
-                    .requested_model_alias
-                    .as_deref()
-                    .unwrap_or("codex-default"),
-                provider_selection
-                    .requested_provider_alias
-                    .as_deref()
-                    .unwrap_or("codex-default"),
-                satelle_core::ProviderAuthValidationMode::Cached,
-            )
-            .map_err(failure),
-    )?;
+    let provider_validation = match transport.validate_provider_descriptor(
+        provider_selection
+            .requested_model_alias
+            .as_deref()
+            .unwrap_or("codex-default"),
+        provider_selection
+            .requested_provider_alias
+            .as_deref()
+            .unwrap_or("codex-default"),
+        satelle_core::ProviderAuthValidationMode::Cached,
+    ) {
+        Ok(validation) => validation,
+        Err(error) => {
+            let error = if host.config.transport == satelle_core::TransportKind::Direct
+                && error.code == ErrorCode::HostUnreachable
+            {
+                SatelleError::direct_daemon_unreachable(&host.alias)
+            } else {
+                error
+            };
+            let validation_failure = failure(error);
+            if !command.detach {
+                event_output
+                    .emit_preflight(
+                        &host.alias,
+                        "run",
+                        &host.config.transport,
+                        &provider_selection,
+                        None,
+                        command.refresh_provider_smoke_test,
+                    )
+                    .map_err(failure)?;
+                event_output
+                    .emit_command_failed(
+                        &host.alias,
+                        &validation_failure.error,
+                        TurnAdmissionPhase::NotAdmitted,
+                        None,
+                    )
+                    .map_err(failure)?;
+            }
+            return Err(validation_failure);
+        }
+    };
     print_experimental_provider_warning(
         &provider_validation,
         command.quiet,
@@ -7012,23 +7127,43 @@ fn steer_prompt(
             return Err(transport_failure);
         }
     };
-    let provider_validation = report_not_admitted(
-        &mut event_output,
-        Some(&host.alias),
-        transport
-            .validate_provider_descriptor(
-                provider_selection
-                    .requested_model_alias
-                    .as_deref()
-                    .unwrap_or("codex-default"),
-                provider_selection
-                    .requested_provider_alias
-                    .as_deref()
-                    .unwrap_or("codex-default"),
-                satelle_core::ProviderAuthValidationMode::Cached,
-            )
-            .map_err(failure),
-    )?;
+    let provider_validation = match transport.validate_provider_descriptor(
+        provider_selection
+            .requested_model_alias
+            .as_deref()
+            .unwrap_or("codex-default"),
+        provider_selection
+            .requested_provider_alias
+            .as_deref()
+            .unwrap_or("codex-default"),
+        satelle_core::ProviderAuthValidationMode::Cached,
+    ) {
+        Ok(validation) => validation,
+        Err(error) => {
+            let validation_failure = failure(error);
+            if !command.detach {
+                event_output
+                    .emit_preflight(
+                        &host.alias,
+                        "steer",
+                        &host.config.transport,
+                        &provider_selection,
+                        None,
+                        command.refresh_provider_smoke_test,
+                    )
+                    .map_err(failure)?;
+                event_output
+                    .emit_command_failed(
+                        &host.alias,
+                        &validation_failure.error,
+                        TurnAdmissionPhase::NotAdmitted,
+                        None,
+                    )
+                    .map_err(failure)?;
+            }
+            return Err(validation_failure);
+        }
+    };
     print_experimental_provider_warning(
         &provider_validation,
         command.quiet,

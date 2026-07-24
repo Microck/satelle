@@ -237,6 +237,81 @@ fn write_user_config(
     test_file::write_user_controlled(path.as_ref(), contents)
 }
 
+fn authorize_default_provider_binding(state: &TestStateDir) -> std::path::PathBuf {
+    let config_file = state.path().join("provider-binding-config.toml");
+    let secret_file = state.path().join("provider-token");
+    test_file::write_user_controlled(&secret_file, b"fixture-provider-token")
+        .expect("write fixture provider token");
+    let secret_path = toml::Value::String(secret_file.to_string_lossy().into_owned()).to_string();
+    write_user_config(
+        &config_file,
+        format!(
+            r#"
+default_host = "local-demo"
+model_alias = "fixture-model"
+provider_alias = "fixture-provider"
+
+[hosts.local-demo]
+transport = "local"
+adapter = "fake"
+
+[hosts.local-demo.experimental_provider_computer_use_by_provider]
+fixture-provider = true
+
+[hosts.local-demo.provider_bindings.fixture-provider.fixture-model]
+model = "fixture-model-v1"
+model_provider = "fixture-provider-v1"
+auth_source = "fixture-auth"
+
+[hosts.local-demo.provider_auth.fixture-auth]
+kind = "file"
+path = {secret_path}
+"#
+        ),
+    )
+    .expect("write exact provider binding config");
+    let output = satelle()
+        .env("SATELLE_CONFIG_FILE", &config_file)
+        .env("SATELLE_STATE_DIR", state.path())
+        .args([
+            "setup",
+            "--host",
+            "local-demo",
+            "--component",
+            "provider-auth",
+            "--no-input",
+            "--yes",
+            "--json",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .clone();
+    assert!(output.stderr.is_empty());
+    let report = parse_json_output(&output.stdout);
+    assert_eq!(report["status"], "applied");
+    assert_eq!(report["mutated"], true);
+    assert!(
+        report["applied_actions"]
+            .as_array()
+            .expect("applied_actions should be an array")
+            .iter()
+            .filter_map(serde_json::Value::as_str)
+            .any(|action| {
+                action.contains("provider binding")
+                    && action.contains("fixture-provider/fixture-model")
+            }),
+        "setup should report the fixture provider binding authorization"
+    );
+    satelle()
+        .env("SATELLE_CONFIG_FILE", &config_file)
+        .env("SATELLE_STATE_DIR", state.path())
+        .args(["host", "release-state"])
+        .assert()
+        .success();
+    config_file
+}
+
 fn absolute_test_path(components: &[&str]) -> std::path::PathBuf {
     #[cfg(windows)]
     let mut path = std::path::PathBuf::from(r"C:\");
@@ -360,6 +435,7 @@ fn assert_sqlite_files_are_private(state_root: &std::path::Path, canaries: &[&st
     }
 }
 
+#[cfg(target_os = "linux")]
 fn collect_regular_file_bytes(path: &std::path::Path, bytes: &mut Vec<u8>) {
     if !path.exists() {
         return;
@@ -378,6 +454,10 @@ fn ordinary_production_run_is_blocked_without_fake_completion_or_state_mutation(
     let state = state_dir();
     let empty_path = state.path().join("empty-path");
     fs::create_dir(&empty_path).expect("create a deterministic empty executable search path");
+    #[cfg(target_os = "linux")]
+    let expected_exit_code = 74;
+    #[cfg(any(target_os = "macos", windows))]
+    let expected_exit_code = 75;
     let output = production_satelle()
         .env("SATELLE_STATE_DIR", state.path())
         .env("PATH", empty_path)
@@ -389,16 +469,18 @@ fn ordinary_production_run_is_blocked_without_fake_completion_or_state_mutation(
             "PRODUCTION_ADMISSION_PROMPT_CANARY",
         ])
         .assert()
-        .code(75)
+        .code(expected_exit_code)
         .get_output()
         .clone();
     let combined = command_output_text(&output);
 
-    // Linux closes at native platform admission. On the supported desktop
-    // platforms, the more specific missing-runtime control-plane diagnosis
-    // precedes the native readiness blocker.
+    // Linux has no supported native Host target. On supported desktop
+    // platforms, the missing-runtime control-plane diagnosis precedes native
+    // readiness.
     #[cfg(target_os = "linux")]
-    assert!(combined.contains("computer-use-not-ready"));
+    assert!(combined.contains("storage-integrity-failed"));
+    #[cfg(target_os = "linux")]
+    assert!(combined.contains("unsupported_host_target"));
     #[cfg(any(target_os = "macos", windows))]
     assert!(combined.contains("incompatible-control-plane"));
     #[cfg(any(target_os = "macos", windows))]
@@ -1147,7 +1229,9 @@ fn stopping_terminal_turn_preserves_history_and_allows_later_steer() {
 #[test]
 fn stopping_detached_turn_returns_exact_stop_contract() {
     let state = state_dir();
+    let provider_config = authorize_default_provider_binding(&state);
     let run_output = satelle()
+        .env("SATELLE_CONFIG_FILE", &provider_config)
         .env("SATELLE_STATE_DIR", state.path())
         .env(TEST_SUPPORT_ADAPTER_ENV, "pending")
         .args([
@@ -1889,7 +1973,9 @@ fn run_and_steer_reject_conflicting_interrupt_modes_before_admission() {
 #[test]
 fn detach_returns_starting_session_without_event_streaming() {
     let state = state_dir();
+    let provider_config = authorize_default_provider_binding(&state);
     let output = satelle()
+        .env("SATELLE_CONFIG_FILE", &provider_config)
         .env("SATELLE_STATE_DIR", state.path())
         .env(TEST_SUPPORT_ADAPTER_ENV, "pending")
         .args([
@@ -3396,7 +3482,7 @@ provider_alias = "anthropic"
     assert_eq!(model_provider["model_alias_source"], "project_config");
     assert_eq!(model_provider["provider_alias_source"], "project_config");
     assert_eq!(model_provider["winning_source"], "project_config");
-    assert_eq!(model_provider["binding_status"], "binding_required");
+    assert_eq!(model_provider["binding_status"], "binding_missing");
     assert_eq!(
         model_provider["resolved_codex_model"],
         serde_json::Value::Null
@@ -3606,7 +3692,9 @@ fn doctor_missing_host_returns_typed_host_not_found() {
 #[test]
 fn doctor_json_emits_single_final_object_with_probe_contract() {
     let state = state_dir();
+    let provider_config = authorize_default_provider_binding(&state);
     let output = satelle()
+        .env("SATELLE_CONFIG_FILE", &provider_config)
         .env("SATELLE_STATE_DIR", state.path())
         .args(["doctor", "--host", "local-demo", "--json"])
         .assert()
@@ -3670,7 +3758,9 @@ fn doctor_json_emits_single_final_object_with_probe_contract() {
 #[test]
 fn doctor_events_emit_ndjson_with_terminal_result() {
     let state = state_dir();
+    let provider_config = authorize_default_provider_binding(&state);
     let output = satelle()
+        .env("SATELLE_CONFIG_FILE", &provider_config)
         .env("SATELLE_STATE_DIR", state.path())
         .args([
             "doctor",
@@ -3766,7 +3856,9 @@ fn doctor_refresh_timeout_updates_cache_metadata() {
 #[test]
 fn doctor_provider_refresh_reports_provider_cache_provenance() {
     let state = state_dir();
+    let provider_config = authorize_default_provider_binding(&state);
     let output = satelle()
+        .env("SATELLE_CONFIG_FILE", &provider_config)
         .env("SATELLE_STATE_DIR", state.path())
         .args([
             "doctor",
@@ -3939,13 +4031,8 @@ fn config_check_explain_and_paths_use_versioned_read_only_json_contracts() {
     let state = state_dir();
     let project = state.path().join("project");
     fs::create_dir_all(project.join(".satelle")).expect("project config dir should be created");
-    fs::write(
-        project.join(".satelle").join("config.toml"),
-        r#"
-model_alias = "project-model"
-"#,
-    )
-    .expect("project config should be written");
+    fs::write(project.join(".satelle").join("config.toml"), "")
+        .expect("project config should be written");
 
     let check_output = satelle()
         .current_dir(&project)
@@ -4113,13 +4200,8 @@ fn project_config_discovery_walks_up_to_nearest_satelle_config() {
     let nested = project.join("nested").join("child");
     fs::create_dir_all(project.join(".satelle")).expect("project config dir should be created");
     fs::create_dir_all(&nested).expect("nested dir should be created");
-    fs::write(
-        project.join(".satelle").join("config.toml"),
-        r#"
-model_alias = "project-model"
-"#,
-    )
-    .expect("project config should be written");
+    fs::write(project.join(".satelle").join("config.toml"), "")
+        .expect("project config should be written");
 
     let output = satelle()
         .current_dir(&nested)
@@ -5871,7 +5953,16 @@ model_provider = "anthropic"
     let output = satelle()
         .env("SATELLE_CONFIG_FILE", &user_config)
         .env("SATELLE_STATE_DIR", state.path())
-        .args(["run", "--host", "local", "--json", "Open the browser"])
+        .args([
+            "setup",
+            "--host",
+            "local",
+            "--component",
+            "provider-auth",
+            "--no-input",
+            "--yes",
+            "--json",
+        ])
         .assert()
         .code(64)
         .get_output()
@@ -5879,9 +5970,6 @@ model_provider = "anthropic"
     let error = parse_json_output(&output.stderr);
 
     assert_eq!(error["code"], "experimental-provider-opt-in-required");
-    assert_eq!(error["details"]["host"], "local");
-    assert_eq!(error["details"]["requested_model_alias"], "vision");
-    assert_eq!(error["details"]["requested_provider_alias"], "anthropic");
 
     write_user_config(
         &user_config,
@@ -5904,7 +5992,7 @@ model_provider = "anthropic"
     )
     .expect("user config should be rewritten with provider-scoped opt-in");
 
-    satelle()
+    let setup_output = satelle()
         .env("SATELLE_CONFIG_FILE", &user_config)
         .env("SATELLE_STATE_DIR", state.path())
         .args([
@@ -5918,7 +6006,22 @@ model_provider = "anthropic"
             "--json",
         ])
         .assert()
-        .success();
+        .success()
+        .get_output()
+        .clone();
+    let setup_report = parse_json_output(&setup_output.stdout);
+    assert_eq!(setup_report["status"], "applied");
+    assert_eq!(setup_report["mutated"], true);
+    assert!(
+        setup_report["applied_actions"]
+            .as_array()
+            .expect("applied_actions should be an array")
+            .iter()
+            .filter_map(serde_json::Value::as_str)
+            .any(|action| {
+                action.contains("provider binding") && action.contains("anthropic/vision")
+            })
+    );
     satelle()
         .env("SATELLE_CONFIG_FILE", &user_config)
         .env("SATELLE_STATE_DIR", state.path())
@@ -6152,6 +6255,99 @@ auth_source = "openai"
             && input["input_kind"] == "provider_secret_source_descriptor"
     }));
     assert_eq!(report["applied_actions"], serde_json::json!([]));
+}
+
+#[test]
+fn noninteractive_provider_auth_setup_reports_host_missing_descriptor_without_mutation() {
+    let state = state_dir();
+    let user_config = state.path().join("user-config.toml");
+    let config = |include_descriptor: bool| {
+        format!(
+            r#"
+default_host = "local"
+model_alias = "review"
+provider_alias = "openai"
+
+[hosts.local]
+transport = "local"
+adapter = "fake"
+
+[hosts.local.provider_bindings.openai.review]
+model = "gpt-5.2"
+model_provider = "openai"
+auth_source = "operator-auth"
+{}
+"#,
+            if include_descriptor {
+                r#"
+[hosts.local.provider_auth.operator-auth]
+kind = "environment"
+variable = "SATELLE_TEST_OPENAI_TOKEN"
+"#
+            } else {
+                ""
+            }
+        )
+    };
+    write_user_config(&user_config, config(true))
+        .expect("write provider binding with its descriptor");
+    satelle()
+        .env("SATELLE_CONFIG_FILE", &user_config)
+        .env("SATELLE_STATE_DIR", state.path())
+        .args([
+            "setup",
+            "--host",
+            "local",
+            "--component",
+            "provider-auth",
+            "--no-input",
+            "--yes",
+            "--json",
+        ])
+        .assert()
+        .success();
+    satelle()
+        .env("SATELLE_CONFIG_FILE", &user_config)
+        .env("SATELLE_STATE_DIR", state.path())
+        .args(["host", "release-state"])
+        .assert()
+        .success();
+
+    write_user_config(&user_config, config(false))
+        .expect("remove the referenced provider descriptor");
+    let output = satelle()
+        .env("SATELLE_CONFIG_FILE", &user_config)
+        .env("SATELLE_STATE_DIR", state.path())
+        .args([
+            "setup",
+            "--host",
+            "local",
+            "--component",
+            "provider-auth",
+            "--no-input",
+            "--json",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .clone();
+    assert!(output.stderr.is_empty());
+    let report = parse_json_output(&output.stdout);
+    let required_input = report["required_input"]
+        .as_array()
+        .expect("required_input should be an array");
+
+    assert_eq!(report["status"], "input_required");
+    assert_eq!(
+        report["readiness_summary"]["provider_auth"],
+        "missing_descriptor"
+    );
+    assert!(required_input.iter().any(|input| {
+        input["component"] == "provider-auth"
+            && input["input_kind"] == "provider_secret_source_descriptor"
+    }));
+    assert_eq!(report["applied_actions"], serde_json::json!([]));
+    assert_eq!(report["mutated"], false);
 }
 
 #[test]

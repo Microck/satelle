@@ -33,8 +33,10 @@ struct AttachmentObservation {
 }
 
 #[derive(Clone, Copy)]
+#[cfg(unix)]
 struct SecretBoundaryAdapter;
 
+#[cfg(unix)]
 impl ComputerUseAdapter for SecretBoundaryAdapter {
     fn preflight(
         &self,
@@ -67,8 +69,10 @@ impl ComputerUseAdapter for SecretBoundaryAdapter {
 }
 
 #[derive(Clone, Copy)]
+#[cfg(unix)]
 struct FailedProviderSmokeAdapter;
 
+#[cfg(unix)]
 impl ComputerUseAdapter for FailedProviderSmokeAdapter {
     fn preflight(
         &self,
@@ -134,6 +138,85 @@ impl ComputerUseAdapter for RecordingTurnExtrasAdapter {
         subject: AdapterSubject<'_>,
     ) -> Result<RecoveryObservation, SatelleError> {
         FakeComputerUseAdapter.observe_recovery(subject)
+    }
+}
+
+#[derive(Clone)]
+struct ProviderPreflightCounter {
+    calls: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl ComputerUseAdapter for ProviderPreflightCounter {
+    fn preflight(
+        &self,
+        host: &str,
+        provider_intent: &ProviderComputerUseIntent,
+    ) -> Result<AdapterReadiness, SatelleError> {
+        self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        FakeComputerUseAdapter.preflight(host, provider_intent)
+    }
+
+    fn execute(&self, request: ExecuteRequest<'_>) -> Result<ExecuteResult, SatelleError> {
+        FakeComputerUseAdapter.execute(request)
+    }
+
+    fn observe_stop(&self, subject: AdapterSubject<'_>) -> Result<StopObservation, SatelleError> {
+        FakeComputerUseAdapter.observe_stop(subject)
+    }
+
+    fn observe_recovery(
+        &self,
+        subject: AdapterSubject<'_>,
+    ) -> Result<RecoveryObservation, SatelleError> {
+        FakeComputerUseAdapter.observe_recovery(subject)
+    }
+}
+
+fn provider_intent_with_missing_descriptor() -> ProviderComputerUseIntent {
+    ProviderComputerUseIntent::new(
+        Some(
+            satelle_core::session::EffectiveModelRef::new("review")
+                .expect("valid requested model alias"),
+        ),
+        Some(
+            satelle_core::session::ProviderBindingRef::new("openai")
+                .expect("valid requested provider alias"),
+        ),
+        false,
+    )
+}
+
+fn service_with_provider_descriptor<A: ComputerUseAdapter>(
+    state_root: PathBuf,
+    adapter: A,
+    auth_source: Option<String>,
+) -> HostService {
+    let mut config = satelle_core::SatelleConfig::defaults().hosts[LOCAL_DEMO_HOST].clone();
+    config.provider_bindings.insert(
+        "openai".to_string(),
+        std::collections::BTreeMap::from([(
+            "review".to_string(),
+            satelle_core::ProviderBindingConfig {
+                model: "provider-model".to_string(),
+                model_provider: "openai".to_string(),
+                endpoint: None,
+                auth_source,
+            },
+        )]),
+    );
+    HostService {
+        runtime: RuntimeHandle::new_with_provider_policy(
+            Ok(state_root),
+            adapter,
+            crate::runtime::RuntimeProviderPolicy::from_host_config(&config),
+        ),
+        operation_capacity: Arc::new(OperationCapacity::default()),
+        turn_execution_timeout: crate::configured_turn_execution_timeout(&config),
+        mode: HostMode::TestFake {
+            image_attachments: true,
+        },
+        bootstrap_auth: None,
+        bootstrap_maintenance: Arc::new(Mutex::new(None)),
     }
 }
 
@@ -1324,6 +1407,132 @@ fn doctor_provider_scope_reports_closed_descriptor_status_without_secret_text() 
             .expect("serialize doctor report")
             .contains(&variable),
         "doctor output must not return environment variable names or secret material"
+    );
+}
+
+#[test]
+fn named_missing_provider_descriptor_remains_observable_to_cached_validation() {
+    let state = crate::TestStateDir::new().expect("temporary state directory");
+    let service = service_with_provider_descriptor(
+        state.path().to_path_buf(),
+        FakeComputerUseAdapter,
+        Some("missing-provider-token".to_string()),
+    );
+    let intent = provider_intent_with_missing_descriptor();
+
+    let resolution = service
+        .resolve_provider_binding(LOCAL_DEMO_HOST, &intent)
+        .expect("diagnostic binding resolution must preserve a missing descriptor");
+    let ProviderBindingResolution::MissingDescriptor {
+        binding,
+        auth_source_name,
+    } = resolution
+    else {
+        panic!("named missing descriptor must not be reported as ready");
+    };
+    assert_eq!("missing-provider-token", auth_source_name);
+    assert_eq!("provider-model", binding.model());
+    assert_eq!(None, binding.auth_source());
+
+    let validation = service
+        .validate_provider_descriptor(
+            LOCAL_DEMO_HOST,
+            "review",
+            "openai",
+            satelle_core::ProviderAuthValidationMode::Cached,
+        )
+        .expect("cached validation must classify the missing descriptor");
+    assert_eq!(
+        satelle_core::ProviderAuthValidationOutcome::MissingDescriptor,
+        validation.validation().outcome()
+    );
+    assert_eq!(
+        satelle_core::ProviderAuthObservationSource::Deferred,
+        validation.validation().observation_source()
+    );
+}
+
+#[test]
+fn provider_binding_without_auth_source_is_resolved_by_cached_validation() {
+    let state = crate::TestStateDir::new().expect("temporary state directory");
+    let service =
+        service_with_provider_descriptor(state.path().to_path_buf(), FakeComputerUseAdapter, None);
+
+    let validation = service
+        .validate_provider_descriptor(
+            LOCAL_DEMO_HOST,
+            "review",
+            "openai",
+            satelle_core::ProviderAuthValidationMode::Cached,
+        )
+        .expect("cached validation must accept a binding that requires no secret");
+    assert_eq!(
+        satelle_core::ProviderAuthValidationOutcome::Resolved,
+        validation.validation().outcome()
+    );
+    assert_eq!(
+        satelle_core::ProviderAuthObservationSource::Cached,
+        validation.validation().observation_source(),
+        "cached validation must not invoke secret resolution"
+    );
+}
+
+#[test]
+fn doctor_reports_a_named_missing_provider_descriptor_without_resolving_it() {
+    let state = crate::TestStateDir::new().expect("temporary state directory");
+    let service = service_with_provider_descriptor(
+        state.path().to_path_buf(),
+        FakeComputerUseAdapter,
+        Some("missing-provider-token".to_string()),
+    );
+
+    let report = service
+        .doctor_with_provider_intent(
+            LOCAL_DEMO_HOST,
+            Some("provider"),
+            DoctorOptions::new(false, None),
+            &provider_intent_with_missing_descriptor(),
+        )
+        .expect("doctor must preserve the missing descriptor as diagnostic evidence");
+    let evidence = report
+        .findings
+        .iter()
+        .flat_map(|finding| finding.evidence.iter())
+        .collect::<Vec<_>>();
+    assert!(
+        evidence
+            .iter()
+            .any(|value| value.as_str() == "provider_auth_outcome=missing_descriptor")
+    );
+    assert!(
+        evidence
+            .iter()
+            .any(|value| value.as_str() == "provider_auth_observation_source=deferred")
+    );
+}
+
+#[test]
+fn strict_provider_smoke_rejects_a_missing_descriptor_before_adapter_preflight() {
+    let state = crate::TestStateDir::new().expect("temporary state directory");
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let service = service_with_provider_descriptor(
+        state.path().to_path_buf(),
+        ProviderPreflightCounter {
+            calls: Arc::clone(&calls),
+        },
+        Some("missing-provider-token".to_string()),
+    );
+
+    let error = service
+        .runtime
+        .refresh_provider_smoke(LOCAL_DEMO_HOST, &provider_intent_with_missing_descriptor())
+        .expect_err("strict provider smoke must fail closed");
+    assert_eq!(ErrorCode::ProviderSecretResolutionFailed, error.code);
+    assert_eq!(error.details["auth_source"], "missing-provider-token");
+    assert_eq!(
+        0,
+        calls.load(std::sync::atomic::Ordering::SeqCst),
+        "the adapter must not receive preflight for a missing descriptor"
     );
 }
 

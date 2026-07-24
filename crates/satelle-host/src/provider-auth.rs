@@ -1,6 +1,7 @@
 use satelle_core::{
     ProviderAuthValidationOutcome, ProviderSecretSource, read_owner_only_secret_file,
 };
+use sha2::{Digest, Sha256};
 use std::fmt;
 use std::path::Path;
 use thiserror::Error;
@@ -31,6 +32,41 @@ impl ResolvedProviderSecret {
     fn matches_for_test(&self, expected: &str) -> bool {
         self.value.as_str() == expected
     }
+}
+
+/// Derives the only credential identity that may cross into provider-smoke
+/// cache state. The binding digest scopes identical secret bytes to one exact
+/// authorized provider binding, while the marker keeps no-secret bindings
+/// distinct from bindings whose resolved secret happens to be empty.
+pub(crate) fn provider_smoke_credential_fingerprint(
+    binding_digest: &str,
+    secret: Option<&ResolvedProviderSecret>,
+) -> String {
+    let mut digest = Sha256::new();
+    digest.update(b"satelle.provider-smoke-credential.v1\0");
+    digest.update(
+        u64::try_from(binding_digest.len())
+            .expect("a provider binding digest length fits in u64")
+            .to_be_bytes(),
+    );
+    digest.update(binding_digest.as_bytes());
+    match secret {
+        Some(secret) => {
+            digest.update(b"present\0");
+            digest.update(
+                u64::try_from(secret.value.len())
+                    .expect("a provider secret length fits in u64")
+                    .to_be_bytes(),
+            );
+            digest.update(secret.value.as_bytes());
+        }
+        None => digest.update(b"absent\0"),
+    }
+    digest
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
 }
 
 impl fmt::Debug for ResolvedProviderSecret {
@@ -190,7 +226,9 @@ pub(crate) fn diagnose_provider_secret(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use satelle_core::{ProviderSecretSource, persist_new_owner_only_secret_file};
+    use satelle_core::ProviderSecretSource;
+    #[cfg(unix)]
+    use satelle_core::persist_new_owner_only_secret_file;
     use std::path::{Path, PathBuf};
 
     /// Owns one unique process-environment variable for the duration of a
@@ -297,6 +335,39 @@ mod tests {
     }
 
     #[test]
+    fn environment_secret_rotation_changes_the_private_smoke_cache_identity() {
+        let environment = ScopedEnvironmentVariable::missing();
+        let source = environment.source();
+        let binding_digest = "a".repeat(64);
+
+        environment.set("first-provider-token");
+        let first = resolve_provider_secret(&source, ProviderHostPlatform::Posix)
+            .expect("resolve the first environment credential");
+        let first_fingerprint =
+            provider_smoke_credential_fingerprint(&binding_digest, Some(&first));
+
+        environment.set("rotated-provider-token");
+        let rotated = resolve_provider_secret(&source, ProviderHostPlatform::Posix)
+            .expect("resolve the rotated environment credential");
+        let rotated_fingerprint =
+            provider_smoke_credential_fingerprint(&binding_digest, Some(&rotated));
+
+        assert_eq!(64, first_fingerprint.len());
+        assert!(
+            first_fingerprint
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+        );
+        assert_ne!(first_fingerprint, rotated_fingerprint);
+        assert_ne!(
+            first_fingerprint,
+            provider_smoke_credential_fingerprint(&binding_digest, None)
+        );
+        assert!(!first_fingerprint.contains("first-provider-token"));
+        assert!(!rotated_fingerprint.contains("rotated-provider-token"));
+    }
+
+    #[test]
     fn file_paths_follow_the_target_host_absolute_path_rules() {
         let directory = tempfile::tempdir().expect("create provider-auth test directory");
         let missing_posix_path = directory.path().join("missing-token");
@@ -372,6 +443,36 @@ mod tests {
             resolve_provider_secret(&file_source(&insecure_path), ProviderHostPlatform::Posix,),
             Err(ProviderAuthResolutionError::Unresolved)
         ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn file_secret_rotation_changes_the_private_smoke_cache_identity() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempfile::tempdir().expect("create provider-auth test directory");
+        std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700))
+            .expect("make provider-auth test directory owner-only");
+        let path = directory.path().join("rotating-token");
+        persist_new_owner_only_secret_file(&path, "first-file-provider-token")
+            .expect("persist the first owner-only provider credential");
+        let source = file_source(&path);
+        let binding_digest = "b".repeat(64);
+        let first = resolve_provider_secret(&source, ProviderHostPlatform::Posix)
+            .expect("resolve the first file credential");
+        let first_fingerprint =
+            provider_smoke_credential_fingerprint(&binding_digest, Some(&first));
+
+        std::fs::write(&path, "rotated-file-provider-token")
+            .expect("rotate the owner-only provider credential");
+        let rotated = resolve_provider_secret(&source, ProviderHostPlatform::Posix)
+            .expect("resolve the rotated file credential");
+        let rotated_fingerprint =
+            provider_smoke_credential_fingerprint(&binding_digest, Some(&rotated));
+
+        assert_ne!(first_fingerprint, rotated_fingerprint);
+        assert!(!first_fingerprint.contains("first-file-provider-token"));
+        assert!(!rotated_fingerprint.contains("rotated-file-provider-token"));
     }
 
     #[test]
