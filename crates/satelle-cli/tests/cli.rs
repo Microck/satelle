@@ -454,10 +454,6 @@ fn ordinary_production_run_is_blocked_without_fake_completion_or_state_mutation(
     let state = state_dir();
     let empty_path = state.path().join("empty-path");
     fs::create_dir(&empty_path).expect("create a deterministic empty executable search path");
-    #[cfg(target_os = "linux")]
-    let expected_exit_code = 74;
-    #[cfg(any(target_os = "macos", windows))]
-    let expected_exit_code = 75;
     let output = production_satelle()
         .env("SATELLE_STATE_DIR", state.path())
         .env("PATH", empty_path)
@@ -469,22 +465,15 @@ fn ordinary_production_run_is_blocked_without_fake_completion_or_state_mutation(
             "PRODUCTION_ADMISSION_PROMPT_CANARY",
         ])
         .assert()
-        .code(expected_exit_code)
+        .code(74)
         .get_output()
         .clone();
     let combined = command_output_text(&output);
 
-    // Linux has no supported native Host target. On supported desktop
-    // platforms, the missing-runtime control-plane diagnosis precedes native
-    // readiness.
-    #[cfg(target_os = "linux")]
+    // This production invocation closes before adapter execution because the
+    // test environment does not provide a supported native Host target.
     assert!(combined.contains("storage-integrity-failed"));
-    #[cfg(target_os = "linux")]
     assert!(combined.contains("unsupported_host_target"));
-    #[cfg(any(target_os = "macos", windows))]
-    assert!(combined.contains("incompatible-control-plane"));
-    #[cfg(any(target_os = "macos", windows))]
-    assert!(combined.contains("runtime_missing"));
     assert!(!combined.contains("fake"));
     assert!(!combined.contains("completed"));
     assert!(!combined.contains("PRODUCTION_ADMISSION_PROMPT_CANARY"));

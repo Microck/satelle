@@ -369,15 +369,13 @@ mod tests {
 
     #[test]
     fn file_paths_follow_the_target_host_absolute_path_rules() {
-        let directory = tempfile::tempdir().expect("create provider-auth test directory");
-        let missing_posix_path = directory.path().join("missing-token");
-        assert!(matches!(
-            resolve_provider_secret(
-                &file_source(&missing_posix_path),
+        assert_eq!(
+            Ok(()),
+            validate_provider_secret_source_descriptor(
+                &file_source(Path::new("/satelle/provider-token")),
                 ProviderHostPlatform::Posix,
-            ),
-            Err(ProviderAuthResolutionError::Unresolved)
-        ));
+            )
+        );
         assert!(matches!(
             resolve_provider_secret(
                 &file_source(Path::new("relative/provider-token")),
@@ -393,13 +391,13 @@ mod tests {
             Err(ProviderAuthResolutionError::InvalidFilePath)
         ));
 
-        assert!(matches!(
-            resolve_provider_secret(
+        assert_eq!(
+            Ok(()),
+            validate_provider_secret_source_descriptor(
                 &file_source(Path::new(r"C:\Satelle\provider-token")),
                 ProviderHostPlatform::Windows,
-            ),
-            Err(ProviderAuthResolutionError::Unresolved)
-        ));
+            )
+        );
         for invalid_path in [
             r"C:relative\provider-token",
             r"\rooted-on-current-drive",

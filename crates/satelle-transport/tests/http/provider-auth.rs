@@ -533,6 +533,18 @@ async fn binding_mutations_do_not_resolve_secret_or_contact_provider_endpoint() 
     let log_bytes = logs.bytes().await.expect("read Host log bytes");
     assert!(!String::from_utf8_lossy(&log_bytes).contains(secret_canary));
 
+    let RunningServer {
+        _state,
+        service,
+        server,
+        ..
+    } = running;
+    server
+        .shutdown()
+        .await
+        .expect("stop provider privacy daemon");
+    drop(service);
+
     let mut state_bytes = Vec::new();
     collect_state_bytes(&state_path, &mut state_bytes);
     assert!(

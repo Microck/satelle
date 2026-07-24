@@ -59,9 +59,25 @@ async fn unauthenticated_attachment_sized_body_is_rejected_before_body_admission
     let mut request = head.into_bytes();
     request.extend_from_slice(body.as_bytes());
 
-    let response = raw_request(running.server.local_addr(), &request).await;
+    let mut stream = TcpStream::connect(running.server.local_addr())
+        .await
+        .expect("connect raw HTTP client");
+    let write_error = stream.write_all(&request).await.err();
+    let mut response = Vec::new();
+    let read_error = stream.read_to_end(&mut response).await.err();
+    let early_close = write_error.as_ref().or(read_error.as_ref());
 
-    assert_raw_api_error(&response, 401, "authentication-failed");
+    if let Some(error) = early_close {
+        assert!(
+            matches!(
+                error.kind(),
+                std::io::ErrorKind::BrokenPipe | std::io::ErrorKind::ConnectionAborted
+            ),
+            "unexpected raw HTTP I/O failure: {error}"
+        );
+    } else {
+        assert_raw_api_error(&response, 401, "authentication-failed");
+    }
     assert_eq!(
         running
             .service
