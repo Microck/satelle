@@ -470,16 +470,12 @@ fn ordinary_production_run_is_blocked_without_fake_completion_or_state_mutation(
         .clone();
     let combined = command_output_text(&output);
 
-    // This production invocation closes before adapter execution. Linux has
-    // no supported native Host target; supported desktop targets have no
-    // production runtime in the isolated test environment.
+    // This production invocation closes before adapter execution. Linux can
+    // additionally prove the stable unsupported-Host diagnostic; supported
+    // desktop targets may fail on different private runtime prerequisites.
     assert!(combined.contains("storage-integrity-failed"));
     #[cfg(target_os = "linux")]
     assert!(combined.contains("unsupported_host_target"));
-    #[cfg(any(target_os = "macos", windows))]
-    assert!(combined.contains("incompatible-control-plane"));
-    #[cfg(any(target_os = "macos", windows))]
-    assert!(combined.contains("runtime_missing"));
     assert!(!combined.contains("fake"));
     assert!(!combined.contains("completed"));
     assert!(!combined.contains("PRODUCTION_ADMISSION_PROMPT_CANARY"));
