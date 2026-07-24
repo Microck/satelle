@@ -38,7 +38,7 @@
 - a Satelle Idempotency Record binds one API Principal, operation, idempotency key, request digest, and durable outcome @mvp @implemented
 - a Satelle Readiness Result is a timestamped capability result whose validity is bounded by its cache key, expiry, and invalidation conditions @spec @mvp @implemented
 - Satelle YOLO Mode is an explicit unsafe execution mode that asks Codex to bypass Codex-controlled approvals and sandboxing where the compatible Codex control plane supports those settings @spec @mvp
-- a Satelle Provider Probe Surface is an ephemeral local UI served by the Host Daemon to verify that a selected model and provider can observe and act through native Computer Use @spec @mvp
+- a Satelle Provider Probe Surface is an ephemeral local UI served by the Host Daemon to verify that a selected model and provider can observe and act through native Computer Use @spec @mvp @implemented
 - a Satelle Event is a stable JSON lifecycle record emitted by attached run and steer commands or Host Daemon event streams @spec @mvp @implemented
 - a Satelle Setup Action Ledger is the Host Daemon-owned record of setup, repair, update, migration, and other specified maintenance action plans, status changes, partial failures, and recovery metadata for a controlled Host @spec @mvp
 - a Satelle Setup Component is a named onboarding responsibility that setup can plan, report, and selectively target without changing the default setup contract @spec @mvp
@@ -73,9 +73,9 @@
   tags: [spec, mvp, implemented]
 - a Satelle Multi-User Broker permits an authorized API Principal to select among multiple Desktop Bindings owned by one Host Identity at request time while preserving per-user authorization, isolation, and audit boundaries @spec @later
 - a Satelle Secret Source is a typed reference to secret material stored outside Satelle config files, such as an operating-system credential store item, environment variable, file path, or remote-Host-owned provider auth store @spec @mvp @implemented
-- a Satelle Host-Resolved Secret Source is a Secret Source descriptor containing only a non-secret lookup reference and resolved by the target Host Daemon on the machine running the selected provider binding @spec @mvp
-- a Satelle File Secret Source is a Secret Source whose value is a path to a file containing secret material on the machine resolving that provider authentication binding @spec @mvp
-- a Satelle Provider Binding maps requested model and provider intent to a concrete upstream model, provider endpoint, and Host-Resolved Secret Source @spec @mvp
+- a Satelle Host-Resolved Secret Source is a Secret Source descriptor containing only a non-secret lookup reference and resolved by the target Host Daemon on the machine running the selected provider binding @spec @mvp @implemented
+- a Satelle File Secret Source is a Secret Source whose value is a path to a file containing secret material on the machine resolving that provider authentication binding @spec @mvp @implemented
+- a Satelle Provider Binding maps requested model and provider intent to a concrete upstream model, provider endpoint, and Host-Resolved Secret Source @spec @mvp @implemented
 - a Satelle MCP Server is a local stdio JSON-RPC bridge exposing selected Satelle control surfaces as tools for AI Clients @spec @mvp
 - a Satelle AI Client Install Target is a supported AI client configuration destination that can be updated to call Satelle through MCP @spec @mvp
 - a Satelle Agent Skill Bundle is a versioned set of Satelle-owned SKILL.md guides for AI agents setting up, using, and recovering Satelle @spec @mvp
@@ -416,14 +416,14 @@
 - satelle native readiness smoke-test failures block prompt execution and include a typed error plus a recommended diagnostic or repair command @spec @mvp @implemented
 - satelle run and steer automatically run the required provider Computer Use smoke test during preflight when experimental provider Computer Use is active and no valid matching provider smoke-test cache entry exists @spec @mvp @implemented
 - satelle run and steer do not start a prompt Turn until a required live provider Computer Use smoke test passes or a valid matching provider smoke-test cache entry exists @spec @mvp @implemented
-- satelle Provider Probe Surface includes a harmless click-and-drag task before caching provider Computer Use readiness for providers that claim pointer control support @spec @mvp
-- satelle quiet output may suppress provider smoke-test progress text but does not skip provider smoke tests required for prompt execution @spec @mvp
+- satelle Provider Probe Surface includes a harmless click-and-drag task before caching provider Computer Use readiness for providers that claim pointer control support @spec @mvp @implemented
+- satelle quiet output may suppress provider smoke-test progress text but does not skip provider smoke tests required for prompt execution @spec @mvp @implemented
 - satelle run and steer support --refresh-provider-smoke-test to ignore a matching provider smoke-test cache entry and rerun the provider Computer Use smoke test before prompt execution @spec @mvp @implemented
 - satelle --refresh-provider-smoke-test does not opt into experimental provider Computer Use by itself; non-OpenAI provider use still requires --experimental-provider-computer-use or user-level configuration opt-in @implemented @mvp
 - satelle --refresh-provider-smoke-test has no short alias in MVP because it is a diagnostic validation control rather than a frequent-path flag @implemented @mvp
 - satelle help text describes --refresh-provider-smoke-test as a cache refresh, not as a provider capability bypass or experimental provider opt-in @implemented @mvp
 - satelle session control reuses the same stored Codex thread identifier for follow-up steering, status inspection, and stopping flows @implemented @mvp
-- satelle steer supports image attachments using the same constraints as run @spec @mvp
+- satelle steer supports image attachments using the same constraints as run @spec @mvp @implemented
 - satelle steer waits by default until the newly started follow-up turn reaches a terminal status such as completed, blocked, failed, or stopped @implemented @mvp
 - satelle steer supports a detach option that returns after starting the follow-up turn and prints the reusable session identifier @implemented @mvp
 - satelle steer streams concise human lifecycle and progress events by default when running attached in an interactive terminal @implemented @mvp
@@ -558,11 +558,11 @@
 - satelle setup accepts noninteractive mutation consent for ordinary setup mutations only from the current command's --yes flag or from an applicable user-level Satelle Trusted Profile, excluding raw provider secret entry, provider-secret provisioning, and provider-secret overwrite confirmation @spec @mvp
 - satelle setup never treats project-level configuration as noninteractive mutation consent, even when project-level configuration selects the host, profile, provider, model, or component set @spec @mvp
 - satelle setup reports setup-consent-required instead of applying remote mutations when the only available consent-like setting comes from project-level configuration @spec @mvp
-- satelle setup treats provider authentication onboarding as part of getting a configured host ready for Satelle prompt execution when the selected model and provider require provider credentials @spec @mvp
-- satelle setup distinguishes configuring a provider authentication Secret Source descriptor from provisioning the raw provider secret material that descriptor references @spec @mvp
-- satelle setup can configure host-resolved provider authentication Secret Source descriptors for a concrete host alias in user-level configuration or remote-host owned configuration @spec @mvp
-- satelle interactive setup uses cliclack prompts to help the user choose a supported provider authentication Secret Source kind for the target host when provider authentication is missing or incomplete @spec @mvp
-- satelle setup can validate that a configured provider authentication Secret Source is resolvable by the target Host Daemon without returning the resolved secret value to the local CLI @spec @mvp
+- satelle setup treats provider authentication onboarding as part of getting a configured host ready for Satelle prompt execution when the selected model and provider require provider credentials @spec @mvp @implemented
+- satelle setup distinguishes configuring a provider authentication Secret Source descriptor from provisioning the raw provider secret material that descriptor references @spec @mvp @implemented
+- satelle setup can configure host-resolved provider authentication Secret Source descriptors for a concrete host alias in user-level configuration or remote-host owned configuration @spec @mvp @implemented
+- satelle interactive setup uses cliclack prompts to help the user choose a supported provider authentication Secret Source kind for the target host when provider authentication is missing or incomplete @spec @mvp @implemented
+- satelle setup can validate that a configured provider authentication Secret Source is resolvable by the target Host Daemon without returning the resolved secret value to the local CLI @spec @mvp @implemented
 - satelle setup supports --verify as an explicit request to run the live native Computer Use readiness smoke test and any required provider smoke test after prerequisite planning or mutation completes @spec @mvp
 - satelle setup --verify runs a provider smoke test after provider authentication onboarding when the selected provider and model require provider validation @spec @mvp
 - satelle setup --verify is valid with --no-input and is explicit authorization for the same harmless desktop and provider probes used by doctor refresh, but it is not consent for setup mutations @spec @mvp
@@ -813,11 +813,11 @@
 - every Host Daemon JSON response and error declares one Satelle API schema version @spec @mvp @implemented
 - satelle rejects unsupported API schema versions before executing an operation @spec @mvp @implemented
 - satelle rejects incompatible CLI and Host Daemon protocol versions before executing a mutating request @spec @contract @mvp @implemented
-- authenticated Host Daemon mutations require exactly one Satelle-Protocol-Version header whose value is a canonical unsigned decimal without leading zeroes, and MVP supports only value 4 @spec @contract @mvp @implemented
+- authenticated Host Daemon mutations require exactly one Satelle-Protocol-Version header whose value is a canonical unsigned decimal without leading zeroes, and MVP supports only value 8 @spec @contract @mvp @implemented
 - protocol compatibility is checked after authentication, control-scope authorization, request correlation, and Host Identity pinning but before mutation query or cookie validation, control rate limiting, idempotency validation, request-body decoding, or Host calls @spec @contract @mvp @implemented
 - missing, malformed, duplicate, and unsupported Satelle-Protocol-Version values return HTTP 426 with code incompatible-protocol, category compatibility, retryable false, and schema_version satelle.error.v1 @spec @contract @mvp @implemented
-- incompatible-protocol details contain exactly reason, supported_versions, and received_version; reason is missing, malformed, duplicate, or unsupported, supported_versions is ["4"], received_version is the validated canonical unsupported token or null, and arbitrary header bytes are never reflected @spec @contract @mvp @implemented
-- DaemonClient sends Satelle-Protocol-Version 4 on every mutating request and does not require the header for authenticated reads used to diagnose or recover version skew @spec @contract @mvp @implemented
+- incompatible-protocol details contain exactly reason, supported_versions, and received_version; reason is missing, malformed, duplicate, or unsupported, supported_versions is ["8"], received_version is the validated canonical unsupported token or null, and arbitrary header bytes are never reflected @spec @contract @mvp @implemented
+- DaemonClient sends Satelle-Protocol-Version 8 on every mutating request and does not require the header for authenticated reads used to diagnose or recover version skew @spec @contract @mvp @implemented
 - POST /v1/sessions, POST /v1/sessions/{session_id}/turns, POST /v1/sessions/{session_id}/stop, POST /v1/setup/api-token, POST /v1/setup/api-token/{token_id}/activate, and POST /v1/setup/api-token/{token_id}/abort enforce protocol compatibility, and future POST /v1/doctor routes use the same mutation gate when implemented @spec @contract @mvp @implemented
 - satelle API JSON decoding rejects unknown fields instead of ignoring misspelled security, authority, or execution-policy fields @spec @mvp @implemented
 - satelle API endpoints reject unsupported content types before reading operation data @spec @mvp @implemented
@@ -1243,15 +1243,15 @@
 - satelle project-level configuration does not define concrete provider credentials, provider auth commands, bearer tokens, secret environment variables, or provider endpoint bindings @implemented @mvp
 - satelle project-level configuration cannot define Satelle Secret Sources for provider authentication because provider credential locations are personal or host-owned @implemented @mvp
 - satelle project-level configuration may request a non-OpenAI provider alias but does not satisfy the experimental provider Computer Use opt-in by itself @implemented @mvp
-- satelle user-level configuration may opt into experimental non-OpenAI provider Computer Use globally, per profile, per host, or per provider alias @spec @mvp
+- satelle user-level configuration may opt into experimental non-OpenAI provider Computer Use globally, per profile, per host, or per provider alias @spec @mvp @implemented
 - satelle user-level configuration uses experimental_provider_computer_use as the exact key for experimental non-OpenAI provider Computer Use opt-in @implemented @mvp
 - satelle reports a typed project-experimental-provider-opt-in-not-allowed configuration error when project-level configuration sets experimental_provider_computer_use @implemented @mvp
 - satelle CLI flags may opt into experimental non-OpenAI provider Computer Use for one command and take precedence over user-level and project-level configuration @spec @mvp @implemented
-- satelle reports a typed experimental-provider-opt-in-required error when project configuration requests a non-OpenAI provider for Computer Use and no CLI or user-level experimental opt-in is active @spec @mvp
-- satelle user-level configuration or remote-host owned configuration binds project model and provider aliases to concrete Codex model, modelProvider, endpoint, and authentication sources @spec @mvp
+- satelle reports a typed experimental-provider-opt-in-required error when project configuration requests a non-OpenAI provider for Computer Use and no CLI or user-level experimental opt-in is active @spec @mvp @implemented
+- satelle user-level configuration or remote-host owned configuration binds project model and provider aliases to concrete Codex model, modelProvider, endpoint, and authentication sources @spec @mvp @implemented
 - satelle MVP provider authentication configuration supports only typed Satelle Secret Source references for operating-system credential stores, environment variables, files, and remote-host owned provider auth stores @implemented @mvp
 - satelle MVP provider authentication Secret Sources are Satelle Host-Resolved Secret Sources instead of local-CLI-resolved secrets @implemented @mvp
-- satelle local CLI may transmit Satelle Host-Resolved Secret Source descriptors to the target Host Daemon only when the descriptor contains no secret material @spec @mvp
+- satelle local CLI may transmit Satelle Host-Resolved Secret Source descriptors to the target Host Daemon only when the descriptor contains no secret material @spec @mvp @implemented
 - satelle local CLI never reads local environment variables, local files, local operating-system credential stores, local keychains, local credential helpers, or local provider auth stores to obtain provider authentication secret material for a target host @spec @mvp @implemented
 - satelle local CLI never forwards provider bearer tokens, API keys, OAuth tokens, secret file contents, or resolved provider credential material to a target Host Daemon except through the explicit interactive setup provider-secret provisioning flow @spec @mvp @implemented
 - satelle interactive setup provider-secret provisioning flow requires stdin to be a TTY, disables terminal echo for secret entry, and is unavailable when --no-input, --json, --quiet, or --dry-run is active @spec @mvp
@@ -1266,16 +1266,16 @@
 - satelle setup reports a typed provider-secret-overwrite-required diagnostic when interactive provider-secret provisioning would replace an existing provider secret and no explicit overwrite confirmation has been given @spec @mvp
 - satelle setup with valid noninteractive mutation consent still reports provider-secret-provisioning-required or provider-secret-overwrite-required when raw provider secret material must be created or replaced, and does not transmit, persist, or overwrite raw provider secret material in that invocation @spec @mvp
 - satelle user-level configuration may define host-resolved provider authentication Secret Source descriptors for a concrete host alias, but those descriptors are interpreted on the target host rather than on the invoking CLI machine @implemented @mvp
-- satelle Host Daemon resolves provider authentication Secret Sources only when a provider smoke test or prompt execution needs provider authentication on that target host @spec @mvp
-- satelle Host Daemon never persists resolved provider secret material in Satelle Event streams, SQLite stores, readiness caches, provider smoke-test caches, setup action ledgers, operator log files, diagnostic bundles, or config explain output @spec @mvp
-- satelle reports a typed provider-secret-resolution-failed error when the target Host Daemon cannot resolve a configured provider authentication Secret Source during a provider smoke test or prompt execution @spec @mvp
-- satelle doctor provider-auth diagnostics inspect configured provider Secret Source descriptors and host-side resolution status without printing raw provider secret values @spec @mvp
-- satelle provider-auth diagnostics distinguish missing descriptor, unsupported descriptor kind, unresolved host-side secret, resolved-but-invalid provider credential, and provider Computer Use smoke-test failure as separate outcomes @spec @mvp
-- satelle provider-auth diagnostics are diagnostic checks and do not create, overwrite, reveal, or transmit raw provider secrets to the local CLI @spec @mvp
+- satelle Host Daemon resolves provider authentication Secret Sources only when a provider smoke test or prompt execution needs provider authentication on that target host @spec @mvp @implemented
+- satelle Host Daemon never persists resolved provider secret material in Satelle Event streams, SQLite stores, readiness caches, provider smoke-test caches, setup action ledgers, operator log files, diagnostic bundles, or config explain output @spec @mvp @implemented
+- satelle reports a typed provider-secret-resolution-failed error when the target Host Daemon cannot resolve a configured provider authentication Secret Source during a provider smoke test or prompt execution @spec @mvp @implemented
+- satelle doctor provider-auth diagnostics inspect configured provider Secret Source descriptors and host-side resolution status without printing raw provider secret values @spec @mvp @implemented
+- satelle provider-auth diagnostics classify missing descriptor, unsupported descriptor kind, unresolved host-side secret, and provider Computer Use smoke-test failure as separate outcomes, while custom-provider credential rejection remains provider-computer-use-smoke-test-failed until Codex exposes a typed provider-auth signal @spec @mvp @implemented
+- satelle provider-auth diagnostics are diagnostic checks and do not create, overwrite, reveal, or transmit raw provider secrets to the local CLI @spec @mvp @implemented
 - satelle MVP requires Satelle File Secret Source values to be absolute paths @implemented @mvp
 - satelle MVP does not support relative paths or shell home syntax such as ~ in Satelle File Secret Source values @implemented @mvp
 - satelle rejects relative or tilde-prefixed Satelle File Secret Source values with a typed secret-file-path-not-absolute configuration error @implemented @mvp
-- satelle validates Satelle File Secret Source absolute-path syntax according to the operating system that resolves the provider authentication binding @spec @mvp
+- satelle validates Satelle File Secret Source absolute-path syntax according to the operating system that resolves the provider authentication binding @spec @mvp @implemented
 - satelle config check validates Satelle File Secret Source path syntax but does not read the referenced file contents @implemented @mvp
 - satelle config explain redacts Satelle File Secret Source values by default and never reads the referenced file contents @implemented @mvp
 - a Host Daemon resolves a Satelle File Secret Source only from a regular file owned by its OS user and rejects symlinks, directories, devices, sockets, and files readable or writable by unrelated principals @spec @mvp @implemented
@@ -1286,10 +1286,10 @@
 - satelle MVP config loading, validation, merging, config check, config explain, setup, repair, doctor diagnostics, preflight, run, and steer never execute shell commands, command arrays, inline scripts, shell snippets, process execution hooks, or credential helper commands declared by configuration files @spec @mvp @implemented
 - satelle config check validates provider authentication Secret Source shape and source kind locally but does not read or resolve provider secret material @implemented @mvp
 - satelle config explain reports provider authentication Secret Source kind and winning source according to its redaction and --show-secret-references rules instead of resolving provider secret material @implemented @mvp
-- satelle reports a typed model-provider-binding-missing error when project configuration requests a model or provider alias that has no user-level or host-owned binding @spec @mvp
-- satelle config explain output shows requested model and provider aliases, resolved Codex model and modelProvider values, contributing config files, and the winning source @spec @mvp
+- satelle reports a typed model-provider-binding-missing error when project configuration requests a model or provider alias that has no user-level or host-owned binding @spec @mvp @implemented
+- satelle config explain output shows requested model and provider aliases, resolved Codex model and modelProvider values, contributing config files, and the winning source @spec @mvp @implemented
 - satelle config explain output shows whether experimental non-OpenAI provider Computer Use is active and whether it was selected by CLI flag or user-level configuration @implemented @mvp
-- satelle preflight and JSON state output include the resolved model, resolved provider, provider source, experimental-provider status, and provider Computer Use smoke-test status @spec @mvp
+- satelle preflight and JSON state output include the resolved model, resolved provider, provider source, experimental-provider status, and provider Computer Use smoke-test status @spec @mvp @implemented
 - satelle later config composition supports only explicit Satelle Config Includes declared by a schema-owned include key and continues rejecting imports, extends, glob-loaded fragments, plugin-discovered fragments, URLs, and extension namespaces unless later facts separately enable them @spec @later
 - satelle post-MVP Satelle Config Include paths resolve relative paths against the directory of the configuration file that declares the include and resolve absolute paths on the machine reading that configuration file @spec @later
 - satelle post-MVP Satelle Config Includes must target existing regular TOML files and reject missing targets, directories, unsupported symlinks, globs, URLs, environment interpolation, and shell home syntax with typed configuration errors @spec @later
@@ -2092,7 +2092,7 @@
 - satelle Host Daemon verifies provider smoke test success from probe surface callbacks or daemon-observed state instead of trusting the model's final message text @mvp @implemented
 - satelle provider smoke tests may use a browser as the probe target only when native Computer Use is operating that browser as an approved desktop target rather than relying solely on the Codex Browser plugin @mvp @implemented
 - satelle provider smoke tests distinguish selected provider or model failure from native Computer Use readiness failures such as missing OS permissions, app approval prompts, locked desktop state, or inability to open the probe target @mvp @implemented
-- satelle provider smoke tests report readiness blockers or manual-action-required when the probe cannot run because native Computer Use cannot access the probe target @spec @mvp
+- satelle provider smoke tests report manual-action-required only for an authoritative Host OS permission or app approval denial and do not infer target-access failure from an unobserved probe action or callback @spec @mvp @implemented
 - satelle provider smoke tests time out, close or retire the probe surface, and clean up probe session state after completion or failure @spec @mvp @implemented
 - label: satelle provider smoke tests use a 120 second timeout by default
   command: cargo test --locked -p satelle-host --lib tests::admission_request_timeout_tracks_both_configured_readiness_phases -- --exact
@@ -2258,17 +2258,17 @@
 
 ## model-providers
 - satelle defaults model and provider selection to the configured Codex model and provider on the remote host @mvp @implemented
-- satelle supports explicit per-run model and provider overrides when the remote host can validate the requested combination @spec @mvp
-- satelle project-level model and provider defaults are treated as shared intent and must resolve through user-level or host-owned provider bindings before execution @spec @mvp
-- satelle does not write provider credentials or project-defined provider endpoint data into the remote Codex configuration as a side effect of resolving project model defaults @spec @mvp
+- satelle supports explicit per-run model and provider overrides when the remote host can validate the requested combination @spec @mvp @implemented
+- satelle project-level model and provider defaults are treated as shared intent and must resolve through user-level or host-owned provider bindings before execution @spec @mvp @implemented
+- satelle does not write provider credentials or project-defined provider endpoint data into the remote Codex configuration as a side effect of resolving project model defaults @spec @mvp @implemented
 - satelle requires an explicit experimental provider Computer Use option before attempting native Computer Use with a non-OpenAI provider @spec @mvp @implemented
 - satelle experimental non-OpenAI provider Computer Use opt-in must come from a CLI flag or user-level configuration rather than project-level configuration @implemented @mvp
-- satelle supports non-OpenAI provider Computer Use only as an explicit experimental mode guarded by warning text and a live remote smoke test @spec @mvp
+- satelle supports non-OpenAI provider Computer Use only as an explicit experimental mode guarded by warning text and a live remote smoke test @spec @mvp @implemented
 - satelle caches non-OpenAI provider Computer Use smoke test results by host, provider, model, Codex version, and native Computer Use runtime version @mvp @implemented
 - satelle can refresh a cached non-OpenAI provider Computer Use smoke test result on demand @mvp @implemented
 - satelle reports providers that pass normal Codex text turns but fail the Computer Use smoke test as unsupported for native Computer Use on that host @mvp @implemented
-- satelle treats text-only or Chat-Completions-only providers as incompatible with native visual Computer Use unless a configured proxy supplies the required Responses-compatible visual/tool semantics @spec @mvp
-- satelle does not allow a non-OpenAI provider smoke test cache miss to start prompt execution without first running a live smoke test during preflight or failing with an experimental-provider-not-validated error when the live test cannot be run @spec @mvp
+- satelle treats text-only or Chat-Completions-only providers as incompatible with native visual Computer Use unless a configured proxy supplies the required Responses-compatible visual/tool semantics @spec @mvp @implemented
+- satelle does not allow a non-OpenAI provider smoke test cache miss to start prompt execution without first running a live smoke test during preflight or failing with an experimental-provider-not-validated error when the live test cannot be run @spec @mvp @implemented
 
 # docs
 - satelle MVP public documentation uses Fumadocs as the documentation site framework @spec @mvp @implemented

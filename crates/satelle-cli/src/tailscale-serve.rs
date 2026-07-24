@@ -948,6 +948,8 @@ mod tests {
 
     fn tailscale_host() -> HostConfig {
         HostConfig {
+            provider_bindings: std::collections::BTreeMap::new(),
+            experimental_provider_computer_use_by_provider: std::collections::BTreeMap::new(),
             transport: TransportKind::Direct,
             adapter: AdapterKind::Codex,
             address: Some("https://studio.example.ts.net".to_string()),

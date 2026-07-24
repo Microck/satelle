@@ -118,7 +118,6 @@ allow_project_selection = true
 host = "profile-host"
 
 [profiles.audit]
-model_alias = "audit-model"
 "#,
         r#"
 default_host = "base-host"
@@ -179,7 +178,6 @@ allow_project_selection = true
 host = "profile-host"
 
 [profiles.audit]
-model_alias = "audit-model"
 "#,
     );
     fixture.write_project_config("unknown_project_key = true\n");
@@ -576,4 +574,226 @@ fn clean_satelle_command() -> Command {
     }
     command.env("SATELLE_TEST_SUPPORT_ADAPTER", "fake");
     command
+}
+
+#[test]
+fn project_model_and_provider_intent_requires_one_exact_host_binding() {
+    let fixture = ConfigFixture::new(
+        r#"
+default_host = "local"
+
+[hosts.local]
+transport = "local"
+adapter = "fake"
+allow_project_selection = true
+
+[hosts.local.provider_bindings.openai.review]
+model = "gpt-5.2"
+model_provider = "openai"
+"#,
+        r#"
+default_host = "local"
+model_alias = "review"
+provider_alias = "openai"
+"#,
+    );
+
+    fixture
+        .command()
+        .args(["config", "check", "--json"])
+        .assert()
+        .success();
+
+    for (model_alias, provider_alias) in
+        [("missing-model", "openai"), ("review", "missing-provider")]
+    {
+        fixture.write_project_config(&format!(
+            r#"
+default_host = "local"
+model_alias = "{model_alias}"
+provider_alias = "{provider_alias}"
+"#,
+        ));
+        let output = fixture
+            .command()
+            .args(["config", "check", "--json"])
+            .assert()
+            .code(66)
+            .get_output()
+            .clone();
+        let error = parse_json(&output.stderr);
+
+        assert_eq!(error["code"], "model-provider-binding-missing");
+        assert_eq!(error["details"]["host"], "local");
+        assert_eq!(error["details"]["requested_model_alias"], model_alias);
+        assert_eq!(error["details"]["requested_provider_alias"], provider_alias);
+        assert!(
+            error["suggested_commands"]
+                .as_array()
+                .is_some_and(|commands| !commands.is_empty())
+        );
+    }
+}
+
+#[cfg(feature = "test-support")]
+#[test]
+fn non_openai_project_binding_requires_provider_scoped_user_opt_in() {
+    let fixture = ConfigFixture::new(
+        r#"
+default_host = "local"
+
+[hosts.local]
+transport = "local"
+adapter = "fake"
+allow_project_selection = true
+
+[hosts.local.provider_bindings.anthropic.vision]
+model = "claude-computer-use"
+model_provider = "anthropic"
+auth_source = "anthropic"
+
+[hosts.local.provider_auth.anthropic]
+kind = "environment"
+variable = "SATELLE_TEST_ANTHROPIC_TOKEN"
+"#,
+        r#"
+default_host = "local"
+model_alias = "vision"
+provider_alias = "anthropic"
+        "#,
+    );
+
+    let output = fixture
+        .command()
+        .args([
+            "setup",
+            "--host",
+            "local",
+            "--component",
+            "provider-auth",
+            "--no-input",
+            "--yes",
+            "--json",
+        ])
+        .assert()
+        .code(64)
+        .get_output()
+        .clone();
+    let error = parse_json(&output.stderr);
+    assert_eq!(error["code"], "experimental-provider-opt-in-required");
+
+    fixture.write_user_config(
+        r#"
+default_host = "local"
+
+[hosts.local]
+transport = "local"
+adapter = "fake"
+allow_project_selection = true
+
+[hosts.local.experimental_provider_computer_use_by_provider]
+anthropic = true
+
+[hosts.local.provider_bindings.anthropic.vision]
+model = "claude-computer-use"
+model_provider = "anthropic"
+auth_source = "anthropic"
+
+[hosts.local.provider_auth.anthropic]
+kind = "environment"
+variable = "SATELLE_TEST_ANTHROPIC_TOKEN"
+"#,
+    );
+    fixture
+        .command()
+        .args([
+            "setup",
+            "--host",
+            "local",
+            "--component",
+            "provider-auth",
+            "--no-input",
+            "--yes",
+            "--json",
+        ])
+        .assert()
+        .success();
+    fixture
+        .command()
+        .args(["host", "release-state"])
+        .assert()
+        .success();
+    fixture
+        .command()
+        .args(["run", "--json", "test non-openai opt-in"])
+        .assert()
+        .success();
+}
+
+#[test]
+fn provider_auth_config_accepts_descriptors_but_rejects_raw_secret_values() {
+    let fixture = ConfigFixture::new(
+        r#"
+default_host = "local"
+
+[hosts.local]
+transport = "local"
+adapter = "fake"
+allow_project_selection = true
+
+[hosts.local.provider_auth.openai]
+kind = "environment"
+variable = "OPENAI_API_KEY"
+
+[hosts.local.provider_bindings.openai.review]
+model = "gpt-5.2"
+model_provider = "openai"
+auth_source = "openai"
+"#,
+        r#"
+default_host = "local"
+model_alias = "review"
+provider_alias = "openai"
+"#,
+    );
+
+    fixture
+        .command()
+        .args(["config", "check", "--json"])
+        .assert()
+        .success();
+
+    let raw_secret = "sk-raw-provider-secret-must-not-enter-config";
+    fixture.write_user_config(&format!(
+        r#"
+default_host = "local"
+
+[hosts.local]
+transport = "local"
+adapter = "fake"
+allow_project_selection = true
+
+[hosts.local.provider_auth.openai]
+kind = "environment"
+variable = "OPENAI_API_KEY"
+value = "{raw_secret}"
+
+[hosts.local.provider_bindings.openai.review]
+model = "gpt-5.2"
+model_provider = "openai"
+auth_source = "openai"
+"#,
+    ));
+    let output = fixture
+        .command()
+        .args(["config", "check", "--json"])
+        .assert()
+        .code(66)
+        .get_output()
+        .clone();
+    let error = parse_json(&output.stderr);
+
+    assert_eq!(error["code"], "unknown-config-key");
+    assert!(!String::from_utf8_lossy(&output.stdout).contains(raw_secret));
+    assert!(!String::from_utf8_lossy(&output.stderr).contains(raw_secret));
 }

@@ -86,6 +86,9 @@ impl RuntimeEngine {
         turn_id: &TurnId,
     ) -> Option<SatelleEventBody> {
         let evidence = readiness.provider_smoke_evidence()?;
+        let binding = readiness
+            .resolved_provider_binding()
+            .expect("typed provider smoke evidence always carries its authorized binding");
         let turn = session
             .turn(turn_id)
             .expect("an admitted provider preflight retains its Turn");
@@ -108,6 +111,16 @@ impl RuntimeEngine {
             json!({
                 "status": "passed",
                 "source": evidence.source().as_str(),
+                "resolved_codex_model": binding.model(),
+                "resolved_model_provider": binding.model_provider(),
+                "provider_binding_source": binding.source().as_str(),
+                "experimental_provider_computer_use":
+                    binding.experimental_provider_computer_use(),
+                "binding_digest": binding.binding_digest(),
+                "model_origin": binding.model_origin().map(|origin| origin.as_str()),
+                "model_provider_origin": binding
+                    .model_provider_origin()
+                    .map(|origin| origin.as_str()),
                 "observed_at": evidence.observed_at().format(&Rfc3339)
                     .expect("provider evidence timestamp is RFC 3339 representable"),
                 "expires_at": evidence.expires_at().format(&Rfc3339)

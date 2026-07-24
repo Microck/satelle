@@ -1,8 +1,12 @@
+use super::api_json::ApiJson;
 use super::auth::AuthorizedRequest;
 use super::{ApiFailure, DaemonState, api_error_response, authenticated_json_response, host_error};
 use crate::contract::{
     ApiErrorCategory, ApiErrorCode, BootstrapMaintenanceResponse, DURABLE_SETUP_PENDING_TTL,
     DurableTokenActivationResponse, DurableTokenConfirmationResponse, DurableTokenIssuanceResponse,
+    ProviderBindingAuthorizationRequest, ProviderBindingAuthorizationResponse,
+    ProviderBindingDeletionResponse, ProviderDescriptorValidationRequest,
+    ProviderDescriptorValidationResponse,
 };
 use axum::extract::{Extension, Path, State};
 use axum::http::StatusCode;
@@ -36,6 +40,109 @@ enum SetupTokenMutationOutcome {
     Conflict,
     HostError(SatelleError),
     TaskFailure,
+}
+
+pub(super) async fn validate_provider_descriptor(
+    State(state): State<Arc<DaemonState>>,
+    Extension(authorized): Extension<AuthorizedRequest>,
+    Extension(authority): Extension<MutationAuthority>,
+    Path((provider_alias, model_alias)): Path<(String, String)>,
+    ApiJson(request): ApiJson<ProviderDescriptorValidationRequest>,
+) -> Response {
+    let mode = request.mode();
+    let service = Arc::clone(&state.service);
+    let validation = match tokio::task::spawn_blocking(move || {
+        service.validate_provider_descriptor_idempotent(
+            satelle_core::LOCAL_DEMO_HOST,
+            &model_alias,
+            &provider_alias,
+            mode,
+            &authority,
+        )
+    })
+    .await
+    {
+        Ok(Ok(validation)) => validation,
+        Ok(Err(error)) => return host_error::response(&state, &authorized, &error),
+        Err(_) => return host_error::task_failure(&state, &authorized),
+    };
+    let response = ProviderDescriptorValidationResponse::new(
+        authorized.request_id().clone(),
+        state.host_identity.clone(),
+        &validation,
+    );
+    authenticated_json_response(
+        StatusCode::OK,
+        &response,
+        authorized.request_id(),
+        &state.host_identity,
+    )
+}
+
+pub(super) async fn authorize_provider_binding(
+    State(state): State<Arc<DaemonState>>,
+    Extension(authorized): Extension<AuthorizedRequest>,
+    Extension(authority): Extension<MutationAuthority>,
+    Path((provider_alias, model_alias)): Path<(String, String)>,
+    ApiJson(request): ApiJson<ProviderBindingAuthorizationRequest>,
+) -> Response {
+    let service = Arc::clone(&state.service);
+    let authorization = request.into_authorization();
+    let binding = match tokio::task::spawn_blocking(move || {
+        service.authorize_provider_binding_idempotent(
+            satelle_core::LOCAL_DEMO_HOST,
+            &model_alias,
+            &provider_alias,
+            authorization,
+            &authority,
+        )
+    })
+    .await
+    {
+        Ok(Ok(binding)) => binding,
+        Ok(Err(error)) => return host_error::response(&state, &authorized, &error),
+        Err(_) => return host_error::task_failure(&state, &authorized),
+    };
+    let response = ProviderBindingAuthorizationResponse::new(
+        authorized.request_id().clone(),
+        state.host_identity.clone(),
+        binding,
+    );
+    authenticated_json_response(
+        StatusCode::OK,
+        &response,
+        authorized.request_id(),
+        &state.host_identity,
+    )
+}
+
+pub(super) async fn delete_provider_binding(
+    State(state): State<Arc<DaemonState>>,
+    Extension(authorized): Extension<AuthorizedRequest>,
+    Extension(authority): Extension<MutationAuthority>,
+    Path((provider_alias, model_alias)): Path<(String, String)>,
+) -> Response {
+    let service = Arc::clone(&state.service);
+    let deleted = match tokio::task::spawn_blocking(move || {
+        service.delete_provider_binding_idempotent(&model_alias, &provider_alias, &authority)
+    })
+    .await
+    {
+        Ok(Ok(deleted)) => deleted,
+        Ok(Err(error)) => return host_error::response(&state, &authorized, &error),
+        Err(_) => return host_error::task_failure(&state, &authorized),
+    };
+    let response = ProviderBindingDeletionResponse::new(
+        authorized.request_id().clone(),
+        state.host_identity.clone(),
+        deleted,
+    );
+    authenticated_json_response(
+        StatusCode::OK,
+        &response,
+        authorized.request_id(),
+        &state.host_identity,
+    )
 }
 
 pub(super) async fn complete_bootstrap_maintenance(

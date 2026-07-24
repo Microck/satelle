@@ -1,6 +1,7 @@
 use directories::ProjectDirs;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
+use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::num::NonZeroUsize;
@@ -75,6 +76,8 @@ pub struct SatelleConfig {
     pub model_alias: Option<String>,
     pub provider_alias: Option<String>,
     pub experimental_provider_computer_use: Option<bool>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub experimental_provider_computer_use_by_provider: BTreeMap<String, bool>,
     pub yolo: Option<bool>,
     pub command_history: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -110,12 +113,14 @@ impl SatelleConfig {
                 daemon_log_dir: None,
                 setup_mode: None,
                 experimental_provider_computer_use: None,
+                experimental_provider_computer_use_by_provider: BTreeMap::new(),
                 yolo: None,
                 allow_project_selection: false,
                 expected_host_id: None,
                 api_token: None,
                 ca_bundle: None,
                 provider_auth: BTreeMap::new(),
+                provider_bindings: BTreeMap::new(),
             },
         );
 
@@ -124,6 +129,7 @@ impl SatelleConfig {
             model_alias: None,
             provider_alias: None,
             experimental_provider_computer_use: None,
+            experimental_provider_computer_use_by_provider: BTreeMap::new(),
             yolo: None,
             command_history: None,
             api_rate_limits: None,
@@ -144,6 +150,10 @@ impl SatelleConfig {
         }
         if higher.experimental_provider_computer_use.is_some() {
             self.experimental_provider_computer_use = higher.experimental_provider_computer_use;
+        }
+        for (provider_alias, enabled) in higher.experimental_provider_computer_use_by_provider {
+            self.experimental_provider_computer_use_by_provider
+                .insert(provider_alias, enabled);
         }
         if higher.yolo.is_some() {
             self.yolo = higher.yolo;
@@ -279,6 +289,8 @@ pub struct HostConfig {
     pub daemon_log_dir: Option<PathBuf>,
     pub setup_mode: Option<SetupMode>,
     pub experimental_provider_computer_use: Option<bool>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub experimental_provider_computer_use_by_provider: BTreeMap<String, bool>,
     pub yolo: Option<bool>,
     #[serde(default)]
     pub allow_project_selection: bool,
@@ -290,6 +302,18 @@ pub struct HostConfig {
     pub ca_bundle: Option<PathBuf>,
     #[serde(default)]
     pub provider_auth: BTreeMap<String, ProviderSecretSource>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub provider_bindings: BTreeMap<String, BTreeMap<String, ProviderBindingConfig>>,
+}
+
+impl HostConfig {
+    pub fn provider_binding(
+        &self,
+        provider_alias: &str,
+        model_alias: &str,
+    ) -> Option<&ProviderBindingConfig> {
+        self.provider_bindings.get(provider_alias)?.get(model_alias)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -386,6 +410,979 @@ pub enum ProviderSecretSource {
     File { path: PathBuf },
     CredentialStore { service: String, account: String },
     HostStore { name: String },
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderAuthValidationMode {
+    Cached,
+    RefreshProviderSmoke,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderAuthValidationOutcome {
+    MissingDescriptor,
+    UnsupportedDescriptorKind,
+    ConfiguredDeferred,
+    UnresolvedHostSecret,
+    Resolved,
+    ProviderComputerUseSmokeTestFailed,
+}
+
+impl ProviderAuthValidationOutcome {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::MissingDescriptor => "missing_descriptor",
+            Self::UnsupportedDescriptorKind => "unsupported_descriptor_kind",
+            Self::ConfiguredDeferred => "configured_deferred",
+            Self::UnresolvedHostSecret => "unresolved_host_secret",
+            Self::Resolved => "resolved",
+            Self::ProviderComputerUseSmokeTestFailed => "provider_computer_use_smoke_test_failed",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderAuthObservationSource {
+    Cached,
+    Live,
+    Deferred,
+}
+
+impl ProviderAuthObservationSource {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Cached => "cached",
+            Self::Live => "live",
+            Self::Deferred => "deferred",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProviderAuthValidationResult {
+    outcome: ProviderAuthValidationOutcome,
+    observation_source: ProviderAuthObservationSource,
+}
+
+impl ProviderAuthValidationResult {
+    pub const fn new(
+        outcome: ProviderAuthValidationOutcome,
+        observation_source: ProviderAuthObservationSource,
+    ) -> Self {
+        assert!(
+            Self::is_valid_pair(outcome, observation_source),
+            "provider validation outcome contradicts its observation source"
+        );
+        Self {
+            outcome,
+            observation_source,
+        }
+    }
+
+    pub const fn outcome(self) -> ProviderAuthValidationOutcome {
+        self.outcome
+    }
+
+    pub const fn observation_source(self) -> ProviderAuthObservationSource {
+        self.observation_source
+    }
+
+    const fn is_valid_pair(
+        outcome: ProviderAuthValidationOutcome,
+        observation_source: ProviderAuthObservationSource,
+    ) -> bool {
+        match observation_source {
+            ProviderAuthObservationSource::Deferred => matches!(
+                outcome,
+                ProviderAuthValidationOutcome::MissingDescriptor
+                    | ProviderAuthValidationOutcome::UnsupportedDescriptorKind
+                    | ProviderAuthValidationOutcome::ConfiguredDeferred
+            ),
+            ProviderAuthObservationSource::Cached | ProviderAuthObservationSource::Live => {
+                matches!(
+                    outcome,
+                    ProviderAuthValidationOutcome::UnresolvedHostSecret
+                        | ProviderAuthValidationOutcome::Resolved
+                        | ProviderAuthValidationOutcome::ProviderComputerUseSmokeTestFailed
+                )
+            }
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for ProviderAuthValidationResult {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct WireResult {
+            outcome: ProviderAuthValidationOutcome,
+            observation_source: ProviderAuthObservationSource,
+        }
+
+        let wire = WireResult::deserialize(deserializer)?;
+        if !Self::is_valid_pair(wire.outcome, wire.observation_source) {
+            return Err(serde::de::Error::custom(
+                "provider validation outcome contradicts its observation source",
+            ));
+        }
+        Ok(Self::new(wire.outcome, wire.observation_source))
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ProviderBindingConfig {
+    pub model: String,
+    pub model_provider: String,
+    pub endpoint: Option<String>,
+    pub auth_source: Option<String>,
+}
+
+fn deserialize_optional_provider_secret_source<'de, D>(
+    deserializer: D,
+) -> Result<Option<ProviderSecretSource>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let Some(value) = Option::<Value>::deserialize(deserializer)? else {
+        return Ok(None);
+    };
+    let object = value
+        .as_object()
+        .ok_or_else(|| serde::de::Error::custom("provider secret source must be an object"))?;
+    let kind = object
+        .get("kind")
+        .and_then(Value::as_str)
+        .ok_or_else(|| serde::de::Error::custom("provider secret source requires kind"))?;
+    let allowed_fields: &[&str] = match kind {
+        "environment" => &["kind", "variable"],
+        "file" => &["kind", "path"],
+        "credential-store" => &["kind", "service", "account"],
+        "host-store" => &["kind", "name"],
+        _ => &["kind"],
+    };
+    if let Some(field) = object
+        .keys()
+        .find(|field| !allowed_fields.contains(&field.as_str()))
+    {
+        return Err(serde::de::Error::custom(format!(
+            "unknown provider secret source field `{field}`"
+        )));
+    }
+    serde_json::from_value(value)
+        .map(Some)
+        .map_err(serde::de::Error::custom)
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderBindingSource {
+    HostOwned,
+    UserConfig,
+}
+
+impl ProviderBindingSource {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::HostOwned => "host_owned",
+            Self::UserConfig => "user_config",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ProviderValueOrigin {
+    HostConfig,
+    UserConfig,
+    CodexDefault,
+    CodexUser,
+    CodexProject,
+    CodexManaged,
+    CodexSession,
+    CodexOther,
+}
+
+impl ProviderValueOrigin {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::HostConfig => "host_config",
+            Self::UserConfig => "user_config",
+            Self::CodexDefault => "codex_default",
+            Self::CodexUser => "codex_user",
+            Self::CodexProject => "codex_project",
+            Self::CodexManaged => "codex_managed",
+            Self::CodexSession => "codex_session",
+            Self::CodexOther => "codex_other",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProviderBindingAuthorization {
+    requested_model_alias: String,
+    requested_provider_alias: String,
+    model: String,
+    model_provider: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    endpoint: Option<String>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_optional_provider_secret_source"
+    )]
+    auth_source: Option<ProviderSecretSource>,
+    experimental_provider_computer_use: bool,
+}
+
+impl ProviderBindingAuthorization {
+    pub fn new(
+        requested_model_alias: impl Into<String>,
+        requested_provider_alias: impl Into<String>,
+        model: impl Into<String>,
+        model_provider: impl Into<String>,
+    ) -> Self {
+        Self {
+            requested_model_alias: requested_model_alias.into(),
+            requested_provider_alias: requested_provider_alias.into(),
+            model: model.into(),
+            model_provider: model_provider.into(),
+            endpoint: None,
+            auth_source: None,
+            experimental_provider_computer_use: false,
+        }
+    }
+
+    pub fn with_endpoint(mut self, endpoint: impl Into<String>) -> Self {
+        self.endpoint = Some(endpoint.into());
+        self
+    }
+
+    pub fn with_auth_source(mut self, auth_source: ProviderSecretSource) -> Self {
+        self.auth_source = Some(auth_source);
+        self
+    }
+
+    pub const fn with_experimental_provider_computer_use(mut self, enabled: bool) -> Self {
+        self.experimental_provider_computer_use = enabled;
+        self
+    }
+
+    pub fn requested_model_alias(&self) -> &str {
+        &self.requested_model_alias
+    }
+
+    pub fn requested_provider_alias(&self) -> &str {
+        &self.requested_provider_alias
+    }
+
+    pub fn model(&self) -> &str {
+        &self.model
+    }
+
+    pub fn model_provider(&self) -> &str {
+        &self.model_provider
+    }
+
+    pub fn endpoint(&self) -> Option<&str> {
+        self.endpoint.as_deref()
+    }
+
+    pub fn auth_source(&self) -> Option<&ProviderSecretSource> {
+        self.auth_source.as_ref()
+    }
+
+    pub const fn experimental_provider_computer_use(&self) -> bool {
+        self.experimental_provider_computer_use
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ResolvedProviderBinding {
+    requested_model_alias: String,
+    requested_provider_alias: String,
+    model: String,
+    model_provider: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    endpoint: Option<String>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_optional_provider_secret_source"
+    )]
+    auth_source: Option<ProviderSecretSource>,
+    source: ProviderBindingSource,
+    experimental_provider_computer_use: bool,
+    binding_digest: String,
+    #[serde(skip)]
+    model_origin: Option<ProviderValueOrigin>,
+    #[serde(skip)]
+    model_provider_origin: Option<ProviderValueOrigin>,
+}
+
+impl ResolvedProviderBinding {
+    pub fn from_authorization(
+        authorization: ProviderBindingAuthorization,
+        source: ProviderBindingSource,
+    ) -> Self {
+        let value_origin = match source {
+            ProviderBindingSource::HostOwned => ProviderValueOrigin::HostConfig,
+            ProviderBindingSource::UserConfig => ProviderValueOrigin::UserConfig,
+        };
+        let mut binding = Self {
+            requested_model_alias: authorization.requested_model_alias,
+            requested_provider_alias: authorization.requested_provider_alias,
+            model: authorization.model,
+            model_provider: authorization.model_provider,
+            endpoint: authorization.endpoint,
+            auth_source: authorization.auth_source,
+            source,
+            experimental_provider_computer_use: authorization.experimental_provider_computer_use,
+            binding_digest: String::new(),
+            model_origin: Some(value_origin),
+            model_provider_origin: Some(value_origin),
+        };
+        binding.binding_digest = binding.compute_binding_digest();
+        binding
+    }
+
+    pub fn with_value_origins(
+        mut self,
+        model_origin: ProviderValueOrigin,
+        model_provider_origin: ProviderValueOrigin,
+    ) -> Self {
+        self.model_origin = Some(model_origin);
+        self.model_provider_origin = Some(model_provider_origin);
+        self
+    }
+
+    pub fn requested_model_alias(&self) -> &str {
+        &self.requested_model_alias
+    }
+
+    pub fn requested_provider_alias(&self) -> &str {
+        &self.requested_provider_alias
+    }
+
+    pub fn model(&self) -> &str {
+        &self.model
+    }
+
+    pub fn model_provider(&self) -> &str {
+        &self.model_provider
+    }
+
+    pub fn endpoint(&self) -> Option<&str> {
+        self.endpoint.as_deref()
+    }
+
+    pub fn auth_source(&self) -> Option<&ProviderSecretSource> {
+        self.auth_source.as_ref()
+    }
+
+    pub const fn source(&self) -> ProviderBindingSource {
+        self.source
+    }
+
+    pub const fn experimental_provider_computer_use(&self) -> bool {
+        self.experimental_provider_computer_use
+    }
+
+    pub fn binding_digest(&self) -> &str {
+        &self.binding_digest
+    }
+
+    pub fn has_valid_binding_digest(&self) -> bool {
+        self.binding_digest == self.compute_binding_digest()
+    }
+
+    pub const fn model_origin(&self) -> Option<ProviderValueOrigin> {
+        self.model_origin
+    }
+
+    pub const fn model_provider_origin(&self) -> Option<ProviderValueOrigin> {
+        self.model_provider_origin
+    }
+
+    fn compute_binding_digest(&self) -> String {
+        let mut digest = Sha256::new();
+        digest.update(b"satelle.authorized-provider-binding.v1\0");
+        for value in [
+            self.requested_model_alias.as_str(),
+            self.requested_provider_alias.as_str(),
+            self.model.as_str(),
+            self.model_provider.as_str(),
+            self.endpoint.as_deref().unwrap_or_default(),
+            self.source.as_str(),
+        ] {
+            digest.update(value.len().to_be_bytes());
+            digest.update(value.as_bytes());
+        }
+        let auth_source = self
+            .auth_source
+            .as_ref()
+            .map(serde_json::to_vec)
+            .transpose()
+            .expect("a Provider Secret Source descriptor always serializes")
+            .unwrap_or_default();
+        digest.update(auth_source.len().to_be_bytes());
+        digest.update(auth_source);
+        digest.update([u8::from(self.experimental_provider_computer_use)]);
+        digest
+            .finalize()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect()
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct PublicResolvedProviderBinding {
+    requested_model_alias: String,
+    requested_provider_alias: String,
+    model: String,
+    model_provider: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    endpoint: Option<String>,
+    source: ProviderBindingSource,
+    experimental_provider_computer_use: bool,
+    binding_digest: String,
+}
+
+impl PublicResolvedProviderBinding {
+    pub fn requested_model_alias(&self) -> &str {
+        &self.requested_model_alias
+    }
+
+    pub fn requested_provider_alias(&self) -> &str {
+        &self.requested_provider_alias
+    }
+
+    pub fn model(&self) -> &str {
+        &self.model
+    }
+
+    pub fn model_provider(&self) -> &str {
+        &self.model_provider
+    }
+
+    pub fn endpoint(&self) -> Option<&str> {
+        self.endpoint.as_deref()
+    }
+
+    pub const fn source(&self) -> ProviderBindingSource {
+        self.source
+    }
+
+    pub const fn experimental_provider_computer_use(&self) -> bool {
+        self.experimental_provider_computer_use
+    }
+
+    pub fn binding_digest(&self) -> &str {
+        &self.binding_digest
+    }
+}
+
+impl From<&ResolvedProviderBinding> for PublicResolvedProviderBinding {
+    fn from(binding: &ResolvedProviderBinding) -> Self {
+        Self {
+            requested_model_alias: binding.requested_model_alias.clone(),
+            requested_provider_alias: binding.requested_provider_alias.clone(),
+            model: binding.model.clone(),
+            model_provider: binding.model_provider.clone(),
+            endpoint: binding.endpoint.clone(),
+            source: binding.source,
+            experimental_provider_computer_use: binding.experimental_provider_computer_use,
+            binding_digest: binding.binding_digest.clone(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProviderDescriptorValidation {
+    resolved_binding: ResolvedProviderBinding,
+    validation: ProviderAuthValidationResult,
+}
+
+impl ProviderDescriptorValidation {
+    pub const fn new(
+        resolved_binding: ResolvedProviderBinding,
+        validation: ProviderAuthValidationResult,
+    ) -> Self {
+        Self {
+            resolved_binding,
+            validation,
+        }
+    }
+
+    pub const fn resolved_binding(&self) -> &ResolvedProviderBinding {
+        &self.resolved_binding
+    }
+
+    pub const fn validation(&self) -> ProviderAuthValidationResult {
+        self.validation
+    }
+
+    pub fn into_parts(self) -> (ResolvedProviderBinding, ProviderAuthValidationResult) {
+        (self.resolved_binding, self.validation)
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct PublicProviderDescriptorValidation {
+    resolved_binding: PublicResolvedProviderBinding,
+    validation: ProviderAuthValidationResult,
+}
+
+impl PublicProviderDescriptorValidation {
+    pub fn resolved_binding(&self) -> &PublicResolvedProviderBinding {
+        &self.resolved_binding
+    }
+
+    pub const fn validation(&self) -> ProviderAuthValidationResult {
+        self.validation
+    }
+}
+
+impl From<&ProviderDescriptorValidation> for PublicProviderDescriptorValidation {
+    fn from(result: &ProviderDescriptorValidation) -> Self {
+        Self {
+            resolved_binding: PublicResolvedProviderBinding::from(result.resolved_binding()),
+            validation: result.validation(),
+        }
+    }
+}
+
+#[cfg(test)]
+mod provider_binding_config_tests {
+    use super::*;
+
+    #[test]
+    fn provider_binding_authorization_and_resolution_preserve_the_non_secret_domain_contract() {
+        let authorization =
+            ProviderBindingAuthorization::new("vision", "open_ai", "gpt-5.6", "openai")
+                .with_endpoint("https://provider.example/v1")
+                .with_auth_source(ProviderSecretSource::Environment {
+                    variable: "OPENAI_API_KEY".to_string(),
+                })
+                .with_experimental_provider_computer_use(true);
+
+        assert_eq!(authorization.requested_model_alias(), "vision");
+        assert_eq!(authorization.requested_provider_alias(), "open_ai");
+        assert_eq!(authorization.model(), "gpt-5.6");
+        assert_eq!(authorization.model_provider(), "openai");
+        assert_eq!(
+            authorization.endpoint(),
+            Some("https://provider.example/v1")
+        );
+        assert!(matches!(
+            authorization.auth_source(),
+            Some(ProviderSecretSource::Environment { variable })
+                if variable == "OPENAI_API_KEY"
+        ));
+
+        let authorization_json =
+            serde_json::to_value(&authorization).expect("serialize provider binding authorization");
+        assert_eq!(
+            authorization_json,
+            serde_json::json!({
+                "requested_model_alias": "vision",
+                "requested_provider_alias": "open_ai",
+                "model": "gpt-5.6",
+                "model_provider": "openai",
+                "endpoint": "https://provider.example/v1",
+                "auth_source": {
+                    "kind": "environment",
+                    "variable": "OPENAI_API_KEY"
+                },
+                "experimental_provider_computer_use": true
+            })
+        );
+        assert!(authorization_json.get("source").is_none());
+
+        let resolved = ResolvedProviderBinding::from_authorization(
+            authorization,
+            ProviderBindingSource::HostOwned,
+        );
+        assert_eq!(resolved.requested_model_alias(), "vision");
+        assert_eq!(resolved.requested_provider_alias(), "open_ai");
+        assert_eq!(resolved.model(), "gpt-5.6");
+        assert_eq!(resolved.model_provider(), "openai");
+        assert_eq!(resolved.endpoint(), Some("https://provider.example/v1"));
+        assert!(resolved.auth_source().is_some());
+        assert_eq!(resolved.source(), ProviderBindingSource::HostOwned);
+        assert!(resolved.experimental_provider_computer_use());
+        assert!(resolved.has_valid_binding_digest());
+        assert_eq!(resolved.binding_digest().len(), 64);
+        assert_eq!(
+            serde_json::to_value(resolved).expect("serialize resolved provider binding")["source"],
+            serde_json::json!("host_owned")
+        );
+    }
+
+    #[test]
+    fn provider_binding_domain_types_reject_raw_secret_and_source_injection() {
+        let authorization_with_raw_secret = serde_json::json!({
+            "requested_model_alias": "vision",
+            "requested_provider_alias": "open_ai",
+            "model": "gpt-5.6",
+            "model_provider": "openai",
+            "auth_source": {
+                "kind": "environment",
+                "variable": "OPENAI_API_KEY",
+                "api_key": "must-not-cross-the-boundary"
+            }
+        });
+        assert!(
+            serde_json::from_value::<ProviderBindingAuthorization>(authorization_with_raw_secret)
+                .is_err()
+        );
+
+        let authorization_with_source = serde_json::json!({
+            "requested_model_alias": "vision",
+            "requested_provider_alias": "open_ai",
+            "model": "gpt-5.6",
+            "model_provider": "openai",
+            "source": "user_config"
+        });
+        assert!(
+            serde_json::from_value::<ProviderBindingAuthorization>(authorization_with_source)
+                .is_err()
+        );
+
+        let resolved_without_source = serde_json::json!({
+            "requested_model_alias": "vision",
+            "requested_provider_alias": "open_ai",
+            "model": "gpt-5.6",
+            "model_provider": "openai"
+        });
+        assert!(
+            serde_json::from_value::<ResolvedProviderBinding>(resolved_without_source).is_err()
+        );
+    }
+
+    #[test]
+    fn public_provider_validation_is_secret_free_and_rejects_contradictory_evidence() {
+        let resolved = ResolvedProviderBinding::from_authorization(
+            ProviderBindingAuthorization::new("vision", "open_ai", "gpt-5.6", "openai")
+                .with_endpoint("https://provider.example/v1")
+                .with_auth_source(ProviderSecretSource::Environment {
+                    variable: "PRIVATE_PROVIDER_TOKEN".to_string(),
+                })
+                .with_experimental_provider_computer_use(true),
+            ProviderBindingSource::HostOwned,
+        );
+        let validation = ProviderDescriptorValidation::new(
+            resolved,
+            ProviderAuthValidationResult::new(
+                ProviderAuthValidationOutcome::ConfiguredDeferred,
+                ProviderAuthObservationSource::Deferred,
+            ),
+        );
+        let public = PublicProviderDescriptorValidation::from(&validation);
+        let wire = serde_json::to_value(public).expect("serialize public provider validation");
+        assert_eq!(wire["resolved_binding"]["source"], "host_owned");
+        assert_eq!(
+            wire["resolved_binding"]["endpoint"],
+            "https://provider.example/v1"
+        );
+        assert!(!wire.to_string().contains("PRIVATE_PROVIDER_TOKEN"));
+        assert!(wire["resolved_binding"].get("auth_source").is_none());
+
+        for (outcome, observation_source) in [
+            ("missing_descriptor", "live"),
+            ("configured_deferred", "cached"),
+            ("resolved", "deferred"),
+            ("provider_computer_use_smoke_test_failed", "deferred"),
+        ] {
+            assert!(
+                serde_json::from_value::<ProviderAuthValidationResult>(serde_json::json!({
+                    "outcome": outcome,
+                    "observation_source": observation_source,
+                }))
+                .is_err(),
+                "{outcome} must reject contradictory {observation_source} evidence"
+            );
+        }
+    }
+
+    const BINDING_CONFIG: &str = r#"
+model_alias = "vision_pro"
+provider_alias = "open_ai"
+
+[hosts.workstation]
+transport = "local"
+adapter = "codex"
+
+[hosts.workstation.provider_bindings.open_ai.vision_pro]
+model = "gpt-5.6"
+model_provider = "openai"
+endpoint = "https://provider.example/v1"
+auth_source = "primary"
+
+[hosts.workstation.provider_bindings.open_ai.default]
+model = "gpt-5.6-mini"
+model_provider = "openai"
+
+[hosts.workstation.provider_bindings.anthropic.vision_pro]
+model = "claude-vision"
+model_provider = "anthropic"
+"#;
+
+    #[test]
+    fn provider_binding_config_parses_snake_case_tables_and_requires_exact_alias_pair() {
+        let parsed = parse_user_config(Path::new("/test/config.toml"), BINDING_CONFIG)
+            .expect("parse provider bindings");
+        let host = parsed
+            .config
+            .hosts
+            .get("workstation")
+            .expect("retain configured Host");
+
+        let binding = host
+            .provider_binding("open_ai", "vision_pro")
+            .expect("resolve the exact provider and model aliases");
+        assert_eq!(binding.model, "gpt-5.6");
+        assert_eq!(binding.model_provider, "openai");
+        assert_eq!(
+            binding.endpoint.as_deref(),
+            Some("https://provider.example/v1")
+        );
+        assert_eq!(binding.auth_source.as_deref(), Some("primary"));
+
+        let binding_without_optional_fields = host
+            .provider_binding("open_ai", "default")
+            .expect("parse a binding without optional fields");
+        assert_eq!(binding_without_optional_fields.endpoint, None);
+        assert_eq!(binding_without_optional_fields.auth_source, None);
+
+        assert!(host.provider_binding("open_ai", "missing").is_none());
+        assert!(host.provider_binding("missing", "vision_pro").is_none());
+
+        let encoded = toml::to_string(&parsed.config).expect("serialize provider bindings");
+        assert!(encoded.contains("provider_bindings"));
+        assert!(!encoded.contains("provider-bindings"));
+    }
+
+    #[test]
+    fn provider_binding_requires_concrete_model_and_model_provider_without_raw_secrets() {
+        for raw in [
+            r#"
+[hosts.workstation]
+transport = "local"
+adapter = "codex"
+[hosts.workstation.provider_bindings.open_ai.vision]
+model = "gpt-5.6"
+"#,
+            r#"
+[hosts.workstation]
+transport = "local"
+adapter = "codex"
+[hosts.workstation.provider_bindings.open_ai.vision]
+model_provider = "openai"
+"#,
+            r#"
+[hosts.workstation]
+transport = "local"
+adapter = "codex"
+[hosts.workstation.provider_bindings.open_ai.vision]
+model = ""
+model_provider = "openai"
+"#,
+            r#"
+[hosts.workstation]
+transport = "local"
+adapter = "codex"
+[hosts.workstation.provider_bindings.open_ai.vision]
+model = "gpt-5.6"
+model_provider = ""
+"#,
+        ] {
+            let error = parse_user_config(Path::new("/test/config.toml"), raw)
+                .expect_err("reject an incomplete concrete provider binding");
+            assert_eq!(error.code, ErrorCode::ConfigError);
+        }
+
+        for raw_secret_key in ["api_key", "secret", "token"] {
+            let raw = format!(
+                r#"
+[hosts.workstation]
+transport = "local"
+adapter = "codex"
+[hosts.workstation.provider_bindings.open_ai.vision]
+model = "gpt-5.6"
+model_provider = "openai"
+{raw_secret_key} = "must-not-enter-config"
+"#
+            );
+            let error = parse_user_config(Path::new("/test/config.toml"), &raw)
+                .expect_err("reject raw provider credentials in a binding");
+            assert_eq!(error.code, ErrorCode::UnknownConfigKey);
+        }
+    }
+
+    #[test]
+    fn single_alias_overrides_combine_with_the_other_effective_alias_before_binding_lookup() {
+        let base = parse_user_config(Path::new("/test/config.toml"), BINDING_CONFIG)
+            .expect("parse base provider bindings")
+            .config;
+
+        let model_override = parse_user_config(
+            Path::new("/test/model-override.toml"),
+            "model_alias = \"default\"\n",
+        )
+        .expect("parse model-only override")
+        .config;
+        let model_selected = base.clone().merge(model_override);
+        assert_eq!(model_selected.model_alias.as_deref(), Some("default"));
+        assert_eq!(model_selected.provider_alias.as_deref(), Some("open_ai"));
+        assert_eq!(
+            model_selected.hosts["workstation"]
+                .provider_binding(
+                    model_selected
+                        .provider_alias
+                        .as_deref()
+                        .expect("retain effective provider alias"),
+                    model_selected
+                        .model_alias
+                        .as_deref()
+                        .expect("apply model override"),
+                )
+                .expect("resolve the merged exact alias pair")
+                .model,
+            "gpt-5.6-mini"
+        );
+
+        let provider_override = parse_user_config(
+            Path::new("/test/provider-override.toml"),
+            "provider_alias = \"anthropic\"\n",
+        )
+        .expect("parse provider-only override")
+        .config;
+        let provider_selected = base.merge(provider_override);
+        assert_eq!(provider_selected.model_alias.as_deref(), Some("vision_pro"));
+        assert_eq!(
+            provider_selected.provider_alias.as_deref(),
+            Some("anthropic")
+        );
+        assert_eq!(
+            provider_selected.hosts["workstation"]
+                .provider_binding(
+                    provider_selected
+                        .provider_alias
+                        .as_deref()
+                        .expect("apply provider override"),
+                    provider_selected
+                        .model_alias
+                        .as_deref()
+                        .expect("retain effective model alias"),
+                )
+                .expect("resolve the merged exact alias pair")
+                .model_provider,
+            "anthropic"
+        );
+    }
+
+    #[test]
+    fn provider_experimental_opt_in_maps_merge_by_provider_with_profile_over_host_over_global_precedence()
+     {
+        let parsed = parse_user_config(
+            Path::new("/test/config.toml"),
+            r#"
+experimental_provider_computer_use_by_provider = { open_ai = false, anthropic = true }
+
+[hosts.workstation]
+transport = "local"
+adapter = "codex"
+experimental_provider_computer_use_by_provider = { open_ai = true, local = false }
+
+[profiles.lab]
+experimental_provider_computer_use_by_provider = { open_ai = false, anthropic = false }
+"#,
+        )
+        .expect("parse provider-scoped experimental opt-ins");
+
+        assert_eq!(
+            parsed
+                .config
+                .experimental_provider_computer_use_by_provider
+                .get("open_ai"),
+            Some(&false)
+        );
+        assert_eq!(
+            parsed
+                .config
+                .experimental_provider_computer_use_by_provider
+                .get("anthropic"),
+            Some(&true)
+        );
+
+        let mut host = parsed.config.hosts["workstation"].clone();
+        assert_eq!(
+            host.experimental_provider_computer_use_by_provider
+                .get("open_ai"),
+            Some(&true)
+        );
+        parsed.profiles["lab"].apply_to_host(
+            "workstation",
+            &mut host,
+            ProfileSelectionSource::CliFlag,
+        );
+
+        assert_eq!(
+            host.experimental_provider_computer_use_by_provider
+                .get("open_ai"),
+            Some(&false)
+        );
+        assert_eq!(
+            host.experimental_provider_computer_use_by_provider
+                .get("anthropic"),
+            Some(&false)
+        );
+        assert_eq!(
+            host.experimental_provider_computer_use_by_provider
+                .get("local"),
+            Some(&false)
+        );
+    }
+
+    #[test]
+    fn provider_binding_failures_have_stable_typed_error_codes() {
+        for (code, expected) in [
+            (
+                ErrorCode::ExperimentalProviderOptInRequired,
+                "experimental-provider-opt-in-required",
+            ),
+            (
+                ErrorCode::ModelProviderBindingMissing,
+                "model-provider-binding-missing",
+            ),
+            (
+                ErrorCode::ProviderSecretResolutionFailed,
+                "provider-secret-resolution-failed",
+            ),
+            (
+                ErrorCode::ExperimentalProviderNotValidated,
+                "experimental-provider-not-validated",
+            ),
+        ] {
+            assert_eq!(code.as_str(), expected);
+            assert_eq!(
+                serde_json::to_value(code).expect("serialize provider error code"),
+                serde_json::json!(expected)
+            );
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -753,6 +1750,18 @@ pub fn load_user_api_rate_limits(user_config_path: &Path) -> Result<ApiRateLimit
 }
 
 pub fn load_config(cwd: &Path, flag_profile: Option<&str>) -> Result<ResolvedConfig, SatelleError> {
+    load_config_with_profile_selection(cwd, flag_profile, true)
+}
+
+pub fn load_config_without_profile(cwd: &Path) -> Result<ResolvedConfig, SatelleError> {
+    load_config_with_profile_selection(cwd, None, false)
+}
+
+fn load_config_with_profile_selection(
+    cwd: &Path,
+    flag_profile: Option<&str>,
+    select_profile: bool,
+) -> Result<ResolvedConfig, SatelleError> {
     let paths = resolve_path_set(cwd)?;
     let user_config_path = paths.config_file;
     let project_config_path = paths.project_config_file;
@@ -812,15 +1821,19 @@ pub fn load_config(cwd: &Path, flag_profile: Option<&str>) -> Result<ResolvedCon
         Some((host.to_string(), profile_name.to_string()))
     });
 
-    let selected_profile = profiles::select_profile(
-        flag_profile,
-        user_config
-            .as_ref()
-            .and_then(|config| config.default_profile.as_deref()),
-        project_config
-            .as_ref()
-            .and_then(|config| config.default_profile.as_deref()),
-    );
+    let selected_profile = select_profile
+        .then(|| {
+            profiles::select_profile(
+                flag_profile,
+                user_config
+                    .as_ref()
+                    .and_then(|config| config.default_profile.as_deref()),
+                project_config
+                    .as_ref()
+                    .and_then(|config| config.default_profile.as_deref()),
+            )
+        })
+        .flatten();
     let profile_overlay = if let Some(selected) = &selected_profile {
         let profile =
             selected_profile_definition(user_config.as_ref(), &user_config_path, selected)?;
@@ -1476,6 +2489,7 @@ fn parse_user_config(path: &Path, raw: &str) -> Result<ParsedUserConfig, Satelle
     reject_timeout_config_errors(path, &value)?;
     reject_desktop_session_selector_conflicts(path, &value)?;
     reject_provider_secret_source_errors(path, &value)?;
+    reject_provider_binding_errors(path, &value)?;
     reject_unknown_user_config_keys(path, &value)?;
     reject_trusted_profile_errors(path, &value)?;
 
@@ -1731,6 +2745,31 @@ fn reject_interpolation(path: &Path, value: &toml::Value) -> Result<(), SatelleE
                         source_table.get(key),
                         &mut interpolations,
                     );
+                }
+            }
+        }
+
+        if let Some(provider_bindings) = host_table
+            .get("provider_bindings")
+            .and_then(toml::Value::as_table)
+        {
+            for (provider_alias, model_bindings) in provider_bindings {
+                let Some(model_bindings) = model_bindings.as_table() else {
+                    continue;
+                };
+                for (model_alias, binding) in model_bindings {
+                    let Some(binding) = binding.as_table() else {
+                        continue;
+                    };
+                    for key in ["model", "model_provider", "endpoint", "auth_source"] {
+                        collect_interpolation_for_value(
+                            &format!(
+                                "{host_path}.provider_bindings.{provider_alias}.{model_alias}.{key}"
+                            ),
+                            binding.get(key),
+                            &mut interpolations,
+                        );
+                    }
                 }
             }
         }
@@ -2012,17 +3051,52 @@ fn reject_provider_secret_source_errors(
                 ));
             }
 
-            if kind == "file" {
-                let Some(file_path) = source_table.get("path").and_then(toml::Value::as_str) else {
+            // File paths belong to the target Host's filesystem grammar.
+            // The controller can validate descriptor shape, but only the Host
+            // can decide whether a POSIX or Windows path is absolute.
+        }
+    }
+
+    Ok(())
+}
+
+fn reject_provider_binding_errors(path: &Path, value: &toml::Value) -> Result<(), SatelleError> {
+    let Some(hosts) = value.get("hosts").and_then(toml::Value::as_table) else {
+        return Ok(());
+    };
+
+    for (host_alias, host_value) in hosts {
+        let Some(provider_bindings) = host_value
+            .get("provider_bindings")
+            .and_then(toml::Value::as_table)
+        else {
+            continue;
+        };
+        for (provider_alias, model_bindings) in provider_bindings {
+            let Some(model_bindings) = model_bindings.as_table() else {
+                continue;
+            };
+            for (model_alias, binding) in model_bindings {
+                let Some(binding) = binding.as_table() else {
                     continue;
                 };
-                let parsed = PathBuf::from(file_path);
-                if parsed.starts_with("~") || !parsed.is_absolute() {
-                    return Err(SatelleError::secret_file_path_not_absolute(
-                        path,
-                        &format!("{source_path}.path"),
-                        file_path,
-                    ));
+                for field in ["model", "model_provider"] {
+                    let field_path = format!(
+                        "hosts.{host_alias}.provider_bindings.{provider_alias}.{model_alias}.{field}"
+                    );
+                    if binding
+                        .get(field)
+                        .and_then(toml::Value::as_str)
+                        .is_none_or(str::is_empty)
+                    {
+                        return Err(SatelleError::config_error(
+                            format!(
+                                "config file {} requires a non-empty string at {field_path}",
+                                path.display()
+                            ),
+                            None,
+                        ));
+                    }
                 }
             }
         }
@@ -2085,6 +3159,7 @@ fn reject_unknown_user_config_keys(path: &Path, value: &toml::Value) -> Result<(
             "model_alias",
             "provider_alias",
             "experimental_provider_computer_use",
+            "experimental_provider_computer_use_by_provider",
             "yolo",
             "command_history",
             "api_rate_limits",
@@ -2157,12 +3232,14 @@ fn reject_unknown_user_config_keys(path: &Path, value: &toml::Value) -> Result<(
                     "daemon_log_dir",
                     "setup_mode",
                     "experimental_provider_computer_use",
+                    "experimental_provider_computer_use_by_provider",
                     "yolo",
                     "allow_project_selection",
                     "expected_host_id",
                     "api_token",
                     "ca_bundle",
                     "provider_auth",
+                    "provider_bindings",
                 ],
                 &mut unknown_keys,
             );
@@ -2202,6 +3279,30 @@ fn reject_unknown_user_config_keys(path: &Path, value: &toml::Value) -> Result<(
                         &["kind", "variable", "path", "service", "account", "name"],
                         &mut unknown_keys,
                     );
+                }
+            }
+
+            if let Some(provider_bindings) = host_table
+                .get("provider_bindings")
+                .and_then(toml::Value::as_table)
+            {
+                for (provider_alias, model_bindings) in provider_bindings {
+                    let Some(model_bindings) = model_bindings.as_table() else {
+                        continue;
+                    };
+                    for (model_alias, binding) in model_bindings {
+                        let Some(binding) = binding.as_table() else {
+                            continue;
+                        };
+                        collect_unknown_keys_for_table(
+                            &format!(
+                                "{host_path}.provider_bindings.{provider_alias}.{model_alias}"
+                            ),
+                            binding,
+                            &["model", "model_provider", "endpoint", "auth_source"],
+                            &mut unknown_keys,
+                        );
+                    }
                 }
             }
 
@@ -2435,6 +3536,10 @@ pub enum ErrorCode {
     NativeReadinessTimeout,
     ProviderSmokeTestTimeout,
     UnsupportedProviderComputerUse,
+    ExperimentalProviderOptInRequired,
+    ModelProviderBindingMissing,
+    ProviderSecretResolutionFailed,
+    ExperimentalProviderNotValidated,
     DoctorReadinessBlockersFound,
     DoctorRefreshScopeRequired,
     DoctorRefreshTimeoutWithoutRefresh,
@@ -2528,6 +3633,10 @@ impl ErrorCode {
             Self::NativeReadinessTimeout => "native-readiness-timeout",
             Self::ProviderSmokeTestTimeout => "provider-smoke-test-timeout",
             Self::UnsupportedProviderComputerUse => "unsupported-provider-computer-use",
+            Self::ExperimentalProviderOptInRequired => "experimental-provider-opt-in-required",
+            Self::ModelProviderBindingMissing => "model-provider-binding-missing",
+            Self::ProviderSecretResolutionFailed => "provider-secret-resolution-failed",
+            Self::ExperimentalProviderNotValidated => "experimental-provider-not-validated",
             Self::DoctorReadinessBlockersFound => "doctor-readiness-blockers-found",
             Self::DoctorRefreshScopeRequired => "refresh-scope-required",
             Self::DoctorRefreshTimeoutWithoutRefresh => "refresh-timeout-without-refresh",
@@ -2567,6 +3676,7 @@ impl ErrorCode {
             | Self::ComponentSelectionConflict
             | Self::UnsupportedUpdateComponent
             | Self::PersistentServiceUnsupported
+            | Self::ExperimentalProviderOptInRequired
             | Self::SetupConsentRequired
             | Self::DoctorFixConsentRequired
             | Self::InputRequired
@@ -2599,6 +3709,7 @@ impl ErrorCode {
             | Self::PlatformDirectoriesUnavailable
             | Self::PathOverrideNotAbsolute
             | Self::DaemonPathOverrideNotAbsolute
+            | Self::ModelProviderBindingMissing
             | Self::HostNotFound
             | Self::SessionNotFound
             | Self::LogsCursorExpired => 66,
@@ -2615,7 +3726,8 @@ impl ErrorCode {
             | Self::StoreInUse
             | Self::RemoteExecution
             | Self::StorageBusy
-            | Self::StorageIntegrityFailed => 74,
+            | Self::StorageIntegrityFailed
+            | Self::ProviderSecretResolutionFailed => 74,
             Self::BootstrapBusy
             | Self::CapacityExceeded
             | Self::HostBusy
@@ -2624,6 +3736,7 @@ impl ErrorCode {
             | Self::NativeReadinessTimeout
             | Self::ProviderSmokeTestTimeout
             | Self::UnsupportedProviderComputerUse
+            | Self::ExperimentalProviderNotValidated
             | Self::DesktopSessionUnavailable
             | Self::DesktopSessionAmbiguous
             | Self::DesktopSessionPreferenceUnmatched

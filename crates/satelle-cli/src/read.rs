@@ -26,8 +26,34 @@ pub(super) fn config_check_report(
         .expect("config check always validates at least the selected context");
     let checked_contexts = contexts
         .iter()
-        .map(|context| {
-            json!({
+        .map(|context| -> Result<Value, CliFailure> {
+            let context_config = context.profile.as_deref().map_or_else(
+                ConfigContext::without_profile,
+                |profile| ConfigContext::new(Some(profile)),
+            );
+            let resolved = context_config.load()?;
+            let provider_host = resolved
+                .resolve_host(Some(&context.host))
+                .map(super::SelectedHost::from)
+                .map_err(failure)?;
+            let provider_selection = super::resolve_provider_selection(
+                resolved,
+                &provider_host,
+                None,
+                None,
+                false,
+                true,
+            )?;
+            if let Some(auth_source_name) = provider_selection.missing_auth_source_name() {
+                return Err(failure(SatelleError::config_error(
+                    format!(
+                        "Host Binding '{}' has provider authentication outcome missing_descriptor because provider_auth entry '{auth_source_name}' is absent",
+                        provider_host.alias
+                    ),
+                    None,
+                )));
+            }
+            Ok(json!({
                 "host": context.host,
                 "profile": context.profile,
                 "source": context.source,
@@ -35,9 +61,9 @@ pub(super) fn config_check_report(
                 "checks": LOCAL_CONFIG_CHECKS,
                 "errors": [],
                 "not_checked": REMOTE_CONFIG_CHECKS,
-            })
+            }))
         })
-        .collect::<Vec<_>>();
+        .collect::<Result<Vec<_>, _>>()?;
     Ok(json!({
         "schema_version": CONFIG_CHECK_SCHEMA_VERSION,
         "status": "ok",
@@ -124,7 +150,11 @@ pub(super) fn config_explain_report(
                 super::configured_turn_execution_timeout_ms(&selected_host_config),
             ),
             "daemon_path_overrides": daemon_path_overrides_json(&selected_host_config),
-            "model_provider": model_provider_config_json(config, &selected_host),
+            "model_provider": model_provider_config_json(
+                config,
+                &selected_host,
+                &selected_host_config,
+            ),
             "experimental_provider_computer_use": experimental_provider_computer_use_json(
                 config,
                 &selected_host,

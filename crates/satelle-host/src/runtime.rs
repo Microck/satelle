@@ -24,7 +24,9 @@ pub use adapter::{
     ReadinessEvidence, ReadinessObservationState, RecoveryObservation,
 };
 pub(crate) use adapter::{NativeProbeResult, ReadinessProbeDriver, ReadinessSource};
-pub(crate) use codex_adapter::{ProductionAdapterPolicy, ProductionComputerUseAdapter};
+pub(crate) use codex_adapter::{
+    ProductionAdapterPolicy, ProductionComputerUseAdapter, validate_provider_endpoint,
+};
 pub use request::AdmissionCancellation;
 pub(crate) use request::{
     AdmissionCancellationState, RequestIdentity, RunCommand, SteerCommand, StopCommand,
@@ -40,9 +42,10 @@ use crate::live_events::LiveEventHub;
 use crate::process_identity::ProcessIdentity;
 use crate::storage::{
     AdmissionOutcome, ApiTokenRegistration, IdempotentOperation, LeaseOwner, LogPageStorageError,
-    ObservedUpstreamRef, OperatorLogMirror, OperatorLogPolicy, ReadinessProbeKind,
-    ReadinessProbeTerminal, SensitiveRequestDigest, SetupActionSkipReason, SetupRepairPlan,
-    SetupRepairProbe, SetupRunPlan, SetupRunRecord, SetupRunStatus, Storage, StorageSnapshot,
+    ObservedUpstreamRef, OperatorLogMirror, OperatorLogPolicy, ProviderBindingAuthorizationReplay,
+    ProviderBindingDeletionReplay, ReadinessProbeKind, ReadinessProbeTerminal,
+    SensitiveRequestDigest, SetupActionSkipReason, SetupRepairPlan, SetupRepairProbe, SetupRunPlan,
+    SetupRunRecord, SetupRunStatus, Storage, StorageSnapshot,
 };
 use crate::{ApiBearerToken, ApiPrincipal, DaemonLogPage, LogCursor, LogPageQuery};
 use recovery::RecoveryQueue;
@@ -51,9 +54,12 @@ pub(crate) use recovery::VerifiedSetupPostconditions;
 pub(crate) use recovery::verify_setup_postconditions;
 use satelle_core::session::{DesktopBindingRef, PublicSession, TurnAdmissionFailure};
 use satelle_core::{
-    ControlPlaneOperation, ErrorCode, LOCAL_DEMO_HOST, SatelleError, SatelleEvent, SessionId,
-    TurnId,
+    ControlPlaneOperation, ErrorCode, LOCAL_DEMO_HOST, ProviderBindingAuthorization,
+    ProviderBindingSource, PublicResolvedProviderBinding, ResolvedProviderBinding, SatelleError,
+    SatelleEvent, SessionId, TurnId,
 };
+use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::ops::{Deref, DerefMut};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -71,13 +77,45 @@ pub(crate) struct RuntimeTurnOutcome {
     pub(crate) events: Vec<SatelleEvent>,
 }
 
+#[derive(Deserialize, Serialize)]
+#[serde(tag = "status", content = "result", rename_all = "snake_case")]
+enum ProviderDescriptorValidationReplay {
+    Completed(satelle_core::PublicProviderDescriptorValidation),
+    Failed(SatelleError),
+}
+
 struct AdmissionExecution<'a> {
     host: &'a str,
     prompt: &'a str,
     execution_mode: satelle_core::session::TurnExecutionMode,
     dispatch_preference: request::DispatchPreference,
     provider_smoke_event: Option<satelle_core::SatelleEventBody>,
+    resolved_provider_binding: Option<satelle_core::ResolvedProviderBinding>,
     attachments: crate::attachment::StagedAttachments,
+}
+
+/// The Host's closed resolution result for one exact model/provider pair.
+///
+/// A named but unavailable descriptor stays observable to setup and
+/// diagnostics without pretending that the binding is execution-ready.
+#[derive(Clone, Debug)]
+pub enum ProviderBindingResolution {
+    Ready(ResolvedProviderBinding),
+    MissingDescriptor {
+        binding: ResolvedProviderBinding,
+        auth_source_name: String,
+    },
+}
+
+impl ProviderBindingResolution {
+    fn into_ready(self) -> Result<ResolvedProviderBinding, SatelleError> {
+        match self {
+            Self::Ready(binding) => Ok(binding),
+            Self::MissingDescriptor {
+                auth_source_name, ..
+            } => Err(provider_secret_source_missing(&auth_source_name)),
+        }
+    }
 }
 
 /// Exclusive in-process authority for one live setup or repair operation.
@@ -400,6 +438,47 @@ fn readiness_probe_recovery_pending(kind: ReadinessProbeKind) -> SatelleError {
     error
 }
 
+fn model_provider_binding_missing(provider_intent: &ProviderComputerUseIntent) -> SatelleError {
+    let mut details = BTreeMap::new();
+    if let Some(model) = provider_intent.model() {
+        details.insert(
+            "requested_model_alias".to_string(),
+            serde_json::Value::String(model.as_str().to_string()),
+        );
+    }
+    if let Some(provider) = provider_intent.provider() {
+        details.insert(
+            "requested_provider_alias".to_string(),
+            serde_json::Value::String(provider.as_str().to_string()),
+        );
+    }
+    SatelleError {
+        code: ErrorCode::ModelProviderBindingMissing,
+        message: "the requested model and provider aliases have no exact authorized Host binding"
+            .to_string(),
+        recovery_command: Some(
+            "authorize the exact model/provider pair through SSH bootstrap setup".to_string(),
+        ),
+        source_detail: None,
+        details,
+    }
+}
+
+fn provider_secret_source_missing(auth_source: &str) -> SatelleError {
+    SatelleError {
+        code: ErrorCode::ProviderSecretResolutionFailed,
+        message: "the Host provider binding references an unavailable Secret Source".to_string(),
+        recovery_command: Some(
+            "repair the referenced provider_auth descriptor on the selected Host".to_string(),
+        ),
+        source_detail: None,
+        details: BTreeMap::from([(
+            "auth_source".to_string(),
+            serde_json::Value::String(auth_source.to_string()),
+        )]),
+    }
+}
+
 #[cfg(test)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum RuntimeStartupState {
@@ -413,6 +492,7 @@ pub(crate) struct RuntimeEngine {
     storage: Arc<Mutex<Storage>>,
     operator_log: Mutex<OperatorLogMirror>,
     adapter: Arc<dyn ComputerUseAdapter>,
+    provider_policy: RuntimeProviderPolicy,
     readiness_probe_driver: Option<Arc<dyn ReadinessProbeDriver>>,
     recovery: Mutex<RecoveryQueue>,
     restart_recovery_initialized: Mutex<bool>,
@@ -420,6 +500,27 @@ pub(crate) struct RuntimeEngine {
     live_events: LiveEventHub,
     process_identity: ProcessIdentity,
     attachment_store: crate::attachment::AttachmentStore,
+}
+
+#[derive(Clone, Default)]
+pub(crate) struct RuntimeProviderPolicy {
+    provider_bindings: BTreeMap<String, BTreeMap<String, satelle_core::ProviderBindingConfig>>,
+    provider_auth: BTreeMap<String, satelle_core::ProviderSecretSource>,
+    experimental_provider_computer_use: Option<bool>,
+    experimental_provider_computer_use_by_provider: BTreeMap<String, bool>,
+}
+
+impl RuntimeProviderPolicy {
+    pub(crate) fn from_host_config(config: &satelle_core::HostConfig) -> Self {
+        Self {
+            provider_bindings: config.provider_bindings.clone(),
+            provider_auth: config.provider_auth.clone(),
+            experimental_provider_computer_use: config.experimental_provider_computer_use,
+            experimental_provider_computer_use_by_provider: config
+                .experimental_provider_computer_use_by_provider
+                .clone(),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -452,6 +553,7 @@ impl RuntimeEngine {
         operator_log_root: PathBuf,
         adapter: Arc<dyn ComputerUseAdapter>,
         readiness_probe_driver: Option<Arc<dyn ReadinessProbeDriver>>,
+        provider_policy: RuntimeProviderPolicy,
     ) -> Result<Arc<Self>, SatelleError> {
         let process_identity =
             ProcessIdentity::current().map_err(model::process_identity_failure)?;
@@ -469,6 +571,7 @@ impl RuntimeEngine {
                 mirrored_cursor,
             )),
             adapter,
+            provider_policy,
             readiness_probe_driver,
             recovery: Mutex::new(RecoveryQueue::new(Vec::new())),
             restart_recovery_initialized: Mutex::new(false),
@@ -661,6 +764,7 @@ impl RuntimeEngine {
                 execution_mode: command.execution_mode,
                 dispatch_preference: command.dispatch,
                 provider_smoke_event,
+                resolved_provider_binding: readiness.resolved_provider_binding().cloned(),
                 attachments,
             },
             outcome,
@@ -728,6 +832,7 @@ impl RuntimeEngine {
                 execution_mode: command.execution_mode,
                 dispatch_preference: command.dispatch,
                 provider_smoke_event,
+                resolved_provider_binding: readiness.resolved_provider_binding().cloned(),
                 attachments,
             },
             outcome,
@@ -745,7 +850,14 @@ impl RuntimeEngine {
             cancellation.finish(AdmissionCancellationState::Cancelled);
             return Err(SatelleError::interrupted_attached_command());
         }
-        let cache_key = self.adapter.readiness_cache_key(host, provider_intent)?;
+        let provider_intent = self.authorize_provider_intent(provider_intent)?;
+        let cache_key = self.adapter.readiness_cache_key(host, &provider_intent)?;
+        let provider_smoke_enabled = cache_key.as_ref().is_some_and(|key| {
+            key.execution_policy()
+                .experimental_features()
+                .provider_computer_use()
+                == satelle_core::session::FeatureChoice::Enabled
+        });
         if let (Some(key), Some(driver)) =
             (cache_key.as_ref(), self.readiness_probe_driver.as_ref())
         {
@@ -758,7 +870,7 @@ impl RuntimeEngine {
             let readiness = storage
                 .load_reusable_readiness(key, now)
                 .map_err(model::storage_failure)?;
-            let provider = if provider_intent.experimental() && !provider_intent.refresh() {
+            let provider = if provider_smoke_enabled && !provider_intent.refresh() {
                 storage
                     .load_reusable_provider_smoke(key, now)
                     .map_err(model::storage_failure)?
@@ -775,8 +887,8 @@ impl RuntimeEngine {
         {
             cached = Some(self.run_live_native_probe(key, driver.as_ref(), cancellation)?);
         }
-        let requires_live_provider_probe = provider_intent.experimental()
-            && (provider_intent.refresh() || cached_provider.is_none());
+        let requires_live_provider_probe =
+            provider_smoke_enabled && (provider_intent.refresh() || cached_provider.is_none());
         let (provider_probe_ref, _provider_heartbeat) = if requires_live_provider_probe
             && self.readiness_probe_driver.is_some()
             && let Some(key) = cache_key.as_ref()
@@ -846,14 +958,14 @@ impl RuntimeEngine {
                         host,
                         cached,
                         cached_provider,
-                        provider_intent,
+                        &provider_intent,
                         cancellation,
                         &mut persist_thread_ref,
                         &mut persist_turn_ref,
                     ),
                 _ => {
                     self.adapter
-                        .preflight_terminal(host, cached, cached_provider, provider_intent)
+                        .preflight_terminal(host, cached, cached_provider, &provider_intent)
                 }
             }
         };
@@ -985,6 +1097,148 @@ impl RuntimeEngine {
                 Err(error)
             }
         }
+    }
+
+    fn cached_provider_smoke(
+        &self,
+        host: &str,
+        provider_intent: &ProviderComputerUseIntent,
+    ) -> Result<Option<ProviderSmokeResult>, SatelleError> {
+        let provider_intent = self.authorize_provider_intent(provider_intent)?;
+        let Some(key) = self.adapter.readiness_cache_key(host, &provider_intent)? else {
+            return Ok(None);
+        };
+        self.lock_storage()?
+            .load_reusable_provider_smoke(&key, time::OffsetDateTime::now_utc())
+            .map_err(model::storage_failure)
+    }
+
+    fn authorize_provider_intent(
+        &self,
+        provider_intent: &ProviderComputerUseIntent,
+    ) -> Result<ProviderComputerUseIntent, SatelleError> {
+        let Some(resolution) = self.resolve_requested_provider_binding(provider_intent)? else {
+            return Ok(provider_intent.clone());
+        };
+        let binding = resolution.into_ready()?;
+        Ok(provider_intent
+            .clone()
+            .with_resolved_provider_binding(binding))
+    }
+
+    fn resolve_requested_provider_binding(
+        &self,
+        provider_intent: &ProviderComputerUseIntent,
+    ) -> Result<Option<ProviderBindingResolution>, SatelleError> {
+        let requested_pair = match (provider_intent.model(), provider_intent.provider()) {
+            (None, None) => return Ok(None),
+            (Some(model), Some(provider)) => (model.as_str(), provider.as_str()),
+            _ => return Err(model_provider_binding_missing(provider_intent)),
+        };
+        if let Some(resolution) =
+            self.resolve_remote_host_binding(requested_pair.0, requested_pair.1)?
+        {
+            return Ok(Some(resolution));
+        }
+        let binding = self
+            .lock_storage()?
+            .load_authorized_provider_binding(requested_pair.0, requested_pair.1)
+            .map_err(model::storage_failure)?
+            .ok_or_else(|| model_provider_binding_missing(provider_intent))?;
+        Ok(Some(ProviderBindingResolution::Ready(binding)))
+    }
+
+    fn resolve_remote_host_binding(
+        &self,
+        model_alias: &str,
+        provider_alias: &str,
+    ) -> Result<Option<ProviderBindingResolution>, SatelleError> {
+        let Some(binding) = self
+            .provider_policy
+            .provider_bindings
+            .get(provider_alias)
+            .and_then(|models| models.get(model_alias))
+        else {
+            return Ok(None);
+        };
+        let mut authorization = ProviderBindingAuthorization::new(
+            model_alias,
+            provider_alias,
+            &binding.model,
+            &binding.model_provider,
+        );
+        if let Some(endpoint) = binding.endpoint.as_deref() {
+            authorization = authorization.with_endpoint(endpoint);
+        }
+        let missing_auth_source_name =
+            if let Some(auth_source_name) = binding.auth_source.as_deref() {
+                match self
+                    .provider_policy
+                    .provider_auth
+                    .get(auth_source_name)
+                    .cloned()
+                {
+                    Some(descriptor) => {
+                        authorization = authorization.with_auth_source(descriptor);
+                        None
+                    }
+                    None => Some(auth_source_name.to_string()),
+                }
+            } else {
+                None
+            };
+        let experimental = self
+            .provider_policy
+            .experimental_provider_computer_use_by_provider
+            .get(provider_alias)
+            .copied()
+            .or(self.provider_policy.experimental_provider_computer_use)
+            .unwrap_or(false);
+        authorization = authorization.with_experimental_provider_computer_use(experimental);
+        crate::validate_provider_binding_authorization(&authorization)?;
+        let binding = ResolvedProviderBinding::from_authorization(
+            authorization,
+            ProviderBindingSource::HostOwned,
+        );
+        Ok(Some(match missing_auth_source_name {
+            Some(auth_source_name) => ProviderBindingResolution::MissingDescriptor {
+                binding,
+                auth_source_name,
+            },
+            None => ProviderBindingResolution::Ready(binding),
+        }))
+    }
+
+    fn resolve_provider_binding(
+        &self,
+        host: &str,
+        provider_intent: &ProviderComputerUseIntent,
+    ) -> Result<ProviderBindingResolution, SatelleError> {
+        if let Some(resolution) = self.resolve_requested_provider_binding(provider_intent)? {
+            return Ok(resolution);
+        }
+        self.adapter
+            .resolve_provider_binding(host, provider_intent)
+            .map(ProviderBindingResolution::Ready)
+    }
+
+    pub(crate) fn authorize_provider_binding(
+        &self,
+        binding: &ResolvedProviderBinding,
+    ) -> Result<(), SatelleError> {
+        self.lock_storage()?
+            .authorize_provider_binding(binding, time::OffsetDateTime::now_utc())
+            .map_err(model::storage_failure)
+    }
+
+    pub(crate) fn delete_provider_binding(
+        &self,
+        model_alias: &str,
+        provider_alias: &str,
+    ) -> Result<bool, SatelleError> {
+        self.lock_storage()?
+            .delete_authorized_provider_binding(model_alias, provider_alias)
+            .map_err(model::storage_failure)
     }
 
     fn run_live_native_probe(
@@ -1234,6 +1488,7 @@ impl RuntimeEngine {
                     execution_mode: execution.execution_mode,
                     work,
                     provider_smoke_event: execution.provider_smoke_event,
+                    resolved_provider_binding: execution.resolved_provider_binding,
                     attachments: execution.attachments,
                 };
                 match execution.dispatch_preference {
@@ -1379,6 +1634,7 @@ struct LazyRuntime {
     state_root: Result<PathBuf, SatelleError>,
     operator_log_root: Result<PathBuf, SatelleError>,
     engine: Option<Arc<RuntimeEngine>>,
+    provider_policy: RuntimeProviderPolicy,
 }
 
 #[derive(Clone)]
@@ -1708,6 +1964,30 @@ impl RuntimeHandle {
                 state_root,
                 operator_log_root,
                 engine: None,
+                provider_policy: RuntimeProviderPolicy::default(),
+            })),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new_with_provider_policy<A: ComputerUseAdapter>(
+        state_root: Result<PathBuf, SatelleError>,
+        adapter: A,
+        provider_policy: RuntimeProviderPolicy,
+    ) -> Self {
+        let operator_log_root = state_root
+            .as_ref()
+            .map(|root| root.join("logs"))
+            .map_err(Clone::clone);
+        Self {
+            adapter: Arc::new(adapter),
+            readiness_probe_driver: None,
+            activity: Arc::new(DaemonActivity::default()),
+            lazy: Arc::new(Mutex::new(LazyRuntime {
+                state_root,
+                operator_log_root,
+                engine: None,
+                provider_policy,
             })),
         }
     }
@@ -1716,6 +1996,7 @@ impl RuntimeHandle {
         state_root: Result<PathBuf, SatelleError>,
         operator_log_root: Result<PathBuf, SatelleError>,
         adapter: ProductionComputerUseAdapter,
+        provider_policy: RuntimeProviderPolicy,
     ) -> Self {
         let adapter = Arc::new(adapter);
         let computer_use_adapter: Arc<dyn ComputerUseAdapter> = adapter.clone();
@@ -1728,6 +2009,7 @@ impl RuntimeHandle {
                 state_root,
                 operator_log_root,
                 engine: None,
+                provider_policy,
             })),
         }
     }
@@ -1754,6 +2036,7 @@ impl RuntimeHandle {
                 state_root,
                 operator_log_root,
                 engine: None,
+                provider_policy: RuntimeProviderPolicy::default(),
             })),
         }
     }
@@ -2039,6 +2322,39 @@ impl RuntimeHandle {
             .preflight(host, provider_intent, &AdmissionCancellation::new())
     }
 
+    pub(crate) fn resolve_provider_binding(
+        &self,
+        host: &str,
+        provider_intent: &ProviderComputerUseIntent,
+    ) -> Result<ProviderBindingResolution, SatelleError> {
+        self.engine()?
+            .resolve_provider_binding(host, provider_intent)
+    }
+
+    pub(crate) fn authorize_provider_binding(
+        &self,
+        binding: &ResolvedProviderBinding,
+    ) -> Result<(), SatelleError> {
+        self.engine()?.authorize_provider_binding(binding)
+    }
+
+    pub(crate) fn delete_provider_binding(
+        &self,
+        model_alias: &str,
+        provider_alias: &str,
+    ) -> Result<bool, SatelleError> {
+        self.engine()?
+            .delete_provider_binding(model_alias, provider_alias)
+    }
+
+    pub(crate) fn cached_provider_smoke(
+        &self,
+        host: &str,
+        provider_intent: &ProviderComputerUseIntent,
+    ) -> Result<Option<ProviderSmokeResult>, SatelleError> {
+        self.engine()?.cached_provider_smoke(host, provider_intent)
+    }
+
     pub(crate) fn daemon_workers_idle(&self) -> Result<bool, SatelleError> {
         self.engine()?.reap_finished_workers()
     }
@@ -2180,6 +2496,151 @@ impl RuntimeHandle {
         ))
     }
 
+    pub(crate) fn claim_provider_descriptor_validation(
+        &self,
+        identity: &RequestIdentity,
+    ) -> Result<Option<satelle_core::PublicProviderDescriptorValidation>, SatelleError> {
+        let requested_at = time::OffsetDateTime::now_utc();
+        let idempotency = model::idempotency(
+            IdempotentOperation::ProviderDescriptorValidation,
+            identity,
+            requested_at,
+        )?;
+        let replay = self
+            .engine()?
+            .lock_storage()?
+            .claim_provider_descriptor_validation(&idempotency)
+            .map_err(model::storage_failure)?;
+        match replay
+            .map(|json| {
+                serde_json::from_str(&json).map_err(|_| {
+                    integrity_error("stored provider validation replay is not valid canonical JSON")
+                })
+            })
+            .transpose()?
+        {
+            Some(ProviderDescriptorValidationReplay::Completed(result)) => Ok(Some(result)),
+            Some(ProviderDescriptorValidationReplay::Failed(error)) => Err(error),
+            None => Ok(None),
+        }
+    }
+
+    pub(crate) fn complete_provider_descriptor_validation(
+        &self,
+        identity: &RequestIdentity,
+        result: &satelle_core::PublicProviderDescriptorValidation,
+    ) -> Result<(), SatelleError> {
+        let completed_at = time::OffsetDateTime::now_utc();
+        let idempotency = model::idempotency(
+            IdempotentOperation::ProviderDescriptorValidation,
+            identity,
+            completed_at,
+        )?;
+        let result_json = serde_json::to_string(&ProviderDescriptorValidationReplay::Completed(
+            result.clone(),
+        ))
+        .map_err(|_| {
+            integrity_error("provider validation result could not be serialized for durable replay")
+        })?;
+        self.engine()?
+            .lock_storage()?
+            .complete_provider_descriptor_validation(
+                &idempotency,
+                &result_json,
+                false,
+                completed_at,
+            )
+            .map_err(model::storage_failure)
+    }
+
+    pub(crate) fn fail_provider_descriptor_validation(
+        &self,
+        identity: &RequestIdentity,
+        error: &SatelleError,
+    ) -> Result<(), SatelleError> {
+        let completed_at = time::OffsetDateTime::now_utc();
+        let idempotency = model::idempotency(
+            IdempotentOperation::ProviderDescriptorValidation,
+            identity,
+            completed_at,
+        )?;
+        let result_json =
+            serde_json::to_string(&ProviderDescriptorValidationReplay::Failed(error.clone()))
+                .map_err(|_| {
+                    integrity_error(
+                        "provider validation failure could not be serialized for durable replay",
+                    )
+                })?;
+        self.engine()?
+            .lock_storage()?
+            .complete_provider_descriptor_validation(&idempotency, &result_json, true, completed_at)
+            .map_err(model::storage_failure)
+    }
+
+    pub(crate) fn authorize_provider_binding_idempotent<F>(
+        &self,
+        identity: &RequestIdentity,
+        validate: F,
+    ) -> Result<PublicResolvedProviderBinding, SatelleError>
+    where
+        F: FnOnce() -> Result<ResolvedProviderBinding, SatelleError>,
+    {
+        let completed_at = time::OffsetDateTime::now_utc();
+        let idempotency = model::idempotency(
+            IdempotentOperation::ProviderBindingAuthorization,
+            identity,
+            completed_at,
+        )?;
+        let replay = self
+            .engine()?
+            .lock_storage()?
+            .authorize_provider_binding_idempotent(
+                &idempotency,
+                completed_at,
+                validate,
+                model::storage_failure_ref,
+            )
+            .map_err(model::storage_failure)?;
+        match replay {
+            ProviderBindingAuthorizationReplay::Completed(binding) => Ok(binding),
+            ProviderBindingAuthorizationReplay::Failed(error) => Err(error),
+        }
+    }
+
+    pub(crate) fn delete_provider_binding_idempotent<F>(
+        &self,
+        identity: &RequestIdentity,
+        model_alias: &str,
+        provider_alias: &str,
+        validate: F,
+    ) -> Result<bool, SatelleError>
+    where
+        F: FnOnce() -> Result<(), SatelleError>,
+    {
+        let completed_at = time::OffsetDateTime::now_utc();
+        let idempotency = model::idempotency(
+            IdempotentOperation::ProviderBindingDeletion,
+            identity,
+            completed_at,
+        )?;
+        let replay = self
+            .engine()?
+            .lock_storage()?
+            .delete_provider_binding_idempotent(
+                &idempotency,
+                model_alias,
+                provider_alias,
+                completed_at,
+                validate,
+                model::storage_failure_ref,
+            )
+            .map_err(model::storage_failure)?;
+        match replay {
+            ProviderBindingDeletionReplay::Completed(deleted) => Ok(deleted),
+            ProviderBindingDeletionReplay::Failed(error) => Err(error),
+        }
+    }
+
     #[cfg(test)]
     pub(crate) fn startup_state(&self) -> Result<RuntimeStartupState, SatelleError> {
         self.engine()?.startup_state()
@@ -2235,6 +2696,7 @@ impl RuntimeHandle {
             operator_log_root,
             Arc::clone(&self.adapter),
             self.readiness_probe_driver.clone(),
+            lazy.provider_policy.clone(),
         )?;
         lazy.engine = Some(Arc::clone(&engine));
         Ok(engine)
@@ -2256,6 +2718,9 @@ impl RuntimeHandle {
         self.engine_without_restart_recovery().map(Some)
     }
 }
+
+#[cfg(any(test, feature = "test-support"))]
+pub(crate) use self::codex_adapter::resolve_provider_child_secret as resolve_provider_child_secret_for_test;
 
 #[cfg(test)]
 #[path = "runtime-retention-tests.rs"]

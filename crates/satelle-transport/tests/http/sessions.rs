@@ -5,8 +5,8 @@ use satelle_core::StopResultOutcome;
 use satelle_core::session::{SessionActivity, TurnExecutionMode};
 use satelle_test_contract::assert_privacy_canaries_absent;
 use satelle_transport::{
-    AdmissionCancellationOutcome, AdmissionCancellationResponse, ImageAttachment, SessionResponse,
-    StopRequest, StopResponse, TurnRequest,
+    AdmissionCancellationOutcome, AdmissionCancellationResponse, ImageAttachment,
+    MAX_IMAGE_ATTACHMENT_BYTES, SessionResponse, StopRequest, StopResponse, TurnRequest,
 };
 use sha2::Digest as _;
 
@@ -16,6 +16,114 @@ const STOP_KEY: &str = "01890a5d-ac96-7b7c-8f89-37c3d0a66f03";
 const SECOND_CREATE_KEY: &str = "01890a5d-ac96-7b7c-8f89-37c3d0a66f04";
 const CROSS_SESSION_TURN_KEY: &str = "01890a5d-ac96-7b7c-8f89-37c3d0a66f05";
 const STALE_STOP_KEY: &str = "01890a5d-ac96-7b7c-8f89-37c3d0a66f06";
+
+#[tokio::test]
+async fn run_and_steer_reject_the_same_invalid_image_constraints_without_mutation() {
+    let running = RunningServer::start(ApiScopes::CONTROL).await;
+    let created: SessionResponse = running
+        .mutation("/v1/sessions", "invalid-image-parity-baseline")
+        .json(&TurnRequest::new(
+            "Create a baseline Session for invalid image parity",
+        ))
+        .send()
+        .await
+        .expect("create invalid image parity baseline")
+        .json()
+        .await
+        .expect("decode invalid image parity baseline");
+    let session_id = created.session().session_id().clone();
+    let baseline = wait_until_idle(&running, session_id.as_str()).await;
+    let steer_path = format!("/v1/sessions/{session_id}/turns");
+
+    let bytes = b"\x89PNG\r\n\x1a\nPRIVATE_INVALID_IMAGE_PARITY";
+    let data_base64 = base64::engine::general_purpose::STANDARD.encode(bytes);
+    let digest = sha2::Sha256::digest(bytes)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    let valid = ImageAttachment::new(
+        "image/png",
+        bytes.len() as u64,
+        digest.clone(),
+        data_base64.clone(),
+    );
+    let cases = [
+        (
+            "count",
+            vec![valid.clone(), valid.clone(), valid.clone()],
+            ATTACHMENT_LIMIT_ERROR,
+        ),
+        (
+            "sniffed-media-type",
+            vec![ImageAttachment::new(
+                "image/jpeg",
+                bytes.len() as u64,
+                digest.clone(),
+                data_base64.clone(),
+            )],
+            INVALID_IMAGE_ATTACHMENT_ERROR,
+        ),
+        (
+            "declared-size",
+            vec![ImageAttachment::new(
+                "image/png",
+                (MAX_IMAGE_ATTACHMENT_BYTES + 1) as u64,
+                digest.clone(),
+                data_base64.clone(),
+            )],
+            ATTACHMENT_LIMIT_ERROR,
+        ),
+        (
+            "content-digest",
+            vec![ImageAttachment::new(
+                "image/png",
+                bytes.len() as u64,
+                "00".repeat(32),
+                data_base64,
+            )],
+            INVALID_IMAGE_ATTACHMENT_ERROR,
+        ),
+    ];
+
+    for (name, attachments, expected) in cases {
+        let request = TurnRequest::new(format!(
+            "Reject the {name} image constraint without admitting a Turn"
+        ))
+        .with_attachments(attachments);
+        let rejected_run = running
+            .mutation("/v1/sessions", &format!("invalid-image-parity-{name}-run"))
+            .json(&request)
+            .send()
+            .await
+            .unwrap_or_else(|error| panic!("send {name} invalid run image: {error}"));
+        assert_exact_api_error(rejected_run, &running.host_identity, expected).await;
+        let rejected_steer = running
+            .mutation(&steer_path, &format!("invalid-image-parity-{name}-steer"))
+            .json(&request)
+            .send()
+            .await
+            .unwrap_or_else(|error| panic!("send {name} invalid steer image: {error}"));
+        assert_exact_api_error(rejected_steer, &running.host_identity, expected).await;
+        assert_eq!(
+            running
+                .service
+                .initialize_daemon()
+                .expect("read session count after rejected images")
+                .session_count(),
+            1,
+            "case={name}"
+        );
+        let after: SessionResponse = running
+            .request(&format!("/v1/sessions/{session_id}"))
+            .send()
+            .await
+            .unwrap_or_else(|error| panic!("read Session after {name} rejection: {error}"))
+            .json()
+            .await
+            .unwrap_or_else(|error| panic!("decode Session after {name} image rejection: {error}"));
+        assert_eq!(after.session(), baseline.session(), "case={name}");
+    }
+}
 
 #[tokio::test]
 async fn cancelled_admission_replay_returns_a_stable_conflict() {
@@ -483,6 +591,139 @@ async fn unsupported_image_runtime_enforces_advertised_zero_before_decode() {
 }
 
 #[tokio::test]
+async fn steer_images_share_run_validation_and_idempotency_identity() {
+    let running = RunningServer::start(ApiScopes::CONTROL).await;
+    let created = running
+        .mutation("/v1/sessions", "steer-image-create")
+        .json(&TurnRequest::new("Create a Session before the image steer"))
+        .send()
+        .await
+        .expect("create baseline Session");
+    assert_eq!(created.status(), StatusCode::ACCEPTED);
+    let created: SessionResponse = created.json().await.expect("decode baseline Session");
+    let session_id = created.session().session_id().clone();
+    wait_until_idle(&running, session_id.as_str()).await;
+
+    let first_bytes = b"\x89PNG\r\n\x1a\nPRIVATE_STEER_IMAGE_ONE";
+    let first_digest = sha2::Sha256::digest(first_bytes)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    let prompt = "Use the attached image in this steer";
+    let request = TurnRequest::new(prompt).with_attachments(vec![ImageAttachment::new(
+        "image/png",
+        first_bytes.len() as u64,
+        first_digest,
+        base64::engine::general_purpose::STANDARD.encode(first_bytes),
+    )]);
+    let path = format!("/v1/sessions/{session_id}/turns");
+    let accepted = running
+        .mutation(&path, "steer-image-key")
+        .json(&request)
+        .send()
+        .await
+        .expect("send steer image");
+    assert_eq!(accepted.status(), StatusCode::ACCEPTED);
+    let accepted: SessionResponse = accepted.json().await.expect("decode image steer");
+    assert_eq!(accepted.session().turns().len(), 2);
+    let turn_id = accepted.session().turns()[1].turn_id().clone();
+
+    let replay = running
+        .mutation(&path, "steer-image-key")
+        .json(&request)
+        .send()
+        .await
+        .expect("replay steer image");
+    assert_eq!(replay.status(), StatusCode::ACCEPTED);
+    let replay: SessionResponse = replay.json().await.expect("decode replayed image steer");
+    assert_eq!(replay.session().turns().len(), 2);
+    assert_eq!(replay.session().turns()[1].turn_id(), &turn_id);
+
+    let changed_bytes = b"\x89PNG\r\n\x1a\nPRIVATE_STEER_IMAGE_TWO";
+    let changed_digest = sha2::Sha256::digest(changed_bytes)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    let changed = TurnRequest::new(prompt).with_attachments(vec![ImageAttachment::new(
+        "image/png",
+        changed_bytes.len() as u64,
+        changed_digest,
+        base64::engine::general_purpose::STANDARD.encode(changed_bytes),
+    )]);
+    let conflict = running
+        .mutation(&path, "steer-image-key")
+        .json(&changed)
+        .send()
+        .await
+        .expect("reuse steer key with changed attachment");
+    assert_eq!(conflict.status(), StatusCode::CONFLICT);
+    let error: ApiError = conflict.json().await.expect("decode attachment conflict");
+    assert_eq!(error.code(), ApiErrorCode::IdempotencyKeyConflict);
+}
+
+#[tokio::test]
+async fn run_and_steer_http_requests_reject_provider_descriptor_material() {
+    let running = RunningServer::start(ApiScopes::CONTROL).await;
+    let secret_canary = "PRIVATE_PROVIDER_DESCRIPTOR_TURN_CANARY";
+    let mut run_request = serde_json::to_value(TurnRequest::new("Reject descriptor-bearing run"))
+        .expect("serialize valid run request");
+    run_request
+        .as_object_mut()
+        .expect("Turn request serializes as an object")
+        .insert(
+            "provider_binding_candidate".to_string(),
+            serde_json::json!({
+                "endpoint": "https://attacker.example",
+                "raw_secret": secret_canary,
+            }),
+        );
+    let rejected_run = running
+        .mutation("/v1/sessions", "descriptor-bearing-run")
+        .json(&run_request)
+        .send()
+        .await
+        .expect("send descriptor-bearing run");
+    assert_eq!(rejected_run.status(), StatusCode::BAD_REQUEST);
+    let rejected_run = rejected_run.bytes().await.expect("read rejected run");
+    assert!(!String::from_utf8_lossy(&rejected_run).contains(secret_canary));
+
+    let created = running
+        .mutation("/v1/sessions", "descriptor-steer-create")
+        .json(&TurnRequest::new("Create Session before rejected steer"))
+        .send()
+        .await
+        .expect("create baseline Session");
+    assert_eq!(created.status(), StatusCode::ACCEPTED);
+    let created: SessionResponse = created.json().await.expect("decode baseline Session");
+    let session_id = created.session().session_id().clone();
+    wait_until_idle(&running, session_id.as_str()).await;
+
+    let mut steer_request =
+        serde_json::to_value(TurnRequest::new("Reject descriptor-bearing steer"))
+            .expect("serialize valid steer request");
+    steer_request
+        .as_object_mut()
+        .expect("Turn request serializes as an object")
+        .insert(
+            "provider_binding_candidate".to_string(),
+            serde_json::json!({
+                "endpoint": "https://attacker.example",
+                "raw_secret": secret_canary,
+            }),
+        );
+    let path = format!("/v1/sessions/{session_id}/turns");
+    let rejected_steer = running
+        .mutation(&path, "descriptor-bearing-steer")
+        .json(&steer_request)
+        .send()
+        .await
+        .expect("send descriptor-bearing steer");
+    assert_eq!(rejected_steer.status(), StatusCode::BAD_REQUEST);
+    let rejected_steer = rejected_steer.bytes().await.expect("read rejected steer");
+    assert!(!String::from_utf8_lossy(&rejected_steer).contains(secret_canary));
+}
+
+#[tokio::test]
 async fn simultaneous_identical_mutations_all_replay_one_atomic_admission() {
     let running = RunningServer::start(ApiScopes::CONTROL).await;
     let authorization = bearer(&running.token);
@@ -842,7 +1083,7 @@ async fn mutation_validation_fails_before_execution_with_typed_errors() {
 
     let missing_key = running
         .protected_request(Method::POST, "/v1/sessions")
-        .header("Satelle-Protocol-Version", "6")
+        .header("Satelle-Protocol-Version", "8")
         .json(&TurnRequest::new("PRIVATE_MISSING_KEY_CANARY"))
         .send()
         .await
@@ -865,7 +1106,7 @@ async fn mutation_validation_fails_before_execution_with_typed_errors() {
         .mutation("/v1/sessions", CREATE_KEY)
         .header("Content-Type", "text/plain")
         .body(
-            r#"{"schema_version":"satelle.api.v3","prompt":"private","execution_mode":"standard"}"#,
+            r#"{"schema_version":"satelle.api.v5","prompt":"private","execution_mode":"standard"}"#,
         )
         .send()
         .await
@@ -880,7 +1121,7 @@ async fn mutation_validation_fails_before_execution_with_typed_errors() {
     let duplicate_prompt = running
         .mutation("/v1/sessions", "duplicate-json-field-key")
         .header("Content-Type", "application/json")
-        .body(r#"{"schema_version":"satelle.api.v3","prompt":"first","prompt":"second","execution_mode":"standard"}"#)
+        .body(r#"{"schema_version":"satelle.api.v5","prompt":"first","prompt":"second","execution_mode":"standard"}"#)
         .send()
         .await
         .expect("send duplicate JSON field");
@@ -896,12 +1137,7 @@ async fn mutation_validation_fails_before_execution_with_typed_errors() {
 
     let invalid_model = running
         .mutation("/v1/sessions", "invalid-model-key")
-        .json(&TurnRequest::new("private").with_provider_intent(
-            Some(" ".to_owned()),
-            None,
-            false,
-            false,
-        ))
+        .json(&TurnRequest::new("private").with_provider_intent(Some(" ".to_owned()), None, false))
         .send()
         .await
         .expect("send invalid model override");
@@ -915,12 +1151,7 @@ async fn mutation_validation_fails_before_execution_with_typed_errors() {
 
     let invalid_provider = running
         .mutation("/v1/sessions", "invalid-provider-key")
-        .json(&TurnRequest::new("private").with_provider_intent(
-            None,
-            Some(" ".to_owned()),
-            false,
-            false,
-        ))
+        .json(&TurnRequest::new("private").with_provider_intent(None, Some(" ".to_owned()), false))
         .send()
         .await
         .expect("send invalid provider override");
@@ -976,7 +1207,7 @@ async fn fixed_size_attachments_precede_turn_request_deserialization() {
     let response = running
         .mutation("/v1/sessions", "attachment-limit-fixed-size")
         .json(&serde_json::json!({
-            "schema_version": "satelle.api.v3",
+            "schema_version": "satelle.api.v5",
             "prompt": "PRIVATE_ATTACHMENT_LIMIT_CANARY",
             "attachments": [{"name": "private.txt", "content": "private"}]
         }))
@@ -999,7 +1230,7 @@ async fn fixed_size_attachments_precede_turn_request_deserialization() {
 async fn attachment_limit_preserves_decoder_error_precedence() {
     let running = RunningServer::start(ApiScopes::CONTROL).await;
     let oversized = format!(
-        r#"{{"schema_version":"satelle.api.v3","prompt":"PRIVATE_OVERSIZED_ATTACHMENT_CANARY","execution_mode":"standard","attachments":[{{"name":"private.txt"}}],"padding":"{}"}}"#,
+        r#"{{"schema_version":"satelle.api.v5","prompt":"PRIVATE_OVERSIZED_ATTACHMENT_CANARY","execution_mode":"standard","attachments":[{{"name":"private.txt"}}],"padding":"{}"}}"#,
         "x".repeat(1_048_576)
     );
     let cases = [
@@ -1010,7 +1241,7 @@ async fn attachment_limit_preserves_decoder_error_precedence() {
         ),
         (
             "duplicate-json-key",
-            r#"{"schema_version":"satelle.api.v3","prompt":"PRIVATE_DUPLICATE_ATTACHMENT_CANARY","prompt":"duplicate","execution_mode":"standard","attachments":[{"name":"private.txt"}]}"#.to_string(),
+            r#"{"schema_version":"satelle.api.v5","prompt":"PRIVATE_DUPLICATE_ATTACHMENT_CANARY","prompt":"duplicate","execution_mode":"standard","attachments":[{"name":"private.txt"}]}"#.to_string(),
             INVALID_JSON_ERROR,
         ),
         ("oversized-body", oversized, ATTACHMENT_LIMIT_ERROR),
@@ -1096,7 +1327,7 @@ async fn empty_attachments_are_allowed_but_other_shapes_remain_contract_errors()
     let empty_response = running
         .mutation("/v1/sessions", "attachment-operation-contract-empty-array")
         .json(&serde_json::json!({
-            "schema_version": "satelle.api.v3",
+            "schema_version": "satelle.api.v5",
             "prompt": "PRIVATE_ATTACHMENT_SHAPE_CANARY",
             "execution_mode": "standard",
             "attachments": []
@@ -1117,7 +1348,7 @@ async fn empty_attachments_are_allowed_but_other_shapes_remain_contract_errors()
                 &format!("attachment-operation-contract-{name}"),
             )
             .json(&serde_json::json!({
-                "schema_version": "satelle.api.v3",
+                "schema_version": "satelle.api.v5",
                 "prompt": "PRIVATE_ATTACHMENT_SHAPE_CANARY",
                 "execution_mode": "standard",
                 "attachments": attachments
@@ -1160,7 +1391,7 @@ async fn create_turn_attachments_precede_deserialization_without_admission() {
             "attachment-limit-create-turn",
         )
         .json(&serde_json::json!({
-            "schema_version": "satelle.api.v3",
+            "schema_version": "satelle.api.v5",
             "prompt": "PRIVATE_REJECTED_ATTACHMENT_TURN_CANARY",
             "attachments": [{"name": "private.txt", "content": "private"}]
         }))
@@ -1338,7 +1569,7 @@ async fn request_material_log_privacy(trace_capture: TraceCapture) {
             &rejected_request_id,
         )
         .json(&serde_json::json!({
-            "schema_version": "satelle.api.v3",
+            "schema_version": "satelle.api.v5",
             "prompt": rejected_prompt,
             "execution_mode": "standard",
             "body_canary": rejected_body,
@@ -1489,7 +1720,7 @@ fn protected_at(
         .header("Satelle-Expected-Host-Identity", host_identity)
         .header("Satelle-Request-Id", RequestId::new().to_string());
     if is_mutation {
-        request.header("Satelle-Protocol-Version", "6")
+        request.header("Satelle-Protocol-Version", "8")
     } else {
         request
     }
@@ -1524,7 +1755,7 @@ async fn assert_attachment_limit_error(response: reqwest::Response, host_identit
 
 fn turn_request_with_controller_field(field: &str, prompt: &str) -> Value {
     let mut request = serde_json::json!({
-        "schema_version": "satelle.api.v3",
+        "schema_version": "satelle.api.v5",
         "prompt": prompt,
         "execution_mode": "standard"
     });
@@ -1564,6 +1795,14 @@ const ATTACHMENT_LIMIT_ERROR: ExpectedApiError = ExpectedApiError {
     category: "capacity",
     retryable: false,
     message: "the request exceeds the advertised attachment limit",
+};
+
+const INVALID_IMAGE_ATTACHMENT_ERROR: ExpectedApiError = ExpectedApiError {
+    status: StatusCode::BAD_REQUEST,
+    code: "invalid-request",
+    category: "invalid_request",
+    retryable: false,
+    message: "image attachments failed integrity validation",
 };
 
 const JSON_BODY_LIMIT_ERROR: ExpectedApiError = ExpectedApiError {

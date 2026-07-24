@@ -19,7 +19,7 @@ use axum::http::header::{CACHE_CONTROL, CONTENT_TYPE};
 use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::middleware;
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
+use axum::routing::{get, post, put};
 use listener::{ConnectionActivity, ConnectionContext, LimitedTcpListener};
 use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName};
@@ -891,6 +891,24 @@ fn router(state: Arc<DaemonState>) -> Router {
             Arc::clone(&state),
             auth::require_setup_mutation,
         ));
+    let provider_binding_authorization_routes = Router::new()
+        .route(
+            "/v1/setup/provider-bindings/{provider_alias}/{model_alias}",
+            put(setup::authorize_provider_binding).delete(setup::delete_provider_binding),
+        )
+        .route_layer(middleware::from_fn_with_state(
+            Arc::clone(&state),
+            auth::require_bootstrap_admin_mutation,
+        ));
+    let provider_descriptor_validation_route = Router::new()
+        .route(
+            "/v1/setup/provider-bindings/{provider_alias}/{model_alias}/validate",
+            post(setup::validate_provider_descriptor),
+        )
+        .route_layer(middleware::from_fn_with_state(
+            Arc::clone(&state),
+            auth::require_setup_or_control_mutation,
+        ));
     let control_routes = Router::new()
         .route("/v1/sessions", post(sessions::create_session))
         .route(
@@ -908,6 +926,8 @@ fn router(state: Arc<DaemonState>) -> Router {
     let protected = read_routes
         .merge(bootstrap_maintenance_routes)
         .merge(setup_routes)
+        .merge(provider_binding_authorization_routes)
+        .merge(provider_descriptor_validation_route)
         .merge(control_routes)
         .method_not_allowed_fallback(protected_method_not_allowed)
         .fallback(protected_not_found)

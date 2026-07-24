@@ -305,7 +305,6 @@ fn turn_intent(
         execution_mode,
         model,
         provider,
-        experimental_provider_computer_use,
         refresh_provider_smoke_test,
         attachments,
         turn_execution_timeout_ms,
@@ -324,12 +323,7 @@ fn turn_intent(
 
     TurnIntent::new(prompt, execution_mode)
         .and_then(|intent| {
-            intent.with_provider_intent(
-                model,
-                provider,
-                experimental_provider_computer_use,
-                refresh_provider_smoke_test,
-            )
+            intent.with_provider_intent(model, provider, refresh_provider_smoke_test)
         })
         .and_then(|intent| intent.with_turn_execution_timeout_ms(turn_execution_timeout_ms))
         .and_then(|intent| intent.with_attachments(attachments))

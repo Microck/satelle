@@ -3,12 +3,16 @@ use crate::contract::{
     BootstrapMaintenanceResponse, CapabilitiesResponse, DurableTokenActivationResponse,
     DurableTokenConfirmationResponse, DurableTokenIssuanceResponse, HostDesktopSessionsResponse,
     HostStatusResponse, LiveResponse, LogsPageResponse, PROTOCOL_VERSION, PROTOCOL_VERSION_HEADER,
-    RequestId, SessionResponse, StopRequest, StopResponse, TurnRequest,
+    ProviderBindingAuthorizationRequest, ProviderBindingAuthorizationResponse,
+    ProviderBindingDeletionResponse, ProviderDescriptorValidationRequest,
+    ProviderDescriptorValidationResponse, RequestId, SessionResponse, StopRequest, StopResponse,
+    TurnRequest,
 };
 use crate::transport_tls::{
     ReqwestTrustError, TlsFailureKind, classify_tls_error, configure_reqwest_trust,
     find_error_in_tree,
 };
+use percent_encoding::{AsciiSet, CONTROLS, utf8_percent_encode};
 use reqwest::blocking::{Client, RequestBuilder, Response};
 use reqwest::header::{AUTHORIZATION, HeaderValue};
 use reqwest::redirect::Policy;
@@ -22,6 +26,15 @@ use std::time::Duration;
 use zeroize::Zeroizing;
 
 const DIRECT_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+const PROVIDER_BINDING_ALIAS_ENCODE_SET: &AsciiSet = &CONTROLS.add(b'/');
+
+fn provider_binding_path(provider_alias: &str, model_alias: &str) -> String {
+    // Shared reference validation admits `/` as alias data. Encode it here so
+    // each exact alias remains one route segment and Axum decodes it in Path.
+    let provider_alias = utf8_percent_encode(provider_alias, PROVIDER_BINDING_ALIAS_ENCODE_SET);
+    let model_alias = utf8_percent_encode(model_alias, PROVIDER_BINDING_ALIAS_ENCODE_SET);
+    format!("/v1/setup/provider-bindings/{provider_alias}/{model_alias}")
+}
 
 pub struct DaemonClient {
     client: Client,
@@ -242,6 +255,46 @@ impl DaemonClient {
         let path = format!("/v1/setup/api-token/{token_id}/abort");
         let (request, request_id) = self.mutation_request(&path, idempotency_key)?;
         self.send_authenticated(request, request_id, StatusCode::OK)
+    }
+
+    pub fn authorize_provider_binding(
+        &self,
+        provider_alias: &str,
+        model_alias: &str,
+        authorization: &ProviderBindingAuthorizationRequest,
+        idempotency_key: &str,
+    ) -> Result<ProviderBindingAuthorizationResponse, DaemonClientError> {
+        let path = provider_binding_path(provider_alias, model_alias);
+        let (request, request_id) =
+            self.mutation_request_with_method(Method::PUT, &path, idempotency_key)?;
+        self.send_authenticated(request.json(authorization), request_id, StatusCode::OK)
+    }
+
+    pub fn delete_provider_binding(
+        &self,
+        provider_alias: &str,
+        model_alias: &str,
+        idempotency_key: &str,
+    ) -> Result<ProviderBindingDeletionResponse, DaemonClientError> {
+        let path = provider_binding_path(provider_alias, model_alias);
+        let (request, request_id) =
+            self.mutation_request_with_method(Method::DELETE, &path, idempotency_key)?;
+        self.send_authenticated(request, request_id, StatusCode::OK)
+    }
+
+    pub fn validate_provider_descriptor(
+        &self,
+        provider_alias: &str,
+        model_alias: &str,
+        validation: &ProviderDescriptorValidationRequest,
+        idempotency_key: &str,
+    ) -> Result<ProviderDescriptorValidationResponse, DaemonClientError> {
+        let path = format!(
+            "{}/validate",
+            provider_binding_path(provider_alias, model_alias)
+        );
+        let (request, request_id) = self.mutation_request(&path, idempotency_key)?;
+        self.send_authenticated(request.json(validation), request_id, StatusCode::OK)
     }
 
     pub fn complete_bootstrap_maintenance(
@@ -477,10 +530,19 @@ impl DaemonClient {
         path: &str,
         idempotency_key: &str,
     ) -> Result<(RequestBuilder, RequestId), DaemonClientError> {
+        self.mutation_request_with_method(Method::POST, path, idempotency_key)
+    }
+
+    fn mutation_request_with_method(
+        &self,
+        method: Method,
+        path: &str,
+        idempotency_key: &str,
+    ) -> Result<(RequestBuilder, RequestId), DaemonClientError> {
         let mut header = HeaderValue::from_str(idempotency_key)
             .map_err(|_| DaemonClientError::InvalidIdempotencyKeyHeader)?;
         header.set_sensitive(true);
-        let (request, request_id) = self.protected_request(Method::POST, path)?;
+        let (request, request_id) = self.protected_request(method, path)?;
         Ok((
             request
                 .header("Idempotency-Key", header)
@@ -759,6 +821,14 @@ mod tests {
     use std::io::{Read, Write};
     use std::net::TcpListener;
     use std::sync::Arc;
+
+    #[test]
+    fn provider_binding_path_encodes_each_alias_as_one_segment() {
+        assert_eq!(
+            provider_binding_path("open_ai/us:west", "vision/v2.1"),
+            "/v1/setup/provider-bindings/open_ai%2Fus:west/vision%2Fv2.1"
+        );
+    }
 
     #[test]
     fn direct_client_accepts_only_a_canonical_https_origin() {

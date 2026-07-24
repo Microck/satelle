@@ -12,7 +12,8 @@ mod approvals;
 
 const FIXTURE_SOURCE: &str = r##"
 use std::fs::OpenOptions;
-use std::io::{BufRead, Write};
+use std::io::{BufRead, Read, Write};
+use std::net::TcpStream;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
@@ -22,6 +23,14 @@ fn main() {
         std::thread::sleep(Duration::from_millis(300));
         std::fs::write(std::env::args().nth(2).unwrap(), "escaped").unwrap();
         return;
+    }
+    if let Some(path) = std::env::var_os("SATELLE_FIXTURE_ARGS_LOG") {
+        let args = std::env::args().skip(1).collect::<Vec<_>>().join("\n");
+        std::fs::write(path, args).unwrap();
+    }
+    if let Some(path) = std::env::var_os("SATELLE_FIXTURE_PROVIDER_ENV_LOG") {
+        let value = std::env::var("SATELLE_CODEX_API_KEY").unwrap_or_default();
+        std::fs::write(path, value).unwrap();
     }
     let scenario = std::env::var("SATELLE_FIXTURE_SCENARIO").unwrap();
     let log = PathBuf::from(std::env::var_os("SATELLE_FIXTURE_LOG").unwrap());
@@ -120,6 +129,8 @@ fn main() {
             assert!(next_request.contains(r#""threadId":"thread-1""#));
             send(&mut output, r#"{"id":3,"result":{"goal":{"threadId":"thread-1","objective":"perform the harmless action PRIVATE_PROMPT_CANARY","status":"active","createdAt":1,"updatedAt":1,"tokensUsed":0,"timeUsedSeconds":0,"tokenBudget":null}}}"#);
             receive(&mut input, &log);
+        } else if scenario == "provider-probe-responses" {
+            complete_provider_probe_drag(&next_request);
         }
     }
 
@@ -196,11 +207,16 @@ fn main() {
     }
     let status = match scenario.as_str() {
         "interrupted" => "interrupted",
-        "failed" => "failed",
+        "failed" | "upstream-http-failed" => "failed",
         _ => "completed",
     };
     let terminal_turn = if scenario == "turn-conflict" { "turn-conflict" } else { "turn-1" };
-    send(&mut output, &format!(r#"{{"method":"turn/completed","params":{{"threadId":"{thread_id}","turn":{{"id":"{terminal_turn}","status":"{status}"}}}}}}"#));
+    let error = if scenario == "upstream-http-failed" {
+        r#","error":{"message":"PRIVATE_PROVIDER_ERROR_CANARY","codexErrorInfo":{"httpConnectionFailed":{"httpStatusCode":503}},"additionalDetails":"PRIVATE_PROVIDER_DETAILS_CANARY"}"#
+    } else {
+        ""
+    };
+    send(&mut output, &format!(r#"{{"method":"turn/completed","params":{{"threadId":"{thread_id}","turn":{{"id":"{terminal_turn}","status":"{status}"{error}}}}}}}"#));
     hang();
 }
 
@@ -225,18 +241,71 @@ fn wait_for(path: &Path) {
     }
 }
 
+fn complete_provider_probe_drag(turn_request: &str) {
+    let url_start = turn_request.find("http://127.0.0.1:").unwrap();
+    let url_tail = &turn_request[url_start..];
+    let url_end = url_tail.find(" in the approved visible browser").unwrap();
+    let url = &url_tail[..url_end];
+    let without_scheme = url.strip_prefix("http://").unwrap();
+    let (host, target) = without_scheme.split_once('/').unwrap();
+    let target = format!("/{target}");
+
+    let mut page_stream = TcpStream::connect(host).unwrap();
+    write!(
+        page_stream,
+        "GET {target} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n"
+    )
+    .unwrap();
+    page_stream.flush().unwrap();
+    let mut page = String::new();
+    page_stream.read_to_string(&mut page).unwrap();
+    assert!(page.starts_with("HTTP/1.1 200 OK"));
+    assert!(page.contains("id=source draggable=true"));
+    assert!(page.contains("id=target"));
+    assert!(page.contains("addEventListener('drop'"));
+
+    let nonce_start = page.find("<strong>").unwrap() + "<strong>".len();
+    let nonce_end = nonce_start + page[nonce_start..].find("</strong>").unwrap();
+    let nonce = &page[nonce_start..nonce_end];
+    let completion_start = page.find("fetch('").unwrap() + "fetch('".len();
+    let completion_end =
+        completion_start + page[completion_start..].find('\'').unwrap();
+    let completion_target = &page[completion_start..completion_end];
+    let body = format!("nonce={nonce}&action=drag");
+
+    let mut completion_stream = TcpStream::connect(host).unwrap();
+    write!(
+        completion_stream,
+        "POST {completion_target} HTTP/1.1\r\nHost: {host}\r\nOrigin: http://{host}\r\nContent-Type: application/x-www-form-urlencoded\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    )
+    .unwrap();
+    completion_stream.flush().unwrap();
+    let mut completion = String::new();
+    completion_stream
+        .read_to_string(&mut completion)
+        .unwrap();
+    assert!(completion.starts_with("HTTP/1.1 204 No Content"));
+}
+
 fn hang() -> ! {
     std::thread::sleep(Duration::from_secs(5));
     std::process::exit(0)
 }
 "##;
 
-struct CompiledFixture {
+pub(crate) struct CompiledFixture {
     _directory: tempfile::TempDir,
     executable: PathBuf,
 }
 
-fn compile_fixture() -> CompiledFixture {
+impl CompiledFixture {
+    pub(crate) fn executable(&self) -> &Path {
+        &self.executable
+    }
+}
+
+pub(crate) fn compile_fixture() -> CompiledFixture {
     let directory = tempfile::tempdir().expect("fixture directory");
     let source = directory.path().join("codex-session-fixture.rs");
     std::fs::write(&source, FIXTURE_SOURCE).expect("write fixture source");
@@ -440,6 +509,8 @@ fn run_scenario_with_options(
             existing_thread_ref,
             model: Some("gpt-fixture"),
             model_provider: Some("fixture-provider"),
+            provider_endpoint: None,
+            provider_secret: None,
             execution_mode: execution.mode,
             approval_policy: execution.approval_policy,
             sandbox_policy: execution.sandbox_policy,
@@ -541,6 +612,114 @@ fn first_thread_uses_exact_policy_order_and_persists_refs() {
 }
 
 #[test]
+fn provider_child_overrides_are_process_scoped_and_secret_safe() {
+    let fixture = compile_fixture();
+    let directory = tempfile::tempdir().expect("provider child fixture directory");
+    let home = tempfile::tempdir().expect("isolated provider child home");
+    let log_path = directory.path().join("requests.jsonl");
+    let cwd_log_path = directory.path().join("child-cwd");
+    let args_log_path = directory.path().join("child-args");
+    let provider_env_log_path = directory.path().join("child-provider-env");
+    let thread_marker = directory.path().join("thread-persisted");
+    let turn_marker = directory.path().join("turn-persisted");
+    let mut command = Command::new(&fixture.executable);
+    command
+        .env("HOME", home.path())
+        .env("SATELLE_FIXTURE_SCENARIO", "completed")
+        .env("SATELLE_FIXTURE_LOG", &log_path)
+        .env("SATELLE_FIXTURE_CWD_LOG", &cwd_log_path)
+        .env("SATELLE_FIXTURE_ARGS_LOG", &args_log_path)
+        .env("SATELLE_FIXTURE_PROVIDER_ENV_LOG", &provider_env_log_path)
+        .env("SATELLE_THREAD_MARKER", &thread_marker)
+        .env("SATELLE_TURN_MARKER", &turn_marker)
+        .env(
+            "SATELLE_DESCENDANT_MARKER",
+            directory.path().join("unused-descendant"),
+        );
+    let mut persist_thread = |_: &str| {
+        touch(&thread_marker);
+        Ok(())
+    };
+    let mut persist_turn = |_: &str| {
+        touch(&turn_marker);
+        Ok(())
+    };
+    let secret = "PRIVATE_PROVIDER_CHILD_SECRET_CANARY";
+    let endpoint = "https://provider.invalid/v1";
+    let result = run_codex_session(
+        command,
+        CodexSessionRequest {
+            working_directory: directory.path(),
+            prompt: "PRIVATE_PROVIDER_PROMPT",
+            existing_thread_ref: None,
+            model: Some("provider-concrete-model"),
+            model_provider: Some(PROVIDER_CHILD_ID),
+            provider_endpoint: Some(endpoint),
+            provider_secret: Some(crate::provider_auth::ResolvedProviderSecret::for_test(
+                secret,
+            )),
+            execution_mode: TurnExecutionMode::Standard,
+            approval_policy: CodexApprovalPolicy::OnRequest,
+            sandbox_policy: CodexSandboxPolicy::WorkspaceWrite,
+            deadline: Instant::now() + Duration::from_secs(3),
+            persist_thread_ref: &mut persist_thread,
+            persist_turn_ref: &mut persist_turn,
+            control: None,
+            goal_set_supported: false,
+            image_input_mode: crate::codex_capabilities::CodexImageInputMode::Unsupported,
+            attachments: &[],
+        },
+    );
+
+    assert_eq!(result, Ok(CodexSessionTerminal::Completed));
+    let args = read_to_string(&args_log_path).expect("read provider child args");
+    for expected in [
+        "model=\"provider-concrete-model\"",
+        "model_provider=\"satelle_runtime\"",
+        "model_providers.satelle_runtime.name=\"Satelle\"",
+        "model_providers.satelle_runtime.base_url=\"https://provider.invalid/v1\"",
+        "model_providers.satelle_runtime.env_key=\"SATELLE_CODEX_API_KEY\"",
+        "model_providers.satelle_runtime.wire_api=\"responses\"",
+        "model_providers.satelle_runtime.requires_openai_auth=false",
+        "shell_environment_policy.exclude=[\"SATELLE_CODEX_API_KEY\"]",
+    ] {
+        assert!(
+            args.lines().any(|arg| arg == expected),
+            "missing {expected}"
+        );
+    }
+    assert_eq!(args.lines().filter(|arg| *arg == "-c").count(), 8);
+    assert!(!args.contains(secret));
+    assert_eq!(
+        read_to_string(provider_env_log_path).expect("read provider child environment"),
+        secret
+    );
+    let requests = read_to_string(&log_path).expect("read provider protocol log");
+    assert!(requests.contains(r#""modelProvider":"satelle_runtime""#));
+    assert!(!requests.contains(secret));
+    assert!(!format!("{result:?}").contains(secret));
+    for (label, path) in [
+        ("provider child arguments", &args_log_path),
+        ("provider protocol transcript", &log_path),
+        ("provider child working directory", &cwd_log_path),
+        ("persisted thread marker", &thread_marker),
+        ("persisted turn marker", &turn_marker),
+    ] {
+        let artifact = std::fs::read(path).unwrap_or_default();
+        assert!(
+            !artifact
+                .windows(secret.len())
+                .any(|window| window == secret.as_bytes()),
+            "{label} must not retain the provider secret"
+        );
+    }
+    assert!(
+        !home.path().join(".codex").join("config.toml").exists(),
+        "provider child overrides must not write global Codex config"
+    );
+}
+
+#[test]
 fn supported_goal_is_confirmed_before_the_first_turn() {
     let run = run_scenario("goal", None, Duration::from_secs(3));
     assert_eq!(run.result, Ok(CodexSessionTerminal::Completed));
@@ -607,12 +786,20 @@ fn terminal_status_is_closed() {
     for (scenario, expected) in [
         ("completed", CodexSessionTerminal::Completed),
         ("interrupted", CodexSessionTerminal::Interrupted),
-        ("failed", CodexSessionTerminal::Failed),
+        (
+            "failed",
+            CodexSessionTerminal::Failed(CodexFailedTurnKind::Other),
+        ),
+        (
+            "upstream-http-failed",
+            CodexSessionTerminal::Failed(CodexFailedTurnKind::Other),
+        ),
     ] {
-        assert_eq!(
-            run_scenario(scenario, None, Duration::from_secs(3)).result,
-            Ok(expected)
-        );
+        let result = run_scenario(scenario, None, Duration::from_secs(3)).result;
+        assert_eq!(result, Ok(expected));
+        let debug = format!("{result:?}");
+        assert!(!debug.contains("PRIVATE_PROVIDER_ERROR_CANARY"));
+        assert!(!debug.contains("PRIVATE_PROVIDER_DETAILS_CANARY"));
     }
 }
 
@@ -656,6 +843,8 @@ fn live_interrupt_waits_for_the_durable_stop_acknowledgement() {
                 existing_thread_ref: None,
                 model: Some("gpt-fixture"),
                 model_provider: Some("fixture-provider"),
+                provider_endpoint: None,
+                provider_secret: None,
                 execution_mode: TurnExecutionMode::Standard,
                 approval_policy: CodexApprovalPolicy::OnRequest,
                 sandbox_policy: CodexSandboxPolicy::WorkspaceWrite,
@@ -726,6 +915,8 @@ fn timed_provider_exchange_requests_correlated_upstream_cancellation() {
             existing_thread_ref: None,
             model: Some("gpt-fixture"),
             model_provider: Some("fixture-provider"),
+            provider_endpoint: None,
+            provider_secret: None,
             execution_mode: TurnExecutionMode::Standard,
             approval_policy: CodexApprovalPolicy::OnRequest,
             sandbox_policy: CodexSandboxPolicy::WorkspaceWrite,

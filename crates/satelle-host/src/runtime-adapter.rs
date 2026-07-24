@@ -10,13 +10,13 @@ use satelle_core::{
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
-/// Non-secret provider intent resolved by the Controller and validated at the
-/// Host boundary before it can affect native Computer Use preflight.
+/// Alias-only provider intent from the Controller. The Host runtime attaches
+/// an exact authorized binding before this value can reach an adapter.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ProviderComputerUseIntent {
     model: Option<satelle_core::session::EffectiveModelRef>,
     provider: Option<satelle_core::session::ProviderBindingRef>,
-    experimental: bool,
+    resolved_provider_binding: Option<satelle_core::ResolvedProviderBinding>,
     refresh: bool,
     provider_smoke_timeout: Option<std::time::Duration>,
 }
@@ -25,16 +25,23 @@ impl ProviderComputerUseIntent {
     pub fn new(
         model: Option<satelle_core::session::EffectiveModelRef>,
         provider: Option<satelle_core::session::ProviderBindingRef>,
-        experimental: bool,
         refresh: bool,
     ) -> Self {
         Self {
             model,
             provider,
-            experimental,
+            resolved_provider_binding: None,
             refresh,
             provider_smoke_timeout: None,
         }
+    }
+
+    pub(crate) fn with_resolved_provider_binding(
+        mut self,
+        binding: satelle_core::ResolvedProviderBinding,
+    ) -> Self {
+        self.resolved_provider_binding = Some(binding);
+        self
     }
 
     /// Applies a one-shot timeout to a diagnostic provider smoke refresh.
@@ -45,7 +52,7 @@ impl ProviderComputerUseIntent {
     }
 
     pub fn host_default() -> Self {
-        Self::new(None, None, false, false)
+        Self::new(None, None, false)
     }
 
     pub fn model(&self) -> Option<&satelle_core::session::EffectiveModelRef> {
@@ -56,8 +63,10 @@ impl ProviderComputerUseIntent {
         self.provider.as_ref()
     }
 
-    pub const fn experimental(&self) -> bool {
-        self.experimental
+    pub(crate) fn resolved_provider_binding(
+        &self,
+    ) -> Option<&satelle_core::ResolvedProviderBinding> {
+        self.resolved_provider_binding.as_ref()
     }
 
     pub const fn refresh(&self) -> bool {
@@ -79,6 +88,7 @@ pub struct AdapterReadiness {
     execution_policy: ExecutionPolicy,
     evidence: ReadinessEvidence,
     provider_smoke_evidence: Option<ProviderSmokeEvidence>,
+    resolved_provider_binding: Option<satelle_core::ResolvedProviderBinding>,
     source: ReadinessSource,
     checks: Vec<NativeReadinessCheck>,
 }
@@ -256,6 +266,7 @@ impl EvidenceWindow {
 pub struct ProviderSmokeEvidence {
     window: EvidenceWindow,
     provider_config_fingerprint: String,
+    provider_credential_fingerprint: String,
     source: ProviderSmokeSource,
 }
 
@@ -263,12 +274,14 @@ impl ProviderSmokeEvidence {
     pub fn new(
         result_id: impl Into<String>,
         provider_config_fingerprint: impl Into<String>,
+        provider_credential_fingerprint: impl Into<String>,
         observed_at: time::OffsetDateTime,
         expires_at: time::OffsetDateTime,
     ) -> Result<Self, EvidenceError> {
         Ok(Self {
             window: EvidenceWindow::new(result_id, observed_at, expires_at)?,
             provider_config_fingerprint: fingerprint(provider_config_fingerprint)?,
+            provider_credential_fingerprint: fingerprint(provider_credential_fingerprint)?,
             source: ProviderSmokeSource::Live,
         })
     }
@@ -284,6 +297,10 @@ impl ProviderSmokeEvidence {
 
     pub(crate) fn provider_config_fingerprint(&self) -> &str {
         &self.provider_config_fingerprint
+    }
+
+    pub(crate) fn provider_credential_fingerprint(&self) -> &str {
+        &self.provider_credential_fingerprint
     }
 
     pub(crate) const fn observed_at(&self) -> time::OffsetDateTime {
@@ -314,6 +331,7 @@ impl std::fmt::Debug for ProviderSmokeEvidence {
 pub struct ProviderSmokeFailureEvidence {
     window: EvidenceWindow,
     provider_config_fingerprint: String,
+    provider_credential_fingerprint: String,
     error_code: ErrorCode,
     failure_reason: String,
     source: ProviderSmokeSource,
@@ -323,6 +341,7 @@ impl ProviderSmokeFailureEvidence {
     pub fn new(
         result_id: impl Into<String>,
         provider_config_fingerprint: impl Into<String>,
+        provider_credential_fingerprint: impl Into<String>,
         error_code: ErrorCode,
         failure_reason: impl Into<String>,
         observed_at: time::OffsetDateTime,
@@ -331,6 +350,7 @@ impl ProviderSmokeFailureEvidence {
         Ok(Self {
             window: EvidenceWindow::new(result_id, observed_at, expires_at)?,
             provider_config_fingerprint: fingerprint(provider_config_fingerprint)?,
+            provider_credential_fingerprint: fingerprint(provider_credential_fingerprint)?,
             error_code,
             failure_reason: normalized_identifier(failure_reason)?,
             source: ProviderSmokeSource::Live,
@@ -348,6 +368,10 @@ impl ProviderSmokeFailureEvidence {
 
     pub(crate) fn provider_config_fingerprint(&self) -> &str {
         &self.provider_config_fingerprint
+    }
+
+    pub(crate) fn provider_credential_fingerprint(&self) -> &str {
+        &self.provider_credential_fingerprint
     }
 
     pub(crate) const fn error_code(&self) -> ErrorCode {
@@ -385,6 +409,15 @@ impl std::fmt::Debug for ProviderSmokeFailureEvidence {
 pub enum ProviderSmokeResult {
     Passed(ProviderSmokeEvidence),
     Failed(ProviderSmokeFailureEvidence),
+}
+
+impl ProviderSmokeResult {
+    pub(crate) fn provider_credential_fingerprint(&self) -> &str {
+        match self {
+            Self::Passed(evidence) => evidence.provider_credential_fingerprint(),
+            Self::Failed(evidence) => evidence.provider_credential_fingerprint(),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -473,6 +506,7 @@ pub struct ReadinessCacheKey {
     codex_version: String,
     native_runtime_version: String,
     plugin_version: Option<String>,
+    provider_config_fingerprint: Option<String>,
     os_permission_fingerprint: String,
     app_approval_fingerprint: String,
     os_permission_state: ReadinessObservationState,
@@ -504,11 +538,20 @@ impl ReadinessCacheKey {
             codex_version: normalized_identifier(codex_version)?,
             native_runtime_version: normalized_identifier(native_runtime_version)?,
             plugin_version: plugin_version.map(normalized_identifier).transpose()?,
+            provider_config_fingerprint: None,
             os_permission_fingerprint: fingerprint(os_permission_fingerprint)?,
             app_approval_fingerprint: fingerprint(app_approval_fingerprint)?,
             os_permission_state,
             app_approval_state,
         })
+    }
+
+    pub(crate) fn with_provider_binding(
+        mut self,
+        binding: &satelle_core::ResolvedProviderBinding,
+    ) -> Self {
+        self.provider_config_fingerprint = Some(binding.binding_digest().to_string());
+        self
     }
 
     pub(crate) const fn adapter(&self) -> &'static str {
@@ -572,6 +615,9 @@ impl ReadinessCacheKey {
     /// Binds reusable provider evidence to the exact provider/model/runtime
     /// tuple that the next prompt Turn will use.
     pub(crate) fn provider_config_fingerprint(&self) -> String {
+        if let Some(fingerprint) = &self.provider_config_fingerprint {
+            return fingerprint.clone();
+        }
         let mut digest = Sha256::new();
         digest.update(b"satelle-provider-smoke-v1\0");
         digest.update(self.execution_policy.provider_binding().as_str().as_bytes());
@@ -753,12 +799,17 @@ impl AdapterReadiness {
         execution_policy: ExecutionPolicy,
         evidence: ReadinessEvidence,
         provider_smoke_evidence: Option<ProviderSmokeEvidence>,
+        resolved_provider_binding: Option<satelle_core::ResolvedProviderBinding>,
     ) -> Result<Self, EvidenceError> {
         normalized_identifier(adapter)?;
         let features = execution_policy.experimental_features();
         let provider_evidence_matches = matches!(
-            (features.provider_computer_use(), &provider_smoke_evidence),
-            (FeatureChoice::Enabled, Some(_)) | (FeatureChoice::Disabled, None)
+            (
+                features.provider_computer_use(),
+                &provider_smoke_evidence,
+                &resolved_provider_binding,
+            ),
+            (FeatureChoice::Enabled, Some(_), Some(_)) | (FeatureChoice::Disabled, None, _)
         );
         if features.computer_use() != FeatureChoice::Enabled
             || execution_policy.desktop_target().binding() != &desktop_binding
@@ -775,6 +826,7 @@ impl AdapterReadiness {
             execution_policy,
             evidence,
             provider_smoke_evidence,
+            resolved_provider_binding,
             source,
             checks: successful_native_readiness_checks(),
         })
@@ -811,6 +863,12 @@ impl AdapterReadiness {
 
     pub(crate) fn provider_smoke_evidence(&self) -> Option<&ProviderSmokeEvidence> {
         self.provider_smoke_evidence.as_ref()
+    }
+
+    pub(crate) fn resolved_provider_binding(
+        &self,
+    ) -> Option<&satelle_core::ResolvedProviderBinding> {
+        self.resolved_provider_binding.as_ref()
     }
 
     pub(crate) const fn source(&self) -> ReadinessSource {
@@ -925,8 +983,25 @@ mod evidence_tests {
         );
         assert_eq!(
             EvidenceError::InvalidWindow,
-            ProviderSmokeEvidence::new("provider-1", FINGERPRINT_A, observed_at, observed_at,)
-                .unwrap_err()
+            ProviderSmokeEvidence::new(
+                "provider-1",
+                FINGERPRINT_A,
+                FINGERPRINT_B,
+                observed_at,
+                observed_at,
+            )
+            .unwrap_err()
+        );
+        assert_eq!(
+            EvidenceError::InvalidFingerprint,
+            ProviderSmokeEvidence::new(
+                "provider-1",
+                FINGERPRINT_A,
+                "raw-secret",
+                observed_at,
+                observed_at + time::Duration::minutes(1),
+            )
+            .unwrap_err()
         );
     }
 
@@ -944,6 +1019,7 @@ mod evidence_tests {
                 policy.clone(),
                 evidence.clone(),
                 None,
+                None,
             )
             .is_ok()
         );
@@ -956,6 +1032,7 @@ mod evidence_tests {
                 policy,
                 evidence,
                 Some(provider_evidence()),
+                None,
             )
             .unwrap_err()
         );
@@ -1013,9 +1090,16 @@ mod evidence_tests {
             },
         ];
 
-        let readiness =
-            AdapterReadiness::ready("test", "ready", desktop, policy, readiness_evidence(), None)
-                .unwrap();
+        let readiness = AdapterReadiness::ready(
+            "test",
+            "ready",
+            desktop,
+            policy,
+            readiness_evidence(),
+            None,
+            None,
+        )
+        .unwrap();
 
         assert_eq!(readiness.source, ReadinessSource::Live);
         assert_eq!(readiness.checks, checks);
@@ -1037,6 +1121,7 @@ mod evidence_tests {
             desktop,
             policy,
             readiness_evidence().with_source(ReadinessSource::Cache),
+            None,
             None,
         )
         .unwrap();
@@ -1173,6 +1258,7 @@ mod evidence_tests {
         ProviderSmokeEvidence::new(
             "provider-1",
             FINGERPRINT_A,
+            FINGERPRINT_B,
             observed_at,
             observed_at + time::Duration::hours(24),
         )
@@ -1261,6 +1347,7 @@ pub struct ExecuteRequest<'a> {
     prompt: &'a str,
     execution_mode: satelle_core::session::TurnExecutionMode,
     execution_policy: &'a ExecutionPolicy,
+    resolved_provider_binding: Option<&'a satelle_core::ResolvedProviderBinding>,
     subject: AdapterSubject<'a>,
     persist_upstream_ref: &'a dyn Fn(UpstreamReference) -> Result<(), SatelleError>,
     attachments: &'a [crate::attachment::StagedImage],
@@ -1281,10 +1368,19 @@ impl<'a> ExecuteRequest<'a> {
             prompt,
             execution_mode,
             execution_policy,
+            resolved_provider_binding: None,
             subject,
             persist_upstream_ref,
             attachments,
         }
+    }
+
+    pub(super) const fn with_resolved_provider_binding(
+        mut self,
+        binding: Option<&'a satelle_core::ResolvedProviderBinding>,
+    ) -> Self {
+        self.resolved_provider_binding = binding;
+        self
     }
 
     pub const fn host(&self) -> &'a str {
@@ -1305,6 +1401,12 @@ impl<'a> ExecuteRequest<'a> {
 
     pub const fn execution_policy(&self) -> &'a ExecutionPolicy {
         self.execution_policy
+    }
+
+    pub const fn resolved_provider_binding(
+        &self,
+    ) -> Option<&'a satelle_core::ResolvedProviderBinding> {
+        self.resolved_provider_binding
     }
 
     /// Returns the private Codex thread reference for a follow-up Turn. This
@@ -1422,6 +1524,25 @@ pub trait ComputerUseAdapter: Send + Sync + 'static {
     /// allowing the adapter to start unrelated work under the same Session.
     fn requires_upstream_thread_for_follow_up(&self) -> bool {
         false
+    }
+
+    /// Resolves one exact provider binding without running readiness or
+    /// provider I/O. Adapters must opt in explicitly because synthesizing a
+    /// binding here would let non-authoritative callers invent provenance.
+    fn resolve_provider_binding(
+        &self,
+        _host: &str,
+        _provider_intent: &ProviderComputerUseIntent,
+    ) -> Result<satelle_core::ResolvedProviderBinding, SatelleError> {
+        Err(SatelleError {
+            code: satelle_core::ErrorCode::ModelProviderBindingMissing,
+            message: "the Host adapter cannot resolve an exact provider binding".to_string(),
+            recovery_command: Some(
+                "configure one exact Host model/provider binding before validating it".to_string(),
+            ),
+            source_detail: None,
+            details: std::collections::BTreeMap::new(),
+        })
     }
 
     fn preflight(

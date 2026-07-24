@@ -778,6 +778,36 @@ pub(super) async fn require_setup_mutation(
     require_mutation(&state, request, next, authorized).await
 }
 
+pub(super) async fn require_bootstrap_admin_mutation(
+    State(state): State<Arc<DaemonState>>,
+    request: Request,
+    next: Next,
+) -> Response {
+    let Some(authorized) = request.extensions().get::<AuthorizedRequest>().cloned() else {
+        return missing_authorization_context();
+    };
+    let principal = authorized.principal();
+    if !principal.is_ssh_bootstrap() || !principal.scopes().allows(ApiScopes::ADMIN) {
+        return insufficient_scope(&state, &authorized, "bootstrap admin");
+    }
+    require_mutation(&state, request, next, authorized).await
+}
+
+pub(super) async fn require_setup_or_control_mutation(
+    State(state): State<Arc<DaemonState>>,
+    request: Request,
+    next: Next,
+) -> Response {
+    let Some(authorized) = request.extensions().get::<AuthorizedRequest>().cloned() else {
+        return missing_authorization_context();
+    };
+    let principal = authorized.principal();
+    if !principal.scopes().allows(ApiScopes::CONTROL) && !principal.is_ssh_bootstrap() {
+        return insufficient_scope(&state, &authorized, "setup or control");
+    }
+    require_mutation(&state, request, next, authorized).await
+}
+
 pub(super) async fn require_protocol_read(
     State(state): State<Arc<DaemonState>>,
     request: Request,
@@ -943,13 +973,23 @@ fn insufficient_scope(
             code: ApiErrorCode::AuthorizationInsufficientScope,
             category: ApiErrorCategory::Authorization,
             retryable: false,
-            message: match scope {
-                "control" => "the API Principal does not have control scope",
-                _ => "the API Principal does not have read scope",
-            },
+            message: insufficient_scope_message(scope),
             details: None,
         },
     )
+}
+
+fn insufficient_scope_message(scope: &'static str) -> &'static str {
+    match scope {
+        "control" => "the API Principal does not have control scope",
+        "bootstrap admin" => {
+            "durable setup credentials require an admin-scoped SSH bootstrap principal"
+        }
+        "setup or control" => {
+            "the API Principal must have control scope or be an SSH bootstrap principal"
+        }
+        _ => "the API Principal does not have read scope",
+    }
 }
 
 fn rate_limited_response(
@@ -1116,6 +1156,14 @@ mod forwarded_tests {
         assert_eq!(
             parse_forwarded_address("192.0.2.1:4711").expect("parse IPv4 socket address"),
             "192.0.2.1".parse::<IpAddr>().expect("parse IPv4 address")
+        );
+    }
+
+    #[test]
+    fn setup_or_control_scope_has_specific_failure_message() {
+        assert_eq!(
+            insufficient_scope_message("setup or control"),
+            "the API Principal must have control scope or be an SSH bootstrap principal"
         );
     }
 }

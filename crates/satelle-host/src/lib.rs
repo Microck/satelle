@@ -17,6 +17,8 @@ mod log_page;
 mod operation_capacity;
 #[path = "process-identity.rs"]
 mod process_identity;
+#[path = "provider-auth.rs"]
+pub(crate) mod provider_auth;
 #[path = "provider-probe.rs"]
 mod provider_probe;
 mod runtime;
@@ -49,9 +51,9 @@ pub(crate) use runtime::ReadinessSource;
 pub use runtime::{
     AdapterPreflight, AdapterReadiness, AdapterSubject, AdmissionCancellation, ComputerUseAdapter,
     EvidenceError, ExecuteRequest, ExecuteResult, MaintenanceOperationHandle,
-    ProviderComputerUseIntent, ProviderSmokeEvidence, ProviderSmokeFailureEvidence,
-    ProviderSmokeResult, ProviderSmokeSource, ReadinessCacheKey, ReadinessEvidence,
-    ReadinessObservationState, RecoveryObservation,
+    ProviderBindingResolution, ProviderComputerUseIntent, ProviderSmokeEvidence,
+    ProviderSmokeFailureEvidence, ProviderSmokeResult, ProviderSmokeSource, ReadinessCacheKey,
+    ReadinessEvidence, ReadinessObservationState, RecoveryObservation,
 };
 use runtime::{ProductionComputerUseAdapter, RunCommand, RuntimeHandle, SteerCommand, StopCommand};
 use satelle_core::session::{PublicSession, TurnAdmissionFailure};
@@ -61,6 +63,10 @@ use satelle_core::{
     HostSessionsSchemaVersion, LOCAL_DEMO_HOST, SatelleError, SatelleEvent, SessionId,
     SetupReadinessSummary, SetupReport, SetupSchemaVersion, StopResult, TurnId, object_value,
     utc_now,
+};
+pub use satelle_core::{
+    ProviderBindingAuthorization, ProviderBindingSource, ProviderDescriptorValidation,
+    PublicResolvedProviderBinding, ResolvedProviderBinding,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -611,6 +617,48 @@ mod bootstrap_maintenance_tests {
     }
 }
 
+#[cfg(feature = "test-support")]
+#[derive(Clone, Copy)]
+struct ResolvedSecretCanaryAdapter;
+
+#[cfg(feature = "test-support")]
+impl ComputerUseAdapter for ResolvedSecretCanaryAdapter {
+    fn preflight(
+        &self,
+        host: &str,
+        provider_intent: &ProviderComputerUseIntent,
+    ) -> Result<AdapterReadiness, SatelleError> {
+        let binding = provider_intent
+            .resolved_provider_binding()
+            .expect("Host must inject the authoritative provider binding");
+        let secret = runtime::resolve_provider_child_secret_for_test(binding)?
+            .expect("the canary provider binding must resolve a secret");
+        assert!(
+            secret
+                .expose_to_provider(|value| { value == "PRIVATE_RESOLVED_PROVIDER_SECRET_CANARY" })
+        );
+        FakeComputerUseAdapter.preflight(host, provider_intent)
+    }
+
+    fn execute(&self, request: ExecuteRequest<'_>) -> Result<ExecuteResult, SatelleError> {
+        FakeComputerUseAdapter.execute(request)
+    }
+
+    fn observe_stop(
+        &self,
+        subject: AdapterSubject<'_>,
+    ) -> Result<satelle_core::session::StopObservation, SatelleError> {
+        FakeComputerUseAdapter.observe_stop(subject)
+    }
+
+    fn observe_recovery(
+        &self,
+        subject: AdapterSubject<'_>,
+    ) -> Result<RecoveryObservation, SatelleError> {
+        FakeComputerUseAdapter.observe_recovery(subject)
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct HostService {
     runtime: RuntimeHandle,
@@ -702,6 +750,79 @@ fn replace_production_snapshot(
     *snapshot.write().map_err(|_| {
         crate::runtime::integrity_error("the production capability snapshot lock was poisoned")
     })? = refreshed;
+    Ok(())
+}
+
+fn provider_validation_outcome_for_error(
+    code: satelle_core::ErrorCode,
+) -> satelle_core::ProviderAuthValidationOutcome {
+    match code {
+        satelle_core::ErrorCode::ProviderSecretResolutionFailed => {
+            satelle_core::ProviderAuthValidationOutcome::UnresolvedHostSecret
+        }
+        _ => satelle_core::ProviderAuthValidationOutcome::ProviderComputerUseSmokeTestFailed,
+    }
+}
+
+pub(crate) fn validate_provider_binding_authorization(
+    authorization: &ProviderBindingAuthorization,
+) -> Result<(), SatelleError> {
+    if authorization.requested_model_alias().trim().is_empty()
+        || authorization.requested_provider_alias().trim().is_empty()
+        || authorization.model().trim().is_empty()
+        || authorization.model_provider().trim().is_empty()
+    {
+        return Err(SatelleError::config_error(
+            "provider binding authorization values must not be empty",
+            None,
+        ));
+    }
+    satelle_core::session::EffectiveModelRef::new(authorization.requested_model_alias())
+        .map_err(|_| SatelleError::config_error("the model alias is invalid", None))?;
+    satelle_core::session::ProviderBindingRef::new(authorization.requested_provider_alias())
+        .map_err(|_| SatelleError::config_error("the provider alias is invalid", None))?;
+    if let Some(endpoint) = authorization.endpoint() {
+        runtime::validate_provider_endpoint(endpoint)?;
+    }
+    if let Some(source) = authorization.auth_source() {
+        provider_auth::validate_provider_secret_source_descriptor(
+            source,
+            provider_auth::ProviderHostPlatform::current(),
+        )
+        .map_err(|error| match error {
+            provider_auth::ProviderAuthResolutionError::InvalidFilePath => SatelleError {
+                code: satelle_core::ErrorCode::SecretFilePathNotAbsolute,
+                message: "the provider Secret Source file path is not absolute for the target Host"
+                    .to_string(),
+                recovery_command: Some(
+                    "use an absolute target-host file path for file Secret Sources".to_string(),
+                ),
+                source_detail: None,
+                details: std::collections::BTreeMap::new(),
+            },
+            _ => SatelleError::config_error(
+                "the provider Secret Source descriptor is invalid for the target Host",
+                None,
+            ),
+        })?;
+    }
+    if (!authorization
+        .model_provider()
+        .eq_ignore_ascii_case("openai")
+        || authorization.endpoint().is_some())
+        && !authorization.experimental_provider_computer_use()
+    {
+        return Err(SatelleError {
+            code: satelle_core::ErrorCode::ExperimentalProviderOptInRequired,
+            message: "custom provider Computer Use requires explicit Host authorization"
+                .to_string(),
+            recovery_command: Some(
+                "enable experimental provider Computer Use during SSH bootstrap setup".to_string(),
+            ),
+            source_detail: None,
+            details: std::collections::BTreeMap::new(),
+        });
+    }
     Ok(())
 }
 
@@ -1131,7 +1252,12 @@ impl HostService {
             policy,
         );
         Self {
-            runtime: RuntimeHandle::new_production(state_root, operator_log_root, adapter),
+            runtime: RuntimeHandle::new_production(
+                state_root,
+                operator_log_root,
+                adapter,
+                runtime::RuntimeProviderPolicy::from_host_config(config),
+            ),
             operation_capacity: Arc::new(OperationCapacity::default()),
             turn_execution_timeout: configured_turn_execution_timeout(config),
             mode: HostMode::Production { snapshot },
@@ -1199,6 +1325,23 @@ impl HostService {
 
     #[doc(hidden)]
     #[cfg(feature = "test-support")]
+    pub fn resolved_secret_canary_local_demo_for_tests() -> Result<Self, SatelleError> {
+        Ok(Self {
+            runtime: RuntimeHandle::new(satelle_core::state_dir(), ResolvedSecretCanaryAdapter),
+            operation_capacity: Arc::new(OperationCapacity::default()),
+            turn_execution_timeout: configured_turn_execution_timeout(
+                &satelle_core::SatelleConfig::defaults().hosts[LOCAL_DEMO_HOST],
+            ),
+            mode: HostMode::TestFake {
+                image_attachments: true,
+            },
+            bootstrap_auth: None,
+            bootstrap_maintenance: Arc::new(Mutex::new(None)),
+        })
+    }
+
+    #[doc(hidden)]
+    #[cfg(feature = "test-support")]
     pub fn failing_local_demo_for_tests() -> Result<Self, SatelleError> {
         Ok(Self {
             runtime: RuntimeHandle::new(satelle_core::state_dir(), FailingComputerUseAdapter),
@@ -1248,6 +1391,27 @@ impl HostService {
         {
             return Err(SatelleError::invalid_usage("unsupported doctor scope"));
         }
+        let mut provider_auth_evidence = if matches!(scope, Some("provider" | "all")) {
+            let evidence = match self.resolve_provider_binding(host, provider_intent)? {
+                ProviderBindingResolution::Ready(binding) => match binding.auth_source() {
+                    Some(source) => (
+                        provider_auth::diagnose_provider_secret(Some(source), None, false),
+                        satelle_core::ProviderAuthObservationSource::Deferred,
+                    ),
+                    None => (
+                        satelle_core::ProviderAuthValidationOutcome::Resolved,
+                        satelle_core::ProviderAuthObservationSource::Cached,
+                    ),
+                },
+                ProviderBindingResolution::MissingDescriptor { .. } => (
+                    satelle_core::ProviderAuthValidationOutcome::MissingDescriptor,
+                    satelle_core::ProviderAuthObservationSource::Deferred,
+                ),
+            };
+            Some(evidence)
+        } else {
+            None
+        };
         let mut report = match &self.mode {
             HostMode::Production { snapshot } if options.refresh() => {
                 let refreshed = ProductionCapabilitySnapshot::collect(options.probe_timeout());
@@ -1268,12 +1432,217 @@ impl HostService {
                 report.changed = false;
                 report.cache_updates.clear();
             }
-            let started_at = utc_now();
-            let started = Instant::now();
-            let refresh = self.runtime.refresh_provider_smoke(host, provider_intent);
-            apply_provider_refresh(&mut report, refresh, started_at, started.elapsed());
+            let deferred_outcome =
+                provider_auth_evidence.expect("provider scopes always diagnose provider auth");
+            if !matches!(
+                deferred_outcome.0,
+                satelle_core::ProviderAuthValidationOutcome::MissingDescriptor
+                    | satelle_core::ProviderAuthValidationOutcome::UnsupportedDescriptorKind
+            ) {
+                let started_at = utc_now();
+                let started = Instant::now();
+                let refresh = self.runtime.refresh_provider_smoke(host, provider_intent);
+                let observed = match &refresh {
+                    Ok(readiness) if readiness.provider_smoke_evidence().is_some() => (
+                        satelle_core::ProviderAuthValidationOutcome::Resolved,
+                        satelle_core::ProviderAuthObservationSource::Live,
+                    ),
+                    Ok(_) => deferred_outcome,
+                    Err(error) => (
+                        provider_validation_outcome_for_error(error.code),
+                        satelle_core::ProviderAuthObservationSource::Live,
+                    ),
+                };
+                apply_provider_refresh(&mut report, refresh, started_at, started.elapsed());
+                provider_auth_evidence = Some(observed);
+            }
+        }
+        if let Some((outcome, source)) = provider_auth_evidence {
+            for finding in &mut report.findings {
+                if finding.scope == "provider" {
+                    finding
+                        .evidence
+                        .push(format!("provider_auth_outcome={}", outcome.as_str()));
+                    finding.evidence.push(format!(
+                        "provider_auth_observation_source={}",
+                        source.as_str()
+                    ));
+                }
+            }
         }
         Ok(report)
+    }
+
+    /// Reports cached provider-auth evidence without resolving a secret, or
+    /// delegates an explicit live refresh to the normal provider-smoke path.
+    pub fn resolve_provider_binding(
+        &self,
+        host: &str,
+        provider_intent: &ProviderComputerUseIntent,
+    ) -> Result<ProviderBindingResolution, SatelleError> {
+        self.runtime.resolve_provider_binding(host, provider_intent)
+    }
+
+    pub fn authorize_provider_binding(
+        &self,
+        host: &str,
+        model_alias: &str,
+        provider_alias: &str,
+        authorization: ProviderBindingAuthorization,
+    ) -> Result<ResolvedProviderBinding, SatelleError> {
+        let binding = self.prepare_provider_binding_authorization(
+            host,
+            model_alias,
+            provider_alias,
+            authorization,
+        )?;
+        self.runtime.authorize_provider_binding(&binding)?;
+        Ok(binding)
+    }
+
+    pub(crate) fn prepare_provider_binding_authorization(
+        &self,
+        host: &str,
+        model_alias: &str,
+        provider_alias: &str,
+        authorization: ProviderBindingAuthorization,
+    ) -> Result<ResolvedProviderBinding, SatelleError> {
+        if authorization.requested_model_alias() != model_alias
+            || authorization.requested_provider_alias() != provider_alias
+        {
+            return Err(SatelleError::config_error(
+                "provider binding aliases do not match the authorization resource path",
+                None,
+            ));
+        }
+        validate_provider_binding_authorization(&authorization)?;
+        let binding = ResolvedProviderBinding::from_authorization(
+            authorization,
+            ProviderBindingSource::UserConfig,
+        );
+        let _ = host;
+        Ok(binding)
+    }
+
+    pub fn delete_provider_binding(
+        &self,
+        model_alias: &str,
+        provider_alias: &str,
+    ) -> Result<bool, SatelleError> {
+        satelle_core::session::EffectiveModelRef::new(model_alias)
+            .map_err(|_| SatelleError::config_error("the model alias is invalid", None))?;
+        satelle_core::session::ProviderBindingRef::new(provider_alias)
+            .map_err(|_| SatelleError::config_error("the provider alias is invalid", None))?;
+        self.runtime
+            .delete_provider_binding(model_alias, provider_alias)
+    }
+
+    pub fn validate_provider_descriptor(
+        &self,
+        host: &str,
+        model_alias: &str,
+        provider_alias: &str,
+        mode: satelle_core::ProviderAuthValidationMode,
+    ) -> Result<ProviderDescriptorValidation, SatelleError> {
+        use satelle_core::{
+            ProviderAuthObservationSource, ProviderAuthValidationMode,
+            ProviderAuthValidationOutcome, ProviderAuthValidationResult,
+        };
+
+        let intent = if model_alias == "codex-default" && provider_alias == "codex-default" {
+            ProviderComputerUseIntent::new(
+                None,
+                None,
+                matches!(mode, ProviderAuthValidationMode::RefreshProviderSmoke),
+            )
+        } else {
+            ProviderComputerUseIntent::new(
+                Some(
+                    satelle_core::session::EffectiveModelRef::new(model_alias).map_err(|_| {
+                        SatelleError::config_error("the model alias is invalid", None)
+                    })?,
+                ),
+                Some(
+                    satelle_core::session::ProviderBindingRef::new(provider_alias).map_err(
+                        |_| SatelleError::config_error("the provider alias is invalid", None),
+                    )?,
+                ),
+                matches!(mode, ProviderAuthValidationMode::RefreshProviderSmoke),
+            )
+        };
+        let (resolved_binding, deferred_outcome, deferred_source) =
+            match self.resolve_provider_binding(host, &intent)? {
+                ProviderBindingResolution::Ready(binding) => {
+                    let (outcome, source) = match binding.auth_source() {
+                        Some(source) => (
+                            provider_auth::diagnose_provider_secret(Some(source), None, false),
+                            ProviderAuthObservationSource::Deferred,
+                        ),
+                        None => (
+                            ProviderAuthValidationOutcome::Resolved,
+                            ProviderAuthObservationSource::Cached,
+                        ),
+                    };
+                    (binding, outcome, source)
+                }
+                ProviderBindingResolution::MissingDescriptor { binding, .. } => (
+                    binding,
+                    ProviderAuthValidationOutcome::MissingDescriptor,
+                    ProviderAuthObservationSource::Deferred,
+                ),
+            };
+        if deferred_outcome != ProviderAuthValidationOutcome::ConfiguredDeferred {
+            return Ok(ProviderDescriptorValidation::new(
+                resolved_binding,
+                ProviderAuthValidationResult::new(deferred_outcome, deferred_source),
+            ));
+        }
+
+        let validation = match mode {
+            ProviderAuthValidationMode::Cached => {
+                let result = self.runtime.cached_provider_smoke(host, &intent)?;
+                match result {
+                    Some(ProviderSmokeResult::Passed(_)) => ProviderAuthValidationResult::new(
+                        ProviderAuthValidationOutcome::Resolved,
+                        ProviderAuthObservationSource::Cached,
+                    ),
+                    Some(ProviderSmokeResult::Failed(failure)) => {
+                        ProviderAuthValidationResult::new(
+                            provider_validation_outcome_for_error(failure.error_code()),
+                            ProviderAuthObservationSource::Cached,
+                        )
+                    }
+                    None => ProviderAuthValidationResult::new(
+                        ProviderAuthValidationOutcome::ConfiguredDeferred,
+                        ProviderAuthObservationSource::Deferred,
+                    ),
+                }
+            }
+            ProviderAuthValidationMode::RefreshProviderSmoke => {
+                let result = self.runtime.refresh_provider_smoke(host, &intent);
+                match result {
+                    Ok(readiness) => {
+                        if readiness.resolved_provider_binding() != Some(&resolved_binding) {
+                            return Err(crate::runtime::integrity_error(
+                                "provider readiness binding diverged from Host resolution",
+                            ));
+                        }
+                        ProviderAuthValidationResult::new(
+                            ProviderAuthValidationOutcome::Resolved,
+                            ProviderAuthObservationSource::Live,
+                        )
+                    }
+                    Err(error) => ProviderAuthValidationResult::new(
+                        provider_validation_outcome_for_error(error.code),
+                        ProviderAuthObservationSource::Live,
+                    ),
+                }
+            }
+        };
+        Ok(ProviderDescriptorValidation::new(
+            resolved_binding,
+            validation,
+        ))
     }
 
     pub fn setup(

@@ -32,6 +32,7 @@ pub(super) struct StoredIdempotency {
     pub(super) turn_id: Option<String>,
     pub(super) result_session_state_revision: Option<String>,
     pub(super) result_session_updated_at: Option<String>,
+    pub(super) result_json: Option<String>,
 }
 
 pub(super) fn insert_safe_log(
@@ -639,7 +640,7 @@ pub(super) fn matching_idempotency(
 ) -> Result<Option<StoredIdempotency>, StorageError> {
     let record = connection
         .query_row(
-            "SELECT request_digest, digest_schema_version, hmac_key_version, status, durable_outcome, session_id, turn_id, result_session_state_revision, result_session_updated_at \
+            "SELECT request_digest, digest_schema_version, hmac_key_version, status, durable_outcome, session_id, turn_id, result_session_state_revision, result_session_updated_at, result_json \
              FROM idempotency_records \
              WHERE principal_ref = ?1 AND operation = ?2 AND idempotency_key = ?3",
             params![
@@ -658,6 +659,7 @@ pub(super) fn matching_idempotency(
                     turn_id: row.get(6)?,
                     result_session_state_revision: row.get(7)?,
                     result_session_updated_at: row.get(8)?,
+                    result_json: row.get(9)?,
                 })
             },
         )
@@ -698,8 +700,8 @@ pub(super) fn insert_idempotency(
 ) -> Result<(), StorageError> {
     transaction
         .execute(
-            "INSERT INTO idempotency_records (principal_ref, operation, idempotency_key, operation_id, request_digest, digest_schema_version, hmac_key_version, status, durable_outcome, session_id, turn_id, result_session_state_revision, result_session_updated_at, created_at, completed_at, expires_at) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, NULL, NULL, ?12, ?13, ?14)",
+            "INSERT INTO idempotency_records (principal_ref, operation, idempotency_key, operation_id, request_digest, digest_schema_version, hmac_key_version, status, durable_outcome, session_id, turn_id, result_session_state_revision, result_session_updated_at, result_json, created_at, completed_at, expires_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, NULL, NULL, NULL, ?12, ?13, ?14)",
             params![
                 input.principal_ref.as_str(),
                 idempotent_operation_token(input.operation),
@@ -714,6 +716,42 @@ pub(super) fn insert_idempotency(
                 turn_id.map(TurnId::as_str),
                 format_time(input.created_at)?,
                 completed_at.map(format_time).transpose()?,
+                format_time(input.expires_at)?,
+            ],
+        )
+        .map_err(|source| sqlite_error(StorageErrorKind::OperationFailed, source))?;
+    Ok(())
+}
+
+pub(super) fn insert_terminal_json_idempotency(
+    transaction: &Transaction<'_>,
+    input: &IdempotencyInput,
+    durable_outcome: &str,
+    result_json: &str,
+    completed_at: OffsetDateTime,
+) -> Result<(), StorageError> {
+    transaction
+        .execute(
+            "INSERT INTO idempotency_records (
+                principal_ref, operation, idempotency_key, operation_id,
+                request_digest, digest_schema_version, hmac_key_version,
+                status, durable_outcome, session_id, turn_id,
+                result_session_state_revision, result_session_updated_at,
+                result_json, created_at, completed_at, expires_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'terminal', ?8,
+                       NULL, NULL, NULL, NULL, ?9, ?10, ?11, ?12)",
+            params![
+                input.principal_ref.as_str(),
+                idempotent_operation_token(input.operation),
+                input.key.as_str(),
+                input.operation_id.as_str(),
+                input.request_digest.as_str(),
+                i64::from(input.digest_schema_version),
+                i64::from(input.hmac_key_version),
+                durable_outcome,
+                result_json,
+                format_time(input.created_at)?,
+                format_time(completed_at)?,
                 format_time(input.expires_at)?,
             ],
         )

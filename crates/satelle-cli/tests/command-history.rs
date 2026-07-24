@@ -51,6 +51,71 @@ impl Fixture {
     fn connection(&self) -> Connection {
         Connection::open(self.database_path()).expect("open command-history database")
     }
+
+    fn authorize_default_provider_binding(&self) -> std::path::PathBuf {
+        let config_file = self.cache.path().join("provider-binding-config.toml");
+        test_file::write_user_controlled(
+            &config_file,
+            r#"
+default_host = "local-demo"
+model_alias = "history-model"
+provider_alias = "history-provider"
+
+[hosts.local-demo]
+transport = "local"
+adapter = "fake"
+
+[hosts.local-demo.provider_bindings.history-provider.history-model]
+model = "fake-model-v1"
+model_provider = "openai"
+auth_source = "test"
+
+[hosts.local-demo.provider_auth.test]
+kind = "environment"
+variable = "SATELLE_TEST_PROVIDER_TOKEN"
+"#,
+        )
+        .expect("write exact provider binding config");
+        let setup_output = self
+            .command()
+            .env("SATELLE_CONFIG_FILE", &config_file)
+            .env("SATELLE_TEST_PROVIDER_TOKEN", "fixture-provider-token")
+            .args([
+                "setup",
+                "--host",
+                "local-demo",
+                "--component",
+                "provider-auth",
+                "--no-input",
+                "--yes",
+                "--json",
+            ])
+            .assert()
+            .success()
+            .get_output()
+            .clone();
+        let setup_report: serde_json::Value = serde_json::from_slice(&setup_output.stdout)
+            .expect("setup stdout should be one JSON report");
+        assert_eq!(setup_report["status"], "applied");
+        assert_eq!(setup_report["mutated"], true);
+        assert!(
+            setup_report["applied_actions"]
+                .as_array()
+                .expect("applied_actions should be an array")
+                .iter()
+                .filter_map(serde_json::Value::as_str)
+                .any(|action| {
+                    action.contains("provider binding")
+                        && action.contains("history-provider/history-model")
+                })
+        );
+        self.command()
+            .env("SATELLE_CONFIG_FILE", &config_file)
+            .args(["host", "release-state"])
+            .assert()
+            .success();
+        config_file
+    }
 }
 
 fn satelle_command(cache_root: &Path, state_root: &Path) -> Command {
@@ -426,8 +491,11 @@ fn history_failures_do_not_corrupt_json_error_output() {
 #[test]
 fn admitted_run_failures_retain_their_session_id() {
     let fixture = Fixture::new();
+    let provider_config = fixture.authorize_default_provider_binding();
     fixture
         .command()
+        .env("SATELLE_CONFIG_FILE", provider_config)
+        .env("SATELLE_TEST_PROVIDER_TOKEN", "fixture-provider-token")
         .env(TEST_SUPPORT_ADAPTER_ENV, "failing")
         .args([
             "run",
