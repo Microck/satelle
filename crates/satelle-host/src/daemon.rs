@@ -343,6 +343,7 @@ struct CanonicalSessionCreate<'a> {
     model: Option<&'a str>,
     provider: Option<&'a str>,
     refresh_provider_smoke_test: bool,
+    experimental_provider_computer_use: bool,
     turn_execution_timeout_seconds: Option<u32>,
     attachments: &'a [CanonicalAttachment<'a>],
 }
@@ -356,6 +357,7 @@ struct CanonicalTurnCreate<'a> {
     model: Option<&'a str>,
     provider: Option<&'a str>,
     refresh_provider_smoke_test: bool,
+    experimental_provider_computer_use: bool,
     turn_execution_timeout_seconds: Option<u32>,
     attachments: &'a [CanonicalAttachment<'a>],
 }
@@ -901,6 +903,9 @@ impl HostService {
                     .provider()
                     .map(ProviderBindingRef::as_str),
                 refresh_provider_smoke_test: intent.provider_intent.refresh(),
+                experimental_provider_computer_use: intent
+                    .provider_intent
+                    .experimental_provider_computer_use(),
                 turn_execution_timeout_seconds: Some(turn_execution_timeout.seconds()),
                 attachments: &intent
                     .attachments
@@ -1009,6 +1014,9 @@ impl HostService {
                     .provider()
                     .map(ProviderBindingRef::as_str),
                 refresh_provider_smoke_test: intent.provider_intent.refresh(),
+                experimental_provider_computer_use: intent
+                    .provider_intent
+                    .experimental_provider_computer_use(),
                 turn_execution_timeout_seconds: Some(turn_execution_timeout.seconds()),
                 attachments: &intent
                     .attachments
@@ -1103,6 +1111,9 @@ impl HostService {
                     .provider()
                     .map(ProviderBindingRef::as_str),
                 refresh_provider_smoke_test: intent.provider_intent.refresh(),
+                experimental_provider_computer_use: intent
+                    .provider_intent
+                    .experimental_provider_computer_use(),
                 turn_execution_timeout_seconds: Some(turn_execution_timeout.seconds()),
                 attachments: &intent
                     .attachments
@@ -1168,6 +1179,9 @@ impl HostService {
                     .provider()
                     .map(ProviderBindingRef::as_str),
                 refresh_provider_smoke_test: intent.provider_intent.refresh(),
+                experimental_provider_computer_use: intent
+                    .provider_intent
+                    .experimental_provider_computer_use(),
                 turn_execution_timeout_seconds: Some(turn_execution_timeout.seconds()),
                 attachments: &intent
                     .attachments
@@ -1573,6 +1587,7 @@ mod tests {
                 model: Some("model-test"),
                 provider: Some("provider-test"),
                 refresh_provider_smoke_test: true,
+                experimental_provider_computer_use: true,
                 turn_execution_timeout_seconds: Some(30 * 60),
                 attachments: &[],
             },
@@ -1592,6 +1607,7 @@ mod tests {
                     "model": "model-test",
                     "provider": "provider-test",
                     "refresh_provider_smoke_test": true,
+                    "experimental_provider_computer_use": true,
                     "turn_execution_timeout_seconds": 1800,
                     "attachments": []
                 }

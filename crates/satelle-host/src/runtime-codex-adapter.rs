@@ -882,12 +882,18 @@ pub(crate) fn resolve_provider_child_secret(
     if let Some(endpoint) = endpoint {
         validate_provider_endpoint(endpoint)?;
     }
-    match (endpoint, binding.auth_source()) {
-        (None, Some(_)) => Err(provider_secret_resolution_error(
+    let auth_source = binding.auth_source();
+    if endpoint.is_none()
+        && auth_source.is_some()
+        && !binding.model_provider().eq_ignore_ascii_case("openai")
+    {
+        return Err(provider_secret_resolution_error(
             "provider_auth_destination_unsupported",
-        )),
-        (_, None) => Ok(None),
-        (Some(_), Some(source)) => resolve_provider_secret(source, ProviderHostPlatform::current())
+        ));
+    }
+    match auth_source {
+        None => Ok(None),
+        Some(source) => resolve_provider_secret(source, ProviderHostPlatform::current())
             .map(Some)
             .map_err(|error| {
                 let reason = match error {
@@ -2517,9 +2523,8 @@ mod tests {
                 "rotation-model",
                 "rotation-provider",
                 "rotation-model",
-                "rotation-provider",
+                "openai",
             )
-            .with_endpoint("https://provider.invalid/v1")
             .with_auth_source(satelle_core::ProviderSecretSource::Environment {
                 variable: environment.0.clone(),
             }),
@@ -2564,6 +2569,30 @@ mod tests {
             .expect("the binding has a provider credential");
         assert!(
             staged_secret.expose_to_provider(|secret| { secret == "preflight-provider-secret" })
+        );
+    }
+
+    #[test]
+    fn endpointless_custom_provider_auth_source_is_rejected() {
+        let binding = ResolvedProviderBinding::from_authorization(
+            ProviderBindingAuthorization::new(
+                "custom-model",
+                "custom-provider",
+                "custom-model",
+                "custom-provider",
+            )
+            .with_auth_source(satelle_core::ProviderSecretSource::Environment {
+                variable: "SATELLE_CUSTOM_PROVIDER_SECRET".to_string(),
+            })
+            .with_experimental_provider_computer_use(true),
+            ProviderBindingSource::HostOwned,
+        );
+
+        let error = resolve_provider_child_secret(&binding)
+            .expect_err("endpoint-less custom-provider credentials must fail closed");
+        assert_eq!(
+            error.details["reason"],
+            "provider_auth_destination_unsupported"
         );
     }
 

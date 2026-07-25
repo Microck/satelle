@@ -720,6 +720,93 @@ fn provider_child_overrides_are_process_scoped_and_secret_safe() {
 }
 
 #[test]
+fn builtin_openai_provider_secret_is_process_scoped_and_shell_excluded() {
+    let fixture = compile_fixture();
+    let directory = tempfile::tempdir().expect("built-in OpenAI child fixture directory");
+    let home = tempfile::tempdir().expect("isolated built-in OpenAI child home");
+    let log_path = directory.path().join("requests.jsonl");
+    let cwd_log_path = directory.path().join("child-cwd");
+    let args_log_path = directory.path().join("child-args");
+    let provider_env_log_path = directory.path().join("child-provider-env");
+    let thread_marker = directory.path().join("thread-persisted");
+    let turn_marker = directory.path().join("turn-persisted");
+    let mut command = Command::new(&fixture.executable);
+    command
+        .env("HOME", home.path())
+        .env("SATELLE_FIXTURE_SCENARIO", "completed")
+        .env("SATELLE_FIXTURE_LOG", &log_path)
+        .env("SATELLE_FIXTURE_CWD_LOG", &cwd_log_path)
+        .env("SATELLE_FIXTURE_ARGS_LOG", &args_log_path)
+        .env("SATELLE_FIXTURE_PROVIDER_ENV_LOG", &provider_env_log_path)
+        .env("SATELLE_THREAD_MARKER", &thread_marker)
+        .env("SATELLE_TURN_MARKER", &turn_marker)
+        .env(
+            "SATELLE_DESCENDANT_MARKER",
+            directory.path().join("unused-descendant"),
+        );
+    let mut persist_thread = |_: &str| {
+        touch(&thread_marker);
+        Ok(())
+    };
+    let mut persist_turn = |_: &str| {
+        touch(&turn_marker);
+        Ok(())
+    };
+    let secret = "PRIVATE_BUILTIN_OPENAI_SECRET_CANARY";
+    let result = run_codex_session(
+        command,
+        CodexSessionRequest {
+            working_directory: directory.path(),
+            prompt: "PRIVATE_BUILTIN_OPENAI_PROMPT",
+            existing_thread_ref: None,
+            model: Some("gpt-fixture"),
+            model_provider: Some("openai"),
+            provider_endpoint: None,
+            provider_secret: Some(crate::provider_auth::ResolvedProviderSecret::for_test(
+                secret,
+            )),
+            execution_mode: TurnExecutionMode::Standard,
+            approval_policy: CodexApprovalPolicy::OnRequest,
+            sandbox_policy: CodexSandboxPolicy::WorkspaceWrite,
+            deadline: Instant::now() + Duration::from_secs(3),
+            persist_thread_ref: &mut persist_thread,
+            persist_turn_ref: &mut persist_turn,
+            control: None,
+            goal_set_supported: false,
+            image_input_mode: crate::codex_capabilities::CodexImageInputMode::Unsupported,
+            attachments: &[],
+        },
+    );
+
+    assert_eq!(result, Ok(CodexSessionTerminal::Completed));
+    let args = read_to_string(&args_log_path).expect("read built-in OpenAI child args");
+    for expected in [
+        "model_providers.openai.env_key=\"SATELLE_CODEX_API_KEY\"",
+        "model_providers.openai.requires_openai_auth=false",
+        "shell_environment_policy.exclude=[\"SATELLE_CODEX_API_KEY\"]",
+    ] {
+        assert!(
+            args.lines().any(|arg| arg == expected),
+            "missing {expected}"
+        );
+    }
+    assert_eq!(args.lines().filter(|arg| *arg == "-c").count(), 3);
+    assert!(!args.contains(secret));
+    assert_eq!(
+        read_to_string(provider_env_log_path).expect("read built-in OpenAI child environment"),
+        secret
+    );
+    let requests = read_to_string(log_path).expect("read built-in OpenAI protocol log");
+    assert!(requests.contains(r#""modelProvider":"openai""#));
+    assert!(!requests.contains(secret));
+    assert!(!format!("{result:?}").contains(secret));
+    assert!(
+        !home.path().join(".codex").join("config.toml").exists(),
+        "built-in OpenAI overrides must not write global Codex config"
+    );
+}
+
+#[test]
 fn supported_goal_is_confirmed_before_the_first_turn() {
     let run = run_scenario("goal", None, Duration::from_secs(3));
     assert_eq!(run.result, Ok(CodexSessionTerminal::Completed));

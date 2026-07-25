@@ -1065,6 +1065,39 @@ fn doctor_provider_refresh_updates_cache_without_admitting_prompt_work() {
 }
 
 #[test]
+fn endpointless_auth_sources_are_reserved_for_builtin_openai() {
+    let openai = satelle_core::ProviderBindingAuthorization::new(
+        "openai-model",
+        "openai-provider",
+        "gpt-test",
+        "openai",
+    )
+    .with_auth_source(satelle_core::ProviderSecretSource::Environment {
+        variable: "SATELLE_OPENAI_API_KEY".to_string(),
+    });
+    validate_provider_binding_authorization(&openai)
+        .expect("the built-in OpenAI provider may use a Host auth source");
+
+    let custom = satelle_core::ProviderBindingAuthorization::new(
+        "custom-model",
+        "custom-provider",
+        "custom-model",
+        "custom-provider",
+    )
+    .with_auth_source(satelle_core::ProviderSecretSource::Environment {
+        variable: "SATELLE_CUSTOM_PROVIDER_API_KEY".to_string(),
+    })
+    .with_experimental_provider_computer_use(true);
+    let error = validate_provider_binding_authorization(&custom)
+        .expect_err("a custom provider auth source requires a custom endpoint");
+    assert!(
+        error
+            .message
+            .contains("supported only for the built-in OpenAI provider")
+    );
+}
+
+#[test]
 fn production_adapter_accepts_host_authorized_binding_without_resolving_auth() {
     let state = crate::TestStateDir::new().expect("temporary state directory");
     let host_auth = satelle_core::ProviderSecretSource::Environment {

@@ -304,10 +304,25 @@ pub(crate) fn run_codex_session(
                 command.env(PROVIDER_CHILD_SECRET_ENV, value);
             });
         }
-    } else if request.provider_secret.is_some() {
-        return Err(CodexSessionFailure::before_turn_dispatch(
-            CodexSessionError::Write,
-        ));
+    } else if let Some(secret) = request.provider_secret.as_ref() {
+        if !request
+            .model_provider
+            .is_some_and(|provider| provider.eq_ignore_ascii_case("openai"))
+        {
+            return Err(CodexSessionFailure::before_turn_dispatch(
+                CodexSessionError::Write,
+            ));
+        }
+        for override_value in [
+            format!("model_providers.openai.env_key=\"{PROVIDER_CHILD_SECRET_ENV}\""),
+            "model_providers.openai.requires_openai_auth=false".to_string(),
+            format!("shell_environment_policy.exclude=[\"{PROVIDER_CHILD_SECRET_ENV}\"]"),
+        ] {
+            command.arg("-c").arg(override_value);
+        }
+        secret.expose_to_provider(|value| {
+            command.env(PROVIDER_CHILD_SECRET_ENV, value);
+        });
     }
     let working_directory = request.working_directory;
     let deadline = request.deadline;

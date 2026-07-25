@@ -431,6 +431,62 @@ async fn mutation_replays_preserve_operation_boundaries_and_reject_digest_drift(
 }
 
 #[tokio::test]
+async fn turn_idempotency_digest_binds_experimental_provider_computer_use() {
+    let running = RunningServer::start(ApiScopes::CONTROL).await;
+    let run_key = "turn-experimental-opt-in-run";
+    let prompt = "Bind the one-shot provider opt-in to the run identity";
+    let created: SessionResponse = running
+        .mutation("/v1/sessions", run_key)
+        .json(&TurnRequest::new(prompt))
+        .send()
+        .await
+        .expect("create baseline Session")
+        .json()
+        .await
+        .expect("decode baseline Session");
+    let session_id = created.session().session_id().clone();
+
+    let run_conflict = running
+        .mutation("/v1/sessions", run_key)
+        .json(&TurnRequest::new(prompt).with_experimental_provider_computer_use(true))
+        .send()
+        .await
+        .expect("send run opt-in conflict");
+    assert_eq!(run_conflict.status(), StatusCode::CONFLICT);
+    let error: ApiError = run_conflict
+        .json()
+        .await
+        .expect("decode run opt-in conflict");
+    assert_eq!(error.code().as_str(), "idempotency-key-conflict");
+
+    wait_until_idle(&running, session_id.as_str()).await;
+    let steer_path = format!("/v1/sessions/{session_id}/turns");
+    let steer_key = "turn-experimental-opt-in-steer";
+    let steer_prompt = "Bind the one-shot provider opt-in to the steer identity";
+    running
+        .mutation(&steer_path, steer_key)
+        .json(&TurnRequest::new(steer_prompt))
+        .send()
+        .await
+        .expect("create baseline steer")
+        .error_for_status()
+        .expect("baseline steer accepted");
+
+    let steer_conflict = running
+        .mutation(&steer_path, steer_key)
+        .json(&TurnRequest::new(steer_prompt).with_experimental_provider_computer_use(true))
+        .send()
+        .await
+        .expect("send steer opt-in conflict");
+    assert_eq!(steer_conflict.status(), StatusCode::CONFLICT);
+    let error: ApiError = steer_conflict
+        .json()
+        .await
+        .expect("decode steer opt-in conflict");
+    assert_eq!(error.code().as_str(), "idempotency-key-conflict");
+}
+
+#[tokio::test]
 async fn turn_timeout_is_part_of_the_admission_identity() {
     let running = RunningServer::start(ApiScopes::CONTROL).await;
     let request =

@@ -130,7 +130,7 @@ impl DaemonClient {
         })
     }
 
-    /// Overrides the total deadline only for session and turn admission.
+    /// Overrides the total deadline for admission and live readiness refreshes.
     pub fn with_admission_timeout(mut self, admission_timeout: Duration) -> Self {
         self.admission_timeout = Some(admission_timeout);
         self
@@ -294,7 +294,8 @@ impl DaemonClient {
             provider_binding_path(provider_alias, model_alias)
         );
         let (request, request_id) = self.mutation_request(&path, idempotency_key)?;
-        self.send_authenticated(request.json(validation), request_id, StatusCode::OK)
+        let request = self.provider_validation_request(request.json(validation), validation);
+        self.send_authenticated(request, request_id, StatusCode::OK)
     }
 
     pub fn complete_bootstrap_maintenance(
@@ -478,6 +479,21 @@ impl DaemonClient {
         match self.admission_timeout {
             Some(timeout) => request.timeout(timeout),
             None => request,
+        }
+    }
+
+    fn provider_validation_request(
+        &self,
+        request: RequestBuilder,
+        validation: &ProviderDescriptorValidationRequest,
+    ) -> RequestBuilder {
+        if matches!(
+            validation.mode(),
+            satelle_core::ProviderAuthValidationMode::RefreshProviderSmoke
+        ) {
+            self.admission_request(request)
+        } else {
+            request
         }
     }
 
@@ -1193,6 +1209,36 @@ mod tests {
             .expect("build admission request");
 
         assert_eq!(request.timeout(), Some(&admission_timeout));
+
+        let cached_validation = ProviderDescriptorValidationRequest::new(
+            satelle_core::ProviderAuthValidationMode::Cached,
+        );
+        let (cached_request, _) = client
+            .mutation_request(
+                "/v1/setup/provider-bindings/openai/review/validate",
+                "cached-test",
+            )
+            .expect("construct cached validation request");
+        let cached_request = client
+            .provider_validation_request(cached_request, &cached_validation)
+            .build()
+            .expect("build cached validation request");
+        assert_eq!(cached_request.timeout(), None);
+
+        let refresh_validation = ProviderDescriptorValidationRequest::new(
+            satelle_core::ProviderAuthValidationMode::RefreshProviderSmoke,
+        );
+        let (refresh_request, _) = client
+            .mutation_request(
+                "/v1/setup/provider-bindings/openai/review/validate",
+                "refresh-test",
+            )
+            .expect("construct refresh validation request");
+        let refresh_request = client
+            .provider_validation_request(refresh_request, &refresh_validation)
+            .build()
+            .expect("build refresh validation request");
+        assert_eq!(refresh_request.timeout(), Some(&admission_timeout));
     }
 
     #[test]

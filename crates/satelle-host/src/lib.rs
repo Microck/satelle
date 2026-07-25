@@ -805,6 +805,16 @@ pub(crate) fn validate_provider_binding_authorization(
                 None,
             ),
         })?;
+        if authorization.endpoint().is_none()
+            && !authorization
+                .model_provider()
+                .eq_ignore_ascii_case("openai")
+        {
+            return Err(SatelleError::config_error(
+                "provider Secret Sources without a custom endpoint are supported only for the built-in OpenAI provider",
+                None,
+            ));
+        }
     }
     if (!authorization
         .model_provider()
