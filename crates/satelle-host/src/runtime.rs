@@ -890,8 +890,10 @@ impl RuntimeEngine {
         {
             cached = Some(self.run_live_native_probe(key, driver.as_ref(), cancellation)?);
         }
-        let requires_live_provider_probe =
-            provider_smoke_enabled && (provider_intent.refresh() || cached_provider.is_none());
+        // The adapter resolves the exact credential only inside preflight.
+        // Hold probe ownership even for a cache candidate so credential
+        // rotation cannot turn that candidate into untracked live provider I/O.
+        let requires_live_provider_probe = provider_smoke_enabled;
         let (provider_probe_ref, _provider_heartbeat) = if requires_live_provider_probe
             && self.readiness_probe_driver.is_some()
             && let Some(key) = cache_key.as_ref()

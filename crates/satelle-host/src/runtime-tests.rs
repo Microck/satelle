@@ -300,6 +300,66 @@ fn implicit_non_openai_cache_miss_runs_live_provider_smoke_before_execute() {
 }
 
 #[test]
+fn cached_provider_candidate_still_acquires_provider_probe_ownership() {
+    let state = crate::TestStateDir::new().expect("temporary state directory should exist");
+    let adapter = ProviderProbeRecoveryAdapter::new([]).with_provider_dispatch_possible(false);
+    let runtime = RuntimeHandle::new_with_readiness_probe_driver(
+        Ok(state.path().to_path_buf()),
+        adapter.clone(),
+        adapter.clone(),
+    );
+    let key = ProviderProbeRecoveryAdapter::key();
+    let observed_at = time::OffsetDateTime::now_utc();
+    let readiness = key
+        .evidence(
+            "cached-provider-lease-readiness",
+            observed_at,
+            observed_at + time::Duration::minutes(5),
+        )
+        .unwrap();
+    let provider = ProviderSmokeEvidence::new(
+        "cached-provider-lease-smoke",
+        key.provider_config_fingerprint(),
+        "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+        observed_at,
+        observed_at + time::Duration::hours(24),
+    )
+    .unwrap();
+    runtime
+        .engine()
+        .expect("open runtime storage")
+        .lock_storage()
+        .unwrap()
+        .store_preflight_successes(
+            key.adapter(),
+            key.desktop_binding(),
+            key.execution_policy(),
+            &readiness,
+            Some(&provider),
+        )
+        .unwrap();
+
+    let error = runtime
+        .run(RunCommand::attached(
+            LOCAL_DEMO_HOST,
+            "cached-provider-candidate-needs-probe-ownership",
+        ))
+        .expect_err("the persistence-aware provider probe fixture rejects admission");
+
+    assert_eq!(error.error().code, ErrorCode::ProviderSmokeTestTimeout);
+    assert_eq!(
+        adapter.provider_probe_calls.load(Ordering::SeqCst),
+        1,
+        "a cache candidate cannot bypass durable provider-probe ownership"
+    );
+    assert_eq!(
+        adapter.execute_calls.load(Ordering::SeqCst),
+        0,
+        "failed provider validation must not admit prompt execution"
+    );
+}
+
+#[test]
 fn host_config_binding_precedes_colliding_persisted_user_config_without_secret_resolution() {
     let state = crate::TestStateDir::new().expect("temporary state directory should exist");
     let host_secret_variable = format!(
@@ -555,7 +615,7 @@ fn unknown_provider_probe_ownership_blocks_probe_and_prompt_until_terminal_recon
     let runtime = RuntimeHandle::new_with_readiness_probe_driver(
         Ok(state.path().to_path_buf()),
         adapter.clone(),
-        adapter,
+        adapter.clone(),
     );
     let provider_intent = ProviderComputerUseIntent::new(None, None, true);
 
@@ -607,12 +667,19 @@ fn unknown_provider_probe_ownership_blocks_probe_and_prompt_until_terminal_recon
         "provider_probe_recovery_pending"
     );
 
-    runtime
+    adapter
+        .provider_dispatch_possible
+        .store(false, Ordering::SeqCst);
+    let prompt_error = runtime
         .run(RunCommand::attached(
             LOCAL_DEMO_HOST,
             "prompt-after-terminal-reconciliation",
         ))
-        .expect("terminal upstream observation should release the probe lease");
+        .expect_err("terminal reconciliation permits a new fail-closed provider probe");
+    assert_eq!(
+        prompt_error.error().code,
+        ErrorCode::ProviderSmokeTestTimeout
+    );
     let remaining: i64 = engine
         .lock_storage()
         .unwrap()
@@ -1981,7 +2048,7 @@ impl ReadinessProbeDriver for ProviderProbeRecoveryAdapter {
     fn preflight_terminal_with_provider_probe(
         &self,
         _host: &str,
-        _cached: Option<ReadinessEvidence>,
+        cached: Option<ReadinessEvidence>,
         _cached_provider: Option<super::ProviderSmokeResult>,
         _provider_intent: &ProviderComputerUseIntent,
         _cancellation: &super::AdmissionCancellation,
@@ -1995,10 +2062,10 @@ impl ReadinessProbeDriver for ProviderProbeRecoveryAdapter {
             persist_turn_ref(PRIVATE_UPSTREAM_TURN_REF).unwrap();
         }
         let key = self.effective_key();
-        let readiness = self.readiness();
+        let readiness = cached.unwrap_or_else(|| self.readiness());
         let now = time::OffsetDateTime::now_utc();
         let failure = ProviderSmokeFailureEvidence::new(
-            "provider-probe-outcome-unknown",
+            format!("provider-probe-outcome-unknown-{}", SessionId::new()),
             key.provider_config_fingerprint(),
             "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
             ErrorCode::ProviderSmokeTestTimeout,
