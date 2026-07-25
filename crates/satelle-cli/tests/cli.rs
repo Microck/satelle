@@ -261,6 +261,7 @@ fixture-provider = true
 [hosts.local-demo.provider_bindings.fixture-provider.fixture-model]
 model = "fixture-model-v1"
 model_provider = "fixture-provider-v1"
+endpoint = "https://fixture-provider.invalid/v1"
 auth_source = "fixture-auth"
 
 [hosts.local-demo.provider_auth.fixture-auth]
@@ -5831,6 +5832,7 @@ auth_source = "openai"
 [hosts.local.provider_bindings.anthropic.default]
 model = "claude-computer-use"
 model_provider = "anthropic"
+endpoint = "https://anthropic.invalid/v1"
 auth_source = "anthropic"
 
 [hosts.local.provider_auth.openai]

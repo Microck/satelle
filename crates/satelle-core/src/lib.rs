@@ -3081,17 +3081,35 @@ fn reject_provider_binding_errors(path: &Path, value: &toml::Value) -> Result<()
             continue;
         };
         for (provider_alias, model_bindings) in provider_bindings {
+            let provider_path = format!("hosts.{host_alias}.provider_bindings.{provider_alias}");
+            crate::session::ProviderBindingRef::new(provider_alias.clone()).map_err(|_| {
+                SatelleError::config_error(
+                    format!(
+                        "config file {} has an invalid provider binding alias at {provider_path}",
+                        path.display()
+                    ),
+                    None,
+                )
+            })?;
             let Some(model_bindings) = model_bindings.as_table() else {
                 continue;
             };
             for (model_alias, binding) in model_bindings {
+                let model_path = format!("{provider_path}.{model_alias}");
+                crate::session::EffectiveModelRef::new(model_alias.clone()).map_err(|_| {
+                    SatelleError::config_error(
+                        format!(
+                            "config file {} has an invalid model binding alias at {model_path}",
+                            path.display()
+                        ),
+                        None,
+                    )
+                })?;
                 let Some(binding) = binding.as_table() else {
                     continue;
                 };
                 for field in ["model", "model_provider"] {
-                    let field_path = format!(
-                        "hosts.{host_alias}.provider_bindings.{provider_alias}.{model_alias}.{field}"
-                    );
+                    let field_path = format!("{model_path}.{field}");
                     if binding
                         .get(field)
                         .and_then(toml::Value::as_str)

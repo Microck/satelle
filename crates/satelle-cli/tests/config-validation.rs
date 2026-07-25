@@ -8,6 +8,60 @@ mod config_fixture;
 use config_fixture::{ConfigFixture, assert_same_file, parse_json};
 
 #[test]
+fn config_check_rejects_invalid_provider_binding_table_aliases() {
+    let fixture = ConfigFixture::new(
+        r#"
+default_host = "local"
+
+[hosts.local]
+transport = "local"
+adapter = "fake"
+
+[hosts.local.provider_bindings."invalid provider".model]
+model = "provider-model"
+model_provider = "custom"
+"#,
+        "",
+    );
+    let invalid_provider = fixture
+        .command()
+        .args(["config", "check", "--json"])
+        .assert()
+        .code(66)
+        .get_output()
+        .clone();
+    assert_eq!(
+        parse_json(&invalid_provider.stderr)["code"],
+        "configuration-error"
+    );
+
+    fixture.write_user_config(
+        r#"
+default_host = "local"
+
+[hosts.local]
+transport = "local"
+adapter = "fake"
+
+[hosts.local.provider_bindings.custom."invalid model"]
+model = "provider-model"
+model_provider = "custom"
+"#,
+    );
+    let invalid_model = fixture
+        .command()
+        .args(["config", "check", "--json"])
+        .assert()
+        .code(66)
+        .get_output()
+        .clone();
+    assert_eq!(
+        parse_json(&invalid_model.stderr)["code"],
+        "configuration-error"
+    );
+}
+
+#[test]
 fn api_rate_limits_are_user_owned_and_nonzero() {
     let fixture = ConfigFixture::new(
         r#"
@@ -650,6 +704,7 @@ allow_project_selection = true
 [hosts.local.provider_bindings.anthropic.vision]
 model = "claude-computer-use"
 model_provider = "anthropic"
+endpoint = "https://anthropic.invalid/v1"
 auth_source = "anthropic"
 
 [hosts.local.provider_auth.anthropic]
@@ -697,6 +752,7 @@ anthropic = true
 [hosts.local.provider_bindings.anthropic.vision]
 model = "claude-computer-use"
 model_provider = "anthropic"
+endpoint = "https://anthropic.invalid/v1"
 auth_source = "anthropic"
 
 [hosts.local.provider_auth.anthropic]

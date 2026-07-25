@@ -213,7 +213,10 @@ impl TurnIntent {
             .map(ProviderBindingRef::new)
             .transpose()
             .map_err(|_| TurnIntentError::InvalidProvider)?;
-        self.provider_intent = crate::ProviderComputerUseIntent::new(model, provider, refresh);
+        let experimental_provider_computer_use =
+            self.provider_intent.experimental_provider_computer_use();
+        self.provider_intent = crate::ProviderComputerUseIntent::new(model, provider, refresh)
+            .with_experimental_provider_computer_use(experimental_provider_computer_use);
         Ok(self)
     }
 
@@ -1557,6 +1560,21 @@ mod tests {
     use std::sync::Arc;
 
     #[test]
+    fn provider_intent_builder_preserves_explicit_computer_use_opt_in() {
+        let intent = TurnIntent::new("prompt", TurnExecutionMode::Standard)
+            .unwrap()
+            .with_experimental_provider_computer_use(true)
+            .with_provider_intent(
+                Some("model-test".to_owned()),
+                Some("provider-test".to_owned()),
+                false,
+            )
+            .unwrap();
+
+        assert!(intent.provider_intent.experimental_provider_computer_use());
+    }
+
+    #[test]
     fn host_turn_timeout_resolves_omitted_and_longer_requests_before_admission() {
         let state = crate::TestStateDir::new().expect("temporary Host state directory");
         let service = HostService::local_demo_for_tests_at(state.path())
@@ -1596,22 +1614,8 @@ mod tests {
         .expect("serialize Turn idempotency payload");
         assert_eq!(turn.digest_schema_version, 5);
         assert_eq!(
-            serde_json::from_slice::<serde_json::Value>(turn.as_slice())
-                .expect("decode Turn payload"),
-            serde_json::json!({
-                "digest_schema_version": 5,
-                "payload": {
-                    "operation": "session_create",
-                    "prompt": "PRIVATE_DIGEST_VERSION_PROMPT",
-                    "execution_mode": "yolo",
-                    "model": "model-test",
-                    "provider": "provider-test",
-                    "refresh_provider_smoke_test": true,
-                    "experimental_provider_computer_use": true,
-                    "turn_execution_timeout_seconds": 1800,
-                    "attachments": []
-                }
-            })
+            turn.as_slice(),
+            br#"{"digest_schema_version":5,"payload":{"operation":"session_create","prompt":"PRIVATE_DIGEST_VERSION_PROMPT","execution_mode":"yolo","model":"model-test","provider":"provider-test","refresh_provider_smoke_test":true,"experimental_provider_computer_use":true,"turn_execution_timeout_seconds":1800,"attachments":[]}}"#
         );
 
         let stop = canonical_payload(

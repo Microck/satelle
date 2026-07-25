@@ -26,7 +26,8 @@ use std::time::Duration;
 use zeroize::Zeroizing;
 
 const DIRECT_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
-const PROVIDER_BINDING_ALIAS_ENCODE_SET: &AsciiSet = &CONTROLS.add(b'/');
+const PROVIDER_BINDING_ALIAS_ENCODE_SET: &AsciiSet =
+    &CONTROLS.add(b'/').add(b'?').add(b'#').add(b'%').add(b'\\');
 
 fn provider_binding_path(provider_alias: &str, model_alias: &str) -> String {
     // Shared reference validation admits `/` as alias data. Encode it here so
@@ -841,8 +842,11 @@ mod tests {
     #[test]
     fn provider_binding_path_encodes_each_alias_as_one_segment() {
         assert_eq!(
-            provider_binding_path("open_ai/us:west", "vision/v2.1"),
-            "/v1/setup/provider-bindings/open_ai%2Fus:west/vision%2Fv2.1"
+            provider_binding_path(
+                "open_ai/us:west?query#frag%2F\\raw",
+                "vision/v2.1?mode#frag%2F\\raw"
+            ),
+            "/v1/setup/provider-bindings/open_ai%2Fus:west%3Fquery%23frag%252F%5Craw/vision%2Fv2.1%3Fmode%23frag%252F%5Craw"
         );
     }
 
