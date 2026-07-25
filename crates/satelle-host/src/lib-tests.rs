@@ -1134,8 +1134,7 @@ fn production_adapter_accepts_host_authorized_binding_without_resolving_auth() {
             "host-provider",
         )
         .with_endpoint("https://host-provider.invalid/v1")
-        .with_auth_source(host_auth.clone())
-        .with_experimental_provider_computer_use(true),
+        .with_auth_source(host_auth.clone()),
         satelle_core::ProviderBindingSource::HostOwned,
     );
     let intent = ProviderComputerUseIntent::new(
@@ -1149,7 +1148,8 @@ fn production_adapter_accepts_host_authorized_binding_without_resolving_auth() {
         ),
         false,
     )
-    .with_resolved_provider_binding(binding);
+    .with_resolved_provider_binding(binding)
+    .with_experimental_provider_computer_use(true);
 
     let resolved = ComputerUseAdapter::resolve_provider_binding(&adapter, LOCAL_DEMO_HOST, &intent)
         .expect("Host-owned binding resolution must not read its missing secret");
@@ -1165,6 +1165,7 @@ fn production_adapter_accepts_host_authorized_binding_without_resolving_auth() {
         resolved.endpoint()
     );
     assert_eq!(Some(&host_auth), resolved.auth_source());
+    assert!(resolved.experimental_provider_computer_use());
 }
 
 #[test]

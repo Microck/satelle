@@ -198,39 +198,46 @@ impl ProductionComputerUseAdapter {
             (None, None) => None,
             _ => return Err(model_provider_binding_missing(provider_intent)),
         };
-        let Some((model_alias, provider_alias)) = requested_pair else {
-            let command = crate::codex_capabilities::installed_app_server_command()?;
-            let defaults = crate::codex_capabilities::probe_effective_codex_defaults(command)
-                .map_err(|_| codex_effective_defaults_unavailable())?;
-            let resolved = ResolvedProviderBinding::from_authorization(
-                ProviderBindingAuthorization::new(
-                    DEFAULT_MODEL_BINDING,
-                    DEFAULT_PROVIDER_BINDING,
-                    defaults.model(),
-                    defaults.model_provider(),
-                ),
-                ProviderBindingSource::HostOwned,
-            )
-            .with_value_origins(
-                defaults.model_origin().provider_value_origin(),
-                defaults.model_provider_origin().provider_value_origin(),
-            );
-            return Ok(resolved);
+        let resolved = match requested_pair {
+            Some((model_alias, provider_alias)) => {
+                let Some(resolved) = provider_intent.resolved_provider_binding() else {
+                    return Err(model_provider_binding_missing(provider_intent));
+                };
+                if resolved.requested_model_alias() != model_alias
+                    || resolved.requested_provider_alias() != provider_alias
+                    || resolved.model().trim().is_empty()
+                    || resolved.model_provider().trim().is_empty()
+                    || !resolved.has_valid_binding_digest()
+                {
+                    return Err(model_provider_binding_missing(provider_intent));
+                }
+                resolved.clone()
+            }
+            None => {
+                let command = crate::codex_capabilities::installed_app_server_command()?;
+                let defaults = crate::codex_capabilities::probe_effective_codex_defaults(command)
+                    .map_err(|_| codex_effective_defaults_unavailable())?;
+                ResolvedProviderBinding::from_authorization(
+                    ProviderBindingAuthorization::new(
+                        DEFAULT_MODEL_BINDING,
+                        DEFAULT_PROVIDER_BINDING,
+                        defaults.model(),
+                        defaults.model_provider(),
+                    ),
+                    ProviderBindingSource::HostOwned,
+                )
+                .with_value_origins(
+                    defaults.model_origin().provider_value_origin(),
+                    defaults.model_provider_origin().provider_value_origin(),
+                )
+            }
         };
-
-        let Some(resolved) = provider_intent.resolved_provider_binding() else {
-            return Err(model_provider_binding_missing(provider_intent));
-        };
-        if resolved.requested_model_alias() != model_alias
-            || resolved.requested_provider_alias() != provider_alias
-            || resolved.model().trim().is_empty()
-            || resolved.model_provider().trim().is_empty()
-            || !resolved.has_valid_binding_digest()
-        {
-            return Err(model_provider_binding_missing(provider_intent));
-        }
-        self.require_experimental_provider_opt_in(resolved)?;
-        Ok(resolved.clone())
+        let experimental_provider_computer_use = resolved.experimental_provider_computer_use()
+            || provider_intent.experimental_provider_computer_use();
+        let resolved =
+            resolved.with_experimental_provider_computer_use(experimental_provider_computer_use);
+        self.require_experimental_provider_opt_in(&resolved)?;
+        Ok(resolved)
     }
 
     fn require_experimental_provider_opt_in(
