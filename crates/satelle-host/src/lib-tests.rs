@@ -1482,6 +1482,31 @@ fn provider_binding_without_auth_source_is_resolved_by_cached_validation() {
 }
 
 #[test]
+fn provider_binding_without_auth_source_runs_live_refresh_validation() {
+    let state = crate::TestStateDir::new().expect("temporary state directory");
+    let service =
+        service_with_provider_descriptor(state.path().to_path_buf(), FakeComputerUseAdapter, None);
+
+    let validation = service
+        .validate_provider_descriptor(
+            LOCAL_DEMO_HOST,
+            "review",
+            "openai",
+            satelle_core::ProviderAuthValidationMode::RefreshProviderSmoke,
+            false,
+        )
+        .expect("refresh validation must run the live provider smoke");
+    assert_eq!(
+        satelle_core::ProviderAuthValidationOutcome::Resolved,
+        validation.validation().outcome()
+    );
+    assert_eq!(
+        satelle_core::ProviderAuthObservationSource::Live,
+        validation.validation().observation_source()
+    );
+}
+
+#[test]
 fn doctor_reports_a_named_missing_provider_descriptor_without_resolving_it() {
     let state = crate::TestStateDir::new().expect("temporary state directory");
     let service = service_with_provider_descriptor(

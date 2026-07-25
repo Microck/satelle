@@ -1598,7 +1598,13 @@ impl HostService {
                     ProviderAuthObservationSource::Deferred,
                 ),
             };
-        if deferred_outcome != ProviderAuthValidationOutcome::ConfiguredDeferred {
+        let requires_live_refresh =
+            matches!(mode, ProviderAuthValidationMode::RefreshProviderSmoke)
+                && deferred_outcome == ProviderAuthValidationOutcome::Resolved
+                && resolved_binding.auth_source().is_none();
+        if deferred_outcome != ProviderAuthValidationOutcome::ConfiguredDeferred
+            && !requires_live_refresh
+        {
             return Ok(ProviderDescriptorValidation::new(
                 resolved_binding,
                 ProviderAuthValidationResult::new(deferred_outcome, deferred_source),
