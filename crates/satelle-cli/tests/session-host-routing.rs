@@ -138,18 +138,30 @@ api_token = {{ kind = "file", path = {token_path} }}
         .assert()
         .success();
 
-    for args in [
-        vec!["status", &session, "--host", "remote", "--json"],
-        vec![
-            "steer",
-            &session,
-            "--host",
-            "remote",
-            "Do not route this Turn",
-            "--json",
-        ],
-        vec!["stop", &session, "--host", "remote", "--json"],
-        vec!["logs", "--session", &session, "--host", "remote", "--json"],
+    for (args, expected_code) in [
+        (
+            vec!["status", &session, "--host", "remote", "--json"],
+            "host-unreachable",
+        ),
+        (
+            vec![
+                "steer",
+                &session,
+                "--host",
+                "remote",
+                "Do not route this Turn",
+                "--json",
+            ],
+            "direct-daemon-unreachable",
+        ),
+        (
+            vec!["stop", &session, "--host", "remote", "--json"],
+            "host-unreachable",
+        ),
+        (
+            vec!["logs", "--session", &session, "--host", "remote", "--json"],
+            "host-unreachable",
+        ),
     ] {
         let output = satelle()
             .env("SATELLE_CONFIG_FILE", &user_config)
@@ -159,10 +171,7 @@ api_token = {{ kind = "file", path = {token_path} }}
             .failure()
             .get_output()
             .clone();
-        assert_eq!(
-            parse_json_output(&output.stderr)["code"],
-            "host-unreachable"
-        );
+        assert_eq!(parse_json_output(&output.stderr)["code"], expected_code);
     }
 }
 

@@ -1501,7 +1501,7 @@ api_token = {{ kind = "file", path = {token_path} }}
                 "json".to_string(),
                 "Continue".to_string(),
             ],
-            "host-unreachable",
+            "direct-daemon-unreachable",
         ),
     ] {
         let output = production_satelle()
