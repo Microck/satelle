@@ -79,7 +79,7 @@ impl ProviderComputerUseIntent {
 }
 
 /// Typed evidence returned before the runtime may durably admit work.
-#[derive(Clone, Eq, PartialEq)]
+#[derive(Clone)]
 pub struct AdapterReadiness {
     ready: bool,
     adapter: &'static str,
@@ -89,8 +89,31 @@ pub struct AdapterReadiness {
     evidence: ReadinessEvidence,
     provider_smoke_evidence: Option<ProviderSmokeEvidence>,
     resolved_provider_binding: Option<satelle_core::ResolvedProviderBinding>,
+    prepared_provider_secret: Option<PreparedProviderSecret>,
     source: ReadinessSource,
     checks: Vec<NativeReadinessCheck>,
+}
+
+/// One preflight's provider credential, shared only across clones of that
+/// exact readiness value and consumed once by its admitted execution.
+#[derive(Clone)]
+pub(crate) struct PreparedProviderSecret {
+    secret: std::sync::Arc<std::sync::Mutex<Option<crate::provider_auth::ResolvedProviderSecret>>>,
+}
+
+impl PreparedProviderSecret {
+    pub(crate) fn new(secret: Option<crate::provider_auth::ResolvedProviderSecret>) -> Self {
+        Self {
+            secret: std::sync::Arc::new(std::sync::Mutex::new(secret)),
+        }
+    }
+
+    pub(crate) fn take(&self) -> Option<crate::provider_auth::ResolvedProviderSecret> {
+        self.secret
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+    }
 }
 
 impl std::fmt::Debug for AdapterReadiness {
@@ -827,9 +850,26 @@ impl AdapterReadiness {
             evidence,
             provider_smoke_evidence,
             resolved_provider_binding,
+            prepared_provider_secret: None,
             source,
             checks: successful_native_readiness_checks(),
         })
+    }
+
+    pub(crate) fn with_resolved_provider_secret(
+        mut self,
+        secret: Option<crate::provider_auth::ResolvedProviderSecret>,
+    ) -> Self {
+        self.prepared_provider_secret = Some(PreparedProviderSecret::new(secret));
+        self
+    }
+
+    pub(crate) fn take_resolved_provider_secret(
+        &self,
+    ) -> Option<crate::provider_auth::ResolvedProviderSecret> {
+        self.prepared_provider_secret
+            .as_ref()
+            .and_then(PreparedProviderSecret::take)
     }
 
     pub(crate) fn with_source(mut self, source: ReadinessSource) -> Self {
@@ -1348,6 +1388,7 @@ pub struct ExecuteRequest<'a> {
     execution_mode: satelle_core::session::TurnExecutionMode,
     execution_policy: &'a ExecutionPolicy,
     resolved_provider_binding: Option<&'a satelle_core::ResolvedProviderBinding>,
+    resolved_provider_secret: Option<crate::provider_auth::ResolvedProviderSecret>,
     subject: AdapterSubject<'a>,
     persist_upstream_ref: &'a dyn Fn(UpstreamReference) -> Result<(), SatelleError>,
     attachments: &'a [crate::attachment::StagedImage],
@@ -1369,6 +1410,7 @@ impl<'a> ExecuteRequest<'a> {
             execution_mode,
             execution_policy,
             resolved_provider_binding: None,
+            resolved_provider_secret: None,
             subject,
             persist_upstream_ref,
             attachments,
@@ -1381,6 +1423,20 @@ impl<'a> ExecuteRequest<'a> {
     ) -> Self {
         self.resolved_provider_binding = binding;
         self
+    }
+
+    pub(super) fn with_resolved_provider_secret(
+        mut self,
+        secret: Option<crate::provider_auth::ResolvedProviderSecret>,
+    ) -> Self {
+        self.resolved_provider_secret = secret;
+        self
+    }
+
+    pub(crate) fn take_resolved_provider_secret(
+        &mut self,
+    ) -> Option<crate::provider_auth::ResolvedProviderSecret> {
+        self.resolved_provider_secret.take()
     }
 
     pub const fn host(&self) -> &'a str {

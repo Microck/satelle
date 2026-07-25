@@ -256,6 +256,7 @@ pub(super) struct ExecutionPlan {
     pub(super) work: TurnWork,
     pub(super) provider_smoke_event: Option<satelle_core::SatelleEventBody>,
     pub(super) resolved_provider_binding: Option<ResolvedProviderBinding>,
+    pub(super) resolved_provider_secret: Option<crate::provider_auth::ResolvedProviderSecret>,
     pub(super) attachments: crate::attachment::StagedAttachments,
 }
 
@@ -376,6 +377,7 @@ impl RuntimeEngine {
             .turn(&turn_id)
             .ok_or_else(|| model::integrity_failure("the executing Turn is missing"))?
             .execution_policy();
+        let resolved_provider_secret = plan.resolved_provider_secret.take();
         let result = self.adapter.execute(
             ExecuteRequest::new(
                 &plan.host,
@@ -386,7 +388,8 @@ impl RuntimeEngine {
                 &persist_upstream_ref,
                 plan.attachments.images(),
             )
-            .with_resolved_provider_binding(plan.resolved_provider_binding.as_ref()),
+            .with_resolved_provider_binding(plan.resolved_provider_binding.as_ref())
+            .with_resolved_provider_secret(resolved_provider_secret),
         )?;
         let Some(transition) = result.transition() else {
             let session = self

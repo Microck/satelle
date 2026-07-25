@@ -91,6 +91,7 @@ struct AdmissionExecution<'a> {
     dispatch_preference: request::DispatchPreference,
     provider_smoke_event: Option<satelle_core::SatelleEventBody>,
     resolved_provider_binding: Option<satelle_core::ResolvedProviderBinding>,
+    resolved_provider_secret: Option<crate::provider_auth::ResolvedProviderSecret>,
     attachments: crate::attachment::StagedAttachments,
 }
 
@@ -765,6 +766,7 @@ impl RuntimeEngine {
                 dispatch_preference: command.dispatch,
                 provider_smoke_event,
                 resolved_provider_binding: readiness.resolved_provider_binding().cloned(),
+                resolved_provider_secret: readiness.take_resolved_provider_secret(),
                 attachments,
             },
             outcome,
@@ -833,6 +835,7 @@ impl RuntimeEngine {
                 dispatch_preference: command.dispatch,
                 provider_smoke_event,
                 resolved_provider_binding: readiness.resolved_provider_binding().cloned(),
+                resolved_provider_secret: readiness.take_resolved_provider_secret(),
                 attachments,
             },
             outcome,
@@ -1489,6 +1492,7 @@ impl RuntimeEngine {
                     work,
                     provider_smoke_event: execution.provider_smoke_event,
                     resolved_provider_binding: execution.resolved_provider_binding,
+                    resolved_provider_secret: execution.resolved_provider_secret,
                     attachments: execution.attachments,
                 };
                 match execution.dispatch_preference {

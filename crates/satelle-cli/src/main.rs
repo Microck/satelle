@@ -550,9 +550,17 @@ struct SelfUpdateCommand {
 struct RunCommand {
     #[arg(long)]
     host: Option<String>,
-    #[arg(long, value_name = "ALIAS")]
+    #[arg(
+        long,
+        value_name = "ALIAS",
+        help = "Model alias; must resolve with the effective provider alias as one exact Host Provider Binding pair"
+    )]
     model: Option<String>,
-    #[arg(long, value_name = "ALIAS")]
+    #[arg(
+        long,
+        value_name = "ALIAS",
+        help = "Provider alias; must resolve with the effective model alias as one exact Host Provider Binding pair"
+    )]
     provider: Option<String>,
     #[arg(long)]
     detach: bool,
@@ -614,9 +622,17 @@ struct SteerCommand {
     session_id: String,
     #[arg(long)]
     host: Option<String>,
-    #[arg(long, value_name = "ALIAS")]
+    #[arg(
+        long,
+        value_name = "ALIAS",
+        help = "Model alias; must resolve with the effective provider alias as one exact Host Provider Binding pair"
+    )]
     model: Option<String>,
-    #[arg(long, value_name = "ALIAS")]
+    #[arg(
+        long,
+        value_name = "ALIAS",
+        help = "Provider alias; must resolve with the effective model alias as one exact Host Provider Binding pair"
+    )]
     provider: Option<String>,
     #[arg(long)]
     detach: bool,
@@ -7140,6 +7156,13 @@ fn steer_prompt(
     ) {
         Ok(validation) => validation,
         Err(error) => {
+            let error = if host.config.transport == satelle_core::TransportKind::Direct
+                && error.code == ErrorCode::HostUnreachable
+            {
+                SatelleError::direct_daemon_unreachable(&host.alias)
+            } else {
+                error
+            };
             let validation_failure = failure(error);
             if !command.detach {
                 event_output
