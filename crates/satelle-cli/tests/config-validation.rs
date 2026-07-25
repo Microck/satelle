@@ -30,9 +30,12 @@ model_provider = "custom"
         .code(66)
         .get_output()
         .clone();
-    assert_eq!(
-        parse_json(&invalid_provider.stderr)["code"],
-        "configuration-error"
+    let invalid_provider = parse_json(&invalid_provider.stderr);
+    assert_eq!(invalid_provider["code"], "configuration-error");
+    assert!(
+        invalid_provider["message"].as_str().is_some_and(
+            |message| message.contains("hosts.local.provider_bindings.invalid provider")
+        )
     );
 
     fixture.write_user_config(
@@ -55,10 +58,11 @@ model_provider = "custom"
         .code(66)
         .get_output()
         .clone();
-    assert_eq!(
-        parse_json(&invalid_model.stderr)["code"],
-        "configuration-error"
-    );
+    let invalid_model = parse_json(&invalid_model.stderr);
+    assert_eq!(invalid_model["code"], "configuration-error");
+    assert!(invalid_model["message"].as_str().is_some_and(|message| {
+        message.contains("hosts.local.provider_bindings.custom.invalid model")
+    }));
 }
 
 #[test]
