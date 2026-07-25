@@ -2278,8 +2278,12 @@ fn local_turn_request_provider_intent_reaches_host_preflight() {
     .unwrap();
     let transport = LocalTransport::new(LOCAL_DEMO_HOST.to_string(), service);
     transport
-        .authorize_provider_binding(
-            &satelle_core::ProviderBindingAuthorization::new(
+        .service
+        .authorize_provider_binding_without_validation_for_tests(
+            LOCAL_DEMO_HOST,
+            "model-explicit",
+            "provider-explicit",
+            satelle_core::ProviderBindingAuthorization::new(
                 "model-explicit",
                 "provider-explicit",
                 "resolved-model",
@@ -2287,7 +2291,7 @@ fn local_turn_request_provider_intent_reaches_host_preflight() {
             )
             .with_experimental_provider_computer_use(true),
         )
-        .expect("authorize the exact aliases before Host preflight");
+        .expect("seed the exact aliases for this turn-preflight fixture");
     let request = TurnRequest::new("provider intent probe").with_provider_intent(
         Some("model-explicit".to_string()),
         Some("provider-explicit".to_string()),
@@ -2311,18 +2315,21 @@ fn local_turn_request_provider_intent_reaches_host_preflight() {
 }
 
 #[test]
-fn turn_request_wire_carries_only_provider_aliases_and_refresh_intent() {
-    let request = TurnRequest::new("alias-only wire probe").with_provider_intent(
-        Some("model-alias".to_string()),
-        Some("provider-alias".to_string()),
-        true,
-    );
+fn turn_request_wire_carries_only_provider_aliases_refresh_and_one_shot_opt_in() {
+    let request = TurnRequest::new("alias-only wire probe")
+        .with_provider_intent(
+            Some("model-alias".to_string()),
+            Some("provider-alias".to_string()),
+            true,
+        )
+        .with_experimental_provider_computer_use(true);
     let wire = serde_json::to_value(&request).expect("serialize Turn request");
     let wire = wire.as_object().expect("Turn request wire object");
 
     assert_eq!(wire["model"], "model-alias");
     assert_eq!(wire["provider"], "provider-alias");
     assert_eq!(wire["refresh_provider_smoke_test"], true);
+    assert_eq!(wire["experimental_provider_computer_use"], true);
     for forbidden in [
         "provider_binding_candidate",
         "model_provider",
@@ -2340,7 +2347,7 @@ fn turn_request_wire_carries_only_provider_aliases_and_refresh_intent() {
 }
 
 #[test]
-fn setup_authorization_is_revalidated_by_alias_before_alias_only_turn_preflight() {
+fn stored_authorization_is_revalidated_by_alias_before_alias_only_turn_preflight() {
     let state = TestStateDir::new().expect("temporary state directory");
     let observed = Arc::new(Mutex::new(None));
     let service = HostService::with_adapter_for_tests_at(
@@ -2355,13 +2362,20 @@ fn setup_authorization_is_revalidated_by_alias_before_alias_only_turn_preflight(
         satelle_core::ProviderBindingAuthorization::new("review", "openai", "gpt-5.2", "openai");
 
     transport
-        .authorize_provider_binding(&authorization)
-        .expect("setup authorizes the alias-scoped Provider Binding");
+        .service
+        .authorize_provider_binding_without_validation_for_tests(
+            LOCAL_DEMO_HOST,
+            "review",
+            "openai",
+            authorization,
+        )
+        .expect("seed the alias-scoped Provider Binding");
     let validation = transport
         .validate_provider_descriptor(
             "review",
             "openai",
             satelle_core::ProviderAuthValidationMode::Cached,
+            false,
         )
         .expect("the distinct post-setup preflight resolves the authorized aliases");
     let resolved =
@@ -2840,6 +2854,7 @@ fn host_provider_validation_drives_conflicting_controller_projection() {
             "review",
             "openai",
             satelle_core::ProviderAuthValidationMode::Cached,
+            controller_selection.experimental_provider_computer_use,
         )
         .expect("validate the requested aliases over HTTP");
 
@@ -2850,11 +2865,11 @@ fn host_provider_validation_drives_conflicting_controller_projection() {
         satelle_core::ProviderBindingSource::UserConfig
     );
     assert!(
-        !validation
+        validation
             .resolved_binding
             .experimental_provider_computer_use()
     );
-    assert!(!projected_experimental_provider_computer_use(
+    assert!(projected_experimental_provider_computer_use(
         &controller_selection,
         Some(&validation),
     ));

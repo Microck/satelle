@@ -2257,6 +2257,7 @@ fn run_setup(
                     model_alias,
                     provider_alias,
                     satelle_core::ProviderAuthValidationMode::Cached,
+                    provider_selection.experimental_provider_computer_use,
                 ) {
                     Ok(validation) => {
                         provider_auth_validation = accept_setup_provider_auth_validation(
@@ -2490,6 +2491,7 @@ fn run_setup(
                 model_alias,
                 provider_alias,
                 satelle_core::ProviderAuthValidationMode::Cached,
+                provider_selection.experimental_provider_computer_use,
             ) {
                 Ok(validation) => {
                     provider_auth_validation = accept_setup_provider_auth_validation(
@@ -2516,40 +2518,20 @@ fn run_setup(
                 provider_transport
                     .authorize_provider_binding(authorization)
                     .map_err(failure)?;
-                let validation = (|| {
-                    let validation = provider_transport
-                        .validate_provider_descriptor(
-                            authorization.requested_model_alias(),
-                            authorization.requested_provider_alias(),
-                            satelle_core::ProviderAuthValidationMode::RefreshProviderSmoke,
-                        )
-                        .map_err(failure)?;
-                    accept_setup_provider_auth_validation(
-                        &mut report,
-                        &provider_selection,
-                        validation,
+                let validation = provider_transport
+                    .validate_provider_descriptor(
+                        authorization.requested_model_alias(),
+                        authorization.requested_provider_alias(),
+                        satelle_core::ProviderAuthValidationMode::Cached,
+                        authorization.experimental_provider_computer_use(),
                     )
-                })();
-                let validation = match validation {
-                    Ok(validation) => validation,
-                    Err(error) => {
-                        provider_transport
-                            .delete_provider_binding(
-                                authorization.requested_model_alias(),
-                                authorization.requested_provider_alias(),
-                            )
-                            .map_err(failure)?;
-                        return Err(error);
-                    }
-                };
-                if validation.is_none() {
-                    provider_transport
-                        .delete_provider_binding(
-                            authorization.requested_model_alias(),
-                            authorization.requested_provider_alias(),
-                        )
-                        .map_err(failure)?;
-                } else {
+                    .map_err(failure)?;
+                let validation = accept_setup_provider_auth_validation(
+                    &mut report,
+                    &provider_selection,
+                    validation,
+                )?;
+                if validation.is_some() {
                     if let Some((auth_source_name, descriptor)) = &pending_provider_auth
                         && let Err(error) = persist_provider_auth_descriptor(
                             &user_config_path,
@@ -2558,12 +2540,6 @@ fn run_setup(
                             descriptor,
                         )
                     {
-                        provider_transport
-                            .delete_provider_binding(
-                                authorization.requested_model_alias(),
-                                authorization.requested_provider_alias(),
-                            )
-                            .map_err(failure)?;
                         return Err(failure(error));
                     }
                     if let Some((auth_source_name, descriptor)) = &pending_provider_auth {
@@ -6790,7 +6766,7 @@ fn image_loader_rejects_unsupported_media_and_oversized_files() {
 }
 
 #[test]
-fn turn_request_construction_carries_only_provider_aliases_and_refresh() {
+fn turn_request_construction_carries_provider_aliases_refresh_and_one_shot_opt_in() {
     let candidate =
         ProviderBindingAuthorization::new("vision", "anthropic", "claude-sonnet", "anthropic")
             .with_endpoint("https://provider.example.test")
@@ -6819,12 +6795,13 @@ fn turn_request_construction_carries_only_provider_aliases_and_refresh() {
     assert_eq!(
         serde_json::to_value(request).expect("TurnRequest should serialize"),
         json!({
-            "schema_version": "satelle.api.v5",
+            "schema_version": "satelle.api.v6",
             "prompt": "inspect the desktop",
             "execution_mode": "standard",
             "model": "vision",
             "provider": "anthropic",
             "refresh_provider_smoke_test": true,
+            "experimental_provider_computer_use": true,
             "turn_execution_timeout_ms": satelle_core::DEFAULT_TURN_EXECUTION_TIMEOUT_MS,
         })
     );
@@ -6925,6 +6902,7 @@ fn run_prompt(
             .as_deref()
             .unwrap_or("codex-default"),
         satelle_core::ProviderAuthValidationMode::Cached,
+        provider_selection.experimental_provider_computer_use,
     ) {
         Ok(validation) => validation,
         Err(error) => {
@@ -7153,6 +7131,7 @@ fn steer_prompt(
             .as_deref()
             .unwrap_or("codex-default"),
         satelle_core::ProviderAuthValidationMode::Cached,
+        provider_selection.experimental_provider_computer_use,
     ) {
         Ok(validation) => validation,
         Err(error) => {
@@ -7317,6 +7296,9 @@ fn build_turn_request(
             provider_selection.requested_model_alias.clone(),
             provider_selection.requested_provider_alias.clone(),
             refresh_provider_smoke_test,
+        )
+        .with_experimental_provider_computer_use(
+            provider_selection.experimental_provider_computer_use,
         )
         .with_turn_execution_timeout_ms(turn_execution_timeout_ms)
 }

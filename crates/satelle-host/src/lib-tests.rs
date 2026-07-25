@@ -1190,10 +1190,8 @@ fn provider_descriptor_validation_resolves_only_during_target_host_refresh() {
         bootstrap_maintenance: Arc::new(Mutex::new(None)),
     };
     service
-        .authorize_provider_binding(
-            LOCAL_DEMO_HOST,
-            "review",
-            "openai",
+        .runtime
+        .authorize_provider_binding(&satelle_core::ResolvedProviderBinding::from_authorization(
             satelle_core::ProviderBindingAuthorization::new(
                 "review",
                 "openai",
@@ -1205,8 +1203,9 @@ fn provider_descriptor_validation_resolves_only_during_target_host_refresh() {
                 path: secret_path.clone(),
             })
             .with_experimental_provider_computer_use(true),
-        )
-        .expect("authorization stores only the provider descriptor");
+            satelle_core::ProviderBindingSource::UserConfig,
+        ))
+        .expect("seed the provider descriptor for validation");
 
     let cached = service
         .validate_provider_descriptor(
@@ -1214,6 +1213,7 @@ fn provider_descriptor_validation_resolves_only_during_target_host_refresh() {
             "review",
             "openai",
             satelle_core::ProviderAuthValidationMode::Cached,
+            false,
         )
         .expect("cached validation remains observation-only");
     assert_eq!(
@@ -1235,6 +1235,7 @@ fn provider_descriptor_validation_resolves_only_during_target_host_refresh() {
             "review",
             "openai",
             satelle_core::ProviderAuthValidationMode::RefreshProviderSmoke,
+            false,
         )
         .expect("live validation resolves at the target Host");
     assert_eq!(
@@ -1257,6 +1258,7 @@ fn provider_descriptor_validation_resolves_only_during_target_host_refresh() {
             "review",
             "openai",
             satelle_core::ProviderAuthValidationMode::RefreshProviderSmoke,
+            false,
         )
         .expect("live validation reports a closed unresolved outcome");
     assert_eq!(
@@ -1304,10 +1306,8 @@ fn failed_upstream_validation_returns_only_the_closed_smoke_failed_outcome() {
         bootstrap_maintenance: Arc::new(Mutex::new(None)),
     };
     service
-        .authorize_provider_binding(
-            LOCAL_DEMO_HOST,
-            "review",
-            "openai",
+        .runtime
+        .authorize_provider_binding(&satelle_core::ResolvedProviderBinding::from_authorization(
             satelle_core::ProviderBindingAuthorization::new(
                 "review",
                 "openai",
@@ -1315,8 +1315,9 @@ fn failed_upstream_validation_returns_only_the_closed_smoke_failed_outcome() {
                 "openai",
             )
             .with_auth_source(satelle_core::ProviderSecretSource::File { path: secret_path }),
-        )
-        .expect("authorize provider binding before failed smoke");
+            satelle_core::ProviderBindingSource::UserConfig,
+        ))
+        .expect("seed provider binding before failed smoke");
 
     let validation = service
         .validate_provider_descriptor(
@@ -1324,6 +1325,7 @@ fn failed_upstream_validation_returns_only_the_closed_smoke_failed_outcome() {
             "review",
             "openai",
             satelle_core::ProviderAuthValidationMode::RefreshProviderSmoke,
+            false,
         )
         .expect("upstream smoke failure must become a closed validation outcome");
     assert_eq!(
@@ -1440,6 +1442,7 @@ fn named_missing_provider_descriptor_remains_observable_to_cached_validation() {
             "review",
             "openai",
             satelle_core::ProviderAuthValidationMode::Cached,
+            false,
         )
         .expect("cached validation must classify the missing descriptor");
     assert_eq!(
@@ -1464,6 +1467,7 @@ fn provider_binding_without_auth_source_is_resolved_by_cached_validation() {
             "review",
             "openai",
             satelle_core::ProviderAuthValidationMode::Cached,
+            false,
         )
         .expect("cached validation must accept a binding that requires no secret");
     assert_eq!(

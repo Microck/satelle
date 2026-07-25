@@ -2841,6 +2841,57 @@ fn authorized_provider_binding_tampered_digest_fails_closed() {
 }
 
 #[test]
+fn provider_binding_compare_and_swap_preserves_a_concurrent_replacement() {
+    let state = TempDir::new().expect("create state directory");
+    let (mut storage, _) = Storage::open(state.path()).expect("open storage");
+    let initial = satelle_core::ResolvedProviderBinding::from_authorization(
+        satelle_core::ProviderBindingAuthorization::new(
+            "review-model",
+            "review-provider",
+            "gpt-initial",
+            "openai",
+        ),
+        satelle_core::ProviderBindingSource::UserConfig,
+    );
+    storage
+        .authorize_provider_binding(&initial, at(1))
+        .expect("authorize initial provider binding");
+    let concurrent = satelle_core::ResolvedProviderBinding::from_authorization(
+        satelle_core::ProviderBindingAuthorization::new(
+            "review-model",
+            "review-provider",
+            "gpt-concurrent",
+            "openai",
+        ),
+        satelle_core::ProviderBindingSource::UserConfig,
+    );
+    storage
+        .authorize_provider_binding(&concurrent, at(2))
+        .expect("commit concurrent provider replacement");
+    let stale = satelle_core::ResolvedProviderBinding::from_authorization(
+        satelle_core::ProviderBindingAuthorization::new(
+            "review-model",
+            "review-provider",
+            "gpt-stale",
+            "openai",
+        ),
+        satelle_core::ProviderBindingSource::UserConfig,
+    );
+
+    let error = storage
+        .authorize_provider_binding_if_unchanged(&stale, Some(initial.binding_digest()), at(3))
+        .expect_err("a stale replacement must not overwrite the current binding");
+    assert_eq!(error.kind(), StorageErrorKind::StateConflict);
+    assert_eq!(
+        storage
+            .load_authorized_provider_binding("review-model", "review-provider")
+            .expect("load current provider binding")
+            .expect("current provider binding exists"),
+        concurrent
+    );
+}
+
+#[test]
 fn operational_fingerprints_reject_non_digest_values() {
     let key = readiness_key("fingerprint-rejection");
     let error = ReadinessCacheKey::new(

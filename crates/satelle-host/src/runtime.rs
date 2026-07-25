@@ -117,6 +117,25 @@ impl ProviderBindingResolution {
             } => Err(provider_secret_source_missing(&auth_source_name)),
         }
     }
+
+    fn with_experimental_provider_computer_use(self, requested: bool) -> Self {
+        match self {
+            Self::Ready(binding) => {
+                let enabled = binding.experimental_provider_computer_use() || requested;
+                Self::Ready(binding.with_experimental_provider_computer_use(enabled))
+            }
+            Self::MissingDescriptor {
+                binding,
+                auth_source_name,
+            } => {
+                let enabled = binding.experimental_provider_computer_use() || requested;
+                Self::MissingDescriptor {
+                    binding: binding.with_experimental_provider_computer_use(enabled),
+                    auth_source_name,
+                }
+            }
+        }
+    }
 }
 
 /// Exclusive in-process authority for one live setup or repair operation.
@@ -1122,10 +1141,22 @@ impl RuntimeEngine {
         &self,
         provider_intent: &ProviderComputerUseIntent,
     ) -> Result<ProviderComputerUseIntent, SatelleError> {
+        if let Some(binding) = provider_intent.resolved_provider_binding() {
+            let effective_binding = binding.clone().with_experimental_provider_computer_use(
+                binding.experimental_provider_computer_use()
+                    || provider_intent.experimental_provider_computer_use(),
+            );
+            return Ok(provider_intent
+                .clone()
+                .with_resolved_provider_binding(effective_binding));
+        }
         let Some(resolution) = self.resolve_requested_provider_binding(provider_intent)? else {
             return Ok(provider_intent.clone());
         };
         let binding = resolution.into_ready()?;
+        let enabled = binding.experimental_provider_computer_use()
+            || provider_intent.experimental_provider_computer_use();
+        let binding = binding.with_experimental_provider_computer_use(enabled);
         Ok(provider_intent
             .clone()
             .with_resolved_provider_binding(binding))
@@ -1220,19 +1251,51 @@ impl RuntimeEngine {
         provider_intent: &ProviderComputerUseIntent,
     ) -> Result<ProviderBindingResolution, SatelleError> {
         if let Some(resolution) = self.resolve_requested_provider_binding(provider_intent)? {
-            return Ok(resolution);
+            return Ok(resolution.with_experimental_provider_computer_use(
+                provider_intent.experimental_provider_computer_use(),
+            ));
         }
         self.adapter
             .resolve_provider_binding(host, provider_intent)
-            .map(ProviderBindingResolution::Ready)
+            .map(|binding| {
+                ProviderBindingResolution::Ready(binding.with_experimental_provider_computer_use(
+                    provider_intent.experimental_provider_computer_use(),
+                ))
+            })
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn authorize_provider_binding(
         &self,
         binding: &ResolvedProviderBinding,
     ) -> Result<(), SatelleError> {
         self.lock_storage()?
             .authorize_provider_binding(binding, time::OffsetDateTime::now_utc())
+            .map_err(model::storage_failure)
+    }
+
+    pub(crate) fn provider_binding_digest(
+        &self,
+        model_alias: &str,
+        provider_alias: &str,
+    ) -> Result<Option<String>, SatelleError> {
+        self.lock_storage()?
+            .load_authorized_provider_binding(model_alias, provider_alias)
+            .map(|binding| binding.map(|binding| binding.binding_digest().to_string()))
+            .map_err(model::storage_failure)
+    }
+
+    pub(crate) fn authorize_provider_binding_if_unchanged(
+        &self,
+        binding: &ResolvedProviderBinding,
+        expected_previous_digest: Option<&str>,
+    ) -> Result<(), SatelleError> {
+        self.lock_storage()?
+            .authorize_provider_binding_if_unchanged(
+                binding,
+                expected_previous_digest,
+                time::OffsetDateTime::now_utc(),
+            )
             .map_err(model::storage_failure)
     }
 
@@ -2337,11 +2400,30 @@ impl RuntimeHandle {
             .resolve_provider_binding(host, provider_intent)
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn authorize_provider_binding(
         &self,
         binding: &ResolvedProviderBinding,
     ) -> Result<(), SatelleError> {
         self.engine()?.authorize_provider_binding(binding)
+    }
+
+    pub(crate) fn provider_binding_digest(
+        &self,
+        model_alias: &str,
+        provider_alias: &str,
+    ) -> Result<Option<String>, SatelleError> {
+        self.engine()?
+            .provider_binding_digest(model_alias, provider_alias)
+    }
+
+    pub(crate) fn authorize_provider_binding_if_unchanged(
+        &self,
+        binding: &ResolvedProviderBinding,
+        expected_previous_digest: Option<&str>,
+    ) -> Result<(), SatelleError> {
+        self.engine()?
+            .authorize_provider_binding_if_unchanged(binding, expected_previous_digest)
     }
 
     pub(crate) fn delete_provider_binding(
@@ -2586,6 +2668,8 @@ impl RuntimeHandle {
     pub(crate) fn authorize_provider_binding_idempotent<F>(
         &self,
         identity: &RequestIdentity,
+        model_alias: &str,
+        provider_alias: &str,
         validate: F,
     ) -> Result<PublicResolvedProviderBinding, SatelleError>
     where
@@ -2597,13 +2681,27 @@ impl RuntimeHandle {
             identity,
             completed_at,
         )?;
-        let replay = self
-            .engine()?
+        let engine = self.engine()?;
+        if let Some(replay) = engine
+            .lock_storage()?
+            .provider_binding_authorization_replay(&idempotency)
+            .map_err(model::storage_failure)?
+        {
+            return match replay {
+                ProviderBindingAuthorizationReplay::Completed(binding) => Ok(binding),
+                ProviderBindingAuthorizationReplay::Failed(error) => Err(error),
+            };
+        }
+        let expected_previous_digest =
+            engine.provider_binding_digest(model_alias, provider_alias)?;
+        let validation = validate();
+        let replay = engine
             .lock_storage()?
             .authorize_provider_binding_idempotent(
                 &idempotency,
+                expected_previous_digest.as_deref(),
                 completed_at,
-                validate,
+                || validation,
                 model::storage_failure_ref,
             )
             .map_err(model::storage_failure)?;

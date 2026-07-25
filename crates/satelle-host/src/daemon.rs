@@ -217,6 +217,13 @@ impl TurnIntent {
         Ok(self)
     }
 
+    pub fn with_experimental_provider_computer_use(mut self, enabled: bool) -> Self {
+        self.provider_intent = self
+            .provider_intent
+            .with_experimental_provider_computer_use(enabled);
+        self
+    }
+
     pub fn with_turn_execution_timeout_ms(
         mut self,
         timeout_ms: Option<u64>,
@@ -385,12 +392,15 @@ struct CanonicalProviderDescriptorValidation<'a> {
     model_alias: &'a str,
     provider_alias: &'a str,
     mode: ProviderAuthValidationMode,
+    experimental_provider_computer_use: bool,
 }
 
 #[derive(Serialize)]
 struct CanonicalProviderBindingAuthorization<'a> {
     operation: &'static str,
     host: &'a str,
+    model_alias: &'a str,
+    provider_alias: &'a str,
     authorization: &'a satelle_core::ProviderBindingAuthorization,
 }
 
@@ -733,6 +743,7 @@ impl HostService {
         model_alias: &str,
         provider_alias: &str,
         mode: ProviderAuthValidationMode,
+        experimental_provider_computer_use: bool,
         authority: &MutationAuthority,
     ) -> Result<PublicProviderDescriptorValidation, SatelleError> {
         let canonical_payload = canonical_payload(
@@ -742,6 +753,7 @@ impl HostService {
                 model_alias,
                 provider_alias,
                 mode,
+                experimental_provider_computer_use,
             },
             PROVIDER_DESCRIPTOR_VALIDATION_DIGEST_SCHEMA_VERSION,
         )?;
@@ -759,15 +771,20 @@ impl HostService {
         {
             return Ok(replay);
         }
-        let validation =
-            match self.validate_provider_descriptor(host, model_alias, provider_alias, mode) {
-                Ok(validation) => validation,
-                Err(error) => {
-                    self.runtime
-                        .fail_provider_descriptor_validation(&identity, &error)?;
-                    return Err(error);
-                }
-            };
+        let validation = match self.validate_provider_descriptor(
+            host,
+            model_alias,
+            provider_alias,
+            mode,
+            experimental_provider_computer_use,
+        ) {
+            Ok(validation) => validation,
+            Err(error) => {
+                self.runtime
+                    .fail_provider_descriptor_validation(&identity, &error)?;
+                return Err(error);
+            }
+        };
         let public_validation = PublicProviderDescriptorValidation::from(&validation);
         self.runtime
             .complete_provider_descriptor_validation(&identity, &public_validation)?;
@@ -786,6 +803,8 @@ impl HostService {
             &CanonicalProviderBindingAuthorization {
                 operation: "provider_binding_authorization",
                 host,
+                model_alias,
+                provider_alias,
                 authorization: &authorization,
             },
             PROVIDER_BINDING_MUTATION_DIGEST_SCHEMA_VERSION,
@@ -798,15 +817,21 @@ impl HostService {
             canonical_payload.as_slice(),
             canonical_payload.digest_schema_version,
         )?;
-        self.runtime
-            .authorize_provider_binding_idempotent(&identity, || {
-                self.prepare_provider_binding_authorization(
+        self.runtime.authorize_provider_binding_idempotent(
+            &identity,
+            model_alias,
+            provider_alias,
+            || {
+                let binding = self.prepare_provider_binding_authorization(
                     host,
                     model_alias,
                     provider_alias,
                     authorization,
-                )
-            })
+                )?;
+                self.validate_provider_binding_candidate(host, &binding)
+                    .map(|()| binding)
+            },
+        )
     }
 
     pub fn delete_provider_binding_idempotent(
@@ -1355,6 +1380,24 @@ impl HostService {
             bootstrap_auth: None,
             bootstrap_maintenance: std::sync::Arc::new(std::sync::Mutex::new(None)),
         })
+    }
+
+    #[doc(hidden)]
+    #[cfg(feature = "test-support")]
+    pub fn authorize_provider_binding_without_validation_for_tests(
+        &self,
+        host: &str,
+        model_alias: &str,
+        provider_alias: &str,
+        authorization: satelle_core::ProviderBindingAuthorization,
+    ) -> Result<(), SatelleError> {
+        let binding = self.prepare_provider_binding_authorization(
+            host,
+            model_alias,
+            provider_alias,
+            authorization,
+        )?;
+        self.runtime.authorize_provider_binding(&binding)
     }
 }
 

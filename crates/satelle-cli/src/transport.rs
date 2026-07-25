@@ -243,16 +243,12 @@ pub(crate) trait TransportClient {
         &self,
         authorization: &satelle_core::ProviderBindingAuthorization,
     ) -> Result<satelle_core::PublicResolvedProviderBinding, SatelleError>;
-    fn delete_provider_binding(
-        &self,
-        model_alias: &str,
-        provider_alias: &str,
-    ) -> Result<bool, SatelleError>;
     fn validate_provider_descriptor(
         &self,
         model_alias: &str,
         provider_alias: &str,
         mode: satelle_core::ProviderAuthValidationMode,
+        experimental_provider_computer_use: bool,
     ) -> Result<ProviderDescriptorValidationReport, SatelleError>;
     fn host_status(&self) -> Result<HostStatus, SatelleError>;
     fn host_sessions(&self, no_bootstrap: bool) -> Result<HostSessionsReport, SatelleError>;
@@ -577,12 +573,14 @@ impl TransportClient for LocalTransport {
         model_alias: &str,
         provider_alias: &str,
         mode: satelle_core::ProviderAuthValidationMode,
+        experimental_provider_computer_use: bool,
     ) -> Result<ProviderDescriptorValidationReport, SatelleError> {
         let validation = self.service.validate_provider_descriptor(
             &self.alias,
             model_alias,
             provider_alias,
             mode,
+            experimental_provider_computer_use,
         )?;
         Ok(ProviderDescriptorValidationReport {
             resolved_binding: satelle_core::PublicResolvedProviderBinding::from(
@@ -604,15 +602,6 @@ impl TransportClient for LocalTransport {
                 authorization.clone(),
             )
             .map(|binding| satelle_core::PublicResolvedProviderBinding::from(&binding))
-    }
-
-    fn delete_provider_binding(
-        &self,
-        model_alias: &str,
-        provider_alias: &str,
-    ) -> Result<bool, SatelleError> {
-        self.service
-            .delete_provider_binding(model_alias, provider_alias)
     }
 
     fn host_status(&self) -> Result<HostStatus, SatelleError> {
@@ -780,6 +769,11 @@ fn local_turn_intent(request: &TurnRequest) -> Result<satelle_host::TurnIntent, 
                 request.refresh_provider_smoke_test(),
             )?;
             Ok(intent)
+        })
+        .map(|intent| {
+            intent.with_experimental_provider_computer_use(
+                request.experimental_provider_computer_use(),
+            )
         })
         .and_then(|intent| {
             intent.with_turn_execution_timeout_ms(request.turn_execution_timeout_ms())
@@ -3173,6 +3167,7 @@ impl TransportClient for SshSetupTransport {
         _model_alias: &str,
         _provider_alias: &str,
         _mode: satelle_core::ProviderAuthValidationMode,
+        _experimental_provider_computer_use: bool,
     ) -> Result<ProviderDescriptorValidationReport, SatelleError> {
         Err(self.unsupported("provider descriptor validation"))
     }
@@ -3182,14 +3177,6 @@ impl TransportClient for SshSetupTransport {
         _authorization: &satelle_core::ProviderBindingAuthorization,
     ) -> Result<satelle_core::PublicResolvedProviderBinding, SatelleError> {
         Err(self.unsupported("provider binding authorization"))
-    }
-
-    fn delete_provider_binding(
-        &self,
-        _model_alias: &str,
-        _provider_alias: &str,
-    ) -> Result<bool, SatelleError> {
-        Err(self.unsupported("provider binding deletion"))
     }
 
     fn host_status(&self) -> Result<HostStatus, SatelleError> {
@@ -3280,13 +3267,15 @@ impl TransportClient for DirectTransport {
         model_alias: &str,
         provider_alias: &str,
         mode: satelle_core::ProviderAuthValidationMode,
+        experimental_provider_computer_use: bool,
     ) -> Result<ProviderDescriptorValidationReport, SatelleError> {
         let response = self
             .client
             .validate_provider_descriptor(
                 provider_alias,
                 model_alias,
-                &satelle_transport::ProviderDescriptorValidationRequest::new(mode),
+                &satelle_transport::ProviderDescriptorValidationRequest::new(mode)
+                    .with_experimental_provider_computer_use(experimental_provider_computer_use),
                 &format!("provider-validation-{}", Uuid::now_v7()),
             )
             .map_err(|error| direct_transport_error(&self.alias, error))?;
@@ -3308,21 +3297,6 @@ impl TransportClient for DirectTransport {
                 &format!("provider-authorization-{}", Uuid::now_v7()),
             )
             .map(|response| response.binding().clone())
-            .map_err(|error| direct_transport_error(&self.alias, error))
-    }
-
-    fn delete_provider_binding(
-        &self,
-        model_alias: &str,
-        provider_alias: &str,
-    ) -> Result<bool, SatelleError> {
-        self.client
-            .delete_provider_binding(
-                provider_alias,
-                model_alias,
-                &format!("provider-deletion-{}", Uuid::now_v7()),
-            )
-            .map(|response| response.deleted())
             .map_err(|error| direct_transport_error(&self.alias, error))
     }
 

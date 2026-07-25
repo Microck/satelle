@@ -981,7 +981,7 @@ async fn bearer_tokens_outside_authorization_are_rejected() {
             .mutation("/v1/sessions", "01890a5d-ac96-7b7c-8f89-37c3d0a66ec2")
             .header("Content-Type", "application/json")
             .body(format!(
-                r#"{{"schema_version":"satelle.api.v5","prompt":"{token}","prompt":"safe","execution_mode":"standard"}}"#
+                r#"{{"schema_version":"satelle.api.v6","prompt":"{token}","prompt":"safe","execution_mode":"standard"}}"#
             )),
     ];
 

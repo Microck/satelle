@@ -796,6 +796,14 @@ impl ResolvedProviderBinding {
         self.experimental_provider_computer_use
     }
 
+    pub fn with_experimental_provider_computer_use(mut self, enabled: bool) -> Self {
+        if enabled != self.experimental_provider_computer_use {
+            self.experimental_provider_computer_use = enabled;
+            self.binding_digest = self.compute_binding_digest();
+        }
+        self
+    }
+
     pub fn binding_digest(&self) -> &str {
         &self.binding_digest
     }

@@ -122,7 +122,7 @@ async fn validation_rejects_descriptor_material_and_control_cannot_authorize() {
     let descriptor = control
         .mutation(VALIDATION_PATH, "provider-validation-descriptor")
         .json(&serde_json::json!({
-            "schema_version": "satelle.provider-binding-validation.v3",
+            "schema_version": "satelle.provider-binding-validation.v4",
             "mode": "cached",
             "endpoint": "https://attacker.example",
             "raw_secret": raw_secret
@@ -270,6 +270,19 @@ async fn provider_binding_mutation_replay_and_conflict_survive_restart() {
         .await
         .expect("decode authorization replay");
     assert_eq!(replay.binding().model(), "gpt-5.6");
+
+    let path_conflict = bootstrap_mutation(
+        &running,
+        &bootstrap_token,
+        reqwest::Method::PUT,
+        "/v1/setup/provider-bindings/open_ai/other-model",
+        "provider-authorization-durable",
+    )
+    .json(&initial)
+    .send()
+    .await
+    .expect("send the same authorization to a different resource path");
+    assert_eq!(path_conflict.status(), StatusCode::CONFLICT);
 
     let conflict = bootstrap_mutation(
         &running,

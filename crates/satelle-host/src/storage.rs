@@ -1308,9 +1308,38 @@ impl Storage {
             .map_err(|source| sqlite_error(StorageErrorKind::OperationFailed, source))
     }
 
+    pub(crate) fn provider_binding_authorization_replay(
+        &self,
+        idempotency: &IdempotencyInput,
+    ) -> Result<Option<ProviderBindingAuthorizationReplay>, StorageError> {
+        require_operation(
+            idempotency,
+            IdempotentOperation::ProviderBindingAuthorization,
+        )?;
+        let Some(record) = matching_idempotency(&self.connection, idempotency)? else {
+            return Ok(None);
+        };
+        match (
+            record.status.as_str(),
+            record.durable_outcome.as_str(),
+            record.result_json,
+        ) {
+            (
+                "terminal",
+                "v1.provider_binding_authorization.completed"
+                | "v1.provider_binding_authorization.failed",
+                Some(result_json),
+            ) => serde_json::from_str(&result_json)
+                .map(Some)
+                .map_err(|_| StorageError::new(StorageErrorKind::InvalidStoredState)),
+            _ => Err(StorageError::new(StorageErrorKind::InvalidStoredState)),
+        }
+    }
+
     pub(crate) fn authorize_provider_binding_idempotent<V, M>(
         &mut self,
         idempotency: &IdempotencyInput,
+        expected_previous_digest: Option<&str>,
         completed_at: OffsetDateTime,
         validate: V,
         map_failure: M,
@@ -1355,11 +1384,21 @@ impl Storage {
                 let savepoint = transaction
                     .savepoint()
                     .map_err(|source| sqlite_error(StorageErrorKind::OperationFailed, source))?;
-                match Self::authorize_provider_binding_in_connection(
+                let current_digest = Self::provider_binding_digest_in_connection(
                     &savepoint,
-                    &binding,
-                    completed_at,
-                ) {
+                    binding.requested_model_alias(),
+                    binding.requested_provider_alias(),
+                )?;
+                let stored = if current_digest.as_deref() != expected_previous_digest {
+                    Err(StorageError::new(StorageErrorKind::StateConflict))
+                } else {
+                    Self::authorize_provider_binding_in_connection(
+                        &savepoint,
+                        &binding,
+                        completed_at,
+                    )
+                };
+                match stored {
                     Ok(()) => {
                         savepoint.commit().map_err(|source| {
                             sqlite_error(StorageErrorKind::OperationFailed, source)
@@ -1482,6 +1521,7 @@ impl Storage {
         Ok(replay)
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn authorize_provider_binding(
         &mut self,
         binding: &ResolvedProviderBinding,
@@ -1576,6 +1616,47 @@ impl Storage {
                 .map_err(|source| sqlite_error(StorageErrorKind::OperationFailed, source))?;
         }
         Ok(())
+    }
+
+    pub(crate) fn authorize_provider_binding_if_unchanged(
+        &mut self,
+        binding: &ResolvedProviderBinding,
+        expected_previous_digest: Option<&str>,
+        updated_at: OffsetDateTime,
+    ) -> Result<(), StorageError> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|source| sqlite_error(StorageErrorKind::OperationFailed, source))?;
+        let current_digest = Self::provider_binding_digest_in_connection(
+            &transaction,
+            binding.requested_model_alias(),
+            binding.requested_provider_alias(),
+        )?;
+        if current_digest.as_deref() != expected_previous_digest {
+            return Err(StorageError::new(StorageErrorKind::StateConflict));
+        }
+        Self::authorize_provider_binding_in_connection(&transaction, binding, updated_at)?;
+        transaction
+            .commit()
+            .map_err(|source| sqlite_error(StorageErrorKind::OperationFailed, source))
+    }
+
+    fn provider_binding_digest_in_connection(
+        connection: &Connection,
+        model_alias: &str,
+        provider_alias: &str,
+    ) -> Result<Option<String>, StorageError> {
+        connection
+            .query_row(
+                "SELECT binding_digest
+                 FROM authorized_provider_bindings
+                 WHERE provider_alias = ?1 AND model_alias = ?2",
+                rusqlite::params![provider_alias, model_alias],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|source| sqlite_error(StorageErrorKind::OperationFailed, source))
     }
 
     pub(crate) fn delete_authorized_provider_binding(

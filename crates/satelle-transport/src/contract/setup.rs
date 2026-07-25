@@ -39,7 +39,7 @@ define_schema_token!(
 );
 define_schema_token!(
     ProviderDescriptorValidationSchema,
-    "satelle.provider-binding-validation.v3"
+    "satelle.provider-binding-validation.v4"
 );
 define_schema_token!(
     ProviderDescriptorValidationResponseSchema,
@@ -122,6 +122,8 @@ impl ApiRequestContract for ProviderBindingAuthorizationRequest {
 pub struct ProviderDescriptorValidationRequest {
     schema_version: ProviderDescriptorValidationSchema,
     mode: ProviderAuthValidationMode,
+    #[serde(default, skip_serializing_if = "is_false")]
+    experimental_provider_computer_use: bool,
 }
 
 impl ProviderDescriptorValidationRequest {
@@ -129,12 +131,26 @@ impl ProviderDescriptorValidationRequest {
         Self {
             schema_version: ProviderDescriptorValidationSchema,
             mode,
+            experimental_provider_computer_use: false,
         }
     }
 
     pub const fn mode(&self) -> ProviderAuthValidationMode {
         self.mode
     }
+
+    pub fn with_experimental_provider_computer_use(mut self, enabled: bool) -> Self {
+        self.experimental_provider_computer_use = enabled;
+        self
+    }
+
+    pub const fn experimental_provider_computer_use(&self) -> bool {
+        self.experimental_provider_computer_use
+    }
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 impl ApiRequestContract for ProviderDescriptorValidationRequest {
@@ -495,13 +511,17 @@ mod provider_binding_contract_tests {
         );
 
         assert_eq!(
-            serde_json::to_value(ProviderDescriptorValidationRequest::new(
-                ProviderAuthValidationMode::RefreshProviderSmoke,
-            ))
+            serde_json::to_value(
+                ProviderDescriptorValidationRequest::new(
+                    ProviderAuthValidationMode::RefreshProviderSmoke,
+                )
+                .with_experimental_provider_computer_use(true)
+            )
             .unwrap(),
             json!({
-                "schema_version": "satelle.provider-binding-validation.v3",
-                "mode": "refresh_provider_smoke"
+                "schema_version": "satelle.provider-binding-validation.v4",
+                "mode": "refresh_provider_smoke",
+                "experimental_provider_computer_use": true
             })
         );
     }
@@ -509,7 +529,7 @@ mod provider_binding_contract_tests {
     #[test]
     fn validation_rejects_caller_binding_material() {
         let request = json!({
-            "schema_version": "satelle.provider-binding-validation.v3",
+            "schema_version": "satelle.provider-binding-validation.v4",
             "mode": "cached",
             "endpoint": "https://attacker.example"
         });

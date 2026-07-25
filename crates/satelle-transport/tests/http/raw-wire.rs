@@ -19,7 +19,7 @@ async fn chunked_oversize_body_returns_typed_413_without_admission() {
     let running = RunningServer::start(ApiScopes::CONTROL).await;
     let authorization = bearer(&running.token);
     let body = format!(
-        r#"{{"schema_version":"satelle.api.v5","prompt":"{}"}}"#,
+        r#"{{"schema_version":"satelle.api.v6","prompt":"{}"}}"#,
         "x".repeat(1_048_576)
     );
     let payload_bytes = body.len();
@@ -49,7 +49,7 @@ async fn chunked_oversize_body_returns_typed_413_without_admission() {
 async fn unauthenticated_attachment_sized_body_is_rejected_before_body_admission() {
     let running = RunningServer::start(ApiScopes::CONTROL).await;
     let body = format!(
-        r#"{{"schema_version":"satelle.api.v5","prompt":"{}"}}"#,
+        r#"{{"schema_version":"satelle.api.v6","prompt":"{}"}}"#,
         "x".repeat(1_048_576)
     );
     let head = format!(
@@ -100,7 +100,7 @@ async fn chunked_attachment_limit_and_log_privacy(trace_capture: TraceCapture) {
     let attachment_name = "PRIVATE_CHUNKED_ATTACHMENT_NAME_CANARY";
     let attachment_bytes = "PRIVATE_CHUNKED_ATTACHMENT_BYTES_CANARY";
     let body = format!(
-        r#"{{"schema_version":"satelle.api.v5","prompt":7,"execution_mode":"standard","body_canary":"{body_canary}","attachments":[{{"name":"{attachment_name}","content":"{attachment_bytes}"}}]}}"#
+        r#"{{"schema_version":"satelle.api.v6","prompt":7,"execution_mode":"standard","body_canary":"{body_canary}","attachments":[{{"name":"{attachment_name}","content":"{attachment_bytes}"}}]}}"#
     );
     let body = body.as_bytes();
     let split = body.len() / 2;
@@ -181,7 +181,7 @@ async fn bearer_tokens_in_http_trailers_are_rejected_without_admission() {
     assert_raw_api_error(&response, 400, "invalid-request");
 
     let body =
-        br#"{"schema_version":"satelle.api.v5","prompt":"safe","execution_mode":"standard"}"#;
+        br#"{"schema_version":"satelle.api.v6","prompt":"safe","execution_mode":"standard"}"#;
     let mutation_request = format!(
         "POST /v1/sessions HTTP/1.1\r\nHost: localhost\r\nAuthorization: {}\r\nSatelle-Expected-Host-Identity: {}\r\nSatelle-Request-Id: {}\r\nSatelle-Protocol-Version: 8\r\nIdempotency-Key: trailer-carrier\r\nContent-Type: application/json\r\nTransfer-Encoding: chunked\r\nTrailer: X-Api-Token\r\nConnection: close\r\n\r\n{:x}\r\n{}\r\n0\r\nX-Api-Token: {}\r\n\r\n",
         bearer(&running.token),
@@ -584,7 +584,7 @@ enum DuplicateHeader {
 async fn duplicate_header_case(header: DuplicateHeader, status: u16, code: &str) {
     let running = RunningServer::start(ApiScopes::CONTROL).await;
     let authorization = bearer(&running.token);
-    let body = br#"{"schema_version":"satelle.api.v5","prompt":"PRIVATE_RAW_HEADER_CANARY","execution_mode":"standard"}"#;
+    let body = br#"{"schema_version":"satelle.api.v6","prompt":"PRIVATE_RAW_HEADER_CANARY","execution_mode":"standard"}"#;
     let duplicated = match header {
         DuplicateHeader::Authorization => format!(
             "Authorization: {authorization}\r\nAuthorization: {authorization}\r\nIdempotency-Key: duplicate-auth\r\nContent-Type: application/json\r\n"

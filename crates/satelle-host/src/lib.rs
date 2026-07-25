@@ -1496,7 +1496,12 @@ impl HostService {
             provider_alias,
             authorization,
         )?;
-        self.runtime.authorize_provider_binding(&binding)?;
+        let previous_digest = self
+            .runtime
+            .provider_binding_digest(model_alias, provider_alias)?;
+        self.validate_provider_binding_candidate(host, &binding)?;
+        self.runtime
+            .authorize_provider_binding_if_unchanged(&binding, previous_digest.as_deref())?;
         Ok(binding)
     }
 
@@ -1543,6 +1548,7 @@ impl HostService {
         model_alias: &str,
         provider_alias: &str,
         mode: satelle_core::ProviderAuthValidationMode,
+        experimental_provider_computer_use: bool,
     ) -> Result<ProviderDescriptorValidation, SatelleError> {
         use satelle_core::{
             ProviderAuthObservationSource, ProviderAuthValidationMode,
@@ -1569,7 +1575,8 @@ impl HostService {
                 ),
                 matches!(mode, ProviderAuthValidationMode::RefreshProviderSmoke),
             )
-        };
+        }
+        .with_experimental_provider_computer_use(experimental_provider_computer_use);
         let (resolved_binding, deferred_outcome, deferred_source) =
             match self.resolve_provider_binding(host, &intent)? {
                 ProviderBindingResolution::Ready(binding) => {
@@ -1643,6 +1650,34 @@ impl HostService {
             resolved_binding,
             validation,
         ))
+    }
+
+    fn validate_provider_binding_candidate(
+        &self,
+        host: &str,
+        binding: &ResolvedProviderBinding,
+    ) -> Result<(), SatelleError> {
+        let intent = ProviderComputerUseIntent::new(
+            Some(
+                satelle_core::session::EffectiveModelRef::new(binding.requested_model_alias())
+                    .map_err(|_| SatelleError::config_error("the model alias is invalid", None))?,
+            ),
+            Some(
+                satelle_core::session::ProviderBindingRef::new(binding.requested_provider_alias())
+                    .map_err(|_| {
+                        SatelleError::config_error("the provider alias is invalid", None)
+                    })?,
+            ),
+            true,
+        )
+        .with_resolved_provider_binding(binding.clone());
+        let readiness = self.runtime.refresh_provider_smoke(host, &intent)?;
+        if readiness.resolved_provider_binding() != Some(binding) {
+            return Err(crate::runtime::integrity_error(
+                "provider readiness binding diverged from the authorization candidate",
+            ));
+        }
+        Ok(())
     }
 
     pub fn setup(

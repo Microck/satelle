@@ -306,6 +306,7 @@ fn turn_intent(
         model,
         provider,
         refresh_provider_smoke_test,
+        experimental_provider_computer_use,
         attachments,
         turn_execution_timeout_ms,
     } = request.into_parts();
@@ -324,6 +325,9 @@ fn turn_intent(
     TurnIntent::new(prompt, execution_mode)
         .and_then(|intent| {
             intent.with_provider_intent(model, provider, refresh_provider_smoke_test)
+        })
+        .map(|intent| {
+            intent.with_experimental_provider_computer_use(experimental_provider_computer_use)
         })
         .and_then(|intent| intent.with_turn_execution_timeout_ms(turn_execution_timeout_ms))
         .and_then(|intent| intent.with_attachments(attachments))

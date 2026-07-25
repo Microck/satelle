@@ -50,6 +50,7 @@ pub(super) async fn validate_provider_descriptor(
     ApiJson(request): ApiJson<ProviderDescriptorValidationRequest>,
 ) -> Response {
     let mode = request.mode();
+    let experimental_provider_computer_use = request.experimental_provider_computer_use();
     let service = Arc::clone(&state.service);
     let validation = match tokio::task::spawn_blocking(move || {
         service.validate_provider_descriptor_idempotent(
@@ -57,6 +58,7 @@ pub(super) async fn validate_provider_descriptor(
             &model_alias,
             &provider_alias,
             mode,
+            experimental_provider_computer_use,
             &authority,
         )
     })

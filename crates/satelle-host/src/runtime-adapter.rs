@@ -17,6 +17,7 @@ pub struct ProviderComputerUseIntent {
     model: Option<satelle_core::session::EffectiveModelRef>,
     provider: Option<satelle_core::session::ProviderBindingRef>,
     resolved_provider_binding: Option<satelle_core::ResolvedProviderBinding>,
+    experimental_provider_computer_use: bool,
     refresh: bool,
     provider_smoke_timeout: Option<std::time::Duration>,
 }
@@ -31,6 +32,7 @@ impl ProviderComputerUseIntent {
             model,
             provider,
             resolved_provider_binding: None,
+            experimental_provider_computer_use: false,
             refresh,
             provider_smoke_timeout: None,
         }
@@ -41,6 +43,11 @@ impl ProviderComputerUseIntent {
         binding: satelle_core::ResolvedProviderBinding,
     ) -> Self {
         self.resolved_provider_binding = Some(binding);
+        self
+    }
+
+    pub fn with_experimental_provider_computer_use(mut self, enabled: bool) -> Self {
+        self.experimental_provider_computer_use = enabled;
         self
     }
 
@@ -71,6 +78,10 @@ impl ProviderComputerUseIntent {
 
     pub const fn refresh(&self) -> bool {
         self.refresh
+    }
+
+    pub const fn experimental_provider_computer_use(&self) -> bool {
+        self.experimental_provider_computer_use
     }
 
     pub const fn provider_smoke_timeout(&self) -> Option<std::time::Duration> {
