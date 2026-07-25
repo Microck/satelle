@@ -154,6 +154,223 @@ fn rebuild_idempotency_records_as_pre_v11_fixture(connection: &Connection) {
         .expect("restore the exact pre-version-eleven idempotency schema");
 }
 
+fn rebuild_storage_as_version_eleven_fixture(connection: &Connection) {
+    // Lowering migration metadata alone leaves both future table shapes in
+    // place. Recreate the exact schemas that migration 12 receives.
+    connection
+        .execute_batch(
+            "DROP INDEX idempotency_expiry;
+            ALTER TABLE idempotency_records
+                RENAME TO idempotency_records_v12_fixture;
+
+            CREATE TABLE idempotency_records (
+                principal_ref TEXT NOT NULL,
+                operation TEXT NOT NULL CHECK (operation IN (
+                    'run',
+                    'steer',
+                    'stop',
+                    'setup',
+                    'repair',
+                    'host_update',
+                    'storage_migration',
+                    'destructive_maintenance'
+                )),
+                idempotency_key TEXT NOT NULL,
+                operation_id TEXT NOT NULL,
+                request_digest TEXT NOT NULL
+                    CHECK (
+                        length(request_digest) = 64
+                        AND request_digest NOT GLOB '*[^0-9a-f]*'
+                    ),
+                digest_schema_version INTEGER NOT NULL CHECK (digest_schema_version > 0),
+                hmac_key_version INTEGER NOT NULL CHECK (hmac_key_version > 0),
+                status TEXT NOT NULL CHECK (status IN ('in_progress', 'terminal')),
+                durable_outcome TEXT NOT NULL CHECK (durable_outcome IN (
+                    'v1.turn.starting',
+                    'v1.turn.running',
+                    'v1.turn.recovery_pending',
+                    'v1.turn.completed',
+                    'v1.turn.blocked',
+                    'v1.turn.failed',
+                    'v1.turn.stopped',
+                    'v1.stop.pending',
+                    'v1.stop.stopped_from_starting',
+                    'v1.stop.stopped_from_running',
+                    'v1.stop.stopped_from_recovery_pending',
+                    'v1.stop.already_completed',
+                    'v1.stop.already_blocked',
+                    'v1.stop.already_failed',
+                    'v1.stop.already_stopped',
+                    'v1.stop.not_confirmed_active_changed',
+                    'v1.stop.not_confirmed_active_unchanged',
+                    'v1.stop.not_confirmed_recovery_pending_changed',
+                    'v1.stop.not_confirmed_recovery_pending_unchanged'
+                )),
+                session_id TEXT REFERENCES sessions(session_id) ON DELETE RESTRICT,
+                turn_id TEXT REFERENCES turns(turn_id) ON DELETE RESTRICT,
+                result_session_state_revision TEXT
+                    CHECK (
+                        result_session_state_revision IS NULL
+                        OR (
+                            length(result_session_state_revision) = 16
+                            AND result_session_state_revision NOT GLOB '*[^0-9a-f]*'
+                            AND result_session_state_revision <> '0000000000000000'
+                        )
+                    ),
+                result_session_updated_at TEXT,
+                created_at TEXT NOT NULL,
+                completed_at TEXT,
+                expires_at TEXT NOT NULL,
+                FOREIGN KEY (hmac_key_version)
+                    REFERENCES idempotency_hmac_keys(key_version) ON DELETE RESTRICT,
+                PRIMARY KEY (principal_ref, operation, idempotency_key),
+                CHECK (
+                    (status = 'in_progress' AND completed_at IS NULL)
+                    OR (status = 'terminal' AND completed_at IS NOT NULL)
+                ),
+                CHECK (
+                    operation = 'stop'
+                    OR (
+                        status = 'in_progress'
+                        AND result_session_state_revision IS NULL
+                        AND result_session_updated_at IS NULL
+                    )
+                    OR (
+                        status = 'terminal'
+                        AND result_session_state_revision IS NOT NULL
+                        AND result_session_updated_at IS NOT NULL
+                    )
+                )
+            ) STRICT;
+
+            INSERT INTO idempotency_records (
+                principal_ref,
+                operation,
+                idempotency_key,
+                operation_id,
+                request_digest,
+                digest_schema_version,
+                hmac_key_version,
+                status,
+                durable_outcome,
+                session_id,
+                turn_id,
+                result_session_state_revision,
+                result_session_updated_at,
+                created_at,
+                completed_at,
+                expires_at
+            )
+            SELECT
+                principal_ref,
+                operation,
+                idempotency_key,
+                operation_id,
+                request_digest,
+                digest_schema_version,
+                hmac_key_version,
+                status,
+                durable_outcome,
+                session_id,
+                turn_id,
+                result_session_state_revision,
+                result_session_updated_at,
+                created_at,
+                completed_at,
+                expires_at
+            FROM idempotency_records_v12_fixture;
+
+            DROP TABLE idempotency_records_v12_fixture;
+            CREATE INDEX idempotency_expiry
+                ON idempotency_records(expires_at);
+
+            DROP INDEX provider_smoke_reuse;
+            ALTER TABLE provider_smoke_results
+                RENAME TO provider_smoke_results_v12_fixture;
+
+            CREATE TABLE provider_smoke_results (
+                result_id TEXT PRIMARY KEY,
+                host_identity_ref TEXT NOT NULL
+                    REFERENCES daemon_identity(host_identity_ref) ON DELETE CASCADE,
+                desktop_binding_ref TEXT NOT NULL,
+                provider_binding_ref TEXT NOT NULL,
+                effective_model_ref TEXT NOT NULL,
+                codex_version TEXT NOT NULL,
+                native_runtime_version TEXT NOT NULL,
+                provider_config_fingerprint TEXT NOT NULL,
+                status TEXT NOT NULL
+                    CHECK (status IN (
+                        'passed', 'failed', 'timed_out', 'outcome_unknown'
+                    )),
+                failure_code TEXT,
+                failure_reason TEXT,
+                observed_at INTEGER NOT NULL,
+                expires_at INTEGER NOT NULL,
+                CHECK (expires_at > observed_at),
+                CHECK (
+                    (status = 'passed'
+                        AND failure_code IS NULL
+                        AND failure_reason IS NULL)
+                    OR (
+                        status IN ('failed', 'timed_out', 'outcome_unknown')
+                        AND failure_code IS NOT NULL
+                        AND failure_reason IS NOT NULL
+                    )
+                )
+            ) STRICT;
+
+            INSERT INTO provider_smoke_results (
+                result_id,
+                host_identity_ref,
+                desktop_binding_ref,
+                provider_binding_ref,
+                effective_model_ref,
+                codex_version,
+                native_runtime_version,
+                provider_config_fingerprint,
+                status,
+                failure_code,
+                failure_reason,
+                observed_at,
+                expires_at
+            )
+            SELECT
+                result_id,
+                host_identity_ref,
+                desktop_binding_ref,
+                provider_binding_ref,
+                effective_model_ref,
+                codex_version,
+                native_runtime_version,
+                provider_config_fingerprint,
+                status,
+                failure_code,
+                failure_reason,
+                observed_at,
+                expires_at
+            FROM provider_smoke_results_v12_fixture;
+
+            DROP TABLE provider_smoke_results_v12_fixture;
+
+            CREATE INDEX provider_smoke_reuse
+            ON provider_smoke_results (
+                host_identity_ref,
+                desktop_binding_ref,
+                provider_binding_ref,
+                effective_model_ref,
+                codex_version,
+                native_runtime_version,
+                provider_config_fingerprint,
+                expires_at
+            );
+
+            DROP TABLE authorized_provider_bindings;
+            DELETE FROM schema_migrations WHERE version = 12;
+            PRAGMA user_version = 11;",
+        )
+        .expect("restore the exact version eleven storage schema");
+}
+
 #[test]
 fn operational_evidence_schema_is_migrated_atomically_to_version_twelve() {
     let state = TempDir::new().expect("temporary state directory");
@@ -194,6 +411,117 @@ fn operational_evidence_schema_is_migrated_atomically_to_version_twelve() {
         assert!(exists, "missing operational evidence table {table}");
     }
     assert!(migration_backups(state.path()).is_empty());
+}
+
+#[test]
+fn version_eleven_provider_smoke_rows_upgrade_to_credential_scoped_cache() {
+    let state = TempDir::new().expect("temporary state directory");
+    let (mut storage, _) = Storage::open(state.path()).expect("open current storage");
+    let observed_at = at(1);
+    let expires_at = at(2);
+    let desktop = DesktopBindingRef::new("migration-desktop").unwrap();
+    let policy = ExecutionPolicy::new(
+        EffectiveModelRef::new("computer-use-preview").unwrap(),
+        ProviderBindingRef::new("openai").unwrap(),
+        DesktopTarget::new(desktop.clone(), "migration-session"),
+        ApprovalPolicy::OnRequest,
+        SandboxPolicy::WorkspaceWrite,
+        TimeoutPolicy::bounded_seconds(120).unwrap(),
+        ExperimentalFeatureChoices::new(FeatureChoice::Enabled, FeatureChoice::Enabled),
+    );
+    let cache_key = ReadinessCacheKey::new(
+        "codex-native-computer-use",
+        desktop.clone(),
+        policy.clone(),
+        "0.144.0",
+        "1.0.0",
+        Some("plugin-1.0.0"),
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        ReadinessObservationState::Unknown,
+        ReadinessObservationState::Unknown,
+    )
+    .unwrap();
+    let readiness =
+        ReadinessEvidence::new(&cache_key, "migration-readiness", observed_at, expires_at).unwrap();
+    let provider = ProviderSmokeEvidence::new(
+        "legacy-provider-smoke",
+        cache_key.provider_config_fingerprint(),
+        "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+        observed_at,
+        expires_at,
+    )
+    .unwrap();
+    storage
+        .store_preflight_successes(
+            "codex-native-computer-use",
+            &desktop,
+            &policy,
+            &readiness,
+            Some(&provider),
+        )
+        .expect("store a smoke result before reconstructing version eleven");
+
+    rebuild_storage_as_version_eleven_fixture(storage.connection_for_test());
+    drop(storage);
+
+    let mut upgraded = Storage::open_without_restart_recovery(state.path())
+        .expect("upgrade the version eleven store");
+    assert_eq!(
+        12_i64,
+        pragma_integer(upgraded.connection_for_test(), "user_version")
+    );
+    let credential_columns: i64 = upgraded
+        .connection_for_test()
+        .query_row(
+            "SELECT count(*)
+             FROM pragma_table_info('provider_smoke_results')
+             WHERE name = 'provider_credential_fingerprint'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("inspect upgraded provider smoke columns");
+    assert_eq!(1_i64, credential_columns);
+    let legacy_rows: i64 = upgraded
+        .connection_for_test()
+        .query_row(
+            "SELECT count(*)
+             FROM provider_smoke_results
+             WHERE result_id = 'legacy-provider-smoke'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("inspect invalidated legacy provider smoke rows");
+    assert_eq!(
+        0_i64, legacy_rows,
+        "unscoped provider smoke evidence must not survive migration"
+    );
+    assert!(
+        upgraded
+            .load_reusable_provider_smoke(&cache_key, observed_at)
+            .expect("query invalidated legacy provider smoke")
+            .is_none()
+    );
+
+    upgraded
+        .store_preflight_successes(
+            "codex-native-computer-use",
+            &desktop,
+            &policy,
+            &readiness,
+            Some(&provider),
+        )
+        .expect("store credential-scoped evidence after migration");
+    assert_eq!(
+        Some(ProviderSmokeResult::Passed(
+            provider
+                .clone()
+                .with_source(crate::ProviderSmokeSource::Cache),
+        )),
+        upgraded
+            .load_reusable_provider_smoke(&cache_key, observed_at)
+            .expect("load credential-scoped evidence after migration")
+    );
 }
 
 #[test]
