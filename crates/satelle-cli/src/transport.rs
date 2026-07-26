@@ -28,6 +28,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use std::{fs, path::Path};
 use uuid::Uuid;
+use zeroize::Zeroizing;
 
 const SSH_DAEMON_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const SSH_DAEMON_LAUNCH_TIMEOUT: Duration = Duration::from_secs(30);
@@ -220,6 +221,20 @@ pub(crate) struct ProviderDescriptorValidationReport {
     pub(crate) validation: satelle_core::ProviderAuthValidationResult,
 }
 
+fn local_provider_secret_provisioning_required() -> SatelleError {
+    SatelleError {
+        code: ErrorCode::ProviderSecretProvisioningRequired,
+        message:
+            "provider secret provisioning requires an authenticated selected-Host transport"
+                .to_string(),
+        recovery_command: Some(
+            "satelle setup --host <host-alias> --component provider-auth".to_string(),
+        ),
+        source_detail: None,
+        details: std::collections::BTreeMap::new(),
+    }
+}
+
 fn setup_provider_intent(
     request: &satelle_transport::SetupVerificationRequest,
 ) -> Result<satelle_host::ProviderComputerUseIntent, SatelleError> {
@@ -281,6 +296,15 @@ pub(crate) trait TransportClient {
         &self,
         authorization: &satelle_core::ProviderBindingAuthorization,
     ) -> Result<satelle_core::PublicResolvedProviderBinding, SatelleError>;
+    fn preview_provider_secret_provisioning(
+        &self,
+        metadata: &satelle_transport::ProviderSecretProvisioningMetadata,
+    ) -> Result<satelle_transport::ProviderSecretProvisioningPreviewResponse, SatelleError>;
+    fn provision_provider_secret(
+        &self,
+        metadata: &satelle_transport::ProviderSecretProvisioningMetadata,
+        secret: Zeroizing<Vec<u8>>,
+    ) -> Result<satelle_transport::ProviderSecretProvisioningResponse, SatelleError>;
     fn validate_provider_descriptor(
         &self,
         model_alias: &str,
@@ -665,6 +689,21 @@ impl TransportClient for LocalTransport {
                 authorization.clone(),
             )
             .map(|binding| satelle_core::PublicResolvedProviderBinding::from(&binding))
+    }
+
+    fn preview_provider_secret_provisioning(
+        &self,
+        _metadata: &satelle_transport::ProviderSecretProvisioningMetadata,
+    ) -> Result<satelle_transport::ProviderSecretProvisioningPreviewResponse, SatelleError> {
+        Err(local_provider_secret_provisioning_required())
+    }
+
+    fn provision_provider_secret(
+        &self,
+        _metadata: &satelle_transport::ProviderSecretProvisioningMetadata,
+        _secret: Zeroizing<Vec<u8>>,
+    ) -> Result<satelle_transport::ProviderSecretProvisioningResponse, SatelleError> {
+        Err(local_provider_secret_provisioning_required())
     }
 
     fn host_status(&self) -> Result<HostStatus, SatelleError> {
@@ -3280,6 +3319,21 @@ impl TransportClient for SshSetupTransport {
         Err(self.unsupported("provider binding authorization"))
     }
 
+    fn preview_provider_secret_provisioning(
+        &self,
+        _metadata: &satelle_transport::ProviderSecretProvisioningMetadata,
+    ) -> Result<satelle_transport::ProviderSecretProvisioningPreviewResponse, SatelleError> {
+        Err(self.unsupported("provider secret provisioning preview"))
+    }
+
+    fn provision_provider_secret(
+        &self,
+        _metadata: &satelle_transport::ProviderSecretProvisioningMetadata,
+        _secret: Zeroizing<Vec<u8>>,
+    ) -> Result<satelle_transport::ProviderSecretProvisioningResponse, SatelleError> {
+        Err(self.unsupported("provider secret provisioning"))
+    }
+
     fn host_status(&self) -> Result<HostStatus, SatelleError> {
         Err(self.unsupported("host status"))
     }
@@ -3435,6 +3489,32 @@ impl TransportClient for DirectTransport {
                 &format!("provider-authorization-{}", Uuid::now_v7()),
             )
             .map(|response| response.binding().clone())
+            .map_err(|error| direct_transport_error(&self.alias, error))
+    }
+
+    fn preview_provider_secret_provisioning(
+        &self,
+        metadata: &satelle_transport::ProviderSecretProvisioningMetadata,
+    ) -> Result<satelle_transport::ProviderSecretProvisioningPreviewResponse, SatelleError> {
+        self.client
+            .preview_provider_secret_provisioning(
+                metadata,
+                &format!("provider-secret-preview-{}", Uuid::now_v7()),
+            )
+            .map_err(|error| direct_transport_error(&self.alias, error))
+    }
+
+    fn provision_provider_secret(
+        &self,
+        metadata: &satelle_transport::ProviderSecretProvisioningMetadata,
+        secret: Zeroizing<Vec<u8>>,
+    ) -> Result<satelle_transport::ProviderSecretProvisioningResponse, SatelleError> {
+        self.client
+            .provision_provider_secret(
+                metadata,
+                secret,
+                &format!("provider-secret-provision-{}", Uuid::now_v7()),
+            )
             .map_err(|error| direct_transport_error(&self.alias, error))
     }
 

@@ -5335,6 +5335,7 @@ name = "local-provider-token"
     let openai = &report["effective"]["hosts"]["local"]["provider_auth"]["openai"];
     let anthropic = &report["effective"]["hosts"]["local"]["provider_auth"]["anthropic"];
 
+    assert_eq!(report["schema_version"], "satelle.config.explain.v2");
     assert_eq!(openai["kind"], "file");
     assert_eq!(openai["redacted"], true);
     assert_eq!(openai["value"], serde_json::Value::Null);
@@ -5342,6 +5343,23 @@ name = "local-provider-token"
     assert_eq!(openai["source"], "user_config");
     assert_eq!(anthropic["kind"], "environment");
     assert_eq!(anthropic["redacted"], true);
+
+    let human = satelle()
+        .env("SATELLE_CONFIG_FILE", &user_config)
+        .env("SATELLE_STATE_DIR", state.path())
+        .args(["config", "explain"])
+        .assert()
+        .success()
+        .get_output()
+        .clone();
+    let human_stdout = String::from_utf8_lossy(&human.stdout);
+    assert!(human_stdout.contains(
+        "hosts.local.provider_auth.openai: <redacted> \
+         (reason: secret_source_reference, source: user_config)"
+    ));
+    assert!(human_stdout.contains("hosts.local.transport: local"));
+    assert!(!human_stdout.contains(secret_file.to_string_lossy().as_ref()));
+    assert!(!human_stdout.contains("ANTHROPIC_API_KEY"));
 
     let output = satelle()
         .env("SATELLE_CONFIG_FILE", &user_config)
@@ -7090,26 +7108,21 @@ variable = "SATELLE_TEST_OPENAI_TOKEN"
             "--json",
         ])
         .assert()
-        .success()
+        .failure()
         .get_output()
         .clone();
-    assert!(output.stderr.is_empty());
-    let report = parse_json_output(&output.stdout);
-    let required_input = report["required_input"]
+    assert!(output.stdout.is_empty());
+    let error = parse_json_output(&output.stderr);
+    let suggested_commands = error["suggested_commands"]
         .as_array()
-        .expect("required_input should be an array");
-
-    assert_eq!(report["status"], "input_required");
+        .expect("typed error should contain suggested commands");
+    assert_eq!(error["code"], "provider-secret-source-required");
     assert_eq!(
-        report["readiness_summary"]["provider_auth"],
-        "missing_descriptor"
+        suggested_commands,
+        &[serde_json::json!(
+            "satelle setup --host <host-alias> --component provider-auth"
+        )]
     );
-    assert!(required_input.iter().any(|input| {
-        input["component"] == "provider-auth"
-            && input["input_kind"] == "provider_secret_source_descriptor"
-    }));
-    assert_eq!(report["applied_actions"], serde_json::json!([]));
-    assert_eq!(report["mutated"], false);
 }
 
 #[test]
@@ -7420,6 +7433,91 @@ auth_source = "operator-auth"
 }
 
 #[test]
+fn noninteractive_file_provisioning_is_typed_and_never_accepts_secret_bytes() {
+    let state = state_dir();
+    let user_config = state.path().join("user-config.toml");
+    let secret_file = state.path().join("provider-secret");
+    let secret_canary = "sk-provider-provisioning-error-canary";
+    test_file::write_user_controlled(&secret_file, secret_canary)
+        .expect("provider secret fixture should be written securely");
+    write_user_config(
+        &user_config,
+        format!(
+            r#"
+default_host = "local"
+model_alias = "review"
+provider_alias = "openai"
+
+[hosts.local]
+transport = "local"
+adapter = "fake"
+
+[hosts.local.provider_auth.openai]
+kind = "file"
+path = '{}'
+
+[hosts.local.provider_bindings.openai.review]
+model = "gpt-5.2"
+model_provider = "openai"
+auth_source = "openai"
+"#,
+            secret_file.display()
+        ),
+    )
+    .expect("user config should be written");
+    satelle()
+        .env("SATELLE_CONFIG_FILE", &user_config)
+        .env("SATELLE_STATE_DIR", state.path())
+        .args([
+            "setup",
+            "--host",
+            "local",
+            "--component",
+            "provider-auth",
+            "--no-input",
+            "--yes",
+            "--json",
+        ])
+        .assert()
+        .success();
+    satelle()
+        .env("SATELLE_CONFIG_FILE", &user_config)
+        .env("SATELLE_STATE_DIR", state.path())
+        .args(["host", "release-state"])
+        .assert()
+        .success();
+    fs::remove_file(&secret_file).expect("remove provider secret before provisioning check");
+
+    let output = satelle()
+        .env("SATELLE_CONFIG_FILE", &user_config)
+        .env("SATELLE_STATE_DIR", state.path())
+        .args([
+            "setup",
+            "--host",
+            "local",
+            "--component",
+            "provider-auth",
+            "--no-input",
+            "--yes",
+            "--json",
+        ])
+        .assert()
+        .failure()
+        .get_output()
+        .clone();
+    assert!(output.stdout.is_empty());
+    assert_command_canaries_are_absent(&output, &[secret_canary]);
+    let error = parse_json_output(&output.stderr);
+    assert_eq!(error["code"], "provider-secret-provisioning-required");
+    assert_eq!(
+        error["suggested_commands"],
+        serde_json::json!([
+            "satelle setup --host <host-alias> --component provider-auth"
+        ])
+    );
+}
+
+#[test]
 fn provider_auth_dry_run_defers_host_resolution_without_returning_the_secret() {
     let state = state_dir();
     let user_config = state.path().join("user-config.toml");
@@ -7485,4 +7583,8 @@ auth_source = "openai"
     assert_eq!(report["provider_auth_validation"]["source"], "deferred");
     assert_eq!(report["required_input"], serde_json::json!([]));
     assert_eq!(report["applied_actions"], serde_json::json!([]));
+    assert_eq!(report["descriptor_configured"], true);
+    assert_eq!(report["secret_provisioned"], false);
+    assert_eq!(report["validation_status"], "deferred");
+    assert_eq!(report["provider_smoke_test_status"], "not_checked");
 }

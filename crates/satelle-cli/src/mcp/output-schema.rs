@@ -33,7 +33,7 @@ pub(super) fn config_check() -> Value {
 
 pub(super) fn config_explain() -> Value {
     versioned(
-        "satelle.config.explain.v1",
+        "satelle.config.explain.v2",
         json!({
             "status": {"type": "string"},
             "selected_host": {"type": "string"},

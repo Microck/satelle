@@ -84,6 +84,7 @@ const STATE_RELEASE_TIMEOUT: Duration = Duration::from_secs(20);
 const STATE_RELEASE_POLL_INTERVAL: Duration = Duration::from_millis(50);
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
+use zeroize::Zeroizing;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -2323,6 +2324,8 @@ fn run_setup(
     let mut provider_auth_validation = None;
     let mut pending_provider_auth = None;
     let mut pending_provider_binding_authorization = None;
+    let mut pending_provider_secret_authorization = None;
+    let mut provider_secret_setup_completed = false;
     if first_ssh_trust
         && !command.dry_run
         && !command.yes
@@ -2404,6 +2407,20 @@ fn run_setup(
     }
     if command.dry_run {
         add_setup_required_inputs(&mut report, &provider_selection, provider_auth_setup);
+        if provider_auth_setup
+            && provider_selection
+                .authorization
+                .as_ref()
+                .and_then(ProviderBindingAuthorization::auth_source)
+                .is_some()
+        {
+            report.descriptor_configured = true;
+            report.validation_status = "deferred".to_string();
+            report.planned_actions.push(format!(
+                "inspect the provider secret destination on Host '{}' and provision it if required",
+                host.alias
+            ));
+        }
     }
     let mut desktop_selection = None;
     if desktop_setup
@@ -2478,6 +2495,17 @@ fn run_setup(
                     satelle_core::ProviderAuthValidationMode::Cached,
                     provider_selection.experimental_provider_computer_use,
                 ) {
+                    Ok(validation)
+                        if validation.validation.outcome()
+                            == satelle_core::ProviderAuthValidationOutcome::UnresolvedHostSecret =>
+                    {
+                        pending_provider_secret_authorization =
+                            Some(plan_provider_secret_provisioning(
+                                &mut report,
+                                &provider_selection,
+                                &host.alias,
+                            )?);
+                    }
                     Ok(validation) => {
                         provider_auth_validation = accept_setup_provider_auth_validation(
                             &mut report,
@@ -2533,6 +2561,19 @@ fn run_setup(
                 }
             }
         }
+    }
+
+    if !command.dry_run
+        && !interactive_selection
+        && report.required_input.iter().any(|input| {
+            input.component == "provider-auth"
+                && input.input_kind == "provider_secret_source_descriptor"
+        })
+    {
+        return Err(failure(provider_secret_setup_error(
+            ErrorCode::ProviderSecretSourceRequired,
+            "provider authentication requires a host-resolved Secret Source descriptor",
+        )));
     }
 
     let first_ssh_discovery = if first_ssh_trust && !command.dry_run {
@@ -2661,6 +2702,32 @@ fn run_setup(
             transport =
                 setup_transport_if_required(host_setup_required, || transport_for_setup(&host))?;
         }
+        if let Some(authorization) = pending_provider_secret_authorization.take() {
+            let provider_transport = if host.config.transport == satelle_core::TransportKind::Ssh {
+                transport_for_with_ssh_bootstrap(&host, Some(SshBootstrapScope::Admin))?
+            } else {
+                transport_for(&host)?
+            };
+            let response = provision_provider_secret(
+                provider_transport.as_ref(),
+                &authorization,
+                &command,
+                &format,
+            )?;
+            provider_secret_setup_completed = true;
+            report.secret_provisioned = response.provisioned();
+            report.validation_status = response.validation_status().to_string();
+            report.readiness_summary.provider_auth =
+                response.validation_status().to_string();
+            report.applied_actions.push(format!(
+                "provisioned and authorized {} provider authentication on Host '{}'",
+                response.destination_kind(),
+                host.alias,
+            ));
+            report.mutated = true;
+            report.changed = true;
+            report.status = "applied".to_string();
+        }
         let mut persisted_desktop_action = None;
         let mut persisted_provider_auth_action = None;
         if report.required_input.is_empty() {
@@ -2712,6 +2779,7 @@ fn run_setup(
         if provider_auth_setup
             && report.required_input.is_empty()
             && provider_auth_validation.is_none()
+            && !provider_secret_setup_completed
             && let (Some(model_alias), Some(provider_alias)) = (
                 provider_selection.requested_model_alias.as_deref(),
                 provider_selection.requested_provider_alias.as_deref(),
@@ -2730,6 +2798,42 @@ fn run_setup(
                 satelle_core::ProviderAuthValidationMode::Cached,
                 provider_selection.experimental_provider_computer_use,
             ) {
+                Ok(validation)
+                    if validation.validation.outcome()
+                        == satelle_core::ProviderAuthValidationOutcome::UnresolvedHostSecret =>
+                {
+                    let authorization = provider_selection
+                        .authorization
+                        .as_ref()
+                        .ok_or_else(|| {
+                            failure(provider_secret_setup_error(
+                                ErrorCode::ProviderSecretSourceRequired,
+                                "provider authentication requires a host-resolved Secret Source descriptor",
+                            ))
+                        })?
+                        .clone();
+                    ensure_file_provider_secret_source(&authorization)?;
+                    let response = provision_provider_secret(
+                        provider_transport.as_ref(),
+                        &authorization,
+                        &command,
+                        &format,
+                    )?;
+                    provider_secret_setup_completed = true;
+                    report.secret_provisioned = response.provisioned();
+                    report.validation_status = response.validation_status().to_string();
+                    report.readiness_summary.provider_auth =
+                        response.validation_status().to_string();
+                    report.applied_actions.push(format!(
+                        "provisioned and authorized {} provider authentication on Host '{}'",
+                        response.destination_kind(),
+                        host.alias,
+                    ));
+                    report.mutated = true;
+                    report.changed = true;
+                    report.status = "applied".to_string();
+                    None
+                }
                 Ok(validation) => {
                     provider_auth_validation = accept_setup_provider_auth_validation(
                         &mut report,
@@ -2922,6 +3026,7 @@ fn run_setup(
             .iter()
             .any(|check| check == "provider_computer_use")
         {
+            report.provider_smoke_test_status = verification_status.to_string();
             report.readiness_summary.provider_auth = if ready {
                 "ready".to_string()
             } else {
@@ -2956,6 +3061,7 @@ fn run_setup(
         let mut output = serde_json::to_value(&report)
             .map_err(|error| failure(SatelleError::invalid_usage(error.to_string())))?;
         if provider_auth_setup
+            && !provider_secret_setup_completed
             && let Some(validation) = provider_auth_validation_json(
                 &provider_selection,
                 provider_auth_validation.as_ref(),
@@ -3064,6 +3170,13 @@ fn accept_setup_provider_auth_validation(
 
     let outcome = validation.validation.outcome();
     report.readiness_summary.provider_auth = outcome.as_str().to_string();
+    report.descriptor_configured = provider_selection
+        .authorization
+        .as_ref()
+        .and_then(ProviderBindingAuthorization::auth_source)
+        .is_some();
+    report.validation_status = outcome.as_str().to_string();
+    report.secret_provisioned = outcome == Resolved;
     if matches!(outcome, ConfiguredDeferred | Resolved) {
         return Ok(Some(validation));
     }
@@ -3123,6 +3236,8 @@ fn add_setup_required_inputs(
     };
     if authorization.auth_source().is_some() {
         report.readiness_summary.provider_auth = "configured_deferred".to_string();
+        report.descriptor_configured = true;
+        report.validation_status = "deferred".to_string();
         return;
     }
 
@@ -3233,6 +3348,156 @@ fn prompt_provider_auth_descriptor(
         }
         _ => unreachable!("provider authentication prompt exposes only supported descriptor kinds"),
     }
+}
+
+fn provider_secret_setup_error(code: ErrorCode, message: impl Into<String>) -> SatelleError {
+    SatelleError {
+        code,
+        message: message.into(),
+        recovery_command: Some(
+            "satelle setup --host <host-alias> --component provider-auth".to_string(),
+        ),
+        source_detail: None,
+        details: BTreeMap::new(),
+    }
+}
+
+fn ensure_file_provider_secret_source(
+    authorization: &ProviderBindingAuthorization,
+) -> Result<(), CliFailure> {
+    match authorization.auth_source() {
+        Some(ProviderSecretSource::File { .. }) => Ok(()),
+        Some(_) => Err(failure(provider_secret_setup_error(
+            ErrorCode::ProviderSecretProvisioningRequired,
+            "interactive provider secret provisioning supports only File Secret Source descriptors",
+        ))),
+        None => Err(failure(provider_secret_setup_error(
+            ErrorCode::ProviderSecretSourceRequired,
+            "provider authentication requires a host-resolved Secret Source descriptor",
+        ))),
+    }
+}
+
+fn plan_provider_secret_provisioning(
+    report: &mut SetupReport,
+    provider_selection: &ProviderSelection,
+    host_alias: &str,
+) -> Result<ProviderBindingAuthorization, CliFailure> {
+    let authorization = provider_selection
+        .authorization
+        .as_ref()
+        .ok_or_else(|| {
+            failure(provider_secret_setup_error(
+                ErrorCode::ProviderSecretSourceRequired,
+                "provider authentication requires a host-resolved Secret Source descriptor",
+            ))
+        })?
+        .clone();
+    ensure_file_provider_secret_source(&authorization)?;
+    report.descriptor_configured = true;
+    report.secret_provisioned = false;
+    report.validation_status = "provisioning_required".to_string();
+    report.readiness_summary.provider_auth = "provisioning_required".to_string();
+    report.mutation_planned = true;
+    report.planned_actions.push(format!(
+        "preview and provision the File provider secret destination on Host '{host_alias}'"
+    ));
+    Ok(authorization)
+}
+
+fn provision_provider_secret(
+    provider_transport: &dyn transport::TransportClient,
+    authorization: &ProviderBindingAuthorization,
+    command: &SetupCommand,
+    format: &OutputFormat,
+) -> Result<satelle_transport::ProviderSecretProvisioningResponse, CliFailure> {
+    ensure_file_provider_secret_source(authorization)?;
+
+    // Prove that this client is authenticated to the selected, pinned Host before
+    // reading raw bytes. The later preview and provision calls use the same client.
+    provider_transport.host_status().map_err(failure)?;
+    let preview_metadata =
+        satelle_transport::ProviderSecretProvisioningMetadata::new(authorization.clone(), false);
+    let preview = provider_transport
+        .preview_provider_secret_provisioning(&preview_metadata)
+        .map_err(failure)?;
+
+    if !format.is_json() {
+        println!(
+            "Provider secret destination kind: {}",
+            preview.destination_kind()
+        );
+        println!(
+            "Provider secret destination exists: {}",
+            preview.destination_exists()
+        );
+        println!(
+            "Provider secret overwrite required: {}",
+            preview.overwrite_required()
+        );
+    }
+
+    let interaction_available = !command.no_input
+        && !format.is_json()
+        && io::stdin().is_terminal()
+        && io::stdout().is_terminal()
+        && io::stderr().is_terminal();
+    if !interaction_available {
+        let code = if preview.overwrite_required() {
+            ErrorCode::ProviderSecretOverwriteRequired
+        } else {
+            ErrorCode::ProviderSecretProvisioningRequired
+        };
+        return Err(failure(provider_secret_setup_error(
+            code,
+            "provider secret provisioning requires an immediate confirmation in an interactive human terminal",
+        )));
+    }
+
+    let confirmation = if preview.overwrite_required() {
+        "Replace the existing provider secret at this exact destination?"
+    } else {
+        "Provision the provider secret at this exact destination?"
+    };
+    let confirmed = cliclack::confirm(confirmation)
+        .initial_value(false)
+        .interact()
+        .map_err(|source| {
+            failure(setup_interaction_error(
+                "could not read provider secret provisioning confirmation",
+                source,
+            ))
+        })?;
+    if !confirmed {
+        let code = if preview.overwrite_required() {
+            ErrorCode::ProviderSecretOverwriteRequired
+        } else {
+            ErrorCode::ProviderSecretProvisioningRequired
+        };
+        return Err(failure(provider_secret_setup_error(
+            code,
+            "provider secret provisioning was not authorized",
+        )));
+    }
+
+    let secret = Zeroizing::new(
+        cliclack::password("Provider secret")
+            .interact()
+            .map_err(|source| {
+                failure(setup_interaction_error(
+                    "could not read provider secret",
+                    source,
+                ))
+            })?
+            .into_bytes(),
+    );
+    let metadata = satelle_transport::ProviderSecretProvisioningMetadata::new(
+        authorization.clone(),
+        preview.overwrite_required(),
+    );
+    provider_transport
+        .provision_provider_secret(&metadata, secret)
+        .map_err(failure)
 }
 
 fn daemon_path_overrides(command: &SetupCommand, host_config: &HostConfig) -> DaemonPathOverrides {
@@ -3996,7 +4261,38 @@ fn config_explain(
             "Host aliases: {}",
             output["values"]["host_count"].as_u64().unwrap_or_default()
         );
+        print_config_explain_values("", &output["effective"]);
         Ok(())
+    }
+}
+
+fn print_config_explain_values(path: &str, value: &serde_json::Value) {
+    if value
+        .get("redacted")
+        .and_then(serde_json::Value::as_bool)
+        == Some(true)
+    {
+        println!(
+            "{}: <redacted> (reason: {}, source: {})",
+            path,
+            value["redaction_reason"].as_str().unwrap_or("secret"),
+            value["source"].as_str().unwrap_or("unknown")
+        );
+        return;
+    }
+    match value {
+        serde_json::Value::Object(fields) => {
+            for (name, field) in fields {
+                let child_path = if path.is_empty() {
+                    name.clone()
+                } else {
+                    format!("{path}.{name}")
+                };
+                print_config_explain_values(&child_path, field);
+            }
+        }
+        serde_json::Value::String(value) => println!("{path}: {value}"),
+        _ => println!("{path}: {value}"),
     }
 }
 
@@ -4019,35 +4315,47 @@ fn redacted_config_json(
     show_secret_references: bool,
 ) -> serde_json::Value {
     let mut value = serde_json::to_value(config).unwrap_or_else(|_| json!({}));
-    let Some(hosts) = value
-        .get_mut("hosts")
-        .and_then(serde_json::Value::as_object_mut)
-    else {
-        return value;
-    };
-
-    for host in hosts.values_mut() {
-        let Some(host_object) = host.as_object_mut() else {
-            continue;
-        };
-
-        if let Some(api_token) = host_object.get_mut("api_token") {
-            redact_secret_source_descriptor(api_token, show_secret_references);
-        }
-
-        let Some(provider_auth) = host_object
-            .get_mut("provider_auth")
-            .and_then(serde_json::Value::as_object_mut)
-        else {
-            continue;
-        };
-
-        for descriptor in provider_auth.values_mut() {
-            redact_secret_source_descriptor(descriptor, show_secret_references);
-        }
-    }
-
+    redact_schema_marked_config_values(&mut value, &mut Vec::new(), show_secret_references);
     value
+}
+
+const CONFIG_SECRET_SOURCE_SCHEMA_PATHS: &[&[&str]] = &[
+    &["hosts", "*", "api_token"],
+    &["hosts", "*", "provider_auth", "*"],
+];
+
+fn redact_schema_marked_config_values(
+    value: &mut serde_json::Value,
+    path: &mut Vec<String>,
+    show_secret_references: bool,
+) {
+    if CONFIG_SECRET_SOURCE_SCHEMA_PATHS.iter().any(|schema_path| {
+        schema_path.len() == path.len()
+            && schema_path
+                .iter()
+                .zip(path.iter())
+                .all(|(schema, actual)| *schema == "*" || *schema == actual)
+    }) {
+        redact_secret_source_descriptor(value, show_secret_references);
+        return;
+    }
+    match value {
+        serde_json::Value::Object(fields) => {
+            for (name, field) in fields {
+                path.push(name.clone());
+                redact_schema_marked_config_values(field, path, show_secret_references);
+                path.pop();
+            }
+        }
+        serde_json::Value::Array(values) => {
+            for (index, field) in values.iter_mut().enumerate() {
+                path.push(index.to_string());
+                redact_schema_marked_config_values(field, path, show_secret_references);
+                path.pop();
+            }
+        }
+        _ => {}
+    }
 }
 
 fn redact_secret_source_descriptor(
@@ -8251,6 +8559,19 @@ fn print_setup_human(report: &SetupReport) {
     println!("Service scope: {}", report.service_scope);
     println!("Components: {}", report.setup_components.join(", "));
     println!("Changed: {}", report.changed);
+    println!(
+        "Provider descriptor configured: {}",
+        report.descriptor_configured
+    );
+    println!(
+        "Provider secret provisioned: {}",
+        report.secret_provisioned
+    );
+    println!("Provider validation: {}", report.validation_status);
+    println!(
+        "Provider smoke test: {}",
+        report.provider_smoke_test_status
+    );
     println!(
         "Native Computer Use readiness: {}",
         report.native_computer_use_readiness
