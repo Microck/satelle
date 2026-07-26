@@ -76,12 +76,12 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::sync::{Arc, Mutex, RwLock, RwLockReadGuard};
 use std::time::Instant;
-use zeroize::Zeroizing;
 pub use storage::{
     SetupActionPlan, SetupActionRecord, SetupActionSkipReason, SetupActionStatus,
     SetupOperationKind, SetupRepairAction, SetupRepairDecision, SetupRepairPlan,
     SetupRepairPostcondition, SetupRepairProbe, SetupRunPlan, SetupRunRecord, SetupRunStatus,
 };
+use zeroize::Zeroizing;
 
 pub(crate) const DEFAULT_MODEL_BINDING: &str = "codex-default";
 pub(crate) const DEFAULT_PROVIDER_BINDING: &str = "codex-default";
@@ -836,7 +836,7 @@ struct ProviderSecretComparison {
 
 fn provider_secret_comparison(
     runtime: &RuntimeHandle,
-    domain: &str,
+    domain: &'static str,
     secret: &provider_auth::ResolvedProviderSecret,
 ) -> Result<ProviderSecretComparison, SatelleError> {
     let key = Zeroizing::new(runtime.provider_secret_provisioning_hmac(domain, secret)?);
@@ -862,10 +862,40 @@ fn provider_secret_comparison(
 }
 
 fn provider_secret_file_error() -> SatelleError {
-    SatelleError::config_error(
-        "the Host could not safely provision the provider secret File destination",
-        None,
-    )
+    SatelleError {
+        code: satelle_core::ErrorCode::ProviderSecretProvisioningRequired,
+        message: "the Host could not safely provision the provider secret File destination"
+            .to_string(),
+        recovery_command: Some(
+            "retry provider secret provisioning after inspecting the Host destination".to_string(),
+        ),
+        source_detail: None,
+        details: std::collections::BTreeMap::new(),
+    }
+}
+
+fn provider_secret_source_error() -> SatelleError {
+    SatelleError {
+        code: satelle_core::ErrorCode::ProviderSecretSourceRequired,
+        message: "provider secret provisioning requires a File Secret Source".to_string(),
+        recovery_command: Some("configure an absolute target-host File Secret Source".to_string()),
+        source_detail: None,
+        details: std::collections::BTreeMap::new(),
+    }
+}
+
+fn provider_secret_overwrite_error() -> SatelleError {
+    SatelleError {
+        code: satelle_core::ErrorCode::ProviderSecretOverwriteRequired,
+        message:
+            "explicit overwrite confirmation is required for the provider secret File destination"
+                .to_string(),
+        recovery_command: Some(
+            "repeat provisioning with explicit overwrite confirmation".to_string(),
+        ),
+        source_detail: None,
+        details: std::collections::BTreeMap::new(),
+    }
 }
 
 pub(crate) fn validate_provider_binding_authorization(
@@ -1735,20 +1765,10 @@ impl HostService {
         )?;
         let path = match binding.auth_source() {
             Some(satelle_core::ProviderSecretSource::File { path }) => path,
-            _ => {
-                return Err(SatelleError::config_error(
-                    "provider secret provisioning supports only a File Secret Source",
-                    None,
-                ));
-            }
+            _ => return Err(provider_secret_source_error()),
         };
-        let exists = satelle_core::owner_only_secret_destination_exists(path).map_err(|_| {
-            SatelleError::config_error(
-                "the Host could not safely inspect the provider secret destination",
-                None,
-            )
-        })?;
-        Ok(ProviderSecretProvisioningPreview::file(exists))
+        let _metadata_only_path = path;
+        Ok(ProviderSecretProvisioningPreview::file())
     }
 
     fn provision_provider_secret(
@@ -1769,19 +1789,8 @@ impl HostService {
         )?;
         let destination = match binding.auth_source() {
             Some(satelle_core::ProviderSecretSource::File { path }) => path.clone(),
-            _ => {
-                return Err(SatelleError::config_error(
-                    "provider secret provisioning supports only a File Secret Source",
-                    None,
-                ));
-            }
+            _ => return Err(provider_secret_source_error()),
         };
-        let previous_binding = self
-            .runtime
-            .authorized_provider_binding(&model_alias, &provider_alias)?;
-        let expected_previous_digest = previous_binding
-            .as_ref()
-            .map(|previous| previous.binding_digest().to_string());
         let intent = Self::provider_candidate_intent(&binding)?;
         let provider_probe_ref = format!("provider-probe-{}", SessionId::new());
         let (host_identity, key, owner) = self.runtime.provider_secret_provisioning_ownership(
@@ -1790,16 +1799,12 @@ impl HostService {
             identity.key(),
             &provider_probe_ref,
         )?;
-        let paths = satelle_core::OwnerOnlySecretFilePaths::new(
-            &destination,
-            SessionId::new().as_str(),
-        )
-        .map_err(|_| provider_secret_file_error())?;
-        let candidate_secret =
-            provider_auth::ResolvedProviderSecret::from_provisioning(secret);
+        let paths = satelle_core::OwnerOnlySecretFilePaths::new(&destination, identity.key())
+            .map_err(|_| provider_secret_file_error())?;
+        let candidate_secret = provider_auth::ResolvedProviderSecret::from_provisioning(secret);
         let candidate_comparison = provider_secret_comparison(
             &self.runtime,
-            "satelle.provider-secret-provisioning.candidate.v1",
+            storage::PROVIDER_SECRET_CANDIDATE_HMAC_DOMAIN,
             &candidate_secret,
         )?;
         let plan = storage::ProviderSecretProvisioningPlan::new(
@@ -1809,16 +1814,13 @@ impl HostService {
             binding.clone(),
             destination.clone(),
             paths.staging().to_path_buf(),
-            expected_previous_digest.clone(),
             candidate_comparison.digest_hex.clone(),
         )
         .map_err(|_| SatelleError::state_conflict())?;
-        let journal = match self.runtime.begin_provider_secret_provisioning(
-            identity,
-            &key,
-            &owner,
-            plan,
-        )? {
+        let journal = match self
+            .runtime
+            .begin_provider_secret_provisioning(identity, &key, &owner, plan)?
+        {
             storage::BeginProviderSecretProvisioning::Claimed(journal) => journal,
             storage::BeginProviderSecretProvisioning::Resume(_) => {
                 return Err(SatelleError::state_conflict());
@@ -1838,13 +1840,10 @@ impl HostService {
         // The preview was advisory. T0 ownership precedes this authoritative
         // no-follow inspection so a preview-to-confirmation race cannot decide
         // overwrite behavior.
-        let destination_existed =
-            satelle_core::owner_only_secret_destination_exists(&destination)
-                .map_err(|_| provider_secret_file_error())?;
+        let destination_existed = satelle_core::owner_only_secret_destination_exists(&destination)
+            .map_err(|_| provider_secret_file_error())?;
         if destination_existed && !overwrite_authorized {
-            let error = SatelleError::input_required(
-                "explicit overwrite confirmation is required for the provider secret File destination",
-            );
+            let error = provider_secret_overwrite_error();
             drop(owned_probe);
             return Err(self
                 .runtime
@@ -1856,7 +1855,7 @@ impl HostService {
                 .map_err(|_| provider_secret_file_error())?;
             Some(provider_secret_comparison(
                 &self.runtime,
-                "satelle.provider-secret-provisioning.prior.v1",
+                storage::PROVIDER_SECRET_PRIOR_HMAC_DOMAIN,
                 &prior,
             )?)
         } else {
@@ -1897,8 +1896,20 @@ impl HostService {
                 if RuntimeHandle::provider_probe_recovery_required(&error) {
                     return Err(error);
                 }
-                if satelle_core::cleanup_owner_only_secret_file(&paths).is_err() {
-                    return Err(error);
+                if satelle_core::cleanup_owner_only_secret_file(
+                    &paths,
+                    Some((
+                        candidate_comparison.key.as_bytes(),
+                        &candidate_comparison.digest,
+                    )),
+                    prior_comparison
+                        .as_ref()
+                        .map(|prior| (prior.key.as_bytes(), &prior.digest)),
+                )
+                .is_err()
+                {
+                    pending.retain_for_recovery();
+                    return Err(SatelleError::state_conflict());
                 }
                 return Err(self
                     .runtime
@@ -1917,29 +1928,33 @@ impl HostService {
         )?;
         let overwritten = match satelle_core::publish_owner_only_secret_file(
             &paths,
+            destination_existed,
             overwrite_authorized,
             candidate_comparison.key.as_bytes(),
             &candidate_comparison.digest,
+            prior_comparison
+                .as_ref()
+                .map(|comparison| comparison.key.as_bytes()),
+            prior_comparison
+                .as_ref()
+                .map(|comparison| &comparison.digest),
         ) {
-            Ok(overwritten) if overwritten == destination_existed => overwritten,
-            Ok(overwritten) => {
-                let rollback_key = if overwritten {
-                    prior_comparison
-                        .as_ref()
-                        .map(|comparison| comparison.key.as_bytes())
-                        .ok_or_else(provider_secret_file_error)?
-                } else {
-                    candidate_comparison.key.as_bytes()
-                };
+            Ok(overwritten) => overwritten,
+            Err(satelle_core::SecureFileError::OverwriteRequired) => {
                 self.runtime
                     .mark_provider_secret_provisioning_rollback_pending(
                         &operation_id,
                         storage::ProviderSecretProvisioningPhase::PublishIntent,
                     )?;
-                if satelle_core::rollback_owner_only_secret_file(
+                if satelle_core::cleanup_owner_only_secret_file(
                     &paths,
-                    overwritten,
-                    rollback_key,
+                    Some((
+                        candidate_comparison.key.as_bytes(),
+                        &candidate_comparison.digest,
+                    )),
+                    prior_comparison
+                        .as_ref()
+                        .map(|prior| (prior.key.as_bytes(), &prior.digest)),
                 )
                 .is_err()
                 {
@@ -1947,7 +1962,7 @@ impl HostService {
                     return Err(SatelleError::state_conflict());
                 }
                 pending.finish();
-                let error = SatelleError::state_conflict();
+                let error = provider_secret_overwrite_error();
                 return Err(self
                     .runtime
                     .finish_provider_secret_provisioning_failure(&operation_id, error)?);
@@ -1957,8 +1972,21 @@ impl HostService {
                     .mark_provider_secret_provisioning_rollback_pending(
                         &operation_id,
                         storage::ProviderSecretProvisioningPhase::PublishIntent,
-                )?;
-                if satelle_core::cleanup_owner_only_secret_file(&paths).is_err() {
+                    )?;
+                if satelle_core::rollback_owner_only_secret_file(
+                    &paths,
+                    destination_existed,
+                    candidate_comparison.key.as_bytes(),
+                    &candidate_comparison.digest,
+                    prior_comparison
+                        .as_ref()
+                        .map(|comparison| comparison.key.as_bytes()),
+                    prior_comparison
+                        .as_ref()
+                        .map(|comparison| &comparison.digest),
+                )
+                .is_err()
+                {
                     pending.retain_for_recovery();
                     return Err(SatelleError::state_conflict());
                 }
@@ -1973,73 +2001,112 @@ impl HostService {
         // Re-open both durable artifacts through the owner-only reader
         // immediately before T3. The journal stores only keyed comparisons,
         // so neither this check nor recovery needs a raw reusable hash.
-        let published = satelle_core::read_owner_only_secret_file(&destination)
-            .map(provider_auth::ResolvedProviderSecret::from_provisioning)
-            .map_err(|_| provider_secret_file_error())?;
-        let published_comparison = provider_secret_comparison(
-            &self.runtime,
-            "satelle.provider-secret-provisioning.candidate.v1",
-            &published,
-        )?;
-        if published_comparison.digest_hex != candidate_comparison.digest_hex {
-            pending.retain_for_recovery();
-            return Err(SatelleError::state_conflict());
-        }
-        if overwritten {
-            let backup = satelle_core::read_owner_only_secret_file(paths.backup())
+        let published_artifacts_valid = (|| {
+            let published = satelle_core::read_owner_only_secret_file(&destination)
                 .map(provider_auth::ResolvedProviderSecret::from_provisioning)
                 .map_err(|_| provider_secret_file_error())?;
-            let backup_comparison = provider_secret_comparison(
+            let published_comparison = provider_secret_comparison(
                 &self.runtime,
-                "satelle.provider-secret-provisioning.prior.v1",
-                &backup,
+                storage::PROVIDER_SECRET_CANDIDATE_HMAC_DOMAIN,
+                &published,
             )?;
-            if prior_comparison.as_ref().map(|prior| prior.digest_hex.as_str())
-                != Some(backup_comparison.digest_hex.as_str())
-            {
-                pending.retain_for_recovery();
+            if published_comparison.digest_hex != candidate_comparison.digest_hex {
                 return Err(SatelleError::state_conflict());
             }
-        }
-        let readiness = pending.readiness()?;
-        if let Err(error) = self.runtime.commit_provider_secret_provisioning(
-            &operation_id,
-            &binding,
-            expected_previous_digest.as_deref(),
-            &key,
-            readiness.evidence(),
-            readiness.provider_smoke_evidence(),
-        ) {
-            let rollback_key = if overwritten {
-                prior_comparison
+            if overwritten {
+                let backup = satelle_core::read_owner_only_secret_file(paths.backup())
+                    .map(provider_auth::ResolvedProviderSecret::from_provisioning)
+                    .map_err(|_| provider_secret_file_error())?;
+                let backup_comparison = provider_secret_comparison(
+                    &self.runtime,
+                    storage::PROVIDER_SECRET_PRIOR_HMAC_DOMAIN,
+                    &backup,
+                )?;
+                if prior_comparison
                     .as_ref()
-                    .map(|comparison| comparison.key.as_bytes())
-                    .ok_or_else(provider_secret_file_error)?
-            } else {
-                candidate_comparison.key.as_bytes()
-            };
-            if satelle_core::rollback_owner_only_secret_file(&paths, overwritten, rollback_key)
-                .is_err()
-            {
-                self.runtime
-                    .mark_provider_secret_provisioning_rollback_pending(
-                        &operation_id,
-                        storage::ProviderSecretProvisioningPhase::PublishIntent,
-                    )?;
-                pending.retain_for_recovery();
-                return Err(error);
+                    .map(|prior| prior.digest_hex.as_str())
+                    != Some(backup_comparison.digest_hex.as_str())
+                {
+                    return Err(SatelleError::state_conflict());
+                }
             }
+            Ok(())
+        })();
+        if let Err(error) = published_artifacts_valid {
             self.runtime
                 .mark_provider_secret_provisioning_rollback_pending(
                     &operation_id,
                     storage::ProviderSecretProvisioningPhase::PublishIntent,
                 )?;
+            if satelle_core::rollback_owner_only_secret_file(
+                &paths,
+                overwritten,
+                candidate_comparison.key.as_bytes(),
+                &candidate_comparison.digest,
+                prior_comparison
+                    .as_ref()
+                    .map(|comparison| comparison.key.as_bytes()),
+                prior_comparison
+                    .as_ref()
+                    .map(|comparison| &comparison.digest),
+            )
+            .is_err()
+            {
+                pending.retain_for_recovery();
+                return Err(error);
+            }
             pending.finish();
             return Err(self
                 .runtime
                 .finish_provider_secret_provisioning_failure(&operation_id, error)?);
         }
-        if satelle_core::cleanup_owner_only_secret_file(&paths).is_err() {
+        let readiness = pending.readiness()?;
+        if let Err(error) = self.runtime.commit_provider_secret_provisioning(
+            &operation_id,
+            &binding,
+            &key,
+            readiness.evidence(),
+            readiness.provider_smoke_evidence(),
+        ) {
+            self.runtime
+                .mark_provider_secret_provisioning_rollback_pending(
+                    &operation_id,
+                    storage::ProviderSecretProvisioningPhase::PublishIntent,
+                )?;
+            if satelle_core::rollback_owner_only_secret_file(
+                &paths,
+                overwritten,
+                candidate_comparison.key.as_bytes(),
+                &candidate_comparison.digest,
+                prior_comparison
+                    .as_ref()
+                    .map(|comparison| comparison.key.as_bytes()),
+                prior_comparison
+                    .as_ref()
+                    .map(|comparison| &comparison.digest),
+            )
+            .is_err()
+            {
+                pending.retain_for_recovery();
+                return Err(error);
+            }
+            pending.finish();
+            return Err(self
+                .runtime
+                .finish_provider_secret_provisioning_failure(&operation_id, error)?);
+        }
+        if satelle_core::cleanup_owner_only_secret_file(
+            &paths,
+            Some((
+                candidate_comparison.key.as_bytes(),
+                &candidate_comparison.digest,
+            )),
+            prior_comparison
+                .as_ref()
+                .map(|prior| (prior.key.as_bytes(), &prior.digest)),
+        )
+        .is_err()
+        {
             pending.retain_for_recovery();
             return Err(SatelleError::state_conflict());
         }
@@ -2083,19 +2150,15 @@ impl HostService {
                     .map_err(|_| SatelleError::config_error("the model alias is invalid", None))?,
             ),
             Some(
-                satelle_core::session::ProviderBindingRef::new(
-                    binding.requested_provider_alias(),
-                )
-                .map_err(|_| {
-                    SatelleError::config_error("the provider alias is invalid", None)
-                })?,
+                satelle_core::session::ProviderBindingRef::new(binding.requested_provider_alias())
+                    .map_err(|_| {
+                        SatelleError::config_error("the provider alias is invalid", None)
+                    })?,
             ),
             true,
         )
         .with_resolved_provider_binding(binding.clone())
-        .with_experimental_provider_computer_use(
-            binding.experimental_provider_computer_use(),
-        ))
+        .with_experimental_provider_computer_use(binding.experimental_provider_computer_use()))
     }
 
     pub fn delete_provider_binding(

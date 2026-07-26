@@ -11,9 +11,8 @@ use crate::{
 use rusqlite::{OptionalExtension, TransactionBehavior, params};
 use satelle_core::session::{DesktopBindingRef, HostIdentityRef};
 use satelle_core::{
-    ProviderBindingAuthorization, ProviderBindingSource, ProviderSecretSource,
-    ProviderSecretProvisioningResult, PublicResolvedProviderBinding, ResolvedProviderBinding,
-    SatelleError,
+    ProviderBindingAuthorization, ProviderBindingSource, ProviderSecretProvisioningResult,
+    ProviderSecretSource, PublicResolvedProviderBinding, ResolvedProviderBinding, SatelleError,
 };
 use serde::{Deserialize, Serialize};
 use std::fmt;
@@ -23,10 +22,10 @@ use time::OffsetDateTime;
 const PENDING_OUTCOME: &str = "v1.provider_secret_provisioning.pending";
 const COMPLETED_OUTCOME: &str = "v1.provider_secret_provisioning.completed";
 const FAILED_OUTCOME: &str = "v1.provider_secret_provisioning.failed";
-pub(crate) const PROVIDER_SECRET_CANDIDATE_HMAC_DOMAIN: &[u8] =
-    b"satelle.provider-secret-provisioning.candidate.v1\0";
-pub(crate) const PROVIDER_SECRET_PRIOR_HMAC_DOMAIN: &[u8] =
-    b"satelle.provider-secret-provisioning.prior.v1\0";
+pub(crate) const PROVIDER_SECRET_CANDIDATE_HMAC_DOMAIN: &str =
+    "satelle.provider-secret-provisioning.candidate.v1";
+pub(crate) const PROVIDER_SECRET_PRIOR_HMAC_DOMAIN: &str =
+    "satelle.provider-secret-provisioning.prior.v1";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ProviderSecretProvisioningPhase {
@@ -65,8 +64,12 @@ impl ProviderSecretProvisioningPhase {
     fn permits(self, next: Self) -> bool {
         matches!(
             (self, next),
-            (Self::Staged, Self::Validated)
+            (Self::Planned, Self::Staged)
+                | (Self::Staged, Self::Validated)
                 | (Self::Validated, Self::PublishIntent)
+                | (Self::Staged, Self::RollbackPending)
+                | (Self::Validated, Self::RollbackPending)
+                | (Self::PublishIntent, Self::RollbackPending)
         )
     }
 }
@@ -79,7 +82,6 @@ pub(crate) struct ProviderSecretProvisioningPlan {
     binding: ResolvedProviderBinding,
     destination_path: PathBuf,
     staged_path: PathBuf,
-    expected_previous_binding_digest: Option<String>,
     candidate_secret_hmac: String,
 }
 
@@ -92,15 +94,11 @@ impl ProviderSecretProvisioningPlan {
         binding: ResolvedProviderBinding,
         destination_path: PathBuf,
         staged_path: PathBuf,
-        expected_previous_binding_digest: Option<String>,
         candidate_secret_hmac: impl Into<String>,
     ) -> Result<Self, StorageError> {
         let provider_probe_ref = validated_reference(provider_probe_ref.into())?;
         validate_binding_file_destination(&binding, &destination_path)?;
         validate_planned_paths(&destination_path, &staged_path)?;
-        if let Some(digest) = expected_previous_binding_digest.as_deref() {
-            validate_digest(digest)?;
-        }
         let candidate_secret_hmac = candidate_secret_hmac.into();
         validate_digest(&candidate_secret_hmac)?;
         Ok(Self {
@@ -110,7 +108,6 @@ impl ProviderSecretProvisioningPlan {
             binding,
             destination_path,
             staged_path,
-            expected_previous_binding_digest,
             candidate_secret_hmac,
         })
     }
@@ -123,7 +120,10 @@ impl fmt::Debug for ProviderSecretProvisioningPlan {
             .field("host_identity", &self.host_identity)
             .field("desktop_binding", &self.desktop_binding)
             .field("provider_probe_ref", &"[redacted]")
-            .field("binding", &PublicResolvedProviderBinding::from(&self.binding))
+            .field(
+                "binding",
+                &PublicResolvedProviderBinding::from(&self.binding),
+            )
             .field("destination_path", &"[redacted]")
             .field("staged_path", &"[redacted]")
             .field("candidate_secret_hmac", &"[redacted]")
@@ -189,6 +189,14 @@ impl ProviderSecretProvisioningJournal {
         self.expected_previous_binding_digest.as_deref()
     }
 
+    pub(crate) fn candidate_secret_hmac(&self) -> &str {
+        &self.candidate_secret_hmac
+    }
+
+    pub(crate) fn prior_secret_hmac(&self) -> Option<&str> {
+        self.prior_secret_hmac.as_deref()
+    }
+
     pub(crate) const fn phase(&self) -> ProviderSecretProvisioningPhase {
         self.phase
     }
@@ -217,7 +225,10 @@ impl fmt::Debug for ProviderSecretProvisioningJournal {
             .field("host_identity", &self.host_identity)
             .field("desktop_binding", &self.desktop_binding)
             .field("provider_probe_ref", &"[redacted]")
-            .field("binding", &PublicResolvedProviderBinding::from(&self.binding))
+            .field(
+                "binding",
+                &PublicResolvedProviderBinding::from(&self.binding),
+            )
             .field("paths", &"[redacted]")
             .field("destination_existed", &self.destination_existed)
             .field("phase", &self.phase)
@@ -266,31 +277,21 @@ impl Storage {
                 record.durable_outcome.as_str(),
                 record.result_json,
             ) {
-                ("in_progress", PENDING_OUTCOME, None) => {
-                    BeginProviderSecretProvisioning::Resume(load_journal(
-                        &transaction,
-                        &idempotency.operation_id,
-                    )?)
-                }
-                (
-                    "terminal",
-                    COMPLETED_OUTCOME | FAILED_OUTCOME,
-                    Some(result_json),
-                ) => BeginProviderSecretProvisioning::Replay(
-                    serde_json::from_str(&result_json)
-                        .map_err(|_| invalid_stored_state())?,
+                ("in_progress", PENDING_OUTCOME, None) => BeginProviderSecretProvisioning::Resume(
+                    load_journal(&transaction, &idempotency.operation_id)?,
                 ),
+                ("terminal", COMPLETED_OUTCOME | FAILED_OUTCOME, Some(result_json)) => {
+                    BeginProviderSecretProvisioning::Replay(
+                        serde_json::from_str(&result_json).map_err(|_| invalid_stored_state())?,
+                    )
+                }
                 _ => return Err(invalid_stored_state()),
             };
             transaction.commit().map_err(operation_failed)?;
             return Ok(outcome);
         }
 
-        ensure_control_lease_available(
-            &transaction,
-            &plan.host_identity,
-            &plan.desktop_binding,
-        )?;
+        ensure_control_lease_available(&transaction, &plan.host_identity, &plan.desktop_binding)?;
         insert_idempotency(
             &transaction,
             idempotency,
@@ -301,10 +302,22 @@ impl Storage {
             None,
         )?;
         insert_provider_probe_lease(&transaction, &plan, owner)?;
+        validate_operation_paths(
+            idempotency.operation_id.as_str(),
+            &plan.destination_path,
+            &plan.staged_path,
+            None,
+        )?;
+        let expected_previous_binding_digest = Self::provider_binding_digest_in_connection(
+            &transaction,
+            plan.binding.requested_model_alias(),
+            plan.binding.requested_provider_alias(),
+        )?;
         insert_journal(
             &transaction,
             idempotency.operation_id.as_str(),
             &plan,
+            expected_previous_binding_digest.as_deref(),
             idempotency.created_at,
         )?;
         let journal = load_journal(&transaction, idempotency.operation_id.as_str())?;
@@ -322,13 +335,7 @@ impl Storage {
         if !expected.permits(next) {
             return Err(StorageError::new(StorageErrorKind::InvalidInput));
         }
-        update_phase(
-            &self.connection,
-            operation_id,
-            expected,
-            next,
-            at,
-        )
+        update_phase(&self.connection, operation_id, expected, next, at)
     }
 
     pub(crate) fn record_staged_provider_secret(
@@ -385,12 +392,7 @@ impl Storage {
         expected: ProviderSecretProvisioningPhase,
         at: OffsetDateTime,
     ) -> Result<(), StorageError> {
-        if !matches!(
-            expected,
-            ProviderSecretProvisioningPhase::Staged
-                | ProviderSecretProvisioningPhase::Validated
-                | ProviderSecretProvisioningPhase::PublishIntent
-        ) {
+        if !expected.permits(ProviderSecretProvisioningPhase::RollbackPending) {
             return Err(StorageError::new(StorageErrorKind::InvalidInput));
         }
         update_phase(
@@ -410,7 +412,6 @@ impl Storage {
         &mut self,
         operation_id: &str,
         binding: &ResolvedProviderBinding,
-        expected_previous_digest: Option<&str>,
         key: &ReadinessCacheKey,
         readiness: &ReadinessEvidence,
         provider: Option<&ProviderSmokeEvidence>,
@@ -423,7 +424,6 @@ impl Storage {
         let journal = load_journal(&transaction, operation_id)?;
         if journal.phase != ProviderSecretProvisioningPhase::PublishIntent
             || journal.binding.binding_digest() != binding.binding_digest()
-            || journal.expected_previous_binding_digest.as_deref() != expected_previous_digest
             || journal.desktop_binding != *key.desktop_binding()
             || binding.experimental_provider_computer_use() != provider.is_some()
         {
@@ -450,7 +450,7 @@ impl Storage {
             binding.requested_model_alias(),
             binding.requested_provider_alias(),
         )?;
-        if current_digest.as_deref() != expected_previous_digest {
+        if current_digest.as_deref() != journal.expected_previous_binding_digest.as_deref() {
             return Err(StorageError::new(StorageErrorKind::StateConflict));
         }
         Self::authorize_provider_binding_in_connection(&transaction, binding, committed_at)?;
@@ -489,12 +489,11 @@ impl Storage {
         if journal.phase != ProviderSecretProvisioningPhase::Committed {
             return Err(StorageError::new(StorageErrorKind::StateConflict));
         }
-        let replay = ProviderSecretProvisioningReplay::Completed(
-            ProviderSecretProvisioningResult::file(
+        let replay =
+            ProviderSecretProvisioningReplay::Completed(ProviderSecretProvisioningResult::file(
                 journal.destination_existed.unwrap_or(false),
                 "validated",
-            ),
-        );
+            ));
         terminalize(
             &transaction,
             operation_id,
@@ -640,6 +639,7 @@ fn insert_journal(
     transaction: &rusqlite::Transaction<'_>,
     operation_id: &str,
     plan: &ProviderSecretProvisioningPlan,
+    expected_previous_binding_digest: Option<&str>,
     created_at: OffsetDateTime,
 ) -> Result<(), StorageError> {
     let auth_source_json = serde_json::to_string(
@@ -679,7 +679,7 @@ fn insert_journal(
                 path_text(&plan.staged_path)?,
                 Option::<&str>::None,
                 Option::<i64>::None,
-                plan.expected_previous_binding_digest.as_deref(),
+                expected_previous_binding_digest,
                 plan.binding.binding_digest(),
                 plan.candidate_secret_hmac.as_str(),
                 Option::<&str>::None,
@@ -757,7 +757,7 @@ fn load_journal(
     ) = row;
     if !matches!(experimental, 0 | 1)
         || !matches!(allow_project_selection, 0 | 1)
-        || !matches!(destination_existed, 0 | 1)
+        || !matches!(destination_existed, None | Some(0 | 1))
     {
         return Err(invalid_stored_state());
     }
@@ -800,8 +800,13 @@ fn load_journal(
         prior_secret_hmac,
         phase: ProviderSecretProvisioningPhase::parse(&phase)?,
     };
-    validate_planned_paths(&journal.destination_path, &journal.staged_path)
-        .map_err(|_| invalid_stored_state())?;
+    validate_operation_paths(
+        journal.operation_id(),
+        &journal.destination_path,
+        &journal.staged_path,
+        journal.backup_path.as_deref(),
+    )
+    .map_err(|_| invalid_stored_state())?;
     match journal.phase {
         ProviderSecretProvisioningPhase::Planned => {
             if journal.destination_existed.is_some()
@@ -812,9 +817,7 @@ fn load_journal(
             }
         }
         _ => match journal.destination_existed {
-            Some(true)
-                if journal.backup_path.is_some() && journal.prior_secret_hmac.is_some() =>
-            {
+            Some(true) if journal.backup_path.is_some() && journal.prior_secret_hmac.is_some() => {
                 validate_staged_paths(
                     &journal.destination_path,
                     &journal.staged_path,
@@ -822,8 +825,8 @@ fn load_journal(
                 )
                 .map_err(|_| invalid_stored_state())?;
             }
-            Some(false)
-                if journal.backup_path.is_none() && journal.prior_secret_hmac.is_none() => {}
+            Some(false) if journal.backup_path.is_none() && journal.prior_secret_hmac.is_none() => {
+            }
             _ => return Err(invalid_stored_state()),
         },
     }
@@ -833,7 +836,44 @@ fn load_journal(
             journal.prior_secret_hmac.as_deref(),
         )
         .map_err(|_| invalid_stored_state())?;
+    let matching_active_leases: i64 = connection
+        .query_row(
+            "SELECT COUNT(*)
+             FROM control_leases
+             WHERE operation_id = ?1
+               AND host_identity_ref = ?2
+               AND desktop_binding_ref = ?3
+               AND owner_kind = 'provider_probe'
+               AND provider_probe_ref = ?4
+               AND lease_state = 'active'",
+            params![
+                journal.operation_id(),
+                journal.host_identity().as_str(),
+                journal.desktop_binding().as_str(),
+                journal.provider_probe_ref(),
+            ],
+            |row| row.get(0),
+        )
+        .map_err(operation_failed)?;
+    if matching_active_leases != 1 {
+        return Err(invalid_stored_state());
+    }
     Ok(journal)
+}
+
+fn validate_operation_paths(
+    operation_id: &str,
+    destination: &Path,
+    staged: &Path,
+    backup: Option<&Path>,
+) -> Result<(), StorageError> {
+    validate_planned_paths(destination, staged)?;
+    let paths = satelle_core::OwnerOnlySecretFilePaths::new(destination, operation_id)
+        .map_err(|_| StorageError::new(StorageErrorKind::InvalidInput))?;
+    if paths.staging() != staged || backup.is_some_and(|backup| backup != paths.backup()) {
+        return Err(StorageError::new(StorageErrorKind::InvalidInput));
+    }
+    Ok(())
 }
 
 fn update_phase(
@@ -849,7 +889,12 @@ fn update_phase(
                 "UPDATE provider_secret_provisioning_journal
                  SET phase = ?1, updated_at = ?2
                  WHERE operation_id = ?3 AND phase = ?4",
-                params![next.as_str(), format_time(at)?, operation_id, expected.as_str()],
+                params![
+                    next.as_str(),
+                    format_time(at)?,
+                    operation_id,
+                    expected.as_str()
+                ],
             )
             .map_err(operation_failed)?,
     )
@@ -921,10 +966,7 @@ fn validate_binding_file_destination(
     Ok(())
 }
 
-fn validate_planned_paths(
-    destination: &Path,
-    staged: &Path,
-) -> Result<(), StorageError> {
+fn validate_planned_paths(destination: &Path, staged: &Path) -> Result<(), StorageError> {
     if !destination.is_absolute()
         || !staged.is_absolute()
         || destination == staged
@@ -932,6 +974,8 @@ fn validate_planned_paths(
     {
         return Err(StorageError::new(StorageErrorKind::InvalidInput));
     }
+    satelle_core::OwnerOnlySecretFilePaths::from_staged_path(destination, staged)
+        .map_err(|_| StorageError::new(StorageErrorKind::InvalidInput))?;
     path_text(destination)?;
     path_text(staged)?;
     Ok(())
@@ -944,10 +988,13 @@ fn validate_staged_paths(
 ) -> Result<(), StorageError> {
     validate_planned_paths(destination, staged)?;
     let backup = backup.ok_or_else(|| StorageError::new(StorageErrorKind::InvalidInput))?;
+    let paths = satelle_core::OwnerOnlySecretFilePaths::from_staged_path(destination, staged)
+        .map_err(|_| StorageError::new(StorageErrorKind::InvalidInput))?;
     if !backup.is_absolute()
         || destination == backup
         || staged == backup
         || destination.parent() != backup.parent()
+        || backup != paths.backup()
     {
         return Err(StorageError::new(StorageErrorKind::InvalidInput));
     }
@@ -998,16 +1045,38 @@ mod tests {
 
     #[test]
     fn phase_graph_stops_before_committed_cleanup() {
-        assert!(!ProviderSecretProvisioningPhase::Planned
-            .permits(ProviderSecretProvisioningPhase::Staged));
-        assert!(ProviderSecretProvisioningPhase::Staged
-            .permits(ProviderSecretProvisioningPhase::Validated));
-        assert!(ProviderSecretProvisioningPhase::Validated
-            .permits(ProviderSecretProvisioningPhase::PublishIntent));
-        assert!(!ProviderSecretProvisioningPhase::PublishIntent
-            .permits(ProviderSecretProvisioningPhase::Committed));
-        assert!(!ProviderSecretProvisioningPhase::Committed
-            .permits(ProviderSecretProvisioningPhase::RollbackPending));
+        assert!(
+            ProviderSecretProvisioningPhase::Planned
+                .permits(ProviderSecretProvisioningPhase::Staged)
+        );
+        assert!(
+            ProviderSecretProvisioningPhase::Staged
+                .permits(ProviderSecretProvisioningPhase::Validated)
+        );
+        assert!(
+            ProviderSecretProvisioningPhase::Validated
+                .permits(ProviderSecretProvisioningPhase::PublishIntent)
+        );
+        assert!(
+            ProviderSecretProvisioningPhase::Staged
+                .permits(ProviderSecretProvisioningPhase::RollbackPending)
+        );
+        assert!(
+            ProviderSecretProvisioningPhase::Validated
+                .permits(ProviderSecretProvisioningPhase::RollbackPending)
+        );
+        assert!(
+            ProviderSecretProvisioningPhase::PublishIntent
+                .permits(ProviderSecretProvisioningPhase::RollbackPending)
+        );
+        assert!(
+            !ProviderSecretProvisioningPhase::PublishIntent
+                .permits(ProviderSecretProvisioningPhase::Committed)
+        );
+        assert!(
+            !ProviderSecretProvisioningPhase::Committed
+                .permits(ProviderSecretProvisioningPhase::RollbackPending)
+        );
     }
 
     #[test]
@@ -1015,5 +1084,30 @@ mod tests {
         assert!(validate_digest("raw-secret").is_err());
         assert!(validate_digest(&"A".repeat(64)).is_err());
         assert!(validate_digest(&"a".repeat(64)).is_ok());
+    }
+
+    #[test]
+    fn operation_identity_owns_the_only_accepted_recovery_paths() {
+        let destination = Path::new("/tmp/provider-secret");
+        let expected =
+            satelle_core::OwnerOnlySecretFilePaths::new(destination, "operation-a").unwrap();
+        assert!(
+            validate_operation_paths(
+                "operation-a",
+                destination,
+                expected.staging(),
+                Some(expected.backup()),
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_operation_paths(
+                "operation-b",
+                destination,
+                expected.staging(),
+                Some(expected.backup()),
+            )
+            .is_err()
+        );
     }
 }

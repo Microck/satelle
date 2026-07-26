@@ -65,6 +65,7 @@ use std::collections::BTreeMap;
 use std::ops::{Deref, DerefMut};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
+use zeroize::Zeroizing;
 
 #[cfg(test)]
 thread_local! {
@@ -816,13 +817,14 @@ impl RuntimeEngine {
         }
     }
 
-    fn initialize_restart_recovery(&self) -> Result<(), SatelleError> {
+    fn initialize_restart_recovery(&self, runtime: &RuntimeHandle) -> Result<(), SatelleError> {
         let mut initialized = self.restart_recovery_initialized.lock().map_err(|_| {
             model::integrity_failure("the restart recovery initialization lock was poisoned")
         })?;
         if *initialized {
             return Ok(());
         }
+        self.recover_provider_secret_provisionings(runtime)?;
         let subjects = self
             .lock_storage()?
             .initialize_restart_recovery()
@@ -831,6 +833,193 @@ impl RuntimeEngine {
             model::integrity_failure("the runtime recovery lock was poisoned during startup")
         })? = RecoveryQueue::new(subjects);
         *initialized = true;
+        Ok(())
+    }
+
+    fn recover_provider_secret_provisionings(
+        &self,
+        runtime: &RuntimeHandle,
+    ) -> Result<(), SatelleError> {
+        let journals = self
+            .lock_storage()?
+            .pending_provider_secret_provisionings()
+            .map_err(model::storage_failure)?;
+        for journal in journals {
+            let original_phase = journal.phase();
+            if matches!(
+                original_phase,
+                ProviderSecretProvisioningPhase::Staged
+                    | ProviderSecretProvisioningPhase::Validated
+                    | ProviderSecretProvisioningPhase::PublishIntent
+            ) {
+                self.lock_storage()?
+                    .mark_provider_secret_provisioning_rollback_pending(
+                        journal.operation_id(),
+                        original_phase,
+                        time::OffsetDateTime::now_utc(),
+                    )
+                    .map_err(model::storage_failure)?;
+            }
+            self.recover_provider_secret_provisioning(runtime, &journal, original_phase)?;
+        }
+        Ok(())
+    }
+
+    fn recover_provider_secret_provisioning(
+        &self,
+        runtime: &RuntimeHandle,
+        journal: &crate::storage::ProviderSecretProvisioningJournal,
+        original_phase: ProviderSecretProvisioningPhase,
+    ) -> Result<(), SatelleError> {
+        let paths = satelle_core::OwnerOnlySecretFilePaths::new(
+            journal.destination_path(),
+            journal.operation_id(),
+        )
+        .map_err(|_| provider_secret_recovery_failure())?;
+        if paths.staging() != journal.staged_path()
+            || journal
+                .backup_path()
+                .is_some_and(|backup| backup != paths.backup())
+        {
+            return Err(provider_secret_recovery_failure());
+        }
+        let destination = if original_phase == ProviderSecretProvisioningPhase::Planned {
+            None
+        } else {
+            inspect_provider_secret_recovery_artifact(runtime, paths.destination(), journal)?
+        };
+        let staging = inspect_provider_secret_recovery_artifact(runtime, paths.staging(), journal)?;
+        let backup = inspect_provider_secret_recovery_artifact(runtime, paths.backup(), journal)?;
+
+        if staging
+            .as_ref()
+            .is_some_and(|artifact| artifact.candidate.is_none())
+            || backup
+                .as_ref()
+                .is_some_and(|artifact| artifact.prior.is_none())
+        {
+            return Err(provider_secret_recovery_failure());
+        }
+
+        match original_phase {
+            ProviderSecretProvisioningPhase::Planned => {
+                if backup.is_some() {
+                    return Err(provider_secret_recovery_failure());
+                }
+                satelle_core::cleanup_owner_only_secret_file(
+                    &paths,
+                    staging
+                        .as_ref()
+                        .and_then(|artifact| artifact.candidate.as_ref())
+                        .map(ProviderSecretRecoveryComparison::as_evidence),
+                    None,
+                )
+                .map_err(|_| provider_secret_recovery_failure())?;
+                self.finish_recovered_provider_secret_failure(journal.operation_id())?;
+            }
+            ProviderSecretProvisioningPhase::Committed => {
+                let candidate = destination
+                    .as_ref()
+                    .and_then(|artifact| artifact.candidate.as_ref())
+                    .ok_or_else(provider_secret_recovery_failure)?;
+                let prior = backup.as_ref().and_then(|artifact| artifact.prior.as_ref());
+                if journal.destination_existed() == Some(false) && backup.is_some() {
+                    return Err(provider_secret_recovery_failure());
+                }
+                satelle_core::cleanup_owner_only_secret_file(
+                    &paths,
+                    Some(candidate.as_evidence()),
+                    prior.map(ProviderSecretRecoveryComparison::as_evidence),
+                )
+                .map_err(|_| provider_secret_recovery_failure())?;
+                self.lock_storage()?
+                    .finish_provider_secret_provisioning_success(
+                        journal.operation_id(),
+                        time::OffsetDateTime::now_utc(),
+                    )
+                    .map_err(model::storage_failure)?;
+            }
+            ProviderSecretProvisioningPhase::Staged
+            | ProviderSecretProvisioningPhase::Validated
+            | ProviderSecretProvisioningPhase::PublishIntent
+            | ProviderSecretProvisioningPhase::RollbackPending => {
+                let overwritten = journal
+                    .destination_existed()
+                    .ok_or_else(provider_secret_recovery_failure)?;
+                if matches!(
+                    original_phase,
+                    ProviderSecretProvisioningPhase::Staged
+                        | ProviderSecretProvisioningPhase::Validated
+                ) && staging.is_none()
+                {
+                    return Err(provider_secret_recovery_failure());
+                }
+                if overwritten {
+                    if destination.as_ref().is_some_and(|artifact| {
+                        artifact.candidate.is_none() && artifact.prior.is_none()
+                    }) || backup.is_none()
+                        && destination
+                            .as_ref()
+                            .and_then(|artifact| artifact.prior.as_ref())
+                            .is_none()
+                    {
+                        return Err(provider_secret_recovery_failure());
+                    }
+                } else if backup.is_some()
+                    || destination
+                        .as_ref()
+                        .is_some_and(|artifact| artifact.candidate.is_none())
+                {
+                    return Err(provider_secret_recovery_failure());
+                }
+                if !overwritten && destination.is_none() && staging.is_none() {
+                    self.finish_recovered_provider_secret_failure(journal.operation_id())?;
+                    return Ok(());
+                }
+                let prior = backup
+                    .as_ref()
+                    .and_then(|artifact| artifact.prior.as_ref())
+                    .or_else(|| {
+                        destination
+                            .as_ref()
+                            .and_then(|artifact| artifact.prior.as_ref())
+                    });
+                let candidate = staging
+                    .as_ref()
+                    .and_then(|artifact| artifact.candidate.as_ref())
+                    .or_else(|| {
+                        destination
+                            .as_ref()
+                            .and_then(|artifact| artifact.candidate.as_ref())
+                    })
+                    .or(prior)
+                    .ok_or_else(provider_secret_recovery_failure)?;
+                satelle_core::rollback_owner_only_secret_file(
+                    &paths,
+                    overwritten,
+                    candidate.key.as_bytes(),
+                    &candidate.digest,
+                    prior.map(|comparison| comparison.key.as_bytes()),
+                    prior.map(|comparison| &comparison.digest),
+                )
+                .map_err(|_| provider_secret_recovery_failure())?;
+                self.finish_recovered_provider_secret_failure(journal.operation_id())?;
+            }
+        }
+        Ok(())
+    }
+
+    fn finish_recovered_provider_secret_failure(
+        &self,
+        operation_id: &str,
+    ) -> Result<(), SatelleError> {
+        self.lock_storage()?
+            .finish_provider_secret_provisioning_failure(
+                operation_id,
+                SatelleError::state_conflict(),
+                time::OffsetDateTime::now_utc(),
+            )
+            .map_err(model::storage_failure)?;
         Ok(())
     }
 
@@ -1061,7 +1250,7 @@ impl RuntimeEngine {
         });
         if owned_provider_probe.is_none()
             && let (Some(key), Some(driver)) =
-            (cache_key.as_ref(), self.readiness_probe_driver.as_ref())
+                (cache_key.as_ref(), self.readiness_probe_driver.as_ref())
         {
             self.reconcile_readiness_probe(key, driver.as_ref(), ReadinessProbeKind::Provider)?;
         }
@@ -1080,10 +1269,10 @@ impl RuntimeEngine {
         // Hold probe ownership even for a cache candidate so credential
         // rotation cannot turn that candidate into untracked live provider I/O.
         let requires_live_provider_probe = provider_smoke_enabled;
-        let (provider_probe_ref, mut provider_heartbeat) =
-            if let Some(owned) = owned_provider_probe {
-                (Some(owned.provider_probe_ref), Some(owned.heartbeat))
-            } else if requires_live_provider_probe
+        let (provider_probe_ref, mut provider_heartbeat) = if let Some(owned) = owned_provider_probe
+        {
+            (Some(owned.provider_probe_ref), Some(owned.heartbeat))
+        } else if requires_live_provider_probe
             && self.readiness_probe_driver.is_some()
             && let Some(key) = cache_key.as_ref()
         {
@@ -1111,9 +1300,9 @@ impl RuntimeEngine {
                 }
             };
             (Some(provider_probe_ref), Some(heartbeat))
-            } else {
-                (None, None)
-            };
+        } else {
+            (None, None)
+        };
 
         let persistence_error = std::cell::RefCell::new(None);
         let preflight = {
@@ -1972,7 +2161,7 @@ impl std::fmt::Debug for RuntimeHandle {
 impl RuntimeHandle {
     pub(crate) fn provider_secret_provisioning_hmac(
         &self,
-        domain: &str,
+        domain: &'static str,
         secret: &crate::provider_auth::ResolvedProviderSecret,
     ) -> Result<String, SatelleError> {
         let fingerprinter = self
@@ -2791,7 +2980,6 @@ impl RuntimeHandle {
         &self,
         operation_id: &str,
         binding: &ResolvedProviderBinding,
-        expected_previous_digest: Option<&str>,
         key: &ReadinessCacheKey,
         readiness: &ReadinessEvidence,
         provider: Option<&ProviderSmokeEvidence>,
@@ -2801,7 +2989,6 @@ impl RuntimeHandle {
             .commit_provider_secret_provisioning(
                 operation_id,
                 binding,
-                expected_previous_digest,
                 key,
                 readiness,
                 provider,
@@ -3467,7 +3654,7 @@ impl RuntimeHandle {
 
     fn engine(&self) -> Result<Arc<RuntimeEngine>, SatelleError> {
         let engine = self.engine_without_restart_recovery()?;
-        engine.initialize_restart_recovery()?;
+        engine.initialize_restart_recovery(self)?;
         Ok(engine)
     }
 
@@ -3507,6 +3694,84 @@ impl RuntimeHandle {
         }
         self.engine_without_restart_recovery().map(Some)
     }
+}
+
+struct ProviderSecretRecoveryComparison {
+    key: Zeroizing<String>,
+    digest: [u8; 32],
+}
+
+impl ProviderSecretRecoveryComparison {
+    fn as_evidence(&self) -> (&[u8], &[u8; 32]) {
+        (self.key.as_bytes(), &self.digest)
+    }
+}
+
+struct ProviderSecretRecoveryArtifact {
+    candidate: Option<ProviderSecretRecoveryComparison>,
+    prior: Option<ProviderSecretRecoveryComparison>,
+}
+
+fn inspect_provider_secret_recovery_artifact(
+    runtime: &RuntimeHandle,
+    path: &Path,
+    journal: &crate::storage::ProviderSecretProvisioningJournal,
+) -> Result<Option<ProviderSecretRecoveryArtifact>, SatelleError> {
+    if !satelle_core::owner_only_secret_destination_exists(path)
+        .map_err(|_| provider_secret_recovery_failure())?
+    {
+        return Ok(None);
+    }
+    let secret = satelle_core::read_owner_only_secret_file(path)
+        .map(crate::provider_auth::ResolvedProviderSecret::from_provisioning)
+        .map_err(|_| provider_secret_recovery_failure())?;
+    let candidate = provider_secret_recovery_comparison(
+        runtime,
+        crate::storage::PROVIDER_SECRET_CANDIDATE_HMAC_DOMAIN,
+        &secret,
+        journal.candidate_secret_hmac(),
+    )?;
+    let prior = journal
+        .prior_secret_hmac()
+        .map(|expected| {
+            provider_secret_recovery_comparison(
+                runtime,
+                crate::storage::PROVIDER_SECRET_PRIOR_HMAC_DOMAIN,
+                &secret,
+                expected,
+            )
+        })
+        .transpose()?
+        .flatten();
+    if candidate.is_none() && prior.is_none() {
+        return Err(provider_secret_recovery_failure());
+    }
+    Ok(Some(ProviderSecretRecoveryArtifact { candidate, prior }))
+}
+
+fn provider_secret_recovery_comparison(
+    runtime: &RuntimeHandle,
+    domain: &'static str,
+    secret: &crate::provider_auth::ResolvedProviderSecret,
+    expected: &str,
+) -> Result<Option<ProviderSecretRecoveryComparison>, SatelleError> {
+    let key = Zeroizing::new(runtime.provider_secret_provisioning_hmac(domain, secret)?);
+    let digest = secret
+        .expose_to_provider(|value| {
+            satelle_core::keyed_secret_comparison_digest(key.as_bytes(), value.as_bytes())
+        })
+        .map_err(|_| provider_secret_recovery_failure())?;
+    let actual = digest
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    Ok((actual == expected).then_some(ProviderSecretRecoveryComparison { key, digest }))
+}
+
+fn provider_secret_recovery_failure() -> SatelleError {
+    model::integrity_failure(
+        "provider secret provisioning recovery could not prove durable artifact ownership",
+    )
 }
 
 #[cfg(any(test, feature = "test-support"))]
