@@ -2229,6 +2229,7 @@ impl ReadinessProbeDriver for ProviderProbeRecoveryAdapter {
         cached: Option<ReadinessEvidence>,
         _cached_provider: Option<super::ProviderSmokeResult>,
         _provider_intent: &ProviderComputerUseIntent,
+        _provider_secret: Option<crate::provider_auth::ResolvedProviderSecret>,
         _cancellation: &super::AdmissionCancellation,
         persist_thread_ref: &mut dyn FnMut(&str) -> Result<(), ()>,
         persist_turn_ref: &mut dyn FnMut(&str) -> Result<(), ()>,

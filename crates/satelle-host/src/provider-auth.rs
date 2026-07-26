@@ -62,6 +62,10 @@ pub(crate) struct ResolvedProviderSecret {
 }
 
 impl ResolvedProviderSecret {
+    pub(crate) fn from_provisioning(value: zeroize::Zeroizing<String>) -> Self {
+        Self { value }
+    }
+
     pub(crate) fn expose_to_provider<T>(&self, operation: impl FnOnce(&str) -> T) -> T {
         operation(self.value.as_str())
     }

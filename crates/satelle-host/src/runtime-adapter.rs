@@ -526,6 +526,7 @@ pub(crate) trait ReadinessProbeDriver: Send + Sync + 'static {
         cached: Option<ReadinessEvidence>,
         cached_provider: Option<ProviderSmokeResult>,
         provider_intent: &ProviderComputerUseIntent,
+        provider_secret: Option<crate::provider_auth::ResolvedProviderSecret>,
         cancellation: &super::request::AdmissionCancellation,
         persist_thread_ref: &mut dyn FnMut(&str) -> Result<(), ()>,
         persist_turn_ref: &mut dyn FnMut(&str) -> Result<(), ()>,

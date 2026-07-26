@@ -29,6 +29,7 @@ const TURN_IDEMPOTENCY_DIGEST_SCHEMA_VERSION: u16 = 6;
 const STOP_IDEMPOTENCY_DIGEST_SCHEMA_VERSION: u16 = 1;
 const PROVIDER_DESCRIPTOR_VALIDATION_DIGEST_SCHEMA_VERSION: u16 = 3;
 const PROVIDER_BINDING_MUTATION_DIGEST_SCHEMA_VERSION: u16 = 2;
+const PROVIDER_SECRET_PROVISIONING_DIGEST_SCHEMA_VERSION: u16 = 1;
 const SETUP_VERIFICATION_DIGEST_SCHEMA_VERSION: u16 = 1;
 const NATIVE_READINESS_INVALIDATION_DIGEST_SCHEMA_VERSION: u16 = 1;
 const DURABLE_SETUP_PRINCIPAL_PREFIX: &str = "controller-setup";
@@ -426,6 +427,15 @@ struct CanonicalProviderBindingAuthorization<'a> {
     model_alias: &'a str,
     provider_alias: &'a str,
     authorization: &'a satelle_core::ProviderBindingAuthorization,
+}
+
+#[derive(Serialize)]
+struct CanonicalProviderSecretProvisioning<'a> {
+    operation: &'static str,
+    host: &'a str,
+    authorization: &'a satelle_core::ProviderBindingAuthorization,
+    overwrite_authorized: bool,
+    secret: &'a str,
 }
 
 #[derive(Serialize)]
@@ -898,6 +908,66 @@ impl HostService {
             )
             .and_then(
                 crate::operation_capacity::OperationOutcome::into_provider_binding_authorization,
+            )
+    }
+
+    pub fn provision_provider_secret_idempotent(
+        &self,
+        host: &str,
+        authorization: satelle_core::ProviderBindingAuthorization,
+        secret: zeroize::Zeroizing<String>,
+        overwrite_authorized: bool,
+        authority: &MutationAuthority,
+    ) -> Result<satelle_core::ProviderSecretProvisioningResult, SatelleError> {
+        let canonical_payload = canonical_payload(
+            &CanonicalProviderSecretProvisioning {
+                operation: "provider_secret_provisioning",
+                host,
+                authorization: &authorization,
+                overwrite_authorized,
+                secret: secret.as_str(),
+            },
+            PROVIDER_SECRET_PROVISIONING_DIGEST_SCHEMA_VERSION,
+        )?;
+        let _identity_gate = self.operation_capacity.lock_identity_read()?;
+        let identity = self.runtime.authenticated_request_identity(
+            &authority.principal,
+            IdempotentOperation::ProviderSecretProvisioning,
+            &authority.idempotency_key,
+            canonical_payload.as_slice(),
+            canonical_payload.digest_schema_version,
+        )?;
+        let operation_identity = identity.clone();
+        self.operation_capacity
+            .execute(
+                crate::operation_capacity::OperationRequest::new(
+                    IdempotentOperation::ProviderSecretProvisioning,
+                    &identity,
+                ),
+                || {
+                    self.runtime
+                        .provider_secret_provisioning_replay(&identity)
+                        .map(|result| {
+                            result.map(
+                                crate::operation_capacity::OperationOutcome::provider_secret_provisioning,
+                            )
+                        })
+                },
+                || {
+                    self.provision_provider_secret(
+                        host,
+                        authorization,
+                        secret,
+                        overwrite_authorized,
+                        &operation_identity,
+                    )
+                    .map(
+                        crate::operation_capacity::OperationOutcome::provider_secret_provisioning,
+                    )
+                },
+            )
+            .and_then(
+                crate::operation_capacity::OperationOutcome::into_provider_secret_provisioning,
             )
     }
 

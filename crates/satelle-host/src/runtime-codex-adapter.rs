@@ -56,6 +56,7 @@ struct ProviderProbePersistence<'a> {
     cancellation: Option<&'a super::request::AdmissionCancellation>,
     persist_thread_ref: &'a mut dyn FnMut(&str) -> Result<(), ()>,
     persist_turn_ref: &'a mut dyn FnMut(&str) -> Result<(), ()>,
+    provider_secret: Option<ResolvedProviderSecret>,
 }
 
 struct ProviderSmokeInvocation<'a> {
@@ -529,12 +530,15 @@ impl ProductionComputerUseAdapter {
         provider_intent: &ProviderComputerUseIntent,
         persistence: &mut ProviderProbePersistence<'_>,
     ) -> Result<PreparedProviderAdmission, Box<ProviderSmokeAttemptFailure>> {
-        let provider_secret = resolve_provider_child_secret(binding).map_err(|error| {
-            Box::new(ProviderSmokeAttemptFailure {
-                evidence: None,
-                error: Box::new(error),
-            })
-        })?;
+        let provider_secret = match persistence.provider_secret.take() {
+            Some(secret) => Some(secret),
+            None => resolve_provider_child_secret(binding).map_err(|error| {
+                Box::new(ProviderSmokeAttemptFailure {
+                    evidence: None,
+                    error: Box::new(error),
+                })
+            })?,
+        };
         if key
             .execution_policy()
             .experimental_features()
@@ -2007,6 +2011,7 @@ impl ComputerUseAdapter for ProductionComputerUseAdapter {
             cancellation: None,
             persist_thread_ref: &mut persist_thread_ref,
             persist_turn_ref: &mut persist_turn_ref,
+            provider_secret: None,
         };
         self.preflight_terminal_inner(provider_intent, cached, cached_provider, &mut persistence)
     }
@@ -2187,6 +2192,7 @@ impl ReadinessProbeDriver for ProductionComputerUseAdapter {
         cached: Option<ReadinessEvidence>,
         cached_provider: Option<ProviderSmokeResult>,
         provider_intent: &ProviderComputerUseIntent,
+        provider_secret: Option<ResolvedProviderSecret>,
         cancellation: &super::request::AdmissionCancellation,
         persist_thread_ref: &mut dyn FnMut(&str) -> Result<(), ()>,
         persist_turn_ref: &mut dyn FnMut(&str) -> Result<(), ()>,
@@ -2195,6 +2201,7 @@ impl ReadinessProbeDriver for ProductionComputerUseAdapter {
             cancellation: Some(cancellation),
             persist_thread_ref,
             persist_turn_ref,
+            provider_secret,
         };
         let result = self.preflight_terminal_inner(
             provider_intent,
@@ -3210,6 +3217,7 @@ mod tests {
             cancellation: None,
             persist_thread_ref: &mut persist_thread_ref,
             persist_turn_ref: &mut persist_turn_ref,
+            provider_secret: None,
         };
         let provider_intent = ProviderComputerUseIntent::new(None, None, false);
         let binding = resolved_provider_binding_for_test("model-provider-cache", "provider-cache");
@@ -3393,6 +3401,7 @@ mod tests {
                 cancellation: None,
                 persist_thread_ref: &mut persist_thread_ref,
                 persist_turn_ref: &mut persist_turn_ref,
+                provider_secret: None,
             };
             let outcome = adapter.run_live_provider_smoke_with_app_server(
                 ProviderSmokeInvocation {

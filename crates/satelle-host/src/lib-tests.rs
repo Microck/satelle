@@ -176,6 +176,7 @@ impl crate::runtime::ReadinessProbeDriver for DoctorRefreshAdapter {
         cached: Option<ReadinessEvidence>,
         cached_provider: Option<ProviderSmokeResult>,
         provider_intent: &ProviderComputerUseIntent,
+        _provider_secret: Option<crate::provider_auth::ResolvedProviderSecret>,
         _cancellation: &AdmissionCancellation,
         _persist_thread_ref: &mut dyn FnMut(&str) -> Result<(), ()>,
         _persist_turn_ref: &mut dyn FnMut(&str) -> Result<(), ()>,

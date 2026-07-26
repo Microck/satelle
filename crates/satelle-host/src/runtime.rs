@@ -41,11 +41,13 @@ use daemon_activity::{DaemonActivity, DaemonActivityGuard};
 use crate::live_events::LiveEventHub;
 use crate::process_identity::ProcessIdentity;
 use crate::storage::{
-    AdmissionOutcome, ApiTokenRegistration, IdempotentOperation, LeaseOwner, LogPageStorageError,
-    NativeReadinessInvalidationReplay, ObservedUpstreamRef, OperatorLogMirror, OperatorLogPolicy,
-    ProviderBindingAuthorizationReplay, ProviderBindingDeletionReplay, ReadinessProbeKind,
-    ReadinessProbeTerminal, SensitiveRequestDigest, SetupActionSkipReason, SetupRepairPlan,
-    SetupRepairProbe, SetupRunPlan, SetupRunRecord, SetupRunStatus, Storage, StorageSnapshot,
+    AdmissionOutcome, ApiTokenRegistration, BeginProviderSecretProvisioning, IdempotentOperation,
+    LeaseOwner, LogPageStorageError, NativeReadinessInvalidationReplay, ObservedUpstreamRef,
+    OperatorLogMirror, OperatorLogPolicy, ProviderBindingAuthorizationReplay,
+    ProviderBindingDeletionReplay, ProviderSecretProvisioningPhase, ProviderSecretProvisioningPlan,
+    ProviderSecretProvisioningReplay, ReadinessProbeKind, ReadinessProbeTerminal,
+    SensitiveRequestDigest, SetupActionSkipReason, SetupRepairPlan, SetupRepairProbe, SetupRunPlan,
+    SetupRunRecord, SetupRunStatus, Storage, StorageSnapshot,
 };
 use crate::{ApiBearerToken, ApiPrincipal, DaemonLogPage, LogCursor, LogPageQuery};
 use recovery::RecoveryQueue;
@@ -89,6 +91,74 @@ enum ProviderDescriptorValidationReplay {
 enum SetupVerificationReplay {
     Completed(satelle_core::DoctorReport),
     Failed(SatelleError),
+}
+
+pub(crate) struct PendingProviderReadiness {
+    readiness: Option<AdapterReadiness>,
+    heartbeat: Option<LeaseHeartbeatGuard>,
+}
+
+impl PendingProviderReadiness {
+    pub(crate) fn readiness(&self) -> Result<&AdapterReadiness, SatelleError> {
+        self.readiness
+            .as_ref()
+            .ok_or_else(|| integrity_error("provider readiness was already consumed"))
+    }
+
+    pub(crate) fn take_provider_secret(
+        &self,
+    ) -> Option<crate::provider_auth::ResolvedProviderSecret> {
+        self.readiness
+            .as_ref()
+            .and_then(AdapterReadiness::take_resolved_provider_secret)
+    }
+
+    pub(crate) fn finish(mut self) {
+        self.heartbeat.take();
+    }
+
+    pub(crate) fn retain_for_recovery(mut self) {
+        self.heartbeat.take();
+    }
+}
+
+impl Drop for PendingProviderReadiness {
+    fn drop(&mut self) {
+        // An unconsumed deferred result intentionally leaves the durable lease
+        // active. Startup reconciliation owns the only safe decision after
+        // the caller exits without T3 or an explicit rollback.
+        self.heartbeat.take();
+    }
+}
+
+enum ProviderPreflightSuccess {
+    Committed(AdapterReadiness),
+    Deferred(PendingProviderReadiness),
+}
+
+impl ProviderPreflightSuccess {
+    fn committed(self) -> Result<AdapterReadiness, SatelleError> {
+        match self {
+            Self::Committed(readiness) => Ok(readiness),
+            Self::Deferred(_) => Err(integrity_error(
+                "deferred provider evidence reached a normal preflight caller",
+            )),
+        }
+    }
+
+    fn deferred(self) -> Result<PendingProviderReadiness, SatelleError> {
+        match self {
+            Self::Deferred(readiness) => Ok(readiness),
+            Self::Committed(_) => Err(integrity_error(
+                "committed provider evidence reached a provisioning caller",
+            )),
+        }
+    }
+}
+
+pub(crate) struct OwnedProviderProbe {
+    provider_probe_ref: String,
+    heartbeat: LeaseHeartbeatGuard,
 }
 
 struct AdmissionExecution<'a> {
@@ -909,6 +979,29 @@ impl RuntimeEngine {
         cancellation: &AdmissionCancellation,
         supplied_native: Option<ReadinessEvidence>,
     ) -> Result<AdapterReadiness, SatelleError> {
+        self.preflight_with_native_mode(
+            host,
+            provider_intent,
+            cancellation,
+            supplied_native,
+            None,
+            None,
+            false,
+        )?
+        .committed()
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn preflight_with_native_mode(
+        &self,
+        host: &str,
+        provider_intent: &ProviderComputerUseIntent,
+        cancellation: &AdmissionCancellation,
+        supplied_native: Option<ReadinessEvidence>,
+        provider_secret: Option<crate::provider_auth::ResolvedProviderSecret>,
+        owned_provider_probe: Option<OwnedProviderProbe>,
+        defer_success: bool,
+    ) -> Result<ProviderPreflightSuccess, SatelleError> {
         if cancellation.is_requested() {
             cancellation.finish(AdmissionCancellationState::Cancelled);
             return Err(SatelleError::interrupted_attached_command());
@@ -966,7 +1059,8 @@ impl RuntimeEngine {
                 .provider_computer_use()
                 == satelle_core::session::FeatureChoice::Enabled
         });
-        if let (Some(key), Some(driver)) =
+        if owned_provider_probe.is_none()
+            && let (Some(key), Some(driver)) =
             (cache_key.as_ref(), self.readiness_probe_driver.as_ref())
         {
             self.reconcile_readiness_probe(key, driver.as_ref(), ReadinessProbeKind::Provider)?;
@@ -986,7 +1080,10 @@ impl RuntimeEngine {
         // Hold probe ownership even for a cache candidate so credential
         // rotation cannot turn that candidate into untracked live provider I/O.
         let requires_live_provider_probe = provider_smoke_enabled;
-        let (provider_probe_ref, _provider_heartbeat) = if requires_live_provider_probe
+        let (provider_probe_ref, mut provider_heartbeat) =
+            if let Some(owned) = owned_provider_probe {
+                (Some(owned.provider_probe_ref), Some(owned.heartbeat))
+            } else if requires_live_provider_probe
             && self.readiness_probe_driver.is_some()
             && let Some(key) = cache_key.as_ref()
         {
@@ -1014,9 +1111,9 @@ impl RuntimeEngine {
                 }
             };
             (Some(provider_probe_ref), Some(heartbeat))
-        } else {
-            (None, None)
-        };
+            } else {
+                (None, None)
+            };
 
         let persistence_error = std::cell::RefCell::new(None);
         let preflight = {
@@ -1056,6 +1153,7 @@ impl RuntimeEngine {
                         cached,
                         cached_provider,
                         &provider_intent,
+                        provider_secret,
                         cancellation,
                         &mut persist_thread_ref,
                         &mut persist_turn_ref,
@@ -1070,6 +1168,10 @@ impl RuntimeEngine {
 
         match preflight {
             AdapterPreflight::Cancelled(observation) => {
+                if defer_success {
+                    provider_heartbeat.take();
+                    return Err(adapter::admission_cancelled_error(observation));
+                }
                 let terminal = matches!(
                     observation,
                     satelle_core::session::StopObservation::CancellationConfirmed
@@ -1094,6 +1196,19 @@ impl RuntimeEngine {
                 Err(adapter::admission_cancelled_error(observation))
             }
             AdapterPreflight::Ready(readiness) => {
+                if defer_success {
+                    if provider_probe_ref.is_none() {
+                        return Err(integrity_error(
+                            "deferred provider validation lost durable ownership",
+                        ));
+                    }
+                    return Ok(ProviderPreflightSuccess::Deferred(
+                        PendingProviderReadiness {
+                            readiness: Some(readiness),
+                            heartbeat: provider_heartbeat.take(),
+                        },
+                    ));
+                }
                 self.lock_storage()?
                     .store_preflight_successes(
                         readiness.adapter(),
@@ -1108,7 +1223,7 @@ impl RuntimeEngine {
                         .release_provider_probe(provider_probe_ref)
                         .map_err(model::storage_failure)?;
                 }
-                Ok(readiness)
+                Ok(ProviderPreflightSuccess::Committed(readiness))
             }
             AdapterPreflight::Failed {
                 key,
@@ -1117,6 +1232,10 @@ impl RuntimeEngine {
                 error,
                 dispatch_possible,
             } => {
+                if defer_success {
+                    provider_heartbeat.take();
+                    return Err(error);
+                }
                 self.lock_storage()?
                     .store_preflight_failure(&key, &evidence, reason)
                     .map_err(model::storage_failure)?;
@@ -1144,6 +1263,10 @@ impl RuntimeEngine {
                 failure,
                 error,
             } => {
+                if defer_success {
+                    provider_heartbeat.take();
+                    return Err(error);
+                }
                 let terminal = readiness_probe_terminal_with_dispatch(
                     &error,
                     persistence_failed,
@@ -1174,6 +1297,10 @@ impl RuntimeEngine {
                 Err(error)
             }
             AdapterPreflight::UncachedFailure(error) => {
+                if defer_success {
+                    provider_heartbeat.take();
+                    return Err(error);
+                }
                 let recovery_pending = probe_dispatch_possible(&error) || persistence_failed;
                 if let Some(provider_probe_ref) = provider_probe_ref.as_deref() {
                     if recovery_pending {
@@ -1194,6 +1321,25 @@ impl RuntimeEngine {
                 Err(error)
             }
         }
+    }
+
+    fn provider_secret_provisioning_probe(
+        &self,
+        host: &str,
+        provider_intent: &ProviderComputerUseIntent,
+        provider_secret: crate::provider_auth::ResolvedProviderSecret,
+        owned_provider_probe: OwnedProviderProbe,
+    ) -> Result<PendingProviderReadiness, SatelleError> {
+        self.preflight_with_native_mode(
+            host,
+            provider_intent,
+            &AdmissionCancellation::new(),
+            None,
+            Some(provider_secret),
+            Some(owned_provider_probe),
+            true,
+        )?
+        .deferred()
     }
 
     #[cfg(test)]
@@ -1824,6 +1970,27 @@ impl std::fmt::Debug for RuntimeHandle {
 }
 
 impl RuntimeHandle {
+    pub(crate) fn provider_secret_provisioning_hmac(
+        &self,
+        domain: &str,
+        secret: &crate::provider_auth::ResolvedProviderSecret,
+    ) -> Result<String, SatelleError> {
+        let fingerprinter = self
+            .lazy
+            .lock()
+            .map_err(|_| integrity_error("the lazy runtime lock was poisoned"))?
+            .provider_smoke_fingerprinter
+            .clone()
+            .ok_or_else(|| integrity_error("the provider secret HMAC key is unavailable"))?;
+        fingerprinter
+            .fingerprint(domain, Some(secret))
+            .ok_or_else(|| integrity_error("the provider secret HMAC key is uninitialized"))
+    }
+
+    pub(crate) fn provider_probe_recovery_required(error: &SatelleError) -> bool {
+        probe_dispatch_possible(error)
+    }
+
     pub(crate) fn begin_setup_run(
         &self,
         plan: &SetupRunPlan,
@@ -2497,6 +2664,224 @@ impl RuntimeHandle {
             .preflight(host, provider_intent, &AdmissionCancellation::new())
     }
 
+    pub(crate) fn provider_secret_provisioning_ownership(
+        &self,
+        host: &str,
+        provider_intent: &ProviderComputerUseIntent,
+        operation_id: &str,
+        provider_probe_ref: &str,
+    ) -> Result<
+        (
+            satelle_core::session::HostIdentityRef,
+            ReadinessCacheKey,
+            LeaseOwner,
+        ),
+        SatelleError,
+    > {
+        let engine = self.engine()?;
+        let authorized = engine.authorize_provider_intent(host, provider_intent)?;
+        let key = engine
+            .adapter
+            .readiness_cache_key(host, &authorized)?
+            .ok_or_else(SatelleError::computer_use_not_ready)?;
+        let now = time::OffsetDateTime::now_utc();
+        let owner = LeaseOwner::new(
+            operation_id,
+            engine.process_identity.process_id(),
+            engine.process_identity.process_start_ref(),
+            engine.process_identity.boot_identity_ref(),
+            now,
+        )
+        .map_err(model::storage_failure)?;
+        Ok((engine.host_identity()?, key, owner))
+    }
+
+    pub(crate) fn provider_secret_provisioning_replay(
+        &self,
+        identity: &RequestIdentity,
+    ) -> Result<Option<satelle_core::ProviderSecretProvisioningResult>, SatelleError> {
+        let idempotency = model::idempotency(
+            IdempotentOperation::ProviderSecretProvisioning,
+            identity,
+            time::OffsetDateTime::now_utc(),
+        )?;
+        match self
+            .engine()?
+            .lock_storage()?
+            .provider_secret_provisioning_replay(&idempotency)
+            .map_err(model::storage_failure)?
+        {
+            Some(ProviderSecretProvisioningReplay::Completed(result)) => Ok(Some(result)),
+            Some(ProviderSecretProvisioningReplay::Failed(error)) => Err(error),
+            None => Ok(None),
+        }
+    }
+
+    pub(crate) fn begin_provider_secret_provisioning(
+        &self,
+        identity: &RequestIdentity,
+        key: &ReadinessCacheKey,
+        owner: &LeaseOwner,
+        plan: ProviderSecretProvisioningPlan,
+    ) -> Result<BeginProviderSecretProvisioning, SatelleError> {
+        let idempotency = model::idempotency(
+            IdempotentOperation::ProviderSecretProvisioning,
+            identity,
+            time::OffsetDateTime::now_utc(),
+        )?;
+        self.engine()?
+            .lock_storage()?
+            .begin_provider_secret_provisioning(&idempotency, key, owner, plan)
+            .map_err(model::storage_failure)
+    }
+
+    pub(crate) fn record_staged_provider_secret(
+        &self,
+        operation_id: &str,
+        destination_existed: bool,
+        backup_path: Option<&Path>,
+        prior_secret_hmac: Option<&str>,
+    ) -> Result<(), SatelleError> {
+        self.engine()?
+            .lock_storage()?
+            .record_staged_provider_secret(
+                operation_id,
+                destination_existed,
+                backup_path,
+                prior_secret_hmac,
+                time::OffsetDateTime::now_utc(),
+            )
+            .map_err(model::storage_failure)
+    }
+
+    pub(crate) fn transition_provider_secret_provisioning(
+        &self,
+        operation_id: &str,
+        expected: ProviderSecretProvisioningPhase,
+        next: ProviderSecretProvisioningPhase,
+    ) -> Result<(), SatelleError> {
+        self.engine()?
+            .lock_storage()?
+            .transition_provider_secret_provisioning(
+                operation_id,
+                expected,
+                next,
+                time::OffsetDateTime::now_utc(),
+            )
+            .map_err(model::storage_failure)
+    }
+
+    pub(crate) fn mark_provider_secret_provisioning_rollback_pending(
+        &self,
+        operation_id: &str,
+        expected: ProviderSecretProvisioningPhase,
+    ) -> Result<(), SatelleError> {
+        self.engine()?
+            .lock_storage()?
+            .mark_provider_secret_provisioning_rollback_pending(
+                operation_id,
+                expected,
+                time::OffsetDateTime::now_utc(),
+            )
+            .map_err(model::storage_failure)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn commit_provider_secret_provisioning(
+        &self,
+        operation_id: &str,
+        binding: &ResolvedProviderBinding,
+        expected_previous_digest: Option<&str>,
+        key: &ReadinessCacheKey,
+        readiness: &ReadinessEvidence,
+        provider: Option<&ProviderSmokeEvidence>,
+    ) -> Result<(), SatelleError> {
+        self.engine()?
+            .lock_storage()?
+            .commit_provider_secret_provisioning(
+                operation_id,
+                binding,
+                expected_previous_digest,
+                key,
+                readiness,
+                provider,
+                time::OffsetDateTime::now_utc(),
+            )
+            .map_err(model::storage_failure)
+    }
+
+    pub(crate) fn finish_provider_secret_provisioning_success(
+        &self,
+        operation_id: &str,
+    ) -> Result<satelle_core::ProviderSecretProvisioningResult, SatelleError> {
+        match self
+            .engine()?
+            .lock_storage()?
+            .finish_provider_secret_provisioning_success(
+                operation_id,
+                time::OffsetDateTime::now_utc(),
+            )
+            .map_err(model::storage_failure)?
+        {
+            ProviderSecretProvisioningReplay::Completed(result) => Ok(result),
+            ProviderSecretProvisioningReplay::Failed(_) => Err(integrity_error(
+                "successful provider provisioning produced a failure replay",
+            )),
+        }
+    }
+
+    pub(crate) fn finish_provider_secret_provisioning_failure(
+        &self,
+        operation_id: &str,
+        error: SatelleError,
+    ) -> Result<SatelleError, SatelleError> {
+        match self
+            .engine()?
+            .lock_storage()?
+            .finish_provider_secret_provisioning_failure(
+                operation_id,
+                error,
+                time::OffsetDateTime::now_utc(),
+            )
+            .map_err(model::storage_failure)?
+        {
+            ProviderSecretProvisioningReplay::Failed(error) => Ok(error),
+            ProviderSecretProvisioningReplay::Completed(_) => Err(integrity_error(
+                "failed provider provisioning produced a success replay",
+            )),
+        }
+    }
+
+    pub(crate) fn validate_staged_provider_secret(
+        &self,
+        host: &str,
+        provider_intent: &ProviderComputerUseIntent,
+        provider_secret: crate::provider_auth::ResolvedProviderSecret,
+        owned_provider_probe: OwnedProviderProbe,
+    ) -> Result<PendingProviderReadiness, SatelleError> {
+        let _activity = self.activity.begin();
+        self.engine()?.provider_secret_provisioning_probe(
+            host,
+            provider_intent,
+            provider_secret,
+            owned_provider_probe,
+        )
+    }
+
+    pub(crate) fn start_owned_provider_probe(
+        &self,
+        provider_probe_ref: impl Into<String>,
+        owner: &LeaseOwner,
+    ) -> Result<OwnedProviderProbe, SatelleError> {
+        let engine = self.engine()?;
+        let heartbeat = LeaseHeartbeatGuard::start(Arc::clone(&engine.storage), owner)
+            .map_err(heartbeat_start_failure)?;
+        Ok(OwnedProviderProbe {
+            provider_probe_ref: provider_probe_ref.into(),
+            heartbeat,
+        })
+    }
+
     /// Runs only the live native setup phase for the current explicit Host
     /// context. Provider authorization cannot run before this returns.
     pub(crate) fn refresh_setup_native_readiness(
@@ -2544,6 +2929,17 @@ impl RuntimeHandle {
     ) -> Result<ProviderBindingResolution, SatelleError> {
         self.engine()?
             .resolve_provider_binding(host, provider_intent)
+    }
+
+    pub(crate) fn authorized_provider_binding(
+        &self,
+        model_alias: &str,
+        provider_alias: &str,
+    ) -> Result<Option<ResolvedProviderBinding>, SatelleError> {
+        self.engine()?
+            .lock_storage()?
+            .load_authorized_provider_binding(model_alias, provider_alias)
+            .map_err(model::storage_failure)
     }
 
     #[cfg(any(test, feature = "test-support"))]

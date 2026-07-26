@@ -12,7 +12,8 @@ use rusqlite::{OptionalExtension, TransactionBehavior, params};
 use satelle_core::session::{DesktopBindingRef, HostIdentityRef};
 use satelle_core::{
     ProviderBindingAuthorization, ProviderBindingSource, ProviderSecretSource,
-    PublicResolvedProviderBinding, ResolvedProviderBinding, SatelleError,
+    ProviderSecretProvisioningResult, PublicResolvedProviderBinding, ResolvedProviderBinding,
+    SatelleError,
 };
 use serde::{Deserialize, Serialize};
 use std::fmt;
@@ -227,7 +228,7 @@ impl fmt::Debug for ProviderSecretProvisioningJournal {
 #[derive(Clone, Deserialize, Serialize)]
 #[serde(tag = "status", content = "result", rename_all = "snake_case")]
 pub(crate) enum ProviderSecretProvisioningReplay {
-    Completed(PublicResolvedProviderBinding),
+    Completed(ProviderSecretProvisioningResult),
     Failed(SatelleError),
 }
 
@@ -489,7 +490,10 @@ impl Storage {
             return Err(StorageError::new(StorageErrorKind::StateConflict));
         }
         let replay = ProviderSecretProvisioningReplay::Completed(
-            PublicResolvedProviderBinding::from(&journal.binding),
+            ProviderSecretProvisioningResult::file(
+                journal.destination_existed.unwrap_or(false),
+                "validated",
+            ),
         );
         terminalize(
             &transaction,
