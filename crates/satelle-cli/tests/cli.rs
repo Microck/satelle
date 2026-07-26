@@ -2370,7 +2370,7 @@ adapter = "codex"
     });
     let report = parse_json_output(&output.stdout);
 
-    assert_eq!(report["schema_version"], "satelle.setup.v1");
+    assert_eq!(report["schema_version"], "satelle.setup.v2");
     assert_eq!(report["dry_run"], true);
     assert_eq!(report["status"], "planned");
     assert_eq!(
@@ -4630,7 +4630,7 @@ fn config_check_explain_and_paths_use_versioned_read_only_json_contracts() {
     let explain_report = parse_json_output(&explain_output.stdout);
     assert_eq!(
         explain_report["schema_version"],
-        "satelle.config.explain.v1"
+        "satelle.config.explain.v2"
     );
     assert_eq!(explain_report["selected_host"], "local-demo");
     assert!(explain_report["effective"].is_object());
