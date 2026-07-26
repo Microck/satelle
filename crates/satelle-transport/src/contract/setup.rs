@@ -53,6 +53,10 @@ define_schema_token!(
     ProviderSecretProvisioningResponseSchema,
     "satelle.provider-secret-provisioning-response.v1"
 );
+define_schema_token!(
+    ProviderSecretProvisioningPreviewResponseSchema,
+    "satelle.provider-secret-provisioning-preview-response.v1"
+);
 define_schema_token!(SetupVerificationSchema, "satelle.setup-verification.v1");
 define_schema_token!(
     SetupVerificationResponseSchema,
@@ -181,6 +185,57 @@ impl ApiRequestContract for ProviderSecretProvisioningMetadata {
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
+pub struct ProviderSecretProvisioningPreviewResponse {
+    schema_version: ProviderSecretProvisioningPreviewResponseSchema,
+    request_id: RequestId,
+    host_identity: String,
+    destination_kind: String,
+    destination_exists: bool,
+    overwrite_required: bool,
+}
+
+impl ProviderSecretProvisioningPreviewResponse {
+    pub(crate) fn new(
+        request_id: RequestId,
+        host_identity: String,
+        destination_kind: impl Into<String>,
+        destination_exists: bool,
+    ) -> Self {
+        Self {
+            schema_version: ProviderSecretProvisioningPreviewResponseSchema,
+            request_id,
+            host_identity,
+            destination_kind: destination_kind.into(),
+            destination_exists,
+            overwrite_required: destination_exists,
+        }
+    }
+
+    pub fn destination_kind(&self) -> &str {
+        &self.destination_kind
+    }
+
+    pub const fn destination_exists(&self) -> bool {
+        self.destination_exists
+    }
+
+    pub const fn overwrite_required(&self) -> bool {
+        self.overwrite_required
+    }
+}
+
+impl AuthenticatedResponseContract for ProviderSecretProvisioningPreviewResponse {
+    fn request_id(&self) -> &RequestId {
+        &self.request_id
+    }
+
+    fn host_identity(&self) -> &str {
+        &self.host_identity
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct ProviderSecretProvisioningResponse {
     schema_version: ProviderSecretProvisioningResponseSchema,
     request_id: RequestId,
@@ -195,6 +250,7 @@ impl ProviderSecretProvisioningResponse {
     pub(crate) fn new(
         request_id: RequestId,
         host_identity: String,
+        destination_kind: impl Into<String>,
         overwritten: bool,
         validation_status: impl Into<String>,
     ) -> Self {
@@ -202,11 +258,15 @@ impl ProviderSecretProvisioningResponse {
             schema_version: ProviderSecretProvisioningResponseSchema,
             request_id,
             host_identity,
-            destination_kind: "file".to_string(),
+            destination_kind: destination_kind.into(),
             provisioned: true,
             overwritten,
             validation_status: validation_status.into(),
         }
+    }
+
+    pub fn destination_kind(&self) -> &str {
+        &self.destination_kind
     }
 
     pub const fn provisioned(&self) -> bool {

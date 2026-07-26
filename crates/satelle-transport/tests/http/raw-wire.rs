@@ -15,6 +15,60 @@ use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 #[tokio::test]
+async fn provider_secret_raw_wire_rejects_identity_content_type_and_duplicate_metadata_safely() {
+    let running = RunningServer::start(ApiScopes::ADMIN).await;
+    let authorization = bearer(&running.token);
+    let secret_canary = "PRIVATE_PROVIDER_SECRET_RAW_WIRE_CANARY";
+    let metadata = serde_json::to_string(&satelle_transport::ProviderSecretProvisioningMetadata::new(
+        satelle_core::ProviderBindingAuthorization::new(
+            "vision",
+            "open_ai",
+            "gpt-5.6",
+            "openai",
+        ),
+        false,
+    ))
+    .expect("encode provider secret metadata");
+
+    for (expected_host, content_type, metadata_headers, status, code) in [
+        (
+            "unexpected-host",
+            "application/octet-stream",
+            format!("Satelle-Provider-Secret-Metadata: {metadata}\r\n"),
+            409,
+            "host-identity-mismatch",
+        ),
+        (
+            running.host_identity.as_str(),
+            "application/json",
+            format!("Satelle-Provider-Secret-Metadata: {metadata}\r\n"),
+            415,
+            "unsupported-content-type",
+        ),
+        (
+            running.host_identity.as_str(),
+            "application/octet-stream",
+            format!(
+                "Satelle-Provider-Secret-Metadata: {metadata}\r\nSatelle-Provider-Secret-Metadata: {metadata}\r\n"
+            ),
+            400,
+            "invalid-request",
+        ),
+    ] {
+        let mut request = format!(
+            "POST /v1/setup/provider-secret HTTP/1.1\r\nHost: localhost\r\nAuthorization: {authorization}\r\nSatelle-Expected-Host-Identity: {expected_host}\r\nSatelle-Request-Id: {}\r\nSatelle-Protocol-Version: 10\r\nIdempotency-Key: provider-secret-raw-wire\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\n{metadata_headers}Connection: close\r\n\r\n",
+            RequestId::new(),
+            secret_canary.len(),
+        )
+        .into_bytes();
+        request.extend_from_slice(secret_canary.as_bytes());
+        let response = raw_request(running.server.local_addr(), &request).await;
+        assert_raw_api_error(&response, status, code);
+        assert!(!String::from_utf8_lossy(&response).contains(secret_canary));
+    }
+}
+
+#[tokio::test]
 async fn chunked_oversize_body_returns_typed_413_without_admission() {
     let running = RunningServer::start(ApiScopes::CONTROL).await;
     let authorization = bearer(&running.token);

@@ -19,10 +19,11 @@ pub use contract::{
     ProviderBindingAuthorizationRequest, ProviderBindingAuthorizationResponse,
     ProviderBindingDeletionResponse, ProviderBindingSource, ProviderDescriptorValidationRequest,
     ProviderDescriptorValidationResponse, ProviderSecretProvisioningMetadata,
-    ProviderSecretProvisioningResponse, RequestId, ResolvedProviderBinding,
-    SUPPORTED_IMAGE_MEDIA_TYPES, SessionResponse, SetupVerificationRequest,
-    SetupVerificationResponse, StopRequest, StopResponse, SubscribeRequest, SubscribeRequestError,
-    SubscribedResponse, TurnRequest, WsCloseReason, WsControlError, WsServerControl,
+    ProviderSecretProvisioningPreviewResponse, ProviderSecretProvisioningResponse, RequestId,
+    ResolvedProviderBinding, SUPPORTED_IMAGE_MEDIA_TYPES, SessionResponse,
+    SetupVerificationRequest, SetupVerificationResponse, StopRequest, StopResponse,
+    SubscribeRequest, SubscribeRequestError, SubscribedResponse, TurnRequest, WsCloseReason,
+    WsControlError, WsServerControl,
 };
 pub use server::{
     DaemonServer, DaemonServerConfig, DaemonServerError, DaemonShutdownHandle, DaemonTlsConfig,

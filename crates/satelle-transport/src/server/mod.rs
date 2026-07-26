@@ -922,6 +922,19 @@ fn router(state: Arc<DaemonState>) -> Router {
             Arc::clone(&state),
             auth::require_control,
         ));
+    let provider_secret_provisioning_routes = Router::new()
+        .route(
+            "/v1/setup/provider-secret/preview",
+            post(setup::preview_provider_secret_provisioning),
+        )
+        .route(
+            "/v1/setup/provider-secret",
+            post(setup::provision_provider_secret),
+        )
+        .route_layer(middleware::from_fn_with_state(
+            Arc::clone(&state),
+            auth::require_admin_mutation,
+        ));
     let setup_verification_route = Router::new()
         .route("/v1/setup/verify", post(setup::verify_setup))
         .route_layer(middleware::from_fn_with_state(
@@ -957,6 +970,7 @@ fn router(state: Arc<DaemonState>) -> Router {
         .merge(provider_binding_authorization_routes)
         .merge(provider_binding_deletion_route)
         .merge(provider_descriptor_validation_route)
+        .merge(provider_secret_provisioning_routes)
         .merge(setup_verification_route)
         .merge(native_readiness_invalidation_route)
         .merge(control_routes)

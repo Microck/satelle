@@ -6,8 +6,10 @@ use crate::contract::{
     NativeReadinessInvalidationResponse, PROTOCOL_VERSION, PROTOCOL_VERSION_HEADER,
     ProviderBindingAuthorizationRequest, ProviderBindingAuthorizationResponse,
     ProviderBindingDeletionResponse, ProviderDescriptorValidationRequest,
-    ProviderDescriptorValidationResponse, RequestId, SessionResponse, SetupVerificationRequest,
-    SetupVerificationResponse, StopRequest, StopResponse, TurnRequest,
+    ProviderDescriptorValidationResponse, ProviderSecretProvisioningMetadata,
+    ProviderSecretProvisioningPreviewResponse, ProviderSecretProvisioningResponse, RequestId,
+    SessionResponse, SetupVerificationRequest, SetupVerificationResponse, StopRequest, StopResponse,
+    TurnRequest,
 };
 use crate::transport_tls::{
     ReqwestTrustError, TlsFailureKind, classify_tls_error, configure_reqwest_trust,
@@ -15,7 +17,7 @@ use crate::transport_tls::{
 };
 use percent_encoding::{AsciiSet, CONTROLS, utf8_percent_encode};
 use reqwest::blocking::{Client, RequestBuilder, Response};
-use reqwest::header::{AUTHORIZATION, HeaderValue};
+use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, HeaderValue};
 use reqwest::redirect::Policy;
 use reqwest::{Method, StatusCode};
 use satelle_core::session::{EffectiveModelRef, ProviderBindingRef};
@@ -23,11 +25,14 @@ use satelle_core::{DirectHostBinding, SessionId};
 use satelle_host::{ApiBearerToken, LogPageQuery};
 use serde::de::DeserializeOwned;
 use std::fmt;
+use std::io::{self, Read};
 use std::net::SocketAddr;
 use std::time::Duration;
 use zeroize::Zeroizing;
 
 const DIRECT_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+const PROVIDER_SECRET_CONTENT_TYPE: &str = "application/octet-stream";
+const PROVIDER_SECRET_METADATA_HEADER: &str = "Satelle-Provider-Secret-Metadata";
 const PROVIDER_BINDING_ALIAS_ENCODE_SET: &AsciiSet =
     &CONTROLS.add(b'/').add(b'?').add(b'#').add(b'%').add(b'\\');
 
@@ -46,6 +51,27 @@ fn provider_binding_path(
     Ok(format!(
         "/v1/setup/provider-bindings/{provider_alias}/{model_alias}"
     ))
+}
+
+struct ZeroizingRequestBody {
+    bytes: Zeroizing<Vec<u8>>,
+    position: usize,
+}
+
+impl ZeroizingRequestBody {
+    fn new(bytes: Zeroizing<Vec<u8>>) -> Self {
+        Self { bytes, position: 0 }
+    }
+}
+
+impl Read for ZeroizingRequestBody {
+    fn read(&mut self, output: &mut [u8]) -> io::Result<usize> {
+        let remaining = &self.bytes[self.position..];
+        let read = remaining.len().min(output.len());
+        output[..read].copy_from_slice(&remaining[..read]);
+        self.position += read;
+        Ok(read)
+    }
 }
 
 pub struct DaemonClient {
@@ -307,6 +333,45 @@ impl DaemonClient {
         );
         let (request, request_id) = self.mutation_request(&path, idempotency_key)?;
         let request = self.provider_validation_request(request.json(validation), validation);
+        self.send_authenticated(request, request_id, StatusCode::OK)
+    }
+
+    pub fn preview_provider_secret_provisioning(
+        &self,
+        metadata: &ProviderSecretProvisioningMetadata,
+        idempotency_key: &str,
+    ) -> Result<ProviderSecretProvisioningPreviewResponse, DaemonClientError> {
+        let (request, request_id) =
+            self.mutation_request("/v1/setup/provider-secret/preview", idempotency_key)?;
+        self.send_authenticated(request.json(metadata), request_id, StatusCode::OK)
+    }
+
+    pub fn provision_provider_secret(
+        &self,
+        metadata: &ProviderSecretProvisioningMetadata,
+        secret: Zeroizing<Vec<u8>>,
+        idempotency_key: &str,
+    ) -> Result<ProviderSecretProvisioningResponse, DaemonClientError> {
+        // The authenticated preview validates the pinned Host Identity before
+        // reqwest receives any raw secret bytes.
+        self.preview_provider_secret_provisioning(metadata, idempotency_key)?;
+
+        let encoded_metadata = Zeroizing::new(
+            serde_json::to_vec(metadata)
+                .map_err(|_| DaemonClientError::ResponseContractViolation)?,
+        );
+        let mut metadata_header = HeaderValue::from_bytes(encoded_metadata.as_slice())
+            .map_err(|_| DaemonClientError::ResponseContractViolation)?;
+        metadata_header.set_sensitive(true);
+        let (request, request_id) =
+            self.mutation_request("/v1/setup/provider-secret", idempotency_key)?;
+        let body = reqwest::blocking::Body::new(ZeroizingRequestBody::new(secret));
+        let request = self.admission_request(
+            request
+                .header(CONTENT_TYPE, PROVIDER_SECRET_CONTENT_TYPE)
+                .header(PROVIDER_SECRET_METADATA_HEADER, metadata_header)
+                .body(body),
+        );
         self.send_authenticated(request, request_id, StatusCode::OK)
     }
 

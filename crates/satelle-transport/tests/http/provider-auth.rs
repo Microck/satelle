@@ -6,11 +6,92 @@ use satelle_core::{
 use satelle_transport::{
     ProviderBindingAuthorizationRequest, ProviderBindingAuthorizationResponse,
     ProviderBindingDeletionResponse, ProviderDescriptorValidationRequest,
-    ProviderDescriptorValidationResponse,
+    ProviderDescriptorValidationResponse, ProviderSecretProvisioningMetadata,
 };
 
 const VALIDATION_PATH: &str = "/v1/setup/provider-bindings/open_ai/vision/validate";
 const AUTHORIZATION_PATH: &str = "/v1/setup/provider-bindings/open_ai/vision";
+const PROVIDER_SECRET_PATH: &str = "/v1/setup/provider-secret";
+const PROVIDER_SECRET_METADATA_HEADER: &str = "Satelle-Provider-Secret-Metadata";
+
+fn provider_secret_metadata(overwrite_authorized: bool) -> ProviderSecretProvisioningMetadata {
+    ProviderSecretProvisioningMetadata::new(
+        ProviderBindingAuthorization::new("vision", "open_ai", "gpt-5.6", "openai"),
+        overwrite_authorized,
+    )
+}
+
+#[tokio::test]
+async fn provider_secret_provisioning_requires_admin_mutation_authority_before_body_dispatch() {
+    let metadata =
+        serde_json::to_string(&provider_secret_metadata(false)).expect("encode metadata");
+    let secret_canary = "PRIVATE_PROVIDER_SECRET_AUTHORITY_CANARY";
+
+    let read_only = RunningServer::start(ApiScopes::READ).await;
+    let forbidden = read_only
+        .mutation(PROVIDER_SECRET_PATH, "provider-secret-read-only")
+        .header("Content-Type", "application/octet-stream")
+        .header(PROVIDER_SECRET_METADATA_HEADER, &metadata)
+        .body(secret_canary)
+        .send()
+        .await
+        .expect("send provider secret without admin authority");
+    assert_eq!(forbidden.status(), StatusCode::FORBIDDEN);
+    let bytes = forbidden.bytes().await.expect("read forbidden response");
+    assert!(!String::from_utf8_lossy(&bytes).contains(secret_canary));
+
+    let control = RunningServer::start(ApiScopes::CONTROL).await;
+    let forbidden = control
+        .mutation(PROVIDER_SECRET_PATH, "provider-secret-control")
+        .header("Content-Type", "application/octet-stream")
+        .header(PROVIDER_SECRET_METADATA_HEADER, metadata)
+        .body(secret_canary)
+        .send()
+        .await
+        .expect("send provider secret with control-only authority");
+    assert_eq!(forbidden.status(), StatusCode::FORBIDDEN);
+    let bytes = forbidden.bytes().await.expect("read forbidden response");
+    assert!(!String::from_utf8_lossy(&bytes).contains(secret_canary));
+}
+
+#[tokio::test]
+async fn provider_secret_provisioning_failure_replays_without_echoing_secret_material() {
+    let admin = RunningServer::start(ApiScopes::ADMIN).await;
+    let metadata =
+        serde_json::to_string(&provider_secret_metadata(false)).expect("encode metadata");
+    let secret_canary = "PRIVATE_PROVIDER_SECRET_REPLAY_CANARY";
+    let request_id = RequestId::new();
+
+    let send = || {
+        admin
+            .protected_request_with_request_id(
+                reqwest::Method::POST,
+                PROVIDER_SECRET_PATH,
+                &request_id,
+            )
+            .header("Satelle-Protocol-Version", "10")
+            .header("Idempotency-Key", "provider-secret-failed-replay")
+            .header("Content-Type", "application/octet-stream")
+            .header(PROVIDER_SECRET_METADATA_HEADER, &metadata)
+            .body(secret_canary)
+    };
+    let initial = send()
+        .send()
+        .await
+        .expect("send provider secret without configured destination");
+    let initial_status = initial.status();
+    let initial_bytes = initial.bytes().await.expect("read initial response");
+    assert!(!String::from_utf8_lossy(&initial_bytes).contains(secret_canary));
+
+    let replay = send()
+        .send()
+        .await
+        .expect("replay provider secret failure");
+    assert_eq!(replay.status(), initial_status);
+    let replay_bytes = replay.bytes().await.expect("read replay response");
+    assert_eq!(replay_bytes, initial_bytes);
+    assert!(!String::from_utf8_lossy(&replay_bytes).contains(secret_canary));
+}
 
 #[tokio::test]
 async fn provider_binding_validation_requires_setup_or_control_authority() {
