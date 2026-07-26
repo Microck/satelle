@@ -186,7 +186,7 @@ fn expired_sessionless_provider_idempotency(
              WHERE session_id IS NULL
                AND (
                    (operation = ?1 AND status IN ('in_progress', 'terminal'))
-                   OR (operation IN (?2, ?3) AND status = 'terminal')
+                   OR (operation IN (?2, ?3, ?4) AND status = 'terminal')
                )",
         )
         .map_err(|source| sqlite_error(StorageErrorKind::OperationFailed, source))?;
@@ -194,6 +194,7 @@ fn expired_sessionless_provider_idempotency(
         .query_map(
             params![
                 idempotent_operation_token(IdempotentOperation::ProviderDescriptorValidation),
+                idempotent_operation_token(IdempotentOperation::ProviderSecretProvisioning),
                 idempotent_operation_token(IdempotentOperation::ProviderBindingAuthorization),
                 idempotent_operation_token(IdempotentOperation::ProviderBindingDeletion),
             ],

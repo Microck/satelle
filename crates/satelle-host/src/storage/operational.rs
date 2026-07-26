@@ -1337,6 +1337,35 @@ fn insert_readiness(
         .and_then(require_idempotent_write)
 }
 
+pub(super) fn insert_provider_provisioning_success(
+    transaction: &rusqlite::Transaction<'_>,
+    host_identity: &str,
+    key: &ReadinessCacheKey,
+    readiness: &ReadinessEvidence,
+    provider: Option<&ProviderSmokeEvidence>,
+) -> Result<(), StorageError> {
+    insert_readiness(
+        transaction,
+        host_identity,
+        key.adapter(),
+        key.desktop_binding(),
+        readiness,
+        "passed",
+        None,
+    )?;
+    if let Some(provider) = provider {
+        insert_provider_smoke(
+            transaction,
+            host_identity,
+            key.desktop_binding(),
+            key.execution_policy(),
+            readiness,
+            ProviderSmokeInsert::Passed(provider),
+        )?;
+    }
+    Ok(())
+}
+
 enum ProviderSmokeInsert<'a> {
     Passed(&'a ProviderSmokeEvidence),
     Failed(&'a ProviderSmokeFailureEvidence),

@@ -5,6 +5,8 @@ mod open;
 mod operational;
 #[path = "storage/operator-log.rs"]
 mod operator_log;
+#[path = "storage/provider-secret-journal.rs"]
+mod provider_secret_journal;
 mod retention;
 mod setup_ledger;
 mod sql;
@@ -36,6 +38,12 @@ pub(crate) use self::operator_log::{
     OperatorLogFailureKind, OperatorLogSink, OperatorLogWriteOutcome,
 };
 pub(crate) use self::operator_log::{OperatorLogMirror, OperatorLogPolicy};
+pub(crate) use self::provider_secret_journal::{
+    BeginProviderSecretProvisioning, ProviderSecretProvisioningJournal,
+    ProviderSecretProvisioningPhase, ProviderSecretProvisioningPlan,
+    ProviderSecretProvisioningReplay, PROVIDER_SECRET_CANDIDATE_HMAC_DOMAIN,
+    PROVIDER_SECRET_PRIOR_HMAC_DOMAIN,
+};
 pub(crate) use self::setup_ledger::{
     MaintenanceLeaseCapability, MaintenanceLeaseState, MaintenanceRecoverySubject,
 };
@@ -338,6 +346,7 @@ pub(crate) enum IdempotentOperation {
     HostUpdate,
     StorageMigration,
     DestructiveMaintenance,
+    ProviderSecretProvisioning,
     ProviderDescriptorValidation,
     ProviderBindingAuthorization,
     ProviderBindingDeletion,
