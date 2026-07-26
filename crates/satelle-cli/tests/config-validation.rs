@@ -684,6 +684,7 @@ allow_project_selection = true
 [hosts.local.provider_bindings.openai.review]
 model = "gpt-5.2"
 model_provider = "openai"
+allow_project_selection = true
 "#,
         r#"
 default_host = "local"
@@ -726,6 +727,43 @@ provider_alias = "{provider_alias}"
     }
 }
 
+#[test]
+fn config_check_rejects_project_aliases_without_exact_provider_binding_consent() {
+    let fixture = ConfigFixture::new(
+        r#"
+default_host = "local"
+
+[hosts.local]
+transport = "local"
+adapter = "fake"
+allow_project_selection = true
+
+[hosts.local.provider_bindings.openai.review]
+model = "gpt-5.2"
+model_provider = "openai"
+"#,
+        r#"
+default_host = "local"
+model_alias = "review"
+provider_alias = "openai"
+"#,
+    );
+
+    let output = fixture
+        .command()
+        .args(["config", "check", "--json"])
+        .assert()
+        .code(66)
+        .get_output()
+        .clone();
+    let error = parse_json(&output.stderr);
+
+    assert_eq!(
+        error["code"],
+        "project-provider-selection-not-allowed"
+    );
+}
+
 #[cfg(feature = "test-support")]
 #[test]
 fn non_openai_project_binding_requires_provider_scoped_user_opt_in() {
@@ -743,6 +781,7 @@ model = "claude-computer-use"
 model_provider = "anthropic"
 endpoint = "https://anthropic.invalid/v1"
 auth_source = "anthropic"
+allow_project_selection = true
 
 [hosts.local.provider_auth.anthropic]
 kind = "environment"
@@ -791,6 +830,7 @@ model = "claude-computer-use"
 model_provider = "anthropic"
 endpoint = "https://anthropic.invalid/v1"
 auth_source = "anthropic"
+allow_project_selection = true
 
 [hosts.local.provider_auth.anthropic]
 kind = "environment"

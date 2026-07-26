@@ -247,6 +247,8 @@ pub(crate) trait TransportClient {
         &self,
         model_alias: &str,
         provider_alias: &str,
+        model_alias_from_project: bool,
+        provider_alias_from_project: bool,
         mode: satelle_core::ProviderAuthValidationMode,
         experimental_provider_computer_use: bool,
     ) -> Result<ProviderDescriptorValidationReport, SatelleError>;
@@ -572,6 +574,8 @@ impl TransportClient for LocalTransport {
         &self,
         model_alias: &str,
         provider_alias: &str,
+        model_alias_from_project: bool,
+        provider_alias_from_project: bool,
         mode: satelle_core::ProviderAuthValidationMode,
         experimental_provider_computer_use: bool,
     ) -> Result<ProviderDescriptorValidationReport, SatelleError> {
@@ -580,6 +584,8 @@ impl TransportClient for LocalTransport {
             model_alias,
             provider_alias,
             mode,
+            model_alias_from_project,
+            provider_alias_from_project,
             experimental_provider_computer_use,
         )?;
         Ok(ProviderDescriptorValidationReport {
@@ -3166,6 +3172,8 @@ impl TransportClient for SshSetupTransport {
         &self,
         _model_alias: &str,
         _provider_alias: &str,
+        _model_alias_from_project: bool,
+        _provider_alias_from_project: bool,
         _mode: satelle_core::ProviderAuthValidationMode,
         _experimental_provider_computer_use: bool,
     ) -> Result<ProviderDescriptorValidationReport, SatelleError> {
@@ -3266,6 +3274,8 @@ impl TransportClient for DirectTransport {
         &self,
         model_alias: &str,
         provider_alias: &str,
+        model_alias_from_project: bool,
+        provider_alias_from_project: bool,
         mode: satelle_core::ProviderAuthValidationMode,
         experimental_provider_computer_use: bool,
     ) -> Result<ProviderDescriptorValidationReport, SatelleError> {
@@ -3274,8 +3284,12 @@ impl TransportClient for DirectTransport {
             .validate_provider_descriptor(
                 provider_alias,
                 model_alias,
-                &satelle_transport::ProviderDescriptorValidationRequest::new(mode)
-                    .with_experimental_provider_computer_use(experimental_provider_computer_use),
+                &satelle_transport::ProviderDescriptorValidationRequest::new(
+                    mode,
+                    model_alias_from_project,
+                    provider_alias_from_project,
+                )
+                .with_experimental_provider_computer_use(experimental_provider_computer_use),
                 &format!("provider-validation-{}", Uuid::now_v7()),
             )
             .map_err(|error| direct_transport_error(&self.alias, error))?;

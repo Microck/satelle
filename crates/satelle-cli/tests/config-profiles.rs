@@ -465,6 +465,7 @@ yolo = true
 [hosts.local-demo.provider_bindings.profile-provider.profile-model]
 model = "profile-model"
 model_provider = "openai"
+allow_project_selection = true
 "#,
         r#"
 profile = "unsafe"
@@ -488,6 +489,14 @@ profile = "unsafe"
         let report = parse_json(&output.stdout);
         assert_eq!(report["sources"]["profile"], source);
         assert_eq!(report["effective"]["model_alias"], "profile-model");
+        assert_eq!(
+            report["values"]["model_provider"]["model_alias_from_project"],
+            source == "project_config"
+        );
+        assert_eq!(
+            report["values"]["model_provider"]["provider_alias_from_project"],
+            source == "project_config"
+        );
         assert_eq!(
             report["effective"]["experimental_provider_computer_use"],
             serde_json::Value::Null
@@ -545,6 +554,50 @@ profile = "unsafe"
     let run = parse_json(&run.stdout);
     assert_eq!(run["yolo"]["active"], true);
     assert_eq!(run["yolo"]["source"], "user_config_profile");
+}
+
+#[test]
+fn project_selected_profile_requires_exact_provider_binding_consent() {
+    let fixture = ConfigFixture::new(
+        r#"
+default_host = "local-demo"
+
+[hosts.local-demo]
+transport = "local"
+adapter = "fake"
+allow_project_selection = true
+
+[profiles.review]
+model_alias = "review"
+provider_alias = "openai"
+
+[hosts.local-demo.provider_bindings.openai.review]
+model = "gpt-5.2"
+model_provider = "openai"
+"#,
+        r#"
+profile = "review"
+"#,
+    );
+
+    let denied = fixture
+        .command()
+        .args(["config", "check", "--json"])
+        .assert()
+        .code(66)
+        .get_output()
+        .clone();
+    let denied = parse_json(&denied.stderr);
+    assert_eq!(
+        denied["code"],
+        "project-provider-selection-not-allowed"
+    );
+
+    fixture
+        .command()
+        .args(["--profile", "review", "config", "check", "--json"])
+        .assert()
+        .success();
 }
 
 #[test]

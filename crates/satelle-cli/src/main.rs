@@ -2256,6 +2256,8 @@ fn run_setup(
                 match provider_transport.validate_provider_descriptor(
                     model_alias,
                     provider_alias,
+                    provider_selection.model_alias_from_project,
+                    provider_selection.provider_alias_from_project,
                     satelle_core::ProviderAuthValidationMode::Cached,
                     provider_selection.experimental_provider_computer_use,
                 ) {
@@ -2490,6 +2492,8 @@ fn run_setup(
             let pending_authorization = match provider_transport.validate_provider_descriptor(
                 model_alias,
                 provider_alias,
+                provider_selection.model_alias_from_project,
+                provider_selection.provider_alias_from_project,
                 satelle_core::ProviderAuthValidationMode::Cached,
                 provider_selection.experimental_provider_computer_use,
             ) {
@@ -2522,6 +2526,8 @@ fn run_setup(
                     .validate_provider_descriptor(
                         authorization.requested_model_alias(),
                         authorization.requested_provider_alias(),
+                        provider_selection.model_alias_from_project,
+                        provider_selection.provider_alias_from_project,
                         satelle_core::ProviderAuthValidationMode::Cached,
                         authorization.experimental_provider_computer_use(),
                     )
@@ -2825,6 +2831,8 @@ fn provider_auth_validation_json(
             "resolved_model_provider": validation.resolved_binding.model_provider(),
             "provider_binding_source": validation.resolved_binding.source().as_str(),
             "auth_source_name": provider_selection.auth_source_name,
+            "model_alias_from_project": provider_selection.model_alias_from_project,
+            "provider_alias_from_project": provider_selection.provider_alias_from_project,
             "outcome": validation.validation.outcome().as_str(),
             "source": validation.validation.observation_source().as_str(),
         }));
@@ -2836,6 +2844,8 @@ fn provider_auth_validation_json(
         "resolved_model_provider": null,
         "provider_binding_source": null,
         "auth_source_name": auth_source_name,
+        "model_alias_from_project": provider_selection.model_alias_from_project,
+        "provider_alias_from_project": provider_selection.provider_alias_from_project,
         "outcome": if authorization.auth_source().is_some() {
             "configured_deferred"
         } else {
@@ -3809,7 +3819,11 @@ fn model_provider_config_json(
 ) -> serde_json::Value {
     let model_alias_source =
         if config.profile_overrides_for_host(ProfileField::ModelAlias, selected_host) {
-            json!("user_config_profile")
+            if config.model_alias_from_project() {
+                json!("project_selected_profile")
+            } else {
+                json!("user_config_profile")
+            }
         } else {
             root_config_key_source(
                 "model_alias",
@@ -3819,7 +3833,11 @@ fn model_provider_config_json(
         };
     let provider_alias_source =
         if config.profile_overrides_for_host(ProfileField::ProviderAlias, selected_host) {
-            json!("user_config_profile")
+            if config.provider_alias_from_project() {
+                json!("project_selected_profile")
+            } else {
+                json!("user_config_profile")
+            }
         } else {
             root_config_key_source(
                 "provider_alias",
@@ -3853,6 +3871,8 @@ fn model_provider_config_json(
         "binding_status": binding_status,
         "model_alias_source": model_alias_source,
         "provider_alias_source": provider_alias_source,
+        "model_alias_from_project": config.model_alias_from_project(),
+        "provider_alias_from_project": config.provider_alias_from_project(),
         "contributing_config_files": [
             config.user_config_path,
             config.project_config_path,
@@ -4029,6 +4049,8 @@ fn resolve_experimental_provider_computer_use(
 struct ProviderSelection {
     requested_model_alias: Option<String>,
     requested_provider_alias: Option<String>,
+    model_alias_from_project: bool,
+    provider_alias_from_project: bool,
     authorization: Option<ProviderBindingAuthorization>,
     auth_source_name: Option<String>,
     experimental_provider_computer_use: bool,
@@ -4076,6 +4098,9 @@ fn resolve_provider_selection(
     command_experimental: bool,
     require_local_binding: bool,
 ) -> Result<ProviderSelection, CliFailure> {
+    let model_alias_from_project = model_override.is_none() && config.model_alias_from_project();
+    let provider_alias_from_project =
+        provider_override.is_none() && config.provider_alias_from_project();
     let requested_model_alias = model_override
         .map(str::to_string)
         .or_else(|| config.config.model_alias.clone());
@@ -4097,6 +4122,8 @@ fn resolve_provider_selection(
             return Ok(ProviderSelection {
                 requested_model_alias,
                 requested_provider_alias,
+                model_alias_from_project,
+                provider_alias_from_project,
                 authorization: None,
                 auth_source_name: None,
                 experimental_provider_computer_use,
@@ -4116,6 +4143,8 @@ fn resolve_provider_selection(
             return Ok(ProviderSelection {
                 requested_model_alias,
                 requested_provider_alias,
+                model_alias_from_project,
+                provider_alias_from_project,
                 authorization: None,
                 auth_source_name: None,
                 experimental_provider_computer_use,
@@ -4130,6 +4159,17 @@ fn resolve_provider_selection(
             "add the exact provider_bindings entry to the selected user-level Host Binding",
         ));
     };
+    if (model_alias_from_project || provider_alias_from_project)
+        && !binding.allow_project_selection
+    {
+        return Err(failure(
+            SatelleError::project_provider_selection_not_allowed(
+                &host.alias,
+                provider_alias,
+                model_alias,
+            ),
+        ));
+    }
 
     let mut authorization = ProviderBindingAuthorization::new(
         model_alias,
@@ -4137,7 +4177,8 @@ fn resolve_provider_selection(
         &binding.model,
         &binding.model_provider,
     )
-    .with_experimental_provider_computer_use(experimental_provider_computer_use);
+    .with_experimental_provider_computer_use(experimental_provider_computer_use)
+    .with_allow_project_selection(binding.allow_project_selection);
     if let Some(endpoint) = binding.endpoint.as_deref() {
         authorization = authorization.with_endpoint(endpoint);
     }
@@ -4149,6 +4190,8 @@ fn resolve_provider_selection(
     Ok(ProviderSelection {
         requested_model_alias,
         requested_provider_alias,
+        model_alias_from_project,
+        provider_alias_from_project,
         authorization: Some(authorization),
         auth_source_name: binding.auth_source.clone(),
         experimental_provider_computer_use,
@@ -6777,6 +6820,8 @@ fn turn_request_construction_carries_provider_aliases_refresh_and_one_shot_opt_i
     let selection = ProviderSelection {
         requested_model_alias: Some("vision".to_string()),
         requested_provider_alias: Some("anthropic".to_string()),
+        model_alias_from_project: true,
+        provider_alias_from_project: false,
         authorization: Some(candidate),
         auth_source_name: None,
         experimental_provider_computer_use: true,
@@ -6795,11 +6840,13 @@ fn turn_request_construction_carries_provider_aliases_refresh_and_one_shot_opt_i
     assert_eq!(
         serde_json::to_value(request).expect("TurnRequest should serialize"),
         json!({
-            "schema_version": "satelle.api.v6",
+            "schema_version": "satelle.api.v7",
             "prompt": "inspect the desktop",
             "execution_mode": "standard",
             "model": "vision",
             "provider": "anthropic",
+            "model_from_project": true,
+            "provider_from_project": false,
             "refresh_provider_smoke_test": true,
             "experimental_provider_computer_use": true,
             "turn_execution_timeout_ms": satelle_core::DEFAULT_TURN_EXECUTION_TIMEOUT_MS,
@@ -6901,6 +6948,8 @@ fn run_prompt(
             .requested_provider_alias
             .as_deref()
             .unwrap_or("codex-default"),
+        provider_selection.model_alias_from_project,
+        provider_selection.provider_alias_from_project,
         satelle_core::ProviderAuthValidationMode::Cached,
         provider_selection.experimental_provider_computer_use,
     ) {
@@ -7130,6 +7179,8 @@ fn steer_prompt(
             .requested_provider_alias
             .as_deref()
             .unwrap_or("codex-default"),
+        provider_selection.model_alias_from_project,
+        provider_selection.provider_alias_from_project,
         satelle_core::ProviderAuthValidationMode::Cached,
         provider_selection.experimental_provider_computer_use,
     ) {
@@ -7295,6 +7346,8 @@ fn build_turn_request(
         .with_provider_intent(
             provider_selection.requested_model_alias.clone(),
             provider_selection.requested_provider_alias.clone(),
+            provider_selection.model_alias_from_project,
+            provider_selection.provider_alias_from_project,
             refresh_provider_smoke_test,
         )
         .with_experimental_provider_computer_use(
@@ -7621,6 +7674,8 @@ impl TurnEventOutput {
                 "transport": transport,
                 "requested_model_alias": provider_selection.requested_model_alias,
                 "requested_provider_alias": provider_selection.requested_provider_alias,
+                "model_alias_from_project": provider_selection.model_alias_from_project,
+                "provider_alias_from_project": provider_selection.provider_alias_from_project,
                 "resolved_codex_model": provider_validation.map(|validation| validation.resolved_binding.model()),
                 "resolved_model_provider": provider_validation.map(|validation| validation.resolved_binding.model_provider()),
                 "provider_binding_source": provider_validation.map(|validation| validation.resolved_binding.source().as_str()),

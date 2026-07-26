@@ -3473,6 +3473,8 @@ provider_alias = "anthropic"
     assert_eq!(model_provider["requested_provider_alias"], "anthropic");
     assert_eq!(model_provider["model_alias_source"], "project_config");
     assert_eq!(model_provider["provider_alias_source"], "project_config");
+    assert_eq!(model_provider["model_alias_from_project"], true);
+    assert_eq!(model_provider["provider_alias_from_project"], true);
     assert_eq!(model_provider["winning_source"], "project_config");
     assert_eq!(model_provider["binding_status"], "binding_missing");
     assert_eq!(
@@ -5818,6 +5820,7 @@ allow_project_selection = true
 model = "gpt-5.2"
 model_provider = "openai"
 endpoint = "https://api.openai.example/v1"
+allow_project_selection = true
 "#,
     )
     .expect("user config should be written");
@@ -5848,6 +5851,8 @@ provider_alias = "openai"
     assert_eq!(binding["resolved_codex_model"], "gpt-5.2");
     assert_eq!(binding["resolved_model_provider"], "openai");
     assert_eq!(binding["provider_binding_source"], "user_config");
+    assert_eq!(binding["model_alias_from_project"], true);
+    assert_eq!(binding["provider_alias_from_project"], true);
     assert_eq!(binding["winning_source"], "user_config");
     assert_eq!(
         binding["contributing_config_files"],
@@ -5882,6 +5887,7 @@ auth_source = "openai"
 model = "gpt-5.2-mini"
 model_provider = "openai"
 auth_source = "openai"
+allow_project_selection = true
 
 [hosts.local.provider_bindings.anthropic.default]
 model = "claude-computer-use"
@@ -5926,8 +5932,25 @@ variable = "SATELLE_TEST_ANTHROPIC_TOKEN"
     }
     write_user_config(&user_config, config("default", "openai"))
         .expect("effective default config should be restored");
+    let project = state.path().join("project");
+    let project_config = project.join(".satelle").join("config.toml");
+    fs::create_dir_all(
+        project_config
+            .parent()
+            .expect("project config should have a parent"),
+    )
+    .expect("project config directory should be created");
+    fs::write(
+        &project_config,
+        r#"
+model_alias = "default"
+provider_alias = "openai"
+"#,
+    )
+    .expect("project config should be written");
 
     let model_override = satelle()
+        .current_dir(&project)
         .env("SATELLE_CONFIG_FILE", &user_config)
         .env("SATELLE_STATE_DIR", state.path())
         .args([
@@ -5950,6 +5973,7 @@ variable = "SATELLE_TEST_ANTHROPIC_TOKEN"
     assert_eq!(model_override["resolved_model_provider"], "openai");
 
     let provider_override = satelle()
+        .current_dir(&project)
         .env("SATELLE_CONFIG_FILE", &user_config)
         .env("SATELLE_STATE_DIR", state.path())
         .args([
@@ -5962,17 +5986,42 @@ variable = "SATELLE_TEST_ANTHROPIC_TOKEN"
             "Use the provider override",
         ])
         .assert()
+        .code(66)
+        .get_output()
+        .clone();
+    let provider_override = parse_json_output(&provider_override.stderr);
+    assert_eq!(
+        provider_override["code"],
+        "project-provider-selection-not-allowed"
+    );
+
+    let both_overrides = satelle()
+        .current_dir(&project)
+        .env("SATELLE_CONFIG_FILE", &user_config)
+        .env("SATELLE_STATE_DIR", state.path())
+        .args([
+            "run",
+            "--host",
+            "local",
+            "--model",
+            "default",
+            "--provider",
+            "anthropic",
+            "--json",
+            "Use both trusted overrides",
+        ])
+        .assert()
         .success()
         .get_output()
         .clone();
-    let provider_override = parse_json_output(&provider_override.stdout);
-    assert_eq!(provider_override["requested_model_alias"], "default");
-    assert_eq!(provider_override["requested_provider_alias"], "anthropic");
+    let both_overrides = parse_json_output(&both_overrides.stdout);
+    assert_eq!(both_overrides["requested_model_alias"], "default");
+    assert_eq!(both_overrides["requested_provider_alias"], "anthropic");
     assert_eq!(
-        provider_override["resolved_codex_model"],
+        both_overrides["resolved_codex_model"],
         "claude-computer-use"
     );
-    assert_eq!(provider_override["resolved_model_provider"], "anthropic");
+    assert_eq!(both_overrides["resolved_model_provider"], "anthropic");
 }
 
 #[test]

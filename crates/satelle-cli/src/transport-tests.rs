@@ -2295,6 +2295,8 @@ fn local_turn_request_provider_intent_reaches_host_preflight() {
     let request = TurnRequest::new("provider intent probe").with_provider_intent(
         Some("model-explicit".to_string()),
         Some("provider-explicit".to_string()),
+        false,
+        false,
         true,
     );
 
@@ -2321,6 +2323,8 @@ fn turn_request_wire_carries_only_provider_aliases_refresh_and_one_shot_opt_in()
             Some("model-alias".to_string()),
             Some("provider-alias".to_string()),
             true,
+            false,
+            true,
         )
         .with_experimental_provider_computer_use(true);
     let wire = serde_json::to_value(&request).expect("serialize Turn request");
@@ -2328,6 +2332,8 @@ fn turn_request_wire_carries_only_provider_aliases_refresh_and_one_shot_opt_in()
 
     assert_eq!(wire["model"], "model-alias");
     assert_eq!(wire["provider"], "provider-alias");
+    assert_eq!(wire["model_from_project"], true);
+    assert_eq!(wire["provider_from_project"], false);
     assert_eq!(wire["refresh_provider_smoke_test"], true);
     assert_eq!(wire["experimental_provider_computer_use"], true);
     for forbidden in [
@@ -2389,6 +2395,8 @@ fn stored_authorization_is_revalidated_by_alias_before_alias_only_turn_preflight
     let request = TurnRequest::new("post-setup alias preflight").with_provider_intent(
         Some("review".to_string()),
         Some("openai".to_string()),
+        false,
+        false,
         true,
     );
     let wire = serde_json::to_value(&request).expect("serialize alias-only Turn request");
