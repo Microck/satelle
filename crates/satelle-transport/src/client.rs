@@ -3,16 +3,21 @@ use crate::contract::{
     BootstrapMaintenanceResponse, CapabilitiesResponse, DurableTokenActivationResponse,
     DurableTokenConfirmationResponse, DurableTokenIssuanceResponse, HostDesktopSessionsResponse,
     HostStatusResponse, LiveResponse, LogsPageResponse, PROTOCOL_VERSION, PROTOCOL_VERSION_HEADER,
-    RequestId, SessionResponse, StopRequest, StopResponse, TurnRequest,
+    ProviderBindingAuthorizationRequest, ProviderBindingAuthorizationResponse,
+    ProviderBindingDeletionResponse, ProviderDescriptorValidationRequest,
+    ProviderDescriptorValidationResponse, RequestId, SessionResponse, StopRequest, StopResponse,
+    TurnRequest,
 };
 use crate::transport_tls::{
     ReqwestTrustError, TlsFailureKind, classify_tls_error, configure_reqwest_trust,
     find_error_in_tree,
 };
+use percent_encoding::{AsciiSet, CONTROLS, utf8_percent_encode};
 use reqwest::blocking::{Client, RequestBuilder, Response};
 use reqwest::header::{AUTHORIZATION, HeaderValue};
 use reqwest::redirect::Policy;
 use reqwest::{Method, StatusCode};
+use satelle_core::session::{EffectiveModelRef, ProviderBindingRef};
 use satelle_core::{DirectHostBinding, SessionId};
 use satelle_host::{ApiBearerToken, LogPageQuery};
 use serde::de::DeserializeOwned;
@@ -22,6 +27,25 @@ use std::time::Duration;
 use zeroize::Zeroizing;
 
 const DIRECT_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+const PROVIDER_BINDING_ALIAS_ENCODE_SET: &AsciiSet =
+    &CONTROLS.add(b'/').add(b'?').add(b'#').add(b'%').add(b'\\');
+
+fn provider_binding_path(
+    provider_alias: &str,
+    model_alias: &str,
+) -> Result<String, DaemonClientError> {
+    ProviderBindingRef::new(provider_alias)
+        .map_err(|_| DaemonClientError::InvalidProviderBindingAlias)?;
+    EffectiveModelRef::new(model_alias)
+        .map_err(|_| DaemonClientError::InvalidProviderBindingAlias)?;
+    // Shared reference validation admits `/` as alias data. Encode it here so
+    // each exact alias remains one route segment and Axum decodes it in Path.
+    let provider_alias = utf8_percent_encode(provider_alias, PROVIDER_BINDING_ALIAS_ENCODE_SET);
+    let model_alias = utf8_percent_encode(model_alias, PROVIDER_BINDING_ALIAS_ENCODE_SET);
+    Ok(format!(
+        "/v1/setup/provider-bindings/{provider_alias}/{model_alias}"
+    ))
+}
 
 pub struct DaemonClient {
     client: Client,
@@ -117,7 +141,7 @@ impl DaemonClient {
         })
     }
 
-    /// Overrides the total deadline only for session and turn admission.
+    /// Overrides the total deadline for admission and live readiness refreshes.
     pub fn with_admission_timeout(mut self, admission_timeout: Duration) -> Self {
         self.admission_timeout = Some(admission_timeout);
         self
@@ -241,6 +265,47 @@ impl DaemonClient {
     ) -> Result<DurableTokenActivationResponse, DaemonClientError> {
         let path = format!("/v1/setup/api-token/{token_id}/abort");
         let (request, request_id) = self.mutation_request(&path, idempotency_key)?;
+        self.send_authenticated(request, request_id, StatusCode::OK)
+    }
+
+    pub fn authorize_provider_binding(
+        &self,
+        provider_alias: &str,
+        model_alias: &str,
+        authorization: &ProviderBindingAuthorizationRequest,
+        idempotency_key: &str,
+    ) -> Result<ProviderBindingAuthorizationResponse, DaemonClientError> {
+        let path = provider_binding_path(provider_alias, model_alias)?;
+        let (request, request_id) =
+            self.mutation_request_with_method(Method::PUT, &path, idempotency_key)?;
+        self.send_authenticated(request.json(authorization), request_id, StatusCode::OK)
+    }
+
+    pub fn delete_provider_binding(
+        &self,
+        provider_alias: &str,
+        model_alias: &str,
+        idempotency_key: &str,
+    ) -> Result<ProviderBindingDeletionResponse, DaemonClientError> {
+        let path = provider_binding_path(provider_alias, model_alias)?;
+        let (request, request_id) =
+            self.mutation_request_with_method(Method::DELETE, &path, idempotency_key)?;
+        self.send_authenticated(request, request_id, StatusCode::OK)
+    }
+
+    pub fn validate_provider_descriptor(
+        &self,
+        provider_alias: &str,
+        model_alias: &str,
+        validation: &ProviderDescriptorValidationRequest,
+        idempotency_key: &str,
+    ) -> Result<ProviderDescriptorValidationResponse, DaemonClientError> {
+        let path = format!(
+            "{}/validate",
+            provider_binding_path(provider_alias, model_alias)?
+        );
+        let (request, request_id) = self.mutation_request(&path, idempotency_key)?;
+        let request = self.provider_validation_request(request.json(validation), validation);
         self.send_authenticated(request, request_id, StatusCode::OK)
     }
 
@@ -428,6 +493,21 @@ impl DaemonClient {
         }
     }
 
+    fn provider_validation_request(
+        &self,
+        request: RequestBuilder,
+        validation: &ProviderDescriptorValidationRequest,
+    ) -> RequestBuilder {
+        if matches!(
+            validation.mode(),
+            satelle_core::ProviderAuthValidationMode::RefreshProviderSmoke
+        ) {
+            self.admission_request(request)
+        } else {
+            request
+        }
+    }
+
     pub fn read_session(
         &self,
         session_id: &SessionId,
@@ -477,10 +557,19 @@ impl DaemonClient {
         path: &str,
         idempotency_key: &str,
     ) -> Result<(RequestBuilder, RequestId), DaemonClientError> {
+        self.mutation_request_with_method(Method::POST, path, idempotency_key)
+    }
+
+    fn mutation_request_with_method(
+        &self,
+        method: Method,
+        path: &str,
+        idempotency_key: &str,
+    ) -> Result<(RequestBuilder, RequestId), DaemonClientError> {
         let mut header = HeaderValue::from_str(idempotency_key)
             .map_err(|_| DaemonClientError::InvalidIdempotencyKeyHeader)?;
         header.set_sensitive(true);
-        let (request, request_id) = self.protected_request(Method::POST, path)?;
+        let (request, request_id) = self.protected_request(method, path)?;
         Ok((
             request
                 .header("Idempotency-Key", header)
@@ -544,6 +633,7 @@ pub enum DaemonClientError {
     InvalidTokenHeader,
     InvalidHostIdentityHeader,
     InvalidIdempotencyKeyHeader,
+    InvalidProviderBindingAlias,
     InvalidCaBundle(reqwest::Error),
     EmptyCaBundle,
     CertificateUntrusted(reqwest::Error),
@@ -578,6 +668,9 @@ impl fmt::Display for DaemonClientError {
                 "the expected Host Identity cannot form a request header"
             }
             Self::InvalidIdempotencyKeyHeader => "the idempotency key cannot form a request header",
+            Self::InvalidProviderBindingAlias => {
+                "the provider or model alias is not a valid reference"
+            }
             Self::InvalidCaBundle(_) => "the configured CA bundle is invalid",
             Self::EmptyCaBundle => "the configured CA bundle contains no certificates",
             Self::CertificateUntrusted(_) => "the Host Daemon certificate is not trusted",
@@ -759,6 +852,30 @@ mod tests {
     use std::io::{Read, Write};
     use std::net::TcpListener;
     use std::sync::Arc;
+
+    #[test]
+    fn provider_binding_path_encodes_each_alias_as_one_segment() {
+        assert_eq!(
+            provider_binding_path("open_ai/us:west", "vision/v2.1")
+                .expect("valid aliases form a provider-binding path"),
+            "/v1/setup/provider-bindings/open_ai%2Fus:west/vision%2Fv2.1"
+        );
+    }
+
+    #[test]
+    fn provider_binding_path_rejects_relative_url_segments() {
+        for (provider_alias, model_alias) in [
+            (".", "model"),
+            ("..", "model"),
+            ("provider", "."),
+            ("provider", ".."),
+        ] {
+            assert!(matches!(
+                provider_binding_path(provider_alias, model_alias),
+                Err(DaemonClientError::InvalidProviderBindingAlias)
+            ));
+        }
+    }
 
     #[test]
     fn direct_client_accepts_only_a_canonical_https_origin() {
@@ -1123,6 +1240,40 @@ mod tests {
             .expect("build admission request");
 
         assert_eq!(request.timeout(), Some(&admission_timeout));
+
+        let cached_validation = ProviderDescriptorValidationRequest::new(
+            satelle_core::ProviderAuthValidationMode::Cached,
+            false,
+            false,
+        );
+        let (cached_request, _) = client
+            .mutation_request(
+                "/v1/setup/provider-bindings/openai/review/validate",
+                "cached-test",
+            )
+            .expect("construct cached validation request");
+        let cached_request = client
+            .provider_validation_request(cached_request, &cached_validation)
+            .build()
+            .expect("build cached validation request");
+        assert_eq!(cached_request.timeout(), None);
+
+        let refresh_validation = ProviderDescriptorValidationRequest::new(
+            satelle_core::ProviderAuthValidationMode::RefreshProviderSmoke,
+            false,
+            false,
+        );
+        let (refresh_request, _) = client
+            .mutation_request(
+                "/v1/setup/provider-bindings/openai/review/validate",
+                "refresh-test",
+            )
+            .expect("construct refresh validation request");
+        let refresh_request = client
+            .provider_validation_request(refresh_request, &refresh_validation)
+            .build()
+            .expect("build refresh validation request");
+        assert_eq!(refresh_request.timeout(), Some(&admission_timeout));
     }
 
     #[test]

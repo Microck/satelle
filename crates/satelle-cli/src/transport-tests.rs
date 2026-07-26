@@ -1,4 +1,8 @@
 use super::*;
+use crate::{
+    ProviderSelection, accept_setup_provider_auth_validation, cli_owned_setup_report,
+    projected_experimental_provider_computer_use, transport,
+};
 use satelle_core::session::{
     ApprovalPolicy, DesktopBindingRef, DesktopTarget, EffectiveModelRef, ExecutionPolicy,
     ExperimentalFeatureChoices, FeatureChoice, ProviderBindingRef, SandboxPolicy, SessionActivity,
@@ -287,10 +291,20 @@ fn lifecycle_readiness() -> Result<AdapterReadiness, SatelleError> {
     let provider_evidence = ProviderSmokeEvidence::new(
         format!("interrupt-provider-{}", SessionId::new()),
         "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+        "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
         observed_at,
         observed_at + time::Duration::hours(1),
     )
     .map_err(|error| SatelleError::not_implemented(format!("test provider evidence: {error}")))?;
+    let resolved_binding = satelle_core::ResolvedProviderBinding::from_authorization(
+        satelle_core::ProviderBindingAuthorization::new(
+            "interrupt-test-model",
+            "interrupt-test-provider",
+            "interrupt-test-model",
+            "interrupt-test-provider",
+        ),
+        satelle_core::ProviderBindingSource::HostOwned,
+    );
     AdapterReadiness::ready(
         "interrupt-test",
         "interrupt test readiness",
@@ -298,6 +312,7 @@ fn lifecycle_readiness() -> Result<AdapterReadiness, SatelleError> {
         execution_policy,
         evidence,
         Some(provider_evidence),
+        Some(resolved_binding),
     )
     .map_err(|error| SatelleError::not_implemented(format!("test readiness: {error}")))
 }
@@ -2238,7 +2253,7 @@ impl ComputerUseAdapter for RecordingProviderIntentAdapter {
     }
 
     fn execute(&self, _request: ExecuteRequest<'_>) -> Result<ExecuteResult, SatelleError> {
-        unreachable!("failed preflight must prevent adapter execution")
+        Ok(ExecuteResult::new(TurnTransition::Completed, Vec::new()))
     }
 
     fn observe_stop(&self, _subject: AdapterSubject<'_>) -> Result<StopObservation, SatelleError> {
@@ -2265,10 +2280,26 @@ fn local_turn_request_provider_intent_reaches_host_preflight() {
     )
     .unwrap();
     let transport = LocalTransport::new(LOCAL_DEMO_HOST.to_string(), service);
+    transport
+        .service
+        .authorize_provider_binding_without_validation_for_tests(
+            LOCAL_DEMO_HOST,
+            "model-explicit",
+            "provider-explicit",
+            satelle_core::ProviderBindingAuthorization::new(
+                "model-explicit",
+                "provider-explicit",
+                "resolved-model",
+                "resolved-provider",
+            )
+            .with_experimental_provider_computer_use(true),
+        )
+        .expect("seed the exact aliases for this turn-preflight fixture");
     let request = TurnRequest::new("provider intent probe").with_provider_intent(
         Some("model-explicit".to_string()),
         Some("provider-explicit".to_string()),
-        true,
+        false,
+        false,
         true,
     );
 
@@ -2285,7 +2316,126 @@ fn local_turn_request_provider_intent_reaches_host_preflight() {
     let observed = observed.as_ref().expect("adapter observed provider intent");
     assert_eq!(observed.model().unwrap().as_str(), "model-explicit");
     assert_eq!(observed.provider().unwrap().as_str(), "provider-explicit");
-    assert!(observed.experimental());
+    assert!(observed.refresh());
+}
+
+#[test]
+fn turn_request_wire_carries_only_provider_aliases_refresh_and_one_shot_opt_in() {
+    let request = TurnRequest::new("alias-only wire probe")
+        .with_provider_intent(
+            Some("model-alias".to_string()),
+            Some("provider-alias".to_string()),
+            true,
+            false,
+            true,
+        )
+        .with_experimental_provider_computer_use(true);
+    let wire = serde_json::to_value(&request).expect("serialize Turn request");
+    let wire = wire.as_object().expect("Turn request wire object");
+
+    assert_eq!(wire["model"], "model-alias");
+    assert_eq!(wire["provider"], "provider-alias");
+    assert_eq!(wire["model_from_project"], true);
+    assert_eq!(wire["provider_from_project"], false);
+    assert_eq!(wire["refresh_provider_smoke_test"], true);
+    assert_eq!(wire["experimental_provider_computer_use"], true);
+    for forbidden in [
+        "provider_binding_candidate",
+        "model_provider",
+        "endpoint",
+        "auth_source",
+        "source",
+        "resolved_secret",
+        "experimental",
+    ] {
+        assert!(
+            !wire.contains_key(forbidden),
+            "Controller Turn request must not carry Host-owned field {forbidden}"
+        );
+    }
+}
+
+#[test]
+fn stored_authorization_is_revalidated_by_alias_before_alias_only_turn_preflight() {
+    let state = TestStateDir::new().expect("temporary state directory");
+    let observed = Arc::new(Mutex::new(None));
+    let service = HostService::with_adapter_for_tests_at(
+        state.path(),
+        RecordingProviderIntentAdapter {
+            observed: Arc::clone(&observed),
+        },
+    )
+    .expect("construct recording Host service");
+    let transport = LocalTransport::new(LOCAL_DEMO_HOST.to_string(), service);
+    let authorization =
+        satelle_core::ProviderBindingAuthorization::new("review", "openai", "gpt-5.2", "openai");
+
+    transport
+        .service
+        .authorize_provider_binding_without_validation_for_tests(
+            LOCAL_DEMO_HOST,
+            "review",
+            "openai",
+            authorization,
+        )
+        .expect("seed the alias-scoped Provider Binding");
+    let validation = transport
+        .validate_provider_descriptor(
+            "review",
+            "openai",
+            false,
+            false,
+            satelle_core::ProviderAuthValidationMode::Cached,
+            false,
+        )
+        .expect("the distinct post-setup preflight resolves the authorized aliases");
+    let resolved =
+        serde_json::to_value(&validation.resolved_binding).expect("serialize resolved binding");
+    assert_eq!(resolved["requested_model_alias"], "review");
+    assert_eq!(resolved["requested_provider_alias"], "openai");
+    assert_eq!(resolved["model"], "gpt-5.2");
+    assert_eq!(resolved["model_provider"], "openai");
+    assert_eq!(resolved["source"], "user_config");
+
+    let request = TurnRequest::new("post-setup alias preflight").with_provider_intent(
+        Some("review".to_string()),
+        Some("openai".to_string()),
+        false,
+        false,
+        true,
+    );
+    let wire = serde_json::to_value(&request).expect("serialize alias-only Turn request");
+    let wire = wire.as_object().expect("Turn request wire object");
+    for forbidden in [
+        "provider_binding_authorization",
+        "provider_binding_candidate",
+        "resolved_provider_binding",
+        "model_provider",
+        "endpoint",
+        "auth_source",
+        "source",
+        "resolved_secret",
+    ] {
+        assert!(
+            !wire.contains_key(forbidden),
+            "post-setup Turn request must not carry Host-owned field {forbidden}"
+        );
+    }
+
+    let failure = match transport.run(&request, false, &mut |_| Ok(())) {
+        Err(failure) => failure,
+        Ok(_) => panic!("recording adapter should reject after the second preflight"),
+    };
+    assert_eq!(
+        failure.error().code,
+        ErrorCode::UnsupportedProviderComputerUse
+    );
+    let observed = observed.lock().expect("recorded provider intent");
+    let observed = observed
+        .as_ref()
+        .expect("second preflight observed alias-only intent");
+    assert_eq!(observed.model().unwrap().as_str(), "review");
+    assert_eq!(observed.provider().unwrap().as_str(), "openai");
     assert!(observed.refresh());
 }
 
@@ -2676,6 +2826,166 @@ impl Drop for DirectFixture {
             }
         }
     }
+}
+
+#[test]
+fn host_provider_validation_drives_conflicting_controller_projection() {
+    let fixture = DirectFixture::start();
+    let controller_selection = ProviderSelection {
+        requested_model_alias: Some("review".to_string()),
+        requested_provider_alias: Some("openai".to_string()),
+        model_alias_from_project: false,
+        provider_alias_from_project: false,
+        authorization: Some(
+            satelle_core::ProviderBindingAuthorization::new(
+                "review",
+                "openai",
+                "controller-model-canary",
+                "controller-provider-canary",
+            )
+            .with_experimental_provider_computer_use(true),
+        ),
+        auth_source_name: None,
+        experimental_provider_computer_use: true,
+    };
+    fixture
+        .service
+        .authorize_provider_binding(
+            LOCAL_DEMO_HOST,
+            "review",
+            "openai",
+            satelle_core::ProviderBindingAuthorization::new(
+                "review",
+                "openai",
+                "host-model",
+                "openai",
+            ),
+        )
+        .expect("preauthorize the Host-owned provider binding");
+
+    let validation = fixture
+        .transport()
+        .validate_provider_descriptor(
+            "review",
+            "openai",
+            controller_selection.model_alias_from_project,
+            controller_selection.provider_alias_from_project,
+            satelle_core::ProviderAuthValidationMode::Cached,
+            controller_selection.experimental_provider_computer_use,
+        )
+        .expect("validate the requested aliases over HTTP");
+
+    assert_eq!(validation.resolved_binding.model(), "host-model");
+    assert_eq!(validation.resolved_binding.model_provider(), "openai");
+    assert_eq!(
+        validation.resolved_binding.source(),
+        satelle_core::ProviderBindingSource::UserConfig
+    );
+    assert!(
+        validation
+            .resolved_binding
+            .experimental_provider_computer_use()
+    );
+    assert!(projected_experimental_provider_computer_use(
+        &controller_selection,
+        Some(&validation),
+    ));
+}
+
+#[test]
+fn setup_accepts_matching_host_owned_provider_projection() {
+    let authorization =
+        satelle_core::ProviderBindingAuthorization::new("review", "openai", "gpt-5.2", "openai");
+    let provider_selection = ProviderSelection {
+        requested_model_alias: Some("review".to_string()),
+        requested_provider_alias: Some("openai".to_string()),
+        model_alias_from_project: false,
+        provider_alias_from_project: false,
+        authorization: Some(authorization.clone()),
+        auth_source_name: None,
+        experimental_provider_computer_use: false,
+    };
+    let resolved_binding = satelle_core::ResolvedProviderBinding::from_authorization(
+        authorization,
+        satelle_core::ProviderBindingSource::HostOwned,
+    );
+    let validation = transport::ProviderDescriptorValidationReport {
+        resolved_binding: satelle_core::PublicResolvedProviderBinding::from(&resolved_binding),
+        validation: satelle_core::ProviderAuthValidationResult::new(
+            satelle_core::ProviderAuthValidationOutcome::ConfiguredDeferred,
+            satelle_core::ProviderAuthObservationSource::Deferred,
+        ),
+    };
+    let mut report = cli_owned_setup_report(
+        LOCAL_DEMO_HOST,
+        true,
+        "foreground",
+        vec!["provider-auth".to_string()],
+    );
+
+    let accepted =
+        match accept_setup_provider_auth_validation(&mut report, &provider_selection, validation) {
+            Ok(accepted) => accepted,
+            Err(_) => panic!("matching Host-owned validation should be accepted"),
+        }
+        .expect("matching Host-owned validation should remain available");
+
+    assert_eq!(
+        accepted.resolved_binding.source(),
+        satelle_core::ProviderBindingSource::HostOwned
+    );
+    assert_eq!(
+        report.readiness_summary.provider_auth,
+        "configured_deferred"
+    );
+}
+
+#[test]
+fn setup_rejects_conflicting_host_owned_provider_projection() {
+    let controller_authorization = satelle_core::ProviderBindingAuthorization::new(
+        "review",
+        "openai",
+        "controller-model",
+        "openai",
+    );
+    let provider_selection = ProviderSelection {
+        requested_model_alias: Some("review".to_string()),
+        requested_provider_alias: Some("openai".to_string()),
+        model_alias_from_project: false,
+        provider_alias_from_project: false,
+        authorization: Some(controller_authorization),
+        auth_source_name: None,
+        experimental_provider_computer_use: false,
+    };
+    let resolved_binding = satelle_core::ResolvedProviderBinding::from_authorization(
+        satelle_core::ProviderBindingAuthorization::new("review", "openai", "host-model", "openai"),
+        satelle_core::ProviderBindingSource::HostOwned,
+    );
+    let validation = transport::ProviderDescriptorValidationReport {
+        resolved_binding: satelle_core::PublicResolvedProviderBinding::from(&resolved_binding),
+        validation: satelle_core::ProviderAuthValidationResult::new(
+            satelle_core::ProviderAuthValidationOutcome::ConfiguredDeferred,
+            satelle_core::ProviderAuthObservationSource::Deferred,
+        ),
+    };
+    let mut report = cli_owned_setup_report(
+        LOCAL_DEMO_HOST,
+        true,
+        "foreground",
+        vec!["provider-auth".to_string()],
+    );
+
+    let accepted =
+        match accept_setup_provider_auth_validation(&mut report, &provider_selection, validation) {
+            Ok(accepted) => accepted,
+            Err(_) => panic!("conflicting Host-owned validation should be handled"),
+        };
+
+    assert!(accepted.is_none());
+    assert_ne!(
+        report.readiness_summary.provider_auth,
+        "configured_deferred"
+    );
 }
 
 fn install_silent_event_peer(
@@ -4014,6 +4324,56 @@ fn desktop_selection_api_errors_round_trip_only_validated_details() {
         mapped.details.get("remote_code"),
         Some(&serde_json::json!("invalid-daemon-response"))
     );
+}
+
+#[test]
+fn provider_binding_api_errors_preserve_typed_remote_codes() {
+    let api_error = |code: ApiErrorCode| {
+        serde_json::from_value::<satelle_transport::ApiError>(serde_json::json!({
+            "schema_version": "satelle.error.v1",
+            "request_id": satelle_transport::RequestId::new().to_string(),
+            "host_identity": "host-direct-test",
+            "code": code.as_str(),
+            "category": "readiness",
+            "retryable": false,
+            "message": "Provider Binding preflight failed",
+            "details": null,
+            "docs_url": null,
+            "suggested_commands": []
+        }))
+        .expect("deserialize Provider Binding API error")
+    };
+    let cases = [
+        (
+            ApiErrorCode::ModelProviderBindingMissing,
+            ErrorCode::ModelProviderBindingMissing,
+        ),
+        (
+            ApiErrorCode::ExperimentalProviderOptInRequired,
+            ErrorCode::ExperimentalProviderOptInRequired,
+        ),
+        (
+            ApiErrorCode::ProviderSecretResolutionFailed,
+            ErrorCode::ProviderSecretResolutionFailed,
+        ),
+        (
+            ApiErrorCode::ExperimentalProviderNotValidated,
+            ErrorCode::ExperimentalProviderNotValidated,
+        ),
+    ];
+
+    for (remote_code, expected_code) in cases {
+        let failure = direct_admission_error(
+            "direct-test",
+            DaemonClientError::Api {
+                status: 422_u16.try_into().expect("422 is a valid HTTP status"),
+                error: Box::new(api_error(remote_code)),
+            },
+        );
+
+        assert_eq!(failure.phase(), TurnAdmissionPhase::NotAdmitted);
+        assert_eq!(failure.error().code, expected_code);
+    }
 }
 
 #[test]

@@ -6,6 +6,7 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 const TOKEN_ID: &str = "token-01890a5d-ac96-7b7c-8f89-37c3d0a66e31";
 const PRINCIPAL_ID: &str = "principal-01890a5d-ac96-7b7c-8f89-37c3d0a66e32";
 const PAYLOAD_CANARY: &[u8] = b"PRIVATE_CANONICAL_PROMPT_PAYLOAD_CANARY";
+const PROVIDER_SECRET_CANARY: &str = "PRIVATE_PROVIDER_SECRET_RESTART_CANARY";
 
 #[test]
 fn daemon_identity_and_idempotency_hmac_survive_restart() {
@@ -17,6 +18,17 @@ fn daemon_identity_and_idempotency_hmac_survive_restart() {
     let first_digest = storage
         .digest_idempotency_payload(PAYLOAD_CANARY)
         .expect("digest canonical payload");
+    let provider_secret =
+        crate::provider_auth::ResolvedProviderSecret::for_test(PROVIDER_SECRET_CANARY);
+    let first_fingerprinter = crate::provider_auth::ProviderSmokeCredentialFingerprinter::default();
+    first_fingerprinter.initialize(
+        storage
+            .provider_smoke_hmac_key()
+            .expect("load provider smoke HMAC key"),
+    );
+    let first_provider_fingerprint = first_fingerprinter
+        .fingerprint(&"a".repeat(64), Some(&provider_secret))
+        .expect("fingerprint provider credential");
     assert_eq!(first_digest.key_version(), 1);
     assert_eq!(first_digest.hex().len(), 64);
     drop(storage);
@@ -33,15 +45,36 @@ fn daemon_identity_and_idempotency_hmac_survive_restart() {
             .digest_idempotency_payload(PAYLOAD_CANARY)
             .expect("recompute canonical digest")
     );
+    let reopened_fingerprinter =
+        crate::provider_auth::ProviderSmokeCredentialFingerprinter::default();
+    reopened_fingerprinter.initialize(
+        storage
+            .provider_smoke_hmac_key()
+            .expect("reload provider smoke HMAC key"),
+    );
+    assert_eq!(
+        first_provider_fingerprint,
+        reopened_fingerprinter
+            .fingerprint(&"a".repeat(64), Some(&provider_secret))
+            .expect("recompute provider credential fingerprint")
+    );
 
     storage.checkpoint_for_test();
     let database = fs::read(state.path().join("satelle.sqlite3")).expect("read test database");
     assert!(!contains_bytes(&database, PAYLOAD_CANARY));
+    assert!(!contains_bytes(
+        &database,
+        PROVIDER_SECRET_CANARY.as_bytes()
+    ));
 }
 
 #[test]
 fn missing_sensitive_singletons_fail_closed_on_reopen() {
-    for table in ["daemon_identity", "idempotency_hmac_keys"] {
+    for table in [
+        "daemon_identity",
+        "idempotency_hmac_keys",
+        "provider_smoke_hmac_key",
+    ] {
         let state = TempDir::new().expect("temporary state directory");
         let (storage, _) = Storage::open(state.path()).expect("open storage");
         storage

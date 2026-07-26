@@ -1223,6 +1223,47 @@ fn one_host_global_slot_is_shared_by_clones_and_principals() {
 }
 
 #[test]
+fn provider_binding_deletion_shares_the_host_global_slot() {
+    let state = crate::TestStateDir::new().expect("temporary state directory");
+    let adapter = ControlledAdapter::default();
+    adapter.block_next_preflight();
+    let service = service(state.path(), adapter.clone());
+    let admission_authority = authority(&service, "admission-principal", "active-admission");
+    let deletion_authority = authority(&service, "deletion-principal", "binding-deletion");
+
+    let admission_service = service.clone();
+    let admission = std::thread::spawn(move || {
+        admission_service.admit_run(&intent("occupy deletion capacity"), &admission_authority)
+    });
+    assert!(
+        adapter.preflight_started.wait_for(WAIT_LIMIT),
+        "the admission must resolve its binding and occupy capacity before deletion"
+    );
+
+    let error = service
+        .delete_provider_binding_idempotent("review", "openai", &deletion_authority)
+        .expect_err("binding deletion must not race an active admission");
+    assert_capacity_exceeded(&error);
+
+    adapter.preflight_release.signal();
+    admission
+        .join()
+        .expect("admission thread must not panic")
+        .expect("admission must finish");
+    service
+        .runtime
+        .wait_for_background()
+        .expect("admitted Turn must finish");
+
+    assert!(
+        !service
+            .delete_provider_binding_idempotent("review", "openai", &deletion_authority)
+            .expect("the deletion retry must run after admission releases capacity"),
+        "the absent binding must report that no row was deleted"
+    );
+}
+
+#[test]
 fn setup_token_issuance_shares_the_host_global_slot() {
     let state = crate::TestStateDir::new().expect("temporary state directory");
     let adapter = ControlledAdapter::default();

@@ -96,6 +96,8 @@ pub enum ReferenceError {
     Empty,
     #[error("the reference exceeds {MAX_REFERENCE_BYTES} bytes")]
     TooLong,
+    #[error("the reference cannot be a relative URL path segment")]
+    RelativePathSegment,
     #[error("the reference contains a character outside the safe identifier alphabet")]
     InvalidCharacter,
 }
@@ -106,6 +108,9 @@ fn validate_reference(value: &str) -> Result<(), ReferenceError> {
     }
     if value.len() > MAX_REFERENCE_BYTES {
         return Err(ReferenceError::TooLong);
+    }
+    if matches!(value, "." | "..") {
+        return Err(ReferenceError::RelativePathSegment);
     }
     if !value.bytes().all(|byte| {
         byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b':' | b'/')
@@ -1597,6 +1602,22 @@ mod tests {
     const SESSION_ID: &str = "rs_01890a5d-ac96-7b7c-9f89-37c3d0a66e11";
     const TURN_1: &str = "rt_01890a5d-ac96-7b7d-9f89-37c3d0a66e11";
     const TURN_2: &str = "rt_01890a5d-ac96-7b7e-9f89-37c3d0a66e11";
+
+    #[test]
+    fn references_reject_relative_url_path_segments() {
+        for value in [".", ".."] {
+            assert_eq!(
+                ProviderBindingRef::new(value).unwrap_err(),
+                ReferenceError::RelativePathSegment
+            );
+            assert_eq!(
+                EffectiveModelRef::new(value).unwrap_err(),
+                ReferenceError::RelativePathSegment
+            );
+        }
+        assert!(ProviderBindingRef::new("provider.v2").is_ok());
+        assert!(EffectiveModelRef::new("model.v2.1").is_ok());
+    }
 
     #[test]
     fn states_have_exact_names_and_terminal_partition() {

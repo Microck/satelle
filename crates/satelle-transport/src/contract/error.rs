@@ -35,6 +35,11 @@ pub enum ApiErrorCode {
     NativeReadinessTimeout,
     ProviderSmokeTestTimeout,
     UnsupportedProviderComputerUse,
+    ExperimentalProviderOptInRequired,
+    ModelProviderBindingMissing,
+    ProjectProviderSelectionNotAllowed,
+    ProviderSecretResolutionFailed,
+    ExperimentalProviderNotValidated,
     StorageBusy,
     StorageIntegrityFailed,
     RemoteExecutionFailed,
@@ -80,6 +85,11 @@ impl ApiErrorCode {
             Self::NativeReadinessTimeout => "native-readiness-timeout",
             Self::ProviderSmokeTestTimeout => "provider-smoke-test-timeout",
             Self::UnsupportedProviderComputerUse => "unsupported-provider-computer-use",
+            Self::ExperimentalProviderOptInRequired => "experimental-provider-opt-in-required",
+            Self::ModelProviderBindingMissing => "model-provider-binding-missing",
+            Self::ProjectProviderSelectionNotAllowed => "project-provider-selection-not-allowed",
+            Self::ProviderSecretResolutionFailed => "provider-secret-resolution-failed",
+            Self::ExperimentalProviderNotValidated => "experimental-provider-not-validated",
             Self::StorageBusy => "storage-busy",
             Self::StorageIntegrityFailed => "storage-integrity-failed",
             Self::RemoteExecutionFailed => "remote-execution-failed",
@@ -119,6 +129,26 @@ mod tests {
             (
                 ApiErrorCode::UnsupportedProviderComputerUse,
                 "unsupported-provider-computer-use",
+            ),
+            (
+                ApiErrorCode::ExperimentalProviderOptInRequired,
+                "experimental-provider-opt-in-required",
+            ),
+            (
+                ApiErrorCode::ModelProviderBindingMissing,
+                "model-provider-binding-missing",
+            ),
+            (
+                ApiErrorCode::ProjectProviderSelectionNotAllowed,
+                "project-provider-selection-not-allowed",
+            ),
+            (
+                ApiErrorCode::ProviderSecretResolutionFailed,
+                "provider-secret-resolution-failed",
+            ),
+            (
+                ApiErrorCode::ExperimentalProviderNotValidated,
+                "experimental-provider-not-validated",
             ),
         ] {
             assert_eq!(code.as_str(), token);

@@ -5728,6 +5728,8 @@ mod tests {
     #[test]
     fn path_change_releases_the_old_owner_before_the_new_daemon_becomes_authoritative() {
         let mut host = HostConfig {
+            provider_bindings: std::collections::BTreeMap::new(),
+            experimental_provider_computer_use_by_provider: std::collections::BTreeMap::new(),
             transport: satelle_core::TransportKind::Ssh,
             adapter: satelle_core::AdapterKind::Codex,
             address: Some("operator@host".to_string()),

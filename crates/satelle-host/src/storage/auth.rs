@@ -3,6 +3,7 @@ use super::{StorageError, StorageErrorKind};
 use crate::api_auth::{
     ApiBearerToken, ApiPrincipal, ApiScopes, ApiTokenVerifier, validate_token_id,
 };
+use crate::provider_auth::ProviderSmokeHmacKey;
 use hmac::{Hmac, KeyInit, Mac};
 use rusqlite::{Connection, OptionalExtension, Row, Transaction, TransactionBehavior, params};
 use satelle_core::session::HostIdentityRef;
@@ -305,8 +306,25 @@ pub(super) fn seed_sensitive_state(
     Ok(())
 }
 
+pub(super) fn seed_provider_smoke_hmac_key(
+    transaction: &Transaction<'_>,
+    created_at: OffsetDateTime,
+) -> Result<(), StorageError> {
+    let mut key = Zeroizing::new([0_u8; SECRET_BYTES]);
+    getrandom::fill(key.as_mut())
+        .map_err(|source| StorageError::with_source(StorageErrorKind::OperationFailed, source))?;
+    transaction
+        .execute(
+            "INSERT INTO provider_smoke_hmac_key (singleton, key_material, created_at)
+             VALUES (1, ?1, ?2)",
+            params![key.as_slice(), format_time(created_at)?],
+        )
+        .map_err(operation_failed)?;
+    Ok(())
+}
+
 pub(super) fn validate_sensitive_state(connection: &Connection) -> Result<(), StorageError> {
-    validate_sensitive_state_with_token_state(connection, true)
+    validate_sensitive_state_with_schema(connection, true, true)
 }
 
 /// Migration 8 makes the historical implicit `active` state explicit. This
@@ -315,12 +333,19 @@ pub(super) fn validate_sensitive_state(connection: &Connection) -> Result<(), St
 pub(super) fn validate_sensitive_state_before_token_state_migration(
     connection: &Connection,
 ) -> Result<(), StorageError> {
-    validate_sensitive_state_with_token_state(connection, false)
+    validate_sensitive_state_with_schema(connection, false, false)
 }
 
-fn validate_sensitive_state_with_token_state(
+pub(super) fn validate_sensitive_state_before_provider_smoke_key_migration(
+    connection: &Connection,
+) -> Result<(), StorageError> {
+    validate_sensitive_state_with_schema(connection, true, false)
+}
+
+fn validate_sensitive_state_with_schema(
     connection: &Connection,
     token_state_is_stored: bool,
+    provider_smoke_key_is_stored: bool,
 ) -> Result<(), StorageError> {
     let identity_count: i64 = connection
         .query_row("SELECT count(*) FROM daemon_identity", [], |row| row.get(0))
@@ -392,7 +417,31 @@ fn validate_sensitive_state_with_token_state(
     for row in token_rows {
         row.map_err(operation_failed)?.validate()?;
     }
+    if provider_smoke_key_is_stored {
+        drop(provider_smoke_hmac_key(connection)?);
+    }
     Ok(())
+}
+
+pub(super) fn provider_smoke_hmac_key(
+    connection: &Connection,
+) -> Result<ProviderSmokeHmacKey, StorageError> {
+    let (material, created_at): (Vec<u8>, String) = connection
+        .query_row(
+            "SELECT key_material, created_at
+             FROM provider_smoke_hmac_key
+             WHERE singleton = 1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .map_err(|source| {
+            StorageError::with_source(StorageErrorKind::InvalidStoredState, source)
+        })?;
+    parse_stored_time(&created_at)?;
+    let material: [u8; SECRET_BYTES] = material
+        .try_into()
+        .map_err(|_| StorageError::new(StorageErrorKind::InvalidStoredState))?;
+    Ok(ProviderSmokeHmacKey::new(material))
 }
 
 pub(super) fn host_identity(connection: &Connection) -> Result<HostIdentityRef, StorageError> {

@@ -2,6 +2,9 @@ use assert_cmd::Command;
 use satelle_host::test_support::TestStateDir;
 use serde_json::Value;
 
+#[path = "support/test-file.rs"]
+mod test_file;
+
 const TEST_SUPPORT_ADAPTER_ENV: &str = "SATELLE_TEST_SUPPORT_ADAPTER";
 
 fn satelle() -> Command {
@@ -25,6 +28,70 @@ fn satelle() -> Command {
 
 fn state_dir() -> TestStateDir {
     TestStateDir::new().expect("secure temp state directory should be created")
+}
+
+fn authorize_default_provider_binding(state: &TestStateDir) -> std::path::PathBuf {
+    let config_file = state.path().join("provider-binding-config.toml");
+    test_file::write_user_controlled(
+        &config_file,
+        r#"
+default_host = "local-demo"
+model_alias = "stop-model"
+provider_alias = "stop-provider"
+
+[hosts.local-demo]
+transport = "local"
+adapter = "fake"
+
+[hosts.local-demo.provider_bindings.stop-provider.stop-model]
+model = "fake-model-v1"
+model_provider = "openai"
+auth_source = "test"
+
+[hosts.local-demo.provider_auth.test]
+kind = "environment"
+variable = "SATELLE_TEST_PROVIDER_TOKEN"
+"#,
+    )
+    .expect("write exact provider binding config");
+    let setup_output = satelle()
+        .env("SATELLE_CONFIG_FILE", &config_file)
+        .env("SATELLE_STATE_DIR", state.path())
+        .env("SATELLE_TEST_PROVIDER_TOKEN", "fixture-provider-token")
+        .args([
+            "setup",
+            "--host",
+            "local-demo",
+            "--component",
+            "provider-auth",
+            "--no-input",
+            "--yes",
+            "--json",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .clone();
+    let setup_report = parse_json(&setup_output.stdout);
+    assert_eq!(setup_report["status"], "applied");
+    assert_eq!(setup_report["mutated"], true);
+    assert!(
+        setup_report["applied_actions"]
+            .as_array()
+            .expect("applied_actions should be an array")
+            .iter()
+            .filter_map(serde_json::Value::as_str)
+            .any(|action| {
+                action.contains("provider binding") && action.contains("stop-provider/stop-model")
+            })
+    );
+    satelle()
+        .env("SATELLE_CONFIG_FILE", &config_file)
+        .env("SATELLE_STATE_DIR", state.path())
+        .args(["host", "release-state"])
+        .assert()
+        .success();
+    config_file
 }
 
 fn parse_json(bytes: &[u8]) -> Value {
@@ -248,9 +315,12 @@ fn stop_json_v1_has_one_closed_contract_for_stopped_and_already_terminal_turns()
         ("pending", ("stopped", "recovery_pending", "stopped", true)),
     ] {
         let state = state_dir();
+        let provider_config = authorize_default_provider_binding(&state);
         let mut run_command = satelle();
         run_command
+            .env("SATELLE_CONFIG_FILE", &provider_config)
             .env("SATELLE_STATE_DIR", state.path())
+            .env("SATELLE_TEST_PROVIDER_TOKEN", "fixture-provider-token")
             .env(TEST_SUPPORT_ADAPTER_ENV, adapter)
             .args(["run", "--host", "local-demo"]);
         if adapter == "pending" {
@@ -272,7 +342,9 @@ fn stop_json_v1_has_one_closed_contract_for_stopped_and_already_terminal_turns()
             .expect("run result should include a Turn id");
 
         let stop = satelle()
+            .env("SATELLE_CONFIG_FILE", &provider_config)
             .env("SATELLE_STATE_DIR", state.path())
+            .env("SATELLE_TEST_PROVIDER_TOKEN", "fixture-provider-token")
             .env(TEST_SUPPORT_ADAPTER_ENV, adapter)
             .args(["stop", session_id, "--json"])
             .assert()

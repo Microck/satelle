@@ -1,5 +1,6 @@
 use satelle_core::{
-    DesktopSessionPreference, ErrorCode, SatelleError, read_owner_controlled_config_file,
+    DesktopSessionPreference, ErrorCode, ProviderSecretSource, SatelleError,
+    read_owner_controlled_config_file,
 };
 use serde::Serialize;
 use std::fs;
@@ -10,7 +11,7 @@ use std::path::Path;
 use tempfile::NamedTempFile;
 #[cfg(windows)]
 use tempfile::{Builder as TempFileBuilder, TempPath};
-use toml_edit::{DocumentMut, value};
+use toml_edit::{DocumentMut, Item, Table, value};
 
 #[derive(Debug, Serialize)]
 pub(crate) struct HostTrustReport {
@@ -176,6 +177,109 @@ pub(crate) fn persist_desktop_selection(
     host.remove("desktop_session_native_selector");
     persist_config(config_path, document.to_string().as_bytes())?;
     Ok(true)
+}
+
+pub(crate) fn persist_provider_auth_descriptor(
+    config_path: &Path,
+    host_alias: &str,
+    auth_source_name: &str,
+    descriptor: &ProviderSecretSource,
+) -> Result<bool, SatelleError> {
+    let original = read_owner_controlled_config_file(config_path).map_err(|error| {
+        trust_config_error(
+            config_path,
+            "could not read the user configuration securely",
+            Some(error.to_string()),
+        )
+    })?;
+    let mut document = original.parse::<DocumentMut>().map_err(|error| {
+        trust_config_error(
+            config_path,
+            "could not parse the user configuration for provider authentication",
+            Some(error.to_string()),
+        )
+    })?;
+    let hosts = document
+        .get_mut("hosts")
+        .and_then(Item::as_table_like_mut)
+        .ok_or_else(|| {
+            trust_config_error(
+                config_path,
+                "the user configuration does not contain a hosts table",
+                None,
+            )
+        })?;
+    let host = hosts
+        .get_mut(host_alias)
+        .and_then(Item::as_table_like_mut)
+        .ok_or_else(|| {
+            trust_config_error(
+                config_path,
+                &format!("the user configuration does not contain Host Binding {host_alias}"),
+                None,
+            )
+        })?;
+    if host.get("provider_auth").is_none() {
+        host.insert("provider_auth", Item::Table(Table::new()));
+    }
+    let provider_auth = host
+        .get_mut("provider_auth")
+        .and_then(Item::as_table_like_mut)
+        .ok_or_else(|| {
+            trust_config_error(
+                config_path,
+                "the Host Binding provider_auth value is not a table",
+                None,
+            )
+        })?;
+    let descriptor = provider_secret_source_item(descriptor);
+    if provider_auth.get(auth_source_name).is_some_and(|existing| {
+        provider_secret_source_item_matches(
+            existing,
+            descriptor
+                .as_table()
+                .expect("provider secret descriptors are tables"),
+        )
+    }) {
+        return Ok(false);
+    }
+    provider_auth.insert(auth_source_name, descriptor);
+    persist_config(config_path, document.to_string().as_bytes())?;
+    Ok(true)
+}
+
+fn provider_secret_source_item_matches(existing: &Item, expected: &Table) -> bool {
+    let Some(existing) = existing.as_table_like() else {
+        return false;
+    };
+    existing.len() == expected.len()
+        && expected
+            .iter()
+            .all(|(key, value)| existing.get(key).and_then(Item::as_str) == value.as_str())
+}
+
+fn provider_secret_source_item(descriptor: &ProviderSecretSource) -> Item {
+    let mut table = Table::new();
+    match descriptor {
+        ProviderSecretSource::Environment { variable } => {
+            table.insert("kind", value("environment"));
+            table.insert("variable", value(variable));
+        }
+        ProviderSecretSource::File { path } => {
+            table.insert("kind", value("file"));
+            table.insert("path", value(path.to_string_lossy().as_ref()));
+        }
+        ProviderSecretSource::CredentialStore { service, account } => {
+            table.insert("kind", value("credential-store"));
+            table.insert("service", value(service));
+            table.insert("account", value(account));
+        }
+        ProviderSecretSource::HostStore { name } => {
+            table.insert("kind", value("host-store"));
+            table.insert("name", value(name));
+        }
+    }
+    Item::Table(table)
 }
 
 fn persist_config(config_path: &Path, contents: &[u8]) -> Result<(), SatelleError> {
@@ -728,6 +832,34 @@ mod tests {
         let error = persist_host_identity(&config, "remote", "host-observed").unwrap_err();
         assert_eq!(error.code, ErrorCode::ConfigError);
         assert_eq!(fs::read_to_string(&config).unwrap(), contents);
+    }
+
+    #[test]
+    fn provider_auth_update_persists_only_the_descriptor_reference() {
+        let original = concat!(
+            "default_host = \"remote\"\n\n",
+            "[hosts.remote]\n",
+            "transport = \"direct\"\n",
+            "adapter = \"codex\"\n",
+            "address = \"https://host.example.test\"\n",
+        );
+        let (_directory, config) = secure_config(original);
+        let descriptor = ProviderSecretSource::Environment {
+            variable: "SATELLE_PROVIDER_TOKEN".to_string(),
+        };
+
+        assert!(
+            persist_provider_auth_descriptor(&config, "remote", "openai", &descriptor).unwrap()
+        );
+        let updated = fs::read_to_string(&config).unwrap();
+        assert!(updated.contains("[hosts.remote.provider_auth.openai]"));
+        assert!(updated.contains("kind = \"environment\""));
+        assert!(updated.contains("variable = \"SATELLE_PROVIDER_TOKEN\""));
+        assert!(!updated.contains("secret"));
+        assert!(
+            !persist_provider_auth_descriptor(&config, "remote", "openai", &descriptor).unwrap()
+        );
+        assert_eq!(fs::read_to_string(&config).unwrap(), updated);
     }
 
     #[cfg(windows)]

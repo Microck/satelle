@@ -607,6 +607,8 @@ fn stop_winning_before_running_skips_adapter_execution_and_returns_stopped() {
             _heartbeat: heartbeat,
         },
         provider_smoke_event: None,
+        resolved_provider_binding: None,
+        resolved_provider_secret: None,
         attachments: crate::attachment::StagedAttachments::default(),
     };
     let outcome = engine

@@ -137,6 +137,57 @@ impl HostPlatform {
     }
 }
 
+/// Closed provenance for one effective Codex setting. Raw layer names, file
+/// paths, hashes, and flattened configuration never cross this boundary.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum CodexConfigOriginClass {
+    Default,
+    User,
+    Project,
+    Managed,
+    Session,
+    Other,
+}
+
+impl CodexConfigOriginClass {
+    pub(crate) const fn provider_value_origin(self) -> satelle_core::ProviderValueOrigin {
+        match self {
+            Self::Default => satelle_core::ProviderValueOrigin::CodexDefault,
+            Self::User => satelle_core::ProviderValueOrigin::CodexUser,
+            Self::Project => satelle_core::ProviderValueOrigin::CodexProject,
+            Self::Managed => satelle_core::ProviderValueOrigin::CodexManaged,
+            Self::Session => satelle_core::ProviderValueOrigin::CodexSession,
+            Self::Other => satelle_core::ProviderValueOrigin::CodexOther,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct EffectiveCodexDefaults {
+    model: String,
+    model_provider: String,
+    model_origin: CodexConfigOriginClass,
+    model_provider_origin: CodexConfigOriginClass,
+}
+
+impl EffectiveCodexDefaults {
+    pub(crate) fn model(&self) -> &str {
+        &self.model
+    }
+
+    pub(crate) fn model_provider(&self) -> &str {
+        &self.model_provider
+    }
+
+    pub(crate) const fn model_origin(&self) -> CodexConfigOriginClass {
+        self.model_origin
+    }
+
+    pub(crate) const fn model_provider_origin(&self) -> CodexConfigOriginClass {
+        self.model_provider_origin
+    }
+}
+
 /// Stable Satelle capability keys. These keys describe product requirements,
 /// not upstream method names.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
@@ -595,6 +646,133 @@ fn probe_windows_app_policy_with(mut command: Command, timeout: Duration) -> Evi
         surface
     } else {
         EvidenceSurface::Incomplete
+    }
+}
+
+/// Reads only the effective model pair required to resolve Codex's implicit
+/// default. The app-server response is classified immediately; no raw config,
+/// layer, path, or hash survives the probe.
+pub(crate) fn probe_effective_codex_defaults(
+    command: Command,
+) -> Result<EffectiveCodexDefaults, ()> {
+    probe_effective_codex_defaults_with(command, APP_POLICY_PROBE_TIMEOUT).ok_or(())
+}
+
+fn probe_effective_codex_defaults_with(
+    mut command: Command,
+    timeout: Duration,
+) -> Option<EffectiveCodexDefaults> {
+    let deadline = Instant::now() + timeout;
+    if Instant::now() >= deadline {
+        return None;
+    }
+    let mut child = command
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .group_spawn()
+        .ok()?;
+    let Some(mut stdin) = child.inner().stdin.take() else {
+        let _ = terminate_group(&mut child);
+        return None;
+    };
+    let Some(stdout) = child.inner().stdout.take() else {
+        let _ = terminate_group(&mut child);
+        return None;
+    };
+
+    let (sender, receiver) = mpsc::channel();
+    let reader = thread::spawn(move || read_app_policy_messages(stdout, sender));
+    let initialized = write_json_line(
+        &mut stdin,
+        &serde_json::json!({
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "clientInfo": {
+                    "name": "satelle-host",
+                    "version": env!("CARGO_PKG_VERSION")
+                },
+                "capabilities": {"experimentalApi": false}
+            }
+        }),
+    );
+    let initialize_result = initialized
+        .then(|| next_app_policy_result(&receiver, 1, deadline))
+        .flatten();
+    let initialized_sent = initialize_result.is_some()
+        && write_json_line(&mut stdin, &serde_json::json!({"method": "initialized"}));
+    let config_read_sent = initialized_sent
+        && write_json_line(
+            &mut stdin,
+            &serde_json::json!({
+                "id": 2,
+                "method": "config/read",
+                "params": {"includeLayers": false}
+            }),
+        );
+    let defaults = config_read_sent
+        .then(|| next_app_policy_result(&receiver, 2, deadline))
+        .flatten()
+        .as_ref()
+        .and_then(classify_effective_codex_defaults);
+
+    let shutdown_deadline = Instant::now()
+        + deadline
+            .saturating_duration_since(Instant::now())
+            .min(APP_POLICY_SHUTDOWN_GRACE);
+    let status = wait_for_group(&mut child, shutdown_deadline);
+    let group_stopped = terminate_group(&mut child);
+    drop(stdin);
+    let reader_cleanup_deadline = Instant::now() + APP_POLICY_SHUTDOWN_GRACE;
+    while !reader.is_finished() && Instant::now() < reader_cleanup_deadline {
+        thread::sleep(VERSION_PROBE_POLL_INTERVAL);
+    }
+    let reader_stopped = reader.is_finished() && reader.join().is_ok();
+    if matches!(status, GroupWaitOutcome::Deadline) && group_stopped && reader_stopped {
+        defaults
+    } else {
+        None
+    }
+}
+
+fn classify_effective_codex_defaults(result: &Value) -> Option<EffectiveCodexDefaults> {
+    let config = result.get("config")?.as_object()?;
+    let model = config.get("model")?.as_str()?.trim();
+    let model_provider = config.get("model_provider")?.as_str()?.trim();
+    if model.is_empty() || model_provider.is_empty() {
+        return None;
+    }
+    let origins = result.get("origins").and_then(Value::as_object);
+    Some(EffectiveCodexDefaults {
+        model: model.to_string(),
+        model_provider: model_provider.to_string(),
+        model_origin: classify_codex_config_origin(origins.and_then(|value| value.get("model"))),
+        model_provider_origin: classify_codex_config_origin(
+            origins.and_then(|value| value.get("model_provider")),
+        ),
+    })
+}
+
+fn classify_codex_config_origin(origin: Option<&Value>) -> CodexConfigOriginClass {
+    let Some(origin) = origin else {
+        return CodexConfigOriginClass::Other;
+    };
+    let kind = origin.as_str().or_else(|| {
+        origin
+            .get("type")
+            .and_then(Value::as_str)
+            .or_else(|| origin.get("name")?.get("type")?.as_str())
+    });
+    match kind.map(str::to_ascii_lowercase).as_deref() {
+        Some("default" | "builtin") => CodexConfigOriginClass::Default,
+        Some("user" | "profile") => CodexConfigOriginClass::User,
+        Some("project" | "local") => CodexConfigOriginClass::Project,
+        Some("managed" | "system") => CodexConfigOriginClass::Managed,
+        Some("session" | "session_flags" | "sessionflags" | "cli") => {
+            CodexConfigOriginClass::Session
+        }
+        _ => CodexConfigOriginClass::Other,
     }
 }
 

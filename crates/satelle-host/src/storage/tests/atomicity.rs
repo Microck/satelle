@@ -107,6 +107,51 @@ fn stop_idempotency_retention_starts_when_stop_completes() {
 }
 
 #[test]
+fn provider_validation_retention_starts_when_validation_completes() {
+    let state = TempDir::new().expect("temporary state directory");
+    let (mut storage, _) = Storage::open(state.path()).expect("open storage");
+    let key = "provider-validation-retention";
+    storage
+        .claim_provider_descriptor_validation(&idempotency(
+            IdempotentOperation::ProviderDescriptorValidation,
+            key,
+            at(0),
+        ))
+        .expect("claim provider validation");
+    let completed_at = at(2);
+    storage
+        .complete_provider_descriptor_validation(
+            &idempotency(
+                IdempotentOperation::ProviderDescriptorValidation,
+                key,
+                completed_at,
+            ),
+            "{}",
+            false,
+            completed_at,
+        )
+        .expect("complete provider validation");
+
+    let (stored_completed_at, expires_at) = storage
+        .connection_for_test()
+        .query_row(
+            "SELECT completed_at, expires_at FROM idempotency_records
+             WHERE operation = 'provider_descriptor_validation'
+               AND idempotency_key = ?1",
+            [key],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+        )
+        .expect("read provider validation retention");
+    assert_eq!(stored_completed_at, completed_at.format(&Rfc3339).unwrap());
+    assert_eq!(
+        expires_at,
+        (completed_at + IDEMPOTENCY_RETENTION)
+            .format(&Rfc3339)
+            .unwrap()
+    );
+}
+
+#[test]
 fn admission_and_its_canonical_log_commit_atomically() {
     let state = TempDir::new().expect("temporary state directory");
     let (mut storage, _) = Storage::open(state.path()).expect("open storage");

@@ -18,6 +18,11 @@ pub use read::{
     CapabilitiesResponse, EffectiveLimits, HostDesktopSessionsResponse, HostStatusResponse,
     LiveResponse,
 };
+pub use satelle_core::{
+    ProviderAuthObservationSource, ProviderAuthValidationMode, ProviderAuthValidationOutcome,
+    ProviderAuthValidationResult, ProviderBindingAuthorization, ProviderBindingSource,
+    ResolvedProviderBinding,
+};
 pub(crate) use session::ApiRequestContract;
 pub(crate) use session::TurnRequestParts;
 pub use session::{
@@ -28,12 +33,16 @@ pub use session::{
 pub use setup::{
     BootstrapMaintenanceResponse, DURABLE_SETUP_PENDING_TTL, DurableTokenActivationResponse,
     DurableTokenConfirmationResponse, DurableTokenIssuanceResponse,
+    ProviderBindingAuthorizationRequest, ProviderBindingAuthorizationResponse,
+    ProviderBindingDeletionResponse, ProviderDescriptorValidationRequest,
+    ProviderDescriptorValidationResponse,
 };
 
 pub(crate) const PROTOCOL_VERSION_HEADER: &str = "satelle-protocol-version";
-// Persistent maintenance changes the route and authorization contract. Bump the exact-match
-// protocol so either side detects a v4 peer before using a maintenance route it cannot represent.
-pub(crate) const PROTOCOL_VERSION: &str = "6";
+// Project-origin provenance and exact-binding consent close the remaining
+// Provider Binding selection boundary. Exact-match negotiation rejects every
+// peer that still implements the protocol v8 request surface.
+pub(crate) const PROTOCOL_VERSION: &str = "9";
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::fmt;

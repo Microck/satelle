@@ -4,6 +4,9 @@ use satelle_host::test_support::TestStateDir;
 use serde_json::{Value, json};
 use std::collections::BTreeSet;
 
+#[path = "support/test-file.rs"]
+mod test_file;
+
 const TEST_SUPPORT_ADAPTER_ENV: &str = "SATELLE_TEST_SUPPORT_ADAPTER";
 
 fn satelle() -> Command {
@@ -26,8 +29,69 @@ fn satelle() -> Command {
     command
 }
 
+fn authorize_default_provider_binding(state: &TestStateDir) -> std::path::PathBuf {
+    let config_file = state.path().join("provider-binding-config.toml");
+    test_file::write_user_controlled(
+        &config_file,
+        r#"
+default_host = "local-demo"
+model_alias = "schema-model"
+provider_alias = "schema-provider"
+
+[hosts.local-demo]
+transport = "local"
+adapter = "fake"
+
+[hosts.local-demo.provider_bindings.schema-provider.schema-model]
+model = "fake-model-v1"
+model_provider = "openai"
+"#,
+    )
+    .expect("write exact provider binding config");
+    satelle()
+        .env("SATELLE_CONFIG_FILE", &config_file)
+        .env("SATELLE_STATE_DIR", state.path())
+        .args([
+            "setup",
+            "--host",
+            "local-demo",
+            "--component",
+            "provider-auth",
+            "--no-input",
+            "--yes",
+            "--json",
+        ])
+        .assert()
+        .success();
+    satelle()
+        .env("SATELLE_CONFIG_FILE", &config_file)
+        .env("SATELLE_STATE_DIR", state.path())
+        .args(["host", "release-state"])
+        .assert()
+        .success();
+    config_file
+}
+
 fn json_report(state: &TestStateDir, args: Vec<&str>) -> Value {
     let output = satelle()
+        .env("SATELLE_STATE_DIR", state.path())
+        .args(args)
+        .assert()
+        .success()
+        .get_output()
+        .clone();
+
+    assert!(output.stderr.is_empty());
+    serde_json::from_slice(&output.stdout).expect("stdout should be one JSON report")
+}
+
+fn json_report_with_config(
+    state: &TestStateDir,
+    config_file: &std::path::Path,
+    args: Vec<&str>,
+) -> Value {
+    let output = satelle()
+        .env("SATELLE_CONFIG_FILE", config_file)
         .env("SATELLE_STATE_DIR", state.path())
         .args(args)
         .assert()
@@ -270,9 +334,11 @@ fn local_inspection_reports_keep_their_closed_v1_shapes() {
 #[test]
 fn session_commands_use_command_specific_v2_schema_tokens() {
     let state = TestStateDir::new().expect("secure temp state directory should be created");
+    let provider_config = authorize_default_provider_binding(&state);
 
-    let run = json_report(
+    let run = json_report_with_config(
         &state,
+        &provider_config,
         vec!["run", "--host", "local-demo", "--json", "Inspect"],
     );
     assert_report_contract(
@@ -280,8 +346,15 @@ fn session_commands_use_command_specific_v2_schema_tokens() {
         "satelle.run.v2",
         &[
             "effective_timeouts",
+            "experimental_provider_computer_use",
             "latest_turn",
+            "provider_binding_source",
             "provider_smoke",
+            "provider_smoke_test_status",
+            "requested_model_alias",
+            "requested_provider_alias",
+            "resolved_codex_model",
+            "resolved_model_provider",
             "schema_version",
             "session_id",
             "status",
@@ -292,8 +365,9 @@ fn session_commands_use_command_specific_v2_schema_tokens() {
         .as_str()
         .expect("run should return a session id");
 
-    let steer = json_report(
+    let steer = json_report_with_config(
         &state,
+        &provider_config,
         vec!["steer", session, "--json", "Continue inspection"],
     );
     assert_report_contract(
@@ -301,8 +375,15 @@ fn session_commands_use_command_specific_v2_schema_tokens() {
         "satelle.steer.v2",
         &[
             "effective_timeouts",
+            "experimental_provider_computer_use",
             "latest_turn",
+            "provider_binding_source",
             "provider_smoke",
+            "provider_smoke_test_status",
+            "requested_model_alias",
+            "requested_provider_alias",
+            "resolved_codex_model",
+            "resolved_model_provider",
             "schema_version",
             "session_id",
             "status",
@@ -325,8 +406,9 @@ fn session_commands_use_command_specific_v2_schema_tokens() {
         ],
     );
 
-    let detached_steer = json_report(
+    let detached_steer = json_report_with_config(
         &state,
+        &provider_config,
         vec![
             "steer",
             session,
@@ -341,7 +423,14 @@ fn session_commands_use_command_specific_v2_schema_tokens() {
         &[
             "created_at",
             "effective_timeouts",
+            "experimental_provider_computer_use",
             "host",
+            "provider_binding_source",
+            "provider_smoke_test_status",
+            "requested_model_alias",
+            "requested_provider_alias",
+            "resolved_codex_model",
+            "resolved_model_provider",
             "schema_version",
             "session_id",
             "status",
@@ -353,8 +442,10 @@ fn session_commands_use_command_specific_v2_schema_tokens() {
 
     let detached_run_state =
         TestStateDir::new().expect("second secure temp state directory should be created");
-    let detached_run = json_report(
+    let detached_provider_config = authorize_default_provider_binding(&detached_run_state);
+    let detached_run = json_report_with_config(
         &detached_run_state,
+        &detached_provider_config,
         vec![
             "run",
             "--host",
@@ -370,7 +461,14 @@ fn session_commands_use_command_specific_v2_schema_tokens() {
         &[
             "created_at",
             "effective_timeouts",
+            "experimental_provider_computer_use",
             "host",
+            "provider_binding_source",
+            "provider_smoke_test_status",
+            "requested_model_alias",
+            "requested_provider_alias",
+            "resolved_codex_model",
+            "resolved_model_provider",
             "schema_version",
             "session_id",
             "status",

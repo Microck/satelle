@@ -198,6 +198,7 @@ fn lifecycle_schema_excludes_raw_content_and_replayable_event_history() {
         [
             "admission_cancellations",
             "api_tokens",
+            "authorized_provider_bindings",
             "control_leases",
             "daemon_identity",
             "idempotency_hmac_keys",
@@ -206,6 +207,7 @@ fn lifecycle_schema_excludes_raw_content_and_replayable_event_history() {
             "logs",
             "maintenance_leases",
             "native_readiness_results",
+            "provider_smoke_hmac_key",
             "provider_smoke_results",
             "schema_migrations",
             "session_private_refs",
@@ -217,6 +219,24 @@ fn lifecycle_schema_excludes_raw_content_and_replayable_event_history() {
             "turn_private_refs",
             "turns",
         ]
+    );
+
+    assert_table_columns(
+        &storage,
+        "authorized_provider_bindings",
+        &[
+            "provider_alias",
+            "model_alias",
+            "model",
+            "model_provider",
+            "endpoint",
+            "auth_source_json",
+            "source",
+            "experimental_provider_computer_use",
+            "allow_project_selection",
+            "binding_digest",
+            "updated_at",
+        ],
     );
 
     assert_table_columns(

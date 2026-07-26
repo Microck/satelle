@@ -228,6 +228,10 @@ fn stop_not_confirmed(
 }
 
 pub(super) fn storage_failure(error: StorageError) -> SatelleError {
+    storage_failure_ref(&error)
+}
+
+pub(super) fn storage_failure_ref(error: &StorageError) -> SatelleError {
     if let Some(session_id) = error.conflicting_session_id() {
         return SatelleError::host_busy(LOCAL_DEMO_HOST, session_id);
     }

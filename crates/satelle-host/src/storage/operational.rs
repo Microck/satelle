@@ -1134,7 +1134,8 @@ impl Storage {
         let row = self
             .connection
             .query_row(
-                "SELECT result_id, provider_config_fingerprint, status,
+                "SELECT result_id, provider_config_fingerprint,
+                        provider_credential_fingerprint, status,
                         failure_code, failure_reason, observed_at, expires_at
                  FROM provider_smoke_results
                  WHERE host_identity_ref = ?1
@@ -1163,10 +1164,11 @@ impl Storage {
                         row.get::<_, String>(0)?,
                         row.get::<_, String>(1)?,
                         row.get::<_, String>(2)?,
-                        row.get::<_, Option<String>>(3)?,
+                        row.get::<_, String>(3)?,
                         row.get::<_, Option<String>>(4)?,
-                        row.get::<_, i64>(5)?,
+                        row.get::<_, Option<String>>(5)?,
                         row.get::<_, i64>(6)?,
+                        row.get::<_, i64>(7)?,
                     ))
                 },
             )
@@ -1176,6 +1178,7 @@ impl Storage {
             |(
                 result_id,
                 provider_config_fingerprint,
+                provider_credential_fingerprint,
                 status,
                 failure_code,
                 failure_reason,
@@ -1192,6 +1195,7 @@ impl Storage {
                     ("passed", None, None) => ProviderSmokeEvidence::new(
                         result_id,
                         provider_config_fingerprint,
+                        provider_credential_fingerprint,
                         observed_at,
                         expires_at,
                     )
@@ -1210,6 +1214,7 @@ impl Storage {
                         ProviderSmokeFailureEvidence::new(
                             result_id,
                             provider_config_fingerprint,
+                            provider_credential_fingerprint,
                             error_code,
                             failure_reason,
                             observed_at,
@@ -1304,6 +1309,7 @@ fn insert_provider_smoke(
     let (
         result_id,
         provider_config_fingerprint,
+        provider_credential_fingerprint,
         status,
         failure_code,
         failure_reason,
@@ -1313,6 +1319,7 @@ fn insert_provider_smoke(
         ProviderSmokeInsert::Passed(evidence) => (
             evidence.result_id(),
             evidence.provider_config_fingerprint(),
+            evidence.provider_credential_fingerprint(),
             "passed",
             None,
             None,
@@ -1322,6 +1329,7 @@ fn insert_provider_smoke(
         ProviderSmokeInsert::Failed(evidence) => (
             evidence.result_id(),
             evidence.provider_config_fingerprint(),
+            evidence.provider_credential_fingerprint(),
             "failed",
             Some(evidence.error_code().as_str()),
             Some(evidence.failure_reason()),
@@ -1331,6 +1339,7 @@ fn insert_provider_smoke(
         ProviderSmokeInsert::TerminalFailure { evidence, status } => (
             evidence.result_id(),
             evidence.provider_config_fingerprint(),
+            evidence.provider_credential_fingerprint(),
             status,
             Some(evidence.error_code().as_str()),
             Some(evidence.failure_reason()),
@@ -1366,9 +1375,10 @@ fn insert_provider_smoke(
             "INSERT INTO provider_smoke_results (
                 result_id, host_identity_ref, desktop_binding_ref,
                 provider_binding_ref, effective_model_ref, codex_version,
-                native_runtime_version, provider_config_fingerprint, status,
+                native_runtime_version, provider_config_fingerprint,
+                provider_credential_fingerprint, status,
                 failure_code, failure_reason, observed_at, expires_at
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
             ON CONFLICT(result_id) DO UPDATE SET result_id = excluded.result_id
             WHERE host_identity_ref = excluded.host_identity_ref
               AND desktop_binding_ref = excluded.desktop_binding_ref
@@ -1377,6 +1387,7 @@ fn insert_provider_smoke(
               AND codex_version = excluded.codex_version
               AND native_runtime_version = excluded.native_runtime_version
               AND provider_config_fingerprint = excluded.provider_config_fingerprint
+              AND provider_credential_fingerprint = excluded.provider_credential_fingerprint
               AND status = excluded.status
               AND failure_code IS excluded.failure_code
               AND failure_reason IS excluded.failure_reason
@@ -1391,6 +1402,7 @@ fn insert_provider_smoke(
                 readiness.codex_version(),
                 readiness.native_runtime_version(),
                 provider_config_fingerprint,
+                provider_credential_fingerprint,
                 status,
                 failure_code,
                 failure_reason,

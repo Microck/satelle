@@ -8,6 +8,9 @@ use satelle_core::session::TurnExecutionMode;
 use satelle_core::session::{StopObservation, TurnState, TurnTransition};
 use satelle_core::{ErrorCode, SatelleError};
 use sha2::{Digest as _, Sha256};
+use std::path::PathBuf;
+use std::sync::Condvar;
+use std::time::Duration;
 
 fn turn_intent(prompt: &str) -> TurnIntent {
     TurnIntent::new(prompt, TurnExecutionMode::Standard).expect("valid test Turn intent")
@@ -15,7 +18,125 @@ fn turn_intent(prompt: &str) -> TurnIntent {
 
 #[derive(Clone)]
 struct RecordingTurnExtrasAdapter {
-    observations: Arc<Mutex<Vec<(usize, u32)>>>,
+    observations: Arc<Mutex<Vec<TurnExtrasObservation>>>,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct TurnExtrasObservation {
+    attachments: Vec<AttachmentObservation>,
+    timeout_seconds: u32,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct AttachmentObservation {
+    path: PathBuf,
+    media_type: String,
+    size_bytes: usize,
+}
+
+#[derive(Clone, Copy)]
+#[cfg(unix)]
+struct SecretBoundaryAdapter;
+
+#[cfg(unix)]
+impl ComputerUseAdapter for SecretBoundaryAdapter {
+    fn preflight(
+        &self,
+        host: &str,
+        provider_intent: &ProviderComputerUseIntent,
+    ) -> Result<AdapterReadiness, SatelleError> {
+        let binding = provider_intent
+            .resolved_provider_binding()
+            .expect("Host must inject the authoritative provider binding");
+        drop(crate::runtime::resolve_provider_child_secret_for_test(
+            binding,
+        )?);
+        FakeComputerUseAdapter.preflight(host, provider_intent)
+    }
+
+    fn execute(&self, request: ExecuteRequest<'_>) -> Result<ExecuteResult, SatelleError> {
+        FakeComputerUseAdapter.execute(request)
+    }
+
+    fn observe_stop(&self, subject: AdapterSubject<'_>) -> Result<StopObservation, SatelleError> {
+        FakeComputerUseAdapter.observe_stop(subject)
+    }
+
+    fn observe_recovery(
+        &self,
+        subject: AdapterSubject<'_>,
+    ) -> Result<RecoveryObservation, SatelleError> {
+        FakeComputerUseAdapter.observe_recovery(subject)
+    }
+}
+
+#[derive(Clone, Copy)]
+#[cfg(unix)]
+struct FailedProviderSmokeAdapter;
+
+#[cfg(unix)]
+impl ComputerUseAdapter for FailedProviderSmokeAdapter {
+    fn preflight(
+        &self,
+        _host: &str,
+        _provider_intent: &ProviderComputerUseIntent,
+    ) -> Result<AdapterReadiness, SatelleError> {
+        let mut error = SatelleError::computer_use_not_ready();
+        error.details.insert(
+            "provider_smoke_status".to_string(),
+            serde_json::Value::String("failed".to_string()),
+        );
+        Err(error)
+    }
+
+    fn execute(&self, request: ExecuteRequest<'_>) -> Result<ExecuteResult, SatelleError> {
+        FakeComputerUseAdapter.execute(request)
+    }
+
+    fn observe_stop(&self, subject: AdapterSubject<'_>) -> Result<StopObservation, SatelleError> {
+        FakeComputerUseAdapter.observe_stop(subject)
+    }
+
+    fn observe_recovery(
+        &self,
+        subject: AdapterSubject<'_>,
+    ) -> Result<RecoveryObservation, SatelleError> {
+        FakeComputerUseAdapter.observe_recovery(subject)
+    }
+}
+
+#[derive(Clone)]
+struct HostBusyProviderPreflightAdapter {
+    calls: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl ComputerUseAdapter for HostBusyProviderPreflightAdapter {
+    fn preflight(
+        &self,
+        _host: &str,
+        _provider_intent: &ProviderComputerUseIntent,
+    ) -> Result<AdapterReadiness, SatelleError> {
+        self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Err(SatelleError::host_busy(
+            LOCAL_DEMO_HOST,
+            &satelle_core::SessionId::new(),
+        ))
+    }
+
+    fn execute(&self, request: ExecuteRequest<'_>) -> Result<ExecuteResult, SatelleError> {
+        FakeComputerUseAdapter.execute(request)
+    }
+
+    fn observe_stop(&self, subject: AdapterSubject<'_>) -> Result<StopObservation, SatelleError> {
+        FakeComputerUseAdapter.observe_stop(subject)
+    }
+
+    fn observe_recovery(
+        &self,
+        subject: AdapterSubject<'_>,
+    ) -> Result<RecoveryObservation, SatelleError> {
+        FakeComputerUseAdapter.observe_recovery(subject)
+    }
 }
 
 impl ComputerUseAdapter for RecordingTurnExtrasAdapter {
@@ -28,10 +149,21 @@ impl ComputerUseAdapter for RecordingTurnExtrasAdapter {
     }
 
     fn execute(&self, request: ExecuteRequest<'_>) -> Result<ExecuteResult, SatelleError> {
-        self.observations.lock().expect("lock observations").push((
-            request.attachments().len(),
-            request.execution_policy().timeout_policy().seconds(),
-        ));
+        self.observations
+            .lock()
+            .expect("lock observations")
+            .push(TurnExtrasObservation {
+                attachments: request
+                    .attachments()
+                    .iter()
+                    .map(|attachment| AttachmentObservation {
+                        path: attachment.path().to_path_buf(),
+                        media_type: attachment.media_type().to_string(),
+                        size_bytes: attachment.bytes().len(),
+                    })
+                    .collect(),
+                timeout_seconds: request.execution_policy().timeout_policy().seconds(),
+            });
         Ok(ExecuteResult::new(TurnTransition::Completed, Vec::new()))
     }
 
@@ -44,6 +176,137 @@ impl ComputerUseAdapter for RecordingTurnExtrasAdapter {
         subject: AdapterSubject<'_>,
     ) -> Result<RecoveryObservation, SatelleError> {
         FakeComputerUseAdapter.observe_recovery(subject)
+    }
+}
+
+#[derive(Clone, Default)]
+struct ProviderPreflightGate {
+    state: Arc<(Mutex<ProviderPreflightGateState>, Condvar)>,
+}
+
+#[derive(Default)]
+struct ProviderPreflightGateState {
+    started: bool,
+    released: bool,
+}
+
+impl ProviderPreflightGate {
+    fn signal_started_and_wait(&self) -> Result<(), SatelleError> {
+        let (state, changed) = &*self.state;
+        let mut state = state.lock().expect("provider preflight gate lock");
+        state.started = true;
+        changed.notify_all();
+
+        let (state, _) = changed
+            .wait_timeout_while(state, Duration::from_secs(5), |state| !state.released)
+            .expect("provider preflight gate wait");
+        if !state.released {
+            return Err(SatelleError::config_error(
+                "provider preflight test gate timed out",
+                None,
+            ));
+        }
+        Ok(())
+    }
+
+    fn wait_for_started(&self, timeout: Duration) -> bool {
+        let (state, changed) = &*self.state;
+        let state = state.lock().expect("provider preflight gate lock");
+        let (state, _) = changed
+            .wait_timeout_while(state, timeout, |state| !state.started)
+            .expect("provider preflight start wait");
+        state.started
+    }
+
+    fn release(&self) {
+        let (state, changed) = &*self.state;
+        let mut state = state.lock().expect("provider preflight gate lock");
+        state.released = true;
+        changed.notify_all();
+    }
+}
+
+#[derive(Clone)]
+struct ProviderPreflightCounter {
+    calls: Arc<std::sync::atomic::AtomicUsize>,
+    gate: Option<ProviderPreflightGate>,
+}
+
+impl ComputerUseAdapter for ProviderPreflightCounter {
+    fn preflight(
+        &self,
+        host: &str,
+        provider_intent: &ProviderComputerUseIntent,
+    ) -> Result<AdapterReadiness, SatelleError> {
+        self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if let Some(gate) = &self.gate {
+            gate.signal_started_and_wait()?;
+        }
+        FakeComputerUseAdapter.preflight(host, provider_intent)
+    }
+
+    fn execute(&self, request: ExecuteRequest<'_>) -> Result<ExecuteResult, SatelleError> {
+        FakeComputerUseAdapter.execute(request)
+    }
+
+    fn observe_stop(&self, subject: AdapterSubject<'_>) -> Result<StopObservation, SatelleError> {
+        FakeComputerUseAdapter.observe_stop(subject)
+    }
+
+    fn observe_recovery(
+        &self,
+        subject: AdapterSubject<'_>,
+    ) -> Result<RecoveryObservation, SatelleError> {
+        FakeComputerUseAdapter.observe_recovery(subject)
+    }
+}
+
+fn provider_intent_with_missing_descriptor() -> ProviderComputerUseIntent {
+    ProviderComputerUseIntent::new(
+        Some(
+            satelle_core::session::EffectiveModelRef::new("review")
+                .expect("valid requested model alias"),
+        ),
+        Some(
+            satelle_core::session::ProviderBindingRef::new("openai")
+                .expect("valid requested provider alias"),
+        ),
+        false,
+    )
+}
+
+fn service_with_provider_descriptor<A: ComputerUseAdapter>(
+    state_root: PathBuf,
+    adapter: A,
+    auth_source: Option<String>,
+) -> HostService {
+    let mut config = satelle_core::SatelleConfig::defaults().hosts[LOCAL_DEMO_HOST].clone();
+    config.provider_bindings.insert(
+        "openai".to_string(),
+        std::collections::BTreeMap::from([(
+            "review".to_string(),
+            satelle_core::ProviderBindingConfig {
+                model: "provider-model".to_string(),
+                model_provider: "openai".to_string(),
+                endpoint: None,
+                auth_source,
+                allow_project_selection: false,
+            },
+        )]),
+    );
+    HostService {
+        runtime: RuntimeHandle::new_with_provider_policy(
+            Ok(state_root),
+            adapter,
+            crate::runtime::RuntimeProviderPolicy::from_host_config(&config),
+        ),
+        operation_capacity: Arc::new(OperationCapacity::default()),
+        turn_execution_timeout: crate::configured_turn_execution_timeout(&config),
+        mode: HostMode::TestFake {
+            image_attachments: true,
+        },
+        bootstrap_auth: None,
+        bootstrap_maintenance: Arc::new(Mutex::new(None)),
     }
 }
 
@@ -103,10 +366,36 @@ fn local_host_run_and_steer_forward_attachments_and_host_clamped_timeout() {
         )
         .expect("steer local Turn");
 
-    assert_eq!(
-        *observations.lock().expect("lock observations"),
-        [(1, 3), (1, 5)],
-        "run must preserve a shorter timeout and steer must clamp to the Host limit"
+    let observations = observations.lock().expect("lock observations");
+    assert_eq!(observations.len(), 2);
+    assert_eq!(observations[0].timeout_seconds, 3);
+    assert_eq!(observations[1].timeout_seconds, 5);
+    for observation in observations.iter() {
+        assert_eq!(observation.attachments.len(), 1);
+        let attachment = &observation.attachments[0];
+        assert_eq!(attachment.media_type, "image/png");
+        assert_eq!(attachment.size_bytes, 8);
+        assert!(
+            attachment
+                .path
+                .starts_with(state.path().join("attachments"))
+        );
+        assert!(
+            attachment
+                .path
+                .file_name()
+                .expect("staged image path has a file name")
+                .to_string_lossy()
+                .starts_with("satelle-image-")
+        );
+        assert!(
+            !attachment.path.exists(),
+            "terminal run and steer must both delete staged images"
+        );
+    }
+    assert_ne!(
+        observations[0].attachments[0].path, observations[1].attachments[0].path,
+        "run and steer must receive separate generated staging names"
     );
 }
 
@@ -814,6 +1103,22 @@ fn doctor_provider_refresh_updates_cache_without_admitting_prompt_work() {
     let state = crate::TestStateDir::new().expect("temporary state directory");
     let service = HostService::local_demo_for_tests_at(state.path())
         .expect("construct deterministic Host service");
+    service
+        .runtime
+        .authorize_provider_binding(&satelle_core::ResolvedProviderBinding::from_authorization(
+            satelle_core::ProviderBindingAuthorization::new(
+                "provider-doctor-model",
+                "provider-doctor-binding",
+                "provider-doctor-model",
+                "provider-doctor-binding",
+            )
+            .with_auth_source(satelle_core::ProviderSecretSource::Environment {
+                variable: "SATELLE_PROVIDER_DOCTOR_TOKEN".to_string(),
+            })
+            .with_experimental_provider_computer_use(true),
+            satelle_core::ProviderBindingSource::UserConfig,
+        ))
+        .expect("authorize the persisted UserConfig provider binding");
     let intent = ProviderComputerUseIntent::new(
         Some(
             satelle_core::session::EffectiveModelRef::new("provider-doctor-model")
@@ -823,7 +1128,6 @@ fn doctor_provider_refresh_updates_cache_without_admitting_prompt_work() {
             satelle_core::session::ProviderBindingRef::new("provider-doctor-binding")
                 .expect("valid provider"),
         ),
-        true,
         true,
     );
 
@@ -847,7 +1151,848 @@ fn doctor_provider_refresh_updates_cache_without_admitting_prompt_work() {
             .evidence
             .contains(&"source=refresh".to_string())
     );
+    let default_report = service
+        .doctor_with_provider_intent(
+            LOCAL_DEMO_HOST,
+            None,
+            DoctorOptions::new(true, Some(std::time::Duration::from_secs(5))),
+            &intent,
+        )
+        .expect("default all-scope doctor refresh should include provider refresh");
+    assert!(
+        default_report
+            .cache_updates
+            .iter()
+            .any(|update| update == "provider_smoke")
+    );
+    assert!(default_report.probe_results.iter().any(|probe| {
+        probe.probe_id == "provider.smoke.refresh" && probe.cache_status == "refreshed"
+    }));
     assert_eq!(service.host_status().unwrap().sessions, 0);
+}
+
+#[test]
+fn endpointless_auth_sources_are_reserved_for_builtin_openai() {
+    let openai = satelle_core::ProviderBindingAuthorization::new(
+        "openai-model",
+        "openai-provider",
+        "gpt-test",
+        "openai",
+    )
+    .with_auth_source(satelle_core::ProviderSecretSource::Environment {
+        variable: "SATELLE_OPENAI_API_KEY".to_string(),
+    });
+    validate_provider_binding_authorization(&openai)
+        .expect("the built-in OpenAI provider may use a Host auth source");
+
+    let custom = satelle_core::ProviderBindingAuthorization::new(
+        "custom-model",
+        "custom-provider",
+        "custom-model",
+        "custom-provider",
+    )
+    .with_auth_source(satelle_core::ProviderSecretSource::Environment {
+        variable: "SATELLE_CUSTOM_PROVIDER_API_KEY".to_string(),
+    })
+    .with_experimental_provider_computer_use(true);
+    let error = validate_provider_binding_authorization(&custom)
+        .expect_err("a custom provider auth source requires a custom endpoint");
+    assert!(
+        error
+            .message
+            .contains("supported only for the built-in OpenAI provider")
+    );
+}
+
+#[test]
+fn implicit_codex_default_alias_pair_is_reserved_from_provider_authorization() {
+    let reserved = satelle_core::ProviderBindingAuthorization::new(
+        DEFAULT_MODEL_BINDING,
+        DEFAULT_PROVIDER_BINDING,
+        "gpt-test",
+        "openai",
+    );
+    let error = validate_provider_binding_authorization(&reserved)
+        .expect_err("the implicit Codex default pair must not name an exact binding");
+    assert_eq!(error.code, satelle_core::ErrorCode::ConfigError);
+    assert!(
+        error
+            .message
+            .contains("reserved for implicit Codex defaults")
+    );
+
+    for (model_alias, provider_alias) in [
+        (DEFAULT_MODEL_BINDING, "openai"),
+        ("review", DEFAULT_PROVIDER_BINDING),
+    ] {
+        validate_provider_binding_authorization(&satelle_core::ProviderBindingAuthorization::new(
+            model_alias,
+            provider_alias,
+            "gpt-test",
+            "openai",
+        ))
+        .expect("only the exact implicit default pair is reserved");
+    }
+}
+
+#[test]
+fn production_adapter_accepts_host_authorized_binding_without_resolving_auth() {
+    let state = crate::TestStateDir::new().expect("temporary state directory");
+    let host_auth = satelle_core::ProviderSecretSource::Environment {
+        variable: "SATELLE_HOST_OWNED_PROVIDER_SECRET_MISSING".to_string(),
+    };
+    let adapter = ProductionComputerUseAdapter::with_readiness_policy(
+        Arc::new(RwLock::new(capability_snapshot(
+            Phase0CapabilityEvidence {
+                codex_version: CodexVersionEvidence::Malformed,
+                host_platform: HostPlatform::Linux,
+                capabilities: CapabilityMatrix::unproven(),
+            },
+            0,
+        ))),
+        Ok(state.path().to_path_buf()),
+        crate::runtime::ProductionAdapterPolicy {
+            native_readiness_timeout: std::time::Duration::from_secs(1),
+            native_readiness_ttl: time::Duration::minutes(5),
+            provider_smoke_timeout: std::time::Duration::from_secs(1),
+            provider_smoke_success_ttl: time::Duration::hours(24),
+            provider_smoke_failure_ttl: time::Duration::minutes(10),
+            desktop_selection: satelle_core::DesktopSelectionPolicy {
+                desktop_user: None,
+                preference: None,
+                native_selector: None,
+            },
+        },
+    );
+    let binding = satelle_core::ResolvedProviderBinding::from_authorization(
+        satelle_core::ProviderBindingAuthorization::new(
+            "review",
+            "openai",
+            "host-model",
+            "host-provider",
+        )
+        .with_endpoint("https://host-provider.invalid/v1")
+        .with_auth_source(host_auth.clone()),
+        satelle_core::ProviderBindingSource::HostOwned,
+    );
+    let intent = ProviderComputerUseIntent::new(
+        Some(
+            satelle_core::session::EffectiveModelRef::new("review")
+                .expect("valid requested model alias"),
+        ),
+        Some(
+            satelle_core::session::ProviderBindingRef::new("openai")
+                .expect("valid requested provider alias"),
+        ),
+        false,
+    )
+    .with_resolved_provider_binding(binding)
+    .with_experimental_provider_computer_use(true);
+
+    let resolved = ComputerUseAdapter::resolve_provider_binding(&adapter, LOCAL_DEMO_HOST, &intent)
+        .expect("Host-owned binding resolution must not read its missing secret");
+
+    assert_eq!(
+        satelle_core::ProviderBindingSource::HostOwned,
+        resolved.source()
+    );
+    assert_eq!("host-model", resolved.model());
+    assert_eq!("host-provider", resolved.model_provider());
+    assert_eq!(
+        Some("https://host-provider.invalid/v1"),
+        resolved.endpoint()
+    );
+    assert_eq!(Some(&host_auth), resolved.auth_source());
+    assert!(resolved.experimental_provider_computer_use());
+}
+
+#[test]
+fn unresolved_host_secret_maps_to_the_typed_public_error_without_descriptor_text() {
+    let variable = format!(
+        "SATELLE_PROVIDER_AUTH_MISSING_{}",
+        uuid::Uuid::now_v7().simple()
+    );
+    let binding = satelle_core::ResolvedProviderBinding::from_authorization(
+        satelle_core::ProviderBindingAuthorization::new(
+            "review",
+            "openai",
+            "host-model",
+            "host-provider",
+        )
+        .with_endpoint("https://host-provider.invalid/v1")
+        .with_auth_source(satelle_core::ProviderSecretSource::Environment {
+            variable: variable.clone(),
+        }),
+        satelle_core::ProviderBindingSource::HostOwned,
+    );
+
+    let error = crate::runtime::resolve_provider_child_secret_for_test(&binding)
+        .expect_err("the missing Host environment secret must fail closed");
+
+    assert_eq!(ErrorCode::ProviderSecretResolutionFailed, error.code);
+    assert_eq!(error.details["reason"], "provider_auth_unresolved");
+    let encoded = serde_json::to_string(&error).expect("serialize typed error");
+    assert!(!encoded.contains(&variable));
+}
+
+#[cfg(unix)]
+#[test]
+fn provider_descriptor_validation_resolves_only_during_target_host_refresh() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let state = TestStateDir::new().expect("temporary state directory");
+    let secret_directory = tempfile::tempdir().expect("create provider secret directory");
+    std::fs::set_permissions(
+        secret_directory.path(),
+        std::fs::Permissions::from_mode(0o700),
+    )
+    .expect("make provider secret directory owner-only");
+    let secret_path = secret_directory.path().join("provider-token");
+    let secret_canary = "PRIVATE_PROVIDER_REFRESH_SECRET_CANARY";
+    let service = HostService {
+        runtime: RuntimeHandle::new(Ok(state.path().to_path_buf()), SecretBoundaryAdapter),
+        operation_capacity: Arc::new(OperationCapacity::default()),
+        turn_execution_timeout: crate::configured_turn_execution_timeout(
+            &satelle_core::SatelleConfig::defaults().hosts[LOCAL_DEMO_HOST],
+        ),
+        mode: HostMode::TestFake {
+            image_attachments: true,
+        },
+        bootstrap_auth: None,
+        bootstrap_maintenance: Arc::new(Mutex::new(None)),
+    };
+    service
+        .runtime
+        .authorize_provider_binding(&satelle_core::ResolvedProviderBinding::from_authorization(
+            satelle_core::ProviderBindingAuthorization::new(
+                "review",
+                "openai",
+                "host-model",
+                "openai",
+            )
+            .with_endpoint("http://127.0.0.1:9")
+            .with_auth_source(satelle_core::ProviderSecretSource::File {
+                path: secret_path.clone(),
+            })
+            .with_experimental_provider_computer_use(true),
+            satelle_core::ProviderBindingSource::UserConfig,
+        ))
+        .expect("seed the provider descriptor for validation");
+
+    let cached = service
+        .validate_provider_descriptor(
+            LOCAL_DEMO_HOST,
+            "review",
+            "openai",
+            crate::ProviderDescriptorValidationOptions::new(
+                satelle_core::ProviderAuthValidationMode::Cached,
+                false,
+                false,
+                false,
+            ),
+        )
+        .expect("cached validation remains observation-only");
+    assert_eq!(
+        cached.validation().outcome(),
+        satelle_core::ProviderAuthValidationOutcome::ConfiguredDeferred
+    );
+    assert_eq!(
+        cached.validation().observation_source(),
+        satelle_core::ProviderAuthObservationSource::Deferred
+    );
+    assert!(!secret_path.exists());
+
+    std::fs::write(&secret_path, secret_canary).expect("write provider secret canary");
+    std::fs::set_permissions(&secret_path, std::fs::Permissions::from_mode(0o600))
+        .expect("make provider secret owner-only");
+    let refreshed = service
+        .validate_provider_descriptor(
+            LOCAL_DEMO_HOST,
+            "review",
+            "openai",
+            crate::ProviderDescriptorValidationOptions::new(
+                satelle_core::ProviderAuthValidationMode::RefreshProviderSmoke,
+                false,
+                false,
+                false,
+            ),
+        )
+        .expect("live validation resolves at the target Host");
+    assert_eq!(
+        refreshed.validation().outcome(),
+        satelle_core::ProviderAuthValidationOutcome::Resolved
+    );
+    assert_eq!(
+        refreshed.validation().observation_source(),
+        satelle_core::ProviderAuthObservationSource::Live
+    );
+    let public = satelle_core::PublicProviderDescriptorValidation::from(&refreshed);
+    let encoded = serde_json::to_string(&public).expect("serialize public validation");
+    assert!(!encoded.contains(secret_canary));
+    assert!(!encoded.contains(secret_path.to_string_lossy().as_ref()));
+
+    let cached_after_pass = service
+        .validate_provider_descriptor(
+            LOCAL_DEMO_HOST,
+            "review",
+            "openai",
+            crate::ProviderDescriptorValidationOptions::new(
+                satelle_core::ProviderAuthValidationMode::Cached,
+                false,
+                false,
+                false,
+            ),
+        )
+        .expect("cached validation remains deferred after a live pass");
+    assert_eq!(
+        cached_after_pass.validation().outcome(),
+        satelle_core::ProviderAuthValidationOutcome::ConfiguredDeferred
+    );
+    assert_eq!(
+        cached_after_pass.validation().observation_source(),
+        satelle_core::ProviderAuthObservationSource::Deferred
+    );
+
+    std::fs::remove_file(&secret_path).expect("remove provider secret");
+    let unresolved = service
+        .validate_provider_descriptor(
+            LOCAL_DEMO_HOST,
+            "review",
+            "openai",
+            crate::ProviderDescriptorValidationOptions::new(
+                satelle_core::ProviderAuthValidationMode::RefreshProviderSmoke,
+                false,
+                false,
+                false,
+            ),
+        )
+        .expect("live validation reports a closed unresolved outcome");
+    assert_eq!(
+        unresolved.validation().outcome(),
+        satelle_core::ProviderAuthValidationOutcome::UnresolvedHostSecret
+    );
+    assert_eq!(
+        unresolved.validation().observation_source(),
+        satelle_core::ProviderAuthObservationSource::Live
+    );
+    let encoded = serde_json::to_string(&satelle_core::PublicProviderDescriptorValidation::from(
+        &unresolved,
+    ))
+    .expect("serialize unresolved public validation");
+    assert!(!encoded.contains(secret_canary));
+    assert!(!encoded.contains(secret_path.to_string_lossy().as_ref()));
+
+    let cached_after_failure = service
+        .validate_provider_descriptor(
+            LOCAL_DEMO_HOST,
+            "review",
+            "openai",
+            crate::ProviderDescriptorValidationOptions::new(
+                satelle_core::ProviderAuthValidationMode::Cached,
+                false,
+                false,
+                false,
+            ),
+        )
+        .expect("cached validation remains deferred after a live failure");
+    assert_eq!(
+        cached_after_failure.validation().outcome(),
+        satelle_core::ProviderAuthValidationOutcome::ConfiguredDeferred
+    );
+    assert_eq!(
+        cached_after_failure.validation().observation_source(),
+        satelle_core::ProviderAuthObservationSource::Deferred
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn failed_upstream_validation_returns_only_the_closed_smoke_failed_outcome() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let state = TestStateDir::new().expect("temporary state directory");
+    let secret_directory = tempfile::tempdir().expect("create provider secret directory");
+    std::fs::set_permissions(
+        secret_directory.path(),
+        std::fs::Permissions::from_mode(0o700),
+    )
+    .expect("make provider secret directory owner-only");
+    let secret_path = secret_directory.path().join("provider-token");
+    std::fs::write(&secret_path, "provider-smoke-token").expect("write provider smoke secret");
+    std::fs::set_permissions(&secret_path, std::fs::Permissions::from_mode(0o600))
+        .expect("make provider smoke secret owner-only");
+    let service = HostService {
+        runtime: RuntimeHandle::new(Ok(state.path().to_path_buf()), FailedProviderSmokeAdapter),
+        operation_capacity: Arc::new(OperationCapacity::default()),
+        turn_execution_timeout: crate::configured_turn_execution_timeout(
+            &satelle_core::SatelleConfig::defaults().hosts[LOCAL_DEMO_HOST],
+        ),
+        mode: HostMode::TestFake {
+            image_attachments: true,
+        },
+        bootstrap_auth: None,
+        bootstrap_maintenance: Arc::new(Mutex::new(None)),
+    };
+    service
+        .runtime
+        .authorize_provider_binding(&satelle_core::ResolvedProviderBinding::from_authorization(
+            satelle_core::ProviderBindingAuthorization::new(
+                "review",
+                "openai",
+                "host-model",
+                "openai",
+            )
+            .with_auth_source(satelle_core::ProviderSecretSource::File { path: secret_path }),
+            satelle_core::ProviderBindingSource::UserConfig,
+        ))
+        .expect("seed provider binding before failed smoke");
+
+    let validation = service
+        .validate_provider_descriptor(
+            LOCAL_DEMO_HOST,
+            "review",
+            "openai",
+            crate::ProviderDescriptorValidationOptions::new(
+                satelle_core::ProviderAuthValidationMode::RefreshProviderSmoke,
+                false,
+                false,
+                false,
+            ),
+        )
+        .expect("upstream smoke failure must become a closed validation outcome");
+    assert_eq!(
+        validation.validation().outcome(),
+        satelle_core::ProviderAuthValidationOutcome::ProviderComputerUseSmokeTestFailed
+    );
+    assert_eq!(
+        validation.validation().observation_source(),
+        satelle_core::ProviderAuthObservationSource::Live
+    );
+    let public = satelle_core::PublicProviderDescriptorValidation::from(&validation);
+    let encoded = serde_json::to_value(public).expect("serialize closed validation");
+    assert_eq!(
+        encoded["validation"]["outcome"],
+        satelle_core::ProviderAuthValidationOutcome::ProviderComputerUseSmokeTestFailed.as_str()
+    );
+}
+
+#[test]
+fn provider_descriptor_refresh_replays_control_plane_errors_without_reclassifying_them() {
+    let state = crate::TestStateDir::new().expect("temporary state directory");
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let service = service_with_provider_descriptor(
+        state.path().to_path_buf(),
+        HostBusyProviderPreflightAdapter {
+            calls: Arc::clone(&calls),
+        },
+        None,
+    );
+    service.initialize_daemon().expect("initialize daemon");
+
+    let token = ApiBearerToken::generate().expect("generate token");
+    let principal = service
+        .register_api_token(
+            &token,
+            "provider-validation-host-busy",
+            ApiScopes::CONTROL,
+            None,
+        )
+        .expect("register token");
+    let authority = MutationAuthority::new(principal, "provider-validation-host-busy")
+        .expect("construct mutation authority");
+    let options = || {
+        crate::ProviderDescriptorValidationOptions::new(
+            satelle_core::ProviderAuthValidationMode::RefreshProviderSmoke,
+            false,
+            false,
+            true,
+        )
+    };
+
+    let first = service
+        .validate_provider_descriptor_idempotent(
+            LOCAL_DEMO_HOST,
+            "review",
+            "openai",
+            options(),
+            &authority,
+        )
+        .expect_err("HostBusy must propagate instead of becoming a provider outcome");
+    let replay = service
+        .validate_provider_descriptor_idempotent(
+            LOCAL_DEMO_HOST,
+            "review",
+            "openai",
+            options(),
+            &authority,
+        )
+        .expect_err("the exact HostBusy failure must replay");
+
+    assert_eq!(first.code, ErrorCode::HostBusy);
+    assert_eq!(replay.code, ErrorCode::HostBusy);
+    assert_eq!(first.message, replay.message);
+    assert_eq!(first.recovery_command, replay.recovery_command);
+    assert_eq!(first.details, replay.details);
+    assert_eq!(
+        1,
+        calls.load(std::sync::atomic::Ordering::SeqCst),
+        "durable failure replay must not repeat preflight"
+    );
+}
+
+#[test]
+fn doctor_provider_and_default_scopes_report_closed_descriptor_status_without_secret_text() {
+    let state = crate::TestStateDir::new().expect("temporary state directory");
+    let service = HostService::local_demo_for_tests_at(state.path())
+        .expect("construct deterministic Host service");
+    let variable = format!(
+        "SATELLE_DOCTOR_PROVIDER_SECRET_{}",
+        uuid::Uuid::now_v7().simple()
+    );
+    service
+        .runtime
+        .authorize_provider_binding(&satelle_core::ResolvedProviderBinding::from_authorization(
+            satelle_core::ProviderBindingAuthorization::new(
+                "review",
+                "openai",
+                "provider-doctor-model",
+                "provider-doctor-binding",
+            )
+            .with_auth_source(satelle_core::ProviderSecretSource::Environment {
+                variable: variable.clone(),
+            })
+            .with_experimental_provider_computer_use(true),
+            satelle_core::ProviderBindingSource::UserConfig,
+        ))
+        .expect("authorize the persisted UserConfig provider binding");
+    let intent = ProviderComputerUseIntent::new(
+        Some(
+            satelle_core::session::EffectiveModelRef::new("review")
+                .expect("valid requested model alias"),
+        ),
+        Some(
+            satelle_core::session::ProviderBindingRef::new("openai")
+                .expect("valid requested provider alias"),
+        ),
+        false,
+    );
+
+    for scope in [None, Some("provider"), Some("all")] {
+        let report = service
+            .doctor_with_provider_intent(
+                LOCAL_DEMO_HOST,
+                scope,
+                DoctorOptions::new(false, None),
+                &intent,
+            )
+            .expect("read-only doctor should classify its provider descriptor");
+        let evidence = report
+            .findings
+            .iter()
+            .flat_map(|finding| finding.evidence.iter())
+            .cloned()
+            .collect::<Vec<_>>();
+
+        assert!(
+            evidence.contains(&"provider_auth_outcome=configured_deferred".to_string()),
+            "doctor must report the closed descriptor outcome"
+        );
+        assert!(
+            evidence.contains(&"provider_auth_observation_source=deferred".to_string()),
+            "doctor must distinguish deferred descriptor inspection from live resolution"
+        );
+        assert!(
+            !serde_json::to_string(&report)
+                .expect("serialize doctor report")
+                .contains(&variable),
+            "doctor output must not return environment variable names or secret material"
+        );
+    }
+}
+
+#[test]
+fn named_missing_provider_descriptor_remains_observable_to_cached_validation() {
+    let state = crate::TestStateDir::new().expect("temporary state directory");
+    let service = service_with_provider_descriptor(
+        state.path().to_path_buf(),
+        FakeComputerUseAdapter,
+        Some("missing-provider-token".to_string()),
+    );
+    let intent = provider_intent_with_missing_descriptor();
+
+    let resolution = service
+        .resolve_provider_binding(LOCAL_DEMO_HOST, &intent)
+        .expect("diagnostic binding resolution must preserve a missing descriptor");
+    let ProviderBindingResolution::MissingDescriptor {
+        binding,
+        auth_source_name,
+    } = resolution
+    else {
+        panic!("named missing descriptor must not be reported as ready");
+    };
+    assert_eq!("missing-provider-token", auth_source_name);
+    assert_eq!("provider-model", binding.model());
+    assert_eq!(None, binding.auth_source());
+
+    let validation = service
+        .validate_provider_descriptor(
+            LOCAL_DEMO_HOST,
+            "review",
+            "openai",
+            crate::ProviderDescriptorValidationOptions::new(
+                satelle_core::ProviderAuthValidationMode::Cached,
+                false,
+                false,
+                false,
+            ),
+        )
+        .expect("cached validation must classify the missing descriptor");
+    assert_eq!(
+        satelle_core::ProviderAuthValidationOutcome::MissingDescriptor,
+        validation.validation().outcome()
+    );
+    assert_eq!(
+        satelle_core::ProviderAuthObservationSource::Deferred,
+        validation.validation().observation_source()
+    );
+}
+
+#[test]
+fn provider_binding_without_auth_source_is_resolved_by_cached_validation() {
+    let state = crate::TestStateDir::new().expect("temporary state directory");
+    let service =
+        service_with_provider_descriptor(state.path().to_path_buf(), FakeComputerUseAdapter, None);
+
+    let validation = service
+        .validate_provider_descriptor(
+            LOCAL_DEMO_HOST,
+            "review",
+            "openai",
+            crate::ProviderDescriptorValidationOptions::new(
+                satelle_core::ProviderAuthValidationMode::Cached,
+                false,
+                false,
+                false,
+            ),
+        )
+        .expect("cached validation must accept a binding that requires no secret");
+    assert_eq!(
+        satelle_core::ProviderAuthValidationOutcome::Resolved,
+        validation.validation().outcome()
+    );
+    assert_eq!(
+        satelle_core::ProviderAuthObservationSource::Cached,
+        validation.validation().observation_source(),
+        "cached validation must not invoke secret resolution"
+    );
+}
+
+#[test]
+fn provider_binding_without_auth_source_runs_live_refresh_validation() {
+    let state = crate::TestStateDir::new().expect("temporary state directory");
+    let service =
+        service_with_provider_descriptor(state.path().to_path_buf(), FakeComputerUseAdapter, None);
+
+    let validation = service
+        .validate_provider_descriptor(
+            LOCAL_DEMO_HOST,
+            "review",
+            "openai",
+            crate::ProviderDescriptorValidationOptions::new(
+                satelle_core::ProviderAuthValidationMode::RefreshProviderSmoke,
+                false,
+                false,
+                false,
+            ),
+        )
+        .expect("refresh validation must run the live provider smoke");
+    assert_eq!(
+        satelle_core::ProviderAuthValidationOutcome::Resolved,
+        validation.validation().outcome()
+    );
+    assert_eq!(
+        satelle_core::ProviderAuthObservationSource::Live,
+        validation.validation().observation_source()
+    );
+}
+
+#[test]
+fn doctor_reports_a_named_missing_provider_descriptor_without_resolving_it() {
+    let state = crate::TestStateDir::new().expect("temporary state directory");
+    let service = service_with_provider_descriptor(
+        state.path().to_path_buf(),
+        FakeComputerUseAdapter,
+        Some("missing-provider-token".to_string()),
+    );
+
+    let report = service
+        .doctor_with_provider_intent(
+            LOCAL_DEMO_HOST,
+            Some("provider"),
+            DoctorOptions::new(false, None),
+            &provider_intent_with_missing_descriptor(),
+        )
+        .expect("doctor must preserve the missing descriptor as diagnostic evidence");
+    let evidence = report
+        .findings
+        .iter()
+        .flat_map(|finding| finding.evidence.iter())
+        .collect::<Vec<_>>();
+    assert!(
+        evidence
+            .iter()
+            .any(|value| value.as_str() == "provider_auth_outcome=missing_descriptor")
+    );
+    assert!(
+        evidence
+            .iter()
+            .any(|value| value.as_str() == "provider_auth_observation_source=deferred")
+    );
+}
+
+#[test]
+fn strict_provider_smoke_rejects_a_missing_descriptor_before_adapter_preflight() {
+    let state = crate::TestStateDir::new().expect("temporary state directory");
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let service = service_with_provider_descriptor(
+        state.path().to_path_buf(),
+        ProviderPreflightCounter {
+            calls: Arc::clone(&calls),
+            gate: None,
+        },
+        Some("missing-provider-token".to_string()),
+    );
+
+    let error = service
+        .runtime
+        .refresh_provider_smoke(LOCAL_DEMO_HOST, &provider_intent_with_missing_descriptor())
+        .expect_err("strict provider smoke must fail closed");
+    assert_eq!(ErrorCode::ProviderSecretResolutionFailed, error.code);
+    assert_eq!(error.details["auth_source"], "missing-provider-token");
+    assert_eq!(
+        0,
+        calls.load(std::sync::atomic::Ordering::SeqCst),
+        "the adapter must not receive preflight for a missing descriptor"
+    );
+}
+
+#[test]
+fn concurrent_provider_binding_authorization_retries_share_one_live_validation() {
+    let state = crate::TestStateDir::new().expect("temporary state directory");
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let gate = ProviderPreflightGate::default();
+    let service = Arc::new(service_with_provider_descriptor(
+        state.path().to_path_buf(),
+        ProviderPreflightCounter {
+            calls: Arc::clone(&calls),
+            gate: Some(gate.clone()),
+        },
+        None,
+    ));
+    service.initialize_daemon().expect("initialize daemon");
+
+    let token = ApiBearerToken::generate().expect("generate token");
+    let principal = service
+        .register_api_token(
+            &token,
+            "provider-authorization-concurrency",
+            ApiScopes::CONTROL,
+            None,
+        )
+        .expect("register token");
+    let authority =
+        MutationAuthority::new(principal, "provider-authorization-concurrency").expect("authority");
+    let authorization = ProviderBindingAuthorization::new("vision", "open_ai", "gpt-5.6", "openai");
+
+    let leader_service = Arc::clone(&service);
+    let leader_authority = authority.clone();
+    let leader_authorization = authorization.clone();
+    let leader = std::thread::spawn(move || {
+        leader_service.authorize_provider_binding_idempotent(
+            LOCAL_DEMO_HOST,
+            "vision",
+            "open_ai",
+            leader_authorization,
+            &leader_authority,
+        )
+    });
+
+    assert!(
+        gate.wait_for_started(Duration::from_secs(5)),
+        "leader validation did not start"
+    );
+
+    let follower_service = Arc::clone(&service);
+    let follower_authority = authority.clone();
+    let follower_authorization = authorization.clone();
+    let follower = std::thread::spawn(move || {
+        follower_service.authorize_provider_binding_idempotent(
+            LOCAL_DEMO_HOST,
+            "vision",
+            "open_ai",
+            follower_authorization,
+            &follower_authority,
+        )
+    });
+
+    let follower_registered = service
+        .operation_capacity
+        .wait_for_follower_registration(Duration::from_secs(5));
+    let conflict = service
+        .authorize_provider_binding_idempotent(
+            LOCAL_DEMO_HOST,
+            "vision",
+            "open_ai",
+            ProviderBindingAuthorization::new("vision", "open_ai", "gpt-conflict", "openai"),
+            &authority,
+        )
+        .expect_err("changed authorization must conflict");
+    let calls_before_release = calls.load(std::sync::atomic::Ordering::SeqCst);
+    gate.release();
+
+    assert!(follower_registered, "exact retry did not join the leader");
+    assert_eq!(ErrorCode::IdempotencyKeyConflict, conflict.code);
+    assert_eq!(
+        1, calls_before_release,
+        "concurrent requests performed duplicate live validation"
+    );
+
+    let leader_binding = leader
+        .join()
+        .expect("leader thread")
+        .expect("leader authorization");
+    let follower_binding = follower
+        .join()
+        .expect("follower thread")
+        .expect("follower authorization");
+    assert_eq!(
+        leader_binding.binding_digest(),
+        follower_binding.binding_digest()
+    );
+
+    let replay = service
+        .authorize_provider_binding_idempotent(
+            LOCAL_DEMO_HOST,
+            "vision",
+            "open_ai",
+            authorization,
+            &authority,
+        )
+        .expect("terminal replay");
+    assert_eq!(leader_binding.binding_digest(), replay.binding_digest());
+    assert_eq!(
+        1,
+        calls.load(std::sync::atomic::Ordering::SeqCst),
+        "terminal replay repeated live validation"
+    );
+    assert_eq!(
+        Some(leader_binding.binding_digest()),
+        service
+            .runtime
+            .provider_binding_digest("vision", "open_ai")
+            .expect("read persisted provider binding")
+            .as_deref()
+    );
 }
 
 fn capability_snapshot(

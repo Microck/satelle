@@ -4,6 +4,7 @@ use crate::storage::{
     IdempotentOperation, LeaseOwner, PrivateRequestToken, Storage,
 };
 use crate::test_runtime::FakeComputerUseAdapter;
+use crate::{ApiBearerToken, ApiScopes, HostService};
 use satelle_core::session::{
     ApprovalPolicy, DesktopBindingRef, DesktopTarget, EffectiveModelRef, ExecutionPolicy,
     ExperimentalFeatureChoices, FeatureChoice, ProviderBindingRef, SandboxPolicy, Session,
@@ -80,6 +81,75 @@ fn due_retention_failure_blocks_status_and_logs_and_rolls_back() {
     let (storage, _) = Storage::open(state.path()).expect("reopen rolled-back storage");
     assert_eq!(rows_before, retention_row_counts(&storage, &session_id));
     assert_eq!(expired_through_before, expired_through_cursor(&storage));
+}
+
+#[test]
+fn provider_request_identity_prunes_expired_sessionless_replay_before_key_selection() {
+    let state = crate::TestStateDir::new().expect("temporary state directory");
+    let (mut storage, _) = Storage::open(state.path()).expect("open storage");
+    let observed_at = time::OffsetDateTime::now_utc();
+    let created_at = observed_at - IDEMPOTENCY_RETENTION - time::Duration::seconds(1);
+    storage
+        .claim_provider_descriptor_validation(
+            &IdempotencyInput::new(
+                "principal-provider-retention",
+                IdempotentOperation::ProviderDescriptorValidation,
+                "expired-provider-validation",
+                "operation-provider-retention",
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                1,
+                1,
+                created_at,
+                created_at + IDEMPOTENCY_RETENTION,
+            )
+            .unwrap(),
+        )
+        .expect("seed expired sessionless provider replay");
+    assert_eq!(
+        2,
+        storage
+            .rotate_idempotency_hmac_key(observed_at)
+            .expect("rotate the active HMAC key")
+    );
+    drop(storage);
+
+    let service =
+        HostService::local_demo_for_tests_at(state.path()).expect("construct Host service");
+    service.initialize_daemon().expect("initialize Host state");
+    let token = ApiBearerToken::generate().expect("generate API token");
+    let principal = service
+        .register_api_token(
+            &token,
+            "principal-provider-retention",
+            ApiScopes::CONTROL,
+            None,
+        )
+        .expect("register API principal");
+    let identity = service
+        .runtime
+        .authenticated_request_identity(
+            &principal,
+            IdempotentOperation::ProviderDescriptorValidation,
+            "expired-provider-validation",
+            b"fresh-provider-validation",
+            1,
+        )
+        .expect("construct fresh identity after pruning expired replay");
+    assert_eq!(2, identity.hmac_key_version());
+    drop(service);
+
+    let (storage, _) = Storage::open(state.path()).expect("reopen retained storage");
+    let expired_rows: i64 = storage
+        .connection_for_test()
+        .query_row(
+            "SELECT count(*) FROM idempotency_records
+             WHERE operation = 'provider_descriptor_validation'
+               AND idempotency_key = 'expired-provider-validation'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(0, expired_rows);
 }
 
 fn expired_session_fixture() -> (crate::TestStateDir, Storage, SessionId) {

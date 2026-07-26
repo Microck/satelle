@@ -604,7 +604,7 @@ pub(super) async fn require_empty_setup_mutation(
                 axum::http::StatusCode::BAD_REQUEST,
                 ApiErrorCode::InvalidRequest,
                 ApiErrorCategory::InvalidRequest,
-                "the setup token request body could not be read",
+                "the setup mutation request body could not be read",
             );
         }
         Err(EmptyBodyFailure::Timeout) => {
@@ -614,7 +614,7 @@ pub(super) async fn require_empty_setup_mutation(
                 axum::http::StatusCode::REQUEST_TIMEOUT,
                 ApiErrorCode::InvalidRequest,
                 ApiErrorCategory::InvalidRequest,
-                "the setup token request body exceeded its read deadline",
+                "the setup mutation request body exceeded its read deadline",
             );
         }
         Err(EmptyBodyFailure::DisallowedBearer) => {
@@ -630,7 +630,7 @@ pub(super) async fn require_empty_setup_mutation(
                 axum::http::StatusCode::BAD_REQUEST,
                 ApiErrorCode::InvalidRequest,
                 ApiErrorCategory::InvalidRequest,
-                "setup token mutations do not accept a request body",
+                "setup mutations do not accept a request body",
             );
         }
     };
@@ -775,6 +775,21 @@ pub(super) async fn require_setup_mutation(
     let Some(authorized) = request.extensions().get::<AuthorizedRequest>().cloned() else {
         return missing_authorization_context();
     };
+    require_mutation(&state, request, next, authorized).await
+}
+
+pub(super) async fn require_admin_mutation(
+    State(state): State<Arc<DaemonState>>,
+    request: Request,
+    next: Next,
+) -> Response {
+    let Some(authorized) = request.extensions().get::<AuthorizedRequest>().cloned() else {
+        return missing_authorization_context();
+    };
+    let principal = authorized.principal();
+    if !principal.scopes().allows(ApiScopes::ADMIN) {
+        return insufficient_scope(&state, &authorized, "admin");
+    }
     require_mutation(&state, request, next, authorized).await
 }
 
@@ -943,13 +958,21 @@ fn insufficient_scope(
             code: ApiErrorCode::AuthorizationInsufficientScope,
             category: ApiErrorCategory::Authorization,
             retryable: false,
-            message: match scope {
-                "control" => "the API Principal does not have control scope",
-                _ => "the API Principal does not have read scope",
-            },
+            message: insufficient_scope_message(scope),
             details: None,
         },
     )
+}
+
+fn insufficient_scope_message(scope: &'static str) -> &'static str {
+    match scope {
+        "control" => "the API Principal does not have control scope",
+        "admin" => "the API Principal does not have admin scope",
+        "bootstrap admin" => {
+            "durable setup credentials require an admin-scoped SSH bootstrap principal"
+        }
+        _ => "the API Principal does not have read scope",
+    }
 }
 
 fn rate_limited_response(
@@ -1116,6 +1139,14 @@ mod forwarded_tests {
         assert_eq!(
             parse_forwarded_address("192.0.2.1:4711").expect("parse IPv4 socket address"),
             "192.0.2.1".parse::<IpAddr>().expect("parse IPv4 address")
+        );
+    }
+
+    #[test]
+    fn admin_scope_has_specific_failure_message() {
+        assert_eq!(
+            insufficient_scope_message("admin"),
+            "the API Principal does not have admin scope"
         );
     }
 }

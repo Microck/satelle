@@ -99,6 +99,14 @@ impl ParsedProjectConfig {
         self.config.default_host.is_some()
     }
 
+    pub(super) fn defines_model_alias(&self) -> bool {
+        self.config.model_alias.is_some()
+    }
+
+    pub(super) fn defines_provider_alias(&self) -> bool {
+        self.config.provider_alias.is_some()
+    }
+
     pub(super) fn apply_to(
         &self,
         mut base: SatelleConfig,
