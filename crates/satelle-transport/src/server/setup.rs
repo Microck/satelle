@@ -11,7 +11,7 @@ use crate::contract::{
     ProviderSecretProvisioningPreviewResponse, ProviderSecretProvisioningResponse,
     SetupVerificationRequest, SetupVerificationResponse,
 };
-use axum::body::{Body, to_bytes};
+use axum::body::to_bytes;
 use axum::extract::{Extension, Path, Request, State};
 use axum::http::header::CONTENT_TYPE;
 use axum::http::{HeaderMap, StatusCode};

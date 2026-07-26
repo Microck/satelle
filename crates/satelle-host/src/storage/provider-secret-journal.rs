@@ -162,10 +162,6 @@ impl ProviderSecretProvisioningJournal {
         &self.provider_probe_ref
     }
 
-    pub(crate) fn binding(&self) -> &ResolvedProviderBinding {
-        &self.binding
-    }
-
     pub(crate) fn destination_path(&self) -> &Path {
         &self.destination_path
     }
@@ -180,10 +176,6 @@ impl ProviderSecretProvisioningJournal {
 
     pub(crate) const fn destination_existed(&self) -> Option<bool> {
         self.destination_existed
-    }
-
-    pub(crate) fn expected_previous_binding_digest(&self) -> Option<&str> {
-        self.expected_previous_binding_digest.as_deref()
     }
 
     pub(crate) fn candidate_secret_hmac(&self) -> &str {
@@ -242,7 +234,7 @@ pub(crate) enum ProviderSecretProvisioningReplay {
 
 pub(crate) enum BeginProviderSecretProvisioning {
     Claimed(ProviderSecretProvisioningJournal),
-    Resume(ProviderSecretProvisioningJournal),
+    Resume,
     Replay(ProviderSecretProvisioningReplay),
 }
 
@@ -274,9 +266,7 @@ impl Storage {
                 record.durable_outcome.as_str(),
                 record.result_json,
             ) {
-                ("in_progress", PENDING_OUTCOME, None) => BeginProviderSecretProvisioning::Resume(
-                    load_journal(&transaction, &idempotency.operation_id)?,
-                ),
+                ("in_progress", PENDING_OUTCOME, None) => BeginProviderSecretProvisioning::Resume,
                 ("terminal", COMPLETED_OUTCOME | FAILED_OUTCOME, Some(result_json)) => {
                     BeginProviderSecretProvisioning::Replay(
                         serde_json::from_str(&result_json).map_err(|_| invalid_stored_state())?,
@@ -580,27 +570,6 @@ impl Storage {
             .iter()
             .map(|operation_id| load_journal(&self.connection, operation_id))
             .collect()
-    }
-
-    pub(crate) fn prune_provider_secret_provisioning_journal(
-        &mut self,
-        observed_at: OffsetDateTime,
-    ) -> Result<u64, StorageError> {
-        let deleted = self
-            .connection
-            .execute(
-                "DELETE FROM provider_secret_provisioning_journal
-                 WHERE operation_id IN (
-                     SELECT operation_id
-                     FROM idempotency_records
-                     WHERE operation = 'provider_secret_provisioning'
-                       AND status = 'terminal'
-                       AND expires_at <= ?1
-                 )",
-                [format_time(observed_at)?],
-            )
-            .map_err(operation_failed)?;
-        u64::try_from(deleted).map_err(|_| invalid_stored_state())
     }
 }
 

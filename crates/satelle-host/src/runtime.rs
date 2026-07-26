@@ -111,14 +111,6 @@ impl PendingProviderReadiness {
             .ok_or_else(|| integrity_error("provider readiness was already consumed"))
     }
 
-    pub(crate) fn take_provider_secret(
-        &self,
-    ) -> Option<crate::provider_auth::ResolvedProviderSecret> {
-        self.readiness
-            .as_ref()
-            .and_then(AdapterReadiness::take_resolved_provider_secret)
-    }
-
     pub(crate) fn finish(mut self) {
         self.heartbeat.take();
     }
@@ -3144,17 +3136,6 @@ impl RuntimeHandle {
     ) -> Result<ProviderBindingResolution, SatelleError> {
         self.engine()?
             .resolve_provider_binding(host, provider_intent)
-    }
-
-    pub(crate) fn authorized_provider_binding(
-        &self,
-        model_alias: &str,
-        provider_alias: &str,
-    ) -> Result<Option<ResolvedProviderBinding>, SatelleError> {
-        self.engine()?
-            .lock_storage()?
-            .load_authorized_provider_binding(model_alias, provider_alias)
-            .map_err(model::storage_failure)
     }
 
     #[cfg(any(test, feature = "test-support"))]

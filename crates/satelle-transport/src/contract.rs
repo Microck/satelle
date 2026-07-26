@@ -36,7 +36,9 @@ pub use setup::{
     NativeReadinessInvalidationRequest, NativeReadinessInvalidationResponse,
     ProviderBindingAuthorizationRequest, ProviderBindingAuthorizationResponse,
     ProviderBindingDeletionResponse, ProviderDescriptorValidationRequest,
-    ProviderDescriptorValidationResponse, SetupVerificationRequest, SetupVerificationResponse,
+    ProviderDescriptorValidationResponse, ProviderSecretProvisioningMetadata,
+    ProviderSecretProvisioningPreviewResponse, ProviderSecretProvisioningResponse,
+    SetupVerificationRequest, SetupVerificationResponse,
 };
 
 pub(crate) const PROTOCOL_VERSION_HEADER: &str = "satelle-protocol-version";
