@@ -991,7 +991,7 @@ fn expired_sessionless_provider_idempotency_records_are_pruned_at_the_boundary()
             created_at,
         ),
         "in_progress",
-        "v1.setup.pending",
+        "v1.turn.starting",
         None,
         None,
         None,
