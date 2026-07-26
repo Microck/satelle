@@ -50,7 +50,6 @@ pub use events::{
     SatelleEventBody, SatelleEventError,
 };
 pub use ids::{IdParseError, SESSION_ID_PATTERN, SessionId, TurnId};
-pub use profiles::ProfileSelectionSource;
 pub use profiles::{ProfileField, ProfileSelectionSource, SelectedProfile};
 pub use secure_file::{
     OwnerOnlyDirectory, SecureFileError, open_new_owner_only_file,
