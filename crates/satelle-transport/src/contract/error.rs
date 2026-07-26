@@ -37,6 +37,7 @@ pub enum ApiErrorCode {
     UnsupportedProviderComputerUse,
     ExperimentalProviderOptInRequired,
     ModelProviderBindingMissing,
+    ProjectProviderSelectionNotAllowed,
     ProviderSecretResolutionFailed,
     ExperimentalProviderNotValidated,
     StorageBusy,
@@ -86,6 +87,7 @@ impl ApiErrorCode {
             Self::UnsupportedProviderComputerUse => "unsupported-provider-computer-use",
             Self::ExperimentalProviderOptInRequired => "experimental-provider-opt-in-required",
             Self::ModelProviderBindingMissing => "model-provider-binding-missing",
+            Self::ProjectProviderSelectionNotAllowed => "project-provider-selection-not-allowed",
             Self::ProviderSecretResolutionFailed => "provider-secret-resolution-failed",
             Self::ExperimentalProviderNotValidated => "experimental-provider-not-validated",
             Self::StorageBusy => "storage-busy",
@@ -135,6 +137,10 @@ mod tests {
             (
                 ApiErrorCode::ModelProviderBindingMissing,
                 "model-provider-binding-missing",
+            ),
+            (
+                ApiErrorCode::ProjectProviderSelectionNotAllowed,
+                "project-provider-selection-not-allowed",
             ),
             (
                 ApiErrorCode::ProviderSecretResolutionFailed,

@@ -4371,6 +4371,7 @@ fn api_error_is_definitively_not_admitted(code: ApiErrorCode) -> bool {
             | ApiErrorCode::UnsupportedProviderComputerUse
             | ApiErrorCode::ExperimentalProviderOptInRequired
             | ApiErrorCode::ModelProviderBindingMissing
+            | ApiErrorCode::ProjectProviderSelectionNotAllowed
             | ApiErrorCode::ProviderSecretResolutionFailed
             | ApiErrorCode::ExperimentalProviderNotValidated
             | ApiErrorCode::CapacityExceeded
@@ -4401,6 +4402,10 @@ fn api_code_error(host: &str, code: ApiErrorCode) -> SatelleError {
         ApiErrorCode::ModelProviderBindingMissing => provider_api_error(
             ErrorCode::ModelProviderBindingMissing,
             "the requested model and provider binding is not configured",
+        ),
+        ApiErrorCode::ProjectProviderSelectionNotAllowed => provider_api_error(
+            ErrorCode::ProjectProviderSelectionNotAllowed,
+            "the project is not allowed to select this provider binding",
         ),
         ApiErrorCode::ProviderSecretResolutionFailed => provider_api_error(
             ErrorCode::ProviderSecretResolutionFailed,

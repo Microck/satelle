@@ -96,6 +96,14 @@ fn failure(error: &SatelleError) -> ApiFailure {
             message: "the provider configuration cannot admit this operation",
             details: None,
         },
+        ErrorCode::ProjectProviderSelectionNotAllowed => ApiFailure {
+            status: StatusCode::BAD_REQUEST,
+            code: ApiErrorCode::ProjectProviderSelectionNotAllowed,
+            category: ApiErrorCategory::InvalidRequest,
+            retryable: false,
+            message: "the provider configuration cannot admit this operation",
+            details: None,
+        },
         ErrorCode::DesktopBindingRequired => ApiFailure {
             status: StatusCode::BAD_REQUEST,
             code: ApiErrorCode::DesktopBindingRequired,

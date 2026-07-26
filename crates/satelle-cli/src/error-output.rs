@@ -330,6 +330,7 @@ fn error_contract(code: ErrorCode) -> ErrorContract {
         | ErrorCode::ProjectMutationConsentNotAllowed
         | ErrorCode::ProjectHostBindingNotAllowed
         | ErrorCode::ProjectHostSelectionNotAllowed
+        | ErrorCode::ProjectProviderSelectionNotAllowed
         | ErrorCode::ProjectSecretSourceNotAllowed
         | ErrorCode::ProjectCredentialHelperNotAllowed
         | ErrorCode::UnsupportedSecretSourceKind
