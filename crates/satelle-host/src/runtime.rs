@@ -2605,6 +2605,7 @@ impl RuntimeHandle {
         digest_schema_version: u16,
     ) -> Result<RequestIdentity, SatelleError> {
         let engine = self.engine()?;
+        engine.maintain_session_retention(time::OffsetDateTime::now_utc())?;
         let storage = engine.lock_storage()?;
         let key_version = storage
             .idempotency_hmac_key_version(principal.principal_ref(), operation, idempotency_key)

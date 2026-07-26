@@ -1151,6 +1151,23 @@ fn doctor_provider_refresh_updates_cache_without_admitting_prompt_work() {
             .evidence
             .contains(&"source=refresh".to_string())
     );
+    let default_report = service
+        .doctor_with_provider_intent(
+            LOCAL_DEMO_HOST,
+            None,
+            DoctorOptions::new(true, Some(std::time::Duration::from_secs(5))),
+            &intent,
+        )
+        .expect("default all-scope doctor refresh should include provider refresh");
+    assert!(
+        default_report
+            .cache_updates
+            .iter()
+            .any(|update| update == "provider_smoke")
+    );
+    assert!(default_report.probe_results.iter().any(|probe| {
+        probe.probe_id == "provider.smoke.refresh" && probe.cache_status == "refreshed"
+    }));
     assert_eq!(service.host_status().unwrap().sessions, 0);
 }
 
@@ -1624,7 +1641,7 @@ fn provider_descriptor_refresh_replays_control_plane_errors_without_reclassifyin
 }
 
 #[test]
-fn doctor_provider_scope_reports_closed_descriptor_status_without_secret_text() {
+fn doctor_provider_and_default_scopes_report_closed_descriptor_status_without_secret_text() {
     let state = crate::TestStateDir::new().expect("temporary state directory");
     let service = HostService::local_demo_for_tests_at(state.path())
         .expect("construct deterministic Host service");
@@ -1660,35 +1677,37 @@ fn doctor_provider_scope_reports_closed_descriptor_status_without_secret_text() 
         false,
     );
 
-    let report = service
-        .doctor_with_provider_intent(
-            LOCAL_DEMO_HOST,
-            Some("provider"),
-            DoctorOptions::new(false, None),
-            &intent,
-        )
-        .expect("read-only provider doctor should classify its descriptor");
-    let evidence = report
-        .findings
-        .iter()
-        .flat_map(|finding| finding.evidence.iter())
-        .cloned()
-        .collect::<Vec<_>>();
+    for scope in [None, Some("provider"), Some("all")] {
+        let report = service
+            .doctor_with_provider_intent(
+                LOCAL_DEMO_HOST,
+                scope,
+                DoctorOptions::new(false, None),
+                &intent,
+            )
+            .expect("read-only doctor should classify its provider descriptor");
+        let evidence = report
+            .findings
+            .iter()
+            .flat_map(|finding| finding.evidence.iter())
+            .cloned()
+            .collect::<Vec<_>>();
 
-    assert!(
-        evidence.contains(&"provider_auth_outcome=configured_deferred".to_string()),
-        "doctor must report the closed descriptor outcome"
-    );
-    assert!(
-        evidence.contains(&"provider_auth_observation_source=deferred".to_string()),
-        "doctor must distinguish deferred descriptor inspection from live resolution"
-    );
-    assert!(
-        !serde_json::to_string(&report)
-            .expect("serialize doctor report")
-            .contains(&variable),
-        "doctor output must not return environment variable names or secret material"
-    );
+        assert!(
+            evidence.contains(&"provider_auth_outcome=configured_deferred".to_string()),
+            "doctor must report the closed descriptor outcome"
+        );
+        assert!(
+            evidence.contains(&"provider_auth_observation_source=deferred".to_string()),
+            "doctor must distinguish deferred descriptor inspection from live resolution"
+        );
+        assert!(
+            !serde_json::to_string(&report)
+                .expect("serialize doctor report")
+                .contains(&variable),
+            "doctor output must not return environment variable names or secret material"
+        );
+    }
 }
 
 #[test]

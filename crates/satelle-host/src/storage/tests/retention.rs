@@ -923,3 +923,112 @@ fn cleanup_failure_rolls_back_every_dependency_deletion() {
         .unwrap();
     assert_eq!(expired_through_before, expired_through_after);
 }
+
+#[test]
+fn expired_sessionless_provider_idempotency_records_are_pruned_at_the_boundary() {
+    let state = TempDir::new().expect("temporary state directory");
+    let (mut storage, _) = Storage::open(state.path()).expect("open storage");
+    let created_at = at(0);
+    let observed_at = created_at + IDEMPOTENCY_RETENTION;
+    let transaction = storage.connection.transaction().unwrap();
+    for (operation, key, outcome) in [
+        (
+            IdempotentOperation::ProviderDescriptorValidation,
+            "terminal-provider-validation",
+            "v2.provider_descriptor_validation.completed",
+        ),
+        (
+            IdempotentOperation::ProviderBindingAuthorization,
+            "terminal-provider-authorization",
+            "v1.provider_binding_authorization.completed",
+        ),
+        (
+            IdempotentOperation::ProviderBindingDeletion,
+            "terminal-provider-deletion",
+            "v1.provider_binding_deletion.completed",
+        ),
+    ] {
+        insert_terminal_json_idempotency(
+            &transaction,
+            &idempotency(operation, key, created_at),
+            outcome,
+            "{}",
+            created_at,
+        )
+        .unwrap();
+    }
+    insert_idempotency(
+        &transaction,
+        &idempotency(
+            IdempotentOperation::ProviderDescriptorValidation,
+            "pending-provider-validation",
+            created_at,
+        ),
+        "in_progress",
+        "v2.provider_descriptor_validation.pending",
+        None,
+        None,
+        None,
+    )
+    .unwrap();
+    insert_terminal_json_idempotency(
+        &transaction,
+        &idempotency(
+            IdempotentOperation::ProviderBindingAuthorization,
+            "unexpired-provider-authorization",
+            created_at + time::Duration::nanoseconds(1),
+        ),
+        "v1.provider_binding_authorization.completed",
+        "{}",
+        created_at + time::Duration::nanoseconds(1),
+    )
+    .unwrap();
+    insert_idempotency(
+        &transaction,
+        &idempotency(
+            IdempotentOperation::Setup,
+            "expired-unrelated-setup",
+            created_at,
+        ),
+        "in_progress",
+        "v1.setup.pending",
+        None,
+        None,
+        None,
+    )
+    .unwrap();
+    transaction.commit().unwrap();
+
+    storage
+        .prune_expired_session_metadata(observed_at - time::Duration::nanoseconds(1))
+        .unwrap();
+    let before_boundary: i64 = storage
+        .connection_for_test()
+        .query_row(
+            "SELECT count(*) FROM idempotency_records WHERE session_id IS NULL",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(6, before_boundary);
+
+    storage.prune_expired_session_metadata(observed_at).unwrap();
+    let retained = storage
+        .connection_for_test()
+        .prepare(
+            "SELECT idempotency_key FROM idempotency_records
+             WHERE session_id IS NULL ORDER BY idempotency_key",
+        )
+        .unwrap()
+        .query_map([], |row| row.get::<_, String>(0))
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert_eq!(
+        retained,
+        [
+            "expired-unrelated-setup",
+            "unexpired-provider-authorization"
+        ]
+    );
+}

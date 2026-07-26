@@ -1281,10 +1281,11 @@ impl Storage {
                  SET status = 'terminal',
                      durable_outcome = ?1,
                      result_json = ?2,
-                     completed_at = ?3
-                 WHERE principal_ref = ?4
-                   AND operation = ?5
-                   AND idempotency_key = ?6
+                     completed_at = ?3,
+                     expires_at = ?4
+                 WHERE principal_ref = ?5
+                   AND operation = ?6
+                   AND idempotency_key = ?7
                    AND status = 'in_progress'",
                 rusqlite::params![
                     if failed {
@@ -1294,6 +1295,7 @@ impl Storage {
                     },
                     result_json,
                     self::codec::format_time(completed_at)?,
+                    self::codec::format_time(idempotency.expires_at)?,
                     idempotency.principal_ref.as_str(),
                     self::codec::idempotent_operation_token(idempotency.operation),
                     idempotency.key.as_str(),
