@@ -2007,6 +2007,12 @@ impl HostService {
             _ => return Err(provider_secret_source_error()),
         };
         let intent = Self::provider_candidate_intent(&binding)?;
+        // Native readiness owns its own durable probe lease. Complete that
+        // phase before T0 so staged provider validation can reuse the exact
+        // evidence without competing with the provider-secret lease.
+        let native_readiness = self
+            .runtime
+            .refresh_setup_native_readiness(host, &intent)?;
         let provider_probe_ref = format!("provider-probe-{}", SessionId::new());
         let (host_identity, key, owner) =
             self.runtime
@@ -2107,6 +2113,7 @@ impl HostService {
                 let pending = match self.runtime.validate_staged_provider_secret(
                     host,
                     &intent,
+                    native_readiness,
                     candidate_secret,
                     owned_probe,
                 ) {

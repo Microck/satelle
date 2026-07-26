@@ -1527,6 +1527,7 @@ impl RuntimeEngine {
         &self,
         host: &str,
         provider_intent: &ProviderComputerUseIntent,
+        native_readiness: ReadinessEvidence,
         provider_secret: crate::provider_auth::ResolvedProviderSecret,
         owned_provider_probe: OwnedProviderProbe,
     ) -> Result<PendingProviderReadiness, ProviderSecretValidationFailure> {
@@ -1536,7 +1537,7 @@ impl RuntimeEngine {
                 host,
                 provider_intent,
                 &AdmissionCancellation::new(),
-                None,
+                Some(native_readiness),
                 Some(provider_secret),
                 Some(owned_provider_probe),
                 true,
@@ -3065,6 +3066,7 @@ impl RuntimeHandle {
         &self,
         host: &str,
         provider_intent: &ProviderComputerUseIntent,
+        native_readiness: ReadinessEvidence,
         provider_secret: crate::provider_auth::ResolvedProviderSecret,
         owned_provider_probe: OwnedProviderProbe,
     ) -> Result<PendingProviderReadiness, ProviderSecretValidationFailure> {
@@ -3074,6 +3076,7 @@ impl RuntimeHandle {
             .provider_secret_provisioning_probe(
                 host,
                 provider_intent,
+                native_readiness,
                 provider_secret,
                 owned_provider_probe,
             )
