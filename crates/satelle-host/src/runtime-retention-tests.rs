@@ -1,15 +1,16 @@
-use super::{ComputerUseAdapter, HostService, RuntimeHandle, SteerCommand};
+use super::{ComputerUseAdapter, RuntimeHandle, SteerCommand};
 use crate::storage::{
     AdmissionContext, AdmissionOutcome, IDEMPOTENCY_RETENTION, IdempotencyInput,
     IdempotentOperation, LeaseOwner, PrivateRequestToken, Storage,
 };
 use crate::test_runtime::FakeComputerUseAdapter;
+use crate::{ApiBearerToken, ApiScopes, HostService};
 use satelle_core::session::{
     ApprovalPolicy, DesktopBindingRef, DesktopTarget, EffectiveModelRef, ExecutionPolicy,
     ExperimentalFeatureChoices, FeatureChoice, ProviderBindingRef, SandboxPolicy, Session,
     TimeoutPolicy, TurnTransition,
 };
-use satelle_core::{ApiBearerToken, ApiScopes, ErrorCode, SessionId, TurnId};
+use satelle_core::{ErrorCode, SessionId, TurnId};
 
 #[test]
 fn normal_status_use_hides_and_deletes_expired_session_metadata() {
