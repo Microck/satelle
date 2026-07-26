@@ -2137,7 +2137,7 @@
 - satelle offers assisted installation for missing Codex or native Codex Computer Use prerequisites but requires explicit user confirmation before running remote install commands @mvp @implemented
 - satelle run, steer, and status do not install Codex, Computer Use plugins, OS permissions, or app approvals as side effects @implemented @mvp
 - satelle doctor reports missing Codex runtime, Computer Use plugin, OS permissions, app approvals, authentication, unsupported operating system, and unsupported region as separate readiness blockers when those blockers can be detected @spec @mvp
-- satelle provides an explicit host setup or repair command for guided Codex and native Computer Use prerequisite setup on supported hosts @spec @mvp
+- satelle provides an explicit host setup or repair command for guided Codex and native Computer Use prerequisite setup on supported hosts @mvp @implemented
 - satelle setup in an interactive terminal is an applying onboarding flow by default instead of a preview-only command @mvp @implemented
 - satelle setup presents planned remote install, update, and configuration actions before mutating the remote host @mvp @implemented
 - satelle interactive setup and repair ask for one final cliclack confirmation after presenting the planned remote mutations and before running install, update, service, or configuration actions @spec @mvp
