@@ -52,11 +52,14 @@ pub use events::{
 pub use ids::{IdParseError, SESSION_ID_PATTERN, SessionId, TurnId};
 pub use profiles::{ProfileField, ProfileSelectionSource, SelectedProfile};
 pub use secure_file::{
-    OwnerOnlyDirectory, SecureFileError, open_new_owner_only_file,
+    OwnerOnlyDirectory, OwnerOnlySecretFilePaths, SecureFileError,
+    cleanup_owner_only_secret_file, keyed_secret_comparison_digest, open_new_owner_only_file,
     open_or_create_owner_only_directory, open_or_create_owner_only_file, open_owner_only_directory,
-    persist_new_owner_only_secret_file, read_bounded_regular_file_no_follow,
+    owner_only_secret_destination_exists, persist_new_owner_only_secret_file,
+    publish_owner_only_secret_file, read_bounded_regular_file_no_follow,
     read_owner_controlled_config_file, read_owner_only_secret_config_file,
-    read_owner_only_secret_file, read_trusted_ca_bundle_file,
+    read_owner_only_secret_file, read_trusted_ca_bundle_file, rollback_owner_only_secret_file,
+    stage_owner_only_secret_file,
 };
 
 pub const PRODUCT_NAME: &str = "Satelle";
@@ -410,6 +413,66 @@ pub enum ProviderSecretSource {
     File { path: PathBuf },
     CredentialStore { service: String, account: String },
     HostStore { name: String },
+}
+
+/// Secret-free Host preview returned before an interactive provisioning
+/// confirmation. The destination path and all credential material remain
+/// outside this serializable report.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProviderSecretProvisioningPreview {
+    destination_kind: String,
+    destination_exists: bool,
+}
+
+impl ProviderSecretProvisioningPreview {
+    pub fn file(destination_exists: bool) -> Self {
+        Self {
+            destination_kind: "file".to_string(),
+            destination_exists,
+        }
+    }
+
+    pub fn destination_kind(&self) -> &str {
+        &self.destination_kind
+    }
+
+    pub const fn destination_exists(&self) -> bool {
+        self.destination_exists
+    }
+}
+
+/// Secret-free Host result suitable for authenticated transport and
+/// idempotent replay. It records only the public destination class, overwrite
+/// outcome, and redacted validation status.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProviderSecretProvisioningResult {
+    destination_kind: String,
+    overwritten: bool,
+    validation_status: String,
+}
+
+impl ProviderSecretProvisioningResult {
+    pub fn file(overwritten: bool, validation_status: impl Into<String>) -> Self {
+        Self {
+            destination_kind: "file".to_string(),
+            overwritten,
+            validation_status: validation_status.into(),
+        }
+    }
+
+    pub fn destination_kind(&self) -> &str {
+        &self.destination_kind
+    }
+
+    pub const fn overwritten(&self) -> bool {
+        self.overwritten
+    }
+
+    pub fn validation_status(&self) -> &str {
+        &self.validation_status
+    }
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -1105,6 +1168,30 @@ mod provider_binding_config_tests {
             serde_json::to_value(resolved).expect("serialize resolved provider binding")["source"],
             serde_json::json!("host_owned")
         );
+    }
+
+    #[test]
+    fn provider_secret_provisioning_reports_are_redacted() {
+        let preview = ProviderSecretProvisioningPreview::file(true);
+        assert_eq!(preview.destination_kind(), "file");
+        assert!(preview.destination_exists());
+        let preview_wire = serde_json::to_string(&preview).expect("serialize preview");
+        assert_eq!(
+            preview_wire,
+            r#"{"destination_kind":"file","destination_exists":true}"#
+        );
+
+        let result = ProviderSecretProvisioningResult::file(true, "provider_smoke_validated");
+        assert_eq!(result.destination_kind(), "file");
+        assert!(result.overwritten());
+        assert_eq!(result.validation_status(), "provider_smoke_validated");
+        let result_wire = serde_json::to_string(&result).expect("serialize result");
+        assert_eq!(
+            result_wire,
+            r#"{"destination_kind":"file","overwritten":true,"validation_status":"provider_smoke_validated"}"#
+        );
+        assert!(!preview_wire.contains("path"));
+        assert!(!result_wire.contains("secret"));
     }
 
     #[test]

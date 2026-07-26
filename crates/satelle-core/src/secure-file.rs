@@ -1,6 +1,7 @@
 use std::fs::File;
 use std::io::{Read, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use sha2::{Digest, Sha256};
 use thiserror::Error;
 use zeroize::Zeroizing;
 
@@ -19,6 +20,8 @@ pub enum SecureFileError {
     ContainsNul,
     #[error("the published secret could not be removed after persistence failed")]
     PublishedCleanupFailed,
+    #[error("the prior owner-only secret could not be restored")]
+    RollbackFailed,
 }
 
 #[cfg(not(windows))]
@@ -96,6 +99,399 @@ pub fn persist_new_owner_only_secret_file(
             cleanup_failed_new_secret(&temporary_path, path, published)?;
             Err(error)
         }
+    }
+}
+
+/// Deterministic sibling paths for one journaled secret-file provisioning
+/// operation. The journal identifier must be an opaque ASCII token rather than
+/// secret material. A durable caller can reconstruct these paths after a
+/// restart without persisting a second copy of the credential.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OwnerOnlySecretFilePaths {
+    destination: PathBuf,
+    staging: PathBuf,
+    backup: PathBuf,
+}
+
+impl OwnerOnlySecretFilePaths {
+    pub fn new(destination: &Path, journal_id: &str) -> Result<Self, SecureFileError> {
+        if journal_id.is_empty()
+            || journal_id.len() > 64
+            || !journal_id
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+        {
+            return Err(SecureFileError::UnsafeOrUnavailable);
+        }
+        let parent = destination
+            .parent()
+            .ok_or(SecureFileError::UnsafeOrUnavailable)?;
+        let file_name = destination
+            .file_name()
+            .ok_or(SecureFileError::UnsafeOrUnavailable)?;
+        let mut staging_name = file_name.to_os_string();
+        staging_name.push(format!(".satelle-{journal_id}.staged"));
+        let mut backup_name = file_name.to_os_string();
+        backup_name.push(format!(".satelle-{journal_id}.backup"));
+        Ok(Self {
+            destination: destination.to_path_buf(),
+            staging: parent.join(staging_name),
+            backup: parent.join(backup_name),
+        })
+    }
+
+    pub fn destination(&self) -> &Path {
+        &self.destination
+    }
+
+    pub fn staging(&self) -> &Path {
+        &self.staging
+    }
+
+    pub fn backup(&self) -> &Path {
+        &self.backup
+    }
+}
+
+/// Produces a keyed comparison value for a secret without creating a reusable
+/// raw SHA-256 fingerprint. Callers may persist this HMAC in a redacted
+/// provisioning journal and use the same per-installation key during recovery.
+pub fn keyed_secret_comparison_digest(
+    comparison_key: &[u8],
+    secret: &[u8],
+) -> Result<[u8; 32], SecureFileError> {
+    if comparison_key.is_empty() {
+        return Err(SecureFileError::UnsafeOrUnavailable);
+    }
+
+    const BLOCK_BYTES: usize = 64;
+    let mut key_block = Zeroizing::new([0_u8; BLOCK_BYTES]);
+    if comparison_key.len() > BLOCK_BYTES {
+        key_block[..32].copy_from_slice(&Sha256::digest(comparison_key));
+    } else {
+        key_block[..comparison_key.len()].copy_from_slice(comparison_key);
+    }
+    let mut inner_pad = Zeroizing::new([0_u8; BLOCK_BYTES]);
+    let mut outer_pad = Zeroizing::new([0_u8; BLOCK_BYTES]);
+    for index in 0..BLOCK_BYTES {
+        inner_pad[index] = key_block[index] ^ 0x36;
+        outer_pad[index] = key_block[index] ^ 0x5c;
+    }
+
+    let mut inner = Sha256::new();
+    inner.update(inner_pad.as_slice());
+    inner.update(secret);
+    let inner_digest = Zeroizing::new(inner.finalize().to_vec());
+    let mut outer = Sha256::new();
+    outer.update(outer_pad.as_slice());
+    outer.update(inner_digest.as_slice());
+    Ok(outer.finalize().into())
+}
+
+/// Reports whether a destination already contains an owner-only regular file.
+/// An occupied path that does not satisfy the policy is an error rather than a
+/// misleading overwrite preview.
+pub fn owner_only_secret_destination_exists(path: &Path) -> Result<bool, SecureFileError> {
+    match std::fs::symlink_metadata(path) {
+        Ok(_) => {
+            drop(open_secure_file(path, SecurityPolicy::OwnerOnly)?);
+            Ok(true)
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(_) => Err(SecureFileError::UnsafeOrUnavailable),
+    }
+}
+
+/// Creates and fsyncs the deterministic owner-only staging file, then verifies
+/// it through a new no-follow read using the caller's keyed HMAC comparison.
+/// Repeating the call after a crash accepts only an existing staged file with
+/// the same comparison value.
+pub fn stage_owner_only_secret_file(
+    paths: &OwnerOnlySecretFilePaths,
+    secret: &str,
+    comparison_key: &[u8],
+    expected_digest: &[u8; 32],
+) -> Result<(), SecureFileError> {
+    if secret.len() > MAX_SECRET_FILE_BYTES || secret.as_bytes().contains(&0) {
+        return Err(if secret.len() > MAX_SECRET_FILE_BYTES {
+            SecureFileError::TooLarge
+        } else {
+            SecureFileError::ContainsNul
+        });
+    }
+    let source_digest = keyed_secret_comparison_digest(comparison_key, secret.as_bytes())?;
+    if !constant_time_digest_eq(&source_digest, expected_digest) {
+        return Err(SecureFileError::UnsafeOrUnavailable);
+    }
+
+    let parent = paths
+        .destination
+        .parent()
+        .ok_or(SecureFileError::UnsafeOrUnavailable)?;
+    let directory = open_or_create_owner_only_directory(parent)?;
+    let mut staging = match open_new_owner_only_file(&paths.staging) {
+        Ok(staging) => staging,
+        Err(_) => {
+            return verify_owner_only_secret_digest(
+                &paths.staging,
+                comparison_key,
+                expected_digest,
+            );
+        }
+    };
+    let staged = staging
+        .write_all(secret.as_bytes())
+        .and_then(|()| staging.sync_all())
+        .map_err(|_| SecureFileError::UnsafeOrUnavailable)
+        .and_then(|()| {
+            drop(staging);
+            sync_owner_only_directory(parent, &directory)?;
+            verify_owner_only_secret_digest(
+                &paths.staging,
+                comparison_key,
+                expected_digest,
+            )
+        });
+    if let Err(error) = staged {
+        let _ = remove_sibling_file(&paths.staging, &directory);
+        return Err(error);
+    }
+    Ok(())
+}
+
+/// Atomically publishes a verified staging file. Replacements first create an
+/// independent owner-only backup, so the destination itself keeps one link and
+/// remains readable under the owner-only policy throughout the operation.
+pub fn publish_owner_only_secret_file(
+    paths: &OwnerOnlySecretFilePaths,
+    overwrite_authorized: bool,
+    comparison_key: &[u8],
+    expected_digest: &[u8; 32],
+) -> Result<bool, SecureFileError> {
+    verify_owner_only_secret_digest(&paths.staging, comparison_key, expected_digest)?;
+    let destination_exists = owner_only_secret_destination_exists(&paths.destination)?;
+    if destination_exists && !overwrite_authorized {
+        return Err(SecureFileError::UnsafeOrUnavailable);
+    }
+
+    let parent = paths
+        .destination
+        .parent()
+        .ok_or(SecureFileError::UnsafeOrUnavailable)?;
+    let directory = open_or_create_owner_only_directory(parent)?;
+    if destination_exists {
+        create_owner_only_backup(paths, comparison_key, &directory)?;
+    }
+    let published = replace_sibling_file(&paths.staging, &paths.destination, &directory)
+        .and_then(|()| sync_owner_only_directory(parent, &directory))
+        .and_then(|()| {
+            verify_owner_only_secret_digest(
+                &paths.destination,
+                comparison_key,
+                expected_digest,
+            )
+        });
+    if let Err(error) = published {
+        rollback_owner_only_secret_file(paths, destination_exists, comparison_key)?;
+        return Err(error);
+    }
+    Ok(destination_exists)
+}
+
+/// Restores the owner-only backup after a failed replacement, or removes a
+/// newly published destination when no prior secret existed. The durable
+/// journal decides when rollback is the correct recovery action.
+pub fn rollback_owner_only_secret_file(
+    paths: &OwnerOnlySecretFilePaths,
+    overwritten: bool,
+    comparison_key: &[u8],
+) -> Result<(), SecureFileError> {
+    let parent = paths
+        .destination
+        .parent()
+        .ok_or(SecureFileError::RollbackFailed)?;
+    let directory =
+        open_or_create_owner_only_directory(parent).map_err(|_| SecureFileError::RollbackFailed)?;
+    if overwritten {
+        let backup = read_secure_file(
+            &paths.backup,
+            SecurityPolicy::OwnerOnly,
+            MAX_SECRET_FILE_BYTES,
+        )
+        .map_err(|_| SecureFileError::RollbackFailed)?;
+        let backup_digest = keyed_secret_comparison_digest(comparison_key, backup.as_slice())
+            .map_err(|_| SecureFileError::RollbackFailed)?;
+        replace_sibling_file(&paths.backup, &paths.destination, &directory)
+            .and_then(|()| sync_owner_only_directory(parent, &directory))
+            .and_then(|()| {
+                verify_owner_only_secret_digest(
+                    &paths.destination,
+                    comparison_key,
+                    &backup_digest,
+                )
+            })
+            .map_err(|_| SecureFileError::RollbackFailed)?;
+    } else {
+        remove_sibling_file(&paths.destination, &directory)
+            .and_then(|()| sync_owner_only_directory(parent, &directory))
+            .map_err(|_| SecureFileError::RollbackFailed)?;
+    }
+    remove_sibling_file(&paths.staging, &directory)
+        .and_then(|()| sync_owner_only_directory(parent, &directory))
+        .map_err(|_| SecureFileError::RollbackFailed)
+}
+
+/// Removes deterministic staging and backup artifacts after the journal has
+/// durably recorded completion or a successful rollback.
+pub fn cleanup_owner_only_secret_file(
+    paths: &OwnerOnlySecretFilePaths,
+) -> Result<(), SecureFileError> {
+    let parent = paths
+        .destination
+        .parent()
+        .ok_or(SecureFileError::UnsafeOrUnavailable)?;
+    let directory = open_or_create_owner_only_directory(parent)?;
+    remove_sibling_file(&paths.staging, &directory)?;
+    remove_sibling_file(&paths.backup, &directory)?;
+    sync_owner_only_directory(parent, &directory)
+}
+
+fn create_owner_only_backup(
+    paths: &OwnerOnlySecretFilePaths,
+    comparison_key: &[u8],
+    directory: &OwnerOnlyDirectory,
+) -> Result<(), SecureFileError> {
+    let destination = read_secure_file(
+        &paths.destination,
+        SecurityPolicy::OwnerOnly,
+        MAX_SECRET_FILE_BYTES,
+    )?;
+    let expected_digest =
+        keyed_secret_comparison_digest(comparison_key, destination.as_slice())?;
+    let mut backup = open_new_owner_only_file(&paths.backup)?;
+    let backed_up = backup
+        .write_all(destination.as_slice())
+        .and_then(|()| backup.sync_all())
+        .map_err(|_| SecureFileError::UnsafeOrUnavailable)
+        .and_then(|()| {
+            drop(backup);
+            verify_owner_only_secret_digest(&paths.backup, comparison_key, &expected_digest)
+        });
+    if let Err(error) = backed_up {
+        let _ = remove_sibling_file(&paths.backup, directory);
+        return Err(error);
+    }
+    Ok(())
+}
+
+fn verify_owner_only_secret_digest(
+    path: &Path,
+    comparison_key: &[u8],
+    expected_digest: &[u8; 32],
+) -> Result<(), SecureFileError> {
+    let stored = read_secure_file(path, SecurityPolicy::OwnerOnly, MAX_SECRET_FILE_BYTES)?;
+    let stored_digest = keyed_secret_comparison_digest(comparison_key, stored.as_slice())?;
+    constant_time_digest_eq(&stored_digest, expected_digest)
+        .then_some(())
+        .ok_or(SecureFileError::UnsafeOrUnavailable)
+}
+
+fn constant_time_digest_eq(left: &[u8; 32], right: &[u8; 32]) -> bool {
+    left.iter()
+        .zip(right)
+        .fold(0_u8, |difference, (left, right)| {
+            difference | (left ^ right)
+        })
+        == 0
+}
+
+#[cfg(unix)]
+fn replace_sibling_file(
+    source: &Path,
+    destination: &Path,
+    directory: &OwnerOnlyDirectory,
+) -> Result<(), SecureFileError> {
+    let source_name = source
+        .file_name()
+        .ok_or(SecureFileError::UnsafeOrUnavailable)?;
+    let destination_name = destination
+        .file_name()
+        .ok_or(SecureFileError::UnsafeOrUnavailable)?;
+    rustix::fs::renameat(
+        directory,
+        source_name,
+        directory,
+        destination_name,
+    )
+    .map_err(|_| SecureFileError::UnsafeOrUnavailable)
+}
+
+#[cfg(windows)]
+fn replace_sibling_file(
+    source: &Path,
+    destination: &Path,
+    _directory: &OwnerOnlyDirectory,
+) -> Result<(), SecureFileError> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::{
+        MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW,
+    };
+
+    let source = source
+        .as_os_str()
+        .encode_wide()
+        .chain(Some(0))
+        .collect::<Vec<_>>();
+    let destination = destination
+        .as_os_str()
+        .encode_wide()
+        .chain(Some(0))
+        .collect::<Vec<_>>();
+    (unsafe {
+        MoveFileExW(
+            source.as_ptr(),
+            destination.as_ptr(),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+        )
+    } != 0)
+        .then_some(())
+        .ok_or(SecureFileError::UnsafeOrUnavailable)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn replace_sibling_file(
+    _source: &Path,
+    _destination: &Path,
+    _directory: &OwnerOnlyDirectory,
+) -> Result<(), SecureFileError> {
+    Err(SecureFileError::UnsafeOrUnavailable)
+}
+
+#[cfg(unix)]
+fn remove_sibling_file(
+    path: &Path,
+    directory: &OwnerOnlyDirectory,
+) -> Result<(), SecureFileError> {
+    use rustix::fs::AtFlags;
+
+    let file_name = path
+        .file_name()
+        .ok_or(SecureFileError::UnsafeOrUnavailable)?;
+    match rustix::fs::unlinkat(directory, file_name, AtFlags::empty()) {
+        Ok(()) | Err(rustix::io::Errno::NOENT) => Ok(()),
+        Err(_) => Err(SecureFileError::UnsafeOrUnavailable),
+    }
+}
+
+#[cfg(not(unix))]
+fn remove_sibling_file(
+    path: &Path,
+    _directory: &OwnerOnlyDirectory,
+) -> Result<(), SecureFileError> {
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(_) => Err(SecureFileError::UnsafeOrUnavailable),
     }
 }
 
@@ -1948,6 +2344,145 @@ mod tests {
                     .to_string_lossy()
                     .ends_with(".tmp")),
             "atomic publication must consume or clean every staging name"
+        );
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn journaled_secret_paths_are_deterministic_and_reject_unsafe_identifiers() {
+        let destination = Path::new("/private/provider-token");
+        let paths = OwnerOnlySecretFilePaths::new(destination, "019abc-operation_4")
+            .expect("create deterministic journal paths");
+        assert_eq!(paths.destination(), destination);
+        assert_eq!(
+            paths.staging(),
+            Path::new("/private/provider-token.satelle-019abc-operation_4.staged")
+        );
+        assert_eq!(
+            paths.backup(),
+            Path::new("/private/provider-token.satelle-019abc-operation_4.backup")
+        );
+        assert!(OwnerOnlySecretFilePaths::new(destination, "../escape").is_err());
+        assert!(OwnerOnlySecretFilePaths::new(destination, "raw secret").is_err());
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn keyed_secret_comparisons_are_not_raw_secret_hashes() {
+        let first =
+            keyed_secret_comparison_digest(b"installation-key-a", b"provider-secret")
+                .expect("compute keyed digest");
+        let second =
+            keyed_secret_comparison_digest(b"installation-key-b", b"provider-secret")
+                .expect("compute keyed digest");
+        let raw: [u8; 32] = Sha256::digest(b"provider-secret").into();
+        assert_ne!(first, second);
+        assert_ne!(first, raw);
+        assert!(keyed_secret_comparison_digest(b"", b"provider-secret").is_err());
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn journaled_secret_replacement_can_rollback_and_cleanup() {
+        let temporary_root = tempfile::tempdir().expect("create temporary root");
+        #[cfg(unix)]
+        secure_test_root(temporary_root.path());
+        let directory = temporary_root.path().join("owner-only");
+        drop(open_or_create_owner_only_directory(&directory).expect("create owner-only directory"));
+        let destination = directory.join("provider-token");
+        persist_new_owner_only_secret_file(&destination, "prior-secret")
+            .expect("persist prior secret");
+        let paths = OwnerOnlySecretFilePaths::new(&destination, "journal-1")
+            .expect("create journal paths");
+        let key = b"installation-comparison-key";
+        let expected = keyed_secret_comparison_digest(key, b"replacement-secret")
+            .expect("compute replacement digest");
+
+        stage_owner_only_secret_file(&paths, "replacement-secret", key, &expected)
+            .expect("stage replacement");
+        assert!(owner_only_secret_destination_exists(&destination).expect("preview destination"));
+        assert!(
+            publish_owner_only_secret_file(&paths, true, key, &expected)
+                .expect("publish replacement")
+        );
+        assert_eq!(
+            read_owner_only_secret_file(&destination)
+                .expect("read replacement")
+                .as_str(),
+            "replacement-secret"
+        );
+        assert!(paths.backup().exists());
+
+        rollback_owner_only_secret_file(&paths, true, key).expect("restore prior secret");
+        assert_eq!(
+            read_owner_only_secret_file(&destination)
+                .expect("read restored secret")
+                .as_str(),
+            "prior-secret"
+        );
+        cleanup_owner_only_secret_file(&paths).expect("remove journal artifacts");
+        assert!(!paths.staging().exists());
+        assert!(!paths.backup().exists());
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn journaled_new_secret_publish_is_atomic_and_idempotently_staged() {
+        let temporary_root = tempfile::tempdir().expect("create temporary root");
+        #[cfg(unix)]
+        secure_test_root(temporary_root.path());
+        let directory = temporary_root.path().join("owner-only");
+        drop(open_or_create_owner_only_directory(&directory).expect("create owner-only directory"));
+        let destination = directory.join("provider-token");
+        let paths = OwnerOnlySecretFilePaths::new(&destination, "journal-2")
+            .expect("create journal paths");
+        let key = b"installation-comparison-key";
+        let expected =
+            keyed_secret_comparison_digest(key, b"new-secret").expect("compute secret digest");
+
+        stage_owner_only_secret_file(&paths, "new-secret", key, &expected)
+            .expect("stage new secret");
+        stage_owner_only_secret_file(&paths, "new-secret", key, &expected)
+            .expect("resume matching staged secret");
+        assert!(
+            !publish_owner_only_secret_file(&paths, false, key, &expected)
+                .expect("publish new secret")
+        );
+        assert_eq!(
+            read_owner_only_secret_file(&destination)
+                .expect("read new secret")
+                .as_str(),
+            "new-secret"
+        );
+        cleanup_owner_only_secret_file(&paths).expect("cleanup completed operation");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn journaled_staging_never_follows_a_preoccupied_symlink() {
+        let temporary_root = tempfile::tempdir().expect("create temporary root");
+        secure_test_root(temporary_root.path());
+        let directory = temporary_root.path().join("owner-only");
+        drop(open_or_create_owner_only_directory(&directory).expect("create owner-only directory"));
+        let destination = directory.join("provider-token");
+        let paths = OwnerOnlySecretFilePaths::new(&destination, "journal-3")
+            .expect("create journal paths");
+        let victim = directory.join("victim");
+        persist_new_owner_only_secret_file(&victim, "victim-secret").expect("create victim");
+        std::os::unix::fs::symlink(&victim, paths.staging()).expect("preoccupy staging path");
+        let key = b"installation-comparison-key";
+        let expected =
+            keyed_secret_comparison_digest(key, b"new-secret").expect("compute secret digest");
+
+        assert_eq!(
+            stage_owner_only_secret_file(&paths, "new-secret", key, &expected),
+            Err(SecureFileError::UnsafeOrUnavailable)
+        );
+        assert_eq!(
+            read_owner_only_secret_file(&victim)
+                .expect("read untouched victim")
+                .as_str(),
+            "victim-secret"
         );
     }
 
