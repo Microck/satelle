@@ -672,6 +672,8 @@ fn existing_provider_secret_requires_typed_overwrite_and_preserves_prior_value()
 #[cfg(unix)]
 #[test]
 fn typed_unknown_provider_outcomes_retain_recovery_ownership() {
+    use std::os::unix::fs::PermissionsExt;
+
     for (suffix, outcome) in [
         (
             "upstream-still-active",
@@ -688,6 +690,11 @@ fn typed_unknown_provider_outcomes_retain_recovery_ownership() {
     ] {
         let state = TestStateDir::new().expect("temporary Host state");
         let secret_directory = tempfile::tempdir().expect("temporary provider secret directory");
+        std::fs::set_permissions(
+            secret_directory.path(),
+            std::fs::Permissions::from_mode(0o700),
+        )
+        .expect("make provider secret directory owner-only");
         let destination = secret_directory.path().join("provider-token");
         let operation_id = format!("provider-secret-{suffix}");
         let identity = RequestIdentity::new(&operation_id, "d".repeat(64));
