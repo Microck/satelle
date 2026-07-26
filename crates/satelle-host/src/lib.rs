@@ -2010,9 +2010,7 @@ impl HostService {
         // Native readiness owns its own durable probe lease. Complete that
         // phase before T0 so staged provider validation can reuse the exact
         // evidence without competing with the provider-secret lease.
-        let native_readiness = self
-            .runtime
-            .refresh_setup_native_readiness(host, &intent)?;
+        let native_readiness = self.runtime.refresh_setup_native_readiness(host, &intent)?;
         let provider_probe_ref = format!("provider-probe-{}", SessionId::new());
         let (host_identity, key, owner) =
             self.runtime
