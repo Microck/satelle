@@ -604,7 +604,7 @@ pub(super) async fn require_empty_setup_mutation(
                 axum::http::StatusCode::BAD_REQUEST,
                 ApiErrorCode::InvalidRequest,
                 ApiErrorCategory::InvalidRequest,
-                "the setup token request body could not be read",
+                "the setup mutation request body could not be read",
             );
         }
         Err(EmptyBodyFailure::Timeout) => {
@@ -614,7 +614,7 @@ pub(super) async fn require_empty_setup_mutation(
                 axum::http::StatusCode::REQUEST_TIMEOUT,
                 ApiErrorCode::InvalidRequest,
                 ApiErrorCategory::InvalidRequest,
-                "the setup token request body exceeded its read deadline",
+                "the setup mutation request body exceeded its read deadline",
             );
         }
         Err(EmptyBodyFailure::DisallowedBearer) => {
@@ -630,7 +630,7 @@ pub(super) async fn require_empty_setup_mutation(
                 axum::http::StatusCode::BAD_REQUEST,
                 ApiErrorCode::InvalidRequest,
                 ApiErrorCategory::InvalidRequest,
-                "setup token mutations do not accept a request body",
+                "setup mutations do not accept a request body",
             );
         }
     };

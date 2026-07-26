@@ -894,8 +894,21 @@ fn router(state: Arc<DaemonState>) -> Router {
     let provider_binding_authorization_routes = Router::new()
         .route(
             "/v1/setup/provider-bindings/{provider_alias}/{model_alias}",
-            put(setup::authorize_provider_binding).delete(setup::delete_provider_binding),
+            put(setup::authorize_provider_binding),
         )
+        .route_layer(middleware::from_fn_with_state(
+            Arc::clone(&state),
+            auth::require_admin_mutation,
+        ));
+    let provider_binding_deletion_route = Router::new()
+        .route(
+            "/v1/setup/provider-bindings/{provider_alias}/{model_alias}",
+            axum::routing::delete(setup::delete_provider_binding),
+        )
+        .route_layer(middleware::from_fn_with_state(
+            Arc::clone(&state),
+            auth::require_empty_setup_mutation,
+        ))
         .route_layer(middleware::from_fn_with_state(
             Arc::clone(&state),
             auth::require_admin_mutation,
@@ -927,6 +940,7 @@ fn router(state: Arc<DaemonState>) -> Router {
         .merge(bootstrap_maintenance_routes)
         .merge(setup_routes)
         .merge(provider_binding_authorization_routes)
+        .merge(provider_binding_deletion_route)
         .merge(provider_descriptor_validation_route)
         .merge(control_routes)
         .method_not_allowed_fallback(protected_method_not_allowed)

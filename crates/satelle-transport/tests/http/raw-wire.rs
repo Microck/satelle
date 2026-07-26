@@ -201,6 +201,29 @@ async fn bearer_tokens_in_http_trailers_are_rejected_without_admission() {
             .session_count(),
         0
     );
+
+    let admin = RunningServer::start(ApiScopes::ADMIN).await;
+    let deletion_request = format!(
+        "DELETE /v1/setup/provider-bindings/openai/review HTTP/1.1\r\nHost: localhost\r\nAuthorization: {}\r\nSatelle-Expected-Host-Identity: {}\r\nSatelle-Request-Id: {}\r\nSatelle-Protocol-Version: 9\r\nIdempotency-Key: provider-delete-trailer\r\nTransfer-Encoding: chunked\r\nTrailer: X-Api-Token\r\nConnection: close\r\n\r\n2\r\n{{}}\r\n0\r\nX-Api-Token: {}\r\n\r\n",
+        bearer(&admin.token),
+        admin.host_identity,
+        RequestId::new(),
+        admin.token.expose().as_str(),
+    );
+    let response = raw_request(admin.server.local_addr(), deletion_request.as_bytes()).await;
+    assert_raw_api_error(&response, 400, "invalid-request");
+
+    let retry = admin
+        .protected_request(
+            reqwest::Method::DELETE,
+            "/v1/setup/provider-bindings/openai/review",
+        )
+        .header("Satelle-Protocol-Version", "9")
+        .header("Idempotency-Key", "provider-delete-trailer")
+        .send()
+        .await
+        .expect("reuse the rejected trailer idempotency key");
+    assert_eq!(retry.status().as_u16(), 200);
 }
 
 #[tokio::test]

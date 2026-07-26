@@ -225,6 +225,47 @@ async fn provider_binding_mutations_require_admin() {
         .await
         .expect("send authorization as ordinary admin principal");
     assert_eq!(authorized.status(), StatusCode::OK);
+
+    let rejected_body = ordinary_admin
+        .protected_request(reqwest::Method::DELETE, AUTHORIZATION_PATH)
+        .header("Idempotency-Key", "provider-delete-body")
+        .header("Satelle-Protocol-Version", "9")
+        .json(&serde_json::json!({"unexpected": true}))
+        .send()
+        .await
+        .expect("send deletion with an unsupported body");
+    assert_eq!(rejected_body.status(), StatusCode::BAD_REQUEST);
+
+    let rejected_oversized_body = ordinary_admin
+        .protected_request(reqwest::Method::DELETE, AUTHORIZATION_PATH)
+        .header("Idempotency-Key", "provider-delete-oversized-body")
+        .header("Satelle-Protocol-Version", "9")
+        .body(vec![b'x'; 2 * 1024 * 1024])
+        .send()
+        .await
+        .expect("send deletion with an oversized body");
+    assert_eq!(
+        rejected_oversized_body.status(),
+        StatusCode::PAYLOAD_TOO_LARGE
+    );
+
+    let deleted = ordinary_admin
+        .protected_request(reqwest::Method::DELETE, AUTHORIZATION_PATH)
+        .header("Idempotency-Key", "provider-delete-body")
+        .header("Satelle-Protocol-Version", "9")
+        .send()
+        .await
+        .expect("reuse the rejected body idempotency key");
+    assert_eq!(deleted.status(), StatusCode::OK);
+
+    let absent = ordinary_admin
+        .protected_request(reqwest::Method::DELETE, AUTHORIZATION_PATH)
+        .header("Idempotency-Key", "provider-delete-oversized-body")
+        .header("Satelle-Protocol-Version", "9")
+        .send()
+        .await
+        .expect("reuse the rejected oversized-body idempotency key");
+    assert_eq!(absent.status(), StatusCode::OK);
 }
 
 #[tokio::test]
