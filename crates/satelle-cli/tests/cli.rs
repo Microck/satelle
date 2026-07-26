@@ -7511,9 +7511,7 @@ auth_source = "openai"
     assert_eq!(error["code"], "provider-secret-provisioning-required");
     assert_eq!(
         error["suggested_commands"],
-        serde_json::json!([
-            "satelle setup --host <host-alias> --component provider-auth"
-        ])
+        serde_json::json!(["satelle setup --host <host-alias> --component provider-auth"])
     );
 }
 

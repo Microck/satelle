@@ -845,10 +845,7 @@ impl LocalProviderSecretBridge {
     fn start(alias: &str, service: HostService) -> Result<Self, SatelleError> {
         let token =
             ApiBearerToken::generate().map_err(|_| SatelleError::host_unreachable(alias))?;
-        let host_identity = service
-            .initialize_daemon()?
-            .host_identity()
-            .to_string();
+        let host_identity = service.initialize_daemon()?.host_identity().to_string();
         let service = service.with_ephemeral_bootstrap_auth(
             &token,
             ApiScopes::ADMIN,
@@ -871,17 +868,13 @@ impl LocalProviderSecretBridge {
                 runtime.block_on(async move {
                     let server = match DaemonServer::bind(
                         service,
-                        DaemonServerConfig::loopback(SocketAddr::from((
-                            Ipv4Addr::LOCALHOST,
-                            0,
-                        ))),
+                        DaemonServerConfig::loopback(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))),
                     )
                     .await
                     {
                         Ok(server) => server,
                         Err(error) => {
-                            let _ = started_tx
-                                .send(Err(format!("{} ({error})", error.code())));
+                            let _ = started_tx.send(Err(format!("{} ({error})", error.code())));
                             return;
                         }
                     };

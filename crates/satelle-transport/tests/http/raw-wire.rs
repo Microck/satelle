@@ -19,16 +19,14 @@ async fn provider_secret_raw_wire_rejects_identity_content_type_and_duplicate_me
     let running = RunningServer::start(ApiScopes::ADMIN).await;
     let authorization = bearer(&running.token);
     let secret_canary = "PRIVATE_PROVIDER_SECRET_RAW_WIRE_CANARY";
-    let metadata = serde_json::to_string(&satelle_transport::ProviderSecretProvisioningMetadata::new(
-        satelle_core::ProviderBindingAuthorization::new(
-            "vision",
-            "open_ai",
-            "gpt-5.6",
-            "openai",
-        ),
-        false,
-    ))
-    .expect("encode provider secret metadata");
+    let metadata =
+        serde_json::to_string(&satelle_transport::ProviderSecretProvisioningMetadata::new(
+            satelle_core::ProviderBindingAuthorization::new(
+                "vision", "open_ai", "gpt-5.6", "openai",
+            ),
+            false,
+        ))
+        .expect("encode provider secret metadata");
 
     for (expected_host, content_type, metadata_headers, status, code) in [
         (

@@ -39,10 +39,10 @@ pub(crate) use self::operator_log::{
 };
 pub(crate) use self::operator_log::{OperatorLogMirror, OperatorLogPolicy};
 pub(crate) use self::provider_secret_journal::{
-    BeginProviderSecretProvisioning, ProviderSecretProvisioningJournal,
+    BeginProviderSecretProvisioning, PROVIDER_SECRET_CANDIDATE_HMAC_DOMAIN,
+    PROVIDER_SECRET_PRIOR_HMAC_DOMAIN, ProviderSecretProvisioningJournal,
     ProviderSecretProvisioningPhase, ProviderSecretProvisioningPlan,
-    ProviderSecretProvisioningReplay, PROVIDER_SECRET_CANDIDATE_HMAC_DOMAIN,
-    PROVIDER_SECRET_PRIOR_HMAC_DOMAIN,
+    ProviderSecretProvisioningReplay,
 };
 pub(crate) use self::setup_ledger::{
     MaintenanceLeaseCapability, MaintenanceLeaseState, MaintenanceRecoverySubject,

@@ -83,10 +83,7 @@ async fn provider_secret_provisioning_failure_replays_without_echoing_secret_mat
     let initial_bytes = initial.bytes().await.expect("read initial response");
     assert!(!String::from_utf8_lossy(&initial_bytes).contains(secret_canary));
 
-    let replay = send()
-        .send()
-        .await
-        .expect("replay provider secret failure");
+    let replay = send().send().await.expect("replay provider secret failure");
     assert_eq!(replay.status(), initial_status);
     let replay_bytes = replay.bytes().await.expect("read replay response");
     assert_eq!(replay_bytes, initial_bytes);

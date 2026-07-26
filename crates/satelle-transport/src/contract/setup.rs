@@ -155,10 +155,7 @@ pub struct ProviderSecretProvisioningMetadata {
 }
 
 impl ProviderSecretProvisioningMetadata {
-    pub fn new(
-        authorization: ProviderBindingAuthorization,
-        overwrite_authorized: bool,
-    ) -> Self {
+    pub fn new(authorization: ProviderBindingAuthorization, overwrite_authorized: bool) -> Self {
         Self {
             schema_version: ProviderSecretProvisioningSchema,
             authorization,

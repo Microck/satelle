@@ -2649,7 +2649,9 @@ mod tests {
             }),
             ProviderBindingSource::HostOwned,
         );
-        let candidate = Some(ResolvedProviderSecret::for_test("replacement-provider-secret"));
+        let candidate = Some(ResolvedProviderSecret::for_test(
+            "replacement-provider-secret",
+        ));
         let fingerprinter = ProviderSmokeCredentialFingerprinter::for_test([0x5a; 32]);
         let candidate_fingerprint = fingerprinter
             .fingerprint(binding.binding_digest(), candidate.as_ref())

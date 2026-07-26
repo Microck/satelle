@@ -8,8 +8,8 @@ use crate::contract::{
     ProviderBindingDeletionResponse, ProviderDescriptorValidationRequest,
     ProviderDescriptorValidationResponse, ProviderSecretProvisioningMetadata,
     ProviderSecretProvisioningPreviewResponse, ProviderSecretProvisioningResponse, RequestId,
-    SessionResponse, SetupVerificationRequest, SetupVerificationResponse, StopRequest, StopResponse,
-    TurnRequest,
+    SessionResponse, SetupVerificationRequest, SetupVerificationResponse, StopRequest,
+    StopResponse, TurnRequest,
 };
 use crate::transport_tls::{
     ReqwestTrustError, TlsFailureKind, classify_tls_error, configure_reqwest_trust,

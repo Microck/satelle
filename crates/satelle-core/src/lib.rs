@@ -52,9 +52,9 @@ pub use events::{
 pub use ids::{IdParseError, SESSION_ID_PATTERN, SessionId, TurnId};
 pub use profiles::{ProfileField, ProfileSelectionSource, SelectedProfile};
 pub use secure_file::{
-    OwnerOnlyDirectory, OwnerOnlySecretFilePaths, SecureFileError,
-    cleanup_owner_only_secret_file, keyed_secret_comparison_digest, open_new_owner_only_file,
-    open_or_create_owner_only_directory, open_or_create_owner_only_file, open_owner_only_directory,
+    OwnerOnlyDirectory, OwnerOnlySecretFilePaths, SecureFileError, cleanup_owner_only_secret_file,
+    keyed_secret_comparison_digest, open_new_owner_only_file, open_or_create_owner_only_directory,
+    open_or_create_owner_only_file, open_owner_only_directory,
     owner_only_secret_destination_exists, persist_new_owner_only_secret_file,
     publish_owner_only_secret_file, read_bounded_regular_file_no_follow,
     read_owner_controlled_config_file, read_owner_only_secret_config_file,
@@ -1180,10 +1180,7 @@ mod provider_binding_config_tests {
     fn provider_secret_provisioning_reports_are_redacted() {
         let preview = ProviderSecretProvisioningPreview::file();
         assert_eq!(preview.destination_kind(), "file");
-        assert_eq!(
-            preview.persistence_location_class(),
-            "host_private_file"
-        );
+        assert_eq!(preview.persistence_location_class(), "host_private_file");
         assert_eq!(
             preview.overwrite_behavior(),
             "reject_existing_without_explicit_authorization"

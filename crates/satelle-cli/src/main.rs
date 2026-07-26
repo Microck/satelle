@@ -2718,8 +2718,7 @@ fn run_setup(
             provider_secret_setup_completed = true;
             report.secret_provisioned = response.provisioned();
             report.validation_status = response.validation_status().to_string();
-            report.readiness_summary.provider_auth =
-                response.validation_status().to_string();
+            report.readiness_summary.provider_auth = response.validation_status().to_string();
             report.applied_actions.push(format!(
                 "provisioned and authorized {} provider authentication on Host '{}'",
                 response.destination_kind(),
@@ -3492,10 +3491,9 @@ fn provision_provider_secret(
 
     let metadata =
         satelle_transport::ProviderSecretProvisioningMetadata::new(authorization.clone(), false);
-    match provider_transport.provision_provider_secret(
-        &metadata,
-        Zeroizing::new(secret.as_slice().to_vec()),
-    ) {
+    match provider_transport
+        .provision_provider_secret(&metadata, Zeroizing::new(secret.as_slice().to_vec()))
+    {
         Ok(response) => Ok(response),
         Err(error) if error.code == ErrorCode::ProviderSecretOverwriteRequired => {
             let confirmed = cliclack::confirm(
@@ -4294,11 +4292,7 @@ fn config_explain(
 }
 
 fn print_config_explain_values(path: &str, value: &serde_json::Value) {
-    if value
-        .get("redacted")
-        .and_then(serde_json::Value::as_bool)
-        == Some(true)
-    {
+    if value.get("redacted").and_then(serde_json::Value::as_bool) == Some(true) {
         println!(
             "{}: <redacted> (reason: {}, source: {})",
             path,
@@ -8590,15 +8584,9 @@ fn print_setup_human(report: &SetupReport) {
         "Provider descriptor configured: {}",
         report.descriptor_configured
     );
-    println!(
-        "Provider secret provisioned: {}",
-        report.secret_provisioned
-    );
+    println!("Provider secret provisioned: {}", report.secret_provisioned);
     println!("Provider validation: {}", report.validation_status);
-    println!(
-        "Provider smoke test: {}",
-        report.provider_smoke_test_status
-    );
+    println!("Provider smoke test: {}", report.provider_smoke_test_status);
     println!(
         "Native Computer Use readiness: {}",
         report.native_computer_use_readiness
