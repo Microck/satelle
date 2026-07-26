@@ -543,6 +543,8 @@ pub struct ProviderBindingConfig {
     pub model_provider: String,
     pub endpoint: Option<String>,
     pub auth_source: Option<String>,
+    #[serde(default)]
+    pub allow_project_selection: bool,
 }
 
 fn deserialize_optional_provider_secret_source<'de, D>(
@@ -639,6 +641,8 @@ pub struct ProviderBindingAuthorization {
         deserialize_with = "deserialize_optional_provider_secret_source"
     )]
     auth_source: Option<ProviderSecretSource>,
+    #[serde(default)]
+    allow_project_selection: bool,
     experimental_provider_computer_use: bool,
 }
 
@@ -656,6 +660,7 @@ impl ProviderBindingAuthorization {
             model_provider: model_provider.into(),
             endpoint: None,
             auth_source: None,
+            allow_project_selection: false,
             experimental_provider_computer_use: false,
         }
     }
@@ -667,6 +672,11 @@ impl ProviderBindingAuthorization {
 
     pub fn with_auth_source(mut self, auth_source: ProviderSecretSource) -> Self {
         self.auth_source = Some(auth_source);
+        self
+    }
+
+    pub const fn with_allow_project_selection(mut self, allowed: bool) -> Self {
+        self.allow_project_selection = allowed;
         self
     }
 
@@ -699,6 +709,10 @@ impl ProviderBindingAuthorization {
         self.auth_source.as_ref()
     }
 
+    pub const fn allow_project_selection(&self) -> bool {
+        self.allow_project_selection
+    }
+
     pub const fn experimental_provider_computer_use(&self) -> bool {
         self.experimental_provider_computer_use
     }
@@ -720,6 +734,8 @@ pub struct ResolvedProviderBinding {
     )]
     auth_source: Option<ProviderSecretSource>,
     source: ProviderBindingSource,
+    #[serde(default)]
+    allow_project_selection: bool,
     experimental_provider_computer_use: bool,
     binding_digest: String,
     #[serde(skip)]
@@ -745,6 +761,7 @@ impl ResolvedProviderBinding {
             endpoint: authorization.endpoint,
             auth_source: authorization.auth_source,
             source,
+            allow_project_selection: authorization.allow_project_selection,
             experimental_provider_computer_use: authorization.experimental_provider_computer_use,
             binding_digest: String::new(),
             model_origin: Some(value_origin),
@@ -792,6 +809,10 @@ impl ResolvedProviderBinding {
         self.source
     }
 
+    pub const fn allow_project_selection(&self) -> bool {
+        self.allow_project_selection
+    }
+
     pub const fn experimental_provider_computer_use(&self) -> bool {
         self.experimental_provider_computer_use
     }
@@ -822,7 +843,7 @@ impl ResolvedProviderBinding {
 
     fn compute_binding_digest(&self) -> String {
         let mut digest = Sha256::new();
-        digest.update(b"satelle.authorized-provider-binding.v1\0");
+        digest.update(b"satelle.authorized-provider-binding.v2\0");
         for value in [
             self.requested_model_alias.as_str(),
             self.requested_provider_alias.as_str(),
@@ -843,6 +864,7 @@ impl ResolvedProviderBinding {
             .unwrap_or_default();
         digest.update(auth_source.len().to_be_bytes());
         digest.update(auth_source);
+        digest.update([u8::from(self.allow_project_selection)]);
         digest.update([u8::from(self.experimental_provider_computer_use)]);
         digest
             .finalize()
@@ -862,6 +884,8 @@ pub struct PublicResolvedProviderBinding {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     endpoint: Option<String>,
     source: ProviderBindingSource,
+    #[serde(default)]
+    allow_project_selection: bool,
     experimental_provider_computer_use: bool,
     binding_digest: String,
 }
@@ -891,6 +915,10 @@ impl PublicResolvedProviderBinding {
         self.source
     }
 
+    pub const fn allow_project_selection(&self) -> bool {
+        self.allow_project_selection
+    }
+
     pub const fn experimental_provider_computer_use(&self) -> bool {
         self.experimental_provider_computer_use
     }
@@ -909,8 +937,39 @@ impl From<&ResolvedProviderBinding> for PublicResolvedProviderBinding {
             model_provider: binding.model_provider.clone(),
             endpoint: binding.endpoint.clone(),
             source: binding.source,
+            allow_project_selection: binding.allow_project_selection,
             experimental_provider_computer_use: binding.experimental_provider_computer_use,
             binding_digest: binding.binding_digest.clone(),
+        }
+    }
+}
+
+impl SatelleError {
+    pub fn project_provider_selection_not_allowed(
+        host_alias: &str,
+        provider_alias: &str,
+        model_alias: &str,
+    ) -> Self {
+        let mut details = BTreeMap::new();
+        details.insert("host".to_string(), Value::String(host_alias.to_string()));
+        details.insert(
+            "provider_alias".to_string(),
+            Value::String(provider_alias.to_string()),
+        );
+        details.insert(
+            "model_alias".to_string(),
+            Value::String(model_alias.to_string()),
+        );
+        Self {
+            code: ErrorCode::ProjectProviderSelectionNotAllowed,
+            message: format!(
+                "project-selected provider binding `{provider_alias}.{model_alias}` is not authorized on Host `{host_alias}`"
+            ),
+            details,
+            recovery_command: Some(format!(
+                "Set `allow_project_selection = true` in `[hosts.{host_alias}.provider_bindings.{provider_alias}.{model_alias}]` in owner-controlled Host config, or pass an explicit override for each project-selected alias."
+            )),
+            source_detail: None,
         }
     }
 }
@@ -983,6 +1042,7 @@ mod provider_binding_config_tests {
                 .with_auth_source(ProviderSecretSource::Environment {
                     variable: "OPENAI_API_KEY".to_string(),
                 })
+                .with_allow_project_selection(true)
                 .with_experimental_provider_computer_use(true);
 
         assert_eq!(authorization.requested_model_alias(), "vision");
@@ -998,6 +1058,7 @@ mod provider_binding_config_tests {
             Some(ProviderSecretSource::Environment { variable })
                 if variable == "OPENAI_API_KEY"
         ));
+        assert!(authorization.allow_project_selection());
 
         let authorization_json =
             serde_json::to_value(&authorization).expect("serialize provider binding authorization");
@@ -1013,11 +1074,15 @@ mod provider_binding_config_tests {
                     "kind": "environment",
                     "variable": "OPENAI_API_KEY"
                 },
+                "allow_project_selection": true,
                 "experimental_provider_computer_use": true
             })
         );
         assert!(authorization_json.get("source").is_none());
 
+        let denied_authorization = authorization
+            .clone()
+            .with_allow_project_selection(false);
         let resolved = ResolvedProviderBinding::from_authorization(
             authorization,
             ProviderBindingSource::HostOwned,
@@ -1029,9 +1094,16 @@ mod provider_binding_config_tests {
         assert_eq!(resolved.endpoint(), Some("https://provider.example/v1"));
         assert!(resolved.auth_source().is_some());
         assert_eq!(resolved.source(), ProviderBindingSource::HostOwned);
+        assert!(resolved.allow_project_selection());
         assert!(resolved.experimental_provider_computer_use());
         assert!(resolved.has_valid_binding_digest());
         assert_eq!(resolved.binding_digest().len(), 64);
+        let denied = ResolvedProviderBinding::from_authorization(
+            denied_authorization,
+            ProviderBindingSource::HostOwned,
+        );
+        assert!(denied.has_valid_binding_digest());
+        assert_ne!(denied.binding_digest(), resolved.binding_digest());
         assert_eq!(
             serde_json::to_value(resolved).expect("serialize resolved provider binding")["source"],
             serde_json::json!("host_owned")
@@ -1087,6 +1159,7 @@ mod provider_binding_config_tests {
                 .with_auth_source(ProviderSecretSource::Environment {
                     variable: "PRIVATE_PROVIDER_TOKEN".to_string(),
                 })
+                .with_allow_project_selection(true)
                 .with_experimental_provider_computer_use(true),
             ProviderBindingSource::HostOwned,
         );
@@ -1103,6 +1176,10 @@ mod provider_binding_config_tests {
         assert_eq!(
             wire["resolved_binding"]["endpoint"],
             "https://provider.example/v1"
+        );
+        assert_eq!(
+            wire["resolved_binding"]["allow_project_selection"],
+            serde_json::json!(true)
         );
         assert!(!wire.to_string().contains("PRIVATE_PROVIDER_TOKEN"));
         assert!(wire["resolved_binding"].get("auth_source").is_none());
@@ -1137,6 +1214,7 @@ model = "gpt-5.6"
 model_provider = "openai"
 endpoint = "https://provider.example/v1"
 auth_source = "primary"
+allow_project_selection = true
 
 [hosts.workstation.provider_bindings.open_ai.default]
 model = "gpt-5.6-mini"
@@ -1167,12 +1245,14 @@ model_provider = "anthropic"
             Some("https://provider.example/v1")
         );
         assert_eq!(binding.auth_source.as_deref(), Some("primary"));
+        assert!(binding.allow_project_selection);
 
         let binding_without_optional_fields = host
             .provider_binding("open_ai", "default")
             .expect("parse a binding without optional fields");
         assert_eq!(binding_without_optional_fields.endpoint, None);
         assert_eq!(binding_without_optional_fields.auth_source, None);
+        assert!(!binding_without_optional_fields.allow_project_selection);
 
         assert!(host.provider_binding("open_ai", "missing").is_none());
         assert!(host.provider_binding("missing", "vision_pro").is_none());
@@ -1180,6 +1260,37 @@ model_provider = "anthropic"
         let encoded = toml::to_string(&parsed.config).expect("serialize provider bindings");
         assert!(encoded.contains("provider_bindings"));
         assert!(!encoded.contains("provider-bindings"));
+    }
+
+    #[test]
+    fn profile_alias_project_origin_is_independent_and_preserves_absent_fields() {
+        let model_only: profiles::ProfileConfig =
+            toml::from_str("model_alias = \"vision\"").expect("parse model-only profile");
+
+        assert_eq!(
+            model_only.alias_from_project(
+                profiles::ProfileField::ModelAlias,
+                profiles::ProfileSelectionSource::ProjectConfig,
+            ),
+            Some(true)
+        );
+        assert_eq!(
+            model_only.alias_from_project(
+                profiles::ProfileField::ProviderAlias,
+                profiles::ProfileSelectionSource::ProjectConfig,
+            ),
+            None
+        );
+        for source in [
+            profiles::ProfileSelectionSource::UserConfig,
+            profiles::ProfileSelectionSource::Environment,
+            profiles::ProfileSelectionSource::CliFlag,
+        ] {
+            assert_eq!(
+                model_only.alias_from_project(profiles::ProfileField::ModelAlias, source),
+                Some(false)
+            );
+        }
     }
 
     #[test]
@@ -1571,10 +1682,24 @@ pub struct ResolvedConfig {
     // user-level Host Binding can permit implicit project selection.
     #[serde(skip)]
     project_selectable_hosts: BTreeSet<String>,
+    #[serde(skip)]
+    model_alias_from_project: bool,
+    #[serde(skip)]
+    provider_alias_from_project: bool,
     // Config-check enumeration retains only selectors discovered from already validated files.
     // Effective HostConfig values continue to have a single owner in `config`.
     #[serde(skip)]
     config_check_metadata: ConfigCheckMetadata,
+}
+
+impl ResolvedConfig {
+    pub const fn model_alias_from_project(&self) -> bool {
+        self.model_alias_from_project
+    }
+
+    pub const fn provider_alias_from_project(&self) -> bool {
+        self.provider_alias_from_project
+    }
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -1795,6 +1920,12 @@ fn load_config_with_profile_selection(
     let mut default_host_requires_project_permission = project_config
         .as_ref()
         .is_some_and(project_config::ParsedProjectConfig::selects_default_host);
+    let mut model_alias_from_project = project_config
+        .as_ref()
+        .is_some_and(project_config::ParsedProjectConfig::defines_model_alias);
+    let mut provider_alias_from_project = project_config
+        .as_ref()
+        .is_some_and(project_config::ParsedProjectConfig::defines_provider_alias);
 
     if let Some(user_config) = &user_config {
         config = config.merge(user_config.config.clone());
@@ -1857,6 +1988,18 @@ fn load_config_with_profile_selection(
             default_host_requires_project_permission =
                 selected.source == profiles::ProfileSelectionSource::ProjectConfig;
         }
+        if let Some(from_project) = profile.alias_from_project(
+            profiles::ProfileField::ModelAlias,
+            selected.source,
+        ) {
+            model_alias_from_project = from_project;
+        }
+        if let Some(from_project) = profile.alias_from_project(
+            profiles::ProfileField::ProviderAlias,
+            selected.source,
+        ) {
+            provider_alias_from_project = from_project;
+        }
         profile.apply_to_base(&mut config, selected.source);
         Some(profile)
     } else {
@@ -1871,6 +2014,8 @@ fn load_config_with_profile_selection(
         profile_overlay,
         default_host_requires_project_permission,
         project_selectable_hosts,
+        model_alias_from_project,
+        provider_alias_from_project,
         config_check_metadata: ConfigCheckMetadata {
             configured_hosts,
             configured_profiles,
@@ -3325,7 +3470,13 @@ fn reject_unknown_user_config_keys(path: &Path, value: &toml::Value) -> Result<(
                                 "{host_path}.provider_bindings.{provider_alias}.{model_alias}"
                             ),
                             binding,
-                            &["model", "model_provider", "endpoint", "auth_source"],
+                            &[
+                                "model",
+                                "model_provider",
+                                "endpoint",
+                                "auth_source",
+                                "allow_project_selection",
+                            ],
                             &mut unknown_keys,
                         );
                     }
@@ -3521,6 +3672,7 @@ pub enum ErrorCode {
     ProjectMutationConsentNotAllowed,
     ProjectHostBindingNotAllowed,
     ProjectHostSelectionNotAllowed,
+    ProjectProviderSelectionNotAllowed,
     ProjectSecretSourceNotAllowed,
     ProjectCredentialHelperNotAllowed,
     UnsupportedSecretSourceKind,
@@ -3614,6 +3766,9 @@ impl ErrorCode {
             Self::ProjectMutationConsentNotAllowed => "project-mutation-consent-not-allowed",
             Self::ProjectHostBindingNotAllowed => "project-host-binding-not-allowed",
             Self::ProjectHostSelectionNotAllowed => "project-host-selection-not-allowed",
+            Self::ProjectProviderSelectionNotAllowed => {
+                "project-provider-selection-not-allowed"
+            }
             Self::ProjectSecretSourceNotAllowed => "project-secret-source-not-allowed",
             Self::ProjectCredentialHelperNotAllowed => "project-credential-helper-not-allowed",
             Self::UnsupportedSecretSourceKind => "unsupported-secret-source-kind",

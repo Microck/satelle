@@ -84,6 +84,19 @@ impl ProfileConfig {
         self.host.as_deref()
     }
 
+    pub(super) fn alias_from_project(
+        &self,
+        field: ProfileField,
+        source: ProfileSelectionSource,
+    ) -> Option<bool> {
+        let overrides_alias = match field {
+            ProfileField::ModelAlias => self.model_alias.is_some(),
+            ProfileField::ProviderAlias => self.provider_alias.is_some(),
+            ProfileField::ExperimentalProviderComputerUse | ProfileField::Yolo => false,
+        };
+        overrides_alias.then_some(source == ProfileSelectionSource::ProjectConfig)
+    }
+
     fn yolo_applies(&self, source: ProfileSelectionSource) -> bool {
         match self.yolo {
             Some(false) => true,
