@@ -394,6 +394,7 @@ model_provider = "openai"
 [hosts.work-host.provider_bindings.openai.work-model]
 model = "work-model"
 model_provider = "openai"
+allow_project_selection = true
 
 [profiles.work]
 host = "work-host"
