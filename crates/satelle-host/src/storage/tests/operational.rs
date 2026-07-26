@@ -36,7 +36,9 @@ fn rebuild_idempotency_records_as_pre_v11_fixture(connection: &Connection) {
     // migration 11 receives from real version 1 through version 10 stores.
     connection
         .execute_batch(
-            "CREATE TABLE idempotency_records_pre_v11_fixture (
+            "DROP TABLE provider_secret_provisioning_journal;
+
+            CREATE TABLE idempotency_records_pre_v11_fixture (
                 principal_ref TEXT NOT NULL,
                 operation TEXT NOT NULL CHECK (operation IN ('run', 'steer', 'stop')),
                 idempotency_key TEXT NOT NULL,
@@ -801,8 +803,6 @@ fn version_seven_api_tokens_upgrade_to_explicit_active_state() {
              ALTER TABLE sessions DROP COLUMN display_name;
              ALTER TABLE session_private_refs DROP COLUMN upstream_goal_ref;
              ALTER TABLE api_tokens DROP COLUMN token_state;
-             DROP TABLE provider_secret_provisioning_journal;
-             DROP INDEX idempotency_operation_identity;
              DROP TABLE authorized_provider_bindings;
              DROP TABLE provider_smoke_hmac_key;
              DELETE FROM schema_migrations WHERE version IN (8, 9, 10, 11, 12, 13);
@@ -2069,8 +2069,6 @@ fn version_one_store_upgrades_without_replacing_existing_state() {
              ALTER TABLE sessions DROP COLUMN display_name;
              ALTER TABLE session_private_refs DROP COLUMN upstream_goal_ref;
              ALTER TABLE api_tokens DROP COLUMN token_state;
-             DROP TABLE provider_secret_provisioning_journal;
-             DROP INDEX idempotency_operation_identity;
              DROP TABLE authorized_provider_bindings;
              DROP TABLE provider_smoke_hmac_key;
              DELETE FROM schema_migrations WHERE version IN (2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13);
