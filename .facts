@@ -41,7 +41,7 @@
 - a Satelle Provider Probe Surface is an ephemeral local UI served by the Host Daemon to verify that a selected model and provider can observe and act through native Computer Use @spec @mvp @implemented
 - a Satelle Event is a stable JSON lifecycle record emitted by attached run and steer commands or Host Daemon event streams @spec @mvp @implemented
 - a Satelle Setup Action Ledger is the Host Daemon-owned record of setup, repair, update, migration, and other specified maintenance action plans, status changes, partial failures, and recovery metadata for a controlled Host @spec @mvp
-- a Satelle Setup Component is a named onboarding responsibility that setup can plan, report, and selectively target without changing the default setup contract @spec @mvp
+- a Satelle Setup Component is a named onboarding responsibility that setup can plan, report, and selectively target without changing the default setup contract @mvp @implemented
 - a Satelle Trusted Profile is a user-level profile explicitly allowed by the local OS user to supply noninteractive mutation consent for configured command families and Host Aliases @spec @mvp
 - a Satelle Mutation Command Family is a stable consent scope grouping one mutating command workflow independently from exact CLI subcommand spelling @spec @mvp
 - a Satelle Doctor Finding is a diagnostic result with a scope, severity, fixability, readiness impact, summary, evidence, and optional recovery command @spec @mvp
@@ -541,23 +541,23 @@
 - satelle setup records persisted daemon path override changes in the remote setup action ledger @spec @mvp @implemented
 - satelle setup --dry-run reports planned daemon path override persistence without writing service configuration, creating directories, or restarting a Host Daemon @implemented @mvp
 - satelle setup defaults to the all setup component set when no component filter is provided @implemented @mvp
-- satelle setup default component set configures or diagnoses every readiness-critical prerequisite for prompt execution, including transport, Host Daemon setup, Codex runtime setup, detectable native Computer Use prerequisites, desktop binding, and required provider authentication @spec @mvp
-- satelle setup reports prerequisite configuration separately from live native Computer Use action-path readiness verification @spec @mvp
-- satelle setup does not require --component provider-auth for ordinary first-run onboarding @spec @mvp
+- satelle setup default component set configures or diagnoses every readiness-critical prerequisite for prompt execution, including transport, Host Daemon setup, Codex runtime setup, detectable native Computer Use prerequisites, desktop binding, and required provider authentication @mvp @implemented
+- satelle setup reports prerequisite configuration separately from live native Computer Use action-path readiness verification @mvp @implemented
+- satelle setup does not require --component provider-auth for ordinary first-run onboarding @mvp @implemented
 - satelle setup supports repeatable --component <transport|host|codex|computer-use|desktop|provider-auth|all> filters for targeted setup runs, reruns, repairs, and AI-agent workflows @implemented @mvp
 - satelle setup reports a typed component-selection-conflict usage error when --component all is combined with any other setup component value @implemented @mvp
 - satelle setup has no short alias for --component in MVP because component selection changes onboarding scope @implemented @mvp
-- satelle setup --component provider-auth limits planning and mutation to provider authentication descriptor configuration, interactive provider secret provisioning when explicitly confirmed, provider authentication validation, and provider smoke tests unless another selected setup component is a prerequisite that the plan explicitly reports @spec @mvp
+- satelle setup --component provider-auth limits planning and mutation to provider authentication descriptor configuration, interactive provider secret provisioning when explicitly confirmed, provider authentication validation, and provider smoke tests unless another selected setup component is a prerequisite that the plan explicitly reports @mvp @implemented
 - satelle setup --no-input --json is the stable AI-agent onboarding contract and emits setup components, planned_actions, applied_actions, required_input, recovery_commands, and readiness_summary fields @implemented @mvp
 - satelle setup --no-input --json reports required_input entries for any setup component that needs human-only material, including provider secret entry, instead of blocking on prompts or accepting secrets through automation-only channels @implemented @mvp
-- satelle setup --no-input --json without --yes may build a setup plan but never applies planned mutations, writes action-ledger entries for unapplied actions, installs services, changes configuration, or provisions secrets; it updates readiness caches only through an explicit --verify after required prerequisites are already satisfied @spec @mvp
-- satelle setup --no-input --json without --yes reports a typed setup-consent-required error when the setup plan contains any remote mutation that would be applied only after consent @spec @mvp
+- satelle setup --no-input --json without --yes may build a setup plan but never applies planned mutations, writes action-ledger entries for unapplied actions, installs services, changes configuration, or provisions secrets; it updates readiness caches only through an explicit --verify after required prerequisites are already satisfied @mvp @implemented
+- satelle setup --no-input --json without --yes reports a typed setup-consent-required error when the setup plan contains any remote mutation that would be applied only after consent @mvp @implemented
 - when setup --verify discovers consent-required setup mutations but receives no applicable consent, it reports setup-consent-required before running live probes or updating readiness and provider smoke-test caches @spec @mvp
-- satelle setup setup-consent-required output states that no remote changes were applied and includes the planned_actions plus a safe recovery command that reruns the same setup selection with --no-input --json --yes @spec @mvp
+- satelle setup setup-consent-required output states that no remote changes were applied and includes the planned_actions plus a safe recovery command that reruns the same setup selection with --no-input --json --yes @mvp @implemented
 - satelle setup --no-input --json --yes may apply remote mutations only after rebuilding or revalidating the setup plan in the same invocation and then following the normal setup action ledger, partial-failure, and postcheck rules @spec @mvp
-- satelle setup accepts noninteractive mutation consent for ordinary setup mutations only from the current command's --yes flag or from an applicable user-level Satelle Trusted Profile, excluding raw provider secret entry, provider-secret provisioning, and provider-secret overwrite confirmation @spec @mvp
-- satelle setup never treats project-level configuration as noninteractive mutation consent, even when project-level configuration selects the host, profile, provider, model, or component set @spec @mvp
-- satelle setup reports setup-consent-required instead of applying remote mutations when the only available consent-like setting comes from project-level configuration @spec @mvp
+- satelle setup accepts noninteractive mutation consent for ordinary setup mutations only from the current command's --yes flag or from an applicable user-level Satelle Trusted Profile, excluding raw provider secret entry, provider-secret provisioning, and provider-secret overwrite confirmation @mvp @implemented
+- satelle setup never treats project-level configuration as noninteractive mutation consent, even when project-level configuration selects the host, profile, provider, model, or component set @mvp @implemented
+- satelle setup reports setup-consent-required instead of applying remote mutations when the only available consent-like setting comes from project-level configuration @mvp @implemented
 - satelle setup treats provider authentication onboarding as part of getting a configured host ready for Satelle prompt execution when the selected model and provider require provider credentials @spec @mvp @implemented
 - satelle setup distinguishes configuring a provider authentication Secret Source descriptor from provisioning the raw provider secret material that descriptor references @spec @mvp @implemented
 - satelle setup can configure host-resolved provider authentication Secret Source descriptors for a concrete host alias in user-level configuration or remote-host owned configuration @spec @mvp @implemented
@@ -2132,14 +2132,14 @@
   tags: [implemented, mvp]
 
 ## computer-use
-- satelle prefers native Codex Computer Use installed on the remote host over custom screenshot and input automation @spec @mvp
-- satelle detects when native Codex Computer Use is unavailable on a configured remote host and reports the missing capability to the user @spec @mvp
-- satelle offers assisted installation for missing Codex or native Codex Computer Use prerequisites but requires explicit user confirmation before running remote install commands @spec @mvp
+- satelle prefers native Codex Computer Use installed on the remote host over custom screenshot and input automation @mvp @implemented
+- satelle detects when native Codex Computer Use is unavailable on a configured remote host and reports the missing capability to the user @mvp @implemented
+- satelle offers assisted installation for missing Codex or native Codex Computer Use prerequisites but requires explicit user confirmation before running remote install commands @mvp @implemented
 - satelle run, steer, and status do not install Codex, Computer Use plugins, OS permissions, or app approvals as side effects @implemented @mvp
 - satelle doctor reports missing Codex runtime, Computer Use plugin, OS permissions, app approvals, authentication, unsupported operating system, and unsupported region as separate readiness blockers when those blockers can be detected @spec @mvp
 - satelle provides an explicit host setup or repair command for guided Codex and native Computer Use prerequisite setup on supported hosts @spec @mvp
-- satelle setup in an interactive terminal is an applying onboarding flow by default instead of a preview-only command @spec @mvp
-- satelle setup presents planned remote install, update, and configuration actions before mutating the remote host @spec @mvp
+- satelle setup in an interactive terminal is an applying onboarding flow by default instead of a preview-only command @mvp @implemented
+- satelle setup presents planned remote install, update, and configuration actions before mutating the remote host @mvp @implemented
 - satelle interactive setup and repair ask for one final cliclack confirmation after presenting the planned remote mutations and before running install, update, service, or configuration actions @spec @mvp
 - satelle interactive setup and repair treat the user's earlier setup selections as configuration input rather than final consent to mutate the remote host @spec @mvp
 - satelle setup and repair skip the final interactive mutation confirmation when --yes is present @spec @mvp

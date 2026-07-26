@@ -2525,6 +2525,12 @@ fn production_setup_report(
     daemon_path_overrides: DaemonPathOverrides,
 ) -> SetupReport {
     let service_persistent = setup_mode == "persistent";
+    let mutation_planned = setup_components.iter().any(|component| {
+        matches!(
+            component.as_str(),
+            "all" | "host" | "codex" | "computer-use"
+        )
+    });
     let service_scope = if service_persistent {
         "user"
     } else {
@@ -2548,6 +2554,7 @@ fn production_setup_report(
         host: host.to_string(),
         dry_run,
         status: "planned".to_string(),
+        cancellation_reason: None,
         setup_mode,
         service_persistent,
         service_scope: service_scope.to_string(),
@@ -2570,7 +2577,9 @@ fn production_setup_report(
             provider_auth: "not_checked".to_string(),
         },
         daemon_path_overrides,
+        changed: false,
         mutated: false,
+        mutation_planned,
         native_computer_use_readiness: "blocked_pending_acceptance".to_string(),
         next_command: "satelle doctor --scope computer-use --refresh --json".to_string(),
     }

@@ -138,6 +138,7 @@ pub(super) fn setup(
         host: host.to_string(),
         dry_run,
         status: "planned".to_string(),
+        cancellation_reason: None,
         setup_mode,
         service_persistent,
         service_scope,
@@ -160,7 +161,9 @@ pub(super) fn setup(
             provider_auth: "not_required_for_local_demo".to_string(),
         },
         daemon_path_overrides,
+        changed: false,
         mutated: false,
+        mutation_planned: false,
         native_computer_use_readiness: "not_verified".to_string(),
         next_command: "satelle doctor --scope computer-use --refresh".to_string(),
     }

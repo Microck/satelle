@@ -200,6 +200,7 @@ fn readiness_reports_use_their_canonical_v1_schema_tokens() {
             "satelle.setup.v1",
             &[
                 "applied_actions",
+                "changed",
                 "current_daemon_paths",
                 "daemon_path_overrides",
                 "dry_run",

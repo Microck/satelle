@@ -6024,6 +6024,8 @@ pub struct SetupReport {
     pub host: String,
     pub dry_run: bool,
     pub status: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cancellation_reason: Option<String>,
     pub setup_mode: String,
     pub service_persistent: bool,
     pub service_scope: String,
@@ -6040,7 +6042,12 @@ pub struct SetupReport {
     pub recovery_commands: Vec<String>,
     pub readiness_summary: SetupReadinessSummary,
     pub daemon_path_overrides: Vec<DaemonPathOverride>,
+    pub changed: bool,
     pub mutated: bool,
+    /// Internal execution metadata. The public plan text is descriptive and must not become a
+    /// control-flow contract for deciding whether setup needs mutation consent.
+    #[serde(skip)]
+    pub mutation_planned: bool,
     pub native_computer_use_readiness: String,
     pub next_command: String,
 }

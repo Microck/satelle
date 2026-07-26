@@ -1457,6 +1457,7 @@ impl SshSetupTransport {
             host: self.alias.clone(),
             dry_run,
             status: status.to_string(),
+            cancellation_reason: None,
             setup_mode,
             service_persistent,
             service_scope: if service_persistent {
@@ -1493,6 +1494,13 @@ impl SshSetupTransport {
                 provider_auth: "not_checked".to_string(),
             },
             daemon_path_overrides: path_override_entries,
+            changed: applied
+                && (service_persistent
+                    || matches!(
+                        application,
+                        SetupApplication::AppliedNewToken
+                            | SetupApplication::AppliedPendingActivation
+                    )),
             mutated: applied
                 && (service_persistent
                     || matches!(
@@ -1500,6 +1508,7 @@ impl SshSetupTransport {
                         SetupApplication::AppliedNewToken
                             | SetupApplication::AppliedPendingActivation
                     )),
+            mutation_planned: true,
             native_computer_use_readiness: "not_checked".to_string(),
             next_command,
         }

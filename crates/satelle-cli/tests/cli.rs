@@ -2681,6 +2681,27 @@ fn setup_component_filters_default_repeat_and_reject_all_conflict() {
         .clone();
     let report = parse_json_output(&output.stdout);
     assert_eq!(report["setup_components"], serde_json::json!(["all"]));
+    let planned_actions = report["planned_actions"]
+        .as_array()
+        .expect("setup planning returns actions");
+    for action in [
+        "check transport readiness",
+        "check Host Daemon readiness",
+        "check Codex runtime prerequisites",
+        "check native Codex Computer Use prerequisites",
+        "check Desktop Binding",
+        "check provider authentication",
+    ] {
+        assert!(
+            planned_actions.iter().any(|planned| planned == action),
+            "default setup plan should include {action}"
+        );
+    }
+    assert_eq!(report["native_computer_use_readiness"], "not_verified");
+    assert_eq!(
+        report["next_command"],
+        "satelle doctor --scope computer-use --refresh"
+    );
 
     let output = satelle()
         .env("SATELLE_STATE_DIR", state.path())
@@ -2746,6 +2767,142 @@ fn setup_component_filters_default_repeat_and_reject_all_conflict() {
     assert!(!help.contains("YOLO"));
     assert!(!help.contains("prompt-execution auto-approval"));
     assert!(!help.contains("-c, --component"));
+}
+
+#[test]
+fn setup_without_a_planned_mutation_neither_prompts_nor_runs_an_executor() {
+    let state = state_dir();
+    let output = satelle()
+        .env("SATELLE_STATE_DIR", state.path())
+        .args([
+            "setup",
+            "--host",
+            "local-demo",
+            "--component",
+            "transport",
+            "--no-input",
+            "--json",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .clone();
+    let report = parse_json_output(&output.stdout);
+
+    assert_eq!(report["status"], "planned");
+    assert_eq!(report["changed"], false);
+    assert_eq!(report["mutated"], false);
+    assert_eq!(report["applied_actions"], serde_json::json!([]));
+    assert!(report.get("cancellation_reason").is_none());
+    assert!(!state.path().join("local-demo-state.json").exists());
+}
+
+#[test]
+fn explicitly_selected_trusted_profile_authorizes_setup_but_environment_selection_does_not() {
+    let state = state_dir();
+    let config_file = state.path().join("config.toml");
+    write_user_config(
+        &config_file,
+        r#"
+default_host = "local-demo"
+
+[hosts.local-demo]
+transport = "local"
+adapter = "fake"
+
+[profiles.maintenance]
+
+[trusted_profiles.maintenance]
+hosts = ["local-demo"]
+command_families = ["setup"]
+"#,
+    )
+    .expect("trusted profile config should be written");
+
+    let output = satelle()
+        .env("SATELLE_CONFIG_FILE", &config_file)
+        .env("SATELLE_STATE_DIR", state.path())
+        .args([
+            "--profile",
+            "maintenance",
+            "setup",
+            "--host",
+            "local-demo",
+            "--no-input",
+            "--json",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .clone();
+    let report = parse_json_output(&output.stdout);
+    assert_eq!(report["changed"], true);
+    assert!(
+        report["applied_actions"]
+            .as_array()
+            .is_some_and(|actions| !actions.is_empty())
+    );
+
+    let environment_state = state_dir();
+    let output = satelle()
+        .env("SATELLE_CONFIG_FILE", &config_file)
+        .env("SATELLE_STATE_DIR", environment_state.path())
+        .env("SATELLE_PROFILE", "maintenance")
+        .args(["setup", "--host", "local-demo", "--no-input", "--json"])
+        .assert()
+        .code(64)
+        .get_output()
+        .clone();
+    assert_eq!(
+        parse_json_output(&output.stderr)["code"],
+        "setup-consent-required"
+    );
+    assert!(
+        !environment_state
+            .path()
+            .join("local-demo-state.json")
+            .exists()
+    );
+
+    let project_state = state_dir();
+    let project_config_file = project_state.path().join("user-config.toml");
+    write_user_config(
+        &project_config_file,
+        r#"
+default_host = "local-demo"
+
+[hosts.local-demo]
+transport = "local"
+adapter = "fake"
+
+[profiles.maintenance]
+
+[trusted_profiles.maintenance]
+hosts = ["local-demo"]
+command_families = ["setup"]
+"#,
+    )
+    .expect("project-selection user config should be written");
+    let project = project_state.path().join("project");
+    fs::create_dir_all(project.join(".satelle")).expect("project config directory should exist");
+    fs::write(
+        project.join(".satelle/config.toml"),
+        "profile = \"maintenance\"\n",
+    )
+    .expect("project profile selection should be written");
+    let output = satelle()
+        .current_dir(&project)
+        .env("SATELLE_CONFIG_FILE", &project_config_file)
+        .env("SATELLE_STATE_DIR", project_state.path().join("state"))
+        .args(["setup", "--host", "local-demo", "--no-input", "--json"])
+        .assert()
+        .code(64)
+        .get_output()
+        .clone();
+    assert_eq!(
+        parse_json_output(&output.stderr)["code"],
+        "setup-consent-required"
+    );
 }
 
 #[test]
@@ -2833,6 +2990,54 @@ fn setup_interactive_decline_exits_successfully_without_mutating_state() {
     assert!(!state.path().join("local-demo-state.json").exists());
 }
 
+#[cfg(target_os = "linux")]
+#[test]
+fn setup_interactive_json_decline_reports_typed_cancellation() {
+    let state = state_dir();
+    let executable = assert_cmd::cargo::cargo_bin!("satelle");
+    let command_line = format!("{} setup --host local-demo --json", executable.display());
+    let mut command = Command::new("script");
+    command
+        .env("SATELLE_STATE_DIR", state.path())
+        .env("SATELLE_COMMAND_HISTORY", "false")
+        .env(TEST_SUPPORT_ADAPTER_ENV, "fake")
+        .args(["-qec", command_line.as_str(), "/dev/null"])
+        .write_stdin("n\n");
+    let output = command.assert().success().get_output().clone();
+    let output = String::from_utf8_lossy(&[output.stdout, output.stderr].concat()).to_string();
+
+    assert!(output.contains(r#""status": "cancelled""#));
+    assert!(output.contains(r#""changed": false"#));
+    assert!(output.contains(r#""applied_actions": []"#));
+    assert!(output.contains(r#""cancellation_reason": "user_declined_confirmation""#));
+    assert!(!state.path().join("local-demo-state.json").exists());
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn setup_interactive_prompt_interruption_uses_the_interrupted_exit_contract() {
+    let state = state_dir();
+    let executable = assert_cmd::cargo::cargo_bin!("satelle");
+    let command_line = format!(
+        "{} --error-format json setup --host local-demo",
+        executable.display()
+    );
+    let mut command = Command::new("script");
+    command
+        .env("SATELLE_STATE_DIR", state.path())
+        .env("SATELLE_COMMAND_HISTORY", "false")
+        .env(TEST_SUPPORT_ADAPTER_ENV, "fake")
+        .args(["-qec", command_line.as_str(), "/dev/null"])
+        .write_stdin("\u{1b}");
+    let output = command.assert().code(130).get_output().clone();
+    let output = String::from_utf8_lossy(&[output.stdout, output.stderr].concat()).to_string();
+
+    assert!(output.contains(r#""code": "interrupted""#));
+    assert!(output.contains(r#""changed": false"#));
+    assert!(output.contains(r#""applied_actions": []"#));
+    assert!(!state.path().join("local-demo-state.json").exists());
+}
+
 #[test]
 fn setup_provider_auth_without_a_user_binding_defers_to_host_ownership() {
     let state = state_dir();
@@ -2863,7 +3068,23 @@ fn setup_provider_auth_without_a_user_binding_defers_to_host_ownership() {
     assert_eq!(report["readiness_summary"]["provider_auth"], "host_owned");
     assert!(required_input.is_empty());
     assert_eq!(report["applied_actions"], serde_json::json!([]));
+    assert_eq!(report["changed"], false);
     assert_eq!(report["mutated"], false);
+    let planned_actions = report["planned_actions"]
+        .as_array()
+        .expect("provider setup returns a plan");
+    assert!(
+        planned_actions
+            .iter()
+            .any(|action| action == "check provider authentication")
+    );
+    for unrelated in [
+        "check transport readiness",
+        "check Host Daemon readiness",
+        "check Desktop Binding",
+    ] {
+        assert!(!planned_actions.iter().any(|action| action == unrelated));
+    }
     assert!(!state.path().join("local-demo-state.json").exists());
 }
 

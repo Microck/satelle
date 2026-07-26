@@ -391,6 +391,7 @@ fn report(host_alias: &str, setup_mode: &str, dry_run: bool, changed: bool) -> S
         host: host_alias.to_string(),
         dry_run,
         status: if dry_run { "planned" } else { "configured" }.to_string(),
+        cancellation_reason: None,
         setup_mode: setup_mode.to_string(),
         service_persistent: false,
         service_scope: "remote_user".to_string(),
@@ -420,7 +421,9 @@ fn report(host_alias: &str, setup_mode: &str, dry_run: bool, changed: bool) -> S
             provider_auth: "not_verified".to_string(),
         },
         daemon_path_overrides: Vec::new(),
+        changed,
         mutated: changed,
+        mutation_planned: dry_run || changed,
         native_computer_use_readiness: "not_verified".to_string(),
         next_command: format!("satelle doctor --host {host_alias} --scope transport --json"),
     }

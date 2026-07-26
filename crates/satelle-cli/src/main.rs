@@ -38,12 +38,13 @@ use satelle_core::session::{
 use satelle_core::{
     BEACON_CORAL, CLI_NAME, DaemonPathOverrides, DesktopSelectionPolicy, DesktopSessionPreference,
     DoctorEventRecord, DoctorOptions, DoctorReport, ERROR_RED, ErrorCode, EventSource, EventType,
-    HostConfig, HostSessionsReport, LOCAL_DEMO_HOST, OwnerOnlyDirectory, PRODUCT_NAME,
-    ProfileField, ProviderSecretSource, RELAY_ROSE, ResolvedConfig, SUCCESS_GREEN, SatelleError,
-    SatelleEvent, SatelleEventBody, SecureFileError, SessionId, SetupMode, SetupReadinessSummary,
-    SetupReport, SetupRequiredInput, SetupSchemaVersion, load_config, load_config_for_profile,
-    load_config_without_profile, load_user_api_rate_limits, open_or_create_owner_only_directory,
-    open_or_create_owner_only_file, open_owner_only_directory, read_owner_controlled_config_file,
+    HostConfig, HostSessionsReport, LOCAL_DEMO_HOST, MutationCommandFamily, OwnerOnlyDirectory,
+    PRODUCT_NAME, ProfileField, ProfileSelectionSource, ProviderSecretSource, RELAY_ROSE,
+    ResolvedConfig, SUCCESS_GREEN, SatelleError, SatelleEvent, SatelleEventBody, SecureFileError,
+    SessionId, SetupMode, SetupReadinessSummary, SetupReport, SetupRequiredInput,
+    SetupSchemaVersion, load_config, load_config_for_profile, load_config_without_profile,
+    load_user_api_rate_limits, open_or_create_owner_only_directory, open_or_create_owner_only_file,
+    open_owner_only_directory, read_owner_controlled_config_file,
     read_owner_only_secret_config_file, resolve_desktop_session, resolve_path_set, utc_now,
 };
 use satelle_host::{
@@ -1921,6 +1922,7 @@ fn run_host_setup_if_required<T>(
     }
 }
 
+#[cfg(test)]
 fn run_host_setup_after_desktop_preflight<C, T>(
     desktop_preflight: Result<(), CliFailure>,
     setup_config: &mut C,
@@ -1944,6 +1946,7 @@ fn cli_owned_setup_report(
         host: host.to_string(),
         dry_run,
         status: "planned".to_string(),
+        cancellation_reason: None,
         setup_mode: setup_mode.to_string(),
         service_persistent,
         service_scope: if service_persistent {
@@ -1970,9 +1973,95 @@ fn cli_owned_setup_report(
             provider_auth: "not_checked".to_string(),
         },
         daemon_path_overrides: Vec::new(),
+        changed: false,
         mutated: false,
+        mutation_planned: false,
         native_computer_use_readiness: "not_checked".to_string(),
         next_command: "satelle doctor --scope computer-use --refresh --json".to_string(),
+    }
+}
+
+fn add_setup_component_plan(report: &mut SetupReport) {
+    let components = [
+        ("transport", "check transport readiness"),
+        ("host", "check Host Daemon readiness"),
+        ("codex", "check Codex runtime prerequisites"),
+        (
+            "computer-use",
+            "check native Codex Computer Use prerequisites",
+        ),
+        ("desktop", "check Desktop Binding"),
+        ("provider-auth", "check provider authentication"),
+    ];
+    for (component, action) in components {
+        if report
+            .setup_components
+            .iter()
+            .any(|selected| selected == component || selected == "all")
+            && !report
+                .planned_actions
+                .iter()
+                .any(|planned| planned == action)
+        {
+            report.planned_actions.push((*action).to_string());
+        }
+    }
+}
+
+fn trusted_profile_allows_setup(resolved: &ResolvedConfig, host_alias: &str) -> bool {
+    let Some(selected) = resolved.selected_profile.as_ref() else {
+        return false;
+    };
+    if !matches!(
+        selected.source,
+        ProfileSelectionSource::CliFlag | ProfileSelectionSource::UserConfig
+    ) {
+        return false;
+    }
+    resolved
+        .config
+        .trusted_profiles
+        .get(&selected.name)
+        .is_some_and(|trusted| {
+            trusted.hosts.contains(host_alias)
+                && trusted
+                    .command_families
+                    .contains(&MutationCommandFamily::Setup)
+        })
+}
+
+fn setup_interaction_error(message: &str, source: io::Error) -> SatelleError {
+    SatelleError {
+        code: if source.kind() == io::ErrorKind::Interrupted {
+            ErrorCode::Interrupted
+        } else {
+            ErrorCode::InvalidUsage
+        },
+        message: message.to_string(),
+        recovery_command: Some("rerun with --yes or --dry-run".to_string()),
+        source_detail: Some(source.to_string()),
+        details: BTreeMap::from([
+            ("changed".to_string(), json!(false)),
+            ("applied_actions".to_string(), json!([])),
+        ]),
+    }
+}
+
+fn finish_cancelled_setup(report: &mut SetupReport, json: bool) -> Result<(), CliFailure> {
+    report.status = "cancelled".to_string();
+    report.cancellation_reason = Some("user_declined_confirmation".to_string());
+    report.changed = false;
+    report.mutated = false;
+    report.applied_actions.clear();
+    if json {
+        print_json(
+            &serde_json::to_value(report)
+                .map_err(|error| failure(SatelleError::invalid_usage(error.to_string())))?,
+        )
+        .map_err(failure)
+    } else {
+        println!("No changes applied.");
+        Ok(())
     }
 }
 
@@ -2045,9 +2134,7 @@ fn resolve_setup_desktop_selection(
                     );
                 }
                 policy.desktop_user = Some(prompt.interact().map_err(|source| {
-                    SatelleError::invalid_usage(format!(
-                        "could not read Desktop Binding selection: {source}"
-                    ))
+                    setup_interaction_error("could not read Desktop Binding selection", source)
                 })?);
             }
             Err(error) if error.code == ErrorCode::DesktopSessionAmbiguous && interactive => {
@@ -2080,9 +2167,10 @@ fn resolve_setup_desktop_selection(
                         )
                         .interact()
                         .map_err(|source| {
-                            SatelleError::invalid_usage(format!(
-                                "could not read Desktop Session Preference selection: {source}"
-                            ))
+                            setup_interaction_error(
+                                "could not read Desktop Session Preference selection",
+                                source,
+                            )
                         })?,
                 );
             }
@@ -2162,7 +2250,8 @@ fn run_setup(
     let tailscale_serve_setup = command.component.as_slice() == [SetupComponent::Transport]
         && tailscale_serve::applies_to(&host.config);
     let host_setup_required = !host_setup_components.is_empty();
-    let interactive_selection = !command.no_input && !json && io::stdin().is_terminal();
+    let interactive_selection = !command.no_input && io::stdin().is_terminal();
+    let trusted_consent = trusted_profile_allows_setup(resolved, &host.alias);
     let mut provider_selection =
         resolve_provider_selection(resolved, &host, None, None, false, false)?;
     let mut provider_auth_validation = None;
@@ -2201,6 +2290,7 @@ fn run_setup(
         .map_err(failure)?
     };
     report.setup_components.clone_from(&setup_components);
+    add_setup_component_plan(&mut report);
     if let Some(decision) = &local_service_decision {
         apply_service_decision_to_report(&mut report, decision);
     }
@@ -2235,6 +2325,7 @@ fn run_setup(
         .map_err(failure)?;
         if let Some(selection) = &desktop_selection {
             report.planned_actions.push(selection.action(&host.alias));
+            report.mutation_planned = true;
         }
     } else if desktop_setup
         && !command.dry_run
@@ -2247,6 +2338,7 @@ fn run_setup(
     }
 
     if first_ssh_trust {
+        report.mutation_planned = true;
         report.planned_actions.insert(
             0,
             "bootstrap the temporary Host Daemon, discover its Host Identity, and persist explicit trust"
@@ -2313,6 +2405,7 @@ fn run_setup(
                         .provider_auth
                         .insert(auth_source_name.clone(), descriptor.clone());
                     pending_provider_auth = Some((auth_source_name.clone(), descriptor));
+                    report.mutation_planned = true;
                     report.planned_actions.push(format!(
                         "save provider authentication descriptor reference '{auth_source_name}' for Host '{}'",
                         host.alias
@@ -2325,6 +2418,7 @@ fn run_setup(
                     && let Some(authorization) = provider_selection.authorization.as_ref()
                 {
                     pending_provider_binding_authorization = Some(authorization.clone());
+                    report.mutation_planned = true;
                     report.planned_actions.push(format!(
                         "authorize provider binding '{}/{}' on Host '{}'",
                         authorization.requested_provider_alias(),
@@ -2336,8 +2430,44 @@ fn run_setup(
         }
     }
 
-    if !command.dry_run && report.required_input.is_empty() {
-        if !command.yes && (command.no_input || json || !io::stdin().is_terminal()) {
+    let first_ssh_discovery = if first_ssh_trust && !command.dry_run {
+        let discovery = inspect_first_ssh_host_during_setup(
+            &command,
+            command.yes || trusted_consent,
+            &daemon_path_overrides,
+            &host,
+        )?;
+        let action = format!(
+            "trust observed Host Identity '{}' for Host '{}'",
+            discovery.identity, host.alias
+        );
+        if !report.planned_actions.contains(&action) {
+            report.planned_actions.push(action);
+        }
+        if desktop_setup && report.required_input.is_empty() {
+            desktop_selection = resolve_setup_desktop_selection(
+                &discovery.sessions,
+                &host.config,
+                interactive_selection,
+                Some(&discovery.authenticated_user),
+            )
+            .map_err(failure)?;
+            if let Some(selection) = &desktop_selection {
+                let action = selection.action(&host.alias);
+                if !report.planned_actions.contains(&action) {
+                    report.planned_actions.push(action);
+                }
+                report.mutation_planned = true;
+            }
+        }
+        Some(discovery)
+    } else {
+        None
+    };
+
+    let mut prompted_for_consent = false;
+    if !command.dry_run && report.required_input.is_empty() && report.mutation_planned {
+        if !command.yes && !trusted_consent && (command.no_input || !io::stdin().is_terminal()) {
             let consent_recovery_command = setup_consent_recovery_command(
                 &command,
                 config.flag_profile,
@@ -2351,7 +2481,11 @@ fn run_setup(
             )));
         }
 
-        if !command.yes {
+        if !json {
+            print_setup_human(&report);
+        }
+        if !command.yes && !trusted_consent {
+            prompted_for_consent = true;
             let _color_enabled = style.color_enabled();
             cliclack::intro(format!("{PRODUCT_NAME} setup")).map_err(|source| {
                 failure(SatelleError {
@@ -2362,138 +2496,73 @@ fn run_setup(
                     details: BTreeMap::new(),
                 })
             })?;
-            print_setup_human(&report);
             let confirmed = cliclack::confirm("Apply these setup mutations?")
                 .initial_value(false)
                 .interact()
                 .map_err(|source| {
-                    failure(SatelleError {
-                        code: ErrorCode::InvalidUsage,
-                        message: "could not read setup confirmation".to_string(),
-                        recovery_command: Some("rerun with --yes or --dry-run".to_string()),
-                        source_detail: Some(source.to_string()),
-                        details: BTreeMap::new(),
-                    })
+                    failure(setup_interaction_error(
+                        "could not read setup confirmation",
+                        source,
+                    ))
                 })?;
             if !confirmed {
-                println!("No changes applied.");
-                return Ok(());
+                return finish_cancelled_setup(&mut report, json);
             }
         }
 
-        let first_ssh_discovery = if first_ssh_trust {
-            let Some(discovery) = trust_first_ssh_host_during_setup(
-                &command,
-                json,
-                &user_config_path,
-                &daemon_path_overrides,
-                &mut host,
-            )?
-            else {
-                println!("No changes applied.");
-                return Ok(());
-            };
+        if let Some(discovery) = &first_ssh_discovery {
+            persist_host_identity(&user_config_path, &host.alias, &discovery.identity)
+                .map_err(failure)?;
+            host.config.expected_host_id = Some(discovery.identity.clone());
             transport =
                 setup_transport_if_required(host_setup_required, || transport_for_setup(&host))?;
-            Some(discovery)
-        } else {
-            None
-        };
-
-        let desktop_preflight = (|| {
-            if desktop_setup
-                && report.required_input.is_empty()
-                && let Some(discovery) = &first_ssh_discovery
-            {
-                desktop_selection = resolve_setup_desktop_selection(
-                    &discovery.sessions,
-                    &host.config,
-                    interactive_selection,
-                    Some(&discovery.authenticated_user),
-                )
-                .map_err(failure)?;
-            }
-            if let Some(selection) = &desktop_selection {
-                let action = selection.action(&host.alias);
-                if !report.planned_actions.contains(&action) {
-                    report.planned_actions.push(action.clone());
-                }
-                if !command.yes {
-                    println!("Plan: {action}");
-                    let confirmed = cliclack::confirm("Save this desktop selection?")
-                        .initial_value(false)
-                        .interact()
-                        .map_err(|source| {
-                            failure(SatelleError::invalid_usage(format!(
-                                "could not read desktop selection confirmation: {source}"
-                            )))
-                        })?;
-                    if !confirmed {
-                        return Err(failure(SatelleError::input_required(
-                            "desktop selection was not saved",
-                        )));
-                    }
-                }
-            }
-            Ok(())
-        })();
-
-        desktop_preflight?;
+        }
         let mut persisted_desktop_action = None;
         let mut persisted_provider_auth_action = None;
         if report.required_input.is_empty() {
-            report = run_host_setup_after_desktop_preflight(
-                Ok(()),
-                &mut host.config,
-                |host_config| {
-                    if let Some(selection) = &desktop_selection {
-                        persist_desktop_selection(
-                            &user_config_path,
-                            &host.alias,
-                            &selection.desktop_user,
-                            Some(&selection.preference),
-                        )
-                        .map_err(failure)?;
-                        host_config.desktop_user = Some(selection.desktop_user.clone());
-                        host_config.desktop_session_preference = Some(selection.preference.clone());
-                        host_config.desktop_session_native_selector = None;
-                        persisted_desktop_action = Some(selection.action(&host.alias));
-                    }
-                    Ok(())
-                },
-                |host_config| {
-                    if tailscale_serve_setup {
-                        tailscale_serve::configure(
-                            &host.alias,
-                            host_config,
-                            &daemon_path_overrides,
-                            false,
-                            &setup_mode,
-                        )
-                        .map_err(failure)
-                    } else {
-                        run_host_setup_if_required(
-                            host_setup_required,
-                            || {
-                                report.dry_run = false;
-                                report
-                            },
-                            || {
-                                transport
-                                    .as_ref()
-                                    .expect("Host-owned setup transport is present")
-                                    .setup(
-                                        false,
-                                        setup_mode_selection,
-                                        host_setup_components,
-                                        daemon_path_overrides,
-                                    )
-                            },
-                        )
-                        .map_err(failure)
-                    }
-                },
-            )?;
+            if let Some(selection) = &desktop_selection {
+                persist_desktop_selection(
+                    &user_config_path,
+                    &host.alias,
+                    &selection.desktop_user,
+                    Some(&selection.preference),
+                )
+                .map_err(failure)?;
+                host.config.desktop_user = Some(selection.desktop_user.clone());
+                host.config.desktop_session_preference = Some(selection.preference.clone());
+                host.config.desktop_session_native_selector = None;
+                persisted_desktop_action = Some(selection.action(&host.alias));
+            }
+            report = if tailscale_serve_setup {
+                tailscale_serve::configure(
+                    &host.alias,
+                    &host.config,
+                    &daemon_path_overrides,
+                    false,
+                    &setup_mode,
+                )
+                .map_err(failure)?
+            } else {
+                run_host_setup_if_required(
+                    host_setup_required,
+                    || {
+                        report.dry_run = false;
+                        report
+                    },
+                    || {
+                        transport
+                            .as_ref()
+                            .expect("Host-owned setup transport is present")
+                            .setup(
+                                false,
+                                setup_mode_selection,
+                                host_setup_components,
+                                daemon_path_overrides,
+                            )
+                    },
+                )
+                .map_err(failure)?
+            };
         }
 
         if provider_auth_setup
@@ -2584,6 +2653,7 @@ fn run_setup(
                         host.alias
                     ));
                     report.mutated = true;
+                    report.changed = true;
                     if report.status == "planned" {
                         report.status = "applied".to_string();
                     }
@@ -2602,6 +2672,7 @@ fn run_setup(
         if let Some(action) = persisted_provider_auth_action {
             report.applied_actions.push(action);
             report.mutated = true;
+            report.changed = true;
             if report.status == "planned" {
                 report.status = "applied".to_string();
             }
@@ -2612,6 +2683,7 @@ fn run_setup(
             }
             report.applied_actions.push(action);
             report.mutated = true;
+            report.changed = true;
             if report.status == "planned" {
                 report.status = "applied".to_string();
             }
@@ -2622,10 +2694,11 @@ fn run_setup(
                 "discovered and explicitly trusted the reachable Host Identity".to_string(),
             );
             report.mutated = true;
+            report.changed = true;
         }
     }
 
-    if !command.dry_run && report.required_input.is_empty() && !command.no_input && !json {
+    if prompted_for_consent && !json {
         cliclack::outro("Satelle setup produced a readiness plan").map_err(|source| {
             failure(SatelleError {
                 code: ErrorCode::InvalidUsage,
@@ -2658,13 +2731,12 @@ fn run_setup(
     }
 }
 
-fn trust_first_ssh_host_during_setup(
+fn inspect_first_ssh_host_during_setup(
     command: &SetupCommand,
-    json: bool,
-    user_config_path: &Path,
+    consent_granted: bool,
     daemon_path_overrides: &DaemonPathOverrides,
-    host: &mut SelectedHost,
-) -> Result<Option<SshHostDiscovery>, CliFailure> {
+    host: &SelectedHost,
+) -> Result<SshHostDiscovery, CliFailure> {
     let discovery = discover_ssh_host(host, daemon_path_overrides).map_err(failure)?;
     let observed_identity = &discovery.identity;
     HostIdentityRef::new(observed_identity.clone()).map_err(|_| {
@@ -2681,11 +2753,13 @@ fn trust_first_ssh_host_during_setup(
         return Err(failure(SatelleError::host_identity_mismatch(&host.alias)));
     }
     if host.config.expected_host_id.as_deref() == Some(observed_identity.as_str()) {
-        return Ok(Some(discovery));
+        return Ok(discovery);
     }
 
-    let noninteractive = command.no_input || json || !io::stdin().is_terminal();
-    if noninteractive && (!command.no_input || !command.yes || command.expected_host_id.is_none()) {
+    let noninteractive = command.no_input || !io::stdin().is_terminal();
+    if noninteractive
+        && (!command.no_input || !consent_granted || command.expected_host_id.is_none())
+    {
         return Err(failure(SatelleError::invalid_usage(
             "noninteractive SSH Host trust requires --no-input --yes --expected-host-id <exact-id>",
         )));
@@ -2712,22 +2786,9 @@ fn trust_first_ssh_host_during_setup(
                 .as_deref()
                 .unwrap_or("not configured")
         );
-        let confirmed = cliclack::confirm("Trust this Host Identity?")
-            .initial_value(false)
-            .interact()
-            .map_err(|error| {
-                failure(SatelleError::invalid_usage(format!(
-                    "could not read Host trust confirmation: {error}"
-                )))
-            })?;
-        if !confirmed {
-            return Ok(None);
-        }
     }
 
-    persist_host_identity(user_config_path, &host.alias, observed_identity).map_err(failure)?;
-    host.config.expected_host_id = Some(observed_identity.clone());
-    Ok(Some(discovery))
+    Ok(discovery)
 }
 
 fn accept_setup_provider_auth_validation(
@@ -7944,7 +8005,7 @@ fn print_setup_human(report: &SetupReport) {
     println!("Service persistent: {}", report.service_persistent);
     println!("Service scope: {}", report.service_scope);
     println!("Components: {}", report.setup_components.join(", "));
-    println!("Mutated: {}", report.mutated);
+    println!("Changed: {}", report.changed);
     println!(
         "Native Computer Use readiness: {}",
         report.native_computer_use_readiness
