@@ -79,7 +79,7 @@ async fn protocol_version_gate_is_exact_sanitized_and_precedes_mutation_work() {
     // exposed. Send this case at the wire layer because reqwest deliberately
     // prevents callers from constructing padded header values.
     let whitespace_request = format!(
-        "POST /v1/sessions HTTP/1.1\r\nHost: localhost\r\nAuthorization: {}\r\nSatelle-Expected-Host-Identity: {}\r\nSatelle-Request-Id: {}\r\nSatelle-Protocol-Version:   8 \r\nIdempotency-Key:\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        "POST /v1/sessions HTTP/1.1\r\nHost: localhost\r\nAuthorization: {}\r\nSatelle-Expected-Host-Identity: {}\r\nSatelle-Request-Id: {}\r\nSatelle-Protocol-Version:   9 \r\nIdempotency-Key:\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
         bearer(&running.token),
         running.host_identity,
         RequestId::new(),
