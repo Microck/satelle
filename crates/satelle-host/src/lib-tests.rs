@@ -1247,10 +1247,12 @@ fn provider_descriptor_validation_resolves_only_during_target_host_refresh() {
             LOCAL_DEMO_HOST,
             "review",
             "openai",
-            satelle_core::ProviderAuthValidationMode::Cached,
-            false,
-            false,
-            false,
+            crate::ProviderDescriptorValidationOptions::new(
+                satelle_core::ProviderAuthValidationMode::Cached,
+                false,
+                false,
+                false,
+            ),
         )
         .expect("cached validation remains observation-only");
     assert_eq!(
@@ -1271,10 +1273,12 @@ fn provider_descriptor_validation_resolves_only_during_target_host_refresh() {
             LOCAL_DEMO_HOST,
             "review",
             "openai",
-            satelle_core::ProviderAuthValidationMode::RefreshProviderSmoke,
-            false,
-            false,
-            false,
+            crate::ProviderDescriptorValidationOptions::new(
+                satelle_core::ProviderAuthValidationMode::RefreshProviderSmoke,
+                false,
+                false,
+                false,
+            ),
         )
         .expect("live validation resolves at the target Host");
     assert_eq!(
@@ -1295,10 +1299,12 @@ fn provider_descriptor_validation_resolves_only_during_target_host_refresh() {
             LOCAL_DEMO_HOST,
             "review",
             "openai",
-            satelle_core::ProviderAuthValidationMode::Cached,
-            false,
-            false,
-            false,
+            crate::ProviderDescriptorValidationOptions::new(
+                satelle_core::ProviderAuthValidationMode::Cached,
+                false,
+                false,
+                false,
+            ),
         )
         .expect("cached validation remains deferred after a live pass");
     assert_eq!(
@@ -1316,10 +1322,12 @@ fn provider_descriptor_validation_resolves_only_during_target_host_refresh() {
             LOCAL_DEMO_HOST,
             "review",
             "openai",
-            satelle_core::ProviderAuthValidationMode::RefreshProviderSmoke,
-            false,
-            false,
-            false,
+            crate::ProviderDescriptorValidationOptions::new(
+                satelle_core::ProviderAuthValidationMode::RefreshProviderSmoke,
+                false,
+                false,
+                false,
+            ),
         )
         .expect("live validation reports a closed unresolved outcome");
     assert_eq!(
@@ -1342,10 +1350,12 @@ fn provider_descriptor_validation_resolves_only_during_target_host_refresh() {
             LOCAL_DEMO_HOST,
             "review",
             "openai",
-            satelle_core::ProviderAuthValidationMode::Cached,
-            false,
-            false,
-            false,
+            crate::ProviderDescriptorValidationOptions::new(
+                satelle_core::ProviderAuthValidationMode::Cached,
+                false,
+                false,
+                false,
+            ),
         )
         .expect("cached validation remains deferred after a live failure");
     assert_eq!(
@@ -1405,10 +1415,12 @@ fn failed_upstream_validation_returns_only_the_closed_smoke_failed_outcome() {
             LOCAL_DEMO_HOST,
             "review",
             "openai",
-            satelle_core::ProviderAuthValidationMode::RefreshProviderSmoke,
-            false,
-            false,
-            false,
+            crate::ProviderDescriptorValidationOptions::new(
+                satelle_core::ProviderAuthValidationMode::RefreshProviderSmoke,
+                false,
+                false,
+                false,
+            ),
         )
         .expect("upstream smoke failure must become a closed validation outcome");
     assert_eq!(
@@ -1524,10 +1536,12 @@ fn named_missing_provider_descriptor_remains_observable_to_cached_validation() {
             LOCAL_DEMO_HOST,
             "review",
             "openai",
-            satelle_core::ProviderAuthValidationMode::Cached,
-            false,
-            false,
-            false,
+            crate::ProviderDescriptorValidationOptions::new(
+                satelle_core::ProviderAuthValidationMode::Cached,
+                false,
+                false,
+                false,
+            ),
         )
         .expect("cached validation must classify the missing descriptor");
     assert_eq!(
@@ -1551,10 +1565,12 @@ fn provider_binding_without_auth_source_is_resolved_by_cached_validation() {
             LOCAL_DEMO_HOST,
             "review",
             "openai",
-            satelle_core::ProviderAuthValidationMode::Cached,
-            false,
-            false,
-            false,
+            crate::ProviderDescriptorValidationOptions::new(
+                satelle_core::ProviderAuthValidationMode::Cached,
+                false,
+                false,
+                false,
+            ),
         )
         .expect("cached validation must accept a binding that requires no secret");
     assert_eq!(
@@ -1579,10 +1595,12 @@ fn provider_binding_without_auth_source_runs_live_refresh_validation() {
             LOCAL_DEMO_HOST,
             "review",
             "openai",
-            satelle_core::ProviderAuthValidationMode::RefreshProviderSmoke,
-            false,
-            false,
-            false,
+            crate::ProviderDescriptorValidationOptions::new(
+                satelle_core::ProviderAuthValidationMode::RefreshProviderSmoke,
+                false,
+                false,
+                false,
+            ),
         )
         .expect("refresh validation must run the live provider smoke");
     assert_eq!(

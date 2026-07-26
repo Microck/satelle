@@ -764,10 +764,7 @@ impl HostService {
         host: &str,
         model_alias: &str,
         provider_alias: &str,
-        mode: ProviderAuthValidationMode,
-        model_from_project: bool,
-        provider_from_project: bool,
-        experimental_provider_computer_use: bool,
+        options: crate::ProviderDescriptorValidationOptions,
         authority: &MutationAuthority,
     ) -> Result<PublicProviderDescriptorValidation, SatelleError> {
         let canonical_payload = canonical_payload(
@@ -776,10 +773,10 @@ impl HostService {
                 host,
                 model_alias,
                 provider_alias,
-                mode,
-                model_from_project,
-                provider_from_project,
-                experimental_provider_computer_use,
+                mode: options.mode(),
+                model_from_project: options.model_from_project(),
+                provider_from_project: options.provider_from_project(),
+                experimental_provider_computer_use: options.experimental_provider_computer_use(),
             },
             PROVIDER_DESCRIPTOR_VALIDATION_DIGEST_SCHEMA_VERSION,
         )?;
@@ -797,22 +794,15 @@ impl HostService {
         {
             return Ok(replay);
         }
-        let validation = match self.validate_provider_descriptor(
-            host,
-            model_alias,
-            provider_alias,
-            mode,
-            model_from_project,
-            provider_from_project,
-            experimental_provider_computer_use,
-        ) {
-            Ok(validation) => validation,
-            Err(error) => {
-                self.runtime
-                    .fail_provider_descriptor_validation(&identity, &error)?;
-                return Err(error);
-            }
-        };
+        let validation =
+            match self.validate_provider_descriptor(host, model_alias, provider_alias, options) {
+                Ok(validation) => validation,
+                Err(error) => {
+                    self.runtime
+                        .fail_provider_descriptor_validation(&identity, &error)?;
+                    return Err(error);
+                }
+            };
         let public_validation = PublicProviderDescriptorValidation::from(&validation);
         self.runtime
             .complete_provider_descriptor_validation(&identity, &public_validation)?;

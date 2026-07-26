@@ -49,20 +49,19 @@ pub(super) async fn validate_provider_descriptor(
     Path((provider_alias, model_alias)): Path<(String, String)>,
     ApiJson(request): ApiJson<ProviderDescriptorValidationRequest>,
 ) -> Response {
-    let mode = request.mode();
-    let model_from_project = request.model_from_project();
-    let provider_from_project = request.provider_from_project();
-    let experimental_provider_computer_use = request.experimental_provider_computer_use();
+    let options = satelle_host::ProviderDescriptorValidationOptions::new(
+        request.mode(),
+        request.model_from_project(),
+        request.provider_from_project(),
+        request.experimental_provider_computer_use(),
+    );
     let service = Arc::clone(&state.service);
     let validation = match tokio::task::spawn_blocking(move || {
         service.validate_provider_descriptor_idempotent(
             satelle_core::LOCAL_DEMO_HOST,
             &model_alias,
             &provider_alias,
-            mode,
-            model_from_project,
-            provider_from_project,
-            experimental_provider_computer_use,
+            options,
             &authority,
         )
     })

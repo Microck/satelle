@@ -583,10 +583,12 @@ impl TransportClient for LocalTransport {
             &self.alias,
             model_alias,
             provider_alias,
-            mode,
-            model_alias_from_project,
-            provider_alias_from_project,
-            experimental_provider_computer_use,
+            satelle_host::ProviderDescriptorValidationOptions::new(
+                mode,
+                model_alias_from_project,
+                provider_alias_from_project,
+                experimental_provider_computer_use,
+            ),
         )?;
         Ok(ProviderDescriptorValidationReport {
             resolved_binding: satelle_core::PublicResolvedProviderBinding::from(

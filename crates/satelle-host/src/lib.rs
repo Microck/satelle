@@ -78,6 +78,50 @@ pub use storage::{
     SetupRepairPostcondition, SetupRepairProbe, SetupRunPlan, SetupRunRecord, SetupRunStatus,
 };
 
+/// Behavior-changing inputs for one provider descriptor validation.
+///
+/// Keeping these values together makes the runtime validation and its
+/// idempotency identity consume the same request contract.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ProviderDescriptorValidationOptions {
+    mode: satelle_core::ProviderAuthValidationMode,
+    model_from_project: bool,
+    provider_from_project: bool,
+    experimental_provider_computer_use: bool,
+}
+
+impl ProviderDescriptorValidationOptions {
+    pub const fn new(
+        mode: satelle_core::ProviderAuthValidationMode,
+        model_from_project: bool,
+        provider_from_project: bool,
+        experimental_provider_computer_use: bool,
+    ) -> Self {
+        Self {
+            mode,
+            model_from_project,
+            provider_from_project,
+            experimental_provider_computer_use,
+        }
+    }
+
+    pub const fn mode(self) -> satelle_core::ProviderAuthValidationMode {
+        self.mode
+    }
+
+    pub const fn model_from_project(self) -> bool {
+        self.model_from_project
+    }
+
+    pub const fn provider_from_project(self) -> bool {
+        self.provider_from_project
+    }
+
+    pub const fn experimental_provider_computer_use(self) -> bool {
+        self.experimental_provider_computer_use
+    }
+}
+
 /// Operation-specific observer used to reconcile an interrupted setup action.
 ///
 /// Returning `Ok(true)` verifies the action's postcondition, `Ok(false)`
@@ -1557,15 +1601,13 @@ impl HostService {
         host: &str,
         model_alias: &str,
         provider_alias: &str,
-        mode: satelle_core::ProviderAuthValidationMode,
-        model_from_project: bool,
-        provider_from_project: bool,
-        experimental_provider_computer_use: bool,
+        options: ProviderDescriptorValidationOptions,
     ) -> Result<ProviderDescriptorValidation, SatelleError> {
         use satelle_core::{
             ProviderAuthObservationSource, ProviderAuthValidationMode,
             ProviderAuthValidationOutcome, ProviderAuthValidationResult,
         };
+        let mode = options.mode();
 
         let intent = if model_alias == "codex-default" && provider_alias == "codex-default" {
             ProviderComputerUseIntent::new(
@@ -1588,8 +1630,11 @@ impl HostService {
                 matches!(mode, ProviderAuthValidationMode::RefreshProviderSmoke),
             )
         }
-        .with_project_selection_provenance(model_from_project, provider_from_project)
-        .with_experimental_provider_computer_use(experimental_provider_computer_use);
+        .with_project_selection_provenance(
+            options.model_from_project(),
+            options.provider_from_project(),
+        )
+        .with_experimental_provider_computer_use(options.experimental_provider_computer_use());
         let (resolved_binding, deferred_outcome, deferred_source) =
             match self.resolve_provider_binding(host, &intent)? {
                 ProviderBindingResolution::Ready(binding) => {
