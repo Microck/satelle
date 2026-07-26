@@ -33,7 +33,7 @@ use satelle_transport::{
     DaemonClientError, DaemonEventClient, DaemonServer, DaemonServerConfig, DaemonTlsConfig,
     DaemonTlsConfigError, DaemonTlsReloadError, DurableTokenActivationResponse,
     DurableTokenIssuanceResponse, EventSubscription, HostDesktopSessionsResponse,
-    HostStatusResponse, LiveResponse, LogsPageResponse, PROTOCOL_VERSION, RequestId, TrustedProxy,
+    HostStatusResponse, LiveResponse, LogsPageResponse, RequestId, TrustedProxy,
 };
 use serde_json::Value;
 use std::cell::RefCell;
@@ -1642,7 +1642,7 @@ async fn bootstrap_maintenance_routes_enforce_the_mutation_contract_before_ledge
         ),
         (
             "missing-idempotency",
-            Some(PROTOCOL_VERSION),
+            Some("9"),
             None,
             false,
             false,
@@ -1651,7 +1651,7 @@ async fn bootstrap_maintenance_routes_enforce_the_mutation_contract_before_ledge
         ),
         (
             "query",
-            Some(PROTOCOL_VERSION),
+            Some("9"),
             Some("query-key"),
             true,
             false,
@@ -1660,7 +1660,7 @@ async fn bootstrap_maintenance_routes_enforce_the_mutation_contract_before_ledge
         ),
         (
             "cookie",
-            Some(PROTOCOL_VERSION),
+            Some("9"),
             Some("cookie-key"),
             false,
             true,
@@ -1773,7 +1773,7 @@ async fn bootstrap_maintenance_routes_enforce_the_mutation_contract_before_ledge
         ),
         (
             "missing-idempotency",
-            Some(PROTOCOL_VERSION),
+            Some("9"),
             None,
             false,
             false,
@@ -1782,7 +1782,7 @@ async fn bootstrap_maintenance_routes_enforce_the_mutation_contract_before_ledge
         ),
         (
             "query",
-            Some(PROTOCOL_VERSION),
+            Some("9"),
             Some("complete-query-key"),
             true,
             false,
@@ -1791,7 +1791,7 @@ async fn bootstrap_maintenance_routes_enforce_the_mutation_contract_before_ledge
         ),
         (
             "cookie",
-            Some(PROTOCOL_VERSION),
+            Some("9"),
             Some("complete-cookie-key"),
             false,
             true,
