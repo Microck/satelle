@@ -590,6 +590,16 @@ profile = "review"
     let denied = parse_json(&denied.stderr);
     assert_eq!(denied["code"], "project-provider-selection-not-allowed");
 
+    let denied_all = fixture
+        .command()
+        .args(["config", "check", "--all", "--json"])
+        .assert()
+        .code(66)
+        .get_output()
+        .clone();
+    let denied_all = parse_json(&denied_all.stderr);
+    assert_eq!(denied_all["code"], "project-provider-selection-not-allowed");
+
     fixture
         .command()
         .args(["--profile", "review", "config", "check", "--json"])

@@ -1712,6 +1712,8 @@ pub struct ConfigCheckContext {
     pub host: String,
     pub profile: Option<String>,
     pub source: String,
+    #[serde(skip)]
+    pub profile_source: Option<profiles::ProfileSelectionSource>,
 }
 
 impl ResolvedConfig {
@@ -1777,6 +1779,7 @@ impl ResolvedConfig {
                 host: selected_host,
                 profile: selected_profile,
                 source: source.to_string(),
+                profile_source: self.selected_profile.as_ref().map(|profile| profile.source),
             }]);
         }
 
@@ -1784,6 +1787,7 @@ impl ResolvedConfig {
             host: selected_host,
             profile: selected_profile,
             source: "default_context".to_string(),
+            profile_source: self.selected_profile.as_ref().map(|profile| profile.source),
         }];
 
         contexts.extend(
@@ -1794,6 +1798,7 @@ impl ResolvedConfig {
                     host: host.clone(),
                     profile: None,
                     source: "configured_host".to_string(),
+                    profile_source: None,
                 }),
         );
 
@@ -1812,6 +1817,7 @@ impl ResolvedConfig {
                 host: host.to_string(),
                 profile: Some(profile_name.clone()),
                 source: "configured_profile".to_string(),
+                profile_source: Some(profiles::ProfileSelectionSource::CliFlag),
             });
         }
 
@@ -1853,6 +1859,7 @@ impl ResolvedConfig {
                 host: host.to_string(),
                 profile: Some(profile_name.clone()),
                 source: "project_defaults".to_string(),
+                profile_source: Some(profiles::ProfileSelectionSource::ProjectConfig),
             });
         }
 
@@ -1880,17 +1887,34 @@ pub fn load_user_api_rate_limits(user_config_path: &Path) -> Result<ApiRateLimit
 }
 
 pub fn load_config(cwd: &Path, flag_profile: Option<&str>) -> Result<ResolvedConfig, SatelleError> {
-    load_config_with_profile_selection(cwd, flag_profile, true)
+    load_config_with_profile_selection(cwd, flag_profile, true, None)
 }
 
 pub fn load_config_without_profile(cwd: &Path) -> Result<ResolvedConfig, SatelleError> {
-    load_config_with_profile_selection(cwd, None, false)
+    load_config_with_profile_selection(cwd, None, false, None)
+}
+
+pub fn load_config_for_profile(
+    cwd: &Path,
+    profile: &str,
+    source: profiles::ProfileSelectionSource,
+) -> Result<ResolvedConfig, SatelleError> {
+    load_config_with_profile_selection(
+        cwd,
+        None,
+        true,
+        Some(profiles::SelectedProfile {
+            name: profile.to_string(),
+            source,
+        }),
+    )
 }
 
 fn load_config_with_profile_selection(
     cwd: &Path,
     flag_profile: Option<&str>,
     select_profile: bool,
+    selected_profile_override: Option<profiles::SelectedProfile>,
 ) -> Result<ResolvedConfig, SatelleError> {
     let paths = resolve_path_set(cwd)?;
     let user_config_path = paths.config_file;
@@ -1957,19 +1981,21 @@ fn load_config_with_profile_selection(
         Some((host.to_string(), profile_name.to_string()))
     });
 
-    let selected_profile = select_profile
-        .then(|| {
-            profiles::select_profile(
-                flag_profile,
-                user_config
-                    .as_ref()
-                    .and_then(|config| config.default_profile.as_deref()),
-                project_config
-                    .as_ref()
-                    .and_then(|config| config.default_profile.as_deref()),
-            )
-        })
-        .flatten();
+    let selected_profile = selected_profile_override.or_else(|| {
+        select_profile
+            .then(|| {
+                profiles::select_profile(
+                    flag_profile,
+                    user_config
+                        .as_ref()
+                        .and_then(|config| config.default_profile.as_deref()),
+                    project_config
+                        .as_ref()
+                        .and_then(|config| config.default_profile.as_deref()),
+                )
+            })
+            .flatten()
+    });
     let profile_overlay = if let Some(selected) = &selected_profile {
         let profile =
             selected_profile_definition(user_config.as_ref(), &user_config_path, selected)?;

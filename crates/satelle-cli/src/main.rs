@@ -41,9 +41,9 @@ use satelle_core::{
     HostConfig, HostSessionsReport, LOCAL_DEMO_HOST, OwnerOnlyDirectory, PRODUCT_NAME,
     ProfileField, ProviderSecretSource, RELAY_ROSE, ResolvedConfig, SUCCESS_GREEN, SatelleError,
     SatelleEvent, SatelleEventBody, SecureFileError, SessionId, SetupMode, SetupReadinessSummary,
-    SetupReport, SetupRequiredInput, SetupSchemaVersion, load_config, load_config_without_profile,
-    load_user_api_rate_limits, open_or_create_owner_only_directory, open_or_create_owner_only_file,
-    open_owner_only_directory, read_owner_controlled_config_file,
+    SetupReport, SetupRequiredInput, SetupSchemaVersion, load_config, load_config_for_profile,
+    load_config_without_profile, load_user_api_rate_limits, open_or_create_owner_only_directory,
+    open_or_create_owner_only_file, open_owner_only_directory, read_owner_controlled_config_file,
     read_owner_only_secret_config_file, resolve_desktop_session, resolve_path_set, utc_now,
 };
 use satelle_host::{
@@ -121,6 +121,7 @@ struct Cli {
 struct ConfigContext<'a> {
     flag_profile: Option<&'a str>,
     select_profile: bool,
+    profile_source: Option<satelle_core::profiles::ProfileSelectionSource>,
     resolved: Arc<OnceLock<Result<ResolvedConfig, SatelleError>>>,
 }
 
@@ -141,6 +142,19 @@ impl<'a> ConfigContext<'a> {
         Self {
             flag_profile,
             select_profile: true,
+            profile_source: None,
+            resolved: Arc::new(OnceLock::new()),
+        }
+    }
+
+    fn for_profile(
+        profile: &'a str,
+        source: satelle_core::profiles::ProfileSelectionSource,
+    ) -> Self {
+        Self {
+            flag_profile: Some(profile),
+            select_profile: true,
+            profile_source: Some(source),
             resolved: Arc::new(OnceLock::new()),
         }
     }
@@ -149,6 +163,7 @@ impl<'a> ConfigContext<'a> {
         Self {
             flag_profile: None,
             select_profile: false,
+            profile_source: None,
             resolved: Arc::new(OnceLock::new()),
         }
     }
@@ -156,7 +171,14 @@ impl<'a> ConfigContext<'a> {
     fn load(&self) -> Result<&ResolvedConfig, CliFailure> {
         let resolved = self.resolved.get_or_init(|| {
             let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-            if self.select_profile {
+            if let Some(source) = self.profile_source {
+                load_config_for_profile(
+                    &cwd,
+                    self.flag_profile
+                        .expect("an exact profile source always has a profile"),
+                    source,
+                )
+            } else if self.select_profile {
                 load_config(&cwd, self.flag_profile)
             } else {
                 load_config_without_profile(&cwd)
@@ -1387,6 +1409,7 @@ mod mcp_install_cli_tests {
         let config = ConfigContext {
             flag_profile: None,
             select_profile: true,
+            profile_source: None,
             resolved,
         };
         // The invalid target selection proves the installer reached its own

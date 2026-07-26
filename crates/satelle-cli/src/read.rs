@@ -29,7 +29,12 @@ pub(super) fn config_check_report(
         .map(|context| -> Result<Value, CliFailure> {
             let context_config = context.profile.as_deref().map_or_else(
                 ConfigContext::without_profile,
-                |profile| ConfigContext::new(Some(profile)),
+                |profile| {
+                    context.profile_source.map_or_else(
+                        || ConfigContext::new(Some(profile)),
+                        |source| ConfigContext::for_profile(profile, source),
+                    )
+                },
             );
             let resolved = context_config.load()?;
             let provider_host = resolved
