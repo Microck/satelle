@@ -78,6 +78,9 @@ pub use storage::{
     SetupRepairPostcondition, SetupRepairProbe, SetupRunPlan, SetupRunRecord, SetupRunStatus,
 };
 
+pub(crate) const DEFAULT_MODEL_BINDING: &str = "codex-default";
+pub(crate) const DEFAULT_PROVIDER_BINDING: &str = "codex-default";
+
 /// Behavior-changing inputs for one provider descriptor validation.
 ///
 /// Keeping these values together makes the runtime validation and its
@@ -818,6 +821,14 @@ pub(crate) fn validate_provider_binding_authorization(
     {
         return Err(SatelleError::config_error(
             "provider binding authorization values must not be empty",
+            None,
+        ));
+    }
+    if authorization.requested_model_alias() == DEFAULT_MODEL_BINDING
+        && authorization.requested_provider_alias() == DEFAULT_PROVIDER_BINDING
+    {
+        return Err(SatelleError::config_error(
+            "the provider binding alias pair `codex-default/codex-default` is reserved for implicit Codex defaults",
             None,
         ));
     }
@@ -1609,32 +1620,33 @@ impl HostService {
         };
         let mode = options.mode();
 
-        let intent = if model_alias == "codex-default" && provider_alias == "codex-default" {
-            ProviderComputerUseIntent::new(
-                None,
-                None,
-                matches!(mode, ProviderAuthValidationMode::RefreshProviderSmoke),
+        let intent =
+            if model_alias == DEFAULT_MODEL_BINDING && provider_alias == DEFAULT_PROVIDER_BINDING {
+                ProviderComputerUseIntent::new(
+                    None,
+                    None,
+                    matches!(mode, ProviderAuthValidationMode::RefreshProviderSmoke),
+                )
+            } else {
+                ProviderComputerUseIntent::new(
+                    Some(
+                        satelle_core::session::EffectiveModelRef::new(model_alias).map_err(
+                            |_| SatelleError::config_error("the model alias is invalid", None),
+                        )?,
+                    ),
+                    Some(
+                        satelle_core::session::ProviderBindingRef::new(provider_alias).map_err(
+                            |_| SatelleError::config_error("the provider alias is invalid", None),
+                        )?,
+                    ),
+                    matches!(mode, ProviderAuthValidationMode::RefreshProviderSmoke),
+                )
+            }
+            .with_project_selection_provenance(
+                options.model_from_project(),
+                options.provider_from_project(),
             )
-        } else {
-            ProviderComputerUseIntent::new(
-                Some(
-                    satelle_core::session::EffectiveModelRef::new(model_alias).map_err(|_| {
-                        SatelleError::config_error("the model alias is invalid", None)
-                    })?,
-                ),
-                Some(
-                    satelle_core::session::ProviderBindingRef::new(provider_alias).map_err(
-                        |_| SatelleError::config_error("the provider alias is invalid", None),
-                    )?,
-                ),
-                matches!(mode, ProviderAuthValidationMode::RefreshProviderSmoke),
-            )
-        }
-        .with_project_selection_provenance(
-            options.model_from_project(),
-            options.provider_from_project(),
-        )
-        .with_experimental_provider_computer_use(options.experimental_provider_computer_use());
+            .with_experimental_provider_computer_use(options.experimental_provider_computer_use());
         let (resolved_binding, deferred_outcome, deferred_source) =
             match self.resolve_provider_binding(host, &intent)? {
                 ProviderBindingResolution::Ready(binding) => {

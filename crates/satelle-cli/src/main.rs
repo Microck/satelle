@@ -4226,7 +4226,7 @@ fn provider_selection_error(
 
 fn doctor_provider_intent(
     config: &ResolvedConfig,
-    _host_config: &HostConfig,
+    host_config: &HostConfig,
     refresh: bool,
     probe_timeout: Option<std::time::Duration>,
 ) -> Result<ProviderComputerUseIntent, SatelleError> {
@@ -4244,11 +4244,18 @@ fn doctor_provider_intent(
         .map(ProviderBindingRef::new)
         .transpose()
         .map_err(|_| SatelleError::invalid_usage("the selected provider alias is invalid"))?;
+    let experimental_provider_computer_use = resolve_experimental_provider_computer_use(
+        false,
+        config.config.provider_alias.as_deref(),
+        host_config,
+        config,
+    );
     let intent = ProviderComputerUseIntent::new(model, provider, refresh)
         .with_project_selection_provenance(
             config.model_alias_from_project(),
             config.provider_alias_from_project(),
-        );
+        )
+        .with_experimental_provider_computer_use(experimental_provider_computer_use);
     Ok(match probe_timeout {
         Some(timeout) => intent.with_provider_smoke_timeout(timeout),
         None => intent,

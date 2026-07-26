@@ -6,7 +6,6 @@ use super::adapter::{
     ReadinessCacheKey, ReadinessEvidence, ReadinessObservationState, ReadinessProbeDriver,
     ReadinessSource, RecoveryObservation,
 };
-use crate::READINESS_CANCELLATION_GRACE;
 use crate::codex_session::{
     CodexApprovalPolicy, CodexSandboxPolicy, CodexSessionControl, CodexSessionError,
     CodexSessionFailure, CodexSessionRequest, CodexSessionTerminal, CodexTurnReadRequest,
@@ -17,6 +16,7 @@ use crate::provider_auth::{
     ProviderAuthResolutionError, ProviderHostPlatform, ResolvedProviderSecret,
     resolve_provider_secret,
 };
+use crate::{DEFAULT_MODEL_BINDING, DEFAULT_PROVIDER_BINDING, READINESS_CANCELLATION_GRACE};
 use command_group::{CommandGroup, GroupChild};
 use satelle_core::session::{
     ApprovalPolicy, DesktopBindingRef, DesktopTarget, EffectiveModelRef, ExecutionPolicy,
@@ -37,8 +37,6 @@ use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 use time::format_description::well_known::Rfc3339;
 
-const DEFAULT_MODEL_BINDING: &str = "codex-default";
-const DEFAULT_PROVIDER_BINDING: &str = "codex-default";
 const NATIVE_ADAPTER: &str = "codex-native-computer-use";
 const PROVIDER_CHILD_ID: &str = "satelle_runtime";
 

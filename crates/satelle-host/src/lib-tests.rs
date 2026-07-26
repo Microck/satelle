@@ -1099,6 +1099,37 @@ fn endpointless_auth_sources_are_reserved_for_builtin_openai() {
 }
 
 #[test]
+fn implicit_codex_default_alias_pair_is_reserved_from_provider_authorization() {
+    let reserved = satelle_core::ProviderBindingAuthorization::new(
+        DEFAULT_MODEL_BINDING,
+        DEFAULT_PROVIDER_BINDING,
+        "gpt-test",
+        "openai",
+    );
+    let error = validate_provider_binding_authorization(&reserved)
+        .expect_err("the implicit Codex default pair must not name an exact binding");
+    assert_eq!(error.code, satelle_core::ErrorCode::ConfigError);
+    assert!(
+        error
+            .message
+            .contains("reserved for implicit Codex defaults")
+    );
+
+    for (model_alias, provider_alias) in [
+        (DEFAULT_MODEL_BINDING, "openai"),
+        ("review", DEFAULT_PROVIDER_BINDING),
+    ] {
+        validate_provider_binding_authorization(&satelle_core::ProviderBindingAuthorization::new(
+            model_alias,
+            provider_alias,
+            "gpt-test",
+            "openai",
+        ))
+        .expect("only the exact implicit default pair is reserved");
+    }
+}
+
+#[test]
 fn production_adapter_accepts_host_authorized_binding_without_resolving_auth() {
     let state = crate::TestStateDir::new().expect("temporary state directory");
     let host_auth = satelle_core::ProviderSecretSource::Environment {
