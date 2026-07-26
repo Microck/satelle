@@ -3876,6 +3876,7 @@ impl ErrorCode {
             | Self::ProjectMutationConsentNotAllowed
             | Self::ProjectHostBindingNotAllowed
             | Self::ProjectHostSelectionNotAllowed
+            | Self::ProjectProviderSelectionNotAllowed
             | Self::ProjectSecretSourceNotAllowed
             | Self::ProjectCredentialHelperNotAllowed
             | Self::UnsupportedSecretSourceKind
