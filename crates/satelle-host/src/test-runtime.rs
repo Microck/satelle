@@ -68,6 +68,40 @@ impl HostService {
 #[derive(Clone, Debug)]
 pub(super) struct FakeComputerUseAdapter;
 
+impl FakeComputerUseAdapter {
+    pub(super) fn readiness_contract()
+    -> Result<(DesktopBindingRef, ExecutionPolicy, crate::ReadinessCacheKey), SatelleError> {
+        let desktop_binding = DesktopBindingRef::new("local-demo-desktop-v1")
+            .map_err(|_| adapter_configuration_error("desktop binding"))?;
+        let execution_policy = ExecutionPolicy::new(
+            EffectiveModelRef::new("fake-model-v1")
+                .map_err(|_| adapter_configuration_error("model binding"))?,
+            ProviderBindingRef::new("fake-provider-v1")
+                .map_err(|_| adapter_configuration_error("provider binding"))?,
+            DesktopTarget::new(desktop_binding.clone(), "local-demo-session-v1"),
+            ApprovalPolicy::OnRequest,
+            SandboxPolicy::WorkspaceWrite,
+            TimeoutPolicy::bounded_seconds(30 * 60)
+                .map_err(|_| adapter_configuration_error("timeout policy"))?,
+            ExperimentalFeatureChoices::new(FeatureChoice::Enabled, FeatureChoice::Enabled),
+        );
+        let key = crate::ReadinessCacheKey::new(
+            "fake",
+            desktop_binding.clone(),
+            execution_policy.clone(),
+            "fake-codex-v1",
+            "fake-native-runtime-v1",
+            Some("fake-plugin-v1"),
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            crate::ReadinessObservationState::Unknown,
+            crate::ReadinessObservationState::Unknown,
+        )
+        .map_err(|_| adapter_configuration_error("readiness cache key"))?;
+        Ok((desktop_binding, execution_policy, key))
+    }
+}
+
 #[cfg(feature = "test-support")]
 #[derive(Clone, Debug)]
 pub(super) struct PendingComputerUseAdapter;
@@ -160,34 +194,8 @@ impl ComputerUseAdapter for FakeComputerUseAdapter {
         host: &str,
         provider_intent: &crate::ProviderComputerUseIntent,
     ) -> Result<AdapterReadiness, SatelleError> {
-        let desktop_binding = DesktopBindingRef::new("local-demo-desktop-v1")
-            .map_err(|_| adapter_configuration_error("desktop binding"))?;
-        let execution_policy = ExecutionPolicy::new(
-            EffectiveModelRef::new("fake-model-v1")
-                .map_err(|_| adapter_configuration_error("model binding"))?,
-            ProviderBindingRef::new("fake-provider-v1")
-                .map_err(|_| adapter_configuration_error("provider binding"))?,
-            DesktopTarget::new(desktop_binding.clone(), "local-demo-session-v1"),
-            ApprovalPolicy::OnRequest,
-            SandboxPolicy::WorkspaceWrite,
-            TimeoutPolicy::bounded_seconds(30 * 60)
-                .map_err(|_| adapter_configuration_error("timeout policy"))?,
-            ExperimentalFeatureChoices::new(FeatureChoice::Enabled, FeatureChoice::Enabled),
-        );
+        let (desktop_binding, execution_policy, readiness_key) = Self::readiness_contract()?;
         let observed_at = time::OffsetDateTime::now_utc();
-        let readiness_key = crate::ReadinessCacheKey::new(
-            "fake",
-            desktop_binding.clone(),
-            execution_policy.clone(),
-            "fake-codex-v1",
-            "fake-native-runtime-v1",
-            Some("fake-plugin-v1"),
-            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
-            crate::ReadinessObservationState::Unknown,
-            crate::ReadinessObservationState::Unknown,
-        )
-        .map_err(|_| adapter_configuration_error("readiness cache key"))?;
         let evidence = readiness_key
             .evidence(
                 format!("readiness-{}", satelle_core::SessionId::new()),

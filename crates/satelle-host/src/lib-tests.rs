@@ -105,6 +105,92 @@ impl ComputerUseAdapter for FailedProviderSmokeAdapter {
     }
 }
 
+/// Keeps phase-aware Doctor coverage isolated from the shared fake's deliberate
+/// no-cache behavior, which other admission tests use as part of their setup.
+#[derive(Clone, Copy)]
+struct DoctorRefreshAdapter;
+
+impl ComputerUseAdapter for DoctorRefreshAdapter {
+    fn resolve_provider_binding(
+        &self,
+        host: &str,
+        provider_intent: &ProviderComputerUseIntent,
+    ) -> Result<satelle_core::ResolvedProviderBinding, SatelleError> {
+        FakeComputerUseAdapter.resolve_provider_binding(host, provider_intent)
+    }
+
+    fn preflight(
+        &self,
+        host: &str,
+        provider_intent: &ProviderComputerUseIntent,
+    ) -> Result<AdapterReadiness, SatelleError> {
+        FakeComputerUseAdapter.preflight(host, provider_intent)
+    }
+
+    fn readiness_cache_key(
+        &self,
+        _host: &str,
+        _provider_intent: &ProviderComputerUseIntent,
+    ) -> Result<Option<ReadinessCacheKey>, SatelleError> {
+        Ok(Some(FakeComputerUseAdapter::readiness_contract()?.2))
+    }
+
+    fn execute(&self, request: ExecuteRequest<'_>) -> Result<ExecuteResult, SatelleError> {
+        FakeComputerUseAdapter.execute(request)
+    }
+
+    fn observe_stop(&self, subject: AdapterSubject<'_>) -> Result<StopObservation, SatelleError> {
+        FakeComputerUseAdapter.observe_stop(subject)
+    }
+
+    fn observe_recovery(
+        &self,
+        subject: AdapterSubject<'_>,
+    ) -> Result<RecoveryObservation, SatelleError> {
+        FakeComputerUseAdapter.observe_recovery(subject)
+    }
+}
+
+impl crate::runtime::ReadinessProbeDriver for DoctorRefreshAdapter {
+    fn run_native_probe(
+        &self,
+        key: &ReadinessCacheKey,
+        _cancellation: &AdmissionCancellation,
+        _persist_thread_ref: &mut dyn FnMut(&str) -> Result<(), ()>,
+        _persist_turn_ref: &mut dyn FnMut(&str) -> Result<(), ()>,
+    ) -> crate::runtime::NativeProbeResult {
+        let observed_at = time::OffsetDateTime::now_utc();
+        crate::runtime::NativeProbeResult::Passed(
+            key.evidence(
+                format!("native-probe-{}", satelle_core::SessionId::new()),
+                observed_at,
+                observed_at + time::Duration::minutes(5),
+            )
+            .expect("validated Doctor readiness key produces valid evidence"),
+        )
+    }
+
+    fn preflight_terminal_with_provider_probe(
+        &self,
+        host: &str,
+        cached: Option<ReadinessEvidence>,
+        cached_provider: Option<ProviderSmokeResult>,
+        provider_intent: &ProviderComputerUseIntent,
+        _cancellation: &AdmissionCancellation,
+        _persist_thread_ref: &mut dyn FnMut(&str) -> Result<(), ()>,
+        _persist_turn_ref: &mut dyn FnMut(&str) -> Result<(), ()>,
+    ) -> AdapterPreflight {
+        self.preflight_terminal(host, cached, cached_provider, provider_intent)
+    }
+
+    fn observe_readiness_probe(
+        &self,
+        _subject: &crate::storage::ProbeRecoverySubject,
+    ) -> RecoveryObservation {
+        RecoveryObservation::Completed
+    }
+}
+
 #[derive(Clone)]
 struct HostBusyProviderPreflightAdapter {
     calls: Arc<std::sync::atomic::AtomicUsize>,
@@ -1101,8 +1187,21 @@ fn production_doctor_filters_requested_scopes_without_relabeling_blockers() {
 #[test]
 fn doctor_provider_refresh_updates_cache_without_admitting_prompt_work() {
     let state = crate::TestStateDir::new().expect("temporary state directory");
-    let service = HostService::local_demo_for_tests_at(state.path())
-        .expect("construct deterministic Host service");
+    let config = satelle_core::SatelleConfig::defaults().hosts[LOCAL_DEMO_HOST].clone();
+    let service = HostService {
+        runtime: RuntimeHandle::new_with_readiness_probe_driver(
+            Ok(state.path().to_path_buf()),
+            DoctorRefreshAdapter,
+            DoctorRefreshAdapter,
+        ),
+        operation_capacity: Arc::new(OperationCapacity::default()),
+        turn_execution_timeout: crate::configured_turn_execution_timeout(&config),
+        mode: HostMode::TestFake {
+            image_attachments: true,
+        },
+        bootstrap_auth: None,
+        bootstrap_maintenance: Arc::new(Mutex::new(None)),
+    };
     service
         .runtime
         .authorize_provider_binding(&satelle_core::ResolvedProviderBinding::from_authorization(
@@ -1129,7 +1228,8 @@ fn doctor_provider_refresh_updates_cache_without_admitting_prompt_work() {
                 .expect("valid provider"),
         ),
         true,
-    );
+    )
+    .with_experimental_provider_computer_use(true);
 
     let report = service
         .doctor_with_provider_intent(

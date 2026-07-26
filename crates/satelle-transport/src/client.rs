@@ -2,11 +2,12 @@ use crate::contract::{
     AdmissionCancellationResponse, ApiError, ApiErrorCode, AuthenticatedResponseContract,
     BootstrapMaintenanceResponse, CapabilitiesResponse, DurableTokenActivationResponse,
     DurableTokenConfirmationResponse, DurableTokenIssuanceResponse, HostDesktopSessionsResponse,
-    HostStatusResponse, LiveResponse, LogsPageResponse, PROTOCOL_VERSION, PROTOCOL_VERSION_HEADER,
+    HostStatusResponse, LiveResponse, LogsPageResponse, NativeReadinessInvalidationRequest,
+    NativeReadinessInvalidationResponse, PROTOCOL_VERSION, PROTOCOL_VERSION_HEADER,
     ProviderBindingAuthorizationRequest, ProviderBindingAuthorizationResponse,
     ProviderBindingDeletionResponse, ProviderDescriptorValidationRequest,
-    ProviderDescriptorValidationResponse, RequestId, SessionResponse, StopRequest, StopResponse,
-    TurnRequest,
+    ProviderDescriptorValidationResponse, RequestId, SessionResponse, SetupVerificationRequest,
+    SetupVerificationResponse, StopRequest, StopResponse, TurnRequest,
 };
 use crate::transport_tls::{
     ReqwestTrustError, TlsFailureKind, classify_tls_error, configure_reqwest_trust,
@@ -307,6 +308,29 @@ impl DaemonClient {
         let (request, request_id) = self.mutation_request(&path, idempotency_key)?;
         let request = self.provider_validation_request(request.json(validation), validation);
         self.send_authenticated(request, request_id, StatusCode::OK)
+    }
+
+    pub fn verify_setup(
+        &self,
+        verification: &SetupVerificationRequest,
+        idempotency_key: &str,
+    ) -> Result<SetupVerificationResponse, DaemonClientError> {
+        let (request, request_id) = self.mutation_request("/v1/setup/verify", idempotency_key)?;
+        self.send_authenticated(
+            self.admission_request(request.json(verification)),
+            request_id,
+            StatusCode::OK,
+        )
+    }
+
+    pub fn invalidate_native_readiness(
+        &self,
+        invalidation: &NativeReadinessInvalidationRequest,
+        idempotency_key: &str,
+    ) -> Result<NativeReadinessInvalidationResponse, DaemonClientError> {
+        let (request, request_id) =
+            self.mutation_request("/v1/setup/readiness/native/invalidate", idempotency_key)?;
+        self.send_authenticated(request.json(invalidation), request_id, StatusCode::OK)
     }
 
     pub fn complete_bootstrap_maintenance(

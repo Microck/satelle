@@ -1,9 +1,9 @@
 use super::session::ApiRequestContract;
 use super::{AuthenticatedResponseContract, RequestId, define_schema_token};
 use satelle_core::{
-    ProviderAuthObservationSource, ProviderAuthValidationMode, ProviderAuthValidationOutcome,
-    ProviderAuthValidationResult, ProviderBindingAuthorization, PublicProviderDescriptorValidation,
-    PublicResolvedProviderBinding,
+    DoctorReport, ProviderAuthObservationSource, ProviderAuthValidationMode,
+    ProviderAuthValidationOutcome, ProviderAuthValidationResult, ProviderBindingAuthorization,
+    PublicProviderDescriptorValidation, PublicResolvedProviderBinding,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -44,6 +44,19 @@ define_schema_token!(
 define_schema_token!(
     ProviderDescriptorValidationResponseSchema,
     "satelle.provider-binding-validation-response.v4"
+);
+define_schema_token!(SetupVerificationSchema, "satelle.setup-verification.v1");
+define_schema_token!(
+    SetupVerificationResponseSchema,
+    "satelle.setup-verification-response.v1"
+);
+define_schema_token!(
+    NativeReadinessInvalidationSchema,
+    "satelle.native-readiness-invalidation.v1"
+);
+define_schema_token!(
+    NativeReadinessInvalidationResponseSchema,
+    "satelle.native-readiness-invalidation-response.v1"
 );
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -175,6 +188,286 @@ fn is_false(value: &bool) -> bool {
 
 impl ApiRequestContract for ProviderDescriptorValidationRequest {
     const SCHEMA_VERSION: &'static str = ProviderDescriptorValidationSchema::TOKEN;
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct SetupVerificationRequest {
+    schema_version: SetupVerificationSchema,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    model_alias: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    provider_alias: Option<String>,
+    model_from_project: bool,
+    provider_from_project: bool,
+    experimental_provider_computer_use: bool,
+}
+
+impl<'de> Deserialize<'de> for SetupVerificationRequest {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct WireRequest {
+            schema_version: SetupVerificationSchema,
+            model_alias: Option<String>,
+            provider_alias: Option<String>,
+            model_from_project: bool,
+            provider_from_project: bool,
+            experimental_provider_computer_use: bool,
+        }
+
+        let request = WireRequest::deserialize(deserializer)?;
+        if request.model_alias.is_some() != request.provider_alias.is_some() {
+            return Err(serde::de::Error::custom(
+                "model_alias and provider_alias must be supplied together",
+            ));
+        }
+        if request.model_alias.as_deref().is_some_and(str::is_empty)
+            || request.provider_alias.as_deref().is_some_and(str::is_empty)
+        {
+            return Err(serde::de::Error::custom(
+                "model_alias and provider_alias must be non-empty",
+            ));
+        }
+
+        Ok(Self {
+            schema_version: request.schema_version,
+            model_alias: request.model_alias,
+            provider_alias: request.provider_alias,
+            model_from_project: request.model_from_project,
+            provider_from_project: request.provider_from_project,
+            experimental_provider_computer_use: request.experimental_provider_computer_use,
+        })
+    }
+}
+
+impl SetupVerificationRequest {
+    pub fn new(
+        model_alias: Option<String>,
+        provider_alias: Option<String>,
+        model_from_project: bool,
+        provider_from_project: bool,
+        experimental_provider_computer_use: bool,
+    ) -> Result<Self, &'static str> {
+        if model_alias.is_some() != provider_alias.is_some() {
+            return Err("model_alias and provider_alias must be supplied together");
+        }
+        if model_alias.as_deref().is_some_and(str::is_empty)
+            || provider_alias.as_deref().is_some_and(str::is_empty)
+        {
+            return Err("model_alias and provider_alias must be non-empty");
+        }
+        Ok(Self {
+            schema_version: SetupVerificationSchema,
+            model_alias,
+            provider_alias,
+            model_from_project,
+            provider_from_project,
+            experimental_provider_computer_use,
+        })
+    }
+
+    pub fn model_alias(&self) -> Option<&str> {
+        self.model_alias.as_deref()
+    }
+
+    pub fn provider_alias(&self) -> Option<&str> {
+        self.provider_alias.as_deref()
+    }
+
+    pub const fn model_from_project(&self) -> bool {
+        self.model_from_project
+    }
+
+    pub const fn provider_from_project(&self) -> bool {
+        self.provider_from_project
+    }
+
+    pub const fn experimental_provider_computer_use(&self) -> bool {
+        self.experimental_provider_computer_use
+    }
+}
+
+impl ApiRequestContract for SetupVerificationRequest {
+    const SCHEMA_VERSION: &'static str = SetupVerificationSchema::TOKEN;
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct NativeReadinessInvalidationRequest {
+    schema_version: NativeReadinessInvalidationSchema,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    model_alias: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    provider_alias: Option<String>,
+    model_from_project: bool,
+    provider_from_project: bool,
+    experimental_provider_computer_use: bool,
+}
+
+impl<'de> Deserialize<'de> for NativeReadinessInvalidationRequest {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct WireRequest {
+            schema_version: NativeReadinessInvalidationSchema,
+            model_alias: Option<String>,
+            provider_alias: Option<String>,
+            model_from_project: bool,
+            provider_from_project: bool,
+            experimental_provider_computer_use: bool,
+        }
+
+        let request = WireRequest::deserialize(deserializer)?;
+        if request.model_alias.is_some() != request.provider_alias.is_some() {
+            return Err(serde::de::Error::custom(
+                "model_alias and provider_alias must be supplied together",
+            ));
+        }
+        if request.model_alias.as_deref().is_some_and(str::is_empty)
+            || request.provider_alias.as_deref().is_some_and(str::is_empty)
+        {
+            return Err(serde::de::Error::custom(
+                "model_alias and provider_alias must be non-empty",
+            ));
+        }
+
+        Ok(Self {
+            schema_version: request.schema_version,
+            model_alias: request.model_alias,
+            provider_alias: request.provider_alias,
+            model_from_project: request.model_from_project,
+            provider_from_project: request.provider_from_project,
+            experimental_provider_computer_use: request.experimental_provider_computer_use,
+        })
+    }
+}
+
+impl NativeReadinessInvalidationRequest {
+    pub fn new(
+        model_alias: Option<String>,
+        provider_alias: Option<String>,
+        model_from_project: bool,
+        provider_from_project: bool,
+        experimental_provider_computer_use: bool,
+    ) -> Result<Self, &'static str> {
+        if model_alias.is_some() != provider_alias.is_some() {
+            return Err("model_alias and provider_alias must be supplied together");
+        }
+        if model_alias.as_deref().is_some_and(str::is_empty)
+            || provider_alias.as_deref().is_some_and(str::is_empty)
+        {
+            return Err("model_alias and provider_alias must be non-empty");
+        }
+        Ok(Self {
+            schema_version: NativeReadinessInvalidationSchema,
+            model_alias,
+            provider_alias,
+            model_from_project,
+            provider_from_project,
+            experimental_provider_computer_use,
+        })
+    }
+
+    pub fn model_alias(&self) -> Option<&str> {
+        self.model_alias.as_deref()
+    }
+
+    pub fn provider_alias(&self) -> Option<&str> {
+        self.provider_alias.as_deref()
+    }
+
+    pub const fn model_from_project(&self) -> bool {
+        self.model_from_project
+    }
+
+    pub const fn provider_from_project(&self) -> bool {
+        self.provider_from_project
+    }
+
+    pub const fn experimental_provider_computer_use(&self) -> bool {
+        self.experimental_provider_computer_use
+    }
+}
+
+impl ApiRequestContract for NativeReadinessInvalidationRequest {
+    const SCHEMA_VERSION: &'static str = NativeReadinessInvalidationSchema::TOKEN;
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SetupVerificationResponse {
+    schema_version: SetupVerificationResponseSchema,
+    request_id: RequestId,
+    host_identity: String,
+    verification: DoctorReport,
+}
+
+impl SetupVerificationResponse {
+    pub(crate) fn new(
+        request_id: RequestId,
+        host_identity: String,
+        verification: DoctorReport,
+    ) -> Self {
+        Self {
+            schema_version: SetupVerificationResponseSchema,
+            request_id,
+            host_identity,
+            verification,
+        }
+    }
+
+    pub fn verification(&self) -> &DoctorReport {
+        &self.verification
+    }
+}
+
+impl AuthenticatedResponseContract for SetupVerificationResponse {
+    fn request_id(&self) -> &RequestId {
+        &self.request_id
+    }
+
+    fn host_identity(&self) -> &str {
+        &self.host_identity
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct NativeReadinessInvalidationResponse {
+    schema_version: NativeReadinessInvalidationResponseSchema,
+    request_id: RequestId,
+    host_identity: String,
+    deleted: u64,
+}
+
+impl NativeReadinessInvalidationResponse {
+    pub(crate) fn new(request_id: RequestId, host_identity: String, deleted: u64) -> Self {
+        Self {
+            schema_version: NativeReadinessInvalidationResponseSchema,
+            request_id,
+            host_identity,
+            deleted,
+        }
+    }
+
+    pub const fn deleted(&self) -> u64 {
+        self.deleted
+    }
+}
+
+impl AuthenticatedResponseContract for NativeReadinessInvalidationResponse {
+    fn request_id(&self) -> &RequestId {
+        &self.request_id
+    }
+
+    fn host_identity(&self) -> &str {
+        &self.host_identity
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -627,11 +920,76 @@ mod provider_binding_contract_tests {
         });
         assert!(serde_json::from_value::<ProviderDescriptorValidationRequest>(request).is_err());
     }
+
+    #[test]
+    fn setup_verification_is_strict_and_aliases_are_paired() {
+        let request = SetupVerificationRequest::new(
+            Some("vision".to_string()),
+            Some("open_ai".to_string()),
+            true,
+            false,
+            true,
+        )
+        .unwrap();
+        assert_eq!(
+            serde_json::to_value(request).unwrap(),
+            json!({
+                "schema_version": "satelle.setup-verification.v1",
+                "model_alias": "vision",
+                "provider_alias": "open_ai",
+                "model_from_project": true,
+                "provider_from_project": false,
+                "experimental_provider_computer_use": true
+            })
+        );
+
+        for invalid in [
+            json!({
+                "schema_version": "satelle.setup-verification.v1",
+                "model_alias": "vision",
+                "model_from_project": false,
+                "provider_from_project": false,
+                "experimental_provider_computer_use": false
+            }),
+            json!({
+                "schema_version": "satelle.setup-verification.v1",
+                "model_from_project": false,
+                "provider_from_project": false,
+                "experimental_provider_computer_use": false,
+                "unexpected": true
+            }),
+        ] {
+            assert!(serde_json::from_value::<SetupVerificationRequest>(invalid).is_err());
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn native_invalidation_carries_intent_without_exposing_a_cache_key() {
+        let request = NativeReadinessInvalidationRequest::new(
+            Some("vision".to_string()),
+            Some("open_ai".to_string()),
+            true,
+            false,
+            true,
+        )
+        .unwrap();
+        assert_eq!(
+            serde_json::to_value(request).unwrap(),
+            serde_json::json!({
+                "schema_version": "satelle.native-readiness-invalidation.v1",
+                "model_alias": "vision",
+                "provider_alias": "open_ai",
+                "model_from_project": true,
+                "provider_from_project": false,
+                "experimental_provider_computer_use": true
+            })
+        );
+    }
 
     #[test]
     fn provider_binding_authorization_rejects_unknown_top_level_fields() {

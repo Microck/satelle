@@ -392,6 +392,7 @@ fn report(host_alias: &str, setup_mode: &str, dry_run: bool, changed: bool) -> S
         dry_run,
         status: if dry_run { "planned" } else { "configured" }.to_string(),
         cancellation_reason: None,
+        verification: None,
         setup_mode: setup_mode.to_string(),
         service_persistent: false,
         service_scope: "remote_user".to_string(),

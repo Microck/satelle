@@ -11,7 +11,9 @@ CREATE TABLE idempotency_records_v12 (
         'destructive_maintenance',
         'provider_descriptor_validation',
         'provider_binding_authorization',
-        'provider_binding_deletion'
+        'provider_binding_deletion',
+        'setup_verification',
+        'native_readiness_invalidation'
     )),
     idempotency_key TEXT NOT NULL,
     operation_id TEXT NOT NULL,
@@ -49,7 +51,12 @@ CREATE TABLE idempotency_records_v12 (
         'v1.provider_binding_authorization.completed',
         'v1.provider_binding_authorization.failed',
         'v1.provider_binding_deletion.completed',
-        'v1.provider_binding_deletion.failed'
+        'v1.provider_binding_deletion.failed',
+        'v1.setup_verification.pending',
+        'v1.setup_verification.completed',
+        'v1.setup_verification.failed',
+        'v1.native_readiness_invalidation.completed',
+        'v1.native_readiness_invalidation.failed'
     )),
     session_id TEXT REFERENCES sessions(session_id) ON DELETE RESTRICT,
     turn_id TEXT REFERENCES turns(turn_id) ON DELETE RESTRICT,
@@ -79,7 +86,9 @@ CREATE TABLE idempotency_records_v12 (
             'stop',
             'provider_descriptor_validation',
             'provider_binding_authorization',
-            'provider_binding_deletion'
+            'provider_binding_deletion',
+            'setup_verification',
+            'native_readiness_invalidation'
         )
         OR (
             status = 'in_progress'
@@ -116,6 +125,28 @@ CREATE TABLE idempotency_records_v12 (
             )
         )
         OR (
+            operation = 'setup_verification'
+            AND session_id IS NULL
+            AND turn_id IS NULL
+            AND result_session_state_revision IS NULL
+            AND result_session_updated_at IS NULL
+            AND (
+                (
+                    status = 'in_progress'
+                    AND durable_outcome = 'v1.setup_verification.pending'
+                    AND result_json IS NULL
+                )
+                OR (
+                    status = 'terminal'
+                    AND durable_outcome IN (
+                        'v1.setup_verification.completed',
+                        'v1.setup_verification.failed'
+                    )
+                    AND result_json IS NOT NULL
+                )
+            )
+        )
+        OR (
             operation = 'provider_binding_authorization'
             AND status = 'terminal'
             AND durable_outcome IN (
@@ -142,10 +173,25 @@ CREATE TABLE idempotency_records_v12 (
             AND result_json IS NOT NULL
         )
         OR (
+            operation = 'native_readiness_invalidation'
+            AND status = 'terminal'
+            AND durable_outcome IN (
+                'v1.native_readiness_invalidation.completed',
+                'v1.native_readiness_invalidation.failed'
+            )
+            AND session_id IS NULL
+            AND turn_id IS NULL
+            AND result_session_state_revision IS NULL
+            AND result_session_updated_at IS NULL
+            AND result_json IS NOT NULL
+        )
+        OR (
             operation NOT IN (
                 'provider_descriptor_validation',
                 'provider_binding_authorization',
-                'provider_binding_deletion'
+                'provider_binding_deletion',
+                'setup_verification',
+                'native_readiness_invalidation'
             )
             AND result_json IS NULL
         )

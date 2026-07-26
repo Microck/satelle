@@ -10,7 +10,7 @@ use satelle_core::session::{
     TurnStateRevision,
 };
 use satelle_core::{
-    DesktopSessionRecord, LOCAL_DEMO_HOST, ProviderAuthValidationMode,
+    DesktopSessionRecord, DoctorReport, LOCAL_DEMO_HOST, ProviderAuthValidationMode,
     PublicProviderDescriptorValidation, SatelleError, SessionId, StopResult, TurnId,
 };
 use serde::Serialize;
@@ -29,6 +29,8 @@ const TURN_IDEMPOTENCY_DIGEST_SCHEMA_VERSION: u16 = 6;
 const STOP_IDEMPOTENCY_DIGEST_SCHEMA_VERSION: u16 = 1;
 const PROVIDER_DESCRIPTOR_VALIDATION_DIGEST_SCHEMA_VERSION: u16 = 3;
 const PROVIDER_BINDING_MUTATION_DIGEST_SCHEMA_VERSION: u16 = 2;
+const SETUP_VERIFICATION_DIGEST_SCHEMA_VERSION: u16 = 1;
+const NATIVE_READINESS_INVALIDATION_DIGEST_SCHEMA_VERSION: u16 = 1;
 const DURABLE_SETUP_PRINCIPAL_PREFIX: &str = "controller-setup";
 
 /// A diagnostic-safe snapshot captured from the daemon-owned runtime after
@@ -431,6 +433,27 @@ struct CanonicalProviderBindingDeletion<'a> {
     operation: &'static str,
     model_alias: &'a str,
     provider_alias: &'a str,
+}
+
+#[derive(Serialize)]
+struct CanonicalSetupVerification<'a> {
+    operation: &'static str,
+    model_alias: Option<&'a str>,
+    provider_alias: Option<&'a str>,
+    model_from_project: bool,
+    provider_from_project: bool,
+    experimental_provider_computer_use: bool,
+}
+
+#[derive(Serialize)]
+struct CanonicalNativeReadinessInvalidation<'a> {
+    operation: &'static str,
+    host: &'static str,
+    model_alias: Option<&'a str>,
+    provider_alias: Option<&'a str>,
+    model_from_project: bool,
+    provider_from_project: bool,
+    experimental_provider_computer_use: bool,
 }
 
 #[derive(Serialize)]
@@ -914,6 +937,131 @@ impl HostService {
                     )?;
                     Ok(())
                 },
+            )
+        })
+    }
+
+    pub fn verify_setup_idempotent(
+        &self,
+        authority: &MutationAuthority,
+        model_alias: Option<&str>,
+        provider_alias: Option<&str>,
+        model_from_project: bool,
+        provider_from_project: bool,
+        experimental_provider_computer_use: bool,
+    ) -> Result<DoctorReport, SatelleError> {
+        if model_alias.is_some() != provider_alias.is_some() {
+            return Err(SatelleError::config_error(
+                "setup verification requires model and provider aliases together",
+                None,
+            ));
+        }
+        let provider_intent =
+            match (model_alias, provider_alias) {
+                (Some(model_alias), Some(provider_alias)) => crate::ProviderComputerUseIntent::new(
+                    Some(EffectiveModelRef::new(model_alias).map_err(|_| {
+                        SatelleError::config_error("the model alias is invalid", None)
+                    })?),
+                    Some(ProviderBindingRef::new(provider_alias).map_err(|_| {
+                        SatelleError::config_error("the provider alias is invalid", None)
+                    })?),
+                    true,
+                )
+                .with_project_selection_provenance(model_from_project, provider_from_project)
+                .with_experimental_provider_computer_use(experimental_provider_computer_use),
+                (None, None) => crate::ProviderComputerUseIntent::host_default(),
+                _ => unreachable!("the paired alias invariant is checked above"),
+            };
+        let canonical_payload = canonical_payload(
+            &CanonicalSetupVerification {
+                operation: "setup_verification",
+                model_alias,
+                provider_alias,
+                model_from_project,
+                provider_from_project,
+                experimental_provider_computer_use,
+            },
+            SETUP_VERIFICATION_DIGEST_SCHEMA_VERSION,
+        )?;
+        let _identity_gate = self.operation_capacity.lock_identity_read()?;
+        let identity = self.runtime.authenticated_request_identity(
+            &authority.principal,
+            IdempotentOperation::SetupVerification,
+            &authority.idempotency_key,
+            canonical_payload.as_slice(),
+            canonical_payload.digest_schema_version,
+        )?;
+        if let Some(replay) = self.runtime.claim_setup_verification(&identity)? {
+            return Ok(replay);
+        }
+        let report = match self.verify_setup(LOCAL_DEMO_HOST, &provider_intent) {
+            Ok(report) => report,
+            Err(error) => {
+                self.runtime.fail_setup_verification(&identity, &error)?;
+                return Err(error);
+            }
+        };
+        self.runtime
+            .complete_setup_verification(&identity, &report)?;
+        Ok(report)
+    }
+
+    pub fn invalidate_native_readiness_idempotent(
+        &self,
+        authority: &MutationAuthority,
+        model_alias: Option<&str>,
+        provider_alias: Option<&str>,
+        model_from_project: bool,
+        provider_from_project: bool,
+        experimental_provider_computer_use: bool,
+    ) -> Result<u64, SatelleError> {
+        if model_alias.is_some() != provider_alias.is_some() {
+            return Err(SatelleError::config_error(
+                "native readiness invalidation requires model and provider aliases together",
+                None,
+            ));
+        }
+        let provider_intent =
+            match (model_alias, provider_alias) {
+                (Some(model_alias), Some(provider_alias)) => crate::ProviderComputerUseIntent::new(
+                    Some(EffectiveModelRef::new(model_alias).map_err(|_| {
+                        SatelleError::config_error("the model alias is invalid", None)
+                    })?),
+                    Some(ProviderBindingRef::new(provider_alias).map_err(|_| {
+                        SatelleError::config_error("the provider alias is invalid", None)
+                    })?),
+                    false,
+                )
+                .with_project_selection_provenance(model_from_project, provider_from_project)
+                .with_experimental_provider_computer_use(experimental_provider_computer_use),
+                (None, None) => crate::ProviderComputerUseIntent::host_default(),
+                _ => unreachable!("the paired alias invariant is checked above"),
+            };
+        let canonical_payload = canonical_payload(
+            &CanonicalNativeReadinessInvalidation {
+                operation: "native_readiness_invalidation",
+                host: LOCAL_DEMO_HOST,
+                model_alias,
+                provider_alias,
+                model_from_project,
+                provider_from_project,
+                experimental_provider_computer_use,
+            },
+            NATIVE_READINESS_INVALIDATION_DIGEST_SCHEMA_VERSION,
+        )?;
+        let _identity_gate = self.operation_capacity.lock_identity_read()?;
+        let identity = self.runtime.authenticated_request_identity(
+            &authority.principal,
+            IdempotentOperation::NativeReadinessInvalidation,
+            &authority.idempotency_key,
+            canonical_payload.as_slice(),
+            canonical_payload.digest_schema_version,
+        )?;
+        self.operation_capacity.execute_exclusive(|| {
+            self.runtime.invalidate_native_readiness_idempotent(
+                &identity,
+                LOCAL_DEMO_HOST,
+                &provider_intent,
             )
         })
     }

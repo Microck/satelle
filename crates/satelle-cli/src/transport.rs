@@ -220,6 +220,36 @@ pub(crate) struct ProviderDescriptorValidationReport {
     pub(crate) validation: satelle_core::ProviderAuthValidationResult,
 }
 
+fn setup_provider_intent(
+    request: &satelle_transport::SetupVerificationRequest,
+) -> Result<satelle_host::ProviderComputerUseIntent, SatelleError> {
+    let provider_intent = match (request.model_alias(), request.provider_alias()) {
+        (None, None) => satelle_host::ProviderComputerUseIntent::host_default(),
+        (Some(model_alias), Some(provider_alias)) => satelle_host::ProviderComputerUseIntent::new(
+            Some(
+                satelle_core::session::EffectiveModelRef::new(model_alias)
+                    .map_err(|error| SatelleError::invalid_usage(error.to_string()))?,
+            ),
+            Some(
+                satelle_core::session::ProviderBindingRef::new(provider_alias)
+                    .map_err(|error| SatelleError::invalid_usage(error.to_string()))?,
+            ),
+            true,
+        )
+        .with_project_selection_provenance(
+            request.model_from_project(),
+            request.provider_from_project(),
+        ),
+        _ => {
+            return Err(SatelleError::invalid_usage(
+                "setup verification model and provider aliases must be supplied together",
+            ));
+        }
+    };
+    Ok(provider_intent
+        .with_experimental_provider_computer_use(request.experimental_provider_computer_use()))
+}
+
 /// The command surface is intentionally exhaustive. A new transport operation
 /// must be implemented or explicitly rejected by every backend.
 pub(crate) trait TransportClient {
@@ -239,6 +269,14 @@ pub(crate) trait TransportClient {
         options: DoctorOptions,
         provider_intent: &satelle_host::ProviderComputerUseIntent,
     ) -> Result<DoctorReport, SatelleError>;
+    fn verify_setup(
+        &self,
+        request: &satelle_transport::SetupVerificationRequest,
+    ) -> Result<DoctorReport, SatelleError>;
+    fn invalidate_native_readiness(
+        &self,
+        request: &satelle_transport::SetupVerificationRequest,
+    ) -> Result<u64, SatelleError>;
     fn authorize_provider_binding(
         &self,
         authorization: &satelle_core::ProviderBindingAuthorization,
@@ -568,6 +606,23 @@ impl TransportClient for LocalTransport {
     ) -> Result<DoctorReport, SatelleError> {
         self.service
             .doctor_with_provider_intent(&self.alias, scope, options, provider_intent)
+    }
+
+    fn verify_setup(
+        &self,
+        request: &satelle_transport::SetupVerificationRequest,
+    ) -> Result<DoctorReport, SatelleError> {
+        let provider_intent = setup_provider_intent(request)?;
+        self.service.verify_setup(&self.alias, &provider_intent)
+    }
+
+    fn invalidate_native_readiness(
+        &self,
+        request: &satelle_transport::SetupVerificationRequest,
+    ) -> Result<u64, SatelleError> {
+        let provider_intent = setup_provider_intent(request)?;
+        self.service
+            .invalidate_native_readiness(&self.alias, &provider_intent)
     }
 
     fn validate_provider_descriptor(
@@ -1458,6 +1513,7 @@ impl SshSetupTransport {
             dry_run,
             status: status.to_string(),
             cancellation_reason: None,
+            verification: None,
             setup_mode,
             service_persistent,
             service_scope: if service_persistent {
@@ -3182,6 +3238,25 @@ impl TransportClient for SshSetupTransport {
         Err(self.unsupported("doctor"))
     }
 
+    fn verify_setup(
+        &self,
+        _request: &satelle_transport::SetupVerificationRequest,
+    ) -> Result<DoctorReport, SatelleError> {
+        // Setup uses this transport only while bootstrapping. Live verification
+        // must rebuild the configured Host transport after setup so it cannot
+        // depend on the temporary bootstrap daemon or credential.
+        Err(SatelleError::state_conflict())
+    }
+
+    fn invalidate_native_readiness(
+        &self,
+        _request: &satelle_transport::SetupVerificationRequest,
+    ) -> Result<u64, SatelleError> {
+        // The caller must rebuild the configured Host transport after setup
+        // before invalidating Host-owned readiness state.
+        Err(SatelleError::state_conflict())
+    }
+
     fn validate_provider_descriptor(
         &self,
         _model_alias: &str,
@@ -3282,6 +3357,37 @@ impl TransportClient for DirectTransport {
         _provider_intent: &satelle_host::ProviderComputerUseIntent,
     ) -> Result<DoctorReport, SatelleError> {
         Err(self.unsupported("doctor"))
+    }
+
+    fn verify_setup(
+        &self,
+        request: &satelle_transport::SetupVerificationRequest,
+    ) -> Result<DoctorReport, SatelleError> {
+        self.client
+            .verify_setup(request, &format!("setup-verification-{}", Uuid::now_v7()))
+            .map(|response| response.verification().clone())
+            .map_err(|error| direct_transport_error(&self.alias, error))
+    }
+
+    fn invalidate_native_readiness(
+        &self,
+        request: &satelle_transport::SetupVerificationRequest,
+    ) -> Result<u64, SatelleError> {
+        let invalidation = satelle_transport::NativeReadinessInvalidationRequest::new(
+            request.model_alias().map(str::to_owned),
+            request.provider_alias().map(str::to_owned),
+            request.model_from_project(),
+            request.provider_from_project(),
+            request.experimental_provider_computer_use(),
+        )
+        .map_err(SatelleError::invalid_usage)?;
+        self.client
+            .invalidate_native_readiness(
+                &invalidation,
+                &format!("native-readiness-invalidation-{}", Uuid::now_v7()),
+            )
+            .map(|response| response.deleted())
+            .map_err(|error| direct_transport_error(&self.alias, error))
     }
 
     fn validate_provider_descriptor(

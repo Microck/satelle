@@ -2947,6 +2947,355 @@ fn setup_no_input_json_requires_consent_without_mutating() {
     assert!(!state.path().join("local-demo-state.json").exists());
 }
 
+#[test]
+fn setup_verify_rejects_first_ssh_without_consent_before_any_side_effect() {
+    let sandbox = state_dir();
+    let config_file = sandbox.path().join("config.toml");
+    let token_file = sandbox.path().join("remote-api-token");
+    let operator_home = sandbox.path().join("operator-home");
+    let operator_state = sandbox.path().join("operator-state");
+    let operator_cache = sandbox.path().join("operator-cache");
+    write_user_config(
+        &config_file,
+        format!(
+            r#"
+default_host = "remote"
+
+[hosts.remote]
+transport = "ssh"
+adapter = "fake"
+address = "operator@127.0.0.1:1"
+
+[hosts.remote.api_token]
+kind = "file"
+path = '{}'
+"#,
+            token_file.display()
+        ),
+    )
+    .expect("first-SSH config should be written");
+
+    let output = assert_directory_tree_unchanged(
+        "noninteractive first-SSH setup --verify without consent",
+        sandbox.path(),
+        || {
+            satelle()
+                .env("HOME", &operator_home)
+                .env("SATELLE_CONFIG_FILE", &config_file)
+                .env("SATELLE_STATE_DIR", &operator_state)
+                .env("SATELLE_CACHE_DIR", &operator_cache)
+                .args([
+                    "setup",
+                    "--host",
+                    "remote",
+                    "--verify",
+                    "--no-input",
+                    "--json",
+                ])
+                .assert()
+                .code(64)
+                .get_output()
+                .clone()
+        },
+    );
+    let error = parse_json_output(&output.stderr);
+
+    assert_eq!(error["code"], "setup-consent-required");
+    assert_eq!(error["details"]["applied_actions"], serde_json::json!([]));
+    assert_eq!(error["details"]["mutated"], false);
+    assert!(!token_file.exists());
+}
+
+#[test]
+fn setup_verify_dry_run_plans_checks_without_probing_or_mutating() {
+    let state = state_dir();
+    let output =
+        assert_directory_tree_unchanged("satelle setup --verify --dry-run", state.path(), || {
+            satelle()
+                .env("SATELLE_STATE_DIR", state.path())
+                .args([
+                    "setup",
+                    "--host",
+                    "local-demo",
+                    "--component",
+                    "transport",
+                    "--verify",
+                    "--dry-run",
+                    "--no-input",
+                    "--json",
+                ])
+                .assert()
+                .success()
+                .stderr(predicate::str::is_empty())
+                .get_output()
+                .clone()
+        });
+    let report = parse_json_output(&output.stdout);
+    let verification = &report["verification"];
+
+    assert_eq!(report["status"], "planned");
+    assert_eq!(report["changed"], false);
+    assert_eq!(report["mutated"], false);
+    assert_eq!(report["applied_actions"], serde_json::json!([]));
+    assert_eq!(verification["status"], "planned");
+    assert_eq!(verification["result"], serde_json::Value::Null);
+    assert_eq!(verification["cache_updates"], serde_json::json!([]));
+    assert!(
+        verification["planned_checks"]
+            .as_array()
+            .is_some_and(|checks| checks.iter().any(|check| {
+                check
+                    .as_str()
+                    .is_some_and(|check| check.to_ascii_lowercase().contains("native"))
+            }))
+    );
+}
+
+#[test]
+fn setup_verify_runs_live_fake_readiness_and_records_the_cache_update() {
+    let state = state_dir();
+    let output = satelle()
+        .env("SATELLE_STATE_DIR", state.path())
+        .args([
+            "setup",
+            "--host",
+            "local-demo",
+            "--component",
+            "transport",
+            "--verify",
+            "--no-input",
+            "--json",
+        ])
+        .assert()
+        .success()
+        .stderr(predicate::str::is_empty())
+        .get_output()
+        .clone();
+    let report = parse_json_output(&output.stdout);
+    let verification = &report["verification"];
+
+    assert_eq!(verification["status"], "passed");
+    assert_eq!(verification["result"]["ready"], true);
+    assert!(
+        verification["cache_updates"]
+            .as_array()
+            .is_some_and(|updates| updates.iter().any(|update| update == "native_readiness"))
+    );
+    assert_eq!(report["native_computer_use_readiness"], "ready");
+}
+
+#[test]
+fn provider_auth_only_setup_does_not_probe_or_invalidate_native_readiness() {
+    let state = state_dir();
+    let config_file = state.path().join("provider-auth-only.toml");
+    let secret_file = state.path().join("provider-token");
+    test_file::write_user_controlled(&secret_file, b"fixture-provider-token")
+        .expect("write fixture provider token");
+    let secret_path = toml::Value::String(secret_file.to_string_lossy().into_owned()).to_string();
+    write_user_config(
+        &config_file,
+        format!(
+            r#"
+default_host = "local-demo"
+model_alias = "fixture-model"
+provider_alias = "fixture-provider"
+
+[hosts.local-demo]
+transport = "local"
+adapter = "fake"
+
+[hosts.local-demo.experimental_provider_computer_use_by_provider]
+fixture-provider = true
+
+[hosts.local-demo.provider_bindings.fixture-provider.fixture-model]
+model = "fixture-model-v1"
+model_provider = "fixture-provider-v1"
+endpoint = "https://fixture-provider.invalid/v1"
+auth_source = "fixture-auth"
+
+[hosts.local-demo.provider_auth.fixture-auth]
+kind = "file"
+path = {secret_path}
+"#
+        ),
+    )
+    .expect("write provider-auth-only config");
+
+    let output = satelle()
+        .env("SATELLE_CONFIG_FILE", &config_file)
+        .env("SATELLE_STATE_DIR", state.path())
+        .args([
+            "setup",
+            "--host",
+            "local-demo",
+            "--component",
+            "provider-auth",
+            "--no-input",
+            "--yes",
+            "--json",
+        ])
+        .assert()
+        .success()
+        .stderr(predicate::str::is_empty())
+        .get_output()
+        .clone();
+    let report = parse_json_output(&output.stdout);
+
+    assert_eq!(report["native_computer_use_readiness"], "not_verified");
+    assert!(report.get("verification").is_none());
+    assert!(
+        report["applied_actions"]
+            .as_array()
+            .is_some_and(|actions| actions.iter().any(|action| {
+                action
+                    .as_str()
+                    .is_some_and(|action| action.contains("provider binding"))
+            }))
+    );
+}
+
+#[test]
+fn setup_verify_plan_omits_provider_smoke_when_effective_policy_does_not_require_it() {
+    let state = state_dir();
+    let config_file = state.path().join("provider-smoke-not-required.toml");
+    write_user_config(
+        &config_file,
+        r#"
+default_host = "local-demo"
+model_alias = "fixture-model"
+provider_alias = "fixture-provider"
+
+[hosts.local-demo]
+transport = "local"
+adapter = "fake"
+
+[hosts.local-demo.provider_bindings.fixture-provider.fixture-model]
+model = "fixture-model-v1"
+model_provider = "fixture-provider-v1"
+"#,
+    )
+    .expect("write provider policy config");
+
+    let output = satelle()
+        .env("SATELLE_CONFIG_FILE", &config_file)
+        .env("SATELLE_STATE_DIR", state.path())
+        .args([
+            "setup",
+            "--host",
+            "local-demo",
+            "--component",
+            "transport",
+            "--verify",
+            "--dry-run",
+            "--no-input",
+            "--json",
+        ])
+        .assert()
+        .success()
+        .stderr(predicate::str::is_empty())
+        .get_output()
+        .clone();
+    let report = parse_json_output(&output.stdout);
+    let checks = report["verification"]["planned_checks"]
+        .as_array()
+        .expect("verification plan should contain planned checks");
+
+    assert!(checks.iter().any(|check| {
+        check
+            .as_str()
+            .is_some_and(|check| check.to_ascii_lowercase().contains("native"))
+    }));
+    assert!(
+        checks.iter().all(|check| {
+            check
+                .as_str()
+                .is_some_and(|check| !check.to_ascii_lowercase().contains("provider"))
+        }),
+        "provider smoke must be absent when the effective provider policy does not require it"
+    );
+}
+
+#[test]
+fn setup_verify_failure_preserves_the_setup_report_and_uses_readiness_exit_75() {
+    let state = state_dir();
+    let output = production_satelle()
+        .env("SATELLE_STATE_DIR", state.path())
+        .args([
+            "setup",
+            "--host",
+            "local-demo",
+            "--component",
+            "transport",
+            "--verify",
+            "--no-input",
+            "--json",
+        ])
+        .assert()
+        .code(75)
+        .get_output()
+        .clone();
+    assert!(output.stdout.is_empty());
+    let error = parse_json_output(&output.stderr);
+
+    assert_eq!(error["code"], "setup-verification-failed");
+    assert_eq!(error["details"]["changed"], false);
+    assert_eq!(error["details"]["applied_actions"], serde_json::json!([]));
+    assert!(matches!(
+        error["details"]["verification"]["status"].as_str(),
+        Some("failed" | "manual_action_required")
+    ));
+    assert_eq!(error["details"]["verification"]["result"]["ready"], false);
+    let doctor_recovery = error["details"]["verification"]["result"]["recovery_commands"]
+        .as_array()
+        .expect("failed verification should retain Doctor recovery commands");
+    let suggested_recovery = error["suggested_commands"]
+        .as_array()
+        .expect("failed verification should expose recovery commands");
+    for recoveries in [doctor_recovery, suggested_recovery] {
+        assert!(
+            recoveries.iter().any(|command| {
+                command.as_str().is_some_and(|command| {
+                    (command.starts_with("satelle doctor --host local-demo ")
+                        && command.contains("--refresh"))
+                        || command == "satelle setup --host local-demo --verify --no-input"
+                })
+            }),
+            "verification recovery must preserve the exact Host scope"
+        );
+    }
+    let rendered = String::from_utf8_lossy(&output.stderr).to_ascii_lowercase();
+    assert!(!rendered.contains("rolled back"));
+    assert!(!rendered.contains("rollback"));
+}
+
+#[test]
+fn setup_apply_and_yes_outside_consent_commands_are_rejected_by_the_parser() {
+    for args in [
+        &["setup", "--apply"][..],
+        &["repair", "--apply"][..],
+        &["doctor", "--apply"][..],
+        &["paths", "--apply"][..],
+    ] {
+        satelle()
+            .args(args)
+            .assert()
+            .failure()
+            .stderr(predicate::str::contains("--apply"));
+    }
+
+    for args in [
+        &["run", "--yes", "Inspect"][..],
+        &["doctor", "--yes"][..],
+        &["paths", "--yes"][..],
+    ] {
+        satelle()
+            .args(args)
+            .assert()
+            .failure()
+            .stderr(predicate::str::contains("--yes"));
+    }
+}
+
 #[cfg(target_os = "linux")]
 #[test]
 fn setup_interactive_decline_exits_successfully_without_mutating_state() {

@@ -273,6 +273,68 @@ fn readiness_reports_use_their_canonical_v1_schema_tokens() {
 }
 
 #[test]
+fn setup_verification_is_an_optional_closed_extension_of_the_v1_report() {
+    let state = TestStateDir::new().expect("secure temp state directory should be created");
+    let without_verification = json_report(
+        &state,
+        vec!["setup", "--host", "local-demo", "--dry-run", "--json"],
+    );
+    assert!(without_verification.get("verification").is_none());
+
+    let with_verification = json_report(
+        &state,
+        vec![
+            "setup",
+            "--host",
+            "local-demo",
+            "--component",
+            "transport",
+            "--verify",
+            "--dry-run",
+            "--no-input",
+            "--json",
+        ],
+    );
+    assert_eq!(with_verification["schema_version"], "satelle.setup.v1");
+
+    let mut expected_report_fields = without_verification
+        .as_object()
+        .expect("setup report should be an object")
+        .keys()
+        .map(String::as_str)
+        .collect::<BTreeSet<_>>();
+    expected_report_fields.insert("verification");
+    let actual_report_fields = with_verification
+        .as_object()
+        .expect("verified setup report should be an object")
+        .keys()
+        .map(String::as_str)
+        .collect::<BTreeSet<_>>();
+    assert_eq!(actual_report_fields, expected_report_fields);
+
+    let verification = with_verification["verification"]
+        .as_object()
+        .expect("verification should be an object");
+    assert_eq!(
+        verification
+            .keys()
+            .map(String::as_str)
+            .collect::<BTreeSet<_>>(),
+        ["cache_updates", "planned_checks", "result", "status"]
+            .into_iter()
+            .collect::<BTreeSet<_>>()
+    );
+    assert_eq!(verification["status"], "planned");
+    assert!(
+        verification["planned_checks"]
+            .as_array()
+            .is_some_and(|checks| !checks.is_empty())
+    );
+    assert_eq!(verification["result"], Value::Null);
+    assert_eq!(verification["cache_updates"], json!([]));
+}
+
+#[test]
 fn local_inspection_reports_keep_their_closed_v1_shapes() {
     let state = TestStateDir::new().expect("secure temp state directory should be created");
 

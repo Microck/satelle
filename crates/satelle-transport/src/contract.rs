@@ -33,16 +33,17 @@ pub use session::{
 pub use setup::{
     BootstrapMaintenanceResponse, DURABLE_SETUP_PENDING_TTL, DurableTokenActivationResponse,
     DurableTokenConfirmationResponse, DurableTokenIssuanceResponse,
+    NativeReadinessInvalidationRequest, NativeReadinessInvalidationResponse,
     ProviderBindingAuthorizationRequest, ProviderBindingAuthorizationResponse,
     ProviderBindingDeletionResponse, ProviderDescriptorValidationRequest,
-    ProviderDescriptorValidationResponse,
+    ProviderDescriptorValidationResponse, SetupVerificationRequest, SetupVerificationResponse,
 };
 
 pub(crate) const PROTOCOL_VERSION_HEADER: &str = "satelle-protocol-version";
 // Project-origin provenance and exact-binding consent close the remaining
 // Provider Binding selection boundary. Exact-match negotiation rejects every
-// peer that still implements the protocol v8 request surface.
-pub(crate) const PROTOCOL_VERSION: &str = "9";
+// peer that still implements the protocol v9 request surface.
+pub(crate) const PROTOCOL_VERSION: &str = "10";
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::fmt;

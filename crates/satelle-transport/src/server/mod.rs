@@ -922,6 +922,21 @@ fn router(state: Arc<DaemonState>) -> Router {
             Arc::clone(&state),
             auth::require_control,
         ));
+    let setup_verification_route = Router::new()
+        .route("/v1/setup/verify", post(setup::verify_setup))
+        .route_layer(middleware::from_fn_with_state(
+            Arc::clone(&state),
+            auth::require_control,
+        ));
+    let native_readiness_invalidation_route = Router::new()
+        .route(
+            "/v1/setup/readiness/native/invalidate",
+            post(setup::invalidate_native_readiness),
+        )
+        .route_layer(middleware::from_fn_with_state(
+            Arc::clone(&state),
+            auth::require_control,
+        ));
     let control_routes = Router::new()
         .route("/v1/sessions", post(sessions::create_session))
         .route(
@@ -942,6 +957,8 @@ fn router(state: Arc<DaemonState>) -> Router {
         .merge(provider_binding_authorization_routes)
         .merge(provider_binding_deletion_route)
         .merge(provider_descriptor_validation_route)
+        .merge(setup_verification_route)
+        .merge(native_readiness_invalidation_route)
         .merge(control_routes)
         .method_not_allowed_fallback(protected_method_not_allowed)
         .fallback(protected_not_found)

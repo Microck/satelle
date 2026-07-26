@@ -1469,6 +1469,7 @@ impl HostService {
             return Err(SatelleError::invalid_usage("unsupported doctor scope"));
         }
         let includes_provider_scope = matches!(scope, None | Some("provider" | "all"));
+        let includes_native_scope = matches!(scope, None | Some("computer-use" | "all"));
         let has_provider_selection =
             provider_intent.model().is_some() || provider_intent.provider().is_some();
         let should_resolve_provider = includes_provider_scope && has_provider_selection;
@@ -1508,33 +1509,89 @@ impl HostService {
                 self.fake_doctor(host, scope, options, &FakeComputerUseAdapter)?
             }
         };
-        if options.refresh() && should_resolve_provider {
+        if options.refresh() && (includes_native_scope || should_resolve_provider) {
             if scope == Some("provider") {
                 report.changed = false;
                 report.cache_updates.clear();
             }
-            let deferred_outcome =
-                provider_auth_evidence.expect("provider scopes always diagnose provider auth");
-            if !matches!(
-                deferred_outcome.0,
-                satelle_core::ProviderAuthValidationOutcome::MissingDescriptor
-                    | satelle_core::ProviderAuthValidationOutcome::UnsupportedDescriptorKind
-            ) {
+            let provider_refresh_allowed = provider_auth_evidence.is_some_and(|outcome| {
+                !matches!(
+                    outcome.0,
+                    satelle_core::ProviderAuthValidationOutcome::MissingDescriptor
+                        | satelle_core::ProviderAuthValidationOutcome::UnsupportedDescriptorKind
+                )
+            });
+            let provider_probe_required =
+                should_resolve_provider && provider_intent.provider_probe_required();
+            let should_run_native_phase =
+                includes_native_scope || (provider_refresh_allowed && provider_probe_required);
+            let native_only_intent = ProviderComputerUseIntent::host_default();
+            let native_intent = if scope == Some("computer-use") {
+                &native_only_intent
+            } else {
+                provider_intent
+            };
+            let mut native_evidence = None;
+            if should_run_native_phase {
                 let started_at = utc_now();
                 let started = Instant::now();
-                let refresh = self.runtime.refresh_provider_smoke(host, provider_intent);
-                let observed = match &refresh {
-                    Ok(readiness) if readiness.provider_smoke_evidence().is_some() => (
-                        satelle_core::ProviderAuthValidationOutcome::Resolved,
-                        satelle_core::ProviderAuthObservationSource::Live,
-                    ),
-                    Ok(_) => deferred_outcome,
-                    Err(error) => provider_validation_outcome_for_error(error)
-                        .map(|outcome| (outcome, satelle_core::ProviderAuthObservationSource::Live))
-                        .unwrap_or(deferred_outcome),
-                };
-                apply_provider_refresh(&mut report, refresh, started_at, started.elapsed());
-                provider_auth_evidence = Some(observed);
+                let native_refresh = self
+                    .runtime
+                    .refresh_setup_native_readiness(host, native_intent);
+                if includes_native_scope {
+                    apply_native_refresh(
+                        &mut report,
+                        &native_refresh,
+                        started_at,
+                        started.elapsed(),
+                    );
+                }
+                native_evidence = native_refresh.ok();
+            }
+            if should_resolve_provider && provider_refresh_allowed {
+                let deferred_outcome =
+                    provider_auth_evidence.expect("provider scopes always diagnose provider auth");
+                if provider_probe_required {
+                    if let Some(native_evidence) = native_evidence {
+                        let started_at = utc_now();
+                        let started = Instant::now();
+                        let provider_refresh = self.runtime.refresh_setup_provider_readiness(
+                            host,
+                            provider_intent,
+                            native_evidence,
+                        );
+                        let observed = match &provider_refresh {
+                            Ok(readiness) if readiness.provider_smoke_evidence().is_some() => (
+                                satelle_core::ProviderAuthValidationOutcome::Resolved,
+                                satelle_core::ProviderAuthObservationSource::Live,
+                            ),
+                            Ok(_) => deferred_outcome,
+                            Err(error) => provider_validation_outcome_for_error(error)
+                                .map(|outcome| {
+                                    (outcome, satelle_core::ProviderAuthObservationSource::Live)
+                                })
+                                .unwrap_or(deferred_outcome),
+                        };
+                        apply_provider_refresh(
+                            &mut report,
+                            &provider_refresh,
+                            started_at,
+                            started.elapsed(),
+                        );
+                        provider_auth_evidence = Some(observed);
+                    }
+                } else {
+                    apply_provider_not_required(&mut report);
+                }
+            } else if matches!(
+                provider_auth_evidence,
+                Some((
+                    satelle_core::ProviderAuthValidationOutcome::MissingDescriptor
+                        | satelle_core::ProviderAuthValidationOutcome::UnsupportedDescriptorKind,
+                    _
+                ))
+            ) {
+                recompute_doctor_summary(&mut report);
             }
         }
         if let Some((outcome, source)) = provider_auth_evidence {
@@ -1551,6 +1608,38 @@ impl HostService {
             }
         }
         Ok(report)
+    }
+
+    /// Runs the canonical live setup readiness path through Doctor so setup,
+    /// admission, and diagnostics share lease, cache, timeout, and recovery
+    /// semantics.
+    pub fn verify_setup(
+        &self,
+        host: &str,
+        provider_intent: &ProviderComputerUseIntent,
+    ) -> Result<DoctorReport, SatelleError> {
+        let scope = if provider_intent.model().is_some() || provider_intent.provider().is_some() {
+            "all"
+        } else {
+            "computer-use"
+        };
+        self.doctor_with_provider_intent(
+            host,
+            Some(scope),
+            DoctorOptions::new(true, None),
+            provider_intent,
+        )
+    }
+
+    /// Invalidates the current Host identity's native readiness evidence while
+    /// leaving provider smoke evidence untouched.
+    pub fn invalidate_native_readiness(
+        &self,
+        host: &str,
+        provider_intent: &ProviderComputerUseIntent,
+    ) -> Result<u64, SatelleError> {
+        self.runtime
+            .invalidate_native_readiness(host, provider_intent)
     }
 
     /// Reports cached provider-auth evidence without resolving a secret, or
@@ -2061,7 +2150,7 @@ pub fn admission_request_timeout(config: &HostConfig) -> std::time::Duration {
 
 fn apply_provider_refresh(
     report: &mut DoctorReport,
-    refresh: Result<AdapterReadiness, SatelleError>,
+    refresh: &Result<AdapterReadiness, SatelleError>,
     started_at: String,
     duration: std::time::Duration,
 ) {
@@ -2142,9 +2231,9 @@ fn apply_provider_refresh(
                     severity: "error".to_string(),
                     fixability: DoctorFixability::Blocked,
                     readiness_impact: "blocked".to_string(),
-                    summary: error.message,
+                    summary: error.message.clone(),
                     evidence,
-                    recovery_command: error.recovery_command,
+                    recovery_command: error.recovery_command.clone(),
                 },
                 "blocked",
                 if changed {
@@ -2189,6 +2278,180 @@ fn apply_provider_refresh(
     {
         report.cache_updates.push("provider_smoke".to_string());
     }
+    recompute_doctor_summary(report);
+}
+
+fn apply_native_refresh(
+    report: &mut DoctorReport,
+    refresh: &Result<ReadinessEvidence, SatelleError>,
+    started_at: String,
+    duration: std::time::Duration,
+) {
+    report
+        .findings
+        .retain(|finding| finding.scope != "computer-use");
+    report
+        .probe_results
+        .retain(|probe| probe.scope != "computer-use");
+    let (finding, status, cache_status, changed) = match refresh {
+        Ok(readiness) => (
+            DoctorFinding {
+                finding_id: "computer-use.native.refresh.passed".to_string(),
+                scope: "computer-use".to_string(),
+                severity: "info".to_string(),
+                fixability: DoctorFixability::Informational,
+                readiness_impact: "ready".to_string(),
+                summary: "native Computer Use readiness passed".to_string(),
+                evidence: vec![
+                    format!("source={}", readiness.source().as_str()),
+                    format!(
+                        "observed_at={}",
+                        readiness
+                            .observed_at()
+                            .format(&Rfc3339)
+                            .expect("native evidence timestamp is RFC 3339 representable")
+                    ),
+                    format!(
+                        "expires_at={}",
+                        readiness
+                            .expires_at()
+                            .format(&Rfc3339)
+                            .expect("native evidence expiry is RFC 3339 representable")
+                    ),
+                ],
+                recovery_command: None,
+            },
+            "passed",
+            "refreshed",
+            true,
+        ),
+        Err(error) => {
+            let manual_action_required = error
+                .details
+                .get("native_readiness")
+                .and_then(Value::as_object)
+                .and_then(|details| details.get("status"))
+                .and_then(Value::as_str)
+                == Some("manual_action_required")
+                || error.details.get("status").and_then(Value::as_str)
+                    == Some("manual_action_required");
+            let mut evidence = vec![format!("code={}", error.code.as_str())];
+            if let Some(details) = error
+                .details
+                .get("native_readiness")
+                .and_then(Value::as_object)
+            {
+                for key in ["status", "reason", "observed_at", "expires_at"] {
+                    if let Some(value) = details.get(key) {
+                        evidence.push(format!("{key}={}", json_scalar(value)));
+                    }
+                }
+            }
+            let changed = error.details.contains_key("native_readiness")
+                || matches!(
+                    error.code.as_str(),
+                    "computer-use-not-ready" | "native-readiness-timeout"
+                );
+            (
+                DoctorFinding {
+                    finding_id: "computer-use.native.refresh.failed".to_string(),
+                    scope: "computer-use".to_string(),
+                    severity: "error".to_string(),
+                    fixability: if manual_action_required {
+                        DoctorFixability::ManualActionRequired
+                    } else {
+                        DoctorFixability::Blocked
+                    },
+                    readiness_impact: "blocked".to_string(),
+                    summary: error.message.clone(),
+                    evidence,
+                    recovery_command: error.recovery_command.clone(),
+                },
+                "blocked",
+                if changed {
+                    "refreshed_failed"
+                } else {
+                    "not_updated"
+                },
+                changed,
+            )
+        }
+    };
+    let finding_id = finding.finding_id.clone();
+    report.findings.push(finding);
+    report.probe_results.push(DoctorProbeResult {
+        probe_id: "computer-use.native.refresh".to_string(),
+        scope: "computer-use".to_string(),
+        status: status.to_string(),
+        started_at,
+        finished_at: utc_now(),
+        duration_ms: u64::try_from(duration.as_millis()).unwrap_or(u64::MAX),
+        cache_status: cache_status.to_string(),
+        dependency_status: "satisfied".to_string(),
+        finding_ids: vec![finding_id],
+    });
+    report.findings.sort_by(|left, right| {
+        left.scope
+            .cmp(&right.scope)
+            .then(left.finding_id.cmp(&right.finding_id))
+    });
+    report.probe_results.sort_by(|left, right| {
+        left.scope
+            .cmp(&right.scope)
+            .then(left.probe_id.cmp(&right.probe_id))
+    });
+    report.changed |= changed;
+    if changed
+        && !report
+            .cache_updates
+            .iter()
+            .any(|entry| entry == "native_readiness")
+    {
+        report.cache_updates.push("native_readiness".to_string());
+    }
+    recompute_doctor_summary(report);
+}
+
+fn apply_provider_not_required(report: &mut DoctorReport) {
+    report
+        .findings
+        .retain(|finding| finding.scope != "provider");
+    report
+        .probe_results
+        .retain(|probe| probe.scope != "provider");
+    let finding_id = "provider.smoke.refresh.not_required".to_string();
+    report.findings.push(DoctorFinding {
+        finding_id: finding_id.clone(),
+        scope: "provider".to_string(),
+        severity: "info".to_string(),
+        fixability: DoctorFixability::Informational,
+        readiness_impact: "ready".to_string(),
+        summary: "the selected provider does not require an experimental smoke test".to_string(),
+        evidence: vec!["source=not_required".to_string()],
+        recovery_command: None,
+    });
+    let observed_at = utc_now();
+    report.probe_results.push(DoctorProbeResult {
+        probe_id: "provider.smoke.refresh".to_string(),
+        scope: "provider".to_string(),
+        status: "passed".to_string(),
+        started_at: observed_at.clone(),
+        finished_at: observed_at,
+        duration_ms: 0,
+        cache_status: "not_required".to_string(),
+        dependency_status: "satisfied".to_string(),
+        finding_ids: vec![finding_id],
+    });
+    report.findings.sort_by(|left, right| {
+        left.scope
+            .cmp(&right.scope)
+            .then(left.finding_id.cmp(&right.finding_id))
+    });
+    report.probe_results.sort_by(|left, right| {
+        left.scope
+            .cmp(&right.scope)
+            .then(left.probe_id.cmp(&right.probe_id))
+    });
     recompute_doctor_summary(report);
 }
 
@@ -2555,6 +2818,7 @@ fn production_setup_report(
         dry_run,
         status: "planned".to_string(),
         cancellation_reason: None,
+        verification: None,
         setup_mode,
         service_persistent,
         service_scope: service_scope.to_string(),

@@ -53,7 +53,7 @@ use self::sql::{
     validate_initial_session,
 };
 pub(crate) use self::stop::{BeginStopOutcome, StopCommit, StopCommitOutcome};
-use crate::{ApiBearerToken, ApiPrincipal};
+use crate::{ApiBearerToken, ApiPrincipal, ReadinessCacheKey};
 pub(crate) use crate::{LogEvent, LogSeverity, LogSource};
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior};
 use satelle_core::session::{
@@ -83,6 +83,13 @@ pub(crate) enum ProviderBindingAuthorizationReplay {
 #[serde(tag = "status", content = "result", rename_all = "snake_case")]
 pub(crate) enum ProviderBindingDeletionReplay {
     Completed(bool),
+    Failed(SatelleError),
+}
+
+#[derive(Clone, Deserialize, Serialize)]
+#[serde(tag = "status", content = "result", rename_all = "snake_case")]
+pub(crate) enum NativeReadinessInvalidationReplay {
+    Completed(u64),
     Failed(SatelleError),
 }
 
@@ -334,6 +341,8 @@ pub(crate) enum IdempotentOperation {
     ProviderDescriptorValidation,
     ProviderBindingAuthorization,
     ProviderBindingDeletion,
+    SetupVerification,
+    NativeReadinessInvalidation,
 }
 
 #[derive(Clone)]
@@ -850,6 +859,7 @@ impl Storage {
     ) -> Result<Vec<RecoverySubject>, StorageError> {
         let detected_at = OffsetDateTime::now_utc();
         self.mark_interrupted_provider_descriptor_validations_failed(detected_at)?;
+        self.mark_interrupted_setup_verifications_failed(detected_at)?;
         self.mark_interrupted_setup_actions_outcome_unknown(detected_at)?;
         self.mark_restart_recovery_pending()
     }
@@ -873,6 +883,31 @@ impl Storage {
                  WHERE operation = 'provider_descriptor_validation'
                    AND status = 'in_progress'
                    AND durable_outcome = 'v2.provider_descriptor_validation.pending'",
+                rusqlite::params![replay, format_time(detected_at)?],
+            )
+            .map(|_| ())
+            .map_err(|source| sqlite_error(StorageErrorKind::OperationFailed, source))
+    }
+
+    fn mark_interrupted_setup_verifications_failed(
+        &mut self,
+        detected_at: OffsetDateTime,
+    ) -> Result<(), StorageError> {
+        let replay = serde_json::to_string(&serde_json::json!({
+            "status": "failed",
+            "result": satelle_core::SatelleError::state_conflict(),
+        }))
+        .map_err(|source| StorageError::with_source(StorageErrorKind::OperationFailed, source))?;
+        self.connection
+            .execute(
+                "UPDATE idempotency_records
+                 SET status = 'terminal',
+                     durable_outcome = 'v1.setup_verification.failed',
+                     result_json = ?1,
+                     completed_at = ?2
+                 WHERE operation = 'setup_verification'
+                   AND status = 'in_progress'
+                   AND durable_outcome = 'v1.setup_verification.pending'",
                 rusqlite::params![replay, format_time(detected_at)?],
             )
             .map(|_| ())
@@ -1314,6 +1349,191 @@ impl Storage {
         transaction
             .commit()
             .map_err(|source| sqlite_error(StorageErrorKind::OperationFailed, source))
+    }
+
+    pub(crate) fn claim_setup_verification(
+        &mut self,
+        idempotency: &IdempotencyInput,
+    ) -> Result<Option<String>, StorageError> {
+        require_operation(idempotency, IdempotentOperation::SetupVerification)?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|source| sqlite_error(StorageErrorKind::OperationFailed, source))?;
+        if let Some(record) = matching_idempotency(&transaction, idempotency)? {
+            return match (
+                record.status.as_str(),
+                record.durable_outcome.as_str(),
+                record.result_json,
+            ) {
+                (
+                    "terminal",
+                    "v1.setup_verification.completed" | "v1.setup_verification.failed",
+                    Some(result_json),
+                ) => Ok(Some(result_json)),
+                ("in_progress", "v1.setup_verification.pending", None) => {
+                    Err(StorageError::new(StorageErrorKind::StateConflict))
+                }
+                _ => Err(StorageError::new(StorageErrorKind::InvalidStoredState)),
+            };
+        }
+        insert_idempotency(
+            &transaction,
+            idempotency,
+            "in_progress",
+            "v1.setup_verification.pending",
+            None,
+            None,
+            None,
+        )?;
+        transaction
+            .commit()
+            .map_err(|source| sqlite_error(StorageErrorKind::OperationFailed, source))?;
+        Ok(None)
+    }
+
+    pub(crate) fn complete_setup_verification(
+        &mut self,
+        idempotency: &IdempotencyInput,
+        result_json: &str,
+        failed: bool,
+        completed_at: OffsetDateTime,
+    ) -> Result<(), StorageError> {
+        require_operation(idempotency, IdempotentOperation::SetupVerification)?;
+        if result_json.is_empty() {
+            return Err(StorageError::new(StorageErrorKind::InvalidInput));
+        }
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|source| sqlite_error(StorageErrorKind::OperationFailed, source))?;
+        let record = matching_idempotency(&transaction, idempotency)?
+            .ok_or_else(|| StorageError::new(StorageErrorKind::InvalidStoredState))?;
+        if record.status != "in_progress"
+            || record.durable_outcome != "v1.setup_verification.pending"
+            || record.result_json.is_some()
+        {
+            return Err(StorageError::new(StorageErrorKind::InvalidStoredState));
+        }
+        let updated = transaction
+            .execute(
+                "UPDATE idempotency_records
+                 SET status = 'terminal',
+                     durable_outcome = ?1,
+                     result_json = ?2,
+                     completed_at = ?3,
+                     expires_at = ?4
+                 WHERE principal_ref = ?5
+                   AND operation = ?6
+                   AND idempotency_key = ?7
+                   AND status = 'in_progress'",
+                rusqlite::params![
+                    if failed {
+                        "v1.setup_verification.failed"
+                    } else {
+                        "v1.setup_verification.completed"
+                    },
+                    result_json,
+                    self::codec::format_time(completed_at)?,
+                    self::codec::format_time(idempotency.expires_at)?,
+                    idempotency.principal_ref.as_str(),
+                    self::codec::idempotent_operation_token(idempotency.operation),
+                    idempotency.key.as_str(),
+                ],
+            )
+            .map_err(|source| sqlite_error(StorageErrorKind::OperationFailed, source))?;
+        if updated != 1 {
+            return Err(StorageError::new(StorageErrorKind::StateConflict));
+        }
+        transaction
+            .commit()
+            .map_err(|source| sqlite_error(StorageErrorKind::OperationFailed, source))
+    }
+
+    pub(crate) fn invalidate_native_readiness_idempotent<M>(
+        &mut self,
+        idempotency: &IdempotencyInput,
+        key: Option<&ReadinessCacheKey>,
+        completed_at: OffsetDateTime,
+        map_failure: M,
+    ) -> Result<NativeReadinessInvalidationReplay, StorageError>
+    where
+        M: FnOnce(&StorageError) -> SatelleError,
+    {
+        require_operation(
+            idempotency,
+            IdempotentOperation::NativeReadinessInvalidation,
+        )?;
+        let mut transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|source| sqlite_error(StorageErrorKind::OperationFailed, source))?;
+        if let Some(record) = matching_idempotency(&transaction, idempotency)? {
+            let replay = match (
+                record.status.as_str(),
+                record.durable_outcome.as_str(),
+                record.result_json,
+            ) {
+                (
+                    "terminal",
+                    "v1.native_readiness_invalidation.completed"
+                    | "v1.native_readiness_invalidation.failed",
+                    Some(result_json),
+                ) => serde_json::from_str(&result_json)
+                    .map_err(|_| StorageError::new(StorageErrorKind::InvalidStoredState))?,
+                _ => return Err(StorageError::new(StorageErrorKind::InvalidStoredState)),
+            };
+            transaction
+                .commit()
+                .map_err(|source| sqlite_error(StorageErrorKind::OperationFailed, source))?;
+            return Ok(replay);
+        }
+
+        let savepoint = transaction
+            .savepoint()
+            .map_err(|source| sqlite_error(StorageErrorKind::OperationFailed, source))?;
+        let invalidated = auth::host_identity(&savepoint).and_then(|host_identity| {
+            key.map_or(Ok(0), |key| {
+                operational::invalidate_native_readiness_for_key(
+                    &savepoint,
+                    host_identity.as_str(),
+                    key,
+                )
+            })
+        });
+        let replay = match invalidated {
+            Ok(deleted) => {
+                savepoint
+                    .commit()
+                    .map_err(|source| sqlite_error(StorageErrorKind::OperationFailed, source))?;
+                NativeReadinessInvalidationReplay::Completed(deleted)
+            }
+            Err(error) => {
+                savepoint
+                    .finish()
+                    .map_err(|source| sqlite_error(StorageErrorKind::OperationFailed, source))?;
+                NativeReadinessInvalidationReplay::Failed(map_failure(&error))
+            }
+        };
+        let failed = matches!(replay, NativeReadinessInvalidationReplay::Failed(_));
+        let result_json = serde_json::to_string(&replay).map_err(|source| {
+            StorageError::with_source(StorageErrorKind::OperationFailed, source)
+        })?;
+        insert_terminal_json_idempotency(
+            &transaction,
+            idempotency,
+            if failed {
+                "v1.native_readiness_invalidation.failed"
+            } else {
+                "v1.native_readiness_invalidation.completed"
+            },
+            &result_json,
+            completed_at,
+        )?;
+        transaction
+            .commit()
+            .map_err(|source| sqlite_error(StorageErrorKind::OperationFailed, source))?;
+        Ok(replay)
     }
 
     pub(crate) fn provider_binding_authorization_replay(

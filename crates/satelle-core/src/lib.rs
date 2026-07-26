@@ -3756,6 +3756,7 @@ pub enum ErrorCode {
     UnsupportedUpdateComponent,
     PersistentServiceUnsupported,
     SetupConsentRequired,
+    SetupVerificationFailed,
     DoctorFixConsentRequired,
     InputRequired,
     Interrupted,
@@ -3854,6 +3855,7 @@ impl ErrorCode {
             Self::UnsupportedUpdateComponent => "unsupported-update-component",
             Self::PersistentServiceUnsupported => "persistent-service-unsupported",
             Self::SetupConsentRequired => "setup-consent-required",
+            Self::SetupVerificationFailed => "setup-verification-failed",
             Self::DoctorFixConsentRequired => "doctor-fix-consent-required",
             Self::InputRequired => "input-required",
             Self::Interrupted => "interrupted",
@@ -3945,6 +3947,7 @@ impl ErrorCode {
             | Self::DesktopSessionNativeSelectorWrongPlatform
             | Self::DesktopSessionNativeSelectorUnmatched
             | Self::DoctorReadinessBlockersFound
+            | Self::SetupVerificationFailed
             | Self::StateConflict
             | Self::StopNotConfirmed => 75,
             Self::NotImplemented => 70,
@@ -3978,6 +3981,45 @@ impl SatelleError {
             recovery_command: Some("satelle --help".to_string()),
             source_detail: None,
             details: BTreeMap::new(),
+        }
+    }
+
+    pub fn setup_verification_failed(report: &SetupReport) -> Self {
+        let recovery_command = report.recovery_commands.first().cloned();
+        let mut details = BTreeMap::new();
+        details.insert("changed".to_string(), Value::Bool(report.changed));
+        details.insert(
+            "applied_actions".to_string(),
+            serde_json::to_value(&report.applied_actions)
+                .unwrap_or_else(|_| Value::Array(Vec::new())),
+        );
+        details.insert(
+            "verification".to_string(),
+            serde_json::to_value(&report.verification).unwrap_or(Value::Null),
+        );
+        details.insert(
+            "cache_updates".to_string(),
+            serde_json::to_value(
+                report
+                    .verification
+                    .as_ref()
+                    .map(|verification| verification.cache_updates.as_slice())
+                    .unwrap_or_default(),
+            )
+            .unwrap_or_else(|_| Value::Array(Vec::new())),
+        );
+        details.insert(
+            "recovery_commands".to_string(),
+            serde_json::to_value(&report.recovery_commands)
+                .unwrap_or_else(|_| Value::Array(Vec::new())),
+        );
+
+        Self {
+            code: ErrorCode::SetupVerificationFailed,
+            message: "setup completed, but live readiness verification did not pass".to_string(),
+            recovery_command,
+            source_detail: None,
+            details,
         }
     }
 
@@ -6019,6 +6061,40 @@ pub enum SetupSchemaVersion {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SetupVerification {
+    pub status: String,
+    pub planned_checks: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub result: Option<DoctorReport>,
+    pub cache_updates: Vec<String>,
+}
+
+impl SetupVerification {
+    pub fn planned(planned_checks: Vec<String>) -> Self {
+        Self {
+            status: "planned".to_string(),
+            planned_checks,
+            result: None,
+            cache_updates: Vec::new(),
+        }
+    }
+
+    pub fn completed(
+        status: impl Into<String>,
+        planned_checks: Vec<String>,
+        result: DoctorReport,
+        cache_updates: Vec<String>,
+    ) -> Self {
+        Self {
+            status: status.into(),
+            planned_checks,
+            result: Some(result),
+            cache_updates,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SetupReport {
     pub schema_version: SetupSchemaVersion,
     pub host: String,
@@ -6026,6 +6102,8 @@ pub struct SetupReport {
     pub status: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cancellation_reason: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub verification: Option<SetupVerification>,
     pub setup_mode: String,
     pub service_persistent: bool,
     pub service_scope: String,

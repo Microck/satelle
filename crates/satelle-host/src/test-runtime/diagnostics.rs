@@ -139,6 +139,7 @@ pub(super) fn setup(
         dry_run,
         status: "planned".to_string(),
         cancellation_reason: None,
+        verification: None,
         setup_mode,
         service_persistent,
         service_scope,

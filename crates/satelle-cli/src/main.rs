@@ -37,14 +37,14 @@ use satelle_core::session::{
 };
 use satelle_core::{
     BEACON_CORAL, CLI_NAME, DaemonPathOverrides, DesktopSelectionPolicy, DesktopSessionPreference,
-    DoctorEventRecord, DoctorOptions, DoctorReport, ERROR_RED, ErrorCode, EventSource, EventType,
-    HostConfig, HostSessionsReport, LOCAL_DEMO_HOST, MutationCommandFamily, OwnerOnlyDirectory,
-    PRODUCT_NAME, ProfileField, ProfileSelectionSource, ProviderSecretSource, RELAY_ROSE,
-    ResolvedConfig, SUCCESS_GREEN, SatelleError, SatelleEvent, SatelleEventBody, SecureFileError,
-    SessionId, SetupMode, SetupReadinessSummary, SetupReport, SetupRequiredInput,
-    SetupSchemaVersion, load_config, load_config_for_profile, load_config_without_profile,
-    load_user_api_rate_limits, open_or_create_owner_only_directory, open_or_create_owner_only_file,
-    open_owner_only_directory, read_owner_controlled_config_file,
+    DoctorEventRecord, DoctorFixability, DoctorOptions, DoctorReport, ERROR_RED, ErrorCode,
+    EventSource, EventType, HostConfig, HostSessionsReport, LOCAL_DEMO_HOST, MutationCommandFamily,
+    OwnerOnlyDirectory, PRODUCT_NAME, ProfileField, ProfileSelectionSource, ProviderSecretSource,
+    RELAY_ROSE, ResolvedConfig, SUCCESS_GREEN, SatelleError, SatelleEvent, SatelleEventBody,
+    SecureFileError, SessionId, SetupMode, SetupReadinessSummary, SetupReport, SetupRequiredInput,
+    SetupSchemaVersion, SetupVerification, load_config, load_config_for_profile,
+    load_config_without_profile, load_user_api_rate_limits, open_or_create_owner_only_directory,
+    open_or_create_owner_only_file, open_owner_only_directory, read_owner_controlled_config_file,
     read_owner_only_secret_config_file, resolve_desktop_session, resolve_path_set, utc_now,
 };
 use satelle_host::{
@@ -52,7 +52,8 @@ use satelle_host::{
 };
 use satelle_transport::{
     DaemonServer, DaemonServerConfig, DaemonServerError, DaemonTlsConfig, DaemonTlsConfigError,
-    DaemonTlsReloadError, DaemonTlsReloader, ProviderBindingAuthorization, TurnRequest,
+    DaemonTlsReloadError, DaemonTlsReloader, ProviderBindingAuthorization,
+    SetupVerificationRequest, TurnRequest,
 };
 use serde_json::json;
 use std::collections::{BTreeMap, BTreeSet};
@@ -269,6 +270,11 @@ struct SetupCommand {
     host: Option<String>,
     #[arg(long)]
     dry_run: bool,
+    #[arg(
+        long,
+        help = "Run live native Computer Use readiness checks and any required provider smoke test after setup"
+    )]
+    verify: bool,
     #[arg(long)]
     on_demand: bool,
     #[arg(long)]
@@ -1978,6 +1984,7 @@ fn cli_owned_setup_report(
         mutation_planned: false,
         native_computer_use_readiness: "not_checked".to_string(),
         next_command: "satelle doctor --scope computer-use --refresh --json".to_string(),
+        verification: None,
     }
 }
 
@@ -2005,6 +2012,47 @@ fn add_setup_component_plan(report: &mut SetupReport) {
         {
             report.planned_actions.push((*action).to_string());
         }
+    }
+}
+
+fn setup_verification_checks(provider_probe_required: bool) -> Vec<String> {
+    let mut checks = vec!["native_computer_use".to_string()];
+    if provider_probe_required {
+        checks.push("provider_computer_use".to_string());
+    }
+    checks
+}
+
+fn add_setup_verification_plan(report: &mut SetupReport, checks: &[String]) {
+    report.verification = Some(SetupVerification::planned(checks.to_vec()));
+    if !report
+        .planned_actions
+        .iter()
+        .any(|action| action == "run live native Computer Use readiness verification")
+    {
+        report
+            .planned_actions
+            .push("run live native Computer Use readiness verification".to_string());
+    }
+    if checks.iter().any(|check| check == "provider_computer_use")
+        && !report
+            .planned_actions
+            .iter()
+            .any(|action| action == "run required provider Computer Use smoke verification")
+    {
+        report
+            .planned_actions
+            .push("run required provider Computer Use smoke verification".to_string());
+    }
+}
+
+fn ensure_exact_setup_verification_recovery(report: &mut SetupReport, host: &str) {
+    let recovery = format!(
+        "satelle setup --host {} --verify --no-input",
+        shell_argument(host)
+    );
+    if !report.recovery_commands.contains(&recovery) {
+        report.recovery_commands.insert(0, recovery);
     }
 }
 
@@ -2220,6 +2268,12 @@ fn run_setup(
     let first_ssh_trust = host.config.transport == satelle_core::TransportKind::Ssh
         && (host.config.expected_host_id.is_none() || path_rebind);
     let setup_components = setup_components(&command.component).map_err(failure)?;
+    let native_affecting_setup = setup_components.iter().any(|component| {
+        matches!(
+            component.as_str(),
+            "all" | "host" | "codex" | "computer-use" | "desktop"
+        )
+    });
     let provider_auth_setup = setup_components
         .iter()
         .any(|component| component == "all" || component == "provider-auth");
@@ -2254,9 +2308,49 @@ fn run_setup(
     let trusted_consent = trusted_profile_allows_setup(resolved, &host.alias);
     let mut provider_selection =
         resolve_provider_selection(resolved, &host, None, None, false, false)?;
+    let provider_probe_required = if command.verify {
+        doctor_provider_intent(resolved, &host.config, true, None)
+            .map_err(failure)?
+            .provider_probe_required()
+    } else {
+        false
+    };
+    let verification_checks = setup_verification_checks(provider_probe_required);
     let mut provider_auth_validation = None;
     let mut pending_provider_auth = None;
     let mut pending_provider_binding_authorization = None;
+    if first_ssh_trust
+        && !command.dry_run
+        && !command.yes
+        && !trusted_consent
+        && (command.no_input || !io::stdin().is_terminal())
+    {
+        // First-time SSH discovery can upload and start a temporary Host. Reject before
+        // constructing that transport so missing consent cannot cause remote mutations.
+        let mut consent_report =
+            cli_owned_setup_report(&host.alias, false, &setup_mode, setup_components.clone());
+        add_setup_component_plan(&mut consent_report);
+        consent_report.mutation_planned = true;
+        consent_report.planned_actions.insert(
+            0,
+            "bootstrap the temporary Host Daemon, discover its Host Identity, and persist explicit trust"
+                .to_string(),
+        );
+        if command.verify {
+            add_setup_verification_plan(&mut consent_report, &verification_checks);
+        }
+        let consent_recovery_command = setup_consent_recovery_command(
+            &command,
+            config.flag_profile,
+            &setup_mode,
+            &daemon_path_overrides,
+            true,
+        );
+        return Err(failure(SatelleError::setup_consent_required(
+            &consent_report.planned_actions,
+            &consent_recovery_command,
+        )));
+    }
     let mut transport = if tailscale_serve_setup || !host_setup_required {
         None
     } else {
@@ -2291,6 +2385,9 @@ fn run_setup(
     };
     report.setup_components.clone_from(&setup_components);
     add_setup_component_plan(&mut report);
+    if command.verify {
+        add_setup_verification_plan(&mut report, &verification_checks);
+    }
     if let Some(decision) = &local_service_decision {
         apply_service_decision_to_report(&mut report, decision);
     }
@@ -2345,6 +2442,10 @@ fn run_setup(
                 .to_string(),
         );
     }
+    // Capture this before provider-auth planning can mark an otherwise native-stable
+    // setup as mutating. First SSH trust has no prior authenticated Host cache.
+    let native_readiness_invalidation_planned =
+        native_affecting_setup && report.mutation_planned && !first_ssh_trust;
 
     if provider_auth_setup && !command.dry_run && report.required_input.is_empty() {
         let provider_aliases = match (
@@ -2466,6 +2567,8 @@ fn run_setup(
     };
 
     let mut prompted_for_consent = false;
+    let mut verification_cache_updates = Vec::new();
+    let mut native_invalidation_action = None;
     if !command.dry_run && report.required_input.is_empty() && report.mutation_planned {
         if !command.yes && !trusted_consent && (command.no_input || !io::stdin().is_terminal()) {
             let consent_recovery_command = setup_consent_recovery_command(
@@ -2508,6 +2611,43 @@ fn run_setup(
             if !confirmed {
                 return finish_cancelled_setup(&mut report, json);
             }
+        }
+
+        if native_readiness_invalidation_planned {
+            // The configured Host still identifies the old readiness key here. Invalidate
+            // after consent but before any setup write changes that identity.
+            let invalidation_request = SetupVerificationRequest::new(
+                provider_selection.requested_model_alias.clone(),
+                provider_selection.requested_provider_alias.clone(),
+                provider_selection.model_alias_from_project,
+                provider_selection.provider_alias_from_project,
+                provider_selection.experimental_provider_computer_use,
+            )
+            .map_err(|message| failure(SatelleError::invalid_usage(message)))?;
+            let invalidated =
+                match transport_for(&host)?.invalidate_native_readiness(&invalidation_request) {
+                    Ok(invalidated) => invalidated,
+                    Err(error) if command.verify => {
+                        ensure_exact_setup_verification_recovery(&mut report, &host.alias);
+                        if let Some(recovery) = error.recovery_command.as_ref()
+                            && !report.recovery_commands.contains(recovery)
+                        {
+                            report.recovery_commands.push(recovery.clone());
+                        }
+                        report.status = "failed".to_string();
+                        report.verification = Some(SetupVerification {
+                            status: "failed".to_string(),
+                            planned_checks: verification_checks.clone(),
+                            result: None,
+                            cache_updates: verification_cache_updates,
+                        });
+                        return Err(failure(SatelleError::setup_verification_failed(&report)));
+                    }
+                    Err(error) => return Err(failure(error)),
+                };
+            let cache_update = format!("invalidated_native_readiness_results:{invalidated}");
+            verification_cache_updates.push(cache_update.clone());
+            native_invalidation_action = Some(cache_update);
         }
 
         if let Some(discovery) = &first_ssh_discovery {
@@ -2688,6 +2828,14 @@ fn run_setup(
                 report.status = "applied".to_string();
             }
         }
+        if let Some(action) = native_invalidation_action.take() {
+            report.applied_actions.push(action);
+            report.mutated = true;
+            report.changed = true;
+            if report.status == "planned" {
+                report.status = "applied".to_string();
+            }
+        }
         if first_ssh_trust {
             report.applied_actions.insert(
                 0,
@@ -2695,6 +2843,96 @@ fn run_setup(
             );
             report.mutated = true;
             report.changed = true;
+        }
+    }
+
+    // A Host setup response replaces the planning report. Restore the verification plan
+    // before invalidation and live verification so all result paths retain the same contract.
+    if command.verify {
+        add_setup_verification_plan(&mut report, &verification_checks);
+    }
+
+    if command.verify && !command.dry_run && report.required_input.is_empty() {
+        let verification_request = SetupVerificationRequest::new(
+            provider_selection.requested_model_alias.clone(),
+            provider_selection.requested_provider_alias.clone(),
+            provider_selection.model_alias_from_project,
+            provider_selection.provider_alias_from_project,
+            provider_selection.experimental_provider_computer_use,
+        )
+        .map_err(|message| failure(SatelleError::invalid_usage(message)))?;
+        let verification_response = match transport_for(&host)?.verify_setup(&verification_request)
+        {
+            Ok(response) => response,
+            Err(error) => {
+                ensure_exact_setup_verification_recovery(&mut report, &host.alias);
+                if let Some(recovery) = error.recovery_command.as_ref()
+                    && !report.recovery_commands.contains(recovery)
+                {
+                    report.recovery_commands.push(recovery.clone());
+                }
+                report.status = "failed".to_string();
+                report.verification = Some(SetupVerification {
+                    status: "failed".to_string(),
+                    planned_checks: verification_checks.clone(),
+                    result: None,
+                    cache_updates: verification_cache_updates,
+                });
+                return Err(failure(SatelleError::setup_verification_failed(&report)));
+            }
+        };
+        let verification_report = verification_response;
+        let ready = verification_report.summary.ready;
+        let manual_action_required = verification_report
+            .findings
+            .iter()
+            .any(|finding| finding.fixability == DoctorFixability::ManualActionRequired);
+        let verification_status = if ready {
+            "passed"
+        } else if manual_action_required {
+            "manual_action_required"
+        } else {
+            "failed"
+        };
+        let doctor_recovery_available = !verification_report.recovery_commands.is_empty();
+        for recovery in verification_report.recovery_commands.iter().rev() {
+            if !report.recovery_commands.contains(recovery) {
+                report.recovery_commands.insert(0, recovery.clone());
+            }
+        }
+        for cache_update in &verification_report.cache_updates {
+            if !verification_cache_updates.contains(cache_update) {
+                verification_cache_updates.push(cache_update.clone());
+            }
+        }
+        if !ready && !doctor_recovery_available {
+            ensure_exact_setup_verification_recovery(&mut report, &host.alias);
+        }
+        report.native_computer_use_readiness = if ready {
+            "ready".to_string()
+        } else {
+            verification_status.to_string()
+        };
+        report.readiness_summary.native_computer_use = report.native_computer_use_readiness.clone();
+        if verification_checks
+            .iter()
+            .any(|check| check == "provider_computer_use")
+        {
+            report.readiness_summary.provider_auth = if ready {
+                "ready".to_string()
+            } else {
+                verification_status.to_string()
+            };
+        }
+        report.verification = Some(SetupVerification::completed(
+            verification_status,
+            verification_checks.clone(),
+            verification_report,
+            verification_cache_updates,
+        ));
+        if !ready {
+            report.status = verification_status.to_string();
+            return Err(failure(SatelleError::setup_verification_failed(&report)));
         }
     }
 
@@ -3166,6 +3404,9 @@ fn setup_consent_recovery_command(
             "--expected-host-id".to_string(),
             shell_argument(expected_host_id),
         ]);
+    }
+    if command.verify {
+        arguments.push("--verify".to_string());
     }
     if first_ssh_trust && command.expected_host_id.is_none() {
         // The first trust prompt must remain interactive unless the operator
@@ -8012,6 +8253,15 @@ fn print_setup_human(report: &SetupReport) {
     );
     for action in &report.planned_actions {
         println!("Plan: {action}");
+    }
+    if let Some(verification) = &report.verification {
+        println!("Verification: {}", verification.status);
+        for check in &verification.planned_checks {
+            println!("Verification check: {check}");
+        }
+        for cache_update in &verification.cache_updates {
+            println!("Verification cache: {cache_update}");
+        }
     }
     for override_entry in &report.daemon_path_overrides {
         println!(

@@ -4,9 +4,10 @@ use super::{ApiFailure, DaemonState, api_error_response, authenticated_json_resp
 use crate::contract::{
     ApiErrorCategory, ApiErrorCode, BootstrapMaintenanceResponse, DURABLE_SETUP_PENDING_TTL,
     DurableTokenActivationResponse, DurableTokenConfirmationResponse, DurableTokenIssuanceResponse,
+    NativeReadinessInvalidationRequest, NativeReadinessInvalidationResponse,
     ProviderBindingAuthorizationRequest, ProviderBindingAuthorizationResponse,
     ProviderBindingDeletionResponse, ProviderDescriptorValidationRequest,
-    ProviderDescriptorValidationResponse,
+    ProviderDescriptorValidationResponse, SetupVerificationRequest, SetupVerificationResponse,
 };
 use axum::extract::{Extension, Path, State};
 use axum::http::StatusCode;
@@ -40,6 +41,88 @@ enum SetupTokenMutationOutcome {
     Conflict,
     HostError(SatelleError),
     TaskFailure,
+}
+
+pub(super) async fn verify_setup(
+    State(state): State<Arc<DaemonState>>,
+    Extension(authorized): Extension<AuthorizedRequest>,
+    Extension(authority): Extension<MutationAuthority>,
+    ApiJson(request): ApiJson<SetupVerificationRequest>,
+) -> Response {
+    let service = Arc::clone(&state.service);
+    let model_alias = request.model_alias().map(str::to_string);
+    let provider_alias = request.provider_alias().map(str::to_string);
+    let model_from_project = request.model_from_project();
+    let provider_from_project = request.provider_from_project();
+    let experimental_provider_computer_use = request.experimental_provider_computer_use();
+    let verification = match tokio::task::spawn_blocking(move || {
+        service.verify_setup_idempotent(
+            &authority,
+            model_alias.as_deref(),
+            provider_alias.as_deref(),
+            model_from_project,
+            provider_from_project,
+            experimental_provider_computer_use,
+        )
+    })
+    .await
+    {
+        Ok(Ok(verification)) => verification,
+        Ok(Err(error)) => return host_error::response(&state, &authorized, &error),
+        Err(_) => return host_error::task_failure(&state, &authorized),
+    };
+    let response = SetupVerificationResponse::new(
+        authorized.request_id().clone(),
+        state.host_identity.clone(),
+        verification,
+    );
+    authenticated_json_response(
+        StatusCode::OK,
+        &response,
+        authorized.request_id(),
+        &state.host_identity,
+    )
+}
+
+pub(super) async fn invalidate_native_readiness(
+    State(state): State<Arc<DaemonState>>,
+    Extension(authorized): Extension<AuthorizedRequest>,
+    Extension(authority): Extension<MutationAuthority>,
+    ApiJson(request): ApiJson<NativeReadinessInvalidationRequest>,
+) -> Response {
+    let service = Arc::clone(&state.service);
+    let model_alias = request.model_alias().map(str::to_string);
+    let provider_alias = request.provider_alias().map(str::to_string);
+    let model_from_project = request.model_from_project();
+    let provider_from_project = request.provider_from_project();
+    let experimental_provider_computer_use = request.experimental_provider_computer_use();
+    let deleted = match tokio::task::spawn_blocking(move || {
+        service.invalidate_native_readiness_idempotent(
+            &authority,
+            model_alias.as_deref(),
+            provider_alias.as_deref(),
+            model_from_project,
+            provider_from_project,
+            experimental_provider_computer_use,
+        )
+    })
+    .await
+    {
+        Ok(Ok(deleted)) => deleted,
+        Ok(Err(error)) => return host_error::response(&state, &authorized, &error),
+        Err(_) => return host_error::task_failure(&state, &authorized),
+    };
+    let response = NativeReadinessInvalidationResponse::new(
+        authorized.request_id().clone(),
+        state.host_identity.clone(),
+        deleted,
+    );
+    authenticated_json_response(
+        StatusCode::OK,
+        &response,
+        authorized.request_id(),
+        &state.host_identity,
+    )
 }
 
 pub(super) async fn validate_provider_descriptor(

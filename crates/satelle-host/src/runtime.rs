@@ -42,10 +42,10 @@ use crate::live_events::LiveEventHub;
 use crate::process_identity::ProcessIdentity;
 use crate::storage::{
     AdmissionOutcome, ApiTokenRegistration, IdempotentOperation, LeaseOwner, LogPageStorageError,
-    ObservedUpstreamRef, OperatorLogMirror, OperatorLogPolicy, ProviderBindingAuthorizationReplay,
-    ProviderBindingDeletionReplay, ReadinessProbeKind, ReadinessProbeTerminal,
-    SensitiveRequestDigest, SetupActionSkipReason, SetupRepairPlan, SetupRepairProbe, SetupRunPlan,
-    SetupRunRecord, SetupRunStatus, Storage, StorageSnapshot,
+    NativeReadinessInvalidationReplay, ObservedUpstreamRef, OperatorLogMirror, OperatorLogPolicy,
+    ProviderBindingAuthorizationReplay, ProviderBindingDeletionReplay, ReadinessProbeKind,
+    ReadinessProbeTerminal, SensitiveRequestDigest, SetupActionSkipReason, SetupRepairPlan,
+    SetupRepairProbe, SetupRunPlan, SetupRunRecord, SetupRunStatus, Storage, StorageSnapshot,
 };
 use crate::{ApiBearerToken, ApiPrincipal, DaemonLogPage, LogCursor, LogPageQuery};
 use recovery::RecoveryQueue;
@@ -81,6 +81,13 @@ pub(crate) struct RuntimeTurnOutcome {
 #[serde(tag = "status", content = "result", rename_all = "snake_case")]
 enum ProviderDescriptorValidationReplay {
     Completed(satelle_core::PublicProviderDescriptorValidation),
+    Failed(SatelleError),
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(tag = "status", content = "result", rename_all = "snake_case")]
+enum SetupVerificationReplay {
+    Completed(satelle_core::DoctorReport),
     Failed(SatelleError),
 }
 
@@ -892,10 +899,65 @@ impl RuntimeEngine {
         provider_intent: &ProviderComputerUseIntent,
         cancellation: &AdmissionCancellation,
     ) -> Result<AdapterReadiness, SatelleError> {
+        self.preflight_with_native(host, provider_intent, cancellation, None)
+    }
+
+    fn preflight_with_native(
+        &self,
+        host: &str,
+        provider_intent: &ProviderComputerUseIntent,
+        cancellation: &AdmissionCancellation,
+        supplied_native: Option<ReadinessEvidence>,
+    ) -> Result<AdapterReadiness, SatelleError> {
         if cancellation.is_requested() {
             cancellation.finish(AdmissionCancellationState::Cancelled);
             return Err(SatelleError::interrupted_attached_command());
         }
+        // Native readiness is independent of provider credentials. Prove this
+        // phase before provider authorization so a missing secret cannot hide
+        // the current native Host state.
+        let native_cache_key = self.adapter.readiness_cache_key(host, provider_intent)?;
+        if let (Some(key), Some(driver)) = (
+            native_cache_key.as_ref(),
+            self.readiness_probe_driver.as_ref(),
+        ) {
+            self.reconcile_readiness_probe(key, driver.as_ref(), ReadinessProbeKind::Native)?;
+        }
+        let mut cached = match supplied_native {
+            Some(evidence)
+                if native_cache_key
+                    .as_ref()
+                    .is_some_and(|key| key.matches_evidence(&evidence)) =>
+            {
+                Some(evidence)
+            }
+            Some(_) => {
+                return Err(integrity_error(
+                    "supplied native readiness does not match the current Host cache key",
+                ));
+            }
+            None if provider_intent.refresh() => None,
+            None => {
+                if let Some(key) = native_cache_key.as_ref() {
+                    self.lock_storage()?
+                        .load_reusable_readiness(key, time::OffsetDateTime::now_utc())
+                        .map_err(model::storage_failure)?
+                } else {
+                    None
+                }
+            }
+        };
+        if cached.is_none()
+            && let (Some(key), Some(driver)) = (
+                native_cache_key.as_ref(),
+                self.readiness_probe_driver.as_ref(),
+            )
+        {
+            cached = Some(self.run_live_native_probe(key, driver.as_ref(), cancellation)?);
+        }
+
+        // Provider authorization and provider-smoke ownership begin only
+        // after native readiness has completed successfully.
         let provider_intent = self.authorize_provider_intent(host, provider_intent)?;
         let cache_key = self.adapter.readiness_cache_key(host, &provider_intent)?;
         let provider_smoke_enabled = cache_key.as_ref().is_some_and(|key| {
@@ -907,32 +969,19 @@ impl RuntimeEngine {
         if let (Some(key), Some(driver)) =
             (cache_key.as_ref(), self.readiness_probe_driver.as_ref())
         {
-            self.reconcile_readiness_probe(key, driver.as_ref(), ReadinessProbeKind::Native)?;
             self.reconcile_readiness_probe(key, driver.as_ref(), ReadinessProbeKind::Provider)?;
         }
-        let (mut cached, cached_provider) = if let Some(key) = cache_key.as_ref() {
-            let now = time::OffsetDateTime::now_utc();
-            let storage = self.lock_storage()?;
-            let readiness = storage
-                .load_reusable_readiness(key, now)
-                .map_err(model::storage_failure)?;
-            let provider = if provider_smoke_enabled && !provider_intent.refresh() {
-                storage
-                    .load_reusable_provider_smoke(key, now)
+        let cached_provider = if let Some(key) = cache_key.as_ref() {
+            if provider_smoke_enabled && !provider_intent.refresh() {
+                self.lock_storage()?
+                    .load_reusable_provider_smoke(key, time::OffsetDateTime::now_utc())
                     .map_err(model::storage_failure)?
             } else {
                 None
-            };
-            (readiness, provider)
+            }
         } else {
-            (None, None)
+            None
         };
-        if cached.is_none()
-            && let (Some(key), Some(driver)) =
-                (cache_key.as_ref(), self.readiness_probe_driver.as_ref())
-        {
-            cached = Some(self.run_live_native_probe(key, driver.as_ref(), cancellation)?);
-        }
         // The adapter resolves the exact credential only inside preflight.
         // Hold probe ownership even for a cache candidate so credential
         // rotation cannot turn that candidate into untracked live provider I/O.
@@ -2448,6 +2497,46 @@ impl RuntimeHandle {
             .preflight(host, provider_intent, &AdmissionCancellation::new())
     }
 
+    /// Runs only the live native setup phase for the current explicit Host
+    /// context. Provider authorization cannot run before this returns.
+    pub(crate) fn refresh_setup_native_readiness(
+        &self,
+        host: &str,
+        provider_intent: &ProviderComputerUseIntent,
+    ) -> Result<ReadinessEvidence, SatelleError> {
+        let _activity = self.activity.begin();
+        let engine = self.engine()?;
+        let cancellation = AdmissionCancellation::new();
+        let key = engine
+            .adapter
+            .readiness_cache_key(host, provider_intent)?
+            .ok_or_else(SatelleError::computer_use_not_ready)?;
+        let driver = engine
+            .readiness_probe_driver
+            .as_ref()
+            .ok_or_else(SatelleError::computer_use_not_ready)?;
+        engine.reconcile_readiness_probe(&key, driver.as_ref(), ReadinessProbeKind::Native)?;
+        engine.run_live_native_probe(&key, driver.as_ref(), &cancellation)
+    }
+
+    /// Runs provider authorization and a live provider smoke probe using the
+    /// native evidence returned by `refresh_setup_native_readiness`.
+    pub(crate) fn refresh_setup_provider_readiness(
+        &self,
+        host: &str,
+        provider_intent: &ProviderComputerUseIntent,
+        native: ReadinessEvidence,
+    ) -> Result<AdapterReadiness, SatelleError> {
+        let _activity = self.activity.begin();
+        let intent = provider_intent.clone().with_refresh(true);
+        self.engine()?.preflight_with_native(
+            host,
+            &intent,
+            &AdmissionCancellation::new(),
+            Some(native),
+        )
+    }
+
     pub(crate) fn resolve_provider_binding(
         &self,
         host: &str,
@@ -2721,6 +2810,125 @@ impl RuntimeHandle {
         self.engine()?
             .lock_storage()?
             .complete_provider_descriptor_validation(&idempotency, &result_json, true, completed_at)
+            .map_err(model::storage_failure)
+    }
+
+    pub(crate) fn claim_setup_verification(
+        &self,
+        identity: &RequestIdentity,
+    ) -> Result<Option<satelle_core::DoctorReport>, SatelleError> {
+        let requested_at = time::OffsetDateTime::now_utc();
+        let idempotency = model::idempotency(
+            IdempotentOperation::SetupVerification,
+            identity,
+            requested_at,
+        )?;
+        let replay = self
+            .engine()?
+            .lock_storage()?
+            .claim_setup_verification(&idempotency)
+            .map_err(model::storage_failure)?;
+        match replay
+            .map(|json| {
+                serde_json::from_str(&json).map_err(|_| {
+                    integrity_error("stored setup verification replay is not valid canonical JSON")
+                })
+            })
+            .transpose()?
+        {
+            Some(SetupVerificationReplay::Completed(result)) => Ok(Some(result)),
+            Some(SetupVerificationReplay::Failed(error)) => Err(error),
+            None => Ok(None),
+        }
+    }
+
+    pub(crate) fn complete_setup_verification(
+        &self,
+        identity: &RequestIdentity,
+        result: &satelle_core::DoctorReport,
+    ) -> Result<(), SatelleError> {
+        let completed_at = time::OffsetDateTime::now_utc();
+        let idempotency = model::idempotency(
+            IdempotentOperation::SetupVerification,
+            identity,
+            completed_at,
+        )?;
+        let result_json = serde_json::to_string(&SetupVerificationReplay::Completed(
+            result.clone(),
+        ))
+        .map_err(|_| {
+            integrity_error("setup verification result could not be serialized for durable replay")
+        })?;
+        self.engine()?
+            .lock_storage()?
+            .complete_setup_verification(&idempotency, &result_json, false, completed_at)
+            .map_err(model::storage_failure)
+    }
+
+    pub(crate) fn fail_setup_verification(
+        &self,
+        identity: &RequestIdentity,
+        error: &SatelleError,
+    ) -> Result<(), SatelleError> {
+        let completed_at = time::OffsetDateTime::now_utc();
+        let idempotency = model::idempotency(
+            IdempotentOperation::SetupVerification,
+            identity,
+            completed_at,
+        )?;
+        let result_json = serde_json::to_string(&SetupVerificationReplay::Failed(error.clone()))
+            .map_err(|_| {
+                integrity_error(
+                    "setup verification failure could not be serialized for durable replay",
+                )
+            })?;
+        self.engine()?
+            .lock_storage()?
+            .complete_setup_verification(&idempotency, &result_json, true, completed_at)
+            .map_err(model::storage_failure)
+    }
+
+    pub(crate) fn invalidate_native_readiness_idempotent(
+        &self,
+        identity: &RequestIdentity,
+        host: &str,
+        provider_intent: &ProviderComputerUseIntent,
+    ) -> Result<u64, SatelleError> {
+        let completed_at = time::OffsetDateTime::now_utc();
+        let idempotency = model::idempotency(
+            IdempotentOperation::NativeReadinessInvalidation,
+            identity,
+            completed_at,
+        )?;
+        let engine = self.engine()?;
+        let key = engine.adapter.readiness_cache_key(host, provider_intent)?;
+        let replay = engine
+            .lock_storage()?
+            .invalidate_native_readiness_idempotent(
+                &idempotency,
+                key.as_ref(),
+                completed_at,
+                model::storage_failure_ref,
+            )
+            .map_err(model::storage_failure)?;
+        match replay {
+            NativeReadinessInvalidationReplay::Completed(deleted) => Ok(deleted),
+            NativeReadinessInvalidationReplay::Failed(error) => Err(error),
+        }
+    }
+
+    pub(crate) fn invalidate_native_readiness(
+        &self,
+        host: &str,
+        provider_intent: &ProviderComputerUseIntent,
+    ) -> Result<u64, SatelleError> {
+        let engine = self.engine()?;
+        let Some(key) = engine.adapter.readiness_cache_key(host, provider_intent)? else {
+            return Ok(0);
+        };
+        engine
+            .lock_storage()?
+            .invalidate_native_readiness(&key)
             .map_err(model::storage_failure)
     }
 

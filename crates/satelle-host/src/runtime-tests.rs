@@ -716,13 +716,26 @@ fn unknown_provider_probe_ownership_blocks_probe_and_prompt_until_terminal_recon
         adapter.clone(),
         adapter.clone(),
     );
-    let provider_intent = ProviderComputerUseIntent::new(None, None, true);
+    let provider_intent = ProviderComputerUseIntent::new(None, None, false);
+    let engine = runtime.engine().expect("runtime engine should be open");
+    let key = ProviderProbeRecoveryAdapter::key();
+    let native = adapter.readiness_with_id("unknown-provider-probe-native-ready");
+    engine
+        .lock_storage()
+        .unwrap()
+        .store_preflight_successes(
+            key.adapter(),
+            key.desktop_binding(),
+            key.execution_policy(),
+            &native,
+            None,
+        )
+        .expect("preseed native readiness before creating provider-probe recovery ownership");
 
     let first = runtime
         .refresh_provider_smoke(LOCAL_DEMO_HOST, &provider_intent)
         .expect_err("unknown cancellation must fail the provider probe");
     assert_eq!(first.code, ErrorCode::ProviderSmokeTestTimeout);
-    let engine = runtime.engine().expect("runtime engine should be open");
     let storage = engine.lock_storage().unwrap();
     let status: String = storage
         .connection_for_test()
@@ -802,16 +815,25 @@ fn active_provider_probe_blocks_without_external_reconciliation() {
         adapter.clone(),
     );
     let engine = runtime.engine().expect("runtime engine should be open");
+    let key = ProviderProbeRecoveryAdapter::key();
+    let native = adapter.readiness_with_id("active-provider-probe-native-ready");
+    engine
+        .lock_storage()
+        .unwrap()
+        .store_preflight_successes(
+            key.adapter(),
+            key.desktop_binding(),
+            key.execution_policy(),
+            &native,
+            None,
+        )
+        .expect("preseed native readiness before asserting provider-probe recovery");
     let now = time::OffsetDateTime::now_utc();
     let owner = LeaseOwner::new("active-probe", 1, "process-start", "boot-id", now).unwrap();
     engine
         .lock_storage()
         .unwrap()
-        .begin_provider_probe(
-            &ProviderProbeRecoveryAdapter::key(),
-            "active-provider-probe",
-            &owner,
-        )
+        .begin_provider_probe(&key, "active-provider-probe", &owner)
         .unwrap();
 
     let error = runtime
@@ -1002,6 +1024,63 @@ fn exact_readiness_reuse_reports_live_then_cache_source() {
     assert_eq!(cached_readiness.event_type(), EventType::Readiness);
     assert_eq!(cached_readiness.data()["source"], "cache");
     assert_eq!(adapter.native_probe_calls.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn setup_native_refresh_never_reuses_an_exact_cached_pass() {
+    let state = crate::TestStateDir::new().expect("temporary state directory should exist");
+    let adapter = ProviderProbeRecoveryAdapter::with_native_only_results(
+        [],
+        [NativeProbeBehavior::Passed, NativeProbeBehavior::Passed],
+    );
+    let runtime = RuntimeHandle::new_with_readiness_probe_driver(
+        Ok(state.path().to_path_buf()),
+        adapter.clone(),
+        adapter.clone(),
+    );
+    let intent = ProviderComputerUseIntent::host_default();
+
+    runtime
+        .run(RunCommand::attached(
+            LOCAL_DEMO_HOST,
+            "seed-native-readiness-before-setup-refresh",
+        ))
+        .expect("seed exact reusable native readiness");
+    let refreshed = runtime
+        .refresh_setup_native_readiness(LOCAL_DEMO_HOST, &intent)
+        .expect("setup performs a fresh native probe");
+
+    assert_eq!(refreshed.source(), super::ReadinessSource::Live);
+    assert_eq!(adapter.native_probe_calls.load(Ordering::SeqCst), 2);
+}
+
+#[test]
+fn setup_provider_binding_failure_occurs_after_returned_native_evidence() {
+    let state = crate::TestStateDir::new().expect("temporary state directory should exist");
+    let adapter =
+        ProviderProbeRecoveryAdapter::with_native_results([], [NativeProbeBehavior::Passed]);
+    let runtime = RuntimeHandle::new_with_readiness_probe_driver(
+        Ok(state.path().to_path_buf()),
+        adapter.clone(),
+        adapter.clone(),
+    );
+    let intent = ProviderComputerUseIntent::new(
+        Some(EffectiveModelRef::new("missing-model").expect("valid model alias")),
+        Some(ProviderBindingRef::new("missing-provider").expect("valid provider alias")),
+        true,
+    )
+    .with_experimental_provider_computer_use(true);
+
+    let native = runtime
+        .refresh_setup_native_readiness(LOCAL_DEMO_HOST, &intent)
+        .expect("the explicit native phase completes before provider authorization");
+    let error = runtime
+        .refresh_setup_provider_readiness(LOCAL_DEMO_HOST, &intent, native)
+        .expect_err("the missing provider binding fails only in the provider phase");
+
+    assert_eq!(error.code, ErrorCode::ModelProviderBindingMissing);
+    assert_eq!(adapter.native_probe_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(adapter.provider_probe_calls.load(Ordering::SeqCst), 0);
 }
 
 #[test]

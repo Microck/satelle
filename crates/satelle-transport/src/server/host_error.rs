@@ -187,7 +187,9 @@ fn failure(error: &SatelleError) -> ApiFailure {
             message: "the Codex control plane cannot admit this operation",
             details: validated_control_plane_details(error),
         },
-        ErrorCode::ComputerUseNotReady | ErrorCode::DoctorReadinessBlockersFound => ApiFailure {
+        ErrorCode::ComputerUseNotReady
+        | ErrorCode::DoctorReadinessBlockersFound
+        | ErrorCode::SetupVerificationFailed => ApiFailure {
             status: StatusCode::SERVICE_UNAVAILABLE,
             code: ApiErrorCode::ComputerUseNotReady,
             category: ApiErrorCategory::Readiness,

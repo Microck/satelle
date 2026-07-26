@@ -211,6 +211,7 @@ fn error_contract(code: ErrorCode) -> ErrorContract {
         | ErrorCode::DesktopSessionNativeSelectorWrongPlatform
         | ErrorCode::DesktopSessionNativeSelectorUnmatched
         | ErrorCode::DoctorReadinessBlockersFound
+        | ErrorCode::SetupVerificationFailed
         | ErrorCode::ProviderSecretResolutionFailed
         | ErrorCode::ExperimentalProviderNotValidated => ErrorContract {
             category: ErrorCategory::Readiness,
@@ -392,6 +393,7 @@ mod tests {
             (ErrorCode::ConfigError, 66),
             (ErrorCode::HostUnreachable, 69),
             (ErrorCode::ComputerUseNotReady, 75),
+            (ErrorCode::SetupVerificationFailed, 75),
             (ErrorCode::RemoteExecution, 74),
             (ErrorCode::CompletionInstallFailed, 73),
             (ErrorCode::AuthenticationFailed, 74),
@@ -530,6 +532,13 @@ mod tests {
         let contract = error_contract(ErrorCode::NativeReadinessTimeout);
         assert_eq!(contract.category.as_str(), "readiness");
         assert!(contract.retryable);
+    }
+
+    #[test]
+    fn setup_verification_failure_is_a_non_retryable_readiness_failure() {
+        let contract = error_contract(ErrorCode::SetupVerificationFailed);
+        assert_eq!(contract.category.as_str(), "readiness");
+        assert!(!contract.retryable);
     }
 
     #[test]
