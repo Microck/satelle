@@ -102,6 +102,38 @@ model_provider = "custom"
 }
 
 #[test]
+fn config_check_rejects_explicit_codex_default_alias_pair() {
+    let fixture = ConfigFixture::new(
+        r#"
+default_host = "local"
+model_alias = "codex-default"
+provider_alias = "codex-default"
+
+[hosts.local]
+transport = "local"
+adapter = "fake"
+"#,
+        "",
+    );
+
+    let output = fixture
+        .command()
+        .args(["config", "check", "--json"])
+        .assert()
+        .code(66)
+        .get_output()
+        .clone();
+    let error = parse_json(&output.stderr);
+
+    assert_eq!(error["code"], "configuration-error");
+    assert!(
+        error["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("reserved for implicit Codex defaults"))
+    );
+}
+
+#[test]
 fn api_rate_limits_are_user_owned_and_nonzero() {
     let fixture = ConfigFixture::new(
         r#"

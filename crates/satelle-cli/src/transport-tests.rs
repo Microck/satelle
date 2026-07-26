@@ -1,5 +1,8 @@
 use super::*;
-use crate::{ProviderSelection, projected_experimental_provider_computer_use};
+use crate::{
+    ProviderSelection, accept_setup_provider_auth_validation, cli_owned_setup_report,
+    projected_experimental_provider_computer_use, transport,
+};
 use satelle_core::session::{
     ApprovalPolicy, DesktopBindingRef, DesktopTarget, EffectiveModelRef, ExecutionPolicy,
     ExperimentalFeatureChoices, FeatureChoice, ProviderBindingRef, SandboxPolicy, SessionActivity,
@@ -2887,6 +2890,102 @@ fn host_provider_validation_drives_conflicting_controller_projection() {
         &controller_selection,
         Some(&validation),
     ));
+}
+
+#[test]
+fn setup_accepts_matching_host_owned_provider_projection() {
+    let authorization =
+        satelle_core::ProviderBindingAuthorization::new("review", "openai", "gpt-5.2", "openai");
+    let provider_selection = ProviderSelection {
+        requested_model_alias: Some("review".to_string()),
+        requested_provider_alias: Some("openai".to_string()),
+        model_alias_from_project: false,
+        provider_alias_from_project: false,
+        authorization: Some(authorization.clone()),
+        auth_source_name: None,
+        experimental_provider_computer_use: false,
+    };
+    let resolved_binding = satelle_core::ResolvedProviderBinding::from_authorization(
+        authorization,
+        satelle_core::ProviderBindingSource::HostOwned,
+    );
+    let validation = transport::ProviderDescriptorValidationReport {
+        resolved_binding: satelle_core::PublicResolvedProviderBinding::from(&resolved_binding),
+        validation: satelle_core::ProviderAuthValidationResult::new(
+            satelle_core::ProviderAuthValidationOutcome::ConfiguredDeferred,
+            satelle_core::ProviderAuthObservationSource::Deferred,
+        ),
+    };
+    let mut report = cli_owned_setup_report(
+        LOCAL_DEMO_HOST,
+        true,
+        "foreground",
+        vec!["provider-auth".to_string()],
+    );
+
+    let accepted =
+        match accept_setup_provider_auth_validation(&mut report, &provider_selection, validation) {
+            Ok(accepted) => accepted,
+            Err(_) => panic!("matching Host-owned validation should be accepted"),
+        }
+        .expect("matching Host-owned validation should remain available");
+
+    assert_eq!(
+        accepted.resolved_binding.source(),
+        satelle_core::ProviderBindingSource::HostOwned
+    );
+    assert_eq!(
+        report.readiness_summary.provider_auth,
+        "configured_deferred"
+    );
+}
+
+#[test]
+fn setup_rejects_conflicting_host_owned_provider_projection() {
+    let controller_authorization = satelle_core::ProviderBindingAuthorization::new(
+        "review",
+        "openai",
+        "controller-model",
+        "openai",
+    );
+    let provider_selection = ProviderSelection {
+        requested_model_alias: Some("review".to_string()),
+        requested_provider_alias: Some("openai".to_string()),
+        model_alias_from_project: false,
+        provider_alias_from_project: false,
+        authorization: Some(controller_authorization),
+        auth_source_name: None,
+        experimental_provider_computer_use: false,
+    };
+    let resolved_binding = satelle_core::ResolvedProviderBinding::from_authorization(
+        satelle_core::ProviderBindingAuthorization::new("review", "openai", "host-model", "openai"),
+        satelle_core::ProviderBindingSource::HostOwned,
+    );
+    let validation = transport::ProviderDescriptorValidationReport {
+        resolved_binding: satelle_core::PublicResolvedProviderBinding::from(&resolved_binding),
+        validation: satelle_core::ProviderAuthValidationResult::new(
+            satelle_core::ProviderAuthValidationOutcome::ConfiguredDeferred,
+            satelle_core::ProviderAuthObservationSource::Deferred,
+        ),
+    };
+    let mut report = cli_owned_setup_report(
+        LOCAL_DEMO_HOST,
+        true,
+        "foreground",
+        vec!["provider-auth".to_string()],
+    );
+
+    let accepted =
+        match accept_setup_provider_auth_validation(&mut report, &provider_selection, validation) {
+            Ok(accepted) => accepted,
+            Err(_) => panic!("conflicting Host-owned validation should be handled"),
+        };
+
+    assert!(accepted.is_none());
+    assert_ne!(
+        report.readiness_summary.provider_auth,
+        "configured_deferred"
+    );
 }
 
 fn install_silent_event_peer(

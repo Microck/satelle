@@ -2752,7 +2752,7 @@ fn accept_setup_provider_auth_validation(
     if let Some(authorization) = provider_selection.authorization.as_ref() {
         let current_binding = satelle_core::ResolvedProviderBinding::from_authorization(
             authorization.clone(),
-            satelle_core::ProviderBindingSource::UserConfig,
+            validation.resolved_binding.source(),
         );
         if current_binding.binding_digest() != validation.resolved_binding.binding_digest() {
             return Ok(None);
@@ -4127,6 +4127,11 @@ fn resolve_provider_selection(
     let requested_provider_alias = provider_override
         .map(str::to_string)
         .or_else(|| config.config.provider_alias.clone());
+    validate_explicit_provider_alias_pair(
+        requested_model_alias.as_deref(),
+        requested_provider_alias.as_deref(),
+    )
+    .map_err(failure)?;
     let experimental_provider_computer_use = resolve_experimental_provider_computer_use(
         command_experimental,
         requested_provider_alias.as_deref(),
@@ -4217,6 +4222,19 @@ fn resolve_provider_selection(
     })
 }
 
+fn validate_explicit_provider_alias_pair(
+    model_alias: Option<&str>,
+    provider_alias: Option<&str>,
+) -> Result<(), SatelleError> {
+    if model_alias == Some("codex-default") && provider_alias == Some("codex-default") {
+        return Err(SatelleError::config_error(
+            "the provider binding alias pair `codex-default/codex-default` is reserved for implicit Codex defaults",
+            None,
+        ));
+    }
+    Ok(())
+}
+
 fn provider_selection_error(
     code: ErrorCode,
     host: &str,
@@ -4250,6 +4268,10 @@ fn doctor_provider_intent(
     refresh: bool,
     probe_timeout: Option<std::time::Duration>,
 ) -> Result<ProviderComputerUseIntent, SatelleError> {
+    validate_explicit_provider_alias_pair(
+        config.config.model_alias.as_deref(),
+        config.config.provider_alias.as_deref(),
+    )?;
     let model = config
         .config
         .model_alias

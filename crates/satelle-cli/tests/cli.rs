@@ -4604,6 +4604,102 @@ value = "42"
 }
 
 #[test]
+fn run_and_steer_reject_explicit_codex_default_flags_before_preflight() {
+    let state = state_dir();
+    let user_config = state.path().join("user-config.toml");
+    write_user_config(
+        &user_config,
+        r#"
+default_host = "local"
+
+[hosts.local]
+transport = "local"
+adapter = "fake"
+"#,
+    )
+    .expect("user config should be written");
+
+    for arguments in [
+        vec![
+            "run".to_string(),
+            "--host".to_string(),
+            "local".to_string(),
+            "--model".to_string(),
+            "codex-default".to_string(),
+            "--provider".to_string(),
+            "codex-default".to_string(),
+            "--json".to_string(),
+            "Do not dispatch the reserved pair".to_string(),
+        ],
+        vec![
+            "steer".to_string(),
+            SessionId::new().to_string(),
+            "--host".to_string(),
+            "local".to_string(),
+            "--model".to_string(),
+            "codex-default".to_string(),
+            "--provider".to_string(),
+            "codex-default".to_string(),
+            "--json".to_string(),
+            "Do not dispatch the reserved pair".to_string(),
+        ],
+    ] {
+        let output = satelle()
+            .env("SATELLE_CONFIG_FILE", &user_config)
+            .env("SATELLE_STATE_DIR", state.path())
+            .args(arguments)
+            .assert()
+            .code(66)
+            .get_output()
+            .clone();
+        let error = parse_json_output(&output.stderr);
+
+        assert_eq!(error["code"], "configuration-error");
+        assert!(
+            error["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("reserved for implicit Codex defaults"))
+        );
+    }
+}
+
+#[test]
+fn doctor_rejects_explicit_codex_default_config_pair() {
+    let state = state_dir();
+    let user_config = state.path().join("user-config.toml");
+    write_user_config(
+        &user_config,
+        r#"
+default_host = "local"
+model_alias = "codex-default"
+provider_alias = "codex-default"
+
+[hosts.local]
+transport = "local"
+adapter = "fake"
+"#,
+    )
+    .expect("user config should be written");
+
+    let output = satelle()
+        .env("SATELLE_CONFIG_FILE", &user_config)
+        .env("SATELLE_STATE_DIR", state.path())
+        .args(["doctor", "--host", "local", "--json"])
+        .assert()
+        .code(66)
+        .get_output()
+        .clone();
+    let error = parse_json_output(&output.stderr);
+
+    assert_eq!(error["code"], "configuration-error");
+    assert!(
+        error["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("reserved for implicit Codex defaults"))
+    );
+}
+
+#[test]
 fn provider_auth_secret_sources_are_host_resolved_and_redacted_in_config_explain() {
     let state = state_dir();
     let user_config = state.path().join("user-config.toml");
