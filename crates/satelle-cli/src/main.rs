@@ -73,7 +73,7 @@ use transport::{
 };
 
 const CONFIG_CHECK_SCHEMA_VERSION: &str = "satelle.config.check.v1";
-const CONFIG_EXPLAIN_SCHEMA_VERSION: &str = "satelle.config.explain.v1";
+const CONFIG_EXPLAIN_SCHEMA_VERSION: &str = "satelle.config.explain.v2";
 const PATHS_SCHEMA_VERSION: &str = "satelle.paths.v1";
 const DEFAULT_HOST_BIND: &str = "127.0.0.1:3001";
 const DEFAULT_ON_DEMAND_IDLE_TIMEOUT: Duration = Duration::from_secs(10 * 60);
@@ -1948,7 +1948,7 @@ fn cli_owned_setup_report(
 ) -> SetupReport {
     let service_persistent = setup_mode == "persistent";
     SetupReport {
-        schema_version: SetupSchemaVersion::V1,
+        schema_version: SetupSchemaVersion::V2,
         host: host.to_string(),
         dry_run,
         status: "planned".to_string(),
@@ -1978,6 +1978,10 @@ fn cli_owned_setup_report(
             native_computer_use: "not_checked".to_string(),
             provider_auth: "not_checked".to_string(),
         },
+        descriptor_configured: false,
+        secret_provisioned: false,
+        validation_status: "not_checked".to_string(),
+        provider_smoke_test_status: "not_checked".to_string(),
         daemon_path_overrides: Vec::new(),
         changed: false,
         mutated: false,

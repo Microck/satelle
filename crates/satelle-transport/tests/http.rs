@@ -54,7 +54,7 @@ use tracing::metadata::LevelFilter;
 use tracing::span::{Attributes, Id, Record};
 use tracing::{Event, Metadata, Subscriber};
 
-const EXPECTED_OPERATIONS: [&str; 14] = [
+const EXPECTED_OPERATIONS: [&str; 15] = [
     "live",
     "capabilities",
     "host_status",
@@ -69,6 +69,7 @@ const EXPECTED_OPERATIONS: [&str; 14] = [
     "setup_api_token_issue",
     "setup_api_token_activate",
     "setup_api_token_abort",
+    "provider_secret_provisioning",
 ];
 
 const BLOCKING_SPAN_ATTRIBUTE_MARKER: &str = "trace-blocking-span-attribute-connected";
@@ -1216,10 +1217,10 @@ async fn capabilities_are_truthful_and_unknown_routes_are_typed() {
         response.json().await.expect("decode capabilities JSON");
     assert_eq!(
         capabilities_json["schema_version"],
-        "satelle.capabilities.v3"
+        "satelle.capabilities.v4"
     );
     let mut obsolete_v1 = capabilities_json.clone();
-    obsolete_v1["schema_version"] = serde_json::json!("satelle.capabilities.v2");
+    obsolete_v1["schema_version"] = serde_json::json!("satelle.capabilities.v3");
     assert!(serde_json::from_value::<CapabilitiesResponse>(obsolete_v1).is_err());
     let capabilities: CapabilitiesResponse =
         serde_json::from_value(capabilities_json).expect("decode typed capabilities");

@@ -134,7 +134,7 @@ pub(super) fn setup(
     }));
 
     SetupReport {
-        schema_version: SetupSchemaVersion::V1,
+        schema_version: SetupSchemaVersion::V2,
         host: host.to_string(),
         dry_run,
         status: "planned".to_string(),
@@ -161,6 +161,10 @@ pub(super) fn setup(
             native_computer_use: "not_verified".to_string(),
             provider_auth: "not_required_for_local_demo".to_string(),
         },
+        descriptor_configured: false,
+        secret_provisioned: false,
+        validation_status: "not_required".to_string(),
+        provider_smoke_test_status: "not_required".to_string(),
         daemon_path_overrides,
         changed: false,
         mutated: false,

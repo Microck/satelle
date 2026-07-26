@@ -1508,7 +1508,7 @@ impl SshSetupTransport {
             }
         }
         SetupReport {
-            schema_version: SetupSchemaVersion::V1,
+            schema_version: SetupSchemaVersion::V2,
             host: self.alias.clone(),
             dry_run,
             status: status.to_string(),
@@ -1549,6 +1549,10 @@ impl SshSetupTransport {
                 native_computer_use: "not_checked".to_string(),
                 provider_auth: "not_checked".to_string(),
             },
+            descriptor_configured: false,
+            secret_provisioned: false,
+            validation_status: "not_checked".to_string(),
+            provider_smoke_test_status: "not_checked".to_string(),
             daemon_path_overrides: path_override_entries,
             changed: applied
                 && (service_persistent
@@ -4489,6 +4493,9 @@ fn api_error_is_definitively_not_admitted(code: ApiErrorCode) -> bool {
             | ApiErrorCode::ExperimentalProviderOptInRequired
             | ApiErrorCode::ModelProviderBindingMissing
             | ApiErrorCode::ProjectProviderSelectionNotAllowed
+            | ApiErrorCode::ProviderSecretSourceRequired
+            | ApiErrorCode::ProviderSecretProvisioningRequired
+            | ApiErrorCode::ProviderSecretOverwriteRequired
             | ApiErrorCode::ProviderSecretResolutionFailed
             | ApiErrorCode::ExperimentalProviderNotValidated
             | ApiErrorCode::CapacityExceeded
@@ -4527,6 +4534,18 @@ fn api_code_error(host: &str, code: ApiErrorCode) -> SatelleError {
         ApiErrorCode::ProviderSecretResolutionFailed => provider_api_error(
             ErrorCode::ProviderSecretResolutionFailed,
             "the Host could not resolve provider authentication",
+        ),
+        ApiErrorCode::ProviderSecretSourceRequired => provider_api_error(
+            ErrorCode::ProviderSecretSourceRequired,
+            "provider authentication requires a Secret Source descriptor",
+        ),
+        ApiErrorCode::ProviderSecretProvisioningRequired => provider_api_error(
+            ErrorCode::ProviderSecretProvisioningRequired,
+            "provider authentication requires interactive secret provisioning",
+        ),
+        ApiErrorCode::ProviderSecretOverwriteRequired => provider_api_error(
+            ErrorCode::ProviderSecretOverwriteRequired,
+            "provider secret replacement requires explicit confirmation",
         ),
         ApiErrorCode::ExperimentalProviderNotValidated => provider_api_error(
             ErrorCode::ExperimentalProviderNotValidated,

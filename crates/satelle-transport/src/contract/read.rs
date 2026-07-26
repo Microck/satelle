@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 
 define_schema_token!(LiveSchema, "satelle.live.v1");
-define_schema_token!(CapabilitiesSchema, "satelle.capabilities.v3");
+define_schema_token!(CapabilitiesSchema, "satelle.capabilities.v4");
 define_schema_token!(HostStatusSchema, "satelle.host.status.v1");
 define_schema_token!(
     HostDesktopSessionsSchema,
@@ -48,6 +48,7 @@ enum Operation {
     SetupApiTokenIssue,
     SetupApiTokenActivate,
     SetupApiTokenAbort,
+    ProviderSecretProvisioning,
 }
 
 impl Operation {
@@ -67,6 +68,7 @@ impl Operation {
             Self::SetupApiTokenIssue => "setup_api_token_issue",
             Self::SetupApiTokenActivate => "setup_api_token_activate",
             Self::SetupApiTokenAbort => "setup_api_token_abort",
+            Self::ProviderSecretProvisioning => "provider_secret_provisioning",
         }
     }
 }
@@ -265,6 +267,7 @@ impl CapabilitiesResponse {
                 Operation::SetupApiTokenIssue,
                 Operation::SetupApiTokenActivate,
                 Operation::SetupApiTokenAbort,
+                Operation::ProviderSecretProvisioning,
             ],
             runtime_capabilities: RuntimeCapabilities {
                 codex_runtime,

@@ -45,6 +45,14 @@ define_schema_token!(
     ProviderDescriptorValidationResponseSchema,
     "satelle.provider-binding-validation-response.v4"
 );
+define_schema_token!(
+    ProviderSecretProvisioningSchema,
+    "satelle.provider-secret-provisioning.v1"
+);
+define_schema_token!(
+    ProviderSecretProvisioningResponseSchema,
+    "satelle.provider-secret-provisioning-response.v1"
+);
 define_schema_token!(SetupVerificationSchema, "satelle.setup-verification.v1");
 define_schema_token!(
     SetupVerificationResponseSchema,
@@ -132,6 +140,96 @@ impl ProviderBindingAuthorizationRequest {
 
 impl ApiRequestContract for ProviderBindingAuthorizationRequest {
     const SCHEMA_VERSION: &'static str = ProviderBindingAuthorizationSchema::TOKEN;
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProviderSecretProvisioningMetadata {
+    schema_version: ProviderSecretProvisioningSchema,
+    authorization: ProviderBindingAuthorization,
+    overwrite_authorized: bool,
+}
+
+impl ProviderSecretProvisioningMetadata {
+    pub fn new(
+        authorization: ProviderBindingAuthorization,
+        overwrite_authorized: bool,
+    ) -> Self {
+        Self {
+            schema_version: ProviderSecretProvisioningSchema,
+            authorization,
+            overwrite_authorized,
+        }
+    }
+
+    pub fn authorization(&self) -> &ProviderBindingAuthorization {
+        &self.authorization
+    }
+
+    pub fn into_authorization(self) -> ProviderBindingAuthorization {
+        self.authorization
+    }
+
+    pub const fn overwrite_authorized(&self) -> bool {
+        self.overwrite_authorized
+    }
+}
+
+impl ApiRequestContract for ProviderSecretProvisioningMetadata {
+    const SCHEMA_VERSION: &'static str = ProviderSecretProvisioningSchema::TOKEN;
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProviderSecretProvisioningResponse {
+    schema_version: ProviderSecretProvisioningResponseSchema,
+    request_id: RequestId,
+    host_identity: String,
+    destination_kind: String,
+    provisioned: bool,
+    overwritten: bool,
+    validation_status: String,
+}
+
+impl ProviderSecretProvisioningResponse {
+    pub(crate) fn new(
+        request_id: RequestId,
+        host_identity: String,
+        overwritten: bool,
+        validation_status: impl Into<String>,
+    ) -> Self {
+        Self {
+            schema_version: ProviderSecretProvisioningResponseSchema,
+            request_id,
+            host_identity,
+            destination_kind: "file".to_string(),
+            provisioned: true,
+            overwritten,
+            validation_status: validation_status.into(),
+        }
+    }
+
+    pub const fn provisioned(&self) -> bool {
+        self.provisioned
+    }
+
+    pub const fn overwritten(&self) -> bool {
+        self.overwritten
+    }
+
+    pub fn validation_status(&self) -> &str {
+        &self.validation_status
+    }
+}
+
+impl AuthenticatedResponseContract for ProviderSecretProvisioningResponse {
+    fn request_id(&self) -> &RequestId {
+        &self.request_id
+    }
+
+    fn host_identity(&self) -> &str {
+        &self.host_identity
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]

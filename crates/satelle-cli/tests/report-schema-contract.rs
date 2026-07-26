@@ -191,18 +191,19 @@ fn every_named_json_command_result_has_a_top_level_schema_version() {
 }
 
 #[test]
-fn readiness_reports_use_their_canonical_v1_schema_tokens() {
+fn readiness_reports_use_their_canonical_schema_tokens() {
     let state = TestStateDir::new().expect("secure temp state directory should be created");
 
     for (args, expected_schema, expected_fields) in [
         (
             vec!["setup", "--host", "local-demo", "--dry-run", "--json"],
-            "satelle.setup.v1",
+            "satelle.setup.v2",
             &[
                 "applied_actions",
                 "changed",
                 "current_daemon_paths",
                 "daemon_path_overrides",
+                "descriptor_configured",
                 "dry_run",
                 "fallback_reason",
                 "host",
@@ -212,10 +213,12 @@ fn readiness_reports_use_their_canonical_v1_schema_tokens() {
                 "next_command",
                 "planned_daemon_paths",
                 "planned_actions",
+                "provider_smoke_test_status",
                 "readiness_summary",
                 "recovery_commands",
                 "required_input",
                 "schema_version",
+                "secret_provisioned",
                 "service_persistent",
                 "service_plan",
                 "service_scope",
@@ -223,6 +226,7 @@ fn readiness_reports_use_their_canonical_v1_schema_tokens() {
                 "setup_mode",
                 "status",
                 "target_platform",
+                "validation_status",
             ][..],
         ),
         (
@@ -273,7 +277,7 @@ fn readiness_reports_use_their_canonical_v1_schema_tokens() {
 }
 
 #[test]
-fn setup_verification_is_an_optional_closed_extension_of_the_v1_report() {
+fn setup_verification_is_an_optional_closed_extension_of_the_v2_report() {
     let state = TestStateDir::new().expect("secure temp state directory should be created");
     let without_verification = json_report(
         &state,
@@ -295,7 +299,7 @@ fn setup_verification_is_an_optional_closed_extension_of_the_v1_report() {
             "--json",
         ],
     );
-    assert_eq!(with_verification["schema_version"], "satelle.setup.v1");
+    assert_eq!(with_verification["schema_version"], "satelle.setup.v2");
 
     let mut expected_report_fields = without_verification
         .as_object()
@@ -375,7 +379,7 @@ fn local_inspection_reports_keep_their_closed_v1_shapes() {
         ),
         (
             vec!["config", "explain", "--json"],
-            "satelle.config.explain.v1",
+            "satelle.config.explain.v2",
             &[
                 "checked_files",
                 "effective",
@@ -624,8 +628,8 @@ fn logs_json_lines_use_the_exact_entry_v1_contract() {
 #[test]
 fn readiness_report_schema_types_reject_unknown_tokens() {
     assert_eq!(
-        serde_json::to_value(SetupSchemaVersion::V1).expect("setup schema token should serialize"),
-        json!("satelle.setup.v1")
+        serde_json::to_value(SetupSchemaVersion::V2).expect("setup schema token should serialize"),
+        json!("satelle.setup.v2")
     );
     assert_eq!(
         serde_json::to_value(DoctorSchemaVersion::V1)
@@ -638,7 +642,7 @@ fn readiness_report_schema_types_reject_unknown_tokens() {
         json!("satelle.host.sessions.v1")
     );
 
-    assert!(serde_json::from_value::<SetupSchemaVersion>(json!("satelle.setup.v2")).is_err());
+    assert!(serde_json::from_value::<SetupSchemaVersion>(json!("satelle.setup.v1")).is_err());
     assert!(serde_json::from_value::<DoctorSchemaVersion>(json!("satelle.doctor.v2")).is_err());
     assert!(
         serde_json::from_value::<HostSessionsSchemaVersion>(json!("satelle.host.sessions.v2"))

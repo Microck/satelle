@@ -2813,7 +2813,7 @@ fn production_setup_report(
     }));
 
     SetupReport {
-        schema_version: SetupSchemaVersion::V1,
+        schema_version: SetupSchemaVersion::V2,
         host: host.to_string(),
         dry_run,
         status: "planned".to_string(),
@@ -2840,6 +2840,10 @@ fn production_setup_report(
             native_computer_use: "blocked_pending_acceptance".to_string(),
             provider_auth: "not_checked".to_string(),
         },
+        descriptor_configured: false,
+        secret_provisioned: false,
+        validation_status: "not_checked".to_string(),
+        provider_smoke_test_status: "not_checked".to_string(),
         daemon_path_overrides,
         changed: false,
         mutated: false,

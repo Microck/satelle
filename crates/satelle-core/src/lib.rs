@@ -3737,6 +3737,9 @@ pub enum ErrorCode {
     UnsupportedProviderComputerUse,
     ExperimentalProviderOptInRequired,
     ModelProviderBindingMissing,
+    ProviderSecretSourceRequired,
+    ProviderSecretProvisioningRequired,
+    ProviderSecretOverwriteRequired,
     ProviderSecretResolutionFailed,
     ExperimentalProviderNotValidated,
     DoctorReadinessBlockersFound,
@@ -3836,6 +3839,9 @@ impl ErrorCode {
             Self::UnsupportedProviderComputerUse => "unsupported-provider-computer-use",
             Self::ExperimentalProviderOptInRequired => "experimental-provider-opt-in-required",
             Self::ModelProviderBindingMissing => "model-provider-binding-missing",
+            Self::ProviderSecretSourceRequired => "provider-secret-source-required",
+            Self::ProviderSecretProvisioningRequired => "provider-secret-provisioning-required",
+            Self::ProviderSecretOverwriteRequired => "provider-secret-overwrite-required",
             Self::ProviderSecretResolutionFailed => "provider-secret-resolution-failed",
             Self::ExperimentalProviderNotValidated => "experimental-provider-not-validated",
             Self::DoctorReadinessBlockersFound => "doctor-readiness-blockers-found",
@@ -3931,6 +3937,9 @@ impl ErrorCode {
             | Self::StorageBusy
             | Self::StorageIntegrityFailed
             | Self::ProviderSecretResolutionFailed => 74,
+            Self::ProviderSecretSourceRequired
+            | Self::ProviderSecretProvisioningRequired
+            | Self::ProviderSecretOverwriteRequired => 64,
             Self::BootstrapBusy
             | Self::CapacityExceeded
             | Self::HostBusy
@@ -6056,8 +6065,8 @@ pub struct DoctorEventRecord {
 /// The only schema token accepted for setup reports in this release line.
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub enum SetupSchemaVersion {
-    #[serde(rename = "satelle.setup.v1")]
-    V1,
+    #[serde(rename = "satelle.setup.v2")]
+    V2,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -6119,6 +6128,10 @@ pub struct SetupReport {
     pub required_input: Vec<SetupRequiredInput>,
     pub recovery_commands: Vec<String>,
     pub readiness_summary: SetupReadinessSummary,
+    pub descriptor_configured: bool,
+    pub secret_provisioned: bool,
+    pub validation_status: String,
+    pub provider_smoke_test_status: String,
     pub daemon_path_overrides: Vec<DaemonPathOverride>,
     pub changed: bool,
     pub mutated: bool,

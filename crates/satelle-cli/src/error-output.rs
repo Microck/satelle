@@ -282,6 +282,9 @@ fn error_contract(code: ErrorCode) -> ErrorContract {
         | ErrorCode::UnsupportedUpdateComponent
         | ErrorCode::PersistentServiceUnsupported
         | ErrorCode::SetupConsentRequired
+        | ErrorCode::ProviderSecretSourceRequired
+        | ErrorCode::ProviderSecretProvisioningRequired
+        | ErrorCode::ProviderSecretOverwriteRequired
         | ErrorCode::DoctorFixConsentRequired
         | ErrorCode::DesktopBindingRequired
         | ErrorCode::DoctorRefreshScopeRequired
