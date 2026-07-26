@@ -801,13 +801,25 @@ fn replace_production_snapshot(
 }
 
 fn provider_validation_outcome_for_error(
-    code: satelle_core::ErrorCode,
-) -> satelle_core::ProviderAuthValidationOutcome {
-    match code {
+    error: &SatelleError,
+) -> Option<satelle_core::ProviderAuthValidationOutcome> {
+    match error.code {
         satelle_core::ErrorCode::ProviderSecretResolutionFailed => {
-            satelle_core::ProviderAuthValidationOutcome::UnresolvedHostSecret
+            Some(satelle_core::ProviderAuthValidationOutcome::UnresolvedHostSecret)
         }
-        _ => satelle_core::ProviderAuthValidationOutcome::ProviderComputerUseSmokeTestFailed,
+        satelle_core::ErrorCode::ProviderSmokeTestTimeout
+        | satelle_core::ErrorCode::ExperimentalProviderNotValidated => {
+            Some(satelle_core::ProviderAuthValidationOutcome::ProviderComputerUseSmokeTestFailed)
+        }
+        _ if error
+            .details
+            .get("provider_smoke_status")
+            .and_then(serde_json::Value::as_str)
+            == Some("failed") =>
+        {
+            Some(satelle_core::ProviderAuthValidationOutcome::ProviderComputerUseSmokeTestFailed)
+        }
+        _ => None,
     }
 }
 
@@ -1513,10 +1525,9 @@ impl HostService {
                         satelle_core::ProviderAuthObservationSource::Live,
                     ),
                     Ok(_) => deferred_outcome,
-                    Err(error) => (
-                        provider_validation_outcome_for_error(error.code),
-                        satelle_core::ProviderAuthObservationSource::Live,
-                    ),
+                    Err(error) => provider_validation_outcome_for_error(error)
+                        .map(|outcome| (outcome, satelle_core::ProviderAuthObservationSource::Live))
+                        .unwrap_or(deferred_outcome),
                 };
                 apply_provider_refresh(&mut report, refresh, started_at, started.elapsed());
                 provider_auth_evidence = Some(observed);
@@ -1704,10 +1715,15 @@ impl HostService {
                             ProviderAuthObservationSource::Live,
                         )
                     }
-                    Err(error) => ProviderAuthValidationResult::new(
-                        provider_validation_outcome_for_error(error.code),
-                        ProviderAuthObservationSource::Live,
-                    ),
+                    Err(error) => {
+                        let Some(outcome) = provider_validation_outcome_for_error(&error) else {
+                            return Err(error);
+                        };
+                        ProviderAuthValidationResult::new(
+                            outcome,
+                            ProviderAuthObservationSource::Live,
+                        )
+                    }
                 }
             }
         };

@@ -81,9 +81,45 @@ impl ComputerUseAdapter for FailedProviderSmokeAdapter {
         _host: &str,
         _provider_intent: &ProviderComputerUseIntent,
     ) -> Result<AdapterReadiness, SatelleError> {
-        Err(SatelleError::remote_api_error(
+        let mut error = SatelleError::computer_use_not_ready();
+        error.details.insert(
+            "provider_smoke_status".to_string(),
+            serde_json::Value::String("failed".to_string()),
+        );
+        Err(error)
+    }
+
+    fn execute(&self, request: ExecuteRequest<'_>) -> Result<ExecuteResult, SatelleError> {
+        FakeComputerUseAdapter.execute(request)
+    }
+
+    fn observe_stop(&self, subject: AdapterSubject<'_>) -> Result<StopObservation, SatelleError> {
+        FakeComputerUseAdapter.observe_stop(subject)
+    }
+
+    fn observe_recovery(
+        &self,
+        subject: AdapterSubject<'_>,
+    ) -> Result<RecoveryObservation, SatelleError> {
+        FakeComputerUseAdapter.observe_recovery(subject)
+    }
+}
+
+#[derive(Clone)]
+struct HostBusyProviderPreflightAdapter {
+    calls: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl ComputerUseAdapter for HostBusyProviderPreflightAdapter {
+    fn preflight(
+        &self,
+        _host: &str,
+        _provider_intent: &ProviderComputerUseIntent,
+    ) -> Result<AdapterReadiness, SatelleError> {
+        self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Err(SatelleError::host_busy(
             LOCAL_DEMO_HOST,
-            "provider smoke failed",
+            &satelle_core::SessionId::new(),
         ))
     }
 
@@ -1520,6 +1556,70 @@ fn failed_upstream_validation_returns_only_the_closed_smoke_failed_outcome() {
     assert_eq!(
         encoded["validation"]["outcome"],
         satelle_core::ProviderAuthValidationOutcome::ProviderComputerUseSmokeTestFailed.as_str()
+    );
+}
+
+#[test]
+fn provider_descriptor_refresh_replays_control_plane_errors_without_reclassifying_them() {
+    let state = crate::TestStateDir::new().expect("temporary state directory");
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let service = service_with_provider_descriptor(
+        state.path().to_path_buf(),
+        HostBusyProviderPreflightAdapter {
+            calls: Arc::clone(&calls),
+        },
+        None,
+    );
+    service.initialize_daemon().expect("initialize daemon");
+
+    let token = ApiBearerToken::generate().expect("generate token");
+    let principal = service
+        .register_api_token(
+            &token,
+            "provider-validation-host-busy",
+            ApiScopes::CONTROL,
+            None,
+        )
+        .expect("register token");
+    let authority = MutationAuthority::new(principal, "provider-validation-host-busy")
+        .expect("construct mutation authority");
+    let options = || {
+        crate::ProviderDescriptorValidationOptions::new(
+            satelle_core::ProviderAuthValidationMode::RefreshProviderSmoke,
+            false,
+            false,
+            true,
+        )
+    };
+
+    let first = service
+        .validate_provider_descriptor_idempotent(
+            LOCAL_DEMO_HOST,
+            "review",
+            "openai",
+            options(),
+            &authority,
+        )
+        .expect_err("HostBusy must propagate instead of becoming a provider outcome");
+    let replay = service
+        .validate_provider_descriptor_idempotent(
+            LOCAL_DEMO_HOST,
+            "review",
+            "openai",
+            options(),
+            &authority,
+        )
+        .expect_err("the exact HostBusy failure must replay");
+
+    assert_eq!(first.code, ErrorCode::HostBusy);
+    assert_eq!(replay.code, ErrorCode::HostBusy);
+    assert_eq!(first.message, replay.message);
+    assert_eq!(first.recovery_command, replay.recovery_command);
+    assert_eq!(first.details, replay.details);
+    assert_eq!(
+        1,
+        calls.load(std::sync::atomic::Ordering::SeqCst),
+        "durable failure replay must not repeat preflight"
     );
 }
 
