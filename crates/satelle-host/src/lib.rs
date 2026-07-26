@@ -2008,12 +2008,9 @@ impl HostService {
         };
         let intent = Self::provider_candidate_intent(&binding)?;
         let provider_probe_ref = format!("provider-probe-{}", SessionId::new());
-        let (host_identity, key, owner) = self.runtime.provider_secret_provisioning_ownership(
-            host,
-            &intent,
-            identity.key(),
-            &provider_probe_ref,
-        )?;
+        let (host_identity, key, owner) =
+            self.runtime
+                .provider_secret_provisioning_ownership(host, &intent, identity.key())?;
         let paths = satelle_core::OwnerOnlySecretFilePaths::new(&destination, identity.key())
             .map_err(|_| provider_secret_file_error())?;
         let candidate_secret = provider_auth::ResolvedProviderSecret::from_provisioning(secret);

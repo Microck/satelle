@@ -169,7 +169,7 @@ fn provider_secret_recovery_fixture(
             }),
         satelle_core::ProviderBindingSource::UserConfig,
     );
-    let key = ProbeHarness::key();
+    let key = ProviderProbeRecoveryAdapter::key();
     let paths = satelle_core::OwnerOnlySecretFilePaths::new(destination, operation_id)
         .expect("construct deterministic recovery paths");
     let plan = ProviderSecretProvisioningPlan::new(
@@ -343,7 +343,8 @@ fn startup_recovery_finishes_committed_cleanup_without_rolling_back() {
     let engine = runtime
         .engine_without_restart_recovery()
         .expect("open runtime without recovery");
-    let readiness = ProbeHarness::new(std::iter::empty()).readiness_with_id("committed-recovery");
+    let readiness = ProviderProbeRecoveryAdapter::new(std::iter::empty())
+        .readiness_with_id("committed-recovery");
     {
         let mut storage = engine.lock_storage().expect("lock storage");
         storage

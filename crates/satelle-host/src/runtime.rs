@@ -2885,7 +2885,6 @@ impl RuntimeHandle {
         host: &str,
         provider_intent: &ProviderComputerUseIntent,
         operation_id: &str,
-        provider_probe_ref: &str,
     ) -> Result<
         (
             satelle_core::session::HostIdentityRef,

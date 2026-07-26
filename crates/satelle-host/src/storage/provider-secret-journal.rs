@@ -1,13 +1,10 @@
-use super::codec::{format_time, idempotent_operation_token};
+use super::codec::format_time;
 use super::sql::{ensure_control_lease_available, insert_idempotency, matching_idempotency};
 use super::{
     IdempotencyInput, IdempotentOperation, LeaseOwner, Storage, StorageError, StorageErrorKind,
     sqlite_error,
 };
-use crate::{
-    ReadinessCacheKey,
-    runtime_adapter::{ProviderSmokeEvidence, ReadinessEvidence},
-};
+use crate::{ProviderSmokeEvidence, ReadinessCacheKey, ReadinessEvidence};
 use rusqlite::{OptionalExtension, TransactionBehavior, params};
 use satelle_core::session::{DesktopBindingRef, HostIdentityRef};
 use satelle_core::{
