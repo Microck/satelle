@@ -200,7 +200,8 @@ pub(super) async fn preview_provider_secret_provisioning(
         authorized.request_id().clone(),
         state.host_identity.clone(),
         preview.destination_kind().to_string(),
-        preview.destination_exists(),
+        preview.persistence_location_class().to_string(),
+        preview.overwrite_behavior().to_string(),
     );
     authenticated_json_response(
         StatusCode::OK,

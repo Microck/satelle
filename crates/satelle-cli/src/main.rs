@@ -2711,6 +2711,7 @@ fn run_setup(
             let response = provision_provider_secret(
                 provider_transport.as_ref(),
                 &authorization,
+                &host.alias,
                 &command,
                 &format,
             )?;
@@ -2816,6 +2817,7 @@ fn run_setup(
                     let response = provision_provider_secret(
                         provider_transport.as_ref(),
                         &authorization,
+                        &host.alias,
                         &command,
                         &format,
                     )?;
@@ -3408,10 +3410,15 @@ fn plan_provider_secret_provisioning(
 fn provision_provider_secret(
     provider_transport: &dyn transport::TransportClient,
     authorization: &ProviderBindingAuthorization,
+    host_alias: &str,
     command: &SetupCommand,
     format: &OutputFormat,
 ) -> Result<satelle_transport::ProviderSecretProvisioningResponse, CliFailure> {
     ensure_file_provider_secret_source(authorization)?;
+    let destination_descriptor = match authorization.auth_source() {
+        Some(ProviderSecretSource::File { path }) => format!("file:{}", path.display()),
+        _ => unreachable!("provider secret provisioning accepts only File destinations"),
+    };
 
     // Prove that this client is authenticated to the selected, pinned Host before
     // reading raw bytes. The later preview and provision calls use the same client.
@@ -3423,17 +3430,24 @@ fn provision_provider_secret(
         .map_err(failure)?;
 
     if !format.is_json() {
+        println!("Target Host: {host_alias}");
+        println!(
+            "Provider alias: {}",
+            authorization.requested_provider_alias()
+        );
+        println!("Provider Secret Source kind: file");
+        println!("Exact destination descriptor: {destination_descriptor}");
         println!(
             "Provider secret destination kind: {}",
             preview.destination_kind()
         );
         println!(
-            "Provider secret destination exists: {}",
-            preview.destination_exists()
+            "Provider secret persistence location class: {}",
+            preview.persistence_location_class()
         );
         println!(
-            "Provider secret overwrite required: {}",
-            preview.overwrite_required()
+            "Provider secret overwrite behavior: {}",
+            preview.overwrite_behavior()
         );
     }
 
@@ -3443,40 +3457,9 @@ fn provision_provider_secret(
         && io::stdout().is_terminal()
         && io::stderr().is_terminal();
     if !interaction_available {
-        let code = if preview.overwrite_required() {
-            ErrorCode::ProviderSecretOverwriteRequired
-        } else {
-            ErrorCode::ProviderSecretProvisioningRequired
-        };
         return Err(failure(provider_secret_setup_error(
-            code,
+            ErrorCode::ProviderSecretProvisioningRequired,
             "provider secret provisioning requires an immediate confirmation in an interactive human terminal",
-        )));
-    }
-
-    let confirmation = if preview.overwrite_required() {
-        "Replace the existing provider secret at this exact destination?"
-    } else {
-        "Provision the provider secret at this exact destination?"
-    };
-    let confirmed = cliclack::confirm(confirmation)
-        .initial_value(false)
-        .interact()
-        .map_err(|source| {
-            failure(setup_interaction_error(
-                "could not read provider secret provisioning confirmation",
-                source,
-            ))
-        })?;
-    if !confirmed {
-        let code = if preview.overwrite_required() {
-            ErrorCode::ProviderSecretOverwriteRequired
-        } else {
-            ErrorCode::ProviderSecretProvisioningRequired
-        };
-        return Err(failure(provider_secret_setup_error(
-            code,
-            "provider secret provisioning was not authorized",
         )));
     }
 
@@ -3491,13 +3474,57 @@ fn provision_provider_secret(
             })?
             .into_bytes(),
     );
-    let metadata = satelle_transport::ProviderSecretProvisioningMetadata::new(
-        authorization.clone(),
-        preview.overwrite_required(),
-    );
-    provider_transport
-        .provision_provider_secret(&metadata, secret)
-        .map_err(failure)
+    let confirmed = cliclack::confirm("Provision the provider secret at this exact destination?")
+        .initial_value(false)
+        .interact()
+        .map_err(|source| {
+            failure(setup_interaction_error(
+                "could not read provider secret provisioning confirmation",
+                source,
+            ))
+        })?;
+    if !confirmed {
+        return Err(failure(provider_secret_setup_error(
+            ErrorCode::ProviderSecretProvisioningRequired,
+            "provider secret provisioning was not authorized",
+        )));
+    }
+
+    let metadata =
+        satelle_transport::ProviderSecretProvisioningMetadata::new(authorization.clone(), false);
+    match provider_transport.provision_provider_secret(
+        &metadata,
+        Zeroizing::new(secret.as_slice().to_vec()),
+    ) {
+        Ok(response) => Ok(response),
+        Err(error) if error.code == ErrorCode::ProviderSecretOverwriteRequired => {
+            let confirmed = cliclack::confirm(
+                "Replace the existing provider secret at this exact destination?",
+            )
+            .initial_value(false)
+            .interact()
+            .map_err(|source| {
+                failure(setup_interaction_error(
+                    "could not read provider secret overwrite confirmation",
+                    source,
+                ))
+            })?;
+            if !confirmed {
+                return Err(failure(provider_secret_setup_error(
+                    ErrorCode::ProviderSecretOverwriteRequired,
+                    "provider secret replacement was not authorized",
+                )));
+            }
+            let metadata = satelle_transport::ProviderSecretProvisioningMetadata::new(
+                authorization.clone(),
+                true,
+            );
+            provider_transport
+                .provision_provider_secret(&metadata, secret)
+                .map_err(failure)
+        }
+        Err(error) => Err(failure(error)),
+    }
 }
 
 fn daemon_path_overrides(command: &SetupCommand, host_config: &HostConfig) -> DaemonPathOverrides {

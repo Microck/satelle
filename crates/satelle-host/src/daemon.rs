@@ -502,6 +502,21 @@ impl DaemonRuntimeCapabilities {
 }
 
 impl HostService {
+    /// Adds a process-local credential for a loopback bootstrap transport.
+    /// The raw bearer remains only in the caller and this in-memory
+    /// authenticator; it is never registered in durable Host state.
+    pub fn with_ephemeral_bootstrap_auth(
+        mut self,
+        token: &ApiBearerToken,
+        scopes: ApiScopes,
+        expires_at: OffsetDateTime,
+    ) -> Self {
+        self.bootstrap_auth = Some(Arc::new(EphemeralApiAuthenticator::new(
+            token, scopes, expires_at,
+        )));
+        self
+    }
+
     /// Opens and exclusively owns Host state before a network listener starts.
     /// Existing nonterminal work is reconciled first, so a daemon never reports
     /// itself initialized while restart recovery remains unexamined.
@@ -1616,15 +1631,12 @@ impl HostService {
     #[doc(hidden)]
     #[cfg(any(test, feature = "test-support"))]
     pub fn with_ssh_bootstrap_auth_for_tests(
-        mut self,
+        self,
         token: &ApiBearerToken,
         scopes: ApiScopes,
         expires_at: OffsetDateTime,
     ) -> Self {
-        self.bootstrap_auth = Some(Arc::new(EphemeralApiAuthenticator::new(
-            token, scopes, expires_at,
-        )));
-        self
+        self.with_ephemeral_bootstrap_auth(token, scopes, expires_at)
     }
 
     #[doc(hidden)]

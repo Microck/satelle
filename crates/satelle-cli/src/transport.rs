@@ -18,13 +18,16 @@ use satelle_host::{
 };
 use satelle_transport::{
     ApiError, ApiErrorCode, DaemonClient, DaemonClientError, DaemonEventClient, DaemonEventError,
-    TurnRequest,
+    DaemonServer, DaemonServerConfig, DaemonShutdownHandle, TurnRequest,
 };
 use std::collections::BTreeSet;
 use std::future::Future;
+use std::net::{Ipv4Addr, SocketAddr};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
+use std::thread;
 use std::time::{Duration, Instant};
 use std::{fs, path::Path};
 use uuid::Uuid;
@@ -221,20 +224,6 @@ pub(crate) struct ProviderDescriptorValidationReport {
     pub(crate) validation: satelle_core::ProviderAuthValidationResult,
 }
 
-fn local_provider_secret_provisioning_required() -> SatelleError {
-    SatelleError {
-        code: ErrorCode::ProviderSecretProvisioningRequired,
-        message:
-            "provider secret provisioning requires an authenticated selected-Host transport"
-                .to_string(),
-        recovery_command: Some(
-            "satelle setup --host <host-alias> --component provider-auth".to_string(),
-        ),
-        source_detail: None,
-        details: std::collections::BTreeMap::new(),
-    }
-}
-
 fn setup_provider_intent(
     request: &satelle_transport::SetupVerificationRequest,
 ) -> Result<satelle_host::ProviderComputerUseIntent, SatelleError> {
@@ -343,11 +332,39 @@ pub(crate) trait TransportClient {
 struct LocalTransport {
     alias: String,
     service: HostService,
+    provider_secret_bridge: Mutex<Option<LocalProviderSecretBridge>>,
 }
 
 impl LocalTransport {
     fn new(alias: String, service: HostService) -> Self {
-        Self { alias, service }
+        Self {
+            alias,
+            service,
+            provider_secret_bridge: Mutex::new(None),
+        }
+    }
+
+    fn with_provider_secret_client<T>(
+        &self,
+        operation: impl FnOnce(&DaemonClient) -> Result<T, DaemonClientError>,
+    ) -> Result<T, SatelleError> {
+        let mut bridge = self
+            .provider_secret_bridge
+            .lock()
+            .map_err(|_| SatelleError::host_unreachable(&self.alias))?;
+        if bridge.is_none() {
+            *bridge = Some(LocalProviderSecretBridge::start(
+                &self.alias,
+                self.service.clone(),
+            )?);
+        }
+        operation(
+            &bridge
+                .as_ref()
+                .expect("the local provider-secret bridge is initialized")
+                .client,
+        )
+        .map_err(|error| direct_transport_error(&self.alias, error))
     }
 
     fn attached(
@@ -693,17 +710,28 @@ impl TransportClient for LocalTransport {
 
     fn preview_provider_secret_provisioning(
         &self,
-        _metadata: &satelle_transport::ProviderSecretProvisioningMetadata,
+        metadata: &satelle_transport::ProviderSecretProvisioningMetadata,
     ) -> Result<satelle_transport::ProviderSecretProvisioningPreviewResponse, SatelleError> {
-        Err(local_provider_secret_provisioning_required())
+        self.with_provider_secret_client(|client| {
+            client.preview_provider_secret_provisioning(
+                metadata,
+                &format!("provider-secret-preview-{}", Uuid::now_v7()),
+            )
+        })
     }
 
     fn provision_provider_secret(
         &self,
-        _metadata: &satelle_transport::ProviderSecretProvisioningMetadata,
-        _secret: Zeroizing<Vec<u8>>,
+        metadata: &satelle_transport::ProviderSecretProvisioningMetadata,
+        secret: Zeroizing<Vec<u8>>,
     ) -> Result<satelle_transport::ProviderSecretProvisioningResponse, SatelleError> {
-        Err(local_provider_secret_provisioning_required())
+        self.with_provider_secret_client(|client| {
+            client.provision_provider_secret(
+                metadata,
+                secret,
+                &format!("provider-secret-provision-{}", Uuid::now_v7()),
+            )
+        })
     }
 
     fn host_status(&self) -> Result<HostStatus, SatelleError> {
@@ -804,6 +832,93 @@ impl TransportClient for LocalTransport {
             return Err(SatelleError::host_not_found(self.alias.clone()));
         }
         self.service.daemon_log_page(query)
+    }
+}
+
+struct LocalProviderSecretBridge {
+    client: DaemonClient,
+    shutdown: DaemonShutdownHandle,
+    server_thread: Option<thread::JoinHandle<()>>,
+}
+
+impl LocalProviderSecretBridge {
+    fn start(alias: &str, service: HostService) -> Result<Self, SatelleError> {
+        let token =
+            ApiBearerToken::generate().map_err(|_| SatelleError::host_unreachable(alias))?;
+        let host_identity = service
+            .initialize_daemon()?
+            .host_identity()
+            .to_string();
+        let service = service.with_ephemeral_bootstrap_auth(
+            &token,
+            ApiScopes::ADMIN,
+            time::OffsetDateTime::now_utc() + time::Duration::minutes(5),
+        );
+        let (started_tx, started_rx) = mpsc::sync_channel(1);
+        let server_thread = thread::Builder::new()
+            .name("satelle-local-provider-secret".to_string())
+            .spawn(move || {
+                let runtime = match tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                {
+                    Ok(runtime) => runtime,
+                    Err(error) => {
+                        let _ = started_tx.send(Err(error.to_string()));
+                        return;
+                    }
+                };
+                runtime.block_on(async move {
+                    let server = match DaemonServer::bind(
+                        service,
+                        DaemonServerConfig::loopback(SocketAddr::from((
+                            Ipv4Addr::LOCALHOST,
+                            0,
+                        ))),
+                    )
+                    .await
+                    {
+                        Ok(server) => server,
+                        Err(error) => {
+                            let _ = started_tx
+                                .send(Err(format!("{} ({error})", error.code())));
+                            return;
+                        }
+                    };
+                    let started =
+                        started_tx.send(Ok((server.local_addr(), server.shutdown_handle())));
+                    if started.is_ok() {
+                        let _ = server.wait().await;
+                    }
+                });
+            })
+            .map_err(|_| SatelleError::host_unreachable(alias))?;
+        let (address, shutdown) = started_rx
+            .recv()
+            .map_err(|_| SatelleError::host_unreachable(alias))?
+            .map_err(|detail| SatelleError::host_unreachable(&format!("{alias} ({detail})")))?;
+        let client = match DaemonClient::loopback(address, token, host_identity) {
+            Ok(client) => client,
+            Err(error) => {
+                shutdown.request_shutdown();
+                let _ = server_thread.join();
+                return Err(direct_transport_error(alias, error));
+            }
+        };
+        Ok(Self {
+            client,
+            shutdown,
+            server_thread: Some(server_thread),
+        })
+    }
+}
+
+impl Drop for LocalProviderSecretBridge {
+    fn drop(&mut self) {
+        self.shutdown.request_shutdown();
+        if let Some(server_thread) = self.server_thread.take() {
+            let _ = server_thread.join();
+        }
     }
 }
 
@@ -4611,19 +4726,23 @@ fn api_code_error(host: &str, code: ApiErrorCode) -> SatelleError {
             ErrorCode::ProjectProviderSelectionNotAllowed,
             "the project is not allowed to select this provider binding",
         ),
-        ApiErrorCode::ProviderSecretResolutionFailed => provider_api_error(
+        ApiErrorCode::ProviderSecretResolutionFailed => provider_secret_api_error(
+            host,
             ErrorCode::ProviderSecretResolutionFailed,
             "the Host could not resolve provider authentication",
         ),
-        ApiErrorCode::ProviderSecretSourceRequired => provider_api_error(
+        ApiErrorCode::ProviderSecretSourceRequired => provider_secret_api_error(
+            host,
             ErrorCode::ProviderSecretSourceRequired,
             "provider authentication requires a Secret Source descriptor",
         ),
-        ApiErrorCode::ProviderSecretProvisioningRequired => provider_api_error(
+        ApiErrorCode::ProviderSecretProvisioningRequired => provider_secret_api_error(
+            host,
             ErrorCode::ProviderSecretProvisioningRequired,
             "provider authentication requires interactive secret provisioning",
         ),
-        ApiErrorCode::ProviderSecretOverwriteRequired => provider_api_error(
+        ApiErrorCode::ProviderSecretOverwriteRequired => provider_secret_api_error(
+            host,
             ErrorCode::ProviderSecretOverwriteRequired,
             "provider secret replacement requires explicit confirmation",
         ),
@@ -4640,6 +4759,18 @@ fn provider_api_error(code: ErrorCode, message: &str) -> SatelleError {
         code,
         message: message.to_string(),
         recovery_command: Some("run satelle doctor --scope provider --refresh --json".to_string()),
+        source_detail: None,
+        details: std::collections::BTreeMap::new(),
+    }
+}
+
+fn provider_secret_api_error(host: &str, code: ErrorCode, message: &str) -> SatelleError {
+    SatelleError {
+        code,
+        message: message.to_string(),
+        recovery_command: Some(format!(
+            "satelle setup --host {host} --component provider-auth"
+        )),
         source_detail: None,
         details: std::collections::BTreeMap::new(),
     }

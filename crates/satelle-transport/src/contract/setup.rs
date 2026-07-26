@@ -190,8 +190,8 @@ pub struct ProviderSecretProvisioningPreviewResponse {
     request_id: RequestId,
     host_identity: String,
     destination_kind: String,
-    destination_exists: bool,
-    overwrite_required: bool,
+    persistence_location_class: String,
+    overwrite_behavior: String,
 }
 
 impl ProviderSecretProvisioningPreviewResponse {
@@ -199,15 +199,16 @@ impl ProviderSecretProvisioningPreviewResponse {
         request_id: RequestId,
         host_identity: String,
         destination_kind: impl Into<String>,
-        destination_exists: bool,
+        persistence_location_class: impl Into<String>,
+        overwrite_behavior: impl Into<String>,
     ) -> Self {
         Self {
             schema_version: ProviderSecretProvisioningPreviewResponseSchema,
             request_id,
             host_identity,
             destination_kind: destination_kind.into(),
-            destination_exists,
-            overwrite_required: destination_exists,
+            persistence_location_class: persistence_location_class.into(),
+            overwrite_behavior: overwrite_behavior.into(),
         }
     }
 
@@ -215,12 +216,12 @@ impl ProviderSecretProvisioningPreviewResponse {
         &self.destination_kind
     }
 
-    pub const fn destination_exists(&self) -> bool {
-        self.destination_exists
+    pub fn persistence_location_class(&self) -> &str {
+        &self.persistence_location_class
     }
 
-    pub const fn overwrite_required(&self) -> bool {
-        self.overwrite_required
+    pub fn overwrite_behavior(&self) -> &str {
+        &self.overwrite_behavior
     }
 }
 

@@ -1,6 +1,7 @@
 use satelle_core::{ProviderBindingAuthorization, ProviderSecretSource};
 use satelle_transport::{
-    ProviderSecretProvisioningMetadata, ProviderSecretProvisioningResponse,
+    ProviderSecretProvisioningMetadata, ProviderSecretProvisioningPreviewResponse,
+    ProviderSecretProvisioningResponse,
 };
 use serde_json::json;
 use std::path::PathBuf;
@@ -65,4 +66,29 @@ fn provisioning_response_schema_has_no_secret_carrier() {
 
     assert!(encoded.get("secret").is_none());
     assert!(encoded.get("value").is_none());
+}
+
+#[test]
+fn preview_response_is_metadata_only_and_does_not_report_destination_state() {
+    let value = json!({
+        "schema_version": "satelle.provider-secret-provisioning-preview-response.v1",
+        "request_id": "0195f6d5-18da-7a80-8000-000000000001",
+        "host_identity": "host-test",
+        "destination_kind": "file",
+        "persistence_location_class": "host_private_file",
+        "overwrite_behavior": "reject_existing_without_explicit_authorization"
+    });
+    let response: ProviderSecretProvisioningPreviewResponse =
+        serde_json::from_value(value).expect("metadata-only preview should decode");
+    let encoded = serde_json::to_value(response).expect("metadata-only preview should encode");
+
+    assert_eq!(encoded["destination_kind"], "file");
+    assert_eq!(encoded["persistence_location_class"], "host_private_file");
+    assert_eq!(
+        encoded["overwrite_behavior"],
+        "reject_existing_without_explicit_authorization"
+    );
+    assert!(encoded.get("destination_exists").is_none());
+    assert!(encoded.get("overwrite_required").is_none());
+    assert!(encoded.get("path").is_none());
 }

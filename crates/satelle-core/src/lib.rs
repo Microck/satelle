@@ -422,14 +422,16 @@ pub enum ProviderSecretSource {
 #[serde(deny_unknown_fields)]
 pub struct ProviderSecretProvisioningPreview {
     destination_kind: String,
-    destination_exists: bool,
+    persistence_location_class: String,
+    overwrite_behavior: String,
 }
 
 impl ProviderSecretProvisioningPreview {
-    pub fn file(destination_exists: bool) -> Self {
+    pub fn file() -> Self {
         Self {
             destination_kind: "file".to_string(),
-            destination_exists,
+            persistence_location_class: "host_private_file".to_string(),
+            overwrite_behavior: "reject_existing_without_explicit_authorization".to_string(),
         }
     }
 
@@ -437,8 +439,12 @@ impl ProviderSecretProvisioningPreview {
         &self.destination_kind
     }
 
-    pub const fn destination_exists(&self) -> bool {
-        self.destination_exists
+    pub fn persistence_location_class(&self) -> &str {
+        &self.persistence_location_class
+    }
+
+    pub fn overwrite_behavior(&self) -> &str {
+        &self.overwrite_behavior
     }
 }
 
@@ -1172,13 +1178,20 @@ mod provider_binding_config_tests {
 
     #[test]
     fn provider_secret_provisioning_reports_are_redacted() {
-        let preview = ProviderSecretProvisioningPreview::file(true);
+        let preview = ProviderSecretProvisioningPreview::file();
         assert_eq!(preview.destination_kind(), "file");
-        assert!(preview.destination_exists());
+        assert_eq!(
+            preview.persistence_location_class(),
+            "host_private_file"
+        );
+        assert_eq!(
+            preview.overwrite_behavior(),
+            "reject_existing_without_explicit_authorization"
+        );
         let preview_wire = serde_json::to_string(&preview).expect("serialize preview");
         assert_eq!(
             preview_wire,
-            r#"{"destination_kind":"file","destination_exists":true}"#
+            r#"{"destination_kind":"file","persistence_location_class":"host_private_file","overwrite_behavior":"reject_existing_without_explicit_authorization"}"#
         );
 
         let result = ProviderSecretProvisioningResult::file(true, "provider_smoke_validated");
@@ -1191,6 +1204,7 @@ mod provider_binding_config_tests {
             r#"{"destination_kind":"file","overwritten":true,"validation_status":"provider_smoke_validated"}"#
         );
         assert!(!preview_wire.contains("path"));
+        assert!(!preview_wire.contains("exists"));
         assert!(!result_wire.contains("secret"));
     }
 
