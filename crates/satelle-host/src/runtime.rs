@@ -2707,6 +2707,28 @@ impl RuntimeHandle {
             .map_err(model::storage_failure)
     }
 
+    pub(crate) fn provider_binding_authorization_replay(
+        &self,
+        identity: &RequestIdentity,
+    ) -> Result<Option<PublicResolvedProviderBinding>, SatelleError> {
+        let requested_at = time::OffsetDateTime::now_utc();
+        let idempotency = model::idempotency(
+            IdempotentOperation::ProviderBindingAuthorization,
+            identity,
+            requested_at,
+        )?;
+        match self
+            .engine()?
+            .lock_storage()?
+            .provider_binding_authorization_replay(&idempotency)
+            .map_err(model::storage_failure)?
+        {
+            Some(ProviderBindingAuthorizationReplay::Completed(binding)) => Ok(Some(binding)),
+            Some(ProviderBindingAuthorizationReplay::Failed(error)) => Err(error),
+            None => Ok(None),
+        }
+    }
+
     pub(crate) fn authorize_provider_binding_idempotent<F>(
         &self,
         identity: &RequestIdentity,

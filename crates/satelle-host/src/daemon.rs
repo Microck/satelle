@@ -835,21 +835,47 @@ impl HostService {
             canonical_payload.as_slice(),
             canonical_payload.digest_schema_version,
         )?;
-        self.runtime.authorize_provider_binding_idempotent(
-            &identity,
-            model_alias,
-            provider_alias,
-            || {
-                let binding = self.prepare_provider_binding_authorization(
-                    host,
-                    model_alias,
-                    provider_alias,
-                    authorization,
-                )?;
-                self.validate_provider_binding_candidate(host, &binding)
-                    .map(|()| binding)
-            },
-        )
+        let operation_identity = identity.clone();
+        self.operation_capacity
+            .execute(
+                crate::operation_capacity::OperationRequest::new(
+                    IdempotentOperation::ProviderBindingAuthorization,
+                    &identity,
+                ),
+                || {
+                    self.runtime
+                        .provider_binding_authorization_replay(&identity)
+                        .map(|binding| {
+                            binding.map(
+                                crate::operation_capacity::OperationOutcome::provider_binding_authorization,
+                            )
+                        })
+                },
+                || {
+                    self.runtime
+                        .authorize_provider_binding_idempotent(
+                            &operation_identity,
+                            model_alias,
+                            provider_alias,
+                            || {
+                                let binding = self.prepare_provider_binding_authorization(
+                                    host,
+                                    model_alias,
+                                    provider_alias,
+                                    authorization,
+                                )?;
+                                self.validate_provider_binding_candidate(host, &binding)
+                                    .map(|()| binding)
+                            },
+                        )
+                        .map(
+                            crate::operation_capacity::OperationOutcome::provider_binding_authorization,
+                        )
+                },
+            )
+            .and_then(
+                crate::operation_capacity::OperationOutcome::into_provider_binding_authorization,
+            )
     }
 
     pub fn delete_provider_binding_idempotent(

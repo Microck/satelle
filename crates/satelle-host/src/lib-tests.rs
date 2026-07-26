@@ -9,6 +9,8 @@ use satelle_core::session::{StopObservation, TurnState, TurnTransition};
 use satelle_core::{ErrorCode, SatelleError};
 use sha2::{Digest as _, Sha256};
 use std::path::PathBuf;
+use std::sync::Condvar;
+use std::time::Duration;
 
 fn turn_intent(prompt: &str) -> TurnIntent {
     TurnIntent::new(prompt, TurnExecutionMode::Standard).expect("valid test Turn intent")
@@ -141,9 +143,57 @@ impl ComputerUseAdapter for RecordingTurnExtrasAdapter {
     }
 }
 
+#[derive(Clone, Default)]
+struct ProviderPreflightGate {
+    state: Arc<(Mutex<ProviderPreflightGateState>, Condvar)>,
+}
+
+#[derive(Default)]
+struct ProviderPreflightGateState {
+    started: bool,
+    released: bool,
+}
+
+impl ProviderPreflightGate {
+    fn signal_started_and_wait(&self) -> Result<(), SatelleError> {
+        let (state, changed) = &*self.state;
+        let mut state = state.lock().expect("provider preflight gate lock");
+        state.started = true;
+        changed.notify_all();
+
+        let (state, _) = changed
+            .wait_timeout_while(state, Duration::from_secs(5), |state| !state.released)
+            .expect("provider preflight gate wait");
+        if !state.released {
+            return Err(SatelleError::config_error(
+                "provider preflight test gate timed out",
+                None,
+            ));
+        }
+        Ok(())
+    }
+
+    fn wait_for_started(&self, timeout: Duration) -> bool {
+        let (state, changed) = &*self.state;
+        let state = state.lock().expect("provider preflight gate lock");
+        let (state, _) = changed
+            .wait_timeout_while(state, timeout, |state| !state.started)
+            .expect("provider preflight start wait");
+        state.started
+    }
+
+    fn release(&self) {
+        let (state, changed) = &*self.state;
+        let mut state = state.lock().expect("provider preflight gate lock");
+        state.released = true;
+        changed.notify_all();
+    }
+}
+
 #[derive(Clone)]
 struct ProviderPreflightCounter {
     calls: Arc<std::sync::atomic::AtomicUsize>,
+    gate: Option<ProviderPreflightGate>,
 }
 
 impl ComputerUseAdapter for ProviderPreflightCounter {
@@ -153,6 +203,9 @@ impl ComputerUseAdapter for ProviderPreflightCounter {
         provider_intent: &ProviderComputerUseIntent,
     ) -> Result<AdapterReadiness, SatelleError> {
         self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if let Some(gate) = &self.gate {
+            gate.signal_started_and_wait()?;
+        }
         FakeComputerUseAdapter.preflight(host, provider_intent)
     }
 
@@ -1686,6 +1739,7 @@ fn strict_provider_smoke_rejects_a_missing_descriptor_before_adapter_preflight()
         state.path().to_path_buf(),
         ProviderPreflightCounter {
             calls: Arc::clone(&calls),
+            gate: None,
         },
         Some("missing-provider-token".to_string()),
     );
@@ -1700,6 +1754,125 @@ fn strict_provider_smoke_rejects_a_missing_descriptor_before_adapter_preflight()
         0,
         calls.load(std::sync::atomic::Ordering::SeqCst),
         "the adapter must not receive preflight for a missing descriptor"
+    );
+}
+
+#[test]
+fn concurrent_provider_binding_authorization_retries_share_one_live_validation() {
+    let state = crate::TestStateDir::new().expect("temporary state directory");
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let gate = ProviderPreflightGate::default();
+    let service = Arc::new(service_with_provider_descriptor(
+        state.path().to_path_buf(),
+        ProviderPreflightCounter {
+            calls: Arc::clone(&calls),
+            gate: Some(gate.clone()),
+        },
+        None,
+    ));
+    service.initialize_daemon().expect("initialize daemon");
+
+    let token = ApiBearerToken::generate().expect("generate token");
+    let principal = service
+        .register_api_token(
+            &token,
+            "provider-authorization-concurrency",
+            ApiScopes::CONTROL,
+            None,
+        )
+        .expect("register token");
+    let authority =
+        MutationAuthority::new(principal, "provider-authorization-concurrency").expect("authority");
+    let authorization = ProviderBindingAuthorization::new("vision", "open_ai", "gpt-5.6", "openai");
+
+    let leader_service = Arc::clone(&service);
+    let leader_authority = authority.clone();
+    let leader_authorization = authorization.clone();
+    let leader = std::thread::spawn(move || {
+        leader_service.authorize_provider_binding_idempotent(
+            LOCAL_DEMO_HOST,
+            "vision",
+            "open_ai",
+            leader_authorization,
+            &leader_authority,
+        )
+    });
+
+    assert!(
+        gate.wait_for_started(Duration::from_secs(5)),
+        "leader validation did not start"
+    );
+
+    let follower_service = Arc::clone(&service);
+    let follower_authority = authority.clone();
+    let follower_authorization = authorization.clone();
+    let follower = std::thread::spawn(move || {
+        follower_service.authorize_provider_binding_idempotent(
+            LOCAL_DEMO_HOST,
+            "vision",
+            "open_ai",
+            follower_authorization,
+            &follower_authority,
+        )
+    });
+
+    let follower_registered = service
+        .operation_capacity
+        .wait_for_follower_registration(Duration::from_secs(5));
+    let conflict = service
+        .authorize_provider_binding_idempotent(
+            LOCAL_DEMO_HOST,
+            "vision",
+            "open_ai",
+            ProviderBindingAuthorization::new("vision", "open_ai", "gpt-conflict", "openai"),
+            &authority,
+        )
+        .expect_err("changed authorization must conflict");
+    let calls_before_release = calls.load(std::sync::atomic::Ordering::SeqCst);
+    gate.release();
+
+    assert!(follower_registered, "exact retry did not join the leader");
+    assert_eq!(ErrorCode::IdempotencyKeyConflict, conflict.code);
+    assert_eq!(
+        1, calls_before_release,
+        "concurrent requests performed duplicate live validation"
+    );
+
+    let leader_binding = leader
+        .join()
+        .expect("leader thread")
+        .expect("leader authorization");
+    let follower_binding = follower
+        .join()
+        .expect("follower thread")
+        .expect("follower authorization");
+    assert_eq!(
+        leader_binding.binding_digest(),
+        follower_binding.binding_digest()
+    );
+
+    let replay = service
+        .authorize_provider_binding_idempotent(
+            LOCAL_DEMO_HOST,
+            "vision",
+            "open_ai",
+            authorization,
+            &authority,
+        )
+        .expect("terminal replay");
+    assert_eq!(leader_binding.binding_digest(), replay.binding_digest());
+    assert_eq!(
+        1,
+        calls.load(std::sync::atomic::Ordering::SeqCst),
+        "terminal replay repeated live validation"
+    );
+    assert_eq!(
+        Some(leader_binding.binding_digest()),
+        service
+            .runtime
+            .provider_binding_digest("vision", "open_ai")
+            .expect("read persisted provider binding")
+            .as_deref()
     );
 }
 
