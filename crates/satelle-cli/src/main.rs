@@ -121,7 +121,7 @@ struct Cli {
 struct ConfigContext<'a> {
     flag_profile: Option<&'a str>,
     select_profile: bool,
-    profile_source: Option<satelle_core::profiles::ProfileSelectionSource>,
+    profile_source: Option<satelle_core::ProfileSelectionSource>,
     resolved: Arc<OnceLock<Result<ResolvedConfig, SatelleError>>>,
 }
 
@@ -147,10 +147,7 @@ impl<'a> ConfigContext<'a> {
         }
     }
 
-    fn for_profile(
-        profile: &'a str,
-        source: satelle_core::profiles::ProfileSelectionSource,
-    ) -> Self {
+    fn for_profile(profile: &'a str, source: satelle_core::ProfileSelectionSource) -> Self {
         Self {
             flag_profile: Some(profile),
             select_profile: true,
