@@ -13,8 +13,8 @@ use crate::codex_session::{
     run_codex_session_with_timeout_cancellation,
 };
 use crate::provider_auth::{
-    ProviderAuthResolutionError, ProviderHostPlatform, ResolvedProviderSecret,
-    resolve_provider_secret,
+    ProviderAuthResolutionError, ProviderHostPlatform, ProviderSmokeCredentialFingerprinter,
+    ResolvedProviderSecret, resolve_provider_secret,
 };
 use crate::{DEFAULT_MODEL_BINDING, DEFAULT_PROVIDER_BINDING, READINESS_CANCELLATION_GRACE};
 use command_group::{CommandGroup, GroupChild};
@@ -109,6 +109,7 @@ pub(crate) struct ProductionComputerUseAdapter {
     provider_smoke_success_ttl: time::Duration,
     provider_smoke_failure_ttl: time::Duration,
     desktop_selection: DesktopSelectionPolicy,
+    provider_smoke_fingerprinter: ProviderSmokeCredentialFingerprinter,
 }
 
 pub(crate) struct ProductionAdapterPolicy {
@@ -166,6 +167,9 @@ impl ProductionComputerUseAdapter {
                 preference: None,
                 native_selector: None,
             },
+            provider_smoke_fingerprinter: ProviderSmokeCredentialFingerprinter::for_test(
+                [0x5a; 32],
+            ),
         }
     }
 
@@ -184,7 +188,22 @@ impl ProductionComputerUseAdapter {
             provider_smoke_success_ttl: policy.provider_smoke_success_ttl,
             provider_smoke_failure_ttl: policy.provider_smoke_failure_ttl,
             desktop_selection: policy.desktop_selection,
+            provider_smoke_fingerprinter: ProviderSmokeCredentialFingerprinter::default(),
         }
+    }
+
+    pub(crate) fn provider_smoke_fingerprinter(&self) -> ProviderSmokeCredentialFingerprinter {
+        self.provider_smoke_fingerprinter.clone()
+    }
+
+    fn provider_smoke_credential_fingerprint(
+        &self,
+        binding_digest: &str,
+        secret: Option<&ResolvedProviderSecret>,
+    ) -> Result<String, SatelleError> {
+        self.provider_smoke_fingerprinter
+            .fingerprint(binding_digest, secret)
+            .ok_or_else(|| adapter_failure("provider_smoke_hmac_key_unavailable"))
     }
 
     fn resolve_provider_binding(
@@ -527,11 +546,17 @@ impl ProductionComputerUseAdapter {
                 provider_secret,
             });
         }
-        let provider_credential_fingerprint =
-            crate::provider_auth::provider_smoke_credential_fingerprint(
+        let provider_credential_fingerprint = self
+            .provider_smoke_credential_fingerprint(
                 binding.binding_digest(),
                 provider_secret.as_ref(),
-            );
+            )
+            .map_err(|error| {
+                Box::new(ProviderSmokeAttemptFailure {
+                    evidence: None,
+                    error: Box::new(error),
+                })
+            })?;
         match matching_provider_cache(cached_provider, &provider_credential_fingerprint) {
             Some(ProviderSmokeResult::Passed(evidence)) => {
                 return Ok(PreparedProviderAdmission {
@@ -600,15 +625,17 @@ impl ProductionComputerUseAdapter {
                     error: Box::new(error),
                 })
             })?;
-        let provider_secret =
-            resolve_execution_provider_secret(binding, &provider_credential_fingerprint).map_err(
-                |error| {
-                    Box::new(ProviderSmokeAttemptFailure {
-                        evidence: None,
-                        error: Box::new(error),
-                    })
-                },
-            )?;
+        let provider_secret = resolve_execution_provider_secret(
+            binding,
+            &provider_credential_fingerprint,
+            &self.provider_smoke_fingerprinter,
+        )
+        .map_err(|error| {
+            Box::new(ProviderSmokeAttemptFailure {
+                evidence: None,
+                error: Box::new(error),
+            })
+        })?;
         Ok(PreparedProviderAdmission {
             evidence: Some(provider_smoke_evidence),
             provider_secret,
@@ -916,12 +943,12 @@ pub(crate) fn resolve_provider_child_secret(
 fn resolve_execution_provider_secret(
     binding: &ResolvedProviderBinding,
     preflight_fingerprint: &str,
+    fingerprinter: &ProviderSmokeCredentialFingerprinter,
 ) -> Result<Option<ResolvedProviderSecret>, SatelleError> {
     let provider_secret = resolve_provider_child_secret(binding)?;
-    let execution_fingerprint = crate::provider_auth::provider_smoke_credential_fingerprint(
-        binding.binding_digest(),
-        provider_secret.as_ref(),
-    );
+    let execution_fingerprint = fingerprinter
+        .fingerprint(binding.binding_digest(), provider_secret.as_ref())
+        .ok_or_else(|| adapter_failure("provider_smoke_hmac_key_unavailable"))?;
     if execution_fingerprint != preflight_fingerprint {
         return Err(provider_secret_resolution_error(
             "provider_auth_changed_during_preflight",
@@ -2537,18 +2564,19 @@ mod tests {
         );
         let smoked_secret =
             resolve_provider_child_secret(&binding).expect("resolve the credential used by smoke");
-        let preflight_fingerprint = crate::provider_auth::provider_smoke_credential_fingerprint(
-            binding.binding_digest(),
-            smoked_secret.as_ref(),
-        );
+        let fingerprinter = ProviderSmokeCredentialFingerprinter::for_test([0x5a; 32]);
+        let preflight_fingerprint = fingerprinter
+            .fingerprint(binding.binding_digest(), smoked_secret.as_ref())
+            .unwrap();
         drop(smoked_secret);
 
         // SAFETY: the UUID-qualified name is owned only by this test.
         unsafe {
             std::env::set_var(&environment.0, "rotated-provider-secret");
         }
-        let rotation_error = resolve_execution_provider_secret(&binding, &preflight_fingerprint)
-            .expect_err("rotation after smoke must fail before admission");
+        let rotation_error =
+            resolve_execution_provider_secret(&binding, &preflight_fingerprint, &fingerprinter)
+                .expect_err("rotation after smoke must fail before admission");
         assert_eq!(
             rotation_error.code,
             ErrorCode::ProviderSecretResolutionFailed
@@ -2563,8 +2591,9 @@ mod tests {
         unsafe {
             std::env::set_var(&environment.0, "preflight-provider-secret");
         }
-        let provider_secret = resolve_execution_provider_secret(&binding, &preflight_fingerprint)
-            .expect("an unchanged credential remains admissible");
+        let provider_secret =
+            resolve_execution_provider_secret(&binding, &preflight_fingerprint, &fingerprinter)
+                .expect("an unchanged credential remains admissible");
         let prepared_secret = crate::runtime::adapter::PreparedProviderSecret::new(provider_secret);
         unsafe {
             std::env::set_var(&environment.0, "post-admission-provider-secret");
@@ -3185,7 +3214,7 @@ mod tests {
         let provider_intent = ProviderComputerUseIntent::new(None, None, false);
         let binding = resolved_provider_binding_for_test("model-provider-cache", "provider-cache");
         let provider_credential_fingerprint =
-            crate::provider_auth::provider_smoke_credential_fingerprint(
+            crate::provider_auth::provider_smoke_credential_fingerprint_for_test(
                 binding.binding_digest(),
                 None,
             );
@@ -3331,7 +3360,7 @@ mod tests {
         .unwrap()
         .with_provider_binding(&binding);
         let provider_credential_fingerprint =
-            crate::provider_auth::provider_smoke_credential_fingerprint(
+            crate::provider_auth::provider_smoke_credential_fingerprint_for_test(
                 binding.binding_digest(),
                 None,
             );

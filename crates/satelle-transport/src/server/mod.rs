@@ -920,7 +920,7 @@ fn router(state: Arc<DaemonState>) -> Router {
         )
         .route_layer(middleware::from_fn_with_state(
             Arc::clone(&state),
-            auth::require_setup_or_control_mutation,
+            auth::require_control,
         ));
     let control_routes = Router::new()
         .route("/v1/sessions", post(sessions::create_session))

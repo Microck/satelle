@@ -365,6 +365,7 @@ fn rebuild_storage_as_version_eleven_fixture(connection: &Connection) {
             );
 
             DROP TABLE authorized_provider_bindings;
+            DROP TABLE provider_smoke_hmac_key;
             DELETE FROM schema_migrations WHERE version = 12;
             PRAGMA user_version = 11;",
         )
@@ -560,7 +561,10 @@ fn version_ten_operation_rows_upgrade_without_data_loss_or_foreign_key_damage() 
     rebuild_idempotency_records_as_pre_v11_fixture(storage.connection_for_test());
     storage
         .connection_for_test()
-        .execute("DROP TABLE authorized_provider_bindings", [])
+        .execute_batch(
+            "DROP TABLE authorized_provider_bindings;
+             DROP TABLE provider_smoke_hmac_key;",
+        )
         .expect("remove version twelve provider bindings table");
     storage
         .connection_for_test()
@@ -794,6 +798,7 @@ fn version_seven_api_tokens_upgrade_to_explicit_active_state() {
              ALTER TABLE session_private_refs DROP COLUMN upstream_goal_ref;
              ALTER TABLE api_tokens DROP COLUMN token_state;
              DROP TABLE authorized_provider_bindings;
+             DROP TABLE provider_smoke_hmac_key;
              DELETE FROM schema_migrations WHERE version IN (8, 9, 10, 11, 12);
              PRAGMA user_version = 7;",
         )
@@ -2059,6 +2064,7 @@ fn version_one_store_upgrades_without_replacing_existing_state() {
              ALTER TABLE session_private_refs DROP COLUMN upstream_goal_ref;
              ALTER TABLE api_tokens DROP COLUMN token_state;
              DROP TABLE authorized_provider_bindings;
+             DROP TABLE provider_smoke_hmac_key;
              DELETE FROM schema_migrations WHERE version IN (2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12);
              PRAGMA user_version = 1;",
         )
@@ -2163,6 +2169,7 @@ fn assert_version_one_corruption_rejected_before_migration(
              ALTER TABLE session_private_refs DROP COLUMN upstream_goal_ref;
              ALTER TABLE api_tokens DROP COLUMN token_state;
              DROP TABLE authorized_provider_bindings;
+             DROP TABLE provider_smoke_hmac_key;
              DELETE FROM schema_migrations WHERE version IN (2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12);
              PRAGMA user_version = 1;",
         )
@@ -2226,6 +2233,7 @@ fn failed_migration_rolls_back_partial_schema_and_preserves_existing_state() {
              ALTER TABLE session_private_refs DROP COLUMN upstream_goal_ref;
              ALTER TABLE api_tokens DROP COLUMN token_state;
              DROP TABLE authorized_provider_bindings;
+             DROP TABLE provider_smoke_hmac_key;
              DELETE FROM schema_migrations WHERE version IN (2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12);
              PRAGMA user_version = 1;
              CREATE TABLE migration_sentinel (value TEXT NOT NULL) STRICT;

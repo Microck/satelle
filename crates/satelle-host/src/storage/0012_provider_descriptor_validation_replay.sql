@@ -218,6 +218,12 @@ CREATE TABLE authorized_provider_bindings (
     PRIMARY KEY (provider_alias, model_alias)
 ) STRICT;
 
+CREATE TABLE provider_smoke_hmac_key (
+    singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+    key_material BLOB NOT NULL CHECK (length(key_material) = 32),
+    created_at TEXT NOT NULL
+) STRICT;
+
 -- Provider smoke evidence written before version 12 is not bound to the
 -- credential that was probed. Rebuild the cache instead of treating those
 -- rows as reusable under an unknown credential.

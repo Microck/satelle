@@ -905,6 +905,12 @@ impl Storage {
         auth::rotate_idempotency_hmac_key(&mut self.connection, at)
     }
 
+    pub(crate) fn provider_smoke_hmac_key(
+        &self,
+    ) -> Result<crate::provider_auth::ProviderSmokeHmacKey, StorageError> {
+        auth::provider_smoke_hmac_key(&self.connection)
+    }
+
     pub(crate) fn register_api_token(
         &mut self,
         registration: ApiTokenRegistration,

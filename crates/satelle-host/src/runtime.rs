@@ -589,11 +589,20 @@ impl RuntimeEngine {
         adapter: Arc<dyn ComputerUseAdapter>,
         readiness_probe_driver: Option<Arc<dyn ReadinessProbeDriver>>,
         provider_policy: RuntimeProviderPolicy,
+        provider_smoke_fingerprinter: Option<
+            crate::provider_auth::ProviderSmokeCredentialFingerprinter,
+        >,
     ) -> Result<Arc<Self>, SatelleError> {
         let process_identity =
             ProcessIdentity::current().map_err(model::process_identity_failure)?;
         let storage =
             Storage::open_without_restart_recovery(state_root).map_err(model::storage_failure)?;
+        if let Some(fingerprinter) = provider_smoke_fingerprinter {
+            let key = storage
+                .provider_smoke_hmac_key()
+                .map_err(model::storage_failure)?;
+            fingerprinter.initialize(key);
+        }
         let attachment_store =
             crate::attachment::AttachmentStore::open(state_root.join("attachments"))?;
         let mirrored_cursor = storage
@@ -1745,6 +1754,8 @@ struct LazyRuntime {
     operator_log_root: Result<PathBuf, SatelleError>,
     engine: Option<Arc<RuntimeEngine>>,
     provider_policy: RuntimeProviderPolicy,
+    provider_smoke_fingerprinter:
+        Option<crate::provider_auth::ProviderSmokeCredentialFingerprinter>,
 }
 
 #[derive(Clone)]
@@ -2075,6 +2086,7 @@ impl RuntimeHandle {
                 operator_log_root,
                 engine: None,
                 provider_policy: RuntimeProviderPolicy::default(),
+                provider_smoke_fingerprinter: None,
             })),
         }
     }
@@ -2098,6 +2110,7 @@ impl RuntimeHandle {
                 operator_log_root,
                 engine: None,
                 provider_policy,
+                provider_smoke_fingerprinter: None,
             })),
         }
     }
@@ -2108,6 +2121,7 @@ impl RuntimeHandle {
         adapter: ProductionComputerUseAdapter,
         provider_policy: RuntimeProviderPolicy,
     ) -> Self {
+        let provider_smoke_fingerprinter = adapter.provider_smoke_fingerprinter();
         let adapter = Arc::new(adapter);
         let computer_use_adapter: Arc<dyn ComputerUseAdapter> = adapter.clone();
         let readiness_probe_driver: Arc<dyn ReadinessProbeDriver> = adapter;
@@ -2120,6 +2134,7 @@ impl RuntimeHandle {
                 operator_log_root,
                 engine: None,
                 provider_policy,
+                provider_smoke_fingerprinter: Some(provider_smoke_fingerprinter),
             })),
         }
     }
@@ -2147,6 +2162,7 @@ impl RuntimeHandle {
                 operator_log_root,
                 engine: None,
                 provider_policy: RuntimeProviderPolicy::default(),
+                provider_smoke_fingerprinter: None,
             })),
         }
     }
@@ -2866,6 +2882,7 @@ impl RuntimeHandle {
             Arc::clone(&self.adapter),
             self.readiness_probe_driver.clone(),
             lazy.provider_policy.clone(),
+            lazy.provider_smoke_fingerprinter.clone(),
         )?;
         lazy.engine = Some(Arc::clone(&engine));
         Ok(engine)

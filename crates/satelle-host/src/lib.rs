@@ -1469,7 +1469,10 @@ impl HostService {
             return Err(SatelleError::invalid_usage("unsupported doctor scope"));
         }
         let includes_provider_scope = matches!(scope, None | Some("provider" | "all"));
-        let mut provider_auth_evidence = if includes_provider_scope {
+        let has_provider_selection =
+            provider_intent.model().is_some() || provider_intent.provider().is_some();
+        let should_resolve_provider = includes_provider_scope && has_provider_selection;
+        let mut provider_auth_evidence = if should_resolve_provider {
             let evidence = match self.resolve_provider_binding(host, provider_intent)? {
                 ProviderBindingResolution::Ready(binding) => match binding.auth_source() {
                     Some(source) => (
@@ -1505,7 +1508,7 @@ impl HostService {
                 self.fake_doctor(host, scope, options, &FakeComputerUseAdapter)?
             }
         };
-        if options.refresh() && includes_provider_scope {
+        if options.refresh() && should_resolve_provider {
             if scope == Some("provider") {
                 report.changed = false;
                 report.cache_updates.clear();

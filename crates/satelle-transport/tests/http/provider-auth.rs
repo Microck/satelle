@@ -118,6 +118,41 @@ async fn bootstrap_admin_authorizes_and_control_validates_the_exact_path_aliases
 }
 
 #[tokio::test]
+async fn ssh_bootstrap_read_cannot_validate_provider_bindings() {
+    let state = TestStateDir::new().expect("create bootstrap read state");
+    let bootstrap_token = ApiBearerToken::generate().expect("generate bootstrap token");
+    let service = HostService::local_demo_for_tests_at(state.path())
+        .expect("create bootstrap read service")
+        .with_ssh_bootstrap_auth_for_tests(
+            &bootstrap_token,
+            ApiScopes::READ,
+            time::OffsetDateTime::now_utc() + time::Duration::minutes(15),
+        );
+    let running = RunningServer::start_with_service(
+        ApiScopes::CONTROL,
+        DaemonServerConfig::loopback(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))),
+        state,
+        service,
+    )
+    .await;
+    let validation =
+        ProviderDescriptorValidationRequest::new(ProviderAuthValidationMode::Cached, false, false);
+    let forbidden = bootstrap_mutation(
+        &running,
+        &bootstrap_token,
+        reqwest::Method::POST,
+        VALIDATION_PATH,
+        "provider-validation-bootstrap-read",
+    )
+    .json(&validation)
+    .send()
+    .await
+    .expect("send validation as bootstrap read principal");
+
+    assert_eq!(forbidden.status(), StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
 async fn validation_rejects_descriptor_material_and_control_cannot_authorize() {
     let control = RunningServer::start(ApiScopes::CONTROL).await;
     let raw_secret = "PRIVATE_PROVIDER_DESCRIPTOR_RAW_SECRET_CANARY";
@@ -214,6 +249,13 @@ async fn provider_binding_mutations_require_admin() {
         .await
         .expect("send deletion as control principal");
     assert_eq!(forbidden_delete.status(), StatusCode::FORBIDDEN);
+    assert!(
+        forbidden_delete
+            .text()
+            .await
+            .expect("decode admin scope rejection")
+            .contains("the API Principal does not have admin scope")
+    );
 
     let ordinary_admin = RunningServer::start(ApiScopes::ADMIN).await;
     let authorized = ordinary_admin

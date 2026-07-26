@@ -869,6 +869,8 @@ fn apply_migrations(
         verify_integrity(connection)?;
         if expected_user_version < 8 {
             super::auth::validate_sensitive_state_before_token_state_migration(connection)?;
+        } else if expected_user_version < 12 {
+            super::auth::validate_sensitive_state_before_provider_smoke_key_migration(connection)?;
         } else {
             super::auth::validate_sensitive_state(connection)?;
         }
@@ -908,6 +910,9 @@ fn apply_migrations(
             .map_err(|source| sqlite_error(StorageErrorKind::MigrationFailed, source))?;
         if migration.seeds_sensitive_state {
             super::auth::seed_sensitive_state(&transaction, applied_at)?;
+        }
+        if migration.version == 12 {
+            super::auth::seed_provider_smoke_hmac_key(&transaction, applied_at)?;
         }
         transaction
             .execute(

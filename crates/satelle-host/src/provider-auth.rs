@@ -5,13 +5,52 @@ use satelle_core::{
 use sha2::Sha256;
 use std::fmt;
 use std::path::Path;
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 use thiserror::Error;
 use zeroize::Zeroizing;
 
 type HmacSha256 = Hmac<Sha256>;
 
-static PROVIDER_SMOKE_CREDENTIAL_KEY: OnceLock<[u8; 32]> = OnceLock::new();
+pub(crate) struct ProviderSmokeHmacKey(Zeroizing<[u8; 32]>);
+
+impl ProviderSmokeHmacKey {
+    pub(crate) fn new(value: [u8; 32]) -> Self {
+        Self(Zeroizing::new(value))
+    }
+}
+
+/// Shares one Host-owned credential fingerprinter between production adapter
+/// clones. Storage initializes it before any provider preflight can run.
+#[derive(Clone, Default)]
+pub(crate) struct ProviderSmokeCredentialFingerprinter {
+    key: Arc<OnceLock<ProviderSmokeHmacKey>>,
+}
+
+impl ProviderSmokeCredentialFingerprinter {
+    pub(crate) fn initialize(&self, key: ProviderSmokeHmacKey) {
+        // Runtime startup can retry after a later initialization step fails.
+        // One RuntimeHandle has one immutable state root, so its first loaded
+        // key remains authoritative.
+        drop(self.key.set(key));
+    }
+
+    pub(crate) fn fingerprint(
+        &self,
+        binding_digest: &str,
+        secret: Option<&ResolvedProviderSecret>,
+    ) -> Option<String> {
+        self.key.get().map(|key| {
+            provider_smoke_credential_fingerprint_with_key(key.0.as_ref(), binding_digest, secret)
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_test(key: [u8; 32]) -> Self {
+        let fingerprinter = Self::default();
+        fingerprinter.initialize(ProviderSmokeHmacKey::new(key));
+        fingerprinter
+    }
+}
 
 /// A provider credential whose allocation is zeroized when dropped.
 ///
@@ -44,19 +83,14 @@ impl ResolvedProviderSecret {
 /// cache state. The binding digest scopes identical secret bytes to one exact
 /// authorized provider binding, while the marker keeps no-secret bindings
 /// distinct from bindings whose resolved secret happens to be empty.
-pub(crate) fn provider_smoke_credential_fingerprint(
+#[cfg(test)]
+pub(crate) fn provider_smoke_credential_fingerprint_for_test(
     binding_digest: &str,
     secret: Option<&ResolvedProviderSecret>,
 ) -> String {
-    let key = PROVIDER_SMOKE_CREDENTIAL_KEY.get_or_init(|| {
-        let mut key = [0_u8; 32];
-        // A missing OS random source cannot safely fall back to a deterministic
-        // credential verifier. Abort the process before provider I/O instead.
-        getrandom::fill(&mut key)
-            .expect("the OS random source must initialize provider credential cache identity");
-        key
-    });
-    provider_smoke_credential_fingerprint_with_key(key, binding_digest, secret)
+    ProviderSmokeCredentialFingerprinter::for_test([0x5a; 32])
+        .fingerprint(binding_digest, secret)
+        .expect("the test provider credential fingerprinter is initialized")
 }
 
 fn provider_smoke_credential_fingerprint_with_key(
@@ -98,7 +132,7 @@ mod provider_credential_fingerprint_tests {
     use super::*;
 
     #[test]
-    fn provider_smoke_credential_fingerprint_is_scoped_to_a_process_secret() {
+    fn provider_smoke_credential_fingerprint_is_scoped_to_a_host_secret() {
         let secret = ResolvedProviderSecret::for_test("low-entropy-provider-secret");
         let binding_digest = "a".repeat(64);
         let first = provider_smoke_credential_fingerprint_with_key(
@@ -399,13 +433,13 @@ mod tests {
         let first = resolve_provider_secret(&source, ProviderHostPlatform::Posix)
             .expect("resolve the first environment credential");
         let first_fingerprint =
-            provider_smoke_credential_fingerprint(&binding_digest, Some(&first));
+            provider_smoke_credential_fingerprint_for_test(&binding_digest, Some(&first));
 
         environment.set("rotated-provider-token");
         let rotated = resolve_provider_secret(&source, ProviderHostPlatform::Posix)
             .expect("resolve the rotated environment credential");
         let rotated_fingerprint =
-            provider_smoke_credential_fingerprint(&binding_digest, Some(&rotated));
+            provider_smoke_credential_fingerprint_for_test(&binding_digest, Some(&rotated));
 
         assert_eq!(64, first_fingerprint.len());
         assert!(
@@ -416,7 +450,7 @@ mod tests {
         assert_ne!(first_fingerprint, rotated_fingerprint);
         assert_ne!(
             first_fingerprint,
-            provider_smoke_credential_fingerprint(&binding_digest, None)
+            provider_smoke_credential_fingerprint_for_test(&binding_digest, None)
         );
         assert!(!first_fingerprint.contains("first-provider-token"));
         assert!(!rotated_fingerprint.contains("rotated-provider-token"));
@@ -514,14 +548,14 @@ mod tests {
         let first = resolve_provider_secret(&source, ProviderHostPlatform::Posix)
             .expect("resolve the first file credential");
         let first_fingerprint =
-            provider_smoke_credential_fingerprint(&binding_digest, Some(&first));
+            provider_smoke_credential_fingerprint_for_test(&binding_digest, Some(&first));
 
         std::fs::write(&path, "rotated-file-provider-token")
             .expect("rotate the owner-only provider credential");
         let rotated = resolve_provider_secret(&source, ProviderHostPlatform::Posix)
             .expect("resolve the rotated file credential");
         let rotated_fingerprint =
-            provider_smoke_credential_fingerprint(&binding_digest, Some(&rotated));
+            provider_smoke_credential_fingerprint_for_test(&binding_digest, Some(&rotated));
 
         assert_ne!(first_fingerprint, rotated_fingerprint);
         assert!(!first_fingerprint.contains("first-file-provider-token"));
