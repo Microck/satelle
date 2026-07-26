@@ -884,7 +884,6 @@ pub struct PublicResolvedProviderBinding {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     endpoint: Option<String>,
     source: ProviderBindingSource,
-    #[serde(default)]
     allow_project_selection: bool,
     experimental_provider_computer_use: bool,
     binding_digest: String,

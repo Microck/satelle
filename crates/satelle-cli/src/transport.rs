@@ -774,7 +774,10 @@ fn local_turn_intent(request: &TurnRequest) -> Result<satelle_host::TurnIntent, 
                 request.provider().map(str::to_string),
                 request.refresh_provider_smoke_test(),
             )?;
-            Ok(intent)
+            Ok(intent.with_project_selection_provenance(
+                request.model_from_project(),
+                request.provider_from_project(),
+            ))
         })
         .map(|intent| {
             intent.with_experimental_provider_computer_use(

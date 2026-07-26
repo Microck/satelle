@@ -326,13 +326,10 @@ fn turn_intent(
 
     TurnIntent::new(prompt, execution_mode)
         .and_then(|intent| {
-            intent.with_provider_intent(
-                model,
-                provider,
-                model_from_project,
-                provider_from_project,
-                refresh_provider_smoke_test,
-            )
+            intent.with_provider_intent(model, provider, refresh_provider_smoke_test)
+        })
+        .map(|intent| {
+            intent.with_project_selection_provenance(model_from_project, provider_from_project)
         })
         .map(|intent| {
             intent.with_experimental_provider_computer_use(experimental_provider_computer_use)

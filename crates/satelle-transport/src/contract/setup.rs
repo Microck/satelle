@@ -593,6 +593,27 @@ mod provider_binding_contract_tests {
                 serde_json::from_value::<ProviderDescriptorValidationRequest>(request).is_err()
             );
         }
+
+        let current_binding = json!({
+            "requested_model_alias": "vision",
+            "requested_provider_alias": "open_ai",
+            "model": "gpt-5.6",
+            "model_provider": "openai",
+            "source": "host_owned",
+            "allow_project_selection": false,
+            "experimental_provider_computer_use": false,
+            "binding_digest": "digest"
+        });
+        assert!(
+            serde_json::from_value::<PublicResolvedProviderBinding>(current_binding.clone())
+                .is_ok()
+        );
+        let mut missing_consent = current_binding;
+        missing_consent
+            .as_object_mut()
+            .expect("binding fixture is an object")
+            .remove("allow_project_selection");
+        assert!(serde_json::from_value::<PublicResolvedProviderBinding>(missing_consent).is_err());
     }
 
     #[test]

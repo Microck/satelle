@@ -4244,7 +4244,11 @@ fn doctor_provider_intent(
         .map(ProviderBindingRef::new)
         .transpose()
         .map_err(|_| SatelleError::invalid_usage("the selected provider alias is invalid"))?;
-    let intent = ProviderComputerUseIntent::new(model, provider, refresh);
+    let intent = ProviderComputerUseIntent::new(model, provider, refresh)
+        .with_project_selection_provenance(
+            config.model_alias_from_project(),
+            config.provider_alias_from_project(),
+        );
     Ok(match probe_timeout {
         Some(timeout) => intent.with_provider_smoke_timeout(timeout),
         None => intent,
