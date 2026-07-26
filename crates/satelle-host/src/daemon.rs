@@ -19,9 +19,7 @@ use thiserror::Error;
 use time::OffsetDateTime;
 use zeroize::Zeroizing;
 
-#[cfg(any(test, feature = "test-support"))]
 use crate::EphemeralApiAuthenticator;
-#[cfg(any(test, feature = "test-support"))]
 use std::sync::Arc;
 
 const MAX_IDEMPOTENCY_KEY_BYTES: usize = 256;
