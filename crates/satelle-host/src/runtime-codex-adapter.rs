@@ -530,6 +530,7 @@ impl ProductionComputerUseAdapter {
         provider_intent: &ProviderComputerUseIntent,
         persistence: &mut ProviderProbePersistence<'_>,
     ) -> Result<PreparedProviderAdmission, Box<ProviderSmokeAttemptFailure>> {
+        let candidate_secret_supplied = persistence.provider_secret.is_some();
         let provider_secret = match persistence.provider_secret.take() {
             Some(secret) => Some(secret),
             None => resolve_provider_child_secret(binding).map_err(|error| {
@@ -629,10 +630,11 @@ impl ProductionComputerUseAdapter {
                     error: Box::new(error),
                 })
             })?;
-        let provider_secret = resolve_execution_provider_secret(
+        let provider_secret = provider_secret_after_live_smoke(
             binding,
             &provider_credential_fingerprint,
             &self.provider_smoke_fingerprinter,
+            candidate_secret_supplied,
         )
         .map_err(|error| {
             Box::new(ProviderSmokeAttemptFailure {
@@ -959,6 +961,22 @@ fn resolve_execution_provider_secret(
         ));
     }
     Ok(provider_secret)
+}
+
+fn provider_secret_after_live_smoke(
+    binding: &ResolvedProviderBinding,
+    preflight_fingerprint: &str,
+    fingerprinter: &ProviderSmokeCredentialFingerprinter,
+    candidate_secret_supplied: bool,
+) -> Result<Option<ResolvedProviderSecret>, SatelleError> {
+    if candidate_secret_supplied {
+        // Setup and repair supply a one-shot candidate by value. The live
+        // smoke owns and zeroizes it; the caller commits the separately held
+        // candidate only after readiness succeeds. Re-resolving here would
+        // incorrectly consult the old or intentionally absent destination.
+        return Ok(None);
+    }
+    resolve_execution_provider_secret(binding, preflight_fingerprint, fingerprinter)
 }
 
 pub(crate) fn validate_provider_endpoint(endpoint: &str) -> Result<(), SatelleError> {
@@ -2484,6 +2502,17 @@ fn host_turn_timeout_ceiling() -> Result<TimeoutPolicy, SatelleError> {
 mod tests {
     use super::*;
 
+    struct ScopedEnvironmentVariable(String);
+
+    impl Drop for ScopedEnvironmentVariable {
+        fn drop(&mut self) {
+            // SAFETY: each test uses a UUID-qualified variable it alone owns.
+            unsafe {
+                std::env::remove_var(&self.0);
+            }
+        }
+    }
+
     fn execution_policy_for(desktop_binding: &str, desktop_session_id: &str) -> ExecutionPolicy {
         ExecutionPolicy::new(
             EffectiveModelRef::new(DEFAULT_MODEL_BINDING).unwrap(),
@@ -2538,17 +2567,6 @@ mod tests {
 
     #[test]
     fn provider_credential_rotation_cannot_cross_preflight_execution_boundary() {
-        struct ScopedEnvironmentVariable(String);
-
-        impl Drop for ScopedEnvironmentVariable {
-            fn drop(&mut self) {
-                // SAFETY: the UUID-qualified name is owned only by this test.
-                unsafe {
-                    std::env::remove_var(&self.0);
-                }
-            }
-        }
-
         let environment = ScopedEnvironmentVariable(format!(
             "SATELLE_PROVIDER_ROTATION_TEST_{}",
             uuid::Uuid::now_v7().simple()
@@ -2610,6 +2628,119 @@ mod tests {
             .expect("the binding has a provider credential");
         assert!(
             staged_secret.expose_to_provider(|secret| { secret == "preflight-provider-secret" })
+        );
+    }
+
+    #[test]
+    fn staged_candidate_live_smoke_succeeds_without_destination_secret() {
+        let environment = ScopedEnvironmentVariable(format!(
+            "SATELLE_PROVIDER_CANDIDATE_MISSING_TEST_{}",
+            uuid::Uuid::now_v7().simple()
+        ));
+        let binding = ResolvedProviderBinding::from_authorization(
+            ProviderBindingAuthorization::new(
+                "candidate-model",
+                "candidate-provider",
+                "candidate-model",
+                "openai",
+            )
+            .with_auth_source(satelle_core::ProviderSecretSource::Environment {
+                variable: environment.0.clone(),
+            }),
+            ProviderBindingSource::HostOwned,
+        );
+        let candidate = Some(ResolvedProviderSecret::for_test("replacement-provider-secret"));
+        let fingerprinter = ProviderSmokeCredentialFingerprinter::for_test([0x5a; 32]);
+        let candidate_fingerprint = fingerprinter
+            .fingerprint(binding.binding_digest(), candidate.as_ref())
+            .unwrap();
+        let working_directory = tempfile::tempdir().expect("provider smoke working directory");
+        let mut persist_thread_ref = |_value: &str| Ok(());
+        let mut persist_turn_ref = |_value: &str| Ok(());
+        let request = provider_smoke_session_request(
+            &binding,
+            candidate,
+            working_directory.path(),
+            "candidate live smoke",
+            Instant::now() + Duration::from_secs(10),
+            &mut persist_thread_ref,
+            &mut persist_turn_ref,
+        );
+        assert!(
+            request
+                .provider_secret
+                .as_ref()
+                .is_some_and(|secret| secret
+                    .expose_to_provider(|value| value == "replacement-provider-secret")),
+            "the live smoke request must own the staged candidate"
+        );
+        drop(request);
+
+        assert!(
+            resolve_provider_child_secret(&binding).is_err(),
+            "the destination is intentionally absent before candidate commit"
+        );
+        let prepared = provider_secret_after_live_smoke(
+            &binding,
+            &candidate_fingerprint,
+            &fingerprinter,
+            true,
+        )
+        .expect("candidate evidence must not re-resolve the absent destination");
+        assert!(prepared.is_none());
+    }
+
+    #[test]
+    fn staged_candidate_rotation_skips_post_smoke_reresolution_but_normal_admission_does_not() {
+        let environment = ScopedEnvironmentVariable(format!(
+            "SATELLE_PROVIDER_CANDIDATE_ROTATION_TEST_{}",
+            uuid::Uuid::now_v7().simple()
+        ));
+        unsafe {
+            std::env::set_var(&environment.0, "preflight-provider-secret");
+        }
+        let binding = ResolvedProviderBinding::from_authorization(
+            ProviderBindingAuthorization::new(
+                "rotation-model",
+                "rotation-provider",
+                "rotation-model",
+                "openai",
+            )
+            .with_auth_source(satelle_core::ProviderSecretSource::Environment {
+                variable: environment.0.clone(),
+            }),
+            ProviderBindingSource::HostOwned,
+        );
+        let smoked_secret =
+            resolve_provider_child_secret(&binding).expect("resolve the preflight credential");
+        let fingerprinter = ProviderSmokeCredentialFingerprinter::for_test([0x5a; 32]);
+        let preflight_fingerprint = fingerprinter
+            .fingerprint(binding.binding_digest(), smoked_secret.as_ref())
+            .unwrap();
+        drop(smoked_secret);
+
+        unsafe {
+            std::env::set_var(&environment.0, "rotated-destination-secret");
+        }
+        let candidate_prepared = provider_secret_after_live_smoke(
+            &binding,
+            &preflight_fingerprint,
+            &fingerprinter,
+            true,
+        )
+        .expect("a consumed candidate must not consult the rotated destination");
+        assert!(candidate_prepared.is_none());
+
+        let normal_error = provider_secret_after_live_smoke(
+            &binding,
+            &preflight_fingerprint,
+            &fingerprinter,
+            false,
+        )
+        .expect_err("normal admission must re-resolve and detect rotation");
+        assert_eq!(
+            normal_error.details["reason"],
+            "provider_auth_changed_during_preflight"
         );
     }
 
