@@ -898,7 +898,7 @@ fn router(state: Arc<DaemonState>) -> Router {
         )
         .route_layer(middleware::from_fn_with_state(
             Arc::clone(&state),
-            auth::require_bootstrap_admin_mutation,
+            auth::require_admin_mutation,
         ));
     let provider_descriptor_validation_route = Router::new()
         .route(

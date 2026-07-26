@@ -778,7 +778,7 @@ pub(super) async fn require_setup_mutation(
     require_mutation(&state, request, next, authorized).await
 }
 
-pub(super) async fn require_bootstrap_admin_mutation(
+pub(super) async fn require_admin_mutation(
     State(state): State<Arc<DaemonState>>,
     request: Request,
     next: Next,
@@ -787,8 +787,8 @@ pub(super) async fn require_bootstrap_admin_mutation(
         return missing_authorization_context();
     };
     let principal = authorized.principal();
-    if !principal.is_ssh_bootstrap() || !principal.scopes().allows(ApiScopes::ADMIN) {
-        return insufficient_scope(&state, &authorized, "bootstrap admin");
+    if !principal.scopes().allows(ApiScopes::ADMIN) {
+        return insufficient_scope(&state, &authorized, "admin");
     }
     require_mutation(&state, request, next, authorized).await
 }

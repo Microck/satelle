@@ -200,7 +200,7 @@ fn bootstrap_service(state: &TestStateDir, token: &ApiBearerToken) -> HostServic
 }
 
 #[tokio::test]
-async fn provider_binding_mutations_require_bootstrap_admin() {
+async fn provider_binding_mutations_require_admin() {
     let authorization = ProviderBindingAuthorizationRequest::new(
         ProviderBindingAuthorization::new("vision", "open_ai", "gpt-5.6", "openai"),
     );
@@ -216,7 +216,7 @@ async fn provider_binding_mutations_require_bootstrap_admin() {
     assert_eq!(forbidden_delete.status(), StatusCode::FORBIDDEN);
 
     let ordinary_admin = RunningServer::start(ApiScopes::ADMIN).await;
-    let forbidden_authorization = ordinary_admin
+    let authorized = ordinary_admin
         .protected_request(reqwest::Method::PUT, AUTHORIZATION_PATH)
         .header("Idempotency-Key", "provider-authorization-ordinary-admin")
         .header("Satelle-Protocol-Version", "9")
@@ -224,7 +224,7 @@ async fn provider_binding_mutations_require_bootstrap_admin() {
         .send()
         .await
         .expect("send authorization as ordinary admin principal");
-    assert_eq!(forbidden_authorization.status(), StatusCode::FORBIDDEN);
+    assert_eq!(authorized.status(), StatusCode::OK);
 }
 
 #[tokio::test]
@@ -387,8 +387,13 @@ async fn authorization_is_checked_before_the_durable_mutation_claim() {
         .initialize_daemon()
         .expect("initialize provider authority service");
     service
-        .register_api_token(&token, "shared-provider-principal", ApiScopes::ADMIN, None)
-        .expect("register ordinary admin token");
+        .register_api_token(
+            &token,
+            "shared-provider-principal",
+            ApiScopes::CONTROL,
+            None,
+        )
+        .expect("register ordinary control token");
     let running = RunningServer::start_with_service(
         ApiScopes::CONTROL,
         DaemonServerConfig::loopback(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))),
@@ -407,7 +412,7 @@ async fn authorization_is_checked_before_the_durable_mutation_claim() {
         .body("{")
         .send()
         .await
-        .expect("reject ordinary admin before protocol and body processing");
+        .expect("reject control authority before protocol and body processing");
     assert_eq!(rejected_before_protocol.status(), StatusCode::FORBIDDEN);
     let rejected_before_body = running
         .protected_request(reqwest::Method::PUT, AUTHORIZATION_PATH)
@@ -416,7 +421,7 @@ async fn authorization_is_checked_before_the_durable_mutation_claim() {
         .body("{")
         .send()
         .await
-        .expect("reject ordinary admin before body processing");
+        .expect("reject control authority before body processing");
     assert_eq!(rejected_before_body.status(), StatusCode::FORBIDDEN);
     let forbidden = bootstrap_mutation(
         &running,
@@ -428,7 +433,7 @@ async fn authorization_is_checked_before_the_durable_mutation_claim() {
     .json(&initial)
     .send()
     .await
-    .expect("send forbidden ordinary admin authorization");
+    .expect("send forbidden control authorization");
     assert_eq!(forbidden.status(), StatusCode::FORBIDDEN);
 
     let state = stop_provider_auth_server(running).await;

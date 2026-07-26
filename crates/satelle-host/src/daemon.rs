@@ -900,19 +900,22 @@ impl HostService {
             canonical_payload.as_slice(),
             canonical_payload.digest_schema_version,
         )?;
-        self.runtime.delete_provider_binding_idempotent(
-            &identity,
-            model_alias,
-            provider_alias,
-            || {
-                satelle_core::session::EffectiveModelRef::new(model_alias)
-                    .map_err(|_| SatelleError::config_error("the model alias is invalid", None))?;
-                satelle_core::session::ProviderBindingRef::new(provider_alias).map_err(|_| {
-                    SatelleError::config_error("the provider alias is invalid", None)
-                })?;
-                Ok(())
-            },
-        )
+        self.operation_capacity.execute_exclusive(|| {
+            self.runtime.delete_provider_binding_idempotent(
+                &identity,
+                model_alias,
+                provider_alias,
+                || {
+                    satelle_core::session::EffectiveModelRef::new(model_alias).map_err(|_| {
+                        SatelleError::config_error("the model alias is invalid", None)
+                    })?;
+                    satelle_core::session::ProviderBindingRef::new(provider_alias).map_err(
+                        |_| SatelleError::config_error("the provider alias is invalid", None),
+                    )?;
+                    Ok(())
+                },
+            )
+        })
     }
 
     pub fn admit_run(

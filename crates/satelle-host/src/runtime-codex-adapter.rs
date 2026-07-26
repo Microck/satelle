@@ -931,20 +931,20 @@ fn resolve_execution_provider_secret(
 }
 
 pub(crate) fn validate_provider_endpoint(endpoint: &str) -> Result<(), SatelleError> {
-    if endpoint.contains('?')
-        || endpoint.contains('#')
-        || endpoint.contains('\\')
+    if endpoint.contains('\\')
         || endpoint.chars().any(char::is_whitespace)
         || endpoint.chars().any(char::is_control)
     {
         return Err(invalid_provider_endpoint());
     }
-    let authority_and_path = endpoint
-        .strip_prefix("https://")
-        .or_else(|| endpoint.strip_prefix("http://"))
-        .ok_or_else(invalid_provider_endpoint)?;
-    let authority = authority_and_path.split('/').next().unwrap_or_default();
-    if authority.is_empty() || authority.contains('@') {
+    let endpoint = url::Url::parse(endpoint).map_err(|_| invalid_provider_endpoint())?;
+    if !matches!(endpoint.scheme(), "http" | "https")
+        || endpoint.host().is_none()
+        || !endpoint.username().is_empty()
+        || endpoint.password().is_some()
+        || endpoint.query().is_some()
+        || endpoint.fragment().is_some()
+    {
         return Err(invalid_provider_endpoint());
     }
     Ok(())
@@ -2658,6 +2658,9 @@ mod tests {
             "https://user:password@provider.invalid/v1",
             "https://provider.invalid/v1?token=PRIVATE_QUERY_CANARY",
             "https://provider.invalid/v1#PRIVATE_FRAGMENT_CANARY",
+            "https://:443/v1",
+            "https://provider.invalid:not-a-port/v1",
+            "https://provider.invalid:65536/v1",
         ] {
             let error = validate_provider_endpoint(endpoint).expect_err("unsafe provider endpoint");
             assert_eq!(error.code, ErrorCode::ModelProviderBindingMissing);
