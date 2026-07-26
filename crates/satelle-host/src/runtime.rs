@@ -2534,7 +2534,9 @@ impl RuntimeHandle {
                 operator_log_root,
                 engine: None,
                 provider_policy,
-                provider_smoke_fingerprinter: None,
+                provider_smoke_fingerprinter: Some(
+                    crate::provider_auth::ProviderSmokeCredentialFingerprinter::default(),
+                ),
             })),
         }
     }
@@ -2586,7 +2588,9 @@ impl RuntimeHandle {
                 operator_log_root,
                 engine: None,
                 provider_policy: RuntimeProviderPolicy::default(),
-                provider_smoke_fingerprinter: None,
+                provider_smoke_fingerprinter: Some(
+                    crate::provider_auth::ProviderSmokeCredentialFingerprinter::default(),
+                ),
             })),
         }
     }
