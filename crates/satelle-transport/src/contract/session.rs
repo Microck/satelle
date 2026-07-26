@@ -7,7 +7,7 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::Value;
 use std::fmt;
 
-define_schema_token!(TurnRequestSchema, "satelle.api.v6");
+define_schema_token!(TurnRequestSchema, "satelle.api.v7");
 define_schema_token!(StopRequestSchema, "satelle.api.v1");
 define_schema_token!(SessionSchema, "satelle.session.v1");
 define_schema_token!(SessionStopSchema, "satelle.session.stop.v1");
@@ -45,6 +45,8 @@ pub struct TurnRequest {
     model: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     provider: Option<String>,
+    model_from_project: bool,
+    provider_from_project: bool,
     #[serde(default, skip_serializing_if = "is_false")]
     refresh_provider_smoke_test: bool,
     #[serde(default, skip_serializing_if = "is_false")]
@@ -60,6 +62,8 @@ pub(crate) struct TurnRequestParts {
     pub(crate) execution_mode: TurnExecutionMode,
     pub(crate) model: Option<String>,
     pub(crate) provider: Option<String>,
+    pub(crate) model_from_project: bool,
+    pub(crate) provider_from_project: bool,
     pub(crate) refresh_provider_smoke_test: bool,
     pub(crate) experimental_provider_computer_use: bool,
     pub(crate) attachments: Vec<ImageAttachment>,
@@ -130,6 +134,8 @@ impl TurnRequest {
             execution_mode: TurnExecutionMode::Standard,
             model: None,
             provider: None,
+            model_from_project: false,
+            provider_from_project: false,
             refresh_provider_smoke_test: false,
             experimental_provider_computer_use: false,
             attachments: Vec::new(),
@@ -146,10 +152,14 @@ impl TurnRequest {
         mut self,
         model: Option<String>,
         provider: Option<String>,
+        model_from_project: bool,
+        provider_from_project: bool,
         refresh_provider_smoke_test: bool,
     ) -> Self {
         self.model = model;
         self.provider = provider;
+        self.model_from_project = model_from_project;
+        self.provider_from_project = provider_from_project;
         self.refresh_provider_smoke_test = refresh_provider_smoke_test;
         self
     }
@@ -185,6 +195,14 @@ impl TurnRequest {
         self.provider.as_deref()
     }
 
+    pub const fn model_from_project(&self) -> bool {
+        self.model_from_project
+    }
+
+    pub const fn provider_from_project(&self) -> bool {
+        self.provider_from_project
+    }
+
     pub const fn refresh_provider_smoke_test(&self) -> bool {
         self.refresh_provider_smoke_test
     }
@@ -207,6 +225,8 @@ impl TurnRequest {
             execution_mode: self.execution_mode,
             model: self.model,
             provider: self.provider,
+            model_from_project: self.model_from_project,
+            provider_from_project: self.provider_from_project,
             refresh_provider_smoke_test: self.refresh_provider_smoke_test,
             experimental_provider_computer_use: self.experimental_provider_computer_use,
             attachments: self.attachments,
@@ -297,18 +317,22 @@ mod provider_binding_boundary_tests {
     use serde_json::json;
 
     #[test]
-    fn turn_request_v6_carries_aliases_refresh_and_one_shot_opt_in_only() {
+    fn turn_request_v7_carries_independent_project_provenance_and_opt_ins() {
         let request = TurnRequest::new("inspect the repository")
             .with_provider_intent(
                 Some("vision".to_string()),
                 Some("open_ai".to_string()),
+                true,
+                false,
                 true,
             )
             .with_experimental_provider_computer_use(true);
         assert_eq!(
             serde_json::to_value(request).unwrap(),
             json!({
-                "schema_version": "satelle.api.v6",
+                "schema_version": "satelle.api.v7",
+                "model_from_project": true,
+                "provider_from_project": false,
                 "prompt": "inspect the repository",
                 "execution_mode": "standard",
                 "model": "vision",
@@ -317,6 +341,26 @@ mod provider_binding_boundary_tests {
                 "experimental_provider_computer_use": true
             })
         );
+    }
+
+    #[test]
+    fn turn_request_rejects_missing_provenance_and_the_v6_shape() {
+        for request in [
+            serde_json::json!({
+                "schema_version": "satelle.api.v7",
+                "prompt": "private",
+                "execution_mode": "standard"
+            }),
+            serde_json::json!({
+                "schema_version": "satelle.api.v6",
+                "model_from_project": false,
+                "provider_from_project": false,
+                "prompt": "private",
+                "execution_mode": "standard"
+            }),
+        ] {
+            assert!(serde_json::from_value::<TurnRequest>(request).is_err());
+        }
     }
 
     #[test]
@@ -734,7 +778,9 @@ mod tests {
         assert_eq!(
             serde_json::to_value(request).expect("serialize request"),
             serde_json::json!({
-                "schema_version": "satelle.api.v6",
+                "schema_version": "satelle.api.v7",
+                "model_from_project": false,
+                "provider_from_project": false,
                 "prompt": "private prompt",
                 "execution_mode": "standard"
             })
@@ -745,7 +791,9 @@ mod tests {
             )
             .expect("serialize YOLO request"),
             serde_json::json!({
-                "schema_version": "satelle.api.v6",
+                "schema_version": "satelle.api.v7",
+                "model_from_project": false,
+                "provider_from_project": false,
                 "prompt": "private prompt",
                 "execution_mode": "yolo"
             })
@@ -754,11 +802,15 @@ mod tests {
             serde_json::to_value(TurnRequest::new("private prompt").with_provider_intent(
                 Some("model-explicit".to_string()),
                 Some("provider-explicit".to_string()),
+                false,
+                false,
                 true,
             ))
             .expect("serialize provider intent"),
             serde_json::json!({
-                "schema_version": "satelle.api.v6",
+                "schema_version": "satelle.api.v7",
+                "model_from_project": false,
+                "provider_from_project": false,
                 "prompt": "private prompt",
                 "execution_mode": "standard",
                 "model": "model-explicit",
@@ -768,14 +820,18 @@ mod tests {
         );
         assert!(
             serde_json::from_value::<TurnRequest>(serde_json::json!({
-                "schema_version": "satelle.api.v6",
+                "schema_version": "satelle.api.v7",
+                "model_from_project": false,
+                "provider_from_project": false,
                 "prompt": "private prompt"
             }))
             .is_err()
         );
         assert!(
             serde_json::from_value::<TurnRequest>(serde_json::json!({
-                "schema_version": "satelle.api.v6",
+                "schema_version": "satelle.api.v7",
+                "model_from_project": false,
+                "provider_from_project": false,
                 "prompt": "private prompt",
                 "execution_mode": "standard",
                 "controller_only": true
@@ -792,7 +848,9 @@ mod tests {
     fn controller_presentation_fields_are_absent_from_the_turn_request_contract() {
         for field in ["attach", "detach"] {
             let mut request = serde_json::json!({
-                "schema_version": "satelle.api.v6",
+                "schema_version": "satelle.api.v7",
+                "model_from_project": false,
+                "provider_from_project": false,
                 "prompt": "private prompt",
                 "execution_mode": "standard"
             });
@@ -812,7 +870,9 @@ mod tests {
     fn mvp_turn_requests_cannot_route_across_desktop_bindings() {
         for field in ["desktop_user", "desktop_binding", "desktop_session"] {
             let mut request = serde_json::json!({
-                "schema_version": "satelle.api.v6",
+                "schema_version": "satelle.api.v7",
+                "model_from_project": false,
+                "provider_from_project": false,
                 "prompt": "private prompt",
                 "execution_mode": "standard"
             });

@@ -1243,6 +1243,8 @@ mod tests {
 
         let cached_validation = ProviderDescriptorValidationRequest::new(
             satelle_core::ProviderAuthValidationMode::Cached,
+            false,
+            false,
         );
         let (cached_request, _) = client
             .mutation_request(
@@ -1258,6 +1260,8 @@ mod tests {
 
         let refresh_validation = ProviderDescriptorValidationRequest::new(
             satelle_core::ProviderAuthValidationMode::RefreshProviderSmoke,
+            false,
+            false,
         );
         let (refresh_request, _) = client
             .mutation_request(

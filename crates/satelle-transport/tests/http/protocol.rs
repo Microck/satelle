@@ -148,7 +148,7 @@ async fn capabilities_handshake_rejects_old_and_missing_clients() {
 
     let current = running
         .protected_request(Method::GET, "/v1/capabilities")
-        .header("Satelle-Protocol-Version", "8")
+        .header("Satelle-Protocol-Version", "9")
         .send()
         .await
         .expect("send capabilities request with current protocol version");

@@ -1139,7 +1139,7 @@ async fn mutation_validation_fails_before_execution_with_typed_errors() {
 
     let missing_key = running
         .protected_request(Method::POST, "/v1/sessions")
-        .header("Satelle-Protocol-Version", "8")
+        .header("Satelle-Protocol-Version", "9")
         .json(&TurnRequest::new("PRIVATE_MISSING_KEY_CANARY"))
         .send()
         .await
@@ -1162,7 +1162,7 @@ async fn mutation_validation_fails_before_execution_with_typed_errors() {
         .mutation("/v1/sessions", CREATE_KEY)
         .header("Content-Type", "text/plain")
         .body(
-            r#"{"schema_version":"satelle.api.v6","prompt":"private","execution_mode":"standard"}"#,
+            r#"{"schema_version":"satelle.api.v7","model_from_project":false,"provider_from_project":false,"prompt":"private","execution_mode":"standard"}"#,
         )
         .send()
         .await
@@ -1177,7 +1177,7 @@ async fn mutation_validation_fails_before_execution_with_typed_errors() {
     let duplicate_prompt = running
         .mutation("/v1/sessions", "duplicate-json-field-key")
         .header("Content-Type", "application/json")
-        .body(r#"{"schema_version":"satelle.api.v6","prompt":"first","prompt":"second","execution_mode":"standard"}"#)
+        .body(r#"{"schema_version":"satelle.api.v7","model_from_project":false,"provider_from_project":false,"prompt":"first","prompt":"second","execution_mode":"standard"}"#)
         .send()
         .await
         .expect("send duplicate JSON field");
@@ -1193,7 +1193,13 @@ async fn mutation_validation_fails_before_execution_with_typed_errors() {
 
     let invalid_model = running
         .mutation("/v1/sessions", "invalid-model-key")
-        .json(&TurnRequest::new("private").with_provider_intent(Some(" ".to_owned()), None, false))
+        .json(&TurnRequest::new("private").with_provider_intent(
+            Some(" ".to_owned()),
+            None,
+            false,
+            false,
+            false,
+        ))
         .send()
         .await
         .expect("send invalid model override");
@@ -1207,7 +1213,13 @@ async fn mutation_validation_fails_before_execution_with_typed_errors() {
 
     let invalid_provider = running
         .mutation("/v1/sessions", "invalid-provider-key")
-        .json(&TurnRequest::new("private").with_provider_intent(None, Some(" ".to_owned()), false))
+        .json(&TurnRequest::new("private").with_provider_intent(
+            None,
+            Some(" ".to_owned()),
+            false,
+            false,
+            false,
+        ))
         .send()
         .await
         .expect("send invalid provider override");
@@ -1263,7 +1275,9 @@ async fn fixed_size_attachments_precede_turn_request_deserialization() {
     let response = running
         .mutation("/v1/sessions", "attachment-limit-fixed-size")
         .json(&serde_json::json!({
-            "schema_version": "satelle.api.v6",
+            "schema_version": "satelle.api.v7",
+            "model_from_project": false,
+            "provider_from_project": false,
             "prompt": "PRIVATE_ATTACHMENT_LIMIT_CANARY",
             "attachments": [{"name": "private.txt", "content": "private"}]
         }))
@@ -1286,7 +1300,7 @@ async fn fixed_size_attachments_precede_turn_request_deserialization() {
 async fn attachment_limit_preserves_decoder_error_precedence() {
     let running = RunningServer::start(ApiScopes::CONTROL).await;
     let oversized = format!(
-        r#"{{"schema_version":"satelle.api.v6","prompt":"PRIVATE_OVERSIZED_ATTACHMENT_CANARY","execution_mode":"standard","attachments":[{{"name":"private.txt"}}],"padding":"{}"}}"#,
+        r#"{{"schema_version":"satelle.api.v7","model_from_project":false,"provider_from_project":false,"prompt":"PRIVATE_OVERSIZED_ATTACHMENT_CANARY","execution_mode":"standard","attachments":[{{"name":"private.txt"}}],"padding":"{}"}}"#,
         "x".repeat(1_048_576)
     );
     let cases = [
@@ -1297,7 +1311,7 @@ async fn attachment_limit_preserves_decoder_error_precedence() {
         ),
         (
             "duplicate-json-key",
-            r#"{"schema_version":"satelle.api.v6","prompt":"PRIVATE_DUPLICATE_ATTACHMENT_CANARY","prompt":"duplicate","execution_mode":"standard","attachments":[{"name":"private.txt"}]}"#.to_string(),
+            r#"{"schema_version":"satelle.api.v7","model_from_project":false,"provider_from_project":false,"prompt":"PRIVATE_DUPLICATE_ATTACHMENT_CANARY","prompt":"duplicate","execution_mode":"standard","attachments":[{"name":"private.txt"}]}"#.to_string(),
             INVALID_JSON_ERROR,
         ),
         ("oversized-body", oversized, ATTACHMENT_LIMIT_ERROR),
@@ -1383,7 +1397,9 @@ async fn empty_attachments_are_allowed_but_other_shapes_remain_contract_errors()
     let empty_response = running
         .mutation("/v1/sessions", "attachment-operation-contract-empty-array")
         .json(&serde_json::json!({
-            "schema_version": "satelle.api.v6",
+            "schema_version": "satelle.api.v7",
+            "model_from_project": false,
+            "provider_from_project": false,
             "prompt": "PRIVATE_ATTACHMENT_SHAPE_CANARY",
             "execution_mode": "standard",
             "attachments": []
@@ -1404,7 +1420,9 @@ async fn empty_attachments_are_allowed_but_other_shapes_remain_contract_errors()
                 &format!("attachment-operation-contract-{name}"),
             )
             .json(&serde_json::json!({
-                "schema_version": "satelle.api.v6",
+                "schema_version": "satelle.api.v7",
+                "model_from_project": false,
+                "provider_from_project": false,
                 "prompt": "PRIVATE_ATTACHMENT_SHAPE_CANARY",
                 "execution_mode": "standard",
                 "attachments": attachments
@@ -1447,7 +1465,9 @@ async fn create_turn_attachments_precede_deserialization_without_admission() {
             "attachment-limit-create-turn",
         )
         .json(&serde_json::json!({
-            "schema_version": "satelle.api.v6",
+            "schema_version": "satelle.api.v7",
+            "model_from_project": false,
+            "provider_from_project": false,
             "prompt": "PRIVATE_REJECTED_ATTACHMENT_TURN_CANARY",
             "attachments": [{"name": "private.txt", "content": "private"}]
         }))
@@ -1625,7 +1645,9 @@ async fn request_material_log_privacy(trace_capture: TraceCapture) {
             &rejected_request_id,
         )
         .json(&serde_json::json!({
-            "schema_version": "satelle.api.v6",
+            "schema_version": "satelle.api.v7",
+            "model_from_project": false,
+            "provider_from_project": false,
             "prompt": rejected_prompt,
             "execution_mode": "standard",
             "body_canary": rejected_body,
@@ -1776,7 +1798,7 @@ fn protected_at(
         .header("Satelle-Expected-Host-Identity", host_identity)
         .header("Satelle-Request-Id", RequestId::new().to_string());
     if is_mutation {
-        request.header("Satelle-Protocol-Version", "8")
+        request.header("Satelle-Protocol-Version", "9")
     } else {
         request
     }
@@ -1811,7 +1833,9 @@ async fn assert_attachment_limit_error(response: reqwest::Response, host_identit
 
 fn turn_request_with_controller_field(field: &str, prompt: &str) -> Value {
     let mut request = serde_json::json!({
-        "schema_version": "satelle.api.v6",
+        "schema_version": "satelle.api.v7",
+        "model_from_project": false,
+        "provider_from_project": false,
         "prompt": prompt,
         "execution_mode": "standard"
     });

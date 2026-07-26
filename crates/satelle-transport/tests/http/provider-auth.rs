@@ -14,13 +14,14 @@ const AUTHORIZATION_PATH: &str = "/v1/setup/provider-bindings/open_ai/vision";
 
 #[tokio::test]
 async fn provider_binding_validation_requires_setup_or_control_authority() {
-    let request = ProviderDescriptorValidationRequest::new(ProviderAuthValidationMode::Cached);
+    let request =
+        ProviderDescriptorValidationRequest::new(ProviderAuthValidationMode::Cached, false, false);
 
     let control = RunningServer::start(ApiScopes::CONTROL).await;
     let unauthenticated = reqwest::Client::new()
         .post(control.url(VALIDATION_PATH))
         .header("Content-Type", "application/json")
-        .header("Satelle-Protocol-Version", "8")
+        .header("Satelle-Protocol-Version", "9")
         .header("Satelle-Expected-Host-Identity", &control.host_identity)
         .header("Satelle-Request-Id", RequestId::new().as_str())
         .header("Idempotency-Key", "provider-auth-unauthenticated")
@@ -67,7 +68,7 @@ async fn bootstrap_admin_authorizes_and_control_validates_the_exact_path_aliases
         .header("Authorization", bearer(&bootstrap_token))
         .header("Satelle-Expected-Host-Identity", &running.host_identity)
         .header("Satelle-Request-Id", RequestId::new().as_str())
-        .header("Satelle-Protocol-Version", "8")
+        .header("Satelle-Protocol-Version", "9")
         .header("Idempotency-Key", "provider-authorization-admin")
         .json(&authorization)
         .send()
@@ -87,7 +88,8 @@ async fn bootstrap_admin_authorizes_and_control_validates_the_exact_path_aliases
         ProviderBindingSource::UserConfig
     );
 
-    let validation = ProviderDescriptorValidationRequest::new(ProviderAuthValidationMode::Cached);
+    let validation =
+        ProviderDescriptorValidationRequest::new(ProviderAuthValidationMode::Cached, false, false);
     let validated = running
         .mutation(VALIDATION_PATH, "provider-validation-control")
         .json(&validation)
@@ -122,7 +124,9 @@ async fn validation_rejects_descriptor_material_and_control_cannot_authorize() {
     let descriptor = control
         .mutation(VALIDATION_PATH, "provider-validation-descriptor")
         .json(&serde_json::json!({
-            "schema_version": "satelle.provider-binding-validation.v4",
+            "schema_version": "satelle.provider-binding-validation.v5",
+            "model_from_project": false,
+            "provider_from_project": false,
             "mode": "cached",
             "endpoint": "https://attacker.example",
             "raw_secret": raw_secret
@@ -146,7 +150,7 @@ async fn validation_rejects_descriptor_material_and_control_cannot_authorize() {
     let forbidden = control
         .protected_request(reqwest::Method::PUT, AUTHORIZATION_PATH)
         .header("Idempotency-Key", "provider-authorization-control")
-        .header("Satelle-Protocol-Version", "8")
+        .header("Satelle-Protocol-Version", "9")
         .json(&authorization)
         .send()
         .await
@@ -166,7 +170,7 @@ fn bootstrap_mutation(
         .header("Authorization", bearer(token))
         .header("Satelle-Expected-Host-Identity", &running.host_identity)
         .header("Satelle-Request-Id", RequestId::new().as_str())
-        .header("Satelle-Protocol-Version", "8")
+        .header("Satelle-Protocol-Version", "9")
         .header("Idempotency-Key", idempotency_key)
 }
 
@@ -205,7 +209,7 @@ async fn provider_binding_mutations_require_bootstrap_admin() {
     let forbidden_delete = control
         .protected_request(reqwest::Method::DELETE, AUTHORIZATION_PATH)
         .header("Idempotency-Key", "provider-delete-control")
-        .header("Satelle-Protocol-Version", "8")
+        .header("Satelle-Protocol-Version", "9")
         .send()
         .await
         .expect("send deletion as control principal");
@@ -215,7 +219,7 @@ async fn provider_binding_mutations_require_bootstrap_admin() {
     let forbidden_authorization = ordinary_admin
         .protected_request(reqwest::Method::PUT, AUTHORIZATION_PATH)
         .header("Idempotency-Key", "provider-authorization-ordinary-admin")
-        .header("Satelle-Protocol-Version", "8")
+        .header("Satelle-Protocol-Version", "9")
         .json(&authorization)
         .send()
         .await
@@ -408,7 +412,7 @@ async fn authorization_is_checked_before_the_durable_mutation_claim() {
     let rejected_before_body = running
         .protected_request(reqwest::Method::PUT, AUTHORIZATION_PATH)
         .header("Idempotency-Key", "provider-authority-before-body")
-        .header("Satelle-Protocol-Version", "8")
+        .header("Satelle-Protocol-Version", "9")
         .body("{")
         .send()
         .await

@@ -39,10 +39,10 @@ pub use setup::{
 };
 
 pub(crate) const PROTOCOL_VERSION_HEADER: &str = "satelle-protocol-version";
-// Host-authorized Provider Bindings remove caller-supplied descriptors and
-// opt-in from run, steer, and validation. Exact-match negotiation rejects all
-// peers that still implement the unsafe v7 request surface.
-pub(crate) const PROTOCOL_VERSION: &str = "8";
+// Project-origin provenance and exact-binding consent close the remaining
+// Provider Binding selection boundary. Exact-match negotiation rejects every
+// peer that still implements the protocol v8 request surface.
+pub(crate) const PROTOCOL_VERSION: &str = "9";
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::fmt;

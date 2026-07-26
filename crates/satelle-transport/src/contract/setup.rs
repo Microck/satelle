@@ -27,11 +27,11 @@ define_schema_token!(
 );
 define_schema_token!(
     ProviderBindingAuthorizationSchema,
-    "satelle.provider-binding-authorization.v1"
+    "satelle.provider-binding-authorization.v2"
 );
 define_schema_token!(
     ProviderBindingAuthorizationResponseSchema,
-    "satelle.provider-binding-authorization-response.v1"
+    "satelle.provider-binding-authorization-response.v2"
 );
 define_schema_token!(
     ProviderBindingDeletionResponseSchema,
@@ -39,11 +39,11 @@ define_schema_token!(
 );
 define_schema_token!(
     ProviderDescriptorValidationSchema,
-    "satelle.provider-binding-validation.v4"
+    "satelle.provider-binding-validation.v5"
 );
 define_schema_token!(
     ProviderDescriptorValidationResponseSchema,
-    "satelle.provider-binding-validation-response.v3"
+    "satelle.provider-binding-validation-response.v4"
 );
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -61,6 +61,7 @@ const PROVIDER_BINDING_AUTHORIZATION_REQUEST_FIELDS: &[&str] = &[
     "model_provider",
     "endpoint",
     "auth_source",
+    "allow_project_selection",
     "experimental_provider_computer_use",
 ];
 
@@ -78,6 +79,9 @@ impl<'de> Deserialize<'de> for ProviderBindingAuthorizationRequest {
                 unknown,
                 PROVIDER_BINDING_AUTHORIZATION_REQUEST_FIELDS,
             ));
+        }
+        if !fields.contains_key("allow_project_selection") {
+            return Err(serde::de::Error::missing_field("allow_project_selection"));
         }
 
         #[derive(Deserialize)]
@@ -122,21 +126,37 @@ impl ApiRequestContract for ProviderBindingAuthorizationRequest {
 pub struct ProviderDescriptorValidationRequest {
     schema_version: ProviderDescriptorValidationSchema,
     mode: ProviderAuthValidationMode,
+    model_from_project: bool,
+    provider_from_project: bool,
     #[serde(default, skip_serializing_if = "is_false")]
     experimental_provider_computer_use: bool,
 }
 
 impl ProviderDescriptorValidationRequest {
-    pub fn new(mode: ProviderAuthValidationMode) -> Self {
+    pub fn new(
+        mode: ProviderAuthValidationMode,
+        model_from_project: bool,
+        provider_from_project: bool,
+    ) -> Self {
         Self {
             schema_version: ProviderDescriptorValidationSchema,
             mode,
+            model_from_project,
+            provider_from_project,
             experimental_provider_computer_use: false,
         }
     }
 
     pub const fn mode(&self) -> ProviderAuthValidationMode {
         self.mode
+    }
+
+    pub const fn model_from_project(&self) -> bool {
+        self.model_from_project
+    }
+
+    pub const fn provider_from_project(&self) -> bool {
+        self.provider_from_project
     }
 
     pub fn with_experimental_provider_computer_use(mut self, enabled: bool) -> Self {
@@ -496,16 +516,18 @@ mod provider_binding_contract_tests {
     fn authorization_is_explicit_and_validation_is_alias_scoped() {
         let authorization = ProviderBindingAuthorizationRequest::new(
             ProviderBindingAuthorization::new("vision", "open_ai", "gpt-5.6", "openai")
+                .with_allow_project_selection(true)
                 .with_experimental_provider_computer_use(true),
         );
         assert_eq!(
             serde_json::to_value(authorization).unwrap(),
             json!({
-                "schema_version": "satelle.provider-binding-authorization.v1",
+                "schema_version": "satelle.provider-binding-authorization.v2",
                 "requested_model_alias": "vision",
                 "requested_provider_alias": "open_ai",
                 "model": "gpt-5.6",
                 "model_provider": "openai",
+                "allow_project_selection": true,
                 "experimental_provider_computer_use": true
             })
         );
@@ -514,12 +536,16 @@ mod provider_binding_contract_tests {
             serde_json::to_value(
                 ProviderDescriptorValidationRequest::new(
                     ProviderAuthValidationMode::RefreshProviderSmoke,
+                    true,
+                    false,
                 )
                 .with_experimental_provider_computer_use(true)
             )
             .unwrap(),
             json!({
-                "schema_version": "satelle.provider-binding-validation.v4",
+                "schema_version": "satelle.provider-binding-validation.v5",
+                "model_from_project": true,
+                "provider_from_project": false,
                 "mode": "refresh_provider_smoke",
                 "experimental_provider_computer_use": true
             })
@@ -527,9 +553,54 @@ mod provider_binding_contract_tests {
     }
 
     #[test]
+    fn provider_requests_reject_missing_provenance_and_old_schemas() {
+        let old_authorization = json!({
+            "schema_version": "satelle.provider-binding-authorization.v1",
+            "requested_model_alias": "vision",
+            "requested_provider_alias": "open_ai",
+            "model": "gpt-5.6",
+            "model_provider": "openai",
+            "allow_project_selection": false
+        });
+        assert!(
+            serde_json::from_value::<ProviderBindingAuthorizationRequest>(old_authorization)
+                .is_err()
+        );
+        assert!(
+            serde_json::from_value::<ProviderBindingAuthorizationRequest>(json!({
+                "schema_version": "satelle.provider-binding-authorization.v2",
+                "requested_model_alias": "vision",
+                "requested_provider_alias": "open_ai",
+                "model": "gpt-5.6",
+                "model_provider": "openai"
+            }))
+            .is_err()
+        );
+
+        for request in [
+            json!({
+                "schema_version": "satelle.provider-binding-validation.v5",
+                "mode": "cached"
+            }),
+            json!({
+                "schema_version": "satelle.provider-binding-validation.v4",
+                "model_from_project": false,
+                "provider_from_project": false,
+                "mode": "cached"
+            }),
+        ] {
+            assert!(
+                serde_json::from_value::<ProviderDescriptorValidationRequest>(request).is_err()
+            );
+        }
+    }
+
+    #[test]
     fn validation_rejects_caller_binding_material() {
         let request = json!({
-            "schema_version": "satelle.provider-binding-validation.v4",
+            "schema_version": "satelle.provider-binding-validation.v5",
+            "model_from_project": false,
+            "provider_from_project": false,
             "mode": "cached",
             "endpoint": "https://attacker.example"
         });
@@ -545,7 +616,7 @@ mod tests {
     fn provider_binding_authorization_rejects_unknown_top_level_fields() {
         let error =
             serde_json::from_value::<ProviderBindingAuthorizationRequest>(serde_json::json!({
-                "schema_version": "satelle.provider-binding-authorization.v1",
+                "schema_version": "satelle.provider-binding-authorization.v2",
                 "requested_model_alias": "default",
                 "requested_provider_alias": "openai",
                 "model": "gpt-5",
