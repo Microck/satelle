@@ -1274,10 +1274,10 @@ fn read_backup_manifest(
         state_directory,
         manifest_file_name,
         LeafOpenMode::ExistingPrivateGuarded,
-        StorageErrorKind::InvalidInput,
+        StorageErrorKind::UnsafeStatePath,
     )?
     .ok_or_else(|| StorageError::new(StorageErrorKind::InvalidInput))?;
-    let identity = leaf_identity(&manifest_file, StorageErrorKind::InvalidInput)?;
+    let identity = leaf_identity(&manifest_file, StorageErrorKind::UnsafeStatePath)?;
     let mut bytes = Vec::new();
     Read::take(&mut manifest_file, MAXIMUM_MANIFEST_BYTES + 1)
         .read_to_end(&mut bytes)
@@ -1383,10 +1383,10 @@ fn validate_migration_backup_at_with_hook(
         state_directory,
         physical_backup_file_name,
         LeafOpenMode::ExistingPrivateGuarded,
-        StorageErrorKind::InvalidInput,
+        StorageErrorKind::UnsafeStatePath,
     )?
     .ok_or_else(|| StorageError::new(StorageErrorKind::InvalidInput))?;
-    let backup_identity = leaf_identity(&backup_file, StorageErrorKind::InvalidInput)?;
+    let backup_identity = leaf_identity(&backup_file, StorageErrorKind::UnsafeStatePath)?;
     let source_database_digest = digest_file(&backup_file, StorageErrorKind::IntegrityCheckFailed)?;
     if source_database_digest != manifest_read.manifest.source_database_digest {
         return Err(StorageError::new(StorageErrorKind::IntegrityCheckFailed));
