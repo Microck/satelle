@@ -711,8 +711,15 @@ fn typed_unknown_provider_outcomes_retain_recovery_ownership() {
 #[cfg(unix)]
 #[test]
 fn failed_staged_rollback_retains_pending_journal_and_active_lease() {
+    use std::os::unix::fs::PermissionsExt;
+
     let state = TestStateDir::new().expect("temporary Host state");
     let secret_directory = tempfile::tempdir().expect("temporary provider secret directory");
+    std::fs::set_permissions(
+        secret_directory.path(),
+        std::fs::Permissions::from_mode(0o700),
+    )
+    .expect("make provider secret directory owner-only");
     let destination = secret_directory.path().join("provider-token");
     let identity = RequestIdentity::new("provider-secret-rollback-pending", "b".repeat(64));
     let paths = satelle_core::OwnerOnlySecretFilePaths::new(&destination, identity.key())
