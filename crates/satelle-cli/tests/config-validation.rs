@@ -63,6 +63,42 @@ model_provider = "custom"
     assert!(invalid_model["message"].as_str().is_some_and(|message| {
         message.contains("hosts.local.provider_bindings.custom.invalid model")
     }));
+
+    for config in [
+        r#"
+default_host = "local"
+
+[hosts.local]
+transport = "local"
+adapter = "fake"
+
+[hosts.local.provider_bindings.".".model]
+model = "provider-model"
+model_provider = "custom"
+"#,
+        r#"
+default_host = "local"
+
+[hosts.local]
+transport = "local"
+adapter = "fake"
+
+[hosts.local.provider_bindings.custom.".."]
+model = "provider-model"
+model_provider = "custom"
+"#,
+    ] {
+        fixture.write_user_config(config);
+        let invalid_dot_segment = fixture
+            .command()
+            .args(["config", "check", "--json"])
+            .assert()
+            .code(66)
+            .get_output()
+            .clone();
+        let invalid_dot_segment = parse_json(&invalid_dot_segment.stderr);
+        assert_eq!(invalid_dot_segment["code"], "configuration-error");
+    }
 }
 
 #[test]
@@ -635,7 +671,7 @@ fn clean_satelle_command() -> Command {
 }
 
 #[test]
-fn project_model_and_provider_intent_requires_one_exact_host_binding() {
+fn project_model_and_provider_intent_defers_missing_host_bindings() {
     let fixture = ConfigFixture::new(
         r#"
 default_host = "local"
@@ -676,19 +712,16 @@ provider_alias = "{provider_alias}"
             .command()
             .args(["config", "check", "--json"])
             .assert()
-            .code(66)
+            .success()
             .get_output()
             .clone();
-        let error = parse_json(&output.stderr);
+        let report = parse_json(&output.stdout);
 
-        assert_eq!(error["code"], "model-provider-binding-missing");
-        assert_eq!(error["details"]["host"], "local");
-        assert_eq!(error["details"]["requested_model_alias"], model_alias);
-        assert_eq!(error["details"]["requested_provider_alias"], provider_alias);
+        assert_eq!(report["status"], "ok");
         assert!(
-            error["suggested_commands"]
+            report["not_checked"]
                 .as_array()
-                .is_some_and(|commands| !commands.is_empty())
+                .is_some_and(|checks| checks.iter().any(|check| check == "provider_auth"))
         );
     }
 }

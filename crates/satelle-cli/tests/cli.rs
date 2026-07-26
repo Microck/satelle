@@ -4094,6 +4094,60 @@ fn config_check_explain_and_paths_use_versioned_read_only_json_contracts() {
 }
 
 #[test]
+fn config_check_defers_provider_bindings_owned_by_the_selected_host() {
+    let state = state_dir();
+    let user_config = state.path().join("host-owned-provider-config.toml");
+    write_user_config(
+        &user_config,
+        r#"
+default_host = "local-demo"
+
+[hosts.local-demo]
+transport = "local"
+adapter = "fake"
+"#,
+    )
+    .expect("user config should be written");
+    let project = state.path().join("host-owned-provider-project");
+    fs::create_dir_all(project.join(".satelle")).expect("project config dir should be created");
+    fs::write(
+        project.join(".satelle").join("config.toml"),
+        r#"
+model_alias = "host-model"
+provider_alias = "host-provider"
+"#,
+    )
+    .expect("project config should be written");
+
+    let output = satelle()
+        .current_dir(&project)
+        .env("SATELLE_CONFIG_FILE", &user_config)
+        .env("SATELLE_STATE_DIR", state.path())
+        .args(["config", "check", "--json"])
+        .assert()
+        .success()
+        .get_output()
+        .clone();
+    let report = parse_json_output(&output.stdout);
+    for field in ["remote_host", "provider_auth"] {
+        assert!(
+            report["not_checked"]
+                .as_array()
+                .expect("top-level not_checked array")
+                .iter()
+                .any(|value| value == field)
+        );
+        assert!(
+            report["checked_contexts"][0]["not_checked"]
+                .as_array()
+                .expect("context not_checked array")
+                .iter()
+                .any(|value| value == field)
+        );
+    }
+}
+
+#[test]
 fn paths_json_uses_satelle_home_and_explicit_overrides() {
     let state = state_dir();
     let satelle_home = state.path().join("portable-home");

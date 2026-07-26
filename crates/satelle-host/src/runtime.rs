@@ -1123,6 +1123,7 @@ impl RuntimeEngine {
         }
     }
 
+    #[cfg(test)]
     fn cached_provider_smoke(
         &self,
         host: &str,
@@ -2435,6 +2436,7 @@ impl RuntimeHandle {
             .delete_provider_binding(model_alias, provider_alias)
     }
 
+    #[cfg(test)]
     pub(crate) fn cached_provider_smoke(
         &self,
         host: &str,

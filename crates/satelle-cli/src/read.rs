@@ -42,7 +42,7 @@ pub(super) fn config_check_report(
                 None,
                 None,
                 false,
-                true,
+                false,
             )?;
             if let Some(auth_source_name) = provider_selection.missing_auth_source_name() {
                 return Err(failure(SatelleError::config_error(

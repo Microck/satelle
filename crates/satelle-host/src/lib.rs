@@ -1622,25 +1622,14 @@ impl HostService {
         }
 
         let validation = match mode {
-            ProviderAuthValidationMode::Cached => {
-                let result = self.runtime.cached_provider_smoke(host, &intent)?;
-                match result {
-                    Some(ProviderSmokeResult::Passed(_)) => ProviderAuthValidationResult::new(
-                        ProviderAuthValidationOutcome::Resolved,
-                        ProviderAuthObservationSource::Cached,
-                    ),
-                    Some(ProviderSmokeResult::Failed(failure)) => {
-                        ProviderAuthValidationResult::new(
-                            provider_validation_outcome_for_error(failure.error_code()),
-                            ProviderAuthObservationSource::Cached,
-                        )
-                    }
-                    None => ProviderAuthValidationResult::new(
-                        ProviderAuthValidationOutcome::ConfiguredDeferred,
-                        ProviderAuthObservationSource::Deferred,
-                    ),
-                }
-            }
+            // A read-only check cannot associate historical provider-smoke
+            // evidence with the current env/file credential without resolving
+            // that secret. Keep the descriptor deferred until a live provider
+            // boundary can compare the keyed credential identity.
+            ProviderAuthValidationMode::Cached => ProviderAuthValidationResult::new(
+                ProviderAuthValidationOutcome::ConfiguredDeferred,
+                ProviderAuthObservationSource::Deferred,
+            ),
             ProviderAuthValidationMode::RefreshProviderSmoke => {
                 let result = self.runtime.refresh_provider_smoke(host, &intent);
                 match result {

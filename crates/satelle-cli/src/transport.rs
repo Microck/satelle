@@ -4030,6 +4030,7 @@ fn direct_transport_error(host: &str, error: DaemonClientError) -> SatelleError 
         }
         DaemonClientError::Transport(_) => SatelleError::host_unreachable(host),
         DaemonClientError::InvalidHostIdentityHeader
+        | DaemonClientError::InvalidProviderBindingAlias
         | DaemonClientError::InvalidCaBundle(_)
         | DaemonClientError::EmptyCaBundle => SatelleError::config_error(error.to_string(), None),
         DaemonClientError::NonLoopbackPlaintextEndpoint

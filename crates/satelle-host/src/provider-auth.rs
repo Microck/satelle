@@ -1,11 +1,17 @@
+use hmac::{Hmac, KeyInit, Mac};
 use satelle_core::{
     ProviderAuthValidationOutcome, ProviderSecretSource, read_owner_only_secret_file,
 };
-use sha2::{Digest, Sha256};
+use sha2::Sha256;
 use std::fmt;
 use std::path::Path;
+use std::sync::OnceLock;
 use thiserror::Error;
 use zeroize::Zeroizing;
+
+type HmacSha256 = Hmac<Sha256>;
+
+static PROVIDER_SMOKE_CREDENTIAL_KEY: OnceLock<[u8; 32]> = OnceLock::new();
 
 /// A provider credential whose allocation is zeroized when dropped.
 ///
@@ -42,10 +48,27 @@ pub(crate) fn provider_smoke_credential_fingerprint(
     binding_digest: &str,
     secret: Option<&ResolvedProviderSecret>,
 ) -> String {
-    let mut digest = Sha256::new();
-    digest.update(b"satelle.provider-smoke-credential.v1\0");
+    let key = PROVIDER_SMOKE_CREDENTIAL_KEY.get_or_init(|| {
+        let mut key = [0_u8; 32];
+        // A missing OS random source cannot safely fall back to a deterministic
+        // credential verifier. Abort the process before provider I/O instead.
+        getrandom::fill(&mut key)
+            .expect("the OS random source must initialize provider credential cache identity");
+        key
+    });
+    provider_smoke_credential_fingerprint_with_key(key, binding_digest, secret)
+}
+
+fn provider_smoke_credential_fingerprint_with_key(
+    key: &[u8],
+    binding_digest: &str,
+    secret: Option<&ResolvedProviderSecret>,
+) -> String {
+    let mut digest =
+        HmacSha256::new_from_slice(key).expect("a 32-byte HMAC-SHA256 key is always valid");
+    digest.update(b"satelle.provider-smoke-credential-hmac.v1\0");
     digest.update(
-        u64::try_from(binding_digest.len())
+        &u64::try_from(binding_digest.len())
             .expect("a provider binding digest length fits in u64")
             .to_be_bytes(),
     );
@@ -54,7 +77,7 @@ pub(crate) fn provider_smoke_credential_fingerprint(
         Some(secret) => {
             digest.update(b"present\0");
             digest.update(
-                u64::try_from(secret.value.len())
+                &u64::try_from(secret.value.len())
                     .expect("a provider secret length fits in u64")
                     .to_be_bytes(),
             );
@@ -64,9 +87,41 @@ pub(crate) fn provider_smoke_credential_fingerprint(
     }
     digest
         .finalize()
+        .into_bytes()
         .iter()
         .map(|byte| format!("{byte:02x}"))
         .collect()
+}
+
+#[cfg(test)]
+mod provider_credential_fingerprint_tests {
+    use super::*;
+
+    #[test]
+    fn provider_smoke_credential_fingerprint_is_scoped_to_a_process_secret() {
+        let secret = ResolvedProviderSecret::for_test("low-entropy-provider-secret");
+        let binding_digest = "a".repeat(64);
+        let first = provider_smoke_credential_fingerprint_with_key(
+            &[0x11; 32],
+            &binding_digest,
+            Some(&secret),
+        );
+        let repeated = provider_smoke_credential_fingerprint_with_key(
+            &[0x11; 32],
+            &binding_digest,
+            Some(&secret),
+        );
+        let other_process = provider_smoke_credential_fingerprint_with_key(
+            &[0x22; 32],
+            &binding_digest,
+            Some(&secret),
+        );
+
+        assert_eq!(first, repeated);
+        assert_ne!(first, other_process);
+        assert_eq!(first.len(), 64);
+        assert!(first.bytes().all(|byte| byte.is_ascii_hexdigit()));
+    }
 }
 
 impl fmt::Debug for ResolvedProviderSecret {

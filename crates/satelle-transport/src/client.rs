@@ -17,6 +17,7 @@ use reqwest::blocking::{Client, RequestBuilder, Response};
 use reqwest::header::{AUTHORIZATION, HeaderValue};
 use reqwest::redirect::Policy;
 use reqwest::{Method, StatusCode};
+use satelle_core::session::{EffectiveModelRef, ProviderBindingRef};
 use satelle_core::{DirectHostBinding, SessionId};
 use satelle_host::{ApiBearerToken, LogPageQuery};
 use serde::de::DeserializeOwned;
@@ -29,12 +30,21 @@ const DIRECT_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const PROVIDER_BINDING_ALIAS_ENCODE_SET: &AsciiSet =
     &CONTROLS.add(b'/').add(b'?').add(b'#').add(b'%').add(b'\\');
 
-fn provider_binding_path(provider_alias: &str, model_alias: &str) -> String {
+fn provider_binding_path(
+    provider_alias: &str,
+    model_alias: &str,
+) -> Result<String, DaemonClientError> {
+    ProviderBindingRef::new(provider_alias)
+        .map_err(|_| DaemonClientError::InvalidProviderBindingAlias)?;
+    EffectiveModelRef::new(model_alias)
+        .map_err(|_| DaemonClientError::InvalidProviderBindingAlias)?;
     // Shared reference validation admits `/` as alias data. Encode it here so
     // each exact alias remains one route segment and Axum decodes it in Path.
     let provider_alias = utf8_percent_encode(provider_alias, PROVIDER_BINDING_ALIAS_ENCODE_SET);
     let model_alias = utf8_percent_encode(model_alias, PROVIDER_BINDING_ALIAS_ENCODE_SET);
-    format!("/v1/setup/provider-bindings/{provider_alias}/{model_alias}")
+    Ok(format!(
+        "/v1/setup/provider-bindings/{provider_alias}/{model_alias}"
+    ))
 }
 
 pub struct DaemonClient {
@@ -265,7 +275,7 @@ impl DaemonClient {
         authorization: &ProviderBindingAuthorizationRequest,
         idempotency_key: &str,
     ) -> Result<ProviderBindingAuthorizationResponse, DaemonClientError> {
-        let path = provider_binding_path(provider_alias, model_alias);
+        let path = provider_binding_path(provider_alias, model_alias)?;
         let (request, request_id) =
             self.mutation_request_with_method(Method::PUT, &path, idempotency_key)?;
         self.send_authenticated(request.json(authorization), request_id, StatusCode::OK)
@@ -277,7 +287,7 @@ impl DaemonClient {
         model_alias: &str,
         idempotency_key: &str,
     ) -> Result<ProviderBindingDeletionResponse, DaemonClientError> {
-        let path = provider_binding_path(provider_alias, model_alias);
+        let path = provider_binding_path(provider_alias, model_alias)?;
         let (request, request_id) =
             self.mutation_request_with_method(Method::DELETE, &path, idempotency_key)?;
         self.send_authenticated(request, request_id, StatusCode::OK)
@@ -292,7 +302,7 @@ impl DaemonClient {
     ) -> Result<ProviderDescriptorValidationResponse, DaemonClientError> {
         let path = format!(
             "{}/validate",
-            provider_binding_path(provider_alias, model_alias)
+            provider_binding_path(provider_alias, model_alias)?
         );
         let (request, request_id) = self.mutation_request(&path, idempotency_key)?;
         let request = self.provider_validation_request(request.json(validation), validation);
@@ -623,6 +633,7 @@ pub enum DaemonClientError {
     InvalidTokenHeader,
     InvalidHostIdentityHeader,
     InvalidIdempotencyKeyHeader,
+    InvalidProviderBindingAlias,
     InvalidCaBundle(reqwest::Error),
     EmptyCaBundle,
     CertificateUntrusted(reqwest::Error),
@@ -657,6 +668,9 @@ impl fmt::Display for DaemonClientError {
                 "the expected Host Identity cannot form a request header"
             }
             Self::InvalidIdempotencyKeyHeader => "the idempotency key cannot form a request header",
+            Self::InvalidProviderBindingAlias => {
+                "the provider or model alias is not a valid reference"
+            }
             Self::InvalidCaBundle(_) => "the configured CA bundle is invalid",
             Self::EmptyCaBundle => "the configured CA bundle contains no certificates",
             Self::CertificateUntrusted(_) => "the Host Daemon certificate is not trusted",
@@ -842,12 +856,25 @@ mod tests {
     #[test]
     fn provider_binding_path_encodes_each_alias_as_one_segment() {
         assert_eq!(
-            provider_binding_path(
-                "open_ai/us:west?query#frag%2F\\raw",
-                "vision/v2.1?mode#frag%2F\\raw"
-            ),
-            "/v1/setup/provider-bindings/open_ai%2Fus:west%3Fquery%23frag%252F%5Craw/vision%2Fv2.1%3Fmode%23frag%252F%5Craw"
+            provider_binding_path("open_ai/us:west", "vision/v2.1")
+                .expect("valid aliases form a provider-binding path"),
+            "/v1/setup/provider-bindings/open_ai%2Fus:west/vision%2Fv2.1"
         );
+    }
+
+    #[test]
+    fn provider_binding_path_rejects_relative_url_segments() {
+        for (provider_alias, model_alias) in [
+            (".", "model"),
+            ("..", "model"),
+            ("provider", "."),
+            ("provider", ".."),
+        ] {
+            assert!(matches!(
+                provider_binding_path(provider_alias, model_alias),
+                Err(DaemonClientError::InvalidProviderBindingAlias)
+            ));
+        }
     }
 
     #[test]

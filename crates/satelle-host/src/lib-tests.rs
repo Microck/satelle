@@ -1285,6 +1285,24 @@ fn provider_descriptor_validation_resolves_only_during_target_host_refresh() {
     assert!(!encoded.contains(secret_canary));
     assert!(!encoded.contains(secret_path.to_string_lossy().as_ref()));
 
+    let cached_after_pass = service
+        .validate_provider_descriptor(
+            LOCAL_DEMO_HOST,
+            "review",
+            "openai",
+            satelle_core::ProviderAuthValidationMode::Cached,
+            false,
+        )
+        .expect("cached validation remains deferred after a live pass");
+    assert_eq!(
+        cached_after_pass.validation().outcome(),
+        satelle_core::ProviderAuthValidationOutcome::ConfiguredDeferred
+    );
+    assert_eq!(
+        cached_after_pass.validation().observation_source(),
+        satelle_core::ProviderAuthObservationSource::Deferred
+    );
+
     std::fs::remove_file(&secret_path).expect("remove provider secret");
     let unresolved = service
         .validate_provider_descriptor(
@@ -1309,6 +1327,24 @@ fn provider_descriptor_validation_resolves_only_during_target_host_refresh() {
     .expect("serialize unresolved public validation");
     assert!(!encoded.contains(secret_canary));
     assert!(!encoded.contains(secret_path.to_string_lossy().as_ref()));
+
+    let cached_after_failure = service
+        .validate_provider_descriptor(
+            LOCAL_DEMO_HOST,
+            "review",
+            "openai",
+            satelle_core::ProviderAuthValidationMode::Cached,
+            false,
+        )
+        .expect("cached validation remains deferred after a live failure");
+    assert_eq!(
+        cached_after_failure.validation().outcome(),
+        satelle_core::ProviderAuthValidationOutcome::ConfiguredDeferred
+    );
+    assert_eq!(
+        cached_after_failure.validation().observation_source(),
+        satelle_core::ProviderAuthObservationSource::Deferred
+    );
 }
 
 #[cfg(unix)]
