@@ -2380,6 +2380,8 @@ fn stored_authorization_is_revalidated_by_alias_before_alias_only_turn_preflight
         .validate_provider_descriptor(
             "review",
             "openai",
+            false,
+            false,
             satelle_core::ProviderAuthValidationMode::Cached,
             false,
         )
@@ -2829,6 +2831,8 @@ fn host_provider_validation_drives_conflicting_controller_projection() {
     let controller_selection = ProviderSelection {
         requested_model_alias: Some("review".to_string()),
         requested_provider_alias: Some("openai".to_string()),
+        model_alias_from_project: false,
+        provider_alias_from_project: false,
         authorization: Some(
             satelle_core::ProviderBindingAuthorization::new(
                 "review",
@@ -2861,6 +2865,8 @@ fn host_provider_validation_drives_conflicting_controller_projection() {
         .validate_provider_descriptor(
             "review",
             "openai",
+            controller_selection.model_alias_from_project,
+            controller_selection.provider_alias_from_project,
             satelle_core::ProviderAuthValidationMode::Cached,
             controller_selection.experimental_provider_computer_use,
         )
