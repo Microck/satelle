@@ -105,6 +105,155 @@ impl ComputerUseAdapter for FailedProviderSmokeAdapter {
     }
 }
 
+#[derive(Clone)]
+#[cfg(unix)]
+struct TamperingProviderProvisioningAdapter {
+    staging_path: PathBuf,
+}
+
+#[cfg(unix)]
+impl ComputerUseAdapter for TamperingProviderProvisioningAdapter {
+    fn preflight(
+        &self,
+        _host: &str,
+        _provider_intent: &ProviderComputerUseIntent,
+    ) -> Result<AdapterReadiness, SatelleError> {
+        // Use real filesystem I/O to make the candidate evidence fail closed.
+        // This represents a concurrent local actor rather than mocking the
+        // secure-file implementation.
+        std::fs::write(&self.staging_path, "tampered-staged-secret")
+            .map_err(|_| SatelleError::state_conflict())?;
+        Err(SatelleError::computer_use_not_ready())
+    }
+
+    fn readiness_cache_key(
+        &self,
+        _host: &str,
+        _provider_intent: &ProviderComputerUseIntent,
+    ) -> Result<Option<ReadinessCacheKey>, SatelleError> {
+        Ok(Some(FakeComputerUseAdapter::readiness_contract()?.2))
+    }
+
+    fn execute(&self, request: ExecuteRequest<'_>) -> Result<ExecuteResult, SatelleError> {
+        FakeComputerUseAdapter.execute(request)
+    }
+
+    fn observe_stop(&self, subject: AdapterSubject<'_>) -> Result<StopObservation, SatelleError> {
+        FakeComputerUseAdapter.observe_stop(subject)
+    }
+
+    fn observe_recovery(
+        &self,
+        subject: AdapterSubject<'_>,
+    ) -> Result<RecoveryObservation, SatelleError> {
+        FakeComputerUseAdapter.observe_recovery(subject)
+    }
+}
+
+#[derive(Clone, Copy)]
+#[cfg(unix)]
+enum ProviderProvisioningProbeOutcome {
+    UpstreamStillActive,
+    OutcomeUnknown,
+    PersistenceFailure,
+}
+
+#[derive(Clone, Copy)]
+#[cfg(unix)]
+struct ClassifiedProviderProvisioningAdapter {
+    outcome: ProviderProvisioningProbeOutcome,
+}
+
+#[cfg(unix)]
+impl ComputerUseAdapter for ClassifiedProviderProvisioningAdapter {
+    fn preflight(
+        &self,
+        host: &str,
+        provider_intent: &ProviderComputerUseIntent,
+    ) -> Result<AdapterReadiness, SatelleError> {
+        FakeComputerUseAdapter.preflight(host, provider_intent)
+    }
+
+    fn readiness_cache_key(
+        &self,
+        _host: &str,
+        _provider_intent: &ProviderComputerUseIntent,
+    ) -> Result<Option<ReadinessCacheKey>, SatelleError> {
+        Ok(Some(FakeComputerUseAdapter::readiness_contract()?.2))
+    }
+
+    fn execute(&self, request: ExecuteRequest<'_>) -> Result<ExecuteResult, SatelleError> {
+        FakeComputerUseAdapter.execute(request)
+    }
+
+    fn observe_stop(&self, subject: AdapterSubject<'_>) -> Result<StopObservation, SatelleError> {
+        FakeComputerUseAdapter.observe_stop(subject)
+    }
+
+    fn observe_recovery(
+        &self,
+        subject: AdapterSubject<'_>,
+    ) -> Result<RecoveryObservation, SatelleError> {
+        FakeComputerUseAdapter.observe_recovery(subject)
+    }
+}
+
+#[cfg(unix)]
+impl crate::runtime::ReadinessProbeDriver for ClassifiedProviderProvisioningAdapter {
+    fn run_native_probe(
+        &self,
+        key: &ReadinessCacheKey,
+        _cancellation: &AdmissionCancellation,
+        _persist_thread_ref: &mut dyn FnMut(&str) -> Result<(), ()>,
+        _persist_turn_ref: &mut dyn FnMut(&str) -> Result<(), ()>,
+    ) -> crate::runtime::NativeProbeResult {
+        let observed_at = time::OffsetDateTime::now_utc();
+        crate::runtime::NativeProbeResult::Passed(
+            key.evidence(
+                format!("native-probe-{}", satelle_core::SessionId::new()),
+                observed_at,
+                observed_at + time::Duration::minutes(5),
+            )
+            .expect("validated readiness key produces native evidence"),
+        )
+    }
+
+    fn preflight_terminal_with_provider_probe(
+        &self,
+        _host: &str,
+        _cached: Option<ReadinessEvidence>,
+        _cached_provider: Option<ProviderSmokeResult>,
+        _provider_intent: &ProviderComputerUseIntent,
+        _provider_secret: Option<crate::provider_auth::ResolvedProviderSecret>,
+        _cancellation: &AdmissionCancellation,
+        persist_thread_ref: &mut dyn FnMut(&str) -> Result<(), ()>,
+        _persist_turn_ref: &mut dyn FnMut(&str) -> Result<(), ()>,
+    ) -> AdapterPreflight {
+        match self.outcome {
+            ProviderProvisioningProbeOutcome::UpstreamStillActive => {
+                AdapterPreflight::Cancelled(StopObservation::UpstreamStillActive)
+            }
+            ProviderProvisioningProbeOutcome::OutcomeUnknown => {
+                AdapterPreflight::Cancelled(StopObservation::OutcomeUnknown)
+            }
+            ProviderProvisioningProbeOutcome::PersistenceFailure => {
+                assert!(
+                    persist_thread_ref("").is_err(),
+                    "invalid upstream identity must fail durable persistence"
+                );
+                AdapterPreflight::Cancelled(StopObservation::CancellationConfirmed)
+            }
+        }
+    }
+
+    fn observe_readiness_probe(
+        &self,
+        _subject: &crate::storage::ProbeRecoverySubject,
+    ) -> RecoveryObservation {
+        RecoveryObservation::Completed
+    }
+}
+
 /// Keeps phase-aware Doctor coverage isolated from the shared fake's deliberate
 /// no-cache behavior, which other admission tests use as part of their setup.
 #[derive(Clone, Copy)]
@@ -395,6 +544,227 @@ fn service_with_provider_descriptor<A: ComputerUseAdapter>(
         bootstrap_auth: None,
         bootstrap_maintenance: Arc::new(Mutex::new(None)),
     }
+}
+
+#[cfg(unix)]
+fn provider_file_authorization(path: PathBuf) -> ProviderBindingAuthorization {
+    ProviderBindingAuthorization::new("review", "openai", "provider-model", "openai")
+        .with_auth_source(satelle_core::ProviderSecretSource::File { path })
+        .with_experimental_provider_computer_use(true)
+}
+
+#[cfg(unix)]
+fn service_with_classified_provider_probe(
+    state_root: PathBuf,
+    outcome: ProviderProvisioningProbeOutcome,
+) -> HostService {
+    let config = satelle_core::SatelleConfig::defaults().hosts[LOCAL_DEMO_HOST].clone();
+    let adapter = ClassifiedProviderProvisioningAdapter { outcome };
+    HostService {
+        runtime: RuntimeHandle::new_with_readiness_probe_driver(Ok(state_root), adapter, adapter),
+        operation_capacity: Arc::new(OperationCapacity::default()),
+        turn_execution_timeout: crate::configured_turn_execution_timeout(&config),
+        mode: HostMode::TestFake {
+            image_attachments: true,
+        },
+        bootstrap_auth: None,
+        bootstrap_maintenance: Arc::new(Mutex::new(None)),
+    }
+}
+
+#[cfg(unix)]
+fn assert_provider_provisioning_recovery_owned(state: &TestStateDir, operation_id: &str) {
+    let connection = rusqlite::Connection::open(state.path().join("satelle.sqlite3"))
+        .expect("open Host SQLite state");
+    let (phase, lease_state): (String, String) = connection
+        .query_row(
+            "SELECT journal.phase, lease.lease_state
+             FROM provider_secret_provisioning_journal AS journal
+             JOIN control_leases AS lease
+               ON lease.operation_id = journal.operation_id
+              AND lease.provider_probe_ref = journal.provider_probe_ref
+             WHERE journal.operation_id = ?1",
+            [operation_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .expect("load retained provider provisioning ownership");
+    assert_eq!(phase, "rollback_pending");
+    assert_eq!(lease_state, "active");
+}
+
+#[cfg(unix)]
+#[test]
+fn ordinary_post_t0_destination_failure_terminalizes_for_same_daemon_replay() {
+    use std::os::unix::fs::symlink;
+
+    let state = TestStateDir::new().expect("temporary Host state");
+    let secret_directory = tempfile::tempdir().expect("temporary provider secret directory");
+    let destination = secret_directory.path().join("provider-token");
+    let unrelated_target = secret_directory.path().join("unrelated-target");
+    std::fs::write(&unrelated_target, "unrelated").expect("write unrelated symlink target");
+    symlink(&unrelated_target, &destination).expect("create unsafe destination symlink");
+    let service =
+        service_with_provider_descriptor(state.path().to_path_buf(), DoctorRefreshAdapter, None);
+    service.initialize_daemon().expect("initialize Host daemon");
+    let identity = RequestIdentity::new("provider-secret-planned-failure", "a".repeat(64));
+    let authorization = provider_file_authorization(destination);
+
+    let first = service
+        .provision_provider_secret(
+            LOCAL_DEMO_HOST,
+            authorization.clone(),
+            Zeroizing::new("candidate-provider-secret".to_string()),
+            false,
+            &identity,
+        )
+        .expect_err("unsafe destination must fail after T0");
+    let replay = service
+        .provision_provider_secret(
+            LOCAL_DEMO_HOST,
+            authorization,
+            Zeroizing::new("candidate-provider-secret".to_string()),
+            false,
+            &identity,
+        )
+        .expect_err("same-daemon retry must replay the terminal failure");
+
+    assert_ne!(first.code, ErrorCode::StateConflict);
+    assert_eq!(first.code, replay.code);
+    assert_eq!(first.message, replay.message);
+    assert_eq!(first.recovery_command, replay.recovery_command);
+    assert_eq!(first.details, replay.details);
+}
+
+#[cfg(unix)]
+#[test]
+fn existing_provider_secret_requires_typed_overwrite_and_preserves_prior_value() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let state = TestStateDir::new().expect("temporary Host state");
+    let secret_directory = tempfile::tempdir().expect("temporary provider secret directory");
+    let destination = secret_directory.path().join("provider-token");
+    let prior_secret = "prior-provider-secret";
+    std::fs::write(&destination, prior_secret).expect("write prior provider secret");
+    std::fs::set_permissions(&destination, std::fs::Permissions::from_mode(0o600))
+        .expect("make prior provider secret owner-only");
+    let service =
+        service_with_provider_descriptor(state.path().to_path_buf(), DoctorRefreshAdapter, None);
+    service.initialize_daemon().expect("initialize Host daemon");
+    let identity = RequestIdentity::new("provider-secret-overwrite-required", "c".repeat(64));
+
+    let error = service
+        .provision_provider_secret(
+            LOCAL_DEMO_HOST,
+            provider_file_authorization(destination.clone()),
+            Zeroizing::new("replacement-provider-secret".to_string()),
+            false,
+            &identity,
+        )
+        .expect_err("existing destination requires explicit overwrite authority");
+
+    assert_eq!(error.code, ErrorCode::ProviderSecretOverwriteRequired);
+    assert_eq!(
+        std::fs::read_to_string(destination).expect("read preserved prior provider secret"),
+        prior_secret
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn typed_unknown_provider_outcomes_retain_recovery_ownership() {
+    for (suffix, outcome) in [
+        (
+            "upstream-still-active",
+            ProviderProvisioningProbeOutcome::UpstreamStillActive,
+        ),
+        (
+            "outcome-unknown",
+            ProviderProvisioningProbeOutcome::OutcomeUnknown,
+        ),
+        (
+            "persistence-failure",
+            ProviderProvisioningProbeOutcome::PersistenceFailure,
+        ),
+    ] {
+        let state = TestStateDir::new().expect("temporary Host state");
+        let secret_directory = tempfile::tempdir().expect("temporary provider secret directory");
+        let destination = secret_directory.path().join("provider-token");
+        let operation_id = format!("provider-secret-{suffix}");
+        let identity = RequestIdentity::new(&operation_id, "d".repeat(64));
+        let service = service_with_classified_provider_probe(state.path().to_path_buf(), outcome);
+        service.initialize_daemon().expect("initialize Host daemon");
+
+        service
+            .provision_provider_secret(
+                LOCAL_DEMO_HOST,
+                provider_file_authorization(destination),
+                Zeroizing::new("candidate-provider-secret".to_string()),
+                false,
+                &identity,
+            )
+            .expect_err("unknown provider outcome must stay recovery-owned");
+
+        assert_provider_provisioning_recovery_owned(&state, &operation_id);
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn failed_staged_rollback_retains_pending_journal_and_active_lease() {
+    let state = TestStateDir::new().expect("temporary Host state");
+    let secret_directory = tempfile::tempdir().expect("temporary provider secret directory");
+    let destination = secret_directory.path().join("provider-token");
+    let identity = RequestIdentity::new("provider-secret-rollback-pending", "b".repeat(64));
+    let paths = satelle_core::OwnerOnlySecretFilePaths::new(&destination, identity.key())
+        .expect("deterministic provider secret paths");
+    let service = service_with_provider_descriptor(
+        state.path().to_path_buf(),
+        TamperingProviderProvisioningAdapter {
+            staging_path: paths.staging().to_path_buf(),
+        },
+        None,
+    );
+    service.initialize_daemon().expect("initialize Host daemon");
+    let authorization = provider_file_authorization(destination);
+
+    let failure = service
+        .provision_provider_secret(
+            LOCAL_DEMO_HOST,
+            authorization.clone(),
+            Zeroizing::new("candidate-provider-secret".to_string()),
+            false,
+            &identity,
+        )
+        .expect_err("tampered staging must prevent rollback terminalization");
+    assert_eq!(failure.code, ErrorCode::StateConflict);
+
+    let connection = rusqlite::Connection::open(state.path().join("satelle.sqlite3"))
+        .expect("open Host SQLite state");
+    let (phase, lease_state): (String, String) = connection
+        .query_row(
+            "SELECT journal.phase, lease.lease_state
+             FROM provider_secret_provisioning_journal AS journal
+             JOIN control_leases AS lease
+               ON lease.operation_id = journal.operation_id
+              AND lease.provider_probe_ref = journal.provider_probe_ref
+             WHERE journal.operation_id = ?1",
+            [identity.key()],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .expect("load retained provider provisioning ownership");
+    assert_eq!(phase, "rollback_pending");
+    assert_eq!(lease_state, "active");
+
+    let retry = service
+        .provision_provider_secret(
+            LOCAL_DEMO_HOST,
+            authorization,
+            Zeroizing::new("candidate-provider-secret".to_string()),
+            false,
+            &identity,
+        )
+        .expect_err("pending recovery must not start a second operation");
+    assert_eq!(retry.code, ErrorCode::StateConflict);
 }
 
 fn turn_intent_with_extras(prompt: &str, timeout_seconds: u64) -> TurnIntent {

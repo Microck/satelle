@@ -3462,6 +3462,26 @@ fn provision_provider_secret(
         )));
     }
 
+    let confirmed =
+        cliclack::confirm("Provision or replace the provider secret at this exact destination?")
+            .initial_value(false)
+            .interact()
+            .map_err(|source| {
+                failure(setup_interaction_error(
+                    "could not read provider secret provisioning confirmation",
+                    source,
+                ))
+            })?;
+    if !confirmed {
+        return Err(failure(provider_secret_setup_error(
+            ErrorCode::ProviderSecretProvisioningRequired,
+            "provider secret provisioning or replacement was not authorized",
+        )));
+    }
+
+    // Confirmation authorizes both creation and replacement before the secret
+    // enters the process. No other flag or profile can set this transport bit.
+    let overwrite_authorized = confirmed;
     let secret = Zeroizing::new(
         cliclack::password("Provider secret")
             .interact()
@@ -3473,56 +3493,13 @@ fn provision_provider_secret(
             })?
             .into_bytes(),
     );
-    let confirmed = cliclack::confirm("Provision the provider secret at this exact destination?")
-        .initial_value(false)
-        .interact()
-        .map_err(|source| {
-            failure(setup_interaction_error(
-                "could not read provider secret provisioning confirmation",
-                source,
-            ))
-        })?;
-    if !confirmed {
-        return Err(failure(provider_secret_setup_error(
-            ErrorCode::ProviderSecretProvisioningRequired,
-            "provider secret provisioning was not authorized",
-        )));
-    }
-
-    let metadata =
-        satelle_transport::ProviderSecretProvisioningMetadata::new(authorization.clone(), false);
-    match provider_transport
-        .provision_provider_secret(&metadata, Zeroizing::new(secret.as_slice().to_vec()))
-    {
-        Ok(response) => Ok(response),
-        Err(error) if error.code == ErrorCode::ProviderSecretOverwriteRequired => {
-            let confirmed = cliclack::confirm(
-                "Replace the existing provider secret at this exact destination?",
-            )
-            .initial_value(false)
-            .interact()
-            .map_err(|source| {
-                failure(setup_interaction_error(
-                    "could not read provider secret overwrite confirmation",
-                    source,
-                ))
-            })?;
-            if !confirmed {
-                return Err(failure(provider_secret_setup_error(
-                    ErrorCode::ProviderSecretOverwriteRequired,
-                    "provider secret replacement was not authorized",
-                )));
-            }
-            let metadata = satelle_transport::ProviderSecretProvisioningMetadata::new(
-                authorization.clone(),
-                true,
-            );
-            provider_transport
-                .provision_provider_secret(&metadata, secret)
-                .map_err(failure)
-        }
-        Err(error) => Err(failure(error)),
-    }
+    let metadata = satelle_transport::ProviderSecretProvisioningMetadata::new(
+        authorization.clone(),
+        overwrite_authorized,
+    );
+    provider_transport
+        .provision_provider_secret(&metadata, secret)
+        .map_err(failure)
 }
 
 fn daemon_path_overrides(command: &SetupCommand, host_config: &HostConfig) -> DaemonPathOverrides {
@@ -4439,6 +4416,81 @@ fn reveal_secret_source_descriptor(
             "redaction_reason": "unsupported_secret_source_kind",
             "source": "user_config",
         }),
+    }
+}
+
+#[cfg(test)]
+mod config_redaction_tests {
+    use super::redact_schema_marked_config_values;
+    use serde_json::json;
+
+    #[test]
+    fn schema_marked_secret_fields_never_fall_back_to_raw_values() {
+        const CANARY: &str = "PRIVATE_CONFIG_REDACTION_FAILURE_CANARY";
+        let mut value = json!({
+            "hosts": {
+                "selected": {
+                    "transport": "direct",
+                    "api_token": {
+                        "kind": "file",
+                        "path": CANARY,
+                    },
+                    "provider_auth": {
+                        "operator-auth": {
+                            "kind": "auth-command",
+                            "argv": ["/usr/bin/credential-helper", CANARY],
+                            "secret": CANARY,
+                        },
+                    },
+                },
+            },
+        });
+
+        redact_schema_marked_config_values(&mut value, &mut Vec::new(), false);
+
+        let selected = &value["hosts"]["selected"];
+        assert_eq!(selected["transport"], "direct");
+        assert_eq!(selected["api_token"]["value"], serde_json::Value::Null);
+        assert_eq!(selected["api_token"]["redacted"], true);
+        assert_eq!(
+            selected["provider_auth"]["operator-auth"]["value"],
+            serde_json::Value::Null
+        );
+        assert_eq!(
+            selected["provider_auth"]["operator-auth"]["redaction_reason"],
+            "secret_source_reference"
+        );
+        assert!(
+            !serde_json::to_string(&value)
+                .expect("redacted config should serialize")
+                .contains(CANARY)
+        );
+
+        let mut revealed = json!({
+            "hosts": {
+                "selected": {
+                    "provider_auth": {
+                        "operator-auth": {
+                            "kind": "auth-command",
+                            "argv": ["/usr/bin/credential-helper", CANARY],
+                        },
+                    },
+                },
+            },
+        });
+        redact_schema_marked_config_values(&mut revealed, &mut Vec::new(), true);
+        let unknown = &revealed["hosts"]["selected"]["provider_auth"]["operator-auth"];
+        assert_eq!(unknown["value"], serde_json::Value::Null);
+        assert_eq!(unknown["redacted"], true);
+        assert_eq!(
+            unknown["redaction_reason"],
+            "unsupported_secret_source_kind"
+        );
+        assert!(
+            !serde_json::to_string(&revealed)
+                .expect("unknown secret source should serialize as redacted")
+                .contains(CANARY)
+        );
     }
 }
 

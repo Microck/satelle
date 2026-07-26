@@ -2,11 +2,25 @@ use assert_cmd::Command;
 use predicates::prelude::*;
 use satelle_core::SessionId;
 use satelle_host::{ApiBearerToken, test_support::TestStateDir};
+#[cfg(target_os = "linux")]
+use satelle_host::{ApiScopes, HostService};
 use satelle_test_contract::{assert_directory_tree_unchanged, assert_privacy_canaries_absent};
 use serde_json::Value;
 use std::collections::BTreeSet;
 use std::fs;
+#[cfg(target_os = "linux")]
+use std::io::{Read, Write};
 use std::net::TcpListener;
+#[cfg(target_os = "linux")]
+use std::net::TcpStream;
+#[cfg(target_os = "linux")]
+use std::process::{Child, ChildStdin, Stdio};
+#[cfg(target_os = "linux")]
+use std::sync::mpsc::{self, Receiver};
+#[cfg(target_os = "linux")]
+use std::thread::{self, JoinHandle};
+#[cfg(target_os = "linux")]
+use std::time::{Duration, Instant};
 
 #[path = "support/test-file.rs"]
 mod test_file;
@@ -239,14 +253,9 @@ fn write_user_config(
 
 fn authorize_default_provider_binding(state: &TestStateDir) -> std::path::PathBuf {
     let config_file = state.path().join("provider-binding-config.toml");
-    let secret_file = state.path().join("provider-token");
-    test_file::write_user_controlled(&secret_file, b"fixture-provider-token")
-        .expect("write fixture provider token");
-    let secret_path = toml::Value::String(secret_file.to_string_lossy().into_owned()).to_string();
     write_user_config(
         &config_file,
-        format!(
-            r#"
+        r#"
 default_host = "local-demo"
 model_alias = "fixture-model"
 provider_alias = "fixture-provider"
@@ -265,15 +274,15 @@ endpoint = "https://fixture-provider.invalid/v1"
 auth_source = "fixture-auth"
 
 [hosts.local-demo.provider_auth.fixture-auth]
-kind = "file"
-path = {secret_path}
-"#
-        ),
+kind = "environment"
+variable = "FIXTURE_PROVIDER_TOKEN"
+"#,
     )
     .expect("write exact provider binding config");
     let output = satelle()
         .env("SATELLE_CONFIG_FILE", &config_file)
         .env("SATELLE_STATE_DIR", state.path())
+        .env("FIXTURE_PROVIDER_TOKEN", "fixture-provider-token")
         .args([
             "setup",
             "--host",
@@ -3088,14 +3097,9 @@ fn setup_verify_runs_live_fake_readiness_and_records_the_cache_update() {
 fn provider_auth_only_setup_does_not_probe_or_invalidate_native_readiness() {
     let state = state_dir();
     let config_file = state.path().join("provider-auth-only.toml");
-    let secret_file = state.path().join("provider-token");
-    test_file::write_user_controlled(&secret_file, b"fixture-provider-token")
-        .expect("write fixture provider token");
-    let secret_path = toml::Value::String(secret_file.to_string_lossy().into_owned()).to_string();
     write_user_config(
         &config_file,
-        format!(
-            r#"
+        r#"
 default_host = "local-demo"
 model_alias = "fixture-model"
 provider_alias = "fixture-provider"
@@ -3114,16 +3118,16 @@ endpoint = "https://fixture-provider.invalid/v1"
 auth_source = "fixture-auth"
 
 [hosts.local-demo.provider_auth.fixture-auth]
-kind = "file"
-path = {secret_path}
-"#
-        ),
+kind = "environment"
+variable = "FIXTURE_PROVIDER_TOKEN"
+"#,
     )
     .expect("write provider-auth-only config");
 
     let output = satelle()
         .env("SATELLE_CONFIG_FILE", &config_file)
         .env("SATELLE_STATE_DIR", state.path())
+        .env("FIXTURE_PROVIDER_TOKEN", "fixture-provider-token")
         .args([
             "setup",
             "--host",
@@ -7277,15 +7281,336 @@ variable = "DECOY_PROVIDER_TOKEN"
 }
 
 #[cfg(target_os = "linux")]
-#[test]
-fn resolved_provider_secret_is_absent_from_every_implemented_retention_surface() {
-    const CANARY: &str = "PRIVATE_RESOLVED_PROVIDER_SECRET_CANARY";
+enum ProviderSecretPtyDecision<'a> {
+    Decline,
+    Accept(&'a str),
+}
 
+#[cfg(target_os = "linux")]
+struct ProviderSecretPtyProcess {
+    child: Child,
+    stdin: Option<ChildStdin>,
+    stdout: Vec<u8>,
+    stdout_receiver: Receiver<u8>,
+    stdout_reader: JoinHandle<()>,
+    stderr_reader: JoinHandle<Vec<u8>>,
+}
+
+#[cfg(target_os = "linux")]
+impl ProviderSecretPtyProcess {
+    fn wait_for_after(&mut self, fragment: &str, start: usize) -> usize {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            if let Some(offset) = self.stdout[start..]
+                .windows(fragment.len())
+                .position(|window| window == fragment.as_bytes())
+            {
+                return start + offset + fragment.len();
+            }
+
+            let remaining = deadline
+                .checked_duration_since(Instant::now())
+                .unwrap_or_default();
+            assert!(
+                !remaining.is_zero(),
+                "timed out waiting for PTY fragment {fragment:?}: {}",
+                String::from_utf8_lossy(&self.stdout)
+            );
+            let byte = self
+                .stdout_receiver
+                .recv_timeout(remaining)
+                .unwrap_or_else(|error| {
+                    panic!(
+                        "PTY ended before fragment {fragment:?} ({error}): {}",
+                        String::from_utf8_lossy(&self.stdout)
+                    )
+                });
+            self.stdout.push(byte);
+        }
+    }
+
+    fn write_input(&mut self, input: &str) {
+        let stdin = self.stdin.as_mut().expect("PTY stdin should remain open");
+        stdin
+            .write_all(input.as_bytes())
+            .expect("write synchronized PTY input");
+        stdin.flush().expect("flush synchronized PTY input");
+    }
+
+    fn finish(mut self) -> std::process::Output {
+        drop(self.stdin.take());
+        let status = self.child.wait().expect("wait for PTY command");
+        self.stdout_reader.join().expect("join PTY stdout reader");
+        self.stdout.extend(self.stdout_receiver.try_iter());
+        let stderr = self.stderr_reader.join().expect("join PTY stderr reader");
+        std::process::Output {
+            status,
+            stdout: self.stdout,
+            stderr,
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn run_provider_secret_setup_in_pty(
+    user_config: &std::path::Path,
+    state_dir: &std::path::Path,
+    profile: Option<&str>,
+    yes: bool,
+    decision: ProviderSecretPtyDecision<'_>,
+) -> (std::process::Output, usize, Option<usize>) {
+    let executable = assert_cmd::cargo::cargo_bin!("satelle");
+    let profile_argument = profile
+        .map(|profile| format!("--profile {profile} "))
+        .unwrap_or_default();
+    let yes_argument = if yes { " --yes" } else { "" };
+    let command_line = format!(
+        "{} {profile_argument}setup --host selected --component provider-auth{yes_argument}",
+        executable.display()
+    );
+    let mut command = std::process::Command::new("script");
+    for name in [
+        "SATELLE_HOME",
+        "SATELLE_CONFIG_FILE",
+        "SATELLE_STATE_DIR",
+        "SATELLE_CACHE_DIR",
+        "SATELLE_LOG_DIR",
+        "SATELLE_HOST",
+        "SATELLE_PROFILE",
+        "SATELLE_ERROR_FORMAT",
+        TEST_SUPPORT_ADAPTER_ENV,
+    ] {
+        command.env_remove(name);
+    }
+    let mut child = command
+        .env("SATELLE_CONFIG_FILE", user_config)
+        .env("SATELLE_STATE_DIR", state_dir)
+        .env("SATELLE_COMMAND_HISTORY", "false")
+        .env(TEST_SUPPORT_ADAPTER_ENV, "fake")
+        .args(["-qec", command_line.as_str(), "/dev/null"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn synchronized provider secret PTY");
+    let stdin = child.stdin.take().expect("take PTY stdin");
+    let mut stdout = child.stdout.take().expect("take PTY stdout");
+    let mut stderr = child.stderr.take().expect("take PTY stderr");
+    let (stdout_sender, stdout_receiver) = mpsc::channel();
+    let stdout_reader = thread::spawn(move || {
+        let mut byte = [0_u8; 1];
+        while stdout.read_exact(&mut byte).is_ok() {
+            if stdout_sender.send(byte[0]).is_err() {
+                break;
+            }
+        }
+    });
+    let stderr_reader = thread::spawn(move || {
+        let mut bytes = Vec::new();
+        stderr
+            .read_to_end(&mut bytes)
+            .expect("read provider secret PTY stderr");
+        bytes
+    });
+    let mut process = ProviderSecretPtyProcess {
+        child,
+        stdin: Some(stdin),
+        stdout: Vec::new(),
+        stdout_receiver,
+        stdout_reader,
+        stderr_reader,
+    };
+
+    let confirmation_end = process.wait_for_after(
+        "Provision or replace the provider secret at this exact destination?",
+        0,
+    );
+    let secret_prompt_end = match decision {
+        ProviderSecretPtyDecision::Decline => {
+            process.write_input("n\n");
+            None
+        }
+        ProviderSecretPtyDecision::Accept(secret) => {
+            process.write_input("y\n");
+            let prompt_end = process.wait_for_after("Provider secret", confirmation_end);
+            process.write_input(&format!("{secret}\n"));
+            Some(prompt_end)
+        }
+    };
+    let output = process.finish();
+    (output, confirmation_end, secret_prompt_end)
+}
+
+#[cfg(target_os = "linux")]
+fn combined_output(output: &std::process::Output) -> String {
+    String::from_utf8_lossy(&[output.stdout.as_slice(), output.stderr.as_slice()].concat())
+        .to_string()
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn provider_secret_provisioning_requires_a_separate_tty_confirmation_and_never_echoes_secret() {
+    for (case, profile, yes, accepted) in [
+        ("yes-declined", None, true, false),
+        (
+            "trusted-profile-declined",
+            Some("maintenance"),
+            false,
+            false,
+        ),
+        ("confirmed", None, true, true),
+    ] {
+        let state = state_dir();
+        let user_config = state.path().join("user-config.toml");
+        let destinations = tempfile::tempdir().expect("create external secret destinations");
+        let selected_destination = destinations.path().join("selected-provider-secret");
+        let decoy_destination = destinations.path().join("decoy-provider-secret");
+        test_file::write_user_controlled(&decoy_destination, "decoy-secret")
+            .expect("write decoy provider secret");
+        let secret_canary = format!("PRIVATE_PROVIDER_SECRET_{case}_CANARY");
+        write_user_config(
+            &user_config,
+            format!(
+                r#"
+default_host = "selected"
+model_alias = "review"
+provider_alias = "openai"
+
+[hosts.selected]
+transport = "local"
+adapter = "fake"
+
+[hosts.selected.provider_auth.operator-auth]
+kind = "file"
+path = '{}'
+
+[hosts.selected.provider_bindings.openai.review]
+model = "gpt-5.2"
+model_provider = "openai"
+auth_source = "operator-auth"
+
+[hosts.decoy]
+transport = "local"
+adapter = "fake"
+
+[hosts.decoy.provider_auth.operator-auth]
+kind = "file"
+path = '{}'
+
+[profiles.maintenance]
+
+[trusted_profiles.maintenance]
+hosts = ["selected"]
+command_families = ["setup"]
+"#,
+                selected_destination.display(),
+                decoy_destination.display(),
+            ),
+        )
+        .expect("write provider secret setup config");
+
+        let decision = if accepted {
+            ProviderSecretPtyDecision::Accept(secret_canary.as_str())
+        } else {
+            ProviderSecretPtyDecision::Decline
+        };
+        let (output, confirmation_end, secret_prompt_end) =
+            run_provider_secret_setup_in_pty(&user_config, state.path(), profile, yes, decision);
+        if accepted {
+            assert!(
+                output.status.success(),
+                "accepted provisioning should succeed"
+            );
+            assert!(
+                secret_prompt_end.is_some_and(|prompt_end| prompt_end > confirmation_end),
+                "hidden input must follow the dedicated confirmation"
+            );
+        } else {
+            assert!(!output.status.success(), "declined provisioning must fail");
+            assert_eq!(
+                secret_prompt_end, None,
+                "decline must stop before hidden input"
+            );
+        }
+        let rendered = combined_output(&output);
+        assert_privacy_canaries_absent(
+            "interactive provider secret output",
+            rendered.as_bytes(),
+            &[secret_canary.as_str()],
+        );
+        if accepted {
+            for field in [
+                "Provider descriptor configured: true",
+                "Provider secret provisioned: true",
+                "Provider validation: resolved",
+                "Provider smoke test: not_checked",
+            ] {
+                assert!(
+                    rendered.contains(field),
+                    "accepted human result must expose {field:?}: {rendered}"
+                );
+            }
+            assert!(
+                !rendered.contains("Recovery:"),
+                "successful provisioning must not report recovery commands: {rendered}"
+            );
+        }
+
+        let destination_descriptor = format!("file:{}", selected_destination.display());
+        let mut position = 0;
+        for fragment in [
+            "Target Host: selected",
+            "Provider alias: openai",
+            "Provider Secret Source kind: file",
+            destination_descriptor.as_str(),
+            "Provider secret persistence location class:",
+            "Provider secret overwrite behavior:",
+            "Provision or replace the provider secret at this exact destination?",
+        ] {
+            let offset = rendered[position..].find(fragment).unwrap_or_else(|| {
+                panic!("missing ordered provider secret prompt fragment {fragment:?}: {rendered}")
+            });
+            position += offset + fragment.len();
+        }
+
+        if accepted {
+            assert_eq!(
+                fs::read_to_string(&selected_destination)
+                    .expect("selected destination should contain the confirmed secret"),
+                secret_canary
+            );
+        } else {
+            assert!(
+                !selected_destination.exists(),
+                "{case} must not read or provision a secret after decline"
+            );
+        }
+        assert_eq!(
+            fs::read_to_string(&decoy_destination).expect("read decoy provider secret"),
+            "decoy-secret"
+        );
+        let mut local_state = Vec::new();
+        collect_regular_file_bytes(state.path(), &mut local_state);
+        assert_privacy_canaries_absent(
+            "local CLI state after provider secret setup",
+            &local_state,
+            &[secret_canary.as_str()],
+        );
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn provider_secret_noninteractive_modes_are_typed_and_never_read_or_mutate_secrets() {
+    const EXISTING_SECRET: &str = "EXISTING_PROVIDER_SECRET_CANARY";
     let state = state_dir();
     let user_config = state.path().join("user-config.toml");
-    let secret_directory = tempfile::tempdir().expect("create external provider secret directory");
-    let secret_file = secret_directory.path().join("provider-secret");
-    test_file::write_user_controlled(&secret_file, CANARY).expect("write provider secret canary");
+    let destinations = tempfile::tempdir().expect("create external secret destination");
+    let destination = destinations.path().join("provider-secret");
+    fs::create_dir(&destination).expect("create non-regular provider secret destination");
+    let unchanged_marker = destination.join("unchanged-marker");
+    test_file::write_user_controlled(&unchanged_marker, EXISTING_SECRET)
+        .expect("write non-regular destination marker");
     write_user_config(
         &user_config,
         format!(
@@ -7298,8 +7623,197 @@ provider_alias = "openai"
 transport = "local"
 adapter = "fake"
 
-[hosts.selected.experimental_provider_computer_use_by_provider]
-openai = true
+[hosts.selected.provider_auth.operator-auth]
+kind = "file"
+path = '{}'
+
+[hosts.selected.provider_bindings.openai.review]
+model = "gpt-5.2"
+model_provider = "openai"
+auth_source = "operator-auth"
+"#,
+            destination.display(),
+        ),
+    )
+    .expect("write overwrite setup config");
+
+    for arguments in [
+        vec![
+            "--error-format",
+            "json",
+            "setup",
+            "--host",
+            "selected",
+            "--component",
+            "provider-auth",
+            "--yes",
+        ],
+        vec![
+            "--error-format",
+            "json",
+            "setup",
+            "--host",
+            "selected",
+            "--component",
+            "provider-auth",
+            "--no-input",
+            "--yes",
+        ],
+        vec![
+            "setup",
+            "--host",
+            "selected",
+            "--component",
+            "provider-auth",
+            "--json",
+            "--yes",
+        ],
+    ] {
+        let output = satelle()
+            .env("SATELLE_CONFIG_FILE", &user_config)
+            .env("SATELLE_STATE_DIR", state.path())
+            .args(arguments)
+            .assert()
+            .failure()
+            .get_output()
+            .clone();
+        assert_eq!(
+            parse_json_output(&output.stderr)["code"],
+            "provider-secret-provisioning-required"
+        );
+        assert_command_canaries_are_absent(&output, &[EXISTING_SECRET]);
+        assert!(destination.is_dir(), "setup must not replace the directory");
+        assert_eq!(
+            fs::read(&unchanged_marker).expect("read unchanged destination marker"),
+            EXISTING_SECRET.as_bytes()
+        );
+    }
+
+    let dry_run = satelle()
+        .env("SATELLE_CONFIG_FILE", &user_config)
+        .env("SATELLE_STATE_DIR", state.path())
+        .args([
+            "setup",
+            "--host",
+            "selected",
+            "--component",
+            "provider-auth",
+            "--dry-run",
+            "--no-input",
+            "--yes",
+            "--json",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .clone();
+    assert_command_canaries_are_absent(&dry_run, &[EXISTING_SECRET]);
+    assert!(
+        destination.is_dir(),
+        "dry run must not replace the directory"
+    );
+    assert_eq!(
+        fs::read(&unchanged_marker).expect("read destination marker after dry run"),
+        EXISTING_SECRET.as_bytes()
+    );
+
+    let quiet = satelle()
+        .env("SATELLE_CONFIG_FILE", &user_config)
+        .env("SATELLE_STATE_DIR", state.path())
+        .args([
+            "setup",
+            "--host",
+            "selected",
+            "--component",
+            "provider-auth",
+            "--quiet",
+            "--yes",
+        ])
+        .assert()
+        .failure()
+        .get_output()
+        .clone();
+    assert!(String::from_utf8_lossy(&quiet.stderr).contains("--quiet"));
+    assert_command_canaries_are_absent(&quiet, &[EXISTING_SECRET]);
+    assert!(
+        destination.is_dir(),
+        "quiet rejection must not replace the directory"
+    );
+    assert_eq!(
+        fs::read(&unchanged_marker).expect("read destination marker after quiet rejection"),
+        EXISTING_SECRET.as_bytes()
+    );
+}
+
+#[cfg(target_os = "linux")]
+struct ChildGuard(Child);
+
+#[cfg(target_os = "linux")]
+impl Drop for ChildGuard {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn selected_host_authentication_precedes_provider_secret_prompting() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let state = state_dir();
+    let user_config = state.path().join("user-config.toml");
+    let token_file = state.path().join("satelle.token");
+    let token = ApiBearerToken::generate().expect("generate direct Host API token");
+    let exposed = token.expose();
+    fs::write(&token_file, exposed.as_bytes()).expect("write direct Host API token");
+    fs::set_permissions(&token_file, fs::Permissions::from_mode(0o600))
+        .expect("restrict direct Host API token");
+
+    let service =
+        HostService::local_demo_for_tests_at(state.path()).expect("open real Host state fixture");
+    let actual_host_identity = service
+        .initialize_daemon()
+        .expect("initialize real Host identity")
+        .host_identity()
+        .to_string();
+    assert_ne!(actual_host_identity, "host-intentionally-wrong");
+    service
+        .register_api_token(&token, "provider-secret-auth-order", ApiScopes::ADMIN, None)
+        .expect("register real Host admin token");
+    drop(service);
+
+    let certificate = state.path().join("certificate.pem");
+    let private_key = state.path().join("private-key.pem");
+    let certified = rcgen::generate_simple_self_signed(["localhost".to_string()])
+        .expect("generate matching TLS fixture");
+    fs::write(&certificate, certified.cert.pem()).expect("write TLS certificate");
+    fs::write(&private_key, certified.signing_key.serialize_pem()).expect("write TLS private key");
+    fs::set_permissions(&certificate, fs::Permissions::from_mode(0o600))
+        .expect("restrict TLS certificate");
+    fs::set_permissions(&private_key, fs::Permissions::from_mode(0o600))
+        .expect("restrict TLS private key");
+
+    let destinations = tempfile::tempdir().expect("create external provider destination");
+    let selected_destination = destinations.path().join("selected-provider-secret");
+    let reservation = TcpListener::bind("127.0.0.1:0").expect("reserve direct Host port");
+    let address = reservation.local_addr().expect("read direct Host address");
+    drop(reservation);
+    write_user_config(
+        &user_config,
+        format!(
+            r#"
+default_host = "selected"
+model_alias = "review"
+provider_alias = "openai"
+
+[hosts.selected]
+transport = "direct"
+adapter = "codex"
+address = "https://localhost:{}"
+expected_host_id = "host-intentionally-wrong"
+api_token = {{ kind = "file", path = "{}" }}
+ca_bundle = "{}"
 
 [hosts.selected.provider_auth.operator-auth]
 kind = "file"
@@ -7308,11 +7822,137 @@ path = '{}'
 [hosts.selected.provider_bindings.openai.review]
 model = "gpt-5.2"
 model_provider = "openai"
+auth_source = "operator-auth"
+"#,
+            address.port(),
+            token_file.display(),
+            certificate.display(),
+            selected_destination.display(),
+        ),
+    )
+    .expect("write direct Host provider setup config");
+
+    let executable = assert_cmd::cargo::cargo_bin!("satelle");
+    let mut daemon_command = std::process::Command::new(executable);
+    let bind_address = address.to_string();
+    for name in [
+        "SATELLE_HOME",
+        "SATELLE_CONFIG_FILE",
+        "SATELLE_STATE_DIR",
+        "SATELLE_CACHE_DIR",
+        "SATELLE_LOG_DIR",
+        "SATELLE_HOST",
+        "SATELLE_PROFILE",
+        "SATELLE_ERROR_FORMAT",
+        TEST_SUPPORT_ADAPTER_ENV,
+    ] {
+        daemon_command.env_remove(name);
+    }
+    let child = daemon_command
+        .env("SATELLE_STATE_DIR", state.path())
+        .args([
+            "host",
+            "start",
+            "--foreground",
+            "--bind",
+            bind_address.as_str(),
+            "--tls-cert",
+            certificate.to_str().expect("UTF-8 certificate path"),
+            "--tls-key",
+            private_key.to_str().expect("UTF-8 private key path"),
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("start real TLS Host");
+    let mut daemon = ChildGuard(child);
+    let ready_deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        if TcpStream::connect(address).is_ok() {
+            break;
+        }
+        if let Some(status) = daemon.0.try_wait().expect("inspect real Host process") {
+            panic!("real TLS Host exited before accepting requests: {status}");
+        }
+        assert!(
+            Instant::now() < ready_deadline,
+            "real TLS Host did not accept requests before the deadline"
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+
+    let output = production_satelle()
+        .env("SATELLE_CONFIG_FILE", &user_config)
+        .env("SATELLE_STATE_DIR", state.path())
+        .env("SATELLE_COMMAND_HISTORY", "false")
+        .args([
+            "--error-format",
+            "json",
+            "setup",
+            "--host",
+            "selected",
+            "--component",
+            "provider-auth",
+            "--no-input",
+            "--yes",
+        ])
+        .assert()
+        .failure()
+        .get_output()
+        .clone();
+    assert_eq!(
+        parse_json_output(&output.stderr)["code"],
+        "host-identity-mismatch"
+    );
+    let rendered = combined_output(&output);
+
+    assert!(
+        !rendered.contains("Target Host:")
+            && !rendered.contains("Provider secret persistence location class:")
+            && !rendered
+                .contains("Provision or replace the provider secret at this exact destination?"),
+        "the CLI must authenticate and pin the selected Host before preview or prompting: {rendered}"
+    );
+    assert_privacy_canaries_absent(
+        "selected Host authentication failure",
+        rendered.as_bytes(),
+        &[exposed.as_str()],
+    );
+    assert!(!selected_destination.exists());
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn resolved_provider_secret_is_absent_from_every_implemented_retention_surface() {
+    const CANARY: &str = "PRIVATE_RESOLVED_PROVIDER_SECRET_CANARY";
+
+    let state = state_dir();
+    let user_config = state.path().join("user-config.toml");
+    write_user_config(
+        &user_config,
+        r#"
+default_host = "selected"
+model_alias = "review"
+provider_alias = "openai"
+
+[hosts.selected]
+transport = "local"
+adapter = "fake"
+
+[hosts.selected.experimental_provider_computer_use_by_provider]
+openai = true
+
+[hosts.selected.provider_auth.operator-auth]
+kind = "environment"
+variable = "PRIVATE_PROVIDER_TOKEN"
+
+[hosts.selected.provider_bindings.openai.review]
+model = "gpt-5.2"
+model_provider = "openai"
 endpoint = "http://127.0.0.1:9"
 auth_source = "operator-auth"
 "#,
-            secret_file.display()
-        ),
     )
     .expect("write provider secret canary config");
 
@@ -7320,6 +7960,7 @@ auth_source = "operator-auth"
         .env("SATELLE_CONFIG_FILE", &user_config)
         .env("SATELLE_STATE_DIR", state.path())
         .env(TEST_SUPPORT_ADAPTER_ENV, "resolved-secret-canary")
+        .env("PRIVATE_PROVIDER_TOKEN", CANARY)
         .args([
             "setup",
             "--host",
@@ -7340,6 +7981,7 @@ auth_source = "operator-auth"
         .env("SATELLE_CONFIG_FILE", &user_config)
         .env("SATELLE_STATE_DIR", state.path())
         .env(TEST_SUPPORT_ADAPTER_ENV, "resolved-secret-canary")
+        .env("PRIVATE_PROVIDER_TOKEN", CANARY)
         .args([
             "run",
             "--host",
@@ -7442,6 +8084,50 @@ fn noninteractive_file_provisioning_is_typed_and_never_accepts_secret_bytes() {
         .expect("provider secret fixture should be written securely");
     write_user_config(
         &user_config,
+        r#"
+default_host = "local"
+model_alias = "review"
+provider_alias = "openai"
+
+[hosts.local]
+transport = "local"
+adapter = "fake"
+
+[hosts.local.provider_auth.openai]
+kind = "environment"
+variable = "PROVIDER_SECRET_SETUP_TOKEN"
+
+[hosts.local.provider_bindings.openai.review]
+model = "gpt-5.2"
+model_provider = "openai"
+auth_source = "openai"
+"#,
+    )
+    .expect("user config should be written");
+    satelle()
+        .env("SATELLE_CONFIG_FILE", &user_config)
+        .env("SATELLE_STATE_DIR", state.path())
+        .env("PROVIDER_SECRET_SETUP_TOKEN", secret_canary)
+        .args([
+            "setup",
+            "--host",
+            "local",
+            "--component",
+            "provider-auth",
+            "--no-input",
+            "--yes",
+            "--json",
+        ])
+        .assert()
+        .success();
+    satelle()
+        .env("SATELLE_CONFIG_FILE", &user_config)
+        .env("SATELLE_STATE_DIR", state.path())
+        .args(["host", "release-state"])
+        .assert()
+        .success();
+    write_user_config(
+        &user_config,
         format!(
             r#"
 default_host = "local"
@@ -7464,28 +8150,7 @@ auth_source = "openai"
             secret_file.display()
         ),
     )
-    .expect("user config should be written");
-    satelle()
-        .env("SATELLE_CONFIG_FILE", &user_config)
-        .env("SATELLE_STATE_DIR", state.path())
-        .args([
-            "setup",
-            "--host",
-            "local",
-            "--component",
-            "provider-auth",
-            "--no-input",
-            "--yes",
-            "--json",
-        ])
-        .assert()
-        .success();
-    satelle()
-        .env("SATELLE_CONFIG_FILE", &user_config)
-        .env("SATELLE_STATE_DIR", state.path())
-        .args(["host", "release-state"])
-        .assert()
-        .success();
+    .expect("switch the authorized descriptor to the missing File destination");
     fs::remove_file(&secret_file).expect("remove provider secret before provisioning check");
 
     let output = satelle()

@@ -834,6 +834,221 @@ struct ProviderSecretComparison {
     digest_hex: String,
 }
 
+#[derive(Clone, Copy)]
+enum ProviderSecretPostT0Phase {
+    Planned,
+    Staged,
+    Validated,
+    PublishIntent,
+    Committed,
+}
+
+enum ProviderSecretPostT0Failure {
+    Ordinary(SatelleError),
+    RecoveryRequired(SatelleError),
+    UnknownProviderOutcome(SatelleError),
+}
+
+impl From<SatelleError> for ProviderSecretPostT0Failure {
+    fn from(error: SatelleError) -> Self {
+        Self::Ordinary(error)
+    }
+}
+
+/// Owns every exit after the provisioning journal has durably claimed T0.
+///
+/// Ordinary failures must either terminalize now or leave enough verified
+/// evidence for startup recovery. Journal, cleanup, rollback, and unknown
+/// provider outcomes cannot safely choose a terminal state, so those paths
+/// deliberately retain the lease.
+struct ProviderSecretPostT0Guard<'a> {
+    runtime: &'a RuntimeHandle,
+    operation_id: String,
+    paths: satelle_core::OwnerOnlySecretFilePaths,
+    candidate: ProviderSecretComparison,
+    prior: Option<ProviderSecretComparison>,
+    destination_existed: Option<bool>,
+    phase: ProviderSecretPostT0Phase,
+    publish_may_have_mutated: bool,
+    preserve_raced_destination: bool,
+    published_overwrite: Option<bool>,
+    pending: Option<runtime::PendingProviderReadiness>,
+}
+
+impl<'a> ProviderSecretPostT0Guard<'a> {
+    fn new(
+        runtime: &'a RuntimeHandle,
+        operation_id: String,
+        paths: satelle_core::OwnerOnlySecretFilePaths,
+        candidate: ProviderSecretComparison,
+    ) -> Self {
+        Self {
+            runtime,
+            operation_id,
+            paths,
+            candidate,
+            prior: None,
+            destination_existed: None,
+            phase: ProviderSecretPostT0Phase::Planned,
+            publish_may_have_mutated: false,
+            preserve_raced_destination: false,
+            published_overwrite: None,
+            pending: None,
+        }
+    }
+
+    fn record_destination(
+        &mut self,
+        destination_existed: bool,
+        prior: Option<ProviderSecretComparison>,
+    ) {
+        self.destination_existed = Some(destination_existed);
+        self.prior = prior;
+    }
+
+    fn candidate_evidence(&self) -> (&[u8], &[u8; 32]) {
+        (self.candidate.key.as_bytes(), &self.candidate.digest)
+    }
+
+    fn prior_evidence(&self) -> Option<(&[u8], &[u8; 32])> {
+        self.prior
+            .as_ref()
+            .map(|prior| (prior.key.as_bytes(), &prior.digest))
+    }
+
+    fn mark_staged(&mut self) {
+        self.phase = ProviderSecretPostT0Phase::Staged;
+    }
+
+    fn mark_validated(&mut self) {
+        self.phase = ProviderSecretPostT0Phase::Validated;
+    }
+
+    fn mark_publish_intent(&mut self) {
+        self.phase = ProviderSecretPostT0Phase::PublishIntent;
+        self.publish_may_have_mutated = true;
+    }
+
+    fn preserve_raced_destination(&mut self) {
+        self.preserve_raced_destination = true;
+    }
+
+    fn record_published(&mut self, overwritten: bool) {
+        self.published_overwrite = Some(overwritten);
+    }
+
+    fn mark_committed(&mut self) {
+        self.phase = ProviderSecretPostT0Phase::Committed;
+    }
+
+    fn set_pending(&mut self, pending: runtime::PendingProviderReadiness) {
+        self.pending = Some(pending);
+    }
+
+    fn readiness(&self) -> Result<&AdapterReadiness, SatelleError> {
+        self.pending
+            .as_ref()
+            .ok_or_else(SatelleError::state_conflict)?
+            .readiness()
+    }
+
+    fn cleanup_staging(&self) -> Result<(), SatelleError> {
+        satelle_core::cleanup_owner_only_secret_file(
+            &self.paths,
+            Some(self.candidate_evidence()),
+            self.prior_evidence(),
+        )
+        .map_err(|_| SatelleError::state_conflict())
+    }
+
+    fn rollback_publish(&self) -> Result<(), SatelleError> {
+        let overwritten = self
+            .published_overwrite
+            .or(self.destination_existed)
+            .unwrap_or(false);
+        satelle_core::rollback_owner_only_secret_file(
+            &self.paths,
+            overwritten,
+            self.candidate.key.as_bytes(),
+            &self.candidate.digest,
+            self.prior.as_ref().map(|prior| prior.key.as_bytes()),
+            self.prior.as_ref().map(|prior| &prior.digest),
+        )
+        .map_err(|_| SatelleError::state_conflict())
+    }
+
+    fn retain_for_recovery(mut self) {
+        if let Some(pending) = self.pending.take() {
+            pending.retain_for_recovery();
+        }
+    }
+
+    fn finish_success(mut self) {
+        if let Some(pending) = self.pending.take() {
+            pending.finish();
+        }
+    }
+
+    fn terminalize_failure(mut self, error: SatelleError) -> SatelleError {
+        let expected_phase = match self.phase {
+            ProviderSecretPostT0Phase::Planned => None,
+            ProviderSecretPostT0Phase::Staged => {
+                Some(storage::ProviderSecretProvisioningPhase::Staged)
+            }
+            ProviderSecretPostT0Phase::Validated => {
+                Some(storage::ProviderSecretProvisioningPhase::Validated)
+            }
+            ProviderSecretPostT0Phase::PublishIntent => {
+                Some(storage::ProviderSecretProvisioningPhase::PublishIntent)
+            }
+            ProviderSecretPostT0Phase::Committed => {
+                self.retain_for_recovery();
+                return SatelleError::state_conflict();
+            }
+        };
+        if let Some(expected_phase) = expected_phase
+            && self
+                .runtime
+                .mark_provider_secret_provisioning_rollback_pending(
+                    &self.operation_id,
+                    expected_phase,
+                )
+                .is_err()
+        {
+            self.retain_for_recovery();
+            return SatelleError::state_conflict();
+        }
+
+        // Before publication, rollback means deleting only verified sibling
+        // artifacts. Once publication may have started, restore the prior
+        // destination or remove the verified new candidate. An overwrite race
+        // is the exception: the newly occupied destination is not ours.
+        let rollback = match self.phase {
+            ProviderSecretPostT0Phase::Planned
+            | ProviderSecretPostT0Phase::Staged
+            | ProviderSecretPostT0Phase::Validated => self.cleanup_staging(),
+            ProviderSecretPostT0Phase::PublishIntent
+                if self.preserve_raced_destination || !self.publish_may_have_mutated =>
+            {
+                self.cleanup_staging()
+            }
+            ProviderSecretPostT0Phase::PublishIntent => self.rollback_publish(),
+            ProviderSecretPostT0Phase::Committed => unreachable!("handled above"),
+        };
+        if rollback.is_err() {
+            self.retain_for_recovery();
+            return SatelleError::state_conflict();
+        }
+
+        if let Some(pending) = self.pending.take() {
+            pending.finish();
+        }
+        self.runtime
+            .finish_provider_secret_provisioning_failure(&self.operation_id, error)
+            .unwrap_or_else(|_| SatelleError::state_conflict())
+    }
+}
+
 fn provider_secret_comparison(
     runtime: &RuntimeHandle,
     domain: &'static str,
@@ -1833,288 +2048,208 @@ impl HostService {
             ) => return Err(error),
         };
         let operation_id = journal.operation_id().to_string();
-        let owned_probe = self
-            .runtime
-            .start_owned_provider_probe(&provider_probe_ref, &owner)?;
+        let mut lifecycle = ProviderSecretPostT0Guard::new(
+            &self.runtime,
+            operation_id,
+            paths,
+            candidate_comparison,
+        );
+        let workflow =
+            (|| -> Result<ProviderSecretProvisioningResult, ProviderSecretPostT0Failure> {
+                let owned_probe = self
+                    .runtime
+                    .start_owned_provider_probe(&provider_probe_ref, &owner)?;
 
-        // The preview was advisory. T0 ownership precedes this authoritative
-        // no-follow inspection so a preview-to-confirmation race cannot decide
-        // overwrite behavior.
-        let destination_existed = satelle_core::owner_only_secret_destination_exists(&destination)
-            .map_err(|_| provider_secret_file_error())?;
-        if destination_existed && !overwrite_authorized {
-            let error = provider_secret_overwrite_error();
-            drop(owned_probe);
-            return Err(self
-                .runtime
-                .finish_provider_secret_provisioning_failure(&operation_id, error)?);
-        }
-        let prior_comparison = if destination_existed {
-            let prior = satelle_core::read_owner_only_secret_file(&destination)
-                .map(provider_auth::ResolvedProviderSecret::from_provisioning)
-                .map_err(|_| provider_secret_file_error())?;
-            Some(provider_secret_comparison(
-                &self.runtime,
-                storage::PROVIDER_SECRET_PRIOR_HMAC_DOMAIN,
-                &prior,
-            )?)
-        } else {
-            None
-        };
-        candidate_secret
-            .expose_to_provider(|value| {
-                satelle_core::stage_owner_only_secret_file(
-                    &paths,
-                    value,
-                    candidate_comparison.key.as_bytes(),
-                    &candidate_comparison.digest,
-                )
-            })
-            .map_err(|_| provider_secret_file_error())?;
-        self.runtime.record_staged_provider_secret(
-            &operation_id,
-            destination_existed,
-            destination_existed.then_some(paths.backup()),
-            prior_comparison
-                .as_ref()
-                .map(|comparison| comparison.digest_hex.as_str()),
-        )?;
-
-        let pending = match self.runtime.validate_staged_provider_secret(
-            host,
-            &intent,
-            candidate_secret,
-            owned_probe,
-        ) {
-            Ok(pending) => pending,
-            Err(error) => {
+                // The preview was advisory. T0 ownership precedes this
+                // authoritative no-follow inspection so a
+                // preview-to-confirmation race cannot decide overwrite behavior.
+                let destination_existed =
+                    satelle_core::owner_only_secret_destination_exists(&destination)
+                        .map_err(|_| provider_secret_file_error())?;
+                if destination_existed && !overwrite_authorized {
+                    return Err(ProviderSecretPostT0Failure::Ordinary(
+                        provider_secret_overwrite_error(),
+                    ));
+                }
+                let prior_comparison = if destination_existed {
+                    let prior = satelle_core::read_owner_only_secret_file(&destination)
+                        .map(provider_auth::ResolvedProviderSecret::from_provisioning)
+                        .map_err(|_| provider_secret_file_error())?;
+                    Some(provider_secret_comparison(
+                        &self.runtime,
+                        storage::PROVIDER_SECRET_PRIOR_HMAC_DOMAIN,
+                        &prior,
+                    )?)
+                } else {
+                    None
+                };
+                lifecycle.record_destination(destination_existed, prior_comparison);
+                candidate_secret
+                    .expose_to_provider(|value| {
+                        satelle_core::stage_owner_only_secret_file(
+                            &lifecycle.paths,
+                            value,
+                            lifecycle.candidate.key.as_bytes(),
+                            &lifecycle.candidate.digest,
+                        )
+                    })
+                    .map_err(|_| provider_secret_file_error())?;
                 self.runtime
-                    .mark_provider_secret_provisioning_rollback_pending(
-                        &operation_id,
+                    .record_staged_provider_secret(
+                        &lifecycle.operation_id,
+                        destination_existed,
+                        destination_existed.then_some(lifecycle.paths.backup()),
+                        lifecycle
+                            .prior
+                            .as_ref()
+                            .map(|comparison| comparison.digest_hex.as_str()),
+                    )
+                    .map_err(ProviderSecretPostT0Failure::RecoveryRequired)?;
+                lifecycle.mark_staged();
+
+                let pending = match self.runtime.validate_staged_provider_secret(
+                    host,
+                    &intent,
+                    candidate_secret,
+                    owned_probe,
+                ) {
+                    Ok(pending) => pending,
+                    Err(runtime::ProviderSecretValidationFailure::RecoveryRequired(error)) => {
+                        self.runtime
+                            .mark_provider_secret_provisioning_rollback_pending(
+                                &lifecycle.operation_id,
+                                storage::ProviderSecretProvisioningPhase::Staged,
+                            )
+                            .map_err(ProviderSecretPostT0Failure::RecoveryRequired)?;
+                        return Err(ProviderSecretPostT0Failure::UnknownProviderOutcome(error));
+                    }
+                    Err(runtime::ProviderSecretValidationFailure::Terminal(error)) => {
+                        return Err(ProviderSecretPostT0Failure::Ordinary(error));
+                    }
+                };
+                lifecycle.set_pending(pending);
+                self.runtime
+                    .transition_provider_secret_provisioning(
+                        &lifecycle.operation_id,
                         storage::ProviderSecretProvisioningPhase::Staged,
-                    )?;
-                if RuntimeHandle::provider_probe_recovery_required(&error) {
-                    return Err(error);
-                }
-                if satelle_core::cleanup_owner_only_secret_file(
-                    &paths,
-                    Some((
-                        candidate_comparison.key.as_bytes(),
-                        &candidate_comparison.digest,
-                    )),
-                    prior_comparison
-                        .as_ref()
-                        .map(|prior| (prior.key.as_bytes(), &prior.digest)),
-                )
-                .is_err()
-                {
-                    pending.retain_for_recovery();
-                    return Err(SatelleError::state_conflict());
-                }
-                return Err(self
-                    .runtime
-                    .finish_provider_secret_provisioning_failure(&operation_id, error)?);
-            }
-        };
-        self.runtime.transition_provider_secret_provisioning(
-            &operation_id,
-            storage::ProviderSecretProvisioningPhase::Staged,
-            storage::ProviderSecretProvisioningPhase::Validated,
-        )?;
-        self.runtime.transition_provider_secret_provisioning(
-            &operation_id,
-            storage::ProviderSecretProvisioningPhase::Validated,
-            storage::ProviderSecretProvisioningPhase::PublishIntent,
-        )?;
-        let overwritten = match satelle_core::publish_owner_only_secret_file(
-            &paths,
-            destination_existed,
-            overwrite_authorized,
-            candidate_comparison.key.as_bytes(),
-            &candidate_comparison.digest,
-            prior_comparison
-                .as_ref()
-                .map(|comparison| comparison.key.as_bytes()),
-            prior_comparison
-                .as_ref()
-                .map(|comparison| &comparison.digest),
-        ) {
-            Ok(overwritten) => overwritten,
-            Err(satelle_core::SecureFileError::OverwriteRequired) => {
+                        storage::ProviderSecretProvisioningPhase::Validated,
+                    )
+                    .map_err(ProviderSecretPostT0Failure::RecoveryRequired)?;
+                lifecycle.mark_validated();
                 self.runtime
-                    .mark_provider_secret_provisioning_rollback_pending(
-                        &operation_id,
+                    .transition_provider_secret_provisioning(
+                        &lifecycle.operation_id,
+                        storage::ProviderSecretProvisioningPhase::Validated,
                         storage::ProviderSecretProvisioningPhase::PublishIntent,
-                    )?;
-                if satelle_core::cleanup_owner_only_secret_file(
-                    &paths,
-                    Some((
-                        candidate_comparison.key.as_bytes(),
-                        &candidate_comparison.digest,
-                    )),
-                    prior_comparison
-                        .as_ref()
-                        .map(|prior| (prior.key.as_bytes(), &prior.digest)),
-                )
-                .is_err()
-                {
-                    pending.retain_for_recovery();
-                    return Err(SatelleError::state_conflict());
-                }
-                pending.finish();
-                let error = provider_secret_overwrite_error();
-                return Err(self
-                    .runtime
-                    .finish_provider_secret_provisioning_failure(&operation_id, error)?);
-            }
-            Err(_) => {
-                self.runtime
-                    .mark_provider_secret_provisioning_rollback_pending(
-                        &operation_id,
-                        storage::ProviderSecretProvisioningPhase::PublishIntent,
-                    )?;
-                if satelle_core::rollback_owner_only_secret_file(
-                    &paths,
+                    )
+                    .map_err(ProviderSecretPostT0Failure::RecoveryRequired)?;
+                lifecycle.mark_publish_intent();
+                let overwritten = match satelle_core::publish_owner_only_secret_file(
+                    &lifecycle.paths,
                     destination_existed,
-                    candidate_comparison.key.as_bytes(),
-                    &candidate_comparison.digest,
-                    prior_comparison
+                    overwrite_authorized,
+                    lifecycle.candidate.key.as_bytes(),
+                    &lifecycle.candidate.digest,
+                    lifecycle
+                        .prior
                         .as_ref()
                         .map(|comparison| comparison.key.as_bytes()),
-                    prior_comparison
+                    lifecycle
+                        .prior
                         .as_ref()
                         .map(|comparison| &comparison.digest),
-                )
-                .is_err()
-                {
-                    pending.retain_for_recovery();
-                    return Err(SatelleError::state_conflict());
-                }
-                pending.finish();
-                let error = provider_secret_file_error();
-                return Err(self
-                    .runtime
-                    .finish_provider_secret_provisioning_failure(&operation_id, error)?);
-            }
-        };
+                ) {
+                    Ok(overwritten) => overwritten,
+                    Err(satelle_core::SecureFileError::OverwriteRequired) => {
+                        lifecycle.preserve_raced_destination();
+                        return Err(ProviderSecretPostT0Failure::Ordinary(
+                            provider_secret_overwrite_error(),
+                        ));
+                    }
+                    Err(_) => {
+                        return Err(ProviderSecretPostT0Failure::Ordinary(
+                            provider_secret_file_error(),
+                        ));
+                    }
+                };
+                lifecycle.record_published(overwritten);
 
-        // Re-open both durable artifacts through the owner-only reader
-        // immediately before T3. The journal stores only keyed comparisons,
-        // so neither this check nor recovery needs a raw reusable hash.
-        let published_artifacts_valid = (|| {
-            let published = satelle_core::read_owner_only_secret_file(&destination)
-                .map(provider_auth::ResolvedProviderSecret::from_provisioning)
-                .map_err(|_| provider_secret_file_error())?;
-            let published_comparison = provider_secret_comparison(
-                &self.runtime,
-                storage::PROVIDER_SECRET_CANDIDATE_HMAC_DOMAIN,
-                &published,
-            )?;
-            if published_comparison.digest_hex != candidate_comparison.digest_hex {
-                return Err(SatelleError::state_conflict());
-            }
-            if overwritten {
-                let backup = satelle_core::read_owner_only_secret_file(paths.backup())
+                // Re-open both durable artifacts through the owner-only reader
+                // immediately before T3. The journal stores only keyed
+                // comparisons, so neither this check nor recovery needs a raw
+                // reusable hash.
+                let published = satelle_core::read_owner_only_secret_file(&destination)
                     .map(provider_auth::ResolvedProviderSecret::from_provisioning)
                     .map_err(|_| provider_secret_file_error())?;
-                let backup_comparison = provider_secret_comparison(
+                let published_comparison = provider_secret_comparison(
                     &self.runtime,
-                    storage::PROVIDER_SECRET_PRIOR_HMAC_DOMAIN,
-                    &backup,
+                    storage::PROVIDER_SECRET_CANDIDATE_HMAC_DOMAIN,
+                    &published,
                 )?;
-                if prior_comparison
-                    .as_ref()
-                    .map(|prior| prior.digest_hex.as_str())
-                    != Some(backup_comparison.digest_hex.as_str())
-                {
-                    return Err(SatelleError::state_conflict());
+                if published_comparison.digest_hex != lifecycle.candidate.digest_hex {
+                    return Err(ProviderSecretPostT0Failure::Ordinary(
+                        SatelleError::state_conflict(),
+                    ));
                 }
+                if overwritten {
+                    let backup =
+                        satelle_core::read_owner_only_secret_file(lifecycle.paths.backup())
+                            .map(provider_auth::ResolvedProviderSecret::from_provisioning)
+                            .map_err(|_| provider_secret_file_error())?;
+                    let backup_comparison = provider_secret_comparison(
+                        &self.runtime,
+                        storage::PROVIDER_SECRET_PRIOR_HMAC_DOMAIN,
+                        &backup,
+                    )?;
+                    if lifecycle
+                        .prior
+                        .as_ref()
+                        .map(|prior| prior.digest_hex.as_str())
+                        != Some(backup_comparison.digest_hex.as_str())
+                    {
+                        return Err(ProviderSecretPostT0Failure::Ordinary(
+                            SatelleError::state_conflict(),
+                        ));
+                    }
+                }
+
+                let readiness = lifecycle.readiness()?;
+                self.runtime
+                    .commit_provider_secret_provisioning(
+                        &lifecycle.operation_id,
+                        &binding,
+                        &key,
+                        readiness.evidence(),
+                        readiness.provider_smoke_evidence(),
+                    )
+                    .map_err(ProviderSecretPostT0Failure::RecoveryRequired)?;
+                lifecycle.mark_committed();
+                lifecycle
+                    .cleanup_staging()
+                    .map_err(ProviderSecretPostT0Failure::RecoveryRequired)?;
+                let result = self
+                    .runtime
+                    .finish_provider_secret_provisioning_success(&lifecycle.operation_id)
+                    .map_err(ProviderSecretPostT0Failure::RecoveryRequired)?;
+                Ok(result)
+            })();
+
+        match workflow {
+            Ok(result) => {
+                lifecycle.finish_success();
+                Ok(result)
             }
-            Ok(())
-        })();
-        if let Err(error) = published_artifacts_valid {
-            self.runtime
-                .mark_provider_secret_provisioning_rollback_pending(
-                    &operation_id,
-                    storage::ProviderSecretProvisioningPhase::PublishIntent,
-                )?;
-            if satelle_core::rollback_owner_only_secret_file(
-                &paths,
-                overwritten,
-                candidate_comparison.key.as_bytes(),
-                &candidate_comparison.digest,
-                prior_comparison
-                    .as_ref()
-                    .map(|comparison| comparison.key.as_bytes()),
-                prior_comparison
-                    .as_ref()
-                    .map(|comparison| &comparison.digest),
-            )
-            .is_err()
-            {
-                pending.retain_for_recovery();
-                return Err(error);
+            Err(ProviderSecretPostT0Failure::Ordinary(error)) => {
+                Err(lifecycle.terminalize_failure(error))
             }
-            pending.finish();
-            return Err(self
-                .runtime
-                .finish_provider_secret_provisioning_failure(&operation_id, error)?);
-        }
-        let readiness = pending.readiness()?;
-        if let Err(error) = self.runtime.commit_provider_secret_provisioning(
-            &operation_id,
-            &binding,
-            &key,
-            readiness.evidence(),
-            readiness.provider_smoke_evidence(),
-        ) {
-            self.runtime
-                .mark_provider_secret_provisioning_rollback_pending(
-                    &operation_id,
-                    storage::ProviderSecretProvisioningPhase::PublishIntent,
-                )?;
-            if satelle_core::rollback_owner_only_secret_file(
-                &paths,
-                overwritten,
-                candidate_comparison.key.as_bytes(),
-                &candidate_comparison.digest,
-                prior_comparison
-                    .as_ref()
-                    .map(|comparison| comparison.key.as_bytes()),
-                prior_comparison
-                    .as_ref()
-                    .map(|comparison| &comparison.digest),
-            )
-            .is_err()
-            {
-                pending.retain_for_recovery();
-                return Err(error);
+            Err(
+                ProviderSecretPostT0Failure::RecoveryRequired(error)
+                | ProviderSecretPostT0Failure::UnknownProviderOutcome(error),
+            ) => {
+                lifecycle.retain_for_recovery();
+                Err(error)
             }
-            pending.finish();
-            return Err(self
-                .runtime
-                .finish_provider_secret_provisioning_failure(&operation_id, error)?);
         }
-        if satelle_core::cleanup_owner_only_secret_file(
-            &paths,
-            Some((
-                candidate_comparison.key.as_bytes(),
-                &candidate_comparison.digest,
-            )),
-            prior_comparison
-                .as_ref()
-                .map(|prior| (prior.key.as_bytes(), &prior.digest)),
-        )
-        .is_err()
-        {
-            pending.retain_for_recovery();
-            return Err(SatelleError::state_conflict());
-        }
-        let result = self
-            .runtime
-            .finish_provider_secret_provisioning_success(&operation_id)?;
-        pending.finish();
-        Ok(result)
     }
 
     pub(crate) fn prepare_provider_binding_authorization(

@@ -99,6 +99,11 @@ pub(crate) struct PendingProviderReadiness {
     heartbeat: Option<LeaseHeartbeatGuard>,
 }
 
+pub(crate) enum ProviderSecretValidationFailure {
+    Terminal(SatelleError),
+    RecoveryRequired(SatelleError),
+}
+
 impl PendingProviderReadiness {
     pub(crate) fn readiness(&self) -> Result<&AdapterReadiness, SatelleError> {
         self.readiness
@@ -1176,6 +1181,7 @@ impl RuntimeEngine {
             None,
             None,
             false,
+            None,
         )?
         .committed()
     }
@@ -1190,6 +1196,7 @@ impl RuntimeEngine {
         provider_secret: Option<crate::provider_auth::ResolvedProviderSecret>,
         owned_provider_probe: Option<OwnedProviderProbe>,
         defer_success: bool,
+        deferred_recovery_required: Option<&std::cell::Cell<bool>>,
     ) -> Result<ProviderPreflightSuccess, SatelleError> {
         if cancellation.is_requested() {
             cancellation.finish(AdmissionCancellationState::Cancelled);
@@ -1357,15 +1364,18 @@ impl RuntimeEngine {
 
         match preflight {
             AdapterPreflight::Cancelled(observation) => {
-                if defer_success {
-                    provider_heartbeat.take();
-                    return Err(adapter::admission_cancelled_error(observation));
-                }
                 let terminal = matches!(
                     observation,
                     satelle_core::session::StopObservation::CancellationConfirmed
                         | satelle_core::session::StopObservation::UpstreamInactiveConfirmed
                 );
+                if defer_success {
+                    if let Some(recovery_required) = deferred_recovery_required {
+                        recovery_required.set(!terminal || persistence_failed);
+                    }
+                    provider_heartbeat.take();
+                    return Err(adapter::admission_cancelled_error(observation));
+                }
                 if let Some(provider_probe_ref) = provider_probe_ref.as_deref() {
                     if terminal {
                         self.lock_storage()?
@@ -1422,6 +1432,9 @@ impl RuntimeEngine {
                 dispatch_possible,
             } => {
                 if defer_success {
+                    if let Some(recovery_required) = deferred_recovery_required {
+                        recovery_required.set(dispatch_possible || persistence_failed);
+                    }
                     provider_heartbeat.take();
                     return Err(error);
                 }
@@ -1452,10 +1465,6 @@ impl RuntimeEngine {
                 failure,
                 error,
             } => {
-                if defer_success {
-                    provider_heartbeat.take();
-                    return Err(error);
-                }
                 let terminal = readiness_probe_terminal_with_dispatch(
                     &error,
                     persistence_failed,
@@ -1463,6 +1472,13 @@ impl RuntimeEngine {
                     Some(ErrorCode::ProviderSmokeTestTimeout),
                     probe_dispatch_possible(&error),
                 );
+                if defer_success {
+                    if let Some(recovery_required) = deferred_recovery_required {
+                        recovery_required.set(terminal == ReadinessProbeTerminal::OutcomeUnknown);
+                    }
+                    provider_heartbeat.take();
+                    return Err(error);
+                }
                 if let Some(provider_probe_ref) = provider_probe_ref.as_deref() {
                     self.lock_storage()?
                         .finish_provider_probe_failure(
@@ -1486,11 +1502,14 @@ impl RuntimeEngine {
                 Err(error)
             }
             AdapterPreflight::UncachedFailure(error) => {
+                let recovery_pending = probe_dispatch_possible(&error) || persistence_failed;
                 if defer_success {
+                    if let Some(recovery_required) = deferred_recovery_required {
+                        recovery_required.set(recovery_pending);
+                    }
                     provider_heartbeat.take();
                     return Err(error);
                 }
-                let recovery_pending = probe_dispatch_possible(&error) || persistence_failed;
                 if let Some(provider_probe_ref) = provider_probe_ref.as_deref() {
                     if recovery_pending {
                         self.lock_storage()?
@@ -1518,17 +1537,29 @@ impl RuntimeEngine {
         provider_intent: &ProviderComputerUseIntent,
         provider_secret: crate::provider_auth::ResolvedProviderSecret,
         owned_provider_probe: OwnedProviderProbe,
-    ) -> Result<PendingProviderReadiness, SatelleError> {
-        self.preflight_with_native_mode(
-            host,
-            provider_intent,
-            &AdmissionCancellation::new(),
-            None,
-            Some(provider_secret),
-            Some(owned_provider_probe),
-            true,
-        )?
-        .deferred()
+    ) -> Result<PendingProviderReadiness, ProviderSecretValidationFailure> {
+        let recovery_required = std::cell::Cell::new(false);
+        let success = self
+            .preflight_with_native_mode(
+                host,
+                provider_intent,
+                &AdmissionCancellation::new(),
+                None,
+                Some(provider_secret),
+                Some(owned_provider_probe),
+                true,
+                Some(&recovery_required),
+            )
+            .map_err(|error| {
+                if recovery_required.get() {
+                    ProviderSecretValidationFailure::RecoveryRequired(error)
+                } else {
+                    ProviderSecretValidationFailure::Terminal(error)
+                }
+            })?;
+        success
+            .deferred()
+            .map_err(ProviderSecretValidationFailure::RecoveryRequired)
     }
 
     #[cfg(test)]
@@ -2174,10 +2205,6 @@ impl RuntimeHandle {
         fingerprinter
             .fingerprint(domain, Some(secret))
             .ok_or_else(|| integrity_error("the provider secret HMAC key is uninitialized"))
-    }
-
-    pub(crate) fn provider_probe_recovery_required(error: &SatelleError) -> bool {
-        probe_dispatch_possible(error)
     }
 
     pub(crate) fn begin_setup_run(
@@ -3045,14 +3072,16 @@ impl RuntimeHandle {
         provider_intent: &ProviderComputerUseIntent,
         provider_secret: crate::provider_auth::ResolvedProviderSecret,
         owned_provider_probe: OwnedProviderProbe,
-    ) -> Result<PendingProviderReadiness, SatelleError> {
+    ) -> Result<PendingProviderReadiness, ProviderSecretValidationFailure> {
         let _activity = self.activity.begin();
-        self.engine()?.provider_secret_provisioning_probe(
-            host,
-            provider_intent,
-            provider_secret,
-            owned_provider_probe,
-        )
+        self.engine()
+            .map_err(ProviderSecretValidationFailure::Terminal)?
+            .provider_secret_provisioning_probe(
+                host,
+                provider_intent,
+                provider_secret,
+                owned_provider_probe,
+            )
     }
 
     pub(crate) fn start_owned_provider_probe(
