@@ -1,9 +1,10 @@
 use super::adapter::{BlockedComputerUseAdapter, NativeProbeResult, ReadinessProbeDriver};
 use super::{
     AdapterPreflight, AdapterReadiness, ComputerUseAdapter, ExecuteRequest, ExecuteResult,
-    LogPageQuery, ProviderComputerUseIntent, ProviderSmokeFailureEvidence, ReadinessCacheKey,
-    ReadinessEvidence, RecoveryObservation, RequestIdentity, RunCommand, RuntimeHandle,
-    RuntimeProviderPolicy, RuntimeStartupState, SteerCommand, StopCommand,
+    LogPageQuery, ProviderBindingResolution, ProviderComputerUseIntent,
+    ProviderSmokeFailureEvidence, ReadinessCacheKey, ReadinessEvidence, RecoveryObservation,
+    RequestIdentity, RunCommand, RuntimeHandle, RuntimeProviderPolicy, RuntimeStartupState,
+    SteerCommand, StopCommand,
 };
 use crate::storage::{LeaseOwner, PrivateUpstreamRef, ProbeRecoverySubject};
 use crate::test_runtime::FakeComputerUseAdapter;

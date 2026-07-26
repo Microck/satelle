@@ -201,6 +201,7 @@ fn service_with_provider_descriptor<A: ComputerUseAdapter>(
                 model_provider: "openai".to_string(),
                 endpoint: None,
                 auth_source,
+                allow_project_selection: false,
             },
         )]),
     );

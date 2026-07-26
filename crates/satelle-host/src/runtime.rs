@@ -887,7 +887,7 @@ impl RuntimeEngine {
             cancellation.finish(AdmissionCancellationState::Cancelled);
             return Err(SatelleError::interrupted_attached_command());
         }
-        let provider_intent = self.authorize_provider_intent(provider_intent)?;
+        let provider_intent = self.authorize_provider_intent(host, provider_intent)?;
         let cache_key = self.adapter.readiness_cache_key(host, &provider_intent)?;
         let provider_smoke_enabled = cache_key.as_ref().is_some_and(|key| {
             key.execution_policy()
@@ -1144,7 +1144,7 @@ impl RuntimeEngine {
         host: &str,
         provider_intent: &ProviderComputerUseIntent,
     ) -> Result<Option<ProviderSmokeResult>, SatelleError> {
-        let provider_intent = self.authorize_provider_intent(provider_intent)?;
+        let provider_intent = self.authorize_provider_intent(host, provider_intent)?;
         let Some(key) = self.adapter.readiness_cache_key(host, &provider_intent)? else {
             return Ok(None);
         };
@@ -1155,6 +1155,7 @@ impl RuntimeEngine {
 
     fn authorize_provider_intent(
         &self,
+        host: &str,
         provider_intent: &ProviderComputerUseIntent,
     ) -> Result<ProviderComputerUseIntent, SatelleError> {
         if let Some(binding) = provider_intent.resolved_provider_binding() {
@@ -1166,7 +1167,8 @@ impl RuntimeEngine {
                 .clone()
                 .with_resolved_provider_binding(effective_binding));
         }
-        let Some(resolution) = self.resolve_requested_provider_binding(provider_intent)? else {
+        let Some(resolution) = self.resolve_requested_provider_binding(host, provider_intent)?
+        else {
             return Ok(provider_intent.clone());
         };
         let binding = resolution.into_ready()?;
