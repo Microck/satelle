@@ -1376,9 +1376,6 @@ fn validate_migration_backup_at_with_hook(
     let _ = state_root;
     let parsed_name = parse_migration_backup_file_name(backup_file_name)
         .ok_or_else(|| StorageError::new(StorageErrorKind::InvalidInput))?;
-    let manifest_read = read_backup_manifest(state_directory, physical_manifest_file_name)?;
-    validate_manifest_contract(backup_file_name, parsed_name, &manifest_read.manifest)?;
-
     let backup_file = open_private_leaf(
         state_directory,
         physical_backup_file_name,
@@ -1387,6 +1384,9 @@ fn validate_migration_backup_at_with_hook(
     )?
     .ok_or_else(|| StorageError::new(StorageErrorKind::InvalidInput))?;
     let backup_identity = leaf_identity(&backup_file, StorageErrorKind::UnsafeStatePath)?;
+    let manifest_read = read_backup_manifest(state_directory, physical_manifest_file_name)?;
+    validate_manifest_contract(backup_file_name, parsed_name, &manifest_read.manifest)?;
+
     let source_database_digest = digest_file(&backup_file, StorageErrorKind::IntegrityCheckFailed)?;
     if source_database_digest != manifest_read.manifest.source_database_digest {
         return Err(StorageError::new(StorageErrorKind::IntegrityCheckFailed));
