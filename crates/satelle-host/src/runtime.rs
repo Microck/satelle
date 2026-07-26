@@ -2542,6 +2542,37 @@ impl RuntimeHandle {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn new_with_provider_policy_and_readiness_probe_driver<A, D>(
+        state_root: Result<PathBuf, SatelleError>,
+        adapter: A,
+        readiness_probe_driver: D,
+        provider_policy: RuntimeProviderPolicy,
+    ) -> Self
+    where
+        A: ComputerUseAdapter,
+        D: ReadinessProbeDriver,
+    {
+        let operator_log_root = state_root
+            .as_ref()
+            .map(|root| root.join("logs"))
+            .map_err(Clone::clone);
+        Self {
+            adapter: Arc::new(adapter),
+            readiness_probe_driver: Some(Arc::new(readiness_probe_driver)),
+            activity: Arc::new(DaemonActivity::default()),
+            lazy: Arc::new(Mutex::new(LazyRuntime {
+                state_root,
+                operator_log_root,
+                engine: None,
+                provider_policy,
+                provider_smoke_fingerprinter: Some(
+                    crate::provider_auth::ProviderSmokeCredentialFingerprinter::default(),
+                ),
+            })),
+        }
+    }
+
     pub(crate) fn new_production(
         state_root: Result<PathBuf, SatelleError>,
         operator_log_root: Result<PathBuf, SatelleError>,

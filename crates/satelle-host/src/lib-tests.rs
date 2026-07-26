@@ -150,6 +150,48 @@ impl ComputerUseAdapter for TamperingProviderProvisioningAdapter {
     }
 }
 
+#[cfg(unix)]
+impl crate::runtime::ReadinessProbeDriver for TamperingProviderProvisioningAdapter {
+    fn run_native_probe(
+        &self,
+        key: &ReadinessCacheKey,
+        _cancellation: &AdmissionCancellation,
+        _persist_thread_ref: &mut dyn FnMut(&str) -> Result<(), ()>,
+        _persist_turn_ref: &mut dyn FnMut(&str) -> Result<(), ()>,
+    ) -> crate::runtime::NativeProbeResult {
+        let observed_at = time::OffsetDateTime::now_utc();
+        crate::runtime::NativeProbeResult::Passed(
+            key.evidence(
+                format!("native-probe-{}", satelle_core::SessionId::new()),
+                observed_at,
+                observed_at + time::Duration::minutes(5),
+            )
+            .expect("validated readiness key produces native evidence"),
+        )
+    }
+
+    fn preflight_terminal_with_provider_probe(
+        &self,
+        host: &str,
+        cached: Option<ReadinessEvidence>,
+        cached_provider: Option<ProviderSmokeResult>,
+        provider_intent: &ProviderComputerUseIntent,
+        _provider_secret: Option<crate::provider_auth::ResolvedProviderSecret>,
+        _cancellation: &AdmissionCancellation,
+        _persist_thread_ref: &mut dyn FnMut(&str) -> Result<(), ()>,
+        _persist_turn_ref: &mut dyn FnMut(&str) -> Result<(), ()>,
+    ) -> AdapterPreflight {
+        self.preflight_terminal(host, cached, cached_provider, provider_intent)
+    }
+
+    fn observe_readiness_probe(
+        &self,
+        _subject: &crate::storage::ProbeRecoverySubject,
+    ) -> RecoveryObservation {
+        RecoveryObservation::Completed
+    }
+}
+
 #[derive(Clone, Copy)]
 #[cfg(unix)]
 enum ProviderProvisioningProbeOutcome {
@@ -521,11 +563,9 @@ fn provider_intent_with_missing_descriptor() -> ProviderComputerUseIntent {
     )
 }
 
-fn service_with_provider_descriptor<A: ComputerUseAdapter>(
-    state_root: PathBuf,
-    adapter: A,
+fn provider_descriptor_config(
     auth_source: Option<String>,
-) -> HostService {
+) -> satelle_core::HostConfig {
     let mut config = satelle_core::SatelleConfig::defaults().hosts[LOCAL_DEMO_HOST].clone();
     config.provider_bindings.insert(
         "openai".to_string(),
@@ -540,9 +580,45 @@ fn service_with_provider_descriptor<A: ComputerUseAdapter>(
             },
         )]),
     );
+    config
+}
+
+fn service_with_provider_descriptor<A: ComputerUseAdapter>(
+    state_root: PathBuf,
+    adapter: A,
+    auth_source: Option<String>,
+) -> HostService {
+    let config = provider_descriptor_config(auth_source);
     HostService {
         runtime: RuntimeHandle::new_with_provider_policy(
             Ok(state_root),
+            adapter,
+            crate::runtime::RuntimeProviderPolicy::from_host_config(&config),
+        ),
+        operation_capacity: Arc::new(OperationCapacity::default()),
+        turn_execution_timeout: crate::configured_turn_execution_timeout(&config),
+        mode: HostMode::TestFake {
+            image_attachments: true,
+        },
+        bootstrap_auth: None,
+        bootstrap_maintenance: Arc::new(Mutex::new(None)),
+    }
+}
+
+#[cfg(unix)]
+fn service_with_provider_descriptor_and_readiness_probe<A>(
+    state_root: PathBuf,
+    adapter: A,
+    auth_source: Option<String>,
+) -> HostService
+where
+    A: ComputerUseAdapter + crate::runtime::ReadinessProbeDriver + Clone,
+{
+    let config = provider_descriptor_config(auth_source);
+    HostService {
+        runtime: RuntimeHandle::new_with_provider_policy_and_readiness_probe_driver(
+            Ok(state_root),
+            adapter.clone(),
             adapter,
             crate::runtime::RuntimeProviderPolicy::from_host_config(&config),
         ),
@@ -672,8 +748,11 @@ fn existing_provider_secret_requires_typed_overwrite_and_preserves_prior_value()
     std::fs::write(&destination, prior_secret).expect("write prior provider secret");
     std::fs::set_permissions(&destination, std::fs::Permissions::from_mode(0o600))
         .expect("make prior provider secret owner-only");
-    let service =
-        service_with_provider_descriptor(state.path().to_path_buf(), DoctorRefreshAdapter, None);
+    let service = service_with_provider_descriptor_and_readiness_probe(
+        state.path().to_path_buf(),
+        DoctorRefreshAdapter,
+        None,
+    );
     service.initialize_daemon().expect("initialize Host daemon");
     let identity = RequestIdentity::new("provider-secret-overwrite-required", "c".repeat(64));
 
@@ -810,7 +889,7 @@ fn failed_staged_rollback_retains_pending_journal_and_active_lease() {
     let identity = RequestIdentity::new("provider-secret-rollback-pending", "b".repeat(64));
     let paths = satelle_core::OwnerOnlySecretFilePaths::new(&destination, identity.key())
         .expect("deterministic provider secret paths");
-    let service = service_with_provider_descriptor(
+    let service = service_with_provider_descriptor_and_readiness_probe(
         state.path().to_path_buf(),
         TamperingProviderProvisioningAdapter {
             staging_path: paths.staging().to_path_buf(),
