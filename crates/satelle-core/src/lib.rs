@@ -1080,9 +1080,7 @@ mod provider_binding_config_tests {
         );
         assert!(authorization_json.get("source").is_none());
 
-        let denied_authorization = authorization
-            .clone()
-            .with_allow_project_selection(false);
+        let denied_authorization = authorization.clone().with_allow_project_selection(false);
         let resolved = ResolvedProviderBinding::from_authorization(
             authorization,
             ProviderBindingSource::HostOwned,
@@ -1988,16 +1986,14 @@ fn load_config_with_profile_selection(
             default_host_requires_project_permission =
                 selected.source == profiles::ProfileSelectionSource::ProjectConfig;
         }
-        if let Some(from_project) = profile.alias_from_project(
-            profiles::ProfileField::ModelAlias,
-            selected.source,
-        ) {
+        if let Some(from_project) =
+            profile.alias_from_project(profiles::ProfileField::ModelAlias, selected.source)
+        {
             model_alias_from_project = from_project;
         }
-        if let Some(from_project) = profile.alias_from_project(
-            profiles::ProfileField::ProviderAlias,
-            selected.source,
-        ) {
+        if let Some(from_project) =
+            profile.alias_from_project(profiles::ProfileField::ProviderAlias, selected.source)
+        {
             provider_alias_from_project = from_project;
         }
         profile.apply_to_base(&mut config, selected.source);
@@ -3766,9 +3762,7 @@ impl ErrorCode {
             Self::ProjectMutationConsentNotAllowed => "project-mutation-consent-not-allowed",
             Self::ProjectHostBindingNotAllowed => "project-host-binding-not-allowed",
             Self::ProjectHostSelectionNotAllowed => "project-host-selection-not-allowed",
-            Self::ProjectProviderSelectionNotAllowed => {
-                "project-provider-selection-not-allowed"
-            }
+            Self::ProjectProviderSelectionNotAllowed => "project-provider-selection-not-allowed",
             Self::ProjectSecretSourceNotAllowed => "project-secret-source-not-allowed",
             Self::ProjectCredentialHelperNotAllowed => "project-credential-helper-not-allowed",
             Self::UnsupportedSecretSourceKind => "unsupported-secret-source-kind",

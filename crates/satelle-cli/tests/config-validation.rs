@@ -758,10 +758,7 @@ provider_alias = "openai"
         .clone();
     let error = parse_json(&output.stderr);
 
-    assert_eq!(
-        error["code"],
-        "project-provider-selection-not-allowed"
-    );
+    assert_eq!(error["code"], "project-provider-selection-not-allowed");
 }
 
 #[cfg(feature = "test-support")]

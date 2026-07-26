@@ -463,9 +463,7 @@ fn require_project_binding_consent(
     provider_intent: &ProviderComputerUseIntent,
     binding: &ResolvedProviderBinding,
 ) -> Result<(), SatelleError> {
-    if provider_intent.requires_project_binding_consent()
-        && !binding.allow_project_selection()
-    {
+    if provider_intent.requires_project_binding_consent() && !binding.allow_project_selection() {
         return Err(SatelleError::project_provider_selection_not_allowed(
             host,
             binding.requested_provider_alias(),
@@ -1203,8 +1201,7 @@ impl RuntimeEngine {
             requested_pair.0,
             requested_pair.1,
             provider_intent.requires_project_binding_consent(),
-        )?
-        {
+        )? {
             return Ok(Some(resolution));
         }
         let binding = self

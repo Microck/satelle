@@ -4159,8 +4159,7 @@ fn resolve_provider_selection(
             "add the exact provider_bindings entry to the selected user-level Host Binding",
         ));
     };
-    if (model_alias_from_project || provider_alias_from_project)
-        && !binding.allow_project_selection
+    if (model_alias_from_project || provider_alias_from_project) && !binding.allow_project_selection
     {
         return Err(failure(
             SatelleError::project_provider_selection_not_allowed(
