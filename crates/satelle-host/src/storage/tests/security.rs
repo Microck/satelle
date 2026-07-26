@@ -232,6 +232,7 @@ fn lifecycle_schema_excludes_raw_content_and_replayable_event_history() {
             "auth_source_json",
             "source",
             "experimental_provider_computer_use",
+            "allow_project_selection",
             "binding_digest",
             "updated_at",
         ],
