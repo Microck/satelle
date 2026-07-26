@@ -81,6 +81,7 @@ fn host_config_with_provider_binding(secret_variable: &str) -> satelle_core::Hos
                 model_provider: "openai".to_string(),
                 endpoint: None,
                 auth_source: Some("host-auth".to_string()),
+                allow_project_selection: false,
             },
         )]),
     )]);
@@ -414,6 +415,103 @@ fn host_config_binding_precedes_colliding_persisted_user_config_without_secret_r
             variable: host_secret_variable,
         })
     );
+}
+
+#[test]
+fn project_selection_requires_exact_host_owned_binding_consent() {
+    let state = crate::TestStateDir::new().expect("temporary state directory should exist");
+    let variable = format!(
+        "SATELLE_PROJECT_HOST_BINDING_SECRET_{}",
+        uuid::Uuid::now_v7().simple()
+    );
+    let mut config = host_config_with_provider_binding(&variable);
+    let project_intent = ProviderComputerUseIntent::new(
+        Some(EffectiveModelRef::new("review").expect("valid model alias")),
+        Some(ProviderBindingRef::new("openai").expect("valid provider alias")),
+        false,
+    )
+    .with_project_selection_provenance(true, true);
+
+    let denied_runtime = production_runtime_with_host_policy(state.path(), &config);
+    let error = denied_runtime
+        .resolve_provider_binding(LOCAL_DEMO_HOST, &project_intent)
+        .expect_err("Host-owned binding must deny project selection by default");
+    assert_eq!(
+        error.code,
+        satelle_core::ErrorCode::ProjectProviderSelectionNotAllowed
+    );
+    drop(denied_runtime);
+
+    config
+        .provider_bindings
+        .get_mut("openai")
+        .and_then(|models| models.get_mut("review"))
+        .expect("exact Host-owned binding exists")
+        .allow_project_selection = true;
+    let allowed_runtime = production_runtime_with_host_policy(state.path(), &config);
+    let ProviderBindingResolution::Ready(binding) = allowed_runtime
+        .resolve_provider_binding(LOCAL_DEMO_HOST, &project_intent)
+        .expect("exact Host-owned consent permits project selection")
+    else {
+        panic!("the authorized Host-owned binding must be ready");
+    };
+    assert!(binding.allow_project_selection());
+    assert_eq!(binding.model(), "host-review-model");
+}
+
+#[test]
+fn project_selection_requires_exact_persisted_binding_consent() {
+    let state = crate::TestStateDir::new().expect("temporary state directory should exist");
+    let runtime = RuntimeHandle::new(
+        Ok(state.path().to_path_buf()),
+        ProviderProbeRecoveryAdapter::new([]),
+    );
+    let authorization = satelle_core::ProviderBindingAuthorization::new(
+        "review",
+        "openai",
+        "persisted-project-model",
+        "openai",
+    )
+    .with_auth_source(satelle_core::ProviderSecretSource::Environment {
+        variable: format!(
+            "SATELLE_PROJECT_PERSISTED_SECRET_{}",
+            uuid::Uuid::now_v7().simple()
+        ),
+    });
+    runtime
+        .authorize_provider_binding(&satelle_core::ResolvedProviderBinding::from_authorization(
+            authorization.clone(),
+            satelle_core::ProviderBindingSource::UserConfig,
+        ))
+        .expect("persist the default-deny binding");
+    let project_intent = ProviderComputerUseIntent::new(
+        Some(EffectiveModelRef::new("review").expect("valid model alias")),
+        Some(ProviderBindingRef::new("openai").expect("valid provider alias")),
+        false,
+    )
+    .with_project_selection_provenance(false, true);
+
+    let error = runtime
+        .resolve_provider_binding(LOCAL_DEMO_HOST, &project_intent)
+        .expect_err("persisted binding must deny project selection by default");
+    assert_eq!(
+        error.code,
+        satelle_core::ErrorCode::ProjectProviderSelectionNotAllowed
+    );
+
+    runtime
+        .authorize_provider_binding(&satelle_core::ResolvedProviderBinding::from_authorization(
+            authorization.with_allow_project_selection(true),
+            satelle_core::ProviderBindingSource::UserConfig,
+        ))
+        .expect("replace the binding with exact project consent");
+    let ProviderBindingResolution::Ready(binding) = runtime
+        .resolve_provider_binding(LOCAL_DEMO_HOST, &project_intent)
+        .expect("exact persisted consent permits project selection")
+    else {
+        panic!("the authorized persisted binding must be ready");
+    };
+    assert!(binding.allow_project_selection());
 }
 
 #[test]

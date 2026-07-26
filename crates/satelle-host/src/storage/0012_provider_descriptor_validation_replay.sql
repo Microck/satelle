@@ -207,6 +207,8 @@ CREATE TABLE authorized_provider_bindings (
     source TEXT NOT NULL CHECK (source = 'user_config'),
     experimental_provider_computer_use INTEGER NOT NULL
         CHECK (experimental_provider_computer_use IN (0, 1)),
+    allow_project_selection INTEGER NOT NULL
+        CHECK (allow_project_selection IN (0, 1)),
     binding_digest TEXT NOT NULL
         CHECK (
             length(binding_digest) = 64

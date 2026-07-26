@@ -1558,6 +1558,8 @@ impl HostService {
         model_alias: &str,
         provider_alias: &str,
         mode: satelle_core::ProviderAuthValidationMode,
+        model_from_project: bool,
+        provider_from_project: bool,
         experimental_provider_computer_use: bool,
     ) -> Result<ProviderDescriptorValidation, SatelleError> {
         use satelle_core::{
@@ -1586,6 +1588,7 @@ impl HostService {
                 matches!(mode, ProviderAuthValidationMode::RefreshProviderSmoke),
             )
         }
+        .with_project_selection_provenance(model_from_project, provider_from_project)
         .with_experimental_provider_computer_use(experimental_provider_computer_use);
         let (resolved_binding, deferred_outcome, deferred_source) =
             match self.resolve_provider_binding(host, &intent)? {

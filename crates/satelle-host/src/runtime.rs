@@ -458,6 +458,23 @@ fn readiness_probe_recovery_pending(kind: ReadinessProbeKind) -> SatelleError {
     error
 }
 
+fn require_project_binding_consent(
+    host: &str,
+    provider_intent: &ProviderComputerUseIntent,
+    binding: &ResolvedProviderBinding,
+) -> Result<(), SatelleError> {
+    if provider_intent.requires_project_binding_consent()
+        && !binding.allow_project_selection()
+    {
+        return Err(SatelleError::project_provider_selection_not_allowed(
+            host,
+            binding.requested_provider_alias(),
+            binding.requested_model_alias(),
+        ));
+    }
+    Ok(())
+}
+
 fn model_provider_binding_missing(provider_intent: &ProviderComputerUseIntent) -> SatelleError {
     let mut details = BTreeMap::new();
     if let Some(model) = provider_intent.model() {
@@ -1165,15 +1182,28 @@ impl RuntimeEngine {
 
     fn resolve_requested_provider_binding(
         &self,
+        host: &str,
         provider_intent: &ProviderComputerUseIntent,
     ) -> Result<Option<ProviderBindingResolution>, SatelleError> {
+        if (provider_intent.model_from_project() && provider_intent.model().is_none())
+            || (provider_intent.provider_from_project() && provider_intent.provider().is_none())
+        {
+            return Err(SatelleError::config_error(
+                "project Provider Binding provenance requires the corresponding alias",
+                None,
+            ));
+        }
         let requested_pair = match (provider_intent.model(), provider_intent.provider()) {
             (None, None) => return Ok(None),
             (Some(model), Some(provider)) => (model.as_str(), provider.as_str()),
             _ => return Err(model_provider_binding_missing(provider_intent)),
         };
-        if let Some(resolution) =
-            self.resolve_remote_host_binding(requested_pair.0, requested_pair.1)?
+        if let Some(resolution) = self.resolve_remote_host_binding(
+            host,
+            requested_pair.0,
+            requested_pair.1,
+            provider_intent.requires_project_binding_consent(),
+        )?
         {
             return Ok(Some(resolution));
         }
@@ -1182,13 +1212,16 @@ impl RuntimeEngine {
             .load_authorized_provider_binding(requested_pair.0, requested_pair.1)
             .map_err(model::storage_failure)?
             .ok_or_else(|| model_provider_binding_missing(provider_intent))?;
+        require_project_binding_consent(host, provider_intent, &binding)?;
         Ok(Some(ProviderBindingResolution::Ready(binding)))
     }
 
     fn resolve_remote_host_binding(
         &self,
+        host: &str,
         model_alias: &str,
         provider_alias: &str,
+        project_selection: bool,
     ) -> Result<Option<ProviderBindingResolution>, SatelleError> {
         let Some(binding) = self
             .provider_policy
@@ -1198,12 +1231,20 @@ impl RuntimeEngine {
         else {
             return Ok(None);
         };
+        if project_selection && !binding.allow_project_selection {
+            return Err(SatelleError::project_provider_selection_not_allowed(
+                host,
+                provider_alias,
+                model_alias,
+            ));
+        }
         let mut authorization = ProviderBindingAuthorization::new(
             model_alias,
             provider_alias,
             &binding.model,
             &binding.model_provider,
-        );
+        )
+        .with_allow_project_selection(binding.allow_project_selection);
         if let Some(endpoint) = binding.endpoint.as_deref() {
             authorization = authorization.with_endpoint(endpoint);
         }
@@ -1251,7 +1292,7 @@ impl RuntimeEngine {
         host: &str,
         provider_intent: &ProviderComputerUseIntent,
     ) -> Result<ProviderBindingResolution, SatelleError> {
-        if let Some(resolution) = self.resolve_requested_provider_binding(provider_intent)? {
+        if let Some(resolution) = self.resolve_requested_provider_binding(host, provider_intent)? {
             return Ok(resolution.with_experimental_provider_computer_use(
                 provider_intent.experimental_provider_computer_use(),
             ));

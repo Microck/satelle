@@ -2671,10 +2671,32 @@ fn authorized_provider_binding_round_trips_replaces_restarts_and_deletes() {
         .with_auth_source(satelle_core::ProviderSecretSource::Environment {
             variable: "SATELLE_PROVIDER_ONE_TOKEN".to_string(),
         })
+        .with_allow_project_selection(true)
         .with_experimental_provider_computer_use(true),
         satelle_core::ProviderBindingSource::UserConfig,
     );
     let initial_digest = initial.binding_digest().to_string();
+    let denied_project_selection_digest =
+        satelle_core::ResolvedProviderBinding::from_authorization(
+            satelle_core::ProviderBindingAuthorization::new(
+                "review-model",
+                "review-provider",
+                "gpt-initial",
+                "openai",
+            )
+            .with_endpoint("https://provider-one.invalid/v1")
+            .with_auth_source(satelle_core::ProviderSecretSource::Environment {
+                variable: "SATELLE_PROVIDER_ONE_TOKEN".to_string(),
+            })
+            .with_experimental_provider_computer_use(true),
+            satelle_core::ProviderBindingSource::UserConfig,
+        )
+        .binding_digest()
+        .to_string();
+    assert_ne!(
+        initial_digest, denied_project_selection_digest,
+        "exact-binding project consent participates in binding identity"
+    );
 
     storage
         .authorize_provider_binding(&initial, at(1))
@@ -2703,6 +2725,7 @@ fn authorized_provider_binding_round_trips_replaces_restarts_and_deletes() {
         satelle_core::ProviderBindingSource::UserConfig
     );
     assert!(loaded_initial.experimental_provider_computer_use());
+    assert!(loaded_initial.allow_project_selection());
     assert_eq!(loaded_initial.binding_digest(), initial_digest);
     assert!(loaded_initial.has_valid_binding_digest());
 
@@ -2752,6 +2775,7 @@ fn authorized_provider_binding_round_trips_replaces_restarts_and_deletes() {
         satelle_core::ProviderBindingSource::UserConfig
     );
     assert!(!loaded_replacement.experimental_provider_computer_use());
+    assert!(!loaded_replacement.allow_project_selection());
     assert_eq!(loaded_replacement.binding_digest(), replacement_digest);
     assert!(loaded_replacement.has_valid_binding_digest());
 

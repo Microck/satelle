@@ -1578,9 +1578,10 @@ impl Storage {
                     auth_source_json,
                     source,
                     experimental_provider_computer_use,
+                    allow_project_selection,
                     binding_digest,
                     updated_at
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'user_config', ?7, ?8, ?9)
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'user_config', ?7, ?8, ?9, ?10)
                  ON CONFLICT(provider_alias, model_alias) DO UPDATE SET
                     model = excluded.model,
                     model_provider = excluded.model_provider,
@@ -1589,6 +1590,7 @@ impl Storage {
                     source = excluded.source,
                     experimental_provider_computer_use =
                         excluded.experimental_provider_computer_use,
+                    allow_project_selection = excluded.allow_project_selection,
                     binding_digest = excluded.binding_digest,
                     updated_at = excluded.updated_at",
                 rusqlite::params![
@@ -1599,6 +1601,7 @@ impl Storage {
                     binding.endpoint(),
                     auth_source_json,
                     i64::from(binding.experimental_provider_computer_use()),
+                    i64::from(binding.allow_project_selection()),
                     binding.binding_digest(),
                     format_time(updated_at)?,
                 ],
@@ -1726,6 +1729,7 @@ impl Storage {
                         auth_source_json,
                         source,
                         experimental_provider_computer_use,
+                        allow_project_selection,
                         binding_digest
                  FROM authorized_provider_bindings
                  WHERE provider_alias = ?1 AND model_alias = ?2",
@@ -1738,7 +1742,8 @@ impl Storage {
                         row.get::<_, Option<String>>(3)?,
                         row.get::<_, String>(4)?,
                         row.get::<_, i64>(5)?,
-                        row.get::<_, String>(6)?,
+                        row.get::<_, i64>(6)?,
+                        row.get::<_, String>(7)?,
                     ))
                 },
             )
@@ -1751,12 +1756,16 @@ impl Storage {
             auth_source_json,
             source,
             experimental,
+            allow_project_selection,
             stored_digest,
         )) = stored
         else {
             return Ok(None);
         };
-        if source != ProviderBindingSource::UserConfig.as_str() || !matches!(experimental, 0 | 1) {
+        if source != ProviderBindingSource::UserConfig.as_str()
+            || !matches!(experimental, 0 | 1)
+            || !matches!(allow_project_selection, 0 | 1)
+        {
             return Err(StorageError::new(StorageErrorKind::InvalidStoredState));
         }
         let auth_source = auth_source_json
@@ -1768,6 +1777,7 @@ impl Storage {
             })?;
         let mut authorization =
             ProviderBindingAuthorization::new(model_alias, provider_alias, model, model_provider)
+                .with_allow_project_selection(allow_project_selection == 1)
                 .with_experimental_provider_computer_use(experimental == 1);
         if let Some(endpoint) = endpoint {
             authorization = authorization.with_endpoint(endpoint);

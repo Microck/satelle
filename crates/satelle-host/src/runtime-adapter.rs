@@ -16,6 +16,8 @@ use thiserror::Error;
 pub struct ProviderComputerUseIntent {
     model: Option<satelle_core::session::EffectiveModelRef>,
     provider: Option<satelle_core::session::ProviderBindingRef>,
+    model_from_project: bool,
+    provider_from_project: bool,
     resolved_provider_binding: Option<satelle_core::ResolvedProviderBinding>,
     experimental_provider_computer_use: bool,
     refresh: bool,
@@ -31,6 +33,8 @@ impl ProviderComputerUseIntent {
         Self {
             model,
             provider,
+            model_from_project: false,
+            provider_from_project: false,
             resolved_provider_binding: None,
             experimental_provider_computer_use: false,
             refresh,
@@ -51,6 +55,16 @@ impl ProviderComputerUseIntent {
         self
     }
 
+    pub const fn with_project_selection_provenance(
+        mut self,
+        model_from_project: bool,
+        provider_from_project: bool,
+    ) -> Self {
+        self.model_from_project = model_from_project;
+        self.provider_from_project = provider_from_project;
+        self
+    }
+
     /// Applies a one-shot timeout to a diagnostic provider smoke refresh.
     /// Normal prompt admission continues to use the Host configuration.
     pub fn with_provider_smoke_timeout(mut self, timeout: std::time::Duration) -> Self {
@@ -68,6 +82,18 @@ impl ProviderComputerUseIntent {
 
     pub fn provider(&self) -> Option<&satelle_core::session::ProviderBindingRef> {
         self.provider.as_ref()
+    }
+
+    pub const fn model_from_project(&self) -> bool {
+        self.model_from_project
+    }
+
+    pub const fn provider_from_project(&self) -> bool {
+        self.provider_from_project
+    }
+
+    pub const fn requires_project_binding_consent(&self) -> bool {
+        self.model_from_project || self.provider_from_project
     }
 
     pub(crate) fn resolved_provider_binding(

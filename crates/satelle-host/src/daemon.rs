@@ -25,10 +25,10 @@ use crate::EphemeralApiAuthenticator;
 use std::sync::Arc;
 
 const MAX_IDEMPOTENCY_KEY_BYTES: usize = 256;
-const TURN_IDEMPOTENCY_DIGEST_SCHEMA_VERSION: u16 = 5;
+const TURN_IDEMPOTENCY_DIGEST_SCHEMA_VERSION: u16 = 6;
 const STOP_IDEMPOTENCY_DIGEST_SCHEMA_VERSION: u16 = 1;
-const PROVIDER_DESCRIPTOR_VALIDATION_DIGEST_SCHEMA_VERSION: u16 = 2;
-const PROVIDER_BINDING_MUTATION_DIGEST_SCHEMA_VERSION: u16 = 1;
+const PROVIDER_DESCRIPTOR_VALIDATION_DIGEST_SCHEMA_VERSION: u16 = 3;
+const PROVIDER_BINDING_MUTATION_DIGEST_SCHEMA_VERSION: u16 = 2;
 const DURABLE_SETUP_PRINCIPAL_PREFIX: &str = "controller-setup";
 
 /// A diagnostic-safe snapshot captured from the daemon-owned runtime after
@@ -220,6 +220,17 @@ impl TurnIntent {
         Ok(self)
     }
 
+    pub fn with_project_selection_provenance(
+        mut self,
+        model_from_project: bool,
+        provider_from_project: bool,
+    ) -> Self {
+        self.provider_intent = self
+            .provider_intent
+            .with_project_selection_provenance(model_from_project, provider_from_project);
+        self
+    }
+
     pub fn with_experimental_provider_computer_use(mut self, enabled: bool) -> Self {
         self.provider_intent = self
             .provider_intent
@@ -345,6 +356,8 @@ struct CanonicalSessionCreate<'a> {
     execution_mode: TurnExecutionMode,
     model: Option<&'a str>,
     provider: Option<&'a str>,
+    model_from_project: bool,
+    provider_from_project: bool,
     refresh_provider_smoke_test: bool,
     experimental_provider_computer_use: bool,
     turn_execution_timeout_seconds: Option<u32>,
@@ -359,6 +372,8 @@ struct CanonicalTurnCreate<'a> {
     execution_mode: TurnExecutionMode,
     model: Option<&'a str>,
     provider: Option<&'a str>,
+    model_from_project: bool,
+    provider_from_project: bool,
     refresh_provider_smoke_test: bool,
     experimental_provider_computer_use: bool,
     turn_execution_timeout_seconds: Option<u32>,
@@ -397,6 +412,8 @@ struct CanonicalProviderDescriptorValidation<'a> {
     model_alias: &'a str,
     provider_alias: &'a str,
     mode: ProviderAuthValidationMode,
+    model_from_project: bool,
+    provider_from_project: bool,
     experimental_provider_computer_use: bool,
 }
 
@@ -748,6 +765,8 @@ impl HostService {
         model_alias: &str,
         provider_alias: &str,
         mode: ProviderAuthValidationMode,
+        model_from_project: bool,
+        provider_from_project: bool,
         experimental_provider_computer_use: bool,
         authority: &MutationAuthority,
     ) -> Result<PublicProviderDescriptorValidation, SatelleError> {
@@ -758,6 +777,8 @@ impl HostService {
                 model_alias,
                 provider_alias,
                 mode,
+                model_from_project,
+                provider_from_project,
                 experimental_provider_computer_use,
             },
             PROVIDER_DESCRIPTOR_VALIDATION_DIGEST_SCHEMA_VERSION,
@@ -781,6 +802,8 @@ impl HostService {
             model_alias,
             provider_alias,
             mode,
+            model_from_project,
+            provider_from_project,
             experimental_provider_computer_use,
         ) {
             Ok(validation) => validation,
@@ -905,6 +928,8 @@ impl HostService {
                     .provider_intent
                     .provider()
                     .map(ProviderBindingRef::as_str),
+                model_from_project: intent.provider_intent.model_from_project(),
+                provider_from_project: intent.provider_intent.provider_from_project(),
                 refresh_provider_smoke_test: intent.provider_intent.refresh(),
                 experimental_provider_computer_use: intent
                     .provider_intent
@@ -1016,6 +1041,8 @@ impl HostService {
                     .provider_intent
                     .provider()
                     .map(ProviderBindingRef::as_str),
+                model_from_project: intent.provider_intent.model_from_project(),
+                provider_from_project: intent.provider_intent.provider_from_project(),
                 refresh_provider_smoke_test: intent.provider_intent.refresh(),
                 experimental_provider_computer_use: intent
                     .provider_intent
@@ -1113,6 +1140,8 @@ impl HostService {
                     .provider_intent
                     .provider()
                     .map(ProviderBindingRef::as_str),
+                model_from_project: intent.provider_intent.model_from_project(),
+                provider_from_project: intent.provider_intent.provider_from_project(),
                 refresh_provider_smoke_test: intent.provider_intent.refresh(),
                 experimental_provider_computer_use: intent
                     .provider_intent
@@ -1181,6 +1210,8 @@ impl HostService {
                     .provider_intent
                     .provider()
                     .map(ProviderBindingRef::as_str),
+                model_from_project: intent.provider_intent.model_from_project(),
+                provider_from_project: intent.provider_intent.provider_from_project(),
                 refresh_provider_smoke_test: intent.provider_intent.refresh(),
                 experimental_provider_computer_use: intent
                     .provider_intent
@@ -1604,6 +1635,8 @@ mod tests {
                 execution_mode: TurnExecutionMode::Yolo,
                 model: Some("model-test"),
                 provider: Some("provider-test"),
+                model_from_project: true,
+                provider_from_project: false,
                 refresh_provider_smoke_test: true,
                 experimental_provider_computer_use: true,
                 turn_execution_timeout_seconds: Some(30 * 60),
@@ -1612,10 +1645,10 @@ mod tests {
             TURN_IDEMPOTENCY_DIGEST_SCHEMA_VERSION,
         )
         .expect("serialize Turn idempotency payload");
-        assert_eq!(turn.digest_schema_version, 5);
+        assert_eq!(turn.digest_schema_version, 6);
         assert_eq!(
             turn.as_slice(),
-            br#"{"digest_schema_version":5,"payload":{"operation":"session_create","prompt":"PRIVATE_DIGEST_VERSION_PROMPT","execution_mode":"yolo","model":"model-test","provider":"provider-test","refresh_provider_smoke_test":true,"experimental_provider_computer_use":true,"turn_execution_timeout_seconds":1800,"attachments":[]}}"#
+            br#"{"digest_schema_version":6,"payload":{"operation":"session_create","prompt":"PRIVATE_DIGEST_VERSION_PROMPT","execution_mode":"yolo","model":"model-test","provider":"provider-test","model_from_project":true,"provider_from_project":false,"refresh_provider_smoke_test":true,"experimental_provider_computer_use":true,"turn_execution_timeout_seconds":1800,"attachments":[]}}"#
         );
 
         let stop = canonical_payload(
