@@ -879,6 +879,7 @@ variable = "OPENAI_API_KEY"
 model = "gpt-5.2"
 model_provider = "openai"
 auth_source = "openai"
+allow_project_selection = true
 "#,
         r#"
 default_host = "local"
@@ -912,6 +913,7 @@ value = "{raw_secret}"
 model = "gpt-5.2"
 model_provider = "openai"
 auth_source = "openai"
+allow_project_selection = true
 "#,
     ));
     let output = fixture
