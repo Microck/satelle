@@ -8,18 +8,272 @@ use satelle_transport::{
     ProviderBindingDeletionResponse, ProviderDescriptorValidationRequest,
     ProviderDescriptorValidationResponse, ProviderSecretProvisioningMetadata,
 };
+use zeroize::Zeroizing;
 
 const VALIDATION_PATH: &str = "/v1/setup/provider-bindings/open_ai/vision/validate";
 const AUTHORIZATION_PATH: &str = "/v1/setup/provider-bindings/open_ai/vision";
 const PROVIDER_SECRET_PATH: &str = "/v1/setup/provider-secret";
 const PROVIDER_SECRET_PREVIEW_PATH: &str = "/v1/setup/provider-secret/preview";
 const PROVIDER_SECRET_METADATA_HEADER: &str = "Satelle-Provider-Secret-Metadata";
+const PROVIDER_SECRET_COMPLETED_OUTCOME: &str = "v1.provider_secret_provisioning.completed";
 
 fn provider_secret_metadata(overwrite_authorized: bool) -> ProviderSecretProvisioningMetadata {
     ProviderSecretProvisioningMetadata::new(
         ProviderBindingAuthorization::new("vision", "open_ai", "gpt-5.6", "openai"),
         overwrite_authorized,
     )
+}
+
+fn provider_secret_file_metadata(path: std::path::PathBuf) -> ProviderSecretProvisioningMetadata {
+    ProviderSecretProvisioningMetadata::new(
+        ProviderBindingAuthorization::new("vision", "open_ai", "gpt-5.6", "openai")
+            .with_auth_source(ProviderSecretSource::File { path }),
+        false,
+    )
+}
+
+fn copy_provider_secret_client_token(token: &ApiBearerToken) -> ApiBearerToken {
+    let exposed = token.expose();
+    ApiBearerToken::parse(exposed.as_str()).expect("copy provider secret client token")
+}
+
+fn provider_secret_client(
+    address: SocketAddr,
+    token: ApiBearerToken,
+    host_identity: String,
+) -> DaemonClient {
+    DaemonClient::loopback(address, token, host_identity).expect("construct provider secret client")
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct ProviderSecretPersistenceState {
+    journal_rows: i64,
+    status: String,
+    durable_outcome: String,
+    result_json: String,
+}
+
+impl ProviderSecretPersistenceState {
+    fn assert_completed(&self) {
+        assert_eq!(self.journal_rows, 0);
+        assert_eq!(self.status, "terminal");
+        assert_eq!(self.durable_outcome, PROVIDER_SECRET_COMPLETED_OUTCOME);
+        assert!(!self.result_json.is_empty());
+    }
+}
+
+fn provider_secret_persistence_state(
+    state_path: &std::path::Path,
+    idempotency_key: &str,
+) -> ProviderSecretPersistenceState {
+    let connection =
+        rusqlite::Connection::open(state_path.join("satelle.sqlite3")).expect("open Host SQLite");
+    let journal_rows = connection
+        .query_row(
+            "SELECT COUNT(*) FROM provider_secret_provisioning_journal",
+            [],
+            |row| row.get(0),
+        )
+        .expect("count provider secret journal rows");
+    let (status, durable_outcome, result_json) = connection
+        .query_row(
+            "SELECT status, durable_outcome, result_json
+             FROM idempotency_records
+             WHERE operation = 'provider_secret_provisioning'
+               AND idempotency_key = ?1",
+            [idempotency_key],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .expect("load completed provider secret idempotency record");
+    ProviderSecretPersistenceState {
+        journal_rows,
+        status,
+        durable_outcome,
+        result_json,
+    }
+}
+
+#[tokio::test]
+async fn exact_prepared_provider_secret_replays_but_a_fresh_reseal_conflicts() {
+    let state = TestStateDir::new().expect("create provider secret state");
+    let service = HostService::local_demo_with_readiness_for_tests_at(state.path())
+        .expect("create provider secret service");
+    let admin = RunningServer::start_with_service(
+        ApiScopes::ADMIN,
+        DaemonServerConfig::loopback(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))),
+        state,
+        service,
+    )
+    .await;
+    let secret_directory = TestStateDir::new().expect("create provider secret directory");
+    let secret_path = secret_directory.path().join("provider-token");
+    let state_path = admin._state.path().to_path_buf();
+    let client_address = admin.server.local_addr();
+    let client_token = copy_provider_secret_client_token(&admin.token);
+    let client_host_identity = admin.host_identity.clone();
+
+    tokio::task::spawn_blocking(move || {
+        let client = provider_secret_client(client_address, client_token, client_host_identity);
+        let metadata = provider_secret_file_metadata(secret_path.clone());
+        let idempotency_key = "provider-secret-exact-envelope";
+        let preview = client
+            .preview_provider_secret_provisioning(&metadata, idempotency_key)
+            .expect("preview provider secret provisioning");
+        let prepared = client
+            .prepare_provider_secret_provisioning(
+                &preview,
+                &metadata,
+                Zeroizing::new(b"PRIVATE_PREPARED_PROVIDER_SECRET".to_vec()),
+                idempotency_key,
+            )
+            .expect("prepare provider secret envelope");
+        let resealed = client
+            .prepare_provider_secret_provisioning(
+                &preview,
+                &metadata,
+                Zeroizing::new(b"PRIVATE_PREPARED_PROVIDER_SECRET".to_vec()),
+                idempotency_key,
+            )
+            .expect("freshly reseal identical logical inputs");
+
+        // Commit the operation, then discard the response to model a caller
+        // that cannot tell whether the Host applied the request.
+        client
+            .send_prepared_provider_secret_provisioning(&prepared)
+            .expect("commit provider secret before losing the response");
+        let persistence_after_commit =
+            provider_secret_persistence_state(&state_path, idempotency_key);
+        persistence_after_commit.assert_completed();
+
+        client
+            .send_prepared_provider_secret_provisioning(&prepared)
+            .expect("replay the exact prepared envelope");
+        assert_eq!(
+            provider_secret_persistence_state(&state_path, idempotency_key),
+            persistence_after_commit
+        );
+
+        let conflict = client
+            .send_prepared_provider_secret_provisioning(&resealed)
+            .expect_err("fresh ciphertext must conflict with the committed envelope");
+        assert!(matches!(
+            conflict,
+            DaemonClientError::Api { status, error }
+                if status == StatusCode::CONFLICT
+                    && error.code() == ApiErrorCode::IdempotencyKeyConflict
+        ));
+        assert_eq!(
+            provider_secret_persistence_state(&state_path, idempotency_key),
+            persistence_after_commit
+        );
+        assert_eq!(
+            std::fs::read_to_string(secret_path).expect("read provisioned secret"),
+            "PRIVATE_PREPARED_PROVIDER_SECRET"
+        );
+    })
+    .await
+    .expect("join prepared provider secret replay test");
+}
+
+#[tokio::test]
+async fn prepared_provider_secret_survives_send_error_and_replays_after_restart() {
+    let state = TestStateDir::new().expect("create durable provider secret state");
+    let state_path = state.path().to_path_buf();
+    let secret_directory = TestStateDir::new().expect("create durable secret directory");
+    let secret_path = secret_directory.path().join("provider-token");
+    let bootstrap_token = ApiBearerToken::generate().expect("generate bootstrap token");
+    let service = ready_bootstrap_service(&state, &bootstrap_token);
+    let running = RunningServer::start_with_service(
+        ApiScopes::CONTROL,
+        DaemonServerConfig::loopback(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))),
+        state,
+        service,
+    )
+    .await;
+    let live_client_address = running.server.local_addr();
+    let live_client_token = copy_provider_secret_client_token(&bootstrap_token);
+    let live_client_host_identity = running.host_identity.clone();
+    let unavailable_listener =
+        std::net::TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
+            .expect("reserve unavailable address");
+    let unavailable_address = unavailable_listener.local_addr().expect("read address");
+    drop(unavailable_listener);
+    let unavailable_token = copy_provider_secret_client_token(&bootstrap_token);
+    let unavailable_host_identity = running.host_identity.clone();
+    let first_secret_path = secret_path.clone();
+    let first_state_path = state_path.clone();
+
+    let (prepared, persistence_after_commit) = tokio::task::spawn_blocking(move || {
+        let live_client = provider_secret_client(
+            live_client_address,
+            live_client_token,
+            live_client_host_identity,
+        );
+        let unavailable_client = provider_secret_client(
+            unavailable_address,
+            unavailable_token,
+            unavailable_host_identity,
+        );
+        let metadata = provider_secret_file_metadata(first_secret_path);
+        let idempotency_key = "provider-secret-durable-envelope";
+        let preview = live_client
+            .preview_provider_secret_provisioning(&metadata, idempotency_key)
+            .expect("preview durable provisioning");
+        let prepared = live_client
+            .prepare_provider_secret_provisioning(
+                &preview,
+                &metadata,
+                Zeroizing::new(b"PRIVATE_DURABLE_PROVIDER_SECRET".to_vec()),
+                idempotency_key,
+            )
+            .expect("prepare durable envelope");
+
+        unavailable_client
+            .send_prepared_provider_secret_provisioning(&prepared)
+            .expect_err("unavailable daemon must reject the send");
+        live_client
+            .send_prepared_provider_secret_provisioning(&prepared)
+            .expect("the same handle remains sendable after failure");
+        let persistence = provider_secret_persistence_state(&first_state_path, idempotency_key);
+        persistence.assert_completed();
+        (prepared, persistence)
+    })
+    .await
+    .expect("join initial provider secret send");
+
+    let state = stop_provider_auth_server(running).await;
+    let service = ready_bootstrap_service(&state, &bootstrap_token);
+    let restarted = RunningServer::start_with_service(
+        ApiScopes::CONTROL,
+        DaemonServerConfig::loopback(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))),
+        state,
+        service,
+    )
+    .await;
+    let restarted_client_address = restarted.server.local_addr();
+    let restarted_client_token = copy_provider_secret_client_token(&bootstrap_token);
+    let restarted_client_host_identity = restarted.host_identity.clone();
+
+    tokio::task::spawn_blocking(move || {
+        let restarted_client = provider_secret_client(
+            restarted_client_address,
+            restarted_client_token,
+            restarted_client_host_identity,
+        );
+        restarted_client
+            .send_prepared_provider_secret_provisioning(&prepared)
+            .expect("replay exact envelope after Host restart");
+        assert_eq!(
+            provider_secret_persistence_state(&state_path, "provider-secret-durable-envelope"),
+            persistence_after_commit
+        );
+        assert_eq!(
+            std::fs::read_to_string(secret_path).expect("read durable provider secret"),
+            "PRIVATE_DURABLE_PROVIDER_SECRET"
+        );
+    })
+    .await
+    .expect("join restarted provider secret replay");
 }
 
 #[tokio::test]
@@ -342,6 +596,16 @@ async fn stop_provider_auth_server(running: RunningServer) -> TestStateDir {
 fn bootstrap_service(state: &TestStateDir, token: &ApiBearerToken) -> HostService {
     HostService::local_demo_for_tests_at(state.path())
         .expect("reopen provider authorization service")
+        .with_ssh_bootstrap_auth_for_tests(
+            token,
+            ApiScopes::ADMIN,
+            time::OffsetDateTime::now_utc() + time::Duration::minutes(15),
+        )
+}
+
+fn ready_bootstrap_service(state: &TestStateDir, token: &ApiBearerToken) -> HostService {
+    HostService::local_demo_with_readiness_for_tests_at(state.path())
+        .expect("reopen provider secret service")
         .with_ssh_bootstrap_auth_for_tests(
             token,
             ApiScopes::ADMIN,

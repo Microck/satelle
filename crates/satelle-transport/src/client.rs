@@ -32,6 +32,7 @@ use std::time::Duration;
 use zeroize::Zeroizing;
 
 const DIRECT_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+const PROVIDER_SECRET_PROVISIONING_PATH: &str = "/v1/setup/provider-secret";
 const PROVIDER_BINDING_ALIAS_ENCODE_SET: &AsciiSet =
     &CONTROLS.add(b'/').add(b'?').add(b'#').add(b'%').add(b'\\');
 
@@ -79,6 +80,23 @@ pub struct DaemonClient {
     token: ApiBearerToken,
     expected_host_identity: String,
     admission_timeout: Option<Duration>,
+}
+
+pub struct PreparedProviderSecretProvisioning {
+    path: &'static str,
+    content_type: &'static str,
+    protocol_metadata_header: (&'static str, &'static str),
+    expected_host_identity: String,
+    idempotency_key: Zeroizing<String>,
+    encoded_envelope: Zeroizing<Vec<u8>>,
+}
+
+impl fmt::Debug for PreparedProviderSecretProvisioning {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PreparedProviderSecretProvisioning")
+            .finish_non_exhaustive()
+    }
 }
 
 impl DaemonClient {
@@ -352,6 +370,18 @@ impl DaemonClient {
         secret: Zeroizing<Vec<u8>>,
         idempotency_key: &str,
     ) -> Result<ProviderSecretProvisioningResponse, DaemonClientError> {
+        let prepared =
+            self.prepare_provider_secret_provisioning(preview, metadata, secret, idempotency_key)?;
+        self.send_prepared_provider_secret_provisioning(&prepared)
+    }
+
+    pub fn prepare_provider_secret_provisioning(
+        &self,
+        preview: &ProviderSecretProvisioningPreviewResponse,
+        metadata: &ProviderSecretProvisioningMetadata,
+        secret: Zeroizing<Vec<u8>>,
+        idempotency_key: &str,
+    ) -> Result<PreparedProviderSecretProvisioning, DaemonClientError> {
         if preview.host_identity() != self.expected_host_identity {
             return Err(DaemonClientError::ResponseContractViolation);
         }
@@ -378,12 +408,35 @@ impl DaemonClient {
             serde_json::to_vec(&envelope)
                 .map_err(|_| DaemonClientError::ResponseContractViolation)?,
         );
-        let (request, request_id) =
-            self.mutation_request("/v1/setup/provider-secret", idempotency_key)?;
-        let body = reqwest::blocking::Body::new(ZeroizingRequestBody::new(encoded_envelope));
+        Ok(PreparedProviderSecretProvisioning {
+            path: PROVIDER_SECRET_PROVISIONING_PATH,
+            content_type: PROVIDER_SECRET_UPLOAD_CONTENT_TYPE,
+            protocol_metadata_header: (PROTOCOL_VERSION_HEADER, PROTOCOL_VERSION),
+            expected_host_identity: self.expected_host_identity.clone(),
+            idempotency_key: Zeroizing::new(idempotency_key.to_string()),
+            encoded_envelope,
+        })
+    }
+
+    pub fn send_prepared_provider_secret_provisioning(
+        &self,
+        prepared: &PreparedProviderSecretProvisioning,
+    ) -> Result<ProviderSecretProvisioningResponse, DaemonClientError> {
+        if prepared.expected_host_identity != self.expected_host_identity {
+            return Err(DaemonClientError::ResponseContractViolation);
+        }
+        let (request, request_id) = self.mutation_request_with_bound_protocol_metadata(
+            Method::POST,
+            prepared.path,
+            prepared.idempotency_key.as_str(),
+            prepared.protocol_metadata_header,
+        )?;
+        let body = reqwest::blocking::Body::new(ZeroizingRequestBody::new(Zeroizing::new(
+            prepared.encoded_envelope.as_slice().to_vec(),
+        )));
         let request = self.admission_request(
             request
-                .header(CONTENT_TYPE, PROVIDER_SECRET_UPLOAD_CONTENT_TYPE)
+                .header(CONTENT_TYPE, prepared.content_type)
                 .body(body),
         );
         self.send_authenticated(request, request_id, StatusCode::OK)
@@ -669,6 +722,21 @@ impl DaemonClient {
         path: &str,
         idempotency_key: &str,
     ) -> Result<(RequestBuilder, RequestId), DaemonClientError> {
+        self.mutation_request_with_bound_protocol_metadata(
+            method,
+            path,
+            idempotency_key,
+            (PROTOCOL_VERSION_HEADER, PROTOCOL_VERSION),
+        )
+    }
+
+    fn mutation_request_with_bound_protocol_metadata(
+        &self,
+        method: Method,
+        path: &str,
+        idempotency_key: &str,
+        protocol_metadata_header: (&'static str, &'static str),
+    ) -> Result<(RequestBuilder, RequestId), DaemonClientError> {
         let mut header = HeaderValue::from_str(idempotency_key)
             .map_err(|_| DaemonClientError::InvalidIdempotencyKeyHeader)?;
         header.set_sensitive(true);
@@ -676,7 +744,7 @@ impl DaemonClient {
         Ok((
             request
                 .header("Idempotency-Key", header)
-                .header(PROTOCOL_VERSION_HEADER, PROTOCOL_VERSION),
+                .header(protocol_metadata_header.0, protocol_metadata_header.1),
             request_id,
         ))
     }

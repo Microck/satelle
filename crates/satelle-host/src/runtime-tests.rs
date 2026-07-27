@@ -6,14 +6,13 @@ use super::{
     RequestIdentity, RunCommand, RuntimeHandle, RuntimeProviderPolicy, RuntimeStartupState,
     SteerCommand, StopCommand,
 };
-use crate::storage::{
-    IdempotencyInput, IdempotentOperation, LeaseOwner, PrivateUpstreamRef, ProbeRecoverySubject,
-};
 #[cfg(unix)]
 use crate::storage::{
-    PROVIDER_SECRET_CANDIDATE_HMAC_DOMAIN, PROVIDER_SECRET_PRIOR_HMAC_DOMAIN,
-    ProviderSecretProvisioningPhase, ProviderSecretProvisioningPlan,
+    IdempotencyInput, IdempotentOperation, PROVIDER_SECRET_CANDIDATE_HMAC_DOMAIN,
+    PROVIDER_SECRET_PRIOR_HMAC_DOMAIN, ProviderSecretProvisioningPhase,
+    ProviderSecretProvisioningPlan,
 };
+use crate::storage::{LeaseOwner, PrivateUpstreamRef, ProbeRecoverySubject};
 use crate::test_runtime::FakeComputerUseAdapter;
 use crate::{
     AttachmentUpload, ProductionComputerUseAdapter, ProviderSmokeEvidence,
@@ -352,6 +351,84 @@ fn startup_recovery_rolls_back_publish_intent_before_serving_requests() {
         "rollback-token",
         "provider-rollback-crash",
         "prior",
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn startup_recovery_preserves_an_unowned_parked_rotation() {
+    let state = crate::TestStateDir::new().expect("temporary state directory");
+    let destination = recovery_secret_destination(&state, "parked-rotation-token");
+    satelle_core::persist_new_owner_only_secret_file(&destination, "prior")
+        .expect("persist prior credential");
+    let runtime = recovery_test_runtime(&state);
+    let fixture =
+        provider_secret_recovery_fixture(&runtime, &destination, "provider-parked-rotation-crash");
+    satelle_core::stage_owner_only_secret_file(
+        &fixture.paths,
+        "candidate",
+        fixture.candidate_key.as_bytes(),
+        &fixture.candidate_digest,
+    )
+    .expect("stage candidate");
+    let engine = runtime
+        .engine_without_restart_recovery()
+        .expect("open runtime without recovery");
+    {
+        let mut storage = engine.lock_storage().expect("lock storage");
+        storage
+            .record_staged_provider_secret(
+                &fixture.operation_id,
+                true,
+                Some(fixture.paths.backup()),
+                Some(&fixture.prior_hmac),
+                time::OffsetDateTime::now_utc(),
+            )
+            .expect("record staged state");
+        storage
+            .transition_provider_secret_provisioning(
+                &fixture.operation_id,
+                ProviderSecretProvisioningPhase::Staged,
+                ProviderSecretProvisioningPhase::Validated,
+                time::OffsetDateTime::now_utc(),
+            )
+            .expect("record validation");
+        storage
+            .transition_provider_secret_provisioning(
+                &fixture.operation_id,
+                ProviderSecretProvisioningPhase::Validated,
+                ProviderSecretProvisioningPhase::PublishIntent,
+                time::OffsetDateTime::now_utc(),
+            )
+            .expect("record publish intent");
+    }
+
+    std::fs::rename(&destination, fixture.paths.backup()).expect("park prior credential");
+    std::fs::rename(fixture.paths.staging(), &destination).expect("publish candidate");
+    std::fs::write(&destination, "rotated").expect("rotate published credential");
+    std::fs::rename(&destination, fixture.paths.staging()).expect("park unowned rotation");
+    drop(engine);
+    drop(runtime);
+
+    let restarted = recovery_test_runtime(&state);
+    restarted.snapshot().expect("recover parked rotation");
+    assert_eq!(
+        satelle_core::read_owner_only_secret_file(&destination)
+            .expect("read recovered rotation")
+            .as_str(),
+        "rotated"
+    );
+    assert!(!fixture.paths.staging().exists());
+    assert!(!fixture.paths.backup().exists());
+    assert!(
+        restarted
+            .engine_without_restart_recovery()
+            .expect("open recovered engine")
+            .lock_storage()
+            .expect("lock recovered storage")
+            .pending_provider_secret_provisionings()
+            .expect("load pending journals")
+            .is_empty()
     );
 }
 

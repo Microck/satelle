@@ -295,9 +295,10 @@ pub fn stage_owner_only_secret_file(
     Ok(())
 }
 
-/// Atomically publishes a verified staging file. Replacements first create an
-/// independent owner-only backup, so the destination itself keeps one link and
-/// remains readable under the owner-only policy throughout the operation.
+/// Publishes a verified staging file without replacing an occupied pathname.
+/// A replacement parks the observed destination at the journal's backup
+/// pathname, verifies its exact prior digest, and then publishes into the
+/// vacant destination pathname.
 pub fn publish_owner_only_secret_file(
     paths: &OwnerOnlySecretFilePaths,
     expected_destination_exists: bool,
@@ -308,14 +309,7 @@ pub fn publish_owner_only_secret_file(
     prior_digest: Option<&[u8; 32]>,
 ) -> Result<bool, SecureFileError> {
     verify_owner_only_secret_digest(&paths.staging, candidate_comparison_key, candidate_digest)?;
-    let destination_exists = owner_only_secret_destination_exists(&paths.destination)?;
-    if destination_exists && !expected_destination_exists {
-        return Err(SecureFileError::OverwriteRequired);
-    }
-    if destination_exists != expected_destination_exists {
-        return Err(SecureFileError::UnsafeOrUnavailable);
-    }
-    if destination_exists && !overwrite_authorized {
+    if expected_destination_exists && !overwrite_authorized {
         return Err(SecureFileError::OverwriteRequired);
     }
 
@@ -324,38 +318,101 @@ pub fn publish_owner_only_secret_file(
         .parent()
         .ok_or(SecureFileError::UnsafeOrUnavailable)?;
     let directory = open_or_create_owner_only_directory(parent)?;
-    if destination_exists {
-        create_owner_only_backup(
-            paths,
-            prior_comparison_key.ok_or(SecureFileError::UnsafeOrUnavailable)?,
-            prior_digest.ok_or(SecureFileError::UnsafeOrUnavailable)?,
+
+    if !expected_destination_exists {
+        return match move_sibling_file_without_replace(
+            &paths.staging,
+            &paths.destination,
             &directory,
-        )?;
+        )? {
+            NoReplaceMoveOutcome::Moved => {
+                sync_owner_only_directory(parent, &directory)?;
+                verify_owner_only_secret_digest(
+                    &paths.destination,
+                    candidate_comparison_key,
+                    candidate_digest,
+                )?;
+                Ok(false)
+            }
+            NoReplaceMoveOutcome::DestinationOccupied => Err(SecureFileError::OverwriteRequired),
+            NoReplaceMoveOutcome::SourceMissing => Err(SecureFileError::UnsafeOrUnavailable),
+        };
     }
-    let publish = if destination_exists {
-        replace_sibling_file(&paths.staging, &paths.destination, &directory)
-    } else {
-        publish_new_file_without_replace(&paths.staging, &paths.destination, &directory).map_err(
-            |error| {
-                if owner_only_secret_destination_exists(&paths.destination) == Ok(true) {
-                    SecureFileError::OverwriteRequired
-                } else {
-                    error
-                }
-            },
-        )
-    };
-    let published = publish
-        .and_then(|()| sync_owner_only_directory(parent, &directory))
-        .and_then(|()| {
+
+    let prior_comparison_key = prior_comparison_key.ok_or(SecureFileError::UnsafeOrUnavailable)?;
+    let prior_digest = prior_digest.ok_or(SecureFileError::UnsafeOrUnavailable)?;
+    match move_sibling_file_without_replace(&paths.destination, &paths.backup, &directory)? {
+        NoReplaceMoveOutcome::Moved => sync_owner_only_directory(parent, &directory)?,
+        NoReplaceMoveOutcome::SourceMissing | NoReplaceMoveOutcome::DestinationOccupied => {
+            return Err(SecureFileError::UnsafeOrUnavailable);
+        }
+    }
+
+    match secret_digest_matches(&paths.backup, prior_comparison_key, prior_digest) {
+        Ok(true) => {}
+        comparison => {
+            restore_parked_secret(
+                &paths.backup,
+                &paths.destination,
+                parent,
+                &directory,
+                SecretArtifactKind::Unowned,
+                candidate_comparison_key,
+                candidate_digest,
+                Some((prior_comparison_key, prior_digest)),
+            )?;
+            return match comparison {
+                Ok(false) => Err(SecureFileError::OverwriteRequired),
+                Err(error) => Err(error),
+                Ok(true) => unreachable!(),
+            };
+        }
+    }
+
+    match move_sibling_file_without_replace(&paths.staging, &paths.destination, &directory)? {
+        NoReplaceMoveOutcome::Moved => {
+            sync_owner_only_directory(parent, &directory)?;
             verify_owner_only_secret_digest(
                 &paths.destination,
                 candidate_comparison_key,
                 candidate_digest,
-            )
-        });
-    published?;
-    Ok(destination_exists)
+            )?;
+            Ok(true)
+        }
+        NoReplaceMoveOutcome::DestinationOccupied => {
+            remove_verified_secret_artifact(
+                &paths.staging,
+                &directory,
+                SecretArtifactKind::Candidate,
+                candidate_comparison_key,
+                candidate_digest,
+                Some((prior_comparison_key, prior_digest)),
+            )?;
+            remove_verified_secret_artifact(
+                &paths.backup,
+                &directory,
+                SecretArtifactKind::Prior,
+                candidate_comparison_key,
+                candidate_digest,
+                Some((prior_comparison_key, prior_digest)),
+            )?;
+            sync_owner_only_directory(parent, &directory)?;
+            Err(SecureFileError::OverwriteRequired)
+        }
+        NoReplaceMoveOutcome::SourceMissing => {
+            restore_parked_secret(
+                &paths.backup,
+                &paths.destination,
+                parent,
+                &directory,
+                SecretArtifactKind::Prior,
+                candidate_comparison_key,
+                candidate_digest,
+                Some((prior_comparison_key, prior_digest)),
+            )?;
+            Err(SecureFileError::UnsafeOrUnavailable)
+        }
+    }
 }
 
 /// Restores the owner-only backup after a failed replacement, or removes a
@@ -376,74 +433,192 @@ pub fn rollback_owner_only_secret_file(
         .destination
         .parent()
         .ok_or(SecureFileError::RollbackFailed)?;
-    let destination_exists = owner_only_secret_destination_exists(&paths.destination)
-        .map_err(|_| SecureFileError::RollbackFailed)?;
-    let staging_exists = owner_only_secret_destination_exists(&paths.staging)
-        .map_err(|_| SecureFileError::RollbackFailed)?;
-    let backup_exists = owner_only_secret_destination_exists(&paths.backup)
-        .map_err(|_| SecureFileError::RollbackFailed)?;
-    if !overwritten && !destination_exists && !staging_exists && !backup_exists {
-        return Ok(());
-    }
     let directory =
         open_or_create_owner_only_directory(parent).map_err(|_| SecureFileError::RollbackFailed)?;
-    if overwritten {
-        let prior_comparison_key = prior_comparison_key.ok_or(SecureFileError::RollbackFailed)?;
-        let prior_digest = prior_digest.ok_or(SecureFileError::RollbackFailed)?;
-        if backup_exists {
-            verify_owner_only_secret_digest(&paths.backup, prior_comparison_key, prior_digest)
-                .map_err(|_| SecureFileError::RollbackFailed)?;
-            if !destination_exists {
-                replace_sibling_file(&paths.backup, &paths.destination, &directory)
-                    .map_err(|_| SecureFileError::RollbackFailed)?;
-            } else if secret_digest_matches(&paths.destination, prior_comparison_key, prior_digest)
-                .map_err(|_| SecureFileError::RollbackFailed)?
-            {
-                remove_sibling_file(&paths.backup, &directory)
-                    .map_err(|_| SecureFileError::RollbackFailed)?;
-            } else {
-                verify_owner_only_secret_digest(
-                    &paths.destination,
+    let prior_evidence = match (prior_comparison_key, prior_digest) {
+        (Some(key), Some(digest)) => Some((key, digest)),
+        (None, None) => None,
+        _ => return Err(SecureFileError::RollbackFailed),
+    };
+    let restores_prior = overwritten || prior_evidence.is_some();
+    let classify = |path: &Path| {
+        classify_secret_artifact(
+            path,
+            candidate_comparison_key,
+            candidate_digest,
+            prior_evidence,
+        )
+        .map_err(|_| SecureFileError::RollbackFailed)
+    };
+    let destination = classify(&paths.destination)?;
+    let mut staging = classify(&paths.staging)?;
+    let backup = classify(&paths.backup)?;
+
+    if destination != SecretArtifactKind::Missing && staging != SecretArtifactKind::Missing {
+        match (destination, staging, backup) {
+            (
+                SecretArtifactKind::Unowned | SecretArtifactKind::Prior,
+                SecretArtifactKind::Candidate,
+                SecretArtifactKind::Missing | SecretArtifactKind::Prior,
+            ) => {
+                remove_verified_secret_artifact(
+                    &paths.staging,
+                    &directory,
+                    SecretArtifactKind::Candidate,
                     candidate_comparison_key,
                     candidate_digest,
+                    prior_evidence,
                 )
                 .map_err(|_| SecureFileError::RollbackFailed)?;
-                replace_sibling_file(&paths.backup, &paths.destination, &directory)
+                if backup == SecretArtifactKind::Prior {
+                    remove_verified_secret_artifact(
+                        &paths.backup,
+                        &directory,
+                        SecretArtifactKind::Prior,
+                        candidate_comparison_key,
+                        candidate_digest,
+                        prior_evidence,
+                    )
+                    .map_err(|_| SecureFileError::RollbackFailed)?;
+                }
+                return sync_owner_only_directory(parent, &directory)
+                    .map_err(|_| SecureFileError::RollbackFailed);
+            }
+            (SecretArtifactKind::Candidate, SecretArtifactKind::Candidate, _) => {
+                remove_verified_secret_artifact(
+                    &paths.staging,
+                    &directory,
+                    SecretArtifactKind::Candidate,
+                    candidate_comparison_key,
+                    candidate_digest,
+                    prior_evidence,
+                )
+                .map_err(|_| SecureFileError::RollbackFailed)?;
+                staging = SecretArtifactKind::Missing;
+            }
+            _ => return Err(SecureFileError::RollbackFailed),
+        }
+    }
+
+    if destination != SecretArtifactKind::Missing {
+        debug_assert_eq!(staging, SecretArtifactKind::Missing);
+        match move_sibling_file_without_replace(&paths.destination, &paths.staging, &directory)
+            .map_err(|_| SecureFileError::RollbackFailed)?
+        {
+            NoReplaceMoveOutcome::Moved => {
+                sync_owner_only_directory(parent, &directory)
                     .map_err(|_| SecureFileError::RollbackFailed)?;
             }
-            sync_owner_only_directory(parent, &directory)
-                .map_err(|_| SecureFileError::RollbackFailed)?;
-        } else {
-            if !destination_exists {
+            NoReplaceMoveOutcome::SourceMissing | NoReplaceMoveOutcome::DestinationOccupied => {
                 return Err(SecureFileError::RollbackFailed);
             }
-            verify_owner_only_secret_digest(&paths.destination, prior_comparison_key, prior_digest)
-                .map_err(|_| SecureFileError::RollbackFailed)?;
         }
-    } else {
-        if backup_exists {
-            return Err(SecureFileError::RollbackFailed);
-        }
-        if destination_exists {
-            verify_owner_only_secret_digest(
+    }
+
+    staging = classify(&paths.staging)?;
+    let backup = classify(&paths.backup)?;
+    match (staging, backup) {
+        (
+            SecretArtifactKind::Candidate,
+            SecretArtifactKind::Prior | SecretArtifactKind::Unowned,
+        ) => {
+            restore_parked_secret(
+                &paths.backup,
                 &paths.destination,
+                parent,
+                &directory,
+                backup,
                 candidate_comparison_key,
                 candidate_digest,
+                prior_evidence,
             )
             .map_err(|_| SecureFileError::RollbackFailed)?;
-            remove_sibling_file(&paths.destination, &directory)
-                .and_then(|()| sync_owner_only_directory(parent, &directory))
-                .map_err(|_| SecureFileError::RollbackFailed)?;
+            remove_verified_secret_artifact(
+                &paths.staging,
+                &directory,
+                SecretArtifactKind::Candidate,
+                candidate_comparison_key,
+                candidate_digest,
+                prior_evidence,
+            )
+            .map_err(|_| SecureFileError::RollbackFailed)?;
         }
-    }
-    if staging_exists {
-        verify_owner_only_secret_digest(&paths.staging, candidate_comparison_key, candidate_digest)
+        (SecretArtifactKind::Candidate, SecretArtifactKind::Missing) if !restores_prior => {
+            remove_verified_secret_artifact(
+                &paths.staging,
+                &directory,
+                SecretArtifactKind::Candidate,
+                candidate_comparison_key,
+                candidate_digest,
+                prior_evidence,
+            )
             .map_err(|_| SecureFileError::RollbackFailed)?;
-        remove_sibling_file(&paths.staging, &directory)
-            .and_then(|()| sync_owner_only_directory(parent, &directory))
+        }
+        (SecretArtifactKind::Unowned, SecretArtifactKind::Missing | SecretArtifactKind::Prior) => {
+            restore_parked_secret(
+                &paths.staging,
+                &paths.destination,
+                parent,
+                &directory,
+                SecretArtifactKind::Unowned,
+                candidate_comparison_key,
+                candidate_digest,
+                prior_evidence,
+            )
             .map_err(|_| SecureFileError::RollbackFailed)?;
+            if backup == SecretArtifactKind::Prior {
+                remove_verified_secret_artifact(
+                    &paths.backup,
+                    &directory,
+                    SecretArtifactKind::Prior,
+                    candidate_comparison_key,
+                    candidate_digest,
+                    prior_evidence,
+                )
+                .map_err(|_| SecureFileError::RollbackFailed)?;
+            }
+        }
+        (SecretArtifactKind::Prior, SecretArtifactKind::Missing | SecretArtifactKind::Prior) => {
+            restore_parked_secret(
+                &paths.staging,
+                &paths.destination,
+                parent,
+                &directory,
+                SecretArtifactKind::Prior,
+                candidate_comparison_key,
+                candidate_digest,
+                prior_evidence,
+            )
+            .map_err(|_| SecureFileError::RollbackFailed)?;
+            if backup == SecretArtifactKind::Prior {
+                remove_verified_secret_artifact(
+                    &paths.backup,
+                    &directory,
+                    SecretArtifactKind::Prior,
+                    candidate_comparison_key,
+                    candidate_digest,
+                    prior_evidence,
+                )
+                .map_err(|_| SecureFileError::RollbackFailed)?;
+            }
+        }
+        (SecretArtifactKind::Missing, SecretArtifactKind::Prior | SecretArtifactKind::Unowned) => {
+            restore_parked_secret(
+                &paths.backup,
+                &paths.destination,
+                parent,
+                &directory,
+                backup,
+                candidate_comparison_key,
+                candidate_digest,
+                prior_evidence,
+            )
+            .map_err(|_| SecureFileError::RollbackFailed)?;
+        }
+        (SecretArtifactKind::Missing, SecretArtifactKind::Missing) if !restores_prior => {}
+        _ => return Err(SecureFileError::RollbackFailed),
     }
-    Ok(())
+    sync_owner_only_directory(parent, &directory).map_err(|_| SecureFileError::RollbackFailed)
 }
 
 /// Removes deterministic staging and backup artifacts after the journal has
@@ -476,38 +651,6 @@ pub fn cleanup_owner_only_secret_file(
     sync_owner_only_directory(parent, &directory)
 }
 
-fn create_owner_only_backup(
-    paths: &OwnerOnlySecretFilePaths,
-    comparison_key: &[u8],
-    expected_digest: &[u8; 32],
-    directory: &OwnerOnlyDirectory,
-) -> Result<(), SecureFileError> {
-    let destination = read_secure_file(
-        &paths.destination,
-        SecurityPolicy::OwnerOnly,
-        MAX_SECRET_FILE_BYTES,
-    )?;
-    let destination_digest =
-        keyed_secret_comparison_digest(comparison_key, destination.as_slice())?;
-    if !constant_time_digest_eq(&destination_digest, expected_digest) {
-        return Err(SecureFileError::UnsafeOrUnavailable);
-    }
-    let mut backup = open_new_owner_only_file(&paths.backup)?;
-    let backed_up = backup
-        .write_all(destination.as_slice())
-        .and_then(|()| backup.sync_all())
-        .map_err(|_| SecureFileError::UnsafeOrUnavailable)
-        .and_then(|()| {
-            drop(backup);
-            verify_owner_only_secret_digest(&paths.backup, comparison_key, expected_digest)
-        });
-    if let Err(error) = backed_up {
-        let _ = remove_sibling_file(&paths.backup, directory);
-        return Err(error);
-    }
-    Ok(())
-}
-
 fn verify_owner_only_secret_digest(
     path: &Path,
     comparison_key: &[u8],
@@ -538,32 +681,137 @@ fn constant_time_digest_eq(left: &[u8; 32], right: &[u8; 32]) -> bool {
         == 0
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SecretArtifactKind {
+    Missing,
+    Candidate,
+    Prior,
+    Unowned,
+}
+
+fn classify_secret_artifact(
+    path: &Path,
+    candidate_comparison_key: &[u8],
+    candidate_digest: &[u8; 32],
+    prior_evidence: Option<(&[u8], &[u8; 32])>,
+) -> Result<SecretArtifactKind, SecureFileError> {
+    if !owner_only_secret_destination_exists(path)? {
+        return Ok(SecretArtifactKind::Missing);
+    }
+    if let Some((prior_comparison_key, prior_digest)) = prior_evidence
+        && secret_digest_matches(path, prior_comparison_key, prior_digest)?
+    {
+        return Ok(SecretArtifactKind::Prior);
+    }
+    if secret_digest_matches(path, candidate_comparison_key, candidate_digest)? {
+        return Ok(SecretArtifactKind::Candidate);
+    }
+    Ok(SecretArtifactKind::Unowned)
+}
+
+fn remove_verified_secret_artifact(
+    path: &Path,
+    directory: &OwnerOnlyDirectory,
+    expected: SecretArtifactKind,
+    candidate_comparison_key: &[u8],
+    candidate_digest: &[u8; 32],
+    prior_evidence: Option<(&[u8], &[u8; 32])>,
+) -> Result<(), SecureFileError> {
+    (classify_secret_artifact(
+        path,
+        candidate_comparison_key,
+        candidate_digest,
+        prior_evidence,
+    )? == expected)
+        .then_some(())
+        .ok_or(SecureFileError::UnsafeOrUnavailable)?;
+    remove_sibling_file(path, directory)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn restore_parked_secret(
+    source: &Path,
+    destination: &Path,
+    parent: &Path,
+    directory: &OwnerOnlyDirectory,
+    expected: SecretArtifactKind,
+    candidate_comparison_key: &[u8],
+    candidate_digest: &[u8; 32],
+    prior_evidence: Option<(&[u8], &[u8; 32])>,
+) -> Result<(), SecureFileError> {
+    let source_kind = classify_secret_artifact(
+        source,
+        candidate_comparison_key,
+        candidate_digest,
+        prior_evidence,
+    )?;
+    if source_kind != expected {
+        return Err(SecureFileError::UnsafeOrUnavailable);
+    }
+    match move_sibling_file_without_replace(source, destination, directory)? {
+        NoReplaceMoveOutcome::Moved => {
+            sync_owner_only_directory(parent, directory)?;
+            let restored_kind = classify_secret_artifact(
+                destination,
+                candidate_comparison_key,
+                candidate_digest,
+                prior_evidence,
+            )?;
+            (restored_kind == expected)
+                .then_some(())
+                .ok_or(SecureFileError::UnsafeOrUnavailable)
+        }
+        NoReplaceMoveOutcome::SourceMissing | NoReplaceMoveOutcome::DestinationOccupied => {
+            Err(SecureFileError::UnsafeOrUnavailable)
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum NoReplaceMoveOutcome {
+    Moved,
+    SourceMissing,
+    DestinationOccupied,
+}
+
 #[cfg(unix)]
-fn replace_sibling_file(
+fn move_sibling_file_without_replace(
     source: &Path,
     destination: &Path,
     directory: &OwnerOnlyDirectory,
-) -> Result<(), SecureFileError> {
+) -> Result<NoReplaceMoveOutcome, SecureFileError> {
     let source_name = source
         .file_name()
         .ok_or(SecureFileError::UnsafeOrUnavailable)?;
     let destination_name = destination
         .file_name()
         .ok_or(SecureFileError::UnsafeOrUnavailable)?;
-    rustix::fs::renameat(directory, source_name, directory, destination_name)
-        .map_err(|_| SecureFileError::UnsafeOrUnavailable)
+    match rustix::fs::renameat_with(
+        directory,
+        source_name,
+        directory,
+        destination_name,
+        rustix::fs::RenameFlags::NOREPLACE,
+    ) {
+        Ok(()) => Ok(NoReplaceMoveOutcome::Moved),
+        Err(rustix::io::Errno::NOENT) => Ok(NoReplaceMoveOutcome::SourceMissing),
+        Err(rustix::io::Errno::EXIST) => Ok(NoReplaceMoveOutcome::DestinationOccupied),
+        Err(_) => Err(SecureFileError::UnsafeOrUnavailable),
+    }
 }
 
 #[cfg(windows)]
-fn replace_sibling_file(
+fn move_sibling_file_without_replace(
     source: &Path,
     destination: &Path,
     _directory: &OwnerOnlyDirectory,
-) -> Result<(), SecureFileError> {
+) -> Result<NoReplaceMoveOutcome, SecureFileError> {
     use std::os::windows::ffi::OsStrExt;
-    use windows_sys::Win32::Storage::FileSystem::{
-        MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW,
+    use windows_sys::Win32::Foundation::{
+        ERROR_ALREADY_EXISTS, ERROR_FILE_EXISTS, ERROR_FILE_NOT_FOUND, ERROR_PATH_NOT_FOUND,
+        GetLastError,
     };
+    use windows_sys::Win32::Storage::FileSystem::{MOVEFILE_WRITE_THROUGH, MoveFileExW};
 
     let source = source
         .as_os_str()
@@ -575,23 +823,29 @@ fn replace_sibling_file(
         .encode_wide()
         .chain(Some(0))
         .collect::<Vec<_>>();
-    (unsafe {
+    if unsafe {
         MoveFileExW(
             source.as_ptr(),
             destination.as_ptr(),
-            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+            MOVEFILE_WRITE_THROUGH,
         )
-    } != 0)
-        .then_some(())
-        .ok_or(SecureFileError::UnsafeOrUnavailable)
+    } != 0
+    {
+        return Ok(NoReplaceMoveOutcome::Moved);
+    }
+    match unsafe { GetLastError() } {
+        ERROR_FILE_NOT_FOUND | ERROR_PATH_NOT_FOUND => Ok(NoReplaceMoveOutcome::SourceMissing),
+        ERROR_ALREADY_EXISTS | ERROR_FILE_EXISTS => Ok(NoReplaceMoveOutcome::DestinationOccupied),
+        _ => Err(SecureFileError::UnsafeOrUnavailable),
+    }
 }
 
 #[cfg(not(any(unix, windows)))]
-fn replace_sibling_file(
+fn move_sibling_file_without_replace(
     _source: &Path,
     _destination: &Path,
     _directory: &OwnerOnlyDirectory,
-) -> Result<(), SecureFileError> {
+) -> Result<NoReplaceMoveOutcome, SecureFileError> {
     Err(SecureFileError::UnsafeOrUnavailable)
 }
 
@@ -692,7 +946,7 @@ fn publish_new_file_without_replace(
 }
 
 #[cfg(unix)]
-fn sync_owner_only_directory(
+pub fn sync_owner_only_directory(
     path: &Path,
     _directory: &OwnerOnlyDirectory,
 ) -> Result<(), SecureFileError> {
@@ -2582,6 +2836,113 @@ mod tests {
             Some((prior_key, &prior_digest)),
         )
         .expect("remove journal artifacts");
+        assert!(!paths.staging().exists());
+        assert!(!paths.backup().exists());
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn journaled_replacement_restores_a_rotation_observed_during_park() {
+        let temporary_root = tempfile::tempdir().expect("create temporary root");
+        #[cfg(unix)]
+        secure_test_root(temporary_root.path());
+        let directory = temporary_root.path().join("owner-only");
+        drop(open_or_create_owner_only_directory(&directory).expect("create owner-only directory"));
+        let destination = directory.join("provider-token");
+        persist_new_owner_only_secret_file(&destination, "prior-secret")
+            .expect("persist prior secret");
+        let paths = OwnerOnlySecretFilePaths::new(&destination, "journal-park-rotation")
+            .expect("create journal paths");
+        let candidate_key = b"candidate-comparison-key";
+        let prior_key = b"prior-comparison-key";
+        let candidate_digest = keyed_secret_comparison_digest(candidate_key, b"candidate-secret")
+            .expect("compute candidate digest");
+        let prior_digest = keyed_secret_comparison_digest(prior_key, b"prior-secret")
+            .expect("compute prior digest");
+
+        stage_owner_only_secret_file(&paths, "candidate-secret", candidate_key, &candidate_digest)
+            .expect("stage candidate");
+        std::fs::write(&destination, "rotated-secret").expect("rotate destination before park");
+
+        assert!(matches!(
+            publish_owner_only_secret_file(
+                &paths,
+                true,
+                true,
+                candidate_key,
+                &candidate_digest,
+                Some(prior_key),
+                Some(&prior_digest),
+            ),
+            Err(SecureFileError::OverwriteRequired)
+        ));
+        assert_eq!(
+            read_owner_only_secret_file(&destination)
+                .expect("read restored rotation")
+                .as_str(),
+            "rotated-secret"
+        );
+        assert!(paths.staging().exists());
+        assert!(!paths.backup().exists());
+        cleanup_owner_only_secret_file(
+            &paths,
+            Some((candidate_key, &candidate_digest)),
+            Some((prior_key, &prior_digest)),
+        )
+        .expect("discard candidate after rejected replacement");
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn journaled_rollback_preserves_a_post_publish_rotation() {
+        let temporary_root = tempfile::tempdir().expect("create temporary root");
+        #[cfg(unix)]
+        secure_test_root(temporary_root.path());
+        let directory = temporary_root.path().join("owner-only");
+        drop(open_or_create_owner_only_directory(&directory).expect("create owner-only directory"));
+        let destination = directory.join("provider-token");
+        persist_new_owner_only_secret_file(&destination, "prior-secret")
+            .expect("persist prior secret");
+        let paths = OwnerOnlySecretFilePaths::new(&destination, "journal-post-publish-rotation")
+            .expect("create journal paths");
+        let candidate_key = b"candidate-comparison-key";
+        let prior_key = b"prior-comparison-key";
+        let candidate_digest = keyed_secret_comparison_digest(candidate_key, b"candidate-secret")
+            .expect("compute candidate digest");
+        let prior_digest = keyed_secret_comparison_digest(prior_key, b"prior-secret")
+            .expect("compute prior digest");
+
+        stage_owner_only_secret_file(&paths, "candidate-secret", candidate_key, &candidate_digest)
+            .expect("stage candidate");
+        assert!(
+            publish_owner_only_secret_file(
+                &paths,
+                true,
+                true,
+                candidate_key,
+                &candidate_digest,
+                Some(prior_key),
+                Some(&prior_digest),
+            )
+            .expect("publish candidate")
+        );
+        std::fs::write(&destination, "rotated-secret").expect("rotate published credential");
+
+        rollback_owner_only_secret_file(
+            &paths,
+            true,
+            candidate_key,
+            &candidate_digest,
+            Some(prior_key),
+            Some(&prior_digest),
+        )
+        .expect("preserve post-publish rotation");
+        assert_eq!(
+            read_owner_only_secret_file(&destination)
+                .expect("read preserved rotation")
+                .as_str(),
+            "rotated-secret"
+        );
         assert!(!paths.staging().exists());
         assert!(!paths.backup().exists());
     }

@@ -880,22 +880,36 @@ impl RuntimeEngine {
         {
             return Err(provider_secret_recovery_failure());
         }
-        let staging =
-            inspect_provider_secret_recovery_artifact(runtime, paths.staging(), journal, false)?;
-        let backup =
-            inspect_provider_secret_recovery_artifact(runtime, paths.backup(), journal, false)?;
+        let rollback_may_hold_unowned_artifacts = matches!(
+            original_phase,
+            ProviderSecretProvisioningPhase::PublishIntent
+                | ProviderSecretProvisioningPhase::RollbackPending
+        );
+        let staging = inspect_provider_secret_recovery_artifact(
+            runtime,
+            paths.staging(),
+            journal,
+            rollback_may_hold_unowned_artifacts,
+        )?;
+        let backup = inspect_provider_secret_recovery_artifact(
+            runtime,
+            paths.backup(),
+            journal,
+            rollback_may_hold_unowned_artifacts,
+        )?;
         let destination = if original_phase == ProviderSecretProvisioningPhase::Planned {
             None
         } else {
             inspect_provider_secret_recovery_artifact(runtime, paths.destination(), journal, true)?
         };
 
-        if staging
-            .as_ref()
-            .is_some_and(|artifact| artifact.candidate.is_none())
-            || backup
+        if !rollback_may_hold_unowned_artifacts
+            && (staging
                 .as_ref()
-                .is_some_and(|artifact| artifact.prior.is_none())
+                .is_some_and(|artifact| artifact.candidate.is_none())
+                || backup
+                    .as_ref()
+                    .is_some_and(|artifact| artifact.prior.is_none()))
         {
             return Err(provider_secret_recovery_failure());
         }
@@ -945,7 +959,7 @@ impl RuntimeEngine {
                 let overwritten = journal
                     .destination_existed()
                     .ok_or_else(provider_secret_recovery_failure)?;
-                if !overwritten {
+                if !overwritten && !rollback_may_hold_unowned_artifacts {
                     if backup.is_some() {
                         return Err(provider_secret_recovery_failure());
                     }
@@ -979,25 +993,37 @@ impl RuntimeEngine {
                 {
                     return Err(provider_secret_recovery_failure());
                 }
-                if overwritten {
-                    if destination.as_ref().is_some_and(|artifact| {
-                        artifact.candidate.is_none() && artifact.prior.is_none()
-                    }) || backup.is_none()
-                        && destination
+                if !rollback_may_hold_unowned_artifacts {
+                    if overwritten {
+                        if destination.as_ref().is_some_and(|artifact| {
+                            artifact.candidate.is_none() && artifact.prior.is_none()
+                        }) || backup.is_none()
+                            && destination
+                                .as_ref()
+                                .and_then(|artifact| artifact.prior.as_ref())
+                                .is_none()
+                        {
+                            return Err(provider_secret_recovery_failure());
+                        }
+                    } else if backup.is_some()
+                        || destination
                             .as_ref()
-                            .and_then(|artifact| artifact.prior.as_ref())
-                            .is_none()
+                            .is_some_and(|artifact| artifact.candidate.is_none())
                     {
                         return Err(provider_secret_recovery_failure());
                     }
-                } else if backup.is_some()
-                    || destination
-                        .as_ref()
-                        .is_some_and(|artifact| artifact.candidate.is_none())
-                {
-                    return Err(provider_secret_recovery_failure());
                 }
                 if !overwritten && destination.is_none() && staging.is_none() {
+                    self.finish_recovered_provider_secret_failure(journal.operation_id())?;
+                    return Ok(());
+                }
+                if rollback_may_hold_unowned_artifacts
+                    && destination
+                        .as_ref()
+                        .is_some_and(|artifact| artifact.unowned)
+                    && staging.is_none()
+                    && backup.is_none()
+                {
                     self.finish_recovered_provider_secret_failure(journal.operation_id())?;
                     return Ok(());
                 }

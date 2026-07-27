@@ -457,6 +457,25 @@ pub(super) fn host_identity(connection: &Connection) -> Result<HostIdentityRef, 
     HostIdentityRef::new(value).map_err(|_| StorageError::new(StorageErrorKind::InvalidStoredState))
 }
 
+pub(super) fn commit_fresh_host_identity(
+    connection: &mut Connection,
+    accepted_identity: &HostIdentityRef,
+) -> Result<(), StorageError> {
+    let transaction = connection.transaction().map_err(operation_failed)?;
+    let changed = transaction
+        .execute(
+            "UPDATE daemon_identity
+             SET host_identity_ref = ?1
+             WHERE singleton = 1",
+            params![accepted_identity.as_str()],
+        )
+        .map_err(operation_failed)?;
+    if changed != 1 {
+        return Err(StorageError::new(StorageErrorKind::InvalidStoredState));
+    }
+    transaction.commit().map_err(operation_failed)
+}
+
 pub(super) fn digest_idempotency_payload(
     connection: &Connection,
     canonical_payload: &[u8],

@@ -74,8 +74,10 @@ pub use satelle_core::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use std::path::Path;
 use std::sync::{Arc, Mutex, RwLock, RwLockReadGuard};
 use std::time::Instant;
+use storage::Storage;
 pub use storage::{
     SetupActionPlan, SetupActionRecord, SetupActionSkipReason, SetupActionStatus,
     SetupOperationKind, SetupRepairAction, SetupRepairDecision, SetupRepairPlan,
@@ -1666,6 +1668,31 @@ impl HostService {
             token, scopes, expires_at,
         )));
         service
+    }
+
+    /// Commits the exact Controller-accepted identity for a fresh SSH Host
+    /// before any listener can expose the new daemon.
+    pub fn commit_fresh_ssh_host_identity(
+        state_root: &Path,
+        identity: &satelle_core::session::HostIdentityRef,
+        operation_id: &str,
+    ) -> Result<satelle_core::session::HostIdentityRef, SatelleError> {
+        Storage::commit_fresh_ssh_host_identity(state_root, identity, operation_id)
+            .map_err(runtime::storage_error)
+    }
+
+    /// Reports an interrupted fresh-identity commit so ordinary startup can
+    /// fail closed instead of opening the partially initialized store.
+    pub fn fresh_ssh_identity_commit_pending(state_root: &Path) -> Result<bool, SatelleError> {
+        Storage::fresh_ssh_identity_commit_pending(state_root).map_err(runtime::storage_error)
+    }
+
+    /// Reads only a valid owner-only unfinished SSH identity intent. It never
+    /// opens SQLite or initializes Host state.
+    pub fn inspect_fresh_ssh_identity_commit(
+        state_root: &Path,
+    ) -> Result<Option<(String, satelle_core::session::HostIdentityRef)>, SatelleError> {
+        Storage::inspect_fresh_ssh_identity_commit(state_root).map_err(runtime::storage_error)
     }
 
     /// Reports whether this service owns a process-local SSH bootstrap

@@ -8,6 +8,7 @@ mod transport_tls;
 
 pub use client::{
     DaemonClient, DaemonClientError, DaemonEventClient, DaemonEventError, DaemonEventStream,
+    PreparedProviderSecretProvisioning,
 };
 pub use contract::{
     AdmissionCancellationOutcome, AdmissionCancellationResponse, ApiError, ApiErrorCode,

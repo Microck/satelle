@@ -84,6 +84,7 @@ const STATE_RELEASE_TIMEOUT: Duration = Duration::from_secs(20);
 const STATE_RELEASE_POLL_INTERVAL: Duration = Duration::from_millis(50);
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
+use uuid::Uuid;
 use zeroize::Zeroizing;
 
 #[derive(Parser, Debug)]
@@ -437,6 +438,43 @@ struct HostStartCommand {
     /// retained only by this daemon process.
     #[arg(long, hide = true)]
     bootstrap_token_stdin: bool,
+    /// Internal exact identity accepted by the Controller for a fresh SSH Host.
+    #[arg(
+        long,
+        hide = true,
+        value_name = "HOST_ID",
+        requires = "bootstrap_token_stdin",
+        requires = "initial_identity_operation_id"
+    )]
+    initial_host_identity: Option<String>,
+    /// Internal Bootstrap Lock operation that owns the fresh identity commit.
+    #[arg(
+        long,
+        hide = true,
+        value_name = "OPERATION_ID",
+        requires = "bootstrap_token_stdin",
+        requires = "initial_host_identity"
+    )]
+    initial_identity_operation_id: Option<String>,
+    /// Internal read-only inspection of an unfinished fresh SSH identity commit.
+    #[arg(
+        long,
+        hide = true,
+        conflicts_with_all = [
+            "tls_cert",
+            "tls_key",
+            "foreground",
+            "bootstrap_token_stdin",
+            "initial_host_identity",
+            "initial_identity_operation_id",
+            "bootstrap_scope",
+            "bootstrap_native_readiness_timeout_ms",
+            "bootstrap_provider_smoke_timeout_ms",
+            "on_demand_idle_timeout_ms",
+            "service_config"
+        ]
+    )]
+    inspect_ssh_identity_commit: bool,
     /// Internal least-privilege scope for the one SSH bootstrap operation.
     #[arg(long, hide = true, value_enum, requires = "bootstrap_token_stdin")]
     bootstrap_scope: Option<SshBootstrapScope>,
@@ -460,6 +498,9 @@ struct HostStartCommand {
             "tls_key",
             "foreground",
             "bootstrap_token_stdin",
+            "initial_host_identity",
+            "initial_identity_operation_id",
+            "inspect_ssh_identity_commit",
             "bootstrap_scope",
             "bootstrap_native_readiness_timeout_ms",
             "bootstrap_provider_smoke_timeout_ms",
@@ -1268,6 +1309,9 @@ fn history_target(command: &Command) -> Option<HistoryTarget<'_>> {
         Command::Host {
             command: HostCommand::ReleaseState,
         } => return None,
+        Command::Host {
+            command: HostCommand::Start(command),
+        } if command.inspect_ssh_identity_commit => return None,
         Command::Host { command } => HistoryTarget {
             family: "host",
             selects_host: match command {
@@ -1650,6 +1694,9 @@ mod history_target_tests {
                 tls_key: None,
                 foreground,
                 bootstrap_token_stdin,
+                initial_host_identity: None,
+                initial_identity_operation_id: None,
+                inspect_ssh_identity_commit: false,
                 bootstrap_scope: bootstrap_token_stdin.then_some(SshBootstrapScope::Control),
                 bootstrap_native_readiness_timeout_ms: None,
                 bootstrap_provider_smoke_timeout_ms: None,
@@ -3241,7 +3288,7 @@ fn inspect_first_ssh_host_during_setup(
     }
     if !noninteractive && !command.yes && !consent_granted {
         let confirmed = cliclack::confirm(format!(
-            "Start a temporary SSH bootstrap for Host '{}' at '{}'?",
+            "Run the temporary SSH identity probe for Host '{}' at '{}'?",
             host.alias,
             host.config.address.as_deref().unwrap_or("not configured")
         ))
@@ -3249,19 +3296,24 @@ fn inspect_first_ssh_host_during_setup(
         .interact()
         .map_err(|source| {
             failure(setup_interaction_error(
-                "could not read temporary SSH bootstrap confirmation",
+                "could not read temporary SSH identity probe confirmation",
                 source,
             ))
         })?;
         if !confirmed {
             return Err(failure(SatelleError::setup_consent_required(
-                &["start the temporary SSH bootstrap".to_string()],
-                "rerun setup and approve the temporary SSH bootstrap",
+                &["run the temporary SSH identity probe".to_string()],
+                "rerun setup and approve the temporary SSH identity probe",
             )));
         }
     }
-    let discovery = discover_ssh_host(host, daemon_path_overrides).map_err(failure)?;
-    let observed_identity = &discovery.identity;
+    let pending = discover_ssh_host(
+        host,
+        daemon_path_overrides,
+        command.expected_host_id.as_deref(),
+    )
+    .map_err(failure)?;
+    let observed_identity = pending.identity().to_string();
     HostIdentityRef::new(observed_identity.clone()).map_err(|_| {
         failure(SatelleError::remote_api_error(
             &host.alias,
@@ -3276,7 +3328,7 @@ fn inspect_first_ssh_host_during_setup(
         return Err(failure(SatelleError::host_identity_mismatch(&host.alias)));
     }
     if host.config.expected_host_id.as_deref() == Some(observed_identity.as_str()) {
-        return Ok(discovery);
+        return pending.accept().map_err(failure);
     }
 
     if !noninteractive {
@@ -3317,7 +3369,7 @@ fn inspect_first_ssh_host_during_setup(
         }
     }
 
-    Ok(discovery)
+    pending.accept().map_err(failure)
 }
 
 fn accept_setup_provider_auth_validation(
@@ -5811,6 +5863,20 @@ fn start_host_daemon_with(
         &HostConfig,
     ) -> HostService,
 ) -> Result<(), CliFailure> {
+    if command.inspect_ssh_identity_commit {
+        let state_root = satelle_core::state_dir().map_err(failure)?;
+        let Some((operation_id, host_identity)) =
+            HostService::inspect_fresh_ssh_identity_commit(&state_root).map_err(failure)?
+        else {
+            return Err(failure(SatelleError::state_conflict()));
+        };
+        return print_json(&json!({
+            "schema_version": "satelle.ssh-identity-commit-inspection.v1",
+            "operation_id": operation_id,
+            "host_identity": host_identity.as_str(),
+        }))
+        .map_err(failure);
+    }
     validate_host_start_mode(&command).map_err(failure)?;
     if command.service_config.is_some() {
         #[cfg(not(windows))]
@@ -5841,6 +5907,30 @@ fn start_host_daemon_with(
         (false, Some(_)) => {
             return Err(failure(SatelleError::invalid_usage(
                 "SSH bootstrap scope is valid only with --bootstrap-token-stdin",
+            )));
+        }
+    };
+    let initial_identity = match (
+        command.initial_host_identity.as_deref(),
+        command.initial_identity_operation_id.as_deref(),
+    ) {
+        (Some(identity), Some(operation_id)) => {
+            let identity = HostIdentityRef::new(identity.to_string()).map_err(|_| {
+                failure(SatelleError::invalid_usage(
+                    "--initial-host-identity must be a valid Host Identity",
+                ))
+            })?;
+            Uuid::parse_str(operation_id).map_err(|_| {
+                failure(SatelleError::invalid_usage(
+                    "--initial-identity-operation-id must be a UUID",
+                ))
+            })?;
+            Some((identity, operation_id.to_string()))
+        }
+        (None, None) => None,
+        _ => {
+            return Err(failure(SatelleError::invalid_usage(
+                "fresh SSH identity commit arguments require each other",
             )));
         }
     };
@@ -5902,6 +5992,14 @@ fn start_host_daemon_with(
         .and_then(|host| host.config.daemon_state_dir.clone())
         .map_or_else(satelle_core::state_dir, Ok)
         .map_err(failure)?;
+    if initial_identity.is_none()
+        && HostService::fresh_ssh_identity_commit_pending(&state_release_root).map_err(failure)?
+    {
+        return Err(failure(SatelleError::config_error(
+            "the Host has an unfinished SSH identity commit",
+            Some("rerun SSH setup with the exact previously accepted Host Identity".to_string()),
+        )));
+    }
     let service = match (on_demand_host.as_ref(), bootstrap_token.as_ref()) {
         (_, Some(token)) => {
             let mut host_config = satelle_core::SatelleConfig::defaults()
@@ -5909,6 +6007,17 @@ fn start_host_daemon_with(
                 .remove(LOCAL_DEMO_HOST)
                 .expect("the built-in local Host config exists");
             host_config.timeouts = forwarded_readiness_timeouts;
+            if let Some((identity, operation_id)) = initial_identity.as_ref() {
+                let committed = HostService::commit_fresh_ssh_host_identity(
+                    &state_release_root,
+                    identity,
+                    operation_id,
+                )
+                .map_err(failure)?;
+                if committed != *identity {
+                    return Err(failure(SatelleError::state_conflict()));
+                }
+            }
             build_bootstrap_service(
                 token,
                 bootstrap_scopes.expect("bootstrap token has a validated scope"),
@@ -6629,6 +6738,9 @@ mod daemon_tls_watcher_tests {
             tls_key: tls_key.map(PathBuf::from),
             foreground: true,
             bootstrap_token_stdin: false,
+            initial_host_identity: None,
+            initial_identity_operation_id: None,
+            inspect_ssh_identity_commit: false,
             bootstrap_scope: None,
             bootstrap_native_readiness_timeout_ms: None,
             bootstrap_provider_smoke_timeout_ms: None,
@@ -7148,6 +7260,9 @@ mod bootstrap_startup_tests {
             tls_key: None,
             foreground: false,
             bootstrap_token_stdin: true,
+            initial_host_identity: None,
+            initial_identity_operation_id: None,
+            inspect_ssh_identity_commit: false,
             bootstrap_scope: Some(SshBootstrapScope::Read),
             bootstrap_native_readiness_timeout_ms: None,
             bootstrap_provider_smoke_timeout_ms: None,

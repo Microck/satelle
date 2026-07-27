@@ -1658,6 +1658,31 @@ impl HostService {
 
     #[doc(hidden)]
     #[cfg(any(test, feature = "test-support"))]
+    pub fn local_demo_with_readiness_for_tests_at(
+        state_root: impl Into<std::path::PathBuf>,
+    ) -> Result<Self, SatelleError> {
+        Ok(Self {
+            runtime: crate::runtime::RuntimeHandle::new_with_readiness_probe_driver(
+                Ok(state_root.into()),
+                crate::test_runtime::FakeComputerUseAdapter,
+                crate::test_runtime::FakeComputerUseAdapter,
+            ),
+            operation_capacity: std::sync::Arc::new(
+                crate::operation_capacity::OperationCapacity::default(),
+            ),
+            turn_execution_timeout: crate::configured_turn_execution_timeout(
+                &satelle_core::SatelleConfig::defaults().hosts[satelle_core::LOCAL_DEMO_HOST],
+            ),
+            mode: HostMode::TestFake {
+                image_attachments: true,
+            },
+            bootstrap_auth: None,
+            bootstrap_maintenance: std::sync::Arc::new(std::sync::Mutex::new(None)),
+        })
+    }
+
+    #[doc(hidden)]
+    #[cfg(any(test, feature = "test-support"))]
     pub fn with_ssh_bootstrap_auth_for_tests(
         self,
         token: &ApiBearerToken,

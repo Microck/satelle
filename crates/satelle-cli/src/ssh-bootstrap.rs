@@ -1,5 +1,6 @@
 use flate2::read::GzDecoder;
 use reqwest::blocking::{Client, Response};
+use satelle_core::session::HostIdentityRef;
 use satelle_core::{DaemonPathOverrides, HostConfig};
 use satelle_host::{ApiBearerToken, readiness_probe_timeouts};
 use serde::{Deserialize, Serialize};
@@ -116,6 +117,7 @@ struct ReadinessTimeouts {
 #[derive(Clone, Copy)]
 enum BootstrapLaunchMode<'a> {
     Durable,
+    Fresh,
     Ephemeral {
         previous_host_config: &'a HostConfig,
     },
@@ -125,6 +127,7 @@ impl<'a> BootstrapLaunchMode<'a> {
     const fn bind(self) -> &'static str {
         match self {
             Self::Durable => "127.0.0.1:3001",
+            Self::Fresh => "127.0.0.1:0",
             Self::Ephemeral { .. } => "127.0.0.1:0",
         }
     }
@@ -132,13 +135,14 @@ impl<'a> BootstrapLaunchMode<'a> {
     const fn expected_port(self) -> Option<u16> {
         match self {
             Self::Durable => Some(3001),
+            Self::Fresh => None,
             Self::Ephemeral { .. } => None,
         }
     }
 
     const fn release_host_config(self) -> Option<&'a HostConfig> {
         match self {
-            Self::Durable => None,
+            Self::Durable | Self::Fresh => None,
             Self::Ephemeral {
                 previous_host_config,
             } => Some(previous_host_config),
@@ -146,9 +150,16 @@ impl<'a> BootstrapLaunchMode<'a> {
     }
 }
 
+#[derive(Clone, Copy)]
+pub(super) struct InitialHostIdentityCommit<'a> {
+    pub(super) host_identity: &'a HostIdentityRef,
+    pub(super) operation_id: &'a str,
+}
+
 struct BootstrapStartContext<'a> {
     bootstrap_scope: SshBootstrapScope,
     bind: &'a str,
+    initial_identity: Option<InitialHostIdentityCommit<'a>>,
 }
 
 impl SshBootstrapLock {
@@ -451,6 +462,7 @@ impl SshBootstrapProcess {
             host_config,
             bootstrap_scope,
             BootstrapLaunchMode::Durable,
+            None,
             bootstrap_lock,
         )
     }
@@ -471,6 +483,26 @@ impl SshBootstrapProcess {
             BootstrapLaunchMode::Ephemeral {
                 previous_host_config,
             },
+            None,
+            bootstrap_lock,
+        )
+    }
+
+    pub(super) fn launch_fresh(
+        destination: &str,
+        token: &ApiBearerToken,
+        host_config: &HostConfig,
+        bootstrap_scope: SshBootstrapScope,
+        initial_identity: InitialHostIdentityCommit<'_>,
+        bootstrap_lock: &mut SshBootstrapLock,
+    ) -> Result<Self, SshBootstrapError> {
+        Self::launch_bound(
+            destination,
+            token,
+            host_config,
+            bootstrap_scope,
+            BootstrapLaunchMode::Fresh,
+            Some(initial_identity),
             bootstrap_lock,
         )
     }
@@ -481,6 +513,7 @@ impl SshBootstrapProcess {
         host_config: &HostConfig,
         bootstrap_scope: SshBootstrapScope,
         launch_mode: BootstrapLaunchMode<'_>,
+        initial_identity: Option<InitialHostIdentityCommit<'_>>,
         bootstrap_lock: &mut SshBootstrapLock,
     ) -> Result<Self, SshBootstrapError> {
         let target = RemoteTarget::probe(destination)?;
@@ -507,6 +540,7 @@ impl SshBootstrapProcess {
             BootstrapStartContext {
                 bootstrap_scope,
                 bind: launch_mode.bind(),
+                initial_identity,
             },
         );
         if let Some(release_command) = release_command {
@@ -679,7 +713,123 @@ pub(super) enum RemoteTarget {
     WindowsX64Msvc,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) enum InitialHostState {
+    Fresh,
+    Existing,
+    PendingIdentityCommit {
+        operation_id: String,
+        host_identity: HostIdentityRef,
+    },
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SshIdentityCommitInspection {
+    schema_version: String,
+    operation_id: String,
+    host_identity: String,
+}
+
 impl RemoteTarget {
+    pub(super) fn inspect_initial_host_state(
+        self,
+        destination: &str,
+        directories: &RemoteUserDirectories,
+        host_config: &HostConfig,
+    ) -> Result<InitialHostState, SshBootstrapError> {
+        let state_root = host_config
+            .daemon_state_dir
+            .as_ref()
+            .map(|path| path.as_os_str().to_string_lossy().into_owned())
+            .unwrap_or_else(|| directories.resolved_path_set().state_root);
+        self.validate_daemon_path("SATELLE_STATE_DIR", Path::new(&state_root))?;
+        let journal = join_target_path(self, &state_root, ".satelle-ssh-identity-commit");
+        let command = if self.is_windows() {
+            let script = format!(
+                "$ErrorActionPreference = 'Stop'; [Console]::Out.WriteLine('satelle-initial-host-state-v1'); if (Test-Path -LiteralPath {}) {{ [Console]::Out.WriteLine('pending_identity_commit') }} elseif (Test-Path -LiteralPath {}) {{ [Console]::Out.WriteLine('existing') }} else {{ [Console]::Out.WriteLine('fresh') }}",
+                powershell_quote(&journal),
+                powershell_quote(&state_root),
+            );
+            powershell_encoded_command(&script)
+        } else {
+            let script = format!(
+                "printf 'satelle-initial-host-state-v1\\n'; if [ -e {journal} ] || [ -L {journal} ]; then printf 'pending_identity_commit\\n'; elif [ -e {state_root} ] || [ -L {state_root} ]; then printf 'existing\\n'; else printf 'fresh\\n'; fi",
+                journal = posix_quote(&journal),
+                state_root = posix_quote(&state_root),
+            );
+            format!("sh -c {}", posix_quote(&script))
+        };
+        let output = run_ssh_command(destination, &command)?;
+        if !output.status.success() {
+            return Err(SshBootstrapError::PlatformProbeFailed);
+        }
+        let output =
+            std::str::from_utf8(&output.stdout).map_err(|_| SshBootstrapError::InvalidProbe)?;
+        let mut lines = output.lines();
+        if lines.next() != Some("satelle-initial-host-state-v1") {
+            return Err(SshBootstrapError::InvalidProbe);
+        }
+        let state = match lines.next() {
+            Some("fresh") => InitialHostState::Fresh,
+            Some("existing") => InitialHostState::Existing,
+            Some("pending_identity_commit") => {
+                if lines.next().is_some() {
+                    return Err(SshBootstrapError::InvalidProbe);
+                }
+                return self.inspect_pending_identity_commit(destination, directories, host_config);
+            }
+            _ => return Err(SshBootstrapError::InvalidProbe),
+        };
+        if lines.next().is_some() {
+            return Err(SshBootstrapError::InvalidProbe);
+        }
+        Ok(state)
+    }
+
+    fn inspect_pending_identity_commit(
+        self,
+        destination: &str,
+        directories: &RemoteUserDirectories,
+        host_config: &HostConfig,
+    ) -> Result<InitialHostState, SshBootstrapError> {
+        let release = ReleaseArtifactMetadata::fetch(self)?;
+        let remote_binary = self.planned_install_path(directories, &release.digest())?;
+        let environment = self.validated_daemon_environment(host_config)?;
+        let command = if self.is_windows() {
+            let script = format!(
+                "{}& {} host start --inspect-ssh-identity-commit --json",
+                powershell_environment(&environment),
+                powershell_quote(&remote_binary),
+            );
+            powershell_encoded_command(&script)
+        } else {
+            let script = format!(
+                "{}exec {} host start --inspect-ssh-identity-commit --json",
+                posix_environment(&environment),
+                posix_quote(&remote_binary),
+            );
+            format!("sh -c {}", posix_quote(&script))
+        };
+        let output = run_ssh_command(destination, &command)?;
+        if !output.status.success() {
+            return Err(SshBootstrapError::RemoteOperationFailed);
+        }
+        let inspection: SshIdentityCommitInspection =
+            serde_json::from_slice(&output.stdout).map_err(|_| SshBootstrapError::InvalidProbe)?;
+        if inspection.schema_version != "satelle.ssh-identity-commit-inspection.v1"
+            || Uuid::parse_str(&inspection.operation_id).is_err()
+        {
+            return Err(SshBootstrapError::InvalidProbe);
+        }
+        let host_identity = HostIdentityRef::new(inspection.host_identity)
+            .map_err(|_| SshBootstrapError::InvalidProbe)?;
+        Ok(InitialHostState::PendingIdentityCommit {
+            operation_id: inspection.operation_id,
+            host_identity,
+        })
+    }
+
     fn state_owner_handoff_commands(
         self,
         remote_binary: &str,
@@ -698,6 +848,7 @@ impl RemoteTarget {
             ReadinessTimeouts { native, provider },
             start_context.bind,
             environment,
+            start_context.initial_identity,
         );
         (release_command, start_command)
     }
@@ -1516,6 +1667,7 @@ printf 'removed=%s\nretained=%s\n' "$removed" "$retained""#,
             },
             bind,
             &[],
+            None,
         )
     }
 
@@ -1526,6 +1678,7 @@ printf 'removed=%s\nretained=%s\n' "$removed" "$retained""#,
         readiness_timeouts: ReadinessTimeouts,
         bind: &str,
         environment: &[(&'static str, &Path)],
+        initial_identity: Option<InitialHostIdentityCommit<'_>>,
     ) -> String {
         let timeout_args = format!(
             "--bind {bind} --bootstrap-scope {} --bootstrap-native-readiness-timeout-ms {} --bootstrap-provider-smoke-timeout-ms {}",
@@ -1533,16 +1686,39 @@ printf 'removed=%s\nretained=%s\n' "$removed" "$retained""#,
             readiness_timeouts.native.as_millis(),
             readiness_timeouts.provider.as_millis(),
         );
+        let windows_identity_args = initial_identity.map_or_else(String::new, |initial| {
+            format!(
+                " --initial-host-identity {} --initial-identity-operation-id {}",
+                powershell_quote(initial.host_identity.as_str()),
+                powershell_quote(initial.operation_id),
+            )
+        });
+        let posix_identity_args = initial_identity.map_or_else(String::new, |initial| {
+            format!(
+                " --initial-host-identity {} --initial-identity-operation-id {}",
+                posix_quote(initial.host_identity.as_str()),
+                posix_quote(initial.operation_id),
+            )
+        });
         if self.is_windows() {
             let script = format!(
-                "{}& {} host start --bootstrap-token-stdin {timeout_args} --json",
+                "{}& {} host start --bootstrap-token-stdin {timeout_args}{windows_identity_args} --json",
                 powershell_environment(environment),
                 powershell_quote(remote_binary),
             );
             powershell_encoded_command(&script)
+        } else if initial_identity.is_some() {
+            // Pass the fresh identity command as an argument vector so the
+            // outer login shell cannot reinterpret either identity value.
+            let script = format!("{}exec \"$@\"", posix_environment(environment));
+            let arguments = format!(
+                "{} host start --bootstrap-token-stdin {timeout_args}{posix_identity_args} --json",
+                posix_quote(remote_binary),
+            );
+            format!("sh -c {} sh {arguments}", posix_quote(&script))
         } else {
             let script = format!(
-                "{}exec {remote_binary} host start --bootstrap-token-stdin {timeout_args} --json",
+                "{}exec {remote_binary} host start --bootstrap-token-stdin {timeout_args}{posix_identity_args} --json",
                 posix_environment(environment),
             );
             format!("sh -c {}", posix_quote(&script))
@@ -5726,6 +5902,51 @@ mod tests {
     }
 
     #[test]
+    fn fresh_bootstrap_start_commands_bind_the_exact_identity_commit() {
+        let identity = HostIdentityRef::new("host-0195f6d5-18da-7a80-8000-000000000001")
+            .expect("valid Host Identity");
+        let initial = InitialHostIdentityCommit {
+            host_identity: &identity,
+            operation_id: "0195f6d5-18da-7a80-8000-000000000002",
+        };
+        let timeouts = ReadinessTimeouts {
+            native: Duration::from_millis(2_500),
+            provider: Duration::from_millis(7_500),
+        };
+        let unix = RemoteTarget::LinuxX64Gnu.start_command_with_environment(
+            "/tmp/satelle",
+            SshBootstrapScope::Admin,
+            timeouts,
+            "127.0.0.1:0",
+            &[],
+            Some(initial),
+        );
+        assert!(
+            unix.contains("--initial-host-identity 'host-0195f6d5-18da-7a80-8000-000000000001'")
+        );
+        assert!(
+            unix.contains("--initial-identity-operation-id '0195f6d5-18da-7a80-8000-000000000002'")
+        );
+
+        let windows = RemoteTarget::WindowsX64Msvc.start_command_with_environment(
+            "satelle.exe",
+            SshBootstrapScope::Admin,
+            timeouts,
+            "127.0.0.1:0",
+            &[],
+            Some(initial),
+        );
+        let script = decode_powershell_command(&windows).expect("decode fresh bootstrap command");
+        assert!(
+            script.contains("--initial-host-identity 'host-0195f6d5-18da-7a80-8000-000000000001'")
+        );
+        assert!(
+            script
+                .contains("--initial-identity-operation-id '0195f6d5-18da-7a80-8000-000000000002'")
+        );
+    }
+
+    #[test]
     fn path_change_releases_the_old_owner_before_the_new_daemon_becomes_authoritative() {
         let mut host = HostConfig {
             provider_bindings: std::collections::BTreeMap::new(),
@@ -5768,6 +5989,7 @@ mod tests {
             },
             "127.0.0.1:3001",
             &unix_environment,
+            None,
         );
         assert!(unix.contains("SATELLE_HOME"));
         assert!(unix.contains("/srv/satelle home"));
@@ -5787,6 +6009,7 @@ mod tests {
             BootstrapStartContext {
                 bootstrap_scope: SshBootstrapScope::Admin,
                 bind: "127.0.0.1:0",
+                initial_identity: None,
             },
         );
         let release = release.expect("a setup bootstrap releases the prior state owner");
@@ -5810,6 +6033,7 @@ mod tests {
             },
             "127.0.0.1:3001",
             &windows_environment,
+            None,
         );
         let script = decode_powershell_command(&windows).expect("decode PowerShell command");
         assert_powershell_clears_daemon_environment(&script);
@@ -5836,6 +6060,7 @@ mod tests {
             },
             "127.0.0.1:3001",
             &[],
+            None,
         );
         assert!(empty_posix.contains(POSIX_DAEMON_ENVIRONMENT_CLEAR));
 
@@ -5849,6 +6074,7 @@ mod tests {
             },
             "127.0.0.1:3001",
             &posix_environment,
+            None,
         );
         assert!(configured_posix.contains(POSIX_DAEMON_ENVIRONMENT_CLEAR));
         assert!(configured_posix.contains("SATELLE_STATE_DIR="));
@@ -5867,6 +6093,7 @@ mod tests {
             },
             "127.0.0.1:3001",
             &[],
+            None,
         );
         let empty_script =
             decode_powershell_command(&empty_windows).expect("decode empty foreground command");
@@ -5882,6 +6109,7 @@ mod tests {
             },
             "127.0.0.1:3001",
             &windows_environment,
+            None,
         );
         let configured_script = decode_powershell_command(&configured_windows)
             .expect("decode configured foreground command");

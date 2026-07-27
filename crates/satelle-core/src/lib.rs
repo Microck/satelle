@@ -59,7 +59,7 @@ pub use secure_file::{
     persist_new_owner_only_secret_file, publish_owner_only_secret_file,
     read_bounded_regular_file_no_follow, read_owner_controlled_config_file,
     read_owner_only_secret_config_file, read_owner_only_secret_file, read_trusted_ca_bundle_file,
-    rollback_owner_only_secret_file, stage_owner_only_secret_file,
+    rollback_owner_only_secret_file, stage_owner_only_secret_file, sync_owner_only_directory,
 };
 
 pub const PRODUCT_NAME: &str = "Satelle";

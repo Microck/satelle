@@ -1,10 +1,12 @@
 use satelle_core::{ProviderBindingAuthorization, ProviderSecretSource};
+use satelle_host::ApiBearerToken;
 use satelle_transport::{
-    ProviderSecretProvisioningMetadata, ProviderSecretProvisioningPreviewResponse,
-    ProviderSecretProvisioningResponse,
+    DaemonClient, PreparedProviderSecretProvisioning, ProviderSecretProvisioningMetadata,
+    ProviderSecretProvisioningPreviewResponse, ProviderSecretProvisioningResponse,
 };
 use serde_json::json;
 use std::path::PathBuf;
+use zeroize::Zeroizing;
 
 #[test]
 fn provisioning_metadata_is_versioned_and_carries_no_raw_secret_field() {
@@ -94,4 +96,53 @@ fn preview_response_contains_only_metadata_and_ephemeral_upload_grant() {
     assert!(encoded.get("destination_exists").is_none());
     assert!(encoded.get("overwrite_required").is_none());
     assert!(encoded.get("path").is_none());
+}
+
+#[test]
+fn prepared_provider_secret_debug_is_fully_redacted() {
+    let preview: ProviderSecretProvisioningPreviewResponse = serde_json::from_value(json!({
+        "schema_version": "satelle.provider-secret-provisioning-preview-response.v2",
+        "request_id": "0195f6d5-18da-7a80-8000-000000000001",
+        "host_identity": "host-debug-redaction-marker",
+        "destination_kind": "file",
+        "persistence_location_class": "host_private_file",
+        "overwrite_behavior": "reject_existing_without_explicit_authorization",
+        "upload_id": "0195f6d5-18da-7a80-8000-000000000002",
+        "recipient_public_key": "hSDwCYkwp1R0i33ctD73Wg2/Og0mOBr066SpjqqbTmo=",
+        "expires_at": "2099-07-27T02:10:00Z"
+    }))
+    .expect("provider-secret preview should decode");
+    let metadata = ProviderSecretProvisioningMetadata::new(
+        ProviderBindingAuthorization::new(
+            "model-debug-redaction-marker",
+            "provider-debug-redaction-marker",
+            "gpt-image",
+            "openai",
+        )
+        .with_auth_source(ProviderSecretSource::File {
+            path: PathBuf::from("/run/secrets/debug-redaction-marker"),
+        }),
+        true,
+    );
+    let client = DaemonClient::loopback(
+        "127.0.0.1:1"
+            .parse()
+            .expect("loopback fixture address should parse"),
+        ApiBearerToken::generate().expect("generate client token"),
+        "host-debug-redaction-marker",
+    )
+    .expect("construct loopback client");
+    let prepared: PreparedProviderSecretProvisioning = client
+        .prepare_provider_secret_provisioning(
+            &preview,
+            &metadata,
+            Zeroizing::new(b"provider-secret-debug-redaction-marker".to_vec()),
+            "idempotency-debug-redaction-marker",
+        )
+        .expect("prepare provider-secret upload");
+
+    assert_eq!(
+        format!("{prepared:?}"),
+        "PreparedProviderSecretProvisioning { .. }"
+    );
 }

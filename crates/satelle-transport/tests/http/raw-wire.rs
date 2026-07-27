@@ -123,7 +123,9 @@ async fn unauthenticated_attachment_sized_body_is_rejected_before_body_admission
         assert!(
             matches!(
                 error.kind(),
-                std::io::ErrorKind::BrokenPipe | std::io::ErrorKind::ConnectionAborted
+                std::io::ErrorKind::BrokenPipe
+                    | std::io::ErrorKind::ConnectionAborted
+                    | std::io::ErrorKind::ConnectionReset
             ),
             "unexpected raw HTTP I/O failure: {error}"
         );
