@@ -69,14 +69,17 @@ fn provisioning_response_schema_has_no_secret_carrier() {
 }
 
 #[test]
-fn preview_response_is_metadata_only_and_does_not_report_destination_state() {
+fn preview_response_contains_only_metadata_and_ephemeral_upload_grant() {
     let value = json!({
-        "schema_version": "satelle.provider-secret-provisioning-preview-response.v1",
+        "schema_version": "satelle.provider-secret-provisioning-preview-response.v2",
         "request_id": "0195f6d5-18da-7a80-8000-000000000001",
         "host_identity": "host-test",
         "destination_kind": "file",
         "persistence_location_class": "host_private_file",
-        "overwrite_behavior": "reject_existing_without_explicit_authorization"
+        "overwrite_behavior": "reject_existing_without_explicit_authorization",
+        "upload_id": "0195f6d5-18da-7a80-8000-000000000002",
+        "recipient_public_key": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+        "expires_at": "2026-07-27T02:10:00Z"
     });
     let response: ProviderSecretProvisioningPreviewResponse =
         serde_json::from_value(value).expect("metadata-only preview should decode");

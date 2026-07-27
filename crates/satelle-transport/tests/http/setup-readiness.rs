@@ -33,7 +33,7 @@ async fn setup_readiness_mutations_require_authenticated_control_scope() {
         let unauthenticated = reqwest::Client::new()
             .post(control.url(path))
             .header("Content-Type", "application/json")
-            .header("Satelle-Protocol-Version", "10")
+            .header("Satelle-Protocol-Version", "11")
             .header("Satelle-Expected-Host-Identity", &control.host_identity)
             .header("Satelle-Request-Id", RequestId::new().as_str())
             .header("Idempotency-Key", "setup-readiness-unauthenticated")

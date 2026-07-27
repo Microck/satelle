@@ -288,11 +288,14 @@ pub(crate) trait TransportClient {
     fn preview_provider_secret_provisioning(
         &self,
         metadata: &satelle_transport::ProviderSecretProvisioningMetadata,
+        idempotency_key: &str,
     ) -> Result<satelle_transport::ProviderSecretProvisioningPreviewResponse, SatelleError>;
     fn provision_provider_secret(
         &self,
+        preview: &satelle_transport::ProviderSecretProvisioningPreviewResponse,
         metadata: &satelle_transport::ProviderSecretProvisioningMetadata,
         secret: Zeroizing<Vec<u8>>,
+        idempotency_key: &str,
     ) -> Result<satelle_transport::ProviderSecretProvisioningResponse, SatelleError>;
     fn validate_provider_descriptor(
         &self,
@@ -342,29 +345,6 @@ impl LocalTransport {
             service,
             provider_secret_bridge: Mutex::new(None),
         }
-    }
-
-    fn with_provider_secret_client<T>(
-        &self,
-        operation: impl FnOnce(&DaemonClient) -> Result<T, DaemonClientError>,
-    ) -> Result<T, SatelleError> {
-        let mut bridge = self
-            .provider_secret_bridge
-            .lock()
-            .map_err(|_| SatelleError::host_unreachable(&self.alias))?;
-        if bridge.is_none() {
-            *bridge = Some(LocalProviderSecretBridge::start(
-                &self.alias,
-                self.service.clone(),
-            )?);
-        }
-        operation(
-            &bridge
-                .as_ref()
-                .expect("the local provider-secret bridge is initialized")
-                .client,
-        )
-        .map_err(|error| direct_transport_error(&self.alias, error))
     }
 
     fn attached(
@@ -711,27 +691,37 @@ impl TransportClient for LocalTransport {
     fn preview_provider_secret_provisioning(
         &self,
         metadata: &satelle_transport::ProviderSecretProvisioningMetadata,
+        idempotency_key: &str,
     ) -> Result<satelle_transport::ProviderSecretProvisioningPreviewResponse, SatelleError> {
-        self.with_provider_secret_client(|client| {
-            client.preview_provider_secret_provisioning(
-                metadata,
-                &format!("provider-secret-preview-{}", Uuid::now_v7()),
-            )
-        })
+        let bridge = LocalProviderSecretBridge::start(&self.alias, self.service.clone())?;
+        let preview = bridge
+            .client
+            .preview_provider_secret_provisioning(metadata, idempotency_key)
+            .map_err(|error| direct_transport_error(&self.alias, error))?;
+        *self
+            .provider_secret_bridge
+            .lock()
+            .map_err(|_| SatelleError::host_unreachable(&self.alias))? = Some(bridge);
+        Ok(preview)
     }
 
     fn provision_provider_secret(
         &self,
+        preview: &satelle_transport::ProviderSecretProvisioningPreviewResponse,
         metadata: &satelle_transport::ProviderSecretProvisioningMetadata,
         secret: Zeroizing<Vec<u8>>,
+        idempotency_key: &str,
     ) -> Result<satelle_transport::ProviderSecretProvisioningResponse, SatelleError> {
-        self.with_provider_secret_client(|client| {
-            client.provision_provider_secret(
-                metadata,
-                secret,
-                &format!("provider-secret-provision-{}", Uuid::now_v7()),
-            )
-        })
+        let bridge = self
+            .provider_secret_bridge
+            .lock()
+            .map_err(|_| SatelleError::host_unreachable(&self.alias))?
+            .take()
+            .ok_or_else(SatelleError::state_conflict)?;
+        bridge
+            .client
+            .provision_provider_secret(preview, metadata, secret, idempotency_key)
+            .map_err(|error| direct_transport_error(&self.alias, error))
     }
 
     fn host_status(&self) -> Result<HostStatus, SatelleError> {
@@ -887,7 +877,7 @@ impl LocalProviderSecretBridge {
             })
             .map_err(|_| SatelleError::host_unreachable(alias))?;
         let (address, shutdown) = started_rx
-            .recv()
+            .recv_timeout(Duration::from_secs(30))
             .map_err(|_| SatelleError::host_unreachable(alias))?
             .map_err(|detail| SatelleError::host_unreachable(&format!("{alias} ({detail})")))?;
         let client = match DaemonClient::loopback(address, token, host_identity) {
@@ -3430,14 +3420,17 @@ impl TransportClient for SshSetupTransport {
     fn preview_provider_secret_provisioning(
         &self,
         _metadata: &satelle_transport::ProviderSecretProvisioningMetadata,
+        _idempotency_key: &str,
     ) -> Result<satelle_transport::ProviderSecretProvisioningPreviewResponse, SatelleError> {
         Err(self.unsupported("provider secret provisioning preview"))
     }
 
     fn provision_provider_secret(
         &self,
+        _preview: &satelle_transport::ProviderSecretProvisioningPreviewResponse,
         _metadata: &satelle_transport::ProviderSecretProvisioningMetadata,
         _secret: Zeroizing<Vec<u8>>,
+        _idempotency_key: &str,
     ) -> Result<satelle_transport::ProviderSecretProvisioningResponse, SatelleError> {
         Err(self.unsupported("provider secret provisioning"))
     }
@@ -3603,26 +3596,22 @@ impl TransportClient for DirectTransport {
     fn preview_provider_secret_provisioning(
         &self,
         metadata: &satelle_transport::ProviderSecretProvisioningMetadata,
+        idempotency_key: &str,
     ) -> Result<satelle_transport::ProviderSecretProvisioningPreviewResponse, SatelleError> {
         self.client
-            .preview_provider_secret_provisioning(
-                metadata,
-                &format!("provider-secret-preview-{}", Uuid::now_v7()),
-            )
+            .preview_provider_secret_provisioning(metadata, idempotency_key)
             .map_err(|error| direct_transport_error(&self.alias, error))
     }
 
     fn provision_provider_secret(
         &self,
+        preview: &satelle_transport::ProviderSecretProvisioningPreviewResponse,
         metadata: &satelle_transport::ProviderSecretProvisioningMetadata,
         secret: Zeroizing<Vec<u8>>,
+        idempotency_key: &str,
     ) -> Result<satelle_transport::ProviderSecretProvisioningResponse, SatelleError> {
         self.client
-            .provision_provider_secret(
-                metadata,
-                secret,
-                &format!("provider-secret-provision-{}", Uuid::now_v7()),
-            )
+            .provision_provider_secret(preview, metadata, secret, idempotency_key)
             .map_err(|error| direct_transport_error(&self.alias, error))
     }
 

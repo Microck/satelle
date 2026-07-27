@@ -475,6 +475,7 @@ impl DaemonServer {
             ),
             setup_issuances: Mutex::new(HashMap::new()),
             setup_mutations: Mutex::new(HashMap::new()),
+            provider_secret_uploads: Mutex::new(HashMap::new()),
             shutdown: shutdown.clone(),
         });
         let router = router(Arc::clone(&state));
@@ -796,6 +797,7 @@ pub(super) struct DaemonState {
     setup_mutations: Mutex<
         HashMap<(String, setup::SetupTokenMutationOperation, String), setup::SetupTokenMutation>,
     >,
+    provider_secret_uploads: Mutex<HashMap<String, setup::PendingProviderSecretUpload>>,
     shutdown: watch::Sender<bool>,
 }
 

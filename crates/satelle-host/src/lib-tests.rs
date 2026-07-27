@@ -894,7 +894,7 @@ fn failed_staged_rollback_retains_pending_journal_and_active_lease() {
     .expect("make provider secret directory owner-only");
     let destination = secret_directory.path().join("provider-token");
     let identity = RequestIdentity::new("provider-secret-rollback-pending", "b".repeat(64));
-    let paths = satelle_core::OwnerOnlySecretFilePaths::new(&destination, identity.key())
+    let paths = storage::provider_secret_file_paths(&destination, identity.key())
         .expect("deterministic provider secret paths");
     let native_probe_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let provider_probe_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));

@@ -1976,7 +1976,7 @@ fn cli_owned_setup_report(
             transport: "not_checked".to_string(),
             host_daemon: "not_checked".to_string(),
             codex_runtime: "not_checked".to_string(),
-            native_computer_use: "not_checked".to_string(),
+            native_computer_use: "not_verified".to_string(),
             provider_auth: "not_checked".to_string(),
         },
         descriptor_configured: false,
@@ -1987,7 +1987,7 @@ fn cli_owned_setup_report(
         changed: false,
         mutated: false,
         mutation_planned: false,
-        native_computer_use_readiness: "not_checked".to_string(),
+        native_computer_use_readiness: "not_verified".to_string(),
         next_command: "satelle doctor --scope computer-use --refresh --json".to_string(),
         verification: None,
     }
@@ -2717,8 +2717,9 @@ fn run_setup(
             )?;
             provider_secret_setup_completed = true;
             report.secret_provisioned = response.provisioned();
-            report.validation_status = response.validation_status().to_string();
-            report.readiness_summary.provider_auth = response.validation_status().to_string();
+            report.validation_status = response.validation_status().as_str().to_string();
+            report.readiness_summary.provider_auth =
+                response.validation_status().as_str().to_string();
             report.applied_actions.push(format!(
                 "provisioned and authorized {} provider authentication on Host '{}'",
                 response.destination_kind(),
@@ -2822,9 +2823,9 @@ fn run_setup(
                     )?;
                     provider_secret_setup_completed = true;
                     report.secret_provisioned = response.provisioned();
-                    report.validation_status = response.validation_status().to_string();
+                    report.validation_status = response.validation_status().as_str().to_string();
                     report.readiness_summary.provider_auth =
-                        response.validation_status().to_string();
+                        response.validation_status().as_str().to_string();
                     report.applied_actions.push(format!(
                         "provisioned and authorized {} provider authentication on Host '{}'",
                         response.destination_kind(),
@@ -3086,6 +3087,33 @@ fn inspect_first_ssh_host_during_setup(
     daemon_path_overrides: &DaemonPathOverrides,
     host: &SelectedHost,
 ) -> Result<SshHostDiscovery, CliFailure> {
+    let noninteractive = command.no_input || !io::stdin().is_terminal();
+    if noninteractive && (!command.no_input || !command.yes || command.expected_host_id.is_none()) {
+        return Err(failure(SatelleError::invalid_usage(
+            "noninteractive SSH Host trust requires --no-input --yes --expected-host-id <exact-id>",
+        )));
+    }
+    if !noninteractive && !command.yes && !consent_granted {
+        let confirmed = cliclack::confirm(format!(
+            "Start a temporary SSH bootstrap for Host '{}' at '{}'?",
+            host.alias,
+            host.config.address.as_deref().unwrap_or("not configured")
+        ))
+        .initial_value(false)
+        .interact()
+        .map_err(|source| {
+            failure(setup_interaction_error(
+                "could not read temporary SSH bootstrap confirmation",
+                source,
+            ))
+        })?;
+        if !confirmed {
+            return Err(failure(SatelleError::setup_consent_required(
+                &["start the temporary SSH bootstrap".to_string()],
+                "rerun setup and approve the temporary SSH bootstrap",
+            )));
+        }
+    }
     let discovery = discover_ssh_host(host, daemon_path_overrides).map_err(failure)?;
     let observed_identity = &discovery.identity;
     HostIdentityRef::new(observed_identity.clone()).map_err(|_| {
@@ -3105,16 +3133,7 @@ fn inspect_first_ssh_host_during_setup(
         return Ok(discovery);
     }
 
-    let noninteractive = command.no_input || !io::stdin().is_terminal();
-    if noninteractive
-        && (!command.no_input || !consent_granted || command.expected_host_id.is_none())
-    {
-        return Err(failure(SatelleError::invalid_usage(
-            "noninteractive SSH Host trust requires --no-input --yes --expected-host-id <exact-id>",
-        )));
-    }
-
-    if command.expected_host_id.is_none() {
+    if !noninteractive {
         println!("Host: {}", host.alias);
         println!(
             "Endpoint: {}",
@@ -3135,6 +3154,21 @@ fn inspect_first_ssh_host_during_setup(
                 .as_deref()
                 .unwrap_or("not configured")
         );
+        let confirmed = cliclack::confirm(format!(
+            "Trust exact observed Host Identity '{observed_identity}' for Host '{}'?",
+            host.alias
+        ))
+        .initial_value(false)
+        .interact()
+        .map_err(|source| {
+            failure(setup_interaction_error(
+                "could not read exact Host Identity confirmation",
+                source,
+            ))
+        })?;
+        if !confirmed {
+            return Err(failure(SatelleError::host_identity_mismatch(&host.alias)));
+        }
     }
 
     Ok(discovery)
@@ -3422,10 +3456,14 @@ fn provision_provider_secret(
     // Prove that this client is authenticated to the selected, pinned Host before
     // reading raw bytes. The later preview and provision calls use the same client.
     provider_transport.host_status().map_err(failure)?;
+    let idempotency_key = format!(
+        "provider-secret-provision-{}",
+        satelle_transport::RequestId::new()
+    );
     let preview_metadata =
-        satelle_transport::ProviderSecretProvisioningMetadata::new(authorization.clone(), false);
+        satelle_transport::ProviderSecretProvisioningMetadata::new(authorization.clone(), true);
     let preview = provider_transport
-        .preview_provider_secret_provisioning(&preview_metadata)
+        .preview_provider_secret_provisioning(&preview_metadata, &idempotency_key)
         .map_err(failure)?;
 
     if !format.is_json() {
@@ -3498,7 +3536,7 @@ fn provision_provider_secret(
         overwrite_authorized,
     );
     provider_transport
-        .provision_provider_secret(&metadata, secret)
+        .provision_provider_secret(&preview, &metadata, secret, &idempotency_key)
         .map_err(failure)
 }
 

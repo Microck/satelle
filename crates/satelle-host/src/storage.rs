@@ -43,6 +43,7 @@ pub(crate) use self::provider_secret_journal::{
     PROVIDER_SECRET_PRIOR_HMAC_DOMAIN, ProviderSecretProvisioningJournal,
     ProviderSecretProvisioningPhase, ProviderSecretProvisioningPlan,
     ProviderSecretProvisioningPreflight, ProviderSecretProvisioningReplay,
+    provider_secret_file_paths,
 };
 pub(crate) use self::setup_ledger::{
     MaintenanceLeaseCapability, MaintenanceLeaseState, MaintenanceRecoverySubject,

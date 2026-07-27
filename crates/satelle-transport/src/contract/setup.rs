@@ -55,7 +55,11 @@ define_schema_token!(
 );
 define_schema_token!(
     ProviderSecretProvisioningPreviewResponseSchema,
-    "satelle.provider-secret-provisioning-preview-response.v1"
+    "satelle.provider-secret-provisioning-preview-response.v2"
+);
+define_schema_token!(
+    ProviderSecretUploadEnvelopeSchema,
+    "satelle.provider-secret-upload.v2"
 );
 define_schema_token!(SetupVerificationSchema, "satelle.setup-verification.v1");
 define_schema_token!(
@@ -189,15 +193,22 @@ pub struct ProviderSecretProvisioningPreviewResponse {
     destination_kind: String,
     persistence_location_class: String,
     overwrite_behavior: String,
+    upload_id: String,
+    recipient_public_key: String,
+    expires_at: String,
 }
 
 impl ProviderSecretProvisioningPreviewResponse {
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         request_id: RequestId,
         host_identity: String,
         destination_kind: impl Into<String>,
         persistence_location_class: impl Into<String>,
         overwrite_behavior: impl Into<String>,
+        upload_id: impl Into<String>,
+        recipient_public_key: impl Into<String>,
+        expires_at: impl Into<String>,
     ) -> Self {
         Self {
             schema_version: ProviderSecretProvisioningPreviewResponseSchema,
@@ -206,6 +217,9 @@ impl ProviderSecretProvisioningPreviewResponse {
             destination_kind: destination_kind.into(),
             persistence_location_class: persistence_location_class.into(),
             overwrite_behavior: overwrite_behavior.into(),
+            upload_id: upload_id.into(),
+            recipient_public_key: recipient_public_key.into(),
+            expires_at: expires_at.into(),
         }
     }
 
@@ -219,6 +233,22 @@ impl ProviderSecretProvisioningPreviewResponse {
 
     pub fn overwrite_behavior(&self) -> &str {
         &self.overwrite_behavior
+    }
+
+    pub fn upload_id(&self) -> &str {
+        &self.upload_id
+    }
+
+    pub fn recipient_public_key(&self) -> &str {
+        &self.recipient_public_key
+    }
+
+    pub fn expires_at(&self) -> &str {
+        &self.expires_at
+    }
+
+    pub fn host_identity(&self) -> &str {
+        &self.host_identity
     }
 }
 
@@ -234,6 +264,99 @@ impl AuthenticatedResponseContract for ProviderSecretProvisioningPreviewResponse
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
+pub struct ProviderSecretUploadEnvelope {
+    schema_version: ProviderSecretUploadEnvelopeSchema,
+    upload_id: String,
+    host_identity: String,
+    expires_at: String,
+    metadata: ProviderSecretProvisioningMetadata,
+    encapsulated_key: String,
+    ciphertext: String,
+}
+
+impl ProviderSecretUploadEnvelope {
+    pub(crate) fn new(
+        preview: &ProviderSecretProvisioningPreviewResponse,
+        metadata: ProviderSecretProvisioningMetadata,
+        encapsulated_key: String,
+        ciphertext: String,
+    ) -> Self {
+        Self {
+            schema_version: ProviderSecretUploadEnvelopeSchema,
+            upload_id: preview.upload_id.clone(),
+            host_identity: preview.host_identity.clone(),
+            expires_at: preview.expires_at.clone(),
+            metadata,
+            encapsulated_key,
+            ciphertext,
+        }
+    }
+
+    pub fn upload_id(&self) -> &str {
+        &self.upload_id
+    }
+
+    pub fn host_identity(&self) -> &str {
+        &self.host_identity
+    }
+
+    pub fn expires_at(&self) -> &str {
+        &self.expires_at
+    }
+
+    pub fn metadata(&self) -> &ProviderSecretProvisioningMetadata {
+        &self.metadata
+    }
+
+    pub fn encapsulated_key(&self) -> &str {
+        &self.encapsulated_key
+    }
+
+    pub fn ciphertext(&self) -> &str {
+        &self.ciphertext
+    }
+}
+
+impl Drop for ProviderSecretUploadEnvelope {
+    fn drop(&mut self) {
+        self.ciphertext.zeroize();
+    }
+}
+
+pub(crate) const PROVIDER_SECRET_UPLOAD_CONTENT_TYPE: &str =
+    "application/vnd.satelle.provider-secret-upload+json";
+pub(crate) const PROVIDER_SECRET_UPLOAD_INFO: &[u8] = b"satelle.provider-secret-upload.v2";
+
+pub(crate) fn provider_secret_upload_aad(
+    preview: &ProviderSecretProvisioningPreviewResponse,
+    metadata: &ProviderSecretProvisioningMetadata,
+    token_id: &str,
+    idempotency_key: &str,
+) -> Result<Zeroizing<Vec<u8>>, serde_json::Error> {
+    let metadata = Zeroizing::new(serde_json::to_vec(metadata)?);
+    let mut aad = Zeroizing::new(Vec::new());
+    for field in [
+        PROVIDER_SECRET_UPLOAD_INFO,
+        b"POST",
+        b"/v1/setup/provider-secret",
+        super::PROTOCOL_VERSION.as_bytes(),
+        preview.host_identity().as_bytes(),
+        preview.upload_id().as_bytes(),
+        token_id.as_bytes(),
+        idempotency_key.as_bytes(),
+        satelle_core::LOCAL_DEMO_HOST.as_bytes(),
+        preview.expires_at().as_bytes(),
+        metadata.as_slice(),
+    ] {
+        let length = u32::try_from(field.len()).unwrap_or(u32::MAX);
+        aad.extend_from_slice(&length.to_be_bytes());
+        aad.extend_from_slice(field);
+    }
+    Ok(aad)
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct ProviderSecretProvisioningResponse {
     schema_version: ProviderSecretProvisioningResponseSchema,
     request_id: RequestId,
@@ -241,7 +364,7 @@ pub struct ProviderSecretProvisioningResponse {
     destination_kind: String,
     provisioned: bool,
     overwritten: bool,
-    validation_status: String,
+    validation_status: ProviderAuthValidationOutcome,
 }
 
 impl ProviderSecretProvisioningResponse {
@@ -250,7 +373,7 @@ impl ProviderSecretProvisioningResponse {
         host_identity: String,
         destination_kind: impl Into<String>,
         overwritten: bool,
-        validation_status: impl Into<String>,
+        validation_status: ProviderAuthValidationOutcome,
     ) -> Self {
         Self {
             schema_version: ProviderSecretProvisioningResponseSchema,
@@ -259,7 +382,7 @@ impl ProviderSecretProvisioningResponse {
             destination_kind: destination_kind.into(),
             provisioned: true,
             overwritten,
-            validation_status: validation_status.into(),
+            validation_status,
         }
     }
 
@@ -275,8 +398,8 @@ impl ProviderSecretProvisioningResponse {
         self.overwritten
     }
 
-    pub fn validation_status(&self) -> &str {
-        &self.validation_status
+    pub const fn validation_status(&self) -> ProviderAuthValidationOutcome {
+        self.validation_status
     }
 }
 

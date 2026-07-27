@@ -6,7 +6,9 @@ license.workspace = true
 
 [dependencies]
 axum.workspace = true
+base64.workspace = true
 futures-util.workspace = true
+hpke.workspace = true
 http-body-util.workspace = true
 percent-encoding.workspace = true
 reqwest.workspace = true
@@ -16,6 +18,7 @@ satelle-core = { path = "../satelle-core" }
 satelle-host = { path = "../satelle-host" }
 serde.workspace = true
 serde_json.workspace = true
+sha2.workspace = true
 thiserror.workspace = true
 time.workspace = true
 tokio.workspace = true

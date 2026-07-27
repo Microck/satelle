@@ -868,7 +868,7 @@ impl RuntimeEngine {
         journal: &crate::storage::ProviderSecretProvisioningJournal,
         original_phase: ProviderSecretProvisioningPhase,
     ) -> Result<(), SatelleError> {
-        let paths = satelle_core::OwnerOnlySecretFilePaths::new(
+        let paths = crate::storage::provider_secret_file_paths(
             journal.destination_path(),
             journal.operation_id(),
         )
@@ -880,13 +880,15 @@ impl RuntimeEngine {
         {
             return Err(provider_secret_recovery_failure());
         }
+        let staging =
+            inspect_provider_secret_recovery_artifact(runtime, paths.staging(), journal, false)?;
+        let backup =
+            inspect_provider_secret_recovery_artifact(runtime, paths.backup(), journal, false)?;
         let destination = if original_phase == ProviderSecretProvisioningPhase::Planned {
             None
         } else {
-            inspect_provider_secret_recovery_artifact(runtime, paths.destination(), journal)?
+            inspect_provider_secret_recovery_artifact(runtime, paths.destination(), journal, true)?
         };
-        let staging = inspect_provider_secret_recovery_artifact(runtime, paths.staging(), journal)?;
-        let backup = inspect_provider_secret_recovery_artifact(runtime, paths.backup(), journal)?;
 
         if staging
             .as_ref()
@@ -943,6 +945,32 @@ impl RuntimeEngine {
                 let overwritten = journal
                     .destination_existed()
                     .ok_or_else(provider_secret_recovery_failure)?;
+                if !overwritten {
+                    if backup.is_some() {
+                        return Err(provider_secret_recovery_failure());
+                    }
+                    if let Some(candidate) = staging
+                        .as_ref()
+                        .and_then(|artifact| artifact.candidate.as_ref())
+                    {
+                        satelle_core::cleanup_owner_only_secret_file(
+                            &paths,
+                            Some(candidate.as_evidence()),
+                            None,
+                        )
+                        .map_err(|_| provider_secret_recovery_failure())?;
+                        self.finish_recovered_provider_secret_failure(journal.operation_id())?;
+                        return Ok(());
+                    }
+                    if destination.is_none()
+                        || destination
+                            .as_ref()
+                            .is_some_and(|artifact| artifact.unowned)
+                    {
+                        self.finish_recovered_provider_secret_failure(journal.operation_id())?;
+                        return Ok(());
+                    }
+                }
                 if matches!(
                     original_phase,
                     ProviderSecretProvisioningPhase::Staged
@@ -3762,12 +3790,14 @@ impl ProviderSecretRecoveryComparison {
 struct ProviderSecretRecoveryArtifact {
     candidate: Option<ProviderSecretRecoveryComparison>,
     prior: Option<ProviderSecretRecoveryComparison>,
+    unowned: bool,
 }
 
 fn inspect_provider_secret_recovery_artifact(
     runtime: &RuntimeHandle,
     path: &Path,
     journal: &crate::storage::ProviderSecretProvisioningJournal,
+    allow_unowned: bool,
 ) -> Result<Option<ProviderSecretRecoveryArtifact>, SatelleError> {
     if !satelle_core::owner_only_secret_destination_exists(path)
         .map_err(|_| provider_secret_recovery_failure())?
@@ -3796,9 +3826,20 @@ fn inspect_provider_secret_recovery_artifact(
         .transpose()?
         .flatten();
     if candidate.is_none() && prior.is_none() {
+        if allow_unowned {
+            return Ok(Some(ProviderSecretRecoveryArtifact {
+                candidate,
+                prior,
+                unowned: true,
+            }));
+        }
         return Err(provider_secret_recovery_failure());
     }
-    Ok(Some(ProviderSecretRecoveryArtifact { candidate, prior }))
+    Ok(Some(ProviderSecretRecoveryArtifact {
+        candidate,
+        prior,
+        unowned: false,
+    }))
 }
 
 fn provider_secret_recovery_comparison(

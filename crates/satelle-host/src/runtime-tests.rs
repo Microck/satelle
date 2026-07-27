@@ -170,7 +170,7 @@ fn provider_secret_recovery_fixture(
         satelle_core::ProviderBindingSource::UserConfig,
     );
     let key = ProviderProbeRecoveryAdapter::key();
-    let paths = satelle_core::OwnerOnlySecretFilePaths::new(destination, operation_id)
+    let paths = crate::storage::provider_secret_file_paths(destination, operation_id)
         .expect("construct deterministic recovery paths");
     let plan = ProviderSecretProvisioningPlan::new(
         engine.host_identity().expect("load host identity"),

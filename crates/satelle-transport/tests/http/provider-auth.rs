@@ -12,6 +12,7 @@ use satelle_transport::{
 const VALIDATION_PATH: &str = "/v1/setup/provider-bindings/open_ai/vision/validate";
 const AUTHORIZATION_PATH: &str = "/v1/setup/provider-bindings/open_ai/vision";
 const PROVIDER_SECRET_PATH: &str = "/v1/setup/provider-secret";
+const PROVIDER_SECRET_PREVIEW_PATH: &str = "/v1/setup/provider-secret/preview";
 const PROVIDER_SECRET_METADATA_HEADER: &str = "Satelle-Provider-Secret-Metadata";
 
 fn provider_secret_metadata(overwrite_authorized: bool) -> ProviderSecretProvisioningMetadata {
@@ -30,7 +31,10 @@ async fn provider_secret_provisioning_requires_admin_mutation_authority_before_b
     let read_only = RunningServer::start(ApiScopes::READ).await;
     let forbidden = read_only
         .mutation(PROVIDER_SECRET_PATH, "provider-secret-read-only")
-        .header("Content-Type", "application/octet-stream")
+        .header(
+            "Content-Type",
+            "application/vnd.satelle.provider-secret-upload+json",
+        )
         .header(PROVIDER_SECRET_METADATA_HEADER, &metadata)
         .body(secret_canary)
         .send()
@@ -43,7 +47,10 @@ async fn provider_secret_provisioning_requires_admin_mutation_authority_before_b
     let control = RunningServer::start(ApiScopes::CONTROL).await;
     let forbidden = control
         .mutation(PROVIDER_SECRET_PATH, "provider-secret-control")
-        .header("Content-Type", "application/octet-stream")
+        .header(
+            "Content-Type",
+            "application/vnd.satelle.provider-secret-upload+json",
+        )
         .header(PROVIDER_SECRET_METADATA_HEADER, metadata)
         .body(secret_canary)
         .send()
@@ -55,39 +62,69 @@ async fn provider_secret_provisioning_requires_admin_mutation_authority_before_b
 }
 
 #[tokio::test]
-async fn provider_secret_provisioning_failure_replays_without_echoing_secret_material() {
+async fn provider_secret_preview_rejects_missing_file_source_without_side_effects() {
     let admin = RunningServer::start(ApiScopes::ADMIN).await;
-    let metadata =
-        serde_json::to_string(&provider_secret_metadata(false)).expect("encode metadata");
-    let secret_canary = "PRIVATE_PROVIDER_SECRET_REPLAY_CANARY";
-    let request_id = RequestId::new();
+    let metadata = provider_secret_metadata(false);
+    let mut durable_before = Vec::new();
+    collect_state_bytes(admin._state.path(), &mut durable_before);
 
-    let send = || {
-        admin
-            .protected_request_with_request_id(
-                reqwest::Method::POST,
-                PROVIDER_SECRET_PATH,
-                &request_id,
+    let mut normalized = Vec::new();
+    let mut request_ids = Vec::new();
+    for _ in 0..2 {
+        let response = admin
+            .mutation(
+                PROVIDER_SECRET_PREVIEW_PATH,
+                "provider-secret-missing-file-source",
             )
-            .header("Satelle-Protocol-Version", "10")
-            .header("Idempotency-Key", "provider-secret-failed-replay")
-            .header("Content-Type", "application/octet-stream")
-            .header(PROVIDER_SECRET_METADATA_HEADER, &metadata)
-            .body(secret_canary)
-    };
-    let initial = send()
-        .send()
-        .await
-        .expect("send provider secret without configured destination");
-    let initial_status = initial.status();
-    let initial_bytes = initial.bytes().await.expect("read initial response");
-    assert!(!String::from_utf8_lossy(&initial_bytes).contains(secret_canary));
+            .json(&metadata)
+            .send()
+            .await
+            .expect("send provider secret preview without a File source");
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let mut body = response
+            .json::<serde_json::Value>()
+            .await
+            .expect("decode provider secret preview failure");
+        assert_eq!(
+            body.pointer("/code").and_then(serde_json::Value::as_str),
+            Some("provider-secret-source-required")
+        );
+        assert!(body.get("upload_id").is_none());
+        assert!(body.get("recipient_public_key").is_none());
+        request_ids.push(
+            body.get("request_id")
+                .and_then(serde_json::Value::as_str)
+                .expect("failure includes its fresh request ID")
+                .to_string(),
+        );
+        body.as_object_mut()
+            .expect("API error is a JSON object")
+            .remove("request_id");
+        normalized.push(body);
+    }
+    assert_ne!(request_ids[0], request_ids[1]);
+    assert_eq!(normalized[0], normalized[1]);
 
-    let replay = send().send().await.expect("replay provider secret failure");
-    assert_eq!(replay.status(), initial_status);
-    let replay_bytes = replay.bytes().await.expect("read replay response");
-    assert_eq!(replay_bytes, initial_bytes);
-    assert!(!String::from_utf8_lossy(&replay_bytes).contains(secret_canary));
+    let mut durable_after = Vec::new();
+    collect_state_bytes(admin._state.path(), &mut durable_after);
+    assert_eq!(durable_before, durable_after);
+    assert!(!state_contains_provider_secret_sibling(admin._state.path()));
+}
+
+fn state_contains_provider_secret_sibling(path: &std::path::Path) -> bool {
+    std::fs::read_dir(path)
+        .expect("read Host state directory")
+        .filter_map(Result::ok)
+        .any(|entry| {
+            let path = entry.path();
+            if path.is_dir() {
+                state_contains_provider_secret_sibling(&path)
+            } else {
+                let name = entry.file_name();
+                let name = name.to_string_lossy();
+                name.contains(".staged.") || name.contains(".backup.")
+            }
+        })
 }
 
 #[tokio::test]
@@ -99,7 +136,7 @@ async fn provider_binding_validation_requires_setup_or_control_authority() {
     let unauthenticated = reqwest::Client::new()
         .post(control.url(VALIDATION_PATH))
         .header("Content-Type", "application/json")
-        .header("Satelle-Protocol-Version", "10")
+        .header("Satelle-Protocol-Version", "11")
         .header("Satelle-Expected-Host-Identity", &control.host_identity)
         .header("Satelle-Request-Id", RequestId::new().as_str())
         .header("Idempotency-Key", "provider-auth-unauthenticated")
@@ -146,7 +183,7 @@ async fn bootstrap_admin_authorizes_and_control_validates_the_exact_path_aliases
         .header("Authorization", bearer(&bootstrap_token))
         .header("Satelle-Expected-Host-Identity", &running.host_identity)
         .header("Satelle-Request-Id", RequestId::new().as_str())
-        .header("Satelle-Protocol-Version", "10")
+        .header("Satelle-Protocol-Version", "11")
         .header("Idempotency-Key", "provider-authorization-admin")
         .json(&authorization)
         .send()
@@ -263,7 +300,7 @@ async fn validation_rejects_descriptor_material_and_control_cannot_authorize() {
     let forbidden = control
         .protected_request(reqwest::Method::PUT, AUTHORIZATION_PATH)
         .header("Idempotency-Key", "provider-authorization-control")
-        .header("Satelle-Protocol-Version", "10")
+        .header("Satelle-Protocol-Version", "11")
         .json(&authorization)
         .send()
         .await
@@ -283,7 +320,7 @@ fn bootstrap_mutation(
         .header("Authorization", bearer(token))
         .header("Satelle-Expected-Host-Identity", &running.host_identity)
         .header("Satelle-Request-Id", RequestId::new().as_str())
-        .header("Satelle-Protocol-Version", "10")
+        .header("Satelle-Protocol-Version", "11")
         .header("Idempotency-Key", idempotency_key)
 }
 
@@ -322,7 +359,7 @@ async fn provider_binding_mutations_require_admin() {
     let forbidden_delete = control
         .protected_request(reqwest::Method::DELETE, AUTHORIZATION_PATH)
         .header("Idempotency-Key", "provider-delete-control")
-        .header("Satelle-Protocol-Version", "10")
+        .header("Satelle-Protocol-Version", "11")
         .send()
         .await
         .expect("send deletion as control principal");
@@ -339,7 +376,7 @@ async fn provider_binding_mutations_require_admin() {
     let authorized = ordinary_admin
         .protected_request(reqwest::Method::PUT, AUTHORIZATION_PATH)
         .header("Idempotency-Key", "provider-authorization-ordinary-admin")
-        .header("Satelle-Protocol-Version", "10")
+        .header("Satelle-Protocol-Version", "11")
         .json(&authorization)
         .send()
         .await
@@ -349,7 +386,7 @@ async fn provider_binding_mutations_require_admin() {
     let rejected_body = ordinary_admin
         .protected_request(reqwest::Method::DELETE, AUTHORIZATION_PATH)
         .header("Idempotency-Key", "provider-delete-body")
-        .header("Satelle-Protocol-Version", "10")
+        .header("Satelle-Protocol-Version", "11")
         .json(&serde_json::json!({"unexpected": true}))
         .send()
         .await
@@ -359,7 +396,7 @@ async fn provider_binding_mutations_require_admin() {
     let rejected_oversized_body = ordinary_admin
         .protected_request(reqwest::Method::DELETE, AUTHORIZATION_PATH)
         .header("Idempotency-Key", "provider-delete-oversized-body")
-        .header("Satelle-Protocol-Version", "10")
+        .header("Satelle-Protocol-Version", "11")
         .body(vec![b'x'; 2 * 1024 * 1024])
         .send()
         .await
@@ -372,7 +409,7 @@ async fn provider_binding_mutations_require_admin() {
     let deleted = ordinary_admin
         .protected_request(reqwest::Method::DELETE, AUTHORIZATION_PATH)
         .header("Idempotency-Key", "provider-delete-body")
-        .header("Satelle-Protocol-Version", "10")
+        .header("Satelle-Protocol-Version", "11")
         .send()
         .await
         .expect("reuse the rejected body idempotency key");
@@ -381,7 +418,7 @@ async fn provider_binding_mutations_require_admin() {
     let absent = ordinary_admin
         .protected_request(reqwest::Method::DELETE, AUTHORIZATION_PATH)
         .header("Idempotency-Key", "provider-delete-oversized-body")
-        .header("Satelle-Protocol-Version", "10")
+        .header("Satelle-Protocol-Version", "11")
         .send()
         .await
         .expect("reuse the rejected oversized-body idempotency key");
@@ -578,7 +615,7 @@ async fn authorization_is_checked_before_the_durable_mutation_claim() {
     let rejected_before_body = running
         .protected_request(reqwest::Method::PUT, AUTHORIZATION_PATH)
         .header("Idempotency-Key", "provider-authority-before-body")
-        .header("Satelle-Protocol-Version", "10")
+        .header("Satelle-Protocol-Version", "11")
         .body("{")
         .send()
         .await
@@ -633,8 +670,13 @@ async fn authorization_is_checked_before_the_durable_mutation_claim() {
 
 fn collect_state_bytes(path: &std::path::Path, bytes: &mut Vec<u8>) {
     if path.is_dir() {
-        for entry in std::fs::read_dir(path).expect("read Host state directory") {
-            collect_state_bytes(&entry.expect("read Host state entry").path(), bytes);
+        let mut entries = std::fs::read_dir(path)
+            .expect("read Host state directory")
+            .map(|entry| entry.expect("read Host state entry").path())
+            .collect::<Vec<_>>();
+        entries.sort();
+        for entry in entries {
+            collect_state_bytes(&entry, bytes);
         }
     } else if path.is_file() {
         bytes.extend(std::fs::read(path).expect("read Host state file"));

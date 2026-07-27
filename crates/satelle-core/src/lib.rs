@@ -456,15 +456,15 @@ impl ProviderSecretProvisioningPreview {
 pub struct ProviderSecretProvisioningResult {
     destination_kind: String,
     overwritten: bool,
-    validation_status: String,
+    validation_status: ProviderAuthValidationOutcome,
 }
 
 impl ProviderSecretProvisioningResult {
-    pub fn file(overwritten: bool, validation_status: impl Into<String>) -> Self {
+    pub fn file(overwritten: bool, validation_status: ProviderAuthValidationOutcome) -> Self {
         Self {
             destination_kind: "file".to_string(),
             overwritten,
-            validation_status: validation_status.into(),
+            validation_status,
         }
     }
 
@@ -476,8 +476,8 @@ impl ProviderSecretProvisioningResult {
         self.overwritten
     }
 
-    pub fn validation_status(&self) -> &str {
-        &self.validation_status
+    pub const fn validation_status(&self) -> ProviderAuthValidationOutcome {
+        self.validation_status
     }
 }
 
@@ -1191,14 +1191,18 @@ mod provider_binding_config_tests {
             r#"{"destination_kind":"file","persistence_location_class":"host_private_file","overwrite_behavior":"reject_existing_without_explicit_authorization"}"#
         );
 
-        let result = ProviderSecretProvisioningResult::file(true, "provider_smoke_validated");
+        let result =
+            ProviderSecretProvisioningResult::file(true, ProviderAuthValidationOutcome::Resolved);
         assert_eq!(result.destination_kind(), "file");
         assert!(result.overwritten());
-        assert_eq!(result.validation_status(), "provider_smoke_validated");
+        assert_eq!(
+            result.validation_status(),
+            ProviderAuthValidationOutcome::Resolved
+        );
         let result_wire = serde_json::to_string(&result).expect("serialize result");
         assert_eq!(
             result_wire,
-            r#"{"destination_kind":"file","overwritten":true,"validation_status":"provider_smoke_validated"}"#
+            r#"{"destination_kind":"file","overwritten":true,"validation_status":"resolved"}"#
         );
         assert!(!preview_wire.contains("path"));
         assert!(!preview_wire.contains("exists"));
@@ -4092,7 +4096,12 @@ impl SatelleError {
     }
 
     pub fn setup_verification_failed(report: &SetupReport) -> Self {
-        let recovery_command = report.recovery_commands.first().cloned();
+        let recovery_command = report.recovery_commands.first().cloned().or_else(|| {
+            Some(format!(
+                "satelle doctor --host {} --scope all --json",
+                report.host
+            ))
+        });
         let mut details = BTreeMap::new();
         details.insert("changed".to_string(), Value::Bool(report.changed));
         details.insert(

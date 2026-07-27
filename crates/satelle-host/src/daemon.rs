@@ -433,7 +433,7 @@ struct CanonicalProviderSecretProvisioning<'a> {
     host: &'a str,
     authorization: &'a satelle_core::ProviderBindingAuthorization,
     overwrite_authorized: bool,
-    secret: &'a str,
+    envelope_digest: &'a str,
 }
 
 #[derive(Serialize)]
@@ -930,6 +930,7 @@ impl HostService {
         authorization: satelle_core::ProviderBindingAuthorization,
         secret: zeroize::Zeroizing<String>,
         overwrite_authorized: bool,
+        envelope_digest: &str,
         authority: &MutationAuthority,
     ) -> Result<satelle_core::ProviderSecretProvisioningResult, SatelleError> {
         let canonical_payload = canonical_payload(
@@ -938,7 +939,7 @@ impl HostService {
                 host,
                 authorization: &authorization,
                 overwrite_authorized,
-                secret: secret.as_str(),
+                envelope_digest,
             },
             PROVIDER_SECRET_PROVISIONING_DIGEST_SCHEMA_VERSION,
         )?;
@@ -982,6 +983,35 @@ impl HostService {
             .and_then(
                 crate::operation_capacity::OperationOutcome::into_provider_secret_provisioning,
             )
+    }
+
+    pub fn replay_provider_secret_provisioning_idempotent(
+        &self,
+        host: &str,
+        authorization: satelle_core::ProviderBindingAuthorization,
+        overwrite_authorized: bool,
+        envelope_digest: &str,
+        authority: &MutationAuthority,
+    ) -> Result<Option<satelle_core::ProviderSecretProvisioningResult>, SatelleError> {
+        let canonical_payload = canonical_payload(
+            &CanonicalProviderSecretProvisioning {
+                operation: "provider_secret_provisioning",
+                host,
+                authorization: &authorization,
+                overwrite_authorized,
+                envelope_digest,
+            },
+            PROVIDER_SECRET_PROVISIONING_DIGEST_SCHEMA_VERSION,
+        )?;
+        let _identity_gate = self.operation_capacity.lock_identity_read()?;
+        let identity = self.runtime.authenticated_request_identity(
+            &authority.principal,
+            IdempotentOperation::ProviderSecretProvisioning,
+            &authority.idempotency_key,
+            canonical_payload.as_slice(),
+            canonical_payload.digest_schema_version,
+        )?;
+        self.runtime.provider_secret_provisioning_replay(&identity)
     }
 
     pub fn delete_provider_binding_idempotent(

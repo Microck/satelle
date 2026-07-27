@@ -38,14 +38,18 @@ pub use setup::{
     ProviderBindingDeletionResponse, ProviderDescriptorValidationRequest,
     ProviderDescriptorValidationResponse, ProviderSecretProvisioningMetadata,
     ProviderSecretProvisioningPreviewResponse, ProviderSecretProvisioningResponse,
-    SetupVerificationRequest, SetupVerificationResponse,
+    ProviderSecretUploadEnvelope, SetupVerificationRequest, SetupVerificationResponse,
+};
+pub(crate) use setup::{
+    PROVIDER_SECRET_UPLOAD_CONTENT_TYPE, PROVIDER_SECRET_UPLOAD_INFO, provider_secret_upload_aad,
 };
 
 pub(crate) const PROTOCOL_VERSION_HEADER: &str = "satelle-protocol-version";
-// Project-origin provenance and exact-binding consent close the remaining
-// Provider Binding selection boundary. Exact-match negotiation rejects every
-// peer that still implements the protocol v9 request surface.
-pub(crate) const PROTOCOL_VERSION: &str = "10";
+// Protocol v11 hard-cuts the plaintext provider-secret upload in favor of the
+// Host-bound HPKE preview/envelope v2 contract. It also carries setup
+// verification, native-readiness invalidation, and capabilities v5. Exact
+// negotiation rejects v10 peers rather than preserving the old carrier.
+pub(crate) const PROTOCOL_VERSION: &str = "11";
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::fmt;
@@ -180,5 +184,10 @@ mod tests {
         assert_eq!(RequestId::parse(generated.as_str()), Ok(generated));
         assert!(RequestId::parse("550e8400-e29b-41d4-a716-446655440000").is_err());
         assert!(RequestId::parse("not-a-request-id").is_err());
+    }
+
+    #[test]
+    fn protocol_version_is_the_v11_hard_cut() {
+        assert_eq!(PROTOCOL_VERSION, "11");
     }
 }

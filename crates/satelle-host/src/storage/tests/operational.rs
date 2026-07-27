@@ -397,6 +397,14 @@ fn operational_evidence_schema_is_migrated_atomically_to_version_thirteen() {
         ],
         versions
     );
+    let migration_twelve_checksum: String = connection
+        .query_row(
+            "SELECT checksum FROM schema_migrations WHERE version = 12",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!("fnv1a64:a5672c42bd40d2a8", migration_twelve_checksum);
     for table in [
         "sessions",
         "turns",
@@ -2206,6 +2214,7 @@ fn assert_version_one_corruption_rejected_before_migration(
         "provider_smoke_successes",
         "provider_smoke_results",
         "authorized_provider_bindings",
+        "provider_secret_provisioning_journal",
         "setup_runs",
         "setup_actions",
     ] {
@@ -2299,6 +2308,7 @@ fn failed_migration_rolls_back_partial_schema_and_preserves_existing_state() {
         "provider_smoke_successes",
         "provider_smoke_results",
         "authorized_provider_bindings",
+        "provider_secret_provisioning_journal",
         "setup_runs",
         "setup_actions",
     ] {

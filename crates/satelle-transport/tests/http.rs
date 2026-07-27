@@ -145,13 +145,13 @@ impl RunningServer {
 
     fn request(&self, path: &str) -> reqwest::RequestBuilder {
         self.protected_request(reqwest::Method::GET, path)
-            .header("Satelle-Protocol-Version", "10")
+            .header("Satelle-Protocol-Version", "11")
     }
 
     fn mutation(&self, path: &str, idempotency_key: &str) -> reqwest::RequestBuilder {
         self.protected_request(reqwest::Method::POST, path)
             .header("Idempotency-Key", idempotency_key)
-            .header("Satelle-Protocol-Version", "10")
+            .header("Satelle-Protocol-Version", "11")
     }
 
     fn mutation_with_request_id(
@@ -162,7 +162,7 @@ impl RunningServer {
     ) -> reqwest::RequestBuilder {
         self.protected_request_with_request_id(reqwest::Method::POST, path, request_id)
             .header("Idempotency-Key", idempotency_key)
-            .header("Satelle-Protocol-Version", "10")
+            .header("Satelle-Protocol-Version", "11")
     }
 
     fn protected_request(&self, method: reqwest::Method, path: &str) -> reqwest::RequestBuilder {
@@ -368,7 +368,7 @@ fn setup_mutation_request(
         .header("Satelle-Expected-Host-Identity", host_identity)
         .header("Satelle-Request-Id", RequestId::new().to_string())
         .header("Idempotency-Key", idempotency_key)
-        .header("Satelle-Protocol-Version", "10")
+        .header("Satelle-Protocol-Version", "11")
 }
 
 fn replacement_token(token_id: &str) -> ApiBearerToken {
@@ -1217,11 +1217,11 @@ async fn capabilities_are_truthful_and_unknown_routes_are_typed() {
         response.json().await.expect("decode capabilities JSON");
     assert_eq!(
         capabilities_json["schema_version"],
-        "satelle.capabilities.v4"
+        "satelle.capabilities.v5"
     );
-    let mut obsolete_v1 = capabilities_json.clone();
-    obsolete_v1["schema_version"] = serde_json::json!("satelle.capabilities.v3");
-    assert!(serde_json::from_value::<CapabilitiesResponse>(obsolete_v1).is_err());
+    let mut obsolete_v4 = capabilities_json.clone();
+    obsolete_v4["schema_version"] = serde_json::json!("satelle.capabilities.v4");
+    assert!(serde_json::from_value::<CapabilitiesResponse>(obsolete_v4).is_err());
     let capabilities: CapabilitiesResponse =
         serde_json::from_value(capabilities_json).expect("decode typed capabilities");
     assert_eq!(capabilities.host_identity(), running.host_identity);
@@ -1645,7 +1645,7 @@ async fn bootstrap_maintenance_routes_enforce_the_mutation_contract_before_ledge
         ),
         (
             "missing-idempotency",
-            Some("10"),
+            Some("11"),
             None,
             false,
             false,
@@ -1654,7 +1654,7 @@ async fn bootstrap_maintenance_routes_enforce_the_mutation_contract_before_ledge
         ),
         (
             "query",
-            Some("10"),
+            Some("11"),
             Some("query-key"),
             true,
             false,
@@ -1663,7 +1663,7 @@ async fn bootstrap_maintenance_routes_enforce_the_mutation_contract_before_ledge
         ),
         (
             "cookie",
-            Some("10"),
+            Some("11"),
             Some("cookie-key"),
             false,
             true,
@@ -1776,7 +1776,7 @@ async fn bootstrap_maintenance_routes_enforce_the_mutation_contract_before_ledge
         ),
         (
             "missing-idempotency",
-            Some("10"),
+            Some("11"),
             None,
             false,
             false,
@@ -1785,7 +1785,7 @@ async fn bootstrap_maintenance_routes_enforce_the_mutation_contract_before_ledge
         ),
         (
             "query",
-            Some("10"),
+            Some("11"),
             Some("complete-query-key"),
             true,
             false,
@@ -1794,7 +1794,7 @@ async fn bootstrap_maintenance_routes_enforce_the_mutation_contract_before_ledge
         ),
         (
             "cookie",
-            Some("10"),
+            Some("11"),
             Some("complete-cookie-key"),
             false,
             true,

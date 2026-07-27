@@ -4,12 +4,13 @@ use crate::contract::{
     DurableTokenConfirmationResponse, DurableTokenIssuanceResponse, HostDesktopSessionsResponse,
     HostStatusResponse, LiveResponse, LogsPageResponse, NativeReadinessInvalidationRequest,
     NativeReadinessInvalidationResponse, PROTOCOL_VERSION, PROTOCOL_VERSION_HEADER,
+    PROVIDER_SECRET_UPLOAD_CONTENT_TYPE, PROVIDER_SECRET_UPLOAD_INFO,
     ProviderBindingAuthorizationRequest, ProviderBindingAuthorizationResponse,
     ProviderBindingDeletionResponse, ProviderDescriptorValidationRequest,
     ProviderDescriptorValidationResponse, ProviderSecretProvisioningMetadata,
-    ProviderSecretProvisioningPreviewResponse, ProviderSecretProvisioningResponse, RequestId,
-    SessionResponse, SetupVerificationRequest, SetupVerificationResponse, StopRequest,
-    StopResponse, TurnRequest,
+    ProviderSecretProvisioningPreviewResponse, ProviderSecretProvisioningResponse,
+    ProviderSecretUploadEnvelope, RequestId, SessionResponse, SetupVerificationRequest,
+    SetupVerificationResponse, StopRequest, StopResponse, TurnRequest, provider_secret_upload_aad,
 };
 use crate::transport_tls::{
     ReqwestTrustError, TlsFailureKind, classify_tls_error, configure_reqwest_trust,
@@ -31,8 +32,6 @@ use std::time::Duration;
 use zeroize::Zeroizing;
 
 const DIRECT_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
-const PROVIDER_SECRET_CONTENT_TYPE: &str = "application/octet-stream";
-const PROVIDER_SECRET_METADATA_HEADER: &str = "Satelle-Provider-Secret-Metadata";
 const PROVIDER_BINDING_ALIAS_ENCODE_SET: &AsciiSet =
     &CONTROLS.add(b'/').add(b'?').add(b'#').add(b'%').add(b'\\');
 
@@ -348,28 +347,43 @@ impl DaemonClient {
 
     pub fn provision_provider_secret(
         &self,
+        preview: &ProviderSecretProvisioningPreviewResponse,
         metadata: &ProviderSecretProvisioningMetadata,
         secret: Zeroizing<Vec<u8>>,
         idempotency_key: &str,
     ) -> Result<ProviderSecretProvisioningResponse, DaemonClientError> {
-        // The authenticated preview validates the pinned Host Identity before
-        // reqwest receives any raw secret bytes.
-        self.preview_provider_secret_provisioning(metadata, idempotency_key)?;
-
-        let encoded_metadata = Zeroizing::new(
-            serde_json::to_vec(metadata)
+        if preview.host_identity() != self.expected_host_identity {
+            return Err(DaemonClientError::ResponseContractViolation);
+        }
+        let recipient_public_key =
+            crate::provider_secret_crypto::decode_canonical_base64(preview.recipient_public_key())
+                .map_err(|_| DaemonClientError::ResponseContractViolation)?;
+        let aad =
+            provider_secret_upload_aad(preview, metadata, self.token.token_id(), idempotency_key)
+                .map_err(|_| DaemonClientError::ResponseContractViolation)?;
+        let sealed = crate::provider_secret_crypto::encrypt_provider_secret(
+            recipient_public_key.as_slice(),
+            PROVIDER_SECRET_UPLOAD_INFO,
+            aad.as_slice(),
+            secret.as_slice(),
+        )
+        .map_err(|_| DaemonClientError::ResponseContractViolation)?;
+        let envelope = ProviderSecretUploadEnvelope::new(
+            preview,
+            metadata.clone(),
+            crate::provider_secret_crypto::encode_canonical_base64(&sealed.encapsulated_key),
+            crate::provider_secret_crypto::encode_canonical_base64(&sealed.ciphertext),
+        );
+        let encoded_envelope = Zeroizing::new(
+            serde_json::to_vec(&envelope)
                 .map_err(|_| DaemonClientError::ResponseContractViolation)?,
         );
-        let mut metadata_header = HeaderValue::from_bytes(encoded_metadata.as_slice())
-            .map_err(|_| DaemonClientError::ResponseContractViolation)?;
-        metadata_header.set_sensitive(true);
         let (request, request_id) =
             self.mutation_request("/v1/setup/provider-secret", idempotency_key)?;
-        let body = reqwest::blocking::Body::new(ZeroizingRequestBody::new(secret));
+        let body = reqwest::blocking::Body::new(ZeroizingRequestBody::new(encoded_envelope));
         let request = self.admission_request(
             request
-                .header(CONTENT_TYPE, PROVIDER_SECRET_CONTENT_TYPE)
-                .header(PROVIDER_SECRET_METADATA_HEADER, metadata_header)
+                .header(CONTENT_TYPE, PROVIDER_SECRET_UPLOAD_CONTENT_TYPE)
                 .body(body),
         );
         self.send_authenticated(request, request_id, StatusCode::OK)

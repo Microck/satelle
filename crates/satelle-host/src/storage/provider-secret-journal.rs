@@ -12,7 +12,8 @@ use satelle_core::{
     ProviderSecretSource, PublicResolvedProviderBinding, ResolvedProviderBinding, SatelleError,
 };
 use serde::{Deserialize, Serialize};
-use std::fmt;
+use sha2::{Digest, Sha256};
+use std::fmt::{self, Write as _};
 use std::path::{Path, PathBuf};
 use time::OffsetDateTime;
 
@@ -23,6 +24,20 @@ pub(crate) const PROVIDER_SECRET_CANDIDATE_HMAC_DOMAIN: &str =
     "satelle.provider-secret-provisioning.candidate.v1";
 pub(crate) const PROVIDER_SECRET_PRIOR_HMAC_DOMAIN: &str =
     "satelle.provider-secret-provisioning.prior.v1";
+
+pub(crate) fn provider_secret_file_paths(
+    destination: &Path,
+    operation_id: &str,
+) -> Result<satelle_core::OwnerOnlySecretFilePaths, StorageError> {
+    let digest = Sha256::digest(operation_id.as_bytes());
+    let mut file_component = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        write!(&mut file_component, "{byte:02x}")
+            .expect("writing lowercase hex into a String cannot fail");
+    }
+    satelle_core::OwnerOnlySecretFilePaths::new(destination, &file_component)
+        .map_err(|_| StorageError::new(StorageErrorKind::InvalidInput))
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ProviderSecretProvisioningPhase {
@@ -485,7 +500,7 @@ impl Storage {
         let replay =
             ProviderSecretProvisioningReplay::Completed(ProviderSecretProvisioningResult::file(
                 journal.destination_existed.unwrap_or(false),
-                "validated",
+                satelle_core::ProviderAuthValidationOutcome::Resolved,
             ));
         terminalize(
             &transaction,
@@ -517,7 +532,13 @@ impl Storage {
         ) {
             return Err(StorageError::new(StorageErrorKind::StateConflict));
         }
-        let replay = ProviderSecretProvisioningReplay::Failed(error);
+        let replay = ProviderSecretProvisioningReplay::Failed(SatelleError {
+            code: error.code,
+            message: "provider secret provisioning failed".to_string(),
+            recovery_command: None,
+            source_detail: None,
+            details: Default::default(),
+        });
         terminalize(
             &transaction,
             operation_id,
@@ -842,8 +863,7 @@ fn validate_operation_paths(
     backup: Option<&Path>,
 ) -> Result<(), StorageError> {
     validate_planned_paths(destination, staged)?;
-    let paths = satelle_core::OwnerOnlySecretFilePaths::new(destination, operation_id)
-        .map_err(|_| StorageError::new(StorageErrorKind::InvalidInput))?;
+    let paths = provider_secret_file_paths(destination, operation_id)?;
     if paths.staging() != staged || backup.is_some_and(|backup| backup != paths.backup()) {
         return Err(StorageError::new(StorageErrorKind::InvalidInput));
     }
@@ -1063,8 +1083,7 @@ mod tests {
     #[test]
     fn operation_identity_owns_the_only_accepted_recovery_paths() {
         let destination = Path::new("/tmp/provider-secret");
-        let expected =
-            satelle_core::OwnerOnlySecretFilePaths::new(destination, "operation-a").unwrap();
+        let expected = provider_secret_file_paths(destination, "operation-a").unwrap();
         assert!(
             validate_operation_paths(
                 "operation-a",

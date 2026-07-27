@@ -2020,7 +2020,7 @@ impl HostService {
         let (host_identity, key, owner) =
             self.runtime
                 .provider_secret_provisioning_ownership(host, &intent, identity.key())?;
-        let paths = satelle_core::OwnerOnlySecretFilePaths::new(&destination, identity.key())
+        let paths = storage::provider_secret_file_paths(&destination, identity.key())
             .map_err(|_| provider_secret_file_error())?;
         let candidate_secret = provider_auth::ResolvedProviderSecret::from_provisioning(secret);
         let candidate_comparison = provider_secret_comparison(

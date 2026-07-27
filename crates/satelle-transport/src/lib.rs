@@ -1,5 +1,7 @@
 mod client;
 mod contract;
+#[path = "provider-secret-crypto.rs"]
+mod provider_secret_crypto;
 mod server;
 #[path = "transport-tls.rs"]
 mod transport_tls;
@@ -19,11 +21,11 @@ pub use contract::{
     ProviderBindingAuthorizationRequest, ProviderBindingAuthorizationResponse,
     ProviderBindingDeletionResponse, ProviderBindingSource, ProviderDescriptorValidationRequest,
     ProviderDescriptorValidationResponse, ProviderSecretProvisioningMetadata,
-    ProviderSecretProvisioningPreviewResponse, ProviderSecretProvisioningResponse, RequestId,
-    ResolvedProviderBinding, SUPPORTED_IMAGE_MEDIA_TYPES, SessionResponse,
-    SetupVerificationRequest, SetupVerificationResponse, StopRequest, StopResponse,
-    SubscribeRequest, SubscribeRequestError, SubscribedResponse, TurnRequest, WsCloseReason,
-    WsControlError, WsServerControl,
+    ProviderSecretProvisioningPreviewResponse, ProviderSecretProvisioningResponse,
+    ProviderSecretUploadEnvelope, RequestId, ResolvedProviderBinding, SUPPORTED_IMAGE_MEDIA_TYPES,
+    SessionResponse, SetupVerificationRequest, SetupVerificationResponse, StopRequest,
+    StopResponse, SubscribeRequest, SubscribeRequestError, SubscribedResponse, TurnRequest,
+    WsCloseReason, WsControlError, WsServerControl,
 };
 pub use server::{
     DaemonServer, DaemonServerConfig, DaemonServerError, DaemonShutdownHandle, DaemonTlsConfig,
