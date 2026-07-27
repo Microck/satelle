@@ -232,6 +232,12 @@ pub(crate) enum ProviderSecretProvisioningReplay {
     Failed(SatelleError),
 }
 
+pub(crate) enum ProviderSecretProvisioningPreflight {
+    Absent,
+    InProgress,
+    Replay(ProviderSecretProvisioningReplay),
+}
+
 pub(crate) enum BeginProviderSecretProvisioning {
     Claimed(ProviderSecretProvisioningJournal),
     Resume,
@@ -527,23 +533,25 @@ impl Storage {
     pub(crate) fn provider_secret_provisioning_replay(
         &self,
         idempotency: &IdempotencyInput,
-    ) -> Result<Option<ProviderSecretProvisioningReplay>, StorageError> {
+    ) -> Result<ProviderSecretProvisioningPreflight, StorageError> {
         super::sql::require_operation(
             idempotency,
             IdempotentOperation::ProviderSecretProvisioning,
         )?;
         let Some(record) = matching_idempotency(&self.connection, idempotency)? else {
-            return Ok(None);
+            return Ok(ProviderSecretProvisioningPreflight::Absent);
         };
         match (
             record.status.as_str(),
             record.durable_outcome.as_str(),
             record.result_json,
         ) {
-            ("in_progress", PENDING_OUTCOME, None) => Ok(None),
+            ("in_progress", PENDING_OUTCOME, None) => {
+                Ok(ProviderSecretProvisioningPreflight::InProgress)
+            }
             ("terminal", COMPLETED_OUTCOME | FAILED_OUTCOME, Some(result_json)) => {
                 serde_json::from_str(&result_json)
-                    .map(Some)
+                    .map(ProviderSecretProvisioningPreflight::Replay)
                     .map_err(|_| invalid_stored_state())
             }
             _ => Err(invalid_stored_state()),

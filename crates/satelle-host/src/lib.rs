@@ -1994,6 +1994,14 @@ impl HostService {
         overwrite_authorized: bool,
         identity: &RequestIdentity,
     ) -> Result<ProviderSecretProvisioningResult, SatelleError> {
+        // Exact-idempotency replay and retained recovery ownership must be
+        // classified before native readiness can attempt a competing lease.
+        if let Some(result) = self
+            .runtime
+            .provider_secret_provisioning_replay(identity)?
+        {
+            return Ok(result);
+        }
         let model_alias = authorization.requested_model_alias().to_string();
         let provider_alias = authorization.requested_provider_alias().to_string();
         let binding = self.prepare_provider_binding_authorization(

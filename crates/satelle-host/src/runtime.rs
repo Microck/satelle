@@ -45,7 +45,8 @@ use crate::storage::{
     LeaseOwner, LogPageStorageError, NativeReadinessInvalidationReplay, ObservedUpstreamRef,
     OperatorLogMirror, OperatorLogPolicy, ProviderBindingAuthorizationReplay,
     ProviderBindingDeletionReplay, ProviderSecretProvisioningPhase, ProviderSecretProvisioningPlan,
-    ProviderSecretProvisioningReplay, ReadinessProbeKind, ReadinessProbeTerminal,
+    ProviderSecretProvisioningPreflight, ProviderSecretProvisioningReplay, ReadinessProbeKind,
+    ReadinessProbeTerminal,
     SensitiveRequestDigest, SetupActionSkipReason, SetupRepairPlan, SetupRepairProbe, SetupRunPlan,
     SetupRunRecord, SetupRunStatus, Storage, StorageSnapshot,
 };
@@ -2954,9 +2955,16 @@ impl RuntimeHandle {
             .provider_secret_provisioning_replay(&idempotency)
             .map_err(model::storage_failure)?
         {
-            Some(ProviderSecretProvisioningReplay::Completed(result)) => Ok(Some(result)),
-            Some(ProviderSecretProvisioningReplay::Failed(error)) => Err(error),
-            None => Ok(None),
+            ProviderSecretProvisioningPreflight::Absent => Ok(None),
+            ProviderSecretProvisioningPreflight::InProgress => {
+                Err(SatelleError::state_conflict())
+            }
+            ProviderSecretProvisioningPreflight::Replay(
+                ProviderSecretProvisioningReplay::Completed(result),
+            ) => Ok(Some(result)),
+            ProviderSecretProvisioningPreflight::Replay(
+                ProviderSecretProvisioningReplay::Failed(error),
+            ) => Err(error),
         }
     }
 

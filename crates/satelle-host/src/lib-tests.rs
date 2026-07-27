@@ -109,6 +109,9 @@ impl ComputerUseAdapter for FailedProviderSmokeAdapter {
 #[cfg(unix)]
 struct TamperingProviderProvisioningAdapter {
     staging_path: PathBuf,
+    native_probe_calls: Arc<std::sync::atomic::AtomicUsize>,
+    provider_probe_calls: Arc<std::sync::atomic::AtomicUsize>,
+    tamper_calls: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 #[cfg(unix)]
@@ -118,6 +121,8 @@ impl ComputerUseAdapter for TamperingProviderProvisioningAdapter {
         _host: &str,
         _provider_intent: &ProviderComputerUseIntent,
     ) -> Result<AdapterReadiness, SatelleError> {
+        self.tamper_calls
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         // Use real filesystem I/O to make the candidate evidence fail closed.
         // This represents a concurrent local actor rather than mocking the
         // secure-file implementation.
@@ -159,6 +164,8 @@ impl crate::runtime::ReadinessProbeDriver for TamperingProviderProvisioningAdapt
         _persist_thread_ref: &mut dyn FnMut(&str) -> Result<(), ()>,
         _persist_turn_ref: &mut dyn FnMut(&str) -> Result<(), ()>,
     ) -> crate::runtime::NativeProbeResult {
+        self.native_probe_calls
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let observed_at = time::OffsetDateTime::now_utc();
         crate::runtime::NativeProbeResult::Passed(
             key.evidence(
@@ -181,6 +188,8 @@ impl crate::runtime::ReadinessProbeDriver for TamperingProviderProvisioningAdapt
         _persist_thread_ref: &mut dyn FnMut(&str) -> Result<(), ()>,
         _persist_turn_ref: &mut dyn FnMut(&str) -> Result<(), ()>,
     ) -> AdapterPreflight {
+        self.provider_probe_calls
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         self.preflight_terminal(host, cached, cached_provider, provider_intent)
     }
 
@@ -889,10 +898,16 @@ fn failed_staged_rollback_retains_pending_journal_and_active_lease() {
     let identity = RequestIdentity::new("provider-secret-rollback-pending", "b".repeat(64));
     let paths = satelle_core::OwnerOnlySecretFilePaths::new(&destination, identity.key())
         .expect("deterministic provider secret paths");
+    let native_probe_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let provider_probe_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let tamper_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let service = service_with_provider_descriptor_and_readiness_probe(
         state.path().to_path_buf(),
         TamperingProviderProvisioningAdapter {
             staging_path: paths.staging().to_path_buf(),
+            native_probe_calls: Arc::clone(&native_probe_calls),
+            provider_probe_calls: Arc::clone(&provider_probe_calls),
+            tamper_calls: Arc::clone(&tamper_calls),
         },
         None,
     );
@@ -909,10 +924,22 @@ fn failed_staged_rollback_retains_pending_journal_and_active_lease() {
         )
         .expect_err("tampered staging must prevent rollback terminalization");
     assert_eq!(failure.code, ErrorCode::StateConflict);
+    assert_eq!(
+        native_probe_calls.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+    );
+    assert_eq!(
+        provider_probe_calls.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+    );
+    assert_eq!(
+        tamper_calls.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+    );
 
     let connection = rusqlite::Connection::open(state.path().join("satelle.sqlite3"))
         .expect("open Host SQLite state");
-    let (phase, lease_state): (String, String) = connection
+    let retained_state: (String, String) = connection
         .query_row(
             "SELECT journal.phase, lease.lease_state
              FROM provider_secret_provisioning_journal AS journal
@@ -924,8 +951,10 @@ fn failed_staged_rollback_retains_pending_journal_and_active_lease() {
             |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .expect("load retained provider provisioning ownership");
-    assert_eq!(phase, "rollback_pending");
-    assert_eq!(lease_state, "active");
+    assert_eq!(
+        retained_state,
+        ("rollback_pending".to_string(), "active".to_string()),
+    );
 
     let retry = service
         .provision_provider_secret(
@@ -937,6 +966,31 @@ fn failed_staged_rollback_retains_pending_journal_and_active_lease() {
         )
         .expect_err("pending recovery must not start a second operation");
     assert_eq!(retry.code, ErrorCode::StateConflict);
+    assert_eq!(
+        native_probe_calls.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+    );
+    assert_eq!(
+        provider_probe_calls.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+    );
+    assert_eq!(
+        tamper_calls.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+    );
+    let retry_retained_state: (String, String) = connection
+        .query_row(
+            "SELECT journal.phase, lease.lease_state
+             FROM provider_secret_provisioning_journal AS journal
+             JOIN control_leases AS lease
+               ON lease.operation_id = journal.operation_id
+              AND lease.provider_probe_ref = journal.provider_probe_ref
+             WHERE journal.operation_id = ?1",
+            [identity.key()],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .expect("reload retained provider provisioning ownership");
+    assert_eq!(retry_retained_state, retained_state);
 }
 
 fn turn_intent_with_extras(prompt: &str, timeout_seconds: u64) -> TurnIntent {
