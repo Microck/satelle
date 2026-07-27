@@ -6,6 +6,24 @@ use thiserror::Error;
 /// One Doctor command owns one scheduler for one target Host. Keeping the
 /// bound here makes the default concurrency contract independent of output
 /// order and of the executor used by the Host.
+/// Closed blocker classes that Doctor may report when an authoritative probe
+/// has observed the corresponding condition.
+///
+/// Defining a class here does not imply that every runtime can currently
+/// detect it. Callers must omit a class when they lack a typed observation
+/// from the subsystem that owns that condition.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum DoctorReadinessBlocker {
+    CodexRuntimeMissing,
+    ComputerUsePluginMissing,
+    OsPermissionRequired,
+    AppApprovalRequired,
+    AuthenticationRequired,
+    UnsupportedOperatingSystem,
+    UnsupportedRegion,
+}
+
 pub const DEFAULT_DOCTOR_PROBE_CONCURRENCY: usize = 4;
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -384,6 +402,32 @@ pub enum DoctorProbeScheduleError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn readiness_blocker_taxonomy_has_seven_distinct_closed_tokens() {
+        let blockers = [
+            DoctorReadinessBlocker::CodexRuntimeMissing,
+            DoctorReadinessBlocker::ComputerUsePluginMissing,
+            DoctorReadinessBlocker::OsPermissionRequired,
+            DoctorReadinessBlocker::AppApprovalRequired,
+            DoctorReadinessBlocker::AuthenticationRequired,
+            DoctorReadinessBlocker::UnsupportedOperatingSystem,
+            DoctorReadinessBlocker::UnsupportedRegion,
+        ];
+
+        assert_eq!(
+            blockers.map(|blocker| serde_json::to_value(blocker).unwrap()),
+            [
+                serde_json::json!("codex-runtime-missing"),
+                serde_json::json!("computer-use-plugin-missing"),
+                serde_json::json!("os-permission-required"),
+                serde_json::json!("app-approval-required"),
+                serde_json::json!("authentication-required"),
+                serde_json::json!("unsupported-operating-system"),
+                serde_json::json!("unsupported-region"),
+            ]
+        );
+    }
 
     fn probe(
         probe_id: &str,

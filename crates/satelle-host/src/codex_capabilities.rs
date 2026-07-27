@@ -432,6 +432,32 @@ pub(crate) struct Phase0CapabilityBlocker {
     pub(crate) live_proof: LiveProofStatus,
 }
 
+impl Phase0CapabilityBlocker {
+    /// Maps only observations whose current Phase 0 evidence proves the exact
+    /// Doctor blocker class. The remaining closed classes are intentionally
+    /// non-emitting until their owning subsystems provide typed observations.
+    pub(crate) fn doctor_readiness_blocker(
+        &self,
+    ) -> Option<satelle_core::doctor::DoctorReadinessBlocker> {
+        use satelle_core::doctor::DoctorReadinessBlocker;
+
+        match self.reason {
+            BlockerReason::MissingCodexRuntime => Some(DoctorReadinessBlocker::CodexRuntimeMissing),
+            BlockerReason::NativeExecutionPathUnavailable => {
+                Some(DoctorReadinessBlocker::ComputerUsePluginMissing)
+            }
+            BlockerReason::UnsupportedHostPlatform => {
+                Some(DoctorReadinessBlocker::UnsupportedOperatingSystem)
+            }
+            BlockerReason::MalformedCodexVersion
+            | BlockerReason::CodexVersionUnavailable
+            | BlockerReason::UnsupportedCodexVersion
+            | BlockerReason::NonStableSurface
+            | BlockerReason::IncompleteLiveProof => None,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
 pub(crate) enum Phase0SupportVerdict {

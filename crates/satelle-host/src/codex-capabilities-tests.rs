@@ -825,6 +825,62 @@ fn missing_and_malformed_versions_have_distinct_typed_blockers() {
 }
 
 #[test]
+fn doctor_maps_only_authoritative_phase0_blocker_observations() {
+    use satelle_core::doctor::DoctorReadinessBlocker;
+
+    let cases = [
+        (
+            BlockerReason::MissingCodexRuntime,
+            DoctorReadinessBlocker::CodexRuntimeMissing,
+        ),
+        (
+            BlockerReason::NativeExecutionPathUnavailable,
+            DoctorReadinessBlocker::ComputerUsePluginMissing,
+        ),
+        (
+            BlockerReason::UnsupportedHostPlatform,
+            DoctorReadinessBlocker::UnsupportedOperatingSystem,
+        ),
+    ];
+
+    for (reason, expected) in cases {
+        let blocker = Phase0CapabilityBlocker {
+            reason,
+            capability: RequiredCapability::NativeReadiness,
+            codex_version: CodexVersionEvidence::Missing,
+            host_platform: HostPlatform::Windows,
+            observed_surface: EvidenceSurface::Absent,
+            live_proof: LiveProofStatus::NotObserved,
+        };
+
+        assert_eq!(blocker.doctor_readiness_blocker(), Some(expected));
+    }
+
+    for reason in [
+        BlockerReason::MalformedCodexVersion,
+        BlockerReason::CodexVersionUnavailable,
+        BlockerReason::UnsupportedCodexVersion,
+        BlockerReason::NonStableSurface,
+        BlockerReason::IncompleteLiveProof,
+    ] {
+        let blocker = Phase0CapabilityBlocker {
+            reason,
+            capability: RequiredCapability::ApprovalObservation,
+            codex_version: CodexVersionEvidence::Unavailable,
+            host_platform: HostPlatform::Windows,
+            observed_surface: EvidenceSurface::Undocumented,
+            live_proof: LiveProofStatus::Failed,
+        };
+
+        assert_eq!(
+            blocker.doctor_readiness_blocker(),
+            None,
+            "{reason:?} must not fabricate a more specific Doctor blocker"
+        );
+    }
+}
+
+#[test]
 fn version_probe_times_out_and_terminates_a_slow_process() {
     let mut command = Command::new(
         std::env::current_exe().expect("the current test executable should be available"),
