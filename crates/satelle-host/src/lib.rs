@@ -1947,7 +1947,7 @@ impl HostService {
             && !report
                 .cache_updates
                 .iter()
-                .any(|entry| entry == "native_readiness")
+                .any(|entry| matches!(entry.as_str(), "local-demo-readiness" | "native_readiness"))
         {
             report.cache_updates.push("native_readiness".to_string());
         }

@@ -3085,10 +3085,9 @@ fn setup_verify_runs_live_fake_readiness_and_records_the_cache_update() {
 
     assert_eq!(verification["status"], "passed");
     assert_eq!(verification["result"]["ready"], true);
-    assert!(
-        verification["cache_updates"]
-            .as_array()
-            .is_some_and(|updates| updates.iter().any(|update| update == "native_readiness"))
+    assert_eq!(
+        verification["cache_updates"],
+        serde_json::json!(["local-demo-readiness"])
     );
     assert_eq!(report["native_computer_use_readiness"], "ready");
 }
@@ -7357,6 +7356,7 @@ fn run_provider_secret_setup_in_pty(
     state_dir: &std::path::Path,
     profile: Option<&str>,
     yes: bool,
+    components: &[&str],
     decision: ProviderSecretPtyDecision<'_>,
 ) -> (std::process::Output, usize, Option<usize>) {
     let executable = assert_cmd::cargo::cargo_bin!("satelle");
@@ -7364,8 +7364,12 @@ fn run_provider_secret_setup_in_pty(
         .map(|profile| format!("--profile {profile} "))
         .unwrap_or_default();
     let yes_argument = if yes { " --yes" } else { "" };
+    let component_arguments = components
+        .iter()
+        .map(|component| format!(" --component {component}"))
+        .collect::<String>();
     let command_line = format!(
-        "{} {profile_argument}setup --host selected --component provider-auth{yes_argument}",
+        "{} {profile_argument}setup --host selected{component_arguments}{yes_argument}",
         executable.display()
     );
     let mut command = std::process::Command::new("script");
@@ -7518,8 +7522,14 @@ command_families = ["setup"]
         } else {
             ProviderSecretPtyDecision::Decline
         };
-        let (output, confirmation_end, secret_prompt_end) =
-            run_provider_secret_setup_in_pty(&user_config, state.path(), profile, yes, decision);
+        let (output, confirmation_end, secret_prompt_end) = run_provider_secret_setup_in_pty(
+            &user_config,
+            state.path(),
+            profile,
+            yes,
+            &["provider-auth"],
+            decision,
+        );
         if accepted {
             assert!(
                 output.status.success(),
@@ -7584,6 +7594,15 @@ command_families = ["setup"]
                     .expect("selected destination should contain the confirmed secret"),
                 secret_canary
             );
+            assert_eq!(
+                fs::metadata(&selected_destination)
+                    .expect("stat provisioned provider secret")
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o600,
+                "{case} must persist the provider secret owner-only"
+            );
         } else {
             assert!(
                 !selected_destination.exists(),
@@ -7602,6 +7621,69 @@ command_families = ["setup"]
             &[secret_canary.as_str()],
         );
     }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn combined_native_and_file_provider_setup_retains_both_applied_results() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let state = state_dir();
+    let user_config = state.path().join("user-config.toml");
+    let destinations = tempfile::tempdir().expect("create external secret destination");
+    fs::set_permissions(destinations.path(), fs::Permissions::from_mode(0o700))
+        .expect("make provider secret destination owner-only");
+    let destination = destinations.path().join("selected-provider-secret");
+    let secret = "COMBINED_SETUP_PROVIDER_SECRET_CANARY";
+    write_user_config(
+        &user_config,
+        format!(
+            r#"
+default_host = "selected"
+model_alias = "review"
+provider_alias = "openai"
+
+[hosts.selected]
+transport = "local"
+adapter = "fake"
+
+[hosts.selected.provider_auth.operator-auth]
+kind = "file"
+path = '{}'
+
+[hosts.selected.provider_bindings.openai.review]
+model = "gpt-5.2"
+model_provider = "openai"
+auth_source = "operator-auth"
+"#,
+            destination.display()
+        ),
+    )
+    .expect("write combined setup config");
+
+    let (output, confirmation_end, secret_prompt_end) = run_provider_secret_setup_in_pty(
+        &user_config,
+        state.path(),
+        None,
+        true,
+        &["codex", "provider-auth"],
+        ProviderSecretPtyDecision::Accept(secret),
+    );
+    let rendered = combined_process_output(&output);
+    assert!(
+        output.status.success(),
+        "combined setup failed: {}",
+        rendered.replace(secret, "<redacted>")
+    );
+    assert!(secret_prompt_end.is_some_and(|end| end > confirmation_end));
+    assert!(rendered.contains("Components: codex"));
+    assert!(rendered.contains("Provider secret provisioned: true"));
+    assert!(rendered.contains("Provider validation: resolved"));
+    assert_eq!(
+        fs::read_to_string(&destination).expect("read provisioned secret"),
+        secret
+    );
+    assert_privacy_canaries_absent("combined setup output", rendered.as_bytes(), &[secret]);
 }
 
 #[cfg(target_os = "linux")]

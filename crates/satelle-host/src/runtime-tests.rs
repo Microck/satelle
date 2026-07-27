@@ -7,8 +7,11 @@ use super::{
     SteerCommand, StopCommand,
 };
 use crate::storage::{
-    IdempotencyInput, IdempotentOperation, LeaseOwner, PROVIDER_SECRET_CANDIDATE_HMAC_DOMAIN,
-    PROVIDER_SECRET_PRIOR_HMAC_DOMAIN, PrivateUpstreamRef, ProbeRecoverySubject,
+    IdempotencyInput, IdempotentOperation, LeaseOwner, PrivateUpstreamRef, ProbeRecoverySubject,
+};
+#[cfg(unix)]
+use crate::storage::{
+    PROVIDER_SECRET_CANDIDATE_HMAC_DOMAIN, PROVIDER_SECRET_PRIOR_HMAC_DOMAIN,
     ProviderSecretProvisioningPhase, ProviderSecretProvisioningPlan,
 };
 use crate::test_runtime::FakeComputerUseAdapter;
@@ -116,6 +119,7 @@ fn production_runtime_with_host_policy(
     )
 }
 
+#[cfg(unix)]
 struct ProviderSecretRecoveryFixture {
     operation_id: String,
     binding: satelle_core::ResolvedProviderBinding,
@@ -128,6 +132,7 @@ struct ProviderSecretRecoveryFixture {
     prior_hmac: String,
 }
 
+#[cfg(unix)]
 fn provider_secret_recovery_fixture(
     runtime: &RuntimeHandle,
     destination: &std::path::Path,
@@ -149,15 +154,17 @@ fn provider_secret_recovery_fixture(
         .iter()
         .map(|byte| format!("{byte:02x}"))
         .collect::<String>();
-    let prior_secret = crate::provider_auth::ResolvedProviderSecret::for_test("prior");
+    let prior_secret = satelle_core::read_owner_only_secret_file(destination)
+        .map(crate::provider_auth::ResolvedProviderSecret::from_provisioning)
+        .expect("read normalized prior secret");
     let prior_key = runtime
         .provider_secret_provisioning_hmac(PROVIDER_SECRET_PRIOR_HMAC_DOMAIN, &prior_secret)
         .expect("derive prior comparison key");
-    let prior_digest = prior_secret
-        .expose_to_provider(|value| {
-            satelle_core::keyed_secret_comparison_digest(prior_key.as_bytes(), value.as_bytes())
-        })
-        .expect("derive prior digest");
+    let prior_digest = satelle_core::keyed_owner_only_secret_file_comparison_digest(
+        destination,
+        prior_key.as_bytes(),
+    )
+    .expect("derive exact prior file digest");
     let prior_hmac = prior_digest
         .iter()
         .map(|byte| format!("{byte:02x}"))
@@ -221,6 +228,7 @@ fn provider_secret_recovery_fixture(
     }
 }
 
+#[cfg(unix)]
 fn recovery_test_runtime(state: &crate::TestStateDir) -> RuntimeHandle {
     let config = satelle_core::SatelleConfig::defaults()
         .hosts
@@ -241,15 +249,31 @@ fn recovery_secret_destination(state: &crate::TestStateDir, name: &str) -> std::
 }
 
 #[cfg(unix)]
-#[test]
-fn startup_recovery_rolls_back_publish_intent_before_serving_requests() {
+fn assert_startup_recovery_rolls_back_publish_intent(
+    destination_name: &str,
+    operation_id: &str,
+    prior_bytes: &str,
+) {
+    use std::io::Write as _;
+    use std::os::unix::fs::OpenOptionsExt;
+
     let state = crate::TestStateDir::new().expect("temporary state directory");
-    let destination = recovery_secret_destination(&state, "rollback-token");
-    satelle_core::persist_new_owner_only_secret_file(&destination, "prior")
-        .expect("persist prior credential");
+    let destination = recovery_secret_destination(&state, destination_name);
+    let mut prior_file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&destination)
+        .expect("create exact owner-only prior credential");
+    prior_file
+        .write_all(prior_bytes.as_bytes())
+        .expect("write exact prior credential bytes");
+    prior_file
+        .sync_all()
+        .expect("sync exact prior credential bytes");
+    drop(prior_file);
     let runtime = recovery_test_runtime(&state);
-    let fixture =
-        provider_secret_recovery_fixture(&runtime, &destination, "provider-rollback-crash");
+    let fixture = provider_secret_recovery_fixture(&runtime, &destination, operation_id);
     satelle_core::stage_owner_only_secret_file(
         &fixture.paths,
         "candidate",
@@ -304,10 +328,8 @@ fn startup_recovery_rolls_back_publish_intent_before_serving_requests() {
     let restarted = recovery_test_runtime(&state);
     restarted.snapshot().expect("startup recovery succeeds");
     assert_eq!(
-        satelle_core::read_owner_only_secret_file(&destination)
-            .expect("read restored credential")
-            .as_str(),
-        "prior"
+        std::fs::read(&destination).expect("read exact restored credential bytes"),
+        prior_bytes.as_bytes(),
     );
     assert!(!fixture.paths.staging().exists());
     assert!(!fixture.paths.backup().exists());
@@ -320,6 +342,36 @@ fn startup_recovery_rolls_back_publish_intent_before_serving_requests() {
             .pending_provider_secret_provisionings()
             .expect("load pending journals")
             .is_empty()
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn startup_recovery_rolls_back_publish_intent_before_serving_requests() {
+    assert_startup_recovery_rolls_back_publish_intent(
+        "rollback-token",
+        "provider-rollback-crash",
+        "prior",
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn startup_recovery_preserves_lf_terminated_prior_secret_bytes() {
+    assert_startup_recovery_rolls_back_publish_intent(
+        "rollback-token-lf",
+        "provider-rollback-crash-lf",
+        "prior\n",
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn startup_recovery_preserves_crlf_terminated_prior_secret_bytes() {
+    assert_startup_recovery_rolls_back_publish_intent(
+        "rollback-token-crlf",
+        "provider-rollback-crash-crlf",
+        "prior\r\n",
     );
 }
 

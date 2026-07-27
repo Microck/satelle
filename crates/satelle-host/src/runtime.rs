@@ -2570,7 +2570,7 @@ impl RuntimeHandle {
         }
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     pub(crate) fn new_with_provider_policy_and_readiness_probe_driver<A, D>(
         state_root: Result<PathBuf, SatelleError>,
         adapter: A,
@@ -3814,6 +3814,7 @@ fn inspect_provider_secret_recovery_artifact(
         .map_err(|_| provider_secret_recovery_failure())?;
     let candidate = provider_secret_recovery_comparison(
         runtime,
+        path,
         crate::storage::PROVIDER_SECRET_CANDIDATE_HMAC_DOMAIN,
         &secret,
         journal.candidate_secret_hmac(),
@@ -3823,6 +3824,7 @@ fn inspect_provider_secret_recovery_artifact(
         .map(|expected| {
             provider_secret_recovery_comparison(
                 runtime,
+                path,
                 crate::storage::PROVIDER_SECRET_PRIOR_HMAC_DOMAIN,
                 &secret,
                 expected,
@@ -3849,15 +3851,13 @@ fn inspect_provider_secret_recovery_artifact(
 
 fn provider_secret_recovery_comparison(
     runtime: &RuntimeHandle,
+    path: &Path,
     domain: &'static str,
     secret: &crate::provider_auth::ResolvedProviderSecret,
     expected: &str,
 ) -> Result<Option<ProviderSecretRecoveryComparison>, SatelleError> {
     let key = Zeroizing::new(runtime.provider_secret_provisioning_hmac(domain, secret)?);
-    let digest = secret
-        .expose_to_provider(|value| {
-            satelle_core::keyed_secret_comparison_digest(key.as_bytes(), value.as_bytes())
-        })
+    let digest = satelle_core::keyed_owner_only_secret_file_comparison_digest(path, key.as_bytes())
         .map_err(|_| provider_secret_recovery_failure())?;
     let actual = digest
         .iter()

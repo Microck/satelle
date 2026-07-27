@@ -1967,6 +1967,15 @@ fn run_host_setup_if_required<T>(
     }
 }
 
+fn run_host_setup_then_follow_up<T, E>(
+    host_setup: impl FnOnce() -> Result<T, E>,
+    follow_up: impl FnOnce(&mut T) -> Result<(), E>,
+) -> Result<T, E> {
+    let mut result = host_setup()?;
+    follow_up(&mut result)?;
+    Ok(result)
+}
+
 #[cfg(test)]
 fn run_host_setup_after_desktop_preflight<C, T>(
     desktop_preflight: Result<(), CliFailure>,
@@ -2770,33 +2779,6 @@ fn run_setup(
             transport =
                 setup_transport_if_required(host_setup_required, || transport_for_setup(&host))?;
         }
-        if let Some(authorization) = pending_provider_secret_authorization.take() {
-            let provider_transport = if host.config.transport == satelle_core::TransportKind::Ssh {
-                transport_for_with_ssh_bootstrap(&host, Some(SshBootstrapScope::Admin))?
-            } else {
-                transport_for(&host)?
-            };
-            let response = provision_provider_secret(
-                provider_transport.as_ref(),
-                &authorization,
-                &host.alias,
-                &command,
-                &format,
-            )?;
-            provider_secret_setup_completed = true;
-            report.secret_provisioned = response.provisioned();
-            report.validation_status = response.validation_status().as_str().to_string();
-            report.readiness_summary.provider_auth =
-                response.validation_status().as_str().to_string();
-            report.applied_actions.push(format!(
-                "provisioned and authorized {} provider authentication on Host '{}'",
-                response.destination_kind(),
-                host.alias,
-            ));
-            report.mutated = true;
-            report.changed = true;
-            report.status = "applied".to_string();
-        }
         let mut persisted_desktop_action = None;
         let mut persisted_provider_auth_action = None;
         if report.required_input.is_empty() {
@@ -2813,36 +2795,75 @@ fn run_setup(
                 host.config.desktop_session_native_selector = None;
                 persisted_desktop_action = Some(selection.action(&host.alias));
             }
-            report = if tailscale_serve_setup {
-                tailscale_serve::configure(
-                    &host.alias,
-                    &host.config,
-                    &daemon_path_overrides,
-                    false,
-                    &setup_mode,
-                )
-                .map_err(failure)?
-            } else {
-                run_host_setup_if_required(
-                    host_setup_required,
-                    || {
-                        report.dry_run = false;
-                        report
-                    },
-                    || {
-                        transport
-                            .as_ref()
-                            .expect("Host-owned setup transport is present")
-                            .setup(
-                                false,
-                                setup_mode_selection,
-                                host_setup_components,
-                                daemon_path_overrides,
-                            )
-                    },
-                )
-                .map_err(failure)?
-            };
+            report = run_host_setup_then_follow_up(
+                || {
+                    if tailscale_serve_setup {
+                        tailscale_serve::configure(
+                            &host.alias,
+                            &host.config,
+                            &daemon_path_overrides,
+                            false,
+                            &setup_mode,
+                        )
+                        .map_err(failure)
+                    } else {
+                        run_host_setup_if_required(
+                            host_setup_required,
+                            || {
+                                report.dry_run = false;
+                                report
+                            },
+                            || {
+                                transport
+                                    .as_ref()
+                                    .expect("Host-owned setup transport is present")
+                                    .setup(
+                                        false,
+                                        setup_mode_selection,
+                                        host_setup_components,
+                                        daemon_path_overrides,
+                                    )
+                            },
+                        )
+                        .map_err(failure)
+                    }
+                },
+                |report| {
+                    if let Some(authorization) = pending_provider_secret_authorization.take() {
+                        // Build the provider client only after Host setup has installed
+                        // every prerequisite needed by live readiness validation.
+                        let provider_transport = if host.config.transport
+                            == satelle_core::TransportKind::Ssh
+                        {
+                            transport_for_with_ssh_bootstrap(&host, Some(SshBootstrapScope::Admin))?
+                        } else {
+                            transport_for(&host)?
+                        };
+                        let response = provision_provider_secret(
+                            provider_transport.as_ref(),
+                            &authorization,
+                            &host.alias,
+                            &command,
+                            &format,
+                        )?;
+                        provider_secret_setup_completed = true;
+                        report.secret_provisioned = response.provisioned();
+                        report.validation_status =
+                            response.validation_status().as_str().to_string();
+                        report.readiness_summary.provider_auth =
+                            response.validation_status().as_str().to_string();
+                        report.applied_actions.push(format!(
+                            "provisioned and authorized {} provider authentication on Host '{}'",
+                            response.destination_kind(),
+                            host.alias,
+                        ));
+                        report.mutated = true;
+                        report.changed = true;
+                        report.status = "applied".to_string();
+                    }
+                    Ok(())
+                },
+            )?;
         }
 
         if provider_auth_setup
@@ -9112,6 +9133,37 @@ mod setup_desktop_binding_tests {
         assert!(transport.is_none());
         assert!(!constructed.get());
         assert!(!called.get());
+    }
+
+    #[test]
+    fn host_setup_precedes_provider_follow_up_and_failure_blocks_it() {
+        let result = run_host_setup_then_follow_up(
+            || Ok::<_, &'static str>(vec!["configured fake native Computer Use readiness"]),
+            |applied_actions| {
+                applied_actions.push(
+                    "provisioned and authorized file provider authentication on Host 'selected'",
+                );
+                Ok(())
+            },
+        );
+        assert_eq!(
+            result,
+            Ok(vec![
+                "configured fake native Computer Use readiness",
+                "provisioned and authorized file provider authentication on Host 'selected'",
+            ])
+        );
+
+        let provider_called = std::cell::Cell::new(false);
+        let result = run_host_setup_then_follow_up(
+            || Err::<(), _>("host setup failed"),
+            |_| {
+                provider_called.set(true);
+                Ok(())
+            },
+        );
+        assert_eq!(result, Err("host setup failed"));
+        assert!(!provider_called.get());
     }
 
     #[test]
