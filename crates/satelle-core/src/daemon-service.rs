@@ -235,8 +235,8 @@ impl From<&crate::SatellePathSet> for DaemonResolvedPathSet {
             sources: paths.sources.clone(),
             project_config_file: paths
                 .project_config_file
-                .as_ref()
-                .map(|path| path.display().to_string()),
+                .is_file()
+                .then(|| paths.project_config_file.display().to_string()),
             install_receipt: paths.install_receipt.display().to_string(),
         }
     }
