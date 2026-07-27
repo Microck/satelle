@@ -486,7 +486,7 @@ async fn provider_binding_validation_requires_setup_or_control_authority() {
     let unauthenticated = reqwest::Client::new()
         .post(control.url(VALIDATION_PATH))
         .header("Content-Type", "application/json")
-        .header("Satelle-Protocol-Version", "11")
+        .header("Satelle-Protocol-Version", "12")
         .header("Satelle-Expected-Host-Identity", &control.host_identity)
         .header("Satelle-Request-Id", RequestId::new().as_str())
         .header("Idempotency-Key", "provider-auth-unauthenticated")
@@ -533,7 +533,7 @@ async fn bootstrap_admin_authorizes_and_control_validates_the_exact_path_aliases
         .header("Authorization", bearer(&bootstrap_token))
         .header("Satelle-Expected-Host-Identity", &running.host_identity)
         .header("Satelle-Request-Id", RequestId::new().as_str())
-        .header("Satelle-Protocol-Version", "11")
+        .header("Satelle-Protocol-Version", "12")
         .header("Idempotency-Key", "provider-authorization-admin")
         .json(&authorization)
         .send()
@@ -650,7 +650,7 @@ async fn validation_rejects_descriptor_material_and_control_cannot_authorize() {
     let forbidden = control
         .protected_request(reqwest::Method::PUT, AUTHORIZATION_PATH)
         .header("Idempotency-Key", "provider-authorization-control")
-        .header("Satelle-Protocol-Version", "11")
+        .header("Satelle-Protocol-Version", "12")
         .json(&authorization)
         .send()
         .await
@@ -670,7 +670,7 @@ fn bootstrap_mutation(
         .header("Authorization", bearer(token))
         .header("Satelle-Expected-Host-Identity", &running.host_identity)
         .header("Satelle-Request-Id", RequestId::new().as_str())
-        .header("Satelle-Protocol-Version", "11")
+        .header("Satelle-Protocol-Version", "12")
         .header("Idempotency-Key", idempotency_key)
 }
 
@@ -719,7 +719,7 @@ async fn provider_binding_mutations_require_admin() {
     let forbidden_delete = control
         .protected_request(reqwest::Method::DELETE, AUTHORIZATION_PATH)
         .header("Idempotency-Key", "provider-delete-control")
-        .header("Satelle-Protocol-Version", "11")
+        .header("Satelle-Protocol-Version", "12")
         .send()
         .await
         .expect("send deletion as control principal");
@@ -736,7 +736,7 @@ async fn provider_binding_mutations_require_admin() {
     let authorized = ordinary_admin
         .protected_request(reqwest::Method::PUT, AUTHORIZATION_PATH)
         .header("Idempotency-Key", "provider-authorization-ordinary-admin")
-        .header("Satelle-Protocol-Version", "11")
+        .header("Satelle-Protocol-Version", "12")
         .json(&authorization)
         .send()
         .await
@@ -746,7 +746,7 @@ async fn provider_binding_mutations_require_admin() {
     let rejected_body = ordinary_admin
         .protected_request(reqwest::Method::DELETE, AUTHORIZATION_PATH)
         .header("Idempotency-Key", "provider-delete-body")
-        .header("Satelle-Protocol-Version", "11")
+        .header("Satelle-Protocol-Version", "12")
         .json(&serde_json::json!({"unexpected": true}))
         .send()
         .await
@@ -756,7 +756,7 @@ async fn provider_binding_mutations_require_admin() {
     let rejected_oversized_body = ordinary_admin
         .protected_request(reqwest::Method::DELETE, AUTHORIZATION_PATH)
         .header("Idempotency-Key", "provider-delete-oversized-body")
-        .header("Satelle-Protocol-Version", "11")
+        .header("Satelle-Protocol-Version", "12")
         .body(vec![b'x'; 2 * 1024 * 1024])
         .send()
         .await
@@ -769,7 +769,7 @@ async fn provider_binding_mutations_require_admin() {
     let deleted = ordinary_admin
         .protected_request(reqwest::Method::DELETE, AUTHORIZATION_PATH)
         .header("Idempotency-Key", "provider-delete-body")
-        .header("Satelle-Protocol-Version", "11")
+        .header("Satelle-Protocol-Version", "12")
         .send()
         .await
         .expect("reuse the rejected body idempotency key");
@@ -778,7 +778,7 @@ async fn provider_binding_mutations_require_admin() {
     let absent = ordinary_admin
         .protected_request(reqwest::Method::DELETE, AUTHORIZATION_PATH)
         .header("Idempotency-Key", "provider-delete-oversized-body")
-        .header("Satelle-Protocol-Version", "11")
+        .header("Satelle-Protocol-Version", "12")
         .send()
         .await
         .expect("reuse the rejected oversized-body idempotency key");
@@ -975,7 +975,7 @@ async fn authorization_is_checked_before_the_durable_mutation_claim() {
     let rejected_before_body = running
         .protected_request(reqwest::Method::PUT, AUTHORIZATION_PATH)
         .header("Idempotency-Key", "provider-authority-before-body")
-        .header("Satelle-Protocol-Version", "11")
+        .header("Satelle-Protocol-Version", "12")
         .body("{")
         .send()
         .await

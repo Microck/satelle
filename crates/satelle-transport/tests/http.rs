@@ -145,13 +145,13 @@ impl RunningServer {
 
     fn request(&self, path: &str) -> reqwest::RequestBuilder {
         self.protected_request(reqwest::Method::GET, path)
-            .header("Satelle-Protocol-Version", "11")
+            .header("Satelle-Protocol-Version", "12")
     }
 
     fn mutation(&self, path: &str, idempotency_key: &str) -> reqwest::RequestBuilder {
         self.protected_request(reqwest::Method::POST, path)
             .header("Idempotency-Key", idempotency_key)
-            .header("Satelle-Protocol-Version", "11")
+            .header("Satelle-Protocol-Version", "12")
     }
 
     fn mutation_with_request_id(
@@ -162,7 +162,7 @@ impl RunningServer {
     ) -> reqwest::RequestBuilder {
         self.protected_request_with_request_id(reqwest::Method::POST, path, request_id)
             .header("Idempotency-Key", idempotency_key)
-            .header("Satelle-Protocol-Version", "11")
+            .header("Satelle-Protocol-Version", "12")
     }
 
     fn protected_request(&self, method: reqwest::Method, path: &str) -> reqwest::RequestBuilder {
@@ -368,7 +368,7 @@ fn setup_mutation_request(
         .header("Satelle-Expected-Host-Identity", host_identity)
         .header("Satelle-Request-Id", RequestId::new().to_string())
         .header("Idempotency-Key", idempotency_key)
-        .header("Satelle-Protocol-Version", "11")
+        .header("Satelle-Protocol-Version", "12")
 }
 
 fn replacement_token(token_id: &str) -> ApiBearerToken {
@@ -1217,7 +1217,7 @@ async fn capabilities_are_truthful_and_unknown_routes_are_typed() {
         response.json().await.expect("decode capabilities JSON");
     assert_eq!(
         capabilities_json["schema_version"],
-        "satelle.capabilities.v5"
+        "satelle.capabilities.v6"
     );
     assert_eq!(
         capabilities_json["provider_secret_upload"],
@@ -1672,7 +1672,7 @@ async fn bootstrap_maintenance_routes_enforce_the_mutation_contract_before_ledge
         ),
         (
             "missing-idempotency",
-            Some("11"),
+            Some("12"),
             None,
             false,
             false,
@@ -1681,7 +1681,7 @@ async fn bootstrap_maintenance_routes_enforce_the_mutation_contract_before_ledge
         ),
         (
             "query",
-            Some("11"),
+            Some("12"),
             Some("query-key"),
             true,
             false,
@@ -1690,7 +1690,7 @@ async fn bootstrap_maintenance_routes_enforce_the_mutation_contract_before_ledge
         ),
         (
             "cookie",
-            Some("11"),
+            Some("12"),
             Some("cookie-key"),
             false,
             true,
@@ -1803,7 +1803,7 @@ async fn bootstrap_maintenance_routes_enforce_the_mutation_contract_before_ledge
         ),
         (
             "missing-idempotency",
-            Some("11"),
+            Some("12"),
             None,
             false,
             false,
@@ -1812,7 +1812,7 @@ async fn bootstrap_maintenance_routes_enforce_the_mutation_contract_before_ledge
         ),
         (
             "query",
-            Some("11"),
+            Some("12"),
             Some("complete-query-key"),
             true,
             false,
@@ -1821,7 +1821,7 @@ async fn bootstrap_maintenance_routes_enforce_the_mutation_contract_before_ledge
         ),
         (
             "cookie",
-            Some("11"),
+            Some("12"),
             Some("complete-cookie-key"),
             false,
             true,
