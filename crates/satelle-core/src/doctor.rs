@@ -24,6 +24,110 @@ pub enum DoctorReadinessBlocker {
     UnsupportedRegion,
 }
 
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
+)]
+#[serde(rename_all = "kebab-case")]
+pub enum DoctorScope {
+    Codex,
+    ComputerUse,
+    Config,
+    Provider,
+    Transport,
+}
+
+impl DoctorScope {
+    pub const ALL: [Self; 5] = [
+        Self::Codex,
+        Self::ComputerUse,
+        Self::Config,
+        Self::Provider,
+        Self::Transport,
+    ];
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Codex => "codex",
+            Self::ComputerUse => "computer-use",
+            Self::Config => "config",
+            Self::Provider => "provider",
+            Self::Transport => "transport",
+        }
+    }
+
+    pub const fn supports_refresh(self) -> bool {
+        matches!(self, Self::ComputerUse | Self::Provider)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DoctorScopeSelectionError {
+    UnsupportedScope(String),
+    AllWithSpecificScopes(Vec<String>),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DoctorScopeSelection {
+    scopes: Vec<DoctorScope>,
+}
+
+impl DoctorScopeSelection {
+    pub fn parse(raw_scopes: &[String]) -> Result<Self, DoctorScopeSelectionError> {
+        let mut includes_all = false;
+        let mut specific_scopes = Vec::new();
+
+        for raw_scope in raw_scopes {
+            let scope = match raw_scope.as_str() {
+                "all" => {
+                    includes_all = true;
+                    continue;
+                }
+                "codex" => DoctorScope::Codex,
+                "computer-use" => DoctorScope::ComputerUse,
+                "config" => DoctorScope::Config,
+                "provider" => DoctorScope::Provider,
+                "transport" => DoctorScope::Transport,
+                unsupported => {
+                    return Err(DoctorScopeSelectionError::UnsupportedScope(
+                        unsupported.to_string(),
+                    ));
+                }
+            };
+            if !specific_scopes.contains(&scope) {
+                specific_scopes.push(scope);
+            }
+        }
+
+        if includes_all && !specific_scopes.is_empty() {
+            return Err(DoctorScopeSelectionError::AllWithSpecificScopes(
+                raw_scopes.to_vec(),
+            ));
+        }
+
+        let scopes = if raw_scopes.is_empty() || includes_all {
+            DoctorScope::ALL.to_vec()
+        } else {
+            DoctorScope::ALL
+                .into_iter()
+                .filter(|scope| specific_scopes.contains(scope))
+                .collect()
+        };
+        Ok(Self { scopes })
+    }
+
+    pub fn scopes(&self) -> &[DoctorScope] {
+        &self.scopes
+    }
+
+    pub fn contains(&self, scope: DoctorScope) -> bool {
+        self.scopes.contains(&scope)
+    }
+
+    pub fn supports_refresh(&self) -> bool {
+        self.scopes.iter().any(|scope| scope.supports_refresh())
+    }
+}
+
 pub const DEFAULT_DOCTOR_PROBE_CONCURRENCY: usize = 4;
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -426,6 +530,52 @@ mod tests {
                 serde_json::json!("unsupported-operating-system"),
                 serde_json::json!("unsupported-region"),
             ]
+        );
+    }
+
+    #[test]
+    fn omitted_and_explicit_all_scopes_select_the_same_deterministic_set() {
+        let omitted = DoctorScopeSelection::parse(&[]).unwrap();
+        let explicit = DoctorScopeSelection::parse(&["all".to_string()]).unwrap();
+
+        assert_eq!(omitted, explicit);
+        assert_eq!(omitted.scopes(), DoctorScope::ALL);
+        assert!(omitted.supports_refresh());
+    }
+
+    #[test]
+    fn specific_scopes_are_deduplicated_and_canonically_ordered() {
+        let selection = DoctorScopeSelection::parse(&[
+            "provider".to_string(),
+            "codex".to_string(),
+            "provider".to_string(),
+        ])
+        .unwrap();
+
+        assert_eq!(
+            selection.scopes(),
+            [DoctorScope::Codex, DoctorScope::Provider]
+        );
+        assert!(selection.contains(DoctorScope::Provider));
+    }
+
+    #[test]
+    fn all_with_a_specific_scope_is_a_typed_conflict() {
+        let raw_scopes = vec!["provider".to_string(), "all".to_string()];
+
+        assert_eq!(
+            DoctorScopeSelection::parse(&raw_scopes),
+            Err(DoctorScopeSelectionError::AllWithSpecificScopes(raw_scopes))
+        );
+    }
+
+    #[test]
+    fn unsupported_scope_remains_distinct_from_selection_conflict() {
+        assert_eq!(
+            DoctorScopeSelection::parse(&["database".to_string()]),
+            Err(DoctorScopeSelectionError::UnsupportedScope(
+                "database".to_string()
+            ))
         );
     }
 
