@@ -3683,6 +3683,8 @@ impl RemoteUserDirectories {
             cache_root,
             state_root,
             operator_log_root,
+            // On-demand SSH inspection has no authoritative daemon-side project discovery.
+            project_config_file: None,
         }
     }
 
@@ -3762,6 +3764,67 @@ mod remote_user_directories_tests {
                 Err(SshBootstrapError::InvalidProbe)
             ));
         }
+    }
+
+    #[test]
+    fn linux_path_set_uses_xdg_state_for_logs_sqlite_and_recordings() {
+        let directories = RemoteUserDirectories::parse(
+            RemoteTarget::LinuxX64Gnu,
+            b"satelle-user-dirs-v2\nUSER=operator\nHOME=/home/operator\nXDG_CONFIG_HOME=\nXDG_CACHE_HOME=\nXDG_STATE_HOME=\n",
+        )
+        .expect("authenticated Linux directory probe should parse");
+
+        let paths = directories.resolved_path_set();
+
+        assert_eq!(paths.config_file, "/home/operator/.config/satelle/config.toml");
+        assert_eq!(paths.cache_root, "/home/operator/.cache/satelle");
+        assert_eq!(paths.state_root, "/home/operator/.local/state/satelle");
+        assert_eq!(
+            paths.sqlite_store,
+            "/home/operator/.local/state/satelle/satelle.sqlite3"
+        );
+        assert_eq!(
+            paths.recording_root,
+            "/home/operator/.local/state/satelle/recordings"
+        );
+        assert_eq!(
+            paths.operator_log_root,
+            "/home/operator/.local/state/satelle/logs"
+        );
+        assert_eq!(paths.project_config_file, None);
+    }
+
+    #[test]
+    fn windows_path_set_uses_local_app_data_for_logs_sqlite_and_recordings() {
+        let directories = RemoteUserDirectories::parse(
+            RemoteTarget::WindowsX64Msvc,
+            b"satelle-user-dirs-v2\nUSER=operator\nHOME=C:\\Users\\operator\nLOCALAPPDATA=C:\\Users\\operator\\AppData\\Local\nAPPDATA=C:\\Users\\operator\\AppData\\Roaming\n",
+        )
+        .expect("authenticated Windows directory probe should parse");
+
+        let paths = directories.resolved_path_set();
+
+        assert_eq!(
+            paths.config_file,
+            r"C:\Users\operator\AppData\Roaming\Microck\Satelle\config\config.toml"
+        );
+        assert_eq!(
+            paths.state_root,
+            r"C:\Users\operator\AppData\Local\Microck\Satelle\data\state"
+        );
+        assert_eq!(
+            paths.sqlite_store,
+            r"C:\Users\operator\AppData\Local\Microck\Satelle\data\state\satelle.sqlite3"
+        );
+        assert_eq!(
+            paths.recording_root,
+            r"C:\Users\operator\AppData\Local\Microck\Satelle\data\state\recordings"
+        );
+        assert_eq!(
+            paths.operator_log_root,
+            r"C:\Users\operator\AppData\Local\Microck\Satelle\data\state\logs"
+        );
+        assert_eq!(paths.project_config_file, None);
     }
 }
 
