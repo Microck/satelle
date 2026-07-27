@@ -1076,6 +1076,26 @@ fn provider_secret_comparison(
     })
 }
 
+fn provider_secret_file_comparison(
+    runtime: &RuntimeHandle,
+    domain: &'static str,
+    secret: &provider_auth::ResolvedProviderSecret,
+    path: &std::path::Path,
+) -> Result<ProviderSecretComparison, SatelleError> {
+    let key = Zeroizing::new(runtime.provider_secret_provisioning_hmac(domain, secret)?);
+    let digest = satelle_core::keyed_owner_only_secret_file_comparison_digest(path, key.as_bytes())
+        .map_err(|_| provider_secret_file_error())?;
+    let digest_hex = digest
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    Ok(ProviderSecretComparison {
+        key,
+        digest,
+        digest_hex,
+    })
+}
+
 fn provider_secret_file_error() -> SatelleError {
     SatelleError {
         code: satelle_core::ErrorCode::ProviderSecretProvisioningRequired,
@@ -1660,7 +1680,11 @@ impl HostService {
     #[cfg(feature = "test-support")]
     pub fn local_demo_for_tests() -> Result<Self, SatelleError> {
         Ok(Self {
-            runtime: RuntimeHandle::new(satelle_core::state_dir(), FakeComputerUseAdapter),
+            runtime: RuntimeHandle::new_with_readiness_probe_driver(
+                satelle_core::state_dir(),
+                FakeComputerUseAdapter,
+                FakeComputerUseAdapter,
+            ),
             operation_capacity: Arc::new(OperationCapacity::default()),
             turn_execution_timeout: configured_turn_execution_timeout(
                 &satelle_core::SatelleConfig::defaults().hosts[LOCAL_DEMO_HOST],
@@ -1913,12 +1937,21 @@ impl HostService {
         } else {
             "computer-use"
         };
-        self.doctor_with_provider_intent(
+        let mut report = self.doctor_with_provider_intent(
             host,
             Some(scope),
             DoctorOptions::new(true, None),
             provider_intent,
-        )
+        )?;
+        if report.changed
+            && !report
+                .cache_updates
+                .iter()
+                .any(|entry| entry == "native_readiness")
+        {
+            report.cache_updates.push("native_readiness".to_string());
+        }
+        Ok(report)
     }
 
     /// Invalidates the current Host identity's native readiness evidence while
@@ -1958,7 +1991,17 @@ impl HostService {
         let previous_digest = self
             .runtime
             .provider_binding_digest(model_alias, provider_alias)?;
-        self.validate_provider_binding_candidate(host, &binding)?;
+        let missing_file_destination = matches!(
+            binding.auth_source(),
+            Some(satelle_core::ProviderSecretSource::File { path })
+                if matches!(
+                    satelle_core::owner_only_secret_destination_exists(path),
+                    Ok(false)
+                )
+        );
+        if !missing_file_destination {
+            self.validate_provider_binding_candidate(host, &binding)?;
+        }
         self.runtime
             .authorize_provider_binding_if_unchanged(&binding, previous_digest.as_deref())?;
         Ok(binding)
@@ -2081,10 +2124,11 @@ impl HostService {
                     let prior = satelle_core::read_owner_only_secret_file(&destination)
                         .map(provider_auth::ResolvedProviderSecret::from_provisioning)
                         .map_err(|_| provider_secret_file_error())?;
-                    Some(provider_secret_comparison(
+                    Some(provider_secret_file_comparison(
                         &self.runtime,
                         storage::PROVIDER_SECRET_PRIOR_HMAC_DOMAIN,
                         &prior,
+                        &destination,
                     )?)
                 } else {
                     None
@@ -2203,10 +2247,11 @@ impl HostService {
                         satelle_core::read_owner_only_secret_file(lifecycle.paths.backup())
                             .map(provider_auth::ResolvedProviderSecret::from_provisioning)
                             .map_err(|_| provider_secret_file_error())?;
-                    let backup_comparison = provider_secret_comparison(
+                    let backup_comparison = provider_secret_file_comparison(
                         &self.runtime,
                         storage::PROVIDER_SECRET_PRIOR_HMAC_DOMAIN,
                         &backup,
+                        lifecycle.paths.backup(),
                     )?;
                     if lifecycle
                         .prior
@@ -2360,6 +2405,20 @@ impl HostService {
             match self.resolve_provider_binding(host, &intent)? {
                 ProviderBindingResolution::Ready(binding) => {
                     let (outcome, source) = match binding.auth_source() {
+                        Some(satelle_core::ProviderSecretSource::File { path })
+                            if matches!(mode, ProviderAuthValidationMode::Cached)
+                                && !matches!(
+                                    satelle_core::owner_only_secret_destination_exists(path),
+                                    Ok(true)
+                                ) =>
+                        {
+                            // Cached validation may inspect destination metadata, but it
+                            // must not read secret bytes or contact the provider.
+                            (
+                                ProviderAuthValidationOutcome::UnresolvedHostSecret,
+                                ProviderAuthObservationSource::Live,
+                            )
+                        }
                         Some(source) => (
                             provider_auth::diagnose_provider_secret(Some(source), None, false),
                             ProviderAuthObservationSource::Deferred,
@@ -2454,19 +2513,21 @@ impl HostService {
         setup_components: Vec<String>,
         daemon_path_overrides: DaemonPathOverrides,
     ) -> Result<SetupReport, SatelleError> {
-        if !dry_run {
-            return Err(SatelleError::not_implemented(format!(
-                "{setup_mode} setup mutations are not supported by the local Host transport"
-            )));
-        }
         match &self.mode {
-            HostMode::Production { .. } => Ok(production_setup_report(
-                host,
-                dry_run,
-                setup_mode,
-                setup_components,
-                daemon_path_overrides,
-            )),
+            HostMode::Production { .. } => {
+                if !dry_run {
+                    return Err(SatelleError::not_implemented(format!(
+                        "{setup_mode} setup mutations are not supported by the local Host transport"
+                    )));
+                }
+                Ok(production_setup_report(
+                    host,
+                    dry_run,
+                    setup_mode,
+                    setup_components,
+                    daemon_path_overrides,
+                ))
+            }
             #[cfg(any(test, feature = "test-support"))]
             HostMode::TestFake { .. } => self.setup_fake(
                 host,
@@ -2997,7 +3058,7 @@ fn apply_native_refresh(
         && !report
             .cache_updates
             .iter()
-            .any(|entry| entry == "native_readiness")
+            .any(|entry| matches!(entry.as_str(), "local-demo-readiness" | "native_readiness"))
     {
         report.cache_updates.push("native_readiness".to_string());
     }

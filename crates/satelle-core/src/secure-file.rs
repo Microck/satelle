@@ -56,6 +56,17 @@ pub fn read_owner_only_secret_file(path: &Path) -> Result<Zeroizing<String>, Sec
     Ok(Zeroizing::new(value.to_string()))
 }
 
+/// Computes a comparison digest over the exact bytes stored in an owner-only
+/// secret file. Provider consumers normalize one trailing line ending, but
+/// replacement recovery compares the persisted representation byte-for-byte.
+pub fn keyed_owner_only_secret_file_comparison_digest(
+    path: &Path,
+    comparison_key: &[u8],
+) -> Result<[u8; 32], SecureFileError> {
+    let stored = read_secure_file(path, SecurityPolicy::OwnerOnly, MAX_SECRET_FILE_BYTES)?;
+    keyed_secret_comparison_digest(comparison_key, stored.as_slice())
+}
+
 /// Persists a new secret without ever replacing an existing credential. The
 /// no-replace rename publishes the secret atomically and consumes the staging
 /// name, so a crash cannot leave a second hard link that makes the credential
@@ -502,8 +513,7 @@ fn verify_owner_only_secret_digest(
     comparison_key: &[u8],
     expected_digest: &[u8; 32],
 ) -> Result<(), SecureFileError> {
-    let stored = read_secure_file(path, SecurityPolicy::OwnerOnly, MAX_SECRET_FILE_BYTES)?;
-    let stored_digest = keyed_secret_comparison_digest(comparison_key, stored.as_slice())?;
+    let stored_digest = keyed_owner_only_secret_file_comparison_digest(path, comparison_key)?;
     constant_time_digest_eq(&stored_digest, expected_digest)
         .then_some(())
         .ok_or(SecureFileError::UnsafeOrUnavailable)

@@ -132,12 +132,23 @@ pub(super) fn setup(
             override_entry.environment_variable, override_entry.value
         )
     }));
+    let native_setup_planned = setup_components.iter().any(|component| {
+        matches!(
+            component.as_str(),
+            "all" | "host" | "codex" | "computer-use" | "desktop"
+        )
+    });
+    let applied = native_setup_planned && !dry_run;
+    let applied_actions = applied
+        .then(|| "configured fake native Computer Use readiness".to_string())
+        .into_iter()
+        .collect();
 
     SetupReport {
         schema_version: SetupSchemaVersion::V2,
         host: host.to_string(),
         dry_run,
-        status: "planned".to_string(),
+        status: if applied { "applied" } else { "planned" }.to_string(),
         cancellation_reason: None,
         verification: None,
         setup_mode,
@@ -151,7 +162,7 @@ pub(super) fn setup(
         planned_daemon_paths: None,
         setup_components,
         planned_actions,
-        applied_actions: Vec::new(),
+        applied_actions,
         required_input: Vec::new(),
         recovery_commands: vec!["satelle doctor --scope computer-use --refresh".to_string()],
         readiness_summary: SetupReadinessSummary {
@@ -166,9 +177,9 @@ pub(super) fn setup(
         validation_status: "not_required".to_string(),
         provider_smoke_test_status: "not_required".to_string(),
         daemon_path_overrides,
-        changed: false,
-        mutated: false,
-        mutation_planned: false,
+        changed: applied,
+        mutated: applied,
+        mutation_planned: native_setup_planned,
         native_computer_use_readiness: "not_verified".to_string(),
         next_command: "satelle doctor --scope computer-use --refresh".to_string(),
     }

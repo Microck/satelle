@@ -782,6 +782,67 @@ fn existing_provider_secret_requires_typed_overwrite_and_preserves_prior_value()
 
 #[cfg(unix)]
 #[test]
+fn newline_terminated_provider_secrets_can_be_replaced_atomically() {
+    use std::os::unix::fs::PermissionsExt;
+
+    for (suffix, prior_secret) in [
+        ("lf", "prior-provider-secret\n"),
+        ("crlf", "prior-provider-secret\r\n"),
+    ] {
+        let state = TestStateDir::new().expect("temporary Host state");
+        let secret_directory = tempfile::tempdir().expect("temporary provider secret directory");
+        std::fs::set_permissions(
+            secret_directory.path(),
+            std::fs::Permissions::from_mode(0o700),
+        )
+        .expect("make provider secret directory owner-only");
+        let destination = secret_directory.path().join("provider-token");
+        std::fs::write(&destination, prior_secret).expect("write prior provider secret");
+        std::fs::set_permissions(&destination, std::fs::Permissions::from_mode(0o600))
+            .expect("make prior provider secret owner-only");
+        let (service, _native_probe_calls, provider_probe_calls) =
+            service_with_classified_provider_probe(
+                state.path().to_path_buf(),
+                ProviderProvisioningProbeOutcome::Ready,
+            );
+        service.initialize_daemon().expect("initialize Host daemon");
+        let identity =
+            RequestIdentity::new(format!("provider-secret-newline-{suffix}"), "f".repeat(64));
+
+        let result = service
+            .provision_provider_secret(
+                LOCAL_DEMO_HOST,
+                provider_file_authorization(destination.clone()),
+                Zeroizing::new("replacement-provider-secret".to_string()),
+                true,
+                &identity,
+            )
+            .expect("replace newline-terminated provider secret");
+
+        assert!(result.overwritten());
+        assert_eq!(
+            std::fs::read_to_string(&destination).expect("read replacement provider secret"),
+            "replacement-provider-secret"
+        );
+        assert_eq!(
+            provider_probe_calls.load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+        let residue = std::fs::read_dir(secret_directory.path())
+            .expect("read provider secret directory")
+            .filter_map(Result::ok)
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.contains(".staged.") || name.contains(".backup."))
+            .collect::<Vec<_>>();
+        assert!(
+            residue.is_empty(),
+            "unexpected replacement residue: {residue:?}"
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
 fn typed_unknown_provider_outcomes_retain_recovery_ownership() {
     use std::os::unix::fs::PermissionsExt;
 
@@ -2083,11 +2144,11 @@ fn provider_descriptor_validation_resolves_only_during_target_host_refresh() {
         .expect("cached validation remains observation-only");
     assert_eq!(
         cached.validation().outcome(),
-        satelle_core::ProviderAuthValidationOutcome::ConfiguredDeferred
+        satelle_core::ProviderAuthValidationOutcome::UnresolvedHostSecret
     );
     assert_eq!(
         cached.validation().observation_source(),
-        satelle_core::ProviderAuthObservationSource::Deferred
+        satelle_core::ProviderAuthObservationSource::Live
     );
     assert!(!secret_path.exists());
 
@@ -2186,11 +2247,11 @@ fn provider_descriptor_validation_resolves_only_during_target_host_refresh() {
         .expect("cached validation remains deferred after a live failure");
     assert_eq!(
         cached_after_failure.validation().outcome(),
-        satelle_core::ProviderAuthValidationOutcome::ConfiguredDeferred
+        satelle_core::ProviderAuthValidationOutcome::UnresolvedHostSecret
     );
     assert_eq!(
         cached_after_failure.validation().observation_source(),
-        satelle_core::ProviderAuthObservationSource::Deferred
+        satelle_core::ProviderAuthObservationSource::Live
     );
 }
 

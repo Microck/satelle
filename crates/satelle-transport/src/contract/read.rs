@@ -16,6 +16,22 @@ pub struct ProviderSecretUploadCapability {
 }
 
 impl ProviderSecretUploadCapability {
+    pub fn envelope_schema_version(&self) -> &str {
+        &self.envelope_schema_version
+    }
+
+    pub fn algorithm(&self) -> &str {
+        &self.algorithm
+    }
+
+    pub fn content_type(&self) -> &str {
+        &self.content_type
+    }
+
+    pub const fn max_plaintext_bytes(&self) -> usize {
+        self.max_plaintext_bytes
+    }
+
     fn current() -> Self {
         Self {
             envelope_schema_version: "satelle.provider-secret-upload.v2".to_string(),

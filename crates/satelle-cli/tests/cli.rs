@@ -7442,7 +7442,7 @@ fn run_provider_secret_setup_in_pty(
 }
 
 #[cfg(target_os = "linux")]
-fn combined_output(output: &std::process::Output) -> String {
+fn combined_process_output(output: &std::process::Output) -> String {
     String::from_utf8_lossy(&[output.stdout.as_slice(), output.stderr.as_slice()].concat())
         .to_string()
 }
@@ -7450,6 +7450,8 @@ fn combined_output(output: &std::process::Output) -> String {
 #[cfg(target_os = "linux")]
 #[test]
 fn provider_secret_provisioning_requires_a_separate_tty_confirmation_and_never_echoes_secret() {
+    use std::os::unix::fs::PermissionsExt;
+
     for (case, profile, yes, accepted) in [
         ("yes-declined", None, true, false),
         (
@@ -7463,6 +7465,8 @@ fn provider_secret_provisioning_requires_a_separate_tty_confirmation_and_never_e
         let state = state_dir();
         let user_config = state.path().join("user-config.toml");
         let destinations = tempfile::tempdir().expect("create external secret destinations");
+        fs::set_permissions(destinations.path(), fs::Permissions::from_mode(0o700))
+            .expect("make provider secret fixture boundary owner-only");
         let selected_destination = destinations.path().join("selected-provider-secret");
         let decoy_destination = destinations.path().join("decoy-provider-secret");
         test_file::write_user_controlled(&decoy_destination, "decoy-secret")
@@ -7519,7 +7523,8 @@ command_families = ["setup"]
         if accepted {
             assert!(
                 output.status.success(),
-                "accepted provisioning should succeed"
+                "accepted provisioning should succeed: {}",
+                combined_process_output(&output).replace(secret_canary.as_str(), "<redacted>")
             );
             assert!(
                 secret_prompt_end.is_some_and(|prompt_end| prompt_end > confirmation_end),
@@ -7532,7 +7537,7 @@ command_families = ["setup"]
                 "decline must stop before hidden input"
             );
         }
-        let rendered = combined_output(&output);
+        let rendered = combined_process_output(&output);
         assert_privacy_canaries_absent(
             "interactive provider secret output",
             rendered.as_bytes(),
@@ -7905,7 +7910,7 @@ auth_source = "operator-auth"
         parse_json_output(&output.stderr)["code"],
         "host-identity-mismatch"
     );
-    let rendered = combined_output(&output);
+    let rendered = combined_process_output(&output);
 
     assert!(
         !rendered.contains("Target Host:")

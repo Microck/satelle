@@ -2625,7 +2625,7 @@ impl RuntimeHandle {
         }
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn new_with_readiness_probe_driver<A, D>(
         state_root: Result<PathBuf, SatelleError>,
         adapter: A,
@@ -3071,6 +3071,10 @@ impl RuntimeHandle {
         readiness: &ReadinessEvidence,
         provider: Option<&ProviderSmokeEvidence>,
     ) -> Result<(), SatelleError> {
+        let provider = binding
+            .experimental_provider_computer_use()
+            .then_some(provider)
+            .flatten();
         self.engine()?
             .lock_storage()?
             .commit_provider_secret_provisioning(
@@ -3170,9 +3174,10 @@ impl RuntimeHandle {
         let _activity = self.activity.begin();
         let engine = self.engine()?;
         let cancellation = AdmissionCancellation::new();
+        let provider_intent = provider_intent.clone().with_refresh(true);
         let key = engine
             .adapter
-            .readiness_cache_key(host, provider_intent)?
+            .readiness_cache_key(host, &provider_intent)?
             .ok_or_else(SatelleError::computer_use_not_ready)?;
         let driver = engine
             .readiness_probe_driver

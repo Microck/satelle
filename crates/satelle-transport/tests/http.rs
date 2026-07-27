@@ -1219,11 +1219,38 @@ async fn capabilities_are_truthful_and_unknown_routes_are_typed() {
         capabilities_json["schema_version"],
         "satelle.capabilities.v5"
     );
+    assert_eq!(
+        capabilities_json["provider_secret_upload"],
+        serde_json::json!({
+            "envelope_schema_version": "satelle.provider-secret-upload.v2",
+            "algorithm": "x25519-hkdf-sha256-chacha20poly1305",
+            "content_type": "application/vnd.satelle.provider-secret-upload+json",
+            "max_plaintext_bytes": 65_536
+        })
+    );
     let mut obsolete_v4 = capabilities_json.clone();
     obsolete_v4["schema_version"] = serde_json::json!("satelle.capabilities.v4");
     assert!(serde_json::from_value::<CapabilitiesResponse>(obsolete_v4).is_err());
     let capabilities: CapabilitiesResponse =
         serde_json::from_value(capabilities_json).expect("decode typed capabilities");
+    assert_eq!(
+        capabilities
+            .provider_secret_upload()
+            .envelope_schema_version(),
+        "satelle.provider-secret-upload.v2"
+    );
+    assert_eq!(
+        capabilities.provider_secret_upload().algorithm(),
+        "x25519-hkdf-sha256-chacha20poly1305"
+    );
+    assert_eq!(
+        capabilities.provider_secret_upload().content_type(),
+        "application/vnd.satelle.provider-secret-upload+json"
+    );
+    assert_eq!(
+        capabilities.provider_secret_upload().max_plaintext_bytes(),
+        65_536
+    );
     assert_eq!(capabilities.host_identity(), running.host_identity);
     assert_eq!(capabilities.operations(), EXPECTED_OPERATIONS);
     assert_eq!(capabilities.limits().json_body_bytes(), 1_048_576);

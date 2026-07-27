@@ -920,13 +920,13 @@ fn preflight_setup_before_history(
         .output_args
         .resolve(EventOutput::None)
         .map_err(failure)?;
-    setup_components(&command.component).map_err(failure)?;
+    let setup_components = setup_components(&command.component).map_err(failure)?;
     if command.on_demand && command.persistent {
         return Err(failure(SatelleError::invalid_usage(
             "--on-demand and --persistent cannot be combined",
         )));
     }
-    if command.dry_run || !uses_production_local_setup_backend() {
+    if command.dry_run {
         return Ok(());
     }
     if let Some(expected) = command.expected_host_id.as_deref() {
@@ -936,13 +936,51 @@ fn preflight_setup_before_history(
             )))
         })?;
     }
-    let host = config.resolve_host(command.host.as_deref())?;
+    let resolved = config.load()?;
+    let host = resolved
+        .resolve_host(command.host.as_deref())
+        .map(SelectedHost::from)
+        .map_err(failure)?;
     if command.expected_host_id.is_some()
         && host.config.transport != satelle_core::TransportKind::Ssh
     {
         return Err(failure(SatelleError::invalid_usage(
             "setup --expected-host-id is only valid for an SSH Host Binding",
         )));
+    }
+    let daemon_path_overrides = daemon_path_overrides(command, &host.config);
+    let first_ssh_trust = host.config.transport == satelle_core::TransportKind::Ssh
+        && (host.config.expected_host_id.is_none() || !daemon_path_overrides.entries().is_empty());
+    let setup_mode = setup_mode(command, &host.config)
+        .map_err(failure)?
+        .mode
+        .as_str()
+        .to_string();
+    let trusted_consent = trusted_profile_allows_setup(resolved, &host.alias);
+    let verification_checks = if command.verify {
+        setup_verification_checks(
+            doctor_provider_intent(resolved, &host.config, true, None)
+                .map_err(failure)?
+                .provider_probe_required(),
+        )
+    } else {
+        Vec::new()
+    };
+    if let Some(error) = first_ssh_setup_consent_error(
+        command,
+        config.flag_profile,
+        trusted_consent,
+        first_ssh_trust,
+        &host.alias,
+        &setup_mode,
+        &setup_components,
+        &daemon_path_overrides,
+        &verification_checks,
+    ) {
+        return Err(failure(error));
+    }
+    if command.verify || !uses_production_local_setup_backend() {
+        return Ok(());
     }
     if host.config.transport != satelle_core::TransportKind::Local {
         return Ok(());
@@ -2083,6 +2121,54 @@ fn trusted_profile_allows_setup(resolved: &ResolvedConfig, host_alias: &str) -> 
         })
 }
 
+#[allow(clippy::too_many_arguments)]
+fn first_ssh_setup_consent_error(
+    command: &SetupCommand,
+    flag_profile: Option<&str>,
+    trusted_consent: bool,
+    first_ssh_trust: bool,
+    host_alias: &str,
+    setup_mode: &str,
+    setup_components: &[String],
+    daemon_path_overrides: &DaemonPathOverrides,
+    verification_checks: &[String],
+) -> Option<SatelleError> {
+    if !first_ssh_trust
+        || command.dry_run
+        || command.yes
+        || trusted_consent
+        || (!command.no_input && io::stdin().is_terminal())
+    {
+        return None;
+    }
+
+    // First-time SSH discovery can upload and start a temporary Host. Reject
+    // before command-history initialization or transport construction.
+    let mut consent_report =
+        cli_owned_setup_report(host_alias, false, setup_mode, setup_components.to_vec());
+    add_setup_component_plan(&mut consent_report);
+    consent_report.mutation_planned = true;
+    consent_report.planned_actions.insert(
+        0,
+        "bootstrap the temporary Host Daemon, discover its Host Identity, and persist explicit trust"
+            .to_string(),
+    );
+    if command.verify {
+        add_setup_verification_plan(&mut consent_report, verification_checks);
+    }
+    let recovery_command = setup_consent_recovery_command(
+        command,
+        flag_profile,
+        setup_mode,
+        daemon_path_overrides,
+        true,
+    );
+    Some(SatelleError::setup_consent_required(
+        &consent_report.planned_actions,
+        &recovery_command,
+    ))
+}
+
 fn setup_interaction_error(message: &str, source: io::Error) -> SatelleError {
     SatelleError {
         code: if source.kind() == io::ErrorKind::Interrupted {
@@ -2326,37 +2412,18 @@ fn run_setup(
     let mut pending_provider_binding_authorization = None;
     let mut pending_provider_secret_authorization = None;
     let mut provider_secret_setup_completed = false;
-    if first_ssh_trust
-        && !command.dry_run
-        && !command.yes
-        && !trusted_consent
-        && (command.no_input || !io::stdin().is_terminal())
-    {
-        // First-time SSH discovery can upload and start a temporary Host. Reject before
-        // constructing that transport so missing consent cannot cause remote mutations.
-        let mut consent_report =
-            cli_owned_setup_report(&host.alias, false, &setup_mode, setup_components.clone());
-        add_setup_component_plan(&mut consent_report);
-        consent_report.mutation_planned = true;
-        consent_report.planned_actions.insert(
-            0,
-            "bootstrap the temporary Host Daemon, discover its Host Identity, and persist explicit trust"
-                .to_string(),
-        );
-        if command.verify {
-            add_setup_verification_plan(&mut consent_report, &verification_checks);
-        }
-        let consent_recovery_command = setup_consent_recovery_command(
-            &command,
-            config.flag_profile,
-            &setup_mode,
-            &daemon_path_overrides,
-            true,
-        );
-        return Err(failure(SatelleError::setup_consent_required(
-            &consent_report.planned_actions,
-            &consent_recovery_command,
-        )));
+    if let Some(error) = first_ssh_setup_consent_error(
+        &command,
+        config.flag_profile,
+        trusted_consent,
+        first_ssh_trust,
+        &host.alias,
+        &setup_mode,
+        &setup_components,
+        &daemon_path_overrides,
+        &verification_checks,
+    ) {
+        return Err(failure(error));
     }
     let mut transport = if tailscale_serve_setup || !host_setup_required {
         None
@@ -2548,6 +2615,7 @@ fn run_setup(
                 }
                 add_setup_required_inputs(&mut report, &provider_selection, provider_auth_setup);
                 if report.required_input.is_empty()
+                    && pending_provider_secret_authorization.is_none()
                     && let Some(authorization) = provider_selection.authorization.as_ref()
                 {
                     pending_provider_binding_authorization = Some(authorization.clone());
@@ -2858,25 +2926,83 @@ fn run_setup(
                 Err(error) => return Err(failure(error)),
             };
             if let Some(authorization) = pending_authorization {
-                provider_transport
-                    .authorize_provider_binding(authorization)
-                    .map_err(failure)?;
-                let validation = provider_transport
-                    .validate_provider_descriptor(
-                        authorization.requested_model_alias(),
-                        authorization.requested_provider_alias(),
-                        provider_selection.model_alias_from_project,
-                        provider_selection.provider_alias_from_project,
-                        satelle_core::ProviderAuthValidationMode::Cached,
-                        authorization.experimental_provider_computer_use(),
+                let authorization_requires_provisioning =
+                    match provider_transport.authorize_provider_binding(authorization) {
+                        Ok(_) => false,
+                        Err(error)
+                            if file_authorization_requires_provisioning(authorization, &error) =>
+                        {
+                            true
+                        }
+                        Err(error) => return Err(failure(error)),
+                    };
+                let validation = if authorization_requires_provisioning {
+                    None
+                } else {
+                    Some(
+                        provider_transport
+                            .validate_provider_descriptor(
+                                authorization.requested_model_alias(),
+                                authorization.requested_provider_alias(),
+                                provider_selection.model_alias_from_project,
+                                provider_selection.provider_alias_from_project,
+                                satelle_core::ProviderAuthValidationMode::Cached,
+                                authorization.experimental_provider_computer_use(),
+                            )
+                            .map_err(failure)?,
                     )
-                    .map_err(failure)?;
-                let validation = accept_setup_provider_auth_validation(
-                    &mut report,
-                    &provider_selection,
-                    validation,
-                )?;
-                if validation.is_some() {
+                };
+                let provisioning_required = authorization_requires_provisioning
+                    || validation.as_ref().is_some_and(|validation| {
+                        validation.validation.outcome()
+                            == satelle_core::ProviderAuthValidationOutcome::UnresolvedHostSecret
+                    });
+
+                if provisioning_required {
+                    ensure_file_provider_secret_source(authorization)?;
+                    let response = provision_provider_secret(
+                        provider_transport.as_ref(),
+                        authorization,
+                        &host.alias,
+                        &command,
+                        &format,
+                    )?;
+                    provider_secret_setup_completed = true;
+                    report.secret_provisioned = response.provisioned();
+                    report.validation_status = response.validation_status().as_str().to_string();
+                    report.readiness_summary.provider_auth =
+                        response.validation_status().as_str().to_string();
+                    report.applied_actions.push(format!(
+                        "provisioned and authorized {} provider authentication on Host '{}'",
+                        response.destination_kind(),
+                        host.alias,
+                    ));
+                    report.mutated = true;
+                    report.changed = true;
+                    report.status = "applied".to_string();
+                } else {
+                    let validation = accept_setup_provider_auth_validation(
+                        &mut report,
+                        &provider_selection,
+                        validation.expect("non-provisioning authorization has cached validation"),
+                    )?;
+                    if validation.is_some() {
+                        report.applied_actions.push(format!(
+                            "authorize provider binding '{}/{}' on Host '{}'",
+                            authorization.requested_provider_alias(),
+                            authorization.requested_model_alias(),
+                            host.alias
+                        ));
+                        report.mutated = true;
+                        report.changed = true;
+                        if report.status == "planned" {
+                            report.status = "applied".to_string();
+                        }
+                    }
+                    provider_auth_validation = validation;
+                }
+
+                if provider_secret_setup_completed || provider_auth_validation.is_some() {
                     if let Some((auth_source_name, descriptor)) = &pending_provider_auth
                         && let Err(error) = persist_provider_auth_descriptor(
                             &user_config_path,
@@ -2896,19 +3022,7 @@ fn run_setup(
                             host.alias
                         ));
                     }
-                    report.applied_actions.push(format!(
-                        "authorize provider binding '{}/{}' on Host '{}'",
-                        authorization.requested_provider_alias(),
-                        authorization.requested_model_alias(),
-                        host.alias
-                    ));
-                    report.mutated = true;
-                    report.changed = true;
-                    if report.status == "planned" {
-                        report.status = "applied".to_string();
-                    }
                 }
-                provider_auth_validation = validation;
             }
         }
 
@@ -2916,7 +3030,10 @@ fn run_setup(
         if let Some(decision) = &local_service_decision {
             apply_service_decision_to_report(&mut report, decision);
         }
-        if provider_auth_validation.is_none() && report.required_input.is_empty() {
+        if !provider_secret_setup_completed
+            && provider_auth_validation.is_none()
+            && report.required_input.is_empty()
+        {
             add_setup_required_inputs(&mut report, &provider_selection, provider_auth_setup);
         }
         if let Some(action) = persisted_provider_auth_action {
@@ -2991,7 +3108,7 @@ fn run_setup(
                 return Err(failure(SatelleError::setup_verification_failed(&report)));
             }
         };
-        let verification_report = verification_response;
+        let mut verification_report = verification_response;
         let ready = verification_report.summary.ready;
         let manual_action_required = verification_report
             .findings
@@ -3004,7 +3121,15 @@ fn run_setup(
         } else {
             "failed"
         };
-        let doctor_recovery_available = !verification_report.recovery_commands.is_empty();
+        if !ready {
+            let recovery = format!(
+                "satelle setup --host {} --verify --no-input",
+                shell_argument(&host.alias)
+            );
+            if !verification_report.recovery_commands.contains(&recovery) {
+                verification_report.recovery_commands.insert(0, recovery);
+            }
+        }
         for recovery in verification_report.recovery_commands.iter().rev() {
             if !report.recovery_commands.contains(recovery) {
                 report.recovery_commands.insert(0, recovery.clone());
@@ -3015,7 +3140,7 @@ fn run_setup(
                 verification_cache_updates.push(cache_update.clone());
             }
         }
-        if !ready && !doctor_recovery_available {
+        if !ready {
             ensure_exact_setup_verification_recovery(&mut report, &host.alias);
         }
         report.native_computer_use_readiness = if ready {
@@ -3413,6 +3538,16 @@ fn ensure_file_provider_secret_source(
     }
 }
 
+fn file_authorization_requires_provisioning(
+    authorization: &ProviderBindingAuthorization,
+    error: &SatelleError,
+) -> bool {
+    matches!(
+        authorization.auth_source(),
+        Some(ProviderSecretSource::File { .. })
+    ) && error.code == ErrorCode::ProviderSecretResolutionFailed
+}
+
 fn plan_provider_secret_provisioning(
     report: &mut SetupReport,
     provider_selection: &ProviderSelection,
@@ -3453,41 +3588,6 @@ fn provision_provider_secret(
         _ => unreachable!("provider secret provisioning accepts only File destinations"),
     };
 
-    // Prove that this client is authenticated to the selected, pinned Host before
-    // reading raw bytes. The later preview and provision calls use the same client.
-    provider_transport.host_status().map_err(failure)?;
-    let idempotency_key = format!(
-        "provider-secret-provision-{}",
-        satelle_transport::RequestId::new()
-    );
-    let preview_metadata =
-        satelle_transport::ProviderSecretProvisioningMetadata::new(authorization.clone(), true);
-    let preview = provider_transport
-        .preview_provider_secret_provisioning(&preview_metadata, &idempotency_key)
-        .map_err(failure)?;
-
-    if !format.is_json() {
-        println!("Target Host: {host_alias}");
-        println!(
-            "Provider alias: {}",
-            authorization.requested_provider_alias()
-        );
-        println!("Provider Secret Source kind: file");
-        println!("Exact destination descriptor: {destination_descriptor}");
-        println!(
-            "Provider secret destination kind: {}",
-            preview.destination_kind()
-        );
-        println!(
-            "Provider secret persistence location class: {}",
-            preview.persistence_location_class()
-        );
-        println!(
-            "Provider secret overwrite behavior: {}",
-            preview.overwrite_behavior()
-        );
-    }
-
     let interaction_available = !command.no_input
         && !format.is_json()
         && io::stdin().is_terminal()
@@ -3499,6 +3599,39 @@ fn provision_provider_secret(
             "provider secret provisioning requires an immediate confirmation in an interactive human terminal",
         )));
     }
+
+    // Prove that this client is authenticated to the selected, pinned Host before
+    // prompting. The later preview and provision calls use the same client.
+    provider_transport.host_status().map_err(failure)?;
+    println!("Target Host: {host_alias}");
+    println!(
+        "Provider alias: {}",
+        authorization.requested_provider_alias()
+    );
+    println!("Provider Secret Source kind: file");
+    println!("Exact destination descriptor: {destination_descriptor}");
+
+    let idempotency_key = format!(
+        "provider-secret-provision-{}",
+        satelle_transport::RequestId::new()
+    );
+    let preview_metadata =
+        satelle_transport::ProviderSecretProvisioningMetadata::new(authorization.clone(), true);
+    let preview = provider_transport
+        .preview_provider_secret_provisioning(&preview_metadata, &idempotency_key)
+        .map_err(failure)?;
+    println!(
+        "Provider secret destination kind: {}",
+        preview.destination_kind()
+    );
+    println!(
+        "Provider secret persistence location class: {}",
+        preview.persistence_location_class()
+    );
+    println!(
+        "Provider secret overwrite behavior: {}",
+        preview.overwrite_behavior()
+    );
 
     let confirmed =
         cliclack::confirm("Provision or replace the provider secret at this exact destination?")
@@ -3520,6 +3653,10 @@ fn provision_provider_secret(
     // Confirmation authorizes both creation and replacement before the secret
     // enters the process. No other flag or profile can set this transport bit.
     let overwrite_authorized = confirmed;
+
+    // The secret enters memory only after authenticated preview metadata and its
+    // upload grant have been accepted for the already-pinned Host and the
+    // dedicated mutation confirmation succeeds.
     let secret = Zeroizing::new(
         cliclack::password("Provider secret")
             .interact()
