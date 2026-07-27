@@ -73,6 +73,7 @@ use satelle_core::{
     SessionId, SetupReadinessSummary, SetupReport, SetupSchemaVersion, StopResult, TurnId,
     object_value, utc_now,
 };
+use satelle_core::daemon_service::DaemonResolvedPathSet;
 pub use satelle_core::{
     ProviderBindingAuthorization, ProviderBindingSource, ProviderDescriptorValidation,
     ProviderSecretProvisioningPreview, ProviderSecretProvisioningResult,
@@ -2891,6 +2892,15 @@ impl HostService {
             host_daemon_version: env!("CARGO_PKG_VERSION").to_string(),
             sessions,
         })
+    }
+
+    /// Resolves paths inside the Host process so a remote controller cannot
+    /// substitute its own project discovery result or local filesystem paths.
+    pub fn daemon_resolved_paths(&self) -> Result<DaemonResolvedPathSet, SatelleError> {
+        let daemon_working_directory =
+            std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+        satelle_core::resolve_path_set(&daemon_working_directory)
+            .map(|paths| DaemonResolvedPathSet::from(&paths))
     }
 }
 

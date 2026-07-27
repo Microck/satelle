@@ -9,8 +9,8 @@ mod setup;
 
 use crate::contract::{
     ApiError, ApiErrorCategory, ApiErrorCode, CapabilitiesResponse, EffectiveLimits,
-    HostDesktopSessionsResponse, HostStatusResponse, LiveResponse, PROTOCOL_VERSION,
-    PROTOCOL_VERSION_HEADER, RequestId, effective_limits,
+    HostDesktopSessionsResponse, HostPathsResponse, HostStatusResponse, LiveResponse,
+    PROTOCOL_VERSION, PROTOCOL_VERSION_HEADER, RequestId, effective_limits,
 };
 use auth::{AuthorizedRequest, REQUEST_ID_HEADER};
 use axum::Router;
@@ -822,6 +822,7 @@ fn router(state: Arc<DaemonState>) -> Router {
     let bodyless_read_routes = Router::new()
         .route("/v1/setup/api-token/current", get(setup::confirm_api_token))
         .route("/v1/host/status", get(host_status))
+        .route("/v1/host/paths", get(host_paths))
         .route("/v1/host/desktop-sessions", get(host_desktop_sessions))
         .route("/v1/sessions/{session_id}", get(sessions::get_session))
         .route("/v1/events", get(events::get_events))
@@ -1096,6 +1097,29 @@ async fn host_desktop_sessions(
         authorized.request_id().clone(),
         state.host_identity.clone(),
         sessions,
+    );
+    authenticated_json_response(
+        StatusCode::OK,
+        &response,
+        authorized.request_id(),
+        &state.host_identity,
+    )
+}
+
+async fn host_paths(
+    State(state): State<Arc<DaemonState>>,
+    Extension(authorized): Extension<AuthorizedRequest>,
+) -> Response {
+    let service = Arc::clone(&state.service);
+    let paths = match tokio::task::spawn_blocking(move || service.daemon_resolved_paths()).await {
+        Ok(Ok(paths)) => paths,
+        Ok(Err(error)) => return host_error::response(&state, &authorized, &error),
+        Err(_) => return host_error::task_failure(&state, &authorized),
+    };
+    let response = HostPathsResponse::new(
+        authorized.request_id().clone(),
+        state.host_identity.clone(),
+        paths,
     );
     authenticated_json_response(
         StatusCode::OK,
