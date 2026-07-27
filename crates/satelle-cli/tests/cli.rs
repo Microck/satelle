@@ -4415,6 +4415,10 @@ fn doctor_json_emits_single_final_object_with_probe_contract() {
         serde_json::json!(["codex", "computer-use", "config", "provider", "transport"])
     );
     assert_eq!(report["summary"]["ready"], true);
+    assert!(
+        report.get("fix_flow").is_none(),
+        "ordinary diagnostics must not publish fix_flow fields"
+    );
 
     let probe = report["probe_results"][0]
         .as_object()
@@ -4654,7 +4658,7 @@ fn doctor_serial_no_input_run_remains_noninteractive() {
 }
 
 #[test]
-fn doctor_events_invalid_scope_emits_failed_terminal_event() {
+fn doctor_events_invalid_scope_uses_pre_stream_machine_error_contract() {
     let state = state_dir();
     let output = satelle()
         .env("SATELLE_STATE_DIR", state.path())
@@ -4664,12 +4668,84 @@ fn doctor_events_invalid_scope_emits_failed_terminal_event() {
         .stderr(predicate::str::contains("invalid-usage"))
         .get_output()
         .clone();
+
+    assert!(
+        output.stdout.is_empty(),
+        "a failure before doctor_started must leave stdout empty"
+    );
+}
+
+#[test]
+fn doctor_events_after_start_emit_one_failed_terminal_without_stderr_error() {
+    let state = state_dir();
+    let output = production_satelle()
+        .env("SATELLE_STATE_DIR", state.path())
+        .args(["doctor", "--host", "local-demo", "--events"])
+        .assert()
+        .code(75)
+        .stderr(predicate::str::is_empty())
+        .get_output()
+        .clone();
     let events = parse_json_lines(&output.stdout);
 
-    assert_eq!(events.len(), 1);
-    assert_eq!(events[0]["event_type"], "doctor_failed");
-    assert_eq!(events[0]["data"]["error"]["code"], "invalid-usage");
-    assert_eq!(events[0]["data"]["error"]["exit_code"], 64);
+    assert_eq!(events[0]["event_type"], "doctor_started");
+    assert_eq!(events.last().unwrap()["event_type"], "doctor_failed");
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| matches!(
+                event["event_type"].as_str(),
+                Some("doctor_finished" | "doctor_failed")
+            ))
+            .count(),
+        1
+    );
+    assert_eq!(
+        events.last().unwrap()["data"]["error"]["code"],
+        "doctor-readiness-blockers-found"
+    );
+}
+
+#[test]
+fn doctor_refresh_without_scope_selects_computer_use_and_provider() {
+    let state = state_dir();
+    let provider_config = authorize_default_provider_binding(&state);
+    let output = satelle()
+        .env("SATELLE_CONFIG_FILE", &provider_config)
+        .env("SATELLE_STATE_DIR", state.path())
+        .args(["doctor", "--refresh", "--json"])
+        .assert()
+        .success()
+        .get_output()
+        .clone();
+    let report = parse_json_output(&output.stdout);
+    let scopes = report["probe_results"]
+        .as_array()
+        .expect("probe results should be an array")
+        .iter()
+        .filter_map(|probe| probe["scope"].as_str())
+        .collect::<std::collections::BTreeSet<_>>();
+
+    assert!(scopes.contains("computer-use"));
+    assert!(scopes.contains("provider"));
+}
+
+#[test]
+fn doctor_scope_all_combined_with_another_scope_is_typed_pre_stream_failure() {
+    let state = state_dir();
+    let output = satelle()
+        .env("SATELLE_STATE_DIR", state.path())
+        .args([
+            "doctor", "--scope", "all", "--scope", "provider", "--events",
+        ])
+        .assert()
+        .code(64)
+        .stdout(predicate::str::is_empty())
+        .stderr(predicate::str::contains("scope-selection-conflict"))
+        .get_output()
+        .clone();
+
+    assert!(output.stdout.is_empty());
 }
 
 #[test]

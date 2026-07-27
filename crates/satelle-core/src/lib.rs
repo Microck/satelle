@@ -17,6 +17,7 @@ pub mod control_plane;
 pub mod daemon_service;
 #[path = "direct-host-binding.rs"]
 mod direct_host_binding;
+pub mod doctor;
 mod events;
 pub mod ids;
 mod profiles;
@@ -3777,6 +3778,7 @@ fn edit_distance(left: &str, right: &str) -> usize {
 #[serde(rename_all = "kebab-case")]
 pub enum ErrorCode {
     InvalidUsage,
+    ScopeSelectionConflict,
     PromptSourceConflict,
     CompletionInstallFailed,
     CompletionProfileUpdateFailed,
@@ -3873,6 +3875,7 @@ impl ErrorCode {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::InvalidUsage => "invalid-usage",
+            Self::ScopeSelectionConflict => "scope-selection-conflict",
             Self::PromptSourceConflict => "prompt-source-conflict",
             Self::CompletionInstallFailed => "completion-install-failed",
             Self::CompletionProfileUpdateFailed => "completion-profile-update-failed",
@@ -3975,6 +3978,7 @@ impl ErrorCode {
     pub fn exit_code(self) -> i32 {
         match self {
             Self::InvalidUsage
+            | Self::ScopeSelectionConflict
             | Self::PromptSourceConflict
             | Self::IdempotencyKeyConflict
             | Self::EventsWithDetach
@@ -5090,6 +5094,21 @@ impl SatelleError {
         }
     }
 
+    pub fn scope_selection_conflict(scopes: &[String]) -> Self {
+        Self {
+            code: ErrorCode::ScopeSelectionConflict,
+            message: "doctor scope 'all' cannot be combined with another scope".to_string(),
+            recovery_command: Some(
+                "choose either --scope all or one or more specific --scope values".to_string(),
+            ),
+            source_detail: None,
+            details: BTreeMap::from([(
+                "scopes".to_string(),
+                Value::Array(scopes.iter().cloned().map(Value::String).collect()),
+            )]),
+        }
+    }
+
     pub fn doctor_refresh_scope_required() -> Self {
         Self {
             code: ErrorCode::DoctorRefreshScopeRequired,
@@ -6157,11 +6176,29 @@ pub struct DoctorProbeResult {
     pub finding_ids: Vec<String>,
 }
 
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub enum DoctorEventSchemaVersion {
+    #[serde(rename = "satelle.doctor.events.v1")]
+    V1,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum DoctorEventType {
+    DoctorStarted,
+    ProbeStarted,
+    ProbeFinished,
+    FindingReported,
+    CacheUpdated,
+    DoctorFinished,
+    DoctorFailed,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct DoctorEventRecord {
-    pub schema_version: String,
+    pub schema_version: DoctorEventSchemaVersion,
     pub event_id: String,
-    pub event_type: String,
+    pub event_type: DoctorEventType,
     pub target: String,
     pub scope: String,
     pub probe_id: Option<String>,
