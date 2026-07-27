@@ -239,7 +239,7 @@ pub(crate) enum ProviderSecretProvisioningPreflight {
 }
 
 pub(crate) enum BeginProviderSecretProvisioning {
-    Claimed(ProviderSecretProvisioningJournal),
+    Claimed(Box<ProviderSecretProvisioningJournal>),
     Resume,
     Replay(ProviderSecretProvisioningReplay),
 }
@@ -315,7 +315,7 @@ impl Storage {
         )?;
         let journal = load_journal(&transaction, idempotency.operation_id.as_str())?;
         transaction.commit().map_err(operation_failed)?;
-        Ok(BeginProviderSecretProvisioning::Claimed(journal))
+        Ok(BeginProviderSecretProvisioning::Claimed(Box::new(journal)))
     }
 
     pub(crate) fn transition_provider_secret_provisioning(

@@ -2042,7 +2042,7 @@ impl HostService {
             .runtime
             .begin_provider_secret_provisioning(identity, &key, &owner, plan)?
         {
-            storage::BeginProviderSecretProvisioning::Claimed(journal) => journal,
+            storage::BeginProviderSecretProvisioning::Claimed(journal) => *journal,
             storage::BeginProviderSecretProvisioning::Resume => {
                 return Err(SatelleError::state_conflict());
             }
