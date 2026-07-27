@@ -141,30 +141,73 @@ test("Windows drive-style npm archive paths reach tar only as basenames", {
   }
 });
 
-test("release workflow is dry-run safe and owns six-target release validation", () => {
+test("release workflow validates six targets and publishes only a fully verified tag", () => {
   const workflow = readFileSync(
     path.join(repositoryRoot, ".github", "workflows", "release.yml"),
     "utf8",
   ).replaceAll("\r\n", "\n");
-  for (const target of [
-    "linux-arm64-gnu",
-    "linux-x64-gnu",
-    "darwin-arm64",
-    "darwin-x64",
-    "win32-arm64-msvc",
-    "win32-x64-msvc",
-  ]) {
-    assert.match(workflow, new RegExp(target));
-  }
+  const platformMatrix = JSON.parse(
+    readFileSync(
+      path.join(repositoryRoot, "npm", "satelle", "platforms.json"),
+      "utf8",
+    ),
+  );
+  const buildMatrix = workflow.match(
+    /^  build:\n[\s\S]*?^      matrix:\n^        include:\n(?<entries>[\s\S]*?)^    steps:/m,
+  )?.groups?.entries;
+  assert.ok(buildMatrix, "release build matrix is missing");
+
+  const declaredTargets = buildMatrix.match(/^          - target:/gm) ?? [];
+  const actualTargets = [
+    ...buildMatrix.matchAll(
+      /^          - target: ([^\n]+)\n            rust-target: ([^\n]+)$/gm,
+    ),
+  ]
+    .map(([, target, rustTarget]) => ({ target, rustTarget }))
+    .sort((left, right) => left.target.localeCompare(right.target));
+  assert.equal(
+    actualTargets.length,
+    declaredTargets.length,
+    "every workflow target needs one Rust target",
+  );
+
+  const expectedTargets = Object.entries(platformMatrix)
+    .map(([target, { rustTarget }]) => ({ target, rustTarget }))
+    .sort((left, right) => left.target.localeCompare(right.target));
+  assert.deepEqual(actualTargets, expectedTargets);
   assert.match(workflow, /workflow_dispatch:/);
   assert.match(workflow, /npm publish[^\n]*--dry-run/);
-  assert.doesNotMatch(workflow, /npm publish(?![^\n]*--dry-run)/);
+  assert.match(
+    workflow,
+    /publish:\n[\s\S]*?if: startsWith\(github\.ref, 'refs\/tags\/v'\)\n\s+needs: \[collect, attest, lifecycle\]/,
+  );
+  assert.match(
+    workflow,
+    /publish:\n[\s\S]*?runs-on: ubuntu-24\.04[\s\S]*?id-token: write/,
+  );
+  assert.match(
+    workflow,
+    /npm publish "\$package" --provenance --access public --tag "rc-v\$RELEASE_VERSION"/,
+  );
+  assert.match(workflow, /npm view "\$package_name@\$RELEASE_VERSION" dist\.integrity --json/);
+  assert.match(workflow, /published package integrity does not match the validated artifact/);
+  assert.doesNotMatch(workflow, /NODE_AUTH_TOKEN|NPM_TOKEN|npm_[A-Za-z0-9]{20,}/);
+  assert.match(workflow, /gh release create "\$GITHUB_REF_NAME" --draft/);
+  assert.match(workflow, /gh release upload "\$GITHUB_REF_NAME"/);
+  assert.match(workflow, /release asset set does not match the validated artifact set/);
+  assert.match(workflow, /gh release edit "\$GITHUB_REF_NAME" --draft=false --latest/);
+  assert.ok(
+    workflow.indexOf(
+      'npm publish "$package" --provenance --access public --tag "rc-v$RELEASE_VERSION"',
+    ) <
+      workflow.indexOf('gh release edit "$GITHUB_REF_NAME" --draft=false --latest'),
+    "the release must remain a draft until every package is published",
+  );
   assert.doesNotMatch(workflow, /^\s+(?:validated|dist)\/npm-.*\.tgz \\?$/m);
   assert.match(workflow, /\.\/dist\/npm-satelle-scoped\.tgz/);
   assert.match(workflow, /\.\/dist\/npm-satelle-unscoped\.tgz/);
   assert.match(workflow, /dist\/npm-satelle-scoped\.tgz/);
   assert.match(workflow, /dist\/npm-satelle-unscoped\.tgz/);
-  assert.doesNotMatch(workflow, /gh release (?:create|upload|edit)/);
   assert.match(workflow, /actions\/attest-build-provenance@/);
   assert.match(
     workflow,
@@ -182,7 +225,7 @@ test("release workflow is dry-run safe and owns six-target release validation", 
   const hardenedCheckoutUses = workflow.match(
     /uses: actions\/checkout@[^\n]+\n\s+with:\n\s+persist-credentials: false/g,
   ) ?? [];
-  assert.equal(checkoutUses.length, 4);
+  assert.equal(checkoutUses.length, 5);
   assert.equal(hardenedCheckoutUses.length, checkoutUses.length);
 });
 

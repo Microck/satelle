@@ -158,6 +158,15 @@ jobs:
       - name: Validate native archives and create SHA256SUMS
         run: node npm/scripts/release.cjs validate-native-release-archives dist validated
 
+      - name: Complete validated npm publication set
+        shell: bash
+        run: |
+          cp \
+            ./dist/npm-satelle-scoped.tgz \
+            ./dist/npm-satelle-unscoped.tgz \
+            ./dist/npm-artifacts.json \
+            validated/npm/
+
       - name: Run npm publication dry-runs sequentially
         shell: bash
         run: |
@@ -413,3 +422,126 @@ jobs:
           if ((Get-Content $PolicyLog -Raw) -notmatch "--deny-self-hosted-runners") { throw "attestation policy was not invoked" }
           & scripts/install.ps1 -Uninstall -BinDir $InstallRoot
           if (Test-Path (Join-Path $InstallRoot "satelle.exe")) { throw "installer uninstall failed" }
+
+  publish:
+    name: Publish verified release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [collect, attest, lifecycle]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: write
+      id-token: write
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Install Node.js for trusted publishing
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24
+          cache: npm
+          registry-url: https://registry.npmjs.org
+
+      - name: Install npm workspace
+        run: npm ci --ignore-scripts
+
+      - name: Download validated release candidate
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: validated-release-candidate
+          path: validated
+
+      - name: Revalidate immutable publication inputs
+        env:
+          RELEASE_VERSION: ${{ needs.collect.outputs.version }}
+        shell: bash
+        run: |
+          test "$GITHUB_REF_NAME" = "v${RELEASE_VERSION}"
+          node npm/scripts/release.cjs check "$GITHUB_REF_NAME"
+          node npm/scripts/release.cjs validate-npm-artifacts validated/npm
+          (
+            cd validated/github
+            sha256sum --check SHA256SUMS
+          )
+
+      - name: Create or require a draft GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          if gh release view "$GITHUB_REF_NAME" --json isDraft >/tmp/satelle-release.json 2>/dev/null; then
+            test "$(jq -r .isDraft /tmp/satelle-release.json)" = true
+          else
+            gh release create "$GITHUB_REF_NAME" --draft --verify-tag --title "Satelle $GITHUB_REF_NAME"
+          fi
+
+      - name: Upload and verify the complete release asset set
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          gh release upload "$GITHUB_REF_NAME" \
+            validated/github/* \
+            validated/npm/npm-artifacts.json \
+            --clobber
+          expected_assets=$(
+            {
+              find validated/github -maxdepth 1 -type f -printf '%f\n'
+              printf '%s\n' npm-artifacts.json
+            } | LC_ALL=C sort
+          )
+          actual_assets=$(gh release view "$GITHUB_REF_NAME" --json assets --jq '.assets[].name' | LC_ALL=C sort)
+          if [ "$actual_assets" != "$expected_assets" ]; then
+            printf '%s\n' "release asset set does not match the validated artifact set" >&2
+            exit 1
+          fi
+
+      - name: Publish every npm package through trusted publishing
+        env:
+          RELEASE_VERSION: ${{ needs.collect.outputs.version }}
+        shell: bash
+        run: |
+          for package in \
+            ./validated/npm/npm-linux-arm64-gnu.tgz \
+            ./validated/npm/npm-linux-x64-gnu.tgz \
+            ./validated/npm/npm-darwin-arm64.tgz \
+            ./validated/npm/npm-darwin-x64.tgz \
+            ./validated/npm/npm-win32-arm64-msvc.tgz \
+            ./validated/npm/npm-win32-x64-msvc.tgz \
+            ./validated/npm/npm-satelle-scoped.tgz \
+            ./validated/npm/npm-satelle-unscoped.tgz
+          do
+            package_name=$(node -e '
+              const fs = require("node:fs");
+              const path = require("node:path");
+              const manifest = JSON.parse(fs.readFileSync("validated/npm/npm-artifacts.json"));
+              const artifact = manifest.packages.find(({ file }) => file === path.basename(process.argv[1]));
+              if (!artifact) process.exit(1);
+              process.stdout.write(artifact.package);
+            ' "$package")
+            expected_integrity=$(node -e '
+              const fs = require("node:fs");
+              const path = require("node:path");
+              const manifest = JSON.parse(fs.readFileSync("validated/npm/npm-artifacts.json"));
+              const artifact = manifest.packages.find(({ file }) => file === path.basename(process.argv[1]));
+              if (!artifact) process.exit(1);
+              process.stdout.write(artifact.integrity);
+            ' "$package")
+            if published_integrity_json=$(npm view "$package_name@$RELEASE_VERSION" dist.integrity --json 2>/dev/null); then
+              published_integrity=$(printf '%s' "$published_integrity_json" | node -pe 'JSON.parse(require("fs").readFileSync(0, "utf8"))')
+              if [ "$published_integrity" != "$expected_integrity" ]; then
+                printf '%s\n' "published package integrity does not match the validated artifact" >&2
+                exit 1
+              fi
+              continue
+            fi
+            npm publish "$package" --provenance --access public --tag "rc-v$RELEASE_VERSION"
+          done
+
+      - name: Publish the GitHub release after npm succeeds
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release edit "$GITHUB_REF_NAME" --draft=false --latest

@@ -4,6 +4,7 @@
     "cpu": "arm64",
     "libc": "glibc",
     "rustTarget": "aarch64-unknown-linux-gnu",
+    "nativeComputerUseHost": false,
     "packageName": "@microck/satelle-linux-arm64-gnu",
     "binaryPath": "bin/satelle"
   },
@@ -12,6 +13,7 @@
     "cpu": "x64",
     "libc": "glibc",
     "rustTarget": "x86_64-unknown-linux-gnu",
+    "nativeComputerUseHost": false,
     "packageName": "@microck/satelle-linux-x64-gnu",
     "binaryPath": "bin/satelle"
   },
@@ -19,6 +21,7 @@
     "os": "darwin",
     "cpu": "arm64",
     "rustTarget": "aarch64-apple-darwin",
+    "nativeComputerUseHost": true,
     "packageName": "@microck/satelle-darwin-arm64",
     "binaryPath": "bin/satelle"
   },
@@ -26,6 +29,7 @@
     "os": "darwin",
     "cpu": "x64",
     "rustTarget": "x86_64-apple-darwin",
+    "nativeComputerUseHost": true,
     "packageName": "@microck/satelle-darwin-x64",
     "binaryPath": "bin/satelle"
   },
@@ -33,6 +37,7 @@
     "os": "win32",
     "cpu": "arm64",
     "rustTarget": "aarch64-pc-windows-msvc",
+    "nativeComputerUseHost": true,
     "packageName": "@microck/satelle-win32-arm64-msvc",
     "binaryPath": "bin/satelle.exe"
   },
@@ -40,6 +45,7 @@
     "os": "win32",
     "cpu": "x64",
     "rustTarget": "x86_64-pc-windows-msvc",
+    "nativeComputerUseHost": true,
     "packageName": "@microck/satelle-win32-x64-msvc",
     "binaryPath": "bin/satelle.exe"
   }
