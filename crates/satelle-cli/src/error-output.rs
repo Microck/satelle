@@ -237,7 +237,10 @@ fn error_contract(code: ErrorCode) -> ErrorContract {
             outcome: "The Host state could not be read safely.",
             default_recovery: "run satelle doctor and repair the reported storage problem",
         },
-        ErrorCode::HostUnreachable | ErrorCode::DirectDaemonUnreachable => ErrorContract {
+        ErrorCode::HostUnreachable
+        | ErrorCode::HostDaemonUnreachable
+        | ErrorCode::DirectDaemonUnreachable
+        | ErrorCode::SshBootstrapUnavailable => ErrorContract {
             category: ErrorCategory::RemoteExecution,
             retryable: true,
             outcome: "The Host could not be reached.",

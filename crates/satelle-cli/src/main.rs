@@ -79,7 +79,7 @@ use transport::{
 
 const CONFIG_CHECK_SCHEMA_VERSION: &str = "satelle.config.check.v1";
 const CONFIG_EXPLAIN_SCHEMA_VERSION: &str = "satelle.config.explain.v2";
-const PATHS_SCHEMA_VERSION: &str = "satelle.paths.v1";
+const PATHS_SCHEMA_VERSION: &str = "satelle.paths.v2";
 const DEFAULT_HOST_BIND: &str = "127.0.0.1:3001";
 const DEFAULT_ON_DEMAND_IDLE_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 const SSH_STATE_RELEASE_REQUEST: &str = "ssh-state-release.request";
@@ -1065,7 +1065,25 @@ fn execute_command(
 ) -> Result<Option<SessionId>, CliFailure> {
     let early_lifecycle_host = explicit_lifecycle_json_host(&command).map(str::to_owned);
     let (output_args, event_output) = command.output_request();
-    let output = match output_args.resolve(event_output) {
+    let presentation_default_applies = matches!(
+        &command,
+        Command::Config { .. }
+            | Command::Paths(_)
+            | Command::Status(_)
+            | Command::Logs(_)
+            | Command::Host {
+                command: HostCommand::Status(_) | HostCommand::Sessions(_),
+            }
+    );
+    let presentation_default = presentation_default_applies
+        .then(|| {
+            config
+                .load()
+                .ok()
+                .and_then(|resolved| resolved.config.output_format)
+        })
+        .flatten();
+    let output = match output_args.resolve_with_default(event_output, presentation_default) {
         Ok(output) => output,
         Err(error) => {
             if let Some(host_alias) = early_lifecycle_host.as_deref() {
@@ -1085,7 +1103,7 @@ fn execute_command(
         Command::Repair(command) => run_repair(command).map(|_| None),
         Command::Doctor(command) => run_doctor(command, config, output).map(|_| None),
         Command::Config { command } => run_config(command, config, output).map(|_| None),
-        Command::Paths(command) => show_paths(command, output).map(|_| None),
+        Command::Paths(command) => show_paths(command, config, output).map(|_| None),
         Command::Host { command } => run_host(command, config, output).map(|_| None),
         Command::SelfCtl { command } => run_self(command).map(|_| None),
         Command::Run(command) => run_prompt(command, config, output).map(Some),
@@ -5568,9 +5586,18 @@ fn config_file_has_root_key(path: &std::path::Path, key: &str) -> bool {
         .unwrap_or(false)
 }
 
-fn show_paths(command: PathsCommand, format: OutputFormat) -> Result<(), CliFailure> {
+fn show_paths(
+    command: PathsCommand,
+    config: ConfigContext<'_>,
+    format: OutputFormat,
+) -> Result<(), CliFailure> {
     let json = format.is_json();
-    let output = read::paths_report(command.host)?;
+    let selected_host = command
+        .host
+        .as_deref()
+        .map(|alias| config.resolve_host(Some(alias)))
+        .transpose()?;
+    let output = read::paths_report(selected_host.as_ref())?;
 
     if json {
         print_json(&output).map_err(failure)
@@ -8237,6 +8264,8 @@ fn run_prompt(
                         &host.alias,
                         "run",
                         &host.config.transport,
+                        config,
+                        &host.config,
                         &provider_selection,
                         None,
                         command.refresh_provider_smoke_test,
@@ -8284,6 +8313,8 @@ fn run_prompt(
                         &host.alias,
                         "run",
                         &host.config.transport,
+                        config,
+                        &host.config,
                         &provider_selection,
                         None,
                         command.refresh_provider_smoke_test,
@@ -8367,6 +8398,8 @@ fn run_prompt(
             &host.alias,
             "run",
             &host.config.transport,
+            config,
+            &host.config,
             &provider_selection,
             Some(&provider_validation),
             command.refresh_provider_smoke_test,
@@ -8470,6 +8503,8 @@ fn steer_prompt(
                         &host.alias,
                         "steer",
                         &host.config.transport,
+                        config,
+                        &host.config,
                         &provider_selection,
                         None,
                         command.refresh_provider_smoke_test,
@@ -8517,6 +8552,8 @@ fn steer_prompt(
                         &host.alias,
                         "steer",
                         &host.config.transport,
+                        config,
+                        &host.config,
                         &provider_selection,
                         None,
                         command.refresh_provider_smoke_test,
@@ -8602,6 +8639,8 @@ fn steer_prompt(
             &host.alias,
             "steer",
             &host.config.transport,
+            config,
+            &host.config,
             &provider_selection,
             Some(&provider_validation),
             command.refresh_provider_smoke_test,
@@ -8974,6 +9013,8 @@ impl TurnEventOutput {
         host: &str,
         operation: &str,
         transport: &satelle_core::TransportKind,
+        config: &ResolvedConfig,
+        host_config: &HostConfig,
         provider_selection: &ProviderSelection,
         provider_validation: Option<&transport::ProviderDescriptorValidationReport>,
         refresh_provider_smoke_test: bool,
@@ -8991,6 +9032,22 @@ impl TurnEventOutput {
             json!({
                 "operation": operation,
                 "transport": transport,
+                "selected_profile": config.selected_profile.as_ref().map(|profile| &profile.name),
+                "effective_timeouts": effective_timeouts_json(
+                    host_config,
+                    configured_turn_execution_timeout_ms(host_config),
+                ),
+                "project_config_intent": {
+                    "host": config.default_host_from_project(),
+                    "model": config.model_alias_from_project(),
+                    "provider": config.provider_alias_from_project(),
+                    "profile": config.selected_profile.as_ref().is_some_and(
+                        |profile| profile.source.as_str() == "project_config"
+                    ),
+                    "timeouts": config.host_intent_from_project(host),
+                    "transport": config.host_intent_from_project(host),
+                    "output_format": config.output_format_from_project(),
+                },
                 "requested_model_alias": provider_selection.requested_model_alias,
                 "requested_provider_alias": provider_selection.requested_provider_alias,
                 "model_alias_from_project": provider_selection.model_alias_from_project,

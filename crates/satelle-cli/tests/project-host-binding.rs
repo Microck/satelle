@@ -475,3 +475,52 @@ allow_project_selection = true
         "hosts.remote.allow_project_selection"
     );
 }
+
+#[test]
+fn project_output_format_is_a_presentation_only_default() {
+    let fixture = ConfigFixture::new(
+        "",
+        r#"
+output_format = "json"
+"#,
+    );
+
+    let output = fixture
+        .command()
+        .args(["config", "explain"])
+        .assert()
+        .success()
+        .get_output()
+        .clone();
+    let report = parse_json(&output.stdout);
+
+    assert_eq!(report["effective"]["output_format"], "json");
+    assert_eq!(report["project_intent"]["output_format"], true);
+}
+
+#[test]
+fn config_check_all_reports_every_missing_project_host_binding() {
+    let fixture = ConfigFixture::new(
+        "",
+        r#"
+default_host = "alpha"
+
+[hosts.beta]
+"#,
+    );
+
+    let output = fixture
+        .command()
+        .args(["config", "check", "--all", "--json"])
+        .assert()
+        .code(66)
+        .get_output()
+        .clone();
+    let error = parse_json(&output.stderr);
+
+    assert_eq!(error["code"], "project-host-bindings-not-found");
+    assert_eq!(
+        error["details"]["hosts"],
+        serde_json::json!(["alpha", "beta"])
+    );
+}

@@ -357,7 +357,9 @@ fn failure(error: &SatelleError) -> ApiFailure {
         | ErrorCode::HostIdentityMismatch
         // This is a Controller-local reachability error. If it ever reaches
         // the Host boundary, fail closed instead of inventing a wire code.
+        | ErrorCode::HostDaemonUnreachable
         | ErrorCode::DirectDaemonUnreachable
+        | ErrorCode::SshBootstrapUnavailable
         // Process interruption is a Controller-local process-exit contract.
         // If it crosses the Host boundary, expose no extra API surface.
         | ErrorCode::Interrupted

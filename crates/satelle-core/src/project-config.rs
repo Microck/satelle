@@ -13,6 +13,7 @@ const ACCEPTED_ROOT_KEYS: &[&str] = &[
     "default_host",
     "model_alias",
     "provider_alias",
+    "output_format",
     "profile",
     "hosts",
 ];
@@ -56,6 +57,7 @@ struct ProjectConfig {
     default_host: Option<String>,
     model_alias: Option<String>,
     provider_alias: Option<String>,
+    output_format: Option<crate::PresentationOutputFormat>,
     #[serde(default)]
     hosts: BTreeMap<String, ProjectHostIntent>,
 }
@@ -107,6 +109,14 @@ impl ParsedProjectConfig {
         self.config.provider_alias.is_some()
     }
 
+    pub(super) fn defines_output_format(&self) -> bool {
+        self.config.output_format.is_some()
+    }
+
+    pub(super) fn host_intent_aliases(&self) -> BTreeSet<String> {
+        self.config.hosts.keys().cloned().collect()
+    }
+
     pub(super) fn apply_to(
         &self,
         mut base: SatelleConfig,
@@ -117,25 +127,37 @@ impl ParsedProjectConfig {
         // Validate the complete overlay before mutating the effective config. Built-in defaults
         // are deliberately excluded from user_bound_hosts because repository intent never counts
         // as operator authorization for a concrete Host Binding.
+        let mut missing_bindings = BTreeMap::new();
         if let Some(alias) = &self.config.default_host
             && !user_bound_hosts.contains(alias)
         {
+            missing_bindings.insert(alias.clone(), "default_host".to_string());
+        }
+        for alias in self.config.hosts.keys() {
+            if !user_bound_hosts.contains(alias) {
+                missing_bindings.insert(alias.clone(), format!("hosts.{alias}"));
+            }
+        }
+        if missing_bindings.len() == 1 {
+            let (alias, reference_path) = missing_bindings
+                .first_key_value()
+                .expect("one missing Host Binding was counted");
             return Err(SatelleError::project_host_binding_not_found_at(
                 project_config_path,
-                "default_host",
+                reference_path,
                 user_config_path,
                 alias,
             ));
         }
+        if !missing_bindings.is_empty() {
+            return Err(SatelleError::project_host_bindings_not_found(
+                project_config_path,
+                user_config_path,
+                &missing_bindings,
+            ));
+        }
 
         for (alias, intent) in &self.config.hosts {
-            if !user_bound_hosts.contains(alias) {
-                return Err(SatelleError::project_host_binding_not_found(
-                    project_config_path,
-                    user_config_path,
-                    alias,
-                ));
-            }
             let host = base.hosts.get(alias).ok_or_else(|| {
                 SatelleError::project_host_binding_not_found(
                     project_config_path,
@@ -163,6 +185,9 @@ impl ParsedProjectConfig {
         }
         if self.config.provider_alias.is_some() {
             base.provider_alias.clone_from(&self.config.provider_alias);
+        }
+        if self.config.output_format.is_some() {
+            base.output_format = self.config.output_format;
         }
 
         for (alias, intent) in &self.config.hosts {
@@ -515,6 +540,46 @@ impl SatelleError {
             user_config_file,
             alias,
         )
+    }
+
+    fn project_host_bindings_not_found(
+        project_config_file: &Path,
+        user_config_file: &Path,
+        missing_bindings: &BTreeMap<String, String>,
+    ) -> Self {
+        let aliases = missing_bindings.keys().cloned().collect::<Vec<_>>();
+        let references = missing_bindings.values().cloned().collect::<Vec<_>>();
+        let project_config_file = project_config_file.display().to_string();
+        let user_config_file = user_config_file.display().to_string();
+        let mut details = BTreeMap::new();
+        details.insert(
+            "file".to_string(),
+            Value::String(project_config_file.clone()),
+        );
+        details.insert(
+            "hosts".to_string(),
+            Value::Array(aliases.iter().cloned().map(Value::String).collect()),
+        );
+        details.insert(
+            "reference_paths".to_string(),
+            Value::Array(references.into_iter().map(Value::String).collect()),
+        );
+        details.insert(
+            "user_config_file".to_string(),
+            Value::String(user_config_file.clone()),
+        );
+        Self {
+            code: ErrorCode::HostNotFound,
+            message: format!(
+                "config file {project_config_file} references hosts without trusted user-level bindings: {}",
+                aliases.join(", ")
+            ),
+            recovery_command: Some(format!(
+                "configure each reported host under hosts in user-level config {user_config_file}"
+            )),
+            source_detail: None,
+            details,
+        }
     }
 
     fn project_host_binding_not_found_at(

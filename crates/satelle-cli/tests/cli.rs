@@ -5073,7 +5073,7 @@ fn config_check_explain_and_paths_use_versioned_read_only_json_contracts() {
         .clone();
     assert!(paths_output.stderr.is_empty());
     let paths_report = parse_json_output(&paths_output.stdout);
-    assert_eq!(paths_report["schema_version"], "satelle.paths.v1");
+    assert_eq!(paths_report["schema_version"], "satelle.paths.v2");
     for field in [
         "config_file",
         "cache_root",
@@ -5089,6 +5089,23 @@ fn config_check_explain_and_paths_use_versioned_read_only_json_contracts() {
             "paths JSON should include {field}"
         );
     }
+    assert_eq!(paths_report["observation_source"], serde_json::Value::Null);
+    assert_eq!(
+        paths_report["sources"]["state_root"],
+        "explicit_environment"
+    );
+    assert_eq!(
+        paths_report["sources"]["sqlite_store"],
+        "explicit_environment"
+    );
+    assert_eq!(
+        paths_report["sources"]["recording_root"],
+        "explicit_environment"
+    );
+    assert_eq!(
+        paths_report["sources"]["project_config_file"],
+        "project_discovery"
+    );
 
     assert!(!state.path().join("local-demo-state.json").exists());
 }

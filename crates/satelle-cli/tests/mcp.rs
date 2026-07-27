@@ -419,7 +419,7 @@ fn initialize_and_tool_contracts_are_sdk_compatible() {
     assert_eq!(paths["isError"], false);
     assert_eq!(
         paths["structuredContent"]["schema_version"],
-        "satelle.paths.v1"
+        "satelle.paths.v2"
     );
     assert_eq!(
         paths["content"][0]["text"],

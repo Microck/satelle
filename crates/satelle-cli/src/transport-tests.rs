@@ -4618,3 +4618,67 @@ fn failed_local_status_preserves_interrupt_exit_and_session_recovery_command() {
     assert_eq!(error.details["session_id"], session_id.as_str());
     assert_eq!(error.details["status_error_code"], "host-unreachable");
 }
+
+#[test]
+fn direct_inspection_fallback_uses_only_operator_ssh_bootstrap_settings() {
+    let selected = SelectedHost {
+        alias: "workstation".to_string(),
+        config: HostConfig {
+            transport: TransportKind::Direct,
+            address: Some("https://daemon.example.test:9443".to_string()),
+            network: Some(satelle_core::NetworkConfig::Tailscale {
+                tailnet_name: Some("corp".to_string()),
+                hostname: None,
+            }),
+            expected_host_id: Some("host-123".to_string()),
+            api_token: Some(ApiTokenSource::File {
+                path: PathBuf::from("/operator/daemon.token"),
+            }),
+            ca_bundle: Some(PathBuf::from("/operator/daemon-ca.pem")),
+            ssh_bootstrap: Some(satelle_core::SshBootstrapConfig {
+                address: "operator@bootstrap.example.test:22".to_string(),
+            }),
+            ..HostConfig::default()
+        },
+    };
+
+    let fallback = ssh_bootstrap_host(&selected).expect("operator bootstrap settings should work");
+
+    assert_eq!(fallback.alias, "workstation");
+    assert_eq!(fallback.config.transport, TransportKind::Ssh);
+    assert_eq!(
+        fallback.config.address,
+        "operator@bootstrap.example.test:22"
+    );
+    assert_eq!(
+        fallback.config.expected_host_id.as_deref(),
+        Some("host-123")
+    );
+    assert_eq!(
+        fallback.config.api_token,
+        Some(ApiTokenSource::File {
+            path: PathBuf::from("/operator/daemon.token"),
+        })
+    );
+    assert_eq!(fallback.config.network, None);
+    assert_eq!(fallback.config.ca_bundle, None);
+    assert_eq!(fallback.config.ssh_bootstrap, None);
+}
+
+#[test]
+fn direct_inspection_fallback_requires_operator_ssh_bootstrap_settings() {
+    let selected = SelectedHost {
+        alias: "workstation".to_string(),
+        config: HostConfig {
+            transport: TransportKind::Direct,
+            address: Some("https://daemon.example.test:9443".to_string()),
+            ..HostConfig::default()
+        },
+    };
+
+    let error = ssh_bootstrap_host(&selected).expect_err("fallback must be explicitly configured");
+
+    assert_eq!(error.code, ErrorCode::SshBootstrapUnavailable);
+    assert_eq!(error.code.as_str(), "ssh-bootstrap-unavailable");
+    assert_eq!(error.exit_code(), 69);
+}

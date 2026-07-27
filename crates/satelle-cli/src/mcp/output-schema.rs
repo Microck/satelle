@@ -59,7 +59,7 @@ pub(super) fn config_explain() -> Value {
 
 pub(super) fn paths() -> Value {
     versioned(
-        "satelle.paths.v1",
+        "satelle.paths.v2",
         json!({
             "host": {"type": "string"},
             "config_file": {"type": "string"},

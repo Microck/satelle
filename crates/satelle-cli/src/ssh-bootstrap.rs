@@ -3683,6 +3683,16 @@ impl RemoteUserDirectories {
             cache_root,
             state_root,
             operator_log_root,
+            sources: satelle_core::SatellePathSources {
+                config_file: satelle_core::PathSource::OsDefault,
+                cache_root: satelle_core::PathSource::OsDefault,
+                state_root: satelle_core::PathSource::OsDefault,
+                sqlite_store: satelle_core::PathSource::OsDefault,
+                operator_log_root: satelle_core::PathSource::OsDefault,
+                recording_root: satelle_core::PathSource::OsDefault,
+                project_config_file: satelle_core::PathSource::ProjectDiscovery,
+                install_receipt: satelle_core::PathSource::OsDefault,
+            },
             // On-demand SSH inspection has no authoritative daemon-side project discovery.
             project_config_file: None,
         }
@@ -3776,7 +3786,10 @@ mod remote_user_directories_tests {
 
         let paths = directories.resolved_path_set();
 
-        assert_eq!(paths.config_file, "/home/operator/.config/satelle/config.toml");
+        assert_eq!(
+            paths.config_file,
+            "/home/operator/.config/satelle/config.toml"
+        );
         assert_eq!(paths.cache_root, "/home/operator/.cache/satelle");
         assert_eq!(paths.state_root, "/home/operator/.local/state/satelle");
         assert_eq!(
@@ -6638,6 +6651,7 @@ mod tests {
             adapter: satelle_core::AdapterKind::Codex,
             address: Some("operator@host".to_string()),
             network: None,
+            ssh_bootstrap: None,
             timeouts: None,
             native_readiness_cache_ttl: None,
             provider_smoke_success_cache_ttl: None,

@@ -161,6 +161,7 @@ pub struct DaemonResolvedPathSet {
     pub sqlite_store: String,
     pub operator_log_root: String,
     pub recording_root: String,
+    pub sources: crate::SatellePathSources,
     /// The project config discovered by the daemon, if the daemon resolved one.
     ///
     /// A controller-side project path is not authoritative for a remote Host and must never be
@@ -178,22 +179,33 @@ impl DaemonResolvedPathSet {
             planned.cache_root = join_remote_path(&home, "cache");
             planned.state_root = join_remote_path(&home, "state");
             planned.operator_log_root = join_remote_path(&home, "logs");
+            planned.sources.config_file = crate::PathSource::ServiceConfig;
+            planned.sources.cache_root = crate::PathSource::ServiceConfig;
+            planned.sources.state_root = crate::PathSource::ServiceConfig;
+            planned.sources.operator_log_root = crate::PathSource::ServiceConfig;
         }
         if let Some(path) = overrides.config_file.as_ref() {
             planned.config_file = path.display().to_string();
+            planned.sources.config_file = crate::PathSource::ServiceConfig;
         }
         if let Some(path) = overrides.cache_dir.as_ref() {
             planned.cache_root = path.display().to_string();
+            planned.sources.cache_root = crate::PathSource::ServiceConfig;
         }
         if let Some(path) = overrides.state_dir.as_ref() {
             planned.state_root = path.display().to_string();
+            planned.sources.state_root = crate::PathSource::ServiceConfig;
         }
         if let Some(path) = overrides.log_dir.as_ref() {
             planned.operator_log_root = path.display().to_string();
+            planned.sources.operator_log_root = crate::PathSource::ServiceConfig;
         }
         planned.sqlite_store = join_remote_path(&planned.state_root, "satelle.sqlite3");
         planned.recording_root = join_remote_path(&planned.state_root, "recordings");
         planned.install_receipt = join_remote_path(&planned.state_root, "install-receipt.json");
+        planned.sources.sqlite_store = planned.sources.state_root;
+        planned.sources.recording_root = planned.sources.state_root;
+        planned.sources.install_receipt = planned.sources.state_root;
         planned
     }
 
@@ -220,6 +232,7 @@ impl From<&crate::SatellePathSet> for DaemonResolvedPathSet {
             sqlite_store: paths.sqlite_store.display().to_string(),
             operator_log_root: paths.operator_log_root.display().to_string(),
             recording_root: paths.recording_root.display().to_string(),
+            sources: paths.sources.clone(),
             project_config_file: paths
                 .project_config_file
                 .as_ref()
@@ -1122,6 +1135,16 @@ mod tests {
             sqlite_store: "/old/state/satelle.sqlite3".to_string(),
             operator_log_root: "/old/logs".to_string(),
             recording_root: "/old/state/recordings".to_string(),
+            sources: crate::SatellePathSources {
+                config_file: crate::PathSource::OsDefault,
+                cache_root: crate::PathSource::OsDefault,
+                state_root: crate::PathSource::OsDefault,
+                sqlite_store: crate::PathSource::OsDefault,
+                operator_log_root: crate::PathSource::OsDefault,
+                recording_root: crate::PathSource::OsDefault,
+                project_config_file: crate::PathSource::ProjectDiscovery,
+                install_receipt: crate::PathSource::OsDefault,
+            },
             project_config_file: None,
             install_receipt: "/old/state/install-receipt.json".to_string(),
         };

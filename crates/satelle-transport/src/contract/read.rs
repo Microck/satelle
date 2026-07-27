@@ -1,6 +1,6 @@
 use super::{AuthenticatedResponseContract, RequestId, define_schema_token};
-use satelle_core::{ApiRateLimits, DesktopSessionRecord};
 use satelle_core::daemon_service::DaemonResolvedPathSet;
+use satelle_core::{ApiRateLimits, DesktopSessionRecord};
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 
@@ -589,14 +589,21 @@ mod tests {
             sqlite_store: "/daemon/state/satelle.sqlite3".to_string(),
             operator_log_root: "/daemon/state/logs".to_string(),
             recording_root: "/daemon/state/recordings".to_string(),
+            sources: satelle_core::SatellePathSources {
+                config_file: satelle_core::PathSource::ServiceConfig,
+                cache_root: satelle_core::PathSource::ServiceConfig,
+                state_root: satelle_core::PathSource::ServiceConfig,
+                sqlite_store: satelle_core::PathSource::ServiceConfig,
+                operator_log_root: satelle_core::PathSource::ServiceConfig,
+                recording_root: satelle_core::PathSource::ServiceConfig,
+                project_config_file: satelle_core::PathSource::ProjectDiscovery,
+                install_receipt: satelle_core::PathSource::ServiceConfig,
+            },
             project_config_file: Some("/daemon/project/satelle.toml".to_string()),
             install_receipt: "/daemon/state/install-receipt.json".to_string(),
         };
-        let response = HostPathsResponse::new(
-            request_id.clone(),
-            "host-daemon".to_string(),
-            paths.clone(),
-        );
+        let response =
+            HostPathsResponse::new(request_id.clone(), "host-daemon".to_string(), paths.clone());
 
         assert_eq!(response.paths(), &paths);
         assert_eq!(
@@ -612,6 +619,16 @@ mod tests {
                     "sqlite_store": "/daemon/state/satelle.sqlite3",
                     "operator_log_root": "/daemon/state/logs",
                     "recording_root": "/daemon/state/recordings",
+                    "sources": {
+                        "config_file": "service_config",
+                        "cache_root": "service_config",
+                        "state_root": "service_config",
+                        "sqlite_store": "service_config",
+                        "operator_log_root": "service_config",
+                        "recording_root": "service_config",
+                        "project_config_file": "project_discovery",
+                        "install_receipt": "service_config"
+                    },
                     "project_config_file": "/daemon/project/satelle.toml",
                     "install_receipt": "/daemon/state/install-receipt.json"
                 }
