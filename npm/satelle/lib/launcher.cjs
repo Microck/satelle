@@ -1,12 +1,13 @@
 "use strict";
 
 const { spawnSync } = require("node:child_process");
-const { existsSync, readFileSync } = require("node:fs");
+const { existsSync, readFileSync, realpathSync } = require("node:fs");
 const { createRequire } = require("node:module");
 const path = require("node:path");
 
 const launcherVersion = require("../package.json").version;
 const platformMatrix = require("../platforms.json");
+const packageInstallContextEnvironment = "SATELLE_PACKAGE_INSTALL_CONTEXT";
 
 class LauncherError extends Error {
   constructor(code, message) {
@@ -138,6 +139,192 @@ function detectInstallationScope(launcherPath) {
   return normalizedPath.includes("/node_modules/") ? "local" : undefined;
 }
 
+function pathContains(parentPath, childPath) {
+  const relative = path.relative(parentPath, childPath);
+  return relative === "" || (!relative.startsWith("..") && !path.isAbsolute(relative));
+}
+
+function packageRoot(globalRoot, packageName) {
+  return path.join(globalRoot, ...packageName.split("/"));
+}
+
+function globalRootOwnsLauncher({ globalRoot, packageName, launcherPath }) {
+  try {
+    return pathContains(
+      realpathSync(packageRoot(globalRoot, packageName)),
+      realpathSync(launcherPath),
+    );
+  } catch {
+    return false;
+  }
+}
+
+function commandLine(command, argumentsToForward) {
+  const result = spawnSync(command, argumentsToForward, {
+    encoding: "utf8",
+    timeout: 10_000,
+    maxBuffer: 64 * 1024,
+    windowsHide: true,
+  });
+  if (result.status !== 0 || result.error) {
+    return undefined;
+  }
+  const lines = result.stdout
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean);
+  return lines.length === 1 ? lines[0] : undefined;
+}
+
+function outerNodeModulesRoot(filePath) {
+  let current = path.resolve(filePath);
+  let selected;
+  while (true) {
+    if (path.basename(current).toLowerCase() === "node_modules") {
+      selected = current;
+    }
+    const parent = path.dirname(current);
+    if (parent === current) {
+      return selected;
+    }
+    current = parent;
+  }
+}
+
+function discoverGlobalOwnership({
+  packageName,
+  launcherPath,
+  runCommand = commandLine,
+  platform = process.platform,
+}) {
+  const owners = [];
+  for (const [manager, command, argumentsToForward] of [
+    ["npm", "npm", ["root", "--global"]],
+    ["pnpm", "pnpm", ["root", "--global"]],
+  ]) {
+    const globalRoot = runCommand(command, argumentsToForward);
+    if (
+      globalRoot &&
+      globalRootOwnsLauncher({ globalRoot, packageName, launcherPath })
+    ) {
+      owners.push({ manager, installRoot: globalRoot });
+    }
+  }
+
+  const bunBin = runCommand("bun", ["pm", "bin", "--global"]);
+  if (bunBin) {
+    const shimNames =
+      platform === "win32"
+        ? ["satelle.exe", "satelle.cmd", "satelle"]
+        : ["satelle"];
+    const bunOwnsLauncher = shimNames.some((shimName) => {
+      try {
+        return realpathSync(path.join(bunBin, shimName)) === realpathSync(launcherPath);
+      } catch {
+        return false;
+      }
+    });
+    const installRoot = bunOwnsLauncher ? outerNodeModulesRoot(launcherPath) : undefined;
+    if (
+      installRoot &&
+      globalRootOwnsLauncher({ globalRoot: installRoot, packageName, launcherPath })
+    ) {
+      owners.push({ manager: "bun", installRoot });
+    }
+  }
+  return owners;
+}
+
+function declaredPackageManager(projectRoot, manifest) {
+  const packageManager = manifest.packageManager?.split("@", 1)[0];
+  const declaredManager = ["npm", "pnpm", "bun"].includes(packageManager)
+    ? packageManager
+    : undefined;
+  const lockOwners = new Set();
+  for (const [manager, lockfiles] of [
+    ["npm", ["package-lock.json", "npm-shrinkwrap.json"]],
+    ["pnpm", ["pnpm-lock.yaml"]],
+    ["bun", ["bun.lock", "bun.lockb"]],
+  ]) {
+    if (lockfiles.some((lockfile) => existsSync(path.join(projectRoot, lockfile)))) {
+      lockOwners.add(manager);
+    }
+  }
+  if (declaredManager) {
+    return [...lockOwners].every((manager) => manager === declaredManager)
+      ? declaredManager
+      : undefined;
+  }
+  return lockOwners.size === 1 ? [...lockOwners][0] : undefined;
+}
+
+function manifestDeclaresPackage(manifest, packageName) {
+  return ["dependencies", "devDependencies", "optionalDependencies"].some(
+    (field) => Object.hasOwn(manifest[field] || {}, packageName),
+  );
+}
+
+function discoverLocalOwnership({ packageName, launcherPath }) {
+  const contexts = [];
+  let current = path.resolve(launcherPath);
+  while (true) {
+    if (path.basename(current).toLowerCase() === "node_modules") {
+      const installRoot = path.dirname(current);
+      try {
+        const manifest = JSON.parse(readFileSync(path.join(installRoot, "package.json"), "utf8"));
+        const manager = declaredPackageManager(installRoot, manifest);
+        if (manager && manifestDeclaresPackage(manifest, packageName)) {
+          contexts.push({ manager, installRoot });
+        }
+      } catch {
+        // Missing or invalid project metadata cannot establish package ownership.
+      }
+    }
+    const parent = path.dirname(current);
+    if (parent === current) {
+      break;
+    }
+    current = parent;
+  }
+  return contexts.length === 1 ? contexts[0] : undefined;
+}
+
+function packageInstallContext({
+  packageName,
+  launcherPath,
+  globalOwners = discoverGlobalOwnership({ packageName, launcherPath }),
+} = {}) {
+  if (!packageName || !launcherPath) {
+    return undefined;
+  }
+  const candidates = globalOwners.map((owner) => ({
+    manager: owner.manager,
+    scope: "global",
+    package_name: packageName,
+    install_root: path.resolve(owner.installRoot),
+    launcher_path: realpathSync(launcherPath),
+  }));
+  const localOwner = discoverLocalOwnership({ packageName, launcherPath });
+  if (localOwner) {
+    candidates.push({
+      manager: localOwner.manager,
+      scope: "local",
+      package_name: packageName,
+      install_root: path.resolve(localOwner.installRoot),
+      launcher_path: realpathSync(launcherPath),
+    });
+  }
+  return candidates.length === 1 ? candidates[0] : undefined;
+}
+
+function isSelfUpdate(argumentsToForward) {
+  return argumentsToForward[0] === "self" && argumentsToForward[1] === "update";
+}
+
+function packageInstallContextForCommand(argumentsToForward, options) {
+  return isSelfUpdate(argumentsToForward) ? packageInstallContext(options) : undefined;
+}
+
 function detectForwardingContext({ packageName, launcherPath }) {
   if (packageName !== "@microck/satelle") {
     return { packageName, launcherPath };
@@ -151,24 +338,37 @@ function detectForwardingContext({ packageName, launcherPath }) {
     return { packageName, launcherPath };
   }
 
-  const nodeModulesRoot = path.dirname(path.dirname(canonicalRoot));
-  const unscopedRoot = path.join(nodeModulesRoot, "satelle");
-  const unscopedManifestPath = path.join(unscopedRoot, "package.json");
-  const unscopedLauncherPath = path.join(unscopedRoot, "bin", "satelle.cjs");
-  if (!existsSync(unscopedManifestPath) || !existsSync(unscopedLauncherPath)) {
-    return { packageName, launcherPath };
-  }
-
-  try {
-    const manifest = JSON.parse(readFileSync(unscopedManifestPath, "utf8"));
-    if (manifest.name === "satelle" && manifest.dependencies?.["@microck/satelle"]) {
-      return { packageName: "satelle", launcherPath: unscopedLauncherPath };
+  const candidates = [];
+  let current = canonicalRoot;
+  while (true) {
+    if (path.basename(current).toLowerCase() === "node_modules") {
+      const unscopedRoot = path.join(current, "satelle");
+      const unscopedManifestPath = path.join(unscopedRoot, "package.json");
+      const unscopedLauncherPath = path.join(unscopedRoot, "bin", "satelle.cjs");
+      try {
+        const manifest = JSON.parse(readFileSync(unscopedManifestPath, "utf8"));
+        if (
+          existsSync(unscopedLauncherPath) &&
+          manifest.name === "satelle" &&
+          manifest.version === launcherVersion &&
+          manifest.dependencies?.["@microck/satelle"] === launcherVersion
+        ) {
+          candidates.push({
+            packageName: "satelle",
+            launcherPath: realpathSync(unscopedLauncherPath),
+          });
+        }
+      } catch {
+        // Invalid package metadata must not change the canonical launch context.
+      }
     }
-  } catch {
-    // Invalid package metadata must not change the canonical launch context.
+    const parent = path.dirname(current);
+    if (parent === current) {
+      break;
+    }
+    current = parent;
   }
-
-  return { packageName, launcherPath };
+  return candidates.length === 1 ? candidates[0] : { packageName, launcherPath };
 }
 
 function reinstallCommand({ packageManager, packageName, installScope }) {
@@ -234,8 +434,14 @@ function resolveNativeBinary(
   return binaryPath;
 }
 
-function executeNativeBinary(binaryPath, argumentsToForward) {
+function executeNativeBinary(binaryPath, argumentsToForward, installContext) {
+  const environment = { ...process.env };
+  delete environment[packageInstallContextEnvironment];
+  if (installContext) {
+    environment[packageInstallContextEnvironment] = JSON.stringify(installContext);
+  }
   const child = spawnSync(path.toNamespacedPath(binaryPath), argumentsToForward, {
+    env: environment,
     stdio: "inherit",
   });
   if (child.error) {
@@ -274,7 +480,12 @@ function main({ packageName = "@microck/satelle", launcherPath = __filename } = 
       path.resolve(__dirname, ".."),
       recoveryContext,
     );
-    process.exitCode = executeNativeBinary(binaryPath, process.argv.slice(2));
+    const argumentsToForward = process.argv.slice(2);
+    const installContext = packageInstallContextForCommand(argumentsToForward, {
+      packageName: launchContext.packageName,
+      launcherPath: launchContext.launcherPath,
+    });
+    process.exitCode = executeNativeBinary(binaryPath, argumentsToForward, installContext);
   } catch (error) {
     if (!(error instanceof LauncherError)) {
       throw error;
@@ -290,8 +501,12 @@ module.exports = {
   detectInstallationScope,
   detectLinuxLibc,
   detectPackageManager,
+  discoverGlobalOwnership,
   executeNativeBinary,
+  isSelfUpdate,
   main,
+  packageInstallContext,
+  packageInstallContextForCommand,
   resolveNativeBinary,
   selectTarget,
 };

@@ -25,6 +25,7 @@ const ARCHIVE_LIMIT: u64 = 256 * 1024 * 1024;
 const BINARY_LIMIT: u64 = 256 * 1024 * 1024;
 const RECEIPT_FILE_NAME: &str = ".satelle-install.json";
 const LOCK_FILE_NAME: &str = ".satelle-install.lock";
+const PACKAGE_INSTALL_CONTEXT_ENV: &str = "SATELLE_PACKAGE_INSTALL_CONTEXT";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct SelfUpdateRequest {
@@ -156,7 +157,7 @@ fn run_with(
         .current_executable
         .canonicalize()
         .map_err(SelfUpdateError::CurrentExecutable)?;
-    if let Some(managed) = detect_managed_install(&executable) {
+    if let Some(managed) = detect_managed_install(&executable)? {
         return Err(SelfUpdateError::ManagedInstall(managed));
     }
     let receipt_path = receipt_path(&executable)?;
@@ -413,6 +414,17 @@ impl LocalTarget {
         }
     }
 
+    const fn npm_package_name(self) -> &'static str {
+        match self {
+            Self::LinuxArm64Gnu => "satelle-linux-arm64-gnu",
+            Self::LinuxX64Gnu => "satelle-linux-x64-gnu",
+            Self::DarwinArm64 => "satelle-darwin-arm64",
+            Self::DarwinX64 => "satelle-darwin-x64",
+            Self::WindowsArm64Msvc => "satelle-win32-arm64-msvc",
+            Self::WindowsX64Msvc => "satelle-win32-x64-msvc",
+        }
+    }
+
     const fn archive_extension(self) -> &'static str {
         match self {
             Self::WindowsArm64Msvc | Self::WindowsX64Msvc => "zip",
@@ -442,11 +454,39 @@ struct InstallReceipt {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct ManagedInstall {
-    pub(crate) install_method: &'static str,
-    pub(crate) upgrade_command: &'static str,
+    pub(crate) install_method: String,
+    pub(crate) install_scope: Option<String>,
+    pub(crate) package_name: String,
+    pub(crate) install_root: Option<PathBuf>,
+    pub(crate) upgrade_program: String,
+    pub(crate) upgrade_arguments: Vec<String>,
+    pub(crate) upgrade_working_directory: Option<PathBuf>,
+    pub(crate) upgrade_command: String,
 }
 
-fn detect_managed_install(executable: &Path) -> Option<ManagedInstall> {
+impl std::fmt::Display for ManagedInstall {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "{}; run `{}`", self.install_method, self.upgrade_command)?;
+        if let Some(working_directory) = &self.upgrade_working_directory {
+            write!(formatter, " from `{}`", working_directory.display())?;
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PackageInstallContext {
+    manager: String,
+    scope: String,
+    package_name: String,
+    install_root: PathBuf,
+    launcher_path: PathBuf,
+}
+
+fn detect_managed_install(
+    executable: &Path,
+) -> Result<Option<ManagedInstall>, SelfUpdateError> {
     let components = executable
         .components()
         .filter_map(|component| match component {
@@ -457,37 +497,382 @@ fn detect_managed_install(executable: &Path) -> Option<ManagedInstall> {
     let contains = |value: &str| components.iter().any(|component| component == value);
     let joined = components.join("/");
 
-    if joined.contains("/.pnpm/") || contains(".pnpm") {
-        return Some(ManagedInstall {
-            install_method: "pnpm",
-            upgrade_command: "pnpm update @microck/satelle",
-        });
-    }
-    if joined.contains("/.bun/") || contains(".bun") {
-        return Some(ManagedInstall {
-            install_method: "bun",
-            upgrade_command: "bun update @microck/satelle",
-        });
-    }
-    if contains("node_modules") {
-        return Some(ManagedInstall {
-            install_method: "npm",
-            upgrade_command: "npm update @microck/satelle",
-        });
-    }
     if contains("cellar") || joined.contains("/homebrew/") {
-        return Some(ManagedInstall {
-            install_method: "homebrew",
-            upgrade_command: "brew upgrade satelle",
-        });
+        return Ok(Some(ManagedInstall {
+            install_method: "homebrew".to_string(),
+            install_scope: Some("global".to_string()),
+            package_name: "satelle".to_string(),
+            install_root: None,
+            upgrade_program: "brew".to_string(),
+            upgrade_arguments: vec!["upgrade".to_string(), "satelle".to_string()],
+            upgrade_working_directory: None,
+            upgrade_command: "brew upgrade satelle".to_string(),
+        }));
     }
     if joined.contains("/scoop/apps/") {
-        return Some(ManagedInstall {
-            install_method: "scoop",
-            upgrade_command: "scoop update satelle",
-        });
+        return Ok(Some(ManagedInstall {
+            install_method: "scoop".to_string(),
+            install_scope: Some("global".to_string()),
+            package_name: "satelle".to_string(),
+            install_root: None,
+            upgrade_program: "scoop".to_string(),
+            upgrade_arguments: vec!["update".to_string(), "satelle".to_string()],
+            upgrade_working_directory: None,
+            upgrade_command: "scoop update satelle".to_string(),
+        }));
     }
-    None
+
+    let raw_context = std::env::var_os(PACKAGE_INSTALL_CONTEXT_ENV);
+    if raw_context.is_none() {
+        return if contains("node_modules") {
+            Err(SelfUpdateError::InstallOwnerUnknown)
+        } else {
+            Ok(None)
+        };
+    }
+    let raw_context = raw_context
+        .and_then(|value| value.into_string().ok())
+        .ok_or(SelfUpdateError::InstallOwnerUnknown)?;
+    package_managed_install(executable, &raw_context).map(Some)
+}
+
+fn package_managed_install(
+    executable: &Path,
+    raw_context: &str,
+) -> Result<ManagedInstall, SelfUpdateError> {
+    package_managed_install_with_global_owners(executable, raw_context, |context| {
+        verified_global_manager(context)
+    })
+}
+
+fn package_managed_install_with_global_owners(
+    executable: &Path,
+    raw_context: &str,
+    global_manager: impl FnOnce(&PackageInstallContext) -> Option<String>,
+) -> Result<ManagedInstall, SelfUpdateError> {
+    let context: PackageInstallContext =
+        serde_json::from_str(raw_context).map_err(|_| SelfUpdateError::InstallOwnerUnknown)?;
+    if !matches!(context.manager.as_str(), "npm" | "pnpm" | "bun")
+        || !matches!(context.scope.as_str(), "local" | "global")
+        || !matches!(context.package_name.as_str(), "@microck/satelle" | "satelle")
+    {
+        return Err(SelfUpdateError::InstallOwnerUnknown);
+    }
+
+    let install_root = context
+        .install_root
+        .canonicalize()
+        .map_err(|_| SelfUpdateError::InstallOwnerUnknown)?;
+    let launcher_path = context
+        .launcher_path
+        .canonicalize()
+        .map_err(|_| SelfUpdateError::InstallOwnerUnknown)?;
+    let relative = executable
+        .strip_prefix(&install_root)
+        .map_err(|_| SelfUpdateError::InstallOwnerUnknown)?;
+    let relative_components = relative
+        .components()
+        .filter_map(|component| match component {
+            Component::Normal(value) => Some(value.to_string_lossy().to_ascii_lowercase()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    let launcher_relative = launcher_path
+        .strip_prefix(&install_root)
+        .map_err(|_| SelfUpdateError::InstallOwnerUnknown)?;
+    let root_is_node_modules = install_root
+        .file_name()
+        .map(|name| name.to_string_lossy().eq_ignore_ascii_case("node_modules"))
+        == Some(true);
+    if (context.scope == "local"
+        && (root_is_node_modules
+            || relative_components.first().map(String::as_str) != Some("node_modules")
+            || launcher_relative.components().next().and_then(|component| match component {
+                Component::Normal(value) => Some(value.to_string_lossy().to_ascii_lowercase()),
+                _ => None,
+            }).as_deref() != Some("node_modules")))
+        || (context.scope == "global" && !root_is_node_modules)
+    {
+        return Err(SelfUpdateError::InstallOwnerUnknown);
+    }
+
+    let target = LocalTarget::current().map_err(|_| SelfUpdateError::InstallOwnerUnknown)?;
+    let expected_suffix = [
+        "@microck",
+        target.npm_package_name(),
+        "bin",
+        target.executable_name(),
+    ];
+    if relative_components.len() < expected_suffix.len()
+        || !relative_components[relative_components.len() - expected_suffix.len()..]
+            .iter()
+            .zip(expected_suffix)
+            .all(|(actual, expected)| actual == expected)
+    {
+        return Err(SelfUpdateError::InstallOwnerUnknown);
+    }
+
+    validate_launcher_manifest(
+        &context,
+        &launcher_path,
+        target,
+        env!("CARGO_PKG_VERSION"),
+    )?;
+    let derived_manager = if context.scope == "local" {
+        local_manager(&install_root, &context.package_name)?
+    } else {
+        global_manager(&context).ok_or(SelfUpdateError::InstallOwnerUnknown)?
+    };
+    if derived_manager != context.manager {
+        return Err(SelfUpdateError::InstallOwnerUnknown);
+    }
+
+    Ok(managed_upgrade(context, install_root))
+}
+
+fn managed_upgrade(context: PackageInstallContext, install_root: PathBuf) -> ManagedInstall {
+    let mut upgrade_arguments = vec!["update".to_string()];
+    if context.scope == "global" {
+        upgrade_arguments.push("--global".to_string());
+    }
+    upgrade_arguments.push(context.package_name.clone());
+    if context.manager == "npm" {
+        upgrade_arguments.push("--include=optional".to_string());
+    }
+    let upgrade_program = context.manager.clone();
+    let upgrade_command = std::iter::once(upgrade_program.as_str())
+        .chain(upgrade_arguments.iter().map(String::as_str))
+        .collect::<Vec<_>>()
+        .join(" ");
+    ManagedInstall {
+        install_method: context.manager,
+        install_scope: Some(context.scope.clone()),
+        package_name: context.package_name,
+        install_root: Some(install_root.clone()),
+        upgrade_program,
+        upgrade_arguments,
+        upgrade_working_directory: (context.scope == "local").then_some(install_root),
+        upgrade_command,
+    }
+}
+
+#[derive(Deserialize)]
+struct PackageManifest {
+    name: String,
+    version: String,
+    #[serde(rename = "packageManager")]
+    package_manager: Option<String>,
+    #[serde(default)]
+    dependencies: std::collections::BTreeMap<String, String>,
+    #[serde(default, rename = "devDependencies")]
+    dev_dependencies: std::collections::BTreeMap<String, String>,
+    #[serde(default, rename = "optionalDependencies")]
+    optional_dependencies: std::collections::BTreeMap<String, String>,
+}
+
+fn read_package_manifest(path: &Path) -> Result<PackageManifest, SelfUpdateError> {
+    let bytes = fs::read(path).map_err(|_| SelfUpdateError::InstallOwnerUnknown)?;
+    if bytes.len() > 64 * 1024 {
+        return Err(SelfUpdateError::InstallOwnerUnknown);
+    }
+    serde_json::from_slice(&bytes).map_err(|_| SelfUpdateError::InstallOwnerUnknown)
+}
+
+fn validate_launcher_manifest(
+    context: &PackageInstallContext,
+    launcher_path: &Path,
+    target: LocalTarget,
+    current_version: &str,
+) -> Result<(), SelfUpdateError> {
+    if launcher_path.file_name().and_then(|name| name.to_str()) != Some("satelle.cjs")
+        || launcher_path.parent().and_then(Path::file_name).and_then(|name| name.to_str())
+            != Some("bin")
+    {
+        return Err(SelfUpdateError::InstallOwnerUnknown);
+    }
+    let package_root = launcher_path
+        .parent()
+        .and_then(Path::parent)
+        .ok_or(SelfUpdateError::InstallOwnerUnknown)?;
+    let install_root = context
+        .install_root
+        .canonicalize()
+        .map_err(|_| SelfUpdateError::InstallOwnerUnknown)?;
+    let package_components = package_root
+        .strip_prefix(&install_root)
+        .map_err(|_| SelfUpdateError::InstallOwnerUnknown)?
+        .components()
+        .filter_map(|component| match component {
+            Component::Normal(value) => Some(value.to_string_lossy().to_ascii_lowercase()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    let expected_package_suffix = if context.package_name == "satelle" {
+        &["satelle"][..]
+    } else {
+        &["@microck", "satelle"][..]
+    };
+    if package_components.len() < expected_package_suffix.len()
+        || !package_components[package_components.len() - expected_package_suffix.len()..]
+            .iter()
+            .zip(expected_package_suffix)
+            .all(|(actual, expected)| actual == *expected)
+    {
+        return Err(SelfUpdateError::InstallOwnerUnknown);
+    }
+    let manifest = read_package_manifest(&package_root.join("package.json"))?;
+    if manifest.name != context.package_name || manifest.version != current_version {
+        return Err(SelfUpdateError::InstallOwnerUnknown);
+    }
+    let dependency_matches = if context.package_name == "@microck/satelle" {
+        manifest
+            .optional_dependencies
+            .get(&format!("@microck/{}", target.npm_package_name()))
+            .map(String::as_str)
+            == Some(current_version)
+    } else {
+        manifest
+            .dependencies
+            .get("@microck/satelle")
+            .map(String::as_str)
+            == Some(current_version)
+    };
+    if !dependency_matches {
+        return Err(SelfUpdateError::InstallOwnerUnknown);
+    }
+    Ok(())
+}
+
+fn local_manager(install_root: &Path, package_name: &str) -> Result<String, SelfUpdateError> {
+    let manifest = read_package_manifest(&install_root.join("package.json"))?;
+    if !manifest.dependencies.contains_key(package_name)
+        && !manifest.dev_dependencies.contains_key(package_name)
+        && !manifest.optional_dependencies.contains_key(package_name)
+    {
+        return Err(SelfUpdateError::InstallOwnerUnknown);
+    }
+    let declared = manifest
+        .package_manager
+        .as_deref()
+        .and_then(|value| value.split('@').next())
+        .filter(|value| matches!(*value, "npm" | "pnpm" | "bun"));
+    let mut lock_owners = std::collections::BTreeSet::new();
+    for (manager, names) in [
+        ("npm", &["package-lock.json", "npm-shrinkwrap.json"][..]),
+        ("pnpm", &["pnpm-lock.yaml"][..]),
+        ("bun", &["bun.lock", "bun.lockb"][..]),
+    ] {
+        if names.iter().any(|name| install_root.join(name).is_file()) {
+            lock_owners.insert(manager);
+        }
+    }
+    match declared {
+        Some(manager) if lock_owners.iter().all(|owner| *owner == manager) => {
+            Ok(manager.to_string())
+        }
+        None if lock_owners.len() == 1 => Ok(lock_owners
+            .into_iter()
+            .next()
+            .expect("one lock owner")
+            .to_string()),
+        _ => Err(SelfUpdateError::InstallOwnerUnknown),
+    }
+}
+
+fn verified_global_manager(context: &PackageInstallContext) -> Option<String> {
+    let install_root = context.install_root.canonicalize().ok()?;
+    let launcher_path = context.launcher_path.canonicalize().ok()?;
+    let mut owners = Vec::new();
+    for manager in ["npm", "pnpm"] {
+        if let Some(root) = manager_command_line(manager, &["root", "--global"]) {
+            if Path::new(&root).canonicalize().ok().as_ref() == Some(&install_root) {
+                owners.push(manager.to_string());
+            }
+        }
+    }
+    if let Some(bin) = manager_command_line("bun", &["pm", "bin", "--global"]) {
+        let shim = Path::new(&bin).join(if cfg!(windows) {
+            "satelle.exe"
+        } else {
+            "satelle"
+        });
+        if shim.canonicalize().ok().as_ref() == Some(&launcher_path) {
+            owners.push("bun".to_string());
+        }
+    }
+    if owners.len() == 1 {
+        owners.pop()
+    } else {
+        None
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ManagerProbeError {
+    Spawn,
+    Wait,
+    Timeout,
+    OutputRead,
+    OutputLimit,
+    Failed,
+    InvalidOutput,
+}
+
+fn manager_command_line(program: &str, arguments: &[&str]) -> Option<String> {
+    manager_command_line_bounded(
+        program,
+        arguments,
+        Duration::from_secs(10),
+        64 * 1024,
+    )
+    .ok()
+}
+
+fn manager_command_line_bounded(
+    program: &str,
+    arguments: &[&str],
+    timeout: Duration,
+    output_limit: usize,
+) -> Result<String, ManagerProbeError> {
+    let mut stdout = tempfile::tempfile().map_err(|_| ManagerProbeError::OutputRead)?;
+    let child_stdout = stdout
+        .try_clone()
+        .map_err(|_| ManagerProbeError::OutputRead)?;
+    let mut child = Command::new(program)
+        .args(arguments)
+        .stdout(Stdio::from(child_stdout))
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|_| ManagerProbeError::Spawn)?;
+    let status = wait_bounded(&mut child, timeout).map_err(|error| match error {
+        SelfUpdateError::ProcessTimeout => ManagerProbeError::Timeout,
+        _ => ManagerProbeError::Wait,
+    })?;
+    if !status.success() {
+        return Err(ManagerProbeError::Failed);
+    }
+    stdout
+        .seek(SeekFrom::Start(0))
+        .map_err(|_| ManagerProbeError::OutputRead)?;
+    let read_limit = u64::try_from(output_limit)
+        .ok()
+        .and_then(|limit| limit.checked_add(1))
+        .ok_or(ManagerProbeError::OutputLimit)?;
+    let mut output = Vec::with_capacity(output_limit.min(8 * 1024));
+    stdout
+        .take(read_limit)
+        .read_to_end(&mut output)
+        .map_err(|_| ManagerProbeError::OutputRead)?;
+    if output.len() > output_limit {
+        return Err(ManagerProbeError::OutputLimit);
+    }
+    let output = String::from_utf8(output).map_err(|_| ManagerProbeError::InvalidOutput)?;
+    let mut lines = output.lines().map(str::trim).filter(|line| !line.is_empty());
+    let line = lines.next().ok_or(ManagerProbeError::InvalidOutput)?;
+    if lines.next().is_some() {
+        return Err(ManagerProbeError::InvalidOutput);
+    }
+    Ok(line.to_string())
 }
 
 fn receipt_path(executable: &Path) -> Result<PathBuf, SelfUpdateError> {
@@ -786,12 +1171,21 @@ fn run_gh_line(arguments: &[&str]) -> Result<String, SelfUpdateError> {
 fn wait_bounded(child: &mut Child, timeout: Duration) -> Result<ExitStatus, SelfUpdateError> {
     let deadline = Instant::now() + timeout;
     loop {
-        if let Some(status) = child.try_wait().map_err(SelfUpdateError::ProcessWait)? {
-            return Ok(status);
+        match child.try_wait() {
+            Ok(Some(status)) => return Ok(status),
+            Ok(None) => {}
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(SelfUpdateError::ProcessWait(error));
+            }
         }
         if Instant::now() >= deadline {
-            child.kill().map_err(SelfUpdateError::ProcessWait)?;
-            let _ = child.wait();
+            let kill_error = child.kill().err();
+            let wait_error = child.wait().err();
+            if let Some(error) = kill_error.or(wait_error) {
+                return Err(SelfUpdateError::ProcessWait(error));
+            }
             return Err(SelfUpdateError::ProcessTimeout);
         }
         thread::sleep(Duration::from_millis(25));
@@ -988,7 +1382,7 @@ fn digest_hex(digest: &[u8; 32]) -> String {
 pub(crate) enum SelfUpdateError {
     #[error("the running Satelle executable could not be identified")]
     CurrentExecutable(#[source] io::Error),
-    #[error("self update is managed by {0:?}")]
+    #[error("self update is managed by {0}")]
     ManagedInstall(ManagedInstall),
     #[error("the Satelle installation owner could not be established")]
     InstallOwnerUnknown,
@@ -1088,6 +1482,12 @@ impl SelfUpdateError {
         match self {
             Self::ManagedInstall(managed) => json!({
                 "install_method": managed.install_method,
+                "install_scope": managed.install_scope,
+                "package_name": managed.package_name,
+                "install_root": managed.install_root,
+                "upgrade_program": managed.upgrade_program,
+                "upgrade_arguments": managed.upgrade_arguments,
+                "working_directory": managed.upgrade_working_directory,
                 "upgrade_command": managed.upgrade_command,
             }),
             Self::ExplicitVersionRequired { current, candidate } => json!({
@@ -1114,7 +1514,10 @@ impl SelfUpdateError {
 
     pub(crate) fn recovery_command(&self) -> Option<String> {
         match self {
-            Self::ManagedInstall(managed) => Some(managed.upgrade_command.to_string()),
+            Self::ManagedInstall(managed) => managed
+                .upgrade_working_directory
+                .is_none()
+                .then(|| managed.upgrade_command.to_string()),
             Self::InstallOwnerUnknown | Self::ReceiptInvalid(_) | Self::ReceiptRead(_) => Some(
                 "reinstall Satelle with the verified install script or direct archive receipt"
                     .to_string(),
@@ -1284,22 +1687,356 @@ mod tests {
 
     #[test]
     fn package_manager_layouts_have_typed_owner_and_upgrade_commands() {
-        for (path, method, command) in [
-            (
-                "/home/user/project/node_modules/@microck/satelle-linux-x64-gnu/bin/satelle",
-                "npm",
-                "npm update @microck/satelle",
+        for (manager, scope, package_name) in [
+            ("npm", "local", "@microck/satelle"),
+            ("npm", "global", "@microck/satelle"),
+            ("pnpm", "local", "@microck/satelle"),
+            ("pnpm", "global", "@microck/satelle"),
+            ("bun", "local", "@microck/satelle"),
+            ("bun", "global", "satelle"),
+        ] {
+            let directory = tempdir().unwrap();
+            let install_root = if scope == "local" {
+                directory.path().to_path_buf()
+            } else {
+                let root = directory.path().join("node_modules");
+                fs::create_dir(&root).unwrap();
+                root
+            };
+            if scope == "local" {
+                let mut project_dependencies = serde_json::Map::new();
+                project_dependencies.insert(
+                    package_name.to_string(),
+                    json!(env!("CARGO_PKG_VERSION")),
+                );
+                let project_manifest = json!({
+                    "name": "consumer",
+                    "version": "1.0.0",
+                    "packageManager": format!("{manager}@1.0.0"),
+                    "dependencies": project_dependencies,
+                });
+                fs::write(
+                    install_root.join("package.json"),
+                    serde_json::to_vec(&project_manifest).unwrap(),
+                )
+                .unwrap();
+                let lockfile = match manager {
+                    "npm" => "package-lock.json",
+                    "pnpm" => "pnpm-lock.yaml",
+                    "bun" => "bun.lock",
+                    _ => unreachable!(),
+                };
+                fs::write(install_root.join(lockfile), b"fixture").unwrap();
+            }
+            let package_root = if scope == "local" {
+                install_root.join("node_modules")
+            } else {
+                install_root.clone()
+            }
+            .join(if package_name == "satelle" {
+                "satelle"
+            } else {
+                "@microck/satelle"
+            });
+            let launcher_path = package_root.join("bin/satelle.cjs");
+            fs::create_dir_all(launcher_path.parent().unwrap()).unwrap();
+            fs::write(&launcher_path, b"fixture").unwrap();
+            let target = LocalTarget::current().unwrap();
+            let launcher_manifest = if package_name == "satelle" {
+                json!({
+                    "name": "satelle",
+                    "version": env!("CARGO_PKG_VERSION"),
+                    "dependencies": {
+                        "@microck/satelle": env!("CARGO_PKG_VERSION"),
+                    },
+                })
+            } else {
+                let mut optional_dependencies = serde_json::Map::new();
+                optional_dependencies.insert(
+                    format!("@microck/{}", target.npm_package_name()),
+                    json!(env!("CARGO_PKG_VERSION")),
+                );
+                json!({
+                    "name": "@microck/satelle",
+                    "version": env!("CARGO_PKG_VERSION"),
+                    "optionalDependencies": optional_dependencies,
+                })
+            };
+            fs::write(
+                package_root.join("package.json"),
+                serde_json::to_vec(&launcher_manifest).unwrap(),
+            )
+            .unwrap();
+            let native_root = if scope == "local" {
+                install_root.join("node_modules")
+            } else {
+                install_root.clone()
+            }
+            .join("@microck")
+            .join(target.npm_package_name())
+            .join("bin");
+            fs::create_dir_all(&native_root).unwrap();
+            let executable = native_root.join(target.executable_name());
+            fs::write(&executable, b"fixture").unwrap();
+            let executable = executable.canonicalize().unwrap();
+            let context = json!({
+                "manager": manager,
+                "scope": scope,
+                "package_name": package_name,
+                "install_root": install_root,
+                "launcher_path": launcher_path,
+            });
+            let managed = package_managed_install_with_global_owners(
+                &executable,
+                &context.to_string(),
+                |_| (scope == "global").then(|| manager.to_string()),
+            )
+            .expect("managed install");
+            let command = match (manager, scope) {
+                ("npm", "local") => {
+                    "npm update @microck/satelle --include=optional".to_string()
+                }
+                ("npm", "global") => {
+                    "npm update --global @microck/satelle --include=optional".to_string()
+                }
+                ("pnpm", "local") => "pnpm update @microck/satelle".to_string(),
+                ("pnpm", "global") => {
+                    "pnpm update --global @microck/satelle".to_string()
+                }
+                ("bun", "local") => "bun update @microck/satelle".to_string(),
+                ("bun", "global") => "bun update --global satelle".to_string(),
+                _ => unreachable!(),
+            };
+            assert_eq!(managed.install_method, manager);
+            assert_eq!(managed.install_scope.as_deref(), Some(scope));
+            assert_eq!(managed.package_name, package_name);
+            assert_eq!(managed.upgrade_command, command);
+            assert_eq!(
+                managed.upgrade_working_directory.as_deref(),
+                (scope == "local").then_some(install_root.as_path())
+            );
+            let managed_error = SelfUpdateError::ManagedInstall(managed.clone());
+            assert_eq!(
+                managed_error.recovery_command(),
+                (scope == "global").then(|| command.clone())
+            );
+            if manager == "npm" && scope == "local" {
+                let mut false_manager = context.clone();
+                false_manager["manager"] = json!("pnpm");
+                assert!(matches!(
+                    package_managed_install_with_global_owners(
+                        &executable,
+                        &false_manager.to_string(),
+                        |_| None,
+                    ),
+                    Err(SelfUpdateError::InstallOwnerUnknown)
+                ));
+
+                let mut false_scope = context.clone();
+                false_scope["scope"] = json!("global");
+                assert!(matches!(
+                    package_managed_install_with_global_owners(
+                        &executable,
+                        &false_scope.to_string(),
+                        |_| Some("npm".to_string()),
+                    ),
+                    Err(SelfUpdateError::InstallOwnerUnknown)
+                ));
+
+                let mut false_package = context.clone();
+                false_package["package_name"] = json!("satelle");
+                assert!(matches!(
+                    package_managed_install_with_global_owners(
+                        &executable,
+                        &false_package.to_string(),
+                        |_| None,
+                    ),
+                    Err(SelfUpdateError::InstallOwnerUnknown)
+                ));
+
+                let wrong_target_package = if target.npm_package_name()
+                    == "satelle-darwin-arm64"
+                {
+                    "satelle-linux-x64-gnu"
+                } else {
+                    "satelle-darwin-arm64"
+                };
+                let wrong_target_root = install_root
+                    .join("node_modules/@microck")
+                    .join(wrong_target_package)
+                    .join("bin");
+                fs::create_dir_all(&wrong_target_root).unwrap();
+                let wrong_target = wrong_target_root.join(target.executable_name());
+                fs::write(&wrong_target, b"fixture").unwrap();
+                assert!(matches!(
+                    package_managed_install_with_global_owners(
+                        &wrong_target.canonicalize().unwrap(),
+                        &context.to_string(),
+                        |_| None,
+                    ),
+                    Err(SelfUpdateError::InstallOwnerUnknown)
+                ));
+
+                let nonterminal_root = native_root.join(target.executable_name());
+                fs::create_dir_all(&nonterminal_root).unwrap();
+                let nonterminal = nonterminal_root.join("extra");
+                fs::write(&nonterminal, b"fixture").unwrap();
+                assert!(matches!(
+                    package_managed_install_with_global_owners(
+                        &nonterminal.canonicalize().unwrap(),
+                        &context.to_string(),
+                        |_| None,
+                    ),
+                    Err(SelfUpdateError::InstallOwnerUnknown)
+                ));
+
+                let direct = directory.path().join("satelle-direct");
+                fs::write(&direct, b"fixture").unwrap();
+                assert!(matches!(
+                    package_managed_install_with_global_owners(
+                        &direct.canonicalize().unwrap(),
+                        &context.to_string(),
+                        |_| None,
+                    ),
+                    Err(SelfUpdateError::InstallOwnerUnknown)
+                ));
+            }
+            let error = SelfUpdateError::ManagedInstall(managed);
+            assert_eq!(error.code(), "self-update-managed-install");
+            assert_eq!(error.details()["install_method"], manager);
+            assert_eq!(error.details()["upgrade_command"], command);
+        }
+    }
+
+    #[test]
+    fn local_upgrade_paths_are_structured_and_never_interpolated() {
+        for install_root in [
+            PathBuf::from("/tmp/satelle root/$(touch injected)"),
+            PathBuf::from(r"C:\Users\Operator Name\Satelle & calc.exe"),
+        ] {
+            let context = PackageInstallContext {
+                manager: "npm".to_string(),
+                scope: "local".to_string(),
+                package_name: "@microck/satelle".to_string(),
+                install_root: install_root.clone(),
+                launcher_path: install_root.join("node_modules/@microck/satelle/bin/satelle.cjs"),
+            };
+            let managed = managed_upgrade(context, install_root.clone());
+            assert_eq!(
+                managed.upgrade_command,
+                "npm update @microck/satelle --include=optional"
+            );
+            assert!(!managed.upgrade_command.contains(&install_root.to_string_lossy()[..]));
+            assert_eq!(
+                managed.upgrade_working_directory.as_deref(),
+                Some(install_root.as_path())
+            );
+            let error = SelfUpdateError::ManagedInstall(managed);
+            assert_eq!(error.recovery_command(), None);
+            assert_eq!(error.details()["working_directory"], json!(install_root));
+            assert!(error.to_string().contains(" from `"));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn manager_probe_enforces_timeout_and_stdout_limit() {
+        assert_eq!(
+            manager_command_line_bounded(
+                "sh",
+                &["-c", "sleep 1; printf late"],
+                Duration::from_millis(10),
+                64 * 1024,
             ),
-            (
-                "/home/user/project/node_modules/.pnpm/@microck+satelle/bin/satelle",
-                "pnpm",
-                "pnpm update @microck/satelle",
+            Err(ManagerProbeError::Timeout)
+        );
+        assert_eq!(
+            manager_command_line_bounded(
+                "sh",
+                &["-c", "printf 12345678"],
+                Duration::from_secs(1),
+                8,
             ),
-            (
-                "/home/user/.bun/install/cache/node_modules/@microck/satelle/bin/satelle",
-                "bun",
-                "bun update @microck/satelle",
+            Ok("12345678".to_string())
+        );
+        assert_eq!(
+            manager_command_line_bounded(
+                "sh",
+                &["-c", "printf 123456789"],
+                Duration::from_secs(1),
+                8,
             ),
+            Err(ManagerProbeError::OutputLimit)
+        );
+        let started = Instant::now();
+        assert_eq!(
+            manager_command_line_bounded(
+                "sh",
+                &["-c", "(sleep 1; printf descendant) & sleep 1"],
+                Duration::from_millis(250),
+                64,
+            ),
+            Err(ManagerProbeError::Timeout)
+        );
+        assert!(started.elapsed() >= Duration::from_millis(200));
+        assert!(started.elapsed() < Duration::from_millis(750));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn manager_probe_enforces_timeout_and_stdout_limit() {
+        assert_eq!(
+            manager_command_line_bounded(
+                "powershell",
+                &[
+                    "-NoProfile",
+                    "-Command",
+                    "Start-Sleep -Milliseconds 500; Write-Output late",
+                ],
+                Duration::from_millis(10),
+                64 * 1024,
+            ),
+            Err(ManagerProbeError::Timeout)
+        );
+        assert_eq!(
+            manager_command_line_bounded(
+                "powershell",
+                &["-NoProfile", "-Command", "[Console]::Write('12345678')"],
+                Duration::from_secs(1),
+                8,
+            ),
+            Ok("12345678".to_string())
+        );
+        assert_eq!(
+            manager_command_line_bounded(
+                "powershell",
+                &["-NoProfile", "-Command", "[Console]::Write('123456789')"],
+                Duration::from_secs(1),
+                8,
+            ),
+            Err(ManagerProbeError::OutputLimit)
+        );
+        let started = Instant::now();
+        assert_eq!(
+            manager_command_line_bounded(
+                "powershell",
+                &[
+                    "-NoProfile",
+                    "-Command",
+                    "Start-Process powershell -NoNewWindow -ArgumentList '-NoProfile','-Command','Start-Sleep -Seconds 1; [Console]::Write(''descendant'')'; Start-Sleep -Seconds 1",
+                ],
+                Duration::from_millis(250),
+                64,
+            ),
+            Err(ManagerProbeError::Timeout)
+        );
+        assert!(started.elapsed() >= Duration::from_millis(200));
+        assert!(started.elapsed() < Duration::from_millis(750));
+    }
+
+    #[test]
+    fn homebrew_and_scoop_layouts_keep_typed_upgrade_guidance() {
+        for (path, manager, command) in [
             (
                 "/opt/homebrew/Cellar/satelle/0.1.0/bin/satelle",
                 "homebrew",
@@ -1311,14 +2048,43 @@ mod tests {
                 "scoop update satelle",
             ),
         ] {
-            let managed = detect_managed_install(Path::new(path)).expect("managed layout");
-            assert_eq!(managed.install_method, method);
+            let managed = detect_managed_install(Path::new(path))
+                .unwrap()
+                .expect("managed install");
+            assert_eq!(managed.install_method, manager);
             assert_eq!(managed.upgrade_command, command);
-            let error = SelfUpdateError::ManagedInstall(managed);
-            assert_eq!(error.code(), "self-update-managed-install");
-            assert_eq!(error.details()["install_method"], method);
-            assert_eq!(error.details()["upgrade_command"], command);
         }
+    }
+
+    #[test]
+    fn package_manager_context_fails_closed_when_missing_or_spoofed() {
+        let directory = tempdir().unwrap();
+        let native_root = directory
+            .path()
+            .join("node_modules/@microck/satelle-linux-x64-gnu/bin");
+        fs::create_dir_all(&native_root).unwrap();
+        let executable = native_root.join(if cfg!(windows) {
+            "satelle.exe"
+        } else {
+            "satelle"
+        });
+        fs::write(&executable, b"fixture").unwrap();
+        let executable = executable.canonicalize().unwrap();
+
+        assert!(matches!(
+            package_managed_install(&executable, "{}"),
+            Err(SelfUpdateError::InstallOwnerUnknown)
+        ));
+        let spoofed = json!({
+            "manager": "npm",
+            "scope": "local",
+            "package_name": "@microck/satelle",
+            "install_root": directory.path().join("other"),
+        });
+        assert!(matches!(
+            package_managed_install(&executable, &spoofed.to_string()),
+            Err(SelfUpdateError::InstallOwnerUnknown)
+        ));
     }
 
     #[test]
