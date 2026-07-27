@@ -65,6 +65,7 @@ use satelle_core::doctor::{
     DoctorProbeLifecycleEvent, DoctorProbeResource, DoctorProbeScheduleEvent, DoctorProbeScheduler,
     DoctorProbeState, DoctorProbeStatus, DoctorScope, DoctorScopeSelection,
 };
+use satelle_core::daemon_service::DaemonResolvedPathSet;
 use satelle_core::session::{PublicSession, TurnAdmissionFailure};
 use satelle_core::{
     DaemonPathOverrides, DoctorFinding, DoctorFixability, DoctorOptions, DoctorProbeResult,
@@ -73,7 +74,6 @@ use satelle_core::{
     SessionId, SetupReadinessSummary, SetupReport, SetupSchemaVersion, StopResult, TurnId,
     object_value, utc_now,
 };
-use satelle_core::daemon_service::DaemonResolvedPathSet;
 pub use satelle_core::{
     ProviderBindingAuthorization, ProviderBindingSource, ProviderDescriptorValidation,
     ProviderSecretProvisioningPreview, ProviderSecretProvisioningResult,
