@@ -1996,10 +1996,7 @@ impl HostService {
     ) -> Result<ProviderSecretProvisioningResult, SatelleError> {
         // Exact-idempotency replay and retained recovery ownership must be
         // classified before native readiness can attempt a competing lease.
-        if let Some(result) = self
-            .runtime
-            .provider_secret_provisioning_replay(identity)?
-        {
+        if let Some(result) = self.runtime.provider_secret_provisioning_replay(identity)? {
             return Ok(result);
         }
         let model_alias = authorization.requested_model_alias().to_string();

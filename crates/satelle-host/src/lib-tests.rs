@@ -572,9 +572,7 @@ fn provider_intent_with_missing_descriptor() -> ProviderComputerUseIntent {
     )
 }
 
-fn provider_descriptor_config(
-    auth_source: Option<String>,
-) -> satelle_core::HostConfig {
+fn provider_descriptor_config(auth_source: Option<String>) -> satelle_core::HostConfig {
     let mut config = satelle_core::SatelleConfig::defaults().hosts[LOCAL_DEMO_HOST].clone();
     config.provider_bindings.insert(
         "openai".to_string(),
@@ -932,10 +930,7 @@ fn failed_staged_rollback_retains_pending_journal_and_active_lease() {
         provider_probe_calls.load(std::sync::atomic::Ordering::SeqCst),
         1,
     );
-    assert_eq!(
-        tamper_calls.load(std::sync::atomic::Ordering::SeqCst),
-        1,
-    );
+    assert_eq!(tamper_calls.load(std::sync::atomic::Ordering::SeqCst), 1,);
 
     let connection = rusqlite::Connection::open(state.path().join("satelle.sqlite3"))
         .expect("open Host SQLite state");
@@ -974,10 +969,7 @@ fn failed_staged_rollback_retains_pending_journal_and_active_lease() {
         provider_probe_calls.load(std::sync::atomic::Ordering::SeqCst),
         1,
     );
-    assert_eq!(
-        tamper_calls.load(std::sync::atomic::Ordering::SeqCst),
-        1,
-    );
+    assert_eq!(tamper_calls.load(std::sync::atomic::Ordering::SeqCst), 1,);
     let retry_retained_state: (String, String) = connection
         .query_row(
             "SELECT journal.phase, lease.lease_state

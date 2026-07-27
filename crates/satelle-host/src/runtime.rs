@@ -46,9 +46,8 @@ use crate::storage::{
     OperatorLogMirror, OperatorLogPolicy, ProviderBindingAuthorizationReplay,
     ProviderBindingDeletionReplay, ProviderSecretProvisioningPhase, ProviderSecretProvisioningPlan,
     ProviderSecretProvisioningPreflight, ProviderSecretProvisioningReplay, ReadinessProbeKind,
-    ReadinessProbeTerminal,
-    SensitiveRequestDigest, SetupActionSkipReason, SetupRepairPlan, SetupRepairProbe, SetupRunPlan,
-    SetupRunRecord, SetupRunStatus, Storage, StorageSnapshot,
+    ReadinessProbeTerminal, SensitiveRequestDigest, SetupActionSkipReason, SetupRepairPlan,
+    SetupRepairProbe, SetupRunPlan, SetupRunRecord, SetupRunStatus, Storage, StorageSnapshot,
 };
 use crate::{ApiBearerToken, ApiPrincipal, DaemonLogPage, LogCursor, LogPageQuery};
 use recovery::RecoveryQueue;
@@ -2956,9 +2955,7 @@ impl RuntimeHandle {
             .map_err(model::storage_failure)?
         {
             ProviderSecretProvisioningPreflight::Absent => Ok(None),
-            ProviderSecretProvisioningPreflight::InProgress => {
-                Err(SatelleError::state_conflict())
-            }
+            ProviderSecretProvisioningPreflight::InProgress => Err(SatelleError::state_conflict()),
             ProviderSecretProvisioningPreflight::Replay(
                 ProviderSecretProvisioningReplay::Completed(result),
             ) => Ok(Some(result)),
