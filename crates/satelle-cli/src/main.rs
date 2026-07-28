@@ -3080,29 +3080,27 @@ fn run_setup(
                     }
                     provider_auth_validation = validation;
                 }
-
-                if provider_secret_setup_completed || provider_auth_validation.is_some() {
-                    if let Some((auth_source_name, descriptor)) = &pending_provider_auth
-                        && let Err(error) = persist_provider_auth_descriptor(
-                            &user_config_path,
-                            &host.alias,
-                            auth_source_name,
-                            descriptor,
-                        )
-                    {
-                        return Err(failure(error));
-                    }
-                    if let Some((auth_source_name, descriptor)) = &pending_provider_auth {
-                        host.config
-                            .provider_auth
-                            .insert(auth_source_name.clone(), descriptor.clone());
-                        persisted_provider_auth_action = Some(format!(
-                            "saved provider authentication descriptor reference '{auth_source_name}' for Host '{}'",
-                            host.alias
-                        ));
-                    }
-                }
             }
+        }
+
+        if (provider_secret_setup_completed || provider_auth_validation.is_some())
+            && let Some((auth_source_name, descriptor)) = &pending_provider_auth
+        {
+            if let Err(error) = persist_provider_auth_descriptor(
+                &user_config_path,
+                &host.alias,
+                auth_source_name,
+                descriptor,
+            ) {
+                return Err(failure(error));
+            }
+            host.config
+                .provider_auth
+                .insert(auth_source_name.clone(), descriptor.clone());
+            persisted_provider_auth_action = Some(format!(
+                "saved provider authentication descriptor reference '{auth_source_name}' for Host '{}'",
+                host.alias
+            ));
         }
 
         report.setup_components.clone_from(&setup_components);

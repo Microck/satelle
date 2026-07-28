@@ -7471,6 +7471,7 @@ fn run_provider_secret_setup_in_pty(
     profile: Option<&str>,
     yes: bool,
     components: &[&str],
+    initial_input: Option<&str>,
     decision: ProviderSecretPtyDecision<'_>,
 ) -> (std::process::Output, usize, Option<usize>) {
     let executable = assert_cmd::cargo::cargo_bin!("satelle");
@@ -7539,6 +7540,9 @@ fn run_provider_secret_setup_in_pty(
         stderr_reader,
     };
 
+    if let Some(initial_input) = initial_input {
+        process.write_input(initial_input);
+    }
     let preview_end = process.wait_for_after("Provider secret overwrite behavior:", 0);
     let secret_prompt_end = process.wait_for_after("Provider secret", preview_end);
     let (secret, accepted) = match decision {
@@ -7642,6 +7646,7 @@ command_families = ["setup"]
             profile,
             yes,
             &["provider-auth"],
+            None,
             decision,
         );
         if accepted {
@@ -7739,6 +7744,82 @@ command_families = ["setup"]
 
 #[cfg(target_os = "linux")]
 #[test]
+fn interactive_missing_file_descriptor_provisioning_persists_reconstructible_config() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let state = state_dir();
+    let user_config = state.path().join("user-config.toml");
+    let destinations = tempfile::tempdir().expect("create external secret destination");
+    fs::set_permissions(destinations.path(), fs::Permissions::from_mode(0o700))
+        .expect("make provider secret destination owner-only");
+    let destination = destinations.path().join("selected-provider-secret");
+    let secret = "MISSING_DESCRIPTOR_PROVIDER_SECRET_CANARY";
+    write_user_config(
+        &user_config,
+        r#"
+default_host = "selected"
+model_alias = "review"
+provider_alias = "openai"
+
+[hosts.selected]
+transport = "local"
+adapter = "fake"
+
+[hosts.selected.provider_bindings.openai.review]
+model = "gpt-5.2"
+model_provider = "openai"
+auth_source = "operator-auth"
+"#,
+    )
+    .expect("write provider binding with missing descriptor");
+    let descriptor_input = format!("\u{1b}[B\n{}\n", destination.display());
+
+    let (output, confirmation_end, secret_prompt_end) = run_provider_secret_setup_in_pty(
+        &user_config,
+        state.path(),
+        None,
+        true,
+        &["provider-auth"],
+        Some(&descriptor_input),
+        ProviderSecretPtyDecision::Accept(secret),
+    );
+    let rendered = combined_process_output(&output);
+    assert!(
+        output.status.success(),
+        "missing descriptor setup failed: {}",
+        rendered.replace(secret, "<redacted>")
+    );
+    assert!(secret_prompt_end.is_some_and(|end| end < confirmation_end));
+    assert_privacy_canaries_absent(
+        "missing descriptor setup output",
+        rendered.as_bytes(),
+        &[secret],
+    );
+    assert_eq!(
+        fs::read_to_string(&destination).expect("read provisioned provider secret"),
+        secret
+    );
+
+    let persisted_text = fs::read_to_string(&user_config).expect("read reconstructed user config");
+    assert!(!persisted_text.contains(secret));
+    let persisted =
+        toml::from_str::<toml::Value>(&persisted_text).expect("reconstructed config is TOML");
+    let descriptor = &persisted["hosts"]["selected"]["provider_auth"]["operator-auth"];
+    assert_eq!(descriptor["kind"].as_str(), Some("file"));
+    assert_eq!(
+        descriptor["path"].as_str(),
+        Some(destination.to_string_lossy().as_ref())
+    );
+    satelle()
+        .env("SATELLE_CONFIG_FILE", &user_config)
+        .env("SATELLE_STATE_DIR", state.path())
+        .args(["config", "check", "--json"])
+        .assert()
+        .success();
+}
+
+#[cfg(target_os = "linux")]
+#[test]
 fn combined_native_and_file_provider_setup_retains_both_applied_results() {
     use std::os::unix::fs::PermissionsExt;
 
@@ -7781,6 +7862,7 @@ auth_source = "operator-auth"
         None,
         true,
         &["codex", "provider-auth"],
+        None,
         ProviderSecretPtyDecision::Accept(secret),
     );
     let rendered = combined_process_output(&output);
