@@ -922,6 +922,17 @@ impl Storage {
         transaction.commit().map_err(operation_failed)
     }
 
+    /// Removes only the affected native readiness tuple for this daemon
+    /// identity. Provider smoke evidence and unrelated native tuples have
+    /// separate lifecycles and are intentionally preserved.
+    pub(crate) fn invalidate_native_readiness(
+        &mut self,
+        key: &ReadinessCacheKey,
+    ) -> Result<u64, StorageError> {
+        let host_identity = self.host_identity()?;
+        invalidate_native_readiness_for_key(&self.connection, host_identity.as_str(), key)
+    }
+
     pub(crate) fn store_preflight_failure(
         &mut self,
         key: &ReadinessCacheKey,
@@ -1232,6 +1243,43 @@ impl Storage {
     }
 }
 
+pub(super) fn invalidate_native_readiness_for_key(
+    connection: &rusqlite::Connection,
+    host_identity_ref: &str,
+    key: &ReadinessCacheKey,
+) -> Result<u64, StorageError> {
+    let deleted = connection
+        .execute(
+            "DELETE FROM native_readiness_results
+             WHERE host_identity_ref = ?1
+               AND desktop_binding_ref = ?2
+               AND desktop_session_ref = ?3
+               AND adapter_ref = ?4
+               AND codex_version = ?5
+               AND native_runtime_version = ?6
+               AND plugin_version IS ?7
+               AND os_permission_state = ?8
+               AND os_permission_fingerprint = ?9
+               AND app_approval_state = ?10
+               AND app_approval_fingerprint = ?11",
+            params![
+                host_identity_ref,
+                key.desktop_binding().as_str(),
+                key.desktop_session_ref(),
+                key.adapter(),
+                key.codex_version(),
+                key.native_runtime_version(),
+                key.plugin_version(),
+                key.os_permission_state().as_str(),
+                key.os_permission_fingerprint(),
+                key.app_approval_state().as_str(),
+                key.app_approval_fingerprint(),
+            ],
+        )
+        .map_err(operation_failed)?;
+    u64::try_from(deleted).map_err(|_| StorageError::new(StorageErrorKind::InvalidStoredState))
+}
+
 fn insert_readiness(
     connection: &rusqlite::Connection,
     host_identity: &str,
@@ -1287,6 +1335,35 @@ fn insert_readiness(
         )
         .map_err(operation_failed)
         .and_then(require_idempotent_write)
+}
+
+pub(super) fn insert_provider_provisioning_success(
+    transaction: &rusqlite::Transaction<'_>,
+    host_identity: &str,
+    key: &ReadinessCacheKey,
+    readiness: &ReadinessEvidence,
+    provider: Option<&ProviderSmokeEvidence>,
+) -> Result<(), StorageError> {
+    insert_readiness(
+        transaction,
+        host_identity,
+        key.adapter(),
+        key.desktop_binding(),
+        readiness,
+        "passed",
+        None,
+    )?;
+    if let Some(provider) = provider {
+        insert_provider_smoke(
+            transaction,
+            host_identity,
+            key.desktop_binding(),
+            key.execution_policy(),
+            readiness,
+            ProviderSmokeInsert::Passed(provider),
+        )?;
+    }
+    Ok(())
 }
 
 enum ProviderSmokeInsert<'a> {

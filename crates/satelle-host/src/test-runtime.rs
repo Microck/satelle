@@ -3,9 +3,12 @@ mod diagnostics;
 
 use crate::HostService;
 use crate::runtime::{
-    AdapterReadiness, AdapterSubject, ComputerUseAdapter, ExecuteRequest, ExecuteResult,
-    ProviderSmokeEvidence, ProviderSmokeSource, RecoveryObservation,
+    AdapterPreflight, AdapterReadiness, AdapterSubject, ComputerUseAdapter, ExecuteRequest,
+    ExecuteResult, NativeProbeResult, ProviderSmokeEvidence, ProviderSmokeResult,
+    ProviderSmokeSource, ReadinessCacheKey, ReadinessEvidence, ReadinessProbeDriver,
+    RecoveryObservation,
 };
+use crate::storage::ProbeRecoverySubject;
 use satelle_core::session::{
     ApprovalPolicy, DesktopBindingRef, DesktopTarget, EffectiveModelRef, ExecutionPolicy,
     ExperimentalFeatureChoices, FeatureChoice, ProviderBindingRef, SandboxPolicy, StopObservation,
@@ -68,6 +71,89 @@ impl HostService {
 #[derive(Clone, Debug)]
 pub(super) struct FakeComputerUseAdapter;
 
+impl FakeComputerUseAdapter {
+    pub(super) fn readiness_contract()
+    -> Result<(DesktopBindingRef, ExecutionPolicy, crate::ReadinessCacheKey), SatelleError> {
+        Self::readiness_contract_with_provider_feature(FeatureChoice::Enabled)
+    }
+
+    fn readiness_contract_with_provider_feature(
+        provider_computer_use: FeatureChoice,
+    ) -> Result<(DesktopBindingRef, ExecutionPolicy, crate::ReadinessCacheKey), SatelleError> {
+        let desktop_binding = DesktopBindingRef::new("local-demo-desktop-v1")
+            .map_err(|_| adapter_configuration_error("desktop binding"))?;
+        let execution_policy = ExecutionPolicy::new(
+            EffectiveModelRef::new("fake-model-v1")
+                .map_err(|_| adapter_configuration_error("model binding"))?,
+            ProviderBindingRef::new("fake-provider-v1")
+                .map_err(|_| adapter_configuration_error("provider binding"))?,
+            DesktopTarget::new(desktop_binding.clone(), "local-demo-session-v1"),
+            ApprovalPolicy::OnRequest,
+            SandboxPolicy::WorkspaceWrite,
+            TimeoutPolicy::bounded_seconds(30 * 60)
+                .map_err(|_| adapter_configuration_error("timeout policy"))?,
+            ExperimentalFeatureChoices::new(FeatureChoice::Enabled, provider_computer_use),
+        );
+        let key = crate::ReadinessCacheKey::new(
+            "fake",
+            desktop_binding.clone(),
+            execution_policy.clone(),
+            "fake-codex-v1",
+            "fake-native-runtime-v1",
+            Some("fake-plugin-v1"),
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            crate::ReadinessObservationState::Unknown,
+            crate::ReadinessObservationState::Unknown,
+        )
+        .map_err(|_| adapter_configuration_error("readiness cache key"))?;
+        Ok((desktop_binding, execution_policy, key))
+    }
+}
+
+impl ReadinessProbeDriver for FakeComputerUseAdapter {
+    fn run_native_probe(
+        &self,
+        key: &ReadinessCacheKey,
+        _cancellation: &crate::runtime::AdmissionCancellation,
+        _persist_thread_ref: &mut dyn FnMut(&str) -> Result<(), ()>,
+        _persist_turn_ref: &mut dyn FnMut(&str) -> Result<(), ()>,
+    ) -> NativeProbeResult {
+        let observed_at = OffsetDateTime::now_utc();
+        match key.evidence(
+            format!("native-probe-{}", satelle_core::SessionId::new()),
+            observed_at,
+            observed_at + time::Duration::minutes(5),
+        ) {
+            Ok(evidence) => NativeProbeResult::Passed(evidence),
+            Err(_) => NativeProbeResult::UncachedFailure(adapter_configuration_error(
+                "readiness evidence",
+            )),
+        }
+    }
+
+    fn preflight_terminal_with_provider_probe(
+        &self,
+        host: &str,
+        _cached: Option<ReadinessEvidence>,
+        _cached_provider: Option<ProviderSmokeResult>,
+        provider_intent: &crate::ProviderComputerUseIntent,
+        _provider_secret: Option<crate::provider_auth::ResolvedProviderSecret>,
+        _cancellation: &crate::runtime::AdmissionCancellation,
+        _persist_thread_ref: &mut dyn FnMut(&str) -> Result<(), ()>,
+        _persist_turn_ref: &mut dyn FnMut(&str) -> Result<(), ()>,
+    ) -> AdapterPreflight {
+        match self.preflight(host, provider_intent) {
+            Ok(readiness) => AdapterPreflight::Ready(readiness),
+            Err(error) => AdapterPreflight::UncachedFailure(error),
+        }
+    }
+
+    fn observe_readiness_probe(&self, _subject: &ProbeRecoverySubject) -> RecoveryObservation {
+        RecoveryObservation::Completed
+    }
+}
+
 #[cfg(feature = "test-support")]
 #[derive(Clone, Debug)]
 pub(super) struct PendingComputerUseAdapter;
@@ -75,6 +161,36 @@ pub(super) struct PendingComputerUseAdapter;
 #[cfg(feature = "test-support")]
 #[derive(Clone, Debug)]
 pub(super) struct FailingComputerUseAdapter;
+
+#[cfg(feature = "test-support")]
+#[derive(Clone, Debug)]
+pub(super) struct ReadinessFailingComputerUseAdapter;
+
+#[cfg(feature = "test-support")]
+impl ComputerUseAdapter for ReadinessFailingComputerUseAdapter {
+    fn preflight(
+        &self,
+        _host: &str,
+        _provider_intent: &crate::ProviderComputerUseIntent,
+    ) -> Result<AdapterReadiness, SatelleError> {
+        Err(SatelleError::computer_use_not_ready())
+    }
+
+    fn execute(&self, request: ExecuteRequest<'_>) -> Result<ExecuteResult, SatelleError> {
+        FakeComputerUseAdapter.execute(request)
+    }
+
+    fn observe_stop(&self, subject: AdapterSubject<'_>) -> Result<StopObservation, SatelleError> {
+        FakeComputerUseAdapter.observe_stop(subject)
+    }
+
+    fn observe_recovery(
+        &self,
+        subject: AdapterSubject<'_>,
+    ) -> Result<RecoveryObservation, SatelleError> {
+        FakeComputerUseAdapter.observe_recovery(subject)
+    }
+}
 
 #[cfg(feature = "test-support")]
 impl ComputerUseAdapter for FailingComputerUseAdapter {
@@ -155,39 +271,30 @@ impl ComputerUseAdapter for FakeComputerUseAdapter {
         Ok(binding)
     }
 
+    fn readiness_cache_key(
+        &self,
+        _host: &str,
+        provider_intent: &crate::ProviderComputerUseIntent,
+    ) -> Result<Option<crate::ReadinessCacheKey>, SatelleError> {
+        if !provider_intent.refresh() && provider_intent.resolved_provider_binding().is_none() {
+            return Ok(None);
+        }
+        let key = Self::readiness_contract()?.2;
+        Ok(Some(match provider_intent.resolved_provider_binding() {
+            Some(binding) => key.with_provider_binding(binding),
+            None => key,
+        }))
+    }
+
     fn preflight(
         &self,
         host: &str,
         provider_intent: &crate::ProviderComputerUseIntent,
     ) -> Result<AdapterReadiness, SatelleError> {
-        let desktop_binding = DesktopBindingRef::new("local-demo-desktop-v1")
-            .map_err(|_| adapter_configuration_error("desktop binding"))?;
-        let execution_policy = ExecutionPolicy::new(
-            EffectiveModelRef::new("fake-model-v1")
-                .map_err(|_| adapter_configuration_error("model binding"))?,
-            ProviderBindingRef::new("fake-provider-v1")
-                .map_err(|_| adapter_configuration_error("provider binding"))?,
-            DesktopTarget::new(desktop_binding.clone(), "local-demo-session-v1"),
-            ApprovalPolicy::OnRequest,
-            SandboxPolicy::WorkspaceWrite,
-            TimeoutPolicy::bounded_seconds(30 * 60)
-                .map_err(|_| adapter_configuration_error("timeout policy"))?,
-            ExperimentalFeatureChoices::new(FeatureChoice::Enabled, FeatureChoice::Enabled),
-        );
+        let (desktop_binding, execution_policy, readiness_key) = Self::readiness_contract()?;
+        let resolved_binding = self.resolve_provider_binding(host, provider_intent)?;
+        let readiness_key = readiness_key.with_provider_binding(&resolved_binding);
         let observed_at = time::OffsetDateTime::now_utc();
-        let readiness_key = crate::ReadinessCacheKey::new(
-            "fake",
-            desktop_binding.clone(),
-            execution_policy.clone(),
-            "fake-codex-v1",
-            "fake-native-runtime-v1",
-            Some("fake-plugin-v1"),
-            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
-            crate::ReadinessObservationState::Unknown,
-            crate::ReadinessObservationState::Unknown,
-        )
-        .map_err(|_| adapter_configuration_error("readiness cache key"))?;
         let evidence = readiness_key
             .evidence(
                 format!("readiness-{}", satelle_core::SessionId::new()),
@@ -195,27 +302,28 @@ impl ComputerUseAdapter for FakeComputerUseAdapter {
                 observed_at + time::Duration::minutes(5),
             )
             .map_err(|_| adapter_configuration_error("readiness evidence"))?;
-        let provider_evidence = ProviderSmokeEvidence::new(
-            format!("provider-smoke-{}", satelle_core::SessionId::new()),
-            "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
-            "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
-            observed_at,
-            observed_at + time::Duration::hours(24),
-        )
-        .map_err(|_| adapter_configuration_error("provider smoke evidence"))?
-        .with_source(if provider_intent.refresh() {
-            ProviderSmokeSource::Refresh
-        } else {
-            ProviderSmokeSource::Live
-        });
-        let resolved_binding = self.resolve_provider_binding(host, provider_intent)?;
+        let provider_evidence = Some(
+            ProviderSmokeEvidence::new(
+                format!("provider-smoke-{}", satelle_core::SessionId::new()),
+                readiness_key.provider_config_fingerprint(),
+                "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+                observed_at,
+                observed_at + time::Duration::hours(24),
+            )
+            .map_err(|_| adapter_configuration_error("provider smoke evidence"))?
+            .with_source(if provider_intent.refresh() {
+                ProviderSmokeSource::Refresh
+            } else {
+                ProviderSmokeSource::Live
+            }),
+        );
         AdapterReadiness::ready(
             "fake",
             "fake native computer-use adapter is ready for local demo",
             desktop_binding,
             execution_policy,
             evidence,
-            Some(provider_evidence),
+            provider_evidence,
             Some(resolved_binding),
         )
         .map_err(|_| adapter_configuration_error("preflight evidence policy"))

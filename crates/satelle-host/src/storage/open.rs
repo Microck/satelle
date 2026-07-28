@@ -44,7 +44,7 @@ pub(super) const PROTECTED_FILE_NAMES: [&str; 5] = [
 ];
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 const BACKUP_FORMAT_VERSION: u32 = 1;
-const MIGRATIONS: [Migration; 12] = [
+const MIGRATIONS: [Migration; 13] = [
     Migration {
         version: 1,
         sql: include_str!("0001_initial.sql"),
@@ -114,6 +114,12 @@ const MIGRATIONS: [Migration; 12] = [
     Migration {
         version: 12,
         sql: include_str!("0012_provider_descriptor_validation_replay.sql"),
+        seeds_sensitive_state: false,
+        irreversible: false,
+    },
+    Migration {
+        version: 13,
+        sql: include_str!("0013_provider_secret_provisioning.sql"),
         seeds_sensitive_state: false,
         irreversible: false,
     },
@@ -224,6 +230,8 @@ enum ActivationStep {
     CandidateValidated,
     StagedValidated,
     RecoveryStateDurable,
+    SidecarRenamedBeforeSync(usize),
+    SidecarMovedDurably(usize),
     SidecarsMovedDurably,
     BeforeStagedInstallMove,
     InstalledBeforeValidation,
@@ -324,6 +332,104 @@ impl StateDirectory {
     #[cfg(windows)]
     fn sync_for(&self, _fallback: StorageErrorKind) -> Result<(), StorageError> {
         self.secure.sync()
+    }
+
+    pub(super) fn has_existing_store_state(&self) -> Result<bool, StorageError> {
+        for file_name in [
+            DATABASE_FILE_NAME,
+            "satelle.sqlite3-wal",
+            "satelle.sqlite3-shm",
+            "satelle.sqlite3-journal",
+        ] {
+            if open_private_leaf(
+                self,
+                file_name,
+                LeafOpenMode::Existing,
+                StorageErrorKind::OpenFailed,
+            )?
+            .is_some()
+            {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    pub(super) fn read_private_leaf_bounded(
+        &self,
+        file_name: &str,
+        limit: usize,
+    ) -> Result<Option<Vec<u8>>, StorageError> {
+        let Some(mut file) = open_private_leaf(
+            self,
+            file_name,
+            LeafOpenMode::ExistingPrivate,
+            StorageErrorKind::InvalidStoredState,
+        )?
+        else {
+            return Ok(None);
+        };
+        let mut bytes = Vec::new();
+        std::io::Read::read_to_end(
+            &mut std::io::Read::take(&mut file, limit as u64 + 1),
+            &mut bytes,
+        )
+        .map_err(|source| {
+            StorageError::with_source(StorageErrorKind::InvalidStoredState, source)
+        })?;
+        if bytes.len() > limit {
+            return Err(StorageError::new(StorageErrorKind::InvalidStoredState));
+        }
+        Ok(Some(bytes))
+    }
+
+    pub(super) fn create_private_leaf_durable(
+        &self,
+        file_name: &str,
+        contents: &[u8],
+    ) -> Result<(), StorageError> {
+        let mut file = open_private_leaf(
+            self,
+            file_name,
+            LeafOpenMode::CreateNew,
+            StorageErrorKind::OperationFailed,
+        )?
+        .ok_or_else(|| StorageError::new(StorageErrorKind::OperationFailed))?;
+        let persisted = std::io::Write::write_all(&mut file, contents)
+            .and_then(|()| file.sync_all())
+            .map_err(|source| StorageError::with_source(StorageErrorKind::OperationFailed, source))
+            .and_then(|()| self.sync_for(StorageErrorKind::OperationFailed));
+        if let Err(error) = persisted {
+            let cleanup_identity = leaf_identity(&file, StorageErrorKind::OperationFailed).ok();
+            drop(file);
+            if let Some(identity) = cleanup_identity {
+                let _ = self.delete_leaf(file_name, identity);
+            }
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    pub(super) fn delete_private_leaf_durable(
+        &self,
+        file_name: &str,
+    ) -> Result<bool, StorageError> {
+        let Some(file) = open_private_leaf(
+            self,
+            file_name,
+            LeafOpenMode::ExistingPrivate,
+            StorageErrorKind::InvalidStoredState,
+        )?
+        else {
+            return Ok(false);
+        };
+        let identity = leaf_identity(&file, StorageErrorKind::InvalidStoredState)?;
+        drop(file);
+        let deleted = self.delete_leaf(file_name, identity)?;
+        if deleted {
+            self.sync_for(StorageErrorKind::OperationFailed)?;
+        }
+        Ok(deleted)
     }
 
     #[cfg(unix)]
@@ -439,17 +545,17 @@ impl Drop for OwnershipLock {
 pub(super) fn open_parts(
     state_root: &Path,
 ) -> Result<(Connection, OwnershipLock, StateDirectory), StorageError> {
-    open_parts_after_lock(state_root, || {})
+    open_parts_with_locked_preflight(state_root, |_| Ok(()))
 }
 
-fn open_parts_after_lock(
+pub(super) fn open_parts_with_locked_preflight(
     state_root: &Path,
-    after_lock: impl FnOnce(),
+    locked_preflight: impl FnOnce(&StateDirectory) -> Result<(), StorageError>,
 ) -> Result<(Connection, OwnershipLock, StateDirectory), StorageError> {
     let state_directory = prepare_state_root(state_root)?;
     preflight_protected_files(&state_directory)?;
     let ownership_lock = acquire_ownership_lock(&state_directory)?;
-    after_lock();
+    locked_preflight(&state_directory)?;
     // Pre-create and permission the database through the pinned state
     // directory. Existing SQLite sidecars were checked before this point, so
     // the platform VFS cannot encounter an unchecked protected leaf.
@@ -551,7 +657,10 @@ pub(super) fn open_parts_with_after_lock_hook(
     state_root: &Path,
     after_lock: impl FnOnce(),
 ) -> Result<(Connection, OwnershipLock, StateDirectory), StorageError> {
-    open_parts_after_lock(state_root, after_lock)
+    open_parts_with_locked_preflight(state_root, |_| {
+        after_lock();
+        Ok(())
+    })
 }
 
 #[cfg(unix)]
@@ -1268,10 +1377,10 @@ fn read_backup_manifest(
         state_directory,
         manifest_file_name,
         LeafOpenMode::ExistingPrivateGuarded,
-        StorageErrorKind::InvalidInput,
+        StorageErrorKind::UnsafeStatePath,
     )?
     .ok_or_else(|| StorageError::new(StorageErrorKind::InvalidInput))?;
-    let identity = leaf_identity(&manifest_file, StorageErrorKind::InvalidInput)?;
+    let identity = leaf_identity(&manifest_file, StorageErrorKind::UnsafeStatePath)?;
     let mut bytes = Vec::new();
     Read::take(&mut manifest_file, MAXIMUM_MANIFEST_BYTES + 1)
         .read_to_end(&mut bytes)
@@ -1370,17 +1479,17 @@ fn validate_migration_backup_at_with_hook(
     let _ = state_root;
     let parsed_name = parse_migration_backup_file_name(backup_file_name)
         .ok_or_else(|| StorageError::new(StorageErrorKind::InvalidInput))?;
-    let manifest_read = read_backup_manifest(state_directory, physical_manifest_file_name)?;
-    validate_manifest_contract(backup_file_name, parsed_name, &manifest_read.manifest)?;
-
     let backup_file = open_private_leaf(
         state_directory,
         physical_backup_file_name,
         LeafOpenMode::ExistingPrivateGuarded,
-        StorageErrorKind::InvalidInput,
+        StorageErrorKind::UnsafeStatePath,
     )?
     .ok_or_else(|| StorageError::new(StorageErrorKind::InvalidInput))?;
-    let backup_identity = leaf_identity(&backup_file, StorageErrorKind::InvalidInput)?;
+    let backup_identity = leaf_identity(&backup_file, StorageErrorKind::UnsafeStatePath)?;
+    let manifest_read = read_backup_manifest(state_directory, physical_manifest_file_name)?;
+    validate_manifest_contract(backup_file_name, parsed_name, &manifest_read.manifest)?;
+
     let source_database_digest = digest_file(&backup_file, StorageErrorKind::IntegrityCheckFailed)?;
     if source_database_digest != manifest_read.manifest.source_database_digest {
         return Err(StorageError::new(StorageErrorKind::IntegrityCheckFailed));
@@ -1678,8 +1787,27 @@ fn move_private_leaf_durable_with_hook(
     expected_identity: LeafIdentity,
     before_move: impl FnOnce() -> Result<(), StorageError>,
 ) -> Result<(), StorageError> {
+    move_private_leaf_durable_with_hooks(
+        state_directory,
+        source_file_name,
+        destination_file_name,
+        expected_identity,
+        before_move,
+        || Ok(()),
+    )
+}
+
+fn move_private_leaf_durable_with_hooks(
+    state_directory: &StateDirectory,
+    source_file_name: &str,
+    destination_file_name: &str,
+    expected_identity: LeafIdentity,
+    before_move: impl FnOnce() -> Result<(), StorageError>,
+    after_rename: impl FnOnce() -> Result<(), StorageError>,
+) -> Result<(), StorageError> {
     before_move()?;
     state_directory.move_leaf(source_file_name, destination_file_name)?;
+    after_rename()?;
     state_directory.sync_for(StorageErrorKind::OperationFailed)?;
     if open_private_leaf_identity(state_directory, destination_file_name)?
         != Some(expected_identity)
@@ -1723,55 +1851,119 @@ fn remove_private_leaf_checked(
     Ok(removed)
 }
 
+#[derive(Clone, Debug)]
+struct MovedActiveSidecar {
+    active_file_name: String,
+    failed_file_name: String,
+    identity: LeafIdentity,
+}
+
+#[derive(Debug)]
+struct ActivationRecoveryError {
+    trigger: StorageError,
+    recovery_errors: Vec<StorageError>,
+}
+
+impl fmt::Display for ActivationRecoveryError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "activation failed: {}", self.trigger)?;
+        for recovery_error in &self.recovery_errors {
+            write!(formatter, "; recovery failed: {recovery_error}")?;
+        }
+        Ok(())
+    }
+}
+
+impl std::error::Error for ActivationRecoveryError {}
+
+fn activation_error_after_recovery(
+    trigger: StorageError,
+    recovery_errors: Vec<StorageError>,
+) -> StorageError {
+    if recovery_errors.is_empty() {
+        trigger
+    } else {
+        StorageError::with_source(
+            StorageErrorKind::OperationFailed,
+            ActivationRecoveryError {
+                trigger,
+                recovery_errors,
+            },
+        )
+    }
+}
+
 fn restore_prior_active_store(
     state_directory: &StateDirectory,
     failed_store_file_name: &str,
     failed_store_identity: LeafIdentity,
-    failed_sidecar_file_names: &[String],
+    moved_sidecars: &[MovedActiveSidecar],
     activation_id: Uuid,
-) -> Result<(), StorageError> {
-    if open_private_leaf_identity(state_directory, DATABASE_FILE_NAME)?.is_some() {
-        let rejected_id = Uuid::now_v7();
-        let rejected_name =
-            format!("satelle.sqlite3.rejected-{activation_id}-{rejected_id}.sqlite3");
-        move_current_private_leaf_durable(state_directory, DATABASE_FILE_NAME, &rejected_name)?;
+) -> Vec<StorageError> {
+    let mut recovery_errors = Vec::new();
+    let restore_primary = (|| {
+        let active_identity = open_private_leaf_identity(state_directory, DATABASE_FILE_NAME)?;
+        let failed_identity = open_private_leaf_identity(state_directory, failed_store_file_name)?;
+        if active_identity == Some(failed_store_identity) && failed_identity.is_none() {
+            return Ok(());
+        }
+        if active_identity.is_some() {
+            let rejected_id = Uuid::now_v7();
+            let rejected_name =
+                format!("satelle.sqlite3.rejected-{activation_id}-{rejected_id}.sqlite3");
+            move_current_private_leaf_durable(state_directory, DATABASE_FILE_NAME, &rejected_name)?;
+        }
+        if failed_identity != Some(failed_store_identity) {
+            return Err(StorageError::new(StorageErrorKind::StateConflict));
+        }
+        move_private_leaf_durable(
+            state_directory,
+            failed_store_file_name,
+            DATABASE_FILE_NAME,
+            failed_store_identity,
+        )
+    })();
+    if let Err(error) = restore_primary {
+        recovery_errors.push(error);
     }
-    move_private_leaf_durable(
+    recovery_errors.extend(restore_prior_active_sidecars(
         state_directory,
-        failed_store_file_name,
-        DATABASE_FILE_NAME,
-        failed_store_identity,
-    )?;
-    restore_prior_active_sidecars(state_directory, failed_sidecar_file_names)
+        moved_sidecars,
+    ));
+    recovery_errors
 }
 
 fn restore_prior_active_sidecars(
     state_directory: &StateDirectory,
-    failed_sidecar_file_names: &[String],
-) -> Result<(), StorageError> {
+    moved_sidecars: &[MovedActiveSidecar],
+) -> Vec<StorageError> {
     // An activation error must leave the old SQLite file set reopenable, not
     // merely recoverable under internal quarantine names.
-    for failed_sidecar_file_name in failed_sidecar_file_names {
-        let suffix = if failed_sidecar_file_name.ends_with("-wal") {
-            "-wal"
-        } else if failed_sidecar_file_name.ends_with("-shm") {
-            "-shm"
-        } else if failed_sidecar_file_name.ends_with("-journal") {
-            "-journal"
-        } else {
-            return Err(StorageError::new(StorageErrorKind::StateConflict));
-        };
-        let active_sidecar_file_name = format!("{DATABASE_FILE_NAME}{suffix}");
-        let identity = open_private_leaf_identity(state_directory, failed_sidecar_file_name)?
-            .ok_or_else(|| StorageError::new(StorageErrorKind::StateConflict))?;
-        move_private_leaf_durable(
-            state_directory,
-            failed_sidecar_file_name,
-            &active_sidecar_file_name,
-            identity,
-        )?;
+    let mut recovery_errors = Vec::new();
+    for moved_sidecar in moved_sidecars {
+        let restore = (|| {
+            let active_identity =
+                open_private_leaf_identity(state_directory, &moved_sidecar.active_file_name)?;
+            let failed_identity =
+                open_private_leaf_identity(state_directory, &moved_sidecar.failed_file_name)?;
+            match (active_identity, failed_identity) {
+                (Some(active), None) if active == moved_sidecar.identity => Ok(()),
+                (None, Some(failed)) if failed == moved_sidecar.identity => {
+                    move_private_leaf_durable(
+                        state_directory,
+                        &moved_sidecar.failed_file_name,
+                        &moved_sidecar.active_file_name,
+                        moved_sidecar.identity,
+                    )
+                }
+                _ => Err(StorageError::new(StorageErrorKind::StateConflict)),
+            }
+        })();
+        if let Err(error) = restore {
+            recovery_errors.push(error);
+        }
     }
-    Ok(())
+    recovery_errors
 }
 
 fn same_restore_content_and_manifest(
@@ -1841,26 +2033,57 @@ fn activate_migration_backup_with_hook(
     }
     hook(ActivationStep::StagedValidated)?;
 
-    let mut failed_sidecar_file_names = Vec::new();
-    for sidecar_file_name in &PROTECTED_FILE_NAMES[2..] {
-        let Some(identity) = open_private_leaf_identity(state_directory, sidecar_file_name)? else {
-            continue;
+    let mut moved_sidecars = Vec::new();
+    for (sidecar_index, sidecar_file_name) in PROTECTED_FILE_NAMES[2..].iter().enumerate() {
+        let identity = match open_private_leaf_identity(state_directory, sidecar_file_name) {
+            Ok(Some(identity)) => identity,
+            Ok(None) => continue,
+            Err(error) => {
+                return Err(activation_error_after_recovery(
+                    error,
+                    restore_prior_active_sidecars(state_directory, &moved_sidecars),
+                ));
+            }
         };
         let failed_sidecar_file_name = format!(
             "{failed_store_file_name}{}",
             &sidecar_file_name[DATABASE_FILE_NAME.len()..]
         );
-        move_private_leaf_durable(
-            state_directory,
-            sidecar_file_name,
-            &failed_sidecar_file_name,
+        // Record the exact canonical identity before the first mutation. A
+        // failure before or after rename can then recover only proven bytes.
+        moved_sidecars.push(MovedActiveSidecar {
+            active_file_name: (*sidecar_file_name).to_owned(),
+            failed_file_name: failed_sidecar_file_name,
             identity,
-        )?;
-        failed_sidecar_file_names.push(failed_sidecar_file_name);
+        });
+        let moved_sidecar = moved_sidecars
+            .last()
+            .expect("the sidecar move was registered");
+        if let Err(error) = move_private_leaf_durable_with_hooks(
+            state_directory,
+            &moved_sidecar.active_file_name,
+            &moved_sidecar.failed_file_name,
+            identity,
+            || Ok(()),
+            || hook(ActivationStep::SidecarRenamedBeforeSync(sidecar_index)),
+        ) {
+            return Err(activation_error_after_recovery(
+                error,
+                restore_prior_active_sidecars(state_directory, &moved_sidecars),
+            ));
+        }
+        if let Err(error) = hook(ActivationStep::SidecarMovedDurably(sidecar_index)) {
+            return Err(activation_error_after_recovery(
+                error,
+                restore_prior_active_sidecars(state_directory, &moved_sidecars),
+            ));
+        }
     }
     if let Err(error) = hook(ActivationStep::SidecarsMovedDurably) {
-        restore_prior_active_sidecars(state_directory, &failed_sidecar_file_names)?;
-        return Err(error);
+        return Err(activation_error_after_recovery(
+            error,
+            restore_prior_active_sidecars(state_directory, &moved_sidecars),
+        ));
     }
 
     let staged_before_install = match validate_migration_backup_at(
@@ -1872,31 +2095,65 @@ fn activate_migration_backup_with_hook(
     ) {
         Ok(staged_before_install) => staged_before_install,
         Err(error) => {
-            restore_prior_active_sidecars(state_directory, &failed_sidecar_file_names)?;
-            return Err(error);
+            return Err(activation_error_after_recovery(
+                error,
+                restore_prior_active_sidecars(state_directory, &moved_sidecars),
+            ));
         }
     };
     if staged_before_install.token != staged.token {
-        restore_prior_active_sidecars(state_directory, &failed_sidecar_file_names)?;
-        return Err(StorageError::new(StorageErrorKind::StateConflict));
+        return Err(activation_error_after_recovery(
+            StorageError::new(StorageErrorKind::StateConflict),
+            restore_prior_active_sidecars(state_directory, &moved_sidecars),
+        ));
     }
 
     // Remove the prior active name without overwriting it. From this point
     // until installation succeeds, every error restores this exact object.
-    let failed_store_identity = move_current_private_leaf_durable(
+    let failed_store_identity =
+        match open_private_leaf_identity(state_directory, DATABASE_FILE_NAME) {
+            Ok(Some(identity)) => identity,
+            Ok(None) => {
+                return Err(activation_error_after_recovery(
+                    StorageError::new(StorageErrorKind::StateConflict),
+                    restore_prior_active_sidecars(state_directory, &moved_sidecars),
+                ));
+            }
+            Err(error) => {
+                return Err(activation_error_after_recovery(
+                    error,
+                    restore_prior_active_sidecars(state_directory, &moved_sidecars),
+                ));
+            }
+        };
+    if let Err(error) = move_private_leaf_durable(
         state_directory,
         DATABASE_FILE_NAME,
         &failed_store_file_name,
-    )?;
+        failed_store_identity,
+    ) {
+        return Err(activation_error_after_recovery(
+            error,
+            restore_prior_active_store(
+                state_directory,
+                &failed_store_file_name,
+                failed_store_identity,
+                &moved_sidecars,
+                activation_id,
+            ),
+        ));
+    }
     if let Err(error) = hook(ActivationStep::RecoveryStateDurable) {
-        restore_prior_active_store(
-            state_directory,
-            &failed_store_file_name,
-            failed_store_identity,
-            &failed_sidecar_file_names,
-            activation_id,
-        )?;
-        return Err(error);
+        return Err(activation_error_after_recovery(
+            error,
+            restore_prior_active_store(
+                state_directory,
+                &failed_store_file_name,
+                failed_store_identity,
+                &moved_sidecars,
+                activation_id,
+            ),
+        ));
     }
 
     let install = move_private_leaf_durable_with_hook(
@@ -1907,24 +2164,28 @@ fn activate_migration_backup_with_hook(
         || hook(ActivationStep::BeforeStagedInstallMove),
     );
     if let Err(error) = install {
-        restore_prior_active_store(
-            state_directory,
-            &failed_store_file_name,
-            failed_store_identity,
-            &failed_sidecar_file_names,
-            activation_id,
-        )?;
-        return Err(error);
+        return Err(activation_error_after_recovery(
+            error,
+            restore_prior_active_store(
+                state_directory,
+                &failed_store_file_name,
+                failed_store_identity,
+                &moved_sidecars,
+                activation_id,
+            ),
+        ));
     }
     if let Err(error) = hook(ActivationStep::InstalledBeforeValidation) {
-        restore_prior_active_store(
-            state_directory,
-            &failed_store_file_name,
-            failed_store_identity,
-            &failed_sidecar_file_names,
-            activation_id,
-        )?;
-        return Err(error);
+        return Err(activation_error_after_recovery(
+            error,
+            restore_prior_active_store(
+                state_directory,
+                &failed_store_file_name,
+                failed_store_identity,
+                &moved_sidecars,
+                activation_id,
+            ),
+        ));
     }
 
     let installed = validate_migration_backup_at(
@@ -1937,21 +2198,26 @@ fn activate_migration_backup_with_hook(
     match installed {
         Ok(installed) if installed.token == staged.token => {}
         Ok(_) | Err(_) => {
-            restore_prior_active_store(
-                state_directory,
-                &failed_store_file_name,
-                failed_store_identity,
-                &failed_sidecar_file_names,
-                activation_id,
-            )?;
-            return Err(StorageError::new(StorageErrorKind::StateConflict));
+            return Err(activation_error_after_recovery(
+                StorageError::new(StorageErrorKind::StateConflict),
+                restore_prior_active_store(
+                    state_directory,
+                    &failed_store_file_name,
+                    failed_store_identity,
+                    &moved_sidecars,
+                    activation_id,
+                ),
+            ));
         }
     }
     hook(ActivationStep::ReplacementDurable)?;
 
     Ok(RestoreActivation {
         failed_store_file_name,
-        failed_sidecar_file_names,
+        failed_sidecar_file_names: moved_sidecars
+            .into_iter()
+            .map(|sidecar| sidecar.failed_file_name)
+            .collect(),
     })
 }
 
@@ -2367,7 +2633,9 @@ fn cleanup_migration_backups_with_hook(
 
 fn migration_checksum(value: &str) -> String {
     let mut checksum = 0xcbf29ce484222325_u64;
-    for byte in value.bytes() {
+    // Source checkouts may materialize SQL with CRLF on Windows. Migration
+    // identity is the canonical SQL content, independent of checkout endings.
+    for byte in value.replace("\r\n", "\n").bytes() {
         checksum ^= u64::from(byte);
         checksum = checksum.wrapping_mul(0x100000001b3);
     }

@@ -10,7 +10,7 @@ use satelle_core::session::{
     TurnStateRevision,
 };
 use satelle_core::{
-    DesktopSessionRecord, LOCAL_DEMO_HOST, ProviderAuthValidationMode,
+    DesktopSessionRecord, DoctorReport, LOCAL_DEMO_HOST, ProviderAuthValidationMode,
     PublicProviderDescriptorValidation, SatelleError, SessionId, StopResult, TurnId,
 };
 use serde::Serialize;
@@ -19,9 +19,7 @@ use thiserror::Error;
 use time::OffsetDateTime;
 use zeroize::Zeroizing;
 
-#[cfg(any(test, feature = "test-support"))]
 use crate::EphemeralApiAuthenticator;
-#[cfg(any(test, feature = "test-support"))]
 use std::sync::Arc;
 
 const MAX_IDEMPOTENCY_KEY_BYTES: usize = 256;
@@ -29,6 +27,9 @@ const TURN_IDEMPOTENCY_DIGEST_SCHEMA_VERSION: u16 = 6;
 const STOP_IDEMPOTENCY_DIGEST_SCHEMA_VERSION: u16 = 1;
 const PROVIDER_DESCRIPTOR_VALIDATION_DIGEST_SCHEMA_VERSION: u16 = 3;
 const PROVIDER_BINDING_MUTATION_DIGEST_SCHEMA_VERSION: u16 = 2;
+const PROVIDER_SECRET_PROVISIONING_DIGEST_SCHEMA_VERSION: u16 = 1;
+const SETUP_VERIFICATION_DIGEST_SCHEMA_VERSION: u16 = 1;
+const NATIVE_READINESS_INVALIDATION_DIGEST_SCHEMA_VERSION: u16 = 1;
 const DURABLE_SETUP_PRINCIPAL_PREFIX: &str = "controller-setup";
 
 /// A diagnostic-safe snapshot captured from the daemon-owned runtime after
@@ -427,10 +428,40 @@ struct CanonicalProviderBindingAuthorization<'a> {
 }
 
 #[derive(Serialize)]
+struct CanonicalProviderSecretProvisioning<'a> {
+    operation: &'static str,
+    host: &'a str,
+    authorization: &'a satelle_core::ProviderBindingAuthorization,
+    overwrite_authorized: bool,
+    envelope_digest: &'a str,
+}
+
+#[derive(Serialize)]
 struct CanonicalProviderBindingDeletion<'a> {
     operation: &'static str,
     model_alias: &'a str,
     provider_alias: &'a str,
+}
+
+#[derive(Serialize)]
+struct CanonicalSetupVerification<'a> {
+    operation: &'static str,
+    model_alias: Option<&'a str>,
+    provider_alias: Option<&'a str>,
+    model_from_project: bool,
+    provider_from_project: bool,
+    experimental_provider_computer_use: bool,
+}
+
+#[derive(Serialize)]
+struct CanonicalNativeReadinessInvalidation<'a> {
+    operation: &'static str,
+    host: &'static str,
+    model_alias: Option<&'a str>,
+    provider_alias: Option<&'a str>,
+    model_from_project: bool,
+    provider_from_project: bool,
+    experimental_provider_computer_use: bool,
 }
 
 #[derive(Serialize)]
@@ -469,6 +500,21 @@ impl DaemonRuntimeCapabilities {
 }
 
 impl HostService {
+    /// Adds a process-local credential for a loopback bootstrap transport.
+    /// The raw bearer remains only in the caller and this in-memory
+    /// authenticator; it is never registered in durable Host state.
+    pub fn with_ephemeral_bootstrap_auth(
+        mut self,
+        token: &ApiBearerToken,
+        scopes: ApiScopes,
+        expires_at: OffsetDateTime,
+    ) -> Self {
+        self.bootstrap_auth = Some(Arc::new(EphemeralApiAuthenticator::new(
+            token, scopes, expires_at,
+        )));
+        self
+    }
+
     /// Opens and exclusively owns Host state before a network listener starts.
     /// Existing nonterminal work is reconciled first, so a daemon never reports
     /// itself initialized while restart recovery remains unexamined.
@@ -878,6 +924,96 @@ impl HostService {
             )
     }
 
+    pub fn provision_provider_secret_idempotent(
+        &self,
+        host: &str,
+        authorization: satelle_core::ProviderBindingAuthorization,
+        secret: zeroize::Zeroizing<String>,
+        overwrite_authorized: bool,
+        envelope_digest: &str,
+        authority: &MutationAuthority,
+    ) -> Result<satelle_core::ProviderSecretProvisioningResult, SatelleError> {
+        let canonical_payload = canonical_payload(
+            &CanonicalProviderSecretProvisioning {
+                operation: "provider_secret_provisioning",
+                host,
+                authorization: &authorization,
+                overwrite_authorized,
+                envelope_digest,
+            },
+            PROVIDER_SECRET_PROVISIONING_DIGEST_SCHEMA_VERSION,
+        )?;
+        let _identity_gate = self.operation_capacity.lock_identity_read()?;
+        let identity = self.runtime.authenticated_request_identity(
+            &authority.principal,
+            IdempotentOperation::ProviderSecretProvisioning,
+            &authority.idempotency_key,
+            canonical_payload.as_slice(),
+            canonical_payload.digest_schema_version,
+        )?;
+        let operation_identity = identity.clone();
+        self.operation_capacity
+            .execute(
+                crate::operation_capacity::OperationRequest::new(
+                    IdempotentOperation::ProviderSecretProvisioning,
+                    &identity,
+                ),
+                || {
+                    self.runtime
+                        .provider_secret_provisioning_replay(&identity)
+                        .map(|result| {
+                            result.map(
+                                crate::operation_capacity::OperationOutcome::provider_secret_provisioning,
+                            )
+                        })
+                },
+                || {
+                    self.provision_provider_secret(
+                        host,
+                        authorization,
+                        secret,
+                        overwrite_authorized,
+                        &operation_identity,
+                    )
+                    .map(
+                        crate::operation_capacity::OperationOutcome::provider_secret_provisioning,
+                    )
+                },
+            )
+            .and_then(
+                crate::operation_capacity::OperationOutcome::into_provider_secret_provisioning,
+            )
+    }
+
+    pub fn replay_provider_secret_provisioning_idempotent(
+        &self,
+        host: &str,
+        authorization: satelle_core::ProviderBindingAuthorization,
+        overwrite_authorized: bool,
+        envelope_digest: &str,
+        authority: &MutationAuthority,
+    ) -> Result<Option<satelle_core::ProviderSecretProvisioningResult>, SatelleError> {
+        let canonical_payload = canonical_payload(
+            &CanonicalProviderSecretProvisioning {
+                operation: "provider_secret_provisioning",
+                host,
+                authorization: &authorization,
+                overwrite_authorized,
+                envelope_digest,
+            },
+            PROVIDER_SECRET_PROVISIONING_DIGEST_SCHEMA_VERSION,
+        )?;
+        let _identity_gate = self.operation_capacity.lock_identity_read()?;
+        let identity = self.runtime.authenticated_request_identity(
+            &authority.principal,
+            IdempotentOperation::ProviderSecretProvisioning,
+            &authority.idempotency_key,
+            canonical_payload.as_slice(),
+            canonical_payload.digest_schema_version,
+        )?;
+        self.runtime.provider_secret_provisioning_replay(&identity)
+    }
+
     pub fn delete_provider_binding_idempotent(
         &self,
         model_alias: &str,
@@ -914,6 +1050,131 @@ impl HostService {
                     )?;
                     Ok(())
                 },
+            )
+        })
+    }
+
+    pub fn verify_setup_idempotent(
+        &self,
+        authority: &MutationAuthority,
+        model_alias: Option<&str>,
+        provider_alias: Option<&str>,
+        model_from_project: bool,
+        provider_from_project: bool,
+        experimental_provider_computer_use: bool,
+    ) -> Result<DoctorReport, SatelleError> {
+        if model_alias.is_some() != provider_alias.is_some() {
+            return Err(SatelleError::config_error(
+                "setup verification requires model and provider aliases together",
+                None,
+            ));
+        }
+        let provider_intent =
+            match (model_alias, provider_alias) {
+                (Some(model_alias), Some(provider_alias)) => crate::ProviderComputerUseIntent::new(
+                    Some(EffectiveModelRef::new(model_alias).map_err(|_| {
+                        SatelleError::config_error("the model alias is invalid", None)
+                    })?),
+                    Some(ProviderBindingRef::new(provider_alias).map_err(|_| {
+                        SatelleError::config_error("the provider alias is invalid", None)
+                    })?),
+                    true,
+                )
+                .with_project_selection_provenance(model_from_project, provider_from_project)
+                .with_experimental_provider_computer_use(experimental_provider_computer_use),
+                (None, None) => crate::ProviderComputerUseIntent::host_default(),
+                _ => unreachable!("the paired alias invariant is checked above"),
+            };
+        let canonical_payload = canonical_payload(
+            &CanonicalSetupVerification {
+                operation: "setup_verification",
+                model_alias,
+                provider_alias,
+                model_from_project,
+                provider_from_project,
+                experimental_provider_computer_use,
+            },
+            SETUP_VERIFICATION_DIGEST_SCHEMA_VERSION,
+        )?;
+        let _identity_gate = self.operation_capacity.lock_identity_read()?;
+        let identity = self.runtime.authenticated_request_identity(
+            &authority.principal,
+            IdempotentOperation::SetupVerification,
+            &authority.idempotency_key,
+            canonical_payload.as_slice(),
+            canonical_payload.digest_schema_version,
+        )?;
+        if let Some(replay) = self.runtime.claim_setup_verification(&identity)? {
+            return Ok(replay);
+        }
+        let report = match self.verify_setup(LOCAL_DEMO_HOST, &provider_intent) {
+            Ok(report) => report,
+            Err(error) => {
+                self.runtime.fail_setup_verification(&identity, &error)?;
+                return Err(error);
+            }
+        };
+        self.runtime
+            .complete_setup_verification(&identity, &report)?;
+        Ok(report)
+    }
+
+    pub fn invalidate_native_readiness_idempotent(
+        &self,
+        authority: &MutationAuthority,
+        model_alias: Option<&str>,
+        provider_alias: Option<&str>,
+        model_from_project: bool,
+        provider_from_project: bool,
+        experimental_provider_computer_use: bool,
+    ) -> Result<u64, SatelleError> {
+        if model_alias.is_some() != provider_alias.is_some() {
+            return Err(SatelleError::config_error(
+                "native readiness invalidation requires model and provider aliases together",
+                None,
+            ));
+        }
+        let provider_intent =
+            match (model_alias, provider_alias) {
+                (Some(model_alias), Some(provider_alias)) => crate::ProviderComputerUseIntent::new(
+                    Some(EffectiveModelRef::new(model_alias).map_err(|_| {
+                        SatelleError::config_error("the model alias is invalid", None)
+                    })?),
+                    Some(ProviderBindingRef::new(provider_alias).map_err(|_| {
+                        SatelleError::config_error("the provider alias is invalid", None)
+                    })?),
+                    false,
+                )
+                .with_project_selection_provenance(model_from_project, provider_from_project)
+                .with_experimental_provider_computer_use(experimental_provider_computer_use),
+                (None, None) => crate::ProviderComputerUseIntent::host_default(),
+                _ => unreachable!("the paired alias invariant is checked above"),
+            };
+        let canonical_payload = canonical_payload(
+            &CanonicalNativeReadinessInvalidation {
+                operation: "native_readiness_invalidation",
+                host: LOCAL_DEMO_HOST,
+                model_alias,
+                provider_alias,
+                model_from_project,
+                provider_from_project,
+                experimental_provider_computer_use,
+            },
+            NATIVE_READINESS_INVALIDATION_DIGEST_SCHEMA_VERSION,
+        )?;
+        let _identity_gate = self.operation_capacity.lock_identity_read()?;
+        let identity = self.runtime.authenticated_request_identity(
+            &authority.principal,
+            IdempotentOperation::NativeReadinessInvalidation,
+            &authority.idempotency_key,
+            canonical_payload.as_slice(),
+            canonical_payload.digest_schema_version,
+        )?;
+        self.operation_capacity.execute_exclusive(|| {
+            self.runtime.invalidate_native_readiness_idempotent(
+                &identity,
+                LOCAL_DEMO_HOST,
+                &provider_intent,
             )
         })
     }
@@ -1397,16 +1658,38 @@ impl HostService {
 
     #[doc(hidden)]
     #[cfg(any(test, feature = "test-support"))]
+    pub fn local_demo_with_readiness_for_tests_at(
+        state_root: impl Into<std::path::PathBuf>,
+    ) -> Result<Self, SatelleError> {
+        Ok(Self {
+            runtime: crate::runtime::RuntimeHandle::new_with_readiness_probe_driver(
+                Ok(state_root.into()),
+                crate::test_runtime::FakeComputerUseAdapter,
+                crate::test_runtime::FakeComputerUseAdapter,
+            ),
+            operation_capacity: std::sync::Arc::new(
+                crate::operation_capacity::OperationCapacity::default(),
+            ),
+            turn_execution_timeout: crate::configured_turn_execution_timeout(
+                &satelle_core::SatelleConfig::defaults().hosts[satelle_core::LOCAL_DEMO_HOST],
+            ),
+            mode: HostMode::TestFake {
+                image_attachments: true,
+            },
+            bootstrap_auth: None,
+            bootstrap_maintenance: std::sync::Arc::new(std::sync::Mutex::new(None)),
+        })
+    }
+
+    #[doc(hidden)]
+    #[cfg(any(test, feature = "test-support"))]
     pub fn with_ssh_bootstrap_auth_for_tests(
-        mut self,
+        self,
         token: &ApiBearerToken,
         scopes: ApiScopes,
         expires_at: OffsetDateTime,
     ) -> Self {
-        self.bootstrap_auth = Some(Arc::new(EphemeralApiAuthenticator::new(
-            token, scopes, expires_at,
-        )));
-        self
+        self.with_ephemeral_bootstrap_auth(token, scopes, expires_at)
     }
 
     #[doc(hidden)]

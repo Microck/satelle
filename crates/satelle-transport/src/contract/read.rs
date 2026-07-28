@@ -4,7 +4,43 @@ use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 
 define_schema_token!(LiveSchema, "satelle.live.v1");
-define_schema_token!(CapabilitiesSchema, "satelle.capabilities.v3");
+define_schema_token!(CapabilitiesSchema, "satelle.capabilities.v5");
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProviderSecretUploadCapability {
+    envelope_schema_version: String,
+    algorithm: String,
+    content_type: String,
+    max_plaintext_bytes: usize,
+}
+
+impl ProviderSecretUploadCapability {
+    pub fn envelope_schema_version(&self) -> &str {
+        &self.envelope_schema_version
+    }
+
+    pub fn algorithm(&self) -> &str {
+        &self.algorithm
+    }
+
+    pub fn content_type(&self) -> &str {
+        &self.content_type
+    }
+
+    pub const fn max_plaintext_bytes(&self) -> usize {
+        self.max_plaintext_bytes
+    }
+
+    fn current() -> Self {
+        Self {
+            envelope_schema_version: "satelle.provider-secret-upload.v2".to_string(),
+            algorithm: "x25519-hkdf-sha256-chacha20poly1305".to_string(),
+            content_type: super::setup::PROVIDER_SECRET_UPLOAD_CONTENT_TYPE.to_string(),
+            max_plaintext_bytes: 64 * 1024,
+        }
+    }
+}
 define_schema_token!(HostStatusSchema, "satelle.host.status.v1");
 define_schema_token!(
     HostDesktopSessionsSchema,
@@ -48,6 +84,7 @@ enum Operation {
     SetupApiTokenIssue,
     SetupApiTokenActivate,
     SetupApiTokenAbort,
+    ProviderSecretProvisioning,
 }
 
 impl Operation {
@@ -67,6 +104,7 @@ impl Operation {
             Self::SetupApiTokenIssue => "setup_api_token_issue",
             Self::SetupApiTokenActivate => "setup_api_token_activate",
             Self::SetupApiTokenAbort => "setup_api_token_abort",
+            Self::ProviderSecretProvisioning => "provider_secret_provisioning",
         }
     }
 }
@@ -217,6 +255,7 @@ pub struct CapabilitiesResponse {
     runtime_capabilities: RuntimeCapabilities,
     limits: EffectiveLimits,
     supported_attachment_media_types: Vec<String>,
+    provider_secret_upload: ProviderSecretUploadCapability,
 }
 
 impl CapabilitiesResponse {
@@ -265,6 +304,7 @@ impl CapabilitiesResponse {
                 Operation::SetupApiTokenIssue,
                 Operation::SetupApiTokenActivate,
                 Operation::SetupApiTokenAbort,
+                Operation::ProviderSecretProvisioning,
             ],
             runtime_capabilities: RuntimeCapabilities {
                 codex_runtime,
@@ -280,6 +320,7 @@ impl CapabilitiesResponse {
             } else {
                 Vec::new()
             },
+            provider_secret_upload: ProviderSecretUploadCapability::current(),
         }
     }
 
@@ -304,6 +345,10 @@ impl CapabilitiesResponse {
             .iter()
             .map(|operation| operation.as_str())
             .collect()
+    }
+
+    pub const fn provider_secret_upload(&self) -> &ProviderSecretUploadCapability {
+        &self.provider_secret_upload
     }
 
     pub const fn limits(&self) -> EffectiveLimits {

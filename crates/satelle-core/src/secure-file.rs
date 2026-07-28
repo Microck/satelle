@@ -1,11 +1,13 @@
+use sha2::{Digest, Sha256};
 use std::fs::File;
 use std::io::{Read, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use thiserror::Error;
 use zeroize::Zeroizing;
 
 const MAX_SECRET_FILE_BYTES: usize = 64 * 1024;
 const MAX_CONFIG_FILE_BYTES: usize = 1024 * 1024;
+const SSH_IDENTITY_COMMIT_SCHEMA: &str = "satelle.ssh-host-identity-commit.v2";
 
 #[derive(Clone, Copy, Debug, Error, Eq, PartialEq)]
 pub enum SecureFileError {
@@ -17,8 +19,209 @@ pub enum SecureFileError {
     NotUtf8,
     #[error("the file contains a NUL byte")]
     ContainsNul,
+    #[error("the destination appeared after overwrite intent was recorded")]
+    OverwriteRequired,
     #[error("the published secret could not be removed after persistence failed")]
     PublishedCleanupFailed,
+    #[error("the prior owner-only secret could not be restored")]
+    RollbackFailed,
+    #[error("the SSH identity operation record is invalid")]
+    InvalidSshIdentityOperation,
+}
+
+/// Immutable recovery authority for one accepted fresh SSH Host identity.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SshIdentityCommitRecord {
+    operation_id: String,
+    candidate_host_identity: crate::session::HostIdentityRef,
+    target_id: String,
+    canonical_state_root: String,
+    artifact_version: String,
+    archive_sha256: String,
+    binary_sha256: String,
+    exact_remote_path: String,
+}
+
+impl SshIdentityCommitRecord {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        operation_id: impl Into<String>,
+        candidate_host_identity: crate::session::HostIdentityRef,
+        target_id: impl Into<String>,
+        canonical_state_root: impl Into<String>,
+        artifact_version: impl Into<String>,
+        archive_sha256: impl Into<String>,
+        binary_sha256: impl Into<String>,
+        exact_remote_path: impl Into<String>,
+    ) -> Result<Self, SecureFileError> {
+        let record = Self {
+            operation_id: operation_id.into(),
+            candidate_host_identity,
+            target_id: target_id.into(),
+            canonical_state_root: canonical_state_root.into(),
+            artifact_version: artifact_version.into(),
+            archive_sha256: archive_sha256.into(),
+            binary_sha256: binary_sha256.into(),
+            exact_remote_path: exact_remote_path.into(),
+        };
+        record.validate()?;
+        Ok(record)
+    }
+
+    pub fn parse(encoded: &str) -> Result<Self, SecureFileError> {
+        if encoded.len() > 4096 || encoded.contains('\0') {
+            return Err(SecureFileError::InvalidSshIdentityOperation);
+        }
+        let mut lines = encoded.split('\n');
+        if lines.next() != Some(SSH_IDENTITY_COMMIT_SCHEMA) {
+            return Err(SecureFileError::InvalidSshIdentityOperation);
+        }
+        let field = |line: Option<&str>, prefix: &str| {
+            line.and_then(|line| line.strip_prefix(prefix))
+                .filter(|value| !value.is_empty())
+                .map(str::to_string)
+                .ok_or(SecureFileError::InvalidSshIdentityOperation)
+        };
+        let operation_id = field(lines.next(), "operation_id=")?;
+        let candidate_host_identity =
+            crate::session::HostIdentityRef::new(field(lines.next(), "candidate_host_identity=")?)
+                .map_err(|_| SecureFileError::InvalidSshIdentityOperation)?;
+        let target_id = field(lines.next(), "target_id=")?;
+        let canonical_state_root = field(lines.next(), "canonical_state_root=")?;
+        let artifact_version = field(lines.next(), "artifact_version=")?;
+        let archive_sha256 = field(lines.next(), "archive_sha256=")?;
+        let binary_sha256 = field(lines.next(), "binary_sha256=")?;
+        let exact_remote_path = field(lines.next(), "exact_remote_path=")?;
+        if lines.next().is_some() {
+            return Err(SecureFileError::InvalidSshIdentityOperation);
+        }
+        Self::new(
+            operation_id,
+            candidate_host_identity,
+            target_id,
+            canonical_state_root,
+            artifact_version,
+            archive_sha256,
+            binary_sha256,
+            exact_remote_path,
+        )
+    }
+
+    pub fn encode(&self) -> String {
+        format!(
+            concat!(
+                "{}\n",
+                "operation_id={}\n",
+                "candidate_host_identity={}\n",
+                "target_id={}\n",
+                "canonical_state_root={}\n",
+                "artifact_version={}\n",
+                "archive_sha256={}\n",
+                "binary_sha256={}\n",
+                "exact_remote_path={}"
+            ),
+            SSH_IDENTITY_COMMIT_SCHEMA,
+            self.operation_id,
+            self.candidate_host_identity.as_str(),
+            self.target_id,
+            self.canonical_state_root,
+            self.artifact_version,
+            self.archive_sha256,
+            self.binary_sha256,
+            self.exact_remote_path,
+        )
+    }
+
+    pub fn operation_id(&self) -> &str {
+        &self.operation_id
+    }
+
+    pub fn candidate_host_identity(&self) -> &crate::session::HostIdentityRef {
+        &self.candidate_host_identity
+    }
+
+    pub fn target_id(&self) -> &str {
+        &self.target_id
+    }
+
+    pub fn canonical_state_root(&self) -> &str {
+        &self.canonical_state_root
+    }
+
+    pub fn artifact_version(&self) -> &str {
+        &self.artifact_version
+    }
+
+    pub fn archive_sha256(&self) -> &str {
+        &self.archive_sha256
+    }
+
+    pub fn binary_sha256(&self) -> &str {
+        &self.binary_sha256
+    }
+
+    pub fn exact_remote_path(&self) -> &str {
+        &self.exact_remote_path
+    }
+
+    fn validate(&self) -> Result<(), SecureFileError> {
+        let parsed = uuid::Uuid::parse_str(&self.operation_id)
+            .map_err(|_| SecureFileError::InvalidSshIdentityOperation)?;
+        if parsed.hyphenated().to_string() != self.operation_id
+            || self.operation_id.as_bytes().get(14) != Some(&b'7')
+            || !matches!(
+                self.target_id.as_str(),
+                "linux-arm64-gnu"
+                    | "linux-x64-gnu"
+                    | "darwin-arm64"
+                    | "darwin-x64"
+                    | "win32-arm64-msvc"
+                    | "win32-x64-msvc"
+            )
+            || !valid_record_text(&self.canonical_state_root)
+            || !valid_record_text(&self.artifact_version)
+            || !valid_sha256(&self.archive_sha256)
+            || !valid_sha256(&self.binary_sha256)
+            || !valid_record_text(&self.exact_remote_path)
+        {
+            return Err(SecureFileError::InvalidSshIdentityOperation);
+        }
+        let executable = if self.target_id.starts_with("win32-") {
+            "satelle.exe"
+        } else {
+            "satelle"
+        };
+        let normalized_path = self.exact_remote_path.replace('\\', "/");
+        let absolute = if self.target_id.starts_with("win32-") {
+            normalized_path.as_bytes().get(1) == Some(&b':')
+                && normalized_path.as_bytes().get(2) == Some(&b'/')
+        } else {
+            normalized_path.starts_with('/')
+        };
+        let expected_suffix = format!(
+            "/bootstrap/{}/{}/{}",
+            self.operation_id, self.binary_sha256, executable
+        );
+        if !absolute || !normalized_path.ends_with(&expected_suffix) {
+            return Err(SecureFileError::InvalidSshIdentityOperation);
+        }
+        Ok(())
+    }
+}
+
+fn valid_record_text(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 1024
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii() && !matches!(byte, b'\0' | b'\n' | b'\r'))
+}
+
+fn valid_sha256(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
 }
 
 #[cfg(not(windows))]
@@ -49,6 +252,17 @@ pub fn read_owner_only_secret_file(path: &Path) -> Result<Zeroizing<String>, Sec
         .or_else(|| value.strip_suffix('\n'))
         .unwrap_or(value);
     Ok(Zeroizing::new(value.to_string()))
+}
+
+/// Computes a comparison digest over the exact bytes stored in an owner-only
+/// secret file. Provider consumers normalize one trailing line ending, but
+/// replacement recovery compares the persisted representation byte-for-byte.
+pub fn keyed_owner_only_secret_file_comparison_digest(
+    path: &Path,
+    comparison_key: &[u8],
+) -> Result<[u8; 32], SecureFileError> {
+    let stored = read_secure_file(path, SecurityPolicy::OwnerOnly, MAX_SECRET_FILE_BYTES)?;
+    keyed_secret_comparison_digest(comparison_key, stored.as_slice())
 }
 
 /// Persists a new secret without ever replacing an existing credential. The
@@ -96,6 +310,765 @@ pub fn persist_new_owner_only_secret_file(
             cleanup_failed_new_secret(&temporary_path, path, published)?;
             Err(error)
         }
+    }
+}
+
+/// Deterministic sibling paths for one journaled secret-file provisioning
+/// operation. The journal identifier must be an opaque ASCII token rather than
+/// secret material. A durable caller can reconstruct these paths after a
+/// restart without persisting a second copy of the credential.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OwnerOnlySecretFilePaths {
+    destination: PathBuf,
+    staging: PathBuf,
+    backup: PathBuf,
+}
+
+impl OwnerOnlySecretFilePaths {
+    pub fn new(destination: &Path, journal_id: &str) -> Result<Self, SecureFileError> {
+        if journal_id.is_empty()
+            || journal_id.len() > 64
+            || !journal_id
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+        {
+            return Err(SecureFileError::UnsafeOrUnavailable);
+        }
+        let parent = destination
+            .parent()
+            .ok_or(SecureFileError::UnsafeOrUnavailable)?;
+        let file_name = destination
+            .file_name()
+            .ok_or(SecureFileError::UnsafeOrUnavailable)?;
+        let mut staging_name = file_name.to_os_string();
+        staging_name.push(format!(".satelle-{journal_id}.staged"));
+        let mut backup_name = file_name.to_os_string();
+        backup_name.push(format!(".satelle-{journal_id}.backup"));
+        Ok(Self {
+            destination: destination.to_path_buf(),
+            staging: parent.join(staging_name),
+            backup: parent.join(backup_name),
+        })
+    }
+
+    /// Reconstructs deterministic paths from the destination and the staged
+    /// path stored in a durable provisioning journal. The staged name must be
+    /// exactly one produced by `new`; a same-directory arbitrary path is not
+    /// sufficient recovery authority.
+    pub fn from_staged_path(destination: &Path, staged: &Path) -> Result<Self, SecureFileError> {
+        if destination.parent() != staged.parent() {
+            return Err(SecureFileError::UnsafeOrUnavailable);
+        }
+        let destination_name = destination
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or(SecureFileError::UnsafeOrUnavailable)?;
+        let staged_name = staged
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or(SecureFileError::UnsafeOrUnavailable)?;
+        let prefix = format!("{destination_name}.satelle-");
+        let journal_id = staged_name
+            .strip_prefix(&prefix)
+            .and_then(|name| name.strip_suffix(".staged"))
+            .ok_or(SecureFileError::UnsafeOrUnavailable)?;
+        let paths = Self::new(destination, journal_id)?;
+        (paths.staging == staged)
+            .then_some(paths)
+            .ok_or(SecureFileError::UnsafeOrUnavailable)
+    }
+
+    pub fn destination(&self) -> &Path {
+        &self.destination
+    }
+
+    pub fn staging(&self) -> &Path {
+        &self.staging
+    }
+
+    pub fn backup(&self) -> &Path {
+        &self.backup
+    }
+}
+
+/// Produces a keyed comparison value for a secret without creating a reusable
+/// raw SHA-256 fingerprint. Callers may persist this HMAC in a redacted
+/// provisioning journal and use the same per-installation key during recovery.
+pub fn keyed_secret_comparison_digest(
+    comparison_key: &[u8],
+    secret: &[u8],
+) -> Result<[u8; 32], SecureFileError> {
+    if comparison_key.is_empty() {
+        return Err(SecureFileError::UnsafeOrUnavailable);
+    }
+
+    const BLOCK_BYTES: usize = 64;
+    let mut key_block = Zeroizing::new([0_u8; BLOCK_BYTES]);
+    if comparison_key.len() > BLOCK_BYTES {
+        key_block[..32].copy_from_slice(&Sha256::digest(comparison_key));
+    } else {
+        key_block[..comparison_key.len()].copy_from_slice(comparison_key);
+    }
+    let mut inner_pad = Zeroizing::new([0_u8; BLOCK_BYTES]);
+    let mut outer_pad = Zeroizing::new([0_u8; BLOCK_BYTES]);
+    for index in 0..BLOCK_BYTES {
+        inner_pad[index] = key_block[index] ^ 0x36;
+        outer_pad[index] = key_block[index] ^ 0x5c;
+    }
+
+    let mut inner = Sha256::new();
+    inner.update(inner_pad.as_slice());
+    inner.update(secret);
+    let inner_digest = Zeroizing::new(inner.finalize().to_vec());
+    let mut outer = Sha256::new();
+    outer.update(outer_pad.as_slice());
+    outer.update(inner_digest.as_slice());
+    Ok(outer.finalize().into())
+}
+
+/// Reports whether a destination already contains an owner-only regular file.
+/// An occupied path that does not satisfy the policy is an error rather than a
+/// misleading overwrite preview.
+pub fn owner_only_secret_destination_exists(path: &Path) -> Result<bool, SecureFileError> {
+    match std::fs::symlink_metadata(path) {
+        Ok(_) => {
+            drop(open_secure_file(path, SecurityPolicy::OwnerOnly)?);
+            Ok(true)
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(_) => Err(SecureFileError::UnsafeOrUnavailable),
+    }
+}
+
+/// Creates and fsyncs the deterministic owner-only staging file, then verifies
+/// it through a new no-follow read using the caller's keyed HMAC comparison.
+/// Repeating the call after a crash accepts only an existing staged file with
+/// the same comparison value.
+pub fn stage_owner_only_secret_file(
+    paths: &OwnerOnlySecretFilePaths,
+    secret: &str,
+    comparison_key: &[u8],
+    expected_digest: &[u8; 32],
+) -> Result<(), SecureFileError> {
+    if secret.len() > MAX_SECRET_FILE_BYTES || secret.as_bytes().contains(&0) {
+        return Err(if secret.len() > MAX_SECRET_FILE_BYTES {
+            SecureFileError::TooLarge
+        } else {
+            SecureFileError::ContainsNul
+        });
+    }
+    let source_digest = keyed_secret_comparison_digest(comparison_key, secret.as_bytes())?;
+    if !constant_time_digest_eq(&source_digest, expected_digest) {
+        return Err(SecureFileError::UnsafeOrUnavailable);
+    }
+
+    let parent = paths
+        .destination
+        .parent()
+        .ok_or(SecureFileError::UnsafeOrUnavailable)?;
+    let directory = open_or_create_owner_only_directory(parent)?;
+    let mut staging = match open_new_owner_only_file(&paths.staging) {
+        Ok(staging) => staging,
+        Err(_) => {
+            return verify_owner_only_secret_digest(
+                &paths.staging,
+                comparison_key,
+                expected_digest,
+            );
+        }
+    };
+    let staged = staging
+        .write_all(secret.as_bytes())
+        .and_then(|()| staging.sync_all())
+        .map_err(|_| SecureFileError::UnsafeOrUnavailable)
+        .and_then(|()| {
+            drop(staging);
+            sync_owner_only_directory(parent, &directory)?;
+            verify_owner_only_secret_digest(&paths.staging, comparison_key, expected_digest)
+        });
+    if let Err(error) = staged {
+        let _ = remove_sibling_file(&paths.staging, &directory);
+        return Err(error);
+    }
+    Ok(())
+}
+
+/// Publishes a verified staging file without replacing an occupied pathname.
+/// A replacement parks the observed destination at the journal's backup
+/// pathname, verifies its exact prior digest, and then publishes into the
+/// vacant destination pathname.
+pub fn publish_owner_only_secret_file(
+    paths: &OwnerOnlySecretFilePaths,
+    expected_destination_exists: bool,
+    overwrite_authorized: bool,
+    candidate_comparison_key: &[u8],
+    candidate_digest: &[u8; 32],
+    prior_comparison_key: Option<&[u8]>,
+    prior_digest: Option<&[u8; 32]>,
+) -> Result<bool, SecureFileError> {
+    verify_owner_only_secret_digest(&paths.staging, candidate_comparison_key, candidate_digest)?;
+    if expected_destination_exists && !overwrite_authorized {
+        return Err(SecureFileError::OverwriteRequired);
+    }
+
+    let parent = paths
+        .destination
+        .parent()
+        .ok_or(SecureFileError::UnsafeOrUnavailable)?;
+    let directory = open_or_create_owner_only_directory(parent)?;
+
+    if !expected_destination_exists {
+        return match move_sibling_file_without_replace(
+            &paths.staging,
+            &paths.destination,
+            &directory,
+        )? {
+            NoReplaceMoveOutcome::Moved => {
+                sync_owner_only_directory(parent, &directory)?;
+                verify_owner_only_secret_digest(
+                    &paths.destination,
+                    candidate_comparison_key,
+                    candidate_digest,
+                )?;
+                Ok(false)
+            }
+            NoReplaceMoveOutcome::DestinationOccupied => Err(SecureFileError::OverwriteRequired),
+            NoReplaceMoveOutcome::SourceMissing => Err(SecureFileError::UnsafeOrUnavailable),
+        };
+    }
+
+    let prior_comparison_key = prior_comparison_key.ok_or(SecureFileError::UnsafeOrUnavailable)?;
+    let prior_digest = prior_digest.ok_or(SecureFileError::UnsafeOrUnavailable)?;
+    match move_sibling_file_without_replace(&paths.destination, &paths.backup, &directory)? {
+        NoReplaceMoveOutcome::Moved => sync_owner_only_directory(parent, &directory)?,
+        NoReplaceMoveOutcome::SourceMissing | NoReplaceMoveOutcome::DestinationOccupied => {
+            return Err(SecureFileError::UnsafeOrUnavailable);
+        }
+    }
+
+    match secret_digest_matches(&paths.backup, prior_comparison_key, prior_digest) {
+        Ok(true) => {}
+        comparison => {
+            restore_parked_secret(
+                &paths.backup,
+                &paths.destination,
+                parent,
+                &directory,
+                SecretArtifactKind::Unowned,
+                candidate_comparison_key,
+                candidate_digest,
+                Some((prior_comparison_key, prior_digest)),
+            )?;
+            return match comparison {
+                Ok(false) => Err(SecureFileError::OverwriteRequired),
+                Err(error) => Err(error),
+                Ok(true) => unreachable!(),
+            };
+        }
+    }
+
+    match move_sibling_file_without_replace(&paths.staging, &paths.destination, &directory)? {
+        NoReplaceMoveOutcome::Moved => {
+            sync_owner_only_directory(parent, &directory)?;
+            verify_owner_only_secret_digest(
+                &paths.destination,
+                candidate_comparison_key,
+                candidate_digest,
+            )?;
+            Ok(true)
+        }
+        NoReplaceMoveOutcome::DestinationOccupied => {
+            remove_verified_secret_artifact(
+                &paths.staging,
+                &directory,
+                SecretArtifactKind::Candidate,
+                candidate_comparison_key,
+                candidate_digest,
+                Some((prior_comparison_key, prior_digest)),
+            )?;
+            remove_verified_secret_artifact(
+                &paths.backup,
+                &directory,
+                SecretArtifactKind::Prior,
+                candidate_comparison_key,
+                candidate_digest,
+                Some((prior_comparison_key, prior_digest)),
+            )?;
+            sync_owner_only_directory(parent, &directory)?;
+            Err(SecureFileError::OverwriteRequired)
+        }
+        NoReplaceMoveOutcome::SourceMissing => {
+            restore_parked_secret(
+                &paths.backup,
+                &paths.destination,
+                parent,
+                &directory,
+                SecretArtifactKind::Prior,
+                candidate_comparison_key,
+                candidate_digest,
+                Some((prior_comparison_key, prior_digest)),
+            )?;
+            Err(SecureFileError::UnsafeOrUnavailable)
+        }
+    }
+}
+
+/// Restores the owner-only backup after a failed replacement, or removes a
+/// newly published destination when no prior secret existed. Every artifact
+/// is verified against a journal-supplied keyed digest before deletion or
+/// replacement. Repeating rollback accepts only an already-restored prior
+/// destination or an already-deleted new destination.
+#[allow(clippy::too_many_arguments)]
+pub fn rollback_owner_only_secret_file(
+    paths: &OwnerOnlySecretFilePaths,
+    overwritten: bool,
+    candidate_comparison_key: &[u8],
+    candidate_digest: &[u8; 32],
+    prior_comparison_key: Option<&[u8]>,
+    prior_digest: Option<&[u8; 32]>,
+) -> Result<(), SecureFileError> {
+    let parent = paths
+        .destination
+        .parent()
+        .ok_or(SecureFileError::RollbackFailed)?;
+    let directory =
+        open_or_create_owner_only_directory(parent).map_err(|_| SecureFileError::RollbackFailed)?;
+    let prior_evidence = match (prior_comparison_key, prior_digest) {
+        (Some(key), Some(digest)) => Some((key, digest)),
+        (None, None) => None,
+        _ => return Err(SecureFileError::RollbackFailed),
+    };
+    let restores_prior = overwritten || prior_evidence.is_some();
+    let classify = |path: &Path| {
+        classify_secret_artifact(
+            path,
+            candidate_comparison_key,
+            candidate_digest,
+            prior_evidence,
+        )
+        .map_err(|_| SecureFileError::RollbackFailed)
+    };
+    let destination = classify(&paths.destination)?;
+    let mut staging = classify(&paths.staging)?;
+    let backup = classify(&paths.backup)?;
+
+    if destination != SecretArtifactKind::Missing && staging != SecretArtifactKind::Missing {
+        match (destination, staging, backup) {
+            (
+                SecretArtifactKind::Unowned | SecretArtifactKind::Prior,
+                SecretArtifactKind::Candidate,
+                SecretArtifactKind::Missing | SecretArtifactKind::Prior,
+            ) => {
+                remove_verified_secret_artifact(
+                    &paths.staging,
+                    &directory,
+                    SecretArtifactKind::Candidate,
+                    candidate_comparison_key,
+                    candidate_digest,
+                    prior_evidence,
+                )
+                .map_err(|_| SecureFileError::RollbackFailed)?;
+                if backup == SecretArtifactKind::Prior {
+                    remove_verified_secret_artifact(
+                        &paths.backup,
+                        &directory,
+                        SecretArtifactKind::Prior,
+                        candidate_comparison_key,
+                        candidate_digest,
+                        prior_evidence,
+                    )
+                    .map_err(|_| SecureFileError::RollbackFailed)?;
+                }
+                return sync_owner_only_directory(parent, &directory)
+                    .map_err(|_| SecureFileError::RollbackFailed);
+            }
+            (SecretArtifactKind::Candidate, SecretArtifactKind::Candidate, _) => {
+                remove_verified_secret_artifact(
+                    &paths.staging,
+                    &directory,
+                    SecretArtifactKind::Candidate,
+                    candidate_comparison_key,
+                    candidate_digest,
+                    prior_evidence,
+                )
+                .map_err(|_| SecureFileError::RollbackFailed)?;
+                staging = SecretArtifactKind::Missing;
+            }
+            _ => return Err(SecureFileError::RollbackFailed),
+        }
+    }
+
+    if destination != SecretArtifactKind::Missing {
+        debug_assert_eq!(staging, SecretArtifactKind::Missing);
+        match move_sibling_file_without_replace(&paths.destination, &paths.staging, &directory)
+            .map_err(|_| SecureFileError::RollbackFailed)?
+        {
+            NoReplaceMoveOutcome::Moved => {
+                sync_owner_only_directory(parent, &directory)
+                    .map_err(|_| SecureFileError::RollbackFailed)?;
+            }
+            NoReplaceMoveOutcome::SourceMissing | NoReplaceMoveOutcome::DestinationOccupied => {
+                return Err(SecureFileError::RollbackFailed);
+            }
+        }
+    }
+
+    staging = classify(&paths.staging)?;
+    let backup = classify(&paths.backup)?;
+    match (staging, backup) {
+        (
+            SecretArtifactKind::Candidate,
+            SecretArtifactKind::Prior | SecretArtifactKind::Unowned,
+        ) => {
+            restore_parked_secret(
+                &paths.backup,
+                &paths.destination,
+                parent,
+                &directory,
+                backup,
+                candidate_comparison_key,
+                candidate_digest,
+                prior_evidence,
+            )
+            .map_err(|_| SecureFileError::RollbackFailed)?;
+            remove_verified_secret_artifact(
+                &paths.staging,
+                &directory,
+                SecretArtifactKind::Candidate,
+                candidate_comparison_key,
+                candidate_digest,
+                prior_evidence,
+            )
+            .map_err(|_| SecureFileError::RollbackFailed)?;
+        }
+        (SecretArtifactKind::Candidate, SecretArtifactKind::Missing) if !restores_prior => {
+            remove_verified_secret_artifact(
+                &paths.staging,
+                &directory,
+                SecretArtifactKind::Candidate,
+                candidate_comparison_key,
+                candidate_digest,
+                prior_evidence,
+            )
+            .map_err(|_| SecureFileError::RollbackFailed)?;
+        }
+        (SecretArtifactKind::Unowned, SecretArtifactKind::Missing | SecretArtifactKind::Prior) => {
+            restore_parked_secret(
+                &paths.staging,
+                &paths.destination,
+                parent,
+                &directory,
+                SecretArtifactKind::Unowned,
+                candidate_comparison_key,
+                candidate_digest,
+                prior_evidence,
+            )
+            .map_err(|_| SecureFileError::RollbackFailed)?;
+            if backup == SecretArtifactKind::Prior {
+                remove_verified_secret_artifact(
+                    &paths.backup,
+                    &directory,
+                    SecretArtifactKind::Prior,
+                    candidate_comparison_key,
+                    candidate_digest,
+                    prior_evidence,
+                )
+                .map_err(|_| SecureFileError::RollbackFailed)?;
+            }
+        }
+        (SecretArtifactKind::Prior, SecretArtifactKind::Missing | SecretArtifactKind::Prior) => {
+            restore_parked_secret(
+                &paths.staging,
+                &paths.destination,
+                parent,
+                &directory,
+                SecretArtifactKind::Prior,
+                candidate_comparison_key,
+                candidate_digest,
+                prior_evidence,
+            )
+            .map_err(|_| SecureFileError::RollbackFailed)?;
+            if backup == SecretArtifactKind::Prior {
+                remove_verified_secret_artifact(
+                    &paths.backup,
+                    &directory,
+                    SecretArtifactKind::Prior,
+                    candidate_comparison_key,
+                    candidate_digest,
+                    prior_evidence,
+                )
+                .map_err(|_| SecureFileError::RollbackFailed)?;
+            }
+        }
+        (SecretArtifactKind::Missing, SecretArtifactKind::Prior | SecretArtifactKind::Unowned) => {
+            restore_parked_secret(
+                &paths.backup,
+                &paths.destination,
+                parent,
+                &directory,
+                backup,
+                candidate_comparison_key,
+                candidate_digest,
+                prior_evidence,
+            )
+            .map_err(|_| SecureFileError::RollbackFailed)?;
+        }
+        (SecretArtifactKind::Missing, SecretArtifactKind::Missing) if !restores_prior => {}
+        _ => return Err(SecureFileError::RollbackFailed),
+    }
+    sync_owner_only_directory(parent, &directory).map_err(|_| SecureFileError::RollbackFailed)
+}
+
+/// Removes deterministic staging and backup artifacts after the journal has
+/// durably recorded completion or a successful rollback.
+pub fn cleanup_owner_only_secret_file(
+    paths: &OwnerOnlySecretFilePaths,
+    candidate_evidence: Option<(&[u8], &[u8; 32])>,
+    prior_evidence: Option<(&[u8], &[u8; 32])>,
+) -> Result<(), SecureFileError> {
+    let parent = paths
+        .destination
+        .parent()
+        .ok_or(SecureFileError::UnsafeOrUnavailable)?;
+    let staging_exists = owner_only_secret_destination_exists(&paths.staging)?;
+    let backup_exists = owner_only_secret_destination_exists(&paths.backup)?;
+    if !staging_exists && !backup_exists {
+        return Ok(());
+    }
+    let directory = open_or_create_owner_only_directory(parent)?;
+    if staging_exists {
+        let (key, digest) = candidate_evidence.ok_or(SecureFileError::UnsafeOrUnavailable)?;
+        verify_owner_only_secret_digest(&paths.staging, key, digest)?;
+        remove_sibling_file(&paths.staging, &directory)?;
+    }
+    if backup_exists {
+        let (key, digest) = prior_evidence.ok_or(SecureFileError::UnsafeOrUnavailable)?;
+        verify_owner_only_secret_digest(&paths.backup, key, digest)?;
+        remove_sibling_file(&paths.backup, &directory)?;
+    }
+    sync_owner_only_directory(parent, &directory)
+}
+
+fn verify_owner_only_secret_digest(
+    path: &Path,
+    comparison_key: &[u8],
+    expected_digest: &[u8; 32],
+) -> Result<(), SecureFileError> {
+    let stored_digest = keyed_owner_only_secret_file_comparison_digest(path, comparison_key)?;
+    constant_time_digest_eq(&stored_digest, expected_digest)
+        .then_some(())
+        .ok_or(SecureFileError::UnsafeOrUnavailable)
+}
+
+fn secret_digest_matches(
+    path: &Path,
+    comparison_key: &[u8],
+    expected_digest: &[u8; 32],
+) -> Result<bool, SecureFileError> {
+    let stored = read_secure_file(path, SecurityPolicy::OwnerOnly, MAX_SECRET_FILE_BYTES)?;
+    let stored_digest = keyed_secret_comparison_digest(comparison_key, stored.as_slice())?;
+    Ok(constant_time_digest_eq(&stored_digest, expected_digest))
+}
+
+fn constant_time_digest_eq(left: &[u8; 32], right: &[u8; 32]) -> bool {
+    left.iter()
+        .zip(right)
+        .fold(0_u8, |difference, (left, right)| {
+            difference | (left ^ right)
+        })
+        == 0
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SecretArtifactKind {
+    Missing,
+    Candidate,
+    Prior,
+    Unowned,
+}
+
+fn classify_secret_artifact(
+    path: &Path,
+    candidate_comparison_key: &[u8],
+    candidate_digest: &[u8; 32],
+    prior_evidence: Option<(&[u8], &[u8; 32])>,
+) -> Result<SecretArtifactKind, SecureFileError> {
+    if !owner_only_secret_destination_exists(path)? {
+        return Ok(SecretArtifactKind::Missing);
+    }
+    if let Some((prior_comparison_key, prior_digest)) = prior_evidence
+        && secret_digest_matches(path, prior_comparison_key, prior_digest)?
+    {
+        return Ok(SecretArtifactKind::Prior);
+    }
+    if secret_digest_matches(path, candidate_comparison_key, candidate_digest)? {
+        return Ok(SecretArtifactKind::Candidate);
+    }
+    Ok(SecretArtifactKind::Unowned)
+}
+
+fn remove_verified_secret_artifact(
+    path: &Path,
+    directory: &OwnerOnlyDirectory,
+    expected: SecretArtifactKind,
+    candidate_comparison_key: &[u8],
+    candidate_digest: &[u8; 32],
+    prior_evidence: Option<(&[u8], &[u8; 32])>,
+) -> Result<(), SecureFileError> {
+    (classify_secret_artifact(
+        path,
+        candidate_comparison_key,
+        candidate_digest,
+        prior_evidence,
+    )? == expected)
+        .then_some(())
+        .ok_or(SecureFileError::UnsafeOrUnavailable)?;
+    remove_sibling_file(path, directory)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn restore_parked_secret(
+    source: &Path,
+    destination: &Path,
+    parent: &Path,
+    directory: &OwnerOnlyDirectory,
+    expected: SecretArtifactKind,
+    candidate_comparison_key: &[u8],
+    candidate_digest: &[u8; 32],
+    prior_evidence: Option<(&[u8], &[u8; 32])>,
+) -> Result<(), SecureFileError> {
+    let source_kind = classify_secret_artifact(
+        source,
+        candidate_comparison_key,
+        candidate_digest,
+        prior_evidence,
+    )?;
+    if source_kind != expected {
+        return Err(SecureFileError::UnsafeOrUnavailable);
+    }
+    match move_sibling_file_without_replace(source, destination, directory)? {
+        NoReplaceMoveOutcome::Moved => {
+            sync_owner_only_directory(parent, directory)?;
+            let restored_kind = classify_secret_artifact(
+                destination,
+                candidate_comparison_key,
+                candidate_digest,
+                prior_evidence,
+            )?;
+            (restored_kind == expected)
+                .then_some(())
+                .ok_or(SecureFileError::UnsafeOrUnavailable)
+        }
+        NoReplaceMoveOutcome::SourceMissing | NoReplaceMoveOutcome::DestinationOccupied => {
+            Err(SecureFileError::UnsafeOrUnavailable)
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum NoReplaceMoveOutcome {
+    Moved,
+    SourceMissing,
+    DestinationOccupied,
+}
+
+#[cfg(unix)]
+fn move_sibling_file_without_replace(
+    source: &Path,
+    destination: &Path,
+    directory: &OwnerOnlyDirectory,
+) -> Result<NoReplaceMoveOutcome, SecureFileError> {
+    let source_name = source
+        .file_name()
+        .ok_or(SecureFileError::UnsafeOrUnavailable)?;
+    let destination_name = destination
+        .file_name()
+        .ok_or(SecureFileError::UnsafeOrUnavailable)?;
+    match rustix::fs::renameat_with(
+        directory,
+        source_name,
+        directory,
+        destination_name,
+        rustix::fs::RenameFlags::NOREPLACE,
+    ) {
+        Ok(()) => Ok(NoReplaceMoveOutcome::Moved),
+        Err(rustix::io::Errno::NOENT) => Ok(NoReplaceMoveOutcome::SourceMissing),
+        Err(rustix::io::Errno::EXIST) => Ok(NoReplaceMoveOutcome::DestinationOccupied),
+        Err(_) => Err(SecureFileError::UnsafeOrUnavailable),
+    }
+}
+
+#[cfg(windows)]
+fn move_sibling_file_without_replace(
+    source: &Path,
+    destination: &Path,
+    _directory: &OwnerOnlyDirectory,
+) -> Result<NoReplaceMoveOutcome, SecureFileError> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Foundation::{
+        ERROR_ALREADY_EXISTS, ERROR_FILE_EXISTS, ERROR_FILE_NOT_FOUND, ERROR_PATH_NOT_FOUND,
+        GetLastError,
+    };
+    use windows_sys::Win32::Storage::FileSystem::{MOVEFILE_WRITE_THROUGH, MoveFileExW};
+
+    let source = source
+        .as_os_str()
+        .encode_wide()
+        .chain(Some(0))
+        .collect::<Vec<_>>();
+    let destination = destination
+        .as_os_str()
+        .encode_wide()
+        .chain(Some(0))
+        .collect::<Vec<_>>();
+    if unsafe {
+        MoveFileExW(
+            source.as_ptr(),
+            destination.as_ptr(),
+            MOVEFILE_WRITE_THROUGH,
+        )
+    } != 0
+    {
+        return Ok(NoReplaceMoveOutcome::Moved);
+    }
+    match unsafe { GetLastError() } {
+        ERROR_FILE_NOT_FOUND | ERROR_PATH_NOT_FOUND => Ok(NoReplaceMoveOutcome::SourceMissing),
+        ERROR_ALREADY_EXISTS | ERROR_FILE_EXISTS => Ok(NoReplaceMoveOutcome::DestinationOccupied),
+        _ => Err(SecureFileError::UnsafeOrUnavailable),
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
+fn move_sibling_file_without_replace(
+    _source: &Path,
+    _destination: &Path,
+    _directory: &OwnerOnlyDirectory,
+) -> Result<NoReplaceMoveOutcome, SecureFileError> {
+    Err(SecureFileError::UnsafeOrUnavailable)
+}
+
+#[cfg(unix)]
+fn remove_sibling_file(path: &Path, directory: &OwnerOnlyDirectory) -> Result<(), SecureFileError> {
+    use rustix::fs::AtFlags;
+
+    let file_name = path
+        .file_name()
+        .ok_or(SecureFileError::UnsafeOrUnavailable)?;
+    match rustix::fs::unlinkat(directory, file_name, AtFlags::empty()) {
+        Ok(()) | Err(rustix::io::Errno::NOENT) => Ok(()),
+        Err(_) => Err(SecureFileError::UnsafeOrUnavailable),
+    }
+}
+
+#[cfg(not(unix))]
+fn remove_sibling_file(
+    path: &Path,
+    _directory: &OwnerOnlyDirectory,
+) -> Result<(), SecureFileError> {
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(_) => Err(SecureFileError::UnsafeOrUnavailable),
     }
 }
 
@@ -171,7 +1144,7 @@ fn publish_new_file_without_replace(
 }
 
 #[cfg(unix)]
-fn sync_owner_only_directory(
+pub fn sync_owner_only_directory(
     path: &Path,
     _directory: &OwnerOnlyDirectory,
 ) -> Result<(), SecureFileError> {
@@ -182,7 +1155,7 @@ fn sync_owner_only_directory(
 }
 
 #[cfg(not(unix))]
-fn sync_owner_only_directory(
+pub fn sync_owner_only_directory(
     _path: &Path,
     _directory: &OwnerOnlyDirectory,
 ) -> Result<(), SecureFileError> {
@@ -1738,6 +2711,232 @@ mod tests {
     #[cfg(unix)]
     use std::os::unix::fs::{PermissionsExt, symlink};
 
+    const SSH_IDENTITY_OPERATION_ID: &str = "0195f6d5-18da-7a80-8000-000000000001";
+    const SSH_IDENTITY_BINARY_SHA256: &str =
+        "2222222222222222222222222222222222222222222222222222222222222222";
+    const SSH_IDENTITY_ARCHIVE_SHA256: &str =
+        "1111111111111111111111111111111111111111111111111111111111111111";
+
+    #[cfg(any(unix, windows))]
+    fn ssh_identity_record(
+        target_id: &str,
+        state_root: &str,
+        exact_remote_path: &str,
+    ) -> SshIdentityCommitRecord {
+        SshIdentityCommitRecord::new(
+            SSH_IDENTITY_OPERATION_ID,
+            crate::session::HostIdentityRef::new(
+                "host-0195f6d5-18da-7a80-8000-000000000002".to_string(),
+            )
+            .expect("valid Host Identity fixture"),
+            target_id,
+            state_root,
+            "0.1.0",
+            SSH_IDENTITY_ARCHIVE_SHA256,
+            SSH_IDENTITY_BINARY_SHA256,
+            exact_remote_path,
+        )
+        .expect("valid SSH identity operation record")
+    }
+
+    #[cfg(any(unix, windows))]
+    fn posix_ssh_identity_record() -> SshIdentityCommitRecord {
+        ssh_identity_record(
+            "linux-x64-gnu",
+            "/home/operator/.local/state/satelle",
+            &format!(
+                "/home/operator/.cache/satelle/bootstrap/{SSH_IDENTITY_OPERATION_ID}/{SSH_IDENTITY_BINARY_SHA256}/satelle"
+            ),
+        )
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn ssh_identity_commit_record_v2_roundtrips_with_exact_field_order() {
+        let record = posix_ssh_identity_record();
+        let encoded = format!(
+            concat!(
+                "satelle.ssh-host-identity-commit.v2\n",
+                "operation_id={0}\n",
+                "candidate_host_identity=host-0195f6d5-18da-7a80-8000-000000000002\n",
+                "target_id=linux-x64-gnu\n",
+                "canonical_state_root=/home/operator/.local/state/satelle\n",
+                "artifact_version=0.1.0\n",
+                "archive_sha256={1}\n",
+                "binary_sha256={2}\n",
+                "exact_remote_path=/home/operator/.cache/satelle/bootstrap/",
+                "{0}/{2}/satelle"
+            ),
+            SSH_IDENTITY_OPERATION_ID, SSH_IDENTITY_ARCHIVE_SHA256, SSH_IDENTITY_BINARY_SHA256,
+        );
+
+        assert_eq!(record.encode(), encoded);
+        assert_eq!(
+            SshIdentityCommitRecord::parse(&encoded).expect("parse exact v2 record"),
+            record
+        );
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn ssh_identity_commit_record_parser_rejects_schema_field_and_line_drift() {
+        let encoded = posix_ssh_identity_record().encode();
+        let lines = encoded.lines().collect::<Vec<_>>();
+        let mut swapped = lines.clone();
+        swapped.swap(2, 3);
+        let missing = lines[..lines.len() - 1].join("\n");
+        let duplicated = format!("{encoded}\n{}", lines[8]);
+
+        for invalid in [
+            encoded.replacen(
+                "satelle.ssh-host-identity-commit.v2",
+                "satelle.ssh-host-identity-commit.v1",
+                1,
+            ),
+            swapped.join("\n"),
+            missing,
+            duplicated,
+            format!("{encoded}\nunknown=value"),
+            format!("{encoded}\n"),
+        ] {
+            assert!(
+                SshIdentityCommitRecord::parse(&invalid).is_err(),
+                "schema shape must fail closed: {invalid:?}"
+            );
+        }
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn ssh_identity_commit_record_rejects_noncanonical_text_uuid_target_and_digests() {
+        let encoded = posix_ssh_identity_record().encode();
+        for invalid in [
+            encoded.replace("artifact_version=0.1.0", "artifact_version=0.1.0\0"),
+            encoded.replace("artifact_version=0.1.0", "artifact_version=0.1.0\r"),
+            encoded.replace(
+                "artifact_version=0.1.0",
+                "artifact_version=0.1.0\ninjected=x",
+            ),
+            encoded.replace("artifact_version=0.1.0", "artifact_version=0.1.\u{e9}"),
+            encoded.replace(
+                SSH_IDENTITY_OPERATION_ID,
+                "0195F6D5-18DA-7A80-8000-000000000001",
+            ),
+            encoded.replace(
+                SSH_IDENTITY_OPERATION_ID,
+                "0195f6d5-18da-4a80-8000-000000000001",
+            ),
+            encoded.replace("target_id=linux-x64-gnu", "target_id=linux-x64-musl"),
+            encoded.replace(
+                SSH_IDENTITY_ARCHIVE_SHA256,
+                "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+            ),
+            encoded.replace(SSH_IDENTITY_ARCHIVE_SHA256, &"1".repeat(63)),
+            encoded.replace(
+                SSH_IDENTITY_BINARY_SHA256,
+                "gggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggg",
+            ),
+        ] {
+            assert!(
+                SshIdentityCommitRecord::parse(&invalid).is_err(),
+                "noncanonical record text must fail closed: {invalid:?}"
+            );
+        }
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn ssh_identity_commit_record_requires_exact_platform_operation_path() {
+        let posix_path = format!(
+            "/home/operator/.cache/satelle/bootstrap/{SSH_IDENTITY_OPERATION_ID}/{SSH_IDENTITY_BINARY_SHA256}/satelle"
+        );
+        let posix = ssh_identity_record(
+            "darwin-arm64",
+            "/Users/operator/.local/state/satelle",
+            &posix_path,
+        );
+        assert_eq!(posix.exact_remote_path(), posix_path);
+
+        let windows_path = format!(
+            "C:\\Users\\operator\\AppData\\Local\\satelle\\bootstrap\\{SSH_IDENTITY_OPERATION_ID}\\{SSH_IDENTITY_BINARY_SHA256}\\satelle.exe"
+        );
+        let windows = ssh_identity_record("win32-x64-msvc", "C:\\Satelle\\state", &windows_path);
+        assert_eq!(windows.exact_remote_path(), windows_path);
+
+        for (target, state_root, invalid_path) in [
+            (
+                "linux-x64-gnu",
+                "/home/operator/.local/state/satelle",
+                format!(
+                    "home/operator/.cache/satelle/bootstrap/{SSH_IDENTITY_OPERATION_ID}/{SSH_IDENTITY_BINARY_SHA256}/satelle"
+                ),
+            ),
+            (
+                "linux-x64-gnu",
+                "/home/operator/.local/state/satelle",
+                format!(
+                    "/home/operator/.cache/satelle/bootstrap/0195f6d5-18da-7a80-8000-000000000099/{SSH_IDENTITY_BINARY_SHA256}/satelle"
+                ),
+            ),
+            (
+                "linux-x64-gnu",
+                "/home/operator/.local/state/satelle",
+                format!(
+                    "/home/operator/.cache/satelle/bootstrap/{SSH_IDENTITY_OPERATION_ID}/{}/satelle",
+                    "33".repeat(32)
+                ),
+            ),
+            (
+                "linux-x64-gnu",
+                "/home/operator/.local/state/satelle",
+                format!(
+                    "/home/operator/.cache/satelle/bootstrap/{SSH_IDENTITY_OPERATION_ID}/{SSH_IDENTITY_BINARY_SHA256}/satelle.exe"
+                ),
+            ),
+            (
+                "win32-x64-msvc",
+                "C:\\Satelle\\state",
+                format!(
+                    "C:Users\\operator\\AppData\\Local\\satelle\\bootstrap\\{SSH_IDENTITY_OPERATION_ID}\\{SSH_IDENTITY_BINARY_SHA256}\\satelle.exe"
+                ),
+            ),
+            (
+                "win32-x64-msvc",
+                "C:\\Satelle\\state",
+                format!(
+                    "C:\\Users\\operator\\AppData\\Local\\satelle\\bootstrap\\{SSH_IDENTITY_OPERATION_ID}\\{SSH_IDENTITY_BINARY_SHA256}\\satelle"
+                ),
+            ),
+        ] {
+            assert!(
+                SshIdentityCommitRecord::new(
+                    SSH_IDENTITY_OPERATION_ID,
+                    crate::session::HostIdentityRef::new(
+                        "host-0195f6d5-18da-7a80-8000-000000000002".to_string(),
+                    )
+                    .expect("valid Host Identity fixture"),
+                    target,
+                    state_root,
+                    "0.1.0",
+                    SSH_IDENTITY_ARCHIVE_SHA256,
+                    SSH_IDENTITY_BINARY_SHA256,
+                    invalid_path,
+                )
+                .is_err(),
+                "noncanonical platform path must fail closed"
+            );
+        }
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn ssh_identity_commit_record_parser_enforces_maximum_encoded_size() {
+        let mut oversized = posix_ssh_identity_record().encode();
+        oversized.push_str(&"x".repeat(4_097 - oversized.len()));
+        assert_eq!(oversized.len(), 4_097);
+        assert!(SshIdentityCommitRecord::parse(&oversized).is_err());
+    }
+
     #[cfg(unix)]
     fn secure_test_root(path: &Path) {
         #[cfg(target_os = "macos")]
@@ -1948,6 +3147,321 @@ mod tests {
                     .to_string_lossy()
                     .ends_with(".tmp")),
             "atomic publication must consume or clean every staging name"
+        );
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn journaled_secret_paths_are_deterministic_and_reject_unsafe_identifiers() {
+        let destination = Path::new("/private/provider-token");
+        let paths = OwnerOnlySecretFilePaths::new(destination, "019abc-operation_4")
+            .expect("create deterministic journal paths");
+        assert_eq!(paths.destination(), destination);
+        assert_eq!(
+            paths.staging(),
+            Path::new("/private/provider-token.satelle-019abc-operation_4.staged")
+        );
+        assert_eq!(
+            paths.backup(),
+            Path::new("/private/provider-token.satelle-019abc-operation_4.backup")
+        );
+        assert!(OwnerOnlySecretFilePaths::new(destination, "../escape").is_err());
+        assert!(OwnerOnlySecretFilePaths::new(destination, "raw secret").is_err());
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn keyed_secret_comparisons_are_not_raw_secret_hashes() {
+        let first = keyed_secret_comparison_digest(b"installation-key-a", b"provider-secret")
+            .expect("compute keyed digest");
+        let second = keyed_secret_comparison_digest(b"installation-key-b", b"provider-secret")
+            .expect("compute keyed digest");
+        let raw: [u8; 32] = Sha256::digest(b"provider-secret").into();
+        assert_ne!(first, second);
+        assert_ne!(first, raw);
+        assert!(keyed_secret_comparison_digest(b"", b"provider-secret").is_err());
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn journaled_secret_replacement_can_rollback_and_cleanup() {
+        let temporary_root = tempfile::tempdir().expect("create temporary root");
+        #[cfg(unix)]
+        secure_test_root(temporary_root.path());
+        let directory = temporary_root.path().join("owner-only");
+        drop(open_or_create_owner_only_directory(&directory).expect("create owner-only directory"));
+        let destination = directory.join("provider-token");
+        persist_new_owner_only_secret_file(&destination, "prior-secret")
+            .expect("persist prior secret");
+        let paths =
+            OwnerOnlySecretFilePaths::new(&destination, "journal-1").expect("create journal paths");
+        let candidate_key = b"candidate-comparison-key";
+        let prior_key = b"prior-comparison-key";
+        let candidate_digest = keyed_secret_comparison_digest(candidate_key, b"replacement-secret")
+            .expect("compute replacement digest");
+        let prior_digest = keyed_secret_comparison_digest(prior_key, b"prior-secret")
+            .expect("compute prior digest");
+
+        stage_owner_only_secret_file(
+            &paths,
+            "replacement-secret",
+            candidate_key,
+            &candidate_digest,
+        )
+        .expect("stage replacement");
+        assert!(owner_only_secret_destination_exists(&destination).expect("preview destination"));
+        assert!(
+            publish_owner_only_secret_file(
+                &paths,
+                true,
+                true,
+                candidate_key,
+                &candidate_digest,
+                Some(prior_key),
+                Some(&prior_digest),
+            )
+            .expect("publish replacement")
+        );
+        assert_eq!(
+            read_owner_only_secret_file(&destination)
+                .expect("read replacement")
+                .as_str(),
+            "replacement-secret"
+        );
+        assert!(paths.backup().exists());
+
+        rollback_owner_only_secret_file(
+            &paths,
+            true,
+            candidate_key,
+            &candidate_digest,
+            Some(prior_key),
+            Some(&prior_digest),
+        )
+        .expect("restore prior secret");
+        rollback_owner_only_secret_file(
+            &paths,
+            true,
+            prior_key,
+            &prior_digest,
+            Some(prior_key),
+            Some(&prior_digest),
+        )
+        .expect("repeat completed rollback");
+        assert_eq!(
+            read_owner_only_secret_file(&destination)
+                .expect("read restored secret")
+                .as_str(),
+            "prior-secret"
+        );
+        cleanup_owner_only_secret_file(
+            &paths,
+            Some((candidate_key, &candidate_digest)),
+            Some((prior_key, &prior_digest)),
+        )
+        .expect("remove journal artifacts");
+        assert!(!paths.staging().exists());
+        assert!(!paths.backup().exists());
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn journaled_replacement_restores_a_rotation_observed_during_park() {
+        let temporary_root = tempfile::tempdir().expect("create temporary root");
+        #[cfg(unix)]
+        secure_test_root(temporary_root.path());
+        let directory = temporary_root.path().join("owner-only");
+        drop(open_or_create_owner_only_directory(&directory).expect("create owner-only directory"));
+        let destination = directory.join("provider-token");
+        persist_new_owner_only_secret_file(&destination, "prior-secret")
+            .expect("persist prior secret");
+        let paths = OwnerOnlySecretFilePaths::new(&destination, "journal-park-rotation")
+            .expect("create journal paths");
+        let candidate_key = b"candidate-comparison-key";
+        let prior_key = b"prior-comparison-key";
+        let candidate_digest = keyed_secret_comparison_digest(candidate_key, b"candidate-secret")
+            .expect("compute candidate digest");
+        let prior_digest = keyed_secret_comparison_digest(prior_key, b"prior-secret")
+            .expect("compute prior digest");
+
+        stage_owner_only_secret_file(&paths, "candidate-secret", candidate_key, &candidate_digest)
+            .expect("stage candidate");
+        std::fs::write(&destination, "rotated-secret").expect("rotate destination before park");
+
+        assert!(matches!(
+            publish_owner_only_secret_file(
+                &paths,
+                true,
+                true,
+                candidate_key,
+                &candidate_digest,
+                Some(prior_key),
+                Some(&prior_digest),
+            ),
+            Err(SecureFileError::OverwriteRequired)
+        ));
+        assert_eq!(
+            read_owner_only_secret_file(&destination)
+                .expect("read restored rotation")
+                .as_str(),
+            "rotated-secret"
+        );
+        assert!(paths.staging().exists());
+        assert!(!paths.backup().exists());
+        cleanup_owner_only_secret_file(
+            &paths,
+            Some((candidate_key, &candidate_digest)),
+            Some((prior_key, &prior_digest)),
+        )
+        .expect("discard candidate after rejected replacement");
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn journaled_rollback_preserves_a_post_publish_rotation() {
+        let temporary_root = tempfile::tempdir().expect("create temporary root");
+        #[cfg(unix)]
+        secure_test_root(temporary_root.path());
+        let directory = temporary_root.path().join("owner-only");
+        drop(open_or_create_owner_only_directory(&directory).expect("create owner-only directory"));
+        let destination = directory.join("provider-token");
+        persist_new_owner_only_secret_file(&destination, "prior-secret")
+            .expect("persist prior secret");
+        let paths = OwnerOnlySecretFilePaths::new(&destination, "journal-post-publish-rotation")
+            .expect("create journal paths");
+        let candidate_key = b"candidate-comparison-key";
+        let prior_key = b"prior-comparison-key";
+        let candidate_digest = keyed_secret_comparison_digest(candidate_key, b"candidate-secret")
+            .expect("compute candidate digest");
+        let prior_digest = keyed_secret_comparison_digest(prior_key, b"prior-secret")
+            .expect("compute prior digest");
+
+        stage_owner_only_secret_file(&paths, "candidate-secret", candidate_key, &candidate_digest)
+            .expect("stage candidate");
+        assert!(
+            publish_owner_only_secret_file(
+                &paths,
+                true,
+                true,
+                candidate_key,
+                &candidate_digest,
+                Some(prior_key),
+                Some(&prior_digest),
+            )
+            .expect("publish candidate")
+        );
+        std::fs::write(&destination, "rotated-secret").expect("rotate published credential");
+
+        rollback_owner_only_secret_file(
+            &paths,
+            true,
+            candidate_key,
+            &candidate_digest,
+            Some(prior_key),
+            Some(&prior_digest),
+        )
+        .expect("preserve post-publish rotation");
+        assert_eq!(
+            read_owner_only_secret_file(&destination)
+                .expect("read preserved rotation")
+                .as_str(),
+            "rotated-secret"
+        );
+        assert!(!paths.staging().exists());
+        assert!(!paths.backup().exists());
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn journaled_new_secret_publish_is_atomic_and_idempotently_staged() {
+        let temporary_root = tempfile::tempdir().expect("create temporary root");
+        #[cfg(unix)]
+        secure_test_root(temporary_root.path());
+        let directory = temporary_root.path().join("owner-only");
+        drop(open_or_create_owner_only_directory(&directory).expect("create owner-only directory"));
+        let destination = directory.join("provider-token");
+        let paths =
+            OwnerOnlySecretFilePaths::new(&destination, "journal-2").expect("create journal paths");
+        let key = b"installation-comparison-key";
+        let expected =
+            keyed_secret_comparison_digest(key, b"new-secret").expect("compute secret digest");
+
+        stage_owner_only_secret_file(&paths, "new-secret", key, &expected)
+            .expect("stage new secret");
+        stage_owner_only_secret_file(&paths, "new-secret", key, &expected)
+            .expect("resume matching staged secret");
+        assert!(
+            !publish_owner_only_secret_file(&paths, false, false, key, &expected, None, None,)
+                .expect("publish new secret")
+        );
+        assert_eq!(
+            read_owner_only_secret_file(&destination)
+                .expect("read new secret")
+                .as_str(),
+            "new-secret"
+        );
+        cleanup_owner_only_secret_file(&paths, Some((key, &expected)), None)
+            .expect("cleanup completed operation");
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn journaled_new_secret_publish_rejects_a_post_intent_overwrite_race() {
+        let temporary_root = tempfile::tempdir().expect("create temporary root");
+        #[cfg(unix)]
+        secure_test_root(temporary_root.path());
+        let directory = temporary_root.path().join("owner-only");
+        drop(open_or_create_owner_only_directory(&directory).expect("create owner-only directory"));
+        let destination = directory.join("provider-token");
+        let paths = OwnerOnlySecretFilePaths::new(&destination, "journal-race")
+            .expect("create journal paths");
+        let key = b"installation-comparison-key";
+        let expected =
+            keyed_secret_comparison_digest(key, b"candidate").expect("compute candidate digest");
+        stage_owner_only_secret_file(&paths, "candidate", key, &expected).expect("stage candidate");
+        persist_new_owner_only_secret_file(&destination, "racing-prior")
+            .expect("create destination after T0");
+
+        assert_eq!(
+            publish_owner_only_secret_file(&paths, false, true, key, &expected, None, None,),
+            Err(SecureFileError::OverwriteRequired)
+        );
+        assert_eq!(
+            read_owner_only_secret_file(&destination)
+                .expect("read racing destination")
+                .as_str(),
+            "racing-prior"
+        );
+        cleanup_owner_only_secret_file(&paths, Some((key, &expected)), None)
+            .expect("discard verified candidate");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn journaled_staging_never_follows_a_preoccupied_symlink() {
+        let temporary_root = tempfile::tempdir().expect("create temporary root");
+        secure_test_root(temporary_root.path());
+        let directory = temporary_root.path().join("owner-only");
+        drop(open_or_create_owner_only_directory(&directory).expect("create owner-only directory"));
+        let destination = directory.join("provider-token");
+        let paths =
+            OwnerOnlySecretFilePaths::new(&destination, "journal-3").expect("create journal paths");
+        let victim = directory.join("victim");
+        persist_new_owner_only_secret_file(&victim, "victim-secret").expect("create victim");
+        std::os::unix::fs::symlink(&victim, paths.staging()).expect("preoccupy staging path");
+        let key = b"installation-comparison-key";
+        let expected =
+            keyed_secret_comparison_digest(key, b"new-secret").expect("compute secret digest");
+
+        assert_eq!(
+            stage_owner_only_secret_file(&paths, "new-secret", key, &expected),
+            Err(SecureFileError::UnsafeOrUnavailable)
+        );
+        assert_eq!(
+            read_owner_only_secret_file(&victim)
+                .expect("read untouched victim")
+                .as_str(),
+            "victim-secret"
         );
     }
 

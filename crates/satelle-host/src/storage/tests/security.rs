@@ -207,6 +207,7 @@ fn lifecycle_schema_excludes_raw_content_and_replayable_event_history() {
             "logs",
             "maintenance_leases",
             "native_readiness_results",
+            "provider_secret_provisioning_journal",
             "provider_smoke_hmac_key",
             "provider_smoke_results",
             "schema_migrations",
@@ -219,6 +220,37 @@ fn lifecycle_schema_excludes_raw_content_and_replayable_event_history() {
             "turn_private_refs",
             "turns",
         ]
+    );
+
+    assert_table_columns(
+        &storage,
+        "provider_secret_provisioning_journal",
+        &[
+            "operation_id",
+            "operation",
+            "host_identity_ref",
+            "desktop_binding_ref",
+            "provider_probe_ref",
+            "requested_model_alias",
+            "requested_provider_alias",
+            "model",
+            "model_provider",
+            "endpoint",
+            "auth_source_json",
+            "experimental_provider_computer_use",
+            "allow_project_selection",
+            "destination_path",
+            "staged_path",
+            "backup_path",
+            "destination_existed",
+            "expected_previous_binding_digest",
+            "candidate_binding_digest",
+            "candidate_secret_hmac",
+            "prior_secret_hmac",
+            "phase",
+            "created_at",
+            "updated_at",
+        ],
     );
 
     assert_table_columns(
@@ -362,6 +394,91 @@ fn lifecycle_schema_excludes_raw_content_and_replayable_event_history() {
             "skip_reason",
         ],
     );
+}
+
+#[test]
+fn provider_secret_journal_rejects_non_file_sources_and_raw_secret_fields() {
+    let state = TempDir::new().expect("temporary state directory");
+    let (storage, _) = Storage::open(state.path()).expect("open storage");
+    let connection = storage.connection_for_test();
+    let host_identity = storage.host_identity().expect("load Host Identity");
+    connection
+        .execute(
+            "INSERT INTO idempotency_records (
+                principal_ref, operation, idempotency_key, operation_id,
+                request_digest, digest_schema_version, hmac_key_version,
+                status, durable_outcome, created_at, expires_at
+             ) VALUES (
+                'principal-journal', 'provider_secret_provisioning', 'key-journal',
+                'operation-journal', ?1, 1, 1, 'in_progress',
+                'v1.provider_secret_provisioning.pending',
+                '2026-07-26T00:00:00Z', '2026-07-27T00:00:00Z'
+             )",
+            ["a".repeat(64)],
+        )
+        .expect("insert provisioning idempotency owner");
+    let insert = |auth_source_json: &str| {
+        connection.execute(
+            "INSERT INTO provider_secret_provisioning_journal (
+                operation_id, host_identity_ref, desktop_binding_ref, provider_probe_ref,
+                requested_model_alias, requested_provider_alias, model, model_provider,
+                auth_source_json, experimental_provider_computer_use,
+                allow_project_selection, destination_path, staged_path, backup_path,
+                destination_existed, candidate_binding_digest, candidate_secret_hmac,
+                phase, created_at, updated_at
+             ) VALUES (
+                'operation-journal', ?1, 'desktop-journal', 'probe-journal',
+                'model-alias', 'provider-alias', 'model', 'provider',
+                ?2, 1, 0, '/secure/key', '/secure/key.staged', NULL,
+                NULL, ?3, ?4, 'planned',
+                '2026-07-26T00:00:00Z', '2026-07-26T00:00:00Z'
+             )",
+            params![
+                host_identity.as_str(),
+                auth_source_json,
+                "b".repeat(64),
+                "c".repeat(64),
+            ],
+        )
+    };
+    assert!(
+        insert(r#"{"kind":"environment","variable":"RAW_SECRET_CANARY"}"#).is_err(),
+        "only a normalized File descriptor may enter the journal"
+    );
+    insert(r#"{"kind":"file","path":"/secure/key"}"#)
+        .expect("T0 persists without trusting an advisory destination preview");
+    assert!(
+        connection
+            .execute(
+                "UPDATE provider_secret_provisioning_journal
+                 SET destination_existed = 1, phase = 'staged'
+                 WHERE operation_id = 'operation-journal'",
+                [],
+            )
+            .is_err(),
+        "staging must atomically record the re-inspected prior state"
+    );
+    connection
+        .execute(
+            "UPDATE provider_secret_provisioning_journal
+             SET destination_existed = 1, backup_path = '/secure/key.backup',
+                 prior_secret_hmac = ?1, phase = 'staged'
+             WHERE operation_id = 'operation-journal'",
+            ["d".repeat(64)],
+        )
+        .expect("record the prior keyed HMAC with the staged phase");
+
+    let stored_json: String = connection
+        .query_row(
+            "SELECT auth_source_json
+             FROM provider_secret_provisioning_journal
+             WHERE operation_id = 'operation-journal'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("load stored descriptor");
+    assert!(!stored_json.contains("RAW_SECRET_CANARY"));
+    assert!(!stored_json.contains("secret_value"));
 }
 
 #[test]

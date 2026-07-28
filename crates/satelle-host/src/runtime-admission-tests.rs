@@ -522,6 +522,7 @@ impl ReadinessProbeDriver for MaintenanceProbeFixture {
         _cached: Option<crate::ReadinessEvidence>,
         _cached_provider: Option<crate::ProviderSmokeResult>,
         _provider_intent: &crate::ProviderComputerUseIntent,
+        _provider_secret: Option<crate::provider_auth::ResolvedProviderSecret>,
         _cancellation: &crate::AdmissionCancellation,
         _persist_thread_ref: &mut dyn FnMut(&str) -> Result<(), ()>,
         _persist_turn_ref: &mut dyn FnMut(&str) -> Result<(), ()>,

@@ -3,7 +3,7 @@ use satelle_core::daemon_service::{
     DaemonArtifactPlan, DaemonServicePlan, DaemonServicePlatform, PersistentServiceDecision,
     SetupModeSelection, WindowsServiceConfigV1, WindowsTaskDefinition,
 };
-use satelle_core::session::{PublicSession, TurnAdmissionFailure};
+use satelle_core::session::{HostIdentityRef, PublicSession, TurnAdmissionFailure};
 use satelle_core::{
     ApiTokenSource, DaemonPathOverrides, DirectHostBinding, DoctorOptions, DoctorReport, ErrorCode,
     HostSessionsReport, HostSessionsSchemaVersion, LOCAL_DEMO_HOST, SatelleError, SatelleEvent,
@@ -18,16 +18,20 @@ use satelle_host::{
 };
 use satelle_transport::{
     ApiError, ApiErrorCode, DaemonClient, DaemonClientError, DaemonEventClient, DaemonEventError,
-    TurnRequest,
+    DaemonServer, DaemonServerConfig, DaemonShutdownHandle, TurnRequest,
 };
 use std::collections::BTreeSet;
 use std::future::Future;
+use std::net::{Ipv4Addr, SocketAddr};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
+use std::thread;
 use std::time::{Duration, Instant};
 use std::{fs, path::Path};
 use uuid::Uuid;
+use zeroize::Zeroizing;
 
 const SSH_DAEMON_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const SSH_DAEMON_LAUNCH_TIMEOUT: Duration = Duration::from_secs(30);
@@ -220,6 +224,36 @@ pub(crate) struct ProviderDescriptorValidationReport {
     pub(crate) validation: satelle_core::ProviderAuthValidationResult,
 }
 
+fn setup_provider_intent(
+    request: &satelle_transport::SetupVerificationRequest,
+) -> Result<satelle_host::ProviderComputerUseIntent, SatelleError> {
+    let provider_intent = match (request.model_alias(), request.provider_alias()) {
+        (None, None) => satelle_host::ProviderComputerUseIntent::host_default(),
+        (Some(model_alias), Some(provider_alias)) => satelle_host::ProviderComputerUseIntent::new(
+            Some(
+                satelle_core::session::EffectiveModelRef::new(model_alias)
+                    .map_err(|error| SatelleError::invalid_usage(error.to_string()))?,
+            ),
+            Some(
+                satelle_core::session::ProviderBindingRef::new(provider_alias)
+                    .map_err(|error| SatelleError::invalid_usage(error.to_string()))?,
+            ),
+            true,
+        )
+        .with_project_selection_provenance(
+            request.model_from_project(),
+            request.provider_from_project(),
+        ),
+        _ => {
+            return Err(SatelleError::invalid_usage(
+                "setup verification model and provider aliases must be supplied together",
+            ));
+        }
+    };
+    Ok(provider_intent
+        .with_experimental_provider_computer_use(request.experimental_provider_computer_use()))
+}
+
 /// The command surface is intentionally exhaustive. A new transport operation
 /// must be implemented or explicitly rejected by every backend.
 pub(crate) trait TransportClient {
@@ -239,10 +273,30 @@ pub(crate) trait TransportClient {
         options: DoctorOptions,
         provider_intent: &satelle_host::ProviderComputerUseIntent,
     ) -> Result<DoctorReport, SatelleError>;
+    fn verify_setup(
+        &self,
+        request: &satelle_transport::SetupVerificationRequest,
+    ) -> Result<DoctorReport, SatelleError>;
+    fn invalidate_native_readiness(
+        &self,
+        request: &satelle_transport::SetupVerificationRequest,
+    ) -> Result<u64, SatelleError>;
     fn authorize_provider_binding(
         &self,
         authorization: &satelle_core::ProviderBindingAuthorization,
     ) -> Result<satelle_core::PublicResolvedProviderBinding, SatelleError>;
+    fn preview_provider_secret_provisioning(
+        &self,
+        metadata: &satelle_transport::ProviderSecretProvisioningMetadata,
+        idempotency_key: &str,
+    ) -> Result<satelle_transport::ProviderSecretProvisioningPreviewResponse, SatelleError>;
+    fn provision_provider_secret(
+        &self,
+        preview: &satelle_transport::ProviderSecretProvisioningPreviewResponse,
+        metadata: &satelle_transport::ProviderSecretProvisioningMetadata,
+        secret: Zeroizing<Vec<u8>>,
+        idempotency_key: &str,
+    ) -> Result<satelle_transport::ProviderSecretProvisioningResponse, SatelleError>;
     fn validate_provider_descriptor(
         &self,
         model_alias: &str,
@@ -281,11 +335,16 @@ pub(crate) trait TransportClient {
 struct LocalTransport {
     alias: String,
     service: HostService,
+    provider_secret_bridge: Mutex<Option<LocalProviderSecretBridge>>,
 }
 
 impl LocalTransport {
     fn new(alias: String, service: HostService) -> Self {
-        Self { alias, service }
+        Self {
+            alias,
+            service,
+            provider_secret_bridge: Mutex::new(None),
+        }
     }
 
     fn attached(
@@ -570,6 +629,23 @@ impl TransportClient for LocalTransport {
             .doctor_with_provider_intent(&self.alias, scope, options, provider_intent)
     }
 
+    fn verify_setup(
+        &self,
+        request: &satelle_transport::SetupVerificationRequest,
+    ) -> Result<DoctorReport, SatelleError> {
+        let provider_intent = setup_provider_intent(request)?;
+        self.service.verify_setup(&self.alias, &provider_intent)
+    }
+
+    fn invalidate_native_readiness(
+        &self,
+        request: &satelle_transport::SetupVerificationRequest,
+    ) -> Result<u64, SatelleError> {
+        let provider_intent = setup_provider_intent(request)?;
+        self.service
+            .invalidate_native_readiness(&self.alias, &provider_intent)
+    }
+
     fn validate_provider_descriptor(
         &self,
         model_alias: &str,
@@ -610,6 +686,42 @@ impl TransportClient for LocalTransport {
                 authorization.clone(),
             )
             .map(|binding| satelle_core::PublicResolvedProviderBinding::from(&binding))
+    }
+
+    fn preview_provider_secret_provisioning(
+        &self,
+        metadata: &satelle_transport::ProviderSecretProvisioningMetadata,
+        idempotency_key: &str,
+    ) -> Result<satelle_transport::ProviderSecretProvisioningPreviewResponse, SatelleError> {
+        let bridge = LocalProviderSecretBridge::start(&self.alias, self.service.clone())?;
+        let preview = bridge
+            .client
+            .preview_provider_secret_provisioning(metadata, idempotency_key)
+            .map_err(|error| direct_transport_error(&self.alias, error))?;
+        *self
+            .provider_secret_bridge
+            .lock()
+            .map_err(|_| SatelleError::host_unreachable(&self.alias))? = Some(bridge);
+        Ok(preview)
+    }
+
+    fn provision_provider_secret(
+        &self,
+        preview: &satelle_transport::ProviderSecretProvisioningPreviewResponse,
+        metadata: &satelle_transport::ProviderSecretProvisioningMetadata,
+        secret: Zeroizing<Vec<u8>>,
+        idempotency_key: &str,
+    ) -> Result<satelle_transport::ProviderSecretProvisioningResponse, SatelleError> {
+        let bridge = self
+            .provider_secret_bridge
+            .lock()
+            .map_err(|_| SatelleError::host_unreachable(&self.alias))?
+            .take()
+            .ok_or_else(SatelleError::state_conflict)?;
+        bridge
+            .client
+            .provision_provider_secret(preview, metadata, secret, idempotency_key)
+            .map_err(|error| direct_transport_error(&self.alias, error))
     }
 
     fn host_status(&self) -> Result<HostStatus, SatelleError> {
@@ -710,6 +822,92 @@ impl TransportClient for LocalTransport {
             return Err(SatelleError::host_not_found(self.alias.clone()));
         }
         self.service.daemon_log_page(query)
+    }
+}
+
+struct LocalProviderSecretBridge {
+    client: DaemonClient,
+    shutdown: DaemonShutdownHandle,
+    server_thread: Option<thread::JoinHandle<()>>,
+}
+
+fn local_provider_secret_bridge_startup_channel<T>() -> (mpsc::SyncSender<T>, mpsc::Receiver<T>) {
+    // A rendezvous makes successful send the exact ownership handoff. Once a
+    // timed-out receiver drops, a late server cannot enter its wait loop.
+    mpsc::sync_channel(0)
+}
+
+impl LocalProviderSecretBridge {
+    fn start(alias: &str, service: HostService) -> Result<Self, SatelleError> {
+        let token =
+            ApiBearerToken::generate().map_err(|_| SatelleError::host_unreachable(alias))?;
+        let host_identity = service.initialize_daemon()?.host_identity().to_string();
+        let service = service.with_ephemeral_bootstrap_auth(
+            &token,
+            ApiScopes::ADMIN,
+            time::OffsetDateTime::now_utc() + time::Duration::minutes(5),
+        );
+        let (started_tx, started_rx) = local_provider_secret_bridge_startup_channel();
+        let server_thread = thread::Builder::new()
+            .name("satelle-local-provider-secret".to_string())
+            .spawn(move || {
+                let runtime = match tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                {
+                    Ok(runtime) => runtime,
+                    Err(error) => {
+                        let _ = started_tx.send(Err(error.to_string()));
+                        return;
+                    }
+                };
+                runtime.block_on(async move {
+                    let server = match DaemonServer::bind(
+                        service,
+                        DaemonServerConfig::loopback(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))),
+                    )
+                    .await
+                    {
+                        Ok(server) => server,
+                        Err(error) => {
+                            let _ = started_tx.send(Err(format!("{} ({error})", error.code())));
+                            return;
+                        }
+                    };
+                    let started =
+                        started_tx.send(Ok((server.local_addr(), server.shutdown_handle())));
+                    if started.is_ok() {
+                        let _ = server.wait().await;
+                    }
+                });
+            })
+            .map_err(|_| SatelleError::host_unreachable(alias))?;
+        let (address, shutdown) = started_rx
+            .recv_timeout(Duration::from_secs(30))
+            .map_err(|_| SatelleError::host_unreachable(alias))?
+            .map_err(|detail| SatelleError::host_unreachable(&format!("{alias} ({detail})")))?;
+        let client = match DaemonClient::loopback(address, token, host_identity) {
+            Ok(client) => client,
+            Err(error) => {
+                shutdown.request_shutdown();
+                let _ = server_thread.join();
+                return Err(direct_transport_error(alias, error));
+            }
+        };
+        Ok(Self {
+            client,
+            shutdown,
+            server_thread: Some(server_thread),
+        })
+    }
+}
+
+impl Drop for LocalProviderSecretBridge {
+    fn drop(&mut self) {
+        self.shutdown.request_shutdown();
+        if let Some(server_thread) = self.server_thread.take() {
+            let _ = server_thread.join();
+        }
     }
 }
 
@@ -1128,9 +1326,7 @@ impl SshSetupTransport {
         address: std::net::SocketAddr,
         token: ApiBearerToken,
     ) -> Result<CurrentDaemonArtifactObservation, SatelleError> {
-        // Keep a zeroizing copy only when first trust may need to reconstruct
-        // the non-Clone token for a client bound to the discovered identity.
-        let exposed_token = self.requires_first_trust.then(|| token.expose());
+        let first_trust_token = self.requires_first_trust.then(|| token.expose());
         let client = DaemonClient::loopback_with_timeout(
             address,
             token,
@@ -1138,48 +1334,38 @@ impl SshSetupTransport {
             SSH_DAEMON_REQUEST_TIMEOUT,
         )
         .map_err(|error| direct_transport_error(&self.alias, error))?;
-        let capabilities = match client.capabilities() {
-            Err(DaemonClientError::Api { status: _, error })
-                if self.requires_first_trust
-                    && error.code() == ApiErrorCode::HostIdentityMismatch =>
-            {
-                // Identity discovery validates the structured mismatch but does
-                // not persist trust. The configured credential still has to
-                // authenticate the rebound capabilities request.
-                let observed_identity =
-                    client
-                        .discover_host_identity()
-                        .map_err(|error| match error {
-                            DaemonClientError::Api { status: _, error }
-                                if matches!(
-                                    error.code(),
-                                    ApiErrorCode::AuthenticationFailed
-                                        | ApiErrorCode::HostIdentityMismatch
-                                ) =>
-                            {
-                                self.unauthenticated_daemon_version_error()
-                            }
-                            error => direct_transport_error(&self.alias, error),
-                        })?;
-                let token = ApiBearerToken::parse(
-                    exposed_token
-                        .as_ref()
-                        .expect("first trust retains the configured probe token")
-                        .as_str(),
-                )
-                .map_err(|_| SatelleError::host_unreachable(&self.alias))?;
-                let rebound_client = DaemonClient::loopback_with_timeout(
-                    address,
-                    token,
-                    observed_identity,
-                    SSH_DAEMON_REQUEST_TIMEOUT,
-                )
-                .map_err(|error| direct_transport_error(&self.alias, error))?;
-                rebound_client.capabilities()
-            }
-            capabilities => capabilities,
-        };
-        self.current_daemon_observation_from_capabilities(capabilities)
+        if self.requires_first_trust {
+            let discovered_identity =
+                client
+                    .discover_host_identity()
+                    .map_err(|error| match error {
+                        DaemonClientError::Api { status: _, error }
+                            if matches!(
+                                error.code(),
+                                ApiErrorCode::AuthenticationFailed
+                                    | ApiErrorCode::HostIdentityMismatch
+                            ) =>
+                        {
+                            self.unauthenticated_daemon_version_error()
+                        }
+                        error => direct_transport_error(&self.alias, error),
+                    })?;
+            let token = ApiBearerToken::parse(
+                first_trust_token
+                    .expect("first-trust probing retains its typed credential")
+                    .as_str(),
+            )
+            .map_err(|_| SatelleError::host_unreachable(&self.alias))?;
+            let client = DaemonClient::loopback_with_timeout(
+                address,
+                token,
+                discovered_identity,
+                SSH_DAEMON_REQUEST_TIMEOUT,
+            )
+            .map_err(|error| direct_transport_error(&self.alias, error))?;
+            return self.current_daemon_observation_from_capabilities(client.capabilities());
+        }
+        self.current_daemon_observation_from_capabilities(client.capabilities())
     }
 
     fn current_daemon_observation_from_capabilities(
@@ -1453,10 +1639,12 @@ impl SshSetupTransport {
             }
         }
         SetupReport {
-            schema_version: SetupSchemaVersion::V1,
+            schema_version: SetupSchemaVersion::V2,
             host: self.alias.clone(),
             dry_run,
             status: status.to_string(),
+            cancellation_reason: None,
+            verification: None,
             setup_mode,
             service_persistent,
             service_scope: if service_persistent {
@@ -1492,7 +1680,18 @@ impl SshSetupTransport {
                 native_computer_use: "not_checked".to_string(),
                 provider_auth: "not_checked".to_string(),
             },
+            descriptor_configured: false,
+            secret_provisioned: false,
+            validation_status: "not_checked".to_string(),
+            provider_smoke_test_status: "not_checked".to_string(),
             daemon_path_overrides: path_override_entries,
+            changed: applied
+                && (service_persistent
+                    || matches!(
+                        application,
+                        SetupApplication::AppliedNewToken
+                            | SetupApplication::AppliedPendingActivation
+                    )),
             mutated: applied
                 && (service_persistent
                     || matches!(
@@ -1500,6 +1699,7 @@ impl SshSetupTransport {
                         SetupApplication::AppliedNewToken
                             | SetupApplication::AppliedPendingActivation
                     )),
+            mutation_planned: true,
             native_computer_use_readiness: "not_checked".to_string(),
             next_command,
         }
@@ -3173,6 +3373,25 @@ impl TransportClient for SshSetupTransport {
         Err(self.unsupported("doctor"))
     }
 
+    fn verify_setup(
+        &self,
+        _request: &satelle_transport::SetupVerificationRequest,
+    ) -> Result<DoctorReport, SatelleError> {
+        // Setup uses this transport only while bootstrapping. Live verification
+        // must rebuild the configured Host transport after setup so it cannot
+        // depend on the temporary bootstrap daemon or credential.
+        Err(SatelleError::state_conflict())
+    }
+
+    fn invalidate_native_readiness(
+        &self,
+        _request: &satelle_transport::SetupVerificationRequest,
+    ) -> Result<u64, SatelleError> {
+        // The caller must rebuild the configured Host transport after setup
+        // before invalidating Host-owned readiness state.
+        Err(SatelleError::state_conflict())
+    }
+
     fn validate_provider_descriptor(
         &self,
         _model_alias: &str,
@@ -3190,6 +3409,24 @@ impl TransportClient for SshSetupTransport {
         _authorization: &satelle_core::ProviderBindingAuthorization,
     ) -> Result<satelle_core::PublicResolvedProviderBinding, SatelleError> {
         Err(self.unsupported("provider binding authorization"))
+    }
+
+    fn preview_provider_secret_provisioning(
+        &self,
+        _metadata: &satelle_transport::ProviderSecretProvisioningMetadata,
+        _idempotency_key: &str,
+    ) -> Result<satelle_transport::ProviderSecretProvisioningPreviewResponse, SatelleError> {
+        Err(self.unsupported("provider secret provisioning preview"))
+    }
+
+    fn provision_provider_secret(
+        &self,
+        _preview: &satelle_transport::ProviderSecretProvisioningPreviewResponse,
+        _metadata: &satelle_transport::ProviderSecretProvisioningMetadata,
+        _secret: Zeroizing<Vec<u8>>,
+        _idempotency_key: &str,
+    ) -> Result<satelle_transport::ProviderSecretProvisioningResponse, SatelleError> {
+        Err(self.unsupported("provider secret provisioning"))
     }
 
     fn host_status(&self) -> Result<HostStatus, SatelleError> {
@@ -3275,6 +3512,37 @@ impl TransportClient for DirectTransport {
         Err(self.unsupported("doctor"))
     }
 
+    fn verify_setup(
+        &self,
+        request: &satelle_transport::SetupVerificationRequest,
+    ) -> Result<DoctorReport, SatelleError> {
+        self.client
+            .verify_setup(request, &format!("setup-verification-{}", Uuid::now_v7()))
+            .map(|response| response.verification().clone())
+            .map_err(|error| direct_transport_error(&self.alias, error))
+    }
+
+    fn invalidate_native_readiness(
+        &self,
+        request: &satelle_transport::SetupVerificationRequest,
+    ) -> Result<u64, SatelleError> {
+        let invalidation = satelle_transport::NativeReadinessInvalidationRequest::new(
+            request.model_alias().map(str::to_owned),
+            request.provider_alias().map(str::to_owned),
+            request.model_from_project(),
+            request.provider_from_project(),
+            request.experimental_provider_computer_use(),
+        )
+        .map_err(SatelleError::invalid_usage)?;
+        self.client
+            .invalidate_native_readiness(
+                &invalidation,
+                &format!("native-readiness-invalidation-{}", Uuid::now_v7()),
+            )
+            .map(|response| response.deleted())
+            .map_err(|error| direct_transport_error(&self.alias, error))
+    }
+
     fn validate_provider_descriptor(
         &self,
         model_alias: &str,
@@ -3316,6 +3584,28 @@ impl TransportClient for DirectTransport {
                 &format!("provider-authorization-{}", Uuid::now_v7()),
             )
             .map(|response| response.binding().clone())
+            .map_err(|error| direct_transport_error(&self.alias, error))
+    }
+
+    fn preview_provider_secret_provisioning(
+        &self,
+        metadata: &satelle_transport::ProviderSecretProvisioningMetadata,
+        idempotency_key: &str,
+    ) -> Result<satelle_transport::ProviderSecretProvisioningPreviewResponse, SatelleError> {
+        self.client
+            .preview_provider_secret_provisioning(metadata, idempotency_key)
+            .map_err(|error| direct_transport_error(&self.alias, error))
+    }
+
+    fn provision_provider_secret(
+        &self,
+        preview: &satelle_transport::ProviderSecretProvisioningPreviewResponse,
+        metadata: &satelle_transport::ProviderSecretProvisioningMetadata,
+        secret: Zeroizing<Vec<u8>>,
+        idempotency_key: &str,
+    ) -> Result<satelle_transport::ProviderSecretProvisioningResponse, SatelleError> {
+        self.client
+            .provision_provider_secret(preview, metadata, secret, idempotency_key)
             .map_err(|error| direct_transport_error(&self.alias, error))
     }
 
@@ -3595,14 +3885,18 @@ fn durable_ssh_clients(
         destination,
         LockFirstOperationKind::MissingDaemonRepair,
     )?;
-    confirm_bootstrap_lock(alias, &mut bootstrap_lock)?;
-    match client.capabilities() {
-        Ok(_) => {
+    match probe_durable_daemon_under_lock(
+        alias,
+        || confirm_bootstrap_lock(alias, &mut bootstrap_lock),
+        || observe_remote_durable_readiness(client.capabilities()),
+    )? {
+        DurableDaemonProbe::Ready(readiness) => {
+            require_exact_durable_readiness(alias, expected_host_identity, &readiness)?;
             bootstrap_lock
                 .release_unmodified()
                 .map_err(|_| SatelleError::host_unreachable(alias))?;
         }
-        Err(DaemonClientError::Transport(_)) => {
+        DurableDaemonProbe::Missing => {
             let bootstrap_token =
                 ApiBearerToken::generate().map_err(|_| SatelleError::host_unreachable(alias))?;
             let raw_bootstrap_token = bootstrap_token.expose();
@@ -3623,9 +3917,14 @@ fn durable_ssh_clients(
                 SSH_DAEMON_REQUEST_TIMEOUT,
             )
             .map_err(|error| direct_transport_error(alias, error))?;
-            finish_durable_daemon_launch(alias, &client, &bootstrap_client, &mut bootstrap_lock)?;
+            finish_durable_daemon_launch(
+                alias,
+                expected_host_identity,
+                &client,
+                &bootstrap_client,
+                &mut bootstrap_lock,
+            )?;
         }
-        Err(error) => return Err(direct_transport_error(alias, error)),
     }
     let event_client =
         DaemonEventClient::loopback(tunnel_addr, event_token, expected_host_identity)
@@ -3635,6 +3934,7 @@ fn durable_ssh_clients(
 
 fn finish_durable_daemon_launch(
     alias: &str,
+    expected_host_identity: &str,
     durable_client: &DaemonClient,
     bootstrap_client: &DaemonClient,
     bootstrap_lock: &mut ssh_bootstrap::SshBootstrapLock,
@@ -3651,33 +3951,159 @@ fn finish_durable_daemon_launch(
 
     // Only after the launch and maintenance handoff are terminal do we surface
     // the durable credential's independent authentication or scope result.
-    durable_client
-        .capabilities()
-        .map(|_| ())
-        .map_err(|error| direct_transport_error(alias, error))
+    authenticate_durable_with_confirmation(
+        alias,
+        expected_host_identity,
+        || Ok(()),
+        || observe_remote_durable_readiness(durable_client.capabilities()),
+        Instant::now() + SSH_DAEMON_LAUNCH_TIMEOUT,
+    )
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct DurableReadinessSnapshot {
+    daemon_version: String,
+    host_identity: String,
+}
+
+trait DurableReadiness {
+    fn daemon_version(&self) -> &str;
+    fn host_identity(&self) -> &str;
+}
+
+impl DurableReadiness for satelle_transport::CapabilitiesResponse {
+    fn daemon_version(&self) -> &str {
+        self.daemon_version()
+    }
+
+    fn host_identity(&self) -> &str {
+        self.host_identity()
+    }
+}
+
+impl DurableReadiness for DurableReadinessSnapshot {
+    fn daemon_version(&self) -> &str {
+        &self.daemon_version
+    }
+
+    fn host_identity(&self) -> &str {
+        &self.host_identity
+    }
+}
+
+enum DurableReadinessObservation {
+    Ready(DurableReadinessSnapshot),
+    ConnectFailure,
+    Failure(DaemonClientError),
+}
+
+fn observe_remote_durable_readiness<T: DurableReadiness>(
+    readiness: Result<T, DaemonClientError>,
+) -> DurableReadinessObservation {
+    match readiness {
+        Ok(capabilities) => DurableReadinessObservation::Ready(DurableReadinessSnapshot {
+            daemon_version: capabilities.daemon_version().to_string(),
+            host_identity: capabilities.host_identity().to_string(),
+        }),
+        Err(DaemonClientError::Transport(error)) if error.is_connect() => {
+            DurableReadinessObservation::ConnectFailure
+        }
+        Err(error) => DurableReadinessObservation::Failure(error),
+    }
+}
+
+enum DurableDaemonProbe {
+    Ready(DurableReadinessSnapshot),
+    Missing,
+}
+
+fn probe_durable_daemon_under_lock(
+    host: &str,
+    mut confirm_lock_ownership: impl FnMut() -> Result<(), SatelleError>,
+    readiness: impl FnOnce() -> DurableReadinessObservation,
+) -> Result<DurableDaemonProbe, SatelleError> {
+    confirm_lock_ownership()?;
+    let readiness = readiness();
+    confirm_lock_ownership()?;
+    match readiness {
+        DurableReadinessObservation::Ready(readiness) => Ok(DurableDaemonProbe::Ready(readiness)),
+        DurableReadinessObservation::ConnectFailure => Ok(DurableDaemonProbe::Missing),
+        DurableReadinessObservation::Failure(error) => Err(direct_transport_error(host, error)),
+    }
+}
+
+fn require_exact_durable_readiness(
+    host: &str,
+    expected_host_identity: &str,
+    readiness: &DurableReadinessSnapshot,
+) -> Result<(), SatelleError> {
+    if readiness.daemon_version != env!("CARGO_PKG_VERSION") {
+        return Err(SatelleError::remote_api_error(
+            host,
+            "unexpected-durable-daemon-version",
+        ));
+    }
+    if readiness.host_identity != expected_host_identity {
+        return Err(SatelleError::host_identity_mismatch(host));
+    }
+    Ok(())
+}
+
+fn authenticate_durable_with_confirmation(
+    host: &str,
+    expected_host_identity: &str,
+    mut confirm_lock_ownership: impl FnMut() -> Result<(), SatelleError>,
+    mut readiness: impl FnMut() -> DurableReadinessObservation,
+    deadline: Instant,
+) -> Result<(), SatelleError> {
+    loop {
+        confirm_lock_ownership()?;
+        let observation = readiness();
+        confirm_lock_ownership()?;
+        match observation {
+            DurableReadinessObservation::Ready(readiness) => {
+                return require_exact_durable_readiness(host, expected_host_identity, &readiness);
+            }
+            DurableReadinessObservation::Failure(error) => {
+                return Err(direct_transport_error(host, error));
+            }
+            DurableReadinessObservation::ConnectFailure => {
+                let now = Instant::now();
+                if now >= deadline {
+                    return Err(SatelleError::host_unreachable(host));
+                }
+                std::thread::sleep(SSH_DAEMON_LAUNCH_POLL_INTERVAL.min(deadline - now));
+            }
+        }
+    }
 }
 
 #[cfg(test)]
-fn relaunch_durable_daemon_under_lock<T>(
+fn relaunch_durable_daemon_under_lock(
     host: &str,
+    expected_host_identity: &str,
     mut confirm_lock_ownership: impl FnMut() -> Result<(), SatelleError>,
-    mut readiness: impl FnMut() -> Result<T, DaemonClientError>,
+    initial_readiness: impl FnOnce() -> DurableReadinessObservation,
     launch: impl FnOnce() -> Result<(), SatelleError>,
-) -> Result<T, SatelleError> {
-    // Another Controller may have completed startup while this Controller
-    // waited for the remote lock. Recheck before launching to avoid a second
-    // daemon and retain the lock until the selected daemon is authenticated.
-    confirm_lock_ownership()?;
-    let ready = match readiness() {
-        Ok(ready) => Ok(ready),
-        Err(DaemonClientError::Transport(_)) => {
-            launch()?;
-            wait_for_durable_daemon(host, readiness)
+    final_readiness: impl FnMut() -> DurableReadinessObservation,
+) -> Result<bool, SatelleError> {
+    match probe_durable_daemon_under_lock(host, &mut confirm_lock_ownership, initial_readiness)? {
+        DurableDaemonProbe::Ready(readiness) => {
+            require_exact_durable_readiness(host, expected_host_identity, &readiness)?;
+            Ok(false)
         }
-        Err(error) => return Err(direct_transport_error(host, error)),
-    }?;
-    confirm_lock_ownership()?;
-    Ok(ready)
+        DurableDaemonProbe::Missing => {
+            launch()?;
+            authenticate_durable_with_confirmation(
+                host,
+                expected_host_identity,
+                confirm_lock_ownership,
+                final_readiness,
+                Instant::now(),
+            )?;
+            Ok(true)
+        }
+    }
 }
 
 fn confirm_bootstrap_lock(
@@ -3802,7 +4228,7 @@ fn acquire_bootstrap_lock(
     destination: &str,
     operation_kind: LockFirstOperationKind,
 ) -> Result<ssh_bootstrap::SshBootstrapLock, SatelleError> {
-    let operation_id = format!("bootstrap-{}", Uuid::now_v7());
+    let operation_id = Uuid::now_v7().hyphenated().to_string();
     acquire_bootstrap_lock_for_operation(
         alias,
         destination,
@@ -3945,6 +4371,81 @@ fn setup_bootstrap_client(
     Ok((client, tunnel, bootstrap, handoff_token))
 }
 
+fn setup_fresh_bootstrap_client(
+    alias: &str,
+    destination: &str,
+    previous_host_config: &satelle_core::HostConfig,
+    host_config: &satelle_core::HostConfig,
+    identity_commit: ssh_bootstrap::InitialHostIdentityCommit<'_>,
+    remote_binary: &str,
+    bootstrap_lock: &mut ssh_bootstrap::SshBootstrapLock,
+) -> Result<
+    (
+        Arc<DaemonClient>,
+        SshTunnel,
+        SshBootstrapProcess,
+        HostSessionsReport,
+    ),
+    SatelleError,
+> {
+    let bootstrap_token =
+        ApiBearerToken::generate().map_err(|_| SatelleError::host_unreachable(alias))?;
+    let raw_bootstrap_token = bootstrap_token.expose();
+    let bootstrap = SshBootstrapProcess::launch_fresh(
+        destination,
+        &bootstrap_token,
+        host_config,
+        SshBootstrapScope::Admin,
+        identity_commit,
+        remote_binary,
+        bootstrap_lock,
+    )
+    .map_err(|error| map_ssh_daemon_bootstrap_error(alias, error))?;
+    commit_verified_bootstrap_mutation(alias, bootstrap_lock)?;
+    let tunnel =
+        SshTunnel::open_to(destination, bootstrap.remote_port()).map_err(|error| match error {
+            ssh_tunnel::SshTunnelError::HostKeyVerificationRequired => {
+                SatelleError::ssh_host_key_verification_required(alias)
+            }
+            _ => SatelleError::host_unreachable(alias),
+        })?;
+    let token = ApiBearerToken::parse(raw_bootstrap_token.as_str())
+        .map_err(|_| SatelleError::host_unreachable(alias))?;
+    let client = Arc::new(
+        DaemonClient::loopback_with_timeout(
+            tunnel.local_addr(),
+            token,
+            identity_commit.host_identity.as_str(),
+            SSH_DAEMON_REQUEST_TIMEOUT,
+        )
+        .map_err(|error| direct_transport_error(alias, error))?
+        .with_admission_timeout(admission_request_timeout(previous_host_config)),
+    );
+    client
+        .capabilities()
+        .map_err(|error| direct_transport_error(alias, error))
+        .and_then(|capabilities| {
+            client
+                .desktop_sessions()
+                .map_err(|error| direct_transport_error(alias, error))
+                .map(|desktop_sessions| HostSessionsReport {
+                    schema_version: HostSessionsSchemaVersion::V1,
+                    host: alias.to_string(),
+                    detected_platform: capabilities.platform().to_string(),
+                    connection_mode: "ssh-bootstrap".to_string(),
+                    bootstrapped: true,
+                    bootstrap_actions: vec![
+                        "committed the accepted Host Identity and started an authenticated temporary Host Daemon"
+                            .to_string(),
+                    ],
+                    host_daemon_version: capabilities.daemon_version().to_string(),
+                    sessions: desktop_sessions.sessions().to_vec(),
+                })
+        })
+        .map(|sessions| (client, tunnel, bootstrap, sessions))
+}
+
+#[cfg(all(test, unix))]
 fn discovered_bootstrap_client(
     alias: &str,
     tunnel_addr: std::net::SocketAddr,
@@ -4374,6 +4875,9 @@ fn api_error_is_definitively_not_admitted(code: ApiErrorCode) -> bool {
             | ApiErrorCode::ExperimentalProviderOptInRequired
             | ApiErrorCode::ModelProviderBindingMissing
             | ApiErrorCode::ProjectProviderSelectionNotAllowed
+            | ApiErrorCode::ProviderSecretSourceRequired
+            | ApiErrorCode::ProviderSecretProvisioningRequired
+            | ApiErrorCode::ProviderSecretOverwriteRequired
             | ApiErrorCode::ProviderSecretResolutionFailed
             | ApiErrorCode::ExperimentalProviderNotValidated
             | ApiErrorCode::CapacityExceeded
@@ -4409,9 +4913,25 @@ fn api_code_error(host: &str, code: ApiErrorCode) -> SatelleError {
             ErrorCode::ProjectProviderSelectionNotAllowed,
             "the project is not allowed to select this provider binding",
         ),
-        ApiErrorCode::ProviderSecretResolutionFailed => provider_api_error(
+        ApiErrorCode::ProviderSecretResolutionFailed => provider_secret_api_error(
+            host,
             ErrorCode::ProviderSecretResolutionFailed,
             "the Host could not resolve provider authentication",
+        ),
+        ApiErrorCode::ProviderSecretSourceRequired => provider_secret_api_error(
+            host,
+            ErrorCode::ProviderSecretSourceRequired,
+            "provider authentication requires a Secret Source descriptor",
+        ),
+        ApiErrorCode::ProviderSecretProvisioningRequired => provider_secret_api_error(
+            host,
+            ErrorCode::ProviderSecretProvisioningRequired,
+            "provider authentication requires interactive secret provisioning",
+        ),
+        ApiErrorCode::ProviderSecretOverwriteRequired => provider_secret_api_error(
+            host,
+            ErrorCode::ProviderSecretOverwriteRequired,
+            "provider secret replacement requires explicit confirmation",
         ),
         ApiErrorCode::ExperimentalProviderNotValidated => provider_api_error(
             ErrorCode::ExperimentalProviderNotValidated,
@@ -4431,6 +4951,18 @@ fn provider_api_error(code: ErrorCode, message: &str) -> SatelleError {
     }
 }
 
+fn provider_secret_api_error(host: &str, code: ErrorCode, message: &str) -> SatelleError {
+    SatelleError {
+        code,
+        message: message.to_string(),
+        recovery_command: Some(format!(
+            "satelle setup --host {host} --component provider-auth"
+        )),
+        source_detail: None,
+        details: std::collections::BTreeMap::new(),
+    }
+}
+
 fn local_host_service(host_config: &satelle_core::HostConfig) -> Result<HostService, CliFailure> {
     #[cfg(feature = "test-support")]
     match std::env::var(TEST_SUPPORT_ADAPTER_ENV) {
@@ -4443,12 +4975,15 @@ fn local_host_service(host_config: &satelle_core::HostConfig) -> Result<HostServ
         Ok(value) if value == "failing" => {
             return HostService::failing_local_demo_for_tests().map_err(failure);
         }
+        Ok(value) if value == "readiness-failing" => {
+            return HostService::readiness_failing_local_demo_for_tests().map_err(failure);
+        }
         Ok(value) if value == "resolved-secret-canary" => {
             return HostService::resolved_secret_canary_local_demo_for_tests().map_err(failure);
         }
         Ok(_) => {
             return Err(failure(SatelleError::invalid_usage(
-                "SATELLE_TEST_SUPPORT_ADAPTER must be exactly 'fake', 'pending', 'failing', 'resolved-secret-canary', or unset",
+                "SATELLE_TEST_SUPPORT_ADAPTER must be exactly 'fake', 'pending', 'failing', 'readiness-failing', 'resolved-secret-canary', or unset",
             )));
         }
         Err(std::env::VarError::NotUnicode(_)) => {
@@ -4553,6 +5088,234 @@ pub(crate) struct SshHostDiscovery {
     pub(crate) identity: String,
     pub(crate) authenticated_user: String,
     pub(crate) sessions: HostSessionsReport,
+    finalization: Option<SshTrustFinalization>,
+}
+
+impl SshHostDiscovery {
+    pub(crate) fn finalize_after_binding(&mut self) -> Result<(), SatelleError> {
+        let Some(mut finalization) = self.finalization.take() else {
+            return Ok(());
+        };
+        let finalized = (|| {
+            complete_bootstrap_handoff(
+                &finalization.alias,
+                &finalization.client,
+                &mut finalization.bootstrap_lock,
+            )?;
+            finalization
+                .target
+                .cleanup_identity_operation_artifact(
+                    &finalization.destination,
+                    &finalization.record,
+                    &mut finalization.bootstrap_lock,
+                )
+                .map_err(|error| map_ssh_daemon_bootstrap_error(&finalization.alias, error))?;
+            finalization
+                .bootstrap_lock
+                .release_committed_handoff()
+                .map_err(|_| SatelleError::host_unreachable(&finalization.alias))
+        })();
+        if finalized.is_err() {
+            // Keep the exact operation cleanup capability retryable. Host
+            // completion is idempotent; once it deleted the record, a retry
+            // can only remove the orphaned artifact and release this lock.
+            self.finalization = Some(finalization);
+        }
+        finalized
+    }
+}
+
+pub(crate) enum PendingSshTrust {
+    Live(Box<PendingLiveSshTrustCandidate>),
+    Fresh(Box<PendingSshTrustCandidate>),
+}
+
+impl PendingSshTrust {
+    pub(crate) fn identity(&self) -> &str {
+        match self {
+            Self::Live(candidate) => candidate.identity.as_str(),
+            Self::Fresh(candidate) => candidate.identity.as_str(),
+        }
+    }
+
+    pub(crate) fn accept(self) -> Result<SshHostDiscovery, SatelleError> {
+        match self {
+            Self::Live(candidate) => (*candidate).accept(),
+            Self::Fresh(candidate) => (*candidate).accept(),
+        }
+    }
+}
+
+pub(crate) struct PendingLiveSshTrustCandidate {
+    alias: String,
+    identity: String,
+    authenticated_user: String,
+    client: Arc<DaemonClient>,
+    _tunnel: SshTunnel,
+}
+
+impl PendingLiveSshTrustCandidate {
+    fn accept(self) -> Result<SshHostDiscovery, SatelleError> {
+        let capabilities = self
+            .client
+            .capabilities()
+            .map_err(|error| direct_transport_error(&self.alias, error))?;
+        let desktop_sessions = self
+            .client
+            .desktop_sessions()
+            .map_err(|error| direct_transport_error(&self.alias, error))?;
+        Ok(SshHostDiscovery {
+            identity: self.identity,
+            authenticated_user: self.authenticated_user,
+            sessions: HostSessionsReport {
+                schema_version: HostSessionsSchemaVersion::V1,
+                host: self.alias,
+                detected_platform: capabilities.platform().to_string(),
+                connection_mode: "ssh".to_string(),
+                bootstrapped: false,
+                bootstrap_actions: Vec::new(),
+                host_daemon_version: capabilities.daemon_version().to_string(),
+                sessions: desktop_sessions.sessions().to_vec(),
+            },
+            finalization: None,
+        })
+    }
+}
+
+enum IdentityOperationState {
+    Fresh,
+    Pending(satelle_core::SshIdentityCommitRecord),
+}
+
+struct SshTrustFinalization {
+    alias: String,
+    destination: String,
+    target: ssh_bootstrap::RemoteTarget,
+    record: satelle_core::SshIdentityCommitRecord,
+    client: Arc<DaemonClient>,
+    _tunnel: SshTunnel,
+    _bootstrap: SshBootstrapProcess,
+    bootstrap_lock: ssh_bootstrap::SshBootstrapLock,
+}
+
+pub(crate) struct PendingSshTrustCandidate {
+    alias: String,
+    destination: String,
+    authenticated_user: String,
+    previous_host_config: satelle_core::HostConfig,
+    host_config: satelle_core::HostConfig,
+    target: ssh_bootstrap::RemoteTarget,
+    state: IdentityOperationState,
+    identity: HostIdentityRef,
+    operation_id: String,
+}
+
+impl PendingSshTrustCandidate {
+    fn accept(self) -> Result<SshHostDiscovery, SatelleError> {
+        let observed_target = ssh_bootstrap::RemoteTarget::probe(&self.destination)
+            .map_err(|error| map_ssh_daemon_bootstrap_error(&self.alias, error))?;
+        if observed_target != self.target {
+            return Err(SatelleError::host_identity_mismatch(&self.alias));
+        }
+        let observed_directories =
+            ssh_bootstrap::RemoteUserDirectories::probe(&self.destination, observed_target)
+                .map_err(|error| map_ssh_daemon_bootstrap_error(&self.alias, error))?;
+        if observed_directories.authenticated_user() != self.authenticated_user {
+            return Err(SatelleError::host_identity_mismatch(&self.alias));
+        }
+        let mut bootstrap_lock = acquire_bootstrap_lock_for_operation(
+            &self.alias,
+            &self.destination,
+            self.operation_id.clone(),
+            LockFirstOperationKind::InitialSetup.operation_kind(),
+        )?;
+        confirm_bootstrap_lock(&self.alias, &mut bootstrap_lock)?;
+        let observed_state = self
+            .target
+            .inspect_initial_host_state(&self.destination, &observed_directories, &self.host_config)
+            .map_err(|error| map_ssh_daemon_bootstrap_error(&self.alias, error))?;
+        let record = match (&self.state, observed_state) {
+            (IdentityOperationState::Fresh, ssh_bootstrap::InitialHostState::Fresh) => {
+                let prepared = self
+                    .target
+                    .prepare_identity_operation(
+                        &observed_directories,
+                        &self.host_config,
+                        &self.operation_id,
+                        &self.identity,
+                    )
+                    .map_err(|error| map_ssh_daemon_bootstrap_error(&self.alias, error))?;
+                let record = prepared.record().clone();
+                if let Err(error) = self.target.begin_identity_operation(
+                    &self.destination,
+                    &prepared,
+                    &mut bootstrap_lock,
+                ) {
+                    let _ = self.target.cleanup_identity_operation_artifact(
+                        &self.destination,
+                        &record,
+                        &mut bootstrap_lock,
+                    );
+                    return Err(map_ssh_daemon_bootstrap_error(&self.alias, error));
+                }
+                record
+            }
+            (
+                IdentityOperationState::Pending(expected),
+                ssh_bootstrap::InitialHostState::PendingIdentityCommit(observed),
+            ) if expected == &observed => {
+                self.target
+                    .validate_pending_identity_operation(&self.destination, &observed)
+                    .map_err(|error| map_ssh_daemon_bootstrap_error(&self.alias, error))?;
+                observed
+            }
+            _ => return Err(SatelleError::host_identity_mismatch(&self.alias)),
+        };
+        // These guards stay bound through the authenticated handoff so neither
+        // the SSH tunnel nor its bootstrap daemon can end between requests.
+        let setup = setup_fresh_bootstrap_client(
+            &self.alias,
+            &self.destination,
+            &self.previous_host_config,
+            &self.host_config,
+            ssh_bootstrap::InitialHostIdentityCommit {
+                host_identity: &self.identity,
+                operation_id: &self.operation_id,
+                record: &record,
+            },
+            record.exact_remote_path(),
+            &mut bootstrap_lock,
+        );
+        let (client, tunnel, bootstrap, sessions) = match setup {
+            Ok(setup) => setup,
+            Err(error) => {
+                // Cleanup is allowed only while the Host record is absent. If
+                // Host reached its durable commit, this command refuses to
+                // remove the artifact and preserves an exact pending resume.
+                let _ = self.target.cleanup_identity_operation_artifact(
+                    &self.destination,
+                    &record,
+                    &mut bootstrap_lock,
+                );
+                return Err(error);
+            }
+        };
+        Ok(SshHostDiscovery {
+            identity: self.identity.as_str().to_string(),
+            authenticated_user: self.authenticated_user,
+            sessions,
+            finalization: Some(SshTrustFinalization {
+                alias: self.alias,
+                destination: self.destination,
+                target: self.target,
+                record,
+                client,
+                _tunnel: tunnel,
+                _bootstrap: bootstrap,
+                bootstrap_lock,
+            }),
+        })
+    }
 }
 
 pub(crate) fn authenticated_ssh_bootstrap_user(
@@ -4569,7 +5332,8 @@ pub(crate) fn authenticated_ssh_bootstrap_user(
 pub(crate) fn discover_ssh_host(
     host: &SelectedHost,
     daemon_path_overrides: &DaemonPathOverrides,
-) -> Result<SshHostDiscovery, SatelleError> {
+    requested_identity: Option<&str>,
+) -> Result<PendingSshTrust, SatelleError> {
     if host.config.transport != TransportKind::Ssh {
         return Err(SatelleError::invalid_usage(
             "SSH Host identity discovery requires an SSH Host Binding",
@@ -4582,64 +5346,143 @@ pub(crate) fn discover_ssh_host(
         .map_err(|error| SatelleError::config_error(error.to_string(), None))?;
     let target = ssh_bootstrap::RemoteTarget::probe(binding.destination())
         .map_err(|error| map_ssh_daemon_bootstrap_error(&host.alias, error))?;
-    let authenticated_user =
-        ssh_bootstrap::RemoteUserDirectories::probe(binding.destination(), target)
-            .map_err(|error| map_ssh_daemon_bootstrap_error(&host.alias, error))?
-            .authenticated_user()
-            .to_string();
-    let mut bootstrap_lock = acquire_bootstrap_lock(
-        &host.alias,
-        binding.destination(),
-        LockFirstOperationKind::InitialSetup,
-    )?;
-    confirm_bootstrap_lock(&host.alias, &mut bootstrap_lock)?;
+    let directories = ssh_bootstrap::RemoteUserDirectories::probe(binding.destination(), target)
+        .map_err(|error| map_ssh_daemon_bootstrap_error(&host.alias, error))?;
+    let authenticated_user = directories.authenticated_user().to_string();
+    let tunnel = SshTunnel::open(binding.destination()).map_err(|error| match error {
+        ssh_tunnel::SshTunnelError::HostKeyVerificationRequired => {
+            SatelleError::ssh_host_key_verification_required(&host.alias)
+        }
+        _ => SatelleError::host_unreachable(&host.alias),
+    })?;
+    let liveness_token =
+        ApiBearerToken::generate().map_err(|_| SatelleError::host_unreachable(&host.alias))?;
+    let liveness_client = DaemonClient::loopback_with_timeout(
+        tunnel.local_addr(),
+        liveness_token,
+        &probe_identity,
+        SSH_DAEMON_REQUEST_TIMEOUT,
+    )
+    .map_err(|error| direct_transport_error(&host.alias, error))?;
+    match liveness_client.live() {
+        Ok(_) => {
+            let setup_transport = SshSetupTransport::new(host)?;
+            let token = setup_transport.read_configured_durable_token()?;
+            let raw_token = token.expose();
+            let discovery_client = DaemonClient::loopback_with_timeout(
+                tunnel.local_addr(),
+                token,
+                &probe_identity,
+                SSH_DAEMON_REQUEST_TIMEOUT,
+            )
+            .map_err(|error| direct_transport_error(&host.alias, error))?;
+            let identity =
+                discovery_client
+                    .discover_host_identity()
+                    .map_err(|error| match error {
+                        DaemonClientError::Api { status: _, error }
+                            if matches!(
+                                error.code(),
+                                ApiErrorCode::AuthenticationFailed
+                                    | ApiErrorCode::HostIdentityMismatch
+                            ) =>
+                        {
+                            setup_transport.unauthenticated_daemon_version_error()
+                        }
+                        error => direct_transport_error(&host.alias, error),
+                    })?;
+            let token = ApiBearerToken::parse(raw_token.as_str())
+                .map_err(|_| SatelleError::host_unreachable(&host.alias))?;
+            let client = DaemonClient::loopback_with_timeout(
+                tunnel.local_addr(),
+                token,
+                &identity,
+                SSH_DAEMON_REQUEST_TIMEOUT,
+            )
+            .map_err(|error| direct_transport_error(&host.alias, error))?;
+            return Ok(PendingSshTrust::Live(Box::new(
+                PendingLiveSshTrustCandidate {
+                    alias: host.alias.clone(),
+                    identity,
+                    authenticated_user,
+                    client: Arc::new(client),
+                    _tunnel: tunnel,
+                },
+            )));
+        }
+        Err(DaemonClientError::Transport(error)) if error.is_connect() => {}
+        Err(error) => return Err(direct_transport_error(&host.alias, error)),
+    }
+    drop(tunnel);
     let mut selected_host_config = host.config.clone();
     selected_host_config.daemon_home = daemon_path_overrides.home.clone();
     selected_host_config.daemon_config_file = daemon_path_overrides.config_file.clone();
     selected_host_config.daemon_state_dir = daemon_path_overrides.state_dir.clone();
     selected_host_config.daemon_cache_dir = daemon_path_overrides.cache_dir.clone();
     selected_host_config.daemon_log_dir = daemon_path_overrides.log_dir.clone();
-    let (client, tunnel, _bootstrap, handoff_token) = setup_bootstrap_client(
-        &host.alias,
-        binding.destination(),
-        &probe_identity,
-        &host.config,
-        &selected_host_config,
-        SshBootstrapScope::Admin,
-        &mut bootstrap_lock,
-    )?;
-    let identity = client
-        .discover_host_identity()
-        .map_err(|error| direct_transport_error(&host.alias, error))?;
-    let authenticated_client =
-        discovered_bootstrap_client(&host.alias, tunnel.local_addr(), handoff_token, &identity)?;
-    let capabilities = authenticated_client
-        .capabilities()
-        .map_err(|error| direct_transport_error(&host.alias, error))?;
-    let desktop_sessions = authenticated_client
-        .desktop_sessions()
-        .map_err(|error| direct_transport_error(&host.alias, error))?;
-    let sessions = HostSessionsReport {
-        schema_version: HostSessionsSchemaVersion::V1,
-        host: host.alias.clone(),
-        detected_platform: capabilities.platform().to_string(),
-        connection_mode: "ssh-bootstrap".to_string(),
-        bootstrapped: true,
-        bootstrap_actions: vec![
-            "started an authenticated temporary Host Daemon for first-trust inspection".to_string(),
-        ],
-        host_daemon_version: capabilities.daemon_version().to_string(),
-        sessions: desktop_sessions.sessions().to_vec(),
+    let pending_resume = match target
+        .inspect_initial_host_state(binding.destination(), &directories, &selected_host_config)
+        .map_err(|error| map_ssh_daemon_bootstrap_error(&host.alias, error))?
+    {
+        ssh_bootstrap::InitialHostState::Fresh => None,
+        ssh_bootstrap::InitialHostState::Existing => {
+            return Err(SatelleError::config_error(
+                format!(
+                    "host '{}' has existing stopped Host state; start its canonical Host Daemon and retry with the configured durable credential",
+                    host.alias
+                ),
+                None,
+            ));
+        }
+        ssh_bootstrap::InitialHostState::PendingIdentityCommit(record) => {
+            if requested_identity
+                .is_some_and(|expected| expected != record.candidate_host_identity().as_str())
+            {
+                return Err(SatelleError::host_identity_mismatch(&host.alias));
+            }
+            Some(record)
+        }
     };
-    complete_bootstrap_handoff(&host.alias, &authenticated_client, &mut bootstrap_lock)?;
-    bootstrap_lock
-        .release_committed_handoff()
-        .map_err(|_| SatelleError::host_unreachable(&host.alias))?;
-    Ok(SshHostDiscovery {
-        identity,
+    let (operation_id, identity, state) = match pending_resume {
+        Some(record) => (
+            record.operation_id().to_string(),
+            record.candidate_host_identity().clone(),
+            IdentityOperationState::Pending(record),
+        ),
+        None => {
+            let identity = requested_identity.map_or_else(
+                || {
+                    Ok(
+                        HostIdentityRef::new(format!("host-{}", Uuid::now_v7().hyphenated()))
+                            .expect("a generated UUIDv7 Host Identity is valid"),
+                    )
+                },
+                |identity| {
+                    HostIdentityRef::new(identity.to_string()).map_err(|_| {
+                        SatelleError::invalid_usage(
+                            "--expected-host-id must be a valid Host Identity",
+                        )
+                    })
+                },
+            )?;
+            (
+                Uuid::now_v7().hyphenated().to_string(),
+                identity,
+                IdentityOperationState::Fresh,
+            )
+        }
+    };
+    Ok(PendingSshTrust::Fresh(Box::new(PendingSshTrustCandidate {
+        alias: host.alias.clone(),
+        destination: binding.destination().to_string(),
         authenticated_user,
-        sessions,
-    })
+        previous_host_config: host.config.clone(),
+        host_config: selected_host_config,
+        target,
+        state,
+        identity,
+        operation_id,
+    })))
 }
 
 #[cfg(test)]

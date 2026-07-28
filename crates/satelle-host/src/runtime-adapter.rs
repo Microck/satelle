@@ -106,6 +106,17 @@ impl ProviderComputerUseIntent {
         self.refresh
     }
 
+    pub fn with_refresh(mut self, refresh: bool) -> Self {
+        self.refresh = refresh;
+        self
+    }
+
+    /// Returns whether this explicit selection requires a provider smoke
+    /// probe in addition to native Computer Use readiness.
+    pub const fn provider_probe_required(&self) -> bool {
+        self.model.is_some() && self.provider.is_some() && self.experimental_provider_computer_use
+    }
+
     pub const fn experimental_provider_computer_use(&self) -> bool {
         self.experimental_provider_computer_use
     }
@@ -515,6 +526,7 @@ pub(crate) trait ReadinessProbeDriver: Send + Sync + 'static {
         cached: Option<ReadinessEvidence>,
         cached_provider: Option<ProviderSmokeResult>,
         provider_intent: &ProviderComputerUseIntent,
+        provider_secret: Option<crate::provider_auth::ResolvedProviderSecret>,
         cancellation: &super::request::AdmissionCancellation,
         persist_thread_ref: &mut dyn FnMut(&str) -> Result<(), ()>,
         persist_turn_ref: &mut dyn FnMut(&str) -> Result<(), ()>,

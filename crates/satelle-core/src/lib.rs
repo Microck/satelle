@@ -52,11 +52,15 @@ pub use events::{
 pub use ids::{IdParseError, SESSION_ID_PATTERN, SessionId, TurnId};
 pub use profiles::{ProfileField, ProfileSelectionSource, SelectedProfile};
 pub use secure_file::{
-    OwnerOnlyDirectory, SecureFileError, open_new_owner_only_file,
-    open_or_create_owner_only_directory, open_or_create_owner_only_file, open_owner_only_directory,
-    persist_new_owner_only_secret_file, read_bounded_regular_file_no_follow,
+    OwnerOnlyDirectory, OwnerOnlySecretFilePaths, SecureFileError, SshIdentityCommitRecord,
+    cleanup_owner_only_secret_file, keyed_owner_only_secret_file_comparison_digest,
+    keyed_secret_comparison_digest, open_new_owner_only_file, open_or_create_owner_only_directory,
+    open_or_create_owner_only_file, open_owner_only_directory,
+    owner_only_secret_destination_exists, persist_new_owner_only_secret_file,
+    publish_owner_only_secret_file, read_bounded_regular_file_no_follow,
     read_owner_controlled_config_file, read_owner_only_secret_config_file,
-    read_owner_only_secret_file, read_trusted_ca_bundle_file,
+    read_owner_only_secret_file, read_trusted_ca_bundle_file, rollback_owner_only_secret_file,
+    stage_owner_only_secret_file, sync_owner_only_directory,
 };
 
 pub const PRODUCT_NAME: &str = "Satelle";
@@ -410,6 +414,72 @@ pub enum ProviderSecretSource {
     File { path: PathBuf },
     CredentialStore { service: String, account: String },
     HostStore { name: String },
+}
+
+/// Secret-free Host preview returned before an interactive provisioning
+/// confirmation. The destination path and all credential material remain
+/// outside this serializable report.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProviderSecretProvisioningPreview {
+    destination_kind: String,
+    persistence_location_class: String,
+    overwrite_behavior: String,
+}
+
+impl ProviderSecretProvisioningPreview {
+    pub fn file() -> Self {
+        Self {
+            destination_kind: "file".to_string(),
+            persistence_location_class: "host_private_file".to_string(),
+            overwrite_behavior: "reject_existing_without_explicit_authorization".to_string(),
+        }
+    }
+
+    pub fn destination_kind(&self) -> &str {
+        &self.destination_kind
+    }
+
+    pub fn persistence_location_class(&self) -> &str {
+        &self.persistence_location_class
+    }
+
+    pub fn overwrite_behavior(&self) -> &str {
+        &self.overwrite_behavior
+    }
+}
+
+/// Secret-free Host result suitable for authenticated transport and
+/// idempotent replay. It records only the public destination class, overwrite
+/// outcome, and redacted validation status.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProviderSecretProvisioningResult {
+    destination_kind: String,
+    overwritten: bool,
+    validation_status: ProviderAuthValidationOutcome,
+}
+
+impl ProviderSecretProvisioningResult {
+    pub fn file(overwritten: bool, validation_status: ProviderAuthValidationOutcome) -> Self {
+        Self {
+            destination_kind: "file".to_string(),
+            overwritten,
+            validation_status,
+        }
+    }
+
+    pub fn destination_kind(&self) -> &str {
+        &self.destination_kind
+    }
+
+    pub const fn overwritten(&self) -> bool {
+        self.overwritten
+    }
+
+    pub const fn validation_status(&self) -> ProviderAuthValidationOutcome {
+        self.validation_status
+    }
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -1105,6 +1175,39 @@ mod provider_binding_config_tests {
             serde_json::to_value(resolved).expect("serialize resolved provider binding")["source"],
             serde_json::json!("host_owned")
         );
+    }
+
+    #[test]
+    fn provider_secret_provisioning_reports_are_redacted() {
+        let preview = ProviderSecretProvisioningPreview::file();
+        assert_eq!(preview.destination_kind(), "file");
+        assert_eq!(preview.persistence_location_class(), "host_private_file");
+        assert_eq!(
+            preview.overwrite_behavior(),
+            "reject_existing_without_explicit_authorization"
+        );
+        let preview_wire = serde_json::to_string(&preview).expect("serialize preview");
+        assert_eq!(
+            preview_wire,
+            r#"{"destination_kind":"file","persistence_location_class":"host_private_file","overwrite_behavior":"reject_existing_without_explicit_authorization"}"#
+        );
+
+        let result =
+            ProviderSecretProvisioningResult::file(true, ProviderAuthValidationOutcome::Resolved);
+        assert_eq!(result.destination_kind(), "file");
+        assert!(result.overwritten());
+        assert_eq!(
+            result.validation_status(),
+            ProviderAuthValidationOutcome::Resolved
+        );
+        let result_wire = serde_json::to_string(&result).expect("serialize result");
+        assert_eq!(
+            result_wire,
+            r#"{"destination_kind":"file","overwritten":true,"validation_status":"resolved"}"#
+        );
+        assert!(!preview_wire.contains("path"));
+        assert!(!preview_wire.contains("exists"));
+        assert!(!result_wire.contains("secret"));
     }
 
     #[test]
@@ -3737,6 +3840,9 @@ pub enum ErrorCode {
     UnsupportedProviderComputerUse,
     ExperimentalProviderOptInRequired,
     ModelProviderBindingMissing,
+    ProviderSecretSourceRequired,
+    ProviderSecretProvisioningRequired,
+    ProviderSecretOverwriteRequired,
     ProviderSecretResolutionFailed,
     ExperimentalProviderNotValidated,
     DoctorReadinessBlockersFound,
@@ -3756,6 +3862,7 @@ pub enum ErrorCode {
     UnsupportedUpdateComponent,
     PersistentServiceUnsupported,
     SetupConsentRequired,
+    SetupVerificationFailed,
     DoctorFixConsentRequired,
     InputRequired,
     Interrupted,
@@ -3835,6 +3942,9 @@ impl ErrorCode {
             Self::UnsupportedProviderComputerUse => "unsupported-provider-computer-use",
             Self::ExperimentalProviderOptInRequired => "experimental-provider-opt-in-required",
             Self::ModelProviderBindingMissing => "model-provider-binding-missing",
+            Self::ProviderSecretSourceRequired => "provider-secret-source-required",
+            Self::ProviderSecretProvisioningRequired => "provider-secret-provisioning-required",
+            Self::ProviderSecretOverwriteRequired => "provider-secret-overwrite-required",
             Self::ProviderSecretResolutionFailed => "provider-secret-resolution-failed",
             Self::ExperimentalProviderNotValidated => "experimental-provider-not-validated",
             Self::DoctorReadinessBlockersFound => "doctor-readiness-blockers-found",
@@ -3854,6 +3964,7 @@ impl ErrorCode {
             Self::UnsupportedUpdateComponent => "unsupported-update-component",
             Self::PersistentServiceUnsupported => "persistent-service-unsupported",
             Self::SetupConsentRequired => "setup-consent-required",
+            Self::SetupVerificationFailed => "setup-verification-failed",
             Self::DoctorFixConsentRequired => "doctor-fix-consent-required",
             Self::InputRequired => "input-required",
             Self::Interrupted => "interrupted",
@@ -3929,6 +4040,9 @@ impl ErrorCode {
             | Self::StorageBusy
             | Self::StorageIntegrityFailed
             | Self::ProviderSecretResolutionFailed => 74,
+            Self::ProviderSecretSourceRequired
+            | Self::ProviderSecretProvisioningRequired
+            | Self::ProviderSecretOverwriteRequired => 64,
             Self::BootstrapBusy
             | Self::CapacityExceeded
             | Self::HostBusy
@@ -3945,6 +4059,7 @@ impl ErrorCode {
             | Self::DesktopSessionNativeSelectorWrongPlatform
             | Self::DesktopSessionNativeSelectorUnmatched
             | Self::DoctorReadinessBlockersFound
+            | Self::SetupVerificationFailed
             | Self::StateConflict
             | Self::StopNotConfirmed => 75,
             Self::NotImplemented => 70,
@@ -3978,6 +4093,50 @@ impl SatelleError {
             recovery_command: Some("satelle --help".to_string()),
             source_detail: None,
             details: BTreeMap::new(),
+        }
+    }
+
+    pub fn setup_verification_failed(report: &SetupReport) -> Self {
+        let recovery_command = report.recovery_commands.first().cloned().or_else(|| {
+            Some(format!(
+                "satelle doctor --host {} --scope all --json",
+                report.host
+            ))
+        });
+        let mut details = BTreeMap::new();
+        details.insert("changed".to_string(), Value::Bool(report.changed));
+        details.insert(
+            "applied_actions".to_string(),
+            serde_json::to_value(&report.applied_actions)
+                .unwrap_or_else(|_| Value::Array(Vec::new())),
+        );
+        details.insert(
+            "verification".to_string(),
+            serde_json::to_value(&report.verification).unwrap_or(Value::Null),
+        );
+        details.insert(
+            "cache_updates".to_string(),
+            serde_json::to_value(
+                report
+                    .verification
+                    .as_ref()
+                    .map(|verification| verification.cache_updates.as_slice())
+                    .unwrap_or_default(),
+            )
+            .unwrap_or_else(|_| Value::Array(Vec::new())),
+        );
+        details.insert(
+            "recovery_commands".to_string(),
+            serde_json::to_value(&report.recovery_commands)
+                .unwrap_or_else(|_| Value::Array(Vec::new())),
+        );
+
+        Self {
+            code: ErrorCode::SetupVerificationFailed,
+            message: "setup completed, but live readiness verification did not pass".to_string(),
+            recovery_command,
+            source_detail: None,
+            details,
         }
     }
 
@@ -6014,8 +6173,41 @@ pub struct DoctorEventRecord {
 /// The only schema token accepted for setup reports in this release line.
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub enum SetupSchemaVersion {
-    #[serde(rename = "satelle.setup.v1")]
-    V1,
+    #[serde(rename = "satelle.setup.v2")]
+    V2,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SetupVerification {
+    pub status: String,
+    pub planned_checks: Vec<String>,
+    pub result: Option<DoctorReport>,
+    pub cache_updates: Vec<String>,
+}
+
+impl SetupVerification {
+    pub fn planned(planned_checks: Vec<String>) -> Self {
+        Self {
+            status: "planned".to_string(),
+            planned_checks,
+            result: None,
+            cache_updates: Vec::new(),
+        }
+    }
+
+    pub fn completed(
+        status: impl Into<String>,
+        planned_checks: Vec<String>,
+        result: DoctorReport,
+        cache_updates: Vec<String>,
+    ) -> Self {
+        Self {
+            status: status.into(),
+            planned_checks,
+            result: Some(result),
+            cache_updates,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -6024,6 +6216,10 @@ pub struct SetupReport {
     pub host: String,
     pub dry_run: bool,
     pub status: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cancellation_reason: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub verification: Option<SetupVerification>,
     pub setup_mode: String,
     pub service_persistent: bool,
     pub service_scope: String,
@@ -6039,8 +6235,17 @@ pub struct SetupReport {
     pub required_input: Vec<SetupRequiredInput>,
     pub recovery_commands: Vec<String>,
     pub readiness_summary: SetupReadinessSummary,
+    pub descriptor_configured: bool,
+    pub secret_provisioned: bool,
+    pub validation_status: String,
+    pub provider_smoke_test_status: String,
     pub daemon_path_overrides: Vec<DaemonPathOverride>,
+    pub changed: bool,
     pub mutated: bool,
+    /// Internal execution metadata. The public plan text is descriptive and must not become a
+    /// control-flow contract for deciding whether setup needs mutation consent.
+    #[serde(skip)]
+    pub mutation_planned: bool,
     pub native_computer_use_readiness: String,
     pub next_command: String,
 }

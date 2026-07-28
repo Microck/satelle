@@ -106,6 +106,303 @@ impl ComputerUseAdapter for FailedProviderSmokeAdapter {
 }
 
 #[derive(Clone)]
+#[cfg(unix)]
+struct TamperingProviderProvisioningAdapter {
+    staging_path: PathBuf,
+    native_probe_calls: Arc<std::sync::atomic::AtomicUsize>,
+    provider_probe_calls: Arc<std::sync::atomic::AtomicUsize>,
+    tamper_calls: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+#[cfg(unix)]
+impl ComputerUseAdapter for TamperingProviderProvisioningAdapter {
+    fn preflight(
+        &self,
+        _host: &str,
+        _provider_intent: &ProviderComputerUseIntent,
+    ) -> Result<AdapterReadiness, SatelleError> {
+        self.tamper_calls
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        // Use real filesystem I/O to make the candidate evidence fail closed.
+        // This represents a concurrent local actor rather than mocking the
+        // secure-file implementation.
+        std::fs::write(&self.staging_path, "tampered-staged-secret")
+            .map_err(|_| SatelleError::state_conflict())?;
+        Err(SatelleError::computer_use_not_ready())
+    }
+
+    fn readiness_cache_key(
+        &self,
+        _host: &str,
+        _provider_intent: &ProviderComputerUseIntent,
+    ) -> Result<Option<ReadinessCacheKey>, SatelleError> {
+        Ok(Some(FakeComputerUseAdapter::readiness_contract()?.2))
+    }
+
+    fn execute(&self, request: ExecuteRequest<'_>) -> Result<ExecuteResult, SatelleError> {
+        FakeComputerUseAdapter.execute(request)
+    }
+
+    fn observe_stop(&self, subject: AdapterSubject<'_>) -> Result<StopObservation, SatelleError> {
+        FakeComputerUseAdapter.observe_stop(subject)
+    }
+
+    fn observe_recovery(
+        &self,
+        subject: AdapterSubject<'_>,
+    ) -> Result<RecoveryObservation, SatelleError> {
+        FakeComputerUseAdapter.observe_recovery(subject)
+    }
+}
+
+#[cfg(unix)]
+impl crate::runtime::ReadinessProbeDriver for TamperingProviderProvisioningAdapter {
+    fn run_native_probe(
+        &self,
+        key: &ReadinessCacheKey,
+        _cancellation: &AdmissionCancellation,
+        _persist_thread_ref: &mut dyn FnMut(&str) -> Result<(), ()>,
+        _persist_turn_ref: &mut dyn FnMut(&str) -> Result<(), ()>,
+    ) -> crate::runtime::NativeProbeResult {
+        self.native_probe_calls
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let observed_at = time::OffsetDateTime::now_utc();
+        crate::runtime::NativeProbeResult::Passed(
+            key.evidence(
+                format!("native-probe-{}", satelle_core::SessionId::new()),
+                observed_at,
+                observed_at + time::Duration::minutes(5),
+            )
+            .expect("validated readiness key produces native evidence"),
+        )
+    }
+
+    fn preflight_terminal_with_provider_probe(
+        &self,
+        host: &str,
+        cached: Option<ReadinessEvidence>,
+        cached_provider: Option<ProviderSmokeResult>,
+        provider_intent: &ProviderComputerUseIntent,
+        _provider_secret: Option<crate::provider_auth::ResolvedProviderSecret>,
+        _cancellation: &AdmissionCancellation,
+        _persist_thread_ref: &mut dyn FnMut(&str) -> Result<(), ()>,
+        _persist_turn_ref: &mut dyn FnMut(&str) -> Result<(), ()>,
+    ) -> AdapterPreflight {
+        self.provider_probe_calls
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.preflight_terminal(host, cached, cached_provider, provider_intent)
+    }
+
+    fn observe_readiness_probe(
+        &self,
+        _subject: &crate::storage::ProbeRecoverySubject,
+    ) -> RecoveryObservation {
+        RecoveryObservation::Completed
+    }
+}
+
+#[derive(Clone, Copy)]
+#[cfg(unix)]
+enum ProviderProvisioningProbeOutcome {
+    Ready,
+    UpstreamStillActive,
+    OutcomeUnknown,
+    PersistenceFailure,
+}
+
+#[derive(Clone)]
+#[cfg(unix)]
+struct ClassifiedProviderProvisioningAdapter {
+    outcome: ProviderProvisioningProbeOutcome,
+    native_probe_calls: Arc<std::sync::atomic::AtomicUsize>,
+    provider_probe_calls: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+#[cfg(unix)]
+impl ComputerUseAdapter for ClassifiedProviderProvisioningAdapter {
+    fn preflight(
+        &self,
+        host: &str,
+        provider_intent: &ProviderComputerUseIntent,
+    ) -> Result<AdapterReadiness, SatelleError> {
+        FakeComputerUseAdapter.preflight(host, provider_intent)
+    }
+
+    fn readiness_cache_key(
+        &self,
+        _host: &str,
+        _provider_intent: &ProviderComputerUseIntent,
+    ) -> Result<Option<ReadinessCacheKey>, SatelleError> {
+        Ok(Some(FakeComputerUseAdapter::readiness_contract()?.2))
+    }
+
+    fn execute(&self, request: ExecuteRequest<'_>) -> Result<ExecuteResult, SatelleError> {
+        FakeComputerUseAdapter.execute(request)
+    }
+
+    fn observe_stop(&self, subject: AdapterSubject<'_>) -> Result<StopObservation, SatelleError> {
+        FakeComputerUseAdapter.observe_stop(subject)
+    }
+
+    fn observe_recovery(
+        &self,
+        subject: AdapterSubject<'_>,
+    ) -> Result<RecoveryObservation, SatelleError> {
+        FakeComputerUseAdapter.observe_recovery(subject)
+    }
+}
+
+#[cfg(unix)]
+impl crate::runtime::ReadinessProbeDriver for ClassifiedProviderProvisioningAdapter {
+    fn run_native_probe(
+        &self,
+        key: &ReadinessCacheKey,
+        _cancellation: &AdmissionCancellation,
+        _persist_thread_ref: &mut dyn FnMut(&str) -> Result<(), ()>,
+        _persist_turn_ref: &mut dyn FnMut(&str) -> Result<(), ()>,
+    ) -> crate::runtime::NativeProbeResult {
+        self.native_probe_calls
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let observed_at = time::OffsetDateTime::now_utc();
+        crate::runtime::NativeProbeResult::Passed(
+            key.evidence(
+                format!("native-probe-{}", satelle_core::SessionId::new()),
+                observed_at,
+                observed_at + time::Duration::minutes(5),
+            )
+            .expect("validated readiness key produces native evidence"),
+        )
+    }
+
+    fn preflight_terminal_with_provider_probe(
+        &self,
+        host: &str,
+        cached: Option<ReadinessEvidence>,
+        cached_provider: Option<ProviderSmokeResult>,
+        provider_intent: &ProviderComputerUseIntent,
+        _provider_secret: Option<crate::provider_auth::ResolvedProviderSecret>,
+        _cancellation: &AdmissionCancellation,
+        persist_thread_ref: &mut dyn FnMut(&str) -> Result<(), ()>,
+        _persist_turn_ref: &mut dyn FnMut(&str) -> Result<(), ()>,
+    ) -> AdapterPreflight {
+        self.provider_probe_calls
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        match self.outcome {
+            ProviderProvisioningProbeOutcome::Ready => {
+                self.preflight_terminal(host, cached, cached_provider, provider_intent)
+            }
+            ProviderProvisioningProbeOutcome::UpstreamStillActive => {
+                AdapterPreflight::Cancelled(StopObservation::UpstreamStillActive)
+            }
+            ProviderProvisioningProbeOutcome::OutcomeUnknown => {
+                AdapterPreflight::Cancelled(StopObservation::OutcomeUnknown)
+            }
+            ProviderProvisioningProbeOutcome::PersistenceFailure => {
+                assert!(
+                    persist_thread_ref("").is_err(),
+                    "invalid upstream identity must fail durable persistence"
+                );
+                AdapterPreflight::Cancelled(StopObservation::CancellationConfirmed)
+            }
+        }
+    }
+
+    fn observe_readiness_probe(
+        &self,
+        _subject: &crate::storage::ProbeRecoverySubject,
+    ) -> RecoveryObservation {
+        RecoveryObservation::Completed
+    }
+}
+
+/// Keeps phase-aware Doctor coverage isolated from the shared fake's deliberate
+/// no-cache behavior, which other admission tests use as part of their setup.
+#[derive(Clone, Copy)]
+struct DoctorRefreshAdapter;
+
+impl ComputerUseAdapter for DoctorRefreshAdapter {
+    fn resolve_provider_binding(
+        &self,
+        host: &str,
+        provider_intent: &ProviderComputerUseIntent,
+    ) -> Result<satelle_core::ResolvedProviderBinding, SatelleError> {
+        FakeComputerUseAdapter.resolve_provider_binding(host, provider_intent)
+    }
+
+    fn preflight(
+        &self,
+        host: &str,
+        provider_intent: &ProviderComputerUseIntent,
+    ) -> Result<AdapterReadiness, SatelleError> {
+        FakeComputerUseAdapter.preflight(host, provider_intent)
+    }
+
+    fn readiness_cache_key(
+        &self,
+        _host: &str,
+        _provider_intent: &ProviderComputerUseIntent,
+    ) -> Result<Option<ReadinessCacheKey>, SatelleError> {
+        Ok(Some(FakeComputerUseAdapter::readiness_contract()?.2))
+    }
+
+    fn execute(&self, request: ExecuteRequest<'_>) -> Result<ExecuteResult, SatelleError> {
+        FakeComputerUseAdapter.execute(request)
+    }
+
+    fn observe_stop(&self, subject: AdapterSubject<'_>) -> Result<StopObservation, SatelleError> {
+        FakeComputerUseAdapter.observe_stop(subject)
+    }
+
+    fn observe_recovery(
+        &self,
+        subject: AdapterSubject<'_>,
+    ) -> Result<RecoveryObservation, SatelleError> {
+        FakeComputerUseAdapter.observe_recovery(subject)
+    }
+}
+
+impl crate::runtime::ReadinessProbeDriver for DoctorRefreshAdapter {
+    fn run_native_probe(
+        &self,
+        key: &ReadinessCacheKey,
+        _cancellation: &AdmissionCancellation,
+        _persist_thread_ref: &mut dyn FnMut(&str) -> Result<(), ()>,
+        _persist_turn_ref: &mut dyn FnMut(&str) -> Result<(), ()>,
+    ) -> crate::runtime::NativeProbeResult {
+        let observed_at = time::OffsetDateTime::now_utc();
+        crate::runtime::NativeProbeResult::Passed(
+            key.evidence(
+                format!("native-probe-{}", satelle_core::SessionId::new()),
+                observed_at,
+                observed_at + time::Duration::minutes(5),
+            )
+            .expect("validated Doctor readiness key produces valid evidence"),
+        )
+    }
+
+    fn preflight_terminal_with_provider_probe(
+        &self,
+        host: &str,
+        cached: Option<ReadinessEvidence>,
+        cached_provider: Option<ProviderSmokeResult>,
+        provider_intent: &ProviderComputerUseIntent,
+        _provider_secret: Option<crate::provider_auth::ResolvedProviderSecret>,
+        _cancellation: &AdmissionCancellation,
+        _persist_thread_ref: &mut dyn FnMut(&str) -> Result<(), ()>,
+        _persist_turn_ref: &mut dyn FnMut(&str) -> Result<(), ()>,
+    ) -> AdapterPreflight {
+        self.preflight_terminal(host, cached, cached_provider, provider_intent)
+    }
+
+    fn observe_readiness_probe(
+        &self,
+        _subject: &crate::storage::ProbeRecoverySubject,
+    ) -> RecoveryObservation {
+        RecoveryObservation::Completed
+    }
+}
+
+#[derive(Clone)]
 struct HostBusyProviderPreflightAdapter {
     calls: Arc<std::sync::atomic::AtomicUsize>,
 }
@@ -275,11 +572,7 @@ fn provider_intent_with_missing_descriptor() -> ProviderComputerUseIntent {
     )
 }
 
-fn service_with_provider_descriptor<A: ComputerUseAdapter>(
-    state_root: PathBuf,
-    adapter: A,
-    auth_source: Option<String>,
-) -> HostService {
+fn provider_descriptor_config(auth_source: Option<String>) -> satelle_core::HostConfig {
     let mut config = satelle_core::SatelleConfig::defaults().hosts[LOCAL_DEMO_HOST].clone();
     config.provider_bindings.insert(
         "openai".to_string(),
@@ -294,6 +587,15 @@ fn service_with_provider_descriptor<A: ComputerUseAdapter>(
             },
         )]),
     );
+    config
+}
+
+fn service_with_provider_descriptor<A: ComputerUseAdapter>(
+    state_root: PathBuf,
+    adapter: A,
+    auth_source: Option<String>,
+) -> HostService {
+    let config = provider_descriptor_config(auth_source);
     HostService {
         runtime: RuntimeHandle::new_with_provider_policy(
             Ok(state_root),
@@ -308,6 +610,490 @@ fn service_with_provider_descriptor<A: ComputerUseAdapter>(
         bootstrap_auth: None,
         bootstrap_maintenance: Arc::new(Mutex::new(None)),
     }
+}
+
+#[cfg(unix)]
+fn service_with_provider_descriptor_and_readiness_probe<A>(
+    state_root: PathBuf,
+    adapter: A,
+    auth_source: Option<String>,
+) -> HostService
+where
+    A: ComputerUseAdapter + crate::runtime::ReadinessProbeDriver + Clone,
+{
+    let config = provider_descriptor_config(auth_source);
+    HostService {
+        runtime: RuntimeHandle::new_with_provider_policy_and_readiness_probe_driver(
+            Ok(state_root),
+            adapter.clone(),
+            adapter,
+            crate::runtime::RuntimeProviderPolicy::from_host_config(&config),
+        ),
+        operation_capacity: Arc::new(OperationCapacity::default()),
+        turn_execution_timeout: crate::configured_turn_execution_timeout(&config),
+        mode: HostMode::TestFake {
+            image_attachments: true,
+        },
+        bootstrap_auth: None,
+        bootstrap_maintenance: Arc::new(Mutex::new(None)),
+    }
+}
+
+#[cfg(unix)]
+fn provider_file_authorization(path: PathBuf) -> ProviderBindingAuthorization {
+    ProviderBindingAuthorization::new("review", "openai", "provider-model", "openai")
+        .with_auth_source(satelle_core::ProviderSecretSource::File { path })
+        .with_experimental_provider_computer_use(true)
+}
+
+#[cfg(unix)]
+fn service_with_classified_provider_probe(
+    state_root: PathBuf,
+    outcome: ProviderProvisioningProbeOutcome,
+) -> (
+    HostService,
+    Arc<std::sync::atomic::AtomicUsize>,
+    Arc<std::sync::atomic::AtomicUsize>,
+) {
+    let config = satelle_core::SatelleConfig::defaults().hosts[LOCAL_DEMO_HOST].clone();
+    let native_probe_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let provider_probe_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let adapter = ClassifiedProviderProvisioningAdapter {
+        outcome,
+        native_probe_calls: Arc::clone(&native_probe_calls),
+        provider_probe_calls: Arc::clone(&provider_probe_calls),
+    };
+    let service = HostService {
+        runtime: RuntimeHandle::new_with_readiness_probe_driver(
+            Ok(state_root),
+            adapter.clone(),
+            adapter,
+        ),
+        operation_capacity: Arc::new(OperationCapacity::default()),
+        turn_execution_timeout: crate::configured_turn_execution_timeout(&config),
+        mode: HostMode::TestFake {
+            image_attachments: true,
+        },
+        bootstrap_auth: None,
+        bootstrap_maintenance: Arc::new(Mutex::new(None)),
+    };
+    (service, native_probe_calls, provider_probe_calls)
+}
+
+#[cfg(unix)]
+fn assert_provider_provisioning_recovery_owned(state: &TestStateDir, operation_id: &str) {
+    let connection = rusqlite::Connection::open(state.path().join("satelle.sqlite3"))
+        .expect("open Host SQLite state");
+    let (phase, lease_state): (String, String) = connection
+        .query_row(
+            "SELECT journal.phase, lease.lease_state
+             FROM provider_secret_provisioning_journal AS journal
+             JOIN control_leases AS lease
+               ON lease.operation_id = journal.operation_id
+              AND lease.provider_probe_ref = journal.provider_probe_ref
+             WHERE journal.operation_id = ?1",
+            [operation_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .expect("load retained provider provisioning ownership");
+    assert_eq!(phase, "rollback_pending");
+    assert_eq!(lease_state, "active");
+}
+
+#[cfg(unix)]
+#[test]
+fn ordinary_post_t0_destination_failure_terminalizes_for_same_daemon_replay() {
+    use std::os::unix::fs::symlink;
+
+    let state = TestStateDir::new().expect("temporary Host state");
+    let secret_directory = tempfile::tempdir().expect("temporary provider secret directory");
+    let destination = secret_directory.path().join("provider-token");
+    let unrelated_target = secret_directory.path().join("unrelated-target");
+    std::fs::write(&unrelated_target, "unrelated").expect("write unrelated symlink target");
+    symlink(&unrelated_target, &destination).expect("create unsafe destination symlink");
+    let service =
+        service_with_provider_descriptor(state.path().to_path_buf(), DoctorRefreshAdapter, None);
+    service.initialize_daemon().expect("initialize Host daemon");
+    let identity = RequestIdentity::new("provider-secret-planned-failure", "a".repeat(64));
+    let authorization = provider_file_authorization(destination);
+
+    let first = service
+        .provision_provider_secret(
+            LOCAL_DEMO_HOST,
+            authorization.clone(),
+            Zeroizing::new("candidate-provider-secret".to_string()),
+            false,
+            &identity,
+        )
+        .expect_err("unsafe destination must fail after T0");
+    let replay = service
+        .provision_provider_secret(
+            LOCAL_DEMO_HOST,
+            authorization,
+            Zeroizing::new("candidate-provider-secret".to_string()),
+            false,
+            &identity,
+        )
+        .expect_err("same-daemon retry must replay the terminal failure");
+
+    assert_ne!(first.code, ErrorCode::StateConflict);
+    assert_eq!(first.code, replay.code);
+    assert_eq!(first.message, replay.message);
+    assert_eq!(first.recovery_command, replay.recovery_command);
+    assert_eq!(first.details, replay.details);
+}
+
+#[cfg(unix)]
+#[test]
+fn existing_provider_secret_requires_typed_overwrite_and_preserves_prior_value() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let state = TestStateDir::new().expect("temporary Host state");
+    let secret_directory = tempfile::tempdir().expect("temporary provider secret directory");
+    let destination = secret_directory.path().join("provider-token");
+    let prior_secret = "prior-provider-secret";
+    std::fs::write(&destination, prior_secret).expect("write prior provider secret");
+    std::fs::set_permissions(&destination, std::fs::Permissions::from_mode(0o600))
+        .expect("make prior provider secret owner-only");
+    let service = service_with_provider_descriptor_and_readiness_probe(
+        state.path().to_path_buf(),
+        DoctorRefreshAdapter,
+        None,
+    );
+    service.initialize_daemon().expect("initialize Host daemon");
+    let identity = RequestIdentity::new("provider-secret-overwrite-required", "c".repeat(64));
+
+    let error = service
+        .provision_provider_secret(
+            LOCAL_DEMO_HOST,
+            provider_file_authorization(destination.clone()),
+            Zeroizing::new("replacement-provider-secret".to_string()),
+            false,
+            &identity,
+        )
+        .expect_err("existing destination requires explicit overwrite authority");
+
+    assert_eq!(error.code, ErrorCode::ProviderSecretOverwriteRequired);
+    assert_eq!(
+        std::fs::read_to_string(destination).expect("read preserved prior provider secret"),
+        prior_secret
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn newline_terminated_provider_secrets_can_be_replaced_atomically() {
+    use std::os::unix::fs::PermissionsExt;
+
+    for (suffix, prior_secret) in [
+        ("lf", "prior-provider-secret\n"),
+        ("crlf", "prior-provider-secret\r\n"),
+    ] {
+        let state = TestStateDir::new().expect("temporary Host state");
+        let secret_directory = tempfile::tempdir().expect("temporary provider secret directory");
+        std::fs::set_permissions(
+            secret_directory.path(),
+            std::fs::Permissions::from_mode(0o700),
+        )
+        .expect("make provider secret directory owner-only");
+        let destination = secret_directory.path().join("provider-token");
+        std::fs::write(&destination, prior_secret).expect("write prior provider secret");
+        std::fs::set_permissions(&destination, std::fs::Permissions::from_mode(0o600))
+            .expect("make prior provider secret owner-only");
+        let (service, _native_probe_calls, provider_probe_calls) =
+            service_with_classified_provider_probe(
+                state.path().to_path_buf(),
+                ProviderProvisioningProbeOutcome::Ready,
+            );
+        service.initialize_daemon().expect("initialize Host daemon");
+        let identity =
+            RequestIdentity::new(format!("provider-secret-newline-{suffix}"), "f".repeat(64));
+
+        let result = service
+            .provision_provider_secret(
+                LOCAL_DEMO_HOST,
+                provider_file_authorization(destination.clone()),
+                Zeroizing::new("replacement-provider-secret".to_string()),
+                true,
+                &identity,
+            )
+            .expect("replace newline-terminated provider secret");
+
+        assert!(result.overwritten());
+        assert_eq!(
+            std::fs::read_to_string(&destination).expect("read replacement provider secret"),
+            "replacement-provider-secret"
+        );
+        assert_eq!(
+            provider_probe_calls.load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+        let residue = std::fs::read_dir(secret_directory.path())
+            .expect("read provider secret directory")
+            .filter_map(Result::ok)
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.contains(".staged.") || name.contains(".backup."))
+            .collect::<Vec<_>>();
+        assert!(
+            residue.is_empty(),
+            "unexpected replacement residue: {residue:?}"
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn provider_secret_publication_preserves_candidate_terminal_line_endings() {
+    use std::os::unix::fs::PermissionsExt;
+
+    for (suffix, candidate) in [
+        ("lf", "replacement-provider-secret\n"),
+        ("crlf", "replacement-provider-secret\r\n"),
+    ] {
+        let state = TestStateDir::new().expect("temporary Host state");
+        let secret_directory = tempfile::tempdir().expect("temporary provider secret directory");
+        std::fs::set_permissions(
+            secret_directory.path(),
+            std::fs::Permissions::from_mode(0o700),
+        )
+        .expect("make provider secret directory owner-only");
+        let destination = secret_directory.path().join("provider-token");
+        let (service, _native_probe_calls, provider_probe_calls) =
+            service_with_classified_provider_probe(
+                state.path().to_path_buf(),
+                ProviderProvisioningProbeOutcome::Ready,
+            );
+        service.initialize_daemon().expect("initialize Host daemon");
+        let identity = RequestIdentity::new(
+            format!("provider-secret-candidate-{suffix}"),
+            "e".repeat(64),
+        );
+
+        let result = service
+            .provision_provider_secret(
+                LOCAL_DEMO_HOST,
+                provider_file_authorization(destination.clone()),
+                Zeroizing::new(candidate.to_string()),
+                false,
+                &identity,
+            )
+            .expect("publish the exact newline-terminated candidate");
+
+        assert!(!result.overwritten());
+        assert_eq!(
+            std::fs::read(&destination).expect("read published provider secret"),
+            candidate.as_bytes()
+        );
+        assert_eq!(
+            provider_probe_calls.load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn typed_unknown_provider_outcomes_retain_recovery_ownership() {
+    use std::os::unix::fs::PermissionsExt;
+
+    for (suffix, outcome, expected_cancellation) in [
+        (
+            "upstream-still-active",
+            ProviderProvisioningProbeOutcome::UpstreamStillActive,
+            "upstream_still_active",
+        ),
+        (
+            "outcome-unknown",
+            ProviderProvisioningProbeOutcome::OutcomeUnknown,
+            "outcome_unknown",
+        ),
+        (
+            "persistence-failure",
+            ProviderProvisioningProbeOutcome::PersistenceFailure,
+            "confirmed",
+        ),
+    ] {
+        let state = TestStateDir::new().expect("temporary Host state");
+        let secret_directory = tempfile::tempdir().expect("temporary provider secret directory");
+        std::fs::set_permissions(
+            secret_directory.path(),
+            std::fs::Permissions::from_mode(0o700),
+        )
+        .expect("make provider secret directory owner-only");
+        let destination = secret_directory.path().join("provider-token");
+        let operation_id = format!("provider-secret-{suffix}");
+        let identity = RequestIdentity::new(&operation_id, "d".repeat(64));
+        let (service, native_probe_calls, provider_probe_calls) =
+            service_with_classified_provider_probe(state.path().to_path_buf(), outcome);
+        service.initialize_daemon().expect("initialize Host daemon");
+
+        let failure = service
+            .provision_provider_secret(
+                LOCAL_DEMO_HOST,
+                provider_file_authorization(destination),
+                Zeroizing::new("candidate-provider-secret".to_string()),
+                false,
+                &identity,
+            )
+            .expect_err("unknown provider outcome must stay recovery-owned");
+        assert_eq!(failure.code, ErrorCode::Interrupted);
+        assert_eq!(
+            failure
+                .details
+                .get("admission_cancellation")
+                .and_then(serde_json::Value::as_str),
+            Some(expected_cancellation),
+        );
+        assert_eq!(
+            native_probe_calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+        );
+        assert_eq!(
+            provider_probe_calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+        );
+
+        assert_provider_provisioning_recovery_owned(&state, &operation_id);
+    }
+
+    let state = TestStateDir::new().expect("temporary Host state");
+    let secret_directory = tempfile::tempdir().expect("temporary provider secret directory");
+    std::fs::set_permissions(
+        secret_directory.path(),
+        std::fs::Permissions::from_mode(0o700),
+    )
+    .expect("make provider secret directory owner-only");
+    let destination = secret_directory.path().join("provider-token");
+    let identity = RequestIdentity::new("provider-secret-ready", "e".repeat(64));
+    let (service, native_probe_calls, provider_probe_calls) =
+        service_with_classified_provider_probe(
+            state.path().to_path_buf(),
+            ProviderProvisioningProbeOutcome::Ready,
+        );
+    service.initialize_daemon().expect("initialize Host daemon");
+
+    service
+        .provision_provider_secret(
+            LOCAL_DEMO_HOST,
+            provider_file_authorization(destination),
+            Zeroizing::new("candidate-provider-secret".to_string()),
+            false,
+            &identity,
+        )
+        .expect("clean-state provider secret provisioning must complete");
+    assert_eq!(
+        native_probe_calls.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+    );
+    assert_eq!(
+        provider_probe_calls.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn failed_staged_rollback_retains_pending_journal_and_active_lease() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let state = TestStateDir::new().expect("temporary Host state");
+    let secret_directory = tempfile::tempdir().expect("temporary provider secret directory");
+    std::fs::set_permissions(
+        secret_directory.path(),
+        std::fs::Permissions::from_mode(0o700),
+    )
+    .expect("make provider secret directory owner-only");
+    let destination = secret_directory.path().join("provider-token");
+    let identity = RequestIdentity::new("provider-secret-rollback-pending", "b".repeat(64));
+    let paths = storage::provider_secret_file_paths(&destination, identity.key())
+        .expect("deterministic provider secret paths");
+    let native_probe_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let provider_probe_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let tamper_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let service = service_with_provider_descriptor_and_readiness_probe(
+        state.path().to_path_buf(),
+        TamperingProviderProvisioningAdapter {
+            staging_path: paths.staging().to_path_buf(),
+            native_probe_calls: Arc::clone(&native_probe_calls),
+            provider_probe_calls: Arc::clone(&provider_probe_calls),
+            tamper_calls: Arc::clone(&tamper_calls),
+        },
+        None,
+    );
+    service.initialize_daemon().expect("initialize Host daemon");
+    let authorization = provider_file_authorization(destination);
+
+    let failure = service
+        .provision_provider_secret(
+            LOCAL_DEMO_HOST,
+            authorization.clone(),
+            Zeroizing::new("candidate-provider-secret".to_string()),
+            false,
+            &identity,
+        )
+        .expect_err("tampered staging must prevent rollback terminalization");
+    assert_eq!(failure.code, ErrorCode::StateConflict);
+    assert_eq!(
+        native_probe_calls.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+    );
+    assert_eq!(
+        provider_probe_calls.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+    );
+    assert_eq!(tamper_calls.load(std::sync::atomic::Ordering::SeqCst), 1,);
+
+    let connection = rusqlite::Connection::open(state.path().join("satelle.sqlite3"))
+        .expect("open Host SQLite state");
+    let retained_state: (String, String) = connection
+        .query_row(
+            "SELECT journal.phase, lease.lease_state
+             FROM provider_secret_provisioning_journal AS journal
+             JOIN control_leases AS lease
+               ON lease.operation_id = journal.operation_id
+              AND lease.provider_probe_ref = journal.provider_probe_ref
+             WHERE journal.operation_id = ?1",
+            [identity.key()],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .expect("load retained provider provisioning ownership");
+    assert_eq!(
+        retained_state,
+        ("rollback_pending".to_string(), "active".to_string()),
+    );
+
+    let retry = service
+        .provision_provider_secret(
+            LOCAL_DEMO_HOST,
+            authorization,
+            Zeroizing::new("candidate-provider-secret".to_string()),
+            false,
+            &identity,
+        )
+        .expect_err("pending recovery must not start a second operation");
+    assert_eq!(retry.code, ErrorCode::StateConflict);
+    assert_eq!(
+        native_probe_calls.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+    );
+    assert_eq!(
+        provider_probe_calls.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+    );
+    assert_eq!(tamper_calls.load(std::sync::atomic::Ordering::SeqCst), 1,);
+    let retry_retained_state: (String, String) = connection
+        .query_row(
+            "SELECT journal.phase, lease.lease_state
+             FROM provider_secret_provisioning_journal AS journal
+             JOIN control_leases AS lease
+               ON lease.operation_id = journal.operation_id
+              AND lease.provider_probe_ref = journal.provider_probe_ref
+             WHERE journal.operation_id = ?1",
+            [identity.key()],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .expect("reload retained provider provisioning ownership");
+    assert_eq!(retry_retained_state, retained_state);
 }
 
 fn turn_intent_with_extras(prompt: &str, timeout_seconds: u64) -> TurnIntent {
@@ -1101,8 +1887,21 @@ fn production_doctor_filters_requested_scopes_without_relabeling_blockers() {
 #[test]
 fn doctor_provider_refresh_updates_cache_without_admitting_prompt_work() {
     let state = crate::TestStateDir::new().expect("temporary state directory");
-    let service = HostService::local_demo_for_tests_at(state.path())
-        .expect("construct deterministic Host service");
+    let config = satelle_core::SatelleConfig::defaults().hosts[LOCAL_DEMO_HOST].clone();
+    let service = HostService {
+        runtime: RuntimeHandle::new_with_readiness_probe_driver(
+            Ok(state.path().to_path_buf()),
+            DoctorRefreshAdapter,
+            DoctorRefreshAdapter,
+        ),
+        operation_capacity: Arc::new(OperationCapacity::default()),
+        turn_execution_timeout: crate::configured_turn_execution_timeout(&config),
+        mode: HostMode::TestFake {
+            image_attachments: true,
+        },
+        bootstrap_auth: None,
+        bootstrap_maintenance: Arc::new(Mutex::new(None)),
+    };
     service
         .runtime
         .authorize_provider_binding(&satelle_core::ResolvedProviderBinding::from_authorization(
@@ -1129,7 +1928,8 @@ fn doctor_provider_refresh_updates_cache_without_admitting_prompt_work() {
                 .expect("valid provider"),
         ),
         true,
-    );
+    )
+    .with_experimental_provider_computer_use(true);
 
     let report = service
         .doctor_with_provider_intent(
@@ -1394,11 +2194,11 @@ fn provider_descriptor_validation_resolves_only_during_target_host_refresh() {
         .expect("cached validation remains observation-only");
     assert_eq!(
         cached.validation().outcome(),
-        satelle_core::ProviderAuthValidationOutcome::ConfiguredDeferred
+        satelle_core::ProviderAuthValidationOutcome::UnresolvedHostSecret
     );
     assert_eq!(
         cached.validation().observation_source(),
-        satelle_core::ProviderAuthObservationSource::Deferred
+        satelle_core::ProviderAuthObservationSource::Live
     );
     assert!(!secret_path.exists());
 
@@ -1497,11 +2297,11 @@ fn provider_descriptor_validation_resolves_only_during_target_host_refresh() {
         .expect("cached validation remains deferred after a live failure");
     assert_eq!(
         cached_after_failure.validation().outcome(),
-        satelle_core::ProviderAuthValidationOutcome::ConfiguredDeferred
+        satelle_core::ProviderAuthValidationOutcome::UnresolvedHostSecret
     );
     assert_eq!(
         cached_after_failure.validation().observation_source(),
-        satelle_core::ProviderAuthObservationSource::Deferred
+        satelle_core::ProviderAuthObservationSource::Live
     );
 }
 

@@ -1076,6 +1076,7 @@ fn rejected_durable_token_is_reported_after_launched_daemon_handoff_is_terminal(
 
             let error = finish_durable_daemon_launch(
                 "rejected-post-launch-token-host",
+                host_identity,
                 &durable_client,
                 bootstrap_client,
                 &mut bootstrap_lock,
@@ -2700,6 +2701,18 @@ fn local_transport_rejects_detach_on_interrupt_before_admission() {
     );
 }
 
+#[test]
+fn local_provider_secret_bridge_startup_requires_a_live_receiver() {
+    let (started_tx, started_rx) = local_provider_secret_bridge_startup_channel::<()>();
+
+    assert!(matches!(
+        started_tx.try_send(()),
+        Err(mpsc::TrySendError::Full(()))
+    ));
+    drop(started_rx);
+    assert!(matches!(started_tx.send(()), Err(mpsc::SendError(()))));
+}
+
 #[path = "transport-reconnect-tests.rs"]
 mod reconnect;
 
@@ -3612,44 +3625,244 @@ fn durable_ssh_relaunch_policy_covers_read_and_stop_without_credential_bootstrap
 
 #[test]
 fn serialized_durable_relaunch_rechecks_readiness_under_the_remote_lock() {
-    struct BootstrapLockGuard(Arc<AtomicBool>);
+    #[derive(Clone, Copy)]
+    enum FixtureReadiness {
+        Exact,
+        VersionMismatch,
+        IdentityMismatch,
+        ConnectFailure,
+        UnprovenTransportFailure,
+    }
 
-    impl Drop for BootstrapLockGuard {
-        fn drop(&mut self) {
-            self.0.store(false, Ordering::SeqCst);
+    fn raw_readiness(
+        readiness: FixtureReadiness,
+    ) -> Result<DurableReadinessSnapshot, DaemonClientError> {
+        match readiness {
+            FixtureReadiness::Exact => Ok(DurableReadinessSnapshot {
+                daemon_version: env!("CARGO_PKG_VERSION").to_string(),
+                host_identity: "host-exact".to_string(),
+            }),
+            FixtureReadiness::VersionMismatch => Ok(DurableReadinessSnapshot {
+                daemon_version: "unexpected-version".to_string(),
+                host_identity: "host-exact".to_string(),
+            }),
+            FixtureReadiness::IdentityMismatch => Ok(DurableReadinessSnapshot {
+                daemon_version: env!("CARGO_PKG_VERSION").to_string(),
+                host_identity: "host-mismatch".to_string(),
+            }),
+            FixtureReadiness::ConnectFailure => Err(DaemonClientError::Transport(
+                reqwest::blocking::Client::new()
+                    .get("http://127.0.0.1:0")
+                    .send()
+                    .expect_err("closed loopback endpoint creates a deterministic connect error"),
+            )),
+            FixtureReadiness::UnprovenTransportFailure => Err(DaemonClientError::Transport(
+                reqwest::blocking::Client::new()
+                    .get("not a valid URL")
+                    .build()
+                    .expect_err("invalid URL creates a deterministic transport error"),
+            )),
         }
     }
 
-    let lock_held = Arc::new(AtomicBool::new(true));
-    let bootstrap_lock = BootstrapLockGuard(Arc::clone(&lock_held));
-    let ready = relaunch_durable_daemon_under_lock(
-        "remote",
-        || {
-            assert!(
-                lock_held.load(Ordering::SeqCst),
-                "the remote helper must confirm live lock ownership"
-            );
-            Ok(())
-        },
-        || {
-            assert!(
-                lock_held.load(Ordering::SeqCst),
-                "readiness must be rechecked while the remote lock is held"
-            );
-            Ok("already started by the first Controller")
-        },
-        || -> Result<(), SatelleError> {
-            panic!("a ready daemon must not be launched a second time")
-        },
-    )
-    .expect("reuse daemon started by the first Controller");
+    struct BootstrapLockGuard {
+        held: Arc<AtomicBool>,
+        token_path: PathBuf,
+    }
 
-    assert_eq!(ready, "already started by the first Controller");
-    drop(bootstrap_lock);
-    assert!(
-        !lock_held.load(Ordering::SeqCst),
-        "the remote lock is released only after readiness succeeds"
+    impl Drop for BootstrapLockGuard {
+        fn drop(&mut self) {
+            match std::fs::remove_file(&self.token_path) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => panic!("remove physical lock token: {error}"),
+            }
+            self.held.store(false, Ordering::SeqCst);
+        }
+    }
+
+    fn assert_lifecycle(
+        initial: FixtureReadiness,
+        final_readiness: FixtureReadiness,
+        expected_error: Option<SatelleError>,
+        expected_events: &[&str],
+    ) {
+        let lock_directory = tempfile::tempdir().expect("temporary lock directory");
+        let token_path = lock_directory.path().join("durable-relaunch.lock");
+        std::fs::write(&token_path, b"held").expect("create physical lock token");
+        let held = Arc::new(AtomicBool::new(true));
+        let guard = BootstrapLockGuard {
+            held: Arc::clone(&held),
+            token_path: token_path.clone(),
+        };
+        let events = std::cell::RefCell::new(Vec::new());
+        let confirmations = std::cell::Cell::new(0_u8);
+        let outcome = relaunch_durable_daemon_under_lock(
+            "remote",
+            "host-exact",
+            || {
+                assert!(held.load(Ordering::SeqCst));
+                let confirmation = confirmations.get();
+                confirmations.set(confirmation + 1);
+                events.borrow_mut().push(match confirmation {
+                    0 => "confirm-before-probe",
+                    1 => "confirm-after-probe",
+                    2 => "confirm-before-final-readiness",
+                    3 => "confirm-after-final-readiness",
+                    _ => panic!("unexpected ownership confirmation"),
+                });
+                Ok(())
+            },
+            || {
+                events.borrow_mut().push("initial-readiness");
+                observe_remote_durable_readiness(raw_readiness(initial))
+            },
+            || {
+                events.borrow_mut().push("launch");
+                events.borrow_mut().push("bootstrap-authenticated");
+                Ok(())
+            },
+            || {
+                events.borrow_mut().push("durable-readiness");
+                observe_remote_durable_readiness(raw_readiness(final_readiness))
+            },
+        );
+        match expected_error {
+            None => {
+                outcome.expect("exact durable readiness succeeds");
+            }
+            Some(expected) => {
+                let actual = outcome.expect_err("non-exact durable readiness fails");
+                assert_eq!(actual.code, expected.code);
+                assert_eq!(actual.message, expected.message);
+                assert_eq!(actual.recovery_command, expected.recovery_command);
+                assert_eq!(actual.details, expected.details);
+                assert_eq!(actual.source_detail, expected.source_detail);
+            }
+        }
+        assert_eq!(events.into_inner(), expected_events);
+        drop(guard);
+        assert!(!held.load(Ordering::SeqCst));
+        assert!(!token_path.exists());
+    }
+
+    assert_lifecycle(
+        FixtureReadiness::Exact,
+        FixtureReadiness::Exact,
+        None,
+        &[
+            "confirm-before-probe",
+            "initial-readiness",
+            "confirm-after-probe",
+        ],
     );
+    assert_lifecycle(
+        FixtureReadiness::ConnectFailure,
+        FixtureReadiness::Exact,
+        None,
+        &[
+            "confirm-before-probe",
+            "initial-readiness",
+            "confirm-after-probe",
+            "launch",
+            "bootstrap-authenticated",
+            "confirm-before-final-readiness",
+            "durable-readiness",
+            "confirm-after-final-readiness",
+        ],
+    );
+    assert_lifecycle(
+        FixtureReadiness::UnprovenTransportFailure,
+        FixtureReadiness::Exact,
+        Some(SatelleError::host_unreachable("remote")),
+        &[
+            "confirm-before-probe",
+            "initial-readiness",
+            "confirm-after-probe",
+        ],
+    );
+    for (readiness, expected_error) in [
+        (
+            FixtureReadiness::VersionMismatch,
+            SatelleError::remote_api_error("remote", "unexpected-durable-daemon-version"),
+        ),
+        (
+            FixtureReadiness::IdentityMismatch,
+            SatelleError::host_identity_mismatch("remote"),
+        ),
+    ] {
+        assert_lifecycle(
+            FixtureReadiness::ConnectFailure,
+            readiness,
+            Some(expected_error),
+            &[
+                "confirm-before-probe",
+                "initial-readiness",
+                "confirm-after-probe",
+                "launch",
+                "bootstrap-authenticated",
+                "confirm-before-final-readiness",
+                "durable-readiness",
+                "confirm-after-final-readiness",
+            ],
+        );
+    }
+
+    #[cfg(unix)]
+    with_bootstrap_handoff_test_context(|_, fake_ssh, _, _, _| {
+        fn request(operation_id: &str, controller_identity: &str) -> bootstrap_lock::Request {
+            bootstrap_lock::Request::new(
+                operation_id,
+                bootstrap_lock::OperationKind::MissingDaemonRepair,
+                Some(controller_identity.to_string()),
+            )
+            .expect("valid serialized relaunch lock request")
+        }
+
+        let mut lock = ssh_bootstrap::SshBootstrapLock::acquire_for_tests(
+            "fake-ssh-host",
+            request("srl-real-lock-owner", "srl-real-lock-owner-controller"),
+            fake_ssh,
+        )
+        .expect("acquire the production SSH bootstrap lock");
+        assert!(lock.exchanged_lock_lines().is_empty());
+        lock.confirm_ownership()
+            .expect("confirm production lock ownership");
+        assert!(matches!(
+            ssh_bootstrap::SshBootstrapLock::acquire_for_tests(
+                "fake-ssh-host",
+                request(
+                    "srl-real-lock-contender",
+                    "srl-real-lock-contender-controller",
+                ),
+                fake_ssh,
+            ),
+            Err(ssh_bootstrap::SshBootstrapError::BootstrapBusy)
+        ));
+        lock.confirm_ownership()
+            .expect("the original lock remains owned after contention");
+        assert_eq!(lock.exchanged_lock_lines().len(), 2);
+        lock.release_unmodified()
+            .expect("release the unmodified production lock");
+        assert_eq!(
+            lock.exchanged_lock_lines().last().map(String::as_str),
+            Some(bootstrap_lock::RELEASE)
+        );
+        drop(lock);
+
+        let mut replacement = ssh_bootstrap::SshBootstrapLock::acquire_for_tests(
+            "fake-ssh-host",
+            request(
+                "srl-real-lock-after-release",
+                "srl-real-lock-after-release-controller",
+            ),
+            fake_ssh,
+        )
+        .expect("the released production lock can be acquired again");
+        replacement
+            .release_unmodified()
+            .expect("release the replacement lock");
+    });
 }
 
 #[test]
@@ -3657,7 +3870,7 @@ fn durable_relaunch_rejects_success_when_remote_lock_ownership_is_lost() {
     let lock_held = Arc::new(AtomicBool::new(true));
     let confirm_lock = Arc::clone(&lock_held);
     let readiness_lock = Arc::clone(&lock_held);
-    let error = relaunch_durable_daemon_under_lock(
+    let error = match probe_durable_daemon_under_lock(
         "remote",
         || {
             if confirm_lock.load(Ordering::SeqCst) {
@@ -3668,11 +3881,15 @@ fn durable_relaunch_rejects_success_when_remote_lock_ownership_is_lost() {
         },
         || {
             readiness_lock.store(false, Ordering::SeqCst);
-            Ok("daemon became ready as the SSH lock disconnected")
+            observe_remote_durable_readiness(Ok(DurableReadinessSnapshot {
+                daemon_version: env!("CARGO_PKG_VERSION").to_string(),
+                host_identity: "host-exact".to_string(),
+            }))
         },
-        || -> Result<(), SatelleError> { panic!("an already-ready daemon is not relaunched") },
-    )
-    .expect_err("stale lock ownership cannot report a serialized relaunch");
+    ) {
+        Err(error) => error,
+        Ok(_) => panic!("stale lock ownership cannot report a serialized relaunch"),
+    };
 
     assert_eq!(error.code, ErrorCode::HostUnreachable);
 }

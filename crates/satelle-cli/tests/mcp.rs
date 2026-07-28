@@ -450,7 +450,7 @@ fn initialize_and_tool_contracts_are_sdk_compatible() {
     );
     assert_eq!(
         response(&responses, 9)["result"]["structuredContent"]["schema_version"],
-        "satelle.config.explain.v1"
+        "satelle.config.explain.v2"
     );
     let logs = &response(&responses, 10)["result"];
     assert_eq!(logs["isError"], false, "logs result: {logs}");

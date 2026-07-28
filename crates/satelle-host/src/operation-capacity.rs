@@ -2,7 +2,9 @@ use crate::runtime::{AdmissionCancellation, AdmissionCancellationState};
 use crate::runtime::{RequestIdentity, RuntimeStopOutcome};
 use crate::storage::IdempotentOperation;
 use satelle_core::session::PublicSession;
-use satelle_core::{PublicResolvedProviderBinding, SatelleError, TurnId};
+use satelle_core::{
+    ProviderSecretProvisioningResult, PublicResolvedProviderBinding, SatelleError, TurnId,
+};
 use std::fmt;
 #[cfg(test)]
 use std::sync::atomic::AtomicUsize;
@@ -25,6 +27,7 @@ pub(crate) enum OperationOutcome {
     },
     Stop(RuntimeStopOutcome),
     ProviderBindingAuthorization(PublicResolvedProviderBinding),
+    ProviderSecretProvisioning(ProviderSecretProvisioningResult),
 }
 
 impl OperationOutcome {
@@ -36,25 +39,40 @@ impl OperationOutcome {
         Self::ProviderBindingAuthorization(binding)
     }
 
+    pub(crate) fn provider_secret_provisioning(result: ProviderSecretProvisioningResult) -> Self {
+        Self::ProviderSecretProvisioning(result)
+    }
+
+    pub(crate) fn into_provider_secret_provisioning(
+        self,
+    ) -> Result<ProviderSecretProvisioningResult, SatelleError> {
+        match self {
+            Self::ProviderSecretProvisioning(result) => Ok(result),
+            _ => Err(crate::runtime::integrity_error(
+                "the operation-capacity result had the wrong response type",
+            )),
+        }
+    }
+
     pub(crate) fn into_session(self) -> Result<PublicSession, SatelleError> {
         match self {
             Self::Admission { session, .. } => Ok(session),
-            Self::Stop(_) | Self::ProviderBindingAuthorization(_) => {
-                Err(crate::runtime::integrity_error(
-                    "the operation-capacity result had the wrong response type",
-                ))
-            }
+            Self::Stop(_)
+            | Self::ProviderBindingAuthorization(_)
+            | Self::ProviderSecretProvisioning(_) => Err(crate::runtime::integrity_error(
+                "the operation-capacity result had the wrong response type",
+            )),
         }
     }
 
     pub(crate) fn into_stop(self) -> Result<RuntimeStopOutcome, SatelleError> {
         match self {
             Self::Stop(outcome) => Ok(outcome),
-            Self::Admission { .. } | Self::ProviderBindingAuthorization(_) => {
-                Err(crate::runtime::integrity_error(
-                    "the operation-capacity result had the wrong response type",
-                ))
-            }
+            Self::Admission { .. }
+            | Self::ProviderBindingAuthorization(_)
+            | Self::ProviderSecretProvisioning(_) => Err(crate::runtime::integrity_error(
+                "the operation-capacity result had the wrong response type",
+            )),
         }
     }
 
@@ -63,9 +81,11 @@ impl OperationOutcome {
     ) -> Result<PublicResolvedProviderBinding, SatelleError> {
         match self {
             Self::ProviderBindingAuthorization(binding) => Ok(binding),
-            Self::Admission { .. } | Self::Stop(_) => Err(crate::runtime::integrity_error(
-                "the operation-capacity result had the wrong response type",
-            )),
+            Self::Admission { .. } | Self::Stop(_) | Self::ProviderSecretProvisioning(_) => {
+                Err(crate::runtime::integrity_error(
+                    "the operation-capacity result had the wrong response type",
+                ))
+            }
         }
     }
 
@@ -79,6 +99,9 @@ impl OperationOutcome {
             )),
             Self::ProviderBindingAuthorization(_) => Err(crate::runtime::integrity_error(
                 "an admission cancellation received a provider binding authorization result",
+            )),
+            Self::ProviderSecretProvisioning(_) => Err(crate::runtime::integrity_error(
+                "an admission cancellation received a provider secret provisioning result",
             )),
         }
     }

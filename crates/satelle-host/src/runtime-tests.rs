@@ -6,6 +6,12 @@ use super::{
     RequestIdentity, RunCommand, RuntimeHandle, RuntimeProviderPolicy, RuntimeStartupState,
     SteerCommand, StopCommand,
 };
+#[cfg(unix)]
+use crate::storage::{
+    IdempotencyInput, IdempotentOperation, PROVIDER_SECRET_CANDIDATE_HMAC_DOMAIN,
+    PROVIDER_SECRET_PRIOR_HMAC_DOMAIN, ProviderSecretProvisioningPhase,
+    ProviderSecretProvisioningPlan,
+};
 use crate::storage::{LeaseOwner, PrivateUpstreamRef, ProbeRecoverySubject};
 use crate::test_runtime::FakeComputerUseAdapter;
 use crate::{
@@ -110,6 +116,485 @@ fn production_runtime_with_host_policy(
         adapter,
         RuntimeProviderPolicy::from_host_config(config),
     )
+}
+
+#[cfg(unix)]
+struct ProviderSecretRecoveryFixture {
+    operation_id: String,
+    binding: satelle_core::ResolvedProviderBinding,
+    key: ReadinessCacheKey,
+    paths: satelle_core::OwnerOnlySecretFilePaths,
+    candidate_key: String,
+    candidate_digest: [u8; 32],
+    prior_key: String,
+    prior_digest: [u8; 32],
+    prior_hmac: String,
+}
+
+#[cfg(unix)]
+fn provider_secret_recovery_fixture(
+    runtime: &RuntimeHandle,
+    destination: &std::path::Path,
+    operation_id: &str,
+) -> ProviderSecretRecoveryFixture {
+    let engine = runtime
+        .engine_without_restart_recovery()
+        .expect("open runtime without recovery");
+    let candidate_secret = crate::provider_auth::ResolvedProviderSecret::for_test("candidate");
+    let candidate_key = runtime
+        .provider_secret_provisioning_hmac(PROVIDER_SECRET_CANDIDATE_HMAC_DOMAIN, &candidate_secret)
+        .expect("derive candidate comparison key");
+    let candidate_digest = candidate_secret
+        .expose_to_provider(|value| {
+            satelle_core::keyed_secret_comparison_digest(candidate_key.as_bytes(), value.as_bytes())
+        })
+        .expect("derive candidate digest");
+    let candidate_hmac = candidate_digest
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    let prior_secret = satelle_core::read_owner_only_secret_file(destination)
+        .map(crate::provider_auth::ResolvedProviderSecret::from_provisioning)
+        .expect("read normalized prior secret");
+    let prior_key = runtime
+        .provider_secret_provisioning_hmac(PROVIDER_SECRET_PRIOR_HMAC_DOMAIN, &prior_secret)
+        .expect("derive prior comparison key");
+    let prior_digest = satelle_core::keyed_owner_only_secret_file_comparison_digest(
+        destination,
+        prior_key.as_bytes(),
+    )
+    .expect("derive exact prior file digest");
+    let prior_hmac = prior_digest
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    let binding = satelle_core::ResolvedProviderBinding::from_authorization(
+        satelle_core::ProviderBindingAuthorization::new("review", "openai", "host-model", "openai")
+            .with_auth_source(satelle_core::ProviderSecretSource::File {
+                path: destination.to_path_buf(),
+            }),
+        satelle_core::ProviderBindingSource::UserConfig,
+    );
+    let key = ProviderProbeRecoveryAdapter::key();
+    let paths = crate::storage::provider_secret_file_paths(destination, operation_id)
+        .expect("construct deterministic recovery paths");
+    let plan = ProviderSecretProvisioningPlan::new(
+        engine.host_identity().expect("load host identity"),
+        key.desktop_binding().clone(),
+        format!("probe-{operation_id}"),
+        binding.clone(),
+        destination.to_path_buf(),
+        paths.staging().to_path_buf(),
+        candidate_hmac.clone(),
+    )
+    .expect("construct provisioning plan");
+    let now = time::OffsetDateTime::now_utc();
+    let idempotency = IdempotencyInput::new(
+        "provider-recovery-principal",
+        IdempotentOperation::ProviderSecretProvisioning,
+        operation_id,
+        operation_id,
+        STABLE_DIGEST,
+        1,
+        1,
+        now,
+        now + time::Duration::hours(1),
+    )
+    .expect("construct provisioning idempotency");
+    let owner = LeaseOwner::new(
+        operation_id,
+        engine.process_identity.process_id(),
+        engine.process_identity.process_start_ref(),
+        engine.process_identity.boot_identity_ref(),
+        now,
+    )
+    .expect("construct provisioning owner");
+    engine
+        .lock_storage()
+        .expect("lock storage")
+        .begin_provider_secret_provisioning(&idempotency, &key, &owner, plan)
+        .expect("record T0");
+    ProviderSecretRecoveryFixture {
+        operation_id: operation_id.to_string(),
+        binding,
+        key,
+        paths,
+        candidate_key,
+        candidate_digest,
+        prior_key,
+        prior_digest,
+        prior_hmac,
+    }
+}
+
+#[cfg(unix)]
+fn recovery_test_runtime(state: &crate::TestStateDir) -> RuntimeHandle {
+    let config = satelle_core::SatelleConfig::defaults()
+        .hosts
+        .get(LOCAL_DEMO_HOST)
+        .expect("default host config")
+        .clone();
+    production_runtime_with_host_policy(state.path(), &config)
+}
+
+#[cfg(unix)]
+fn recovery_secret_destination(state: &crate::TestStateDir, name: &str) -> std::path::PathBuf {
+    let directory = state.path().join("provider-secrets");
+    drop(
+        satelle_core::open_or_create_owner_only_directory(&directory)
+            .expect("create owner-only provider secret directory"),
+    );
+    directory.join(name)
+}
+
+#[cfg(unix)]
+fn assert_startup_recovery_rolls_back_publish_intent(
+    destination_name: &str,
+    operation_id: &str,
+    prior_bytes: &str,
+) {
+    use std::io::Write as _;
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let state = crate::TestStateDir::new().expect("temporary state directory");
+    let destination = recovery_secret_destination(&state, destination_name);
+    let mut prior_file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&destination)
+        .expect("create exact owner-only prior credential");
+    prior_file
+        .write_all(prior_bytes.as_bytes())
+        .expect("write exact prior credential bytes");
+    prior_file
+        .sync_all()
+        .expect("sync exact prior credential bytes");
+    drop(prior_file);
+    let runtime = recovery_test_runtime(&state);
+    let fixture = provider_secret_recovery_fixture(&runtime, &destination, operation_id);
+    satelle_core::stage_owner_only_secret_file(
+        &fixture.paths,
+        "candidate",
+        fixture.candidate_key.as_bytes(),
+        &fixture.candidate_digest,
+    )
+    .expect("stage candidate");
+    let engine = runtime
+        .engine_without_restart_recovery()
+        .expect("open runtime without recovery");
+    {
+        let mut storage = engine.lock_storage().expect("lock storage");
+        storage
+            .record_staged_provider_secret(
+                &fixture.operation_id,
+                true,
+                Some(fixture.paths.backup()),
+                Some(&fixture.prior_hmac),
+                time::OffsetDateTime::now_utc(),
+            )
+            .expect("record staged state");
+        storage
+            .transition_provider_secret_provisioning(
+                &fixture.operation_id,
+                ProviderSecretProvisioningPhase::Staged,
+                ProviderSecretProvisioningPhase::Validated,
+                time::OffsetDateTime::now_utc(),
+            )
+            .expect("record validation");
+        storage
+            .transition_provider_secret_provisioning(
+                &fixture.operation_id,
+                ProviderSecretProvisioningPhase::Validated,
+                ProviderSecretProvisioningPhase::PublishIntent,
+                time::OffsetDateTime::now_utc(),
+            )
+            .expect("record publish intent");
+    }
+    satelle_core::publish_owner_only_secret_file(
+        &fixture.paths,
+        true,
+        true,
+        fixture.candidate_key.as_bytes(),
+        &fixture.candidate_digest,
+        Some(fixture.prior_key.as_bytes()),
+        Some(&fixture.prior_digest),
+    )
+    .expect("publish candidate before simulated crash");
+    drop(engine);
+    drop(runtime);
+
+    let restarted = recovery_test_runtime(&state);
+    restarted.snapshot().expect("startup recovery succeeds");
+    assert_eq!(
+        std::fs::read(&destination).expect("read exact restored credential bytes"),
+        prior_bytes.as_bytes(),
+    );
+    assert!(!fixture.paths.staging().exists());
+    assert!(!fixture.paths.backup().exists());
+    assert!(
+        restarted
+            .engine_without_restart_recovery()
+            .expect("open recovered engine")
+            .lock_storage()
+            .expect("lock recovered storage")
+            .pending_provider_secret_provisionings()
+            .expect("load pending journals")
+            .is_empty()
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn startup_recovery_rolls_back_publish_intent_before_serving_requests() {
+    assert_startup_recovery_rolls_back_publish_intent(
+        "rollback-token",
+        "provider-rollback-crash",
+        "prior",
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn startup_recovery_preserves_an_unowned_parked_rotation() {
+    let state = crate::TestStateDir::new().expect("temporary state directory");
+    let destination = recovery_secret_destination(&state, "parked-rotation-token");
+    satelle_core::persist_new_owner_only_secret_file(&destination, "prior")
+        .expect("persist prior credential");
+    let runtime = recovery_test_runtime(&state);
+    let fixture =
+        provider_secret_recovery_fixture(&runtime, &destination, "provider-parked-rotation-crash");
+    satelle_core::stage_owner_only_secret_file(
+        &fixture.paths,
+        "candidate",
+        fixture.candidate_key.as_bytes(),
+        &fixture.candidate_digest,
+    )
+    .expect("stage candidate");
+    let engine = runtime
+        .engine_without_restart_recovery()
+        .expect("open runtime without recovery");
+    {
+        let mut storage = engine.lock_storage().expect("lock storage");
+        storage
+            .record_staged_provider_secret(
+                &fixture.operation_id,
+                true,
+                Some(fixture.paths.backup()),
+                Some(&fixture.prior_hmac),
+                time::OffsetDateTime::now_utc(),
+            )
+            .expect("record staged state");
+        storage
+            .transition_provider_secret_provisioning(
+                &fixture.operation_id,
+                ProviderSecretProvisioningPhase::Staged,
+                ProviderSecretProvisioningPhase::Validated,
+                time::OffsetDateTime::now_utc(),
+            )
+            .expect("record validation");
+        storage
+            .transition_provider_secret_provisioning(
+                &fixture.operation_id,
+                ProviderSecretProvisioningPhase::Validated,
+                ProviderSecretProvisioningPhase::PublishIntent,
+                time::OffsetDateTime::now_utc(),
+            )
+            .expect("record publish intent");
+    }
+
+    std::fs::rename(&destination, fixture.paths.backup()).expect("park prior credential");
+    std::fs::rename(fixture.paths.staging(), &destination).expect("publish candidate");
+    std::fs::write(&destination, "rotated").expect("rotate published credential");
+    std::fs::rename(&destination, fixture.paths.staging()).expect("park unowned rotation");
+    drop(engine);
+    drop(runtime);
+
+    let restarted = recovery_test_runtime(&state);
+    restarted.snapshot().expect("recover parked rotation");
+    assert_eq!(
+        satelle_core::read_owner_only_secret_file(&destination)
+            .expect("read recovered rotation")
+            .as_str(),
+        "rotated"
+    );
+    assert!(!fixture.paths.staging().exists());
+    assert!(!fixture.paths.backup().exists());
+    assert!(
+        restarted
+            .engine_without_restart_recovery()
+            .expect("open recovered engine")
+            .lock_storage()
+            .expect("lock recovered storage")
+            .pending_provider_secret_provisionings()
+            .expect("load pending journals")
+            .is_empty()
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn startup_recovery_preserves_lf_terminated_prior_secret_bytes() {
+    assert_startup_recovery_rolls_back_publish_intent(
+        "rollback-token-lf",
+        "provider-rollback-crash-lf",
+        "prior\n",
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn startup_recovery_preserves_crlf_terminated_prior_secret_bytes() {
+    assert_startup_recovery_rolls_back_publish_intent(
+        "rollback-token-crlf",
+        "provider-rollback-crash-crlf",
+        "prior\r\n",
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn startup_recovery_finishes_committed_cleanup_without_rolling_back() {
+    let state = crate::TestStateDir::new().expect("temporary state directory");
+    let destination = recovery_secret_destination(&state, "committed-token");
+    satelle_core::persist_new_owner_only_secret_file(&destination, "prior")
+        .expect("persist prior credential");
+    let runtime = recovery_test_runtime(&state);
+    let fixture =
+        provider_secret_recovery_fixture(&runtime, &destination, "provider-committed-crash");
+    satelle_core::stage_owner_only_secret_file(
+        &fixture.paths,
+        "candidate",
+        fixture.candidate_key.as_bytes(),
+        &fixture.candidate_digest,
+    )
+    .expect("stage candidate");
+    let engine = runtime
+        .engine_without_restart_recovery()
+        .expect("open runtime without recovery");
+    let readiness = ProviderProbeRecoveryAdapter::new(std::iter::empty())
+        .readiness_with_id("committed-recovery");
+    {
+        let mut storage = engine.lock_storage().expect("lock storage");
+        storage
+            .record_staged_provider_secret(
+                &fixture.operation_id,
+                true,
+                Some(fixture.paths.backup()),
+                Some(&fixture.prior_hmac),
+                time::OffsetDateTime::now_utc(),
+            )
+            .expect("record staged state");
+        storage
+            .transition_provider_secret_provisioning(
+                &fixture.operation_id,
+                ProviderSecretProvisioningPhase::Staged,
+                ProviderSecretProvisioningPhase::Validated,
+                time::OffsetDateTime::now_utc(),
+            )
+            .expect("record validation");
+        storage
+            .transition_provider_secret_provisioning(
+                &fixture.operation_id,
+                ProviderSecretProvisioningPhase::Validated,
+                ProviderSecretProvisioningPhase::PublishIntent,
+                time::OffsetDateTime::now_utc(),
+            )
+            .expect("record publish intent");
+    }
+    satelle_core::publish_owner_only_secret_file(
+        &fixture.paths,
+        true,
+        true,
+        fixture.candidate_key.as_bytes(),
+        &fixture.candidate_digest,
+        Some(fixture.prior_key.as_bytes()),
+        Some(&fixture.prior_digest),
+    )
+    .expect("publish candidate");
+    engine
+        .lock_storage()
+        .expect("lock storage")
+        .commit_provider_secret_provisioning(
+            &fixture.operation_id,
+            &fixture.binding,
+            &fixture.key,
+            &readiness,
+            None,
+            time::OffsetDateTime::now_utc(),
+        )
+        .expect("commit T3");
+    drop(engine);
+    drop(runtime);
+
+    let restarted = recovery_test_runtime(&state);
+    restarted.snapshot().expect("finish committed cleanup");
+    assert_eq!(
+        satelle_core::read_owner_only_secret_file(&destination)
+            .expect("read committed credential")
+            .as_str(),
+        "candidate"
+    );
+    assert!(!fixture.paths.staging().exists());
+    assert!(!fixture.paths.backup().exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn startup_recovery_keeps_rollback_pending_and_leased_on_hmac_failure() {
+    let state = crate::TestStateDir::new().expect("temporary state directory");
+    let destination = recovery_secret_destination(&state, "failed-rollback-token");
+    satelle_core::persist_new_owner_only_secret_file(&destination, "prior")
+        .expect("persist prior credential");
+    let runtime = recovery_test_runtime(&state);
+    let fixture =
+        provider_secret_recovery_fixture(&runtime, &destination, "provider-invalid-crash");
+    satelle_core::stage_owner_only_secret_file(
+        &fixture.paths,
+        "candidate",
+        fixture.candidate_key.as_bytes(),
+        &fixture.candidate_digest,
+    )
+    .expect("stage candidate");
+    runtime
+        .engine_without_restart_recovery()
+        .expect("open runtime without recovery")
+        .lock_storage()
+        .expect("lock storage")
+        .record_staged_provider_secret(
+            &fixture.operation_id,
+            true,
+            Some(fixture.paths.backup()),
+            Some(&fixture.prior_hmac),
+            time::OffsetDateTime::now_utc(),
+        )
+        .expect("record staged state");
+    std::fs::write(fixture.paths.staging(), "unowned-candidate").expect("tamper staged credential");
+    drop(runtime);
+
+    let restarted = recovery_test_runtime(&state);
+    let error = restarted
+        .snapshot()
+        .expect_err("ambiguous HMAC ownership must block startup");
+    assert_eq!(error.code, ErrorCode::StorageIntegrityFailed);
+    let pending = restarted
+        .engine_without_restart_recovery()
+        .expect("open failed recovery engine")
+        .lock_storage()
+        .expect("lock failed recovery storage")
+        .pending_provider_secret_provisionings()
+        .expect("load retained journal");
+    assert_eq!(pending.len(), 1);
+    assert_eq!(
+        pending[0].phase(),
+        ProviderSecretProvisioningPhase::RollbackPending
+    );
+    assert_eq!(
+        satelle_core::read_owner_only_secret_file(&destination)
+            .expect("read preserved prior credential")
+            .as_str(),
+        "prior"
+    );
 }
 
 #[test]
@@ -716,13 +1201,26 @@ fn unknown_provider_probe_ownership_blocks_probe_and_prompt_until_terminal_recon
         adapter.clone(),
         adapter.clone(),
     );
-    let provider_intent = ProviderComputerUseIntent::new(None, None, true);
+    let provider_intent = ProviderComputerUseIntent::new(None, None, false);
+    let engine = runtime.engine().expect("runtime engine should be open");
+    let key = ProviderProbeRecoveryAdapter::key();
+    let native = adapter.readiness_with_id("unknown-provider-probe-native-ready");
+    engine
+        .lock_storage()
+        .unwrap()
+        .store_preflight_successes(
+            key.adapter(),
+            key.desktop_binding(),
+            key.execution_policy(),
+            &native,
+            None,
+        )
+        .expect("preseed native readiness before creating provider-probe recovery ownership");
 
     let first = runtime
         .refresh_provider_smoke(LOCAL_DEMO_HOST, &provider_intent)
         .expect_err("unknown cancellation must fail the provider probe");
     assert_eq!(first.code, ErrorCode::ProviderSmokeTestTimeout);
-    let engine = runtime.engine().expect("runtime engine should be open");
     let storage = engine.lock_storage().unwrap();
     let status: String = storage
         .connection_for_test()
@@ -802,16 +1300,25 @@ fn active_provider_probe_blocks_without_external_reconciliation() {
         adapter.clone(),
     );
     let engine = runtime.engine().expect("runtime engine should be open");
+    let key = ProviderProbeRecoveryAdapter::key();
+    let native = adapter.readiness_with_id("active-provider-probe-native-ready");
+    engine
+        .lock_storage()
+        .unwrap()
+        .store_preflight_successes(
+            key.adapter(),
+            key.desktop_binding(),
+            key.execution_policy(),
+            &native,
+            None,
+        )
+        .expect("preseed native readiness before asserting provider-probe recovery");
     let now = time::OffsetDateTime::now_utc();
     let owner = LeaseOwner::new("active-probe", 1, "process-start", "boot-id", now).unwrap();
     engine
         .lock_storage()
         .unwrap()
-        .begin_provider_probe(
-            &ProviderProbeRecoveryAdapter::key(),
-            "active-provider-probe",
-            &owner,
-        )
+        .begin_provider_probe(&key, "active-provider-probe", &owner)
         .unwrap();
 
     let error = runtime
@@ -1002,6 +1509,63 @@ fn exact_readiness_reuse_reports_live_then_cache_source() {
     assert_eq!(cached_readiness.event_type(), EventType::Readiness);
     assert_eq!(cached_readiness.data()["source"], "cache");
     assert_eq!(adapter.native_probe_calls.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn setup_native_refresh_never_reuses_an_exact_cached_pass() {
+    let state = crate::TestStateDir::new().expect("temporary state directory should exist");
+    let adapter = ProviderProbeRecoveryAdapter::with_native_only_results(
+        [],
+        [NativeProbeBehavior::Passed, NativeProbeBehavior::Passed],
+    );
+    let runtime = RuntimeHandle::new_with_readiness_probe_driver(
+        Ok(state.path().to_path_buf()),
+        adapter.clone(),
+        adapter.clone(),
+    );
+    let intent = ProviderComputerUseIntent::host_default();
+
+    runtime
+        .run(RunCommand::attached(
+            LOCAL_DEMO_HOST,
+            "seed-native-readiness-before-setup-refresh",
+        ))
+        .expect("seed exact reusable native readiness");
+    let refreshed = runtime
+        .refresh_setup_native_readiness(LOCAL_DEMO_HOST, &intent)
+        .expect("setup performs a fresh native probe");
+
+    assert_eq!(refreshed.source(), super::ReadinessSource::Live);
+    assert_eq!(adapter.native_probe_calls.load(Ordering::SeqCst), 2);
+}
+
+#[test]
+fn setup_provider_binding_failure_occurs_after_returned_native_evidence() {
+    let state = crate::TestStateDir::new().expect("temporary state directory should exist");
+    let adapter =
+        ProviderProbeRecoveryAdapter::with_native_results([], [NativeProbeBehavior::Passed]);
+    let runtime = RuntimeHandle::new_with_readiness_probe_driver(
+        Ok(state.path().to_path_buf()),
+        adapter.clone(),
+        adapter.clone(),
+    );
+    let intent = ProviderComputerUseIntent::new(
+        Some(EffectiveModelRef::new("missing-model").expect("valid model alias")),
+        Some(ProviderBindingRef::new("missing-provider").expect("valid provider alias")),
+        true,
+    )
+    .with_experimental_provider_computer_use(true);
+
+    let native = runtime
+        .refresh_setup_native_readiness(LOCAL_DEMO_HOST, &intent)
+        .expect("the explicit native phase completes before provider authorization");
+    let error = runtime
+        .refresh_setup_provider_readiness(LOCAL_DEMO_HOST, &intent, native)
+        .expect_err("the missing provider binding fails only in the provider phase");
+
+    assert_eq!(error.code, ErrorCode::ModelProviderBindingMissing);
+    assert_eq!(adapter.native_probe_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(adapter.provider_probe_calls.load(Ordering::SeqCst), 0);
 }
 
 #[test]
@@ -2150,6 +2714,7 @@ impl ReadinessProbeDriver for ProviderProbeRecoveryAdapter {
         cached: Option<ReadinessEvidence>,
         _cached_provider: Option<super::ProviderSmokeResult>,
         _provider_intent: &ProviderComputerUseIntent,
+        _provider_secret: Option<crate::provider_auth::ResolvedProviderSecret>,
         _cancellation: &super::AdmissionCancellation,
         persist_thread_ref: &mut dyn FnMut(&str) -> Result<(), ()>,
         persist_turn_ref: &mut dyn FnMut(&str) -> Result<(), ()>,

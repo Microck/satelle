@@ -38,6 +38,9 @@ pub enum ApiErrorCode {
     ExperimentalProviderOptInRequired,
     ModelProviderBindingMissing,
     ProjectProviderSelectionNotAllowed,
+    ProviderSecretSourceRequired,
+    ProviderSecretProvisioningRequired,
+    ProviderSecretOverwriteRequired,
     ProviderSecretResolutionFailed,
     ExperimentalProviderNotValidated,
     StorageBusy,
@@ -88,6 +91,9 @@ impl ApiErrorCode {
             Self::ExperimentalProviderOptInRequired => "experimental-provider-opt-in-required",
             Self::ModelProviderBindingMissing => "model-provider-binding-missing",
             Self::ProjectProviderSelectionNotAllowed => "project-provider-selection-not-allowed",
+            Self::ProviderSecretSourceRequired => "provider-secret-source-required",
+            Self::ProviderSecretProvisioningRequired => "provider-secret-provisioning-required",
+            Self::ProviderSecretOverwriteRequired => "provider-secret-overwrite-required",
             Self::ProviderSecretResolutionFailed => "provider-secret-resolution-failed",
             Self::ExperimentalProviderNotValidated => "experimental-provider-not-validated",
             Self::StorageBusy => "storage-busy",
@@ -145,6 +151,18 @@ mod tests {
             (
                 ApiErrorCode::ProviderSecretResolutionFailed,
                 "provider-secret-resolution-failed",
+            ),
+            (
+                ApiErrorCode::ProviderSecretSourceRequired,
+                "provider-secret-source-required",
+            ),
+            (
+                ApiErrorCode::ProviderSecretProvisioningRequired,
+                "provider-secret-provisioning-required",
+            ),
+            (
+                ApiErrorCode::ProviderSecretOverwriteRequired,
+                "provider-secret-overwrite-required",
             ),
             (
                 ApiErrorCode::ExperimentalProviderNotValidated,

@@ -15,7 +15,7 @@ impl Storage {
     ///
     /// Canonical log-prefix pruning runs first because it alone owns cursor
     /// expiry. A Session remains until no retained lifecycle log references it;
-    /// expired replay records, the Session cascade, sessionless provider
+    /// expired replay records, the Session cascade, bounded sessionless
     /// operation replays, and known terminal setup runs are then deleted in the
     /// same immediate transaction. Setup cleanup cannot invoke an executor or
     /// change external host state.
@@ -47,7 +47,7 @@ impl Storage {
             .map_err(|source| sqlite_error(StorageErrorKind::OperationFailed, source))?;
         prune_expired_logs(&transaction, observed_at)?;
         prune_expired_admission_cancellations(&transaction, observed_at)?;
-        prune_expired_sessionless_provider_idempotency(&transaction, observed_at)?;
+        prune_expired_sessionless_idempotency(&transaction, observed_at)?;
         let candidates =
             terminal_session_candidates(&transaction, session_cutoff, session_cutoff_nanos)?;
 
@@ -80,7 +80,7 @@ fn retention_needs_pruning(
     if admission_cancellations_need_pruning(connection, observed_at)? {
         return Ok(true);
     }
-    if !expired_sessionless_provider_idempotency(connection, observed_at)?.is_empty() {
+    if !expired_sessionless_idempotency(connection, observed_at)?.is_empty() {
         return Ok(true);
     }
     for session_id in terminal_session_candidates(connection, session_cutoff, session_cutoff_nanos)?
@@ -154,12 +154,12 @@ fn prune_expired_admission_cancellations(
     Ok(())
 }
 
-fn prune_expired_sessionless_provider_idempotency(
+fn prune_expired_sessionless_idempotency(
     transaction: &Transaction<'_>,
     observed_at: OffsetDateTime,
 ) -> Result<(), StorageError> {
     for (principal_ref, operation, key) in
-        expired_sessionless_provider_idempotency(transaction, observed_at)?
+        expired_sessionless_idempotency(transaction, observed_at)?
     {
         transaction
             .execute(
@@ -175,7 +175,7 @@ fn prune_expired_sessionless_provider_idempotency(
     Ok(())
 }
 
-fn expired_sessionless_provider_idempotency(
+fn expired_sessionless_idempotency(
     connection: &Connection,
     observed_at: OffsetDateTime,
 ) -> Result<Vec<(String, String, String)>, StorageError> {
@@ -186,7 +186,7 @@ fn expired_sessionless_provider_idempotency(
              WHERE session_id IS NULL
                AND (
                    (operation = ?1 AND status IN ('in_progress', 'terminal'))
-                   OR (operation IN (?2, ?3) AND status = 'terminal')
+                   OR (operation IN (?2, ?3, ?4, ?5, ?6) AND status = 'terminal')
                )",
         )
         .map_err(|source| sqlite_error(StorageErrorKind::OperationFailed, source))?;
@@ -194,8 +194,11 @@ fn expired_sessionless_provider_idempotency(
         .query_map(
             params![
                 idempotent_operation_token(IdempotentOperation::ProviderDescriptorValidation),
+                idempotent_operation_token(IdempotentOperation::ProviderSecretProvisioning),
                 idempotent_operation_token(IdempotentOperation::ProviderBindingAuthorization),
                 idempotent_operation_token(IdempotentOperation::ProviderBindingDeletion),
+                idempotent_operation_token(IdempotentOperation::SetupVerification),
+                idempotent_operation_token(IdempotentOperation::NativeReadinessInvalidation),
             ],
             |row| {
                 Ok((

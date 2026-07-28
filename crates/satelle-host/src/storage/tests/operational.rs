@@ -36,7 +36,9 @@ fn rebuild_idempotency_records_as_pre_v11_fixture(connection: &Connection) {
     // migration 11 receives from real version 1 through version 10 stores.
     connection
         .execute_batch(
-            "CREATE TABLE idempotency_records_pre_v11_fixture (
+            "DROP TABLE provider_secret_provisioning_journal;
+
+            CREATE TABLE idempotency_records_pre_v11_fixture (
                 principal_ref TEXT NOT NULL,
                 operation TEXT NOT NULL CHECK (operation IN ('run', 'steer', 'stop')),
                 idempotency_key TEXT NOT NULL,
@@ -159,7 +161,9 @@ fn rebuild_storage_as_version_eleven_fixture(connection: &Connection) {
     // place. Recreate the exact schemas that migration 12 receives.
     connection
         .execute_batch(
-            "DROP INDEX idempotency_expiry;
+            "DROP TABLE provider_secret_provisioning_journal;
+            DROP INDEX idempotency_operation_identity;
+            DROP INDEX idempotency_expiry;
             ALTER TABLE idempotency_records
                 RENAME TO idempotency_records_v12_fixture;
 
@@ -366,19 +370,19 @@ fn rebuild_storage_as_version_eleven_fixture(connection: &Connection) {
 
             DROP TABLE authorized_provider_bindings;
             DROP TABLE provider_smoke_hmac_key;
-            DELETE FROM schema_migrations WHERE version = 12;
+            DELETE FROM schema_migrations WHERE version IN (12, 13);
             PRAGMA user_version = 11;",
         )
         .expect("restore the exact version eleven storage schema");
 }
 
 #[test]
-fn operational_evidence_schema_is_migrated_atomically_to_version_twelve() {
+fn operational_evidence_schema_is_migrated_atomically_to_version_thirteen() {
     let state = TempDir::new().expect("temporary state directory");
     let (storage, _) = Storage::open(state.path()).expect("open storage");
     let connection = storage.connection_for_test();
 
-    assert_eq!(12_i64, pragma_integer(connection, "user_version"));
+    assert_eq!(13_i64, pragma_integer(connection, "user_version"));
     let versions = connection
         .prepare("SELECT version FROM schema_migrations ORDER BY version")
         .unwrap()
@@ -389,9 +393,18 @@ fn operational_evidence_schema_is_migrated_atomically_to_version_twelve() {
     assert_eq!(
         vec![
             1_i64, 2_i64, 3_i64, 4_i64, 5_i64, 6_i64, 7_i64, 8_i64, 9_i64, 10_i64, 11_i64, 12_i64,
+            13_i64,
         ],
         versions
     );
+    let migration_twelve_checksum: String = connection
+        .query_row(
+            "SELECT checksum FROM schema_migrations WHERE version = 12",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!("fnv1a64:a5672c42bd40d2a8", migration_twelve_checksum);
     for table in [
         "sessions",
         "turns",
@@ -401,6 +414,7 @@ fn operational_evidence_schema_is_migrated_atomically_to_version_twelve() {
         "setup_actions",
         "logs",
         "authorized_provider_bindings",
+        "provider_secret_provisioning_journal",
     ] {
         let exists: bool = connection
             .query_row(
@@ -469,7 +483,7 @@ fn version_eleven_provider_smoke_rows_upgrade_to_credential_scoped_cache() {
     let mut upgraded = Storage::open_without_restart_recovery(state.path())
         .expect("upgrade the version eleven store");
     assert_eq!(
-        12_i64,
+        13_i64,
         pragma_integer(upgraded.connection_for_test(), "user_version")
     );
     let credential_columns: i64 = upgraded
@@ -569,7 +583,7 @@ fn version_ten_operation_rows_upgrade_without_data_loss_or_foreign_key_damage() 
     storage
         .connection_for_test()
         .execute(
-            "DELETE FROM schema_migrations WHERE version IN (11, 12)",
+            "DELETE FROM schema_migrations WHERE version IN (11, 12, 13)",
             [],
         )
         .expect("remove version eleven and twelve history");
@@ -582,7 +596,7 @@ fn version_ten_operation_rows_upgrade_without_data_loss_or_foreign_key_damage() 
     let upgraded = Storage::open_without_restart_recovery(state.path())
         .expect("upgrade populated version ten storage");
     let connection = upgraded.connection_for_test();
-    assert_eq!(12_i64, pragma_integer(connection, "user_version"));
+    assert_eq!(13_i64, pragma_integer(connection, "user_version"));
     assert_eq!(
         ("run".to_string(), "in_progress".to_string()),
         connection
@@ -749,13 +763,13 @@ fn newer_schema_history_is_rejected_without_downgrade() {
         .connection_for_test()
         .execute(
             "INSERT INTO schema_migrations (version, checksum, applied_at)
-             VALUES (13, ?1, '2026-07-21T00:00:00Z')",
+             VALUES (14, ?1, '2026-07-21T00:00:00Z')",
             ["aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"],
         )
         .expect("insert future migration");
     storage
         .connection_for_test()
-        .pragma_update(None, "user_version", 13)
+        .pragma_update(None, "user_version", 14)
         .expect("mark future schema");
     drop(storage);
 
@@ -766,7 +780,7 @@ fn newer_schema_history_is_rejected_without_downgrade() {
     assert_eq!(error.kind(), StorageErrorKind::MigrationIntegrity);
     let connection = Connection::open(state.path().join(DATABASE_FILE_NAME))
         .expect("future database remains readable");
-    assert_eq!(pragma_integer(&connection, "user_version"), 13);
+    assert_eq!(pragma_integer(&connection, "user_version"), 14);
 }
 
 #[test]
@@ -799,7 +813,7 @@ fn version_seven_api_tokens_upgrade_to_explicit_active_state() {
              ALTER TABLE api_tokens DROP COLUMN token_state;
              DROP TABLE authorized_provider_bindings;
              DROP TABLE provider_smoke_hmac_key;
-             DELETE FROM schema_migrations WHERE version IN (8, 9, 10, 11, 12);
+             DELETE FROM schema_migrations WHERE version IN (8, 9, 10, 11, 12, 13);
              PRAGMA user_version = 7;",
         )
         .expect("recreate the version seven token schema");
@@ -807,7 +821,7 @@ fn version_seven_api_tokens_upgrade_to_explicit_active_state() {
 
     let (storage, _) = Storage::open(state.path()).expect("upgrade version seven storage");
     assert_eq!(
-        12_i64,
+        13_i64,
         pragma_integer(storage.connection_for_test(), "user_version")
     );
     let token_state: String = storage
@@ -2065,7 +2079,7 @@ fn version_one_store_upgrades_without_replacing_existing_state() {
              ALTER TABLE api_tokens DROP COLUMN token_state;
              DROP TABLE authorized_provider_bindings;
              DROP TABLE provider_smoke_hmac_key;
-             DELETE FROM schema_migrations WHERE version IN (2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12);
+             DELETE FROM schema_migrations WHERE version IN (2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13);
              PRAGMA user_version = 1;",
         )
         .unwrap();
@@ -2074,7 +2088,7 @@ fn version_one_store_upgrades_without_replacing_existing_state() {
     let (storage, _) = Storage::open(state.path()).expect("upgrade version one storage");
     assert_eq!(expected_host, storage.host_identity().unwrap());
     assert_eq!(
-        12_i64,
+        13_i64,
         pragma_integer(storage.connection_for_test(), "user_version")
     );
 
@@ -2168,9 +2182,11 @@ fn assert_version_one_corruption_rejected_before_migration(
              ALTER TABLE sessions DROP COLUMN display_name;
              ALTER TABLE session_private_refs DROP COLUMN upstream_goal_ref;
              ALTER TABLE api_tokens DROP COLUMN token_state;
+             DROP TABLE provider_secret_provisioning_journal;
+             DROP INDEX idempotency_operation_identity;
              DROP TABLE authorized_provider_bindings;
              DROP TABLE provider_smoke_hmac_key;
-             DELETE FROM schema_migrations WHERE version IN (2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12);
+             DELETE FROM schema_migrations WHERE version IN (2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13);
              PRAGMA user_version = 1;",
         )
         .expect("create a logically corrupt version one store");
@@ -2198,6 +2214,7 @@ fn assert_version_one_corruption_rejected_before_migration(
         "provider_smoke_successes",
         "provider_smoke_results",
         "authorized_provider_bindings",
+        "provider_secret_provisioning_journal",
         "setup_runs",
         "setup_actions",
     ] {
@@ -2232,9 +2249,11 @@ fn failed_migration_rolls_back_partial_schema_and_preserves_existing_state() {
              ALTER TABLE sessions DROP COLUMN display_name;
              ALTER TABLE session_private_refs DROP COLUMN upstream_goal_ref;
              ALTER TABLE api_tokens DROP COLUMN token_state;
+             DROP TABLE provider_secret_provisioning_journal;
+             DROP INDEX idempotency_operation_identity;
              DROP TABLE authorized_provider_bindings;
              DROP TABLE provider_smoke_hmac_key;
-             DELETE FROM schema_migrations WHERE version IN (2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12);
+             DELETE FROM schema_migrations WHERE version IN (2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13);
              PRAGMA user_version = 1;
              CREATE TABLE migration_sentinel (value TEXT NOT NULL) STRICT;
              INSERT INTO migration_sentinel (value) VALUES ('preserve-me');
@@ -2289,6 +2308,7 @@ fn failed_migration_rolls_back_partial_schema_and_preserves_existing_state() {
         "provider_smoke_successes",
         "provider_smoke_results",
         "authorized_provider_bindings",
+        "provider_secret_provisioning_journal",
         "setup_runs",
         "setup_actions",
     ] {
@@ -2416,6 +2436,72 @@ fn native_readiness_pass_is_invalidated_by_an_observation_state_change() {
             .is_none(),
         "a detectable observation-state change must invalidate native readiness reuse"
     );
+}
+
+#[test]
+fn native_readiness_invalidation_removes_only_the_affected_exact_key() {
+    let state = TempDir::new().expect("temporary state directory");
+    let (mut storage, _) = Storage::open(state.path()).expect("open storage");
+    let affected = readiness_key("affected-native-readiness");
+    let unaffected = readiness_key("unaffected-native-readiness");
+    let affected_evidence = affected
+        .evidence("affected-native-result", at(1), at(6))
+        .expect("construct affected readiness evidence");
+    let unaffected_evidence = unaffected
+        .evidence("unaffected-native-result", at(1), at(6))
+        .expect("construct unaffected readiness evidence");
+    let provider = ProviderSmokeEvidence::new(
+        "preserved-provider-result",
+        affected.provider_config_fingerprint(),
+        "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+        at(1),
+        at(6),
+    )
+    .expect("construct provider evidence");
+    storage
+        .store_preflight_successes(
+            affected.adapter(),
+            affected.desktop_binding(),
+            affected.execution_policy(),
+            &affected_evidence,
+            Some(&provider),
+        )
+        .expect("preseed affected native and provider evidence");
+    storage
+        .store_preflight_successes(
+            unaffected.adapter(),
+            unaffected.desktop_binding(),
+            unaffected.execution_policy(),
+            &unaffected_evidence,
+            None,
+        )
+        .expect("preseed unaffected native evidence");
+
+    assert_eq!(
+        1,
+        storage
+            .invalidate_native_readiness(&affected)
+            .expect("invalidate the exact affected native tuple")
+    );
+    assert!(
+        storage
+            .load_reusable_readiness(&affected, at(2))
+            .expect("query affected native evidence")
+            .is_none()
+    );
+    assert!(
+        storage
+            .load_reusable_readiness(&unaffected, at(2))
+            .expect("query unaffected native evidence")
+            .is_some()
+    );
+    let provider_count: i64 = storage
+        .connection_for_test()
+        .query_row("SELECT count(*) FROM provider_smoke_results", [], |row| {
+            row.get(0)
+        })
+        .expect("count preserved provider evidence");
+    assert_eq!(1, provider_count);
 }
 
 #[test]

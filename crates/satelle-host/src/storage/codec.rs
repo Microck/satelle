@@ -474,9 +474,12 @@ pub(super) fn idempotent_operation_token(operation: IdempotentOperation) -> &'st
         IdempotentOperation::HostUpdate => "host_update",
         IdempotentOperation::StorageMigration => "storage_migration",
         IdempotentOperation::DestructiveMaintenance => "destructive_maintenance",
+        IdempotentOperation::ProviderSecretProvisioning => "provider_secret_provisioning",
         IdempotentOperation::ProviderDescriptorValidation => "provider_descriptor_validation",
         IdempotentOperation::ProviderBindingAuthorization => "provider_binding_authorization",
         IdempotentOperation::ProviderBindingDeletion => "provider_binding_deletion",
+        IdempotentOperation::SetupVerification => "setup_verification",
+        IdempotentOperation::NativeReadinessInvalidation => "native_readiness_invalidation",
     }
 }
 

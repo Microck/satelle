@@ -37,11 +37,12 @@ use satelle_core::session::{
 };
 use satelle_core::{
     BEACON_CORAL, CLI_NAME, DaemonPathOverrides, DesktopSelectionPolicy, DesktopSessionPreference,
-    DoctorEventRecord, DoctorOptions, DoctorReport, ERROR_RED, ErrorCode, EventSource, EventType,
-    HostConfig, HostSessionsReport, LOCAL_DEMO_HOST, OwnerOnlyDirectory, PRODUCT_NAME,
-    ProfileField, ProviderSecretSource, RELAY_ROSE, ResolvedConfig, SUCCESS_GREEN, SatelleError,
-    SatelleEvent, SatelleEventBody, SecureFileError, SessionId, SetupMode, SetupReadinessSummary,
-    SetupReport, SetupRequiredInput, SetupSchemaVersion, load_config, load_config_for_profile,
+    DoctorEventRecord, DoctorFixability, DoctorOptions, DoctorReport, ERROR_RED, ErrorCode,
+    EventSource, EventType, HostConfig, HostSessionsReport, LOCAL_DEMO_HOST, MutationCommandFamily,
+    OwnerOnlyDirectory, PRODUCT_NAME, ProfileField, ProfileSelectionSource, ProviderSecretSource,
+    RELAY_ROSE, ResolvedConfig, SUCCESS_GREEN, SatelleError, SatelleEvent, SatelleEventBody,
+    SecureFileError, SessionId, SetupMode, SetupReadinessSummary, SetupReport, SetupRequiredInput,
+    SetupSchemaVersion, SetupVerification, load_config, load_config_for_profile,
     load_config_without_profile, load_user_api_rate_limits, open_or_create_owner_only_directory,
     open_or_create_owner_only_file, open_owner_only_directory, read_owner_controlled_config_file,
     read_owner_only_secret_config_file, resolve_desktop_session, resolve_path_set, utc_now,
@@ -51,7 +52,8 @@ use satelle_host::{
 };
 use satelle_transport::{
     DaemonServer, DaemonServerConfig, DaemonServerError, DaemonTlsConfig, DaemonTlsConfigError,
-    DaemonTlsReloadError, DaemonTlsReloader, ProviderBindingAuthorization, TurnRequest,
+    DaemonTlsReloadError, DaemonTlsReloader, ProviderBindingAuthorization,
+    SetupVerificationRequest, TurnRequest,
 };
 use serde_json::json;
 use std::collections::{BTreeMap, BTreeSet};
@@ -71,7 +73,7 @@ use transport::{
 };
 
 const CONFIG_CHECK_SCHEMA_VERSION: &str = "satelle.config.check.v1";
-const CONFIG_EXPLAIN_SCHEMA_VERSION: &str = "satelle.config.explain.v1";
+const CONFIG_EXPLAIN_SCHEMA_VERSION: &str = "satelle.config.explain.v2";
 const PATHS_SCHEMA_VERSION: &str = "satelle.paths.v1";
 const DEFAULT_HOST_BIND: &str = "127.0.0.1:3001";
 const DEFAULT_ON_DEMAND_IDLE_TIMEOUT: Duration = Duration::from_secs(10 * 60);
@@ -82,6 +84,7 @@ const STATE_RELEASE_TIMEOUT: Duration = Duration::from_secs(20);
 const STATE_RELEASE_POLL_INTERVAL: Duration = Duration::from_millis(50);
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
+use zeroize::Zeroizing;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -268,6 +271,11 @@ struct SetupCommand {
     host: Option<String>,
     #[arg(long)]
     dry_run: bool,
+    #[arg(
+        long,
+        help = "Run live native Computer Use readiness checks and any required provider smoke test after setup"
+    )]
+    verify: bool,
     #[arg(long)]
     on_demand: bool,
     #[arg(long)]
@@ -429,6 +437,36 @@ struct HostStartCommand {
     /// retained only by this daemon process.
     #[arg(long, hide = true)]
     bootstrap_token_stdin: bool,
+    /// Internal exact identity accepted by the Controller for a fresh SSH Host.
+    #[arg(
+        long,
+        hide = true,
+        value_name = "HOST_ID",
+        requires = "bootstrap_token_stdin",
+        requires = "initial_identity_operation_id",
+        requires = "initial_identity_record"
+    )]
+    initial_host_identity: Option<String>,
+    /// Internal Bootstrap Lock operation that owns the fresh identity commit.
+    #[arg(
+        long,
+        hide = true,
+        value_name = "OPERATION_ID",
+        requires = "bootstrap_token_stdin",
+        requires = "initial_host_identity",
+        requires = "initial_identity_record"
+    )]
+    initial_identity_operation_id: Option<String>,
+    /// Internal exact v2 identity operation accepted by the Controller.
+    #[arg(
+        long,
+        hide = true,
+        value_name = "RECORD",
+        requires = "bootstrap_token_stdin",
+        requires = "initial_host_identity",
+        requires = "initial_identity_operation_id"
+    )]
+    initial_identity_record: Option<String>,
     /// Internal least-privilege scope for the one SSH bootstrap operation.
     #[arg(long, hide = true, value_enum, requires = "bootstrap_token_stdin")]
     bootstrap_scope: Option<SshBootstrapScope>,
@@ -452,6 +490,9 @@ struct HostStartCommand {
             "tls_key",
             "foreground",
             "bootstrap_token_stdin",
+            "initial_host_identity",
+            "initial_identity_operation_id",
+            "initial_identity_record",
             "bootstrap_scope",
             "bootstrap_native_readiness_timeout_ms",
             "bootstrap_provider_smoke_timeout_ms",
@@ -912,13 +953,13 @@ fn preflight_setup_before_history(
         .output_args
         .resolve(EventOutput::None)
         .map_err(failure)?;
-    setup_components(&command.component).map_err(failure)?;
+    let setup_components = setup_components(&command.component).map_err(failure)?;
     if command.on_demand && command.persistent {
         return Err(failure(SatelleError::invalid_usage(
             "--on-demand and --persistent cannot be combined",
         )));
     }
-    if command.dry_run || !uses_production_local_setup_backend() {
+    if command.dry_run {
         return Ok(());
     }
     if let Some(expected) = command.expected_host_id.as_deref() {
@@ -928,7 +969,11 @@ fn preflight_setup_before_history(
             )))
         })?;
     }
-    let host = config.resolve_host(command.host.as_deref())?;
+    let resolved = config.load()?;
+    let host = resolved
+        .resolve_host(command.host.as_deref())
+        .map(SelectedHost::from)
+        .map_err(failure)?;
     if command.expected_host_id.is_some()
         && host.config.transport != satelle_core::TransportKind::Ssh
     {
@@ -936,8 +981,52 @@ fn preflight_setup_before_history(
             "setup --expected-host-id is only valid for an SSH Host Binding",
         )));
     }
+    let daemon_path_overrides = daemon_path_overrides(command, &host.config);
+    let first_ssh_trust = host.config.transport == satelle_core::TransportKind::Ssh
+        && (host.config.expected_host_id.is_none() || !daemon_path_overrides.entries().is_empty());
+    let setup_mode = setup_mode(command, &host.config)
+        .map_err(failure)?
+        .mode
+        .as_str()
+        .to_string();
+    let trusted_consent = trusted_profile_allows_setup(resolved, &host.alias);
+    let verification_checks = if command.verify {
+        setup_verification_checks(
+            doctor_provider_intent(resolved, &host.config, true, None)
+                .map_err(failure)?
+                .provider_probe_required(),
+        )
+    } else {
+        Vec::new()
+    };
+    if let Some(error) = first_ssh_setup_consent_error(
+        command,
+        config.flag_profile,
+        trusted_consent,
+        first_ssh_trust,
+        &host.alias,
+        &setup_mode,
+        &setup_components,
+        &daemon_path_overrides,
+        &verification_checks,
+    ) {
+        return Err(failure(error));
+    }
+    if !uses_production_local_setup_backend() {
+        return Ok(());
+    }
     if host.config.transport != satelle_core::TransportKind::Local {
         return Ok(());
+    }
+    if command.verify {
+        let path_rebind = !daemon_path_overrides.entries().is_empty();
+        let (host_setup_components, _) =
+            partition_setup_components(&setup_components, false, path_rebind);
+        let tailscale_serve_setup = command.component.as_slice() == [SetupComponent::Transport]
+            && tailscale_serve::applies_to(&host.config);
+        if host_setup_components.is_empty() || tailscale_serve_setup {
+            return Ok(());
+        }
     }
 
     let setup_mode = if command.persistent {
@@ -1604,6 +1693,9 @@ mod history_target_tests {
                 tls_key: None,
                 foreground,
                 bootstrap_token_stdin,
+                initial_host_identity: None,
+                initial_identity_operation_id: None,
+                initial_identity_record: None,
                 bootstrap_scope: bootstrap_token_stdin.then_some(SshBootstrapScope::Control),
                 bootstrap_native_readiness_timeout_ms: None,
                 bootstrap_provider_smoke_timeout_ms: None,
@@ -1921,6 +2013,16 @@ fn run_host_setup_if_required<T>(
     }
 }
 
+fn run_host_setup_then_follow_up<T, E>(
+    host_setup: impl FnOnce() -> Result<T, E>,
+    follow_up: impl FnOnce(&mut T) -> Result<(), E>,
+) -> Result<T, E> {
+    let mut result = host_setup()?;
+    follow_up(&mut result)?;
+    Ok(result)
+}
+
+#[cfg(test)]
 fn run_host_setup_after_desktop_preflight<C, T>(
     desktop_preflight: Result<(), CliFailure>,
     setup_config: &mut C,
@@ -1940,10 +2042,11 @@ fn cli_owned_setup_report(
 ) -> SetupReport {
     let service_persistent = setup_mode == "persistent";
     SetupReport {
-        schema_version: SetupSchemaVersion::V1,
+        schema_version: SetupSchemaVersion::V2,
         host: host.to_string(),
         dry_run,
         status: "planned".to_string(),
+        cancellation_reason: None,
         setup_mode: setup_mode.to_string(),
         service_persistent,
         service_scope: if service_persistent {
@@ -1966,13 +2069,193 @@ fn cli_owned_setup_report(
             transport: "not_checked".to_string(),
             host_daemon: "not_checked".to_string(),
             codex_runtime: "not_checked".to_string(),
-            native_computer_use: "not_checked".to_string(),
+            native_computer_use: "not_verified".to_string(),
             provider_auth: "not_checked".to_string(),
         },
+        descriptor_configured: false,
+        secret_provisioned: false,
+        validation_status: "not_checked".to_string(),
+        provider_smoke_test_status: "not_checked".to_string(),
         daemon_path_overrides: Vec::new(),
+        changed: false,
         mutated: false,
-        native_computer_use_readiness: "not_checked".to_string(),
+        mutation_planned: false,
+        native_computer_use_readiness: "not_verified".to_string(),
         next_command: "satelle doctor --scope computer-use --refresh --json".to_string(),
+        verification: None,
+    }
+}
+
+fn add_setup_component_plan(report: &mut SetupReport) {
+    let components = [
+        ("transport", "check transport readiness"),
+        ("host", "check Host Daemon readiness"),
+        ("codex", "check Codex runtime prerequisites"),
+        (
+            "computer-use",
+            "check native Codex Computer Use prerequisites",
+        ),
+        ("desktop", "check Desktop Binding"),
+        ("provider-auth", "check provider authentication"),
+    ];
+    for (component, action) in components {
+        if report
+            .setup_components
+            .iter()
+            .any(|selected| selected == component || selected == "all")
+            && !report
+                .planned_actions
+                .iter()
+                .any(|planned| planned == action)
+        {
+            report.planned_actions.push((*action).to_string());
+        }
+    }
+}
+
+fn setup_verification_checks(provider_probe_required: bool) -> Vec<String> {
+    let mut checks = vec!["native_computer_use".to_string()];
+    if provider_probe_required {
+        checks.push("provider_computer_use".to_string());
+    }
+    checks
+}
+
+fn add_setup_verification_plan(report: &mut SetupReport, checks: &[String]) {
+    report.verification = Some(SetupVerification::planned(checks.to_vec()));
+    if !report
+        .planned_actions
+        .iter()
+        .any(|action| action == "run live native Computer Use readiness verification")
+    {
+        report
+            .planned_actions
+            .push("run live native Computer Use readiness verification".to_string());
+    }
+    if checks.iter().any(|check| check == "provider_computer_use")
+        && !report
+            .planned_actions
+            .iter()
+            .any(|action| action == "run required provider Computer Use smoke verification")
+    {
+        report
+            .planned_actions
+            .push("run required provider Computer Use smoke verification".to_string());
+    }
+}
+
+fn ensure_exact_setup_verification_recovery(report: &mut SetupReport, host: &str) {
+    let recovery = format!(
+        "satelle setup --host {} --verify --no-input",
+        shell_argument(host)
+    );
+    if !report.recovery_commands.contains(&recovery) {
+        report.recovery_commands.insert(0, recovery);
+    }
+}
+
+fn trusted_profile_allows_setup(resolved: &ResolvedConfig, host_alias: &str) -> bool {
+    let Some(selected) = resolved.selected_profile.as_ref() else {
+        return false;
+    };
+    if !matches!(
+        selected.source,
+        ProfileSelectionSource::CliFlag | ProfileSelectionSource::UserConfig
+    ) {
+        return false;
+    }
+    resolved
+        .config
+        .trusted_profiles
+        .get(&selected.name)
+        .is_some_and(|trusted| {
+            trusted.hosts.contains(host_alias)
+                && trusted
+                    .command_families
+                    .contains(&MutationCommandFamily::Setup)
+        })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn first_ssh_setup_consent_error(
+    command: &SetupCommand,
+    flag_profile: Option<&str>,
+    trusted_consent: bool,
+    first_ssh_trust: bool,
+    host_alias: &str,
+    setup_mode: &str,
+    setup_components: &[String],
+    daemon_path_overrides: &DaemonPathOverrides,
+    verification_checks: &[String],
+) -> Option<SatelleError> {
+    if !first_ssh_trust
+        || command.dry_run
+        || command.yes
+        || trusted_consent
+        || (!command.no_input && io::stdin().is_terminal())
+    {
+        return None;
+    }
+
+    // First-time SSH discovery can upload and start a temporary Host. Reject
+    // before command-history initialization or transport construction.
+    let mut consent_report =
+        cli_owned_setup_report(host_alias, false, setup_mode, setup_components.to_vec());
+    add_setup_component_plan(&mut consent_report);
+    consent_report.mutation_planned = true;
+    consent_report.planned_actions.insert(
+        0,
+        "bootstrap the temporary Host Daemon, discover its Host Identity, and persist explicit trust"
+            .to_string(),
+    );
+    if command.verify {
+        add_setup_verification_plan(&mut consent_report, verification_checks);
+    }
+    let recovery_command = setup_consent_recovery_command(
+        command,
+        flag_profile,
+        setup_mode,
+        daemon_path_overrides,
+        true,
+    );
+    Some(SatelleError::setup_consent_required(
+        &consent_report.planned_actions,
+        &recovery_command,
+    ))
+}
+
+fn setup_interaction_error(message: &str, source: io::Error) -> SatelleError {
+    SatelleError {
+        code: if source.kind() == io::ErrorKind::Interrupted {
+            ErrorCode::Interrupted
+        } else {
+            ErrorCode::InvalidUsage
+        },
+        message: message.to_string(),
+        recovery_command: Some("rerun with --yes or --dry-run".to_string()),
+        source_detail: Some(source.to_string()),
+        details: BTreeMap::from([
+            ("changed".to_string(), json!(false)),
+            ("applied_actions".to_string(), json!([])),
+        ]),
+    }
+}
+
+fn finish_cancelled_setup(report: &mut SetupReport, json: bool) -> Result<(), CliFailure> {
+    report.status = "cancelled".to_string();
+    report.cancellation_reason = Some("user_declined_confirmation".to_string());
+    report.changed = false;
+    report.mutated = false;
+    report.applied_actions.clear();
+    if json {
+        print_json(
+            &serde_json::to_value(report)
+                .map_err(|error| failure(SatelleError::invalid_usage(error.to_string())))?,
+        )
+        .map_err(failure)
+    } else {
+        println!("No changes applied.");
+        Ok(())
     }
 }
 
@@ -2045,9 +2328,7 @@ fn resolve_setup_desktop_selection(
                     );
                 }
                 policy.desktop_user = Some(prompt.interact().map_err(|source| {
-                    SatelleError::invalid_usage(format!(
-                        "could not read Desktop Binding selection: {source}"
-                    ))
+                    setup_interaction_error("could not read Desktop Binding selection", source)
                 })?);
             }
             Err(error) if error.code == ErrorCode::DesktopSessionAmbiguous && interactive => {
@@ -2080,9 +2361,10 @@ fn resolve_setup_desktop_selection(
                         )
                         .interact()
                         .map_err(|source| {
-                            SatelleError::invalid_usage(format!(
-                                "could not read Desktop Session Preference selection: {source}"
-                            ))
+                            setup_interaction_error(
+                                "could not read Desktop Session Preference selection",
+                                source,
+                            )
                         })?,
                 );
             }
@@ -2132,6 +2414,12 @@ fn run_setup(
     let first_ssh_trust = host.config.transport == satelle_core::TransportKind::Ssh
         && (host.config.expected_host_id.is_none() || path_rebind);
     let setup_components = setup_components(&command.component).map_err(failure)?;
+    let native_affecting_setup = setup_components.iter().any(|component| {
+        matches!(
+            component.as_str(),
+            "all" | "host" | "codex" | "computer-use" | "desktop"
+        )
+    });
     let provider_auth_setup = setup_components
         .iter()
         .any(|component| component == "all" || component == "provider-auth");
@@ -2162,12 +2450,36 @@ fn run_setup(
     let tailscale_serve_setup = command.component.as_slice() == [SetupComponent::Transport]
         && tailscale_serve::applies_to(&host.config);
     let host_setup_required = !host_setup_components.is_empty();
-    let interactive_selection = !command.no_input && !json && io::stdin().is_terminal();
+    let interactive_selection = !command.no_input && io::stdin().is_terminal();
+    let trusted_consent = trusted_profile_allows_setup(resolved, &host.alias);
     let mut provider_selection =
         resolve_provider_selection(resolved, &host, None, None, false, false)?;
+    let provider_probe_required = if command.verify {
+        doctor_provider_intent(resolved, &host.config, true, None)
+            .map_err(failure)?
+            .provider_probe_required()
+    } else {
+        false
+    };
+    let verification_checks = setup_verification_checks(provider_probe_required);
     let mut provider_auth_validation = None;
     let mut pending_provider_auth = None;
     let mut pending_provider_binding_authorization = None;
+    let mut pending_provider_secret_authorization = None;
+    let mut provider_secret_setup_completed = false;
+    if let Some(error) = first_ssh_setup_consent_error(
+        &command,
+        config.flag_profile,
+        trusted_consent,
+        first_ssh_trust,
+        &host.alias,
+        &setup_mode,
+        &setup_components,
+        &daemon_path_overrides,
+        &verification_checks,
+    ) {
+        return Err(failure(error));
+    }
     let mut transport = if tailscale_serve_setup || !host_setup_required {
         None
     } else {
@@ -2201,6 +2513,10 @@ fn run_setup(
         .map_err(failure)?
     };
     report.setup_components.clone_from(&setup_components);
+    add_setup_component_plan(&mut report);
+    if command.verify {
+        add_setup_verification_plan(&mut report, &verification_checks);
+    }
     if let Some(decision) = &local_service_decision {
         apply_service_decision_to_report(&mut report, decision);
     }
@@ -2213,6 +2529,20 @@ fn run_setup(
     }
     if command.dry_run {
         add_setup_required_inputs(&mut report, &provider_selection, provider_auth_setup);
+        if provider_auth_setup
+            && provider_selection
+                .authorization
+                .as_ref()
+                .and_then(ProviderBindingAuthorization::auth_source)
+                .is_some()
+        {
+            report.descriptor_configured = true;
+            report.validation_status = "deferred".to_string();
+            report.planned_actions.push(format!(
+                "inspect the provider secret destination on Host '{}' and provision it if required",
+                host.alias
+            ));
+        }
     }
     let mut desktop_selection = None;
     if desktop_setup
@@ -2235,6 +2565,7 @@ fn run_setup(
         .map_err(failure)?;
         if let Some(selection) = &desktop_selection {
             report.planned_actions.push(selection.action(&host.alias));
+            report.mutation_planned = true;
         }
     } else if desktop_setup
         && !command.dry_run
@@ -2247,12 +2578,17 @@ fn run_setup(
     }
 
     if first_ssh_trust {
+        report.mutation_planned = true;
         report.planned_actions.insert(
             0,
             "bootstrap the temporary Host Daemon, discover its Host Identity, and persist explicit trust"
                 .to_string(),
         );
     }
+    // Capture this before provider-auth planning can mark an otherwise native-stable
+    // setup as mutating. First SSH trust has no prior authenticated Host cache.
+    let native_readiness_invalidation_planned =
+        native_affecting_setup && report.mutation_planned && !first_ssh_trust;
 
     if provider_auth_setup && !command.dry_run && report.required_input.is_empty() {
         let provider_aliases = match (
@@ -2281,6 +2617,17 @@ fn run_setup(
                     satelle_core::ProviderAuthValidationMode::Cached,
                     provider_selection.experimental_provider_computer_use,
                 ) {
+                    Ok(validation)
+                        if validation.validation.outcome()
+                            == satelle_core::ProviderAuthValidationOutcome::UnresolvedHostSecret =>
+                    {
+                        pending_provider_secret_authorization =
+                            Some(plan_provider_secret_provisioning(
+                                &mut report,
+                                &provider_selection,
+                                &host.alias,
+                            )?);
+                    }
                     Ok(validation) => {
                         provider_auth_validation = accept_setup_provider_auth_validation(
                             &mut report,
@@ -2313,6 +2660,7 @@ fn run_setup(
                         .provider_auth
                         .insert(auth_source_name.clone(), descriptor.clone());
                     pending_provider_auth = Some((auth_source_name.clone(), descriptor));
+                    report.mutation_planned = true;
                     report.planned_actions.push(format!(
                         "save provider authentication descriptor reference '{auth_source_name}' for Host '{}'",
                         host.alias
@@ -2322,9 +2670,11 @@ fn run_setup(
                 }
                 add_setup_required_inputs(&mut report, &provider_selection, provider_auth_setup);
                 if report.required_input.is_empty()
+                    && pending_provider_secret_authorization.is_none()
                     && let Some(authorization) = provider_selection.authorization.as_ref()
                 {
                     pending_provider_binding_authorization = Some(authorization.clone());
+                    report.mutation_planned = true;
                     report.planned_actions.push(format!(
                         "authorize provider binding '{}/{}' on Host '{}'",
                         authorization.requested_provider_alias(),
@@ -2336,8 +2686,26 @@ fn run_setup(
         }
     }
 
-    if !command.dry_run && report.required_input.is_empty() {
-        if !command.yes && (command.no_input || json || !io::stdin().is_terminal()) {
+    if !command.dry_run
+        && !interactive_selection
+        && report.required_input.iter().any(|input| {
+            input.component == "provider-auth"
+                && input.input_kind == "provider_secret_source_descriptor"
+        })
+    {
+        return Err(failure(provider_secret_setup_error(
+            ErrorCode::ProviderSecretSourceRequired,
+            "provider authentication requires a host-resolved Secret Source descriptor",
+        )));
+    }
+
+    let mut first_ssh_discovery = None;
+
+    let mut prompted_for_consent = false;
+    let mut verification_cache_updates = Vec::new();
+    let mut native_invalidation_action = None;
+    if !command.dry_run && report.required_input.is_empty() && report.mutation_planned {
+        if !command.yes && !trusted_consent && (command.no_input || !io::stdin().is_terminal()) {
             let consent_recovery_command = setup_consent_recovery_command(
                 &command,
                 config.flag_profile,
@@ -2351,7 +2719,11 @@ fn run_setup(
             )));
         }
 
-        if !command.yes {
+        if !json {
+            print_setup_human(&report);
+        }
+        if !command.yes && !trusted_consent {
+            prompted_for_consent = true;
             let _color_enabled = style.color_enabled();
             cliclack::intro(format!("{PRODUCT_NAME} setup")).map_err(|source| {
                 failure(SatelleError {
@@ -2362,49 +2734,31 @@ fn run_setup(
                     details: BTreeMap::new(),
                 })
             })?;
-            print_setup_human(&report);
             let confirmed = cliclack::confirm("Apply these setup mutations?")
                 .initial_value(false)
                 .interact()
                 .map_err(|source| {
-                    failure(SatelleError {
-                        code: ErrorCode::InvalidUsage,
-                        message: "could not read setup confirmation".to_string(),
-                        recovery_command: Some("rerun with --yes or --dry-run".to_string()),
-                        source_detail: Some(source.to_string()),
-                        details: BTreeMap::new(),
-                    })
+                    failure(setup_interaction_error(
+                        "could not read setup confirmation",
+                        source,
+                    ))
                 })?;
             if !confirmed {
-                println!("No changes applied.");
-                return Ok(());
+                return finish_cancelled_setup(&mut report, json);
             }
         }
 
-        let first_ssh_discovery = if first_ssh_trust {
-            let Some(discovery) = trust_first_ssh_host_during_setup(
-                &command,
-                json,
-                &user_config_path,
-                &daemon_path_overrides,
-                &mut host,
-            )?
-            else {
-                println!("No changes applied.");
-                return Ok(());
-            };
-            transport =
-                setup_transport_if_required(host_setup_required, || transport_for_setup(&host))?;
-            Some(discovery)
-        } else {
-            None
-        };
-
-        let desktop_preflight = (|| {
-            if desktop_setup
-                && report.required_input.is_empty()
-                && let Some(discovery) = &first_ssh_discovery
-            {
+        if first_ssh_trust {
+            let discovery =
+                inspect_first_ssh_host_during_setup(&command, true, &daemon_path_overrides, &host)?;
+            let action = format!(
+                "trust observed Host Identity '{}' for Host '{}'",
+                discovery.identity, host.alias
+            );
+            if !report.planned_actions.contains(&action) {
+                report.planned_actions.push(action);
+            }
+            if desktop_setup {
                 desktop_selection = resolve_setup_desktop_selection(
                     &discovery.sessions,
                     &host.config,
@@ -2412,60 +2766,83 @@ fn run_setup(
                     Some(&discovery.authenticated_user),
                 )
                 .map_err(failure)?;
-            }
-            if let Some(selection) = &desktop_selection {
-                let action = selection.action(&host.alias);
-                if !report.planned_actions.contains(&action) {
-                    report.planned_actions.push(action.clone());
-                }
-                if !command.yes {
-                    println!("Plan: {action}");
-                    let confirmed = cliclack::confirm("Save this desktop selection?")
-                        .initial_value(false)
-                        .interact()
-                        .map_err(|source| {
-                            failure(SatelleError::invalid_usage(format!(
-                                "could not read desktop selection confirmation: {source}"
-                            )))
-                        })?;
-                    if !confirmed {
-                        return Err(failure(SatelleError::input_required(
-                            "desktop selection was not saved",
-                        )));
+                if let Some(selection) = &desktop_selection {
+                    let action = selection.action(&host.alias);
+                    if !report.planned_actions.contains(&action) {
+                        report.planned_actions.push(action);
                     }
                 }
             }
-            Ok(())
-        })();
+            first_ssh_discovery = Some(discovery);
+        }
 
-        desktop_preflight?;
+        if native_readiness_invalidation_planned {
+            // The configured Host still identifies the old readiness key here. Invalidate
+            // after consent but before any setup write changes that identity.
+            let invalidation_request = SetupVerificationRequest::new(
+                provider_selection.requested_model_alias.clone(),
+                provider_selection.requested_provider_alias.clone(),
+                provider_selection.model_alias_from_project,
+                provider_selection.provider_alias_from_project,
+                provider_selection.experimental_provider_computer_use,
+            )
+            .map_err(|message| failure(SatelleError::invalid_usage(message)))?;
+            let invalidated =
+                match transport_for(&host)?.invalidate_native_readiness(&invalidation_request) {
+                    Ok(invalidated) => invalidated,
+                    Err(error) if command.verify => {
+                        ensure_exact_setup_verification_recovery(&mut report, &host.alias);
+                        if let Some(recovery) = error.recovery_command.as_ref()
+                            && !report.recovery_commands.contains(recovery)
+                        {
+                            report.recovery_commands.push(recovery.clone());
+                        }
+                        report.status = "failed".to_string();
+                        report.verification = Some(SetupVerification {
+                            status: "failed".to_string(),
+                            planned_checks: verification_checks.clone(),
+                            result: None,
+                            cache_updates: verification_cache_updates,
+                        });
+                        return Err(failure(SatelleError::setup_verification_failed(&report)));
+                    }
+                    Err(error) => return Err(failure(error)),
+                };
+            let cache_update = format!("invalidated_native_readiness_results:{invalidated}");
+            verification_cache_updates.push(cache_update.clone());
+            native_invalidation_action = Some(cache_update);
+        }
+
+        if let Some(discovery) = first_ssh_discovery.as_mut() {
+            discovery.finalize_after_binding().map_err(failure)?;
+            persist_host_identity(&user_config_path, &host.alias, &discovery.identity)
+                .map_err(failure)?;
+            host.config.expected_host_id = Some(discovery.identity.clone());
+            transport =
+                setup_transport_if_required(host_setup_required, || transport_for_setup(&host))?;
+        }
         let mut persisted_desktop_action = None;
         let mut persisted_provider_auth_action = None;
         if report.required_input.is_empty() {
-            report = run_host_setup_after_desktop_preflight(
-                Ok(()),
-                &mut host.config,
-                |host_config| {
-                    if let Some(selection) = &desktop_selection {
-                        persist_desktop_selection(
-                            &user_config_path,
-                            &host.alias,
-                            &selection.desktop_user,
-                            Some(&selection.preference),
-                        )
-                        .map_err(failure)?;
-                        host_config.desktop_user = Some(selection.desktop_user.clone());
-                        host_config.desktop_session_preference = Some(selection.preference.clone());
-                        host_config.desktop_session_native_selector = None;
-                        persisted_desktop_action = Some(selection.action(&host.alias));
-                    }
-                    Ok(())
-                },
-                |host_config| {
+            if let Some(selection) = &desktop_selection {
+                persist_desktop_selection(
+                    &user_config_path,
+                    &host.alias,
+                    &selection.desktop_user,
+                    Some(&selection.preference),
+                )
+                .map_err(failure)?;
+                host.config.desktop_user = Some(selection.desktop_user.clone());
+                host.config.desktop_session_preference = Some(selection.preference.clone());
+                host.config.desktop_session_native_selector = None;
+                persisted_desktop_action = Some(selection.action(&host.alias));
+            }
+            report = run_host_setup_then_follow_up(
+                || {
                     if tailscale_serve_setup {
                         tailscale_serve::configure(
                             &host.alias,
-                            host_config,
+                            &host.config,
                             &daemon_path_overrides,
                             false,
                             &setup_mode,
@@ -2493,12 +2870,48 @@ fn run_setup(
                         .map_err(failure)
                     }
                 },
+                |report| {
+                    if let Some(authorization) = pending_provider_secret_authorization.take() {
+                        // Build the provider client only after Host setup has installed
+                        // every prerequisite needed by live readiness validation.
+                        let provider_transport = if host.config.transport
+                            == satelle_core::TransportKind::Ssh
+                        {
+                            transport_for_with_ssh_bootstrap(&host, Some(SshBootstrapScope::Admin))?
+                        } else {
+                            transport_for(&host)?
+                        };
+                        let response = provision_provider_secret(
+                            provider_transport.as_ref(),
+                            &authorization,
+                            &host.alias,
+                            &command,
+                            &format,
+                        )?;
+                        provider_secret_setup_completed = true;
+                        report.secret_provisioned = response.provisioned();
+                        report.validation_status =
+                            response.validation_status().as_str().to_string();
+                        report.readiness_summary.provider_auth =
+                            response.validation_status().as_str().to_string();
+                        report.applied_actions.push(format!(
+                            "provisioned and authorized {} provider authentication on Host '{}'",
+                            response.destination_kind(),
+                            host.alias,
+                        ));
+                        report.mutated = true;
+                        report.changed = true;
+                        report.status = "applied".to_string();
+                    }
+                    Ok(())
+                },
             )?;
         }
 
         if provider_auth_setup
             && report.required_input.is_empty()
             && provider_auth_validation.is_none()
+            && !provider_secret_setup_completed
             && let (Some(model_alias), Some(provider_alias)) = (
                 provider_selection.requested_model_alias.as_deref(),
                 provider_selection.requested_provider_alias.as_deref(),
@@ -2517,6 +2930,43 @@ fn run_setup(
                 satelle_core::ProviderAuthValidationMode::Cached,
                 provider_selection.experimental_provider_computer_use,
             ) {
+                Ok(validation)
+                    if validation.validation.outcome()
+                        == satelle_core::ProviderAuthValidationOutcome::UnresolvedHostSecret =>
+                {
+                    let authorization = provider_selection
+                        .authorization
+                        .as_ref()
+                        .ok_or_else(|| {
+                            failure(provider_secret_setup_error(
+                                ErrorCode::ProviderSecretSourceRequired,
+                                "provider authentication requires a host-resolved Secret Source descriptor",
+                            ))
+                        })?
+                        .clone();
+                    ensure_file_provider_secret_source(&authorization)?;
+                    let response = provision_provider_secret(
+                        provider_transport.as_ref(),
+                        &authorization,
+                        &host.alias,
+                        &command,
+                        &format,
+                    )?;
+                    provider_secret_setup_completed = true;
+                    report.secret_provisioned = response.provisioned();
+                    report.validation_status = response.validation_status().as_str().to_string();
+                    report.readiness_summary.provider_auth =
+                        response.validation_status().as_str().to_string();
+                    report.applied_actions.push(format!(
+                        "provisioned and authorized {} provider authentication on Host '{}'",
+                        response.destination_kind(),
+                        host.alias,
+                    ));
+                    report.mutated = true;
+                    report.changed = true;
+                    report.status = "applied".to_string();
+                    None
+                }
                 Ok(validation) => {
                     provider_auth_validation = accept_setup_provider_auth_validation(
                         &mut report,
@@ -2539,69 +2989,134 @@ fn run_setup(
                 Err(error) => return Err(failure(error)),
             };
             if let Some(authorization) = pending_authorization {
-                provider_transport
-                    .authorize_provider_binding(authorization)
-                    .map_err(failure)?;
-                let validation = provider_transport
-                    .validate_provider_descriptor(
-                        authorization.requested_model_alias(),
-                        authorization.requested_provider_alias(),
-                        provider_selection.model_alias_from_project,
-                        provider_selection.provider_alias_from_project,
-                        satelle_core::ProviderAuthValidationMode::Cached,
-                        authorization.experimental_provider_computer_use(),
-                    )
-                    .map_err(failure)?;
-                let validation = accept_setup_provider_auth_validation(
-                    &mut report,
-                    &provider_selection,
-                    validation,
-                )?;
-                if validation.is_some() {
-                    if let Some((auth_source_name, descriptor)) = &pending_provider_auth
-                        && let Err(error) = persist_provider_auth_descriptor(
-                            &user_config_path,
-                            &host.alias,
-                            auth_source_name,
-                            descriptor,
+                let authorization_requires_provisioning =
+                    match provider_transport.authorize_provider_binding(authorization) {
+                        Ok(_) => false,
+                        Err(error)
+                            if file_authorization_requires_provisioning(authorization, &error) =>
+                        {
+                            true
+                        }
+                        Err(error) => return Err(failure(error)),
+                    };
+                let validation = if authorization_requires_provisioning {
+                    None
+                } else {
+                    let cached = provider_transport
+                        .validate_provider_descriptor(
+                            authorization.requested_model_alias(),
+                            authorization.requested_provider_alias(),
+                            provider_selection.model_alias_from_project,
+                            provider_selection.provider_alias_from_project,
+                            satelle_core::ProviderAuthValidationMode::Cached,
+                            authorization.experimental_provider_computer_use(),
                         )
+                        .map_err(failure)?;
+                    if cached.validation.outcome()
+                        == satelle_core::ProviderAuthValidationOutcome::ConfiguredDeferred
                     {
-                        return Err(failure(error));
+                        Some(
+                            provider_transport
+                                .validate_provider_descriptor(
+                                    authorization.requested_model_alias(),
+                                    authorization.requested_provider_alias(),
+                                    provider_selection.model_alias_from_project,
+                                    provider_selection.provider_alias_from_project,
+                                    satelle_core::ProviderAuthValidationMode::RefreshProviderSmoke,
+                                    authorization.experimental_provider_computer_use(),
+                                )
+                                .map_err(failure)?,
+                        )
+                    } else {
+                        Some(cached)
                     }
-                    if let Some((auth_source_name, descriptor)) = &pending_provider_auth {
-                        host.config
-                            .provider_auth
-                            .insert(auth_source_name.clone(), descriptor.clone());
-                        persisted_provider_auth_action = Some(format!(
-                            "saved provider authentication descriptor reference '{auth_source_name}' for Host '{}'",
-                            host.alias
-                        ));
-                    }
+                };
+                let provisioning_required = authorization_requires_provisioning
+                    || validation.as_ref().is_some_and(|validation| {
+                        validation.validation.outcome()
+                            == satelle_core::ProviderAuthValidationOutcome::UnresolvedHostSecret
+                    });
+
+                if provisioning_required {
+                    ensure_file_provider_secret_source(authorization)?;
+                    let response = provision_provider_secret(
+                        provider_transport.as_ref(),
+                        authorization,
+                        &host.alias,
+                        &command,
+                        &format,
+                    )?;
+                    provider_secret_setup_completed = true;
+                    report.secret_provisioned = response.provisioned();
+                    report.validation_status = response.validation_status().as_str().to_string();
+                    report.readiness_summary.provider_auth =
+                        response.validation_status().as_str().to_string();
                     report.applied_actions.push(format!(
-                        "authorize provider binding '{}/{}' on Host '{}'",
-                        authorization.requested_provider_alias(),
-                        authorization.requested_model_alias(),
-                        host.alias
+                        "provisioned and authorized {} provider authentication on Host '{}'",
+                        response.destination_kind(),
+                        host.alias,
                     ));
                     report.mutated = true;
-                    if report.status == "planned" {
-                        report.status = "applied".to_string();
+                    report.changed = true;
+                    report.status = "applied".to_string();
+                } else {
+                    let validation = accept_setup_provider_auth_validation(
+                        &mut report,
+                        &provider_selection,
+                        validation.expect("non-provisioning authorization has cached validation"),
+                    )?;
+                    if validation.is_some() {
+                        report.applied_actions.push(format!(
+                            "authorize provider binding '{}/{}' on Host '{}'",
+                            authorization.requested_provider_alias(),
+                            authorization.requested_model_alias(),
+                            host.alias
+                        ));
+                        report.mutated = true;
+                        report.changed = true;
+                        if report.status == "planned" {
+                            report.status = "applied".to_string();
+                        }
                     }
+                    provider_auth_validation = validation;
                 }
-                provider_auth_validation = validation;
             }
+        }
+
+        if (provider_secret_setup_completed || provider_auth_validation.is_some())
+            && let Some((auth_source_name, descriptor)) = &pending_provider_auth
+        {
+            if let Err(error) = persist_provider_auth_descriptor(
+                &user_config_path,
+                &host.alias,
+                auth_source_name,
+                descriptor,
+            ) {
+                return Err(failure(error));
+            }
+            host.config
+                .provider_auth
+                .insert(auth_source_name.clone(), descriptor.clone());
+            persisted_provider_auth_action = Some(format!(
+                "saved provider authentication descriptor reference '{auth_source_name}' for Host '{}'",
+                host.alias
+            ));
         }
 
         report.setup_components.clone_from(&setup_components);
         if let Some(decision) = &local_service_decision {
             apply_service_decision_to_report(&mut report, decision);
         }
-        if provider_auth_validation.is_none() && report.required_input.is_empty() {
+        if !provider_secret_setup_completed
+            && provider_auth_validation.is_none()
+            && report.required_input.is_empty()
+        {
             add_setup_required_inputs(&mut report, &provider_selection, provider_auth_setup);
         }
         if let Some(action) = persisted_provider_auth_action {
             report.applied_actions.push(action);
             report.mutated = true;
+            report.changed = true;
             if report.status == "planned" {
                 report.status = "applied".to_string();
             }
@@ -2612,6 +3127,15 @@ fn run_setup(
             }
             report.applied_actions.push(action);
             report.mutated = true;
+            report.changed = true;
+            if report.status == "planned" {
+                report.status = "applied".to_string();
+            }
+        }
+        if let Some(action) = native_invalidation_action.take() {
+            report.applied_actions.push(action);
+            report.mutated = true;
+            report.changed = true;
             if report.status == "planned" {
                 report.status = "applied".to_string();
             }
@@ -2622,10 +3146,107 @@ fn run_setup(
                 "discovered and explicitly trusted the reachable Host Identity".to_string(),
             );
             report.mutated = true;
+            report.changed = true;
         }
     }
 
-    if !command.dry_run && report.required_input.is_empty() && !command.no_input && !json {
+    // A Host setup response replaces the planning report. Restore the verification plan
+    // before invalidation and live verification so all result paths retain the same contract.
+    if command.verify {
+        add_setup_verification_plan(&mut report, &verification_checks);
+    }
+
+    if command.verify && !command.dry_run && report.required_input.is_empty() {
+        let verification_request = SetupVerificationRequest::new(
+            provider_selection.requested_model_alias.clone(),
+            provider_selection.requested_provider_alias.clone(),
+            provider_selection.model_alias_from_project,
+            provider_selection.provider_alias_from_project,
+            provider_selection.experimental_provider_computer_use,
+        )
+        .map_err(|message| failure(SatelleError::invalid_usage(message)))?;
+        let verification_response = match transport_for(&host)?.verify_setup(&verification_request)
+        {
+            Ok(response) => response,
+            Err(error) => {
+                ensure_exact_setup_verification_recovery(&mut report, &host.alias);
+                if let Some(recovery) = error.recovery_command.as_ref()
+                    && !report.recovery_commands.contains(recovery)
+                {
+                    report.recovery_commands.push(recovery.clone());
+                }
+                report.status = "failed".to_string();
+                report.verification = Some(SetupVerification {
+                    status: "failed".to_string(),
+                    planned_checks: verification_checks.clone(),
+                    result: None,
+                    cache_updates: verification_cache_updates,
+                });
+                return Err(failure(SatelleError::setup_verification_failed(&report)));
+            }
+        };
+        let mut verification_report = verification_response;
+        let ready = verification_report.summary.ready;
+        let manual_action_required = verification_report
+            .findings
+            .iter()
+            .any(|finding| finding.fixability == DoctorFixability::ManualActionRequired);
+        let verification_status = if ready {
+            "passed"
+        } else if manual_action_required {
+            "manual_action_required"
+        } else {
+            "failed"
+        };
+        if !ready {
+            let recovery = format!(
+                "satelle setup --host {} --verify --no-input",
+                shell_argument(&host.alias)
+            );
+            if !verification_report.recovery_commands.contains(&recovery) {
+                verification_report.recovery_commands.insert(0, recovery);
+            }
+        }
+        for recovery in verification_report.recovery_commands.iter().rev() {
+            if !report.recovery_commands.contains(recovery) {
+                report.recovery_commands.insert(0, recovery.clone());
+            }
+        }
+        for cache_update in &verification_report.cache_updates {
+            if !verification_cache_updates.contains(cache_update) {
+                verification_cache_updates.push(cache_update.clone());
+            }
+        }
+        if !ready {
+            ensure_exact_setup_verification_recovery(&mut report, &host.alias);
+        }
+        report.native_computer_use_readiness =
+            native_verification_status(&verification_report.findings).to_string();
+        report.readiness_summary.native_computer_use = report.native_computer_use_readiness.clone();
+        if verification_checks
+            .iter()
+            .any(|check| check == "provider_computer_use")
+        {
+            report.provider_smoke_test_status = verification_status.to_string();
+            report.readiness_summary.provider_auth = if ready {
+                "ready".to_string()
+            } else {
+                verification_status.to_string()
+            };
+        }
+        report.verification = Some(SetupVerification::completed(
+            verification_status,
+            verification_checks.clone(),
+            verification_report,
+            verification_cache_updates,
+        ));
+        if !ready {
+            report.status = verification_status.to_string();
+            return Err(failure(SatelleError::setup_verification_failed(&report)));
+        }
+    }
+
+    if prompted_for_consent && !json {
         cliclack::outro("Satelle setup produced a readiness plan").map_err(|source| {
             failure(SatelleError {
                 code: ErrorCode::InvalidUsage,
@@ -2641,6 +3262,7 @@ fn run_setup(
         let mut output = serde_json::to_value(&report)
             .map_err(|error| failure(SatelleError::invalid_usage(error.to_string())))?;
         if provider_auth_setup
+            && !provider_secret_setup_completed
             && let Some(validation) = provider_auth_validation_json(
                 &provider_selection,
                 provider_auth_validation.as_ref(),
@@ -2658,15 +3280,46 @@ fn run_setup(
     }
 }
 
-fn trust_first_ssh_host_during_setup(
+fn inspect_first_ssh_host_during_setup(
     command: &SetupCommand,
-    json: bool,
-    user_config_path: &Path,
+    consent_granted: bool,
     daemon_path_overrides: &DaemonPathOverrides,
-    host: &mut SelectedHost,
-) -> Result<Option<SshHostDiscovery>, CliFailure> {
-    let discovery = discover_ssh_host(host, daemon_path_overrides).map_err(failure)?;
-    let observed_identity = &discovery.identity;
+    host: &SelectedHost,
+) -> Result<SshHostDiscovery, CliFailure> {
+    let noninteractive = command.no_input || !io::stdin().is_terminal();
+    if noninteractive && (!command.no_input || !command.yes || command.expected_host_id.is_none()) {
+        return Err(failure(SatelleError::invalid_usage(
+            "noninteractive SSH Host trust requires --no-input --yes --expected-host-id <exact-id>",
+        )));
+    }
+    if !noninteractive && !command.yes && !consent_granted {
+        let confirmed = cliclack::confirm(format!(
+            "Run the temporary SSH identity probe for Host '{}' at '{}'?",
+            host.alias,
+            host.config.address.as_deref().unwrap_or("not configured")
+        ))
+        .initial_value(false)
+        .interact()
+        .map_err(|source| {
+            failure(setup_interaction_error(
+                "could not read temporary SSH identity probe confirmation",
+                source,
+            ))
+        })?;
+        if !confirmed {
+            return Err(failure(SatelleError::setup_consent_required(
+                &["run the temporary SSH identity probe".to_string()],
+                "rerun setup and approve the temporary SSH identity probe",
+            )));
+        }
+    }
+    let pending = discover_ssh_host(
+        host,
+        daemon_path_overrides,
+        command.expected_host_id.as_deref(),
+    )
+    .map_err(failure)?;
+    let observed_identity = pending.identity().to_string();
     HostIdentityRef::new(observed_identity.clone()).map_err(|_| {
         failure(SatelleError::remote_api_error(
             &host.alias,
@@ -2681,17 +3334,10 @@ fn trust_first_ssh_host_during_setup(
         return Err(failure(SatelleError::host_identity_mismatch(&host.alias)));
     }
     if host.config.expected_host_id.as_deref() == Some(observed_identity.as_str()) {
-        return Ok(Some(discovery));
+        return pending.accept().map_err(failure);
     }
 
-    let noninteractive = command.no_input || json || !io::stdin().is_terminal();
-    if noninteractive && (!command.no_input || !command.yes || command.expected_host_id.is_none()) {
-        return Err(failure(SatelleError::invalid_usage(
-            "noninteractive SSH Host trust requires --no-input --yes --expected-host-id <exact-id>",
-        )));
-    }
-
-    if command.expected_host_id.is_none() {
+    if !noninteractive {
         println!("Host: {}", host.alias);
         println!(
             "Endpoint: {}",
@@ -2712,22 +3358,24 @@ fn trust_first_ssh_host_during_setup(
                 .as_deref()
                 .unwrap_or("not configured")
         );
-        let confirmed = cliclack::confirm("Trust this Host Identity?")
-            .initial_value(false)
-            .interact()
-            .map_err(|error| {
-                failure(SatelleError::invalid_usage(format!(
-                    "could not read Host trust confirmation: {error}"
-                )))
-            })?;
+        let confirmed = cliclack::confirm(format!(
+            "Trust exact observed Host Identity '{observed_identity}' for Host '{}'?",
+            host.alias
+        ))
+        .initial_value(false)
+        .interact()
+        .map_err(|source| {
+            failure(setup_interaction_error(
+                "could not read exact Host Identity confirmation",
+                source,
+            ))
+        })?;
         if !confirmed {
-            return Ok(None);
+            return Err(failure(SatelleError::host_identity_mismatch(&host.alias)));
         }
     }
 
-    persist_host_identity(user_config_path, &host.alias, observed_identity).map_err(failure)?;
-    host.config.expected_host_id = Some(observed_identity.clone());
-    Ok(Some(discovery))
+    pending.accept().map_err(failure)
 }
 
 fn accept_setup_provider_auth_validation(
@@ -2761,6 +3409,12 @@ fn accept_setup_provider_auth_validation(
 
     let outcome = validation.validation.outcome();
     report.readiness_summary.provider_auth = outcome.as_str().to_string();
+    report.descriptor_configured = provider_selection
+        .authorization
+        .as_ref()
+        .and_then(ProviderBindingAuthorization::auth_source)
+        .is_some();
+    report.validation_status = outcome.as_str().to_string();
     if matches!(outcome, ConfiguredDeferred | Resolved) {
         return Ok(Some(validation));
     }
@@ -2775,6 +3429,60 @@ fn accept_setup_provider_auth_validation(
         ),
         None,
     )))
+}
+
+fn native_verification_status(findings: &[satelle_core::DoctorFinding]) -> &'static str {
+    let mut observed = false;
+    let mut blocked = false;
+    for finding in findings
+        .iter()
+        .filter(|finding| finding.scope == "computer-use")
+    {
+        observed = true;
+        if finding.fixability == DoctorFixability::ManualActionRequired {
+            return "manual_action_required";
+        }
+        blocked |= finding.readiness_impact != "ready";
+    }
+    if !observed {
+        "not_verified"
+    } else if blocked {
+        "failed"
+    } else {
+        "ready"
+    }
+}
+
+#[cfg(test)]
+mod native_verification_status_tests {
+    use super::*;
+
+    fn finding(
+        scope: &str,
+        impact: &str,
+        fixability: DoctorFixability,
+    ) -> satelle_core::DoctorFinding {
+        satelle_core::DoctorFinding {
+            finding_id: format!("{scope}.{impact}"),
+            scope: scope.to_string(),
+            severity: "info".to_string(),
+            fixability,
+            readiness_impact: impact.to_string(),
+            summary: "fixture".to_string(),
+            evidence: Vec::new(),
+            recovery_command: None,
+        }
+    }
+
+    #[test]
+    fn provider_failure_does_not_downgrade_native_readiness() {
+        let findings = vec![
+            finding("computer-use", "ready", DoctorFixability::Informational),
+            finding("provider", "blocked", DoctorFixability::Blocked),
+        ];
+
+        assert_eq!(native_verification_status(&findings), "ready");
+    }
 }
 
 fn add_missing_provider_descriptor_required_input(
@@ -2820,6 +3528,8 @@ fn add_setup_required_inputs(
     };
     if authorization.auth_source().is_some() {
         report.readiness_summary.provider_auth = "configured_deferred".to_string();
+        report.descriptor_configured = true;
+        report.validation_status = "deferred".to_string();
         return;
     }
 
@@ -2930,6 +3640,172 @@ fn prompt_provider_auth_descriptor(
         }
         _ => unreachable!("provider authentication prompt exposes only supported descriptor kinds"),
     }
+}
+
+fn provider_secret_setup_error(code: ErrorCode, message: impl Into<String>) -> SatelleError {
+    SatelleError {
+        code,
+        message: message.into(),
+        recovery_command: Some(
+            "satelle setup --host <host-alias> --component provider-auth".to_string(),
+        ),
+        source_detail: None,
+        details: BTreeMap::new(),
+    }
+}
+
+fn ensure_file_provider_secret_source(
+    authorization: &ProviderBindingAuthorization,
+) -> Result<(), CliFailure> {
+    match authorization.auth_source() {
+        Some(ProviderSecretSource::File { .. }) => Ok(()),
+        Some(_) => Err(failure(provider_secret_setup_error(
+            ErrorCode::ProviderSecretProvisioningRequired,
+            "interactive provider secret provisioning supports only File Secret Source descriptors",
+        ))),
+        None => Err(failure(provider_secret_setup_error(
+            ErrorCode::ProviderSecretSourceRequired,
+            "provider authentication requires a host-resolved Secret Source descriptor",
+        ))),
+    }
+}
+
+fn file_authorization_requires_provisioning(
+    authorization: &ProviderBindingAuthorization,
+    error: &SatelleError,
+) -> bool {
+    matches!(
+        authorization.auth_source(),
+        Some(ProviderSecretSource::File { .. })
+    ) && error.code == ErrorCode::ProviderSecretResolutionFailed
+}
+
+fn plan_provider_secret_provisioning(
+    report: &mut SetupReport,
+    provider_selection: &ProviderSelection,
+    host_alias: &str,
+) -> Result<ProviderBindingAuthorization, CliFailure> {
+    let authorization = provider_selection
+        .authorization
+        .as_ref()
+        .ok_or_else(|| {
+            failure(provider_secret_setup_error(
+                ErrorCode::ProviderSecretSourceRequired,
+                "provider authentication requires a host-resolved Secret Source descriptor",
+            ))
+        })?
+        .clone();
+    ensure_file_provider_secret_source(&authorization)?;
+    report.descriptor_configured = true;
+    report.secret_provisioned = false;
+    report.validation_status = "provisioning_required".to_string();
+    report.readiness_summary.provider_auth = "provisioning_required".to_string();
+    report.mutation_planned = true;
+    report.planned_actions.push(format!(
+        "preview and provision the File provider secret destination on Host '{host_alias}'"
+    ));
+    Ok(authorization)
+}
+
+fn provision_provider_secret(
+    provider_transport: &dyn transport::TransportClient,
+    authorization: &ProviderBindingAuthorization,
+    host_alias: &str,
+    command: &SetupCommand,
+    format: &OutputFormat,
+) -> Result<satelle_transport::ProviderSecretProvisioningResponse, CliFailure> {
+    ensure_file_provider_secret_source(authorization)?;
+    let destination_descriptor = match authorization.auth_source() {
+        Some(ProviderSecretSource::File { path }) => format!("file:{}", path.display()),
+        _ => unreachable!("provider secret provisioning accepts only File destinations"),
+    };
+
+    let interaction_available = !command.no_input
+        && !format.is_json()
+        && io::stdin().is_terminal()
+        && io::stdout().is_terminal()
+        && io::stderr().is_terminal();
+    if !interaction_available {
+        return Err(failure(provider_secret_setup_error(
+            ErrorCode::ProviderSecretProvisioningRequired,
+            "provider secret provisioning requires an immediate confirmation in an interactive human terminal",
+        )));
+    }
+
+    // Prove that this client is authenticated to the selected, pinned Host before
+    // prompting. The later preview and provision calls use the same client.
+    provider_transport.host_status().map_err(failure)?;
+    println!("Target Host: {host_alias}");
+    println!(
+        "Provider alias: {}",
+        authorization.requested_provider_alias()
+    );
+    println!("Provider Secret Source kind: file");
+    println!("Exact destination descriptor: {destination_descriptor}");
+
+    let idempotency_key = format!(
+        "provider-secret-provision-{}",
+        satelle_transport::RequestId::new()
+    );
+    let preview_metadata =
+        satelle_transport::ProviderSecretProvisioningMetadata::new(authorization.clone(), true);
+    let preview = provider_transport
+        .preview_provider_secret_provisioning(&preview_metadata, &idempotency_key)
+        .map_err(failure)?;
+    println!(
+        "Provider secret destination kind: {}",
+        preview.destination_kind()
+    );
+    println!(
+        "Provider secret persistence location class: {}",
+        preview.persistence_location_class()
+    );
+    println!(
+        "Provider secret overwrite behavior: {}",
+        preview.overwrite_behavior()
+    );
+
+    // Read the secret only after the authenticated preview fixes its exact
+    // destination. Keep it zeroized while asking for the dedicated,
+    // immediately-pre-transmission confirmation.
+    let secret = Zeroizing::new(
+        cliclack::password("Provider secret")
+            .interact()
+            .map_err(|source| {
+                failure(setup_interaction_error(
+                    "could not read provider secret",
+                    source,
+                ))
+            })?
+            .into_bytes(),
+    );
+    let confirmed =
+        cliclack::confirm("Provision or replace the provider secret at this exact destination?")
+            .initial_value(false)
+            .interact()
+            .map_err(|source| {
+                failure(setup_interaction_error(
+                    "could not read provider secret provisioning confirmation",
+                    source,
+                ))
+            })?;
+    if !confirmed {
+        return Err(failure(provider_secret_setup_error(
+            ErrorCode::ProviderSecretProvisioningRequired,
+            "provider secret provisioning or replacement was not authorized",
+        )));
+    }
+
+    // No flag or profile can set this transport bit. The raw material is sent
+    // by the next operation only after this dedicated confirmation.
+    let overwrite_authorized = confirmed;
+    let metadata = satelle_transport::ProviderSecretProvisioningMetadata::new(
+        authorization.clone(),
+        overwrite_authorized,
+    );
+    provider_transport
+        .provision_provider_secret(&preview, &metadata, secret, &idempotency_key)
+        .map_err(failure)
 }
 
 fn daemon_path_overrides(command: &SetupCommand, host_config: &HostConfig) -> DaemonPathOverrides {
@@ -3105,6 +3981,9 @@ fn setup_consent_recovery_command(
             "--expected-host-id".to_string(),
             shell_argument(expected_host_id),
         ]);
+    }
+    if command.verify {
+        arguments.push("--verify".to_string());
     }
     if first_ssh_trust && command.expected_host_id.is_none() {
         // The first trust prompt must remain interactive unless the operator
@@ -3690,7 +4569,34 @@ fn config_explain(
             "Host aliases: {}",
             output["values"]["host_count"].as_u64().unwrap_or_default()
         );
+        print_config_explain_values("", &output["effective"]);
         Ok(())
+    }
+}
+
+fn print_config_explain_values(path: &str, value: &serde_json::Value) {
+    if value.get("redacted").and_then(serde_json::Value::as_bool) == Some(true) {
+        println!(
+            "{}: <redacted> (reason: {}, source: {})",
+            path,
+            value["redaction_reason"].as_str().unwrap_or("secret"),
+            value["source"].as_str().unwrap_or("unknown")
+        );
+        return;
+    }
+    match value {
+        serde_json::Value::Object(fields) => {
+            for (name, field) in fields {
+                let child_path = if path.is_empty() {
+                    name.clone()
+                } else {
+                    format!("{path}.{name}")
+                };
+                print_config_explain_values(&child_path, field);
+            }
+        }
+        serde_json::Value::String(value) => println!("{path}: {value}"),
+        _ => println!("{path}: {value}"),
     }
 }
 
@@ -3713,35 +4619,47 @@ fn redacted_config_json(
     show_secret_references: bool,
 ) -> serde_json::Value {
     let mut value = serde_json::to_value(config).unwrap_or_else(|_| json!({}));
-    let Some(hosts) = value
-        .get_mut("hosts")
-        .and_then(serde_json::Value::as_object_mut)
-    else {
-        return value;
-    };
-
-    for host in hosts.values_mut() {
-        let Some(host_object) = host.as_object_mut() else {
-            continue;
-        };
-
-        if let Some(api_token) = host_object.get_mut("api_token") {
-            redact_secret_source_descriptor(api_token, show_secret_references);
-        }
-
-        let Some(provider_auth) = host_object
-            .get_mut("provider_auth")
-            .and_then(serde_json::Value::as_object_mut)
-        else {
-            continue;
-        };
-
-        for descriptor in provider_auth.values_mut() {
-            redact_secret_source_descriptor(descriptor, show_secret_references);
-        }
-    }
-
+    redact_schema_marked_config_values(&mut value, &mut Vec::new(), show_secret_references);
     value
+}
+
+const CONFIG_SECRET_SOURCE_SCHEMA_PATHS: &[&[&str]] = &[
+    &["hosts", "*", "api_token"],
+    &["hosts", "*", "provider_auth", "*"],
+];
+
+fn redact_schema_marked_config_values(
+    value: &mut serde_json::Value,
+    path: &mut Vec<String>,
+    show_secret_references: bool,
+) {
+    if CONFIG_SECRET_SOURCE_SCHEMA_PATHS.iter().any(|schema_path| {
+        schema_path.len() == path.len()
+            && schema_path
+                .iter()
+                .zip(path.iter())
+                .all(|(schema, actual)| *schema == "*" || *schema == actual)
+    }) {
+        redact_secret_source_descriptor(value, show_secret_references);
+        return;
+    }
+    match value {
+        serde_json::Value::Object(fields) => {
+            for (name, field) in fields {
+                path.push(name.clone());
+                redact_schema_marked_config_values(field, path, show_secret_references);
+                path.pop();
+            }
+        }
+        serde_json::Value::Array(values) => {
+            for (index, field) in values.iter_mut().enumerate() {
+                path.push(index.to_string());
+                redact_schema_marked_config_values(field, path, show_secret_references);
+                path.pop();
+            }
+        }
+        _ => {}
+    }
 }
 
 fn redact_secret_source_descriptor(
@@ -3804,6 +4722,81 @@ fn reveal_secret_source_descriptor(
             "redaction_reason": "unsupported_secret_source_kind",
             "source": "user_config",
         }),
+    }
+}
+
+#[cfg(test)]
+mod config_redaction_tests {
+    use super::redact_schema_marked_config_values;
+    use serde_json::json;
+
+    #[test]
+    fn schema_marked_secret_fields_never_fall_back_to_raw_values() {
+        const CANARY: &str = "PRIVATE_CONFIG_REDACTION_FAILURE_CANARY";
+        let mut value = json!({
+            "hosts": {
+                "selected": {
+                    "transport": "direct",
+                    "api_token": {
+                        "kind": "file",
+                        "path": CANARY,
+                    },
+                    "provider_auth": {
+                        "operator-auth": {
+                            "kind": "auth-command",
+                            "argv": ["/usr/bin/credential-helper", CANARY],
+                            "secret": CANARY,
+                        },
+                    },
+                },
+            },
+        });
+
+        redact_schema_marked_config_values(&mut value, &mut Vec::new(), false);
+
+        let selected = &value["hosts"]["selected"];
+        assert_eq!(selected["transport"], "direct");
+        assert_eq!(selected["api_token"]["value"], serde_json::Value::Null);
+        assert_eq!(selected["api_token"]["redacted"], true);
+        assert_eq!(
+            selected["provider_auth"]["operator-auth"]["value"],
+            serde_json::Value::Null
+        );
+        assert_eq!(
+            selected["provider_auth"]["operator-auth"]["redaction_reason"],
+            "secret_source_reference"
+        );
+        assert!(
+            !serde_json::to_string(&value)
+                .expect("redacted config should serialize")
+                .contains(CANARY)
+        );
+
+        let mut revealed = json!({
+            "hosts": {
+                "selected": {
+                    "provider_auth": {
+                        "operator-auth": {
+                            "kind": "auth-command",
+                            "argv": ["/usr/bin/credential-helper", CANARY],
+                        },
+                    },
+                },
+            },
+        });
+        redact_schema_marked_config_values(&mut revealed, &mut Vec::new(), true);
+        let unknown = &revealed["hosts"]["selected"]["provider_auth"]["operator-auth"];
+        assert_eq!(unknown["value"], serde_json::Value::Null);
+        assert_eq!(unknown["redacted"], true);
+        assert_eq!(
+            unknown["redaction_reason"],
+            "unsupported_secret_source_kind"
+        );
+        assert!(
+            !serde_json::to_string(&revealed)
+                .expect("unknown secret source should serialize as redacted")
+                .contains(CANARY)
+        );
     }
 }
 
@@ -4961,6 +5954,39 @@ fn start_host_daemon_with(
             )));
         }
     };
+    let initial_identity = match (
+        command.initial_host_identity.as_deref(),
+        command.initial_identity_operation_id.as_deref(),
+        command.initial_identity_record.as_deref(),
+    ) {
+        (Some(identity), Some(operation_id), Some(encoded_record)) => {
+            let identity = HostIdentityRef::new(identity.to_string()).map_err(|_| {
+                failure(SatelleError::invalid_usage(
+                    "--initial-host-identity must be a valid Host Identity",
+                ))
+            })?;
+            let record =
+                satelle_core::SshIdentityCommitRecord::parse(encoded_record).map_err(|_| {
+                    failure(SatelleError::invalid_usage(
+                        "--initial-identity-record must be a valid v2 identity operation record",
+                    ))
+                })?;
+            if record.candidate_host_identity() != &identity
+                || record.operation_id() != operation_id
+            {
+                return Err(failure(SatelleError::invalid_usage(
+                    "fresh SSH identity commit arguments must describe the same operation",
+                )));
+            }
+            Some(record)
+        }
+        (None, None, None) => None,
+        _ => {
+            return Err(failure(SatelleError::invalid_usage(
+                "fresh SSH identity commit arguments require each other",
+            )));
+        }
+    };
     let bind_addr = command.bind.parse::<SocketAddr>().map_err(|error| {
         failure(SatelleError {
             code: ErrorCode::InvalidUsage,
@@ -5019,6 +6045,14 @@ fn start_host_daemon_with(
         .and_then(|host| host.config.daemon_state_dir.clone())
         .map_or_else(satelle_core::state_dir, Ok)
         .map_err(failure)?;
+    if initial_identity.is_none()
+        && HostService::fresh_ssh_identity_commit_pending(&state_release_root).map_err(failure)?
+    {
+        return Err(failure(SatelleError::config_error(
+            "the Host has an unfinished SSH identity commit",
+            Some("rerun SSH setup with the exact previously accepted Host Identity".to_string()),
+        )));
+    }
     let service = match (on_demand_host.as_ref(), bootstrap_token.as_ref()) {
         (_, Some(token)) => {
             let mut host_config = satelle_core::SatelleConfig::defaults()
@@ -5026,6 +6060,14 @@ fn start_host_daemon_with(
                 .remove(LOCAL_DEMO_HOST)
                 .expect("the built-in local Host config exists");
             host_config.timeouts = forwarded_readiness_timeouts;
+            if let Some(record) = initial_identity.as_ref() {
+                let committed =
+                    HostService::commit_fresh_ssh_host_identity(&state_release_root, record)
+                        .map_err(failure)?;
+                if committed != *record.candidate_host_identity() {
+                    return Err(failure(SatelleError::state_conflict()));
+                }
+            }
             build_bootstrap_service(
                 token,
                 bootstrap_scopes.expect("bootstrap token has a validated scope"),
@@ -5746,6 +6788,9 @@ mod daemon_tls_watcher_tests {
             tls_key: tls_key.map(PathBuf::from),
             foreground: true,
             bootstrap_token_stdin: false,
+            initial_host_identity: None,
+            initial_identity_operation_id: None,
+            initial_identity_record: None,
             bootstrap_scope: None,
             bootstrap_native_readiness_timeout_ms: None,
             bootstrap_provider_smoke_timeout_ms: None,
@@ -6265,6 +7310,9 @@ mod bootstrap_startup_tests {
             tls_key: None,
             foreground: false,
             bootstrap_token_stdin: true,
+            initial_host_identity: None,
+            initial_identity_operation_id: None,
+            initial_identity_record: None,
             bootstrap_scope: Some(SshBootstrapScope::Read),
             bootstrap_native_readiness_timeout_ms: None,
             bootstrap_provider_smoke_timeout_ms: None,
@@ -7944,13 +8992,29 @@ fn print_setup_human(report: &SetupReport) {
     println!("Service persistent: {}", report.service_persistent);
     println!("Service scope: {}", report.service_scope);
     println!("Components: {}", report.setup_components.join(", "));
-    println!("Mutated: {}", report.mutated);
+    println!("Changed: {}", report.changed);
+    println!(
+        "Provider descriptor configured: {}",
+        report.descriptor_configured
+    );
+    println!("Provider secret provisioned: {}", report.secret_provisioned);
+    println!("Provider validation: {}", report.validation_status);
+    println!("Provider smoke test: {}", report.provider_smoke_test_status);
     println!(
         "Native Computer Use readiness: {}",
         report.native_computer_use_readiness
     );
     for action in &report.planned_actions {
         println!("Plan: {action}");
+    }
+    if let Some(verification) = &report.verification {
+        println!("Verification: {}", verification.status);
+        for check in &verification.planned_checks {
+            println!("Verification check: {check}");
+        }
+        for cache_update in &verification.cache_updates {
+            println!("Verification cache: {cache_update}");
+        }
     }
     for override_entry in &report.daemon_path_overrides {
         println!(
@@ -8234,6 +9298,37 @@ mod setup_desktop_binding_tests {
         assert!(transport.is_none());
         assert!(!constructed.get());
         assert!(!called.get());
+    }
+
+    #[test]
+    fn host_setup_precedes_provider_follow_up_and_failure_blocks_it() {
+        let result = run_host_setup_then_follow_up(
+            || Ok::<_, &'static str>(vec!["configured fake native Computer Use readiness"]),
+            |applied_actions| {
+                applied_actions.push(
+                    "provisioned and authorized file provider authentication on Host 'selected'",
+                );
+                Ok(())
+            },
+        );
+        assert_eq!(
+            result,
+            Ok(vec![
+                "configured fake native Computer Use readiness",
+                "provisioned and authorized file provider authentication on Host 'selected'",
+            ])
+        );
+
+        let provider_called = std::cell::Cell::new(false);
+        let result = run_host_setup_then_follow_up(
+            || Err::<(), _>("host setup failed"),
+            |_| {
+                provider_called.set(true);
+                Ok(())
+            },
+        );
+        assert_eq!(result, Err("host setup failed"));
+        assert!(!provider_called.get());
     }
 
     #[test]

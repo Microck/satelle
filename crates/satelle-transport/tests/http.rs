@@ -16,6 +16,8 @@ mod provider_auth;
 mod raw_wire;
 #[path = "http/sessions.rs"]
 mod sessions;
+#[path = "http/setup-readiness.rs"]
+mod setup_readiness;
 
 use reqwest::StatusCode;
 use rustls::RootCertStore;
@@ -52,7 +54,7 @@ use tracing::metadata::LevelFilter;
 use tracing::span::{Attributes, Id, Record};
 use tracing::{Event, Metadata, Subscriber};
 
-const EXPECTED_OPERATIONS: [&str; 14] = [
+const EXPECTED_OPERATIONS: [&str; 15] = [
     "live",
     "capabilities",
     "host_status",
@@ -67,6 +69,7 @@ const EXPECTED_OPERATIONS: [&str; 14] = [
     "setup_api_token_issue",
     "setup_api_token_activate",
     "setup_api_token_abort",
+    "provider_secret_provisioning",
 ];
 
 const BLOCKING_SPAN_ATTRIBUTE_MARKER: &str = "trace-blocking-span-attribute-connected";
@@ -142,13 +145,13 @@ impl RunningServer {
 
     fn request(&self, path: &str) -> reqwest::RequestBuilder {
         self.protected_request(reqwest::Method::GET, path)
-            .header("Satelle-Protocol-Version", "9")
+            .header("Satelle-Protocol-Version", "11")
     }
 
     fn mutation(&self, path: &str, idempotency_key: &str) -> reqwest::RequestBuilder {
         self.protected_request(reqwest::Method::POST, path)
             .header("Idempotency-Key", idempotency_key)
-            .header("Satelle-Protocol-Version", "9")
+            .header("Satelle-Protocol-Version", "11")
     }
 
     fn mutation_with_request_id(
@@ -159,7 +162,7 @@ impl RunningServer {
     ) -> reqwest::RequestBuilder {
         self.protected_request_with_request_id(reqwest::Method::POST, path, request_id)
             .header("Idempotency-Key", idempotency_key)
-            .header("Satelle-Protocol-Version", "9")
+            .header("Satelle-Protocol-Version", "11")
     }
 
     fn protected_request(&self, method: reqwest::Method, path: &str) -> reqwest::RequestBuilder {
@@ -365,7 +368,7 @@ fn setup_mutation_request(
         .header("Satelle-Expected-Host-Identity", host_identity)
         .header("Satelle-Request-Id", RequestId::new().to_string())
         .header("Idempotency-Key", idempotency_key)
-        .header("Satelle-Protocol-Version", "9")
+        .header("Satelle-Protocol-Version", "11")
 }
 
 fn replacement_token(token_id: &str) -> ApiBearerToken {
@@ -1214,13 +1217,40 @@ async fn capabilities_are_truthful_and_unknown_routes_are_typed() {
         response.json().await.expect("decode capabilities JSON");
     assert_eq!(
         capabilities_json["schema_version"],
-        "satelle.capabilities.v3"
+        "satelle.capabilities.v5"
     );
-    let mut obsolete_v1 = capabilities_json.clone();
-    obsolete_v1["schema_version"] = serde_json::json!("satelle.capabilities.v2");
-    assert!(serde_json::from_value::<CapabilitiesResponse>(obsolete_v1).is_err());
+    assert_eq!(
+        capabilities_json["provider_secret_upload"],
+        serde_json::json!({
+            "envelope_schema_version": "satelle.provider-secret-upload.v2",
+            "algorithm": "x25519-hkdf-sha256-chacha20poly1305",
+            "content_type": "application/vnd.satelle.provider-secret-upload+json",
+            "max_plaintext_bytes": 65_536
+        })
+    );
+    let mut obsolete_v4 = capabilities_json.clone();
+    obsolete_v4["schema_version"] = serde_json::json!("satelle.capabilities.v4");
+    assert!(serde_json::from_value::<CapabilitiesResponse>(obsolete_v4).is_err());
     let capabilities: CapabilitiesResponse =
         serde_json::from_value(capabilities_json).expect("decode typed capabilities");
+    assert_eq!(
+        capabilities
+            .provider_secret_upload()
+            .envelope_schema_version(),
+        "satelle.provider-secret-upload.v2"
+    );
+    assert_eq!(
+        capabilities.provider_secret_upload().algorithm(),
+        "x25519-hkdf-sha256-chacha20poly1305"
+    );
+    assert_eq!(
+        capabilities.provider_secret_upload().content_type(),
+        "application/vnd.satelle.provider-secret-upload+json"
+    );
+    assert_eq!(
+        capabilities.provider_secret_upload().max_plaintext_bytes(),
+        65_536
+    );
     assert_eq!(capabilities.host_identity(), running.host_identity);
     assert_eq!(capabilities.operations(), EXPECTED_OPERATIONS);
     assert_eq!(capabilities.limits().json_body_bytes(), 1_048_576);
@@ -1642,7 +1672,7 @@ async fn bootstrap_maintenance_routes_enforce_the_mutation_contract_before_ledge
         ),
         (
             "missing-idempotency",
-            Some("9"),
+            Some("11"),
             None,
             false,
             false,
@@ -1651,7 +1681,7 @@ async fn bootstrap_maintenance_routes_enforce_the_mutation_contract_before_ledge
         ),
         (
             "query",
-            Some("9"),
+            Some("11"),
             Some("query-key"),
             true,
             false,
@@ -1660,7 +1690,7 @@ async fn bootstrap_maintenance_routes_enforce_the_mutation_contract_before_ledge
         ),
         (
             "cookie",
-            Some("9"),
+            Some("11"),
             Some("cookie-key"),
             false,
             true,
@@ -1773,7 +1803,7 @@ async fn bootstrap_maintenance_routes_enforce_the_mutation_contract_before_ledge
         ),
         (
             "missing-idempotency",
-            Some("9"),
+            Some("11"),
             None,
             false,
             false,
@@ -1782,7 +1812,7 @@ async fn bootstrap_maintenance_routes_enforce_the_mutation_contract_before_ledge
         ),
         (
             "query",
-            Some("9"),
+            Some("11"),
             Some("complete-query-key"),
             true,
             false,
@@ -1791,7 +1821,7 @@ async fn bootstrap_maintenance_routes_enforce_the_mutation_contract_before_ledge
         ),
         (
             "cookie",
-            Some("9"),
+            Some("11"),
             Some("complete-cookie-key"),
             false,
             true,

@@ -475,6 +475,7 @@ impl DaemonServer {
             ),
             setup_issuances: Mutex::new(HashMap::new()),
             setup_mutations: Mutex::new(HashMap::new()),
+            provider_secret_uploads: Mutex::new(HashMap::new()),
             shutdown: shutdown.clone(),
         });
         let router = router(Arc::clone(&state));
@@ -796,6 +797,7 @@ pub(super) struct DaemonState {
     setup_mutations: Mutex<
         HashMap<(String, setup::SetupTokenMutationOperation, String), setup::SetupTokenMutation>,
     >,
+    provider_secret_uploads: Mutex<HashMap<String, setup::PendingProviderSecretUpload>>,
     shutdown: watch::Sender<bool>,
 }
 
@@ -922,6 +924,34 @@ fn router(state: Arc<DaemonState>) -> Router {
             Arc::clone(&state),
             auth::require_control,
         ));
+    let provider_secret_provisioning_routes = Router::new()
+        .route(
+            "/v1/setup/provider-secret/preview",
+            post(setup::preview_provider_secret_provisioning),
+        )
+        .route(
+            "/v1/setup/provider-secret",
+            post(setup::provision_provider_secret),
+        )
+        .route_layer(middleware::from_fn_with_state(
+            Arc::clone(&state),
+            auth::require_admin_mutation,
+        ));
+    let setup_verification_route = Router::new()
+        .route("/v1/setup/verify", post(setup::verify_setup))
+        .route_layer(middleware::from_fn_with_state(
+            Arc::clone(&state),
+            auth::require_control,
+        ));
+    let native_readiness_invalidation_route = Router::new()
+        .route(
+            "/v1/setup/readiness/native/invalidate",
+            post(setup::invalidate_native_readiness),
+        )
+        .route_layer(middleware::from_fn_with_state(
+            Arc::clone(&state),
+            auth::require_control,
+        ));
     let control_routes = Router::new()
         .route("/v1/sessions", post(sessions::create_session))
         .route(
@@ -942,6 +972,9 @@ fn router(state: Arc<DaemonState>) -> Router {
         .merge(provider_binding_authorization_routes)
         .merge(provider_binding_deletion_route)
         .merge(provider_descriptor_validation_route)
+        .merge(provider_secret_provisioning_routes)
+        .merge(setup_verification_route)
+        .merge(native_readiness_invalidation_route)
         .merge(control_routes)
         .method_not_allowed_fallback(protected_method_not_allowed)
         .fallback(protected_not_found)

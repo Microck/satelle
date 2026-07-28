@@ -925,7 +925,7 @@ fn cleanup_failure_rolls_back_every_dependency_deletion() {
 }
 
 #[test]
-fn expired_sessionless_provider_idempotency_records_are_pruned_at_the_boundary() {
+fn expired_sessionless_bounded_idempotency_records_are_pruned_at_the_boundary() {
     let state = TempDir::new().expect("temporary state directory");
     let (mut storage, _) = Storage::open(state.path()).expect("open storage");
     let created_at = at(0);
@@ -946,6 +946,16 @@ fn expired_sessionless_provider_idempotency_records_are_pruned_at_the_boundary()
             IdempotentOperation::ProviderBindingDeletion,
             "terminal-provider-deletion",
             "v1.provider_binding_deletion.completed",
+        ),
+        (
+            IdempotentOperation::SetupVerification,
+            "terminal-setup-verification",
+            "v1.setup_verification.completed",
+        ),
+        (
+            IdempotentOperation::NativeReadinessInvalidation,
+            "terminal-native-readiness-invalidation",
+            "v1.native_readiness_invalidation.completed",
         ),
     ] {
         insert_terminal_json_idempotency(
@@ -1010,7 +1020,7 @@ fn expired_sessionless_provider_idempotency_records_are_pruned_at_the_boundary()
             |row| row.get(0),
         )
         .unwrap();
-    assert_eq!(6, before_boundary);
+    assert_eq!(8, before_boundary);
 
     storage.prune_expired_session_metadata(observed_at).unwrap();
     let retained = storage

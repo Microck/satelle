@@ -387,10 +387,12 @@ fn destination(host: &HostConfig) -> Result<&str, SatelleError> {
 
 fn report(host_alias: &str, setup_mode: &str, dry_run: bool, changed: bool) -> SetupReport {
     SetupReport {
-        schema_version: SetupSchemaVersion::V1,
+        schema_version: SetupSchemaVersion::V2,
         host: host_alias.to_string(),
         dry_run,
         status: if dry_run { "planned" } else { "configured" }.to_string(),
+        cancellation_reason: None,
+        verification: None,
         setup_mode: setup_mode.to_string(),
         service_persistent: false,
         service_scope: "remote_user".to_string(),
@@ -419,8 +421,14 @@ fn report(host_alias: &str, setup_mode: &str, dry_run: bool, changed: bool) -> S
             native_computer_use: "not_verified".to_string(),
             provider_auth: "not_verified".to_string(),
         },
+        descriptor_configured: false,
+        secret_provisioned: false,
+        validation_status: "not_verified".to_string(),
+        provider_smoke_test_status: "not_verified".to_string(),
         daemon_path_overrides: Vec::new(),
+        changed,
         mutated: changed,
+        mutation_planned: dry_run || changed,
         native_computer_use_readiness: "not_verified".to_string(),
         next_command: format!("satelle doctor --host {host_alias} --scope transport --json"),
     }

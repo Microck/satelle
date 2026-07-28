@@ -2,11 +2,15 @@ use crate::contract::{
     AdmissionCancellationResponse, ApiError, ApiErrorCode, AuthenticatedResponseContract,
     BootstrapMaintenanceResponse, CapabilitiesResponse, DurableTokenActivationResponse,
     DurableTokenConfirmationResponse, DurableTokenIssuanceResponse, HostDesktopSessionsResponse,
-    HostStatusResponse, LiveResponse, LogsPageResponse, PROTOCOL_VERSION, PROTOCOL_VERSION_HEADER,
+    HostStatusResponse, LiveResponse, LogsPageResponse, NativeReadinessInvalidationRequest,
+    NativeReadinessInvalidationResponse, PROTOCOL_VERSION, PROTOCOL_VERSION_HEADER,
+    PROVIDER_SECRET_UPLOAD_CONTENT_TYPE, PROVIDER_SECRET_UPLOAD_INFO,
     ProviderBindingAuthorizationRequest, ProviderBindingAuthorizationResponse,
     ProviderBindingDeletionResponse, ProviderDescriptorValidationRequest,
-    ProviderDescriptorValidationResponse, RequestId, SessionResponse, StopRequest, StopResponse,
-    TurnRequest,
+    ProviderDescriptorValidationResponse, ProviderSecretProvisioningMetadata,
+    ProviderSecretProvisioningPreviewResponse, ProviderSecretProvisioningResponse,
+    ProviderSecretUploadEnvelope, RequestId, SessionResponse, SetupVerificationRequest,
+    SetupVerificationResponse, StopRequest, StopResponse, TurnRequest, provider_secret_upload_aad,
 };
 use crate::transport_tls::{
     ReqwestTrustError, TlsFailureKind, classify_tls_error, configure_reqwest_trust,
@@ -14,7 +18,7 @@ use crate::transport_tls::{
 };
 use percent_encoding::{AsciiSet, CONTROLS, utf8_percent_encode};
 use reqwest::blocking::{Client, RequestBuilder, Response};
-use reqwest::header::{AUTHORIZATION, HeaderValue};
+use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, HeaderValue};
 use reqwest::redirect::Policy;
 use reqwest::{Method, StatusCode};
 use satelle_core::session::{EffectiveModelRef, ProviderBindingRef};
@@ -22,11 +26,13 @@ use satelle_core::{DirectHostBinding, SessionId};
 use satelle_host::{ApiBearerToken, LogPageQuery};
 use serde::de::DeserializeOwned;
 use std::fmt;
+use std::io::{self, Read};
 use std::net::SocketAddr;
 use std::time::Duration;
 use zeroize::Zeroizing;
 
 const DIRECT_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+const PROVIDER_SECRET_PROVISIONING_PATH: &str = "/v1/setup/provider-secret";
 const PROVIDER_BINDING_ALIAS_ENCODE_SET: &AsciiSet =
     &CONTROLS.add(b'/').add(b'?').add(b'#').add(b'%').add(b'\\');
 
@@ -47,12 +53,50 @@ fn provider_binding_path(
     ))
 }
 
+struct ZeroizingRequestBody {
+    bytes: Zeroizing<Vec<u8>>,
+    position: usize,
+}
+
+impl ZeroizingRequestBody {
+    fn new(bytes: Zeroizing<Vec<u8>>) -> Self {
+        Self { bytes, position: 0 }
+    }
+}
+
+impl Read for ZeroizingRequestBody {
+    fn read(&mut self, output: &mut [u8]) -> io::Result<usize> {
+        let remaining = &self.bytes[self.position..];
+        let read = remaining.len().min(output.len());
+        output[..read].copy_from_slice(&remaining[..read]);
+        self.position += read;
+        Ok(read)
+    }
+}
+
 pub struct DaemonClient {
     client: Client,
     base_url: String,
     token: ApiBearerToken,
     expected_host_identity: String,
     admission_timeout: Option<Duration>,
+}
+
+pub struct PreparedProviderSecretProvisioning {
+    path: &'static str,
+    content_type: &'static str,
+    protocol_metadata_header: (&'static str, &'static str),
+    expected_host_identity: String,
+    idempotency_key: Zeroizing<String>,
+    encoded_envelope: Zeroizing<Vec<u8>>,
+}
+
+impl fmt::Debug for PreparedProviderSecretProvisioning {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PreparedProviderSecretProvisioning")
+            .finish_non_exhaustive()
+    }
 }
 
 impl DaemonClient {
@@ -307,6 +351,118 @@ impl DaemonClient {
         let (request, request_id) = self.mutation_request(&path, idempotency_key)?;
         let request = self.provider_validation_request(request.json(validation), validation);
         self.send_authenticated(request, request_id, StatusCode::OK)
+    }
+
+    pub fn preview_provider_secret_provisioning(
+        &self,
+        metadata: &ProviderSecretProvisioningMetadata,
+        idempotency_key: &str,
+    ) -> Result<ProviderSecretProvisioningPreviewResponse, DaemonClientError> {
+        let (request, request_id) =
+            self.mutation_request("/v1/setup/provider-secret/preview", idempotency_key)?;
+        self.send_authenticated(request.json(metadata), request_id, StatusCode::OK)
+    }
+
+    pub fn provision_provider_secret(
+        &self,
+        preview: &ProviderSecretProvisioningPreviewResponse,
+        metadata: &ProviderSecretProvisioningMetadata,
+        secret: Zeroizing<Vec<u8>>,
+        idempotency_key: &str,
+    ) -> Result<ProviderSecretProvisioningResponse, DaemonClientError> {
+        let prepared =
+            self.prepare_provider_secret_provisioning(preview, metadata, secret, idempotency_key)?;
+        self.send_prepared_provider_secret_provisioning(&prepared)
+    }
+
+    pub fn prepare_provider_secret_provisioning(
+        &self,
+        preview: &ProviderSecretProvisioningPreviewResponse,
+        metadata: &ProviderSecretProvisioningMetadata,
+        secret: Zeroizing<Vec<u8>>,
+        idempotency_key: &str,
+    ) -> Result<PreparedProviderSecretProvisioning, DaemonClientError> {
+        if preview.host_identity() != self.expected_host_identity {
+            return Err(DaemonClientError::ResponseContractViolation);
+        }
+        let recipient_public_key =
+            crate::provider_secret_crypto::decode_canonical_base64(preview.recipient_public_key())
+                .map_err(|_| DaemonClientError::ResponseContractViolation)?;
+        let aad =
+            provider_secret_upload_aad(preview, metadata, self.token.token_id(), idempotency_key)
+                .map_err(|_| DaemonClientError::ResponseContractViolation)?;
+        let sealed = crate::provider_secret_crypto::encrypt_provider_secret(
+            recipient_public_key.as_slice(),
+            PROVIDER_SECRET_UPLOAD_INFO,
+            aad.as_slice(),
+            secret.as_slice(),
+        )
+        .map_err(|_| DaemonClientError::ResponseContractViolation)?;
+        let envelope = ProviderSecretUploadEnvelope::new(
+            preview,
+            metadata.clone(),
+            crate::provider_secret_crypto::encode_canonical_base64(&sealed.encapsulated_key),
+            crate::provider_secret_crypto::encode_canonical_base64(&sealed.ciphertext),
+        );
+        let encoded_envelope = Zeroizing::new(
+            serde_json::to_vec(&envelope)
+                .map_err(|_| DaemonClientError::ResponseContractViolation)?,
+        );
+        Ok(PreparedProviderSecretProvisioning {
+            path: PROVIDER_SECRET_PROVISIONING_PATH,
+            content_type: PROVIDER_SECRET_UPLOAD_CONTENT_TYPE,
+            protocol_metadata_header: (PROTOCOL_VERSION_HEADER, PROTOCOL_VERSION),
+            expected_host_identity: self.expected_host_identity.clone(),
+            idempotency_key: Zeroizing::new(idempotency_key.to_string()),
+            encoded_envelope,
+        })
+    }
+
+    pub fn send_prepared_provider_secret_provisioning(
+        &self,
+        prepared: &PreparedProviderSecretProvisioning,
+    ) -> Result<ProviderSecretProvisioningResponse, DaemonClientError> {
+        if prepared.expected_host_identity != self.expected_host_identity {
+            return Err(DaemonClientError::ResponseContractViolation);
+        }
+        let (request, request_id) = self.mutation_request_with_bound_protocol_metadata(
+            Method::POST,
+            prepared.path,
+            prepared.idempotency_key.as_str(),
+            prepared.protocol_metadata_header,
+        )?;
+        let body = reqwest::blocking::Body::new(ZeroizingRequestBody::new(Zeroizing::new(
+            prepared.encoded_envelope.as_slice().to_vec(),
+        )));
+        let request = self.admission_request(
+            request
+                .header(CONTENT_TYPE, prepared.content_type)
+                .body(body),
+        );
+        self.send_authenticated(request, request_id, StatusCode::OK)
+    }
+
+    pub fn verify_setup(
+        &self,
+        verification: &SetupVerificationRequest,
+        idempotency_key: &str,
+    ) -> Result<SetupVerificationResponse, DaemonClientError> {
+        let (request, request_id) = self.mutation_request("/v1/setup/verify", idempotency_key)?;
+        self.send_authenticated(
+            self.admission_request(request.json(verification)),
+            request_id,
+            StatusCode::OK,
+        )
+    }
+
+    pub fn invalidate_native_readiness(
+        &self,
+        invalidation: &NativeReadinessInvalidationRequest,
+        idempotency_key: &str,
+    ) -> Result<NativeReadinessInvalidationResponse, DaemonClientError> {
+        let (request, request_id) =
+            self.mutation_request("/v1/setup/readiness/native/invalidate", idempotency_key)?;
+        self.send_authenticated(request.json(invalidation), request_id, StatusCode::OK)
     }
 
     pub fn complete_bootstrap_maintenance(
@@ -566,6 +722,21 @@ impl DaemonClient {
         path: &str,
         idempotency_key: &str,
     ) -> Result<(RequestBuilder, RequestId), DaemonClientError> {
+        self.mutation_request_with_bound_protocol_metadata(
+            method,
+            path,
+            idempotency_key,
+            (PROTOCOL_VERSION_HEADER, PROTOCOL_VERSION),
+        )
+    }
+
+    fn mutation_request_with_bound_protocol_metadata(
+        &self,
+        method: Method,
+        path: &str,
+        idempotency_key: &str,
+        protocol_metadata_header: (&'static str, &'static str),
+    ) -> Result<(RequestBuilder, RequestId), DaemonClientError> {
         let mut header = HeaderValue::from_str(idempotency_key)
             .map_err(|_| DaemonClientError::InvalidIdempotencyKeyHeader)?;
         header.set_sensitive(true);
@@ -573,7 +744,7 @@ impl DaemonClient {
         Ok((
             request
                 .header("Idempotency-Key", header)
-                .header(PROTOCOL_VERSION_HEADER, PROTOCOL_VERSION),
+                .header(protocol_metadata_header.0, protocol_metadata_header.1),
             request_id,
         ))
     }

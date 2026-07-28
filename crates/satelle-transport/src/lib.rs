@@ -1,11 +1,14 @@
 mod client;
 mod contract;
+#[path = "provider-secret-crypto.rs"]
+mod provider_secret_crypto;
 mod server;
 #[path = "transport-tls.rs"]
 mod transport_tls;
 
 pub use client::{
     DaemonClient, DaemonClientError, DaemonEventClient, DaemonEventError, DaemonEventStream,
+    PreparedProviderSecretProvisioning,
 };
 pub use contract::{
     AdmissionCancellationOutcome, AdmissionCancellationResponse, ApiError, ApiErrorCode,
@@ -13,14 +16,17 @@ pub use contract::{
     DurableTokenConfirmationResponse, DurableTokenIssuanceResponse, EventSubscription,
     HostDesktopSessionsResponse, HostStatusResponse, ImageAttachment, LiveResponse,
     LogsPageResponse, MAX_IMAGE_ATTACHMENT_BYTES, MAX_IMAGE_ATTACHMENT_BYTES_TOTAL,
-    MAX_IMAGE_ATTACHMENT_COUNT, ProviderAuthObservationSource, ProviderAuthValidationMode,
+    MAX_IMAGE_ATTACHMENT_COUNT, NativeReadinessInvalidationRequest,
+    NativeReadinessInvalidationResponse, ProviderAuthObservationSource, ProviderAuthValidationMode,
     ProviderAuthValidationOutcome, ProviderAuthValidationResult, ProviderBindingAuthorization,
     ProviderBindingAuthorizationRequest, ProviderBindingAuthorizationResponse,
     ProviderBindingDeletionResponse, ProviderBindingSource, ProviderDescriptorValidationRequest,
-    ProviderDescriptorValidationResponse, RequestId, ResolvedProviderBinding,
-    SUPPORTED_IMAGE_MEDIA_TYPES, SessionResponse, StopRequest, StopResponse, SubscribeRequest,
-    SubscribeRequestError, SubscribedResponse, TurnRequest, WsCloseReason, WsControlError,
-    WsServerControl,
+    ProviderDescriptorValidationResponse, ProviderSecretProvisioningMetadata,
+    ProviderSecretProvisioningPreviewResponse, ProviderSecretProvisioningResponse,
+    ProviderSecretUploadEnvelope, RequestId, ResolvedProviderBinding, SUPPORTED_IMAGE_MEDIA_TYPES,
+    SessionResponse, SetupVerificationRequest, SetupVerificationResponse, StopRequest,
+    StopResponse, SubscribeRequest, SubscribeRequestError, SubscribedResponse, TurnRequest,
+    WsCloseReason, WsControlError, WsServerControl,
 };
 pub use server::{
     DaemonServer, DaemonServerConfig, DaemonServerError, DaemonShutdownHandle, DaemonTlsConfig,

@@ -1,22 +1,47 @@
-use super::api_json::ApiJson;
-use super::auth::AuthorizedRequest;
+use super::api_json::{ApiJson, BoundedBodyError, read_bounded_body};
+use super::auth::{self, AuthorizedRequest};
 use super::{ApiFailure, DaemonState, api_error_response, authenticated_json_response, host_error};
 use crate::contract::{
     ApiErrorCategory, ApiErrorCode, BootstrapMaintenanceResponse, DURABLE_SETUP_PENDING_TTL,
     DurableTokenActivationResponse, DurableTokenConfirmationResponse, DurableTokenIssuanceResponse,
+    NativeReadinessInvalidationRequest, NativeReadinessInvalidationResponse,
+    PROVIDER_SECRET_UPLOAD_CONTENT_TYPE, PROVIDER_SECRET_UPLOAD_INFO,
     ProviderBindingAuthorizationRequest, ProviderBindingAuthorizationResponse,
     ProviderBindingDeletionResponse, ProviderDescriptorValidationRequest,
-    ProviderDescriptorValidationResponse,
+    ProviderDescriptorValidationResponse, ProviderSecretProvisioningMetadata,
+    ProviderSecretProvisioningPreviewResponse, ProviderSecretProvisioningResponse,
+    ProviderSecretUploadEnvelope, SetupVerificationRequest, SetupVerificationResponse,
+    provider_secret_upload_aad,
 };
-use axum::extract::{Extension, Path, State};
-use axum::http::StatusCode;
+use axum::extract::{Extension, Path, Request, State};
+use axum::http::header::CONTENT_TYPE;
+use axum::http::{HeaderMap, StatusCode};
 use axum::response::Response;
 use satelle_core::SatelleError;
 use satelle_host::{ApiScopes, HostService, MutationAuthority, SetupOperationKind};
+use sha2::{Digest, Sha256};
+use std::collections::HashMap;
 use std::sync::Arc;
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
-use zeroize::Zeroizing;
+use zeroize::{Zeroize, Zeroizing};
+
+const MAX_PROVIDER_SECRET_BYTES: usize = 64 * 1024;
+const MAX_PROVIDER_SECRET_ENVELOPE_BYTES: usize = 96 * 1024;
+const MAX_PENDING_PROVIDER_SECRET_UPLOADS: usize = 128;
+const PROVIDER_SECRET_UPLOAD_TTL: time::Duration = time::Duration::minutes(5);
+
+pub(super) struct PendingProviderSecretUpload {
+    preview: ProviderSecretProvisioningPreviewResponse,
+    metadata: ProviderSecretProvisioningMetadata,
+    token_id: String,
+    principal_ref: String,
+    credential_revision: u64,
+    idempotency_key: String,
+    request_digest: [u8; 32],
+    expires_at: OffsetDateTime,
+    private_key: Zeroizing<Vec<u8>>,
+}
 
 #[derive(Clone)]
 pub(super) struct SetupTokenIssuance {
@@ -40,6 +65,88 @@ enum SetupTokenMutationOutcome {
     Conflict,
     HostError(SatelleError),
     TaskFailure,
+}
+
+pub(super) async fn verify_setup(
+    State(state): State<Arc<DaemonState>>,
+    Extension(authorized): Extension<AuthorizedRequest>,
+    Extension(authority): Extension<MutationAuthority>,
+    ApiJson(request): ApiJson<SetupVerificationRequest>,
+) -> Response {
+    let service = Arc::clone(&state.service);
+    let model_alias = request.model_alias().map(str::to_string);
+    let provider_alias = request.provider_alias().map(str::to_string);
+    let model_from_project = request.model_from_project();
+    let provider_from_project = request.provider_from_project();
+    let experimental_provider_computer_use = request.experimental_provider_computer_use();
+    let verification = match tokio::task::spawn_blocking(move || {
+        service.verify_setup_idempotent(
+            &authority,
+            model_alias.as_deref(),
+            provider_alias.as_deref(),
+            model_from_project,
+            provider_from_project,
+            experimental_provider_computer_use,
+        )
+    })
+    .await
+    {
+        Ok(Ok(verification)) => verification,
+        Ok(Err(error)) => return host_error::response(&state, &authorized, &error),
+        Err(_) => return host_error::task_failure(&state, &authorized),
+    };
+    let response = SetupVerificationResponse::new(
+        authorized.request_id().clone(),
+        state.host_identity.clone(),
+        verification,
+    );
+    authenticated_json_response(
+        StatusCode::OK,
+        &response,
+        authorized.request_id(),
+        &state.host_identity,
+    )
+}
+
+pub(super) async fn invalidate_native_readiness(
+    State(state): State<Arc<DaemonState>>,
+    Extension(authorized): Extension<AuthorizedRequest>,
+    Extension(authority): Extension<MutationAuthority>,
+    ApiJson(request): ApiJson<NativeReadinessInvalidationRequest>,
+) -> Response {
+    let service = Arc::clone(&state.service);
+    let model_alias = request.model_alias().map(str::to_string);
+    let provider_alias = request.provider_alias().map(str::to_string);
+    let model_from_project = request.model_from_project();
+    let provider_from_project = request.provider_from_project();
+    let experimental_provider_computer_use = request.experimental_provider_computer_use();
+    let deleted = match tokio::task::spawn_blocking(move || {
+        service.invalidate_native_readiness_idempotent(
+            &authority,
+            model_alias.as_deref(),
+            provider_alias.as_deref(),
+            model_from_project,
+            provider_from_project,
+            experimental_provider_computer_use,
+        )
+    })
+    .await
+    {
+        Ok(Ok(deleted)) => deleted,
+        Ok(Err(error)) => return host_error::response(&state, &authorized, &error),
+        Err(_) => return host_error::task_failure(&state, &authorized),
+    };
+    let response = NativeReadinessInvalidationResponse::new(
+        authorized.request_id().clone(),
+        state.host_identity.clone(),
+        deleted,
+    );
+    authenticated_json_response(
+        StatusCode::OK,
+        &response,
+        authorized.request_id(),
+        &state.host_identity,
+    )
 }
 
 pub(super) async fn validate_provider_descriptor(
@@ -81,6 +188,475 @@ pub(super) async fn validate_provider_descriptor(
         &response,
         authorized.request_id(),
         &state.host_identity,
+    )
+}
+
+pub(super) async fn preview_provider_secret_provisioning(
+    State(state): State<Arc<DaemonState>>,
+    Extension(authorized): Extension<AuthorizedRequest>,
+    Extension(authority): Extension<MutationAuthority>,
+    ApiJson(request): ApiJson<ProviderSecretProvisioningMetadata>,
+) -> Response {
+    let request_digest = match serde_json::to_vec(&request) {
+        Ok(bytes) => Sha256::digest(bytes).into(),
+        Err(_) => return host_error::task_failure(&state, &authorized),
+    };
+    let now = OffsetDateTime::now_utc();
+    let replay = {
+        let mut uploads = match state.provider_secret_uploads.lock() {
+            Ok(uploads) => uploads,
+            Err(_) => return host_error::task_failure(&state, &authorized),
+        };
+        uploads.retain(|_, pending| pending.expires_at > now);
+        matching_pending_provider_secret_upload(
+            &uploads,
+            authorized.principal().token_id(),
+            authorized.principal().principal_ref(),
+            authorized.principal().credential_revision(),
+            authority.idempotency_key(),
+        )
+        .map(|pending| (pending.request_digest, pending.preview.clone()))
+    };
+    if let Some((original_digest, original_response)) = replay {
+        if original_digest != request_digest {
+            return idempotency_conflict(&state, &authorized);
+        }
+        return replay_provider_secret_preview(&state, &authorized, &original_response);
+    }
+
+    let service = Arc::clone(&state.service);
+    let authorization = request.authorization().clone();
+    let preview_authority = authority.clone();
+    let preview = match tokio::task::spawn_blocking(move || {
+        service.preview_provider_secret_provisioning(
+            satelle_core::LOCAL_DEMO_HOST,
+            authorization,
+            &preview_authority,
+        )
+    })
+    .await
+    {
+        Ok(Ok(preview)) => preview,
+        Ok(Err(error)) => return host_error::response(&state, &authorized, &error),
+        Err(_) => return host_error::task_failure(&state, &authorized),
+    };
+    let now = OffsetDateTime::now_utc();
+    let expires_at = now + PROVIDER_SECRET_UPLOAD_TTL;
+    let expires_at_text = match expires_at.format(&Rfc3339) {
+        Ok(value) => value,
+        Err(_) => return host_error::task_failure(&state, &authorized),
+    };
+    let upload_id = crate::contract::RequestId::new().to_string();
+    let keypair = crate::provider_secret_crypto::generate_server_keypair();
+    let response = ProviderSecretProvisioningPreviewResponse::new(
+        authorized.request_id().clone(),
+        state.host_identity.clone(),
+        preview.destination_kind().to_string(),
+        preview.persistence_location_class().to_string(),
+        preview.overwrite_behavior().to_string(),
+        upload_id.clone(),
+        crate::provider_secret_crypto::encode_canonical_base64(&keypair.public_key),
+        expires_at_text,
+    );
+    let mut uploads = match state.provider_secret_uploads.lock() {
+        Ok(uploads) => uploads,
+        Err(_) => return host_error::task_failure(&state, &authorized),
+    };
+    uploads.retain(|_, pending| pending.expires_at > now);
+    if let Some(pending) = matching_pending_provider_secret_upload(
+        &uploads,
+        authorized.principal().token_id(),
+        authorized.principal().principal_ref(),
+        authorized.principal().credential_revision(),
+        authority.idempotency_key(),
+    ) {
+        if pending.request_digest != request_digest {
+            return idempotency_conflict(&state, &authorized);
+        }
+        let original_response = pending.preview.clone();
+        drop(uploads);
+        return replay_provider_secret_preview(&state, &authorized, &original_response);
+    }
+    if uploads.len() >= MAX_PENDING_PROVIDER_SECRET_UPLOADS {
+        return provider_secret_request_failure(
+            &state,
+            &authorized,
+            StatusCode::CONFLICT,
+            ApiErrorCode::StateConflict,
+            ApiErrorCategory::Conflict,
+            "the Host has no provider-secret upload capacity",
+        );
+    }
+    uploads.insert(
+        upload_id,
+        PendingProviderSecretUpload {
+            preview: response.clone(),
+            metadata: request,
+            token_id: authorized.principal().token_id().to_string(),
+            principal_ref: authorized.principal().principal_ref().to_string(),
+            credential_revision: authorized.principal().credential_revision(),
+            idempotency_key: authority.idempotency_key().to_string(),
+            request_digest,
+            expires_at,
+            private_key: keypair.private_key,
+        },
+    );
+    drop(uploads);
+    authenticated_json_response(
+        StatusCode::OK,
+        &response,
+        authorized.request_id(),
+        &state.host_identity,
+    )
+}
+
+fn matching_pending_provider_secret_upload<'a>(
+    uploads: &'a HashMap<String, PendingProviderSecretUpload>,
+    token_id: &str,
+    principal_ref: &str,
+    credential_revision: u64,
+    idempotency_key: &str,
+) -> Option<&'a PendingProviderSecretUpload> {
+    uploads.values().find(|pending| {
+        pending.token_id == token_id
+            && pending.principal_ref == principal_ref
+            && pending.credential_revision == credential_revision
+            && pending.idempotency_key == idempotency_key
+    })
+}
+
+fn replay_provider_secret_preview(
+    state: &DaemonState,
+    authorized: &AuthorizedRequest,
+    original: &ProviderSecretProvisioningPreviewResponse,
+) -> Response {
+    let response = ProviderSecretProvisioningPreviewResponse::new(
+        authorized.request_id().clone(),
+        original.host_identity().to_string(),
+        original.destination_kind(),
+        original.persistence_location_class(),
+        original.overwrite_behavior(),
+        original.upload_id(),
+        original.recipient_public_key(),
+        original.expires_at(),
+    );
+    authenticated_json_response(
+        StatusCode::OK,
+        &response,
+        authorized.request_id(),
+        &state.host_identity,
+    )
+}
+
+pub(super) async fn provision_provider_secret(
+    State(state): State<Arc<DaemonState>>,
+    Extension(authorized): Extension<AuthorizedRequest>,
+    Extension(authority): Extension<MutationAuthority>,
+    request: Request,
+) -> Response {
+    if let Err(failure) = require_provider_secret_content_type(request.headers()) {
+        return api_error_response(
+            authorized.request_id().clone(),
+            Some(state.host_identity.clone()),
+            failure,
+        );
+    }
+
+    let body = match tokio::time::timeout(
+        auth::REQUEST_BODY_READ_TIMEOUT,
+        read_bounded_body(request.into_body(), MAX_PROVIDER_SECRET_ENVELOPE_BYTES),
+    )
+    .await
+    {
+        Ok(Ok(body)) if !body.bytes.is_empty() => body,
+        Ok(Ok(_)) => {
+            return provider_secret_request_failure(
+                &state,
+                &authorized,
+                StatusCode::BAD_REQUEST,
+                ApiErrorCode::InvalidRequest,
+                ApiErrorCategory::InvalidRequest,
+                "the provider secret body must not be empty",
+            );
+        }
+        Ok(Err(BoundedBodyError::TooLarge)) => {
+            return provider_secret_request_failure(
+                &state,
+                &authorized,
+                StatusCode::PAYLOAD_TOO_LARGE,
+                ApiErrorCode::PayloadTooLarge,
+                ApiErrorCategory::Capacity,
+                "the provider secret body exceeds the accepted limit",
+            );
+        }
+        Ok(Err(BoundedBodyError::Read)) => {
+            return provider_secret_request_failure(
+                &state,
+                &authorized,
+                StatusCode::BAD_REQUEST,
+                ApiErrorCode::InvalidRequest,
+                ApiErrorCategory::InvalidRequest,
+                "the provider secret body could not be read",
+            );
+        }
+        Err(_) => {
+            return provider_secret_request_failure(
+                &state,
+                &authorized,
+                StatusCode::REQUEST_TIMEOUT,
+                ApiErrorCode::InvalidRequest,
+                ApiErrorCategory::InvalidRequest,
+                "the provider secret body was not received before the deadline",
+            );
+        }
+    };
+    if body
+        .trailers
+        .as_ref()
+        .is_some_and(auth::trailers_have_disallowed_bearer_carrier)
+    {
+        return auth::disallowed_bearer_token_carrier(
+            Some(state.host_identity.clone()),
+            authorized.request_id().clone(),
+        );
+    }
+    let envelope_digest = Sha256::digest(&body.bytes)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    let envelope: ProviderSecretUploadEnvelope = match serde_json::from_slice(&body.bytes) {
+        Ok(envelope) => envelope,
+        Err(_) => {
+            return provider_secret_request_failure(
+                &state,
+                &authorized,
+                StatusCode::BAD_REQUEST,
+                ApiErrorCode::InvalidRequest,
+                ApiErrorCategory::InvalidRequest,
+                "the provider secret upload envelope is invalid",
+            );
+        }
+    };
+    let service = Arc::clone(&state.service);
+    let replay_authorization = envelope.metadata().authorization().clone();
+    let replay_overwrite_authorized = envelope.metadata().overwrite_authorized();
+    let replay_envelope_digest = envelope_digest.clone();
+    let replay_authority = authority.clone();
+    let replay = match tokio::task::spawn_blocking(move || {
+        service.replay_provider_secret_provisioning_idempotent(
+            satelle_core::LOCAL_DEMO_HOST,
+            replay_authorization,
+            replay_overwrite_authorized,
+            &replay_envelope_digest,
+            &replay_authority,
+        )
+    })
+    .await
+    {
+        Ok(Ok(replay)) => replay,
+        Ok(Err(error)) => return host_error::response(&state, &authorized, &error),
+        Err(_) => return host_error::task_failure(&state, &authorized),
+    };
+    if let Some(report) = replay {
+        let response = ProviderSecretProvisioningResponse::new(
+            authorized.request_id().clone(),
+            state.host_identity.clone(),
+            report.destination_kind().to_string(),
+            report.overwritten(),
+            report.validation_status(),
+        );
+        return authenticated_json_response(
+            StatusCode::OK,
+            &response,
+            authorized.request_id(),
+            &state.host_identity,
+        );
+    }
+
+    // Removing the grant is the single-use claim. From this point every
+    // outcome consumes it, including an invalid ciphertext.
+    let pending = match state.provider_secret_uploads.lock() {
+        Ok(mut uploads) => uploads.remove(envelope.upload_id()),
+        Err(_) => return host_error::task_failure(&state, &authorized),
+    };
+    let Some(pending) = pending else {
+        return provider_secret_request_failure(
+            &state,
+            &authorized,
+            StatusCode::CONFLICT,
+            ApiErrorCode::StateConflict,
+            ApiErrorCategory::Conflict,
+            "the provider secret upload grant is unavailable",
+        );
+    };
+    let now = OffsetDateTime::now_utc();
+    if pending.expires_at <= now
+        || pending.preview.host_identity() != state.host_identity
+        || envelope.host_identity() != pending.preview.host_identity()
+        || envelope.expires_at() != pending.preview.expires_at()
+        || envelope.metadata() != &pending.metadata
+        || pending.token_id != authorized.principal().token_id()
+        || pending.principal_ref != authorized.principal().principal_ref()
+        || pending.credential_revision != authorized.principal().credential_revision()
+        || pending.idempotency_key != authority.idempotency_key()
+    {
+        return provider_secret_request_failure(
+            &state,
+            &authorized,
+            StatusCode::CONFLICT,
+            ApiErrorCode::StateConflict,
+            ApiErrorCategory::Conflict,
+            "the provider secret upload grant does not match this request",
+        );
+    }
+    let aad = match provider_secret_upload_aad(
+        &pending.preview,
+        &pending.metadata,
+        &pending.token_id,
+        &pending.idempotency_key,
+    ) {
+        Ok(aad) => aad,
+        Err(_) => return host_error::task_failure(&state, &authorized),
+    };
+    let encapsulated_key =
+        match crate::provider_secret_crypto::decode_canonical_base64(envelope.encapsulated_key()) {
+            Ok(value) => value,
+            Err(_) => {
+                return provider_secret_request_failure(
+                    &state,
+                    &authorized,
+                    StatusCode::BAD_REQUEST,
+                    ApiErrorCode::InvalidRequest,
+                    ApiErrorCategory::InvalidRequest,
+                    "the provider secret upload envelope is invalid",
+                );
+            }
+        };
+    let ciphertext =
+        match crate::provider_secret_crypto::decode_canonical_base64(envelope.ciphertext()) {
+            Ok(value) => value,
+            Err(_) => {
+                return provider_secret_request_failure(
+                    &state,
+                    &authorized,
+                    StatusCode::BAD_REQUEST,
+                    ApiErrorCode::InvalidRequest,
+                    ApiErrorCategory::InvalidRequest,
+                    "the provider secret upload envelope is invalid",
+                );
+            }
+        };
+    let mut secret_bytes = match crate::provider_secret_crypto::decrypt_provider_secret(
+        pending.private_key.as_slice(),
+        PROVIDER_SECRET_UPLOAD_INFO,
+        aad.as_slice(),
+        encapsulated_key.as_slice(),
+        ciphertext.as_slice(),
+    ) {
+        Ok(secret) if !secret.is_empty() && secret.len() <= MAX_PROVIDER_SECRET_BYTES => secret,
+        _ => {
+            return provider_secret_request_failure(
+                &state,
+                &authorized,
+                StatusCode::BAD_REQUEST,
+                ApiErrorCode::InvalidRequest,
+                ApiErrorCategory::InvalidRequest,
+                "the provider secret upload envelope could not be opened",
+            );
+        }
+    };
+    let secret = match String::from_utf8(std::mem::take(&mut *secret_bytes)) {
+        Ok(secret) => Zeroizing::new(secret),
+        Err(error) => {
+            let mut invalid = error.into_bytes();
+            invalid.zeroize();
+            return provider_secret_request_failure(
+                &state,
+                &authorized,
+                StatusCode::BAD_REQUEST,
+                ApiErrorCode::InvalidRequest,
+                ApiErrorCategory::InvalidRequest,
+                "the provider secret body must be valid UTF-8",
+            );
+        }
+    };
+
+    let service = Arc::clone(&state.service);
+    let overwrite_authorized = pending.metadata.overwrite_authorized();
+    let authorization = pending.metadata.into_authorization();
+    let report = match tokio::task::spawn_blocking(move || {
+        service.provision_provider_secret_idempotent(
+            satelle_core::LOCAL_DEMO_HOST,
+            authorization,
+            secret,
+            overwrite_authorized,
+            &envelope_digest,
+            &authority,
+        )
+    })
+    .await
+    {
+        Ok(Ok(report)) => report,
+        Ok(Err(error)) => return host_error::response(&state, &authorized, &error),
+        Err(_) => return host_error::task_failure(&state, &authorized),
+    };
+    let response = ProviderSecretProvisioningResponse::new(
+        authorized.request_id().clone(),
+        state.host_identity.clone(),
+        report.destination_kind().to_string(),
+        report.overwritten(),
+        report.validation_status(),
+    );
+    authenticated_json_response(
+        StatusCode::OK,
+        &response,
+        authorized.request_id(),
+        &state.host_identity,
+    )
+}
+
+fn require_provider_secret_content_type(headers: &HeaderMap) -> Result<(), ApiFailure> {
+    let mut values = headers.get_all(CONTENT_TYPE).iter();
+    let content_type = values
+        .next()
+        .and_then(|value| value.to_str().ok())
+        .ok_or_else(unsupported_provider_secret_content_type)?;
+    if values.next().is_some() || content_type != PROVIDER_SECRET_UPLOAD_CONTENT_TYPE {
+        return Err(unsupported_provider_secret_content_type());
+    }
+    Ok(())
+}
+
+fn unsupported_provider_secret_content_type() -> ApiFailure {
+    ApiFailure {
+        status: StatusCode::UNSUPPORTED_MEDIA_TYPE,
+        code: ApiErrorCode::UnsupportedContentType,
+        category: ApiErrorCategory::InvalidRequest,
+        retryable: false,
+        message: "provider secrets require the encrypted provider-secret upload content type",
+        details: None,
+    }
+}
+
+fn provider_secret_request_failure(
+    state: &DaemonState,
+    authorized: &AuthorizedRequest,
+    status: StatusCode,
+    code: ApiErrorCode,
+    category: ApiErrorCategory,
+    message: &'static str,
+) -> Response {
+    api_error_response(
+        authorized.request_id().clone(),
+        Some(state.host_identity.clone()),
+        ApiFailure {
+            status,
+            code,
+            category,
+            retryable: false,
+            message,
+            details: None,
+        },
     )
 }
 

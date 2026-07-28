@@ -88,6 +88,30 @@ fn failure(error: &SatelleError) -> ApiFailure {
             message: "the provider configuration cannot admit this operation",
             details: None,
         },
+        ErrorCode::ProviderSecretSourceRequired => ApiFailure {
+            status: StatusCode::BAD_REQUEST,
+            code: ApiErrorCode::ProviderSecretSourceRequired,
+            category: ApiErrorCategory::InvalidRequest,
+            retryable: false,
+            message: "provider authentication requires a Secret Source descriptor",
+            details: None,
+        },
+        ErrorCode::ProviderSecretProvisioningRequired => ApiFailure {
+            status: StatusCode::BAD_REQUEST,
+            code: ApiErrorCode::ProviderSecretProvisioningRequired,
+            category: ApiErrorCategory::InvalidRequest,
+            retryable: false,
+            message: "provider authentication requires interactive secret provisioning",
+            details: None,
+        },
+        ErrorCode::ProviderSecretOverwriteRequired => ApiFailure {
+            status: StatusCode::CONFLICT,
+            code: ApiErrorCode::ProviderSecretOverwriteRequired,
+            category: ApiErrorCategory::InvalidRequest,
+            retryable: false,
+            message: "provider secret replacement requires explicit confirmation",
+            details: None,
+        },
         ErrorCode::ModelProviderBindingMissing => ApiFailure {
             status: StatusCode::BAD_REQUEST,
             code: ApiErrorCode::ModelProviderBindingMissing,
@@ -187,7 +211,9 @@ fn failure(error: &SatelleError) -> ApiFailure {
             message: "the Codex control plane cannot admit this operation",
             details: validated_control_plane_details(error),
         },
-        ErrorCode::ComputerUseNotReady | ErrorCode::DoctorReadinessBlockersFound => ApiFailure {
+        ErrorCode::ComputerUseNotReady
+        | ErrorCode::DoctorReadinessBlockersFound
+        | ErrorCode::SetupVerificationFailed => ApiFailure {
             status: StatusCode::SERVICE_UNAVAILABLE,
             code: ApiErrorCode::ComputerUseNotReady,
             category: ApiErrorCategory::Readiness,
