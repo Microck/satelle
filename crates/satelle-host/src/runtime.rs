@@ -3203,9 +3203,18 @@ impl RuntimeHandle {
         host: &str,
         provider_intent: &ProviderComputerUseIntent,
     ) -> Result<ReadinessEvidence, SatelleError> {
+        let cancellation = AdmissionCancellation::new();
+        self.refresh_setup_native_readiness_with_cancellation(host, provider_intent, &cancellation)
+    }
+
+    pub(crate) fn refresh_setup_native_readiness_with_cancellation(
+        &self,
+        host: &str,
+        provider_intent: &ProviderComputerUseIntent,
+        cancellation: &AdmissionCancellation,
+    ) -> Result<ReadinessEvidence, SatelleError> {
         let _activity = self.activity.begin();
         let engine = self.engine()?;
-        let cancellation = AdmissionCancellation::new();
         let provider_intent = provider_intent.clone().with_refresh(true);
         let key = engine
             .adapter
@@ -3216,25 +3225,22 @@ impl RuntimeHandle {
             .as_ref()
             .ok_or_else(SatelleError::computer_use_not_ready)?;
         engine.reconcile_readiness_probe(&key, driver.as_ref(), ReadinessProbeKind::Native)?;
-        engine.run_live_native_probe(&key, driver.as_ref(), &cancellation)
+        engine.run_live_native_probe(&key, driver.as_ref(), cancellation)
     }
 
     /// Runs provider authorization and a live provider smoke probe using the
     /// native evidence returned by `refresh_setup_native_readiness`.
-    pub(crate) fn refresh_setup_provider_readiness(
+    pub(crate) fn refresh_setup_provider_readiness_with_cancellation(
         &self,
         host: &str,
         provider_intent: &ProviderComputerUseIntent,
         native: ReadinessEvidence,
+        cancellation: &AdmissionCancellation,
     ) -> Result<AdapterReadiness, SatelleError> {
         let _activity = self.activity.begin();
         let intent = provider_intent.clone().with_refresh(true);
-        self.engine()?.preflight_with_native(
-            host,
-            &intent,
-            &AdmissionCancellation::new(),
-            Some(native),
-        )
+        self.engine()?
+            .preflight_with_native(host, &intent, cancellation, Some(native))
     }
 
     pub(crate) fn resolve_provider_binding(

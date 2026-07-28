@@ -305,7 +305,14 @@ impl DoctorProbeScheduler {
         }
 
         for scheduled_probe in scheduled.values() {
+            let mut unique_dependencies = BTreeSet::new();
             for dependency in &scheduled_probe.definition.dependencies {
+                if !unique_dependencies.insert(dependency) {
+                    return Err(DoctorProbeScheduleError::DuplicateDependency {
+                        probe_id: scheduled_probe.definition.probe_id.clone(),
+                        dependency: dependency.clone(),
+                    });
+                }
                 if !scheduled.contains_key(dependency) {
                     return Err(DoctorProbeScheduleError::UnknownDependency {
                         probe_id: scheduled_probe.definition.probe_id.clone(),
@@ -430,9 +437,21 @@ impl DoctorProbeScheduler {
             timed_out: bool,
         }
 
+        enum WorkerResult {
+            Completed {
+                probe_id: String,
+                completion: DoctorProbeCompletion,
+                completed_at: Instant,
+            },
+            Panicked {
+                probe_id: String,
+                payload: Box<dyn std::any::Any + Send>,
+            },
+        }
+
         let mut records = Vec::new();
         std::thread::scope(|scope| {
-            let (sender, receiver) = mpsc::channel::<(String, DoctorProbeCompletion)>();
+            let (sender, receiver) = mpsc::channel::<WorkerResult>();
             let mut running = BTreeMap::<String, RunningProbe>::new();
 
             while !self.is_complete() {
@@ -455,8 +474,18 @@ impl DoctorProbeScheduler {
                         },
                     );
                     scope.spawn(move || {
-                        let completion = execute(&probe, &context);
-                        let _ = sender.send((probe_id, completion));
+                        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            execute(&probe, &context)
+                        }));
+                        let result = match result {
+                            Ok(completion) => WorkerResult::Completed {
+                                probe_id,
+                                completion,
+                                completed_at: Instant::now(),
+                            },
+                            Err(payload) => WorkerResult::Panicked { probe_id, payload },
+                        };
+                        let _ = sender.send(result);
                     });
                 }
 
@@ -484,12 +513,16 @@ impl DoctorProbeScheduler {
                 };
 
                 match received {
-                    Ok((probe_id, completion)) => {
+                    Ok(WorkerResult::Completed {
+                        probe_id,
+                        completion,
+                        completed_at,
+                    }) => {
                         let running_probe = running
                             .remove(&probe_id)
                             .expect("only running Doctor probes can complete");
                         let timed_out =
-                            running_probe.timed_out || Instant::now() >= running_probe.deadline;
+                            completion_missed_deadline(completed_at, running_probe.deadline);
                         let final_completion = if timed_out {
                             DoctorProbeCompletion::new(
                                 DoctorProbeStatus::TimedOut,
@@ -502,6 +535,13 @@ impl DoctorProbeScheduler {
                         self.finish(&probe_id, final_completion)
                             .expect("the completed Doctor probe is running");
                         records.push(DoctorProbeExecutionRecord { probe_id, status });
+                    }
+                    Ok(WorkerResult::Panicked { probe_id, payload }) => {
+                        running.remove(&probe_id);
+                        for probe in running.values() {
+                            probe.cancelled.store(true, Ordering::Release);
+                        }
+                        std::panic::resume_unwind(payload);
                     }
                     Err(mpsc::RecvTimeoutError::Timeout) => {
                         let now = Instant::now();
@@ -589,6 +629,10 @@ impl DoctorProbeScheduler {
     }
 }
 
+fn completion_missed_deadline(completed_at: Instant, deadline: Instant) -> bool {
+    completed_at >= deadline
+}
+
 fn validate_acyclic(
     probes: &BTreeMap<String, ScheduledProbe>,
 ) -> Result<(), DoctorProbeScheduleError> {
@@ -635,6 +679,11 @@ pub enum DoctorProbeScheduleError {
     ZeroTimeout { probe_id: String },
     #[error("doctor probe id '{probe_id}' is duplicated")]
     DuplicateProbeId { probe_id: String },
+    #[error("doctor probe '{probe_id}' repeats dependency '{dependency}'")]
+    DuplicateDependency {
+        probe_id: String,
+        dependency: String,
+    },
     #[error("doctor probe '{probe_id}' depends on unknown probe '{dependency}'")]
     UnknownDependency {
         probe_id: String,
@@ -1037,5 +1086,44 @@ mod tests {
                 if blocking_probe_id == "z-child"
         ));
         assert!(scheduler.is_complete());
+    }
+
+    #[test]
+    fn duplicate_dependencies_are_rejected_at_the_scheduler_boundary() {
+        assert_eq!(
+            DoctorProbeScheduler::new(vec![
+                probe("root", "codex", &[], &[]),
+                probe("dependent", "computer-use", &["root", "root"], &[]),
+            ])
+            .unwrap_err(),
+            DoctorProbeScheduleError::DuplicateDependency {
+                probe_id: "dependent".to_string(),
+                dependency: "root".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn worker_panics_propagate_without_waiting_for_channel_disconnect() {
+        let mut scheduler =
+            DoctorProbeScheduler::new(vec![probe("panic", "codex", &[], &[])]).unwrap();
+
+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            scheduler.execute(|_, _| panic!("packet-17 probe panic"));
+        }))
+        .expect_err("the probe panic must propagate through execute");
+
+        assert_eq!(panic.downcast_ref::<&str>(), Some(&"packet-17 probe panic"));
+    }
+
+    #[test]
+    fn timeout_classification_uses_worker_completion_time() {
+        let deadline = Instant::now() + Duration::from_secs(1);
+
+        assert!(!completion_missed_deadline(
+            deadline - Duration::from_nanos(1),
+            deadline,
+        ));
+        assert!(completion_missed_deadline(deadline, deadline));
     }
 }

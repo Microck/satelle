@@ -6111,6 +6111,7 @@ pub enum DoctorSchemaVersion {
 pub struct DoctorOptions {
     refresh: bool,
     probe_timeout: Option<std::time::Duration>,
+    serial_probes: bool,
 }
 
 impl DoctorOptions {
@@ -6118,7 +6119,13 @@ impl DoctorOptions {
         Self {
             refresh,
             probe_timeout,
+            serial_probes: false,
         }
+    }
+
+    pub const fn with_serial_probes(mut self, serial_probes: bool) -> Self {
+        self.serial_probes = serial_probes;
+        self
     }
 
     pub const fn refresh(self) -> bool {
@@ -6127,6 +6134,10 @@ impl DoctorOptions {
 
     pub const fn probe_timeout(self) -> Option<std::time::Duration> {
         self.probe_timeout
+    }
+
+    pub const fn serial_probes(self) -> bool {
+        self.serial_probes
     }
 }
 

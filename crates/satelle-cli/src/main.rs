@@ -4119,7 +4119,8 @@ fn run_doctor(
         return emit_doctor_report(report, command.events, json);
     }
     let transport = transport_for(&host)?;
-    let options = DoctorOptions::new(command.refresh, timeout);
+    let options =
+        DoctorOptions::new(command.refresh, timeout).with_serial_probes(command.serial_probes);
     let provider_intent = doctor_provider_intent(
         resolved_config,
         &host.config,
