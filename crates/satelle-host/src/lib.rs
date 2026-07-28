@@ -1676,10 +1676,14 @@ impl HostService {
     /// before any listener can expose the new daemon.
     pub fn commit_fresh_ssh_host_identity(
         state_root: &Path,
-        identity: &satelle_core::session::HostIdentityRef,
-        operation_id: &str,
+        record: &satelle_core::SshIdentityCommitRecord,
     ) -> Result<satelle_core::session::HostIdentityRef, SatelleError> {
-        Storage::commit_fresh_ssh_host_identity(state_root, identity, operation_id)
+        let executing_artifact = std::env::current_exe().map_err(|error| {
+            SatelleError::invalid_usage(format!(
+                "could not identify the fresh SSH Host artifact: {error}"
+            ))
+        })?;
+        Storage::commit_fresh_ssh_host_identity(state_root, record, &executing_artifact)
             .map_err(runtime::storage_error)
     }
 
@@ -1687,14 +1691,6 @@ impl HostService {
     /// fail closed instead of opening the partially initialized store.
     pub fn fresh_ssh_identity_commit_pending(state_root: &Path) -> Result<bool, SatelleError> {
         Storage::fresh_ssh_identity_commit_pending(state_root).map_err(runtime::storage_error)
-    }
-
-    /// Reads only a valid owner-only unfinished SSH identity intent. It never
-    /// opens SQLite or initializes Host state.
-    pub fn inspect_fresh_ssh_identity_commit(
-        state_root: &Path,
-    ) -> Result<Option<(String, satelle_core::session::HostIdentityRef)>, SatelleError> {
-        Storage::inspect_fresh_ssh_identity_commit(state_root).map_err(runtime::storage_error)
     }
 
     /// Reports whether this service owns a process-local SSH bootstrap

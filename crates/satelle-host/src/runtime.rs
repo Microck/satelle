@@ -2496,11 +2496,17 @@ impl RuntimeHandle {
         finished_at: time::OffsetDateTime,
     ) -> Result<SetupRunStatus, SatelleError> {
         let engine = self.engine()?;
-        let guard = operation.operation().map_err(model::storage_failure)?;
-        let status = engine
-            .lock_storage()?
-            .complete_bootstrap_maintenance(guard.capability(), finished_at)
-            .map_err(model::storage_failure)?;
+        let operation_id = operation.operation_id().to_string();
+        let status = {
+            let guard = operation.operation().map_err(model::storage_failure)?;
+            let mut storage = engine.lock_storage()?;
+            storage
+                .finalize_fresh_ssh_identity_commit(&operation_id)
+                .map_err(model::storage_failure)?;
+            storage
+                .complete_bootstrap_maintenance(guard.capability(), finished_at)
+                .map_err(model::storage_failure)?
+        };
         operation.disarm();
         Ok(status)
     }

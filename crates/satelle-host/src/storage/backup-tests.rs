@@ -1,4 +1,5 @@
 use super::*;
+use std::error::Error as _;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -499,7 +500,7 @@ fn write_distinct_active_sidecars(fixture: &BackupFixture) -> Vec<(String, Vec<u
         .iter()
         .enumerate()
         .map(|(index, file_name)| {
-            let bytes = format!("sidecar-{index}-{}", Uuid::now_v7()).into_bytes();
+            let bytes = format!("deterministic-active-sidecar-{index}").into_bytes();
             write_private_file(&fixture.state_root.join(file_name), &bytes);
             ((*file_name).to_owned(), bytes)
         })
@@ -799,9 +800,106 @@ fn activation_moves_byte_distinct_sidecars_to_durable_failed_names() {
 
 #[test]
 fn activation_errors_restore_active_sidecars() {
+    for injected_failure in [
+        ActivationStep::SidecarRenamedBeforeSync(0),
+        ActivationStep::SidecarRenamedBeforeSync(1),
+        ActivationStep::SidecarRenamedBeforeSync(2),
+        ActivationStep::SidecarMovedDurably(0),
+        ActivationStep::SidecarMovedDurably(1),
+        ActivationStep::SidecarMovedDurably(2),
+        ActivationStep::SidecarsMovedDurably,
+    ] {
+        let fixture = BackupFixture::new(1);
+        let active_store = fs::read(fixture.state_root.join(DATABASE_FILE_NAME))
+            .expect("read active primary before sidecar interruption");
+        let state_directory = fixture.state_directory();
+        let active_store_identity =
+            open_private_leaf_identity(&state_directory, DATABASE_FILE_NAME)
+                .expect("inspect active primary")
+                .expect("active primary exists");
+        let sidecars = write_distinct_active_sidecars(&fixture);
+        let sidecar_identities = sidecars
+            .iter()
+            .map(|(file_name, _)| {
+                open_private_leaf_identity(&state_directory, file_name)
+                    .expect("inspect active sidecar")
+                    .expect("active sidecar exists")
+            })
+            .collect::<Vec<_>>();
+        let validated = validate_migration_backup(
+            &fixture.state_root,
+            &state_directory,
+            fixture.backup_file_name(),
+        )
+        .expect("validate backup");
+
+        let error = activate_migration_backup_with_hook(
+            &fixture.state_root,
+            &state_directory,
+            &validated,
+            |step| {
+                if step == injected_failure {
+                    Err(StorageError::for_test(StorageErrorKind::OperationFailed))
+                } else {
+                    Ok(())
+                }
+            },
+        )
+        .expect_err("interrupt during the deterministic sidecar move sequence");
+
+        assert_eq!(StorageErrorKind::OperationFailed, error.kind());
+        assert!(
+            error.source().is_none(),
+            "successful recovery preserves the original activation error"
+        );
+        assert_eq!(
+            active_store,
+            fs::read(fixture.state_root.join(DATABASE_FILE_NAME))
+                .expect("read unchanged active primary")
+        );
+        assert_eq!(
+            Some(active_store_identity),
+            open_private_leaf_identity(&state_directory, DATABASE_FILE_NAME)
+                .expect("inspect restored active primary")
+        );
+        let files = existing_files(&fixture.state_root);
+        assert!(files.iter().any(|name| name.ends_with(".staged")));
+        for ((active_name, expected_bytes), expected_identity) in
+            sidecars.iter().zip(&sidecar_identities)
+        {
+            assert_eq!(
+                expected_bytes,
+                &fs::read(fixture.state_root.join(active_name))
+                    .expect("read restored active sidecar")
+            );
+            assert_eq!(
+                Some(*expected_identity),
+                open_private_leaf_identity(&state_directory, active_name)
+                    .expect("inspect restored active sidecar")
+            );
+        }
+        assert!(!files.iter().any(|name| {
+            name.starts_with("satelle.sqlite3.failed-")
+                && (name.ends_with("-wal") || name.ends_with("-shm") || name.ends_with("-journal"))
+        }));
+        let reopened = Connection::open(fixture.state_root.join(DATABASE_FILE_NAME))
+            .expect("reopen the restored DB and sidecar namespace");
+        assert_eq!(
+            reopened
+                .query_row("PRAGMA integrity_check", [], |row| row.get::<_, String>(0))
+                .expect("check the restored active database"),
+            "ok"
+        );
+        drop(reopened);
+        validate_migration_backup(
+            &fixture.state_root,
+            &state_directory,
+            fixture.backup_file_name(),
+        )
+        .expect("original restore point remains valid");
+    }
+
     let fixture = BackupFixture::new(1);
-    let active_store: &[u8] = b"active primary before sidecar move interruption";
-    replace_active_store_with_marker(&fixture, active_store);
     let sidecars = write_distinct_active_sidecars(&fixture);
     let state_directory = fixture.state_directory();
     let validated = validate_migration_backup(
@@ -809,45 +907,45 @@ fn activation_errors_restore_active_sidecars() {
         &state_directory,
         fixture.backup_file_name(),
     )
-    .expect("validate backup");
-
+    .expect("validate backup for identity-conflicted recovery");
     let error = activate_migration_backup_with_hook(
         &fixture.state_root,
         &state_directory,
         &validated,
         |step| {
-            if step == ActivationStep::SidecarsMovedDurably {
+            if step == ActivationStep::SidecarRenamedBeforeSync(0) {
+                let failed_name = existing_files(&fixture.state_root)
+                    .into_iter()
+                    .find(|name| {
+                        name.starts_with("satelle.sqlite3.failed-") && name.ends_with("-wal")
+                    })
+                    .expect("renamed WAL sidecar");
+                fs::rename(
+                    fixture.state_root.join(&failed_name),
+                    fixture
+                        .state_root
+                        .join(format!("{failed_name}.identity-evidence")),
+                )
+                .expect("preserve displaced original sidecar identity");
+                write_private_file(
+                    &fixture.state_root.join(&sidecars[0].0),
+                    b"identity-distinct canonical sidecar",
+                );
                 Err(StorageError::for_test(StorageErrorKind::OperationFailed))
             } else {
                 Ok(())
             }
         },
     )
-    .expect_err("interrupt after durable sidecar moves");
-
+    .expect_err("reject recovery through an unproven canonical identity");
     assert_eq!(StorageErrorKind::OperationFailed, error.kind());
     assert_eq!(
-        active_store,
-        fs::read(fixture.state_root.join(DATABASE_FILE_NAME)).expect("read active primary")
+        error
+            .source()
+            .expect("combined activation and recovery error")
+            .to_string(),
+        "activation failed: the Satelle storage operation failed; recovery failed: the stored Satelle lifecycle state changed concurrently"
     );
-    let files = existing_files(&fixture.state_root);
-    assert!(files.iter().any(|name| name.ends_with(".staged")));
-    for (active_name, expected_bytes) in sidecars {
-        assert_eq!(
-            expected_bytes,
-            fs::read(fixture.state_root.join(active_name)).expect("read restored active sidecar")
-        );
-    }
-    assert!(!files.iter().any(|name| {
-        name.starts_with("satelle.sqlite3.failed-")
-            && (name.ends_with("-wal") || name.ends_with("-shm"))
-    }));
-    validate_migration_backup(
-        &fixture.state_root,
-        &state_directory,
-        fixture.backup_file_name(),
-    )
-    .expect("original restore point remains valid");
 
     let fixture = BackupFixture::new(1);
     let sidecars = write_distinct_active_sidecars(&fixture);

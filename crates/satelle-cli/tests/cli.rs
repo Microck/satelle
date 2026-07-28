@@ -8229,6 +8229,94 @@ auth_source = "operator-auth"
 }
 
 #[test]
+fn resolved_existing_provider_credentials_are_reused_not_reported_as_provisioned() {
+    const CANARY: &str = "PRIVATE_RESOLVED_PROVIDER_SECRET_CANARY";
+
+    for source_kind in ["environment", "file"] {
+        let state = state_dir();
+        let user_config = state.path().join("user-config.toml");
+        let secret_file = state.path().join("existing-provider-secret");
+        let descriptor = if source_kind == "environment" {
+            "kind = \"environment\"\nvariable = \"PRIVATE_PROVIDER_TOKEN\"".to_string()
+        } else {
+            test_file::write_user_controlled(&secret_file, CANARY)
+                .expect("existing file credential should be owner controlled");
+            format!(
+                "kind = \"file\"\npath = \"{}\"",
+                secret_file.to_string_lossy().replace('\\', "\\\\")
+            )
+        };
+        write_user_config(
+            &user_config,
+            format!(
+                r#"
+default_host = "selected"
+model_alias = "review"
+provider_alias = "openai"
+
+[hosts.selected]
+transport = "local"
+adapter = "fake"
+
+[hosts.selected.experimental_provider_computer_use_by_provider]
+openai = true
+
+[hosts.selected.provider_auth.operator-auth]
+{descriptor}
+
+[hosts.selected.provider_bindings.openai.review]
+model = "gpt-5.2"
+model_provider = "openai"
+endpoint = "http://127.0.0.1:9"
+auth_source = "operator-auth"
+"#
+            ),
+        )
+        .expect("write existing provider credential config");
+
+        let mut command = satelle();
+        command
+            .env("SATELLE_CONFIG_FILE", &user_config)
+            .env("SATELLE_STATE_DIR", state.path())
+            .env(TEST_SUPPORT_ADAPTER_ENV, "resolved-secret-canary");
+        if source_kind == "environment" {
+            command.env("PRIVATE_PROVIDER_TOKEN", CANARY);
+        }
+        let output = command
+            .args([
+                "setup",
+                "--host",
+                "selected",
+                "--component",
+                "provider-auth",
+                "--no-input",
+                "--yes",
+                "--json",
+            ])
+            .assert()
+            .success()
+            .get_output()
+            .clone();
+        assert_command_canaries_are_absent(&output, &[CANARY]);
+        let report = parse_json_output(&output.stdout);
+        assert_eq!(report["descriptor_configured"], true);
+        assert_eq!(report["validation_status"], "resolved");
+        assert_eq!(report["readiness_summary"]["provider_auth"], "resolved");
+        assert_eq!(report["secret_provisioned"], false);
+        assert!(
+            report["applied_actions"]
+                .as_array()
+                .expect("applied actions should be an array")
+                .iter()
+                .all(|action| !action
+                    .as_str()
+                    .unwrap_or_default()
+                    .contains("provisioned and authorized"))
+        );
+    }
+}
+
+#[test]
 fn noninteractive_file_provisioning_is_typed_and_never_accepts_secret_bytes() {
     let state = state_dir();
     let user_config = state.path().join("user-config.toml");

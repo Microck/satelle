@@ -1,7 +1,7 @@
 use flate2::read::GzDecoder;
 use reqwest::blocking::{Client, Response};
 use satelle_core::session::HostIdentityRef;
-use satelle_core::{DaemonPathOverrides, HostConfig};
+use satelle_core::{DaemonPathOverrides, HostConfig, SshIdentityCommitRecord};
 use satelle_host::{ApiBearerToken, readiness_probe_timeouts};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -119,6 +119,7 @@ enum BootstrapLaunchMode<'a> {
     Durable,
     Fresh {
         initial_identity: InitialHostIdentityCommit<'a>,
+        remote_binary: &'a str,
     },
     Ephemeral {
         previous_host_config: &'a HostConfig,
@@ -153,7 +154,16 @@ impl<'a> BootstrapLaunchMode<'a> {
 
     const fn initial_identity(self) -> Option<InitialHostIdentityCommit<'a>> {
         match self {
-            Self::Fresh { initial_identity } => Some(initial_identity),
+            Self::Fresh {
+                initial_identity, ..
+            } => Some(initial_identity),
+            Self::Durable | Self::Ephemeral { .. } => None,
+        }
+    }
+
+    const fn remote_binary(self) -> Option<&'a str> {
+        match self {
+            Self::Fresh { remote_binary, .. } => Some(remote_binary),
             Self::Durable | Self::Ephemeral { .. } => None,
         }
     }
@@ -163,6 +173,7 @@ impl<'a> BootstrapLaunchMode<'a> {
 pub(super) struct InitialHostIdentityCommit<'a> {
     pub(super) host_identity: &'a HostIdentityRef,
     pub(super) operation_id: &'a str,
+    pub(super) record: &'a SshIdentityCommitRecord,
 }
 
 struct BootstrapStartContext<'a> {
@@ -501,6 +512,7 @@ impl SshBootstrapProcess {
         host_config: &HostConfig,
         bootstrap_scope: SshBootstrapScope,
         initial_identity: InitialHostIdentityCommit<'_>,
+        remote_binary: &str,
         bootstrap_lock: &mut SshBootstrapLock,
     ) -> Result<Self, SshBootstrapError> {
         Self::launch_bound(
@@ -508,7 +520,10 @@ impl SshBootstrapProcess {
             token,
             host_config,
             bootstrap_scope,
-            BootstrapLaunchMode::Fresh { initial_identity },
+            BootstrapLaunchMode::Fresh {
+                initial_identity,
+                remote_binary,
+            },
             bootstrap_lock,
         )
     }
@@ -527,18 +542,24 @@ impl SshBootstrapProcess {
             .release_host_config()
             .map(|previous_host_config| target.validated_daemon_environment(previous_host_config))
             .transpose()?;
-        let artifact = DownloadedArtifact::fetch(target)?;
-        let directory = target.remote_directory();
-        let remote_binary = upload_artifact(
-            destination,
-            target,
-            artifact.path(),
-            &directory,
-            artifact.release_digest(),
-            bootstrap_lock,
-        )?;
+        let remote_binary = if let Some(remote_binary) = launch_mode.remote_binary() {
+            remote_binary.to_string()
+        } else {
+            let artifact = DownloadedArtifact::fetch(target)?;
+            let directory = target.remote_directory();
+            upload_artifact(
+                destination,
+                target,
+                artifact.path(),
+                &directory,
+                artifact.release_digest(),
+                bootstrap_lock,
+            )?
+            .remote_path()
+            .to_string()
+        };
         let (release_command, start_command) = target.state_owner_handoff_commands(
-            remote_binary.remote_path(),
+            &remote_binary,
             release_environment.as_deref(),
             host_config,
             &environment,
@@ -722,18 +743,18 @@ pub(super) enum RemoteTarget {
 pub(super) enum InitialHostState {
     Fresh,
     Existing,
-    PendingIdentityCommit {
-        operation_id: String,
-        host_identity: HostIdentityRef,
-    },
+    PendingIdentityCommit(SshIdentityCommitRecord),
 }
 
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct SshIdentityCommitInspection {
-    schema_version: String,
-    operation_id: String,
-    host_identity: String,
+pub(super) struct PreparedIdentityOperation {
+    record: SshIdentityCommitRecord,
+    artifact: DownloadedArtifact,
+}
+
+impl PreparedIdentityOperation {
+    pub(super) fn record(&self) -> &SshIdentityCommitRecord {
+        &self.record
+    }
 }
 
 impl RemoteTarget {
@@ -742,7 +763,6 @@ impl RemoteTarget {
         destination: &str,
         directories: &RemoteUserDirectories,
         host_config: &HostConfig,
-        bootstrap_lock: &mut SshBootstrapLock,
     ) -> Result<InitialHostState, SshBootstrapError> {
         let state_root = host_config
             .daemon_state_dir
@@ -752,17 +772,45 @@ impl RemoteTarget {
         self.validate_daemon_path("SATELLE_STATE_DIR", Path::new(&state_root))?;
         let journal = join_target_path(self, &state_root, ".satelle-ssh-identity-commit");
         let command = if self.is_windows() {
+            let database = join_target_path(self, &state_root, "satelle.sqlite3");
             let script = format!(
-                "$ErrorActionPreference = 'Stop'; [Console]::Out.WriteLine('satelle-initial-host-state-v1'); if (Test-Path -LiteralPath {}) {{ [Console]::Out.WriteLine('pending_identity_commit') }} elseif (Test-Path -LiteralPath {}) {{ [Console]::Out.WriteLine('existing') }} else {{ [Console]::Out.WriteLine('fresh') }}",
+                concat!(
+                    "$ErrorActionPreference='Stop'; ",
+                    "[Console]::Out.WriteLine('satelle-initial-host-state-v2'); ",
+                    "if (Test-Path -LiteralPath {0}) {{ ",
+                    "$item=Get-Item -LiteralPath {0} -Force; ",
+                    "if ($item.PSIsContainer -or (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) -or $item.Length -gt 4096) {{ exit 75 }}; ",
+                    "[Console]::Out.WriteLine('pending_identity_commit'); ",
+                    "[Console]::Out.Write((Get-Content -LiteralPath {0} -Raw)); ",
+                    "}} elseif ((Test-Path -LiteralPath {1} -PathType Leaf) -or ",
+                    "(Test-Path -LiteralPath ({1} + '-wal') -PathType Leaf) -or ",
+                    "(Test-Path -LiteralPath ({1} + '-shm') -PathType Leaf) -or ",
+                    "(Test-Path -LiteralPath ({1} + '-journal') -PathType Leaf)) {{ ",
+                    "[Console]::Out.WriteLine('existing') ",
+                    "}} else {{ [Console]::Out.WriteLine('fresh') }}"
+                ),
                 powershell_quote(&journal),
-                powershell_quote(&state_root),
+                powershell_quote(&database),
             );
             powershell_encoded_command(&script)
         } else {
+            let database = join_target_path(self, &state_root, "satelle.sqlite3");
             let script = format!(
-                "printf 'satelle-initial-host-state-v1\\n'; if [ -e {journal} ] || [ -L {journal} ]; then printf 'pending_identity_commit\\n'; elif [ -e {state_root} ] || [ -L {state_root} ]; then printf 'existing\\n'; else printf 'fresh\\n'; fi",
+                concat!(
+                    "printf 'satelle-initial-host-state-v2\\n'; ",
+                    "if [ -e {journal} ] || [ -L {journal} ]; then ",
+                    "[ -f {journal} ] && [ ! -L {journal} ] || exit 75; ",
+                    "size=$(wc -c < {journal}) || exit 75; [ \"$size\" -le 4096 ] || exit 75; ",
+                    "printf 'pending_identity_commit\\n'; cat -- {journal}; ",
+                    "elif [ -f {database} ] || [ -f {database_wal} ] || ",
+                    "[ -f {database_shm} ] || [ -f {database_journal} ]; then ",
+                    "printf 'existing\\n'; else printf 'fresh\\n'; fi"
+                ),
                 journal = posix_quote(&journal),
-                state_root = posix_quote(&state_root),
+                database = posix_quote(&database),
+                database_wal = posix_quote(&format!("{database}-wal")),
+                database_shm = posix_quote(&format!("{database}-shm")),
+                database_journal = posix_quote(&format!("{database}-journal")),
             );
             format!("sh -c {}", posix_quote(&script))
         };
@@ -772,91 +820,359 @@ impl RemoteTarget {
         }
         let output =
             std::str::from_utf8(&output.stdout).map_err(|_| SshBootstrapError::InvalidProbe)?;
-        let mut lines = output.lines();
-        if lines.next() != Some("satelle-initial-host-state-v1") {
+        let mut sections = output.splitn(3, '\n');
+        if sections.next() != Some("satelle-initial-host-state-v2") {
             return Err(SshBootstrapError::InvalidProbe);
         }
-        let state = match lines.next() {
+        let state = match sections.next() {
             Some("fresh") => InitialHostState::Fresh,
             Some("existing") => InitialHostState::Existing,
             Some("pending_identity_commit") => {
-                if lines.next().is_some() {
+                let record = sections
+                    .next()
+                    .ok_or(SshBootstrapError::InvalidProbe)
+                    .and_then(|encoded| {
+                        SshIdentityCommitRecord::parse(encoded)
+                            .map_err(|_| SshBootstrapError::InvalidProbe)
+                    })?;
+                let cache_root = host_config
+                    .daemon_cache_dir
+                    .as_ref()
+                    .map(|path| path.as_os_str().to_string_lossy().into_owned())
+                    .unwrap_or_else(|| directories.resolved_path_set().cache_root);
+                self.validate_daemon_path("SATELLE_CACHE_DIR", Path::new(&cache_root))?;
+                let operation_directory = join_target_path(
+                    self,
+                    &cache_root,
+                    &format!(
+                        "bootstrap/{}/{}",
+                        record.operation_id(),
+                        record.binary_sha256()
+                    ),
+                );
+                let expected_path = self.shared_executable_path(&operation_directory);
+                if record.canonical_state_root() != state_root
+                    || record.target_id() != self.id()
+                    || !self.paths_equal(record.exact_remote_path(), &expected_path)
+                {
                     return Err(SshBootstrapError::InvalidProbe);
                 }
-                return self.inspect_pending_identity_commit(
-                    destination,
-                    host_config,
-                    bootstrap_lock,
-                );
+                return Ok(InitialHostState::PendingIdentityCommit(record));
             }
             _ => return Err(SshBootstrapError::InvalidProbe),
         };
-        if lines.next().is_some() {
+        if sections.next().is_some() {
             return Err(SshBootstrapError::InvalidProbe);
         }
         Ok(state)
     }
 
-    fn inspect_pending_identity_commit(
-        self,
-        destination: &str,
-        host_config: &HostConfig,
-        bootstrap_lock: &mut SshBootstrapLock,
-    ) -> Result<InitialHostState, SshBootstrapError> {
-        let artifact = DownloadedArtifact::fetch(self)?;
-        let directory = self.remote_directory();
-        let uploaded = upload_artifact(
-            destination,
-            self,
-            artifact.path(),
-            &directory,
-            artifact.release_digest(),
-            bootstrap_lock,
-        )?;
-        if uploaded.cache_changed() {
-            bootstrap_lock.commit_current_mutation()?;
+    fn paths_equal(self, left: &str, right: &str) -> bool {
+        let left = left.replace('\\', "/");
+        let right = right.replace('\\', "/");
+        if self.is_windows() {
+            left.eq_ignore_ascii_case(&right)
+        } else {
+            left == right
         }
-        let environment = self.validated_daemon_environment(host_config)?;
-        let command = self.identity_commit_inspection_command(uploaded.remote_path(), &environment);
-        let output = run_ssh_command(destination, &command)?;
-        if !output.status.success() {
-            return Err(SshBootstrapError::RemoteOperationFailed);
-        }
-        let inspection: SshIdentityCommitInspection =
-            serde_json::from_slice(&output.stdout).map_err(|_| SshBootstrapError::InvalidProbe)?;
-        if inspection.schema_version != "satelle.ssh-identity-commit-inspection.v1"
-            || Uuid::parse_str(&inspection.operation_id).is_err()
-        {
-            return Err(SshBootstrapError::InvalidProbe);
-        }
-        let host_identity = HostIdentityRef::new(inspection.host_identity)
-            .map_err(|_| SshBootstrapError::InvalidProbe)?;
-        Ok(InitialHostState::PendingIdentityCommit {
-            operation_id: inspection.operation_id,
-            host_identity,
-        })
     }
 
-    fn identity_commit_inspection_command(
+    pub(super) fn prepare_identity_operation(
         self,
-        remote_binary: &str,
-        environment: &[(&'static str, &Path)],
+        directories: &RemoteUserDirectories,
+        host_config: &HostConfig,
+        operation_id: &str,
+        identity: &HostIdentityRef,
+    ) -> Result<PreparedIdentityOperation, SshBootstrapError> {
+        let artifact = DownloadedArtifact::fetch(self)?;
+        let binary_digest = sha256_file(artifact.path())?;
+        let binary_sha256 = digest_hex(&binary_digest);
+        let archive_sha256 = digest_hex(&artifact.release_digest());
+        let state_root = host_config
+            .daemon_state_dir
+            .as_ref()
+            .map(|path| path.as_os_str().to_string_lossy().into_owned())
+            .unwrap_or_else(|| directories.resolved_path_set().state_root);
+        self.validate_daemon_path("SATELLE_STATE_DIR", Path::new(&state_root))?;
+        let cache_root = host_config
+            .daemon_cache_dir
+            .as_ref()
+            .map(|path| path.as_os_str().to_string_lossy().into_owned())
+            .unwrap_or_else(|| directories.resolved_path_set().cache_root);
+        self.validate_daemon_path("SATELLE_CACHE_DIR", Path::new(&cache_root))?;
+        let operation_directory = join_target_path(
+            self,
+            &cache_root,
+            &format!("bootstrap/{operation_id}/{binary_sha256}"),
+        );
+        let exact_remote_path = self.shared_executable_path(&operation_directory);
+        let record = SshIdentityCommitRecord::new(
+            operation_id,
+            identity.clone(),
+            self.id(),
+            state_root,
+            env!("CARGO_PKG_VERSION"),
+            archive_sha256,
+            binary_sha256,
+            exact_remote_path,
+        )
+        .map_err(|_| SshBootstrapError::InvalidProbe)?;
+        Ok(PreparedIdentityOperation { record, artifact })
+    }
+
+    pub(super) fn begin_identity_operation(
+        self,
+        destination: &str,
+        prepared: &PreparedIdentityOperation,
+        bootstrap_lock: &mut SshBootstrapLock,
+    ) -> Result<(), SshBootstrapError> {
+        let uploaded = upload_operation_artifact(
+            destination,
+            self,
+            prepared.artifact.path(),
+            prepared.record(),
+            bootstrap_lock,
+        )?;
+        if uploaded.binary_sha256() != prepared.record().binary_sha256() {
+            return Err(SshBootstrapError::RemoteCacheEntryRejected);
+        }
+        bootstrap_lock.commit_current_mutation()
+    }
+
+    pub(super) fn validate_pending_identity_operation(
+        self,
+        destination: &str,
+        record: &SshIdentityCommitRecord,
+    ) -> Result<(), SshBootstrapError> {
+        if operation_artifact_matches(destination, self, record)? {
+            Ok(())
+        } else {
+            Err(SshBootstrapError::RemoteCacheEntryRejected)
+        }
+    }
+
+    pub(super) fn cleanup_identity_operation_artifact(
+        self,
+        destination: &str,
+        record: &SshIdentityCommitRecord,
+        bootstrap_lock: &mut SshBootstrapLock,
+    ) -> Result<(), SshBootstrapError> {
+        let cleanup = self.cleanup_identity_operation_artifact_command(record);
+        let command =
+            bootstrap_lock.fenced_command(self, "identity_operation_artifact_cleanup", &cleanup)?;
+        require_success(run_fenced_ssh_command(destination, &command, None)?)?;
+        bootstrap_lock.commit_current_mutation()
+    }
+
+    fn cleanup_identity_operation_artifact_command(
+        self,
+        record: &SshIdentityCommitRecord,
     ) -> String {
+        let journal = join_target_path(
+            self,
+            record.canonical_state_root(),
+            ".satelle-ssh-identity-commit",
+        );
+        let artifact = record.exact_remote_path();
         if self.is_windows() {
             let script = format!(
-                "{}& {} host start --inspect-ssh-identity-commit --json",
-                powershell_environment(environment),
-                powershell_quote(remote_binary),
+                concat!(
+                    "$ErrorActionPreference='Stop'; $journal={journal}; $artifact={artifact}; ",
+                    "if (Test-Path -LiteralPath $journal) {{ exit 75 }}; ",
+                    "$item=Get-Item -LiteralPath $artifact -Force; ",
+                    "if ($item.PSIsContainer -or (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0)) {{ exit 75 }}; ",
+                    "Remove-Item -LiteralPath $artifact -Force"
+                ),
+                journal = powershell_quote(&journal),
+                artifact = powershell_quote(artifact),
             );
             powershell_encoded_command(&script)
         } else {
-            let script = format!("{}exec \"$@\"", posix_environment(environment));
-            format!(
-                "sh -c {} sh {} host start --inspect-ssh-identity-commit --json",
-                posix_quote(&script),
-                posix_quote(remote_binary),
-            )
+            let script = format!(
+                concat!(
+                    "journal={journal}; artifact={artifact}; ",
+                    "[ ! -e \"$journal\" ] && [ ! -L \"$journal\" ] || exit 75; ",
+                    "[ -f \"$artifact\" ] && [ ! -L \"$artifact\" ] || exit 75; ",
+                    "rm -f -- \"$artifact\"; sync"
+                ),
+                journal = posix_quote(&journal),
+                artifact = posix_quote(artifact),
+            );
+            format!("sh -c {}", posix_quote(&script))
         }
+    }
+
+    fn operation_artifact_upload_command(
+        self,
+        record: &SshIdentityCommitRecord,
+    ) -> Result<String, SshBootstrapError> {
+        let root = operation_cache_root(record)?;
+        let final_path = record.exact_remote_path();
+        let directory = remote_parent(final_path);
+        let staged = format!(
+            "{directory}/.satelle-upload-{}{}",
+            Uuid::now_v7().hyphenated(),
+            if self.is_windows() { ".exe" } else { "" }
+        );
+        if self.is_windows() {
+            let script = format!(
+                r#"$ErrorActionPreference='Stop'
+$separator=[IO.Path]::DirectorySeparatorChar
+$root=[IO.Path]::GetFullPath(({root}).Replace('/', $separator))
+$directory=[IO.Path]::GetFullPath(({directory}).Replace('/', $separator))
+$finalPath=[IO.Path]::GetFullPath(({final_path}).Replace('/', $separator))
+$staged=[IO.Path]::GetFullPath(({staged}).Replace('/', $separator))
+$rootPrefix=$root.TrimEnd($separator)+$separator
+$bootstrapPrefix=(Join-Path $root 'bootstrap').TrimEnd($separator)+$separator
+if (-not $directory.StartsWith($bootstrapPrefix,[StringComparison]::OrdinalIgnoreCase)) {{ exit 75 }}
+if (-not $finalPath.StartsWith(($directory.TrimEnd($separator)+$separator),[StringComparison]::OrdinalIgnoreCase)) {{ exit 75 }}
+if (Test-Path -LiteralPath $finalPath) {{ exit 75 }}
+[IO.Directory]::CreateDirectory($directory) | Out-Null
+$identity=[System.Security.Principal.WindowsIdentity]::GetCurrent().Name
+$current=Get-Item -LiteralPath $directory -Force
+while ($true) {{
+  $currentPath=[IO.Path]::GetFullPath($current.FullName)
+  if (-not [StringComparer]::OrdinalIgnoreCase.Equals($currentPath,$root) -and
+      -not $currentPath.StartsWith($rootPrefix,[StringComparison]::OrdinalIgnoreCase)) {{ exit 75 }}
+  if (-not $current.PSIsContainer -or (($current.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0)) {{ exit 75 }}
+  $acl=Get-Acl -LiteralPath $currentPath
+  $acl.SetAccessRuleProtection($true,$false)
+  foreach ($rule in @($acl.Access)) {{ [void]$acl.RemoveAccessRuleAll($rule) }}
+  $ownerRule=New-Object System.Security.AccessControl.FileSystemAccessRule(
+    $identity,'FullControl','ContainerInherit,ObjectInherit','None','Allow')
+  $acl.SetAccessRule($ownerRule)
+  Set-Acl -LiteralPath $currentPath -AclObject $acl
+  if ([StringComparer]::OrdinalIgnoreCase.Equals($currentPath,$root)) {{ break }}
+  $current=$current.Parent
+  if ($null -eq $current) {{ exit 75 }}
+}}
+$digestMismatch=$false
+try {{
+  $inputStream=[Console]::OpenStandardInput()
+  $outputStream=[IO.File]::Open($staged,[IO.FileMode]::CreateNew,[IO.FileAccess]::Write,[IO.FileShare]::None)
+  try {{ $inputStream.CopyTo($outputStream); $outputStream.Flush($true) }} finally {{ $outputStream.Dispose() }}
+  if ((Get-FileHash -Algorithm SHA256 -LiteralPath $staged).Hash.ToLowerInvariant() -cne {digest}) {{
+    $digestMismatch=$true
+    throw 'staged artifact digest mismatch'
+  }}
+  Move-Item -LiteralPath $staged -Destination $finalPath
+  $acl=Get-Acl -LiteralPath $finalPath
+  $acl.SetAccessRuleProtection($true,$false)
+  foreach ($rule in @($acl.Access)) {{ [void]$acl.RemoveAccessRuleAll($rule) }}
+  $ownerRule=New-Object System.Security.AccessControl.FileSystemAccessRule($identity,'FullControl','Allow')
+  $acl.SetAccessRule($ownerRule)
+  Set-Acl -LiteralPath $finalPath -AclObject $acl
+}} catch {{
+  if (Test-Path -LiteralPath $staged) {{
+    $item=Get-Item -LiteralPath $staged -Force
+    if ($item.PSIsContainer -or (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0)) {{ exit 75 }}
+    Remove-Item -LiteralPath $staged -Force
+  }}
+  if ($digestMismatch) {{ exit {digest_mismatch_exit_code} }}
+  throw
+}}"#,
+                root = powershell_quote(&root),
+                directory = powershell_quote(directory),
+                final_path = powershell_quote(final_path),
+                staged = powershell_quote(&staged),
+                digest = powershell_quote(record.binary_sha256()),
+                digest_mismatch_exit_code = STAGED_DIGEST_MISMATCH_EXIT_CODE,
+            );
+            return Ok(powershell_encoded_command(&script));
+        }
+        let script = format!(
+            r#"set -eu
+umask 077
+root={root}
+directory={directory}
+final_path={final_path}
+staged={staged}
+expected={digest}
+case "$directory" in "$root"/bootstrap/*) ;; *) exit 75;; esac
+mkdir -p -- "$directory"
+uid=$(id -u)
+current="$directory"
+while :; do
+  [ -d "$current" ] && [ ! -L "$current" ] || exit 75
+  owner=$(stat -c %u "$current" 2>/dev/null || stat -f %u "$current") || exit 75
+  [ "$owner" = "$uid" ] || exit 75
+  chmod 700 -- "$current"
+  [ "$current" = "$root" ] && break
+  current="${{current%/*}}"
+  [ -n "$current" ] || exit 75
+done
+[ ! -e "$final_path" ] && [ ! -L "$final_path" ] || exit 75
+cleanup() {{
+  status=$?
+  trap - EXIT
+  if [ -e "$staged" ] || [ -L "$staged" ]; then
+    [ -f "$staged" ] && [ ! -L "$staged" ] || exit 75
+    rm -f -- "$staged" || exit 75
+  fi
+  exit "$status"
+}}
+trap cleanup EXIT
+set -C
+cat >"$staged"
+if command -v sha256sum >/dev/null 2>&1; then actual=$(sha256sum "$staged" | awk '{{print $1}}'); elif command -v shasum >/dev/null 2>&1; then actual=$(shasum -a 256 "$staged" | awk '{{print $1}}'); else actual=$(openssl dgst -sha256 "$staged" | awk '{{print $NF}}'); fi
+[ "$actual" = "$expected" ] || exit {digest_mismatch_exit_code}
+chmod 700 -- "$staged"
+mv "$staged" "$final_path"
+trap - EXIT
+sync "$final_path""#,
+            root = posix_quote(&root),
+            directory = posix_quote(directory),
+            final_path = posix_quote(final_path),
+            staged = posix_quote(&staged),
+            digest = posix_quote(record.binary_sha256()),
+            digest_mismatch_exit_code = STAGED_DIGEST_MISMATCH_EXIT_CODE,
+        );
+        Ok(format!("sh -c {}", posix_quote(&script)))
+    }
+
+    fn operation_cache_validation_command(
+        self,
+        record: &SshIdentityCommitRecord,
+    ) -> Result<String, SshBootstrapError> {
+        let root = operation_cache_root(record)?;
+        let path = record.exact_remote_path();
+        if self.is_windows() {
+            let script = format!(
+                concat!(
+                    "$ErrorActionPreference='Stop'; $separator=[IO.Path]::DirectorySeparatorChar; ",
+                    "$root=[IO.Path]::GetFullPath(({root}).Replace('/', $separator)); ",
+                    "$path=[IO.Path]::GetFullPath(({path}).Replace('/', $separator)); ",
+                    "$rootPrefix=$root.TrimEnd($separator)+$separator; ",
+                    "if (-not $path.StartsWith($rootPrefix,[StringComparison]::OrdinalIgnoreCase)) {{ exit 1 }}; ",
+                    "$item=Get-Item -LiteralPath $path -Force; ",
+                    "if ($item.PSIsContainer -or (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0)) {{ exit 1 }}; ",
+                    "$identity=[System.Security.Principal.WindowsIdentity]::GetCurrent().Name; ",
+                    "$current=$item; while ($true) {{ $currentPath=[IO.Path]::GetFullPath($current.FullName); ",
+                    "if (($current.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {{ exit 1 }}; ",
+                    "$acl=Get-Acl -LiteralPath $currentPath; if ($acl.Owner -ne $identity) {{ exit 1 }}; ",
+                    "foreach ($rule in $acl.Access) {{ if ($rule.AccessControlType -eq 'Allow' -and $rule.IdentityReference.Value -ne $identity) {{ exit 1 }} }}; ",
+                    "if ([StringComparer]::OrdinalIgnoreCase.Equals($currentPath,$root)) {{ break }}; ",
+                    "$current=$current.Parent; if ($null -eq $current) {{ exit 1 }} }}"
+                ),
+                root = powershell_quote(&root),
+                path = powershell_quote(path),
+            );
+            return Ok(powershell_encoded_command(&script));
+        }
+        let script = format!(
+            concat!(
+                "path={path}; root={root}; uid=$(id -u); ",
+                "test -f \"$path\" && test ! -L \"$path\" || exit 1; ",
+                "current=\"$path\"; while :; do [ ! -L \"$current\" ] || exit 1; ",
+                "owner=$(stat -c %u \"$current\" 2>/dev/null || stat -f %u \"$current\") || exit 1; ",
+                "[ \"$owner\" = \"$uid\" ] || exit 1; ",
+                "[ \"$current\" = \"$root\" ] && break; current=\"${{current%/*}}\"; ",
+                "[ -n \"$current\" ] || exit 1; done"
+            ),
+            path = posix_quote(path),
+            root = posix_quote(&root),
+        );
+        Ok(format!("sh -c {}", posix_quote(&script)))
     }
 
     fn state_owner_handoff_commands(
@@ -1717,16 +2033,18 @@ printf 'removed=%s\nretained=%s\n' "$removed" "$retained""#,
         );
         let windows_identity_args = initial_identity.map_or_else(String::new, |initial| {
             format!(
-                " --initial-host-identity {} --initial-identity-operation-id {}",
+                " --initial-host-identity {} --initial-identity-operation-id {} --initial-identity-record {}",
                 powershell_quote(initial.host_identity.as_str()),
                 powershell_quote(initial.operation_id),
+                powershell_quote(&initial.record.encode()),
             )
         });
         let posix_identity_args = initial_identity.map_or_else(String::new, |initial| {
             format!(
-                " --initial-host-identity {} --initial-identity-operation-id {}",
+                " --initial-host-identity {} --initial-identity-operation-id {} --initial-identity-record {}",
                 posix_quote(initial.host_identity.as_str()),
                 posix_quote(initial.operation_id),
+                posix_quote(&initial.record.encode()),
             )
         });
         if self.is_windows() {
@@ -1988,10 +2306,6 @@ impl UploadedHostArtifact {
 
     pub(super) fn binary_sha256(&self) -> &str {
         &self.binary_sha256
-    }
-
-    pub(super) const fn cache_changed(&self) -> bool {
-        self.cache_changed
     }
 }
 
@@ -3976,6 +4290,85 @@ fn upload_artifact(
     }
 }
 
+fn upload_operation_artifact(
+    destination: &str,
+    target: RemoteTarget,
+    local_binary: &Path,
+    record: &SshIdentityCommitRecord,
+    bootstrap_lock: &mut SshBootstrapLock,
+) -> Result<UploadedHostArtifact, SshBootstrapError> {
+    let local_digest = sha256_file(local_binary)?;
+    if digest_hex(&local_digest) != record.binary_sha256() {
+        return Err(SshBootstrapError::IntegrityMismatch);
+    }
+    let input = File::open(local_binary).map_err(SshBootstrapError::LocalFile)?;
+    let upload = target.operation_artifact_upload_command(record)?;
+    let command = bootstrap_lock.fenced_command(target, "identity_artifact_upload", &upload)?;
+    require_staged_mutation_success(run_fenced_ssh_command(
+        destination,
+        &command,
+        Some(FencedMutationInput::Artifact(input)),
+    )?)?;
+    if !operation_artifact_matches(destination, target, record)? {
+        return Err(SshBootstrapError::RemoteCacheEntryRejected);
+    }
+    Ok(UploadedHostArtifact {
+        remote_path: record.exact_remote_path().to_string(),
+        binary_sha256: digest_hex(&local_digest),
+        cache_changed: true,
+    })
+}
+
+fn operation_cache_root(record: &SshIdentityCommitRecord) -> Result<String, SshBootstrapError> {
+    let normalized = record.exact_remote_path().replace('\\', "/");
+    let suffix = format!(
+        "/bootstrap/{}/{}/{}",
+        record.operation_id(),
+        record.binary_sha256(),
+        if record.target_id().starts_with("win32-") {
+            "satelle.exe"
+        } else {
+            "satelle"
+        }
+    );
+    normalized
+        .strip_suffix(&suffix)
+        .filter(|root| !root.is_empty())
+        .map(str::to_string)
+        .ok_or(SshBootstrapError::InvalidProbe)
+}
+
+fn operation_artifact_matches(
+    destination: &str,
+    target: RemoteTarget,
+    record: &SshIdentityCommitRecord,
+) -> Result<bool, SshBootstrapError> {
+    let validation = run_ssh_command(
+        destination,
+        &target.operation_cache_validation_command(record)?,
+    )?;
+    if !validation.status.success() {
+        return if validation.stderr.host_key_verification_failed() {
+            Err(SshBootstrapError::HostKeyVerificationRequired)
+        } else {
+            Ok(false)
+        };
+    }
+    let digest = run_ssh_command(
+        destination,
+        &target.digest_command(record.exact_remote_path()),
+    )?;
+    if !digest.status.success() {
+        return if digest.stderr.host_key_verification_failed() {
+            Err(SshBootstrapError::HostKeyVerificationRequired)
+        } else {
+            Ok(false)
+        };
+    }
+    let expected = parse_digest_hex(record.binary_sha256())?;
+    Ok(parse_digest_output(&digest.stdout).is_ok_and(|digest| digest == expected))
+}
+
 pub(super) fn cleanup_host_cache(
     destination: &str,
 ) -> Result<CacheCleanupReport, SshBootstrapError> {
@@ -4094,6 +4487,21 @@ fn sha256_file(path: &Path) -> Result<[u8; 32], SshBootstrapError> {
         }
         digest.update(&buffer[..count]);
     }
+}
+
+fn digest_hex(digest: &[u8; 32]) -> String {
+    digest.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+fn parse_digest_hex(encoded: &str) -> Result<[u8; 32], SshBootstrapError> {
+    if encoded.len() != 64 {
+        return Err(SshBootstrapError::InvalidRemoteDigest);
+    }
+    let mut decoded = [0_u8; 32];
+    for (index, pair) in encoded.as_bytes().chunks_exact(2).enumerate() {
+        decoded[index] = decode_hex(pair).ok_or(SshBootstrapError::InvalidRemoteDigest)?;
+    }
+    Ok(decoded)
 }
 
 fn parse_digest_output(output: &[u8]) -> Result<[u8; 32], SshBootstrapError> {
@@ -5942,9 +6350,25 @@ mod tests {
     fn fresh_bootstrap_start_commands_bind_the_exact_identity_commit() {
         let identity = HostIdentityRef::new("host-0195f6d5-18da-7a80-8000-000000000001")
             .expect("valid Host Identity");
+        let operation_id = "0195f6d5-18da-7a80-8000-000000000002";
+        let binary_sha256 = "22".repeat(32);
+        let record = SshIdentityCommitRecord::new(
+            operation_id,
+            identity.clone(),
+            RemoteTarget::LinuxX64Gnu.id(),
+            "/home/operator/.local/state/satelle",
+            env!("CARGO_PKG_VERSION"),
+            "11".repeat(32),
+            &binary_sha256,
+            format!(
+                "/home/operator/.cache/satelle/bootstrap/{operation_id}/{binary_sha256}/satelle"
+            ),
+        )
+        .expect("construct operation record");
         let initial = InitialHostIdentityCommit {
             host_identity: &identity,
-            operation_id: "0195f6d5-18da-7a80-8000-000000000002",
+            operation_id,
+            record: &record,
         };
         let timeouts = ReadinessTimeouts {
             native: Duration::from_millis(2_500),
@@ -5964,6 +6388,7 @@ mod tests {
         assert!(
             unix.contains("--initial-identity-operation-id '0195f6d5-18da-7a80-8000-000000000002'")
         );
+        assert!(unix.contains("--initial-identity-record 'satelle.ssh-host-identity-commit.v2"));
         assert!(unix.contains("exec \"$@\""));
         assert!(!unix.contains("exec /tmp/satelle host start"));
 
@@ -5983,28 +6408,48 @@ mod tests {
             script
                 .contains("--initial-identity-operation-id '0195f6d5-18da-7a80-8000-000000000002'")
         );
+        assert!(script.contains("--initial-identity-record 'satelle.ssh-host-identity-commit.v2"));
     }
 
     #[test]
-    fn pending_identity_inspection_uses_verified_uploaded_binary_path() {
-        let supplied = "/home/operator/.cache/satelle/host/v0.0.1/linux-x64/satelle";
-        let command = RemoteTarget::LinuxX64Gnu.identity_commit_inspection_command(supplied, &[]);
-
-        let inline_interpolation = format!(
-            "exec {} host start --inspect-ssh-identity-commit --json",
-            posix_quote(supplied),
-        );
-        let expected_script = format!("{}exec \"$@\"", posix_environment(&[]));
-        assert_eq!(
-            command,
+    fn pending_identity_record_binds_the_exact_retained_artifact() {
+        let operation_id = "0195f6d5-18da-7a80-8000-000000000002";
+        let binary_sha256 = "22".repeat(32);
+        let record = SshIdentityCommitRecord::new(
+            operation_id,
+            HostIdentityRef::new("host-0195f6d5-18da-7a80-8000-000000000001".to_string())
+                .expect("valid Host Identity"),
+            RemoteTarget::LinuxX64Gnu.id(),
+            "/home/operator/.local/state/satelle",
+            env!("CARGO_PKG_VERSION"),
+            "11".repeat(32),
+            &binary_sha256,
             format!(
-                "sh -c {} sh {} host start --inspect-ssh-identity-commit --json",
-                posix_quote(&expected_script),
-                posix_quote(supplied),
+                "/home/operator/.cache/satelle/bootstrap/{operation_id}/{binary_sha256}/satelle"
             ),
+        )
+        .expect("construct operation record");
+
+        assert_eq!(
+            SshIdentityCommitRecord::parse(&record.encode()).expect("parse operation record"),
+            record
         );
-        assert!(!command.contains(&inline_interpolation));
-        assert!(!command.contains(env!("CARGO_PKG_VERSION")));
+        assert_eq!(
+            record.exact_remote_path(),
+            format!(
+                "/home/operator/.cache/satelle/bootstrap/{operation_id}/{binary_sha256}/satelle"
+            )
+        );
+    }
+
+    #[test]
+    fn old_identity_journal_schema_fails_closed() {
+        assert!(
+            SshIdentityCommitRecord::parse(
+                "satelle.ssh-host-identity-commit.v1\noperation_id=0195f6d5-18da-7a80-8000-000000000002\nhost_identity=host-0195f6d5-18da-7a80-8000-000000000001"
+            )
+            .is_err()
+        );
     }
 
     #[test]

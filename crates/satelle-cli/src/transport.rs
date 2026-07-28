@@ -1326,9 +1326,7 @@ impl SshSetupTransport {
         address: std::net::SocketAddr,
         token: ApiBearerToken,
     ) -> Result<CurrentDaemonArtifactObservation, SatelleError> {
-        // Keep a zeroizing copy only when first trust may need to reconstruct
-        // the non-Clone token for a client bound to the discovered identity.
-        let exposed_token = self.requires_first_trust.then(|| token.expose());
+        let first_trust_token = self.requires_first_trust.then(|| token.expose());
         let client = DaemonClient::loopback_with_timeout(
             address,
             token,
@@ -1336,48 +1334,38 @@ impl SshSetupTransport {
             SSH_DAEMON_REQUEST_TIMEOUT,
         )
         .map_err(|error| direct_transport_error(&self.alias, error))?;
-        let capabilities = match client.capabilities() {
-            Err(DaemonClientError::Api { status: _, error })
-                if self.requires_first_trust
-                    && error.code() == ApiErrorCode::HostIdentityMismatch =>
-            {
-                // Identity discovery validates the structured mismatch but does
-                // not persist trust. The configured credential still has to
-                // authenticate the rebound capabilities request.
-                let observed_identity =
-                    client
-                        .discover_host_identity()
-                        .map_err(|error| match error {
-                            DaemonClientError::Api { status: _, error }
-                                if matches!(
-                                    error.code(),
-                                    ApiErrorCode::AuthenticationFailed
-                                        | ApiErrorCode::HostIdentityMismatch
-                                ) =>
-                            {
-                                self.unauthenticated_daemon_version_error()
-                            }
-                            error => direct_transport_error(&self.alias, error),
-                        })?;
-                let token = ApiBearerToken::parse(
-                    exposed_token
-                        .as_ref()
-                        .expect("first trust retains the configured probe token")
-                        .as_str(),
-                )
-                .map_err(|_| SatelleError::host_unreachable(&self.alias))?;
-                let rebound_client = DaemonClient::loopback_with_timeout(
-                    address,
-                    token,
-                    observed_identity,
-                    SSH_DAEMON_REQUEST_TIMEOUT,
-                )
-                .map_err(|error| direct_transport_error(&self.alias, error))?;
-                rebound_client.capabilities()
-            }
-            capabilities => capabilities,
-        };
-        self.current_daemon_observation_from_capabilities(capabilities)
+        if self.requires_first_trust {
+            let discovered_identity =
+                client
+                    .discover_host_identity()
+                    .map_err(|error| match error {
+                        DaemonClientError::Api { status: _, error }
+                            if matches!(
+                                error.code(),
+                                ApiErrorCode::AuthenticationFailed
+                                    | ApiErrorCode::HostIdentityMismatch
+                            ) =>
+                        {
+                            self.unauthenticated_daemon_version_error()
+                        }
+                        error => direct_transport_error(&self.alias, error),
+                    })?;
+            let token = ApiBearerToken::parse(
+                first_trust_token
+                    .expect("first-trust probing retains its typed credential")
+                    .as_str(),
+            )
+            .map_err(|_| SatelleError::host_unreachable(&self.alias))?;
+            let client = DaemonClient::loopback_with_timeout(
+                address,
+                token,
+                discovered_identity,
+                SSH_DAEMON_REQUEST_TIMEOUT,
+            )
+            .map_err(|error| direct_transport_error(&self.alias, error))?;
+            return self.current_daemon_observation_from_capabilities(client.capabilities());
+        }
+        self.current_daemon_observation_from_capabilities(client.capabilities())
     }
 
     fn current_daemon_observation_from_capabilities(
@@ -3897,14 +3885,18 @@ fn durable_ssh_clients(
         destination,
         LockFirstOperationKind::MissingDaemonRepair,
     )?;
-    confirm_bootstrap_lock(alias, &mut bootstrap_lock)?;
-    match client.capabilities() {
-        Ok(_) => {
+    match probe_durable_daemon_under_lock(
+        alias,
+        || confirm_bootstrap_lock(alias, &mut bootstrap_lock),
+        || observe_remote_durable_readiness(client.capabilities()),
+    )? {
+        DurableDaemonProbe::Ready(readiness) => {
+            require_exact_durable_readiness(alias, expected_host_identity, &readiness)?;
             bootstrap_lock
                 .release_unmodified()
                 .map_err(|_| SatelleError::host_unreachable(alias))?;
         }
-        Err(DaemonClientError::Transport(_)) => {
+        DurableDaemonProbe::Missing => {
             let bootstrap_token =
                 ApiBearerToken::generate().map_err(|_| SatelleError::host_unreachable(alias))?;
             let raw_bootstrap_token = bootstrap_token.expose();
@@ -3925,9 +3917,14 @@ fn durable_ssh_clients(
                 SSH_DAEMON_REQUEST_TIMEOUT,
             )
             .map_err(|error| direct_transport_error(alias, error))?;
-            finish_durable_daemon_launch(alias, &client, &bootstrap_client, &mut bootstrap_lock)?;
+            finish_durable_daemon_launch(
+                alias,
+                expected_host_identity,
+                &client,
+                &bootstrap_client,
+                &mut bootstrap_lock,
+            )?;
         }
-        Err(error) => return Err(direct_transport_error(alias, error)),
     }
     let event_client =
         DaemonEventClient::loopback(tunnel_addr, event_token, expected_host_identity)
@@ -3937,6 +3934,7 @@ fn durable_ssh_clients(
 
 fn finish_durable_daemon_launch(
     alias: &str,
+    expected_host_identity: &str,
     durable_client: &DaemonClient,
     bootstrap_client: &DaemonClient,
     bootstrap_lock: &mut ssh_bootstrap::SshBootstrapLock,
@@ -3953,33 +3951,157 @@ fn finish_durable_daemon_launch(
 
     // Only after the launch and maintenance handoff are terminal do we surface
     // the durable credential's independent authentication or scope result.
-    durable_client
-        .capabilities()
-        .map(|_| ())
-        .map_err(|error| direct_transport_error(alias, error))
+    authenticate_durable_with_confirmation(
+        alias,
+        expected_host_identity,
+        || Ok(()),
+        || observe_remote_durable_readiness(durable_client.capabilities()),
+        Instant::now() + SSH_DAEMON_LAUNCH_TIMEOUT,
+    )
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct DurableReadinessSnapshot {
+    daemon_version: String,
+    host_identity: String,
+}
+
+trait DurableReadiness {
+    fn daemon_version(&self) -> &str;
+    fn host_identity(&self) -> &str;
+}
+
+impl DurableReadiness for satelle_transport::CapabilitiesResponse {
+    fn daemon_version(&self) -> &str {
+        self.daemon_version()
+    }
+
+    fn host_identity(&self) -> &str {
+        self.host_identity()
+    }
+}
+
+impl DurableReadiness for DurableReadinessSnapshot {
+    fn daemon_version(&self) -> &str {
+        &self.daemon_version
+    }
+
+    fn host_identity(&self) -> &str {
+        &self.host_identity
+    }
+}
+
+enum DurableReadinessObservation {
+    Ready(DurableReadinessSnapshot),
+    TransportFailure,
+    Failure(DaemonClientError),
+}
+
+fn observe_remote_durable_readiness<T: DurableReadiness>(
+    readiness: Result<T, DaemonClientError>,
+) -> DurableReadinessObservation {
+    match readiness {
+        Ok(capabilities) => DurableReadinessObservation::Ready(DurableReadinessSnapshot {
+            daemon_version: capabilities.daemon_version().to_string(),
+            host_identity: capabilities.host_identity().to_string(),
+        }),
+        Err(DaemonClientError::Transport(_)) => DurableReadinessObservation::TransportFailure,
+        Err(error) => DurableReadinessObservation::Failure(error),
+    }
+}
+
+enum DurableDaemonProbe {
+    Ready(DurableReadinessSnapshot),
+    Missing,
+}
+
+fn probe_durable_daemon_under_lock(
+    host: &str,
+    mut confirm_lock_ownership: impl FnMut() -> Result<(), SatelleError>,
+    readiness: impl FnOnce() -> DurableReadinessObservation,
+) -> Result<DurableDaemonProbe, SatelleError> {
+    confirm_lock_ownership()?;
+    let readiness = readiness();
+    confirm_lock_ownership()?;
+    match readiness {
+        DurableReadinessObservation::Ready(readiness) => Ok(DurableDaemonProbe::Ready(readiness)),
+        DurableReadinessObservation::TransportFailure => Ok(DurableDaemonProbe::Missing),
+        DurableReadinessObservation::Failure(error) => Err(direct_transport_error(host, error)),
+    }
+}
+
+fn require_exact_durable_readiness(
+    host: &str,
+    expected_host_identity: &str,
+    readiness: &DurableReadinessSnapshot,
+) -> Result<(), SatelleError> {
+    if readiness.daemon_version != env!("CARGO_PKG_VERSION") {
+        return Err(SatelleError::remote_api_error(
+            host,
+            "unexpected-durable-daemon-version",
+        ));
+    }
+    if readiness.host_identity != expected_host_identity {
+        return Err(SatelleError::host_identity_mismatch(host));
+    }
+    Ok(())
+}
+
+fn authenticate_durable_with_confirmation(
+    host: &str,
+    expected_host_identity: &str,
+    mut confirm_lock_ownership: impl FnMut() -> Result<(), SatelleError>,
+    mut readiness: impl FnMut() -> DurableReadinessObservation,
+    deadline: Instant,
+) -> Result<(), SatelleError> {
+    loop {
+        confirm_lock_ownership()?;
+        let observation = readiness();
+        confirm_lock_ownership()?;
+        match observation {
+            DurableReadinessObservation::Ready(readiness) => {
+                return require_exact_durable_readiness(host, expected_host_identity, &readiness);
+            }
+            DurableReadinessObservation::Failure(error) => {
+                return Err(direct_transport_error(host, error));
+            }
+            DurableReadinessObservation::TransportFailure => {
+                let now = Instant::now();
+                if now >= deadline {
+                    return Err(SatelleError::host_unreachable(host));
+                }
+                std::thread::sleep(SSH_DAEMON_LAUNCH_POLL_INTERVAL.min(deadline - now));
+            }
+        }
+    }
 }
 
 #[cfg(test)]
-fn relaunch_durable_daemon_under_lock<T>(
+fn relaunch_durable_daemon_under_lock(
     host: &str,
+    expected_host_identity: &str,
     mut confirm_lock_ownership: impl FnMut() -> Result<(), SatelleError>,
-    mut readiness: impl FnMut() -> Result<T, DaemonClientError>,
+    initial_readiness: impl FnOnce() -> DurableReadinessObservation,
     launch: impl FnOnce() -> Result<(), SatelleError>,
-) -> Result<T, SatelleError> {
-    // Another Controller may have completed startup while this Controller
-    // waited for the remote lock. Recheck before launching to avoid a second
-    // daemon and retain the lock until the selected daemon is authenticated.
-    confirm_lock_ownership()?;
-    let ready = match readiness() {
-        Ok(ready) => Ok(ready),
-        Err(DaemonClientError::Transport(_)) => {
-            launch()?;
-            wait_for_durable_daemon(host, readiness)
+    final_readiness: impl FnMut() -> DurableReadinessObservation,
+) -> Result<bool, SatelleError> {
+    match probe_durable_daemon_under_lock(host, &mut confirm_lock_ownership, initial_readiness)? {
+        DurableDaemonProbe::Ready(readiness) => {
+            require_exact_durable_readiness(host, expected_host_identity, &readiness)?;
+            Ok(false)
         }
-        Err(error) => return Err(direct_transport_error(host, error)),
-    }?;
-    confirm_lock_ownership()?;
-    Ok(ready)
+        DurableDaemonProbe::Missing => {
+            launch()?;
+            authenticate_durable_with_confirmation(
+                host,
+                expected_host_identity,
+                confirm_lock_ownership,
+                final_readiness,
+                Instant::now(),
+            )?;
+            Ok(true)
+        }
+    }
 }
 
 fn confirm_bootstrap_lock(
@@ -4104,7 +4226,7 @@ fn acquire_bootstrap_lock(
     destination: &str,
     operation_kind: LockFirstOperationKind,
 ) -> Result<ssh_bootstrap::SshBootstrapLock, SatelleError> {
-    let operation_id = format!("bootstrap-{}", Uuid::now_v7());
+    let operation_id = Uuid::now_v7().hyphenated().to_string();
     acquire_bootstrap_lock_for_operation(
         alias,
         destination,
@@ -4252,8 +4374,8 @@ fn setup_fresh_bootstrap_client(
     destination: &str,
     previous_host_config: &satelle_core::HostConfig,
     host_config: &satelle_core::HostConfig,
-    identity: &HostIdentityRef,
-    operation_id: &str,
+    identity_commit: ssh_bootstrap::InitialHostIdentityCommit<'_>,
+    remote_binary: &str,
     bootstrap_lock: &mut ssh_bootstrap::SshBootstrapLock,
 ) -> Result<
     (
@@ -4272,10 +4394,8 @@ fn setup_fresh_bootstrap_client(
         &bootstrap_token,
         host_config,
         SshBootstrapScope::Admin,
-        ssh_bootstrap::InitialHostIdentityCommit {
-            host_identity: identity,
-            operation_id,
-        },
+        identity_commit,
+        remote_binary,
         bootstrap_lock,
     )
     .map_err(|error| map_ssh_daemon_bootstrap_error(alias, error))?;
@@ -4293,7 +4413,7 @@ fn setup_fresh_bootstrap_client(
         DaemonClient::loopback_with_timeout(
             tunnel.local_addr(),
             token,
-            identity.as_str(),
+            identity_commit.host_identity.as_str(),
             SSH_DAEMON_REQUEST_TIMEOUT,
         )
         .map_err(|error| direct_transport_error(alias, error))?
@@ -4323,7 +4443,7 @@ fn setup_fresh_bootstrap_client(
         .map(|sessions| (client, tunnel, bootstrap, sessions))
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 fn discovered_bootstrap_client(
     alias: &str,
     tunnel_addr: std::net::SocketAddr,
@@ -4966,27 +5086,114 @@ pub(crate) struct SshHostDiscovery {
     pub(crate) identity: String,
     pub(crate) authenticated_user: String,
     pub(crate) sessions: HostSessionsReport,
+    finalization: Option<SshTrustFinalization>,
+}
+
+impl SshHostDiscovery {
+    pub(crate) fn finalize_after_binding(&mut self) -> Result<(), SatelleError> {
+        let Some(mut finalization) = self.finalization.take() else {
+            return Ok(());
+        };
+        let finalized = (|| {
+            complete_bootstrap_handoff(
+                &finalization.alias,
+                &finalization.client,
+                &mut finalization.bootstrap_lock,
+            )?;
+            finalization
+                .target
+                .cleanup_identity_operation_artifact(
+                    &finalization.destination,
+                    &finalization.record,
+                    &mut finalization.bootstrap_lock,
+                )
+                .map_err(|error| map_ssh_daemon_bootstrap_error(&finalization.alias, error))?;
+            finalization
+                .bootstrap_lock
+                .release_committed_handoff()
+                .map_err(|_| SatelleError::host_unreachable(&finalization.alias))
+        })();
+        if finalized.is_err() {
+            // Keep the exact operation cleanup capability retryable. Host
+            // completion is idempotent; once it deleted the record, a retry
+            // can only remove the orphaned artifact and release this lock.
+            self.finalization = Some(finalization);
+        }
+        finalized
+    }
 }
 
 pub(crate) enum PendingSshTrust {
-    Live(SshHostDiscovery),
+    Live(Box<PendingLiveSshTrustCandidate>),
     Fresh(Box<PendingSshTrustCandidate>),
 }
 
 impl PendingSshTrust {
     pub(crate) fn identity(&self) -> &str {
         match self {
-            Self::Live(discovery) => &discovery.identity,
+            Self::Live(candidate) => candidate.identity.as_str(),
             Self::Fresh(candidate) => candidate.identity.as_str(),
         }
     }
 
     pub(crate) fn accept(self) -> Result<SshHostDiscovery, SatelleError> {
         match self {
-            Self::Live(discovery) => Ok(discovery),
+            Self::Live(candidate) => (*candidate).accept(),
             Self::Fresh(candidate) => (*candidate).accept(),
         }
     }
+}
+
+pub(crate) struct PendingLiveSshTrustCandidate {
+    alias: String,
+    identity: String,
+    authenticated_user: String,
+    client: Arc<DaemonClient>,
+    _tunnel: SshTunnel,
+}
+
+impl PendingLiveSshTrustCandidate {
+    fn accept(self) -> Result<SshHostDiscovery, SatelleError> {
+        let capabilities = self
+            .client
+            .capabilities()
+            .map_err(|error| direct_transport_error(&self.alias, error))?;
+        let desktop_sessions = self
+            .client
+            .desktop_sessions()
+            .map_err(|error| direct_transport_error(&self.alias, error))?;
+        Ok(SshHostDiscovery {
+            identity: self.identity,
+            authenticated_user: self.authenticated_user,
+            sessions: HostSessionsReport {
+                schema_version: HostSessionsSchemaVersion::V1,
+                host: self.alias,
+                detected_platform: capabilities.platform().to_string(),
+                connection_mode: "ssh".to_string(),
+                bootstrapped: false,
+                bootstrap_actions: Vec::new(),
+                host_daemon_version: capabilities.daemon_version().to_string(),
+                sessions: desktop_sessions.sessions().to_vec(),
+            },
+            finalization: None,
+        })
+    }
+}
+
+enum IdentityOperationState {
+    Fresh,
+    Pending(satelle_core::SshIdentityCommitRecord),
+}
+
+struct SshTrustFinalization {
+    alias: String,
+    destination: String,
+    target: ssh_bootstrap::RemoteTarget,
+    record: satelle_core::SshIdentityCommitRecord,
+    client: Arc<DaemonClient>,
+    _tunnel: SshTunnel,
+    _bootstrap: SshBootstrapProcess,
+    bootstrap_lock: ssh_bootstrap::SshBootstrapLock,
 }
 
 pub(crate) struct PendingSshTrustCandidate {
@@ -4995,33 +5202,116 @@ pub(crate) struct PendingSshTrustCandidate {
     authenticated_user: String,
     previous_host_config: satelle_core::HostConfig,
     host_config: satelle_core::HostConfig,
-    bootstrap_lock: ssh_bootstrap::SshBootstrapLock,
+    target: ssh_bootstrap::RemoteTarget,
+    state: IdentityOperationState,
     identity: HostIdentityRef,
     operation_id: String,
 }
 
 impl PendingSshTrustCandidate {
-    fn accept(mut self) -> Result<SshHostDiscovery, SatelleError> {
-        confirm_bootstrap_lock(&self.alias, &mut self.bootstrap_lock)?;
+    fn accept(self) -> Result<SshHostDiscovery, SatelleError> {
+        let observed_target = ssh_bootstrap::RemoteTarget::probe(&self.destination)
+            .map_err(|error| map_ssh_daemon_bootstrap_error(&self.alias, error))?;
+        if observed_target != self.target {
+            return Err(SatelleError::host_identity_mismatch(&self.alias));
+        }
+        let observed_directories =
+            ssh_bootstrap::RemoteUserDirectories::probe(&self.destination, observed_target)
+                .map_err(|error| map_ssh_daemon_bootstrap_error(&self.alias, error))?;
+        if observed_directories.authenticated_user() != self.authenticated_user {
+            return Err(SatelleError::host_identity_mismatch(&self.alias));
+        }
+        let mut bootstrap_lock = acquire_bootstrap_lock_for_operation(
+            &self.alias,
+            &self.destination,
+            self.operation_id.clone(),
+            LockFirstOperationKind::InitialSetup.operation_kind(),
+        )?;
+        confirm_bootstrap_lock(&self.alias, &mut bootstrap_lock)?;
+        let observed_state = self
+            .target
+            .inspect_initial_host_state(&self.destination, &observed_directories, &self.host_config)
+            .map_err(|error| map_ssh_daemon_bootstrap_error(&self.alias, error))?;
+        let record = match (&self.state, observed_state) {
+            (IdentityOperationState::Fresh, ssh_bootstrap::InitialHostState::Fresh) => {
+                let prepared = self
+                    .target
+                    .prepare_identity_operation(
+                        &observed_directories,
+                        &self.host_config,
+                        &self.operation_id,
+                        &self.identity,
+                    )
+                    .map_err(|error| map_ssh_daemon_bootstrap_error(&self.alias, error))?;
+                let record = prepared.record().clone();
+                if let Err(error) = self.target.begin_identity_operation(
+                    &self.destination,
+                    &prepared,
+                    &mut bootstrap_lock,
+                ) {
+                    let _ = self.target.cleanup_identity_operation_artifact(
+                        &self.destination,
+                        &record,
+                        &mut bootstrap_lock,
+                    );
+                    return Err(map_ssh_daemon_bootstrap_error(&self.alias, error));
+                }
+                record
+            }
+            (
+                IdentityOperationState::Pending(expected),
+                ssh_bootstrap::InitialHostState::PendingIdentityCommit(observed),
+            ) if expected == &observed => {
+                self.target
+                    .validate_pending_identity_operation(&self.destination, &observed)
+                    .map_err(|error| map_ssh_daemon_bootstrap_error(&self.alias, error))?;
+                observed
+            }
+            _ => return Err(SatelleError::host_identity_mismatch(&self.alias)),
+        };
         // These guards stay bound through the authenticated handoff so neither
         // the SSH tunnel nor its bootstrap daemon can end between requests.
-        let (client, _tunnel, _bootstrap, sessions) = setup_fresh_bootstrap_client(
+        let setup = setup_fresh_bootstrap_client(
             &self.alias,
             &self.destination,
             &self.previous_host_config,
             &self.host_config,
-            &self.identity,
-            &self.operation_id,
-            &mut self.bootstrap_lock,
-        )?;
-        complete_bootstrap_handoff(&self.alias, &client, &mut self.bootstrap_lock)?;
-        self.bootstrap_lock
-            .release_committed_handoff()
-            .map_err(|_| SatelleError::host_unreachable(&self.alias))?;
+            ssh_bootstrap::InitialHostIdentityCommit {
+                host_identity: &self.identity,
+                operation_id: &self.operation_id,
+                record: &record,
+            },
+            record.exact_remote_path(),
+            &mut bootstrap_lock,
+        );
+        let (client, tunnel, bootstrap, sessions) = match setup {
+            Ok(setup) => setup,
+            Err(error) => {
+                // Cleanup is allowed only while the Host record is absent. If
+                // Host reached its durable commit, this command refuses to
+                // remove the artifact and preserves an exact pending resume.
+                let _ = self.target.cleanup_identity_operation_artifact(
+                    &self.destination,
+                    &record,
+                    &mut bootstrap_lock,
+                );
+                return Err(error);
+            }
+        };
         Ok(SshHostDiscovery {
             identity: self.identity.as_str().to_string(),
             authenticated_user: self.authenticated_user,
             sessions,
+            finalization: Some(SshTrustFinalization {
+                alias: self.alias,
+                destination: self.destination,
+                target: self.target,
+                record,
+                client,
+                _tunnel: tunnel,
+                _bootstrap: bootstrap,
+                bootstrap_lock,
+            }),
         })
     }
 }
@@ -5108,37 +5398,20 @@ pub(crate) fn discover_ssh_host(
                 SSH_DAEMON_REQUEST_TIMEOUT,
             )
             .map_err(|error| direct_transport_error(&host.alias, error))?;
-            let capabilities = client
-                .capabilities()
-                .map_err(|error| direct_transport_error(&host.alias, error))?;
-            let desktop_sessions = client
-                .desktop_sessions()
-                .map_err(|error| direct_transport_error(&host.alias, error))?;
-            return Ok(PendingSshTrust::Live(SshHostDiscovery {
-                identity,
-                authenticated_user,
-                sessions: HostSessionsReport {
-                    schema_version: HostSessionsSchemaVersion::V1,
-                    host: host.alias.clone(),
-                    detected_platform: capabilities.platform().to_string(),
-                    connection_mode: "ssh".to_string(),
-                    bootstrapped: false,
-                    bootstrap_actions: Vec::new(),
-                    host_daemon_version: capabilities.daemon_version().to_string(),
-                    sessions: desktop_sessions.sessions().to_vec(),
+            return Ok(PendingSshTrust::Live(Box::new(
+                PendingLiveSshTrustCandidate {
+                    alias: host.alias.clone(),
+                    identity,
+                    authenticated_user,
+                    client: Arc::new(client),
+                    _tunnel: tunnel,
                 },
-            }));
+            )));
         }
         Err(DaemonClientError::Transport(error)) if error.is_connect() => {}
         Err(error) => return Err(direct_transport_error(&host.alias, error)),
     }
     drop(tunnel);
-    let mut bootstrap_lock = acquire_bootstrap_lock(
-        &host.alias,
-        binding.destination(),
-        LockFirstOperationKind::InitialSetup,
-    )?;
-    confirm_bootstrap_lock(&host.alias, &mut bootstrap_lock)?;
     let mut selected_host_config = host.config.clone();
     selected_host_config.daemon_home = daemon_path_overrides.home.clone();
     selected_host_config.daemon_config_file = daemon_path_overrides.config_file.clone();
@@ -5146,12 +5419,7 @@ pub(crate) fn discover_ssh_host(
     selected_host_config.daemon_cache_dir = daemon_path_overrides.cache_dir.clone();
     selected_host_config.daemon_log_dir = daemon_path_overrides.log_dir.clone();
     let pending_resume = match target
-        .inspect_initial_host_state(
-            binding.destination(),
-            &directories,
-            &selected_host_config,
-            &mut bootstrap_lock,
-        )
+        .inspect_initial_host_state(binding.destination(), &directories, &selected_host_config)
         .map_err(|error| map_ssh_daemon_bootstrap_error(&host.alias, error))?
     {
         ssh_bootstrap::InitialHostState::Fresh => None,
@@ -5164,18 +5432,21 @@ pub(crate) fn discover_ssh_host(
                 None,
             ));
         }
-        ssh_bootstrap::InitialHostState::PendingIdentityCommit {
-            operation_id,
-            host_identity,
-        } => {
-            if requested_identity.is_some_and(|expected| expected != host_identity.as_str()) {
+        ssh_bootstrap::InitialHostState::PendingIdentityCommit(record) => {
+            if requested_identity
+                .is_some_and(|expected| expected != record.candidate_host_identity().as_str())
+            {
                 return Err(SatelleError::host_identity_mismatch(&host.alias));
             }
-            Some((operation_id, host_identity))
+            Some(record)
         }
     };
-    let (operation_id, identity) = match pending_resume {
-        Some(resume) => resume,
+    let (operation_id, identity, state) = match pending_resume {
+        Some(record) => (
+            record.operation_id().to_string(),
+            record.candidate_host_identity().clone(),
+            IdentityOperationState::Pending(record),
+        ),
         None => {
             let identity = requested_identity.map_or_else(
                 || {
@@ -5192,7 +5463,11 @@ pub(crate) fn discover_ssh_host(
                     })
                 },
             )?;
-            (bootstrap_lock.operation_id().to_string(), identity)
+            (
+                Uuid::now_v7().hyphenated().to_string(),
+                identity,
+                IdentityOperationState::Fresh,
+            )
         }
     };
     Ok(PendingSshTrust::Fresh(Box::new(PendingSshTrustCandidate {
@@ -5201,7 +5476,8 @@ pub(crate) fn discover_ssh_host(
         authenticated_user,
         previous_host_config: host.config.clone(),
         host_config: selected_host_config,
-        bootstrap_lock,
+        target,
+        state,
         identity,
         operation_id,
     })))

@@ -52,14 +52,15 @@ pub use events::{
 pub use ids::{IdParseError, SESSION_ID_PATTERN, SessionId, TurnId};
 pub use profiles::{ProfileField, ProfileSelectionSource, SelectedProfile};
 pub use secure_file::{
-    OwnerOnlyDirectory, OwnerOnlySecretFilePaths, SecureFileError, cleanup_owner_only_secret_file,
-    keyed_owner_only_secret_file_comparison_digest, keyed_secret_comparison_digest,
-    open_new_owner_only_file, open_or_create_owner_only_directory, open_or_create_owner_only_file,
-    open_owner_only_directory, owner_only_secret_destination_exists,
-    persist_new_owner_only_secret_file, publish_owner_only_secret_file,
-    read_bounded_regular_file_no_follow, read_owner_controlled_config_file,
-    read_owner_only_secret_config_file, read_owner_only_secret_file, read_trusted_ca_bundle_file,
-    rollback_owner_only_secret_file, stage_owner_only_secret_file, sync_owner_only_directory,
+    OwnerOnlyDirectory, OwnerOnlySecretFilePaths, SecureFileError, SshIdentityCommitRecord,
+    cleanup_owner_only_secret_file, keyed_owner_only_secret_file_comparison_digest,
+    keyed_secret_comparison_digest, open_new_owner_only_file, open_or_create_owner_only_directory,
+    open_or_create_owner_only_file, open_owner_only_directory,
+    owner_only_secret_destination_exists, persist_new_owner_only_secret_file,
+    publish_owner_only_secret_file, read_bounded_regular_file_no_follow,
+    read_owner_controlled_config_file, read_owner_only_secret_config_file,
+    read_owner_only_secret_file, read_trusted_ca_bundle_file, rollback_owner_only_secret_file,
+    stage_owner_only_secret_file, sync_owner_only_directory,
 };
 
 pub const PRODUCT_NAME: &str = "Satelle";

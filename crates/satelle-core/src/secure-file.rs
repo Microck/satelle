@@ -7,6 +7,7 @@ use zeroize::Zeroizing;
 
 const MAX_SECRET_FILE_BYTES: usize = 64 * 1024;
 const MAX_CONFIG_FILE_BYTES: usize = 1024 * 1024;
+const SSH_IDENTITY_COMMIT_SCHEMA: &str = "satelle.ssh-host-identity-commit.v2";
 
 #[derive(Clone, Copy, Debug, Error, Eq, PartialEq)]
 pub enum SecureFileError {
@@ -24,6 +25,203 @@ pub enum SecureFileError {
     PublishedCleanupFailed,
     #[error("the prior owner-only secret could not be restored")]
     RollbackFailed,
+    #[error("the SSH identity operation record is invalid")]
+    InvalidSshIdentityOperation,
+}
+
+/// Immutable recovery authority for one accepted fresh SSH Host identity.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SshIdentityCommitRecord {
+    operation_id: String,
+    candidate_host_identity: crate::session::HostIdentityRef,
+    target_id: String,
+    canonical_state_root: String,
+    artifact_version: String,
+    archive_sha256: String,
+    binary_sha256: String,
+    exact_remote_path: String,
+}
+
+impl SshIdentityCommitRecord {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        operation_id: impl Into<String>,
+        candidate_host_identity: crate::session::HostIdentityRef,
+        target_id: impl Into<String>,
+        canonical_state_root: impl Into<String>,
+        artifact_version: impl Into<String>,
+        archive_sha256: impl Into<String>,
+        binary_sha256: impl Into<String>,
+        exact_remote_path: impl Into<String>,
+    ) -> Result<Self, SecureFileError> {
+        let record = Self {
+            operation_id: operation_id.into(),
+            candidate_host_identity,
+            target_id: target_id.into(),
+            canonical_state_root: canonical_state_root.into(),
+            artifact_version: artifact_version.into(),
+            archive_sha256: archive_sha256.into(),
+            binary_sha256: binary_sha256.into(),
+            exact_remote_path: exact_remote_path.into(),
+        };
+        record.validate()?;
+        Ok(record)
+    }
+
+    pub fn parse(encoded: &str) -> Result<Self, SecureFileError> {
+        if encoded.len() > 4096 || encoded.contains('\0') {
+            return Err(SecureFileError::InvalidSshIdentityOperation);
+        }
+        let mut lines = encoded.split('\n');
+        if lines.next() != Some(SSH_IDENTITY_COMMIT_SCHEMA) {
+            return Err(SecureFileError::InvalidSshIdentityOperation);
+        }
+        let field = |line: Option<&str>, prefix: &str| {
+            line.and_then(|line| line.strip_prefix(prefix))
+                .filter(|value| !value.is_empty())
+                .map(str::to_string)
+                .ok_or(SecureFileError::InvalidSshIdentityOperation)
+        };
+        let operation_id = field(lines.next(), "operation_id=")?;
+        let candidate_host_identity =
+            crate::session::HostIdentityRef::new(field(lines.next(), "candidate_host_identity=")?)
+                .map_err(|_| SecureFileError::InvalidSshIdentityOperation)?;
+        let target_id = field(lines.next(), "target_id=")?;
+        let canonical_state_root = field(lines.next(), "canonical_state_root=")?;
+        let artifact_version = field(lines.next(), "artifact_version=")?;
+        let archive_sha256 = field(lines.next(), "archive_sha256=")?;
+        let binary_sha256 = field(lines.next(), "binary_sha256=")?;
+        let exact_remote_path = field(lines.next(), "exact_remote_path=")?;
+        if lines.next().is_some() {
+            return Err(SecureFileError::InvalidSshIdentityOperation);
+        }
+        Self::new(
+            operation_id,
+            candidate_host_identity,
+            target_id,
+            canonical_state_root,
+            artifact_version,
+            archive_sha256,
+            binary_sha256,
+            exact_remote_path,
+        )
+    }
+
+    pub fn encode(&self) -> String {
+        format!(
+            concat!(
+                "{}\n",
+                "operation_id={}\n",
+                "candidate_host_identity={}\n",
+                "target_id={}\n",
+                "canonical_state_root={}\n",
+                "artifact_version={}\n",
+                "archive_sha256={}\n",
+                "binary_sha256={}\n",
+                "exact_remote_path={}"
+            ),
+            SSH_IDENTITY_COMMIT_SCHEMA,
+            self.operation_id,
+            self.candidate_host_identity.as_str(),
+            self.target_id,
+            self.canonical_state_root,
+            self.artifact_version,
+            self.archive_sha256,
+            self.binary_sha256,
+            self.exact_remote_path,
+        )
+    }
+
+    pub fn operation_id(&self) -> &str {
+        &self.operation_id
+    }
+
+    pub fn candidate_host_identity(&self) -> &crate::session::HostIdentityRef {
+        &self.candidate_host_identity
+    }
+
+    pub fn target_id(&self) -> &str {
+        &self.target_id
+    }
+
+    pub fn canonical_state_root(&self) -> &str {
+        &self.canonical_state_root
+    }
+
+    pub fn artifact_version(&self) -> &str {
+        &self.artifact_version
+    }
+
+    pub fn archive_sha256(&self) -> &str {
+        &self.archive_sha256
+    }
+
+    pub fn binary_sha256(&self) -> &str {
+        &self.binary_sha256
+    }
+
+    pub fn exact_remote_path(&self) -> &str {
+        &self.exact_remote_path
+    }
+
+    fn validate(&self) -> Result<(), SecureFileError> {
+        let parsed = uuid::Uuid::parse_str(&self.operation_id)
+            .map_err(|_| SecureFileError::InvalidSshIdentityOperation)?;
+        if parsed.hyphenated().to_string() != self.operation_id
+            || self.operation_id.as_bytes().get(14) != Some(&b'7')
+            || !matches!(
+                self.target_id.as_str(),
+                "linux-arm64-gnu"
+                    | "linux-x64-gnu"
+                    | "darwin-arm64"
+                    | "darwin-x64"
+                    | "win32-arm64-msvc"
+                    | "win32-x64-msvc"
+            )
+            || !valid_record_text(&self.canonical_state_root)
+            || !valid_record_text(&self.artifact_version)
+            || !valid_sha256(&self.archive_sha256)
+            || !valid_sha256(&self.binary_sha256)
+            || !valid_record_text(&self.exact_remote_path)
+        {
+            return Err(SecureFileError::InvalidSshIdentityOperation);
+        }
+        let executable = if self.target_id.starts_with("win32-") {
+            "satelle.exe"
+        } else {
+            "satelle"
+        };
+        let normalized_path = self.exact_remote_path.replace('\\', "/");
+        let absolute = if self.target_id.starts_with("win32-") {
+            normalized_path.as_bytes().get(1) == Some(&b':')
+                && normalized_path.as_bytes().get(2) == Some(&b'/')
+        } else {
+            normalized_path.starts_with('/')
+        };
+        let expected_suffix = format!(
+            "/bootstrap/{}/{}/{}",
+            self.operation_id, self.binary_sha256, executable
+        );
+        if !absolute || !normalized_path.ends_with(&expected_suffix) {
+            return Err(SecureFileError::InvalidSshIdentityOperation);
+        }
+        Ok(())
+    }
+}
+
+fn valid_record_text(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 1024
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii() && !matches!(byte, b'\0' | b'\n' | b'\r'))
+}
+
+fn valid_sha256(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
 }
 
 #[cfg(not(windows))]
@@ -2512,6 +2710,232 @@ mod tests {
 
     #[cfg(unix)]
     use std::os::unix::fs::{PermissionsExt, symlink};
+
+    const SSH_IDENTITY_OPERATION_ID: &str = "0195f6d5-18da-7a80-8000-000000000001";
+    const SSH_IDENTITY_BINARY_SHA256: &str =
+        "2222222222222222222222222222222222222222222222222222222222222222";
+    const SSH_IDENTITY_ARCHIVE_SHA256: &str =
+        "1111111111111111111111111111111111111111111111111111111111111111";
+
+    #[cfg(any(unix, windows))]
+    fn ssh_identity_record(
+        target_id: &str,
+        state_root: &str,
+        exact_remote_path: &str,
+    ) -> SshIdentityCommitRecord {
+        SshIdentityCommitRecord::new(
+            SSH_IDENTITY_OPERATION_ID,
+            crate::session::HostIdentityRef::new(
+                "host-0195f6d5-18da-7a80-8000-000000000002".to_string(),
+            )
+            .expect("valid Host Identity fixture"),
+            target_id,
+            state_root,
+            "0.1.0",
+            SSH_IDENTITY_ARCHIVE_SHA256,
+            SSH_IDENTITY_BINARY_SHA256,
+            exact_remote_path,
+        )
+        .expect("valid SSH identity operation record")
+    }
+
+    #[cfg(any(unix, windows))]
+    fn posix_ssh_identity_record() -> SshIdentityCommitRecord {
+        ssh_identity_record(
+            "linux-x64-gnu",
+            "/home/operator/.local/state/satelle",
+            &format!(
+                "/home/operator/.cache/satelle/bootstrap/{SSH_IDENTITY_OPERATION_ID}/{SSH_IDENTITY_BINARY_SHA256}/satelle"
+            ),
+        )
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn ssh_identity_commit_record_v2_roundtrips_with_exact_field_order() {
+        let record = posix_ssh_identity_record();
+        let encoded = format!(
+            concat!(
+                "satelle.ssh-host-identity-commit.v2\n",
+                "operation_id={0}\n",
+                "candidate_host_identity=host-0195f6d5-18da-7a80-8000-000000000002\n",
+                "target_id=linux-x64-gnu\n",
+                "canonical_state_root=/home/operator/.local/state/satelle\n",
+                "artifact_version=0.1.0\n",
+                "archive_sha256={1}\n",
+                "binary_sha256={2}\n",
+                "exact_remote_path=/home/operator/.cache/satelle/bootstrap/",
+                "{0}/{2}/satelle"
+            ),
+            SSH_IDENTITY_OPERATION_ID, SSH_IDENTITY_ARCHIVE_SHA256, SSH_IDENTITY_BINARY_SHA256,
+        );
+
+        assert_eq!(record.encode(), encoded);
+        assert_eq!(
+            SshIdentityCommitRecord::parse(&encoded).expect("parse exact v2 record"),
+            record
+        );
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn ssh_identity_commit_record_parser_rejects_schema_field_and_line_drift() {
+        let encoded = posix_ssh_identity_record().encode();
+        let lines = encoded.lines().collect::<Vec<_>>();
+        let mut swapped = lines.clone();
+        swapped.swap(2, 3);
+        let missing = lines[..lines.len() - 1].join("\n");
+        let duplicated = format!("{encoded}\n{}", lines[8]);
+
+        for invalid in [
+            encoded.replacen(
+                "satelle.ssh-host-identity-commit.v2",
+                "satelle.ssh-host-identity-commit.v1",
+                1,
+            ),
+            swapped.join("\n"),
+            missing,
+            duplicated,
+            format!("{encoded}\nunknown=value"),
+            format!("{encoded}\n"),
+        ] {
+            assert!(
+                SshIdentityCommitRecord::parse(&invalid).is_err(),
+                "schema shape must fail closed: {invalid:?}"
+            );
+        }
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn ssh_identity_commit_record_rejects_noncanonical_text_uuid_target_and_digests() {
+        let encoded = posix_ssh_identity_record().encode();
+        for invalid in [
+            encoded.replace("artifact_version=0.1.0", "artifact_version=0.1.0\0"),
+            encoded.replace("artifact_version=0.1.0", "artifact_version=0.1.0\r"),
+            encoded.replace(
+                "artifact_version=0.1.0",
+                "artifact_version=0.1.0\ninjected=x",
+            ),
+            encoded.replace("artifact_version=0.1.0", "artifact_version=0.1.\u{e9}"),
+            encoded.replace(
+                SSH_IDENTITY_OPERATION_ID,
+                "0195F6D5-18DA-7A80-8000-000000000001",
+            ),
+            encoded.replace(
+                SSH_IDENTITY_OPERATION_ID,
+                "0195f6d5-18da-4a80-8000-000000000001",
+            ),
+            encoded.replace("target_id=linux-x64-gnu", "target_id=linux-x64-musl"),
+            encoded.replace(
+                SSH_IDENTITY_ARCHIVE_SHA256,
+                "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+            ),
+            encoded.replace(SSH_IDENTITY_ARCHIVE_SHA256, &"1".repeat(63)),
+            encoded.replace(
+                SSH_IDENTITY_BINARY_SHA256,
+                "gggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggg",
+            ),
+        ] {
+            assert!(
+                SshIdentityCommitRecord::parse(&invalid).is_err(),
+                "noncanonical record text must fail closed: {invalid:?}"
+            );
+        }
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn ssh_identity_commit_record_requires_exact_platform_operation_path() {
+        let posix_path = format!(
+            "/home/operator/.cache/satelle/bootstrap/{SSH_IDENTITY_OPERATION_ID}/{SSH_IDENTITY_BINARY_SHA256}/satelle"
+        );
+        let posix = ssh_identity_record(
+            "darwin-arm64",
+            "/Users/operator/.local/state/satelle",
+            &posix_path,
+        );
+        assert_eq!(posix.exact_remote_path(), posix_path);
+
+        let windows_path = format!(
+            "C:\\Users\\operator\\AppData\\Local\\satelle\\bootstrap\\{SSH_IDENTITY_OPERATION_ID}\\{SSH_IDENTITY_BINARY_SHA256}\\satelle.exe"
+        );
+        let windows = ssh_identity_record("win32-x64-msvc", "C:\\Satelle\\state", &windows_path);
+        assert_eq!(windows.exact_remote_path(), windows_path);
+
+        for (target, state_root, invalid_path) in [
+            (
+                "linux-x64-gnu",
+                "/home/operator/.local/state/satelle",
+                format!(
+                    "home/operator/.cache/satelle/bootstrap/{SSH_IDENTITY_OPERATION_ID}/{SSH_IDENTITY_BINARY_SHA256}/satelle"
+                ),
+            ),
+            (
+                "linux-x64-gnu",
+                "/home/operator/.local/state/satelle",
+                format!(
+                    "/home/operator/.cache/satelle/bootstrap/0195f6d5-18da-7a80-8000-000000000099/{SSH_IDENTITY_BINARY_SHA256}/satelle"
+                ),
+            ),
+            (
+                "linux-x64-gnu",
+                "/home/operator/.local/state/satelle",
+                format!(
+                    "/home/operator/.cache/satelle/bootstrap/{SSH_IDENTITY_OPERATION_ID}/{}/satelle",
+                    "33".repeat(32)
+                ),
+            ),
+            (
+                "linux-x64-gnu",
+                "/home/operator/.local/state/satelle",
+                format!(
+                    "/home/operator/.cache/satelle/bootstrap/{SSH_IDENTITY_OPERATION_ID}/{SSH_IDENTITY_BINARY_SHA256}/satelle.exe"
+                ),
+            ),
+            (
+                "win32-x64-msvc",
+                "C:\\Satelle\\state",
+                format!(
+                    "C:Users\\operator\\AppData\\Local\\satelle\\bootstrap\\{SSH_IDENTITY_OPERATION_ID}\\{SSH_IDENTITY_BINARY_SHA256}\\satelle.exe"
+                ),
+            ),
+            (
+                "win32-x64-msvc",
+                "C:\\Satelle\\state",
+                format!(
+                    "C:\\Users\\operator\\AppData\\Local\\satelle\\bootstrap\\{SSH_IDENTITY_OPERATION_ID}\\{SSH_IDENTITY_BINARY_SHA256}\\satelle"
+                ),
+            ),
+        ] {
+            assert!(
+                SshIdentityCommitRecord::new(
+                    SSH_IDENTITY_OPERATION_ID,
+                    crate::session::HostIdentityRef::new(
+                        "host-0195f6d5-18da-7a80-8000-000000000002".to_string(),
+                    )
+                    .expect("valid Host Identity fixture"),
+                    target,
+                    state_root,
+                    "0.1.0",
+                    SSH_IDENTITY_ARCHIVE_SHA256,
+                    SSH_IDENTITY_BINARY_SHA256,
+                    invalid_path,
+                )
+                .is_err(),
+                "noncanonical platform path must fail closed"
+            );
+        }
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn ssh_identity_commit_record_parser_enforces_maximum_encoded_size() {
+        let mut oversized = posix_ssh_identity_record().encode();
+        oversized.push_str(&"x".repeat(4_097 - oversized.len()));
+        assert_eq!(oversized.len(), 4_097);
+        assert!(SshIdentityCommitRecord::parse(&oversized).is_err());
+    }
 
     #[cfg(unix)]
     fn secure_test_root(path: &Path) {

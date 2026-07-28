@@ -32,7 +32,7 @@ pub(crate) use self::logs::{SafeLogRecord, StoredLogRecord};
 use self::open::DATABASE_FILE_NAME;
 #[cfg(all(test, unix))]
 use self::open::LOCK_FILE_NAME;
-use self::open::{PROTECTED_FILE_NAMES, sqlite_error};
+use self::open::sqlite_error;
 #[cfg(test)]
 pub(crate) use self::operator_log::{
     OperatorLogFailureKind, OperatorLogSink, OperatorLogWriteOutcome,
@@ -71,67 +71,75 @@ use satelle_core::session::{
 };
 use satelle_core::{
     ProviderBindingAuthorization, ProviderBindingSource, PublicResolvedProviderBinding,
-    ResolvedProviderBinding, SatelleError, SessionId, TurnId, open_or_create_owner_only_directory,
-    persist_new_owner_only_secret_file, read_owner_only_secret_file, sync_owner_only_directory,
+    ResolvedProviderBinding, SatelleError, SessionId, SshIdentityCommitRecord, TurnId,
 };
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::error::Error;
 use std::fmt;
+use std::io::Read;
 use std::path::Path;
 #[cfg(any(test, feature = "test-support"))]
 use std::path::PathBuf;
 use time::OffsetDateTime;
 
 const SSH_IDENTITY_COMMIT_JOURNAL: &str = ".satelle-ssh-identity-commit";
-const SSH_IDENTITY_COMMIT_SCHEMA: &str = "satelle.ssh-host-identity-commit.v1";
 
-struct SshIdentityCommitJournal {
-    operation_id: String,
-    host_identity: HostIdentityRef,
+fn sha256_path(path: &Path) -> Result<String, StorageError> {
+    let mut file = std::fs::File::open(path).map_err(|source| {
+        StorageError::with_source(StorageErrorKind::InvalidStoredState, source)
+    })?;
+    let mut digest = Sha256::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let count = file.read(&mut buffer).map_err(|source| {
+            StorageError::with_source(StorageErrorKind::InvalidStoredState, source)
+        })?;
+        if count == 0 {
+            return Ok(digest
+                .finalize()
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect());
+        }
+        digest.update(&buffer[..count]);
+    }
 }
 
-impl SshIdentityCommitJournal {
-    fn new(operation_id: &str, host_identity: &HostIdentityRef) -> Result<Self, StorageError> {
-        uuid::Uuid::parse_str(operation_id)
-            .map_err(|_| StorageError::new(StorageErrorKind::InvalidInput))?;
-        Ok(Self {
-            operation_id: operation_id.to_string(),
-            host_identity: host_identity.clone(),
-        })
-    }
+fn executing_path_matches(recorded: &str, executing: &Path) -> bool {
+    let Ok(recorded) = std::fs::canonicalize(recorded) else {
+        return false;
+    };
+    let Ok(executing) = std::fs::canonicalize(executing) else {
+        return false;
+    };
+    recorded == executing
+}
 
-    fn encode(&self) -> String {
-        format!(
-            "{SSH_IDENTITY_COMMIT_SCHEMA}\noperation_id={}\nhost_identity={}",
-            self.operation_id,
-            self.host_identity.as_str(),
-        )
+const fn current_target_id() -> &'static str {
+    #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+    {
+        "linux-arm64-gnu"
     }
-
-    fn parse(encoded: &str) -> Result<Self, StorageError> {
-        let mut lines = encoded.split('\n');
-        if lines.next() != Some(SSH_IDENTITY_COMMIT_SCHEMA) {
-            return Err(StorageError::new(StorageErrorKind::InvalidStoredState));
-        }
-        let operation_id = lines
-            .next()
-            .and_then(|line| line.strip_prefix("operation_id="))
-            .ok_or_else(|| StorageError::new(StorageErrorKind::InvalidStoredState))?;
-        uuid::Uuid::parse_str(operation_id)
-            .map_err(|_| StorageError::new(StorageErrorKind::InvalidStoredState))?;
-        let host_identity = lines
-            .next()
-            .and_then(|line| line.strip_prefix("host_identity="))
-            .ok_or_else(|| StorageError::new(StorageErrorKind::InvalidStoredState))?;
-        let host_identity = HostIdentityRef::new(host_identity.to_string())
-            .map_err(|_| StorageError::new(StorageErrorKind::InvalidStoredState))?;
-        if lines.next().is_some() {
-            return Err(StorageError::new(StorageErrorKind::InvalidStoredState));
-        }
-        Ok(Self {
-            operation_id: operation_id.to_string(),
-            host_identity,
-        })
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    {
+        "linux-x64-gnu"
+    }
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    {
+        "darwin-arm64"
+    }
+    #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+    {
+        "darwin-x64"
+    }
+    #[cfg(all(target_os = "windows", target_arch = "aarch64"))]
+    {
+        "win32-arm64-msvc"
+    }
+    #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
+    {
+        "win32-x64-msvc"
     }
 }
 
@@ -142,20 +150,27 @@ mod ssh_identity_commit_tests {
     const OPERATION_ID: &str = "0195f6d5-18da-7a80-8000-000000000001";
     const OTHER_OPERATION_ID: &str = "0195f6d5-18da-7a80-8000-000000000002";
     const HOST_IDENTITY: &str = "host-0195f6d5-18da-7a80-8000-000000000003";
-    const OTHER_HOST_IDENTITY: &str = "host-0195f6d5-18da-7a80-8000-000000000004";
+    const EXPECTED_MIGRATIONS: &[(i64, &str)] = &[
+        (1, "fnv1a64:4510abfafef47a94"),
+        (2, "fnv1a64:983538919ef94c60"),
+        (3, "fnv1a64:3bd8f1edd993d68e"),
+        (4, "fnv1a64:0acb1dd04635f1c3"),
+        (5, "fnv1a64:0721b4f8eebf7e32"),
+        (6, "fnv1a64:9e412e0d3a845cd5"),
+        (7, "fnv1a64:e8bf3ca4c0aa3b74"),
+        (8, "fnv1a64:6f25e8f86e1f6294"),
+        (9, "fnv1a64:be23d907fb9ba35f"),
+        (10, "fnv1a64:cd0986f490266e82"),
+        (11, "fnv1a64:a861bcf791484f8b"),
+        (12, "fnv1a64:a5672c42bd40d2a8"),
+        (13, "fnv1a64:5db2b0aa00a5f745"),
+    ];
+    const EXPECTED_SCHEMA_ROW_COUNT: usize = 69;
+    const EXPECTED_SCHEMA_SHA256: &str =
+        "6d8e2eba05361b91d977feb785033618a1f1688094fe52adb0056b933c70f1be";
 
-    fn identity(value: &str) -> HostIdentityRef {
-        HostIdentityRef::new(value.to_string()).expect("valid Host Identity fixture")
-    }
-
-    fn stage_interrupted_journal(state_root: &Path) {
-        let journal = SshIdentityCommitJournal::new(OPERATION_ID, &identity(HOST_IDENTITY))
-            .expect("construct identity journal");
-        persist_new_owner_only_secret_file(
-            &state_root.join(SSH_IDENTITY_COMMIT_JOURNAL),
-            &journal.encode(),
-        )
-        .expect("persist interrupted identity journal");
+    fn identity() -> HostIdentityRef {
+        HostIdentityRef::new(HOST_IDENTITY.to_string()).expect("valid Host Identity fixture")
     }
 
     fn prepared_state_root(state: &crate::TestStateDir) -> PathBuf {
@@ -167,136 +182,300 @@ mod ssh_identity_commit_tests {
         state_root
     }
 
-    #[test]
-    fn interrupted_identity_commit_requires_exact_resume_and_cleans_up() {
-        let state = crate::TestStateDir::new().expect("create state directory");
-        let state_root = prepared_state_root(&state);
-        stage_interrupted_journal(&state_root);
-
-        assert_eq!(
-            Storage::inspect_fresh_ssh_identity_commit(&state_root)
-                .expect("inspect interrupted commit"),
-            Some((OPERATION_ID.to_string(), identity(HOST_IDENTITY)))
-        );
-        assert!(
-            Storage::commit_fresh_ssh_host_identity(
-                &state_root,
-                &identity(OTHER_HOST_IDENTITY),
-                OPERATION_ID,
-            )
-            .is_err()
-        );
-        assert!(
-            Storage::commit_fresh_ssh_host_identity(
-                &state_root,
-                &identity(HOST_IDENTITY),
-                OTHER_OPERATION_ID,
-            )
-            .is_err()
-        );
-        assert!(
-            Storage::fresh_ssh_identity_commit_pending(&state_root)
-                .expect("mismatches retain recovery")
-        );
-
-        let committed = Storage::commit_fresh_ssh_host_identity(
-            &state_root,
-            &identity(HOST_IDENTITY),
+    fn operation(state_root: &Path, create_artifact: bool) -> (SshIdentityCommitRecord, PathBuf) {
+        let artifact_bytes = b"retained SSH Host artifact";
+        let binary_sha256 = Sha256::digest(artifact_bytes)
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        let artifact = state_root
+            .parent()
+            .expect("state root has a parent")
+            .join("cache")
+            .join("bootstrap")
+            .join(OPERATION_ID)
+            .join(&binary_sha256)
+            .join(if cfg!(windows) {
+                "satelle.exe"
+            } else {
+                "satelle"
+            });
+        if create_artifact {
+            std::fs::create_dir_all(artifact.parent().expect("artifact has a parent"))
+                .expect("create operation artifact directory");
+            std::fs::write(&artifact, artifact_bytes).expect("write retained operation artifact");
+        }
+        let record = SshIdentityCommitRecord::new(
             OPERATION_ID,
+            identity(),
+            current_target_id(),
+            state_root.to_string_lossy(),
+            env!("CARGO_PKG_VERSION"),
+            "11".repeat(32),
+            binary_sha256,
+            artifact.to_string_lossy(),
         )
-        .expect("resume exact identity commit");
-        assert_eq!(committed, identity(HOST_IDENTITY));
-        assert!(
-            !Storage::fresh_ssh_identity_commit_pending(&state_root)
-                .expect("successful resume removes journal")
+        .expect("construct identity operation record");
+        (record, artifact)
+    }
+
+    fn persist_record(state_root: &Path, record: &SshIdentityCommitRecord) {
+        satelle_core::persist_new_owner_only_secret_file(
+            &state_root.join(SSH_IDENTITY_COMMIT_JOURNAL),
+            &record.encode(),
+        )
+        .expect("persist interrupted identity operation record");
+    }
+
+    fn update_length_prefixed(digest: &mut Sha256, value: &str) {
+        digest.update(
+            u32::try_from(value.len())
+                .expect("schema field length fits u32")
+                .to_be_bytes(),
         );
-        let reopened =
-            Storage::open_without_restart_recovery(&state_root).expect("reopen committed store");
+        digest.update(value.as_bytes());
+    }
+
+    fn assert_canonical_timestamp(field: &str, value: &str) {
+        let parsed =
+            parse_time(value).unwrap_or_else(|_| panic!("{field} parses as an RFC 3339 timestamp"));
         assert_eq!(
-            reopened.host_identity().expect("read committed identity"),
-            identity(HOST_IDENTITY)
+            format_time(parsed).expect("format parsed storage timestamp"),
+            value,
+            "{field} uses the canonical UTC storage representation"
         );
     }
 
-    #[test]
-    fn inspecting_or_refusing_an_interrupted_commit_preserves_recovery() {
-        let state = crate::TestStateDir::new().expect("create state directory");
-        let state_root = prepared_state_root(&state);
-        stage_interrupted_journal(&state_root);
-        let observed = Storage::inspect_fresh_ssh_identity_commit(&state_root)
-            .expect("inspect interrupted commit");
-        assert_eq!(
-            observed,
-            Some((OPERATION_ID.to_string(), identity(HOST_IDENTITY)))
-        );
-        assert!(
-            Storage::fresh_ssh_identity_commit_pending(&state_root)
-                .expect("read-only inspection retains journal")
-        );
-    }
-
-    #[test]
-    fn ordinary_existing_state_exposes_no_pending_identity() {
-        let state = crate::TestStateDir::new().expect("create state directory");
-        drop(
-            Storage::open_without_restart_recovery(state.path())
-                .expect("initialize ordinary existing state"),
-        );
-        assert_eq!(
-            Storage::inspect_fresh_ssh_identity_commit(state.path())
-                .expect("inspect ordinary state"),
-            None
-        );
-    }
-
-    #[test]
-    fn fresh_identity_commit_rejects_existing_state_without_a_journal_and_preserves_identity() {
-        let state = crate::TestStateDir::new().expect("create state directory");
-        let ordinary = Storage::open_without_restart_recovery(state.path())
-            .expect("initialize ordinary existing state");
-        let original_identity = ordinary.host_identity().expect("read original identity");
-        drop(ordinary);
-
-        assert!(
-            Storage::commit_fresh_ssh_host_identity(
-                state.path(),
-                &identity(HOST_IDENTITY),
-                OPERATION_ID,
+    fn assert_committed_identity_contract(storage: &Storage) {
+        let connection = &storage.connection;
+        let (singleton, host_identity, identity_created_at): (i64, String, String) = connection
+            .query_row(
+                "SELECT singleton, host_identity_ref, created_at FROM daemon_identity",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
-            .is_err()
+            .expect("read committed Host Identity");
+        assert_eq!(singleton, 1);
+        assert_eq!(host_identity, HOST_IDENTITY);
+        assert_canonical_timestamp("daemon_identity.created_at", &identity_created_at);
+
+        let (key_version, key_material, key_created_at, retired_at): (
+            i64,
+            Vec<u8>,
+            String,
+            Option<String>,
+        ) = connection
+            .query_row(
+                "SELECT key_version, key_material, created_at, retired_at \
+                 FROM idempotency_hmac_keys",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .expect("read committed idempotency HMAC key");
+        assert_eq!(key_version, 1);
+        assert_eq!(key_material.len(), 32);
+        assert_canonical_timestamp("idempotency_hmac_keys.created_at", &key_created_at);
+        assert!(retired_at.is_none());
+
+        let (provider_singleton, provider_material, provider_created_at): (i64, Vec<u8>, String) =
+            connection
+                .query_row(
+                    "SELECT singleton, key_material, created_at FROM provider_smoke_hmac_key",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .expect("read committed provider HMAC key");
+        assert_eq!(provider_singleton, 1);
+        assert_eq!(provider_material.len(), 32);
+        assert_canonical_timestamp("provider_smoke_hmac_key.created_at", &provider_created_at);
+
+        let migrations = connection
+            .prepare(
+                "SELECT version, checksum, applied_at \
+                 FROM schema_migrations ORDER BY version",
+            )
+            .expect("prepare migration contract")
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })
+            .expect("read migration contract")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("collect migration contract");
+        assert_eq!(migrations.len(), EXPECTED_MIGRATIONS.len());
+        for ((version, checksum, applied_at), (expected_version, expected_checksum)) in
+            migrations.iter().zip(EXPECTED_MIGRATIONS)
+        {
+            assert_eq!(version, expected_version);
+            assert_eq!(checksum, expected_checksum);
+            assert_canonical_timestamp("schema_migrations.applied_at", applied_at);
+        }
+        let user_version: i64 = connection
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .expect("read schema user version");
+        assert_eq!(user_version, 13);
+
+        let schema = connection
+            .prepare(
+                "SELECT type, name, tbl_name, sql \
+                 FROM sqlite_schema ORDER BY type, name, tbl_name",
+            )
+            .expect("prepare complete schema contract")
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, Option<String>>(3)?
+                        .map(|sql| sql.split_whitespace().collect::<Vec<_>>().join(" ")),
+                ))
+            })
+            .expect("read complete schema contract")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("collect complete schema contract");
+        assert_eq!(schema.len(), EXPECTED_SCHEMA_ROW_COUNT);
+        let mut digest = Sha256::new();
+        digest.update(
+            u32::try_from(schema.len())
+                .expect("schema row count fits u32")
+                .to_be_bytes(),
         );
-        assert!(
-            !Storage::fresh_ssh_identity_commit_pending(state.path())
-                .expect("rejection must not leave a recovery journal")
-        );
-        let reopened = Storage::open_without_restart_recovery(state.path())
-            .expect("reopen the original store");
+        for (object_type, name, table_name, sql) in schema {
+            update_length_prefixed(&mut digest, &object_type);
+            update_length_prefixed(&mut digest, &name);
+            update_length_prefixed(&mut digest, &table_name);
+            match sql {
+                None => digest.update([0]),
+                Some(sql) => {
+                    digest.update([1]);
+                    update_length_prefixed(&mut digest, &sql);
+                }
+            }
+        }
         assert_eq!(
-            reopened.host_identity().expect("read preserved identity"),
-            original_identity
+            digest
+                .finalize()
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>(),
+            EXPECTED_SCHEMA_SHA256,
+            "the complete sqlite_schema matches the independent pinned snapshot"
         );
     }
 
     #[test]
-    fn fresh_identity_locked_preflight_precedes_database_creation() {
+    fn failed_fresh_upload_leaves_no_record_or_operation_artifact() {
         let state = crate::TestStateDir::new().expect("create state directory");
         let state_root = prepared_state_root(&state);
-        let preflight_observed = std::cell::Cell::new(false);
+        let (record, artifact) = operation(&state_root, false);
 
-        let parts =
-            super::open::open_parts_with_locked_preflight(&state_root, |claimed_directory| {
-                assert!(
-                    !claimed_directory
-                        .has_existing_store_state()
-                        .expect("inspect protected store leaves under the ownership lock")
-                );
-                preflight_observed.set(true);
-                Ok(())
-            })
-            .expect("open fresh storage after the locked preflight");
+        assert!(Storage::commit_fresh_ssh_host_identity(&state_root, &record, &artifact).is_err());
+        assert!(!artifact.exists());
+        assert!(!state_root.join(SSH_IDENTITY_COMMIT_JOURNAL).exists());
+    }
 
-        assert!(preflight_observed.get());
-        drop(parts);
+    #[test]
+    fn fresh_host_commit_creates_record_only_with_present_exact_artifact_and_retains_it() {
+        let state = crate::TestStateDir::new().expect("create state directory");
+        let state_root = prepared_state_root(&state);
+        let (record, artifact) = operation(&state_root, true);
+        let journal = state_root.join(SSH_IDENTITY_COMMIT_JOURNAL);
+        assert!(!journal.exists());
+
+        let committed = Storage::commit_fresh_ssh_host_identity(&state_root, &record, &artifact)
+            .expect("commit fresh identity from exact artifact");
+
+        assert_eq!(committed, identity());
+        assert_eq!(
+            std::fs::read_to_string(&journal).expect("read record"),
+            record.encode()
+        );
+        assert!(artifact.exists());
+        let storage =
+            Storage::open_without_restart_recovery(&state_root).expect("reopen committed storage");
+        assert_eq!(
+            storage.host_identity().expect("read Host Identity"),
+            identity()
+        );
+        drop(
+            storage
+                .provider_smoke_hmac_key()
+                .expect("read committed provider HMAC key"),
+        );
+        assert_committed_identity_contract(&storage);
+    }
+
+    #[test]
+    fn pending_identity_commit_requires_exact_record_and_artifact_and_retains_record_until_finalization()
+     {
+        let state = crate::TestStateDir::new().expect("create state directory");
+        let state_root = prepared_state_root(&state);
+        let (record, artifact) = operation(&state_root, true);
+        persist_record(&state_root, &record);
+        let mismatched = SshIdentityCommitRecord::new(
+            OPERATION_ID,
+            HostIdentityRef::new("host-0195f6d5-18da-7a80-8000-000000000004".to_string())
+                .expect("valid different identity"),
+            record.target_id(),
+            record.canonical_state_root(),
+            record.artifact_version(),
+            record.archive_sha256(),
+            record.binary_sha256(),
+            record.exact_remote_path(),
+        )
+        .expect("construct mismatched record");
+
+        assert!(
+            Storage::commit_fresh_ssh_host_identity(&state_root, &mismatched, &artifact).is_err()
+        );
+        std::fs::remove_file(&artifact).expect("remove exact artifact");
+        assert!(Storage::commit_fresh_ssh_host_identity(&state_root, &record, &artifact).is_err());
+        std::fs::write(&artifact, b"retained SSH Host artifact").expect("restore exact artifact");
+        Storage::commit_fresh_ssh_host_identity(&state_root, &record, &artifact)
+            .expect("resume exact pending operation");
+        assert!(state_root.join(SSH_IDENTITY_COMMIT_JOURNAL).exists());
+        assert!(artifact.exists());
+    }
+
+    #[test]
+    fn post_binding_record_delete_failure_preserves_artifact() {
+        let state = crate::TestStateDir::new().expect("create state directory");
+        let state_root = prepared_state_root(&state);
+        let (record, artifact) = operation(&state_root, true);
+        Storage::commit_fresh_ssh_host_identity(&state_root, &record, &artifact)
+            .expect("commit fresh identity");
+        let mut storage =
+            Storage::open_without_restart_recovery(&state_root).expect("open committed storage");
+
+        assert!(
+            storage
+                .finalize_fresh_ssh_identity_commit(OTHER_OPERATION_ID)
+                .is_err()
+        );
+        assert!(state_root.join(SSH_IDENTITY_COMMIT_JOURNAL).exists());
+        assert!(artifact.exists());
+    }
+
+    #[test]
+    fn post_binding_artifact_delete_failure_leaves_no_pending_record() {
+        let state = crate::TestStateDir::new().expect("create state directory");
+        let state_root = prepared_state_root(&state);
+        let (record, artifact) = operation(&state_root, true);
+        Storage::commit_fresh_ssh_host_identity(&state_root, &record, &artifact)
+            .expect("commit fresh identity");
+        let mut storage =
+            Storage::open_without_restart_recovery(&state_root).expect("open committed storage");
+
+        assert!(
+            storage
+                .finalize_fresh_ssh_identity_commit(OPERATION_ID)
+                .expect("delete durable record")
+        );
+        assert!(!state_root.join(SSH_IDENTITY_COMMIT_JOURNAL).exists());
+        assert!(artifact.exists());
     }
 }
 
@@ -1060,6 +1239,27 @@ pub(crate) struct Storage {
 }
 
 impl Storage {
+    #[cfg(test)]
+    pub(crate) fn open(state_root: &Path) -> Result<(Self, Vec<RecoverySubject>), StorageError> {
+        let mut storage = Self::open_without_restart_recovery(state_root)?;
+        let recovery = storage.initialize_restart_recovery()?;
+        Ok((storage, recovery))
+    }
+
+    pub(crate) fn open_without_restart_recovery(state_root: &Path) -> Result<Self, StorageError> {
+        let (connection, ownership_lock, state_directory) = open::open_parts(state_root)?;
+        auth::validate_sensitive_state(&connection)?;
+        Ok(Self {
+            connection,
+            _ownership_lock: ownership_lock,
+            _state_directory: state_directory,
+        })
+    }
+
+    pub(crate) fn has_existing_state(state_root: &Path) -> Result<bool, StorageError> {
+        open::prepare_state_root(state_root)?.has_existing_store_state()
+    }
+
     pub(crate) fn fresh_ssh_identity_commit_pending(
         state_root: &Path,
     ) -> Result<bool, StorageError> {
@@ -1073,88 +1273,39 @@ impl Storage {
         }
     }
 
-    pub(crate) fn inspect_fresh_ssh_identity_commit(
-        state_root: &Path,
-    ) -> Result<Option<(String, HostIdentityRef)>, StorageError> {
-        if !Self::fresh_ssh_identity_commit_pending(state_root)? {
-            return Ok(None);
-        }
-        let encoded = read_owner_only_secret_file(&state_root.join(SSH_IDENTITY_COMMIT_JOURNAL))
-            .map_err(|_| StorageError::new(StorageErrorKind::InvalidStoredState))?;
-        let journal = SshIdentityCommitJournal::parse(encoded.as_str())?;
-        Ok(Some((journal.operation_id, journal.host_identity)))
-    }
-
-    pub(crate) fn has_existing_state(state_root: &Path) -> Result<bool, StorageError> {
-        for file_name in PROTECTED_FILE_NAMES {
-            match std::fs::symlink_metadata(state_root.join(file_name)) {
-                Ok(_) => return Ok(true),
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                Err(error) => {
-                    return Err(StorageError::with_source(
-                        StorageErrorKind::StateDirectoryUnavailable,
-                        error,
-                    ));
-                }
-            }
-        }
-        Ok(false)
-    }
-
-    #[cfg(test)]
-    pub(crate) fn open(state_root: &Path) -> Result<(Self, Vec<RecoverySubject>), StorageError> {
-        let mut storage = Self::open_without_restart_recovery(state_root)?;
-        let recovery_subjects = storage.initialize_restart_recovery()?;
-        Ok((storage, recovery_subjects))
-    }
-
-    /// Opens and validates the authoritative store without changing lifecycle
-    /// state. This is used only for an idempotency replay lookup that must
-    /// remain local even when a new operation cannot pass external admission.
-    pub(crate) fn open_without_restart_recovery(state_root: &Path) -> Result<Self, StorageError> {
-        if Self::fresh_ssh_identity_commit_pending(state_root)? {
-            return Err(StorageError::new(StorageErrorKind::InvalidStoredState));
-        }
-        Self::open_without_restart_recovery_allowing_identity_commit(state_root)
-    }
-
-    fn open_without_restart_recovery_allowing_identity_commit(
-        state_root: &Path,
-    ) -> Result<Self, StorageError> {
-        let (connection, ownership_lock, state_directory) = open::open_parts(state_root)?;
-        let storage = Self {
-            connection,
-            _ownership_lock: ownership_lock,
-            _state_directory: state_directory,
-        };
-        auth::validate_sensitive_state(&storage.connection)?;
-        Ok(storage)
-    }
-
     pub(crate) fn commit_fresh_ssh_host_identity(
         state_root: &Path,
-        accepted_identity: &HostIdentityRef,
-        operation_id: &str,
+        record: &SshIdentityCommitRecord,
+        executing_artifact: &Path,
     ) -> Result<HostIdentityRef, StorageError> {
-        let journal_path = state_root.join(SSH_IDENTITY_COMMIT_JOURNAL);
-        let journal = SshIdentityCommitJournal::new(operation_id, accepted_identity)?;
-        let encoded = journal.encode();
+        let encoded = record.encode();
+        if record.target_id() != current_target_id()
+            || Path::new(record.canonical_state_root()) != state_root
+            || !executing_path_matches(record.exact_remote_path(), executing_artifact)
+            || record.artifact_version() != env!("CARGO_PKG_VERSION")
+            || sha256_path(executing_artifact)? != record.binary_sha256()
+        {
+            return Err(StorageError::new(StorageErrorKind::InvalidStoredState));
+        }
 
         let (connection, ownership_lock, state_directory) =
             open::open_parts_with_locked_preflight(state_root, |claimed_directory| {
-                if let Some((existing_operation, existing_identity)) =
-                    Self::inspect_fresh_ssh_identity_commit(state_root)?
+                match claimed_directory
+                    .read_private_leaf_bounded(SSH_IDENTITY_COMMIT_JOURNAL, 4_096)?
                 {
-                    if existing_operation != operation_id || existing_identity != *accepted_identity
-                    {
+                    Some(observed) if observed == encoded.as_bytes() => {}
+                    Some(_) => {
                         return Err(StorageError::new(StorageErrorKind::InvalidStoredState));
                     }
-                } else {
-                    if claimed_directory.has_existing_store_state()? {
-                        return Err(StorageError::new(StorageErrorKind::InvalidStoredState));
+                    None => {
+                        if claimed_directory.has_existing_store_state()? {
+                            return Err(StorageError::new(StorageErrorKind::InvalidStoredState));
+                        }
+                        claimed_directory.create_private_leaf_durable(
+                            SSH_IDENTITY_COMMIT_JOURNAL,
+                            encoded.as_bytes(),
+                        )?;
                     }
-                    persist_new_owner_only_secret_file(&journal_path, &encoded)
-                        .map_err(|_| StorageError::new(StorageErrorKind::OperationFailed))?;
                 }
                 Ok(())
             })?;
@@ -1165,21 +1316,39 @@ impl Storage {
         };
         auth::validate_sensitive_state(&storage.connection)?;
         let current = storage.host_identity()?;
-        if current != *accepted_identity {
-            auth::commit_fresh_host_identity(&mut storage.connection, accepted_identity)?;
+        if current != *record.candidate_host_identity() {
+            auth::commit_fresh_host_identity(
+                &mut storage.connection,
+                record.candidate_host_identity(),
+            )?;
         }
         let committed = storage.host_identity()?;
-        if committed != *accepted_identity {
+        if committed != *record.candidate_host_identity() {
             return Err(StorageError::new(StorageErrorKind::InvalidStoredState));
         }
-        std::fs::remove_file(&journal_path)
-            .map_err(|error| StorageError::with_source(StorageErrorKind::OperationFailed, error))?;
-        let directory = open_or_create_owner_only_directory(state_root)
-            .map_err(|_| StorageError::new(StorageErrorKind::UnsafeStatePath))?;
-        sync_owner_only_directory(state_root, &directory)
-            .map_err(|_| StorageError::new(StorageErrorKind::OperationFailed))?;
         drop(storage);
         Ok(committed)
+    }
+
+    pub(crate) fn finalize_fresh_ssh_identity_commit(
+        &mut self,
+        operation_id: &str,
+    ) -> Result<bool, StorageError> {
+        let Some(encoded) = self
+            ._state_directory
+            .read_private_leaf_bounded(SSH_IDENTITY_COMMIT_JOURNAL, 4_096)?
+        else {
+            return Ok(false);
+        };
+        let encoded = std::str::from_utf8(&encoded)
+            .map_err(|_| StorageError::new(StorageErrorKind::InvalidStoredState))?;
+        let record = SshIdentityCommitRecord::parse(encoded)
+            .map_err(|_| StorageError::new(StorageErrorKind::InvalidStoredState))?;
+        if record.operation_id() != operation_id {
+            return Err(StorageError::new(StorageErrorKind::InvalidStoredState));
+        }
+        self._state_directory
+            .delete_private_leaf_durable(SSH_IDENTITY_COMMIT_JOURNAL)
     }
 
     pub(crate) fn initialize_restart_recovery(

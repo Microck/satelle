@@ -84,7 +84,6 @@ const STATE_RELEASE_TIMEOUT: Duration = Duration::from_secs(20);
 const STATE_RELEASE_POLL_INTERVAL: Duration = Duration::from_millis(50);
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
-use uuid::Uuid;
 use zeroize::Zeroizing;
 
 #[derive(Parser, Debug)]
@@ -444,7 +443,8 @@ struct HostStartCommand {
         hide = true,
         value_name = "HOST_ID",
         requires = "bootstrap_token_stdin",
-        requires = "initial_identity_operation_id"
+        requires = "initial_identity_operation_id",
+        requires = "initial_identity_record"
     )]
     initial_host_identity: Option<String>,
     /// Internal Bootstrap Lock operation that owns the fresh identity commit.
@@ -453,28 +453,20 @@ struct HostStartCommand {
         hide = true,
         value_name = "OPERATION_ID",
         requires = "bootstrap_token_stdin",
-        requires = "initial_host_identity"
+        requires = "initial_host_identity",
+        requires = "initial_identity_record"
     )]
     initial_identity_operation_id: Option<String>,
-    /// Internal read-only inspection of an unfinished fresh SSH identity commit.
+    /// Internal exact v2 identity operation accepted by the Controller.
     #[arg(
         long,
         hide = true,
-        conflicts_with_all = [
-            "tls_cert",
-            "tls_key",
-            "foreground",
-            "bootstrap_token_stdin",
-            "initial_host_identity",
-            "initial_identity_operation_id",
-            "bootstrap_scope",
-            "bootstrap_native_readiness_timeout_ms",
-            "bootstrap_provider_smoke_timeout_ms",
-            "on_demand_idle_timeout_ms",
-            "service_config"
-        ]
+        value_name = "RECORD",
+        requires = "bootstrap_token_stdin",
+        requires = "initial_host_identity",
+        requires = "initial_identity_operation_id"
     )]
-    inspect_ssh_identity_commit: bool,
+    initial_identity_record: Option<String>,
     /// Internal least-privilege scope for the one SSH bootstrap operation.
     #[arg(long, hide = true, value_enum, requires = "bootstrap_token_stdin")]
     bootstrap_scope: Option<SshBootstrapScope>,
@@ -500,7 +492,7 @@ struct HostStartCommand {
             "bootstrap_token_stdin",
             "initial_host_identity",
             "initial_identity_operation_id",
-            "inspect_ssh_identity_commit",
+            "initial_identity_record",
             "bootstrap_scope",
             "bootstrap_native_readiness_timeout_ms",
             "bootstrap_provider_smoke_timeout_ms",
@@ -1319,9 +1311,6 @@ fn history_target(command: &Command) -> Option<HistoryTarget<'_>> {
         Command::Host {
             command: HostCommand::ReleaseState,
         } => return None,
-        Command::Host {
-            command: HostCommand::Start(command),
-        } if command.inspect_ssh_identity_commit => return None,
         Command::Host { command } => HistoryTarget {
             family: "host",
             selects_host: match command {
@@ -1706,7 +1695,7 @@ mod history_target_tests {
                 bootstrap_token_stdin,
                 initial_host_identity: None,
                 initial_identity_operation_id: None,
-                inspect_ssh_identity_commit: false,
+                initial_identity_record: None,
                 bootstrap_scope: bootstrap_token_stdin.then_some(SshBootstrapScope::Control),
                 bootstrap_native_readiness_timeout_ms: None,
                 bootstrap_provider_smoke_timeout_ms: None,
@@ -2710,7 +2699,7 @@ fn run_setup(
         )));
     }
 
-    let first_ssh_discovery = if first_ssh_trust && !command.dry_run {
+    let mut first_ssh_discovery = if first_ssh_trust && !command.dry_run {
         let discovery = inspect_first_ssh_host_during_setup(
             &command,
             command.yes || trusted_consent,
@@ -2829,9 +2818,10 @@ fn run_setup(
             native_invalidation_action = Some(cache_update);
         }
 
-        if let Some(discovery) = &first_ssh_discovery {
+        if let Some(discovery) = first_ssh_discovery.as_mut() {
             persist_host_identity(&user_config_path, &host.alias, &discovery.identity)
                 .map_err(failure)?;
+            discovery.finalize_after_binding().map_err(failure)?;
             host.config.expected_host_id = Some(discovery.identity.clone());
             transport =
                 setup_transport_if_required(host_setup_required, || transport_for_setup(&host))?;
@@ -3017,18 +3007,34 @@ fn run_setup(
                 let validation = if authorization_requires_provisioning {
                     None
                 } else {
-                    Some(
-                        provider_transport
-                            .validate_provider_descriptor(
-                                authorization.requested_model_alias(),
-                                authorization.requested_provider_alias(),
-                                provider_selection.model_alias_from_project,
-                                provider_selection.provider_alias_from_project,
-                                satelle_core::ProviderAuthValidationMode::Cached,
-                                authorization.experimental_provider_computer_use(),
-                            )
-                            .map_err(failure)?,
-                    )
+                    let cached = provider_transport
+                        .validate_provider_descriptor(
+                            authorization.requested_model_alias(),
+                            authorization.requested_provider_alias(),
+                            provider_selection.model_alias_from_project,
+                            provider_selection.provider_alias_from_project,
+                            satelle_core::ProviderAuthValidationMode::Cached,
+                            authorization.experimental_provider_computer_use(),
+                        )
+                        .map_err(failure)?;
+                    if cached.validation.outcome()
+                        == satelle_core::ProviderAuthValidationOutcome::ConfiguredDeferred
+                    {
+                        Some(
+                            provider_transport
+                                .validate_provider_descriptor(
+                                    authorization.requested_model_alias(),
+                                    authorization.requested_provider_alias(),
+                                    provider_selection.model_alias_from_project,
+                                    provider_selection.provider_alias_from_project,
+                                    satelle_core::ProviderAuthValidationMode::RefreshProviderSmoke,
+                                    authorization.experimental_provider_computer_use(),
+                                )
+                                .map_err(failure)?,
+                        )
+                    } else {
+                        Some(cached)
+                    }
                 };
                 let provisioning_required = authorization_requires_provisioning
                     || validation.as_ref().is_some_and(|validation| {
@@ -3419,7 +3425,6 @@ fn accept_setup_provider_auth_validation(
         .and_then(ProviderBindingAuthorization::auth_source)
         .is_some();
     report.validation_status = outcome.as_str().to_string();
-    report.secret_provisioned = outcome == Resolved;
     if matches!(outcome, ConfiguredDeferred | Resolved) {
         return Ok(Some(validation));
     }
@@ -5873,20 +5878,6 @@ fn start_host_daemon_with(
         &HostConfig,
     ) -> HostService,
 ) -> Result<(), CliFailure> {
-    if command.inspect_ssh_identity_commit {
-        let state_root = satelle_core::state_dir().map_err(failure)?;
-        let Some((operation_id, host_identity)) =
-            HostService::inspect_fresh_ssh_identity_commit(&state_root).map_err(failure)?
-        else {
-            return Err(failure(SatelleError::state_conflict()));
-        };
-        return print_json(&json!({
-            "schema_version": "satelle.ssh-identity-commit-inspection.v1",
-            "operation_id": operation_id,
-            "host_identity": host_identity.as_str(),
-        }))
-        .map_err(failure);
-    }
     validate_host_start_mode(&command).map_err(failure)?;
     if command.service_config.is_some() {
         #[cfg(not(windows))]
@@ -5923,21 +5914,30 @@ fn start_host_daemon_with(
     let initial_identity = match (
         command.initial_host_identity.as_deref(),
         command.initial_identity_operation_id.as_deref(),
+        command.initial_identity_record.as_deref(),
     ) {
-        (Some(identity), Some(operation_id)) => {
+        (Some(identity), Some(operation_id), Some(encoded_record)) => {
             let identity = HostIdentityRef::new(identity.to_string()).map_err(|_| {
                 failure(SatelleError::invalid_usage(
                     "--initial-host-identity must be a valid Host Identity",
                 ))
             })?;
-            Uuid::parse_str(operation_id).map_err(|_| {
-                failure(SatelleError::invalid_usage(
-                    "--initial-identity-operation-id must be a UUID",
-                ))
-            })?;
-            Some((identity, operation_id.to_string()))
+            let record =
+                satelle_core::SshIdentityCommitRecord::parse(encoded_record).map_err(|_| {
+                    failure(SatelleError::invalid_usage(
+                        "--initial-identity-record must be a valid v2 identity operation record",
+                    ))
+                })?;
+            if record.candidate_host_identity() != &identity
+                || record.operation_id() != operation_id
+            {
+                return Err(failure(SatelleError::invalid_usage(
+                    "fresh SSH identity commit arguments must describe the same operation",
+                )));
+            }
+            Some(record)
         }
-        (None, None) => None,
+        (None, None, None) => None,
         _ => {
             return Err(failure(SatelleError::invalid_usage(
                 "fresh SSH identity commit arguments require each other",
@@ -6017,14 +6017,11 @@ fn start_host_daemon_with(
                 .remove(LOCAL_DEMO_HOST)
                 .expect("the built-in local Host config exists");
             host_config.timeouts = forwarded_readiness_timeouts;
-            if let Some((identity, operation_id)) = initial_identity.as_ref() {
-                let committed = HostService::commit_fresh_ssh_host_identity(
-                    &state_release_root,
-                    identity,
-                    operation_id,
-                )
-                .map_err(failure)?;
-                if committed != *identity {
+            if let Some(record) = initial_identity.as_ref() {
+                let committed =
+                    HostService::commit_fresh_ssh_host_identity(&state_release_root, record)
+                        .map_err(failure)?;
+                if committed != *record.candidate_host_identity() {
                     return Err(failure(SatelleError::state_conflict()));
                 }
             }
@@ -6750,7 +6747,7 @@ mod daemon_tls_watcher_tests {
             bootstrap_token_stdin: false,
             initial_host_identity: None,
             initial_identity_operation_id: None,
-            inspect_ssh_identity_commit: false,
+            initial_identity_record: None,
             bootstrap_scope: None,
             bootstrap_native_readiness_timeout_ms: None,
             bootstrap_provider_smoke_timeout_ms: None,
@@ -7272,7 +7269,7 @@ mod bootstrap_startup_tests {
             bootstrap_token_stdin: true,
             initial_host_identity: None,
             initial_identity_operation_id: None,
-            inspect_ssh_identity_commit: false,
+            initial_identity_record: None,
             bootstrap_scope: Some(SshBootstrapScope::Read),
             bootstrap_native_readiness_timeout_ms: None,
             bootstrap_provider_smoke_timeout_ms: None,
