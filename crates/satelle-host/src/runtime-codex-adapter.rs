@@ -466,12 +466,17 @@ impl ProductionComputerUseAdapter {
         persist_turn_ref: &mut dyn FnMut(&str) -> Result<(), ()>,
     ) -> Result<(), NativeSmokeFailure> {
         let nonce = format!("SATELLE-{}", satelle_core::TurnId::new());
-        let deadline = Instant::now()
-            .checked_add(self.native_readiness_timeout)
+        let deadline = cancellation
+            .and_then(super::request::AdmissionCancellation::deadline)
+            .map_or_else(
+                || Instant::now().checked_add(self.native_readiness_timeout),
+                Some,
+            )
             .ok_or_else(|| native_smoke_failure("native_readiness_timeout_invalid"))?;
-        let mut target = NativeActionTarget::spawn(&nonce, self.native_readiness_timeout)
-            .map_err(native_smoke_failure)?;
-        std::thread::sleep(Duration::from_millis(200));
+        let target_timeout = deadline.saturating_duration_since(Instant::now());
+        let mut target =
+            NativeActionTarget::spawn(&nonce, target_timeout).map_err(native_smoke_failure)?;
+        wait_for_native_target_start(deadline, cancellation)?;
         let working_directory = self
             .working_directory
             .as_ref()
@@ -518,7 +523,7 @@ impl ProductionComputerUseAdapter {
             return Err(native_smoke_failure("native_readiness_session_failed"));
         }
         target
-            .wait_for_success(deadline)
+            .wait_for_success(deadline, cancellation)
             .map_err(native_smoke_failure)
     }
 
@@ -673,15 +678,22 @@ impl ProductionComputerUseAdapter {
             timeout_override,
         } = invocation;
         let timeout = timeout_override.unwrap_or(self.provider_smoke_timeout);
-        let probe = crate::provider_probe::ProviderProbeSurface::start(timeout)
-            .map_err(|error| mark_probe_dispatch_possible(provider_smoke_failure(error), false))?;
+        let deadline = persistence
+            .cancellation
+            .and_then(super::request::AdmissionCancellation::deadline)
+            .map_or_else(|| Instant::now().checked_add(timeout), Some)
+            .ok_or_else(|| {
+                mark_probe_dispatch_possible(
+                    provider_smoke_failure(crate::provider_probe::ProviderProbeError::TimedOut),
+                    false,
+                )
+            })?;
+        let probe = crate::provider_probe::ProviderProbeSurface::start_with_control(
+            deadline,
+            persistence.cancellation.cloned(),
+        )
+        .map_err(|error| mark_probe_dispatch_possible(provider_smoke_failure(error), false))?;
         let page_url = probe.page_url().to_string();
-        let deadline = Instant::now().checked_add(timeout).ok_or_else(|| {
-            mark_probe_dispatch_possible(
-                provider_smoke_failure(crate::provider_probe::ProviderProbeError::TimedOut),
-                false,
-            )
-        })?;
         let working_directory = self
             .working_directory
             .as_ref()
@@ -1080,18 +1092,56 @@ impl NativeActionTarget {
             .map_err(|_| "native_readiness_target_unavailable")
     }
 
-    fn wait_for_success(&mut self, deadline: Instant) -> Result<(), &'static str> {
+    fn wait_for_success(
+        &mut self,
+        deadline: Instant,
+        cancellation: Option<&super::request::AdmissionCancellation>,
+    ) -> Result<(), &'static str> {
         loop {
+            if cancellation
+                .is_some_and(super::request::AdmissionCancellation::is_requested_or_expired)
+            {
+                let _ = crate::codex_capabilities::terminate_group(&mut self.child);
+                return Err("native_readiness_cancelled");
+            }
             match self.child.try_wait() {
                 Ok(Some(status)) if status.success() => return Ok(()),
                 Ok(Some(_)) => return Err("native_readiness_action_not_observed"),
                 Ok(None) if Instant::now() < deadline => {
                     std::thread::sleep(Duration::from_millis(10));
                 }
-                Ok(None) => return Err("native_readiness_timed_out"),
+                Ok(None) => {
+                    let _ = crate::codex_capabilities::terminate_group(&mut self.child);
+                    return Err("native_readiness_timed_out");
+                }
                 Err(_) => return Err("native_readiness_target_failed"),
             }
         }
+    }
+}
+
+fn wait_for_native_target_start(
+    deadline: Instant,
+    cancellation: Option<&super::request::AdmissionCancellation>,
+) -> Result<(), NativeSmokeFailure> {
+    let ready_at = Instant::now()
+        .checked_add(Duration::from_millis(200))
+        .unwrap_or(deadline)
+        .min(deadline);
+    loop {
+        if cancellation.is_some_and(super::request::AdmissionCancellation::is_requested_or_expired)
+        {
+            return Err(native_smoke_failure("native_readiness_cancelled"));
+        }
+        let remaining = ready_at.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return if Instant::now() >= deadline {
+                Err(native_smoke_failure("native_readiness_timed_out"))
+            } else {
+                Ok(())
+            };
+        }
+        std::thread::sleep(Duration::from_millis(10).min(remaining));
     }
 }
 
@@ -2187,7 +2237,7 @@ impl ReadinessProbeDriver for ProductionComputerUseAdapter {
         }
         match self.run_native_smoke(Some(cancellation), persist_thread_ref, persist_turn_ref) {
             Ok(()) => NativeProbeResult::Passed(evidence),
-            Err(failure) if cancellation.is_requested() => {
+            Err(failure) if cancellation.is_requested_or_expired() => {
                 let observation = probe_cancellation_observation(
                     failure.dispatch_possible,
                     &failure.error,
@@ -4071,5 +4121,29 @@ mod tests {
         assert!(prompt.contains("click"));
         assert!(prompt.contains("drag"));
         assert!(prompt.contains("readiness-nonce"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn native_target_cancellation_terminates_the_child_before_return() {
+        let mut command = Command::new("sh");
+        command.args(["-c", "sleep 30"]);
+        let child = command.group_spawn().expect("spawn native target fixture");
+        let mut target = NativeActionTarget { child };
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let cancellation = crate::runtime::AdmissionCancellation::with_deadline(deadline);
+        cancellation.request();
+
+        let outcome = target.wait_for_success(deadline, Some(&cancellation));
+
+        assert_eq!(outcome, Err("native_readiness_cancelled"));
+        assert!(
+            target
+                .child
+                .try_wait()
+                .expect("read terminated child")
+                .is_some(),
+            "native target survived cancellation"
+        );
     }
 }

@@ -20,7 +20,8 @@ const FORM_CONTENT_TYPE: &str = "application/x-www-form-urlencoded";
 pub(crate) struct ProviderProbeSurface {
     page_url: String,
     deadline: Instant,
-    cancel: Arc<AtomicBool>,
+    shutdown: Arc<AtomicBool>,
+    cancellation: Option<crate::runtime::AdmissionCancellation>,
     completion: mpsc::Receiver<Result<(), ProviderProbeError>>,
     worker: Option<JoinHandle<()>>,
 }
@@ -46,13 +47,24 @@ pub(crate) enum ProviderProbeError {
 }
 
 impl ProviderProbeSurface {
+    #[cfg(test)]
     pub(crate) fn start(timeout: Duration) -> Result<Self, ProviderProbeError> {
-        // Startup, request handling, completion, and shutdown all consume one
-        // caller-owned budget. A slow bind or entropy source must not grant the
-        // probe surface a fresh timeout after startup work has already elapsed.
         let deadline = Instant::now()
             .checked_add(timeout)
             .ok_or(ProviderProbeError::TimedOut)?;
+        Self::start_with_control(deadline, None)
+    }
+
+    /// Starts the listener with the caller's absolute execution deadline.
+    /// Doctor passes its scheduler-owned cancellation capability unchanged;
+    /// the private shutdown flag exists only to make RAII teardown joinable.
+    pub(crate) fn start_with_control(
+        deadline: Instant,
+        cancellation: Option<crate::runtime::AdmissionCancellation>,
+    ) -> Result<Self, ProviderProbeError> {
+        if Instant::now() >= deadline {
+            return Err(ProviderProbeError::TimedOut);
+        }
         let listener = TcpListener::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0))
             .map_err(ProviderProbeError::Bind)?;
         listener
@@ -73,13 +85,21 @@ impl ProviderProbeSurface {
         let nonce = random_token(32)?;
         let capability = random_token(32)?;
         let page_url = format!("http://127.0.0.1:{port}/probe/{capability}");
-        let cancel = Arc::new(AtomicBool::new(false));
-        let worker_cancel = Arc::clone(&cancel);
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let worker_shutdown = Arc::clone(&shutdown);
+        let worker_cancellation = cancellation.clone();
         let (sender, completion) = mpsc::sync_channel(1);
         let worker = std::thread::Builder::new()
             .name("satelle-provider-probe".to_string())
             .spawn(move || {
-                let outcome = serve_probe(listener, nonce, capability, deadline, &worker_cancel);
+                let outcome = serve_probe(
+                    listener,
+                    nonce,
+                    capability,
+                    deadline,
+                    &worker_shutdown,
+                    worker_cancellation.as_ref(),
+                );
                 let _ = sender.send(outcome);
             })
             .map_err(ProviderProbeError::WorkerSpawn)?;
@@ -87,7 +107,8 @@ impl ProviderProbeSurface {
         Ok(Self {
             page_url,
             deadline,
-            cancel,
+            shutdown,
+            cancellation,
             completion,
             worker: Some(worker),
         })
@@ -100,11 +121,27 @@ impl ProviderProbeSurface {
     /// Success is based only on the exact daemon-observed callback. Codex's
     /// terminal text or process exit status cannot satisfy this check.
     pub(crate) fn wait_for_completion(mut self) -> Result<(), ProviderProbeError> {
-        let outcome = self
-            .completion
-            .recv_timeout(self.deadline.saturating_duration_since(Instant::now()))
-            .unwrap_or(Err(ProviderProbeError::TimedOut));
-        self.cancel.store(true, Ordering::Release);
+        let outcome = loop {
+            if self
+                .cancellation
+                .as_ref()
+                .is_some_and(crate::runtime::AdmissionCancellation::is_requested_or_expired)
+            {
+                break Err(ProviderProbeError::Cancelled);
+            }
+            let remaining = self.deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                break Err(ProviderProbeError::TimedOut);
+            }
+            match self.completion.recv_timeout(POLL_INTERVAL.min(remaining)) {
+                Ok(outcome) => break outcome,
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    break Err(ProviderProbeError::WorkerStopped);
+                }
+            }
+        };
+        self.shutdown.store(true, Ordering::Release);
         self.join_worker()?;
         outcome
     }
@@ -118,7 +155,7 @@ impl ProviderProbeSurface {
 
 impl Drop for ProviderProbeSurface {
     fn drop(&mut self) {
-        self.cancel.store(true, Ordering::Release);
+        self.shutdown.store(true, Ordering::Release);
         let _ = self.join_worker();
     }
 }
@@ -128,7 +165,8 @@ fn serve_probe(
     nonce: String,
     capability: String,
     deadline: Instant,
-    cancel: &AtomicBool,
+    shutdown: &AtomicBool,
+    cancellation: Option<&crate::runtime::AdmissionCancellation>,
 ) -> Result<(), ProviderProbeError> {
     let page_target = format!("/probe/{capability}");
     let completion_target = format!("/complete/{capability}");
@@ -140,7 +178,7 @@ fn serve_probe(
     let expected_origin = format!("http://{expected_host}");
 
     loop {
-        if cancel.load(Ordering::Acquire) {
+        if probe_stopped(shutdown, cancellation) {
             return Err(ProviderProbeError::Cancelled);
         }
         if Instant::now() >= deadline {
@@ -158,29 +196,30 @@ fn serve_probe(
                     .map_or(deadline, |connection_deadline| {
                         connection_deadline.min(deadline)
                     });
-                let request = match read_request(&mut stream, connection_deadline, cancel) {
-                    Ok(request) => request,
-                    Err(error) => {
-                        if cancel.load(Ordering::Acquire) {
-                            return Err(ProviderProbeError::Cancelled);
+                let request =
+                    match read_request(&mut stream, connection_deadline, shutdown, cancellation) {
+                        Ok(request) => request,
+                        Err(error) => {
+                            if probe_stopped(shutdown, cancellation) {
+                                return Err(ProviderProbeError::Cancelled);
+                            }
+                            if Instant::now() >= deadline {
+                                return Err(ProviderProbeError::TimedOut);
+                            }
+                            let _ = write_response(
+                                &mut stream,
+                                "400 Bad Request",
+                                "text/plain; charset=utf-8",
+                                "bad request\n",
+                            );
+                            match error {
+                                ProviderProbeError::InvalidRequest
+                                | ProviderProbeError::TimedOut
+                                | ProviderProbeError::Io(_) => continue,
+                                error => return Err(error),
+                            }
                         }
-                        if Instant::now() >= deadline {
-                            return Err(ProviderProbeError::TimedOut);
-                        }
-                        let _ = write_response(
-                            &mut stream,
-                            "400 Bad Request",
-                            "text/plain; charset=utf-8",
-                            "bad request\n",
-                        );
-                        match error {
-                            ProviderProbeError::InvalidRequest
-                            | ProviderProbeError::TimedOut
-                            | ProviderProbeError::Io(_) => continue,
-                            error => return Err(error),
-                        }
-                    }
-                };
+                    };
                 if request.method == "GET"
                     && request.target == page_target
                     && request.body.is_empty()
@@ -249,14 +288,21 @@ struct ProbeRequest {
 fn read_request(
     stream: &mut TcpStream,
     connection_deadline: Instant,
-    cancel: &AtomicBool,
+    shutdown: &AtomicBool,
+    cancellation: Option<&crate::runtime::AdmissionCancellation>,
 ) -> Result<ProbeRequest, ProviderProbeError> {
     let mut request = Vec::with_capacity(512);
     let header_end = loop {
         if let Some(position) = request.windows(4).position(|window| window == b"\r\n\r\n") {
             break position + 4;
         }
-        read_more(stream, &mut request, connection_deadline, cancel)?;
+        read_more(
+            stream,
+            &mut request,
+            connection_deadline,
+            shutdown,
+            cancellation,
+        )?;
     };
     let header = std::str::from_utf8(&request[..header_end])
         .map_err(|_| ProviderProbeError::InvalidRequest)?;
@@ -333,7 +379,13 @@ fn read_request(
         return Err(ProviderProbeError::InvalidRequest);
     }
     while request.len() < request_length {
-        read_more(stream, &mut request, connection_deadline, cancel)?;
+        read_more(
+            stream,
+            &mut request,
+            connection_deadline,
+            shutdown,
+            cancellation,
+        )?;
     }
     if request.len() != request_length {
         return Err(ProviderProbeError::InvalidRequest);
@@ -356,13 +408,14 @@ fn read_more(
     stream: &mut TcpStream,
     request: &mut Vec<u8>,
     connection_deadline: Instant,
-    cancel: &AtomicBool,
+    shutdown: &AtomicBool,
+    cancellation: Option<&crate::runtime::AdmissionCancellation>,
 ) -> Result<(), ProviderProbeError> {
     loop {
         if request.len() >= MAX_REQUEST_BYTES {
             return Err(ProviderProbeError::InvalidRequest);
         }
-        if cancel.load(Ordering::Acquire) {
+        if probe_stopped(shutdown, cancellation) {
             return Err(ProviderProbeError::Cancelled);
         }
         let now = Instant::now();
@@ -390,6 +443,14 @@ fn read_more(
             Err(error) => return Err(ProviderProbeError::Io(error)),
         }
     }
+}
+
+fn probe_stopped(
+    shutdown: &AtomicBool,
+    cancellation: Option<&crate::runtime::AdmissionCancellation>,
+) -> bool {
+    shutdown.load(Ordering::Acquire)
+        || cancellation.is_some_and(crate::runtime::AdmissionCancellation::is_requested_or_expired)
 }
 
 fn write_page(
@@ -746,6 +807,21 @@ mod tests {
         cancelled_stream.write_all(b"GET /stalled").unwrap();
         drop(cancelled);
         assert!(TcpStream::connect(cancelled_address).is_err());
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let external_cancellation = crate::runtime::AdmissionCancellation::with_deadline(deadline);
+        let externally_cancelled =
+            ProviderProbeSurface::start_with_control(deadline, Some(external_cancellation.clone()))
+                .unwrap();
+        let (external_address, _) = split_local_url(externally_cancelled.page_url());
+        let mut external_stream = TcpStream::connect(&external_address).unwrap();
+        external_stream.write_all(b"GET /stalled").unwrap();
+        external_cancellation.request();
+        assert!(matches!(
+            externally_cancelled.wait_for_completion(),
+            Err(ProviderProbeError::Cancelled)
+        ));
+        assert!(TcpStream::connect(external_address).is_err());
 
         let no_callback = ProviderProbeSurface::start(Duration::from_millis(40)).unwrap();
         assert!(matches!(

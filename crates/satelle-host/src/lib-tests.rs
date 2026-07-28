@@ -16,6 +16,20 @@ fn turn_intent(prompt: &str) -> TurnIntent {
     TurnIntent::new(prompt, TurnExecutionMode::Standard).expect("valid test Turn intent")
 }
 
+fn doctor_selection(scopes: &[&str]) -> DoctorScopeSelection {
+    DoctorScopeSelection::parse(
+        &scopes
+            .iter()
+            .map(|scope| (*scope).to_string())
+            .collect::<Vec<_>>(),
+    )
+    .expect("valid Doctor test scopes")
+}
+
+fn ready_transport() -> DoctorTransportObservation {
+    DoctorTransportObservation::ready(None)
+}
+
 #[derive(Clone)]
 struct RecordingTurnExtrasAdapter {
     observations: Arc<Mutex<Vec<TurnExtrasObservation>>>,
@@ -1346,7 +1360,12 @@ fn configured_remote_alias_is_accepted_by_host_diagnostics() {
         bootstrap_maintenance: Arc::new(Mutex::new(None)),
     };
     let doctor = service
-        .doctor(REMOTE_HOST_ALIAS, None, DoctorOptions::default())
+        .doctor(
+            REMOTE_HOST_ALIAS,
+            &doctor_selection(&[]),
+            &ready_transport(),
+            DoctorOptions::default(),
+        )
         .expect("doctor should diagnose the already-routed Host alias");
     assert_eq!(doctor.host, REMOTE_HOST_ALIAS);
 
@@ -1737,7 +1756,12 @@ fn refreshed_production_snapshot_updates_admission_surfaces_but_not_desktop_disc
     assert_eq!(sessions.schema_version, HostSessionsSchemaVersion::V1);
     assert_eq!(sessions.host, LOCAL_DEMO_HOST);
     let doctor = clone
-        .doctor(LOCAL_DEMO_HOST, Some("codex"), DoctorOptions::default())
+        .doctor(
+            LOCAL_DEMO_HOST,
+            &doctor_selection(&["codex"]),
+            &ready_transport(),
+            DoctorOptions::default(),
+        )
         .expect("non-refresh doctor must read the refreshed snapshot");
     assert!(doctor.findings.iter().any(|finding| {
         finding
@@ -1833,15 +1857,35 @@ fn production_doctor_filters_requested_scopes_without_relabeling_blockers() {
     );
 
     let transport = production_doctor_report(LOCAL_DEMO_HOST, Some("transport"), &snapshot);
-    assert!(!transport.ready);
+    assert!(transport.ready);
     assert_eq!(transport.scopes, ["transport"]);
-    assert_eq!(transport.findings.len(), 1);
-    assert_eq!(transport.findings[0].scope, "transport");
-    assert_eq!(
-        transport.findings[0].evidence,
-        ["reason=transport_unavailable"]
-    );
+    assert!(transport.findings.is_empty());
+    assert_eq!(transport.probe_results[0].status, "passed");
     assert_eq!(transport.probe_results[0].duration_ms, 0);
+    let blocked_transport = DoctorTransportObservation::blocked(DoctorFinding {
+        finding_id: "transport.selected.failed".to_string(),
+        scope: "transport".to_string(),
+        severity: "error".to_string(),
+        fixability: DoctorFixability::ManualActionRequired,
+        readiness_impact: "blocked".to_string(),
+        summary: "the selected transport failed its live observation".to_string(),
+        evidence: vec!["reason=selected_transport_failed".to_string()],
+        recovery_command: None,
+    });
+    let transport_selection = doctor_selection(&["transport"]);
+    let blocked_transport_report = production_doctor_report_with_selection(
+        LOCAL_DEMO_HOST,
+        &transport_selection,
+        &blocked_transport,
+        DoctorOptions::default(),
+        &snapshot,
+    );
+    assert!(!blocked_transport_report.ready);
+    assert_eq!(blocked_transport_report.probe_results[0].status, "blocked");
+    assert_eq!(
+        blocked_transport_report.findings[0].finding_id,
+        "transport.selected.failed"
+    );
 
     let provider = production_doctor_report(LOCAL_DEMO_HOST, Some("provider"), &snapshot);
     assert!(!provider.ready);
@@ -1934,7 +1978,8 @@ fn doctor_provider_refresh_updates_cache_without_admitting_prompt_work() {
     let report = service
         .doctor_with_provider_intent(
             LOCAL_DEMO_HOST,
-            Some("provider"),
+            &doctor_selection(&["provider"]),
+            &ready_transport(),
             DoctorOptions::new(true, Some(std::time::Duration::from_secs(5))),
             &intent,
         )
@@ -1954,7 +1999,8 @@ fn doctor_provider_refresh_updates_cache_without_admitting_prompt_work() {
     let default_report = service
         .doctor_with_provider_intent(
             LOCAL_DEMO_HOST,
-            None,
+            &doctor_selection(&[]),
+            &ready_transport(),
             DoctorOptions::new(true, Some(std::time::Duration::from_secs(5))),
             &intent,
         )
@@ -2478,10 +2524,12 @@ fn doctor_provider_and_default_scopes_report_closed_descriptor_status_without_se
     );
 
     for scope in [None, Some("provider"), Some("all")] {
+        let scopes = scope.map_or_else(Vec::new, |scope| vec![scope]);
         let report = service
             .doctor_with_provider_intent(
                 LOCAL_DEMO_HOST,
-                scope,
+                &doctor_selection(&scopes),
+                &ready_transport(),
                 DoctorOptions::new(false, None),
                 &intent,
             )
@@ -2628,7 +2676,8 @@ fn doctor_reports_a_named_missing_provider_descriptor_without_resolving_it() {
     let report = service
         .doctor_with_provider_intent(
             LOCAL_DEMO_HOST,
-            Some("provider"),
+            &doctor_selection(&["provider"]),
+            &ready_transport(),
             DoctorOptions::new(false, None),
             &provider_intent_with_missing_descriptor(),
         )

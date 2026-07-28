@@ -955,6 +955,7 @@ mod tests {
     #[test]
     fn execution_owns_concurrency_locks_timeouts_and_failure_continuation() {
         use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::{Condvar, Mutex};
 
         let mut probes = vec![
             probe("failed", "codex", &[], &[]),
@@ -986,10 +987,27 @@ mod tests {
         let maximum_active = AtomicUsize::new(0);
         let native_lock_active = AtomicBool::new(false);
         let independent_finished = AtomicBool::new(false);
+        let initial_frontier = Arc::new((Mutex::new(0_usize), Condvar::new()));
+        let expected_frontier = DEFAULT_DOCTOR_PROBE_CONCURRENCY;
 
         let records = scheduler.execute(|probe, context| {
             let active_now = active.fetch_add(1, Ordering::AcqRel) + 1;
             maximum_active.fetch_max(active_now, Ordering::AcqRel);
+            let (arrived, released) = &*initial_frontier;
+            let mut arrived = arrived.lock().unwrap();
+            *arrived += 1;
+            released.notify_all();
+            let (arrived, timeout) = released
+                .wait_timeout_while(arrived, Duration::from_secs(5), |arrived| {
+                    *arrived < expected_frontier
+                })
+                .unwrap();
+            assert!(
+                *arrived >= expected_frontier,
+                "the scheduler did not dispatch the full independent frontier"
+            );
+            assert!(!timeout.timed_out());
+            drop(arrived);
             let owns_native_lock = probe
                 .resource_locks
                 .contains(&DoctorProbeResource::NativeComputerUse);
@@ -1034,7 +1052,10 @@ mod tests {
             completion
         });
 
-        assert!(maximum_active.load(Ordering::Acquire) > 1);
+        assert_eq!(
+            maximum_active.load(Ordering::Acquire),
+            DEFAULT_DOCTOR_PROBE_CONCURRENCY
+        );
         assert!(maximum_active.load(Ordering::Acquire) <= DEFAULT_DOCTOR_PROBE_CONCURRENCY);
         assert!(independent_finished.load(Ordering::Acquire));
         assert_eq!(

@@ -1,20 +1,22 @@
 use super::FakeComputerUseAdapter;
 use crate::runtime::ComputerUseAdapter;
+use satelle_core::doctor::DoctorScopeSelection;
 use satelle_core::{
     DaemonPathOverrides, DoctorFinding, DoctorFixability, DoctorOptions, DoctorProbeResult,
-    DoctorReport, DoctorSchemaVersion, DoctorSummary, SatelleError, SetupReadinessSummary,
-    SetupReport, SetupSchemaVersion, utc_now,
+    DoctorReport, DoctorSchemaVersion, DoctorSummary, DoctorTransportObservation, SatelleError,
+    SetupReadinessSummary, SetupReport, SetupSchemaVersion, utc_now,
 };
 
 pub(super) fn doctor(
     host: &str,
-    scope: Option<&str>,
+    scope_selection: &DoctorScopeSelection,
+    transport_observation: &DoctorTransportObservation,
     options: DoctorOptions,
     adapter: &FakeComputerUseAdapter,
 ) -> Result<DoctorReport, SatelleError> {
     let started_at = utc_now();
     let readiness = adapter.preflight(host, &crate::ProviderComputerUseIntent::host_default())?;
-    let probes = probe_plan(scope);
+    let probes = probe_plan(scope_selection);
     let mut findings = Vec::new();
     let mut probe_results = Vec::new();
 
@@ -54,6 +56,33 @@ pub(super) fn doctor(
             finding_ids: vec![finding_id],
         });
     }
+    if scope_selection
+        .scopes()
+        .iter()
+        .any(|scope| scope.as_str() == "transport")
+        && let Some(finding) = transport_observation.finding()
+    {
+        findings.retain(|finding| finding.scope != "transport");
+        probe_results.retain(|probe| probe.scope != "transport");
+        let finding_id = finding.finding_id.clone();
+        findings.push(finding.clone());
+        probe_results.push(DoctorProbeResult {
+            probe_id: "transport.selected".to_string(),
+            scope: "transport".to_string(),
+            status: if transport_observation.is_ready() {
+                "passed"
+            } else {
+                "blocked"
+            }
+            .to_string(),
+            started_at: started_at.clone(),
+            finished_at: utc_now(),
+            duration_ms: 0,
+            cache_status: "not_persisted".to_string(),
+            dependency_status: "satisfied".to_string(),
+            finding_ids: vec![finding_id],
+        });
+    }
 
     probe_results.sort_by(|left, right| {
         left.scope
@@ -76,7 +105,7 @@ pub(super) fn doctor(
 
     Ok(DoctorReport {
         schema_version: DoctorSchemaVersion::V1,
-        status: if readiness.is_ready() {
+        status: if readiness.is_ready() && transport_observation.is_ready() {
             "ready"
         } else {
             "blocked"
@@ -89,13 +118,19 @@ pub(super) fn doctor(
         finished_at: utc_now(),
         duration_ms: 0,
         summary: DoctorSummary {
-            ready: readiness.is_ready(),
-            blocking_findings: 0,
+            ready: readiness.is_ready() && transport_observation.is_ready(),
+            blocking_findings: findings
+                .iter()
+                .filter(|finding| finding.readiness_impact == "blocked")
+                .count(),
             repairable_findings: 0,
-            informational_findings: findings.len(),
+            informational_findings: findings
+                .iter()
+                .filter(|finding| finding.fixability == DoctorFixability::Informational)
+                .count(),
         },
         probe_results,
-        ready: readiness.is_ready(),
+        ready: readiness.is_ready() && transport_observation.is_ready(),
         findings,
         recovery_commands,
         changed: options.refresh(),
@@ -220,14 +255,15 @@ const PROBES: &[ProbeDefinition] = &[
     },
 ];
 
-fn probe_plan(scope: Option<&str>) -> Vec<ProbeDefinition> {
-    if matches!(scope, None | Some("all")) {
-        return PROBES.to_vec();
-    }
-
+fn probe_plan(scope_selection: &DoctorScopeSelection) -> Vec<ProbeDefinition> {
     PROBES
         .iter()
         .copied()
-        .filter(|probe| Some(probe.scope) == scope)
+        .filter(|probe| {
+            scope_selection
+                .scopes()
+                .iter()
+                .any(|scope| scope.as_str() == probe.scope)
+        })
         .collect()
 }

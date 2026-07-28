@@ -39,15 +39,15 @@ use satelle_core::session::{
 use satelle_core::{
     BEACON_CORAL, CLI_NAME, DaemonPathOverrides, DesktopSelectionPolicy, DesktopSessionPreference,
     DoctorEventRecord, DoctorEventSchemaVersion, DoctorEventType, DoctorFixability, DoctorOptions,
-    DoctorReport, ERROR_RED, ErrorCode, EventSource, EventType, HostConfig, HostSessionsReport,
-    LOCAL_DEMO_HOST, MutationCommandFamily, OwnerOnlyDirectory, PRODUCT_NAME, ProfileField,
-    ProfileSelectionSource, ProviderSecretSource, RELAY_ROSE, ResolvedConfig, SUCCESS_GREEN,
-    SatelleError, SatelleEvent, SatelleEventBody, SecureFileError, SessionId, SetupMode,
-    SetupReadinessSummary, SetupReport, SetupRequiredInput, SetupSchemaVersion, SetupVerification,
-    load_config, load_config_for_profile, load_config_without_profile, load_user_api_rate_limits,
-    open_or_create_owner_only_directory, open_or_create_owner_only_file, open_owner_only_directory,
-    read_owner_controlled_config_file, read_owner_only_secret_config_file, resolve_desktop_session,
-    resolve_path_set, utc_now,
+    DoctorReport, DoctorTransportObservation, ERROR_RED, ErrorCode, EventSource, EventType,
+    HostConfig, HostSessionsReport, LOCAL_DEMO_HOST, MutationCommandFamily, OwnerOnlyDirectory,
+    PRODUCT_NAME, ProfileField, ProfileSelectionSource, ProviderSecretSource, RELAY_ROSE,
+    ResolvedConfig, SUCCESS_GREEN, SatelleError, SatelleEvent, SatelleEventBody, SecureFileError,
+    SessionId, SetupMode, SetupReadinessSummary, SetupReport, SetupRequiredInput,
+    SetupSchemaVersion, SetupVerification, load_config, load_config_for_profile,
+    load_config_without_profile, load_user_api_rate_limits, open_or_create_owner_only_directory,
+    open_or_create_owner_only_file, open_owner_only_directory, read_owner_controlled_config_file,
+    read_owner_only_secret_config_file, resolve_desktop_session, resolve_path_set, utc_now,
 };
 use satelle_host::{
     ApiBearerToken, HostService, ProviderComputerUseIntent, contains_api_bearer_token,
@@ -67,7 +67,7 @@ use std::process::ExitCode;
 use std::str::FromStr;
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
-use tailscale::transport_doctor_report;
+use tailscale::transport_doctor_observation;
 use transport::{
     AttachedTurnOutcome, SshBootstrapScope, SshHostDiscovery, authenticated_ssh_bootstrap_user,
     discover_direct_host_identity, discover_ssh_host, transport_for, transport_for_setup,
@@ -4085,7 +4085,7 @@ fn run_doctor(
     format: OutputFormat,
 ) -> Result<(), CliFailure> {
     let json = format.is_json();
-    let scope = validate_doctor_scope(&command.scope)?;
+    let scope_selection = validate_doctor_scope(&command.scope)?;
     let timeout = match command
         .timeout
         .as_deref()
@@ -4095,12 +4095,12 @@ fn run_doctor(
         Ok(timeout) => timeout.map(std::time::Duration::from_millis),
         Err(error) => return Err(failure(error)),
     };
-    if timeout.is_some() && (!command.refresh || !doctor_scope_supports_refresh(scope)) {
+    if timeout.is_some() && (!command.refresh || !scope_selection.supports_refresh()) {
         return Err(failure(
             SatelleError::doctor_refresh_timeout_without_refresh(),
         ));
     }
-    if command.refresh && !doctor_scope_supports_refresh(scope) {
+    if command.refresh && !scope_selection.supports_refresh() {
         return Err(failure(SatelleError::doctor_refresh_scope_required()));
     }
 
@@ -4110,14 +4110,8 @@ fn run_doctor(
             .resolve_host(command.host.as_deref())
             .map_err(failure)?,
     );
-    if scope == Some("transport")
-        && let Some(report) = transport_doctor_report(&host.alias, &host.config)
-    {
-        if command.events {
-            print_doctor_started_event(&host.alias, scope).map_err(failure)?;
-        }
-        return emit_doctor_report(report, command.events, json);
-    }
+    let transport_observation = transport_doctor_observation(&host.config)
+        .unwrap_or_else(|| DoctorTransportObservation::ready(None));
     let transport = transport_for(&host)?;
     let options =
         DoctorOptions::new(command.refresh, timeout).with_serial_probes(command.serial_probes);
@@ -4129,13 +4123,19 @@ fn run_doctor(
     )
     .map_err(failure)?;
     if command.events {
-        print_doctor_started_event(&host.alias, scope).map_err(failure)?;
+        print_doctor_started_event(&host.alias, &scope_selection).map_err(failure)?;
     }
-    let report = match transport.doctor(scope, options, &provider_intent) {
+    let report = match transport.doctor(
+        &scope_selection,
+        &transport_observation,
+        options,
+        &provider_intent,
+    ) {
         Ok(report) => report,
         Err(error) => {
             if command.events {
-                print_doctor_failed_event(&host.alias, scope, 2, &error).map_err(failure)?;
+                print_doctor_failed_event(&host.alias, &scope_selection, 2, &error)
+                    .map_err(failure)?;
                 return Err(reported_failure(error));
             }
             return Err(failure(error));
@@ -4187,7 +4187,7 @@ fn emit_doctor_report(report: DoctorReport, events: bool, json: bool) -> Result<
     }
 }
 
-fn validate_doctor_scope(scopes: &[String]) -> Result<Option<&str>, CliFailure> {
+fn validate_doctor_scope(scopes: &[String]) -> Result<DoctorScopeSelection, CliFailure> {
     DoctorScopeSelection::parse(scopes).map_err(|error| {
         failure(match error {
             DoctorScopeSelectionError::UnsupportedScope(scope) => SatelleError::invalid_usage(
@@ -4199,17 +4199,7 @@ fn validate_doctor_scope(scopes: &[String]) -> Result<Option<&str>, CliFailure> 
                 SatelleError::scope_selection_conflict(&scopes)
             }
         })
-    })?;
-    if scopes.len() > 1 {
-        return Err(failure(SatelleError::invalid_usage(
-            "doctor accepts one specific --scope per invocation",
-        )));
-    }
-    Ok(scopes.first().map(String::as_str))
-}
-
-fn doctor_scope_supports_refresh(scope: Option<&str>) -> bool {
-    matches!(scope, None | Some("computer-use" | "provider" | "all"))
+    })
 }
 
 fn parse_duration_ms(value: &str) -> Result<u64, SatelleError> {
@@ -4347,32 +4337,47 @@ fn print_doctor_events(
     Ok(())
 }
 
-fn print_doctor_started_event(target: &str, scope: Option<&str>) -> Result<(), SatelleError> {
+fn print_doctor_started_event(
+    target: &str,
+    scope_selection: &DoctorScopeSelection,
+) -> Result<(), SatelleError> {
+    let scopes = scope_selection
+        .scopes()
+        .iter()
+        .map(|scope| scope.as_str())
+        .collect::<Vec<_>>();
+    let scope = if scopes.len() == 1 { scopes[0] } else { "all" };
     print_doctor_event_record(&DoctorEventRecord {
         schema_version: DoctorEventSchemaVersion::V1,
         event_id: "doctor_event_1".to_string(),
         event_type: DoctorEventType::DoctorStarted,
         target: target.to_string(),
-        scope: scope.unwrap_or("all").to_string(),
+        scope: scope.to_string(),
         probe_id: None,
         timestamp: utc_now(),
         status: "running".to_string(),
-        data: json!({"scopes": [scope.unwrap_or("all")]}),
+        data: json!({"scopes": scopes}),
     })
 }
 
 fn print_doctor_failed_event(
     target: &str,
-    scope: Option<&str>,
+    scope_selection: &DoctorScopeSelection,
     seq: u64,
     error: &SatelleError,
 ) -> Result<(), SatelleError> {
+    let scopes = scope_selection
+        .scopes()
+        .iter()
+        .map(|scope| scope.as_str())
+        .collect::<Vec<_>>();
+    let scope = if scopes.len() == 1 { scopes[0] } else { "all" };
     let record = DoctorEventRecord {
         schema_version: DoctorEventSchemaVersion::V1,
         event_id: format!("doctor_event_{seq}"),
         event_type: DoctorEventType::DoctorFailed,
         target: target.to_string(),
-        scope: scope.unwrap_or("all").to_string(),
+        scope: scope.to_string(),
         probe_id: None,
         timestamp: utc_now(),
         status: error.code.as_str().to_string(),
@@ -4384,6 +4389,7 @@ fn print_doctor_failed_event(
                 "recovery_command": error.recovery_command,
             },
             "partial_probe_results": [],
+            "scopes": scopes,
             "recovery_commands": error.recovery_command.iter().collect::<Vec<_>>(),
         }),
     };

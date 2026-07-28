@@ -9,14 +9,16 @@ use crate::runtime::{
     RecoveryObservation,
 };
 use crate::storage::ProbeRecoverySubject;
+use satelle_core::doctor::DoctorScopeSelection;
 use satelle_core::session::{
     ApprovalPolicy, DesktopBindingRef, DesktopTarget, EffectiveModelRef, ExecutionPolicy,
     ExperimentalFeatureChoices, FeatureChoice, ProviderBindingRef, SandboxPolicy, StopObservation,
     TimeoutPolicy, TurnTransition,
 };
 use satelle_core::{
-    DaemonPathOverrides, DesktopSessionRecord, DoctorOptions, DoctorReport, EventSource,
-    EventSubject, EventType, SatelleError, SatelleEvent, SatelleEventBody, SetupReport,
+    DaemonPathOverrides, DesktopSessionRecord, DoctorOptions, DoctorReport,
+    DoctorTransportObservation, EventSource, EventSubject, EventType, SatelleError, SatelleEvent,
+    SatelleEventBody, SetupReport,
 };
 use serde_json::{Value, json};
 use time::OffsetDateTime;
@@ -28,11 +30,18 @@ impl HostService {
     pub(super) fn fake_doctor(
         &self,
         host: &str,
-        scope: Option<&str>,
+        scope_selection: &DoctorScopeSelection,
+        transport_observation: &DoctorTransportObservation,
         options: DoctorOptions,
         adapter: &FakeComputerUseAdapter,
     ) -> Result<DoctorReport, SatelleError> {
-        diagnostics::doctor(host, scope, options, adapter)
+        diagnostics::doctor(
+            host,
+            scope_selection,
+            transport_observation,
+            options,
+            adapter,
+        )
     }
 
     pub(super) fn setup_fake(

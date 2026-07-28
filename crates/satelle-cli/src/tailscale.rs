@@ -1,6 +1,6 @@
 use satelle_core::{
-    DoctorFinding, DoctorFixability, DoctorProbeResult, DoctorReport, DoctorSchemaVersion,
-    DoctorSummary, HostConfig, NetworkConfig, TransportKind, utc_now,
+    DoctorFinding, DoctorFixability, DoctorTransportObservation, HostConfig, NetworkConfig,
+    TransportKind,
 };
 use serde::Deserialize;
 use std::collections::BTreeMap;
@@ -8,27 +8,24 @@ use std::io::{self, Read};
 use std::path::Path;
 use std::process::{Command, Stdio};
 use std::thread;
-use std::time::Instant;
 use url::Url;
 
 const MAX_STATUS_BYTES: usize = 1024 * 1024;
-const STATUS_PROBE_ID: &str = "transport.tailscale_status";
 
-pub(super) fn transport_doctor_report(host_alias: &str, host: &HostConfig) -> Option<DoctorReport> {
-    transport_doctor_report_with(host_alias, host, Path::new("tailscale"))
+pub(super) fn transport_doctor_observation(
+    host: &HostConfig,
+) -> Option<DoctorTransportObservation> {
+    transport_doctor_observation_with(host, Path::new("tailscale"))
 }
 
-fn transport_doctor_report_with(
-    host_alias: &str,
+fn transport_doctor_observation_with(
     host: &HostConfig,
     executable: &Path,
-) -> Option<DoctorReport> {
+) -> Option<DoctorTransportObservation> {
     let NetworkConfig::Tailscale {
         tailnet_name,
         hostname,
     } = host.network.as_ref()?;
-    let started_at = utc_now();
-    let started = Instant::now();
     let address_target = host
         .address
         .as_deref()
@@ -74,45 +71,11 @@ fn transport_doctor_report_with(
         );
     }
 
-    let finished_at = utc_now();
-    let duration_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
     let finding = diagnosis.finding;
-    let ready = diagnosis.ready;
-    let recovery_commands = finding.recovery_command.iter().cloned().collect::<Vec<_>>();
-    let informational_findings = usize::from(ready);
-    let blocking_findings = usize::from(!ready);
-
-    Some(DoctorReport {
-        schema_version: DoctorSchemaVersion::V1,
-        status: if ready { "ready" } else { "blocked" }.to_string(),
-        target: host_alias.to_string(),
-        host: host_alias.to_string(),
-        scopes: vec!["transport".to_string()],
-        started_at: started_at.clone(),
-        finished_at: finished_at.clone(),
-        duration_ms,
-        summary: DoctorSummary {
-            ready,
-            blocking_findings,
-            repairable_findings: 0,
-            informational_findings,
-        },
-        probe_results: vec![DoctorProbeResult {
-            probe_id: STATUS_PROBE_ID.to_string(),
-            scope: "transport".to_string(),
-            status: diagnosis.probe_status.to_string(),
-            started_at,
-            finished_at,
-            duration_ms,
-            cache_status: "not_persisted".to_string(),
-            dependency_status: "satisfied".to_string(),
-            finding_ids: vec![finding.finding_id.clone()],
-        }],
-        ready,
-        findings: vec![finding],
-        recovery_commands,
-        changed: false,
-        cache_updates: Vec::new(),
+    Some(if diagnosis.ready {
+        DoctorTransportObservation::ready(Some(finding))
+    } else {
+        DoctorTransportObservation::blocked(finding)
     })
 }
 
@@ -334,7 +297,6 @@ enum StatusReadError {
 
 struct Diagnosis {
     ready: bool,
-    probe_status: &'static str,
     finding: DoctorFinding,
     ping_target: Option<String>,
 }
@@ -343,7 +305,6 @@ impl Diagnosis {
     fn ready(evidence: Vec<String>, ping_target: String) -> Self {
         Self {
             ready: true,
-            probe_status: "passed",
             finding: DoctorFinding {
                 finding_id: "tailscale_host_reachable".to_string(),
                 scope: "transport".to_string(),
@@ -366,7 +327,6 @@ impl Diagnosis {
     ) -> Self {
         Self {
             ready: false,
-            probe_status: "blocked",
             finding: DoctorFinding {
                 finding_id: finding_id.to_string(),
                 scope: "transport".to_string(),
@@ -418,17 +378,17 @@ mod tests {
 
     #[test]
     fn missing_cli_keeps_configuration_evidence_in_a_partial_report() {
-        let report = transport_doctor_report_with(
-            "studio",
+        let observation = transport_doctor_observation_with(
             &tailscale_host(),
             Path::new("/definitely/missing/tailscale"),
         )
-        .expect("Tailscale host should produce a transport report");
+        .expect("Tailscale host should produce a transport observation");
 
-        assert!(!report.ready);
-        assert_eq!(report.findings[0].finding_id, "tailscale_cli_unavailable");
+        assert!(!observation.is_ready());
+        let finding = observation.finding().expect("blocked transport finding");
+        assert_eq!(finding.finding_id, "tailscale_cli_unavailable");
         assert_eq!(
-            report.findings[0].evidence,
+            finding.evidence,
             vec![
                 "network_provider=tailscale".to_string(),
                 "live_checks=skipped".to_string()

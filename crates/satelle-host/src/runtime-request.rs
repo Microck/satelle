@@ -2,6 +2,7 @@ use super::ProviderComputerUseIntent;
 use satelle_core::session::TurnExecutionMode;
 use satelle_core::{SessionId, TurnId};
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum AdmissionCancellationState {
@@ -24,6 +25,7 @@ pub struct AdmissionCancellation {
 struct AdmissionCancellationInner {
     commit: Mutex<()>,
     state: Mutex<AdmissionCancellationState>,
+    deadline: Option<Instant>,
 }
 
 impl AdmissionCancellation {
@@ -32,8 +34,30 @@ impl AdmissionCancellation {
             inner: Arc::new(AdmissionCancellationInner {
                 commit: Mutex::new(()),
                 state: Mutex::new(AdmissionCancellationState::Open),
+                deadline: None,
             }),
         }
+    }
+
+    pub(crate) fn with_deadline(deadline: Instant) -> Self {
+        Self {
+            inner: Arc::new(AdmissionCancellationInner {
+                commit: Mutex::new(()),
+                state: Mutex::new(AdmissionCancellationState::Open),
+                deadline: Some(deadline),
+            }),
+        }
+    }
+
+    pub(crate) fn deadline(&self) -> Option<Instant> {
+        self.inner.deadline
+    }
+
+    pub(crate) fn is_requested_or_expired(&self) -> bool {
+        self.is_requested()
+            || self
+                .deadline()
+                .is_some_and(|deadline| Instant::now() >= deadline)
     }
 
     pub fn request(&self) {

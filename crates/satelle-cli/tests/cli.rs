@@ -4749,6 +4749,39 @@ fn doctor_scope_all_combined_with_another_scope_is_typed_pre_stream_failure() {
 }
 
 #[test]
+fn doctor_repeatable_specific_scopes_are_deduplicated_and_canonical() {
+    let state = state_dir();
+    let output = satelle()
+        .env("SATELLE_STATE_DIR", state.path())
+        .args([
+            "doctor",
+            "--host",
+            "local-demo",
+            "--scope",
+            "provider",
+            "--scope",
+            "codex",
+            "--scope",
+            "provider",
+            "--json",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .clone();
+    let report = parse_json_output(&output.stdout);
+
+    assert_eq!(report["scopes"], serde_json::json!(["codex", "provider"]));
+    assert!(
+        report["probe_results"]
+            .as_array()
+            .expect("probe results should be an array")
+            .iter()
+            .all(|probe| matches!(probe["scope"].as_str(), Some("codex" | "provider")))
+    );
+}
+
+#[test]
 fn local_demo_outputs_do_not_include_old_product_name() {
     let state = state_dir();
     let run = satelle()

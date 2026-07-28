@@ -6074,6 +6074,40 @@ pub struct DoctorFinding {
     pub recovery_command: Option<String>,
 }
 
+/// One transport observation produced at the selected CLI transport boundary.
+///
+/// The Host scheduler consumes this typed result instead of assuming that a
+/// transport is unavailable or re-running provider-specific transport logic.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DoctorTransportObservation {
+    ready: bool,
+    finding: Option<DoctorFinding>,
+}
+
+impl DoctorTransportObservation {
+    pub fn ready(finding: Option<DoctorFinding>) -> Self {
+        Self {
+            ready: true,
+            finding,
+        }
+    }
+
+    pub fn blocked(finding: DoctorFinding) -> Self {
+        Self {
+            ready: false,
+            finding: Some(finding),
+        }
+    }
+
+    pub const fn is_ready(&self) -> bool {
+        self.ready
+    }
+
+    pub const fn finding(&self) -> Option<&DoctorFinding> {
+        self.finding.as_ref()
+    }
+}
+
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum DoctorFixability {
