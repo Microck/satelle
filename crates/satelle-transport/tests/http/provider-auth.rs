@@ -318,9 +318,30 @@ async fn provider_secret_provisioning_requires_admin_mutation_authority_before_b
 #[tokio::test]
 async fn provider_secret_preview_rejects_missing_file_source_without_side_effects() {
     let admin = RunningServer::start(ApiScopes::ADMIN).await;
+    let raw_token = admin.token.expose();
+    let host_identity = admin.host_identity.clone();
+    let state = stop_provider_auth_server(admin).await;
     let metadata = provider_secret_metadata(false);
     let mut durable_before = Vec::new();
-    collect_state_bytes(admin._state.path(), &mut durable_before);
+    collect_state_bytes(state.path(), &mut durable_before);
+
+    let token =
+        ApiBearerToken::parse(raw_token.as_str()).expect("restore the registered admin token");
+    let service = HostService::local_demo_for_tests_at(state.path())
+        .expect("reopen the provider preview Host service");
+    let server = DaemonServer::bind(
+        service.clone(),
+        DaemonServerConfig::loopback(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))),
+    )
+    .await
+    .expect("restart the provider preview server");
+    let admin = RunningServer {
+        _state: state,
+        service,
+        server,
+        token,
+        host_identity,
+    };
 
     let mut normalized = Vec::new();
     let mut request_ids = Vec::new();
@@ -359,10 +380,11 @@ async fn provider_secret_preview_rejects_missing_file_source_without_side_effect
     assert_ne!(request_ids[0], request_ids[1]);
     assert_eq!(normalized[0], normalized[1]);
 
+    let state = stop_provider_auth_server(admin).await;
     let mut durable_after = Vec::new();
-    collect_state_bytes(admin._state.path(), &mut durable_after);
+    collect_state_bytes(state.path(), &mut durable_after);
     assert_eq!(durable_before, durable_after);
-    assert!(!state_contains_provider_secret_sibling(admin._state.path()));
+    assert!(!state_contains_provider_secret_sibling(state.path()));
 }
 
 fn state_contains_provider_secret_sibling(path: &std::path::Path) -> bool {

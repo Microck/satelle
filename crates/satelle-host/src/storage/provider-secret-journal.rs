@@ -1082,7 +1082,11 @@ mod tests {
 
     #[test]
     fn operation_identity_owns_the_only_accepted_recovery_paths() {
-        let destination = Path::new("/tmp/provider-secret");
+        let destination = if cfg!(windows) {
+            Path::new(r"C:\provider-secret")
+        } else {
+            Path::new("/tmp/provider-secret")
+        };
         let expected = provider_secret_file_paths(destination, "operation-a").unwrap();
         assert!(
             validate_operation_paths(

@@ -2637,7 +2637,9 @@ fn cleanup_migration_backups_with_hook(
 
 fn migration_checksum(value: &str) -> String {
     let mut checksum = 0xcbf29ce484222325_u64;
-    for byte in value.bytes() {
+    // Source checkouts may materialize SQL with CRLF on Windows. Migration
+    // identity is the canonical SQL content, independent of checkout endings.
+    for byte in value.replace("\r\n", "\n").bytes() {
         checksum ^= u64::from(byte);
         checksum = checksum.wrapping_mul(0x100000001b3);
     }
