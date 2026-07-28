@@ -460,6 +460,12 @@ impl DoctorProbeScheduler {
                     });
                 }
 
+                // start_ready propagates dependency skips to a fixed point.
+                // That propagation can complete the graph without starting
+                // another probe, so recheck before requiring running work.
+                if self.is_complete() {
+                    break;
+                }
                 assert!(
                     !running.is_empty(),
                     "a valid incomplete Doctor graph always has running work"
@@ -992,6 +998,43 @@ mod tests {
         assert!(matches!(
             scheduler.state("dependent"),
             Some(DoctorProbeState::SkippedDependency { .. })
+        ));
+        assert!(scheduler.is_complete());
+    }
+
+    #[test]
+    fn execution_completes_a_dependency_blocked_frontier_without_running_work() {
+        let mut scheduler = DoctorProbeScheduler::new(vec![
+            probe("failed", "codex", &[], &[]),
+            probe("z-child", "computer-use", &["failed"], &[]),
+            probe("a-grandchild", "provider", &["z-child"], &[]),
+        ])
+        .expect("valid graph");
+
+        let records = scheduler.execute(|probe, _context| {
+            assert_eq!(probe.probe_id, "failed");
+            DoctorProbeCompletion::new(
+                DoctorProbeStatus::Failed,
+                DoctorDependentEvidence::NotUseful,
+            )
+        });
+
+        assert_eq!(
+            records,
+            [DoctorProbeExecutionRecord {
+                probe_id: "failed".to_string(),
+                status: DoctorProbeStatus::Failed,
+            }]
+        );
+        assert!(matches!(
+            scheduler.state("z-child"),
+            Some(DoctorProbeState::SkippedDependency { blocking_probe_id })
+                if blocking_probe_id == "failed"
+        ));
+        assert!(matches!(
+            scheduler.state("a-grandchild"),
+            Some(DoctorProbeState::SkippedDependency { blocking_probe_id })
+                if blocking_probe_id == "z-child"
         ));
         assert!(scheduler.is_complete());
     }

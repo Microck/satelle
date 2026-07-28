@@ -2902,11 +2902,7 @@ fn production_doctor_with_provider_intent(
                 };
                 match snapshot {
                     Ok(snapshot) => {
-                        let blocked = snapshot
-                            .verdict
-                            .blockers()
-                            .iter()
-                            .any(|blocker| blocker_scope(blocker) == "codex");
+                        let blocked = !snapshot.verdict.blockers().is_empty();
                         execution
                             .lock()
                             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -3167,7 +3163,7 @@ fn apply_production_execution_status(
             scheduler.state(&result.scope),
             Some(DoctorProbeState::SkippedDependency { .. })
         ) {
-            result.status = "skipped".to_string();
+            result.status = "blocked".to_string();
             result.dependency_status = "blocked".to_string();
             result.started_at.clone_from(&snapshot.finished_at);
             result.finished_at.clone_from(&snapshot.finished_at);
