@@ -24,6 +24,20 @@ pub enum DoctorReadinessBlocker {
     UnsupportedRegion,
 }
 
+impl DoctorReadinessBlocker {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::CodexRuntimeMissing => "codex-runtime-missing",
+            Self::ComputerUsePluginMissing => "computer-use-plugin-missing",
+            Self::OsPermissionRequired => "os-permission-required",
+            Self::AppApprovalRequired => "app-approval-required",
+            Self::AuthenticationRequired => "authentication-required",
+            Self::UnsupportedOperatingSystem => "unsupported-operating-system",
+            Self::UnsupportedRegion => "unsupported-region",
+        }
+    }
+}
+
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
 )]

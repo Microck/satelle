@@ -59,6 +59,11 @@ use runtime::{
     ProductionComputerUseAdapter, RequestIdentity, RunCommand, RuntimeHandle, SteerCommand,
     StopCommand,
 };
+use satelle_core::doctor::{
+    DoctorDependentEvidence, DoctorProbe, DoctorProbeCachePolicy, DoctorProbeCompletion,
+    DoctorProbeResource, DoctorProbeScheduler, DoctorProbeState, DoctorProbeStatus, DoctorScope,
+    DoctorScopeSelection, DoctorScopeSelectionError,
+};
 use satelle_core::session::{PublicSession, TurnAdmissionFailure};
 use satelle_core::{
     DaemonPathOverrides, DoctorFinding, DoctorFixability, DoctorOptions, DoctorProbeResult,
@@ -1814,21 +1819,9 @@ impl HostService {
         options: DoctorOptions,
         provider_intent: &ProviderComputerUseIntent,
     ) -> Result<DoctorReport, SatelleError> {
-        if let Some(scope) = scope
-            && ![
-                "transport",
-                "codex",
-                "computer-use",
-                "provider",
-                "config",
-                "all",
-            ]
-            .contains(&scope)
-        {
-            return Err(SatelleError::invalid_usage("unsupported doctor scope"));
-        }
-        let includes_provider_scope = matches!(scope, None | Some("provider" | "all"));
-        let includes_native_scope = matches!(scope, None | Some("computer-use" | "all"));
+        let scope_selection = doctor_scope_selection(scope)?;
+        let includes_provider_scope = scope_selection.contains(DoctorScope::Provider);
+        let includes_native_scope = scope_selection.contains(DoctorScope::ComputerUse);
         let has_provider_selection =
             provider_intent.model().is_some() || provider_intent.provider().is_some();
         let should_resolve_provider = includes_provider_scope && has_provider_selection;
@@ -1856,13 +1849,21 @@ impl HostService {
         let mut report = match &self.mode {
             HostMode::Production { snapshot } if options.refresh() => {
                 let refreshed = ProductionCapabilitySnapshot::collect(options.probe_timeout());
-                let report = production_doctor_report(host, scope, &refreshed);
+                let report = production_doctor_report_with_selection(
+                    host,
+                    &scope_selection,
+                    options,
+                    &refreshed,
+                );
                 replace_production_snapshot(snapshot, refreshed)?;
                 report
             }
-            HostMode::Production { snapshot } => {
-                production_doctor_report(host, scope, &*read_production_snapshot(snapshot)?)
-            }
+            HostMode::Production { snapshot } => production_doctor_report_with_selection(
+                host,
+                &scope_selection,
+                options,
+                &*read_production_snapshot(snapshot)?,
+            ),
             #[cfg(any(test, feature = "test-support"))]
             HostMode::TestFake { .. } => {
                 self.fake_doctor(host, scope, options, &FakeComputerUseAdapter)?
@@ -3208,12 +3209,33 @@ fn execution_blocker(verdict: &Phase0SupportVerdict) -> SatelleError {
     SatelleError::computer_use_not_ready()
 }
 
+#[cfg(test)]
 fn production_doctor_report(
     host: &str,
     scope: Option<&str>,
     snapshot: &ProductionCapabilitySnapshot,
 ) -> DoctorReport {
-    let selected_scopes = selected_doctor_scopes(scope);
+    let scope_selection =
+        doctor_scope_selection(scope).expect("existing Doctor tests use supported scopes");
+    production_doctor_report_with_selection(
+        host,
+        &scope_selection,
+        DoctorOptions::default(),
+        snapshot,
+    )
+}
+
+fn production_doctor_report_with_selection(
+    host: &str,
+    scope_selection: &DoctorScopeSelection,
+    options: DoctorOptions,
+    snapshot: &ProductionCapabilitySnapshot,
+) -> DoctorReport {
+    let selected_scopes = scope_selection
+        .scopes()
+        .iter()
+        .map(|scope| scope.as_str())
+        .collect::<Vec<_>>();
     let capability_recovery = "satelle doctor --scope computer-use --refresh --json";
     let mut findings = snapshot
         .verdict
@@ -3248,14 +3270,16 @@ fn production_doctor_report(
             .then(left.finding_id.cmp(&right.finding_id))
     });
 
-    // Production capability discovery is currently one combined live probe,
-    // so it already satisfies the at-most-one execution promised by
-    // --serial-probes. The per-scope results below are static projections of
-    // that single snapshot, not additional live work to schedule.
-    let probe_results = selected_scopes
-        .iter()
-        .map(|scope| production_probe_result(scope, &findings, snapshot))
-        .collect::<Vec<_>>();
+    // Capability discovery is one bounded live operation. The scheduler owns
+    // how its per-scope projections become visible: dependency and resource
+    // rules apply without repeating the live probe or tying final order to
+    // completion order.
+    let probe_results = scheduled_production_probe_results(
+        scope_selection,
+        options.probe_timeout(),
+        &findings,
+        snapshot,
+    );
     let ready = probe_results.iter().all(|probe| probe.status == "passed");
     let blocking_findings = findings.len()
         + probe_results
@@ -3296,16 +3320,118 @@ fn production_doctor_report(
     }
 }
 
-fn selected_doctor_scopes(scope: Option<&str>) -> Vec<&'static str> {
-    match scope {
-        None | Some("all") => vec!["codex", "computer-use", "config", "provider", "transport"],
-        Some("codex") => vec!["codex"],
-        Some("computer-use") => vec!["computer-use"],
-        Some("config") => vec!["config"],
-        Some("provider") => vec!["provider"],
-        Some("transport") => vec!["transport"],
-        Some(_) => Vec::new(),
+fn doctor_scope_selection(scope: Option<&str>) -> Result<DoctorScopeSelection, SatelleError> {
+    let raw_scopes = scope.into_iter().map(str::to_string).collect::<Vec<_>>();
+    DoctorScopeSelection::parse(&raw_scopes).map_err(|error| match error {
+        DoctorScopeSelectionError::UnsupportedScope(scope) => {
+            SatelleError::invalid_usage(format!("unsupported doctor scope '{scope}'"))
+        }
+        DoctorScopeSelectionError::AllWithSpecificScopes(scopes) => {
+            SatelleError::scope_selection_conflict(&scopes)
+        }
+    })
+}
+
+fn production_doctor_probes(
+    scope_selection: &DoctorScopeSelection,
+    probe_timeout: Option<std::time::Duration>,
+) -> Vec<DoctorProbe> {
+    let timeout = probe_timeout.unwrap_or(std::time::Duration::from_secs(30));
+    scope_selection
+        .scopes()
+        .iter()
+        .map(|scope| {
+            let dependencies = match scope {
+                DoctorScope::ComputerUse if scope_selection.contains(DoctorScope::Codex) => {
+                    vec![DoctorScope::Codex.as_str().to_string()]
+                }
+                DoctorScope::Provider if scope_selection.contains(DoctorScope::ComputerUse) => {
+                    vec![DoctorScope::ComputerUse.as_str().to_string()]
+                }
+                _ => Vec::new(),
+            };
+            let resource_locks = match scope {
+                DoctorScope::ComputerUse => [
+                    DoctorProbeResource::NativeComputerUse,
+                    DoctorProbeResource::VisibleDesktop,
+                    DoctorProbeResource::ReadinessCacheWrite,
+                ]
+                .into_iter()
+                .collect(),
+                DoctorScope::Provider => [
+                    DoctorProbeResource::ProviderProbeSurface,
+                    DoctorProbeResource::ReadinessCacheWrite,
+                ]
+                .into_iter()
+                .collect(),
+                DoctorScope::Transport => [DoctorProbeResource::RemoteServiceManager]
+                    .into_iter()
+                    .collect(),
+                DoctorScope::Codex | DoctorScope::Config => Default::default(),
+            };
+            DoctorProbe {
+                probe_id: scope.as_str().to_string(),
+                scope: scope.as_str().to_string(),
+                dependencies,
+                resource_locks,
+                timeout,
+                cache_policy: DoctorProbeCachePolicy::Reuse,
+            }
+        })
+        .collect()
+}
+
+fn scheduled_production_probe_results(
+    scope_selection: &DoctorScopeSelection,
+    probe_timeout: Option<std::time::Duration>,
+    findings: &[DoctorFinding],
+    snapshot: &ProductionCapabilitySnapshot,
+) -> Vec<DoctorProbeResult> {
+    let probes = production_doctor_probes(scope_selection, probe_timeout);
+    let mut scheduler =
+        DoctorProbeScheduler::new(probes.clone()).expect("the static Doctor probe graph is valid");
+    let mut results = std::collections::BTreeMap::new();
+
+    while !scheduler.is_complete() {
+        let ready = scheduler.start_ready();
+        for probe in ready {
+            let result = production_probe_result(&probe.scope, findings, snapshot);
+            let useful_to_dependents = if result.status == "passed" {
+                DoctorDependentEvidence::Useful
+            } else {
+                DoctorDependentEvidence::NotUseful
+            };
+            let status = if result.status == "passed" {
+                DoctorProbeStatus::Passed
+            } else {
+                DoctorProbeStatus::Finding
+            };
+            scheduler
+                .finish(
+                    &probe.probe_id,
+                    DoctorProbeCompletion::new(status, useful_to_dependents),
+                )
+                .expect("a ready Doctor probe is running");
+            results.insert(probe.probe_id, result);
+        }
     }
+
+    for probe in probes {
+        if matches!(
+            scheduler.state(&probe.probe_id),
+            Some(DoctorProbeState::SkippedDependency { .. })
+        ) {
+            let mut result = production_probe_result(&probe.scope, findings, snapshot);
+            result.status = "skipped".to_string();
+            result.dependency_status = "blocked".to_string();
+            result.started_at.clone_from(&snapshot.finished_at);
+            result.finished_at.clone_from(&snapshot.finished_at);
+            result.duration_ms = 0;
+            results.insert(probe.probe_id, result);
+        }
+    }
+
+    results.into_values().collect()
 }
 
 fn blocker_scope(blocker: &Phase0CapabilityBlocker) -> &'static str {
@@ -3428,6 +3554,21 @@ fn blocker_finding(
     blocker: &Phase0CapabilityBlocker,
     recovery_command: &str,
 ) -> DoctorFinding {
+    let readiness_blocker = blocker.doctor_readiness_blocker();
+    let mut evidence = vec![
+        format!("reason={}", blocker.reason.as_str()),
+        format!("capability={}", blocker.capability.as_str()),
+        version_evidence(blocker.codex_version),
+        format!("host_platform={}", blocker.host_platform.as_str()),
+        format!("observed_surface={}", blocker.observed_surface.as_str()),
+        format!("live_proof={}", blocker.live_proof.as_str()),
+    ];
+    if let Some(readiness_blocker) = readiness_blocker {
+        evidence.push(format!(
+            "doctor_readiness_blocker={}",
+            readiness_blocker.as_str()
+        ));
+    }
     DoctorFinding {
         finding_id: format!(
             "phase0.{}.{}",
@@ -3439,14 +3580,7 @@ fn blocker_finding(
         fixability: DoctorFixability::Blocked,
         readiness_impact: "blocked".to_string(),
         summary: blocker_summary(blocker).to_string(),
-        evidence: vec![
-            format!("reason={}", blocker.reason.as_str()),
-            format!("capability={}", blocker.capability.as_str()),
-            version_evidence(blocker.codex_version),
-            format!("host_platform={}", blocker.host_platform.as_str()),
-            format!("observed_surface={}", blocker.observed_surface.as_str()),
-            format!("live_proof={}", blocker.live_proof.as_str()),
-        ],
+        evidence,
         recovery_command: Some(recovery_command.to_string()),
     }
 }
@@ -3580,6 +3714,70 @@ pub fn readiness_route() -> Value {
         ("host", json!(LOCAL_DEMO_HOST)),
         ("blocker", json!("computer-use-not-ready")),
     ])
+}
+
+#[cfg(test)]
+mod packet17_doctor_tests {
+    use super::*;
+
+    #[test]
+    fn host_default_doctor_graph_uses_dependencies_resources_and_bounded_concurrency() {
+        let selection = doctor_scope_selection(None).expect("default scope is valid");
+        let probes = production_doctor_probes(&selection, Some(std::time::Duration::from_secs(7)));
+        let mut scheduler = DoctorProbeScheduler::new(probes.clone()).expect("valid Host graph");
+
+        assert_eq!(probes.len(), 5);
+        assert!(
+            probes
+                .iter()
+                .all(|probe| probe.timeout == std::time::Duration::from_secs(7))
+        );
+        let first = scheduler.start_ready();
+        assert!(first.len() <= satelle_core::doctor::DEFAULT_DOCTOR_PROBE_CONCURRENCY);
+        assert!(first.iter().any(|probe| probe.scope == "codex"));
+        assert!(!first.iter().any(|probe| probe.scope == "computer-use"));
+        assert!(!first.iter().any(|probe| probe.scope == "provider"));
+        let native = probes
+            .iter()
+            .find(|probe| probe.scope == "computer-use")
+            .expect("native probe");
+        let provider = probes
+            .iter()
+            .find(|probe| probe.scope == "provider")
+            .expect("provider probe");
+        assert_eq!(native.dependencies, ["codex"]);
+        assert_eq!(provider.dependencies, ["computer-use"]);
+        assert!(
+            native
+                .resource_locks
+                .contains(&DoctorProbeResource::NativeComputerUse)
+        );
+        assert!(
+            provider
+                .resource_locks
+                .contains(&DoctorProbeResource::ProviderProbeSurface)
+        );
+    }
+
+    #[test]
+    fn authoritative_capability_blocker_reaches_doctor_finding_evidence() {
+        let blocker = Phase0CapabilityBlocker {
+            reason: BlockerReason::MissingCodexRuntime,
+            capability: RequiredCapability::NativeReadiness,
+            codex_version: CodexVersionEvidence::Missing,
+            host_platform: codex_capabilities::HostPlatform::Windows,
+            observed_surface: codex_capabilities::EvidenceSurface::Absent,
+            live_proof: codex_capabilities::LiveProofStatus::NotObserved,
+        };
+
+        let finding = blocker_finding("codex", &blocker, "satelle doctor --refresh");
+
+        assert!(
+            finding
+                .evidence
+                .contains(&"doctor_readiness_blocker=codex-runtime-missing".to_string())
+        );
+    }
 }
 
 #[cfg(test)]

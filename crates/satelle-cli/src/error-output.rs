@@ -270,6 +270,7 @@ fn error_contract(code: ErrorCode) -> ErrorContract {
             }
         }
         ErrorCode::InvalidUsage
+        | ErrorCode::ScopeSelectionConflict
         | ErrorCode::PromptSourceConflict
         | ErrorCode::EventsWithDetach
         | ErrorCode::InterruptModeConflict

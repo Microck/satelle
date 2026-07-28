@@ -31,6 +31,7 @@ use satelle_core::daemon_service::WindowsServiceConfigV1;
 use satelle_core::daemon_service::{
     DaemonServicePlatform, PersistentServiceDecision, SetupModeSelection, SetupModeSource,
 };
+use satelle_core::doctor::{DoctorScopeSelection, DoctorScopeSelectionError};
 use satelle_core::session::{
     EffectiveModelRef, HostIdentityRef, ProviderBindingRef, PublicSession, PublicTurn,
     TurnAdmissionPhase, TurnExecutionMode, TurnState,
@@ -45,8 +46,8 @@ use satelle_core::{
     SetupReadinessSummary, SetupReport, SetupRequiredInput, SetupSchemaVersion, SetupVerification,
     load_config, load_config_for_profile, load_config_without_profile, load_user_api_rate_limits,
     open_or_create_owner_only_directory, open_or_create_owner_only_file, open_owner_only_directory,
-    read_owner_controlled_config_file,
-    read_owner_only_secret_config_file, resolve_desktop_session, resolve_path_set, utc_now,
+    read_owner_controlled_config_file, read_owner_only_secret_config_file, resolve_desktop_session,
+    resolve_path_set, utc_now,
 };
 use satelle_host::{
     ApiBearerToken, HostService, ProviderComputerUseIntent, contains_api_bearer_token,
@@ -332,7 +333,7 @@ struct DoctorCommand {
     #[arg(long)]
     host: Option<String>,
     #[arg(long)]
-    scope: Option<String>,
+    scope: Vec<String>,
     #[arg(long)]
     refresh: bool,
     #[arg(long)]
@@ -4084,7 +4085,7 @@ fn run_doctor(
     format: OutputFormat,
 ) -> Result<(), CliFailure> {
     let json = format.is_json();
-    validate_doctor_scope(command.scope.as_deref())?;
+    let scope = validate_doctor_scope(&command.scope)?;
     let timeout = match command
         .timeout
         .as_deref()
@@ -4094,14 +4095,12 @@ fn run_doctor(
         Ok(timeout) => timeout.map(std::time::Duration::from_millis),
         Err(error) => return Err(failure(error)),
     };
-    if timeout.is_some()
-        && (!command.refresh || !doctor_scope_supports_refresh(command.scope.as_deref()))
-    {
+    if timeout.is_some() && (!command.refresh || !doctor_scope_supports_refresh(scope)) {
         return Err(failure(
             SatelleError::doctor_refresh_timeout_without_refresh(),
         ));
     }
-    if command.refresh && !doctor_scope_supports_refresh(command.scope.as_deref()) {
+    if command.refresh && !doctor_scope_supports_refresh(scope) {
         return Err(failure(SatelleError::doctor_refresh_scope_required()));
     }
 
@@ -4111,11 +4110,11 @@ fn run_doctor(
             .resolve_host(command.host.as_deref())
             .map_err(failure)?,
     );
-    if command.scope.as_deref() == Some("transport")
+    if scope == Some("transport")
         && let Some(report) = transport_doctor_report(&host.alias, &host.config)
     {
         if command.events {
-            print_doctor_started_event(&host.alias, command.scope.as_deref()).map_err(failure)?;
+            print_doctor_started_event(&host.alias, scope).map_err(failure)?;
         }
         return emit_doctor_report(report, command.events, json);
     }
@@ -4129,14 +4128,13 @@ fn run_doctor(
     )
     .map_err(failure)?;
     if command.events {
-        print_doctor_started_event(&host.alias, command.scope.as_deref()).map_err(failure)?;
+        print_doctor_started_event(&host.alias, scope).map_err(failure)?;
     }
-    let report = match transport.doctor(command.scope.as_deref(), options, &provider_intent) {
+    let report = match transport.doctor(scope, options, &provider_intent) {
         Ok(report) => report,
         Err(error) => {
             if command.events {
-                print_doctor_failed_event(&host.alias, command.scope.as_deref(), 2, &error)
-                    .map_err(failure)?;
+                print_doctor_failed_event(&host.alias, scope, 2, &error).map_err(failure)?;
                 return Err(reported_failure(error));
             }
             return Err(failure(error));
@@ -4188,27 +4186,25 @@ fn emit_doctor_report(report: DoctorReport, events: bool, json: bool) -> Result<
     }
 }
 
-fn validate_doctor_scope(scope: Option<&str>) -> Result<(), CliFailure> {
-    let Some(scope) = scope else {
-        return Ok(());
-    };
-
-    if [
-        "transport",
-        "codex",
-        "computer-use",
-        "provider",
-        "config",
-        "all",
-    ]
-    .contains(&scope)
-    {
-        return Ok(());
+fn validate_doctor_scope(scopes: &[String]) -> Result<Option<&str>, CliFailure> {
+    DoctorScopeSelection::parse(scopes).map_err(|error| {
+        failure(match error {
+            DoctorScopeSelectionError::UnsupportedScope(scope) => SatelleError::invalid_usage(
+                format!(
+                    "unsupported doctor scope '{scope}'; expected transport, codex, computer-use, provider, config, or all"
+                ),
+            ),
+            DoctorScopeSelectionError::AllWithSpecificScopes(scopes) => {
+                SatelleError::scope_selection_conflict(&scopes)
+            }
+        })
+    })?;
+    if scopes.len() > 1 {
+        return Err(failure(SatelleError::invalid_usage(
+            "doctor accepts one specific --scope per invocation",
+        )));
     }
-
-    Err(failure(SatelleError::invalid_usage(format!(
-        "unsupported doctor scope '{scope}'; expected transport, codex, computer-use, provider, config, or all"
-    ))))
+    Ok(scopes.first().map(String::as_str))
 }
 
 fn doctor_scope_supports_refresh(scope: Option<&str>) -> bool {
