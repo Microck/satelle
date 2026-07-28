@@ -20,6 +20,7 @@ use axum::response::Response;
 use satelle_core::SatelleError;
 use satelle_host::{ApiScopes, HostService, MutationAuthority, SetupOperationKind};
 use sha2::{Digest, Sha256};
+use std::collections::HashMap;
 use std::sync::Arc;
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
@@ -37,6 +38,7 @@ pub(super) struct PendingProviderSecretUpload {
     principal_ref: String,
     credential_revision: u64,
     idempotency_key: String,
+    request_digest: [u8; 32],
     expires_at: OffsetDateTime,
     private_key: Zeroizing<Vec<u8>>,
 }
@@ -195,6 +197,33 @@ pub(super) async fn preview_provider_secret_provisioning(
     Extension(authority): Extension<MutationAuthority>,
     ApiJson(request): ApiJson<ProviderSecretProvisioningMetadata>,
 ) -> Response {
+    let request_digest = match serde_json::to_vec(&request) {
+        Ok(bytes) => Sha256::digest(bytes).into(),
+        Err(_) => return host_error::task_failure(&state, &authorized),
+    };
+    let now = OffsetDateTime::now_utc();
+    let replay = {
+        let mut uploads = match state.provider_secret_uploads.lock() {
+            Ok(uploads) => uploads,
+            Err(_) => return host_error::task_failure(&state, &authorized),
+        };
+        uploads.retain(|_, pending| pending.expires_at > now);
+        matching_pending_provider_secret_upload(
+            &uploads,
+            authorized.principal().token_id(),
+            authorized.principal().principal_ref(),
+            authorized.principal().credential_revision(),
+            authority.idempotency_key(),
+        )
+        .map(|pending| (pending.request_digest, pending.preview.clone()))
+    };
+    if let Some((original_digest, original_response)) = replay {
+        if original_digest != request_digest {
+            return idempotency_conflict(&state, &authorized);
+        }
+        return replay_provider_secret_preview(&state, &authorized, &original_response);
+    }
+
     let service = Arc::clone(&state.service);
     let authorization = request.authorization().clone();
     let preview_authority = authority.clone();
@@ -234,6 +263,20 @@ pub(super) async fn preview_provider_secret_provisioning(
         Err(_) => return host_error::task_failure(&state, &authorized),
     };
     uploads.retain(|_, pending| pending.expires_at > now);
+    if let Some(pending) = matching_pending_provider_secret_upload(
+        &uploads,
+        authorized.principal().token_id(),
+        authorized.principal().principal_ref(),
+        authorized.principal().credential_revision(),
+        authority.idempotency_key(),
+    ) {
+        if pending.request_digest != request_digest {
+            return idempotency_conflict(&state, &authorized);
+        }
+        let original_response = pending.preview.clone();
+        drop(uploads);
+        return replay_provider_secret_preview(&state, &authorized, &original_response);
+    }
     if uploads.len() >= MAX_PENDING_PROVIDER_SECRET_UPLOADS {
         return provider_secret_request_failure(
             &state,
@@ -253,11 +296,50 @@ pub(super) async fn preview_provider_secret_provisioning(
             principal_ref: authorized.principal().principal_ref().to_string(),
             credential_revision: authorized.principal().credential_revision(),
             idempotency_key: authority.idempotency_key().to_string(),
+            request_digest,
             expires_at,
             private_key: keypair.private_key,
         },
     );
     drop(uploads);
+    authenticated_json_response(
+        StatusCode::OK,
+        &response,
+        authorized.request_id(),
+        &state.host_identity,
+    )
+}
+
+fn matching_pending_provider_secret_upload<'a>(
+    uploads: &'a HashMap<String, PendingProviderSecretUpload>,
+    token_id: &str,
+    principal_ref: &str,
+    credential_revision: u64,
+    idempotency_key: &str,
+) -> Option<&'a PendingProviderSecretUpload> {
+    uploads.values().find(|pending| {
+        pending.token_id == token_id
+            && pending.principal_ref == principal_ref
+            && pending.credential_revision == credential_revision
+            && pending.idempotency_key == idempotency_key
+    })
+}
+
+fn replay_provider_secret_preview(
+    state: &DaemonState,
+    authorized: &AuthorizedRequest,
+    original: &ProviderSecretProvisioningPreviewResponse,
+) -> Response {
+    let response = ProviderSecretProvisioningPreviewResponse::new(
+        authorized.request_id().clone(),
+        original.host_identity().to_string(),
+        original.destination_kind(),
+        original.persistence_location_class(),
+        original.overwrite_behavior(),
+        original.upload_id(),
+        original.recipient_public_key(),
+        original.expires_at(),
+    );
     authenticated_json_response(
         StatusCode::OK,
         &response,

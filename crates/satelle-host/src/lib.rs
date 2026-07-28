@@ -2277,15 +2277,13 @@ impl HostService {
                 // immediately before T3. The journal stores only keyed
                 // comparisons, so neither this check nor recovery needs a raw
                 // reusable hash.
-                let published = satelle_core::read_owner_only_secret_file(&destination)
-                    .map(provider_auth::ResolvedProviderSecret::from_provisioning)
+                let published_digest =
+                    satelle_core::keyed_owner_only_secret_file_comparison_digest(
+                        &destination,
+                        lifecycle.candidate.key.as_bytes(),
+                    )
                     .map_err(|_| provider_secret_file_error())?;
-                let published_comparison = provider_secret_comparison(
-                    &self.runtime,
-                    storage::PROVIDER_SECRET_CANDIDATE_HMAC_DOMAIN,
-                    &published,
-                )?;
-                if published_comparison.digest_hex != lifecycle.candidate.digest_hex {
+                if published_digest != lifecycle.candidate.digest {
                     return Err(ProviderSecretPostT0Failure::Ordinary(
                         SatelleError::state_conflict(),
                     ));

@@ -45,6 +45,80 @@ fn provider_secret_client(
     DaemonClient::loopback(address, token, host_identity).expect("construct provider secret client")
 }
 
+#[tokio::test]
+async fn provider_secret_preview_replays_without_consuming_upload_capacity() {
+    let limit = NonZeroUsize::new(256).expect("test rate limit is nonzero");
+    let admin = RunningServer::start_with_config(
+        ApiScopes::ADMIN,
+        DaemonServerConfig::loopback(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
+            .with_api_rate_limits(ApiRateLimits::new(limit, limit, limit, limit)),
+    )
+    .await;
+    let secret_directory = TestStateDir::new().expect("create provider secret directory");
+    let metadata = provider_secret_file_metadata(secret_directory.path().join("provider-token"));
+    let idempotency_key = "provider-secret-preview-replay";
+    let mut original = None;
+
+    // A broken implementation allocates one grant per retry and rejects the
+    // 129th request at the pending-upload cap.
+    for _ in 0..129 {
+        let response = admin
+            .mutation(PROVIDER_SECRET_PREVIEW_PATH, idempotency_key)
+            .json(&metadata)
+            .send()
+            .await
+            .expect("send replayed provider secret preview");
+        assert_eq!(response.status(), StatusCode::OK);
+        let mut body = response
+            .json::<serde_json::Value>()
+            .await
+            .expect("decode provider secret preview");
+        body.as_object_mut()
+            .expect("preview response is an object")
+            .remove("request_id");
+        if let Some(original) = &original {
+            assert_eq!(&body, original);
+        } else {
+            original = Some(body);
+        }
+    }
+
+    let conflicting = ProviderSecretProvisioningMetadata::new(
+        metadata.authorization().clone(),
+        !metadata.overwrite_authorized(),
+    );
+    let response = admin
+        .mutation(PROVIDER_SECRET_PREVIEW_PATH, idempotency_key)
+        .json(&conflicting)
+        .send()
+        .await
+        .expect("send conflicting provider secret preview");
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    let error = response
+        .json::<serde_json::Value>()
+        .await
+        .expect("decode preview idempotency conflict");
+    assert_eq!(
+        error.get("code").and_then(serde_json::Value::as_str),
+        Some("idempotency-key-conflict")
+    );
+
+    let response = admin
+        .mutation(
+            PROVIDER_SECRET_PREVIEW_PATH,
+            "provider-secret-preview-fresh",
+        )
+        .json(&metadata)
+        .send()
+        .await
+        .expect("send fresh provider secret preview");
+    assert_eq!(
+        response.status(),
+        StatusCode::OK,
+        "same-key retries must not exhaust pending upload capacity"
+    );
+}
+
 #[derive(Debug, Eq, PartialEq)]
 struct ProviderSecretPersistenceState {
     journal_rows: i64,

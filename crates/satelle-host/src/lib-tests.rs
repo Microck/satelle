@@ -843,6 +843,56 @@ fn newline_terminated_provider_secrets_can_be_replaced_atomically() {
 
 #[cfg(unix)]
 #[test]
+fn provider_secret_publication_preserves_candidate_terminal_line_endings() {
+    use std::os::unix::fs::PermissionsExt;
+
+    for (suffix, candidate) in [
+        ("lf", "replacement-provider-secret\n"),
+        ("crlf", "replacement-provider-secret\r\n"),
+    ] {
+        let state = TestStateDir::new().expect("temporary Host state");
+        let secret_directory = tempfile::tempdir().expect("temporary provider secret directory");
+        std::fs::set_permissions(
+            secret_directory.path(),
+            std::fs::Permissions::from_mode(0o700),
+        )
+        .expect("make provider secret directory owner-only");
+        let destination = secret_directory.path().join("provider-token");
+        let (service, _native_probe_calls, provider_probe_calls) =
+            service_with_classified_provider_probe(
+                state.path().to_path_buf(),
+                ProviderProvisioningProbeOutcome::Ready,
+            );
+        service.initialize_daemon().expect("initialize Host daemon");
+        let identity = RequestIdentity::new(
+            format!("provider-secret-candidate-{suffix}"),
+            "e".repeat(64),
+        );
+
+        let result = service
+            .provision_provider_secret(
+                LOCAL_DEMO_HOST,
+                provider_file_authorization(destination.clone()),
+                Zeroizing::new(candidate.to_string()),
+                false,
+                &identity,
+            )
+            .expect("publish the exact newline-terminated candidate");
+
+        assert!(!result.overwritten());
+        assert_eq!(
+            std::fs::read(&destination).expect("read published provider secret"),
+            candidate.as_bytes()
+        );
+        assert_eq!(
+            provider_probe_calls.load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
 fn typed_unknown_provider_outcomes_retain_recovery_ownership() {
     use std::os::unix::fs::PermissionsExt;
 
