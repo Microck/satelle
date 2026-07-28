@@ -1924,11 +1924,15 @@ impl HostService {
                     if let Some(native_evidence) = native_evidence {
                         let started_at = utc_now();
                         let started = Instant::now();
-                        let provider_refresh = self.runtime.refresh_setup_provider_readiness(
-                            host,
-                            provider_intent,
-                            native_evidence,
-                        );
+                        let cancellation = AdmissionCancellation::new();
+                        let provider_refresh = self
+                            .runtime
+                            .refresh_setup_provider_readiness_with_cancellation(
+                                host,
+                                provider_intent,
+                                native_evidence,
+                                &cancellation,
+                            );
                         let observed = match &provider_refresh {
                             Ok(readiness) if readiness.provider_smoke_evidence().is_some() => (
                                 satelle_core::ProviderAuthValidationOutcome::Resolved,
