@@ -137,6 +137,64 @@ pub(crate) fn host_update_arguments(host: &str) -> Vec<String> {
     ]
 }
 
+pub(crate) struct VerifiedHostArtifact {
+    artifact_identity: String,
+    artifact_digest: String,
+    verified_version: String,
+    staged: VerifiedRelease,
+}
+
+impl VerifiedHostArtifact {
+    pub(crate) fn artifact_identity(&self) -> &str {
+        &self.artifact_identity
+    }
+
+    pub(crate) fn artifact_digest(&self) -> &str {
+        &self.artifact_digest
+    }
+
+    pub(crate) fn verified_version(&self) -> &str {
+        &self.verified_version
+    }
+
+    pub(crate) fn staged_executable(&self) -> &Path {
+        &self.staged.executable
+    }
+}
+
+/// Fetches one version-exact Host artifact through the same trust chain as
+/// local self-update. The returned handle owns the private staging directory;
+/// callers choose destinations and service behavior outside this module.
+pub(crate) fn fetch_verified_host_artifact(
+    exact_version: &str,
+    canonical_target_id: &str,
+) -> Result<VerifiedHostArtifact, SelfUpdateError> {
+    fetch_verified_host_artifact_with(
+        &GithubReleaseSource::new()?,
+        exact_version,
+        canonical_target_id,
+    )
+}
+
+fn fetch_verified_host_artifact_with(
+    source: &impl ReleaseSource,
+    exact_version: &str,
+    canonical_target_id: &str,
+) -> Result<VerifiedHostArtifact, SelfUpdateError> {
+    let version = Version::parse(exact_version)?;
+    if version.to_string() != exact_version {
+        return Err(SelfUpdateError::VersionInvalid(exact_version.to_string()));
+    }
+    let target = LocalTarget::from_id(canonical_target_id)?;
+    let staged = source.fetch_verified_release(exact_version, target)?;
+    Ok(VerifiedHostArtifact {
+        artifact_identity: target.archive_name(exact_version),
+        artifact_digest: digest_hex(&staged.archive_digest),
+        verified_version: exact_version.to_string(),
+        staged,
+    })
+}
+
 pub(crate) fn run(request: SelfUpdateRequest) -> Result<SelfUpdateReport, SelfUpdateError> {
     let source = GithubReleaseSource::new()?;
     run_with(
@@ -367,6 +425,18 @@ enum LocalTarget {
 }
 
 impl LocalTarget {
+    fn from_id(id: &str) -> Result<Self, SelfUpdateError> {
+        match id {
+            "linux-arm64-gnu" => Ok(Self::LinuxArm64Gnu),
+            "linux-x64-gnu" => Ok(Self::LinuxX64Gnu),
+            "darwin-arm64" => Ok(Self::DarwinArm64),
+            "darwin-x64" => Ok(Self::DarwinX64),
+            "win32-arm64-msvc" => Ok(Self::WindowsArm64Msvc),
+            "win32-x64-msvc" => Ok(Self::WindowsX64Msvc),
+            _ => Err(SelfUpdateError::UnsupportedReleaseTarget(id.to_string())),
+        }
+    }
+
     fn current() -> Result<Self, SelfUpdateError> {
         #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
         {
@@ -1398,6 +1468,8 @@ pub(crate) enum SelfUpdateError {
     ExplicitVersionRequired { current: String, candidate: String },
     #[error("the local platform does not have an MVP Controller artifact")]
     UnsupportedLocalPlatform,
+    #[error("the release target is not in the canonical Controller matrix: {0}")]
+    UnsupportedReleaseTarget(String),
     #[error("the GitHub CLI is required for signed tag and attestation verification")]
     GhUnavailable,
     #[error("GitHub release metadata is invalid")]
@@ -1467,6 +1539,7 @@ impl SelfUpdateError {
             Self::VersionInvalid(_) => "self-update-version-invalid",
             Self::ExplicitVersionRequired { .. } => "self-update-explicit-version-required",
             Self::UnsupportedLocalPlatform => "unsupported-local-platform",
+            Self::UnsupportedReleaseTarget(_) => "unsupported-release-target",
             Self::InstallLocked(_) => "self-update-locked",
             Self::ReceiptRollback { .. } => "self-update-rollback-failed",
             Self::ReceiptInvalid(_) | Self::ReceiptRead(_) => "self-update-receipt-invalid",
@@ -1547,7 +1620,7 @@ impl SelfUpdateError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::cell::Cell;
+    use std::cell::{Cell, RefCell};
     use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
     use tempfile::tempdir;
 
@@ -1576,6 +1649,101 @@ mod tests {
                 archive_digest: self.digest,
             })
         }
+    }
+
+    struct RecordingHostArtifactSource {
+        requests: RefCell<Vec<(String, String)>>,
+    }
+
+    impl ReleaseSource for RecordingHostArtifactSource {
+        fn latest_stable_version(&self) -> Result<String, SelfUpdateError> {
+            panic!("cross-target verification must use the exact requested version")
+        }
+
+        fn fetch_verified_release(
+            &self,
+            version: &str,
+            target: LocalTarget,
+        ) -> Result<VerifiedRelease, SelfUpdateError> {
+            self.requests
+                .borrow_mut()
+                .push((version.to_string(), target.id().to_string()));
+            let directory = tempdir().map_err(SelfUpdateError::TemporaryDirectory)?;
+            let executable = directory.path().join(target.executable_name());
+            fs::write(&executable, b"verified host artifact")
+                .map_err(SelfUpdateError::ArchiveRead)?;
+            Ok(VerifiedRelease {
+                _directory: directory,
+                executable,
+                archive_digest: [0x5a; 32],
+            })
+        }
+    }
+
+    #[test]
+    fn cross_target_host_artifacts_use_the_canonical_verified_release_chain() {
+        let source = RecordingHostArtifactSource {
+            requests: RefCell::new(Vec::new()),
+        };
+        for (target, extension) in [
+            ("linux-arm64-gnu", "tar.gz"),
+            ("linux-x64-gnu", "tar.gz"),
+            ("darwin-arm64", "tar.gz"),
+            ("darwin-x64", "tar.gz"),
+            ("win32-arm64-msvc", "zip"),
+            ("win32-x64-msvc", "zip"),
+        ] {
+            let artifact =
+                fetch_verified_host_artifact_with(&source, "1.2.3", target).unwrap();
+            assert_eq!(
+                artifact.artifact_identity(),
+                format!("satelle-v1.2.3-{target}.{extension}")
+            );
+            assert_eq!(artifact.artifact_digest(), "5a".repeat(32));
+            assert_eq!(artifact.verified_version(), "1.2.3");
+            assert!(artifact.staged_executable().is_file());
+            assert_eq!(
+                artifact
+                    .staged_executable()
+                    .file_name()
+                    .and_then(|name| name.to_str()),
+                Some(if target.starts_with("win32-") {
+                    "satelle.exe"
+                } else {
+                    "satelle"
+                })
+            );
+        }
+        assert_eq!(
+            source.requests.into_inner(),
+            [
+                "linux-arm64-gnu",
+                "linux-x64-gnu",
+                "darwin-arm64",
+                "darwin-x64",
+                "win32-arm64-msvc",
+                "win32-x64-msvc",
+            ]
+            .map(|target| ("1.2.3".to_string(), target.to_string()))
+        );
+    }
+
+    #[test]
+    fn cross_target_host_artifacts_reject_noncanonical_selection_before_fetch() {
+        let source = RecordingHostArtifactSource {
+            requests: RefCell::new(Vec::new()),
+        };
+        for (version, target) in [
+            ("v1.2.3", "linux-x64-gnu"),
+            ("1.2.3", "linux-x64-musl"),
+            ("1.2.3", "../linux-x64-gnu"),
+        ] {
+            assert!(
+                fetch_verified_host_artifact_with(&source, version, target).is_err(),
+                "{version} {target}"
+            );
+        }
+        assert!(source.requests.into_inner().is_empty());
     }
 
     struct FixtureReplacer;
