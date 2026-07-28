@@ -347,11 +347,25 @@ function detectForwardingContext({ packageName, launcherPath }) {
       const unscopedLauncherPath = path.join(unscopedRoot, "bin", "satelle.cjs");
       try {
         const manifest = JSON.parse(readFileSync(unscopedManifestPath, "utf8"));
+        const dependency = manifest.dependencies?.["@microck/satelle"];
+        let dependencyMatches = dependency === launcherVersion;
+        if (!dependencyMatches && dependency) {
+          const resolvedCanonicalLauncher = createRequire(unscopedManifestPath).resolve(
+            "@microck/satelle/launcher",
+          );
+          const resolvedCanonicalRoot = path.dirname(path.dirname(resolvedCanonicalLauncher));
+          const canonicalManifest = JSON.parse(
+            readFileSync(path.join(resolvedCanonicalRoot, "package.json"), "utf8"),
+          );
+          dependencyMatches =
+            canonicalManifest.version === launcherVersion &&
+            realpathSync(resolvedCanonicalRoot) === realpathSync(canonicalRoot);
+        }
         if (
           existsSync(unscopedLauncherPath) &&
           manifest.name === "satelle" &&
           manifest.version === launcherVersion &&
-          manifest.dependencies?.["@microck/satelle"] === launcherVersion
+          dependencyMatches
         ) {
           candidates.push({
             packageName: "satelle",
