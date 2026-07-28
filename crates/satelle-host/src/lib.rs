@@ -61,8 +61,8 @@ use runtime::{
 };
 use satelle_core::doctor::{
     DoctorDependentEvidence, DoctorProbe, DoctorProbeCachePolicy, DoctorProbeCompletion,
-    DoctorProbeResource, DoctorProbeScheduler, DoctorProbeState, DoctorProbeStatus, DoctorScope,
-    DoctorScopeSelection, DoctorScopeSelectionError,
+    DoctorProbeExecutionRecord, DoctorProbeResource, DoctorProbeScheduler, DoctorProbeState,
+    DoctorProbeStatus, DoctorScope, DoctorScopeSelection, DoctorScopeSelectionError,
 };
 use satelle_core::session::{PublicSession, TurnAdmissionFailure};
 use satelle_core::{
@@ -1820,6 +1820,16 @@ impl HostService {
         provider_intent: &ProviderComputerUseIntent,
     ) -> Result<DoctorReport, SatelleError> {
         let scope_selection = doctor_scope_selection(scope)?;
+        if let HostMode::Production { snapshot } = &self.mode {
+            return production_doctor_with_provider_intent(
+                self,
+                host,
+                &scope_selection,
+                options,
+                provider_intent,
+                snapshot,
+            );
+        }
         let includes_provider_scope = scope_selection.contains(DoctorScope::Provider);
         let includes_native_scope = scope_selection.contains(DoctorScope::ComputerUse);
         let has_provider_selection =
@@ -1847,23 +1857,7 @@ impl HostService {
             None
         };
         let mut report = match &self.mode {
-            HostMode::Production { snapshot } if options.refresh() => {
-                let refreshed = ProductionCapabilitySnapshot::collect(options.probe_timeout());
-                let report = production_doctor_report_with_selection(
-                    host,
-                    &scope_selection,
-                    options,
-                    &refreshed,
-                );
-                replace_production_snapshot(snapshot, refreshed)?;
-                report
-            }
-            HostMode::Production { snapshot } => production_doctor_report_with_selection(
-                host,
-                &scope_selection,
-                options,
-                &*read_production_snapshot(snapshot)?,
-            ),
+            HostMode::Production { .. } => unreachable!("production Doctor returned above"),
             #[cfg(any(test, feature = "test-support"))]
             HostMode::TestFake { .. } => {
                 self.fake_doctor(host, scope, options, &FakeComputerUseAdapter)?
@@ -2814,6 +2808,388 @@ impl HostService {
     }
 }
 
+struct ProductionDoctorExecution {
+    snapshot: Option<ProductionCapabilitySnapshot>,
+    fatal_error: Option<SatelleError>,
+    native_refresh: Option<(
+        Result<ReadinessEvidence, SatelleError>,
+        String,
+        std::time::Duration,
+    )>,
+    provider_refresh: Option<(
+        Result<AdapterReadiness, SatelleError>,
+        String,
+        std::time::Duration,
+    )>,
+    provider_auth_evidence: Option<(
+        satelle_core::ProviderAuthValidationOutcome,
+        satelle_core::ProviderAuthObservationSource,
+    )>,
+    provider_not_required: bool,
+}
+
+impl ProductionDoctorExecution {
+    fn new() -> Self {
+        Self {
+            snapshot: None,
+            fatal_error: None,
+            native_refresh: None,
+            provider_refresh: None,
+            provider_auth_evidence: None,
+            provider_not_required: false,
+        }
+    }
+}
+
+fn production_doctor_with_provider_intent(
+    service: &HostService,
+    host: &str,
+    scope_selection: &DoctorScopeSelection,
+    options: DoctorOptions,
+    provider_intent: &ProviderComputerUseIntent,
+    snapshot_slot: &Arc<RwLock<ProductionCapabilitySnapshot>>,
+) -> Result<DoctorReport, SatelleError> {
+    let includes_native_scope = scope_selection.contains(DoctorScope::ComputerUse);
+    let includes_provider_scope = scope_selection.contains(DoctorScope::Provider);
+    let has_provider_selection =
+        provider_intent.model().is_some() || provider_intent.provider().is_some();
+    let should_resolve_provider = includes_provider_scope && has_provider_selection;
+    let provider_probe_required =
+        should_resolve_provider && provider_intent.provider_probe_required();
+
+    // Phase 0 is an atomic capability observation. Keep it as one real probe,
+    // and add hidden prerequisite scopes only when a selected probe consumes
+    // their evidence.
+    let execution_scopes = DoctorScope::ALL
+        .into_iter()
+        .filter(|scope| {
+            scope_selection.contains(*scope)
+                || *scope == DoctorScope::Codex
+                || (provider_probe_required && *scope == DoctorScope::ComputerUse)
+        })
+        .collect::<Vec<_>>();
+    let mut probes = production_doctor_probes(&execution_scopes, options.probe_timeout());
+    if should_resolve_provider {
+        probes.push(DoctorProbe {
+            probe_id: "provider-auth".to_string(),
+            scope: DoctorScope::Provider.as_str().to_string(),
+            dependencies: Vec::new(),
+            resource_locks: Default::default(),
+            timeout: options
+                .probe_timeout()
+                .unwrap_or(std::time::Duration::from_secs(30)),
+            cache_policy: DoctorProbeCachePolicy::Reuse,
+        });
+        let provider = probes
+            .iter_mut()
+            .find(|probe| probe.probe_id == DoctorScope::Provider.as_str())
+            .expect("a selected provider scope has a provider probe");
+        provider.dependencies.push("provider-auth".to_string());
+    }
+
+    let execution = Mutex::new(ProductionDoctorExecution::new());
+    let mut scheduler =
+        DoctorProbeScheduler::new(probes).expect("the production Doctor graph is valid");
+    let records = scheduler.execute(|probe, _context| {
+        match probe.probe_id.as_str() {
+            "codex" => {
+                let snapshot = if options.refresh() {
+                    Ok(ProductionCapabilitySnapshot::collect(
+                        options.probe_timeout(),
+                    ))
+                } else {
+                    read_production_snapshot(snapshot_slot).map(|snapshot| snapshot.clone())
+                };
+                match snapshot {
+                    Ok(snapshot) => {
+                        let blocked = snapshot
+                            .verdict
+                            .blockers()
+                            .iter()
+                            .any(|blocker| blocker_scope(blocker) == "codex");
+                        execution
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .snapshot = Some(snapshot);
+                        probe_completion(blocked)
+                    }
+                    Err(error) => {
+                        execution
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .fatal_error = Some(error.clone());
+                        error_probe_completion(&error)
+                    }
+                }
+            }
+            "computer-use" => {
+                if options.refresh() {
+                    let native_only_intent = ProviderComputerUseIntent::host_default();
+                    let native_intent = if includes_native_scope {
+                        &native_only_intent
+                    } else {
+                        provider_intent
+                    };
+                    let started_at = utc_now();
+                    let started = Instant::now();
+                    let refresh = service
+                        .runtime
+                        .refresh_setup_native_readiness(host, native_intent);
+                    let completion = result_probe_completion(&refresh);
+                    execution
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .native_refresh = Some((refresh, started_at, started.elapsed()));
+                    completion
+                } else {
+                    let blocked = execution
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .snapshot
+                        .as_ref()
+                        .is_some_and(|snapshot| {
+                            snapshot
+                                .verdict
+                                .blockers()
+                                .iter()
+                                .any(|blocker| blocker_scope(blocker) == "computer-use")
+                        });
+                    probe_completion(blocked)
+                }
+            }
+            "provider-auth" => {
+                let resolution = service.resolve_provider_binding(host, provider_intent);
+                match resolution {
+                    Ok(ProviderBindingResolution::Ready(binding)) => {
+                        let evidence = match binding.auth_source() {
+                            Some(source) => (
+                                provider_auth::diagnose_provider_secret(Some(source), None, false),
+                                satelle_core::ProviderAuthObservationSource::Deferred,
+                            ),
+                            None => (
+                                satelle_core::ProviderAuthValidationOutcome::Resolved,
+                                satelle_core::ProviderAuthObservationSource::Cached,
+                            ),
+                        };
+                        let blocked = matches!(
+                            evidence.0,
+                            satelle_core::ProviderAuthValidationOutcome::MissingDescriptor
+                                | satelle_core::ProviderAuthValidationOutcome::UnsupportedDescriptorKind
+                        );
+                        execution
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .provider_auth_evidence = Some(evidence);
+                        probe_completion(blocked)
+                    }
+                    Ok(ProviderBindingResolution::MissingDescriptor { .. }) => {
+                        execution
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .provider_auth_evidence = Some((
+                            satelle_core::ProviderAuthValidationOutcome::MissingDescriptor,
+                            satelle_core::ProviderAuthObservationSource::Deferred,
+                        ));
+                        probe_completion(true)
+                    }
+                    Err(error) => {
+                        execution
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .fatal_error = Some(error.clone());
+                        error_probe_completion(&error)
+                    }
+                }
+            }
+            "provider" => {
+                if !should_resolve_provider || !options.refresh() {
+                    return probe_completion(false);
+                }
+                let provider_refresh_allowed = execution
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .provider_auth_evidence
+                    .is_some_and(|outcome| {
+                        !matches!(
+                            outcome.0,
+                            satelle_core::ProviderAuthValidationOutcome::MissingDescriptor
+                                | satelle_core::ProviderAuthValidationOutcome::UnsupportedDescriptorKind
+                        )
+                    });
+                if !provider_refresh_allowed {
+                    return probe_completion(true);
+                }
+                if !provider_probe_required {
+                    execution
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .provider_not_required = true;
+                    return probe_completion(false);
+                }
+
+                let native_evidence = execution
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .native_refresh
+                    .as_ref()
+                    .and_then(|(refresh, _, _)| refresh.as_ref().ok())
+                    .cloned();
+                let Some(native_evidence) = native_evidence else {
+                    return DoctorProbeCompletion::new(
+                        DoctorProbeStatus::Failed,
+                        DoctorDependentEvidence::NotUseful,
+                    );
+                };
+                let started_at = utc_now();
+                let started = Instant::now();
+                let refresh = service.runtime.refresh_setup_provider_readiness(
+                    host,
+                    provider_intent,
+                    native_evidence,
+                );
+                let completion = result_probe_completion(&refresh);
+                let observed = match &refresh {
+                    Ok(readiness) if readiness.provider_smoke_evidence().is_some() => Some((
+                        satelle_core::ProviderAuthValidationOutcome::Resolved,
+                        satelle_core::ProviderAuthObservationSource::Live,
+                    )),
+                    Err(error) => provider_validation_outcome_for_error(error).map(|outcome| {
+                        (
+                            outcome,
+                            satelle_core::ProviderAuthObservationSource::Live,
+                        )
+                    }),
+                    Ok(_) => None,
+                };
+                let mut execution = execution
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if let Some(observed) = observed {
+                    execution.provider_auth_evidence = Some(observed);
+                }
+                execution.provider_refresh = Some((refresh, started_at, started.elapsed()));
+                completion
+            }
+            "transport" => probe_completion(true),
+            "config" => probe_completion(false),
+            unknown => panic!("unknown production Doctor probe {unknown}"),
+        }
+    });
+
+    let mut execution = execution
+        .into_inner()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(error) = execution.fatal_error {
+        // The scheduler has already joined every independent probe before an
+        // error can leave the production Doctor path.
+        return Err(error);
+    }
+    let snapshot = execution
+        .snapshot
+        .take()
+        .expect("the required capability probe completed");
+    let mut report =
+        production_doctor_report_with_selection(host, scope_selection, options, &snapshot);
+    apply_production_execution_status(&mut report, &scheduler, &records, &snapshot);
+
+    if let Some((refresh, started_at, duration)) = execution.native_refresh
+        && includes_native_scope
+    {
+        apply_native_refresh(&mut report, &refresh, started_at, duration);
+    }
+    if let Some((refresh, started_at, duration)) = execution.provider_refresh {
+        apply_provider_refresh(&mut report, &refresh, started_at, duration);
+    } else if execution.provider_not_required {
+        apply_provider_not_required(&mut report);
+    } else if matches!(
+        execution.provider_auth_evidence,
+        Some((
+            satelle_core::ProviderAuthValidationOutcome::MissingDescriptor
+                | satelle_core::ProviderAuthValidationOutcome::UnsupportedDescriptorKind,
+            _
+        ))
+    ) {
+        recompute_doctor_summary(&mut report);
+    }
+    if let Some((outcome, source)) = execution.provider_auth_evidence {
+        for finding in &mut report.findings {
+            if finding.scope == "provider" {
+                finding
+                    .evidence
+                    .push(format!("provider_auth_outcome={}", outcome.as_str()));
+                finding.evidence.push(format!(
+                    "provider_auth_observation_source={}",
+                    source.as_str()
+                ));
+            }
+        }
+    }
+    if options.refresh() {
+        replace_production_snapshot(snapshot_slot, snapshot)?;
+    }
+    Ok(report)
+}
+
+fn probe_completion(blocked: bool) -> DoctorProbeCompletion {
+    if blocked {
+        DoctorProbeCompletion::new(
+            DoctorProbeStatus::Finding,
+            DoctorDependentEvidence::NotUseful,
+        )
+    } else {
+        DoctorProbeCompletion::new(DoctorProbeStatus::Passed, DoctorDependentEvidence::Useful)
+    }
+}
+
+fn error_probe_completion(error: &SatelleError) -> DoctorProbeCompletion {
+    let status = if error.code.as_str().contains("timeout") {
+        DoctorProbeStatus::TimedOut
+    } else {
+        DoctorProbeStatus::Failed
+    };
+    DoctorProbeCompletion::new(status, DoctorDependentEvidence::NotUseful)
+}
+
+fn result_probe_completion<T>(result: &Result<T, SatelleError>) -> DoctorProbeCompletion {
+    result.as_ref().map_or_else(error_probe_completion, |_| {
+        DoctorProbeCompletion::new(DoctorProbeStatus::Passed, DoctorDependentEvidence::Useful)
+    })
+}
+
+fn apply_production_execution_status(
+    report: &mut DoctorReport,
+    scheduler: &DoctorProbeScheduler,
+    records: &[DoctorProbeExecutionRecord],
+    snapshot: &ProductionCapabilitySnapshot,
+) {
+    for result in &mut report.probe_results {
+        if matches!(
+            scheduler.state(&result.scope),
+            Some(DoctorProbeState::SkippedDependency { .. })
+        ) {
+            result.status = "skipped".to_string();
+            result.dependency_status = "blocked".to_string();
+            result.started_at.clone_from(&snapshot.finished_at);
+            result.finished_at.clone_from(&snapshot.finished_at);
+            result.duration_ms = 0;
+            continue;
+        }
+        let Some(record) = records
+            .iter()
+            .find(|record| record.probe_id == result.scope)
+        else {
+            continue;
+        };
+        result.status = match record.status {
+            DoctorProbeStatus::Passed => "passed",
+            DoctorProbeStatus::Finding | DoctorProbeStatus::Failed => "blocked",
+            DoctorProbeStatus::TimedOut => "timed_out",
+        }
+        .to_string();
+    }
+    recompute_doctor_summary(report);
+}
+
 fn duration_to_time(duration: &satelle_core::ExplicitDuration) -> time::Duration {
     time::Duration::milliseconds(i64::try_from(duration.milliseconds()).unwrap_or(i64::MAX))
 }
@@ -3333,19 +3709,18 @@ fn doctor_scope_selection(scope: Option<&str>) -> Result<DoctorScopeSelection, S
 }
 
 fn production_doctor_probes(
-    scope_selection: &DoctorScopeSelection,
+    scopes: &[DoctorScope],
     probe_timeout: Option<std::time::Duration>,
 ) -> Vec<DoctorProbe> {
     let timeout = probe_timeout.unwrap_or(std::time::Duration::from_secs(30));
-    scope_selection
-        .scopes()
+    scopes
         .iter()
         .map(|scope| {
             let dependencies = match scope {
-                DoctorScope::ComputerUse if scope_selection.contains(DoctorScope::Codex) => {
+                DoctorScope::ComputerUse if scopes.contains(&DoctorScope::Codex) => {
                     vec![DoctorScope::Codex.as_str().to_string()]
                 }
-                DoctorScope::Provider if scope_selection.contains(DoctorScope::ComputerUse) => {
+                DoctorScope::Provider if scopes.contains(&DoctorScope::ComputerUse) => {
                     vec![DoctorScope::ComputerUse.as_str().to_string()]
                 }
                 _ => Vec::new(),
@@ -3383,55 +3758,15 @@ fn production_doctor_probes(
 
 fn scheduled_production_probe_results(
     scope_selection: &DoctorScopeSelection,
-    probe_timeout: Option<std::time::Duration>,
+    _probe_timeout: Option<std::time::Duration>,
     findings: &[DoctorFinding],
     snapshot: &ProductionCapabilitySnapshot,
 ) -> Vec<DoctorProbeResult> {
-    let probes = production_doctor_probes(scope_selection, probe_timeout);
-    let mut scheduler =
-        DoctorProbeScheduler::new(probes.clone()).expect("the static Doctor probe graph is valid");
-    let mut results = std::collections::BTreeMap::new();
-
-    while !scheduler.is_complete() {
-        let ready = scheduler.start_ready();
-        for probe in ready {
-            let result = production_probe_result(&probe.scope, findings, snapshot);
-            let useful_to_dependents = if result.status == "passed" {
-                DoctorDependentEvidence::Useful
-            } else {
-                DoctorDependentEvidence::NotUseful
-            };
-            let status = if result.status == "passed" {
-                DoctorProbeStatus::Passed
-            } else {
-                DoctorProbeStatus::Finding
-            };
-            scheduler
-                .finish(
-                    &probe.probe_id,
-                    DoctorProbeCompletion::new(status, useful_to_dependents),
-                )
-                .expect("a ready Doctor probe is running");
-            results.insert(probe.probe_id, result);
-        }
-    }
-
-    for probe in probes {
-        if matches!(
-            scheduler.state(&probe.probe_id),
-            Some(DoctorProbeState::SkippedDependency { .. })
-        ) {
-            let mut result = production_probe_result(&probe.scope, findings, snapshot);
-            result.status = "skipped".to_string();
-            result.dependency_status = "blocked".to_string();
-            result.started_at.clone_from(&snapshot.finished_at);
-            result.finished_at.clone_from(&snapshot.finished_at);
-            result.duration_ms = 0;
-            results.insert(probe.probe_id, result);
-        }
-    }
-
-    results.into_values().collect()
+    scope_selection
+        .scopes()
+        .iter()
+        .map(|scope| production_probe_result(scope.as_str(), findings, snapshot))
+        .collect()
 }
 
 fn blocker_scope(blocker: &Phase0CapabilityBlocker) -> &'static str {
@@ -3723,7 +4058,8 @@ mod packet17_doctor_tests {
     #[test]
     fn host_default_doctor_graph_uses_dependencies_resources_and_bounded_concurrency() {
         let selection = doctor_scope_selection(None).expect("default scope is valid");
-        let probes = production_doctor_probes(&selection, Some(std::time::Duration::from_secs(7)));
+        let probes =
+            production_doctor_probes(selection.scopes(), Some(std::time::Duration::from_secs(7)));
         let mut scheduler = DoctorProbeScheduler::new(probes.clone()).expect("valid Host graph");
 
         assert_eq!(probes.len(), 5);
@@ -3776,6 +4112,27 @@ mod packet17_doctor_tests {
             finding
                 .evidence
                 .contains(&"doctor_readiness_blocker=codex-runtime-missing".to_string())
+        );
+    }
+
+    #[test]
+    fn missing_private_execution_path_does_not_claim_plugin_absence() {
+        let blocker = Phase0CapabilityBlocker {
+            reason: BlockerReason::NativeExecutionPathUnavailable,
+            capability: RequiredCapability::NativeReadiness,
+            codex_version: CodexVersionEvidence::Missing,
+            host_platform: codex_capabilities::HostPlatform::Windows,
+            observed_surface: codex_capabilities::EvidenceSurface::Absent,
+            live_proof: codex_capabilities::LiveProofStatus::NotObserved,
+        };
+
+        let finding = blocker_finding("computer-use", &blocker, "satelle doctor --refresh");
+
+        assert!(
+            finding
+                .evidence
+                .iter()
+                .all(|entry| !entry.contains("computer-use-plugin-missing"))
         );
     }
 }

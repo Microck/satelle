@@ -443,15 +443,13 @@ impl Phase0CapabilityBlocker {
 
         match self.reason {
             BlockerReason::MissingCodexRuntime => Some(DoctorReadinessBlocker::CodexRuntimeMissing),
-            BlockerReason::NativeExecutionPathUnavailable => {
-                Some(DoctorReadinessBlocker::ComputerUsePluginMissing)
-            }
             BlockerReason::UnsupportedHostPlatform => {
                 Some(DoctorReadinessBlocker::UnsupportedOperatingSystem)
             }
             BlockerReason::MalformedCodexVersion
             | BlockerReason::CodexVersionUnavailable
             | BlockerReason::UnsupportedCodexVersion
+            | BlockerReason::NativeExecutionPathUnavailable
             | BlockerReason::NonStableSurface
             | BlockerReason::IncompleteLiveProof => None,
         }

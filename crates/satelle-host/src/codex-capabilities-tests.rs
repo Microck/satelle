@@ -834,10 +834,6 @@ fn doctor_maps_only_authoritative_phase0_blocker_observations() {
             DoctorReadinessBlocker::CodexRuntimeMissing,
         ),
         (
-            BlockerReason::NativeExecutionPathUnavailable,
-            DoctorReadinessBlocker::ComputerUsePluginMissing,
-        ),
-        (
             BlockerReason::UnsupportedHostPlatform,
             DoctorReadinessBlocker::UnsupportedOperatingSystem,
         ),
@@ -860,6 +856,7 @@ fn doctor_maps_only_authoritative_phase0_blocker_observations() {
         BlockerReason::MalformedCodexVersion,
         BlockerReason::CodexVersionUnavailable,
         BlockerReason::UnsupportedCodexVersion,
+        BlockerReason::NativeExecutionPathUnavailable,
         BlockerReason::NonStableSurface,
         BlockerReason::IncompleteLiveProof,
     ] {
