@@ -957,7 +957,7 @@ pub fn sync_owner_only_directory(
 }
 
 #[cfg(not(unix))]
-fn sync_owner_only_directory(
+pub fn sync_owner_only_directory(
     _path: &Path,
     _directory: &OwnerOnlyDirectory,
 ) -> Result<(), SecureFileError> {

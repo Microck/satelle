@@ -248,6 +248,56 @@ mod ssh_identity_commit_tests {
             None
         );
     }
+
+    #[test]
+    fn fresh_identity_commit_rejects_existing_state_without_a_journal_and_preserves_identity() {
+        let state = crate::TestStateDir::new().expect("create state directory");
+        let ordinary = Storage::open_without_restart_recovery(state.path())
+            .expect("initialize ordinary existing state");
+        let original_identity = ordinary.host_identity().expect("read original identity");
+        drop(ordinary);
+
+        assert!(
+            Storage::commit_fresh_ssh_host_identity(
+                state.path(),
+                &identity(HOST_IDENTITY),
+                OPERATION_ID,
+            )
+            .is_err()
+        );
+        assert!(
+            !Storage::fresh_ssh_identity_commit_pending(state.path())
+                .expect("rejection must not leave a recovery journal")
+        );
+        let reopened = Storage::open_without_restart_recovery(state.path())
+            .expect("reopen the original store");
+        assert_eq!(
+            reopened.host_identity().expect("read preserved identity"),
+            original_identity
+        );
+    }
+
+    #[test]
+    fn fresh_identity_locked_preflight_precedes_database_creation() {
+        let state = crate::TestStateDir::new().expect("create state directory");
+        let state_root = prepared_state_root(&state);
+        let preflight_observed = std::cell::Cell::new(false);
+
+        let parts =
+            super::open::open_parts_with_locked_preflight(&state_root, |claimed_directory| {
+                assert!(
+                    !claimed_directory
+                        .has_existing_store_state()
+                        .expect("inspect protected store leaves under the ownership lock")
+                );
+                preflight_observed.set(true);
+                Ok(())
+            })
+            .expect("open fresh storage after the locked preflight");
+
+        assert!(preflight_observed.get());
+        drop(parts);
+    }
 }
 
 #[derive(Clone, Deserialize, Serialize)]
@@ -1090,23 +1140,30 @@ impl Storage {
         let journal = SshIdentityCommitJournal::new(operation_id, accepted_identity)?;
         let encoded = journal.encode();
 
-        if Self::fresh_ssh_identity_commit_pending(state_root)? {
-            let existing = read_owner_only_secret_file(&journal_path)
-                .map_err(|_| StorageError::new(StorageErrorKind::InvalidStoredState))?;
-            let existing = SshIdentityCommitJournal::parse(existing.as_str())?;
-            if existing.operation_id != operation_id || existing.host_identity != *accepted_identity
-            {
-                return Err(StorageError::new(StorageErrorKind::InvalidStoredState));
-            }
-        } else {
-            if Self::has_existing_state(state_root)? {
-                return Err(StorageError::new(StorageErrorKind::InvalidStoredState));
-            }
-            persist_new_owner_only_secret_file(&journal_path, &encoded)
-                .map_err(|_| StorageError::new(StorageErrorKind::OperationFailed))?;
-        }
-
-        let mut storage = Self::open_without_restart_recovery_allowing_identity_commit(state_root)?;
+        let (connection, ownership_lock, state_directory) =
+            open::open_parts_with_locked_preflight(state_root, |claimed_directory| {
+                if let Some((existing_operation, existing_identity)) =
+                    Self::inspect_fresh_ssh_identity_commit(state_root)?
+                {
+                    if existing_operation != operation_id || existing_identity != *accepted_identity
+                    {
+                        return Err(StorageError::new(StorageErrorKind::InvalidStoredState));
+                    }
+                } else {
+                    if claimed_directory.has_existing_store_state()? {
+                        return Err(StorageError::new(StorageErrorKind::InvalidStoredState));
+                    }
+                    persist_new_owner_only_secret_file(&journal_path, &encoded)
+                        .map_err(|_| StorageError::new(StorageErrorKind::OperationFailed))?;
+                }
+                Ok(())
+            })?;
+        let mut storage = Self {
+            connection,
+            _ownership_lock: ownership_lock,
+            _state_directory: state_directory,
+        };
+        auth::validate_sensitive_state(&storage.connection)?;
         let current = storage.host_identity()?;
         if current != *accepted_identity {
             auth::commit_fresh_host_identity(&mut storage.connection, accepted_identity)?;
@@ -1115,14 +1172,13 @@ impl Storage {
         if committed != *accepted_identity {
             return Err(StorageError::new(StorageErrorKind::InvalidStoredState));
         }
-        drop(storage);
-
         std::fs::remove_file(&journal_path)
             .map_err(|error| StorageError::with_source(StorageErrorKind::OperationFailed, error))?;
         let directory = open_or_create_owner_only_directory(state_root)
             .map_err(|_| StorageError::new(StorageErrorKind::UnsafeStatePath))?;
         sync_owner_only_directory(state_root, &directory)
             .map_err(|_| StorageError::new(StorageErrorKind::OperationFailed))?;
+        drop(storage);
         Ok(committed)
     }
 

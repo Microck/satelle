@@ -2506,6 +2506,72 @@ adapter = "codex"
 }
 
 #[test]
+fn production_setup_verify_rejects_unsupported_local_host_mutation_before_state_is_touched() {
+    let sandbox = state_dir();
+    let operator_home = sandbox.path().join("operator/home");
+    let operator_config_file = operator_home.join("config/config.toml");
+    let operator_state_dir = sandbox.path().join("operator/state");
+    let operator_cache_dir = sandbox.path().join("operator/cache");
+    let operator_log_dir = sandbox.path().join("operator/logs");
+    fs::create_dir_all(
+        operator_config_file
+            .parent()
+            .expect("config file has a parent"),
+    )
+    .expect("operator config directory should be created before the mutation check");
+    write_user_config(
+        &operator_config_file,
+        r#"
+default_host = "local-demo"
+
+[hosts.local-demo]
+transport = "local"
+adapter = "codex"
+"#,
+    )
+    .expect("production config should be written");
+
+    for (description, arguments) in [
+        (
+            "satelle setup --verify with the default local Host plan",
+            vec!["setup", "--verify", "--yes", "--json"],
+        ),
+        (
+            "satelle setup --verify with an explicit local Host component",
+            vec![
+                "setup",
+                "--verify",
+                "--component",
+                "host",
+                "--yes",
+                "--json",
+            ],
+        ),
+    ] {
+        let output = assert_directory_tree_unchanged(description, sandbox.path(), || {
+            production_satelle()
+                .env("SATELLE_HOME", &operator_home)
+                .env("SATELLE_CONFIG_FILE", &operator_config_file)
+                .env("SATELLE_STATE_DIR", &operator_state_dir)
+                .env("SATELLE_CACHE_DIR", &operator_cache_dir)
+                .env("SATELLE_LOG_DIR", &operator_log_dir)
+                .args(arguments)
+                .assert()
+                .code(70)
+                .get_output()
+                .clone()
+        });
+        let error = parse_json_output(&output.stderr);
+        assert_eq!(error["code"], "not-implemented");
+        assert!(
+            error["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("setup mutations are not supported"))
+        );
+    }
+}
+
+#[test]
 fn production_setup_with_aliased_local_host_fails_before_operator_state_is_touched() {
     let sandbox = state_dir();
     let operator_home = sandbox.path().join("operator/home");
@@ -3221,8 +3287,9 @@ model_provider = "fixture-provider-v1"
 #[test]
 fn setup_verify_failure_preserves_the_setup_report_and_uses_readiness_exit_75() {
     let state = state_dir();
-    let output = production_satelle()
+    let output = satelle()
         .env("SATELLE_STATE_DIR", state.path())
+        .env(TEST_SUPPORT_ADAPTER_ENV, "readiness-failing")
         .args([
             "setup",
             "--host",

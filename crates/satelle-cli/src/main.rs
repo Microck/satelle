@@ -1020,11 +1020,21 @@ fn preflight_setup_before_history(
     ) {
         return Err(failure(error));
     }
-    if command.verify || !uses_production_local_setup_backend() {
+    if !uses_production_local_setup_backend() {
         return Ok(());
     }
     if host.config.transport != satelle_core::TransportKind::Local {
         return Ok(());
+    }
+    if command.verify {
+        let path_rebind = !daemon_path_overrides.entries().is_empty();
+        let (host_setup_components, _) =
+            partition_setup_components(&setup_components, false, path_rebind);
+        let tailscale_serve_setup = command.component.as_slice() == [SetupComponent::Transport]
+            && tailscale_serve::applies_to(&host.config);
+        if host_setup_components.is_empty() || tailscale_serve_setup {
+            return Ok(());
+        }
     }
 
     let setup_mode = if command.persistent {

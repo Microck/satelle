@@ -2700,6 +2700,18 @@ fn local_transport_rejects_detach_on_interrupt_before_admission() {
     );
 }
 
+#[test]
+fn local_provider_secret_bridge_startup_requires_a_live_receiver() {
+    let (started_tx, started_rx) = local_provider_secret_bridge_startup_channel::<()>();
+
+    assert!(matches!(
+        started_tx.try_send(()),
+        Err(mpsc::TrySendError::Full(()))
+    ));
+    drop(started_rx);
+    assert!(matches!(started_tx.send(()), Err(mpsc::SendError(()))));
+}
+
 #[path = "transport-reconnect-tests.rs"]
 mod reconnect;
 

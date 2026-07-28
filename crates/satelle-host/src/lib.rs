@@ -251,7 +251,9 @@ fn persistent_service_action(action_id: &str) -> bool {
 #[cfg(any(test, feature = "test-support"))]
 use test_runtime::FakeComputerUseAdapter;
 #[cfg(feature = "test-support")]
-use test_runtime::{FailingComputerUseAdapter, PendingComputerUseAdapter};
+use test_runtime::{
+    FailingComputerUseAdapter, PendingComputerUseAdapter, ReadinessFailingComputerUseAdapter,
+};
 use time::format_description::well_known::Rfc3339;
 
 const DEFAULT_NATIVE_READINESS_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
@@ -1743,6 +1745,26 @@ impl HostService {
 
     #[doc(hidden)]
     #[cfg(feature = "test-support")]
+    pub fn readiness_failing_local_demo_for_tests() -> Result<Self, SatelleError> {
+        Ok(Self {
+            runtime: RuntimeHandle::new(
+                satelle_core::state_dir(),
+                ReadinessFailingComputerUseAdapter,
+            ),
+            operation_capacity: Arc::new(OperationCapacity::default()),
+            turn_execution_timeout: configured_turn_execution_timeout(
+                &satelle_core::SatelleConfig::defaults().hosts[LOCAL_DEMO_HOST],
+            ),
+            mode: HostMode::TestFake {
+                image_attachments: true,
+            },
+            bootstrap_auth: None,
+            bootstrap_maintenance: Arc::new(Mutex::new(None)),
+        })
+    }
+
+    #[doc(hidden)]
+    #[cfg(feature = "test-support")]
     pub fn resolved_secret_canary_local_demo_for_tests() -> Result<Self, SatelleError> {
         Ok(Self {
             runtime: RuntimeHandle::new(satelle_core::state_dir(), ResolvedSecretCanaryAdapter),
@@ -2038,6 +2060,8 @@ impl HostService {
         &self,
         host: &str,
         authorization: ProviderBindingAuthorization,
+        // Preview remains on the mutation-authorized route so provisioning
+        // cannot bypass the authority checked at the transport boundary.
         _authority: &MutationAuthority,
     ) -> Result<ProviderSecretProvisioningPreview, SatelleError> {
         let model_alias = authorization.requested_model_alias().to_string();
@@ -2048,11 +2072,12 @@ impl HostService {
             &provider_alias,
             authorization,
         )?;
-        let path = match binding.auth_source() {
-            Some(satelle_core::ProviderSecretSource::File { path }) => path,
-            _ => return Err(provider_secret_source_error()),
-        };
-        let _metadata_only_path = path;
+        if !matches!(
+            binding.auth_source(),
+            Some(satelle_core::ProviderSecretSource::File { .. })
+        ) {
+            return Err(provider_secret_source_error());
+        }
         Ok(ProviderSecretProvisioningPreview::file())
     }
 

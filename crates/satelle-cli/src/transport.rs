@@ -831,6 +831,12 @@ struct LocalProviderSecretBridge {
     server_thread: Option<thread::JoinHandle<()>>,
 }
 
+fn local_provider_secret_bridge_startup_channel<T>() -> (mpsc::SyncSender<T>, mpsc::Receiver<T>) {
+    // A rendezvous makes successful send the exact ownership handoff. Once a
+    // timed-out receiver drops, a late server cannot enter its wait loop.
+    mpsc::sync_channel(0)
+}
+
 impl LocalProviderSecretBridge {
     fn start(alias: &str, service: HostService) -> Result<Self, SatelleError> {
         let token =
@@ -841,7 +847,7 @@ impl LocalProviderSecretBridge {
             ApiScopes::ADMIN,
             time::OffsetDateTime::now_utc() + time::Duration::minutes(5),
         );
-        let (started_tx, started_rx) = mpsc::sync_channel(1);
+        let (started_tx, started_rx) = local_provider_secret_bridge_startup_channel();
         let server_thread = thread::Builder::new()
             .name("satelle-local-provider-secret".to_string())
             .spawn(move || {
@@ -4249,7 +4255,15 @@ fn setup_fresh_bootstrap_client(
     identity: &HostIdentityRef,
     operation_id: &str,
     bootstrap_lock: &mut ssh_bootstrap::SshBootstrapLock,
-) -> Result<(Arc<DaemonClient>, SshTunnel, SshBootstrapProcess), SatelleError> {
+) -> Result<
+    (
+        Arc<DaemonClient>,
+        SshTunnel,
+        SshBootstrapProcess,
+        HostSessionsReport,
+    ),
+    SatelleError,
+> {
     let bootstrap_token =
         ApiBearerToken::generate().map_err(|_| SatelleError::host_unreachable(alias))?;
     let raw_bootstrap_token = bootstrap_token.expose();
@@ -4287,8 +4301,26 @@ fn setup_fresh_bootstrap_client(
     );
     client
         .capabilities()
-        .map_err(|error| direct_transport_error(alias, error))?;
-    Ok((client, tunnel, bootstrap))
+        .map_err(|error| direct_transport_error(alias, error))
+        .and_then(|capabilities| {
+            client
+                .desktop_sessions()
+                .map_err(|error| direct_transport_error(alias, error))
+                .map(|desktop_sessions| HostSessionsReport {
+                    schema_version: HostSessionsSchemaVersion::V1,
+                    host: alias.to_string(),
+                    detected_platform: capabilities.platform().to_string(),
+                    connection_mode: "ssh-bootstrap".to_string(),
+                    bootstrapped: true,
+                    bootstrap_actions: vec![
+                        "committed the accepted Host Identity and started an authenticated temporary Host Daemon"
+                            .to_string(),
+                    ],
+                    host_daemon_version: capabilities.daemon_version().to_string(),
+                    sessions: desktop_sessions.sessions().to_vec(),
+                })
+        })
+        .map(|sessions| (client, tunnel, bootstrap, sessions))
 }
 
 #[cfg(test)]
@@ -4821,12 +4853,15 @@ fn local_host_service(host_config: &satelle_core::HostConfig) -> Result<HostServ
         Ok(value) if value == "failing" => {
             return HostService::failing_local_demo_for_tests().map_err(failure);
         }
+        Ok(value) if value == "readiness-failing" => {
+            return HostService::readiness_failing_local_demo_for_tests().map_err(failure);
+        }
         Ok(value) if value == "resolved-secret-canary" => {
             return HostService::resolved_secret_canary_local_demo_for_tests().map_err(failure);
         }
         Ok(_) => {
             return Err(failure(SatelleError::invalid_usage(
-                "SATELLE_TEST_SUPPORT_ADAPTER must be exactly 'fake', 'pending', 'failing', 'resolved-secret-canary', or unset",
+                "SATELLE_TEST_SUPPORT_ADAPTER must be exactly 'fake', 'pending', 'failing', 'readiness-failing', 'resolved-secret-canary', or unset",
             )));
         }
         Err(std::env::VarError::NotUnicode(_)) => {
@@ -4968,7 +5003,9 @@ pub(crate) struct PendingSshTrustCandidate {
 impl PendingSshTrustCandidate {
     fn accept(mut self) -> Result<SshHostDiscovery, SatelleError> {
         confirm_bootstrap_lock(&self.alias, &mut self.bootstrap_lock)?;
-        let (client, _tunnel, _bootstrap) = setup_fresh_bootstrap_client(
+        // These guards stay bound through the authenticated handoff so neither
+        // the SSH tunnel nor its bootstrap daemon can end between requests.
+        let (client, _tunnel, _bootstrap, sessions) = setup_fresh_bootstrap_client(
             &self.alias,
             &self.destination,
             &self.previous_host_config,
@@ -4977,25 +5014,6 @@ impl PendingSshTrustCandidate {
             &self.operation_id,
             &mut self.bootstrap_lock,
         )?;
-        let capabilities = client
-            .capabilities()
-            .map_err(|error| direct_transport_error(&self.alias, error))?;
-        let desktop_sessions = client
-            .desktop_sessions()
-            .map_err(|error| direct_transport_error(&self.alias, error))?;
-        let sessions = HostSessionsReport {
-            schema_version: HostSessionsSchemaVersion::V1,
-            host: self.alias.clone(),
-            detected_platform: capabilities.platform().to_string(),
-            connection_mode: "ssh-bootstrap".to_string(),
-            bootstrapped: true,
-            bootstrap_actions: vec![
-                "committed the accepted Host Identity and started an authenticated temporary Host Daemon"
-                    .to_string(),
-            ],
-            host_daemon_version: capabilities.daemon_version().to_string(),
-            sessions: desktop_sessions.sessions().to_vec(),
-        };
         complete_bootstrap_handoff(&self.alias, &client, &mut self.bootstrap_lock)?;
         self.bootstrap_lock
             .release_committed_handoff()
@@ -5128,7 +5146,12 @@ pub(crate) fn discover_ssh_host(
     selected_host_config.daemon_cache_dir = daemon_path_overrides.cache_dir.clone();
     selected_host_config.daemon_log_dir = daemon_path_overrides.log_dir.clone();
     let pending_resume = match target
-        .inspect_initial_host_state(binding.destination(), &directories, &selected_host_config)
+        .inspect_initial_host_state(
+            binding.destination(),
+            &directories,
+            &selected_host_config,
+            &mut bootstrap_lock,
+        )
         .map_err(|error| map_ssh_daemon_bootstrap_error(&host.alias, error))?
     {
         ssh_bootstrap::InitialHostState::Fresh => None,

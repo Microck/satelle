@@ -117,7 +117,9 @@ struct ReadinessTimeouts {
 #[derive(Clone, Copy)]
 enum BootstrapLaunchMode<'a> {
     Durable,
-    Fresh,
+    Fresh {
+        initial_identity: InitialHostIdentityCommit<'a>,
+    },
     Ephemeral {
         previous_host_config: &'a HostConfig,
     },
@@ -127,7 +129,7 @@ impl<'a> BootstrapLaunchMode<'a> {
     const fn bind(self) -> &'static str {
         match self {
             Self::Durable => "127.0.0.1:3001",
-            Self::Fresh => "127.0.0.1:0",
+            Self::Fresh { .. } => "127.0.0.1:0",
             Self::Ephemeral { .. } => "127.0.0.1:0",
         }
     }
@@ -135,17 +137,24 @@ impl<'a> BootstrapLaunchMode<'a> {
     const fn expected_port(self) -> Option<u16> {
         match self {
             Self::Durable => Some(3001),
-            Self::Fresh => None,
+            Self::Fresh { .. } => None,
             Self::Ephemeral { .. } => None,
         }
     }
 
     const fn release_host_config(self) -> Option<&'a HostConfig> {
         match self {
-            Self::Durable | Self::Fresh => None,
+            Self::Durable | Self::Fresh { .. } => None,
             Self::Ephemeral {
                 previous_host_config,
             } => Some(previous_host_config),
+        }
+    }
+
+    const fn initial_identity(self) -> Option<InitialHostIdentityCommit<'a>> {
+        match self {
+            Self::Fresh { initial_identity } => Some(initial_identity),
+            Self::Durable | Self::Ephemeral { .. } => None,
         }
     }
 }
@@ -462,7 +471,6 @@ impl SshBootstrapProcess {
             host_config,
             bootstrap_scope,
             BootstrapLaunchMode::Durable,
-            None,
             bootstrap_lock,
         )
     }
@@ -483,7 +491,6 @@ impl SshBootstrapProcess {
             BootstrapLaunchMode::Ephemeral {
                 previous_host_config,
             },
-            None,
             bootstrap_lock,
         )
     }
@@ -501,8 +508,7 @@ impl SshBootstrapProcess {
             token,
             host_config,
             bootstrap_scope,
-            BootstrapLaunchMode::Fresh,
-            Some(initial_identity),
+            BootstrapLaunchMode::Fresh { initial_identity },
             bootstrap_lock,
         )
     }
@@ -513,7 +519,6 @@ impl SshBootstrapProcess {
         host_config: &HostConfig,
         bootstrap_scope: SshBootstrapScope,
         launch_mode: BootstrapLaunchMode<'_>,
-        initial_identity: Option<InitialHostIdentityCommit<'_>>,
         bootstrap_lock: &mut SshBootstrapLock,
     ) -> Result<Self, SshBootstrapError> {
         let target = RemoteTarget::probe(destination)?;
@@ -540,7 +545,7 @@ impl SshBootstrapProcess {
             BootstrapStartContext {
                 bootstrap_scope,
                 bind: launch_mode.bind(),
-                initial_identity,
+                initial_identity: launch_mode.initial_identity(),
             },
         );
         if let Some(release_command) = release_command {
@@ -737,6 +742,7 @@ impl RemoteTarget {
         destination: &str,
         directories: &RemoteUserDirectories,
         host_config: &HostConfig,
+        bootstrap_lock: &mut SshBootstrapLock,
     ) -> Result<InitialHostState, SshBootstrapError> {
         let state_root = host_config
             .daemon_state_dir
@@ -777,7 +783,11 @@ impl RemoteTarget {
                 if lines.next().is_some() {
                     return Err(SshBootstrapError::InvalidProbe);
                 }
-                return self.inspect_pending_identity_commit(destination, directories, host_config);
+                return self.inspect_pending_identity_commit(
+                    destination,
+                    host_config,
+                    bootstrap_lock,
+                );
             }
             _ => return Err(SshBootstrapError::InvalidProbe),
         };
@@ -790,27 +800,24 @@ impl RemoteTarget {
     fn inspect_pending_identity_commit(
         self,
         destination: &str,
-        directories: &RemoteUserDirectories,
         host_config: &HostConfig,
+        bootstrap_lock: &mut SshBootstrapLock,
     ) -> Result<InitialHostState, SshBootstrapError> {
-        let release = ReleaseArtifactMetadata::fetch(self)?;
-        let remote_binary = self.planned_install_path(directories, &release.digest())?;
+        let artifact = DownloadedArtifact::fetch(self)?;
+        let directory = self.remote_directory();
+        let uploaded = upload_artifact(
+            destination,
+            self,
+            artifact.path(),
+            &directory,
+            artifact.release_digest(),
+            bootstrap_lock,
+        )?;
+        if uploaded.cache_changed() {
+            bootstrap_lock.commit_current_mutation()?;
+        }
         let environment = self.validated_daemon_environment(host_config)?;
-        let command = if self.is_windows() {
-            let script = format!(
-                "{}& {} host start --inspect-ssh-identity-commit --json",
-                powershell_environment(&environment),
-                powershell_quote(&remote_binary),
-            );
-            powershell_encoded_command(&script)
-        } else {
-            let script = format!(
-                "{}exec {} host start --inspect-ssh-identity-commit --json",
-                posix_environment(&environment),
-                posix_quote(&remote_binary),
-            );
-            format!("sh -c {}", posix_quote(&script))
-        };
+        let command = self.identity_commit_inspection_command(uploaded.remote_path(), &environment);
         let output = run_ssh_command(destination, &command)?;
         if !output.status.success() {
             return Err(SshBootstrapError::RemoteOperationFailed);
@@ -828,6 +835,28 @@ impl RemoteTarget {
             operation_id: inspection.operation_id,
             host_identity,
         })
+    }
+
+    fn identity_commit_inspection_command(
+        self,
+        remote_binary: &str,
+        environment: &[(&'static str, &Path)],
+    ) -> String {
+        if self.is_windows() {
+            let script = format!(
+                "{}& {} host start --inspect-ssh-identity-commit --json",
+                powershell_environment(environment),
+                powershell_quote(remote_binary),
+            );
+            powershell_encoded_command(&script)
+        } else {
+            let script = format!("{}exec \"$@\"", posix_environment(environment));
+            format!(
+                "sh -c {} sh {} host start --inspect-ssh-identity-commit --json",
+                posix_quote(&script),
+                posix_quote(remote_binary),
+            )
+        }
     }
 
     fn state_owner_handoff_commands(
@@ -1718,7 +1747,7 @@ printf 'removed=%s\nretained=%s\n' "$removed" "$retained""#,
             format!("sh -c {} sh {arguments}", posix_quote(&script))
         } else {
             let script = format!(
-                "{}exec {remote_binary} host start --bootstrap-token-stdin {timeout_args}{posix_identity_args} --json",
+                "{}exec {remote_binary} host start --bootstrap-token-stdin {timeout_args} --json",
                 posix_environment(environment),
             );
             format!("sh -c {}", posix_quote(&script))
@@ -1949,6 +1978,7 @@ pub(super) struct RemoteUserDirectories {
 pub(super) struct UploadedHostArtifact {
     remote_path: String,
     binary_sha256: String,
+    cache_changed: bool,
 }
 
 impl UploadedHostArtifact {
@@ -1958,6 +1988,10 @@ impl UploadedHostArtifact {
 
     pub(super) fn binary_sha256(&self) -> &str {
         &self.binary_sha256
+    }
+
+    pub(super) const fn cache_changed(&self) -> bool {
+        self.cache_changed
     }
 }
 
@@ -2100,6 +2134,7 @@ impl<'a> PersistentServiceRemote<'a> {
             &UploadedHostArtifact {
                 remote_path,
                 binary_sha256: binary_sha256.clone(),
+                cache_changed: false,
             },
         )?;
         Ok(VerifiedCurrentWindowsTask {
@@ -3908,6 +3943,7 @@ fn upload_artifact(
             return Ok(UploadedHostArtifact {
                 remote_path: content_addressed_path,
                 binary_sha256: local_digest_hex,
+                cache_changed: false,
             });
         }
         content_addressed_path
@@ -3933,6 +3969,7 @@ fn upload_artifact(
         Ok(UploadedHostArtifact {
             remote_path: final_path,
             binary_sha256: local_digest_hex,
+            cache_changed: true,
         })
     } else {
         Err(SshBootstrapError::RemoteCacheEntryRejected)
@@ -5927,6 +5964,8 @@ mod tests {
         assert!(
             unix.contains("--initial-identity-operation-id '0195f6d5-18da-7a80-8000-000000000002'")
         );
+        assert!(unix.contains("exec \"$@\""));
+        assert!(!unix.contains("exec /tmp/satelle host start"));
 
         let windows = RemoteTarget::WindowsX64Msvc.start_command_with_environment(
             "satelle.exe",
@@ -5944,6 +5983,28 @@ mod tests {
             script
                 .contains("--initial-identity-operation-id '0195f6d5-18da-7a80-8000-000000000002'")
         );
+    }
+
+    #[test]
+    fn pending_identity_inspection_uses_verified_uploaded_binary_path() {
+        let supplied = "/home/operator/.cache/satelle/host/v0.0.1/linux-x64/satelle";
+        let command = RemoteTarget::LinuxX64Gnu.identity_commit_inspection_command(supplied, &[]);
+
+        let inline_interpolation = format!(
+            "exec {} host start --inspect-ssh-identity-commit --json",
+            posix_quote(supplied),
+        );
+        let expected_script = format!("{}exec \"$@\"", posix_environment(&[]));
+        assert_eq!(
+            command,
+            format!(
+                "sh -c {} sh {} host start --inspect-ssh-identity-commit --json",
+                posix_quote(&expected_script),
+                posix_quote(supplied),
+            ),
+        );
+        assert!(!command.contains(&inline_interpolation));
+        assert!(!command.contains(env!("CARGO_PKG_VERSION")));
     }
 
     #[test]

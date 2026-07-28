@@ -163,6 +163,36 @@ pub(super) struct PendingComputerUseAdapter;
 pub(super) struct FailingComputerUseAdapter;
 
 #[cfg(feature = "test-support")]
+#[derive(Clone, Debug)]
+pub(super) struct ReadinessFailingComputerUseAdapter;
+
+#[cfg(feature = "test-support")]
+impl ComputerUseAdapter for ReadinessFailingComputerUseAdapter {
+    fn preflight(
+        &self,
+        _host: &str,
+        _provider_intent: &crate::ProviderComputerUseIntent,
+    ) -> Result<AdapterReadiness, SatelleError> {
+        Err(SatelleError::computer_use_not_ready())
+    }
+
+    fn execute(&self, request: ExecuteRequest<'_>) -> Result<ExecuteResult, SatelleError> {
+        FakeComputerUseAdapter.execute(request)
+    }
+
+    fn observe_stop(&self, subject: AdapterSubject<'_>) -> Result<StopObservation, SatelleError> {
+        FakeComputerUseAdapter.observe_stop(subject)
+    }
+
+    fn observe_recovery(
+        &self,
+        subject: AdapterSubject<'_>,
+    ) -> Result<RecoveryObservation, SatelleError> {
+        FakeComputerUseAdapter.observe_recovery(subject)
+    }
+}
+
+#[cfg(feature = "test-support")]
 impl ComputerUseAdapter for FailingComputerUseAdapter {
     fn preflight(
         &self,

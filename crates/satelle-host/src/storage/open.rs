@@ -332,6 +332,27 @@ impl StateDirectory {
         self.secure.sync()
     }
 
+    pub(super) fn has_existing_store_state(&self) -> Result<bool, StorageError> {
+        for file_name in [
+            DATABASE_FILE_NAME,
+            "satelle.sqlite3-wal",
+            "satelle.sqlite3-shm",
+            "satelle.sqlite3-journal",
+        ] {
+            if open_private_leaf(
+                self,
+                file_name,
+                LeafOpenMode::Existing,
+                StorageErrorKind::OpenFailed,
+            )?
+            .is_some()
+            {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
     #[cfg(unix)]
     fn leaf_names(&self) -> Result<Vec<String>, StorageError> {
         let directory = rustix::fs::Dir::read_from(&self.handle).map_err(|source| {
@@ -445,17 +466,17 @@ impl Drop for OwnershipLock {
 pub(super) fn open_parts(
     state_root: &Path,
 ) -> Result<(Connection, OwnershipLock, StateDirectory), StorageError> {
-    open_parts_after_lock(state_root, || {})
+    open_parts_with_locked_preflight(state_root, |_| Ok(()))
 }
 
-fn open_parts_after_lock(
+pub(super) fn open_parts_with_locked_preflight(
     state_root: &Path,
-    after_lock: impl FnOnce(),
+    locked_preflight: impl FnOnce(&StateDirectory) -> Result<(), StorageError>,
 ) -> Result<(Connection, OwnershipLock, StateDirectory), StorageError> {
     let state_directory = prepare_state_root(state_root)?;
     preflight_protected_files(&state_directory)?;
     let ownership_lock = acquire_ownership_lock(&state_directory)?;
-    after_lock();
+    locked_preflight(&state_directory)?;
     // Pre-create and permission the database through the pinned state
     // directory. Existing SQLite sidecars were checked before this point, so
     // the platform VFS cannot encounter an unchecked protected leaf.
@@ -557,7 +578,10 @@ pub(super) fn open_parts_with_after_lock_hook(
     state_root: &Path,
     after_lock: impl FnOnce(),
 ) -> Result<(Connection, OwnershipLock, StateDirectory), StorageError> {
-    open_parts_after_lock(state_root, after_lock)
+    open_parts_with_locked_preflight(state_root, |_| {
+        after_lock();
+        Ok(())
+    })
 }
 
 #[cfg(unix)]
