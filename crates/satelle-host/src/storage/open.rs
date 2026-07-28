@@ -400,12 +400,8 @@ impl StateDirectory {
             .map_err(|source| StorageError::with_source(StorageErrorKind::OperationFailed, source))
             .and_then(|()| self.sync_for(StorageErrorKind::OperationFailed));
         if let Err(error) = persisted {
-            #[cfg(windows)]
             let cleanup_identity = leaf_identity(&file, StorageErrorKind::OperationFailed).ok();
             drop(file);
-            #[cfg(unix)]
-            let _ = self.remove_leaf(file_name);
-            #[cfg(windows)]
             if let Some(identity) = cleanup_identity {
                 let _ = self.delete_leaf(file_name, identity);
             }

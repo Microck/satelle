@@ -979,6 +979,7 @@ impl RemoteTarget {
                 concat!(
                     "$ErrorActionPreference='Stop'; $journal={journal}; $artifact={artifact}; ",
                     "if (Test-Path -LiteralPath $journal) {{ exit 75 }}; ",
+                    "if (-not (Test-Path -LiteralPath $artifact)) {{ exit 0 }}; ",
                     "$item=Get-Item -LiteralPath $artifact -Force; ",
                     "if ($item.PSIsContainer -or (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0)) {{ exit 75 }}; ",
                     "Remove-Item -LiteralPath $artifact -Force"
@@ -992,6 +993,7 @@ impl RemoteTarget {
                 concat!(
                     "journal={journal}; artifact={artifact}; ",
                     "[ ! -e \"$journal\" ] && [ ! -L \"$journal\" ] || exit 75; ",
+                    "if [ ! -e \"$artifact\" ] && [ ! -L \"$artifact\" ]; then exit 0; fi; ",
                     "[ -f \"$artifact\" ] && [ ! -L \"$artifact\" ] || exit 75; ",
                     "rm -f -- \"$artifact\"; sync"
                 ),
@@ -1119,7 +1121,7 @@ if command -v sha256sum >/dev/null 2>&1; then actual=$(sha256sum "$staged" | awk
 chmod 700 -- "$staged"
 mv "$staged" "$final_path"
 trap - EXIT
-sync "$final_path""#,
+sync"#,
             root = posix_quote(&root),
             directory = posix_quote(directory),
             final_path = posix_quote(final_path),
@@ -1947,14 +1949,17 @@ printf 'removed=%s\nretained=%s\n' "$removed" "$retained""#,
 
     fn digest_command(self, staged: &str) -> String {
         match self {
-            Self::WindowsArm64Msvc | Self::WindowsX64Msvc => format!(
-                "powershell.exe -NoProfile -NonInteractive -Command \"(Get-FileHash -Algorithm SHA256 -LiteralPath '{staged}').Hash\""
-            ),
+            Self::WindowsArm64Msvc | Self::WindowsX64Msvc => powershell_encoded_command(&format!(
+                "(Get-FileHash -Algorithm SHA256 -LiteralPath {}).Hash",
+                powershell_quote(staged)
+            )),
             Self::DarwinArm64 | Self::DarwinX64 => {
-                format!("sh -c 'shasum -a 256 {staged}'")
+                let script = format!("shasum -a 256 -- {}", posix_quote(staged));
+                format!("sh -c {}", posix_quote(&script))
             }
             Self::LinuxArm64Gnu | Self::LinuxX64Gnu => {
-                format!("sh -c 'sha256sum {staged}'")
+                let script = format!("sha256sum -- {}", posix_quote(staged));
+                format!("sh -c {}", posix_quote(&script))
             }
         }
     }
@@ -6440,6 +6445,115 @@ mod tests {
                 "/home/operator/.cache/satelle/bootstrap/{operation_id}/{binary_sha256}/satelle"
             )
         );
+    }
+
+    #[test]
+    fn identity_operation_cleanup_accepts_an_absent_artifact_after_journal_absence() {
+        let operation_id = "0195f6d5-18da-7a80-8000-000000000002";
+        let binary_sha256 = "22".repeat(32);
+        let unix_record = SshIdentityCommitRecord::new(
+            operation_id,
+            HostIdentityRef::new("host-0195f6d5-18da-7a80-8000-000000000001".to_string())
+                .expect("valid Host Identity"),
+            RemoteTarget::LinuxX64Gnu.id(),
+            "/home/operator/.local/state/satelle",
+            env!("CARGO_PKG_VERSION"),
+            "11".repeat(32),
+            &binary_sha256,
+            format!(
+                "/home/operator/.cache/satelle/bootstrap/{operation_id}/{binary_sha256}/satelle"
+            ),
+        )
+        .expect("construct Unix operation record");
+        let unix =
+            RemoteTarget::LinuxX64Gnu.cleanup_identity_operation_artifact_command(&unix_record);
+        let journal_guard = unix
+            .find("[ ! -e \"$journal\" ] && [ ! -L \"$journal\" ] || exit 75")
+            .expect("journal absence guard");
+        let absent_artifact_success = unix
+            .find("if [ ! -e \"$artifact\" ] && [ ! -L \"$artifact\" ]; then exit 0; fi")
+            .expect("absent artifact succeeds");
+        assert!(journal_guard < absent_artifact_success);
+        assert!(unix.contains("[ -f \"$artifact\" ] && [ ! -L \"$artifact\" ] || exit 75"));
+
+        let windows_record = SshIdentityCommitRecord::new(
+            operation_id,
+            HostIdentityRef::new("host-0195f6d5-18da-7a80-8000-000000000001".to_string())
+                .expect("valid Host Identity"),
+            RemoteTarget::WindowsX64Msvc.id(),
+            r"C:\Users\operator\AppData\Local\Satelle",
+            env!("CARGO_PKG_VERSION"),
+            "11".repeat(32),
+            &binary_sha256,
+            format!(
+                r"C:\Users\operator\AppData\Local\Satelle\cache\bootstrap\{operation_id}\{binary_sha256}\satelle.exe"
+            ),
+        )
+        .expect("construct Windows operation record");
+        let windows = RemoteTarget::WindowsX64Msvc
+            .cleanup_identity_operation_artifact_command(&windows_record);
+        let script = decode_powershell_command(&windows).expect("decode cleanup command");
+        let journal_guard = script
+            .find("if (Test-Path -LiteralPath $journal) { exit 75 }")
+            .expect("journal absence guard");
+        let absent_artifact_success = script
+            .find("if (-not (Test-Path -LiteralPath $artifact)) { exit 0 }")
+            .expect("absent artifact succeeds");
+        assert!(journal_guard < absent_artifact_success);
+        assert!(script.contains("$item=Get-Item -LiteralPath $artifact -Force"));
+    }
+
+    #[test]
+    fn digest_commands_quote_staged_paths_as_single_arguments() {
+        let linux_path = "/tmp/staged '$(touch /tmp/not-run)'";
+        let linux_script = format!("sha256sum -- {}", posix_quote(linux_path));
+        assert_eq!(
+            RemoteTarget::LinuxX64Gnu.digest_command(linux_path),
+            format!("sh -c {}", posix_quote(&linux_script))
+        );
+
+        let darwin_path = "/tmp/staged '$(touch /tmp/not-run)'";
+        let darwin_script = format!("shasum -a 256 -- {}", posix_quote(darwin_path));
+        assert_eq!(
+            RemoteTarget::DarwinArm64.digest_command(darwin_path),
+            format!("sh -c {}", posix_quote(&darwin_script))
+        );
+
+        let windows_path = r"C:\stage'; Write-Output injected; '";
+        let windows = RemoteTarget::WindowsX64Msvc.digest_command(windows_path);
+        assert_eq!(
+            decode_powershell_command(&windows).expect("decode digest command"),
+            format!(
+                "(Get-FileHash -Algorithm SHA256 -LiteralPath {}).Hash",
+                powershell_quote(windows_path)
+            )
+        );
+    }
+
+    #[test]
+    fn darwin_artifact_publication_uses_portable_global_sync() {
+        let operation_id = "0195f6d5-18da-7a80-8000-000000000002";
+        let binary_sha256 = "22".repeat(32);
+        let record = SshIdentityCommitRecord::new(
+            operation_id,
+            HostIdentityRef::new("host-0195f6d5-18da-7a80-8000-000000000001".to_string())
+                .expect("valid Host Identity"),
+            RemoteTarget::DarwinArm64.id(),
+            "/Users/operator/Library/Application Support/Satelle",
+            env!("CARGO_PKG_VERSION"),
+            "11".repeat(32),
+            &binary_sha256,
+            format!(
+                "/Users/operator/Library/Caches/Satelle/bootstrap/{operation_id}/{binary_sha256}/satelle"
+            ),
+        )
+        .expect("construct Darwin operation record");
+
+        let command = RemoteTarget::DarwinArm64
+            .operation_artifact_upload_command(&record)
+            .expect("construct artifact publication command");
+        assert!(command.contains("\nsync"));
+        assert!(!command.contains("sync \"$final_path\""));
     }
 
     #[test]

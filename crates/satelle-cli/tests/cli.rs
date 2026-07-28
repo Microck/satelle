@@ -3441,14 +3441,61 @@ fn setup_interactive_prompt_interruption_uses_the_interrupted_exit_contract() {
         "{} --error-format json setup --host local-demo",
         executable.display()
     );
-    let mut command = Command::new("script");
-    command
+    let mut command = std::process::Command::new("script");
+    for name in [
+        "SATELLE_HOME",
+        "SATELLE_CONFIG_FILE",
+        "SATELLE_STATE_DIR",
+        "SATELLE_CACHE_DIR",
+        "SATELLE_LOG_DIR",
+        "SATELLE_HOST",
+        "SATELLE_PROFILE",
+        "SATELLE_ERROR_FORMAT",
+        TEST_SUPPORT_ADAPTER_ENV,
+    ] {
+        command.env_remove(name);
+    }
+    let mut child = command
         .env("SATELLE_STATE_DIR", state.path())
         .env("SATELLE_COMMAND_HISTORY", "false")
         .env(TEST_SUPPORT_ADAPTER_ENV, "fake")
         .args(["-qec", command_line.as_str(), "/dev/null"])
-        .write_stdin("\u{1b}");
-    let output = command.assert().code(130).get_output().clone();
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn synchronized setup PTY");
+    let stdin = child.stdin.take().expect("take setup PTY stdin");
+    let mut stdout = child.stdout.take().expect("take setup PTY stdout");
+    let mut stderr = child.stderr.take().expect("take setup PTY stderr");
+    let (stdout_sender, stdout_receiver) = mpsc::channel();
+    let stdout_reader = thread::spawn(move || {
+        let mut byte = [0_u8; 1];
+        while stdout.read_exact(&mut byte).is_ok() {
+            if stdout_sender.send(byte[0]).is_err() {
+                break;
+            }
+        }
+    });
+    let stderr_reader = thread::spawn(move || {
+        let mut bytes = Vec::new();
+        stderr
+            .read_to_end(&mut bytes)
+            .expect("read setup PTY stderr");
+        bytes
+    });
+    let mut process = ProviderSecretPtyProcess {
+        child,
+        stdin: Some(stdin),
+        stdout: Vec::new(),
+        stdout_receiver,
+        stdout_reader,
+        stderr_reader,
+    };
+    process.wait_for_after("Apply these setup mutations?", 0);
+    process.write_input("\u{1b}");
+    let output = process.finish();
+    assert_eq!(output.status.code(), Some(130));
     let output = String::from_utf8_lossy(&[output.stdout, output.stderr].concat()).to_string();
 
     assert!(output.contains(r#""code": "interrupted""#));
@@ -7348,7 +7395,7 @@ variable = "DECOY_PROVIDER_TOKEN"
 
 #[cfg(target_os = "linux")]
 enum ProviderSecretPtyDecision<'a> {
-    Decline,
+    Decline(&'a str),
     Accept(&'a str),
 }
 
@@ -7492,24 +7539,24 @@ fn run_provider_secret_setup_in_pty(
         stderr_reader,
     };
 
+    let preview_end = process.wait_for_after("Provider secret overwrite behavior:", 0);
+    let secret_prompt_end = process.wait_for_after("Provider secret", preview_end);
+    let (secret, accepted) = match decision {
+        ProviderSecretPtyDecision::Decline(secret) => (secret, false),
+        ProviderSecretPtyDecision::Accept(secret) => (secret, true),
+    };
+    process.write_input(&format!("{secret}\n"));
     let confirmation_end = process.wait_for_after(
         "Provision or replace the provider secret at this exact destination?",
-        0,
+        secret_prompt_end,
     );
-    let secret_prompt_end = match decision {
-        ProviderSecretPtyDecision::Decline => {
-            process.write_input("n\n");
-            None
-        }
-        ProviderSecretPtyDecision::Accept(secret) => {
-            process.write_input("y\n");
-            let prompt_end = process.wait_for_after("Provider secret", confirmation_end);
-            process.write_input(&format!("{secret}\n"));
-            Some(prompt_end)
-        }
-    };
+    if accepted {
+        process.write_input("y\n");
+    } else {
+        process.write_input("n\n");
+    }
     let output = process.finish();
-    (output, confirmation_end, secret_prompt_end)
+    (output, confirmation_end, Some(secret_prompt_end))
 }
 
 #[cfg(target_os = "linux")]
@@ -7587,7 +7634,7 @@ command_families = ["setup"]
         let decision = if accepted {
             ProviderSecretPtyDecision::Accept(secret_canary.as_str())
         } else {
-            ProviderSecretPtyDecision::Decline
+            ProviderSecretPtyDecision::Decline(secret_canary.as_str())
         };
         let (output, confirmation_end, secret_prompt_end) = run_provider_secret_setup_in_pty(
             &user_config,
@@ -7604,14 +7651,14 @@ command_families = ["setup"]
                 combined_process_output(&output).replace(secret_canary.as_str(), "<redacted>")
             );
             assert!(
-                secret_prompt_end.is_some_and(|prompt_end| prompt_end > confirmation_end),
-                "hidden input must follow the dedicated confirmation"
+                secret_prompt_end.is_some_and(|prompt_end| prompt_end < confirmation_end),
+                "dedicated confirmation must immediately follow hidden input"
             );
         } else {
             assert!(!output.status.success(), "declined provisioning must fail");
-            assert_eq!(
-                secret_prompt_end, None,
-                "decline must stop before hidden input"
+            assert!(
+                secret_prompt_end.is_some_and(|prompt_end| prompt_end < confirmation_end),
+                "decline must occur only after hidden input and before transmission"
             );
         }
         let rendered = combined_process_output(&output);
@@ -7742,7 +7789,7 @@ auth_source = "operator-auth"
         "combined setup failed: {}",
         rendered.replace(secret, "<redacted>")
     );
-    assert!(secret_prompt_end.is_some_and(|end| end > confirmation_end));
+    assert!(secret_prompt_end.is_some_and(|end| end < confirmation_end));
     assert!(rendered.contains("Components: codex"));
     assert!(rendered.contains("Provider secret provisioned: true"));
     assert!(rendered.contains("Provider validation: resolved"));

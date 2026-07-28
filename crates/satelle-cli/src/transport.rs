@@ -3993,7 +3993,7 @@ impl DurableReadiness for DurableReadinessSnapshot {
 
 enum DurableReadinessObservation {
     Ready(DurableReadinessSnapshot),
-    TransportFailure,
+    ConnectFailure,
     Failure(DaemonClientError),
 }
 
@@ -4005,7 +4005,9 @@ fn observe_remote_durable_readiness<T: DurableReadiness>(
             daemon_version: capabilities.daemon_version().to_string(),
             host_identity: capabilities.host_identity().to_string(),
         }),
-        Err(DaemonClientError::Transport(_)) => DurableReadinessObservation::TransportFailure,
+        Err(DaemonClientError::Transport(error)) if error.is_connect() => {
+            DurableReadinessObservation::ConnectFailure
+        }
         Err(error) => DurableReadinessObservation::Failure(error),
     }
 }
@@ -4025,7 +4027,7 @@ fn probe_durable_daemon_under_lock(
     confirm_lock_ownership()?;
     match readiness {
         DurableReadinessObservation::Ready(readiness) => Ok(DurableDaemonProbe::Ready(readiness)),
-        DurableReadinessObservation::TransportFailure => Ok(DurableDaemonProbe::Missing),
+        DurableReadinessObservation::ConnectFailure => Ok(DurableDaemonProbe::Missing),
         DurableReadinessObservation::Failure(error) => Err(direct_transport_error(host, error)),
     }
 }
@@ -4065,7 +4067,7 @@ fn authenticate_durable_with_confirmation(
             DurableReadinessObservation::Failure(error) => {
                 return Err(direct_transport_error(host, error));
             }
-            DurableReadinessObservation::TransportFailure => {
+            DurableReadinessObservation::ConnectFailure => {
                 let now = Instant::now();
                 if now >= deadline {
                     return Err(SatelleError::host_unreachable(host));

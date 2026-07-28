@@ -2699,40 +2699,7 @@ fn run_setup(
         )));
     }
 
-    let mut first_ssh_discovery = if first_ssh_trust && !command.dry_run {
-        let discovery = inspect_first_ssh_host_during_setup(
-            &command,
-            command.yes || trusted_consent,
-            &daemon_path_overrides,
-            &host,
-        )?;
-        let action = format!(
-            "trust observed Host Identity '{}' for Host '{}'",
-            discovery.identity, host.alias
-        );
-        if !report.planned_actions.contains(&action) {
-            report.planned_actions.push(action);
-        }
-        if desktop_setup && report.required_input.is_empty() {
-            desktop_selection = resolve_setup_desktop_selection(
-                &discovery.sessions,
-                &host.config,
-                interactive_selection,
-                Some(&discovery.authenticated_user),
-            )
-            .map_err(failure)?;
-            if let Some(selection) = &desktop_selection {
-                let action = selection.action(&host.alias);
-                if !report.planned_actions.contains(&action) {
-                    report.planned_actions.push(action);
-                }
-                report.mutation_planned = true;
-            }
-        }
-        Some(discovery)
-    } else {
-        None
-    };
+    let mut first_ssh_discovery = None;
 
     let mut prompted_for_consent = false;
     let mut verification_cache_updates = Vec::new();
@@ -2781,6 +2748,34 @@ fn run_setup(
             }
         }
 
+        if first_ssh_trust {
+            let discovery =
+                inspect_first_ssh_host_during_setup(&command, true, &daemon_path_overrides, &host)?;
+            let action = format!(
+                "trust observed Host Identity '{}' for Host '{}'",
+                discovery.identity, host.alias
+            );
+            if !report.planned_actions.contains(&action) {
+                report.planned_actions.push(action);
+            }
+            if desktop_setup {
+                desktop_selection = resolve_setup_desktop_selection(
+                    &discovery.sessions,
+                    &host.config,
+                    interactive_selection,
+                    Some(&discovery.authenticated_user),
+                )
+                .map_err(failure)?;
+                if let Some(selection) = &desktop_selection {
+                    let action = selection.action(&host.alias);
+                    if !report.planned_actions.contains(&action) {
+                        report.planned_actions.push(action);
+                    }
+                }
+            }
+            first_ssh_discovery = Some(discovery);
+        }
+
         if native_readiness_invalidation_planned {
             // The configured Host still identifies the old readiness key here. Invalidate
             // after consent but before any setup write changes that identity.
@@ -2819,9 +2814,9 @@ fn run_setup(
         }
 
         if let Some(discovery) = first_ssh_discovery.as_mut() {
+            discovery.finalize_after_binding().map_err(failure)?;
             persist_host_identity(&user_config_path, &host.alias, &discovery.identity)
                 .map_err(failure)?;
-            discovery.finalize_after_binding().map_err(failure)?;
             host.config.expected_host_id = Some(discovery.identity.clone());
             transport =
                 setup_transport_if_required(host_setup_required, || transport_for_setup(&host))?;
@@ -3227,11 +3222,8 @@ fn run_setup(
         if !ready {
             ensure_exact_setup_verification_recovery(&mut report, &host.alias);
         }
-        report.native_computer_use_readiness = if ready {
-            "ready".to_string()
-        } else {
-            verification_status.to_string()
-        };
+        report.native_computer_use_readiness =
+            native_verification_status(&verification_report.findings).to_string();
         report.readiness_summary.native_computer_use = report.native_computer_use_readiness.clone();
         if verification_checks
             .iter()
@@ -3439,6 +3431,60 @@ fn accept_setup_provider_auth_validation(
         ),
         None,
     )))
+}
+
+fn native_verification_status(findings: &[satelle_core::DoctorFinding]) -> &'static str {
+    let mut observed = false;
+    let mut blocked = false;
+    for finding in findings
+        .iter()
+        .filter(|finding| finding.scope == "computer-use")
+    {
+        observed = true;
+        if finding.fixability == DoctorFixability::ManualActionRequired {
+            return "manual_action_required";
+        }
+        blocked |= finding.readiness_impact != "ready";
+    }
+    if !observed {
+        "not_verified"
+    } else if blocked {
+        "failed"
+    } else {
+        "ready"
+    }
+}
+
+#[cfg(test)]
+mod native_verification_status_tests {
+    use super::*;
+
+    fn finding(
+        scope: &str,
+        impact: &str,
+        fixability: DoctorFixability,
+    ) -> satelle_core::DoctorFinding {
+        satelle_core::DoctorFinding {
+            finding_id: format!("{scope}.{impact}"),
+            scope: scope.to_string(),
+            severity: "info".to_string(),
+            fixability,
+            readiness_impact: impact.to_string(),
+            summary: "fixture".to_string(),
+            evidence: Vec::new(),
+            recovery_command: None,
+        }
+    }
+
+    #[test]
+    fn provider_failure_does_not_downgrade_native_readiness() {
+        let findings = vec![
+            finding("computer-use", "ready", DoctorFixability::Informational),
+            finding("provider", "blocked", DoctorFixability::Blocked),
+        ];
+
+        assert_eq!(native_verification_status(&findings), "ready");
+    }
 }
 
 fn add_missing_provider_descriptor_required_input(
@@ -3721,6 +3767,20 @@ fn provision_provider_secret(
         preview.overwrite_behavior()
     );
 
+    // Read the secret only after the authenticated preview fixes its exact
+    // destination. Keep it zeroized while asking for the dedicated,
+    // immediately-pre-transmission confirmation.
+    let secret = Zeroizing::new(
+        cliclack::password("Provider secret")
+            .interact()
+            .map_err(|source| {
+                failure(setup_interaction_error(
+                    "could not read provider secret",
+                    source,
+                ))
+            })?
+            .into_bytes(),
+    );
     let confirmed =
         cliclack::confirm("Provision or replace the provider secret at this exact destination?")
             .initial_value(false)
@@ -3738,24 +3798,9 @@ fn provision_provider_secret(
         )));
     }
 
-    // Confirmation authorizes both creation and replacement before the secret
-    // enters the process. No other flag or profile can set this transport bit.
+    // No flag or profile can set this transport bit. The raw material is sent
+    // by the next operation only after this dedicated confirmation.
     let overwrite_authorized = confirmed;
-
-    // The secret enters memory only after authenticated preview metadata and its
-    // upload grant have been accepted for the already-pinned Host and the
-    // dedicated mutation confirmation succeeds.
-    let secret = Zeroizing::new(
-        cliclack::password("Provider secret")
-            .interact()
-            .map_err(|source| {
-                failure(setup_interaction_error(
-                    "could not read provider secret",
-                    source,
-                ))
-            })?
-            .into_bytes(),
-    );
     let metadata = satelle_transport::ProviderSecretProvisioningMetadata::new(
         authorization.clone(),
         overwrite_authorized,

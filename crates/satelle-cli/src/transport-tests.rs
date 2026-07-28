@@ -3630,7 +3630,8 @@ fn serialized_durable_relaunch_rechecks_readiness_under_the_remote_lock() {
         Exact,
         VersionMismatch,
         IdentityMismatch,
-        TransportFailure,
+        ConnectFailure,
+        UnprovenTransportFailure,
     }
 
     fn raw_readiness(
@@ -3649,7 +3650,13 @@ fn serialized_durable_relaunch_rechecks_readiness_under_the_remote_lock() {
                 daemon_version: env!("CARGO_PKG_VERSION").to_string(),
                 host_identity: "host-mismatch".to_string(),
             }),
-            FixtureReadiness::TransportFailure => Err(DaemonClientError::Transport(
+            FixtureReadiness::ConnectFailure => Err(DaemonClientError::Transport(
+                reqwest::blocking::Client::new()
+                    .get("http://127.0.0.1:0")
+                    .send()
+                    .expect_err("closed loopback endpoint creates a deterministic connect error"),
+            )),
+            FixtureReadiness::UnprovenTransportFailure => Err(DaemonClientError::Transport(
                 reqwest::blocking::Client::new()
                     .get("not a valid URL")
                     .build()
@@ -3750,7 +3757,7 @@ fn serialized_durable_relaunch_rechecks_readiness_under_the_remote_lock() {
         ],
     );
     assert_lifecycle(
-        FixtureReadiness::TransportFailure,
+        FixtureReadiness::ConnectFailure,
         FixtureReadiness::Exact,
         None,
         &[
@@ -3764,6 +3771,16 @@ fn serialized_durable_relaunch_rechecks_readiness_under_the_remote_lock() {
             "confirm-after-final-readiness",
         ],
     );
+    assert_lifecycle(
+        FixtureReadiness::UnprovenTransportFailure,
+        FixtureReadiness::Exact,
+        Some(SatelleError::host_unreachable("remote")),
+        &[
+            "confirm-before-probe",
+            "initial-readiness",
+            "confirm-after-probe",
+        ],
+    );
     for (readiness, expected_error) in [
         (
             FixtureReadiness::VersionMismatch,
@@ -3775,7 +3792,7 @@ fn serialized_durable_relaunch_rechecks_readiness_under_the_remote_lock() {
         ),
     ] {
         assert_lifecycle(
-            FixtureReadiness::TransportFailure,
+            FixtureReadiness::ConnectFailure,
             readiness,
             Some(expected_error),
             &[

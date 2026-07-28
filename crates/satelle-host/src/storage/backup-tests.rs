@@ -1654,6 +1654,44 @@ fn windows_cleanup_uses_real_write_through_and_handle_delete_primitives() {
     );
 }
 
+#[test]
+fn identity_checked_failed_create_cleanup_preserves_a_replacement() {
+    let fixture = BackupFixture::new(1);
+    let file_name = "failed-create-cleanup.tmp";
+    let original_path = fixture.state_root.join(file_name);
+    let retired_path = fixture.state_root.join("failed-create-cleanup.retired.tmp");
+    write_private_file(&original_path, b"original bytes");
+    let state_directory = fixture.state_directory();
+    let original_file = open_private_leaf(
+        &state_directory,
+        file_name,
+        LeafOpenMode::Existing,
+        StorageErrorKind::OperationFailed,
+    )
+    .expect("open original leaf")
+    .expect("original leaf exists");
+    let original_identity = leaf_identity(&original_file, StorageErrorKind::OperationFailed)
+        .expect("read original identity");
+    drop(original_file);
+
+    fs::rename(&original_path, &retired_path).expect("retire original leaf");
+    write_private_file(&original_path, b"replacement bytes");
+
+    assert_eq!(
+        StorageErrorKind::StateConflict,
+        state_directory
+            .delete_leaf(file_name, original_identity)
+            .expect_err("identity mismatch must preserve replacement")
+            .kind()
+    );
+    assert_eq!(
+        b"replacement bytes",
+        fs::read(&original_path)
+            .expect("read preserved replacement")
+            .as_slice()
+    );
+}
+
 #[cfg(windows)]
 #[test]
 fn windows_handle_delete_unlinks_before_share_delete_handles_close() {
