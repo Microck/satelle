@@ -2234,7 +2234,7 @@ fn expired_admission_remains_authoritative_when_capacity_becomes_ready() {
 }
 
 #[test]
-fn shared_post_start_failure_projection_preserves_completed_rows() {
+fn same_batch_spawn_failure_preserves_already_published_rows() {
     let selection = doctor_selection(&["config"]);
     let mut scheduler = production_doctor_scheduler(
         production_doctor_probes(selection.scopes(), None, true),
@@ -2243,16 +2243,6 @@ fn shared_post_start_failure_projection_preserves_completed_rows() {
     .expect("valid config scheduler");
     let started = scheduler.start_ready();
     assert_eq!(started.len(), 1);
-    scheduler
-        .finish(
-            "config",
-            DoctorProbeCompletion::new(DoctorProbeStatus::Passed, DoctorDependentEvidence::Useful),
-        )
-        .expect("config completion");
-    let records = [DoctorProbeExecutionRecord {
-        probe_id: "config".to_string(),
-        status: DoctorProbeStatus::Passed,
-    }];
     let snapshot_slot = RwLock::new(capability_snapshot(
         Phase0CapabilityEvidence {
             codex_version: CodexVersionEvidence::Detected {
@@ -2265,8 +2255,27 @@ fn shared_post_start_failure_projection_preserves_completed_rows() {
     ));
     let registry = DoctorTaskRegistry::new();
     let request_id = registry.begin_request();
-    let mut request_guard = DoctorRequestGuard::new(registry, request_id);
+    let mut request_guard = DoctorRequestGuard::new(registry.clone(), request_id);
     let mut execution = ProductionDoctorExecution::new();
+    let mut records = Vec::new();
+    apply_production_doctor_registry_events(
+        &registry,
+        vec![DoctorRegistryEvent::Completed {
+            completion_order: (Instant::now(), 1),
+            probe_id: "config".to_string(),
+            completion: DoctorProbeCompletion::new(
+                DoctorProbeStatus::Passed,
+                DoctorDependentEvidence::Useful,
+            ),
+            effect: Box::new(ProductionDoctorTaskEffect::None),
+        }],
+        DoctorOptions::default(),
+        &snapshot_slot,
+        &mut execution,
+        &mut scheduler,
+        &mut records,
+    )
+    .expect("same-batch completion reduction");
 
     let failure = fail_production_doctor_request(
         runtime::integrity_error("Doctor worker could not start"),

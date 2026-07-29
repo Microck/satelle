@@ -3725,69 +3725,17 @@ fn production_doctor_with_provider_intent(
     while !scheduler.is_complete() {
         let now = Instant::now();
         registry.advance(now);
-        let mut progressed = false;
-        let mut worker_panic = None;
-
-        for event in registry.drain_events(request_id) {
-            progressed = true;
-            match event {
-                DoctorRegistryEvent::Completed {
-                    completion_order,
-                    probe_id,
-                    completion,
-                    effect,
-                } => {
-                    let status = completion.status;
-                    if options.refresh()
-                        && let ProductionDoctorTaskEffect::Snapshot(Ok(snapshot)) = &*effect
-                    {
-                        registry
-                            .publish_snapshot_if_newer(
-                                completion_order,
-                                snapshot_slot,
-                                snapshot.clone(),
-                            )
-                            .map_err(DoctorExecutionFailure::from)?;
-                    }
-                    apply_production_doctor_effect(&mut execution, *effect);
-                    scheduler
-                        .finish(&probe_id, completion)
-                        .expect("registry completion belongs to a running probe");
-                    records.push(DoctorProbeExecutionRecord { probe_id, status });
-                }
-                DoctorRegistryEvent::TimedOut { probe_id } => {
-                    let completion = DoctorProbeCompletion::new(
-                        DoctorProbeStatus::TimedOut,
-                        DoctorDependentEvidence::NotUseful,
-                    );
-                    scheduler
-                        .finish(&probe_id, completion)
-                        .expect("registry timeout belongs to a running probe");
-                    records.push(DoctorProbeExecutionRecord {
-                        probe_id,
-                        status: DoctorProbeStatus::TimedOut,
-                    });
-                }
-                DoctorRegistryEvent::Panicked { probe_id } => {
-                    scheduler
-                        .finish(
-                            &probe_id,
-                            DoctorProbeCompletion::new(
-                                DoctorProbeStatus::Failed,
-                                DoctorDependentEvidence::NotUseful,
-                            ),
-                        )
-                        .expect("registry panic belongs to a running probe");
-                    worker_panic.get_or_insert_with(|| {
-                        runtime::integrity_error(format!(
-                            "Doctor probe {probe_id} panicked inside the owned task registry"
-                        ))
-                    });
-                }
-            }
-        }
-
-        if let Some(error) = worker_panic {
+        let events = registry.drain_events(request_id);
+        let mut progressed = !events.is_empty();
+        if let Err(error) = apply_production_doctor_registry_events(
+            registry,
+            events,
+            options,
+            snapshot_slot,
+            &mut execution,
+            &mut scheduler,
+            &mut records,
+        ) {
             // Drain the complete terminal batch before failing so diagnostics
             // that completed beside the panicked probe remain reportable.
             return fail_production_doctor_request(
@@ -4115,6 +4063,19 @@ fn production_doctor_with_provider_intent(
             };
             if let Err(error) = spawn_result {
                 drop(scheduling);
+                // A faster worker from this same admission batch may already
+                // have published before the later thread creation failed.
+                registry.advance(Instant::now());
+                let buffered_events = registry.drain_events(request_id);
+                let _ = apply_production_doctor_registry_events(
+                    registry,
+                    buffered_events,
+                    options,
+                    snapshot_slot,
+                    &mut execution,
+                    &mut scheduler,
+                    &mut records,
+                );
                 return fail_production_doctor_request(
                     error,
                     &mut request_guard,
@@ -4165,6 +4126,75 @@ fn production_doctor_with_provider_intent(
         return Err(DoctorExecutionFailure::new(error, report.probe_results));
     }
     Ok(report)
+}
+
+fn apply_production_doctor_registry_events(
+    registry: &DoctorTaskRegistry,
+    events: Vec<DoctorRegistryEvent>,
+    options: DoctorOptions,
+    snapshot_slot: &RwLock<ProductionCapabilitySnapshot>,
+    execution: &mut ProductionDoctorExecution,
+    scheduler: &mut DoctorProbeScheduler,
+    records: &mut Vec<DoctorProbeExecutionRecord>,
+) -> Result<(), SatelleError> {
+    let mut failure = None;
+    for event in events {
+        match event {
+            DoctorRegistryEvent::Completed {
+                completion_order,
+                probe_id,
+                completion,
+                effect,
+            } => {
+                let status = completion.status;
+                if options.refresh()
+                    && let ProductionDoctorTaskEffect::Snapshot(Ok(snapshot)) = &*effect
+                    && let Err(error) = registry.publish_snapshot_if_newer(
+                        completion_order,
+                        snapshot_slot,
+                        snapshot.clone(),
+                    )
+                {
+                    failure.get_or_insert(error);
+                }
+                apply_production_doctor_effect(execution, *effect);
+                scheduler
+                    .finish(&probe_id, completion)
+                    .expect("registry completion belongs to a running probe");
+                records.push(DoctorProbeExecutionRecord { probe_id, status });
+            }
+            DoctorRegistryEvent::TimedOut { probe_id } => {
+                let completion = DoctorProbeCompletion::new(
+                    DoctorProbeStatus::TimedOut,
+                    DoctorDependentEvidence::NotUseful,
+                );
+                scheduler
+                    .finish(&probe_id, completion)
+                    .expect("registry timeout belongs to a running probe");
+                records.push(DoctorProbeExecutionRecord {
+                    probe_id,
+                    status: DoctorProbeStatus::TimedOut,
+                });
+            }
+            DoctorRegistryEvent::Panicked { probe_id } => {
+                scheduler
+                    .finish(
+                        &probe_id,
+                        DoctorProbeCompletion::new(
+                            DoctorProbeStatus::Failed,
+                            DoctorDependentEvidence::NotUseful,
+                        ),
+                    )
+                    .expect("registry panic belongs to a running probe");
+                failure.get_or_insert_with(|| {
+                    runtime::integrity_error(format!(
+                        "Doctor probe {probe_id} panicked inside the owned task registry"
+                    ))
+                });
+            }
+        }
+    }
+    failure.map_or(Ok(()), Err)
 }
 
 fn expired_doctor_admission(
