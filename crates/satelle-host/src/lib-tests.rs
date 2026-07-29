@@ -631,6 +631,7 @@ fn service_with_provider_descriptor<A: ComputerUseAdapter>(
         },
         bootstrap_auth: None,
         bootstrap_maintenance: Arc::new(Mutex::new(None)),
+        doctor_tasks: DoctorTaskRegistry::new(),
     }
 }
 
@@ -658,6 +659,7 @@ where
         },
         bootstrap_auth: None,
         bootstrap_maintenance: Arc::new(Mutex::new(None)),
+        doctor_tasks: DoctorTaskRegistry::new(),
     }
 }
 
@@ -698,6 +700,7 @@ fn service_with_classified_provider_probe(
         },
         bootstrap_auth: None,
         bootstrap_maintenance: Arc::new(Mutex::new(None)),
+        doctor_tasks: DoctorTaskRegistry::new(),
     };
     (service, native_probe_calls, provider_probe_calls)
 }
@@ -1157,6 +1160,7 @@ fn local_host_run_and_steer_forward_attachments_and_host_clamped_timeout() {
         },
         bootstrap_auth: None,
         bootstrap_maintenance: Arc::new(Mutex::new(None)),
+        doctor_tasks: DoctorTaskRegistry::new(),
     }
     .with_turn_execution_timeout_for_tests(5);
 
@@ -1227,6 +1231,7 @@ fn unsupported_image_capability_rejects_direct_run_and_steer_before_admission() 
         },
         bootstrap_auth: None,
         bootstrap_maintenance: Arc::new(Mutex::new(None)),
+        doctor_tasks: DoctorTaskRegistry::new(),
     };
     let image_intent = turn_intent_with_extras("unsupported image", 3);
 
@@ -1308,6 +1313,7 @@ fn configured_remote_alias_reaches_execution_and_session_keeps_host_identity() {
         },
         bootstrap_auth: None,
         bootstrap_maintenance: Arc::new(Mutex::new(None)),
+        doctor_tasks: DoctorTaskRegistry::new(),
     };
 
     let outcome = service
@@ -1366,6 +1372,7 @@ fn configured_remote_alias_is_accepted_by_host_diagnostics() {
         },
         bootstrap_auth: None,
         bootstrap_maintenance: Arc::new(Mutex::new(None)),
+        doctor_tasks: DoctorTaskRegistry::new(),
     };
     let doctor = service
         .doctor(
@@ -1468,6 +1475,7 @@ fn unsupported_or_unproven_production_execution_is_blocked_without_state_admissi
             mode: HostMode::Production { snapshot },
             bootstrap_auth: None,
             bootstrap_maintenance: Arc::new(Mutex::new(None)),
+            doctor_tasks: DoctorTaskRegistry::new(),
         };
         let session_id = SessionId::new();
 
@@ -1586,6 +1594,7 @@ fn attached_adapter_failures_return_exact_durable_run_and_steer_handles() {
         },
         bootstrap_auth: None,
         bootstrap_maintenance: Arc::new(Mutex::new(None)),
+        doctor_tasks: DoctorTaskRegistry::new(),
     };
     let run_failure = run_service
         .run(
@@ -1623,6 +1632,7 @@ fn attached_adapter_failures_return_exact_durable_run_and_steer_handles() {
         },
         bootstrap_auth: None,
         bootstrap_maintenance: Arc::new(Mutex::new(None)),
+        doctor_tasks: DoctorTaskRegistry::new(),
     };
     let initial = seeded
         .run(
@@ -1646,6 +1656,7 @@ fn attached_adapter_failures_return_exact_durable_run_and_steer_handles() {
         },
         bootstrap_auth: None,
         bootstrap_maintenance: Arc::new(Mutex::new(None)),
+        doctor_tasks: DoctorTaskRegistry::new(),
     };
     let steer_failure = steer_service
         .steer(
@@ -1707,6 +1718,7 @@ fn refreshed_production_snapshot_updates_admission_surfaces_but_not_desktop_disc
         mode: HostMode::Production { snapshot },
         bootstrap_auth: None,
         bootstrap_maintenance: Arc::new(Mutex::new(None)),
+        doctor_tasks: DoctorTaskRegistry::new(),
     };
     let clone = service.clone();
 
@@ -1951,6 +1963,7 @@ fn doctor_provider_refresh_updates_cache_without_admitting_prompt_work() {
         },
         bootstrap_auth: None,
         bootstrap_maintenance: Arc::new(Mutex::new(None)),
+        doctor_tasks: DoctorTaskRegistry::new(),
     };
     service
         .runtime
@@ -1985,8 +1998,9 @@ fn doctor_provider_refresh_updates_cache_without_admitting_prompt_work() {
         .doctor_with_provider_intent(
             LOCAL_DEMO_HOST,
             &doctor_selection(&["provider"]),
-            &ready_transport(),
-            DoctorOptions::new(true, Some(std::time::Duration::from_secs(5))),
+            Arc::new(ready_transport()),
+            DoctorOptions::new(true, Some(std::time::Duration::from_secs(5)))
+                .expect("positive timeout"),
             &intent,
         )
         .expect("provider doctor refresh should complete");
@@ -2006,8 +2020,9 @@ fn doctor_provider_refresh_updates_cache_without_admitting_prompt_work() {
         .doctor_with_provider_intent(
             LOCAL_DEMO_HOST,
             &doctor_selection(&[]),
-            &ready_transport(),
-            DoctorOptions::new(true, Some(std::time::Duration::from_secs(5))),
+            Arc::new(ready_transport()),
+            DoctorOptions::new(true, Some(std::time::Duration::from_secs(5)))
+                .expect("positive timeout"),
             &intent,
         )
         .expect("default all-scope doctor refresh should include provider refresh");
@@ -2212,6 +2227,7 @@ fn provider_descriptor_validation_resolves_only_during_target_host_refresh() {
         },
         bootstrap_auth: None,
         bootstrap_maintenance: Arc::new(Mutex::new(None)),
+        doctor_tasks: DoctorTaskRegistry::new(),
     };
     service
         .runtime
@@ -2384,6 +2400,7 @@ fn failed_upstream_validation_returns_only_the_closed_smoke_failed_outcome() {
         },
         bootstrap_auth: None,
         bootstrap_maintenance: Arc::new(Mutex::new(None)),
+        doctor_tasks: DoctorTaskRegistry::new(),
     };
     service
         .runtime
@@ -2535,8 +2552,8 @@ fn doctor_provider_and_default_scopes_report_closed_descriptor_status_without_se
             .doctor_with_provider_intent(
                 LOCAL_DEMO_HOST,
                 &doctor_selection(&scopes),
-                &ready_transport(),
-                DoctorOptions::new(false, None),
+                Arc::new(ready_transport()),
+                DoctorOptions::new(false, None).expect("default timeout is valid"),
                 &intent,
             )
             .expect("read-only doctor should classify its provider descriptor");
@@ -2683,8 +2700,8 @@ fn doctor_reports_a_named_missing_provider_descriptor_without_resolving_it() {
         .doctor_with_provider_intent(
             LOCAL_DEMO_HOST,
             &doctor_selection(&["provider"]),
-            &ready_transport(),
-            DoctorOptions::new(false, None),
+            Arc::new(ready_transport()),
+            DoctorOptions::new(false, None).expect("default timeout is valid"),
             &provider_intent_with_missing_descriptor(),
         )
         .expect("doctor must preserve the missing descriptor as diagnostic evidence");
@@ -2858,6 +2875,7 @@ fn capability_snapshot(
         evidence,
         verdict: evaluate_phase0_support(evidence),
         control_plane_admission: codex_capabilities::ControlPlaneAdmission::not_applicable(),
+        budget_failure: None,
         started_at: "2026-07-09T00:00:00Z".to_string(),
         finished_at: "2026-07-09T00:00:01Z".to_string(),
         duration_ms,

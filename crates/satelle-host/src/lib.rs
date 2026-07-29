@@ -61,8 +61,9 @@ use runtime::{
 };
 use satelle_core::doctor::{
     DoctorDependentEvidence, DoctorProbe, DoctorProbeCachePolicy, DoctorProbeCompletion,
-    DoctorProbeExecutionContext, DoctorProbeExecutionRecord, DoctorProbeResource,
-    DoctorProbeScheduler, DoctorProbeState, DoctorProbeStatus, DoctorScope, DoctorScopeSelection,
+    DoctorProbeExecutionContext, DoctorProbeExecutionRecord, DoctorProbeLifecycle,
+    DoctorProbeLifecycleEvent, DoctorProbeResource, DoctorProbeScheduler, DoctorProbeState,
+    DoctorProbeStatus, DoctorScope, DoctorScopeSelection,
 };
 use satelle_core::session::{PublicSession, TurnAdmissionFailure};
 use satelle_core::{
@@ -79,9 +80,10 @@ pub use satelle_core::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, RwLock, RwLockReadGuard};
+use std::sync::{Arc, Condvar, Mutex, RwLock, RwLockReadGuard, Weak};
 use std::time::{Duration, Instant};
 use storage::Storage;
 pub use storage::{
@@ -729,6 +731,7 @@ pub struct HostService {
     mode: HostMode,
     bootstrap_auth: Option<Arc<EphemeralApiAuthenticator>>,
     bootstrap_maintenance: Arc<Mutex<Option<MaintenanceOperationHandle>>>,
+    doctor_tasks: DoctorTaskRegistry,
 }
 
 #[derive(Clone, Debug)]
@@ -758,6 +761,7 @@ pub(crate) struct ProductionCapabilitySnapshot {
     evidence: codex_capabilities::Phase0CapabilityEvidence,
     verdict: Phase0SupportVerdict,
     control_plane_admission: codex_capabilities::ControlPlaneAdmission,
+    budget_failure: Option<codex_capabilities::Phase0BudgetFailure>,
     started_at: String,
     finished_at: String,
     duration_ms: u64,
@@ -769,12 +773,17 @@ impl ProductionCapabilitySnapshot {
         let started = Instant::now();
         let discovery = discover_phase0(probe_timeout);
         let verdict = evaluate_phase0_support(discovery.evidence);
+        debug_assert!(
+            discovery.budget_failure.is_none() || !verdict.is_supported(),
+            "a Phase 0 budget failure cannot produce supported evidence"
+        );
         let duration_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
 
         Self {
             evidence: discovery.evidence,
             verdict,
             control_plane_admission: discovery.control_plane_admission,
+            budget_failure: discovery.budget_failure,
             started_at,
             finished_at: utc_now(),
             duration_ms,
@@ -1246,6 +1255,7 @@ impl HostService {
             },
             bootstrap_auth: None,
             bootstrap_maintenance: Arc::new(Mutex::new(None)),
+            doctor_tasks: DoctorTaskRegistry::new(),
         })
     }
 
@@ -1660,6 +1670,7 @@ impl HostService {
             mode: HostMode::Production { snapshot },
             bootstrap_auth: None,
             bootstrap_maintenance: Arc::new(Mutex::new(None)),
+            doctor_tasks: DoctorTaskRegistry::new(),
         }
     }
 
@@ -1725,6 +1736,7 @@ impl HostService {
             },
             bootstrap_auth: None,
             bootstrap_maintenance: Arc::new(Mutex::new(None)),
+            doctor_tasks: DoctorTaskRegistry::new(),
         })
     }
 
@@ -1742,6 +1754,7 @@ impl HostService {
             },
             bootstrap_auth: None,
             bootstrap_maintenance: Arc::new(Mutex::new(None)),
+            doctor_tasks: DoctorTaskRegistry::new(),
         })
     }
 
@@ -1762,6 +1775,7 @@ impl HostService {
             },
             bootstrap_auth: None,
             bootstrap_maintenance: Arc::new(Mutex::new(None)),
+            doctor_tasks: DoctorTaskRegistry::new(),
         })
     }
 
@@ -1779,6 +1793,7 @@ impl HostService {
             },
             bootstrap_auth: None,
             bootstrap_maintenance: Arc::new(Mutex::new(None)),
+            doctor_tasks: DoctorTaskRegistry::new(),
         })
     }
 
@@ -1796,6 +1811,7 @@ impl HostService {
             },
             bootstrap_auth: None,
             bootstrap_maintenance: Arc::new(Mutex::new(None)),
+            doctor_tasks: DoctorTaskRegistry::new(),
         })
     }
 
@@ -1808,7 +1824,7 @@ impl HostService {
         self.doctor_with_provider_intent(
             host,
             scope_selection,
-            &ReadyControllerTransportProbe,
+            Arc::new(ReadyControllerTransportProbe),
             options,
             &ProviderComputerUseIntent::host_default(),
         )
@@ -1818,7 +1834,7 @@ impl HostService {
         &self,
         host: &str,
         scope_selection: &DoctorScopeSelection,
-        transport_probe: &dyn ControllerTransportProbe,
+        transport_probe: Arc<dyn ControllerTransportProbe>,
         options: DoctorOptions,
         provider_intent: &ProviderComputerUseIntent,
     ) -> Result<DoctorReport, SatelleError> {
@@ -1848,7 +1864,7 @@ impl HostService {
         &self,
         host: &str,
         scope_selection: &DoctorScopeSelection,
-        transport_probe: &dyn ControllerTransportProbe,
+        transport_probe: Arc<dyn ControllerTransportProbe>,
         options: DoctorOptions,
         provider_intent: &ProviderComputerUseIntent,
     ) -> Result<DoctorReport, SatelleError> {
@@ -1878,7 +1894,8 @@ impl HostService {
         } else {
             None
         };
-        let transport_observation = execute_controller_transport_probe(transport_probe, options);
+        let transport_observation =
+            execute_test_controller_transport_probe(&*transport_probe, options)?;
         let mut report = self.fake_doctor(
             host,
             scope_selection,
@@ -2010,8 +2027,8 @@ impl HostService {
         let mut report = self.doctor_with_provider_intent(
             host,
             &scope_selection,
-            &ReadyControllerTransportProbe,
-            DoctorOptions::new(true, None),
+            Arc::new(ReadyControllerTransportProbe),
+            DoctorOptions::new(true, None).expect("default timeout is valid"),
             provider_intent,
         )?;
         if report.changed
@@ -2839,6 +2856,7 @@ impl HostService {
     }
 }
 
+#[derive(Clone)]
 pub enum ControllerTransportProbeOutcome {
     Observed(DoctorTransportObservation),
     TimedOut(DoctorTransportObservation),
@@ -2862,7 +2880,7 @@ impl ControllerTransportProbeOutcome {
     }
 }
 
-pub trait ControllerTransportProbe: Sync {
+pub trait ControllerTransportProbe: Send + Sync {
     fn execute(
         &self,
         context: &satelle_core::doctor::DoctorProbeExecutionContext,
@@ -2880,36 +2898,446 @@ impl ControllerTransportProbe for ReadyControllerTransportProbe {
     }
 }
 
-fn execute_controller_transport_probe(
+fn doctor_cleanup_reserve(timeout: Duration) -> Duration {
+    (timeout / 4).min(Duration::from_secs(1))
+}
+
+#[cfg(any(test, feature = "test-support"))]
+fn execute_test_controller_transport_probe(
     probe: &dyn ControllerTransportProbe,
     options: DoctorOptions,
-) -> DoctorTransportObservation {
-    let outcome = Mutex::new(None);
-    let mut scheduler = DoctorProbeScheduler::new(vec![DoctorProbe {
-        probe_id: DoctorScope::Transport.as_str().to_string(),
-        scope: DoctorScope::Transport.as_str().to_string(),
-        dependencies: Vec::new(),
-        resource_locks: [DoctorProbeResource::RemoteServiceManager]
-            .into_iter()
-            .collect(),
-        timeout: options.effective_probe_timeout(),
-        cache_policy: DoctorProbeCachePolicy::Reuse,
-    }])
-    .expect("the controller transport probe is a valid Doctor graph");
-    scheduler.execute(|_, context| {
-        let executed = probe.execute(context);
-        let completion = executed.completion();
-        *outcome
+) -> Result<DoctorTransportObservation, SatelleError> {
+    // Test-fake Hosts do not own production task resources. They still use the
+    // canonical deadline context so controller probe fakes exercise the same
+    // cancellation input as production probes.
+    let lifecycle = DoctorProbeLifecycle::start(
+        DoctorScope::Transport.as_str(),
+        Instant::now(),
+        options.effective_probe_timeout(),
+        Duration::ZERO,
+    )
+    .map_err(|error| runtime::integrity_error(error.to_string()))?;
+    Ok(probe.execute(&lifecycle.context()).observation().clone())
+}
+
+enum ProductionDoctorTaskEffect {
+    None,
+    Snapshot(Result<ProductionCapabilitySnapshot, SatelleError>),
+    NativeRefresh {
+        refresh: Result<ReadinessEvidence, SatelleError>,
+        started_at: String,
+        duration: Duration,
+    },
+    ProviderAuth {
+        evidence: Option<(
+            satelle_core::ProviderAuthValidationOutcome,
+            satelle_core::ProviderAuthObservationSource,
+        )>,
+        error: Option<SatelleError>,
+    },
+    ProviderRefresh {
+        refresh: Box<Result<AdapterReadiness, SatelleError>>,
+        started_at: String,
+        duration: Duration,
+        observed_auth: Option<(
+            satelle_core::ProviderAuthValidationOutcome,
+            satelle_core::ProviderAuthObservationSource,
+        )>,
+    },
+    ProviderNotRequired,
+    Transport {
+        outcome: ControllerTransportProbeOutcome,
+        started_at: String,
+        finished_at: String,
+        duration: Duration,
+    },
+}
+
+struct ProductionDoctorTaskResult {
+    completion: DoctorProbeCompletion,
+    effect: ProductionDoctorTaskEffect,
+}
+
+enum DoctorWorkerTerminal {
+    Completed {
+        completed_at: Instant,
+        result: Box<ProductionDoctorTaskResult>,
+    },
+    Panicked,
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum DoctorRegistryTaskPhase {
+    Running,
+    CleanupOnly,
+}
+
+struct DoctorRegistryTask {
+    request_id: u64,
+    probe_id: String,
+    resource_locks: BTreeSet<DoctorProbeResource>,
+    lifecycle: DoctorProbeLifecycle,
+    phase: DoctorRegistryTaskPhase,
+    terminal: Option<DoctorWorkerTerminal>,
+    worker: Option<std::thread::JoinHandle<()>>,
+}
+
+enum DoctorRegistryEvent {
+    Completed {
+        probe_id: String,
+        completion: DoctorProbeCompletion,
+        effect: Box<ProductionDoctorTaskEffect>,
+    },
+    TimedOut {
+        probe_id: String,
+    },
+    Panicked {
+        probe_id: String,
+    },
+}
+
+struct DoctorTaskRegistryState {
+    next_request_id: u64,
+    next_task_id: u64,
+    tasks: BTreeMap<u64, DoctorRegistryTask>,
+    events: BTreeMap<u64, VecDeque<DoctorRegistryEvent>>,
+}
+
+struct DoctorTaskRegistryInner {
+    scheduling: Mutex<()>,
+    state: Mutex<DoctorTaskRegistryState>,
+    changed: Condvar,
+}
+
+#[derive(Clone)]
+struct DoctorTaskRegistry {
+    inner: Arc<DoctorTaskRegistryInner>,
+}
+
+impl std::fmt::Debug for DoctorTaskRegistry {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("DoctorTaskRegistry")
+    }
+}
+
+impl DoctorTaskRegistry {
+    fn new() -> Self {
+        Self {
+            inner: Arc::new(DoctorTaskRegistryInner {
+                scheduling: Mutex::new(()),
+                state: Mutex::new(DoctorTaskRegistryState {
+                    next_request_id: 1,
+                    next_task_id: 1,
+                    tasks: BTreeMap::new(),
+                    events: BTreeMap::new(),
+                }),
+                changed: Condvar::new(),
+            }),
+        }
+    }
+
+    fn lock_scheduling(&self) -> std::sync::MutexGuard<'_, ()> {
+        self.inner
+            .scheduling
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(executed);
-        completion
-    });
-    outcome
-        .into_inner()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .expect("the controller transport probe executed")
-        .observation()
-        .clone()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn begin_request(&self) -> u64 {
+        let mut state = self
+            .inner
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let request_id = state.next_request_id;
+        state.next_request_id = state.next_request_id.saturating_add(1);
+        request_id
+    }
+
+    fn spawn(
+        &self,
+        request_id: u64,
+        probe: &DoctorProbe,
+        operation: impl FnOnce(
+            satelle_core::doctor::DoctorProbeExecutionContext,
+        ) -> ProductionDoctorTaskResult
+        + Send
+        + 'static,
+    ) -> Result<(), SatelleError> {
+        let lifecycle = DoctorProbeLifecycle::start(
+            probe.probe_id.clone(),
+            Instant::now(),
+            probe.timeout,
+            doctor_cleanup_reserve(probe.timeout),
+        )
+        .map_err(|error| runtime::integrity_error(error.to_string()))?;
+        let context = lifecycle.context();
+        let task_id = {
+            let mut state = self
+                .inner
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let task_id = state.next_task_id;
+            state.next_task_id = state.next_task_id.saturating_add(1);
+            state.tasks.insert(
+                task_id,
+                DoctorRegistryTask {
+                    request_id,
+                    probe_id: probe.probe_id.clone(),
+                    resource_locks: probe.resource_locks.clone(),
+                    lifecycle,
+                    phase: DoctorRegistryTaskPhase::Running,
+                    terminal: None,
+                    worker: None,
+                },
+            );
+            task_id
+        };
+
+        let weak = Arc::downgrade(&self.inner);
+        let worker = match std::thread::Builder::new()
+            .name(format!("doctor-{}", probe.probe_id))
+            .spawn(move || {
+                let terminal = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    operation(context)
+                })) {
+                    Ok(result) => DoctorWorkerTerminal::Completed {
+                        completed_at: Instant::now(),
+                        result: Box::new(result),
+                    },
+                    Err(_) => DoctorWorkerTerminal::Panicked,
+                };
+                let Some(inner) = Weak::upgrade(&weak) else {
+                    return;
+                };
+                let mut state = inner
+                    .state
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if let Some(task) = state.tasks.get_mut(&task_id) {
+                    task.terminal = Some(terminal);
+                }
+                inner.changed.notify_all();
+            }) {
+            Ok(worker) => worker,
+            Err(error) => {
+                self.inner
+                    .state
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .tasks
+                    .remove(&task_id);
+                return Err(runtime::integrity_error(error.to_string()));
+            }
+        };
+
+        let mut state = self
+            .inner
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state
+            .tasks
+            .get_mut(&task_id)
+            .expect("new Doctor registry task remains owned")
+            .worker = Some(worker);
+        Ok(())
+    }
+
+    fn advance(&self, now: Instant) {
+        let mut joins = Vec::new();
+        let mut queued = Vec::new();
+        {
+            let mut state = self
+                .inner
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let task_ids = state.tasks.keys().copied().collect::<Vec<_>>();
+            for task_id in task_ids {
+                let mut remove = false;
+                let mut event = None;
+                {
+                    let task = state
+                        .tasks
+                        .get_mut(&task_id)
+                        .expect("listed Doctor registry task exists");
+                    if let Some(terminal) = task.terminal.take() {
+                        let request_id = task.request_id;
+                        let probe_id = task.probe_id.clone();
+                        if let Some(worker) = task.worker.take() {
+                            joins.push(worker);
+                        }
+                        if task.phase == DoctorRegistryTaskPhase::CleanupOnly {
+                            remove = true;
+                        } else {
+                            match terminal {
+                                DoctorWorkerTerminal::Completed {
+                                    completed_at,
+                                    result,
+                                } => {
+                                    let ProductionDoctorTaskResult {
+                                        completion: result_completion,
+                                        effect,
+                                    } = *result;
+                                    let lifecycle_event = task
+                                        .lifecycle
+                                        .poll(completed_at, Some((completed_at, result_completion)))
+                                        .expect("terminal acknowledgment cannot miss cleanup");
+                                    let DoctorProbeLifecycleEvent::TerminalAck(completion) =
+                                        lifecycle_event
+                                    else {
+                                        unreachable!("worker completion is a terminal ack")
+                                    };
+                                    event = Some((
+                                        request_id,
+                                        if completion.status == DoctorProbeStatus::TimedOut {
+                                            DoctorRegistryEvent::TimedOut { probe_id }
+                                        } else {
+                                            DoctorRegistryEvent::Completed {
+                                                probe_id,
+                                                completion,
+                                                effect: Box::new(effect),
+                                            }
+                                        },
+                                    ));
+                                }
+                                DoctorWorkerTerminal::Panicked => {
+                                    event = Some((
+                                        request_id,
+                                        DoctorRegistryEvent::Panicked { probe_id },
+                                    ));
+                                }
+                            }
+                            remove = true;
+                        }
+                    } else if task.phase == DoctorRegistryTaskPhase::Running {
+                        match task.lifecycle.poll(now, None) {
+                            Ok(DoctorProbeLifecycleEvent::BeginCancellation)
+                            | Ok(DoctorProbeLifecycleEvent::Running) => {}
+                            Ok(DoctorProbeLifecycleEvent::TerminalAck(_)) => {
+                                unreachable!("no terminal ack was supplied")
+                            }
+                            Err(
+                                satelle_core::doctor::DoctorProbeExecutionError::CleanupDeadlineMissed {
+                                    ..
+                                },
+                            ) => {
+                                task.phase = DoctorRegistryTaskPhase::CleanupOnly;
+                                event = Some((
+                                    task.request_id,
+                                    DoctorRegistryEvent::TimedOut {
+                                        probe_id: task.probe_id.clone(),
+                                    },
+                                ));
+                            }
+                            Err(
+                                satelle_core::doctor::DoctorProbeExecutionError::DeadlineOverflow {
+                                    ..
+                                },
+                            ) => unreachable!("deadline overflow is rejected at task start"),
+                        }
+                    }
+                }
+                if remove {
+                    state.tasks.remove(&task_id);
+                }
+                if let Some(event) = event {
+                    queued.push(event);
+                }
+            }
+            for (request_id, event) in queued.drain(..) {
+                state.events.entry(request_id).or_default().push_back(event);
+            }
+        }
+        for worker in joins {
+            worker
+                .join()
+                .expect("a terminal Doctor worker joins after publishing its slot");
+        }
+    }
+
+    fn external_occupancy(&self, request_id: u64) -> (usize, BTreeSet<DoctorProbeResource>) {
+        let state = self
+            .inner
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let tasks = state.tasks.values().filter(|task| {
+            task.request_id != request_id || task.phase == DoctorRegistryTaskPhase::CleanupOnly
+        });
+        let mut capacity = 0;
+        let mut resources = BTreeSet::new();
+        for task in tasks {
+            capacity += 1;
+            resources.extend(task.resource_locks.iter().copied());
+        }
+        (capacity, resources)
+    }
+
+    fn drain_events(&self, request_id: u64) -> Vec<DoctorRegistryEvent> {
+        self.inner
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .events
+            .remove(&request_id)
+            .map(VecDeque::into_iter)
+            .into_iter()
+            .flatten()
+            .collect()
+    }
+
+    fn wait_until(&self, deadline: Instant) {
+        let state = self
+            .inner
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let wait = deadline.saturating_duration_since(Instant::now());
+        if !wait.is_zero() {
+            drop(
+                self.inner
+                    .changed
+                    .wait_timeout(state, wait)
+                    .unwrap_or_else(std::sync::PoisonError::into_inner),
+            );
+        }
+    }
+
+    fn next_transition(&self) -> Option<Instant> {
+        self.inner
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .tasks
+            .values()
+            .filter(|task| task.phase == DoctorRegistryTaskPhase::Running)
+            .map(|task| {
+                if task.lifecycle.context().is_cancelled() {
+                    task.lifecycle.deadline()
+                } else {
+                    task.lifecycle.cancel_at()
+                }
+            })
+            .min()
+    }
+}
+
+impl Drop for DoctorTaskRegistryInner {
+    fn drop(&mut self) {
+        let state = self
+            .state
+            .get_mut()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for task in state.tasks.values_mut() {
+            task.lifecycle.request_cancellation();
+        }
+        // Dropping a JoinHandle detaches the worker. Shutdown must not turn a
+        // bounded Doctor timeout back into an unbounded wait when an external
+        // operation ignores cancellation.
+    }
 }
 
 struct ProductionDoctorExecution {
@@ -2952,11 +3380,63 @@ impl ProductionDoctorExecution {
     }
 }
 
+fn apply_production_doctor_effect(
+    execution: &mut ProductionDoctorExecution,
+    effect: ProductionDoctorTaskEffect,
+) {
+    match effect {
+        ProductionDoctorTaskEffect::None => {}
+        ProductionDoctorTaskEffect::Snapshot(Ok(snapshot)) => {
+            execution.snapshot = Some(snapshot);
+        }
+        ProductionDoctorTaskEffect::Snapshot(Err(error)) => {
+            execution.fatal_error = Some(error);
+        }
+        ProductionDoctorTaskEffect::NativeRefresh {
+            refresh,
+            started_at,
+            duration,
+        } => {
+            execution.native_refresh = Some((refresh, started_at, duration));
+        }
+        ProductionDoctorTaskEffect::ProviderAuth { evidence, error } => {
+            if let Some(evidence) = evidence {
+                execution.provider_auth_evidence = Some(evidence);
+            }
+            if let Some(error) = error {
+                execution.fatal_error = Some(error);
+            }
+        }
+        ProductionDoctorTaskEffect::ProviderRefresh {
+            refresh,
+            started_at,
+            duration,
+            observed_auth,
+        } => {
+            if let Some(observed_auth) = observed_auth {
+                execution.provider_auth_evidence = Some(observed_auth);
+            }
+            execution.provider_refresh = Some((*refresh, started_at, duration));
+        }
+        ProductionDoctorTaskEffect::ProviderNotRequired => {
+            execution.provider_not_required = true;
+        }
+        ProductionDoctorTaskEffect::Transport {
+            outcome,
+            started_at,
+            finished_at,
+            duration,
+        } => {
+            execution.transport = Some((outcome, started_at, finished_at, duration));
+        }
+    }
+}
+
 fn production_doctor_with_provider_intent(
     service: &HostService,
     host: &str,
     scope_selection: &DoctorScopeSelection,
-    transport_probe: &dyn ControllerTransportProbe,
+    transport_probe: Arc<dyn ControllerTransportProbe>,
     options: DoctorOptions,
     provider_intent: &ProviderComputerUseIntent,
     snapshot_slot: &Arc<RwLock<ProductionCapabilitySnapshot>>,
@@ -2997,224 +3477,362 @@ fn production_doctor_with_provider_intent(
         provider.dependencies.push("provider-auth".to_string());
     }
 
-    let execution = Mutex::new(ProductionDoctorExecution::new());
+    let request_started = Instant::now();
+    let pending_deadlines = probes
+        .iter()
+        .map(|probe| {
+            request_started
+                .checked_add(probe.timeout)
+                .map(|deadline| (probe.probe_id.clone(), deadline))
+                .ok_or_else(|| {
+                    runtime::integrity_error(format!(
+                        "Doctor probe {} timeout cannot form an absolute request deadline",
+                        probe.probe_id
+                    ))
+                })
+        })
+        .collect::<Result<BTreeMap<_, _>, _>>()?;
+    let mut execution = ProductionDoctorExecution::new();
     let mut scheduler = production_doctor_scheduler(probes, options)?;
-    let records = scheduler.execute(|probe, context| {
-        match probe.probe_id.as_str() {
-            "codex" => {
-                let snapshot = if options.refresh() {
-                    let remaining = context.remaining();
-                    if remaining.is_zero() {
-                        return DoctorProbeCompletion::new(
-                            DoctorProbeStatus::TimedOut,
-                            DoctorDependentEvidence::NotUseful,
-                        );
-                    }
-                    Ok(ProductionCapabilitySnapshot::collect(Some(remaining)))
-                } else {
-                    read_production_snapshot(snapshot_slot).map(|snapshot| snapshot.clone())
-                };
-                match snapshot {
-                    Ok(snapshot) => {
-                        let completion = phase0_probe_completion(snapshot.verdict.blockers());
-                        execution
-                            .lock()
-                            .unwrap_or_else(std::sync::PoisonError::into_inner)
-                            .snapshot = Some(snapshot);
-                        completion
-                    }
-                    Err(error) => {
-                        execution
-                            .lock()
-                            .unwrap_or_else(std::sync::PoisonError::into_inner)
-                            .fatal_error = Some(error.clone());
-                        error_probe_completion(&error)
-                    }
+    let registry = &service.doctor_tasks;
+    let request_id = registry.begin_request();
+    let mut records = Vec::new();
+
+    while !scheduler.is_complete() {
+        let now = Instant::now();
+        registry.advance(now);
+        let mut progressed = false;
+
+        for event in registry.drain_events(request_id) {
+            progressed = true;
+            match event {
+                DoctorRegistryEvent::Completed {
+                    probe_id,
+                    completion,
+                    effect,
+                } => {
+                    let status = completion.status;
+                    apply_production_doctor_effect(&mut execution, *effect);
+                    scheduler
+                        .finish(&probe_id, completion)
+                        .expect("registry completion belongs to a running probe");
+                    records.push(DoctorProbeExecutionRecord { probe_id, status });
+                }
+                DoctorRegistryEvent::TimedOut { probe_id } => {
+                    let completion = DoctorProbeCompletion::new(
+                        DoctorProbeStatus::TimedOut,
+                        DoctorDependentEvidence::NotUseful,
+                    );
+                    scheduler
+                        .finish(&probe_id, completion)
+                        .expect("registry timeout belongs to a running probe");
+                    records.push(DoctorProbeExecutionRecord {
+                        probe_id,
+                        status: DoctorProbeStatus::TimedOut,
+                    });
+                }
+                DoctorRegistryEvent::Panicked { probe_id } => {
+                    return Err(runtime::integrity_error(format!(
+                        "Doctor probe {probe_id} panicked inside the owned task registry"
+                    )));
                 }
             }
-            "computer-use" => {
-                if options.refresh() {
+        }
+
+        for (probe_id, deadline) in &pending_deadlines {
+            if now >= *deadline
+                && matches!(scheduler.state(probe_id), Some(DoctorProbeState::Pending))
+            {
+                scheduler
+                    .timeout_pending(probe_id)
+                    .expect("request-owned pending probe can time out");
+                records.push(DoctorProbeExecutionRecord {
+                    probe_id: probe_id.clone(),
+                    status: DoctorProbeStatus::TimedOut,
+                });
+                progressed = true;
+            }
+        }
+
+        if scheduler.is_complete() {
+            break;
+        }
+
+        // Occupancy inspection and registration form one admission decision
+        // across concurrent Doctor calls for this Host service.
+        let scheduling = registry.lock_scheduling();
+        let (external_capacity, external_resources) = registry.external_occupancy(request_id);
+        let ready =
+            scheduler.start_ready_with_external_occupancy(external_capacity, &external_resources);
+        for probe in ready {
+            progressed = true;
+            match probe.probe_id.as_str() {
+                "codex" => {
+                    let snapshot_slot = Arc::clone(snapshot_slot);
+                    registry.spawn(request_id, &probe, move |context| {
+                        let snapshot = if options.refresh() {
+                            let remaining = context.remaining();
+                            if remaining.is_zero() {
+                                Err(runtime::integrity_error(
+                                    "Phase 0 started without useful-work budget",
+                                ))
+                            } else {
+                                Ok(ProductionCapabilitySnapshot::collect(Some(remaining)))
+                            }
+                        } else {
+                            read_production_snapshot(&snapshot_slot)
+                                .map(|snapshot| snapshot.clone())
+                        };
+                        let completion = match &snapshot {
+                            Ok(snapshot) => phase0_snapshot_completion(snapshot),
+                            Err(error) => error_probe_completion(error),
+                        };
+                        ProductionDoctorTaskResult {
+                            completion,
+                            effect: ProductionDoctorTaskEffect::Snapshot(snapshot),
+                        }
+                    })?;
+                }
+                "computer-use" if options.refresh() => {
+                    let runtime = service.runtime.clone();
+                    let host = host.to_string();
                     let native_only_intent = ProviderComputerUseIntent::host_default();
                     let native_intent = native_probe_intent(
                         provider_probe_required,
                         provider_intent,
                         &native_only_intent,
-                    );
-                    let started_at = utc_now();
-                    let started = Instant::now();
-                    let refresh = with_doctor_probe_cancellation(context, |cancellation| {
-                        service
-                            .runtime
-                            .refresh_setup_native_readiness_with_cancellation(
-                                host,
-                                native_intent,
+                    )
+                    .clone();
+                    registry.spawn(request_id, &probe, move |context| {
+                        let started_at = utc_now();
+                        let started = Instant::now();
+                        let refresh = with_doctor_probe_cancellation(&context, |cancellation| {
+                            runtime.refresh_setup_native_readiness_with_cancellation(
+                                &host,
+                                &native_intent,
                                 cancellation,
                             )
-                    });
-                    let completion = result_probe_completion(&refresh);
-                    execution
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner)
-                        .native_refresh = Some((refresh, started_at, started.elapsed()));
-                    completion
-                } else {
-                    let blocked = execution
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner)
-                        .snapshot
-                        .as_ref()
-                        .is_some_and(|snapshot| {
-                            snapshot
-                                .verdict
-                                .blockers()
-                                .iter()
-                                .any(|blocker| blocker_scope(blocker) == "computer-use")
                         });
-                    probe_completion(blocked)
+                        ProductionDoctorTaskResult {
+                            completion: result_probe_completion(&refresh),
+                            effect: ProductionDoctorTaskEffect::NativeRefresh {
+                                refresh,
+                                started_at,
+                                duration: started.elapsed(),
+                            },
+                        }
+                    })?;
                 }
-            }
-            "provider-auth" => {
-                let resolution = service.resolve_provider_binding(host, provider_intent);
-                match resolution {
-                    Ok(ProviderBindingResolution::Ready(binding)) => {
-                        let evidence = match binding.auth_source() {
-                            Some(source) => (
-                                provider_auth::diagnose_provider_secret(Some(source), None, false),
-                                satelle_core::ProviderAuthObservationSource::Deferred,
+                "computer-use" => {
+                    let blocked = execution.snapshot.as_ref().is_some_and(|snapshot| {
+                        snapshot
+                            .verdict
+                            .blockers()
+                            .iter()
+                            .any(|blocker| blocker_scope(blocker) == "computer-use")
+                    });
+                    registry.spawn(request_id, &probe, move |_context| {
+                        ProductionDoctorTaskResult {
+                            completion: probe_completion(blocked),
+                            effect: ProductionDoctorTaskEffect::None,
+                        }
+                    })?;
+                }
+                "provider-auth" => {
+                    let runtime = service.runtime.clone();
+                    let host = host.to_string();
+                    let provider_intent = provider_intent.clone();
+                    registry.spawn(request_id, &probe, move |_context| {
+                        let resolution =
+                            runtime.resolve_provider_binding(&host, &provider_intent);
+                        let (completion, evidence, error) = match resolution {
+                            Ok(ProviderBindingResolution::Ready(binding)) => {
+                                let evidence = match binding.auth_source() {
+                                    Some(source) => (
+                                        provider_auth::diagnose_provider_secret(
+                                            Some(source),
+                                            None,
+                                            false,
+                                        ),
+                                        satelle_core::ProviderAuthObservationSource::Deferred,
+                                    ),
+                                    None => (
+                                        satelle_core::ProviderAuthValidationOutcome::Resolved,
+                                        satelle_core::ProviderAuthObservationSource::Cached,
+                                    ),
+                                };
+                                let blocked = matches!(
+                                    evidence.0,
+                                    satelle_core::ProviderAuthValidationOutcome::MissingDescriptor
+                                        | satelle_core::ProviderAuthValidationOutcome::UnsupportedDescriptorKind
+                                );
+                                (probe_completion(blocked), Some(evidence), None)
+                            }
+                            Ok(ProviderBindingResolution::MissingDescriptor { .. }) => (
+                                probe_completion(true),
+                                Some((
+                                    satelle_core::ProviderAuthValidationOutcome::MissingDescriptor,
+                                    satelle_core::ProviderAuthObservationSource::Deferred,
+                                )),
+                                None,
                             ),
-                            None => (
-                                satelle_core::ProviderAuthValidationOutcome::Resolved,
-                                satelle_core::ProviderAuthObservationSource::Cached,
+                            Err(error) => (
+                                error_probe_completion(&error),
+                                None,
+                                Some(error),
                             ),
                         };
-                        let blocked = matches!(
-                            evidence.0,
-                            satelle_core::ProviderAuthValidationOutcome::MissingDescriptor
-                                | satelle_core::ProviderAuthValidationOutcome::UnsupportedDescriptorKind
-                        );
-                        execution
-                            .lock()
-                            .unwrap_or_else(std::sync::PoisonError::into_inner)
-                            .provider_auth_evidence = Some(evidence);
-                        probe_completion(blocked)
+                        ProductionDoctorTaskResult {
+                            completion,
+                            effect: ProductionDoctorTaskEffect::ProviderAuth {
+                                evidence,
+                                error,
+                            },
+                        }
+                    })?;
+                }
+                "provider" => {
+                    let provider_refresh_allowed =
+                        execution.provider_auth_evidence.is_some_and(|outcome| {
+                            !matches!(
+                                outcome.0,
+                                satelle_core::ProviderAuthValidationOutcome::MissingDescriptor
+                                    | satelle_core::ProviderAuthValidationOutcome::UnsupportedDescriptorKind
+                            )
+                        });
+                    if !should_resolve_provider || !options.refresh() {
+                        registry.spawn(request_id, &probe, move |_context| {
+                            ProductionDoctorTaskResult {
+                                completion: probe_completion(false),
+                                effect: ProductionDoctorTaskEffect::None,
+                            }
+                        })?;
+                    } else if !provider_refresh_allowed {
+                        registry.spawn(request_id, &probe, move |_context| {
+                            ProductionDoctorTaskResult {
+                                completion: probe_completion(true),
+                                effect: ProductionDoctorTaskEffect::None,
+                            }
+                        })?;
+                    } else if !provider_probe_required {
+                        registry.spawn(request_id, &probe, move |_context| {
+                            ProductionDoctorTaskResult {
+                                completion: probe_completion(false),
+                                effect: ProductionDoctorTaskEffect::ProviderNotRequired,
+                            }
+                        })?;
+                    } else {
+                        let native_evidence = execution
+                            .native_refresh
+                            .as_ref()
+                            .and_then(|(refresh, _, _)| refresh.as_ref().ok())
+                            .cloned();
+                        let Some(native_evidence) = native_evidence else {
+                            registry.spawn(request_id, &probe, move |_context| {
+                                ProductionDoctorTaskResult {
+                                    completion: DoctorProbeCompletion::new(
+                                        DoctorProbeStatus::Failed,
+                                        DoctorDependentEvidence::NotUseful,
+                                    ),
+                                    effect: ProductionDoctorTaskEffect::None,
+                                }
+                            })?;
+                            continue;
+                        };
+                        let runtime = service.runtime.clone();
+                        let host = host.to_string();
+                        let provider_intent = provider_intent.clone();
+                        registry.spawn(request_id, &probe, move |context| {
+                            let started_at = utc_now();
+                            let started = Instant::now();
+                            let refresh =
+                                with_doctor_probe_cancellation(&context, |cancellation| {
+                                    runtime.refresh_setup_provider_readiness_with_cancellation(
+                                        &host,
+                                        &provider_intent,
+                                        native_evidence,
+                                        cancellation,
+                                    )
+                                });
+                            let observed_auth = match &refresh {
+                                Ok(readiness) if readiness.provider_smoke_evidence().is_some() => {
+                                    Some((
+                                        satelle_core::ProviderAuthValidationOutcome::Resolved,
+                                        satelle_core::ProviderAuthObservationSource::Live,
+                                    ))
+                                }
+                                Err(error) => {
+                                    provider_validation_outcome_for_error(error).map(|outcome| {
+                                        (outcome, satelle_core::ProviderAuthObservationSource::Live)
+                                    })
+                                }
+                                Ok(_) => None,
+                            };
+                            ProductionDoctorTaskResult {
+                                completion: result_probe_completion(&refresh),
+                                effect: ProductionDoctorTaskEffect::ProviderRefresh {
+                                    refresh: Box::new(refresh),
+                                    started_at,
+                                    duration: started.elapsed(),
+                                    observed_auth,
+                                },
+                            }
+                        })?;
                     }
-                    Ok(ProviderBindingResolution::MissingDescriptor { .. }) => {
-                        execution
-                            .lock()
-                            .unwrap_or_else(std::sync::PoisonError::into_inner)
-                            .provider_auth_evidence = Some((
-                            satelle_core::ProviderAuthValidationOutcome::MissingDescriptor,
-                            satelle_core::ProviderAuthObservationSource::Deferred,
-                        ));
-                        probe_completion(true)
-                    }
-                    Err(error) => {
-                        execution
-                            .lock()
-                            .unwrap_or_else(std::sync::PoisonError::into_inner)
-                            .fatal_error = Some(error.clone());
-                        error_probe_completion(&error)
-                    }
                 }
+                "transport" => {
+                    let transport_probe = Arc::clone(&transport_probe);
+                    registry.spawn(request_id, &probe, move |context| {
+                        let started_at = utc_now();
+                        let started = Instant::now();
+                        let outcome = transport_probe.execute(&context);
+                        let finished_at = utc_now();
+                        let duration = started.elapsed();
+                        ProductionDoctorTaskResult {
+                            completion: outcome.completion(),
+                            effect: ProductionDoctorTaskEffect::Transport {
+                                outcome,
+                                started_at,
+                                finished_at,
+                                duration,
+                            },
+                        }
+                    })?;
+                }
+                "config" => {
+                    registry.spawn(request_id, &probe, move |_context| {
+                        ProductionDoctorTaskResult {
+                            completion: probe_completion(false),
+                            effect: ProductionDoctorTaskEffect::None,
+                        }
+                    })?;
+                }
+                unknown => panic!("unknown production Doctor probe {unknown}"),
             }
-            "provider" => {
-                if !should_resolve_provider || !options.refresh() {
-                    return probe_completion(false);
-                }
-                let provider_refresh_allowed = execution
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .provider_auth_evidence
-                    .is_some_and(|outcome| {
-                        !matches!(
-                            outcome.0,
-                            satelle_core::ProviderAuthValidationOutcome::MissingDescriptor
-                                | satelle_core::ProviderAuthValidationOutcome::UnsupportedDescriptorKind
-                        )
-                    });
-                if !provider_refresh_allowed {
-                    return probe_completion(true);
-                }
-                if !provider_probe_required {
-                    execution
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner)
-                        .provider_not_required = true;
-                    return probe_completion(false);
-                }
-
-                let native_evidence = execution
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .native_refresh
-                    .as_ref()
-                    .and_then(|(refresh, _, _)| refresh.as_ref().ok())
-                    .cloned();
-                let Some(native_evidence) = native_evidence else {
-                    return DoctorProbeCompletion::new(
-                        DoctorProbeStatus::Failed,
-                        DoctorDependentEvidence::NotUseful,
-                    );
-                };
-                let started_at = utc_now();
-                let started = Instant::now();
-                let refresh = with_doctor_probe_cancellation(context, |cancellation| {
-                    service
-                        .runtime
-                        .refresh_setup_provider_readiness_with_cancellation(
-                            host,
-                            provider_intent,
-                            native_evidence,
-                            cancellation,
-                        )
-                });
-                let completion = result_probe_completion(&refresh);
-                let observed = match &refresh {
-                    Ok(readiness) if readiness.provider_smoke_evidence().is_some() => Some((
-                        satelle_core::ProviderAuthValidationOutcome::Resolved,
-                        satelle_core::ProviderAuthObservationSource::Live,
-                    )),
-                    Err(error) => provider_validation_outcome_for_error(error).map(|outcome| {
-                        (
-                            outcome,
-                            satelle_core::ProviderAuthObservationSource::Live,
-                        )
-                    }),
-                    Ok(_) => None,
-                };
-                let mut execution = execution
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                if let Some(observed) = observed {
-                    execution.provider_auth_evidence = Some(observed);
-                }
-                execution.provider_refresh = Some((refresh, started_at, started.elapsed()));
-                completion
-            }
-            "transport" => {
-                let started_at = utc_now();
-                let started = Instant::now();
-                let outcome = transport_probe.execute(context);
-                let finished_at = utc_now();
-                let duration = started.elapsed();
-                let completion = outcome.completion();
-                execution
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .transport = Some((outcome, started_at, finished_at, duration));
-                completion
-            }
-            "config" => probe_completion(false),
-            unknown => panic!("unknown production Doctor probe {unknown}"),
         }
-    });
+        drop(scheduling);
 
-    let mut execution = execution
-        .into_inner()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !progressed {
+            let pending_deadline = pending_deadlines
+                .iter()
+                .filter(|(probe_id, _)| {
+                    matches!(scheduler.state(probe_id), Some(DoctorProbeState::Pending))
+                })
+                .map(|(_, deadline)| *deadline)
+                .min();
+            let next = registry
+                .next_transition()
+                .into_iter()
+                .chain(pending_deadline)
+                .min()
+                .unwrap_or_else(|| Instant::now() + Duration::from_millis(10));
+            registry.wait_until(next);
+        }
+    }
+
     if let Some(error) = execution.fatal_error {
-        // The scheduler has already joined every independent probe before an
-        // error can leave the production Doctor path.
+        // Every independent probe has reached a reportable terminal state.
+        // A timed-out operation may still be retained for cleanup.
         return Err(error);
     }
     let (snapshot, snapshot_was_refreshed) =
@@ -3338,6 +3956,17 @@ fn phase0_probe_completion(blockers: &[Phase0CapabilityBlocker]) -> DoctorProbeC
         DoctorDependentEvidence::Useful
     };
     DoctorProbeCompletion::new(status, dependent_evidence)
+}
+
+fn phase0_snapshot_completion(snapshot: &ProductionCapabilitySnapshot) -> DoctorProbeCompletion {
+    if snapshot.budget_failure.is_some() {
+        DoctorProbeCompletion::new(
+            DoctorProbeStatus::TimedOut,
+            DoctorDependentEvidence::NotUseful,
+        )
+    } else {
+        phase0_probe_completion(snapshot.verdict.blockers())
+    }
 }
 
 fn with_doctor_probe_cancellation<T>(
@@ -4404,6 +5033,19 @@ mod packet17_doctor_tests {
     }
 
     #[test]
+    fn phase0_budget_failure_is_a_typed_probe_timeout() {
+        let snapshot = ProductionCapabilitySnapshot::collect(Some(Duration::ZERO));
+
+        assert_eq!(
+            phase0_snapshot_completion(&snapshot),
+            DoctorProbeCompletion::new(
+                DoctorProbeStatus::TimedOut,
+                DoctorDependentEvidence::NotUseful,
+            )
+        );
+    }
+
+    #[test]
     fn serial_option_and_zero_timeout_cross_the_typed_scheduler_boundary() {
         let selection = DoctorScopeSelection::parse(&[]).expect("default scope is valid");
         let probes = production_doctor_probes(selection.scopes(), None);
@@ -4417,85 +5059,6 @@ mod packet17_doctor_tests {
         let error = production_doctor_scheduler(zero_timeout_probes, DoctorOptions::default())
             .expect_err("zero timeout must be rejected");
         assert!(error.message.contains("timeout must be greater than zero"));
-    }
-
-    #[test]
-    fn scheduler_cancellation_reaches_live_probe_cancellation() {
-        let mut scheduler = DoctorProbeScheduler::new(vec![DoctorProbe {
-            probe_id: "native".to_string(),
-            scope: "computer-use".to_string(),
-            dependencies: Vec::new(),
-            resource_locks: Default::default(),
-            timeout: Duration::from_millis(5),
-            cache_policy: DoctorProbeCachePolicy::Never,
-        }])
-        .expect("valid scheduler");
-
-        let records = scheduler.execute(|_, context| {
-            with_doctor_probe_cancellation(context, |cancellation| {
-                assert_eq!(cancellation.deadline(), Some(context.deadline()));
-                while !cancellation.is_requested() {
-                    std::thread::yield_now();
-                }
-                probe_completion(false)
-            })
-        });
-
-        assert_eq!(records[0].status, DoctorProbeStatus::TimedOut);
-    }
-
-    #[test]
-    fn scheduler_timeout_remains_authoritative_after_refresh_projection() {
-        let mut scheduler = DoctorProbeScheduler::new(vec![DoctorProbe {
-            probe_id: "provider".to_string(),
-            scope: "provider".to_string(),
-            dependencies: Vec::new(),
-            resource_locks: Default::default(),
-            timeout: Duration::from_millis(1),
-            cache_policy: DoctorProbeCachePolicy::Never,
-        }])
-        .expect("valid scheduler");
-        let records = scheduler.execute(|_, context| {
-            while !context.is_cancelled() {
-                std::thread::yield_now();
-            }
-            probe_completion(false)
-        });
-        let timestamp = "2026-07-28T00:00:00Z".to_string();
-        let mut report = DoctorReport {
-            schema_version: DoctorSchemaVersion::V1,
-            status: "ready".to_string(),
-            target: LOCAL_DEMO_HOST.to_string(),
-            host: LOCAL_DEMO_HOST.to_string(),
-            scopes: vec!["provider".to_string()],
-            started_at: timestamp.clone(),
-            finished_at: timestamp.clone(),
-            duration_ms: 0,
-            summary: DoctorSummary {
-                ready: true,
-                blocking_findings: 0,
-                repairable_findings: 0,
-                informational_findings: 0,
-            },
-            probe_results: Vec::new(),
-            ready: true,
-            findings: Vec::new(),
-            recovery_commands: Vec::new(),
-            changed: false,
-            cache_updates: Vec::new(),
-        };
-        apply_provider_refresh(
-            &mut report,
-            &Err(SatelleError::computer_use_not_ready()),
-            timestamp.clone(),
-            Duration::ZERO,
-        );
-
-        apply_production_execution_status(&mut report, &scheduler, &records, &timestamp);
-
-        assert_eq!(report.probe_results.len(), 1);
-        assert_eq!(report.probe_results[0].status, "timed_out");
-        assert!(!report.summary.ready);
     }
 
     #[test]
@@ -4535,57 +5098,139 @@ mod packet17_doctor_tests {
 
 #[cfg(test)]
 #[test]
-fn host_scheduler_invokes_controller_transport_probe_and_continues_independent_work() {
-    use std::sync::atomic::{AtomicUsize, Ordering};
+fn doctor_registry_retains_timed_out_capacity_and_lock_until_cleanup_ack() {
+    use std::sync::mpsc;
 
-    struct TimedOutTransportProbe<'a>(&'a AtomicUsize);
+    let registry = DoctorTaskRegistry::new();
+    let request_id = registry.begin_request();
+    let definition = DoctorProbe {
+        probe_id: "provider".to_string(),
+        scope: DoctorScope::Provider.as_str().to_string(),
+        dependencies: Vec::new(),
+        resource_locks: [DoctorProbeResource::ProviderProbeSurface]
+            .into_iter()
+            .collect(),
+        timeout: Duration::from_millis(100),
+        cache_policy: DoctorProbeCachePolicy::Never,
+    };
+    let (started_tx, started_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel();
+    registry
+        .spawn(request_id, &definition, move |context| {
+            started_tx.send(()).expect("signal worker start");
+            release_rx.recv().expect("release cleanup-only worker");
+            assert!(context.is_cancelled());
+            ProductionDoctorTaskResult {
+                completion: DoctorProbeCompletion::new(
+                    DoctorProbeStatus::Passed,
+                    DoctorDependentEvidence::Useful,
+                ),
+                effect: ProductionDoctorTaskEffect::ProviderNotRequired,
+            }
+        })
+        .expect("spawn registry worker");
+    started_rx.recv().expect("worker started");
 
-    impl ControllerTransportProbe for TimedOutTransportProbe<'_> {
-        fn execute(
-            &self,
-            _context: &satelle_core::doctor::DoctorProbeExecutionContext,
-        ) -> ControllerTransportProbeOutcome {
-            self.0.fetch_add(1, Ordering::AcqRel);
-            ControllerTransportProbeOutcome::TimedOut(DoctorTransportObservation::blocked(
-                DoctorFinding {
-                    finding_id: "transport_timeout".to_string(),
-                    scope: DoctorScope::Transport.as_str().to_string(),
-                    severity: "error".to_string(),
-                    fixability: DoctorFixability::Blocked,
-                    readiness_impact: "blocked".to_string(),
-                    summary: "transport timed out".to_string(),
-                    evidence: Vec::new(),
-                    recovery_command: None,
-                },
-            ))
-        }
-    }
+    registry.advance(Instant::now() + definition.timeout);
+    assert!(matches!(
+        registry.drain_events(request_id).as_slice(),
+        [DoctorRegistryEvent::TimedOut { probe_id }] if probe_id == "provider"
+    ));
 
-    let calls = AtomicUsize::new(0);
-    let transport = TimedOutTransportProbe(&calls);
-    let probes = production_doctor_probes(
-        &[DoctorScope::Transport, DoctorScope::Config],
-        Some(std::time::Duration::from_secs(1)),
+    let later_request_id = registry.begin_request();
+    let (capacity, locks) = registry.external_occupancy(later_request_id);
+    assert_eq!(capacity, 1);
+    assert!(locks.contains(&DoctorProbeResource::ProviderProbeSurface));
+
+    let mut same_lock =
+        DoctorProbeScheduler::new(vec![definition.clone()]).expect("same-lock graph is valid");
+    assert!(
+        same_lock
+            .start_ready_with_external_occupancy(capacity, &locks)
+            .is_empty()
     );
-    let mut scheduler =
-        DoctorProbeScheduler::new(probes).expect("transport and config probes form a valid graph");
-    let records = scheduler.execute(|probe, context| {
-        if probe.scope == DoctorScope::Transport.as_str() {
-            transport.execute(context).completion()
-        } else {
-            DoctorProbeCompletion::new(DoctorProbeStatus::Passed, DoctorDependentEvidence::Useful)
-        }
-    });
 
-    assert_eq!(calls.load(Ordering::Acquire), 1);
-    assert!(records.iter().any(|record| {
-        record.probe_id == DoctorScope::Transport.as_str()
-            && record.status == DoctorProbeStatus::TimedOut
-    }));
-    assert!(records.iter().any(|record| {
-        record.probe_id == DoctorScope::Config.as_str()
-            && record.status == DoctorProbeStatus::Passed
-    }));
+    let mut disjoint = DoctorProbeScheduler::new(vec![DoctorProbe {
+        probe_id: "config".to_string(),
+        scope: DoctorScope::Config.as_str().to_string(),
+        dependencies: Vec::new(),
+        resource_locks: Default::default(),
+        timeout: Duration::from_millis(100),
+        cache_policy: DoctorProbeCachePolicy::Never,
+    }])
+    .expect("disjoint graph is valid");
+    assert_eq!(
+        disjoint
+            .start_ready_with_external_occupancy(capacity, &locks)
+            .len(),
+        1
+    );
+
+    release_tx.send(()).expect("release worker");
+    loop {
+        registry.advance(Instant::now());
+        if registry.external_occupancy(later_request_id).0 == 0 {
+            break;
+        }
+        registry.wait_until(Instant::now() + Duration::from_millis(10));
+    }
+    assert!(
+        registry.drain_events(request_id).is_empty(),
+        "late success and effect must be discarded"
+    );
+}
+
+#[cfg(test)]
+#[test]
+fn doctor_registry_shutdown_cancels_without_waiting_for_owned_worker() {
+    use std::sync::mpsc;
+
+    let registry = DoctorTaskRegistry::new();
+    let request_id = registry.begin_request();
+    let definition = DoctorProbe {
+        probe_id: "native".to_string(),
+        scope: DoctorScope::ComputerUse.as_str().to_string(),
+        dependencies: Vec::new(),
+        resource_locks: Default::default(),
+        timeout: Duration::from_secs(1),
+        cache_policy: DoctorProbeCachePolicy::Never,
+    };
+    let (started_tx, started_rx) = mpsc::channel();
+    let (cancelled_tx, cancelled_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel();
+    registry
+        .spawn(request_id, &definition, move |context| {
+            started_tx.send(()).expect("signal worker start");
+            while !context.is_cancelled() {
+                std::thread::yield_now();
+            }
+            cancelled_tx.send(()).expect("signal cancellation");
+            release_rx.recv().expect("release cancelled worker");
+            ProductionDoctorTaskResult {
+                completion: DoctorProbeCompletion::new(
+                    DoctorProbeStatus::TimedOut,
+                    DoctorDependentEvidence::NotUseful,
+                ),
+                effect: ProductionDoctorTaskEffect::None,
+            }
+        })
+        .expect("spawn registry worker");
+    started_rx.recv().expect("worker started");
+
+    let (dropped_tx, dropped_rx) = mpsc::channel();
+    let dropper = std::thread::spawn(move || {
+        drop(registry);
+        dropped_tx.send(()).expect("signal registry drop");
+    });
+    dropped_rx
+        .recv_timeout(Duration::from_secs(1))
+        .expect("registry shutdown must not join an uncooperative worker");
+
+    cancelled_rx
+        .recv_timeout(Duration::from_secs(1))
+        .expect("registry shutdown requested worker cancellation");
+    release_tx.send(()).expect("release detached worker");
+    dropper.join().expect("join registry drop proof");
 }
 
 #[cfg(test)]

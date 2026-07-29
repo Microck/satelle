@@ -44,9 +44,9 @@
 - a Satelle Setup Component is a named onboarding responsibility that setup can plan, report, and selectively target without changing the default setup contract @mvp @implemented
 - a Satelle Trusted Profile is a user-level profile explicitly allowed by the local OS user to supply noninteractive mutation consent for configured command families and Host Aliases @spec @mvp
 - a Satelle Mutation Command Family is a stable consent scope grouping one mutating command workflow independently from exact CLI subcommand spelling @spec @mvp
-- a Satelle Doctor Finding is a diagnostic result with a scope, severity, fixability, readiness impact, summary, evidence, and optional recovery command @spec @mvp
-- a Satelle Doctor Probe is an individual diagnostic check with a stable probe id, scope, dependencies, resource locks, timeout, and cache policy @spec @mvp
-- a Satelle Doctor Event is a diagnostic-stream record with its own versioned schema and is distinct from a lifecycle Satelle Event @spec @mvp
+- a Satelle Doctor Finding is a diagnostic result with a scope, severity, fixability, readiness impact, summary, evidence, and optional recovery command @mvp @implemented
+- a Satelle Doctor Probe is an individual diagnostic check with a stable probe id, scope, dependencies, resource locks, timeout, and cache policy @mvp @implemented
+- a Satelle Doctor Event is a diagnostic-stream record with its own versioned schema and is distinct from a lifecycle Satelle Event @mvp @implemented
 - a Satelle Log Entry is a normalized redacted Host Daemon-owned diagnostic record with timestamp, source, severity, Host, optional Session id, message, structured fields, and redaction metadata @spec @mvp
 - a Satelle Log Cursor is an opaque durable position used to resume normalized log delivery without acting as a Satelle Event replay cursor @mvp @implemented
 - a Satelle Operator Log File is a rotating plain-text mirror of redacted Satelle Log Entries for local inspection on the remote Host, not an authoritative store @spec @mvp
@@ -680,21 +680,21 @@
 - a macOS Host Daemon reports a compatible console session only when /dev/console is owned by the daemon OS user, using native selector macos:console-uid:<decimal-user-id> and portable active and console selectors @contract @mvp @implemented
 
 ## doctor-and-diagnostics
-- satelle treats Codex thread goals as lifecycle metadata for objective, status, budget, and usage tracking, not as a replacement for thread and turn control @spec @mvp
+- satelle treats Codex thread goals as lifecycle metadata for objective, status, budget, and usage tracking, not as a replacement for thread and turn control @mvp @implemented
 - satelle exposes one top-level doctor command for selected-host diagnostics @implemented @mvp
 - satelle doctor supports repeatable --scope <transport|codex|computer-use|provider|config|all> for selected-host diagnostics @spec @mvp @implemented
-- satelle doctor defaults to scope all when no --scope is provided, so doctor --refresh without an explicit scope refreshes both computer-use and provider probes @spec @mvp
-- satelle doctor reports a typed scope-selection-conflict usage error when --scope all is combined with another scope @spec @mvp
+- satelle doctor defaults to scope all when no --scope is provided, so doctor --refresh without an explicit scope refreshes both computer-use and provider probes @mvp @implemented
+- satelle doctor reports a typed scope-selection-conflict usage error when --scope all is combined with another scope @mvp @implemented
 - satelle doctor reports Satelle Doctor Findings with stable fixability values repairable, manual_action_required, blocked, and informational @implemented @mvp
 - satelle doctor exit status is based on whether selected diagnostics prove the checked target is ready, not on whether findings are repairable @implemented @mvp
 - satelle doctor exits 0 when all selected diagnostics pass or produce only informational findings that do not block Satelle prompt execution @implemented @mvp
-- satelle doctor exits with the host readiness failure class when selected diagnostics complete and report any readiness-blocking finding, including repairable findings @spec @mvp
-- satelle doctor reports a typed doctor-readiness-blockers-found error when diagnostics complete but readiness-blocking findings remain @spec @mvp
+- satelle doctor exits with the host readiness failure class when selected diagnostics complete and report any readiness-blocking finding, including repairable findings @mvp @implemented
+- satelle doctor reports a typed doctor-readiness-blockers-found error when diagnostics complete but readiness-blocking findings remain @mvp @implemented
 - satelle doctor exits with the usage error, configuration error, unreachable host, or internal error class when the diagnostic command cannot complete because of that broader failure class @implemented @mvp
 - satelle doctor --json emits one final JSON object after selected diagnostics and any accepted fix flow finish @implemented @mvp
 - satelle doctor --json does not emit newline-delimited JSON progress events or multiple top-level JSON values @implemented @mvp
 - satelle doctor --json final object includes schema_version, status, target, scopes, started_at, finished_at, duration_ms, summary, probe_results, findings, recovery_commands, changed, and cache_updates fields @implemented @mvp
-- satelle doctor --json final object includes fix_flow fields only when an interactive fix flow was accepted or an explicit repair path was invoked through doctor @spec @mvp
+- satelle doctor --json final object includes fix_flow fields only when an interactive fix flow was accepted or an explicit repair path was invoked through doctor @mvp @implemented
 - satelle doctor --events is an explicit diagnostic event streaming output mode for agents and shell pipelines @implemented @mvp
 - satelle doctor --events is mutually exclusive with --json and every explicit --format value and reports a typed output-mode-conflict usage error for either combination @implemented @mvp
 - satelle doctor --events preserves the satelle doctor --json contract by never making --json emit newline-delimited events, progress objects, or multiple top-level JSON values @implemented @mvp
@@ -709,20 +709,20 @@
 - satelle doctor --events emits exactly one terminal event with event_type doctor_finished or doctor_failed before the process exits unless the process is interrupted or crashes @implemented @mvp
 - satelle doctor --events doctor_finished data contains the same final doctor result object shape that satelle doctor --json would emit for the same completed diagnostic run @implemented @mvp
 - satelle doctor --events doctor_failed data contains the typed Satelle error code, exit code class, partial probe results when available, and recovery commands when available @implemented @mvp
-- doctor --events failures detected before doctor_started use the global machine-error contract on stderr and leave stdout empty @spec @contract @mvp
-- after doctor_started, doctor --events emits exactly one doctor_failed terminal record on stdout for any handled failure and does not emit a second machine-readable error object on stderr @spec @contract @mvp
+- doctor --events failures detected before doctor_started use the global machine-error contract on stderr and leave stdout empty @contract @mvp @implemented
+- after doctor_started, doctor --events emits exactly one doctor_failed terminal record on stdout for any handled failure and does not emit a second machine-readable error object on stderr @contract @mvp @implemented
 - satelle doctor --events exits with the same exit code class as the equivalent non-events doctor invocation @implemented @mvp
-- satelle doctor --events compatibility policy freezes v1 event field names, terminal event semantics, and enum token meanings until a new schema_version such as satelle.doctor.events.v2 is introduced @spec @mvp
-- satelle doctor schedules Satelle Doctor Probes with an explicit dependency graph instead of relying on textual output order @spec @mvp
-- satelle doctor runs independent Satelle Doctor Probes concurrently by default with bounded per-host concurrency @spec @mvp
-- satelle doctor default probe concurrency is at most 4 probes per target host @spec @mvp
-- satelle doctor never starts a dependent probe before its prerequisite probes complete @spec @mvp
-- satelle doctor skips a dependent probe when a prerequisite proves the dependent probe cannot produce useful new evidence @spec @mvp
-- satelle doctor continues running independent probes after another probe reports a finding, fails, times out, or is skipped @spec @mvp
-- satelle doctor serializes probes that share native Computer Use, visible desktop control, a provider probe surface, readiness-cache writes, or the same remote service-manager resource @spec @mvp
-- satelle doctor applies per-probe timeouts and reports timed_out probe results without cancelling unrelated independent probes @spec @mvp
+- satelle doctor --events compatibility policy freezes v1 event field names, terminal event semantics, and enum token meanings until a new schema_version such as satelle.doctor.events.v2 is introduced @mvp @implemented
+- satelle doctor schedules Satelle Doctor Probes with an explicit dependency graph instead of relying on textual output order @mvp @implemented
+- satelle doctor runs independent Satelle Doctor Probes concurrently by default with bounded per-host concurrency @mvp @implemented
+- satelle doctor default probe concurrency is at most 4 probes per target host @mvp @implemented
+- satelle doctor never starts a dependent probe before its prerequisite probes complete @mvp @implemented
+- satelle doctor skips a dependent probe when a prerequisite proves the dependent probe cannot produce useful new evidence @mvp @implemented
+- satelle doctor continues running independent probes after another probe reports a finding, fails, times out, or is skipped @mvp @implemented
+- satelle doctor serializes probes that share native Computer Use, visible desktop control, a provider probe surface, readiness-cache writes, or the same remote service-manager resource @mvp @implemented
+- satelle doctor applies per-probe timeouts and reports timed_out probe results without cancelling unrelated independent probes @mvp @implemented
 - satelle doctor final human and JSON output orders probe results by scope and stable probe id instead of probe completion order @implemented @mvp
-- satelle doctor may show transient TTY progress in completion order while preserving deterministic final output order @spec @mvp
+- satelle doctor may show transient TTY progress in completion order while preserving deterministic final output order @mvp @implemented
 - satelle doctor --json probe_results entries include probe_id, scope, status, started_at, finished_at, duration_ms, cache_status, dependency_status, and finding_ids fields @implemented @mvp
 - satelle doctor supports --serial-probes to run at most one probe at a time for debugging and reproducible diagnostic runs @implemented @mvp
 - satelle doctor MVP does not expose a general probe concurrency tuning flag because --serial-probes is the only user-facing probe scheduling override @implemented @mvp
@@ -2136,7 +2136,7 @@
 - satelle detects when native Codex Computer Use is unavailable on a configured remote host and reports the missing capability to the user @mvp @implemented
 - satelle offers assisted installation for missing Codex or native Codex Computer Use prerequisites but requires explicit user confirmation before running remote install commands @mvp @implemented
 - satelle run, steer, and status do not install Codex, Computer Use plugins, OS permissions, or app approvals as side effects @implemented @mvp
-- satelle doctor reports missing Codex runtime, Computer Use plugin, OS permissions, app approvals, authentication, unsupported operating system, and unsupported region as separate readiness blockers when those blockers can be detected @spec @mvp
+- satelle doctor reports missing Codex runtime, Computer Use plugin, OS permissions, app approvals, authentication, unsupported operating system, and unsupported region as separate readiness blockers when those blockers can be detected @mvp @implemented
 - satelle provides an explicit host setup or repair command for guided Codex and native Computer Use prerequisite setup on supported hosts @mvp @implemented
 - satelle setup in an interactive terminal is an applying onboarding flow by default instead of a preview-only command @mvp @implemented
 - satelle setup presents planned remote install, update, and configuration actions before mutating the remote host @mvp @implemented

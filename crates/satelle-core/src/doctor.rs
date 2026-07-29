@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, mpsc};
 use std::time::{Duration, Instant};
 
 use thiserror::Error;
@@ -255,6 +255,136 @@ pub struct DoctorProbeScheduler {
     completion_order: Vec<String>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DoctorProbeLifecyclePhase {
+    Running,
+    Cancelling,
+    Terminal,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DoctorProbeLifecycleEvent {
+    Running,
+    BeginCancellation,
+    TerminalAck(DoctorProbeCompletion),
+}
+
+/// Core-owned timing state for one concrete Doctor operation.
+///
+/// The lifecycle never calls caller-provided behavior. Host and CLI own their
+/// resources and feed only nonblocking terminal observations into `poll`.
+#[derive(Clone, Debug)]
+pub struct DoctorProbeLifecycle {
+    probe_id: String,
+    deadline: Instant,
+    cancel_at: Instant,
+    context: DoctorProbeExecutionContext,
+    phase: DoctorProbeLifecyclePhase,
+}
+
+#[derive(Debug, Error, Eq, PartialEq)]
+pub enum DoctorProbeExecutionError {
+    #[error("Doctor probe {probe_id} timeout cannot be represented as an absolute deadline")]
+    DeadlineOverflow { probe_id: String },
+    #[error("Doctor probe {probe_id} did not acknowledge terminal cleanup by its deadline")]
+    CleanupDeadlineMissed { probe_id: String },
+}
+
+impl DoctorProbeLifecycle {
+    pub fn start(
+        probe_id: impl Into<String>,
+        started_at: Instant,
+        timeout: Duration,
+        cleanup_reserve: Duration,
+    ) -> Result<Self, DoctorProbeExecutionError> {
+        let probe_id = probe_id.into();
+        let deadline = started_at.checked_add(timeout).ok_or_else(|| {
+            DoctorProbeExecutionError::DeadlineOverflow {
+                probe_id: probe_id.clone(),
+            }
+        })?;
+        let cleanup_reserve = cleanup_reserve.min(timeout);
+        let cancel_at = deadline
+            .checked_sub(cleanup_reserve)
+            .expect("a reserve clamped to the timeout fits before its deadline");
+        let cancelled = Arc::new(AtomicBool::new(false));
+        Ok(Self {
+            probe_id,
+            deadline,
+            cancel_at,
+            context: DoctorProbeExecutionContext {
+                // Useful work ends at cancel_at. The remaining interval is
+                // reserved for task-owned cleanup before the hard deadline.
+                deadline: cancel_at,
+                cancelled,
+            },
+            phase: DoctorProbeLifecyclePhase::Running,
+        })
+    }
+
+    pub fn context(&self) -> DoctorProbeExecutionContext {
+        self.context.clone()
+    }
+
+    pub fn cancel_at(&self) -> Instant {
+        self.cancel_at
+    }
+
+    pub fn deadline(&self) -> Instant {
+        self.deadline
+    }
+
+    pub fn request_cancellation(&mut self) {
+        if self.phase == DoctorProbeLifecyclePhase::Running {
+            self.phase = DoctorProbeLifecyclePhase::Cancelling;
+            self.context.cancelled.store(true, Ordering::Release);
+        }
+    }
+
+    pub fn poll(
+        &mut self,
+        now: Instant,
+        terminal_ack: Option<(Instant, DoctorProbeCompletion)>,
+    ) -> Result<DoctorProbeLifecycleEvent, DoctorProbeExecutionError> {
+        if let Some((completed_at, completion)) = terminal_ack {
+            let completion = if completed_at >= self.cancel_at {
+                DoctorProbeCompletion::new(
+                    DoctorProbeStatus::TimedOut,
+                    DoctorDependentEvidence::NotUseful,
+                )
+            } else {
+                completion
+            };
+            self.phase = DoctorProbeLifecyclePhase::Terminal;
+            return Ok(DoctorProbeLifecycleEvent::TerminalAck(completion));
+        }
+
+        match self.phase {
+            DoctorProbeLifecyclePhase::Running if now >= self.deadline => {
+                self.phase = DoctorProbeLifecyclePhase::Cancelling;
+                self.context.cancelled.store(true, Ordering::Release);
+                Err(DoctorProbeExecutionError::CleanupDeadlineMissed {
+                    probe_id: self.probe_id.clone(),
+                })
+            }
+            DoctorProbeLifecyclePhase::Running if now >= self.cancel_at => {
+                self.phase = DoctorProbeLifecyclePhase::Cancelling;
+                self.context.cancelled.store(true, Ordering::Release);
+                Ok(DoctorProbeLifecycleEvent::BeginCancellation)
+            }
+            DoctorProbeLifecyclePhase::Cancelling if now >= self.deadline => {
+                Err(DoctorProbeExecutionError::CleanupDeadlineMissed {
+                    probe_id: self.probe_id.clone(),
+                })
+            }
+            DoctorProbeLifecyclePhase::Running | DoctorProbeLifecyclePhase::Cancelling => {
+                Ok(DoctorProbeLifecycleEvent::Running)
+            }
+            DoctorProbeLifecyclePhase::Terminal => Ok(DoctorProbeLifecycleEvent::Running),
+        }
+    }
+}
+
 impl DoctorProbeScheduler {
     pub fn new(probes: Vec<DoctorProbe>) -> Result<Self, DoctorProbeScheduleError> {
         Self::with_concurrency(probes, DEFAULT_DOCTOR_PROBE_CONCURRENCY)
@@ -334,6 +464,14 @@ impl DoctorProbeScheduler {
     /// bound. The returned order is deterministic; callers may execute the
     /// returned probes concurrently and report completions in any order.
     pub fn start_ready(&mut self) -> Vec<DoctorProbe> {
+        self.start_ready_with_external_occupancy(0, &BTreeSet::new())
+    }
+
+    pub fn start_ready_with_external_occupancy(
+        &mut self,
+        external_capacity: usize,
+        external_resources: &BTreeSet<DoctorProbeResource>,
+    ) -> Vec<DoctorProbe> {
         self.propagate_dependency_skips();
 
         let running = self
@@ -341,17 +479,20 @@ impl DoctorProbeScheduler {
             .values()
             .filter(|probe| probe.state == DoctorProbeState::Running)
             .count();
-        let mut remaining_capacity = self.max_concurrency.saturating_sub(running);
+        let mut remaining_capacity = self
+            .max_concurrency
+            .saturating_sub(running.saturating_add(external_capacity));
         if remaining_capacity == 0 {
             return Vec::new();
         }
 
-        let mut occupied_resources = self
-            .probes
-            .values()
-            .filter(|probe| probe.state == DoctorProbeState::Running)
-            .flat_map(|probe| probe.definition.resource_locks.iter().copied())
-            .collect::<BTreeSet<_>>();
+        let mut occupied_resources = external_resources.clone();
+        occupied_resources.extend(
+            self.probes
+                .values()
+                .filter(|probe| probe.state == DoctorProbeState::Running)
+                .flat_map(|probe| probe.definition.resource_locks.iter().copied()),
+        );
 
         let mut candidates = self
             .probes
@@ -403,6 +544,25 @@ impl DoctorProbeScheduler {
         started
     }
 
+    pub fn timeout_pending(&mut self, probe_id: &str) -> Result<(), DoctorProbeScheduleError> {
+        let probe = self.probes.get_mut(probe_id).ok_or_else(|| {
+            DoctorProbeScheduleError::UnknownProbe {
+                probe_id: probe_id.to_string(),
+            }
+        })?;
+        if probe.state != DoctorProbeState::Pending {
+            return Err(DoctorProbeScheduleError::ProbeNotRunning {
+                probe_id: probe_id.to_string(),
+            });
+        }
+        probe.state = DoctorProbeState::Finished(DoctorProbeCompletion::new(
+            DoctorProbeStatus::TimedOut,
+            DoctorDependentEvidence::NotUseful,
+        ));
+        self.completion_order.push(probe_id.to_string());
+        Ok(())
+    }
+
     pub fn finish(
         &mut self,
         probe_id: &str,
@@ -421,144 +581,6 @@ impl DoctorProbeScheduler {
         probe.state = DoctorProbeState::Finished(completion);
         self.completion_order.push(probe_id.to_string());
         Ok(())
-    }
-
-    /// Executes ready probes on scoped threads while this scheduler remains
-    /// the sole owner of dependency, capacity, resource-lock, and completion
-    /// state. A timed-out probe keeps its locks until its operation observes
-    /// cancellation and returns.
-    pub fn execute<F>(&mut self, execute: F) -> Vec<DoctorProbeExecutionRecord>
-    where
-        F: Fn(&DoctorProbe, &DoctorProbeExecutionContext) -> DoctorProbeCompletion + Sync,
-    {
-        struct RunningProbe {
-            deadline: Instant,
-            cancelled: Arc<AtomicBool>,
-            timed_out: bool,
-        }
-
-        enum WorkerResult {
-            Completed {
-                probe_id: String,
-                completion: DoctorProbeCompletion,
-                completed_at: Instant,
-            },
-            Panicked {
-                probe_id: String,
-                payload: Box<dyn std::any::Any + Send>,
-            },
-        }
-
-        let mut records = Vec::new();
-        std::thread::scope(|scope| {
-            let (sender, receiver) = mpsc::channel::<WorkerResult>();
-            let mut running = BTreeMap::<String, RunningProbe>::new();
-
-            while !self.is_complete() {
-                for probe in self.start_ready() {
-                    let deadline = Instant::now() + probe.timeout;
-                    let cancelled = Arc::new(AtomicBool::new(false));
-                    let context = DoctorProbeExecutionContext {
-                        deadline,
-                        cancelled: Arc::clone(&cancelled),
-                    };
-                    let probe_id = probe.probe_id.clone();
-                    let sender = sender.clone();
-                    let execute = &execute;
-                    running.insert(
-                        probe_id.clone(),
-                        RunningProbe {
-                            deadline,
-                            cancelled,
-                            timed_out: false,
-                        },
-                    );
-                    scope.spawn(move || {
-                        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                            execute(&probe, &context)
-                        }));
-                        let result = match result {
-                            Ok(completion) => WorkerResult::Completed {
-                                probe_id,
-                                completion,
-                                completed_at: Instant::now(),
-                            },
-                            Err(payload) => WorkerResult::Panicked { probe_id, payload },
-                        };
-                        let _ = sender.send(result);
-                    });
-                }
-
-                // start_ready propagates dependency skips to a fixed point.
-                // That propagation can complete the graph without starting
-                // another probe, so recheck before requiring running work.
-                if self.is_complete() {
-                    break;
-                }
-                assert!(
-                    !running.is_empty(),
-                    "a valid incomplete Doctor graph always has running work"
-                );
-                let now = Instant::now();
-                let wait = running
-                    .values()
-                    .filter(|probe| !probe.timed_out)
-                    .map(|probe| probe.deadline.saturating_duration_since(now))
-                    .min();
-                let received = match wait {
-                    Some(wait) => receiver.recv_timeout(wait),
-                    None => receiver
-                        .recv()
-                        .map_err(|_| mpsc::RecvTimeoutError::Disconnected),
-                };
-
-                match received {
-                    Ok(WorkerResult::Completed {
-                        probe_id,
-                        completion,
-                        completed_at,
-                    }) => {
-                        let running_probe = running
-                            .remove(&probe_id)
-                            .expect("only running Doctor probes can complete");
-                        let timed_out =
-                            completion_missed_deadline(completed_at, running_probe.deadline);
-                        let final_completion = if timed_out {
-                            DoctorProbeCompletion::new(
-                                DoctorProbeStatus::TimedOut,
-                                DoctorDependentEvidence::NotUseful,
-                            )
-                        } else {
-                            completion
-                        };
-                        let status = final_completion.status;
-                        self.finish(&probe_id, final_completion)
-                            .expect("the completed Doctor probe is running");
-                        records.push(DoctorProbeExecutionRecord { probe_id, status });
-                    }
-                    Ok(WorkerResult::Panicked { probe_id, payload }) => {
-                        running.remove(&probe_id);
-                        for probe in running.values() {
-                            probe.cancelled.store(true, Ordering::Release);
-                        }
-                        std::panic::resume_unwind(payload);
-                    }
-                    Err(mpsc::RecvTimeoutError::Timeout) => {
-                        let now = Instant::now();
-                        for probe in running.values_mut() {
-                            if !probe.timed_out && now >= probe.deadline {
-                                probe.timed_out = true;
-                                probe.cancelled.store(true, Ordering::Release);
-                            }
-                        }
-                    }
-                    Err(mpsc::RecvTimeoutError::Disconnected) => {
-                        panic!("a Doctor probe exited without reporting completion");
-                    }
-                }
-            }
-        });
-        records
     }
 
     pub fn state(&self, probe_id: &str) -> Option<&DoctorProbeState> {
@@ -627,10 +649,6 @@ impl DoctorProbeScheduler {
             self.completion_order.push(probe_id);
         }
     }
-}
-
-fn completion_missed_deadline(completed_at: Instant, deadline: Instant) -> bool {
-    completed_at >= deadline
 }
 
 fn validate_acyclic(
@@ -953,123 +971,181 @@ mod tests {
     }
 
     #[test]
-    fn execution_owns_concurrency_locks_timeouts_and_failure_continuation() {
-        use std::sync::atomic::{AtomicUsize, Ordering};
-        use std::sync::{Condvar, Mutex};
-
-        let mut probes = vec![
-            probe("failed", "codex", &[], &[]),
-            probe("independent", "config", &[], &[]),
-            probe(
-                "locked-a",
-                "computer-use",
-                &[],
-                &[DoctorProbeResource::NativeComputerUse],
-            ),
-            probe(
-                "locked-b",
-                "computer-use",
-                &[],
-                &[DoctorProbeResource::NativeComputerUse],
-            ),
-            probe("timed-out", "provider", &[], &[]),
-            probe("dependent", "provider", &["failed"], &[]),
-        ];
-        for probe in &mut probes {
-            probe.timeout = if probe.probe_id == "timed-out" {
-                Duration::from_millis(10)
-            } else {
-                Duration::from_secs(1)
-            };
-        }
-        let mut scheduler = DoctorProbeScheduler::new(probes).expect("valid graph");
-        let active = AtomicUsize::new(0);
-        let maximum_active = AtomicUsize::new(0);
-        let native_lock_active = AtomicBool::new(false);
-        let independent_finished = AtomicBool::new(false);
-        let initial_frontier = Arc::new((Mutex::new(0_usize), Condvar::new()));
-        let expected_frontier = DEFAULT_DOCTOR_PROBE_CONCURRENCY;
-
-        let records = scheduler.execute(|probe, context| {
-            let active_now = active.fetch_add(1, Ordering::AcqRel) + 1;
-            maximum_active.fetch_max(active_now, Ordering::AcqRel);
-            let (arrived, released) = &*initial_frontier;
-            let mut arrived = arrived.lock().unwrap();
-            *arrived += 1;
-            released.notify_all();
-            let (arrived, timeout) = released
-                .wait_timeout_while(arrived, Duration::from_secs(5), |arrived| {
-                    *arrived < expected_frontier
-                })
-                .unwrap();
-            assert!(
-                *arrived >= expected_frontier,
-                "the scheduler did not dispatch the full independent frontier"
-            );
-            assert!(!timeout.timed_out());
-            drop(arrived);
-            let owns_native_lock = probe
-                .resource_locks
-                .contains(&DoctorProbeResource::NativeComputerUse);
-            if owns_native_lock {
-                assert!(
-                    !native_lock_active.swap(true, Ordering::AcqRel),
-                    "resource-sharing probes ran together"
-                );
-            }
-
-            let completion = match probe.probe_id.as_str() {
-                "failed" => DoctorProbeCompletion::new(
-                    DoctorProbeStatus::Failed,
-                    DoctorDependentEvidence::NotUseful,
-                ),
-                "timed-out" => {
-                    while !context.is_cancelled() {
-                        std::thread::sleep(Duration::from_millis(1));
-                    }
+    fn lifecycle_classifies_terminal_ack_by_worker_completion_time() {
+        let started = Instant::now();
+        let mut lifecycle = DoctorProbeLifecycle::start(
+            "probe",
+            started,
+            Duration::from_millis(10),
+            Duration::from_millis(4),
+        )
+        .expect("representable deadline");
+        let context = lifecycle.context();
+        let event = lifecycle
+            .poll(
+                started + Duration::from_millis(6),
+                Some((
+                    started + Duration::from_millis(5),
                     DoctorProbeCompletion::new(
                         DoctorProbeStatus::Passed,
                         DoctorDependentEvidence::Useful,
-                    )
-                }
-                "independent" => {
-                    independent_finished.store(true, Ordering::Release);
-                    DoctorProbeCompletion::new(
-                        DoctorProbeStatus::Passed,
-                        DoctorDependentEvidence::Useful,
-                    )
-                }
-                _ => DoctorProbeCompletion::new(
-                    DoctorProbeStatus::Passed,
-                    DoctorDependentEvidence::Useful,
-                ),
-            };
+                    ),
+                )),
+            )
+            .expect("terminal acknowledgment is accepted");
+        assert_eq!(
+            event,
+            DoctorProbeLifecycleEvent::TerminalAck(DoctorProbeCompletion::new(
+                DoctorProbeStatus::Passed,
+                DoctorDependentEvidence::Useful,
+            ))
+        );
+        assert!(!context.is_cancelled());
 
-            if owns_native_lock {
-                native_lock_active.store(false, Ordering::Release);
+        let mut delayed_publication = DoctorProbeLifecycle::start(
+            "delayed-publication",
+            started,
+            Duration::from_millis(10),
+            Duration::from_millis(4),
+        )
+        .expect("representable deadline");
+        assert_eq!(
+            delayed_publication
+                .poll(started + Duration::from_millis(6), None)
+                .expect("cancellation begins while publication waits"),
+            DoctorProbeLifecycleEvent::BeginCancellation
+        );
+        assert_eq!(
+            delayed_publication
+                .poll(
+                    started + Duration::from_millis(7),
+                    Some((
+                        started + Duration::from_millis(5),
+                        DoctorProbeCompletion::new(
+                            DoctorProbeStatus::Passed,
+                            DoctorDependentEvidence::Useful,
+                        ),
+                    )),
+                )
+                .expect("completion time outranks publication delay"),
+            DoctorProbeLifecycleEvent::TerminalAck(DoctorProbeCompletion::new(
+                DoctorProbeStatus::Passed,
+                DoctorDependentEvidence::Useful,
+            ))
+        );
+
+        let mut at_deadline = DoctorProbeLifecycle::start(
+            "at-deadline",
+            started,
+            Duration::from_millis(10),
+            Duration::from_millis(4),
+        )
+        .expect("representable deadline");
+        assert_eq!(
+            at_deadline
+                .poll(
+                    started + Duration::from_millis(6),
+                    Some((
+                        started + Duration::from_millis(6),
+                        DoctorProbeCompletion::new(
+                            DoctorProbeStatus::Passed,
+                            DoctorDependentEvidence::Useful,
+                        ),
+                    )),
+                )
+                .expect("deadline completion is a terminal acknowledgment"),
+            DoctorProbeLifecycleEvent::TerminalAck(DoctorProbeCompletion::new(
+                DoctorProbeStatus::TimedOut,
+                DoctorDependentEvidence::NotUseful,
+            ))
+        );
+    }
+
+    #[test]
+    fn lifecycle_cancellation_ack_releases_immediately_and_cleanup_miss_is_bounded() {
+        let started = Instant::now();
+        let mut acknowledged = DoctorProbeLifecycle::start(
+            "acknowledged",
+            started,
+            Duration::from_millis(10),
+            Duration::from_millis(4),
+        )
+        .expect("representable deadline");
+        let context = acknowledged.context();
+        assert_eq!(
+            acknowledged
+                .poll(started + Duration::from_millis(6), None)
+                .expect("cancellation begins"),
+            DoctorProbeLifecycleEvent::BeginCancellation
+        );
+        assert!(context.is_cancelled());
+        assert_eq!(
+            acknowledged
+                .poll(
+                    started + Duration::from_millis(7),
+                    Some((
+                        started + Duration::from_millis(7),
+                        DoctorProbeCompletion::new(
+                            DoctorProbeStatus::Passed,
+                            DoctorDependentEvidence::Useful,
+                        ),
+                    )),
+                )
+                .expect("acknowledgment releases immediately"),
+            DoctorProbeLifecycleEvent::TerminalAck(DoctorProbeCompletion::new(
+                DoctorProbeStatus::TimedOut,
+                DoctorDependentEvidence::NotUseful,
+            ))
+        );
+
+        let mut missed = DoctorProbeLifecycle::start(
+            "missed",
+            started,
+            Duration::from_millis(10),
+            Duration::from_millis(4),
+        )
+        .expect("representable deadline");
+        assert_eq!(
+            missed
+                .poll(started + Duration::from_millis(6), None)
+                .expect("cancellation begins"),
+            DoctorProbeLifecycleEvent::BeginCancellation
+        );
+        assert_eq!(
+            missed
+                .poll(started + Duration::from_millis(10), None)
+                .expect_err("cleanup miss is a bounded typed failure"),
+            DoctorProbeExecutionError::CleanupDeadlineMissed {
+                probe_id: "missed".to_string(),
             }
-            active.fetch_sub(1, Ordering::AcqRel);
-            completion
-        });
+        );
 
+        let mut scheduler_delayed = DoctorProbeLifecycle::start(
+            "scheduler-delayed",
+            started,
+            Duration::from_millis(10),
+            Duration::from_millis(4),
+        )
+        .expect("representable deadline");
         assert_eq!(
-            maximum_active.load(Ordering::Acquire),
-            DEFAULT_DOCTOR_PROBE_CONCURRENCY
+            scheduler_delayed
+                .poll(started + Duration::from_millis(10), None)
+                .expect_err("the first late poll is already terminal"),
+            DoctorProbeExecutionError::CleanupDeadlineMissed {
+                probe_id: "scheduler-delayed".to_string(),
+            }
         );
-        assert!(maximum_active.load(Ordering::Acquire) <= DEFAULT_DOCTOR_PROBE_CONCURRENCY);
-        assert!(independent_finished.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn lifecycle_deadline_overflow_is_typed() {
         assert_eq!(
-            records
-                .iter()
-                .find(|record| record.probe_id == "timed-out")
-                .map(|record| record.status),
-            Some(DoctorProbeStatus::TimedOut)
+            DoctorProbeLifecycle::start("overflow", Instant::now(), Duration::MAX, Duration::ZERO,)
+                .expect_err("overflow must not become an unbounded deadline"),
+            DoctorProbeExecutionError::DeadlineOverflow {
+                probe_id: "overflow".to_string(),
+            }
         );
-        assert!(matches!(
-            scheduler.state("dependent"),
-            Some(DoctorProbeState::SkippedDependency { .. })
-        ));
-        assert!(scheduler.is_complete());
     }
 
     #[test]
@@ -1081,20 +1157,23 @@ mod tests {
         ])
         .expect("valid graph");
 
-        let records = scheduler.execute(|probe, _context| {
-            assert_eq!(probe.probe_id, "failed");
-            DoctorProbeCompletion::new(
-                DoctorProbeStatus::Failed,
-                DoctorDependentEvidence::NotUseful,
+        let started = scheduler.start_ready();
+        assert_eq!(started.len(), 1);
+        assert_eq!(started[0].probe_id, "failed");
+        scheduler
+            .finish(
+                "failed",
+                DoctorProbeCompletion::new(
+                    DoctorProbeStatus::Failed,
+                    DoctorDependentEvidence::NotUseful,
+                ),
             )
-        });
+            .expect("failed probe is running");
+        assert!(scheduler.start_ready().is_empty());
 
         assert_eq!(
-            records,
-            [DoctorProbeExecutionRecord {
-                probe_id: "failed".to_string(),
-                status: DoctorProbeStatus::Failed,
-            }]
+            scheduler.completion_order(),
+            ["failed", "z-child", "a-grandchild"]
         );
         assert!(matches!(
             scheduler.state("z-child"),
@@ -1122,29 +1201,5 @@ mod tests {
                 dependency: "root".to_string(),
             }
         );
-    }
-
-    #[test]
-    fn worker_panics_propagate_without_waiting_for_channel_disconnect() {
-        let mut scheduler =
-            DoctorProbeScheduler::new(vec![probe("panic", "codex", &[], &[])]).unwrap();
-
-        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            scheduler.execute(|_, _| panic!("packet-17 probe panic"));
-        }))
-        .expect_err("the probe panic must propagate through execute");
-
-        assert_eq!(panic.downcast_ref::<&str>(), Some(&"packet-17 probe panic"));
-    }
-
-    #[test]
-    fn timeout_classification_uses_worker_completion_time() {
-        let deadline = Instant::now() + Duration::from_secs(1);
-
-        assert!(!completion_missed_deadline(
-            deadline - Duration::from_nanos(1),
-            deadline,
-        ));
-        assert!(completion_missed_deadline(deadline, deadline));
     }
 }

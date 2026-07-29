@@ -272,7 +272,7 @@ pub(crate) trait TransportClient {
     fn doctor(
         &self,
         scope_selection: &DoctorScopeSelection,
-        transport_probe: &dyn ControllerTransportProbe,
+        transport_probe: Arc<dyn ControllerTransportProbe>,
         options: DoctorOptions,
         provider_intent: &satelle_host::ProviderComputerUseIntent,
     ) -> Result<DoctorReport, SatelleError>;
@@ -625,7 +625,7 @@ impl TransportClient for LocalTransport {
     fn doctor(
         &self,
         scope_selection: &DoctorScopeSelection,
-        transport_probe: &dyn ControllerTransportProbe,
+        transport_probe: Arc<dyn ControllerTransportProbe>,
         options: DoctorOptions,
         provider_intent: &satelle_host::ProviderComputerUseIntent,
     ) -> Result<DoctorReport, SatelleError> {
@@ -3376,7 +3376,7 @@ impl TransportClient for SshSetupTransport {
     fn doctor(
         &self,
         _scope_selection: &DoctorScopeSelection,
-        _transport_probe: &dyn ControllerTransportProbe,
+        _transport_probe: Arc<dyn ControllerTransportProbe>,
         _options: DoctorOptions,
         _provider_intent: &satelle_host::ProviderComputerUseIntent,
     ) -> Result<DoctorReport, SatelleError> {
@@ -3516,7 +3516,7 @@ impl TransportClient for DirectTransport {
     fn doctor(
         &self,
         _scope_selection: &DoctorScopeSelection,
-        _transport_probe: &dyn ControllerTransportProbe,
+        _transport_probe: Arc<dyn ControllerTransportProbe>,
         _options: DoctorOptions,
         _provider_intent: &satelle_host::ProviderComputerUseIntent,
     ) -> Result<DoctorReport, SatelleError> {

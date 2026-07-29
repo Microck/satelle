@@ -12,6 +12,7 @@ use satelle_core::{DoctorOptions, DoctorReport, SatelleError};
 use serde_json::{Value, json};
 use std::path::PathBuf;
 use std::str::FromStr;
+use std::sync::Arc;
 
 pub(super) fn config_check_report(
     host: Option<String>,
@@ -201,19 +202,22 @@ pub(super) fn doctor_for_host(
         DoctorScopeSelection::parse(&raw_scopes).expect("read helpers use supported Doctor scopes");
     let options = DoctorOptions::default();
     let transport_probe = super::tailscale::transport_doctor_probe(&scope_selection, &host.config);
-    if let Some(report) = super::tailscale::transport_only_doctor_report(
-        &host.alias,
-        &host.config,
-        &scope_selection,
-        &transport_probe,
-        options,
-    ) {
-        return Ok(report);
+    if let Some(prepared) =
+        super::tailscale::prepare_transport_only_doctor(&host.config, &scope_selection, options)
+            .map_err(failure)?
+    {
+        return super::tailscale::execute_transport_only_doctor(
+            &host.alias,
+            &scope_selection,
+            &transport_probe,
+            prepared,
+        )
+        .map_err(failure);
     }
     transport_for(host)?
         .doctor(
             &scope_selection,
-            &transport_probe,
+            Arc::new(transport_probe),
             options,
             &satelle_host::ProviderComputerUseIntent::host_default(),
         )

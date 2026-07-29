@@ -7,14 +7,20 @@ use satelle_host::{ApiScopes, HostService};
 use satelle_test_contract::{assert_directory_tree_unchanged, assert_privacy_canaries_absent};
 use serde_json::Value;
 use std::collections::BTreeSet;
-use std::fs::{self, File};
+use std::fs;
 #[cfg(target_os = "linux")]
-use std::io::{BufRead, Read, Write};
+use std::fs::File;
+#[cfg(target_os = "linux")]
+use std::io::Write;
+#[cfg(unix)]
+use std::io::{BufRead, Read};
 use std::net::TcpListener;
 #[cfg(target_os = "linux")]
 use std::net::TcpStream;
 #[cfg(target_os = "linux")]
-use std::process::{Child, Stdio};
+use std::process::Child;
+#[cfg(unix)]
+use std::process::Stdio;
 #[cfg(target_os = "linux")]
 use std::sync::mpsc::{self, Receiver};
 #[cfg(target_os = "linux")]
@@ -4608,17 +4614,27 @@ hostname = "studio"
     )
     .expect("write Tailscale Doctor config");
     let bin = tempfile::tempdir().expect("create fake Tailscale bin");
-    let marker = state.path().join("tailscale-invoked");
+    let status_marker = state.path().join("tailscale-status-started");
+    let ping_marker = state.path().join("tailscale-ping-started");
+    let release_status = state.path().join("release-tailscale-status");
     let tailscale = bin.path().join("tailscale");
     std::fs::write(
         &tailscale,
         format!(
-            "#!/bin/sh\nprintf invoked > '{}'\nif [ \"$1\" = status ]; then\n\
+            "#!/bin/sh\nif [ \"$1\" = status ]; then\n\
+             printf status > '{}'\n\
+             while [ ! -e '{}' ]; do sleep 0.01; done\n\
              printf '%s' '{{\"BackendState\":\"Running\",\"CurrentTailnet\":\
              {{\"Name\":\"example.test\"}},\"Peer\":{{\"node\":{{\"HostName\":\"studio\",\
              \"DNSName\":\"studio.example.test.\",\"TailscaleIPs\":[\"100.64.0.8\"],\
-             \"Online\":true}}}}}}'\nfi\n",
-            marker.display()
+             \"Online\":true}}}}}}'\n\
+             exit 0\n\
+             fi\n\
+             if [ \"$1\" = ping ]; then printf ping > '{}'; exit 0; fi\n\
+             exit 1\n",
+            status_marker.display(),
+            release_status.display(),
+            ping_marker.display(),
         ),
     )
     .expect("write fake Tailscale executable");
@@ -4646,19 +4662,107 @@ hostname = "studio"
         .stderr(Stdio::piped())
         .spawn()
         .expect("spawn event-mode Tailscale Doctor");
-    let mut stdout = std::io::BufReader::new(child.stdout.take().expect("take Doctor stdout"));
-    let mut first = String::new();
-    stdout
-        .read_line(&mut first)
+    let stdout = child.stdout.take().expect("take Doctor stdout");
+    let stderr = child.stderr.take().expect("take Doctor stderr");
+    let (stdout_sender, stdout_receiver) = std::sync::mpsc::channel();
+    let stdout_reader = std::thread::spawn(move || {
+        let mut stdout = std::io::BufReader::new(stdout);
+        let mut first = String::new();
+        let first_result = stdout.read_line(&mut first).map(|_| first.into_bytes());
+        stdout_sender
+            .send(first_result)
+            .expect("send first Doctor event");
+        let mut remaining = Vec::new();
+        let remaining_result = stdout.read_to_end(&mut remaining).map(|_| remaining);
+        stdout_sender
+            .send(remaining_result)
+            .expect("send remaining Doctor events");
+    });
+    let (stderr_sender, stderr_receiver) = std::sync::mpsc::channel();
+    let stderr_reader = std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        let result = std::io::BufReader::new(stderr)
+            .read_to_end(&mut bytes)
+            .map(|_| bytes);
+        stderr_sender.send(result).expect("send Doctor stderr");
+    });
+    let timeout = std::time::Duration::from_secs(5);
+    let first = stdout_receiver
+        .recv_timeout(timeout)
+        .unwrap_or_else(|error| {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("Doctor did not emit its first event in time: {error}");
+        })
         .expect("read first Doctor event");
-
-    let first: Value = serde_json::from_str(&first).expect("first Doctor record is JSON");
+    let first: Value = serde_json::from_slice(&first).expect("first Doctor record is JSON");
     assert_eq!(first["event_type"], "doctor_started");
-    assert!(child.wait().expect("wait for Doctor").success());
-    assert_eq!(
-        std::fs::read_to_string(marker).expect("Tailscale invocation marker"),
-        "invoked"
+    let marker_deadline = std::time::Instant::now() + timeout;
+    while !status_marker.exists() && std::time::Instant::now() < marker_deadline {
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    assert!(
+        status_marker.exists(),
+        "status probe must start after doctor_started"
     );
+    assert!(
+        !ping_marker.exists(),
+        "ping must wait for the status release handshake"
+    );
+    std::fs::write(&release_status, b"release").expect("release Tailscale status");
+
+    let remaining_stdout = stdout_receiver
+        .recv_timeout(timeout)
+        .unwrap_or_else(|error| {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("Doctor stdout did not terminate in time: {error}");
+        })
+        .expect("drain remaining Doctor events");
+    let process_deadline = std::time::Instant::now() + timeout;
+    let status = loop {
+        if let Some(status) = child.try_wait().expect("poll Doctor process") {
+            break status;
+        }
+        if std::time::Instant::now() >= process_deadline {
+            child.kill().expect("kill timed-out Doctor process");
+            child.wait().expect("reap timed-out Doctor process");
+            panic!("Doctor process did not terminate in time");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    };
+    assert!(status.success());
+    let stderr = stderr_receiver
+        .recv_timeout(timeout)
+        .expect("Doctor stderr reader must finish in time")
+        .expect("drain Doctor stderr");
+    assert!(
+        stderr.is_empty(),
+        "event mode must not emit a second machine error on stderr"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&status_marker).expect("status marker"),
+        "status"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&ping_marker).expect("ping marker"),
+        "ping"
+    );
+    let mut events = vec![first];
+    events.extend(parse_json_lines(&remaining_stdout));
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| matches!(
+                event["event_type"].as_str(),
+                Some("doctor_finished" | "doctor_failed")
+            ))
+            .count(),
+        1
+    );
+    assert_eq!(events.last().unwrap()["event_type"], "doctor_finished");
+    stdout_reader.join().expect("join completed stdout reader");
+    stderr_reader.join().expect("join completed stderr reader");
 }
 
 #[test]
@@ -4677,7 +4781,7 @@ fn doctor_refresh_requires_a_live_probe_scope() {
 #[test]
 fn doctor_timeout_must_be_positive() {
     let state = state_dir();
-    satelle()
+    let output = satelle()
         .env("SATELLE_STATE_DIR", state.path())
         .args([
             "doctor",
@@ -4685,14 +4789,21 @@ fn doctor_timeout_must_be_positive() {
             "computer-use",
             "--refresh",
             "--timeout",
-            "0s",
-            "--json",
+            "0ms",
+            "--events",
         ])
         .assert()
         .failure()
         .stderr(predicate::str::contains(
             "duration must use a positive number",
-        ));
+        ))
+        .get_output()
+        .clone();
+    assert!(output.stdout.is_empty());
+    assert!(
+        serde_json::from_slice::<Value>(&output.stderr).expect("typed pre-stream machine error")["code"]
+            == "invalid-usage"
+    );
 }
 
 #[test]
@@ -4721,6 +4832,45 @@ fn doctor_events_invalid_scope_uses_pre_stream_machine_error_contract() {
         output.stdout.is_empty(),
         "a failure before doctor_started must leave stdout empty"
     );
+}
+
+#[test]
+fn doctor_events_transport_preparation_failure_uses_pre_stream_machine_error_contract() {
+    let state = state_dir();
+    let user_config = state.path().join("user-config.toml");
+    let missing_token = state.path().join("missing-api-token");
+    let token_path = toml::Value::String(missing_token.to_string_lossy().into_owned()).to_string();
+    write_user_config(
+        &user_config,
+        format!(
+            r#"
+default_host = "remote"
+
+[hosts.remote]
+transport = "direct"
+adapter = "codex"
+address = "https://127.0.0.1:3001"
+expected_host_id = "host-remote"
+api_token = {{ kind = "file", path = {token_path} }}
+"#,
+        ),
+    )
+    .expect("write direct Host config");
+
+    let output = production_satelle()
+        .env("SATELLE_CONFIG_FILE", &user_config)
+        .env("SATELLE_STATE_DIR", state.path())
+        .args(["doctor", "--host", "remote", "--events"])
+        .assert()
+        .failure()
+        .get_output()
+        .clone();
+
+    assert!(
+        output.stdout.is_empty(),
+        "transport preparation failed before doctor_started"
+    );
+    serde_json::from_slice::<Value>(&output.stderr).expect("typed pre-stream machine error");
 }
 
 #[test]
@@ -5540,6 +5690,24 @@ adapter = "fake"
         error["message"]
             .as_str()
             .is_some_and(|message| message.contains("reserved for implicit Codex defaults"))
+    );
+
+    let events_output = satelle()
+        .env("SATELLE_CONFIG_FILE", &user_config)
+        .env("SATELLE_STATE_DIR", state.path())
+        .args(["doctor", "--host", "local", "--events"])
+        .assert()
+        .code(66)
+        .get_output()
+        .clone();
+    assert!(
+        events_output.stdout.is_empty(),
+        "provider intent failed before doctor_started"
+    );
+    assert_eq!(
+        serde_json::from_slice::<Value>(&events_output.stderr)
+            .expect("typed pre-stream machine error")["code"],
+        "configuration-error"
     );
 }
 

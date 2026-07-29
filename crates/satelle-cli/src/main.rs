@@ -67,7 +67,9 @@ use std::process::ExitCode;
 use std::str::FromStr;
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
-use tailscale::{transport_doctor_probe, transport_only_doctor_report};
+use tailscale::{
+    execute_transport_only_doctor, prepare_transport_only_doctor, transport_doctor_probe,
+};
 use transport::{
     AttachedTurnOutcome, SshBootstrapScope, SshHostDiscovery, authenticated_ssh_bootstrap_user,
     discover_direct_host_identity, discover_ssh_host, transport_for, transport_for_setup,
@@ -4110,20 +4112,23 @@ fn run_doctor(
             .resolve_host(command.host.as_deref())
             .map_err(failure)?,
     );
-    let options =
-        DoctorOptions::new(command.refresh, timeout).with_serial_probes(command.serial_probes);
+    let options = DoctorOptions::new(command.refresh, timeout)
+        .map_err(failure)?
+        .with_serial_probes(command.serial_probes);
     let transport_probe = transport_doctor_probe(&scope_selection, &host.config);
-    if command.events {
-        print_doctor_started_event(&host.alias, &scope_selection).map_err(failure)?;
-    }
-    if let Some(report) = transport_only_doctor_report(
-        &host.alias,
-        &host.config,
-        &scope_selection,
-        &transport_probe,
-        options,
-    ) {
-        return emit_doctor_report(report, command.events, json);
+    let transport_only =
+        prepare_transport_only_doctor(&host.config, &scope_selection, options).map_err(failure)?;
+    if let Some(prepared) = transport_only {
+        if command.events {
+            print_doctor_started_event(&host.alias, &scope_selection).map_err(failure)?;
+        }
+        let outcome = execute_transport_only_doctor(
+            &host.alias,
+            &scope_selection,
+            &transport_probe,
+            prepared,
+        );
+        return finish_doctor_outcome(outcome, command.events, json, &host.alias, &scope_selection);
     }
     let transport = transport_for(&host)?;
     let provider_intent = doctor_provider_intent(
@@ -4133,24 +4138,34 @@ fn run_doctor(
         options.probe_timeout(),
     )
     .map_err(failure)?;
-    let report = match transport.doctor(
+    if command.events {
+        print_doctor_started_event(&host.alias, &scope_selection).map_err(failure)?;
+    }
+    let outcome = transport.doctor(
         &scope_selection,
-        &transport_probe,
+        Arc::new(transport_probe),
         options,
         &provider_intent,
-    ) {
-        Ok(report) => report,
-        Err(error) => {
-            if command.events {
-                print_doctor_failed_event(&host.alias, &scope_selection, 2, &error)
-                    .map_err(failure)?;
-                return Err(reported_failure(error));
-            }
-            return Err(failure(error));
-        }
-    };
+    );
 
-    emit_doctor_report(report, command.events, json)
+    finish_doctor_outcome(outcome, command.events, json, &host.alias, &scope_selection)
+}
+
+fn finish_doctor_outcome(
+    outcome: Result<DoctorReport, SatelleError>,
+    events: bool,
+    json: bool,
+    target: &str,
+    scope_selection: &DoctorScopeSelection,
+) -> Result<(), CliFailure> {
+    match outcome {
+        Ok(report) => emit_doctor_report(report, events, json),
+        Err(error) if events => {
+            print_doctor_failed_event(target, scope_selection, 2, &error).map_err(failure)?;
+            Err(reported_failure(error))
+        }
+        Err(error) => Err(failure(error)),
+    }
 }
 
 fn emit_doctor_report(report: DoctorReport, events: bool, json: bool) -> Result<(), CliFailure> {

@@ -6141,7 +6141,7 @@ pub enum DoctorSchemaVersion {
     V1,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct DoctorOptions {
     refresh: bool,
     probe_timeout: Option<std::time::Duration>,
@@ -6151,12 +6151,20 @@ pub struct DoctorOptions {
 impl DoctorOptions {
     pub const DEFAULT_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
-    pub const fn new(refresh: bool, probe_timeout: Option<std::time::Duration>) -> Self {
-        Self {
+    pub fn new(
+        refresh: bool,
+        probe_timeout: Option<std::time::Duration>,
+    ) -> Result<Self, SatelleError> {
+        if probe_timeout.is_some_and(|timeout| timeout.is_zero()) {
+            return Err(SatelleError::invalid_usage(
+                "duration must use a positive number",
+            ));
+        }
+        Ok(Self {
             refresh,
             probe_timeout,
             serial_probes: false,
-        }
+        })
     }
 
     pub const fn with_serial_probes(mut self, serial_probes: bool) -> Self {
@@ -6184,9 +6192,16 @@ impl DoctorOptions {
     }
 }
 
-impl Default for DoctorOptions {
-    fn default() -> Self {
-        Self::new(false, None)
+#[cfg(test)]
+mod doctor_options_tests {
+    use super::*;
+
+    #[test]
+    fn explicit_zero_probe_timeout_is_a_typed_usage_error() {
+        let error = DoctorOptions::new(false, Some(std::time::Duration::ZERO))
+            .expect_err("explicit zero must not reach scheduler construction");
+        assert_eq!(error.code, ErrorCode::InvalidUsage);
+        assert_eq!(error.message, "duration must use a positive number");
     }
 }
 

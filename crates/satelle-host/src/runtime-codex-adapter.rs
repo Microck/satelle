@@ -3040,6 +3040,7 @@ mod tests {
             control_plane_admission: crate::codex_capabilities::ControlPlaneAdmission::unavailable(
                 satelle_core::ControlPlaneFailureReason::HandshakeUnavailable,
             ),
+            budget_failure: None,
             started_at: "2026-07-17T00:00:00Z".to_string(),
             finished_at: "2026-07-17T00:00:01Z".to_string(),
             duration_ms: 1_000,

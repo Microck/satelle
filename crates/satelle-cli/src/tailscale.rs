@@ -1,7 +1,7 @@
 use satelle_core::doctor::{
     DoctorDependentEvidence, DoctorProbe, DoctorProbeCachePolicy, DoctorProbeCompletion,
-    DoctorProbeExecutionContext, DoctorProbeScheduler, DoctorProbeStatus, DoctorScope,
-    DoctorScopeSelection,
+    DoctorProbeExecutionContext, DoctorProbeLifecycle, DoctorProbeLifecycleEvent,
+    DoctorProbeScheduler, DoctorProbeStatus, DoctorScope, DoctorScopeSelection,
 };
 use satelle_core::{
     DoctorFinding, DoctorFixability, DoctorOptions, DoctorProbeResult, DoctorReport,
@@ -134,22 +134,26 @@ impl TailscaleDoctorProbe {
     }
 }
 
-pub(super) fn transport_only_doctor_report(
-    host_alias: &str,
+fn is_transport_only_doctor(host: &HostConfig, scope_selection: &DoctorScopeSelection) -> bool {
+    scope_selection.scopes() == [DoctorScope::Transport]
+        && matches!(host.transport, TransportKind::Direct | TransportKind::Ssh)
+        && matches!(host.network, Some(NetworkConfig::Tailscale { .. }))
+}
+
+pub(super) struct PreparedTransportOnlyDoctor {
+    scheduler: DoctorProbeScheduler,
+}
+
+pub(super) fn prepare_transport_only_doctor(
     host: &HostConfig,
     scope_selection: &DoctorScopeSelection,
-    probe: &TailscaleDoctorProbe,
     options: DoctorOptions,
-) -> Option<DoctorReport> {
-    if scope_selection.scopes() != [DoctorScope::Transport]
-        || !matches!(host.transport, TransportKind::Direct | TransportKind::Ssh)
-        || !matches!(host.network, Some(NetworkConfig::Tailscale { .. }))
-    {
-        return None;
+) -> Result<Option<PreparedTransportOnlyDoctor>, satelle_core::SatelleError> {
+    if !is_transport_only_doctor(host, scope_selection) {
+        return Ok(None);
     }
 
-    let execution = std::sync::Mutex::new(None);
-    let mut scheduler = DoctorProbeScheduler::new(vec![DoctorProbe {
+    let scheduler = DoctorProbeScheduler::new(vec![DoctorProbe {
         probe_id: "transport.tailscale.local".to_string(),
         scope: DoctorScope::Transport.as_str().to_string(),
         dependencies: Vec::new(),
@@ -157,35 +161,64 @@ pub(super) fn transport_only_doctor_report(
         timeout: options.effective_probe_timeout(),
         cache_policy: DoctorProbeCachePolicy::RefreshWhenRequested,
     }])
-    .expect("the transport-only Doctor probe graph is valid");
-    let records = scheduler.execute(|_, context| {
-        let started_at = utc_now();
-        let started = std::time::Instant::now();
-        let outcome = probe.execute(context);
-        let finished_at = utc_now();
-        let duration = started.elapsed();
-        let completion = match &outcome {
-            ControllerTransportProbeOutcome::Observed(observation) => DoctorProbeCompletion::new(
-                if observation.is_ready() {
-                    DoctorProbeStatus::Passed
-                } else {
-                    DoctorProbeStatus::Finding
-                },
-                DoctorDependentEvidence::Useful,
-            ),
-            ControllerTransportProbeOutcome::TimedOut(_) => DoctorProbeCompletion::new(
-                DoctorProbeStatus::TimedOut,
-                DoctorDependentEvidence::NotUseful,
-            ),
-        };
-        *execution.lock().expect("transport execution lock") =
-            Some((outcome, started_at, finished_at, duration));
-        completion
-    });
-    let (outcome, started_at, finished_at, duration) = execution
-        .into_inner()
-        .expect("transport execution lock")
-        .expect("transport probe executed");
+    .map_err(|error| satelle_core::SatelleError::invalid_usage(error.to_string()))?;
+    Ok(Some(PreparedTransportOnlyDoctor { scheduler }))
+}
+
+pub(super) fn execute_transport_only_doctor(
+    host_alias: &str,
+    scope_selection: &DoctorScopeSelection,
+    probe: &TailscaleDoctorProbe,
+    mut prepared: PreparedTransportOnlyDoctor,
+) -> Result<DoctorReport, satelle_core::SatelleError> {
+    debug_assert_eq!(scope_selection.scopes(), [DoctorScope::Transport]);
+    let scheduler = &mut prepared.scheduler;
+    let definition = scheduler
+        .start_ready()
+        .into_iter()
+        .next()
+        .expect("the prepared transport graph has one ready probe");
+    let mut lifecycle = DoctorProbeLifecycle::start(
+        definition.probe_id.clone(),
+        std::time::Instant::now(),
+        definition.timeout,
+        (definition.timeout / 4).min(std::time::Duration::from_secs(1)),
+    )
+    .map_err(|error| satelle_core::SatelleError::invalid_usage(error.to_string()))?;
+    let context = lifecycle.context();
+    let started_at = utc_now();
+    let started = std::time::Instant::now();
+    let outcome = probe.execute(&context);
+    let completed_at = std::time::Instant::now();
+    let finished_at = utc_now();
+    let duration = completed_at.duration_since(started);
+    let probe_completion = match &outcome {
+        ControllerTransportProbeOutcome::Observed(observation) => DoctorProbeCompletion::new(
+            if observation.is_ready() {
+                DoctorProbeStatus::Passed
+            } else {
+                DoctorProbeStatus::Finding
+            },
+            DoctorDependentEvidence::Useful,
+        ),
+        ControllerTransportProbeOutcome::TimedOut(_) => DoctorProbeCompletion::new(
+            DoctorProbeStatus::TimedOut,
+            DoctorDependentEvidence::NotUseful,
+        ),
+    };
+    let DoctorProbeLifecycleEvent::TerminalAck(completion) = lifecycle
+        .poll(completed_at, Some((completed_at, probe_completion)))
+        .map_err(|error| satelle_core::SatelleError::invalid_usage(error.to_string()))?
+    else {
+        unreachable!("the owned transport operation returned a terminal acknowledgment")
+    };
+    let records = [satelle_core::doctor::DoctorProbeExecutionRecord {
+        probe_id: definition.probe_id.clone(),
+        status: completion.status,
+    }];
+    scheduler
+        .finish(&definition.probe_id, completion)
+        .expect("the acknowledged transport probe is running");
     let observation = match &outcome {
         ControllerTransportProbeOutcome::Observed(observation)
         | ControllerTransportProbeOutcome::TimedOut(observation) => observation,
@@ -215,7 +248,7 @@ pub(super) fn transport_only_doctor_report(
         .unwrap_or("failed");
     let duration_ms = duration.as_millis().try_into().unwrap_or(u64::MAX);
 
-    Some(DoctorReport {
+    Ok(DoctorReport {
         schema_version: DoctorSchemaVersion::V1,
         status: if ready { "ready" } else { "blocked" }.to_string(),
         target: host_alias.to_string(),
@@ -271,7 +304,11 @@ fn ping(
     target: &str,
     context: &DoctorProbeExecutionContext,
 ) -> Result<(), StatusReadError> {
-    let remaining_ms = context.remaining().as_millis().max(1);
+    let remaining = context.remaining();
+    let remaining_ms = remaining.as_millis();
+    if context.is_cancelled() || remaining.is_zero() || remaining_ms == 0 {
+        return Err(StatusReadError::TimedOut);
+    }
     run_bounded(
         executable,
         &[
@@ -292,8 +329,14 @@ fn run_bounded(
     args: &[String],
     context: &DoctorProbeExecutionContext,
 ) -> Result<Vec<u8>, StatusReadError> {
-    let mut child = Command::new(executable)
-        .args(args)
+    let mut command = Command::new(executable);
+    command.args(args);
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt as _;
+        command.process_group(0);
+    }
+    let mut child = command
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -321,14 +364,13 @@ fn run_bounded(
             break Some(status);
         }
         let remaining = context.remaining();
-        if remaining.is_zero() {
+        if context.is_cancelled() || remaining.is_zero() {
             break None;
         }
         thread::sleep(remaining.min(std::time::Duration::from_millis(10)));
     };
     let Some(status) = status else {
-        let _ = child.kill();
-        let _ = child.wait();
+        terminate_process_tree(&mut child);
         let _ = reader.join();
         return Err(StatusReadError::TimedOut);
     };
@@ -343,6 +385,24 @@ fn run_bounded(
         return Err(StatusReadError::CommandFailed);
     }
     Ok(stdout)
+}
+
+fn terminate_process_tree(child: &mut std::process::Child) {
+    #[cfg(unix)]
+    if let Some(pid) = rustix::process::Pid::from_raw(child.id() as i32) {
+        let _ = rustix::process::kill_process_group(pid, rustix::process::Signal::KILL);
+    }
+    #[cfg(windows)]
+    {
+        let _ = Command::new("taskkill")
+            .args(["/T", "/F", "/PID", &child.id().to_string()])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    }
+    let _ = child.kill();
+    let _ = child.wait();
 }
 
 fn diagnose_status(
@@ -582,6 +642,19 @@ mod tests {
     use satelle_core::{AdapterKind, ApiTokenSource};
     use std::path::PathBuf;
 
+    fn transport_only_doctor_report(
+        host_alias: &str,
+        host: &HostConfig,
+        scope_selection: &DoctorScopeSelection,
+        probe: &TailscaleDoctorProbe,
+        options: DoctorOptions,
+    ) -> Result<Option<DoctorReport>, satelle_core::SatelleError> {
+        let Some(prepared) = prepare_transport_only_doctor(host, scope_selection, options)? else {
+            return Ok(None);
+        };
+        execute_transport_only_doctor(host_alias, scope_selection, probe, prepared).map(Some)
+    }
+
     #[test]
     fn online_peer_reports_tailscale_address_guidance() {
         let status: TailscaleStatus = serde_json::from_str(
@@ -625,8 +698,9 @@ mod tests {
             &host,
             &selection,
             &probe,
-            DoctorOptions::new(false, None),
+            DoctorOptions::new(false, None).expect("default timeout is valid"),
         )
+        .expect("transport scheduler")
         .expect("Tailscale host should produce a transport report");
 
         assert!(!report.ready);
@@ -659,8 +733,9 @@ mod tests {
                 &host,
                 &selection,
                 &probe,
-                DoctorOptions::new(false, None),
+                DoctorOptions::new(false, None).expect("default timeout is valid"),
             )
+            .expect("transport scheduler")
             .is_none()
         );
     }
@@ -743,8 +818,10 @@ mod tests {
             &host,
             &selection,
             &probe,
-            DoctorOptions::new(false, Some(std::time::Duration::from_millis(40))),
+            DoctorOptions::new(false, Some(std::time::Duration::from_millis(40)))
+                .expect("positive timeout"),
         )
+        .expect("transport scheduler")
         .expect("Direct Tailscale transport report");
 
         assert_eq!(report.probe_results[0].status, "timed_out");
@@ -788,8 +865,10 @@ mod tests {
             &host,
             &selection,
             &probe,
-            DoctorOptions::new(false, Some(std::time::Duration::from_millis(60))),
+            DoctorOptions::new(false, Some(std::time::Duration::from_millis(500)))
+                .expect("positive timeout"),
         )
+        .expect("transport scheduler")
         .expect("Direct Tailscale transport report");
 
         assert_eq!(report.probe_results[0].status, "timed_out");
@@ -828,8 +907,10 @@ mod tests {
                 &host,
                 &selection,
                 &probe,
-                DoctorOptions::new(false, Some(std::time::Duration::from_millis(30))),
+                DoctorOptions::new(false, Some(std::time::Duration::from_millis(30)))
+                    .expect("positive timeout"),
             )
+            .expect("transport scheduler")
             .expect("transport-only report");
 
             assert_eq!(report.probe_results[0].status, "timed_out");

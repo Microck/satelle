@@ -389,6 +389,56 @@ pub(crate) struct Phase0CapabilityEvidence {
 pub(crate) struct Phase0Discovery {
     pub(crate) evidence: Phase0CapabilityEvidence,
     pub(crate) control_plane_admission: control_plane::ControlPlaneAdmission,
+    pub(crate) budget_failure: Option<Phase0BudgetFailure>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum Phase0BudgetFailure {
+    ZeroTimeout,
+    DeadlineOverflow,
+    Exhausted,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Phase0Budget {
+    Defaults,
+    Deadline(Instant),
+}
+
+impl Phase0Budget {
+    fn new(timeout: Option<Duration>, started_at: Instant) -> Result<Self, Phase0BudgetFailure> {
+        let Some(timeout) = timeout else {
+            return Ok(Self::Defaults);
+        };
+        if timeout.is_zero() {
+            return Err(Phase0BudgetFailure::ZeroTimeout);
+        }
+        started_at
+            .checked_add(timeout)
+            .map(Self::Deadline)
+            .ok_or(Phase0BudgetFailure::DeadlineOverflow)
+    }
+
+    fn remaining(self, now: Instant, default: Duration) -> Result<Duration, Phase0BudgetFailure> {
+        match self {
+            Self::Defaults => Ok(default),
+            Self::Deadline(deadline) => {
+                let remaining = deadline.saturating_duration_since(now);
+                if remaining.is_zero() {
+                    Err(Phase0BudgetFailure::Exhausted)
+                } else {
+                    Ok(remaining)
+                }
+            }
+        }
+    }
+
+    fn optional_remaining(self, now: Instant) -> Result<Option<Duration>, Phase0BudgetFailure> {
+        match self {
+            Self::Defaults => Ok(None),
+            Self::Deadline(_) => self.remaining(now, Duration::ZERO).map(Some),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
@@ -484,7 +534,12 @@ impl Phase0SupportVerdict {
 /// Collects the deliberately narrow evidence production can prove today. The
 /// version command's bytes are classified and dropped inside this module.
 pub(crate) fn discover_phase0(probe_timeout: Option<Duration>) -> Phase0Discovery {
+    let started_at = Instant::now();
     let host_platform = HostPlatform::current();
+    let budget = match Phase0Budget::new(probe_timeout, started_at) {
+        Ok(budget) => budget,
+        Err(failure) => return phase0_budget_failure(host_platform, failure),
+    };
     if !host_platform.supports_native_computer_use() {
         return Phase0Discovery {
             evidence: Phase0CapabilityEvidence {
@@ -495,6 +550,7 @@ pub(crate) fn discover_phase0(probe_timeout: Option<Duration>) -> Phase0Discover
             // Linux and unknown platforms are native Computer Use readiness
             // failures. They must not be mislabeled as Codex protocol errors.
             control_plane_admission: control_plane::ControlPlaneAdmission::not_applicable(),
+            budget_failure: None,
         };
     }
 
@@ -508,19 +564,43 @@ pub(crate) fn discover_phase0(probe_timeout: Option<Duration>) -> Phase0Discover
             control_plane_admission: control_plane::ControlPlaneAdmission::unavailable(
                 ControlPlaneFailureReason::RuntimeMissing,
             ),
+            budget_failure: None,
         };
     };
-    let codex_version =
-        probe_codex_version(&runtime, probe_timeout.unwrap_or(VERSION_PROBE_TIMEOUT));
+    let version_timeout = match budget.remaining(Instant::now(), VERSION_PROBE_TIMEOUT) {
+        Ok(timeout) => timeout,
+        Err(failure) => return phase0_budget_failure(host_platform, failure),
+    };
+    let codex_version = probe_codex_version(&runtime, version_timeout);
     let (capabilities, control_plane_admission) = match codex_version {
         CodexVersionEvidence::Detected { version } if version == REQUIRED_CODEX_VERSION => {
-            let probe = control_plane::probe_installed_control_plane(&runtime, probe_timeout);
+            let control_plane_timeout = match budget.optional_remaining(Instant::now()) {
+                Ok(timeout) => timeout,
+                Err(failure) => {
+                    return phase0_budget_failure_with_version(
+                        host_platform,
+                        codex_version,
+                        failure,
+                    );
+                }
+            };
+            let probe =
+                control_plane::probe_installed_control_plane(&runtime, control_plane_timeout);
             let mut capabilities = CapabilityMatrix::from_control_plane(probe);
             if host_platform == HostPlatform::Windows {
-                capabilities.approval_observation.surface = probe_windows_app_policy(
-                    &runtime,
-                    probe_timeout.unwrap_or(APP_POLICY_PROBE_TIMEOUT),
-                );
+                let app_policy_timeout =
+                    match budget.remaining(Instant::now(), APP_POLICY_PROBE_TIMEOUT) {
+                        Ok(timeout) => timeout,
+                        Err(failure) => {
+                            return phase0_budget_failure_with_version(
+                                host_platform,
+                                codex_version,
+                                failure,
+                            );
+                        }
+                    };
+                capabilities.approval_observation.surface =
+                    probe_windows_app_policy(&runtime, app_policy_timeout);
             }
             (
                 capabilities,
@@ -559,12 +639,65 @@ pub(crate) fn discover_phase0(probe_timeout: Option<Duration>) -> Phase0Discover
             capabilities,
         },
         control_plane_admission,
+        budget_failure: None,
+    }
+}
+
+fn phase0_budget_failure(
+    host_platform: HostPlatform,
+    failure: Phase0BudgetFailure,
+) -> Phase0Discovery {
+    phase0_budget_failure_with_version(host_platform, CodexVersionEvidence::Unavailable, failure)
+}
+
+fn phase0_budget_failure_with_version(
+    host_platform: HostPlatform,
+    codex_version: CodexVersionEvidence,
+    failure: Phase0BudgetFailure,
+) -> Phase0Discovery {
+    Phase0Discovery {
+        evidence: Phase0CapabilityEvidence {
+            codex_version,
+            host_platform,
+            capabilities: CapabilityMatrix::unproven(),
+        },
+        control_plane_admission: control_plane::ControlPlaneAdmission::unavailable(
+            ControlPlaneFailureReason::VersionUnavailable,
+        ),
+        budget_failure: Some(failure),
     }
 }
 
 #[cfg(all(test, target_os = "linux"))]
 pub(crate) fn discover_phase0_evidence() -> Phase0CapabilityEvidence {
     discover_phase0(None).evidence
+}
+
+#[cfg(test)]
+#[test]
+fn sequential_phase0_probes_consume_one_absolute_deadline() {
+    let started = Instant::now();
+    let budget = Phase0Budget::new(Some(Duration::from_secs(30)), started).expect("valid budget");
+    assert_eq!(
+        budget.remaining(started, Duration::ZERO),
+        Ok(Duration::from_secs(30))
+    );
+    assert_eq!(
+        budget.remaining(started + Duration::from_secs(12), Duration::ZERO),
+        Ok(Duration::from_secs(18))
+    );
+    assert_eq!(
+        budget.remaining(started + Duration::from_secs(31), Duration::ZERO),
+        Err(Phase0BudgetFailure::Exhausted)
+    );
+    assert_eq!(
+        Phase0Budget::new(Some(Duration::ZERO), started),
+        Err(Phase0BudgetFailure::ZeroTimeout)
+    );
+    assert_eq!(
+        Phase0Budget::new(Some(Duration::MAX), started),
+        Err(Phase0BudgetFailure::DeadlineOverflow)
+    );
 }
 
 /// Resolves the active Codex home through the installed app-server, then reads
