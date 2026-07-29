@@ -46,6 +46,25 @@ pub enum HostUpdateVersionSource {
     CodexCompatibilityRequirement,
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CodexComponentOwnership {
+    CodexOwned,
+    Ambiguous,
+}
+
+/// Typed Host evidence used to plan Codex-owned updates. Raw probe output does
+/// not cross this boundary.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct CodexUpdateEvidence {
+    pub ownership: CodexComponentOwnership,
+    pub runtime_current_version: Option<String>,
+    pub native_component_current_version: Option<String>,
+    pub required_version: String,
+    pub runtime_update_required: bool,
+    pub native_update_required: bool,
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct HostUpdateMutation {
     pub operation: String,
@@ -84,9 +103,7 @@ impl HostUpdateReport {
         checked_components: Vec<HostUpdateComponent>,
         targets: Vec<HostUpdateTargetPlan>,
     ) -> Self {
-        let confirmation_required = targets
-            .iter()
-            .any(HostUpdateTargetPlan::requires_mutation);
+        let confirmation_required = targets.iter().any(HostUpdateTargetPlan::requires_mutation);
         Self {
             schema_version: HostUpdateSchemaVersion::V1,
             host: host.into(),

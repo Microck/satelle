@@ -88,12 +88,13 @@ impl DaemonRuntimeStatus {
 /// Host-owned capability evidence. Route availability and network limits stay
 /// in the transport crate because they describe the serving process, not the
 /// Computer Use runtime.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DaemonRuntimeCapabilities {
     codex_runtime: bool,
     native_computer_use: bool,
     provider_computer_use: bool,
     image_attachments: bool,
+    codex_update_evidence: satelle_core::host_update::CodexUpdateEvidence,
 }
 
 /// Volatile activity used only to decide whether an on-demand daemon may exit.
@@ -482,24 +483,32 @@ impl SensitiveCanonicalPayload {
 }
 
 impl DaemonRuntimeCapabilities {
-    pub const fn codex_runtime(self) -> bool {
+    pub const fn codex_runtime(&self) -> bool {
         self.codex_runtime
     }
 
-    pub const fn native_computer_use(self) -> bool {
+    pub const fn native_computer_use(&self) -> bool {
         self.native_computer_use
     }
 
-    pub const fn provider_computer_use(self) -> bool {
+    pub const fn provider_computer_use(&self) -> bool {
         self.provider_computer_use
     }
 
-    pub const fn image_attachments(self) -> bool {
+    pub const fn image_attachments(&self) -> bool {
         self.image_attachments
+    }
+
+    pub fn codex_update_evidence(&self) -> satelle_core::host_update::CodexUpdateEvidence {
+        self.codex_update_evidence.clone()
     }
 }
 
 impl HostService {
+    pub fn required_codex_version() -> String {
+        crate::codex_capabilities::REQUIRED_CODEX_VERSION.to_string()
+    }
+
     /// Adds a process-local credential for a loopback bootstrap transport.
     /// The raw bearer remains only in the caller and this in-memory
     /// authenticator; it is never registered in durable Host state.
@@ -604,6 +613,14 @@ impl HostService {
                 native_computer_use: false,
                 provider_computer_use: false,
                 image_attachments: *image_attachments,
+                codex_update_evidence: satelle_core::host_update::CodexUpdateEvidence {
+                    ownership: satelle_core::host_update::CodexComponentOwnership::CodexOwned,
+                    runtime_current_version: None,
+                    native_component_current_version: None,
+                    required_version: crate::codex_capabilities::REQUIRED_CODEX_VERSION.to_string(),
+                    runtime_update_required: true,
+                    native_update_required: true,
+                },
             }),
         }
     }
@@ -1767,11 +1784,28 @@ fn production_capabilities(
                 | BlockerReason::UnsupportedCodexVersion
         )
     });
+    let runtime_current_version = match snapshot.evidence.codex_version {
+        crate::codex_capabilities::CodexVersionEvidence::Detected { version } => {
+            Some(version.to_string())
+        }
+        crate::codex_capabilities::CodexVersionEvidence::Missing
+        | crate::codex_capabilities::CodexVersionEvidence::Malformed
+        | crate::codex_capabilities::CodexVersionEvidence::Unavailable => None,
+    };
     DaemonRuntimeCapabilities {
         codex_runtime,
         native_computer_use,
         provider_computer_use: false,
         image_attachments: snapshot.image_attachments_supported(),
+        codex_update_evidence: satelle_core::host_update::CodexUpdateEvidence {
+            ownership: satelle_core::host_update::CodexComponentOwnership::CodexOwned,
+            runtime_current_version: runtime_current_version.clone(),
+            native_component_current_version: native_computer_use
+                .then_some(crate::codex_capabilities::REQUIRED_CODEX_VERSION.to_string()),
+            required_version: crate::codex_capabilities::REQUIRED_CODEX_VERSION.to_string(),
+            runtime_update_required: !codex_runtime,
+            native_update_required: !native_computer_use,
+        },
     }
 }
 

@@ -358,6 +358,12 @@ fn failure(error: &SatelleError) -> ApiFailure {
         // This is a Controller-local reachability error. If it ever reaches
         // the Host boundary, fail closed instead of inventing a wire code.
         | ErrorCode::DirectDaemonUnreachable
+        // Host update planning is Controller-owned. These typed CLI errors
+        // must never be reclassified as Host wire failures.
+        | ErrorCode::HostBinaryNewerThanCli
+        | ErrorCode::HostArtifactUnavailable
+        | ErrorCode::HostUpdateRequiresCliUpgrade
+        | ErrorCode::AmbiguousCodexComponentOwnership
         // Process interruption is a Controller-local process-exit contract.
         // If it crosses the Host boundary, expose no extra API surface.
         | ErrorCode::Interrupted

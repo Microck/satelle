@@ -7,6 +7,8 @@ mod completions;
 mod error_output;
 #[path = "host-trust.rs"]
 mod host_trust;
+#[path = "host-update.rs"]
+mod host_update;
 mod logs;
 mod mcp;
 mod output;
@@ -5645,7 +5647,7 @@ fn run_host(
             config,
             format,
         ),
-        HostCommand::Update(command) => run_host_update(command),
+        HostCommand::Update(command) => run_host_update(command, config, format),
         HostCommand::Cleanup(command) => run_host_cleanup(command, config, format),
         HostCommand::Sessions(command) => show_host_sessions(command, config, format),
         HostCommand::Storage { command } => run_host_storage(command),
@@ -7833,11 +7835,41 @@ fn desktop_policy_is_active(policy: &DesktopSelectionPolicy) -> bool {
     policy.desktop_user.is_some() || policy.preference.is_some() || policy.native_selector.is_some()
 }
 
-fn run_host_update(command: HostUpdateCommand) -> Result<(), CliFailure> {
+fn run_host_update(
+    command: HostUpdateCommand,
+    config: ConfigContext<'_>,
+    format: OutputFormat,
+) -> Result<(), CliFailure> {
     validate_host_update_components(&command.component).map_err(failure)?;
+    if command.all_remotes || command.host.len() > 1 {
+        return Err(failure(SatelleError::not_implemented(
+            "multi-Host update planning belongs to the packet 26 update train",
+        )));
+    }
+    let host = config.resolve_host(command.host.first().map(String::as_str))?;
+    let includes_all = command.component.iter().any(|component| component == "all");
+    let components = command
+        .component
+        .iter()
+        .filter_map(|component| match component.as_str() {
+            "host" => Some(satelle_core::host_update::HostUpdateComponent::Host),
+            "codex" => Some(satelle_core::host_update::HostUpdateComponent::Codex),
+            "all" => None,
+            _ => unreachable!("validated update component"),
+        })
+        .collect::<Vec<_>>();
+    let report = transport::plan_host_update(&host, &components, includes_all).map_err(failure)?;
+    if format.is_json() {
+        print_json(&report).map_err(failure)?;
+    } else {
+        print!("{}", host_update::render_host_update_plan(&report));
+    }
+    if command.dry_run {
+        return Ok(());
+    }
     Err(failure(SatelleError::not_implemented(concat!(
-        "Host update was not run because live Host planning and application are not ",
-        "implemented. No Host state or Satelle sessions were changed."
+        "Host update apply belongs to the packet 15 train. The complete plan above was ",
+        "read-only; no Host state or Satelle sessions were changed."
     ))))
 }
 

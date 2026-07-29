@@ -1026,6 +1026,7 @@ async fn capabilities(
         state.capabilities.codex_runtime(),
         state.capabilities.native_computer_use(),
         state.capabilities.provider_computer_use(),
+        state.capabilities.codex_update_evidence(),
         state.capabilities.image_attachments(),
         state.limits,
     );

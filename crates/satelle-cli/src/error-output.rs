@@ -225,6 +225,15 @@ fn error_contract(code: ErrorCode) -> ErrorContract {
             outcome: "The Host readiness check did not finish.",
             default_recovery: "run satelle doctor --refresh and retry the command",
         },
+        ErrorCode::HostBinaryNewerThanCli
+        | ErrorCode::HostArtifactUnavailable
+        | ErrorCode::HostUpdateRequiresCliUpgrade
+        | ErrorCode::AmbiguousCodexComponentOwnership => ErrorContract {
+            category: ErrorCategory::Readiness,
+            retryable: false,
+            outcome: "The Host update plan could not be applied safely.",
+            default_recovery: "resolve the reported version or ownership blocker and retry",
+        },
         ErrorCode::StoreInUse | ErrorCode::StorageBusy => ErrorContract {
             category: ErrorCategory::Storage,
             retryable: true,

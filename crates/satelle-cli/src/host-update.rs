@@ -1,12 +1,14 @@
 use satelle_core::host_update::{
-    HostUpdateComponent, HostUpdateDisposition, HostUpdateMutation, HostUpdateReport,
-    HostUpdateRestartImpact, HostUpdateTarget, HostUpdateTargetPlan, HostUpdateVersionSource,
-    RepairCompatibilityReason, RepairUpgradeDisposition,
+    CodexComponentOwnership, CodexUpdateEvidence, HostUpdateComponent, HostUpdateDisposition,
+    HostUpdateMutation, HostUpdateReport, HostUpdateRestartImpact, HostUpdateTarget,
+    HostUpdateTargetPlan, HostUpdateVersionSource, RepairCompatibilityReason,
+    RepairUpgradeDisposition,
 };
 use std::collections::BTreeSet;
 use std::fmt::Write as _;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[allow(dead_code)]
 pub enum HostVersionRelation {
     Missing,
     OlderThanCli,
@@ -26,8 +28,8 @@ pub struct HostUpdateInspection {
 pub struct VerifiedHostArtifact {
     pub version: String,
     pub remote_platform: String,
-    pub daemon_destination: String,
-    pub service_destination: String,
+    pub daemon_destination: Option<String>,
+    pub service_destination: Option<String>,
 }
 
 /// T4 owns artifact discovery and target-matrix policy. T1 consumes only a
@@ -40,16 +42,10 @@ pub trait VerifiedHostArtifactResolver {
     ) -> Result<Option<VerifiedHostArtifact>, HostUpdatePlanError>;
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum CodexOwnership {
-    CodexOwned,
-    Ambiguous,
-}
-
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CodexUpdateInspection {
     pub target: HostUpdateTarget,
-    pub ownership: CodexOwnership,
+    pub ownership: CodexComponentOwnership,
     pub current_version: Option<String>,
     pub target_version: String,
     pub update_required: bool,
@@ -216,14 +212,14 @@ fn plan_host_targets(
 fn mutation_for(
     disposition: HostUpdateDisposition,
     operation: &str,
-    destination: String,
+    destination: Option<String>,
 ) -> Vec<HostUpdateMutation> {
     if disposition == HostUpdateDisposition::Current {
         Vec::new()
     } else {
         vec![HostUpdateMutation {
             operation: operation.to_string(),
-            remote_path: Some(destination),
+            remote_path: destination,
         }]
     }
 }
@@ -234,7 +230,7 @@ fn plan_codex_targets(
     inspections
         .iter()
         .map(|inspection| {
-            if inspection.ownership == CodexOwnership::Ambiguous {
+            if inspection.ownership == CodexComponentOwnership::Ambiguous {
                 return Err(HostUpdatePlanError::AmbiguousCodexComponentOwnership {
                     target: inspection.target,
                 });
@@ -272,6 +268,38 @@ fn plan_codex_targets(
         .collect()
 }
 
+pub fn codex_inspections_from_evidence(
+    evidence: &CodexUpdateEvidence,
+) -> [CodexUpdateInspection; 2] {
+    [
+        CodexUpdateInspection {
+            target: HostUpdateTarget::CodexRuntime,
+            ownership: evidence.ownership,
+            current_version: evidence.runtime_current_version.clone(),
+            target_version: evidence.required_version.clone(),
+            update_required: evidence.runtime_update_required,
+            restart_impact: HostUpdateRestartImpact::CodexRuntime,
+            remote_mutations: vec![HostUpdateMutation {
+                operation: "replace_codex_runtime".to_string(),
+                remote_path: None,
+            }],
+        },
+        CodexUpdateInspection {
+            target: HostUpdateTarget::CodexNativeComputerUse,
+            ownership: evidence.ownership,
+            current_version: evidence.native_component_current_version.clone(),
+            target_version: evidence.required_version.clone(),
+            update_required: evidence.native_update_required,
+            restart_impact: HostUpdateRestartImpact::NativeComputerUse,
+            remote_mutations: vec![HostUpdateMutation {
+                operation: "replace_codex_native_computer_use".to_string(),
+                remote_path: None,
+            }],
+        },
+    ]
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn classify_repair_upgrade(
     blocking_reason: Option<RepairCompatibilityReason>,
     automation_is_safe: bool,
@@ -330,8 +358,10 @@ mod tests {
         Artifact(Some(VerifiedHostArtifact {
             version: "1.2.3".to_string(),
             remote_platform: "linux-x64".to_string(),
-            daemon_destination: "/opt/satelle/bin/satelle".to_string(),
-            service_destination: "/home/operator/.config/systemd/user/satelle.service".to_string(),
+            daemon_destination: Some("/opt/satelle/bin/satelle".to_string()),
+            service_destination: Some(
+                "/home/operator/.config/systemd/user/satelle.service".to_string(),
+            ),
         }))
     }
 
@@ -349,7 +379,7 @@ mod tests {
         let codex = [
             CodexUpdateInspection {
                 target: HostUpdateTarget::CodexRuntime,
-                ownership: CodexOwnership::CodexOwned,
+                ownership: CodexComponentOwnership::CodexOwned,
                 current_version: Some("0.9.0".to_string()),
                 target_version: "1.0.0".to_string(),
                 update_required: true,
@@ -361,7 +391,7 @@ mod tests {
             },
             CodexUpdateInspection {
                 target: HostUpdateTarget::CodexNativeComputerUse,
-                ownership: CodexOwnership::CodexOwned,
+                ownership: CodexComponentOwnership::CodexOwned,
                 current_version: None,
                 target_version: "1.0.0".to_string(),
                 update_required: true,
@@ -468,7 +498,7 @@ mod tests {
         let host = host_inspection(HostVersionRelation::MatchesCli);
         let ambiguous = [CodexUpdateInspection {
             target: HostUpdateTarget::CodexNativeComputerUse,
-            ownership: CodexOwnership::Ambiguous,
+            ownership: CodexComponentOwnership::Ambiguous,
             current_version: None,
             target_version: "1.0.0".to_string(),
             update_required: true,
