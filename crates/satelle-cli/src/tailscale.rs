@@ -903,7 +903,8 @@ mod tests {
         let started = std::time::Instant::now();
         let tasks_before = std::fs::read_dir("/proc/self/task")
             .expect("read process tasks before probe")
-            .count();
+            .map(|entry| entry.expect("read process task").file_name())
+            .collect::<std::collections::BTreeSet<_>>();
 
         let report = transport_only_doctor_report(
             "studio",
@@ -917,7 +918,12 @@ mod tests {
         .expect("Direct Tailscale transport report");
         let tasks_after = std::fs::read_dir("/proc/self/task")
             .expect("read process tasks after probe")
-            .count();
+            .map(|entry| entry.expect("read process task").file_name())
+            .collect::<std::collections::BTreeSet<_>>();
+        let surviving_new_tasks = tasks_after
+            .difference(&tasks_before)
+            .cloned()
+            .collect::<Vec<_>>();
         let escaped_pid = std::fs::read_to_string(&escaped_pid_file)
             .expect("read contract-violating descendant pid")
             .parse::<i32>()
@@ -931,9 +937,9 @@ mod tests {
             started.elapsed() < std::time::Duration::from_millis(300),
             "escaped pipe holders must not extend the hard cleanup deadline"
         );
-        assert_eq!(
-            tasks_after, tasks_before,
-            "bounded return must not leave a Satelle-owned stdout reader thread"
+        assert!(
+            surviving_new_tasks.is_empty(),
+            "bounded return must not leave a new Satelle-owned task: {surviving_new_tasks:?}"
         );
     }
 
