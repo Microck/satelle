@@ -4626,6 +4626,7 @@ hostname = "studio"
              waited=0\n\
              while [ ! -e '{}' ] && [ \"$waited\" -lt 300 ]; do\n\
              sleep 0.01; waited=$((waited+1)); done\n\
+             if [ ! -e '{}' ]; then exit 1; fi\n\
              printf '%s' '{{\"BackendState\":\"Running\",\"CurrentTailnet\":\
              {{\"Name\":\"example.test\"}},\"Peer\":{{\"node\":{{\"HostName\":\"studio\",\
              \"DNSName\":\"studio.example.test.\",\"TailscaleIPs\":[\"100.64.0.8\"],\
@@ -4635,6 +4636,7 @@ hostname = "studio"
              if [ \"$1\" = ping ]; then printf ping > '{}'; exit 0; fi\n\
              exit 1\n",
             status_marker.display(),
+            release_status.display(),
             release_status.display(),
             ping_marker.display(),
         ),

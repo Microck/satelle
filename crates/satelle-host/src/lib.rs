@@ -3692,7 +3692,7 @@ fn production_doctor_with_provider_intent(
                     if !should_resolve_provider || !options.refresh() {
                         registry.spawn(request_id, &probe, move |_context| {
                             ProductionDoctorTaskResult {
-                                completion: probe_completion(false),
+                                completion: probe_completion(true),
                                 effect: ProductionDoctorTaskEffect::None,
                             }
                         })?;
@@ -3905,9 +3905,10 @@ fn production_doctor_with_provider_intent(
             }
         }
     }
-    // Refresh applicators may replace evidence-rich result rows, but the
-    // scheduler owns their final status. Apply terminal projection last so a
-    // late raw error cannot relabel TimedOut as blocked.
+    // Refresh applicators and the Phase 0 report own scope-aware Finding and
+    // Passed projections. The scheduler's aggregate Phase 0 completion cannot
+    // safely relabel those rows, but terminal failures, timeouts, and skipped
+    // dependencies still override them.
     apply_production_execution_status(&mut report, &scheduler, &records, &snapshot.finished_at);
     report.probe_schedule_events =
         public_probe_schedule_events(&report, scheduler.schedule_events());
@@ -4095,12 +4096,11 @@ fn apply_production_execution_status(
         else {
             continue;
         };
-        result.status = match record.status {
-            DoctorProbeStatus::Passed => "passed",
-            DoctorProbeStatus::Finding | DoctorProbeStatus::Failed => "blocked",
-            DoctorProbeStatus::TimedOut => "timed_out",
+        match record.status {
+            DoctorProbeStatus::Passed | DoctorProbeStatus::Finding => {}
+            DoctorProbeStatus::Failed => result.status = "blocked".to_string(),
+            DoctorProbeStatus::TimedOut => result.status = "timed_out".to_string(),
         }
-        .to_string();
     }
     recompute_doctor_summary(report);
 }

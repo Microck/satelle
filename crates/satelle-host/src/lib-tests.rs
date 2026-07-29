@@ -1843,6 +1843,87 @@ fn production_doctor_test_service(state: &TestStateDir) -> HostService {
 }
 
 #[test]
+fn unrefreshed_provider_probe_keeps_unobserved_readiness_blocked() {
+    let state = TestStateDir::new().expect("temporary state directory should exist");
+    let service = production_doctor_test_service(&state);
+
+    let report = service
+        .doctor_with_provider_intent(
+            LOCAL_DEMO_HOST,
+            &doctor_selection(&["provider"]),
+            Arc::new(ReadyControllerTransportProbe),
+            DoctorOptions::new(false, Some(Duration::from_millis(100)))
+                .expect("positive timeout is valid"),
+            &ProviderComputerUseIntent::host_default(),
+        )
+        .expect("unrefreshed provider Doctor should return its finding");
+    let provider = report
+        .probe_results
+        .iter()
+        .find(|probe| probe.scope == "provider")
+        .expect("provider result");
+
+    assert_eq!(provider.status, "blocked");
+    assert!(
+        provider.finding_ids.iter().any(|finding_id| {
+            finding_id == "production.provider.provider_readiness_not_observed"
+        })
+    );
+    assert!(!report.ready);
+}
+
+#[test]
+fn non_codex_phase0_findings_do_not_block_the_codex_result() {
+    let state = TestStateDir::new().expect("temporary state directory should exist");
+    let service = production_doctor_test_service(&state);
+    let proven = codex_capabilities::CapabilityEvidence::new(
+        codex_capabilities::EvidenceSurface::Stable,
+        codex_capabilities::LiveProofStatus::Passed,
+    );
+    let mut capabilities = CapabilityMatrix::unproven();
+    capabilities.handshake = proven;
+    capabilities.session_thread_creation = proven;
+    capabilities.turn_start = proven;
+    capabilities.lifecycle_events = proven;
+    let snapshot = capability_snapshot(
+        Phase0CapabilityEvidence {
+            codex_version: CodexVersionEvidence::Detected {
+                version: REQUIRED_CODEX_VERSION,
+            },
+            host_platform: HostPlatform::Windows,
+            capabilities,
+        },
+        1,
+    );
+    let HostMode::Production {
+        snapshot: snapshot_slot,
+    } = &service.mode
+    else {
+        unreachable!("the fixture is a production Host")
+    };
+    *snapshot_slot
+        .write()
+        .expect("production snapshot lock should be available") = snapshot;
+
+    let report = service
+        .doctor(
+            LOCAL_DEMO_HOST,
+            &doctor_selection(&["codex"]),
+            DoctorOptions::default(),
+        )
+        .expect("scope-aware Codex Doctor should return");
+    let codex = report
+        .probe_results
+        .iter()
+        .find(|probe| probe.scope == "codex")
+        .expect("Codex result");
+
+    assert_eq!(codex.status, "passed", "{report:#?}");
+    assert!(codex.finding_ids.is_empty());
+    assert!(report.ready);
+}
+
+#[test]
 fn queued_probe_receives_its_full_timeout_after_resource_admission() {
     let state = TestStateDir::new().expect("temporary state directory should exist");
     let service = production_doctor_test_service(&state);
