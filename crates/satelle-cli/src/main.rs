@@ -67,7 +67,7 @@ use std::process::ExitCode;
 use std::str::FromStr;
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
-use tailscale::{transport_doctor_observation, transport_only_doctor_report};
+use tailscale::{transport_doctor_probe, transport_only_doctor_report};
 use transport::{
     AttachedTurnOutcome, SshBootstrapScope, SshHostDiscovery, authenticated_ssh_bootstrap_user,
     discover_direct_host_identity, discover_ssh_host, transport_for, transport_for_setup,
@@ -4110,18 +4110,19 @@ fn run_doctor(
             .resolve_host(command.host.as_deref())
             .map_err(failure)?,
     );
-    let transport_observation = transport_doctor_observation(&scope_selection, &host.config);
     let options =
         DoctorOptions::new(command.refresh, timeout).with_serial_probes(command.serial_probes);
+    let transport_probe = transport_doctor_probe(&scope_selection, &host.config);
+    if command.events {
+        print_doctor_started_event(&host.alias, &scope_selection).map_err(failure)?;
+    }
     if let Some(report) = transport_only_doctor_report(
         &host.alias,
         &host.config,
         &scope_selection,
-        &transport_observation,
+        &transport_probe,
+        options,
     ) {
-        if command.events {
-            print_doctor_started_event(&host.alias, &scope_selection).map_err(failure)?;
-        }
         return emit_doctor_report(report, command.events, json);
     }
     let transport = transport_for(&host)?;
@@ -4132,12 +4133,9 @@ fn run_doctor(
         options.probe_timeout(),
     )
     .map_err(failure)?;
-    if command.events {
-        print_doctor_started_event(&host.alias, &scope_selection).map_err(failure)?;
-    }
     let report = match transport.doctor(
         &scope_selection,
-        &transport_observation,
+        &transport_probe,
         options,
         &provider_intent,
     ) {

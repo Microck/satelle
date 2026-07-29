@@ -36,7 +36,7 @@ reqwest = { version = "0.13.4", default-features = false, features = ["blocking"
 rmcp = { version = "=2.2.0", default-features = false, features = ["server"] }
 rustls = "0.23.41"
 rustls-platform-verifier = "0.7.0"
-rustix = { version = "1.1.4", features = ["fs", "process"] }
+rustix = { version = "1.1.4", features = ["fs", "process", "pty", "termios"] }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.145"
 sha2 = "0.11.0"

@@ -6149,6 +6149,8 @@ pub struct DoctorOptions {
 }
 
 impl DoctorOptions {
+    pub const DEFAULT_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
     pub const fn new(refresh: bool, probe_timeout: Option<std::time::Duration>) -> Self {
         Self {
             refresh,
@@ -6168,6 +6170,13 @@ impl DoctorOptions {
 
     pub const fn probe_timeout(self) -> Option<std::time::Duration> {
         self.probe_timeout
+    }
+
+    pub const fn effective_probe_timeout(self) -> std::time::Duration {
+        match self.probe_timeout {
+            Some(timeout) => timeout,
+            None => Self::DEFAULT_PROBE_TIMEOUT,
+        }
     }
 
     pub const fn serial_probes(self) -> bool {

@@ -6,16 +6,17 @@ use satelle_core::daemon_service::{
 use satelle_core::doctor::DoctorScopeSelection;
 use satelle_core::session::{HostIdentityRef, PublicSession, TurnAdmissionFailure};
 use satelle_core::{
-    ApiTokenSource, DaemonPathOverrides, DirectHostBinding, DoctorOptions, DoctorReport,
-    DoctorTransportObservation, ErrorCode, HostSessionsReport, HostSessionsSchemaVersion,
-    LOCAL_DEMO_HOST, SatelleError, SatelleEvent, SecureFileError, SessionId, SetupReadinessSummary,
-    SetupReport, SetupRequiredInput, SetupSchemaVersion, SshHostBinding, StopResult, TransportKind,
-    TurnId, open_or_create_owner_only_directory, open_or_create_owner_only_file,
+    ApiTokenSource, DaemonPathOverrides, DirectHostBinding, DoctorOptions, DoctorReport, ErrorCode,
+    HostSessionsReport, HostSessionsSchemaVersion, LOCAL_DEMO_HOST, SatelleError, SatelleEvent,
+    SecureFileError, SessionId, SetupReadinessSummary, SetupReport, SetupRequiredInput,
+    SetupSchemaVersion, SshHostBinding, StopResult, TransportKind, TurnId,
+    open_or_create_owner_only_directory, open_or_create_owner_only_file,
     persist_new_owner_only_secret_file, read_owner_only_secret_file, read_trusted_ca_bundle_file,
 };
 use satelle_host::{
-    AdmissionCancellation, ApiBearerToken, ApiScopes, DaemonLogPage, HostService, HostStatus,
-    LogCursor, LogPageQuery, TurnIntent, TurnOutcome, admission_request_timeout,
+    AdmissionCancellation, ApiBearerToken, ApiScopes, ControllerTransportProbe, DaemonLogPage,
+    HostService, HostStatus, LogCursor, LogPageQuery, TurnIntent, TurnOutcome,
+    admission_request_timeout,
 };
 use satelle_transport::{
     ApiError, ApiErrorCode, DaemonClient, DaemonClientError, DaemonEventClient, DaemonEventError,
@@ -271,7 +272,7 @@ pub(crate) trait TransportClient {
     fn doctor(
         &self,
         scope_selection: &DoctorScopeSelection,
-        transport_observation: &DoctorTransportObservation,
+        transport_probe: &dyn ControllerTransportProbe,
         options: DoctorOptions,
         provider_intent: &satelle_host::ProviderComputerUseIntent,
     ) -> Result<DoctorReport, SatelleError>;
@@ -624,14 +625,14 @@ impl TransportClient for LocalTransport {
     fn doctor(
         &self,
         scope_selection: &DoctorScopeSelection,
-        transport_observation: &DoctorTransportObservation,
+        transport_probe: &dyn ControllerTransportProbe,
         options: DoctorOptions,
         provider_intent: &satelle_host::ProviderComputerUseIntent,
     ) -> Result<DoctorReport, SatelleError> {
         self.service.doctor_with_provider_intent(
             &self.alias,
             scope_selection,
-            transport_observation,
+            transport_probe,
             options,
             provider_intent,
         )
@@ -3375,7 +3376,7 @@ impl TransportClient for SshSetupTransport {
     fn doctor(
         &self,
         _scope_selection: &DoctorScopeSelection,
-        _transport_observation: &DoctorTransportObservation,
+        _transport_probe: &dyn ControllerTransportProbe,
         _options: DoctorOptions,
         _provider_intent: &satelle_host::ProviderComputerUseIntent,
     ) -> Result<DoctorReport, SatelleError> {
@@ -3515,7 +3516,7 @@ impl TransportClient for DirectTransport {
     fn doctor(
         &self,
         _scope_selection: &DoctorScopeSelection,
-        _transport_observation: &DoctorTransportObservation,
+        _transport_probe: &dyn ControllerTransportProbe,
         _options: DoctorOptions,
         _provider_intent: &satelle_host::ProviderComputerUseIntent,
     ) -> Result<DoctorReport, SatelleError> {

@@ -1803,13 +1803,12 @@ impl HostService {
         &self,
         host: &str,
         scope_selection: &DoctorScopeSelection,
-        transport_observation: &DoctorTransportObservation,
         options: DoctorOptions,
     ) -> Result<DoctorReport, SatelleError> {
         self.doctor_with_provider_intent(
             host,
             scope_selection,
-            transport_observation,
+            &ReadyControllerTransportProbe,
             options,
             &ProviderComputerUseIntent::host_default(),
         )
@@ -1819,7 +1818,7 @@ impl HostService {
         &self,
         host: &str,
         scope_selection: &DoctorScopeSelection,
-        transport_observation: &DoctorTransportObservation,
+        transport_probe: &dyn ControllerTransportProbe,
         options: DoctorOptions,
         provider_intent: &ProviderComputerUseIntent,
     ) -> Result<DoctorReport, SatelleError> {
@@ -1828,7 +1827,7 @@ impl HostService {
                 self,
                 host,
                 scope_selection,
-                transport_observation,
+                transport_probe,
                 options,
                 provider_intent,
                 snapshot,
@@ -1837,7 +1836,7 @@ impl HostService {
             HostMode::TestFake { .. } => self.test_fake_doctor_with_provider_intent(
                 host,
                 scope_selection,
-                transport_observation,
+                transport_probe,
                 options,
                 provider_intent,
             ),
@@ -1849,7 +1848,7 @@ impl HostService {
         &self,
         host: &str,
         scope_selection: &DoctorScopeSelection,
-        transport_observation: &DoctorTransportObservation,
+        transport_probe: &dyn ControllerTransportProbe,
         options: DoctorOptions,
         provider_intent: &ProviderComputerUseIntent,
     ) -> Result<DoctorReport, SatelleError> {
@@ -1879,10 +1878,11 @@ impl HostService {
         } else {
             None
         };
+        let transport_observation = execute_controller_transport_probe(transport_probe, options);
         let mut report = self.fake_doctor(
             host,
             scope_selection,
-            transport_observation,
+            &transport_observation,
             options,
             &FakeComputerUseAdapter,
         )?;
@@ -2007,11 +2007,10 @@ impl HostService {
             };
         let scope_selection = DoctorScopeSelection::parse(&raw_scopes)
             .expect("setup verification uses supported Doctor scopes");
-        let transport_observation = DoctorTransportObservation::ready(None);
         let mut report = self.doctor_with_provider_intent(
             host,
             &scope_selection,
-            &transport_observation,
+            &ReadyControllerTransportProbe,
             DoctorOptions::new(true, None),
             provider_intent,
         )?;
@@ -2840,6 +2839,79 @@ impl HostService {
     }
 }
 
+pub enum ControllerTransportProbeOutcome {
+    Observed(DoctorTransportObservation),
+    TimedOut(DoctorTransportObservation),
+}
+
+impl ControllerTransportProbeOutcome {
+    fn observation(&self) -> &DoctorTransportObservation {
+        match self {
+            Self::Observed(observation) | Self::TimedOut(observation) => observation,
+        }
+    }
+
+    fn completion(&self) -> DoctorProbeCompletion {
+        match self {
+            Self::Observed(observation) => probe_completion(!observation.is_ready()),
+            Self::TimedOut(_) => DoctorProbeCompletion::new(
+                DoctorProbeStatus::TimedOut,
+                DoctorDependentEvidence::NotUseful,
+            ),
+        }
+    }
+}
+
+pub trait ControllerTransportProbe: Sync {
+    fn execute(
+        &self,
+        context: &satelle_core::doctor::DoctorProbeExecutionContext,
+    ) -> ControllerTransportProbeOutcome;
+}
+
+struct ReadyControllerTransportProbe;
+
+impl ControllerTransportProbe for ReadyControllerTransportProbe {
+    fn execute(
+        &self,
+        _context: &satelle_core::doctor::DoctorProbeExecutionContext,
+    ) -> ControllerTransportProbeOutcome {
+        ControllerTransportProbeOutcome::Observed(DoctorTransportObservation::ready(None))
+    }
+}
+
+fn execute_controller_transport_probe(
+    probe: &dyn ControllerTransportProbe,
+    options: DoctorOptions,
+) -> DoctorTransportObservation {
+    let outcome = Mutex::new(None);
+    let mut scheduler = DoctorProbeScheduler::new(vec![DoctorProbe {
+        probe_id: DoctorScope::Transport.as_str().to_string(),
+        scope: DoctorScope::Transport.as_str().to_string(),
+        dependencies: Vec::new(),
+        resource_locks: [DoctorProbeResource::RemoteServiceManager]
+            .into_iter()
+            .collect(),
+        timeout: options.effective_probe_timeout(),
+        cache_policy: DoctorProbeCachePolicy::Reuse,
+    }])
+    .expect("the controller transport probe is a valid Doctor graph");
+    scheduler.execute(|_, context| {
+        let executed = probe.execute(context);
+        let completion = executed.completion();
+        *outcome
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(executed);
+        completion
+    });
+    outcome
+        .into_inner()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .expect("the controller transport probe executed")
+        .observation()
+        .clone()
+}
+
 struct ProductionDoctorExecution {
     snapshot: Option<ProductionCapabilitySnapshot>,
     fatal_error: Option<SatelleError>,
@@ -2858,6 +2930,12 @@ struct ProductionDoctorExecution {
         satelle_core::ProviderAuthObservationSource,
     )>,
     provider_not_required: bool,
+    transport: Option<(
+        ControllerTransportProbeOutcome,
+        String,
+        String,
+        std::time::Duration,
+    )>,
 }
 
 impl ProductionDoctorExecution {
@@ -2869,6 +2947,7 @@ impl ProductionDoctorExecution {
             provider_refresh: None,
             provider_auth_evidence: None,
             provider_not_required: false,
+            transport: None,
         }
     }
 }
@@ -2877,7 +2956,7 @@ fn production_doctor_with_provider_intent(
     service: &HostService,
     host: &str,
     scope_selection: &DoctorScopeSelection,
-    transport_observation: &DoctorTransportObservation,
+    transport_probe: &dyn ControllerTransportProbe,
     options: DoctorOptions,
     provider_intent: &ProviderComputerUseIntent,
     snapshot_slot: &Arc<RwLock<ProductionCapabilitySnapshot>>,
@@ -2908,9 +2987,7 @@ fn production_doctor_with_provider_intent(
             scope: DoctorScope::Provider.as_str().to_string(),
             dependencies: Vec::new(),
             resource_locks: Default::default(),
-            timeout: options
-                .probe_timeout()
-                .unwrap_or(std::time::Duration::from_secs(30)),
+            timeout: options.effective_probe_timeout(),
             cache_policy: DoctorProbeCachePolicy::Reuse,
         });
         let provider = probes
@@ -3114,7 +3191,19 @@ fn production_doctor_with_provider_intent(
                 execution.provider_refresh = Some((refresh, started_at, started.elapsed()));
                 completion
             }
-            "transport" => probe_completion(!transport_observation.is_ready()),
+            "transport" => {
+                let started_at = utc_now();
+                let started = Instant::now();
+                let outcome = transport_probe.execute(context);
+                let finished_at = utc_now();
+                let duration = started.elapsed();
+                let completion = outcome.completion();
+                execution
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .transport = Some((outcome, started_at, finished_at, duration));
+                completion
+            }
             "config" => probe_completion(false),
             unknown => panic!("unknown production Doctor probe {unknown}"),
         }
@@ -3130,6 +3219,12 @@ fn production_doctor_with_provider_intent(
     }
     let (snapshot, snapshot_was_refreshed) =
         production_snapshot_after_execution(&mut execution, &records, snapshot_slot)?;
+    let default_transport_observation = DoctorTransportObservation::ready(None);
+    let transport_observation = execution
+        .transport
+        .as_ref()
+        .map(|(outcome, _, _, _)| outcome.observation())
+        .unwrap_or(&default_transport_observation);
     let mut report = production_doctor_report_with_selection(
         host,
         scope_selection,
@@ -3156,6 +3251,24 @@ fn production_doctor_with_provider_intent(
         ))
     ) {
         recompute_doctor_summary(&mut report);
+    }
+    if let Some((outcome, started_at, finished_at, duration)) = &execution.transport
+        && let Some(result) = report
+            .probe_results
+            .iter_mut()
+            .find(|result| result.scope == DoctorScope::Transport.as_str())
+    {
+        result.started_at = started_at.clone();
+        result.finished_at = finished_at.clone();
+        result.duration_ms = duration.as_millis().try_into().unwrap_or(u64::MAX);
+        result.status = match outcome {
+            ControllerTransportProbeOutcome::Observed(observation) if observation.is_ready() => {
+                "passed"
+            }
+            ControllerTransportProbeOutcome::Observed(_) => "blocked",
+            ControllerTransportProbeOutcome::TimedOut(_) => "timed_out",
+        }
+        .to_string();
     }
     if let Some((outcome, source)) = execution.provider_auth_evidence {
         for finding in &mut report.findings {
@@ -3846,7 +3959,7 @@ fn production_doctor_probes(
     scopes: &[DoctorScope],
     probe_timeout: Option<std::time::Duration>,
 ) -> Vec<DoctorProbe> {
-    let timeout = probe_timeout.unwrap_or(std::time::Duration::from_secs(30));
+    let timeout = probe_timeout.unwrap_or(DoctorOptions::DEFAULT_PROBE_TIMEOUT);
     scopes
         .iter()
         .map(|scope| {
@@ -4418,6 +4531,61 @@ mod packet17_doctor_tests {
             &native_only_intent,
         ));
     }
+}
+
+#[cfg(test)]
+#[test]
+fn host_scheduler_invokes_controller_transport_probe_and_continues_independent_work() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct TimedOutTransportProbe<'a>(&'a AtomicUsize);
+
+    impl ControllerTransportProbe for TimedOutTransportProbe<'_> {
+        fn execute(
+            &self,
+            _context: &satelle_core::doctor::DoctorProbeExecutionContext,
+        ) -> ControllerTransportProbeOutcome {
+            self.0.fetch_add(1, Ordering::AcqRel);
+            ControllerTransportProbeOutcome::TimedOut(DoctorTransportObservation::blocked(
+                DoctorFinding {
+                    finding_id: "transport_timeout".to_string(),
+                    scope: DoctorScope::Transport.as_str().to_string(),
+                    severity: "error".to_string(),
+                    fixability: DoctorFixability::Blocked,
+                    readiness_impact: "blocked".to_string(),
+                    summary: "transport timed out".to_string(),
+                    evidence: Vec::new(),
+                    recovery_command: None,
+                },
+            ))
+        }
+    }
+
+    let calls = AtomicUsize::new(0);
+    let transport = TimedOutTransportProbe(&calls);
+    let probes = production_doctor_probes(
+        &[DoctorScope::Transport, DoctorScope::Config],
+        Some(std::time::Duration::from_secs(1)),
+    );
+    let mut scheduler =
+        DoctorProbeScheduler::new(probes).expect("transport and config probes form a valid graph");
+    let records = scheduler.execute(|probe, context| {
+        if probe.scope == DoctorScope::Transport.as_str() {
+            transport.execute(context).completion()
+        } else {
+            DoctorProbeCompletion::new(DoctorProbeStatus::Passed, DoctorDependentEvidence::Useful)
+        }
+    });
+
+    assert_eq!(calls.load(Ordering::Acquire), 1);
+    assert!(records.iter().any(|record| {
+        record.probe_id == DoctorScope::Transport.as_str()
+            && record.status == DoctorProbeStatus::TimedOut
+    }));
+    assert!(records.iter().any(|record| {
+        record.probe_id == DoctorScope::Config.as_str()
+            && record.status == DoctorProbeStatus::Passed
+    }));
 }
 
 #[cfg(test)]

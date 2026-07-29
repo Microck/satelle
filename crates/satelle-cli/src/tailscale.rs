@@ -1,8 +1,14 @@
-use satelle_core::doctor::{DoctorScope, DoctorScopeSelection};
-use satelle_core::{
-    DoctorFinding, DoctorFixability, DoctorProbeResult, DoctorReport, DoctorSchemaVersion,
-    DoctorSummary, DoctorTransportObservation, HostConfig, NetworkConfig, TransportKind, utc_now,
+use satelle_core::doctor::{
+    DoctorDependentEvidence, DoctorProbe, DoctorProbeCachePolicy, DoctorProbeCompletion,
+    DoctorProbeExecutionContext, DoctorProbeScheduler, DoctorProbeStatus, DoctorScope,
+    DoctorScopeSelection,
 };
+use satelle_core::{
+    DoctorFinding, DoctorFixability, DoctorOptions, DoctorProbeResult, DoctorReport,
+    DoctorSchemaVersion, DoctorSummary, DoctorTransportObservation, HostConfig, NetworkConfig,
+    TransportKind, utc_now,
+};
+use satelle_host::{ControllerTransportProbe, ControllerTransportProbeOutcome};
 use serde::Deserialize;
 use std::collections::BTreeMap;
 use std::io::{self, Read};
@@ -13,84 +19,127 @@ use url::Url;
 
 const MAX_STATUS_BYTES: usize = 1024 * 1024;
 
-pub(super) fn transport_doctor_observation(
-    scope_selection: &DoctorScopeSelection,
-    host: &HostConfig,
-) -> DoctorTransportObservation {
-    transport_doctor_observation_with(scope_selection, host, Path::new("tailscale"))
-        .unwrap_or_else(|| DoctorTransportObservation::ready(None))
+pub(super) struct TailscaleDoctorProbe {
+    executable: std::path::PathBuf,
+    tailnet_name: Option<String>,
+    target: Option<String>,
+    selected: bool,
 }
 
-fn transport_doctor_observation_with(
+pub(super) fn transport_doctor_probe(
+    scope_selection: &DoctorScopeSelection,
+    host: &HostConfig,
+) -> TailscaleDoctorProbe {
+    transport_doctor_probe_with(scope_selection, host, Path::new("tailscale"))
+}
+
+fn transport_doctor_probe_with(
     scope_selection: &DoctorScopeSelection,
     host: &HostConfig,
     executable: &Path,
-) -> Option<DoctorTransportObservation> {
-    if !scope_selection.contains(DoctorScope::Transport) {
-        return None;
-    }
-    let NetworkConfig::Tailscale {
+) -> TailscaleDoctorProbe {
+    let Some(NetworkConfig::Tailscale {
         tailnet_name,
         hostname,
-    } = host.network.as_ref()?;
+    }) = host.network.as_ref()
+    else {
+        return TailscaleDoctorProbe {
+            executable: executable.to_path_buf(),
+            tailnet_name: None,
+            target: None,
+            selected: false,
+        };
+    };
     let address_target = host
         .address
         .as_deref()
         .and_then(|address| address_host(&host.transport, address));
-    let target = hostname.as_deref().or(address_target.as_deref());
-
-    // Tailscale is only a network provider. This path deliberately uses
-    // read-only status and ping operations and never changes daemon, ACL, or
-    // Serve state.
-    let mut diagnosis = match read_status(executable) {
-        Ok(status) => diagnose_status(status, tailnet_name.as_deref(), target),
-        Err(StatusReadError::MissingCli) => Diagnosis::blocked(
-            "tailscale_cli_unavailable",
-            "the local Tailscale CLI is unavailable; configuration was validated but live checks were skipped",
-            vec![
-                "network_provider=tailscale".to_string(),
-                "live_checks=skipped".to_string(),
-            ],
-            Some("tailscale status --json"),
-        ),
-        Err(StatusReadError::CommandFailed) => Diagnosis::blocked(
-            "tailscale_status_unavailable",
-            "the local Tailscale daemon or login state is unavailable",
-            vec!["network_provider=tailscale".to_string()],
-            Some("tailscale status --json"),
-        ),
-        Err(StatusReadError::InvalidOutput) => Diagnosis::blocked(
-            "tailscale_status_invalid",
-            "the local Tailscale status response could not be read safely",
-            vec!["network_provider=tailscale".to_string()],
-            Some("tailscale status --json"),
-        ),
-    };
-    if diagnosis.ready
-        && let Some(target) = diagnosis.ping_target.as_deref()
-        && ping(executable, target).is_err()
-    {
-        diagnosis = Diagnosis::blocked(
-            "tailscale_host_unreachable",
-            "the configured host is visible but did not answer a Tailscale-layer reachability probe",
-            vec![format!("configured_target={target}")],
-            Some("tailscale ping --c 1 <host>"),
-        );
+    TailscaleDoctorProbe {
+        executable: executable.to_path_buf(),
+        tailnet_name: tailnet_name.clone(),
+        target: hostname.clone().or(address_target),
+        selected: scope_selection.contains(DoctorScope::Transport),
     }
+}
 
-    let finding = diagnosis.finding;
-    Some(if diagnosis.ready {
-        DoctorTransportObservation::ready(Some(finding))
-    } else {
-        DoctorTransportObservation::blocked(finding)
-    })
+impl ControllerTransportProbe for TailscaleDoctorProbe {
+    fn execute(&self, context: &DoctorProbeExecutionContext) -> ControllerTransportProbeOutcome {
+        if !self.selected {
+            return ControllerTransportProbeOutcome::Observed(DoctorTransportObservation::ready(
+                None,
+            ));
+        }
+        self.execute_selected(context)
+    }
+}
+
+impl TailscaleDoctorProbe {
+    fn execute_selected(
+        &self,
+        context: &DoctorProbeExecutionContext,
+    ) -> ControllerTransportProbeOutcome {
+        // Tailscale is only a network provider. This path deliberately uses
+        // read-only status and ping operations and never changes daemon, ACL, or
+        // Serve state.
+        let mut diagnosis = match read_status(&self.executable, context) {
+            Ok(status) => {
+                diagnose_status(status, self.tailnet_name.as_deref(), self.target.as_deref())
+            }
+            Err(StatusReadError::TimedOut) => {
+                return ControllerTransportProbeOutcome::TimedOut(timeout_observation());
+            }
+            Err(StatusReadError::MissingCli) => Diagnosis::blocked(
+                "tailscale_cli_unavailable",
+                "the local Tailscale CLI is unavailable; configuration was validated but live checks were skipped",
+                vec![
+                    "network_provider=tailscale".to_string(),
+                    "live_checks=skipped".to_string(),
+                ],
+                Some("tailscale status --json"),
+            ),
+            Err(StatusReadError::CommandFailed) => Diagnosis::blocked(
+                "tailscale_status_unavailable",
+                "the local Tailscale daemon or login state is unavailable",
+                vec!["network_provider=tailscale".to_string()],
+                Some("tailscale status --json"),
+            ),
+            Err(StatusReadError::InvalidOutput) => Diagnosis::blocked(
+                "tailscale_status_invalid",
+                "the local Tailscale status response could not be read safely",
+                vec!["network_provider=tailscale".to_string()],
+                Some("tailscale status --json"),
+            ),
+        };
+        if diagnosis.ready
+            && let Some(target) = diagnosis.ping_target.as_deref()
+            && let Err(error) = ping(&self.executable, target, context)
+        {
+            if error == StatusReadError::TimedOut {
+                return ControllerTransportProbeOutcome::TimedOut(timeout_observation());
+            }
+            diagnosis = Diagnosis::blocked(
+                "tailscale_host_unreachable",
+                "the configured host is visible but did not answer a Tailscale-layer reachability probe",
+                vec![format!("configured_target={target}")],
+                Some("tailscale ping --c 1 <host>"),
+            );
+        }
+
+        let finding = diagnosis.finding;
+        ControllerTransportProbeOutcome::Observed(if diagnosis.ready {
+            DoctorTransportObservation::ready(Some(finding))
+        } else {
+            DoctorTransportObservation::blocked(finding)
+        })
+    }
 }
 
 pub(super) fn transport_only_doctor_report(
     host_alias: &str,
     host: &HostConfig,
     scope_selection: &DoctorScopeSelection,
-    observation: &DoctorTransportObservation,
+    probe: &TailscaleDoctorProbe,
+    options: DoctorOptions,
 ) -> Option<DoctorReport> {
     if scope_selection.scopes() != [DoctorScope::Transport]
         || !matches!(host.transport, TransportKind::Direct | TransportKind::Ssh)
@@ -99,7 +148,48 @@ pub(super) fn transport_only_doctor_report(
         return None;
     }
 
-    let started_at = utc_now();
+    let execution = std::sync::Mutex::new(None);
+    let mut scheduler = DoctorProbeScheduler::new(vec![DoctorProbe {
+        probe_id: "transport.tailscale.local".to_string(),
+        scope: DoctorScope::Transport.as_str().to_string(),
+        dependencies: Vec::new(),
+        resource_locks: Default::default(),
+        timeout: options.effective_probe_timeout(),
+        cache_policy: DoctorProbeCachePolicy::RefreshWhenRequested,
+    }])
+    .expect("the transport-only Doctor probe graph is valid");
+    let records = scheduler.execute(|_, context| {
+        let started_at = utc_now();
+        let started = std::time::Instant::now();
+        let outcome = probe.execute(context);
+        let finished_at = utc_now();
+        let duration = started.elapsed();
+        let completion = match &outcome {
+            ControllerTransportProbeOutcome::Observed(observation) => DoctorProbeCompletion::new(
+                if observation.is_ready() {
+                    DoctorProbeStatus::Passed
+                } else {
+                    DoctorProbeStatus::Finding
+                },
+                DoctorDependentEvidence::Useful,
+            ),
+            ControllerTransportProbeOutcome::TimedOut(_) => DoctorProbeCompletion::new(
+                DoctorProbeStatus::TimedOut,
+                DoctorDependentEvidence::NotUseful,
+            ),
+        };
+        *execution.lock().expect("transport execution lock") =
+            Some((outcome, started_at, finished_at, duration));
+        completion
+    });
+    let (outcome, started_at, finished_at, duration) = execution
+        .into_inner()
+        .expect("transport execution lock")
+        .expect("transport probe executed");
+    let observation = match &outcome {
+        ControllerTransportProbeOutcome::Observed(observation)
+        | ControllerTransportProbeOutcome::TimedOut(observation) => observation,
+    };
     let findings = observation
         .finding()
         .cloned()
@@ -114,7 +204,16 @@ pub(super) fn transport_only_doctor_report(
         .filter_map(|finding| finding.recovery_command.clone())
         .collect::<Vec<_>>();
     let ready = observation.is_ready();
-    let finished_at = utc_now();
+    let status = records
+        .first()
+        .map(|record| match record.status {
+            DoctorProbeStatus::Passed => "passed",
+            DoctorProbeStatus::Finding => "finding",
+            DoctorProbeStatus::Failed => "failed",
+            DoctorProbeStatus::TimedOut => "timed_out",
+        })
+        .unwrap_or("failed");
+    let duration_ms = duration.as_millis().try_into().unwrap_or(u64::MAX);
 
     Some(DoctorReport {
         schema_version: DoctorSchemaVersion::V1,
@@ -124,7 +223,7 @@ pub(super) fn transport_only_doctor_report(
         scopes: vec![DoctorScope::Transport.as_str().to_string()],
         started_at: started_at.clone(),
         finished_at: finished_at.clone(),
-        duration_ms: 0,
+        duration_ms,
         summary: DoctorSummary {
             ready,
             blocking_findings: findings
@@ -143,10 +242,10 @@ pub(super) fn transport_only_doctor_report(
         probe_results: vec![DoctorProbeResult {
             probe_id: "transport.tailscale.local".to_string(),
             scope: DoctorScope::Transport.as_str().to_string(),
-            status: if ready { "passed" } else { "blocked" }.to_string(),
+            status: status.to_string(),
             started_at,
             finished_at,
-            duration_ms: 0,
+            duration_ms,
             cache_status: "not_persisted".to_string(),
             dependency_status: "satisfied".to_string(),
             finding_ids,
@@ -159,16 +258,40 @@ pub(super) fn transport_only_doctor_report(
     })
 }
 
-fn read_status(executable: &Path) -> Result<TailscaleStatus, StatusReadError> {
-    let stdout = run_bounded(executable, &["status", "--json"])?;
+fn read_status(
+    executable: &Path,
+    context: &DoctorProbeExecutionContext,
+) -> Result<TailscaleStatus, StatusReadError> {
+    let stdout = run_bounded(executable, &["status".into(), "--json".into()], context)?;
     serde_json::from_slice(&stdout).map_err(|_| StatusReadError::InvalidOutput)
 }
 
-fn ping(executable: &Path, target: &str) -> Result<(), StatusReadError> {
-    run_bounded(executable, &["ping", "--c", "1", "--timeout", "5s", target]).map(|_| ())
+fn ping(
+    executable: &Path,
+    target: &str,
+    context: &DoctorProbeExecutionContext,
+) -> Result<(), StatusReadError> {
+    let remaining_ms = context.remaining().as_millis().max(1);
+    run_bounded(
+        executable,
+        &[
+            "ping".into(),
+            "--c".into(),
+            "1".into(),
+            "--timeout".into(),
+            format!("{remaining_ms}ms"),
+            target.into(),
+        ],
+        context,
+    )
+    .map(|_| ())
 }
 
-fn run_bounded(executable: &Path, args: &[&str]) -> Result<Vec<u8>, StatusReadError> {
+fn run_bounded(
+    executable: &Path,
+    args: &[String],
+    context: &DoctorProbeExecutionContext,
+) -> Result<Vec<u8>, StatusReadError> {
     let mut child = Command::new(executable)
         .args(args)
         .stdin(Stdio::null())
@@ -190,7 +313,25 @@ fn run_bounded(executable: &Path, args: &[&str]) -> Result<Vec<u8>, StatusReadEr
             .read_to_end(&mut bytes)
             .map(|_| bytes)
     });
-    let status = child.wait().map_err(|_| StatusReadError::CommandFailed)?;
+    let status = loop {
+        if let Some(status) = child
+            .try_wait()
+            .map_err(|_| StatusReadError::CommandFailed)?
+        {
+            break Some(status);
+        }
+        let remaining = context.remaining();
+        if remaining.is_zero() {
+            break None;
+        }
+        thread::sleep(remaining.min(std::time::Duration::from_millis(10)));
+    };
+    let Some(status) = status else {
+        let _ = child.kill();
+        let _ = child.wait();
+        let _ = reader.join();
+        return Err(StatusReadError::TimedOut);
+    };
     let stdout = reader
         .join()
         .map_err(|_| StatusReadError::InvalidOutput)?
@@ -373,6 +514,19 @@ enum StatusReadError {
     MissingCli,
     CommandFailed,
     InvalidOutput,
+    TimedOut,
+}
+
+fn timeout_observation() -> DoctorTransportObservation {
+    DoctorTransportObservation::blocked(
+        Diagnosis::blocked(
+            "tailscale_probe_timed_out",
+            "the local Tailscale diagnostic exceeded its Doctor probe deadline",
+            vec!["network_provider=tailscale".to_string()],
+            Some("satelle doctor --scope transport --json"),
+        )
+        .finding,
+    )
 }
 
 struct Diagnosis {
@@ -460,15 +614,23 @@ mod tests {
     fn missing_cli_keeps_configuration_evidence_in_a_partial_report() {
         let selection = DoctorScopeSelection::parse(&["transport".to_string()])
             .expect("transport scope should parse");
-        let observation = transport_doctor_observation_with(
+        let host = tailscale_host();
+        let probe = transport_doctor_probe_with(
             &selection,
-            &tailscale_host(),
+            &host,
             Path::new("/definitely/missing/tailscale"),
+        );
+        let report = transport_only_doctor_report(
+            "studio",
+            &host,
+            &selection,
+            &probe,
+            DoctorOptions::new(false, None),
         )
-        .expect("Tailscale host should produce a transport observation");
+        .expect("Tailscale host should produce a transport report");
 
-        assert!(!observation.is_ready());
-        let finding = observation.finding().expect("blocked transport finding");
+        assert!(!report.ready);
+        let finding = report.findings.first().expect("blocked transport finding");
         assert_eq!(finding.finding_id, "tailscale_cli_unavailable");
         assert_eq!(
             finding.evidence,
@@ -484,47 +646,23 @@ mod tests {
         let selection = DoctorScopeSelection::parse(&["config".to_string()])
             .expect("config scope should parse");
 
-        let observation = transport_doctor_observation_with(
+        let host = tailscale_host();
+        let probe = transport_doctor_probe_with(
             &selection,
-            &tailscale_host(),
+            &host,
             Path::new("/definitely/missing/tailscale"),
         );
 
-        assert!(observation.is_none());
-    }
-
-    #[test]
-    fn direct_and_ssh_transport_only_diagnostics_use_the_local_typed_observation() {
-        let selection = DoctorScopeSelection::parse(&["transport".to_string()])
-            .expect("transport scope should parse");
-        let finding = DoctorFinding {
-            finding_id: "tailscale_host_reachable".to_string(),
-            scope: "transport".to_string(),
-            severity: "info".to_string(),
-            fixability: DoctorFixability::Informational,
-            readiness_impact: "ready".to_string(),
-            summary: "the configured host is reachable through Tailscale".to_string(),
-            evidence: vec!["network_provider=tailscale".to_string()],
-            recovery_command: None,
-        };
-        let observation = DoctorTransportObservation::ready(Some(finding));
-
-        for transport in [TransportKind::Direct, TransportKind::Ssh] {
-            let mut host = tailscale_host();
-            let is_ssh = transport == TransportKind::Ssh;
-            host.transport = transport;
-            if is_ssh {
-                host.address = Some("operator@studio".to_string());
-            }
-
-            let report = transport_only_doctor_report("studio", &host, &selection, &observation)
-                .expect("Tailscale transport-only diagnostics stay local");
-
-            assert!(report.ready);
-            assert_eq!(report.scopes, ["transport"]);
-            assert_eq!(report.probe_results[0].status, "passed");
-            assert_eq!(report.findings[0].finding_id, "tailscale_host_reachable");
-        }
+        assert!(
+            transport_only_doctor_report(
+                "studio",
+                &host,
+                &selection,
+                &probe,
+                DoctorOptions::new(false, None),
+            )
+            .is_none()
+        );
     }
 
     fn tailscale_host() -> HostConfig {
@@ -561,6 +699,144 @@ mod tests {
             }),
             ca_bundle: None,
             provider_auth: BTreeMap::new(),
+        }
+    }
+
+    #[cfg(unix)]
+    fn executable_fixture(contents: &str) -> (tempfile::TempDir, PathBuf) {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempfile::tempdir().expect("create Tailscale fixture directory");
+        let executable = directory.path().join("tailscale-fixture");
+        std::fs::write(&executable, contents).expect("write Tailscale fixture");
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700))
+            .expect("make Tailscale fixture executable");
+        (directory, executable)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn blocking_status_times_out_and_is_killed_and_reaped() {
+        let fifo_directory = tempfile::tempdir().expect("create status FIFO directory");
+        let fifo = fifo_directory.path().join("status");
+        std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .expect("create status FIFO")
+            .success()
+            .then_some(())
+            .expect("mkfifo succeeds");
+        let pid_file = fifo_directory.path().join("pid");
+        let script = format!(
+            "#!/bin/sh\nprintf '%s' \"$$\" > '{}'\nexec cat '{}'\n",
+            pid_file.display(),
+            fifo.display()
+        );
+        let (_fixture, executable) = executable_fixture(&script);
+        let selection =
+            DoctorScopeSelection::parse(&["transport".to_string()]).expect("transport scope");
+        let host = tailscale_host();
+        let probe = transport_doctor_probe_with(&selection, &host, &executable);
+
+        let report = transport_only_doctor_report(
+            "studio",
+            &host,
+            &selection,
+            &probe,
+            DoctorOptions::new(false, Some(std::time::Duration::from_millis(40))),
+        )
+        .expect("Direct Tailscale transport report");
+
+        assert_eq!(report.probe_results[0].status, "timed_out");
+        assert!(report.probe_results[0].duration_ms > 0);
+        let pid = std::fs::read_to_string(pid_file).expect("read blocked status pid");
+        assert!(
+            !Path::new("/proc").join(pid).exists(),
+            "timed out status child must be reaped"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn blocking_ping_uses_only_the_remaining_scheduler_budget() {
+        let directory = tempfile::tempdir().expect("create ping FIFO directory");
+        let fifo = directory.path().join("ping");
+        assert!(
+            std::process::Command::new("mkfifo")
+                .arg(&fifo)
+                .status()
+                .expect("create ping FIFO")
+                .success()
+        );
+        let arguments = directory.path().join("arguments");
+        let script = format!(
+            "#!/bin/sh\nif [ \"$1\" = status ]; then\n  printf '%s' \
+             '{{\"BackendState\":\"Running\",\"CurrentTailnet\":{{\"Name\":\"example.test\"}},\
+             \"Peer\":{{\"node\":{{\"HostName\":\"studio\",\"DNSName\":\"studio.example.test.\",\
+             \"TailscaleIPs\":[\"100.64.0.8\"],\"Online\":true}}}}}}'\nelse\n  printf '%s\\n' \"$@\" > '{}'\n  exec cat '{}'\nfi\n",
+            arguments.display(),
+            fifo.display()
+        );
+        let (_fixture, executable) = executable_fixture(&script);
+        let selection =
+            DoctorScopeSelection::parse(&["transport".to_string()]).expect("transport scope");
+        let host = tailscale_host();
+        let probe = transport_doctor_probe_with(&selection, &host, &executable);
+
+        let report = transport_only_doctor_report(
+            "studio",
+            &host,
+            &selection,
+            &probe,
+            DoctorOptions::new(false, Some(std::time::Duration::from_millis(60))),
+        )
+        .expect("Direct Tailscale transport report");
+
+        assert_eq!(report.probe_results[0].status, "timed_out");
+        let arguments = std::fs::read_to_string(arguments).expect("read ping arguments");
+        assert!(arguments.contains("--timeout"));
+        assert!(arguments.contains("ms"));
+        assert!(!arguments.contains("5s"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn direct_and_ssh_transport_only_reports_publish_live_timing_and_status() {
+        for transport in [TransportKind::Direct, TransportKind::Ssh] {
+            let fifo_directory = tempfile::tempdir().expect("create timing FIFO directory");
+            let fifo = fifo_directory.path().join("status");
+            assert!(
+                std::process::Command::new("mkfifo")
+                    .arg(&fifo)
+                    .status()
+                    .expect("create timing FIFO")
+                    .success()
+            );
+            let script = format!("#!/bin/sh\nexec cat '{}'\n", fifo.display());
+            let (_fixture, executable) = executable_fixture(&script);
+            let selection =
+                DoctorScopeSelection::parse(&["transport".to_string()]).expect("transport scope");
+            let mut host = tailscale_host();
+            host.transport = transport.clone();
+            if transport == TransportKind::Ssh {
+                host.address = Some("operator@studio".to_string());
+            }
+            let probe = transport_doctor_probe_with(&selection, &host, &executable);
+
+            let report = transport_only_doctor_report(
+                "studio",
+                &host,
+                &selection,
+                &probe,
+                DoctorOptions::new(false, Some(std::time::Duration::from_millis(30))),
+            )
+            .expect("transport-only report");
+
+            assert_eq!(report.probe_results[0].status, "timed_out");
+            assert!(report.duration_ms > 0);
+            assert_eq!(report.duration_ms, report.probe_results[0].duration_ms);
+            assert_eq!(report.started_at, report.probe_results[0].started_at);
+            assert_eq!(report.finished_at, report.probe_results[0].finished_at);
         }
     }
 }

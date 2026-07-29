@@ -7,14 +7,14 @@ use satelle_host::{ApiScopes, HostService};
 use satelle_test_contract::{assert_directory_tree_unchanged, assert_privacy_canaries_absent};
 use serde_json::Value;
 use std::collections::BTreeSet;
-use std::fs;
+use std::fs::{self, File};
 #[cfg(target_os = "linux")]
-use std::io::{Read, Write};
+use std::io::{BufRead, Read, Write};
 use std::net::TcpListener;
 #[cfg(target_os = "linux")]
 use std::net::TcpStream;
 #[cfg(target_os = "linux")]
-use std::process::{Child, ChildStdin, Stdio};
+use std::process::{Child, Stdio};
 #[cfg(target_os = "linux")]
 use std::sync::mpsc::{self, Receiver};
 #[cfg(target_os = "linux")]
@@ -3442,11 +3442,7 @@ fn setup_interactive_json_decline_reports_typed_cancellation() {
 fn setup_interactive_prompt_interruption_uses_the_interrupted_exit_contract() {
     let state = state_dir();
     let executable = assert_cmd::cargo::cargo_bin!("satelle");
-    let command_line = format!(
-        "{} --error-format json setup --host local-demo",
-        executable.display()
-    );
-    let mut command = std::process::Command::new("script");
+    let mut command = std::process::Command::new(executable);
     for name in [
         "SATELLE_HOME",
         "SATELLE_CONFIG_FILE",
@@ -3460,43 +3456,12 @@ fn setup_interactive_prompt_interruption_uses_the_interrupted_exit_contract() {
     ] {
         command.env_remove(name);
     }
-    let mut child = command
+    command
         .env("SATELLE_STATE_DIR", state.path())
         .env("SATELLE_COMMAND_HISTORY", "false")
         .env(TEST_SUPPORT_ADAPTER_ENV, "fake")
-        .args(["-qec", command_line.as_str(), "/dev/null"])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("spawn synchronized setup PTY");
-    let stdin = child.stdin.take().expect("take setup PTY stdin");
-    let mut stdout = child.stdout.take().expect("take setup PTY stdout");
-    let mut stderr = child.stderr.take().expect("take setup PTY stderr");
-    let (stdout_sender, stdout_receiver) = mpsc::channel();
-    let stdout_reader = thread::spawn(move || {
-        let mut byte = [0_u8; 1];
-        while stdout.read_exact(&mut byte).is_ok() {
-            if stdout_sender.send(byte[0]).is_err() {
-                break;
-            }
-        }
-    });
-    let stderr_reader = thread::spawn(move || {
-        let mut bytes = Vec::new();
-        stderr
-            .read_to_end(&mut bytes)
-            .expect("read setup PTY stderr");
-        bytes
-    });
-    let mut process = ProviderSecretPtyProcess {
-        child,
-        stdin: Some(stdin),
-        stdout: Vec::new(),
-        stdout_receiver,
-        stdout_reader,
-        stderr_reader,
-    };
+        .args(["--error-format", "json", "setup", "--host", "local-demo"]);
+    let mut process = spawn_pty_command(command);
     process.wait_for_after("Apply these setup mutations?", 0);
     process.write_input("\u{1b}");
     let output = process.finish();
@@ -4616,6 +4581,84 @@ fn doctor_timeout_requires_refresh_and_live_probe_scope() {
         .stderr(predicate::str::contains(
             r#""code": "refresh-timeout-without-refresh""#,
         ));
+}
+
+#[cfg(unix)]
+#[test]
+fn doctor_started_is_emitted_before_the_tailscale_probe_completes() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let state = state_dir();
+    let config = state.path().join("tailscale-doctor.toml");
+    write_user_config(
+        &config,
+        r#"
+default_host = "selected"
+
+[hosts.selected]
+transport = "direct"
+adapter = "codex"
+address = "https://studio.example.test:3001"
+
+[hosts.selected.network]
+provider = "tailscale"
+tailnet_name = "example.test"
+hostname = "studio"
+"#,
+    )
+    .expect("write Tailscale Doctor config");
+    let bin = tempfile::tempdir().expect("create fake Tailscale bin");
+    let marker = state.path().join("tailscale-invoked");
+    let tailscale = bin.path().join("tailscale");
+    std::fs::write(
+        &tailscale,
+        format!(
+            "#!/bin/sh\nprintf invoked > '{}'\nif [ \"$1\" = status ]; then\n\
+             printf '%s' '{{\"BackendState\":\"Running\",\"CurrentTailnet\":\
+             {{\"Name\":\"example.test\"}},\"Peer\":{{\"node\":{{\"HostName\":\"studio\",\
+             \"DNSName\":\"studio.example.test.\",\"TailscaleIPs\":[\"100.64.0.8\"],\
+             \"Online\":true}}}}}}'\nfi\n",
+            marker.display()
+        ),
+    )
+    .expect("write fake Tailscale executable");
+    std::fs::set_permissions(&tailscale, std::fs::Permissions::from_mode(0o700))
+        .expect("make fake Tailscale executable");
+    let path = format!(
+        "{}:{}",
+        bin.path().display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let mut child = std::process::Command::new(assert_cmd::cargo::cargo_bin!("satelle"))
+        .env("SATELLE_CONFIG_FILE", &config)
+        .env("SATELLE_STATE_DIR", state.path())
+        .env("SATELLE_COMMAND_HISTORY", "false")
+        .env("PATH", path)
+        .args([
+            "doctor",
+            "--host",
+            "selected",
+            "--scope",
+            "transport",
+            "--events",
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn event-mode Tailscale Doctor");
+    let mut stdout = std::io::BufReader::new(child.stdout.take().expect("take Doctor stdout"));
+    let mut first = String::new();
+    stdout
+        .read_line(&mut first)
+        .expect("read first Doctor event");
+
+    let first: Value = serde_json::from_str(&first).expect("first Doctor record is JSON");
+    assert_eq!(first["event_type"], "doctor_started");
+    assert!(child.wait().expect("wait for Doctor").success());
+    assert_eq!(
+        std::fs::read_to_string(marker).expect("Tailscale invocation marker"),
+        "invoked"
+    );
 }
 
 #[test]
@@ -7516,11 +7559,11 @@ enum ProviderSecretPtyDecision<'a> {
 #[cfg(target_os = "linux")]
 struct ProviderSecretPtyProcess {
     child: Child,
-    stdin: Option<ChildStdin>,
+    input: Option<File>,
+    slave: Option<File>,
     stdout: Vec<u8>,
     stdout_receiver: Receiver<u8>,
-    stdout_reader: JoinHandle<()>,
-    stderr_reader: JoinHandle<Vec<u8>>,
+    stdout_reader: Option<JoinHandle<()>>,
 }
 
 #[cfg(target_os = "linux")]
@@ -7556,25 +7599,149 @@ impl ProviderSecretPtyProcess {
         }
     }
 
-    fn write_input(&mut self, input: &str) {
-        let stdin = self.stdin.as_mut().expect("PTY stdin should remain open");
-        stdin
-            .write_all(input.as_bytes())
+    fn write_input(&mut self, bytes: &str) {
+        let input = self.input.as_mut().expect("PTY input should remain open");
+        input
+            .write_all(bytes.as_bytes())
             .expect("write synchronized PTY input");
-        stdin.flush().expect("flush synchronized PTY input");
+        input.flush().expect("flush synchronized PTY input");
+    }
+
+    fn wait_for_echo_disabled(&mut self) -> Result<(), String> {
+        use rustix::termios::{LocalModes, tcgetattr};
+
+        let slave = self
+            .slave
+            .as_ref()
+            .expect("PTY slave should remain open")
+            .try_clone()
+            .map_err(|error| error.to_string())?;
+        let (ready_sender, ready_receiver) = mpsc::channel();
+        let (shutdown_sender, shutdown_receiver) = mpsc::channel();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let watcher = thread::spawn(move || {
+            loop {
+                match tcgetattr(&slave) {
+                    Ok(termios) if !termios.local_modes.contains(LocalModes::ECHO) => {
+                        let _ = ready_sender.send(());
+                        return;
+                    }
+                    Ok(_) => {}
+                    Err(_) => return,
+                }
+                let remaining = deadline
+                    .checked_duration_since(Instant::now())
+                    .unwrap_or_default();
+                if remaining.is_zero()
+                    || shutdown_receiver
+                        .recv_timeout(remaining.min(Duration::from_millis(2)))
+                        .is_ok()
+                {
+                    return;
+                }
+            }
+        });
+
+        loop {
+            let remaining = deadline
+                .checked_duration_since(Instant::now())
+                .unwrap_or_default();
+            if remaining.is_zero() {
+                let _ = shutdown_sender.send(());
+                watcher
+                    .join()
+                    .map_err(|_| "join PTY echo watcher".to_string())?;
+                return Err("timed out waiting for PTY ECHO to be disabled".to_string());
+            }
+            if ready_receiver
+                .recv_timeout(remaining.min(Duration::from_millis(2)))
+                .is_ok()
+            {
+                watcher
+                    .join()
+                    .map_err(|_| "join PTY echo watcher".to_string())?;
+                return Ok(());
+            }
+            if self
+                .child
+                .try_wait()
+                .map_err(|error| error.to_string())?
+                .is_some()
+            {
+                let _ = shutdown_sender.send(());
+                watcher
+                    .join()
+                    .map_err(|_| "join PTY echo watcher".to_string())?;
+                return Err("PTY child exited before disabling ECHO".to_string());
+            }
+        }
     }
 
     fn finish(mut self) -> std::process::Output {
-        drop(self.stdin.take());
+        drop(self.input.take());
+        drop(self.slave.take());
         let status = self.child.wait().expect("wait for PTY command");
-        self.stdout_reader.join().expect("join PTY stdout reader");
+        self.stdout_reader
+            .take()
+            .expect("PTY stdout reader")
+            .join()
+            .expect("join PTY stdout reader");
         self.stdout.extend(self.stdout_receiver.try_iter());
-        let stderr = self.stderr_reader.join().expect("join PTY stderr reader");
         std::process::Output {
             status,
             stdout: self.stdout,
-            stderr,
+            stderr: Vec::new(),
         }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn spawn_pty_command(mut command: std::process::Command) -> ProviderSecretPtyProcess {
+    use rustix::pty::{OpenptFlags, grantpt, openpt, ptsname, unlockpt};
+
+    let controller = openpt(OpenptFlags::RDWR | OpenptFlags::NOCTTY | OpenptFlags::CLOEXEC)
+        .expect("open provider secret PTY");
+    grantpt(&controller).expect("grant provider secret PTY");
+    unlockpt(&controller).expect("unlock provider secret PTY");
+    let slave_path = ptsname(&controller, Vec::new()).expect("resolve provider secret PTY slave");
+    let slave = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(std::path::Path::new(
+            slave_path.to_str().expect("PTY slave path is UTF-8"),
+        ))
+        .expect("open provider secret PTY slave");
+    let controller = File::from(controller);
+    let child = command
+        .stdin(Stdio::from(
+            slave.try_clone().expect("clone PTY slave for stdin"),
+        ))
+        .stdout(Stdio::from(
+            slave.try_clone().expect("clone PTY slave for stdout"),
+        ))
+        .stderr(Stdio::from(
+            slave.try_clone().expect("clone PTY slave for stderr"),
+        ))
+        .spawn()
+        .expect("spawn synchronized provider secret PTY");
+    let input = controller.try_clone().expect("clone PTY controller input");
+    let mut output = controller;
+    let (stdout_sender, stdout_receiver) = mpsc::channel();
+    let stdout_reader = thread::spawn(move || {
+        let mut byte = [0_u8; 1];
+        while output.read_exact(&mut byte).is_ok() {
+            if stdout_sender.send(byte[0]).is_err() {
+                break;
+            }
+        }
+    });
+    ProviderSecretPtyProcess {
+        child,
+        input: Some(input),
+        slave: Some(slave),
+        stdout: Vec::new(),
+        stdout_receiver,
+        stdout_reader: Some(stdout_reader),
     }
 }
 
@@ -7588,36 +7755,22 @@ fn run_provider_secret_setup_in_pty(
     initial_input: Option<&str>,
     decision: ProviderSecretPtyDecision<'_>,
 ) -> (std::process::Output, usize, Option<usize>) {
-    const ECHO_DISABLED_MARKER: &str = "SATELLE_TEST_PROVIDER_SECRET_ECHO_DISABLED";
-
     let (secret, accepted) = match decision {
         ProviderSecretPtyDecision::Decline(secret) => (secret, false),
         ProviderSecretPtyDecision::Accept(secret) => (secret, true),
     };
     let executable = assert_cmd::cargo::cargo_bin!("satelle");
-    let profile_argument = profile
-        .map(|profile| format!("--profile {profile} "))
-        .unwrap_or_default();
-    let yes_argument = if yes { " --yes" } else { "" };
-    let component_arguments = components
-        .iter()
-        .map(|component| format!(" --component {component}"))
-        .collect::<String>();
-    let satelle_command = format!(
-        "{} {profile_argument}setup --host selected{component_arguments}{yes_argument}",
-        executable.display()
-    );
-    let command_line = if accepted {
-        format!(
-            "(until stty -a </dev/tty 2>/dev/null | \
-             grep -Eq '(^|[[:space:];])-echo([[:space:];]|$)'; \
-             do :; done; printf '\\n{ECHO_DISABLED_MARKER}\\n') & \
-             exec {satelle_command}"
-        )
-    } else {
-        satelle_command
-    };
-    let mut command = std::process::Command::new("script");
+    let mut command = std::process::Command::new(executable);
+    if let Some(profile) = profile {
+        command.args(["--profile", profile]);
+    }
+    command.args(["setup", "--host", "selected"]);
+    for component in components {
+        command.args(["--component", component]);
+    }
+    if yes {
+        command.arg("--yes");
+    }
     for name in [
         "SATELLE_HOME",
         "SATELLE_CONFIG_FILE",
@@ -7631,59 +7784,27 @@ fn run_provider_secret_setup_in_pty(
     ] {
         command.env_remove(name);
     }
-    let mut child = command
+    command
         .env("SATELLE_CONFIG_FILE", user_config)
         .env("SATELLE_STATE_DIR", state_dir)
         .env("SATELLE_COMMAND_HISTORY", "false")
-        .env(TEST_SUPPORT_ADAPTER_ENV, "fake")
-        .args(["-qec", command_line.as_str(), "/dev/null"])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("spawn synchronized provider secret PTY");
-    let stdin = child.stdin.take().expect("take PTY stdin");
-    let mut stdout = child.stdout.take().expect("take PTY stdout");
-    let mut stderr = child.stderr.take().expect("take PTY stderr");
-    let (stdout_sender, stdout_receiver) = mpsc::channel();
-    let stdout_reader = thread::spawn(move || {
-        let mut byte = [0_u8; 1];
-        while stdout.read_exact(&mut byte).is_ok() {
-            if stdout_sender.send(byte[0]).is_err() {
-                break;
-            }
-        }
-    });
-    let stderr_reader = thread::spawn(move || {
-        let mut bytes = Vec::new();
-        stderr
-            .read_to_end(&mut bytes)
-            .expect("read provider secret PTY stderr");
-        bytes
-    });
-    let mut process = ProviderSecretPtyProcess {
-        child,
-        stdin: Some(stdin),
-        stdout: Vec::new(),
-        stdout_receiver,
-        stdout_reader,
-        stderr_reader,
-    };
+        .env(TEST_SUPPORT_ADAPTER_ENV, "fake");
+    let mut process = spawn_pty_command(command);
 
     if let Some(initial_input) = initial_input {
         process.write_input(initial_input);
     }
     let preview_end = process.wait_for_after("Provider secret overwrite behavior:", 0);
     let secret_prompt_end = process.wait_for_after("Provider secret", preview_end);
-    let secret_input_start = if accepted {
-        process.wait_for_after(ECHO_DISABLED_MARKER, secret_prompt_end)
-    } else {
-        secret_prompt_end
-    };
+    if accepted {
+        process
+            .wait_for_echo_disabled()
+            .expect("provider secret prompt disables PTY echo");
+    }
     process.write_input(&format!("{secret}\n"));
     let confirmation_end = process.wait_for_after(
         "Provision or replace the provider secret at this exact destination?",
-        secret_input_start,
+        secret_prompt_end,
     );
     if accepted {
         process.write_input("y\n");
@@ -7692,6 +7813,14 @@ fn run_provider_secret_setup_in_pty(
     }
     let output = process.finish();
     (output, confirmation_end, Some(secret_prompt_end))
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn provider_secret_pty_echo_watcher_stops_when_the_child_exits_early() {
+    let mut process = spawn_pty_command(std::process::Command::new("true"));
+    assert!(process.wait_for_echo_disabled().is_err());
+    assert!(process.finish().status.success());
 }
 
 #[cfg(target_os = "linux")]

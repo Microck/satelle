@@ -199,21 +199,22 @@ pub(super) fn doctor_for_host(
     let raw_scopes = scope.into_iter().map(str::to_string).collect::<Vec<_>>();
     let scope_selection =
         DoctorScopeSelection::parse(&raw_scopes).expect("read helpers use supported Doctor scopes");
-    let transport_observation =
-        super::tailscale::transport_doctor_observation(&scope_selection, &host.config);
+    let options = DoctorOptions::default();
+    let transport_probe = super::tailscale::transport_doctor_probe(&scope_selection, &host.config);
     if let Some(report) = super::tailscale::transport_only_doctor_report(
         &host.alias,
         &host.config,
         &scope_selection,
-        &transport_observation,
+        &transport_probe,
+        options,
     ) {
         return Ok(report);
     }
     transport_for(host)?
         .doctor(
             &scope_selection,
-            &transport_observation,
-            DoctorOptions::default(),
+            &transport_probe,
+            options,
             &satelle_host::ProviderComputerUseIntent::host_default(),
         )
         .map_err(failure)

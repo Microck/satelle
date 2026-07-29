@@ -26,8 +26,16 @@ fn doctor_selection(scopes: &[&str]) -> DoctorScopeSelection {
     .expect("valid Doctor test scopes")
 }
 
-fn ready_transport() -> DoctorTransportObservation {
-    DoctorTransportObservation::ready(None)
+struct ReadyTestTransportProbe;
+
+impl ControllerTransportProbe for ReadyTestTransportProbe {
+    fn execute(&self, _context: &DoctorProbeExecutionContext) -> ControllerTransportProbeOutcome {
+        ControllerTransportProbeOutcome::Observed(DoctorTransportObservation::ready(None))
+    }
+}
+
+fn ready_transport() -> ReadyTestTransportProbe {
+    ReadyTestTransportProbe
 }
 
 #[derive(Clone)]
@@ -1363,7 +1371,6 @@ fn configured_remote_alias_is_accepted_by_host_diagnostics() {
         .doctor(
             REMOTE_HOST_ALIAS,
             &doctor_selection(&[]),
-            &ready_transport(),
             DoctorOptions::default(),
         )
         .expect("doctor should diagnose the already-routed Host alias");
@@ -1759,7 +1766,6 @@ fn refreshed_production_snapshot_updates_admission_surfaces_but_not_desktop_disc
         .doctor(
             LOCAL_DEMO_HOST,
             &doctor_selection(&["codex"]),
-            &ready_transport(),
             DoctorOptions::default(),
         )
         .expect("non-refresh doctor must read the refreshed snapshot");
