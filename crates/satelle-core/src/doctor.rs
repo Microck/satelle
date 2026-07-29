@@ -273,7 +273,7 @@ pub enum DoctorProbeLifecycleEvent {
 ///
 /// The lifecycle never calls caller-provided behavior. Host and CLI own their
 /// resources and feed only nonblocking terminal observations into `poll`.
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct DoctorProbeLifecycle {
     probe_id: String,
     deadline: Instant,
