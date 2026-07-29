@@ -2948,6 +2948,7 @@ fn execute_test_controller_transport_probe(
 
 enum ProductionDoctorTaskEffect {
     None,
+    PersistedCacheUpdate(&'static str),
     Snapshot(Result<ProductionCapabilitySnapshot, SatelleError>),
     NativeRefresh {
         refresh: Result<ReadinessEvidence, SatelleError>,
@@ -2979,6 +2980,20 @@ enum ProductionDoctorTaskEffect {
     },
 }
 
+impl ProductionDoctorTaskEffect {
+    fn into_late_completion_effect(self) -> Self {
+        match self {
+            Self::NativeRefresh { refresh, .. } if native_refresh_changed(&refresh) => {
+                Self::PersistedCacheUpdate("native_readiness")
+            }
+            Self::ProviderRefresh { refresh, .. } if provider_refresh_changed(&refresh) => {
+                Self::PersistedCacheUpdate("provider_smoke")
+            }
+            _ => Self::None,
+        }
+    }
+}
+
 struct ProductionDoctorTaskResult {
     completion: DoctorProbeCompletion,
     effect: ProductionDoctorTaskEffect,
@@ -2994,10 +3009,11 @@ struct ProductionDoctorProjection<'a> {
 enum DoctorWorkerTerminal {
     Completed {
         completed_at: Instant,
+        published_at: Instant,
         result: Box<ProductionDoctorTaskResult>,
     },
     Panicked {
-        completed_at: Instant,
+        published_at: Instant,
     },
 }
 
@@ -3168,17 +3184,9 @@ impl DoctorTaskRegistry {
         let worker = match std::thread::Builder::new()
             .name(format!("doctor-{}", probe.probe_id))
             .spawn(move || {
-                let terminal = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    operation(context)
-                })) {
-                    Ok(result) => DoctorWorkerTerminal::Completed {
-                        completed_at: Instant::now(),
-                        result: Box::new(result),
-                    },
-                    Err(_) => DoctorWorkerTerminal::Panicked {
-                        completed_at: Instant::now(),
-                    },
-                };
+                let outcome =
+                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| operation(context)));
+                let completed_at = Instant::now();
                 let Some(inner) = Weak::upgrade(&weak) else {
                     return;
                 };
@@ -3186,6 +3194,18 @@ impl DoctorTaskRegistry {
                     .state
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
+                // Publication under the registry lock is the authoritative
+                // cross-worker order. A worker cannot be overtaken between
+                // recording its order and making its terminal visible.
+                let published_at = Instant::now();
+                let terminal = match outcome {
+                    Ok(result) => DoctorWorkerTerminal::Completed {
+                        completed_at,
+                        published_at,
+                        result: Box::new(result),
+                    },
+                    Err(_) => DoctorWorkerTerminal::Panicked { published_at },
+                };
                 if let Some(task) = state.tasks.get_mut(&task_id) {
                     task.terminal = Some(terminal);
                 }
@@ -3236,6 +3256,7 @@ impl DoctorTaskRegistry {
                             match terminal {
                                 DoctorWorkerTerminal::Completed {
                                     completed_at,
+                                    published_at,
                                     result,
                                 } => {
                                     let completed_within_useful_work_budget =
@@ -3253,27 +3274,28 @@ impl DoctorTaskRegistry {
                                     else {
                                         unreachable!("worker completion is a terminal ack")
                                     };
+                                    let effect = if completion.status == DoctorProbeStatus::TimedOut
+                                        && !completed_within_useful_work_budget
+                                    {
+                                        effect.into_late_completion_effect()
+                                    } else {
+                                        effect
+                                    };
                                     event = Some((
-                                        completed_at,
+                                        published_at,
                                         task_id,
                                         request_id,
-                                        if completion.status == DoctorProbeStatus::TimedOut
-                                            && !completed_within_useful_work_budget
-                                        {
-                                            DoctorRegistryEvent::TimedOut { probe_id }
-                                        } else {
-                                            DoctorRegistryEvent::Completed {
-                                                completion_order: (completed_at, task_id),
-                                                probe_id,
-                                                completion,
-                                                effect: Box::new(effect),
-                                            }
+                                        DoctorRegistryEvent::Completed {
+                                            completion_order: (published_at, task_id),
+                                            probe_id,
+                                            completion,
+                                            effect: Box::new(effect),
                                         },
                                     ));
                                 }
-                                DoctorWorkerTerminal::Panicked { completed_at } => {
+                                DoctorWorkerTerminal::Panicked { published_at, .. } => {
                                     event = Some((
-                                        completed_at,
+                                        published_at,
                                         task_id,
                                         request_id,
                                         DoctorRegistryEvent::Panicked { probe_id },
@@ -3324,10 +3346,10 @@ impl DoctorTaskRegistry {
                     queued.push(event);
                 }
             }
-            // Workers publish their own completion instants. Task IDs encode
-            // admission order, so sort the drained batch before projecting
-            // completion order. The ID only breaks an exact timestamp tie.
-            queued.sort_by_key(|(completed_at, task_id, _, _)| (*completed_at, *task_id));
+            // Publication instants are captured under the registry lock, so
+            // their order remains authoritative across separate advances.
+            // The task ID only breaks an exact timestamp tie.
+            queued.sort_by_key(|(published_at, task_id, _, _)| (*published_at, *task_id));
             for (_, _, request_id, event) in queued.drain(..) {
                 state.events.entry(request_id).or_default().push_back(event);
             }
@@ -3524,6 +3546,7 @@ impl Drop for DoctorTaskRegistryInner {
 struct ProductionDoctorExecution {
     snapshot: Option<ProductionCapabilitySnapshot>,
     fatal_error: Option<SatelleError>,
+    persisted_cache_updates: BTreeSet<&'static str>,
     native_refresh: Option<(
         Result<ReadinessEvidence, SatelleError>,
         String,
@@ -3552,6 +3575,7 @@ impl ProductionDoctorExecution {
         Self {
             snapshot: None,
             fatal_error: None,
+            persisted_cache_updates: BTreeSet::new(),
             native_refresh: None,
             provider_refresh: None,
             provider_auth_evidence: None,
@@ -3567,6 +3591,9 @@ fn apply_production_doctor_effect(
 ) {
     match effect {
         ProductionDoctorTaskEffect::None => {}
+        ProductionDoctorTaskEffect::PersistedCacheUpdate(cache_update) => {
+            execution.persisted_cache_updates.insert(cache_update);
+        }
         ProductionDoctorTaskEffect::Snapshot(Ok(snapshot)) => {
             execution.snapshot = Some(snapshot);
         }
@@ -4160,6 +4187,18 @@ impl ProductionDoctorExecution {
                 }
             }
         }
+        if !self.persisted_cache_updates.is_empty() {
+            report.changed = true;
+            for cache_update in &self.persisted_cache_updates {
+                if !report
+                    .cache_updates
+                    .iter()
+                    .any(|entry| entry == *cache_update)
+                {
+                    report.cache_updates.push((*cache_update).to_string());
+                }
+            }
+        }
         // Refresh applicators and the Phase 0 report own scope-aware Finding
         // and Passed projections. The scheduler's aggregate Phase 0 completion
         // cannot safely relabel those rows, but terminal failures, timeouts,
@@ -4404,6 +4443,13 @@ pub fn admission_request_timeout(config: &HostConfig) -> std::time::Duration {
         .saturating_add(provider)
         .saturating_add(READINESS_CANCELLATION_GRACE)
         .saturating_add(ADMISSION_RESPONSE_GRACE)
+}
+
+fn provider_refresh_changed(refresh: &Result<AdapterReadiness, SatelleError>) -> bool {
+    match refresh {
+        Ok(readiness) => readiness.provider_smoke_evidence().is_some(),
+        Err(error) => error.details.contains_key("provider_smoke_expires_at"),
+    }
 }
 
 fn apply_provider_refresh(
@@ -5607,11 +5653,11 @@ fn doctor_registry_retains_timed_out_capacity_and_lock_until_cleanup_ack() {
 
 #[cfg(test)]
 #[test]
-fn doctor_registry_drains_completed_workers_by_completion_time() {
+fn doctor_registry_drains_completed_workers_by_publication_time() {
     let registry = DoctorTaskRegistry::new();
     let request_id = registry.begin_request();
     let now = Instant::now();
-    let task = |probe_id: &str, completed_at| DoctorRegistryTask {
+    let task = |probe_id: &str, completed_at, published_at| DoctorRegistryTask {
         request_id,
         probe_id: probe_id.to_string(),
         resource_locks: Default::default(),
@@ -5625,6 +5671,7 @@ fn doctor_registry_drains_completed_workers_by_completion_time() {
         phase: DoctorRegistryTaskPhase::Running,
         terminal: Some(DoctorWorkerTerminal::Completed {
             completed_at,
+            published_at,
             result: Box::new(ProductionDoctorTaskResult {
                 completion: DoctorProbeCompletion::new(
                     DoctorProbeStatus::Passed,
@@ -5641,12 +5688,22 @@ fn doctor_registry_drains_completed_workers_by_completion_time() {
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        state
-            .tasks
-            .insert(1, task("admitted-first", now + Duration::from_millis(2)));
-        state
-            .tasks
-            .insert(2, task("completed-first", now + Duration::from_millis(1)));
+        state.tasks.insert(
+            1,
+            task(
+                "published-first",
+                now + Duration::from_millis(2),
+                now + Duration::from_millis(1),
+            ),
+        );
+        state.tasks.insert(
+            2,
+            task(
+                "completed-first",
+                now + Duration::from_millis(1),
+                now + Duration::from_millis(2),
+            ),
+        );
     }
 
     registry.advance(now + Duration::from_millis(3));
@@ -5661,8 +5718,8 @@ fn doctor_registry_drains_completed_workers_by_completion_time() {
 
     assert_eq!(
         completed_probe_ids,
-        ["completed-first", "admitted-first"],
-        "task admission order must not overwrite actual completion order"
+        ["published-first", "completed-first"],
+        "registry publication order must remain stable across drain batches"
     );
 }
 
@@ -5695,6 +5752,7 @@ fn doctor_registry_preserves_effect_from_worker_reported_timeout() {
                 phase: DoctorRegistryTaskPhase::Running,
                 terminal: Some(DoctorWorkerTerminal::Completed {
                     completed_at: now + Duration::from_millis(1),
+                    published_at: now + Duration::from_millis(1),
                     result: Box::new(ProductionDoctorTaskResult {
                         completion: DoctorProbeCompletion::new(
                             DoctorProbeStatus::TimedOut,
@@ -5722,6 +5780,75 @@ fn doctor_registry_preserves_effect_from_worker_reported_timeout() {
             ..
         }] if probe_id == "transport"
             && matches!(effect.as_ref(), ProductionDoctorTaskEffect::ProviderNotRequired)
+    ));
+}
+
+#[cfg(test)]
+#[test]
+fn doctor_registry_retains_only_cache_mutation_from_late_refresh() {
+    let registry = DoctorTaskRegistry::new();
+    let request_id = registry.begin_request();
+    let now = Instant::now();
+    let lifecycle = DoctorProbeLifecycle::start(
+        "computer-use",
+        now,
+        Duration::from_millis(100),
+        Duration::from_millis(25),
+    )
+    .expect("valid lifecycle");
+    let mut refresh_error = SatelleError::state_conflict();
+    refresh_error.details.insert(
+        "native_readiness".to_string(),
+        serde_json::json!({"status": "manual_action_required"}),
+    );
+    registry
+        .inner
+        .state
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .tasks
+        .insert(
+            1,
+            DoctorRegistryTask {
+                request_id,
+                probe_id: "computer-use".to_string(),
+                resource_locks: Default::default(),
+                lifecycle,
+                phase: DoctorRegistryTaskPhase::Running,
+                terminal: Some(DoctorWorkerTerminal::Completed {
+                    completed_at: now + Duration::from_millis(80),
+                    published_at: now + Duration::from_millis(81),
+                    result: Box::new(ProductionDoctorTaskResult {
+                        completion: DoctorProbeCompletion::new(
+                            DoctorProbeStatus::Finding,
+                            DoctorDependentEvidence::NotUseful,
+                        ),
+                        effect: ProductionDoctorTaskEffect::NativeRefresh {
+                            refresh: Err(refresh_error),
+                            started_at: "2026-07-29T00:00:00Z".to_string(),
+                            duration: Duration::from_millis(80),
+                        },
+                    }),
+                }),
+                worker: None,
+            },
+        );
+
+    registry.advance(now + Duration::from_millis(82));
+
+    assert!(matches!(
+        registry.drain_events(request_id).as_slice(),
+        [DoctorRegistryEvent::Completed {
+            completion: DoctorProbeCompletion {
+                status: DoctorProbeStatus::TimedOut,
+                ..
+            },
+            effect,
+            ..
+        }] if matches!(
+            effect.as_ref(),
+            ProductionDoctorTaskEffect::PersistedCacheUpdate("native_readiness")
+        )
     ));
 }
 
