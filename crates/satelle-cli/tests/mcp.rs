@@ -652,7 +652,7 @@ fn blocked_doctor_is_a_structured_error_with_the_complete_report_as_text() {
         &[
             initialize(1),
             initialized(),
-            tool_call(2, "doctor", json!({"scope": "transport"})),
+            tool_call(2, "doctor", json!({"scope": "codex"})),
         ],
     );
     assert!(

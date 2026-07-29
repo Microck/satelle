@@ -510,13 +510,18 @@ fn ordinary_production_doctor_reports_blocked_probes_without_fake_readiness() {
     let probes = report["probe_results"]
         .as_array()
         .expect("production doctor probes should be an array");
-    for blocked_scope in ["codex", "computer-use", "provider", "transport"] {
+    for blocked_scope in ["codex", "computer-use", "provider"] {
         assert!(
             probes
                 .iter()
                 .any(|probe| { probe["scope"] == blocked_scope && probe["status"] == "blocked" })
         );
     }
+    assert!(
+        probes
+            .iter()
+            .any(|probe| probe["scope"] == "transport" && probe["status"] == "passed")
+    );
     assert!(
         probes
             .iter()
