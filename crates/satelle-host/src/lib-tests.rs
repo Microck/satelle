@@ -2715,6 +2715,23 @@ fn refresh_projection_preserves_worker_finish_timestamps() {
             .finished_at,
         "2026-07-29T21:00:03Z"
     );
+
+    let mut provider_not_required_report =
+        production_doctor_report(LOCAL_DEMO_HOST, Some("provider"), &snapshot);
+    apply_provider_not_required(
+        &mut provider_not_required_report,
+        "2026-07-29T21:00:04Z".to_string(),
+        "2026-07-29T21:00:05Z".to_string(),
+        Duration::from_secs(1),
+    );
+    let provider_not_required = provider_not_required_report
+        .probe_results
+        .iter()
+        .find(|probe| probe.scope == "provider")
+        .expect("no-smoke provider row");
+    assert_eq!(provider_not_required.started_at, "2026-07-29T21:00:04Z");
+    assert_eq!(provider_not_required.finished_at, "2026-07-29T21:00:05Z");
+    assert_eq!(provider_not_required.duration_ms, 1_000);
 }
 
 #[test]

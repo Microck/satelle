@@ -2009,7 +2009,13 @@ impl HostService {
                         provider_auth_evidence = Some(observed);
                     }
                 } else {
-                    apply_provider_not_required(&mut report);
+                    let observed_at = utc_now();
+                    apply_provider_not_required(
+                        &mut report,
+                        observed_at.clone(),
+                        observed_at,
+                        Duration::ZERO,
+                    );
                 }
             } else if matches!(
                 provider_auth_evidence,
@@ -2979,7 +2985,11 @@ enum ProductionDoctorTaskEffect {
             satelle_core::ProviderAuthObservationSource,
         )>,
     },
-    ProviderNotRequired,
+    ProviderNotRequired {
+        started_at: String,
+        finished_at: String,
+        duration: Duration,
+    },
     Transport {
         outcome: ControllerTransportProbeOutcome,
         started_at: String,
@@ -3585,7 +3595,7 @@ struct ProductionDoctorExecution {
         satelle_core::ProviderAuthValidationOutcome,
         satelle_core::ProviderAuthObservationSource,
     )>,
-    provider_not_required: bool,
+    provider_not_required: Option<(String, String, Duration)>,
     transport: Option<(
         ControllerTransportProbeOutcome,
         String,
@@ -3603,7 +3613,7 @@ impl ProductionDoctorExecution {
             native_refresh: None,
             provider_refresh: None,
             provider_auth_evidence: None,
-            provider_not_required: false,
+            provider_not_required: None,
             transport: None,
         }
     }
@@ -3652,8 +3662,12 @@ fn apply_production_doctor_effect(
             }
             execution.provider_refresh = Some((*refresh, started_at, finished_at, duration));
         }
-        ProductionDoctorTaskEffect::ProviderNotRequired => {
-            execution.provider_not_required = true;
+        ProductionDoctorTaskEffect::ProviderNotRequired {
+            started_at,
+            finished_at,
+            duration,
+        } => {
+            execution.provider_not_required = Some((started_at, finished_at, duration));
         }
         ProductionDoctorTaskEffect::Transport {
             outcome,
@@ -3966,9 +3980,16 @@ fn production_doctor_with_provider_intent(
                         })
                     } else if !provider_probe_required {
                         registry.spawn(request_id, &probe, move |_context| {
+                            let started_at = utc_now();
+                            let started = Instant::now();
+                            let finished_at = utc_now();
                             ProductionDoctorTaskResult {
                                 completion: probe_completion(false),
-                                effect: ProductionDoctorTaskEffect::ProviderNotRequired,
+                                effect: ProductionDoctorTaskEffect::ProviderNotRequired {
+                                    started_at,
+                                    finished_at,
+                                    duration: started.elapsed(),
+                                },
                             }
                         })
                     } else {
@@ -4310,8 +4331,9 @@ impl ProductionDoctorExecution {
         }
         if let Some((refresh, started_at, finished_at, duration)) = self.provider_refresh.take() {
             apply_provider_refresh(&mut report, &refresh, started_at, finished_at, duration);
-        } else if self.provider_not_required {
-            apply_provider_not_required(&mut report);
+        } else if let Some((started_at, finished_at, duration)) = self.provider_not_required.take()
+        {
+            apply_provider_not_required(&mut report, started_at, finished_at, duration);
         } else if matches!(
             self.provider_auth_evidence,
             Some((
@@ -4909,7 +4931,12 @@ fn native_refresh_changed(refresh: &Result<ReadinessEvidence, SatelleError>) -> 
     }
 }
 
-fn apply_provider_not_required(report: &mut DoctorReport) {
+fn apply_provider_not_required(
+    report: &mut DoctorReport,
+    started_at: String,
+    finished_at: String,
+    duration: Duration,
+) {
     report
         .findings
         .retain(|finding| finding.scope != "provider");
@@ -4927,14 +4954,13 @@ fn apply_provider_not_required(report: &mut DoctorReport) {
         evidence: vec!["source=not_required".to_string()],
         recovery_command: None,
     });
-    let observed_at = utc_now();
     report.probe_results.push(DoctorProbeResult {
         probe_id: "provider.smoke.refresh".to_string(),
         scope: "provider".to_string(),
         status: "passed".to_string(),
-        started_at: observed_at.clone(),
-        finished_at: observed_at,
-        duration_ms: 0,
+        started_at,
+        finished_at,
+        duration_ms: duration.as_millis().try_into().unwrap_or(u64::MAX),
         cache_status: "not_required".to_string(),
         dependency_status: "satisfied".to_string(),
         finding_ids: vec![finding_id],
@@ -5848,7 +5874,11 @@ fn doctor_registry_retains_timed_out_capacity_and_lock_until_cleanup_ack() {
                     DoctorProbeStatus::Passed,
                     DoctorDependentEvidence::Useful,
                 ),
-                effect: ProductionDoctorTaskEffect::ProviderNotRequired,
+                effect: ProductionDoctorTaskEffect::ProviderNotRequired {
+                    started_at: "2026-07-29T00:00:00Z".to_string(),
+                    finished_at: "2026-07-29T00:00:01Z".to_string(),
+                    duration: Duration::from_secs(1),
+                },
             }
         })
         .expect("spawn registry worker");
@@ -6042,7 +6072,11 @@ fn doctor_registry_preserves_effect_from_worker_reported_timeout() {
                             DoctorProbeStatus::TimedOut,
                             DoctorDependentEvidence::NotUseful,
                         ),
-                        effect: ProductionDoctorTaskEffect::ProviderNotRequired,
+                        effect: ProductionDoctorTaskEffect::ProviderNotRequired {
+                            started_at: "2026-07-29T00:00:00Z".to_string(),
+                            finished_at: "2026-07-29T00:00:01Z".to_string(),
+                            duration: Duration::from_secs(1),
+                        },
                     }),
                 }),
                 worker: None,
@@ -6063,7 +6097,10 @@ fn doctor_registry_preserves_effect_from_worker_reported_timeout() {
             effect,
             ..
         }] if probe_id == "transport"
-            && matches!(effect.as_ref(), ProductionDoctorTaskEffect::ProviderNotRequired)
+            && matches!(
+                effect.as_ref(),
+                ProductionDoctorTaskEffect::ProviderNotRequired { .. }
+            )
     ));
 }
 
