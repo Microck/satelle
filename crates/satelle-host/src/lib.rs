@@ -3310,7 +3310,11 @@ impl DoctorTaskRegistry {
                                         task_id,
                                         request_id,
                                         DoctorRegistryEvent::Completed {
-                                            completion_order: (published_at, task_id),
+                                            // Snapshot freshness follows the
+                                            // observation that completed before
+                                            // this worker acquired the registry
+                                            // publication lock.
+                                            completion_order: (completed_at, task_id),
                                             probe_id,
                                             completion,
                                             effect: Box::new(effect),
@@ -6056,19 +6060,32 @@ fn doctor_registry_drains_completed_workers_by_publication_time() {
     }
 
     registry.advance(now + Duration::from_millis(3));
-    let completed_probe_ids = registry
+    let completed_events = registry
         .drain_events(request_id)
         .into_iter()
         .map(|event| match event {
-            DoctorRegistryEvent::Completed { probe_id, .. } => probe_id,
+            DoctorRegistryEvent::Completed {
+                completion_order,
+                probe_id,
+                ..
+            } => (probe_id, completion_order),
             _ => panic!("expected completed worker"),
         })
         .collect::<Vec<_>>();
 
     assert_eq!(
-        completed_probe_ids,
-        ["published-first", "completed-first"],
-        "registry publication order must remain stable across drain batches"
+        completed_events,
+        [
+            (
+                "published-first".to_string(),
+                (now + Duration::from_millis(2), 1)
+            ),
+            (
+                "completed-first".to_string(),
+                (now + Duration::from_millis(1), 2)
+            ),
+        ],
+        "event order follows publication while snapshot order follows worker completion"
     );
 }
 
