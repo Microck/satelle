@@ -256,6 +256,7 @@ pub struct CapabilitiesResponse {
     platform: Platform,
     operations: Vec<Operation>,
     runtime_capabilities: RuntimeCapabilities,
+    codex_update_evidence: satelle_core::host_update::CodexUpdateEvidence,
     limits: EffectiveLimits,
     supported_attachment_media_types: Vec<String>,
     provider_secret_upload: ProviderSecretUploadCapability,
@@ -270,6 +271,7 @@ impl CapabilitiesResponse {
         codex_runtime: bool,
         native_computer_use: bool,
         provider_computer_use: bool,
+        codex_update_evidence: satelle_core::host_update::CodexUpdateEvidence,
         image_attachments: bool,
         limits: EffectiveLimits,
     ) -> Self {
@@ -315,6 +317,7 @@ impl CapabilitiesResponse {
                 native_computer_use,
                 provider_computer_use,
             },
+            codex_update_evidence,
             limits,
             supported_attachment_media_types: if image_attachments {
                 super::SUPPORTED_IMAGE_MEDIA_TYPES
@@ -338,6 +341,14 @@ impl CapabilitiesResponse {
 
     pub const fn platform(&self) -> &'static str {
         self.platform.os.as_str()
+    }
+
+    pub fn platform_arch(&self) -> &str {
+        &self.platform.arch
+    }
+
+    pub const fn codex_update_evidence(&self) -> &satelle_core::host_update::CodexUpdateEvidence {
+        &self.codex_update_evidence
     }
 
     pub const fn request_id(&self) -> &RequestId {

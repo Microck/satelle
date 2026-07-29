@@ -3573,16 +3573,6 @@ fn host_update_valid_selections_fail_truthfully_without_mutating_state() {
             "codex",
             "--json",
         ],
-        vec![
-            "host",
-            "update",
-            "--host",
-            "local-demo",
-            "--component",
-            "all",
-            "--dry-run",
-            "--json",
-        ],
     ] {
         let output = satelle()
             .env("SATELLE_STATE_DIR", state.path())
@@ -3591,7 +3581,9 @@ fn host_update_valid_selections_fail_truthfully_without_mutating_state() {
             .code(70)
             .get_output()
             .clone();
-        assert!(output.stdout.is_empty());
+        let plan = parse_json_output(&output.stdout);
+        assert_eq!(plan["schema_version"], "satelle.host.update.v1");
+        assert_eq!(plan["host"], "local-demo");
         let report = parse_json_output(&output.stderr);
         assert_exact_object_keys(
             &report,
@@ -3609,11 +3601,37 @@ fn host_update_valid_selections_fail_truthfully_without_mutating_state() {
         assert_eq!(report["schema_version"], "satelle.error.v1");
         assert_eq!(report["code"], "not-implemented");
         let message = report["message"].as_str().unwrap();
-        assert!(message.contains("Host update was not run"));
-        assert!(message.contains("No Host state or Satelle sessions were changed"));
+        assert!(message.contains("Host update apply belongs to the packet 15 train"));
+        assert!(message.contains("no Host state or Satelle sessions were changed"));
         assert!(!state.path().join("satelle.sqlite3").exists());
         assert!(!state.path().join("satelle.sqlite3.lock").exists());
     }
+
+    let output = satelle()
+        .env("SATELLE_STATE_DIR", state.path())
+        .args([
+            "host",
+            "update",
+            "--host",
+            "local-demo",
+            "--component",
+            "all",
+            "--dry-run",
+            "--json",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .clone();
+    assert!(output.stderr.is_empty());
+    let plan = parse_json_output(&output.stdout);
+    assert_eq!(plan["schema_version"], "satelle.host.update.v1");
+    assert_eq!(
+        plan["checked_components"],
+        serde_json::json!(["host", "codex"])
+    );
+    assert!(!state.path().join("satelle.sqlite3").exists());
+    assert!(!state.path().join("satelle.sqlite3.lock").exists());
 }
 
 #[test]

@@ -758,6 +758,18 @@ impl PreparedIdentityOperation {
 }
 
 impl RemoteTarget {
+    pub(super) fn from_platform(os: &str, arch: &str) -> Option<Self> {
+        match (os, arch) {
+            ("linux", "aarch64" | "arm64") => Some(Self::LinuxArm64Gnu),
+            ("linux", "x86_64" | "x64") => Some(Self::LinuxX64Gnu),
+            ("macos", "aarch64" | "arm64") => Some(Self::DarwinArm64),
+            ("macos", "x86_64" | "x64") => Some(Self::DarwinX64),
+            ("windows", "aarch64" | "arm64") => Some(Self::WindowsArm64Msvc),
+            ("windows", "x86_64" | "x64") => Some(Self::WindowsX64Msvc),
+            _ => None,
+        }
+    }
+
     pub(super) fn inspect_initial_host_state(
         self,
         destination: &str,

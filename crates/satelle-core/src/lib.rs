@@ -19,6 +19,8 @@ pub mod daemon_service;
 mod direct_host_binding;
 pub mod doctor;
 mod events;
+#[path = "host-update.rs"]
+pub mod host_update;
 pub mod ids;
 mod profiles;
 #[path = "project-config.rs"]
@@ -4010,6 +4012,10 @@ pub enum ErrorCode {
     ConcurrencyWithoutRemoteUpdate,
     ComponentSelectionConflict,
     UnsupportedUpdateComponent,
+    HostBinaryNewerThanCli,
+    HostArtifactUnavailable,
+    HostUpdateRequiresCliUpgrade,
+    AmbiguousCodexComponentOwnership,
     PersistentServiceUnsupported,
     SetupConsentRequired,
     SetupVerificationFailed,
@@ -4115,6 +4121,10 @@ impl ErrorCode {
             Self::ConcurrencyWithoutRemoteUpdate => "concurrency-without-remote-update",
             Self::ComponentSelectionConflict => "component-selection-conflict",
             Self::UnsupportedUpdateComponent => "unsupported-update-component",
+            Self::HostBinaryNewerThanCli => "host-binary-newer-than-cli",
+            Self::HostArtifactUnavailable => "host-artifact-unavailable",
+            Self::HostUpdateRequiresCliUpgrade => "host-update-requires-cli-upgrade",
+            Self::AmbiguousCodexComponentOwnership => "ambiguous-codex-component-ownership",
             Self::PersistentServiceUnsupported => "persistent-service-unsupported",
             Self::SetupConsentRequired => "setup-consent-required",
             Self::SetupVerificationFailed => "setup-verification-failed",
@@ -4140,6 +4150,10 @@ impl ErrorCode {
             | Self::ConcurrencyWithoutRemoteUpdate
             | Self::ComponentSelectionConflict
             | Self::UnsupportedUpdateComponent
+            | Self::HostBinaryNewerThanCli
+            | Self::HostArtifactUnavailable
+            | Self::HostUpdateRequiresCliUpgrade
+            | Self::AmbiguousCodexComponentOwnership
             | Self::PersistentServiceUnsupported
             | Self::ExperimentalProviderOptInRequired
             | Self::SetupConsentRequired
@@ -5434,6 +5448,71 @@ impl SatelleError {
             ),
             source_detail: None,
             details: BTreeMap::new(),
+        }
+    }
+
+    pub fn host_binary_newer_than_cli(host_version: &str, cli_version: &str) -> Self {
+        let mut details = BTreeMap::new();
+        details.insert("host_version".to_string(), Value::from(host_version));
+        details.insert("cli_version".to_string(), Value::from(cli_version));
+        Self {
+            code: ErrorCode::HostBinaryNewerThanCli,
+            message: format!(
+                "Host version {host_version} is newer than invoking CLI version {cli_version}"
+            ),
+            recovery_command: Some(
+                "upgrade the local Satelle CLI before updating this Host".into(),
+            ),
+            source_detail: None,
+            details,
+        }
+    }
+
+    pub fn host_artifact_unavailable(cli_version: &str, remote_platform: &str) -> Self {
+        let mut details = BTreeMap::new();
+        details.insert("cli_version".to_string(), Value::from(cli_version));
+        details.insert("remote_platform".to_string(), Value::from(remote_platform));
+        Self {
+            code: ErrorCode::HostArtifactUnavailable,
+            message: format!(
+                "Satelle {cli_version} has no verified Host artifact for {remote_platform}"
+            ),
+            recovery_command: Some(
+                "install a Satelle CLI release that publishes an artifact for this Host platform"
+                    .into(),
+            ),
+            source_detail: None,
+            details,
+        }
+    }
+
+    pub fn host_update_requires_cli_upgrade(cli_version: &str) -> Self {
+        let mut details = BTreeMap::new();
+        details.insert("cli_version".to_string(), Value::from(cli_version));
+        Self {
+            code: ErrorCode::HostUpdateRequiresCliUpgrade,
+            message: format!(
+                "the selected Host update requires a Host version newer than CLI {cli_version} can provide"
+            ),
+            recovery_command: Some("upgrade the local Satelle CLI and retry".into()),
+            source_detail: None,
+            details,
+        }
+    }
+
+    pub fn ambiguous_codex_component_ownership(target: &str) -> Self {
+        let mut details = BTreeMap::new();
+        details.insert("target".to_string(), Value::from(target));
+        Self {
+            code: ErrorCode::AmbiguousCodexComponentOwnership,
+            message: format!(
+                "candidate update target '{target}' cannot be classified as Codex-owned"
+            ),
+            recovery_command: Some(
+                "update this component manually after confirming its package ownership".into(),
+            ),
+            source_detail: None,
+            details,
         }
     }
 
