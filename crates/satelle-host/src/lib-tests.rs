@@ -1816,9 +1816,7 @@ fn refreshed_production_snapshot_updates_admission_surfaces_but_not_desktop_disc
     }));
 }
 
-#[test]
-fn queued_probe_receives_its_full_timeout_after_resource_admission() {
-    let state = TestStateDir::new().expect("temporary state directory should exist");
+fn production_doctor_test_service(state: &TestStateDir) -> HostService {
     let evidence = Phase0CapabilityEvidence {
         codex_version: CodexVersionEvidence::Detected {
             version: REQUIRED_CODEX_VERSION,
@@ -1831,7 +1829,7 @@ fn queued_probe_receives_its_full_timeout_after_resource_admission() {
         Arc::clone(&snapshot),
         Ok(state.path().join("codex-app-server-work")),
     );
-    let service = HostService {
+    HostService {
         runtime: RuntimeHandle::new(Ok(state.path().to_path_buf()), adapter),
         operation_capacity: Arc::new(OperationCapacity::default()),
         turn_execution_timeout: crate::configured_turn_execution_timeout(
@@ -1841,14 +1839,105 @@ fn queued_probe_receives_its_full_timeout_after_resource_admission() {
         bootstrap_auth: None,
         bootstrap_maintenance: Arc::new(Mutex::new(None)),
         doctor_tasks: DoctorTaskRegistry::new(),
-    };
+    }
+}
+
+#[test]
+fn queued_probe_receives_its_full_timeout_after_resource_admission() {
+    let state = TestStateDir::new().expect("temporary state directory should exist");
+    let service = production_doctor_test_service(&state);
     let selection = doctor_selection(&["transport"]);
-    let options = DoctorOptions::new(false, Some(Duration::from_millis(100)))
-        .expect("positive timeout is valid");
     let intent = ProviderComputerUseIntent::host_default();
     let (first_started_tx, first_started_rx) = std::sync::mpsc::channel();
     let (release_first_tx, release_first_rx) = std::sync::mpsc::channel();
+    let first_service = service.clone();
+    let first_selection = selection.clone();
+    let first_intent = intent.clone();
+    let (first_result_tx, first_result_rx) = std::sync::mpsc::channel();
+    let first = std::thread::spawn(move || {
+        let report = first_service.doctor_with_provider_intent(
+            LOCAL_DEMO_HOST,
+            &first_selection,
+            Arc::new(BlockingTestTransportProbe {
+                started: first_started_tx,
+                release: Mutex::new(release_first_rx),
+            }),
+            DoctorOptions::new(false, Some(Duration::from_millis(500)))
+                .expect("positive timeout is valid"),
+            &first_intent,
+        );
+        first_result_tx
+            .send(report)
+            .expect("send first Doctor result");
+    });
+    first_started_rx
+        .recv_timeout(Duration::from_secs(1))
+        .expect("first transport started");
 
+    let (second_started_tx, second_started_rx) = std::sync::mpsc::channel();
+    let (second_result_tx, second_result_rx) = std::sync::mpsc::channel();
+    let second_service = service.clone();
+    let second_selection = selection.clone();
+    let second_intent = intent.clone();
+    let second = std::thread::spawn(move || {
+        let report = second_service.doctor_with_provider_intent(
+            LOCAL_DEMO_HOST,
+            &second_selection,
+            Arc::new(RecordingTestTransportProbe {
+                started: second_started_tx,
+            }),
+            DoctorOptions::new(false, Some(Duration::from_millis(100)))
+                .expect("positive timeout is valid"),
+            &second_intent,
+        );
+        second_result_tx
+            .send(report)
+            .expect("send second Doctor result");
+    });
+
+    assert!(
+        second_result_rx
+            .recv_timeout(Duration::from_millis(60))
+            .is_err(),
+        "queue wait must not consume the second probe's own timeout"
+    );
+    release_first_tx
+        .send(())
+        .expect("release the first active transport");
+    first_result_rx
+        .recv_timeout(Duration::from_secs(1))
+        .expect("first Doctor completes")
+        .expect("first Doctor succeeds");
+    first.join().expect("join first Doctor");
+    second_started_rx
+        .recv_timeout(Duration::from_secs(1))
+        .expect("second transport starts after the resource is released");
+    let second_report = second_result_rx
+        .recv_timeout(Duration::from_secs(1))
+        .expect("second Doctor completes")
+        .expect("second Doctor succeeds");
+    second.join().expect("join second Doctor");
+    assert_eq!(
+        second_report
+            .probe_results
+            .iter()
+            .find(|probe| probe.scope == "transport")
+            .expect("second transport result")
+            .status,
+        "passed"
+    );
+}
+
+#[test]
+fn cleanup_only_probe_bounds_later_admission_with_a_typed_failure() {
+    let state = TestStateDir::new().expect("temporary state directory should exist");
+    let service = production_doctor_test_service(&state);
+    let selection = doctor_selection(&["transport"]);
+    let intent = ProviderComputerUseIntent::host_default();
+    let options = DoctorOptions::new(false, Some(Duration::from_millis(100)))
+        .expect("positive timeout is valid");
+    let (first_started_tx, first_started_rx) = std::sync::mpsc::channel();
+    let (release_first_tx, release_first_rx) = std::sync::mpsc::channel();
     let first = service
         .doctor_with_provider_intent(
             LOCAL_DEMO_HOST,
@@ -1860,7 +1949,7 @@ fn queued_probe_receives_its_full_timeout_after_resource_admission() {
             options,
             &intent,
         )
-        .expect("the first Doctor call publishes its typed timeout");
+        .expect("the first Doctor call publishes its typed probe timeout");
     first_started_rx
         .recv_timeout(Duration::from_secs(1))
         .expect("first transport started");
@@ -1891,35 +1980,21 @@ fn queued_probe_receives_its_full_timeout_after_resource_admission() {
         );
         second_result_tx
             .send(report)
-            .expect("send second Doctor result");
+            .expect("send blocked Doctor result");
     });
-
+    let error = second_result_rx
+        .recv_timeout(Duration::from_millis(250))
+        .expect("cleanup-only ownership must bound later admission")
+        .expect_err("cleanup-only ownership must bound later admission");
+    assert_eq!(error.code, ErrorCode::StateConflict);
     assert!(
-        second_result_rx
-            .recv_timeout(Duration::from_millis(150))
-            .is_err(),
-        "queue wait must not consume the second probe's own timeout"
+        second_started_rx.try_recv().is_err(),
+        "the blocked probe must not start before cleanup releases its lock"
     );
     release_first_tx
         .send(())
-        .expect("release the first cleanup-only transport");
-    second_started_rx
-        .recv_timeout(Duration::from_secs(1))
-        .expect("second transport starts after the resource is released");
-    let second_report = second_result_rx
-        .recv_timeout(Duration::from_secs(1))
-        .expect("second Doctor completes")
-        .expect("second Doctor succeeds");
-    second.join().expect("join second Doctor");
-    assert_eq!(
-        second_report
-            .probe_results
-            .iter()
-            .find(|probe| probe.scope == "transport")
-            .expect("second transport result")
-            .status,
-        "passed"
-    );
+        .expect("release the cleanup-only transport");
+    second.join().expect("join blocked Doctor");
 }
 
 #[test]

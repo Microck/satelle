@@ -3482,6 +3482,7 @@ fn production_doctor_with_provider_intent(
     let registry = &service.doctor_tasks;
     let request_id = registry.begin_request();
     let mut records = Vec::new();
+    let mut admission_deadlines = BTreeMap::new();
 
     while !scheduler.is_complete() {
         let now = Instant::now();
@@ -3532,8 +3533,33 @@ fn production_doctor_with_provider_intent(
         // across concurrent Doctor calls for this Host service.
         let scheduling = registry.lock_scheduling();
         let (external_capacity, external_resources) = registry.external_occupancy(request_id);
+        let ready_without_external = scheduler.clone().start_ready();
         let ready =
             scheduler.start_ready_with_external_occupancy(external_capacity, &external_resources);
+        let admitted = ready
+            .iter()
+            .map(|probe| probe.probe_id.clone())
+            .collect::<BTreeSet<_>>();
+        let externally_blocked = ready_without_external
+            .iter()
+            .filter(|probe| !admitted.contains(&probe.probe_id))
+            .map(|probe| probe.probe_id.clone())
+            .collect::<BTreeSet<_>>();
+        admission_deadlines.retain(|probe_id, _| externally_blocked.contains(probe_id));
+        for probe in ready_without_external
+            .iter()
+            .filter(|probe| externally_blocked.contains(&probe.probe_id))
+        {
+            let deadline = now.checked_add(probe.timeout).ok_or_else(|| {
+                runtime::integrity_error(format!(
+                    "Doctor probe {} admission timeout cannot form an absolute deadline",
+                    probe.probe_id
+                ))
+            })?;
+            admission_deadlines
+                .entry(probe.probe_id.clone())
+                .or_insert(deadline);
+        }
         for probe in ready {
             progressed = true;
             match probe.probe_id.as_str() {
@@ -3782,9 +3808,30 @@ fn production_doctor_with_provider_intent(
         }
         drop(scheduling);
 
+        if let Some(probe_id) = admission_deadlines
+            .iter()
+            .find_map(|(probe_id, deadline)| (Instant::now() >= *deadline).then_some(probe_id))
+        {
+            let mut error = SatelleError::state_conflict();
+            error.message = format!(
+                "Doctor probe {probe_id} could not start before its admission wait deadline because another Doctor task still owns its capacity or resource lock"
+            );
+            error.recovery_command = Some(
+                "retry satelle doctor after the prior Doctor task releases its resources".into(),
+            );
+            error.details.insert(
+                "probe_id".to_string(),
+                serde_json::Value::String(probe_id.clone()),
+            );
+            return Err(error);
+        }
+
         if !progressed {
             let next = registry
                 .next_transition()
+                .into_iter()
+                .chain(admission_deadlines.values().copied())
+                .min()
                 .unwrap_or_else(|| Instant::now() + Duration::from_millis(10));
             registry.wait_until(next);
         }
@@ -3865,11 +3912,25 @@ fn production_doctor_with_provider_intent(
     // scheduler owns their final status. Apply terminal projection last so a
     // late raw error cannot relabel TimedOut as blocked.
     apply_production_execution_status(&mut report, &scheduler, &records, &snapshot.finished_at);
-    report.probe_completion_order = scheduler.completion_order().to_vec().into_boxed_slice();
+    report.probe_completion_order = public_probe_order(&report, scheduler.completion_order());
     if options.refresh() && snapshot_was_refreshed {
         replace_production_snapshot(snapshot_slot, snapshot)?;
     }
     Ok(report)
+}
+
+fn public_probe_order(report: &DoctorReport, scheduler_order: &[String]) -> Box<[String]> {
+    scheduler_order
+        .iter()
+        .filter_map(|scheduler_id| {
+            report
+                .probe_results
+                .iter()
+                .find(|probe| probe.scope == *scheduler_id || probe.probe_id == *scheduler_id)
+                .map(|probe| probe.probe_id.clone())
+        })
+        .collect::<Vec<_>>()
+        .into_boxed_slice()
 }
 
 fn production_snapshot_after_execution(
@@ -5009,6 +5070,36 @@ mod packet17_doctor_tests {
                 DoctorProbeStatus::TimedOut,
                 DoctorDependentEvidence::NotUseful,
             )
+        );
+    }
+
+    #[test]
+    fn refresh_result_ids_follow_scheduler_completion_scope_order() {
+        let snapshot = ProductionCapabilitySnapshot::collect(None);
+        let mut report = production_doctor_report(LOCAL_DEMO_HOST, None, &snapshot);
+        report
+            .probe_results
+            .iter_mut()
+            .find(|probe| probe.scope == "computer-use")
+            .expect("native probe result")
+            .probe_id = "computer-use.native.refresh".to_string();
+        report
+            .probe_results
+            .iter_mut()
+            .find(|probe| probe.scope == "provider")
+            .expect("provider probe result")
+            .probe_id = "provider.smoke.refresh".to_string();
+
+        assert_eq!(
+            public_probe_order(
+                &report,
+                &["provider".to_string(), "computer-use".to_string()]
+            )
+            .into_vec(),
+            vec![
+                "provider.smoke.refresh".to_string(),
+                "computer-use.native.refresh".to_string(),
+            ]
         );
     }
 

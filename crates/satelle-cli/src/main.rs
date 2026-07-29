@@ -4289,7 +4289,10 @@ fn doctor_event_records(
     let mut records = Vec::new();
 
     for probe in &report.probe_results {
-        records.push(doctor_event(
+        if probe.dependency_status == "blocked" {
+            continue;
+        }
+        let mut record = doctor_event(
             &mut seq,
             DoctorEventType::ProbeStarted,
             report,
@@ -4297,7 +4300,9 @@ fn doctor_event_records(
             Some(&probe.probe_id),
             "running",
             json!({"cache_status": probe.cache_status}),
-        ));
+        );
+        record.timestamp.clone_from(&probe.started_at);
+        records.push(record);
     }
 
     let mut finished_probe_ids = BTreeSet::new();
@@ -4311,7 +4316,7 @@ fn doctor_event_records(
             continue;
         };
         finished_probe_ids.insert(probe.probe_id.as_str());
-        records.push(doctor_event(
+        let mut record = doctor_event(
             &mut seq,
             DoctorEventType::ProbeFinished,
             report,
@@ -4319,13 +4324,15 @@ fn doctor_event_records(
             Some(&probe.probe_id),
             &probe.status,
             json!(probe),
-        ));
+        );
+        record.timestamp.clone_from(&probe.finished_at);
+        records.push(record);
     }
     for probe in &report.probe_results {
         if finished_probe_ids.contains(probe.probe_id.as_str()) {
             continue;
         }
-        records.push(doctor_event(
+        let mut record = doctor_event(
             &mut seq,
             DoctorEventType::ProbeFinished,
             report,
@@ -4333,7 +4340,9 @@ fn doctor_event_records(
             Some(&probe.probe_id),
             &probe.status,
             json!(probe),
-        ));
+        );
+        record.timestamp.clone_from(&probe.finished_at);
+        records.push(record);
     }
 
     for finding in &report.findings {
@@ -4415,6 +4424,8 @@ mod doctor_event_tests {
 
     #[test]
     fn doctor_events_preserve_completion_order_without_changing_final_report_order() {
+        let mut skipped = probe("skipped-probe", "provider");
+        skipped.dependency_status = "blocked".to_string();
         let report = DoctorReport {
             schema_version: DoctorSchemaVersion::V1,
             status: "ready".to_string(),
@@ -4430,9 +4441,18 @@ mod doctor_event_tests {
                 repairable_findings: 0,
                 informational_findings: 0,
             },
-            probe_results: vec![probe("a-probe", "config"), probe("z-probe", "transport")],
-            probe_completion_order: vec!["z-probe".to_string(), "a-probe".to_string()]
-                .into_boxed_slice(),
+            probe_results: vec![
+                probe("a-probe", "config"),
+                probe("computer-use.native.refresh", "computer-use"),
+                skipped,
+                probe("provider.smoke.refresh", "provider"),
+            ],
+            probe_completion_order: vec![
+                "provider.smoke.refresh".to_string(),
+                "computer-use.native.refresh".to_string(),
+                "a-probe".to_string(),
+            ]
+            .into_boxed_slice(),
             ready: true,
             findings: Vec::new(),
             recovery_commands: Vec::new(),
@@ -4441,20 +4461,53 @@ mod doctor_event_tests {
         };
 
         let records = doctor_event_records(&report, None);
+        let started = records
+            .iter()
+            .filter(|record| record.event_type == DoctorEventType::ProbeStarted)
+            .collect::<Vec<_>>();
         let finished = records
             .iter()
             .filter(|record| record.event_type == DoctorEventType::ProbeFinished)
             .map(|record| record.probe_id.as_deref().expect("finished probe id"))
             .collect::<Vec<_>>();
 
-        assert_eq!(finished, ["z-probe", "a-probe"]);
+        assert_eq!(
+            started
+                .iter()
+                .map(|record| record.probe_id.as_deref().expect("started probe id"))
+                .collect::<Vec<_>>(),
+            [
+                "a-probe",
+                "computer-use.native.refresh",
+                "provider.smoke.refresh"
+            ]
+        );
+        assert!(
+            started
+                .iter()
+                .all(|record| record.timestamp == "2026-07-29T00:00:00Z")
+        );
+        assert_eq!(
+            finished,
+            [
+                "provider.smoke.refresh",
+                "computer-use.native.refresh",
+                "a-probe",
+                "skipped-probe"
+            ]
+        );
         assert_eq!(
             report
                 .probe_results
                 .iter()
                 .map(|probe| probe.probe_id.as_str())
                 .collect::<Vec<_>>(),
-            ["a-probe", "z-probe"]
+            [
+                "a-probe",
+                "computer-use.native.refresh",
+                "skipped-probe",
+                "provider.smoke.refresh"
+            ]
         );
         assert!(
             serde_json::to_value(&report)
