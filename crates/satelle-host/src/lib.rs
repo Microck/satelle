@@ -1957,11 +1957,14 @@ impl HostService {
                 let native_refresh = self
                     .runtime
                     .refresh_setup_native_readiness(host, native_intent);
+                let finished_at = utc_now();
+                let duration = started.elapsed();
                 apply_native_refresh(
                     &mut report,
                     &native_refresh,
                     started_at,
-                    started.elapsed(),
+                    finished_at,
+                    duration,
                     includes_native_scope,
                 );
                 native_evidence = native_refresh.ok();
@@ -1982,6 +1985,8 @@ impl HostService {
                                 native_evidence,
                                 &cancellation,
                             );
+                        let finished_at = utc_now();
+                        let duration = started.elapsed();
                         let observed = match &provider_refresh {
                             Ok(readiness) if readiness.provider_smoke_evidence().is_some() => (
                                 satelle_core::ProviderAuthValidationOutcome::Resolved,
@@ -1998,7 +2003,8 @@ impl HostService {
                             &mut report,
                             &provider_refresh,
                             started_at,
-                            started.elapsed(),
+                            finished_at,
+                            duration,
                         );
                         provider_auth_evidence = Some(observed);
                     }
@@ -2953,6 +2959,7 @@ enum ProductionDoctorTaskEffect {
     NativeRefresh {
         refresh: Result<ReadinessEvidence, SatelleError>,
         started_at: String,
+        finished_at: String,
         duration: Duration,
     },
     ProviderAuth {
@@ -2965,6 +2972,7 @@ enum ProductionDoctorTaskEffect {
     ProviderRefresh {
         refresh: Box<Result<AdapterReadiness, SatelleError>>,
         started_at: String,
+        finished_at: String,
         duration: Duration,
         observed_auth: Option<(
             satelle_core::ProviderAuthValidationOutcome,
@@ -3550,10 +3558,12 @@ struct ProductionDoctorExecution {
     native_refresh: Option<(
         Result<ReadinessEvidence, SatelleError>,
         String,
+        String,
         std::time::Duration,
     )>,
     provider_refresh: Option<(
         Result<AdapterReadiness, SatelleError>,
+        String,
         String,
         std::time::Duration,
     )>,
@@ -3603,9 +3613,10 @@ fn apply_production_doctor_effect(
         ProductionDoctorTaskEffect::NativeRefresh {
             refresh,
             started_at,
+            finished_at,
             duration,
         } => {
-            execution.native_refresh = Some((refresh, started_at, duration));
+            execution.native_refresh = Some((refresh, started_at, finished_at, duration));
         }
         ProductionDoctorTaskEffect::ProviderAuth { evidence, error } => {
             if let Some(evidence) = evidence {
@@ -3618,13 +3629,14 @@ fn apply_production_doctor_effect(
         ProductionDoctorTaskEffect::ProviderRefresh {
             refresh,
             started_at,
+            finished_at,
             duration,
             observed_auth,
         } => {
             if let Some(observed_auth) = observed_auth {
                 execution.provider_auth_evidence = Some(observed_auth);
             }
-            execution.provider_refresh = Some((*refresh, started_at, duration));
+            execution.provider_refresh = Some((*refresh, started_at, finished_at, duration));
         }
         ProductionDoctorTaskEffect::ProviderNotRequired => {
             execution.provider_not_required = true;
@@ -3868,12 +3880,15 @@ fn production_doctor_with_provider_intent(
                                 cancellation,
                             )
                         });
+                        let finished_at = utc_now();
+                        let duration = started.elapsed();
                         ProductionDoctorTaskResult {
                             completion: result_probe_completion(&refresh),
                             effect: ProductionDoctorTaskEffect::NativeRefresh {
                                 refresh,
                                 started_at,
-                                duration: started.elapsed(),
+                                finished_at,
+                                duration,
                             },
                         }
                     })?;
@@ -3980,7 +3995,7 @@ fn production_doctor_with_provider_intent(
                         let native_evidence = execution
                             .native_refresh
                             .as_ref()
-                            .and_then(|(refresh, _, _)| refresh.as_ref().ok())
+                            .and_then(|(refresh, _, _, _)| refresh.as_ref().ok())
                             .cloned();
                         let Some(native_evidence) = native_evidence else {
                             registry.spawn(request_id, &probe, move |_context| {
@@ -4023,12 +4038,15 @@ fn production_doctor_with_provider_intent(
                                 }
                                 Ok(_) => None,
                             };
+                            let finished_at = utc_now();
+                            let duration = started.elapsed();
                             ProductionDoctorTaskResult {
                                 completion: result_probe_completion(&refresh),
                                 effect: ProductionDoctorTaskEffect::ProviderRefresh {
                                     refresh: Box::new(refresh),
                                     started_at,
-                                    duration: started.elapsed(),
+                                    finished_at,
+                                    duration,
                                     observed_auth,
                                 },
                             }
@@ -4179,17 +4197,18 @@ impl ProductionDoctorExecution {
             &snapshot,
         );
 
-        if let Some((refresh, started_at, duration)) = self.native_refresh.take() {
+        if let Some((refresh, started_at, finished_at, duration)) = self.native_refresh.take() {
             apply_native_refresh(
                 &mut report,
                 &refresh,
                 started_at,
+                finished_at,
                 duration,
                 scope_selection.contains(DoctorScope::ComputerUse),
             );
         }
-        if let Some((refresh, started_at, duration)) = self.provider_refresh.take() {
-            apply_provider_refresh(&mut report, &refresh, started_at, duration);
+        if let Some((refresh, started_at, finished_at, duration)) = self.provider_refresh.take() {
+            apply_provider_refresh(&mut report, &refresh, started_at, finished_at, duration);
         } else if self.provider_not_required {
             apply_provider_not_required(&mut report);
         } else if matches!(
@@ -4504,6 +4523,7 @@ fn apply_provider_refresh(
     report: &mut DoctorReport,
     refresh: &Result<AdapterReadiness, SatelleError>,
     started_at: String,
+    finished_at: String,
     duration: std::time::Duration,
 ) {
     report
@@ -4598,7 +4618,6 @@ fn apply_provider_refresh(
         }
     };
     let finding_id = finding.finding_id.clone();
-    let finished_at = utc_now();
     report.findings.push(finding);
     report.probe_results.push(DoctorProbeResult {
         probe_id: "provider.smoke.refresh".to_string(),
@@ -4637,6 +4656,7 @@ fn apply_native_refresh(
     report: &mut DoctorReport,
     refresh: &Result<ReadinessEvidence, SatelleError>,
     started_at: String,
+    finished_at: String,
     duration: std::time::Duration,
     project_public_result: bool,
 ) {
@@ -4744,7 +4764,7 @@ fn apply_native_refresh(
         scope: "computer-use".to_string(),
         status: status.to_string(),
         started_at,
-        finished_at: utc_now(),
+        finished_at,
         duration_ms: u64::try_from(duration.as_millis()).unwrap_or(u64::MAX),
         cache_status: cache_status.to_string(),
         dependency_status: "satisfied".to_string(),
@@ -5890,6 +5910,7 @@ fn doctor_registry_retains_only_cache_mutation_from_late_refresh() {
                         effect: ProductionDoctorTaskEffect::NativeRefresh {
                             refresh: Err(refresh_error),
                             started_at: "2026-07-29T00:00:00Z".to_string(),
+                            finished_at: "2026-07-29T00:00:00.080Z".to_string(),
                             duration: Duration::from_millis(80),
                         },
                     }),

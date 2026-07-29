@@ -2538,6 +2538,63 @@ fn doctor_provider_refresh_updates_cache_without_admitting_prompt_work() {
 }
 
 #[test]
+fn refresh_projection_preserves_worker_finish_timestamps() {
+    let snapshot = capability_snapshot(
+        Phase0CapabilityEvidence {
+            codex_version: CodexVersionEvidence::Detected {
+                version: REQUIRED_CODEX_VERSION,
+            },
+            host_platform: HostPlatform::Linux,
+            capabilities: CapabilityMatrix::unproven(),
+        },
+        1,
+    );
+
+    let mut native_report =
+        production_doctor_report(LOCAL_DEMO_HOST, Some("computer-use"), &snapshot);
+    let native_refresh: Result<ReadinessEvidence, SatelleError> =
+        Err(SatelleError::computer_use_not_ready());
+    apply_native_refresh(
+        &mut native_report,
+        &native_refresh,
+        "2026-07-29T21:00:00Z".to_string(),
+        "2026-07-29T21:00:01Z".to_string(),
+        Duration::from_secs(1),
+        true,
+    );
+    assert_eq!(
+        native_report
+            .probe_results
+            .iter()
+            .find(|probe| probe.scope == "computer-use")
+            .expect("native refresh row")
+            .finished_at,
+        "2026-07-29T21:00:01Z"
+    );
+
+    let mut provider_report =
+        production_doctor_report(LOCAL_DEMO_HOST, Some("provider"), &snapshot);
+    let provider_refresh: Result<AdapterReadiness, SatelleError> =
+        Err(SatelleError::computer_use_not_ready());
+    apply_provider_refresh(
+        &mut provider_report,
+        &provider_refresh,
+        "2026-07-29T21:00:02Z".to_string(),
+        "2026-07-29T21:00:03Z".to_string(),
+        Duration::from_secs(1),
+    );
+    assert_eq!(
+        provider_report
+            .probe_results
+            .iter()
+            .find(|probe| probe.scope == "provider")
+            .expect("provider refresh row")
+            .finished_at,
+        "2026-07-29T21:00:03Z"
+    );
+}
+
+#[test]
 fn endpointless_auth_sources_are_reserved_for_builtin_openai() {
     let openai = satelle_core::ProviderBindingAuthorization::new(
         "openai-model",
