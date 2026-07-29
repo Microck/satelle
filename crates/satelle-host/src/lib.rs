@@ -3064,6 +3064,12 @@ struct DoctorTaskRegistryState {
     events: BTreeMap<u64, VecDeque<DoctorRegistryEvent>>,
 }
 
+struct DoctorRegistryOccupancy {
+    occupied_host_slots: usize,
+    same_request_cleanup_slots: usize,
+    resources: BTreeSet<DoctorProbeResource>,
+}
+
 struct DoctorTaskRegistryInner {
     scheduling: Mutex<()>,
     state: Mutex<DoctorTaskRegistryState>,
@@ -3369,7 +3375,7 @@ impl DoctorTaskRegistry {
         }
     }
 
-    fn external_occupancy(&self, request_id: u64) -> (usize, BTreeSet<DoctorProbeResource>) {
+    fn occupancy(&self, request_id: u64) -> DoctorRegistryOccupancy {
         let state = self
             .inner
             .state
@@ -3378,13 +3384,21 @@ impl DoctorTaskRegistry {
         let tasks = state.tasks.values().filter(|task| {
             task.request_id != request_id || task.phase == DoctorRegistryTaskPhase::CleanupOnly
         });
-        let mut capacity = 0;
+        let mut occupied_host_slots = 0;
+        let mut same_request_cleanup_slots = 0;
         let mut resources = BTreeSet::new();
         for task in tasks {
-            capacity += 1;
+            occupied_host_slots += 1;
+            if task.request_id == request_id {
+                same_request_cleanup_slots += 1;
+            }
             resources.extend(task.resource_locks.iter().copied());
         }
-        (capacity, resources)
+        DoctorRegistryOccupancy {
+            occupied_host_slots,
+            same_request_cleanup_slots,
+            resources,
+        }
     }
 
     fn drain_events(&self, request_id: u64) -> Vec<DoctorRegistryEvent> {
@@ -3818,10 +3832,9 @@ fn production_doctor_with_provider_intent(
         // Occupancy inspection and registration form one admission decision
         // across concurrent Doctor calls for this Host service.
         let scheduling = registry.lock_scheduling();
-        let (external_capacity, external_resources) = registry.external_occupancy(request_id);
+        let occupancy = registry.occupancy(request_id);
         let ready_without_external = scheduler.clone().start_ready();
-        let ready =
-            scheduler.start_ready_with_external_occupancy(external_capacity, &external_resources);
+        let ready = start_production_doctor_ready(&mut scheduler, options, &occupancy);
         let admitted = ready
             .iter()
             .map(|probe| probe.probe_id.clone())
@@ -4459,6 +4472,18 @@ fn production_doctor_scheduler(
         DoctorProbeScheduler::new(probes)
     };
     scheduler.map_err(|error| SatelleError::invalid_usage(error.to_string()))
+}
+
+fn start_production_doctor_ready(
+    scheduler: &mut DoctorProbeScheduler,
+    options: DoctorOptions,
+    occupancy: &DoctorRegistryOccupancy,
+) -> Vec<DoctorProbe> {
+    if options.serial_probes() && occupancy.same_request_cleanup_slots > 0 {
+        return Vec::new();
+    }
+    scheduler
+        .start_ready_with_external_occupancy(occupancy.occupied_host_slots, &occupancy.resources)
 }
 
 fn native_probe_intent<'a>(
@@ -5735,16 +5760,45 @@ fn doctor_registry_retains_timed_out_capacity_and_lock_until_cleanup_ack() {
         [DoctorRegistryEvent::TimedOut { probe_id }] if probe_id == "provider"
     ));
 
+    let same_request_occupancy = registry.occupancy(request_id);
+    assert_eq!(same_request_occupancy.same_request_cleanup_slots, 1);
+    let mut serial_disjoint = DoctorProbeScheduler::serial(vec![DoctorProbe {
+        probe_id: "config".to_string(),
+        scope: DoctorScope::Config.as_str().to_string(),
+        dependencies: Vec::new(),
+        resource_locks: Default::default(),
+        timeout: Duration::from_millis(100),
+        cache_policy: DoctorProbeCachePolicy::Never,
+    }])
+    .expect("serial disjoint graph is valid");
+    assert!(
+        start_production_doctor_ready(
+            &mut serial_disjoint,
+            DoctorOptions::default().with_serial_probes(true),
+            &same_request_occupancy,
+        )
+        .is_empty(),
+        "cleanup-only work retains the same request's serial slot"
+    );
+
     let later_request_id = registry.begin_request();
-    let (capacity, locks) = registry.external_occupancy(later_request_id);
-    assert_eq!(capacity, 1);
-    assert!(locks.contains(&DoctorProbeResource::ProviderProbeSurface));
+    let occupancy = registry.occupancy(later_request_id);
+    assert_eq!(occupancy.occupied_host_slots, 1);
+    assert_eq!(occupancy.same_request_cleanup_slots, 0);
+    assert!(
+        occupancy
+            .resources
+            .contains(&DoctorProbeResource::ProviderProbeSurface)
+    );
 
     let mut same_lock =
         DoctorProbeScheduler::new(vec![definition.clone()]).expect("same-lock graph is valid");
     assert!(
         same_lock
-            .start_ready_with_external_occupancy(capacity, &locks)
+            .start_ready_with_external_occupancy(
+                occupancy.occupied_host_slots,
+                &occupancy.resources,
+            )
             .is_empty()
     );
 
@@ -5759,7 +5813,10 @@ fn doctor_registry_retains_timed_out_capacity_and_lock_until_cleanup_ack() {
     .expect("disjoint graph is valid");
     assert_eq!(
         disjoint
-            .start_ready_with_external_occupancy(capacity, &locks)
+            .start_ready_with_external_occupancy(
+                occupancy.occupied_host_slots,
+                &occupancy.resources,
+            )
             .len(),
         1
     );
@@ -5767,7 +5824,7 @@ fn doctor_registry_retains_timed_out_capacity_and_lock_until_cleanup_ack() {
     release_tx.send(()).expect("release worker");
     loop {
         registry.advance(Instant::now());
-        if registry.external_occupancy(later_request_id).0 == 0 {
+        if registry.occupancy(later_request_id).occupied_host_slots == 0 {
             break;
         }
         registry.wait_until(Instant::now() + Duration::from_millis(10));
