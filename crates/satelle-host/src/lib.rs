@@ -5203,12 +5203,13 @@ fn production_doctor_probes(
                 ]
                 .into_iter()
                 .collect(),
-                DoctorScope::Provider => [
+                DoctorScope::Provider if provider_requires_native => [
                     DoctorProbeResource::ProviderProbeSurface,
                     DoctorProbeResource::ReadinessCacheWrite,
                 ]
                 .into_iter()
                 .collect(),
+                DoctorScope::Provider => Default::default(),
                 DoctorScope::Transport => [DoctorProbeResource::RemoteServiceManager]
                     .into_iter()
                     .collect(),
@@ -5580,6 +5581,15 @@ mod packet17_doctor_tests {
                 .dependencies
                 .is_empty(),
             "a provider that needs no smoke probe must not depend on native readiness"
+        );
+        assert!(
+            provider_without_smoke
+                .iter()
+                .find(|probe| probe.scope == "provider")
+                .expect("provider probe")
+                .resource_locks
+                .is_empty(),
+            "a provider that needs no smoke probe must not claim smoke-only resources"
         );
         assert!(
             native
