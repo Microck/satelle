@@ -3169,6 +3169,8 @@ impl DoctorTaskRegistry {
                                     completed_at,
                                     result,
                                 } => {
+                                    let completed_within_useful_work_budget =
+                                        completed_at < task.lifecycle.cancel_at();
                                     let ProductionDoctorTaskResult {
                                         completion: result_completion,
                                         effect,
@@ -3186,7 +3188,9 @@ impl DoctorTaskRegistry {
                                         completed_at,
                                         task_id,
                                         request_id,
-                                        if completion.status == DoctorProbeStatus::TimedOut {
+                                        if completion.status == DoctorProbeStatus::TimedOut
+                                            && !completed_within_useful_work_budget
+                                        {
                                             DoctorRegistryEvent::TimedOut { probe_id }
                                         } else {
                                             DoctorRegistryEvent::Completed {
@@ -5383,6 +5387,64 @@ fn doctor_registry_drains_completed_workers_by_completion_time() {
         ["completed-first", "admitted-first"],
         "task admission order must not overwrite actual completion order"
     );
+}
+
+#[cfg(test)]
+#[test]
+fn doctor_registry_preserves_effect_from_worker_reported_timeout() {
+    let registry = DoctorTaskRegistry::new();
+    let request_id = registry.begin_request();
+    let now = Instant::now();
+    let lifecycle = DoctorProbeLifecycle::start(
+        "transport",
+        now,
+        Duration::from_secs(1),
+        Duration::from_millis(100),
+    )
+    .expect("valid lifecycle");
+    registry
+        .inner
+        .state
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .tasks
+        .insert(
+            1,
+            DoctorRegistryTask {
+                request_id,
+                probe_id: "transport".to_string(),
+                resource_locks: Default::default(),
+                lifecycle,
+                phase: DoctorRegistryTaskPhase::Running,
+                terminal: Some(DoctorWorkerTerminal::Completed {
+                    completed_at: now + Duration::from_millis(1),
+                    result: Box::new(ProductionDoctorTaskResult {
+                        completion: DoctorProbeCompletion::new(
+                            DoctorProbeStatus::TimedOut,
+                            DoctorDependentEvidence::NotUseful,
+                        ),
+                        effect: ProductionDoctorTaskEffect::ProviderNotRequired,
+                    }),
+                }),
+                worker: None,
+            },
+        );
+
+    registry.advance(now + Duration::from_millis(2));
+    let events = registry.drain_events(request_id);
+
+    assert!(matches!(
+        events.as_slice(),
+        [DoctorRegistryEvent::Completed {
+            probe_id,
+            completion: DoctorProbeCompletion {
+                status: DoctorProbeStatus::TimedOut,
+                ..
+            },
+            effect,
+        }] if probe_id == "transport"
+            && matches!(effect.as_ref(), ProductionDoctorTaskEffect::ProviderNotRequired)
+    ));
 }
 
 #[cfg(test)]
