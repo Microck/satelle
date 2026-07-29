@@ -111,9 +111,11 @@ pub(super) fn doctor(
             [
                 DoctorProbeScheduleEvent::Started {
                     probe_id: probe.probe_id.clone(),
+                    timestamp: probe.started_at.clone(),
                 },
                 DoctorProbeScheduleEvent::Finished {
                     probe_id: probe.probe_id.clone(),
+                    timestamp: probe.finished_at.clone(),
                 },
             ]
         })

@@ -888,42 +888,31 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn contract_violating_stdout_holder_leaves_no_satelle_io_thread() {
+    fn contract_violating_stdout_holder_does_not_extend_bounded_read() {
         let fixture = tempfile::tempdir().expect("create escaped descendant fixture");
+        let parent_pid_file = fixture.path().join("parent-pid");
         let escaped_pid_file = fixture.path().join("escaped-pid");
         let script = format!(
-            "#!/bin/sh\nsetsid sh -c 'printf \"%s\" \"$$\" > \"{}\"; sleep 10' &\nwhile true; do sleep 1; done\n",
+            "#!/bin/sh\nprintf '%s' \"$$\" > '{}'\nsetsid sh -c 'printf \"%s\" \"$$\" > \"{}\"; sleep 10' &\nwhile true; do sleep 1; done\n",
+            parent_pid_file.display(),
             escaped_pid_file.display()
         );
         let (_fixture, executable) = executable_fixture(&script);
-        let selection =
-            DoctorScopeSelection::parse(&["transport".to_string()]).expect("transport scope");
-        let host = tailscale_host();
-        let probe = transport_doctor_probe_with(&selection, &host, &executable);
-        let started = std::time::Instant::now();
-        let tasks_before = std::fs::read_dir("/proc/self/task")
-            .expect("read process tasks before probe")
-            .map(|entry| entry.expect("read process task").file_name())
-            .collect::<std::collections::BTreeSet<_>>();
-
-        let report = transport_only_doctor_report(
-            "studio",
-            &host,
-            &selection,
-            &probe,
-            DoctorOptions::new(false, Some(std::time::Duration::from_millis(80)))
-                .expect("positive timeout"),
+        let lifecycle = DoctorProbeLifecycle::start(
+            "transport",
+            std::time::Instant::now(),
+            std::time::Duration::from_millis(80),
+            std::time::Duration::from_millis(20),
         )
-        .expect("transport scheduler")
-        .expect("Direct Tailscale transport report");
-        let tasks_after = std::fs::read_dir("/proc/self/task")
-            .expect("read process tasks after probe")
-            .map(|entry| entry.expect("read process task").file_name())
-            .collect::<std::collections::BTreeSet<_>>();
-        let surviving_new_tasks = tasks_after
-            .difference(&tasks_before)
-            .cloned()
-            .collect::<Vec<_>>();
+        .expect("bounded probe lifecycle");
+        let context = lifecycle.context();
+        let started = std::time::Instant::now();
+        let error = run_bounded(&executable, &["status".into(), "--json".into()], &context)
+            .expect_err("escaped stdout holder exceeds the useful-work deadline");
+        let parent_pid = std::fs::read_to_string(&parent_pid_file)
+            .expect("read bounded process pid")
+            .parse::<i32>()
+            .expect("parse bounded process pid");
         let escaped_pid = std::fs::read_to_string(&escaped_pid_file)
             .expect("read contract-violating descendant pid")
             .parse::<i32>()
@@ -932,14 +921,14 @@ mod tests {
             let _ = rustix::process::kill_process(pid, rustix::process::Signal::KILL);
         }
 
-        assert_eq!(report.probe_results[0].status, "timed_out");
+        assert_eq!(error, StatusReadError::TimedOut);
         assert!(
             started.elapsed() < std::time::Duration::from_millis(300),
             "escaped pipe holders must not extend the hard cleanup deadline"
         );
         assert!(
-            surviving_new_tasks.is_empty(),
-            "bounded return must not leave a new Satelle-owned task: {surviving_new_tasks:?}"
+            !Path::new("/proc").join(parent_pid.to_string()).exists(),
+            "the bounded Tailscale process must be killed and reaped"
         );
     }
 

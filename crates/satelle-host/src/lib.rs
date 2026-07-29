@@ -2962,7 +2962,9 @@ enum DoctorWorkerTerminal {
         completed_at: Instant,
         result: Box<ProductionDoctorTaskResult>,
     },
-    Panicked,
+    Panicked {
+        completed_at: Instant,
+    },
 }
 
 #[derive(Clone, Copy, Eq, PartialEq)]
@@ -3104,7 +3106,9 @@ impl DoctorTaskRegistry {
                         completed_at: Instant::now(),
                         result: Box::new(result),
                     },
-                    Err(_) => DoctorWorkerTerminal::Panicked,
+                    Err(_) => DoctorWorkerTerminal::Panicked {
+                        completed_at: Instant::now(),
+                    },
                 };
                 let Some(inner) = Weak::upgrade(&weak) else {
                     return;
@@ -3179,6 +3183,8 @@ impl DoctorTaskRegistry {
                                         unreachable!("worker completion is a terminal ack")
                                     };
                                     event = Some((
+                                        completed_at,
+                                        task_id,
                                         request_id,
                                         if completion.status == DoctorProbeStatus::TimedOut {
                                             DoctorRegistryEvent::TimedOut { probe_id }
@@ -3191,8 +3197,10 @@ impl DoctorTaskRegistry {
                                         },
                                     ));
                                 }
-                                DoctorWorkerTerminal::Panicked => {
+                                DoctorWorkerTerminal::Panicked { completed_at } => {
                                     event = Some((
+                                        completed_at,
+                                        task_id,
                                         request_id,
                                         DoctorRegistryEvent::Panicked { probe_id },
                                     ));
@@ -3214,6 +3222,8 @@ impl DoctorTaskRegistry {
                             ) => {
                                 task.phase = DoctorRegistryTaskPhase::CleanupOnly;
                                 event = Some((
+                                    now,
+                                    task_id,
                                     task.request_id,
                                     DoctorRegistryEvent::TimedOut {
                                         probe_id: task.probe_id.clone(),
@@ -3240,7 +3250,11 @@ impl DoctorTaskRegistry {
                     queued.push(event);
                 }
             }
-            for (request_id, event) in queued.drain(..) {
+            // Workers publish their own completion instants. Task IDs encode
+            // admission order, so sort the drained batch before projecting
+            // completion order. The ID only breaks an exact timestamp tie.
+            queued.sort_by_key(|(completed_at, task_id, _, _)| (*completed_at, *task_id));
+            for (_, _, request_id, event) in queued.drain(..) {
                 state.events.entry(request_id).or_default().push_back(event);
             }
         }
@@ -3934,12 +3948,18 @@ fn public_probe_schedule_events(
                 .probe_id
                 .clone();
             Some(match event {
-                DoctorProbeScheduleEvent::Started { .. } => DoctorProbeScheduleEvent::Started {
-                    probe_id: public_probe_id,
-                },
-                DoctorProbeScheduleEvent::Finished { .. } => DoctorProbeScheduleEvent::Finished {
-                    probe_id: public_probe_id,
-                },
+                DoctorProbeScheduleEvent::Started { timestamp, .. } => {
+                    DoctorProbeScheduleEvent::Started {
+                        probe_id: public_probe_id,
+                        timestamp: timestamp.clone(),
+                    }
+                }
+                DoctorProbeScheduleEvent::Finished { timestamp, .. } => {
+                    DoctorProbeScheduleEvent::Finished {
+                        probe_id: public_probe_id,
+                        timestamp: timestamp.clone(),
+                    }
+                }
             })
         })
         .collect::<Vec<_>>()
@@ -4606,9 +4626,11 @@ fn production_doctor_report_with_selection(
             [
                 DoctorProbeScheduleEvent::Started {
                     probe_id: probe.probe_id.clone(),
+                    timestamp: probe.started_at.clone(),
                 },
                 DoctorProbeScheduleEvent::Finished {
                     probe_id: probe.probe_id.clone(),
+                    timestamp: probe.finished_at.clone(),
                 },
             ]
         })
@@ -5128,32 +5150,40 @@ mod packet17_doctor_tests {
                 &report,
                 &[
                     DoctorProbeScheduleEvent::Started {
-                        probe_id: "provider".to_string()
+                        probe_id: "provider".to_string(),
+                        timestamp: "2026-07-29T00:00:00Z".to_string(),
                     },
                     DoctorProbeScheduleEvent::Finished {
-                        probe_id: "provider".to_string()
+                        probe_id: "provider".to_string(),
+                        timestamp: "2026-07-29T00:00:01Z".to_string(),
                     },
                     DoctorProbeScheduleEvent::Started {
-                        probe_id: "computer-use".to_string()
+                        probe_id: "computer-use".to_string(),
+                        timestamp: "2026-07-29T00:00:02Z".to_string(),
                     },
                     DoctorProbeScheduleEvent::Finished {
-                        probe_id: "computer-use".to_string()
+                        probe_id: "computer-use".to_string(),
+                        timestamp: "2026-07-29T00:00:03Z".to_string(),
                     },
                 ]
             )
             .into_vec(),
             vec![
                 DoctorProbeScheduleEvent::Started {
-                    probe_id: "provider.smoke.refresh".to_string()
+                    probe_id: "provider.smoke.refresh".to_string(),
+                    timestamp: "2026-07-29T00:00:00Z".to_string(),
                 },
                 DoctorProbeScheduleEvent::Finished {
-                    probe_id: "provider.smoke.refresh".to_string()
+                    probe_id: "provider.smoke.refresh".to_string(),
+                    timestamp: "2026-07-29T00:00:01Z".to_string(),
                 },
                 DoctorProbeScheduleEvent::Started {
-                    probe_id: "computer-use.native.refresh".to_string()
+                    probe_id: "computer-use.native.refresh".to_string(),
+                    timestamp: "2026-07-29T00:00:02Z".to_string(),
                 },
                 DoctorProbeScheduleEvent::Finished {
-                    probe_id: "computer-use.native.refresh".to_string()
+                    probe_id: "computer-use.native.refresh".to_string(),
+                    timestamp: "2026-07-29T00:00:03Z".to_string(),
                 },
             ]
         );
@@ -5291,6 +5321,67 @@ fn doctor_registry_retains_timed_out_capacity_and_lock_until_cleanup_ack() {
     assert!(
         registry.drain_events(request_id).is_empty(),
         "late success and effect must be discarded"
+    );
+}
+
+#[cfg(test)]
+#[test]
+fn doctor_registry_drains_completed_workers_by_completion_time() {
+    let registry = DoctorTaskRegistry::new();
+    let request_id = registry.begin_request();
+    let now = Instant::now();
+    let task = |probe_id: &str, completed_at| DoctorRegistryTask {
+        request_id,
+        probe_id: probe_id.to_string(),
+        resource_locks: Default::default(),
+        lifecycle: DoctorProbeLifecycle::start(
+            probe_id,
+            now,
+            Duration::from_secs(1),
+            Duration::from_millis(100),
+        )
+        .expect("valid lifecycle"),
+        phase: DoctorRegistryTaskPhase::Running,
+        terminal: Some(DoctorWorkerTerminal::Completed {
+            completed_at,
+            result: Box::new(ProductionDoctorTaskResult {
+                completion: DoctorProbeCompletion::new(
+                    DoctorProbeStatus::Passed,
+                    DoctorDependentEvidence::Useful,
+                ),
+                effect: ProductionDoctorTaskEffect::None,
+            }),
+        }),
+        worker: None,
+    };
+    {
+        let mut state = registry
+            .inner
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state
+            .tasks
+            .insert(1, task("admitted-first", now + Duration::from_millis(2)));
+        state
+            .tasks
+            .insert(2, task("completed-first", now + Duration::from_millis(1)));
+    }
+
+    registry.advance(now + Duration::from_millis(3));
+    let completed_probe_ids = registry
+        .drain_events(request_id)
+        .into_iter()
+        .map(|event| match event {
+            DoctorRegistryEvent::Completed { probe_id, .. } => probe_id,
+            _ => panic!("expected completed worker"),
+        })
+        .collect::<Vec<_>>();
+
+    assert_eq!(
+        completed_probe_ids,
+        ["completed-first", "admitted-first"],
+        "task admission order must not overwrite actual completion order"
     );
 }
 

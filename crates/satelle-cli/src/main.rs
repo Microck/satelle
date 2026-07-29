@@ -4299,7 +4299,7 @@ fn doctor_event_records(
             continue;
         };
         match event {
-            satelle_core::doctor::DoctorProbeScheduleEvent::Started { .. } => {
+            satelle_core::doctor::DoctorProbeScheduleEvent::Started { timestamp, .. } => {
                 if probe.dependency_status == "blocked" {
                     continue;
                 }
@@ -4312,10 +4312,10 @@ fn doctor_event_records(
                     "running",
                     json!({"cache_status": probe.cache_status}),
                 );
-                record.timestamp.clone_from(&probe.started_at);
+                record.timestamp.clone_from(timestamp);
                 records.push(record);
             }
-            satelle_core::doctor::DoctorProbeScheduleEvent::Finished { .. } => {
+            satelle_core::doctor::DoctorProbeScheduleEvent::Finished { timestamp, .. } => {
                 let mut record = doctor_event(
                     &mut seq,
                     DoctorEventType::ProbeFinished,
@@ -4325,7 +4325,7 @@ fn doctor_event_records(
                     &probe.status,
                     json!(probe),
                 );
-                record.timestamp.clone_from(&probe.finished_at);
+                record.timestamp.clone_from(timestamp);
                 records.push(record);
             }
         }
@@ -4436,24 +4436,31 @@ mod doctor_event_tests {
             probe_schedule_events: vec![
                 satelle_core::doctor::DoctorProbeScheduleEvent::Started {
                     probe_id: "provider.smoke.refresh".to_string(),
+                    timestamp: "2026-07-29T00:00:10Z".to_string(),
                 },
                 satelle_core::doctor::DoctorProbeScheduleEvent::Finished {
                     probe_id: "provider.smoke.refresh".to_string(),
+                    timestamp: "2026-07-29T00:00:11Z".to_string(),
                 },
                 satelle_core::doctor::DoctorProbeScheduleEvent::Started {
                     probe_id: "computer-use.native.refresh".to_string(),
+                    timestamp: "2026-07-29T00:00:12Z".to_string(),
                 },
                 satelle_core::doctor::DoctorProbeScheduleEvent::Finished {
                     probe_id: "computer-use.native.refresh".to_string(),
+                    timestamp: "2026-07-29T00:00:13Z".to_string(),
                 },
                 satelle_core::doctor::DoctorProbeScheduleEvent::Started {
                     probe_id: "a-probe".to_string(),
+                    timestamp: "2026-07-29T00:00:14Z".to_string(),
                 },
                 satelle_core::doctor::DoctorProbeScheduleEvent::Finished {
                     probe_id: "a-probe".to_string(),
+                    timestamp: "2026-07-29T00:00:15Z".to_string(),
                 },
                 satelle_core::doctor::DoctorProbeScheduleEvent::Finished {
                     probe_id: "skipped-probe".to_string(),
+                    timestamp: "2026-07-29T00:00:16Z".to_string(),
                 },
             ]
             .into_boxed_slice(),
@@ -4499,10 +4506,17 @@ mod doctor_event_tests {
                 "a-probe",
             ]
         );
-        assert!(
+        assert_eq!(
             started
                 .iter()
-                .all(|record| record.timestamp == "2026-07-29T00:00:00Z")
+                .map(|record| record.timestamp.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "2026-07-29T00:00:10Z",
+                "2026-07-29T00:00:12Z",
+                "2026-07-29T00:00:14Z",
+            ],
+            "public start records must use this scheduler run, not cached probe timestamps"
         );
         assert_eq!(
             finished,

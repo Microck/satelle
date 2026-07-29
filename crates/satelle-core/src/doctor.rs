@@ -246,14 +246,14 @@ pub struct DoctorProbeExecutionRecord {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum DoctorProbeScheduleEvent {
-    Started { probe_id: String },
-    Finished { probe_id: String },
+    Started { probe_id: String, timestamp: String },
+    Finished { probe_id: String, timestamp: String },
 }
 
 impl DoctorProbeScheduleEvent {
     pub fn probe_id(&self) -> &str {
         match self {
-            Self::Started { probe_id } | Self::Finished { probe_id } => probe_id,
+            Self::Started { probe_id, .. } | Self::Finished { probe_id, .. } => probe_id,
         }
     }
 }
@@ -574,7 +574,10 @@ impl DoctorProbeScheduler {
             scheduled_probe.state = DoctorProbeState::Running;
             started.push(scheduled_probe.definition.clone());
             self.schedule_events
-                .push(DoctorProbeScheduleEvent::Started { probe_id });
+                .push(DoctorProbeScheduleEvent::Started {
+                    probe_id,
+                    timestamp: crate::utc_now(),
+                });
             remaining_capacity -= 1;
         }
         started
@@ -600,6 +603,7 @@ impl DoctorProbeScheduler {
         self.schedule_events
             .push(DoctorProbeScheduleEvent::Finished {
                 probe_id: probe_id.to_string(),
+                timestamp: crate::utc_now(),
             });
         Ok(())
     }
@@ -673,7 +677,10 @@ impl DoctorProbeScheduler {
                 .state = DoctorProbeState::SkippedDependency { blocking_probe_id };
             self.completion_order.push(probe_id.clone());
             self.schedule_events
-                .push(DoctorProbeScheduleEvent::Finished { probe_id });
+                .push(DoctorProbeScheduleEvent::Finished {
+                    probe_id,
+                    timestamp: crate::utc_now(),
+                });
         }
     }
 }
@@ -992,21 +999,33 @@ mod tests {
             .finish("dependent", useful(DoctorProbeStatus::Passed))
             .expect("dependent is running");
 
+        let lifecycle = scheduler
+            .schedule_events()
+            .iter()
+            .map(|event| match event {
+                DoctorProbeScheduleEvent::Started {
+                    probe_id,
+                    timestamp,
+                } => {
+                    assert!(!timestamp.is_empty());
+                    ("started", probe_id.as_str())
+                }
+                DoctorProbeScheduleEvent::Finished {
+                    probe_id,
+                    timestamp,
+                } => {
+                    assert!(!timestamp.is_empty());
+                    ("finished", probe_id.as_str())
+                }
+            })
+            .collect::<Vec<_>>();
         assert_eq!(
-            scheduler.schedule_events(),
+            lifecycle,
             [
-                DoctorProbeScheduleEvent::Started {
-                    probe_id: "prerequisite".to_string()
-                },
-                DoctorProbeScheduleEvent::Finished {
-                    probe_id: "prerequisite".to_string()
-                },
-                DoctorProbeScheduleEvent::Started {
-                    probe_id: "dependent".to_string()
-                },
-                DoctorProbeScheduleEvent::Finished {
-                    probe_id: "dependent".to_string()
-                },
+                ("started", "prerequisite"),
+                ("finished", "prerequisite"),
+                ("started", "dependent"),
+                ("finished", "dependent"),
             ]
         );
     }
