@@ -3128,10 +3128,8 @@ fn production_doctor_with_provider_intent(
         // error can leave the production Doctor path.
         return Err(error);
     }
-    let snapshot = execution
-        .snapshot
-        .take()
-        .expect("the required capability probe completed");
+    let (snapshot, snapshot_was_refreshed) =
+        production_snapshot_after_execution(&mut execution, &records, snapshot_slot)?;
     let mut report = production_doctor_report_with_selection(
         host,
         scope_selection,
@@ -3176,10 +3174,29 @@ fn production_doctor_with_provider_intent(
     // scheduler owns their final status. Apply terminal projection last so a
     // late raw error cannot relabel TimedOut as blocked.
     apply_production_execution_status(&mut report, &scheduler, &records, &snapshot.finished_at);
-    if options.refresh() {
+    if options.refresh() && snapshot_was_refreshed {
         replace_production_snapshot(snapshot_slot, snapshot)?;
     }
     Ok(report)
+}
+
+fn production_snapshot_after_execution(
+    execution: &mut ProductionDoctorExecution,
+    records: &[DoctorProbeExecutionRecord],
+    snapshot_slot: &RwLock<ProductionCapabilitySnapshot>,
+) -> Result<(ProductionCapabilitySnapshot, bool), SatelleError> {
+    if let Some(snapshot) = execution.snapshot.take() {
+        return Ok((snapshot, true));
+    }
+    if records.iter().any(|record| {
+        record.probe_id == DoctorScope::Codex.as_str()
+            && record.status == DoctorProbeStatus::TimedOut
+    }) {
+        return read_production_snapshot(snapshot_slot).map(|snapshot| (snapshot.clone(), false));
+    }
+    Err(crate::runtime::integrity_error(
+        "the production capability probe completed without a snapshot or typed timeout",
+    ))
 }
 
 fn probe_completion(blocked: bool) -> DoctorProbeCompletion {
@@ -4366,6 +4383,25 @@ mod packet17_doctor_tests {
         assert_eq!(report.probe_results.len(), 1);
         assert_eq!(report.probe_results[0].status, "timed_out");
         assert!(!report.summary.ready);
+    }
+
+    #[test]
+    fn capability_refresh_dispatched_after_deadline_uses_typed_timeout_without_a_new_snapshot() {
+        let fallback = ProductionCapabilitySnapshot::collect(None);
+        let snapshot_slot = RwLock::new(fallback.clone());
+        let mut execution = ProductionDoctorExecution::new();
+        let records = vec![DoctorProbeExecutionRecord {
+            probe_id: DoctorScope::Codex.as_str().to_string(),
+            status: DoctorProbeStatus::TimedOut,
+        }];
+
+        let (snapshot, snapshot_was_refreshed) =
+            production_snapshot_after_execution(&mut execution, &records, &snapshot_slot)
+                .expect("a typed timeout keeps the last authoritative snapshot as report context");
+
+        assert_eq!(records[0].status, DoctorProbeStatus::TimedOut);
+        assert!(!snapshot_was_refreshed);
+        assert_eq!(snapshot.finished_at, fallback.finished_at);
     }
 
     #[test]

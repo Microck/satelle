@@ -39,15 +39,15 @@ use satelle_core::session::{
 use satelle_core::{
     BEACON_CORAL, CLI_NAME, DaemonPathOverrides, DesktopSelectionPolicy, DesktopSessionPreference,
     DoctorEventRecord, DoctorEventSchemaVersion, DoctorEventType, DoctorFixability, DoctorOptions,
-    DoctorReport, DoctorTransportObservation, ERROR_RED, ErrorCode, EventSource, EventType,
-    HostConfig, HostSessionsReport, LOCAL_DEMO_HOST, MutationCommandFamily, OwnerOnlyDirectory,
-    PRODUCT_NAME, ProfileField, ProfileSelectionSource, ProviderSecretSource, RELAY_ROSE,
-    ResolvedConfig, SUCCESS_GREEN, SatelleError, SatelleEvent, SatelleEventBody, SecureFileError,
-    SessionId, SetupMode, SetupReadinessSummary, SetupReport, SetupRequiredInput,
-    SetupSchemaVersion, SetupVerification, load_config, load_config_for_profile,
-    load_config_without_profile, load_user_api_rate_limits, open_or_create_owner_only_directory,
-    open_or_create_owner_only_file, open_owner_only_directory, read_owner_controlled_config_file,
-    read_owner_only_secret_config_file, resolve_desktop_session, resolve_path_set, utc_now,
+    DoctorReport, ERROR_RED, ErrorCode, EventSource, EventType, HostConfig, HostSessionsReport,
+    LOCAL_DEMO_HOST, MutationCommandFamily, OwnerOnlyDirectory, PRODUCT_NAME, ProfileField,
+    ProfileSelectionSource, ProviderSecretSource, RELAY_ROSE, ResolvedConfig, SUCCESS_GREEN,
+    SatelleError, SatelleEvent, SatelleEventBody, SecureFileError, SessionId, SetupMode,
+    SetupReadinessSummary, SetupReport, SetupRequiredInput, SetupSchemaVersion, SetupVerification,
+    load_config, load_config_for_profile, load_config_without_profile, load_user_api_rate_limits,
+    open_or_create_owner_only_directory, open_or_create_owner_only_file, open_owner_only_directory,
+    read_owner_controlled_config_file, read_owner_only_secret_config_file, resolve_desktop_session,
+    resolve_path_set, utc_now,
 };
 use satelle_host::{
     ApiBearerToken, HostService, ProviderComputerUseIntent, contains_api_bearer_token,
@@ -67,7 +67,7 @@ use std::process::ExitCode;
 use std::str::FromStr;
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
-use tailscale::transport_doctor_observation;
+use tailscale::{transport_doctor_observation, transport_only_doctor_report};
 use transport::{
     AttachedTurnOutcome, SshBootstrapScope, SshHostDiscovery, authenticated_ssh_bootstrap_user,
     discover_direct_host_identity, discover_ssh_host, transport_for, transport_for_setup,
@@ -4110,11 +4110,21 @@ fn run_doctor(
             .resolve_host(command.host.as_deref())
             .map_err(failure)?,
     );
-    let transport_observation = transport_doctor_observation(&host.config)
-        .unwrap_or_else(|| DoctorTransportObservation::ready(None));
-    let transport = transport_for(&host)?;
+    let transport_observation = transport_doctor_observation(&scope_selection, &host.config);
     let options =
         DoctorOptions::new(command.refresh, timeout).with_serial_probes(command.serial_probes);
+    if let Some(report) = transport_only_doctor_report(
+        &host.alias,
+        &host.config,
+        &scope_selection,
+        &transport_observation,
+    ) {
+        if command.events {
+            print_doctor_started_event(&host.alias, &scope_selection).map_err(failure)?;
+        }
+        return emit_doctor_report(report, command.events, json);
+    }
+    let transport = transport_for(&host)?;
     let provider_intent = doctor_provider_intent(
         resolved_config,
         &host.config,

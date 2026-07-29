@@ -1,6 +1,6 @@
 use super::FakeComputerUseAdapter;
 use crate::runtime::ComputerUseAdapter;
-use satelle_core::doctor::DoctorScopeSelection;
+use satelle_core::doctor::{DoctorScope, DoctorScopeSelection};
 use satelle_core::{
     DaemonPathOverrides, DoctorFinding, DoctorFixability, DoctorOptions, DoctorProbeResult,
     DoctorReport, DoctorSchemaVersion, DoctorSummary, DoctorTransportObservation, SatelleError,
@@ -102,15 +102,12 @@ pub(super) fn doctor(
         .iter()
         .filter_map(|finding| finding.recovery_command.clone())
         .collect::<Vec<_>>();
+    let transport_selected = scope_selection.scopes().contains(&DoctorScope::Transport);
+    let ready = readiness.is_ready() && (!transport_selected || transport_observation.is_ready());
 
     Ok(DoctorReport {
         schema_version: DoctorSchemaVersion::V1,
-        status: if readiness.is_ready() && transport_observation.is_ready() {
-            "ready"
-        } else {
-            "blocked"
-        }
-        .to_string(),
+        status: if ready { "ready" } else { "blocked" }.to_string(),
         target: host.to_string(),
         host: host.to_string(),
         scopes,
@@ -118,7 +115,7 @@ pub(super) fn doctor(
         finished_at: utc_now(),
         duration_ms: 0,
         summary: DoctorSummary {
-            ready: readiness.is_ready() && transport_observation.is_ready(),
+            ready,
             blocking_findings: findings
                 .iter()
                 .filter(|finding| finding.readiness_impact == "blocked")
@@ -130,7 +127,7 @@ pub(super) fn doctor(
                 .count(),
         },
         probe_results,
-        ready: readiness.is_ready() && transport_observation.is_ready(),
+        ready,
         findings,
         recovery_commands,
         changed: options.refresh(),
@@ -140,6 +137,59 @@ pub(super) fn doctor(
             Vec::new()
         },
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn blocked_transport_observation() -> DoctorTransportObservation {
+        DoctorTransportObservation::blocked(DoctorFinding {
+            finding_id: "transport.test.blocked".to_string(),
+            scope: "transport".to_string(),
+            severity: "error".to_string(),
+            fixability: DoctorFixability::Blocked,
+            readiness_impact: "blocked".to_string(),
+            summary: "the selected transport is blocked".to_string(),
+            evidence: Vec::new(),
+            recovery_command: Some("repair the selected transport".to_string()),
+        })
+    }
+
+    #[test]
+    fn transport_observation_changes_readiness_only_when_transport_is_selected() {
+        let adapter = FakeComputerUseAdapter;
+        let blocked_transport = blocked_transport_observation();
+        let config_scope = DoctorScopeSelection::parse(&["config".to_string()])
+            .expect("config scope should parse");
+        let config_report = doctor(
+            "local-demo",
+            &config_scope,
+            &blocked_transport,
+            DoctorOptions::default(),
+            &adapter,
+        )
+        .expect("unselected transport evidence must not block config diagnostics");
+
+        assert_eq!(config_report.status, "ready");
+        assert!(config_report.summary.ready);
+        assert!(config_report.ready);
+
+        let transport_scope = DoctorScopeSelection::parse(&["transport".to_string()])
+            .expect("transport scope should parse");
+        let transport_report = doctor(
+            "local-demo",
+            &transport_scope,
+            &blocked_transport,
+            DoctorOptions::default(),
+            &adapter,
+        )
+        .expect("selected transport evidence should produce a report");
+
+        assert_eq!(transport_report.status, "blocked");
+        assert!(!transport_report.summary.ready);
+        assert!(!transport_report.ready);
+    }
 }
 
 pub(super) fn setup(

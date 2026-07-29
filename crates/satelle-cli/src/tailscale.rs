@@ -1,6 +1,7 @@
+use satelle_core::doctor::{DoctorScope, DoctorScopeSelection};
 use satelle_core::{
-    DoctorFinding, DoctorFixability, DoctorTransportObservation, HostConfig, NetworkConfig,
-    TransportKind,
+    DoctorFinding, DoctorFixability, DoctorProbeResult, DoctorReport, DoctorSchemaVersion,
+    DoctorSummary, DoctorTransportObservation, HostConfig, NetworkConfig, TransportKind, utc_now,
 };
 use serde::Deserialize;
 use std::collections::BTreeMap;
@@ -13,15 +14,21 @@ use url::Url;
 const MAX_STATUS_BYTES: usize = 1024 * 1024;
 
 pub(super) fn transport_doctor_observation(
+    scope_selection: &DoctorScopeSelection,
     host: &HostConfig,
-) -> Option<DoctorTransportObservation> {
-    transport_doctor_observation_with(host, Path::new("tailscale"))
+) -> DoctorTransportObservation {
+    transport_doctor_observation_with(scope_selection, host, Path::new("tailscale"))
+        .unwrap_or_else(|| DoctorTransportObservation::ready(None))
 }
 
 fn transport_doctor_observation_with(
+    scope_selection: &DoctorScopeSelection,
     host: &HostConfig,
     executable: &Path,
 ) -> Option<DoctorTransportObservation> {
+    if !scope_selection.contains(DoctorScope::Transport) {
+        return None;
+    }
     let NetworkConfig::Tailscale {
         tailnet_name,
         hostname,
@@ -76,6 +83,79 @@ fn transport_doctor_observation_with(
         DoctorTransportObservation::ready(Some(finding))
     } else {
         DoctorTransportObservation::blocked(finding)
+    })
+}
+
+pub(super) fn transport_only_doctor_report(
+    host_alias: &str,
+    host: &HostConfig,
+    scope_selection: &DoctorScopeSelection,
+    observation: &DoctorTransportObservation,
+) -> Option<DoctorReport> {
+    if scope_selection.scopes() != [DoctorScope::Transport]
+        || !matches!(host.transport, TransportKind::Direct | TransportKind::Ssh)
+        || !matches!(host.network, Some(NetworkConfig::Tailscale { .. }))
+    {
+        return None;
+    }
+
+    let started_at = utc_now();
+    let findings = observation
+        .finding()
+        .cloned()
+        .into_iter()
+        .collect::<Vec<_>>();
+    let finding_ids = findings
+        .iter()
+        .map(|finding| finding.finding_id.clone())
+        .collect::<Vec<_>>();
+    let recovery_commands = findings
+        .iter()
+        .filter_map(|finding| finding.recovery_command.clone())
+        .collect::<Vec<_>>();
+    let ready = observation.is_ready();
+    let finished_at = utc_now();
+
+    Some(DoctorReport {
+        schema_version: DoctorSchemaVersion::V1,
+        status: if ready { "ready" } else { "blocked" }.to_string(),
+        target: host_alias.to_string(),
+        host: host_alias.to_string(),
+        scopes: vec![DoctorScope::Transport.as_str().to_string()],
+        started_at: started_at.clone(),
+        finished_at: finished_at.clone(),
+        duration_ms: 0,
+        summary: DoctorSummary {
+            ready,
+            blocking_findings: findings
+                .iter()
+                .filter(|finding| finding.readiness_impact == "blocked")
+                .count(),
+            repairable_findings: findings
+                .iter()
+                .filter(|finding| finding.fixability == DoctorFixability::Repairable)
+                .count(),
+            informational_findings: findings
+                .iter()
+                .filter(|finding| finding.fixability == DoctorFixability::Informational)
+                .count(),
+        },
+        probe_results: vec![DoctorProbeResult {
+            probe_id: "transport.tailscale.local".to_string(),
+            scope: DoctorScope::Transport.as_str().to_string(),
+            status: if ready { "passed" } else { "blocked" }.to_string(),
+            started_at,
+            finished_at,
+            duration_ms: 0,
+            cache_status: "not_persisted".to_string(),
+            dependency_status: "satisfied".to_string(),
+            finding_ids,
+        }],
+        ready,
+        findings,
+        recovery_commands,
+        changed: false,
+        cache_updates: Vec::new(),
     })
 }
 
@@ -378,7 +458,10 @@ mod tests {
 
     #[test]
     fn missing_cli_keeps_configuration_evidence_in_a_partial_report() {
+        let selection = DoctorScopeSelection::parse(&["transport".to_string()])
+            .expect("transport scope should parse");
         let observation = transport_doctor_observation_with(
+            &selection,
             &tailscale_host(),
             Path::new("/definitely/missing/tailscale"),
         )
@@ -394,6 +477,54 @@ mod tests {
                 "live_checks=skipped".to_string()
             ]
         );
+    }
+
+    #[test]
+    fn non_transport_scope_does_not_run_the_tailscale_executable() {
+        let selection = DoctorScopeSelection::parse(&["config".to_string()])
+            .expect("config scope should parse");
+
+        let observation = transport_doctor_observation_with(
+            &selection,
+            &tailscale_host(),
+            Path::new("/definitely/missing/tailscale"),
+        );
+
+        assert!(observation.is_none());
+    }
+
+    #[test]
+    fn direct_and_ssh_transport_only_diagnostics_use_the_local_typed_observation() {
+        let selection = DoctorScopeSelection::parse(&["transport".to_string()])
+            .expect("transport scope should parse");
+        let finding = DoctorFinding {
+            finding_id: "tailscale_host_reachable".to_string(),
+            scope: "transport".to_string(),
+            severity: "info".to_string(),
+            fixability: DoctorFixability::Informational,
+            readiness_impact: "ready".to_string(),
+            summary: "the configured host is reachable through Tailscale".to_string(),
+            evidence: vec!["network_provider=tailscale".to_string()],
+            recovery_command: None,
+        };
+        let observation = DoctorTransportObservation::ready(Some(finding));
+
+        for transport in [TransportKind::Direct, TransportKind::Ssh] {
+            let mut host = tailscale_host();
+            let is_ssh = transport == TransportKind::Ssh;
+            host.transport = transport;
+            if is_ssh {
+                host.address = Some("operator@studio".to_string());
+            }
+
+            let report = transport_only_doctor_report("studio", &host, &selection, &observation)
+                .expect("Tailscale transport-only diagnostics stay local");
+
+            assert!(report.ready);
+            assert_eq!(report.scopes, ["transport"]);
+            assert_eq!(report.probe_results[0].status, "passed");
+            assert_eq!(report.findings[0].finding_id, "tailscale_host_reachable");
+        }
     }
 
     fn tailscale_host() -> HostConfig {

@@ -8,7 +8,7 @@ use super::{
     redacted_config_json, resolve_path_set, yolo_config_json,
 };
 use satelle_core::doctor::DoctorScopeSelection;
-use satelle_core::{DoctorOptions, DoctorReport, DoctorTransportObservation, SatelleError};
+use satelle_core::{DoctorOptions, DoctorReport, SatelleError};
 use serde_json::{Value, json};
 use std::path::PathBuf;
 use std::str::FromStr;
@@ -199,8 +199,16 @@ pub(super) fn doctor_for_host(
     let raw_scopes = scope.into_iter().map(str::to_string).collect::<Vec<_>>();
     let scope_selection =
         DoctorScopeSelection::parse(&raw_scopes).expect("read helpers use supported Doctor scopes");
-    let transport_observation = super::tailscale::transport_doctor_observation(&host.config)
-        .unwrap_or_else(|| DoctorTransportObservation::ready(None));
+    let transport_observation =
+        super::tailscale::transport_doctor_observation(&scope_selection, &host.config);
+    if let Some(report) = super::tailscale::transport_only_doctor_report(
+        &host.alias,
+        &host.config,
+        &scope_selection,
+        &transport_observation,
+    ) {
+        return Ok(report);
+    }
     transport_for(host)?
         .doctor(
             &scope_selection,
