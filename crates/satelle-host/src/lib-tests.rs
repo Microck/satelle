@@ -2277,6 +2277,7 @@ fn same_batch_spawn_failure_preserves_already_published_rows() {
                 DEFAULT_NATIVE_READINESS_TIMEOUT,
                 DEFAULT_PROVIDER_SMOKE_TEST_TIMEOUT,
             ),
+            false,
         ),
         DoctorOptions::default(),
     )

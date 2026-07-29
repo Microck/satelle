@@ -3715,6 +3715,7 @@ fn production_doctor_with_provider_intent(
         options.probe_timeout(),
         provider_probe_required,
         readiness_probe_timeouts,
+        options.refresh(),
     );
     if should_resolve_provider {
         probes.push(DoctorProbe {
@@ -5172,6 +5173,7 @@ fn production_doctor_probes(
     probe_timeout: Option<std::time::Duration>,
     provider_requires_native: bool,
     readiness_probe_timeouts: (std::time::Duration, std::time::Duration),
+    refresh: bool,
 ) -> Vec<DoctorProbe> {
     scopes
         .iter()
@@ -5196,14 +5198,15 @@ fn production_doctor_probes(
                 _ => Vec::new(),
             };
             let resource_locks = match scope {
-                DoctorScope::ComputerUse => [
+                DoctorScope::ComputerUse if refresh => [
                     DoctorProbeResource::NativeComputerUse,
                     DoctorProbeResource::VisibleDesktop,
                     DoctorProbeResource::ReadinessCacheWrite,
                 ]
                 .into_iter()
                 .collect(),
-                DoctorScope::Provider if provider_requires_native => [
+                DoctorScope::ComputerUse => Default::default(),
+                DoctorScope::Provider if refresh && provider_requires_native => [
                     DoctorProbeResource::ProviderProbeSurface,
                     DoctorProbeResource::ReadinessCacheWrite,
                 ]
@@ -5540,6 +5543,7 @@ mod packet17_doctor_tests {
                 DEFAULT_NATIVE_READINESS_TIMEOUT,
                 DEFAULT_PROVIDER_SMOKE_TEST_TIMEOUT,
             ),
+            true,
         );
         let mut scheduler = DoctorProbeScheduler::new(probes.clone()).expect("valid Host graph");
 
@@ -5572,6 +5576,7 @@ mod packet17_doctor_tests {
                 DEFAULT_NATIVE_READINESS_TIMEOUT,
                 DEFAULT_PROVIDER_SMOKE_TEST_TIMEOUT,
             ),
+            true,
         );
         assert!(
             provider_without_smoke
@@ -5590,6 +5595,23 @@ mod packet17_doctor_tests {
                 .resource_locks
                 .is_empty(),
             "a provider that needs no smoke probe must not claim smoke-only resources"
+        );
+        let cached_probes = production_doctor_probes(
+            selection.scopes(),
+            None,
+            true,
+            (
+                DEFAULT_NATIVE_READINESS_TIMEOUT,
+                DEFAULT_PROVIDER_SMOKE_TEST_TIMEOUT,
+            ),
+            false,
+        );
+        assert!(
+            cached_probes
+                .iter()
+                .filter(|probe| matches!(probe.scope.as_str(), "computer-use" | "provider"))
+                .all(|probe| probe.resource_locks.is_empty()),
+            "cached native and provider probes must not claim live-refresh resources"
         );
         assert!(
             native
@@ -5745,6 +5767,7 @@ mod packet17_doctor_tests {
             None,
             true,
             (native_timeout, provider_timeout),
+            true,
         );
         let timeout = |scope| {
             probes
@@ -5769,7 +5792,8 @@ mod packet17_doctor_tests {
             DEFAULT_NATIVE_READINESS_TIMEOUT,
             DEFAULT_PROVIDER_SMOKE_TEST_TIMEOUT,
         );
-        let probes = production_doctor_probes(selection.scopes(), None, true, readiness_timeouts);
+        let probes =
+            production_doctor_probes(selection.scopes(), None, true, readiness_timeouts, false);
         let mut scheduler =
             production_doctor_scheduler(probes, DoctorOptions::default().with_serial_probes(true))
                 .expect("serial scheduler");
@@ -5780,6 +5804,7 @@ mod packet17_doctor_tests {
             Some(Duration::ZERO),
             true,
             readiness_timeouts,
+            false,
         );
         let error = production_doctor_scheduler(zero_timeout_probes, DoctorOptions::default())
             .expect_err("zero timeout must be rejected");
