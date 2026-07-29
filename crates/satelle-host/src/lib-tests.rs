@@ -1862,7 +1862,7 @@ fn queued_probe_receives_its_full_timeout_after_resource_admission() {
                 started: first_started_tx,
                 release: Mutex::new(release_first_rx),
             }),
-            DoctorOptions::new(false, Some(Duration::from_millis(500)))
+            DoctorOptions::new(false, Some(Duration::from_secs(6)))
                 .expect("positive timeout is valid"),
             &first_intent,
         );
@@ -1871,10 +1871,11 @@ fn queued_probe_receives_its_full_timeout_after_resource_admission() {
             .expect("send first Doctor result");
     });
     first_started_rx
-        .recv_timeout(Duration::from_secs(1))
+        .recv_timeout(Duration::from_secs(2))
         .expect("first transport started");
 
     let (second_started_tx, second_started_rx) = std::sync::mpsc::channel();
+    let (release_second_tx, release_second_rx) = std::sync::mpsc::channel();
     let (second_result_tx, second_result_rx) = std::sync::mpsc::channel();
     let second_service = service.clone();
     let second_selection = selection.clone();
@@ -1883,10 +1884,11 @@ fn queued_probe_receives_its_full_timeout_after_resource_admission() {
         let report = second_service.doctor_with_provider_intent(
             LOCAL_DEMO_HOST,
             &second_selection,
-            Arc::new(RecordingTestTransportProbe {
+            Arc::new(BlockingTestTransportProbe {
                 started: second_started_tx,
+                release: Mutex::new(release_second_rx),
             }),
-            DoctorOptions::new(false, Some(Duration::from_millis(100)))
+            DoctorOptions::new(false, Some(Duration::from_secs(4)))
                 .expect("positive timeout is valid"),
             &second_intent,
         );
@@ -1897,7 +1899,7 @@ fn queued_probe_receives_its_full_timeout_after_resource_admission() {
 
     assert!(
         second_result_rx
-            .recv_timeout(Duration::from_millis(60))
+            .recv_timeout(Duration::from_millis(1_500))
             .is_err(),
         "queue wait must not consume the second probe's own timeout"
     );
@@ -1905,15 +1907,24 @@ fn queued_probe_receives_its_full_timeout_after_resource_admission() {
         .send(())
         .expect("release the first active transport");
     first_result_rx
-        .recv_timeout(Duration::from_secs(1))
+        .recv_timeout(Duration::from_secs(2))
         .expect("first Doctor completes")
         .expect("first Doctor succeeds");
     first.join().expect("join first Doctor");
     second_started_rx
-        .recv_timeout(Duration::from_secs(1))
+        .recv_timeout(Duration::from_secs(2))
         .expect("second transport starts after the resource is released");
+    assert!(
+        second_result_rx
+            .recv_timeout(Duration::from_secs(2))
+            .is_err(),
+        "the admitted probe must retain its full execution budget"
+    );
+    release_second_tx
+        .send(())
+        .expect("release the second active transport");
     let second_report = second_result_rx
-        .recv_timeout(Duration::from_secs(1))
+        .recv_timeout(Duration::from_secs(2))
         .expect("second Doctor completes")
         .expect("second Doctor succeeds");
     second.join().expect("join second Doctor");
