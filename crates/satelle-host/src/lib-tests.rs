@@ -2126,7 +2126,7 @@ fn cleanup_only_probe_bounds_later_admission_with_a_typed_failure() {
     let (second_started_tx, second_started_rx) = std::sync::mpsc::channel();
     let (second_result_tx, second_result_rx) = std::sync::mpsc::channel();
     let second_service = service.clone();
-    let second_selection = selection.clone();
+    let second_selection = doctor_selection(&["config", "transport"]);
     let second_intent = intent.clone();
     let second = std::thread::spawn(move || {
         let report = second_service.doctor_with_provider_intent(
@@ -2147,6 +2147,20 @@ fn cleanup_only_probe_bounds_later_admission_with_a_typed_failure() {
         .expect("cleanup-only ownership must bound later admission")
         .expect_err("cleanup-only ownership must bound later admission");
     assert_eq!(error.error.code, ErrorCode::StateConflict);
+    assert!(
+        error
+            .partial_probe_results
+            .iter()
+            .any(|probe| probe.scope == "config" && probe.status == "passed"),
+        "admission failure must preserve completed independent probe rows"
+    );
+    assert!(
+        error
+            .partial_probe_results
+            .iter()
+            .all(|probe| probe.scope != "transport"),
+        "a probe that never started must not appear as completed evidence"
+    );
     assert!(
         second_started_rx.try_recv().is_err(),
         "the blocked probe must not start before cleanup releases its lock"

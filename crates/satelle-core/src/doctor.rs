@@ -513,9 +513,10 @@ impl DoctorProbeScheduler {
             .values()
             .filter(|probe| probe.state == DoctorProbeState::Running)
             .count();
-        let mut remaining_capacity = self
-            .max_concurrency
+        let request_capacity = self.max_concurrency.saturating_sub(running);
+        let host_capacity = DEFAULT_DOCTOR_PROBE_CONCURRENCY
             .saturating_sub(running.saturating_add(external_capacity));
+        let mut remaining_capacity = request_capacity.min(host_capacity);
         if remaining_capacity == 0 {
             return Vec::new();
         }
@@ -867,6 +868,17 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["probe-0", "probe-1", "probe-2", "probe-3"]
         );
+    }
+
+    #[test]
+    fn serial_scheduler_keeps_its_slot_when_host_capacity_remains() {
+        let mut scheduler = DoctorProbeScheduler::serial(vec![probe("serial", "config", &[], &[])])
+            .expect("valid serial graph");
+
+        let started = scheduler.start_ready_with_external_occupancy(1, &BTreeSet::new());
+
+        assert_eq!(started.len(), 1);
+        assert_eq!(started[0].probe_id, "serial");
     }
 
     #[test]

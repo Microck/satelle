@@ -2984,6 +2984,13 @@ struct ProductionDoctorTaskResult {
     effect: ProductionDoctorTaskEffect,
 }
 
+struct ProductionDoctorProjection<'a> {
+    scheduler: &'a DoctorProbeScheduler,
+    records: &'a [DoctorProbeExecutionRecord],
+    snapshot_slot: &'a RwLock<ProductionCapabilitySnapshot>,
+    fatal_context: bool,
+}
+
 enum DoctorWorkerTerminal {
     Completed {
         completed_at: Instant,
@@ -3047,6 +3054,7 @@ struct DoctorTaskRegistry {
 struct DoctorRequestGuard {
     registry: DoctorTaskRegistry,
     request_id: u64,
+    active: bool,
 }
 
 impl DoctorRequestGuard {
@@ -3054,6 +3062,14 @@ impl DoctorRequestGuard {
         Self {
             registry,
             request_id,
+            active: true,
+        }
+    }
+
+    fn retire(&mut self) {
+        if self.active {
+            self.active = false;
+            self.registry.retire_request(self.request_id);
         }
     }
 }
@@ -3063,7 +3079,7 @@ impl Drop for DoctorRequestGuard {
         // Every exit after begin_request owns the same cleanup boundary.
         // Successful requests are already empty, while early failures cancel
         // and reap their siblings before the public Doctor call returns.
-        self.registry.retire_request(self.request_id);
+        self.retire();
     }
 }
 
@@ -3606,7 +3622,6 @@ fn production_doctor_with_provider_intent(
     provider_intent: &ProviderComputerUseIntent,
     snapshot_slot: &Arc<RwLock<ProductionCapabilitySnapshot>>,
 ) -> DoctorExecutionResult {
-    let includes_native_scope = scope_selection.contains(DoctorScope::ComputerUse);
     let includes_provider_scope = scope_selection.contains(DoctorScope::Provider);
     let has_provider_selection =
         provider_intent.model().is_some() || provider_intent.provider().is_some();
@@ -3646,7 +3661,7 @@ fn production_doctor_with_provider_intent(
     let mut scheduler = production_doctor_scheduler(probes, options)?;
     let registry = &service.doctor_tasks;
     let request_id = registry.begin_request();
-    let _request_guard = DoctorRequestGuard::new(registry.clone(), request_id);
+    let mut request_guard = DoctorRequestGuard::new(registry.clone(), request_id);
     let mut records = Vec::new();
     let mut admission_deadlines = BTreeMap::new();
 
@@ -4001,7 +4016,30 @@ fn production_doctor_with_provider_intent(
                 "probe_id".to_string(),
                 serde_json::Value::String(probe_id.clone()),
             );
-            return Err(DoctorExecutionFailure::from(error));
+            request_guard.retire();
+            let report = execution
+                .project_report(
+                    host,
+                    scope_selection,
+                    options,
+                    ProductionDoctorProjection {
+                        scheduler: &scheduler,
+                        records: &records,
+                        snapshot_slot,
+                        fatal_context: true,
+                    },
+                )
+                .map_err(DoctorExecutionFailure::from)?;
+            let partial_probe_results = report
+                .probe_results
+                .into_iter()
+                .filter(|probe| {
+                    records.iter().any(|record| {
+                        record.probe_id == probe.scope || record.probe_id == probe.probe_id
+                    })
+                })
+                .collect();
+            return Err(DoctorExecutionFailure::new(error, partial_probe_results));
         }
 
         if !progressed {
@@ -4015,95 +4053,127 @@ fn production_doctor_with_provider_intent(
         }
     }
 
+    request_guard.retire();
     let fatal_error = execution.fatal_error.take();
-    let snapshot = production_snapshot_after_execution(
-        &mut execution,
-        &records,
-        snapshot_slot,
-        fatal_error.is_some(),
-    )
-    .map_err(DoctorExecutionFailure::from)?;
-    let default_transport_observation = DoctorTransportObservation::ready(None);
-    let transport_observation = execution
-        .transport
-        .as_ref()
-        .map(|(outcome, _, _, _)| outcome.observation())
-        .unwrap_or(&default_transport_observation);
-    let mut report = production_doctor_report_with_selection(
-        host,
-        scope_selection,
-        transport_observation,
-        options,
-        &snapshot,
-    );
-
-    if let Some((refresh, started_at, duration)) = execution.native_refresh {
-        apply_native_refresh(
-            &mut report,
-            &refresh,
-            started_at,
-            duration,
-            includes_native_scope,
-        );
-    }
-    if let Some((refresh, started_at, duration)) = execution.provider_refresh {
-        apply_provider_refresh(&mut report, &refresh, started_at, duration);
-    } else if execution.provider_not_required {
-        apply_provider_not_required(&mut report);
-    } else if matches!(
-        execution.provider_auth_evidence,
-        Some((
-            satelle_core::ProviderAuthValidationOutcome::MissingDescriptor
-                | satelle_core::ProviderAuthValidationOutcome::UnsupportedDescriptorKind,
-            _
-        ))
-    ) {
-        recompute_doctor_summary(&mut report);
-    }
-    if let Some((outcome, started_at, finished_at, duration)) = &execution.transport
-        && let Some(result) = report
-            .probe_results
-            .iter_mut()
-            .find(|result| result.scope == DoctorScope::Transport.as_str())
-    {
-        result.started_at = started_at.clone();
-        result.finished_at = finished_at.clone();
-        result.duration_ms = duration.as_millis().try_into().unwrap_or(u64::MAX);
-        result.status = match outcome {
-            ControllerTransportProbeOutcome::Observed(observation) if observation.is_ready() => {
-                "passed"
-            }
-            ControllerTransportProbeOutcome::Observed(_) => "blocked",
-            ControllerTransportProbeOutcome::TimedOut(_) => "timed_out",
-        }
-        .to_string();
-    }
-    if let Some((outcome, source)) = execution.provider_auth_evidence {
-        for finding in &mut report.findings {
-            if finding.scope == "provider" {
-                finding
-                    .evidence
-                    .push(format!("provider_auth_outcome={}", outcome.as_str()));
-                finding.evidence.push(format!(
-                    "provider_auth_observation_source={}",
-                    source.as_str()
-                ));
-            }
-        }
-    }
-    // Refresh applicators and the Phase 0 report own scope-aware Finding and
-    // Passed projections. The scheduler's aggregate Phase 0 completion cannot
-    // safely relabel those rows, but terminal failures, timeouts, and skipped
-    // dependencies still override them.
-    apply_production_execution_status(&mut report, &scheduler, &records, &snapshot.finished_at);
-    report.probe_schedule_events =
-        public_probe_schedule_events(&report, scheduler.schedule_events());
+    let report = execution
+        .project_report(
+            host,
+            scope_selection,
+            options,
+            ProductionDoctorProjection {
+                scheduler: &scheduler,
+                records: &records,
+                snapshot_slot,
+                fatal_context: fatal_error.is_some(),
+            },
+        )
+        .map_err(DoctorExecutionFailure::from)?;
     if let Some(error) = fatal_error {
         // Every independent probe has reached a reportable terminal state.
         // Preserve those rows for the command's sole post-start failure event.
         return Err(DoctorExecutionFailure::new(error, report.probe_results));
     }
     Ok(report)
+}
+
+impl ProductionDoctorExecution {
+    fn project_report(
+        &mut self,
+        host: &str,
+        scope_selection: &DoctorScopeSelection,
+        options: DoctorOptions,
+        projection: ProductionDoctorProjection<'_>,
+    ) -> Result<DoctorReport, SatelleError> {
+        let snapshot = production_snapshot_after_execution(
+            self,
+            projection.records,
+            projection.snapshot_slot,
+            projection.fatal_context,
+        )?;
+        let default_transport_observation = DoctorTransportObservation::ready(None);
+        let transport_observation = self
+            .transport
+            .as_ref()
+            .map(|(outcome, _, _, _)| outcome.observation())
+            .unwrap_or(&default_transport_observation);
+        let mut report = production_doctor_report_with_selection(
+            host,
+            scope_selection,
+            transport_observation,
+            options,
+            &snapshot,
+        );
+
+        if let Some((refresh, started_at, duration)) = self.native_refresh.take() {
+            apply_native_refresh(
+                &mut report,
+                &refresh,
+                started_at,
+                duration,
+                scope_selection.contains(DoctorScope::ComputerUse),
+            );
+        }
+        if let Some((refresh, started_at, duration)) = self.provider_refresh.take() {
+            apply_provider_refresh(&mut report, &refresh, started_at, duration);
+        } else if self.provider_not_required {
+            apply_provider_not_required(&mut report);
+        } else if matches!(
+            self.provider_auth_evidence,
+            Some((
+                satelle_core::ProviderAuthValidationOutcome::MissingDescriptor
+                    | satelle_core::ProviderAuthValidationOutcome::UnsupportedDescriptorKind,
+                _
+            ))
+        ) {
+            recompute_doctor_summary(&mut report);
+        }
+        if let Some((outcome, started_at, finished_at, duration)) = &self.transport
+            && let Some(result) = report
+                .probe_results
+                .iter_mut()
+                .find(|result| result.scope == DoctorScope::Transport.as_str())
+        {
+            result.started_at = started_at.clone();
+            result.finished_at = finished_at.clone();
+            result.duration_ms = duration.as_millis().try_into().unwrap_or(u64::MAX);
+            result.status = match outcome {
+                ControllerTransportProbeOutcome::Observed(observation)
+                    if observation.is_ready() =>
+                {
+                    "passed"
+                }
+                ControllerTransportProbeOutcome::Observed(_) => "blocked",
+                ControllerTransportProbeOutcome::TimedOut(_) => "timed_out",
+            }
+            .to_string();
+        }
+        if let Some((outcome, source)) = self.provider_auth_evidence {
+            for finding in &mut report.findings {
+                if finding.scope == "provider" {
+                    finding
+                        .evidence
+                        .push(format!("provider_auth_outcome={}", outcome.as_str()));
+                    finding.evidence.push(format!(
+                        "provider_auth_observation_source={}",
+                        source.as_str()
+                    ));
+                }
+            }
+        }
+        // Refresh applicators and the Phase 0 report own scope-aware Finding
+        // and Passed projections. The scheduler's aggregate Phase 0 completion
+        // cannot safely relabel those rows, but terminal failures, timeouts,
+        // and skipped dependencies still override them.
+        apply_production_execution_status(
+            &mut report,
+            projection.scheduler,
+            projection.records,
+            &snapshot.finished_at,
+        );
+        report.probe_schedule_events =
+            public_probe_schedule_events(&report, projection.scheduler.schedule_events());
+        Ok(report)
+    }
 }
 
 fn public_probe_schedule_events(
