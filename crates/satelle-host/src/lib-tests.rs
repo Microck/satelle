@@ -38,6 +38,34 @@ fn ready_transport() -> ReadyTestTransportProbe {
     ReadyTestTransportProbe
 }
 
+struct BlockingTestTransportProbe {
+    started: std::sync::mpsc::Sender<()>,
+    release: Mutex<std::sync::mpsc::Receiver<()>>,
+}
+
+impl ControllerTransportProbe for BlockingTestTransportProbe {
+    fn execute(&self, _context: &DoctorProbeExecutionContext) -> ControllerTransportProbeOutcome {
+        self.started.send(()).expect("signal transport start");
+        self.release
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .recv()
+            .expect("release blocking transport");
+        ControllerTransportProbeOutcome::Observed(DoctorTransportObservation::ready(None))
+    }
+}
+
+struct RecordingTestTransportProbe {
+    started: std::sync::mpsc::Sender<()>,
+}
+
+impl ControllerTransportProbe for RecordingTestTransportProbe {
+    fn execute(&self, _context: &DoctorProbeExecutionContext) -> ControllerTransportProbeOutcome {
+        self.started.send(()).expect("signal transport start");
+        ControllerTransportProbeOutcome::Observed(DoctorTransportObservation::ready(None))
+    }
+}
+
 #[derive(Clone)]
 struct RecordingTurnExtrasAdapter {
     observations: Arc<Mutex<Vec<TurnExtrasObservation>>>,
@@ -1786,6 +1814,112 @@ fn refreshed_production_snapshot_updates_admission_surfaces_but_not_desktop_disc
             .evidence
             .contains(&"reason=missing_codex_runtime".to_string())
     }));
+}
+
+#[test]
+fn queued_probe_receives_its_full_timeout_after_resource_admission() {
+    let state = TestStateDir::new().expect("temporary state directory should exist");
+    let evidence = Phase0CapabilityEvidence {
+        codex_version: CodexVersionEvidence::Detected {
+            version: REQUIRED_CODEX_VERSION,
+        },
+        host_platform: HostPlatform::Linux,
+        capabilities: CapabilityMatrix::unproven(),
+    };
+    let snapshot = Arc::new(RwLock::new(capability_snapshot(evidence, 1)));
+    let adapter = ProductionComputerUseAdapter::new(
+        Arc::clone(&snapshot),
+        Ok(state.path().join("codex-app-server-work")),
+    );
+    let service = HostService {
+        runtime: RuntimeHandle::new(Ok(state.path().to_path_buf()), adapter),
+        operation_capacity: Arc::new(OperationCapacity::default()),
+        turn_execution_timeout: crate::configured_turn_execution_timeout(
+            &satelle_core::SatelleConfig::defaults().hosts[LOCAL_DEMO_HOST],
+        ),
+        mode: HostMode::Production { snapshot },
+        bootstrap_auth: None,
+        bootstrap_maintenance: Arc::new(Mutex::new(None)),
+        doctor_tasks: DoctorTaskRegistry::new(),
+    };
+    let selection = doctor_selection(&["transport"]);
+    let options = DoctorOptions::new(false, Some(Duration::from_millis(100)))
+        .expect("positive timeout is valid");
+    let intent = ProviderComputerUseIntent::host_default();
+    let (first_started_tx, first_started_rx) = std::sync::mpsc::channel();
+    let (release_first_tx, release_first_rx) = std::sync::mpsc::channel();
+
+    let first = service
+        .doctor_with_provider_intent(
+            LOCAL_DEMO_HOST,
+            &selection,
+            Arc::new(BlockingTestTransportProbe {
+                started: first_started_tx,
+                release: Mutex::new(release_first_rx),
+            }),
+            options,
+            &intent,
+        )
+        .expect("the first Doctor call publishes its typed timeout");
+    first_started_rx
+        .recv_timeout(Duration::from_secs(1))
+        .expect("first transport started");
+    assert_eq!(
+        first
+            .probe_results
+            .iter()
+            .find(|probe| probe.scope == "transport")
+            .expect("first transport result")
+            .status,
+        "timed_out"
+    );
+
+    let (second_started_tx, second_started_rx) = std::sync::mpsc::channel();
+    let (second_result_tx, second_result_rx) = std::sync::mpsc::channel();
+    let second_service = service.clone();
+    let second_selection = selection.clone();
+    let second_intent = intent.clone();
+    let second = std::thread::spawn(move || {
+        let report = second_service.doctor_with_provider_intent(
+            LOCAL_DEMO_HOST,
+            &second_selection,
+            Arc::new(RecordingTestTransportProbe {
+                started: second_started_tx,
+            }),
+            options,
+            &second_intent,
+        );
+        second_result_tx
+            .send(report)
+            .expect("send second Doctor result");
+    });
+
+    assert!(
+        second_result_rx
+            .recv_timeout(Duration::from_millis(150))
+            .is_err(),
+        "queue wait must not consume the second probe's own timeout"
+    );
+    release_first_tx
+        .send(())
+        .expect("release the first cleanup-only transport");
+    second_started_rx
+        .recv_timeout(Duration::from_secs(1))
+        .expect("second transport starts after the resource is released");
+    let second_report = second_result_rx
+        .recv_timeout(Duration::from_secs(1))
+        .expect("second Doctor completes")
+        .expect("second Doctor succeeds");
+    second.join().expect("join second Doctor");
+    assert_eq!(
+        second_report
+            .probe_results
+            .iter()
+            .find(|probe| probe.scope == "transport")
+            .expect("second transport result")
+            .status,
+        "passed"
+    );
 }
 
 #[test]

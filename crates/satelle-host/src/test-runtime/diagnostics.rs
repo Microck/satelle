@@ -105,6 +105,11 @@ pub(super) fn doctor(
     let transport_selected = scope_selection.scopes().contains(&DoctorScope::Transport);
     let ready = readiness.is_ready() && (!transport_selected || transport_observation.is_ready());
 
+    let probe_completion_order = probe_results
+        .iter()
+        .map(|probe| probe.probe_id.clone())
+        .collect::<Vec<_>>()
+        .into_boxed_slice();
     Ok(DoctorReport {
         schema_version: DoctorSchemaVersion::V1,
         status: if ready { "ready" } else { "blocked" }.to_string(),
@@ -127,6 +132,7 @@ pub(super) fn doctor(
                 .count(),
         },
         probe_results,
+        probe_completion_order,
         ready,
         findings,
         recovery_commands,

@@ -4265,6 +4265,26 @@ fn print_doctor_events(
     report: &DoctorReport,
     terminal_error: Option<&SatelleError>,
 ) -> Result<(), SatelleError> {
+    for record in doctor_event_records(report, terminal_error) {
+        println!(
+            "{}",
+            serde_json::to_string(&record).map_err(|source| SatelleError {
+                code: ErrorCode::InvalidUsage,
+                message: "could not serialize doctor event".to_string(),
+                recovery_command: None,
+                source_detail: Some(source.to_string()),
+                details: std::collections::BTreeMap::new(),
+            })?
+        );
+    }
+
+    Ok(())
+}
+
+fn doctor_event_records(
+    report: &DoctorReport,
+    terminal_error: Option<&SatelleError>,
+) -> Vec<DoctorEventRecord> {
     let mut seq = 2_u64;
     let mut records = Vec::new();
 
@@ -4278,6 +4298,33 @@ fn print_doctor_events(
             "running",
             json!({"cache_status": probe.cache_status}),
         ));
+    }
+
+    let mut finished_probe_ids = BTreeSet::new();
+    for probe_id in &report.probe_completion_order {
+        let Some(probe) = report
+            .probe_results
+            .iter()
+            .find(|probe| &probe.probe_id == probe_id)
+        else {
+            // Internal prerequisite probes do not have public result rows.
+            continue;
+        };
+        finished_probe_ids.insert(probe.probe_id.as_str());
+        records.push(doctor_event(
+            &mut seq,
+            DoctorEventType::ProbeFinished,
+            report,
+            &probe.scope,
+            Some(&probe.probe_id),
+            &probe.status,
+            json!(probe),
+        ));
+    }
+    for probe in &report.probe_results {
+        if finished_probe_ids.contains(probe.probe_id.as_str()) {
+            continue;
+        }
         records.push(doctor_event(
             &mut seq,
             DoctorEventType::ProbeFinished,
@@ -4344,20 +4391,79 @@ fn print_doctor_events(
         ));
     }
 
-    for record in records {
-        println!(
-            "{}",
-            serde_json::to_string(&record).map_err(|source| SatelleError {
-                code: ErrorCode::InvalidUsage,
-                message: "could not serialize doctor event".to_string(),
-                recovery_command: None,
-                source_detail: Some(source.to_string()),
-                details: std::collections::BTreeMap::new(),
-            })?
-        );
+    records
+}
+
+#[cfg(test)]
+mod doctor_event_tests {
+    use super::*;
+    use satelle_core::{DoctorProbeResult, DoctorSchemaVersion, DoctorSummary};
+
+    fn probe(probe_id: &str, scope: &str) -> DoctorProbeResult {
+        DoctorProbeResult {
+            probe_id: probe_id.to_string(),
+            scope: scope.to_string(),
+            status: "passed".to_string(),
+            started_at: "2026-07-29T00:00:00Z".to_string(),
+            finished_at: "2026-07-29T00:00:01Z".to_string(),
+            duration_ms: 1,
+            cache_status: "not_persisted".to_string(),
+            dependency_status: "satisfied".to_string(),
+            finding_ids: Vec::new(),
+        }
     }
 
-    Ok(())
+    #[test]
+    fn doctor_events_preserve_completion_order_without_changing_final_report_order() {
+        let report = DoctorReport {
+            schema_version: DoctorSchemaVersion::V1,
+            status: "ready".to_string(),
+            target: "local-demo".to_string(),
+            host: "local-demo".to_string(),
+            scopes: vec!["config".to_string(), "transport".to_string()],
+            started_at: "2026-07-29T00:00:00Z".to_string(),
+            finished_at: "2026-07-29T00:00:01Z".to_string(),
+            duration_ms: 1,
+            summary: DoctorSummary {
+                ready: true,
+                blocking_findings: 0,
+                repairable_findings: 0,
+                informational_findings: 0,
+            },
+            probe_results: vec![probe("a-probe", "config"), probe("z-probe", "transport")],
+            probe_completion_order: vec!["z-probe".to_string(), "a-probe".to_string()]
+                .into_boxed_slice(),
+            ready: true,
+            findings: Vec::new(),
+            recovery_commands: Vec::new(),
+            changed: false,
+            cache_updates: Vec::new(),
+        };
+
+        let records = doctor_event_records(&report, None);
+        let finished = records
+            .iter()
+            .filter(|record| record.event_type == DoctorEventType::ProbeFinished)
+            .map(|record| record.probe_id.as_deref().expect("finished probe id"))
+            .collect::<Vec<_>>();
+
+        assert_eq!(finished, ["z-probe", "a-probe"]);
+        assert_eq!(
+            report
+                .probe_results
+                .iter()
+                .map(|probe| probe.probe_id.as_str())
+                .collect::<Vec<_>>(),
+            ["a-probe", "z-probe"]
+        );
+        assert!(
+            serde_json::to_value(&report)
+                .expect("serialize final report")
+                .get("probe_completion_order")
+                .is_none(),
+            "derived event order must not change the final JSON contract"
+        );
+    }
 }
 
 fn print_doctor_started_event(

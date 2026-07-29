@@ -544,25 +544,6 @@ impl DoctorProbeScheduler {
         started
     }
 
-    pub fn timeout_pending(&mut self, probe_id: &str) -> Result<(), DoctorProbeScheduleError> {
-        let probe = self.probes.get_mut(probe_id).ok_or_else(|| {
-            DoctorProbeScheduleError::UnknownProbe {
-                probe_id: probe_id.to_string(),
-            }
-        })?;
-        if probe.state != DoctorProbeState::Pending {
-            return Err(DoctorProbeScheduleError::ProbeNotRunning {
-                probe_id: probe_id.to_string(),
-            });
-        }
-        probe.state = DoctorProbeState::Finished(DoctorProbeCompletion::new(
-            DoctorProbeStatus::TimedOut,
-            DoctorDependentEvidence::NotUseful,
-        ));
-        self.completion_order.push(probe_id.to_string());
-        Ok(())
-    }
-
     pub fn finish(
         &mut self,
         probe_id: &str,

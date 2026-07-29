@@ -3477,21 +3477,6 @@ fn production_doctor_with_provider_intent(
         provider.dependencies.push("provider-auth".to_string());
     }
 
-    let request_started = Instant::now();
-    let pending_deadlines = probes
-        .iter()
-        .map(|probe| {
-            request_started
-                .checked_add(probe.timeout)
-                .map(|deadline| (probe.probe_id.clone(), deadline))
-                .ok_or_else(|| {
-                    runtime::integrity_error(format!(
-                        "Doctor probe {} timeout cannot form an absolute request deadline",
-                        probe.probe_id
-                    ))
-                })
-        })
-        .collect::<Result<BTreeMap<_, _>, _>>()?;
     let mut execution = ProductionDoctorExecution::new();
     let mut scheduler = production_doctor_scheduler(probes, options)?;
     let registry = &service.doctor_tasks;
@@ -3536,21 +3521,6 @@ fn production_doctor_with_provider_intent(
                         "Doctor probe {probe_id} panicked inside the owned task registry"
                     )));
                 }
-            }
-        }
-
-        for (probe_id, deadline) in &pending_deadlines {
-            if now >= *deadline
-                && matches!(scheduler.state(probe_id), Some(DoctorProbeState::Pending))
-            {
-                scheduler
-                    .timeout_pending(probe_id)
-                    .expect("request-owned pending probe can time out");
-                records.push(DoctorProbeExecutionRecord {
-                    probe_id: probe_id.clone(),
-                    status: DoctorProbeStatus::TimedOut,
-                });
-                progressed = true;
             }
         }
 
@@ -3813,18 +3783,8 @@ fn production_doctor_with_provider_intent(
         drop(scheduling);
 
         if !progressed {
-            let pending_deadline = pending_deadlines
-                .iter()
-                .filter(|(probe_id, _)| {
-                    matches!(scheduler.state(probe_id), Some(DoctorProbeState::Pending))
-                })
-                .map(|(_, deadline)| *deadline)
-                .min();
             let next = registry
                 .next_transition()
-                .into_iter()
-                .chain(pending_deadline)
-                .min()
                 .unwrap_or_else(|| Instant::now() + Duration::from_millis(10));
             registry.wait_until(next);
         }
@@ -3905,6 +3865,7 @@ fn production_doctor_with_provider_intent(
     // scheduler owns their final status. Apply terminal projection last so a
     // late raw error cannot relabel TimedOut as blocked.
     apply_production_execution_status(&mut report, &scheduler, &records, &snapshot.finished_at);
+    report.probe_completion_order = scheduler.completion_order().to_vec().into_boxed_slice();
     if options.refresh() && snapshot_was_refreshed {
         replace_production_snapshot(snapshot_slot, snapshot)?;
     }
@@ -4554,6 +4515,11 @@ fn production_doctor_report_with_selection(
     recovery_commands.sort();
     recovery_commands.dedup();
 
+    let probe_completion_order = probe_results
+        .iter()
+        .map(|probe| probe.probe_id.clone())
+        .collect::<Vec<_>>()
+        .into_boxed_slice();
     DoctorReport {
         schema_version: DoctorSchemaVersion::V1,
         status: if ready { "ready" } else { "blocked" }.to_string(),
@@ -4576,6 +4542,7 @@ fn production_doctor_report_with_selection(
                 .count(),
         },
         probe_results,
+        probe_completion_order,
         ready,
         findings,
         recovery_commands,

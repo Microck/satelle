@@ -283,6 +283,11 @@ pub(super) fn execute_transport_only_doctor(
             dependency_status: "satisfied".to_string(),
             finding_ids,
         }],
+        probe_completion_order: records
+            .iter()
+            .map(|record| record.probe_id.clone())
+            .collect::<Vec<_>>()
+            .into_boxed_slice(),
         ready,
         findings,
         recovery_commands,
