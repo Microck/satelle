@@ -511,6 +511,13 @@ pub(crate) enum NativeProbeResult {
 }
 
 pub(crate) trait ReadinessProbeDriver: Send + Sync + 'static {
+    fn readiness_probe_timeouts(&self) -> (std::time::Duration, std::time::Duration) {
+        (
+            crate::DEFAULT_NATIVE_READINESS_TIMEOUT,
+            crate::DEFAULT_PROVIDER_SMOKE_TEST_TIMEOUT,
+        )
+    }
+
     fn run_native_probe(
         &self,
         key: &ReadinessCacheKey,

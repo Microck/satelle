@@ -2237,6 +2237,16 @@ impl std::fmt::Debug for RuntimeHandle {
 }
 
 impl RuntimeHandle {
+    pub(crate) fn readiness_probe_timeouts(&self) -> (std::time::Duration, std::time::Duration) {
+        self.readiness_probe_driver.as_ref().map_or(
+            (
+                crate::DEFAULT_NATIVE_READINESS_TIMEOUT,
+                crate::DEFAULT_PROVIDER_SMOKE_TEST_TIMEOUT,
+            ),
+            |driver| driver.readiness_probe_timeouts(),
+        )
+    }
+
     pub(crate) fn provider_secret_provisioning_hmac(
         &self,
         domain: &'static str,

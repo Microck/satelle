@@ -2209,6 +2209,10 @@ impl ComputerUseAdapter for ProductionComputerUseAdapter {
 }
 
 impl ReadinessProbeDriver for ProductionComputerUseAdapter {
+    fn readiness_probe_timeouts(&self) -> (Duration, Duration) {
+        (self.native_readiness_timeout, self.provider_smoke_timeout)
+    }
+
     fn run_native_probe(
         &self,
         key: &ReadinessCacheKey,

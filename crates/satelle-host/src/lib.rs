@@ -3683,6 +3683,7 @@ fn production_doctor_with_provider_intent(
     let should_resolve_provider = includes_provider_scope && has_provider_selection;
     let provider_probe_required =
         should_resolve_provider && provider_intent.provider_probe_required();
+    let readiness_probe_timeouts = service.runtime.readiness_probe_timeouts();
 
     // Phase 0 is an atomic capability observation. Keep it as one real probe,
     // and add hidden prerequisite scopes only when a selected probe consumes
@@ -3699,6 +3700,7 @@ fn production_doctor_with_provider_intent(
         &execution_scopes,
         options.probe_timeout(),
         provider_probe_required,
+        readiness_probe_timeouts,
     );
     if should_resolve_provider {
         probes.push(DoctorProbe {
@@ -5143,11 +5145,19 @@ fn production_doctor_probes(
     scopes: &[DoctorScope],
     probe_timeout: Option<std::time::Duration>,
     provider_requires_native: bool,
+    readiness_probe_timeouts: (std::time::Duration, std::time::Duration),
 ) -> Vec<DoctorProbe> {
-    let timeout = probe_timeout.unwrap_or(DoctorOptions::DEFAULT_PROBE_TIMEOUT);
     scopes
         .iter()
         .map(|scope| {
+            let configured_timeout = match scope {
+                DoctorScope::ComputerUse => readiness_probe_timeouts.0,
+                DoctorScope::Provider => readiness_probe_timeouts.1,
+                DoctorScope::Codex | DoctorScope::Config | DoctorScope::Transport => {
+                    DoctorOptions::DEFAULT_PROBE_TIMEOUT
+                }
+            };
+            let timeout = probe_timeout.unwrap_or(configured_timeout);
             let dependencies = match scope {
                 DoctorScope::ComputerUse if scopes.contains(&DoctorScope::Codex) => {
                     vec![DoctorScope::Codex.as_str().to_string()]
@@ -5499,6 +5509,10 @@ mod packet17_doctor_tests {
             selection.scopes(),
             Some(std::time::Duration::from_secs(7)),
             true,
+            (
+                DEFAULT_NATIVE_READINESS_TIMEOUT,
+                DEFAULT_PROVIDER_SMOKE_TEST_TIMEOUT,
+            ),
         );
         let mut scheduler = DoctorProbeScheduler::new(probes.clone()).expect("valid Host graph");
 
@@ -5523,7 +5537,15 @@ mod packet17_doctor_tests {
             .expect("provider probe");
         assert_eq!(native.dependencies, ["codex"]);
         assert_eq!(provider.dependencies, ["computer-use"]);
-        let provider_without_smoke = production_doctor_probes(selection.scopes(), None, false);
+        let provider_without_smoke = production_doctor_probes(
+            selection.scopes(),
+            None,
+            false,
+            (
+                DEFAULT_NATIVE_READINESS_TIMEOUT,
+                DEFAULT_PROVIDER_SMOKE_TEST_TIMEOUT,
+            ),
+        );
         assert!(
             provider_without_smoke
                 .iter()
@@ -5678,16 +5700,51 @@ mod packet17_doctor_tests {
     }
 
     #[test]
+    fn doctor_refresh_probes_keep_their_configured_default_budgets() {
+        let selection = DoctorScopeSelection::parse(&[]).expect("default scope is valid");
+        let native_timeout = Duration::from_secs(73);
+        let provider_timeout = Duration::from_secs(91);
+        let probes = production_doctor_probes(
+            selection.scopes(),
+            None,
+            true,
+            (native_timeout, provider_timeout),
+        );
+        let timeout = |scope| {
+            probes
+                .iter()
+                .find(|probe| probe.scope == scope)
+                .expect("selected probe")
+                .timeout
+        };
+
+        assert_eq!(timeout(DoctorScope::ComputerUse.as_str()), native_timeout);
+        assert_eq!(timeout(DoctorScope::Provider.as_str()), provider_timeout);
+        assert_eq!(
+            timeout(DoctorScope::Transport.as_str()),
+            DoctorOptions::DEFAULT_PROBE_TIMEOUT
+        );
+    }
+
+    #[test]
     fn serial_option_and_zero_timeout_cross_the_typed_scheduler_boundary() {
         let selection = DoctorScopeSelection::parse(&[]).expect("default scope is valid");
-        let probes = production_doctor_probes(selection.scopes(), None, true);
+        let readiness_timeouts = (
+            DEFAULT_NATIVE_READINESS_TIMEOUT,
+            DEFAULT_PROVIDER_SMOKE_TEST_TIMEOUT,
+        );
+        let probes = production_doctor_probes(selection.scopes(), None, true, readiness_timeouts);
         let mut scheduler =
             production_doctor_scheduler(probes, DoctorOptions::default().with_serial_probes(true))
                 .expect("serial scheduler");
         assert_eq!(scheduler.start_ready().len(), 1);
 
-        let zero_timeout_probes =
-            production_doctor_probes(selection.scopes(), Some(Duration::ZERO), true);
+        let zero_timeout_probes = production_doctor_probes(
+            selection.scopes(),
+            Some(Duration::ZERO),
+            true,
+            readiness_timeouts,
+        );
         let error = production_doctor_scheduler(zero_timeout_probes, DoctorOptions::default())
             .expect_err("zero timeout must be rejected");
         assert!(error.message.contains("timeout must be greater than zero"));

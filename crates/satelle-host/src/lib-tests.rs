@@ -2269,7 +2269,15 @@ fn expired_admission_remains_authoritative_when_capacity_becomes_ready() {
 fn same_batch_spawn_failure_preserves_already_published_rows() {
     let selection = doctor_selection(&["config"]);
     let mut scheduler = production_doctor_scheduler(
-        production_doctor_probes(selection.scopes(), None, true),
+        production_doctor_probes(
+            selection.scopes(),
+            None,
+            true,
+            (
+                DEFAULT_NATIVE_READINESS_TIMEOUT,
+                DEFAULT_PROVIDER_SMOKE_TEST_TIMEOUT,
+            ),
+        ),
         DoctorOptions::default(),
     )
     .expect("valid config scheduler");
