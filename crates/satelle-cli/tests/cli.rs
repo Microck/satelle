@@ -7588,6 +7588,12 @@ fn run_provider_secret_setup_in_pty(
     initial_input: Option<&str>,
     decision: ProviderSecretPtyDecision<'_>,
 ) -> (std::process::Output, usize, Option<usize>) {
+    const ECHO_DISABLED_MARKER: &str = "SATELLE_TEST_PROVIDER_SECRET_ECHO_DISABLED";
+
+    let (secret, accepted) = match decision {
+        ProviderSecretPtyDecision::Decline(secret) => (secret, false),
+        ProviderSecretPtyDecision::Accept(secret) => (secret, true),
+    };
     let executable = assert_cmd::cargo::cargo_bin!("satelle");
     let profile_argument = profile
         .map(|profile| format!("--profile {profile} "))
@@ -7597,10 +7603,20 @@ fn run_provider_secret_setup_in_pty(
         .iter()
         .map(|component| format!(" --component {component}"))
         .collect::<String>();
-    let command_line = format!(
+    let satelle_command = format!(
         "{} {profile_argument}setup --host selected{component_arguments}{yes_argument}",
         executable.display()
     );
+    let command_line = if accepted {
+        format!(
+            "(until stty -a </dev/tty 2>/dev/null | \
+             grep -Eq '(^|[[:space:];])-echo([[:space:];]|$)'; \
+             do :; done; printf '\\n{ECHO_DISABLED_MARKER}\\n') & \
+             exec {satelle_command}"
+        )
+    } else {
+        satelle_command
+    };
     let mut command = std::process::Command::new("script");
     for name in [
         "SATELLE_HOME",
@@ -7659,14 +7675,15 @@ fn run_provider_secret_setup_in_pty(
     }
     let preview_end = process.wait_for_after("Provider secret overwrite behavior:", 0);
     let secret_prompt_end = process.wait_for_after("Provider secret", preview_end);
-    let (secret, accepted) = match decision {
-        ProviderSecretPtyDecision::Decline(secret) => (secret, false),
-        ProviderSecretPtyDecision::Accept(secret) => (secret, true),
+    let secret_input_start = if accepted {
+        process.wait_for_after(ECHO_DISABLED_MARKER, secret_prompt_end)
+    } else {
+        secret_prompt_end
     };
     process.write_input(&format!("{secret}\n"));
     let confirmation_end = process.wait_for_after(
         "Provision or replace the provider secret at this exact destination?",
-        secret_prompt_end,
+        secret_input_start,
     );
     if accepted {
         process.write_input("y\n");
