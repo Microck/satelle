@@ -1,3 +1,4 @@
+use command_group::AsyncCommandGroup as _;
 use satelle_core::doctor::{
     DoctorDependentEvidence, DoctorProbe, DoctorProbeCachePolicy, DoctorProbeCompletion,
     DoctorProbeExecutionContext, DoctorProbeLifecycle, DoctorProbeLifecycleEvent,
@@ -11,10 +12,10 @@ use satelle_core::{
 use satelle_host::{ControllerTransportProbe, ControllerTransportProbeOutcome};
 use serde::Deserialize;
 use std::collections::BTreeMap;
-use std::io::{self, Read};
+use std::io;
 use std::path::Path;
-use std::process::{Command, Stdio};
-use std::thread;
+use std::process::Stdio;
+use tokio::io::AsyncReadExt as _;
 use url::Url;
 
 const MAX_STATUS_BYTES: usize = 1024 * 1024;
@@ -212,10 +213,6 @@ pub(super) fn execute_transport_only_doctor(
     else {
         unreachable!("the owned transport operation returned a terminal acknowledgment")
     };
-    let records = [satelle_core::doctor::DoctorProbeExecutionRecord {
-        probe_id: definition.probe_id.clone(),
-        status: completion.status,
-    }];
     scheduler
         .finish(&definition.probe_id, completion)
         .expect("the acknowledged transport probe is running");
@@ -273,11 +270,7 @@ pub(super) fn execute_transport_only_doctor(
             dependency_status: "satisfied".to_string(),
             finding_ids,
         }],
-        probe_completion_order: records
-            .iter()
-            .map(|record| record.probe_id.clone())
-            .collect::<Vec<_>>()
-            .into_boxed_slice(),
+        probe_schedule_events: scheduler.schedule_events().into(),
         ready,
         findings,
         recovery_commands,
@@ -356,17 +349,26 @@ fn run_bounded(
     args: &[String],
     context: &DoctorProbeExecutionContext,
 ) -> Result<Vec<u8>, StatusReadError> {
-    let mut command = Command::new(executable);
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|_| StatusReadError::CommandFailed)?;
+    runtime.block_on(run_bounded_async(executable, args, context))
+}
+
+async fn run_bounded_async(
+    executable: &Path,
+    args: &[String],
+    context: &DoctorProbeExecutionContext,
+) -> Result<Vec<u8>, StatusReadError> {
+    let mut command = tokio::process::Command::new(executable);
     command.args(args);
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::CommandExt as _;
-        command.process_group(0);
-    }
     let mut child = command
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
+        .group()
+        .kill_on_drop(true)
         .spawn()
         .map_err(|error| {
             if error.kind() == io::ErrorKind::NotFound {
@@ -375,91 +377,84 @@ fn run_bounded(
                 StatusReadError::CommandFailed
             }
         })?;
-    let stdout = child.stdout.take().ok_or(StatusReadError::InvalidOutput)?;
-    let (reader_sender, reader_receiver) = std::sync::mpsc::sync_channel(1);
-    thread::spawn(move || {
-        let mut bytes = Vec::new();
-        let result = stdout
-            .take((MAX_STATUS_BYTES + 1) as u64)
-            .read_to_end(&mut bytes)
-            .map(|_| bytes);
-        let _ = reader_sender.send(result);
-    });
+    let mut stdout = child
+        .inner()
+        .stdout
+        .take()
+        .ok_or(StatusReadError::InvalidOutput)?;
+    let mut bytes = Vec::new();
     let mut status = None;
-    let mut stdout = None;
+    let mut stdout_closed = false;
+    let mut buffer = [0_u8; 8192];
     loop {
         if status.is_none() {
             status = child
                 .try_wait()
                 .map_err(|_| StatusReadError::CommandFailed)?;
         }
-        if stdout.is_none() {
-            match reader_receiver.try_recv() {
-                Ok(result) => stdout = Some(result),
-                Err(std::sync::mpsc::TryRecvError::Empty) => {}
-                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                    return Err(StatusReadError::InvalidOutput);
-                }
-            }
-        }
-        if status.is_some() && stdout.is_some() {
+        if status.is_some() && stdout_closed {
             break;
         }
         let remaining = context.remaining();
         if context.is_cancelled() || remaining.is_zero() {
-            terminate_process_tree(&mut child, context.cleanup_deadline());
-            let _ = reader_receiver.recv_timeout(context.cleanup_remaining());
+            drain_after_group_kill(&mut child, &mut stdout, context.cleanup_deadline()).await;
             return Err(StatusReadError::TimedOut);
         }
-        thread::sleep(remaining.min(std::time::Duration::from_millis(10)));
+        match tokio::time::timeout(
+            remaining.min(std::time::Duration::from_millis(10)),
+            stdout.read(&mut buffer),
+        )
+        .await
+        {
+            Ok(Ok(0)) => stdout_closed = true,
+            Ok(Ok(count)) => {
+                bytes.extend_from_slice(&buffer[..count]);
+                if bytes.len() > MAX_STATUS_BYTES {
+                    drain_after_group_kill(&mut child, &mut stdout, context.cleanup_deadline())
+                        .await;
+                    return Err(StatusReadError::InvalidOutput);
+                }
+            }
+            Ok(Err(_)) => {
+                drain_after_group_kill(&mut child, &mut stdout, context.cleanup_deadline()).await;
+                return Err(StatusReadError::InvalidOutput);
+            }
+            Err(_) => {}
+        }
     }
     let status = status.expect("loop exits only with a process status");
-    let stdout = stdout
-        .expect("loop exits only with stdout")
-        .map_err(|_| StatusReadError::InvalidOutput)?;
-    if stdout.len() > MAX_STATUS_BYTES {
-        return Err(StatusReadError::InvalidOutput);
-    }
     if !status.success() {
         return Err(StatusReadError::CommandFailed);
     }
-    Ok(stdout)
+    Ok(bytes)
 }
 
-fn terminate_process_tree(child: &mut std::process::Child, cleanup_deadline: std::time::Instant) {
-    #[cfg(unix)]
-    if let Some(pid) = rustix::process::Pid::from_raw(child.id() as i32) {
-        let _ = rustix::process::kill_process_group(pid, rustix::process::Signal::KILL);
-    }
-    #[cfg(windows)]
-    let mut tree_killer = Command::new("taskkill")
-        .args(["/T", "/F", "/PID", &child.id().to_string()])
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .ok();
-    #[cfg(not(windows))]
-    let mut tree_killer: Option<std::process::Child> = None;
-
-    let _ = child.kill();
-    loop {
-        let child_exited = child.try_wait().map_or(true, |status| status.is_some());
-        let tree_killer_exited = tree_killer
-            .as_mut()
-            .is_none_or(|process| process.try_wait().map_or(true, |status| status.is_some()));
-        if child_exited && tree_killer_exited {
+async fn drain_after_group_kill(
+    child: &mut command_group::AsyncGroupChild,
+    stdout: &mut tokio::process::ChildStdout,
+    cleanup_deadline: std::time::Instant,
+) {
+    // The supported Tailscale CLI contract does not allow daemonizing,
+    // changing process groups, or retaining inherited stdio. A deliberately
+    // escaping Unix descendant cannot be contained portably, so the hard
+    // boundary here is bounded return with no Satelle-owned reader task.
+    let _ = child.start_kill();
+    let mut buffer = [0_u8; 8192];
+    while std::time::Instant::now() < cleanup_deadline {
+        let exited = child.try_wait().map_or(true, |status| status.is_some());
+        let remaining = cleanup_deadline.saturating_duration_since(std::time::Instant::now());
+        let stdout_closed = match tokio::time::timeout(
+            remaining.min(std::time::Duration::from_millis(5)),
+            stdout.read(&mut buffer),
+        )
+        .await
+        {
+            Ok(Ok(0) | Err(_)) => true,
+            Ok(Ok(_)) | Err(_) => false,
+        };
+        if exited && stdout_closed {
             return;
         }
-        let remaining = cleanup_deadline.saturating_duration_since(std::time::Instant::now());
-        if remaining.is_zero() {
-            break;
-        }
-        thread::sleep(remaining.min(std::time::Duration::from_millis(5)));
-    }
-    let _ = child.kill();
-    if let Some(tree_killer) = tree_killer.as_mut() {
-        let _ = tree_killer.kill();
     }
 }
 
@@ -891,16 +886,24 @@ mod tests {
         );
     }
 
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     #[test]
-    fn escaped_stdout_holder_cannot_extend_the_hard_cleanup_deadline() {
-        let script = "#!/bin/sh\nsetsid sh -c 'sleep 1' &\nwhile true; do sleep 1; done\n";
-        let (_fixture, executable) = executable_fixture(script);
+    fn contract_violating_stdout_holder_leaves_no_satelle_io_thread() {
+        let fixture = tempfile::tempdir().expect("create escaped descendant fixture");
+        let escaped_pid_file = fixture.path().join("escaped-pid");
+        let script = format!(
+            "#!/bin/sh\nsetsid sh -c 'printf \"%s\" \"$$\" > \"{}\"; sleep 10' &\nwhile true; do sleep 1; done\n",
+            escaped_pid_file.display()
+        );
+        let (_fixture, executable) = executable_fixture(&script);
         let selection =
             DoctorScopeSelection::parse(&["transport".to_string()]).expect("transport scope");
         let host = tailscale_host();
         let probe = transport_doctor_probe_with(&selection, &host, &executable);
         let started = std::time::Instant::now();
+        let tasks_before = std::fs::read_dir("/proc/self/task")
+            .expect("read process tasks before probe")
+            .count();
 
         let report = transport_only_doctor_report(
             "studio",
@@ -912,11 +915,25 @@ mod tests {
         )
         .expect("transport scheduler")
         .expect("Direct Tailscale transport report");
+        let tasks_after = std::fs::read_dir("/proc/self/task")
+            .expect("read process tasks after probe")
+            .count();
+        let escaped_pid = std::fs::read_to_string(&escaped_pid_file)
+            .expect("read contract-violating descendant pid")
+            .parse::<i32>()
+            .expect("parse contract-violating descendant pid");
+        if let Some(pid) = rustix::process::Pid::from_raw(escaped_pid) {
+            let _ = rustix::process::kill_process(pid, rustix::process::Signal::KILL);
+        }
 
         assert_eq!(report.probe_results[0].status, "timed_out");
         assert!(
             started.elapsed() < std::time::Duration::from_millis(300),
             "escaped pipe holders must not extend the hard cleanup deadline"
+        );
+        assert_eq!(
+            tasks_after, tasks_before,
+            "bounded return must not leave a Satelle-owned stdout reader thread"
         );
     }
 

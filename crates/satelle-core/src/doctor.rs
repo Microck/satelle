@@ -245,6 +245,20 @@ pub struct DoctorProbeExecutionRecord {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub enum DoctorProbeScheduleEvent {
+    Started { probe_id: String },
+    Finished { probe_id: String },
+}
+
+impl DoctorProbeScheduleEvent {
+    pub fn probe_id(&self) -> &str {
+        match self {
+            Self::Started { probe_id } | Self::Finished { probe_id } => probe_id,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum DoctorProbeState {
     Pending,
     Running,
@@ -263,6 +277,7 @@ pub struct DoctorProbeScheduler {
     probes: BTreeMap<String, ScheduledProbe>,
     max_concurrency: usize,
     completion_order: Vec<String>,
+    schedule_events: Vec<DoctorProbeScheduleEvent>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -475,6 +490,7 @@ impl DoctorProbeScheduler {
             probes: scheduled,
             max_concurrency,
             completion_order: Vec::new(),
+            schedule_events: Vec::new(),
         })
     }
 
@@ -557,6 +573,8 @@ impl DoctorProbeScheduler {
                 .expect("candidate probe must remain present");
             scheduled_probe.state = DoctorProbeState::Running;
             started.push(scheduled_probe.definition.clone());
+            self.schedule_events
+                .push(DoctorProbeScheduleEvent::Started { probe_id });
             remaining_capacity -= 1;
         }
         started
@@ -579,6 +597,10 @@ impl DoctorProbeScheduler {
         }
         probe.state = DoctorProbeState::Finished(completion);
         self.completion_order.push(probe_id.to_string());
+        self.schedule_events
+            .push(DoctorProbeScheduleEvent::Finished {
+                probe_id: probe_id.to_string(),
+            });
         Ok(())
     }
 
@@ -588,6 +610,10 @@ impl DoctorProbeScheduler {
 
     pub fn completion_order(&self) -> &[String] {
         &self.completion_order
+    }
+
+    pub fn schedule_events(&self) -> &[DoctorProbeScheduleEvent] {
+        &self.schedule_events
     }
 
     pub fn final_order(&self) -> Vec<String> {
@@ -645,7 +671,9 @@ impl DoctorProbeScheduler {
                 .get_mut(&probe_id)
                 .expect("pending probe must remain present")
                 .state = DoctorProbeState::SkippedDependency { blocking_probe_id };
-            self.completion_order.push(probe_id);
+            self.completion_order.push(probe_id.clone());
+            self.schedule_events
+                .push(DoctorProbeScheduleEvent::Finished { probe_id });
         }
     }
 }
@@ -945,6 +973,42 @@ mod tests {
 
         assert_eq!(scheduler.completion_order(), ["z-probe", "a-probe"]);
         assert_eq!(scheduler.final_order(), ["a-probe", "z-probe"]);
+    }
+
+    #[test]
+    fn schedule_events_preserve_dependency_causality() {
+        let mut scheduler = DoctorProbeScheduler::new(vec![
+            probe("prerequisite", "config", &[], &[]),
+            probe("dependent", "provider", &["prerequisite"], &[]),
+        ])
+        .expect("valid graph");
+
+        scheduler.start_ready();
+        scheduler
+            .finish("prerequisite", useful(DoctorProbeStatus::Passed))
+            .expect("prerequisite is running");
+        scheduler.start_ready();
+        scheduler
+            .finish("dependent", useful(DoctorProbeStatus::Passed))
+            .expect("dependent is running");
+
+        assert_eq!(
+            scheduler.schedule_events(),
+            [
+                DoctorProbeScheduleEvent::Started {
+                    probe_id: "prerequisite".to_string()
+                },
+                DoctorProbeScheduleEvent::Finished {
+                    probe_id: "prerequisite".to_string()
+                },
+                DoctorProbeScheduleEvent::Started {
+                    probe_id: "dependent".to_string()
+                },
+                DoctorProbeScheduleEvent::Finished {
+                    probe_id: "dependent".to_string()
+                },
+            ]
+        );
     }
 
     #[test]

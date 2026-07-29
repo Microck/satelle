@@ -6217,10 +6217,10 @@ pub struct DoctorReport {
     pub duration_ms: u64,
     pub summary: DoctorSummary,
     pub probe_results: Vec<DoctorProbeResult>,
-    /// Scheduler completion order for event projection. This derived runtime
+    /// Scheduler lifecycle order for event projection. This derived runtime
     /// state is not part of the stable final Doctor JSON contract.
     #[serde(skip)]
-    pub probe_completion_order: Box<[String]>,
+    pub probe_schedule_events: Box<[doctor::DoctorProbeScheduleEvent]>,
     pub ready: bool,
     pub findings: Vec<DoctorFinding>,
     pub recovery_commands: Vec<String>,

@@ -4541,7 +4541,7 @@ fn doctor_provider_refresh_reports_provider_cache_provenance() {
     assert_eq!(report["changed"], true);
     assert_eq!(
         report["cache_updates"],
-        serde_json::json!(["provider_smoke"])
+        serde_json::json!(["native_readiness", "provider_smoke"])
     );
     assert_eq!(
         report["probe_results"][0]["probe_id"],

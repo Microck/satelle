@@ -1,6 +1,6 @@
 use super::FakeComputerUseAdapter;
 use crate::runtime::ComputerUseAdapter;
-use satelle_core::doctor::{DoctorScope, DoctorScopeSelection};
+use satelle_core::doctor::{DoctorProbeScheduleEvent, DoctorScope, DoctorScopeSelection};
 use satelle_core::{
     DaemonPathOverrides, DoctorFinding, DoctorFixability, DoctorOptions, DoctorProbeResult,
     DoctorReport, DoctorSchemaVersion, DoctorSummary, DoctorTransportObservation, SatelleError,
@@ -105,9 +105,18 @@ pub(super) fn doctor(
     let transport_selected = scope_selection.scopes().contains(&DoctorScope::Transport);
     let ready = readiness.is_ready() && (!transport_selected || transport_observation.is_ready());
 
-    let probe_completion_order = probe_results
+    let probe_schedule_events = probe_results
         .iter()
-        .map(|probe| probe.probe_id.clone())
+        .flat_map(|probe| {
+            [
+                DoctorProbeScheduleEvent::Started {
+                    probe_id: probe.probe_id.clone(),
+                },
+                DoctorProbeScheduleEvent::Finished {
+                    probe_id: probe.probe_id.clone(),
+                },
+            ]
+        })
         .collect::<Vec<_>>()
         .into_boxed_slice();
     Ok(DoctorReport {
@@ -132,7 +141,7 @@ pub(super) fn doctor(
                 .count(),
         },
         probe_results,
-        probe_completion_order,
+        probe_schedule_events,
         ready,
         findings,
         recovery_commands,

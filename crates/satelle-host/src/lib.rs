@@ -62,8 +62,8 @@ use runtime::{
 use satelle_core::doctor::{
     DoctorDependentEvidence, DoctorProbe, DoctorProbeCachePolicy, DoctorProbeCompletion,
     DoctorProbeExecutionContext, DoctorProbeExecutionRecord, DoctorProbeLifecycle,
-    DoctorProbeLifecycleEvent, DoctorProbeResource, DoctorProbeScheduler, DoctorProbeState,
-    DoctorProbeStatus, DoctorScope, DoctorScopeSelection,
+    DoctorProbeLifecycleEvent, DoctorProbeResource, DoctorProbeScheduleEvent, DoctorProbeScheduler,
+    DoctorProbeState, DoctorProbeStatus, DoctorScope, DoctorScopeSelection,
 };
 use satelle_core::session::{PublicSession, TurnAdmissionFailure};
 use satelle_core::{
@@ -1932,14 +1932,13 @@ impl HostService {
                 let native_refresh = self
                     .runtime
                     .refresh_setup_native_readiness(host, native_intent);
-                if includes_native_scope {
-                    apply_native_refresh(
-                        &mut report,
-                        &native_refresh,
-                        started_at,
-                        started.elapsed(),
-                    );
-                }
+                apply_native_refresh(
+                    &mut report,
+                    &native_refresh,
+                    started_at,
+                    started.elapsed(),
+                    includes_native_scope,
+                );
                 native_evidence = native_refresh.ok();
             }
             if should_resolve_provider && provider_refresh_allowed {
@@ -3852,10 +3851,14 @@ fn production_doctor_with_provider_intent(
         &snapshot,
     );
 
-    if let Some((refresh, started_at, duration)) = execution.native_refresh
-        && includes_native_scope
-    {
-        apply_native_refresh(&mut report, &refresh, started_at, duration);
+    if let Some((refresh, started_at, duration)) = execution.native_refresh {
+        apply_native_refresh(
+            &mut report,
+            &refresh,
+            started_at,
+            duration,
+            includes_native_scope,
+        );
     }
     if let Some((refresh, started_at, duration)) = execution.provider_refresh {
         apply_provider_refresh(&mut report, &refresh, started_at, duration);
@@ -3906,22 +3909,37 @@ fn production_doctor_with_provider_intent(
     // scheduler owns their final status. Apply terminal projection last so a
     // late raw error cannot relabel TimedOut as blocked.
     apply_production_execution_status(&mut report, &scheduler, &records, &snapshot.finished_at);
-    report.probe_completion_order = public_probe_order(&report, scheduler.completion_order());
+    report.probe_schedule_events =
+        public_probe_schedule_events(&report, scheduler.schedule_events());
     if options.refresh() && snapshot_was_refreshed {
         replace_production_snapshot(snapshot_slot, snapshot)?;
     }
     Ok(report)
 }
 
-fn public_probe_order(report: &DoctorReport, scheduler_order: &[String]) -> Box<[String]> {
-    scheduler_order
+fn public_probe_schedule_events(
+    report: &DoctorReport,
+    scheduler_events: &[DoctorProbeScheduleEvent],
+) -> Box<[DoctorProbeScheduleEvent]> {
+    scheduler_events
         .iter()
-        .filter_map(|scheduler_id| {
-            report
+        .filter_map(|event| {
+            let public_probe_id = report
                 .probe_results
                 .iter()
-                .find(|probe| probe.scope == *scheduler_id || probe.probe_id == *scheduler_id)
-                .map(|probe| probe.probe_id.clone())
+                .find(|probe| {
+                    probe.scope == event.probe_id() || probe.probe_id == event.probe_id()
+                })?
+                .probe_id
+                .clone();
+            Some(match event {
+                DoctorProbeScheduleEvent::Started { .. } => DoctorProbeScheduleEvent::Started {
+                    probe_id: public_probe_id,
+                },
+                DoctorProbeScheduleEvent::Finished { .. } => DoctorProbeScheduleEvent::Finished {
+                    probe_id: public_probe_id,
+                },
+            })
         })
         .collect::<Vec<_>>()
         .into_boxed_slice()
@@ -4259,14 +4277,29 @@ fn apply_native_refresh(
     refresh: &Result<ReadinessEvidence, SatelleError>,
     started_at: String,
     duration: std::time::Duration,
+    project_public_result: bool,
 ) {
+    let changed = native_refresh_changed(refresh);
+    report.changed |= changed;
+    if changed
+        && !report
+            .cache_updates
+            .iter()
+            .any(|entry| matches!(entry.as_str(), "local-demo-readiness" | "native_readiness"))
+    {
+        report.cache_updates.push("native_readiness".to_string());
+    }
+    if !project_public_result {
+        return;
+    }
+
     report
         .findings
         .retain(|finding| finding.scope != "computer-use");
     report
         .probe_results
         .retain(|probe| probe.scope != "computer-use");
-    let (finding, status, cache_status, changed) = match refresh {
+    let (finding, status, cache_status) = match refresh {
         Ok(readiness) => (
             DoctorFinding {
                 finding_id: "computer-use.native.refresh.passed".to_string(),
@@ -4296,7 +4329,6 @@ fn apply_native_refresh(
             },
             "passed",
             "refreshed",
-            true,
         ),
         Err(error) => {
             let manual_action_required = error
@@ -4320,11 +4352,6 @@ fn apply_native_refresh(
                     }
                 }
             }
-            let changed = error.details.contains_key("native_readiness")
-                || matches!(
-                    error.code.as_str(),
-                    "computer-use-not-ready" | "native-readiness-timeout"
-                );
             (
                 DoctorFinding {
                     finding_id: "computer-use.native.refresh.failed".to_string(),
@@ -4346,7 +4373,6 @@ fn apply_native_refresh(
                 } else {
                     "not_updated"
                 },
-                changed,
             )
         }
     };
@@ -4373,16 +4399,20 @@ fn apply_native_refresh(
             .cmp(&right.scope)
             .then(left.probe_id.cmp(&right.probe_id))
     });
-    report.changed |= changed;
-    if changed
-        && !report
-            .cache_updates
-            .iter()
-            .any(|entry| matches!(entry.as_str(), "local-demo-readiness" | "native_readiness"))
-    {
-        report.cache_updates.push("native_readiness".to_string());
-    }
     recompute_doctor_summary(report);
+}
+
+fn native_refresh_changed(refresh: &Result<ReadinessEvidence, SatelleError>) -> bool {
+    match refresh {
+        Ok(_) => true,
+        Err(error) => {
+            error.details.contains_key("native_readiness")
+                || matches!(
+                    error.code.as_str(),
+                    "computer-use-not-ready" | "native-readiness-timeout"
+                )
+        }
+    }
 }
 
 fn apply_provider_not_required(report: &mut DoctorReport) {
@@ -4570,9 +4600,18 @@ fn production_doctor_report_with_selection(
     recovery_commands.sort();
     recovery_commands.dedup();
 
-    let probe_completion_order = probe_results
+    let probe_schedule_events = probe_results
         .iter()
-        .map(|probe| probe.probe_id.clone())
+        .flat_map(|probe| {
+            [
+                DoctorProbeScheduleEvent::Started {
+                    probe_id: probe.probe_id.clone(),
+                },
+                DoctorProbeScheduleEvent::Finished {
+                    probe_id: probe.probe_id.clone(),
+                },
+            ]
+        })
         .collect::<Vec<_>>()
         .into_boxed_slice();
     DoctorReport {
@@ -4597,7 +4636,7 @@ fn production_doctor_report_with_selection(
                 .count(),
         },
         probe_results,
-        probe_completion_order,
+        probe_schedule_events,
         ready,
         findings,
         recovery_commands,
@@ -5068,7 +5107,7 @@ mod packet17_doctor_tests {
     }
 
     #[test]
-    fn refresh_result_ids_follow_scheduler_completion_scope_order() {
+    fn refresh_result_ids_follow_scheduler_lifecycle_scope_order() {
         let snapshot = ProductionCapabilitySnapshot::collect(None);
         let mut report = production_doctor_report(LOCAL_DEMO_HOST, None, &snapshot);
         report
@@ -5085,14 +5124,37 @@ mod packet17_doctor_tests {
             .probe_id = "provider.smoke.refresh".to_string();
 
         assert_eq!(
-            public_probe_order(
+            public_probe_schedule_events(
                 &report,
-                &["provider".to_string(), "computer-use".to_string()]
+                &[
+                    DoctorProbeScheduleEvent::Started {
+                        probe_id: "provider".to_string()
+                    },
+                    DoctorProbeScheduleEvent::Finished {
+                        probe_id: "provider".to_string()
+                    },
+                    DoctorProbeScheduleEvent::Started {
+                        probe_id: "computer-use".to_string()
+                    },
+                    DoctorProbeScheduleEvent::Finished {
+                        probe_id: "computer-use".to_string()
+                    },
+                ]
             )
             .into_vec(),
             vec![
-                "provider.smoke.refresh".to_string(),
-                "computer-use.native.refresh".to_string(),
+                DoctorProbeScheduleEvent::Started {
+                    probe_id: "provider.smoke.refresh".to_string()
+                },
+                DoctorProbeScheduleEvent::Finished {
+                    probe_id: "provider.smoke.refresh".to_string()
+                },
+                DoctorProbeScheduleEvent::Started {
+                    probe_id: "computer-use.native.refresh".to_string()
+                },
+                DoctorProbeScheduleEvent::Finished {
+                    probe_id: "computer-use.native.refresh".to_string()
+                },
             ]
         );
     }

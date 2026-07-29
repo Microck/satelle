@@ -2227,7 +2227,11 @@ fn doctor_provider_refresh_updates_cache_without_admitting_prompt_work() {
 
     assert!(report.ready);
     assert!(report.changed);
-    assert_eq!(report.cache_updates, ["provider_smoke"]);
+    assert_eq!(
+        report.cache_updates,
+        ["native_readiness", "provider_smoke"],
+        "the hidden native prerequisite must report its cache mutation"
+    );
     assert_eq!(report.probe_results.len(), 1);
     assert_eq!(report.probe_results[0].probe_id, "provider.smoke.refresh");
     assert_eq!(report.probe_results[0].cache_status, "refreshed");

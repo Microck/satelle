@@ -4288,61 +4288,47 @@ fn doctor_event_records(
     let mut seq = 2_u64;
     let mut records = Vec::new();
 
-    for probe in &report.probe_results {
-        if probe.dependency_status == "blocked" {
-            continue;
-        }
-        let mut record = doctor_event(
-            &mut seq,
-            DoctorEventType::ProbeStarted,
-            report,
-            &probe.scope,
-            Some(&probe.probe_id),
-            "running",
-            json!({"cache_status": probe.cache_status}),
-        );
-        record.timestamp.clone_from(&probe.started_at);
-        records.push(record);
-    }
-
-    let mut finished_probe_ids = BTreeSet::new();
-    for probe_id in &report.probe_completion_order {
+    for event in &report.probe_schedule_events {
+        let probe_id = event.probe_id();
         let Some(probe) = report
             .probe_results
             .iter()
-            .find(|probe| &probe.probe_id == probe_id)
+            .find(|probe| probe.probe_id == probe_id)
         else {
             // Internal prerequisite probes do not have public result rows.
             continue;
         };
-        finished_probe_ids.insert(probe.probe_id.as_str());
-        let mut record = doctor_event(
-            &mut seq,
-            DoctorEventType::ProbeFinished,
-            report,
-            &probe.scope,
-            Some(&probe.probe_id),
-            &probe.status,
-            json!(probe),
-        );
-        record.timestamp.clone_from(&probe.finished_at);
-        records.push(record);
-    }
-    for probe in &report.probe_results {
-        if finished_probe_ids.contains(probe.probe_id.as_str()) {
-            continue;
+        match event {
+            satelle_core::doctor::DoctorProbeScheduleEvent::Started { .. } => {
+                if probe.dependency_status == "blocked" {
+                    continue;
+                }
+                let mut record = doctor_event(
+                    &mut seq,
+                    DoctorEventType::ProbeStarted,
+                    report,
+                    &probe.scope,
+                    Some(&probe.probe_id),
+                    "running",
+                    json!({"cache_status": probe.cache_status}),
+                );
+                record.timestamp.clone_from(&probe.started_at);
+                records.push(record);
+            }
+            satelle_core::doctor::DoctorProbeScheduleEvent::Finished { .. } => {
+                let mut record = doctor_event(
+                    &mut seq,
+                    DoctorEventType::ProbeFinished,
+                    report,
+                    &probe.scope,
+                    Some(&probe.probe_id),
+                    &probe.status,
+                    json!(probe),
+                );
+                record.timestamp.clone_from(&probe.finished_at);
+                records.push(record);
+            }
         }
-        let mut record = doctor_event(
-            &mut seq,
-            DoctorEventType::ProbeFinished,
-            report,
-            &probe.scope,
-            Some(&probe.probe_id),
-            &probe.status,
-            json!(probe),
-        );
-        record.timestamp.clone_from(&probe.finished_at);
-        records.push(record);
     }
 
     for finding in &report.findings {
@@ -4447,10 +4433,28 @@ mod doctor_event_tests {
                 skipped,
                 probe("provider.smoke.refresh", "provider"),
             ],
-            probe_completion_order: vec![
-                "provider.smoke.refresh".to_string(),
-                "computer-use.native.refresh".to_string(),
-                "a-probe".to_string(),
+            probe_schedule_events: vec![
+                satelle_core::doctor::DoctorProbeScheduleEvent::Started {
+                    probe_id: "provider.smoke.refresh".to_string(),
+                },
+                satelle_core::doctor::DoctorProbeScheduleEvent::Finished {
+                    probe_id: "provider.smoke.refresh".to_string(),
+                },
+                satelle_core::doctor::DoctorProbeScheduleEvent::Started {
+                    probe_id: "computer-use.native.refresh".to_string(),
+                },
+                satelle_core::doctor::DoctorProbeScheduleEvent::Finished {
+                    probe_id: "computer-use.native.refresh".to_string(),
+                },
+                satelle_core::doctor::DoctorProbeScheduleEvent::Started {
+                    probe_id: "a-probe".to_string(),
+                },
+                satelle_core::doctor::DoctorProbeScheduleEvent::Finished {
+                    probe_id: "a-probe".to_string(),
+                },
+                satelle_core::doctor::DoctorProbeScheduleEvent::Finished {
+                    probe_id: "skipped-probe".to_string(),
+                },
             ]
             .into_boxed_slice(),
             ready: true,
@@ -4461,6 +4465,19 @@ mod doctor_event_tests {
         };
 
         let records = doctor_event_records(&report, None);
+        let event_position = |event_type, probe_id| {
+            records
+                .iter()
+                .position(|record| {
+                    record.event_type == event_type && record.probe_id.as_deref() == Some(probe_id)
+                })
+                .expect("expected probe lifecycle event")
+        };
+        assert!(
+            event_position(DoctorEventType::ProbeFinished, "provider.smoke.refresh")
+                < event_position(DoctorEventType::ProbeStarted, "computer-use.native.refresh"),
+            "a dependent probe must not start before its prerequisite finishes"
+        );
         let started = records
             .iter()
             .filter(|record| record.event_type == DoctorEventType::ProbeStarted)
@@ -4477,9 +4494,9 @@ mod doctor_event_tests {
                 .map(|record| record.probe_id.as_deref().expect("started probe id"))
                 .collect::<Vec<_>>(),
             [
-                "a-probe",
+                "provider.smoke.refresh",
                 "computer-use.native.refresh",
-                "provider.smoke.refresh"
+                "a-probe",
             ]
         );
         assert!(
@@ -4512,7 +4529,7 @@ mod doctor_event_tests {
         assert!(
             serde_json::to_value(&report)
                 .expect("serialize final report")
-                .get("probe_completion_order")
+                .get("probe_schedule_events")
                 .is_none(),
             "derived event order must not change the final JSON contract"
         );

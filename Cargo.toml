@@ -16,7 +16,7 @@ license = "MIT"
 
 [workspace.dependencies]
 base64 = "0.22.1"
-command-group = "5.0.1"
+command-group = { version = "5.0.1", features = ["with-tokio"] }
 axum = { version = "0.8.9", default-features = false, features = ["http1", "json", "query", "tokio", "ws"] }
 clap = { version = "4.5.52", features = ["derive", "env"] }
 clap_complete = "4.6.7"

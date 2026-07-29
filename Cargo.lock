@@ -525,7 +525,9 @@ dependencies = [
 name = "command-group"
 version = "5.0.1"
 dependencies = [
+ "async-trait",
  "nix",
+ "tokio",
  "winapi",
 ]
 
@@ -2453,6 +2455,7 @@ dependencies = [
  "clap",
  "clap_complete",
  "cliclack",
+ "command-group",
  "flate2",
  "jsonschema",
  "libc",
