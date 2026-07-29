@@ -38,6 +38,17 @@ fn ready_transport() -> ReadyTestTransportProbe {
     ReadyTestTransportProbe
 }
 
+struct PanickingTestTransportProbe;
+
+impl ControllerTransportProbe for PanickingTestTransportProbe {
+    fn execute(&self, _context: &DoctorProbeExecutionContext) -> ControllerTransportProbeOutcome {
+        // Give the independent config worker time to publish its terminal row
+        // before this worker exercises the registry's panic boundary.
+        std::thread::sleep(Duration::from_millis(50));
+        panic!("intentional transport panic");
+    }
+}
+
 struct BlockingTestTransportProbe {
     started: std::sync::mpsc::Sender<()>,
     release: Mutex<std::sync::mpsc::Receiver<()>>,
@@ -1907,6 +1918,42 @@ fn fatal_doctor_failure_preserves_independent_terminal_probe_results() {
             .partial_probe_results
             .iter()
             .any(|probe| { probe.scope == "provider" && probe.status == "blocked" })
+    );
+}
+
+#[test]
+fn panicked_doctor_worker_preserves_completed_independent_probe_results() {
+    let state = TestStateDir::new().expect("temporary state directory should exist");
+    let service = production_doctor_test_service(&state);
+
+    let failure = service
+        .doctor_with_provider_intent(
+            LOCAL_DEMO_HOST,
+            &doctor_selection(&["config", "transport"]),
+            Arc::new(PanickingTestTransportProbe),
+            DoctorOptions::default(),
+            &ProviderComputerUseIntent::host_default(),
+        )
+        .expect_err("the panicked transport worker must fail Doctor");
+
+    assert_eq!(failure.error.code, ErrorCode::StorageIntegrityFailed);
+    assert_eq!(
+        failure.error.message,
+        "Doctor probe transport panicked inside the owned task registry"
+    );
+    assert!(
+        failure
+            .partial_probe_results
+            .iter()
+            .any(|probe| probe.scope == "config" && probe.status == "passed"),
+        "the completed independent config row must survive the worker panic"
+    );
+    assert!(
+        failure
+            .partial_probe_results
+            .iter()
+            .all(|probe| probe.scope != "transport"),
+        "the panicked probe must not be reported as completed evidence"
     );
 }
 

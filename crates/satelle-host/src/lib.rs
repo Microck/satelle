@@ -3700,6 +3700,7 @@ fn production_doctor_with_provider_intent(
         let now = Instant::now();
         registry.advance(now);
         let mut progressed = false;
+        let mut worker_panic = None;
 
         for event in registry.drain_events(request_id) {
             progressed = true;
@@ -3742,11 +3743,45 @@ fn production_doctor_with_provider_intent(
                     });
                 }
                 DoctorRegistryEvent::Panicked { probe_id } => {
-                    return Err(DoctorExecutionFailure::from(runtime::integrity_error(
-                        format!("Doctor probe {probe_id} panicked inside the owned task registry"),
-                    )));
+                    scheduler
+                        .finish(
+                            &probe_id,
+                            DoctorProbeCompletion::new(
+                                DoctorProbeStatus::Failed,
+                                DoctorDependentEvidence::NotUseful,
+                            ),
+                        )
+                        .expect("registry panic belongs to a running probe");
+                    worker_panic.get_or_insert_with(|| {
+                        runtime::integrity_error(format!(
+                            "Doctor probe {probe_id} panicked inside the owned task registry"
+                        ))
+                    });
                 }
             }
+        }
+
+        if let Some(error) = worker_panic {
+            // Drain the complete terminal batch before failing so diagnostics
+            // that completed beside the panicked probe remain reportable.
+            request_guard.retire();
+            let report = execution
+                .project_report(
+                    host,
+                    scope_selection,
+                    options,
+                    ProductionDoctorProjection {
+                        scheduler: &scheduler,
+                        records: &records,
+                        snapshot_slot,
+                        fatal_context: true,
+                    },
+                )
+                .map_err(DoctorExecutionFailure::from)?;
+            return Err(DoctorExecutionFailure::new(
+                error,
+                completed_doctor_probe_results(report, &records),
+            ));
         }
 
         if scheduler.is_complete() {
@@ -4061,16 +4096,10 @@ fn production_doctor_with_provider_intent(
                     },
                 )
                 .map_err(DoctorExecutionFailure::from)?;
-            let partial_probe_results = report
-                .probe_results
-                .into_iter()
-                .filter(|probe| {
-                    records.iter().any(|record| {
-                        record.probe_id == probe.scope || record.probe_id == probe.probe_id
-                    })
-                })
-                .collect();
-            return Err(DoctorExecutionFailure::new(error, partial_probe_results));
+            return Err(DoctorExecutionFailure::new(
+                error,
+                completed_doctor_probe_results(report, &records),
+            ));
         }
 
         if !progressed {
@@ -4105,6 +4134,21 @@ fn production_doctor_with_provider_intent(
         return Err(DoctorExecutionFailure::new(error, report.probe_results));
     }
     Ok(report)
+}
+
+fn completed_doctor_probe_results(
+    report: DoctorReport,
+    records: &[DoctorProbeExecutionRecord],
+) -> Vec<DoctorProbeResult> {
+    report
+        .probe_results
+        .into_iter()
+        .filter(|probe| {
+            records
+                .iter()
+                .any(|record| record.probe_id == probe.scope || record.probe_id == probe.probe_id)
+        })
+        .collect()
 }
 
 impl ProductionDoctorExecution {
