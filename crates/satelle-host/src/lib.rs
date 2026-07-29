@@ -96,6 +96,29 @@ use zeroize::Zeroizing;
 pub(crate) const DEFAULT_MODEL_BINDING: &str = "codex-default";
 pub(crate) const DEFAULT_PROVIDER_BINDING: &str = "codex-default";
 
+#[derive(Debug)]
+pub struct DoctorExecutionFailure {
+    pub error: SatelleError,
+    pub partial_probe_results: Box<[DoctorProbeResult]>,
+}
+
+impl DoctorExecutionFailure {
+    fn new(error: SatelleError, partial_probe_results: Vec<DoctorProbeResult>) -> Self {
+        Self {
+            error,
+            partial_probe_results: partial_probe_results.into_boxed_slice(),
+        }
+    }
+}
+
+impl From<SatelleError> for DoctorExecutionFailure {
+    fn from(error: SatelleError) -> Self {
+        Self::new(error, Vec::new())
+    }
+}
+
+pub type DoctorExecutionResult = Result<DoctorReport, DoctorExecutionFailure>;
+
 /// Behavior-changing inputs for one provider descriptor validation.
 ///
 /// Keeping these values together makes the runtime validation and its
@@ -1820,7 +1843,7 @@ impl HostService {
         host: &str,
         scope_selection: &DoctorScopeSelection,
         options: DoctorOptions,
-    ) -> Result<DoctorReport, SatelleError> {
+    ) -> DoctorExecutionResult {
         self.doctor_with_provider_intent(
             host,
             scope_selection,
@@ -1837,7 +1860,7 @@ impl HostService {
         transport_probe: Arc<dyn ControllerTransportProbe>,
         options: DoctorOptions,
         provider_intent: &ProviderComputerUseIntent,
-    ) -> Result<DoctorReport, SatelleError> {
+    ) -> DoctorExecutionResult {
         match &self.mode {
             HostMode::Production { snapshot } => production_doctor_with_provider_intent(
                 self,
@@ -1849,13 +1872,15 @@ impl HostService {
                 snapshot,
             ),
             #[cfg(any(test, feature = "test-support"))]
-            HostMode::TestFake { .. } => self.test_fake_doctor_with_provider_intent(
-                host,
-                scope_selection,
-                transport_probe,
-                options,
-                provider_intent,
-            ),
+            HostMode::TestFake { .. } => self
+                .test_fake_doctor_with_provider_intent(
+                    host,
+                    scope_selection,
+                    transport_probe,
+                    options,
+                    provider_intent,
+                )
+                .map_err(DoctorExecutionFailure::from),
         }
     }
 
@@ -2023,13 +2048,15 @@ impl HostService {
             };
         let scope_selection = DoctorScopeSelection::parse(&raw_scopes)
             .expect("setup verification uses supported Doctor scopes");
-        let mut report = self.doctor_with_provider_intent(
-            host,
-            &scope_selection,
-            Arc::new(ReadyControllerTransportProbe),
-            DoctorOptions::new(true, None).expect("default timeout is valid"),
-            provider_intent,
-        )?;
+        let mut report = self
+            .doctor_with_provider_intent(
+                host,
+                &scope_selection,
+                Arc::new(ReadyControllerTransportProbe),
+                DoctorOptions::new(true, None).expect("default timeout is valid"),
+                provider_intent,
+            )
+            .map_err(|failure| failure.error)?;
         if report.changed
             && !report
                 .cache_updates
@@ -2985,6 +3012,7 @@ struct DoctorRegistryTask {
 
 enum DoctorRegistryEvent {
     Completed {
+        completion_order: (Instant, u64),
         probe_id: String,
         completion: DoctorProbeCompletion,
         effect: Box<ProductionDoctorTaskEffect>,
@@ -3000,6 +3028,7 @@ enum DoctorRegistryEvent {
 struct DoctorTaskRegistryState {
     next_request_id: u64,
     next_task_id: u64,
+    latest_snapshot_completion: Option<(Instant, u64)>,
     tasks: BTreeMap<u64, DoctorRegistryTask>,
     events: BTreeMap<u64, VecDeque<DoctorRegistryEvent>>,
 }
@@ -3029,6 +3058,7 @@ impl DoctorTaskRegistry {
                 state: Mutex::new(DoctorTaskRegistryState {
                     next_request_id: 1,
                     next_task_id: 1,
+                    latest_snapshot_completion: None,
                     tasks: BTreeMap::new(),
                     events: BTreeMap::new(),
                 }),
@@ -3194,6 +3224,7 @@ impl DoctorTaskRegistry {
                                             DoctorRegistryEvent::TimedOut { probe_id }
                                         } else {
                                             DoctorRegistryEvent::Completed {
+                                                completion_order: (completed_at, task_id),
                                                 probe_id,
                                                 completion,
                                                 effect: Box::new(effect),
@@ -3298,6 +3329,28 @@ impl DoctorTaskRegistry {
             .into_iter()
             .flatten()
             .collect()
+    }
+
+    fn publish_snapshot_if_newer(
+        &self,
+        completion_order: (Instant, u64),
+        snapshot_slot: &RwLock<ProductionCapabilitySnapshot>,
+        refreshed: ProductionCapabilitySnapshot,
+    ) -> Result<(), SatelleError> {
+        let mut state = self
+            .inner
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if state
+            .latest_snapshot_completion
+            .is_some_and(|published| completion_order <= published)
+        {
+            return Ok(());
+        }
+        replace_production_snapshot(snapshot_slot, refreshed)?;
+        state.latest_snapshot_completion = Some(completion_order);
+        Ok(())
     }
 
     fn wait_until(&self, deadline: Instant) {
@@ -3451,7 +3504,7 @@ fn production_doctor_with_provider_intent(
     options: DoctorOptions,
     provider_intent: &ProviderComputerUseIntent,
     snapshot_slot: &Arc<RwLock<ProductionCapabilitySnapshot>>,
-) -> Result<DoctorReport, SatelleError> {
+) -> DoctorExecutionResult {
     let includes_native_scope = scope_selection.contains(DoctorScope::ComputerUse);
     let includes_provider_scope = scope_selection.contains(DoctorScope::Provider);
     let has_provider_selection =
@@ -3504,11 +3557,23 @@ fn production_doctor_with_provider_intent(
             progressed = true;
             match event {
                 DoctorRegistryEvent::Completed {
+                    completion_order,
                     probe_id,
                     completion,
                     effect,
                 } => {
                     let status = completion.status;
+                    if options.refresh()
+                        && let ProductionDoctorTaskEffect::Snapshot(Ok(snapshot)) = &*effect
+                    {
+                        registry
+                            .publish_snapshot_if_newer(
+                                completion_order,
+                                snapshot_slot,
+                                snapshot.clone(),
+                            )
+                            .map_err(DoctorExecutionFailure::from)?;
+                    }
                     apply_production_doctor_effect(&mut execution, *effect);
                     scheduler
                         .finish(&probe_id, completion)
@@ -3529,8 +3594,8 @@ fn production_doctor_with_provider_intent(
                     });
                 }
                 DoctorRegistryEvent::Panicked { probe_id } => {
-                    return Err(runtime::integrity_error(format!(
-                        "Doctor probe {probe_id} panicked inside the owned task registry"
+                    return Err(DoctorExecutionFailure::from(runtime::integrity_error(
+                        format!("Doctor probe {probe_id} panicked inside the owned task registry"),
                     )));
                 }
             }
@@ -3834,7 +3899,7 @@ fn production_doctor_with_provider_intent(
                 "probe_id".to_string(),
                 serde_json::Value::String(probe_id.clone()),
             );
-            return Err(error);
+            return Err(DoctorExecutionFailure::from(error));
         }
 
         if !progressed {
@@ -3848,13 +3913,14 @@ fn production_doctor_with_provider_intent(
         }
     }
 
-    if let Some(error) = execution.fatal_error {
-        // Every independent probe has reached a reportable terminal state.
-        // A timed-out operation may still be retained for cleanup.
-        return Err(error);
-    }
-    let (snapshot, snapshot_was_refreshed) =
-        production_snapshot_after_execution(&mut execution, &records, snapshot_slot)?;
+    let fatal_error = execution.fatal_error.take();
+    let snapshot = production_snapshot_after_execution(
+        &mut execution,
+        &records,
+        snapshot_slot,
+        fatal_error.is_some(),
+    )
+    .map_err(DoctorExecutionFailure::from)?;
     let default_transport_observation = DoctorTransportObservation::ready(None);
     let transport_observation = execution
         .transport
@@ -3930,8 +3996,10 @@ fn production_doctor_with_provider_intent(
     apply_production_execution_status(&mut report, &scheduler, &records, &snapshot.finished_at);
     report.probe_schedule_events =
         public_probe_schedule_events(&report, scheduler.schedule_events());
-    if options.refresh() && snapshot_was_refreshed {
-        replace_production_snapshot(snapshot_slot, snapshot)?;
+    if let Some(error) = fatal_error {
+        // Every independent probe has reached a reportable terminal state.
+        // Preserve those rows for the command's sole post-start failure event.
+        return Err(DoctorExecutionFailure::new(error, report.probe_results));
     }
     Ok(report)
 }
@@ -3974,15 +4042,18 @@ fn production_snapshot_after_execution(
     execution: &mut ProductionDoctorExecution,
     records: &[DoctorProbeExecutionRecord],
     snapshot_slot: &RwLock<ProductionCapabilitySnapshot>,
-) -> Result<(ProductionCapabilitySnapshot, bool), SatelleError> {
+    fatal_error: bool,
+) -> Result<ProductionCapabilitySnapshot, SatelleError> {
     if let Some(snapshot) = execution.snapshot.take() {
-        return Ok((snapshot, true));
+        return Ok(snapshot);
     }
-    if records.iter().any(|record| {
-        record.probe_id == DoctorScope::Codex.as_str()
-            && record.status == DoctorProbeStatus::TimedOut
-    }) {
-        return read_production_snapshot(snapshot_slot).map(|snapshot| (snapshot.clone(), false));
+    if fatal_error
+        || records.iter().any(|record| {
+            record.probe_id == DoctorScope::Codex.as_str()
+                && record.status == DoctorProbeStatus::TimedOut
+        })
+    {
+        return read_production_snapshot(snapshot_slot).map(|snapshot| snapshot.clone());
     }
     Err(crate::runtime::integrity_error(
         "the production capability probe completed without a snapshot or typed timeout",
@@ -5219,13 +5290,47 @@ mod packet17_doctor_tests {
             status: DoctorProbeStatus::TimedOut,
         }];
 
-        let (snapshot, snapshot_was_refreshed) =
-            production_snapshot_after_execution(&mut execution, &records, &snapshot_slot)
+        let snapshot =
+            production_snapshot_after_execution(&mut execution, &records, &snapshot_slot, false)
                 .expect("a typed timeout keeps the last authoritative snapshot as report context");
 
         assert_eq!(records[0].status, DoctorProbeStatus::TimedOut);
-        assert!(!snapshot_was_refreshed);
         assert_eq!(snapshot.finished_at, fallback.finished_at);
+    }
+
+    #[test]
+    fn snapshot_publication_keeps_the_latest_worker_completion() {
+        let registry = DoctorTaskRegistry::new();
+        let mut initial = ProductionCapabilitySnapshot::collect(None);
+        initial.duration_ms = 1;
+        let snapshot_slot = RwLock::new(initial);
+        let completed_at = Instant::now();
+        let mut newer = ProductionCapabilitySnapshot::collect(None);
+        newer.duration_ms = 3;
+        let mut older = ProductionCapabilitySnapshot::collect(None);
+        older.duration_ms = 2;
+
+        registry
+            .publish_snapshot_if_newer(
+                (completed_at + Duration::from_millis(2), 2),
+                &snapshot_slot,
+                newer,
+            )
+            .expect("publish newer Phase 0 completion");
+        registry
+            .publish_snapshot_if_newer(
+                (completed_at + Duration::from_millis(1), 1),
+                &snapshot_slot,
+                older,
+            )
+            .expect("ignore delayed publication from the older completion");
+
+        assert_eq!(
+            read_production_snapshot(&snapshot_slot)
+                .expect("read authoritative snapshot")
+                .duration_ms,
+            3
+        );
     }
 
     #[test]
@@ -5442,6 +5547,7 @@ fn doctor_registry_preserves_effect_from_worker_reported_timeout() {
                 ..
             },
             effect,
+            ..
         }] if probe_id == "transport"
             && matches!(effect.as_ref(), ProductionDoctorTaskEffect::ProviderNotRequired)
     ));

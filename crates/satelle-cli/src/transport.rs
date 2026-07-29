@@ -15,8 +15,8 @@ use satelle_core::{
 };
 use satelle_host::{
     AdmissionCancellation, ApiBearerToken, ApiScopes, ControllerTransportProbe, DaemonLogPage,
-    HostService, HostStatus, LogCursor, LogPageQuery, TurnIntent, TurnOutcome,
-    admission_request_timeout,
+    DoctorExecutionFailure, DoctorExecutionResult, HostService, HostStatus, LogCursor,
+    LogPageQuery, TurnIntent, TurnOutcome, admission_request_timeout,
 };
 use satelle_transport::{
     ApiError, ApiErrorCode, DaemonClient, DaemonClientError, DaemonEventClient, DaemonEventError,
@@ -275,7 +275,7 @@ pub(crate) trait TransportClient {
         transport_probe: Arc<dyn ControllerTransportProbe>,
         options: DoctorOptions,
         provider_intent: &satelle_host::ProviderComputerUseIntent,
-    ) -> Result<DoctorReport, SatelleError>;
+    ) -> DoctorExecutionResult;
     fn verify_setup(
         &self,
         request: &satelle_transport::SetupVerificationRequest,
@@ -628,7 +628,7 @@ impl TransportClient for LocalTransport {
         transport_probe: Arc<dyn ControllerTransportProbe>,
         options: DoctorOptions,
         provider_intent: &satelle_host::ProviderComputerUseIntent,
-    ) -> Result<DoctorReport, SatelleError> {
+    ) -> DoctorExecutionResult {
         self.service.doctor_with_provider_intent(
             &self.alias,
             scope_selection,
@@ -3379,8 +3379,8 @@ impl TransportClient for SshSetupTransport {
         _transport_probe: Arc<dyn ControllerTransportProbe>,
         _options: DoctorOptions,
         _provider_intent: &satelle_host::ProviderComputerUseIntent,
-    ) -> Result<DoctorReport, SatelleError> {
-        Err(self.unsupported("doctor"))
+    ) -> DoctorExecutionResult {
+        Err(DoctorExecutionFailure::from(self.unsupported("doctor")))
     }
 
     fn verify_setup(
@@ -3519,8 +3519,8 @@ impl TransportClient for DirectTransport {
         _transport_probe: Arc<dyn ControllerTransportProbe>,
         _options: DoctorOptions,
         _provider_intent: &satelle_host::ProviderComputerUseIntent,
-    ) -> Result<DoctorReport, SatelleError> {
-        Err(self.unsupported("doctor"))
+    ) -> DoctorExecutionResult {
+        Err(DoctorExecutionFailure::from(self.unsupported("doctor")))
     }
 
     fn verify_setup(

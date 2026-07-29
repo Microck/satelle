@@ -1843,6 +1843,74 @@ fn production_doctor_test_service(state: &TestStateDir) -> HostService {
 }
 
 #[test]
+fn fatal_doctor_failure_preserves_independent_terminal_probe_results() {
+    let state = TestStateDir::new().expect("temporary state directory should exist");
+    let snapshot = Arc::new(RwLock::new(capability_snapshot(
+        Phase0CapabilityEvidence {
+            codex_version: CodexVersionEvidence::Detected {
+                version: REQUIRED_CODEX_VERSION,
+            },
+            host_platform: HostPlatform::Linux,
+            capabilities: CapabilityMatrix::unproven(),
+        },
+        1,
+    )));
+    let service = HostService {
+        runtime: RuntimeHandle::new(Ok(state.path().to_path_buf()), FakeComputerUseAdapter),
+        operation_capacity: Arc::new(OperationCapacity::default()),
+        turn_execution_timeout: crate::configured_turn_execution_timeout(
+            &satelle_core::SatelleConfig::defaults().hosts[LOCAL_DEMO_HOST],
+        ),
+        mode: HostMode::Production { snapshot },
+        bootstrap_auth: None,
+        bootstrap_maintenance: Arc::new(Mutex::new(None)),
+        doctor_tasks: DoctorTaskRegistry::new(),
+    };
+    let intent = ProviderComputerUseIntent::new(
+        Some(
+            satelle_core::session::EffectiveModelRef::new("failing-model")
+                .expect("valid model alias"),
+        ),
+        Some(
+            satelle_core::session::ProviderBindingRef::new("failing-provider")
+                .expect("valid provider alias"),
+        ),
+        true,
+    )
+    .with_experimental_provider_computer_use(true);
+
+    let failure = service
+        .doctor_with_provider_intent(
+            LOCAL_DEMO_HOST,
+            &doctor_selection(&["config", "provider", "transport"]),
+            Arc::new(ready_transport()),
+            DoctorOptions::default(),
+            &intent,
+        )
+        .expect_err("provider binding failure must remain a fatal Doctor outcome");
+
+    assert_eq!(failure.error.code, ErrorCode::ModelProviderBindingMissing);
+    assert!(
+        failure
+            .partial_probe_results
+            .iter()
+            .any(|probe| { probe.scope == "config" && probe.status == "passed" })
+    );
+    assert!(
+        failure
+            .partial_probe_results
+            .iter()
+            .any(|probe| { probe.scope == "transport" && probe.status == "passed" })
+    );
+    assert!(
+        failure
+            .partial_probe_results
+            .iter()
+            .any(|probe| { probe.scope == "provider" && probe.status == "blocked" })
+    );
+}
+
+#[test]
 fn unrefreshed_provider_probe_keeps_unobserved_readiness_blocked() {
     let state = TestStateDir::new().expect("temporary state directory should exist");
     let service = production_doctor_test_service(&state);
@@ -2078,7 +2146,7 @@ fn cleanup_only_probe_bounds_later_admission_with_a_typed_failure() {
         .recv_timeout(Duration::from_millis(250))
         .expect("cleanup-only ownership must bound later admission")
         .expect_err("cleanup-only ownership must bound later admission");
-    assert_eq!(error.code, ErrorCode::StateConflict);
+    assert_eq!(error.error.code, ErrorCode::StateConflict);
     assert!(
         second_started_rx.try_recv().is_err(),
         "the blocked probe must not start before cleanup releases its lock"

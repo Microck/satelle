@@ -50,7 +50,8 @@ use satelle_core::{
     resolve_path_set, utc_now,
 };
 use satelle_host::{
-    ApiBearerToken, HostService, ProviderComputerUseIntent, contains_api_bearer_token,
+    ApiBearerToken, DoctorExecutionFailure, DoctorExecutionResult, HostService,
+    ProviderComputerUseIntent, contains_api_bearer_token,
 };
 use satelle_transport::{
     DaemonServer, DaemonServerConfig, DaemonServerError, DaemonTlsConfig, DaemonTlsConfigError,
@@ -4127,7 +4128,8 @@ fn run_doctor(
             &scope_selection,
             &transport_probe,
             prepared,
-        );
+        )
+        .map_err(DoctorExecutionFailure::from);
         return finish_doctor_outcome(outcome, command.events, json, &host.alias, &scope_selection);
     }
     let transport = transport_for(&host)?;
@@ -4152,7 +4154,7 @@ fn run_doctor(
 }
 
 fn finish_doctor_outcome(
-    outcome: Result<DoctorReport, SatelleError>,
+    outcome: DoctorExecutionResult,
     events: bool,
     json: bool,
     target: &str,
@@ -4160,11 +4162,18 @@ fn finish_doctor_outcome(
 ) -> Result<(), CliFailure> {
     match outcome {
         Ok(report) => emit_doctor_report(report, events, json),
-        Err(error) if events => {
-            print_doctor_failed_event(target, scope_selection, 2, &error).map_err(failure)?;
-            Err(reported_failure(error))
+        Err(failed) if events => {
+            print_doctor_failed_event(
+                target,
+                scope_selection,
+                2,
+                &failed.error,
+                &failed.partial_probe_results,
+            )
+            .map_err(failure)?;
+            Err(reported_failure(failed.error))
         }
-        Err(error) => Err(failure(error)),
+        Err(failed) => Err(failure(failed.error)),
     }
 }
 
@@ -4578,14 +4587,31 @@ fn print_doctor_failed_event(
     scope_selection: &DoctorScopeSelection,
     seq: u64,
     error: &SatelleError,
+    partial_probe_results: &[satelle_core::DoctorProbeResult],
 ) -> Result<(), SatelleError> {
+    print_doctor_event_record(&doctor_failed_event_record(
+        target,
+        scope_selection,
+        seq,
+        error,
+        partial_probe_results,
+    ))
+}
+
+fn doctor_failed_event_record(
+    target: &str,
+    scope_selection: &DoctorScopeSelection,
+    seq: u64,
+    error: &SatelleError,
+    partial_probe_results: &[satelle_core::DoctorProbeResult],
+) -> DoctorEventRecord {
     let scopes = scope_selection
         .scopes()
         .iter()
         .map(|scope| scope.as_str())
         .collect::<Vec<_>>();
     let scope = if scopes.len() == 1 { scopes[0] } else { "all" };
-    let record = DoctorEventRecord {
+    DoctorEventRecord {
         schema_version: DoctorEventSchemaVersion::V1,
         event_id: format!("doctor_event_{seq}"),
         event_type: DoctorEventType::DoctorFailed,
@@ -4601,13 +4627,40 @@ fn print_doctor_failed_event(
                 "exit_code": error.exit_code(),
                 "recovery_command": error.recovery_command,
             },
-            "partial_probe_results": [],
+            "partial_probe_results": partial_probe_results,
             "scopes": scopes,
             "recovery_commands": error.recovery_command.iter().collect::<Vec<_>>(),
         }),
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn post_start_doctor_failure_event_includes_completed_probe_results() {
+    let scope_selection = DoctorScopeSelection::parse(&["config".to_string()])
+        .expect("config is a supported Doctor scope");
+    let partial = satelle_core::DoctorProbeResult {
+        probe_id: "config.selected_host_resolution".to_string(),
+        scope: "config".to_string(),
+        status: "passed".to_string(),
+        started_at: "2026-07-29T00:00:00Z".to_string(),
+        finished_at: "2026-07-29T00:00:00Z".to_string(),
+        duration_ms: 0,
+        cache_status: "not_persisted".to_string(),
+        dependency_status: "satisfied".to_string(),
+        finding_ids: Vec::new(),
     };
 
-    print_doctor_event_record(&record)
+    let record = doctor_failed_event_record(
+        LOCAL_DEMO_HOST,
+        &scope_selection,
+        2,
+        &SatelleError::state_conflict(),
+        std::slice::from_ref(&partial),
+    );
+
+    assert_eq!(record.event_type, DoctorEventType::DoctorFailed);
+    assert_eq!(record.data["partial_probe_results"], json!([partial]));
 }
 
 fn print_doctor_event_record(record: &DoctorEventRecord) -> Result<(), SatelleError> {

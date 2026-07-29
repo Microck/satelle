@@ -221,7 +221,7 @@ pub(super) fn doctor_for_host(
             options,
             &satelle_host::ProviderComputerUseIntent::host_default(),
         )
-        .map_err(failure)
+        .map_err(|failed| failure(failed.error))
 }
 
 pub(super) fn host_status(
