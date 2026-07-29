@@ -2158,6 +2158,71 @@ fn cleanup_only_probe_bounds_later_admission_with_a_typed_failure() {
 }
 
 #[test]
+fn retiring_failed_doctor_request_cancels_and_reaps_remaining_tasks() {
+    let registry = DoctorTaskRegistry::new();
+    let request_id = registry.begin_request();
+    let probe = DoctorProbe {
+        probe_id: "retired-request-probe".to_string(),
+        scope: "transport".to_string(),
+        dependencies: Vec::new(),
+        resource_locks: Default::default(),
+        timeout: Duration::from_secs(2),
+        cache_policy: DoctorProbeCachePolicy::Reuse,
+    };
+    let (started_tx, started_rx) = std::sync::mpsc::channel();
+
+    registry
+        .spawn(request_id, &probe, move |context| {
+            started_tx.send(()).expect("signal probe start");
+            while !context.is_cancelled() {
+                std::thread::yield_now();
+            }
+            ProductionDoctorTaskResult {
+                completion: DoctorProbeCompletion::new(
+                    DoctorProbeStatus::TimedOut,
+                    DoctorDependentEvidence::NotUseful,
+                ),
+                effect: ProductionDoctorTaskEffect::None,
+            }
+        })
+        .expect("spawn cancellable Doctor task");
+    started_rx
+        .recv_timeout(Duration::from_secs(1))
+        .expect("probe starts before request retirement");
+    let completed_probe = DoctorProbe {
+        probe_id: "retired-request-completed-probe".to_string(),
+        ..probe
+    };
+    registry
+        .spawn(request_id, &completed_probe, move |_context| {
+            ProductionDoctorTaskResult {
+                completion: DoctorProbeCompletion::new(
+                    DoctorProbeStatus::Passed,
+                    DoctorDependentEvidence::Useful,
+                ),
+                effect: ProductionDoctorTaskEffect::None,
+            }
+        })
+        .expect("spawn completing Doctor task");
+    let completion_deadline = Instant::now() + Duration::from_secs(1);
+    loop {
+        registry.advance(Instant::now());
+        if registry.request_state_counts(request_id) == (1, 1) {
+            break;
+        }
+        assert!(
+            Instant::now() < completion_deadline,
+            "completed sibling must publish its buffered event"
+        );
+        std::thread::yield_now();
+    }
+
+    registry.retire_request(request_id);
+
+    assert_eq!(registry.request_state_counts(request_id), (0, 0));
+}
+
+#[test]
 fn production_doctor_uses_blocked_probe_results_and_closed_evidence() {
     let snapshot = capability_snapshot(
         Phase0CapabilityEvidence {

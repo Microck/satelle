@@ -3044,6 +3044,29 @@ struct DoctorTaskRegistry {
     inner: Arc<DoctorTaskRegistryInner>,
 }
 
+struct DoctorRequestGuard {
+    registry: DoctorTaskRegistry,
+    request_id: u64,
+}
+
+impl DoctorRequestGuard {
+    fn new(registry: DoctorTaskRegistry, request_id: u64) -> Self {
+        Self {
+            registry,
+            request_id,
+        }
+    }
+}
+
+impl Drop for DoctorRequestGuard {
+    fn drop(&mut self) {
+        // Every exit after begin_request owns the same cleanup boundary.
+        // Successful requests are already empty, while early failures cancel
+        // and reap their siblings before the public Doctor call returns.
+        self.registry.retire_request(self.request_id);
+    }
+}
+
 impl std::fmt::Debug for DoctorTaskRegistry {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.write_str("DoctorTaskRegistry")
@@ -3331,6 +3354,84 @@ impl DoctorTaskRegistry {
             .collect()
     }
 
+    fn retire_request(&self, request_id: u64) {
+        let deadline = {
+            let mut state = self
+                .inner
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            state.events.remove(&request_id);
+            state
+                .tasks
+                .values_mut()
+                .filter(|task| task.request_id == request_id)
+                .map(|task| {
+                    task.lifecycle.request_cancellation();
+                    task.phase = DoctorRegistryTaskPhase::CleanupOnly;
+                    task.lifecycle.deadline()
+                })
+                .max()
+        };
+        let Some(deadline) = deadline else {
+            return;
+        };
+
+        loop {
+            self.advance(Instant::now());
+            let state = self
+                .inner
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let (has_tasks, has_terminal) = state
+                .tasks
+                .values()
+                .filter(|task| task.request_id == request_id)
+                .fold((false, false), |(_, has_terminal), task| {
+                    (true, has_terminal || task.terminal.is_some())
+                });
+            if !has_tasks {
+                return;
+            }
+            if Instant::now() >= deadline {
+                // A worker that breaks the cancellation contract must retain
+                // cleanup-only capacity and resource ownership until a later
+                // registry advance observes its terminal acknowledgment.
+                return;
+            }
+            if has_terminal {
+                continue;
+            }
+            let wait = deadline.saturating_duration_since(Instant::now());
+            if !wait.is_zero() {
+                drop(
+                    self.inner
+                        .changed
+                        .wait_timeout(state, wait)
+                        .unwrap_or_else(std::sync::PoisonError::into_inner),
+                );
+            }
+        }
+    }
+
+    #[cfg(test)]
+    fn request_state_counts(&self, request_id: u64) -> (usize, usize) {
+        let state = self
+            .inner
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        (
+            state
+                .tasks
+                .values()
+                .filter(|task| task.request_id == request_id)
+                .count(),
+            state.events.get(&request_id).map_or(0, VecDeque::len),
+        )
+    }
+
     fn publish_snapshot_if_newer(
         &self,
         completion_order: (Instant, u64),
@@ -3545,6 +3646,7 @@ fn production_doctor_with_provider_intent(
     let mut scheduler = production_doctor_scheduler(probes, options)?;
     let registry = &service.doctor_tasks;
     let request_id = registry.begin_request();
+    let _request_guard = DoctorRequestGuard::new(registry.clone(), request_id);
     let mut records = Vec::new();
     let mut admission_deadlines = BTreeMap::new();
 
