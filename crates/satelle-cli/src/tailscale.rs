@@ -219,10 +219,8 @@ pub(super) fn execute_transport_only_doctor(
     scheduler
         .finish(&definition.probe_id, completion)
         .expect("the acknowledged transport probe is running");
-    let observation = match &outcome {
-        ControllerTransportProbeOutcome::Observed(observation)
-        | ControllerTransportProbeOutcome::TimedOut(observation) => observation,
-    };
+    let projection = project_transport_outcome(&outcome, completion);
+    let observation = &projection.observation;
     let findings = observation
         .finding()
         .cloned()
@@ -236,16 +234,8 @@ pub(super) fn execute_transport_only_doctor(
         .iter()
         .filter_map(|finding| finding.recovery_command.clone())
         .collect::<Vec<_>>();
-    let ready = observation.is_ready();
-    let status = records
-        .first()
-        .map(|record| match record.status {
-            DoctorProbeStatus::Passed => "passed",
-            DoctorProbeStatus::Finding => "finding",
-            DoctorProbeStatus::Failed => "failed",
-            DoctorProbeStatus::TimedOut => "timed_out",
-        })
-        .unwrap_or("failed");
+    let ready = projection.ready;
+    let status = projection.status;
     let duration_ms = duration.as_millis().try_into().unwrap_or(u64::MAX);
 
     Ok(DoctorReport {
@@ -294,6 +284,38 @@ pub(super) fn execute_transport_only_doctor(
         changed: false,
         cache_updates: Vec::new(),
     })
+}
+
+struct TransportProbeProjection {
+    observation: DoctorTransportObservation,
+    status: &'static str,
+    ready: bool,
+}
+
+fn project_transport_outcome(
+    outcome: &ControllerTransportProbeOutcome,
+    completion: DoctorProbeCompletion,
+) -> TransportProbeProjection {
+    let observation = match completion.status {
+        DoctorProbeStatus::TimedOut => timeout_observation(),
+        DoctorProbeStatus::Passed | DoctorProbeStatus::Finding | DoctorProbeStatus::Failed => {
+            match outcome {
+                ControllerTransportProbeOutcome::Observed(observation)
+                | ControllerTransportProbeOutcome::TimedOut(observation) => observation.clone(),
+            }
+        }
+    };
+    let status = match completion.status {
+        DoctorProbeStatus::Passed => "passed",
+        DoctorProbeStatus::Finding => "blocked",
+        DoctorProbeStatus::Failed => "failed",
+        DoctorProbeStatus::TimedOut => "timed_out",
+    };
+    TransportProbeProjection {
+        ready: completion.status == DoctorProbeStatus::Passed && observation.is_ready(),
+        observation,
+        status,
+    }
 }
 
 fn read_status(
@@ -354,34 +376,46 @@ fn run_bounded(
             }
         })?;
     let stdout = child.stdout.take().ok_or(StatusReadError::InvalidOutput)?;
-    let reader = thread::spawn(move || {
+    let (reader_sender, reader_receiver) = std::sync::mpsc::sync_channel(1);
+    thread::spawn(move || {
         let mut bytes = Vec::new();
-        stdout
+        let result = stdout
             .take((MAX_STATUS_BYTES + 1) as u64)
             .read_to_end(&mut bytes)
-            .map(|_| bytes)
+            .map(|_| bytes);
+        let _ = reader_sender.send(result);
     });
-    let status = loop {
-        if let Some(status) = child
-            .try_wait()
-            .map_err(|_| StatusReadError::CommandFailed)?
-        {
-            break Some(status);
+    let mut status = None;
+    let mut stdout = None;
+    loop {
+        if status.is_none() {
+            status = child
+                .try_wait()
+                .map_err(|_| StatusReadError::CommandFailed)?;
+        }
+        if stdout.is_none() {
+            match reader_receiver.try_recv() {
+                Ok(result) => stdout = Some(result),
+                Err(std::sync::mpsc::TryRecvError::Empty) => {}
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    return Err(StatusReadError::InvalidOutput);
+                }
+            }
+        }
+        if status.is_some() && stdout.is_some() {
+            break;
         }
         let remaining = context.remaining();
         if context.is_cancelled() || remaining.is_zero() {
-            break None;
+            terminate_process_tree(&mut child, context.cleanup_deadline());
+            let _ = reader_receiver.recv_timeout(context.cleanup_remaining());
+            return Err(StatusReadError::TimedOut);
         }
         thread::sleep(remaining.min(std::time::Duration::from_millis(10)));
-    };
-    let Some(status) = status else {
-        terminate_process_tree(&mut child);
-        let _ = reader.join();
-        return Err(StatusReadError::TimedOut);
-    };
-    let stdout = reader
-        .join()
-        .map_err(|_| StatusReadError::InvalidOutput)?
+    }
+    let status = status.expect("loop exits only with a process status");
+    let stdout = stdout
+        .expect("loop exits only with stdout")
         .map_err(|_| StatusReadError::InvalidOutput)?;
     if stdout.len() > MAX_STATUS_BYTES {
         return Err(StatusReadError::InvalidOutput);
@@ -392,22 +426,41 @@ fn run_bounded(
     Ok(stdout)
 }
 
-fn terminate_process_tree(child: &mut std::process::Child) {
+fn terminate_process_tree(child: &mut std::process::Child, cleanup_deadline: std::time::Instant) {
     #[cfg(unix)]
     if let Some(pid) = rustix::process::Pid::from_raw(child.id() as i32) {
         let _ = rustix::process::kill_process_group(pid, rustix::process::Signal::KILL);
     }
     #[cfg(windows)]
-    {
-        let _ = Command::new("taskkill")
-            .args(["/T", "/F", "/PID", &child.id().to_string()])
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status();
+    let mut tree_killer = Command::new("taskkill")
+        .args(["/T", "/F", "/PID", &child.id().to_string()])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok();
+    #[cfg(not(windows))]
+    let mut tree_killer: Option<std::process::Child> = None;
+
+    let _ = child.kill();
+    loop {
+        let child_exited = child.try_wait().map_or(true, |status| status.is_some());
+        let tree_killer_exited = tree_killer
+            .as_mut()
+            .is_none_or(|process| process.try_wait().map_or(true, |status| status.is_some()));
+        if child_exited && tree_killer_exited {
+            return;
+        }
+        let remaining = cleanup_deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        thread::sleep(remaining.min(std::time::Duration::from_millis(5)));
     }
     let _ = child.kill();
-    let _ = child.wait();
+    if let Some(tree_killer) = tree_killer.as_mut() {
+        let _ = tree_killer.kill();
+    }
 }
 
 fn diagnose_status(
@@ -836,6 +889,70 @@ mod tests {
             !Path::new("/proc").join(pid).exists(),
             "timed out status child must be reaped"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn escaped_stdout_holder_cannot_extend_the_hard_cleanup_deadline() {
+        let script = "#!/bin/sh\nsetsid sh -c 'sleep 1' &\nwhile true; do sleep 1; done\n";
+        let (_fixture, executable) = executable_fixture(script);
+        let selection =
+            DoctorScopeSelection::parse(&["transport".to_string()]).expect("transport scope");
+        let host = tailscale_host();
+        let probe = transport_doctor_probe_with(&selection, &host, &executable);
+        let started = std::time::Instant::now();
+
+        let report = transport_only_doctor_report(
+            "studio",
+            &host,
+            &selection,
+            &probe,
+            DoctorOptions::new(false, Some(std::time::Duration::from_millis(80)))
+                .expect("positive timeout"),
+        )
+        .expect("transport scheduler")
+        .expect("Direct Tailscale transport report");
+
+        assert_eq!(report.probe_results[0].status, "timed_out");
+        assert!(
+            started.elapsed() < std::time::Duration::from_millis(300),
+            "escaped pipe holders must not extend the hard cleanup deadline"
+        );
+    }
+
+    #[test]
+    fn terminal_transport_projection_owns_readiness_and_public_status() {
+        let ready =
+            ControllerTransportProbeOutcome::Observed(DoctorTransportObservation::ready(None));
+        let timed_out = project_transport_outcome(
+            &ready,
+            DoctorProbeCompletion::new(
+                DoctorProbeStatus::TimedOut,
+                DoctorDependentEvidence::NotUseful,
+            ),
+        );
+        assert!(!timed_out.ready);
+        assert_eq!(timed_out.status, "timed_out");
+        assert_eq!(
+            timed_out
+                .observation
+                .finding()
+                .expect("timeout finding")
+                .finding_id,
+            "tailscale_probe_timed_out"
+        );
+
+        let blocked =
+            ControllerTransportProbeOutcome::Observed(DoctorTransportObservation::blocked(
+                Diagnosis::blocked("tailscale_cli_unavailable", "blocked", Vec::new(), None)
+                    .finding,
+            ));
+        let finding = project_transport_outcome(
+            &blocked,
+            DoctorProbeCompletion::new(DoctorProbeStatus::Finding, DoctorDependentEvidence::Useful),
+        );
+        assert!(!finding.ready);
+        assert_eq!(finding.status, "blocked");
     }
 
     #[cfg(unix)]

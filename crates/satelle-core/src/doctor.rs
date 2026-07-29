@@ -211,6 +211,7 @@ impl DoctorProbeCompletion {
 #[derive(Clone, Debug)]
 pub struct DoctorProbeExecutionContext {
     deadline: Instant,
+    cleanup_deadline: Instant,
     cancelled: Arc<AtomicBool>,
 }
 
@@ -225,6 +226,15 @@ impl DoctorProbeExecutionContext {
 
     pub fn remaining(&self) -> Duration {
         self.deadline.saturating_duration_since(Instant::now())
+    }
+
+    pub fn cleanup_deadline(&self) -> Instant {
+        self.cleanup_deadline
+    }
+
+    pub fn cleanup_remaining(&self) -> Duration {
+        self.cleanup_deadline
+            .saturating_duration_since(Instant::now())
     }
 }
 
@@ -288,6 +298,8 @@ pub enum DoctorProbeExecutionError {
     DeadlineOverflow { probe_id: String },
     #[error("Doctor probe {probe_id} did not acknowledge terminal cleanup by its deadline")]
     CleanupDeadlineMissed { probe_id: String },
+    #[error("Doctor probe {probe_id} already reached a terminal acknowledgment")]
+    AlreadyTerminal { probe_id: String },
 }
 
 impl DoctorProbeLifecycle {
@@ -316,6 +328,7 @@ impl DoctorProbeLifecycle {
                 // Useful work ends at cancel_at. The remaining interval is
                 // reserved for task-owned cleanup before the hard deadline.
                 deadline: cancel_at,
+                cleanup_deadline: deadline,
                 cancelled,
             },
             phase: DoctorProbeLifecyclePhase::Running,
@@ -346,6 +359,11 @@ impl DoctorProbeLifecycle {
         now: Instant,
         terminal_ack: Option<(Instant, DoctorProbeCompletion)>,
     ) -> Result<DoctorProbeLifecycleEvent, DoctorProbeExecutionError> {
+        if self.phase == DoctorProbeLifecyclePhase::Terminal {
+            return Err(DoctorProbeExecutionError::AlreadyTerminal {
+                probe_id: self.probe_id.clone(),
+            });
+        }
         if let Some((completed_at, completion)) = terminal_ack {
             let completion = if completed_at >= self.cancel_at {
                 DoctorProbeCompletion::new(
@@ -380,7 +398,7 @@ impl DoctorProbeLifecycle {
             DoctorProbeLifecyclePhase::Running | DoctorProbeLifecyclePhase::Cancelling => {
                 Ok(DoctorProbeLifecycleEvent::Running)
             }
-            DoctorProbeLifecyclePhase::Terminal => Ok(DoctorProbeLifecycleEvent::Running),
+            DoctorProbeLifecyclePhase::Terminal => unreachable!("terminal polls return above"),
         }
     }
 }
@@ -1114,6 +1132,55 @@ mod tests {
                 .expect_err("the first late poll is already terminal"),
             DoctorProbeExecutionError::CleanupDeadlineMissed {
                 probe_id: "scheduler-delayed".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn lifecycle_terminal_ack_is_immutable() {
+        let started = Instant::now();
+        let mut lifecycle = DoctorProbeLifecycle::start(
+            "terminal",
+            started,
+            Duration::from_millis(10),
+            Duration::from_millis(2),
+        )
+        .expect("representable deadline");
+        let completion =
+            DoctorProbeCompletion::new(DoctorProbeStatus::Passed, DoctorDependentEvidence::Useful);
+        assert_eq!(
+            lifecycle
+                .poll(
+                    started + Duration::from_millis(1),
+                    Some((started + Duration::from_millis(1), completion)),
+                )
+                .expect("first terminal acknowledgment"),
+            DoctorProbeLifecycleEvent::TerminalAck(completion)
+        );
+
+        assert_eq!(
+            lifecycle
+                .poll(started + Duration::from_millis(2), None)
+                .expect_err("terminal lifecycle rejects later polls"),
+            DoctorProbeExecutionError::AlreadyTerminal {
+                probe_id: "terminal".to_string(),
+            }
+        );
+        assert_eq!(
+            lifecycle
+                .poll(
+                    started + Duration::from_millis(9),
+                    Some((
+                        started + Duration::from_millis(9),
+                        DoctorProbeCompletion::new(
+                            DoctorProbeStatus::TimedOut,
+                            DoctorDependentEvidence::NotUseful,
+                        ),
+                    )),
+                )
+                .expect_err("terminal lifecycle rejects replacement acknowledgment"),
+            DoctorProbeExecutionError::AlreadyTerminal {
+                probe_id: "terminal".to_string(),
             }
         );
     }

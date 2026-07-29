@@ -4623,7 +4623,9 @@ hostname = "studio"
         format!(
             "#!/bin/sh\nif [ \"$1\" = status ]; then\n\
              printf status > '{}'\n\
-             while [ ! -e '{}' ]; do sleep 0.01; done\n\
+             waited=0\n\
+             while [ ! -e '{}' ] && [ \"$waited\" -lt 300 ]; do\n\
+             sleep 0.01; waited=$((waited+1)); done\n\
              printf '%s' '{{\"BackendState\":\"Running\",\"CurrentTailnet\":\
              {{\"Name\":\"example.test\"}},\"Peer\":{{\"node\":{{\"HostName\":\"studio\",\
              \"DNSName\":\"studio.example.test.\",\"TailscaleIPs\":[\"100.64.0.8\"],\

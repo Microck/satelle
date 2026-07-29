@@ -3072,28 +3072,27 @@ impl DoctorTaskRegistry {
         )
         .map_err(|error| runtime::integrity_error(error.to_string()))?;
         let context = lifecycle.context();
-        let task_id = {
-            let mut state = self
-                .inner
-                .state
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let task_id = state.next_task_id;
-            state.next_task_id = state.next_task_id.saturating_add(1);
-            state.tasks.insert(
-                task_id,
-                DoctorRegistryTask {
-                    request_id,
-                    probe_id: probe.probe_id.clone(),
-                    resource_locks: probe.resource_locks.clone(),
-                    lifecycle,
-                    phase: DoctorRegistryTaskPhase::Running,
-                    terminal: None,
-                    worker: None,
-                },
-            );
-            task_id
-        };
+        // Keep registry ownership across thread creation so a fast worker cannot
+        // publish completion and be reaped before its join handle is installed.
+        let mut state = self
+            .inner
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let task_id = state.next_task_id;
+        state.next_task_id = state.next_task_id.saturating_add(1);
+        state.tasks.insert(
+            task_id,
+            DoctorRegistryTask {
+                request_id,
+                probe_id: probe.probe_id.clone(),
+                resource_locks: probe.resource_locks.clone(),
+                lifecycle,
+                phase: DoctorRegistryTaskPhase::Running,
+                terminal: None,
+                worker: None,
+            },
+        );
 
         let weak = Arc::downgrade(&self.inner);
         let worker = match std::thread::Builder::new()
@@ -3122,21 +3121,11 @@ impl DoctorTaskRegistry {
             }) {
             Ok(worker) => worker,
             Err(error) => {
-                self.inner
-                    .state
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .tasks
-                    .remove(&task_id);
+                state.tasks.remove(&task_id);
                 return Err(runtime::integrity_error(error.to_string()));
             }
         };
 
-        let mut state = self
-            .inner
-            .state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
         state
             .tasks
             .get_mut(&task_id)
@@ -3237,6 +3226,11 @@ impl DoctorTaskRegistry {
                                     ..
                                 },
                             ) => unreachable!("deadline overflow is rejected at task start"),
+                            Err(
+                                satelle_core::doctor::DoctorProbeExecutionError::AlreadyTerminal {
+                                    ..
+                                },
+                            ) => unreachable!("terminal tasks are removed in the acknowledgment pass"),
                         }
                     }
                 }
