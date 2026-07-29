@@ -2219,6 +2219,80 @@ fn cleanup_only_probe_bounds_later_admission_with_a_typed_failure() {
 }
 
 #[test]
+fn expired_admission_remains_authoritative_when_capacity_becomes_ready() {
+    let now = Instant::now();
+    let admission_deadlines = BTreeMap::from([
+        ("transport".to_string(), now - Duration::from_millis(1)),
+        ("provider".to_string(), now + Duration::from_secs(1)),
+    ]);
+
+    assert_eq!(
+        expired_doctor_admission(&admission_deadlines, now).as_deref(),
+        Some("transport"),
+        "an expired wait must fail before a newly available slot can admit the probe"
+    );
+}
+
+#[test]
+fn shared_post_start_failure_projection_preserves_completed_rows() {
+    let selection = doctor_selection(&["config"]);
+    let mut scheduler = production_doctor_scheduler(
+        production_doctor_probes(selection.scopes(), None, true),
+        DoctorOptions::default(),
+    )
+    .expect("valid config scheduler");
+    let started = scheduler.start_ready();
+    assert_eq!(started.len(), 1);
+    scheduler
+        .finish(
+            "config",
+            DoctorProbeCompletion::new(DoctorProbeStatus::Passed, DoctorDependentEvidence::Useful),
+        )
+        .expect("config completion");
+    let records = [DoctorProbeExecutionRecord {
+        probe_id: "config".to_string(),
+        status: DoctorProbeStatus::Passed,
+    }];
+    let snapshot_slot = RwLock::new(capability_snapshot(
+        Phase0CapabilityEvidence {
+            codex_version: CodexVersionEvidence::Detected {
+                version: REQUIRED_CODEX_VERSION,
+            },
+            host_platform: HostPlatform::Linux,
+            capabilities: CapabilityMatrix::unproven(),
+        },
+        1,
+    ));
+    let registry = DoctorTaskRegistry::new();
+    let request_id = registry.begin_request();
+    let mut request_guard = DoctorRequestGuard::new(registry, request_id);
+    let mut execution = ProductionDoctorExecution::new();
+
+    let failure = fail_production_doctor_request(
+        runtime::integrity_error("Doctor worker could not start"),
+        &mut request_guard,
+        &mut execution,
+        LOCAL_DEMO_HOST,
+        &selection,
+        DoctorOptions::default(),
+        ProductionDoctorProjection {
+            scheduler: &scheduler,
+            records: &records,
+            snapshot_slot: &snapshot_slot,
+            fatal_context: true,
+        },
+    )
+    .expect_err("post-start infrastructure failure");
+
+    assert!(
+        failure
+            .partial_probe_results
+            .iter()
+            .any(|probe| probe.scope == "config" && probe.status == "passed")
+    );
+}
+
+#[test]
 fn retiring_failed_doctor_request_cancels_and_reaps_remaining_tasks() {
     let registry = DoctorTaskRegistry::new();
     let request_id = registry.begin_request();

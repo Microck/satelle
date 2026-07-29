@@ -3776,28 +3776,43 @@ fn production_doctor_with_provider_intent(
         if let Some(error) = worker_panic {
             // Drain the complete terminal batch before failing so diagnostics
             // that completed beside the panicked probe remain reportable.
-            request_guard.retire();
-            let report = execution
-                .project_report(
-                    host,
-                    scope_selection,
-                    options,
-                    ProductionDoctorProjection {
-                        scheduler: &scheduler,
-                        records: &records,
-                        snapshot_slot,
-                        fatal_context: true,
-                    },
-                )
-                .map_err(DoctorExecutionFailure::from)?;
-            return Err(DoctorExecutionFailure::new(
+            return fail_production_doctor_request(
                 error,
-                completed_doctor_probe_results(report, &records),
-            ));
+                &mut request_guard,
+                &mut execution,
+                host,
+                scope_selection,
+                options,
+                ProductionDoctorProjection {
+                    scheduler: &scheduler,
+                    records: &records,
+                    snapshot_slot,
+                    fatal_context: true,
+                },
+            );
         }
 
         if scheduler.is_complete() {
             break;
+        }
+
+        // An admission deadline is authoritative before a newly available
+        // slot can make the same probe runnable on this wake-up.
+        if let Some(probe_id) = expired_doctor_admission(&admission_deadlines, Instant::now()) {
+            return fail_production_doctor_request(
+                doctor_admission_timeout_error(&probe_id),
+                &mut request_guard,
+                &mut execution,
+                host,
+                scope_selection,
+                options,
+                ProductionDoctorProjection {
+                    scheduler: &scheduler,
+                    records: &records,
+                    snapshot_slot,
+                    fatal_context: true,
+                },
+            );
         }
 
         // Occupancy inspection and registration form one admission decision
@@ -3833,7 +3848,7 @@ fn production_doctor_with_provider_intent(
         }
         for probe in ready {
             progressed = true;
-            match probe.probe_id.as_str() {
+            let spawn_result = match probe.probe_id.as_str() {
                 "codex" => {
                     let snapshot_slot = Arc::clone(snapshot_slot);
                     registry.spawn(request_id, &probe, move |context| {
@@ -3858,7 +3873,7 @@ fn production_doctor_with_provider_intent(
                             completion,
                             effect: ProductionDoctorTaskEffect::Snapshot(snapshot),
                         }
-                    })?;
+                    })
                 }
                 "computer-use" if options.refresh() => {
                     let runtime = service.runtime.clone();
@@ -3891,7 +3906,7 @@ fn production_doctor_with_provider_intent(
                                 duration,
                             },
                         }
-                    })?;
+                    })
                 }
                 "computer-use" => {
                     let blocked = execution.snapshot.as_ref().is_some_and(|snapshot| {
@@ -3906,7 +3921,7 @@ fn production_doctor_with_provider_intent(
                             completion: probe_completion(blocked),
                             effect: ProductionDoctorTaskEffect::None,
                         }
-                    })?;
+                    })
                 }
                 "provider-auth" => {
                     let runtime = service.runtime.clone();
@@ -3959,7 +3974,7 @@ fn production_doctor_with_provider_intent(
                                 error,
                             },
                         }
-                    })?;
+                    })
                 }
                 "provider" => {
                     let provider_refresh_allowed =
@@ -3976,28 +3991,76 @@ fn production_doctor_with_provider_intent(
                                 completion: probe_completion(true),
                                 effect: ProductionDoctorTaskEffect::None,
                             }
-                        })?;
+                        })
                     } else if !provider_refresh_allowed {
                         registry.spawn(request_id, &probe, move |_context| {
                             ProductionDoctorTaskResult {
                                 completion: probe_completion(true),
                                 effect: ProductionDoctorTaskEffect::None,
                             }
-                        })?;
+                        })
                     } else if !provider_probe_required {
                         registry.spawn(request_id, &probe, move |_context| {
                             ProductionDoctorTaskResult {
                                 completion: probe_completion(false),
                                 effect: ProductionDoctorTaskEffect::ProviderNotRequired,
                             }
-                        })?;
+                        })
                     } else {
                         let native_evidence = execution
                             .native_refresh
                             .as_ref()
                             .and_then(|(refresh, _, _, _)| refresh.as_ref().ok())
                             .cloned();
-                        let Some(native_evidence) = native_evidence else {
+                        if let Some(native_evidence) = native_evidence {
+                            let runtime = service.runtime.clone();
+                            let host = host.to_string();
+                            let provider_intent = provider_intent.clone();
+                            registry.spawn(request_id, &probe, move |context| {
+                                let started_at = utc_now();
+                                let started = Instant::now();
+                                let refresh =
+                                    with_doctor_probe_cancellation(&context, |cancellation| {
+                                        runtime.refresh_setup_provider_readiness_with_cancellation(
+                                            &host,
+                                            &provider_intent,
+                                            native_evidence,
+                                            cancellation,
+                                        )
+                                    });
+                                let observed_auth = match &refresh {
+                                    Ok(readiness)
+                                        if readiness.provider_smoke_evidence().is_some() =>
+                                    {
+                                        Some((
+                                            satelle_core::ProviderAuthValidationOutcome::Resolved,
+                                            satelle_core::ProviderAuthObservationSource::Live,
+                                        ))
+                                    }
+                                    Err(error) => provider_validation_outcome_for_error(error).map(
+                                        |outcome| {
+                                            (
+                                                outcome,
+                                                satelle_core::ProviderAuthObservationSource::Live,
+                                            )
+                                        },
+                                    ),
+                                    Ok(_) => None,
+                                };
+                                let finished_at = utc_now();
+                                let duration = started.elapsed();
+                                ProductionDoctorTaskResult {
+                                    completion: result_probe_completion(&refresh),
+                                    effect: ProductionDoctorTaskEffect::ProviderRefresh {
+                                        refresh: Box::new(refresh),
+                                        started_at,
+                                        finished_at,
+                                        duration,
+                                        observed_auth,
+                                    },
+                                }
+                            })
+                        } else {
                             registry.spawn(request_id, &probe, move |_context| {
                                 ProductionDoctorTaskResult {
                                     completion: DoctorProbeCompletion::new(
@@ -4006,51 +4069,8 @@ fn production_doctor_with_provider_intent(
                                     ),
                                     effect: ProductionDoctorTaskEffect::None,
                                 }
-                            })?;
-                            continue;
-                        };
-                        let runtime = service.runtime.clone();
-                        let host = host.to_string();
-                        let provider_intent = provider_intent.clone();
-                        registry.spawn(request_id, &probe, move |context| {
-                            let started_at = utc_now();
-                            let started = Instant::now();
-                            let refresh =
-                                with_doctor_probe_cancellation(&context, |cancellation| {
-                                    runtime.refresh_setup_provider_readiness_with_cancellation(
-                                        &host,
-                                        &provider_intent,
-                                        native_evidence,
-                                        cancellation,
-                                    )
-                                });
-                            let observed_auth = match &refresh {
-                                Ok(readiness) if readiness.provider_smoke_evidence().is_some() => {
-                                    Some((
-                                        satelle_core::ProviderAuthValidationOutcome::Resolved,
-                                        satelle_core::ProviderAuthObservationSource::Live,
-                                    ))
-                                }
-                                Err(error) => {
-                                    provider_validation_outcome_for_error(error).map(|outcome| {
-                                        (outcome, satelle_core::ProviderAuthObservationSource::Live)
-                                    })
-                                }
-                                Ok(_) => None,
-                            };
-                            let finished_at = utc_now();
-                            let duration = started.elapsed();
-                            ProductionDoctorTaskResult {
-                                completion: result_probe_completion(&refresh),
-                                effect: ProductionDoctorTaskEffect::ProviderRefresh {
-                                    refresh: Box::new(refresh),
-                                    started_at,
-                                    finished_at,
-                                    duration,
-                                    observed_auth,
-                                },
-                            }
-                        })?;
+                            })
+                        }
                     }
                 }
                 "transport" => {
@@ -4070,39 +4090,22 @@ fn production_doctor_with_provider_intent(
                                 duration,
                             },
                         }
-                    })?;
+                    })
                 }
-                "config" => {
-                    registry.spawn(request_id, &probe, move |_context| {
-                        ProductionDoctorTaskResult {
-                            completion: probe_completion(false),
-                            effect: ProductionDoctorTaskEffect::None,
-                        }
-                    })?;
-                }
+                "config" => registry.spawn(request_id, &probe, move |_context| {
+                    ProductionDoctorTaskResult {
+                        completion: probe_completion(false),
+                        effect: ProductionDoctorTaskEffect::None,
+                    }
+                }),
                 unknown => panic!("unknown production Doctor probe {unknown}"),
-            }
-        }
-        drop(scheduling);
-
-        if let Some(probe_id) = admission_deadlines
-            .iter()
-            .find_map(|(probe_id, deadline)| (Instant::now() >= *deadline).then_some(probe_id))
-        {
-            let mut error = SatelleError::state_conflict();
-            error.message = format!(
-                "Doctor probe {probe_id} could not start before its admission wait deadline because another Doctor task still owns its capacity or resource lock"
-            );
-            error.recovery_command = Some(
-                "retry satelle doctor after the prior Doctor task releases its resources".into(),
-            );
-            error.details.insert(
-                "probe_id".to_string(),
-                serde_json::Value::String(probe_id.clone()),
-            );
-            request_guard.retire();
-            let report = execution
-                .project_report(
+            };
+            if let Err(error) = spawn_result {
+                drop(scheduling);
+                return fail_production_doctor_request(
+                    error,
+                    &mut request_guard,
+                    &mut execution,
                     host,
                     scope_selection,
                     options,
@@ -4112,13 +4115,10 @@ fn production_doctor_with_provider_intent(
                         snapshot_slot,
                         fatal_context: true,
                     },
-                )
-                .map_err(DoctorExecutionFailure::from)?;
-            return Err(DoctorExecutionFailure::new(
-                error,
-                completed_doctor_probe_results(report, &records),
-            ));
+                );
+            }
         }
+        drop(scheduling);
 
         if !progressed {
             let next = registry
@@ -4152,6 +4152,49 @@ fn production_doctor_with_provider_intent(
         return Err(DoctorExecutionFailure::new(error, report.probe_results));
     }
     Ok(report)
+}
+
+fn expired_doctor_admission(
+    admission_deadlines: &BTreeMap<String, Instant>,
+    now: Instant,
+) -> Option<String> {
+    admission_deadlines
+        .iter()
+        .find_map(|(probe_id, deadline)| (now >= *deadline).then(|| probe_id.clone()))
+}
+
+fn doctor_admission_timeout_error(probe_id: &str) -> SatelleError {
+    let mut error = SatelleError::state_conflict();
+    error.message = format!(
+        "Doctor probe {probe_id} could not start before its admission wait deadline because another Doctor task still owns its capacity or resource lock"
+    );
+    error.recovery_command =
+        Some("retry satelle doctor after the prior Doctor task releases its resources".into());
+    error.details.insert(
+        "probe_id".to_string(),
+        serde_json::Value::String(probe_id.to_string()),
+    );
+    error
+}
+
+fn fail_production_doctor_request(
+    error: SatelleError,
+    request_guard: &mut DoctorRequestGuard,
+    execution: &mut ProductionDoctorExecution,
+    host: &str,
+    scope_selection: &DoctorScopeSelection,
+    options: DoctorOptions,
+    projection: ProductionDoctorProjection<'_>,
+) -> DoctorExecutionResult {
+    request_guard.retire();
+    let completed_records = projection.records;
+    let report = execution
+        .project_report(host, scope_selection, options, projection)
+        .map_err(DoctorExecutionFailure::from)?;
+    Err(DoctorExecutionFailure::new(
+        error,
+        completed_doctor_probe_results(report, completed_records),
+    ))
 }
 
 fn completed_doctor_probe_results(
