@@ -38,6 +38,15 @@ fn ready_transport() -> ReadyTestTransportProbe {
     ReadyTestTransportProbe
 }
 
+struct DelayedTestTransportProbe;
+
+impl ControllerTransportProbe for DelayedTestTransportProbe {
+    fn execute(&self, _context: &DoctorProbeExecutionContext) -> ControllerTransportProbeOutcome {
+        std::thread::sleep(Duration::from_millis(40));
+        ControllerTransportProbeOutcome::Observed(DoctorTransportObservation::ready(None))
+    }
+}
+
 struct PanickingTestTransportProbe;
 
 impl ControllerTransportProbe for PanickingTestTransportProbe {
@@ -1985,6 +1994,29 @@ fn unrefreshed_provider_probe_keeps_unobserved_readiness_blocked() {
         })
     );
     assert!(!report.ready);
+}
+
+#[test]
+fn production_doctor_report_times_the_full_scheduled_invocation() {
+    let state = TestStateDir::new().expect("temporary state directory should exist");
+    let service = production_doctor_test_service(&state);
+
+    let report = service
+        .doctor_with_provider_intent(
+            LOCAL_DEMO_HOST,
+            &doctor_selection(&["transport"]),
+            Arc::new(DelayedTestTransportProbe),
+            DoctorOptions::default(),
+            &ProviderComputerUseIntent::host_default(),
+        )
+        .expect("delayed transport Doctor should return");
+
+    assert_ne!(report.started_at, "2026-07-09T00:00:00Z");
+    assert_ne!(report.finished_at, "2026-07-09T00:00:01Z");
+    assert!(
+        report.duration_ms >= 40,
+        "top-level duration must include the delayed scheduled probe"
+    );
 }
 
 #[test]

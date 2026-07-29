@@ -3675,6 +3675,8 @@ fn production_doctor_with_provider_intent(
     provider_intent: &ProviderComputerUseIntent,
     snapshot_slot: &Arc<RwLock<ProductionCapabilitySnapshot>>,
 ) -> DoctorExecutionResult {
+    let invocation_started = Instant::now();
+    let invocation_started_at = utc_now();
     let includes_provider_scope = scope_selection.contains(DoctorScope::Provider);
     let has_provider_selection =
         provider_intent.model().is_some() || provider_intent.provider().is_some();
@@ -4105,9 +4107,15 @@ fn production_doctor_with_provider_intent(
         }
     }
 
+    let invocation_finished_at = utc_now();
+    let invocation_duration_ms = invocation_started
+        .elapsed()
+        .as_millis()
+        .try_into()
+        .unwrap_or(u64::MAX);
     request_guard.retire();
     let fatal_error = execution.fatal_error.take();
-    let report = execution
+    let mut report = execution
         .project_report(
             host,
             scope_selection,
@@ -4120,6 +4128,11 @@ fn production_doctor_with_provider_intent(
             },
         )
         .map_err(DoctorExecutionFailure::from)?;
+    // The capability snapshot has its own observation window. Top-level
+    // report timing covers this complete scheduler invocation instead.
+    report.started_at = invocation_started_at;
+    report.finished_at = invocation_finished_at;
+    report.duration_ms = invocation_duration_ms;
     if let Some(error) = fatal_error {
         // Every independent probe has reached a reportable terminal state.
         // Preserve those rows for the command's sole post-start failure event.
