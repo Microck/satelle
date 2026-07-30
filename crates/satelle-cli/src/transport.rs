@@ -353,6 +353,8 @@ pub(crate) trait TransportClient {
 pub(crate) struct RepairLedgerPlan {
     pub(crate) available: bool,
     pub(crate) automatic_action_ids: Vec<String>,
+    pub(crate) selected_operation_kind: Option<satelle_transport::SetupRepairOperationKind>,
+    pub(crate) selected_run_status: Option<satelle_transport::SetupRepairRunStatus>,
 }
 
 struct LocalTransport {
@@ -694,14 +696,52 @@ impl TransportClient for LocalTransport {
             .collect::<Result<Vec<_>, _>>()?;
         let plan = self.service.plan_setup_repair(None, run_id, &probes)?;
         Ok(RepairLedgerPlan {
-            available: plan
-                .actions()
-                .iter()
-                .any(|action| action.previous_run_id().is_some()),
+            available: plan.selected_operation_kind().is_some()
+                || plan
+                    .actions()
+                    .iter()
+                    .any(|action| action.previous_run_id().is_some()),
             automatic_action_ids: plan
                 .automatic_actions()
                 .map(|action| action.action_id().to_string())
                 .collect(),
+            selected_operation_kind: plan.selected_operation_kind().map(|kind| match kind {
+                satelle_host::SetupOperationKind::Setup => {
+                    satelle_transport::SetupRepairOperationKind::Setup
+                }
+                satelle_host::SetupOperationKind::Repair => {
+                    satelle_transport::SetupRepairOperationKind::Repair
+                }
+                satelle_host::SetupOperationKind::HostUpdate => {
+                    satelle_transport::SetupRepairOperationKind::HostUpdate
+                }
+                satelle_host::SetupOperationKind::StorageMigration => {
+                    satelle_transport::SetupRepairOperationKind::StorageMigration
+                }
+                satelle_host::SetupOperationKind::ServiceStop => {
+                    satelle_transport::SetupRepairOperationKind::ServiceStop
+                }
+                satelle_host::SetupOperationKind::ServiceRestart => {
+                    satelle_transport::SetupRepairOperationKind::ServiceRestart
+                }
+            }),
+            selected_run_status: plan.selected_run_status().map(|status| match status {
+                satelle_host::SetupRunStatus::Running => {
+                    satelle_transport::SetupRepairRunStatus::Running
+                }
+                satelle_host::SetupRunStatus::Completed => {
+                    satelle_transport::SetupRepairRunStatus::Completed
+                }
+                satelle_host::SetupRunStatus::Failed => {
+                    satelle_transport::SetupRepairRunStatus::Failed
+                }
+                satelle_host::SetupRunStatus::PartialFailure => {
+                    satelle_transport::SetupRepairRunStatus::PartialFailure
+                }
+                satelle_host::SetupRunStatus::OutcomeUnknown => {
+                    satelle_transport::SetupRepairRunStatus::OutcomeUnknown
+                }
+            }),
         })
     }
 
@@ -1024,27 +1064,8 @@ fn map_ssh_daemon_bootstrap_error(
         ssh_bootstrap::SshBootstrapError::DaemonPathOverrideNotAbsolute { name, value } => {
             SatelleError::daemon_path_override_not_absolute(name, value)
         }
-        ssh_bootstrap::SshBootstrapError::VerifiedRelease {
-            version,
-            target,
-            source,
-        } if source.release_artifact_is_unavailable() => {
-            SatelleError::host_artifact_unavailable(&version, target.id())
-        }
-        ssh_bootstrap::SshBootstrapError::VerifiedRelease {
-            version,
-            target,
-            source,
-        } => {
-            let mut error = (*source).into_satelle_error();
-            error
-                .details
-                .insert("cli_version".to_string(), serde_json::json!(version));
-            error.details.insert(
-                "remote_platform".to_string(),
-                serde_json::json!(target.id()),
-            );
-            error
+        ssh_bootstrap::SshBootstrapError::InvalidOfflineStorageMaintenanceResponse => {
+            SatelleError::state_conflict()
         }
         _ => SatelleError::host_unreachable(alias),
     }
@@ -2985,7 +3006,7 @@ pub(crate) fn apply_ssh_storage_maintenance(
     maintenance: SshStorageMaintenance,
     backup: Option<&Path>,
     delete_recordings: bool,
-) -> Result<(), SatelleError> {
+) -> Result<serde_json::Value, SatelleError> {
     let transport = SshSetupTransport::new(host)?;
     if transport.requires_first_trust {
         return Err(SatelleError::invalid_usage(format!(
@@ -3055,26 +3076,43 @@ pub(crate) fn apply_ssh_storage_maintenance(
         &persisted_overrides,
         windows_task.as_ref(),
         &mut bootstrap_lock,
-    )?;
-    {
-        let mut remote = ssh_bootstrap::PersistentServiceRemote::new(
+    )
+    .map_err(|source| {
+        storage_maintenance_partial_error(
+            &transport.alias,
+            maintenance,
+            "stop-host-api-service",
+            &[
+                maintenance.action_id().to_string(),
+                "restart-host-api-service".to_string(),
+                "verify-host-api-service".to_string(),
+            ],
+            source,
+        )
+    })?;
+    let mutation = {
+        match ssh_bootstrap::PersistentServiceRemote::new(
             transport.binding.destination(),
             target,
             &directories,
             &mut bootstrap_lock,
-        )
-        .map_err(|error| map_ssh_daemon_bootstrap_error(&transport.alias, error))?;
-        remote
-            .run_offline_storage_maintenance(
-                &artifact,
-                maintenance.token(),
-                &operation_id,
-                &state_root,
-                backup.as_deref(),
-                delete_recordings,
-            )
-            .map_err(|error| map_ssh_daemon_bootstrap_error(&transport.alias, error))?;
-    }
+        ) {
+            Ok(mut remote) => remote
+                .run_offline_storage_maintenance(
+                    &artifact,
+                    maintenance.token(),
+                    ssh_bootstrap::OfflineStorageMaintenanceIdentity {
+                        host: &transport.alias,
+                        operation_id: &operation_id,
+                    },
+                    &state_root,
+                    backup.as_deref(),
+                    delete_recordings,
+                )
+                .map_err(|error| map_ssh_daemon_bootstrap_error(&transport.alias, error)),
+            Err(error) => Err(map_ssh_daemon_bootstrap_error(&transport.alias, error)),
+        }
+    };
     {
         let mut remote = ssh_bootstrap::PersistentServiceRemote::new(
             transport.binding.destination(),
@@ -3164,6 +3202,27 @@ pub(crate) fn apply_ssh_storage_maintenance(
             error,
         )
     })?;
+    let result = match mutation {
+        Ok(result) => result,
+        Err(source) => {
+            bootstrap_lock.release_committed_handoff().map_err(|_| {
+                storage_maintenance_partial_error(
+                    &transport.alias,
+                    maintenance,
+                    "release-storage-maintenance-fence",
+                    &[],
+                    SatelleError::host_unreachable(&transport.alias),
+                )
+            })?;
+            return Err(storage_maintenance_partial_error(
+                &transport.alias,
+                maintenance,
+                maintenance.action_id(),
+                &[],
+                source,
+            ));
+        }
+    };
     let response = verification_client
         .plan_setup_repair(
             &satelle_transport::SetupRepairPlanRequest::new(
@@ -3205,7 +3264,8 @@ pub(crate) fn apply_ssh_storage_maintenance(
             &[],
             SatelleError::host_unreachable(&transport.alias),
         )
-    })
+    })?;
+    Ok(result)
 }
 
 struct HostUpdateArtifactResolver(Option<crate::host_update::VerifiedHostArtifact>);
@@ -3313,8 +3373,8 @@ fn host_service_inspection_from_executable(
 
 fn inspect_host_maintenance(
     host: &SelectedHost,
-    kind: HostMaintenancePlanKind,
-    cli_version: &str,
+    needs_host_artifact: bool,
+    force_host_replacement: bool,
 ) -> Result<HostMaintenanceInspection, SatelleError> {
     match host.config.transport {
         TransportKind::Local => {
@@ -3347,11 +3407,12 @@ fn inspect_host_maintenance(
                 cli_version,
             )?;
             let needs_replacement_artifact = needs_host_artifact
-                && matches!(
-                    relation,
-                    crate::host_update::HostVersionRelation::Missing
-                        | crate::host_update::HostVersionRelation::OlderThanCli
-                );
+                && (force_host_replacement
+                    || matches!(
+                        relation,
+                        crate::host_update::HostVersionRelation::Missing
+                            | crate::host_update::HostVersionRelation::OlderThanCli
+                    ));
             let artifact = if needs_replacement_artifact {
                 match target {
                     Some(target) => verified_host_update_artifact(target, None, None)?,
@@ -3384,11 +3445,12 @@ fn inspect_host_maintenance(
                 cli_version,
             )?;
             let needs_replacement_artifact = needs_host_artifact
-                && matches!(
-                    relation,
-                    crate::host_update::HostVersionRelation::Missing
-                        | crate::host_update::HostVersionRelation::OlderThanCli
-                );
+                && (force_host_replacement
+                    || matches!(
+                        relation,
+                        crate::host_update::HostVersionRelation::Missing
+                            | crate::host_update::HostVersionRelation::OlderThanCli
+                    ));
             let remote_directories = needs_host_artifact
                 .then(|| transport.remote_directories(target))
                 .transpose()?;
@@ -3516,20 +3578,34 @@ pub(crate) fn plan_host_update(
     components: &[satelle_core::host_update::HostUpdateComponent],
     includes_all: bool,
 ) -> Result<satelle_core::host_update::HostUpdateReport, SatelleError> {
+    plan_host_update_internal(host, components, includes_all, false)
+}
+
+fn plan_host_update_internal(
+    host: &SelectedHost,
+    components: &[satelle_core::host_update::HostUpdateComponent],
+    includes_all: bool,
+    force_host_replacement: bool,
+) -> Result<satelle_core::host_update::HostUpdateReport, SatelleError> {
+    let cli_version = env!("CARGO_PKG_VERSION");
     let needs_host_artifact = includes_all
         || components.is_empty()
         || components.contains(&satelle_core::host_update::HostUpdateComponent::Host);
-    let kind = if needs_host_artifact {
-        HostMaintenancePlanKind::HostUpdate
-    } else {
-        HostMaintenancePlanKind::CodexOnly
-    };
-    let inspection = inspect_host_maintenance(host, kind, cli_version)?;
+    let inspection = inspect_host_maintenance(host, needs_host_artifact, force_host_replacement)?;
     let host_automation_is_safe = inspection.host_automation_is_safe;
     let service_inspection = inspection.service_inspection;
 
     let host_inspection = crate::host_update::HostUpdateInspection {
-        relation_to_cli: inspection.relation_to_cli,
+        relation_to_cli: if force_host_replacement {
+            crate::host_update::HostVersionRelation::OlderThanCli
+        } else {
+            host_version_relation(
+                inspection.current_version.as_deref(),
+                inspection.protocol_compatible,
+                inspection.minimum_host_version.as_deref(),
+                cli_version,
+            )?
+        },
         current_version: inspection.current_version,
         remote_platform: inspection.remote_platform,
     };
@@ -3589,8 +3665,17 @@ enum HostUpdateOperation {
 
 fn apply_host_update_with_operation(
     host: &SelectedHost,
+    report: satelle_core::host_update::HostUpdateReport,
+    operation: HostUpdateOperation,
+) -> Result<satelle_core::host_update::HostUpdateReport, SatelleError> {
+    apply_host_update_with_operation_id(host, report, operation, None)
+}
+
+fn apply_host_update_with_operation_id(
+    host: &SelectedHost,
     mut report: satelle_core::host_update::HostUpdateReport,
     operation: HostUpdateOperation,
+    existing_operation_id: Option<&str>,
 ) -> Result<satelle_core::host_update::HostUpdateReport, SatelleError> {
     use satelle_core::host_update::{HostUpdatePostcheck, HostUpdateTarget};
 
@@ -3647,14 +3732,22 @@ fn apply_host_update_with_operation(
         return Err(SatelleError::host_identity_mismatch(&transport.alias));
     }
 
-    let operation_id = format!(
-        "{}-{}",
-        match operation {
-            HostUpdateOperation::Update => "host-update",
-            HostUpdateOperation::Repair => "repair",
-        },
-        Uuid::now_v7()
-    );
+    let operation_id = existing_operation_id
+        .map(str::to_string)
+        .unwrap_or_else(|| {
+            format!(
+                "{}-{}",
+                match operation {
+                    HostUpdateOperation::Update => "host-update",
+                    HostUpdateOperation::Repair => "repair",
+                },
+                Uuid::now_v7()
+            )
+        });
+    report.recovery_command = Some(format!(
+        "satelle repair --host {} --run {} --no-input --yes",
+        report.host, operation_id
+    ));
     let begin = match operation {
         HostUpdateOperation::Update => old_client.begin_host_update_maintenance(&operation_id),
         HostUpdateOperation::Repair => old_client.begin_repair_maintenance(&operation_id),
@@ -4082,6 +4175,13 @@ fn apply_host_update_with_operation(
             source,
         ));
     }
+    if new_capabilities.daemon_version() != env!("CARGO_PKG_VERSION") {
+        return Err(host_update_recovery_pending(
+            &mut report,
+            "restart-host-daemon",
+            SatelleError::state_conflict(),
+        ));
+    }
     let adopted = match operation {
         HostUpdateOperation::Update => new_client.begin_host_update_maintenance(&operation_id),
         HostUpdateOperation::Repair => new_client.begin_repair_maintenance(&operation_id),
@@ -4209,27 +4309,29 @@ fn apply_host_update_with_operation(
     }
     let postcheck = new_client.run_maintenance_postcheck(&operation_id, "host-update-postcheck");
     if let Err(error) = postcheck {
-        let terminal = match &error {
-            DaemonClientError::Api { error, .. } => {
-                maintenance_postcheck_is_terminal(error.details())
-            }
-            _ => false,
-        };
-        let source = direct_transport_error(&transport.alias, error);
-        if !terminal {
+        if let Err(source) = record_persistent_action_failure(
+            &transport.alias,
+            &new_client,
+            &mut bootstrap_lock,
+            "host-update-postcheck",
+            "host_update_postcheck_failed",
+        )
+        .and_then(|()| {
+            finish_persistent_maintenance(&transport.alias, &new_client, &mut bootstrap_lock)
+        }) {
             return Err(host_update_recovery_pending(
                 &mut report,
                 "host-update-postcheck",
-                &operation_id,
                 source,
             ));
         }
-        let error =
-            finish_terminal_failed_host_update_postcheck(report, &operation_id, source, || {
-                bootstrap_lock
-                    .release_committed_handoff()
-                    .map_err(|_| SatelleError::host_unreachable(&transport.alias))
-            });
+        if bootstrap_lock.release_committed_handoff().is_err() {
+            return Err(host_update_recovery_pending(
+                &mut report,
+                "host-update-postcheck",
+                SatelleError::host_unreachable(&transport.alias),
+            ));
+        }
         drop(new_client);
         drop(new_tunnel);
         return Err(error);
@@ -4687,17 +4789,34 @@ fn host_update_recovery_pending(
     }
     report.status = satelle_core::host_update::HostUpdateStatus::PartialFailure;
     report.preserved_state = Some("completed Host update actions were preserved".to_string());
-    report.recovery_command = Some(format!(
-        "satelle repair --host {} --no-input --yes",
-        crate::shell_argument(&report.host)
-    ));
-    let mut error =
-        SatelleError::host_update_partially_applied(report, action_id, source.to_string());
-    error.details.insert(
-        "operation_id".to_string(),
-        serde_json::Value::String(operation_id.to_string()),
-    );
-    error
+    if report.recovery_command.is_none() {
+        report.recovery_command = Some(format!(
+            "satelle repair --host {} --no-input --yes",
+            report.host
+        ));
+    }
+    SatelleError::host_update_partially_applied(report, action_id, source.to_string())
+}
+
+fn selected_repair_run(
+    host: &SelectedHost,
+    run_id: Option<&str>,
+) -> Result<Option<RepairLedgerPlan>, SatelleError> {
+    let Some(run_id) = run_id else {
+        return Ok(None);
+    };
+    transport_for(host)
+        .map_err(|failure| failure.error)?
+        .plan_setup_repair(Some(run_id), &[])
+        .map(Some)
+}
+
+fn resumes_selected_host_update(selected_run: Option<&RepairLedgerPlan>) -> bool {
+    selected_run.is_some_and(|run| {
+        run.selected_operation_kind == Some(satelle_transport::SetupRepairOperationKind::HostUpdate)
+            && run.selected_run_status
+                == Some(satelle_transport::SetupRepairRunStatus::OutcomeUnknown)
+    })
 }
 
 pub(crate) fn plan_repair_upgrades(
@@ -4709,7 +4828,9 @@ pub(crate) fn plan_repair_upgrades(
     };
 
     let cli_version = env!("CARGO_PKG_VERSION");
-    let inspection = inspect_host_maintenance(host, HostMaintenancePlanKind::Repair, cli_version)?;
+    let selected_run = selected_repair_run(host, run_id)?;
+    let resumes_host_update = resumes_selected_host_update(selected_run.as_ref());
+    let inspection = inspect_host_maintenance(host, true, resumes_host_update)?;
     let cli_release = parse_release_version(cli_version)?;
     let current_host_release = inspection
         .current_version
@@ -4731,7 +4852,9 @@ pub(crate) fn plan_repair_upgrades(
         .map(parse_release_version)
         .transpose()?;
     let minimum_exceeds_cli = minimum_host_release.is_some_and(|minimum| minimum > cli_release);
-    let host_reason = if inspection.current_version.is_none() {
+    let host_reason = if resumes_host_update {
+        Some(RepairCompatibilityReason::Corrupted)
+    } else if inspection.current_version.is_none() {
         Some(RepairCompatibilityReason::Missing)
     } else if minimum_exceeds_cli {
         Some(RepairCompatibilityReason::BelowMinimumVersion)
@@ -4878,18 +5001,34 @@ fn append_codex_repair_inspections(
 pub(crate) fn apply_repair_upgrades(
     host: &SelectedHost,
     mut repair: satelle_core::host_update::RepairUpgradeReport,
+    recovery_run_id: Option<&str>,
 ) -> Result<satelle_core::host_update::RepairUpgradeReport, SatelleError> {
     use satelle_core::host_update::HostUpdateComponent;
 
     if !repair.requires_mutation() {
         return Ok(repair);
     }
-    let host_update = plan_host_update(host, &[HostUpdateComponent::Host], false)?;
-    let source =
-        match apply_host_update_with_operation(host, host_update, HostUpdateOperation::Repair) {
-            Ok(applied) => return Ok(repair.applied(applied.applied_actions)),
-            Err(source) => source,
-        };
+    let selected_run = selected_repair_run(host, recovery_run_id)?;
+    let resumes_host_update = resumes_selected_host_update(selected_run.as_ref());
+    let host_update = plan_host_update_internal(
+        host,
+        &[HostUpdateComponent::Host],
+        false,
+        resumes_host_update,
+    )?;
+    let source = match apply_host_update_with_operation_id(
+        host,
+        host_update,
+        if resumes_host_update {
+            HostUpdateOperation::Update
+        } else {
+            HostUpdateOperation::Repair
+        },
+        recovery_run_id.filter(|_| resumes_host_update),
+    ) {
+        Ok(applied) => return Ok(repair.applied(applied.applied_actions)),
+        Err(source) => source,
+    };
     let completed_actions = source
         .details
         .get("completed_actions")
@@ -6031,6 +6170,8 @@ impl TransportClient for DirectTransport {
                 })
                 .map(|action| action.action_id.clone())
                 .collect(),
+            selected_operation_kind: response.selected_operation_kind(),
+            selected_run_status: response.selected_run_status(),
         })
     }
 

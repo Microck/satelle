@@ -27,8 +27,8 @@ use satelle_core::{
     ApiRateLimits, ApiTokenSource, DirectHostBinding, ErrorCode, SatelleConfig, TransportKind,
 };
 use satelle_host::{
-    ApiBearerToken, ApiScopes, HostService, MutationAuthority, SetupOperationKind, TurnIntent,
-    test_support::TestStateDir,
+    ApiBearerToken, ApiScopes, HostService, MutationAuthority, SetupActionPlan, SetupOperationKind,
+    SetupRunPlan, TurnIntent, test_support::TestStateDir,
 };
 use satelle_transport::{
     ApiError, ApiErrorCode, CapabilitiesResponse, DURABLE_SETUP_PENDING_TTL, DaemonClient,
@@ -1269,9 +1269,38 @@ async fn capabilities_are_truthful_and_unknown_routes_are_typed() {
     );
     let mut legacy_v5 = capabilities_json.clone();
     legacy_v5["schema_version"] = serde_json::json!("satelle.capabilities.v5");
+    legacy_v5
+        .as_object_mut()
+        .expect("capabilities are an object")
+        .remove("codex_update_evidence");
+    legacy_v5
+        .as_object_mut()
+        .expect("capabilities are an object")
+        .remove("minimum_host_version");
+    let legacy_keys = legacy_v5
+        .as_object()
+        .expect("legacy capabilities are an object")
+        .keys()
+        .map(String::as_str)
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(
+        legacy_keys,
+        std::collections::BTreeSet::from([
+            "daemon_version",
+            "host_identity",
+            "limits",
+            "operations",
+            "platform",
+            "provider_secret_upload",
+            "request_id",
+            "runtime_capabilities",
+            "schema_version",
+            "supported_attachment_media_types",
+        ])
+    );
     assert!(
-        serde_json::from_value::<CapabilitiesResponse>(legacy_v5).is_err(),
-        "the protocol-v12 hard cut rejects capabilities v5"
+        serde_json::from_value::<CapabilitiesResponse>(legacy_v5.clone()).is_err(),
+        "the protocol hard cut must reject legacy v5 capabilities"
     );
 
     let mut obsolete_v4 = capabilities_json.clone();
@@ -2024,8 +2053,68 @@ async fn setup_repair_plan_uses_live_probes_and_reports_missing_selected_runs() 
     let live_status = live_plan.status();
     let live_body: Value = live_plan.json().await.expect("decode live repair plan");
     assert_eq!(live_status, StatusCode::OK, "{live_body}");
+    assert_eq!(
+        live_body["schema_version"],
+        "satelle.setup-repair-plan-response.v2"
+    );
     assert_eq!(live_body["ledger_available"], false);
+    assert_eq!(live_body["selected_operation_kind"], Value::Null);
+    assert_eq!(live_body["selected_run_status"], Value::Null);
     assert_eq!(live_body["actions"][0]["decision"], "retry_automatically");
+
+    let selected_run_id = "selected-host-update";
+    let now = time::OffsetDateTime::now_utc();
+    let selected_run = SetupRunPlan::new(
+        selected_run_id,
+        SetupOperationKind::HostUpdate,
+        None,
+        now,
+        vec![
+            SetupActionPlan::new(
+                "install-host-artifact",
+                "Install the verified Host artifact",
+                true,
+            )
+            .unwrap(),
+        ],
+    )
+    .unwrap();
+    let mut selected_operation = running
+        .service
+        .begin_setup_run(&selected_run)
+        .expect("begin selected Host update run");
+    running
+        .service
+        .start_setup_action(&selected_operation, "install-host-artifact", now)
+        .unwrap();
+    running
+        .service
+        .complete_setup_action_after_verified_postcondition(
+            &selected_operation,
+            "install-host-artifact",
+            now,
+        )
+        .unwrap();
+    running
+        .service
+        .finish_setup_run(&mut selected_operation, now)
+        .unwrap();
+    let selected = running
+        .mutation("/v1/setup/repair-plan", "repair-plan-selected-host-update")
+        .json(&serde_json::json!({
+            "schema_version": "satelle.setup-repair-plan.v1",
+            "run_id": selected_run_id,
+            "probes": probes.clone()
+        }))
+        .send()
+        .await
+        .expect("inspect selected Host update run");
+    let selected_status = selected.status();
+    let selected_body: Value = selected.json().await.expect("decode selected repair plan");
+    assert_eq!(selected_status, StatusCode::OK, "{selected_body}");
+    assert_eq!(selected_body["ledger_available"], true);
+    assert_eq!(selected_body["selected_operation_kind"], "host_update");
+    assert_eq!(selected_body["selected_run_status"], "completed");
 
     let missing = running
         .mutation("/v1/setup/repair-plan", "repair-plan-missing-run")

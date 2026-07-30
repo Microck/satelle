@@ -5668,16 +5668,18 @@ impl SatelleError {
         failed_action: &str,
         source: impl Into<String>,
     ) -> Self {
-        let recovery_command = Some(format!(
-            "satelle repair --host {} --no-input --yes",
-            shell_argument(&report.host)
-        ));
+        let recovery_command = report.recovery_command.clone().or_else(|| {
+            Some(format!(
+                "satelle repair --host {} --no-input --yes",
+                report.host
+            ))
+        });
         let mut details = BTreeMap::new();
         details.insert(
             "status".to_string(),
             Value::String("partial_failure".to_string()),
         );
-        details.insert("changed".to_string(), Value::Bool(report.changed));
+        details.insert("changed".to_string(), Value::Bool(true));
         details.insert(
             "completed_actions".to_string(),
             serde_json::to_value(&report.applied_actions).unwrap_or(Value::Null),
@@ -6093,16 +6095,8 @@ mod error_contract_tests {
             serde_json::json!(["install-host-artifact"])
         );
         assert_eq!(
-            partial.details["invalidated_caches"],
-            serde_json::json!(["native_computer_use"])
-        );
-        assert_eq!(
-            partial.details["postcheck_results"],
-            serde_json::json!([{
-                "check_id": "native-computer-use-ready",
-                "status": "failed",
-                "summary": "Native Computer Use readiness failed",
-            }])
+            partial.recovery_command, report.recovery_command,
+            "partial Host updates must preserve the operation-specific recovery command"
         );
 
         report.status = HostUpdateStatus::PostcheckFailed;

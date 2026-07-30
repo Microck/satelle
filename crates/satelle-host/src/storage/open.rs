@@ -2297,19 +2297,41 @@ pub(super) fn cleanup_migration_backups_offline(
     cleanup_migration_backups(state_root, &state_directory)
 }
 
-pub(super) fn reset_store_metadata_offline(state_root: &Path) -> Result<Vec<String>, StorageError> {
-    let state_directory = prepare_state_root(state_root)?;
-    let _ownership = acquire_ownership_lock(&state_directory)?;
-    let mut removed = Vec::new();
-    for file_name in &PROTECTED_FILE_NAMES[2..] {
-        if state_directory.delete_private_leaf_durable(file_name)? {
-            removed.push((*file_name).to_string());
+pub(crate) struct OfflineStoreReset {
+    state_directory: StateDirectory,
+    _ownership: OwnershipLock,
+}
+
+impl OfflineStoreReset {
+    pub(crate) fn reset_metadata(self) -> Result<Vec<String>, StorageError> {
+        let mut removed = Vec::new();
+        for file_name in &PROTECTED_FILE_NAMES[2..] {
+            if self
+                .state_directory
+                .delete_private_leaf_durable(file_name)?
+            {
+                removed.push((*file_name).to_string());
+            }
         }
+        if self
+            .state_directory
+            .delete_private_leaf_durable(DATABASE_FILE_NAME)?
+        {
+            removed.push(DATABASE_FILE_NAME.to_string());
+        }
+        Ok(removed)
     }
-    if state_directory.delete_private_leaf_durable(DATABASE_FILE_NAME)? {
-        removed.push(DATABASE_FILE_NAME.to_string());
-    }
-    Ok(removed)
+}
+
+pub(super) fn begin_store_reset_offline(
+    state_root: &Path,
+) -> Result<OfflineStoreReset, StorageError> {
+    let state_directory = prepare_state_root(state_root)?;
+    let ownership = acquire_ownership_lock(&state_directory)?;
+    Ok(OfflineStoreReset {
+        state_directory,
+        _ownership: ownership,
+    })
 }
 
 fn tombstone_matches_token(key: &CleanupTombstoneKey, token: &RestorePointToken) -> bool {

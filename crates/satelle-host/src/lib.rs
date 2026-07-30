@@ -913,10 +913,18 @@ mod bootstrap_maintenance_tests {
         service
             .load_setup_run("missing-active-fixture")
             .expect("open the active Host metadata store");
+        let recordings = state.path().join("recordings");
+        std::fs::create_dir(&recordings).expect("create recordings directory");
+        let recording = recordings.join("recording.webm");
+        std::fs::write(&recording, b"recording").expect("write recording fixture");
 
-        let error = HostService::reset_store_metadata_offline(state.path(), false)
+        let error = HostService::reset_store_metadata_offline(state.path(), true)
             .expect_err("an active Host owner must block offline reset");
         assert_eq!(satelle_core::ErrorCode::StoreInUse, error.code);
+        assert!(
+            recording.exists(),
+            "ownership rejection must precede recording deletion"
+        );
     }
 }
 
@@ -1602,12 +1610,17 @@ impl HostService {
         state_root: &std::path::Path,
         delete_recordings: bool,
     ) -> Result<StoreResetResult, SatelleError> {
+        // Retain the exclusive Storage owner across both destructive steps.
+        // A live daemon must reject the reset before recordings can move.
+        let reset =
+            storage::begin_store_reset_offline(state_root).map_err(runtime::storage_failure)?;
         let recordings_deleted = if delete_recordings {
             delete_recordings_directory(state_root)?
         } else {
             false
         };
-        storage::reset_store_metadata_offline(state_root)
+        reset
+            .reset_metadata()
             .map(|removed_metadata_file_names| StoreResetResult {
                 removed_metadata_file_names,
                 recordings_deleted,

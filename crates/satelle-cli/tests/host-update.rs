@@ -88,7 +88,7 @@ fn local_maintenance_dry_runs_do_not_create_host_storage() {
 
 #[test]
 fn current_host_update_exits_without_confirmation_or_mutation() {
-    let state = tempfile::tempdir().expect("temporary update state");
+    let state = TestStateDir::new().expect("temporary update state");
     let output = satelle()
         .env("SATELLE_STATE_DIR", state.path())
         .args([
@@ -139,7 +139,7 @@ fn default_current_host_update_reports_skipped_targets_in_human_output() {
 
 #[test]
 fn quiet_current_host_update_has_no_output() {
-    let state = tempfile::tempdir().expect("temporary update state");
+    let state = TestStateDir::new().expect("temporary update state");
     let output = satelle()
         .env("SATELLE_STATE_DIR", state.path())
         .args([
@@ -178,7 +178,7 @@ fn host_update_has_no_arbitrary_version_or_channel_flags() {
 
 #[test]
 fn repair_dry_run_uses_live_typed_upgrade_evidence() {
-    let state = TestStateDir::new().expect("create secure temporary state directory");
+    let state = TestStateDir::new().expect("temporary repair state");
     let output = satelle()
         .env("SATELLE_STATE_DIR", state.path())
         .args(["repair", "--host", "local-demo", "--dry-run", "--json"])
@@ -229,7 +229,7 @@ fn repair_dry_run_uses_live_typed_upgrade_evidence() {
 
 #[test]
 fn repair_selected_missing_run_returns_the_typed_ledger_diagnostic() {
-    let state = tempfile::tempdir().expect("temporary repair state");
+    let state = TestStateDir::new().expect("temporary repair state");
     let output = satelle()
         .env("SATELLE_STATE_DIR", state.path())
         .args([
@@ -253,7 +253,7 @@ fn repair_selected_missing_run_returns_the_typed_ledger_diagnostic() {
 
 #[test]
 fn store_reset_dry_run_is_a_noop_and_apply_preserves_recordings_by_default() {
-    let state = tempfile::tempdir().expect("temporary store reset state");
+    let state = TestStateDir::new().expect("temporary store reset state");
     let recordings = state.path().join("recordings");
     fs::create_dir(&recordings).expect("create recordings directory");
     let recording = recordings.join("recording.webm");
@@ -297,6 +297,7 @@ fn store_reset_dry_run_is_a_noop_and_apply_preserves_recordings_by_default() {
         String::from_utf8_lossy(&applied.stderr)
     );
     let report: Value = serde_json::from_slice(&applied.stdout).expect("parse reset report");
+    assert_eq!(report["schema_version"], "satelle.host.storage.v1");
     assert_eq!(report["status"], "applied");
     assert_eq!(report["result"]["recordings_deleted"], false);
     assert!(recording.exists());
@@ -305,7 +306,7 @@ fn store_reset_dry_run_is_a_noop_and_apply_preserves_recordings_by_default() {
 
 #[test]
 fn store_reset_deletes_recordings_only_with_the_explicit_option() {
-    let state = tempfile::tempdir().expect("temporary store reset state");
+    let state = TestStateDir::new().expect("temporary store reset state");
     let recordings = state.path().join("recordings");
     fs::create_dir(&recordings).expect("create recordings directory");
     fs::write(recordings.join("recording.webm"), b"recording").expect("write recording fixture");
@@ -331,6 +332,7 @@ fn store_reset_deletes_recordings_only_with_the_explicit_option() {
         String::from_utf8_lossy(&applied.stderr)
     );
     let report: Value = serde_json::from_slice(&applied.stdout).expect("parse reset report");
+    assert_eq!(report["schema_version"], "satelle.host.storage.v1");
     assert_eq!(report["result"]["recordings_deleted"], true);
     assert!(!recordings.exists());
 }

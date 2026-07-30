@@ -1702,7 +1702,7 @@ fn bootstrap_completion_finalizes_an_already_completed_recovery() {
 }
 
 #[test]
-fn host_update_recovery_adopts_the_interrupted_ordered_action() {
+fn repair_adopts_and_replays_the_exact_interrupted_host_update_run() {
     let state = TempDir::new().expect("temporary state directory");
     let (mut storage, _) = Storage::open(state.path()).expect("open storage");
     let plan = SetupRunPlan::new(
@@ -1711,71 +1711,101 @@ fn host_update_recovery_adopts_the_interrupted_ordered_action() {
         None,
         at(1),
         vec![
-            SetupActionPlan::new(
-                "install-host-artifact",
-                "Install the verified Host artifact",
-                true,
-            )
-            .unwrap(),
-            SetupActionPlan::new(
-                "publish-host-service",
-                "Publish the Host service definition",
-                true,
-            )
-            .unwrap(),
-            SetupActionPlan::new("restart-host-daemon", "Restart the Host daemon", true).unwrap(),
-            SetupActionPlan::new(
-                "invalidate-readiness-caches",
-                "Invalidate readiness caches",
-                true,
-            )
-            .unwrap(),
-            SetupActionPlan::new("host-update-postcheck", "Run Host postchecks", true).unwrap(),
+            SetupActionPlan::new("replace-host", "Replace Host", true).unwrap(),
+            SetupActionPlan::new("restart-host", "Restart Host", true).unwrap(),
         ],
     )
     .unwrap();
-    let capability = storage
-        .begin_bootstrap_maintenance(&plan, maintenance_owner(plan.run_id(), plan.started_at()))
-        .expect("begin Host update maintenance");
-    for (action_id, started_at, finished_at) in [
-        ("install-host-artifact", at(2), at(3)),
-        ("publish-host-service", at(4), at(5)),
-    ] {
-        storage
-            .start_setup_action(&capability, action_id, started_at)
-            .expect("start completed Host update action");
-        storage
-            .complete_setup_action_after_verified_postcondition(&capability, action_id, finished_at)
-            .expect("complete Host update action");
-    }
+    let capability = begin_setup_run(&mut storage, &plan);
     storage
-        .start_setup_action(&capability, "restart-host-daemon", at(6))
-        .expect("start daemon restart before replacement");
+        .start_setup_action(&capability, "replace-host", at(2))
+        .unwrap();
     storage
-        .retain_lease_recovery(capability.lease_owner())
-        .expect("retain interrupted Host update ownership");
+        .complete_setup_action_after_verified_postcondition(&capability, "replace-host", at(3))
+        .unwrap();
+    storage
+        .start_setup_action(&capability, "restart-host", at(4))
+        .unwrap();
+    storage
+        .mark_interrupted_setup_actions_outcome_unknown(at(5))
+        .unwrap();
 
-    storage
-        .adopt_recovery_maintenance(plan.run_id(), maintenance_owner(plan.run_id(), at(7)))
-        .expect("replacement daemon adopts the interrupted Host update action");
-
-    let run = storage
+    let interrupted = storage
         .load_setup_run(plan.run_id())
         .unwrap()
-        .expect("Host update run exists");
-    assert_eq!(SetupRunStatus::Running, run.status());
+        .expect("interrupted run remains selectable by its exact operation ID");
+    let repair = storage
+        .plan_setup_repair(
+            None,
+            Some(&interrupted),
+            &[
+                SetupRepairProbe::try_new(
+                    "replace-host",
+                    "Replace Host",
+                    true,
+                    SetupRepairPostcondition::Satisfied,
+                )
+                .unwrap(),
+                SetupRepairProbe::try_new(
+                    "restart-host",
+                    "Restart Host",
+                    true,
+                    SetupRepairPostcondition::Unsatisfied,
+                )
+                .unwrap(),
+            ],
+        )
+        .expect("the selected active recovery run is the repair source");
     assert_eq!(
-        [
-            SetupActionStatus::Completed,
-            SetupActionStatus::Completed,
-            SetupActionStatus::Started,
-            SetupActionStatus::Planned,
-            SetupActionStatus::Planned,
+        Some(SetupOperationKind::HostUpdate),
+        repair.selected_operation_kind()
+    );
+    assert_eq!(
+        Some(SetupRunStatus::OutcomeUnknown),
+        repair.selected_run_status()
+    );
+    assert_eq!(
+        &[
+            SetupRepairDecision::NoActionRequired,
+            SetupRepairDecision::RetryAutomatically,
         ],
-        run.actions()
+        repair
+            .actions()
             .iter()
-            .map(|action| action.status())
+            .map(|action| action.decision())
             .collect::<Vec<_>>()
             .as_slice()
     );
+
+    let adopted = storage
+        .adopt_recovery_maintenance(plan.run_id(), maintenance_owner(plan.run_id(), at(6)))
+        .expect("repair adopts the exact interrupted operation");
+    storage
+        .start_setup_action(&adopted, "replace-host", at(7))
+        .expect("completed retry-safe actions can be replayed idempotently");
+    storage
+        .complete_setup_action_after_verified_postcondition(&adopted, "replace-host", at(7))
+        .expect("completed retry-safe actions remain completed");
+    storage
+        .start_setup_action(&adopted, "restart-host", at(7))
+        .expect("the interrupted action remains started after adoption");
+    storage
+        .complete_setup_action_after_verified_postcondition(&adopted, "restart-host", at(8))
+        .expect("the interrupted action completes under the original operation ID");
+    assert_eq!(
+        SetupRunStatus::Completed,
+        storage
+            .finish_setup_run_and_release_maintenance(&adopted, at(9))
+            .expect("exact-run repair finalizes and releases maintenance")
+    );
+
+    let completed = storage.load_setup_run(plan.run_id()).unwrap().unwrap();
+    assert_eq!(SetupRunStatus::Completed, completed.status());
+    assert!(
+        completed
+            .actions()
+            .iter()
+            .all(|action| action.status() == SetupActionStatus::Completed)
+    );
+    assert!(storage.maintenance_lease_state().unwrap().is_none());
 }

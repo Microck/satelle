@@ -213,7 +213,14 @@ function Retire-TerminalAttempt([string]$PriorPhase, [string]$PriorAttempt) {{
   if (-not $priorRequiresCommit -and -not $priorUsesSuccess) {{ return $false }}
   $startedName = 'execution_started.' + $PriorAttempt
   $retiringName = 'execution_retiring.' + $PriorAttempt
-  $terminalName = if ($priorRequiresCommit) {{ 'execution_committed.' + $PriorAttempt }} else {{ 'execution_succeeded.' + $PriorAttempt }}
+  $failedName = 'execution_failed.' + $PriorAttempt
+  $terminalName = if (Test-Path -LiteralPath (Join-Path $claimPath $failedName) -PathType Leaf) {{
+    $failedName
+  }} elseif ($priorRequiresCommit) {{
+    'execution_committed.' + $PriorAttempt
+  }} else {{
+    'execution_succeeded.' + $PriorAttempt
+  }}
   $launcherTerminalName = 'execution_succeeded.' + $PriorAttempt
   $allowedMarkers = @($startedName, $terminalName)
   if ($PriorPhase -ceq 'daemon_start') {{ $allowedMarkers += $launcherTerminalName }}
@@ -680,6 +687,10 @@ retire_terminal_attempt() {{
     {posix_success_phases}) terminal_kind=execution_succeeded;;
     *) return 1;;
   esac
+  failed_path="$claim_path/execution_failed.$prior_attempt"
+  if [ -d "$failed_path" ] && [ ! -L "$failed_path" ]; then
+    terminal_kind=execution_failed
+  fi
   started_path="$claim_path/execution_started.$prior_attempt"
   retiring_path="$claim_path/execution_retiring.$prior_attempt"
   terminal_path="$claim_path/$terminal_kind.$prior_attempt"
@@ -2842,6 +2853,41 @@ mod tests {
             recovered.exchange(RELEASE);
             assert!(recovered.close().success(), "{phase} stale recovery");
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn failed_offline_storage_attempt_can_advance_to_service_restart() {
+        let state_home = tempfile::tempdir().expect("temporary storage maintenance home");
+        let lock_root = state_home.path().join("satelle/bootstrap.lock");
+        let failed_attempt = "0123456789abcdef0123456789abcdef";
+        let restart_attempt = "fedcba9876543210fedcba9876543210";
+        let mut owner = RunningProtocol::start(&request(), state_home.path());
+        assert_ready_line(&owner.read_line());
+        owner.exchange(
+            &mutation_started_line("offline_storage_maintenance", failed_attempt).unwrap(),
+        );
+        let claim = only_claim(&lock_root);
+        fs::create_dir(claim.join(format!("execution_started.{failed_attempt}"))).unwrap();
+        fs::create_dir(claim.join(format!("execution_failed.{failed_attempt}"))).unwrap();
+
+        owner.exchange(
+            &mutation_started_line("persistent_service_restart", restart_attempt).unwrap(),
+        );
+
+        let advanced_claim = only_claim(&lock_root);
+        assert!(
+            !advanced_claim
+                .join(format!("execution_started.{failed_attempt}"))
+                .exists()
+        );
+        assert!(
+            !advanced_claim
+                .join(format!("execution_failed.{failed_attempt}"))
+                .exists()
+        );
+        owner.exchange(RELEASE);
+        assert!(owner.close().success());
     }
 
     #[test]

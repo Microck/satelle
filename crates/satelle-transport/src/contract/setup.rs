@@ -77,7 +77,7 @@ define_schema_token!(
 define_schema_token!(SetupRepairPlanSchema, "satelle.setup-repair-plan.v1");
 define_schema_token!(
     SetupRepairPlanResponseSchema,
-    "satelle.setup-repair-plan-response.v1"
+    "satelle.setup-repair-plan-response.v2"
 );
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -136,6 +136,38 @@ pub enum SetupRepairDecision {
     ProbeRequired,
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SetupRepairPreviousStatus {
+    Planned,
+    Started,
+    Completed,
+    Failed,
+    Skipped,
+    OutcomeUnknown,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SetupRepairOperationKind {
+    Setup,
+    Repair,
+    HostUpdate,
+    StorageMigration,
+    ServiceStop,
+    ServiceRestart,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SetupRepairRunStatus {
+    Running,
+    Completed,
+    Failed,
+    PartialFailure,
+    OutcomeUnknown,
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct SetupRepairPlanAction {
@@ -144,7 +176,7 @@ pub struct SetupRepairPlanAction {
     pub decision: SetupRepairDecision,
     pub retry_safe: bool,
     pub previous_run_id: Option<String>,
-    pub previous_status: Option<String>,
+    pub previous_status: Option<SetupRepairPreviousStatus>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -154,6 +186,8 @@ pub struct SetupRepairPlanResponse {
     request_id: RequestId,
     host_identity: String,
     ledger_available: bool,
+    selected_operation_kind: Option<SetupRepairOperationKind>,
+    selected_run_status: Option<SetupRepairRunStatus>,
     actions: Vec<SetupRepairPlanAction>,
 }
 
@@ -161,22 +195,35 @@ impl SetupRepairPlanResponse {
     pub(crate) fn new(
         request_id: RequestId,
         host_identity: String,
+        selected_operation_kind: Option<SetupRepairOperationKind>,
+        selected_run_status: Option<SetupRepairRunStatus>,
         actions: Vec<SetupRepairPlanAction>,
     ) -> Self {
-        let ledger_available = actions
-            .iter()
-            .any(|action| action.previous_run_id.is_some());
+        let ledger_available = selected_operation_kind.is_some()
+            || actions
+                .iter()
+                .any(|action| action.previous_run_id.is_some());
         Self {
             schema_version: SetupRepairPlanResponseSchema,
             request_id,
             host_identity,
             ledger_available,
+            selected_operation_kind,
+            selected_run_status,
             actions,
         }
     }
 
     pub const fn ledger_available(&self) -> bool {
         self.ledger_available
+    }
+
+    pub const fn selected_operation_kind(&self) -> Option<SetupRepairOperationKind> {
+        self.selected_operation_kind
+    }
+
+    pub const fn selected_run_status(&self) -> Option<SetupRepairRunStatus> {
+        self.selected_run_status
     }
 
     pub fn actions(&self) -> &[SetupRepairPlanAction] {

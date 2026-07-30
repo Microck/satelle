@@ -38,8 +38,9 @@ pub use setup::{
     ProviderBindingDeletionResponse, ProviderDescriptorValidationRequest,
     ProviderDescriptorValidationResponse, ProviderSecretProvisioningMetadata,
     ProviderSecretProvisioningPreviewResponse, ProviderSecretProvisioningResponse,
-    ProviderSecretUploadEnvelope, SetupRepairDecision, SetupRepairPlanAction,
-    SetupRepairPlanRequest, SetupRepairPlanResponse, SetupRepairPostcondition, SetupRepairProbe,
+    ProviderSecretUploadEnvelope, SetupRepairDecision, SetupRepairOperationKind,
+    SetupRepairPlanAction, SetupRepairPlanRequest, SetupRepairPlanResponse,
+    SetupRepairPostcondition, SetupRepairPreviousStatus, SetupRepairProbe, SetupRepairRunStatus,
     SetupVerificationRequest, SetupVerificationResponse,
 };
 pub(crate) use setup::{
