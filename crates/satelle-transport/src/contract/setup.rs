@@ -74,6 +74,125 @@ define_schema_token!(
     NativeReadinessInvalidationResponseSchema,
     "satelle.native-readiness-invalidation-response.v1"
 );
+define_schema_token!(SetupRepairPlanSchema, "satelle.setup-repair-plan.v1");
+define_schema_token!(
+    SetupRepairPlanResponseSchema,
+    "satelle.setup-repair-plan-response.v1"
+);
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SetupRepairPostcondition {
+    Satisfied,
+    Unsatisfied,
+    Unknown,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SetupRepairProbe {
+    pub action_id: String,
+    pub label: String,
+    pub retry_safe: bool,
+    pub postcondition: SetupRepairPostcondition,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SetupRepairPlanRequest {
+    schema_version: SetupRepairPlanSchema,
+    run_id: Option<String>,
+    probes: Vec<SetupRepairProbe>,
+}
+
+impl SetupRepairPlanRequest {
+    pub fn new(run_id: Option<String>, probes: Vec<SetupRepairProbe>) -> Self {
+        Self {
+            schema_version: SetupRepairPlanSchema,
+            run_id,
+            probes,
+        }
+    }
+
+    pub fn run_id(&self) -> Option<&str> {
+        self.run_id.as_deref()
+    }
+
+    pub fn probes(&self) -> &[SetupRepairProbe] {
+        &self.probes
+    }
+}
+
+impl ApiRequestContract for SetupRepairPlanRequest {
+    const SCHEMA_VERSION: &'static str = SetupRepairPlanSchema::TOKEN;
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SetupRepairDecision {
+    NoActionRequired,
+    RetryAutomatically,
+    OperatorActionRequired,
+    ProbeRequired,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SetupRepairPlanAction {
+    pub action_id: String,
+    pub label: String,
+    pub decision: SetupRepairDecision,
+    pub retry_safe: bool,
+    pub previous_run_id: Option<String>,
+    pub previous_status: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SetupRepairPlanResponse {
+    schema_version: SetupRepairPlanResponseSchema,
+    request_id: RequestId,
+    host_identity: String,
+    ledger_available: bool,
+    actions: Vec<SetupRepairPlanAction>,
+}
+
+impl SetupRepairPlanResponse {
+    pub(crate) fn new(
+        request_id: RequestId,
+        host_identity: String,
+        actions: Vec<SetupRepairPlanAction>,
+    ) -> Self {
+        let ledger_available = actions
+            .iter()
+            .any(|action| action.previous_run_id.is_some());
+        Self {
+            schema_version: SetupRepairPlanResponseSchema,
+            request_id,
+            host_identity,
+            ledger_available,
+            actions,
+        }
+    }
+
+    pub const fn ledger_available(&self) -> bool {
+        self.ledger_available
+    }
+
+    pub fn actions(&self) -> &[SetupRepairPlanAction] {
+        &self.actions
+    }
+}
+
+impl AuthenticatedResponseContract for SetupRepairPlanResponse {
+    fn request_id(&self) -> &RequestId {
+        &self.request_id
+    }
+
+    fn host_identity(&self) -> &str {
+        &self.host_identity
+    }
+}
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct ProviderBindingAuthorizationRequest {

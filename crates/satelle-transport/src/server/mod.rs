@@ -951,6 +951,12 @@ fn router(state: Arc<DaemonState>) -> Router {
             Arc::clone(&state),
             auth::require_control,
         ));
+    let setup_repair_plan_route = Router::new()
+        .route("/v1/setup/repair-plan", post(setup::plan_setup_repair))
+        .route_layer(middleware::from_fn_with_state(
+            Arc::clone(&state),
+            auth::require_control,
+        ));
     let native_readiness_invalidation_route = Router::new()
         .route(
             "/v1/setup/readiness/native/invalidate",
@@ -982,6 +988,7 @@ fn router(state: Arc<DaemonState>) -> Router {
         .merge(provider_descriptor_validation_route)
         .merge(provider_secret_provisioning_routes)
         .merge(setup_verification_route)
+        .merge(setup_repair_plan_route)
         .merge(native_readiness_invalidation_route)
         .merge(control_routes)
         .method_not_allowed_fallback(protected_method_not_allowed)

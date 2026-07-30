@@ -38,19 +38,19 @@ pub use setup::{
     ProviderBindingDeletionResponse, ProviderDescriptorValidationRequest,
     ProviderDescriptorValidationResponse, ProviderSecretProvisioningMetadata,
     ProviderSecretProvisioningPreviewResponse, ProviderSecretProvisioningResponse,
-    ProviderSecretUploadEnvelope, SetupVerificationRequest, SetupVerificationResponse,
+    ProviderSecretUploadEnvelope, SetupRepairDecision, SetupRepairPlanAction,
+    SetupRepairPlanRequest, SetupRepairPlanResponse, SetupRepairPostcondition, SetupRepairProbe,
+    SetupVerificationRequest, SetupVerificationResponse,
 };
 pub(crate) use setup::{
     PROVIDER_SECRET_UPLOAD_CONTENT_TYPE, PROVIDER_SECRET_UPLOAD_INFO, provider_secret_upload_aad,
 };
 
 pub(crate) const PROTOCOL_VERSION_HEADER: &str = "satelle-protocol-version";
-// Protocol v11 hard-cuts the plaintext provider-secret upload in favor of the
-// Host-bound HPKE preview/envelope v2 contract. It also carries setup
-// verification and native-readiness invalidation. Capabilities v6 adds
-// maintenance evidence while the client still decodes exact v5 responses for
-// the narrow older-Host update handshake.
-pub(crate) const PROTOCOL_VERSION: &str = "11";
+// Protocol v12 adds authoritative setup-repair planning and selected-run
+// inspection. The protocol remains a hard cut because the repair executor
+// cannot safely infer whether an older Host applied ledger retry rules.
+pub(crate) const PROTOCOL_VERSION: &str = "12";
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::fmt;
@@ -188,7 +188,7 @@ mod tests {
     }
 
     #[test]
-    fn protocol_version_is_the_v11_hard_cut() {
-        assert_eq!(PROTOCOL_VERSION, "11");
+    fn protocol_version_is_the_v12_hard_cut() {
+        assert_eq!(PROTOCOL_VERSION, "12");
     }
 }

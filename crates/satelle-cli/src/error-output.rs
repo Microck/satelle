@@ -142,7 +142,10 @@ fn human_error(error: &SatelleError) -> String {
     }
     if matches!(
         error.code,
-        ErrorCode::HostUpdatePartiallyApplied | ErrorCode::HostUpdatePostcheckFailed
+        ErrorCode::HostUpdatePartiallyApplied
+            | ErrorCode::HostUpdatePostcheckFailed
+            | ErrorCode::SetupActionFailed
+            | ErrorCode::SetupPartiallyApplied
     ) {
         let actions_key = if error.code == ErrorCode::HostUpdatePostcheckFailed {
             "applied_actions"
@@ -156,6 +159,21 @@ fn human_error(error: &SatelleError) -> String {
                 .collect::<Vec<_>>()
                 .join(", ");
             lines.push(format!("applied: {actions}"));
+        }
+        if let Some(failed_action) = error.details.get("failed_action").and_then(Value::as_str) {
+            lines.push(format!("failed action: {failed_action}"));
+        }
+        if let Some(skipped) = error
+            .details
+            .get("skipped_actions")
+            .and_then(Value::as_array)
+        {
+            let skipped = skipped
+                .iter()
+                .filter_map(Value::as_str)
+                .collect::<Vec<_>>()
+                .join(", ");
+            lines.push(format!("skipped: {skipped}"));
         }
         if let Some(postchecks) = error
             .details
@@ -322,6 +340,18 @@ fn error_contract(code: ErrorCode) -> ErrorContract {
             outcome: "The Host update changed remote state but readiness failed.",
             default_recovery: "run satelle doctor for the selected Host",
         },
+        ErrorCode::SetupActionFailed => ErrorContract {
+            category: ErrorCategory::RemoteExecution,
+            retryable: false,
+            outcome: "The setup or repair action failed before changing remote state.",
+            default_recovery: "run satelle repair for the selected Host",
+        },
+        ErrorCode::SetupPartiallyApplied => ErrorContract {
+            category: ErrorCategory::RemoteExecution,
+            retryable: false,
+            outcome: "Host maintenance stopped after changing remote state.",
+            default_recovery: "run satelle repair for the selected Host",
+        },
         ErrorCode::SshHostKeyVerificationRequired => ErrorContract {
             category: ErrorCategory::RemoteExecution,
             retryable: false,
@@ -356,6 +386,7 @@ fn error_contract(code: ErrorCode) -> ErrorContract {
         | ErrorCode::UnsupportedUpdateComponent
         | ErrorCode::PersistentServiceUnsupported
         | ErrorCode::SetupConsentRequired
+        | ErrorCode::SetupLedgerUnavailable
         | ErrorCode::ProviderSecretSourceRequired
         | ErrorCode::ProviderSecretProvisioningRequired
         | ErrorCode::ProviderSecretOverwriteRequired

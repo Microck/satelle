@@ -145,13 +145,13 @@ impl RunningServer {
 
     fn request(&self, path: &str) -> reqwest::RequestBuilder {
         self.protected_request(reqwest::Method::GET, path)
-            .header("Satelle-Protocol-Version", "11")
+            .header("Satelle-Protocol-Version", "12")
     }
 
     fn mutation(&self, path: &str, idempotency_key: &str) -> reqwest::RequestBuilder {
         self.protected_request(reqwest::Method::POST, path)
             .header("Idempotency-Key", idempotency_key)
-            .header("Satelle-Protocol-Version", "11")
+            .header("Satelle-Protocol-Version", "12")
     }
 
     fn mutation_with_request_id(
@@ -162,7 +162,7 @@ impl RunningServer {
     ) -> reqwest::RequestBuilder {
         self.protected_request_with_request_id(reqwest::Method::POST, path, request_id)
             .header("Idempotency-Key", idempotency_key)
-            .header("Satelle-Protocol-Version", "11")
+            .header("Satelle-Protocol-Version", "12")
     }
 
     fn protected_request(&self, method: reqwest::Method, path: &str) -> reqwest::RequestBuilder {
@@ -368,7 +368,7 @@ fn setup_mutation_request(
         .header("Satelle-Expected-Host-Identity", host_identity)
         .header("Satelle-Request-Id", RequestId::new().to_string())
         .header("Idempotency-Key", idempotency_key)
-        .header("Satelle-Protocol-Version", "11")
+        .header("Satelle-Protocol-Version", "12")
 }
 
 fn replacement_token(token_id: &str) -> ApiBearerToken {
@@ -1715,7 +1715,7 @@ async fn bootstrap_maintenance_routes_enforce_the_mutation_contract_before_ledge
         ),
         (
             "missing-idempotency",
-            Some("11"),
+            Some("12"),
             None,
             false,
             false,
@@ -1724,7 +1724,7 @@ async fn bootstrap_maintenance_routes_enforce_the_mutation_contract_before_ledge
         ),
         (
             "query",
-            Some("11"),
+            Some("12"),
             Some("query-key"),
             true,
             false,
@@ -1733,7 +1733,7 @@ async fn bootstrap_maintenance_routes_enforce_the_mutation_contract_before_ledge
         ),
         (
             "cookie",
-            Some("11"),
+            Some("12"),
             Some("cookie-key"),
             false,
             true,
@@ -1846,7 +1846,7 @@ async fn bootstrap_maintenance_routes_enforce_the_mutation_contract_before_ledge
         ),
         (
             "missing-idempotency",
-            Some("11"),
+            Some("12"),
             None,
             false,
             false,
@@ -1855,7 +1855,7 @@ async fn bootstrap_maintenance_routes_enforce_the_mutation_contract_before_ledge
         ),
         (
             "query",
-            Some("11"),
+            Some("12"),
             Some("complete-query-key"),
             true,
             false,
@@ -1864,7 +1864,7 @@ async fn bootstrap_maintenance_routes_enforce_the_mutation_contract_before_ledge
         ),
         (
             "cookie",
-            Some("11"),
+            Some("12"),
             Some("complete-cookie-key"),
             false,
             true,
@@ -1955,6 +1955,57 @@ async fn bootstrap_maintenance_routes_enforce_the_mutation_contract_before_ledge
     assert_eq!(complete_competing.status(), StatusCode::OK);
 
     server.shutdown().await.expect("stop bootstrap server");
+}
+
+#[tokio::test]
+async fn setup_repair_plan_uses_live_probes_and_reports_missing_selected_runs() {
+    let running = RunningServer::start(ApiScopes::ADMIN).await;
+    let probes = serde_json::json!([
+        {
+            "action_id": "install-host-artifact",
+            "label": "Install the verified Host artifact",
+            "retry_safe": true,
+            "postcondition": "unsatisfied"
+        }
+    ]);
+
+    let live_plan = running
+        .mutation("/v1/setup/repair-plan", "repair-plan-live-probes")
+        .json(&serde_json::json!({
+            "schema_version": "satelle.setup-repair-plan.v1",
+            "run_id": null,
+            "probes": probes.clone()
+        }))
+        .send()
+        .await
+        .expect("plan repair from live probes");
+    let live_status = live_plan.status();
+    let live_body: Value = live_plan.json().await.expect("decode live repair plan");
+    assert_eq!(live_status, StatusCode::OK, "{live_body}");
+    assert_eq!(live_body["ledger_available"], false);
+    assert_eq!(live_body["actions"][0]["decision"], "retry_automatically");
+
+    let missing = running
+        .mutation("/v1/setup/repair-plan", "repair-plan-missing-run")
+        .json(&serde_json::json!({
+            "schema_version": "satelle.setup-repair-plan.v1",
+            "run_id": "expired-setup-run",
+            "probes": probes
+        }))
+        .send()
+        .await
+        .expect("inspect missing setup run");
+    let missing_status = missing.status();
+    let missing_body: Value = missing.json().await.expect("decode missing-run error");
+    assert_eq!(missing_status, StatusCode::NOT_FOUND, "{missing_body}");
+    assert_eq!(missing_body["code"], "setup-ledger-unavailable");
+    assert_eq!(missing_body["details"]["run_id"], "expired-setup-run");
+
+    running
+        .server
+        .shutdown()
+        .await
+        .expect("stop repair-plan server");
 }
 
 #[tokio::test]

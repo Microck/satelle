@@ -115,6 +115,7 @@ fn production_runtime_with_host_policy(
         Ok(state_root.join("logs")),
         adapter,
         RuntimeProviderPolicy::from_host_config(config),
+        crate::storage::DEFAULT_SETUP_LEDGER_RETENTION,
     )
 }
 

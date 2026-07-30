@@ -2258,6 +2258,60 @@ fn list_validated_migration_backups(
     Ok(validated)
 }
 
+pub(super) fn plan_migration_backup_cleanup(
+    state_root: &Path,
+) -> Result<Vec<String>, StorageError> {
+    let state_directory = prepare_state_root(state_root)?;
+    let validated = list_validated_migration_backups(state_root, &state_directory)?;
+    let delete_count = validated.len().saturating_sub(2);
+    Ok(validated
+        .into_iter()
+        .take(delete_count)
+        .map(|backup| backup.backup_file_name)
+        .collect())
+}
+
+pub(super) fn validate_migration_backup_for_restore(
+    state_root: &Path,
+    backup_file_name: &str,
+) -> Result<(), StorageError> {
+    let state_directory = prepare_state_root(state_root)?;
+    validate_migration_backup(state_root, &state_directory, backup_file_name).map(|_| ())
+}
+
+pub(super) fn restore_migration_backup_offline(
+    state_root: &Path,
+    backup_file_name: &str,
+) -> Result<RestoreActivation, StorageError> {
+    let state_directory = prepare_state_root(state_root)?;
+    let _ownership = acquire_ownership_lock(&state_directory)?;
+    let backup = validate_migration_backup(state_root, &state_directory, backup_file_name)?;
+    activate_migration_backup(state_root, &state_directory, &backup)
+}
+
+pub(super) fn cleanup_migration_backups_offline(
+    state_root: &Path,
+) -> Result<Vec<String>, StorageError> {
+    let state_directory = prepare_state_root(state_root)?;
+    let _ownership = acquire_ownership_lock(&state_directory)?;
+    cleanup_migration_backups(state_root, &state_directory)
+}
+
+pub(super) fn reset_store_metadata_offline(state_root: &Path) -> Result<Vec<String>, StorageError> {
+    let state_directory = prepare_state_root(state_root)?;
+    let _ownership = acquire_ownership_lock(&state_directory)?;
+    let mut removed = Vec::new();
+    for file_name in &PROTECTED_FILE_NAMES[2..] {
+        if state_directory.delete_private_leaf_durable(file_name)? {
+            removed.push((*file_name).to_string());
+        }
+    }
+    if state_directory.delete_private_leaf_durable(DATABASE_FILE_NAME)? {
+        removed.push(DATABASE_FILE_NAME.to_string());
+    }
+    Ok(removed)
+}
+
 fn tombstone_matches_token(key: &CleanupTombstoneKey, token: &RestorePointToken) -> bool {
     key.schema_version == token.schema_version
         && key.backup_id == token.backup_id

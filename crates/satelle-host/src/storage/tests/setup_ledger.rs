@@ -1065,6 +1065,7 @@ fn repair_waits_for_a_live_postcondition_before_retrying_outcome_unknown() {
     let unknown = storage
         .plan_setup_repair(
             setup_plan.desktop_binding(),
+            None,
             &[SetupRepairProbe::try_new(
                 "install-codex",
                 "Install Codex runtime",
@@ -1082,6 +1083,7 @@ fn repair_waits_for_a_live_postcondition_before_retrying_outcome_unknown() {
     let satisfied = storage
         .plan_setup_repair(
             setup_plan.desktop_binding(),
+            None,
             &[SetupRepairProbe::try_new(
                 "install-codex",
                 "Install Codex runtime",
@@ -1099,6 +1101,7 @@ fn repair_waits_for_a_live_postcondition_before_retrying_outcome_unknown() {
     let unsatisfied = storage
         .plan_setup_repair(
             setup_plan.desktop_binding(),
+            None,
             &[SetupRepairProbe::try_new(
                 "install-codex",
                 "Install Codex runtime",
@@ -1184,6 +1187,7 @@ fn repair_uses_the_durable_retry_safe_marker_for_incomplete_actions() {
     let repair = storage
         .plan_setup_repair(
             None,
+            None,
             &[
                 SetupRepairProbe::try_new(
                     "install-codex",
@@ -1224,6 +1228,7 @@ fn repair_replans_from_live_probes_when_ledger_history_is_missing() {
 
     let repair = storage
         .plan_setup_repair(
+            None,
             None,
             &[
                 SetupRepairProbe::try_new(
@@ -1299,12 +1304,12 @@ fn repair_blocks_automatic_retry_while_a_compatible_run_is_active() {
     .unwrap();
 
     let error = storage
-        .plan_setup_repair(Some(&active_binding), std::slice::from_ref(&probe))
+        .plan_setup_repair(Some(&active_binding), None, std::slice::from_ref(&probe))
         .expect_err("an active host mutation blocks repair planning");
     assert_eq!(StorageErrorKind::StateConflict, error.kind());
 
     let other_binding_plan = storage
-        .plan_setup_repair(Some(&other_binding), std::slice::from_ref(&probe))
+        .plan_setup_repair(Some(&other_binding), None, std::slice::from_ref(&probe))
         .expect("an active run for another binding does not block repair");
     assert_eq!(
         SetupRepairDecision::RetryAutomatically,
@@ -1321,7 +1326,7 @@ fn repair_blocks_automatic_retry_while_a_compatible_run_is_active() {
         )
         .unwrap();
     let other_version_plan = storage
-        .plan_setup_repair(Some(&active_binding), &[probe])
+        .plan_setup_repair(Some(&active_binding), None, &[probe])
         .expect("an active run from another version does not block repair");
     assert_eq!(
         SetupRepairDecision::RetryAutomatically,
@@ -1378,9 +1383,11 @@ fn beginning_repair_atomically_reserves_compatible_scope() {
 
     // Both callers can plan before either reserves the repair scope.
     storage
-        .plan_setup_repair(Some(&binding), std::slice::from_ref(&probe))
+        .plan_setup_repair(Some(&binding), None, std::slice::from_ref(&probe))
         .unwrap();
-    storage.plan_setup_repair(Some(&binding), &[probe]).unwrap();
+    storage
+        .plan_setup_repair(Some(&binding), None, &[probe])
+        .unwrap();
 
     let _first_capability = begin_setup_run(&mut storage, &first);
     let error = storage
@@ -1446,7 +1453,7 @@ fn repair_ignores_history_from_other_bindings_or_satelle_versions() {
     .unwrap();
 
     let other_binding = storage
-        .plan_setup_repair(Some(&current_binding), std::slice::from_ref(&probe))
+        .plan_setup_repair(Some(&current_binding), None, std::slice::from_ref(&probe))
         .unwrap();
     assert_eq!(
         SetupRepairDecision::RetryAutomatically,
@@ -1464,7 +1471,7 @@ fn repair_ignores_history_from_other_bindings_or_satelle_versions() {
         )
         .unwrap();
     let other_version = storage
-        .plan_setup_repair(Some(&current_binding), &[probe])
+        .plan_setup_repair(Some(&current_binding), None, &[probe])
         .unwrap();
     assert_eq!(
         SetupRepairDecision::RetryAutomatically,
@@ -1531,6 +1538,7 @@ fn repair_uses_each_actions_most_recent_retained_ledger_entry() {
     let repair = storage
         .plan_setup_repair(
             None,
+            None,
             &[SetupRepairProbe::try_new(
                 "install-codex",
                 "Install Codex runtime",
@@ -1548,6 +1556,32 @@ fn repair_uses_each_actions_most_recent_retained_ledger_entry() {
     assert_eq!(
         Some(SetupActionStatus::Completed),
         repair.actions()[0].previous_status()
+    );
+
+    let selected_run = storage
+        .load_setup_run("setup-run-1")
+        .unwrap()
+        .expect("selected setup run remains retained");
+    let selected_repair = storage
+        .plan_setup_repair(
+            None,
+            Some(&selected_run),
+            &[SetupRepairProbe::try_new(
+                "install-codex",
+                "Install Codex runtime",
+                true,
+                SetupRepairPostcondition::Unsatisfied,
+            )
+            .unwrap()],
+        )
+        .unwrap();
+    assert_eq!(
+        Some("setup-run-1"),
+        selected_repair.actions()[0].previous_run_id()
+    );
+    assert_eq!(
+        Some(SetupActionStatus::Failed),
+        selected_repair.actions()[0].previous_status()
     );
 }
 
