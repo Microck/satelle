@@ -2444,6 +2444,23 @@ struct ParsedUserConfig {
 }
 
 #[cfg(test)]
+mod presentation_output_config_tests {
+    use super::*;
+
+    #[test]
+    fn user_config_accepts_output_format() {
+        let parsed =
+            parse_user_config(Path::new("/test/config.toml"), "output_format = \"json\"\n")
+                .expect("parse the user-owned presentation default");
+
+        assert_eq!(
+            parsed.config.output_format,
+            Some(PresentationOutputFormat::Json)
+        );
+    }
+}
+
+#[cfg(test)]
 mod api_rate_limit_config_tests {
     use super::*;
 
@@ -3569,6 +3586,7 @@ fn reject_unknown_user_config_keys(path: &Path, value: &toml::Value) -> Result<(
             "default_host",
             "model_alias",
             "provider_alias",
+            "output_format",
             "experimental_provider_computer_use",
             "experimental_provider_computer_use_by_provider",
             "yolo",
