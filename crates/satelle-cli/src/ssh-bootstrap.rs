@@ -3347,13 +3347,13 @@ fn parse_launchd_path_overrides(output: &[u8]) -> Result<DaemonPathOverrides, Ss
         "<key>Label</key><string>dev.microck.satelle.host</string>",
         "<key>ProgramArguments</key><array><string>",
     );
-    const ARGUMENTS: &str = concat!(
+    const ARGUMENTS_PREFIX: &str = concat!(
         "</string><string>host</string><string>start</string>",
         "<string>--foreground</string><string>--launchd-service</string>",
-        "<string>--bind</string>",
-        "<string>127.0.0.1:3001</string></array>",
-        "<key>EnvironmentVariables</key><dict>",
+        "<string>--bind</string><string>",
     );
+    const ENVIRONMENT_PREFIX: &str =
+        concat!("</string></array>", "<key>EnvironmentVariables</key><dict>",);
     const SUFFIX: &str = concat!(
         "</dict><key>RunAtLoad</key><true/><key>KeepAlive</key><true/>",
         "</dict></plist>",
@@ -3364,10 +3364,19 @@ fn parse_launchd_path_overrides(output: &[u8]) -> Result<DaemonPathOverrides, Ss
         .strip_prefix(PREFIX)
         .ok_or(SshBootstrapError::InvalidServiceObservation)?;
     let (binary, body) = body
-        .split_once(ARGUMENTS)
+        .split_once(ARGUMENTS_PREFIX)
         .ok_or(SshBootstrapError::InvalidServiceObservation)?;
     let binary = decode_plist_text(binary)?;
     if !target_path_is_absolute(RemoteTarget::DarwinArm64, &binary) {
+        return Err(SshBootstrapError::InvalidServiceObservation);
+    }
+    let (bind, body) = body
+        .split_once(ENVIRONMENT_PREFIX)
+        .ok_or(SshBootstrapError::InvalidServiceObservation)?;
+    let bind = decode_plist_text(bind)?
+        .parse::<SocketAddr>()
+        .map_err(|_| SshBootstrapError::InvalidServiceObservation)?;
+    if !bind.ip().is_loopback() {
         return Err(SshBootstrapError::InvalidServiceObservation);
     }
     let environment = body
@@ -5385,7 +5394,7 @@ mod tests {
         };
         let plist = satelle_core::daemon_service::render_launchd_user_plist(
             Path::new("/Users/operator/Applications/Satelle & Host/satelle"),
-            "127.0.0.1:3001",
+            "127.0.0.1:4001",
             &overrides,
         )
         .expect("valid launchd plist");
@@ -5402,7 +5411,7 @@ mod tests {
             parse_service_path_overrides(RemoteTarget::DarwinArm64, unknown_key.as_bytes())
                 .is_err()
         );
-        let wrong_bind = plist.replace("127.0.0.1:3001", "127.0.0.1:3002");
+        let wrong_bind = plist.replace("127.0.0.1:4001", "0.0.0.0:4001");
         assert!(
             parse_service_path_overrides(RemoteTarget::DarwinArm64, wrong_bind.as_bytes()).is_err()
         );

@@ -1769,6 +1769,7 @@ pub struct SatellePathSet {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct SatellePathSources {
     pub config_file: PathSource,
     pub cache_root: PathSource,

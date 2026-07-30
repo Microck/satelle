@@ -635,6 +635,24 @@ mod tests {
             })
         );
 
+        let mut response_with_nested_path_field =
+            serde_json::to_value(&response).expect("serialize Host Path Set response");
+        response_with_nested_path_field["paths"]["daemon_private_path"] =
+            serde_json::json!("/daemon/private");
+        assert!(
+            serde_json::from_value::<HostPathsResponse>(response_with_nested_path_field).is_err(),
+            "the remote response must reject unknown nested path fields"
+        );
+
+        let mut response_with_nested_source_field =
+            serde_json::to_value(&response).expect("serialize Host Path Set response");
+        response_with_nested_source_field["paths"]["sources"]["daemon_private_path"] =
+            serde_json::json!("service_config");
+        assert!(
+            serde_json::from_value::<HostPathsResponse>(response_with_nested_source_field).is_err(),
+            "the remote response must reject unknown nested source fields"
+        );
+
         let response_with_controller_path = serde_json::json!({
             "schema_version": "satelle.host.paths.v1",
             "request_id": RequestId::new(),

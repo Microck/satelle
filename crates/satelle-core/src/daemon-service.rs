@@ -154,6 +154,7 @@ impl PersistentServiceDecision {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct DaemonResolvedPathSet {
     pub config_file: String,
     pub cache_root: String,
