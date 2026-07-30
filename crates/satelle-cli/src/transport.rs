@@ -2822,9 +2822,13 @@ fn inspect_host_maintenance(
                     )?;
                     let artifact = if needs_host_artifact {
                         match target {
-                            Some(target) => {
-                                verified_host_update_artifact(relation_to_cli, target, None, None)?
-                            }
+                            Some(target) => verified_host_update_artifact(
+                                &host.alias,
+                                host_release_artifact_required(relation_to_cli),
+                                target,
+                                None,
+                                None,
+                            )?,
                             None => None,
                         }
                     } else {
@@ -2846,10 +2850,14 @@ fn inspect_host_maintenance(
                     })
                 }
                 DirectMaintenanceCapabilities::ProtocolIncompatible { current_version } => {
-                    let relation_to_cli =
-                        host_version_relation(Some(&current_version), false, None, cli_version)?;
+                    let relation_to_cli = host_version_relation(
+                        current_version.as_deref(),
+                        false,
+                        None,
+                        cli_version,
+                    )?;
                     Ok(HostMaintenanceInspection {
-                        current_version: Some(current_version),
+                        current_version,
                         minimum_host_version: None,
                         protocol_compatible: false,
                         relation_to_cli,
@@ -2876,11 +2884,60 @@ fn inspect_host_maintenance(
                 current.minimum_host_version.as_deref(),
                 cli_version,
             )?;
-            let needs_host_release_artifact =
-                needs_host_artifact && host_release_artifact_required(relation_to_cli);
             let remote_directories = needs_host_artifact
                 .then(|| transport.remote_directories(target))
                 .transpose()?;
+            let service_inspection = if needs_host_artifact
+                && host.config.setup_mode == Some(satelle_core::SetupMode::Persistent)
+            {
+                let directories = remote_directories
+                    .as_ref()
+                    .expect("persistent Host inspection requests Host artifact metadata");
+                let host_id = transport.binding.expected_host_identity().as_str();
+                let service_path = directories.persistent_service_asset_path(host_id);
+                match service_path {
+                    Some(destination) => directories
+                        .probe_managed_service_executable(
+                            transport.binding.destination(),
+                            &destination,
+                            host_id,
+                        )
+                        .map_err(|error| map_ssh_daemon_bootstrap_error(&transport.alias, error))?
+                        .map(|executable| {
+                            let current_version =
+                                ssh_bootstrap::managed_service_executable_version(
+                                    target,
+                                    &executable,
+                                )
+                                .ok_or_else(|| {
+                                    map_ssh_daemon_bootstrap_error(
+                                        &transport.alias,
+                                        ssh_bootstrap::SshBootstrapError::InvalidServiceObservation,
+                                    )
+                                })?;
+                            let relation_to_cli = host_version_relation(
+                                Some(&current_version),
+                                true,
+                                None,
+                                cli_version,
+                            )?;
+                            Ok::<_, SatelleError>(crate::host_update::HostUpdateServiceInspection {
+                                current_version: Some(current_version),
+                                relation_to_cli,
+                                destination,
+                            })
+                        })
+                        .transpose()?,
+                    None => None,
+                }
+            } else {
+                None
+            };
+            let needs_host_release_artifact = needs_host_artifact
+                && (host_release_artifact_required(relation_to_cli)
+                    || service_inspection.as_ref().is_some_and(|service| {
+                        host_release_artifact_required(service.relation_to_cli)
+                    }));
             let release_artifact = needs_host_release_artifact
                 .then(|| transport.release_artifact(target))
                 .transpose()?;
@@ -2894,44 +2951,12 @@ fn inspect_host_maintenance(
             };
             let artifact = if needs_host_artifact {
                 verified_host_update_artifact(
-                    relation_to_cli,
+                    &host.alias,
+                    needs_host_release_artifact,
                     target,
                     install_path,
                     release_artifact,
                 )?
-            } else {
-                None
-            };
-            let service_inspection = if needs_host_artifact
-                && host.config.setup_mode == Some(satelle_core::SetupMode::Persistent)
-            {
-                let directories = remote_directories
-                    .as_ref()
-                    .expect("persistent Host inspection requests Host artifact metadata");
-                let service_path = directories.persistent_service_asset_path(
-                    transport.binding.expected_host_identity().as_str(),
-                );
-                match service_path {
-                    Some(destination)
-                        if directories
-                            .probe_managed_service_asset(
-                                transport.binding.destination(),
-                                &destination,
-                            )
-                            .map_err(|error| {
-                                map_ssh_daemon_bootstrap_error(&transport.alias, error)
-                            })? =>
-                    {
-                        Some(crate::host_update::HostUpdateServiceInspection {
-                            // The task or launchd definition proves ownership
-                            // but does not carry an independent asset version.
-                            current_version: None,
-                            relation_to_cli,
-                            destination,
-                        })
-                    }
-                    Some(_) | None => None,
-                }
             } else {
                 None
             };
@@ -2952,7 +2977,7 @@ fn inspect_host_maintenance(
 
 enum DirectMaintenanceCapabilities {
     Compatible(Box<satelle_transport::CapabilitiesResponse>),
-    ProtocolIncompatible { current_version: String },
+    ProtocolIncompatible { current_version: Option<String> },
 }
 
 fn classify_direct_maintenance_capabilities(
@@ -2977,7 +3002,14 @@ fn classify_direct_maintenance_capabilities(
                         None,
                     )
                 })?;
-            Ok(DirectMaintenanceCapabilities::ProtocolIncompatible { current_version })
+            Ok(DirectMaintenanceCapabilities::ProtocolIncompatible {
+                current_version: Some(current_version),
+            })
+        }
+        Err(DaemonClientError::CapabilitiesProtocolMismatch) => {
+            Ok(DirectMaintenanceCapabilities::ProtocolIncompatible {
+                current_version: None,
+            })
         }
         Err(error) => Err(direct_transport_error(host, error)),
     }
@@ -3175,28 +3207,33 @@ fn canonical_remote_platform(
 }
 
 fn verified_host_update_artifact(
-    relation: crate::host_update::HostVersionRelation,
+    host: &str,
+    required: bool,
     target: ssh_bootstrap::RemoteTarget,
     install_path: Option<String>,
     known_metadata: Option<ssh_bootstrap::ReleaseArtifactMetadata>,
 ) -> Result<Option<crate::host_update::VerifiedHostArtifact>, SatelleError> {
-    if !host_release_artifact_required(relation) {
+    if !required {
         return Ok(None);
     }
-    let metadata = match known_metadata {
-        Some(metadata) => metadata,
-        None => match ssh_bootstrap::ReleaseArtifactMetadata::fetch(target) {
-            Ok(metadata) => metadata,
-            Err(ssh_bootstrap::SshBootstrapError::MissingIntegrityEntry) => return Ok(None),
-            Err(error) => return Err(map_ssh_daemon_bootstrap_error("release", error)),
-        },
-    };
+    let metadata =
+        known_metadata.map_or_else(|| ssh_bootstrap::ReleaseArtifactMetadata::fetch(target), Ok);
+    verified_host_update_artifact_from_metadata(host, target, install_path, metadata).map(Some)
+}
+
+fn verified_host_update_artifact_from_metadata(
+    host: &str,
+    target: ssh_bootstrap::RemoteTarget,
+    install_path: Option<String>,
+    metadata: Result<ssh_bootstrap::ReleaseArtifactMetadata, ssh_bootstrap::SshBootstrapError>,
+) -> Result<crate::host_update::VerifiedHostArtifact, SatelleError> {
+    let metadata = metadata.map_err(|error| map_release_artifact_error(host, target, error))?;
     let _verified_digest = metadata.digest();
-    Ok(Some(crate::host_update::VerifiedHostArtifact {
+    Ok(crate::host_update::VerifiedHostArtifact {
         version: env!("CARGO_PKG_VERSION").to_string(),
         remote_platform: target.id().to_string(),
         daemon_destination: install_path,
-    }))
+    })
 }
 
 fn unavailable_codex_update_evidence() -> satelle_core::host_update::CodexUpdateEvidence {
@@ -6465,6 +6502,31 @@ mod bootstrap_ordering_tests {
     }
 
     #[test]
+    fn host_update_metadata_failures_keep_the_typed_error_and_real_host_alias() {
+        let missing = verified_host_update_artifact_from_metadata(
+            "office",
+            ssh_bootstrap::RemoteTarget::DarwinArm64,
+            None,
+            Err(ssh_bootstrap::SshBootstrapError::MissingIntegrityEntry),
+        )
+        .expect_err("missing integrity metadata must block the update plan");
+        assert_eq!(
+            missing.code,
+            satelle_core::ErrorCode::HostArtifactUnavailable
+        );
+
+        let unreachable = verified_host_update_artifact_from_metadata(
+            "office",
+            ssh_bootstrap::RemoteTarget::DarwinArm64,
+            None,
+            Err(ssh_bootstrap::SshBootstrapError::InvalidServiceObservation),
+        )
+        .expect_err("release metadata transport failures must retain the Host alias");
+        assert_eq!(unreachable.code, satelle_core::ErrorCode::HostUnreachable);
+        assert_eq!(unreachable.details["host"], serde_json::json!("office"));
+    }
+
+    #[test]
     fn only_missing_or_older_hosts_require_release_artifact_metadata() {
         use crate::host_update::HostVersionRelation;
 
@@ -6486,7 +6548,8 @@ mod bootstrap_ordering_tests {
     #[test]
     fn current_host_artifact_resolution_does_not_fetch_release_metadata() {
         let artifact = verified_host_update_artifact(
-            crate::host_update::HostVersionRelation::MatchesCli,
+            "remote",
+            false,
             ssh_bootstrap::RemoteTarget::LinuxX64Gnu,
             None,
             None,

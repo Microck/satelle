@@ -4199,10 +4199,15 @@ fn run_repair(
         if !format.is_json() {
             print!("{}", host_update::render_repair_upgrade_plan(&report));
         }
-        return Err(failure(SatelleError::not_implemented(concat!(
+        let mut error = SatelleError::not_implemented(concat!(
             "repair upgrade apply belongs to the repair execution train. The plan was read-only; ",
             "no Host state or Satelle sessions were changed."
-        ))));
+        ));
+        error.recovery_command = Some(format!(
+            "satelle repair --host {} --dry-run --json",
+            host.alias
+        ));
+        return Err(failure(error));
     }
 
     if format.is_json() {

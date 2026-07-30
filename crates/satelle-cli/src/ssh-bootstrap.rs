@@ -3569,6 +3569,23 @@ fn same_windows_path_text(left: &str, right: &str) -> bool {
     normalize(left) == normalize(right)
 }
 
+pub(super) fn managed_service_executable_version(
+    target: RemoteTarget,
+    executable: &str,
+) -> Option<String> {
+    let components = executable
+        .split(['/', '\\'])
+        .filter(|component| !component.is_empty())
+        .collect::<Vec<_>>();
+    components.windows(2).find_map(|pair| {
+        (pair[1] == target.id())
+            .then(|| pair[0].strip_prefix('v'))
+            .flatten()
+            .filter(|version| !version.is_empty())
+            .map(str::to_string)
+    })
+}
+
 impl RemoteUserDirectories {
     pub(super) fn probe(
         destination: &str,
@@ -3655,31 +3672,59 @@ impl RemoteUserDirectories {
         }
     }
 
-    pub(super) fn probe_managed_service_asset(
+    pub(super) fn probe_managed_service_executable(
         &self,
         destination: &str,
         path: &str,
-    ) -> Result<bool, SshBootstrapError> {
-        self.probe_managed_service_asset_with_program(OsStr::new("ssh"), destination, path)
+        host_id: &str,
+    ) -> Result<Option<String>, SshBootstrapError> {
+        self.probe_managed_service_executable_with_program(
+            OsStr::new("ssh"),
+            destination,
+            path,
+            host_id,
+        )
     }
 
     #[cfg(all(test, unix))]
-    pub(super) fn probe_managed_service_asset_for_tests(
+    pub(super) fn probe_managed_service_executable_for_tests(
         &self,
         ssh_program: &Path,
         destination: &str,
         path: &str,
-    ) -> Result<bool, SshBootstrapError> {
-        self.probe_managed_service_asset_with_program(ssh_program.as_os_str(), destination, path)
+        host_id: &str,
+    ) -> Result<Option<String>, SshBootstrapError> {
+        self.probe_managed_service_executable_with_program(
+            ssh_program.as_os_str(),
+            destination,
+            path,
+            host_id,
+        )
     }
 
-    fn probe_managed_service_asset_with_program(
+    fn probe_managed_service_executable_with_program(
         &self,
         ssh_program: &OsStr,
         destination: &str,
         path: &str,
-    ) -> Result<bool, SshBootstrapError> {
+        host_id: &str,
+    ) -> Result<Option<String>, SshBootstrapError> {
+        if host_id.is_empty()
+            || !host_id
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+        {
+            return Err(SshBootstrapError::InvalidServiceObservation);
+        }
         let command = if self.target.is_windows() {
+            let task_name = format!("Host-{host_id}");
+            let service_config_argument = if path.contains([' ', '\t', '"']) {
+                format!("\"{}\"", path.replace('"', "\\\""))
+            } else {
+                path.to_string()
+            };
+            let expected_arguments =
+                format!("host start --service-config {service_config_argument}");
             let script = format!(
                 concat!(
                     "$ErrorActionPreference='Stop'; $path={path}; ",
@@ -3689,10 +3734,22 @@ impl RemoteUserDirectories {
                     "if (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0 -or ",
                     "$item.Length -gt 65536) {{ exit 75 }}; ",
                     "$config=Get-Content -LiteralPath $path -Raw | ConvertFrom-Json; ",
-                    "if ($config.schema -ceq 'satelle.host-service.v1') {{ ",
-                    "[Console]::Out.Write('managed') }} else {{ [Console]::Out.Write('absent') }}"
+                    "$task=Get-ScheduledTask -TaskPath '\\Satelle\\' -TaskName {task_name} ",
+                    "-ErrorAction SilentlyContinue; ",
+                    "if ($config.schema -cne 'satelle.host-service.v1' -or $null -eq $task) {{ ",
+                    "[Console]::Out.Write('absent'); exit 0 }}; ",
+                    "[xml]$xml=Export-ScheduledTask -TaskPath '\\Satelle\\' -TaskName {task_name}; ",
+                    "$root=$xml.Task; ",
+                    "if (@($root.Actions.Exec).Count -ne 1 -or ",
+                    "$root.Actions.Exec.Arguments -cne {expected_arguments}) {{ ",
+                    "[Console]::Out.Write('absent'); exit 0 }}; ",
+                    "$executable=[string]$root.Actions.Exec.Command; ",
+                    "if ([String]::IsNullOrWhiteSpace($executable)) {{ exit 75 }}; ",
+                    "[Console]::Out.WriteLine('managed'); [Console]::Out.Write($executable)"
                 ),
                 path = powershell_quote(path),
+                task_name = powershell_quote(&task_name),
+                expected_arguments = powershell_quote(&expected_arguments),
             );
             powershell_encoded_command(&script)
         } else {
@@ -3704,7 +3761,9 @@ impl RemoteUserDirectories {
                     "[ \"$(wc -c < \"$path\")\" -le 65536 ] || exit 75; ",
                     "grep -Fq '<string>dev.microck.satelle.host</string>' \"$path\" && ",
                     "grep -Fq '<string>--foreground</string>' \"$path\" && ",
-                    "printf managed || printf absent"
+                    "{{ printf 'managed\\n'; ",
+                    "/usr/bin/plutil -extract ProgramArguments.0 raw -o - \"$path\"; }} || ",
+                    "printf absent"
                 ),
                 path = posix_quote(path),
             );
@@ -3717,9 +3776,12 @@ impl RemoteUserDirectories {
         let observation = std::str::from_utf8(&output.stdout)
             .map_err(|_| SshBootstrapError::InvalidServiceObservation)?
             .trim();
-        match observation {
-            "managed" => Ok(true),
-            "absent" => Ok(false),
+        let mut lines = observation.lines();
+        match (lines.next(), lines.next(), lines.next()) {
+            (Some("absent"), None, None) => Ok(None),
+            (Some("managed"), Some(executable), None) if !executable.is_empty() => {
+                Ok(Some(executable.to_string()))
+            }
             _ => Err(SshBootstrapError::InvalidServiceObservation),
         }
     }
@@ -5168,7 +5230,11 @@ mod tests {
         fs::write(
             &fake_ssh,
             format!(
-                "#!/bin/sh\nprintf '%s\\n' \"$@\" > {}\nprintf managed\n",
+                concat!(
+                    "#!/bin/sh\nprintf '%s\\n' \"$@\" > {}\n",
+                    "printf 'managed\\n/Users/operator/Library/Caches/Satelle/",
+                    "host/v0.1.0/darwin-arm64/satelle\\n'\n"
+                ),
                 posix_quote(audit_log.to_str().expect("UTF-8 audit path")),
             ),
         )
@@ -5184,17 +5250,20 @@ mod tests {
             service_path,
             "/Users/operator/Library/LaunchAgents/dev.microck.satelle.host.plist"
         );
-        assert!(
+        assert_eq!(
             directories
-                .probe_managed_service_asset_for_tests(
+                .probe_managed_service_executable_for_tests(
                     &fake_ssh,
                     "operator@example",
                     &service_path,
+                    "host-123",
                 )
                 .expect("run audited read-only service probe")
+                .as_deref(),
+            Some("/Users/operator/Library/Caches/Satelle/host/v0.1.0/darwin-arm64/satelle")
         );
 
-        let invocation = fs::read_to_string(audit_log).expect("read fake SSH audit");
+        let invocation = fs::read_to_string(&audit_log).expect("read fake SSH audit");
         assert!(invocation.contains("grep -Fq"));
         for mutation in [
             "Set-Content",
@@ -5210,6 +5279,73 @@ mod tests {
                 "service probe attempted mutation command {mutation}: {invocation}"
             );
         }
+
+        fs::write(
+            &fake_ssh,
+            format!(
+                concat!(
+                    "#!/bin/sh\nprintf '%s\\n' \"$@\" > {}\n",
+                    "printf 'managed\\nC:\\\\Users\\\\operator\\\\AppData\\\\Local\\\\Satelle\\\\",
+                    "host\\\\v0.1.0\\\\win32-x64-msvc\\\\satelle.exe\\n'\n"
+                ),
+                posix_quote(audit_log.to_str().expect("UTF-8 audit path")),
+            ),
+        )
+        .expect("replace fake SSH response");
+        let windows = RemoteUserDirectories::for_tests(RemoteTarget::WindowsX64Msvc);
+        let windows_service_path = windows
+            .persistent_service_asset_path("host-123")
+            .expect("Windows has a managed service asset path");
+        assert_eq!(
+            windows
+                .probe_managed_service_executable_for_tests(
+                    &fake_ssh,
+                    "operator@example",
+                    &windows_service_path,
+                    "host-123",
+                )
+                .expect("run audited Windows service probe")
+                .as_deref(),
+            Some(r"C:\Users\operator\AppData\Local\Satelle\host\v0.1.0\win32-x64-msvc\satelle.exe")
+        );
+        let invocation = fs::read_to_string(audit_log).expect("read Windows fake SSH audit");
+        let command = invocation
+            .lines()
+            .last()
+            .expect("SSH invocation contains a remote command");
+        let script = decode_powershell_command(command).expect("decode service probe");
+        assert!(script.contains("Get-ScheduledTask"));
+        assert!(script.contains("Export-ScheduledTask"));
+        assert!(script.contains(r"Host-host-123"));
+        assert!(script.contains("host start --service-config"));
+        for mutation in [
+            "Set-Content",
+            "Register-ScheduledTask",
+            "Start-ScheduledTask",
+        ] {
+            assert!(
+                !script.contains(mutation),
+                "Windows service probe attempted mutation command {mutation}: {script}"
+            );
+        }
+    }
+
+    #[test]
+    fn managed_service_version_comes_from_its_executable_target() {
+        assert_eq!(
+            managed_service_executable_version(
+                RemoteTarget::DarwinArm64,
+                "/Users/operator/Library/Caches/Satelle/host/v0.0.9/darwin-arm64/satelle",
+            ),
+            Some("0.0.9".to_string())
+        );
+        assert_eq!(
+            managed_service_executable_version(
+                RemoteTarget::WindowsX64Msvc,
+                r"C:\Users\operator\AppData\Local\Satelle\host\v0.0.8\win32-x64-msvc\satelle.exe",
+            ),
+            Some("0.0.8".to_string())
+        );
     }
 
     #[test]

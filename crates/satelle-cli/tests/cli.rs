@@ -3653,6 +3653,10 @@ fn unavailable_json_repair_apply_emits_only_the_terminal_error() {
     let error = parse_json_output(&output.stderr);
     assert_eq!(error["schema_version"], "satelle.error.v1");
     assert_eq!(error["code"], "not-implemented");
+    assert_eq!(
+        error["suggested_commands"],
+        serde_json::json!(["satelle repair --host local-demo --dry-run --json"])
+    );
 }
 
 #[test]

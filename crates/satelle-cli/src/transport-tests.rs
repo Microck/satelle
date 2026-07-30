@@ -3732,7 +3732,22 @@ fn authenticated_direct_protocol_mismatch_retains_daemon_version_for_maintenance
     else {
         panic!("expected retained protocol mismatch evidence");
     };
-    assert_eq!(current_version, "0.0.9");
+    assert_eq!(current_version.as_deref(), Some("0.0.9"));
+}
+
+#[test]
+fn header_direct_protocol_mismatch_remains_a_maintenance_observation() {
+    let observation = classify_direct_maintenance_capabilities(
+        "direct-test",
+        Err(DaemonClientError::CapabilitiesProtocolMismatch),
+    )
+    .expect("classify the authenticated header protocol mismatch");
+
+    let DirectMaintenanceCapabilities::ProtocolIncompatible { current_version } = observation
+    else {
+        panic!("expected protocol-incompatible maintenance evidence");
+    };
+    assert_eq!(current_version, None);
 }
 
 #[test]
