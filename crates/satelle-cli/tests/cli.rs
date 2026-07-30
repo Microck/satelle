@@ -6811,7 +6811,6 @@ desktop_user = "another-user"
 fn future_cli_surfaces_parse_and_return_typed_not_implemented() {
     let state = state_dir();
     for args in [
-        vec!["repair", "--host", "local-demo", "--dry-run", "--json"],
         vec![
             "host",
             "storage",

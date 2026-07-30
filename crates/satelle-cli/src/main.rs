@@ -1084,7 +1084,7 @@ fn execute_command(
     match command {
         Command::Completions(command) => run_completions(command).map_err(failure).map(|_| None),
         Command::Setup(command) => run_setup(command, human_style, config, output).map(|_| None),
-        Command::Repair(command) => run_repair(command).map(|_| None),
+        Command::Repair(command) => run_repair(command, config, output).map(|_| None),
         Command::Doctor(command) => run_doctor(command, config, output).map(|_| None),
         Command::Config { command } => run_config(command, config, output).map(|_| None),
         Command::Paths(command) => show_paths(command, output).map(|_| None),
@@ -4071,16 +4071,39 @@ fn shell_argument(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\"'\"'"))
 }
 
-fn run_repair(command: RepairCommand) -> Result<(), CliFailure> {
+fn run_repair(
+    command: RepairCommand,
+    config: ConfigContext<'_>,
+    format: OutputFormat,
+) -> Result<(), CliFailure> {
     if command.no_input && !command.dry_run && !command.yes {
         return Err(failure(SatelleError::input_required(
             "repair needs --yes when --no-input is used for mutations",
         )));
     }
 
-    Err(failure(SatelleError::not_implemented(format!(
-        "repair planning is not implemented yet for host {}",
-        command.host.as_deref().unwrap_or(LOCAL_DEMO_HOST)
+    let host = config.resolve_host(Some(command.host.as_deref().unwrap_or(LOCAL_DEMO_HOST)))?;
+    let report = transport::plan_repair_upgrades(&host).map_err(failure)?;
+    if format.is_json() {
+        print_json(&report).map_err(failure)?;
+    } else {
+        print!("{}", host_update::render_repair_upgrade_plan(&report));
+    }
+    if command.dry_run
+        || report.actions.iter().all(|action| {
+            matches!(
+                action.disposition,
+                satelle_core::host_update::RepairUpgradeDisposition::NotNeeded
+                    | satelle_core::host_update::RepairUpgradeDisposition::RecommendHostUpdate
+            )
+        })
+    {
+        return Ok(());
+    }
+
+    Err(failure(SatelleError::not_implemented(concat!(
+        "repair upgrade apply belongs to the repair execution train. The complete plan above ",
+        "was read-only; no Host state or Satelle sessions were changed."
     ))))
 }
 

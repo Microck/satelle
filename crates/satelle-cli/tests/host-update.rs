@@ -57,3 +57,48 @@ fn host_update_has_no_arbitrary_version_or_channel_flags() {
             .failure();
     }
 }
+
+#[test]
+fn repair_dry_run_uses_live_typed_upgrade_evidence() {
+    let state = tempfile::tempdir().expect("temporary repair state");
+    let output = satelle()
+        .env("SATELLE_STATE_DIR", state.path())
+        .args(["repair", "--host", "local-demo", "--dry-run", "--json"])
+        .output()
+        .expect("run repair dry-run");
+
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report: Value = serde_json::from_slice(&output.stdout).expect("parse repair report");
+    assert_eq!(report["schema_version"], "satelle.repair.v1");
+    assert_eq!(report["host"], "local-demo");
+    assert_eq!(report["ledger_status"], "unavailable");
+    assert_eq!(report["plan_source"], "live_probes");
+    let actions = report["actions"]
+        .as_array()
+        .expect("repair report has typed actions");
+    assert_eq!(actions.len(), 3);
+    assert!(actions.iter().all(|action| {
+        action["target"].is_string()
+            && (action["current_version"].is_string() || action["current_version"].is_null())
+            && action["target_version"].is_string()
+            && action["version_source"].is_string()
+            && action["disposition"].is_string()
+    }));
+    let runtime = actions
+        .iter()
+        .find(|action| action["target"] == "codex_runtime")
+        .expect("repair report includes the Codex runtime");
+    assert_eq!(runtime["version_source"], "codex_compatibility_requirement");
+    assert_eq!(
+        runtime["disposition"],
+        if runtime["compatibility_reason"].is_null() {
+            "not_needed"
+        } else {
+            "manual_action_required"
+        }
+    );
+}

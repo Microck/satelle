@@ -47,8 +47,9 @@ pub(crate) use setup::{
 pub(crate) const PROTOCOL_VERSION_HEADER: &str = "satelle-protocol-version";
 // Protocol v11 hard-cuts the plaintext provider-secret upload in favor of the
 // Host-bound HPKE preview/envelope v2 contract. It also carries setup
-// verification, native-readiness invalidation, and capabilities v5. Exact
-// negotiation rejects v10 peers rather than preserving the old carrier.
+// verification and native-readiness invalidation. Capabilities v6 adds
+// maintenance evidence while the client still decodes exact v5 responses for
+// the narrow older-Host update handshake.
 pub(crate) const PROTOCOL_VERSION: &str = "11";
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer};

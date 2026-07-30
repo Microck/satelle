@@ -43,6 +43,7 @@ pub enum HostUpdateRestartImpact {
 #[serde(rename_all = "snake_case")]
 pub enum HostUpdateVersionSource {
     InvokingCliRelease,
+    HostCompatibilityRequirement,
     CodexCompatibilityRequirement,
 }
 
@@ -57,12 +58,15 @@ pub enum CodexComponentOwnership {
 /// not cross this boundary.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct CodexUpdateEvidence {
-    pub ownership: CodexComponentOwnership,
+    pub runtime_ownership: CodexComponentOwnership,
+    pub native_component_ownership: CodexComponentOwnership,
     pub runtime_current_version: Option<String>,
     pub native_component_current_version: Option<String>,
     pub required_version: String,
     pub runtime_update_required: bool,
     pub native_update_required: bool,
+    pub runtime_compatibility_reason: Option<RepairCompatibilityReason>,
+    pub native_component_compatibility_reason: Option<RepairCompatibilityReason>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -114,7 +118,8 @@ impl HostUpdateReport {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum RepairCompatibilityReason {
     Missing,
     Corrupted,
@@ -124,10 +129,60 @@ pub enum RepairCompatibilityReason {
     NativeReadinessBlocked,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum RepairUpgradeDisposition {
     NotNeeded,
     Required,
     ManualActionRequired,
     RecommendHostUpdate,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub enum RepairUpgradeSchemaVersion {
+    #[serde(rename = "satelle.repair.v1")]
+    V1,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RepairLedgerStatus {
+    Unavailable,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RepairPlanSource {
+    LiveProbes,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct RepairUpgradeAction {
+    pub target: HostUpdateTarget,
+    pub current_version: Option<String>,
+    pub target_version: String,
+    pub compatibility_reason: Option<RepairCompatibilityReason>,
+    pub version_source: HostUpdateVersionSource,
+    pub disposition: RepairUpgradeDisposition,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct RepairUpgradeReport {
+    pub schema_version: RepairUpgradeSchemaVersion,
+    pub host: String,
+    pub ledger_status: RepairLedgerStatus,
+    pub plan_source: RepairPlanSource,
+    pub actions: Vec<RepairUpgradeAction>,
+}
+
+impl RepairUpgradeReport {
+    pub fn new(host: impl Into<String>, actions: Vec<RepairUpgradeAction>) -> Self {
+        Self {
+            schema_version: RepairUpgradeSchemaVersion::V1,
+            host: host.into(),
+            ledger_status: RepairLedgerStatus::Unavailable,
+            plan_source: RepairPlanSource::LiveProbes,
+            actions,
+        }
+    }
 }

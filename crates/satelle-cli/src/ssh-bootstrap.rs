@@ -3618,6 +3618,102 @@ impl RemoteUserDirectories {
         &self.authenticated_user
     }
 
+    pub(super) fn persistent_service_asset_path(&self, host_id: &str) -> Option<String> {
+        if host_id.is_empty()
+            || !host_id
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+        {
+            return None;
+        }
+        match self.target.service_platform() {
+            satelle_core::daemon_service::DaemonServicePlatform::Windows => {
+                self.local_app_data.as_deref().map(|local_app_data| {
+                    join_target_path(
+                        self.target,
+                        local_app_data,
+                        &format!("Satelle/service/{host_id}.json"),
+                    )
+                })
+            }
+            satelle_core::daemon_service::DaemonServicePlatform::Macos => Some(join_target_path(
+                self.target,
+                &self.home,
+                "Library/LaunchAgents/dev.microck.satelle.host.plist",
+            )),
+            satelle_core::daemon_service::DaemonServicePlatform::Linux => None,
+        }
+    }
+
+    pub(super) fn probe_managed_service_asset(
+        &self,
+        destination: &str,
+        path: &str,
+    ) -> Result<bool, SshBootstrapError> {
+        self.probe_managed_service_asset_with_program(OsStr::new("ssh"), destination, path)
+    }
+
+    #[cfg(test)]
+    pub(super) fn probe_managed_service_asset_for_tests(
+        &self,
+        ssh_program: &Path,
+        destination: &str,
+        path: &str,
+    ) -> Result<bool, SshBootstrapError> {
+        self.probe_managed_service_asset_with_program(ssh_program.as_os_str(), destination, path)
+    }
+
+    fn probe_managed_service_asset_with_program(
+        &self,
+        ssh_program: &OsStr,
+        destination: &str,
+        path: &str,
+    ) -> Result<bool, SshBootstrapError> {
+        let command = if self.target.is_windows() {
+            let script = format!(
+                concat!(
+                    "$ErrorActionPreference='Stop'; $path={path}; ",
+                    "if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {{ ",
+                    "[Console]::Out.Write('absent'); exit 0 }}; ",
+                    "$item=Get-Item -LiteralPath $path -Force; ",
+                    "if (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0 -or ",
+                    "$item.Length -gt 65536) {{ exit 75 }}; ",
+                    "$config=Get-Content -LiteralPath $path -Raw | ConvertFrom-Json; ",
+                    "if ($config.schema -ceq 'satelle.host-service.v1') {{ ",
+                    "[Console]::Out.Write('managed') }} else {{ [Console]::Out.Write('absent') }}"
+                ),
+                path = powershell_quote(path),
+            );
+            powershell_encoded_command(&script)
+        } else {
+            let script = format!(
+                concat!(
+                    "set -eu; path={path}; ",
+                    "if [ ! -e \"$path\" ]; then printf absent; exit 0; fi; ",
+                    "[ -f \"$path\" ] && [ ! -L \"$path\" ] || exit 75; ",
+                    "[ \"$(wc -c < \"$path\")\" -le 65536 ] || exit 75; ",
+                    "grep -Fq '<string>dev.microck.satelle.host</string>' \"$path\" && ",
+                    "grep -Fq '<string>--foreground</string>' \"$path\" && ",
+                    "printf managed || printf absent"
+                ),
+                path = posix_quote(path),
+            );
+            format!("sh -c {}", posix_quote(&script))
+        };
+        let output = run_ssh_command_with_program(ssh_program, destination, &command)?;
+        if !output.status.success() {
+            return Err(SshBootstrapError::InvalidServiceObservation);
+        }
+        let observation = std::str::from_utf8(&output.stdout)
+            .map_err(|_| SshBootstrapError::InvalidServiceObservation)?
+            .trim();
+        match observation {
+            "managed" => Ok(true),
+            "absent" => Ok(false),
+            _ => Err(SshBootstrapError::InvalidServiceObservation),
+        }
+    }
+
     pub(super) fn resolved_path_set(&self) -> satelle_core::daemon_service::DaemonResolvedPathSet {
         use satelle_core::daemon_service::DaemonServicePlatform;
 
@@ -4974,6 +5070,59 @@ mod tests {
             ],
             service_config_path: r"C:\Users\operator\AppData\Local\Satelle\service\host-123.json"
                 .to_string(),
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn managed_service_probe_uses_only_audited_read_commands() {
+        let directory = tempfile::tempdir().expect("temporary fake SSH directory");
+        let fake_ssh = directory.path().join("ssh");
+        let audit_log = directory.path().join("arguments");
+        fs::write(
+            &fake_ssh,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$@\" > {}\nprintf managed\n",
+                posix_quote(audit_log.to_str().expect("UTF-8 audit path")),
+            ),
+        )
+        .expect("write fake SSH");
+        fs::set_permissions(&fake_ssh, fs::Permissions::from_mode(0o700))
+            .expect("make fake SSH executable");
+
+        let directories = RemoteUserDirectories::for_tests(RemoteTarget::DarwinArm64);
+        let service_path = directories
+            .persistent_service_asset_path("host-123")
+            .expect("macOS has a managed service asset path");
+        assert_eq!(
+            service_path,
+            "/Users/operator/Library/LaunchAgents/dev.microck.satelle.host.plist"
+        );
+        assert!(
+            directories
+                .probe_managed_service_asset_for_tests(
+                    &fake_ssh,
+                    "operator@example",
+                    &service_path,
+                )
+                .expect("run audited read-only service probe")
+        );
+
+        let invocation = fs::read_to_string(audit_log).expect("read fake SSH audit");
+        assert!(invocation.contains("grep -Fq"));
+        for mutation in [
+            "Set-Content",
+            "Register-ScheduledTask",
+            "launchctl",
+            "chmod ",
+            "mkdir ",
+            "mv ",
+            "rm ",
+        ] {
+            assert!(
+                !invocation.contains(mutation),
+                "service probe attempted mutation command {mutation}: {invocation}"
+            );
         }
     }
 

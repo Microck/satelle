@@ -614,12 +614,21 @@ impl HostService {
                 provider_computer_use: false,
                 image_attachments: *image_attachments,
                 codex_update_evidence: satelle_core::host_update::CodexUpdateEvidence {
-                    ownership: satelle_core::host_update::CodexComponentOwnership::CodexOwned,
+                    runtime_ownership:
+                        satelle_core::host_update::CodexComponentOwnership::CodexOwned,
+                    native_component_ownership:
+                        satelle_core::host_update::CodexComponentOwnership::CodexOwned,
                     runtime_current_version: None,
                     native_component_current_version: None,
                     required_version: crate::codex_capabilities::REQUIRED_CODEX_VERSION.to_string(),
                     runtime_update_required: true,
                     native_update_required: true,
+                    runtime_compatibility_reason: Some(
+                        satelle_core::host_update::RepairCompatibilityReason::Missing,
+                    ),
+                    native_component_compatibility_reason: Some(
+                        satelle_core::host_update::RepairCompatibilityReason::NativeReadinessBlocked,
+                    ),
                 },
             }),
         }
@@ -1798,14 +1807,60 @@ fn production_capabilities(
         provider_computer_use: false,
         image_attachments: snapshot.image_attachments_supported(),
         codex_update_evidence: satelle_core::host_update::CodexUpdateEvidence {
-            ownership: satelle_core::host_update::CodexComponentOwnership::CodexOwned,
+            runtime_ownership: satelle_core::host_update::CodexComponentOwnership::CodexOwned,
+            native_component_ownership:
+                satelle_core::host_update::CodexComponentOwnership::CodexOwned,
             runtime_current_version: runtime_current_version.clone(),
             native_component_current_version: native_computer_use
                 .then_some(crate::codex_capabilities::REQUIRED_CODEX_VERSION.to_string()),
             required_version: crate::codex_capabilities::REQUIRED_CODEX_VERSION.to_string(),
             runtime_update_required: !codex_runtime,
             native_update_required: !native_computer_use,
+            runtime_compatibility_reason: runtime_compatibility_reason(snapshot),
+            native_component_compatibility_reason: native_compatibility_reason(
+                snapshot,
+                native_computer_use,
+            ),
         },
+    }
+}
+
+fn runtime_compatibility_reason(
+    snapshot: &ProductionCapabilitySnapshot,
+) -> Option<satelle_core::host_update::RepairCompatibilityReason> {
+    use crate::codex_capabilities::CodexVersionEvidence;
+    use satelle_core::host_update::RepairCompatibilityReason;
+
+    match snapshot.evidence.codex_version {
+        CodexVersionEvidence::Detected { .. }
+            if snapshot.verdict.blockers().iter().any(|blocker| {
+                matches!(
+                    blocker.reason,
+                    BlockerReason::MalformedCodexVersion
+                        | BlockerReason::CodexVersionUnavailable
+                        | BlockerReason::UnsupportedCodexVersion
+                )
+            }) =>
+        {
+            Some(RepairCompatibilityReason::Unsupported)
+        }
+        CodexVersionEvidence::Detected { .. } => None,
+        CodexVersionEvidence::Missing => Some(RepairCompatibilityReason::Missing),
+        CodexVersionEvidence::Malformed => Some(RepairCompatibilityReason::Corrupted),
+        CodexVersionEvidence::Unavailable => Some(RepairCompatibilityReason::Unsupported),
+    }
+}
+
+fn native_compatibility_reason(
+    snapshot: &ProductionCapabilitySnapshot,
+    native_computer_use: bool,
+) -> Option<satelle_core::host_update::RepairCompatibilityReason> {
+    if native_computer_use {
+        None
+    } else if snapshot.verdict.is_supported() {
+        Some(satelle_core::host_update::RepairCompatibilityReason::NativeReadinessBlocked)
+    } else {
+        Some(satelle_core::host_update::RepairCompatibilityReason::ControlPlaneIncompatible)
     }
 }
 

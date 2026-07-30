@@ -38,6 +38,40 @@ fn setup_selection(mode: satelle_core::SetupMode) -> SetupModeSelection {
     )
 }
 
+#[test]
+fn direct_host_update_uses_release_target_ids_for_every_supported_platform() {
+    for (os, arch, expected) in [
+        ("linux", "aarch64", "linux-arm64-gnu"),
+        ("linux", "x86_64", "linux-x64-gnu"),
+        ("macos", "aarch64", "darwin-arm64"),
+        ("macos", "x86_64", "darwin-x64"),
+        ("windows", "aarch64", "win32-arm64-msvc"),
+        ("windows", "x86_64", "win32-x64-msvc"),
+    ] {
+        let (target, platform) = canonical_remote_platform(os, arch);
+        assert_eq!(target.expect("supported remote target").id(), expected);
+        assert_eq!(platform, expected);
+    }
+}
+
+#[test]
+fn authenticated_minimum_host_version_can_require_a_cli_upgrade() {
+    assert_eq!(
+        host_version_relation(Some("1.2.0"), true, Some("2.0.0"), "1.5.0")
+            .expect("classify authenticated Host version evidence"),
+        crate::host_update::HostVersionRelation::RequiresNewerCli
+    );
+}
+
+#[test]
+fn newer_reachable_host_is_not_hidden_by_its_minimum_version() {
+    assert_eq!(
+        host_version_relation(Some("2.0.0"), true, Some("2.0.0"), "1.5.0")
+            .expect("classify newer authenticated Host version"),
+        crate::host_update::HostVersionRelation::NewerThanCli
+    );
+}
+
 #[derive(Clone)]
 struct RecordingProviderIntentAdapter {
     observed: Arc<Mutex<Option<ProviderComputerUseIntent>>>,
@@ -3606,6 +3640,26 @@ fn direct_host_sessions_read_daemon_metadata_without_bootstrap() {
     assert!(direct.bootstrap_actions.is_empty());
     assert_eq!(direct.host_daemon_version, env!("CARGO_PKG_VERSION"));
     assert_eq!(direct.sessions, local.sessions);
+}
+
+#[test]
+fn direct_host_maintenance_probe_does_not_mutate_daemon_state() {
+    let fixture = DirectFixture::start();
+    let before = fixture
+        .service
+        .daemon_runtime_status()
+        .expect("read pre-probe daemon state");
+
+    let capabilities = read_direct_maintenance_capabilities("direct-test", fixture.transport())
+        .expect("read authenticated maintenance capabilities");
+
+    let after = fixture
+        .service
+        .daemon_runtime_status()
+        .expect("read post-probe daemon state");
+    assert_eq!(before, after);
+    assert_eq!(capabilities.host_identity(), fixture.host_identity);
+    assert_eq!(capabilities.daemon_version(), env!("CARGO_PKG_VERSION"));
 }
 
 #[test]

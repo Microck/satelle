@@ -1217,7 +1217,7 @@ async fn capabilities_are_truthful_and_unknown_routes_are_typed() {
         response.json().await.expect("decode capabilities JSON");
     assert_eq!(
         capabilities_json["schema_version"],
-        "satelle.capabilities.v5"
+        "satelle.capabilities.v6"
     );
     assert_eq!(
         capabilities_json["provider_secret_upload"],
@@ -1228,7 +1228,50 @@ async fn capabilities_are_truthful_and_unknown_routes_are_typed() {
             "max_plaintext_bytes": 65_536
         })
     );
-    let mut obsolete_v4 = capabilities_json.clone();
+    let mut legacy_v5 = capabilities_json.clone();
+    legacy_v5["schema_version"] = serde_json::json!("satelle.capabilities.v5");
+    legacy_v5
+        .as_object_mut()
+        .expect("capabilities are an object")
+        .remove("codex_update_evidence");
+    legacy_v5
+        .as_object_mut()
+        .expect("capabilities are an object")
+        .remove("minimum_host_version");
+    let legacy_keys = legacy_v5
+        .as_object()
+        .expect("legacy capabilities are an object")
+        .keys()
+        .map(String::as_str)
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(
+        legacy_keys,
+        std::collections::BTreeSet::from([
+            "daemon_version",
+            "host_identity",
+            "limits",
+            "operations",
+            "platform",
+            "provider_secret_upload",
+            "request_id",
+            "runtime_capabilities",
+            "schema_version",
+            "supported_attachment_media_types",
+        ])
+    );
+    let legacy: CapabilitiesResponse =
+        serde_json::from_value(legacy_v5.clone()).expect("decode exact legacy v5 capabilities");
+    assert_eq!(legacy.codex_update_evidence(), None);
+    assert_eq!(legacy.minimum_host_version(), None);
+    let mut invalid_extended_v5 = legacy_v5.clone();
+    invalid_extended_v5["codex_update_evidence"] =
+        capabilities_json["codex_update_evidence"].clone();
+    assert!(
+        serde_json::from_value::<CapabilitiesResponse>(invalid_extended_v5).is_err(),
+        "v5 must remain exact instead of accepting v6 fields under the old schema token"
+    );
+
+    let mut obsolete_v4 = legacy_v5;
     obsolete_v4["schema_version"] = serde_json::json!("satelle.capabilities.v4");
     assert!(serde_json::from_value::<CapabilitiesResponse>(obsolete_v4).is_err());
     let capabilities: CapabilitiesResponse =

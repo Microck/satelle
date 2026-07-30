@@ -1217,6 +1217,7 @@ pub(crate) struct PersistentServiceLifecycleReport {
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct CurrentDaemonArtifactObservation {
     current_version: Option<String>,
+    minimum_host_version: Option<String>,
     protocol_compatible: bool,
     codex_update_evidence: Option<satelle_core::host_update::CodexUpdateEvidence>,
     #[cfg(test)]
@@ -1251,6 +1252,7 @@ impl SshSetupTransport {
             },
             current_daemon_artifact: cfg!(test).then_some(CurrentDaemonArtifactObservation {
                 current_version: None,
+                minimum_host_version: None,
                 protocol_compatible: true,
                 codex_update_evidence: None,
                 #[cfg(test)]
@@ -1292,7 +1294,7 @@ impl SshSetupTransport {
         self.release_artifact.map_or_else(
             || {
                 ssh_bootstrap::ReleaseArtifactMetadata::fetch(target)
-                    .map_err(|error| map_ssh_daemon_bootstrap_error(&self.alias, error))
+                    .map_err(|error| map_release_artifact_error(&self.alias, target, error))
             },
             Ok,
         )
@@ -1386,14 +1388,16 @@ impl SshSetupTransport {
         match capabilities {
             Ok(capabilities) => Ok(CurrentDaemonArtifactObservation {
                 current_version: Some(capabilities.daemon_version().to_string()),
+                minimum_host_version: capabilities.minimum_host_version().map(str::to_string),
                 protocol_compatible: true,
-                codex_update_evidence: Some(capabilities.codex_update_evidence().clone()),
+                codex_update_evidence: capabilities.codex_update_evidence().cloned(),
                 #[cfg(test)]
                 validated_host_identity: Some(capabilities.host_identity().to_string()),
             }),
             Err(DaemonClientError::CapabilitiesProtocolMismatch) => {
                 Ok(CurrentDaemonArtifactObservation {
                     current_version: None,
+                    minimum_host_version: None,
                     protocol_compatible: false,
                     codex_update_evidence: None,
                     #[cfg(test)]
@@ -1416,6 +1420,7 @@ impl SshSetupTransport {
                     })?;
                 Ok(CurrentDaemonArtifactObservation {
                     current_version: Some(current_version),
+                    minimum_host_version: None,
                     protocol_compatible: false,
                     codex_update_evidence: None,
                     #[cfg(test)]
@@ -1433,6 +1438,7 @@ impl SshSetupTransport {
             Err(DaemonClientError::Transport(error)) if error.is_connect() => {
                 Ok(CurrentDaemonArtifactObservation {
                     current_version: None,
+                    minimum_host_version: None,
                     protocol_compatible: true,
                     codex_update_evidence: None,
                     #[cfg(test)]
@@ -1516,11 +1522,20 @@ impl SshSetupTransport {
                     .map_err(|error| map_ssh_daemon_bootstrap_error(&self.alias, error))?,
                 decision.service_persistent,
             )
-            .map_err(|error| {
-                SatelleError::config_error(
+            .map_err(|error| match error {
+                satelle_core::daemon_service::DaemonArtifactPlanError::NewerHostVersion => {
+                    SatelleError::host_binary_newer_than_cli(
+                        current_daemon
+                            .current_version
+                            .as_deref()
+                            .expect("newer-version evidence includes the observed Host version"),
+                        env!("CARGO_PKG_VERSION"),
+                    )
+                }
+                error => SatelleError::config_error(
                     format!("could not construct the Host artifact plan: {error}"),
                     None,
-                )
+                ),
             })?,
         );
         if decision.service_persistent {
@@ -2737,6 +2752,155 @@ impl crate::host_update::VerifiedHostArtifactResolver for HostUpdateArtifactReso
     }
 }
 
+struct HostMaintenanceInspection {
+    current_version: Option<String>,
+    minimum_host_version: Option<String>,
+    protocol_compatible: bool,
+    remote_platform: String,
+    artifact: Option<crate::host_update::VerifiedHostArtifact>,
+    service_inspection: Option<crate::host_update::HostUpdateServiceInspection>,
+    codex_evidence: Option<satelle_core::host_update::CodexUpdateEvidence>,
+    host_automation_is_safe: bool,
+}
+
+fn inspect_host_maintenance(
+    host: &SelectedHost,
+    needs_host_artifact: bool,
+) -> Result<HostMaintenanceInspection, SatelleError> {
+    let cli_version = env!("CARGO_PKG_VERSION");
+    match host.config.transport {
+        TransportKind::Local => {
+            let service = local_host_service(&host.config).map_err(|failure| failure.error)?;
+            let capabilities = service.daemon_runtime_capabilities()?;
+            let (_, platform) =
+                canonical_remote_platform(std::env::consts::OS, std::env::consts::ARCH);
+            Ok(HostMaintenanceInspection {
+                current_version: Some(cli_version.to_string()),
+                minimum_host_version: Some(cli_version.to_string()),
+                protocol_compatible: true,
+                remote_platform: platform.clone(),
+                artifact: needs_host_artifact.then(|| crate::host_update::VerifiedHostArtifact {
+                    version: cli_version.to_string(),
+                    remote_platform: platform,
+                    daemon_destination: None,
+                }),
+                service_inspection: None,
+                codex_evidence: Some(capabilities.codex_update_evidence()),
+                // The local transport has no production mutation backend.
+                host_automation_is_safe: false,
+            })
+        }
+        TransportKind::Direct => {
+            let transport = direct_transport(host)?;
+            let capabilities = read_direct_maintenance_capabilities(&host.alias, &transport)?;
+            let (target, platform) =
+                canonical_remote_platform(capabilities.platform(), capabilities.platform_arch());
+            let artifact = if needs_host_artifact {
+                match target {
+                    Some(target) => verified_host_update_artifact(target, None, None)?,
+                    None => None,
+                }
+            } else {
+                None
+            };
+            Ok(HostMaintenanceInspection {
+                current_version: Some(capabilities.daemon_version().to_string()),
+                minimum_host_version: capabilities.minimum_host_version().map(str::to_string),
+                protocol_compatible: true,
+                remote_platform: platform,
+                artifact,
+                service_inspection: None,
+                codex_evidence: capabilities.codex_update_evidence().cloned(),
+                // Direct maintenance mutation is not implemented in the current transport.
+                host_automation_is_safe: false,
+            })
+        }
+        TransportKind::Ssh => {
+            let transport = SshSetupTransport::new(host)?;
+            let target = transport.remote_target()?;
+            let current =
+                transport.observe_current_daemon_artifact(transport.token_file_exists()?)?;
+            let remote_directories = needs_host_artifact
+                .then(|| transport.remote_directories(target))
+                .transpose()?;
+            let release_artifact = needs_host_artifact
+                .then(|| transport.release_artifact(target))
+                .transpose()?;
+            let install_path = match (remote_directories.as_ref(), release_artifact.as_ref()) {
+                (Some(directories), Some(metadata)) => Some(
+                    target
+                        .planned_install_path(directories, &metadata.digest())
+                        .map_err(|error| map_ssh_daemon_bootstrap_error(&transport.alias, error))?,
+                ),
+                _ => None,
+            };
+            let artifact = if needs_host_artifact {
+                verified_host_update_artifact(target, install_path, release_artifact)?
+            } else {
+                None
+            };
+            let service_inspection = if needs_host_artifact
+                && host.config.setup_mode == Some(satelle_core::SetupMode::Persistent)
+            {
+                let directories = remote_directories
+                    .as_ref()
+                    .expect("persistent Host inspection requests Host artifact metadata");
+                let service_path = directories.persistent_service_asset_path(
+                    transport.binding.expected_host_identity().as_str(),
+                );
+                match service_path {
+                    Some(destination)
+                        if directories
+                            .probe_managed_service_asset(
+                                transport.binding.destination(),
+                                &destination,
+                            )
+                            .map_err(|error| {
+                                map_ssh_daemon_bootstrap_error(&transport.alias, error)
+                            })? =>
+                    {
+                        Some(crate::host_update::HostUpdateServiceInspection {
+                            // The task or launchd definition proves ownership
+                            // but does not carry an independent asset version.
+                            current_version: None,
+                            relation_to_cli: host_version_relation(
+                                current.current_version.as_deref(),
+                                current.protocol_compatible,
+                                current.minimum_host_version.as_deref(),
+                                cli_version,
+                            )?,
+                            destination,
+                        })
+                    }
+                    Some(_) | None => None,
+                }
+            } else {
+                None
+            };
+            Ok(HostMaintenanceInspection {
+                current_version: current.current_version,
+                minimum_host_version: current.minimum_host_version,
+                protocol_compatible: current.protocol_compatible,
+                remote_platform: target.id().to_string(),
+                artifact,
+                service_inspection,
+                codex_evidence: current.codex_update_evidence,
+                host_automation_is_safe: true,
+            })
+        }
+    }
+}
+
+fn read_direct_maintenance_capabilities(
+    host: &str,
+    transport: &DirectTransport,
+) -> Result<satelle_transport::CapabilitiesResponse, SatelleError> {
+    transport
+        .client
+        .capabilities()
+        .map_err(|error| direct_transport_error(host, error))
+}
+
 pub(crate) fn plan_host_update(
     host: &SelectedHost,
     components: &[satelle_core::host_update::HostUpdateComponent],
@@ -2746,95 +2910,22 @@ pub(crate) fn plan_host_update(
     let needs_host_artifact = includes_all
         || components.is_empty()
         || components.contains(&satelle_core::host_update::HostUpdateComponent::Host);
-    let (current_version, protocol_compatible, remote_platform, artifact, codex_evidence) =
-        match host.config.transport {
-            TransportKind::Local => {
-                let service = local_host_service(&host.config).map_err(|failure| failure.error)?;
-                let capabilities = service.daemon_runtime_capabilities()?;
-                let platform = format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH);
-                (
-                    Some(cli_version.to_string()),
-                    true,
-                    platform.clone(),
-                    Some(crate::host_update::VerifiedHostArtifact {
-                        version: cli_version.to_string(),
-                        remote_platform: platform,
-                        daemon_destination: None,
-                        service_destination: None,
-                    }),
-                    capabilities.codex_update_evidence(),
-                )
-            }
-            TransportKind::Direct => {
-                let transport = direct_transport(host)?;
-                let capabilities = transport
-                    .client
-                    .capabilities()
-                    .map_err(|error| direct_transport_error(&host.alias, error))?;
-                let platform = format!(
-                    "{}-{}",
-                    capabilities.platform(),
-                    capabilities.platform_arch()
-                );
-                let artifact = if needs_host_artifact {
-                    match ssh_bootstrap::RemoteTarget::from_platform(
-                        capabilities.platform(),
-                        capabilities.platform_arch(),
-                    ) {
-                        Some(target) => verified_host_update_artifact(target, None, None)?,
-                        None => None,
-                    }
-                } else {
-                    None
-                };
-                (
-                    Some(capabilities.daemon_version().to_string()),
-                    true,
-                    platform,
-                    artifact,
-                    capabilities.codex_update_evidence().clone(),
-                )
-            }
-            TransportKind::Ssh => {
-                let transport = SshSetupTransport::new(host)?;
-                let target = transport.remote_target()?;
-                let current =
-                    transport.observe_current_daemon_artifact(transport.token_file_exists()?)?;
-                let install_path = transport
-                    .remote_directories(target)
-                    .ok()
-                    .zip(transport.release_artifact)
-                    .and_then(|(directories, metadata)| {
-                        target
-                            .planned_install_path(&directories, &metadata.digest())
-                            .ok()
-                    });
-                let artifact = if needs_host_artifact {
-                    verified_host_update_artifact(target, install_path, transport.release_artifact)?
-                } else {
-                    None
-                };
-                (
-                    current.current_version,
-                    current.protocol_compatible,
-                    target.id().to_string(),
-                    artifact,
-                    current
-                        .codex_update_evidence
-                        .unwrap_or_else(unavailable_codex_update_evidence),
-                )
-            }
-        };
+    let inspection = inspect_host_maintenance(host, needs_host_artifact)?;
+    let service_inspection = inspection.service_inspection;
 
     let host_inspection = crate::host_update::HostUpdateInspection {
         relation_to_cli: host_version_relation(
-            current_version.as_deref(),
-            protocol_compatible,
+            inspection.current_version.as_deref(),
+            inspection.protocol_compatible,
+            inspection.minimum_host_version.as_deref(),
             cli_version,
         )?,
-        current_version,
-        remote_platform,
+        current_version: inspection.current_version,
+        remote_platform: inspection.remote_platform,
     };
+    let codex_evidence = inspection
+        .codex_evidence
+        .unwrap_or_else(unavailable_codex_update_evidence);
     let codex_inspections = crate::host_update::codex_inspections_from_evidence(&codex_evidence);
     crate::host_update::build_host_update_plan(
         crate::host_update::HostUpdatePlanRequest {
@@ -2843,11 +2934,145 @@ pub(crate) fn plan_host_update(
             components,
             includes_all,
             host_inspection: &host_inspection,
+            service_inspection: service_inspection.as_ref(),
             codex_inspections: &codex_inspections,
         },
-        &HostUpdateArtifactResolver(artifact),
+        &HostUpdateArtifactResolver(inspection.artifact),
     )
     .map_err(map_host_update_plan_error)
+}
+
+pub(crate) fn plan_repair_upgrades(
+    host: &SelectedHost,
+) -> Result<satelle_core::host_update::RepairUpgradeReport, SatelleError> {
+    use satelle_core::host_update::{
+        CodexComponentOwnership, HostUpdateTarget, HostUpdateVersionSource,
+        RepairCompatibilityReason,
+    };
+
+    let cli_version = env!("CARGO_PKG_VERSION");
+    let inspection = inspect_host_maintenance(host, true)?;
+    let cli_release = parse_release_version(cli_version)?;
+    let current_host_release = inspection
+        .current_version
+        .as_deref()
+        .map(parse_release_version)
+        .transpose()?;
+    if current_host_release.is_some_and(|current| current > cli_release) {
+        return Err(SatelleError::host_binary_newer_than_cli(
+            inspection
+                .current_version
+                .as_deref()
+                .expect("parsed Host version retains its source value"),
+            cli_version,
+        ));
+    }
+    let minimum_host_release = inspection
+        .minimum_host_version
+        .as_deref()
+        .map(parse_release_version)
+        .transpose()?;
+    let minimum_exceeds_cli = minimum_host_release.is_some_and(|minimum| minimum > cli_release);
+    let host_reason = if inspection.current_version.is_none() {
+        Some(RepairCompatibilityReason::Missing)
+    } else if minimum_exceeds_cli {
+        Some(RepairCompatibilityReason::BelowMinimumVersion)
+    } else if !inspection.protocol_compatible {
+        Some(RepairCompatibilityReason::ControlPlaneIncompatible)
+    } else {
+        None
+    };
+    let host_target_version = if minimum_exceeds_cli {
+        inspection
+            .minimum_host_version
+            .clone()
+            .expect("minimum-version comparison retains its source value")
+    } else {
+        cli_version.to_string()
+    };
+    let host_version_source = if minimum_exceeds_cli {
+        HostUpdateVersionSource::HostCompatibilityRequirement
+    } else {
+        HostUpdateVersionSource::InvokingCliRelease
+    };
+    let mut repair_inspections = vec![crate::host_update::RepairUpgradeInspection {
+        target: HostUpdateTarget::HostDaemon,
+        current_version: inspection.current_version.clone(),
+        target_version: host_target_version,
+        compatibility_reason: host_reason,
+        version_source: host_version_source,
+        automation_is_safe: inspection.host_automation_is_safe
+            && inspection
+                .artifact
+                .as_ref()
+                .and_then(|artifact| artifact.daemon_destination.as_ref())
+                .is_some()
+            && !minimum_exceeds_cli,
+        newer_compatible_version_available: host_reason.is_none()
+            && current_host_release.is_some_and(|current| current < cli_release),
+    }];
+
+    let codex = inspection.codex_evidence.ok_or_else(|| {
+        SatelleError::ambiguous_codex_component_ownership("codex_update_evidence")
+    })?;
+    let codex_inspections = [
+        (
+            HostUpdateTarget::CodexRuntime,
+            codex.runtime_ownership,
+            codex.runtime_current_version,
+            codex.runtime_compatibility_reason,
+        ),
+        (
+            HostUpdateTarget::CodexNativeComputerUse,
+            codex.native_component_ownership,
+            codex.native_component_current_version,
+            codex.native_component_compatibility_reason,
+        ),
+    ];
+    for (target, ownership, current_version, compatibility_reason) in codex_inspections {
+        if ownership != CodexComponentOwnership::CodexOwned {
+            return Err(SatelleError::ambiguous_codex_component_ownership(&format!(
+                "{target:?}"
+            )));
+        }
+        repair_inspections.push(crate::host_update::RepairUpgradeInspection {
+            target,
+            current_version,
+            target_version: codex.required_version.clone(),
+            compatibility_reason,
+            version_source: HostUpdateVersionSource::CodexCompatibilityRequirement,
+            // No current transport owns an automatic Codex replacement executor.
+            automation_is_safe: false,
+            newer_compatible_version_available: false,
+        });
+    }
+
+    Ok(crate::host_update::build_repair_upgrade_plan(
+        &host.alias,
+        &repair_inspections,
+    ))
+}
+
+fn map_release_artifact_error(
+    host: &str,
+    target: ssh_bootstrap::RemoteTarget,
+    error: ssh_bootstrap::SshBootstrapError,
+) -> SatelleError {
+    match error {
+        ssh_bootstrap::SshBootstrapError::MissingIntegrityEntry => {
+            SatelleError::host_artifact_unavailable(env!("CARGO_PKG_VERSION"), target.id())
+        }
+        error => map_ssh_daemon_bootstrap_error(host, error),
+    }
+}
+
+fn canonical_remote_platform(
+    os: &str,
+    arch: &str,
+) -> (Option<ssh_bootstrap::RemoteTarget>, String) {
+    let target = ssh_bootstrap::RemoteTarget::from_platform(os, arch);
+    let platform = target.map_or_else(|| format!("{os}-{arch}"), |target| target.id().to_string());
+    (target, platform)
 }
 
 fn verified_host_update_artifact(
@@ -2868,55 +3093,67 @@ fn verified_host_update_artifact(
         version: env!("CARGO_PKG_VERSION").to_string(),
         remote_platform: target.id().to_string(),
         daemon_destination: install_path,
-        service_destination: None,
     }))
 }
 
 fn unavailable_codex_update_evidence() -> satelle_core::host_update::CodexUpdateEvidence {
     satelle_core::host_update::CodexUpdateEvidence {
-        ownership: satelle_core::host_update::CodexComponentOwnership::CodexOwned,
+        runtime_ownership: satelle_core::host_update::CodexComponentOwnership::Ambiguous,
+        native_component_ownership: satelle_core::host_update::CodexComponentOwnership::Ambiguous,
         runtime_current_version: None,
         native_component_current_version: None,
         required_version: HostService::required_codex_version(),
         runtime_update_required: true,
         native_update_required: true,
+        runtime_compatibility_reason: None,
+        native_component_compatibility_reason: None,
     }
 }
 
 fn host_version_relation(
     current: Option<&str>,
     protocol_compatible: bool,
+    minimum_host_version: Option<&str>,
     cli: &str,
 ) -> Result<crate::host_update::HostVersionRelation, SatelleError> {
     let Some(current) = current else {
         return Ok(crate::host_update::HostVersionRelation::Missing);
     };
-    let parse = |value: &str| -> Result<(u64, u64, u64), SatelleError> {
-        let mut parts = value.split('.');
-        let version = (
-            parts.next().and_then(|part| part.parse().ok()),
-            parts.next().and_then(|part| part.parse().ok()),
-            parts.next().and_then(|part| part.parse().ok()),
-        );
-        match version {
-            (Some(major), Some(minor), Some(patch)) if parts.next().is_none() => {
-                Ok((major, minor, patch))
-            }
-            _ => Err(SatelleError::config_error(
-                "the authenticated Host reported a non-release version",
-                None,
-            )),
-        }
-    };
-    let current = parse(current)?;
-    let cli = parse(cli)?;
-    Ok(if current > cli {
-        crate::host_update::HostVersionRelation::NewerThanCli
-    } else if current < cli || !protocol_compatible {
+    let cli = parse_release_version(cli)?;
+    let current = parse_release_version(current)?;
+    if current > cli {
+        return Ok(crate::host_update::HostVersionRelation::NewerThanCli);
+    }
+    if minimum_host_version
+        .map(parse_release_version)
+        .transpose()?
+        .is_some_and(|minimum| minimum > cli)
+    {
+        return Ok(crate::host_update::HostVersionRelation::RequiresNewerCli);
+    }
+    Ok(if current < cli || !protocol_compatible {
         crate::host_update::HostVersionRelation::OlderThanCli
     } else {
         crate::host_update::HostVersionRelation::MatchesCli
     })
+}
+
+fn parse_release_version(value: &str) -> Result<(u64, u64, u64), SatelleError> {
+    let mut parts = value.split('.');
+    let version = (
+        parts.next().and_then(|part| part.parse().ok()),
+        parts.next().and_then(|part| part.parse().ok()),
+        parts.next().and_then(|part| part.parse().ok()),
+    );
+    match version {
+        (Some(major), Some(minor), Some(patch)) if parts.next().is_none() => {
+            Ok((major, minor, patch))
+        }
+        _ => Err(SatelleError::config_error(
+            "the authenticated Host reported a non-release version",
+            None,
+        )),
+    }
 }
 
 fn map_host_update_plan_error(error: crate::host_update::HostUpdatePlanError) -> SatelleError {
@@ -5911,6 +6148,7 @@ mod bootstrap_ordering_tests {
         let transport = setup_transport_for_report();
         let observation = CurrentDaemonArtifactObservation {
             current_version: Some("0.0.0".to_string()),
+            minimum_host_version: None,
             protocol_compatible: true,
             codex_update_evidence: None,
             validated_host_identity: None,
@@ -5937,6 +6175,52 @@ mod bootstrap_ordering_tests {
         assert_eq!(
             artifact.action,
             satelle_core::daemon_service::DaemonArtifactAction::UpdateOlder
+        );
+    }
+
+    #[test]
+    fn setup_reports_newer_host_and_missing_release_artifact_with_typed_errors() {
+        let transport = setup_transport_for_report();
+        let newer = CurrentDaemonArtifactObservation {
+            current_version: Some("999.0.0".to_string()),
+            minimum_host_version: None,
+            protocol_compatible: true,
+            codex_update_evidence: None,
+            validated_host_identity: None,
+        };
+        let newer_error = transport
+            .setup_report_for_target(
+                true,
+                SetupModeSelection::new(
+                    satelle_core::SetupMode::Persistent,
+                    satelle_core::daemon_service::SetupModeSource::SetupFlag,
+                ),
+                ssh_bootstrap::RemoteTarget::WindowsX64Msvc,
+                vec!["transport".to_string()],
+                DaemonPathOverrides::default(),
+                SetupApplication::Planned {
+                    existing_token_file: true,
+                },
+                &newer,
+            )
+            .expect_err("setup must not downgrade a newer Host");
+        assert_eq!(
+            newer_error.code,
+            satelle_core::ErrorCode::HostBinaryNewerThanCli
+        );
+
+        let missing_error = map_release_artifact_error(
+            "remote",
+            ssh_bootstrap::RemoteTarget::DarwinArm64,
+            ssh_bootstrap::SshBootstrapError::MissingIntegrityEntry,
+        );
+        assert_eq!(
+            missing_error.code,
+            satelle_core::ErrorCode::HostArtifactUnavailable
+        );
+        assert_eq!(
+            missing_error.details["remote_platform"],
+            serde_json::json!("darwin-arm64")
         );
     }
 
@@ -5981,6 +6265,7 @@ mod bootstrap_ordering_tests {
         let transport = setup_transport_for_report();
         let observation = CurrentDaemonArtifactObservation {
             current_version: Some("0.0.0".to_string()),
+            minimum_host_version: None,
             protocol_compatible: true,
             codex_update_evidence: None,
             validated_host_identity: None,
