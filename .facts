@@ -1149,8 +1149,8 @@
 - every project-declared Host Alias resolves through a user-level Satelle Host Binding before remote communication or mutation begins @spec @mvp @implemented
 - a user-level Host Binding is selectable by project configuration only when that exact binding sets allow_project_selection = true @spec @mvp @implemented
 - project Host selection permission is scoped to one exact Host Alias and does not grant mutation consent, YOLO, provider-secret consent, Trusted Profile consent, or sensitive-export consent @spec @mvp @implemented
-- a Provider Binding in user-level or Host-owned configuration is selectable by project configuration only when that exact Operator-controlled binding sets allow_project_selection = true @spec @mvp
-- project Provider selection permission is scoped to one exact provider alias and does not grant provider-secret access, endpoint override authority, experimental-provider opt-in, mutation consent, YOLO, or sensitive-export consent @spec @mvp
+- a Provider Binding in user-level or Host-owned configuration is selectable by project configuration only when that exact Operator-controlled binding sets allow_project_selection = true @spec @mvp @implemented
+- project Provider selection permission is scoped to one exact provider alias and does not grant provider-secret access, endpoint override authority, experimental-provider opt-in, mutation consent, YOLO, or sensitive-export consent @spec @mvp @implemented
 - satelle project-level configuration cannot define or override a concrete network address, SSH destination, direct API URL, TLS trust material, bearer-token descriptor, Tailscale node identity, Desktop Binding, daemon path, provider endpoint binding, or provider credential binding @spec @mvp @implemented
 - a project transport preference is accepted only when its transport kind exactly matches the user-level Host Binding, while the concrete destination and authentication details remain exclusively user-owned @spec @mvp @implemented
 - satelle configuration merging never allows a project object to replace a user-owned Host Binding as a whole object @spec @mvp @implemented
