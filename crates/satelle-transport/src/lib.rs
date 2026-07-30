@@ -24,8 +24,9 @@ pub use contract::{
     ProviderDescriptorValidationResponse, ProviderSecretProvisioningMetadata,
     ProviderSecretProvisioningPreviewResponse, ProviderSecretProvisioningResponse,
     ProviderSecretUploadEnvelope, RequestId, ResolvedProviderBinding, SUPPORTED_IMAGE_MEDIA_TYPES,
-    SessionResponse, SetupRepairDecision, SetupRepairPlanAction, SetupRepairPlanRequest,
-    SetupRepairPlanResponse, SetupRepairPostcondition, SetupRepairProbe, SetupVerificationRequest,
+    SessionResponse, SetupRepairDecision, SetupRepairOperationKind, SetupRepairPlanAction,
+    SetupRepairPlanRequest, SetupRepairPlanResponse, SetupRepairPostcondition,
+    SetupRepairPreviousStatus, SetupRepairProbe, SetupRepairRunStatus, SetupVerificationRequest,
     SetupVerificationResponse, StopRequest, StopResponse, SubscribeRequest, SubscribeRequestError,
     SubscribedResponse, TurnRequest, WsCloseReason, WsControlError, WsServerControl,
 };

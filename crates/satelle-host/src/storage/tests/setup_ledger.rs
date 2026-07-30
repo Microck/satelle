@@ -1700,3 +1700,112 @@ fn bootstrap_completion_finalizes_an_already_completed_recovery() {
     assert_eq!(SetupActionStatus::Completed, run.actions()[0].status());
     assert!(storage.maintenance_lease_state().unwrap().is_none());
 }
+
+#[test]
+fn repair_adopts_and_replays_the_exact_interrupted_host_update_run() {
+    let state = TempDir::new().expect("temporary state directory");
+    let (mut storage, _) = Storage::open(state.path()).expect("open storage");
+    let plan = SetupRunPlan::new(
+        "host-update-recovery",
+        SetupOperationKind::HostUpdate,
+        None,
+        at(1),
+        vec![
+            SetupActionPlan::new("replace-host", "Replace Host", true).unwrap(),
+            SetupActionPlan::new("restart-host", "Restart Host", true).unwrap(),
+        ],
+    )
+    .unwrap();
+    let capability = begin_setup_run(&mut storage, &plan);
+    storage
+        .start_setup_action(&capability, "replace-host", at(2))
+        .unwrap();
+    storage
+        .complete_setup_action_after_verified_postcondition(&capability, "replace-host", at(3))
+        .unwrap();
+    storage
+        .start_setup_action(&capability, "restart-host", at(4))
+        .unwrap();
+    storage
+        .mark_interrupted_setup_actions_outcome_unknown(at(5))
+        .unwrap();
+
+    let interrupted = storage
+        .load_setup_run(plan.run_id())
+        .unwrap()
+        .expect("interrupted run remains selectable by its exact operation ID");
+    let repair = storage
+        .plan_setup_repair(
+            None,
+            Some(&interrupted),
+            &[
+                SetupRepairProbe::try_new(
+                    "replace-host",
+                    "Replace Host",
+                    true,
+                    SetupRepairPostcondition::Satisfied,
+                )
+                .unwrap(),
+                SetupRepairProbe::try_new(
+                    "restart-host",
+                    "Restart Host",
+                    true,
+                    SetupRepairPostcondition::Unsatisfied,
+                )
+                .unwrap(),
+            ],
+        )
+        .expect("the selected active recovery run is the repair source");
+    assert_eq!(
+        Some(SetupOperationKind::HostUpdate),
+        repair.selected_operation_kind()
+    );
+    assert_eq!(
+        Some(SetupRunStatus::OutcomeUnknown),
+        repair.selected_run_status()
+    );
+    assert_eq!(
+        &[
+            SetupRepairDecision::NoActionRequired,
+            SetupRepairDecision::RetryAutomatically,
+        ],
+        repair
+            .actions()
+            .iter()
+            .map(|action| action.decision())
+            .collect::<Vec<_>>()
+            .as_slice()
+    );
+
+    let adopted = storage
+        .adopt_recovery_maintenance(plan.run_id(), maintenance_owner(plan.run_id(), at(6)))
+        .expect("repair adopts the exact interrupted operation");
+    storage
+        .start_setup_action(&adopted, "replace-host", at(7))
+        .expect("completed retry-safe actions can be replayed idempotently");
+    storage
+        .complete_setup_action_after_verified_postcondition(&adopted, "replace-host", at(7))
+        .expect("completed retry-safe actions remain completed");
+    storage
+        .start_setup_action(&adopted, "restart-host", at(7))
+        .expect("the interrupted action remains started after adoption");
+    storage
+        .complete_setup_action_after_verified_postcondition(&adopted, "restart-host", at(8))
+        .expect("the interrupted action completes under the original operation ID");
+    assert_eq!(
+        SetupRunStatus::Completed,
+        storage
+            .finish_setup_run_and_release_maintenance(&adopted, at(9))
+            .expect("exact-run repair finalizes and releases maintenance")
+    );
+
+    let completed = storage.load_setup_run(plan.run_id()).unwrap().unwrap();
+    assert_eq!(SetupRunStatus::Completed, completed.status());
+    assert!(
+        completed
+            .actions()
+            .iter()
+            .all(|action| action.status() == SetupActionStatus::Completed)
+    );
+    assert!(storage.maintenance_lease_state().unwrap().is_none());
+}

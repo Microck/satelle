@@ -675,6 +675,8 @@ struct OfflineStorageMaintenanceCommand {
     #[arg(long, value_enum)]
     operation: OfflineStorageOperation,
     #[arg(long)]
+    host: String,
+    #[arg(long)]
     operation_id: String,
     #[arg(long)]
     state_root: PathBuf,
@@ -4344,7 +4346,8 @@ fn run_repair(
     if revalidated != report {
         return Err(failure(SatelleError::state_conflict()));
     }
-    report = transport::apply_repair_upgrades(&host, revalidated).map_err(failure)?;
+    report = transport::apply_repair_upgrades(&host, revalidated, command.run.as_deref())
+        .map_err(failure)?;
     if format.is_json() {
         print_json(&report).map_err(failure)
     } else {
@@ -8278,12 +8281,11 @@ fn apply_local_offline_storage_maintenance<T>(
     let result = match mutate() {
         Ok(result) => result,
         Err(source) => {
-            satelle_host::HostService::record_failed_offline_storage_maintenance(
+            let _ = satelle_host::HostService::record_failed_offline_storage_maintenance(
                 state_root,
                 &operation_id,
                 action_id,
-            )
-            .map_err(failure)?;
+            );
             return Err(failure(source));
         }
     };
@@ -8370,14 +8372,18 @@ fn run_host_storage(
                     )))
                 })?
             } else {
-                transport::apply_ssh_storage_maintenance(
+                let mut activation = transport::apply_ssh_storage_maintenance(
                     &host,
                     transport::SshStorageMaintenance::Restore,
                     Some(&command.backup),
                     false,
                 )
                 .map_err(failure)?;
-                json!({"api_service_restarted": true})
+                activation
+                    .as_object_mut()
+                    .ok_or_else(|| failure(SatelleError::state_conflict()))?
+                    .insert("api_service_restarted".to_string(), json!(true));
+                activation
             };
             print_storage_result(&host.alias, "restore", activation, format)
         }
@@ -8416,14 +8422,15 @@ fn run_host_storage(
             )? {
                 return print_storage_cancelled(&host.alias, "backup_cleanup", format);
             }
-            let removed = if let Some(state_root) = &local_state_root {
-                apply_local_offline_storage_maintenance(
+            let cleanup = if let Some(state_root) = &local_state_root {
+                let removed_backup_file_names = apply_local_offline_storage_maintenance(
                     &host.alias,
                     state_root,
                     "cleanup-storage-backups",
                     "Delete older validated Host storage backups",
                     || satelle_host::HostService::cleanup_storage_backups_offline(state_root),
-                )?
+                )?;
+                json!({"removed_backup_file_names": removed_backup_file_names})
             } else {
                 transport::apply_ssh_storage_maintenance(
                     &host,
@@ -8431,15 +8438,9 @@ fn run_host_storage(
                     None,
                     false,
                 )
-                .map_err(failure)?;
-                Vec::new()
+                .map_err(failure)?
             };
-            print_storage_result(
-                &host.alias,
-                "backup_cleanup",
-                json!({"removed_backup_file_names": removed}),
-                format,
-            )
+            print_storage_result(&host.alias, "backup_cleanup", cleanup, format)
         }
     }
 }
@@ -8499,17 +8500,18 @@ fn run_host_store(
                     )))
                 })?
             } else {
-                transport::apply_ssh_storage_maintenance(
+                let mut reset = transport::apply_ssh_storage_maintenance(
                     &host,
                     transport::SshStorageMaintenance::StoreReset,
                     None,
                     command.delete_recordings,
                 )
                 .map_err(failure)?;
-                json!({
-                    "recordings_deleted": command.delete_recordings,
-                    "api_service_restarted": true
-                })
+                reset
+                    .as_object_mut()
+                    .ok_or_else(|| failure(SatelleError::state_conflict()))?
+                    .insert("api_service_restarted".to_string(), json!(true));
+                reset
             };
             print_storage_result(&host.alias, "store_reset", reset, format)
         }
@@ -8558,29 +8560,45 @@ fn run_offline_storage_maintenance(
                 &command.state_root,
                 backup.expect("validated restore backup"),
             )
-            .map(|_| ())
+            .and_then(|result| {
+                serde_json::to_value(result).map_err(|error| {
+                    SatelleError::invalid_usage(format!(
+                        "could not serialize storage restore result: {error}"
+                    ))
+                })
+            })
         }
         OfflineStorageOperation::BackupCleanup => {
             satelle_host::HostService::cleanup_storage_backups_offline(&command.state_root)
-                .map(|_| ())
+                .map(|removed_backup_file_names| {
+                    json!({"removed_backup_file_names": removed_backup_file_names})
+                })
         }
         OfflineStorageOperation::StoreReset => {
             satelle_host::HostService::reset_store_metadata_offline(
                 &command.state_root,
                 command.delete_recordings,
             )
-            .map(|_| ())
+            .and_then(|result| {
+                serde_json::to_value(result).map_err(|error| {
+                    SatelleError::invalid_usage(format!(
+                        "could not serialize store reset result: {error}"
+                    ))
+                })
+            })
         }
     };
-    if let Err(source) = mutation {
-        satelle_host::HostService::record_failed_offline_storage_maintenance(
-            &command.state_root,
-            &command.operation_id,
-            action_id,
-        )
-        .map_err(failure)?;
-        return Err(failure(source));
-    }
+    let result = match mutation {
+        Ok(result) => result,
+        Err(source) => {
+            let _ = satelle_host::HostService::record_failed_offline_storage_maintenance(
+                &command.state_root,
+                &command.operation_id,
+                action_id,
+            );
+            return Err(failure(source));
+        }
+    };
     if let Err(source) = satelle_host::HostService::record_completed_offline_storage_maintenance(
         &command.state_root,
         &command.operation_id,
@@ -8589,7 +8607,7 @@ fn run_offline_storage_maintenance(
     ) {
         return Err(failure(
             SatelleError::storage_maintenance_partially_applied(
-                LOCAL_DEMO_HOST,
+                &command.host,
                 &[action_id.to_string()],
                 "record-storage-maintenance-ledger-completion",
                 &[],
@@ -8597,7 +8615,7 @@ fn run_offline_storage_maintenance(
             ),
         ));
     }
-    Ok(())
+    print_json(&result).map_err(failure)
 }
 
 fn print_storage_plan(
@@ -8608,6 +8626,7 @@ fn print_storage_plan(
 ) -> Result<(), CliFailure> {
     if format.is_json() {
         print_json(&json!({
+            "schema_version": "satelle.host.storage.v1",
             "host": host,
             "operation": operation,
             "status": "planned",
@@ -8633,6 +8652,7 @@ fn print_storage_cancelled(
 ) -> Result<(), CliFailure> {
     if format.is_json() {
         print_json(&json!({
+            "schema_version": "satelle.host.storage.v1",
             "host": host,
             "operation": operation,
             "status": "cancelled",
@@ -8655,6 +8675,7 @@ fn print_storage_result(
 ) -> Result<(), CliFailure> {
     if format.is_json() {
         print_json(&json!({
+            "schema_version": "satelle.host.storage.v1",
             "host": host,
             "operation": operation,
             "status": "applied",

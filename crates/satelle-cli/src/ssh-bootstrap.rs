@@ -2662,22 +2662,23 @@ impl<'a> PersistentServiceRemote<'a> {
         &mut self,
         artifact: &UploadedHostArtifact,
         operation: &str,
-        operation_id: &str,
+        identity: OfflineStorageMaintenanceIdentity<'_>,
         state_root: &str,
         backup: Option<&str>,
         delete_recordings: bool,
-    ) -> Result<(), SshBootstrapError> {
+    ) -> Result<serde_json::Value, SshBootstrapError> {
         let binary = self.absolute_artifact_path(artifact);
         let command = offline_storage_maintenance_command(
             self.target,
             &binary,
             operation,
-            operation_id,
+            identity,
             state_root,
             backup,
             delete_recordings,
         );
-        self.mutate("offline_storage_maintenance", &command, None)
+        let output = self.mutate_with_output("offline_storage_maintenance", &command, None)?;
+        parse_offline_storage_maintenance_result(operation, &output.stdout)
     }
 
     pub(super) fn observe_canonical_daemon_path_overrides(
@@ -2806,6 +2807,18 @@ impl<'a> PersistentServiceRemote<'a> {
         require_success(run_fenced_ssh_command(self.destination, &command, input)?)
     }
 
+    fn mutate_with_output(
+        &mut self,
+        phase: &str,
+        command: &str,
+        input: Option<FencedMutationInput<'_>>,
+    ) -> Result<CommandOutput, SshBootstrapError> {
+        let command = self
+            .bootstrap_lock
+            .fenced_command(self.target, phase, command)?;
+        require_success_output(run_fenced_ssh_command(self.destination, &command, input)?)
+    }
+
     fn observe(&self, command: &str) -> Result<PersistentServiceObservation, SshBootstrapError> {
         let output = require_success_output(run_ssh_command_with_output_limit(
             self.destination,
@@ -2833,21 +2846,28 @@ impl<'a> PersistentServiceRemote<'a> {
     }
 }
 
+#[derive(Clone, Copy)]
+pub(super) struct OfflineStorageMaintenanceIdentity<'a> {
+    pub(super) host: &'a str,
+    pub(super) operation_id: &'a str,
+}
+
 fn offline_storage_maintenance_command(
     target: RemoteTarget,
     binary: &str,
     operation: &str,
-    operation_id: &str,
+    identity: OfflineStorageMaintenanceIdentity<'_>,
     state_root: &str,
     backup: Option<&str>,
     delete_recordings: bool,
 ) -> String {
     if target.is_windows() {
         let mut script = format!(
-            "& {} host offline-storage-maintenance --operation {} --operation-id {} --state-root {}",
+            "& {} host offline-storage-maintenance --operation {} --host {} --operation-id {} --state-root {}",
             powershell_quote(binary),
             powershell_quote(operation),
-            powershell_quote(operation_id),
+            powershell_quote(identity.host),
+            powershell_quote(identity.operation_id),
             powershell_quote(state_root),
         );
         if let Some(backup) = backup {
@@ -2859,10 +2879,11 @@ fn offline_storage_maintenance_command(
         powershell_encoded_command(&script)
     } else {
         let mut arguments = format!(
-            "{} host offline-storage-maintenance --operation {} --operation-id {} --state-root {}",
+            "{} host offline-storage-maintenance --operation {} --host {} --operation-id {} --state-root {}",
             posix_quote(binary),
             posix_quote(operation),
-            posix_quote(operation_id),
+            posix_quote(identity.host),
+            posix_quote(identity.operation_id),
             posix_quote(state_root),
         );
         if let Some(backup) = backup {
@@ -2872,6 +2893,46 @@ fn offline_storage_maintenance_command(
             arguments.push_str(" --delete-recordings");
         }
         format!("sh -c {}", posix_quote(&format!("exec {arguments}")))
+    }
+}
+
+fn parse_offline_storage_maintenance_result(
+    operation: &str,
+    stdout: &[u8],
+) -> Result<serde_json::Value, SshBootstrapError> {
+    let value: serde_json::Value = serde_json::from_slice(stdout)
+        .map_err(|_| SshBootstrapError::InvalidOfflineStorageMaintenanceResponse)?;
+    let object = value
+        .as_object()
+        .ok_or(SshBootstrapError::InvalidOfflineStorageMaintenanceResponse)?;
+    let string_array = |field: &str| {
+        object
+            .get(field)
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|values| values.iter().all(serde_json::Value::is_string))
+    };
+    let valid = match operation {
+        "restore" => {
+            object.len() == 2
+                && object
+                    .get("failed_store_file_name")
+                    .is_some_and(serde_json::Value::is_string)
+                && string_array("failed_sidecar_file_names")
+        }
+        "backup-cleanup" => object.len() == 1 && string_array("removed_backup_file_names"),
+        "store-reset" => {
+            object.len() == 2
+                && string_array("removed_metadata_file_names")
+                && object
+                    .get("recordings_deleted")
+                    .is_some_and(serde_json::Value::is_boolean)
+        }
+        _ => false,
+    };
+    if valid {
+        Ok(value)
+    } else {
+        Err(SshBootstrapError::InvalidOfflineStorageMaintenanceResponse)
     }
 }
 
@@ -3733,7 +3794,7 @@ impl RemoteUserDirectories {
         self.probe_managed_service_asset_with_program(OsStr::new("ssh"), destination, path)
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     pub(super) fn probe_managed_service_asset_for_tests(
         &self,
         ssh_program: &Path,
@@ -5105,6 +5166,8 @@ pub(super) enum SshBootstrapError {
     ServiceDefinitionTooLarge,
     #[error("the remote Host returned an invalid cache-cleanup result")]
     InvalidCacheCleanupResponse,
+    #[error("the remote Host returned an invalid offline storage maintenance result")]
+    InvalidOfflineStorageMaintenanceResponse,
     #[error("the remote Host returned an invalid SHA-256 result")]
     InvalidRemoteDigest,
     #[error("the release archive is invalid")]
@@ -7921,7 +7984,10 @@ mod tests {
             RemoteTarget::WindowsX64Msvc,
             r"C:\Satelle\satelle.exe",
             "restore",
-            "storage-operation-1",
+            OfflineStorageMaintenanceIdentity {
+                host: "office",
+                operation_id: "storage-operation-1",
+            },
             r"C:\Satelle\state",
             Some(r"C:\Satelle\state\migration.backup"),
             false,
@@ -7932,7 +7998,8 @@ mod tests {
             windows_script,
             concat!(
                 "& 'C:\\Satelle\\satelle.exe' host offline-storage-maintenance ",
-                "--operation 'restore' --operation-id 'storage-operation-1' ",
+                "--operation 'restore' --host 'office' ",
+                "--operation-id 'storage-operation-1' ",
                 "--state-root 'C:\\Satelle\\state' ",
                 "--backup 'C:\\Satelle\\state\\migration.backup'"
             )
@@ -7942,14 +8009,18 @@ mod tests {
             RemoteTarget::DarwinArm64,
             "/Users/test/satelle",
             "store-reset",
-            "storage-operation-2",
+            OfflineStorageMaintenanceIdentity {
+                host: "office",
+                operation_id: "storage-operation-2",
+            },
             "/Users/test/state",
             None,
             true,
         );
         let expected_macos_arguments = concat!(
             "'/Users/test/satelle' host offline-storage-maintenance ",
-            "--operation 'store-reset' --operation-id 'storage-operation-2' ",
+            "--operation 'store-reset' --host 'office' ",
+            "--operation-id 'storage-operation-2' ",
             "--state-root '/Users/test/state' --delete-recordings"
         );
         assert_eq!(
@@ -7958,6 +8029,25 @@ mod tests {
                 "sh -c {}",
                 posix_quote(&format!("exec {expected_macos_arguments}"))
             )
+        );
+    }
+
+    #[test]
+    fn offline_storage_results_preserve_the_remote_observed_values() {
+        let result = parse_offline_storage_maintenance_result(
+            "store-reset",
+            br#"{"removed_metadata_file_names":[],"recordings_deleted":false}"#,
+        )
+        .expect("valid remote store reset result");
+
+        assert_eq!(result["recordings_deleted"], false);
+        assert_eq!(result["removed_metadata_file_names"], serde_json::json!([]));
+        assert!(
+            parse_offline_storage_maintenance_result(
+                "store-reset",
+                br#"{"recordings_deleted":true}"#
+            )
+            .is_err()
         );
     }
 }

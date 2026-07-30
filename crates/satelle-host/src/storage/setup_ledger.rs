@@ -483,6 +483,8 @@ impl SetupRepairAction {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SetupRepairPlan {
     actions: Vec<SetupRepairAction>,
+    selected_operation_kind: Option<SetupOperationKind>,
+    selected_run_status: Option<SetupRunStatus>,
 }
 
 pub(crate) struct MaintenanceRecoverySubject {
@@ -528,6 +530,14 @@ pub(crate) enum MaintenanceLeaseState {
 impl SetupRepairPlan {
     pub fn actions(&self) -> &[SetupRepairAction] {
         &self.actions
+    }
+
+    pub const fn selected_operation_kind(&self) -> Option<SetupOperationKind> {
+        self.selected_operation_kind
+    }
+
+    pub const fn selected_run_status(&self) -> Option<SetupRunStatus> {
+        self.selected_run_status
     }
 
     pub fn automatic_actions(&self) -> impl Iterator<Item = &SetupRepairAction> {
@@ -721,28 +731,40 @@ impl Storage {
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|source| sqlite_error(StorageErrorKind::OperationFailed, source))?;
-        let action_status = transaction
+        let recovery_action = transaction
             .query_row(
-                "SELECT setup_actions.status
+                "SELECT setup_actions.action_id, setup_actions.status
                  FROM setup_actions
                  JOIN setup_runs USING (run_id)
                  WHERE setup_runs.run_id = ?1
                    AND setup_runs.status = 'outcome_unknown'
-                   AND setup_actions.action_id = 'bootstrap-handoff'",
+                   AND (
+                       setup_actions.action_id = 'bootstrap-handoff'
+                       OR setup_actions.status = 'outcome_unknown'
+                   )
+                 ORDER BY
+                   CASE WHEN setup_actions.action_id = 'bootstrap-handoff' THEN 0 ELSE 1 END,
+                   setup_actions.action_order
+                 LIMIT 1",
                 [operation_id.as_str()],
-                |row| row.get::<_, String>(0),
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
             )
             .optional()
             .map_err(|source| sqlite_error(StorageErrorKind::OperationFailed, source))?
             .ok_or_else(|| StorageError::new(StorageErrorKind::StateConflict))?;
+        let (action_id, action_status) = recovery_action;
         let parsed_action_status = SetupActionStatus::parse(&action_status)?;
-        if !matches!(
-            parsed_action_status,
-            SetupActionStatus::Planned
-                | SetupActionStatus::Started
-                | SetupActionStatus::OutcomeUnknown
-                | SetupActionStatus::Completed
-        ) {
+        if action_id == "bootstrap-handoff" {
+            if !matches!(
+                parsed_action_status,
+                SetupActionStatus::Planned
+                    | SetupActionStatus::Started
+                    | SetupActionStatus::OutcomeUnknown
+                    | SetupActionStatus::Completed
+            ) {
+                return Err(StorageError::new(StorageErrorKind::StateConflict));
+            }
+        } else if parsed_action_status != SetupActionStatus::OutcomeUnknown {
             return Err(StorageError::new(StorageErrorKind::StateConflict));
         }
         require_one_transition(
@@ -765,9 +787,9 @@ impl Storage {
                              finished_at = NULL,
                              recovery_hint = NULL
                          WHERE run_id = ?1
-                           AND action_id = 'bootstrap-handoff'
-                           AND status = ?3",
-                        params![operation_id.as_str(), acquired_at, action_status],
+                           AND action_id = ?3
+                           AND status = ?4",
+                        params![operation_id.as_str(), acquired_at, action_id, action_status],
                     )
                     .map_err(|source| sqlite_error(StorageErrorKind::OperationFailed, source))?,
             )?;
@@ -815,6 +837,22 @@ impl Storage {
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|source| sqlite_error(StorageErrorKind::OperationFailed, source))?;
         require_active_maintenance_owner(&transaction, capability)?;
+        let existing_status = transaction
+            .query_row(
+                "SELECT status FROM setup_actions
+                 WHERE run_id = ?1 AND action_id = ?2",
+                params![run_id, action_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(|source| sqlite_error(StorageErrorKind::InvalidStoredState, source))?
+            .ok_or_else(|| StorageError::new(StorageErrorKind::InvalidInput))?;
+        if matches!(
+            SetupActionStatus::parse(&existing_status)?,
+            SetupActionStatus::Started | SetupActionStatus::Completed
+        ) {
+            return Ok(());
+        }
         require_run_and_predecessor_times(&transaction, run_id, &action_id, started_at)?;
         let changed = transaction
             .execute(
@@ -1204,7 +1242,10 @@ impl Storage {
         {
             return Err(StorageError::new(StorageErrorKind::InvalidInput));
         }
-        if active_setup_run_in_scope(&self.connection, desktop_binding)? {
+        if let Some(active_run_id) =
+            active_setup_run_id_in_scope(&self.connection, desktop_binding)?
+            && selected_run.is_none_or(|run| run.run_id() != active_run_id)
+        {
             return Err(StorageError::new(StorageErrorKind::StateConflict));
         }
 
@@ -1254,7 +1295,11 @@ impl Storage {
                 }
             })
             .collect();
-        Ok(SetupRepairPlan { actions })
+        Ok(SetupRepairPlan {
+            actions,
+            selected_operation_kind: selected_run.map(SetupRunRecord::operation_kind),
+            selected_run_status: selected_run.map(SetupRunRecord::status),
+        })
     }
 
     fn latest_setup_actions(
@@ -1347,6 +1392,21 @@ impl Storage {
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|source| sqlite_error(StorageErrorKind::OperationFailed, source))?;
         require_active_maintenance_owner(&transaction, capability)?;
+        let existing_status = transaction
+            .query_row(
+                "SELECT status FROM setup_actions
+                 WHERE run_id = ?1 AND action_id = ?2",
+                params![run_id, action_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(|source| sqlite_error(StorageErrorKind::InvalidStoredState, source))?
+            .ok_or_else(|| StorageError::new(StorageErrorKind::InvalidInput))?;
+        if status == "completed"
+            && SetupActionStatus::parse(&existing_status)? == SetupActionStatus::Completed
+        {
+            return Ok(());
+        }
         require_started_action_time(&transaction, run_id, &action_id, finished_at)?;
         let changed = transaction
             .execute(
@@ -1690,23 +1750,30 @@ fn active_setup_run_in_scope(
     connection: &Connection,
     desktop_binding: Option<&DesktopBindingRef>,
 ) -> Result<bool, StorageError> {
+    active_setup_run_id_in_scope(connection, desktop_binding).map(|run_id| run_id.is_some())
+}
+
+fn active_setup_run_id_in_scope(
+    connection: &Connection,
+    desktop_binding: Option<&DesktopBindingRef>,
+) -> Result<Option<String>, StorageError> {
     connection
         .query_row(
-            "SELECT EXISTS(
-                SELECT 1 FROM setup_runs
-                WHERE status = 'running'
-                  AND satelle_version = ?1
-                  AND (
-                      (?2 IS NULL AND desktop_binding_ref IS NULL)
-                      OR desktop_binding_ref = ?2
-                  )
-             )",
+            "SELECT run_id FROM setup_runs
+             WHERE status = 'running'
+               AND satelle_version = ?1
+               AND (
+                   (?2 IS NULL AND desktop_binding_ref IS NULL)
+                   OR desktop_binding_ref = ?2
+               )
+             LIMIT 1",
             params![
                 env!("CARGO_PKG_VERSION"),
                 desktop_binding.map(DesktopBindingRef::as_str)
             ],
             |row| row.get(0),
         )
+        .optional()
         .map_err(|source| sqlite_error(StorageErrorKind::OperationFailed, source))
 }
 

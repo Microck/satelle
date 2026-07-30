@@ -28,6 +28,33 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Condvar, Mutex, mpsc};
 use std::thread;
 use std::time::Duration;
+
+#[test]
+fn only_outcome_unknown_host_updates_resume_the_selected_operation_id() {
+    let selected = |operation_kind, run_status| RepairLedgerPlan {
+        available: true,
+        automatic_action_ids: Vec::new(),
+        selected_operation_kind: Some(operation_kind),
+        selected_run_status: Some(run_status),
+    };
+    let interrupted_host_update = selected(
+        satelle_transport::SetupRepairOperationKind::HostUpdate,
+        satelle_transport::SetupRepairRunStatus::OutcomeUnknown,
+    );
+    let completed_host_update = selected(
+        satelle_transport::SetupRepairOperationKind::HostUpdate,
+        satelle_transport::SetupRepairRunStatus::Completed,
+    );
+    let interrupted_repair = selected(
+        satelle_transport::SetupRepairOperationKind::Repair,
+        satelle_transport::SetupRepairRunStatus::OutcomeUnknown,
+    );
+
+    assert!(resumes_selected_host_update(Some(&interrupted_host_update)));
+    assert!(!resumes_selected_host_update(Some(&completed_host_update)));
+    assert!(!resumes_selected_host_update(Some(&interrupted_repair)));
+    assert!(!resumes_selected_host_update(None));
+}
 use tokio_tungstenite::tungstenite::Error as WebSocketError;
 use tokio_tungstenite::tungstenite::error::ProtocolError;
 

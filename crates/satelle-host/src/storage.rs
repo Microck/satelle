@@ -86,10 +86,10 @@ pub(crate) fn cleanup_migration_backups_offline(
     open::cleanup_migration_backups_offline(state_root)
 }
 
-pub(crate) fn reset_store_metadata_offline(
+pub(crate) fn begin_store_reset_offline(
     state_root: &std::path::Path,
-) -> Result<Vec<String>, StorageError> {
-    open::reset_store_metadata_offline(state_root)
+) -> Result<open::OfflineStoreReset, StorageError> {
+    open::begin_store_reset_offline(state_root)
 }
 use self::sql::{
     StoredIdempotency, ensure_control_lease_available, ensure_no_pending_stop,

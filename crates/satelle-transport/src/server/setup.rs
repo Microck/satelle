@@ -10,8 +10,9 @@ use crate::contract::{
     ProviderBindingDeletionResponse, ProviderDescriptorValidationRequest,
     ProviderDescriptorValidationResponse, ProviderSecretProvisioningMetadata,
     ProviderSecretProvisioningPreviewResponse, ProviderSecretProvisioningResponse,
-    ProviderSecretUploadEnvelope, SetupRepairDecision, SetupRepairPlanAction,
-    SetupRepairPlanRequest, SetupRepairPlanResponse, SetupRepairPostcondition,
+    ProviderSecretUploadEnvelope, SetupRepairDecision, SetupRepairOperationKind,
+    SetupRepairPlanAction, SetupRepairPlanRequest, SetupRepairPlanResponse,
+    SetupRepairPostcondition, SetupRepairPreviousStatus, SetupRepairRunStatus,
     SetupVerificationRequest, SetupVerificationResponse, provider_secret_upload_aad,
 };
 use axum::extract::{Extension, Path, Request, State};
@@ -114,6 +115,21 @@ pub(super) async fn plan_setup_repair(
         Ok(Err(error)) => return host_error::response(&state, &authorized, &error),
         Err(_) => return host_error::task_failure(&state, &authorized),
     };
+    let selected_operation_kind = plan.selected_operation_kind().map(|kind| match kind {
+        SetupOperationKind::Setup => SetupRepairOperationKind::Setup,
+        SetupOperationKind::Repair => SetupRepairOperationKind::Repair,
+        SetupOperationKind::HostUpdate => SetupRepairOperationKind::HostUpdate,
+        SetupOperationKind::StorageMigration => SetupRepairOperationKind::StorageMigration,
+        SetupOperationKind::ServiceStop => SetupRepairOperationKind::ServiceStop,
+        SetupOperationKind::ServiceRestart => SetupRepairOperationKind::ServiceRestart,
+    });
+    let selected_run_status = plan.selected_run_status().map(|status| match status {
+        satelle_host::SetupRunStatus::Running => SetupRepairRunStatus::Running,
+        satelle_host::SetupRunStatus::Completed => SetupRepairRunStatus::Completed,
+        satelle_host::SetupRunStatus::Failed => SetupRepairRunStatus::Failed,
+        satelle_host::SetupRunStatus::PartialFailure => SetupRepairRunStatus::PartialFailure,
+        satelle_host::SetupRunStatus::OutcomeUnknown => SetupRepairRunStatus::OutcomeUnknown,
+    });
     let actions = plan
         .actions()
         .iter()
@@ -136,16 +152,15 @@ pub(super) async fn plan_setup_repair(
             },
             retry_safe: action.retry_safe(),
             previous_run_id: action.previous_run_id().map(str::to_string),
-            previous_status: action.previous_status().map(|status| {
-                match status {
-                    satelle_host::SetupActionStatus::Planned => "planned",
-                    satelle_host::SetupActionStatus::Started => "started",
-                    satelle_host::SetupActionStatus::Completed => "completed",
-                    satelle_host::SetupActionStatus::Failed => "failed",
-                    satelle_host::SetupActionStatus::Skipped => "skipped",
-                    satelle_host::SetupActionStatus::OutcomeUnknown => "outcome_unknown",
+            previous_status: action.previous_status().map(|status| match status {
+                satelle_host::SetupActionStatus::Planned => SetupRepairPreviousStatus::Planned,
+                satelle_host::SetupActionStatus::Started => SetupRepairPreviousStatus::Started,
+                satelle_host::SetupActionStatus::Completed => SetupRepairPreviousStatus::Completed,
+                satelle_host::SetupActionStatus::Failed => SetupRepairPreviousStatus::Failed,
+                satelle_host::SetupActionStatus::Skipped => SetupRepairPreviousStatus::Skipped,
+                satelle_host::SetupActionStatus::OutcomeUnknown => {
+                    SetupRepairPreviousStatus::OutcomeUnknown
                 }
-                .to_string()
             }),
         })
         .collect();
@@ -154,6 +169,8 @@ pub(super) async fn plan_setup_repair(
         &SetupRepairPlanResponse::new(
             authorized.request_id().clone(),
             state.host_identity.clone(),
+            selected_operation_kind,
+            selected_run_status,
             actions,
         ),
         authorized.request_id(),

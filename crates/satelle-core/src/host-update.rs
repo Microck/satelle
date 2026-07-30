@@ -264,7 +264,7 @@ impl HostUpdateReport {
         self.status = if self
             .postcheck_results
             .iter()
-            .any(|postcheck| postcheck.status == HostUpdatePostcheckStatus::Failed)
+            .any(|postcheck| postcheck.status != HostUpdatePostcheckStatus::Passed)
         {
             HostUpdateStatus::PostcheckFailed
         } else if self.changed {
@@ -422,30 +422,28 @@ pub struct RepairUpgradeReport {
 
 impl RepairUpgradeReport {
     pub fn new(host: impl Into<String>, actions: Vec<RepairUpgradeAction>) -> Self {
-        let planned_actions = if actions.iter().any(|action| {
+        let mut planned_actions = actions
+            .iter()
+            .filter(|action| action.disposition == RepairUpgradeDisposition::Required)
+            .map(|action| action.action_id.clone())
+            .collect::<Vec<_>>();
+        if actions.iter().any(|action| {
             action.disposition == RepairUpgradeDisposition::Required
                 && matches!(
                     action.target,
                     HostUpdateTarget::HostDaemon | HostUpdateTarget::HostDaemonService
                 )
         }) {
-            [
+            for action_id in [
                 "install-host-artifact",
                 "publish-host-service",
                 "restart-host-daemon",
                 "invalidate-readiness-caches",
                 "host-update-postcheck",
-            ]
-            .into_iter()
-            .map(str::to_string)
-            .collect()
-        } else {
-            actions
-                .iter()
-                .filter(|action| action.disposition == RepairUpgradeDisposition::Required)
-                .map(|action| action.action_id.clone())
-                .collect::<Vec<_>>()
-        };
+            ] {
+                push_unique_action(&mut planned_actions, action_id);
+            }
+        }
         let skipped_actions = actions
             .iter()
             .filter(|action| action.disposition == RepairUpgradeDisposition::ManualActionRequired)
@@ -587,6 +585,7 @@ mod tests {
         assert_eq!(
             planned.planned_actions,
             [
+                "repair-host-daemon",
                 "install-host-artifact",
                 "publish-host-service",
                 "restart-host-daemon",
@@ -652,6 +651,64 @@ mod tests {
         assert_eq!(up_to_date.status, HostUpdateStatus::UpToDate);
         assert!(!up_to_date.confirmation_required);
         assert!(up_to_date.planned_actions.is_empty());
+    }
+
+    #[test]
+    fn repair_plan_keeps_required_non_host_actions_with_the_host_sequence() {
+        let report = RepairUpgradeReport::new(
+            "remote",
+            vec![
+                RepairUpgradeAction {
+                    action_id: "repair-host-daemon".to_string(),
+                    target: HostUpdateTarget::HostDaemon,
+                    current_version: None,
+                    target_version: "1.1.0".to_string(),
+                    compatibility_reason: Some(RepairCompatibilityReason::Missing),
+                    version_source: HostUpdateVersionSource::InvokingCliRelease,
+                    disposition: RepairUpgradeDisposition::Required,
+                },
+                RepairUpgradeAction {
+                    action_id: "repair-codex-runtime".to_string(),
+                    target: HostUpdateTarget::CodexRuntime,
+                    current_version: None,
+                    target_version: "1.1.0".to_string(),
+                    compatibility_reason: Some(RepairCompatibilityReason::Missing),
+                    version_source: HostUpdateVersionSource::CodexCompatibilityRequirement,
+                    disposition: RepairUpgradeDisposition::Required,
+                },
+            ],
+        );
+
+        assert!(report.requires_mutation());
+        assert_eq!(
+            report.planned_actions,
+            [
+                "repair-host-daemon",
+                "repair-codex-runtime",
+                "install-host-artifact",
+                "publish-host-service",
+                "restart-host-daemon",
+                "invalidate-readiness-caches",
+                "host-update-postcheck",
+            ]
+        );
+    }
+
+    #[test]
+    fn planned_postchecks_cannot_finish_as_applied() {
+        let mut report = HostUpdateReport::new(
+            "remote",
+            vec![HostUpdateComponent::Host],
+            vec![update_target(
+                HostUpdateTarget::HostDaemon,
+                "install-host-artifact",
+            )],
+        );
+        report.changed = true;
+
+        let finished = report.finish_postchecks();
+
+        assert_eq!(finished.status, HostUpdateStatus::PostcheckFailed);
     }
 
     #[test]

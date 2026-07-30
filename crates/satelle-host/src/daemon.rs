@@ -1833,6 +1833,14 @@ fn runtime_compatibility_reason(
     use crate::codex_capabilities::CodexVersionEvidence;
     use satelle_core::host_update::RepairCompatibilityReason;
 
+    if snapshot
+        .verdict
+        .blockers()
+        .iter()
+        .any(|blocker| blocker.reason == BlockerReason::MissingCodexRuntime)
+    {
+        return Some(RepairCompatibilityReason::Missing);
+    }
     match snapshot.evidence.codex_version {
         CodexVersionEvidence::Detected { .. }
             if snapshot.verdict.blockers().iter().any(|blocker| {
