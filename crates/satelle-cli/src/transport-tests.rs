@@ -3682,8 +3682,12 @@ fn direct_host_maintenance_probe_does_not_mutate_daemon_state() {
         .daemon_runtime_status()
         .expect("read pre-probe daemon state");
 
-    let capabilities = read_direct_maintenance_capabilities("direct-test", fixture.transport())
-        .expect("read authenticated maintenance capabilities");
+    let DirectMaintenanceCapabilities::Compatible(capabilities) =
+        read_direct_maintenance_capabilities("direct-test", fixture.transport())
+            .expect("read authenticated maintenance capabilities")
+    else {
+        panic!("current Direct Host must return compatible capabilities");
+    };
 
     let after = fixture
         .service
@@ -3692,6 +3696,43 @@ fn direct_host_maintenance_probe_does_not_mutate_daemon_state() {
     assert_eq!(before, after);
     assert_eq!(capabilities.host_identity(), fixture.host_identity);
     assert_eq!(capabilities.daemon_version(), env!("CARGO_PKG_VERSION"));
+}
+
+#[test]
+fn authenticated_direct_protocol_mismatch_retains_daemon_version_for_maintenance() {
+    let error = serde_json::from_value(serde_json::json!({
+        "schema_version": "satelle.error.v1",
+        "request_id": satelle_transport::RequestId::new().to_string(),
+        "host_identity": "host-direct-test",
+        "code": "incompatible-protocol",
+        "category": "compatibility",
+        "retryable": false,
+        "message": "the CLI and Host Daemon protocol versions are incompatible",
+        "details": {
+            "daemon_version": "0.0.9",
+            "reason": "unsupported",
+            "supported_versions": ["12"],
+            "received_version": "11",
+        },
+        "docs_url": null,
+        "suggested_commands": [],
+    }))
+    .expect("deserialize an authenticated protocol mismatch");
+
+    let observation = classify_direct_maintenance_capabilities(
+        "direct-test",
+        Err(DaemonClientError::Api {
+            status: reqwest::StatusCode::UPGRADE_REQUIRED,
+            error: Box::new(error),
+        }),
+    )
+    .expect("retain protocol mismatch evidence for maintenance planning");
+
+    let DirectMaintenanceCapabilities::ProtocolIncompatible { current_version } = observation
+    else {
+        panic!("expected retained protocol mismatch evidence");
+    };
+    assert_eq!(current_version, "0.0.9");
 }
 
 #[test]

@@ -2808,36 +2808,62 @@ fn inspect_host_maintenance(
         TransportKind::Direct => {
             let transport = direct_transport(host)?;
             let capabilities = read_direct_maintenance_capabilities(&host.alias, &transport)?;
-            let (target, platform) =
-                canonical_remote_platform(capabilities.platform(), capabilities.platform_arch());
-            let relation_to_cli = host_version_relation(
-                Some(capabilities.daemon_version()),
-                true,
-                capabilities.minimum_host_version(),
-                cli_version,
-            )?;
-            let artifact = if needs_host_artifact {
-                match target {
-                    Some(target) => {
-                        verified_host_update_artifact(relation_to_cli, target, None, None)?
-                    }
-                    None => None,
+            match capabilities {
+                DirectMaintenanceCapabilities::Compatible(capabilities) => {
+                    let (target, platform) = canonical_remote_platform(
+                        capabilities.platform(),
+                        capabilities.platform_arch(),
+                    );
+                    let relation_to_cli = host_version_relation(
+                        Some(capabilities.daemon_version()),
+                        true,
+                        capabilities.minimum_host_version(),
+                        cli_version,
+                    )?;
+                    let artifact = if needs_host_artifact {
+                        match target {
+                            Some(target) => {
+                                verified_host_update_artifact(relation_to_cli, target, None, None)?
+                            }
+                            None => None,
+                        }
+                    } else {
+                        None
+                    };
+                    Ok(HostMaintenanceInspection {
+                        current_version: Some(capabilities.daemon_version().to_string()),
+                        minimum_host_version: capabilities
+                            .minimum_host_version()
+                            .map(str::to_string),
+                        protocol_compatible: true,
+                        relation_to_cli,
+                        remote_platform: platform,
+                        artifact,
+                        service_inspection: None,
+                        codex_evidence: capabilities.codex_update_evidence().cloned(),
+                        // Direct maintenance mutation is not implemented in the current transport.
+                        host_automation_is_safe: false,
+                    })
                 }
-            } else {
-                None
-            };
-            Ok(HostMaintenanceInspection {
-                current_version: Some(capabilities.daemon_version().to_string()),
-                minimum_host_version: capabilities.minimum_host_version().map(str::to_string),
-                protocol_compatible: true,
-                relation_to_cli,
-                remote_platform: platform,
-                artifact,
-                service_inspection: None,
-                codex_evidence: capabilities.codex_update_evidence().cloned(),
-                // Direct maintenance mutation is not implemented in the current transport.
-                host_automation_is_safe: false,
-            })
+                DirectMaintenanceCapabilities::ProtocolIncompatible { current_version } => {
+                    let relation_to_cli =
+                        host_version_relation(Some(&current_version), false, None, cli_version)?;
+                    Ok(HostMaintenanceInspection {
+                        current_version: Some(current_version),
+                        minimum_host_version: None,
+                        protocol_compatible: false,
+                        relation_to_cli,
+                        // The authenticated protocol error cannot expose a
+                        // current-schema platform value. Keep automation
+                        // disabled instead of guessing the remote target.
+                        remote_platform: "unknown".to_string(),
+                        artifact: None,
+                        service_inspection: None,
+                        codex_evidence: None,
+                        host_automation_is_safe: false,
+                    })
+                }
+            }
         }
         TransportKind::Ssh => {
             let transport = SshSetupTransport::new(host)?;
@@ -2924,14 +2950,44 @@ fn inspect_host_maintenance(
     }
 }
 
+enum DirectMaintenanceCapabilities {
+    Compatible(Box<satelle_transport::CapabilitiesResponse>),
+    ProtocolIncompatible { current_version: String },
+}
+
+fn classify_direct_maintenance_capabilities(
+    host: &str,
+    capabilities: Result<satelle_transport::CapabilitiesResponse, DaemonClientError>,
+) -> Result<DirectMaintenanceCapabilities, SatelleError> {
+    match capabilities {
+        Ok(capabilities) => Ok(DirectMaintenanceCapabilities::Compatible(Box::new(
+            capabilities,
+        ))),
+        Err(DaemonClientError::Api { error, .. })
+            if error.code() == ApiErrorCode::IncompatibleProtocol =>
+        {
+            let current_version = error
+                .details()
+                .and_then(|details| details.get("daemon_version"))
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string)
+                .ok_or_else(|| {
+                    SatelleError::config_error(
+                        "the protocol-incompatible Host did not report its current version",
+                        None,
+                    )
+                })?;
+            Ok(DirectMaintenanceCapabilities::ProtocolIncompatible { current_version })
+        }
+        Err(error) => Err(direct_transport_error(host, error)),
+    }
+}
+
 fn read_direct_maintenance_capabilities(
     host: &str,
     transport: &DirectTransport,
-) -> Result<satelle_transport::CapabilitiesResponse, SatelleError> {
-    transport
-        .client
-        .capabilities()
-        .map_err(|error| direct_transport_error(host, error))
+) -> Result<DirectMaintenanceCapabilities, SatelleError> {
+    classify_direct_maintenance_capabilities(host, transport.client.capabilities())
 }
 
 pub(crate) fn plan_host_update(

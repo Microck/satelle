@@ -3636,6 +3636,26 @@ fn host_update_valid_selections_fail_truthfully_without_mutating_state() {
 }
 
 #[test]
+fn unavailable_json_repair_apply_emits_only_the_terminal_error() {
+    let state = state_dir();
+    let output = satelle()
+        .env("SATELLE_STATE_DIR", state.path())
+        .args(["repair", "--host", "local-demo", "--yes", "--json"])
+        .assert()
+        .code(70)
+        .get_output()
+        .clone();
+
+    assert!(
+        output.stdout.is_empty(),
+        "an unavailable JSON apply must not emit a success-shaped plan"
+    );
+    let error = parse_json_output(&output.stderr);
+    assert_eq!(error["schema_version"], "satelle.error.v1");
+    assert_eq!(error["code"], "not-implemented");
+}
+
+#[test]
 fn host_update_rejects_conflicting_or_unsupported_components() {
     satelle()
         .args([

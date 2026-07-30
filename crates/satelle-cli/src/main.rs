@@ -4185,27 +4185,32 @@ fn run_repair(
 
     let host = config.resolve_host(Some(command.host.as_deref().unwrap_or(LOCAL_DEMO_HOST)))?;
     let report = transport::plan_repair_upgrades(&host).map_err(failure)?;
+    let apply_unavailable = !command.dry_run
+        && report.actions.iter().any(|action| {
+            !matches!(
+                action.disposition,
+                satelle_core::host_update::RepairUpgradeDisposition::NotNeeded
+                    | satelle_core::host_update::RepairUpgradeDisposition::RecommendHostUpdate
+            )
+        });
+    if apply_unavailable {
+        // Human output can retain the useful read-only plan before the typed
+        // failure. JSON commands must emit exactly one terminal object.
+        if !format.is_json() {
+            print!("{}", host_update::render_repair_upgrade_plan(&report));
+        }
+        return Err(failure(SatelleError::not_implemented(concat!(
+            "repair upgrade apply belongs to the repair execution train. The plan was read-only; ",
+            "no Host state or Satelle sessions were changed."
+        ))));
+    }
+
     if format.is_json() {
         print_json(&report).map_err(failure)?;
     } else {
         print!("{}", host_update::render_repair_upgrade_plan(&report));
     }
-    if command.dry_run
-        || report.actions.iter().all(|action| {
-            matches!(
-                action.disposition,
-                satelle_core::host_update::RepairUpgradeDisposition::NotNeeded
-                    | satelle_core::host_update::RepairUpgradeDisposition::RecommendHostUpdate
-            )
-        })
-    {
-        return Ok(());
-    }
-
-    Err(failure(SatelleError::not_implemented(concat!(
-        "repair upgrade apply belongs to the repair execution train. The complete plan above ",
-        "was read-only; no Host state or Satelle sessions were changed."
-    ))))
+    Ok(())
 }
 
 fn run_doctor(
