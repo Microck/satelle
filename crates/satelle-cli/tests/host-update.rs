@@ -1,4 +1,5 @@
 use assert_cmd::Command;
+use satelle_host::test_support::TestStateDir;
 use serde_json::Value;
 
 fn satelle() -> Command {
@@ -60,7 +61,7 @@ fn host_update_has_no_arbitrary_version_or_channel_flags() {
 
 #[test]
 fn repair_dry_run_uses_live_typed_upgrade_evidence() {
-    let state = tempfile::tempdir().expect("temporary repair state");
+    let state = TestStateDir::new().expect("create secure temporary state directory");
     let output = satelle()
         .env("SATELLE_STATE_DIR", state.path())
         .args(["repair", "--host", "local-demo", "--dry-run", "--json"])

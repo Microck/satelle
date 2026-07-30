@@ -3663,7 +3663,7 @@ impl RemoteUserDirectories {
         self.probe_managed_service_asset_with_program(OsStr::new("ssh"), destination, path)
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     pub(super) fn probe_managed_service_asset_for_tests(
         &self,
         ssh_program: &Path,
