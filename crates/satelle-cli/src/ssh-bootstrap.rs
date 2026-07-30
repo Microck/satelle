@@ -2397,6 +2397,22 @@ impl<'a> PersistentServiceRemote<'a> {
         &mut self,
     ) -> Result<UploadedHostArtifact, SshBootstrapError> {
         let artifact = DownloadedArtifact::fetch(self.target)?;
+        self.install_host_artifact(artifact)
+    }
+
+    pub(super) fn install_verified_host_artifact(
+        &mut self,
+        expected_digest: &str,
+    ) -> Result<UploadedHostArtifact, SshBootstrapError> {
+        let metadata = ReleaseArtifactMetadata::from_digest_hex(expected_digest)?;
+        let artifact = DownloadedArtifact::fetch_with_metadata(self.target, metadata)?;
+        self.install_host_artifact(artifact)
+    }
+
+    fn install_host_artifact(
+        &mut self,
+        artifact: DownloadedArtifact,
+    ) -> Result<UploadedHostArtifact, SshBootstrapError> {
         let directory = self.target.artifact_upload_directory(self.directories)?;
         let mut uploaded = upload_artifact(
             self.destination,
@@ -4234,6 +4250,12 @@ impl ReleaseArtifactMetadata {
         Self { digest }
     }
 
+    pub(super) fn from_digest_hex(digest: &str) -> Result<Self, SshBootstrapError> {
+        parse_digest_hex(digest)
+            .map(Self::from_digest)
+            .map_err(|_| SshBootstrapError::InvalidManifest)
+    }
+
     pub(super) const fn digest(self) -> [u8; 32] {
         self.digest
     }
@@ -4249,6 +4271,13 @@ impl ReleaseArtifactMetadata {
 
 impl DownloadedArtifact {
     fn fetch(target: RemoteTarget) -> Result<Self, SshBootstrapError> {
+        Self::fetch_with_metadata(target, ReleaseArtifactMetadata::fetch(target)?)
+    }
+
+    fn fetch_with_metadata(
+        target: RemoteTarget,
+        metadata: ReleaseArtifactMetadata,
+    ) -> Result<Self, SshBootstrapError> {
         let version = env!("CARGO_PKG_VERSION");
         let filename = format!(
             "satelle-v{version}-{}.{}",
@@ -4261,7 +4290,7 @@ impl DownloadedArtifact {
             .user_agent(format!("satelle/{version}"))
             .build()
             .map_err(SshBootstrapError::Http)?;
-        let expected_digest = ReleaseArtifactMetadata::fetch(target)?.digest();
+        let expected_digest = metadata.digest();
 
         let mut archive = NamedTempFile::new().map_err(SshBootstrapError::LocalFile)?;
         let mut response = client
@@ -6493,6 +6522,15 @@ mod tests {
             manifest_digest(manifest.as_bytes(), "satelle-v0.1.0-linux-x64-gnu.tar.gz").unwrap(),
             [0x11; 32]
         );
+    }
+
+    #[test]
+    fn accepted_update_digest_round_trips_without_refetching_manifest_state() {
+        let digest = "ab".repeat(32);
+        let metadata =
+            ReleaseArtifactMetadata::from_digest_hex(&digest).expect("parse accepted plan digest");
+
+        assert_eq!(metadata.digest_hex(), digest);
     }
 
     #[test]

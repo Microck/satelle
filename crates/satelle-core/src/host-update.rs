@@ -135,6 +135,7 @@ pub struct HostUpdateTargetPlan {
     pub current_version: Option<String>,
     pub target_version: String,
     pub version_source: HostUpdateVersionSource,
+    pub artifact_digest: Option<String>,
     pub disposition: HostUpdateDisposition,
     pub restart_impact: HostUpdateRestartImpact,
     pub remote_mutations: Vec<HostUpdateMutation>,
@@ -533,6 +534,7 @@ mod tests {
             current_version: Some("1.0.0".to_string()),
             target_version: "1.1.0".to_string(),
             version_source: HostUpdateVersionSource::InvokingCliRelease,
+            artifact_digest: None,
             disposition: HostUpdateDisposition::Update,
             restart_impact: HostUpdateRestartImpact::HostDaemon,
             remote_mutations: vec![HostUpdateMutation {
@@ -640,6 +642,7 @@ mod tests {
             current_version: Some("1.1.0".to_string()),
             target_version: "1.1.0".to_string(),
             version_source: HostUpdateVersionSource::InvokingCliRelease,
+            artifact_digest: None,
             disposition: HostUpdateDisposition::Current,
             restart_impact: HostUpdateRestartImpact::None,
             remote_mutations: Vec::new(),

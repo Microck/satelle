@@ -3126,12 +3126,8 @@ fn inspect_host_maintenance(
                 current_version: Some(cli_version.to_string()),
                 minimum_host_version: Some(cli_version.to_string()),
                 protocol_compatible: true,
-                remote_platform: platform.clone(),
-                artifact: needs_host_artifact.then(|| crate::host_update::VerifiedHostArtifact {
-                    version: cli_version.to_string(),
-                    remote_platform: platform,
-                    daemon_destination: None,
-                }),
+                remote_platform: platform,
+                artifact: None,
                 service_inspection: None,
                 codex_evidence: Some(capabilities.codex_update_evidence()),
                 // The local transport has no production mutation backend.
@@ -3143,7 +3139,19 @@ fn inspect_host_maintenance(
             let capabilities = read_direct_maintenance_capabilities(&host.alias, &transport)?;
             let (target, platform) =
                 canonical_remote_platform(capabilities.platform(), capabilities.platform_arch());
-            let artifact = if needs_host_artifact {
+            let relation = host_version_relation(
+                Some(capabilities.daemon_version()),
+                true,
+                capabilities.minimum_host_version(),
+                cli_version,
+            )?;
+            let needs_replacement_artifact = needs_host_artifact
+                && matches!(
+                    relation,
+                    crate::host_update::HostVersionRelation::Missing
+                        | crate::host_update::HostVersionRelation::OlderThanCli
+                );
+            let artifact = if needs_replacement_artifact {
                 match target {
                     Some(target) => verified_host_update_artifact(target, None, None)?,
                     None => None,
@@ -3168,10 +3176,22 @@ fn inspect_host_maintenance(
             let target = transport.remote_target()?;
             let current =
                 transport.observe_current_daemon_artifact(transport.token_file_exists()?)?;
+            let relation = host_version_relation(
+                current.current_version.as_deref(),
+                current.protocol_compatible,
+                current.minimum_host_version.as_deref(),
+                cli_version,
+            )?;
+            let needs_replacement_artifact = needs_host_artifact
+                && matches!(
+                    relation,
+                    crate::host_update::HostVersionRelation::Missing
+                        | crate::host_update::HostVersionRelation::OlderThanCli
+                );
             let remote_directories = needs_host_artifact
                 .then(|| transport.remote_directories(target))
                 .transpose()?;
-            let release_artifact = needs_host_artifact
+            let release_artifact = needs_replacement_artifact
                 .then(|| transport.release_artifact(target))
                 .transpose()?;
             let install_path = match (remote_directories.as_ref(), release_artifact.as_ref()) {
@@ -3182,7 +3202,7 @@ fn inspect_host_maintenance(
                 ),
                 _ => None,
             };
-            let artifact = if needs_host_artifact {
+            let artifact = if needs_replacement_artifact {
                 verified_host_update_artifact(target, install_path, release_artifact)?
             } else {
                 None
@@ -3340,17 +3360,33 @@ fn apply_host_update_with_operation(
         ));
     }
 
-    let expected_artifact_path = report
+    let planned_host_artifact = report
         .targets
         .iter()
         .find(|target| target.target == HostUpdateTarget::HostDaemon && target.requires_mutation())
-        .and_then(|target| target.remote_mutations.first())
+        .ok_or_else(|| {
+            SatelleError::invalid_usage(
+                "the Host update plan lacks an exact verified artifact destination",
+            )
+        })?;
+    let expected_artifact_path = planned_host_artifact
+        .remote_mutations
+        .first()
         .and_then(|mutation| mutation.remote_path.clone())
         .ok_or_else(|| {
             SatelleError::invalid_usage(
                 "the Host update plan lacks an exact verified artifact destination",
             )
         })?;
+    let expected_artifact_digest =
+        planned_host_artifact
+            .artifact_digest
+            .clone()
+            .ok_or_else(|| {
+                SatelleError::invalid_usage(
+                    "the Host update plan lacks an exact verified artifact digest",
+                )
+            })?;
     let publish_service = report.targets.iter().any(|target| {
         target.target == HostUpdateTarget::HostDaemonService && target.requires_mutation()
     });
@@ -3466,7 +3502,7 @@ fn apply_host_update_with_operation(
                 ));
             }
         };
-        match remote.install_current_host_artifact() {
+        match remote.install_verified_host_artifact(&expected_artifact_digest) {
             Ok(artifact) => artifact,
             Err(error) => {
                 let source = map_ssh_daemon_bootstrap_error(&transport.alias, error);
@@ -3766,7 +3802,11 @@ fn apply_host_update_with_operation(
             source,
         ));
     }
-    let adopted = match new_client.begin_host_update_maintenance(&operation_id) {
+    let adopted = match operation {
+        HostUpdateOperation::Update => new_client.begin_host_update_maintenance(&operation_id),
+        HostUpdateOperation::Repair => new_client.begin_repair_maintenance(&operation_id),
+    };
+    let adopted = match adopted {
         Ok(adopted) => adopted,
         Err(error) => {
             let source = direct_transport_error(&transport.alias, error);
@@ -4255,6 +4295,7 @@ fn verified_host_update_artifact(
     Ok(Some(crate::host_update::VerifiedHostArtifact {
         version: env!("CARGO_PKG_VERSION").to_string(),
         remote_platform: target.id().to_string(),
+        digest: metadata.digest_hex(),
         daemon_destination: install_path,
     }))
 }

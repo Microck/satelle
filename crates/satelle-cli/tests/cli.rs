@@ -3531,7 +3531,7 @@ fn setup_provider_auth_without_a_user_binding_defers_to_host_ownership() {
 }
 
 #[test]
-fn host_update_valid_selections_fail_truthfully_without_mutating_state() {
+fn host_update_valid_selections_report_current_or_manual_targets_without_mutating_state() {
     let state = state_dir();
     for args in [
         vec!["host", "update", "--host", "local-demo", "--json"],
@@ -3569,31 +3569,15 @@ fn host_update_valid_selections_fail_truthfully_without_mutating_state() {
             .env("SATELLE_STATE_DIR", state.path())
             .args(args)
             .assert()
-            .code(70)
+            .success()
             .get_output()
             .clone();
         let plan = parse_json_output(&output.stdout);
         assert_eq!(plan["schema_version"], "satelle.host.update.v1");
         assert_eq!(plan["host"], "local-demo");
-        let report = parse_json_output(&output.stderr);
-        assert_exact_object_keys(
-            &report,
-            &[
-                "category",
-                "code",
-                "details",
-                "docs_url",
-                "message",
-                "retryable",
-                "schema_version",
-                "suggested_commands",
-            ],
-        );
-        assert_eq!(report["schema_version"], "satelle.error.v1");
-        assert_eq!(report["code"], "not-implemented");
-        let message = report["message"].as_str().unwrap();
-        assert!(message.contains("Host update apply belongs to the packet 15 train"));
-        assert!(message.contains("no Host state or Satelle sessions were changed"));
+        assert_eq!(plan["changed"], false);
+        assert_eq!(plan["applied_actions"], serde_json::json!([]));
+        assert!(output.stderr.is_empty());
         assert!(!state.path().join("satelle.sqlite3").exists());
         assert!(!state.path().join("satelle.sqlite3.lock").exists());
     }

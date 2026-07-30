@@ -1781,11 +1781,17 @@ fn refreshed_production_snapshot_updates_admission_surfaces_but_not_desktop_disc
         TurnAdmissionFailure::NotAdmitted(_)
     ));
     assert_eq!(initial_error.error().code, ErrorCode::ComputerUseNotReady);
+    let initial_capabilities = service.daemon_runtime_capabilities().unwrap();
+    assert!(initial_capabilities.codex_runtime());
+    let update_evidence = initial_capabilities.codex_update_evidence();
+    let required_version = REQUIRED_CODEX_VERSION.to_string();
+    assert_eq!(
+        update_evidence.native_component_current_version.as_deref(),
+        Some(required_version.as_str())
+    );
     assert!(
-        service
-            .daemon_runtime_capabilities()
-            .unwrap()
-            .codex_runtime()
+        !update_evidence.native_update_required,
+        "missing readiness evidence is not missing installed component evidence"
     );
 
     let mut refreshed = capability_snapshot(

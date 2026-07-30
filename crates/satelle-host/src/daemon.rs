@@ -1811,15 +1811,17 @@ fn production_capabilities(
             native_component_ownership:
                 satelle_core::host_update::CodexComponentOwnership::CodexOwned,
             runtime_current_version: runtime_current_version.clone(),
-            native_component_current_version: native_computer_use
-                .then_some(crate::codex_capabilities::REQUIRED_CODEX_VERSION.to_string()),
+            // Native Computer Use ships with the managed Codex runtime. Its
+            // installed version is runtime evidence, while
+            // `native_computer_use` remains only the readiness-cache result.
+            native_component_current_version: runtime_current_version,
             required_version: crate::codex_capabilities::REQUIRED_CODEX_VERSION.to_string(),
             runtime_update_required: !codex_runtime,
-            native_update_required: !native_computer_use,
+            native_update_required: !codex_runtime,
             runtime_compatibility_reason: runtime_compatibility_reason(snapshot),
             native_component_compatibility_reason: native_compatibility_reason(
                 snapshot,
-                native_computer_use,
+                codex_runtime,
             ),
         },
     }
@@ -1853,14 +1855,12 @@ fn runtime_compatibility_reason(
 
 fn native_compatibility_reason(
     snapshot: &ProductionCapabilitySnapshot,
-    native_computer_use: bool,
+    codex_runtime: bool,
 ) -> Option<satelle_core::host_update::RepairCompatibilityReason> {
-    if native_computer_use {
+    if codex_runtime {
         None
-    } else if snapshot.verdict.is_supported() {
-        Some(satelle_core::host_update::RepairCompatibilityReason::NativeReadinessBlocked)
     } else {
-        Some(satelle_core::host_update::RepairCompatibilityReason::ControlPlaneIncompatible)
+        runtime_compatibility_reason(snapshot)
     }
 }
 
