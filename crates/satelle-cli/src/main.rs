@@ -8015,13 +8015,20 @@ fn run_host_update(
         })
         .collect::<Vec<_>>();
     let report = transport::plan_host_update(&host, &components, includes_all).map_err(failure)?;
-    if format.is_json() {
-        print_json(&report).map_err(failure)?;
-    } else {
-        print!("{}", host_update::render_host_update_plan(&report));
-    }
     if command.dry_run {
+        if format.is_json() {
+            print_json(&report).map_err(failure)?;
+        } else {
+            print!("{}", host_update::render_host_update_plan(&report));
+        }
         return Ok(());
+    }
+
+    // Until packet 15 supplies the mutation executor, JSON mode must return
+    // one typed error object rather than mixing a plan on stdout with an error
+    // on stderr. The read-only plan remains available through --dry-run.
+    if !format.is_json() {
+        print!("{}", host_update::render_host_update_plan(&report));
     }
     Err(failure(SatelleError::not_implemented(concat!(
         "Host update apply belongs to the packet 15 train. The complete plan above was ",

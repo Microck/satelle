@@ -2955,8 +2955,7 @@ pub(crate) fn plan_repair_upgrades(
     host: &SelectedHost,
 ) -> Result<satelle_core::host_update::RepairUpgradeReport, SatelleError> {
     use satelle_core::host_update::{
-        CodexComponentOwnership, HostUpdateTarget, HostUpdateVersionSource,
-        RepairCompatibilityReason,
+        HostUpdateTarget, HostUpdateVersionSource, RepairCompatibilityReason,
     };
 
     let cli_version = env!("CARGO_PKG_VERSION");
@@ -3021,9 +3020,28 @@ pub(crate) fn plan_repair_upgrades(
             && current_host_release.is_some_and(|current| current < cli_release),
     }];
 
-    let codex = inspection.codex_evidence.ok_or_else(|| {
-        SatelleError::ambiguous_codex_component_ownership("codex_update_evidence")
-    })?;
+    append_codex_repair_inspections(&mut repair_inspections, inspection.codex_evidence)?;
+
+    Ok(crate::host_update::build_repair_upgrade_plan(
+        &host.alias,
+        &repair_inspections,
+    ))
+}
+
+fn append_codex_repair_inspections(
+    repair_inspections: &mut Vec<crate::host_update::RepairUpgradeInspection>,
+    codex: Option<satelle_core::host_update::CodexUpdateEvidence>,
+) -> Result<(), SatelleError> {
+    use satelle_core::host_update::{
+        CodexComponentOwnership, HostUpdateTarget, HostUpdateVersionSource,
+    };
+
+    // A missing or unreachable Host cannot provide authenticated Codex
+    // evidence. Keep the derived Host repair actionable without inventing
+    // Codex ownership or proposing an unobserved Codex mutation.
+    let Some(codex) = codex else {
+        return Ok(());
+    };
     let codex_inspections = [
         (
             HostUpdateTarget::CodexRuntime,
@@ -3056,10 +3074,7 @@ pub(crate) fn plan_repair_upgrades(
         });
     }
 
-    Ok(crate::host_update::build_repair_upgrade_plan(
-        &host.alias,
-        &repair_inspections,
-    ))
+    Ok(())
 }
 
 fn map_release_artifact_error(

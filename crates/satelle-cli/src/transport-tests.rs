@@ -72,6 +72,29 @@ fn newer_reachable_host_is_not_hidden_by_its_minimum_version() {
     );
 }
 
+#[test]
+fn missing_codex_evidence_does_not_block_host_repair_planning() {
+    use satelle_core::host_update::{
+        HostUpdateTarget, HostUpdateVersionSource, RepairCompatibilityReason,
+    };
+
+    let mut inspections = vec![crate::host_update::RepairUpgradeInspection {
+        target: HostUpdateTarget::HostDaemon,
+        current_version: None,
+        target_version: "1.0.0".to_string(),
+        compatibility_reason: Some(RepairCompatibilityReason::Missing),
+        version_source: HostUpdateVersionSource::InvokingCliRelease,
+        automation_is_safe: true,
+        newer_compatible_version_available: false,
+    }];
+
+    append_codex_repair_inspections(&mut inspections, None)
+        .expect("missing Codex evidence must not block Host repair planning");
+
+    assert_eq!(inspections.len(), 1);
+    assert_eq!(inspections[0].target, HostUpdateTarget::HostDaemon);
+}
+
 #[derive(Clone)]
 struct RecordingProviderIntentAdapter {
     observed: Arc<Mutex<Option<ProviderComputerUseIntent>>>,

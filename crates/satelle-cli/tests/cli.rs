@@ -3581,9 +3581,10 @@ fn host_update_valid_selections_fail_truthfully_without_mutating_state() {
             .code(70)
             .get_output()
             .clone();
-        let plan = parse_json_output(&output.stdout);
-        assert_eq!(plan["schema_version"], "satelle.host.update.v1");
-        assert_eq!(plan["host"], "local-demo");
+        assert!(
+            output.stdout.is_empty(),
+            "JSON failures must emit one result object on stderr"
+        );
         let report = parse_json_output(&output.stderr);
         assert_exact_object_keys(
             &report,
