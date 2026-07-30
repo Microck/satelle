@@ -5,13 +5,14 @@ use crate::contract::{
     ApiErrorCategory, ApiErrorCode, BootstrapMaintenanceResponse, DURABLE_SETUP_PENDING_TTL,
     DurableTokenActivationResponse, DurableTokenConfirmationResponse, DurableTokenIssuanceResponse,
     NativeReadinessInvalidationRequest, NativeReadinessInvalidationResponse,
-    NativeReadinessInvalidationScope, PROVIDER_SECRET_UPLOAD_CONTENT_TYPE,
-    PROVIDER_SECRET_UPLOAD_INFO, ProviderBindingAuthorizationRequest,
-    ProviderBindingAuthorizationResponse, ProviderBindingDeletionResponse,
-    ProviderDescriptorValidationRequest, ProviderDescriptorValidationResponse,
-    ProviderSecretProvisioningMetadata, ProviderSecretProvisioningPreviewResponse,
-    ProviderSecretProvisioningResponse, ProviderSecretUploadEnvelope, SetupVerificationRequest,
-    SetupVerificationResponse, provider_secret_upload_aad,
+    PROVIDER_SECRET_UPLOAD_CONTENT_TYPE, PROVIDER_SECRET_UPLOAD_INFO,
+    ProviderBindingAuthorizationRequest, ProviderBindingAuthorizationResponse,
+    ProviderBindingDeletionResponse, ProviderDescriptorValidationRequest,
+    ProviderDescriptorValidationResponse, ProviderSecretProvisioningMetadata,
+    ProviderSecretProvisioningPreviewResponse, ProviderSecretProvisioningResponse,
+    ProviderSecretUploadEnvelope, SetupRepairDecision, SetupRepairPlanAction,
+    SetupRepairPlanRequest, SetupRepairPlanResponse, SetupRepairPostcondition,
+    SetupVerificationRequest, SetupVerificationResponse, provider_secret_upload_aad,
 };
 use axum::extract::{Extension, Path, Request, State};
 use axum::http::header::CONTENT_TYPE;
@@ -65,6 +66,99 @@ enum SetupTokenMutationOutcome {
     Conflict,
     HostError(SatelleError),
     TaskFailure,
+}
+
+pub(super) async fn plan_setup_repair(
+    State(state): State<Arc<DaemonState>>,
+    Extension(authorized): Extension<AuthorizedRequest>,
+    Extension(_authority): Extension<MutationAuthority>,
+    ApiJson(request): ApiJson<SetupRepairPlanRequest>,
+) -> Response {
+    // The route's control-scope middleware is the authorization boundary.
+    // Planning reads Host-owned ledger and live-probe state but does not grant
+    // the persistent-service mutation capability used by apply handlers.
+    let run_id = request.run_id().map(str::to_string);
+    let probes = match request
+        .probes()
+        .iter()
+        .map(|probe| {
+            satelle_host::SetupRepairProbe::new(
+                &probe.action_id,
+                &probe.label,
+                probe.retry_safe,
+                match probe.postcondition {
+                    SetupRepairPostcondition::Satisfied => {
+                        satelle_host::SetupRepairPostcondition::Satisfied
+                    }
+                    SetupRepairPostcondition::Unsatisfied => {
+                        satelle_host::SetupRepairPostcondition::Unsatisfied
+                    }
+                    SetupRepairPostcondition::Unknown => {
+                        satelle_host::SetupRepairPostcondition::Unknown
+                    }
+                },
+            )
+        })
+        .collect::<Result<Vec<_>, _>>()
+    {
+        Ok(probes) => probes,
+        Err(error) => return host_error::response(&state, &authorized, &error),
+    };
+    let service = Arc::clone(&state.service);
+    let plan = match tokio::task::spawn_blocking(move || {
+        service.plan_setup_repair(None, run_id.as_deref(), &probes)
+    })
+    .await
+    {
+        Ok(Ok(plan)) => plan,
+        Ok(Err(error)) => return host_error::response(&state, &authorized, &error),
+        Err(_) => return host_error::task_failure(&state, &authorized),
+    };
+    let actions = plan
+        .actions()
+        .iter()
+        .map(|action| SetupRepairPlanAction {
+            action_id: action.action_id().to_string(),
+            label: action.label().to_string(),
+            decision: match action.decision() {
+                satelle_host::SetupRepairDecision::NoActionRequired => {
+                    SetupRepairDecision::NoActionRequired
+                }
+                satelle_host::SetupRepairDecision::RetryAutomatically => {
+                    SetupRepairDecision::RetryAutomatically
+                }
+                satelle_host::SetupRepairDecision::OperatorActionRequired => {
+                    SetupRepairDecision::OperatorActionRequired
+                }
+                satelle_host::SetupRepairDecision::ProbeRequired => {
+                    SetupRepairDecision::ProbeRequired
+                }
+            },
+            retry_safe: action.retry_safe(),
+            previous_run_id: action.previous_run_id().map(str::to_string),
+            previous_status: action.previous_status().map(|status| {
+                match status {
+                    satelle_host::SetupActionStatus::Planned => "planned",
+                    satelle_host::SetupActionStatus::Started => "started",
+                    satelle_host::SetupActionStatus::Completed => "completed",
+                    satelle_host::SetupActionStatus::Failed => "failed",
+                    satelle_host::SetupActionStatus::Skipped => "skipped",
+                    satelle_host::SetupActionStatus::OutcomeUnknown => "outcome_unknown",
+                }
+                .to_string()
+            }),
+        })
+        .collect();
+    authenticated_json_response(
+        StatusCode::OK,
+        &SetupRepairPlanResponse::new(
+            authorized.request_id().clone(),
+            state.host_identity.clone(),
+            actions,
+        ),
+        authorized.request_id(),
+        &state.host_identity,
+    )
 }
 
 pub(super) async fn verify_setup(
@@ -785,7 +879,8 @@ pub(super) async fn begin_bootstrap_maintenance(
         satelle_host::BootstrapMaintenancePlanKind::PersistentHostService
         | satelle_host::BootstrapMaintenancePlanKind::PersistentHostStop
         | satelle_host::BootstrapMaintenancePlanKind::PersistentHostRestart
-        | satelle_host::BootstrapMaintenancePlanKind::HostUpdate => {
+        | satelle_host::BootstrapMaintenancePlanKind::HostUpdate
+        | satelle_host::BootstrapMaintenancePlanKind::Repair => {
             persistent_service_maintenance_principal_is_authorized(&authorized)
         }
     };

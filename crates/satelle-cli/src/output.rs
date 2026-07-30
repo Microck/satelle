@@ -5,8 +5,8 @@ use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 
 use super::{
-    Command, ConfigCommand, EventMode, HostCommand, HostStorageCommand, SelfSubcommand,
-    SupportCommand,
+    Command, ConfigCommand, EventMode, HostCommand, HostStorageBackupCommand, HostStorageCommand,
+    HostStoreCommand, SelfSubcommand, SupportCommand,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
@@ -219,6 +219,14 @@ impl HostCommand {
             Self::Cleanup(command) => (command.output_args, EventOutput::None),
             Self::Sessions(command) => (command.output_args, EventOutput::None),
             Self::Storage { command } => command.output_request(),
+            Self::Store { command } => command.output_request(),
+            Self::OfflineStorageMaintenance(_) => (
+                OutputArgs {
+                    format: None,
+                    json: false,
+                },
+                EventOutput::None,
+            ),
         }
     }
 }
@@ -227,6 +235,18 @@ impl HostStorageCommand {
     const fn output_request(&self) -> (OutputArgs, EventOutput) {
         match self {
             Self::Migrate(command) => (command.output_args, EventOutput::None),
+            Self::Restore(command) => (command.output_args, EventOutput::None),
+            Self::Backup {
+                command: HostStorageBackupCommand::Cleanup(command),
+            } => (command.output_args, EventOutput::None),
+        }
+    }
+}
+
+impl HostStoreCommand {
+    const fn output_request(&self) -> (OutputArgs, EventOutput) {
+        match self {
+            Self::Reset(command) => (command.output_args, EventOutput::None),
         }
     }
 }

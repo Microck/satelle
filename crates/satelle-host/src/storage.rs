@@ -45,6 +45,7 @@ pub(crate) use self::provider_secret_journal::{
     ProviderSecretProvisioningPreflight, ProviderSecretProvisioningReplay,
     provider_secret_file_paths,
 };
+pub(crate) use self::retention::DEFAULT_SETUP_LEDGER_RETENTION;
 pub(crate) use self::setup_ledger::{
     MaintenanceLeaseCapability, MaintenanceLeaseState, MaintenanceRecoverySubject,
 };
@@ -53,6 +54,43 @@ pub use self::setup_ledger::{
     SetupOperationKind, SetupRepairAction, SetupRepairDecision, SetupRepairPlan,
     SetupRepairPostcondition, SetupRepairProbe, SetupRunPlan, SetupRunRecord, SetupRunStatus,
 };
+
+pub(crate) fn plan_migration_backup_cleanup(
+    state_root: &std::path::Path,
+) -> Result<Vec<String>, StorageError> {
+    open::plan_migration_backup_cleanup(state_root)
+}
+
+pub(crate) fn validate_migration_backup_for_restore(
+    state_root: &std::path::Path,
+    backup_file_name: &str,
+) -> Result<(), StorageError> {
+    open::validate_migration_backup_for_restore(state_root, backup_file_name)
+}
+
+pub(crate) fn restore_migration_backup_offline(
+    state_root: &std::path::Path,
+    backup_file_name: &str,
+) -> Result<(String, Vec<String>), StorageError> {
+    open::restore_migration_backup_offline(state_root, backup_file_name).map(|activation| {
+        (
+            activation.failed_store_file_name,
+            activation.failed_sidecar_file_names,
+        )
+    })
+}
+
+pub(crate) fn cleanup_migration_backups_offline(
+    state_root: &std::path::Path,
+) -> Result<Vec<String>, StorageError> {
+    open::cleanup_migration_backups_offline(state_root)
+}
+
+pub(crate) fn reset_store_metadata_offline(
+    state_root: &std::path::Path,
+) -> Result<Vec<String>, StorageError> {
+    open::reset_store_metadata_offline(state_root)
+}
 use self::sql::{
     StoredIdempotency, ensure_control_lease_available, ensure_no_pending_stop,
     insert_control_lease, insert_idempotency, insert_initial_session, insert_safe_log,

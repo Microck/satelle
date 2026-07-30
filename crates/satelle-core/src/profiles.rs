@@ -21,6 +21,7 @@ const PROFILE_KEYS: &[&str] = &[
     "provider_smoke_success_cache_ttl",
     "provider_smoke_failure_cache_ttl",
     "daemon_idle_timeout",
+    "setup_ledger_retention",
 ];
 const TIMEOUT_KEYS: &[&str] = &["native_readiness", "provider_smoke_test", "turn_execution"];
 
@@ -77,6 +78,7 @@ pub(super) struct ProfileConfig {
     provider_smoke_success_cache_ttl: Option<ExplicitDuration>,
     provider_smoke_failure_cache_ttl: Option<ExplicitDuration>,
     daemon_idle_timeout: Option<ExplicitDuration>,
+    setup_ledger_retention: Option<ExplicitDuration>,
 }
 
 impl ProfileConfig {
@@ -152,6 +154,9 @@ impl ProfileConfig {
         }
         if let Some(timeout) = &self.daemon_idle_timeout {
             host.daemon_idle_timeout = Some(timeout.clone());
+        }
+        if let Some(retention) = &self.setup_ledger_retention {
+            host.setup_ledger_retention = Some(retention.clone());
         }
         if source.allows_user_policy()
             && let Some(enabled) = self.experimental_provider_computer_use
@@ -379,6 +384,11 @@ fn reject_profile_interpolation(
         table.get("daemon_idle_timeout"),
         &mut interpolations,
     );
+    collect_interpolation_for_value(
+        &format!("{profile_path}.setup_ledger_retention"),
+        table.get("setup_ledger_retention"),
+        &mut interpolations,
+    );
     if let Some(timeouts) = table.get("timeouts").and_then(toml::Value::as_table) {
         for key in TIMEOUT_KEYS {
             collect_interpolation_for_value(
@@ -426,6 +436,15 @@ fn reject_profile_duration_errors(
         };
         if ExplicitDuration::parse(value).is_none() {
             return Err(SatelleError::duration_unit_required(path, &timeout_path));
+        }
+    }
+    if let Some(value) = table.get("setup_ledger_retention") {
+        let retention_path = format!("{profile_path}.setup_ledger_retention");
+        let Some(value) = value.as_str() else {
+            return Err(SatelleError::duration_unit_required(path, &retention_path));
+        };
+        if ExplicitDuration::parse(value).is_none() {
+            return Err(SatelleError::duration_unit_required(path, &retention_path));
         }
     }
     let Some(timeouts) = table.get("timeouts").and_then(toml::Value::as_table) else {
@@ -663,5 +682,27 @@ mod timeout_profile_tests {
                 "source={source:?}"
             );
         }
+    }
+
+    #[test]
+    fn profile_overrides_host_setup_ledger_retention() {
+        let profile: ProfileConfig =
+            toml::from_str("setup_ledger_retention = \"60m\"\n").expect("parse profile retention");
+        let mut host = base_host();
+        host.setup_ledger_retention =
+            Some(ExplicitDuration::parse("43200m").expect("parse default retention"));
+
+        profile.apply_to_host(
+            super::super::LOCAL_DEMO_HOST,
+            &mut host,
+            ProfileSelectionSource::UserConfig,
+        );
+
+        assert_eq!(
+            host.setup_ledger_retention
+                .expect("profile retention applies")
+                .milliseconds(),
+            60 * 60 * 1_000
+        );
     }
 }

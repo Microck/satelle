@@ -30,6 +30,7 @@ const SUCCESS_MUTATION_PHASES: &[&str] = &[
     "persistent_service_start",
     "persistent_service_restart",
     "persistent_service_stop",
+    "offline_storage_maintenance",
 ];
 const RECOVERABLE_OPERATION_KINDS: &[&str] = &[
     "initial_setup",
@@ -37,6 +38,7 @@ const RECOVERABLE_OPERATION_KINDS: &[&str] = &[
     "host_binary_replacement",
     "service_stop",
     "service_restart",
+    "storage_maintenance",
 ];
 
 fn powershell_list(values: &[&str]) -> String {
@@ -58,6 +60,7 @@ pub(super) enum OperationKind {
     HostBinaryReplacement,
     ServiceStop,
     ServiceRestart,
+    StorageMaintenance,
 }
 
 impl OperationKind {
@@ -68,6 +71,7 @@ impl OperationKind {
             Self::HostBinaryReplacement => "host_binary_replacement",
             Self::ServiceStop => "service_stop",
             Self::ServiceRestart => "service_restart",
+            Self::StorageMaintenance => "storage_maintenance",
         }
     }
 }

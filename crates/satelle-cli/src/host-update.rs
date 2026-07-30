@@ -497,6 +497,13 @@ pub fn build_repair_upgrade_plan(
         inspections
             .iter()
             .map(|inspection| RepairUpgradeAction {
+                action_id: match inspection.target {
+                    HostUpdateTarget::HostDaemon => "repair-host-daemon",
+                    HostUpdateTarget::HostDaemonService => "repair-host-daemon-service",
+                    HostUpdateTarget::CodexRuntime => "repair-codex-runtime",
+                    HostUpdateTarget::CodexNativeComputerUse => "repair-codex-native-computer-use",
+                }
+                .to_string(),
                 target: inspection.target,
                 current_version: inspection.current_version.clone(),
                 target_version: inspection.target_version.clone(),
@@ -582,11 +589,18 @@ pub fn render_repair_upgrade_plan(
     report: &satelle_core::host_update::RepairUpgradeReport,
 ) -> String {
     let mut output = format!("Repair upgrade plan for {}\n", report.host);
-    let _ = writeln!(
-        output,
-        "ledger: {:?}; plan source: {:?}",
-        report.ledger_status, report.plan_source
-    );
+    if report.ledger_status == satelle_core::host_update::RepairLedgerStatus::Available {
+        let _ = writeln!(output, "plan source: retained setup action ledger");
+    } else if report
+        .actions
+        .iter()
+        .any(|action| action.compatibility_reason.is_some())
+    {
+        let _ = writeln!(
+            output,
+            "warning: retained setup history is unavailable; the plan uses current Host probes"
+        );
+    }
     for action in &report.actions {
         let current = action.current_version.as_deref().unwrap_or("not installed");
         let reason = action
@@ -602,6 +616,19 @@ pub fn render_repair_upgrade_plan(
             reason,
             action.version_source
         );
+    }
+    output
+}
+
+pub fn render_repair_upgrade_result(
+    report: &satelle_core::host_update::RepairUpgradeReport,
+) -> String {
+    let mut output = format!("Repair status for {}: {:?}\n", report.host, report.status);
+    for action in &report.completed_actions {
+        let _ = writeln!(output, "- completed: {action}");
+    }
+    for action in &report.skipped_actions {
+        let _ = writeln!(output, "- skipped: {action}");
     }
     output
 }
@@ -1283,6 +1310,7 @@ mod tests {
         assert_eq!(
             report.actions[0],
             RepairUpgradeAction {
+                action_id: "repair-codex-runtime".to_string(),
                 target: HostUpdateTarget::CodexRuntime,
                 current_version: Some("0.9.0".to_string()),
                 target_version: "1.0.0".to_string(),
@@ -1290,6 +1318,40 @@ mod tests {
                 version_source: HostUpdateVersionSource::CodexCompatibilityRequirement,
                 disposition: RepairUpgradeDisposition::ManualActionRequired,
             }
+        );
+    }
+
+    #[test]
+    fn repair_human_output_warns_about_missing_history_only_when_it_affects_explanation() {
+        let healthy = build_repair_upgrade_plan(
+            "office",
+            &[RepairUpgradeInspection {
+                target: HostUpdateTarget::HostDaemon,
+                current_version: Some("1.0.0".to_string()),
+                target_version: "1.0.0".to_string(),
+                compatibility_reason: None,
+                version_source: HostUpdateVersionSource::InvokingCliRelease,
+                automation_is_safe: true,
+                newer_compatible_version_available: false,
+            }],
+        );
+        assert!(!render_repair_upgrade_plan(&healthy).contains("history is unavailable"));
+
+        let blocked = build_repair_upgrade_plan(
+            "office",
+            &[RepairUpgradeInspection {
+                target: HostUpdateTarget::HostDaemon,
+                current_version: None,
+                target_version: "1.0.0".to_string(),
+                compatibility_reason: Some(RepairCompatibilityReason::Missing),
+                version_source: HostUpdateVersionSource::InvokingCliRelease,
+                automation_is_safe: true,
+                newer_compatible_version_available: false,
+            }],
+        );
+        assert!(
+            render_repair_upgrade_plan(&blocked)
+                .contains("warning: retained setup history is unavailable")
         );
     }
 }

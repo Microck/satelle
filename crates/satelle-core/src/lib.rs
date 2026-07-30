@@ -112,6 +112,7 @@ impl SatelleConfig {
                 provider_smoke_success_cache_ttl: None,
                 provider_smoke_failure_cache_ttl: None,
                 daemon_idle_timeout: None,
+                setup_ledger_retention: None,
                 desktop_user: None,
                 desktop_session_preference: None,
                 desktop_session_native_selector: None,
@@ -295,6 +296,7 @@ pub struct HostConfig {
     pub provider_smoke_success_cache_ttl: Option<ExplicitDuration>,
     pub provider_smoke_failure_cache_ttl: Option<ExplicitDuration>,
     pub daemon_idle_timeout: Option<ExplicitDuration>,
+    pub setup_ledger_retention: Option<ExplicitDuration>,
     pub desktop_user: Option<String>,
     pub desktop_session_preference: Option<DesktopSessionPreference>,
     pub desktop_session_native_selector: Option<DesktopSessionNativeSelector>,
@@ -3100,6 +3102,7 @@ fn reject_interpolation(path: &Path, value: &toml::Value) -> Result<(), SatelleE
             "provider_smoke_success_cache_ttl",
             "provider_smoke_failure_cache_ttl",
             "daemon_idle_timeout",
+            "setup_ledger_retention",
         ] {
             collect_interpolation_for_value(
                 &format!("{host_path}.{key}"),
@@ -3352,6 +3355,15 @@ fn reject_timeout_config_errors(path: &Path, value: &toml::Value) -> Result<(), 
             };
             if ExplicitDuration::parse(value).is_none() {
                 return Err(SatelleError::duration_unit_required(path, &timeout_path));
+            }
+        }
+        if let Some(value) = host_table.get("setup_ledger_retention") {
+            let retention_path = format!("{host_path}.setup_ledger_retention");
+            let Some(value) = value.as_str() else {
+                return Err(SatelleError::duration_unit_required(path, &retention_path));
+            };
+            if ExplicitDuration::parse(value).is_none() {
+                return Err(SatelleError::duration_unit_required(path, &retention_path));
             }
         }
         let Some(timeouts) = host_table.get("timeouts").and_then(toml::Value::as_table) else {
@@ -3654,6 +3666,7 @@ fn reject_unknown_user_config_keys(path: &Path, value: &toml::Value) -> Result<(
                     "provider_smoke_success_cache_ttl",
                     "provider_smoke_failure_cache_ttl",
                     "daemon_idle_timeout",
+                    "setup_ledger_retention",
                     "desktop_user",
                     "desktop_session_preference",
                     "desktop_session_native_selector",
@@ -4033,6 +4046,9 @@ pub enum ErrorCode {
     SelfUpdateFailed,
     PersistentServiceUnsupported,
     SetupConsentRequired,
+    SetupActionFailed,
+    SetupPartiallyApplied,
+    SetupLedgerUnavailable,
     SetupVerificationFailed,
     DoctorFixConsentRequired,
     InputRequired,
@@ -4157,6 +4173,9 @@ impl ErrorCode {
             Self::SelfUpdateFailed => "self-update-failed",
             Self::PersistentServiceUnsupported => "persistent-service-unsupported",
             Self::SetupConsentRequired => "setup-consent-required",
+            Self::SetupActionFailed => "setup-action-failed",
+            Self::SetupPartiallyApplied => "setup-partially-applied",
+            Self::SetupLedgerUnavailable => "setup-ledger-unavailable",
             Self::SetupVerificationFailed => "setup-verification-failed",
             Self::DoctorFixConsentRequired => "doctor-fix-consent-required",
             Self::InputRequired => "input-required",
@@ -4186,6 +4205,7 @@ impl ErrorCode {
             | Self::PersistentServiceUnsupported
             | Self::ExperimentalProviderOptInRequired
             | Self::SetupConsentRequired
+            | Self::SetupLedgerUnavailable
             | Self::DoctorFixConsentRequired
             | Self::InputRequired
             | Self::DesktopBindingRequired
@@ -4245,6 +4265,8 @@ impl ErrorCode {
             | Self::HostUpdateRecoveryPending
             | Self::HostUpdatePartiallyApplied
             | Self::HostUpdatePostcheckFailed
+            | Self::SetupActionFailed
+            | Self::SetupPartiallyApplied
             | Self::StorageBusy
             | Self::StorageIntegrityFailed
             | Self::ProviderSecretResolutionFailed
@@ -5695,6 +5717,146 @@ impl SatelleError {
         }
     }
 
+    pub fn setup_action_failed(
+        host: &str,
+        failed_action: &str,
+        skipped_actions: &[String],
+        source: impl Into<String>,
+    ) -> Self {
+        let recovery_command = Some(format!("satelle repair --host {host} --no-input --yes"));
+        Self {
+            code: ErrorCode::SetupActionFailed,
+            message: format!(
+                "setup or repair action '{failed_action}' failed before any remote mutation completed"
+            ),
+            recovery_command: recovery_command.clone(),
+            source_detail: Some(source.into()),
+            details: BTreeMap::from([
+                ("status".to_string(), Value::String("failed".to_string())),
+                ("changed".to_string(), Value::Bool(false)),
+                ("completed_actions".to_string(), Value::Array(Vec::new())),
+                (
+                    "failed_action".to_string(),
+                    Value::String(failed_action.to_string()),
+                ),
+                (
+                    "skipped_actions".to_string(),
+                    serde_json::to_value(skipped_actions).unwrap_or(Value::Null),
+                ),
+                (
+                    "preserved_state".to_string(),
+                    Value::String("no remote mutation completed".to_string()),
+                ),
+                (
+                    "recovery_command".to_string(),
+                    serde_json::to_value(&recovery_command).unwrap_or(Value::Null),
+                ),
+            ]),
+        }
+    }
+
+    pub fn setup_partially_applied(
+        report: &crate::host_update::RepairUpgradeReport,
+        source: impl Into<String>,
+    ) -> Self {
+        let failed_action = report.failed_action.as_deref().unwrap_or("unknown");
+        Self {
+            code: ErrorCode::SetupPartiallyApplied,
+            message: format!(
+                "setup or repair action '{failed_action}' failed after one or more remote mutations completed"
+            ),
+            recovery_command: report.recovery_command.clone(),
+            source_detail: Some(source.into()),
+            details: BTreeMap::from([
+                (
+                    "status".to_string(),
+                    Value::String("partial_failure".to_string()),
+                ),
+                ("changed".to_string(), Value::Bool(true)),
+                (
+                    "completed_actions".to_string(),
+                    serde_json::to_value(&report.completed_actions).unwrap_or(Value::Null),
+                ),
+                (
+                    "failed_action".to_string(),
+                    Value::String(failed_action.to_string()),
+                ),
+                (
+                    "skipped_actions".to_string(),
+                    serde_json::to_value(&report.skipped_actions).unwrap_or(Value::Null),
+                ),
+                (
+                    "preserved_state".to_string(),
+                    serde_json::to_value(&report.preserved_state).unwrap_or(Value::Null),
+                ),
+                (
+                    "recovery_command".to_string(),
+                    serde_json::to_value(&report.recovery_command).unwrap_or(Value::Null),
+                ),
+            ]),
+        }
+    }
+
+    pub fn storage_maintenance_partially_applied(
+        host: &str,
+        completed_actions: &[String],
+        failed_action: &str,
+        skipped_actions: &[String],
+        source: impl Into<String>,
+    ) -> Self {
+        let recovery_command = Some(format!("satelle repair --host {host} --no-input --yes"));
+        Self {
+            code: ErrorCode::SetupPartiallyApplied,
+            message: format!(
+                "Host storage maintenance action '{failed_action}' failed after one or more mutations completed"
+            ),
+            recovery_command: recovery_command.clone(),
+            source_detail: Some(source.into()),
+            details: BTreeMap::from([
+                (
+                    "status".to_string(),
+                    Value::String("partial_failure".to_string()),
+                ),
+                ("changed".to_string(), Value::Bool(true)),
+                (
+                    "completed_actions".to_string(),
+                    serde_json::to_value(completed_actions).unwrap_or(Value::Null),
+                ),
+                (
+                    "failed_action".to_string(),
+                    Value::String(failed_action.to_string()),
+                ),
+                (
+                    "skipped_actions".to_string(),
+                    serde_json::to_value(skipped_actions).unwrap_or(Value::Null),
+                ),
+                (
+                    "preserved_state".to_string(),
+                    Value::String(
+                        "completed Host storage maintenance mutations were preserved".to_string(),
+                    ),
+                ),
+                (
+                    "recovery_command".to_string(),
+                    serde_json::to_value(&recovery_command).unwrap_or(Value::Null),
+                ),
+            ]),
+        }
+    }
+
+    pub fn setup_ledger_unavailable(run_id: &str) -> Self {
+        Self {
+            code: ErrorCode::SetupLedgerUnavailable,
+            message: format!("setup action ledger run '{run_id}' is unavailable"),
+            recovery_command: Some(
+                "run satelle repair without --run to build a plan from live Host probes"
+                    .to_string(),
+            ),
+            source_detail: None,
+            details: BTreeMap::from([("run_id".to_string(), Value::String(run_id.to_string()))]),
+        }
+    }
+
     pub fn ambiguous_codex_component_ownership(target: &str) -> Self {
         let mut details = BTreeMap::new();
         details.insert("target".to_string(), Value::from(target));
@@ -6014,6 +6176,79 @@ mod error_contract_tests {
 
         let postcheck = SatelleError::host_update_postcheck_failed(&report, "readiness failed");
         assert_eq!(postcheck.recovery_command.as_deref(), Some(doctor_command));
+    }
+
+    #[test]
+    fn setup_failures_distinguish_pre_mutation_and_partial_results() {
+        use crate::host_update::{
+            RepairCompatibilityReason, RepairUpgradeAction, RepairUpgradeDisposition,
+            RepairUpgradeReport,
+        };
+
+        let pre_mutation = SatelleError::setup_action_failed(
+            "remote",
+            "repair-host-daemon",
+            &["repair-codex-runtime".to_string()],
+            "install failed",
+        );
+        assert_eq!(pre_mutation.code, ErrorCode::SetupActionFailed);
+        assert_eq!(pre_mutation.exit_code(), 74);
+        assert_eq!(pre_mutation.details["changed"], false);
+        assert_eq!(
+            pre_mutation.details["completed_actions"],
+            serde_json::json!([])
+        );
+
+        let report = RepairUpgradeReport::new(
+            "remote",
+            vec![RepairUpgradeAction {
+                action_id: "repair-host-daemon".to_string(),
+                target: crate::host_update::HostUpdateTarget::HostDaemon,
+                current_version: Some("1.0.0".to_string()),
+                target_version: "1.1.0".to_string(),
+                compatibility_reason: Some(RepairCompatibilityReason::BelowMinimumVersion),
+                version_source:
+                    crate::host_update::HostUpdateVersionSource::HostCompatibilityRequirement,
+                disposition: RepairUpgradeDisposition::Required,
+            }],
+        )
+        .partial_failure(
+            vec!["repair-host-daemon".to_string()],
+            "repair-native-computer-use",
+        );
+        let partial = SatelleError::setup_partially_applied(&report, "postcheck failed");
+        assert_eq!(partial.code, ErrorCode::SetupPartiallyApplied);
+        assert_eq!(partial.exit_code(), 74);
+        assert_eq!(partial.details["status"], "partial_failure");
+        assert_eq!(
+            partial.details["completed_actions"],
+            serde_json::json!(["repair-host-daemon"])
+        );
+
+        let storage_partial = SatelleError::storage_maintenance_partially_applied(
+            "remote",
+            &["restore-storage-backup".to_string()],
+            "restart-host-api-service",
+            &["verify-host-api-service".to_string()],
+            "service restart failed",
+        );
+        assert_eq!(storage_partial.code, ErrorCode::SetupPartiallyApplied);
+        assert_eq!(storage_partial.exit_code(), 74);
+        assert_eq!(storage_partial.details["status"], "partial_failure");
+        assert_eq!(storage_partial.details["changed"], true);
+        assert_eq!(
+            storage_partial.details["completed_actions"],
+            serde_json::json!(["restore-storage-backup"])
+        );
+        assert_eq!(
+            storage_partial.details["failed_action"],
+            "restart-host-api-service"
+        );
+
+        let missing = SatelleError::setup_ledger_unavailable("expired-run");
+        assert_eq!(missing.code, ErrorCode::SetupLedgerUnavailable);
+        assert_eq!(missing.exit_code(), 64);
+        assert_eq!(missing.details["run_id"], "expired-run");
     }
 
     #[test]

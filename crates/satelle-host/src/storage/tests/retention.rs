@@ -270,6 +270,39 @@ fn terminal_setup_ledgers_expire_only_after_the_exact_thirty_day_boundary() {
 }
 
 #[test]
+fn configured_setup_ledger_retention_changes_only_the_ledger_cutoff() {
+    let state = TempDir::new().expect("temporary state directory");
+    let (mut storage, _) = Storage::open(state.path()).expect("open storage");
+    let finished_at = at(10);
+    let retention = time::Duration::hours(1);
+    terminal_setup_run(
+        &mut storage,
+        "configured-retention",
+        SetupRunStatus::Completed,
+        finished_at,
+    );
+
+    storage
+        .prune_expired_session_metadata_with_setup_retention(finished_at + retention, retention)
+        .unwrap();
+    assert_eq!(
+        1,
+        setup_rows(&storage, "setup_runs", "configured-retention")
+    );
+
+    storage
+        .prune_expired_session_metadata_with_setup_retention(
+            finished_at + retention + time::Duration::nanoseconds(1),
+            retention,
+        )
+        .unwrap();
+    assert_eq!(
+        0,
+        setup_rows(&storage, "setup_runs", "configured-retention")
+    );
+}
+
+#[test]
 fn setup_ledger_retention_preserves_recovery_work_and_unrelated_host_state() {
     let state = TempDir::new().expect("temporary state directory");
     let (mut storage, _) = Storage::open(state.path()).expect("open storage");

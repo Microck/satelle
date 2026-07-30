@@ -2692,6 +2692,28 @@ impl<'a> PersistentServiceRemote<'a> {
         parse_loopback_listener_observation(&output.stdout)
     }
 
+    pub(super) fn run_offline_storage_maintenance(
+        &mut self,
+        artifact: &UploadedHostArtifact,
+        operation: &str,
+        operation_id: &str,
+        state_root: &str,
+        backup: Option<&str>,
+        delete_recordings: bool,
+    ) -> Result<(), SshBootstrapError> {
+        let binary = self.absolute_artifact_path(artifact);
+        let command = offline_storage_maintenance_command(
+            self.target,
+            &binary,
+            operation,
+            operation_id,
+            state_root,
+            backup,
+            delete_recordings,
+        );
+        self.mutate("offline_storage_maintenance", &command, None)
+    }
+
     pub(super) fn observe_canonical_daemon_path_overrides(
         &self,
         host_id: &str,
@@ -2842,6 +2864,48 @@ impl<'a> PersistentServiceRemote<'a> {
         } else {
             join_target_path(self.target, &self.directories.home, artifact.remote_path())
         }
+    }
+}
+
+fn offline_storage_maintenance_command(
+    target: RemoteTarget,
+    binary: &str,
+    operation: &str,
+    operation_id: &str,
+    state_root: &str,
+    backup: Option<&str>,
+    delete_recordings: bool,
+) -> String {
+    if target.is_windows() {
+        let mut script = format!(
+            "& {} host offline-storage-maintenance --operation {} --operation-id {} --state-root {}",
+            powershell_quote(binary),
+            powershell_quote(operation),
+            powershell_quote(operation_id),
+            powershell_quote(state_root),
+        );
+        if let Some(backup) = backup {
+            script.push_str(&format!(" --backup {}", powershell_quote(backup)));
+        }
+        if delete_recordings {
+            script.push_str(" --delete-recordings");
+        }
+        powershell_encoded_command(&script)
+    } else {
+        let mut arguments = format!(
+            "{} host offline-storage-maintenance --operation {} --operation-id {} --state-root {}",
+            posix_quote(binary),
+            posix_quote(operation),
+            posix_quote(operation_id),
+            posix_quote(state_root),
+        );
+        if let Some(backup) = backup {
+            arguments.push_str(&format!(" --backup {}", posix_quote(backup)));
+        }
+        if delete_recordings {
+            arguments.push_str(" --delete-recordings");
+        }
+        format!("sh -c {}", posix_quote(&format!("exec {arguments}")))
     }
 }
 
@@ -7401,6 +7465,7 @@ mod tests {
             provider_smoke_success_cache_ttl: None,
             provider_smoke_failure_cache_ttl: None,
             daemon_idle_timeout: None,
+            setup_ledger_retention: None,
             desktop_user: None,
             desktop_session_preference: None,
             desktop_session_native_selector: None,
@@ -8470,5 +8535,51 @@ mod tests {
         assert!(!script.contains("--bootstrap-operation-kind"));
         assert!(script.contains("RedirectStandardInput = $true"));
         assert!(script.contains("StandardInput.WriteLine($token)"));
+    }
+
+    #[test]
+    fn offline_storage_commands_are_exact_on_windows_and_macos() {
+        let windows = offline_storage_maintenance_command(
+            RemoteTarget::WindowsX64Msvc,
+            r"C:\Satelle\satelle.exe",
+            "restore",
+            "storage-operation-1",
+            r"C:\Satelle\state",
+            Some(r"C:\Satelle\state\migration.backup"),
+            false,
+        );
+        let windows_script =
+            decode_powershell_command(&windows).expect("decode Windows storage command");
+        assert_eq!(
+            windows_script,
+            concat!(
+                "& 'C:\\Satelle\\satelle.exe' host offline-storage-maintenance ",
+                "--operation 'restore' --operation-id 'storage-operation-1' ",
+                "--state-root 'C:\\Satelle\\state' ",
+                "--backup 'C:\\Satelle\\state\\migration.backup'"
+            )
+        );
+
+        let macos = offline_storage_maintenance_command(
+            RemoteTarget::DarwinArm64,
+            "/Users/test/satelle",
+            "store-reset",
+            "storage-operation-2",
+            "/Users/test/state",
+            None,
+            true,
+        );
+        let expected_macos_arguments = concat!(
+            "'/Users/test/satelle' host offline-storage-maintenance ",
+            "--operation 'store-reset' --operation-id 'storage-operation-2' ",
+            "--state-root '/Users/test/state' --delete-recordings"
+        );
+        assert_eq!(
+            macos,
+            format!(
+                "sh -c {}",
+                posix_quote(&format!("exec {expected_macos_arguments}"))
+            )
+        );
     }
 }

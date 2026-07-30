@@ -2000,6 +2000,57 @@ async fn bootstrap_maintenance_routes_enforce_the_mutation_contract_before_ledge
 }
 
 #[tokio::test]
+async fn setup_repair_plan_uses_live_probes_and_reports_missing_selected_runs() {
+    let running = RunningServer::start(ApiScopes::ADMIN).await;
+    let probes = serde_json::json!([
+        {
+            "action_id": "install-host-artifact",
+            "label": "Install the verified Host artifact",
+            "retry_safe": true,
+            "postcondition": "unsatisfied"
+        }
+    ]);
+
+    let live_plan = running
+        .mutation("/v1/setup/repair-plan", "repair-plan-live-probes")
+        .json(&serde_json::json!({
+            "schema_version": "satelle.setup-repair-plan.v1",
+            "run_id": null,
+            "probes": probes.clone()
+        }))
+        .send()
+        .await
+        .expect("plan repair from live probes");
+    let live_status = live_plan.status();
+    let live_body: Value = live_plan.json().await.expect("decode live repair plan");
+    assert_eq!(live_status, StatusCode::OK, "{live_body}");
+    assert_eq!(live_body["ledger_available"], false);
+    assert_eq!(live_body["actions"][0]["decision"], "retry_automatically");
+
+    let missing = running
+        .mutation("/v1/setup/repair-plan", "repair-plan-missing-run")
+        .json(&serde_json::json!({
+            "schema_version": "satelle.setup-repair-plan.v1",
+            "run_id": "expired-setup-run",
+            "probes": probes
+        }))
+        .send()
+        .await
+        .expect("inspect missing setup run");
+    let missing_status = missing.status();
+    let missing_body: Value = missing.json().await.expect("decode missing-run error");
+    assert_eq!(missing_status, StatusCode::NOT_FOUND, "{missing_body}");
+    assert_eq!(missing_body["code"], "setup-ledger-unavailable");
+    assert_eq!(missing_body["details"]["run_id"], "expired-setup-run");
+
+    running
+        .server
+        .shutdown()
+        .await
+        .expect("stop repair-plan server");
+}
+
+#[tokio::test]
 async fn persistent_host_service_maintenance_routes_enforce_action_order() {
     let state = TestStateDir::new().expect("temporary state directory");
     let bootstrap_token = ApiBearerToken::generate().expect("generate bootstrap token");

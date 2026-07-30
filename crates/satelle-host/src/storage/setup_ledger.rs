@@ -1215,6 +1215,7 @@ impl Storage {
     pub(crate) fn plan_setup_repair(
         &self,
         desktop_binding: Option<&DesktopBindingRef>,
+        selected_run: Option<&SetupRunRecord>,
         probes: &[SetupRepairProbe],
     ) -> Result<SetupRepairPlan, StorageError> {
         let mut action_ids = HashSet::with_capacity(probes.len());
@@ -1228,7 +1229,24 @@ impl Storage {
             return Err(StorageError::new(StorageErrorKind::StateConflict));
         }
 
-        let history = self.latest_setup_actions(desktop_binding)?;
+        let history = match selected_run {
+            Some(run) => run
+                .actions()
+                .iter()
+                .map(|action| {
+                    (
+                        action.action_id().to_string(),
+                        PreviousSetupAction {
+                            run_id: run.run_id().to_string(),
+                            status: action.status(),
+                            retry_safe: action.retry_safe(),
+                            row_id: 0,
+                        },
+                    )
+                })
+                .collect(),
+            None => self.latest_setup_actions(desktop_binding)?,
+        };
         let actions = probes
             .iter()
             .map(|probe| {

@@ -810,6 +810,7 @@ mod tests {
             provider_smoke_success_cache_ttl: None,
             provider_smoke_failure_cache_ttl: None,
             daemon_idle_timeout: None,
+            setup_ledger_retention: None,
             desktop_user: None,
             desktop_session_preference: None,
             desktop_session_native_selector: None,

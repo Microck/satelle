@@ -153,6 +153,14 @@ fn failure(error: &SatelleError) -> ApiFailure {
             message: "the requested Satelle Session does not exist",
             details: None,
         },
+        ErrorCode::SetupLedgerUnavailable => ApiFailure {
+            status: StatusCode::NOT_FOUND,
+            code: ApiErrorCode::SetupLedgerUnavailable,
+            category: ApiErrorCategory::NotFound,
+            retryable: false,
+            message: "the requested setup action ledger run is unavailable",
+            details: validated_string_details(error, &["run_id"]),
+        },
         ErrorCode::LogsCursorExpired => ApiFailure {
             status: StatusCode::GONE,
             code: ApiErrorCode::LogsCursorExpired,
@@ -389,6 +397,10 @@ fn failure(error: &SatelleError) -> ApiFailure {
         | ErrorCode::AmbiguousCodexComponentOwnership
         | ErrorCode::HostUpdatePartiallyApplied
         | ErrorCode::HostUpdatePostcheckFailed
+        // Setup action and partial-application failures are Controller-local
+        // execution results.
+        | ErrorCode::SetupActionFailed
+        | ErrorCode::SetupPartiallyApplied
         // Process interruption is a Controller-local process-exit contract.
         // If it crosses the Host boundary, expose no extra API surface.
         | ErrorCode::Interrupted

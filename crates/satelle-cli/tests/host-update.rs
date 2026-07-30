@@ -1,6 +1,7 @@
 use assert_cmd::Command;
 use satelle_host::test_support::TestStateDir;
 use serde_json::Value;
+use std::fs;
 
 fn satelle() -> Command {
     Command::new(assert_cmd::cargo::cargo_bin!("satelle"))
@@ -224,4 +225,112 @@ fn repair_dry_run_uses_live_typed_upgrade_evidence() {
         assert_eq!(actions.len(), 1);
         assert_eq!(actions[0]["target"], "host_daemon");
     }
+}
+
+#[test]
+fn repair_selected_missing_run_returns_the_typed_ledger_diagnostic() {
+    let state = tempfile::tempdir().expect("temporary repair state");
+    let output = satelle()
+        .env("SATELLE_STATE_DIR", state.path())
+        .args([
+            "repair",
+            "--host",
+            "local-demo",
+            "--run",
+            "expired-setup-run",
+            "--dry-run",
+            "--json",
+        ])
+        .output()
+        .expect("inspect a missing repair run");
+
+    assert_eq!(output.status.code(), Some(64));
+    assert!(output.stdout.is_empty());
+    let error: Value = serde_json::from_slice(&output.stderr).expect("parse repair error");
+    assert_eq!(error["code"], "setup-ledger-unavailable");
+    assert_eq!(error["details"]["run_id"], "expired-setup-run");
+}
+
+#[test]
+fn store_reset_dry_run_is_a_noop_and_apply_preserves_recordings_by_default() {
+    let state = tempfile::tempdir().expect("temporary store reset state");
+    let recordings = state.path().join("recordings");
+    fs::create_dir(&recordings).expect("create recordings directory");
+    let recording = recordings.join("recording.webm");
+    fs::write(&recording, b"recording").expect("write recording fixture");
+
+    let dry_run = satelle()
+        .env("SATELLE_STATE_DIR", state.path())
+        .args([
+            "host",
+            "store",
+            "reset",
+            "--host",
+            "local-demo",
+            "--dry-run",
+            "--yes",
+            "--json",
+        ])
+        .output()
+        .expect("preview store reset");
+    assert!(dry_run.status.success());
+    assert!(recording.exists());
+    assert!(!state.path().join("satelle.sqlite3").exists());
+
+    let applied = satelle()
+        .env("SATELLE_STATE_DIR", state.path())
+        .args([
+            "host",
+            "store",
+            "reset",
+            "--host",
+            "local-demo",
+            "--no-input",
+            "--yes",
+            "--json",
+        ])
+        .output()
+        .expect("apply store reset");
+    assert!(
+        applied.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&applied.stderr)
+    );
+    let report: Value = serde_json::from_slice(&applied.stdout).expect("parse reset report");
+    assert_eq!(report["status"], "applied");
+    assert_eq!(report["result"]["recordings_deleted"], false);
+    assert!(recording.exists());
+    assert!(state.path().join("satelle.sqlite3").exists());
+}
+
+#[test]
+fn store_reset_deletes_recordings_only_with_the_explicit_option() {
+    let state = tempfile::tempdir().expect("temporary store reset state");
+    let recordings = state.path().join("recordings");
+    fs::create_dir(&recordings).expect("create recordings directory");
+    fs::write(recordings.join("recording.webm"), b"recording").expect("write recording fixture");
+
+    let applied = satelle()
+        .env("SATELLE_STATE_DIR", state.path())
+        .args([
+            "host",
+            "store",
+            "reset",
+            "--host",
+            "local-demo",
+            "--delete-recordings",
+            "--no-input",
+            "--yes",
+            "--json",
+        ])
+        .output()
+        .expect("apply explicit recording deletion");
+    assert!(
+        applied.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&applied.stderr)
+    );
+    let report: Value = serde_json::from_slice(&applied.stdout).expect("parse reset report");
+    assert_eq!(report["result"]["recordings_deleted"], true);
+    assert!(!recordings.exists());
 }
