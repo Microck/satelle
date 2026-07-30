@@ -45,11 +45,9 @@ pub(crate) use setup::{
 };
 
 pub(crate) const PROTOCOL_VERSION_HEADER: &str = "satelle-protocol-version";
-// Protocol v12 adds authenticated Host Path Set inspection to the v11 hard cut
-// that replaced plaintext provider-secret upload with the Host-bound HPKE
-// preview/envelope v2 contract. It also carries setup verification,
-// native-readiness invalidation, and capabilities v6. Exact negotiation rejects
-// v11 peers that cannot serve or consume the complete Host Path Set contract.
+// Protocol v12 hard-cuts capabilities v6 and authenticated Host Path Set
+// inspection. A v11 peer cannot represent these contracts and must receive the
+// typed protocol incompatibility response before either side decodes them.
 pub(crate) const PROTOCOL_VERSION: &str = "12";
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer};

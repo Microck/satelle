@@ -1,14 +1,13 @@
 use satelle_core::host_update::{
     CodexComponentOwnership, CodexUpdateEvidence, HostUpdateComponent, HostUpdateDisposition,
     HostUpdateMutation, HostUpdateReport, HostUpdateRestartImpact, HostUpdateTarget,
-    HostUpdateTargetPlan, HostUpdateVersionSource, RepairCompatibilityReason,
-    RepairUpgradeDisposition,
+    HostUpdateTargetPlan, HostUpdateVersionSource, RepairCompatibilityReason, RepairUpgradeAction,
+    RepairUpgradeDisposition, RepairUpgradeReport,
 };
 use std::collections::BTreeSet;
 use std::fmt::Write as _;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-#[allow(dead_code)]
 pub enum HostVersionRelation {
     Missing,
     OlderThanCli,
@@ -25,11 +24,17 @@ pub struct HostUpdateInspection {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HostUpdateServiceInspection {
+    pub current_version: Option<String>,
+    pub relation_to_cli: HostVersionRelation,
+    pub destination: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct VerifiedHostArtifact {
     pub version: String,
     pub remote_platform: String,
     pub daemon_destination: Option<String>,
-    pub service_destination: Option<String>,
 }
 
 /// T4 owns artifact discovery and target-matrix policy. T1 consumes only a
@@ -51,6 +56,17 @@ pub struct CodexUpdateInspection {
     pub update_required: bool,
     pub restart_impact: HostUpdateRestartImpact,
     pub remote_mutations: Vec<HostUpdateMutation>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RepairUpgradeInspection {
+    pub target: HostUpdateTarget,
+    pub current_version: Option<String>,
+    pub target_version: String,
+    pub compatibility_reason: Option<RepairCompatibilityReason>,
+    pub version_source: HostUpdateVersionSource,
+    pub automation_is_safe: bool,
+    pub newer_compatible_version_available: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -85,6 +101,7 @@ pub struct HostUpdatePlanRequest<'a> {
     pub components: &'a [HostUpdateComponent],
     pub includes_all: bool,
     pub host_inspection: &'a HostUpdateInspection,
+    pub service_inspection: Option<&'a HostUpdateServiceInspection>,
     pub codex_inspections: &'a [CodexUpdateInspection],
 }
 
@@ -181,32 +198,51 @@ fn plan_host_targets(
         "replace_host_daemon",
         artifact.daemon_destination,
     );
-    let service_mutations = mutation_for(
+    let mut targets = vec![HostUpdateTargetPlan {
+        target: HostUpdateTarget::HostDaemon,
+        current_version: request.host_inspection.current_version.clone(),
+        target_version: request.cli_version.to_string(),
+        version_source: HostUpdateVersionSource::InvokingCliRelease,
         disposition,
-        "replace_host_daemon_service",
-        artifact.service_destination,
-    );
-
-    Ok(vec![
-        HostUpdateTargetPlan {
-            target: HostUpdateTarget::HostDaemon,
-            current_version: request.host_inspection.current_version.clone(),
-            target_version: request.cli_version.to_string(),
-            version_source: HostUpdateVersionSource::InvokingCliRelease,
-            disposition,
-            restart_impact: HostUpdateRestartImpact::HostDaemon,
-            remote_mutations: daemon_mutations,
-        },
-        HostUpdateTargetPlan {
+        restart_impact: HostUpdateRestartImpact::HostDaemon,
+        remote_mutations: daemon_mutations,
+    }];
+    if let Some(service) = request.service_inspection {
+        let disposition = match service.relation_to_cli {
+            HostVersionRelation::Missing => HostUpdateDisposition::Install,
+            HostVersionRelation::OlderThanCli => HostUpdateDisposition::Update,
+            HostVersionRelation::MatchesCli => HostUpdateDisposition::Current,
+            HostVersionRelation::NewerThanCli => {
+                return Err(HostUpdatePlanError::HostBinaryNewerThanCli {
+                    host_version: service
+                        .current_version
+                        .clone()
+                        .unwrap_or_else(|| "unknown".to_string()),
+                    cli_version: request.cli_version.to_string(),
+                });
+            }
+            HostVersionRelation::RequiresNewerCli => {
+                return Err(HostUpdatePlanError::HostUpdateRequiresCliUpgrade {
+                    cli_version: request.cli_version.to_string(),
+                });
+            }
+        };
+        targets.push(HostUpdateTargetPlan {
             target: HostUpdateTarget::HostDaemonService,
-            current_version: request.host_inspection.current_version.clone(),
+            current_version: service.current_version.clone(),
             target_version: request.cli_version.to_string(),
             version_source: HostUpdateVersionSource::InvokingCliRelease,
             disposition,
             restart_impact: HostUpdateRestartImpact::HostDaemon,
-            remote_mutations: service_mutations,
-        },
-    ])
+            remote_mutations: mutation_for(
+                disposition,
+                "replace_host_daemon_service",
+                Some(service.destination.clone()),
+            ),
+        });
+    }
+
+    Ok(targets)
 }
 
 fn mutation_for(
@@ -274,7 +310,7 @@ pub fn codex_inspections_from_evidence(
     [
         CodexUpdateInspection {
             target: HostUpdateTarget::CodexRuntime,
-            ownership: evidence.ownership,
+            ownership: evidence.runtime_ownership,
             current_version: evidence.runtime_current_version.clone(),
             target_version: evidence.required_version.clone(),
             update_required: evidence.runtime_update_required,
@@ -286,7 +322,7 @@ pub fn codex_inspections_from_evidence(
         },
         CodexUpdateInspection {
             target: HostUpdateTarget::CodexNativeComputerUse,
-            ownership: evidence.ownership,
+            ownership: evidence.native_component_ownership,
             current_version: evidence.native_component_current_version.clone(),
             target_version: evidence.required_version.clone(),
             update_required: evidence.native_update_required,
@@ -299,7 +335,6 @@ pub fn codex_inspections_from_evidence(
     ]
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 pub fn classify_repair_upgrade(
     blocking_reason: Option<RepairCompatibilityReason>,
     automation_is_safe: bool,
@@ -318,10 +353,41 @@ pub fn classify_repair_upgrade(
     }
 }
 
+pub fn build_repair_upgrade_plan(
+    host: &str,
+    inspections: &[RepairUpgradeInspection],
+) -> RepairUpgradeReport {
+    // This is read-only compatibility planning. It does not claim access to
+    // the Host-owned setup action ledger. Any apply path must reconcile these
+    // candidates through `SetupRepairPlan` before mutation.
+    RepairUpgradeReport::new(
+        host,
+        inspections
+            .iter()
+            .map(|inspection| RepairUpgradeAction {
+                target: inspection.target,
+                current_version: inspection.current_version.clone(),
+                target_version: inspection.target_version.clone(),
+                compatibility_reason: inspection.compatibility_reason,
+                version_source: inspection.version_source,
+                disposition: classify_repair_upgrade(
+                    inspection.compatibility_reason,
+                    inspection.automation_is_safe,
+                    inspection.newer_compatible_version_available,
+                ),
+            })
+            .collect(),
+    )
+}
+
 pub fn render_host_update_plan(report: &HostUpdateReport) -> String {
     let mut output = format!("Host update plan for {}\n", report.host);
     for target in &report.targets {
-        let current = target.current_version.as_deref().unwrap_or("not installed");
+        let current = match (target.target, target.current_version.as_deref()) {
+            (HostUpdateTarget::HostDaemonService, None) => "managed asset; version unavailable",
+            (_, Some(version)) => version,
+            (_, None) => "not installed",
+        };
         let _ = writeln!(
             output,
             "- {:?}: {} -> {} ({:?}, restart: {:?})",
@@ -334,6 +400,34 @@ pub fn render_host_update_plan(report: &HostUpdateReport) -> String {
         for mutation in &target.remote_mutations {
             let _ = writeln!(output, "  planned remote mutation: {}", mutation.operation);
         }
+    }
+    output
+}
+
+pub fn render_repair_upgrade_plan(
+    report: &satelle_core::host_update::RepairUpgradeReport,
+) -> String {
+    let mut output = format!("Repair upgrade plan for {}\n", report.host);
+    let _ = writeln!(
+        output,
+        "ledger: {:?}; plan source: {:?}",
+        report.ledger_status, report.plan_source
+    );
+    for action in &report.actions {
+        let current = action.current_version.as_deref().unwrap_or("not installed");
+        let reason = action
+            .compatibility_reason
+            .map_or("none".to_string(), |reason| format!("{reason:?}"));
+        let _ = writeln!(
+            output,
+            "- {:?}: {} -> {} ({:?}, reason: {}, source: {:?})",
+            action.target,
+            current,
+            action.target_version,
+            action.disposition,
+            reason,
+            action.version_source
+        );
     }
     output
 }
@@ -359,9 +453,6 @@ mod tests {
             version: "1.2.3".to_string(),
             remote_platform: "linux-x64".to_string(),
             daemon_destination: Some("/opt/satelle/bin/satelle".to_string()),
-            service_destination: Some(
-                "/home/operator/.config/systemd/user/satelle.service".to_string(),
-            ),
         }))
     }
 
@@ -370,6 +461,15 @@ mod tests {
             current_version: Some("1.2.2".to_string()),
             relation_to_cli,
             remote_platform: "linux-x64".to_string(),
+        }
+    }
+
+    fn service_inspection() -> HostUpdateServiceInspection {
+        HostUpdateServiceInspection {
+            // The service asset is managed but does not embed its own version.
+            current_version: None,
+            relation_to_cli: HostVersionRelation::OlderThanCli,
+            destination: "/home/operator/.config/systemd/user/satelle.service".to_string(),
         }
     }
 
@@ -402,6 +502,7 @@ mod tests {
                 }],
             },
         ];
+        let service = service_inspection();
         let report = build_host_update_plan(
             HostUpdatePlanRequest {
                 host: "office",
@@ -409,6 +510,7 @@ mod tests {
                 components: &[],
                 includes_all: false,
                 host_inspection: &host,
+                service_inspection: Some(&service),
                 codex_inspections: &codex,
             },
             &artifact(),
@@ -431,6 +533,7 @@ mod tests {
     #[test]
     fn host_selection_targets_only_exact_cli_host_artifacts() {
         let host = host_inspection(HostVersionRelation::OlderThanCli);
+        let service = service_inspection();
         let report = build_host_update_plan(
             HostUpdatePlanRequest {
                 host: "office",
@@ -438,6 +541,7 @@ mod tests {
                 components: &[HostUpdateComponent::Host],
                 includes_all: false,
                 host_inspection: &host,
+                service_inspection: Some(&service),
                 codex_inspections: &[],
             },
             &artifact(),
@@ -452,6 +556,76 @@ mod tests {
             ) && target.target_version == "1.2.3"
                 && target.version_source == HostUpdateVersionSource::InvokingCliRelease
         }));
+        assert_eq!(report.targets[1].current_version, None);
+    }
+
+    #[test]
+    fn host_selection_omits_an_unobserved_service_asset() {
+        let host = host_inspection(HostVersionRelation::OlderThanCli);
+        let report = build_host_update_plan(
+            HostUpdatePlanRequest {
+                host: "office",
+                cli_version: "1.2.3",
+                components: &[HostUpdateComponent::Host],
+                includes_all: false,
+                host_inspection: &host,
+                service_inspection: None,
+                codex_inspections: &[],
+            },
+            &artifact(),
+        )
+        .expect("build host-only plan without service evidence");
+
+        assert_eq!(report.targets.len(), 1);
+        assert_eq!(report.targets[0].target, HostUpdateTarget::HostDaemon);
+    }
+
+    #[test]
+    fn unavailable_codex_evidence_blocks_default_but_not_host_only_planning() {
+        let host = host_inspection(HostVersionRelation::OlderThanCli);
+        let unavailable = codex_inspections_from_evidence(&CodexUpdateEvidence {
+            runtime_ownership: CodexComponentOwnership::Ambiguous,
+            native_component_ownership: CodexComponentOwnership::Ambiguous,
+            runtime_current_version: None,
+            native_component_current_version: None,
+            required_version: "1.0.0".to_string(),
+            runtime_update_required: true,
+            native_update_required: true,
+            runtime_compatibility_reason: None,
+            native_component_compatibility_reason: None,
+        });
+
+        build_host_update_plan(
+            HostUpdatePlanRequest {
+                host: "office",
+                cli_version: "1.2.3",
+                components: &[HostUpdateComponent::Host],
+                includes_all: false,
+                host_inspection: &host,
+                service_inspection: None,
+                codex_inspections: &unavailable,
+            },
+            &artifact(),
+        )
+        .expect("legacy Host evidence still supports a host-only update plan");
+
+        let error = build_host_update_plan(
+            HostUpdatePlanRequest {
+                host: "office",
+                cli_version: "1.2.3",
+                components: &[],
+                includes_all: false,
+                host_inspection: &host,
+                service_inspection: None,
+                codex_inspections: &unavailable,
+            },
+            &artifact(),
+        )
+        .expect_err("default planning must fail closed without Codex ownership evidence");
+        assert!(matches!(
+            error,
+            HostUpdatePlanError::AmbiguousCodexComponentOwnership { .. }
+        ));
     }
 
     #[test]
@@ -464,6 +638,7 @@ mod tests {
                 components: &[HostUpdateComponent::Host],
                 includes_all: false,
                 host_inspection: &newer,
+                service_inspection: None,
                 codex_inspections: &[],
             },
             &artifact(),
@@ -482,6 +657,7 @@ mod tests {
                 components: &[HostUpdateComponent::Host],
                 includes_all: false,
                 host_inspection: &older,
+                service_inspection: None,
                 codex_inspections: &[],
             },
             &Artifact(None),
@@ -512,6 +688,7 @@ mod tests {
                 components: &[HostUpdateComponent::Codex],
                 includes_all: false,
                 host_inspection: &host,
+                service_inspection: None,
                 codex_inspections: &ambiguous,
             },
             &artifact(),
@@ -549,6 +726,36 @@ mod tests {
                 false,
             ),
             RepairUpgradeDisposition::ManualActionRequired
+        );
+    }
+
+    #[test]
+    fn repair_plan_preserves_observed_reason_and_version_source() {
+        let report = build_repair_upgrade_plan(
+            "office",
+            &[RepairUpgradeInspection {
+                target: HostUpdateTarget::CodexRuntime,
+                current_version: Some("0.9.0".to_string()),
+                target_version: "1.0.0".to_string(),
+                compatibility_reason: Some(RepairCompatibilityReason::ControlPlaneIncompatible),
+                version_source: HostUpdateVersionSource::CodexCompatibilityRequirement,
+                automation_is_safe: false,
+                newer_compatible_version_available: false,
+            }],
+        );
+
+        assert_eq!(report.host, "office");
+        assert_eq!(report.actions.len(), 1);
+        assert_eq!(
+            report.actions[0],
+            RepairUpgradeAction {
+                target: HostUpdateTarget::CodexRuntime,
+                current_version: Some("0.9.0".to_string()),
+                target_version: "1.0.0".to_string(),
+                compatibility_reason: Some(RepairCompatibilityReason::ControlPlaneIncompatible,),
+                version_source: HostUpdateVersionSource::CodexCompatibilityRequirement,
+                disposition: RepairUpgradeDisposition::ManualActionRequired,
+            }
         );
     }
 }
