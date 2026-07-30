@@ -4019,6 +4019,17 @@ pub enum ErrorCode {
     HostUpdatePartiallyApplied,
     HostUpdatePostcheckFailed,
     AmbiguousCodexComponentOwnership,
+    SelfUpdateManagedInstall,
+    SelfUpdateInstallOwnerUnknown,
+    SelfUpdateVersionInvalid,
+    SelfUpdateExplicitVersionRequired,
+    UnsupportedLocalPlatform,
+    UnsupportedReleaseTarget,
+    SelfUpdateLocked,
+    SelfUpdateRollbackFailed,
+    SelfUpdateReceiptInvalid,
+    SelfUpdateVerificationFailed,
+    SelfUpdateFailed,
     PersistentServiceUnsupported,
     SetupConsentRequired,
     SetupVerificationFailed,
@@ -4131,6 +4142,17 @@ impl ErrorCode {
             Self::HostUpdatePartiallyApplied => "host-update-partially-applied",
             Self::HostUpdatePostcheckFailed => "host-update-postcheck-failed",
             Self::AmbiguousCodexComponentOwnership => "ambiguous-codex-component-ownership",
+            Self::SelfUpdateManagedInstall => "self-update-managed-install",
+            Self::SelfUpdateInstallOwnerUnknown => "self-update-install-owner-unknown",
+            Self::SelfUpdateVersionInvalid => "self-update-version-invalid",
+            Self::SelfUpdateExplicitVersionRequired => "self-update-explicit-version-required",
+            Self::UnsupportedLocalPlatform => "unsupported-local-platform",
+            Self::UnsupportedReleaseTarget => "unsupported-release-target",
+            Self::SelfUpdateLocked => "self-update-locked",
+            Self::SelfUpdateRollbackFailed => "self-update-rollback-failed",
+            Self::SelfUpdateReceiptInvalid => "self-update-receipt-invalid",
+            Self::SelfUpdateVerificationFailed => "self-update-verification-failed",
+            Self::SelfUpdateFailed => "self-update-failed",
             Self::PersistentServiceUnsupported => "persistent-service-unsupported",
             Self::SetupConsentRequired => "setup-consent-required",
             Self::SetupVerificationFailed => "setup-verification-failed",
@@ -4156,6 +4178,9 @@ impl ErrorCode {
             | Self::ConcurrencyWithoutRemoteUpdate
             | Self::ComponentSelectionConflict
             | Self::UnsupportedUpdateComponent
+            | Self::SelfUpdateManagedInstall
+            | Self::SelfUpdateVersionInvalid
+            | Self::SelfUpdateExplicitVersionRequired
             | Self::PersistentServiceUnsupported
             | Self::ExperimentalProviderOptInRequired
             | Self::SetupConsentRequired
@@ -4194,11 +4219,15 @@ impl ErrorCode {
             | Self::ModelProviderBindingMissing
             | Self::HostNotFound
             | Self::SessionNotFound
-            | Self::LogsCursorExpired => 66,
+            | Self::LogsCursorExpired
+            | Self::SelfUpdateInstallOwnerUnknown
+            | Self::SelfUpdateReceiptInvalid => 66,
             Self::HostUnreachable
             | Self::HostDaemonUnreachable
             | Self::DirectDaemonUnreachable
-            | Self::SshBootstrapUnavailable => 69,
+            | Self::SshBootstrapUnavailable
+            | Self::UnsupportedLocalPlatform
+            | Self::UnsupportedReleaseTarget => 69,
             Self::CertificateUntrusted
             | Self::CertificateHostnameMismatch
             | Self::CertificateExpired
@@ -4215,7 +4244,10 @@ impl ErrorCode {
             | Self::HostUpdatePostcheckFailed
             | Self::StorageBusy
             | Self::StorageIntegrityFailed
-            | Self::ProviderSecretResolutionFailed => 74,
+            | Self::ProviderSecretResolutionFailed
+            | Self::SelfUpdateRollbackFailed
+            | Self::SelfUpdateVerificationFailed
+            | Self::SelfUpdateFailed => 74,
             Self::ProviderSecretSourceRequired
             | Self::ProviderSecretProvisioningRequired
             | Self::ProviderSecretOverwriteRequired => 64,
@@ -4241,7 +4273,8 @@ impl ErrorCode {
             | Self::AmbiguousCodexComponentOwnership
             | Self::SetupVerificationFailed
             | Self::StateConflict
-            | Self::StopNotConfirmed => 75,
+            | Self::StopNotConfirmed
+            | Self::SelfUpdateLocked => 75,
             Self::NotImplemented => 70,
         }
     }
@@ -6021,6 +6054,66 @@ mod error_contract_tests {
                 expected,
                 "unexpected broad exit class for {}",
                 code.as_str()
+            );
+        }
+    }
+
+    #[test]
+    fn self_update_error_codes_have_stable_tokens_and_exit_classes() {
+        for (code, token, exit_code) in [
+            (
+                ErrorCode::SelfUpdateManagedInstall,
+                "self-update-managed-install",
+                64,
+            ),
+            (
+                ErrorCode::SelfUpdateInstallOwnerUnknown,
+                "self-update-install-owner-unknown",
+                66,
+            ),
+            (
+                ErrorCode::SelfUpdateVersionInvalid,
+                "self-update-version-invalid",
+                64,
+            ),
+            (
+                ErrorCode::SelfUpdateExplicitVersionRequired,
+                "self-update-explicit-version-required",
+                64,
+            ),
+            (
+                ErrorCode::UnsupportedLocalPlatform,
+                "unsupported-local-platform",
+                69,
+            ),
+            (
+                ErrorCode::UnsupportedReleaseTarget,
+                "unsupported-release-target",
+                69,
+            ),
+            (ErrorCode::SelfUpdateLocked, "self-update-locked", 75),
+            (
+                ErrorCode::SelfUpdateRollbackFailed,
+                "self-update-rollback-failed",
+                74,
+            ),
+            (
+                ErrorCode::SelfUpdateReceiptInvalid,
+                "self-update-receipt-invalid",
+                66,
+            ),
+            (
+                ErrorCode::SelfUpdateVerificationFailed,
+                "self-update-verification-failed",
+                74,
+            ),
+            (ErrorCode::SelfUpdateFailed, "self-update-failed", 74),
+        ] {
+            assert_eq!(code.as_str(), token);
+            assert_eq!(code.exit_code(), exit_code);
+            assert_eq!(
+                serde_json::to_value(code).expect("serialize self-update error code"),
+                serde_json::json!(token)
             );
         }
     }

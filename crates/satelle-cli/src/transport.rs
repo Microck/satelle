@@ -975,6 +975,7 @@ fn map_ssh_daemon_bootstrap_error(
         ssh_bootstrap::SshBootstrapError::DaemonPathOverrideNotAbsolute { name, value } => {
             SatelleError::daemon_path_override_not_absolute(name, value)
         }
+        ssh_bootstrap::SshBootstrapError::VerifiedRelease(error) => (*error).into_satelle_error(),
         _ => SatelleError::host_unreachable(alias),
     }
 }

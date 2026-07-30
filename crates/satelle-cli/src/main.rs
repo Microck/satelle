@@ -13,6 +13,8 @@ mod logs;
 mod mcp;
 mod output;
 mod read;
+#[path = "self-update.rs"]
+mod self_update;
 mod tailscale;
 #[path = "tailscale-serve.rs"]
 mod tailscale_serve;
@@ -1170,7 +1172,7 @@ fn execute_command(
         Command::Config { command } => run_config(command, config, output).map(|_| None),
         Command::Paths(command) => show_paths(command, config, output).map(|_| None),
         Command::Host { command } => run_host(command, config, output).map(|_| None),
-        Command::SelfCtl { command } => run_self(command).map(|_| None),
+        Command::SelfCtl { command } => run_self(command, config, output).map(|_| None),
         Command::Run(command) => run_prompt(command, config, output).map(Some),
         Command::Steer(command) => steer_prompt(command, config, output).map(Some),
         Command::Status(command) => show_status(command, config, output).map(|_| None),
@@ -8227,7 +8229,11 @@ fn run_host_storage(command: HostStorageCommand) -> Result<(), CliFailure> {
     }
 }
 
-fn run_self(command: SelfSubcommand) -> Result<(), CliFailure> {
+fn run_self(
+    command: SelfSubcommand,
+    config: ConfigContext<'_>,
+    output: OutputFormat,
+) -> Result<(), CliFailure> {
     match command {
         SelfSubcommand::Update(command) => {
             if command.concurrency == 0 || command.concurrency > 16 {
@@ -8248,14 +8254,50 @@ fn run_self(command: SelfSubcommand) -> Result<(), CliFailure> {
                 }
             }
 
-            Err(failure(SatelleError::not_implemented(format!(
-                "self update is not implemented yet{}",
-                command
-                    .version
-                    .as_ref()
-                    .map(|version| format!(" for version {version}"))
-                    .unwrap_or_default()
-            ))))
+            let resolved = config.load()?;
+            let current_host = std::env::var("SATELLE_HOST")
+                .ok()
+                .filter(|host| !host.is_empty());
+            let remote_choices = self_update::remote_host_choices(
+                current_host.as_deref(),
+                resolved.config.default_host.as_deref(),
+                resolved
+                    .config
+                    .hosts
+                    .iter()
+                    .filter(|(_, host)| host.transport != satelle_core::TransportKind::Local)
+                    .map(|(alias, _)| alias.clone()),
+            );
+            let follow_up_host = self_update::selected_remote_host(&remote_choices);
+
+            // Packet 25 owns selection and delegation, but the canonical Host
+            // updater belongs to packets 14 and 15. Fail before replacing the
+            // local binary until that one implementation is available.
+            if command.update_remotes {
+                let recovery = follow_up_host
+                    .map(self_update::host_update_command)
+                    .unwrap_or_else(|| "satelle host update --host <alias>".to_string());
+                return Err(failure(SatelleError::not_implemented(format!(
+                    "--update-remotes requires the canonical Host update flow; run `{recovery}` after updating the local CLI"
+                ))));
+            }
+
+            let request = self_update::SelfUpdateRequest::current(
+                command.version,
+                command.dry_run,
+                follow_up_host.map(str::to_owned),
+            )
+            .map_err(|error| failure(error.into_satelle_error()))?;
+            let report =
+                self_update::run(request).map_err(|error| failure(error.into_satelle_error()))?;
+            if output.is_json() {
+                print_json(&report).map_err(failure)
+            } else {
+                for line in report.human_lines() {
+                    println!("{line}");
+                }
+                Ok(())
+            }
         }
     }
 }

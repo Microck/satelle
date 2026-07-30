@@ -271,7 +271,8 @@ fn error_contract(code: ErrorCode) -> ErrorContract {
         ErrorCode::BootstrapBusy
         | ErrorCode::HostBusy
         | ErrorCode::StateConflict
-        | ErrorCode::StopNotConfirmed => ErrorContract {
+        | ErrorCode::StopNotConfirmed
+        | ErrorCode::SelfUpdateLocked => ErrorContract {
             category: ErrorCategory::Conflict,
             retryable: true,
             outcome: "The requested state change was not applied.",
@@ -321,6 +322,16 @@ fn error_contract(code: ErrorCode) -> ErrorContract {
             retryable: false,
             outcome: "The Host state could not be read safely.",
             default_recovery: "run satelle doctor and repair the reported storage problem",
+        },
+        ErrorCode::SelfUpdateInstallOwnerUnknown
+        | ErrorCode::SelfUpdateReceiptInvalid
+        | ErrorCode::SelfUpdateVerificationFailed
+        | ErrorCode::SelfUpdateRollbackFailed
+        | ErrorCode::SelfUpdateFailed => ErrorContract {
+            category: ErrorCategory::Storage,
+            retryable: false,
+            outcome: "Satelle could not update its installation safely.",
+            default_recovery: "correct the reported installation problem and retry self update",
         },
         ErrorCode::HostUnreachable
         | ErrorCode::HostDaemonUnreachable
@@ -386,6 +397,11 @@ fn error_contract(code: ErrorCode) -> ErrorContract {
         | ErrorCode::ConcurrencyWithoutRemoteUpdate
         | ErrorCode::ComponentSelectionConflict
         | ErrorCode::UnsupportedUpdateComponent
+        | ErrorCode::SelfUpdateManagedInstall
+        | ErrorCode::SelfUpdateVersionInvalid
+        | ErrorCode::SelfUpdateExplicitVersionRequired
+        | ErrorCode::UnsupportedLocalPlatform
+        | ErrorCode::UnsupportedReleaseTarget
         | ErrorCode::PersistentServiceUnsupported
         | ErrorCode::SetupConsentRequired
         | ErrorCode::ProviderSecretSourceRequired

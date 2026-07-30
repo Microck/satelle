@@ -152,7 +152,7 @@
 - satelle doctor JSON v1 uses schema_version satelle.doctor.v1 @contract @mvp @implemented
 - satelle config check JSON v1 uses schema_version satelle.config.check.v1 @contract @mvp @implemented
 - satelle config explain JSON v2 uses schema_version satelle.config.explain.v2 @contract @mvp @implemented
-- satelle self update JSON v1 uses schema_version satelle.self.update.v1 @spec @contract @mvp
+- satelle self update JSON v1 uses schema_version satelle.self.update.v1 @spec @contract @mvp @implemented
 - satelle host update JSON v1 uses schema_version satelle.host.update.v1 @spec @contract @mvp @implemented
 - satelle paths JSON v2 uses schema_version satelle.paths.v2 @contract @mvp @implemented
 - satelle host sessions JSON v1 uses schema_version satelle.host.sessions.v1 @contract @mvp @implemented
@@ -220,18 +220,18 @@
 - satelle Scoop distribution uses a first-party Scoop bucket in MVP instead of making Scoop Main acceptance a release blocker @spec @mvp @implemented
 - satelle package-manager installs through npm, Homebrew, or Scoop rely on the package manager's own upgrade and uninstall flow instead of Satelle self-updating those installations @spec @mvp @implemented
 - satelle install scripts and direct archive install guidance create or document a local installation receipt that records install_method, binary_path, version, target, artifact_digest, and installed_at metadata @spec @mvp @implemented
-- satelle exposes satelle self update for binaries installed by the Satelle install scripts or direct GitHub release archive flow when the installation receipt identifies Satelle as the binary owner @spec @mvp
-- satelle self update is disabled for npm, pnpm, bun, Homebrew, Scoop, and other package-manager-owned installations @spec @mvp
-- satelle self update reports a typed self-update-managed-install error for package-manager-owned installations and includes the detected install method plus the recommended package-manager upgrade command @spec @mvp
-- satelle self update supports --dry-run to report the current version, latest compatible version, install owner, target artifact, and planned replacement without modifying files @spec @mvp
-- satelle self update supports --version <version> for explicit version updates using the same versioned GitHub release artifact set as install scripts @spec @mvp
-- satelle self update fails closed before replacing the current binary unless the selected archive passes the canonical release archive attestation and SHA256SUMS verification contract @spec @contract @mvp
+- satelle exposes satelle self update for binaries installed by the Satelle install scripts or direct GitHub release archive flow when the installation receipt identifies Satelle as the binary owner @spec @mvp @implemented
+- satelle self update is disabled for npm, pnpm, bun, Homebrew, Scoop, and other package-manager-owned installations @spec @mvp @implemented
+- satelle self update reports a typed self-update-managed-install error for package-manager-owned installations and includes the detected install method plus the recommended package-manager upgrade command @spec @mvp @implemented
+- satelle self update supports --dry-run to report the current version, latest compatible version, install owner, target artifact, and planned replacement without modifying files @spec @mvp @implemented
+- satelle self update supports --version <version> for explicit version updates using the same versioned GitHub release artifact set as install scripts @spec @mvp @implemented
+- satelle self update fails closed before replacing the current binary unless the selected archive passes the canonical release archive attestation and SHA256SUMS verification contract @spec @contract @mvp @implemented
 - satelle self update never runs automatically during ordinary run, steer, setup, repair, host update, or doctor commands @implemented @mvp
-- satelle self update refuses to cross downgrade or prerelease boundaries unless the user explicitly requests a specific version and the release artifact passes integrity checks @spec @mvp
-- satelle self update never mutates configured remote hosts as an implicit side effect of replacing the local CLI binary @spec @mvp
+- satelle self update refuses to cross downgrade or prerelease boundaries unless the user explicitly requests a specific version and the release artifact passes integrity checks @spec @mvp @implemented
+- satelle self update never mutates configured remote hosts as an implicit side effect of replacing the local CLI binary @spec @mvp @implemented
 - satelle self update after a successful local binary replacement in an interactive terminal offers to check and update configured remote hosts to the updated local CLI version @spec @mvp
 - satelle self update does not show the configured-remote update offer when --no-input is set, stdin is not a TTY, JSON output mode is active, or --dry-run is active @spec @mvp
-- satelle self update noninteractive success output includes the follow-up host update command for configured remotes when remote Host Daemon versions may need alignment @spec @mvp
+- satelle self update noninteractive success output includes the follow-up host update command for configured remotes when remote Host Daemon versions may need alignment @spec @mvp @implemented
 - satelle self update supports --update-remotes as an explicit request to run the configured-remote Host Daemon update flow after the local update succeeds @spec @mvp
 - satelle self update interactive configured-remote update offer preselects only the current command target host when one is resolved, otherwise the configured default host when exactly one resolves unambiguously @spec @mvp
 - satelle self update interactive configured-remote update offer lists other configured remote hosts as unselected choices that the user may opt into before the remote update plan is built @spec @mvp
@@ -284,45 +284,45 @@
 - satelle does not guarantee cold offline npm-registry installation or one-shot runner execution @spec @contract @mvp @implemented
 - an installed Satelle JavaScript launcher resolves its native executable only from the local version-matched optional dependency and does not contact the public npm registry during ordinary execution @spec @contract @mvp @implemented
 - satelle platform-specific native npm packages declare npm ecosystem platform constraints such as os, cpu, and libc where supported by the target package manager @spec @mvp @implemented
-- satelle MVP supports Linux, macOS, and Windows as Controller Platforms independently from the narrower Computer Use Host Platform matrix @spec @mvp
-- satelle MVP supports macOS and Windows as native Computer Use Host Platforms because official Codex Computer Use is available there @spec @mvp
-- satelle MVP does not support Linux as a native Computer Use Host Platform until an official provider Computer Use runtime supports Linux @spec @mvp
+- satelle MVP supports Linux, macOS, and Windows as Controller Platforms independently from the narrower Computer Use Host Platform matrix @spec @mvp @implemented
+- satelle MVP supports macOS and Windows as native Computer Use Host Platforms because official Codex Computer Use is available there @spec @mvp @implemented
+- satelle MVP does not support Linux as a native Computer Use Host Platform until an official provider Computer Use runtime supports Linux @spec @mvp @implemented
 - satelle MVP Controller target matrix includes linux-arm64-gnu mapped to Rust target aarch64-unknown-linux-gnu @spec @mvp @implemented
 - satelle MVP Controller target matrix includes linux-x64-gnu mapped to Rust target x86_64-unknown-linux-gnu @spec @mvp @implemented
 - satelle MVP Controller target matrix includes darwin-arm64 mapped to Rust target aarch64-apple-darwin @spec @mvp @implemented
 - satelle MVP Controller target matrix includes darwin-x64 mapped to Rust target x86_64-apple-darwin @spec @mvp @implemented
 - satelle MVP Controller target matrix includes win32-arm64-msvc mapped to Rust target aarch64-pc-windows-msvc @spec @mvp @implemented
 - satelle MVP Controller target matrix includes win32-x64-msvc mapped to Rust target x86_64-pc-windows-msvc @spec @mvp @implemented
-- satelle release validation treats Controller artifacts and native Computer Use Host acceptance as separate matrices @spec @mvp
-- the single satelle executable contains Controller commands on every Controller target and Host Daemon mode on every native Computer Use Host target @spec @mvp
-- satelle MVP does not publish native packages for 32-bit platforms, mobile OS targets, BSD targets, AIX, illumos, PowerPC, RISC-V, s390x, loong64, or ARMv7 targets @spec @mvp
+- satelle release validation treats Controller artifacts and native Computer Use Host acceptance as separate matrices @spec @mvp @implemented
+- the single satelle executable contains Controller commands on every Controller target and Host Daemon mode on every native Computer Use Host target @spec @mvp @implemented
+- satelle MVP does not publish native packages for 32-bit platforms, mobile OS targets, BSD targets, AIX, illumos, PowerPC, RISC-V, s390x, loong64, or ARMv7 targets @spec @mvp @implemented
 - satelle unsupported npm local platform reports a typed unsupported-local-platform error instead of trying a best-effort binary download @spec @mvp @implemented
-- satelle release validation fails when any MVP Controller target matrix entry is missing from the top-level npm optionalDependencies, release artifacts, or integrity metadata @spec @mvp
+- satelle release validation fails when any MVP Controller target matrix entry is missing from the top-level npm optionalDependencies, release artifacts, or integrity metadata @spec @mvp @implemented
 - satelle JavaScript launcher resolves the installed matching platform-specific native package at runtime and executes its native satelle binary @spec @mvp @implemented
 - satelle JavaScript launcher reports a typed native-binary-package-missing error when the matching platform-specific native package is absent @spec @mvp @implemented
 - satelle native-binary-package-missing error output tells users to reinstall without omitting optional dependencies or use the direct native binary installation path @spec @mvp @implemented
 - satelle JavaScript launcher does not silently download a replacement native binary when the matching platform-specific native package is missing @spec @mvp @implemented
 - satelle JavaScript launcher does not run package-manager repair, reinstall, or mutation commands unless the user invokes an explicit repair command added for that purpose @spec @mvp @implemented
 - satelle native-binary-package-missing error output includes package-manager-specific reinstall guidance when the launcher can detect npm, pnpm, bun, or another package-manager owner from the installation layout @spec @mvp @implemented
-- satelle release versions align exactly across scoped and unscoped top-level npm packages, every platform-specific native npm package, the local CLI binary, and every version-matched remote Host binary artifact @spec @contract @mvp
-- satelle public release publishing is performed only by a GitHub Actions release workflow in MVP @spec @mvp
+- satelle release versions align exactly across scoped and unscoped top-level npm packages, every platform-specific native npm package, the local CLI binary, and every version-matched remote Host binary artifact @spec @contract @mvp @implemented
+- satelle public release publishing is performed only by a GitHub Actions release workflow in MVP @spec @mvp @implemented
 - satelle local developer machines may build, test, package, and dry-run releases but do not publish npm packages, upload final public GitHub release assets, or mint public release provenance @spec @mvp @implemented
-- satelle public npm package publishing uses npm trusted publishing with OIDC instead of long-lived npm automation tokens when npm supports trusted publishing for the package @spec @mvp
-- satelle public npm package publishing runs on cloud-hosted CI runners capable of generating npm provenance attestations @spec @mvp
-- satelle public release workflow generates GitHub artifact attestations for each native binary artifact before publishing the release @spec @mvp
-- satelle public release workflow produces checksum and integrity metadata for every native binary artifact before publishing npm packages or GitHub release assets @spec @mvp
-- satelle public GitHub release workflow creates or updates a draft release, attaches all release assets and metadata, verifies the release artifact set, and publishes the release only after validation passes @spec @mvp
-- satelle first MVP public release does not require npm staged publishing because npm staged publishing requires each package to already exist on the npm registry before it can be staged @spec @mvp
-- when staged publishing is unavailable for brand-new package identities, satelle may publish initial npm package versions through trusted publishing under `rc-vX.Y.Z` only after prepublication validation passes @spec @mvp
+- satelle public npm package publishing uses npm trusted publishing with OIDC instead of long-lived npm automation tokens when npm supports trusted publishing for the package @spec @mvp @implemented
+- satelle public npm package publishing runs on cloud-hosted CI runners capable of generating npm provenance attestations @spec @mvp @implemented
+- satelle public release workflow generates GitHub artifact attestations for each native binary artifact before publishing the release @spec @mvp @implemented
+- satelle public release workflow produces checksum and integrity metadata for every native binary artifact before publishing npm packages or GitHub release assets @spec @mvp @implemented
+- satelle public GitHub release workflow creates or updates a draft release, attaches all release assets and metadata, verifies the release artifact set, and publishes the release only after validation passes @spec @mvp @implemented
+- satelle first MVP public release does not require npm staged publishing because npm staged publishing requires each package to already exist on the npm registry before it can be staged @spec @mvp @implemented
+- when staged publishing is unavailable for brand-new package identities, satelle may publish initial npm package versions through trusted publishing under `rc-vX.Y.Z` only after prepublication validation passes @spec @mvp @implemented
 - satelle post-MVP npm staged publishing is adopted only after all Satelle npm package identities exist, trusted publishing is stable, release automation supports npm CLI 11.15.0 or newer and Node.js 22.14.0 or newer, and maintainers accept the required 2FA approval step @spec @later
 - satelle npm staged publishing, when adopted, is used as a human approval gate before npm package versions become installable rather than as a canary rollout, gradual rollout, or replacement for prepublish validation @spec @later
 - satelle npm staged publishing, when adopted, uses trusted publisher stage-only permission for CI so CI can run npm stage publish but cannot directly run npm publish for configured packages @spec @later
 - satelle npm staged publishing approval checks every staged top-level and platform-specific native npm package for version, artifact digest, package metadata, provenance, and release alignment before any staged package is approved @spec @later
 - satelle npm staged publishing approval rejects the entire npm release when any staged Satelle npm package is missing, mismatched, or fails release validation instead of approving a partial platform package set @spec @later
-- satelle local CLI can fetch a version-matched target host binary artifact for a different remote OS or architecture from the same release artifact set when SSH bootstrap or host update needs it @spec @mvp
-- satelle verifies integrity metadata for fetched native binary artifacts before uploading or executing them on a remote host @spec @mvp
-- satelle remote hosts do not need Node.js, npm, pnpm, or bun installed to run the Satelle Host Daemon because the uploaded host component is a self-contained native binary @spec @mvp
-- satelle MVP does not include an explicit package-manager native binary repair command because normal npm-registry installation must succeed through package-manager optionalDependencies rather than a secondary downloader @spec @mvp
+- satelle local CLI can fetch a version-matched target host binary artifact for a different remote OS or architecture from the same release artifact set when SSH bootstrap or host update needs it @spec @mvp @implemented
+- satelle verifies integrity metadata for fetched native binary artifacts before uploading or executing them on a remote host @spec @mvp @implemented
+- satelle remote hosts do not need Node.js, npm, pnpm, or bun installed to run the Satelle Host Daemon because the uploaded host component is a self-contained native binary @spec @mvp @implemented
+- satelle MVP does not include an explicit package-manager native binary repair command because normal npm-registry installation must succeed through package-manager optionalDependencies rather than a secondary downloader @spec @mvp @implemented
 - satelle later adds the launcher-only satelle native repair command so a missing native optionalDependency can be repaired without reinstalling the entire Satelle package graph manually @spec @later
 - satelle native repair is implemented in the JavaScript launcher because the Rust native binary may be missing when repair is needed @spec @later
 - satelle native repair invokes the detected package manager to reinstall the matching platform-specific native package instead of using direct HTTP downloads @spec @later

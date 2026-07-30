@@ -1,8 +1,4 @@
-use flate2::read::GzDecoder;
-use reqwest::{
-    StatusCode,
-    blocking::{Client, Response},
-};
+use crate::self_update;
 use satelle_core::session::HostIdentityRef;
 use satelle_core::{DaemonPathOverrides, HostConfig, SshIdentityCommitRecord};
 use satelle_host::{ApiBearerToken, readiness_probe_timeouts};
@@ -10,7 +6,9 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::ffi::OsStr;
 use std::fmt::Write as _;
-use std::fs::{self, File};
+#[cfg(test)]
+use std::fs;
+use std::fs::File;
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -19,7 +17,6 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
-use tempfile::{NamedTempFile, TempDir};
 use thiserror::Error;
 use uuid::Uuid;
 
@@ -31,15 +28,11 @@ const PROBE_OUTPUT_LIMIT: usize = 4096;
 const SERVICE_DEFINITION_LIMIT: usize = 64 * 1024;
 const TAILSCALE_SERVE_STATUS_OUTPUT_LIMIT: usize = 1024 * 1024;
 const START_OUTPUT_LIMIT: u64 = 16 * 1024;
-const MANIFEST_LIMIT: u64 = 1024 * 1024;
-const ARCHIVE_LIMIT: u64 = 256 * 1024 * 1024;
 const PROCESS_TIMEOUT: Duration = Duration::from_secs(30);
-const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(60);
 const BOOTSTRAP_LOCK_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
 const MUTATION_EXECUTE: &str = "satelle-bootstrap-execute-v1";
 const BOOTSTRAP_LOCK_EXIT_GRACE: Duration = Duration::from_millis(500);
 const BOOTSTRAP_LOCK_EXIT_POLL: Duration = Duration::from_millis(10);
-const RELEASE_BASE_URL: &str = "https://github.com/Microck/satelle/releases/download";
 const CACHE_CLEANUP_PROTOCOL: &str = "satelle-cache-cleanup-v1";
 const STAGED_DIGEST_MISMATCH_EXIT_CODE: i32 = 65;
 const POSIX_CACHE_DIRECTORY_GUARD: &str = r#"safe_cache_directory() {
@@ -1335,10 +1328,6 @@ sync"#,
 
     pub(super) const fn is_windows(self) -> bool {
         matches!(self, Self::WindowsArm64Msvc | Self::WindowsX64Msvc)
-    }
-
-    const fn archive_extension(self) -> &'static str {
-        if self.is_windows() { "zip" } else { "tar.gz" }
     }
 
     const fn executable_name(self) -> &'static str {
@@ -4568,9 +4557,7 @@ fn platform_id_component(value: &str) -> String {
 }
 
 struct DownloadedArtifact {
-    _directory: TempDir,
-    binary: PathBuf,
-    release_digest: [u8; 32],
+    artifact: self_update::VerifiedHostArtifact,
 }
 
 #[derive(Clone, Copy)]
@@ -4580,32 +4567,11 @@ pub(super) struct ReleaseArtifactMetadata {
 
 impl ReleaseArtifactMetadata {
     pub(super) fn fetch(target: RemoteTarget) -> Result<Self, SshBootstrapError> {
-        let version = env!("CARGO_PKG_VERSION");
-        let filename = format!(
-            "satelle-v{version}-{}.{}",
-            target.id(),
-            target.archive_extension()
-        );
-        let release_url = format!("{RELEASE_BASE_URL}/v{version}");
-        let client = Client::builder()
-            .timeout(DOWNLOAD_TIMEOUT)
-            .user_agent(format!("satelle/{version}"))
-            .build()
-            .map_err(SshBootstrapError::Http)?;
-        let manifest = client
-            .get(format!("{release_url}/SHA256SUMS"))
-            .send()
-            .and_then(Response::error_for_status)
-            .map_err(|error| {
-                if release_manifest_is_unavailable(error.status()) {
-                    SshBootstrapError::MissingReleaseManifest
-                } else {
-                    SshBootstrapError::Http(error)
-                }
-            })?;
-        let manifest = read_response_bounded(manifest, MANIFEST_LIMIT)?;
+        let artifact =
+            self_update::fetch_verified_host_artifact(env!("CARGO_PKG_VERSION"), target.id())
+                .map_err(|error| SshBootstrapError::VerifiedRelease(Box::new(error)))?;
         Ok(Self {
-            digest: manifest_digest(&manifest, &filename)?,
+            digest: artifact.artifact_digest_bytes(),
         })
     }
 
@@ -4632,182 +4598,41 @@ impl ReleaseArtifactMetadata {
     }
 }
 
-fn release_manifest_is_unavailable(status: Option<StatusCode>) -> bool {
-    status == Some(StatusCode::NOT_FOUND)
-}
-
 impl DownloadedArtifact {
     fn fetch(target: RemoteTarget) -> Result<Self, SshBootstrapError> {
-        Self::fetch_with_metadata(target, ReleaseArtifactMetadata::fetch(target)?)
+        self_update::fetch_verified_host_artifact(env!("CARGO_PKG_VERSION"), target.id())
+            .map(|artifact| Self { artifact })
+            .map_err(|error| SshBootstrapError::VerifiedRelease(Box::new(error)))
     }
 
     fn fetch_with_metadata(
         target: RemoteTarget,
         metadata: ReleaseArtifactMetadata,
     ) -> Result<Self, SshBootstrapError> {
-        let version = env!("CARGO_PKG_VERSION");
-        let filename = format!(
-            "satelle-v{version}-{}.{}",
-            target.id(),
-            target.archive_extension()
-        );
-        let release_url = format!("{RELEASE_BASE_URL}/v{version}");
-        let client = Client::builder()
-            .timeout(DOWNLOAD_TIMEOUT)
-            .user_agent(format!("satelle/{version}"))
-            .build()
-            .map_err(SshBootstrapError::Http)?;
-        let expected_digest = metadata.digest();
-
-        let mut archive = NamedTempFile::new().map_err(SshBootstrapError::LocalFile)?;
-        let mut response = client
-            .get(format!("{release_url}/{filename}"))
-            .send()
-            .and_then(Response::error_for_status)
-            .map_err(SshBootstrapError::Http)?;
-        let mut digest = Sha256::new();
-        let mut total = 0_u64;
-        let mut buffer = [0_u8; 64 * 1024];
-        loop {
-            let count = response
-                .read(&mut buffer)
-                .map_err(SshBootstrapError::HttpBody)?;
-            if count == 0 {
-                break;
-            }
-            total = total
-                .checked_add(count as u64)
-                .ok_or(SshBootstrapError::ArchiveTooLarge)?;
-            if total > ARCHIVE_LIMIT {
-                return Err(SshBootstrapError::ArchiveTooLarge);
-            }
-            digest.update(&buffer[..count]);
-            archive
-                .write_all(&buffer[..count])
-                .map_err(SshBootstrapError::LocalFile)?;
+        let artifact =
+            self_update::fetch_verified_host_artifact(env!("CARGO_PKG_VERSION"), target.id())
+                .map_err(|error| SshBootstrapError::VerifiedRelease(Box::new(error)))?;
+        if artifact.artifact_digest_bytes() != metadata.digest() {
+            return Err(SshBootstrapError::VerifiedRelease(Box::new(
+                self_update::SelfUpdateError::ArchiveDigestMismatch,
+            )));
         }
-        let actual_digest: [u8; 32] = digest.finalize().into();
-        if actual_digest != expected_digest {
-            return Err(SshBootstrapError::IntegrityMismatch);
-        }
-        archive.flush().map_err(SshBootstrapError::LocalFile)?;
-
-        let directory = TempDir::new().map_err(SshBootstrapError::LocalFile)?;
-        let binary = directory.path().join(target.executable_name());
-        if target.is_windows() {
-            extract_zip(archive.path(), target.executable_name(), &binary)?;
-        } else {
-            extract_tar_gz(archive.path(), target.executable_name(), &binary)?;
-        }
-        Ok(Self {
-            _directory: directory,
-            binary,
-            release_digest: expected_digest,
-        })
+        Ok(Self { artifact })
     }
 
     fn path(&self) -> &Path {
-        &self.binary
+        self.artifact.staged_executable()
     }
 
-    const fn release_digest(&self) -> [u8; 32] {
-        self.release_digest
+    fn release_digest(&self) -> [u8; 32] {
+        self.artifact.artifact_digest_bytes()
     }
-}
-
-fn read_response_bounded(mut response: Response, limit: u64) -> Result<Vec<u8>, SshBootstrapError> {
-    let mut body = Vec::new();
-    response
-        .by_ref()
-        .take(limit + 1)
-        .read_to_end(&mut body)
-        .map_err(SshBootstrapError::HttpBody)?;
-    if body.len() as u64 > limit {
-        return Err(SshBootstrapError::ManifestTooLarge);
-    }
-    Ok(body)
-}
-
-fn manifest_digest(manifest: &[u8], filename: &str) -> Result<[u8; 32], SshBootstrapError> {
-    let manifest = std::str::from_utf8(manifest).map_err(|_| SshBootstrapError::InvalidManifest)?;
-    let mut found = None;
-    for line in manifest.lines() {
-        let mut fields = line.split_whitespace();
-        let Some(digest) = fields.next() else {
-            continue;
-        };
-        let Some(candidate) = fields.next() else {
-            continue;
-        };
-        if fields.next().is_some() || candidate.trim_start_matches('*') != filename {
-            continue;
-        }
-        if found.is_some() || digest.len() != 64 {
-            return Err(SshBootstrapError::InvalidManifest);
-        }
-        let mut decoded = [0_u8; 32];
-        for (index, pair) in digest.as_bytes().chunks_exact(2).enumerate() {
-            decoded[index] = decode_hex(pair).ok_or(SshBootstrapError::InvalidManifest)?;
-        }
-        found = Some(decoded);
-    }
-    found.ok_or(SshBootstrapError::MissingIntegrityEntry)
 }
 
 fn decode_hex(pair: &[u8]) -> Option<u8> {
     let high = (pair.first().copied()? as char).to_digit(16)?;
     let low = (pair.get(1).copied()? as char).to_digit(16)?;
     Some(((high << 4) | low) as u8)
-}
-
-fn extract_tar_gz(
-    archive_path: &Path,
-    executable_name: &str,
-    destination: &Path,
-) -> Result<(), SshBootstrapError> {
-    let archive = File::open(archive_path).map_err(SshBootstrapError::LocalFile)?;
-    let mut archive = tar::Archive::new(GzDecoder::new(archive));
-    let mut found = false;
-    for entry in archive.entries().map_err(SshBootstrapError::Archive)? {
-        let mut entry = entry.map_err(SshBootstrapError::Archive)?;
-        let path = entry.path().map_err(SshBootstrapError::Archive)?;
-        if path == Path::new(executable_name) {
-            if found || !entry.header().entry_type().is_file() {
-                return Err(SshBootstrapError::InvalidArchive);
-            }
-            let mut output = File::create(destination).map_err(SshBootstrapError::LocalFile)?;
-            io::copy(&mut entry, &mut output).map_err(SshBootstrapError::LocalFile)?;
-            output.sync_all().map_err(SshBootstrapError::LocalFile)?;
-            found = true;
-        }
-    }
-    if !found
-        || fs::metadata(destination)
-            .map_err(SshBootstrapError::LocalFile)?
-            .len()
-            == 0
-    {
-        return Err(SshBootstrapError::InvalidArchive);
-    }
-    Ok(())
-}
-
-fn extract_zip(
-    archive_path: &Path,
-    executable_name: &str,
-    destination: &Path,
-) -> Result<(), SshBootstrapError> {
-    let archive = File::open(archive_path).map_err(SshBootstrapError::LocalFile)?;
-    let mut archive = zip::ZipArchive::new(archive).map_err(SshBootstrapError::Zip)?;
-    let mut entry = archive
-        .by_name(executable_name)
-        .map_err(|_| SshBootstrapError::InvalidArchive)?;
-    if entry.is_dir() || entry.size() == 0 {
-        return Err(SshBootstrapError::InvalidArchive);
-    }
-    let mut output = File::create(destination).map_err(SshBootstrapError::LocalFile)?;
-    io::copy(&mut entry, &mut output).map_err(SshBootstrapError::LocalFile)?;
-    output.sync_all().map_err(SshBootstrapError::LocalFile)
 }
 
 fn upload_artifact(
@@ -4872,7 +4697,7 @@ fn upload_operation_artifact(
 ) -> Result<UploadedHostArtifact, SshBootstrapError> {
     let local_digest = sha256_file(local_binary)?;
     if digest_hex(&local_digest) != record.binary_sha256() {
-        return Err(SshBootstrapError::IntegrityMismatch);
+        return Err(SshBootstrapError::IdentityArtifactMismatch);
     }
     let input = File::open(local_binary).map_err(SshBootstrapError::LocalFile)?;
     let upload = target.operation_artifact_upload_command(record)?;
@@ -5444,22 +5269,10 @@ pub(super) enum SshBootstrapError {
     UnsupportedPlatform { platform: String },
     #[error("{name} is not an absolute path for the detected remote platform")]
     DaemonPathOverrideNotAbsolute { name: &'static str, value: String },
-    #[error("the release artifact request failed")]
-    Http(#[source] reqwest::Error),
-    #[error("the release artifact body could not be read")]
-    HttpBody(#[source] io::Error),
-    #[error("the release integrity manifest exceeded its size limit")]
-    ManifestTooLarge,
-    #[error("the release archive exceeded its size limit")]
-    ArchiveTooLarge,
-    #[error("the release integrity manifest is invalid")]
-    InvalidManifest,
-    #[error("the invoking CLI release does not publish an integrity manifest")]
-    MissingReleaseManifest,
-    #[error("the release integrity manifest does not contain the selected artifact")]
-    MissingIntegrityEntry,
-    #[error("the selected release artifact failed SHA-256 verification")]
-    IntegrityMismatch,
+    #[error("the selected release artifact did not pass canonical verification")]
+    VerifiedRelease(#[source] Box<self_update::SelfUpdateError>),
+    #[error("the selected Host binary does not match the committed SSH identity")]
+    IdentityArtifactMismatch,
     #[error("the uploaded Host binary failed SHA-256 verification")]
     UploadedIntegrityMismatch,
     #[error("the remote Host binary cache entry is not an owner-only regular file")]
@@ -5476,12 +5289,6 @@ pub(super) enum SshBootstrapError {
     InvalidCacheCleanupResponse,
     #[error("the remote Host returned an invalid SHA-256 result")]
     InvalidRemoteDigest,
-    #[error("the release archive is invalid")]
-    InvalidArchive,
-    #[error("the release archive could not be read")]
-    Archive(#[source] io::Error),
-    #[error("the Windows release archive could not be read")]
-    Zip(#[source] zip::result::ZipError),
     #[error("a local bootstrap artifact file operation failed")]
     LocalFile(#[source] io::Error),
     #[error("a remote bootstrap operation failed")]
@@ -7202,17 +7009,6 @@ mod tests {
     }
 
     #[test]
-    fn only_a_missing_release_manifest_is_artifact_unavailability() {
-        assert!(release_manifest_is_unavailable(Some(
-            reqwest::StatusCode::NOT_FOUND
-        )));
-        assert!(!release_manifest_is_unavailable(Some(
-            reqwest::StatusCode::INTERNAL_SERVER_ERROR
-        )));
-        assert!(!release_manifest_is_unavailable(None));
-    }
-
-    #[test]
     fn remote_daemon_path_overrides_accept_windows_absolute_paths_for_windows_targets() {
         assert!(
             RemoteTarget::WindowsX64Msvc
@@ -7248,16 +7044,6 @@ mod tests {
                     .is_err()
             );
         }
-    }
-
-    #[test]
-    fn release_manifest_selects_one_exact_archive_digest() {
-        let digest = "11".repeat(32);
-        let manifest = format!("{digest}  satelle-v0.1.0-linux-x64-gnu.tar.gz\n");
-        assert_eq!(
-            manifest_digest(manifest.as_bytes(), "satelle-v0.1.0-linux-x64-gnu.tar.gz").unwrap(),
-            [0x11; 32]
-        );
     }
 
     #[test]

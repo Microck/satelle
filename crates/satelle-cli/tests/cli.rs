@@ -7026,6 +7026,126 @@ fn self_update_remote_options_require_update_remotes() {
 }
 
 #[test]
+fn self_update_without_proven_install_ownership_fails_closed() {
+    let state = state_dir();
+    let output = satelle()
+        .env("SATELLE_STATE_DIR", state.path())
+        .args(["self", "update", "--dry-run", "--json"])
+        .assert()
+        .code(66)
+        .get_output()
+        .clone();
+    let error = parse_json_output(&output.stderr);
+
+    assert_eq!(error["schema_version"], "satelle.error.v1");
+    assert_eq!(error["code"], "self-update-install-owner-unknown");
+    assert_eq!(
+        error["suggested_commands"],
+        serde_json::json!([
+            "reinstall Satelle with the verified install script or direct archive receipt"
+        ])
+    );
+}
+
+#[test]
+fn self_update_reports_one_current_or_default_remote_follow_up() {
+    let sandbox = state_dir();
+    let installed_binary = sandbox
+        .path()
+        .join(format!("satelle{}", std::env::consts::EXE_SUFFIX));
+    fs::copy(assert_cmd::cargo::cargo_bin!("satelle"), &installed_binary)
+        .expect("copy self-update test binary");
+    let installed_binary = installed_binary
+        .canonicalize()
+        .expect("canonicalize self-update test binary");
+    let target = match (std::env::consts::OS, std::env::consts::ARCH) {
+        ("linux", "aarch64") => "linux-arm64-gnu",
+        ("linux", "x86_64") => "linux-x64-gnu",
+        ("macos", "aarch64") => "darwin-arm64",
+        ("macos", "x86_64") => "darwin-x64",
+        ("windows", "aarch64") => "win32-arm64-msvc",
+        ("windows", "x86_64") => "win32-x64-msvc",
+        (os, arch) => panic!("unsupported self-update test target {os}-{arch}"),
+    };
+    fs::write(
+        sandbox.path().join(".satelle-install.json"),
+        serde_json::to_vec(&serde_json::json!({
+            "install_method": "direct-github-release-archive",
+            "binary_path": installed_binary,
+            "version": env!("CARGO_PKG_VERSION"),
+            "target": target,
+            "artifact_digest": "11".repeat(32),
+            "installed_at": "2026-07-30T00:00:00Z",
+        }))
+        .expect("serialize self-update receipt"),
+    )
+    .expect("write self-update receipt");
+    let config_file = sandbox.path().join("config.toml");
+    write_user_config(
+        &config_file,
+        r#"
+default_host = "remote-default"
+
+[hosts.remote-default]
+transport = "ssh"
+adapter = "fake"
+address = "operator@default.example"
+
+[hosts.remote-current]
+transport = "ssh"
+adapter = "fake"
+address = "operator@current.example"
+"#,
+    )
+    .expect("write self-update remote config");
+
+    for (current_host, expected_host) in [
+        (None, "remote-default"),
+        (Some("remote-current"), "remote-current"),
+    ] {
+        let mut command = Command::new(&installed_binary);
+        for name in [
+            "SATELLE_HOME",
+            "SATELLE_CONFIG_FILE",
+            "SATELLE_STATE_DIR",
+            "SATELLE_CACHE_DIR",
+            "SATELLE_LOG_DIR",
+            "SATELLE_HOST",
+            "SATELLE_PROFILE",
+            "SATELLE_ERROR_FORMAT",
+            TEST_SUPPORT_ADAPTER_ENV,
+        ] {
+            command.env_remove(name);
+        }
+        command
+            .env("SATELLE_CONFIG_FILE", &config_file)
+            .env(TEST_SUPPORT_ADAPTER_ENV, "fake");
+        if let Some(current_host) = current_host {
+            command.env("SATELLE_HOST", current_host);
+        }
+        let output = command
+            .args([
+                "self",
+                "update",
+                "--dry-run",
+                "--version",
+                env!("CARGO_PKG_VERSION"),
+                "--json",
+            ])
+            .assert()
+            .success()
+            .get_output()
+            .clone();
+        let report = parse_json_output(&output.stdout);
+        assert_eq!(report["schema_version"], "satelle.self.update.v1");
+        assert_eq!(
+            report["follow_up_host_update_command"],
+            format!("satelle host update --host {expected_host}")
+        );
+    }
+}
+
+#[test]
 fn self_update_is_not_triggered_by_ordinary_commands() {
     let state = state_dir();
     let ordinary_commands = [

@@ -1,5 +1,6 @@
 use flate2::read::GzDecoder;
 use reqwest::blocking::{Client, Response};
+use satelle_core::{ErrorCode, SatelleError};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -75,12 +76,33 @@ pub(crate) struct SelfUpdateReport {
 }
 
 impl SelfUpdateReport {
-    pub(crate) fn outcome(&self) -> SelfUpdateOutcome {
-        self.outcome
-    }
-
-    pub(crate) fn changed(&self) -> bool {
-        self.changed
+    pub(crate) fn human_lines(&self) -> Vec<String> {
+        let mut lines = match self.outcome {
+            SelfUpdateOutcome::UpToDate => vec![format!(
+                "Satelle is up to date at {}.",
+                self.current_version
+            )],
+            SelfUpdateOutcome::WouldUpdate => vec![
+                format!(
+                    "Satelle would update from {} to {}.",
+                    self.current_version, self.latest_compatible_version
+                ),
+                format!("Install owner: {}", self.install_owner),
+                format!("Target artifact: {}", self.target_artifact),
+                format!(
+                    "Planned replacement: {}",
+                    self.planned_replacement.display()
+                ),
+            ],
+            SelfUpdateOutcome::Updated => vec![format!(
+                "Updated Satelle from {} to {}.",
+                self.current_version, self.latest_compatible_version
+            )],
+        };
+        if let Some(command) = &self.follow_up_host_update_command {
+            lines.push(format!("Next: {command}"));
+        }
+        lines
     }
 }
 
@@ -88,6 +110,7 @@ impl SelfUpdateReport {
 pub(crate) struct RemoteHostChoice {
     pub(crate) alias: String,
     pub(crate) selected: bool,
+    #[cfg(test)]
     pub(crate) selection_reason: Option<&'static str>,
 }
 
@@ -115,6 +138,7 @@ pub(crate) fn remote_host_choices(
             RemoteHostChoice {
                 alias,
                 selected: selection_reason.is_some(),
+                #[cfg(test)]
                 selection_reason,
             }
         })
@@ -137,28 +161,47 @@ pub(crate) fn host_update_arguments(host: &str) -> Vec<String> {
     ]
 }
 
+pub(crate) fn host_update_command(host: &str) -> String {
+    format!(
+        "satelle {}",
+        host_update_arguments(host)
+            .iter()
+            .map(|argument| crate::shell_argument(argument))
+            .collect::<Vec<_>>()
+            .join(" ")
+    )
+}
+
 pub(crate) struct VerifiedHostArtifact {
+    #[cfg(test)]
     artifact_identity: String,
-    artifact_digest: String,
+    #[cfg(test)]
     verified_version: String,
     staged: VerifiedRelease,
 }
 
 impl VerifiedHostArtifact {
+    #[cfg(test)]
     pub(crate) fn artifact_identity(&self) -> &str {
         &self.artifact_identity
     }
 
-    pub(crate) fn artifact_digest(&self) -> &str {
-        &self.artifact_digest
+    #[cfg(test)]
+    pub(crate) fn artifact_digest(&self) -> String {
+        digest_hex(&self.staged.archive_digest)
     }
 
+    #[cfg(test)]
     pub(crate) fn verified_version(&self) -> &str {
         &self.verified_version
     }
 
     pub(crate) fn staged_executable(&self) -> &Path {
         &self.staged.executable
+    }
+
+    pub(crate) const fn artifact_digest_bytes(&self) -> [u8; 32] {
+        self.staged.archive_digest
     }
 }
 
@@ -188,8 +231,9 @@ fn fetch_verified_host_artifact_with(
     let target = LocalTarget::from_id(canonical_target_id)?;
     let staged = source.fetch_verified_release(exact_version, target)?;
     Ok(VerifiedHostArtifact {
+        #[cfg(test)]
         artifact_identity: target.archive_name(exact_version),
-        artifact_digest: digest_hex(&staged.archive_digest),
+        #[cfg(test)]
         verified_version: exact_version.to_string(),
         staged,
     })
@@ -216,7 +260,7 @@ fn run_with(
         .canonicalize()
         .map_err(SelfUpdateError::CurrentExecutable)?;
     if let Some(managed) = detect_managed_install(&executable)? {
-        return Err(SelfUpdateError::ManagedInstall(managed));
+        return Err(SelfUpdateError::ManagedInstall(Box::new(managed)));
     }
     let receipt_path = receipt_path(&executable)?;
     let receipt = read_receipt(&receipt_path)?;
@@ -248,10 +292,7 @@ fn run_with(
         return Err(SelfUpdateError::ReceiptInvalid("target_mismatch"));
     }
     let artifact = target.archive_name(&target_version.to_string());
-    let follow_up_host_update_command = request
-        .follow_up_host
-        .as_deref()
-        .map(|host| format!("satelle host update --host {host}"));
+    let follow_up_host_update_command = request.follow_up_host.as_deref().map(host_update_command);
     let same_version = target_version == current;
     let mut report = SelfUpdateReport {
         schema_version: "satelle.self.update.v1",
@@ -383,10 +424,8 @@ impl ReleaseSource for GithubReleaseSource {
     ) -> Result<VerifiedRelease, SelfUpdateError> {
         let archive_name = target.archive_name(version);
         let release_url = format!("{RELEASE_BASE_URL}/v{version}");
-        let archive_bytes = self.download(
-            &format!("{release_url}/{archive_name}"),
-            ARCHIVE_LIMIT,
-        )?;
+        let archive_bytes =
+            self.download(&format!("{release_url}/{archive_name}"), ARCHIVE_LIMIT)?;
         let manifest = self.download(&format!("{release_url}/SHA256SUMS"), MANIFEST_LIMIT)?;
         let expected_digest = manifest_digest(&manifest, &archive_name)?;
         let actual_digest: [u8; 32] = Sha256::digest(&archive_bytes).into();
@@ -536,7 +575,11 @@ pub(crate) struct ManagedInstall {
 
 impl std::fmt::Display for ManagedInstall {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(formatter, "{}; run `{}`", self.install_method, self.upgrade_command)?;
+        write!(
+            formatter,
+            "{}; run `{}`",
+            self.install_method, self.upgrade_command
+        )?;
         if let Some(working_directory) = &self.upgrade_working_directory {
             write!(formatter, " from `{}`", working_directory.display())?;
         }
@@ -554,9 +597,7 @@ struct PackageInstallContext {
     launcher_path: PathBuf,
 }
 
-fn detect_managed_install(
-    executable: &Path,
-) -> Result<Option<ManagedInstall>, SelfUpdateError> {
+fn detect_managed_install(executable: &Path) -> Result<Option<ManagedInstall>, SelfUpdateError> {
     let components = executable
         .components()
         .filter_map(|component| match component {
@@ -592,15 +633,14 @@ fn detect_managed_install(
         }));
     }
 
-    let raw_context = std::env::var_os(PACKAGE_INSTALL_CONTEXT_ENV);
-    if raw_context.is_none() {
-        return if contains("node_modules") {
-            Err(SelfUpdateError::InstallOwnerUnknown)
-        } else {
-            Ok(None)
-        };
+    // Only the JavaScript launcher can establish package ownership, and its
+    // native executable must remain inside the package's node_modules tree.
+    // Ignore an inherited or user-authored launcher marker for direct-install
+    // paths instead of letting unrelated process state mask a valid receipt.
+    if !contains("node_modules") {
+        return Ok(None);
     }
-    let raw_context = raw_context
+    let raw_context = std::env::var_os(PACKAGE_INSTALL_CONTEXT_ENV)
         .and_then(|value| value.into_string().ok())
         .ok_or(SelfUpdateError::InstallOwnerUnknown)?;
     package_managed_install(executable, &raw_context).map(Some)
@@ -624,7 +664,10 @@ fn package_managed_install_with_global_owners(
         serde_json::from_str(raw_context).map_err(|_| SelfUpdateError::InstallOwnerUnknown)?;
     if !matches!(context.manager.as_str(), "npm" | "pnpm" | "bun")
         || !matches!(context.scope.as_str(), "local" | "global")
-        || !matches!(context.package_name.as_str(), "@microck/satelle" | "satelle")
+        || !matches!(
+            context.package_name.as_str(),
+            "@microck/satelle" | "satelle"
+        )
     {
         return Err(SelfUpdateError::InstallOwnerUnknown);
     }
@@ -657,10 +700,15 @@ fn package_managed_install_with_global_owners(
     if (context.scope == "local"
         && (root_is_node_modules
             || relative_components.first().map(String::as_str) != Some("node_modules")
-            || launcher_relative.components().next().and_then(|component| match component {
-                Component::Normal(value) => Some(value.to_string_lossy().to_ascii_lowercase()),
-                _ => None,
-            }).as_deref() != Some("node_modules")))
+            || launcher_relative
+                .components()
+                .next()
+                .and_then(|component| match component {
+                    Component::Normal(value) => Some(value.to_string_lossy().to_ascii_lowercase()),
+                    _ => None,
+                })
+                .as_deref()
+                != Some("node_modules")))
         || (context.scope == "global" && !root_is_node_modules)
     {
         return Err(SelfUpdateError::InstallOwnerUnknown);
@@ -682,12 +730,7 @@ fn package_managed_install_with_global_owners(
         return Err(SelfUpdateError::InstallOwnerUnknown);
     }
 
-    validate_launcher_manifest(
-        &context,
-        &launcher_path,
-        target,
-        env!("CARGO_PKG_VERSION"),
-    )?;
+    validate_launcher_manifest(&context, &launcher_path, target, env!("CARGO_PKG_VERSION"))?;
     let derived_manager = if context.scope == "local" {
         local_manager(&install_root, &context.package_name)?
     } else {
@@ -755,7 +798,10 @@ fn validate_launcher_manifest(
     current_version: &str,
 ) -> Result<(), SelfUpdateError> {
     if launcher_path.file_name().and_then(|name| name.to_str()) != Some("satelle.cjs")
-        || launcher_path.parent().and_then(Path::file_name).and_then(|name| name.to_str())
+        || launcher_path
+            .parent()
+            .and_then(Path::file_name)
+            .and_then(|name| name.to_str())
             != Some("bin")
     {
         return Err(SelfUpdateError::InstallOwnerUnknown);
@@ -854,10 +900,10 @@ fn verified_global_manager(context: &PackageInstallContext) -> Option<String> {
     let launcher_path = context.launcher_path.canonicalize().ok()?;
     let mut owners = Vec::new();
     for manager in ["npm", "pnpm"] {
-        if let Some(root) = manager_command_line(manager, &["root", "--global"]) {
-            if Path::new(&root).canonicalize().ok().as_ref() == Some(&install_root) {
-                owners.push(manager.to_string());
-            }
+        if let Some(root) = manager_command_line(manager, &["root", "--global"])
+            && Path::new(&root).canonicalize().ok().as_ref() == Some(&install_root)
+        {
+            owners.push(manager.to_string());
         }
     }
     if let Some(bin) = manager_command_line("bun", &["pm", "bin", "--global"]) {
@@ -889,13 +935,7 @@ enum ManagerProbeError {
 }
 
 fn manager_command_line(program: &str, arguments: &[&str]) -> Option<String> {
-    manager_command_line_bounded(
-        program,
-        arguments,
-        Duration::from_secs(10),
-        64 * 1024,
-    )
-    .ok()
+    manager_command_line_bounded(program, arguments, Duration::from_secs(10), 64 * 1024).ok()
 }
 
 fn manager_command_line_bounded(
@@ -937,7 +977,10 @@ fn manager_command_line_bounded(
         return Err(ManagerProbeError::OutputLimit);
     }
     let output = String::from_utf8(output).map_err(|_| ManagerProbeError::InvalidOutput)?;
-    let mut lines = output.lines().map(str::trim).filter(|line| !line.is_empty());
+    let mut lines = output
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty());
     let line = lines.next().ok_or(ManagerProbeError::InvalidOutput)?;
     if lines.next().is_some() {
         return Err(ManagerProbeError::InvalidOutput);
@@ -1030,8 +1073,8 @@ fn replace_installation_locked(
     }
 
     if let Err(error) = replacer.replace(executable, staged_binary) {
-        if let Err(rollback) = fs::remove_file(receipt_path)
-            .and_then(|()| fs::rename(&previous_receipt, receipt_path))
+        if let Err(rollback) =
+            fs::remove_file(receipt_path).and_then(|()| fs::rename(&previous_receipt, receipt_path))
         {
             return Err(SelfUpdateError::ReceiptRollback {
                 backup_path: previous_receipt,
@@ -1080,9 +1123,7 @@ impl Version {
     fn parse(raw: &str) -> Result<Self, SelfUpdateError> {
         let (core, prerelease) = raw
             .split_once('-')
-            .map_or((raw, None), |(core, prerelease)| {
-                (core, Some(prerelease))
-            });
+            .map_or((raw, None), |(core, prerelease)| (core, Some(prerelease)));
         if raw.contains('+')
             || prerelease.is_some_and(|value| {
                 value.is_empty()
@@ -1325,9 +1366,7 @@ fn create_executable_file(path: &Path) -> Result<File, SelfUpdateError> {
 
 fn verify_binary_version(executable: &Path, version: &str) -> Result<(), SelfUpdateError> {
     let mut stdout = tempfile::tempfile().map_err(SelfUpdateError::BinarySmoke)?;
-    let child_stdout = stdout
-        .try_clone()
-        .map_err(SelfUpdateError::BinarySmoke)?;
+    let child_stdout = stdout.try_clone().map_err(SelfUpdateError::BinarySmoke)?;
     let mut child = Command::new(executable)
         .arg("--version")
         .stdin(Stdio::null())
@@ -1366,8 +1405,7 @@ fn read_response_bounded(response: Response, limit: u64) -> Result<Vec<u8>, Self
 }
 
 fn manifest_digest(manifest: &[u8], filename: &str) -> Result<[u8; 32], SelfUpdateError> {
-    let text =
-        std::str::from_utf8(manifest).map_err(|_| SelfUpdateError::ManifestInvalid)?;
+    let text = std::str::from_utf8(manifest).map_err(|_| SelfUpdateError::ManifestInvalid)?;
     if !text.ends_with('\n') || text.contains('\r') {
         return Err(SelfUpdateError::ManifestInvalid);
     }
@@ -1382,7 +1420,7 @@ fn manifest_digest(manifest: &[u8], filename: &str) -> Result<[u8; 32], SelfUpda
             || name == "."
             || name == ".."
             || name == "SHA256SUMS"
-            || name.bytes().any(u8::is_ascii_whitespace)
+            || name.bytes().any(|byte| byte.is_ascii_whitespace())
             || name.contains('/')
             || name.contains('\\')
             || previous.is_some_and(|previous| previous >= name)
@@ -1410,7 +1448,8 @@ fn write_private_file(path: &Path, bytes: &[u8]) -> Result<(), SelfUpdateError> 
         options.mode(0o600);
     }
     let mut file = options.open(path).map_err(SelfUpdateError::PrivateWrite)?;
-    file.write_all(bytes).map_err(SelfUpdateError::PrivateWrite)?;
+    file.write_all(bytes)
+        .map_err(SelfUpdateError::PrivateWrite)?;
     file.sync_all().map_err(SelfUpdateError::PrivateWrite)
 }
 
@@ -1453,7 +1492,7 @@ pub(crate) enum SelfUpdateError {
     #[error("the running Satelle executable could not be identified")]
     CurrentExecutable(#[source] io::Error),
     #[error("self update is managed by {0}")]
-    ManagedInstall(ManagedInstall),
+    ManagedInstall(Box<ManagedInstall>),
     #[error("the Satelle installation owner could not be established")]
     InstallOwnerUnknown,
     #[error("the Satelle installation receipt is invalid: {0}")]
@@ -1462,9 +1501,7 @@ pub(crate) enum SelfUpdateError {
     ReceiptRead(#[source] io::Error),
     #[error("the requested Satelle version is invalid: {0}")]
     VersionInvalid(String),
-    #[error(
-        "updating from {current} to {candidate} requires an explicit --version selection"
-    )]
+    #[error("updating from {current} to {candidate} requires an explicit --version selection")]
     ExplicitVersionRequired { current: String, candidate: String },
     #[error("the local platform does not have an MVP Controller artifact")]
     UnsupportedLocalPlatform,
@@ -1532,23 +1569,28 @@ pub(crate) enum SelfUpdateError {
 }
 
 impl SelfUpdateError {
-    pub(crate) fn code(&self) -> &'static str {
+    fn error_code(&self) -> ErrorCode {
         match self {
-            Self::ManagedInstall(_) => "self-update-managed-install",
-            Self::InstallOwnerUnknown => "self-update-install-owner-unknown",
-            Self::VersionInvalid(_) => "self-update-version-invalid",
-            Self::ExplicitVersionRequired { .. } => "self-update-explicit-version-required",
-            Self::UnsupportedLocalPlatform => "unsupported-local-platform",
-            Self::UnsupportedReleaseTarget(_) => "unsupported-release-target",
-            Self::InstallLocked(_) => "self-update-locked",
-            Self::ReceiptRollback { .. } => "self-update-rollback-failed",
-            Self::ReceiptInvalid(_) | Self::ReceiptRead(_) => "self-update-receipt-invalid",
+            Self::ManagedInstall(_) => ErrorCode::SelfUpdateManagedInstall,
+            Self::InstallOwnerUnknown => ErrorCode::SelfUpdateInstallOwnerUnknown,
+            Self::VersionInvalid(_) => ErrorCode::SelfUpdateVersionInvalid,
+            Self::ExplicitVersionRequired { .. } => ErrorCode::SelfUpdateExplicitVersionRequired,
+            Self::UnsupportedLocalPlatform => ErrorCode::UnsupportedLocalPlatform,
+            Self::UnsupportedReleaseTarget(_) => ErrorCode::UnsupportedReleaseTarget,
+            Self::InstallLocked(_) => ErrorCode::SelfUpdateLocked,
+            Self::ReceiptRollback { .. } => ErrorCode::SelfUpdateRollbackFailed,
+            Self::ReceiptInvalid(_) | Self::ReceiptRead(_) => ErrorCode::SelfUpdateReceiptInvalid,
             Self::ArchiveDigestMismatch
             | Self::AttestationInvalid
             | Self::ManifestEntryMissing
-            | Self::ManifestInvalid => "self-update-verification-failed",
-            _ => "self-update-failed",
+            | Self::ManifestInvalid => ErrorCode::SelfUpdateVerificationFailed,
+            _ => ErrorCode::SelfUpdateFailed,
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn code(&self) -> &'static str {
+        self.error_code().as_str()
     }
 
     pub(crate) fn details(&self) -> Value {
@@ -1613,6 +1655,26 @@ impl SelfUpdateError {
                 receipt_path.display()
             )),
             _ => None,
+        }
+    }
+
+    pub(crate) fn into_satelle_error(self) -> SatelleError {
+        let code = self.error_code();
+        let details = self
+            .details()
+            .as_object()
+            .expect("self-update details are always an object")
+            .clone()
+            .into_iter()
+            .collect();
+        let recovery_command = self.recovery_command();
+        let source_detail = std::error::Error::source(&self).map(std::string::ToString::to_string);
+        SatelleError {
+            code,
+            message: self.to_string(),
+            recovery_command,
+            source_detail,
+            details,
         }
     }
 }
@@ -1693,8 +1755,7 @@ mod tests {
             ("win32-arm64-msvc", "zip"),
             ("win32-x64-msvc", "zip"),
         ] {
-            let artifact =
-                fetch_verified_host_artifact_with(&source, "1.2.3", target).unwrap();
+            let artifact = fetch_verified_host_artifact_with(&source, "1.2.3", target).unwrap();
             assert_eq!(
                 artifact.artifact_identity(),
                 format!("satelle-v1.2.3-{target}.{extension}")
@@ -1833,8 +1894,7 @@ mod tests {
             Some(false)
         );
 
-        let choices =
-            remote_host_choices(None, Some("laptop"), ["laptop".to_string()]);
+        let choices = remote_host_choices(None, Some("laptop"), ["laptop".to_string()]);
         assert_eq!(selected_remote_host(&choices), Some("laptop"));
         assert_eq!(choices[0].selection_reason, Some("configured_default"));
 
@@ -1850,6 +1910,10 @@ mod tests {
                 .find(|choice| choice.alias == "workstation")
                 .map(|choice| choice.selected),
             Some(false)
+        );
+        assert_eq!(
+            host_update_command("remote; touch /tmp/not-run"),
+            "satelle host update --host 'remote; touch /tmp/not-run'"
         );
     }
 
@@ -1873,10 +1937,8 @@ mod tests {
             };
             if scope == "local" {
                 let mut project_dependencies = serde_json::Map::new();
-                project_dependencies.insert(
-                    package_name.to_string(),
-                    json!(env!("CARGO_PKG_VERSION")),
-                );
+                project_dependencies
+                    .insert(package_name.to_string(), json!(env!("CARGO_PKG_VERSION")));
                 let project_manifest = json!({
                     "name": "consumer",
                     "version": "1.0.0",
@@ -1961,16 +2023,12 @@ mod tests {
             )
             .expect("managed install");
             let command = match (manager, scope) {
-                ("npm", "local") => {
-                    "npm update @microck/satelle --include=optional".to_string()
-                }
+                ("npm", "local") => "npm update @microck/satelle --include=optional".to_string(),
                 ("npm", "global") => {
                     "npm update --global @microck/satelle --include=optional".to_string()
                 }
                 ("pnpm", "local") => "pnpm update @microck/satelle".to_string(),
-                ("pnpm", "global") => {
-                    "pnpm update --global @microck/satelle".to_string()
-                }
+                ("pnpm", "global") => "pnpm update --global @microck/satelle".to_string(),
                 ("bun", "local") => "bun update @microck/satelle".to_string(),
                 ("bun", "global") => "bun update --global satelle".to_string(),
                 _ => unreachable!(),
@@ -1983,7 +2041,7 @@ mod tests {
                 managed.upgrade_working_directory.as_deref(),
                 (scope == "local").then_some(install_root.as_path())
             );
-            let managed_error = SelfUpdateError::ManagedInstall(managed.clone());
+            let managed_error = SelfUpdateError::ManagedInstall(Box::new(managed.clone()));
             assert_eq!(
                 managed_error.recovery_command(),
                 (scope == "global").then(|| command.clone())
@@ -2022,9 +2080,7 @@ mod tests {
                     Err(SelfUpdateError::InstallOwnerUnknown)
                 ));
 
-                let wrong_target_package = if target.npm_package_name()
-                    == "satelle-darwin-arm64"
-                {
+                let wrong_target_package = if target.npm_package_name() == "satelle-darwin-arm64" {
                     "satelle-linux-x64-gnu"
                 } else {
                     "satelle-darwin-arm64"
@@ -2045,9 +2101,9 @@ mod tests {
                     Err(SelfUpdateError::InstallOwnerUnknown)
                 ));
 
-                let nonterminal_root = native_root.join(target.executable_name());
+                let nonterminal_root = native_root.join("nested");
                 fs::create_dir_all(&nonterminal_root).unwrap();
-                let nonterminal = nonterminal_root.join("extra");
+                let nonterminal = nonterminal_root.join(target.executable_name());
                 fs::write(&nonterminal, b"fixture").unwrap();
                 assert!(matches!(
                     package_managed_install_with_global_owners(
@@ -2069,7 +2125,7 @@ mod tests {
                     Err(SelfUpdateError::InstallOwnerUnknown)
                 ));
             }
-            let error = SelfUpdateError::ManagedInstall(managed);
+            let error = SelfUpdateError::ManagedInstall(Box::new(managed));
             assert_eq!(error.code(), "self-update-managed-install");
             assert_eq!(error.details()["install_method"], manager);
             assert_eq!(error.details()["upgrade_command"], command);
@@ -2094,12 +2150,16 @@ mod tests {
                 managed.upgrade_command,
                 "npm update @microck/satelle --include=optional"
             );
-            assert!(!managed.upgrade_command.contains(&install_root.to_string_lossy()[..]));
+            assert!(
+                !managed
+                    .upgrade_command
+                    .contains(&install_root.to_string_lossy()[..])
+            );
             assert_eq!(
                 managed.upgrade_working_directory.as_deref(),
                 Some(install_root.as_path())
             );
-            let error = SelfUpdateError::ManagedInstall(managed);
+            let error = SelfUpdateError::ManagedInstall(Box::new(managed));
             assert_eq!(error.recovery_command(), None);
             assert_eq!(error.details()["working_directory"], json!(install_root));
             assert!(error.to_string().contains(" from `"));
@@ -2262,15 +2322,7 @@ mod tests {
             Version::parse("1.2.3-rc.1").unwrap().prerelease.as_deref(),
             Some("rc.1")
         );
-        for invalid in [
-            "",
-            "1",
-            "1.2",
-            "01.2.3",
-            "1.2.3+",
-            "1.2.3-",
-            "1.2.3-01",
-        ] {
+        for invalid in ["", "1", "1.2", "01.2.3", "1.2.3+", "1.2.3-", "1.2.3-01"] {
             assert!(Version::parse(invalid).is_err(), "{invalid}");
         }
     }
@@ -2377,6 +2429,19 @@ mod tests {
         );
         assert!(!report.changed);
         assert_eq!(fs::read(&fixture.current_binary).unwrap(), before);
+        assert_eq!(
+            report.human_lines(),
+            [
+                "Satelle would update from 1.0.0 to 1.1.0.",
+                "Install owner: satelle-install-script",
+                &format!("Target artifact: {}", report.target_artifact),
+                &format!(
+                    "Planned replacement: {}",
+                    report.planned_replacement.display()
+                ),
+                "Next: satelle host update --host workstation",
+            ]
+        );
     }
 
     #[test]
@@ -2434,15 +2499,14 @@ mod tests {
         };
 
         thread::scope(|scope| {
-            let first =
-                scope.spawn(move || {
-                    run_with(
-                        first_request,
-                        &first_source,
-                        &FixtureReplacer,
-                        OffsetDateTime::UNIX_EPOCH,
-                    )
-                });
+            let first = scope.spawn(move || {
+                run_with(
+                    first_request,
+                    &first_source,
+                    &FixtureReplacer,
+                    OffsetDateTime::UNIX_EPOCH,
+                )
+            });
             started_receiver
                 .recv()
                 .expect("first updater reaches verification under the lock");
@@ -2485,10 +2549,7 @@ mod tests {
     fn checksum_manifest_requires_one_sorted_canonical_entry() {
         let selected = "satelle-v1.0.0-linux-x64-gnu.tar.gz";
         let digest = "01".repeat(32);
-        let manifest = format!(
-            "{digest}  other.tar.gz\n{}  {selected}\n",
-            "02".repeat(32)
-        );
+        let manifest = format!("{digest}  other.tar.gz\n{}  {selected}\n", "02".repeat(32));
         assert_eq!(
             manifest_digest(manifest.as_bytes(), selected).unwrap(),
             [2; 32]
@@ -2611,9 +2672,11 @@ mod tests {
 
     fn install_fixture(version: &str) -> InstallFixture {
         let directory = tempdir().unwrap();
-        let current_binary = directory.path().join(std::env::consts::EXE_EXTENSION).with_file_name(
-            if cfg!(windows) { "satelle.exe" } else { "satelle" },
-        );
+        let current_binary = directory.path().join(if cfg!(windows) {
+            "satelle.exe"
+        } else {
+            "satelle"
+        });
         let updated_binary = directory.path().join(if cfg!(windows) {
             "satelle-new.exe"
         } else {
