@@ -46,8 +46,9 @@ pub(crate) use setup::{
 
 pub(crate) const PROTOCOL_VERSION_HEADER: &str = "satelle-protocol-version";
 // Protocol v12 hard-cuts capabilities v6 and authenticated Host Path Set
-// inspection. A v11 peer cannot represent these contracts and must receive the
-// typed protocol incompatibility response before either side decodes them.
+// inspection. A v11 client accepts only capabilities v5 and cannot represent
+// the Host Path Set, so it must receive the typed protocol incompatibility
+// response before either side decodes the newer contracts.
 pub(crate) const PROTOCOL_VERSION: &str = "12";
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer};

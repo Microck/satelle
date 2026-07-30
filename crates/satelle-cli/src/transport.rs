@@ -2772,6 +2772,14 @@ struct HostMaintenanceInspection {
     host_automation_is_safe: bool,
 }
 
+fn host_release_artifact_required(relation: crate::host_update::HostVersionRelation) -> bool {
+    matches!(
+        relation,
+        crate::host_update::HostVersionRelation::Missing
+            | crate::host_update::HostVersionRelation::OlderThanCli
+    )
+}
+
 fn inspect_host_maintenance(
     host: &SelectedHost,
     needs_host_artifact: bool,
@@ -2780,7 +2788,7 @@ fn inspect_host_maintenance(
     match host.config.transport {
         TransportKind::Local => {
             let service = local_host_service(&host.config).map_err(|failure| failure.error)?;
-            let capabilities = service.daemon_runtime_capabilities()?;
+            let codex_evidence = service.maintenance_codex_update_evidence()?;
             let (_, platform) =
                 canonical_remote_platform(std::env::consts::OS, std::env::consts::ARCH);
             Ok(HostMaintenanceInspection {
@@ -2794,7 +2802,7 @@ fn inspect_host_maintenance(
                     daemon_destination: None,
                 }),
                 service_inspection: None,
-                codex_evidence: Some(capabilities.codex_update_evidence()),
+                codex_evidence: Some(codex_evidence),
                 // The local transport has no production mutation backend.
                 host_automation_is_safe: false,
             })
@@ -2829,10 +2837,22 @@ fn inspect_host_maintenance(
             let target = transport.remote_target()?;
             let current =
                 transport.observe_current_daemon_artifact(transport.token_file_exists()?)?;
+            let host_relation = needs_host_artifact
+                .then(|| {
+                    host_version_relation(
+                        current.current_version.as_deref(),
+                        current.protocol_compatible,
+                        current.minimum_host_version.as_deref(),
+                        cli_version,
+                    )
+                })
+                .transpose()?;
+            let needs_host_release_artifact =
+                host_relation.is_some_and(host_release_artifact_required);
             let remote_directories = needs_host_artifact
                 .then(|| transport.remote_directories(target))
                 .transpose()?;
-            let release_artifact = needs_host_artifact
+            let release_artifact = needs_host_release_artifact
                 .then(|| transport.release_artifact(target))
                 .transpose()?;
             let install_path = match (remote_directories.as_ref(), release_artifact.as_ref()) {
@@ -2843,7 +2863,7 @@ fn inspect_host_maintenance(
                 ),
                 _ => None,
             };
-            let artifact = if needs_host_artifact {
+            let artifact = if needs_host_release_artifact {
                 verified_host_update_artifact(target, install_path, release_artifact)?
             } else {
                 None
@@ -2872,12 +2892,9 @@ fn inspect_host_maintenance(
                             // The task or launchd definition proves ownership
                             // but does not carry an independent asset version.
                             current_version: None,
-                            relation_to_cli: host_version_relation(
-                                current.current_version.as_deref(),
-                                current.protocol_compatible,
-                                current.minimum_host_version.as_deref(),
-                                cli_version,
-                            )?,
+                            relation_to_cli: host_relation.expect(
+                                "persistent Host inspection computes the Host version relation",
+                            ),
                             destination,
                         })
                     }
@@ -6383,6 +6400,25 @@ mod bootstrap_ordering_tests {
             missing_error.details["remote_platform"],
             serde_json::json!("darwin-arm64")
         );
+    }
+
+    #[test]
+    fn only_missing_or_older_hosts_require_release_artifact_metadata() {
+        use crate::host_update::HostVersionRelation;
+
+        assert!(host_release_artifact_required(HostVersionRelation::Missing));
+        assert!(host_release_artifact_required(
+            HostVersionRelation::OlderThanCli
+        ));
+        assert!(!host_release_artifact_required(
+            HostVersionRelation::MatchesCli
+        ));
+        assert!(!host_release_artifact_required(
+            HostVersionRelation::NewerThanCli
+        ));
+        assert!(!host_release_artifact_required(
+            HostVersionRelation::RequiresNewerCli
+        ));
     }
 
     #[test]

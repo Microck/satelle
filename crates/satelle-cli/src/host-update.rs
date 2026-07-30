@@ -169,34 +169,38 @@ fn plan_host_targets(
         | HostVersionRelation::MatchesCli => {}
     }
 
-    let artifact = artifacts
-        .resolve_exact_cli_artifact(
-            request.cli_version,
-            &request.host_inspection.remote_platform,
-        )?
-        .ok_or_else(|| HostUpdatePlanError::HostArtifactUnavailable {
-            cli_version: request.cli_version.to_string(),
-            remote_platform: request.host_inspection.remote_platform.clone(),
-        })?;
-    if artifact.version != request.cli_version
-        || artifact.remote_platform != request.host_inspection.remote_platform
-    {
-        return Err(HostUpdatePlanError::InvalidArtifact {
-            expected_version: request.cli_version.to_string(),
-            expected_platform: request.host_inspection.remote_platform.clone(),
-        });
-    }
-
     let disposition = match request.host_inspection.relation_to_cli {
         HostVersionRelation::Missing => HostUpdateDisposition::Install,
         HostVersionRelation::OlderThanCli => HostUpdateDisposition::Update,
         HostVersionRelation::MatchesCli => HostUpdateDisposition::Current,
         HostVersionRelation::NewerThanCli | HostVersionRelation::RequiresNewerCli => unreachable!(),
     };
+    let artifact = if disposition == HostUpdateDisposition::Current {
+        None
+    } else {
+        let artifact = artifacts
+            .resolve_exact_cli_artifact(
+                request.cli_version,
+                &request.host_inspection.remote_platform,
+            )?
+            .ok_or_else(|| HostUpdatePlanError::HostArtifactUnavailable {
+                cli_version: request.cli_version.to_string(),
+                remote_platform: request.host_inspection.remote_platform.clone(),
+            })?;
+        if artifact.version != request.cli_version
+            || artifact.remote_platform != request.host_inspection.remote_platform
+        {
+            return Err(HostUpdatePlanError::InvalidArtifact {
+                expected_version: request.cli_version.to_string(),
+                expected_platform: request.host_inspection.remote_platform.clone(),
+            });
+        }
+        Some(artifact)
+    };
     let daemon_mutations = mutation_for(
         disposition,
         "replace_host_daemon",
-        artifact.daemon_destination,
+        artifact.and_then(|artifact| artifact.daemon_destination),
     );
     let mut targets = vec![HostUpdateTargetPlan {
         target: HostUpdateTarget::HostDaemon,
@@ -578,6 +582,32 @@ mod tests {
 
         assert_eq!(report.targets.len(), 1);
         assert_eq!(report.targets[0].target, HostUpdateTarget::HostDaemon);
+    }
+
+    #[test]
+    fn current_host_does_not_resolve_an_update_artifact() {
+        let mut host = host_inspection(HostVersionRelation::MatchesCli);
+        host.current_version = Some("1.2.3".to_string());
+        let report = build_host_update_plan(
+            HostUpdatePlanRequest {
+                host: "office",
+                cli_version: "1.2.3",
+                components: &[HostUpdateComponent::Host],
+                includes_all: false,
+                host_inspection: &host,
+                service_inspection: None,
+                codex_inspections: &[],
+            },
+            &Artifact(None),
+        )
+        .expect("a current Host does not need an update artifact");
+
+        assert_eq!(report.targets.len(), 1);
+        assert_eq!(
+            report.targets[0].disposition,
+            HostUpdateDisposition::Current
+        );
+        assert!(!report.confirmation_required);
     }
 
     #[test]

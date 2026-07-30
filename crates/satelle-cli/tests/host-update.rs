@@ -43,6 +43,45 @@ fn host_update_dry_run_emits_the_v1_plan_before_any_apply_boundary() {
 }
 
 #[test]
+fn local_maintenance_dry_runs_do_not_create_host_storage() {
+    let temporary_root =
+        TestStateDir::new().expect("create secure parent for absent Host state roots");
+    let commands = [
+        vec![
+            "host",
+            "update",
+            "--host",
+            "local-demo",
+            "--component",
+            "host",
+            "--dry-run",
+            "--json",
+        ],
+        vec!["repair", "--host", "local-demo", "--dry-run", "--json"],
+    ];
+
+    for (index, arguments) in commands.iter().enumerate() {
+        let state_root = temporary_root.path().join(format!("absent-{index}"));
+        let output = satelle()
+            .env("SATELLE_STATE_DIR", &state_root)
+            .args(arguments)
+            .output()
+            .expect("run local maintenance dry-run");
+
+        assert!(
+            output.status.success(),
+            "stderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            !state_root.exists(),
+            "local maintenance dry-run created Host storage at {}",
+            state_root.display()
+        );
+    }
+}
+
+#[test]
 fn host_update_has_no_arbitrary_version_or_channel_flags() {
     for unsupported in ["--version", "--channel", "--latest"] {
         satelle()
