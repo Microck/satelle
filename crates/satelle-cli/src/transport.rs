@@ -2765,6 +2765,7 @@ struct HostMaintenanceInspection {
     current_version: Option<String>,
     minimum_host_version: Option<String>,
     protocol_compatible: bool,
+    relation_to_cli: crate::host_update::HostVersionRelation,
     remote_platform: String,
     artifact: Option<crate::host_update::VerifiedHostArtifact>,
     service_inspection: Option<crate::host_update::HostUpdateServiceInspection>,
@@ -2795,12 +2796,9 @@ fn inspect_host_maintenance(
                 current_version: Some(cli_version.to_string()),
                 minimum_host_version: Some(cli_version.to_string()),
                 protocol_compatible: true,
-                remote_platform: platform.clone(),
-                artifact: needs_host_artifact.then(|| crate::host_update::VerifiedHostArtifact {
-                    version: cli_version.to_string(),
-                    remote_platform: platform,
-                    daemon_destination: None,
-                }),
+                relation_to_cli: crate::host_update::HostVersionRelation::MatchesCli,
+                remote_platform: platform,
+                artifact: None,
                 service_inspection: None,
                 codex_evidence: Some(codex_evidence),
                 // The local transport has no production mutation backend.
@@ -2812,9 +2810,17 @@ fn inspect_host_maintenance(
             let capabilities = read_direct_maintenance_capabilities(&host.alias, &transport)?;
             let (target, platform) =
                 canonical_remote_platform(capabilities.platform(), capabilities.platform_arch());
+            let relation_to_cli = host_version_relation(
+                Some(capabilities.daemon_version()),
+                true,
+                capabilities.minimum_host_version(),
+                cli_version,
+            )?;
             let artifact = if needs_host_artifact {
                 match target {
-                    Some(target) => verified_host_update_artifact(target, None, None)?,
+                    Some(target) => {
+                        verified_host_update_artifact(relation_to_cli, target, None, None)?
+                    }
                     None => None,
                 }
             } else {
@@ -2824,6 +2830,7 @@ fn inspect_host_maintenance(
                 current_version: Some(capabilities.daemon_version().to_string()),
                 minimum_host_version: capabilities.minimum_host_version().map(str::to_string),
                 protocol_compatible: true,
+                relation_to_cli,
                 remote_platform: platform,
                 artifact,
                 service_inspection: None,
@@ -2837,18 +2844,14 @@ fn inspect_host_maintenance(
             let target = transport.remote_target()?;
             let current =
                 transport.observe_current_daemon_artifact(transport.token_file_exists()?)?;
-            let host_relation = needs_host_artifact
-                .then(|| {
-                    host_version_relation(
-                        current.current_version.as_deref(),
-                        current.protocol_compatible,
-                        current.minimum_host_version.as_deref(),
-                        cli_version,
-                    )
-                })
-                .transpose()?;
+            let relation_to_cli = host_version_relation(
+                current.current_version.as_deref(),
+                current.protocol_compatible,
+                current.minimum_host_version.as_deref(),
+                cli_version,
+            )?;
             let needs_host_release_artifact =
-                host_relation.is_some_and(host_release_artifact_required);
+                needs_host_artifact && host_release_artifact_required(relation_to_cli);
             let remote_directories = needs_host_artifact
                 .then(|| transport.remote_directories(target))
                 .transpose()?;
@@ -2863,8 +2866,13 @@ fn inspect_host_maintenance(
                 ),
                 _ => None,
             };
-            let artifact = if needs_host_release_artifact {
-                verified_host_update_artifact(target, install_path, release_artifact)?
+            let artifact = if needs_host_artifact {
+                verified_host_update_artifact(
+                    relation_to_cli,
+                    target,
+                    install_path,
+                    release_artifact,
+                )?
             } else {
                 None
             };
@@ -2892,9 +2900,7 @@ fn inspect_host_maintenance(
                             // The task or launchd definition proves ownership
                             // but does not carry an independent asset version.
                             current_version: None,
-                            relation_to_cli: host_relation.expect(
-                                "persistent Host inspection computes the Host version relation",
-                            ),
+                            relation_to_cli,
                             destination,
                         })
                     }
@@ -2907,6 +2913,7 @@ fn inspect_host_maintenance(
                 current_version: current.current_version,
                 minimum_host_version: current.minimum_host_version,
                 protocol_compatible: current.protocol_compatible,
+                relation_to_cli,
                 remote_platform: target.id().to_string(),
                 artifact,
                 service_inspection,
@@ -2940,12 +2947,7 @@ pub(crate) fn plan_host_update(
     let service_inspection = inspection.service_inspection;
 
     let host_inspection = crate::host_update::HostUpdateInspection {
-        relation_to_cli: host_version_relation(
-            inspection.current_version.as_deref(),
-            inspection.protocol_compatible,
-            inspection.minimum_host_version.as_deref(),
-            cli_version,
-        )?,
+        relation_to_cli: inspection.relation_to_cli,
         current_version: inspection.current_version,
         remote_platform: inspection.remote_platform,
     };
@@ -3117,10 +3119,14 @@ fn canonical_remote_platform(
 }
 
 fn verified_host_update_artifact(
+    relation: crate::host_update::HostVersionRelation,
     target: ssh_bootstrap::RemoteTarget,
     install_path: Option<String>,
     known_metadata: Option<ssh_bootstrap::ReleaseArtifactMetadata>,
 ) -> Result<Option<crate::host_update::VerifiedHostArtifact>, SatelleError> {
+    if !host_release_artifact_required(relation) {
+        return Ok(None);
+    }
     let metadata = match known_metadata {
         Some(metadata) => metadata,
         None => match ssh_bootstrap::ReleaseArtifactMetadata::fetch(target) {
@@ -6419,6 +6425,19 @@ mod bootstrap_ordering_tests {
         assert!(!host_release_artifact_required(
             HostVersionRelation::RequiresNewerCli
         ));
+    }
+
+    #[test]
+    fn current_host_artifact_resolution_does_not_fetch_release_metadata() {
+        let artifact = verified_host_update_artifact(
+            crate::host_update::HostVersionRelation::MatchesCli,
+            ssh_bootstrap::RemoteTarget::LinuxX64Gnu,
+            None,
+            None,
+        )
+        .expect("current Host artifact resolution is self-contained");
+
+        assert_eq!(artifact, None);
     }
 
     #[test]
