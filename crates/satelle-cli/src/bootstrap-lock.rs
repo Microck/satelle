@@ -1385,7 +1385,7 @@ mod tests {
         let script = request().windows_script();
         assert!(
             script.contains(
-                "$claimOperationKind -cnotin @('initial_setup', 'missing_daemon_repair', 'host_binary_replacement', 'service_stop', 'service_restart')"
+                "$claimOperationKind -cnotin @('initial_setup', 'missing_daemon_repair', 'host_binary_replacement', 'service_stop', 'service_restart', 'storage_maintenance')"
             )
         );
     }
@@ -2741,6 +2741,7 @@ mod tests {
                 "persistent_service_start",
                 "persistent_service_restart",
                 "persistent_service_stop",
+                "offline_storage_maintenance",
             ]
         );
         assert_eq!(
@@ -2751,6 +2752,7 @@ mod tests {
                 "host_binary_replacement",
                 "service_stop",
                 "service_restart",
+                "storage_maintenance",
             ]
         );
 
@@ -2765,10 +2767,10 @@ mod tests {
             assert_eq!(windows.matches(phase).count(), 2, "Windows {phase}");
         }
         assert!(posix.contains(
-            "case \"$claim_operation_kind\" in initial_setup|missing_daemon_repair|host_binary_replacement|service_stop|service_restart)"
+            "case \"$claim_operation_kind\" in initial_setup|missing_daemon_repair|host_binary_replacement|service_stop|service_restart|storage_maintenance)"
         ));
         assert!(windows.contains(
-            "$claimOperationKind -cnotin @('initial_setup', 'missing_daemon_repair', 'host_binary_replacement', 'service_stop', 'service_restart')"
+            "$claimOperationKind -cnotin @('initial_setup', 'missing_daemon_repair', 'host_binary_replacement', 'service_stop', 'service_restart', 'storage_maintenance')"
         ));
     }
 
