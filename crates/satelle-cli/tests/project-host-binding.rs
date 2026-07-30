@@ -499,6 +499,28 @@ output_format = "json"
 }
 
 #[test]
+fn configured_json_output_format_applies_to_command_errors() {
+    let fixture = ConfigFixture::new(
+        r#"
+output_format = "json"
+"#,
+        "",
+    );
+
+    let output = fixture
+        .command()
+        .args(["host", "status", "--host", "missing"])
+        .assert()
+        .code(66)
+        .get_output()
+        .clone();
+    let error = parse_json(&output.stderr);
+
+    assert_eq!(error["schema_version"], "satelle.error.v1");
+    assert_eq!(error["code"], "host-not-found");
+}
+
+#[test]
 fn project_preflight_provenance_tracks_the_selected_host_and_each_host_field() {
     let fixture = ConfigFixture::new(
         r#"

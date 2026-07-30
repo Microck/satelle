@@ -402,6 +402,14 @@ fn ordinary_ssh_commands_require_a_durable_token_descriptor() {
 }
 
 #[test]
+fn tokenless_ssh_sessions_without_bootstrap_report_daemon_unreachable() {
+    let failure = transport::host_sessions_for_inspection(&ssh_setup_host(None), true)
+        .expect_err("tokenless no-bootstrap inspection cannot authenticate the daemon");
+
+    assert_eq!(failure.error.code, ErrorCode::HostDaemonUnreachable);
+}
+
+#[test]
 fn ssh_setup_plan_declares_one_durable_token_handoff() {
     let state = TestStateDir::new().expect("temporary state directory");
     let path = state.path().join("satelle-setup-plan.token");

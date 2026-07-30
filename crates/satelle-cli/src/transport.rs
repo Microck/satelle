@@ -5125,13 +5125,17 @@ pub(crate) fn host_sessions_for_inspection(
             Err(error) => Err(error),
         },
         TransportKind::Ssh => {
-            let bootstrap_scope = (!no_bootstrap).then_some(SshBootstrapScope::Read);
-            let launch_policy = bootstrap_scope.map_or(
-                SshDaemonLaunchPolicy::Never,
-                SshDaemonLaunchPolicy::Bootstrap,
-            );
-            ssh_transport(host, launch_policy)
-                .and_then(|transport| transport.host_sessions(no_bootstrap))
+            if no_bootstrap && host.config.api_token.is_none() {
+                Err(SatelleError::host_daemon_unreachable(&host.alias))
+            } else {
+                let bootstrap_scope = (!no_bootstrap).then_some(SshBootstrapScope::Read);
+                let launch_policy = bootstrap_scope.map_or(
+                    SshDaemonLaunchPolicy::Never,
+                    SshDaemonLaunchPolicy::Bootstrap,
+                );
+                ssh_transport(host, launch_policy)
+                    .and_then(|transport| transport.host_sessions(no_bootstrap))
+            }
         }
         TransportKind::Local => local_host_service(&host.config)
             .map_err(|failure| failure.error)

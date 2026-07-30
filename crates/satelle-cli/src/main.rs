@@ -891,11 +891,11 @@ fn main() -> ExitCode {
             return process_exit_code(&error);
         }
     };
-    let error_format =
+    let mut error_format =
         ErrorFormat::resolve(cli.error_format, cli.command.requests_machine_errors());
     install_diagnostics(&cli.command, error_format);
 
-    match try_main(cli, error_format) {
+    match try_main(cli, &mut error_format) {
         Ok(()) => ExitCode::SUCCESS,
         Err(failure) => {
             if !failure.error_reported {
@@ -955,7 +955,8 @@ fn parser_error_format(args: &[std::ffi::OsString]) -> ErrorFormat {
     ErrorFormat::resolve(configured, machine_selector)
 }
 
-fn try_main(cli: Cli, error_format: ErrorFormat) -> Result<(), CliFailure> {
+fn try_main(cli: Cli, error_format: &mut ErrorFormat) -> Result<(), CliFailure> {
+    let error_format_configured = cli.error_format.is_some();
     let Cli {
         no_color,
         profile,
@@ -965,7 +966,14 @@ fn try_main(cli: Cli, error_format: ErrorFormat) -> Result<(), CliFailure> {
     let config = ConfigContext::new(profile.as_deref());
     preflight_setup_before_history(&command, &config)?;
     let history = start_command_history(&command, &config);
-    let outcome = execute_command(command, no_color, profile.as_deref(), config);
+    let outcome = execute_command(
+        command,
+        no_color,
+        profile.as_deref(),
+        config,
+        error_format,
+        error_format_configured,
+    );
 
     if let Some(history) = history {
         let session_id = match &outcome {
@@ -974,7 +982,7 @@ fn try_main(cli: Cli, error_format: ErrorFormat) -> Result<(), CliFailure> {
         };
         let error_code = outcome.as_ref().err().map(|failure| failure.error.code);
         if let Err(error) = history.finish(session_id, error_code)
-            && error_format == ErrorFormat::Human
+            && *error_format == ErrorFormat::Human
         {
             // History is non-authoritative and cannot replace the command's
             // outcome, but operators still need to know when a row was lost.
@@ -1099,6 +1107,8 @@ fn execute_command(
     no_color: bool,
     profile: Option<&str>,
     config: ConfigContext<'_>,
+    error_format: &mut ErrorFormat,
+    error_format_configured: bool,
 ) -> Result<Option<SessionId>, CliFailure> {
     let early_lifecycle_host = explicit_lifecycle_json_host(&command).map(str::to_owned);
     let (output_args, event_output) = command.output_request();
@@ -1132,6 +1142,16 @@ fn execute_command(
             return Err(failure(error));
         }
     };
+    if !error_format_configured && presentation_default.is_some() {
+        *error_format = if output.is_json() {
+            ErrorFormat::Json
+        } else {
+            ErrorFormat::Human
+        };
+        // The configured presentation default is now known, so diagnostics and the terminal
+        // command error must use the same resolved format as successful output.
+        install_diagnostics(&command, *error_format);
+    }
     let human_style = HumanStyle::detect(no_color);
 
     match command {
