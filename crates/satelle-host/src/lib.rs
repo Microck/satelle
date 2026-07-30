@@ -762,6 +762,7 @@ pub struct HostService {
 enum HostMode {
     Production {
         snapshot: Arc<RwLock<ProductionCapabilitySnapshot>>,
+        daemon_paths: Box<Result<DaemonResolvedPathSet, SatelleError>>,
     },
     #[cfg(any(test, feature = "test-support"))]
     TestFake { image_attachments: bool },
@@ -778,6 +779,17 @@ fn configured_turn_execution_timeout(config: &HostConfig) -> satelle_core::sessi
         );
     satelle_core::session::TimeoutPolicy::bounded_seconds(seconds)
         .expect("validated Turn execution configuration has a nonzero timeout")
+}
+
+fn configured_daemon_path_overrides(config: &HostConfig) -> DaemonPathOverrides {
+    DaemonPathOverrides {
+        home: config.daemon_home.clone(),
+        config_file: config.daemon_config_file.clone(),
+        state_dir: config.daemon_state_dir.clone(),
+        cache_dir: config.daemon_cache_dir.clone(),
+        log_dir: config.daemon_log_dir.clone(),
+        sources: BTreeMap::new(),
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -1644,13 +1656,19 @@ impl HostService {
         let paths = satelle_core::resolve_path_set(
             &std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")),
         );
-        let state_root = paths
+        let daemon_path_overrides = configured_daemon_path_overrides(config);
+        let daemon_paths = paths
             .as_ref()
-            .map(|paths| paths.state_root.clone())
+            .map(DaemonResolvedPathSet::from)
+            .map(|paths| paths.with_service_overrides(&daemon_path_overrides))
             .map_err(Clone::clone);
-        let operator_log_root = paths
+        let state_root = daemon_paths
             .as_ref()
-            .map(|paths| paths.operator_log_root.clone())
+            .map(|paths| std::path::PathBuf::from(&paths.state_root))
+            .map_err(Clone::clone);
+        let operator_log_root = daemon_paths
+            .as_ref()
+            .map(|paths| std::path::PathBuf::from(&paths.operator_log_root))
             .map_err(Clone::clone);
         let working_directory = state_root
             .as_ref()
@@ -1691,7 +1709,10 @@ impl HostService {
             ),
             operation_capacity: Arc::new(OperationCapacity::default()),
             turn_execution_timeout: configured_turn_execution_timeout(config),
-            mode: HostMode::Production { snapshot },
+            mode: HostMode::Production {
+                snapshot,
+                daemon_paths: Box::new(daemon_paths),
+            },
             bootstrap_auth: None,
             bootstrap_maintenance: Arc::new(Mutex::new(None)),
             doctor_tasks: DoctorTaskRegistry::new(),
@@ -1863,7 +1884,7 @@ impl HostService {
         provider_intent: &ProviderComputerUseIntent,
     ) -> DoctorExecutionResult {
         match &self.mode {
-            HostMode::Production { snapshot } => production_doctor_with_provider_intent(
+            HostMode::Production { snapshot, .. } => production_doctor_with_provider_intent(
                 self,
                 host,
                 scope_selection,
@@ -2691,7 +2712,7 @@ impl HostService {
             return Ok(());
         }
         let supported = match &self.mode {
-            HostMode::Production { snapshot } => {
+            HostMode::Production { snapshot, .. } => {
                 read_production_snapshot(snapshot)?.image_attachments_supported()
             }
             #[cfg(any(test, feature = "test-support"))]
@@ -2897,10 +2918,16 @@ impl HostService {
     /// Resolves paths inside the Host process so a remote controller cannot
     /// substitute its own project discovery result or local filesystem paths.
     pub fn daemon_resolved_paths(&self) -> Result<DaemonResolvedPathSet, SatelleError> {
-        let daemon_working_directory =
-            std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
-        satelle_core::resolve_path_set(&daemon_working_directory)
-            .map(|paths| DaemonResolvedPathSet::from(&paths))
+        match &self.mode {
+            HostMode::Production { daemon_paths, .. } => daemon_paths.as_ref().clone(),
+            #[cfg(any(test, feature = "test-support"))]
+            HostMode::TestFake { .. } => {
+                let daemon_working_directory =
+                    std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+                satelle_core::resolve_path_set(&daemon_working_directory)
+                    .map(|paths| DaemonResolvedPathSet::from(&paths))
+            }
+        }
     }
 }
 

@@ -137,11 +137,26 @@ struct ConfigContext<'a> {
 struct SelectedHost {
     alias: String,
     config: HostConfig,
+    from_project: bool,
+}
+
+impl From<(String, HostConfig, bool)> for SelectedHost {
+    fn from((alias, config, from_project): (String, HostConfig, bool)) -> Self {
+        Self {
+            alias,
+            config,
+            from_project,
+        }
+    }
 }
 
 impl From<(String, HostConfig)> for SelectedHost {
     fn from((alias, config): (String, HostConfig)) -> Self {
-        Self { alias, config }
+        Self {
+            alias,
+            config,
+            from_project: false,
+        }
     }
 }
 
@@ -199,7 +214,7 @@ impl<'a> ConfigContext<'a> {
 
     fn resolve_host(&self, flag_host: Option<&str>) -> Result<SelectedHost, CliFailure> {
         self.load()?
-            .resolve_host(flag_host)
+            .resolve_host_with_project_source(flag_host)
             .map(SelectedHost::from)
             .map_err(failure)
     }
@@ -8239,7 +8254,7 @@ fn run_prompt(
         &mut event_output,
         explicit_host_alias,
         config
-            .resolve_host(explicit_host_alias)
+            .resolve_host_with_project_source(explicit_host_alias)
             .map(SelectedHost::from)
             .map_err(failure),
     )?;
@@ -8261,11 +8276,9 @@ fn run_prompt(
             if !command.detach {
                 event_output
                     .emit_preflight(
-                        &host.alias,
+                        &host,
                         "run",
-                        &host.config.transport,
                         config,
-                        &host.config,
                         &provider_selection,
                         None,
                         command.refresh_provider_smoke_test,
@@ -8310,11 +8323,9 @@ fn run_prompt(
             if !command.detach {
                 event_output
                     .emit_preflight(
-                        &host.alias,
+                        &host,
                         "run",
-                        &host.config.transport,
                         config,
-                        &host.config,
                         &provider_selection,
                         None,
                         command.refresh_provider_smoke_test,
@@ -8395,11 +8406,9 @@ fn run_prompt(
 
     event_output
         .emit_preflight(
-            &host.alias,
+            &host,
             "run",
-            &host.config.transport,
             config,
-            &host.config,
             &provider_selection,
             Some(&provider_validation),
             command.refresh_provider_smoke_test,
@@ -8478,7 +8487,7 @@ fn steer_prompt(
         &mut event_output,
         explicit_host_alias,
         config
-            .resolve_host(explicit_host_alias)
+            .resolve_host_with_project_source(explicit_host_alias)
             .map(SelectedHost::from)
             .map_err(failure),
     )?;
@@ -8500,11 +8509,9 @@ fn steer_prompt(
             if !command.detach {
                 event_output
                     .emit_preflight(
-                        &host.alias,
+                        &host,
                         "steer",
-                        &host.config.transport,
                         config,
-                        &host.config,
                         &provider_selection,
                         None,
                         command.refresh_provider_smoke_test,
@@ -8549,11 +8556,9 @@ fn steer_prompt(
             if !command.detach {
                 event_output
                     .emit_preflight(
-                        &host.alias,
+                        &host,
                         "steer",
-                        &host.config.transport,
                         config,
-                        &host.config,
                         &provider_selection,
                         None,
                         command.refresh_provider_smoke_test,
@@ -8636,11 +8641,9 @@ fn steer_prompt(
 
     event_output
         .emit_preflight(
-            &host.alias,
+            &host,
             "steer",
-            &host.config.transport,
             config,
-            &host.config,
             &provider_selection,
             Some(&provider_validation),
             command.refresh_provider_smoke_test,
@@ -9008,16 +9011,11 @@ impl TurnEventOutput {
         }
     }
 
-    // Keep the complete event payload explicit at each call site. A wrapper used only
-    // to satisfy this lint would hide required preflight fields without reducing them.
-    #[allow(clippy::too_many_arguments)]
     fn emit_preflight(
         &mut self,
-        host: &str,
+        host: &SelectedHost,
         operation: &str,
-        transport: &satelle_core::TransportKind,
         config: &ResolvedConfig,
-        host_config: &HostConfig,
         provider_selection: &ProviderSelection,
         provider_validation: Option<&transport::ProviderDescriptorValidationReport>,
         refresh_provider_smoke_test: bool,
@@ -9029,26 +9027,26 @@ impl TurnEventOutput {
             EventType::Preflight,
             EventSource::Cli,
             OffsetDateTime::now_utc(),
-            host,
+            &host.alias,
             None,
             "resolved configuration and selected Host transport",
             json!({
                 "operation": operation,
-                "transport": transport,
+                "transport": host.config.transport,
                 "selected_profile": config.selected_profile.as_ref().map(|profile| &profile.name),
                 "effective_timeouts": effective_timeouts_json(
-                    host_config,
-                    configured_turn_execution_timeout_ms(host_config),
+                    &host.config,
+                    configured_turn_execution_timeout_ms(&host.config),
                 ),
                 "project_config_intent": {
-                    "host": config.default_host_from_project(),
+                    "host": host.from_project,
                     "model": config.model_alias_from_project(),
                     "provider": config.provider_alias_from_project(),
                     "profile": config.selected_profile.as_ref().is_some_and(
                         |profile| profile.source.as_str() == "project_config"
                     ),
-                    "timeouts": config.host_intent_from_project(host),
-                    "transport": config.host_intent_from_project(host),
+                    "timeouts": config.timeout_intent_from_project(&host.alias),
+                    "transport": config.transport_intent_from_project(&host.alias),
                     "output_format": config.output_format_from_project(),
                 },
                 "requested_model_alias": provider_selection.requested_model_alias,

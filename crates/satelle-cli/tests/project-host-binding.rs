@@ -499,6 +499,71 @@ output_format = "json"
 }
 
 #[test]
+fn project_preflight_provenance_tracks_the_selected_host_and_each_host_field() {
+    let fixture = ConfigFixture::new(
+        r#"
+[hosts.alpha]
+transport = "local"
+adapter = "fake"
+allow_project_selection = true
+
+[hosts.timeout-only]
+transport = "local"
+adapter = "fake"
+
+[hosts.transport-only]
+transport = "local"
+adapter = "fake"
+"#,
+        r#"
+default_host = "alpha"
+
+[hosts.timeout-only.timeouts]
+native_readiness = "3s"
+
+[hosts.transport-only]
+transport = "local"
+"#,
+    );
+
+    let timeout_only = fixture
+        .command()
+        .args(["config", "explain", "--host", "timeout-only", "--json"])
+        .assert()
+        .success()
+        .get_output()
+        .clone();
+    let timeout_report = parse_json(&timeout_only.stdout);
+    assert_eq!(timeout_report["sources"]["project_intent"]["host"], false);
+    assert_eq!(
+        timeout_report["sources"]["project_intent"]["timeouts"],
+        true
+    );
+    assert_eq!(
+        timeout_report["sources"]["project_intent"]["transport"],
+        false
+    );
+
+    let transport_only = fixture
+        .command()
+        .args(["config", "explain", "--host", "transport-only", "--json"])
+        .assert()
+        .success()
+        .get_output()
+        .clone();
+    let transport_report = parse_json(&transport_only.stdout);
+    assert_eq!(transport_report["sources"]["project_intent"]["host"], false);
+    assert_eq!(
+        transport_report["sources"]["project_intent"]["timeouts"],
+        false
+    );
+    assert_eq!(
+        transport_report["sources"]["project_intent"]["transport"],
+        true
+    );
+}
+
+#[test]
 fn config_check_all_reports_every_missing_project_host_binding() {
     let fixture = ConfigFixture::new(
         "",

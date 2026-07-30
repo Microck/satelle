@@ -329,6 +329,7 @@ fn ssh_setup_host(api_token: Option<ApiTokenSource>) -> SelectedHost {
     SelectedHost {
         alias: "remote".to_string(),
         config,
+        from_project: false,
     }
 }
 
@@ -4630,7 +4631,7 @@ fn direct_inspection_host_config() -> HostConfig {
 }
 
 #[test]
-fn direct_inspection_fallback_uses_only_operator_ssh_bootstrap_settings() {
+fn direct_inspection_fallback_uses_bootstrap_settings_without_durable_authentication() {
     let mut config = direct_inspection_host_config();
     config.network = Some(satelle_core::NetworkConfig::Tailscale {
         tailnet_name: Some("corp".to_string()),
@@ -4647,6 +4648,7 @@ fn direct_inspection_fallback_uses_only_operator_ssh_bootstrap_settings() {
     let selected = SelectedHost {
         alias: "workstation".to_string(),
         config,
+        from_project: false,
     };
 
     let fallback = ssh_bootstrap_host(&selected).expect("operator bootstrap settings should work");
@@ -4661,12 +4663,9 @@ fn direct_inspection_fallback_uses_only_operator_ssh_bootstrap_settings() {
         fallback.config.expected_host_id.as_deref(),
         Some("host-123")
     );
-    assert_eq!(
-        fallback.config.api_token,
-        Some(ApiTokenSource::File {
-            path: PathBuf::from("/operator/daemon.token"),
-        })
-    );
+    // The direct daemon already proved this durable credential unreachable. Carrying it into
+    // ssh_transport would select the durable retry branch and skip the read-scoped bootstrap.
+    assert_eq!(fallback.config.api_token, None);
     assert_eq!(fallback.config.network, None);
     assert_eq!(fallback.config.ca_bundle, None);
     assert_eq!(fallback.config.ssh_bootstrap, None);
@@ -4677,6 +4676,7 @@ fn direct_inspection_fallback_requires_operator_ssh_bootstrap_settings() {
     let selected = SelectedHost {
         alias: "workstation".to_string(),
         config: direct_inspection_host_config(),
+        from_project: false,
     };
 
     let error = ssh_bootstrap_host(&selected).expect_err("fallback must be explicitly configured");

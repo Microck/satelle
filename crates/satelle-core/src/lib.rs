@@ -1814,7 +1814,9 @@ pub struct ResolvedConfig {
     #[serde(skip)]
     output_format_from_project: bool,
     #[serde(skip)]
-    project_host_intents: BTreeSet<String>,
+    project_timeout_intents: BTreeSet<String>,
+    #[serde(skip)]
+    project_transport_intents: BTreeSet<String>,
     // Config-check enumeration retains only selectors discovered from already validated files.
     // Effective HostConfig values continue to have a single owner in `config`.
     #[serde(skip)]
@@ -1834,12 +1836,12 @@ impl ResolvedConfig {
         self.output_format_from_project
     }
 
-    pub fn host_intent_from_project(&self, alias: &str) -> bool {
-        self.project_host_intents.contains(alias)
+    pub fn timeout_intent_from_project(&self, alias: &str) -> bool {
+        self.project_timeout_intents.contains(alias)
     }
 
-    pub const fn default_host_from_project(&self) -> bool {
-        self.default_host_requires_project_permission
+    pub fn transport_intent_from_project(&self, alias: &str) -> bool {
+        self.project_transport_intents.contains(alias)
     }
 }
 
@@ -1865,7 +1867,18 @@ impl ResolvedConfig {
         &self,
         flag_host: Option<&str>,
     ) -> Result<(String, HostConfig), SatelleError> {
+        self.resolve_host_with_project_source(flag_host)
+            .map(|(alias, host, _)| (alias, host))
+    }
+
+    pub fn resolve_host_with_project_source(
+        &self,
+        flag_host: Option<&str>,
+    ) -> Result<(String, HostConfig, bool), SatelleError> {
         let environment_host = optional_non_empty_env("SATELLE_HOST");
+        let host_from_project = flag_host.is_none()
+            && environment_host.is_none()
+            && self.default_host_requires_project_permission;
         let alias = flag_host
             .map(str::to_string)
             .or_else(|| environment_host.clone())
@@ -1879,11 +1892,7 @@ impl ResolvedConfig {
             .cloned()
             .ok_or_else(|| SatelleError::host_not_found(alias.clone()))?;
 
-        if flag_host.is_none()
-            && environment_host.is_none()
-            && self.default_host_requires_project_permission
-            && !self.project_selectable_hosts.contains(&alias)
-        {
+        if host_from_project && !self.project_selectable_hosts.contains(&alias) {
             return Err(SatelleError::project_host_selection_not_allowed(alias));
         }
 
@@ -1891,7 +1900,7 @@ impl ResolvedConfig {
             profile.apply_to_host(&alias, &mut host, selected.source);
         }
 
-        Ok((alias, host))
+        Ok((alias, host, host_from_project))
     }
 
     pub fn profile_overrides_for_host(&self, field: ProfileField, host: &str) -> bool {
@@ -2094,9 +2103,13 @@ fn load_config_with_profile_selection(
     let output_format_from_project = project_config
         .as_ref()
         .is_some_and(project_config::ParsedProjectConfig::defines_output_format);
-    let project_host_intents = project_config
+    let project_timeout_intents = project_config
         .as_ref()
-        .map(project_config::ParsedProjectConfig::host_intent_aliases)
+        .map(project_config::ParsedProjectConfig::timeout_intent_aliases)
+        .unwrap_or_default();
+    let project_transport_intents = project_config
+        .as_ref()
+        .map(project_config::ParsedProjectConfig::transport_intent_aliases)
         .unwrap_or_default();
 
     if let Some(user_config) = &user_config {
@@ -2189,7 +2202,8 @@ fn load_config_with_profile_selection(
         model_alias_from_project,
         provider_alias_from_project,
         output_format_from_project,
-        project_host_intents,
+        project_timeout_intents,
+        project_transport_intents,
         config_check_metadata: ConfigCheckMetadata {
             configured_hosts,
             configured_profiles,

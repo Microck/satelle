@@ -523,6 +523,7 @@ fn versioned_tool_results_conform_to_their_advertised_json_schemas() {
             tool_call(14, "doctor", json!({"scope": "config"})),
             tool_call(15, "host_sessions", json!({})),
             tool_call(16, "logs", json!({"tail": 100})),
+            tool_call(17, "paths", json!({"host": "local-demo"})),
         ],
     );
     assert!(
@@ -543,6 +544,30 @@ fn versioned_tool_results_conform_to_their_advertised_json_schemas() {
             "status",
         ]
     );
+    let paths_schema = schemas.get("paths").expect("paths output schema");
+    let paths_success_schema = &paths_schema["oneOf"][0];
+    assert_eq!(
+        paths_success_schema["properties"]["observation_source"]["enum"],
+        json!(["host_reported", null])
+    );
+    assert_eq!(
+        paths_success_schema["properties"]["sources"]["properties"]
+            .as_object()
+            .expect("closed path-source properties")
+            .keys()
+            .map(String::as_str)
+            .collect::<Vec<_>>(),
+        [
+            "cache_root",
+            "config_file",
+            "install_receipt",
+            "operator_log_root",
+            "project_config_file",
+            "recording_root",
+            "sqlite_store",
+            "state_root",
+        ]
+    );
 
     for (tool, id) in [
         ("config_check", 10),
@@ -551,6 +576,7 @@ fn versioned_tool_results_conform_to_their_advertised_json_schemas() {
         ("status", 13),
         ("doctor", 14),
         ("host_sessions", 15),
+        ("paths", 17),
     ] {
         let result = &response(&success_responses, id)["result"];
         assert_eq!(result["isError"], false, "{tool} success result: {result}");

@@ -54,10 +54,11 @@ use tracing::metadata::LevelFilter;
 use tracing::span::{Attributes, Id, Record};
 use tracing::{Event, Metadata, Subscriber};
 
-const EXPECTED_OPERATIONS: [&str; 15] = [
+const EXPECTED_OPERATIONS: [&str; 16] = [
     "live",
     "capabilities",
     "host_status",
+    "host_paths",
     "host_desktop_sessions",
     "session_create",
     "turn_create",

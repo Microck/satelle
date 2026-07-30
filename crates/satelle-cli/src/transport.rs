@@ -5084,10 +5084,14 @@ fn ssh_bootstrap_host(host: &SelectedHost) -> Result<SelectedHost, SatelleError>
     config.address = Some(settings.address.clone());
     config.network = None;
     config.ca_bundle = None;
+    // The direct daemon already proved this durable credential unreachable. The SSH leg must
+    // select the tokenless read-bootstrap branch instead of retrying the same credential.
+    config.api_token = None;
     config.ssh_bootstrap = None;
     Ok(SelectedHost {
         alias: host.alias.clone(),
         config,
+        from_project: host.from_project,
     })
 }
 
@@ -5716,6 +5720,7 @@ mod bootstrap_ordering_tests {
         SshSetupTransport::new(&SelectedHost {
             alias: "remote".to_string(),
             config,
+            from_project: false,
         })
         .expect("construct setup transport")
         .with_remote_target_for_tests(ssh_bootstrap::RemoteTarget::WindowsX64Msvc)

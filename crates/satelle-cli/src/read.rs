@@ -116,8 +116,9 @@ pub(super) fn config_explain_report(
         .selected_profile
         .as_ref()
         .map(|profile| profile.source.as_str());
-    let (selected_host, selected_host_config) =
-        config.resolve_host(host.as_deref()).map_err(failure)?;
+    let (selected_host, selected_host_config, host_from_project) = config
+        .resolve_host_with_project_source(host.as_deref())
+        .map_err(failure)?;
     let mut effective_config = config.config.clone();
     effective_config
         .hosts
@@ -146,12 +147,12 @@ pub(super) fn config_explain_report(
             "project_config": config.project_config_path,
             "profile": selected_profile_source,
             "project_intent": {
-                "host": config.default_host_from_project(),
+                "host": host_from_project,
                 "model": config.model_alias_from_project(),
                 "provider": config.provider_alias_from_project(),
                 "profile": selected_profile_source == Some("project_config"),
-                "timeouts": config.host_intent_from_project(&selected_host),
-                "transport": config.host_intent_from_project(&selected_host),
+                "timeouts": config.timeout_intent_from_project(&selected_host),
+                "transport": config.transport_intent_from_project(&selected_host),
                 "output_format": config.output_format_from_project(),
             },
             "environment": environment_sources,

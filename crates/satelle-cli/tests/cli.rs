@@ -1417,6 +1417,15 @@ fn events_json_emits_newline_delimited_satelle_events() {
     assert_eq!(events.len(), 7);
     assert_eq!(events[0]["type"], "preflight");
     assert_eq!(events[0]["source"], "cli");
+    assert_eq!(events[0]["data"]["project_config_intent"]["host"], false);
+    assert_eq!(
+        events[0]["data"]["project_config_intent"]["timeouts"],
+        false
+    );
+    assert_eq!(
+        events[0]["data"]["project_config_intent"]["transport"],
+        false
+    );
     assert!(events[0]["session_id"].is_null());
     assert!(events[0]["turn_id"].is_null());
     assert!(events.iter().any(|event| event["type"] == "provider_smoke"));
@@ -5343,6 +5352,7 @@ transpor = "direct"
             "default_host",
             "model_alias",
             "provider_alias",
+            "output_format",
             "profile",
             "hosts"
         ])

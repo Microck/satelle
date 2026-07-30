@@ -113,8 +113,22 @@ impl ParsedProjectConfig {
         self.config.output_format.is_some()
     }
 
-    pub(super) fn host_intent_aliases(&self) -> BTreeSet<String> {
-        self.config.hosts.keys().cloned().collect()
+    pub(super) fn timeout_intent_aliases(&self) -> BTreeSet<String> {
+        self.config
+            .hosts
+            .iter()
+            .filter(|(_, intent)| intent.timeouts.is_some())
+            .map(|(alias, _)| alias.clone())
+            .collect()
+    }
+
+    pub(super) fn transport_intent_aliases(&self) -> BTreeSet<String> {
+        self.config
+            .hosts
+            .iter()
+            .filter(|(_, intent)| intent.transport.is_some())
+            .map(|(alias, _)| alias.clone())
+            .collect()
     }
 
     pub(super) fn apply_to(

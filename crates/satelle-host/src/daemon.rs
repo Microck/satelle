@@ -591,7 +591,7 @@ impl HostService {
 
     pub fn daemon_runtime_capabilities(&self) -> Result<DaemonRuntimeCapabilities, SatelleError> {
         match &self.mode {
-            HostMode::Production { snapshot } => {
+            HostMode::Production { snapshot, .. } => {
                 let native_computer_use = self.runtime.has_reusable_readiness(LOCAL_DEMO_HOST)?;
                 Ok(production_capabilities(
                     &*crate::read_production_snapshot(snapshot)?,

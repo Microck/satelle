@@ -26,6 +26,57 @@ fn doctor_selection(scopes: &[&str]) -> DoctorScopeSelection {
     .expect("valid Doctor test scopes")
 }
 
+fn test_daemon_paths(state: &TestStateDir) -> Result<DaemonResolvedPathSet, SatelleError> {
+    satelle_core::resolve_path_set(state.path()).map(|paths| DaemonResolvedPathSet::from(&paths))
+}
+
+#[test]
+fn production_host_reports_the_frozen_service_config_path_set() {
+    let state = TestStateDir::new().expect("temporary state directory");
+    let configured_state_root = state.path().join("service-state");
+    let mut config = satelle_core::SatelleConfig::defaults()
+        .hosts
+        .remove(LOCAL_DEMO_HOST)
+        .expect("the built-in local Host config exists");
+    config.daemon_state_dir = Some(configured_state_root.clone());
+
+    let service = HostService::production_for_host(&config);
+    let paths = service
+        .daemon_resolved_paths()
+        .expect("production Host paths resolve once during construction");
+
+    assert_eq!(
+        paths.state_root,
+        configured_state_root.display().to_string()
+    );
+    assert_eq!(
+        paths.sqlite_store,
+        configured_state_root
+            .join("satelle.sqlite3")
+            .display()
+            .to_string()
+    );
+    assert_eq!(
+        paths.recording_root,
+        configured_state_root
+            .join("recordings")
+            .display()
+            .to_string()
+    );
+    assert_eq!(
+        paths.sources.state_root,
+        satelle_core::PathSource::ServiceConfig
+    );
+    assert_eq!(
+        paths.sources.sqlite_store,
+        satelle_core::PathSource::ServiceConfig
+    );
+    assert_eq!(
+        paths.sources.recording_root,
+        satelle_core::PathSource::ServiceConfig
+    );
+}
+
 struct ReadyTestTransportProbe;
 
 impl ControllerTransportProbe for ReadyTestTransportProbe {
@@ -1520,7 +1571,10 @@ fn unsupported_or_unproven_production_execution_is_blocked_without_state_admissi
             turn_execution_timeout: crate::configured_turn_execution_timeout(
                 &satelle_core::SatelleConfig::defaults().hosts[LOCAL_DEMO_HOST],
             ),
-            mode: HostMode::Production { snapshot },
+            mode: HostMode::Production {
+                snapshot,
+                daemon_paths: Box::new(test_daemon_paths(&state)),
+            },
             bootstrap_auth: None,
             bootstrap_maintenance: Arc::new(Mutex::new(None)),
             doctor_tasks: DoctorTaskRegistry::new(),
@@ -1763,7 +1817,10 @@ fn refreshed_production_snapshot_updates_admission_surfaces_but_not_desktop_disc
         turn_execution_timeout: crate::configured_turn_execution_timeout(
             &satelle_core::SatelleConfig::defaults().hosts[LOCAL_DEMO_HOST],
         ),
-        mode: HostMode::Production { snapshot },
+        mode: HostMode::Production {
+            snapshot,
+            daemon_paths: Box::new(test_daemon_paths(&state)),
+        },
         bootstrap_auth: None,
         bootstrap_maintenance: Arc::new(Mutex::new(None)),
         doctor_tasks: DoctorTaskRegistry::new(),
@@ -1855,7 +1912,10 @@ fn production_doctor_test_service(state: &TestStateDir) -> HostService {
         turn_execution_timeout: crate::configured_turn_execution_timeout(
             &satelle_core::SatelleConfig::defaults().hosts[LOCAL_DEMO_HOST],
         ),
-        mode: HostMode::Production { snapshot },
+        mode: HostMode::Production {
+            snapshot,
+            daemon_paths: Box::new(test_daemon_paths(state)),
+        },
         bootstrap_auth: None,
         bootstrap_maintenance: Arc::new(Mutex::new(None)),
         doctor_tasks: DoctorTaskRegistry::new(),
@@ -1881,7 +1941,10 @@ fn fatal_doctor_failure_preserves_independent_terminal_probe_results() {
         turn_execution_timeout: crate::configured_turn_execution_timeout(
             &satelle_core::SatelleConfig::defaults().hosts[LOCAL_DEMO_HOST],
         ),
-        mode: HostMode::Production { snapshot },
+        mode: HostMode::Production {
+            snapshot,
+            daemon_paths: Box::new(test_daemon_paths(&state)),
+        },
         bootstrap_auth: None,
         bootstrap_maintenance: Arc::new(Mutex::new(None)),
         doctor_tasks: DoctorTaskRegistry::new(),
@@ -2044,6 +2107,7 @@ fn non_codex_phase0_findings_do_not_block_the_codex_result() {
     );
     let HostMode::Production {
         snapshot: snapshot_slot,
+        ..
     } = &service.mode
     else {
         unreachable!("the fixture is a production Host")
