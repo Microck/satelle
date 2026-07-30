@@ -1719,6 +1719,21 @@ impl HostService {
         }
     }
 
+    /// Builds the persistent Host service with the exact path overrides from
+    /// its Satelle-owned launchd or Windows service configuration.
+    pub fn production_for_service(overrides: &DaemonPathOverrides) -> Self {
+        let mut config = satelle_core::SatelleConfig::defaults()
+            .hosts
+            .remove(LOCAL_DEMO_HOST)
+            .expect("the built-in local Host config exists");
+        config.daemon_home = overrides.home.clone();
+        config.daemon_config_file = overrides.config_file.clone();
+        config.daemon_state_dir = overrides.state_dir.clone();
+        config.daemon_cache_dir = overrides.cache_dir.clone();
+        config.daemon_log_dir = overrides.log_dir.clone();
+        Self::production_for_host(&config)
+    }
+
     /// Builds an on-demand Host whose only bootstrap credential is held in
     /// process memory and expires independently of durable Host state.
     pub fn production_for_ssh_bootstrap(

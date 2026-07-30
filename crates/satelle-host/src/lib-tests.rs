@@ -77,6 +77,28 @@ fn production_host_reports_the_frozen_service_config_path_set() {
     );
 }
 
+#[test]
+fn production_service_reports_the_frozen_service_config_path_set() {
+    let state = TestStateDir::new().expect("temporary state directory");
+    let configured_state_root = state.path().join("persistent-service-state");
+    let service = HostService::production_for_service(&DaemonPathOverrides {
+        state_dir: Some(configured_state_root.clone()),
+        ..DaemonPathOverrides::default()
+    });
+    let paths = service
+        .daemon_resolved_paths()
+        .expect("persistent service paths resolve once during construction");
+
+    assert_eq!(
+        paths.state_root,
+        configured_state_root.display().to_string()
+    );
+    assert_eq!(
+        paths.sources.state_root,
+        satelle_core::PathSource::ServiceConfig
+    );
+}
+
 struct ReadyTestTransportProbe;
 
 impl ControllerTransportProbe for ReadyTestTransportProbe {

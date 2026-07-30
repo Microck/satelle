@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::net::SocketAddr;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use thiserror::Error;
 
 pub const WINDOWS_SERVICE_CONFIG_SCHEMA: &str = "satelle.host-service.v1";
@@ -444,7 +444,8 @@ pub fn render_launchd_user_plist(
             "<key>Label</key><string>dev.microck.satelle.host</string>",
             "<key>ProgramArguments</key><array>",
             "<string>{}</string><string>host</string><string>start</string>",
-            "<string>--foreground</string><string>--bind</string><string>{}</string>",
+            "<string>--foreground</string><string>--launchd-service</string>",
+            "<string>--bind</string><string>{}</string>",
             "</array><key>EnvironmentVariables</key><dict>{}</dict>",
             "<key>RunAtLoad</key><true/><key>KeepAlive</key><true/>",
             "</dict></plist>"
@@ -554,6 +555,20 @@ impl WindowsServiceConfigV1 {
 
     pub fn environment(&self) -> &BTreeMap<String, String> {
         &self.environment
+    }
+
+    pub fn path_overrides(&self) -> DaemonPathOverrides {
+        DaemonPathOverrides {
+            home: self.environment.get("SATELLE_HOME").map(PathBuf::from),
+            config_file: self
+                .environment
+                .get("SATELLE_CONFIG_FILE")
+                .map(PathBuf::from),
+            state_dir: self.environment.get("SATELLE_STATE_DIR").map(PathBuf::from),
+            cache_dir: self.environment.get("SATELLE_CACHE_DIR").map(PathBuf::from),
+            log_dir: self.environment.get("SATELLE_LOG_DIR").map(PathBuf::from),
+            sources: BTreeMap::new(),
+        }
     }
 
     fn validate(&self) -> Result<(), &'static str> {
@@ -1176,7 +1191,21 @@ mod tests {
         assert!(plist.contains("<key>SATELLE_HOME</key>"));
         assert!(plist.contains("Satelle &amp; Host"));
         assert!(plist.contains("127.0.0.1:3001"));
+        assert!(plist.contains("<string>--launchd-service</string>"));
         assert!(!plist.contains("0.0.0.0"));
         assert!(!plist.contains("UserName"));
+    }
+
+    #[test]
+    fn windows_service_config_recovers_persistent_path_overrides() {
+        let overrides = DaemonPathOverrides {
+            home: Some(PathBuf::from(r"C:\Users\operator\Satelle")),
+            state_dir: Some(PathBuf::from(r"C:\Users\operator\Satelle\state")),
+            ..DaemonPathOverrides::default()
+        };
+        let config = WindowsServiceConfigV1::new("127.0.0.1:3001", &overrides)
+            .expect("valid Windows service config");
+
+        assert_eq!(config.path_overrides(), overrides);
     }
 }

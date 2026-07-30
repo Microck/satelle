@@ -154,7 +154,7 @@
 - satelle config explain JSON v2 uses schema_version satelle.config.explain.v2 @contract @mvp @implemented
 - satelle self update JSON v1 uses schema_version satelle.self.update.v1 @spec @contract @mvp
 - satelle host update JSON v1 uses schema_version satelle.host.update.v1 @spec @contract @mvp
-- satelle paths JSON v1 uses schema_version satelle.paths.v1 @contract @mvp @implemented
+- satelle paths JSON v2 uses schema_version satelle.paths.v2 @contract @mvp @implemented
 - satelle host sessions JSON v1 uses schema_version satelle.host.sessions.v1 @contract @mvp @implemented
 - satelle JSON error v1 uses schema_version satelle.error.v1 @contract @mvp @implemented
 - satelle does not remove fields, change field meanings, or rename enum tokens within one result schema_version @spec @contract @mvp @implemented

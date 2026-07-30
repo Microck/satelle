@@ -3349,7 +3349,8 @@ fn parse_launchd_path_overrides(output: &[u8]) -> Result<DaemonPathOverrides, Ss
     );
     const ARGUMENTS: &str = concat!(
         "</string><string>host</string><string>start</string>",
-        "<string>--foreground</string><string>--bind</string>",
+        "<string>--foreground</string><string>--launchd-service</string>",
+        "<string>--bind</string>",
         "<string>127.0.0.1:3001</string></array>",
         "<key>EnvironmentVariables</key><dict>",
     );
